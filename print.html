@@ -1,0 +1,826 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Tribles Book</title>
+        <meta name="robots" content="noindex">
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="A guided tour of Trible Space and how to use the crate.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon.svg">
+        <link rel="shortcut icon" href="favicon.png">
+        <link rel="stylesheet" href="css/variables.css">
+        <link rel="stylesheet" href="css/general.css">
+        <link rel="stylesheet" href="css/chrome.css">
+        <link rel="stylesheet" href="css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="highlight-css" href="highlight.css">
+        <link rel="stylesheet" id="tomorrow-night-css" href="tomorrow-night.css">
+        <link rel="stylesheet" id="ayu-highlight-css" href="ayu-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="sidebar-toggle" class="icon-button" for="sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </label>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Tribles Book</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <i class="fa fa-spinner fa-spin"></i>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="introduction"><a class="header" href="#introduction">Introduction</a></h1>
+<p>Welcome to the <strong>Tribles Book</strong>. This guide provides a gentle introduction to
+Trible Space, its design goals and how to use the <code>tribles</code> crate.  The aim is to
+present a clear narrative for newcomers while linking to in‑depth reference
+material for those who want to dig deeper.</p>
+<p>Trible Space combines ideas from databases and version control. Data is stored
+in small immutable blobs that can live in memory, on disk or inside remote
+object stores without conversion. Cryptographic identifiers ensure integrity and
+enable efficient sharing across systems.</p>
+<p>While this book walks you through the basics, the crate documentation offers a
+complete API reference. Use the links throughout the text to jump directly to
+the modules that interest you.</p>
+<p>If you would like to work on Tribles yourself, check out <a href="contributing.html">Developing Locally</a>.</p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="getting-started"><a class="header" href="#getting-started">Getting Started</a></h1>
+<p>First add the crate to your project:</p>
+<pre><code class="language-bash">cargo add tribles
+</code></pre>
+<p>Next create a simple repository and commit some data:</p>
+<pre><code class="language-rust ignore">use tribles::prelude::*;
+use tribles::examples::literature;
+use tribles::repo::Repository;
+use std::path::Path;
+use ed25519_dalek::SigningKey;
+use rand::rngs::OsRng;
+
+const MAX_PILE_SIZE: usize = 1 &lt;&lt; 20;
+
+fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    let pile: Pile&lt;MAX_PILE_SIZE&gt; = Pile::open(Path::new("example.pile"))?;
+    let mut repo = Repository::new(pile, SigningKey::generate(&amp;mut OsRng));
+    let mut ws = repo.branch("main")?;
+
+    ws.commit(literature::entity!(&amp;ufoid(), { firstname: "Alice" }), None);
+    repo.push(&amp;mut ws)?;
+    Ok(())
+}</code></pre>
+<p>See the <a href="https://docs.rs/tribles/latest/tribles/">crate documentation</a> for
+additional modules and examples.</p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="developing-locally"><a class="header" href="#developing-locally">Developing Locally</a></h1>
+<p>To build and test Tribles yourself you need a recent Rust toolchain. Install it from <a href="https://rustup.rs/">rustup.rs</a>.</p>
+<p>Run <code>./scripts/preflight.sh</code> from the repository root to format the code and execute the full test suite. For quick iterations <code>./scripts/devtest.sh</code> runs only the tests.</p>
+<p>If you want to render this book locally first install <code>mdbook</code> with <code>cargo install mdbook</code> and then run <code>./scripts/build_book.sh</code>.</p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="architecture-overview"><a class="header" href="#architecture-overview">Architecture Overview</a></h1>
+<p>Trible Space is designed to keep data management simple, safe and fast.  The <a href="../README.html">README</a> introduces these goals in more detail, emphasizing a lean design with predictable performance and straightforward developer experience.  This chapter explains how the pieces fit together and why they are organised this way.</p>
+<h2 id="design-goals"><a class="header" href="#design-goals">Design Goals</a></h2>
+<p>A full discussion of the motivation behind Trible Space can be found in the <a href="deep-dive/philosophy.html">Philosophy</a> section.  At a high level we want a self‑contained data store that offers:</p>
+<ul>
+<li><strong>Simplicity</strong> – minimal moving parts and predictable behaviour.</li>
+<li><strong>Developer Experience</strong> – a clear API that avoids complex servers or background processes.</li>
+<li><strong>Safety and Performance</strong> – sound data structures backed by efficient content addressed blobs.</li>
+</ul>
+<p>These goals grew out of earlier "semantic" technologies that attempted to model knowledge as graphs.  While systems like RDF promised great flexibility, in practice they often became difficult to host, query and synchronise.  Trible Space keeps the idea of describing the world with simple statements but stores them in a form that is easy to exchange and reason about.</p>
+<h2 id="data-model"><a class="header" href="#data-model">Data Model</a></h2>
+<p>The fundamental unit of information is a <a href="https://docs.rs/tribles/latest/tribles/trible/struct.Trible.html"><code>Trible</code></a>.  Its 64 byte layout is described in <a href="deep-dive/trible-structure.html">Trible Structure</a>.  A <code>Trible</code> links a subject entity to an attribute and value.  Multiple tribles are stored in a <a href="https://docs.rs/tribles/latest/tribles/trible/struct.TribleSet.html"><code>TribleSet</code></a>, which behaves like a hashmap with three columns — subject, attribute and value.</p>
+<h2 id="trible-sets"><a class="header" href="#trible-sets">Trible Sets</a></h2>
+<p><code>TribleSet</code>s provide fast querying and cheap copy‑on‑write semantics.  They can be merged, diffed and searched entirely in memory.  When durability is needed the set is serialised into a blob and tracked by the repository layer.</p>
+<h2 id="blob-storage"><a class="header" href="#blob-storage">Blob Storage</a></h2>
+<p>All persistent data lives in a <a href="https://docs.rs/tribles/latest/tribles/blob/index.html"><code>BlobStore</code></a>.  Every blob is addressed by the hash of its contents.  This content addressing means the same data is never stored twice and its integrity can be verified on read.  Different implementations handle where bytes actually reside: an in‑memory <a href="https://docs.rs/tribles/latest/tribles/blob/struct.MemoryBlobStore.html"><code>MemoryBlobStore</code></a>, an on‑disk <a href="https://docs.rs/tribles/latest/tribles/repo/pile/struct.Pile.html"><code>Pile</code></a> described in <a href="pile-format.html">Pile Format</a> or a remote object store.  Trible sets, user blobs and commit records all share this mechanism.</p>
+<h2 id="branch-store"><a class="header" href="#branch-store">Branch Store</a></h2>
+<p>A <a href="https://docs.rs/tribles/latest/tribles/repo/trait.BranchStore.html"><code>BranchStore</code></a> keeps track of the tips of each branch.  Updates use a simple compare‑and‑set operation so concurrent writers detect conflicts.  Both the in‑memory and pile repositories implement this trait.</p>
+<p>Because only this single operation mutates repository state, nearly all other logic is value oriented and immutable.  Conflicts surface only at the branch store update step, which simplifies concurrent use and reasoning about changes.</p>
+<h2 id="repository"><a class="header" href="#repository">Repository</a></h2>
+<p>The <a href="https://docs.rs/tribles/latest/tribles/repo/struct.Repository.html"><code>Repository</code></a> combines a blob store with a branch store.  Commits store a trible set blob along with a parent link and signature.  Because everything is content addressed, multiple repositories can share blobs or synchronize through a basic file copy.</p>
+<h2 id="workspaces"><a class="header" href="#workspaces">Workspaces</a></h2>
+<p>A <a href="https://docs.rs/tribles/latest/tribles/repo/struct.Workspace.html"><code>Workspace</code></a> represents mutable state during editing.  Checking out or branching yields a workspace backed by a fresh <code>MemoryBlobStore</code>.  Commits are created locally and only become visible to others when pushed, as described in <a href="repository-workflows.html">Repository Workflows</a>.</p>
+<h2 id="commits-and-history"><a class="header" href="#commits-and-history">Commits and History</a></h2>
+<p><code>TribleSet</code>s written to blobs form immutable commits.  Each commit references its parent, creating an append‑only chain signed by the author.  This is the durable history shared between repositories.</p>
+<h2 id="putting-it-together"><a class="header" href="#putting-it-together">Putting It Together</a></h2>
+<pre><code class="language-text">+-----------------------------------------------------------+
+|                        Repository                          |
+|   +---------------------+   +----------------------------+ |
+|   |      BlobStore      |   |        BranchStore        | |
+|   +---------------------+   +----------------------------+ |
++-----------------------------------------------------------+
+           ^ pull                                | push
+           |                                     v
++-----------------------------------------------------------+
+|                        Workspace                           |
+|   +---------------------+   +----------------------------+ |
+|   |   MemoryBlobStore   |   |          TribleSet        | |
+|   +---------------------+   +----------------------------+ |
++-----------------------------------------------------------+
+                      |
+                      | commit/add_blob
+                      v
+                 TribleSet blobs
+</code></pre>
+<p>Repositories persist blobs and branch metadata while workspaces stage changes before pushing them.  Because every blob is addressed by its hash, repositories can safely share data through any common storage without coordination.</p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="query-language"><a class="header" href="#query-language">Query Language</a></h1>
+<p>This chapter introduces the basic query facilities provided by <code>tribles</code>.</p>
+<p>The <a href="crate::prelude::find"><code>find!</code></a> macro builds a <a href="crate::query::Query"><code>Query</code></a>
+by declaring variables and a constraint expression.  A minimal invocation looks
+like:</p>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let results = find!((a), a.is(1.into())).collect::&lt;Vec&lt;_&gt;&gt;();
+<span class="boring">}</span></code></pre></pre>
+<p>Variables can optionally specify a concrete type to convert the underlying
+value:</p>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>find!((x: i32, y: Value&lt;ShortString&gt;),
+      and!(x.is(1.into()), y.is("foo".to_value())))
+<span class="boring">}</span></code></pre></pre>
+<p>The first variable is read as an <code>i32</code> and the second as a short string if the
+conversion succeeds. The query engine walks all possible assignments that
+satisfy the constraint and yields tuples of the declared variables.</p>
+<h2 id="built-in-constraints"><a class="header" href="#built-in-constraints">Built-in constraints</a></h2>
+<p><code>find!</code> queries combine a small set of constraint operators to form a declarative
+language for matching tribles:</p>
+<ul>
+<li><a href="crate::prelude::and"><code>and!</code></a> builds an
+<a href="crate::query::intersectionconstraint::IntersectionConstraint"><code>IntersectionConstraint</code></a>
+requiring all sub-constraints to hold.</li>
+<li><a href="crate::prelude::or"><code>or!</code></a> constructs a
+<a href="crate::query::unionconstraint::UnionConstraint"><code>UnionConstraint</code></a>
+accepting any satisfied alternative.</li>
+<li><a href="crate::prelude::mask"><code>mask!</code></a> hides variables from a sub-query.</li>
+<li>Collection types such as <a href="crate::tribleset::TribleSet"><code>TribleSet</code></a> provide a
+<code>has</code> method yielding a
+<a href="crate::query::hashsetconstraint::ContainsConstraint"><code>ContainsConstraint</code></a> for
+membership tests.</li>
+</ul>
+<p>Any data structure that can iterate its contents, test membership and report its
+size can implement <code>ContainsConstraint</code>, so queries have no inherent ordering
+requirements.</p>
+<h2 id="example"><a class="header" href="#example">Example</a></h2>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use tribles::prelude::*;
+use tribles::examples::{self, literature};
+
+let dataset = examples::dataset();
+
+for (title,) in find!((title: Value&lt;_&gt;),
+                     and!(dataset.has(title), title.is("Dune".to_value()))) {
+    println!("Found {}", title.from_value::&lt;&amp;str&gt;());
+}
+<span class="boring">}</span></code></pre></pre>
+<p>This query searches the example dataset for the book titled "Dune".  The
+variables and constraint can be adapted to express more complex joins and
+filters.</p>
+<h2 id="custom-constraints"><a class="header" href="#custom-constraints">Custom constraints</a></h2>
+<p>Every building block implements the
+<a href="crate::query::Constraint"><code>Constraint</code></a> trait.  You can implement this trait on
+your own types to integrate custom data sources or query operators with the
+solver.</p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="incremental-queries"><a class="header" href="#incremental-queries">Incremental Queries</a></h1>
+<p>The query engine today evaluates against a static <code>TribleSet</code>. Many
+applications would rather compute just the new results when additional
+data arrives. We plan to support this using <em>semi‑naive evaluation</em>.</p>
+<p>When a dataset grows, we compute a delta set of the newly inserted
+tribles. For each triple constraint in the original query we evaluate a
+variant of the query where that single constraint is restricted to the
+delta while the remaining constraints see the full updated dataset. Each
+case yields the new solutions introduced by those additions and we then
+union all of the per‑constraint results.</p>
+<p>To help express these delta queries at the macro level, namespaces will
+offer a <code>delta!</code> operator. It behaves like <code>pattern!</code> but takes the
+previous and current <code>TribleSet</code>. The macro computes their difference
+and then calls <code>union!</code> internally to apply the resulting delta
+constraint, matching only the newly inserted tribles. Combined with the
+union constraint, this lets us run incremental updates using the familiar
+<code>find!</code> interface.</p>
+<p>We can reuse the existing <code>find!</code> interface to run these partial queries
+and poll for updates whenever an application receives a new <code>TribleSet</code>.
+This mechanism also lets us compute the difference between two arbitrary
+datasets by treating the change set as the delta.</p>
+<p>Removed results are not tracked. Tribles are designed to be monotonic
+(CALM); new facts never invalidate previous conclusions. Applications can
+represent contradictions explicitly and continue operating by appending
+new tribles that reference the view they choose to follow.</p>
+<p>Semantically this means tribles are never deleted, though individual
+stores may forget them. Old data remains valid even if it becomes
+inaccessible.</p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="schemas"><a class="header" href="#schemas">Schemas</a></h1>
+<p>Trible Space stores data in strongly typed values and blobs.  A <em>schema</em>
+describes a language‑agnostic data type with a specific byte representation:
+exactly 32 bytes for a [<code>Value</code>] and an arbitrary number of bytes for a
+[<code>Blob</code>].  These abstract types can be converted to the concrete types of your
+application but decouple stored data from any particular implementation.  This
+also means you can refactor to new libraries or frameworks without rewriting
+what's already stored. The crate ships with a collection of ready‑made schemas located in
+<a href="../src/value/schemas"><code>src/value/schemas</code></a> and
+<a href="../src/blob/schemas"><code>src/blob/schemas</code></a>.</p>
+<h2 id="builtin-value-schemas"><a class="header" href="#builtin-value-schemas">Built‑in value schemas</a></h2>
+<p>The crate provides the following value schemas out of the box:</p>
+<ul>
+<li><code>GenId</code> – an abstract 128 bit identifier.</li>
+<li><code>ShortString</code> – a UTF-8 string up to 32 bytes.</li>
+<li><code>U256BE</code> / <code>U256LE</code> – 256-bit unsigned integers.</li>
+<li><code>I256BE</code> / <code>I256LE</code> – 256-bit signed integers.</li>
+<li><code>R256BE</code> / <code>R256LE</code> – 256-bit rational numbers.</li>
+<li><code>F256BE</code> / <code>F256LE</code> – 256-bit floating point numbers.</li>
+<li><code>Hash</code> and <code>Handle</code> – cryptographic digests and blob handles (see <a href="../src/value/schemas/hash.rs"><code>hash.rs</code></a>).</li>
+<li><code>ED25519RComponent</code>, <code>ED25519SComponent</code> and <code>ED25519PublicKey</code> – signature fields and keys.</li>
+<li><code>NsTAIInterval</code> to encode time intervals.</li>
+<li><code>UnknownValue</code> as a fallback when no specific schema is known.</li>
+</ul>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use tribles::value::schemas::shortstring::ShortString;
+use tribles::value::{ToValue, ValueSchema};
+
+let v = "hi".to_value::&lt;ShortString&gt;();
+assert_eq!(v.schema_id(), ShortString::VALUE_SCHEMA_ID);
+<span class="boring">}</span></code></pre></pre>
+<h2 id="builtin-blob-schemas"><a class="header" href="#builtin-blob-schemas">Built‑in blob schemas</a></h2>
+<p>The crate also ships with these blob schemas:</p>
+<ul>
+<li><code>LongString</code> for arbitrarily long UTF‑8 strings.</li>
+<li><code>SimpleArchive</code> which stores a raw sequence of tribles.</li>
+<li><code>SuccinctArchive</code> providing a compressed index for offline queries.</li>
+<li><code>UnknownBlob</code> for data of unknown type.</li>
+</ul>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>use tribles::blob::schemas::longstring::LongString;
+use tribles::blob::{ToBlob, BlobSchema};
+
+let b = "example".to_blob::&lt;LongString&gt;();
+assert_eq!(LongString::BLOB_SCHEMA_ID, b.schema_id());
+<span class="boring">}</span></code></pre></pre>
+<h2 id="defining-new-schemas"><a class="header" href="#defining-new-schemas">Defining new schemas</a></h2>
+<p>Custom formats implement [<code>ValueSchema</code>] or [<code>BlobSchema</code>].  A unique identifier
+serves as the schema ID.  The example below defines a little-endian <code>u64</code> value
+schema and a simple blob schema for arbitrary bytes.</p>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>{{#include ../examples/custom_schema.rs:beginning:ending}}
+<span class="boring">}</span></code></pre></pre>
+<p>See <a href="../examples/custom_schema.rs"><code>examples/custom_schema.rs</code></a> for the full
+source.</p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="repository-workflows"><a class="header" href="#repository-workflows">Repository Workflows</a></h1>
+<p>Tribles borrows a lot of terminology from Git. A <code>Repository</code> stores the history
+of your data, while a <code>Workspace</code> is the mutable view that you operate on much
+like a working directory and index combined. Commits live in a <code>BlobStore</code> and
+branch metadata in a <code>BranchStore</code>; these stores can be purely in memory,
+persisted to disk or backed by a remote service. The examples in
+<code>examples/repo.rs</code> and <code>examples/workspace.rs</code> showcase this API and should feel
+familiar to anyone comfortable with Git.</p>
+<h2 id="branching"><a class="header" href="#branching">Branching</a></h2>
+<p>A branch records a line of history. Creating one writes initial metadata to the
+underlying store and yields a <code>Workspace</code> pointing at that branch. While
+<code>Repository::branch</code> is a convenient way to start a fresh branch, most workflows
+use <code>Repository::pull</code> to obtain a workspace for an existing branch:</p>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let mut repo = Repository::new(pile, SigningKey::generate(&amp;mut OsRng));
+let mut ws = repo.branch("main").expect("create branch");
+let mut ws2 = repo.pull(ws.branch_id()).expect("open branch");
+<span class="boring">}</span></code></pre></pre>
+<p>After committing changes you can push the workspace back:</p>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>ws.commit(change, Some("initial commit"));
+repo.push(&amp;mut ws)?;
+<span class="boring">}</span></code></pre></pre>
+<p>You can inspect previous commits using <code>Workspace::checkout</code> which returns a
+<code>TribleSet</code> with the union of the specified commit contents. Commit ranges
+are supported for convenience:</p>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let history = ws.checkout(commit_a..=commit_b)?;
+<span class="boring">}</span></code></pre></pre>
+<h2 id="merging-and-conflict-handling"><a class="header" href="#merging-and-conflict-handling">Merging and Conflict Handling</a></h2>
+<p>When pushing a workspace another client might have already updated the branch.
+<code>Repository::push</code> returns an optional conflicting <code>Workspace</code>. The usual loop
+looks like:</p>
+<pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>while let Some(mut incoming) = repo.push(&amp;mut ws)? {
+    incoming.merge(&amp;mut ws)?;
+    ws = incoming;
+}
+<span class="boring">}</span></code></pre></pre>
+<p>This snippet is taken from <a href="../examples/workspace.rs"><code>examples/workspace.rs</code></a>.
+The <a href="../examples/repo.rs"><code>examples/repo.rs</code></a> example demonstrates the same
+pattern with two separate workspaces.</p>
+<h2 id="typical-cli-usage"><a class="header" href="#typical-cli-usage">Typical CLI Usage</a></h2>
+<p>There is a small command line front-end in the
+<a href="https://github.com/triblespace/trible"><code>trible</code></a> repository. It exposes push
+and merge operations over simple commands and follows the same API presented in
+the examples. The tool is currently experimental and may lag behind the library,
+but it demonstrates how repository operations map onto a CLI.</p>
+<h2 id="diagram"><a class="header" href="#diagram">Diagram</a></h2>
+<p>A simplified view of the push/merge cycle:</p>
+<pre><code class="language-text">        ┌───────────┐         push          ┌───────────┐
+        │  local ws │ ─────────────────────▶│   repo    │
+        └─────┬─────┘                       └─────┬─────┘
+             │            merge                  │
+             │                                   │ conflict
+             └──────▶┌─────────────┐◀────────────┘
+                     │ conflict ws │
+                     └─────────────┘
+                          │
+                          │ push
+                          ▼
+                     ┌───────────┐
+                     │   repo    │
+                     └───────────┘
+</code></pre>
+<p>Each push either succeeds or returns a workspace containing the other changes.
+Merging incorporates your commits and the process repeats until no conflicts
+remain.</p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="commit-selectors"><a class="header" href="#commit-selectors">Commit Selectors</a></h1>
+<p>The current <code>Workspace::checkout</code> API accepts a <code>CommitSelector</code> trait which is
+implemented for individual handles and standard Rust ranges. While convenient,
+this range-based design makes it difficult to compose complex queries over the
+commit graph.</p>
+<p>A future redesign could mirror Git's revision selection semantics.
+Instead of passing ranges, callers would construct <em>commit sets</em> derived from
+reachability.  Primitive functions like <code>ancestors(&lt;commit&gt;)</code> and
+<code>descendants(&lt;commit&gt;)</code> would produce sets.  Higher level combinators such as
+<code>union</code>, <code>intersection</code> and <code>difference</code> would then let users express queries
+like "A minus B" or "ancestors of A intersect B".  The result of a selector
+would still be an ordered list of commits for <code>checkout</code> to load.</p>
+<p>This approach aligns with Git's mental model and keeps selection logic separate
+from workspace mutation.  It also opens the door for additional operations on
+commit sets without complicating the core API.</p>
+<h2 id="git-comparison"><a class="header" href="#git-comparison">Git Comparison</a></h2>
+<p>The table below summarizes Git's revision grammar. Each row links back to the
+official documentation. Forms that rely on reflogs or reference objects other
+than commits are listed for completeness but are unlikely to be implemented.</p>
+<div class="table-wrapper"><table><thead><tr><th>Git Syntax</th><th>Planned Equivalent</th><th>Reference</th><th>Status</th></tr></thead><tbody>
+<tr><td><code>A</code></td><td><code>commit(A)</code></td><td><a href="https://git-scm.com/docs/gitrevisions#_specifying_revisions">gitrevisions</a></td><td>Unimplemented</td></tr>
+<tr><td><code>A^</code>/<code>A^N</code></td><td><code>nth_parent(A, N)</code></td><td><a href="https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-revnegHEADv1510">gitrevisions</a></td><td>Unimplemented</td></tr>
+<tr><td><code>A~N</code></td><td><code>nth_ancestor(A, N)</code></td><td><a href="https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-revnegHEADmaster3">gitrevisions</a></td><td>Unimplemented</td></tr>
+<tr><td><code>A^@</code></td><td><code>parents(A)</code></td><td><a href="https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-revegHEAD">gitrevisions</a></td><td>Unimplemented</td></tr>
+<tr><td><code>A^!</code></td><td><code>A minus parents(A)</code></td><td><a href="https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-revegHEAD-1">gitrevisions</a></td><td>Unimplemented</td></tr>
+<tr><td><code>A^-N</code></td><td><code>A minus nth_parent(A, N)</code></td><td><a href="https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-rev-negHEAD-HEAD-2">gitrevisions</a></td><td>Unimplemented</td></tr>
+<tr><td><code>A^0</code></td><td><code>commit(A)</code></td><td><a href="https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-revnegHEADv1510">gitrevisions</a></td><td>Unimplemented</td></tr>
+<tr><td><code>A^{}</code></td><td><code>deref_tag(A)</code></td><td><a href="https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-revegv0998">gitrevisions</a></td><td>Unimplemented</td></tr>
+<tr><td><code>A^{type}</code></td><td><code>object_of_type(A, type)</code></td><td><a href="https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-revtypeegv0998commit">gitrevisions</a></td><td>Not planned: non-commit object</td></tr>
+<tr><td><code>A^{/text}</code></td><td><code>search_from(A, text)</code></td><td><a href="https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-revtextegHEADfixnastybug">gitrevisions</a></td><td>Not planned: requires commit message search</td></tr>
+<tr><td><code>:/text</code></td><td><code>search_repo(text)</code></td><td><a href="https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-textegfixnastybug">gitrevisions</a></td><td>Not planned: requires repository search</td></tr>
+<tr><td><code>A:path</code></td><td><code>blob_at(A, path)</code></td><td><a href="https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-revpathegHEADREADMEmasterREADME">gitrevisions</a></td><td>Not planned: selects a blob not a commit</td></tr>
+<tr><td><code>:[N:]path</code></td><td><code>index_blob(path, N)</code></td><td><a href="https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-npatheg0READMEREADME">gitrevisions</a></td><td>Not planned: selects from the index</td></tr>
+<tr><td><code>A..B</code></td><td><code>range(A, B)</code></td><td><a href="https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-Thetwo-dotRangeNotation">gitrevisions</a></td><td>Unimplemented</td></tr>
+<tr><td><code>A...B</code></td><td><code>symmetric_diff(A, B)</code></td><td><a href="https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-Thethree-dotSymmetricDifferenceNotation">gitrevisions</a></td><td>Unimplemented</td></tr>
+<tr><td><code>^A</code></td><td><code>exclude(reachable(A))</code></td><td><a href="https://git-scm.com/docs/gitrevisions#_commit_exclusions">gitrevisions</a></td><td>Unimplemented</td></tr>
+<tr><td><code>A@{upstream}</code></td><td><code>upstream_of(A)</code></td><td><a href="https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-branchnameupstreamegmasterupstreamu">gitrevisions</a></td><td>Not planned: depends on remote config</td></tr>
+<tr><td><code>A@{push}</code></td><td><code>push_target_of(A)</code></td><td><a href="https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-branchnamepushegmasterpushpush">gitrevisions</a></td><td>Not planned: depends on remote config</td></tr>
+<tr><td><code>A@{N}</code></td><td><code>reflog(A, N)</code></td><td><a href="https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-refnamenegmaster1">gitrevisions</a></td><td>Not planned: relies on reflog history</td></tr>
+<tr><td><code>A@{&lt;date&gt;}</code></td><td><code>reflog_at(A, date)</code></td><td><a href="https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-refnamedateegmasteryesterdayHEAD5minutesago">gitrevisions</a></td><td>Not planned: relies on reflog history</td></tr>
+<tr><td><code>@{N}</code></td><td><code>reflog(HEAD, N)</code></td><td><a href="https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-neg1">gitrevisions</a></td><td>Not planned: relies on reflog history</td></tr>
+<tr><td><code>@{-N}</code></td><td><code>previous_checkout(N)</code></td><td><a href="https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt--neg-1">gitrevisions</a></td><td>Not planned: relies on reflog history</td></tr>
+</tbody></table>
+</div>
+<p>Only a subset of Git's revision grammar will likely be supported. Selectors relying on reflog history, remote configuration, or searching commits and blobs add complexity with little benefit for workspace checkout. They are listed above for completeness but remain unplanned for now.</p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="deep-dive"><a class="header" href="#deep-dive">Deep Dive</a></h1>
+<p>This section contains in-depth discussions about Trible Space internals.</p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="philosophy"><a class="header" href="#philosophy">Philosophy</a></h1>
+<p>This section collects the more detailed discussions around the design of
+Trible Space and the reasoning behind certain choices. It is meant as an
+optional read for the curious.</p>
+<p>We prioritise a simple and predictable system over clever heuristics. Each
+component should be understandable on its own and interact cleanly with the
+rest of the stack.</p>
+<p>Developer experience is equally important. APIs aim to be straightforward and
+use synchronous building blocks that can be composed as needed.</p>
+<p>Finally, we strive for soundness and performance. Safety checks guard against
+invalid data while efficient data structures keep the core fast.</p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="identifiers-for-distributed-systems"><a class="header" href="#identifiers-for-distributed-systems">Identifiers for Distributed Systems</a></h1>
+<p>We found it useful to categorize identifiers along two axes:</p>
+<div class="table-wrapper"><table><thead><tr><th></th><th><strong>Abstract</strong></th><th><strong>Semantic</strong></th></tr></thead><tbody>
+<tr><td><strong>Intrinsic</strong></td><td>Hash, Signature, PubKey</td><td>embeddings</td></tr>
+<tr><td><strong>Extrinsic</strong></td><td>UUID, UFOID, FUCID</td><td>names, DOI, URL</td></tr>
+</tbody></table>
+</div>
+<h2 id="abstract-vs-semantic-identifiers"><a class="header" href="#abstract-vs-semantic-identifiers">Abstract vs. Semantic Identifiers</a></h2>
+<ul>
+<li>
+<p><strong>Semantic Identifiers (e.g., human-readable names, URLs, embeddings)</strong>
+These identifiers carry meaning and context about the entity they represent.
+This can make them them useful for human users,
+as they can convey information about the entity without requiring additional lookups.
+For example, a URL can provide information about the location of a resource,
+or a human readable name can provide information about the entity itself.
+Embeddings are a special case of semantic identifiers,
+as they represent the content of an entity in a way that can be compared to other entities.
+They are also more likely to change over time, as the context of the entity changes.
+This makes them less useful for identity, as they are not necessarily unique;
+their strength is to aid interpretation rather than define persistence.
+To avoid ambiguities and conflicts or the need for a central authority to manage them,
+semantic identifiers should always be explicitly scoped to a context,
+such as a namespace or system environment. This ensures that the
+same name can coexist in different contexts without collision or confusion.
+This scoping also addresses social challenges inherent in human-readable names:
+different users may prefer different names for the same entity.
+By allowing local names to reference persistent identifiers (extrinsic or intrinsic),
+each user can adopt their preferred naming conventions while maintaining
+a shared understanding of the underlying identity.</p>
+</li>
+<li>
+<p><strong>Abstract Identifiers (e.g., UUIDs, UFOIDs, FUCIDs, hashes, signatures)</strong><br />
+These identifiers provide abstract identity without imposing any semantic meaning or cultural connotations.
+They can be generated cheaply and without coordination, relying on high entropy to make collisions
+practically impossible, uniquely, globally, and persistently addressing an entity, regardless of its content or context.
+Abstract identifiers, when used to reference entities in a system, provide a stable and unique identity that is
+independent of the content or context of the entity. They are particularly useful in distributed systems, where
+they can be used to address entities across different nodes without requiring a central authority.</p>
+</li>
+</ul>
+<h2 id="intrinsic-vs-extrinsic-identifiers"><a class="header" href="#intrinsic-vs-extrinsic-identifiers">Intrinsic vs. Extrinsic Identifiers</a></h2>
+<ul>
+<li>
+<p><strong>Intrinsic Identifiers (e.g., hashes, signatures)</strong><br />
+These identifiers provide intrinsic identity by acting as unique fingerprints of the exact content they represent.
+Unlike abstract identifiers, intrinsic identifiers are directly tied to the data itself, ensuring immutability
+and self-validation.</p>
+<p>Intrinsic identifiers are generated by applying cryptographic functions to the content. Their entropy requirements
+are higher than those of abstract identifiers, as they must not only prevent accidental collisions but also
+withstand adversarial scenarios, such as deliberate attempts to forge data.</p>
+</li>
+<li>
+<p><strong>Extrinsic Identifiers (e.g., human-readable names, URLs, DOIs, UUIDs, UFOIDs, FUCIDs)</strong>
+These identifiers provide identity that is not tied to the content itself,
+but only by association. They are used to reference entities in a system, but do not
+provide any guarantees about the content or the entity itself.
+Allowing for continuity even as that entity may change or evolve.</p>
+</li>
+</ul>
+<p>Extrinsic identifiers and intrinsic identifiers represent different kinds of metaphysical identity.<br />
+For example, in the ship of Theseus thought experiment, both the original ship and the reconstructed ship<br />
+would share the same extrinsic identity but have different intrinsic identities.</p>
+<h2 id="embeddings-as-semantic-intrinsic-identifiers"><a class="header" href="#embeddings-as-semantic-intrinsic-identifiers">Embeddings as Semantic Intrinsic Identifiers</a></h2>
+<p>Note that embeddings are the somewhat curious case of semantic intrinsic identifiers.
+They are intrinsic in that they are tied to the content they represent, but they are also semantic in that they
+carry meaning about the content. Embeddings are used to represent the content of an entity in a way that can be
+compared to other entities, such as for similarity search or classification.
+This makes them especially interesting for search and retrieval systems, where they can be used to find similar
+entities based on a reference entity. But less useful for identity, as they are not necessarily unique.</p>
+<p>One thing that makes them especially interesting is that they can be used to compare entities across different
+systems or contexts, even if the entities themselves are not directly comparable. For example, you could compare
+the embeddings of a text document and an image to find similar content, even though the two entities are of
+different types.</p>
+<p>Furthermore they aid in the decentralization and commoditization of search and retrieval systems, as they allow
+for the relatively expensive process of generating embeddings to be done decoupled from the indexing and retrieval
+process. This allows for the embedding generation to be done once in a distributed manner, and then the embeddings
+can be used by any system that needs to compare entities. With the embeddings acting as a common language for
+comparing entities, different embeddings can be compared without needing to know about the specifics of each system.</p>
+<p>Contrastingly classic search and retrieval systems require a central authority to index and search the content,
+as the indexing process is tightly coupled with the indexed data. This makes it difficult to compare entities
+across different systems, as each system has its own index and retrieval process.
+It also makes merging indexes virtually impossible, as the indexes are tightly coupled with the structure of the data they index.</p>
+<h2 id="high-entropy-identifiers"><a class="header" href="#high-entropy-identifiers">High-Entropy Identifiers</a></h2>
+<p>For a truly distributed system, the creation of identifiers must avoid the bottlenecks and overhead associated
+with a central coordinating authority. At the same time, we must ensure that these identifiers are unique.</p>
+<p>To guarantee uniqueness, we use abstract identifiers containing a large amount of entropy, making collisions
+statistically irrelevant. However, the entropy requirements differ based on the type of identifier:</p>
+<ul>
+<li><strong>Extrinsic abstract identifiers</strong> need enough entropy to prevent accidental collisions in normal operation.</li>
+<li><strong>Intrinsic abstract identifiers</strong> must also resist adversarial forging attempts, requiring significantly higher entropy.</li>
+</ul>
+<p>From an information-theoretic perspective, the length of an identifier determines the maximum amount of
+entropy it can encode. For example, a 128-bit identifier can represent ( 2^{128} ) unique values, which is
+sufficient to make collisions statistically negligible even for large-scale systems.</p>
+<p>For intrinsic identifiers, 256 bits is widely considered sufficient when modern cryptographic hash functions
+(e.g., SHA-256) are used. These hash functions provide strong guarantees of collision resistance, preimage
+resistance, and second-preimage resistance. Even in the event of weaknesses being discovered in a specific
+algorithm, it is more practical to adopt a new hash function than to increase the bit size of identifiers.</p>
+<p>Additionally, future advances such as quantum computing are unlikely to undermine this length. Grover's algorithm
+would halve the effective security of a 256-bit hash, reducing it to ( 2^{128} ) operations—still infeasible with
+current or theoretical technology. As a result, 256 bits remains a future-proof choice for intrinsic identifiers.</p>
+<p>Such 256-bit intrinsic identifiers are represented by the types
+<a href="crate::value::schemas::hash::Hash"><code>tribles::value::schemas::hash::Hash</code></a> and
+<a href="crate::value::schemas::hash::Handle"><code>tribles::value::schemas::hash::Handle</code></a>.</p>
+<p>Additionally, we define three types of high-entropy abstract identifiers to address different requirements:<br />
+<strong>RNGID, UFOID, and FUCID.</strong> Each balances trade-offs between entropy, locality, compression, and
+predictability, as summarized below.</p>
+<h2 id="comparison-of-identifier-types"><a class="header" href="#comparison-of-identifier-types">Comparison of Identifier Types</a></h2>
+<div class="table-wrapper"><table><thead><tr><th></th><th><a href="rngid::rngid">RNGID</a></th><th><a href="ufoid::ufoid">UFOID</a></th><th><a href="fucid::fucid">FUCID</a></th></tr></thead><tbody>
+<tr><td>Entropy</td><td>High</td><td>High</td><td>Low</td></tr>
+<tr><td>Locality</td><td>None</td><td>High</td><td>High</td></tr>
+<tr><td>Compression</td><td>None</td><td>Low</td><td>High</td></tr>
+<tr><td>Predictability</td><td>None</td><td>Low</td><td>Mid</td></tr>
+</tbody></table>
+</div>
+<h1 id="example-scientific-publishing"><a class="header" href="#example-scientific-publishing">Example: Scientific Publishing</a></h1>
+<p>Consider the case of published scientific papers. Each artifact, such as a <code>.html</code> or <code>.pdf</code> file,
+should be identified by its abstract intrinsic identifier, typically a cryptographic hash of its content.
+This ensures that any two entities referencing the same hash are referring to the exact same version
+of the artifact, providing immutability and validation.</p>
+<p>Across different versions of the same paper, an abstract extrinsic identifier can be used to tie these
+artifacts together as part of one logical entity. The identifier provides continuity,
+regardless of changes to the paper’s content over time.</p>
+<p>Semantic (human-readable) identifiers, such as abbreviations in citations or bibliographies, are scoped to
+individual papers and provide context-specific usability for readers. These names do not convey
+identity but serve as a way for humans to reference the persistent abstract identifiers that underlie the system.</p>
+<p>Sadly the identifiers used in practice, such as DOIs, fail to align with these principles and strengths.
+They attempt to provide global extrinsic semantic identifiers for scientific papers,
+an ultimately flawed approach. They lack the associated guarantees of intrinsic identifiers
+and bring all the challenges of semantic identifiers. With their scope defined too broadly,
+and their authority centralized, they fail to live up to the potential of distributed systems.</p>
+<h1 id="id-ownership"><a class="header" href="#id-ownership">ID Ownership</a></h1>
+<p>In distributed systems, consistency requires monotonicity due to the CALM principle.
+However, this is not necessary for single writer systems. By assigning each ID an owner,
+we ensure that only the current owner can write new information about an entity associated
+with that ID. This allows for fine-grained synchronization and concurrency control.</p>
+<p>To create a transaction, you can uniquely own all entities involved and write new data for them
+simultaneously. Since there can only be one owner for each ID at any given time, you can be
+confident that no other information has been written about the entities in question.</p>
+<p>By default, all minted <code>ExclusiveId</code>s are associated with the thread they are dropped from.
+These IDs can be found in queries via the <code>local_ids</code> function.</p>
+<h2 id="ownership-and-eventual-consistency"><a class="header" href="#ownership-and-eventual-consistency">Ownership and Eventual Consistency</a></h2>
+<p>While a simple grow set like the history stored in a <a href="crate::remote::Head">Head</a>
+already constitutes a conflict-free replicated data type (CRDT), it is also limited in expressiveness.
+To provide richer semantics while guaranteeing conflict-free mergeability we allow only
+"owned" IDs to be used in the <code>entity</code> position of newly generated triples.
+As owned IDs are [Send] but not [Sync] owning a
+set of them essentially constitutes a single writer transaction domain,
+allowing for some non-monotonic operations like <code>if-does-not-exist</code>, over
+the set of contained entities. Note that this does not make operations that
+would break CALM (consistency as logical monotonicity) safe, e.g. <code>delete</code>.</p>
+<div style="break-before: page; page-break-before: always;"></div><p>The <code>trible</code> module contains the definition of the <code>Trible</code> struct, which is the fundamental unit of knowledge in the knowledge graph.
+Instance of <code>Trible</code>s are stored in <code>TribleSet</code>s which index the trible in various ways, allowing for efficient querying and retrieval of data.</p>
+<pre><code class="language-text">┌────────────────────────────64 byte───────────────────────────┐
+┌──────────────┐┌──────────────┐┌──────────────────────────────┐
+│  entity-id   ││ attribute-id ││        inlined value         │
+└──────────────┘└──────────────┘└──────────────────────────────┘
+└────16 byte───┘└────16 byte───┘└────────────32 byte───────────┘
+─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─▶
+</code></pre>
+<h1 id="direction-and-consistency"><a class="header" href="#direction-and-consistency">Direction and Consistency</a></h1>
+<p>In other triple stores the direction of the edge drawn by a triple is often
+choosen incidentally, e.g. there is no intrinsic preference for <code>hasColor</code> over
+<code>colorOf</code>. This can lead to confusion and inconsistency in the graph, as
+different writers might choose different directions for the same edge.
+This is typically solved by:</p>
+<ul>
+<li>Automatically inferring the opposite edge for every edge inserted,
+as done by OWL and RDF with the <code>inverseOf</code> predicate. Leading to a
+doubling of the number of edges in the graph or inference at query time.</li>
+<li>Endless bikeshedding about the "right" direction of edges.</li>
+</ul>
+<p>In the <code>tribles</code> crate we solve this problem by giving the direction of the edge
+an explicit semantic meaning: The direction of the edge indicates which entity
+is the one making the statement, i.e. which entity is observing the fact
+or proclaiming the relationship. This is a simple and consistent rule that
+naturally fits into a distributed system, where each entity is associated with
+a single writer that is responsible the consistency of the facts it asserts.</p>
+<ul>
+<li>see <a href="crate::id">ID Ownership</a>.</li>
+</ul>
+<p>A different perspective is that edges are always ordered from describing
+to described entities, with circles constituting consensus between them.</p>
+<p>For example, the edge <code>hasColor</code> is always drawn from the entity that has
+the color to the entity that represents the color. This makes the direction
+of the edge a natural consequence of the semantics of the edge, and not
+an arbitrary choice.</p>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="pile-format"><a class="header" href="#pile-format">Pile Format</a></h1>
+<p>The on-disk pile keeps every blob and branch in one append-only file. This layout provides a simple <strong>write-ahead log</strong> style database where new data is only appended. It allows both blob and branch storage in a single file while remaining resilient to crashes. The pile file can be memory mapped for fast reads and is safely shared between threads.</p>
+<p>While large databases often avoid <code>mmap</code> due to pitfalls with partial writes
+and page cache thrashing [<a href="https://db.cs.cmu.edu/mmap-cidr2022/">1</a>], this
+design works well for the pile's narrow usage pattern.</p>
+<h2 id="design-rationale"><a class="header" href="#design-rationale">Design Rationale</a></h2>
+<p>This format emphasizes <strong>simplicity</strong> over sophisticated on-disk structures.
+Appending new blobs rather than rewriting existing data keeps corruption
+windows small and avoids complicated page management. Storing everything in a
+single file makes a pile easy to back up or replicate over simple transports
+while still allowing it to be memory mapped for fast reads. The 64 byte
+alignment ensures each entry begins on a cache line boundary, which improves
+concurrent access patterns and allows safe typed views with the <code>zerocopy</code>
+crate.</p>
+<p>Hash verification only happens when blobs are read. Opening even a very large
+pile is therefore fast while still catching corruption before data is used.</p>
+<p>Every record begins with a 16 byte magic marker that identifies whether it
+stores a blob or a branch. The sections below illustrate the layout of each
+type.</p>
+<h2 id="blob-storage-1"><a class="header" href="#blob-storage-1">Blob Storage</a></h2>
+<pre><code>                             8 byte  8 byte
+            ┌────16 byte───┐┌──────┐┌──────┐┌────────────32 byte───────────┐
+          ┌ ┌──────────────┐┌──────┐┌──────┐┌──────────────────────────────┐
+ header   │ │magic number A││ time ││length││             hash             │
+          └ └──────────────┘└──────┘└──────┘└──────────────────────────────┘
+            ┌────────────────────────────64 byte───────────────────────────┐
+          ┌ ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┐
+          │ │                                                              │
+ payload  │ │              bytes (64byte aligned and padded)               │
+          │ │                                                              │
+          └ └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┘
+</code></pre>
+<p>Each blob entry records its creation timestamp, the length of the payload and
+its hash. The payload is padded so the next record begins on a
+64 byte boundary.</p>
+<h2 id="branch-storage"><a class="header" href="#branch-storage">Branch Storage</a></h2>
+<pre><code>            ┌────16 byte───┐┌────16 byte───┐┌────────────32 byte───────────┐
+          ┌ ┌──────────────┐┌──────────────┐┌──────────────────────────────┐
+ header   │ │magic number B││  branch id   ││             hash             │
+          └ └──────────────┘└──────────────┘└──────────────────────────────┘
+</code></pre>
+<p>Branch entries map a branch identifier to the hash of a blob.</p>
+<h2 id="recovery"><a class="header" href="#recovery">Recovery</a></h2>
+<p>When [<code>Pile::try_open</code>] scans an existing file it checks that every header uses a known marker and that the whole record fits. It does not verify any hashes. If a truncated or unknown block is found the function reports the number of bytes that were valid so far using [<code>OpenError::CorruptPile</code>].</p>
+<p>The convenience wrapper [<code>Pile::open</code>] re-runs the same validation and truncates
+the file to the valid length if corruption is encountered. This recovers from
+interrupted writes by discarding incomplete data.
+Hash verification happens lazily only when individual blobs are loaded so that
+opening a large pile remains fast.</p>
+<p>For more details on interacting with a pile see the <a href="https://docs.rs/tribles/latest/tribles/repo/pile/struct.Pile.html"><code>Pile</code> struct
+documentation</a>.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr.min.js"></script>
+        <script src="mark.min.js"></script>
+        <script src="searcher.js"></script>
+
+        <script src="clipboard.min.js"></script>
+        <script src="highlight.js"></script>
+        <script src="book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+        <script>
+        window.addEventListener('load', function() {
+            window.setTimeout(window.print, 100);
+        });
+        </script>
+
+
+    </div>
+    </body>
+</html>
