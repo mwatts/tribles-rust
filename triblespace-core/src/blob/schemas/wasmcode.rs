@@ -39,8 +39,7 @@ impl ConstDescribe for WasmCode {
                 metadata::name: blobs.put("wasmcode".to_string())?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_BLOB_SCHEMA,
-        }
-        )
+        })
     }
 }
 

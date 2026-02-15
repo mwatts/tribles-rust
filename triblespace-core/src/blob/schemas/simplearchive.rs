@@ -39,8 +39,7 @@ impl ConstDescribe for SimpleArchive {
                 metadata::name: blobs.put("simplearchive".to_string())?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_BLOB_SCHEMA,
-        }
-        )
+        })
     }
 }
 

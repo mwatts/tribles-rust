@@ -68,8 +68,7 @@ impl ConstDescribe for SuccinctArchiveBlob {
                 metadata::name: blobs.put("succinctarchive".to_string())?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_BLOB_SCHEMA,
-        }
-        )
+        })
     }
 }
 
