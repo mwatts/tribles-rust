@@ -462,8 +462,8 @@ where
         parse_number_common(bytes)
     }
 
-    pub fn metadata(&mut self) -> Result<TribleSet, Store::PutError> {
-        let mut meta = TribleSet::new();
+    pub fn metadata(&mut self) -> Result<Fragment, Store::PutError> {
+        let mut meta = Fragment::default();
         meta += <Boolean as ConstDescribe>::describe(self.store)?;
         meta += <F64 as ConstDescribe>::describe(self.store)?;
         meta += <GenId as ConstDescribe>::describe(self.store)?;
@@ -650,7 +650,11 @@ mod tests {
         let roots = fragment.exports().collect::<Vec<_>>();
         assert_eq!(roots.len(), 1);
         assert_eq!(fragment.facts().len(), 2);
-        assert!(!importer.metadata().expect("metadata set").is_empty());
+        assert!(!importer
+            .metadata()
+            .expect("metadata set")
+            .facts()
+            .is_empty());
     }
 
     fn extract_handle_raw(facts: &TribleSet, expected_attr: &str) -> RawValue {

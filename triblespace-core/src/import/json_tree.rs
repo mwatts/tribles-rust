@@ -74,11 +74,11 @@ pub const kind_field: Id = id_hex!("890FC1F34B9FAD18F93E6EDF1B69A1A2");
 #[allow(non_upper_case_globals)]
 pub const kind_array_entry: Id = id_hex!("EB325EABEA8C35DE7E5D700A5EF9207B");
 
-pub fn build_json_tree_metadata<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+pub fn build_json_tree_metadata<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
 where
     B: BlobStore<Blake3>,
 {
-    let mut metadata = TribleSet::new();
+    let mut metadata = Fragment::default();
     let name = |value: &'static str| {
         Bytes::from_source(value)
             .view::<str>()
@@ -155,14 +155,13 @@ fn describe_kind<B>(
     kind_id: Id,
     name: &str,
     description: &str,
-) -> Result<TribleSet, B::PutError>
+) -> Result<Fragment, B::PutError>
 where
     B: BlobStore<Blake3>,
 {
-    let mut tribles = TribleSet::new();
     let name_handle = blobs.put(name.to_owned())?;
 
-    tribles += entity! { ExclusiveId::force_ref(&kind_id) @
+    let tribles = entity! { ExclusiveId::force_ref(&kind_id) @
         metadata::name: name_handle,
         metadata::description: blobs.put(description.to_owned())?,
     };
@@ -226,7 +225,7 @@ where
         Ok(Fragment::rooted(root, data))
     }
 
-    pub fn metadata(&mut self) -> Result<TribleSet, Store::PutError> {
+    pub fn metadata(&mut self) -> Result<Fragment, Store::PutError> {
         build_json_tree_metadata(self.store)
     }
 

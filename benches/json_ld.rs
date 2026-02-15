@@ -137,8 +137,8 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
             .import_blob(import_blob.clone())
             .expect("import JSON-LD as JSON");
         let roots = fragment.exports().collect::<Vec<_>>();
-        let mut merged = importer.metadata().expect("metadata set");
-        merged += fragment;
+        let mut merged = importer.metadata().expect("metadata set").into_facts();
+        merged += fragment.into_facts();
         let reader = blobs.reader().expect("reader");
         let payload_len = import_payload.len();
 
@@ -186,8 +186,8 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
                 .import_blob(blob.clone())
                 .expect("import JSON-LD as JSON");
             let roots = fragment.exports().collect::<Vec<_>>();
-            let mut merged = importer.metadata().expect("metadata set");
-            merged += fragment;
+            let mut merged = importer.metadata().expect("metadata set").into_facts();
+            merged += fragment.into_facts();
             let reader = blobs.reader().expect("reader");
             let exported = if roots.len() == 1 {
                 let mut out = String::new();

@@ -68,9 +68,9 @@ fn prepare_fixtures() -> Vec<PreparedFixture> {
                     .root()
                     .expect("fixture payload imports as a single rooted object");
 
-                let mut merged = importer.metadata().expect("metadata set");
+                let mut merged = importer.metadata().expect("metadata set").into_facts();
                 let data_tribles = fragment.len();
-                merged += fragment;
+                merged += fragment.into_facts();
                 (merged, root, data_tribles)
             };
 
@@ -243,8 +243,8 @@ fn bench_tribles_roundtrip_elements(c: &mut Criterion, fixtures: &[PreparedFixtu
                         let root = fragment
                             .root()
                             .expect("fixture payload imports as a single rooted object");
-                        let mut merged = importer.metadata().expect("metadata set");
-                        merged += fragment;
+                        let mut merged = importer.metadata().expect("metadata set").into_facts();
+                        merged += fragment.into_facts();
                         (merged, root)
                     };
                     let reader = blobs.reader().expect("reader");
@@ -279,8 +279,8 @@ fn bench_tribles_roundtrip_bytes(c: &mut Criterion, fixtures: &[PreparedFixture]
                         let root = fragment
                             .root()
                             .expect("fixture payload imports as a single rooted object");
-                        let mut merged = importer.metadata().expect("metadata set");
-                        merged += fragment;
+                        let mut merged = importer.metadata().expect("metadata set").into_facts();
+                        merged += fragment.into_facts();
                         (merged, root)
                     };
                     let reader = blobs.reader().expect("reader");
