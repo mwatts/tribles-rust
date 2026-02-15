@@ -82,7 +82,7 @@ impl AttributeUsage {
         &self,
         blobs: &mut B,
         attribute_id: crate::id::Id,
-    ) -> Result<TribleSet, B::PutError>
+    ) -> Result<Fragment, B::PutError>
     where
         B: crate::repo::BlobStore<Blake3>,
     {
@@ -107,7 +107,7 @@ impl AttributeUsage {
             metadata::tag: metadata::KIND_ATTRIBUTE_USAGE,
         };
 
-        Ok(tribles)
+        Ok(Fragment::rooted(usage_id, tribles))
     }
 }
 /// A typed reference to an attribute id together with its value schema.
