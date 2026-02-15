@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- JSON importer metadata builders now return `Fragment`:
+  - `import::json::JsonObjectImporter::metadata`
+  - `import::json_tree::JsonTreeImporter::metadata`
+  - `import::json_tree::build_json_tree_metadata`
+
 ## [0.15.0] - 2026-02-15
 ### Changed
 - Cleanup/polish after 0.14.0: fixed benches and minor clippy lints, and added

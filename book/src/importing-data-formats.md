@@ -35,9 +35,10 @@ Arrays are treated as multi-valued fields; every element becomes its own trible
 under the same attribute identifier. Nested objects recurse automatically,
 linking parent to child entities through `GenId` attributes derived from the
 containing field name. After one or more imports, call `metadata()` to retrieve
-attribute descriptors and multi-value hints (a `metadata::tag` edge pointing to
-`metadata::KIND_MULTI`). Use `clear()` when you need a completely fresh run
-(drop the per-field attribute caches and multi-value tracking).
+metadata as a `Fragment` exporting the derived attribute ids. The fragment
+contains attribute descriptors plus multi-value hints (a `metadata::tag` edge
+pointing to `metadata::KIND_MULTI`). Use `clear()` when you need a completely
+fresh run (drop the per-field attribute caches and multi-value tracking).
 
 ## Mapping JSON Fields to Attributes
 
@@ -49,8 +50,10 @@ encoded and stored under the same attribute identifier, producing one trible per
 element.
 
 After an import completes the importer regenerates metadata from its cached
-attribute map. The returned `Fragment` contains the emitted facts; call
-`metadata()` to retrieve attribute descriptors and multi-value hints (via
+attribute map. The `import_*` call returns a `Fragment` exporting the root
+entity id(s) for the imported document and containing the emitted facts; call
+`metadata()` to retrieve a separate `Fragment` exporting the derived attribute
+ids and containing attribute descriptors plus multi-value hints (via
 `metadata::tag` pointing to `metadata::KIND_MULTI`). Merge those descriptors
 into your repository alongside the imported facts when you want queries to
 discover the original JSON field names or project datasets by schema without
@@ -106,8 +109,8 @@ still layer semantic projections on top.
 
 Each `import_*` call returns a rooted `Fragment` containing the JSON AST facts.
 Merge fragments when you ingest multiple documents. `metadata()` returns a
-fixed set of schema descriptors for the `json_tree::*` attributes and kinds; you
-typically merge it once alongside your lossless archive.
+fixed `Fragment` exporting the schema ids for the `json_tree::*` attributes and
+kinds. You typically merge it once alongside your lossless archive.
 
 ## Managing Entity Identifiers
 
