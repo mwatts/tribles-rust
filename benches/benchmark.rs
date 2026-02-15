@@ -484,7 +484,7 @@ fn entities_benchmark(c: &mut Criterion) {
                              },
                         ]
                     })
-                    .fold(TribleSet::new(), |kb, set| kb + set.into_facts());
+                    .fold(TribleSet::new(), |kb, set| kb + set);
                 kb
             })
         });
@@ -581,7 +581,7 @@ fn entities_benchmark(c: &mut Criterion) {
                                      },
                                 ]
                             })
-                            .fold(TribleSet::new(), |kb, set| kb + set.into_facts())
+                            .fold(TribleSet::new(), |kb, set| kb + set)
                     })
                     .collect();
                 b.iter(|| {

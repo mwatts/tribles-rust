@@ -157,7 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Stage a non-monotonic update that we plan to reconcile manually.
     ws.commit(
-        entity! { &author_id @ literature::firstname: "Francis" }.into_facts(),
+        entity! { &author_id @ literature::firstname: "Francis" },
         None,
         Some("use pen name"),
     );
@@ -167,7 +167,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .pull(*branch_id)
         .expect("pull collaborator workspace");
     collaborator.commit(
-        entity! { &author_id @ literature::firstname: "Franklin" }.into_facts(),
+        entity! { &author_id @ literature::firstname: "Franklin" },
         None,
         Some("record legal first name"),
     );
@@ -196,7 +196,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .expect("merge conflicting history");
 
         ws.commit(
-            entity! { &author_id @ literature::alias: "Francis" }.into_facts(),
+            entity! { &author_id @ literature::alias: "Francis" },
             None,
             Some("keep pen-name as an alias"),
         );

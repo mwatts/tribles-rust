@@ -30,7 +30,7 @@ fn exports_json_with_cardinality_hints() {
         .expect("payload should import as a single rooted object");
 
     let mut merged = importer.metadata().expect("metadata set");
-    merged += fragment.into_facts();
+    merged += fragment;
 
     let reader = blobs.reader().expect("reader");
 
@@ -88,7 +88,7 @@ fn exports_openai_like_conversation() {
         .expect("payload should import as a single rooted object");
 
     let mut merged = importer.metadata().expect("metadata set");
-    merged += fragment.into_facts();
+    merged += fragment;
 
     let reader = blobs.reader().expect("reader");
 

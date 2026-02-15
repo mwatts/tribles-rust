@@ -138,7 +138,7 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
             .expect("import JSON-LD as JSON");
         let roots = fragment.exports().collect::<Vec<_>>();
         let mut merged = importer.metadata().expect("metadata set");
-        merged += fragment.into_facts();
+        merged += fragment;
         let reader = blobs.reader().expect("reader");
         let payload_len = import_payload.len();
 
@@ -172,8 +172,7 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
             let fragment = importer
                 .import_blob(blob.clone())
                 .expect("import JSON-LD as JSON");
-            let facts = fragment.into_facts();
-            let archive = SimpleArchive::blob_from(&facts);
+            let archive = SimpleArchive::blob_from(&fragment);
             hint::black_box(archive.bytes.len());
         });
     });
@@ -188,7 +187,7 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
                 .expect("import JSON-LD as JSON");
             let roots = fragment.exports().collect::<Vec<_>>();
             let mut merged = importer.metadata().expect("metadata set");
-            merged += fragment.into_facts();
+            merged += fragment;
             let reader = blobs.reader().expect("reader");
             let exported = if roots.len() == 1 {
                 let mut out = String::new();

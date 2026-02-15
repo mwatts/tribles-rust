@@ -319,7 +319,7 @@ repo.push(&mut ws)?;
 - TribleSet: the in-memory content snapshot returned by Workspace::checkout.
 - find!: the macro you use to discover entities matching a pattern (a
   descriptive type declaration).
-- entity!: construct an ad-hoc entity fragment (facts + exported id). Merge it into a TribleSet via `+=` or call `.into_facts()` when you need a plain TribleSet (for example to `commit`).
+- entity!: construct an ad-hoc entity fragment (facts + exported id). Merge it into a TribleSet via `+=` or call `.into_facts()` when you explicitly need a plain TribleSet (dropping exports).
 - LongString: zero-copy blob schema for potentially-large text.
 
 ## Closing notes
