@@ -161,7 +161,7 @@ where
             metadata::value_formatter: blobs.put(wasm_formatter::HASH_HEX_WASM)?,
         };
         tribles
-    }
+    };
 
     Ok(tribles)
 }
