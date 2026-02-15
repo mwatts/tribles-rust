@@ -225,7 +225,7 @@ where
         match bytes.peek_token() {
             Some(b'{') => {
                 let (root, obj_staged) = self.parse_object(&mut bytes)?;
-                staged.union(obj_staged);
+                staged += obj_staged;
                 roots.push(root.forget());
             }
             Some(b'[') => {
@@ -240,7 +240,7 @@ where
                             return Err(JsonImportError::PrimitiveRoot);
                         }
                         let (root, obj_staged) = self.parse_object(&mut bytes)?;
-                        staged.union(obj_staged);
+                        staged += obj_staged;
                         roots.push(root.forget());
                         self.skip_ws(&mut bytes);
                         match bytes.peek_token() {
@@ -380,7 +380,7 @@ where
             }
             Some(b'{') => {
                 let (child, child_staged) = self.parse_object(bytes)?;
-                staged.union(child_staged);
+                *staged += child_staged;
                 let attr = self.genid_attr(field)?;
                 let value = GenId::value_from(&child);
                 pairs.push((attr.raw(), value.raw));
@@ -464,12 +464,10 @@ where
 
     pub fn metadata(&mut self) -> Result<TribleSet, Store::PutError> {
         let mut meta = TribleSet::new();
-        meta.union(<Boolean as ConstDescribe>::describe(self.store)?);
-        meta.union(<F64 as ConstDescribe>::describe(self.store)?);
-        meta.union(<GenId as ConstDescribe>::describe(self.store)?);
-        meta.union(<Handle<Blake3, LongString> as ConstDescribe>::describe(
-            self.store,
-        )?);
+        meta += <Boolean as ConstDescribe>::describe(self.store)?;
+        meta += <F64 as ConstDescribe>::describe(self.store)?;
+        meta += <GenId as ConstDescribe>::describe(self.store)?;
+        meta += <Handle<Blake3, LongString> as ConstDescribe>::describe(self.store)?;
         for (key, attr) in self.bool_attrs.iter() {
             meta += attr.describe(self.store)?;
             if self.array_fields.contains(key) {

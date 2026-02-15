@@ -1885,7 +1885,7 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
                     .get(c)
                     .or_else(|_| self.base_blobs.get(c))
                     .map_err(WorkspaceCheckoutError::Storage)?;
-                result.union(set);
+                result += set;
             } else {
                 // No content for this commit (e.g. merge-only commit); skip it.
                 continue;
@@ -1924,7 +1924,7 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
                     .get(c)
                     .or_else(|_| self.base_blobs.get(c))
                     .map_err(WorkspaceCheckoutError::Storage)?;
-                result.union(set);
+                result += set;
             }
         }
         Ok(result)
@@ -1961,7 +1961,7 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
                     .get(c)
                     .or_else(|_| self.base_blobs.get(c))
                     .map_err(WorkspaceCheckoutError::Storage)?;
-                data.union(set);
+                data += set;
             }
 
             let metadata_opt =
@@ -1976,7 +1976,7 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
                     .get(c)
                     .or_else(|_| self.base_blobs.get(c))
                     .map_err(WorkspaceCheckoutError::Storage)?;
-                metadata_set.union(set);
+                metadata_set += set;
             }
         }
         Ok((data, metadata_set))

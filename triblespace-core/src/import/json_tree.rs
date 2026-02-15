@@ -85,12 +85,10 @@ where
             .expect("static JSON attribute names are valid UTF-8")
     };
 
-    metadata.union(<GenId as ConstDescribe>::describe(blobs)?);
-    metadata.union(<Boolean as ConstDescribe>::describe(blobs)?);
-    metadata.union(<U256BE as ConstDescribe>::describe(blobs)?);
-    metadata.union(<Handle<Blake3, LongString> as ConstDescribe>::describe(
-        blobs,
-    )?);
+    metadata += <GenId as ConstDescribe>::describe(blobs)?;
+    metadata += <Boolean as ConstDescribe>::describe(blobs)?;
+    metadata += <U256BE as ConstDescribe>::describe(blobs)?;
+    metadata += <Handle<Blake3, LongString> as ConstDescribe>::describe(blobs)?;
 
     metadata +=
         ImportAttribute::<GenId>::from_raw(kind.raw(), Some(name("json.kind"))).describe(blobs)?;

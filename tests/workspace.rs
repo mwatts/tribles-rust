@@ -68,7 +68,7 @@ fn workspace_checkout_unions_commits() {
     let result = ws.checkout(&[c1, c2][..]).expect("checkout");
 
     let mut expected = s1;
-    expected.union(s2);
+    expected += s2;
 
     assert_eq!(result, expected);
 }
@@ -124,7 +124,7 @@ fn workspace_checkout_vec_commits() {
 
     let mut expected = TribleSet::new();
     for s in sets {
-        expected.union(s);
+        expected += s;
     }
 
     assert_eq!(result, expected);
@@ -165,7 +165,7 @@ fn workspace_checkout_metadata_unions_commits() {
         .expect("checkout metadata");
 
     let mut expected = m1;
-    expected.union(m2);
+    expected += m2;
 
     assert_eq!(result, expected);
 }
@@ -334,11 +334,11 @@ fn workspace_checkout_range_variants() {
     let (c1, c2, c3) = (handles[0], handles[1], handles[2]);
 
     let mut s1s2 = sets[0].clone();
-    s1s2.union(sets[1].clone());
+    s1s2 += sets[1].clone();
     let mut s2s3 = sets[1].clone();
-    s2s3.union(sets[2].clone());
+    s2s3 += sets[2].clone();
     let mut s1s2s3 = s1s2.clone();
-    s1s2s3.union(sets[2].clone());
+    s1s2s3 += sets[2].clone();
 
     assert_eq!(ws.checkout(c1..c3).unwrap(), s2s3.clone());
     assert_eq!(ws.checkout(c2..).unwrap(), sets[2].clone());
@@ -416,7 +416,7 @@ fn workspace_checkout_range_stops_at_explicit_boundaries() {
     let result = ws.checkout(c_a..c_b).expect("checkout");
 
     let mut expected = root_set.clone();
-    expected.union(child_b_set);
+    expected += child_b_set;
 
     assert_eq!(result, expected);
 }
@@ -446,7 +446,7 @@ fn workspace_checkout_symmetric_diff() {
 
     let (c1, _c2, c3) = (handles[0], handles[1], handles[2]);
     let mut expected = sets[1].clone();
-    expected.union(sets[2].clone());
+    expected += sets[2].clone();
 
     assert_eq!(ws.checkout(symmetric_diff(c1, c3)).unwrap(), expected);
 }
@@ -480,14 +480,14 @@ fn workspace_checkout_set_operation_selectors() {
         .checkout(union(handles[0], handles[2]))
         .expect("checkout union");
     let mut union_expected = sets[0].clone();
-    union_expected.union(sets[2].clone());
+    union_expected += sets[2].clone();
     assert_eq!(union_result, union_expected);
 
     let intersect_result = ws
         .checkout(intersect(ancestors(head), ancestors(handles[1])))
         .expect("checkout intersect");
     let mut intersect_expected = sets[0].clone();
-    intersect_expected.union(sets[1].clone());
+    intersect_expected += sets[1].clone();
     assert_eq!(intersect_result, intersect_expected);
 
     let difference_result = ws
@@ -551,8 +551,8 @@ fn workspace_checkout_head_collects_history() {
     let result = ws.checkout(ancestors(head)).expect("checkout history");
 
     let mut expected = sets[0].clone();
-    expected.union(sets[1].clone());
-    expected.union(sets[2].clone());
+    expected += sets[1].clone();
+    expected += sets[2].clone();
 
     assert_eq!(result, expected);
 }
@@ -639,7 +639,7 @@ fn workspace_parents_selector() {
         .expect("checkout parents");
 
     let mut expected = s1;
-    expected.union(s2);
+    expected += s2;
 
     assert_eq!(result, expected);
 }
@@ -674,7 +674,7 @@ fn workspace_history_of_entity() {
     let result = ws.checkout(history_of(*entity)).expect("history_of");
 
     let mut expected = s1;
-    expected.union(s3);
+    expected += s3;
 
     assert_eq!(result, expected);
 }
