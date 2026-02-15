@@ -25,14 +25,14 @@ fn objectstore_metadata_and_forget_file_backend() -> Result<(), Box<dyn std::err
     use triblespace::prelude::BlobStore;
 
     let reader = remote.reader()?;
-    let meta = reader.metadata(handle.clone())?;
+    let meta = reader.metadata(handle)?;
     assert!(meta.is_some());
     let meta = meta.unwrap();
     assert_eq!(meta.length, contents.len() as u64);
 
     // forget removes the blob and is idempotent
-    remote.forget(handle.clone())?;
-    let meta2 = reader.metadata(handle.clone())?;
+    remote.forget(handle)?;
+    let meta2 = reader.metadata(handle)?;
     assert!(meta2.is_none());
     // second call should succeed as well
     remote.forget(handle)?;

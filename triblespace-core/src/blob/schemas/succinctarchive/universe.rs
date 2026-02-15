@@ -32,6 +32,9 @@ pub trait Universe: Serializable {
     fn access(&self, pos: usize) -> RawValue;
     fn search(&self, v: &RawValue) -> Option<usize>;
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +82,11 @@ impl OrderedUniverse {
     #[inline]
     pub fn len(&self) -> usize {
         self.values.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
     }
 }
 

@@ -522,7 +522,7 @@ where
 
 fn hash_chunk<H: Digest>(hasher: &mut H, bytes: &[u8]) {
     let len = (bytes.len() as u64).to_be_bytes();
-    hasher.update(&len);
+    hasher.update(len);
     hasher.update(bytes);
 }
 

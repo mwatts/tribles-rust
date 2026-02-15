@@ -38,7 +38,7 @@ impl Error for WasmModuleError {
 }
 
 pub fn compile_module(wasm: &[u8]) -> Result<Module, WasmModuleError> {
-    Module::new(&*ENGINE, wasm).map_err(WasmModuleError::Compile)
+    Module::new(&ENGINE, wasm).map_err(WasmModuleError::Compile)
 }
 
 impl crate::blob::TryFromBlob<WasmCode> for Module {

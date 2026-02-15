@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-02-15
+### Changed
+- Cleanup/polish after 0.14.0: fixed benches and minor clippy lints, and added
+  small convenience helpers (`Universe::is_empty`).
+
 ## [0.14.0] - 2026-02-14
 ### Added
 - `Fragment`: a rooted (or multi-root) graph fragment that bundles a `TribleSet`
