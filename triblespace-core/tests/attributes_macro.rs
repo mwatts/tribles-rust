@@ -2,7 +2,7 @@ use triblespace_core::metadata;
 use triblespace_core::metadata::Describe;
 use triblespace_core::prelude::valueschemas::ShortString;
 use triblespace_core::prelude::{
-    attributes, entity, find, pattern, Attribute, Id, MemoryBlobStore, ToValue, TribleSet, Value,
+    attributes, entity, find, pattern, Attribute, Id, MemoryBlobStore, ToValue, Value,
 };
 use triblespace_core::value::schemas::hash::Blake3;
 

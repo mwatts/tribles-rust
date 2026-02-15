@@ -9,6 +9,14 @@ license = "MIT OR Apache-2.0"
 documentation = "https://docs.rs/triblespace"
 repository = "https://github.com/triblespace/triblespace-rs"
 
+[package.metadata.docs.rs]
+# The `wasm` feature requires the `wasm32-unknown-unknown` Rust target at build time
+# (the `#[value_formatter]` macro compiles formatter functions to wasm). Keep docs.rs
+# builds lightweight and reliable by disabling default features and opting into
+# `proptest` only.
+no-default-features = true
+features = ["proptest"]
+
 [workspace]
 members = [
     "const-blake3",

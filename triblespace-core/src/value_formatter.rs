@@ -263,7 +263,6 @@ mod tests {
     use crate::value::schemas::hash::Blake3;
     use crate::value::schemas::hash::Handle;
     use crate::value::Value;
-    use pretty_assertions::assert_eq;
 
     fn formatter_handle(space: &TribleSet, schema: Id) -> Option<Value<Handle<Blake3, WasmCode>>> {
         for (schema_id, handle) in find!(
@@ -491,9 +490,7 @@ mod tests {
             "5..=10"
         );
 
-        let linelocation = formatters
-            .get(&LineLocation::ID)
-            .expect("linelocation formatter");
+        let linelocation = formatter_for(LineLocation::ID);
         assert_eq!(
             linelocation
                 .format_value_with_limits(
@@ -504,9 +501,7 @@ mod tests {
             "1:2..3:4"
         );
 
-        let nstai = formatters
-            .get(&NsTAIInterval::ID)
-            .expect("nstai_interval formatter");
+        let nstai = formatter_for(NsTAIInterval::ID);
         let mut raw = [0u8; 32];
         raw[0..16].copy_from_slice(&5i128.to_le_bytes());
         raw[16..32].copy_from_slice(&10i128.to_le_bytes());
@@ -515,7 +510,7 @@ mod tests {
             "5..=10"
         );
 
-        let f256le = formatters.get(&F256LE::ID).expect("f256le formatter");
+        let f256le = formatter_for(F256LE::ID);
         let raw = F256LE::value_from(f256::f256::from(1u8)).raw;
         assert_eq!(
             f256le.format_value_with_limits(&raw, limits).unwrap(),
@@ -531,7 +526,7 @@ mod tests {
             "0x1p+2000"
         );
 
-        let f256be = formatters.get(&F256BE::ID).expect("f256be formatter");
+        let f256be = formatter_for(F256BE::ID);
         let raw = F256BE::value_from(f256::f256::from(1u8)).raw;
         assert_eq!(
             f256be.format_value_with_limits(&raw, limits).unwrap(),
@@ -546,42 +541,32 @@ mod tests {
             "0x1p+2000"
         );
 
-        let ed25519_r = formatters
-            .get(&ED25519RComponent::ID)
-            .expect("ed25519 r formatter");
+        let ed25519_r = formatter_for(ED25519RComponent::ID);
         let raw = [0xABu8; 32];
         assert_eq!(
             ed25519_r.format_value_with_limits(&raw, limits).unwrap(),
             format!("ed25519:r:{}", "AB".repeat(32))
         );
 
-        let ed25519_s = formatters
-            .get(&ED25519SComponent::ID)
-            .expect("ed25519 s formatter");
+        let ed25519_s = formatter_for(ED25519SComponent::ID);
         assert_eq!(
             ed25519_s.format_value_with_limits(&raw, limits).unwrap(),
             format!("ed25519:s:{}", "AB".repeat(32))
         );
 
-        let ed25519_pk = formatters
-            .get(&ED25519PublicKey::ID)
-            .expect("ed25519 public key formatter");
+        let ed25519_pk = formatter_for(ED25519PublicKey::ID);
         assert_eq!(
             ed25519_pk.format_value_with_limits(&raw, limits).unwrap(),
             format!("ed25519:pubkey:{}", "AB".repeat(32))
         );
 
-        let unknown = formatters
-            .get(&UnknownValue::ID)
-            .expect("unknown formatter");
+        let unknown = formatter_for(UnknownValue::ID);
         assert_eq!(
             unknown.format_value_with_limits(&raw, limits).unwrap(),
             format!("unknown:{}", "AB".repeat(32))
         );
 
-        let hash_formatter = formatters
-            .get(&Hash::<Blake3>::ID)
-            .expect("hash formatter");
+        let hash_formatter = formatter_for(Hash::<Blake3>::ID);
         assert_eq!(
             hash_formatter
                 .format_value_with_limits(&raw, limits)
@@ -589,9 +574,7 @@ mod tests {
             format!("hash:{}", "AB".repeat(32))
         );
 
-        let handle_formatter = formatters
-            .get(&Handle::<Blake3, LongString>::ID)
-            .expect("handle formatter");
+        let handle_formatter = formatter_for(Handle::<Blake3, LongString>::ID);
         let raw = Value::<Handle<Blake3, LongString>>::new([0xEF; 32]).raw;
         assert_eq!(
             handle_formatter

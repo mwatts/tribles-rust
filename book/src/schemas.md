@@ -142,11 +142,11 @@ let schema_id = <LongString as ConstId>::ID;
 ```
 
 Both value and blob schemas can emit optional discovery metadata. Calling
-`ConstDescribe::describe` returns a `TribleSet` that tags the schema entity with
-`metadata::KIND_VALUE_SCHEMA` or `metadata::KIND_BLOB_SCHEMA` and may attach a
-`metadata::name` and `metadata::description` (LongString handles). Persist the
-description blobs alongside the metadata tribles if you want the text to remain
-readable.
+`ConstDescribe::describe` returns a rooted `Fragment` (exporting the schema id)
+whose facts tag the schema entity with `metadata::KIND_VALUE_SCHEMA` or
+`metadata::KIND_BLOB_SCHEMA` and may attach a `metadata::name` and
+`metadata::description` (LongString handles). Persist the description blobs
+alongside the metadata tribles if you want the text to remain readable.
 
 ## Defining new schemas
 

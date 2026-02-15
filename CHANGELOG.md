@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Cleanup/polish after 0.14.0: fixed benches and minor clippy lints, and added
   small convenience helpers (`Universe::is_empty`).
+- `metadata::ConstDescribe::describe` now returns a rooted `Fragment` (exporting
+  the schema id) instead of a raw `TribleSet`, aligning constant schema metadata
+  with runtime `Describe`.
 ### Added
 - Additive set ergonomics: `TribleSet + Fragment` and `Fragment + TribleSet`
   (plus corresponding `+=` forms) to union facts while preserving exports on
