@@ -5,7 +5,7 @@ use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::{ConstDescribe, ConstId};
 use crate::repo::BlobStore;
-use crate::trible::TribleSet;
+use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
 use crate::value::FromValue;
 use crate::value::ToValue;
@@ -52,7 +52,7 @@ pub type I256 = I256BE;
 pub type U256 = U256BE;
 
 impl ConstDescribe for U256LE {
-    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
@@ -75,14 +75,14 @@ impl ConstDescribe for U256LE {
             };
             tribles
         };
-        Ok(tribles.into_facts())
+        Ok(tribles)
     }
 }
 impl ValueSchema for U256LE {
     type ValidationError = Infallible;
 }
 impl ConstDescribe for U256BE {
-    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
@@ -105,14 +105,14 @@ impl ConstDescribe for U256BE {
             };
             tribles
         };
-        Ok(tribles.into_facts())
+        Ok(tribles)
     }
 }
 impl ValueSchema for U256BE {
     type ValidationError = Infallible;
 }
 impl ConstDescribe for I256LE {
-    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
@@ -135,14 +135,14 @@ impl ConstDescribe for I256LE {
             };
             tribles
         };
-        Ok(tribles.into_facts())
+        Ok(tribles)
     }
 }
 impl ValueSchema for I256LE {
     type ValidationError = Infallible;
 }
 impl ConstDescribe for I256BE {
-    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
@@ -165,7 +165,7 @@ impl ConstDescribe for I256BE {
             };
             tribles
         };
-        Ok(tribles.into_facts())
+        Ok(tribles)
     }
 }
 impl ValueSchema for I256BE {

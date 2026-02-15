@@ -10,7 +10,7 @@ use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::{ConstDescribe, ConstId};
 use crate::repo::BlobStore;
-use crate::trible::TribleSet;
+use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
 use crate::value::FromValue;
 use crate::value::ToValue;
@@ -41,7 +41,7 @@ impl ConstId for ED25519PublicKey {
 }
 
 impl ConstDescribe for ED25519RComponent {
-    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
@@ -64,14 +64,14 @@ impl ConstDescribe for ED25519RComponent {
             };
             tribles
         };
-        Ok(tribles.into_facts())
+        Ok(tribles)
     }
 }
 impl ValueSchema for ED25519RComponent {
     type ValidationError = Infallible;
 }
 impl ConstDescribe for ED25519SComponent {
-    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
@@ -94,14 +94,14 @@ impl ConstDescribe for ED25519SComponent {
             };
             tribles
         };
-        Ok(tribles.into_facts())
+        Ok(tribles)
     }
 }
 impl ValueSchema for ED25519SComponent {
     type ValidationError = Infallible;
 }
 impl ConstDescribe for ED25519PublicKey {
-    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
@@ -124,7 +124,7 @@ impl ConstDescribe for ED25519PublicKey {
             };
             tribles
         };
-        Ok(tribles.into_facts())
+        Ok(tribles)
     }
 }
 impl ValueSchema for ED25519PublicKey {

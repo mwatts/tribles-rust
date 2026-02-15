@@ -6,6 +6,7 @@ use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::{ConstDescribe, ConstId};
 use crate::repo::BlobStore;
+use crate::trible::Fragment;
 use crate::trible::TribleSet;
 use crate::value::FromValue;
 use crate::value::RawValue;
@@ -48,7 +49,7 @@ impl<H> ConstDescribe for Hash<H>
 where
     H: HashProtocol,
 {
-    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
@@ -136,7 +137,7 @@ where
     }
 }
 
-fn describe_hash<H, B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+fn describe_hash<H, B>(blobs: &mut B) -> Result<Fragment, B::PutError>
 where
     H: HashProtocol,
     B: BlobStore<Blake3>,
@@ -147,19 +148,19 @@ where
         "{name} 256-bit hash digest of raw bytes. The value stores the digest bytes and is stable across systems.\n\nUse for content-addressed identifiers, deduplication, or integrity checks. Use Handle when you need a typed blob reference with schema metadata.\n\nHashes do not carry type information; the meaning comes from the schema that uses them. If you need provenance or typed payloads, combine with handles or additional metadata."
     ))?;
     let name_handle = blobs.put(name.to_string())?;
-    let mut tribles = TribleSet::new();
-
-    tribles += entity! { ExclusiveId::force_ref(&id) @
+    let tribles = entity! { ExclusiveId::force_ref(&id) @
         metadata::name: name_handle,
         metadata::description: description,
         metadata::tag: metadata::KIND_VALUE_SCHEMA,
     };
 
     #[cfg(feature = "wasm")]
-    {
+    let tribles = {
+        let mut tribles = tribles;
         tribles += entity! { ExclusiveId::force_ref(&id) @
             metadata::value_formatter: blobs.put(wasm_formatter::HASH_HEX_WASM)?,
         };
+        tribles
     }
 
     Ok(tribles)
@@ -203,7 +204,7 @@ impl ConstId for Blake2b {
 }
 
 impl ConstDescribe for Blake2b {
-    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
@@ -216,7 +217,7 @@ impl ConstId for Blake3 {
 }
 
 impl ConstDescribe for Blake3 {
-    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
@@ -285,8 +286,7 @@ where
     H: HashProtocol,
     T: BlobSchema + ConstDescribe,
 {
-
-    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
@@ -315,7 +315,7 @@ where
                 metadata::value_formatter: blobs.put(wasm_formatter::HASH_HEX_WASM)?,
             };
         }
-        Ok(tribles)
+        Ok(Fragment::rooted(id, tribles))
     }
 }
 

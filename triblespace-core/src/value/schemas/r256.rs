@@ -5,7 +5,7 @@ use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::{ConstDescribe, ConstId};
 use crate::repo::BlobStore;
-use crate::trible::TribleSet;
+use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
 use crate::value::FromValue;
 use crate::value::ToValue;
@@ -49,7 +49,7 @@ impl ConstId for R256BE {
 pub type R256 = R256LE;
 
 impl ConstDescribe for R256LE {
-    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
@@ -72,14 +72,14 @@ impl ConstDescribe for R256LE {
             };
             tribles
         };
-        Ok(tribles.into_facts())
+        Ok(tribles)
     }
 }
 impl ValueSchema for R256LE {
     type ValidationError = Infallible;
 }
 impl ConstDescribe for R256BE {
-    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
@@ -102,7 +102,7 @@ impl ConstDescribe for R256BE {
             };
             tribles
         };
-        Ok(tribles.into_facts())
+        Ok(tribles)
     }
 }
 

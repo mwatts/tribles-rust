@@ -5,7 +5,7 @@ use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::{ConstDescribe, ConstId};
 use crate::repo::BlobStore;
-use crate::trible::TribleSet;
+use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
 use crate::value::FromValue;
 use crate::value::RawValue;
@@ -38,7 +38,7 @@ impl ConstId for RangeInclusiveU128 {
 }
 
 impl ConstDescribe for RangeU128 {
-    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
@@ -61,7 +61,7 @@ impl ConstDescribe for RangeU128 {
             };
             tribles
         };
-        Ok(tribles.into_facts())
+        Ok(tribles)
     }
 }
 
@@ -70,7 +70,7 @@ impl ValueSchema for RangeU128 {
 }
 
 impl ConstDescribe for RangeInclusiveU128 {
-    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
@@ -93,7 +93,7 @@ impl ConstDescribe for RangeInclusiveU128 {
             };
             tribles
         };
-        Ok(tribles.into_facts())
+        Ok(tribles)
     }
 }
 

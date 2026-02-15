@@ -7,8 +7,6 @@ use triblespace::core::blob::TryFromBlob;
 use triblespace::core::id::id_hex;
 use triblespace::core::id::Id;
 use triblespace::core::metadata::{ConstDescribe, ConstId};
-use triblespace::core::repo::BlobStore;
-use triblespace::core::value::schemas::hash::Blake3;
 use triblespace::core::value::FromValue;
 use triblespace::core::value::ToValue;
 use triblespace::core::value::Value;
@@ -23,15 +21,7 @@ impl ConstId for U64LE {
     const ID: Id = id_hex!("0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A");
 }
 
-impl ConstDescribe for U64LE {
-    fn describe<B>(blobs: &mut B) -> Result<triblespace::core::trible::TribleSet, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-    {
-        let _ = blobs;
-        Ok(triblespace::core::trible::TribleSet::new())
-    }
-}
+impl ConstDescribe for U64LE {}
 
 impl ValueSchema for U64LE {
     type ValidationError = Infallible;

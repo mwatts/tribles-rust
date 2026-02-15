@@ -30,12 +30,12 @@ pub trait ConstId {
 
 /// Helper trait for schema types that want to expose metadata without requiring an instance.
 pub trait ConstDescribe: ConstId {
-    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
         let _ = blobs;
-        Ok(TribleSet::new())
+        Ok(Fragment::rooted(Self::ID, TribleSet::new()))
     }
 }
 
@@ -47,10 +47,7 @@ where
     where
         B: BlobStore<Blake3>,
     {
-        Ok(Fragment::rooted(
-            S::ID,
-            <S as ConstDescribe>::describe(blobs)?,
-        ))
+        <S as ConstDescribe>::describe(blobs)
     }
 }
 
@@ -62,7 +59,7 @@ where
     where
         B: BlobStore<Blake3>,
     {
-        Ok(Fragment::rooted(T::ID, T::describe(blobs)?))
+        <T as ConstDescribe>::describe(blobs)
     }
 }
 

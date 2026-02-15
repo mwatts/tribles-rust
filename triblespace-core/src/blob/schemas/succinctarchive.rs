@@ -15,6 +15,7 @@ use crate::metadata;
 use crate::metadata::{ConstDescribe, ConstId};
 use crate::query::TriblePattern;
 use crate::repo::BlobStore;
+use crate::trible::Fragment;
 use crate::trible::Trible;
 use crate::trible::TribleSet;
 use crate::value::schemas::genid::GenId;
@@ -54,7 +55,7 @@ impl ConstId for SuccinctArchiveBlob {
 }
 
 impl ConstDescribe for SuccinctArchiveBlob {
-    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
@@ -68,7 +69,7 @@ impl ConstDescribe for SuccinctArchiveBlob {
                 metadata::description: description,
                 metadata::tag: metadata::KIND_BLOB_SCHEMA,
         }
-        .into_facts())
+        )
     }
 }
 

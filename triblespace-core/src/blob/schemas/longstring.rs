@@ -9,7 +9,7 @@ use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::{ConstDescribe, ConstId};
 use crate::repo::BlobStore;
-use crate::trible::TribleSet;
+use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
 
 use anybytes::view::ViewError;
@@ -24,7 +24,7 @@ impl ConstId for LongString {
 }
 
 impl ConstDescribe for LongString {
-    fn describe<B>(blobs: &mut B) -> Result<TribleSet, B::PutError>
+    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
@@ -38,7 +38,7 @@ impl ConstDescribe for LongString {
                 metadata::description: description,
                 metadata::tag: metadata::KIND_BLOB_SCHEMA,
         }
-        .into_facts())
+        )
     }
 }
 
