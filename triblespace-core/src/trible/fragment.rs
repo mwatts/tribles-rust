@@ -106,6 +106,12 @@ impl AddAssign for Fragment {
     }
 }
 
+impl AddAssign<TribleSet> for Fragment {
+    fn add_assign(&mut self, rhs: TribleSet) {
+        self.facts += rhs;
+    }
+}
+
 impl Add for Fragment {
     type Output = Self;
 
@@ -115,9 +121,27 @@ impl Add for Fragment {
     }
 }
 
+impl Add<TribleSet> for Fragment {
+    type Output = Self;
+
+    fn add(mut self, rhs: TribleSet) -> Self::Output {
+        self += rhs;
+        self
+    }
+}
+
 impl AddAssign<Fragment> for TribleSet {
     fn add_assign(&mut self, rhs: Fragment) {
         self.union(rhs.facts);
+    }
+}
+
+impl Add<Fragment> for TribleSet {
+    type Output = Self;
+
+    fn add(mut self, rhs: Fragment) -> Self::Output {
+        self += rhs;
+        self
     }
 }
 

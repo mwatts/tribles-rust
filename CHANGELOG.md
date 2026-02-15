@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Cleanup/polish after 0.14.0: fixed benches and minor clippy lints, and added
   small convenience helpers (`Universe::is_empty`).
+### Added
+- Additive set ergonomics: `TribleSet + Fragment` and `Fragment + TribleSet`
+  (plus corresponding `+=` forms) to union facts while preserving exports on
+  the fragment side.
 
 ## [0.14.0] - 2026-02-14
 ### Added
