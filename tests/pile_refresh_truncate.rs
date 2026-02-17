@@ -15,7 +15,7 @@ fn refresh_during_restore_truncation_is_safe() {
     let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(b"data".to_vec()));
     let handle = pile.put(blob).unwrap();
     pile.flush().unwrap();
-    drop(pile);
+    pile.close().unwrap();
 
     // Append garbage to simulate a truncated write
     {
@@ -35,12 +35,14 @@ fn refresh_during_restore_truncation_is_safe() {
     let refresh_thread = std::thread::spawn(move || {
         b1.wait();
         let _ = pile_refresh.refresh();
+        pile_refresh.close().unwrap();
     });
 
     let b2 = barrier.clone();
     let restore_thread = std::thread::spawn(move || {
         b2.wait();
         pile_restore.restore().unwrap();
+        pile_restore.close().unwrap();
     });
 
     refresh_thread.join().unwrap();
@@ -55,4 +57,5 @@ fn refresh_during_restore_truncation_is_safe() {
         .get::<Blob<UnknownBlob>, _>(handle)
         .unwrap();
     assert_eq!(blob.bytes.as_ref(), b"data");
+    pile.close().unwrap();
 }

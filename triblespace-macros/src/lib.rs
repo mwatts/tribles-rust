@@ -133,7 +133,11 @@ where
 
     let signing_key = match metadata_signing_key() {
         Some(key) => key,
-        None => return,
+        None => {
+            // Avoid Drop warnings if metadata emission is partially configured.
+            let _ = pile.close();
+            return;
+        }
     };
     let mut repo = Repository::new(pile, signing_key);
 

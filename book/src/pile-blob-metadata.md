@@ -76,6 +76,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    drop(reader);
+    pile.close()?;
     Ok(())
 }
 ```

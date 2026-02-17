@@ -755,6 +755,7 @@ fn pile_benchmark(c: &mut Criterion) {
                 data.iter().for_each(|data| {
                     pile.put(UnknownBlob::blob_from(data.clone())).unwrap();
                 });
+                pile.close().unwrap();
             },
             BatchSize::PerIteration,
         );
@@ -785,6 +786,7 @@ fn pile_benchmark(c: &mut Criterion) {
                     pile.put(UnknownBlob::blob_from(data.clone())).unwrap();
                     pile.flush().unwrap();
                 });
+                pile.close().unwrap();
             },
             BatchSize::PerIteration,
         );
@@ -808,6 +810,7 @@ fn pile_benchmark(c: &mut Criterion) {
                 });
 
                 pile.flush().unwrap();
+                pile.close().unwrap();
 
                 tmp_dir
             },
@@ -815,6 +818,7 @@ fn pile_benchmark(c: &mut Criterion) {
                 let tmp_pile = tmp_dir.path().join("test.pile");
                 let mut pile: Pile<Blake3> = Pile::open(&tmp_pile).unwrap();
                 pile.restore().unwrap();
+                pile.close().unwrap();
                 drop(tmp_dir)
             },
             BatchSize::PerIteration,

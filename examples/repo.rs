@@ -42,4 +42,6 @@ fn main() {
             }
         },
     }
+
+    repo.close().expect("close pile");
 }

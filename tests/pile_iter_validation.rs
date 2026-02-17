@@ -45,5 +45,7 @@ fn iterator_errors_on_corrupt_blob() {
         Some(Err(GetBlobError::ValidationError(_))) => {}
         other => panic!("expected validation error, got {:?}", other),
     }
+    drop(iter);
+    drop(reader);
     pile.close().unwrap();
 }

@@ -24,7 +24,7 @@ fn metadata_detects_corrupted_blob() {
     let handle = pile.put(blob).unwrap();
     pile.flush().unwrap();
     assert!(pile.reader().unwrap().metadata(handle).unwrap().is_some());
-    drop(pile);
+    pile.close().unwrap();
 
     {
         let mut file = OpenOptions::new()
@@ -47,4 +47,6 @@ fn metadata_detects_corrupted_blob() {
     reopened.restore().unwrap();
     let reader = reopened.reader().unwrap();
     assert!(reader.metadata(handle).unwrap().is_none());
+    drop(reader);
+    reopened.close().unwrap();
 }

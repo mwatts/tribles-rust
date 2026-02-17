@@ -515,6 +515,11 @@ fn merge_import_example(
         incoming.merge(&mut ws)?;
         ws = incoming;
     }
+
+    drop(ws);
+    repo.close()?;
+    drop(reader);
+    src.close()?;
     Ok(())
 }
 ```

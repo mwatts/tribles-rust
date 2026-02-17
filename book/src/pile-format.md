@@ -128,6 +128,8 @@ fn add_blob(bytes: &[u8]) -> Result<(), Box<dyn Error>> {
     if let Some(meta) = reader.metadata(handle)? {
         println!("stored {} bytes at {}", meta.length, meta.timestamp);
     }
+    drop(reader);
+    pile.close()?;
     Ok(())
 }
 ```
