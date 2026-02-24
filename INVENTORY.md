@@ -67,6 +67,8 @@
   ordering implementations for PATCH at compile time.
 - Expose segment iterators on PATCH using `KeySchema`'s segment permutation instead of raw key ranges.
 - Consolidate pile header size constants to avoid repeated magic numbers.
+- Add an explicit `Pile::put` guard/error for oversized single-record appends
+  (e.g. platform `writev` limits) so failures are deterministic and actionable.
 
 ## Formal Verification
 ### Invariant Catalogue

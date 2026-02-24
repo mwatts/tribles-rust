@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed
+- `PATCH::difference` now returns an empty set when the left-hand side is
+  empty (`∅ \ B = ∅`) instead of incorrectly cloning the right-hand side.
+
+### Documentation
+- Documented `PushError::StoragePut` guidance for large local `Pile` writes:
+  platform `writev` limits can surface `EINVAL`, and oversized payloads should
+  be chunked semantically behind a manifest/root record.
 
 ## [0.16.0] - 2026-02-15
 ### Changed

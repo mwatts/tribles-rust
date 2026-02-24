@@ -1250,7 +1250,7 @@ where
                 (*self).clone()
             }
         } else {
-            (*other).clone()
+            Self::new()
         }
     }
 
@@ -2132,6 +2132,31 @@ mod tests {
         // left only has d
         assert_eq!(res.len(), 1);
         assert!(res.get(&d).is_some());
+    }
+
+    #[test]
+    fn difference_empty_left_is_empty() {
+        const KEY_SIZE: usize = 4;
+        let left = PATCH::<KEY_SIZE, IdentitySchema, u32>::new();
+        let mut right = PATCH::<KEY_SIZE, IdentitySchema, u32>::new();
+        let key = [1u8, 2u8, 3u8, 4u8];
+        right.insert(&Entry::with_value(&key, 7));
+
+        let res = left.difference(&right);
+        assert_eq!(res.len(), 0);
+    }
+
+    #[test]
+    fn difference_empty_right_returns_left() {
+        const KEY_SIZE: usize = 4;
+        let mut left = PATCH::<KEY_SIZE, IdentitySchema, u32>::new();
+        let right = PATCH::<KEY_SIZE, IdentitySchema, u32>::new();
+        let key = [1u8, 2u8, 3u8, 4u8];
+        left.insert(&Entry::with_value(&key, 7));
+
+        let res = left.difference(&right);
+        assert_eq!(res.len(), 1);
+        assert!(res.get(&key).is_some());
     }
 
     #[test]
