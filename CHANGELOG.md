@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     subscribers
   - `triblespace::telemetry::schema` metadata/attribute ids used by the sink
   - environment controls: `TELEMETRY_PILE`,
-    `TELEMETRY_FLUSH_MS`, and `TELEMETRY_QUEUE`.
+    `TELEMETRY_FLUSH_MS`.
 
 ### Changed
 - Trimmed `triblespace::telemetry` schema to generic span/session fields by

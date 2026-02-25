@@ -42,8 +42,7 @@ let _guard = Telemetry::install_global_from_env("my-service");
 ```
 
 Set `TELEMETRY_PILE` to enable the sink. Optional tuning knobs:
-`TELEMETRY_FLUSH_MS` (default `250`) and
-`TELEMETRY_QUEUE` (default `4096`).
+`TELEMETRY_FLUSH_MS` (default `250`).
 
 # Community
 

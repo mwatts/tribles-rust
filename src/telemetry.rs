@@ -24,7 +24,7 @@ use tracing_subscriber::EnvFilter;
 
 const ENV_TELEMETRY_PILE: &str = "TELEMETRY_PILE";
 const ENV_TELEMETRY_FLUSH_MS: &str = "TELEMETRY_FLUSH_MS";
-const ENV_TELEMETRY_QUEUE: &str = "TELEMETRY_QUEUE";
+const TELEMETRY_QUEUE_CAPACITY: usize = 4096;
 
 pub mod schema {
     use super::*;
@@ -304,15 +304,10 @@ impl Telemetry {
             .unwrap_or(250);
         let flush_interval = Duration::from_millis(flush_ms.max(10));
 
-        let queue_cap = std::env::var(ENV_TELEMETRY_QUEUE)
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(4096);
-
         let base = Instant::now();
         let session_id = *ufoid();
 
-        let (tx, rx) = mpsc::sync_channel(queue_cap.max(64));
+        let (tx, rx) = mpsc::sync_channel(TELEMETRY_QUEUE_CAPACITY);
 
         let title = session_name.to_string();
         let join = thread::Builder::new()

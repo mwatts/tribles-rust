@@ -538,5 +538,4 @@ let _guard = Telemetry::install_global_from_env("archive import");
 ```
 
 Set `TELEMETRY_PILE` to enable the sink. You can tune batching via
-`TELEMETRY_FLUSH_MS` and channel capacity via
-`TELEMETRY_QUEUE`.
+`TELEMETRY_FLUSH_MS`.
