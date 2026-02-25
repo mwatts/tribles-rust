@@ -19,6 +19,9 @@ pub mod prelude {
     pub use triblespace_core::prelude::*;
 }
 
+#[cfg(feature = "telemetry")]
+pub mod telemetry;
+
 #[cfg(kani)]
 #[path = "../proofs/mod.rs"]
 mod proofs;

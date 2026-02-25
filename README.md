@@ -30,6 +30,21 @@ Our goal is to re-invent data storage from first principles and overcome the sho
 - **Lock-Free Blob Writes**: Blob data is appended with a single `O_APPEND` write. Each handle advances an in-memory `applied_length` only if no other writer has appended in between, scanning any gap to ingest missing records. Concurrent writers may duplicate blobs, but hashes guarantee consistency. Updating branch heads uses a short `flush → refresh → lock → refresh → append → unlock` sequence.
 - **Coordinated Refresh**: `refresh` acquires a shared file lock while scanning to avoid races with `restore` truncating the pile.
 
+## Optional telemetry feature
+
+Enable the `telemetry` feature to install a `tracing` layer that writes spans
+into a dedicated TribleSpace pile:
+
+```rust,ignore
+use triblespace::telemetry::Telemetry;
+
+let _guard = Telemetry::install_global_from_env("my-service");
+```
+
+Set `TELEMETRY_PILE` to enable the sink. Optional tuning knobs:
+`TELEMETRY_FLUSH_MS` (default `250`) and
+`TELEMETRY_QUEUE` (default `4096`).
+
 # Community
 
 If you have any questions or want to chat about graph databases hop into our [discord](https://discord.gg/v7AezPywZS).

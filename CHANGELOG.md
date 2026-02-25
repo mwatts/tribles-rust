@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- Optional `telemetry` feature in the facade crate:
+  - `triblespace::telemetry::Telemetry` for pile-backed tracing sinks
+  - `triblespace::telemetry::TelemetryLayer` for embedding into custom
+    subscribers
+  - `triblespace::telemetry::schema` metadata/attribute ids used by the sink
+  - environment controls: `TELEMETRY_PILE`,
+    `TELEMETRY_FLUSH_MS`, and `TELEMETRY_QUEUE`.
+
+### Changed
+- Trimmed `triblespace::telemetry` schema to generic span/session fields by
+  removing GORBIE-specific `card_index` capture from the shared sink.
+
 ### Fixed
 - `PATCH::difference` now returns an empty set when the left-hand side is
   empty (`∅ \ B = ∅`) instead of incorrectly cloning the right-hand side.

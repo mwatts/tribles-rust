@@ -523,3 +523,20 @@ fn merge_import_example(
     Ok(())
 }
 ```
+
+## Optional telemetry sink
+
+The facade crate exposes an optional `telemetry` feature that turns `tracing`
+spans into TribleSpace commits. This is useful for profiling services, import
+pipelines, or long-running agents while keeping telemetry noise in a dedicated
+pile.
+
+```rust,ignore
+use triblespace::telemetry::Telemetry;
+
+let _guard = Telemetry::install_global_from_env("archive import");
+```
+
+Set `TELEMETRY_PILE` to enable the sink. You can tune batching via
+`TELEMETRY_FLUSH_MS` and channel capacity via
+`TELEMETRY_QUEUE`.
