@@ -117,6 +117,7 @@ pub fn attributes_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Re
     let AttributesInput { attributes } = syn::parse2(input)?;
 
     let mut out: TokenStream2 = TokenStream2::new();
+    let mut attr_names: Vec<Ident> = Vec::new();
     for AttributesDef {
         mut attrs,
         vis,
@@ -170,7 +171,23 @@ pub fn attributes_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Re
                 });
             }
         }
+        attr_names.push(name);
     }
+
+    out.extend(quote! {
+        pub fn describe<__B>(__blobs: &mut __B) -> ::core::result::Result<
+            #base_path::trible::Fragment,
+            __B::PutError,
+        >
+        where
+            __B: #base_path::repo::BlobStore<#base_path::value::schemas::hash::Blake3>,
+        {
+            use #base_path::metadata::Describe as _;
+            let mut __fragment = #base_path::trible::Fragment::default();
+            #( __fragment += #attr_names.describe(__blobs)?; )*
+            ::core::result::Result::Ok(__fragment)
+        }
+    });
 
     Ok(out)
 }

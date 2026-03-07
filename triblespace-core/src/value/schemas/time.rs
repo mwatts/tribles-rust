@@ -94,11 +94,18 @@ impl ToValue<NsTAIInterval> for (Epoch, Epoch) {
 
 impl FromValue<'_, NsTAIInterval> for (Epoch, Epoch) {
     fn from_value(v: &Value<NsTAIInterval>) -> Self {
-        let lower = i128::from_le_bytes(v.raw[0..16].try_into().unwrap());
-        let upper = i128::from_le_bytes(v.raw[16..32].try_into().unwrap());
+        let (lower, upper): (i128, i128) = v.from_value();
         let lower = Epoch::from_tai_duration(Duration::from_total_nanoseconds(lower));
         let upper = Epoch::from_tai_duration(Duration::from_total_nanoseconds(upper));
 
+        (lower, upper)
+    }
+}
+
+impl FromValue<'_, NsTAIInterval> for (i128, i128) {
+    fn from_value(v: &Value<NsTAIInterval>) -> Self {
+        let lower = i128::from_le_bytes(v.raw[0..16].try_into().unwrap());
+        let upper = i128::from_le_bytes(v.raw[16..32].try_into().unwrap());
         (lower, upper)
     }
 }
@@ -115,5 +122,18 @@ mod tests {
         let time_out: (Epoch, Epoch) = interval.from_value();
 
         assert_eq!(time_in, time_out);
+    }
+
+    #[test]
+    fn nanosecond_conversion() {
+        let lower_ns: i128 = 1_000_000_000;
+        let upper_ns: i128 = 2_000_000_000;
+        let lower = Epoch::from_tai_duration(Duration::from_total_nanoseconds(lower_ns));
+        let upper = Epoch::from_tai_duration(Duration::from_total_nanoseconds(upper_ns));
+        let interval: Value<NsTAIInterval> = (lower, upper).to_value();
+
+        let (out_lower, out_upper): (i128, i128) = interval.from_value();
+        assert_eq!(out_lower, lower_ns);
+        assert_eq!(out_upper, upper_ns);
     }
 }

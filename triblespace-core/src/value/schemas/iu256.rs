@@ -9,9 +9,11 @@ use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
 use crate::value::FromValue;
 use crate::value::ToValue;
+use crate::value::TryFromValue;
 use crate::value::Value;
 use crate::value::ValueSchema;
 use std::convert::Infallible;
+use std::num::TryFromIntError;
 
 use ethnum;
 
@@ -578,3 +580,24 @@ impl ToValue<I256BE> for i128 {
         Value::new(ethnum::I256::new(self).to_be_bytes())
     }
 }
+
+// --- Narrowing TryFromValue impls (U256 → native integers) ---
+
+macro_rules! impl_try_from_u256 {
+    ($schema:ty, $wide:ty, $($narrow:ty),+) => {
+        $(
+            impl TryFromValue<'_, $schema> for $narrow {
+                type Error = TryFromIntError;
+                fn try_from_value(v: &Value<$schema>) -> Result<Self, Self::Error> {
+                    let wide: $wide = v.from_value();
+                    <$narrow>::try_from(wide)
+                }
+            }
+        )+
+    };
+}
+
+impl_try_from_u256!(U256BE, ethnum::U256, u8, u16, u32, u64, u128);
+impl_try_from_u256!(U256LE, ethnum::U256, u8, u16, u32, u64, u128);
+impl_try_from_u256!(I256BE, ethnum::I256, i8, i16, i32, i64, i128);
+impl_try_from_u256!(I256LE, ethnum::I256, i8, i16, i32, i64, i128);
