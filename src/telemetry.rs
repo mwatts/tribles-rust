@@ -1,30 +1,27 @@
-use std::fs;
 use std::path::PathBuf;
-use std::sync::mpsc;
-use std::thread;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::core::metadata;
 use crate::core::repo::pile::Pile;
-use crate::core::repo::Repository;
+use crate::core::repo::{Repository, Workspace};
 use crate::prelude::blobschemas::LongString;
 use crate::prelude::valueschemas::{Blake3, GenId, Handle, ShortString, U256BE};
 use crate::prelude::*;
 use ed25519_dalek::SigningKey;
 use rand_core06::OsRng;
+use thread_local::ThreadLocal;
 use tracing::Subscriber;
 use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::EnvFilter;
 
-// Telemetry is intentionally its own pile to keep profiling noise out of any
-// "real" data model piles. This module installs a tracing subscriber that
-// converts spans into tribles and commits them in batches on a background thread.
-
 const ENV_TELEMETRY_PILE: &str = "TELEMETRY_PILE";
+const ENV_PILE: &str = "PILE";
+const ENV_TELEMETRY_BRANCH: &str = "TELEMETRY_BRANCH";
 const ENV_TELEMETRY_FLUSH_MS: &str = "TELEMETRY_FLUSH_MS";
-const TELEMETRY_QUEUE_CAPACITY: usize = 4096;
 
 pub mod schema {
     use super::*;
@@ -86,47 +83,55 @@ fn is_valid_short(value: &str) -> bool {
     value.as_bytes().len() <= 32 && !value.as_bytes().iter().any(|b| *b == 0)
 }
 
-#[derive(Clone)]
-struct TelemetryHandle {
-    session: Id,
-    base: Instant,
-    tx: mpsc::SyncSender<SinkMsg>,
+struct ThreadTelemetry {
+    workspace: Workspace<Pile<Blake3>>,
+    last_flush: Instant,
 }
 
-impl TelemetryHandle {
+struct TelemetryInner {
+    repo: Mutex<Option<Repository<Pile<Blake3>>>>,
+    workspaces: ThreadLocal<Arc<Mutex<ThreadTelemetry>>>,
+    registry: Mutex<Vec<Arc<Mutex<ThreadTelemetry>>>>,
+    session: Id,
+    base: Instant,
+    branch_id: Id,
+    flush_interval: Duration,
+    shutdown: AtomicBool,
+}
+
+impl TelemetryInner {
     fn now_ns(&self) -> u64 {
         self.base.elapsed().as_nanos() as u64
     }
 
-    fn emit(&self, msg: SinkMsg) {
-        // Best-effort: never block the UI thread.
-        let _ = self.tx.try_send(msg);
+    fn get_or_init_thread(&self) -> &Arc<Mutex<ThreadTelemetry>> {
+        self.workspaces.get_or(|| {
+            let mut repo_guard = self.repo.lock().expect("telemetry repo lock");
+            let repo = repo_guard.as_mut().expect("telemetry repo not closed");
+            let ws = repo
+                .pull(self.branch_id)
+                .expect("telemetry pull workspace");
+            let arc = Arc::new(Mutex::new(ThreadTelemetry {
+                workspace: ws,
+                last_flush: Instant::now(),
+            }));
+            self.registry.lock().expect("telemetry registry lock").push(arc.clone());
+            arc
+        })
     }
-}
 
-#[derive(Debug)]
-enum SinkMsg {
-    Begin(BeginMsg),
-    End(EndMsg),
-    Shutdown { end_ns: u64 },
-}
-
-#[derive(Debug, Clone)]
-struct BeginMsg {
-    span: Id,
-    parent: Option<Id>,
-    session: Id,
-    at_ns: u64,
-    category: &'static str,
-    name: String,
-    source: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct EndMsg {
-    span: Id,
-    at_ns: u64,
-    duration_ns: u64,
+    fn maybe_flush(&self, state: &mut ThreadTelemetry) {
+        if state.last_flush.elapsed() < self.flush_interval {
+            return;
+        }
+        let mut repo_guard = self.repo.lock().expect("telemetry repo lock");
+        if let Some(repo) = repo_guard.as_mut() {
+            if let Err(e) = repo.push(&mut state.workspace) {
+                log::warn!("telemetry flush failed: {e:?}");
+            }
+        }
+        state.last_flush = Instant::now();
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -168,7 +173,7 @@ impl tracing::field::Visit for FieldCapture {
 ///
 /// Construct via [`Telemetry::layer_from_env`] and attach to your application's subscriber.
 pub struct TelemetryLayer {
-    handle: TelemetryHandle,
+    inner: Arc<TelemetryInner>,
 }
 
 impl TelemetryLayer {
@@ -180,7 +185,6 @@ impl TelemetryLayer {
     where
         S: Subscriber + for<'a> LookupSpan<'a>,
     {
-        // Explicit parent beats contextual parent.
         if let Some(parent) = attrs.parent() {
             if let Some(span) = ctx.span(parent) {
                 if let Some(data) = span.extensions().get::<TelemetrySpanData>() {
@@ -211,6 +215,10 @@ where
         id: &tracing::span::Id,
         ctx: Context<'_, S>,
     ) {
+        if self.inner.shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+
         let Some(span) = ctx.span(id) else {
             return;
         };
@@ -219,7 +227,7 @@ where
         let mut fields = FieldCapture::default();
         attrs.record(&mut fields);
 
-        let start_ns = self.handle.now_ns();
+        let start_ns = self.inner.now_ns();
         let span_id = *ufoid();
         let parent = self.parent_id(attrs, &ctx);
 
@@ -228,6 +236,9 @@ where
             start_ns,
         });
 
+        let thread_state = self.inner.get_or_init_thread();
+        let mut state = thread_state.lock().expect("telemetry thread state lock");
+
         let target = meta.target();
         let category = target.split("::").next().unwrap_or(target);
         let category = if !category.is_empty() && is_valid_short(category) {
@@ -235,20 +246,24 @@ where
         } else {
             "span"
         };
-        let name = meta.name().to_string();
 
-        self.handle.emit(SinkMsg::Begin(BeginMsg {
-            span: span_id,
+        span_begin(
+            &mut state.workspace,
+            self.inner.session,
+            span_id,
             parent,
-            session: self.handle.session,
-            at_ns: start_ns,
+            start_ns,
             category,
-            name,
-            source: fields.source,
-        }));
+            meta.name(),
+            fields.source,
+        );
     }
 
     fn on_close(&self, id: tracing::span::Id, ctx: Context<'_, S>) {
+        if self.inner.shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+
         let Some(span) = ctx.span(&id) else {
             return;
         };
@@ -256,19 +271,24 @@ where
             return;
         };
 
-        let end_ns = self.handle.now_ns();
-        self.handle.emit(SinkMsg::End(EndMsg {
-            span: data.span,
-            at_ns: end_ns,
-            duration_ns: end_ns.saturating_sub(data.start_ns),
-        }));
+        let end_ns = self.inner.now_ns();
+
+        let thread_state = self.inner.get_or_init_thread();
+        let mut state = thread_state.lock().expect("telemetry thread state lock");
+
+        span_end(
+            &mut state.workspace,
+            data.span,
+            end_ns,
+            end_ns.saturating_sub(data.start_ns),
+        );
+
+        self.inner.maybe_flush(&mut state);
     }
 }
 
 pub struct Telemetry {
-    base: Instant,
-    tx: mpsc::SyncSender<SinkMsg>,
-    join: Option<thread::JoinHandle<()>>,
+    inner: Arc<TelemetryInner>,
 }
 
 impl Telemetry {
@@ -278,12 +298,25 @@ impl Telemetry {
     /// application's subscriber, and keep the returned [`Telemetry`] guard alive to
     /// flush and close the sink on shutdown.
     pub fn layer_from_env(session_name: &str) -> Option<(TelemetryLayer, Self)> {
-        let pile_path = std::env::var(ENV_TELEMETRY_PILE).ok()?;
+        let pile_path = std::env::var(ENV_TELEMETRY_PILE)
+            .ok()
+            .or_else(|| std::env::var(ENV_PILE).ok())?;
         let pile_path = pile_path.trim();
         if pile_path.is_empty() {
             return None;
         }
         let pile_path = PathBuf::from(pile_path);
+
+        let branch_hex = std::env::var(ENV_TELEMETRY_BRANCH).ok()?;
+        let branch_hex = branch_hex.trim();
+        if branch_hex.len() != 32 {
+            log::warn!(
+                "TELEMETRY_BRANCH must be a 32-char hex ID, got {} chars",
+                branch_hex.len()
+            );
+            return None;
+        }
+        let branch_id = Id::from_hex(branch_hex)?;
 
         let flush_ms = std::env::var(ENV_TELEMETRY_FLUSH_MS)
             .ok()
@@ -294,33 +327,57 @@ impl Telemetry {
         let base = Instant::now();
         let session_id = *ufoid();
 
-        let (tx, rx) = mpsc::sync_channel(TELEMETRY_QUEUE_CAPACITY);
+        // Open and restore pile.
+        if let Some(parent) = pile_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent).ok()?;
+        }
+        let mut pile = Pile::<Blake3>::open(&pile_path).ok()?;
+        if pile.restore().is_err() {
+            let _ = pile.close();
+            return None;
+        }
 
-        let title = session_name.to_string();
-        let join = thread::Builder::new()
-            .name("triblespace-telemetry".to_string())
-            .spawn(move || {
-                if let Err(err) = run_sink(pile_path, title, session_id, flush_interval, rx) {
-                    log::warn!("triblespace telemetry sink failed: {err}");
-                }
-            })
-            .ok()?;
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let mut repo = Repository::new(pile, signing_key);
 
-        let handle = TelemetryHandle {
+        // Set default metadata.
+        let metadata_set: TribleSet = schema::build_telemetry_metadata(repo.storage_mut())
+            .ok()?
+            .into();
+        repo.set_default_metadata(metadata_set).ok()?;
+
+        // Commit session start entity.
+        let mut ws = repo.pull(branch_id).ok()?;
+        let session_entity = ExclusiveId::force_ref(&session_id);
+        let mut init = TribleSet::new();
+        init += entity! { session_entity @
+            metadata::tag: schema::kind_session,
+            schema::category: "session",
+            schema::name: ws.put(session_name.to_string()),
+            schema::begin_ns: 0u64,
+        };
+        ws.commit(init, None, Some("telemetry session"));
+        if repo.push(&mut ws).is_err() {
+            let _ = repo.close();
+            return None;
+        }
+
+        let inner = Arc::new(TelemetryInner {
+            repo: Mutex::new(Some(repo)),
+            workspaces: ThreadLocal::new(),
+            registry: Mutex::new(Vec::new()),
             session: session_id,
             base,
-            tx: tx.clone(),
-        };
-        let layer = TelemetryLayer { handle };
+            branch_id,
+            flush_interval,
+            shutdown: AtomicBool::new(false),
+        });
 
-        Some((
-            layer,
-            Self {
-                base,
-                tx,
-                join: Some(join),
-            },
-        ))
+        let layer = TelemetryLayer {
+            inner: inner.clone(),
+        };
+
+        Some((layer, Self { inner }))
     }
 
     /// Convenience for standalone processes: start telemetry and install a global subscriber
@@ -328,7 +385,6 @@ impl Telemetry {
     pub fn install_global_from_env(session_name: &str) -> Option<Self> {
         let (layer, guard) = Self::layer_from_env(session_name)?;
 
-        // Keep default noise low while still honoring RUST_LOG overrides.
         let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
         let subscriber = tracing_subscriber::registry().with(filter).with(layer);
 
@@ -344,175 +400,82 @@ impl Telemetry {
 
 impl Drop for Telemetry {
     fn drop(&mut self) {
-        // Make a best-effort attempt to flush and close the pile. This is
-        // deliberately blocking during shutdown, but it should be bounded since
-        // the sink is always draining the channel.
-        let _ = self.tx.send(SinkMsg::Shutdown {
-            end_ns: self.base.elapsed().as_nanos() as u64,
-        });
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
-    }
-}
+        self.inner.shutdown.store(true, Ordering::Relaxed);
 
-fn run_sink(
-    pile_path: PathBuf,
-    session_name: String,
-    session: Id,
-    flush_interval: Duration,
-    rx: mpsc::Receiver<SinkMsg>,
-) -> Result<(), String> {
-    if let Some(parent) = pile_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("create telemetry pile dir {}: {e}", parent.display()))?;
-    }
-
-    let mut pile = Pile::<Blake3>::open(&pile_path)
-        .map_err(|e| format!("open telemetry pile {}: {e:?}", pile_path.display()))?;
-    if let Err(err) = pile.restore() {
-        let _ = pile.close();
-        return Err(format!(
-            "restore telemetry pile {}: {err:?}",
-            pile_path.display()
-        ));
-    }
-
-    let signing_key = SigningKey::generate(&mut OsRng);
-    let mut repo = Repository::new(pile, signing_key);
-
-    let result = (|| -> Result<(), String> {
-        // Set the default metadata once; commits only carry a handle.
-        let metadata_set: TribleSet = schema::build_telemetry_metadata(repo.storage_mut())
-            .map_err(|e| format!("build telemetry metadata: {e:?}"))?
-            .into();
-        repo.set_default_metadata(metadata_set)
-            .map_err(|e| format!("set default metadata: {e:?}"))?;
-
-        let session_hex = format!("{session:x}");
-        let branch_name = format!("telemetry-{}", &session_hex[..8]);
-        let branch_id = repo
-            .create_branch(&branch_name, None)
-            .map_err(|e| format!("create branch {branch_name}: {e:?}"))?
-            .release();
-
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| format!("pull workspace: {e:?}"))?;
-
-        let session_entity = ExclusiveId::force_ref(&session);
-        let mut init = TribleSet::new();
-        init += entity! { session_entity @
-            metadata::tag: schema::kind_session,
-            schema::category: "session",
-            schema::name: ws.put(session_name),
-            schema::begin_ns: 0u64,
-        };
-        ws.commit(init, None, Some("telemetry session"));
-        push_workspace(&mut repo, &mut ws)?;
-
-        let mut pending = TribleSet::new();
-        loop {
-            match rx.recv_timeout(flush_interval) {
-                Ok(SinkMsg::Begin(msg)) => {
-                    pending += span_begin(&mut ws, msg);
+        // Flush all thread-local workspaces.
+        let registry = self.inner.registry.lock().expect("telemetry registry lock");
+        {
+            let mut repo_guard = self.inner.repo.lock().expect("telemetry repo lock");
+            if let Some(repo) = repo_guard.as_mut() {
+                for state_arc in registry.iter() {
+                    let mut state = state_arc.lock().expect("telemetry thread state lock");
+                    if let Err(e) = repo.push(&mut state.workspace) {
+                        log::warn!("telemetry shutdown flush failed: {e:?}");
+                    }
                 }
-                Ok(SinkMsg::End(msg)) => {
-                    pending += span_end(msg);
-                }
-                Ok(SinkMsg::Shutdown { end_ns }) => {
-                    flush(&mut repo, &mut ws, &mut pending)?;
-                    let session_entity = ExclusiveId::force_ref(&session);
+
+                // Commit session end entity.
+                let end_ns = self.inner.now_ns();
+                if let Ok(mut ws) = repo.pull(self.inner.branch_id) {
+                    let session_entity = ExclusiveId::force_ref(&self.inner.session);
                     let mut end = TribleSet::new();
                     end += entity! { session_entity @
                         schema::end_ns: end_ns,
                         schema::duration_ns: end_ns,
                     };
                     ws.commit(end, None, Some("telemetry session end"));
-                    push_workspace(&mut repo, &mut ws)?;
-                    break;
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    flush(&mut repo, &mut ws, &mut pending)?;
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    flush(&mut repo, &mut ws, &mut pending)?;
-                    break;
+                    if let Err(e) = repo.push(&mut ws) {
+                        log::warn!("telemetry session end push failed: {e:?}");
+                    }
                 }
             }
         }
+        drop(registry);
 
-        Ok(())
-    })();
-
-    let close_res = repo
-        .close()
-        .map_err(|e| format!("close telemetry pile {}: {e:?}", pile_path.display()));
-    if let Err(err) = close_res {
-        if result.is_ok() {
-            return Err(err);
+        // Close the pile.
+        let mut repo_guard = self.inner.repo.lock().expect("telemetry repo lock");
+        if let Some(repo) = repo_guard.take() {
+            if let Err(e) = repo.close() {
+                log::warn!("telemetry pile close failed: {e:?}");
+            }
         }
-        eprintln!("warning: failed to close telemetry pile cleanly: {err}");
     }
-
-    result
 }
 
-fn span_begin(ws: &mut crate::core::repo::Workspace<Pile<Blake3>>, msg: BeginMsg) -> TribleSet {
-    let span_entity = ExclusiveId::force_ref(&msg.span);
-    let mut out = TribleSet::new();
-    out += entity! { span_entity @
+fn span_begin(
+    ws: &mut Workspace<Pile<Blake3>>,
+    session: Id,
+    span_id: Id,
+    parent: Option<Id>,
+    at_ns: u64,
+    category: &str,
+    name: &str,
+    source: Option<String>,
+) {
+    let span_entity = ExclusiveId::force_ref(&span_id);
+    let mut tribles = TribleSet::new();
+    tribles += entity! { span_entity @
         metadata::tag: schema::kind_span,
-        schema::session: msg.session,
-        schema::category: msg.category,
-        schema::name: ws.put(msg.name),
-        schema::begin_ns: msg.at_ns,
+        schema::session: session,
+        schema::category: category,
+        schema::name: ws.put(name.to_string()),
+        schema::begin_ns: at_ns,
     };
-    if let Some(parent) = msg.parent {
-        out += entity! { span_entity @ schema::parent: parent };
+    if let Some(parent) = parent {
+        tribles += entity! { span_entity @ schema::parent: parent };
     }
-    if let Some(source) = msg.source {
-        out += entity! { span_entity @ schema::source: ws.put(source) };
+    if let Some(source) = source {
+        tribles += entity! { span_entity @ schema::source: ws.put(source) };
     }
-    out
+    ws.commit(tribles, None, None);
 }
 
-fn span_end(msg: EndMsg) -> TribleSet {
-    let span_entity = ExclusiveId::force_ref(&msg.span);
-    let mut out = TribleSet::new();
-    out += entity! { span_entity @
-        schema::end_ns: msg.at_ns,
-        schema::duration_ns: msg.duration_ns,
+fn span_end(ws: &mut Workspace<Pile<Blake3>>, span_id: Id, at_ns: u64, duration_ns: u64) {
+    let span_entity = ExclusiveId::force_ref(&span_id);
+    let mut tribles = TribleSet::new();
+    tribles += entity! { span_entity @
+        schema::end_ns: at_ns,
+        schema::duration_ns: duration_ns,
     };
-    out
-}
-
-fn flush(
-    repo: &mut Repository<Pile<Blake3>>,
-    ws: &mut crate::core::repo::Workspace<Pile<Blake3>>,
-    pending: &mut TribleSet,
-) -> Result<(), String> {
-    if pending.is_empty() {
-        return Ok(());
-    }
-    let content = std::mem::take(pending);
-    ws.commit(content, None, Some("telemetry"));
-    push_workspace(repo, ws)?;
-    Ok(())
-}
-
-fn push_workspace(
-    repo: &mut Repository<Pile<Blake3>>,
-    ws: &mut crate::core::repo::Workspace<Pile<Blake3>>,
-) -> Result<(), String> {
-    while let Some(mut conflict) = repo
-        .try_push(ws)
-        .map_err(|e| format!("push telemetry: {e:?}"))?
-    {
-        conflict
-            .merge(ws)
-            .map_err(|e| format!("merge push conflict: {e:?}"))?;
-        *ws = conflict;
-    }
-    Ok(())
+    ws.commit(tribles, None, None);
 }
