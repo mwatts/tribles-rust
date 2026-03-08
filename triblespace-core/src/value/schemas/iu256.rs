@@ -64,7 +64,7 @@ impl ConstDescribe for U256LE {
         )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("u256le".to_string())?,
+                metadata::name: blobs.put("u256le")?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
@@ -94,7 +94,7 @@ impl ConstDescribe for U256BE {
         )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("u256be".to_string())?,
+                metadata::name: blobs.put("u256be")?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
@@ -124,7 +124,7 @@ impl ConstDescribe for I256LE {
         )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("i256le".to_string())?,
+                metadata::name: blobs.put("i256le")?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
@@ -154,7 +154,7 @@ impl ConstDescribe for I256BE {
         )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("i256be".to_string())?,
+                metadata::name: blobs.put("i256be")?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };

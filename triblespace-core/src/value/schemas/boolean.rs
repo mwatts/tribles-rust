@@ -61,7 +61,7 @@ impl ConstDescribe for Boolean {
         let description = blobs.put(
             "Boolean stored as all-zero bytes for false and all-0xFF bytes for true. The encoding uses the full 32-byte value, making the two states obvious and cheap to test.\n\nUse for simple flags and binary states. Represent unknown or missing data by omitting the trible rather than inventing a third sentinel value.\n\nMixed patterns are invalid and will fail validation. If you need tri-state or richer states, model it explicitly (for example with ShortString or a dedicated entity).",
         )?;
-        let name = blobs.put("boolean".to_string())?;
+        let name = blobs.put("boolean")?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::name: name,

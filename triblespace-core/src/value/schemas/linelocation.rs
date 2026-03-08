@@ -35,7 +35,7 @@ impl ConstDescribe for LineLocation {
         )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("line_location".to_string())?,
+                metadata::name: blobs.put("line_location")?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };

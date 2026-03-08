@@ -48,7 +48,7 @@ impl ConstDescribe for RangeU128 {
         )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("range_u128".to_string())?,
+                metadata::name: blobs.put("range_u128")?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
@@ -80,7 +80,7 @@ impl ConstDescribe for RangeInclusiveU128 {
         )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("range_u128_inc".to_string())?,
+                metadata::name: blobs.put("range_u128_inc")?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };

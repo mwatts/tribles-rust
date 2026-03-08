@@ -37,7 +37,7 @@ impl ConstDescribe for FileBytes {
         )?;
         Ok(entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("filebytes".to_string())?,
+                metadata::name: blobs.put("filebytes")?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_BLOB_SCHEMA,
         })

@@ -90,15 +90,15 @@ impl AttributeUsage {
         let usage_id = self.usage_id(attribute_id);
         let usage_entity = ExclusiveId::force_ref(&usage_id);
 
-        tribles += entity! { &usage_entity @ metadata::name: blobs.put(self.name.to_owned())? };
+        tribles += entity! { &usage_entity @ metadata::name: blobs.put(self.name)? };
 
         if let Some(description) = self.description {
-            let description_handle = blobs.put(description.to_owned())?;
+            let description_handle = blobs.put(description)?;
             tribles += entity! { &usage_entity @ metadata::description: description_handle };
         }
 
         if let Some(source) = self.source {
-            let module_handle = blobs.put(source.module_path.to_owned())?;
+            let module_handle = blobs.put(source.module_path)?;
             tribles += entity! { &usage_entity @ metadata::source_module: module_handle };
         }
 
@@ -223,7 +223,7 @@ impl<S: ValueSchema> Attribute<S> {
 
 impl<S> Describe for Attribute<S>
 where
-    S: ValueSchema,
+    S: ValueSchema + crate::metadata::ConstDescribe,
 {
     fn describe<B>(&self, blobs: &mut B) -> Result<Fragment, B::PutError>
     where
@@ -241,6 +241,8 @@ where
         if let Some(usage) = self.usage {
             tribles += usage.describe(blobs, id)?;
         }
+
+        tribles += <S as crate::metadata::ConstDescribe>::describe(blobs)?.into_facts();
 
         Ok(Fragment::rooted(id, tribles))
     }

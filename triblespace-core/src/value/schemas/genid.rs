@@ -45,7 +45,7 @@ impl ConstDescribe for GenId {
         let description = blobs.put(
             "Opaque 128-bit identifier stored in the lower 16 bytes; the upper 16 bytes are zero. The value is intended to be high-entropy and stable over time.\n\nUse for entity ids, references, or user-assigned identifiers when the bytes do not carry meaning. If you want content-derived identifiers or deduplication, use a Hash schema instead.\n\nGenId does not imply ordering or integrity. If you need deterministic ids across systems, derive them from agreed inputs (for example using Attribute::from_name or a hash).",
         )?;
-        let name = blobs.put("genid".to_string())?;
+        let name = blobs.put("genid")?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::name: name,

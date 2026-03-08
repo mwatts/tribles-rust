@@ -40,7 +40,7 @@ impl ConstDescribe for NsTAIInterval {
         )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("nstai_interval".to_string())?,
+                metadata::name: blobs.put("nstai_interval")?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };

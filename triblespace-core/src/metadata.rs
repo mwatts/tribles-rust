@@ -71,6 +71,10 @@ pub const KIND_VALUE_SCHEMA: Id = id_hex!("9A169BF2383E7B1A3E019808DFE3C2EB");
 pub const KIND_BLOB_SCHEMA: Id = id_hex!("CE488DB0C494C7FDBF3DF1731AED68A6");
 /// Tag for entities that describe an attribute usage in some source context.
 pub const KIND_ATTRIBUTE_USAGE: Id = id_hex!("45759727A79C28D657EC06D5C6013649");
+/// Tag for entities that describe a protocol.
+pub const KIND_PROTOCOL: Id = id_hex!("A04AD649FA28DC5904385532E9C8EF74");
+/// Tag for entities that are themselves tag/marker constants (e.g. kind discriminants).
+pub const KIND_TAG: Id = id_hex!("452584B4C1CAE0B77F44408E6F194A31");
 
 attributes! {
     /// Optional long-form description stored as a LongString handle.

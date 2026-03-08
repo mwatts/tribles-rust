@@ -59,7 +59,7 @@ impl ConstDescribe for R256LE {
         )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("r256le".to_string())?,
+                metadata::name: blobs.put("r256le")?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
@@ -89,7 +89,7 @@ impl ConstDescribe for R256BE {
         )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("r256be".to_string())?,
+                metadata::name: blobs.put("r256be")?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };

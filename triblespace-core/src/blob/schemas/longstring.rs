@@ -34,7 +34,7 @@ impl ConstDescribe for LongString {
         )?;
         Ok(entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("longstring".to_string())?,
+                metadata::name: blobs.put("longstring")?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_BLOB_SCHEMA,
         })

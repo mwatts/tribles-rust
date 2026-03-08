@@ -36,7 +36,7 @@ impl ConstDescribe for WasmCode {
         )?;
         Ok(entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("wasmcode".to_string())?,
+                metadata::name: blobs.put("wasmcode")?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_BLOB_SCHEMA,
         })

@@ -65,7 +65,7 @@ impl ConstDescribe for SuccinctArchiveBlob {
         )?;
         Ok(entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("succinctarchive".to_string())?,
+                metadata::name: blobs.put("succinctarchive")?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_BLOB_SCHEMA,
         })

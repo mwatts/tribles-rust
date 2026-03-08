@@ -51,7 +51,7 @@ impl ConstDescribe for ED25519RComponent {
         )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("ed25519:r".to_string())?,
+                metadata::name: blobs.put("ed25519:r")?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
@@ -81,7 +81,7 @@ impl ConstDescribe for ED25519SComponent {
         )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("ed25519:s".to_string())?,
+                metadata::name: blobs.put("ed25519:s")?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };
@@ -111,7 +111,7 @@ impl ConstDescribe for ED25519PublicKey {
         )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("ed25519:pubkey".to_string())?,
+                metadata::name: blobs.put("ed25519:pubkey")?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };

@@ -34,7 +34,7 @@ impl ConstDescribe for F64 {
         )?;
         let tribles = entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("f64".to_string())?,
+                metadata::name: blobs.put("f64")?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_VALUE_SCHEMA,
         };

@@ -36,7 +36,7 @@ impl ConstDescribe for SimpleArchive {
         )?;
         Ok(entity! {
             ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("simplearchive".to_string())?,
+                metadata::name: blobs.put("simplearchive")?,
                 metadata::description: description,
                 metadata::tag: metadata::KIND_BLOB_SCHEMA,
         })

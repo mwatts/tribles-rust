@@ -578,6 +578,7 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
         let af_ident = format_ident!("__af{}", i, span = Span::mixed_site());
         let val_ident = format_ident!("__val{}", i, span = Span::mixed_site());
         let aid_ident = format_ident!("__a_id{}", i, span = Span::mixed_site());
+        let extra_ident = format_ident!("__extra{}", i, span = Span::mixed_site());
 
         attr_eval_tokens.extend(quote! { let #af_ident = &#field_expr; });
         match mode {
@@ -596,11 +597,13 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
             }
             AttributeMode::Repeated => {
                 attr_eval_tokens.extend(quote! {
-                    let #val_ident = {
-                        let __iter = #value_expr;
-                        ::std::iter::IntoIterator::into_iter(__iter)
+                    let (#val_ident, #extra_ident) = {
+                        let (__spread_iter, __spread_facts) =
+                            #base_path::trible::Spread::spread(#value_expr);
+                        let __vals = ::std::iter::IntoIterator::into_iter(__spread_iter)
                             .map(|__v| #af_ident.value_from(__v))
-                            .collect::<::std::vec::Vec<_>>()
+                            .collect::<::std::vec::Vec<_>>();
+                        (__vals, __spread_facts)
                     };
                 });
             }
@@ -652,6 +655,7 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
                     for __v in #val_ident.iter() {
                         set.insert(&#base_path::trible::Trible::new(id_ref, &#aid_ident, __v));
                     }
+                    set += #extra_ident;
                 });
             }
         }
