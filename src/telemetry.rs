@@ -30,7 +30,6 @@ pub mod schema {
     use super::*;
 
     attributes! {
-        "FCFE9BFBC865C48001535A15594FB4D6" as pub kind: GenId;
         "3E062AA7E3554C8F2DB94883CE639BFE" as pub session: GenId;
         "146E5AA2F7CB3D8B654BC7742A13CAB3" as pub parent: GenId;
         "CCB0147D20C4C6FCAC0E3D87FAFF71D1" as pub name: Handle<Blake3, LongString>;
@@ -49,49 +48,37 @@ pub mod schema {
     #[allow(non_upper_case_globals)]
     pub const telemetry_metadata: Id = crate::macros::id_hex!("BCFDE38F7E452924C72803239392EA05");
 
-    pub fn build_telemetry_metadata<B>(blobs: &mut B) -> std::result::Result<TribleSet, B::PutError>
+    pub fn build_telemetry_metadata<B>(blobs: &mut B) -> std::result::Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
     {
-        let mut metadata_set = TribleSet::new();
+        let attrs = describe(blobs)?;
 
-        metadata_set += entity! { ExclusiveId::force_ref(&telemetry_metadata) @
-            metadata::name: blobs.put("triblespace_telemetry".to_string())?,
+        let mut protocol = entity! { ExclusiveId::force_ref(&telemetry_metadata) @
+            metadata::name: blobs.put("triblespace_telemetry")?,
             metadata::description: blobs.put(
                 "Span-based profiling events emitted by TribleSpace telemetry.",
             )?,
+            metadata::tag: metadata::KIND_PROTOCOL,
+            metadata::attribute*: attrs,
         };
 
-        metadata_set += <GenId as metadata::ConstDescribe>::describe(blobs)?;
-        metadata_set += <ShortString as metadata::ConstDescribe>::describe(blobs)?;
-        metadata_set += <U256BE as metadata::ConstDescribe>::describe(blobs)?;
-        metadata_set += <Handle<Blake3, LongString> as metadata::ConstDescribe>::describe(blobs)?;
-        metadata_set += <LongString as metadata::ConstDescribe>::describe(blobs)?;
-
-        metadata_set += entity! { ExclusiveId::force_ref(&kind_session) @
-            metadata::name: blobs.put("telemetry_session".to_string())?,
+        protocol += entity! { ExclusiveId::force_ref(&kind_session) @
+            metadata::name: blobs.put("telemetry_session")?,
             metadata::description: blobs.put(
-                "A profiling session. Groups spans emitted during one telemetry run.".to_string(),
+                "A profiling session. Groups spans emitted during one telemetry run.",
             )?,
+            metadata::tag: metadata::KIND_TAG,
         };
-        metadata_set += entity! { ExclusiveId::force_ref(&kind_span) @
-            metadata::name: blobs.put("telemetry_span".to_string())?,
+        protocol += entity! { ExclusiveId::force_ref(&kind_span) @
+            metadata::name: blobs.put("telemetry_span")?,
             metadata::description: blobs.put(
-                "A begin/end span with optional parent links.".to_string(),
+                "A begin/end span with optional parent links.",
             )?,
+            metadata::tag: metadata::KIND_TAG,
         };
 
-        metadata_set += metadata::Describe::describe(&kind, blobs)?;
-        metadata_set += metadata::Describe::describe(&session, blobs)?;
-        metadata_set += metadata::Describe::describe(&parent, blobs)?;
-        metadata_set += metadata::Describe::describe(&name, blobs)?;
-        metadata_set += metadata::Describe::describe(&category, blobs)?;
-        metadata_set += metadata::Describe::describe(&begin_ns, blobs)?;
-        metadata_set += metadata::Describe::describe(&end_ns, blobs)?;
-        metadata_set += metadata::Describe::describe(&duration_ns, blobs)?;
-        metadata_set += metadata::Describe::describe(&source, blobs)?;
-
-        Ok(metadata_set)
+        Ok(protocol)
     }
 }
 
@@ -396,8 +383,9 @@ fn run_sink(
 
     let result = (|| -> Result<(), String> {
         // Set the default metadata once; commits only carry a handle.
-        let metadata_set = schema::build_telemetry_metadata(repo.storage_mut())
-            .map_err(|e| format!("build telemetry metadata: {e:?}"))?;
+        let metadata_set: TribleSet = schema::build_telemetry_metadata(repo.storage_mut())
+            .map_err(|e| format!("build telemetry metadata: {e:?}"))?
+            .into();
         repo.set_default_metadata(metadata_set)
             .map_err(|e| format!("set default metadata: {e:?}"))?;
 
@@ -415,7 +403,7 @@ fn run_sink(
         let session_entity = ExclusiveId::force_ref(&session);
         let mut init = TribleSet::new();
         init += entity! { session_entity @
-            schema::kind: schema::kind_session,
+            metadata::tag: schema::kind_session,
             schema::category: "session",
             schema::name: ws.put(session_name),
             schema::begin_ns: 0u64,
@@ -474,7 +462,7 @@ fn span_begin(ws: &mut crate::core::repo::Workspace<Pile<Blake3>>, msg: BeginMsg
     let span_entity = ExclusiveId::force_ref(&msg.span);
     let mut out = TribleSet::new();
     out += entity! { span_entity @
-        schema::kind: schema::kind_span,
+        metadata::tag: schema::kind_span,
         schema::session: msg.session,
         schema::category: msg.category,
         schema::name: ws.put(msg.name),
