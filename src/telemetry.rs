@@ -338,13 +338,10 @@ impl Telemetry {
         }
 
         let signing_key = SigningKey::generate(&mut OsRng);
-        let mut repo = Repository::new(pile, signing_key);
-
-        // Set default metadata.
-        let metadata_set: TribleSet = schema::build_telemetry_metadata(repo.storage_mut())
+        let metadata_set: TribleSet = schema::build_telemetry_metadata(&mut pile)
             .ok()?
             .into();
-        repo.set_default_metadata(metadata_set).ok()?;
+        let mut repo = Repository::new(pile, signing_key, metadata_set).ok()?;
 
         // Commit session start entity.
         let mut ws = repo.pull(branch_id).ok()?;
@@ -356,7 +353,7 @@ impl Telemetry {
             schema::name: ws.put(session_name.to_string()),
             schema::begin_ns: 0u64,
         };
-        ws.commit(init, None, Some("telemetry session"));
+        ws.commit(init, "telemetry session");
         if repo.push(&mut ws).is_err() {
             let _ = repo.close();
             return None;
@@ -423,7 +420,7 @@ impl Drop for Telemetry {
                         schema::end_ns: end_ns,
                         schema::duration_ns: end_ns,
                     };
-                    ws.commit(end, None, Some("telemetry session end"));
+                    ws.commit(end, "telemetry session end");
                     if let Err(e) = repo.push(&mut ws) {
                         log::warn!("telemetry session end push failed: {e:?}");
                     }
@@ -467,7 +464,7 @@ fn span_begin(
     if let Some(source) = source {
         tribles += entity! { span_entity @ schema::source: ws.put(source) };
     }
-    ws.commit(tribles, None, None);
+    ws.commit(tribles, "telemetry span");
 }
 
 fn span_end(ws: &mut Workspace<Pile<Blake3>>, span_id: Id, at_ns: u64, duration_ns: u64) {
@@ -477,5 +474,5 @@ fn span_end(ws: &mut Workspace<Pile<Blake3>>, span_id: Id, at_ns: u64, duration_
         schema::end_ns: at_ns,
         schema::duration_ns: duration_ns,
     };
-    ws.commit(tribles, None, None);
+    ws.commit(tribles, "telemetry span end");
 }

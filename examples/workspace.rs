@@ -5,12 +5,12 @@ use triblespace::core::repo::Repository;
 use triblespace::prelude::*;
 
 fn main() {
-    let mut repo = Repository::new(MemoryRepo::default(), SigningKey::generate(&mut OsRng));
+    let mut repo = Repository::new(MemoryRepo::default(), SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
 
     // create a new branch and add a commit
     let branch_id = repo.create_branch("feature", None).expect("create branch");
     let mut workspace = repo.pull(*branch_id).expect("pull");
-    workspace.commit(TribleSet::new(), None, Some("start feature work"));
+    workspace.commit(TribleSet::new(), "start feature work");
 
     // attempt to push, merging conflicts before retrying
     while let Some(mut incoming) = repo.try_push(&mut workspace).expect("push") {

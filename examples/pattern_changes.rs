@@ -20,7 +20,7 @@ pub mod literature {
 fn main() {
     // ANCHOR: pattern_changes_example
     let storage = MemoryRepo::default();
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng));
+    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
     let branch_id = repo.create_branch("main", None).expect("branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
@@ -30,14 +30,14 @@ fn main() {
     let mut base = TribleSet::new();
     base += entity! { &shakespeare @ literature::firstname: "William", literature::lastname: "Shakespeare" };
     base += entity! { &hamlet @ literature::title: "Hamlet", literature::author: &shakespeare };
-    ws.commit(base.clone(), None, None);
+    ws.commit(base.clone(), "commit");
     let c1 = ws.head().unwrap();
 
     // Commit a new book
     let macbeth = ufoid();
     let mut change = TribleSet::new();
     change += entity! { &macbeth @ literature::title: "Macbeth", literature::author: &shakespeare };
-    ws.commit(change.clone(), None, None);
+    ws.commit(change.clone(), "commit");
     let c2 = ws.head().unwrap();
 
     // Compute updated state and delta between commits

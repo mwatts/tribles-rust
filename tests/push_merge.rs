@@ -7,13 +7,13 @@ use triblespace::prelude::*;
 #[test]
 fn push_and_merge_conflict_resolution() {
     let storage = MemoryRepo::default();
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng));
+    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws1 = repo.pull(*branch_id).expect("pull");
     let mut ws2 = repo.pull(*branch_id).expect("pull");
 
-    ws1.commit(TribleSet::new(), None, Some("first"));
-    ws2.commit(TribleSet::new(), None, Some("second"));
+    ws1.commit(TribleSet::new(), "first");
+    ws2.commit(TribleSet::new(), "second");
 
     repo.push(&mut ws1).expect("push");
 

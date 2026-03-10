@@ -32,18 +32,18 @@ use triblespace_macros_common::{
 };
 
 mod instrumentation_attributes {
+    /// Attributes specific to compile-time attribute definition instrumentation.
+    /// Reuses `metadata::name`, `metadata::attribute`, and `metadata::tag` for
+    /// fields that match their runtime `describe()` counterparts.
     pub(crate) mod attribute {
         use triblespace_core::blob::schemas::longstring::LongString;
         use triblespace_core::prelude::valueschemas::{Blake3, Handle, ShortString};
         use triblespace_core_macros::attributes;
 
-        // IDs generated via
-        // `python - <<'PY' ; import secrets ; [print(secrets.token_hex(16).upper()) for _ in range(9)] ; PY`
-        // to avoid hand-crafted values.
         attributes! {
-            "8DFC35FC0CC0BD1142CBDB11864A1FDD" as attribute_id: ShortString;
-            "C77224F1467F7858D09B1591631C76D6" as attribute_name: ShortString;
+            // Instrumentation-specific: link back to the macro invocation entity.
             "19D4972B2DF977FA64541FC967C4B133" as invocation: ShortString;
+            // Instrumentation-specific: the Rust type tokens for this attribute's value schema.
             "D97A427FF782B0BF08B55AC84877B486" as attribute_type: Handle<Blake3, LongString>;
         }
     }
@@ -139,7 +139,10 @@ where
             return;
         }
     };
-    let mut repo = Repository::new(pile, signing_key);
+    let mut repo = match Repository::new(pile, signing_key, TribleSet::new()) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
 
     let mut workspace = match repo.pull(branch_id) {
         Ok(ws) => ws,
@@ -183,7 +186,7 @@ where
         return;
     }
 
-    workspace.commit(set, None, None);
+    workspace.commit(set, "macro invocation");
 
     {
         let mut context = MetadataContext {
@@ -240,6 +243,10 @@ impl Parse for AttributeDefinitions {
 }
 
 fn emit_attribute_definitions(context: &mut MetadataContext<'_>) {
+    use triblespace_core::metadata;
+    use triblespace_core::prelude::ValueSchema;
+    use triblespace_core::value::schemas::genid::GenId;
+
     let Ok(parsed) =
         syn::parse2::<AttributeDefinitions>(TokenStream2::from(context.tokens().clone()))
     else {
@@ -253,24 +260,29 @@ fn emit_attribute_definitions(context: &mut MetadataContext<'_>) {
 
     for definition in parsed.entries {
         let entity = fucid();
+
+        // Parse the attribute hex ID into a proper Id for GenId storage.
+        let Some(attr_id) = Id::from_hex(&definition.id.value()) else {
+            continue;
+        };
+
+        let name_handle = context.workspace().put(definition.name.to_string());
         let mut set = ::triblespace_core::macros::entity! {
             &entity @
-            attribute::attribute_id: definition.id.value(),
-            attribute::attribute_name: definition.name.to_string(),
+            metadata::attribute: GenId::value_from(attr_id),
+            metadata::name: name_handle,
+            metadata::tag: metadata::KIND_ATTRIBUTE_USAGE,
             attribute::invocation: invocation_hex.as_str()
         };
 
         let ty_tokens = definition.ty.to_token_stream().to_string();
         if !ty_tokens.is_empty() {
-            let handle = {
-                let workspace = context.workspace();
-                workspace.put(ty_tokens)
-            };
+            let handle = context.workspace().put(ty_tokens);
             set +=
                 ::triblespace_core::macros::entity! { &entity @ attribute::attribute_type: handle };
         }
 
-        context.workspace().commit(set, None, None);
+        context.workspace().commit(set, "macro invocation");
     }
 }
 

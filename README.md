@@ -109,7 +109,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Repositories manage shared history; MemoryRepo keeps everything in-memory
     // for quick experiments. Swap in a `Pile` when you need durable storage.
     let storage = MemoryRepo::default();
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng));
+    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new())?;
     let branch_id = repo
         .create_branch("main", None)
         .expect("create branch");
@@ -137,7 +137,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     };
 
-    ws.commit(library, None, Some("import dune"));
+    ws.commit(library, "import dune");
 
     // `checkout(..)` returns the accumulated TribleSet for the branch.
     let catalog = ws.checkout(..)?;
@@ -172,8 +172,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Stage a non-monotonic update that we plan to reconcile manually.
     ws.commit(
         entity! { &author_id @ literature::firstname: "Francis" },
-        None,
-        Some("use pen name"),
+        "use pen name",
     );
 
     // Simulate a collaborator racing us with a different update.
@@ -182,8 +181,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("pull collaborator workspace");
     collaborator.commit(
         entity! { &author_id @ literature::firstname: "Franklin" },
-        None,
-        Some("record legal first name"),
+        "record legal first name",
     );
     repo.push(&mut collaborator)
         .expect("publish collaborator history");
@@ -211,8 +209,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         ws.commit(
             entity! { &author_id @ literature::alias: "Francis" },
-            None,
-            Some("keep pen-name as an alias"),
+            "keep pen-name as an alias",
         );
 
         repo.push(&mut ws)

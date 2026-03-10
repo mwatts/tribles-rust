@@ -13,12 +13,12 @@ fn branch_from_and_pull_with_key() {
     let commit_set = commit::commit_metadata(&key, [], None, None, None);
     let initial = store.put(commit_set).unwrap();
 
-    let mut repo = Repository::new(store, key.clone());
+    let mut repo = Repository::new(store, key.clone(), TribleSet::new()).unwrap();
     let branch_id = repo
         .create_branch("feature", Some(initial))
         .expect("branch from");
     let mut ws = repo.pull(*branch_id).expect("pull");
-    ws.commit(TribleSet::new(), None, Some("work"));
+    ws.commit(TribleSet::new(), "work");
     repo.push(&mut ws).expect("push");
 
     // pull using a different key should succeed

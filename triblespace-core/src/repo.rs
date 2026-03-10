@@ -31,7 +31,7 @@
 //! use triblespace::repo::{memoryrepo::MemoryRepo, Repository};
 //!
 //! let storage = MemoryRepo::default();
-//! let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng));
+//! let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
 //! let branch_id = repo.create_branch("main", None).expect("create branch");
 //! let mut ws = repo.pull(*branch_id).expect("pull branch");
 //!
@@ -46,8 +46,7 @@
 //!         literature::firstname: "Frank",
 //!         literature::lastname: "Herbert",
 //!      },
-//!     None,
-//!     Some("initial commit"),
+//!     "initial commit",
 //! );
 //!
 //! // Single-attempt push: `try_push` uploads local blobs and attempts a
@@ -661,7 +660,7 @@ where
 pub struct Repository<Storage: BlobStore<Blake3> + BranchStore<Blake3>> {
     storage: Storage,
     signing_key: SigningKey,
-    default_metadata: Option<MetadataHandle>,
+    commit_metadata: MetadataHandle,
 }
 
 pub enum PullError<BranchStorageErr, BlobReaderErr, BlobStorageErr>
@@ -703,22 +702,21 @@ impl<Storage> Repository<Storage>
 where
     Storage: BlobStore<Blake3> + BranchStore<Blake3>,
 {
-    /// Creates a new repository with the given blob and branch repositories.
-    /// The blob repository is used to store the actual data of the repository,
-    /// while the branch repository is used to store the state of the repository.
-    /// The hash protocol is used to hash the blobs and branches in the repository.
+    /// Creates a new repository with the given storage, signing key, and commit metadata.
     ///
-    /// # Parameters
-    /// * `blobs` - The blob repository to use for storing blobs.
-    /// * `branches` - The branch repository to use for storing branches.
-    /// # Returns
-    /// * A new `Repo` object that can be used to store and retrieve blobs and branches.
-    pub fn new(storage: Storage, signing_key: SigningKey) -> Self {
-        Self {
+    /// The `commit_metadata` TribleSet is stored as a blob in the repository and attached
+    /// to every commit created through this repository's workspaces.
+    pub fn new(
+        mut storage: Storage,
+        signing_key: SigningKey,
+        commit_metadata: TribleSet,
+    ) -> Result<Self, <Storage as BlobStorePut<Blake3>>::PutError> {
+        let commit_metadata = storage.put(commit_metadata)?;
+        Ok(Self {
             storage,
             signing_key,
-            default_metadata: None,
-        }
+            commit_metadata,
+        })
     }
 
     /// Consume the repository and return the underlying storage backend.
@@ -745,25 +743,9 @@ where
         self.signing_key = signing_key;
     }
 
-    /// Sets the repository default metadata for new workspaces.
-    /// The metadata blob is stored in the repository's blob store.
-    pub fn set_default_metadata(
-        &mut self,
-        metadata_set: TribleSet,
-    ) -> Result<MetadataHandle, <Storage as BlobStorePut<Blake3>>::PutError> {
-        let handle = self.storage.put(metadata_set)?;
-        self.default_metadata = Some(handle);
-        Ok(handle)
-    }
-
-    /// Clears the repository default metadata.
-    pub fn clear_default_metadata(&mut self) {
-        self.default_metadata = None;
-    }
-
-    /// Returns the repository default metadata handle, if configured.
-    pub fn default_metadata(&self) -> Option<MetadataHandle> {
-        self.default_metadata
+    /// Returns the repository commit metadata handle.
+    pub fn commit_metadata(&self) -> MetadataHandle {
+        self.commit_metadata
     }
 
     /// Initializes a new branch in the repository.
@@ -891,26 +873,8 @@ where
             base_branch_id: branch_id,
             base_branch_meta: base_branch_meta_handle,
             signing_key,
-            default_metadata: self.default_metadata,
+            commit_metadata: self.commit_metadata,
         })
-    }
-
-    /// Pulls an existing branch and overrides the workspace default metadata.
-    pub fn pull_with_metadata(
-        &mut self,
-        branch_id: Id,
-        metadata_set: TribleSet,
-    ) -> Result<
-        Workspace<Storage>,
-        PullError<
-            Storage::HeadError,
-            Storage::ReaderError,
-            <Storage::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>,
-        >,
-    > {
-        let mut workspace = self.pull_with_key(branch_id, self.signing_key.clone())?;
-        workspace.set_default_metadata(metadata_set);
-        Ok(workspace)
     }
 
     /// Pushes the workspace's new blobs and commit to the persistent repository.
@@ -1043,7 +1007,7 @@ where
                     base_branch_id: workspace.base_branch_id,
                     base_branch_meta: conflicting_meta,
                     signing_key: workspace.signing_key.clone(),
-                    default_metadata: workspace.default_metadata,
+                    commit_metadata: workspace.commit_metadata,
                 };
 
                 Ok(Some(conflict_ws))
@@ -1079,8 +1043,8 @@ pub struct Workspace<Blobs: BlobStore<Blake3>> {
     base_head: Option<CommitHandle>,
     /// Signing key used for commit/branch signing.
     signing_key: SigningKey,
-    /// Optional default metadata handle for commits created in this workspace.
-    default_metadata: Option<MetadataHandle>,
+    /// Metadata handle for commits created in this workspace.
+    commit_metadata: MetadataHandle,
 }
 
 impl<Blobs> fmt::Debug for Workspace<Blobs>
@@ -1096,7 +1060,7 @@ where
             .field("base_branch_meta", &self.base_branch_meta)
             .field("base_head", &self.base_head)
             .field("head", &self.head)
-            .field("default_metadata", &self.default_metadata)
+            .field("commit_metadata", &self.commit_metadata)
             .finish()
     }
 }
@@ -1671,25 +1635,9 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
         self.head
     }
 
-    /// Sets the default metadata for commits created in this workspace.
-    /// The metadata blob is stored in the workspace's local blob store.
-    pub fn set_default_metadata(&mut self, metadata_set: TribleSet) -> MetadataHandle {
-        let handle = self
-            .local_blobs
-            .put(metadata_set)
-            .expect("infallible metadata blob put");
-        self.default_metadata = Some(handle);
-        handle
-    }
-
-    /// Clears the default metadata for commits created in this workspace.
-    pub fn clear_default_metadata(&mut self) {
-        self.default_metadata = None;
-    }
-
-    /// Returns the default metadata handle, if configured.
-    pub fn default_metadata(&self) -> Option<MetadataHandle> {
-        self.default_metadata
+    /// Returns the workspace metadata handle.
+    pub fn metadata(&self) -> MetadataHandle {
+        self.commit_metadata
     }
 
     /// Adds a blob to the workspace's local blob store.
@@ -1726,24 +1674,25 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
     /// Performs a commit in the workspace.
     /// This method creates a new commit blob (stored in the local blobset)
     /// and updates the current commit handle.
-    /// If `metadata` is `None`, a configured default metadata handle is attached
-    /// automatically. Supplying metadata does not change the workspace default.
     pub fn commit(
         &mut self,
         content_: impl Into<TribleSet>,
-        metadata_: Option<TribleSet>,
-        message_: Option<&str>,
+        message_: &str,
     ) {
         let content_ = content_.into();
-        let metadata_handle = match metadata_ {
-            Some(metadata_set) => Some(
-                self.local_blobs
-                    .put(metadata_set)
-                    .expect("infallible metadata blob put"),
-            ),
-            None => self.default_metadata,
-        };
-        self.commit_internal(content_, metadata_handle, message_);
+        self.commit_internal(content_, Some(self.commit_metadata), Some(message_));
+    }
+
+    /// Like [`commit`](Self::commit) but attaches a one-off metadata handle
+    /// instead of the repository default.
+    pub fn commit_with_metadata(
+        &mut self,
+        content_: impl Into<TribleSet>,
+        metadata_: MetadataHandle,
+        message_: &str,
+    ) {
+        let content_ = content_.into();
+        self.commit_internal(content_, Some(metadata_), Some(message_));
     }
 
     fn commit_internal(

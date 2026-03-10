@@ -69,7 +69,7 @@ mod readme_example {
     #[test]
     fn readme_example() -> Result<(), Box<dyn std::error::Error>> {
         let storage = MemoryRepo::default();
-        let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng));
+        let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
         let branch_id = repo.create_branch("main", None).expect("create branch");
         let mut ws = repo.pull(*branch_id).expect("pull workspace");
 
@@ -98,7 +98,7 @@ mod readme_example {
             ),
         };
 
-        ws.commit(library, None, Some("import dune"));
+        ws.commit(library, "import dune");
 
         let catalog = ws.checkout(..)?;
         let title = "Dune";
@@ -136,16 +136,14 @@ mod readme_example {
         // Stage a non-monotonic update that we plan to reconcile manually.
         ws.commit(
             entity! { &author_id @ literature::firstname: "Francis" },
-            None,
-            Some("use pen name"),
+            "use pen name",
         );
 
         // Simulate a collaborator racing us with a different update.
         let mut collaborator = repo.pull(*branch_id).expect("pull collaborator workspace");
         collaborator.commit(
             entity! { &author_id @ literature::firstname: "Franklin" },
-            None,
-            Some("record legal first name"),
+            "record legal first name",
         );
         repo.push(&mut collaborator)
             .expect("publish collaborator history");
@@ -176,8 +174,7 @@ mod readme_example {
 
             ws.commit(
                 entity! { &author_id @ literature::alias: "Francis" },
-                None,
-                Some("keep pen-name as an alias"),
+                "keep pen-name as an alias",
             );
 
             repo.push(&mut ws).expect("publish merged aliases");

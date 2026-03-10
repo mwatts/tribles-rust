@@ -7,6 +7,7 @@ use crate::blob::schemas::simplearchive::SimpleArchive;
 use crate::repo::commit;
 use crate::repo::memoryrepo::MemoryRepo;
 use crate::repo::{self, Repository};
+use crate::tribleset::TribleSet;
 use crate::value::schemas::hash::{Blake3, Handle};
 use crate::value::Value;
 
@@ -44,7 +45,7 @@ fn ancestors_respects_bounded_commit_dags() {
         return;
     }
 
-    let mut repo = Repository::new(storage, signing_key);
+    let mut repo = Repository::new(storage, signing_key, TribleSet::new()).unwrap();
     let branch_id = repo
         .create_branch("kani", commit_handles.last().copied())
         .expect("branch creation")

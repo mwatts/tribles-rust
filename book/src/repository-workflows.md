@@ -25,7 +25,9 @@ traits. The choice largely depends on your deployment scenario:
 1. Pick or compose a storage backend (see [Storage Backends and
    Composition](#storage-backends-and-composition)).
 2. Create a signing key for the identity that will author commits.
-3. Call `Repository::new(storage, signing_key)` to obtain a handle.
+3. Call `Repository::new(storage, signing_key, commit_metadata)` to obtain a handle.
+   Pass `TribleSet::new()` for `commit_metadata` when you do not need custom
+   metadata on commits.
 
 Most applications perform the above steps once during start-up and then reuse
 the resulting `Repository`. If initialization may fail (for example when opening
@@ -70,7 +72,7 @@ let blob_remote: ObjectStoreRemote<Blake3> =
     ObjectStoreRemote::with_url(&Url::parse("s3://bucket/prefix")?)?;
 let branch_store = MemoryRepo::default();
 let storage = HybridStore::new(blob_remote, branch_store);
-let mut repo = Repository::new(storage, signing_key);
+let mut repo = Repository::new(storage, signing_key, TribleSet::new())?;
 
 // Work with repo as usual …
 // repo.close()?; // if the underlying storage supports StorageClose
@@ -100,7 +102,7 @@ before sharing work or starting another task.
 
 
 ```rust
-let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng));
+let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())?;
 let branch_id = repo.create_branch("main", None).expect("create branch");
 
 let mut ws = repo.pull(*branch_id).expect("pull branch");
@@ -113,7 +115,7 @@ returns `Ok(Some(conflict_ws))` when the branch head moved. Choose the latter
 when you need explicit conflict handling:
 
 ```rust
-ws.commit(change, None, Some("initial commit"));
+ws.commit(change, "initial commit");
 repo.push(&mut ws)?;
 ```
 
@@ -144,7 +146,7 @@ let alice = SigningKey::generate(&mut OsRng);
 let automation = SigningKey::generate(&mut OsRng);
 
 // Assume `pile` was opened earlier, e.g. via `Pile::open` as shown in previous sections.
-let mut repo = Repository::new(pile, alice.clone());
+let mut repo = Repository::new(pile, alice.clone(), TribleSet::new())?;
 
 // Create a dedicated branch for the automation pipeline using its key.
 let automation_branch = repo
@@ -215,7 +217,7 @@ use triblespace::repo::{self, memoryrepo::MemoryRepo, Repository};
 use blobschemas::{LongString, SimpleArchive};
 
 let storage = MemoryRepo::default();
-let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng));
+let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new())?;
 let branch_id = repo.create_branch("main", None).expect("create branch");
 let mut ws = repo.pull(*branch_id).expect("pull branch");
 
@@ -230,7 +232,7 @@ let mut change = triblespace::entity! {
 };
 change += triblespace::entity! { repo::content: archive_handle.clone() };
 
-ws.commit(change, None, Some("Attach annotated dataset"));
+ws.commit(change, "Attach annotated dataset");
 // Single-attempt push. Use `push` to let the repository merge and retry automatically.
 repo.try_push(&mut ws).expect("try_push");
 
@@ -268,7 +270,7 @@ There are two ways to handle this:
   `Ok(Some(conflict_ws))` so callers can merge and retry explicitly:
 
 ```rust
-ws.commit(content, None, Some("codex-turn"));
+ws.commit(content, "codex-turn");
 let mut current_ws = ws;
 while let Some(mut incoming) = repo.try_push(&mut current_ws)? {
     // Merge the local staged changes into the incoming workspace and retry.
@@ -282,7 +284,7 @@ while let Some(mut incoming) = repo.try_push(&mut current_ws)? {
   automatically; it either succeeds (returns `Ok(())`) or returns an error.
 
 ```rust
-ws.commit(content, None, Some("codex-turn"));
+ws.commit(content, "codex-turn");
 repo.push(&mut ws)?; // will internally merge and retry until success
 ```
 
@@ -395,11 +397,11 @@ use url::Url;
 fn open_remote_repo(raw_url: &str) -> anyhow::Result<()> {
     let url = Url::parse(raw_url)?;
     let storage = ObjectStoreRemote::<Blake3>::with_url(&url)?;
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng));
+    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new())?;
 
     let branch_id = repo.create_branch("main", None)?;
     let mut ws = repo.pull(*branch_id)?;
-    ws.commit(TribleSet::new(), None, Some("initial commit"));
+    ws.commit(TribleSet::new(), "initial commit");
 
     while let Some(mut incoming) = repo.try_push(&mut ws)? {
         incoming.merge(&mut ws)?;
@@ -506,7 +508,7 @@ fn merge_import_example(
     eprintln!("copied {} reachable blobs", mapping.len());
 
     // 4) Attach via a single merge commit in the destination branch
-    let mut repo = Repository::new(dst, SigningKey::generate(&mut OsRng));
+    let mut repo = Repository::new(dst, SigningKey::generate(&mut OsRng), TribleSet::new())?;
     let mut ws = repo.pull(dst_branch_id)?;
     ws.merge_commit(src_head)?; // parents = { current HEAD, src_head }
 

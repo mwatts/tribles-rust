@@ -11,7 +11,7 @@ use url::Url;
 fn objectstore_branch_creates_branch() {
     let url = Url::parse("memory:///repo").unwrap();
     let storage = ObjectStoreRemote::<Blake3>::with_url(&url).unwrap();
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng));
+    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
     let branch_id = repo.create_branch("main", None).expect("create branch");
 
     repo.pull(*branch_id).expect("pull");
@@ -21,11 +21,11 @@ fn objectstore_branch_creates_branch() {
 fn objectstore_workspace_commit_updates_head() {
     let url = Url::parse("memory:///repo2").unwrap();
     let storage = ObjectStoreRemote::<Blake3>::with_url(&url).unwrap();
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng));
+    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull");
 
-    ws.commit(TribleSet::new(), None, Some("change"));
+    ws.commit(TribleSet::new(), "change");
 
     repo.push(&mut ws).expect("push");
 }
@@ -38,12 +38,12 @@ fn objectstore_branch_from_and_pull_with_key() {
     let commit_set = repo::commit::commit_metadata(&key, [], None, None, None);
     let initial = store.put(commit_set).unwrap();
 
-    let mut repo = Repository::new(store, key.clone());
+    let mut repo = Repository::new(store, key.clone(), TribleSet::new()).unwrap();
     let branch_id = repo
         .create_branch("feature", Some(initial))
         .expect("branch from");
     let mut ws = repo.pull(*branch_id).expect("pull");
-    ws.commit(TribleSet::new(), None, Some("work"));
+    ws.commit(TribleSet::new(), "work");
     repo.push(&mut ws).expect("push");
 
     let other_key = SigningKey::generate(&mut OsRng);
@@ -55,13 +55,13 @@ fn objectstore_branch_from_and_pull_with_key() {
 fn objectstore_push_and_merge_conflict_resolution() {
     let url = Url::parse("memory:///repo4").unwrap();
     let storage = ObjectStoreRemote::<Blake3>::with_url(&url).unwrap();
-    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng));
+    let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
     let branch_id = repo.create_branch("main", None).expect("create branch");
     let mut ws1 = repo.pull(*branch_id).expect("pull");
     let mut ws2 = repo.pull(*branch_id).expect("pull");
 
-    ws1.commit(TribleSet::new(), None, Some("first"));
-    ws2.commit(TribleSet::new(), None, Some("second"));
+    ws1.commit(TribleSet::new(), "first");
+    ws2.commit(TribleSet::new(), "second");
 
     repo.push(&mut ws1).expect("push");
 
