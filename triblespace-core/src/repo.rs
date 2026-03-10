@@ -651,6 +651,15 @@ where
     BadBranchMetadata(),
 }
 
+#[derive(Debug)]
+pub enum EnsureBranchError<Storage>
+where
+    Storage: BranchStore<Blake3> + BlobStore<Blake3>,
+{
+    Lookup(LookupError<Storage>),
+    Create(BranchError<Storage>),
+}
+
 /// High-level wrapper combining a blob store and branch store into a usable
 /// repository API.
 ///
@@ -808,6 +817,91 @@ where
         match push_result {
             PushResult::Success() => Ok(branch_id),
             PushResult::Conflict(_) => Err(BranchError::AlreadyExists()),
+        }
+    }
+
+    /// Look up a branch by name.
+    ///
+    /// Iterates all branches, reads each one's metadata, and returns the ID
+    /// of the branch whose name matches. Returns `Ok(None)` if no branch has
+    /// that name, or `LookupError::NameConflict` if multiple branches share it.
+    pub fn lookup_branch(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<Id>, LookupError<Storage>> {
+        let branch_ids: Vec<Id> = self
+            .storage
+            .branches()
+            .map_err(LookupError::StorageBranches)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(LookupError::StorageBranches)?;
+
+        let mut matches = Vec::new();
+
+        for branch_id in branch_ids {
+            let Some(meta_handle) = self
+                .storage
+                .head(branch_id)
+                .map_err(LookupError::BranchHead)?
+            else {
+                continue;
+            };
+
+            let reader = self
+                .storage
+                .reader()
+                .map_err(LookupError::StorageReader)?;
+            let meta_set: TribleSet =
+                reader.get(meta_handle).map_err(LookupError::StorageGet)?;
+
+            let Ok((name_handle,)) = find!(
+                (n: Value<Handle<Blake3, LongString>>),
+                pattern!(&meta_set, [{ crate::metadata::name: ?n }])
+            )
+            .exactly_one()
+            else {
+                continue;
+            };
+
+            let Ok(branch_name): Result<anybytes::View<str>, _> = reader.get(name_handle) else {
+                continue;
+            };
+
+            if branch_name.as_ref() == name {
+                matches.push(branch_id);
+            }
+        }
+
+        match matches.len() {
+            0 => Ok(None),
+            1 => Ok(Some(matches[0])),
+            _ => Err(LookupError::NameConflict(matches)),
+        }
+    }
+
+    /// Ensure a branch with the given name exists, creating it if necessary.
+    ///
+    /// If a branch named `name` already exists, returns its ID.
+    /// If no such branch exists, creates a new one (optionally from the given
+    /// commit) and returns its ID.
+    ///
+    /// Errors if multiple branches share the same name (ambiguous).
+    pub fn ensure_branch(
+        &mut self,
+        name: &str,
+        commit: Option<CommitHandle>,
+    ) -> Result<Id, EnsureBranchError<Storage>> {
+        match self
+            .lookup_branch(name)
+            .map_err(EnsureBranchError::Lookup)?
+        {
+            Some(id) => Ok(id),
+            None => {
+                let id = self
+                    .create_branch(name, commit)
+                    .map_err(EnsureBranchError::Create)?;
+                Ok(*id)
+            }
         }
     }
 
