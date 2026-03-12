@@ -8,13 +8,13 @@ pub use triblespace_core as core;
 pub mod macros {
     pub use triblespace_core::macros::id_hex;
     pub use triblespace_macros::{
-        attributes, entity, find, matches, path, pattern, pattern_changes, value_formatter,
+        attributes, entity, exists, find, path, pattern, pattern_changes, value_formatter,
     };
 }
 
 pub mod prelude {
     pub use crate::macros::{
-        attributes, entity, find, matches, path, pattern, pattern_changes, value_formatter,
+        attributes, entity, exists, find, path, pattern, pattern_changes, value_formatter,
     };
     pub use triblespace_core::prelude::*;
 }

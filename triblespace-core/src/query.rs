@@ -647,12 +647,12 @@ macro_rules! find {
 pub use find;
 
 #[macro_export]
-macro_rules! matches {
+macro_rules! exists {
     (($($Var:ident$(:$Ty:ty)?),* $(,)?), $Constraint:expr) => {
         $crate::query::find!(($($Var$(:$Ty)?),*), $Constraint).next().is_some()
     };
 }
-pub use matches;
+pub use exists;
 
 #[macro_export]
 macro_rules! temp {
@@ -827,13 +827,13 @@ mod tests {
     }
 
     #[test]
-    fn matches_true() {
-        assert!(matches!((a: Value<_>), a.is(I256BE::value_from(42))));
+    fn exists_true() {
+        assert!(exists!((a: Value<_>), a.is(I256BE::value_from(42))));
     }
 
     #[test]
-    fn matches_false() {
-        assert!(!matches!(
+    fn exists_false() {
+        assert!(!exists!(
             (a: Value<_>),
             and!(a.is(I256BE::value_from(1)), a.is(I256BE::value_from(2)))
         ));

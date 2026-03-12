@@ -50,7 +50,7 @@ pub use crate::metadata::{ConstDescribe, ConstId, Describe};
 pub use crate::query::find;
 pub use crate::query::intersectionconstraint::and;
 pub use crate::query::intersectionconstraint::IntersectionConstraint;
-pub use crate::query::matches;
+pub use crate::query::exists;
 pub use crate::repo::pile::Pile;
 pub use crate::repo::BlobStore;
 pub use crate::repo::BlobStoreGet;

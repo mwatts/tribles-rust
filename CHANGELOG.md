@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] - 2026-03-13
+### Changed
+- **Breaking:** Renamed the `matches!` query macro to `exists!` to resolve the
+  name collision with `std::matches!` that made the macro unusable in practice.
+
 ## [Unreleased]
 ### Added
 - Optional `telemetry` feature in the facade crate:
@@ -606,7 +611,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Clarified the regular path example to use `temp!` when hiding an endpoint so
   the traversal still participates in follow-up constraints without projecting
   the hidden binding.
-- `ignore!` now always infers its context from `find!`/`matches!`. Use
+- `ignore!` now always infers its context from `find!`/`exists!`. Use
   [`IgnoreConstraint::new`](https://docs.rs/tribles/latest/tribles/query/ignore/struct.IgnoreConstraint.html)
   directly when building bespoke constraints outside those macros.
 - `temp!` now mirrors `ignore!` by taking both the tuple-style binding list and
@@ -1108,7 +1113,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TimeRange` selector to gather commits between two instants.
 - Compressed zero-copy archives are now complete.
 - Incremental queries use a new `pattern_changes!` macro.
-- Added a `matches!` macro mirroring `find!` for boolean checks.
+- Added an `exists!` macro (formerly `matches!`) mirroring `find!` for boolean checks.
 - Regular path queries via a new `RegularPathConstraint` and namespaced `path!` macro.
 - `path!` automata now store transitions in a `PATCH` for efficient lookups and set operations.
 - Added a `filter` commit selector with a `history_of` helper.

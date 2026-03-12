@@ -357,11 +357,11 @@ pub fn find(input: TokenStream) -> TokenStream {
 }
 
 #[proc_macro]
-pub fn matches(input: TokenStream) -> TokenStream {
+pub fn exists(input: TokenStream) -> TokenStream {
     let clone = input.clone();
-    emit_metadata("matches", &clone, |_context| {});
+    emit_metadata("exists", &clone, |_context| {});
     let inner = TokenStream2::from(input);
-    TokenStream::from(quote!(::triblespace::core::matches!(#inner)))
+    TokenStream::from(quote!(::triblespace::core::exists!(#inner)))
 }
 
 #[proc_macro_attribute]

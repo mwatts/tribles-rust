@@ -220,7 +220,7 @@ while only keeping some of its positions.
 This inertness is a strict scoping rule rather than existential quantification.
 If you need to assert that some related fact exists without reifying its value,
 structure the pattern so the surviving variables capture that dependency. The
-macro automatically uses the ambient context that `find!` or `matches!`
+macro automatically uses the ambient context that `find!` or `exists!`
 provides, so typical invocations only specify the variable list and nested
 constraint:
 
@@ -372,19 +372,19 @@ The `_?person` variable is still local to the first pattern, while `friend`
 joins the two constraints without changing the projected results. As above,
 `social` denotes a namespace that defines the `name` and `friend` attributes.
 
-## `matches!`
+## `exists!`
 
 Sometimes you only want to check whether a constraint has any solutions.  The
-`matches!` macro mirrors the `find!` syntax but returns a boolean:
+`exists!` macro mirrors the `find!` syntax but returns a boolean:
 
 ```rust
 use triblespace::prelude::*;
 
-assert!(matches!((x), x.is(1.into())));
-assert!(!matches!((x), and!(x.is(1.into()), x.is(2.into()))));
+assert!(exists!((x), x.is(1.into())));
+assert!(!exists!((x), and!(x.is(1.into()), x.is(2.into()))));
 ```
 
-Internally, `matches!` stops as soon as the first result is found.  It is a
+Internally, `exists!` stops as soon as the first result is found.  It is a
 lightweight alternative to `find!` when the mere existence of a match matters
 more than the actual bindings.
 
