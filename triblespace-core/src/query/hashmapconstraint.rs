@@ -9,7 +9,7 @@ use crate::query::ContainsConstraint;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
-use crate::value::FromValue;
+use crate::value::TryFromValue;
 use crate::value::RawValue;
 use crate::value::ToValue;
 use crate::value::Value;
@@ -34,7 +34,7 @@ where
 
 impl<'a, S: ValueSchema, R, K, V> Constraint<'a> for KeysConstraint<S, R, K, V>
 where
-    K: 'a + std::cmp::Eq + std::hash::Hash + for<'b> FromValue<'b, S>,
+    K: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromValue<'b, S>,
     for<'b> &'b K: ToValue<S>,
     V: 'a,
     R: Deref<Target = HashMap<K, V>>,
@@ -62,7 +62,10 @@ where
         if self.variable.index == variable {
             proposals.retain(|v| {
                 self.map
-                    .contains_key(&FromValue::from_value(Value::<S>::as_transmute_raw(v)))
+                    .contains_key(&match TryFromValue::try_from_value(Value::<S>::as_transmute_raw(v)) {
+                        Ok(v) => v,
+                        Err(_) => return false,
+                    })
             });
         }
     }
@@ -70,7 +73,7 @@ where
 
 impl<'a, S: ValueSchema, K, V> ContainsConstraint<'a, S> for &'a HashMap<K, V>
 where
-    K: 'a + std::cmp::Eq + std::hash::Hash + for<'b> FromValue<'b, S>,
+    K: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromValue<'b, S>,
     for<'b> &'b K: ToValue<S>,
     V: 'a,
 {
@@ -83,7 +86,7 @@ where
 
 impl<'a, S: ValueSchema, K, V> ContainsConstraint<'a, S> for Rc<HashMap<K, V>>
 where
-    K: 'a + std::cmp::Eq + std::hash::Hash + for<'b> FromValue<'b, S>,
+    K: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromValue<'b, S>,
     for<'b> &'b K: ToValue<S>,
     V: 'a,
 {
@@ -96,7 +99,7 @@ where
 
 impl<'a, S: ValueSchema, K, V> ContainsConstraint<'a, S> for Arc<HashMap<K, V>>
 where
-    K: 'a + std::cmp::Eq + std::hash::Hash + for<'b> FromValue<'b, S>,
+    K: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromValue<'b, S>,
     for<'b> &'b K: ToValue<S>,
     V: 'a,
 {

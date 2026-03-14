@@ -7,7 +7,6 @@ use crate::metadata::{ConstDescribe, ConstId};
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
-use crate::value::FromValue;
 use crate::value::ToValue;
 use crate::value::TryFromValue;
 use crate::value::Value;
@@ -189,19 +188,6 @@ impl TryFromValue<'_, R256BE> for Ratio<i128> {
     }
 }
 
-impl FromValue<'_, R256BE> for Ratio<i128> {
-    fn from_value(v: &Value<R256BE>) -> Self {
-        match Ratio::try_from_value(v) {
-            Ok(ratio) => ratio,
-            Err(RatioError::NonCanonical(n, d)) => {
-                panic!("Non canonical ratio: {n}/{d}");
-            }
-            Err(RatioError::ZeroDenominator) => {
-                panic!("Zero denominator ratio");
-            }
-        }
-    }
-}
 
 impl ToValue<R256BE> for Ratio<i128> {
     fn to_value(self) -> Value<R256BE> {
@@ -248,19 +234,6 @@ impl TryFromValue<'_, R256LE> for Ratio<i128> {
     }
 }
 
-impl FromValue<'_, R256LE> for Ratio<i128> {
-    fn from_value(v: &Value<R256LE>) -> Self {
-        match Ratio::try_from_value(v) {
-            Ok(ratio) => ratio,
-            Err(RatioError::NonCanonical(n, d)) => {
-                panic!("Non canonical ratio: {n}/{d}");
-            }
-            Err(RatioError::ZeroDenominator) => {
-                panic!("Zero denominator ratio");
-            }
-        }
-    }
-}
 
 impl ToValue<R256LE> for Ratio<i128> {
     fn to_value(self) -> Value<R256LE> {

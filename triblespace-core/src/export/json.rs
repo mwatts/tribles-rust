@@ -97,18 +97,22 @@ fn write_entity(
         Value<UnknownValue>,
     )> = Vec::new();
     find!(
-        (name_handle: Value<Handle<Blake3, LongString>>, schema: Id, value: Value<UnknownValue>),
+        (name_handle: Value<Handle<Blake3, LongString>>, schema_value: Value<GenId>, value: Value<UnknownValue>),
         temp!((e, attr), and!(
             e.is(entity.to_value()),
             merged.pattern(e, attr, value),
             pattern!(merged, [
                 { ?attr @ metadata::name: ?name_handle },
-                { ?attr @ metadata::value_schema: ?schema }
+                { ?attr @ metadata::value_schema: ?schema_value }
             ])
         ))
     )
-    .for_each(|(name_handle, schema, value)| {
-        field_values.push((name_handle.raw, name_handle, schema, value));
+    .filter_map(|(name_handle, schema_value, value)| {
+        let schema: Id = schema_value.try_from_value().ok()?;
+        Some((name_handle.raw, name_handle, schema, value))
+    })
+    .for_each(|(raw, name_handle, schema, value)| {
+        field_values.push((raw, name_handle, schema, value));
     });
 
     field_values.sort_by(|(a, _, _, _), (b, _, _, _)| a.cmp(b));
@@ -162,11 +166,11 @@ fn render_schema_value(
 ) -> Result<(), ExportError> {
     if schema == Boolean::ID {
         let value = value.transmute::<Boolean>();
-        let _ = out.write_str(if value.from_value::<bool>() {
-            "true"
+        if let Ok(b) = value.try_from_value::<bool>() {
+            let _ = out.write_str(if b { "true" } else { "false" });
         } else {
-            "false"
-        });
+            let _ = out.write_str("null");
+        }
         return Ok(());
     }
     if schema == F64::ID {
@@ -186,8 +190,10 @@ fn render_schema_value(
         return Ok(());
     }
     if schema == GenId::ID {
-        let child_id = value.transmute::<GenId>().from_value::<Id>();
-        return write_entity(merged, child_id, visited, ctx, out);
+        if let Ok(child_id) = value.transmute::<GenId>().try_from_value::<Id>() {
+            return write_entity(merged, child_id, visited, ctx, out);
+        }
+        return Ok(());
     }
     if schema == Handle::<Blake3, LongString>::ID {
         let handle = value.transmute::<Handle<Blake3, LongString>>();

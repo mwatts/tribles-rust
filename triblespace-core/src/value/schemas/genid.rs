@@ -10,7 +10,6 @@ use crate::metadata::{ConstDescribe, ConstId};
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
-use crate::value::FromValue;
 use crate::value::ToValue;
 use crate::value::TryFromValue;
 use crate::value::TryToValue;
@@ -125,18 +124,6 @@ impl TryFromValue<'_, GenId> for RawId {
     }
 }
 
-impl FromValue<'_, GenId> for RawId {
-    fn from_value(v: &Value<GenId>) -> Self {
-        v.try_from_value().unwrap()
-    }
-}
-
-impl<'a> FromValue<'a, GenId> for &'a RawId {
-    fn from_value(v: &'a Value<GenId>) -> Self {
-        v.try_from_value().unwrap()
-    }
-}
-
 impl ToValue<GenId> for RawId {
     fn to_value(self) -> Value<GenId> {
         let mut data = [0; VALUE_LEN];
@@ -170,18 +157,6 @@ impl TryFromValue<'_, GenId> for Id {
     }
 }
 
-impl FromValue<'_, GenId> for Id {
-    fn from_value(v: &Value<GenId>) -> Self {
-        v.try_from_value().unwrap()
-    }
-}
-
-impl<'a> FromValue<'a, GenId> for &'a Id {
-    fn from_value(v: &'a Value<GenId>) -> Self {
-        v.try_from_value().unwrap()
-    }
-}
-
 impl ToValue<GenId> for &Id {
     fn to_value(self) -> Value<GenId> {
         let mut data = [0; VALUE_LEN];
@@ -208,12 +183,6 @@ impl TryFromValue<'_, GenId> for uuid::Uuid {
     }
 }
 
-impl FromValue<'_, GenId> for uuid::Uuid {
-    fn from_value(v: &Value<GenId>) -> Self {
-        v.try_from_value().unwrap()
-    }
-}
-
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ExclusiveIdError {
     FailedParse(IdParseError),
@@ -232,12 +201,6 @@ impl<'a> TryFromValue<'a, GenId> for ExclusiveId {
     fn try_from_value(value: &'a Value<GenId>) -> Result<Self, Self::Error> {
         let id: Id = value.try_from_value()?;
         id.aquire().ok_or(ExclusiveIdError::FailedAquire())
-    }
-}
-
-impl FromValue<'_, GenId> for ExclusiveId {
-    fn from_value(v: &Value<GenId>) -> Self {
-        v.try_from_value().unwrap()
     }
 }
 

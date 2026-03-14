@@ -21,7 +21,7 @@ A schema describes which bit patterns are meaningful for a particular value. The
 [`Value`](../../src/value.rs) type is parameterised by such a schema and remains
 agnostic about whether the underlying bytes currently satisfy the contract.
 Validation lives in the schema through the [`ValueSchema`](../../src/value.rs)
-trait, while conversions to concrete Rust types use [`ToValue`], [`FromValue`],
+trait, while conversions to concrete Rust types use [`ToValue`],
 [`TryToValue`], and [`TryFromValue`]. Because conversion traits are implemented
 for the schema instead of the `Value` type itself, we avoid Rust's orphan rule
 and allow downstream crates to add their own adapters.
@@ -55,6 +55,5 @@ typed Rust code while remaining portable and future-proof.
 
 [`ValueSchema`]: ../../src/value.rs
 [`ToValue`]: ../../src/value.rs
-[`FromValue`]: ../../src/value.rs
 [`TryToValue`]: ../../src/value.rs
 [`TryFromValue`]: ../../src/value.rs

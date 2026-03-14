@@ -5,11 +5,11 @@
 //! # Example
 //!
 //! ```
-//! use triblespace_core::value::{Value, ValueSchema, ToValue, FromValue};
+//! use triblespace_core::value::{Value, ValueSchema, ToValue, TryFromValue};
 //! use triblespace_core::metadata::ConstId;
 //! use triblespace_core::id::Id;
 //! use triblespace_core::macros::id_hex;
-//! use std::convert::TryInto;
+//! use std::convert::{TryInto, Infallible};
 //!
 //! // Define a new schema type.
 //! // We're going to define an unsigned integer type that is stored as a little-endian 32-byte array.
@@ -26,11 +26,12 @@
 //! }
 //!
 //! // Implement conversion functions for the schema type.
-//! impl FromValue<'_, MyNumber> for u32 {
-//!    fn from_value(v: &Value<MyNumber>) -> Self {
-//!      // Convert the schema type to the Rust type.
-//!     u32::from_le_bytes(v.raw[0..4].try_into().unwrap())
-//!  }
+//! // Use `Error = Infallible` when the conversion cannot fail.
+//! impl TryFromValue<'_, MyNumber> for u32 {
+//!    type Error = Infallible;
+//!    fn try_from_value(v: &Value<MyNumber>) -> Result<Self, Infallible> {
+//!      Ok(u32::from_le_bytes(v.raw[0..4].try_into().unwrap()))
+//!    }
 //! }
 //!
 //! impl ToValue<MyNumber> for u32 {
@@ -48,9 +49,10 @@
 //! assert_eq!(i, 42);
 //!
 //! // You can also implement conversion functions for other Rust types.
-//! impl FromValue<'_, MyNumber> for u64 {
-//!   fn from_value(v: &Value<MyNumber>) -> Self {
-//!    u64::from_le_bytes(v.raw[0..8].try_into().unwrap())
+//! impl TryFromValue<'_, MyNumber> for u64 {
+//!   type Error = Infallible;
+//!   fn try_from_value(v: &Value<MyNumber>) -> Result<Self, Infallible> {
+//!    Ok(u64::from_le_bytes(v.raw[0..8].try_into().unwrap()))
 //!   }
 //! }
 //!
@@ -109,7 +111,7 @@ pub type RawValue = [u8; VALUE_LEN];
 ///
 /// let ratio = Ratio::new(1, 2);
 /// let value: Value<R256> = R256::value_from(ratio);
-/// let ratio2: Ratio<i128> = value.from_value();
+/// let ratio2: Ratio<i128> = value.try_from_value().unwrap();
 /// assert_eq!(ratio, ratio2);
 /// ```
 #[derive(TryFromBytes, IntoBytes, Unaligned, Immutable, KnownLayout)]
@@ -196,28 +198,26 @@ impl<S: ValueSchema> Value<S> {
 
     /// Deserialize a value with an abstract schema type to a concrete Rust type.
     ///
-    /// Note that this may panic if the conversion is not possible.
-    /// This might happen if the bytes are not valid for the schema type or if the
-    /// rust type can't represent the specific value of the schema type,
-    /// e.g. if the schema type is a fractional number and the rust type is an integer.
-    ///
-    /// For a conversion that always returns a result, use the [Value::try_from_value] method.
+    /// This method only works for infallible conversions (where `Error = Infallible`).
+    /// For fallible conversions, use the [Value::try_from_value] method.
     ///
     /// # Example
     ///
     /// ```
     /// use triblespace_core::prelude::*;
-    /// use valueschemas::R256;
-    /// use num_rational::Ratio;
+    /// use valueschemas::F64;
     ///
-    /// let value: Value<R256> = R256::value_from(Ratio::new(1, 2));
-    /// let concrete: Ratio<i128> = value.from_value();
+    /// let value: Value<F64> = (3.14f64).to_value();
+    /// let concrete: f64 = value.from_value();
     /// ```
     pub fn from_value<'a, T>(&'a self) -> T
     where
-        T: FromValue<'a, S>,
+        T: TryFromValue<'a, S, Error = std::convert::Infallible>,
     {
-        <T as FromValue<'a, S>>::from_value(self)
+        match <T as TryFromValue<'a, S>>::try_from_value(self) {
+            Ok(v) => v,
+            Err(e) => match e {},
+        }
     }
 
     /// Deserialize a value with an abstract schema type to a concrete Rust type.
@@ -227,7 +227,7 @@ impl<S: ValueSchema> Value<S> {
     /// rust type can't represent the specific value of the schema type,
     /// e.g. if the schema type is a fractional number and the rust type is an integer.
     ///
-    /// For a conversion that retrieves the value without error handling, use the [Value::from_value] method.
+    /// For infallible conversions, use the [Value::from_value] method.
     ///
     /// # Example
     ///
@@ -343,7 +343,7 @@ pub trait ValueSchema: ConstId + Sized + 'static {
 /// This might cause a panic if the conversion is not possible,
 /// see [TryToValue] for a conversion that returns a result.
 ///
-/// This is the counterpart to the [FromValue] trait.
+/// This is the counterpart to the [TryFromValue] trait.
 ///
 /// See [ToBlob](crate::blob::ToBlob) for the counterpart trait for blobs.
 pub trait ToValue<S: ValueSchema> {
@@ -352,23 +352,6 @@ pub trait ToValue<S: ValueSchema> {
     ///
     /// See the [TryToValue] trait for a conversion that returns a result.
     fn to_value(self) -> Value<S>;
-}
-
-/// A trait for converting a [Value] with a specific schema type to a Rust type.
-/// This trait is implemented on the concrete Rust type.
-///
-/// This might cause a panic if the conversion is not possible,
-/// see [TryFromValue] for a conversion that returns a result.
-///
-/// This is the counterpart to the [ToValue] trait.
-///
-/// See [TryFromBlob](crate::blob::TryFromBlob) for the counterpart trait for blobs.
-pub trait FromValue<'a, S: ValueSchema> {
-    /// Convert the [Value] with a specific schema type to the Rust type.
-    /// This might cause a panic if the conversion is not possible.
-    ///
-    /// See the [TryFromValue] trait for a conversion that returns a result.
-    fn from_value(v: &'a Value<S>) -> Self;
 }
 
 /// A trait for converting a Rust type to a [Value] with a specific schema type.
@@ -391,8 +374,11 @@ pub trait TryToValue<S: ValueSchema> {
 /// A trait for converting a [Value] with a specific schema type to a Rust type.
 /// This trait is implemented on the concrete Rust type.
 ///
-/// This might return an error if the conversion is not possible,
-/// see [FromValue] for cases where the conversion is guaranteed to succeed (or panic).
+/// Values are 32-byte arrays that represent data at a deserialization boundary.
+/// Conversions may fail depending on the schema and target type. Use
+/// `Error = Infallible` for conversions that genuinely cannot fail (e.g.
+/// `ethnum::U256` from `U256BE`), and a real error type for narrowing
+/// conversions (e.g. `u64` from `U256BE`).
 ///
 /// This is the counterpart to the [TryToValue] trait.
 ///
@@ -400,9 +386,6 @@ pub trait TryToValue<S: ValueSchema> {
 pub trait TryFromValue<'a, S: ValueSchema>: Sized {
     type Error;
     /// Convert the [Value] with a specific schema type to the Rust type.
-    /// This might return an error if the conversion is not possible.
-    ///
-    /// See the [FromValue] trait for a conversion that always succeeds (or panics).
     fn try_from_value(v: &'a Value<S>) -> Result<Self, Self::Error>;
 }
 
@@ -418,12 +401,16 @@ impl<S: ValueSchema> ToValue<S> for &Value<S> {
     }
 }
 
-impl<'a, S: ValueSchema> FromValue<'a, S> for Value<S> {
-    fn from_value(v: &'a Value<S>) -> Self {
-        *v
+impl<'a, S: ValueSchema> TryFromValue<'a, S> for Value<S> {
+    type Error = std::convert::Infallible;
+    fn try_from_value(v: &'a Value<S>) -> Result<Self, std::convert::Infallible> {
+        Ok(*v)
     }
 }
 
-impl<'a, S: ValueSchema> FromValue<'a, S> for () {
-    fn from_value(_v: &'a Value<S>) -> Self {}
+impl<'a, S: ValueSchema> TryFromValue<'a, S> for () {
+    type Error = std::convert::Infallible;
+    fn try_from_value(_v: &'a Value<S>) -> Result<Self, std::convert::Infallible> {
+        Ok(())
+    }
 }

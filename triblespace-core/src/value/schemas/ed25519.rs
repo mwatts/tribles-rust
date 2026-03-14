@@ -12,7 +12,6 @@ use crate::metadata::{ConstDescribe, ConstId};
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
-use crate::value::FromValue;
 use crate::value::ToValue;
 use crate::value::TryFromValue;
 use crate::value::Value;
@@ -207,9 +206,10 @@ impl ToValue<ED25519RComponent> for ComponentBytes {
     }
 }
 
-impl FromValue<'_, ED25519RComponent> for ComponentBytes {
-    fn from_value(v: &Value<ED25519RComponent>) -> Self {
-        v.raw
+impl TryFromValue<'_, ED25519RComponent> for ComponentBytes {
+    type Error = Infallible;
+    fn try_from_value(v: &Value<ED25519RComponent>) -> Result<Self, Infallible> {
+        Ok(v.raw)
     }
 }
 
@@ -219,9 +219,10 @@ impl ToValue<ED25519SComponent> for ComponentBytes {
     }
 }
 
-impl FromValue<'_, ED25519SComponent> for ComponentBytes {
-    fn from_value(v: &Value<ED25519SComponent>) -> Self {
-        v.raw
+impl TryFromValue<'_, ED25519SComponent> for ComponentBytes {
+    type Error = Infallible;
+    fn try_from_value(v: &Value<ED25519SComponent>) -> Result<Self, Infallible> {
+        Ok(v.raw)
     }
 }
 

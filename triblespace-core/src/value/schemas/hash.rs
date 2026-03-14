@@ -8,7 +8,7 @@ use crate::metadata::{ConstDescribe, ConstId};
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::trible::TribleSet;
-use crate::value::FromValue;
+use crate::value::TryFromValue;
 use crate::value::RawValue;
 use crate::value::TryToValue;
 use crate::value::Value;
@@ -82,16 +82,17 @@ where
     }
 }
 
-impl<H> FromValue<'_, Hash<H>> for String
+impl<H> TryFromValue<'_, Hash<H>> for String
 where
     H: HashProtocol,
 {
-    fn from_value(v: &Value<Hash<H>>) -> Self {
+    type Error = std::convert::Infallible;
+    fn try_from_value(v: &Value<Hash<H>>) -> Result<Self, std::convert::Infallible> {
         let mut out = String::new();
         out.push_str(<H as HashProtocol>::NAME);
         out.push(':');
         out.push_str(&hex::encode(v.raw));
-        out
+        Ok(out)
     }
 }
 

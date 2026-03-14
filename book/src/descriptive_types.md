@@ -121,8 +121,10 @@ hot-loop anti-pattern of repeatedly opening ephemeral repository instances.
 
 find! is not just a query language; it is the place where you declare the
 shape of the data you expect. Treat find! patterns as lightweight, inline
-type declarations. If an entity doesn't match, find! won't return it — no
-error, just absence.
+type declarations. If an entity doesn't match — either because the pattern
+fails or because a typed variable's conversion fails — find! silently skips
+it. Use `?` on a variable to receive conversion errors as `Result` values
+instead of filtering them out.
 
 When your project defines canonical tag ids (GenId constants) prefer to
 match the tag directly in the pattern rather than binding a short-string

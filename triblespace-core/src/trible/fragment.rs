@@ -21,6 +21,11 @@ pub struct Fragment {
 }
 
 impl Fragment {
+    /// Creates an empty fragment with no exports and no facts.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
     /// Creates a fragment that exports a single root id.
     pub fn rooted(root: Id, facts: TribleSet) -> Self {
         let mut exports = PATCH::<16>::new();

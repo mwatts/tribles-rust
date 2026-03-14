@@ -29,7 +29,7 @@ encoding concerns and makes it easy to reason about memory usage.
 ### Conversion traits
 
 Schemas define how to convert between raw bytes and concrete Rust types. The
-conversion traits `ToValue`/`FromValue` and their fallible counterparts live on
+conversion traits `ToValue`/`TryFromValue`/`TryToValue` live on
 the schema types rather than on `Value` itself, avoiding orphan‑rule issues when
 supporting external data types. The `Value` wrapper treats its bytes as opaque;
 schemas may validate them or reject invalid patterns during conversion.

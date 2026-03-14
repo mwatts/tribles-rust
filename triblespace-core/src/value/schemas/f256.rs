@@ -7,7 +7,7 @@ use crate::metadata::{ConstDescribe, ConstId};
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
-use crate::value::FromValue;
+use crate::value::TryFromValue;
 use crate::value::ToValue;
 use crate::value::TryToValue;
 use crate::value::Value;
@@ -279,9 +279,10 @@ mod wasm_formatter {
     }
 }
 
-impl FromValue<'_, F256BE> for f256 {
-    fn from_value(v: &Value<F256BE>) -> Self {
-        f256::from_be_bytes(v.raw)
+impl TryFromValue<'_, F256BE> for f256 {
+    type Error = Infallible;
+    fn try_from_value(v: &Value<F256BE>) -> Result<Self, Infallible> {
+        Ok(f256::from_be_bytes(v.raw))
     }
 }
 
@@ -291,9 +292,10 @@ impl ToValue<F256BE> for f256 {
     }
 }
 
-impl FromValue<'_, F256LE> for f256 {
-    fn from_value(v: &Value<F256LE>) -> Self {
-        f256::from_le_bytes(v.raw)
+impl TryFromValue<'_, F256LE> for f256 {
+    type Error = Infallible;
+    fn try_from_value(v: &Value<F256LE>) -> Result<Self, Infallible> {
+        Ok(f256::from_le_bytes(v.raw))
     }
 }
 

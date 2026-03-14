@@ -51,20 +51,34 @@ destructure results.
 Variables optionally include a concrete type to convert the underlying value.
 The constraint phase still works with untyped [`Value`](crate::value::Value)
 instances; conversion happens when the tuple is emitted.  These conversions use
-[`FromValue`](crate::value::FromValue) and panic if decoding to the requested
-type fails. Bind the variable as a [`Value<_>`](crate::value::Value) and reach
-for [`TryFromValue`](crate::value::TryFromValue) yourself when you want to
-surface conversion errors instead of panicking.
+[`TryFromValue`](crate::value::TryFromValue).
+
+By default, if a conversion fails the entire row is silently skipped — like a
+constraint that doesn't match.  For types whose `TryFromValue::Error` is
+[`Infallible`](core::convert::Infallible) the error branch is dead code and no
+rows can ever be accidentally filtered.
+
+Append `?` to a variable to receive the raw
+[`Result<T, E>`](core::result::Result) instead. Both `Ok` and `Err` values pass
+through without filtering, matching Rust's `?` semantics of "bubble the error
+to the caller."
 
 ```rust
-find!((x: i32, y: Value<ShortString>),
+// `x` is filtered (rows where conversion fails are skipped).
+// `y` is passed through as Result (no filtering).
+find!((x: i32, y: Value<ShortString>?),
       and!(x.is(1.into()), y.is("foo".to_value())))
 ```
 
-The first variable is read as an `i32` and the second as a short string if the
-conversion succeeds. The query engine walks all possible assignments that
-satisfy the constraint and yields tuples of the declared variables in the order
-they appear in the head.
+| Syntax | Meaning |
+|--------|---------|
+| `name` | inferred type, filter on conversion failure |
+| `name: Type` | explicit type, filter on conversion failure |
+| `name?` | inferred type, yield `Result<T, E>` (no filter) |
+| `name: Type?` | explicit type, yield `Result<T, E>` (no filter) |
+
+The query engine walks all possible assignments that satisfy the constraint and
+yields tuples of the declared variables in the order they appear in the head.
 
 ### Collecting results
 

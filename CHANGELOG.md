@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.0] - 2026-03-14
+### Changed
+- **Breaking:** Removed the `FromValue` trait. `TryFromValue` is now the sole
+  value conversion trait. `Value::from_value()` is constrained to
+  `TryFromValue<Error = Infallible>`.
+- **Breaking:** `find!` now uses filter semantics: when a variable's
+  `TryFromValue` conversion fails the row is silently skipped instead of
+  panicking. For types with `Error = Infallible` (e.g. `f64`, `Value<_>`) no
+  rows can ever be accidentally filtered.
+- **Breaking:** `find!` variable declarations support a `?` suffix
+  (`name: Type?`) that yields `Result<T, E>` without filtering, matching
+  Rust's `?` semantics of "bubble the error to the caller."
+- **Breaking:** `Query::new` now expects the post-processing closure to return
+  `Option<R>`. Returning `None` skips the current binding and continues the
+  search. Direct callers of `Query::new` must wrap their return values in
+  `Some(...)`.
+- `find!` is now implemented as a hybrid `macro_rules!` + proc macro
+  (`__find_impl!`), replacing the previous three-arm `macro_rules!` definition.
+- `HashSet`/`HashMap` constraint bounds relaxed from requiring
+  `TryFromValue<Error = Infallible>` to accepting any `TryFromValue`; values
+  that fail to convert are rejected during `confirm()`.
+
 ## [0.19.0] - 2026-03-13
 ### Changed
 - **Breaking:** Renamed the `matches!` query macro to `exists!` to resolve the
@@ -701,7 +723,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Clarified the commit selector traversal description to avoid implying a
   specific order, fixed the `ancestors(A)..B` exclusion example, and tightened
   the debugging guidance wording.
-- Clarified that `find!` retrieves `ExclusiveId` bindings via `FromValue` and
+- Clarified that `find!` retrieves `ExclusiveId` bindings via `TryFromValue` and
   that restricting queries with `local_ids` keeps the conversion safe.
 - Getting started guide now demonstrates defining custom attributes alongside
   the quick-start example, hides doc-test-only cleanup, and exercises the

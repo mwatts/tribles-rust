@@ -293,12 +293,13 @@ inline without touching the outer [`find!`](crate::query::find) signature.
 
 Binding the variable as an [`ExclusiveId`](crate::id::ExclusiveId) means the
 closure that [`find!`](crate::query::find) installs will run the
-[`FromValue`](crate::value::FromValue) implementation for `ExclusiveId`.
-`FromValue` simply unwraps [`TryFromValue`](crate::value::TryFromValue), which
-invokes [`Id::aquire`](crate::id::Id::aquire) and would panic if the current
-thread did not own the identifier.  The
+[`TryFromValue`](crate::value::TryFromValue) implementation for `ExclusiveId`.
+The conversion invokes [`Id::aquire`](crate::id::Id::aquire) and would silently
+skip the row if the current thread did not own the identifier (filter
+semantics).  The
 [`local_ids`](crate::query::local_ids) constraint keeps the query safe by only
-enumerating IDs already owned by this thread.  In the example we immediately
+enumerating IDs already owned by this thread, so no rows are filtered in
+practice.  In the example we immediately
 move the acquired guard into `txn_owner`, enabling subsequent calls to
 [`IdOwner::borrow`](crate::id::IdOwner::borrow) that yield
 [`OwnedId`](crate::id::OwnedId)s.  Dropping an `OwnedId` automatically returns

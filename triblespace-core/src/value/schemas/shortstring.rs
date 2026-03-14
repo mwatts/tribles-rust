@@ -7,7 +7,6 @@ use crate::metadata::{ConstDescribe, ConstId};
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
-use crate::value::FromValue;
 use crate::value::ToValue;
 use crate::value::TryFromValue;
 use crate::value::TryToValue;
@@ -129,18 +128,6 @@ impl<'a> TryFromValue<'a, ShortString> for String {
     fn try_from_value(v: &Value<ShortString>) -> Result<Self, Self::Error> {
         let s: &str = v.try_from_value()?;
         Ok(s.to_string())
-    }
-}
-
-impl<'a> FromValue<'a, ShortString> for &'a str {
-    fn from_value(v: &'a Value<ShortString>) -> Self {
-        v.try_from_value().unwrap()
-    }
-}
-
-impl<'a> FromValue<'a, ShortString> for String {
-    fn from_value(v: &'a Value<ShortString>) -> Self {
-        v.try_from_value().unwrap()
     }
 }
 

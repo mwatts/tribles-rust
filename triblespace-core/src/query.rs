@@ -8,6 +8,10 @@
 //! let results = find!((x: Value<ShortString>), x.is("foo".to_value())).collect::<Vec<_>>();
 //! ```
 //!
+//! Variables are converted via [`TryFromValue`](crate::value::TryFromValue). By default,
+//! conversion failures silently skip the row (filter semantics). Append `?` to a variable
+//! to receive `Result<T, E>` instead, letting the caller handle errors explicitly.
+//!
 //! For a tour of the language see the "Query Language" chapter in the book.
 //! Conceptual background on schemas and join strategy appears in the
 //! "Query Engine" and "Atreides Join" chapters.
@@ -366,7 +370,7 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'static> for std::sync::Arc<T> {
 /// which provides a convenient way to declare variables and concrete types for them.
 /// And which sets up the nessecairy context for higher-level query languages
 /// like the one provided by the [crate::namespace] module.
-pub struct Query<C, P: Fn(&Binding) -> R, R> {
+pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     constraint: C,
     postprocessing: P,
     mode: Search,
@@ -379,10 +383,12 @@ pub struct Query<C, P: Fn(&Binding) -> R, R> {
     values: ArrayVec<Option<Vec<RawValue>>, 128>,
 }
 
-impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> R, R> Query<C, P, R> {
+impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// Create a new query.
     /// The query takes a constraint and a post-processing function as input,
     /// and returns the results of the query as a stream of values.
+    /// The post-processing function returns `Option<R>`: returning `None`
+    /// skips the current binding and continues the search.
     ///
     /// This method is usually not called directly, but rather through the [find!] macro,
     pub fn new(constraint: C, postprocessing: P) -> Self {
@@ -449,7 +455,7 @@ enum Search {
     Done,
 }
 
-impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> R, R> Iterator for Query<C, P, R> {
+impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<C, P, R> {
     type Item = R;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -458,7 +464,12 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> R, R> Iterator for Query<C, P, R>
                 Search::NextVariable => {
                     self.mode = Search::NextValue;
                     if self.unbound.is_empty() {
-                        return Some((self.postprocessing)(&self.binding));
+                        if let Some(result) = (self.postprocessing)(&self.binding) {
+                            return Some(result);
+                        }
+                        // Post-processing rejected this binding; continue
+                        // searching (mode is already NextValue).
+                        continue;
                     }
 
                     let mut stale_estimates = VariableSet::new_empty();
@@ -547,7 +558,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> R, R> Iterator for Query<C, P, R>
     }
 }
 
-impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> R, R> fmt::Debug for Query<C, P, R> {
+impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> fmt::Debug for Query<C, P, R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Query")
             .field("constraint", &std::any::type_name::<C>())
@@ -559,35 +570,41 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> R, R> fmt::Debug for Query<C, P, 
     }
 }
 
-/// The `find!` macro is a convenient way to declare variables and concrete types for them.
-/// It also sets up the nessecairy context for higher-level query languages like the one
-/// provided by the [crate::namespace] module, by injecting a `_local_find_context!` macro
-/// that provides a reference to the current variable context. [^note]
+/// Iterate over query results, converting each variable via
+/// [`TryFromValue`](crate::value::TryFromValue).
 ///
-/// [^note]: This is a bit of a hack to simulate dynamic scoping, which is not possible in Rust.
-/// But it allows for a more ergonomic query language syntax that does not require the user
-/// to manually pass around the variable context.
+/// The macro takes two arguments: a tuple of variables with optional type
+/// annotations, and a constraint expression. It injects a `__local_find_context!`
+/// macro that provides the variable context to nested query macros like
+/// [`pattern!`](crate::namespace), [`temp!`], and [`ignore!`].
 ///
-/// The `find!` macro takes two arguments:
-/// - A tuple of variables and their concrete result types, e.g., `(a: Value<ShortString>, b: Ratio)`.
-/// - A constraint that describes the pattern you are looking for, e.g., `and!(a.is("Hello World!"), b.is(42))`.
+/// # Variable syntax
 ///
-/// Note that concrete type declarations for variables, e.g., `a: Value<ShortString>`, `a: String`, or `a: _`,
-/// are optional, and can be omitted if the type can be inferred from context.
-/// Variable schema types are automatically inferred from the constraint, if possible.
-/// The query will automatically perform the necessary conversions between the schema types
-/// and the concrete types of the variables. If the conversion fails, the query will panic.
-/// For more control over the conversion, you can use a `Value<_>` type for the variable, and use
-/// the `TryFromValue` trait to convert the values manually and handle the errors explicitly.
+/// | Syntax | Meaning |
+/// |--------|---------|
+/// | `name` | inferred type, filter on conversion failure |
+/// | `name: Type` | explicit type, filter on conversion failure |
+/// | `name?` | inferred type, yield `Result<T, E>` (no filter) |
+/// | `name: Type?` | explicit type, yield `Result<T, E>` (no filter) |
 ///
-/// The macro expands to a call to the [Query::new] constructor, which takes the variables and the constraint
-/// as arguments, and returns a [Query] object that can be used to iterate over the results of the query.
+/// **Filter semantics (default):** when a variable's conversion fails the
+/// entire row is silently skipped — like a constraint that doesn't match.
+/// For types whose `TryFromValue::Error = Infallible` the error branch is
+/// dead code, so no rows can ever be accidentally filtered.
 ///
-/// The macro also injects a `_local_find_context!` macro that provides a reference to the current variable context.
-/// This allows for macros in query languages, like [pattern!](crate::namespace),
-/// to declare new variables in the same scope as the `find!` macro.
-/// But you should not use the `_local_find_context!` macro directly,
-/// unless you are implementing a custom query language.
+/// **`?` pass-through:** appending `?` to a variable makes it yield
+/// `Result<T, E>` directly. Both `Ok` and `Err` values pass through with
+/// no filtering, matching Rust's `?` semantics of "bubble the error to the
+/// caller."
+///
+/// # Examples
+///
+/// ```
+/// # use triblespace_core::prelude::*;
+/// # use triblespace_core::prelude::valueschemas::ShortString;
+/// // Filter semantics — rows where conversion fails are skipped:
+/// let results = find!((x: Value<ShortString>), x.is("foo".to_value())).collect::<Vec<_>>();
+/// ```
 #[macro_export]
 macro_rules! find {
     // Zero variables: return unit `()` from the closure.
@@ -601,13 +618,13 @@ macro_rules! find {
 
             $crate::query::Query::new($Constraint,
                 move |_binding| {
-
-            })
+                    ::core::option::Option::Some(())
+                })
         }
     };
 
-    // Single variable case: return a 1-tuple `(v,)` so destructuring `for (v,) in ...` works.
-    (($Var:ident $( : $Ty:ty)? $(,)?), $Constraint:expr) => {
+    // One or more variables: delegate to the __find_impl proc macro.
+    (($($vars:tt)*), $Constraint:expr) => {
         {
             let mut ctx = $crate::query::VariableContext::new();
 
@@ -615,32 +632,7 @@ macro_rules! find {
                 () => { &mut ctx }
             }
 
-            let $Var = ctx.next_variable();
-            $crate::query::Query::new($Constraint,
-                move |binding| {
-                    let $Var$(:$Ty)? = $crate::value::FromValue::from_value($Var.extract(binding));
-                    ($Var,)
-            })
-        }
-    };
-
-    // Two-or-more variables: return a tuple of all variables.
-    (($first:ident $(:$T1:ty)?, $($rest:ident $(:$Trest:ty)?),+ $(,)?), $Constraint:expr) => {
-        {
-            let mut ctx = $crate::query::VariableContext::new();
-
-            macro_rules! __local_find_context {
-                () => { &mut ctx }
-            }
-
-            let $first = ctx.next_variable();
-            $(let $rest = ctx.next_variable();)+
-            $crate::query::Query::new($Constraint,
-                move |binding| {
-                    let $first$(:$T1)? = $crate::value::FromValue::from_value($first.extract(binding));
-                    $(let $rest$(:$Trest)? = $crate::value::FromValue::from_value($rest.extract(binding));)+
-                    ($first, $($rest),+)
-            })
+            $crate::macros::__find_impl!($crate, ctx, ($($vars)*), $Constraint)
         }
     };
 }
@@ -648,8 +640,8 @@ pub use find;
 
 #[macro_export]
 macro_rules! exists {
-    (($($Var:ident$(:$Ty:ty)?),* $(,)?), $Constraint:expr) => {
-        $crate::query::find!(($($Var$(:$Ty)?),*), $Constraint).next().is_some()
+    (($($vars:tt)*), $Constraint:expr) => {
+        $crate::query::find!(($($vars)*), $Constraint).next().is_some()
     };
 }
 pub use exists;
@@ -671,14 +663,6 @@ macro_rules! temp {
     }};
 }
 pub use temp;
-
-// Helper to construct tuples of variables with correct arity. Defined at
-// top-level to avoid nested repetition issues inside other macro_rules!
-macro_rules! __tribles_mk_tuple {
-    () => { () };
-    ($single:ident) => { ($single,) };
-    ($a:ident, $b:ident $(, $rest:ident)*) => { ($a, $b $(, $rest)*) };
-}
 
 #[cfg(test)]
 mod tests {
@@ -814,14 +798,13 @@ mod tests {
 
     #[test]
     fn constant() {
-        let q: Query<IntersectionConstraint<_>, _, _> = find! {
+        let r: Vec<_> = find! {
             (string: Value<_>, number: Value<_>),
             and!(
                 string.is(ShortString::value_from("Hello World!")),
                 number.is(I256BE::value_from(42))
             )
-        };
-        let r: Vec<_> = q.collect();
+        }.collect();
 
         assert_eq!(1, r.len())
     }
@@ -862,7 +845,7 @@ mod tests {
         .collect();
 
         assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].0.from_value::<&str>(), "Alice");
+        assert_eq!(matches[0].0.try_from_value::<&str>().unwrap(), "Alice");
     }
 
     #[test]
@@ -898,7 +881,7 @@ mod tests {
         let record = Rc::new(RefCell::new(Vec::new()));
         let debug = crate::debug::query::DebugConstraint::new(wrapper, Rc::clone(&record));
 
-        let q: Query<_, _, _> = Query::new(debug, |_| ());
+        let q: Query<_, _, _> = Query::new(debug, |_| Some(()));
         let r: Vec<_> = q.collect();
         assert_eq!(1, r.len());
         assert_eq!(&*record.borrow(), &[b.index, a.index]);

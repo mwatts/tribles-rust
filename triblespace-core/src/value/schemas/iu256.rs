@@ -7,7 +7,6 @@ use crate::metadata::{ConstDescribe, ConstId};
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
-use crate::value::FromValue;
 use crate::value::ToValue;
 use crate::value::TryFromValue;
 use crate::value::Value;
@@ -425,9 +424,10 @@ impl ToValue<U256BE> for ethnum::U256 {
     }
 }
 
-impl FromValue<'_, U256BE> for ethnum::U256 {
-    fn from_value(v: &Value<U256BE>) -> Self {
-        ethnum::U256::from_be_bytes(v.raw)
+impl TryFromValue<'_, U256BE> for ethnum::U256 {
+    type Error = Infallible;
+    fn try_from_value(v: &Value<U256BE>) -> Result<Self, Infallible> {
+        Ok(ethnum::U256::from_be_bytes(v.raw))
     }
 }
 
@@ -437,9 +437,10 @@ impl ToValue<U256LE> for ethnum::U256 {
     }
 }
 
-impl FromValue<'_, U256LE> for ethnum::U256 {
-    fn from_value(v: &Value<U256LE>) -> Self {
-        ethnum::U256::from_le_bytes(v.raw)
+impl TryFromValue<'_, U256LE> for ethnum::U256 {
+    type Error = Infallible;
+    fn try_from_value(v: &Value<U256LE>) -> Result<Self, Infallible> {
+        Ok(ethnum::U256::from_le_bytes(v.raw))
     }
 }
 
@@ -449,9 +450,10 @@ impl ToValue<I256BE> for ethnum::I256 {
     }
 }
 
-impl FromValue<'_, I256BE> for ethnum::I256 {
-    fn from_value(v: &Value<I256BE>) -> Self {
-        ethnum::I256::from_be_bytes(v.raw)
+impl TryFromValue<'_, I256BE> for ethnum::I256 {
+    type Error = Infallible;
+    fn try_from_value(v: &Value<I256BE>) -> Result<Self, Infallible> {
+        Ok(ethnum::I256::from_be_bytes(v.raw))
     }
 }
 
@@ -461,9 +463,10 @@ impl ToValue<I256LE> for ethnum::I256 {
     }
 }
 
-impl FromValue<'_, I256LE> for ethnum::I256 {
-    fn from_value(v: &Value<I256LE>) -> Self {
-        ethnum::I256::from_le_bytes(v.raw)
+impl TryFromValue<'_, I256LE> for ethnum::I256 {
+    type Error = Infallible;
+    fn try_from_value(v: &Value<I256LE>) -> Result<Self, Infallible> {
+        Ok(ethnum::I256::from_le_bytes(v.raw))
     }
 }
 

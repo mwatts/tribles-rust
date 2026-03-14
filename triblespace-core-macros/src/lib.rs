@@ -52,6 +52,13 @@ pub fn entity(input: TokenStream) -> TokenStream {
     expand(triblespace_macros_common::entity_impl(tokens, &base_path))
 }
 
+#[proc_macro]
+pub fn __find_impl(input: TokenStream) -> TokenStream {
+    expand(triblespace_macros_common::find_impl(
+        TokenStream2::from(input),
+    ))
+}
+
 #[proc_macro_attribute]
 pub fn value_formatter(attr: TokenStream, item: TokenStream) -> TokenStream {
     expand(triblespace_macros_common::value_formatter_impl(

@@ -7,7 +7,7 @@ use crate::metadata::{ConstDescribe, ConstId};
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
-use crate::value::FromValue;
+use crate::value::TryFromValue;
 use crate::value::RawValue;
 use crate::value::ToValue;
 use crate::value::Value;
@@ -111,9 +111,10 @@ impl ToValue<LineLocation> for (u64, u64, u64, u64) {
     }
 }
 
-impl FromValue<'_, LineLocation> for (u64, u64, u64, u64) {
-    fn from_value(v: &Value<LineLocation>) -> Self {
-        decode_location(&v.raw)
+impl TryFromValue<'_, LineLocation> for (u64, u64, u64, u64) {
+    type Error = Infallible;
+    fn try_from_value(v: &Value<LineLocation>) -> Result<Self, Infallible> {
+        Ok(decode_location(&v.raw))
     }
 }
 

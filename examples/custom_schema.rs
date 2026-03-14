@@ -7,7 +7,7 @@ use triblespace::core::blob::TryFromBlob;
 use triblespace::core::id::id_hex;
 use triblespace::core::id::Id;
 use triblespace::core::metadata::{ConstDescribe, ConstId};
-use triblespace::core::value::FromValue;
+use triblespace::core::value::TryFromValue;
 use triblespace::core::value::ToValue;
 use triblespace::core::value::Value;
 use triblespace::core::value::ValueSchema;
@@ -35,9 +35,10 @@ impl ToValue<U64LE> for u64 {
     }
 }
 
-impl FromValue<'_, U64LE> for u64 {
-    fn from_value(v: &Value<U64LE>) -> Self {
-        u64::from_le_bytes(v.raw[..8].try_into().unwrap())
+impl TryFromValue<'_, U64LE> for u64 {
+    type Error = std::convert::Infallible;
+    fn try_from_value(v: &Value<U64LE>) -> Result<Self, std::convert::Infallible> {
+        Ok(u64::from_le_bytes(v.raw[..8].try_into().unwrap()))
     }
 }
 

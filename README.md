@@ -146,7 +146,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Use `_?ident` when you need a fresh variable scoped to this macro call
     // without declaring it in the find! projection list.
     for (f, l, quote) in find!(
-        (first: String, last: Value<_>, quote),
+        (first: String, last: String, quote),
         pattern!(&catalog, [
             { _?author @
                 literature::firstname: ?first,
@@ -162,7 +162,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let quote: View<str> = ws.get(quote)?;
         let quote = quote.as_ref();
         println!("'{quote}'
- - from {title} by {f} {}.", l.from_value::<&str>());
+ - from {title} by {f} {l}.");
     }
 
     // Use `push` when you want automatic retries that merge concurrent history
@@ -201,7 +201,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 literature::firstname: ?first
             }])
         ) {
-            println!("Collaborator kept the name '{}'.", first.from_value::<&str>());
+            println!("Collaborator kept the name '{}'.", first.try_from_value::<&str>().unwrap());
         }
 
         ws.merge(&mut conflict_ws)

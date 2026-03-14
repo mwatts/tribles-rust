@@ -730,7 +730,7 @@ mod tests {
         wrapper.set_estimate(name.index, 1);
 
         let q: Query<_, _, _> =
-            Query::new(wrapper, |binding| String::from_value(name.extract(binding)));
+            Query::new(wrapper, |binding| Some(name.extract(binding).try_from_value::<String>().unwrap()));
         let r: Vec<_> = q.collect();
         assert_eq!(r, vec!["Isaac", "Jules"]);
     }

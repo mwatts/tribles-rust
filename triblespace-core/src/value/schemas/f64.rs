@@ -7,8 +7,8 @@ use crate::metadata::{ConstDescribe, ConstId};
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
-use crate::value::FromValue;
 use crate::value::ToValue;
+use crate::value::TryFromValue;
 use crate::value::TryToValue;
 use crate::value::Value;
 use crate::value::ValueSchema;
@@ -71,11 +71,12 @@ impl ValueSchema for F64 {
     type ValidationError = Infallible;
 }
 
-impl FromValue<'_, F64> for f64 {
-    fn from_value(v: &Value<F64>) -> Self {
+impl TryFromValue<'_, F64> for f64 {
+    type Error = Infallible;
+    fn try_from_value(v: &Value<F64>) -> Result<Self, Infallible> {
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&v.raw[..8]);
-        f64::from_le_bytes(bytes)
+        Ok(f64::from_le_bytes(bytes))
     }
 }
 

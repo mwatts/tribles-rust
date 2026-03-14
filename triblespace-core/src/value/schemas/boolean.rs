@@ -7,7 +7,6 @@ use crate::metadata::{ConstDescribe, ConstId};
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
-use crate::value::FromValue;
 use crate::value::ToValue;
 use crate::value::TryFromValue;
 use crate::value::TryToValue;
@@ -119,13 +118,6 @@ impl<'a> TryFromValue<'a, Boolean> for bool {
 
     fn try_from_value(v: &'a Value<Boolean>) -> Result<Self, Self::Error> {
         Boolean::decode(v)
-    }
-}
-
-impl<'a> FromValue<'a, Boolean> for bool {
-    fn from_value(v: &'a Value<Boolean>) -> Self {
-        v.try_from_value()
-            .expect("boolean values must be well-formed")
     }
 }
 

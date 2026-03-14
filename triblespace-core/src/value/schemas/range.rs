@@ -7,7 +7,6 @@ use crate::metadata::{ConstDescribe, ConstId};
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
-use crate::value::FromValue;
 use crate::value::RawValue;
 use crate::value::ToValue;
 use crate::value::TryFromValue;
@@ -159,9 +158,10 @@ impl ToValue<RangeU128> for (u128, u128) {
     }
 }
 
-impl FromValue<'_, RangeU128> for (u128, u128) {
-    fn from_value(v: &Value<RangeU128>) -> Self {
-        decode_range_value(v)
+impl TryFromValue<'_, RangeU128> for (u128, u128) {
+    type Error = Infallible;
+    fn try_from_value(v: &Value<RangeU128>) -> Result<Self, Infallible> {
+        Ok(decode_range_value(v))
     }
 }
 
@@ -171,9 +171,10 @@ impl ToValue<RangeInclusiveU128> for (u128, u128) {
     }
 }
 
-impl FromValue<'_, RangeInclusiveU128> for (u128, u128) {
-    fn from_value(v: &Value<RangeInclusiveU128>) -> Self {
-        decode_range_value(v)
+impl TryFromValue<'_, RangeInclusiveU128> for (u128, u128) {
+    type Error = Infallible;
+    fn try_from_value(v: &Value<RangeInclusiveU128>) -> Result<Self, Infallible> {
+        Ok(decode_range_value(v))
     }
 }
 

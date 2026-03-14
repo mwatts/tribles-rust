@@ -62,7 +62,6 @@ pub use crate::trible::Spread;
 pub use crate::trible::Trible;
 pub use crate::trible::TribleSet;
 pub use crate::trible::TribleSetFingerprint;
-pub use crate::value::FromValue;
 pub use crate::value::ToValue;
 pub use crate::value::TryFromValue;
 pub use crate::value::TryToValue;

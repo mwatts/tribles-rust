@@ -1706,8 +1706,7 @@ where
                 if let Ok(Some((ts,))) =
                     find!((t: Value<_>), pattern!(meta, [{ timestamp: ?t }])).at_most_one()
                 {
-                    let (ts_start, ts_end): (Epoch, Epoch) =
-                        crate::value::FromValue::from_value(&ts);
+                    let (ts_start, ts_end): (Epoch, Epoch) = ts.from_value();
                     ts_start <= end && ts_end >= start
                 } else {
                     false

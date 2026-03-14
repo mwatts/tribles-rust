@@ -125,7 +125,7 @@ mod readme_example {
 
             println!(
                 "'{quote}'\n - from {title} by {f} {}.",
-                l.from_value::<&str>()
+                l.try_from_value::<&str>().unwrap()
             );
         }
 
@@ -165,7 +165,7 @@ mod readme_example {
             ) {
                 println!(
                     "Collaborator kept the name '{}'.",
-                    first.from_value::<&str>()
+                    first.try_from_value::<&str>().unwrap()
                 );
             }
 

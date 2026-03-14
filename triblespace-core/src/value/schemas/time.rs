@@ -7,7 +7,7 @@ use crate::metadata::{ConstDescribe, ConstId};
 use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
-use crate::value::FromValue;
+use crate::value::TryFromValue;
 use crate::value::ToValue;
 use crate::value::Value;
 use crate::value::ValueSchema;
@@ -92,21 +92,22 @@ impl ToValue<NsTAIInterval> for (Epoch, Epoch) {
     }
 }
 
-impl FromValue<'_, NsTAIInterval> for (Epoch, Epoch) {
-    fn from_value(v: &Value<NsTAIInterval>) -> Self {
+impl TryFromValue<'_, NsTAIInterval> for (Epoch, Epoch) {
+    type Error = Infallible;
+    fn try_from_value(v: &Value<NsTAIInterval>) -> Result<Self, Infallible> {
         let (lower, upper): (i128, i128) = v.from_value();
         let lower = Epoch::from_tai_duration(Duration::from_total_nanoseconds(lower));
         let upper = Epoch::from_tai_duration(Duration::from_total_nanoseconds(upper));
-
-        (lower, upper)
+        Ok((lower, upper))
     }
 }
 
-impl FromValue<'_, NsTAIInterval> for (i128, i128) {
-    fn from_value(v: &Value<NsTAIInterval>) -> Self {
+impl TryFromValue<'_, NsTAIInterval> for (i128, i128) {
+    type Error = Infallible;
+    fn try_from_value(v: &Value<NsTAIInterval>) -> Result<Self, Infallible> {
         let lower = i128::from_le_bytes(v.raw[0..16].try_into().unwrap());
         let upper = i128::from_le_bytes(v.raw[16..32].try_into().unwrap());
-        (lower, upper)
+        Ok((lower, upper))
     }
 }
 

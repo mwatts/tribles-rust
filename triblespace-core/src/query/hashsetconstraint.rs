@@ -3,7 +3,7 @@ use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::value::FromValue;
+use crate::value::TryFromValue;
 use crate::value::ToValue;
 
 use super::*;
@@ -27,7 +27,7 @@ where
 
 impl<'a, S: ValueSchema, R, T> Constraint<'a> for SetConstraint<S, R, T>
 where
-    T: 'a + std::cmp::Eq + std::hash::Hash + for<'b> FromValue<'b, S>,
+    T: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromValue<'b, S>,
     for<'b> &'b T: ToValue<S>,
     R: Deref<Target = HashSet<T>>,
 {
@@ -53,8 +53,10 @@ where
     fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
         if self.variable.index == variable {
             proposals.retain(|v| {
-                let t = FromValue::from_value(Value::<S>::as_transmute_raw(v));
-                self.set.contains(&t)
+                match TryFromValue::try_from_value(Value::<S>::as_transmute_raw(v)) {
+                    Ok(t) => self.set.contains(&t),
+                    Err(_) => false,
+                }
             });
         }
     }
@@ -62,7 +64,7 @@ where
 
 impl<'a, S: ValueSchema, T> ContainsConstraint<'a, S> for &'a HashSet<T>
 where
-    T: 'a + std::cmp::Eq + std::hash::Hash + for<'b> FromValue<'b, S>,
+    T: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromValue<'b, S>,
     for<'b> &'b T: ToValue<S>,
 {
     type Constraint = SetConstraint<S, Self, T>;
@@ -74,7 +76,7 @@ where
 
 impl<'a, S: ValueSchema, T> ContainsConstraint<'a, S> for Rc<HashSet<T>>
 where
-    T: 'a + std::cmp::Eq + std::hash::Hash + for<'b> FromValue<'b, S>,
+    T: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromValue<'b, S>,
     for<'b> &'b T: ToValue<S>,
 {
     type Constraint = SetConstraint<S, Self, T>;
@@ -86,7 +88,7 @@ where
 
 impl<'a, S: ValueSchema, T> ContainsConstraint<'a, S> for Arc<HashSet<T>>
 where
-    T: 'a + std::cmp::Eq + std::hash::Hash + for<'b> FromValue<'b, S>,
+    T: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromValue<'b, S>,
     for<'b> &'b T: ToValue<S>,
 {
     type Constraint = SetConstraint<S, Self, T>;
