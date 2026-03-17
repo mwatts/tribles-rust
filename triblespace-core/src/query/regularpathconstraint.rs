@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 
@@ -14,12 +13,9 @@ use crate::query::Constraint;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
+use crate::trible::TRIBLE_LEN;
+use crate::trible::EAVOrder;
 use crate::trible::TribleSet;
-use crate::trible::A_END;
-use crate::trible::A_START;
-use crate::trible::E_END;
-use crate::trible::E_START;
-use crate::trible::V_START;
 use crate::value::schemas::genid::GenId;
 use crate::value::RawValue;
 
@@ -177,12 +173,10 @@ impl Automaton {
         result
     }
 
-    /// Collect all non-epsilon transition labels reachable from the initial
-    /// states (after epsilon closure). Used for shallow cardinality estimation.
-    fn initial_labels(&self) -> Vec<RawId> {
-        let start_states = self.epsilon_closure(vec![self.start]);
+    /// Collect all non-epsilon transition labels reachable from a set of NFA states.
+    fn reachable_labels(&self, states: &[u64]) -> Vec<RawId> {
         let mut labels = Vec::new();
-        for s in &start_states {
+        for s in states {
             let prefix = s.to_be_bytes();
             self.transitions
                 .infixes::<{ STATE_LEN }, { ID_LEN + STATE_LEN }, _>(&prefix, |rest| {
@@ -194,35 +188,91 @@ impl Automaton {
         }
         labels
     }
+
+    /// Collect non-epsilon transition labels from the initial states.
+    fn initial_labels(&self) -> Vec<RawId> {
+        let start_states = self.epsilon_closure(vec![self.start]);
+        self.reachable_labels(&start_states)
+    }
+}
+
+/// Query the TribleSet's EAV index for outgoing edges from a node.
+/// For each trible where E=entity and V is a GenId (upper 16 bytes zero),
+/// calls the callback with (attribute, destination).
+///
+/// Uses two-level scan respecting PATCH segment boundaries:
+/// first entity→attributes, then (entity,attribute)→values.
+fn for_each_edge(
+    eav: &PATCH<TRIBLE_LEN, EAVOrder, ()>,
+    entity: &RawId,
+    mut f: impl FnMut(&RawId, &RawId),
+) {
+    // Collect distinct attributes for this entity.
+    let mut attrs: Vec<RawId> = Vec::new();
+    eav.infixes::<{ ID_LEN }, { ID_LEN }, _>(entity, |attr| {
+        if !attrs.contains(attr) {
+            attrs.push(*attr);
+        }
+    });
+    // For each attribute, scan values.
+    for attr in &attrs {
+        let mut prefix = [0u8; ID_LEN * 2];
+        prefix[..ID_LEN].copy_from_slice(entity);
+        prefix[ID_LEN..].copy_from_slice(attr);
+        eav.infixes::<{ ID_LEN * 2 }, 32, _>(&prefix, |value: &[u8; 32]| {
+            if value[..ID_LEN] == [0; ID_LEN] {
+                let dest: &[u8; ID_LEN] = value[ID_LEN..].try_into().unwrap();
+                f(attr, dest);
+            }
+        });
+    }
+}
+
+/// Count outgoing edges from a node that match any of the given attribute labels.
+fn count_matching_edges(
+    eav: &PATCH<TRIBLE_LEN, EAVOrder, ()>,
+    entity: &RawId,
+    labels: &[RawId],
+) -> usize {
+    let mut count = 0;
+    for label in labels {
+        let mut prefix = [0u8; ID_LEN * 2];
+        prefix[..ID_LEN].copy_from_slice(entity);
+        prefix[ID_LEN..].copy_from_slice(label);
+        eav.infixes::<{ ID_LEN * 2 }, 32, _>(&prefix, |value: &[u8; 32]| {
+            if value[..ID_LEN] == [0; ID_LEN] {
+                count += 1;
+            }
+        });
+    }
+    count
 }
 
 pub struct ThompsonEngine {
     automaton: Automaton,
-    edges: HashMap<RawId, Vec<(RawId, RawId)>>,
+    set: TribleSet,
 }
 
 impl ThompsonEngine {
     pub fn new(set: TribleSet, ops: &[PathOp]) -> (Self, Vec<RawValue>) {
         let automaton = Automaton::new(ops);
-        let mut edges: HashMap<RawId, Vec<(RawId, RawId)>> = HashMap::new();
-        let mut node_set: HashSet<RawId> = HashSet::new();
+        // Collect all GenId nodes for the unbound case.
+        let mut node_set: HashSet<RawValue> = HashSet::new();
         for t in set.iter() {
-            let e: RawId = t.data[E_START..=E_END].try_into().unwrap();
-            let a: RawId = t.data[A_START..=A_END].try_into().unwrap();
-            let v = &t.data[V_START..(V_START + 32)];
-            if v[0..16] == [0; 16] {
-                let dest: RawId = v[16..32].try_into().unwrap();
-                edges.entry(e).or_default().push((a, dest));
-                node_set.insert(e);
-                node_set.insert(dest);
+            let v = &t.data[32..64];
+            if v[..ID_LEN] == [0; ID_LEN] {
+                let dest: RawId = v[ID_LEN..].try_into().unwrap();
+                node_set.insert(id_into_value(&dest));
+                let e: RawId = t.data[..ID_LEN].try_into().unwrap();
+                node_set.insert(id_into_value(&e));
             }
         }
-        let nodes: Vec<RawValue> = node_set.iter().map(id_into_value).collect();
-        (ThompsonEngine { automaton, edges }, nodes)
+        let nodes: Vec<RawValue> = node_set.into_iter().collect();
+        (ThompsonEngine { automaton, set }, nodes)
     }
 
-    /// BFS from a start node following the NFA. Returns all reachable endpoints
-    /// (graph nodes that correspond to an accepting NFA state).
+    /// BFS from a start node following the NFA, querying the TribleSet's EAV
+    /// index at each depth. Returns all reachable endpoints.
     fn reachable_from(&self, from: &RawId) -> Vec<RawValue> {
         let start_states = self.automaton.epsilon_closure(vec![self.automaton.start]);
         let mut queue: VecDeque<(RawId, Vec<u64>)> = VecDeque::new();
@@ -235,21 +285,20 @@ impl ThompsonEngine {
             if states.contains(&self.automaton.accept) {
                 result_set.insert(node);
             }
-            if let Some(edges) = self.edges.get(&node) {
-                for (attr, dest) in edges {
-                    let mut next_states = Vec::new();
-                    for s in &states {
-                        next_states.extend(self.automaton.transitions_from(s, attr));
-                    }
-                    if next_states.is_empty() {
-                        continue;
-                    }
-                    let closure = self.automaton.epsilon_closure(next_states);
-                    if visited.insert((*dest, closure.clone())) {
-                        queue.push_back((*dest, closure));
-                    }
+            // Query the TribleSet directly for outgoing edges from this node.
+            for_each_edge(&self.set.eav, &node, |attr, dest| {
+                let mut next_states = Vec::new();
+                for s in &states {
+                    next_states.extend(self.automaton.transitions_from(s, attr));
                 }
-            }
+                if next_states.is_empty() {
+                    return;
+                }
+                let closure = self.automaton.epsilon_closure(next_states);
+                if visited.insert((*dest, closure.clone())) {
+                    queue.push_back((*dest, closure));
+                }
+            });
         }
 
         result_set.iter().map(id_into_value).collect()
@@ -261,37 +310,33 @@ impl ThompsonEngine {
         queue.push_back((*from, start_states.clone()));
         let mut visited: HashSet<(RawId, Vec<u64>)> = HashSet::new();
         visited.insert((*from, start_states));
+
         while let Some((node, states)) = queue.pop_front() {
             if states.contains(&self.automaton.accept) && node == *to {
                 return true;
             }
-            if let Some(edges) = self.edges.get(&node) {
-                for (attr, dest) in edges {
-                    let mut next_states = Vec::new();
-                    for s in &states {
-                        next_states.extend(self.automaton.transitions_from(s, attr));
-                    }
-                    if next_states.is_empty() {
-                        continue;
-                    }
-                    let closure = self.automaton.epsilon_closure(next_states);
-                    if visited.insert((*dest, closure.clone())) {
-                        queue.push_back((*dest, closure));
-                    }
+            for_each_edge(&self.set.eav, &node, |attr, dest| {
+                let mut next_states = Vec::new();
+                for s in &states {
+                    next_states.extend(self.automaton.transitions_from(s, attr));
                 }
-            }
+                if next_states.is_empty() {
+                    return;
+                }
+                let closure = self.automaton.epsilon_closure(next_states);
+                if visited.insert((*dest, closure.clone())) {
+                    queue.push_back((*dest, closure));
+                }
+            });
         }
         false
     }
 
-    /// Shallow estimate: count outgoing edges from a node that match any
-    /// initial NFA transition label. Cheap proxy for the full reachable set size.
+    /// Shallow estimate: count outgoing GenId edges from a node that match
+    /// the initial NFA transition labels. Cheap proxy for reachable set size.
     fn estimate_from(&self, from: &RawId) -> usize {
         let labels = self.automaton.initial_labels();
-        self.edges
-            .get(from)
-            .map(|edges| edges.iter().filter(|(a, _)| labels.contains(a)).count())
-            .unwrap_or(0)
+        count_matching_edges(&self.set.eav, from, &labels)
     }
 }
 
@@ -330,7 +375,6 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
     fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
         if variable == self.end {
             if let Some(start_val) = binding.get(self.start) {
-                // Start is bound — shallow estimate based on outgoing edges.
                 if let Some(start_id) = id_from_value(start_val) {
                     return Some(self.engine.estimate_from(&start_id).max(1));
                 }
@@ -338,7 +382,6 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
             }
             Some(self.nodes.len())
         } else if variable == self.start {
-            // TODO: reverse shallow estimation when end is bound.
             Some(self.nodes.len())
         } else {
             None
@@ -348,7 +391,6 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
         if variable == self.end {
             if let Some(start_val) = binding.get(self.start) {
-                // Start is bound — propose only reachable endpoints.
                 if let Some(start_id) = id_from_value(start_val) {
                     proposals.extend(self.engine.reachable_from(&start_id));
                 }
