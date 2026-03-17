@@ -1,5 +1,15 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::hint::black_box;
+use triblespace::core::id::{Id, RawId, ID_LEN};
+use triblespace::core::patch::{Entry, IdentitySchema, PATCH};
+use triblespace::core::query::intersectionconstraint::IntersectionConstraint;
+use triblespace::core::query::{Binding, Constraint, Query, TriblePattern, VariableContext};
+use triblespace::core::trible::{EAVOrder, TribleSet, TRIBLE_LEN};
+use triblespace::core::value::schemas::genid::GenId;
+use triblespace::core::value::ToValue;
 use triblespace::prelude::*;
 
 mod bench_social {
@@ -10,7 +20,303 @@ mod bench_social {
     }
 }
 
-/// Build a linear chain: n0 → n1 → n2 → ... → n_{len-1}
+// ═══════════════════════════════════════════════════════════════════════════
+// Approach 1: NFA + materialized HashMap (the original)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn raw_id_to_value(id: &RawId) -> [u8; 32] {
+    let mut v = [0u8; 32];
+    v[16..32].copy_from_slice(id);
+    v
+}
+
+fn value_to_raw_id(v: &[u8; 32]) -> Option<RawId> {
+    if v[..16] == [0; 16] {
+        Some(v[16..32].try_into().unwrap())
+    } else {
+        None
+    }
+}
+
+mod nfa_materialized {
+    use super::*;
+
+    const STATE_LEN: usize = core::mem::size_of::<u64>();
+    const EDGE_KEY_LEN: usize = STATE_LEN * 2 + ID_LEN;
+    const NIL_ID: RawId = [0; ID_LEN];
+
+    #[derive(Clone)]
+    struct Automaton {
+        transitions: PATCH<EDGE_KEY_LEN, IdentitySchema, ()>,
+        start: u64,
+        accept: u64,
+    }
+
+    impl Automaton {
+        fn new(attr: &RawId) -> Self {
+            // Simple a+ automaton: s0 --(attr)--> s1, s1 --(attr)--> s1
+            let mut trans = PATCH::<EDGE_KEY_LEN, IdentitySchema, ()>::new();
+            let mut key = [0u8; EDGE_KEY_LEN];
+            // s0 -> s1 via attr
+            key[..STATE_LEN].copy_from_slice(&0u64.to_be_bytes());
+            key[STATE_LEN..STATE_LEN + ID_LEN].copy_from_slice(attr);
+            key[STATE_LEN + ID_LEN..].copy_from_slice(&1u64.to_be_bytes());
+            trans.insert(&Entry::new(&key));
+            // s1 -> s1 via attr (loop)
+            key[..STATE_LEN].copy_from_slice(&1u64.to_be_bytes());
+            key[STATE_LEN + ID_LEN..].copy_from_slice(&1u64.to_be_bytes());
+            trans.insert(&Entry::new(&key));
+            Automaton {
+                transitions: trans,
+                start: 0,
+                accept: 1,
+            }
+        }
+
+        fn transitions_from(&self, state: &u64, label: &RawId) -> Vec<u64> {
+            let mut prefix = [0u8; STATE_LEN + ID_LEN];
+            prefix[..STATE_LEN].copy_from_slice(&state.to_be_bytes());
+            prefix[STATE_LEN..].copy_from_slice(label);
+            let mut dests = Vec::new();
+            self.transitions
+                .infixes::<{ STATE_LEN + ID_LEN }, { STATE_LEN }, _>(&prefix, |to| {
+                    dests.push(u64::from_be_bytes(*to));
+                });
+            dests
+        }
+
+        fn epsilon_closure(&self, states: Vec<u64>) -> Vec<u64> {
+            let mut result = states.clone();
+            let mut stack = states;
+            while let Some(s) = stack.pop() {
+                for dest in self.transitions_from(&s, &NIL_ID) {
+                    if !result.contains(&dest) {
+                        result.push(dest);
+                        stack.push(dest);
+                    }
+                }
+            }
+            result.sort();
+            result.dedup();
+            result
+        }
+    }
+
+    pub fn reachable_from(set: &TribleSet, attr: &RawId, start: &RawId) -> HashSet<RawId> {
+        let automaton = Automaton::new(attr);
+        // Materialize all edges into HashMap.
+        let mut edges: HashMap<RawId, Vec<(RawId, RawId)>> = HashMap::new();
+        for t in set.iter() {
+            let e: RawId = t.data[0..ID_LEN].try_into().unwrap();
+            let a: RawId = t.data[ID_LEN..ID_LEN * 2].try_into().unwrap();
+            let v = &t.data[32..64];
+            if v[..ID_LEN] == [0; ID_LEN] {
+                let dest: RawId = v[ID_LEN..].try_into().unwrap();
+                edges.entry(e).or_default().push((a, dest));
+            }
+        }
+
+        // BFS with NFA state tracking.
+        let start_states = automaton.epsilon_closure(vec![automaton.start]);
+        let mut queue: VecDeque<(RawId, Vec<u64>)> = VecDeque::new();
+        queue.push_back((*start, start_states.clone()));
+        let mut visited: HashSet<(RawId, Vec<u64>)> = HashSet::new();
+        visited.insert((*start, start_states));
+        let mut results = HashSet::new();
+
+        while let Some((node, states)) = queue.pop_front() {
+            if states.contains(&automaton.accept) {
+                results.insert(node);
+            }
+            if let Some(node_edges) = edges.get(&node) {
+                for (a, dest) in node_edges {
+                    let mut next_states = Vec::new();
+                    for s in &states {
+                        next_states.extend(automaton.transitions_from(s, a));
+                    }
+                    if next_states.is_empty() {
+                        continue;
+                    }
+                    let closure = automaton.epsilon_closure(next_states);
+                    if visited.insert((*dest, closure.clone())) {
+                        queue.push_back((*dest, closure));
+                    }
+                }
+            }
+        }
+        results
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Approach 2: NFA + lazy PATCH scans (intermediate)
+// ═══════════════════════════════════════════════════════════════════════════
+
+mod nfa_lazy {
+    use super::*;
+
+    const STATE_LEN: usize = core::mem::size_of::<u64>();
+    const EDGE_KEY_LEN: usize = STATE_LEN * 2 + ID_LEN;
+    const NIL_ID: RawId = [0; ID_LEN];
+
+    #[derive(Clone)]
+    struct Automaton {
+        transitions: PATCH<EDGE_KEY_LEN, IdentitySchema, ()>,
+        start: u64,
+        accept: u64,
+    }
+
+    impl Automaton {
+        fn new(attr: &RawId) -> Self {
+            let mut trans = PATCH::<EDGE_KEY_LEN, IdentitySchema, ()>::new();
+            let mut key = [0u8; EDGE_KEY_LEN];
+            key[..STATE_LEN].copy_from_slice(&0u64.to_be_bytes());
+            key[STATE_LEN..STATE_LEN + ID_LEN].copy_from_slice(attr);
+            key[STATE_LEN + ID_LEN..].copy_from_slice(&1u64.to_be_bytes());
+            trans.insert(&Entry::new(&key));
+            key[..STATE_LEN].copy_from_slice(&1u64.to_be_bytes());
+            key[STATE_LEN + ID_LEN..].copy_from_slice(&1u64.to_be_bytes());
+            trans.insert(&Entry::new(&key));
+            Automaton {
+                transitions: trans,
+                start: 0,
+                accept: 1,
+            }
+        }
+
+        fn transitions_from(&self, state: &u64, label: &RawId) -> Vec<u64> {
+            let mut prefix = [0u8; STATE_LEN + ID_LEN];
+            prefix[..STATE_LEN].copy_from_slice(&state.to_be_bytes());
+            prefix[STATE_LEN..].copy_from_slice(label);
+            let mut dests = Vec::new();
+            self.transitions
+                .infixes::<{ STATE_LEN + ID_LEN }, { STATE_LEN }, _>(&prefix, |to| {
+                    dests.push(u64::from_be_bytes(*to));
+                });
+            dests
+        }
+
+        fn epsilon_closure(&self, states: Vec<u64>) -> Vec<u64> {
+            let mut result = states.clone();
+            let mut stack = states;
+            while let Some(s) = stack.pop() {
+                for dest in self.transitions_from(&s, &NIL_ID) {
+                    if !result.contains(&dest) {
+                        result.push(dest);
+                        stack.push(dest);
+                    }
+                }
+            }
+            result.sort();
+            result.dedup();
+            result
+        }
+    }
+
+    fn for_each_edge(
+        eav: &PATCH<TRIBLE_LEN, EAVOrder, ()>,
+        entity: &RawId,
+        mut f: impl FnMut(&RawId, &RawId),
+    ) {
+        let mut attrs: Vec<RawId> = Vec::new();
+        eav.infixes::<{ ID_LEN }, { ID_LEN }, _>(entity, |attr| {
+            if !attrs.contains(attr) {
+                attrs.push(*attr);
+            }
+        });
+        for attr in &attrs {
+            let mut prefix = [0u8; ID_LEN * 2];
+            prefix[..ID_LEN].copy_from_slice(entity);
+            prefix[ID_LEN..].copy_from_slice(attr);
+            eav.infixes::<{ ID_LEN * 2 }, 32, _>(&prefix, |value: &[u8; 32]| {
+                if value[..ID_LEN] == [0; ID_LEN] {
+                    let dest: &[u8; ID_LEN] = value[ID_LEN..].try_into().unwrap();
+                    f(attr, dest);
+                }
+            });
+        }
+    }
+
+    pub fn reachable_from(set: &TribleSet, attr: &RawId, start: &RawId) -> HashSet<RawId> {
+        let automaton = Automaton::new(attr);
+        let start_states = automaton.epsilon_closure(vec![automaton.start]);
+        let mut queue: VecDeque<(RawId, Vec<u64>)> = VecDeque::new();
+        queue.push_back((*start, start_states.clone()));
+        let mut visited: HashSet<(RawId, Vec<u64>)> = HashSet::new();
+        visited.insert((*start, start_states));
+        let mut results = HashSet::new();
+
+        while let Some((node, states)) = queue.pop_front() {
+            if states.contains(&automaton.accept) {
+                results.insert(node);
+            }
+            for_each_edge(&set.eav, &node, |a, dest| {
+                let mut next_states = Vec::new();
+                for s in &states {
+                    next_states.extend(automaton.transitions_from(s, a));
+                }
+                if next_states.is_empty() {
+                    return;
+                }
+                let closure = automaton.epsilon_closure(next_states);
+                if visited.insert((*dest, closure.clone())) {
+                    queue.push_back((*dest, closure));
+                }
+            });
+        }
+        results
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Approach 3: Recursive sub-joins via WCO engine (current, paper's approach)
+// ═══════════════════════════════════════════════════════════════════════════
+
+mod recursive_join {
+    use super::*;
+
+    pub fn reachable_from(set: &TribleSet, attr: &RawId, start: &RawId) -> HashSet<RawId> {
+        let attr_id = Id::new(*attr).unwrap();
+        let mut visited: HashSet<RawId> = HashSet::new();
+        let mut results: HashSet<RawId> = HashSet::new();
+        let mut frontier: VecDeque<RawId> = VecDeque::new();
+        frontier.push_back(*start);
+        visited.insert(*start);
+
+        while let Some(node) = frontier.pop_front() {
+            let node_id = Id::new(node).unwrap();
+            let mut ctx = VariableContext::new();
+            let e = ctx.next_variable::<GenId>();
+            let a = ctx.next_variable::<GenId>();
+            let v = ctx.next_variable::<GenId>();
+            let constraints: Vec<Box<dyn Constraint<'static>>> = vec![
+                Box::new(e.is(node_id.to_value())),
+                Box::new(a.is(attr_id.to_value())),
+                Box::new(set.pattern(e, a, v)),
+            ];
+            let dest_idx = v.index;
+            let constraint = IntersectionConstraint::new(constraints);
+            let reached: HashSet<RawId> = Query::new(constraint, move |binding: &Binding| {
+                let raw = binding.get(dest_idx)?;
+                super::value_to_raw_id(raw)
+            })
+            .collect();
+
+            for dest in reached {
+                results.insert(dest);
+                if visited.insert(dest) {
+                    frontier.push_back(dest);
+                }
+            }
+        }
+        results
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Graph builders
+// ═══════════════════════════════════════════════════════════════════════════
+
 fn build_chain(len: usize) -> (TribleSet, Vec<ExclusiveId>) {
     let nodes: Vec<ExclusiveId> = (0..len).map(|_| fucid()).collect();
     let mut set = TribleSet::new();
@@ -20,7 +326,6 @@ fn build_chain(len: usize) -> (TribleSet, Vec<ExclusiveId>) {
     (set, nodes)
 }
 
-/// Build a binary tree of depth d: each node follows two children.
 fn build_tree(depth: usize) -> (TribleSet, ExclusiveId) {
     let root = fucid();
     let mut set = TribleSet::new();
@@ -40,13 +345,9 @@ fn build_tree(depth: usize) -> (TribleSet, ExclusiveId) {
     (set, root)
 }
 
-/// Build a graph with many nodes but only a small connected component reachable
-/// from the start. Tests whether binding-aware estimation avoids scanning all nodes.
 fn build_sparse(total_nodes: usize, reachable_len: usize) -> (TribleSet, ExclusiveId) {
-    // Reachable chain.
     let (mut set, chain) = build_chain(reachable_len);
     let start = ExclusiveId::force(chain[0].id);
-    // Unreachable noise: disconnected nodes with random edges among themselves.
     let noise: Vec<ExclusiveId> = (0..total_nodes - reachable_len).map(|_| fucid()).collect();
     for i in 0..noise.len().saturating_sub(1) {
         set += entity! { &noise[i] @ bench_social::follows: &noise[i + 1] };
@@ -54,140 +355,85 @@ fn build_sparse(total_nodes: usize, reachable_len: usize) -> (TribleSet, Exclusi
     (set, start)
 }
 
-fn bench_path_chain(c: &mut Criterion) {
-    let mut group = c.benchmark_group("path/chain/follows+");
+fn follows_attr() -> RawId {
+    bench_social::follows.id().into()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Comparison benchmarks
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn bench_compare_chain(c: &mut Criterion) {
+    let mut group = c.benchmark_group("compare/chain");
+    let attr = follows_attr();
+
     for len in [10, 50, 100, 500] {
         let (set, nodes) = build_chain(len);
-        let start_val = nodes[0].id.to_value();
-        group.bench_with_input(BenchmarkId::from_parameter(len), &len, |b, _| {
-            b.iter(|| {
-                let results: Vec<_> = find!(
-                    (s: Value<_>, e: Value<_>),
-                    and!(s.is(start_val), path!(set.clone(), s bench_social::follows+ e))
-                )
-                .collect();
-                black_box(results)
-            })
+        let start: RawId = nodes[0].id.into();
+
+        group.bench_with_input(BenchmarkId::new("nfa_materialized", len), &len, |b, _| {
+            b.iter(|| black_box(nfa_materialized::reachable_from(&set, &attr, &start)))
+        });
+        group.bench_with_input(BenchmarkId::new("nfa_lazy", len), &len, |b, _| {
+            b.iter(|| black_box(nfa_lazy::reachable_from(&set, &attr, &start)))
+        });
+        group.bench_with_input(BenchmarkId::new("recursive_join", len), &len, |b, _| {
+            b.iter(|| black_box(recursive_join::reachable_from(&set, &attr, &start)))
         });
     }
     group.finish();
 }
 
-fn bench_path_tree(c: &mut Criterion) {
-    let mut group = c.benchmark_group("path/tree/follows+");
-    for depth in [3, 5, 7, 9] {
+fn bench_compare_tree(c: &mut Criterion) {
+    let mut group = c.benchmark_group("compare/tree");
+    let attr = follows_attr();
+
+    for depth in [3, 5, 7] {
         let (set, root) = build_tree(depth);
-        let start_val = root.to_value();
-        let expected = (1 << (depth + 1)) - 2; // 2^(d+1) - 2 reachable nodes
-        group.bench_with_input(BenchmarkId::from_parameter(depth), &depth, |b, _| {
-            b.iter(|| {
-                let results: Vec<_> = find!(
-                    (s: Value<_>, e: Value<_>),
-                    and!(s.is(start_val), path!(set.clone(), s bench_social::follows+ e))
-                )
-                .collect();
-                assert_eq!(results.len(), expected);
-                black_box(results)
-            })
+        let start: RawId = root.id.into();
+
+        group.bench_with_input(BenchmarkId::new("nfa_materialized", depth), &depth, |b, _| {
+            b.iter(|| black_box(nfa_materialized::reachable_from(&set, &attr, &start)))
+        });
+        group.bench_with_input(BenchmarkId::new("nfa_lazy", depth), &depth, |b, _| {
+            b.iter(|| black_box(nfa_lazy::reachable_from(&set, &attr, &start)))
+        });
+        group.bench_with_input(BenchmarkId::new("recursive_join", depth), &depth, |b, _| {
+            b.iter(|| black_box(recursive_join::reachable_from(&set, &attr, &start)))
         });
     }
     group.finish();
 }
 
-fn bench_path_sparse(c: &mut Criterion) {
-    let mut group = c.benchmark_group("path/sparse/follows+");
-    // Fixed reachable chain of 10, increasing noise.
+fn bench_compare_sparse(c: &mut Criterion) {
+    let mut group = c.benchmark_group("compare/sparse");
+    let attr = follows_attr();
+
     for total in [100, 1_000, 10_000] {
-        let (set, start) = build_sparse(total, 10);
-        let start_val = start.to_value();
-        group.bench_with_input(BenchmarkId::from_parameter(total), &total, |b, _| {
-            b.iter(|| {
-                let results: Vec<_> = find!(
-                    (s: Value<_>, e: Value<_>),
-                    and!(s.is(start_val), path!(set.clone(), s bench_social::follows+ e))
-                )
-                .collect();
-                assert_eq!(results.len(), 9); // 10-node chain, 9 reachable from start
-                black_box(results)
-            })
-        });
-    }
-    group.finish();
-}
+        let (set, root) = build_sparse(total, 10);
+        let start: RawId = root.id.into();
 
-fn bench_path_alternation(c: &mut Criterion) {
-    let mut group = c.benchmark_group("path/chain/(follows|likes)+");
-    for len in [10, 50, 100] {
-        let nodes: Vec<ExclusiveId> = (0..len).map(|_| fucid()).collect();
-        let mut set = TribleSet::new();
-        for i in 0..len - 1 {
-            if i % 2 == 0 {
-                set += entity! { &nodes[i] @ bench_social::follows: &nodes[i + 1] };
-            } else {
-                set += entity! { &nodes[i] @ bench_social::likes: &nodes[i + 1] };
-            }
-        }
-        let start_val = nodes[0].id.to_value();
-        group.bench_with_input(BenchmarkId::from_parameter(len), &len, |b, _| {
-            b.iter(|| {
-                let results: Vec<_> = find!(
-                    (s: Value<_>, e: Value<_>),
-                    and!(
-                        s.is(start_val),
-                        path!(set.clone(), s (bench_social::follows | bench_social::likes)+ e)
-                    )
-                )
-                .collect();
-                black_box(results)
-            })
+        group.bench_with_input(
+            BenchmarkId::new("nfa_materialized", total),
+            &total,
+            |b, _| b.iter(|| black_box(nfa_materialized::reachable_from(&set, &attr, &start))),
+        );
+        group.bench_with_input(BenchmarkId::new("nfa_lazy", total), &total, |b, _| {
+            b.iter(|| black_box(nfa_lazy::reachable_from(&set, &attr, &start)))
         });
-    }
-    group.finish();
-}
-
-fn bench_path_conjunctive(c: &mut Criterion) {
-    let mut group = c.benchmark_group("path/conjunctive");
-    // Path query combined with a triple pattern constraint —
-    // tests whether the path constraint participates in variable ordering.
-    for len in [10, 50, 100] {
-        let nodes: Vec<ExclusiveId> = (0..len).map(|_| fucid()).collect();
-        let mut set = TribleSet::new();
-        for i in 0..len - 1 {
-            set += entity! { &nodes[i] @ bench_social::follows: &nodes[i + 1] };
-        }
-        // Add a "likes" edge from the last node to a target.
-        let target = fucid();
-        set += entity! { &nodes[len - 1] @ bench_social::likes: &target };
-        let start_val = nodes[0].id.to_value();
-        let target_val = target.to_value();
-
-        group.bench_with_input(BenchmarkId::from_parameter(len), &len, |b, _| {
-            b.iter(|| {
-                // "Find nodes reachable via follows+ from start that also like target"
-                let results: Vec<_> = find!(
-                    (s: Value<_>, mid: Value<_>, e: Value<_>),
-                    and!(
-                        s.is(start_val),
-                        e.is(target_val),
-                        path!(set.clone(), s bench_social::follows+ mid),
-                        pattern!(&set, [{ ?mid @ bench_social::likes: ?e }])
-                    )
-                )
-                .collect();
-                assert_eq!(results.len(), 1);
-                black_box(results)
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::new("recursive_join", total),
+            &total,
+            |b, _| b.iter(|| black_box(recursive_join::reachable_from(&set, &attr, &start))),
+        );
     }
     group.finish();
 }
 
 criterion_group!(
     path_benches,
-    bench_path_chain,
-    bench_path_tree,
-    bench_path_sparse,
-    bench_path_alternation,
-    bench_path_conjunctive,
+    bench_compare_chain,
+    bench_compare_tree,
+    bench_compare_sparse,
 );
 criterion_main!(path_benches);
