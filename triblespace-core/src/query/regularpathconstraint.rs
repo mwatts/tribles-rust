@@ -239,12 +239,12 @@ fn count_matching_edges(
 
 // ── Public API ───────────────────────────────────────────────────────────
 
-pub struct ThompsonEngine {
+pub struct PathEngine {
     expr: PathExpr,
     set: TribleSet,
 }
 
-impl ThompsonEngine {
+impl PathEngine {
     pub fn new(set: TribleSet, ops: &[PathOp]) -> (Self, Vec<RawValue>) {
         let expr = PathExpr::from_postfix(ops);
         // Collect all GenId nodes for the unbound case.
@@ -259,7 +259,7 @@ impl ThompsonEngine {
             }
         }
         let nodes: Vec<RawValue> = node_set.into_iter().collect();
-        (ThompsonEngine { expr, set }, nodes)
+        (PathEngine { expr, set }, nodes)
     }
 
     fn reachable_from(&self, from: &RawId) -> Vec<RawValue> {
@@ -282,7 +282,7 @@ impl ThompsonEngine {
 pub struct RegularPathConstraint {
     start: VariableId,
     end: VariableId,
-    engine: ThompsonEngine,
+    engine: PathEngine,
     nodes: Vec<RawValue>,
 }
 
@@ -293,7 +293,7 @@ impl RegularPathConstraint {
         end: Variable<GenId>,
         ops: &[PathOp],
     ) -> Self {
-        let (engine, nodes) = ThompsonEngine::new(set, ops);
+        let (engine, nodes) = PathEngine::new(set, ops);
         RegularPathConstraint {
             start: start.index,
             end: end.index,
