@@ -5,7 +5,6 @@ use crate::id::id_from_value;
 use crate::id::id_into_value;
 use crate::id::RawId;
 use crate::id::ID_LEN;
-use crate::patch::PATCH;
 use crate::query::intersectionconstraint::IntersectionConstraint;
 use crate::query::Binding;
 use crate::query::Constraint;
@@ -15,9 +14,7 @@ use crate::query::Variable;
 use crate::query::VariableContext;
 use crate::query::VariableId;
 use crate::query::VariableSet;
-use crate::trible::EAVOrder;
 use crate::trible::TribleSet;
-use crate::trible::TRIBLE_LEN;
 use crate::value::schemas::genid::GenId;
 use crate::value::RawValue;
 use crate::value::ToValue;
@@ -73,27 +70,8 @@ impl PathExpr {
         stack.pop().unwrap()
     }
 
-    /// Collect first-hop attribute IDs (for shallow estimation).
-    fn root_attrs(&self) -> Vec<RawId> {
-        match self {
-            PathExpr::Attr(a) => vec![*a],
-            PathExpr::Concat(lhs, _) => lhs.root_attrs(),
-            PathExpr::Union(lhs, rhs) => {
-                let mut attrs = lhs.root_attrs();
-                for a in rhs.root_attrs() {
-                    if !attrs.contains(&a) {
-                        attrs.push(a);
-                    }
-                }
-                attrs
-            }
-            PathExpr::Star(inner) | PathExpr::Plus(inner) => inner.root_attrs(),
-        }
-    }
-
-    /// Build a constraint for this expression and return the destination variable.
-    /// Each recursive call allocates variables from `ctx` and adds constraints.
-    /// The returned variable holds the destination (endpoint) of the expression.
+    /// Build constraints for this expression, returning the destination variable.
+    /// Allocates fresh variables from `ctx` and pushes constraints.
     fn build_constraint(
         &self,
         set: &TribleSet,
@@ -113,31 +91,42 @@ impl PathExpr {
                 let mid = lhs.build_constraint(set, ctx, start, constraints);
                 rhs.build_constraint(set, ctx, mid, constraints)
             }
-            PathExpr::Union(_lhs, _rhs) => {
-                // Union inside a concat body can't be expressed as a single
-                // IntersectionConstraint. Fall back to evaluating both sides
-                // and merging results in eval_from.
-                // This path shouldn't be reached from build_constraint because
-                // we only call it from Plus/Star which handles union at the
-                // eval_from level.
-                unreachable!("Union should be handled at eval_from level, not inside build_constraint")
-            }
-            PathExpr::Star(_) | PathExpr::Plus(_) => {
-                unreachable!("Nested closures should be handled at eval_from level")
+            PathExpr::Union(..) | PathExpr::Star(..) | PathExpr::Plus(..) => {
+                unreachable!("closures and unions handled at eval_from level")
             }
         }
     }
 }
 
+/// Build the WCO join constraint for a non-closure expression with a bound start,
+/// returning the constraint and the destination variable index.
+fn build_join(
+    set: &TribleSet,
+    expr: &PathExpr,
+    start: &RawId,
+) -> (IntersectionConstraint<Box<dyn Constraint<'static>>>, VariableId) {
+    let mut ctx = VariableContext::new();
+    let start_var = ctx.next_variable::<GenId>();
+    let mut constraints: Vec<Box<dyn Constraint<'static> + 'static>> = Vec::new();
+    constraints.push(Box::new(start_var.is(start.to_value())));
+    let dest_var = expr.build_constraint(set, &mut ctx, start_var, &mut constraints);
+    (IntersectionConstraint::new(constraints), dest_var.index)
+}
+
 // ── Recursive path evaluator ─────────────────────────────────────────────
 
 /// Evaluate a path expression from a bound start node, returning all
-/// reachable endpoints. Uses the query engine for joins (Concat) and
-/// BFS for transitive closures (Plus/Star).
+/// reachable endpoints. Uses the WCO join engine for Attr/Concat bodies
+/// and BFS for transitive closures.
 fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> HashSet<RawId> {
     match expr {
         PathExpr::Attr(_) | PathExpr::Concat(_, _) => {
-            eval_join(set, expr, start)
+            let (constraint, dest_idx) = build_join(set, expr, start);
+            Query::new(constraint, move |binding: &Binding| {
+                let raw = binding.get(dest_idx)?;
+                id_from_value(raw)
+            })
+            .collect()
         }
         PathExpr::Union(lhs, rhs) => {
             let mut results = eval_from(set, lhs, start);
@@ -152,8 +141,7 @@ fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> HashSet<RawId> 
             visited.insert(*start);
 
             while let Some(node) = frontier.pop_front() {
-                let reached = eval_from(set, body, &node);
-                for dest in reached {
+                for dest in eval_from(set, body, &node) {
                     results.insert(dest);
                     if visited.insert(dest) {
                         frontier.push_back(dest);
@@ -170,28 +158,10 @@ fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> HashSet<RawId> 
     }
 }
 
-/// Evaluate an Attr or Concat expression using the WCO join engine.
-fn eval_join(set: &TribleSet, expr: &PathExpr, start: &RawId) -> HashSet<RawId> {
-    let mut ctx = VariableContext::new();
-    let start_var = ctx.next_variable::<GenId>();
-    let mut constraints: Vec<Box<dyn Constraint<'static> + 'static>> = Vec::new();
-    constraints.push(Box::new(start_var.is(start.to_value())));
-    let dest_var = expr.build_constraint(set, &mut ctx, start_var, &mut constraints);
-    let dest_idx = dest_var.index;
-
-    let constraint = IntersectionConstraint::new(constraints);
-    let query = Query::new(constraint, move |binding: &Binding| {
-        let raw = binding.get(dest_idx)?;
-        id_from_value(raw)
-    });
-
-    query.collect()
-}
-
 fn has_path(set: &TribleSet, expr: &PathExpr, from: &RawId, to: &RawId) -> bool {
     match expr {
         PathExpr::Attr(_) | PathExpr::Concat(_, _) => {
-            eval_join(set, expr, from).contains(to)
+            eval_from(set, expr, from).contains(to)
         }
         PathExpr::Union(lhs, rhs) => {
             has_path(set, lhs, from, to) || has_path(set, rhs, from, to)
@@ -203,8 +173,7 @@ fn has_path(set: &TribleSet, expr: &PathExpr, from: &RawId, to: &RawId) -> bool 
             visited.insert(*from);
 
             while let Some(node) = frontier.pop_front() {
-                let reached = eval_from(set, body, &node);
-                for dest in reached {
+                for dest in eval_from(set, body, &node) {
                     if dest == *to {
                         return true;
                     }
@@ -224,23 +193,24 @@ fn has_path(set: &TribleSet, expr: &PathExpr, from: &RawId, to: &RawId) -> bool 
     }
 }
 
-fn count_matching_edges(
-    eav: &PATCH<TRIBLE_LEN, EAVOrder, ()>,
-    entity: &RawId,
-    labels: &[RawId],
-) -> usize {
-    let mut count = 0;
-    for label in labels {
-        let mut prefix = [0u8; ID_LEN * 2];
-        prefix[..ID_LEN].copy_from_slice(entity);
-        prefix[ID_LEN..].copy_from_slice(label);
-        eav.infixes::<{ ID_LEN * 2 }, 32, _>(&prefix, |value: &[u8; 32]| {
-            if value[..ID_LEN] == [0; ID_LEN] {
-                count += 1;
-            }
-        });
+/// Shallow estimate: build the one-step constraint and ask it for the
+/// destination variable's cardinality with the start bound.
+fn estimate_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> usize {
+    // Unwrap closure to get the body for estimation.
+    let body = match expr {
+        PathExpr::Star(inner) | PathExpr::Plus(inner) => inner.as_ref(),
+        other => other,
+    };
+    // For union, sum estimates of both sides.
+    if let PathExpr::Union(lhs, rhs) = body {
+        return estimate_from(set, lhs, start) + estimate_from(set, rhs, start);
     }
-    count
+    let (constraint, dest_idx) = build_join(set, body, start);
+    let mut binding = Binding::default();
+    // The start variable (index 0) is already bound by the ConstantConstraint,
+    // but estimate needs it in the binding too.
+    binding.set(0, &start.to_value().raw);
+    constraint.estimate(dest_idx, &binding).unwrap_or(0)
 }
 
 // ── Constraint ───────────────────────────────────────────────────────────
@@ -293,8 +263,7 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         if variable == self.end {
             if let Some(start_val) = binding.get(self.start) {
                 if let Some(start_id) = id_from_value(start_val) {
-                    let labels = self.expr.root_attrs();
-                    return Some(count_matching_edges(&self.set.eav, &start_id, &labels).max(1));
+                    return Some(estimate_from(&self.set, &self.expr, &start_id).max(1));
                 }
                 return Some(0);
             }
@@ -326,11 +295,8 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
             if let Some(end_val) = binding.get(self.end) {
                 if let Some(end_id) = id_from_value(end_val) {
                     proposals.retain(|v| {
-                        if let Some(start_id) = id_from_value(v) {
-                            has_path(&self.set, &self.expr, &start_id, &end_id)
-                        } else {
-                            false
-                        }
+                        id_from_value(v)
+                            .map_or(false, |sid| has_path(&self.set, &self.expr, &sid, &end_id))
                     });
                 } else {
                     proposals.clear();
@@ -340,11 +306,8 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
             if let Some(start_val) = binding.get(self.start) {
                 if let Some(start_id) = id_from_value(start_val) {
                     proposals.retain(|v| {
-                        if let Some(end_id) = id_from_value(v) {
-                            has_path(&self.set, &self.expr, &start_id, &end_id)
-                        } else {
-                            false
-                        }
+                        id_from_value(v)
+                            .map_or(false, |eid| has_path(&self.set, &self.expr, &start_id, &eid))
                     });
                 } else {
                     proposals.clear();
