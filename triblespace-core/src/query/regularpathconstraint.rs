@@ -161,7 +161,12 @@ fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> HashSet<RawId> 
 fn has_path(set: &TribleSet, expr: &PathExpr, from: &RawId, to: &RawId) -> bool {
     match expr {
         PathExpr::Attr(_) | PathExpr::Concat(_, _) => {
-            eval_from(set, expr, from).contains(to)
+            let (constraint, dest_idx) = build_join(set, expr, from);
+            Query::new(constraint, move |binding: &Binding| {
+                let raw = binding.get(dest_idx)?;
+                id_from_value(raw)
+            })
+            .any(|dest| dest == *to)
         }
         PathExpr::Union(lhs, rhs) => {
             has_path(set, lhs, from, to) || has_path(set, rhs, from, to)
