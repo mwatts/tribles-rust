@@ -314,6 +314,47 @@ mod recursive_join {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Approach 4: Hybrid — direct PATCH scan for Attr, WCO join for Concat
+// ═══════════════════════════════════════════════════════════════════════════
+
+mod hybrid {
+    use super::*;
+
+    fn eval_attr(set: &TribleSet, attr: &RawId, start: &RawId) -> HashSet<RawId> {
+        let mut results = HashSet::new();
+        let mut prefix = [0u8; ID_LEN * 2];
+        prefix[..ID_LEN].copy_from_slice(start);
+        prefix[ID_LEN..].copy_from_slice(attr);
+        set.eav
+            .infixes::<{ ID_LEN * 2 }, 32, _>(&prefix, |value: &[u8; 32]| {
+                if value[..ID_LEN] == [0; ID_LEN] {
+                    let dest: RawId = value[ID_LEN..].try_into().unwrap();
+                    results.insert(dest);
+                }
+            });
+        results
+    }
+
+    pub fn reachable_from(set: &TribleSet, attr: &RawId, start: &RawId) -> HashSet<RawId> {
+        let mut visited: HashSet<RawId> = HashSet::new();
+        let mut results: HashSet<RawId> = HashSet::new();
+        let mut frontier: VecDeque<RawId> = VecDeque::new();
+        frontier.push_back(*start);
+        visited.insert(*start);
+
+        while let Some(node) = frontier.pop_front() {
+            for dest in eval_attr(set, attr, &node) {
+                results.insert(dest);
+                if visited.insert(dest) {
+                    frontier.push_back(dest);
+                }
+            }
+        }
+        results
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Graph builders
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -380,6 +421,9 @@ fn bench_compare_chain(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("recursive_join", len), &len, |b, _| {
             b.iter(|| black_box(recursive_join::reachable_from(&set, &attr, &start)))
         });
+        group.bench_with_input(BenchmarkId::new("hybrid", len), &len, |b, _| {
+            b.iter(|| black_box(hybrid::reachable_from(&set, &attr, &start)))
+        });
     }
     group.finish();
 }
@@ -400,6 +444,9 @@ fn bench_compare_tree(c: &mut Criterion) {
         });
         group.bench_with_input(BenchmarkId::new("recursive_join", depth), &depth, |b, _| {
             b.iter(|| black_box(recursive_join::reachable_from(&set, &attr, &start)))
+        });
+        group.bench_with_input(BenchmarkId::new("hybrid", depth), &depth, |b, _| {
+            b.iter(|| black_box(hybrid::reachable_from(&set, &attr, &start)))
         });
     }
     group.finish();
@@ -426,6 +473,9 @@ fn bench_compare_sparse(c: &mut Criterion) {
             &total,
             |b, _| b.iter(|| black_box(recursive_join::reachable_from(&set, &attr, &start))),
         );
+        group.bench_with_input(BenchmarkId::new("hybrid", total), &total, |b, _| {
+            b.iter(|| black_box(hybrid::reachable_from(&set, &attr, &start)))
+        });
     }
     group.finish();
 }

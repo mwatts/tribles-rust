@@ -118,9 +118,26 @@ fn build_join(
 /// Evaluate a path expression from a bound start node, returning all
 /// reachable endpoints. Uses the WCO join engine for Attr/Concat bodies
 /// and BFS for transitive closures.
+/// Single-attribute hop via direct index scan. No query engine overhead.
+fn eval_attr(set: &TribleSet, attr: &RawId, start: &RawId) -> HashSet<RawId> {
+    let mut results = HashSet::new();
+    let mut prefix = [0u8; ID_LEN * 2];
+    prefix[..ID_LEN].copy_from_slice(start);
+    prefix[ID_LEN..].copy_from_slice(attr);
+    set.eav
+        .infixes::<{ ID_LEN * 2 }, 32, _>(&prefix, |value: &[u8; 32]| {
+            if value[..ID_LEN] == [0; ID_LEN] {
+                let dest: RawId = value[ID_LEN..].try_into().unwrap();
+                results.insert(dest);
+            }
+        });
+    results
+}
+
 fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> HashSet<RawId> {
     match expr {
-        PathExpr::Attr(_) | PathExpr::Concat(_, _) => {
+        PathExpr::Attr(attr) => eval_attr(set, attr, start),
+        PathExpr::Concat(_, _) => {
             let (constraint, dest_idx) = build_join(set, expr, start);
             Query::new(constraint, move |binding: &Binding| {
                 let raw = binding.get(dest_idx)?;
@@ -160,7 +177,8 @@ fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> HashSet<RawId> 
 
 fn has_path(set: &TribleSet, expr: &PathExpr, from: &RawId, to: &RawId) -> bool {
     match expr {
-        PathExpr::Attr(_) | PathExpr::Concat(_, _) => {
+        PathExpr::Attr(attr) => eval_attr(set, attr, from).contains(to),
+        PathExpr::Concat(_, _) => {
             let (constraint, dest_idx) = build_join(set, expr, from);
             Query::new(constraint, move |binding: &Binding| {
                 let raw = binding.get(dest_idx)?;
@@ -206,16 +224,23 @@ fn estimate_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> usize {
         PathExpr::Star(inner) | PathExpr::Plus(inner) => inner.as_ref(),
         other => other,
     };
-    // For union, sum estimates of both sides.
-    if let PathExpr::Union(lhs, rhs) = body {
-        return estimate_from(set, lhs, start) + estimate_from(set, rhs, start);
+    match body {
+        PathExpr::Attr(attr) => {
+            let mut prefix = [0u8; ID_LEN * 2];
+            prefix[..ID_LEN].copy_from_slice(start);
+            prefix[ID_LEN..].copy_from_slice(attr);
+            set.eav.segmented_len(&prefix) as usize
+        }
+        PathExpr::Union(lhs, rhs) => {
+            estimate_from(set, lhs, start) + estimate_from(set, rhs, start)
+        }
+        _ => {
+            let (constraint, dest_idx) = build_join(set, body, start);
+            let mut binding = Binding::default();
+            binding.set(0, &start.to_value().raw);
+            constraint.estimate(dest_idx, &binding).unwrap_or(0)
+        }
     }
-    let (constraint, dest_idx) = build_join(set, body, start);
-    let mut binding = Binding::default();
-    // The start variable (index 0) is already bound by the ConstantConstraint,
-    // but estimate needs it in the binding too.
-    binding.set(0, &start.to_value().raw);
-    constraint.estimate(dest_idx, &binding).unwrap_or(0)
 }
 
 // ── Constraint ───────────────────────────────────────────────────────────
