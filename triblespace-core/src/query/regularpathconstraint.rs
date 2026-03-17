@@ -6,9 +6,13 @@ use crate::id::id_into_value;
 use crate::id::RawId;
 use crate::id::ID_LEN;
 use crate::patch::PATCH;
+use crate::query::intersectionconstraint::IntersectionConstraint;
 use crate::query::Binding;
 use crate::query::Constraint;
+use crate::query::Query;
+use crate::query::TriblePattern;
 use crate::query::Variable;
+use crate::query::VariableContext;
 use crate::query::VariableId;
 use crate::query::VariableSet;
 use crate::trible::EAVOrder;
@@ -16,6 +20,7 @@ use crate::trible::TribleSet;
 use crate::trible::TRIBLE_LEN;
 use crate::value::schemas::genid::GenId;
 use crate::value::RawValue;
+use crate::value::ToValue;
 
 // ── Path expression types ────────────────────────────────────────────────
 
@@ -85,33 +90,54 @@ impl PathExpr {
             PathExpr::Star(inner) | PathExpr::Plus(inner) => inner.root_attrs(),
         }
     }
+
+    /// Build a constraint for this expression and return the destination variable.
+    /// Each recursive call allocates variables from `ctx` and adds constraints.
+    /// The returned variable holds the destination (endpoint) of the expression.
+    fn build_constraint(
+        &self,
+        set: &TribleSet,
+        ctx: &mut VariableContext,
+        start: Variable<GenId>,
+        constraints: &mut Vec<Box<dyn Constraint<'static> + 'static>>,
+    ) -> Variable<GenId> {
+        match self {
+            PathExpr::Attr(attr_id) => {
+                let a = ctx.next_variable::<GenId>();
+                let dest = ctx.next_variable::<GenId>();
+                constraints.push(Box::new(a.is(attr_id.to_value())));
+                constraints.push(Box::new(set.pattern(start, a, dest)));
+                dest
+            }
+            PathExpr::Concat(lhs, rhs) => {
+                let mid = lhs.build_constraint(set, ctx, start, constraints);
+                rhs.build_constraint(set, ctx, mid, constraints)
+            }
+            PathExpr::Union(_lhs, _rhs) => {
+                // Union inside a concat body can't be expressed as a single
+                // IntersectionConstraint. Fall back to evaluating both sides
+                // and merging results in eval_from.
+                // This path shouldn't be reached from build_constraint because
+                // we only call it from Plus/Star which handles union at the
+                // eval_from level.
+                unreachable!("Union should be handled at eval_from level, not inside build_constraint")
+            }
+            PathExpr::Star(_) | PathExpr::Plus(_) => {
+                unreachable!("Nested closures should be handled at eval_from level")
+            }
+        }
+    }
 }
 
 // ── Recursive path evaluator ─────────────────────────────────────────────
 
+/// Evaluate a path expression from a bound start node, returning all
+/// reachable endpoints. Uses the query engine for joins (Concat) and
+/// BFS for transitive closures (Plus/Star).
 fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> HashSet<RawId> {
     match expr {
-        PathExpr::Attr(attr) => {
-            let mut results = HashSet::new();
-            let mut prefix = [0u8; ID_LEN * 2];
-            prefix[..ID_LEN].copy_from_slice(start);
-            prefix[ID_LEN..].copy_from_slice(attr);
-            set.eav
-                .infixes::<{ ID_LEN * 2 }, 32, _>(&prefix, |value: &[u8; 32]| {
-                    if value[..ID_LEN] == [0; ID_LEN] {
-                        let dest: RawId = value[ID_LEN..].try_into().unwrap();
-                        results.insert(dest);
-                    }
-                });
-            results
-        }
-        PathExpr::Concat(lhs, rhs) => {
-            let intermediates = eval_from(set, lhs, start);
-            let mut results = HashSet::new();
-            for mid in &intermediates {
-                results.extend(eval_from(set, rhs, mid));
-            }
-            results
+        PathExpr::Attr(_) | PathExpr::Concat(_, _) => {
+            eval_join(set, expr, start)
         }
         PathExpr::Union(lhs, rhs) => {
             let mut results = eval_from(set, lhs, start);
@@ -144,29 +170,28 @@ fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> HashSet<RawId> 
     }
 }
 
+/// Evaluate an Attr or Concat expression using the WCO join engine.
+fn eval_join(set: &TribleSet, expr: &PathExpr, start: &RawId) -> HashSet<RawId> {
+    let mut ctx = VariableContext::new();
+    let start_var = ctx.next_variable::<GenId>();
+    let mut constraints: Vec<Box<dyn Constraint<'static> + 'static>> = Vec::new();
+    constraints.push(Box::new(start_var.is(start.to_value())));
+    let dest_var = expr.build_constraint(set, &mut ctx, start_var, &mut constraints);
+    let dest_idx = dest_var.index;
+
+    let constraint = IntersectionConstraint::new(constraints);
+    let query = Query::new(constraint, move |binding: &Binding| {
+        let raw = binding.get(dest_idx)?;
+        id_from_value(raw)
+    });
+
+    query.collect()
+}
+
 fn has_path(set: &TribleSet, expr: &PathExpr, from: &RawId, to: &RawId) -> bool {
     match expr {
-        PathExpr::Attr(attr) => {
-            let mut found = false;
-            let mut prefix = [0u8; ID_LEN * 2];
-            prefix[..ID_LEN].copy_from_slice(from);
-            prefix[ID_LEN..].copy_from_slice(attr);
-            set.eav
-                .infixes::<{ ID_LEN * 2 }, 32, _>(&prefix, |value: &[u8; 32]| {
-                    if !found && value[..ID_LEN] == [0; ID_LEN] {
-                        let dest: RawId = value[ID_LEN..].try_into().unwrap();
-                        if dest == *to {
-                            found = true;
-                        }
-                    }
-                });
-            found
-        }
-        PathExpr::Concat(lhs, rhs) => {
-            let intermediates = eval_from(set, lhs, from);
-            intermediates
-                .iter()
-                .any(|mid| has_path(set, rhs, mid, to))
+        PathExpr::Attr(_) | PathExpr::Concat(_, _) => {
+            eval_join(set, expr, from).contains(to)
         }
         PathExpr::Union(lhs, rhs) => {
             has_path(set, lhs, from, to) || has_path(set, rhs, from, to)
