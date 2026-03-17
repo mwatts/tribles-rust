@@ -225,7 +225,6 @@ pub struct RegularPathConstraint {
     end: VariableId,
     expr: PathExpr,
     set: TribleSet,
-    nodes: Vec<RawValue>,
 }
 
 impl RegularPathConstraint {
@@ -236,8 +235,19 @@ impl RegularPathConstraint {
         ops: &[PathOp],
     ) -> Self {
         let expr = PathExpr::from_postfix(ops);
+        RegularPathConstraint {
+            start: start.index,
+            end: end.index,
+            expr,
+            set,
+        }
+    }
+
+    /// Lazily collect all GenId nodes in the TribleSet.
+    /// Only called when neither start nor end is bound.
+    fn all_nodes(&self) -> Vec<RawValue> {
         let mut node_set: HashSet<RawValue> = HashSet::new();
-        for t in set.iter() {
+        for t in self.set.iter() {
             let v = &t.data[32..64];
             if v[..ID_LEN] == [0; ID_LEN] {
                 let dest: RawId = v[ID_LEN..].try_into().unwrap();
@@ -246,13 +256,7 @@ impl RegularPathConstraint {
                 node_set.insert(id_into_value(&e));
             }
         }
-        RegularPathConstraint {
-            start: start.index,
-            end: end.index,
-            expr,
-            set,
-            nodes: node_set.into_iter().collect(),
-        }
+        node_set.into_iter().collect()
     }
 }
 
@@ -272,9 +276,9 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
                 }
                 return Some(0);
             }
-            Some(self.nodes.len())
+            Some(self.set.len())
         } else if variable == self.start {
-            Some(self.nodes.len())
+            Some(self.set.len())
         } else {
             None
         }
@@ -291,7 +295,7 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
             }
         }
         if variable == self.start || variable == self.end {
-            proposals.extend(self.nodes.iter().cloned());
+            proposals.extend(self.all_nodes());
         }
     }
 
