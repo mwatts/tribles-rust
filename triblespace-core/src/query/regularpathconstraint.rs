@@ -40,7 +40,6 @@ enum PathExpr {
 }
 
 impl PathExpr {
-    /// Build a tree from a postfix-encoded sequence of PathOps.
     fn from_postfix(ops: &[PathOp]) -> Self {
         let mut stack: Vec<PathExpr> = Vec::new();
         for op in ops {
@@ -69,7 +68,7 @@ impl PathExpr {
         stack.pop().unwrap()
     }
 
-    /// Collect attribute IDs referenced by this expression (for shallow estimation).
+    /// Collect first-hop attribute IDs (for shallow estimation).
     fn root_attrs(&self) -> Vec<RawId> {
         match self {
             PathExpr::Attr(a) => vec![*a],
@@ -90,18 +89,9 @@ impl PathExpr {
 
 // ── Recursive path evaluator ─────────────────────────────────────────────
 
-/// Evaluate a path expression from a bound start node, returning all
-/// reachable endpoints. Each step queries the TribleSet's EAV index.
-///
-/// This follows the approach of Karalis et al. (Algorithm 2, EvalRPQ_TV):
-/// transitive closures (Star/Plus) are evaluated via BFS with a node-only
-/// visited set; at each BFS depth the closure body is evaluated recursively
-/// as a sub-join. Non-closure operators (Concat, Union) decompose into
-/// sequential or parallel sub-evaluations.
 fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> HashSet<RawId> {
     match expr {
         PathExpr::Attr(attr) => {
-            // Single attribute hop: query {start, attr, ?dest}.
             let mut results = HashSet::new();
             let mut prefix = [0u8; ID_LEN * 2];
             prefix[..ID_LEN].copy_from_slice(start);
@@ -116,7 +106,6 @@ fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> HashSet<RawId> 
             results
         }
         PathExpr::Concat(lhs, rhs) => {
-            // Evaluate lhs from start → intermediates, then rhs from each intermediate.
             let intermediates = eval_from(set, lhs, start);
             let mut results = HashSet::new();
             for mid in &intermediates {
@@ -130,8 +119,6 @@ fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> HashSet<RawId> 
             results
         }
         PathExpr::Plus(body) => {
-            // BFS: each depth evaluates the body expression from frontier nodes.
-            // Visited set is just graph nodes — no NFA state vectors.
             let mut visited: HashSet<RawId> = HashSet::new();
             let mut results: HashSet<RawId> = HashSet::new();
             let mut frontier: VecDeque<RawId> = VecDeque::new();
@@ -150,7 +137,6 @@ fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> HashSet<RawId> 
             results
         }
         PathExpr::Star(body) => {
-            // Same as Plus but also includes the start node (path of length 0).
             let mut results = eval_from(set, &PathExpr::Plus(body.clone()), start);
             results.insert(*start);
             results
@@ -158,8 +144,6 @@ fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> HashSet<RawId> 
     }
 }
 
-/// Check if a path exists from `from` to `to` following the expression.
-/// Short-circuits on first match.
 fn has_path(set: &TribleSet, expr: &PathExpr, from: &RawId, to: &RawId) -> bool {
     match expr {
         PathExpr::Attr(attr) => {
@@ -188,7 +172,6 @@ fn has_path(set: &TribleSet, expr: &PathExpr, from: &RawId, to: &RawId) -> bool 
             has_path(set, lhs, from, to) || has_path(set, rhs, from, to)
         }
         PathExpr::Plus(body) => {
-            // BFS looking specifically for `to`.
             let mut visited: HashSet<RawId> = HashSet::new();
             let mut frontier: VecDeque<RawId> = VecDeque::new();
             frontier.push_back(*from);
@@ -216,8 +199,6 @@ fn has_path(set: &TribleSet, expr: &PathExpr, from: &RawId, to: &RawId) -> bool 
     }
 }
 
-/// Count outgoing edges from a node that match any of the given attribute labels.
-/// Used for shallow estimation.
 fn count_matching_edges(
     eav: &PATCH<TRIBLE_LEN, EAVOrder, ()>,
     entity: &RawId,
@@ -237,52 +218,13 @@ fn count_matching_edges(
     count
 }
 
-// ── Public API ───────────────────────────────────────────────────────────
-
-pub struct PathEngine {
-    expr: PathExpr,
-    set: TribleSet,
-}
-
-impl PathEngine {
-    pub fn new(set: TribleSet, ops: &[PathOp]) -> (Self, Vec<RawValue>) {
-        let expr = PathExpr::from_postfix(ops);
-        // Collect all GenId nodes for the unbound case.
-        let mut node_set: HashSet<RawValue> = HashSet::new();
-        for t in set.iter() {
-            let v = &t.data[32..64];
-            if v[..ID_LEN] == [0; ID_LEN] {
-                let dest: RawId = v[ID_LEN..].try_into().unwrap();
-                node_set.insert(id_into_value(&dest));
-                let e: RawId = t.data[..ID_LEN].try_into().unwrap();
-                node_set.insert(id_into_value(&e));
-            }
-        }
-        let nodes: Vec<RawValue> = node_set.into_iter().collect();
-        (PathEngine { expr, set }, nodes)
-    }
-
-    fn reachable_from(&self, from: &RawId) -> Vec<RawValue> {
-        eval_from(&self.set, &self.expr, from)
-            .iter()
-            .map(id_into_value)
-            .collect()
-    }
-
-    fn has_path(&self, from: &RawId, to: &RawId) -> bool {
-        has_path(&self.set, &self.expr, from, to)
-    }
-
-    fn estimate_from(&self, from: &RawId) -> usize {
-        let labels = self.expr.root_attrs();
-        count_matching_edges(&self.set.eav, from, &labels)
-    }
-}
+// ── Constraint ───────────────────────────────────────────────────────────
 
 pub struct RegularPathConstraint {
     start: VariableId,
     end: VariableId,
-    engine: PathEngine,
+    expr: PathExpr,
+    set: TribleSet,
     nodes: Vec<RawValue>,
 }
 
@@ -293,12 +235,23 @@ impl RegularPathConstraint {
         end: Variable<GenId>,
         ops: &[PathOp],
     ) -> Self {
-        let (engine, nodes) = PathEngine::new(set, ops);
+        let expr = PathExpr::from_postfix(ops);
+        let mut node_set: HashSet<RawValue> = HashSet::new();
+        for t in set.iter() {
+            let v = &t.data[32..64];
+            if v[..ID_LEN] == [0; ID_LEN] {
+                let dest: RawId = v[ID_LEN..].try_into().unwrap();
+                node_set.insert(id_into_value(&dest));
+                let e: RawId = t.data[..ID_LEN].try_into().unwrap();
+                node_set.insert(id_into_value(&e));
+            }
+        }
         RegularPathConstraint {
             start: start.index,
             end: end.index,
-            engine,
-            nodes,
+            expr,
+            set,
+            nodes: node_set.into_iter().collect(),
         }
     }
 }
@@ -315,7 +268,8 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         if variable == self.end {
             if let Some(start_val) = binding.get(self.start) {
                 if let Some(start_id) = id_from_value(start_val) {
-                    return Some(self.engine.estimate_from(&start_id).max(1));
+                    let labels = self.expr.root_attrs();
+                    return Some(count_matching_edges(&self.set.eav, &start_id, &labels).max(1));
                 }
                 return Some(0);
             }
@@ -331,7 +285,8 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         if variable == self.end {
             if let Some(start_val) = binding.get(self.start) {
                 if let Some(start_id) = id_from_value(start_val) {
-                    proposals.extend(self.engine.reachable_from(&start_id));
+                    let reachable = eval_from(&self.set, &self.expr, &start_id);
+                    proposals.extend(reachable.iter().map(id_into_value));
                 }
                 return;
             }
@@ -347,7 +302,7 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
                 if let Some(end_id) = id_from_value(end_val) {
                     proposals.retain(|v| {
                         if let Some(start_id) = id_from_value(v) {
-                            self.engine.has_path(&start_id, &end_id)
+                            has_path(&self.set, &self.expr, &start_id, &end_id)
                         } else {
                             false
                         }
@@ -361,7 +316,7 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
                 if let Some(start_id) = id_from_value(start_val) {
                     proposals.retain(|v| {
                         if let Some(end_id) = id_from_value(v) {
-                            self.engine.has_path(&start_id, &end_id)
+                            has_path(&self.set, &self.expr, &start_id, &end_id)
                         } else {
                             false
                         }

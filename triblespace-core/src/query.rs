@@ -41,7 +41,6 @@ use crate::value::ValueSchema;
 
 pub use regularpathconstraint::PathOp;
 pub use regularpathconstraint::RegularPathConstraint;
-pub use regularpathconstraint::PathEngine;
 pub use variableset::VariableSet;
 
 /// Types storing tribles can implement this trait to expose them to queries.
