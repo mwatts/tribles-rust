@@ -32,10 +32,6 @@ pub enum PathOp {
     Plus,
 }
 
-pub trait PathEngine {
-    fn has_path(&self, from: &RawId, to: &RawId) -> bool;
-}
-
 const STATE_LEN: usize = core::mem::size_of::<u64>();
 const EDGE_KEY_LEN: usize = STATE_LEN * 2 + ID_LEN;
 const NIL_ID: RawId = [0; ID_LEN];
@@ -180,6 +176,24 @@ impl Automaton {
         result.dedup();
         result
     }
+
+    /// Collect all non-epsilon transition labels reachable from the initial
+    /// states (after epsilon closure). Used for shallow cardinality estimation.
+    fn initial_labels(&self) -> Vec<RawId> {
+        let start_states = self.epsilon_closure(vec![self.start]);
+        let mut labels = Vec::new();
+        for s in &start_states {
+            let prefix = s.to_be_bytes();
+            self.transitions
+                .infixes::<{ STATE_LEN }, { ID_LEN + STATE_LEN }, _>(&prefix, |rest| {
+                    let label: RawId = rest[..ID_LEN].try_into().unwrap();
+                    if label != NIL_ID && !labels.contains(&label) {
+                        labels.push(label);
+                    }
+                });
+        }
+        labels
+    }
 }
 
 pub struct ThompsonEngine {
@@ -206,15 +220,47 @@ impl ThompsonEngine {
         let nodes: Vec<RawValue> = node_set.iter().map(id_into_value).collect();
         (ThompsonEngine { automaton, edges }, nodes)
     }
-}
 
-impl PathEngine for ThompsonEngine {
+    /// BFS from a start node following the NFA. Returns all reachable endpoints
+    /// (graph nodes that correspond to an accepting NFA state).
+    fn reachable_from(&self, from: &RawId) -> Vec<RawValue> {
+        let start_states = self.automaton.epsilon_closure(vec![self.automaton.start]);
+        let mut queue: VecDeque<(RawId, Vec<u64>)> = VecDeque::new();
+        queue.push_back((*from, start_states.clone()));
+        let mut visited: HashSet<(RawId, Vec<u64>)> = HashSet::new();
+        visited.insert((*from, start_states));
+        let mut result_set: HashSet<RawId> = HashSet::new();
+
+        while let Some((node, states)) = queue.pop_front() {
+            if states.contains(&self.automaton.accept) {
+                result_set.insert(node);
+            }
+            if let Some(edges) = self.edges.get(&node) {
+                for (attr, dest) in edges {
+                    let mut next_states = Vec::new();
+                    for s in &states {
+                        next_states.extend(self.automaton.transitions_from(s, attr));
+                    }
+                    if next_states.is_empty() {
+                        continue;
+                    }
+                    let closure = self.automaton.epsilon_closure(next_states);
+                    if visited.insert((*dest, closure.clone())) {
+                        queue.push_back((*dest, closure));
+                    }
+                }
+            }
+        }
+
+        result_set.iter().map(id_into_value).collect()
+    }
+
     fn has_path(&self, from: &RawId, to: &RawId) -> bool {
         let start_states = self.automaton.epsilon_closure(vec![self.automaton.start]);
         let mut queue: VecDeque<(RawId, Vec<u64>)> = VecDeque::new();
         queue.push_back((*from, start_states.clone()));
         let mut visited: HashSet<(RawId, Vec<u64>)> = HashSet::new();
-        visited.insert((*from, start_states.clone()));
+        visited.insert((*from, start_states));
         while let Some((node, states)) = queue.pop_front() {
             if states.contains(&self.automaton.accept) && node == *to {
                 return true;
@@ -237,16 +283,26 @@ impl PathEngine for ThompsonEngine {
         }
         false
     }
+
+    /// Shallow estimate: count outgoing edges from a node that match any
+    /// initial NFA transition label. Cheap proxy for the full reachable set size.
+    fn estimate_from(&self, from: &RawId) -> usize {
+        let labels = self.automaton.initial_labels();
+        self.edges
+            .get(from)
+            .map(|edges| edges.iter().filter(|(a, _)| labels.contains(a)).count())
+            .unwrap_or(0)
+    }
 }
 
-pub struct RegularPathConstraint<E: PathEngine> {
+pub struct RegularPathConstraint {
     start: VariableId,
     end: VariableId,
-    engine: E,
+    engine: ThompsonEngine,
     nodes: Vec<RawValue>,
 }
 
-impl RegularPathConstraint<ThompsonEngine> {
+impl RegularPathConstraint {
     pub fn new(
         set: TribleSet,
         start: Variable<GenId>,
@@ -263,7 +319,7 @@ impl RegularPathConstraint<ThompsonEngine> {
     }
 }
 
-impl<'a, E: PathEngine> Constraint<'a> for RegularPathConstraint<E> {
+impl<'a> Constraint<'a> for RegularPathConstraint {
     fn variables(&self) -> VariableSet {
         let mut vars = VariableSet::new_empty();
         vars.set(self.start);
@@ -271,15 +327,34 @@ impl<'a, E: PathEngine> Constraint<'a> for RegularPathConstraint<E> {
         vars
     }
 
-    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
-        if variable == self.start || variable == self.end {
+    fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+        if variable == self.end {
+            if let Some(start_val) = binding.get(self.start) {
+                // Start is bound — shallow estimate based on outgoing edges.
+                if let Some(start_id) = id_from_value(start_val) {
+                    return Some(self.engine.estimate_from(&start_id).max(1));
+                }
+                return Some(0);
+            }
+            Some(self.nodes.len())
+        } else if variable == self.start {
+            // TODO: reverse shallow estimation when end is bound.
             Some(self.nodes.len())
         } else {
             None
         }
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
+    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
+        if variable == self.end {
+            if let Some(start_val) = binding.get(self.start) {
+                // Start is bound — propose only reachable endpoints.
+                if let Some(start_id) = id_from_value(start_val) {
+                    proposals.extend(self.engine.reachable_from(&start_id));
+                }
+                return;
+            }
+        }
         if variable == self.start || variable == self.end {
             proposals.extend(self.nodes.iter().cloned());
         }

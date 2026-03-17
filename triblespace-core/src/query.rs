@@ -39,7 +39,6 @@ use crate::value::RawValue;
 use crate::value::Value;
 use crate::value::ValueSchema;
 
-pub use regularpathconstraint::PathEngine;
 pub use regularpathconstraint::PathOp;
 pub use regularpathconstraint::RegularPathConstraint;
 pub use regularpathconstraint::ThompsonEngine;

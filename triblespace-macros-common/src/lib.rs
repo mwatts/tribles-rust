@@ -230,8 +230,8 @@ pub fn path_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<T
 
     let output = quote! {
         {
-            use #base_path::query::regularpathconstraint::{PathOp, RegularPathConstraint, ThompsonEngine};
-            RegularPathConstraint::<ThompsonEngine>::new(#set.clone(), #start, #end, &[#(#ops),*])
+            use #base_path::query::regularpathconstraint::{PathOp, RegularPathConstraint};
+            RegularPathConstraint::new(#set.clone(), #start, #end, &[#(#ops),*])
         }
     };
     Ok(output)
