@@ -5,20 +5,21 @@ use crate::id::id_from_value;
 use crate::id::id_into_value;
 use crate::id::RawId;
 use crate::id::ID_LEN;
-use crate::patch::Entry;
-use crate::patch::IdentitySchema;
 use crate::patch::PATCH;
 use crate::query::Binding;
 use crate::query::Constraint;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
-use crate::trible::TRIBLE_LEN;
 use crate::trible::EAVOrder;
 use crate::trible::TribleSet;
+use crate::trible::TRIBLE_LEN;
 use crate::value::schemas::genid::GenId;
 use crate::value::RawValue;
 
+// ── Path expression types ────────────────────────────────────────────────
+
+/// Postfix-encoded path operations (used by the `path!` macro).
 #[derive(Clone)]
 pub enum PathOp {
     Attr(RawId),
@@ -28,207 +29,195 @@ pub enum PathOp {
     Plus,
 }
 
-const STATE_LEN: usize = core::mem::size_of::<u64>();
-const EDGE_KEY_LEN: usize = STATE_LEN * 2 + ID_LEN;
-const NIL_ID: RawId = [0; ID_LEN];
-
+/// Tree-structured path expression for recursive evaluation.
 #[derive(Clone)]
-struct Automaton {
-    transitions: PATCH<EDGE_KEY_LEN, IdentitySchema, ()>,
-    start: u64,
-    accept: u64,
+enum PathExpr {
+    Attr(RawId),
+    Concat(Box<PathExpr>, Box<PathExpr>),
+    Union(Box<PathExpr>, Box<PathExpr>),
+    Star(Box<PathExpr>),
+    Plus(Box<PathExpr>),
 }
 
-impl Automaton {
-    /// Builds an NFA using Thompson's construction as described in
-    /// "Regular expression search algorithm" (Thompson, 1968). The
-    /// sequence of `PathOp`s is expected in postfix order.
-    fn new(ops: &[PathOp]) -> Self {
-        #[derive(Clone)]
-        struct Frag {
-            start: u64,
-            accept: u64,
-        }
-
-        fn new_state(counter: &mut u64) -> u64 {
-            let id = *counter;
-            *counter += 1;
-            id
-        }
-
-        fn insert_edge(
-            patch: &mut PATCH<EDGE_KEY_LEN, IdentitySchema, ()>,
-            from: &u64,
-            label: &RawId,
-            to: &u64,
-        ) {
-            let mut key = [0u8; EDGE_KEY_LEN];
-            key[..STATE_LEN].copy_from_slice(&from.to_be_bytes());
-            key[STATE_LEN..STATE_LEN + ID_LEN].copy_from_slice(label);
-            key[STATE_LEN + ID_LEN..].copy_from_slice(&to.to_be_bytes());
-            patch.insert(&Entry::new(&key));
-        }
-
-        let mut trans = PATCH::<EDGE_KEY_LEN, IdentitySchema, ()>::new();
-        let mut counter: u64 = 0;
-        let mut stack: Vec<Frag> = Vec::new();
-
+impl PathExpr {
+    /// Build a tree from a postfix-encoded sequence of PathOps.
+    fn from_postfix(ops: &[PathOp]) -> Self {
+        let mut stack: Vec<PathExpr> = Vec::new();
         for op in ops {
             match op {
-                PathOp::Attr(id) => {
-                    let s = new_state(&mut counter);
-                    let e = new_state(&mut counter);
-                    insert_edge(&mut trans, &s, id, &e);
-                    stack.push(Frag {
-                        start: s,
-                        accept: e,
-                    });
-                }
+                PathOp::Attr(id) => stack.push(PathExpr::Attr(*id)),
                 PathOp::Concat => {
                     let b = stack.pop().unwrap();
                     let a = stack.pop().unwrap();
-                    insert_edge(&mut trans, &a.accept, &NIL_ID, &b.start);
-                    stack.push(Frag {
-                        start: a.start,
-                        accept: b.accept,
-                    });
+                    stack.push(PathExpr::Concat(Box::new(a), Box::new(b)));
                 }
                 PathOp::Union => {
                     let b = stack.pop().unwrap();
                     let a = stack.pop().unwrap();
-                    let s = new_state(&mut counter);
-                    let e = new_state(&mut counter);
-                    insert_edge(&mut trans, &s, &NIL_ID, &a.start);
-                    insert_edge(&mut trans, &s, &NIL_ID, &b.start);
-                    insert_edge(&mut trans, &a.accept, &NIL_ID, &e);
-                    insert_edge(&mut trans, &b.accept, &NIL_ID, &e);
-                    stack.push(Frag {
-                        start: s,
-                        accept: e,
-                    });
+                    stack.push(PathExpr::Union(Box::new(a), Box::new(b)));
                 }
                 PathOp::Star => {
                     let a = stack.pop().unwrap();
-                    let s = new_state(&mut counter);
-                    let e = new_state(&mut counter);
-                    insert_edge(&mut trans, &s, &NIL_ID, &a.start);
-                    insert_edge(&mut trans, &s, &NIL_ID, &e);
-                    insert_edge(&mut trans, &a.accept, &NIL_ID, &a.start);
-                    insert_edge(&mut trans, &a.accept, &NIL_ID, &e);
-                    stack.push(Frag {
-                        start: s,
-                        accept: e,
-                    });
+                    stack.push(PathExpr::Star(Box::new(a)));
                 }
                 PathOp::Plus => {
                     let a = stack.pop().unwrap();
-                    let s = new_state(&mut counter);
-                    let e = new_state(&mut counter);
-                    insert_edge(&mut trans, &s, &NIL_ID, &a.start);
-                    insert_edge(&mut trans, &a.accept, &NIL_ID, &a.start);
-                    insert_edge(&mut trans, &a.accept, &NIL_ID, &e);
-                    stack.push(Frag {
-                        start: s,
-                        accept: e,
-                    });
+                    stack.push(PathExpr::Plus(Box::new(a)));
                 }
             }
         }
-
-        let frag = stack.pop().unwrap();
-        Automaton {
-            transitions: trans,
-            start: frag.start,
-            accept: frag.accept,
-        }
+        stack.pop().unwrap()
     }
 
-    fn transitions_from(&self, state: &u64, label: &RawId) -> Vec<u64> {
-        let mut prefix = [0u8; STATE_LEN + ID_LEN];
-        prefix[..STATE_LEN].copy_from_slice(&state.to_be_bytes());
-        prefix[STATE_LEN..].copy_from_slice(label);
-        let mut dests = Vec::new();
-        self.transitions
-            .infixes::<{ STATE_LEN + ID_LEN }, { STATE_LEN }, _>(&prefix, |to| {
-                dests.push(u64::from_be_bytes(*to));
-            });
-        dests
-    }
-
-    /// Returns the epsilon-closure of the given states. The resulting set is
-    /// sorted and deduplicated to allow canonical comparisons.
-    fn epsilon_closure(&self, states: Vec<u64>) -> Vec<u64> {
-        let mut result = states.clone();
-        let mut stack = states;
-        while let Some(s) = stack.pop() {
-            for dest in self.transitions_from(&s, &NIL_ID) {
-                if !result.contains(&dest) {
-                    result.push(dest);
-                    stack.push(dest);
-                }
-            }
-        }
-        result.sort();
-        result.dedup();
-        result
-    }
-
-    /// Collect all non-epsilon transition labels reachable from a set of NFA states.
-    fn reachable_labels(&self, states: &[u64]) -> Vec<RawId> {
-        let mut labels = Vec::new();
-        for s in states {
-            let prefix = s.to_be_bytes();
-            self.transitions
-                .infixes::<{ STATE_LEN }, { ID_LEN + STATE_LEN }, _>(&prefix, |rest| {
-                    let label: RawId = rest[..ID_LEN].try_into().unwrap();
-                    if label != NIL_ID && !labels.contains(&label) {
-                        labels.push(label);
+    /// Collect attribute IDs referenced by this expression (for shallow estimation).
+    fn root_attrs(&self) -> Vec<RawId> {
+        match self {
+            PathExpr::Attr(a) => vec![*a],
+            PathExpr::Concat(lhs, _) => lhs.root_attrs(),
+            PathExpr::Union(lhs, rhs) => {
+                let mut attrs = lhs.root_attrs();
+                for a in rhs.root_attrs() {
+                    if !attrs.contains(&a) {
+                        attrs.push(a);
                     }
-                });
+                }
+                attrs
+            }
+            PathExpr::Star(inner) | PathExpr::Plus(inner) => inner.root_attrs(),
         }
-        labels
-    }
-
-    /// Collect non-epsilon transition labels from the initial states.
-    fn initial_labels(&self) -> Vec<RawId> {
-        let start_states = self.epsilon_closure(vec![self.start]);
-        self.reachable_labels(&start_states)
     }
 }
 
-/// Query the TribleSet's EAV index for outgoing edges from a node.
-/// For each trible where E=entity and V is a GenId (upper 16 bytes zero),
-/// calls the callback with (attribute, destination).
+// ── Recursive path evaluator ─────────────────────────────────────────────
+
+/// Evaluate a path expression from a bound start node, returning all
+/// reachable endpoints. Each step queries the TribleSet's EAV index.
 ///
-/// Uses two-level scan respecting PATCH segment boundaries:
-/// first entity→attributes, then (entity,attribute)→values.
-fn for_each_edge(
-    eav: &PATCH<TRIBLE_LEN, EAVOrder, ()>,
-    entity: &RawId,
-    mut f: impl FnMut(&RawId, &RawId),
-) {
-    // Collect distinct attributes for this entity.
-    let mut attrs: Vec<RawId> = Vec::new();
-    eav.infixes::<{ ID_LEN }, { ID_LEN }, _>(entity, |attr| {
-        if !attrs.contains(attr) {
-            attrs.push(*attr);
+/// This follows the approach of Karalis et al. (Algorithm 2, EvalRPQ_TV):
+/// transitive closures (Star/Plus) are evaluated via BFS with a node-only
+/// visited set; at each BFS depth the closure body is evaluated recursively
+/// as a sub-join. Non-closure operators (Concat, Union) decompose into
+/// sequential or parallel sub-evaluations.
+fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> HashSet<RawId> {
+    match expr {
+        PathExpr::Attr(attr) => {
+            // Single attribute hop: query {start, attr, ?dest}.
+            let mut results = HashSet::new();
+            let mut prefix = [0u8; ID_LEN * 2];
+            prefix[..ID_LEN].copy_from_slice(start);
+            prefix[ID_LEN..].copy_from_slice(attr);
+            set.eav
+                .infixes::<{ ID_LEN * 2 }, 32, _>(&prefix, |value: &[u8; 32]| {
+                    if value[..ID_LEN] == [0; ID_LEN] {
+                        let dest: RawId = value[ID_LEN..].try_into().unwrap();
+                        results.insert(dest);
+                    }
+                });
+            results
         }
-    });
-    // For each attribute, scan values.
-    for attr in &attrs {
-        let mut prefix = [0u8; ID_LEN * 2];
-        prefix[..ID_LEN].copy_from_slice(entity);
-        prefix[ID_LEN..].copy_from_slice(attr);
-        eav.infixes::<{ ID_LEN * 2 }, 32, _>(&prefix, |value: &[u8; 32]| {
-            if value[..ID_LEN] == [0; ID_LEN] {
-                let dest: &[u8; ID_LEN] = value[ID_LEN..].try_into().unwrap();
-                f(attr, dest);
+        PathExpr::Concat(lhs, rhs) => {
+            // Evaluate lhs from start → intermediates, then rhs from each intermediate.
+            let intermediates = eval_from(set, lhs, start);
+            let mut results = HashSet::new();
+            for mid in &intermediates {
+                results.extend(eval_from(set, rhs, mid));
             }
-        });
+            results
+        }
+        PathExpr::Union(lhs, rhs) => {
+            let mut results = eval_from(set, lhs, start);
+            results.extend(eval_from(set, rhs, start));
+            results
+        }
+        PathExpr::Plus(body) => {
+            // BFS: each depth evaluates the body expression from frontier nodes.
+            // Visited set is just graph nodes — no NFA state vectors.
+            let mut visited: HashSet<RawId> = HashSet::new();
+            let mut results: HashSet<RawId> = HashSet::new();
+            let mut frontier: VecDeque<RawId> = VecDeque::new();
+            frontier.push_back(*start);
+            visited.insert(*start);
+
+            while let Some(node) = frontier.pop_front() {
+                let reached = eval_from(set, body, &node);
+                for dest in reached {
+                    results.insert(dest);
+                    if visited.insert(dest) {
+                        frontier.push_back(dest);
+                    }
+                }
+            }
+            results
+        }
+        PathExpr::Star(body) => {
+            // Same as Plus but also includes the start node (path of length 0).
+            let mut results = eval_from(set, &PathExpr::Plus(body.clone()), start);
+            results.insert(*start);
+            results
+        }
+    }
+}
+
+/// Check if a path exists from `from` to `to` following the expression.
+/// Short-circuits on first match.
+fn has_path(set: &TribleSet, expr: &PathExpr, from: &RawId, to: &RawId) -> bool {
+    match expr {
+        PathExpr::Attr(attr) => {
+            let mut found = false;
+            let mut prefix = [0u8; ID_LEN * 2];
+            prefix[..ID_LEN].copy_from_slice(from);
+            prefix[ID_LEN..].copy_from_slice(attr);
+            set.eav
+                .infixes::<{ ID_LEN * 2 }, 32, _>(&prefix, |value: &[u8; 32]| {
+                    if !found && value[..ID_LEN] == [0; ID_LEN] {
+                        let dest: RawId = value[ID_LEN..].try_into().unwrap();
+                        if dest == *to {
+                            found = true;
+                        }
+                    }
+                });
+            found
+        }
+        PathExpr::Concat(lhs, rhs) => {
+            let intermediates = eval_from(set, lhs, from);
+            intermediates
+                .iter()
+                .any(|mid| has_path(set, rhs, mid, to))
+        }
+        PathExpr::Union(lhs, rhs) => {
+            has_path(set, lhs, from, to) || has_path(set, rhs, from, to)
+        }
+        PathExpr::Plus(body) => {
+            // BFS looking specifically for `to`.
+            let mut visited: HashSet<RawId> = HashSet::new();
+            let mut frontier: VecDeque<RawId> = VecDeque::new();
+            frontier.push_back(*from);
+            visited.insert(*from);
+
+            while let Some(node) = frontier.pop_front() {
+                let reached = eval_from(set, body, &node);
+                for dest in reached {
+                    if dest == *to {
+                        return true;
+                    }
+                    if visited.insert(dest) {
+                        frontier.push_back(dest);
+                    }
+                }
+            }
+            false
+        }
+        PathExpr::Star(body) => {
+            if from == to {
+                return true;
+            }
+            has_path(set, &PathExpr::Plus(body.clone()), from, to)
+        }
     }
 }
 
 /// Count outgoing edges from a node that match any of the given attribute labels.
+/// Used for shallow estimation.
 fn count_matching_edges(
     eav: &PATCH<TRIBLE_LEN, EAVOrder, ()>,
     entity: &RawId,
@@ -248,14 +237,16 @@ fn count_matching_edges(
     count
 }
 
+// ── Public API ───────────────────────────────────────────────────────────
+
 pub struct ThompsonEngine {
-    automaton: Automaton,
+    expr: PathExpr,
     set: TribleSet,
 }
 
 impl ThompsonEngine {
     pub fn new(set: TribleSet, ops: &[PathOp]) -> (Self, Vec<RawValue>) {
-        let automaton = Automaton::new(ops);
+        let expr = PathExpr::from_postfix(ops);
         // Collect all GenId nodes for the unbound case.
         let mut node_set: HashSet<RawValue> = HashSet::new();
         for t in set.iter() {
@@ -268,74 +259,22 @@ impl ThompsonEngine {
             }
         }
         let nodes: Vec<RawValue> = node_set.into_iter().collect();
-        (ThompsonEngine { automaton, set }, nodes)
+        (ThompsonEngine { expr, set }, nodes)
     }
 
-    /// BFS from a start node following the NFA, querying the TribleSet's EAV
-    /// index at each depth. Returns all reachable endpoints.
     fn reachable_from(&self, from: &RawId) -> Vec<RawValue> {
-        let start_states = self.automaton.epsilon_closure(vec![self.automaton.start]);
-        let mut queue: VecDeque<(RawId, Vec<u64>)> = VecDeque::new();
-        queue.push_back((*from, start_states.clone()));
-        let mut visited: HashSet<(RawId, Vec<u64>)> = HashSet::new();
-        visited.insert((*from, start_states));
-        let mut result_set: HashSet<RawId> = HashSet::new();
-
-        while let Some((node, states)) = queue.pop_front() {
-            if states.contains(&self.automaton.accept) {
-                result_set.insert(node);
-            }
-            // Query the TribleSet directly for outgoing edges from this node.
-            for_each_edge(&self.set.eav, &node, |attr, dest| {
-                let mut next_states = Vec::new();
-                for s in &states {
-                    next_states.extend(self.automaton.transitions_from(s, attr));
-                }
-                if next_states.is_empty() {
-                    return;
-                }
-                let closure = self.automaton.epsilon_closure(next_states);
-                if visited.insert((*dest, closure.clone())) {
-                    queue.push_back((*dest, closure));
-                }
-            });
-        }
-
-        result_set.iter().map(id_into_value).collect()
+        eval_from(&self.set, &self.expr, from)
+            .iter()
+            .map(id_into_value)
+            .collect()
     }
 
     fn has_path(&self, from: &RawId, to: &RawId) -> bool {
-        let start_states = self.automaton.epsilon_closure(vec![self.automaton.start]);
-        let mut queue: VecDeque<(RawId, Vec<u64>)> = VecDeque::new();
-        queue.push_back((*from, start_states.clone()));
-        let mut visited: HashSet<(RawId, Vec<u64>)> = HashSet::new();
-        visited.insert((*from, start_states));
-
-        while let Some((node, states)) = queue.pop_front() {
-            if states.contains(&self.automaton.accept) && node == *to {
-                return true;
-            }
-            for_each_edge(&self.set.eav, &node, |attr, dest| {
-                let mut next_states = Vec::new();
-                for s in &states {
-                    next_states.extend(self.automaton.transitions_from(s, attr));
-                }
-                if next_states.is_empty() {
-                    return;
-                }
-                let closure = self.automaton.epsilon_closure(next_states);
-                if visited.insert((*dest, closure.clone())) {
-                    queue.push_back((*dest, closure));
-                }
-            });
-        }
-        false
+        has_path(&self.set, &self.expr, from, to)
     }
 
-    /// Shallow estimate: count outgoing GenId edges from a node that match
-    /// the initial NFA transition labels. Cheap proxy for reachable set size.
     fn estimate_from(&self, from: &RawId) -> usize {
-        let labels = self.automaton.initial_labels();
+        let labels = self.expr.root_attrs();
         count_matching_edges(&self.set.eav, from, &labels)
     }
 }
