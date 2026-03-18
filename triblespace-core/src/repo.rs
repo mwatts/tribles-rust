@@ -113,6 +113,7 @@ pub mod branch;
 pub mod commit;
 pub mod hybridstore;
 pub mod memoryrepo;
+#[cfg(feature = "object-store")]
 pub mod objectstore;
 pub mod pile;
 

@@ -1,3 +1,5 @@
+#![cfg(feature = "object-store")]
+
 use url::Url;
 
 #[test]

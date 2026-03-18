@@ -57,8 +57,9 @@ oxigraph = "0.4.11"
 oxrdf = "0.2.4"
 
 [features]
-default = ["triblespace-core/proptest", "wasm"]
+default = ["triblespace-core/proptest", "wasm", "object-store"]
 proptest = ["triblespace-core/proptest"]
+object-store = ["triblespace-core/object-store"]
 kani = ["triblespace-core/kani"]
 wasm = ["triblespace-core/wasm"]
 telemetry = [

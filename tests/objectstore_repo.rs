@@ -1,3 +1,5 @@
+#![cfg(feature = "object-store")]
+
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use triblespace::core::repo::objectstore::ObjectStoreRemote;
