@@ -4,7 +4,7 @@ use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{Ident, Token};
 
-/// A single variable declaration inside `find!((var: Type?, ...), constraint)`.
+/// A single variable declaration inside `find!`.
 struct FindVariable {
     name: Ident,
     ty: Option<syn::Type>,
@@ -12,67 +12,128 @@ struct FindVariable {
     fallible: bool,
 }
 
-/// Parsed input for `__find_impl!(crate_path, ctx, (vars...), constraint)`.
+/// Whether the result should be wrapped in a tuple or returned bare.
+enum FindMode {
+    /// `find!((), ...)` — zero variables, yield `()`.
+    Unit,
+    /// `find!((vars...), ...)` — one or more variables in parens, yield tuple.
+    Tuple(Vec<FindVariable>),
+    /// `find!(name: Type, ...)` — single variable without parens, yield bare value.
+    Bare(FindVariable),
+}
+
+/// Parsed input for `__find_impl!(crate_path, ctx, ...)`.
 struct FindImplInput {
     crate_path: syn::Path,
-    _comma1: Token![,],
     ctx: Ident,
-    _comma2: Token![,],
-    variables: Vec<FindVariable>,
-    _comma3: Token![,],
+    mode: FindMode,
     constraint: TokenStream2,
+}
+
+fn parse_variable(input: ParseStream<'_>) -> syn::Result<FindVariable> {
+    let name: Ident = input.parse()?;
+
+    let ty = if input.peek(Token![:]) {
+        input.parse::<Token![:]>()?;
+        Some(input.parse::<syn::Type>()?)
+    } else {
+        None
+    };
+
+    let fallible = if input.peek(Token![?]) {
+        input.parse::<Token![?]>()?;
+        true
+    } else {
+        false
+    };
+
+    Ok(FindVariable { name, ty, fallible })
 }
 
 impl Parse for FindImplInput {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         let crate_path: syn::Path = input.parse()?;
-        let _comma1: Token![,] = input.parse()?;
+        input.parse::<Token![,]>()?;
         let ctx: Ident = input.parse()?;
-        let _comma2: Token![,] = input.parse()?;
+        input.parse::<Token![,]>()?;
 
-        // Parse the parenthesised variable list.
-        let vars_content;
-        syn::parenthesized!(vars_content in input);
-        let mut variables = Vec::new();
-        while !vars_content.is_empty() {
-            let name: Ident = vars_content.parse()?;
-
-            // Optional `: Type`
-            let ty = if vars_content.peek(Token![:]) {
-                vars_content.parse::<Token![:]>()?;
-                Some(vars_content.parse::<syn::Type>()?)
+        // Detect the form by peeking at the next token.
+        let mode = if input.peek(syn::token::Paren) {
+            // Parenthesised: either `()` or `(vars...)`.
+            let vars_content;
+            syn::parenthesized!(vars_content in input);
+            if vars_content.is_empty() {
+                FindMode::Unit
             } else {
-                None
-            };
-
-            // Optional trailing `?`
-            let fallible = if vars_content.peek(Token![?]) {
-                vars_content.parse::<Token![?]>()?;
-                true
-            } else {
-                false
-            };
-
-            variables.push(FindVariable { name, ty, fallible });
-
-            // Consume a trailing comma if present.
-            if vars_content.peek(Token![,]) {
-                vars_content.parse::<Token![,]>()?;
+                let mut variables = Vec::new();
+                while !vars_content.is_empty() {
+                    variables.push(parse_variable(&vars_content)?);
+                    if vars_content.peek(Token![,]) {
+                        vars_content.parse::<Token![,]>()?;
+                    }
+                }
+                FindMode::Tuple(variables)
             }
-        }
+        } else {
+            // Bare: `name: Type` or `name: Type?`.
+            FindMode::Bare(parse_variable(input)?)
+        };
 
-        let _comma3: Token![,] = input.parse()?;
+        input.parse::<Token![,]>()?;
         let constraint: TokenStream2 = input.parse()?;
 
         Ok(FindImplInput {
             crate_path,
-            _comma1,
             ctx,
-            _comma2,
-            variables,
-            _comma3,
+            mode,
             constraint,
         })
+    }
+}
+
+fn gen_var_decl(ctx: &Ident, v: &FindVariable) -> TokenStream2 {
+    let name = &v.name;
+    quote! { let #name = #ctx.next_variable(); }
+}
+
+fn gen_var_conversion(
+    crate_path: &syn::Path,
+    binding: &Ident,
+    v: &FindVariable,
+) -> TokenStream2 {
+    let name = &v.name;
+    if v.fallible {
+        if let Some(ref ty) = v.ty {
+            quote! {
+                let #name: ::core::result::Result<#ty, _> =
+                    #crate_path::value::TryFromValue::try_from_value(#name.extract(#binding));
+            }
+        } else {
+            quote! {
+                let #name =
+                    #crate_path::value::TryFromValue::try_from_value(#name.extract(#binding));
+            }
+        }
+    } else {
+        if let Some(ref ty) = v.ty {
+            quote! {
+                let #name: #ty = match #crate_path::value::TryFromValue::try_from_value(
+                    #name.extract(#binding)
+                ) {
+                    ::core::result::Result::Ok(__v) => __v,
+                    ::core::result::Result::Err(_) => return ::core::option::Option::None,
+                };
+            }
+        } else {
+            quote! {
+                let #name = match #crate_path::value::TryFromValue::try_from_value(
+                    #name.extract(#binding)
+                ) {
+                    ::core::result::Result::Ok(__v) => __v,
+                    ::core::result::Result::Err(_) => return ::core::option::Option::None,
+                };
+            }
+        }
     }
 }
 
@@ -80,89 +141,63 @@ pub fn find_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
     let FindImplInput {
         crate_path,
         ctx,
-        variables,
+        mode,
         constraint,
-        ..
     } = syn::parse2(input)?;
 
     let binding = format_ident!("__binding", span = Span::mixed_site());
 
-    // Generate `let var = ctx.next_variable();` for each variable.
-    let var_decls: Vec<TokenStream2> = variables
-        .iter()
-        .map(|v| {
-            let name = &v.name;
-            quote! { let #name = #ctx.next_variable(); }
-        })
-        .collect();
-
-    // Generate conversion code inside the closure for each variable.
-    let var_conversions: Vec<TokenStream2> = variables
-        .iter()
-        .map(|v| {
-            let name = &v.name;
-            if v.fallible {
-                // `?` variable: yield Result<T, E>, no filtering.
-                if let Some(ref ty) = v.ty {
-                    quote! {
-                        let #name: ::core::result::Result<#ty, _> =
-                            #crate_path::value::TryFromValue::try_from_value(#name.extract(#binding));
-                    }
-                } else {
-                    quote! {
-                        let #name =
-                            #crate_path::value::TryFromValue::try_from_value(#name.extract(#binding));
-                    }
-                }
-            } else {
-                // Default: filter on conversion failure.
-                if let Some(ref ty) = v.ty {
-                    quote! {
-                        let #name: #ty = match #crate_path::value::TryFromValue::try_from_value(
-                            #name.extract(#binding)
-                        ) {
-                            ::core::result::Result::Ok(__v) => __v,
-                            ::core::result::Result::Err(_) => return ::core::option::Option::None,
-                        };
-                    }
-                } else {
-                    quote! {
-                        let #name = match #crate_path::value::TryFromValue::try_from_value(
-                            #name.extract(#binding)
-                        ) {
-                            ::core::result::Result::Ok(__v) => __v,
-                            ::core::result::Result::Err(_) => return ::core::option::Option::None,
-                        };
-                    }
-                }
-            }
-        })
-        .collect();
-
-    // Build the result tuple.
-    let var_names: Vec<&Ident> = variables.iter().map(|v| &v.name).collect();
-    let tuple_expr = match var_names.len() {
-        0 => quote! { () },
-        1 => {
-            let v = var_names[0];
-            quote! { (#v,) }
-        }
-        _ => {
-            quote! { (#(#var_names),*) }
-        }
-    };
-
-    let output = quote! {
-        {
-            #(#var_decls)*
+    match mode {
+        FindMode::Unit => Ok(quote! {
             #crate_path::query::Query::new(#constraint,
-                move |#binding| {
-                    #(#var_conversions)*
-                    ::core::option::Option::Some(#tuple_expr)
+                move |_binding| {
+                    ::core::option::Option::Some(())
+                })
+        }),
+        FindMode::Bare(var) => {
+            let decl = gen_var_decl(&ctx, &var);
+            let conversion = gen_var_conversion(&crate_path, &binding, &var);
+            let name = &var.name;
+            Ok(quote! {
+                {
+                    #decl
+                    #crate_path::query::Query::new(#constraint,
+                        move |#binding| {
+                            #conversion
+                            ::core::option::Option::Some(#name)
+                        }
+                    )
                 }
-            )
+            })
         }
-    };
-
-    Ok(output)
+        FindMode::Tuple(variables) => {
+            let var_decls: Vec<TokenStream2> =
+                variables.iter().map(|v| gen_var_decl(&ctx, v)).collect();
+            let var_conversions: Vec<TokenStream2> = variables
+                .iter()
+                .map(|v| gen_var_conversion(&crate_path, &binding, v))
+                .collect();
+            let var_names: Vec<&Ident> = variables.iter().map(|v| &v.name).collect();
+            let tuple_expr = match var_names.len() {
+                1 => {
+                    let v = var_names[0];
+                    quote! { (#v,) }
+                }
+                _ => {
+                    quote! { (#(#var_names),*) }
+                }
+            };
+            Ok(quote! {
+                {
+                    #(#var_decls)*
+                    #crate_path::query::Query::new(#constraint,
+                        move |#binding| {
+                            #(#var_conversions)*
+                            ::core::option::Option::Some(#tuple_expr)
+                        }
+                    )
+                }
+            })
+        }
+    }
 }

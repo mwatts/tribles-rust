@@ -605,8 +605,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> fmt::Debug for Quer
 /// ```
 #[macro_export]
 macro_rules! find {
-    // Zero variables: return unit `()` from the closure.
-    ((), $Constraint:expr) => {
+    ($($tokens:tt)*) => {
         {
             let mut ctx = $crate::query::VariableContext::new();
 
@@ -614,23 +613,7 @@ macro_rules! find {
                 () => { &mut ctx }
             }
 
-            $crate::query::Query::new($Constraint,
-                move |_binding| {
-                    ::core::option::Option::Some(())
-                })
-        }
-    };
-
-    // One or more variables: delegate to the __find_impl proc macro.
-    (($($vars:tt)*), $Constraint:expr) => {
-        {
-            let mut ctx = $crate::query::VariableContext::new();
-
-            macro_rules! __local_find_context {
-                () => { &mut ctx }
-            }
-
-            $crate::macros::__find_impl!($crate, ctx, ($($vars)*), $Constraint)
+            $crate::macros::__find_impl!($crate, ctx, $($tokens)*)
         }
     };
 }
