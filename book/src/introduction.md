@@ -3,13 +3,13 @@
 Welcome to the **Tribles Book**. This first chapter is your map to Trible
 Space—the problems it tackles, the core ideas behind the `triblespace` crate, and
 the kinds of projects it was built to support. By the end of these opening
-pages you should be able to recognize when Trible Space is the right tool,
+pages you should be able to recognize when TribleSpace is the right tool,
 whether you are prototyping something new, extending an existing system, or
 adapting it for your own research purposes.
 
-## Why Trible Space exists
+## Why TribleSpace exists
 
-Trible Space exists because teams need to steward complex, diverse, and
+TribleSpace exists because teams need to steward complex, diverse, and
 interconnected datasets without losing context. Research groups, startups, and
 digital libraries must pair large binary payloads with fine-grained facts,
 synchronize findings across laptops, servers, and mobile devices, and prove that
@@ -18,7 +18,7 @@ object store, and version-control workflow rarely delivers that outcome: blobs
 drift away from their provenance, merges become brittle, and auditing which
 observations justified a decision or model is tedious.
 
-Trible Space closes those gaps with a single substrate that stores heavyweight
+TribleSpace closes those gaps with a single substrate that stores heavyweight
 assets and the relationships that explain them. Think of it as a library catalog
 for blobs and a lab notebook for the annotations, measurements, and discussions
 that give those blobs meaning. Because facts and payloads travel together,
@@ -29,7 +29,7 @@ That same structure also lets you support offline edits, reconcile concurrent
 changes safely, and ship datasets to partners with the evidence needed to trust
 them.
 
-To deliver those outcomes, Trible Space blends ideas from databases, version
+To deliver those outcomes, TribleSpace blends ideas from databases, version
 control, and content-addressed storage. Information is encoded as fixed-width
 *tribles*: 64-byte entity–attribute–value facts. Each trible stores two 16-byte
 extrinsic identifiers plus a 32-byte typed value. When a value exceeds the
@@ -87,7 +87,7 @@ environment and contribute back to the project. Whenever the book introduces a
 new concept, look for references to the crate documentation so you can inspect
 the corresponding APIs and examples.
 
-By the end of this chapter you should have a mental model for why Trible Space
+By the end of this chapter you should have a mental model for why TribleSpace
 is structured the way it is. From there, head to the chapters that match your
 goals—whether that means learning to query data effectively or integrating
 Tribles into a larger system.

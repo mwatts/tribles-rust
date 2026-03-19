@@ -2,7 +2,7 @@
 
 This chapter collects the core terms that appear throughout the book. Skim it
 when you encounter unfamiliar terminology or need a refresher on how concepts
-relate to one another in Trible Space.
+relate to one another in TribleSpace.
 
 ### Attribute
 A property that describes some aspect of an entity. Attributes occupy the
@@ -77,7 +77,7 @@ traversal across commits while enforcing signatures and branch ownership.
 
 ### Schema
 The set of attribute declarations and codecs that document and enforce the shape
-of data in Trible Space. Schemas assign language-agnostic meaning to the raw
+of data in TribleSpace. Schemas assign language-agnostic meaning to the raw
 bytes—they are not the concrete Rust types—so any implementation that
 understands the schema can interpret the payloads consistently. Value schemas
 map the fixed 32-byte payload of a trible to native types, while blob schemas
@@ -89,7 +89,7 @@ A three-part tuple of entity, attribute, and value stored in a fixed 64-byte
 layout. Tribles capture atomic facts, and query engines compose them into joins
 and higher-order results.
 
-### Trible Space
+### TribleSpace
 The overall storage model that organises tribles across blobs, PATCHes, and
 repositories. It emphasises immutable, content-addressed data, monotonic set
 semantics, and familiar repository workflows.
@@ -103,4 +103,4 @@ entities or handles referencing larger blobs.
 A mutable working area for preparing commits. Workspaces track staged trible
 sets and maintain a private blob store so large payloads can be uploaded before
 publishing. Once a commit is finalised it becomes immutable like the rest of
-Trible Space.
+TribleSpace.

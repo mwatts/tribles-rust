@@ -94,7 +94,7 @@ intrinsic identities because their planks differ.
 
 ## Picking entity ids in code
 
-Trible Space lets you mix intrinsic and extrinsic identifiers depending on what
+TribleSpace lets you mix intrinsic and extrinsic identifiers depending on what
 you are modeling. The `entity!` macro mirrors that split:
 
 ```rust

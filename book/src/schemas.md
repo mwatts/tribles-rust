@@ -1,6 +1,6 @@
 # Schemas
 
-Trible Space stores data in strongly typed values and blobs. A *schema*
+TribleSpace stores data in strongly typed values and blobs. A *schema*
 describes the language‑agnostic byte layout for these types: [`Value`]s always
 occupy exactly 32&nbsp;bytes while [`Blob`]s may be any length. Schemas translate
 those raw bytes to concrete application types and decouple persisted data from a
@@ -184,7 +184,7 @@ replacement schema.
 ## Value formatters (WASM)
 
 Binary formats are great for portability and performance, but they can be
-painful to inspect if you don’t know the schema ahead of time. Trible Space
+painful to inspect if you don’t know the schema ahead of time. TribleSpace
 supports an optional schema-level formatter mechanism: a value schema can point
 to a small sandboxed WebAssembly module that turns its raw 32 bytes into a
 human-readable string.

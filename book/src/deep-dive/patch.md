@@ -1,7 +1,7 @@
 # PATCH
 
 The **Persistent Adaptive Trie with Cuckoo-compression and Hash-maintenance**
-(PATCH) is Trible Space’s workhorse for set operations. It combines three core
+(PATCH) is TribleSpace’s workhorse for set operations. It combines three core
 ideas:
 
 1. **Persistence.** Updates clone only the modified path, so existing readers
