@@ -2,51 +2,26 @@
 ![docs.rs](https://img.shields.io/docsrs/triblespace)
 ![Discord Shield](https://discordapp.com/api/guilds/795317845181464651/widget.png?style=shield)
 
-🚧🚧🚧 Please note that this is work in progress, so while a lot of things have settled by now, we still favour breaking backwards compatiblity for seeminly minor improvements. 🚧🚧🚧
-
-
-<img src="https://github.com/triblespace/triblespace-rs/blob/main/sticker.png?raw=true" width="300"
- alt="The mascot of the trible.space a cute fluffy trible with three eyes."/>
-
+<img src=”https://github.com/triblespace/triblespace-rs/blob/main/sticker.png?raw=true” width=”300”
+ alt=”The mascot of the trible.space a cute fluffy trible with three eyes.”/>
 
 # About
 
 > “We need to abolish names and places, and replace them with hashes.”
 > — Joe Armstrong, [The Mess We’re In](https://www.youtube.com/watch?v=lKXe3HUG2l4)
 
-**Trible Space** is a data space and knowledge graph standard. It offers metadata management capabilities similar to file- and version-control systems, combined with the queryability and convenience of an embedded database, tailored towards use with simple blob storage. It is designed to be a holistic yet lightweight data storage solution that can be used in a variety of contexts, from embedded systems to distributed cloud services.
+**TribleSpace** is an embedded knowledge graph with built-in version control. It combines the queryability of a database with the distributed semantics of a content-addressed storage system — all in a single append-only file or S3-compatible endpoint.
 
-Our goal is to re-invent data storage from first principles and overcome the shortcomings of prior "Semantic Web"/triple-store technologies. By focusing on simplicity, canonical data formats, cryptographic identifiers, and clean distributed semantics, we aim to provide a lean, lightweight yet powerful toolkit for knowledge representation, database management, and data exchange use cases.
+Designed from first principles to overcome the shortcomings of prior triple-store technologies, TribleSpace focuses on simplicity, cryptographic identifiers, and clean CRDT semantics to provide a lightweight yet powerful toolkit for knowledge representation, data management, and data exchange.
 
 ## Features
 
-- **Lean, Lightweight & Flexible**: Data storage seamlessly scales from in-memory data organization to large-scale blob and metadata storage on S3 like services.
-- **Distributed**: Eventually consistent CRDT semantics (based on the CALM principle), compressed zero-copy archives, and built-in version control.
-- **Predictable Performance**: An optimizer-free design using novel algorithms and data structures removes the need for manual query-tuning and enables single-digit microsecond latency.  
-- **Fast In-Memory Datasets**: Enjoy cheap copy-on-write (COW) semantics and speedy set operations, allowing you to treat entire datasets as values.
-- **Compile-Time Typed Queries**: Automatic type inference, type-checking, and auto-completion make writing queries a breeze. You can even create queries that span multiple datasets and native Rust data structures.
-- **Low Overall Complexity**: We aim for a design that feels obvious (in the best way) and makes good use of existing language facilities. A serverless design makes it completely self-sufficient for local use and requires only an S3-compatible service for distribution.
-- **Easy Implementation**: The spec is designed to be friendly to high- and low-level languages, or even hardware implementations.
-- **Lock-Free Blob Writes**: Blob data is appended with a single `O_APPEND` write. Each handle advances an in-memory `applied_length` only if no other writer has appended in between, scanning any gap to ingest missing records. Concurrent writers may duplicate blobs, but hashes guarantee consistency. Updating branch heads uses a short `flush → refresh → lock → refresh → append → unlock` sequence.
-- **Coordinated Refresh**: `refresh` acquires a shared file lock while scanning to avoid races with `restore` truncating the pile.
-
-## Optional telemetry feature
-
-Enable the `telemetry` feature to install a `tracing` layer that writes spans
-into a dedicated TribleSpace pile:
-
-```rust,ignore
-use triblespace::telemetry::Telemetry;
-
-let _guard = Telemetry::install_global_from_env("my-service");
-```
-
-Set `TELEMETRY_PILE` to enable the sink. Optional tuning knobs:
-`TELEMETRY_FLUSH_MS` (default `250`).
-
-# Community
-
-If you have any questions or want to chat about graph databases hop into our [discord](https://discord.gg/v7AezPywZS).
+- **Scales from memory to cloud**: In-memory datasets, local pile files, and S3-compatible blob storage all use the same API.
+- **Distributed by default**: Eventually consistent CRDT semantics (based on the CALM principle), compressed zero-copy archives, and built-in version control with branch/merge workflows.
+- **Predictable performance**: An optimizer-free query engine using novel algorithms and data structures removes the need for manual query-tuning and delivers single-digit microsecond latency.
+- **Datasets as values**: Cheap copy-on-write (COW) semantics and fast set operations let you treat entire datasets as ordinary values — diff, merge, and compose them freely.
+- **Compile-time typed queries**: Automatic type inference, type-checking, and auto-completion make writing queries a breeze. Queries can span multiple datasets and native Rust data structures.
+- **Serverless**: No background process needed. A single pile file is completely self-sufficient for local use; add an S3-compatible service when you need distribution.
 
 ## Getting Started
 
@@ -194,14 +169,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let conflict_catalog = conflict_ws.checkout(..)?;
 
-        for (first,) in find!(
-            (first: Value<_>),
+        for first in find!(
+            first: String,
             pattern!(&conflict_catalog, [{
                 literature::author: &author_id,
                 literature::firstname: ?first
             }])
         ) {
-            println!("Collaborator kept the name '{}'.", first.try_from_value::<&str>().unwrap());
+            println!("Collaborator kept the name '{first}'.");
         }
 
         ws.merge(&mut conflict_ws)
@@ -226,21 +201,9 @@ chapter of the book breaks this example down line by line, covers project
 scaffolding, and introduces more background on how repositories, workspaces,
 and queries interact.
 
-## Tribles Book
+## Learn More
 
-For a step-by-step narrative guide, see the [Tribles Book](book/README.md).
-To build the HTML locally, first install `mdbook` with `cargo install mdbook`
-and then run:
-
-```bash
-./scripts/build_book.sh
-```
-
-For details on setting up a development environment, see [Developing Locally](book/src/contributing.md).
-
-# Learn More
-
-The best way to get started is to read the [Tribles Book](https://triblespace.github.io/triblespace-rs/). The following links mirror the book's chapter order so you can progress from the basics to more advanced topics:
+The [Tribles Book](https://triblespace.github.io/triblespace-rs/) is the best place to go deeper:
 
 1. [Introduction](https://triblespace.github.io/triblespace-rs/introduction.html)
 2. [Getting Started](https://triblespace.github.io/triblespace-rs/getting-started.html)
@@ -254,6 +217,15 @@ The best way to get started is to read the [Tribles Book](https://triblespace.gi
 10. [Identifiers](https://triblespace.github.io/triblespace-rs/deep-dive/identifiers.html)
 11. [Trible Structure](https://triblespace.github.io/triblespace-rs/deep-dive/trible-structure.html)
 12. [Pile Format](https://triblespace.github.io/triblespace-rs/pile-format.html)
+
+To build the book locally: `cargo install mdbook && ./scripts/build_book.sh`
+
+For development setup, see [Contributing](book/src/contributing.md).
+
+## Community
+
+Questions or ideas? Join the [Discord](https://discord.gg/v7AezPywZS).
+
 ## License
 
 Licensed under either of
