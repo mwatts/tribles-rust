@@ -2,6 +2,8 @@
 ![docs.rs](https://img.shields.io/docsrs/triblespace)
 ![Discord Shield](https://discordapp.com/api/guilds/795317845181464651/widget.png?style=shield)
 
+<br/>
+
 <img src=”https://github.com/triblespace/triblespace-rs/blob/main/sticker.png?raw=true” width=”300”
  alt=”The mascot of the trible.space a cute fluffy trible with three eyes.”/>
 
