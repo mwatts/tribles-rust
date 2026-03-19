@@ -16,6 +16,25 @@ These goals grew out of earlier "semantic" technologies that attempted to model 
 
 The system is organised into a small set of layers that compose cleanly:
 
+```text
+┌─────────────────────────────────────────────┐
+│  Application                                │
+│  find!, pattern!, entity!, path!            │
+├─────────────────────────────────────────────┤
+│  Workspace                                  │
+│  in-memory editing surface, blob read/write │
+├─────────────────────────────────────────────┤
+│  Repository                                 │
+│  branches, commits, push/pull, merge        │
+├─────────────────────────────────────────────┤
+│  Store (Pile / MemoryRepo / S3)             │
+│  append-only blob + branch storage          │
+├─────────────────────────────────────────────┤
+│  Data Model                                 │
+│  Trible (64 bytes) → TribleSet (6 indexes)  │
+└─────────────────────────────────────────────┘
+```
+
 1. **Data model** – the immutable trible structures that encode facts.
 2. **Stores** – generic blob and branch storage traits that abstract over persistence backends.
 3. **Repository** – the coordination layer that combines stores into a versioned history.

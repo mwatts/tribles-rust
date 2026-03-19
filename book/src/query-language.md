@@ -460,10 +460,26 @@ estimate, propose, and confirm candidate values can participate in `find!`.
 
 ## Regular path queries
 
-The `path!` macro lets you search for graph paths matching a regular
-expression over edge attributes.  It expands to a
-[`RegularPathConstraint`](crate::query::RegularPathConstraint) and can be
-combined with other constraints.  Invoke it through a namespace module
+Sometimes you need to traverse a graph without knowing how many hops are
+involved. "Find everyone reachable through a chain of `follows` edges" or
+"find all ancestors via repeated `parent` links" are naturally recursive — they
+cannot be expressed with a fixed number of pattern clauses.
+
+The `path!` macro handles these cases by matching a **regular expression over
+edge attributes**. Instead of writing recursive Rust or collecting intermediate
+results, you describe the shape of the path and the engine evaluates it:
+
+| Operator | Meaning | Example |
+|----------|---------|---------|
+| `a` | single edge | `social::follows` |
+| `a \| b` | either edge | `follows \| likes` |
+| `a b` | concatenation | `follows likes` (follow then like) |
+| `a+` | one or more | `follows+` (transitive closure) |
+| `a*` | zero or more | `follows*` (reflexive transitive closure) |
+
+`path!` expands to a
+[`RegularPathConstraint`](crate::query::RegularPathConstraint) and composes
+with other constraints.  Invoke it through a namespace module
 (`social::path!`) to implicitly resolve attribute names:
 
 ```rust
