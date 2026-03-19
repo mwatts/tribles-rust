@@ -21,6 +21,7 @@
 # Repositories & Workflows
 
 - [Architecture](architecture.md)
+- [Patterns & Recipes](patterns-and-recipes.md)
 - [Repository Workflows](repository-workflows.md)
 - [Commit Selectors](commit-selectors.md)
 - [Garbage Collection](garbage-collection.md)
