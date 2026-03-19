@@ -148,6 +148,62 @@ whose facts tag the schema entity with `metadata::KIND_VALUE_SCHEMA` or
 `metadata::description` (LongString handles). Persist the description blobs
 alongside the metadata tribles if you want the text to remain readable.
 
+## Choosing the right schema
+
+When defining an attribute, the schema determines how the 32-byte value slot is
+interpreted. Use this decision tree to pick the right one:
+
+```text
+What are you storing?
+│
+├─ A reference to another entity?
+│  └─ GenId
+│
+├─ A short label, name, or tag?
+│  ├─ Fits in 32 bytes (≤32 UTF-8 bytes)?
+│  │  └─ ShortString
+│  └─ Longer text?
+│     └─ Handle<Blake3, LongString>  (blob)
+│
+├─ A number?
+│  ├─ Integer
+│  │  ├─ Fits in 64 bits? → U256BE (zero-extended) or custom u64 schema
+│  │  └─ Needs full 256 bits? → U256BE / I256BE
+│  ├─ Floating point
+│  │  ├─ Standard double? → F64
+│  │  └─ Extended precision? → F256BE
+│  └─ Rational? → R256
+│
+├─ A timestamp or time range?
+│  └─ NsTAIInterval
+│
+├─ A cryptographic value?
+│  ├─ Content hash? → Hash<Blake3>
+│  ├─ Reference to a blob? → Handle<Blake3, BlobSchema>
+│  └─ Signature? → ED25519RComponent / ED25519SComponent / ED25519PublicKey
+│
+├─ A file or binary payload?
+│  └─ Handle<Blake3, FileBytes>  (blob)
+│
+├─ A large structured dataset?
+│  └─ Handle<Blake3, SimpleArchive>  (blob, stores a TribleSet)
+│
+└─ Something else?
+   ├─ Fits in 32 bytes? → define a custom ValueSchema
+   └─ Larger? → define a custom BlobSchema + use Handle
+```
+
+**Rules of thumb:**
+- If two values should be joinable (appear in the same query variable), they must
+  share a schema. Choose the most specific schema that covers both uses.
+- Prefer `ShortString` over `LongString` when the text fits — inline values avoid
+  a blob lookup.
+- Use `GenId` for relationships between entities. Never store entity references as
+  strings.
+- When in doubt between a value schema and a blob, ask: "will I ever want to
+  query or join on this directly?" If yes, it should be a value. If it's opaque
+  content you just retrieve, use a blob handle.
+
 ## Defining new schemas
 
 Custom formats implement [`ValueSchema`] or [`BlobSchema`].  A unique identifier
