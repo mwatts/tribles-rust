@@ -1,29 +1,40 @@
 # Summary
 
+# Foundations
+
 - [Introduction](introduction.md)
+- [Philosophy](deep-dive/philosophy.md)
 - [Getting Started](getting-started.md)
 - [Developing Locally](contributing.md)
-- [Architecture](architecture.md)
-- [Query Engine](query-engine.md)
-- [Atreides Join](atreides-join.md)
+- [Deep Dive: Identifiers](deep-dive/identifiers.md)
+- [Deep Dive: Trible Structure](deep-dive/trible-structure.md)
+
+# Queries & Data
+
 - [Query Language](query-language.md)
-- [Incremental Queries](incremental-queries.md)
 - [Schemas](schemas.md)
-- [Portability & Common Formats](portability-and-formats.md)
-- [Importing Other Data Formats](importing-data-formats.md)
-- [Descriptive Typing & find! Idiom](descriptive_types.md)
-- [Type Algebra of TribleSpace](type-algebra.md)
+- [Incremental Queries](incremental-queries.md)
+- [Deep Dive: Query Engine](query-engine.md)
+- [Deep Dive: Atreides Join](atreides-join.md)
+- [Deep Dive: Type Algebra](type-algebra.md)
+
+# Repositories & Workflows
+
+- [Architecture](architecture.md)
 - [Repository Workflows](repository-workflows.md)
 - [Commit Selectors](commit-selectors.md)
 - [Garbage Collection](garbage-collection.md)
+- [Deep Dive: Descriptive Typing & find! Idioms](descriptive_types.md)
+
+# Storage & Formats
+
+- [Importing Data Formats](importing-data-formats.md)
+- [Deep Dive: PATCH](deep-dive/patch.md)
+- [Deep Dive: Blobs](deep-dive/blobs.md)
+- [Deep Dive: Pile Format](pile-format.md)
+- [Deep Dive: Pile Blob Metadata](pile-blob-metadata.md)
+
+# Appendix
+
 - [Glossary](glossary.md)
-- [Documentation Improvement Ideas](documentation-improvements.md)
 - [Formal Verification Roadmap](formal-verification.md)
-- [Deep Dive](deep-dive/README.md)
-  - [Philosophy](deep-dive/philosophy.md)
-  - [Identifiers](deep-dive/identifiers.md)
-  - [Trible Structure](deep-dive/trible-structure.md)
-  - [Blobs](deep-dive/blobs.md)
-  - [PATCH](deep-dive/patch.md)
-  - [Pile Format](pile-format.md)
-  - [Pile Blob Metadata](pile-blob-metadata.md)
