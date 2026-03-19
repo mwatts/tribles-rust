@@ -159,7 +159,13 @@ What are you storing?
 ├─ A reference to another entity?
 │  └─ GenId
 │
-├─ A short label, name, or tag?
+├─ A tag, category, or enum-like classifier?
+│  └─ metadata::tag (GenId) — tags are entities with their own ID.
+│     Use metadata::name to give them a human-readable label.
+│     ⚠ Do NOT define a separate ShortString tag attribute —
+│     use the canonical metadata::tag and mint tag IDs.
+│
+├─ A short label or display name?
 │  ├─ Fits in 32 bytes (≤32 UTF-8 bytes)?
 │  │  └─ ShortString
 │  └─ Longer text?
