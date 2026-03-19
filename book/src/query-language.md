@@ -26,18 +26,30 @@ A minimal invocation looks like this:
 let results = find!((a), a.is(1.into())).collect::<Vec<_>>();
 ```
 
-`find!` returns an [`Iterator`](core::iter::Iterator) over tuples of the bound
+`find!` returns an [`Iterator`](core::iter::Iterator) over the bound
 variables. Matches can be consumed lazily or collected into common
-collections:
+collections.
+
+When the head declares a **single variable**, omit the parentheses to get bare
+values instead of 1-tuples:
 
 ```rust
-for (a,) in find!((a), a.is(1.into())) {
+for a in find!(a, a.is(1.into())) {
     println!("match: {a}");
 }
 ```
 
-The head tuple supports pattern destructuring, so adding more variables is as
-simple as expanding the list: `find!((a, b, c), ...)` yields `(a, b, c)` tuples.
+When the head declares **multiple variables**, wrap them in parentheses to get
+tuples:
+
+```rust
+for (a, b) in find!((a, b), and!(a.is(1.into()), b.is(2.into()))) {
+    println!("{a}, {b}");
+}
+```
+
+Adding more variables is as simple as expanding the list:
+`find!((a, b, c), ...)` yields `(a, b, c)` tuples.
 Variables declared in the head can be reused multiple times inside the
 constraint to express joins. When a variable appears in several clauses the
 engine ensures every occurrence binds to the same value. Repeating a variable in
@@ -50,7 +62,7 @@ destructure results.
 
 Variables optionally include a concrete type to convert the underlying value.
 The constraint phase still works with untyped [`Value`](crate::value::Value)
-instances; conversion happens when the tuple is emitted.  These conversions use
+instances; conversion happens when results are emitted.  These conversions use
 [`TryFromValue`](crate::value::TryFromValue).
 
 By default, if a conversion fails the entire row is silently skipped — like a
