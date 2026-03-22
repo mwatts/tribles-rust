@@ -8,7 +8,7 @@ use crate::repo::BlobStore;
 use crate::trible::Fragment;
 use crate::value::schemas::hash::Blake3;
 use crate::value::TryFromValue;
-use crate::value::ToValue;
+use crate::value::TryToValue;
 use crate::value::Value;
 use crate::value::ValueSchema;
 use std::convert::Infallible;
@@ -103,33 +103,44 @@ impl ValueSchema for NsTAIInterval {
     }
 }
 
-impl ToValue<NsTAIInterval> for (Epoch, Epoch) {
-    fn to_value(self) -> Value<NsTAIInterval> {
+impl TryToValue<NsTAIInterval> for (Epoch, Epoch) {
+    type Error = InvertedIntervalError;
+    fn try_to_value(self) -> Result<Value<NsTAIInterval>, InvertedIntervalError> {
         let lower = self.0.to_tai_duration().total_nanoseconds();
         let upper = self.1.to_tai_duration().total_nanoseconds();
-
+        if lower > upper {
+            return Err(InvertedIntervalError { lower, upper });
+        }
         let mut value = [0; 32];
         value[0..16].copy_from_slice(&lower.to_le_bytes());
         value[16..32].copy_from_slice(&upper.to_le_bytes());
-        Value::new(value)
+        Ok(Value::new(value))
     }
 }
 
 impl TryFromValue<'_, NsTAIInterval> for (Epoch, Epoch) {
-    type Error = Infallible;
-    fn try_from_value(v: &Value<NsTAIInterval>) -> Result<Self, Infallible> {
-        let (lower, upper): (i128, i128) = v.from_value();
-        let lower = Epoch::from_tai_duration(Duration::from_total_nanoseconds(lower));
-        let upper = Epoch::from_tai_duration(Duration::from_total_nanoseconds(upper));
-        Ok((lower, upper))
+    type Error = InvertedIntervalError;
+    fn try_from_value(v: &Value<NsTAIInterval>) -> Result<Self, InvertedIntervalError> {
+        let lower = i128::from_le_bytes(v.raw[0..16].try_into().unwrap());
+        let upper = i128::from_le_bytes(v.raw[16..32].try_into().unwrap());
+        if lower > upper {
+            return Err(InvertedIntervalError { lower, upper });
+        }
+        Ok((
+            Epoch::from_tai_duration(Duration::from_total_nanoseconds(lower)),
+            Epoch::from_tai_duration(Duration::from_total_nanoseconds(upper)),
+        ))
     }
 }
 
 impl TryFromValue<'_, NsTAIInterval> for (i128, i128) {
-    type Error = Infallible;
-    fn try_from_value(v: &Value<NsTAIInterval>) -> Result<Self, Infallible> {
+    type Error = InvertedIntervalError;
+    fn try_from_value(v: &Value<NsTAIInterval>) -> Result<Self, InvertedIntervalError> {
         let lower = i128::from_le_bytes(v.raw[0..16].try_into().unwrap());
         let upper = i128::from_le_bytes(v.raw[16..32].try_into().unwrap());
+        if lower > upper {
+            return Err(InvertedIntervalError { lower, upper });
+        }
         Ok((lower, upper))
     }
 }
@@ -176,19 +187,25 @@ impl TryFromValue<'_, NsTAIInterval> for Upper {
 }
 
 impl TryFromValue<'_, NsTAIInterval> for Midpoint {
-    type Error = Infallible;
-    fn try_from_value(v: &Value<NsTAIInterval>) -> Result<Self, Infallible> {
+    type Error = InvertedIntervalError;
+    fn try_from_value(v: &Value<NsTAIInterval>) -> Result<Self, InvertedIntervalError> {
         let lower = i128::from_le_bytes(v.raw[0..16].try_into().unwrap());
         let upper = i128::from_le_bytes(v.raw[16..32].try_into().unwrap());
+        if lower > upper {
+            return Err(InvertedIntervalError { lower, upper });
+        }
         Ok(Midpoint(lower + (upper - lower) / 2))
     }
 }
 
 impl TryFromValue<'_, NsTAIInterval> for Width {
-    type Error = Infallible;
-    fn try_from_value(v: &Value<NsTAIInterval>) -> Result<Self, Infallible> {
+    type Error = InvertedIntervalError;
+    fn try_from_value(v: &Value<NsTAIInterval>) -> Result<Self, InvertedIntervalError> {
         let lower = i128::from_le_bytes(v.raw[0..16].try_into().unwrap());
         let upper = i128::from_le_bytes(v.raw[16..32].try_into().unwrap());
+        if lower > upper {
+            return Err(InvertedIntervalError { lower, upper });
+        }
         Ok(Width(upper - lower))
     }
 }
@@ -201,8 +218,8 @@ mod tests {
     fn hifitime_conversion() {
         let epoch = Epoch::from_tai_duration(Duration::from_total_nanoseconds(0));
         let time_in: (Epoch, Epoch) = (epoch, epoch);
-        let interval: Value<NsTAIInterval> = time_in.to_value();
-        let time_out: (Epoch, Epoch) = interval.from_value();
+        let interval: Value<NsTAIInterval> = time_in.try_to_value().unwrap();
+        let time_out: (Epoch, Epoch) = interval.try_from_value().unwrap();
 
         assert_eq!(time_in, time_out);
     }
@@ -213,12 +230,12 @@ mod tests {
         let upper_ns: i128 = 3_000_000_000;
         let lower = Epoch::from_tai_duration(Duration::from_total_nanoseconds(lower_ns));
         let upper = Epoch::from_tai_duration(Duration::from_total_nanoseconds(upper_ns));
-        let interval: Value<NsTAIInterval> = (lower, upper).to_value();
+        let interval: Value<NsTAIInterval> = (lower, upper).try_to_value().unwrap();
 
         let l: Lower = interval.from_value();
         let u: Upper = interval.from_value();
-        let m: Midpoint = interval.from_value();
-        let w: Width = interval.from_value();
+        let m: Midpoint = interval.try_from_value().unwrap();
+        let w: Width = interval.try_from_value().unwrap();
 
         assert_eq!(l.0, lower_ns);
         assert_eq!(u.0, upper_ns);
@@ -228,17 +245,17 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_inverted() {
+    fn try_to_value_rejects_inverted() {
         let lower = Epoch::from_tai_duration(Duration::from_total_nanoseconds(2_000_000_000));
         let upper = Epoch::from_tai_duration(Duration::from_total_nanoseconds(1_000_000_000));
-        let interval: Value<NsTAIInterval> = (lower, upper).to_value();
-        assert!(NsTAIInterval::validate(interval).is_err());
+        let result: Result<Value<NsTAIInterval>, _> = (lower, upper).try_to_value();
+        assert!(result.is_err());
     }
 
     #[test]
     fn validate_accepts_equal() {
         let t = Epoch::from_tai_duration(Duration::from_total_nanoseconds(1_000_000_000));
-        let interval: Value<NsTAIInterval> = (t, t).to_value();
+        let interval: Value<NsTAIInterval> = (t, t).try_to_value().unwrap();
         assert!(NsTAIInterval::validate(interval).is_ok());
     }
 
@@ -248,9 +265,9 @@ mod tests {
         let upper_ns: i128 = 2_000_000_000;
         let lower = Epoch::from_tai_duration(Duration::from_total_nanoseconds(lower_ns));
         let upper = Epoch::from_tai_duration(Duration::from_total_nanoseconds(upper_ns));
-        let interval: Value<NsTAIInterval> = (lower, upper).to_value();
+        let interval: Value<NsTAIInterval> = (lower, upper).try_to_value().unwrap();
 
-        let (out_lower, out_upper): (i128, i128) = interval.from_value();
+        let (out_lower, out_upper): (i128, i128) = interval.try_from_value().unwrap();
         assert_eq!(out_lower, lower_ns);
         assert_eq!(out_upper, upper_ns);
     }

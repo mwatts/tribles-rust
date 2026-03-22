@@ -1,4 +1,5 @@
 use crate::macros::entity;
+use crate::value::TryToValue;
 use crate::macros::pattern;
 use ed25519::Signature;
 use ed25519_dalek::SignatureError;
@@ -49,7 +50,7 @@ pub fn commit_metadata(
     let commit_entity = crate::id::rngid();
     let now = Epoch::now().expect("system time");
 
-    commit += entity! { &commit_entity @  super::timestamp: (now, now)  };
+    commit += entity! { &commit_entity @  super::timestamp: (now, now).try_to_value().expect("point interval")  };
 
     if let Some(content) = content {
         let handle = content.get_handle();
