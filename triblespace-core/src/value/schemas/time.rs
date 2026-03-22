@@ -76,8 +76,31 @@ mod wasm_formatter {
     }
 }
 
+/// The lower bound exceeds the upper bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvertedIntervalError {
+    pub lower: i128,
+    pub upper: i128,
+}
+
+impl std::fmt::Display for InvertedIntervalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "inverted interval: lower {} > upper {}", self.lower, self.upper)
+    }
+}
+
 impl ValueSchema for NsTAIInterval {
-    type ValidationError = Infallible;
+    type ValidationError = InvertedIntervalError;
+
+    fn validate(value: Value<Self>) -> Result<Value<Self>, Self::ValidationError> {
+        let lower = i128::from_le_bytes(value.raw[0..16].try_into().unwrap());
+        let upper = i128::from_le_bytes(value.raw[16..32].try_into().unwrap());
+        if lower > upper {
+            Err(InvertedIntervalError { lower, upper })
+        } else {
+            Ok(value)
+        }
+    }
 }
 
 impl ToValue<NsTAIInterval> for (Epoch, Epoch) {
@@ -202,6 +225,21 @@ mod tests {
         assert_eq!(m.0, 2_000_000_000); // midpoint
         assert_eq!(w.0, 2_000_000_000); // width
         assert!(l < Lower(upper_ns)); // Ord works
+    }
+
+    #[test]
+    fn validate_rejects_inverted() {
+        let lower = Epoch::from_tai_duration(Duration::from_total_nanoseconds(2_000_000_000));
+        let upper = Epoch::from_tai_duration(Duration::from_total_nanoseconds(1_000_000_000));
+        let interval: Value<NsTAIInterval> = (lower, upper).to_value();
+        assert!(NsTAIInterval::validate(interval).is_err());
+    }
+
+    #[test]
+    fn validate_accepts_equal() {
+        let t = Epoch::from_tai_duration(Duration::from_total_nanoseconds(1_000_000_000));
+        let interval: Value<NsTAIInterval> = (t, t).to_value();
+        assert!(NsTAIInterval::validate(interval).is_ok());
     }
 
     #[test]
