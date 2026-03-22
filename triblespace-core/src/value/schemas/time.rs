@@ -111,6 +111,65 @@ impl TryFromValue<'_, NsTAIInterval> for (i128, i128) {
     }
 }
 
+/// The lower bound of a TAI interval in nanoseconds.
+/// Use this when you want to sort or compare by interval start time.
+///
+/// ```rust,ignore
+/// find!(t: Lower, pattern!(&space, [{ entity @ attr: ?t }]))
+///     .max_by_key(|t| *t)  // latest start time
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Lower(pub i128);
+
+/// The upper bound of a TAI interval in nanoseconds.
+/// Use this when you want to sort or compare by interval end time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Upper(pub i128);
+
+/// The midpoint of a TAI interval in nanoseconds.
+/// Use this when you want to sort or compare by interval center.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Midpoint(pub i128);
+
+/// The width of a TAI interval in nanoseconds.
+/// Use this when you want to sort or compare by interval duration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Width(pub i128);
+
+impl TryFromValue<'_, NsTAIInterval> for Lower {
+    type Error = Infallible;
+    fn try_from_value(v: &Value<NsTAIInterval>) -> Result<Self, Infallible> {
+        let lower = i128::from_le_bytes(v.raw[0..16].try_into().unwrap());
+        Ok(Lower(lower))
+    }
+}
+
+impl TryFromValue<'_, NsTAIInterval> for Upper {
+    type Error = Infallible;
+    fn try_from_value(v: &Value<NsTAIInterval>) -> Result<Self, Infallible> {
+        let upper = i128::from_le_bytes(v.raw[16..32].try_into().unwrap());
+        Ok(Upper(upper))
+    }
+}
+
+impl TryFromValue<'_, NsTAIInterval> for Midpoint {
+    type Error = Infallible;
+    fn try_from_value(v: &Value<NsTAIInterval>) -> Result<Self, Infallible> {
+        let lower = i128::from_le_bytes(v.raw[0..16].try_into().unwrap());
+        let upper = i128::from_le_bytes(v.raw[16..32].try_into().unwrap());
+        Ok(Midpoint(lower + (upper - lower) / 2))
+    }
+}
+
+impl TryFromValue<'_, NsTAIInterval> for Width {
+    type Error = Infallible;
+    fn try_from_value(v: &Value<NsTAIInterval>) -> Result<Self, Infallible> {
+        let lower = i128::from_le_bytes(v.raw[0..16].try_into().unwrap());
+        let upper = i128::from_le_bytes(v.raw[16..32].try_into().unwrap());
+        Ok(Width(upper - lower))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,6 +182,26 @@ mod tests {
         let time_out: (Epoch, Epoch) = interval.from_value();
 
         assert_eq!(time_in, time_out);
+    }
+
+    #[test]
+    fn projection_types() {
+        let lower_ns: i128 = 1_000_000_000;
+        let upper_ns: i128 = 3_000_000_000;
+        let lower = Epoch::from_tai_duration(Duration::from_total_nanoseconds(lower_ns));
+        let upper = Epoch::from_tai_duration(Duration::from_total_nanoseconds(upper_ns));
+        let interval: Value<NsTAIInterval> = (lower, upper).to_value();
+
+        let l: Lower = interval.from_value();
+        let u: Upper = interval.from_value();
+        let m: Midpoint = interval.from_value();
+        let w: Width = interval.from_value();
+
+        assert_eq!(l.0, lower_ns);
+        assert_eq!(u.0, upper_ns);
+        assert_eq!(m.0, 2_000_000_000); // midpoint
+        assert_eq!(w.0, 2_000_000_000); // width
+        assert!(l < Lower(upper_ns)); // Ord works
     }
 
     #[test]
