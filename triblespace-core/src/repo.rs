@@ -1111,10 +1111,84 @@ where
     }
 }
 
-type CommitHandle = Value<Handle<Blake3, SimpleArchive>>;
+/// A handle to a commit blob in the repository.
+pub type CommitHandle = Value<Handle<Blake3, SimpleArchive>>;
 type MetadataHandle = Value<Handle<Blake3, SimpleArchive>>;
 type CommitSet = PATCH<VALUE_LEN, IdentitySchema, ()>;
 type BranchMetaHandle = Value<Handle<Blake3, SimpleArchive>>;
+
+/// The result of a [`Workspace::checkout`] operation: a [`TribleSet`] paired
+/// with the commit head it was resolved from. This head can be used as the
+/// start of a range selector to obtain incremental deltas on the next checkout.
+///
+/// `Checkout` dereferences to `TribleSet`, so it can be used directly with
+/// `find!`, `pattern!`, and `pattern_changes!`.
+///
+/// # Example: incremental updates
+///
+/// ```rust,ignore
+/// let mut changed = repo.pull(branch_id)?.checkout(..)?;
+/// let mut full = changed.facts().clone();
+///
+/// loop {
+///     // full already includes changed
+///     for result in pattern_changes!(&full, &changed, [{ ... }]) {
+///         // process new results
+///     }
+///
+///     // Advance
+///     changed = repo.pull(branch_id)?.checkout(changed.head()..)?;
+///     full += &changed;
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct Checkout {
+    facts: TribleSet,
+    head: Option<CommitHandle>,
+}
+
+impl PartialEq<TribleSet> for Checkout {
+    fn eq(&self, other: &TribleSet) -> bool {
+        self.facts == *other
+    }
+}
+
+impl PartialEq<Checkout> for TribleSet {
+    fn eq(&self, other: &Checkout) -> bool {
+        *self == other.facts
+    }
+}
+
+impl Checkout {
+    /// The checked-out tribles.
+    pub fn facts(&self) -> &TribleSet {
+        &self.facts
+    }
+
+    /// The commit head at the time of checkout. Use as the start of a range
+    /// selector (`checkout.head()..`) to get only new commits on the next checkout.
+    pub fn head(&self) -> Option<CommitHandle> {
+        self.head
+    }
+
+    /// Consume the checkout and return the inner TribleSet.
+    pub fn into_facts(self) -> TribleSet {
+        self.facts
+    }
+}
+
+impl std::ops::Deref for Checkout {
+    type Target = TribleSet;
+    fn deref(&self) -> &TribleSet {
+        &self.facts
+    }
+}
+
+impl std::ops::AddAssign<&Checkout> for TribleSet {
+    fn add_assign(&mut self, rhs: &Checkout) {
+        *self += rhs.facts.clone();
+    }
+}
 
 /// The Workspace represents the mutable working area or "staging" state.
 /// It was formerly known as `Head`. It is sent to worker threads,
@@ -2031,7 +2105,7 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
         &mut self,
         spec: R,
     ) -> Result<
-        TribleSet,
+        Checkout,
         WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
     >
     where
@@ -2039,7 +2113,8 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
     {
         let patch = spec.select(self)?;
         let commits = patch.iter().map(|raw| Value::new(*raw));
-        self.checkout_commits(commits)
+        let facts = self.checkout_commits(commits)?;
+        Ok(Checkout { facts, head: self.head })
     }
 
     /// Returns the combined metadata [`TribleSet`] for the specified commits.
