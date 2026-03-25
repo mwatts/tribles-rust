@@ -22,40 +22,55 @@ fn main() {
     let storage = MemoryRepo::default();
     let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
     let branch_id = repo.create_branch("main", None).expect("branch");
-    let mut ws = repo.pull(*branch_id).expect("pull");
 
-    // Commit initial data
+    // ── commit initial data ──────────────────────────────────────────
     let shakespeare = ufoid();
     let hamlet = ufoid();
-    let mut base = TribleSet::new();
-    base += entity! { &shakespeare @ literature::firstname: "William", literature::lastname: "Shakespeare" };
-    base += entity! { &hamlet @ literature::title: "Hamlet", literature::author: &shakespeare };
-    ws.commit(base.clone(), "commit");
-    let c1 = ws.head().unwrap();
+    let mut ws = repo.pull(*branch_id).expect("pull");
+    let mut initial = TribleSet::new();
+    initial += entity! { &shakespeare @ literature::firstname: "William", literature::lastname: "Shakespeare" };
+    initial += entity! { &hamlet @ literature::title: "Hamlet", literature::author: &shakespeare };
+    ws.commit(initial, "initial");
+    repo.push(&mut ws).unwrap();
 
-    // Commit a new book
-    let macbeth = ufoid();
-    let mut change = TribleSet::new();
-    change += entity! { &macbeth @ literature::title: "Macbeth", literature::author: &shakespeare };
-    ws.commit(change.clone(), "commit");
-    let c2 = ws.head().unwrap();
+    // ── first checkout: load everything ──────────────────────────────
+    // `changed` and `full` start as the same full checkout.
+    let mut changed = repo.pull(*branch_id).expect("pull").checkout(..).expect("checkout");
+    let mut full = changed.facts().clone();
 
-    // Compute updated state and delta between commits
-    let base_state = ws.checkout(c1).expect("base");
-    let updated = ws.checkout(c2).expect("updated");
-    let delta = updated.difference(&base_state);
-
-    // Find new titles by Shakespeare
-    let results: Vec<_> = find!(
-        (author: Value<_>, book: Value<_>, title: Value<_>),
-        pattern_changes!(&updated, &delta, [
-            { ?author @ literature::firstname: "William", literature::lastname: "Shakespeare" },
-            { ?book @ literature::author: ?author, literature::title: ?title }
+    // On the first iteration, everything is "new".
+    let all_titles: Vec<String> = find!(
+        title: String,
+        pattern_changes!(&full, &changed, [
+            { _?book @ literature::title: ?title }
         ])
     )
-    .map(|(_, b, t)| (b, t))
     .collect();
+    assert_eq!(all_titles, vec!["Hamlet".to_string()]);
 
-    println!("{results:?}");
+    // ── simulate an external update ──────────────────────────────────
+    let macbeth = ufoid();
+    let mut ws = repo.pull(*branch_id).expect("pull");
+    ws.commit(
+        entity! { &macbeth @ literature::title: "Macbeth", literature::author: &shakespeare },
+        "add Macbeth",
+    );
+    repo.push(&mut ws).unwrap();
+
+    // ── incremental update ───────────────────────────────────────────
+    // Pull fresh, checkout only commits since our last head.
+    changed = repo.pull(*branch_id).expect("pull").checkout(changed.head()..).expect("delta");
+    full += &changed;
+
+    // Only Macbeth shows up — Hamlet was in the previous checkout.
+    let new_titles: Vec<String> = find!(
+        title: String,
+        pattern_changes!(&full, &changed, [
+            { _?book @ literature::title: ?title }
+        ])
+    )
+    .collect();
+    assert_eq!(new_titles, vec!["Macbeth".to_string()]);
+    println!("New titles: {new_titles:?}");
     // ANCHOR_END: pattern_changes_example
 }
