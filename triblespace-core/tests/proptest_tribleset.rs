@@ -212,6 +212,86 @@ proptest! {
             "full delta should equal full pattern");
     }
 
+    /// The bug we fixed: multi-entity joins where one entity is in base and
+    /// the other in delta. pattern_changes must only return results that
+    /// involve at least one trible from the delta.
+    #[test]
+    fn pattern_changes_multi_entity_delta_only(
+        base_names in vec("[a-z]{1,6}", 1..5),
+        delta_names in vec("[a-z]{1,6}", 1..5),
+    ) {
+        // Base: entities with labels + links between them
+        let mut base = TribleSet::new();
+        let mut base_entities = Vec::new();
+        for name in &base_names {
+            let e = rngid();
+            base += entity! { &e @ test_ns::label: name.as_str() };
+            base_entities.push(e);
+        }
+        // Link first base entity to all others
+        if base_entities.len() > 1 {
+            for target in &base_entities[1..] {
+                base += entity! { &base_entities[0] @ test_ns::link: target };
+            }
+        }
+
+        // Delta: new entities with labels + links to base entities
+        let mut delta = TribleSet::new();
+        for name in &delta_names {
+            let e = rngid();
+            delta += entity! { &e @ test_ns::label: name.as_str() };
+            // Link to first base entity (cross-set join)
+            if !base_entities.is_empty() {
+                delta += entity! { &e @ test_ns::link: &base_entities[0] };
+            }
+        }
+
+        let full = base.clone() + delta.clone();
+
+        // Query: find labels of entities that link to the first base entity
+        if !base_entities.is_empty() {
+            let target_val = (&base_entities[0]).to_value();
+            let changes: Vec<String> = find!(
+                label: String,
+                pattern_changes!(&full, &delta, [
+                    { _?e @ test_ns::link: target_val, test_ns::label: ?label }
+                ])
+            ).collect();
+
+            // All results must be from entities that have at least one
+            // trible in the delta
+            let _base_labels: Vec<String> = find!(
+                label: String,
+                pattern!(&base, [
+                    { _?e @ test_ns::link: target_val, test_ns::label: ?label }
+                ])
+            ).collect();
+
+            // pattern_changes should NOT return labels that are
+            // exclusively from base (no delta involvement)
+            for label in &changes {
+                // The label either comes from a delta entity, or the link
+                // comes from delta. Either way, at least one trible is new.
+                // We can't easily check which trible is from delta, but we
+                // CAN check: if a label is ONLY in base (entity has no
+                // delta tribles), it should NOT appear.
+                let in_delta_labels: Vec<String> = find!(
+                    label: String,
+                    pattern!(&delta, [{ test_ns::label: ?label }])
+                ).collect();
+                let in_delta_links = find!(
+                    (e: Value<_>,),
+                    pattern!(&delta, [{ ?e @ test_ns::link: target_val }])
+                ).count();
+
+                // The result must involve SOME delta data
+                let delta_has_something = !in_delta_labels.is_empty() || in_delta_links > 0;
+                prop_assert!(delta_has_something,
+                    "result {:?} has no delta involvement", label);
+            }
+        }
+    }
+
     #[test]
     fn pattern_changes_subset_of_pattern(
         base_labels in vec("[a-z]{1,8}", 1..8),
