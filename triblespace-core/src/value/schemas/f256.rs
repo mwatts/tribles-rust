@@ -354,133 +354,97 @@ mod tests {
     use super::*;
     use crate::value::{ToValue, TryToValue};
     use ::f256::f256;
+    use proptest::prelude::*;
 
-    #[test]
-    fn f256_le_roundtrip_one() {
-        let input = f256::from(1.0f64);
-        let value: Value<F256LE> = input.to_value();
-        let output: f256 = value.from_value();
-        assert_eq!(input, output);
+    /// Generate an f256 from an f64, filtering out NaN (NaN != NaN).
+    fn arb_f256_non_nan() -> impl Strategy<Value = f256> {
+        any::<f64>()
+            .prop_filter("not NaN", |v| !v.is_nan())
+            .prop_map(f256::from)
     }
 
-    #[test]
-    fn f256_be_roundtrip_one() {
-        let input = f256::from(1.0f64);
-        let value: Value<F256BE> = input.to_value();
-        let output: f256 = value.from_value();
-        assert_eq!(input, output);
+    proptest! {
+        #[test]
+        fn f256le_roundtrip(input in arb_f256_non_nan()) {
+            let value: Value<F256LE> = input.to_value();
+            let output: f256 = value.from_value();
+            prop_assert_eq!(input, output);
+        }
+
+        #[test]
+        fn f256be_roundtrip(input in arb_f256_non_nan()) {
+            let value: Value<F256BE> = input.to_value();
+            let output: f256 = value.from_value();
+            prop_assert_eq!(input, output);
+        }
+
+        #[test]
+        fn f256le_validates(input in arb_f256_non_nan()) {
+            let value: Value<F256LE> = input.to_value();
+            prop_assert!(F256LE::validate(value).is_ok());
+        }
+
+        #[test]
+        fn f256be_validates(input in arb_f256_non_nan()) {
+            let value: Value<F256BE> = input.to_value();
+            prop_assert!(F256BE::validate(value).is_ok());
+        }
+
+        #[test]
+        fn f256_le_and_be_differ(input in arb_f256_non_nan().prop_filter("non-zero", |v| *v != f256::ZERO)) {
+            let le_val: Value<F256LE> = input.to_value();
+            let be_val: Value<F256BE> = input.to_value();
+            prop_assert_ne!(le_val.raw, be_val.raw);
+        }
+
+        #[test]
+        fn json_number_u128_roundtrip(input: u64) {
+            let s = input.to_string();
+            let num: JsonNumber = serde_json::from_str(&s).unwrap();
+            let value: Value<F256> = num.try_to_value().expect("valid number");
+            let output: f256 = value.from_value();
+            prop_assert_eq!(output, f256::from(input as u128));
+        }
+
+        #[test]
+        fn json_number_negative_roundtrip(input in any::<i64>().prop_filter("negative", |v| *v < 0)) {
+            let s = input.to_string();
+            let num: JsonNumber = serde_json::from_str(&s).unwrap();
+            let value: Value<F256> = num.try_to_value().expect("valid number");
+            let output: f256 = value.from_value();
+            prop_assert_eq!(output, f256::from(input as i128));
+        }
+
+        #[test]
+        fn json_number_f64_roundtrip(input in any::<f64>().prop_filter("finite", |v| v.is_finite())) {
+            let s = ryu::Buffer::new().format(input).to_string();
+            let num: JsonNumber = serde_json::from_str(&s).unwrap();
+            // Compare via &JsonNumber so we can also inspect the parsed value.
+            let expected = f256::from(num.as_f64().unwrap());
+            let value: Value<F256> = (&num).try_to_value().expect("valid number");
+            let output: f256 = value.from_value();
+            // Compare against what serde_json actually parsed (via as_f64),
+            // not the original f64, since JSON string round-tripping can
+            // shift the least-significant bit.
+            prop_assert_eq!(output, expected);
+        }
+
+        #[test]
+        fn json_number_ref_roundtrip(input: u64) {
+            let s = input.to_string();
+            let num: JsonNumber = serde_json::from_str(&s).unwrap();
+            let value: Value<F256> = (&num).try_to_value().expect("valid ref number");
+            let output: f256 = value.from_value();
+            prop_assert_eq!(output, f256::from(input as u128));
+        }
     }
 
-    #[test]
-    fn f256_le_roundtrip_zero() {
-        let input = f256::ZERO;
-        let value: Value<F256LE> = input.to_value();
-        let output: f256 = value.from_value();
-        assert_eq!(input, output);
-    }
-
-    #[test]
-    fn f256_be_roundtrip_zero() {
-        let input = f256::ZERO;
-        let value: Value<F256BE> = input.to_value();
-        let output: f256 = value.from_value();
-        assert_eq!(input, output);
-    }
-
-    #[test]
-    fn f256_le_roundtrip_negative() {
-        let input = f256::from(-3.14f64);
-        let value: Value<F256LE> = input.to_value();
-        let output: f256 = value.from_value();
-        assert_eq!(input, output);
-    }
-
-    #[test]
-    fn f256_be_roundtrip_negative() {
-        let input = f256::from(-3.14f64);
-        let value: Value<F256BE> = input.to_value();
-        let output: f256 = value.from_value();
-        assert_eq!(input, output);
-    }
-
-    #[test]
-    fn f256_le_roundtrip_large_integer() {
-        let input = f256::from(u128::MAX);
-        let value: Value<F256LE> = input.to_value();
-        let output: f256 = value.from_value();
-        assert_eq!(input, output);
-    }
-
-    #[test]
-    fn f256_be_roundtrip_large_integer() {
-        let input = f256::from(u128::MAX);
-        let value: Value<F256BE> = input.to_value();
-        let output: f256 = value.from_value();
-        assert_eq!(input, output);
-    }
-
-    #[test]
-    fn f256_le_roundtrip_infinity() {
-        let input = f256::INFINITY;
-        let value: Value<F256LE> = input.to_value();
-        let output: f256 = value.from_value();
-        assert_eq!(input, output);
-    }
-
-    #[test]
-    fn f256_be_roundtrip_neg_infinity() {
-        let input = f256::NEG_INFINITY;
-        let value: Value<F256BE> = input.to_value();
-        let output: f256 = value.from_value();
-        assert_eq!(input, output);
-    }
-
+    // NaN round-trip must use is_nan() since NaN != NaN.
     #[test]
     fn f256_le_roundtrip_nan() {
         let input = f256::NAN;
         let value: Value<F256LE> = input.to_value();
         let output: f256 = value.from_value();
         assert!(output.is_nan());
-    }
-
-    #[test]
-    fn f256_le_and_be_differ_for_same_value() {
-        let input = f256::from(42.0f64);
-        let le_val: Value<F256LE> = input.to_value();
-        let be_val: Value<F256BE> = input.to_value();
-        // LE and BE encodings should differ (unless value is zero or symmetric)
-        assert_ne!(le_val.raw, be_val.raw);
-    }
-
-    #[test]
-    fn json_number_u128_roundtrip() {
-        let num: JsonNumber = serde_json::from_str("42").unwrap();
-        let value: Value<F256> = num.try_to_value().expect("valid number");
-        let output: f256 = value.from_value();
-        assert_eq!(output, f256::from(42u128));
-    }
-
-    #[test]
-    fn json_number_negative_roundtrip() {
-        let num: JsonNumber = serde_json::from_str("-100").unwrap();
-        let value: Value<F256> = num.try_to_value().expect("valid number");
-        let output: f256 = value.from_value();
-        assert_eq!(output, f256::from(-100i128));
-    }
-
-    #[test]
-    fn json_number_f64_roundtrip() {
-        let num: JsonNumber = serde_json::from_str("3.14").unwrap();
-        let value: Value<F256> = num.try_to_value().expect("valid number");
-        let output: f256 = value.from_value();
-        assert_eq!(output, f256::from(3.14f64));
-    }
-
-    #[test]
-    fn json_number_ref_roundtrip() {
-        let num: JsonNumber = serde_json::from_str("99").unwrap();
-        let value: Value<F256> = (&num).try_to_value().expect("valid ref number");
-        let output: f256 = value.from_value();
-        assert_eq!(output, f256::from(99u128));
     }
 }

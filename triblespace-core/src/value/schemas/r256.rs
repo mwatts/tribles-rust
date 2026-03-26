@@ -263,89 +263,89 @@ mod tests {
     use super::*;
     use crate::value::{ToValue, TryFromValue};
     use num_rational::Ratio;
+    use proptest::prelude::*;
 
-    // --- R256BE tests ---
-
-    #[test]
-    fn r256be_ratio_roundtrip() {
-        let input = Ratio::new(3i128, 7i128);
-        let value: Value<R256BE> = input.to_value();
-        let output = Ratio::<i128>::try_from_value(&value).expect("valid ratio");
-        assert_eq!(input, output);
+    fn arb_ratio() -> impl Strategy<Value = Ratio<i128>> {
+        (any::<i128>(), any::<i128>().prop_filter("non-zero", |d| *d != 0))
+            .prop_map(|(n, d)| Ratio::new(n, d))
     }
 
-    #[test]
-    fn r256be_ratio_auto_reduces() {
-        // 6/14 reduces to 3/7
-        let input = Ratio::new(6i128, 14i128);
-        let value: Value<R256BE> = input.to_value();
-        let output = Ratio::<i128>::try_from_value(&value).expect("valid ratio");
-        assert_eq!(output, Ratio::new(3i128, 7i128));
+    proptest! {
+        // --- R256BE property tests ---
+
+        #[test]
+        fn r256be_ratio_roundtrip(input in arb_ratio()) {
+            let value: Value<R256BE> = input.to_value();
+            let output = Ratio::<i128>::try_from_value(&value).expect("valid ratio");
+            prop_assert_eq!(input, output);
+        }
+
+        #[test]
+        fn r256be_canonicalization(n: i128, d in any::<i128>().prop_filter("non-zero", |d| *d != 0)) {
+            let ratio = Ratio::new(n, d);
+            let value: Value<R256BE> = ratio.to_value();
+            let output = Ratio::<i128>::try_from_value(&value).expect("valid ratio");
+            // Output must be in reduced form
+            prop_assert_eq!(output, output.reduced());
+        }
+
+        #[test]
+        fn r256be_i128_roundtrip(input: i128) {
+            let value: Value<R256BE> = input.to_value();
+            let output = Ratio::<i128>::try_from_value(&value).expect("valid ratio");
+            prop_assert_eq!(*output.numer(), input);
+            prop_assert_eq!(*output.denom(), 1i128);
+        }
+
+        #[test]
+        fn r256be_validates(input in arb_ratio()) {
+            let value: Value<R256BE> = input.to_value();
+            prop_assert!(R256BE::validate(value).is_ok());
+        }
+
+        // --- R256LE property tests ---
+
+        #[test]
+        fn r256le_ratio_roundtrip(input in arb_ratio()) {
+            let value: Value<R256LE> = input.to_value();
+            let output = Ratio::<i128>::try_from_value(&value).expect("valid ratio");
+            prop_assert_eq!(input, output);
+        }
+
+        #[test]
+        fn r256le_canonicalization(n: i128, d in any::<i128>().prop_filter("non-zero", |d| *d != 0)) {
+            let ratio = Ratio::new(n, d);
+            let value: Value<R256LE> = ratio.to_value();
+            let output = Ratio::<i128>::try_from_value(&value).expect("valid ratio");
+            prop_assert_eq!(output, output.reduced());
+        }
+
+        #[test]
+        fn r256le_i128_roundtrip(input: i128) {
+            let value: Value<R256LE> = input.to_value();
+            let output = Ratio::<i128>::try_from_value(&value).expect("valid ratio");
+            prop_assert_eq!(*output.numer(), input);
+            prop_assert_eq!(*output.denom(), 1i128);
+        }
+
+        #[test]
+        fn r256le_validates(input in arb_ratio()) {
+            let value: Value<R256LE> = input.to_value();
+            prop_assert!(R256LE::validate(value).is_ok());
+        }
+
+        #[test]
+        fn r256_le_and_be_differ(input in arb_ratio().prop_filter("non-trivial", |r| *r.numer() != 0)) {
+            let le_val: Value<R256LE> = input.to_value();
+            let be_val: Value<R256BE> = input.to_value();
+            prop_assert_ne!(le_val.raw, be_val.raw);
+        }
     }
 
-    #[test]
-    fn r256be_ratio_negative_roundtrip() {
-        let input = Ratio::new(-5i128, 3i128);
-        let value: Value<R256BE> = input.to_value();
-        let output = Ratio::<i128>::try_from_value(&value).expect("valid ratio");
-        assert_eq!(input, output);
-    }
-
-    #[test]
-    fn r256be_ratio_one() {
-        let input = Ratio::new(1i128, 1i128);
-        let value: Value<R256BE> = input.to_value();
-        let output = Ratio::<i128>::try_from_value(&value).expect("valid ratio");
-        assert_eq!(output, Ratio::new(1i128, 1i128));
-    }
-
-    #[test]
-    fn r256be_ratio_zero() {
-        let input = Ratio::new(0i128, 1i128);
-        let value: Value<R256BE> = input.to_value();
-        let output = Ratio::<i128>::try_from_value(&value).expect("valid ratio");
-        assert_eq!(*output.numer(), 0i128);
-    }
-
-    #[test]
-    fn r256be_i128_roundtrip() {
-        let input: i128 = 42;
-        let value: Value<R256BE> = input.to_value();
-        let output = Ratio::<i128>::try_from_value(&value).expect("valid ratio");
-        assert_eq!(*output.numer(), 42);
-        assert_eq!(*output.denom(), 1);
-    }
-
-    #[test]
-    fn r256be_i128_negative() {
-        let input: i128 = -100;
-        let value: Value<R256BE> = input.to_value();
-        let output = Ratio::<i128>::try_from_value(&value).expect("valid ratio");
-        assert_eq!(*output.numer(), -100);
-        assert_eq!(*output.denom(), 1);
-    }
-
-    #[test]
-    fn r256be_i128_max() {
-        let input: i128 = i128::MAX;
-        let value: Value<R256BE> = input.to_value();
-        let output = Ratio::<i128>::try_from_value(&value).expect("valid ratio");
-        assert_eq!(*output.numer(), i128::MAX);
-        assert_eq!(*output.denom(), 1);
-    }
-
-    #[test]
-    fn r256be_i128_min() {
-        let input: i128 = i128::MIN;
-        let value: Value<R256BE> = input.to_value();
-        let output = Ratio::<i128>::try_from_value(&value).expect("valid ratio");
-        assert_eq!(*output.numer(), i128::MIN);
-        assert_eq!(*output.denom(), 1);
-    }
+    // --- Error-case unit tests ---
 
     #[test]
     fn r256be_non_canonical_error() {
-        // Manually construct a non-canonical ratio: 2/4 (should be 1/2)
         let mut bytes = [0u8; 32];
         bytes[0..16].copy_from_slice(&2i128.to_be_bytes());
         bytes[16..32].copy_from_slice(&4i128.to_be_bytes());
@@ -363,33 +363,6 @@ mod tests {
             Ratio::<i128>::try_from_value(&value),
             Err(RatioError::ZeroDenominator)
         ));
-    }
-
-    // --- R256LE tests ---
-
-    #[test]
-    fn r256le_ratio_roundtrip() {
-        let input = Ratio::new(3i128, 7i128);
-        let value: Value<R256LE> = input.to_value();
-        let output = Ratio::<i128>::try_from_value(&value).expect("valid ratio");
-        assert_eq!(input, output);
-    }
-
-    #[test]
-    fn r256le_ratio_negative_roundtrip() {
-        let input = Ratio::new(-11i128, 13i128);
-        let value: Value<R256LE> = input.to_value();
-        let output = Ratio::<i128>::try_from_value(&value).expect("valid ratio");
-        assert_eq!(input, output);
-    }
-
-    #[test]
-    fn r256le_i128_roundtrip() {
-        let input: i128 = 99;
-        let value: Value<R256LE> = input.to_value();
-        let output = Ratio::<i128>::try_from_value(&value).expect("valid ratio");
-        assert_eq!(*output.numer(), 99);
-        assert_eq!(*output.denom(), 1);
     }
 
     #[test]
@@ -411,13 +384,5 @@ mod tests {
             Ratio::<i128>::try_from_value(&value),
             Err(RatioError::ZeroDenominator)
         ));
-    }
-
-    #[test]
-    fn r256_le_and_be_differ_for_same_ratio() {
-        let input = Ratio::new(3i128, 7i128);
-        let le_val: Value<R256LE> = input.to_value();
-        let be_val: Value<R256BE> = input.to_value();
-        assert_ne!(le_val.raw, be_val.raw);
     }
 }
