@@ -14,6 +14,18 @@ use crate::value::RawValue;
 use crate::value::ValueSchema;
 use crate::value::VALUE_LEN;
 
+/// A triple-pattern lookup against a [`TribleSet`].
+///
+/// Created by [`TribleSet::pattern`](crate::query::TriblePattern::pattern)
+/// (typically via the [`pattern!`](crate::pattern) macro). Each constraint
+/// binds three variables — entity, attribute, value — and uses the six
+/// covering indexes (EAV, EVA, AEV, AVE, VEA, VAE) to provide tight
+/// estimates and fast proposals regardless of which positions are already
+/// bound.
+///
+/// When all three variables are bound, [`satisfied`](Constraint::satisfied)
+/// checks whether the triple exists in the set, enabling composite
+/// constraints to prune dead branches early.
 pub struct TribleSetConstraint {
     variable_e: VariableId,
     variable_a: VariableId,
@@ -22,6 +34,8 @@ pub struct TribleSetConstraint {
 }
 
 impl TribleSetConstraint {
+    /// Creates a triple-pattern constraint over `set` for the given
+    /// entity, attribute, and value variables.
     pub fn new<V: ValueSchema>(
         variable_e: Variable<GenId>,
         variable_a: Variable<GenId>,
@@ -38,6 +52,7 @@ impl TribleSetConstraint {
 }
 
 impl<'a> Constraint<'a> for TribleSetConstraint {
+    /// Returns the set `{entity, attribute, value}` (three variables).
     fn variables(&self) -> VariableSet {
         let mut variables = VariableSet::new_empty();
         variables.set(self.variable_e);
@@ -46,6 +61,10 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         variables
     }
 
+    /// Uses the covering indexes (EAV, EVA, AEV, AVE, VEA, VAE) to
+    /// count matching entries via `segmented_len`. The index chosen
+    /// depends on which of the other two positions are already bound,
+    /// giving tight estimates regardless of access pattern.
     fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
         if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
         {
@@ -130,6 +149,9 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         } as usize)
     }
 
+    /// Enumerates matching values from the most selective covering index
+    /// via `infixes`. The index is chosen to match the bound positions,
+    /// so proposals are generated directly from a prefix scan.
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
         let e_var = self.variable_e == variable;
         let a_var = self.variable_a == variable;
@@ -230,6 +252,8 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         }
     }
 
+    /// Retains only proposals whose combined key (bound positions +
+    /// proposed value) has a matching prefix in the appropriate index.
     fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
         let e_var = self.variable_e == variable;
         let a_var = self.variable_a == variable;
@@ -350,6 +374,9 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         }
     }
 
+    /// When all three positions are bound, checks whether the triple
+    /// exists in the EAV index. Returns `true` optimistically when any
+    /// position is still unbound.
     fn satisfied(&self, binding: &Binding) -> bool {
         let e = binding.get(self.variable_e);
         let a = binding.get(self.variable_a);

@@ -96,10 +96,12 @@ impl ValueSchema for GenId {
     }
 }
 
-/// Error that can occur when parsing an identifier from a Value.
+/// Error returned when extracting an identifier from a [`Value<GenId>`].
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum IdParseError {
+    /// The identifier is nil (all zeros), which is reserved.
     IsNil,
+    /// The upper 16 bytes are not zero, violating the GenId layout.
     BadFormat,
 }
 
@@ -183,9 +185,13 @@ impl TryFromValue<'_, GenId> for uuid::Uuid {
     }
 }
 
+/// Error returned when extracting an [`ExclusiveId`] from a [`Value<GenId>`].
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ExclusiveIdError {
+    /// The raw bytes could not be interpreted as an identifier.
     FailedParse(IdParseError),
+    /// The identifier is valid but could not be exclusively acquired
+    /// (another holder already owns it).
     FailedAquire(),
 }
 
@@ -240,9 +246,14 @@ impl ToValue<GenId> for &OwnedId<'_> {
     }
 }
 
+/// Error returned when packing a string into a [`Value<GenId>`].
+///
+/// The expected format is `"genid:<32 hex chars>"`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PackIdError {
+    /// The string does not start with `"genid:"`.
     BadProtocol,
+    /// The hex portion could not be decoded.
     BadHex(FromHexError),
 }
 

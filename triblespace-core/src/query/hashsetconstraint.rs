@@ -8,6 +8,12 @@ use crate::value::ToValue;
 
 use super::*;
 
+/// Constrains a variable to values present in a [`HashSet`].
+///
+/// Created via the [`ContainsConstraint`] trait (`.has(variable)`).
+/// Proposals enumerate every element in the set; confirmations retain
+/// only proposals that the set contains. Accepts `&HashSet<T>`,
+/// `Rc<HashSet<T>>`, and `Arc<HashSet<T>>` as the backing store.
 pub struct SetConstraint<S: ValueSchema, R, T>
 where
     R: Deref<Target = HashSet<T>>,
@@ -20,6 +26,7 @@ impl<S: ValueSchema, R, T> SetConstraint<S, R, T>
 where
     R: Deref<Target = HashSet<T>>,
 {
+    /// Creates a constraint that restricts `variable` to values in `set`.
     pub fn new(variable: Variable<S>, set: R) -> Self {
         SetConstraint { variable, set }
     }

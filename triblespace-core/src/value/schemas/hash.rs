@@ -68,15 +68,18 @@ impl<H> Hash<H>
 where
     H: HashProtocol,
 {
+    /// Computes the hash of `blob` and returns it as a value.
     pub fn digest(blob: &Bytes) -> Value<Self> {
         Value::new(H::digest(blob).into())
     }
 
+    /// Parses a hex-encoded digest string into a hash value.
     pub fn from_hex(hex: &str) -> Result<Value<Self>, FromHexError> {
         let digest = RawValue::from_hex(hex)?;
         Ok(Value::new(digest))
     }
 
+    /// Returns the digest as an uppercase hex string.
     pub fn to_hex(value: &Value<Self>) -> String {
         hex::encode_upper(value.raw)
     }
@@ -100,7 +103,10 @@ where
 /// The error can be caused by a bad protocol or a bad hex encoding.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum HashError {
+    /// The string does not start with the expected protocol prefix
+    /// (e.g. `"blake3:"`).
     BadProtocol,
+    /// The hex portion could not be decoded.
     BadHex(FromHexError),
 }
 
@@ -188,8 +194,11 @@ mod wasm_formatter {
 }
 
 use blake2::Blake2b as Blake2bUnsized;
+/// Blake2b truncated to 256 bits, usable as a [`HashProtocol`].
 pub type Blake2b = Blake2bUnsized<U32>;
 
+/// Blake3 hasher, usable as a [`HashProtocol`]. This is the default
+/// hash function for content-addressed blob storage.
 pub use blake3::Hasher as Blake3;
 
 impl HashProtocol for Blake2b {
@@ -241,10 +250,12 @@ pub struct Handle<H: HashProtocol, T: BlobSchema> {
 }
 
 impl<H: HashProtocol, T: BlobSchema> Handle<H, T> {
+    /// Wraps a hash value as a typed handle.
     pub fn from_hash(hash: Value<Hash<H>>) -> Value<Self> {
         hash.transmute()
     }
 
+    /// Extracts the underlying hash, discarding the blob schema type.
     pub fn to_hash(handle: Value<Self>) -> Value<Hash<H>> {
         handle.transmute()
     }

@@ -14,12 +14,16 @@ use super::Variable;
 use super::VariableId;
 use super::VariableSet;
 
+/// Constrains a variable to full-width values present in a [`PATCH`].
+///
+/// Proposals enumerate every entry; confirmations check prefix membership.
 pub struct PatchValueConstraint<'a, T: ValueSchema> {
     variable: Variable<T>,
     patch: &'a PATCH<VALUE_LEN, IdentitySchema, ()>,
 }
 
 impl<'a, T: ValueSchema> PatchValueConstraint<'a, T> {
+    /// Creates a constraint that restricts `variable` to values in `patch`.
     pub fn new(variable: Variable<T>, patch: &'a PATCH<VALUE_LEN, IdentitySchema, ()>) -> Self {
         PatchValueConstraint { variable, patch }
     }
@@ -60,6 +64,11 @@ impl<'a, S: ValueSchema> ContainsConstraint<'a, S> for &'a PATCH<VALUE_LEN, Iden
     }
 }
 
+/// Constrains a variable to ID-width values present in a [`PATCH`].
+///
+/// Like [`PatchValueConstraint`] but for 16-byte identifiers. Values are
+/// converted between the ID representation and the 32-byte value
+/// representation automatically.
 pub struct PatchIdConstraint<S>
 where
     S: ValueSchema,
@@ -72,6 +81,7 @@ impl<S> PatchIdConstraint<S>
 where
     S: ValueSchema,
 {
+    /// Creates a constraint that restricts `variable` to IDs in `patch`.
     pub fn new(variable: Variable<S>, patch: PATCH<ID_LEN, IdentitySchema, ()>) -> Self {
         PatchIdConstraint { variable, patch }
     }

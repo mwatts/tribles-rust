@@ -21,13 +21,22 @@ use crate::value::ToValue;
 
 // ── Path expression types ────────────────────────────────────────────────
 
-/// Postfix-encoded path operations (used by the `path!` macro).
+/// Postfix-encoded path operations (used by the [`path!`](crate::path) macro).
+///
+/// The macro compiles a path expression into a sequence of these
+/// operations. [`RegularPathConstraint::new`] converts the postfix
+/// sequence into a tree for evaluation.
 #[derive(Clone)]
 pub enum PathOp {
+    /// Single-attribute hop: traverse the given attribute.
     Attr(RawId),
+    /// Concatenation: compose the two preceding sub-expressions.
     Concat,
+    /// Alternation: match either of the two preceding sub-expressions.
     Union,
+    /// Reflexive-transitive closure (`*`): zero or more repetitions.
     Star,
+    /// Transitive closure (`+`): one or more repetitions.
     Plus,
 }
 
@@ -245,6 +254,16 @@ fn estimate_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> usize {
 
 // ── Constraint ───────────────────────────────────────────────────────────
 
+/// Constrains two variables to be connected by a regular path expression.
+///
+/// Created by the [`path!`](crate::path) macro. The path expression
+/// supports concatenation, alternation (`|`), transitive closure (`+`),
+/// and reflexive-transitive closure (`*`). Single-attribute hops use
+/// direct index scans; multi-step paths use the WCO join engine for
+/// concatenation and BFS for closures.
+///
+/// When the start variable is bound, propose enumerates all reachable
+/// endpoints. When the end is bound, confirm checks reachability.
 pub struct RegularPathConstraint {
     start: VariableId,
     end: VariableId,
@@ -253,6 +272,8 @@ pub struct RegularPathConstraint {
 }
 
 impl RegularPathConstraint {
+    /// Creates a path constraint from `start` to `end` over the given
+    /// postfix-encoded path operations.
     pub fn new(
         set: TribleSet,
         start: Variable<GenId>,

@@ -15,6 +15,12 @@ use crate::value::ToValue;
 use crate::value::Value;
 use crate::value::ValueSchema;
 
+/// Constrains a variable to keys present in a [`HashMap`].
+///
+/// Created via the [`ContainsConstraint`](crate::query::ContainsConstraint)
+/// trait (`.has(variable)`). Proposals enumerate every key in the map;
+/// confirmations retain only proposals whose key exists. Accepts
+/// `&HashMap<K,V>`, `Rc<HashMap<K,V>>`, and `Arc<HashMap<K,V>>`.
 pub struct KeysConstraint<S: ValueSchema, R, K, V>
 where
     R: Deref<Target = HashMap<K, V>>,
@@ -27,6 +33,7 @@ impl<S: ValueSchema, R, K, V> KeysConstraint<S, R, K, V>
 where
     R: Deref<Target = HashMap<K, V>>,
 {
+    /// Creates a constraint that restricts `variable` to keys in `map`.
     pub fn new(variable: Variable<S>, map: R) -> Self {
         KeysConstraint { variable, map }
     }

@@ -215,95 +215,121 @@ impl Default for Binding {
     }
 }
 
-/// A constraint is a predicate used to filter the results of a query.
-/// It restricts the values that can be assigned to a variable.
-/// Constraints can be combined using logical operators like `and` and `or`.
-/// This trait provides methods to estimate, propose, and confirm values for a variable:
-/// - `estimate` method estimates the number of values that match the constraint.
-/// - `propose` method suggests values for a variable that match the constraint.
-/// - `confirm` method verifies a value for a variable that matches the constraint.
-/// - `variables` method returns the set of variables used by the constraint.
-///   The trait is generic over the lifetime of an underlying borrowed data structure that the
-///   constraint might use, such as a [std::collections::HashMap] or a [crate::trible::TribleSet].
+/// The cooperative protocol that every query participant implements.
 ///
-/// Note that the constraint does not store any state, but rather operates on the binding
-/// passed to it by the query engine. This allows the query engine to efficiently
-/// backtrack and try different values for the variables, potentially in parallel.
+/// A constraint restricts the values that can be assigned to query variables.
+/// The query engine does not plan joins in advance; instead it consults
+/// constraints directly during a depth-first search over partial bindings.
+/// Each constraint reports which variables it touches, estimates how many
+/// candidates remain, enumerates concrete values on demand, and signals
+/// whether its requirements are still satisfiable. This protocol is the
+/// sole interface between the engine and the data — whether that data lives
+/// in a [`TribleSet`](crate::trible::TribleSet), a [`HashMap`](std::collections::HashMap),
+/// or a custom application predicate.
 ///
-/// The trait is designed to be simple and flexible, allowing for a wide range of
-/// constraints to be implemented, while still allowing for efficient exploration of the
-/// search space by the query engine.
+/// # The protocol
 ///
-/// In contrast to many other query languages, the constraints are not evaluated in a
-/// fixed order, but rather the query engine uses the estimates provided by the constraints
-/// to guide the search. This allows for a more flexible and efficient exploration of the
-/// search space, as the query engine can focus on the most promising parts.
-/// This also also obviates the need for complex query optimization techniques, as the
-/// constraints themselves provide the necessary information to guide the search,
-/// and the query engine can adapt dynamically to the data and the query, providing
-/// skew-resistance and predictable performance. This also removes the need for ordered indexes,
-/// allowing for queries to be executed on unsorted data structures like hashmaps, which
-/// enables easy integration with native Rust data structures and libraries.
-/// This also allows for the query engine to be easily extended with new constraints,
-/// so long as they provide reasonable estimates of the number of values that match the constraint.
-/// See the module documentation for notes on the accuracy of these estimates.
+/// The engine drives the search by calling five methods in a fixed rhythm:
 ///
-/// The trait is designed to be used in combination with the [Query] struct, which provides
-/// a simple and efficient way to iterate over the results of a query.
+/// | Method | Role | Called when |
+/// |--------|------|------------|
+/// | [`variables`](Constraint::variables) | Declares which variables the constraint touches. | Once, at query start. |
+/// | [`estimate`](Constraint::estimate) | Predicts the candidate count for a variable. | Before each binding decision. |
+/// | [`propose`](Constraint::propose) | Enumerates candidate values for a variable. | On the most selective constraint. |
+/// | [`confirm`](Constraint::confirm) | Filters candidates proposed by another constraint. | On all remaining constraints. |
+/// | [`satisfied`](Constraint::satisfied) | Checks whether fully-bound sub-constraints still hold. | Before propose/confirm in composite constraints. |
+///
+/// [`influence`](Constraint::influence) completes the picture by telling the
+/// engine which estimates to refresh when a variable is bound or unbound.
+///
+/// # Statelessness
+///
+/// Constraints are stateless: every method receives the current [`Binding`]
+/// as a parameter rather than maintaining internal bookkeeping. This lets
+/// the engine backtrack freely by unsetting variables in the binding
+/// without notifying the constraints.
+///
+/// # Composability
+///
+/// Constraints combine via [`IntersectionConstraint`](crate::query::intersectionconstraint::IntersectionConstraint)
+/// (logical AND — built by [`and!`](crate::and)) and
+/// [`UnionConstraint`](crate::query::unionconstraint::UnionConstraint)
+/// (logical OR — built by [`or!`](crate::or)). Because every constraint
+/// speaks the same protocol, heterogeneous data sources mix freely in a
+/// single query.
+///
+/// # Implementing a custom constraint
+///
+/// A new constraint only needs to implement [`variables`](Constraint::variables),
+/// [`estimate`](Constraint::estimate), [`propose`](Constraint::propose), and
+/// [`confirm`](Constraint::confirm). Override [`satisfied`](Constraint::satisfied)
+/// when the constraint can detect unsatisfiability before the engine asks
+/// about individual variables (e.g. a fully-bound triple lookup that found
+/// no match). Override [`influence`](Constraint::influence) when binding one
+/// variable changes the estimates for a non-obvious set of others.
 pub trait Constraint<'a> {
-    /// Return the set of variables used by the constraint.
-    /// This is only called once at the beginning of the query.
-    /// The query engine uses this information to keep track of the variables
-    /// that are used by each constraint.
+    /// Returns the set of variables this constraint touches.
+    ///
+    /// Called once at query start. The engine uses this to build influence
+    /// graphs and to determine which constraints participate when a
+    /// particular variable is being bound.
     fn variables(&self) -> VariableSet;
 
-    /// Estimate the number of values that match the constraint.
-    /// This is used by the query engine to guide the search.
-    /// The estimate should be as accurate as possible, while being cheap to compute,
-    /// and is not required to be exact or a permissible heuristic.
-    /// The binding passed to the method contains the values assigned to the variables so far.
+    /// Estimates the number of candidate values for `variable` given the
+    /// current partial `binding`.
     ///
-    /// If the variable is not used by the constraint, the method should return `None`.
+    /// Returns `None` when `variable` is not constrained by this constraint.
+    /// The estimate need not be exact — it guides variable ordering, not
+    /// correctness. Tighter estimates lead to better search pruning; see the
+    /// [Atreides join](crate) family for how different estimate fidelities
+    /// affect performance.
     fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize>;
 
-    /// Propose values for a variable that match the constraint.
-    /// This is used by the query engine to explore the search space.
-    /// The method should add values to the `proposals` vector that match the constraint.
-    /// The binding passed to the method contains the values assigned to the variables so far.
+    /// Enumerates candidate values for `variable` into `proposals`.
     ///
-    /// If the variable is not used by the constraint, the method should do nothing.
+    /// Called on the constraint with the lowest estimate for the variable
+    /// being bound. Values are appended to `proposals`; the engine may
+    /// already have values in the vector from a previous round.
+    ///
+    /// Does nothing when `variable` is not constrained by this constraint.
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>);
 
-    /// Confirm a value for a variable that matches the constraint.
-    /// This is used by the query engine to prune the search space, and confirm that a value satisfies the constraint.
-    /// The method should remove values from the `proposals` vector that do not match the constraint.
-    /// The binding passed to the method contains the values assigned to the variables so far.
+    /// Filters `proposals` to remove values for `variable` that violate
+    /// this constraint.
     ///
-    /// If the variable is not used by the constraint, the method should do nothing.
+    /// Called on every constraint *except* the one that proposed, in order
+    /// of increasing estimate. Implementations remove entries from
+    /// `proposals` that are inconsistent with the current `binding`.
+    ///
+    /// Does nothing when `variable` is not constrained by this constraint.
     fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>);
 
-    /// Check whether this constraint is consistent with the current binding.
+    /// Returns whether this constraint is consistent with the current
+    /// `binding`.
     ///
-    /// Returns `false` when all of the constraint's variables are already
-    /// bound and the constraint can determine that no solution exists for
-    /// those bindings (e.g. a triple that does not exist in the dataset).
-    /// The default implementation optimistically returns `true`.
+    /// The default implementation returns `true`. Override this when the
+    /// constraint can cheaply detect that no solution exists — for example,
+    /// a [`TribleSetConstraint`](crate::trible::tribleset::triblesetconstraint::TribleSetConstraint)
+    /// whose entity, attribute, and value are all bound but the triple is
+    /// absent from the dataset.
     ///
-    /// Composite constraints (intersection, union) override this to
-    /// propagate unsatisfiability from their children so that dead
-    /// branches are pruned even when the unsatisfied sub-constraint
-    /// does not share variables with the variable currently being
-    /// explored.
+    /// Composite constraints propagate this check to their children:
+    /// [`IntersectionConstraint`](crate::query::intersectionconstraint::IntersectionConstraint)
+    /// requires *all* children to be satisfied, while
+    /// [`UnionConstraint`](crate::query::unionconstraint::UnionConstraint)
+    /// requires *at least one*. The union uses this to skip dead variants
+    /// in propose and confirm, preventing values from a satisfied variant
+    /// from leaking through a dead one.
     fn satisfied(&self, _binding: &Binding) -> bool {
         true
     }
 
-    /// Return the set of variables potentially influenced when the passed
-    /// variable is bound or unbound.
+    /// Returns the set of variables whose estimates may change when
+    /// `variable` is bound or unbound.
     ///
-    /// By default this includes all variables used by the constraint except the
-    /// queried one when the constraint contains the variable, otherwise the set
-    /// is empty.
+    /// The default includes every variable this constraint touches except
+    /// `variable` itself. Returns an empty set when `variable` is not part
+    /// of this constraint.
     fn influence(&self, variable: VariableId) -> VariableSet {
         let mut vars = self.variables();
         if vars.is_set(variable) {

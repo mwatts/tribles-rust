@@ -20,14 +20,18 @@ use std::str::Utf8Error;
 /// This error occurs when the string is too long or contains an interior NUL byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FromStrError {
+    /// The string exceeds 32 bytes when encoded as UTF-8.
     TooLong,
+    /// The string contains a NUL byte, which is used as the terminator.
     InteriorNul,
 }
 
 /// Errors that can occur when validating a [`ShortString`] value.
 #[derive(Debug)]
 pub enum ValidationError {
+    /// Non-zero bytes appear after the first NUL.
     InteriorNul,
+    /// The byte sequence before the terminator is not valid UTF-8.
     Utf8(Utf8Error),
 }
 
