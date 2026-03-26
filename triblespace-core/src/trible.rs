@@ -296,14 +296,35 @@ impl Trible {
     }
 }
 
-crate::key_segmentation!(TribleSegmentation, TRIBLE_LEN, [16, 16, 32]);
+crate::key_segmentation!(
+    /// Segment layout for a 64-byte trible: 16-byte entity, 16-byte attribute, 32-byte value.
+    TribleSegmentation, TRIBLE_LEN, [16, 16, 32]
+);
 
-crate::key_schema!(EAVOrder, TribleSegmentation, TRIBLE_LEN, [0, 1, 2]);
-crate::key_schema!(EVAOrder, TribleSegmentation, TRIBLE_LEN, [0, 2, 1]);
-crate::key_schema!(AEVOrder, TribleSegmentation, TRIBLE_LEN, [1, 0, 2]);
-crate::key_schema!(AVEOrder, TribleSegmentation, TRIBLE_LEN, [1, 2, 0]);
-crate::key_schema!(VEAOrder, TribleSegmentation, TRIBLE_LEN, [2, 0, 1]);
-crate::key_schema!(VAEOrder, TribleSegmentation, TRIBLE_LEN, [2, 1, 0]);
+crate::key_schema!(
+    /// Key schema ordering: Entity → Attribute → Value.
+    EAVOrder, TribleSegmentation, TRIBLE_LEN, [0, 1, 2]
+);
+crate::key_schema!(
+    /// Key schema ordering: Entity → Value → Attribute.
+    EVAOrder, TribleSegmentation, TRIBLE_LEN, [0, 2, 1]
+);
+crate::key_schema!(
+    /// Key schema ordering: Attribute → Entity → Value.
+    AEVOrder, TribleSegmentation, TRIBLE_LEN, [1, 0, 2]
+);
+crate::key_schema!(
+    /// Key schema ordering: Attribute → Value → Entity.
+    AVEOrder, TribleSegmentation, TRIBLE_LEN, [1, 2, 0]
+);
+crate::key_schema!(
+    /// Key schema ordering: Value → Entity → Attribute.
+    VEAOrder, TribleSegmentation, TRIBLE_LEN, [2, 0, 1]
+);
+crate::key_schema!(
+    /// Key schema ordering: Value → Attribute → Entity.
+    VAEOrder, TribleSegmentation, TRIBLE_LEN, [2, 1, 0]
+);
 
 #[cfg(test)]
 mod tests {

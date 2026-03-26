@@ -36,16 +36,27 @@ use crate::import::json::{
 type ParsedString = View<str>;
 
 attributes! {
+    /// Node kind tag (one of the `kind_*` constants).
     "D78B9D5A96029FDBBB327E377418AF51" as pub kind: GenId;
+    /// String content stored as a LongString blob.
     "40BC51924FD5D2058A48D1FA6073F871" as pub string: Handle<Blake3, LongString>;
+    /// Raw decimal number string (preserves precision).
     "428E02672FFD0D010D95AE641ADE1730" as pub number_raw: Handle<Blake3, LongString>;
+    /// Boolean value.
     "6F43FC771207574BF4CC58D3080C313C" as pub boolean: Boolean;
+    /// Parent entity of an object field entry.
     "97A4ACD83EC9EA29EE7E487BB058C437" as pub field_parent: GenId;
+    /// Field name stored as a LongString blob.
     "2B9FCF2A60C9B05FADDA9F022762B822" as pub field_name: Handle<Blake3, LongString>;
+    /// Ordinal position of a field within its parent object.
     "38C7B1CDEA580DE70A520B2C8CBC4F14" as pub field_index: U256BE;
+    /// Value entity referenced by an object field entry.
     "6E6CA175F925B6AA0844D357B409F15A" as pub field_value: GenId;
+    /// Parent entity of an array entry.
     "B49E6499D0A2CF5DD9A1E72D9D047747" as pub array_parent: GenId;
+    /// Zero-based index of an array element.
     "D5DA41A093BD0DE490925126D1150B57" as pub array_index: U256BE;
+    /// Value entity referenced by an array entry.
     "33535F41827B476B1EC0CACECE9BEED0" as pub array_value: GenId;
 }
 

@@ -147,7 +147,8 @@ macro_rules! key_segmentation {
         <[()]>::len(&[$($crate::key_segmentation!(@sub $e)),*])
     };
     (@sub $e:expr) => { () };
-    ($name:ident, $len:expr, [$($seg_len:expr),+ $(,)?]) => {
+    ($(#[$meta:meta])* $name:ident, $len:expr, [$($seg_len:expr),+ $(,)?]) => {
+        $(#[$meta])*
         #[derive(Copy, Clone, Debug)]
         pub struct $name;
         impl $name {
@@ -166,7 +167,8 @@ macro_rules! key_schema {
         <[()]>::len(&[$($crate::key_schema!(@sub $e)),*])
     };
     (@sub $e:expr) => { () };
-    ($name:ident, $seg:ty, $len:expr, [$($perm:expr),+ $(,)?]) => {
+    ($(#[$meta:meta])* $name:ident, $seg:ty, $len:expr, [$($perm:expr),+ $(,)?]) => {
+        $(#[$meta])*
         #[derive(Copy, Clone, Debug)]
         pub struct $name;
         impl $crate::patch::KeySchema<$len> for $name {
