@@ -2,6 +2,7 @@
 //! It is not intended to be used in practice.
 
 use crate::prelude::*;
+/// Example attribute namespace modelling literary works and their authors.
 pub mod literature {
     #![allow(unused)]
     use super::*;

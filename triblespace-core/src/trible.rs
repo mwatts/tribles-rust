@@ -13,9 +13,13 @@ use crate::id::Id;
 use crate::value::Value;
 use crate::value::ValueSchema;
 
+/// Re-export of [`Fragment`](fragment::Fragment).
 pub use fragment::Fragment;
+/// Re-export of [`Spread`](spread::Spread).
 pub use spread::Spread;
+/// Re-export of [`TribleSet`](tribleset::TribleSet).
 pub use tribleset::TribleSet;
+/// Re-export of [`TribleSetFingerprint`](tribleset::TribleSetFingerprint).
 pub use tribleset::TribleSetFingerprint;
 
 /// The length of a trible in bytes.
@@ -48,6 +52,7 @@ pub type RawTrible = [u8; TRIBLE_LEN];
 #[derive(Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
 #[repr(transparent)]
 pub struct Trible {
+    /// The raw 64-byte EAV content of this trible.
     pub data: RawTrible,
 }
 

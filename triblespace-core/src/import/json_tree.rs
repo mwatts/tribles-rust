@@ -74,6 +74,8 @@ pub const kind_field: Id = id_hex!("890FC1F34B9FAD18F93E6EDF1B69A1A2");
 #[allow(non_upper_case_globals)]
 pub const kind_array_entry: Id = id_hex!("EB325EABEA8C35DE7E5D700A5EF9207B");
 
+/// Returns a [`Fragment`] describing the lossless JSON tree schema —
+/// all node kinds, attribute definitions, and value/blob schema metadata.
 pub fn build_json_tree_metadata<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
 where
     B: BlobStore<Blake3>,
@@ -201,6 +203,8 @@ where
     Store: BlobStore<Blake3>,
     Hasher: HashProtocol,
 {
+    /// Creates a new lossless importer backed by `store`. Pass an optional
+    /// 32-byte salt to namespace the content-addressed entity ids.
     pub fn new(store: &'a mut Store, id_salt: Option<[u8; 32]>) -> Self {
         Self {
             store,
@@ -209,10 +213,13 @@ where
         }
     }
 
+    /// Imports a JSON string. Convenience wrapper around [`import_blob`](Self::import_blob).
     pub fn import_str(&mut self, input: &str) -> Result<Fragment, JsonImportError> {
         self.import_blob(input.to_owned().to_blob())
     }
 
+    /// Imports a JSON document from a [`LongString`] blob, returning a
+    /// [`Fragment`] rooted at the document's top-level node.
     pub fn import_blob(&mut self, blob: Blob<LongString>) -> Result<Fragment, JsonImportError> {
         let mut data = TribleSet::new();
         let mut bytes = blob.bytes.clone();
@@ -225,6 +232,8 @@ where
         Ok(Fragment::rooted(root, data))
     }
 
+    /// Returns schema metadata for the lossless JSON tree format.
+    /// Delegates to [`build_json_tree_metadata`].
     pub fn metadata(&mut self) -> Result<Fragment, Store::PutError> {
         build_json_tree_metadata(self.store)
     }

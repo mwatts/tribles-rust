@@ -23,10 +23,21 @@ use crate::value::Value;
 use anybytes::View;
 use ryu::Buffer;
 
+/// Error returned by [`export_to_json`].
 #[derive(Debug)]
 pub enum ExportError {
-    MissingBlob { hash: String },
-    BlobStore { hash: String, source: String },
+    /// The blob handle has no corresponding entry in the blob store.
+    MissingBlob {
+        /// Hex-encoded hash of the missing blob.
+        hash: String,
+    },
+    /// The blob store returned an error while loading the blob.
+    BlobStore {
+        /// Hex-encoded hash of the blob.
+        hash: String,
+        /// Stringified underlying error.
+        source: String,
+    },
 }
 
 impl fmt::Display for ExportError {

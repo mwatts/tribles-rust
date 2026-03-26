@@ -129,4 +129,5 @@ macro_rules! or {
     )
 }
 
+/// Re-export of the [`or!`] macro.
 pub use or;

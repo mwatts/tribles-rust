@@ -32,6 +32,7 @@ pub enum ValidationError {
 }
 
 impl From<SignatureError> for ValidationError {
+    /// Converts an Ed25519 signature error into a [`ValidationError::FailedValidation`].
     fn from(_: SignatureError) -> Self {
         ValidationError::FailedValidation
     }

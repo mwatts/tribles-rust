@@ -1,16 +1,28 @@
 //! This is a collection of Rust types that can be (de)serialized as [crate::prelude::Value]s.
 
+/// Boolean value schema (all-zero / all-one encoding).
 pub mod boolean;
+/// Ed25519 signature component and public key schemas.
 pub mod ed25519;
+/// 256-bit IEEE-like floating point schemas (little-endian and big-endian).
 pub mod f256;
+/// IEEE-754 double-precision floating point schema.
 pub mod f64;
+/// Opaque 128-bit identifier schema.
 pub mod genid;
+/// Cryptographic hash and typed blob handle schemas.
 pub mod hash;
+/// 256-bit signed and unsigned integer schemas (little-endian and big-endian).
 pub mod iu256;
+/// Line/column source location schema.
 pub mod linelocation;
+/// 256-bit rational number schemas (little-endian and big-endian).
 pub mod r256;
+/// Range schemas for pairs of `u128` values.
 pub mod range;
+/// Inline UTF-8 short string schema (up to 32 bytes).
 pub mod shortstring;
+/// TAI nanosecond interval schema.
 pub mod time;
 
 use crate::id::ExclusiveId;

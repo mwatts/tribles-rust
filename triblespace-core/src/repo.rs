@@ -109,12 +109,18 @@
 //! These parallels should help readers leverage their Git knowledge when
 //! working with trible repositories.
 //!
+/// Branch metadata construction and signature verification.
 pub mod branch;
+/// Commit metadata construction and signature verification.
 pub mod commit;
+/// Storage adapter that delegates blobs and branches to separate backends.
 pub mod hybridstore;
+/// Fully in-memory repository implementation for tests and ephemeral use.
 pub mod memoryrepo;
 #[cfg(feature = "object-store")]
+/// Repository backed by an `object_store`-compatible remote (S3, local FS, etc.).
 pub mod objectstore;
+/// Local file-based pile storage backend.
 pub mod pile;
 
 /// Trait for storage backends that require explicit close/cleanup.

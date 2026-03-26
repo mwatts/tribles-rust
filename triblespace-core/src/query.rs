@@ -15,13 +15,21 @@
 //! For a tour of the language see the "Query Language" chapter in the book.
 //! Conceptual background on schemas and join strategy appears in the
 //! "Query Engine" and "Atreides Join" chapters.
+/// [`ConstantConstraint`](constantconstraint::ConstantConstraint) — pins a variable to a single value.
 pub mod constantconstraint;
+/// [`KeysConstraint`](hashmapconstraint::KeysConstraint) — constrains a variable to HashMap keys.
 pub mod hashmapconstraint;
+/// [`SetConstraint`](hashsetconstraint::SetConstraint) — constrains a variable to HashSet members.
 pub mod hashsetconstraint;
+/// [`IgnoreConstraint`](ignore::IgnoreConstraint) — hides variables from the outer query.
 pub mod ignore;
+/// [`IntersectionConstraint`](intersectionconstraint::IntersectionConstraint) — logical AND.
 pub mod intersectionconstraint;
+/// [`PatchValueConstraint`](patchconstraint::PatchValueConstraint) and [`PatchIdConstraint`](patchconstraint::PatchIdConstraint) — constrains variables to PATCH entries.
 pub mod patchconstraint;
+/// [`RegularPathConstraint`](regularpathconstraint::RegularPathConstraint) — regular path expressions over graphs.
 pub mod regularpathconstraint;
+/// [`UnionConstraint`](unionconstraint::UnionConstraint) — logical OR.
 pub mod unionconstraint;
 mod variableset;
 
@@ -32,6 +40,7 @@ use std::marker::PhantomData;
 
 use arrayvec::ArrayVec;
 use constantconstraint::*;
+/// Re-export of [`IgnoreConstraint`](ignore::IgnoreConstraint).
 pub use ignore::IgnoreConstraint;
 
 use crate::value::schemas::genid::GenId;
@@ -39,8 +48,11 @@ use crate::value::RawValue;
 use crate::value::Value;
 use crate::value::ValueSchema;
 
+/// Re-export of [`PathOp`](regularpathconstraint::PathOp).
 pub use regularpathconstraint::PathOp;
+/// Re-export of [`RegularPathConstraint`](regularpathconstraint::RegularPathConstraint).
 pub use regularpathconstraint::RegularPathConstraint;
+/// Re-export of [`VariableSet`](variableset::VariableSet).
 pub use variableset::VariableSet;
 
 /// Types storing tribles can implement this trait to expose them to queries.
@@ -74,6 +86,7 @@ pub type VariableId = usize;
 /// This allows for the creation of new anonymous variables in higher-level query languages.
 #[derive(Debug)]
 pub struct VariableContext {
+    /// The index that will be assigned to the next variable.
     pub next_index: VariableId,
 }
 
@@ -115,6 +128,7 @@ impl VariableContext {
 /// found by the query engine.
 #[derive(Debug)]
 pub struct Variable<T: ValueSchema> {
+    /// The integer index identifying this variable in the [`Binding`].
     pub index: VariableId,
     typed: PhantomData<T>,
 }
@@ -128,6 +142,7 @@ impl<T: ValueSchema> Clone for Variable<T> {
 }
 
 impl<T: ValueSchema> Variable<T> {
+    /// Creates a variable with the given index.
     pub fn new(index: VariableId) -> Self {
         Variable {
             index,
@@ -135,6 +150,11 @@ impl<T: ValueSchema> Variable<T> {
         }
     }
 
+    /// Extracts the bound value for this variable from `binding`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the variable has not been bound.
     pub fn extract(self, binding: &Binding) -> &Value<T> {
         let raw = binding.get(self.index).unwrap_or_else(|| {
             panic!(
@@ -150,6 +170,7 @@ impl<T: ValueSchema> Variable<T> {
 /// The returned constraint will filter the values assigned to the variable
 /// to only those that are contained in the collection.
 pub trait ContainsConstraint<'a, T: ValueSchema> {
+    /// The concrete constraint type produced by [`has`](ContainsConstraint::has).
     type Constraint: Constraint<'a>;
 
     /// Create a constraint that filters the values assigned to the variable
@@ -179,12 +200,13 @@ impl<T: ValueSchema> Variable<T> {
 /// It is not intended to be used as a long-term storage for query results.
 #[derive(Clone, Debug)]
 pub struct Binding {
+    /// Bitset tracking which variables have been assigned a value.
     pub bound: VariableSet,
     values: [RawValue; 128],
 }
 
 impl Binding {
-    /// Create a new empty binding.
+    /// Binds `variable` to `value`.
     pub fn set(&mut self, variable: VariableId, value: &RawValue) {
         self.values[variable] = *value;
         self.bound.set(variable);
@@ -669,6 +691,7 @@ macro_rules! find {
         }
     };
 }
+/// Re-export of the [`find!`] macro.
 pub use find;
 
 #[macro_export]
@@ -677,6 +700,7 @@ macro_rules! exists {
         $crate::query::find!(($($vars)*), $Constraint).next().is_some()
     };
 }
+/// Re-export of the [`exists!`] macro.
 pub use exists;
 
 #[macro_export]
@@ -695,6 +719,7 @@ macro_rules! temp {
         )
     }};
 }
+/// Re-export of the [`temp!`] macro.
 pub use temp;
 
 #[cfg(test)]

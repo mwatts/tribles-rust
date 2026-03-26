@@ -26,6 +26,7 @@ use crate::value::Value;
 use crate::value::ValueSchema;
 use succinctarchiveconstraint::*;
 
+/// Re-export all universe types and traits.
 pub use universe::*;
 
 use std::convert::TryInto;
@@ -668,6 +669,7 @@ where
     }
 }
 
+/// Error returned when deserializing a [`SuccinctArchiveBlob`] into a [`SuccinctArchive`].
 pub struct SuccinctArchiveError;
 
 impl std::error::Error for SuccinctArchiveError {}

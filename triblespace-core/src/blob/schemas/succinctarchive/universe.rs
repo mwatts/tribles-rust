@@ -14,11 +14,15 @@ use jerky::int_vectors::{Access, DacsByte, NumVals};
 use jerky::serialization::Serializable;
 use quick_cache::sync::Cache;
 
+/// Maps between raw 32-byte values and compact integer codes used by the
+/// [`SuccinctArchive`](super::SuccinctArchive) wavelet matrices.
 pub trait Universe: Serializable {
+    /// Builds a universe from a sorted, deduplicated iterator of raw values.
     fn with_sorted_dedup<I>(values: I, sections: &mut SectionWriter<'_>) -> Self
     where
         I: Iterator<Item = RawValue>;
 
+    /// Builds a universe from an arbitrary iterator, sorting and deduplicating internally.
     fn with<I>(iter: I, sections: &mut SectionWriter<'_>) -> Self
     where
         I: Iterator<Item = RawValue>,
@@ -29,14 +33,22 @@ pub trait Universe: Serializable {
         Self::with_sorted_dedup(values.into_iter(), sections)
     }
 
+    /// Returns the raw value at integer code `pos`.
     fn access(&self, pos: usize) -> RawValue;
+    /// Returns the integer code for `v`, or `None` if absent.
     fn search(&self, v: &RawValue) -> Option<usize>;
+    /// Returns the number of distinct values in the universe.
     fn len(&self) -> usize;
+    /// Returns `true` if the universe contains no values.
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
 }
 
+/// Universe backed by a flat sorted array of raw values.
+///
+/// Access and search are O(1) and O(log n) respectively. Simple to
+/// construct but uses 32 bytes per distinct value.
 #[derive(Debug, Clone)]
 pub struct OrderedUniverse {
     values: View<[RawValue]>,
@@ -79,11 +91,13 @@ impl OrderedUniverse {
         Self { values, handle }
     }
 
+    /// Returns the number of values in this universe.
     #[inline]
     pub fn len(&self) -> usize {
         self.values.len()
     }
 
+    /// Returns `true` if this universe contains no values.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
@@ -107,6 +121,11 @@ impl Serializable for OrderedUniverse {
     }
 }
 
+/// Universe that splits each 32-byte value into eight 4-byte fragments,
+/// frequency-sorts them, and stores indices via a DACs byte sequence.
+///
+/// This yields significantly better compression than [`OrderedUniverse`]
+/// when many values share common 4-byte fragments (e.g. sequential IDs).
 #[derive(Debug, Clone)]
 pub struct CompressedUniverse {
     fragments: View<[[u8; 4]]>,
@@ -185,10 +204,13 @@ impl Universe for CompressedUniverse {
     }
 }
 
+/// Serialisation metadata header for a [`CompressedUniverse`].
 #[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
 #[repr(C)]
 pub struct CompressedUniverseMeta {
+    /// Section handle pointing to the fragment dictionary.
     pub fragments: SectionHandle<[u8; 4]>,
+    /// DACs byte metadata for the fragment-index sequence.
     pub data: DacsByteMeta,
 }
 
@@ -214,6 +236,10 @@ impl Serializable for CompressedUniverse {
     }
 }
 
+/// Wrapper that adds LRU caches around an inner [`Universe`].
+///
+/// `ACCESS_CACHE` sets the capacity for `access` lookups and
+/// `SEARCH_CACHE` for `search` lookups.
 #[derive(Debug)]
 pub struct CachedUniverse<const ACCESS_CACHE: usize, const SEARCH_CACHE: usize, U: Universe> {
     access_cache: Cache<usize, RawValue>,

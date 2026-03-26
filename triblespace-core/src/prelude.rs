@@ -28,7 +28,9 @@
 //! things, `triblespace` allows you to build consistent distributed systems.
 //!
 
+/// Re-exports of blob schema types.
 pub mod blobschemas;
+/// Re-exports of value schema types.
 pub mod valueschemas;
 
 pub use crate::attribute::{Attribute, AttributeUsage, AttributeUsageSource};

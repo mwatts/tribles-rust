@@ -32,11 +32,27 @@ use crate::value::schemas::hash::{Blake3, Handle, HashProtocol};
 use crate::value::schemas::UnknownValue;
 use crate::value::{RawValue, ToValue, Value, ValueSchema};
 
+/// Error returned by [`JsonObjectImporter`] when importing a JSON document.
 #[derive(Debug)]
 pub enum JsonImportError {
+    /// The document root is a primitive (string, number, bool, null) — only
+    /// objects and arrays of objects are accepted.
     PrimitiveRoot,
-    EncodeString { field: String, source: EncodeError },
-    EncodeNumber { field: String, source: EncodeError },
+    /// A string field could not be encoded into the target value schema.
+    EncodeString {
+        /// Name of the JSON field.
+        field: String,
+        /// Underlying encoding error.
+        source: EncodeError,
+    },
+    /// A number field could not be encoded into the target value schema.
+    EncodeNumber {
+        /// Name of the JSON field.
+        field: String,
+        /// Underlying encoding error.
+        source: EncodeError,
+    },
+    /// The JSON input is syntactically invalid.
     Syntax(String),
 }
 
@@ -66,10 +82,12 @@ impl std::error::Error for JsonImportError {
     }
 }
 
+/// Opaque wrapper around a value-encoding error during JSON import.
 #[derive(Debug)]
 pub struct EncodeError(Box<dyn std::error::Error + Send + Sync + 'static>);
 
 impl EncodeError {
+    /// Creates an encode error from a plain message string.
     pub fn message(message: impl Into<String>) -> Self {
         #[derive(Debug)]
         struct Message(String);
@@ -89,6 +107,7 @@ impl EncodeError {
         self.0.as_ref()
     }
 
+    /// Wraps an existing error as an encode error.
     pub fn from_error(err: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self(Box::new(err))
     }
@@ -199,6 +218,8 @@ where
         Ok(attr)
     }
 
+    /// Creates a new importer backed by `store`. Pass an optional 32-byte
+    /// salt to namespace the deterministic entity ids.
     pub fn new(store: &'a mut Store, id_salt: Option<[u8; 32]>) -> Self {
         Self {
             store,
@@ -212,10 +233,13 @@ where
         }
     }
 
+    /// Imports a JSON string. Convenience wrapper around [`import_blob`](Self::import_blob).
     pub fn import_str(&mut self, input: &str) -> Result<Fragment, JsonImportError> {
         self.import_blob(input.to_owned().to_blob())
     }
 
+    /// Imports a JSON document from a [`LongString`] blob, returning a
+    /// [`Fragment`] with the root entity ids as exports.
     pub fn import_blob(&mut self, blob: Blob<LongString>) -> Result<Fragment, JsonImportError> {
         let mut bytes = blob.bytes.clone();
         self.skip_ws(&mut bytes);
@@ -462,6 +486,8 @@ where
         parse_number_common(bytes)
     }
 
+    /// Returns a [`Fragment`] describing every attribute and schema
+    /// encountered so far, suitable for committing alongside the data.
     pub fn metadata(&mut self) -> Result<Fragment, Store::PutError> {
         let mut meta = Fragment::default();
         meta += <Boolean as ConstDescribe>::describe(self.store)?;
@@ -503,6 +529,8 @@ where
         Ok(meta)
     }
 
+    /// Resets the cached attribute mappings. Call between unrelated import
+    /// batches if you want field names to be re-derived.
     pub fn clear(&mut self) {
         self.bool_attrs.clear();
         self.num_attrs.clear();

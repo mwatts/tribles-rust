@@ -121,4 +121,5 @@ macro_rules! and {
     )
 }
 
+/// Re-export of the [`and!`] macro.
 pub use and;

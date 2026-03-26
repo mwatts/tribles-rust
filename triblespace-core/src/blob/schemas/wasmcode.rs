@@ -62,4 +62,5 @@ impl ToBlob<WasmCode> for &[u8] {
 }
 
 #[cfg(feature = "wasm")]
+/// Runtime support for executing [`WasmCode`] modules.
 pub mod runtime;

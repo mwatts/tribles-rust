@@ -12,6 +12,7 @@
 #![allow(unstable_name_collisions)]
 
 mod branch;
+/// Byte-indexed lookup tables used by PATCH branch nodes.
 pub mod bytetable;
 mod entry;
 mod leaf;
@@ -19,9 +20,11 @@ mod leaf;
 use arrayvec::ArrayVec;
 
 use branch::*;
+/// Re-export of [`Entry`](entry::Entry).
 pub use entry::Entry;
 use leaf::*;
 
+/// Re-export of all byte table utilities.
 pub use bytetable::*;
 use rand::thread_rng;
 use rand::RngCore;
@@ -1324,6 +1327,7 @@ pub struct PATCHIterator<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
 }
 
 impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> PATCHIterator<'a, KEY_LEN, O, V> {
+    /// Creates an iterator over all keys in `patch`.
     pub fn new(patch: &'a PATCH<KEY_LEN, O, V>) -> Self {
         let mut r = PATCHIterator {
             stack: ArrayVec::new(),

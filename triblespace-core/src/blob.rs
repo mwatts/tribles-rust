@@ -10,6 +10,7 @@
 
 mod cache;
 mod memoryblobstore;
+/// Built-in blob schema types and their conversion implementations.
 pub mod schemas;
 
 use crate::metadata::ConstId;
@@ -25,9 +26,12 @@ use std::fmt::{self};
 use std::hash::Hash;
 use std::marker::PhantomData;
 
+/// Re-export of the blob cache wrapper.
 pub use cache::BlobCache;
+/// Re-export of the in-memory blob store.
 pub use memoryblobstore::MemoryBlobStore;
 
+/// Re-export of `anybytes::Bytes` for blob payloads.
 pub use anybytes::Bytes;
 
 /// A blob is a immutable sequence of bytes that can be used to represent any kind of data.

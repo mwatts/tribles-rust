@@ -74,6 +74,7 @@
 //! assert_eq!(i, 42);
 //! ```
 
+/// Built-in value schema types and their conversion implementations.
 pub mod schemas;
 
 use crate::metadata::ConstId;

@@ -2,8 +2,11 @@
 //!
 //! For a deeper discussion see the [Identifiers](../book/src/deep-dive/identifiers.md) chapter of the Tribles Book.
 
+/// Fast Unsafe Compressible ID generation.
 pub mod fucid;
+/// Random Number Generated ID generation.
 pub mod rngid;
+/// Universal Forgettable Ordered ID generation.
 pub mod ufoid;
 
 use std::borrow::Borrow;
@@ -20,10 +23,15 @@ use std::ops::Deref;
 
 use hex::FromHex;
 
+/// Re-export of [`fucid::fucid`].
 pub use fucid::fucid;
+/// Re-export of [`fucid::FUCIDsource`].
 pub use fucid::FUCIDsource;
+/// Alias for [`rngid`] — generates a random 128-bit identifier.
 pub use rngid::rngid as genid;
+/// Re-export of [`rngid::rngid`].
 pub use rngid::rngid;
+/// Re-export of [`ufoid::ufoid`].
 pub use ufoid::ufoid;
 
 use crate::patch::Entry;
@@ -257,6 +265,7 @@ macro_rules! id_hex {
     };
 }
 
+/// Re-export of the [`id_hex!`] macro for use in other modules.
 pub use id_hex;
 
 /// Represents an ID that can only be used by a single writer at a time.

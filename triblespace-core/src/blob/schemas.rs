@@ -1,9 +1,14 @@
 //! This is a collection of Rust types that can be (de)serialized as [crate::prelude::Blob]s.
 
+/// Raw file bytes blob schema.
 pub mod filebytes;
+/// Arbitrary-length UTF-8 text blob schema.
 pub mod longstring;
+/// Canonical trible sequence blob schema.
 pub mod simplearchive;
+/// Succinct (Ring-based) compressed trible archive blob schema.
 pub mod succinctarchive;
+/// WebAssembly bytecode blob schema.
 pub mod wasmcode;
 
 use anybytes::Bytes;

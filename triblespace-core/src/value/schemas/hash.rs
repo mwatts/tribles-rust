@@ -26,6 +26,7 @@ use std::marker::PhantomData;
 /// This trait is implemented by hash functions that can be in a value schema
 /// for example via a [struct@Hash] or a [Handle].
 pub trait HashProtocol: Digest<OutputSize = U32> + Clone + Send + 'static + ConstDescribe {
+    /// Short lowercase name used in serialised representations (e.g. `"blake3"`).
     const NAME: &'static str;
 }
 
