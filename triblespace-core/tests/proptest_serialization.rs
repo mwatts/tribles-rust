@@ -1,0 +1,112 @@
+use proptest::prelude::*;
+use proptest::collection::vec;
+use triblespace_core::blob::ToBlob;
+use triblespace_core::prelude::*;
+use triblespace_core::trible::Trible;
+
+fn arb_trible() -> impl Strategy<Value = Trible> {
+    (
+        prop::array::uniform16(1u8..=255),
+        prop::array::uniform16(1u8..=255),
+        prop::array::uniform32(any::<u8>()),
+    )
+        .prop_map(|(e, a, v)| {
+            let mut data = [0u8; 64];
+            data[0..16].copy_from_slice(&e);
+            data[16..32].copy_from_slice(&a);
+            data[32..64].copy_from_slice(&v);
+            Trible::force_raw(data).expect("non-nil e and a")
+        })
+}
+
+fn arb_tribleset(max: usize) -> impl Strategy<Value = TribleSet> {
+    vec(arb_trible(), 0..max).prop_map(|tribles| {
+        let mut set = TribleSet::new();
+        for t in &tribles {
+            set.insert(t);
+        }
+        set
+    })
+}
+
+proptest! {
+    // ── SimpleArchive round-trip ───────────────────────────────────────
+
+    #[test]
+    fn simple_archive_roundtrip(set in arb_tribleset(20)) {
+        let blob = set.clone().to_blob();
+        let restored: TribleSet = blob.try_from_blob()
+            .expect("valid archive should deserialize");
+        prop_assert_eq!(set, restored);
+    }
+
+    #[test]
+    fn simple_archive_preserves_len(set in arb_tribleset(20)) {
+        let blob = set.clone().to_blob();
+        let restored: TribleSet = blob.try_from_blob().unwrap();
+        prop_assert_eq!(set.len(), restored.len());
+    }
+
+    #[test]
+    fn simple_archive_empty_roundtrip(_dummy in 0..1u8) {
+        let empty = TribleSet::new();
+        let blob = empty.clone().to_blob();
+        let restored: TribleSet = blob.try_from_blob().unwrap();
+        prop_assert_eq!(empty, restored);
+    }
+
+    #[test]
+    fn simple_archive_ref_roundtrip(set in arb_tribleset(20)) {
+        // Test the &TribleSet -> blob path too
+        let blob = (&set).to_blob();
+        let restored: TribleSet = blob.try_from_blob().unwrap();
+        prop_assert_eq!(set, restored);
+    }
+
+    #[test]
+    fn simple_archive_union_then_serialize(
+        a in arb_tribleset(10),
+        b in arb_tribleset(10),
+    ) {
+        let union = a.clone() + b.clone();
+        let blob = union.clone().to_blob();
+        let restored: TribleSet = blob.try_from_blob().unwrap();
+        prop_assert_eq!(union.clone(), restored);
+
+        // Also verify union of deserialized parts equals deserialized union
+        let a_blob = a.clone().to_blob();
+        let b_blob = b.clone().to_blob();
+        let a_restored: TribleSet = a_blob.try_from_blob().unwrap();
+        let b_restored: TribleSet = b_blob.try_from_blob().unwrap();
+        let parts_union = a_restored + b_restored;
+        prop_assert_eq!(union, parts_union);
+    }
+
+    // ── Trible raw round-trip ──────────────────────────────────────────
+
+    #[test]
+    fn trible_force_raw_roundtrip(t in arb_trible()) {
+        let raw = t.data;
+        let restored = Trible::force_raw(raw).expect("valid trible");
+        prop_assert_eq!(t, restored);
+    }
+
+    #[test]
+    fn trible_accessors_consistent(t in arb_trible()) {
+        // e(), a(), v() should reconstruct the original data
+        let e = t.e();
+        let a = t.a();
+        prop_assert_eq!(&t.data[0..16], &e[..]);
+        prop_assert_eq!(&t.data[16..32], &a[..]);
+    }
+
+    // ── TribleSet deterministic serialization ──────────────────────────
+
+    #[test]
+    fn simple_archive_deterministic(set in arb_tribleset(15)) {
+        let blob1 = set.clone().to_blob();
+        let blob2 = set.to_blob();
+        prop_assert_eq!(blob1.bytes.as_ref(), blob2.bytes.as_ref(),
+            "same set should produce identical archive bytes");
+    }
+}
