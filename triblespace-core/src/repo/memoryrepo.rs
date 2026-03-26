@@ -21,7 +21,9 @@ use crate::value::ValueSchema;
 /// required.
 #[derive(Default)]
 pub struct MemoryRepo {
+    /// In-memory blob store for all repository blobs.
     pub blobs: MemoryBlobStore<Blake3>,
+    /// Map from branch id to the handle of its current head commit.
     pub branches: HashMap<Id, Value<Handle<Blake3, SimpleArchive>>>,
 }
 

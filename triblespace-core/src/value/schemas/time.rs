@@ -79,7 +79,9 @@ mod wasm_formatter {
 /// The lower bound exceeds the upper bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvertedIntervalError {
+    /// The lower bound that was greater than `upper`.
     pub lower: i128,
+    /// The upper bound that was less than `lower`.
     pub upper: i128,
 }
 

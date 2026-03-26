@@ -32,7 +32,7 @@ impl ConstId for F256BE {
     const ID: Id = id_hex!("A629176D4656928D96B155038F9F2220");
 }
 
-/// A type alias for the little-endian version of the 256-bit floating point number.
+/// Type alias for [`F256LE`], the default little-endian 256-bit float schema.
 pub type F256 = F256LE;
 
 impl ConstDescribe for F256LE {

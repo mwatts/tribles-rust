@@ -73,6 +73,7 @@ impl<H> fmt::Debug for ObjectStoreReader<H> {
     }
 }
 
+/// Read-only handle into an [`ObjectStoreRemote`] that can be cloned and shared.
 #[derive(Clone)]
 pub struct ObjectStoreReader<H> {
     store: Arc<dyn ObjectStore>,
@@ -81,6 +82,7 @@ pub struct ObjectStoreReader<H> {
     _hasher: PhantomData<H>,
 }
 
+/// Iterator that bridges an async [`Stream`] into blocking iteration via a bounded channel.
 pub struct BlockingIter<T> {
     rx: Receiver<T>,
 }
@@ -406,9 +408,12 @@ where
     }
 }
 
+/// Error returned when retrieving a blob from the object store.
 #[derive(Debug)]
 pub enum GetBlobErr<E: Error> {
+    /// The underlying object store operation failed.
     Store(object_store::Error),
+    /// The blob bytes could not be converted to the requested type.
     Conversion(E),
 }
 
@@ -460,10 +465,14 @@ where
     }
 }
 
+/// Error returned when listing blobs from the object store.
 #[derive(Debug)]
 pub enum ListBlobsErr {
+    /// The underlying list operation failed.
     List(object_store::Error),
+    /// A listed object had no filename component.
     NotAFile(&'static str),
+    /// A listed object's filename was not valid hexadecimal.
     BadNameHex(<RawValue as FromHex>::Error),
 }
 
@@ -478,11 +487,16 @@ impl fmt::Display for ListBlobsErr {
 }
 impl Error for ListBlobsErr {}
 
+/// Error returned when listing branches from the object store.
 #[derive(Debug)]
 pub enum ListBranchesErr {
+    /// The underlying list operation failed.
     List(object_store::Error),
+    /// A listed object had no filename component.
     NotAFile(&'static str),
+    /// A listed object's filename was not valid hexadecimal.
     BadNameHex(<RawId as FromHex>::Error),
+    /// The decoded bytes represent the nil identifier.
     BadId,
 }
 
@@ -498,9 +512,12 @@ impl fmt::Display for ListBranchesErr {
 }
 impl Error for ListBranchesErr {}
 
+/// Error returned when reading a branch head from the object store.
 #[derive(Debug)]
 pub enum PullBranchErr {
+    /// The stored bytes could not be parsed as a valid handle.
     ValidationErr(TryFromSliceError),
+    /// The underlying object store operation failed.
     StoreErr(object_store::Error),
 }
 
@@ -527,9 +544,12 @@ impl From<TryFromSliceError> for PullBranchErr {
     }
 }
 
+/// Error returned when updating a branch head in the object store.
 #[derive(Debug)]
 pub enum PushBranchErr {
+    /// The stored bytes could not be parsed as a valid handle during a compare-and-swap.
     ValidationErr(TryFromSliceError),
+    /// The underlying object store operation failed.
     StoreErr(object_store::Error),
 }
 

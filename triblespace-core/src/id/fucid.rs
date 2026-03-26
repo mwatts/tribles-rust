@@ -5,6 +5,11 @@ use std::cell::RefCell;
 use super::ExclusiveId;
 use super::Id;
 
+/// Generator for Fast Unsafe Compressible IDs (FUCIDs).
+///
+/// Each source holds a random salt and an incrementing counter. Sequential ids
+/// from the same source differ by only a few bits, enabling efficient
+/// compression while remaining globally unique with high probability.
 pub struct FUCIDsource {
     salt: u128,
     counter: u128,
@@ -17,6 +22,7 @@ impl Default for FUCIDsource {
 }
 
 impl FUCIDsource {
+    /// Creates a new source with a randomly chosen salt.
     pub fn new() -> Self {
         Self {
             salt: {
@@ -30,6 +36,7 @@ impl FUCIDsource {
         }
     }
 
+    /// Returns the next unique [`ExclusiveId`] from this source.
     pub fn mint(&mut self) -> ExclusiveId {
         let next_id = self.counter ^ self.salt;
         self.counter += 1;

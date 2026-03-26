@@ -21,9 +21,13 @@ use crate::value::Value;
 use crate::value::schemas::hash::Blake3;
 use hifitime::Epoch;
 
+/// Error returned when commit signature verification fails.
 pub enum ValidationError {
+    /// The metadata contains multiple signature entities for the same commit.
     AmbiguousSignature,
+    /// No signature information was found in the metadata.
     MissingSignature,
+    /// The signature did not match the commit bytes or the public key was invalid.
     FailedValidation,
 }
 

@@ -1,6 +1,7 @@
 use ed25519::ComponentBytes;
 use ed25519::Signature;
 use ed25519_dalek::SignatureError;
+/// Re-export of the Ed25519 verifying (public) key type from `ed25519_dalek`.
 pub use ed25519_dalek::VerifyingKey;
 
 use crate::id::ExclusiveId;
@@ -177,12 +178,14 @@ mod wasm_formatter {
 }
 
 impl ED25519RComponent {
+    /// Extracts the R component from a full Ed25519 signature.
     pub fn from_signature(s: Signature) -> Value<ED25519RComponent> {
         Value::new(*s.r_bytes())
     }
 }
 
 impl ED25519SComponent {
+    /// Extracts the S component from a full Ed25519 signature.
     pub fn from_signature(s: Signature) -> Value<ED25519SComponent> {
         Value::new(*s.s_bytes())
     }

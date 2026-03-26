@@ -46,6 +46,13 @@ use jerky::char_sequences::wavelet_matrix::WaveletMatrixMeta;
 use jerky::char_sequences::{WaveletMatrix, WaveletMatrixBuilder};
 use jerky::serialization::{Metadata, Serializable};
 
+/// Blob schema for a succinct archive — a compressed, query-friendly trible
+/// index built from wavelet matrices and bit vectors.
+///
+/// Build from a [`TribleSet`] via [`ToBlob`], then query through
+/// [`SuccinctArchive`] and its [`Constraint`](crate::query::Constraint)
+/// implementation. Suitable for large, read-heavy datasets where compact
+/// storage and fast scans matter more than incremental updates.
 pub struct SuccinctArchiveBlob;
 
 impl BlobSchema for SuccinctArchiveBlob {}
@@ -74,25 +81,48 @@ impl ConstDescribe for SuccinctArchiveBlob {
 
 #[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
 #[repr(C)]
+/// Serialisation metadata header for a [`SuccinctArchive`].
+///
+/// Stored at the start of the blob; the `D` parameter captures the
+/// domain (universe) metadata layout.
 pub struct SuccinctArchiveMeta<D: Metadata> {
+    /// Number of distinct entities in the archive.
     pub entity_count: usize,
+    /// Number of distinct attributes in the archive.
     pub attribute_count: usize,
+    /// Number of distinct values in the archive.
     pub value_count: usize,
+    /// Domain (universe) metadata — maps integer codes to raw values.
     pub domain: D,
+    /// Entity-axis prefix bit vector metadata.
     pub e_a: BitVectorDataMeta,
+    /// Attribute-axis prefix bit vector metadata.
     pub a_a: BitVectorDataMeta,
+    /// Value-axis prefix bit vector metadata.
     pub v_a: BitVectorDataMeta,
+    /// First-occurrence markers for (entity, attribute) pairs.
     pub changed_e_a: BitVectorDataMeta,
+    /// First-occurrence markers for (entity, value) pairs.
     pub changed_e_v: BitVectorDataMeta,
+    /// First-occurrence markers for (attribute, entity) pairs.
     pub changed_a_e: BitVectorDataMeta,
+    /// First-occurrence markers for (attribute, value) pairs.
     pub changed_a_v: BitVectorDataMeta,
+    /// First-occurrence markers for (value, entity) pairs.
     pub changed_v_e: BitVectorDataMeta,
+    /// First-occurrence markers for (value, attribute) pairs.
     pub changed_v_a: BitVectorDataMeta,
+    /// EAV wavelet matrix — values indexed by entity→attribute order.
     pub eav_c: WaveletMatrixMeta,
+    /// VEA wavelet matrix — attributes indexed by value→entity order.
     pub vea_c: WaveletMatrixMeta,
+    /// AVE wavelet matrix — entities indexed by attribute→value order.
     pub ave_c: WaveletMatrixMeta,
+    /// VAE wavelet matrix — entities indexed by value→attribute order.
     pub vae_c: WaveletMatrixMeta,
+    /// EVA wavelet matrix — attributes indexed by entity→value order.
     pub eva_c: WaveletMatrixMeta,
+    /// AEV wavelet matrix — values indexed by attribute→entity order.
     pub aev_c: WaveletMatrixMeta,
 }
 
@@ -123,17 +153,31 @@ where
     builder.freeze::<Rank9SelIndex>()
 }
 
+/// Deserialized succinct archive — six wavelet matrices with prefix bit
+/// vectors and pair-change markers, backed by a shared `Bytes` buffer.
+///
+/// Implements [`Constraint`](crate::query::Constraint) via
+/// `TriblePattern::pattern`, so it can be used directly in `find!` and
+/// `pattern!` queries alongside regular [`TribleSet`]s.
 #[derive(Debug, Clone)]
 pub struct SuccinctArchive<U> {
+    /// The underlying blob bytes (shared, zero-copy).
     pub bytes: Bytes,
+    /// Domain mapping from integer codes to raw 32-byte values.
     pub domain: U,
 
+    /// Number of distinct entities.
     pub entity_count: usize,
+    /// Number of distinct attributes.
     pub attribute_count: usize,
+    /// Number of distinct values.
     pub value_count: usize,
 
+    /// Entity-axis prefix bit vector.
     pub e_a: BitVector<Rank9SelIndex>,
+    /// Attribute-axis prefix bit vector.
     pub a_a: BitVector<Rank9SelIndex>,
+    /// Value-axis prefix bit vector.
     pub v_a: BitVector<Rank9SelIndex>,
 
     /// Bit vector marking the first occurrence of each `(entity, attribute)` pair
@@ -155,11 +199,17 @@ pub struct SuccinctArchive<U> {
     /// in `vae_c`.
     pub changed_v_a: BitVector<Rank9SelIndex>,
 
+    /// EAV wavelet matrix — values indexed by entity→attribute order.
     pub eav_c: WaveletMatrix<Rank9SelIndex>,
+    /// VEA wavelet matrix — attributes indexed by value→entity order.
     pub vea_c: WaveletMatrix<Rank9SelIndex>,
+    /// AVE wavelet matrix — entities indexed by attribute→value order.
     pub ave_c: WaveletMatrix<Rank9SelIndex>,
+    /// VAE wavelet matrix — entities indexed by value→attribute order.
     pub vae_c: WaveletMatrix<Rank9SelIndex>,
+    /// EVA wavelet matrix — attributes indexed by entity→value order.
     pub eva_c: WaveletMatrix<Rank9SelIndex>,
+    /// AEV wavelet matrix — values indexed by attribute→entity order.
     pub aev_c: WaveletMatrix<Rank9SelIndex>,
 }
 
@@ -167,6 +217,8 @@ impl<U> SuccinctArchive<U>
 where
     U: Universe,
 {
+    /// Iterates over all tribles by walking the EAV wavelet matrix and
+    /// resolving each triple through the domain mapping.
     pub fn iter<'a>(&'a self) -> impl Iterator<Item = Trible> + 'a {
         (0..self.eav_c.len()).map(move |v_i| {
             let v = self.eav_c.access(v_i).unwrap();
@@ -243,6 +295,7 @@ where
         })
     }
 
+    /// Returns the serialization metadata header for this archive.
     pub fn meta(&self) -> SuccinctArchiveMeta<U::Meta>
     where
         U: Serializable,

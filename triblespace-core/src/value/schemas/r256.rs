@@ -45,6 +45,7 @@ impl ConstId for R256BE {
     const ID: Id = id_hex!("CA5EAF567171772C1FFD776E9C7C02D1");
 }
 
+/// A type alias for the default (little-endian) variant of the 256-bit ratio schema.
 pub type R256 = R256LE;
 
 impl ConstDescribe for R256LE {
@@ -161,7 +162,9 @@ impl ValueSchema for R256BE {
 /// or by a zero denominator.
 #[derive(Debug)]
 pub enum RatioError {
+    /// The stored numerator/denominator pair is not in reduced (coprime) form.
     NonCanonical(i128, i128),
+    /// The denominator is zero, which is invalid for a ratio.
     ZeroDenominator,
 }
 
