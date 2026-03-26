@@ -403,4 +403,171 @@ proptest! {
                 "missing entity {} from transitive closure", i);
         }
     }
+
+    #[test]
+    fn path_reflexive_closure_includes_start(
+        chain_len in 2..5usize,
+    ) {
+        let mut set = TribleSet::new();
+        let entities: Vec<_> = (0..chain_len).map(|_| rngid()).collect();
+
+        for i in 0..chain_len - 1 {
+            set += entity! { &entities[i] @ test_ns::link: &entities[i + 1] };
+        }
+
+        // star (*) includes the start node itself
+        let start_val = (&entities[0]).to_value();
+        let results: Vec<(Value<_>, Value<_>)> = find!(
+            (s: Value<_>, d: Value<_>),
+            and!(s.is(start_val), path!(set.clone(), s test_ns::link* d))
+        ).collect();
+
+        // Should find start + all reachable = chain_len total
+        prop_assert_eq!(results.len(), chain_len,
+            "expected {} (start + reachable), got {}", chain_len, results.len());
+        // Start must be in results
+        prop_assert!(results.iter().any(|(_, d)| *d == start_val),
+            "reflexive closure missing start node");
+    }
+
+    #[test]
+    fn path_alternation_union_of_both(
+        n_links in 1..4usize,
+        n_labels in 1..4usize,
+    ) {
+        let mut set = TribleSet::new();
+        let root = rngid();
+        let mut link_targets = Vec::new();
+        let mut label_targets = Vec::new();
+
+        // Root links to some entities via `link`
+        for _ in 0..n_links {
+            let target = rngid();
+            set += entity! { &root @ test_ns::link: &target };
+            link_targets.push((&target).to_value());
+        }
+        // Root links to other entities via `label` (as GenId, reusing the attr)
+        // Actually let's use link for one set and build a second attribute
+        // Simpler: just test that alternation of the same attr equals itself
+        for _ in 0..n_labels {
+            let target = rngid();
+            set += entity! { &root @ test_ns::label: "x" };
+            // Use link for the second set too but with different targets
+            let t2 = rngid();
+            set += entity! { &t2 @ test_ns::link: &target };
+            label_targets.push(target);
+        }
+
+        // Single hop via link
+        let root_val = (&root).to_value();
+        let link_results: Vec<(Value<_>, Value<_>)> = find!(
+            (s: Value<_>, d: Value<_>),
+            and!(s.is(root_val), path!(set.clone(), s test_ns::link d))
+        ).collect();
+
+        // link | link should equal link (idempotent alternation)
+        let alt_results: Vec<(Value<_>, Value<_>)> = find!(
+            (s: Value<_>, d: Value<_>),
+            and!(s.is(root_val), path!(set.clone(), s (test_ns::link | test_ns::link) d))
+        ).collect();
+
+        prop_assert_eq!(link_results.len(), alt_results.len(),
+            "idempotent alternation should match single: {} vs {}", link_results.len(), alt_results.len());
+    }
+
+    // ── VariableSet algebra ────────────────────────────────────────────
+
+    #[test]
+    fn variableset_union_commutative(a_bits: u128, b_bits: u128) {
+        let a = unsafe { std::mem::transmute::<u128, triblespace_core::query::VariableSet>(a_bits) };
+        let b = unsafe { std::mem::transmute::<u128, triblespace_core::query::VariableSet>(b_bits) };
+        prop_assert_eq!(a.union(b), b.union(a));
+    }
+
+    #[test]
+    fn variableset_intersect_commutative(a_bits: u128, b_bits: u128) {
+        let a = unsafe { std::mem::transmute::<u128, triblespace_core::query::VariableSet>(a_bits) };
+        let b = unsafe { std::mem::transmute::<u128, triblespace_core::query::VariableSet>(b_bits) };
+        prop_assert_eq!(a.intersect(b), b.intersect(a));
+    }
+
+    #[test]
+    fn variableset_demorgan_union(a_bits: u128, b_bits: u128) {
+        // ¬(A ∪ B) = ¬A ∩ ¬B
+        let a = unsafe { std::mem::transmute::<u128, triblespace_core::query::VariableSet>(a_bits) };
+        let b = unsafe { std::mem::transmute::<u128, triblespace_core::query::VariableSet>(b_bits) };
+        prop_assert_eq!(
+            a.union(b).complement(),
+            a.complement().intersect(b.complement())
+        );
+    }
+
+    #[test]
+    fn variableset_demorgan_intersect(a_bits: u128, b_bits: u128) {
+        // ¬(A ∩ B) = ¬A ∪ ¬B
+        let a = unsafe { std::mem::transmute::<u128, triblespace_core::query::VariableSet>(a_bits) };
+        let b = unsafe { std::mem::transmute::<u128, triblespace_core::query::VariableSet>(b_bits) };
+        prop_assert_eq!(
+            a.intersect(b).complement(),
+            a.complement().union(b.complement())
+        );
+    }
+
+    #[test]
+    fn variableset_subtract_is_intersect_complement(a_bits: u128, b_bits: u128) {
+        // A \ B = A ∩ ¬B
+        let a = unsafe { std::mem::transmute::<u128, triblespace_core::query::VariableSet>(a_bits) };
+        let b = unsafe { std::mem::transmute::<u128, triblespace_core::query::VariableSet>(b_bits) };
+        prop_assert_eq!(
+            a.subtract(b),
+            a.intersect(b.complement())
+        );
+    }
+
+    #[test]
+    fn variableset_count_matches_drain(bits: u128) {
+        let vs = unsafe { std::mem::transmute::<u128, triblespace_core::query::VariableSet>(bits) };
+        let count = vs.count();
+        let mut copy = vs;
+        let mut drained = 0;
+        while copy.drain_next_ascending().is_some() {
+            drained += 1;
+        }
+        prop_assert_eq!(count, drained);
+    }
+
+    // ── Binding set/get/unset ──────────────────────────────────────────
+
+    #[test]
+    fn binding_set_get_roundtrip(idx in 0..128usize, value: [u8; 32]) {
+        let mut binding = Binding::default();
+        binding.set(idx, &value);
+        let got = binding.get(idx);
+        prop_assert_eq!(got, Some(&value));
+    }
+
+    #[test]
+    fn binding_unset_removes(idx in 0..128usize, value: [u8; 32]) {
+        let mut binding = Binding::default();
+        binding.set(idx, &value);
+        binding.unset(idx);
+        prop_assert_eq!(binding.get(idx), None);
+    }
+
+    #[test]
+    fn binding_independent_variables(
+        i in 0..64usize,
+        j in 64..128usize,
+        vi: [u8; 32],
+        vj: [u8; 32],
+    ) {
+        let mut binding = Binding::default();
+        binding.set(i, &vi);
+        binding.set(j, &vj);
+        prop_assert_eq!(binding.get(i), Some(&vi));
+        prop_assert_eq!(binding.get(j), Some(&vj));
+        binding.unset(i);
+        prop_assert_eq!(binding.get(i), None);
+        prop_assert_eq!(binding.get(j), Some(&vj)); // j unaffected
+    }
 }
