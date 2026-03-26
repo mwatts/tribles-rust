@@ -26,6 +26,36 @@ pub mod telemetry;
 #[path = "../proofs/mod.rs"]
 mod proofs;
 
+#[cfg(doctest)]
+mod book_doctests {
+    #[doc = include_str!("../book/src/query-language.md")]
+    pub struct QueryLanguage;
+    #[doc = include_str!("../book/src/patterns-and-recipes.md")]
+    pub struct PatternsAndRecipes;
+    #[doc = include_str!("../book/src/schemas.md")]
+    pub struct Schemas;
+    #[doc = include_str!("../book/src/commit-selectors.md")]
+    pub struct CommitSelectors;
+    #[doc = include_str!("../book/src/descriptive_types.md")]
+    pub struct DescriptiveTypes;
+    #[doc = include_str!("../book/src/repository-workflows.md")]
+    pub struct RepositoryWorkflows;
+    #[doc = include_str!("../book/src/getting-started.md")]
+    pub struct GettingStarted;
+    #[doc = include_str!("../book/src/incremental-queries.md")]
+    pub struct IncrementalQueries;
+    #[doc = include_str!("../book/src/query-engine.md")]
+    pub struct QueryEngine;
+    #[doc = include_str!("../book/src/importing-data-formats.md")]
+    pub struct ImportingDataFormats;
+    #[doc = include_str!("../book/src/garbage-collection.md")]
+    pub struct GarbageCollection;
+    #[doc = include_str!("../book/src/pile-blob-metadata.md")]
+    pub struct PileBlobMetadata;
+    #[doc = include_str!("../book/src/pile-format.md")]
+    pub struct PileFormat;
+}
+
 // Keep the README example here so the facade crate exercises the public API as
 // consumers see it while `triblespace-core` stays lean for proc-macro usage.
 #[cfg(test)]

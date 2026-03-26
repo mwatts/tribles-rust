@@ -53,13 +53,13 @@ type is [`Infallible`](core::convert::Infallible).
 
 [refresh]: ../../src/repo/pile.rs
 
-```rust,no_run
+```rust,ignore
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anybytes::Bytes;
-use triblespace::blob::schemas::UnknownBlob;
-use triblespace::blob::Blob;
-use triblespace::repo::pile::Pile;
+use triblespace::core::blob::schemas::UnknownBlob;
+use triblespace::core::blob::Blob;
+use triblespace::core::repo::pile::Pile;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pile = Pile::open("/tmp/example.pile")?;

@@ -33,7 +33,7 @@ Because the range semantics differ slightly from Git, you can wrap the start
 boundary in `ancestors` to reproduce Git's set-difference behaviour when parity
 is required: `ancestors(a)..b` matches `git log a..b`.
 
-```rust
+```rust,ignore
 // Check out the entire history of the current branch
 let history = ws.checkout(ancestors(ws.head()))?;
 
@@ -104,8 +104,8 @@ helpers when you want to combine selectors without writing a custom
 `CommitSelector` implementation. Each helper accepts any selector combination
 and returns the corresponding `CommitSet`:
 
-```rust
-use tribles::repo::{ancestors, difference, intersect, union};
+```rust,ignore
+use triblespace::core::repo::{ancestors, difference, intersect, union};
 
 // Everything reachable from either branch tip.
 let combined = ws.checkout(union(ancestors(main), ancestors(feature)))?;
@@ -126,9 +126,9 @@ layers a time window with an entity filter before handing the selector to
 `Workspace::checkout`, and the follow-up demonstrates the built-in
 `intersect` selector to combine two existing selectors.
 
-```rust
+```rust,ignore
 use hifitime::Epoch;
-use tribles::repo::{filter, history_of, intersect, time_range};
+use triblespace::core::repo::{filter, history_of, intersect, time_range};
 
 let cutoff = Epoch::from_unix_seconds(1_701_696_000.0); // 2023-12-01
 let recent = filter(time_range(cutoff, Epoch::now().unwrap()), |_, payload| {
@@ -153,7 +153,7 @@ which a user provided closure returns `true`. The closure receives the commit
 metadata and its payload, allowing inspection of authors, timestamps or the
 data itself. Selectors compose, so you can further narrow a range:
 
-```rust
+```rust,ignore
 use hifitime::Epoch;
 use triblespace::core::repo::{filter, time_range};
 
@@ -167,7 +167,7 @@ let recent = ws.checkout(filter(time_range(since, now), |_, payload| {
 Higher level helpers can build on this primitive. For example `history_of(entity)` filters
 `ancestors(HEAD)` to commits touching a specific entity:
 
-```rust
+```rust,ignore
 let changes = ws.checkout(history_of(my_entity))?;
 ```
 
@@ -221,9 +221,9 @@ interval defaults to `(now, now)` but other tools could provide a wider range
 if the clock precision is uncertain. The `TimeRange` selector uses this interval
 to gather commits whose timestamps fall between two `Epoch` values:
 
-```rust
+```rust,ignore
 use hifitime::Epoch;
-use triblespace::repo::time_range;
+use triblespace::core::repo::time_range;
 
 let since = Epoch::from_unix_seconds(1_609_459_200.0); // 2020-12-01
 let now = Epoch::now().unwrap();

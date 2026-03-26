@@ -24,10 +24,10 @@ book data, publishes the first commit with automatic retries, and finally shows
 how to use `try_push` when you want to inspect and reconcile a conflict
 manually.
 
-```rust
+```rust,ignore
 use triblespace::prelude::*;
 use triblespace::prelude::blobschemas::LongString;
-use triblespace::repo::{memoryrepo::MemoryRepo, Repository};
+use triblespace::core::repo::{memoryrepo::MemoryRepo, Repository};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 
@@ -164,7 +164,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 literature::firstname: ?first
             }])
         ) {
-            println!("Collaborator kept the name '{}'.", first.from_value::<&str>());
+            println!("Collaborator kept the name '{}'.", first.try_from_value::<&str>().unwrap());
         }
 
         ws.merge(&mut conflict_ws)

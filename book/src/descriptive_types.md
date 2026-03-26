@@ -97,7 +97,7 @@ read-only helpers) rather than opening new repositories inside hot paths.
 
 Example (pseudocode):
 
-```rust
+```rust,ignore
 // manager owns a Repository for the process/session lifetime
 let mut repo = manager.repo_mut();
 let branch_id = manager.default_branch_id;
@@ -134,7 +134,7 @@ find! invocation.
 
 Example: find plan snapshot ids (match tag directly)
 
-```rust
+```rust,ignore
 // Match entities that have the canonical plan snapshot tag attached.
 for (e,) in find!((e: Id), triblespace::pattern!(&content, [{ ?e @ metadata::tag: (KIND_PLAN_SNAPSHOT) }])) {
     // `e` is a plan snapshot entity id; follow-up finds can read other fields
@@ -143,11 +143,11 @@ for (e,) in find!((e: Id), triblespace::pattern!(&content, [{ ?e @ metadata::tag
 
 Worked example: composing a structural pattern
 
-```rust
+```rust,ignore
 // Grab all active plans with a title and owner.
 for (plan_id, title, owner) in find!(
     (plan_id: Id, title: ShortString, owner: Id),
-    tribles::pattern!(&content, [
+    triblespace::pattern!(&content, [
         { ?plan_id @ metadata::tag: (KIND_PLAN) },
         { ?plan_id plan::status: (plan::STATUS_ACTIVE) },
         { ?plan_id plan::title: ?title },
@@ -179,13 +179,13 @@ they obscure which fields are actually used and quickly devolve into an
 unofficial schema. Treat any adapter as an opt-in shim that exists purely at
 integration boundaries where consumers refuse to speak tribles primitives.
 
-```rust
+```rust,ignore
 fn handle_plan_update(ws: &mut Workspace<Pile<Blake3>>, plan_id: Id) -> io::Result<()> {
     // ad-hoc find! calls to read the fields we need
     let checkout = ws.checkout()?;
 
     if let Some((title,)) =
-        find!((title: ShortString), tribles::pattern!(&checkout, [{ ?plan_id plan::title: ?title }]))
+        find!((title: ShortString), triblespace::pattern!(&checkout, [{ ?plan_id plan::title: ?title }]))
             .next()
     {
         // The returned tuple is already typed. Convert to an owned String only if
@@ -201,7 +201,7 @@ If you cannot avoid exposing a typed facade (for example because an external
 API insists on receiving a struct), keep the struct tiny, document that it is a
 legacy shim, and derive it straight from a find! tuple:
 
-```rust
+```rust,ignore
 struct PlanSummary<'a> {
     id: Id,
     title: &'a str,
@@ -211,7 +211,7 @@ fn load_plan_summary<'a>(ws: &'a mut Workspace<Pile<Blake3>>, plan_id: Id) -> io
     let content = ws.checkout()?;
     Ok(find!(
         (title: ShortString),
-        tribles::pattern!(&content, [{ ?plan_id plan::title: ?title }])
+        triblespace::pattern!(&content, [{ ?plan_id plan::title: ?title }])
     )
     .next()
     .map(|(title,)| PlanSummary {
@@ -231,7 +231,7 @@ external interface forces your hand.
 Blob schema types in tribles are intentionally zerocopy. Prefer the
 typed View API which returns a borrowed &str without copying when possible.
 
-```rust
+```rust,ignore
 let view = ws
     .get::<View<str>, LongString>(handle)
     .map_err(|e| ...)?; // `handle` is a Value<Handle<Blake3, LongString>>
@@ -268,7 +268,7 @@ writers. Two options are available:
 - Manual conflict handling with `try_push` (single attempt; returns a
   conflicting workspace on CAS failure):
 
-```rust
+```rust,ignore
 ws.commit(content, "plan-update");
 let mut current_ws = ws;
 while let Some(mut incoming) = repo.try_push(&mut current_ws)? {
@@ -280,7 +280,7 @@ while let Some(mut incoming) = repo.try_push(&mut current_ws)? {
 - Automatic retries with `push` (convenience wrapper that merges and retries
   until success or error):
 
-```rust
+```rust,ignore
 ws.commit(content, "plan-update");
 // `push` will handle merge+retry internally; it returns Ok(()) on success
 // or an error if the operation ultimately failed.

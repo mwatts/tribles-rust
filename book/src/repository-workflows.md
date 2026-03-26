@@ -101,7 +101,7 @@ workspaces on it. Each workspace holds its own staging area, so remember to push
 before sharing work or starting another task.
 
 
-```rust
+```rust,ignore
 let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())?;
 let branch_id = repo.create_branch("main", None).expect("create branch");
 
@@ -114,7 +114,7 @@ contention and attempt to merge, while `try_push` performs a single attempt and
 returns `Ok(Some(conflict_ws))` when the branch head moved. Choose the latter
 when you need explicit conflict handling:
 
-```rust
+```rust,ignore
 ws.commit(change, "initial commit");
 repo.push(&mut ws)?;
 ```
@@ -140,7 +140,7 @@ letting a human collaborator keep theirs:
 ```rust,ignore
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use triblespace::repo::Repository;
+use triblespace::core::repo::Repository;
 
 let alice = SigningKey::generate(&mut OsRng);
 let automation = SigningKey::generate(&mut OsRng);
@@ -180,7 +180,7 @@ treating missing endpoints as empty (`..b`) or the current `HEAD` (`a..` and
 `..`). These selectors compose with filters, so you can slice history to only
 the entities you care about.
 
-```rust
+```rust,ignore
 let history = ws.checkout(commit_a..commit_b)?;
 let full = ws.checkout(ancestors(commit_b))?;
 ```
@@ -189,7 +189,7 @@ The [`history_of`](../src/repo.rs) helper builds on the `filter` selector to
 retrieve only the commits affecting a specific entity. Commit selectors are
 covered in more detail in the next chapter:
 
-```rust
+```rust,ignore
 let entity_changes = ws.checkout(history_of(my_entity))?;
 ```
 
@@ -207,13 +207,13 @@ retrieves them again with strongly typed and raw views. In practice you might
 use this pattern to attach schema migrations, binary artifacts, or other payloads
 that should travel with the commit:
 
-```rust
+```rust,ignore
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use triblespace::blob::Blob;
-use triblespace::examples::{self, literature};
+use triblespace::core::blob::Blob;
+use triblespace::core::examples::{self, literature};
 use triblespace::prelude::*;
-use triblespace::repo::{self, memoryrepo::MemoryRepo, Repository};
+use triblespace::core::repo::{self, memoryrepo::MemoryRepo, Repository};
 use blobschemas::{LongString, SimpleArchive};
 
 let storage = MemoryRepo::default();
@@ -226,11 +226,11 @@ let quote_handle = ws.put("Fear is the mind-killer".to_owned());
 let archive_handle = ws.put(&examples::dataset());
 
 // Embed the handles inside the change set that will be committed.
-let mut change = triblespace::entity! {
+let mut change = entity! {
     literature::title: "Dune (annotated)",
     literature::quote: quote_handle.clone(),
 };
-change += triblespace::entity! { repo::content: archive_handle.clone() };
+change += entity! { repo::content: archive_handle.clone() };
 
 ws.commit(change, "Attach annotated dataset");
 // Single-attempt push. Use `push` to let the repository merge and retry automatically.
@@ -269,7 +269,7 @@ There are two ways to handle this:
   attempts a CAS update once. If the branch advanced concurrently it returns
   `Ok(Some(conflict_ws))` so callers can merge and retry explicitly:
 
-```rust
+```rust,ignore
 ws.commit(content, "codex-turn");
 let mut current_ws = ws;
 while let Some(mut incoming) = repo.try_push(&mut current_ws)? {
@@ -283,7 +283,7 @@ while let Some(mut incoming) = repo.try_push(&mut current_ws)? {
   loop for you. Call this when you prefer the repository to handle conflicts
   automatically; it either succeeds (returns `Ok(())`) or returns an error.
 
-```rust
+```rust,ignore
 ws.commit(content, "codex-turn");
 repo.push(&mut ws)?; // will internally merge and retry until success
 ```

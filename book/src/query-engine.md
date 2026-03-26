@@ -110,9 +110,10 @@ engine.[^3]
 ```rust
 use std::collections::HashSet;
 
-use tribles::examples::literature;
-use tribles::prelude::*;
-use tribles::prelude::valueschemas::ShortString;
+use triblespace::core::examples::literature;
+use triblespace::core::query::ContainsConstraint;
+use triblespace::prelude::*;
+use triblespace::prelude::valueschemas::ShortString;
 
 fn main() {
     let mut kb = TribleSet::new();
@@ -136,11 +137,11 @@ fn main() {
         and!(
             allowed.has(firstname),
             pattern!(&kb, [{
-                ?person @
+                _?person @
                     literature::firstname: ?firstname,
                     literature::lastname: "Herbert",
             }, {
-                literature::author: ?person,
+                literature::author: _?person,
                 literature::title: ?title,
             }])
         )

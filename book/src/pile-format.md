@@ -96,14 +96,14 @@ Branch updates only record the referenced hash and do not verify that the
 corresponding blob exists in the pile, so a pile may act as a head-only store
 when blob data resides elsewhere.
 
-```rust,no_run
+```rust,ignore
 use std::error::Error;
 use std::path::PathBuf;
 
 use anybytes::Bytes;
-use tribles::prelude::*;
-use tribles::repo::pile::ReadError;
-use tribles::repo::BlobStoreMeta;
+use triblespace::prelude::*;
+use triblespace::core::repo::pile::ReadError;
+use triblespace::core::repo::BlobStoreMeta;
 
 fn add_blob(bytes: &[u8]) -> Result<(), Box<dyn Error>> {
     let path = PathBuf::from("data.pile");
@@ -147,7 +147,7 @@ Filesystems lacking atomic `write`/`vwrite` appends—such as some network or
 FUSE-based implementations—cannot safely host multiple writers and are not
 supported. Using such filesystems risks pile corruption.
 ## Blob Storage
-```
+```text
                              8 byte  8 byte
             ┌────16 byte───┐┌──────┐┌──────┐┌────────────32 byte───────────┐
           ┌ ┌──────────────┐┌──────┐┌──────┐┌──────────────────────────────┐
@@ -172,7 +172,7 @@ boundary. The [Pile Blob Metadata](./pile-blob-metadata.md) chapter explains how
 to query these fields through the `PileReader` API.
 
 ## Branch Storage
-```
+```text
             ┌────16 byte───┐┌────16 byte───┐┌────────────32 byte───────────┐
           ┌ ┌──────────────┐┌──────────────┐┌──────────────────────────────┐
  header   │ │magic number B││  branch id   ││             hash             │
@@ -184,7 +184,7 @@ exists locally, allowing deployments that store heads on disk while serving blob
 contents from a remote store.
 
 ## Branch Tombstones
-```
+```text
             ┌────16 byte───┐┌────16 byte───┐┌────────────32 byte───────────┐
           ┌ ┌──────────────┐┌──────────────┐┌──────────────────────────────┐
  header   │ │magic number C││  branch id   ││           reserved           │

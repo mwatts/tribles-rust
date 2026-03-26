@@ -41,21 +41,21 @@ domain‑specific error type keeps validation logic close to the serialization
 code.
 
 ```rust
-use tribles::value::schemas::shortstring::ShortString;
-use tribles::value::{TryFromValue, TryToValue, Value};
+use triblespace::core::value::schemas::shortstring::ShortString;
+use triblespace::core::value::{TryFromValue, TryToValue, Value};
 
 struct Username(String);
 
 impl TryToValue<ShortString> for Username {
     type Error = &'static str;
 
-    fn try_to_value(&self) -> Result<Value<ShortString>, Self::Error> {
+    fn try_to_value(self) -> Result<Value<ShortString>, Self::Error> {
         if self.0.is_empty() {
             Err("username must not be empty")
         } else {
             self.0
                 .as_str()
-                .try_to_value::<ShortString>()
+                .try_to_value()
                 .map_err(|_| "username too long or contains NULs")
         }
     }
@@ -108,11 +108,12 @@ The crate provides the following value schemas out of the box:
 - `UnknownValue` as a fallback when no specific schema is known.
 
 ```rust
+# use triblespace::prelude::*;
 use triblespace::core::metadata::ConstId;
 use triblespace::core::value::schemas::shortstring::ShortString;
 use triblespace::core::value::{ToValue, ValueSchema};
 
-let v = "hi".to_value::<ShortString>();
+let v: Value<ShortString> = "hi".to_value();
 let raw_bytes = v.raw; // Persist alongside the schema's metadata id.
 let schema_id = <ShortString as ConstId>::ID;
 ```
@@ -133,9 +134,9 @@ The crate also ships with these blob schemas:
 - `UnknownBlob` for data of unknown type.
 
 ```rust
-use triblespace::metadata::ConstId;
-use triblespace::blob::schemas::longstring::LongString;
-use triblespace::blob::{Blob, BlobSchema, ToBlob};
+use triblespace::core::metadata::ConstId;
+use triblespace::core::blob::schemas::longstring::LongString;
+use triblespace::core::blob::{Blob, BlobSchema, ToBlob};
 
 let b: Blob<LongString> = "example".to_blob();
 let schema_id = <LongString as ConstId>::ID;
@@ -216,7 +217,7 @@ Custom formats implement [`ValueSchema`] or [`BlobSchema`].  A unique identifier
 serves as the schema ID.  The example below defines a little-endian `u64` value
 schema and a simple blob schema for arbitrary bytes.
 
-```rust
+```rust,ignore
 {{#include ../../examples/custom_schema.rs:custom_schema}}
 ```
 

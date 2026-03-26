@@ -12,7 +12,7 @@ Every macro shown here is a convenience wrapper around a concrete
 [`Constraint`](crate::query::Constraint) implementation.  When you need finer
 control—or want to assemble constraints manually outside the provided
 macros—reach for the corresponding builder types in
-[`tribles::query`](crate::query).
+[`triblespace::query`](crate::query).
 
 ## Declaring a query
 
@@ -22,7 +22,7 @@ expression. The macro mirrors Datalog syntax: the head `((...))` lists the
 variables you want back, and the body describes the conditions they must meet.
 A minimal invocation looks like this:
 
-```rust
+```rust,ignore
 let results = find!((a), a.is(1.into())).collect::<Vec<_>>();
 ```
 
@@ -33,7 +33,7 @@ collections.
 When the head declares a **single variable**, omit the parentheses to get bare
 values instead of 1-tuples:
 
-```rust
+```rust,ignore
 for a in find!(a, a.is(1.into())) {
     println!("match: {a}");
 }
@@ -42,7 +42,7 @@ for a in find!(a, a.is(1.into())) {
 When the head declares **multiple variables**, wrap them in parentheses to get
 tuples:
 
-```rust
+```rust,ignore
 for (a, b) in find!((a, b), and!(a.is(1.into()), b.is(2.into()))) {
     println!("{a}, {b}");
 }
@@ -75,7 +75,7 @@ Append `?` to a variable to receive the raw
 through without filtering, matching Rust's `?` semantics of "bubble the error
 to the caller."
 
-```rust
+```rust,ignore
 // `x` is filtered (rows where conversion fails are skipped).
 // `y` is passed through as Result (no filtering).
 find!((x: i32, y: Value<ShortString>?),
@@ -135,7 +135,7 @@ clause: combine them with `and!` to narrow a variable after other constraints
 have proposed candidates, or place them inside `or!` branches to accept
 multiple literals.
 
-```rust
+```rust,ignore
 find!((title: Value<_>),
       and!(dataset.has(title), title.is("Dune".to_value())));
 ```
@@ -149,7 +149,7 @@ bindings without exposing them in the result tuple.
 values automatically, so you often get the same behaviour simply by writing the
 desired value in the pattern:
 
-```rust
+```rust,ignore
 find!((friend: Value<_>),
       pattern!(&dataset,
                [{ _?person @ social::friend: ?friend,
@@ -172,7 +172,7 @@ on.  The macro accepts any number of arguments, so `and!(...)` is often a
 convenient way to keep related clauses together without nesting additional
 `find!` calls:
 
-```rust
+```rust,ignore
 let favourites = favourite_titles(); // e.g. a HashSet<Id> built elsewhere
 find!((book: Value<_>, author: Value<_>),
       and!(favourites.has(book),
@@ -195,7 +195,7 @@ like an independent constraint and may introduce additional bindings that
 participate in the surrounding query, provided every branch mentions the same
 set of variables:
 
-```rust
+```rust,ignore
 find!((alias: Value<_>),
       temp!((entity),
             or!(pattern!(&dataset,
@@ -250,7 +250,7 @@ macro automatically uses the ambient context that `find!` or `exists!`
 provides, so typical invocations only specify the variable list and nested
 constraint:
 
-```rust
+```rust,ignore
 find!((person: Value<_>),
       ignore!((street_value),
               pattern!(&dataset, [{ ?person @ contacts::street: ?street_value }])));
@@ -272,7 +272,7 @@ not show up in the result tuple. Wrap the relevant constraint with
 `temp!((...vars...), expr)` to mint hidden variables and evaluate `expr` with
 them in scope:
 
-```rust
+```rust,ignore
 find!((person: Value<_>),
       temp!((friend),
             and!(pattern!(&dataset,
@@ -303,7 +303,7 @@ you need to reuse the same hidden binding across multiple patterns.
 
 ## Example
 
-```rust
+```rust,ignore
 use triblespace::prelude::*;
 use triblespace::examples::{self, literature};
 
@@ -320,7 +320,7 @@ variables and constraint can be adapted to express more complex joins and
 filters.  For instance, you can introduce additional variables to retrieve both
 the title and the author while sharing the same dataset predicate:
 
-```rust
+```rust,ignore
 for (title, author) in find!((title: Value<_>, author: Value<_>),
                              and!(title.is("Dune".to_value()),
                                   pattern!(&dataset,
@@ -347,6 +347,14 @@ multiple times within the same pattern without adding it to the `find!` head.
 Parenthesised expressions remain supported for explicit literals.
 
 ```rust
+# use triblespace::prelude::*;
+# mod literature {
+#     use triblespace::prelude::*;
+#     attributes! {
+#         "0DBB530B37B966D137C50B943700EDB2" as firstname: valueschemas::ShortString;
+#         "6BAA463FD4EAF45F6A103DB9433E4545" as lastname: valueschemas::ShortString;
+#     }
+# }
 let mut kb = TribleSet::new();
 let e = ufoid();
 kb += entity! { &e @ literature::firstname: "William", literature::lastname: "Shakespeare" };
@@ -361,6 +369,14 @@ attributes without introducing extra columns in the result set.  A single
 scoped to the pattern:
 
 ```rust
+# use triblespace::prelude::*;
+# mod literature {
+#     use triblespace::prelude::*;
+#     attributes! {
+#         "0DBB530B37B966D137C50B943700EDB2" as firstname: valueschemas::ShortString;
+#         "6BAA463FD4EAF45F6A103DB9433E4545" as lastname: valueschemas::ShortString;
+#     }
+# }
 let mut kb = TribleSet::new();
 let e = ufoid();
 kb += entity! { &e @ literature::firstname: "Frank", literature::lastname: "Herbert" };
@@ -380,6 +396,14 @@ To share a hidden binding across multiple patterns, declare it once with
 `temp!` and reference it with `?name` from each clause:
 
 ```rust
+# use triblespace::prelude::*;
+# mod social {
+#     use triblespace::prelude::*;
+#     attributes! {
+#         "A19EC1D9DD534BA9896223A457A6B9C9" as name: valueschemas::ShortString;
+#         "C21DE0AA5BA3446AB886C9640BA60244" as friend: valueschemas::GenId;
+#     }
+# }
 let mut kb = TribleSet::new();
 let alice = ufoid();
 let bob = ufoid();
@@ -403,7 +427,7 @@ joins the two constraints without changing the projected results. As above,
 Sometimes you only want to check whether a constraint has any solutions.  The
 `exists!` macro mirrors the `find!` syntax but returns a boolean:
 
-```rust
+```rust,ignore
 use triblespace::prelude::*;
 
 assert!(exists!((x), x.is(1.into())));
@@ -427,7 +451,7 @@ such as `has(...)` work with anything that implements
 against pre-existing indexes, caches, or service clients without copying data
 into a [`TribleSet`](crate::trible::TribleSet).
 
-```rust
+```rust,ignore
 use std::collections::HashSet;
 
 use triblespace::prelude::*;
@@ -482,7 +506,7 @@ results, you describe the shape of the path and the engine evaluates it:
 with other constraints.  Invoke it through a namespace module
 (`social::path!`) to implicitly resolve attribute names:
 
-```rust
+```rust,ignore
 use triblespace::prelude::*;
 
 mod social {
@@ -521,7 +545,7 @@ you want to follow the path but keep one endpoint unprojected, wrap the
 traversal in `temp!` so the hidden binding can participate in follow-up
 clauses:
 
-```rust
+```rust,ignore
 let interesting_post = fucid();
 let influencers = find!((start: Value<_>),
     temp!((end),

@@ -9,7 +9,7 @@ self-contained — jump to the one that matches your situation.
 
 An entity links to exactly one other entity via a `GenId` attribute:
 
-```rust
+```rust,ignore
 attributes! {
     "..." as author: GenId;
 }
@@ -23,7 +23,7 @@ Query both directions: the attribute stores the forward link, and the query
 engine can traverse it in reverse by binding the value and querying for the
 entity:
 
-```rust
+```rust,ignore
 // Forward: who wrote this book?
 find!(author: Id, pattern!(&catalog, [{ book_id @ literature::author: ?author }]))
 
@@ -36,7 +36,7 @@ find!(book: Id, pattern!(&catalog, [{ ?book @ literature::author: author_id }]))
 Use a **repeated attribute** — the same entity can have multiple values for one
 attribute. The `entity!` macro supports this with the `*` spread syntax:
 
-```rust
+```rust,ignore
 let paper = fucid();
 let tag_ml = fucid();
 let tag_neuro = fucid();
@@ -46,14 +46,14 @@ change += entity! { &paper @ metadata::tag: &tag_neuro };
 
 Or in a single entity expression:
 
-```rust
+```rust,ignore
 let tags = vec![tag_ml, tag_neuro];
 change += entity! { &paper @ metadata::tag*: tags.iter() };
 ```
 
 Query all tags for an entity, or all entities with a tag:
 
-```rust
+```rust,ignore
 // All tags on this paper
 find!(tag: Id, pattern!(&catalog, [{ paper_id @ metadata::tag: ?tag }]))
 
@@ -65,7 +65,7 @@ find!(paper: Id, pattern!(&catalog, [{ ?paper @ metadata::tag: tag_id }]))
 
 Model with a `parent` attribute. Children point up to their parent:
 
-```rust
+```rust,ignore
 attributes! {
     "..." as parent: GenId;
 }
@@ -74,7 +74,7 @@ change += entity! { &child @ tree::parent: &parent_node };
 
 For recursive traversal (all ancestors, all descendants), use `path!`:
 
-```rust
+```rust,ignore
 // All ancestors of this node
 find!(ancestor: Id, path!(&catalog, node_id tree::parent+ ancestor))
 
@@ -87,7 +87,7 @@ find!(desc: Id, path!(&catalog, desc tree::parent+ node_id))
 Use `metadata::tag` with minted `GenId` tag entities. Give tags human-readable
 names via `metadata::name`:
 
-```rust
+```rust,ignore
 // Mint a tag once
 let kind_paper = genid!("A1B2C3...");  // or use trible genid
 change += entity! { &kind_paper @ metadata::name: ws.put("paper".to_owned()) };
@@ -108,7 +108,7 @@ systems.
 
 Values larger than 32 bytes live in blobs. The workspace manages their lifecycle:
 
-```rust
+```rust,ignore
 // Write a blob (returns a Handle you can store in an entity)
 let text_handle = ws.put("A very long string...".to_owned());
 change += entity! { &doc @ article::body: text_handle };
@@ -128,7 +128,7 @@ println!("{}", view.as_ref());
 When some attributes are always present and others are conditional, build the
 required part first, then conditionally extend:
 
-```rust
+```rust,ignore
 let id = ufoid();
 let mut change = TribleSet::new();
 
@@ -149,7 +149,7 @@ if let Some(cwd) = default_cwd {
 When querying, use a multi-attribute pattern for the required fields (the query
 engine proves they exist), and separate queries for optional fields:
 
-```rust
+```rust,ignore
 // Required: one pattern, no Option<> needed
 for (id, command, created_at) in find!(
     (id: Id, cmd: TextHandle, at: Value<NsTAIInterval>),
@@ -174,7 +174,7 @@ Adding a new attribute to existing entities is free — just start writing it.
 Existing entities that lack the attribute are unaffected; queries that require
 it simply won't match them. This is the monotonic property at work.
 
-```rust
+```rust,ignore
 // V1: papers have title and author
 change += entity! { &paper @ literature::title: "Dune", literature::author: &herbert };
 
@@ -203,7 +203,7 @@ to prefer it. The old data remains but stops being used.
 Queries can span multiple `TribleSet`s and even native Rust collections in a
 single `find!` call using `and!`:
 
-```rust
+```rust,ignore
 let local_facts = TribleSet::new();
 let remote_facts = TribleSet::new();
 
