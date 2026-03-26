@@ -15,6 +15,11 @@ use crate::value::schemas::hash::Blake3;
 use anybytes::view::ViewError;
 use anybytes::View;
 
+/// Arbitrary-length UTF-8 text stored as a blob.
+///
+/// Use for text that does not fit in the 32-byte [`ShortString`](crate::value::schemas::shortstring::ShortString)
+/// value boundary — documents, prompts, JSON payloads, logs, etc.
+/// Reference it from tribles via a [`Handle<Blake3, LongString>`](crate::value::schemas::hash::Handle).
 pub struct LongString {}
 
 impl BlobSchema for LongString {}

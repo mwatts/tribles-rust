@@ -25,6 +25,7 @@ use std::ops::{Range, RangeInclusive};
 #[derive(Debug, Clone, Copy)]
 pub struct RangeU128;
 
+/// Inclusive range of two `u128` values (`start..=end`), big-endian encoded.
 #[derive(Debug, Clone, Copy)]
 pub struct RangeInclusiveU128;
 

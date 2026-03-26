@@ -39,11 +39,17 @@ use std::ops::AddAssign;
 /// and not to remove elements from the set. A subtle but important distinction.
 #[derive(Debug, Clone)]
 pub struct TribleSet {
+    /// Entity → Attribute → Value index.
     pub eav: PATCH<TRIBLE_LEN, EAVOrder, ()>,
+    /// Value → Entity → Attribute index.
     pub vea: PATCH<TRIBLE_LEN, VEAOrder, ()>,
+    /// Attribute → Value → Entity index.
     pub ave: PATCH<TRIBLE_LEN, AVEOrder, ()>,
+    /// Value → Attribute → Entity index.
     pub vae: PATCH<TRIBLE_LEN, VAEOrder, ()>,
+    /// Entity → Value → Attribute index.
     pub eva: PATCH<TRIBLE_LEN, EVAOrder, ()>,
+    /// Attribute → Entity → Value index.
     pub aev: PATCH<TRIBLE_LEN, AEVOrder, ()>,
 }
 

@@ -36,6 +36,7 @@ pub use anybytes::Bytes;
 /// This is similar to the `Value` type and the `ValueSchema` trait in the [`value`](crate::value) module.
 #[repr(transparent)]
 pub struct Blob<S: BlobSchema> {
+    /// The raw byte content of this blob.
     pub bytes: Bytes,
     _schema: PhantomData<S>,
 }
@@ -143,6 +144,7 @@ pub trait BlobSchema: ConstId + Sized + 'static {
 ///
 /// See [ToValue](crate::value::ToValue) for the counterpart trait for values.
 pub trait ToBlob<S: BlobSchema> {
+    /// Converts this value into a blob.
     fn to_blob(self) -> Blob<S>;
 }
 
@@ -154,7 +156,9 @@ pub trait ToBlob<S: BlobSchema> {
 ///
 /// See [TryFromValue](crate::value::TryFromValue) for the counterpart trait for values.
 pub trait TryFromBlob<S: BlobSchema>: Sized {
+    /// The error type returned when the conversion fails.
     type Error: Error;
+    /// Attempts to convert a blob into this type.
     fn try_from_blob(b: Blob<S>) -> Result<Self, Self::Error>;
 }
 

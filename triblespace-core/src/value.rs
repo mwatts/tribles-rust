@@ -117,6 +117,7 @@ pub type RawValue = [u8; VALUE_LEN];
 #[derive(TryFromBytes, IntoBytes, Unaligned, Immutable, KnownLayout)]
 #[repr(transparent)]
 pub struct Value<T: ValueSchema> {
+    /// The 32-byte representation of this value.
     pub raw: RawValue,
     _schema: PhantomData<T>,
 }
@@ -309,6 +310,8 @@ impl<T: ValueSchema> Debug for Value<T> {
 /// See the [value](crate::value) module for more information.
 /// See the [BlobSchema](crate::blob::BlobSchema) trait for the counterpart trait for blobs.
 pub trait ValueSchema: ConstId + Sized + 'static {
+    /// The error type returned by [`validate`](ValueSchema::validate).
+    /// Use `()` or [`Infallible`](std::convert::Infallible) when every bit pattern is valid.
     type ValidationError;
 
     /// Check if the given value conforms to this schema.
@@ -363,6 +366,7 @@ pub trait ToValue<S: ValueSchema> {
 /// This is the counterpart to the [TryFromValue] trait.
 ///
 pub trait TryToValue<S: ValueSchema> {
+    /// The error type returned when the conversion fails.
     type Error;
     /// Convert the Rust type to a [Value] with a specific schema type.
     /// This might return an error if the conversion is not possible.
@@ -384,6 +388,7 @@ pub trait TryToValue<S: ValueSchema> {
 ///
 /// See [TryFromBlob](crate::blob::TryFromBlob) for the counterpart trait for blobs.
 pub trait TryFromValue<'a, S: ValueSchema>: Sized {
+    /// The error type returned when the conversion fails.
     type Error;
     /// Convert the [Value] with a specific schema type to the Rust type.
     fn try_from_value(v: &'a Value<S>) -> Result<Self, Self::Error>;

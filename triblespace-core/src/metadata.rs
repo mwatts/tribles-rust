@@ -18,6 +18,8 @@ use triblespace_core_macros::attributes;
 
 /// Emits metadata that can be used for documentation or discovery.
 pub trait Describe {
+    /// Produces a [`Fragment`] describing this item, storing any long-form
+    /// content as blobs.
     fn describe<B>(&self, blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>;
@@ -25,11 +27,13 @@ pub trait Describe {
 
 /// Helper trait for types with a stable compile-time identifier.
 pub trait ConstId {
+    /// The stable 128-bit identifier for this type.
     const ID: Id;
 }
 
 /// Helper trait for schema types that want to expose metadata without requiring an instance.
 pub trait ConstDescribe: ConstId {
+    /// Produces a [`Fragment`] describing this schema type.
     fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
     where
         B: BlobStore<Blake3>,
@@ -64,6 +68,7 @@ where
 }
 
 // namespace constants
+/// Tag for entities that can have multiple simultaneous kinds.
 pub const KIND_MULTI: Id = id_hex!("C36D9C16B34729D855BD6C36A624E1BF");
 /// Tag for entities that represent value schemas.
 pub const KIND_VALUE_SCHEMA: Id = id_hex!("9A169BF2383E7B1A3E019808DFE3C2EB");
@@ -83,8 +88,11 @@ attributes! {
     /// metadata uses it for documenting value/blob schemas, but it is equally
     /// valid for domain entities.
     "AE94660A55D2EE3C428D2BB299E02EC3" as description: valueschemas::Handle<hash::Blake3, LongString>;
+    /// Links an attribute or handle to its value schema identifier.
     "213F89E3F49628A105B3830BD3A6612C" as value_schema: valueschemas::GenId;
+    /// Links a handle to its blob schema identifier.
     "43C134652906547383054B1E31E23DF4" as blob_schema: valueschemas::GenId;
+    /// Links a handle to the hash algorithm used for content addressing.
     "51C08CFABB2C848CE0B4A799F0EFE5EA" as hash_schema: valueschemas::GenId;
     /// Optional WebAssembly module for formatting values governed by this schema.
     ///
@@ -105,6 +113,7 @@ attributes! {
     /// Optional module path for the usage annotation (from `module_path!()`).
     "BCB94C7439215641A3E9760CE3F4F432" as source_module: valueschemas::Handle<hash::Blake3, LongString>;
     /// Preferred JSON representation (e.g. string, number, bool, object, ref, blob).
+    /// Preferred JSON representation hint (e.g. `"string"`, `"number"`, `"bool"`, `"object"`).
     "A7AFC8C0FAD017CE7EC19587AF682CFF" as json_kind: valueschemas::ShortString;
     /// Generic tag edge: link any entity to a tag entity (by Id). Reusable across domains.
     "91C50E9FBB1F73E892EBD5FFDE46C251" as tag: valueschemas::GenId;

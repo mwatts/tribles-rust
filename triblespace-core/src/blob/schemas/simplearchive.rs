@@ -17,6 +17,12 @@ use crate::value::schemas::hash::Blake3;
 use anybytes::Bytes;
 use anybytes::View;
 
+/// Canonical trible sequence stored as raw 64-byte entries.
+///
+/// The simplest portable archive format — a flat byte array of tribles
+/// in canonical EAV order with no compression. Used for commits,
+/// streaming, hashing, and audit trails where byte-for-byte stability
+/// matters.
 pub struct SimpleArchive;
 
 impl BlobSchema for SimpleArchive {}
@@ -61,11 +67,16 @@ impl ToBlob<SimpleArchive> for &TribleSet {
     }
 }
 
+/// Error returned when deserializing a [`SimpleArchive`] blob into a [`TribleSet`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnarchiveError {
+    /// The blob length is not a multiple of 64 bytes.
     BadArchive,
+    /// A 64-byte entry has a nil entity or attribute.
     BadTrible,
+    /// The archive contains duplicate tribles.
     BadCanonicalizationRedundancy,
+    /// The tribles are not in ascending canonical order.
     BadCanonicalizationOrdering,
 }
 
