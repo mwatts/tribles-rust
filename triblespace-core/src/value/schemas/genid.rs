@@ -295,9 +295,11 @@ impl TryToValue<GenId> for &uuid::Uuid {
 }
 
 #[cfg(feature = "proptest")]
+/// Proptest value tree for a random [`GenId`]. Does not shrink.
 pub struct IdValueTree(RawId);
 
 #[cfg(feature = "proptest")]
+/// Proptest strategy that generates random 128-bit identifiers.
 #[derive(Debug)]
 pub struct RandomGenId();
 #[cfg(feature = "proptest")]
