@@ -12,25 +12,26 @@ derived from the base dataset.
 ## The Checkout pattern
 
 `Workspace::checkout` returns a [`Checkout`] — a `TribleSet` paired with
-the commit head it was resolved from. The head acts as a continuation
+the set of commits that produced it. That commit set acts as a continuation
 token: pass it as the start of a range selector on the next checkout to
-get only the new commits.
+exclude already-seen commits.
 
 ```rust,ignore
-// Initial load — changed and full start as the same checkout.
+// Initial load — full starts as a clone of the first checkout.
 let mut changed = repo.pull(branch_id)?.checkout(..)?;
-let mut full = changed.facts().clone();
+let mut full = changed.clone();
 
 loop {
     // Process new results. full already includes changed.
-    for (entity, title) in pattern_changes!(&full, &changed, [
-        { ?entity @ wiki::title: ?title }
-    ]) {
+    for title in find!(title: String, pattern_changes!(&full, &changed, [
+        { _?author @ literature::firstname: "Frank" },
+        { _?book @ literature::author: _?author, literature::title: ?title }
+    ])) {
         println!("new: {title}");
     }
 
-    // Advance: pull fresh, checkout only new commits.
-    changed = repo.pull(branch_id)?.checkout(changed.head()..)?;
+    // Advance: exclude all commits we've already processed.
+    changed = repo.pull(branch_id)?.checkout(full.commits()..)?;
     full += &changed;
 }
 ```
@@ -38,7 +39,7 @@ loop {
 `Checkout` dereferences to `TribleSet`, so it works directly with
 `find!`, `pattern!`, and `pattern_changes!`. The `full` accumulator is a
 plain `TribleSet` that grows monotonically. The `changed` checkout
-carries the head forward automatically.
+carries the commit set forward automatically.
 
 This pattern avoids building shadow data models in Rust structs.
 Query the `TribleSet` directly with `find!` — it has sub-microsecond
@@ -96,15 +97,17 @@ subset. The macro unions variants of the query where each triple is
 constrained to the changed set, matching only results that involve at
 least one new trible.
 
-```rust
+```rust,ignore
 {{#include ../../examples/pattern_changes.rs:pattern_changes_example}}
 ```
 
-The example commits initial data, simulates an external update, then uses
-the `Checkout` pattern to discover only the newly added title. The first
-checkout loads the full history; the second checkout uses `changed.head()..`
-to fetch only new commits. `pattern_changes!` finds results involving
-the new tribles without re-deriving prior matches.
+The example commits Herbert and *Dune*, simulates an external update that
+adds *Dune Messiah*, then uses the `Checkout` pattern to discover only the
+newly added title. The multi-entity join links books to their author via
+`_?author`, yet `pattern_changes!` returns only results where at least one
+trible is new — *Dune* does not reappear. The first checkout loads the full
+history; the second uses `changed.commits()..` to exclude
+already-processed commits and fetch only new ones.
 
 ## Comparing history points
 
@@ -118,8 +121,8 @@ added after `a`. Feeding that delta into `pattern_changes!` lets us ask,
 "What new matches did commit `b` introduce over `a`?"
 
 The `Checkout` type makes this ergonomic: `checkout(..)` returns both
-the data and the head, so the next `checkout(head..)` produces exactly
-the delta without manual bookkeeping.
+the data and the commit set, so the next `checkout(commits()..)`
+produces exactly the delta without manual bookkeeping.
 
 ## Trade-offs
 

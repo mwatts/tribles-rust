@@ -1114,12 +1114,13 @@ where
 /// A handle to a commit blob in the repository.
 pub type CommitHandle = Value<Handle<Blake3, SimpleArchive>>;
 type MetadataHandle = Value<Handle<Blake3, SimpleArchive>>;
-type CommitSet = PATCH<VALUE_LEN, IdentitySchema, ()>;
+/// A set of commit handles, used by [`CommitSelector`] and [`Checkout`].
+pub type CommitSet = PATCH<VALUE_LEN, IdentitySchema, ()>;
 type BranchMetaHandle = Value<Handle<Blake3, SimpleArchive>>;
 
 /// The result of a [`Workspace::checkout`] operation: a [`TribleSet`] paired
-/// with the commit head it was resolved from. This head can be used as the
-/// start of a range selector to obtain incremental deltas on the next checkout.
+/// with the set of commits that produced it. Pass the commit set as the start
+/// of a range selector to obtain incremental deltas on the next checkout.
 ///
 /// `Checkout` dereferences to `TribleSet`, so it can be used directly with
 /// `find!`, `pattern!`, and `pattern_changes!`.
@@ -1136,15 +1137,15 @@ type BranchMetaHandle = Value<Handle<Blake3, SimpleArchive>>;
 ///         // process new results
 ///     }
 ///
-///     // Advance
-///     changed = repo.pull(branch_id)?.checkout(changed.head()..)?;
+///     // Advance — exclude exactly the commits we already processed.
+///     changed = repo.pull(branch_id)?.checkout(changed.commits()..)?;
 ///     full += &changed;
 /// }
 /// ```
 #[derive(Debug, Clone)]
 pub struct Checkout {
     facts: TribleSet,
-    head: Option<CommitHandle>,
+    commits: CommitSet,
 }
 
 impl PartialEq<TribleSet> for Checkout {
@@ -1165,10 +1166,11 @@ impl Checkout {
         &self.facts
     }
 
-    /// The commit head at the time of checkout. Use as the start of a range
-    /// selector (`checkout.head()..`) to get only new commits on the next checkout.
-    pub fn head(&self) -> Option<CommitHandle> {
-        self.head
+    /// The set of commits that produced this checkout. Use as the start of a
+    /// range selector (`checkout.commits()..`) to exclude these commits
+    /// on the next checkout and obtain only new data.
+    pub fn commits(&self) -> CommitSet {
+        self.commits.clone()
     }
 
     /// Consume the checkout and return the inner TribleSet.
@@ -1184,9 +1186,10 @@ impl std::ops::Deref for Checkout {
     }
 }
 
-impl std::ops::AddAssign<&Checkout> for TribleSet {
+impl std::ops::AddAssign<&Checkout> for Checkout {
     fn add_assign(&mut self, rhs: &Checkout) {
-        *self += rhs.facts.clone();
+        self.facts += rhs.facts.clone();
+        self.commits.union(rhs.commits.clone());
     }
 }
 
@@ -1345,6 +1348,21 @@ where
         let mut patch = CommitSet::new();
         patch.insert(&Entry::new(&self.raw));
         Ok(patch)
+    }
+}
+
+impl<Blobs> CommitSelector<Blobs> for CommitSet
+where
+    Blobs: BlobStore<Blake3>,
+{
+    fn select(
+        self,
+        _ws: &mut Workspace<Blobs>,
+    ) -> Result<
+        CommitSet,
+        WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
+    > {
+        Ok(self)
     }
 }
 
@@ -2111,10 +2129,9 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
     where
         R: CommitSelector<Blobs>,
     {
-        let patch = spec.select(self)?;
-        let commits = patch.iter().map(|raw| Value::new(*raw));
-        let facts = self.checkout_commits(commits)?;
-        Ok(Checkout { facts, head: self.head })
+        let commits = spec.select(self)?;
+        let facts = self.checkout_commits(commits.iter().map(|raw| Value::new(*raw)))?;
+        Ok(Checkout { facts, commits })
     }
 
     /// Returns the combined metadata [`TribleSet`] for the specified commits.
