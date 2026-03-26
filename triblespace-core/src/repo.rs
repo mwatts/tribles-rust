@@ -215,9 +215,11 @@ attributes! {
 
 /// The `ListBlobs` trait is used to list all blobs in a repository.
 pub trait BlobStoreList<H: HashProtocol> {
+    /// Iterator over blob handles in the store.
     type Iter<'a>: Iterator<Item = Result<Value<Handle<H, UnknownBlob>>, Self::Err>>
     where
         Self: 'a;
+    /// Error type for listing operations.
     type Err: Error + Debug + Send + Sync + 'static;
 
     /// Lists all blobs in the repository.
@@ -238,6 +240,8 @@ pub trait BlobStoreMeta<H: HashProtocol> {
     /// Error type returned by metadata calls.
     type MetaError: std::error::Error + Send + Sync + 'static;
 
+    /// Returns metadata for the blob identified by `handle`, or `None` if
+    /// the blob is not present.
     fn metadata<S>(
         &self,
         handle: Value<Handle<H, S>>,
@@ -252,8 +256,10 @@ pub trait BlobStoreMeta<H: HashProtocol> {
 /// Forget is idempotent and monotonic: it removes materialization from a
 /// particular repository but does not semantically delete derived facts.
 pub trait BlobStoreForget<H: HashProtocol> {
+    /// Error type for forget operations.
     type ForgetError: std::error::Error + Send + Sync + 'static;
 
+    /// Removes the materialized blob identified by `handle` from this store.
     fn forget<S>(&mut self, handle: Value<Handle<H, S>>) -> Result<(), Self::ForgetError>
     where
         S: BlobSchema + 'static,
@@ -262,6 +268,7 @@ pub trait BlobStoreForget<H: HashProtocol> {
 
 /// The `GetBlob` trait is used to retrieve blobs from a repository.
 pub trait BlobStoreGet<H: HashProtocol> {
+    /// Error type for get operations, parameterised by the deserialization error.
     type GetError<E: std::error::Error>: Error;
 
     /// Retrieves a blob from the repository by its handle.
@@ -284,8 +291,10 @@ pub trait BlobStoreGet<H: HashProtocol> {
 
 /// The `PutBlob` trait is used to store blobs in a repository.
 pub trait BlobStorePut<H: HashProtocol> {
+    /// Error type for put operations.
     type PutError: Error + Debug + Send + Sync + 'static;
 
+    /// Serialises `item` as a blob, stores it, and returns its handle.
     fn put<S, T>(&mut self, item: T) -> Result<Value<Handle<H, S>>, Self::PutError>
     where
         S: BlobSchema + 'static,
@@ -293,9 +302,16 @@ pub trait BlobStorePut<H: HashProtocol> {
         Handle<H, S>: ValueSchema;
 }
 
+/// Combined read/write blob storage.
+///
+/// Extends [`BlobStorePut`] with the ability to create a shareable
+/// [`Reader`](BlobStore::Reader) snapshot for concurrent reads.
 pub trait BlobStore<H: HashProtocol>: BlobStorePut<H> {
+    /// A clonable reader handle for concurrent blob lookups.
     type Reader: BlobStoreGet<H> + BlobStoreList<H> + Clone + Send + PartialEq + Eq + 'static;
+    /// Error type for creating a reader.
     type ReaderError: Error + Debug + Send + Sync + 'static;
+    /// Creates a shareable reader snapshot of the current store state.
     fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError>;
 }
 
@@ -307,20 +323,34 @@ pub trait BlobStoreKeep<H: HashProtocol> {
         I: IntoIterator<Item = Value<Handle<H, UnknownBlob>>>;
 }
 
+/// Outcome of a compare-and-swap branch update.
 #[derive(Debug)]
 pub enum PushResult<H>
 where
     H: HashProtocol,
 {
+    /// The CAS succeeded — the branch now points to the new commit.
     Success(),
+    /// The CAS failed — the branch had advanced. Contains the current
+    /// head, or `None` if the branch was deleted concurrently.
     Conflict(Option<Value<Handle<H, SimpleArchive>>>),
 }
 
+/// Storage backend for branch metadata (branch-id → commit-handle mapping).
+///
+/// This is the stateful counterpart to [`BlobStore`]: blob stores are
+/// content-addressed and orderless, while branch stores track a single
+/// mutable pointer per branch. The update operation uses compare-and-swap
+/// semantics so multiple writers can coordinate without locks.
 pub trait BranchStore<H: HashProtocol> {
+    /// Error type for listing branches.
     type BranchesError: Error + Debug + Send + Sync + 'static;
+    /// Error type for head lookups.
     type HeadError: Error + Debug + Send + Sync + 'static;
+    /// Error type for CAS updates.
     type UpdateError: Error + Debug + Send + Sync + 'static;
 
+    /// Iterator over branch IDs.
     type ListIter<'a>: Iterator<Item = Result<Id, Self::BranchesError>>
     where
         Self: 'a;
@@ -364,10 +394,14 @@ pub trait BranchStore<H: HashProtocol> {
     ) -> Result<PushResult<H>, Self::UpdateError>;
 }
 
+/// Error returned by [`transfer`] when copying blobs between stores.
 #[derive(Debug)]
 pub enum TransferError<ListErr, LoadErr, StoreErr> {
+    /// Failed to list handles from the source.
     List(ListErr),
+    /// Failed to load a blob from the source.
     Load(LoadErr),
+    /// Failed to store a blob in the target.
     Store(StoreErr),
 }
 
@@ -568,12 +602,14 @@ impl<BlobErr: Error + Debug + Send + Sync + 'static> Error for CreateCommitError
     }
 }
 
+/// Error returned by [`Workspace::merge`].
 #[derive(Debug)]
 pub enum MergeError {
     /// The merge failed because the workspaces have different base repos.
     DifferentRepos(),
 }
 
+/// Error returned by [`Repository::push`] and [`Repository::try_push`].
 #[derive(Debug)]
 pub enum PushError<Storage: BranchStore<Blake3> + BlobStore<Blake3>> {
     /// An error occurred while enumerating the branch storage branches.
@@ -613,6 +649,7 @@ where
 // enum variant constructors (e.g. `map_err(PushError::StoragePut)`) where
 // needed which keeps conversions explicit and stable.
 
+/// Error returned by [`Repository::create_branch`] and related methods.
 #[derive(Debug)]
 pub enum BranchError<Storage>
 where
@@ -636,28 +673,37 @@ where
     BranchNotFound(Id),
 }
 
+/// Error returned by [`Repository::lookup_branch`].
 #[derive(Debug)]
 pub enum LookupError<Storage>
 where
     Storage: BranchStore<Blake3> + BlobStore<Blake3>,
 {
+    /// Failed to enumerate branches.
     StorageBranches(Storage::BranchesError),
+    /// Failed to read a branch head.
     BranchHead(Storage::HeadError),
+    /// Failed to create a blob reader.
     StorageReader(<Storage as BlobStore<Blake3>>::ReaderError),
+    /// Failed to read a metadata blob.
     StorageGet(
         <<Storage as BlobStore<Blake3>>::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>,
     ),
     /// Multiple branches were found with the given name.
     NameConflict(Vec<Id>),
+    /// Branch metadata is malformed.
     BadBranchMetadata(),
 }
 
+/// Error returned by [`Repository::ensure_branch`].
 #[derive(Debug)]
 pub enum EnsureBranchError<Storage>
 where
     Storage: BranchStore<Blake3> + BlobStore<Blake3>,
 {
+    /// Failed to look up the branch.
     Lookup(LookupError<Storage>),
+    /// Failed to create the branch.
     Create(BranchError<Storage>),
 }
 
@@ -673,6 +719,7 @@ pub struct Repository<Storage: BlobStore<Blake3> + BranchStore<Blake3>> {
     commit_metadata: MetadataHandle,
 }
 
+/// Error returned by [`Repository::pull`].
 pub enum PullError<BranchStorageErr, BlobReaderErr, BlobStorageErr>
 where
     BranchStorageErr: Error,
