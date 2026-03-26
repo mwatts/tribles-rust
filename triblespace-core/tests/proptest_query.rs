@@ -2,9 +2,18 @@ use proptest::prelude::*;
 use proptest::collection::vec;
 use triblespace_core::id::rngid;
 use triblespace_core::prelude::*;
-use triblespace_core::query::{Binding, Constraint, TriblePattern, Variable, VariableContext};
+use triblespace_core::query::{Binding, Constraint, ContainsConstraint, TriblePattern, Variable, VariableContext};
 use triblespace_core::trible::{Fragment, Trible};
 use triblespace_core::value::schemas::UnknownValue;
+use std::collections::HashSet;
+
+mod test_ns {
+    use triblespace_core::prelude::*;
+    attributes! {
+        "BB00000000000000BB00000000000001" as pub link: valueschemas::GenId;
+        "BB00000000000000BB00000000000002" as pub label: valueschemas::ShortString;
+    }
+}
 
 fn arb_trible() -> impl Strategy<Value = Trible> {
     (
@@ -235,5 +244,163 @@ proptest! {
         ).collect();
         prop_assert!(inter_results.len() <= a_results.len());
         prop_assert!(inter_results.len() <= b_results.len());
+    }
+
+    // ── exists! ────────────────────────────────────────────────────────
+
+    #[test]
+    fn exists_consistent_with_find(set in arb_tribleset(10)) {
+        let has_results = find!(
+            (e: Value<_>, a: Value<_>, v: Value<UnknownValue>),
+            set.pattern(e, a, v as Variable<UnknownValue>)
+        ).next().is_some();
+        let exists_result = exists!(
+            (e: Value<_>, a: Value<_>, v: Value<UnknownValue>),
+            set.pattern(e, a, v as Variable<UnknownValue>)
+        );
+        prop_assert_eq!(has_results, exists_result);
+    }
+
+    #[test]
+    fn exists_empty_set_is_false(_dummy in 0..1u8) {
+        let empty = TribleSet::new();
+        let result = exists!(
+            (e: Value<_>, a: Value<_>, v: Value<UnknownValue>),
+            empty.pattern(e, a, v as Variable<UnknownValue>)
+        );
+        prop_assert!(!result);
+    }
+
+    // ── and! (intersection constraint) ─────────────────────────────────
+
+    #[test]
+    fn and_with_hashset_filters(
+        labels in vec("[a-z]{1,6}", 3..8),
+    ) {
+        let mut set = TribleSet::new();
+        for label in &labels {
+            let e = rngid();
+            set += entity! { &e @ test_ns::label: label.as_str() };
+        }
+
+        // Pick a subset to allow
+        let allowed: HashSet<String> = labels.iter().take(2).cloned().collect();
+
+        let all: Vec<String> = find!(
+            label: String,
+            pattern!(&set, [{ test_ns::label: ?label }])
+        ).collect();
+
+        let filtered: Vec<String> = find!(
+            label: String,
+            and!(
+                allowed.has(label),
+                pattern!(&set, [{ test_ns::label: ?label }])
+            )
+        ).collect();
+
+        // Filtered must be a subset of all
+        for label in &filtered {
+            prop_assert!(all.contains(label));
+        }
+        // And only contain allowed values
+        for label in &filtered {
+            prop_assert!(allowed.contains(label),
+                "{:?} not in allowed set", label);
+        }
+    }
+
+    // ── or! (union constraint) ─────────────────────────────────────────
+
+    #[test]
+    fn or_superset_of_both(
+        a in arb_tribleset(8),
+        b in arb_tribleset(8),
+    ) {
+        // or! at the raw constraint level: both branches share variables
+        let a_results: Vec<_> = find!(
+            (e: Value<_>, attr: Value<_>, v: Value<UnknownValue>),
+            a.pattern(e, attr, v as Variable<UnknownValue>)
+        ).collect();
+        let b_results: Vec<_> = find!(
+            (e: Value<_>, attr: Value<_>, v: Value<UnknownValue>),
+            b.pattern(e, attr, v as Variable<UnknownValue>)
+        ).collect();
+        let or_results: Vec<_> = find!(
+            (e: Value<_>, attr: Value<_>, v: Value<UnknownValue>),
+            or!(
+                a.pattern(e, attr, v as Variable<UnknownValue>),
+                b.pattern(e, attr, v as Variable<UnknownValue>)
+            )
+        ).collect();
+
+        // or! must contain everything from a
+        for triple in &a_results {
+            prop_assert!(or_results.contains(triple),
+                "or! missing a result from set a");
+        }
+        // and everything from b
+        for triple in &b_results {
+            prop_assert!(or_results.contains(triple),
+                "or! missing a result from set b");
+        }
+        // and nothing extra (since union of disjoint sets)
+        prop_assert!(or_results.len() <= a_results.len() + b_results.len());
+    }
+
+    // ── path! reachability ─────────────────────────────────────────────
+
+    #[test]
+    fn path_single_hop_finds_direct_links(
+        chain_len in 2..6usize,
+    ) {
+        let mut set = TribleSet::new();
+        let entities: Vec<_> = (0..chain_len).map(|_| rngid()).collect();
+
+        // Build a chain: e0 → e1 → e2 → ...
+        for i in 0..chain_len - 1 {
+            set += entity! { &entities[i] @ test_ns::link: &entities[i + 1] };
+        }
+
+        // Single hop from e0 should find e1
+        let start_val = (&entities[0]).to_value();
+        let results: Vec<(Value<_>, Value<_>)> = find!(
+            (s: Value<_>, d: Value<_>),
+            and!(s.is(start_val), path!(set.clone(), s test_ns::link d))
+        ).collect();
+
+        prop_assert_eq!(results.len(), 1,
+            "expected 1 direct link, got {}", results.len());
+        prop_assert_eq!(results[0].1, (&entities[1]).to_value());
+    }
+
+    #[test]
+    fn path_transitive_closure_finds_all_reachable(
+        chain_len in 2..5usize,
+    ) {
+        let mut set = TribleSet::new();
+        let entities: Vec<_> = (0..chain_len).map(|_| rngid()).collect();
+
+        // Build a chain: e0 → e1 → e2 → ...
+        for i in 0..chain_len - 1 {
+            set += entity! { &entities[i] @ test_ns::link: &entities[i + 1] };
+        }
+
+        // Transitive closure from e0 should find all reachable
+        let start_val = (&entities[0]).to_value();
+        let results: Vec<(Value<_>, Value<_>)> = find!(
+            (s: Value<_>, d: Value<_>),
+            and!(s.is(start_val), path!(set.clone(), s test_ns::link+ d))
+        ).collect();
+
+        // Should find e1, e2, ..., e_{n-1}
+        prop_assert_eq!(results.len(), chain_len - 1,
+            "expected {} reachable, got {}", chain_len - 1, results.len());
+
+        for i in 1..chain_len {
+            let expected = (&entities[i]).to_value();
+            prop_assert!(results.iter().any(|(_, d)| *d == expected),
+                "missing entity {} from transitive closure", i);
+        }
     }
 }
