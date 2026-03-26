@@ -65,9 +65,12 @@ const MAGIC_MARKER_BRANCH_TOMBSTONE: RawId = hex!("E888CC787202D2AE4C654BFE9699C
 const BLOB_HEADER_LEN: usize = std::mem::size_of::<BlobHeader>();
 const BLOB_ALIGNMENT: usize = BLOB_HEADER_LEN;
 
+/// Lazily-computed validation status of a blob record in the pile.
 #[derive(Debug, Clone, Copy)]
 pub enum ValidationState {
+    /// The blob's hash matches its stored digest.
     Validated,
+    /// The blob's hash does not match — the record is corrupt.
     Invalid,
 }
 
@@ -285,11 +288,21 @@ impl<H: HashProtocol> BlobStore<H> for Pile<H> {
     }
 }
 
+/// Error returned when opening or refreshing a [`Pile`].
 #[derive(Debug)]
 pub enum ReadError {
+    /// Underlying I/O failure.
     IoError(std::io::Error),
-    CorruptPile { valid_length: usize },
-    FileTooLarge { length: usize },
+    /// The pile contains corrupted data starting at `valid_length`.
+    CorruptPile {
+        /// Byte offset where the first invalid record was found.
+        valid_length: usize,
+    },
+    /// The pile file exceeds the addressable range.
+    FileTooLarge {
+        /// Actual file length.
+        length: usize,
+    },
 }
 
 impl std::fmt::Display for ReadError {
@@ -327,9 +340,12 @@ impl From<ReadError> for std::io::Error {
     }
 }
 
+/// Error returned when appending a blob to a [`Pile`].
 #[derive(Debug)]
 pub enum InsertError {
+    /// Underlying I/O failure.
     IoError(std::io::Error),
+    /// System clock error when timestamping the record.
     TimeError(std::time::SystemTimeError),
 }
 
@@ -361,7 +377,9 @@ impl From<ReadError> for InsertError {
     }
 }
 
+/// Error returned when updating a branch pointer in a [`Pile`].
 pub enum UpdateBranchError {
+    /// Underlying I/O failure.
     IoError(std::io::Error),
 }
 
@@ -398,10 +416,14 @@ impl From<ReadError> for UpdateBranchError {
     }
 }
 
+/// Error returned when retrieving a blob from a [`Pile`].
 #[derive(Debug)]
 pub enum GetBlobError<E: Error> {
+    /// No blob with the given handle exists in the pile.
     BlobNotFound,
+    /// The blob's hash does not match its stored digest.
     ValidationError(Bytes),
+    /// The blob was found and valid but deserialization failed.
     ConversionError(E),
 }
 
@@ -417,8 +439,10 @@ impl<E: Error> std::fmt::Display for GetBlobError<E> {
 
 impl<E: Error> std::error::Error for GetBlobError<E> {}
 
+/// Error returned by [`Pile::flush`] and [`Pile::close`].
 #[derive(Debug)]
 pub enum FlushError {
+    /// Underlying I/O failure.
     IoError(std::io::Error),
 }
 
