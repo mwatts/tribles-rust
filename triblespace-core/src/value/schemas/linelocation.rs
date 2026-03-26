@@ -134,53 +134,21 @@ impl ToValue<LineLocation> for Span {
 mod tests {
     use super::*;
     use crate::value::ToValue;
+    use proptest::prelude::*;
 
-    #[test]
-    fn tuple_roundtrip() {
-        let input: (u64, u64, u64, u64) = (1, 0, 10, 25);
-        let value: Value<LineLocation> = input.to_value();
-        let output: (u64, u64, u64, u64) = value.from_value();
-        assert_eq!(input, output);
-    }
+    proptest! {
+        #[test]
+        fn tuple_roundtrip(a: u64, b: u64, c: u64, d: u64) {
+            let input = (a, b, c, d);
+            let value: Value<LineLocation> = input.to_value();
+            let output: (u64, u64, u64, u64) = value.from_value();
+            prop_assert_eq!(input, output);
+        }
 
-    #[test]
-    fn tuple_zero() {
-        let input: (u64, u64, u64, u64) = (0, 0, 0, 0);
-        let value: Value<LineLocation> = input.to_value();
-        let output: (u64, u64, u64, u64) = value.from_value();
-        assert_eq!(input, output);
-    }
-
-    #[test]
-    fn tuple_max_values() {
-        let input: (u64, u64, u64, u64) = (u64::MAX, u64::MAX, u64::MAX, u64::MAX);
-        let value: Value<LineLocation> = input.to_value();
-        let output: (u64, u64, u64, u64) = value.from_value();
-        assert_eq!(input, output);
-    }
-
-    #[test]
-    fn tuple_single_line_span() {
-        let input: (u64, u64, u64, u64) = (42, 5, 42, 20);
-        let value: Value<LineLocation> = input.to_value();
-        let output: (u64, u64, u64, u64) = value.from_value();
-        assert_eq!(input, output);
-    }
-
-    #[test]
-    fn tuple_multi_line_span() {
-        let input: (u64, u64, u64, u64) = (100, 0, 200, 80);
-        let value: Value<LineLocation> = input.to_value();
-        let output: (u64, u64, u64, u64) = value.from_value();
-        assert_eq!(input, output);
-    }
-
-    #[test]
-    fn tuple_point_span() {
-        // A zero-width span at a single position
-        let input: (u64, u64, u64, u64) = (5, 10, 5, 10);
-        let value: Value<LineLocation> = input.to_value();
-        let output: (u64, u64, u64, u64) = value.from_value();
-        assert_eq!(input, output);
+        #[test]
+        fn validates(a: u64, b: u64, c: u64, d: u64) {
+            let value: Value<LineLocation> = (a, b, c, d).to_value();
+            prop_assert!(LineLocation::validate(value).is_ok());
+        }
     }
 }
