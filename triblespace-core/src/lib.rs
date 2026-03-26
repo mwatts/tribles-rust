@@ -34,9 +34,13 @@ pub mod examples;
 
 // Re-export dependencies used by generated macros so consumers
 // don't need to add them explicitly.
+/// Re-export of `arrayvec` used by generated macro code.
 pub use arrayvec;
 
+/// Re-exported proc-macros and helper macros for entity, pattern, and query construction.
 pub mod macros {
+    //! Re-exports of procedural macros and helper macros used for entity,
+    //! pattern, and query construction.
     pub use crate::id::id_hex;
     pub use crate::query::find;
     pub use triblespace_core_macros::*;

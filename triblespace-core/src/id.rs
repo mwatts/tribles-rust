@@ -216,6 +216,7 @@ impl From<Id> for uuid::Uuid {
     }
 }
 
+/// Error returned when converting a nil (all-zero) UUID into an [`Id`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NilUuidError;
 
@@ -273,6 +274,7 @@ pub use id_hex;
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct ExclusiveId {
+    /// The underlying identifier.
     pub id: Id,
     // Make sure that the type can't be syntactically initialized.
     // Also make sure that we don't get auto impl of Send and Sync
@@ -424,6 +426,7 @@ pub struct IdOwner {
 /// An `ExclusiveId` that is associated with an `IdOwner`.
 /// It is automatically returned to the `IdOwner` when dropped.
 pub struct OwnedId<'a> {
+    /// The underlying identifier.
     pub id: Id,
     owner: &'a IdOwner,
 }

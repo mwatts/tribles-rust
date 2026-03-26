@@ -46,13 +46,21 @@ use jerky::char_sequences::wavelet_matrix::WaveletMatrixMeta;
 use jerky::char_sequences::{WaveletMatrix, WaveletMatrixBuilder};
 use jerky::serialization::{Metadata, Serializable};
 
-/// Blob schema for a succinct archive — a compressed, query-friendly trible
-/// index built from wavelet matrices and bit vectors.
+/// Blob schema for a succinct archive based on *The Ring* (Arroyuelo
+/// et al., 2024) — a compact index that supports worst-case optimal
+/// joins over triples in almost no extra space.
+///
+/// The Ring treats each triple (E, A, V) as a bidirectional cyclic
+/// string of length 3. Two rings — forward (E→A→V) and reverse
+/// (E→V→A) — cover all six attribute orderings using only two sorted
+/// rotations each. The last column of each rotation is stored as a
+/// wavelet matrix, enabling rank/select navigation between columns
+/// without materialising six separate indexes.
 ///
 /// Build from a [`TribleSet`] via [`ToBlob`], then query through
 /// [`SuccinctArchive`] and its [`Constraint`](crate::query::Constraint)
-/// implementation. Suitable for large, read-heavy datasets where compact
-/// storage and fast scans matter more than incremental updates.
+/// implementation. Suitable for large, read-heavy, mostly-static
+/// datasets where compact storage matters more than incremental updates.
 pub struct SuccinctArchiveBlob;
 
 impl BlobSchema for SuccinctArchiveBlob {}
@@ -112,17 +120,17 @@ pub struct SuccinctArchiveMeta<D: Metadata> {
     pub changed_v_e: BitVectorDataMeta,
     /// First-occurrence markers for (value, attribute) pairs.
     pub changed_v_a: BitVectorDataMeta,
-    /// EAV wavelet matrix — values indexed by entity→attribute order.
+    /// Forward ring: EAV last-column wavelet matrix metadata.
     pub eav_c: WaveletMatrixMeta,
-    /// VEA wavelet matrix — attributes indexed by value→entity order.
+    /// Forward ring: VEA last-column wavelet matrix metadata.
     pub vea_c: WaveletMatrixMeta,
-    /// AVE wavelet matrix — entities indexed by attribute→value order.
+    /// Forward ring: AVE last-column wavelet matrix metadata.
     pub ave_c: WaveletMatrixMeta,
-    /// VAE wavelet matrix — entities indexed by value→attribute order.
+    /// Reverse ring: VAE last-column wavelet matrix metadata.
     pub vae_c: WaveletMatrixMeta,
-    /// EVA wavelet matrix — attributes indexed by entity→value order.
+    /// Reverse ring: EVA last-column wavelet matrix metadata.
     pub eva_c: WaveletMatrixMeta,
-    /// AEV wavelet matrix — values indexed by attribute→entity order.
+    /// Reverse ring: AEV last-column wavelet matrix metadata.
     pub aev_c: WaveletMatrixMeta,
 }
 
@@ -153,8 +161,15 @@ where
     builder.freeze::<Rank9SelIndex>()
 }
 
-/// Deserialized succinct archive — six wavelet matrices with prefix bit
-/// vectors and pair-change markers, backed by a shared `Bytes` buffer.
+/// Deserialized Ring index — two rings of wavelet matrices with prefix
+/// bit vectors and pair-change markers, backed by a shared `Bytes`
+/// buffer.
+///
+/// The forward ring (E→A→V) stores three sorted rotations whose last
+/// columns are `eav_c`, `vea_c`, and `ave_c`. The reverse ring
+/// (E→V→A) stores `eva_c`, `aev_c`, and `vae_c`. Together they cover
+/// all six attribute orderings needed for WCO joins without
+/// materialising six separate indexes.
 ///
 /// Implements [`Constraint`](crate::query::Constraint) via
 /// `TriblePattern::pattern`, so it can be used directly in `find!` and
@@ -163,17 +178,19 @@ where
 pub struct SuccinctArchive<U> {
     /// The underlying blob bytes (shared, zero-copy).
     pub bytes: Bytes,
-    /// Domain mapping from integer codes to raw 32-byte values.
+    /// The universe — maps integer codes to raw 32-byte values (the
+    /// domain of all distinct values appearing in E, A, or V positions).
     pub domain: U,
 
-    /// Number of distinct entities.
+    /// Number of distinct entities in the universe.
     pub entity_count: usize,
-    /// Number of distinct attributes.
+    /// Number of distinct attributes in the universe.
     pub attribute_count: usize,
-    /// Number of distinct values.
+    /// Number of distinct values in the universe.
     pub value_count: usize,
 
-    /// Entity-axis prefix bit vector.
+    /// Entity-axis prefix bit vector: unary encoding of group sizes for
+    /// the entity column, enabling rank/select navigation.
     pub e_a: BitVector<Rank9SelIndex>,
     /// Attribute-axis prefix bit vector.
     pub a_a: BitVector<Rank9SelIndex>,
@@ -199,17 +216,17 @@ pub struct SuccinctArchive<U> {
     /// in `vae_c`.
     pub changed_v_a: BitVector<Rank9SelIndex>,
 
-    /// EAV wavelet matrix — values indexed by entity→attribute order.
+    /// Forward ring: last column of EAV-sorted rotation (values).
     pub eav_c: WaveletMatrix<Rank9SelIndex>,
-    /// VEA wavelet matrix — attributes indexed by value→entity order.
+    /// Forward ring: last column of VEA-sorted rotation (attributes).
     pub vea_c: WaveletMatrix<Rank9SelIndex>,
-    /// AVE wavelet matrix — entities indexed by attribute→value order.
+    /// Forward ring: last column of AVE-sorted rotation (entities).
     pub ave_c: WaveletMatrix<Rank9SelIndex>,
-    /// VAE wavelet matrix — entities indexed by value→attribute order.
+    /// Reverse ring: last column of VAE-sorted rotation (entities).
     pub vae_c: WaveletMatrix<Rank9SelIndex>,
-    /// EVA wavelet matrix — attributes indexed by entity→value order.
+    /// Reverse ring: last column of EVA-sorted rotation (attributes).
     pub eva_c: WaveletMatrix<Rank9SelIndex>,
-    /// AEV wavelet matrix — values indexed by attribute→entity order.
+    /// Reverse ring: last column of AEV-sorted rotation (values).
     pub aev_c: WaveletMatrix<Rank9SelIndex>,
 }
 

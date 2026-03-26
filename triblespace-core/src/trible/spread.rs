@@ -11,8 +11,11 @@ use super::TribleSet;
 /// Plain iterators return an empty extra-facts set. A [`Fragment`] returns
 /// its exported ids as the values and its contained facts as the extras.
 pub trait Spread {
+    /// The type of each yielded value.
     type Item;
+    /// The iterator type returned by [`spread`](Spread::spread).
     type Iter: IntoIterator<Item = Self::Item>;
+    /// Decomposes the value into an iterator of items and extra facts to merge.
     fn spread(self) -> (Self::Iter, TribleSet);
 }
 

@@ -33,9 +33,13 @@ pub struct AttributeUsage {
 /// Source location metadata for attribute usages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AttributeUsageSource {
+    /// Fully qualified Rust module path (e.g. `"crate::schema::core"`).
     pub module_path: &'static str,
+    /// Source file path where the attribute is used.
     pub file: &'static str,
+    /// Line number within the source file.
     pub line: u32,
+    /// Column number within the source line.
     pub column: u32,
 }
 
@@ -248,6 +252,7 @@ where
     }
 }
 
+/// Re-export of [`RawId`](crate::id::RawId) used by generated macro code.
 pub use crate::id::RawId as RawIdAlias;
 
 #[cfg(test)]

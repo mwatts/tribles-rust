@@ -33,10 +33,12 @@ where
     T: TryFromBlob<S>,
     Handle<H, S>: ValueSchema,
 {
+    /// Creates a new cache backed by `blobs` with the default capacity.
     pub fn new(blobs: B) -> Self {
         Self::with_capacity(blobs, DEFAULT_BLOB_CACHE_CAPACITY)
     }
 
+    /// Creates a new cache backed by `blobs` with the given entry capacity.
     pub fn with_capacity(blobs: B, capacity: usize) -> Self {
         Self {
             blobs,
@@ -44,6 +46,7 @@ where
         }
     }
 
+    /// Returns the cached value for `handle`, fetching and converting it on a cache miss.
     pub fn get(&self, handle: Value<Handle<H, S>>) -> Result<Arc<T>, B::GetError<T::Error>> {
         let blobs = &self.blobs;
         self.by_handle.get_or_insert_with(&handle, || {

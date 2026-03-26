@@ -16,6 +16,7 @@ pub struct FUCIDsource {
 }
 
 impl Default for FUCIDsource {
+    /// Creates a new [`FUCIDsource`] with a random salt (equivalent to [`FUCIDsource::new`]).
     fn default() -> Self {
         Self::new()
     }

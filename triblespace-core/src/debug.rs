@@ -1,3 +1,4 @@
+/// Diagnostic wrappers for the query engine used in tests.
 pub mod query {
     use crate::query::Binding;
     use crate::query::Constraint;
@@ -7,12 +8,16 @@ pub mod query {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    /// Constraint wrapper that records which variables are proposed during query execution.
     pub struct DebugConstraint<C> {
+        /// The underlying constraint being observed.
         pub constraint: C,
+        /// Shared log of variable ids in the order they were proposed.
         pub record: Rc<RefCell<Vec<VariableId>>>,
     }
 
     impl<C> DebugConstraint<C> {
+        /// Wraps `constraint` and appends every proposed variable id to `record`.
         pub fn new(constraint: C, record: Rc<RefCell<Vec<VariableId>>>) -> Self {
             DebugConstraint { constraint, record }
         }
@@ -41,12 +46,16 @@ pub mod query {
         }
     }
 
+    /// Constraint wrapper that overrides cardinality estimates for selected variables.
     pub struct EstimateOverrideConstraint<C> {
+        /// The underlying constraint whose estimates may be overridden.
         pub constraint: C,
+        /// Per-variable estimate overrides; `None` falls through to the inner constraint.
         pub estimates: [Option<usize>; 128],
     }
 
     impl<C> EstimateOverrideConstraint<C> {
+        /// Creates a wrapper with no estimate overrides.
         pub fn new(constraint: C) -> Self {
             EstimateOverrideConstraint {
                 constraint,
@@ -54,6 +63,7 @@ pub mod query {
             }
         }
 
+        /// Creates a wrapper with the given estimate override array.
         pub fn with_estimates(constraint: C, estimates: [Option<usize>; 128]) -> Self {
             EstimateOverrideConstraint {
                 constraint,
@@ -61,6 +71,7 @@ pub mod query {
             }
         }
 
+        /// Overrides the cardinality estimate for `variable`.
         pub fn set_estimate(&mut self, variable: VariableId, estimate: usize) {
             self.estimates[variable] = Some(estimate);
         }

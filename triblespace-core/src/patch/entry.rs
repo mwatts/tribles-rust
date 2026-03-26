@@ -1,5 +1,6 @@
 use super::*;
 
+/// Reference-counted handle to a leaf node in a PATCH trie.
 #[derive(Debug)]
 #[repr(C)]
 pub struct Entry<const KEY_LEN: usize, V = ()> {
@@ -7,6 +8,7 @@ pub struct Entry<const KEY_LEN: usize, V = ()> {
 }
 
 impl<const KEY_LEN: usize> Entry<KEY_LEN> {
+    /// Creates a new entry with the given key and a unit value.
     pub fn new(key: &[u8; KEY_LEN]) -> Self {
         unsafe {
             let ptr = Leaf::<KEY_LEN, ()>::new(key, ());
@@ -16,6 +18,7 @@ impl<const KEY_LEN: usize> Entry<KEY_LEN> {
 }
 
 impl<const KEY_LEN: usize, V> Entry<KEY_LEN, V> {
+    /// Creates a new entry with the given key and associated value.
     pub fn with_value(key: &[u8; KEY_LEN], value: V) -> Self {
         unsafe {
             let ptr = Leaf::<KEY_LEN, V>::new(key, value);
@@ -23,6 +26,7 @@ impl<const KEY_LEN: usize, V> Entry<KEY_LEN, V> {
         }
     }
 
+    /// Returns a reference to the value stored in this entry.
     pub fn value(&self) -> &V {
         unsafe { &self.ptr.as_ref().value }
     }

@@ -86,6 +86,7 @@ pub fn init() {
 /// type is `mem::zeroed()`. Failure to uphold this contract may lead to
 /// incorrect behavior when entries are inserted into the table.
 pub unsafe trait ByteEntry {
+    /// Returns the byte key that identifies this entry's bucket.
     fn key(&self) -> u8;
 }
 
@@ -186,10 +187,15 @@ fn plan_insert<T: ByteEntry + Debug>(
     None
 }
 
+/// Operations on a cuckoo hash table indexed by single-byte keys.
 pub trait ByteTable<T: ByteEntry + Debug> {
+    /// Looks up an entry by its byte key, returning a reference if found.
     fn table_get(&self, byte_key: u8) -> Option<&T>;
+    /// Returns a mutable reference to the slot holding `byte_key`, if present.
     fn table_get_slot(&mut self, byte_key: u8) -> Option<&mut Option<T>>;
+    /// Inserts `entry` into the table, returning it back if the table is full.
     fn table_insert(&mut self, entry: T) -> Option<T>;
+    /// Moves entries from `self` into `grown`, which must be twice the size.
     fn table_grow(&mut self, grown: &mut Self);
 }
 
