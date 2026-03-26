@@ -39,6 +39,7 @@ where
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
         self.constraints
             .iter()
+            .filter(|c| c.satisfied(binding))
             .for_each(|c| c.propose(variable, binding, proposals));
         proposals.sort_unstable();
         proposals.dedup();
@@ -50,6 +51,7 @@ where
         let union: Vec<_> = self
             .constraints
             .iter()
+            .filter(|c| c.satisfied(binding))
             .map(|c| {
                 let mut proposals = proposals.clone();
                 c.confirm(variable, binding, &mut proposals);
@@ -60,6 +62,10 @@ where
             .collect();
 
         _ = mem::replace(proposals, union);
+    }
+
+    fn satisfied(&self, binding: &Binding) -> bool {
+        self.constraints.iter().any(|c| c.satisfied(binding))
     }
 
     fn influence(&self, variable: VariableId) -> VariableSet {

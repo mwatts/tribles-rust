@@ -63,6 +63,10 @@ where
             .for_each(|(_, c)| c.confirm(variable, binding, proposals));
     }
 
+    fn satisfied(&self, binding: &Binding) -> bool {
+        self.constraints.iter().all(|c| c.satisfied(binding))
+    }
+
     fn influence(&self, variable: VariableId) -> VariableSet {
         self.constraints
             .iter()

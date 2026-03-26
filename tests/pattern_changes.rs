@@ -62,3 +62,42 @@ fn pattern_changes_empty_delta_returns_no_matches() {
 
     assert!(results.is_empty());
 }
+
+/// Regression: pattern_changes with a multi-entity join should only return
+/// results involving at least one trible from the delta. When the delta adds
+/// a new book by an existing author, only the new book's title should appear,
+/// not the existing book's title.
+#[test]
+fn pattern_changes_multi_entity_delta_only_new_results() {
+    let shakespeare = ufoid();
+    let hamlet = ufoid();
+    let macbeth = ufoid();
+
+    // Base: Shakespeare + Hamlet
+    let mut base = TribleSet::new();
+    base += entity! { &shakespeare @ literature::firstname: "William", literature::lastname: "Shakespeare" };
+    base += entity! { &hamlet @ literature::title: "Hamlet", literature::author: &shakespeare };
+
+    // Delta: only Macbeth (references existing shakespeare entity)
+    let mut delta = TribleSet::new();
+    delta += entity! { &macbeth @ literature::title: "Macbeth", literature::author: &shakespeare };
+
+    // Full = base + delta
+    let full = base + delta.clone();
+
+    // Should find only Macbeth — Hamlet has no tribles in delta.
+    let results: Vec<String> = find!(
+        title: String,
+        pattern_changes!(&full, &delta, [
+            { _?author @ literature::firstname: "William" },
+            { _?book @ literature::author: _?author, literature::title: ?title }
+        ])
+    )
+    .collect();
+
+    assert_eq!(
+        results,
+        vec!["Macbeth".to_string()],
+        "expected only new book, got: {results:?}"
+    );
+}

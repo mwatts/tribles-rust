@@ -38,4 +38,11 @@ impl<'a> Constraint<'a> for ConstantConstraint {
             proposals.retain(|v| *v == self.constant);
         }
     }
+
+    fn satisfied(&self, binding: &Binding) -> bool {
+        match binding.get(self.variable) {
+            Some(v) => *v == self.constant,
+            None => true,
+        }
+    }
 }

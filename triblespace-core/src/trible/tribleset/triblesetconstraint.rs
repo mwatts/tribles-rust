@@ -349,6 +349,28 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
             _ => panic!("invalid trible constraint state"),
         }
     }
+
+    fn satisfied(&self, binding: &Binding) -> bool {
+        let e = binding.get(self.variable_e);
+        let a = binding.get(self.variable_a);
+        let v = binding.get(self.variable_v);
+        match (e, a, v) {
+            (Some(e_raw), Some(a_raw), Some(v_raw)) => {
+                let Some(e) = id_from_value(e_raw) else {
+                    return false;
+                };
+                let Some(a) = id_from_value(a_raw) else {
+                    return false;
+                };
+                let mut prefix = [0u8; ID_LEN + ID_LEN + VALUE_LEN];
+                prefix[0..ID_LEN].copy_from_slice(&e);
+                prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&a);
+                prefix[ID_LEN + ID_LEN..].copy_from_slice(v_raw);
+                self.set.eav.has_prefix(&prefix)
+            }
+            _ => true,
+        }
+    }
 }
 
 #[cfg(test)]

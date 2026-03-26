@@ -282,6 +282,22 @@ pub trait Constraint<'a> {
     /// If the variable is not used by the constraint, the method should do nothing.
     fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>);
 
+    /// Check whether this constraint is consistent with the current binding.
+    ///
+    /// Returns `false` when all of the constraint's variables are already
+    /// bound and the constraint can determine that no solution exists for
+    /// those bindings (e.g. a triple that does not exist in the dataset).
+    /// The default implementation optimistically returns `true`.
+    ///
+    /// Composite constraints (intersection, union) override this to
+    /// propagate unsatisfiability from their children so that dead
+    /// branches are pruned even when the unsatisfied sub-constraint
+    /// does not share variables with the variable currently being
+    /// explored.
+    fn satisfied(&self, _binding: &Binding) -> bool {
+        true
+    }
+
     /// Return the set of variables potentially influenced when the passed
     /// variable is bound or unbound.
     ///
@@ -320,6 +336,11 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.confirm(variable, binding, proposals)
     }
 
+    fn satisfied(&self, binding: &Binding) -> bool {
+        let inner: &T = self;
+        inner.satisfied(binding)
+    }
+
     fn influence(&self, variable: VariableId) -> VariableSet {
         let inner: &T = self;
         inner.influence(variable)
@@ -345,6 +366,11 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'static> for std::sync::Arc<T> {
     fn confirm(&self, variable: VariableId, binding: &Binding, proposal: &mut Vec<RawValue>) {
         let inner: &T = self;
         inner.confirm(variable, binding, proposal)
+    }
+
+    fn satisfied(&self, binding: &Binding) -> bool {
+        let inner: &T = self;
+        inner.satisfied(binding)
     }
 
     fn influence(&self, variable: VariableId) -> VariableSet {
