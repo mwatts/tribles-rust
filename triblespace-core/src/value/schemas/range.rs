@@ -213,3 +213,121 @@ impl TryFromValue<'_, RangeInclusiveU128> for RangeInclusive<u128> {
         Ok(start..=end)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value::{ToValue, TryFromValue, TryToValue};
+
+    // --- RangeU128 tuple roundtrip ---
+
+    #[test]
+    fn range_u128_tuple_roundtrip() {
+        let input: (u128, u128) = (10, 20);
+        let value: Value<RangeU128> = input.to_value();
+        let output: (u128, u128) = value.from_value();
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn range_u128_tuple_zero() {
+        let input: (u128, u128) = (0, 0);
+        let value: Value<RangeU128> = input.to_value();
+        let output: (u128, u128) = value.from_value();
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn range_u128_tuple_max() {
+        let input: (u128, u128) = (u128::MAX, u128::MAX);
+        let value: Value<RangeU128> = input.to_value();
+        let output: (u128, u128) = value.from_value();
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn range_u128_tuple_mixed_bounds() {
+        let input: (u128, u128) = (0, u128::MAX);
+        let value: Value<RangeU128> = input.to_value();
+        let output: (u128, u128) = value.from_value();
+        assert_eq!(input, output);
+    }
+
+    // --- RangeU128 Range<u128> roundtrip ---
+
+    #[test]
+    fn range_u128_range_roundtrip() {
+        let input: Range<u128> = 5..15;
+        let value: Value<RangeU128> = input.clone().try_to_value().unwrap();
+        let output = Range::<u128>::try_from_value(&value).unwrap();
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn range_u128_empty_range() {
+        let input: Range<u128> = 10..10;
+        let value: Value<RangeU128> = input.clone().try_to_value().unwrap();
+        let output = Range::<u128>::try_from_value(&value).unwrap();
+        assert_eq!(input, output);
+    }
+
+    // --- RangeInclusiveU128 tuple roundtrip ---
+
+    #[test]
+    fn range_inclusive_tuple_roundtrip() {
+        let input: (u128, u128) = (100, 200);
+        let value: Value<RangeInclusiveU128> = input.to_value();
+        let output: (u128, u128) = value.from_value();
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn range_inclusive_tuple_zero() {
+        let input: (u128, u128) = (0, 0);
+        let value: Value<RangeInclusiveU128> = input.to_value();
+        let output: (u128, u128) = value.from_value();
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn range_inclusive_tuple_max() {
+        let input: (u128, u128) = (u128::MAX, u128::MAX);
+        let value: Value<RangeInclusiveU128> = input.to_value();
+        let output: (u128, u128) = value.from_value();
+        assert_eq!(input, output);
+    }
+
+    // --- RangeInclusiveU128 RangeInclusive<u128> roundtrip ---
+
+    #[test]
+    fn range_inclusive_range_roundtrip() {
+        let input: RangeInclusive<u128> = 5..=15;
+        let value: Value<RangeInclusiveU128> = input.clone().try_to_value().unwrap();
+        let output = RangeInclusive::<u128>::try_from_value(&value).unwrap();
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn range_inclusive_single_element() {
+        let input: RangeInclusive<u128> = 42..=42;
+        let value: Value<RangeInclusiveU128> = input.clone().try_to_value().unwrap();
+        let output = RangeInclusive::<u128>::try_from_value(&value).unwrap();
+        assert_eq!(input, output);
+    }
+
+    // --- Cross-type consistency ---
+
+    #[test]
+    fn range_u128_tuple_and_range_agree() {
+        let tuple_val: Value<RangeU128> = (10u128, 20u128).to_value();
+        let range_val: Value<RangeU128> = (10u128..20u128).try_to_value().unwrap();
+        assert_eq!(tuple_val.raw, range_val.raw);
+    }
+
+    #[test]
+    fn range_inclusive_tuple_and_range_agree() {
+        let tuple_val: Value<RangeInclusiveU128> = (10u128, 20u128).to_value();
+        let range_val: Value<RangeInclusiveU128> = (10u128..=20u128).try_to_value().unwrap();
+        assert_eq!(tuple_val.raw, range_val.raw);
+    }
+}

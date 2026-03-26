@@ -604,3 +604,270 @@ impl_try_from_u256!(U256BE, ethnum::U256, u8, u16, u32, u64, u128);
 impl_try_from_u256!(U256LE, ethnum::U256, u8, u16, u32, u64, u128);
 impl_try_from_u256!(I256BE, ethnum::I256, i8, i16, i32, i64, i128);
 impl_try_from_u256!(I256LE, ethnum::I256, i8, i16, i32, i64, i128);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value::{ToValue, TryFromValue};
+
+    // --- U256BE tests ---
+
+    #[test]
+    fn u256be_ethnum_roundtrip_zero() {
+        let input = ethnum::U256::ZERO;
+        let value: Value<U256BE> = input.to_value();
+        let output: ethnum::U256 = value.from_value();
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn u256be_ethnum_roundtrip_one() {
+        let input = ethnum::U256::ONE;
+        let value: Value<U256BE> = input.to_value();
+        let output: ethnum::U256 = value.from_value();
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn u256be_ethnum_roundtrip_max() {
+        let input = ethnum::U256::MAX;
+        let value: Value<U256BE> = input.to_value();
+        let output: ethnum::U256 = value.from_value();
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn u256be_u128_to_value_roundtrip() {
+        let input: u128 = 12345678901234567890;
+        let value: Value<U256BE> = input.to_value();
+        let output = u128::try_from_value(&value).expect("fits in u128");
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn u256be_u64_to_value_roundtrip() {
+        let input: u64 = 9999999;
+        let value: Value<U256BE> = input.to_value();
+        let output = u64::try_from_value(&value).expect("fits in u64");
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn u256be_u32_to_value_roundtrip() {
+        let input: u32 = 42;
+        let value: Value<U256BE> = input.to_value();
+        let output = u32::try_from_value(&value).expect("fits in u32");
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn u256be_u16_to_value_roundtrip() {
+        let input: u16 = 1000;
+        let value: Value<U256BE> = input.to_value();
+        let output = u16::try_from_value(&value).expect("fits in u16");
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn u256be_u8_to_value_roundtrip() {
+        let input: u8 = 255;
+        let value: Value<U256BE> = input.to_value();
+        let output = u8::try_from_value(&value).expect("fits in u8");
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn u256be_narrowing_overflow() {
+        let input = ethnum::U256::from(u128::MAX) + ethnum::U256::ONE;
+        let value: Value<U256BE> = input.to_value();
+        assert!(u128::try_from_value(&value).is_err());
+    }
+
+    // --- U256LE tests ---
+
+    #[test]
+    fn u256le_ethnum_roundtrip_zero() {
+        let input = ethnum::U256::ZERO;
+        let value: Value<U256LE> = input.to_value();
+        let output: ethnum::U256 = value.from_value();
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn u256le_ethnum_roundtrip_max() {
+        let input = ethnum::U256::MAX;
+        let value: Value<U256LE> = input.to_value();
+        let output: ethnum::U256 = value.from_value();
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn u256le_u128_roundtrip() {
+        let input: u128 = u128::MAX;
+        let value: Value<U256LE> = input.to_value();
+        let output = u128::try_from_value(&value).expect("fits in u128");
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn u256le_u64_roundtrip() {
+        let input: u64 = u64::MAX;
+        let value: Value<U256LE> = input.to_value();
+        let output = u64::try_from_value(&value).expect("fits in u64");
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn u256_le_and_be_differ() {
+        let input = ethnum::U256::from(0x0102030405060708u64);
+        let le_val: Value<U256LE> = input.to_value();
+        let be_val: Value<U256BE> = input.to_value();
+        assert_ne!(le_val.raw, be_val.raw);
+    }
+
+    // --- I256BE tests ---
+
+    #[test]
+    fn i256be_ethnum_roundtrip_zero() {
+        let input = ethnum::I256::ZERO;
+        let value: Value<I256BE> = input.to_value();
+        let output: ethnum::I256 = value.from_value();
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn i256be_ethnum_roundtrip_one() {
+        let input = ethnum::I256::ONE;
+        let value: Value<I256BE> = input.to_value();
+        let output: ethnum::I256 = value.from_value();
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn i256be_ethnum_roundtrip_neg_one() {
+        let input = ethnum::I256::MINUS_ONE;
+        let value: Value<I256BE> = input.to_value();
+        let output: ethnum::I256 = value.from_value();
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn i256be_ethnum_roundtrip_max() {
+        let input = ethnum::I256::MAX;
+        let value: Value<I256BE> = input.to_value();
+        let output: ethnum::I256 = value.from_value();
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn i256be_ethnum_roundtrip_min() {
+        let input = ethnum::I256::MIN;
+        let value: Value<I256BE> = input.to_value();
+        let output: ethnum::I256 = value.from_value();
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn i256be_i128_to_value_roundtrip() {
+        let input: i128 = -42;
+        let value: Value<I256BE> = input.to_value();
+        let output = i128::try_from_value(&value).expect("fits in i128");
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn i256be_i64_to_value_roundtrip() {
+        let input: i64 = i64::MIN;
+        let value: Value<I256BE> = input.to_value();
+        let output = i64::try_from_value(&value).expect("fits in i64");
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn i256be_i32_to_value_roundtrip() {
+        let input: i32 = -1000;
+        let value: Value<I256BE> = input.to_value();
+        let output = i32::try_from_value(&value).expect("fits in i32");
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn i256be_i8_to_value_roundtrip() {
+        let input: i8 = -128;
+        let value: Value<I256BE> = input.to_value();
+        let output = i8::try_from_value(&value).expect("fits in i8");
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn i256be_narrowing_overflow_positive() {
+        let input = ethnum::I256::from(i128::MAX) + ethnum::I256::ONE;
+        let value: Value<I256BE> = input.to_value();
+        assert!(i128::try_from_value(&value).is_err());
+    }
+
+    #[test]
+    fn i256be_narrowing_overflow_negative() {
+        let input = ethnum::I256::from(i128::MIN) - ethnum::I256::ONE;
+        let value: Value<I256BE> = input.to_value();
+        assert!(i128::try_from_value(&value).is_err());
+    }
+
+    // --- I256LE tests ---
+
+    #[test]
+    fn i256le_ethnum_roundtrip_zero() {
+        let input = ethnum::I256::ZERO;
+        let value: Value<I256LE> = input.to_value();
+        let output: ethnum::I256 = value.from_value();
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn i256le_ethnum_roundtrip_neg_one() {
+        let input = ethnum::I256::MINUS_ONE;
+        let value: Value<I256LE> = input.to_value();
+        let output: ethnum::I256 = value.from_value();
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn i256le_ethnum_roundtrip_max() {
+        let input = ethnum::I256::MAX;
+        let value: Value<I256LE> = input.to_value();
+        let output: ethnum::I256 = value.from_value();
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn i256le_ethnum_roundtrip_min() {
+        let input = ethnum::I256::MIN;
+        let value: Value<I256LE> = input.to_value();
+        let output: ethnum::I256 = value.from_value();
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn i256le_i128_roundtrip() {
+        let input: i128 = i128::MIN;
+        let value: Value<I256LE> = input.to_value();
+        let output = i128::try_from_value(&value).expect("fits in i128");
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn i256le_i64_roundtrip() {
+        let input: i64 = 777;
+        let value: Value<I256LE> = input.to_value();
+        let output = i64::try_from_value(&value).expect("fits in i64");
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn i256_le_and_be_differ() {
+        let input = ethnum::I256::from(-42i64);
+        let le_val: Value<I256LE> = input.to_value();
+        let be_val: Value<I256BE> = input.to_value();
+        assert_ne!(le_val.raw, be_val.raw);
+    }
+}

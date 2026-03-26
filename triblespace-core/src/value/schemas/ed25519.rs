@@ -242,3 +242,103 @@ impl TryFromValue<'_, ED25519PublicKey> for VerifyingKey {
         VerifyingKey::from_bytes(&v.raw)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value::{ToValue, TryFromValue};
+    use ed25519::Signature;
+    use ed25519_dalek::SigningKey;
+
+    fn test_signature() -> Signature {
+        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        use ed25519_dalek::Signer;
+        let sig = signing_key.sign(b"test message");
+        Signature::from_bytes(&sig.to_bytes())
+    }
+
+    fn test_verifying_key() -> VerifyingKey {
+        let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+        signing_key.verifying_key()
+    }
+
+    #[test]
+    fn r_component_from_signature_roundtrip() {
+        let sig = test_signature();
+        let value: Value<ED25519RComponent> = sig.to_value();
+        let bytes: ComponentBytes = value.from_value();
+        assert_eq!(&bytes, sig.r_bytes());
+    }
+
+    #[test]
+    fn s_component_from_signature_roundtrip() {
+        let sig = test_signature();
+        let value: Value<ED25519SComponent> = sig.to_value();
+        let bytes: ComponentBytes = value.from_value();
+        assert_eq!(&bytes, sig.s_bytes());
+    }
+
+    #[test]
+    fn r_component_bytes_roundtrip() {
+        let input: ComponentBytes = [0xAB; 32];
+        let value: Value<ED25519RComponent> = input.to_value();
+        let output: ComponentBytes = value.from_value();
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn s_component_bytes_roundtrip() {
+        let input: ComponentBytes = [0xCD; 32];
+        let value: Value<ED25519SComponent> = input.to_value();
+        let output: ComponentBytes = value.from_value();
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn r_component_zero_bytes() {
+        let input: ComponentBytes = [0u8; 32];
+        let value: Value<ED25519RComponent> = input.to_value();
+        let output: ComponentBytes = value.from_value();
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn s_component_max_bytes() {
+        let input: ComponentBytes = [0xFF; 32];
+        let value: Value<ED25519SComponent> = input.to_value();
+        let output: ComponentBytes = value.from_value();
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn verifying_key_roundtrip() {
+        let key = test_verifying_key();
+        let value: Value<ED25519PublicKey> = key.to_value();
+        let recovered = VerifyingKey::try_from_value(&value).expect("valid key");
+        assert_eq!(key, recovered);
+    }
+
+    #[test]
+    fn verifying_key_invalid_bytes() {
+        // A y-coordinate of 2 is not on the Ed25519 curve, so decompression
+        // should fail.
+        let mut raw = [0u8; 32];
+        raw[0] = 2;
+        let value: Value<ED25519PublicKey> = Value::new(raw);
+        assert!(VerifyingKey::try_from_value(&value).is_err());
+    }
+
+    #[test]
+    fn signature_r_and_s_reconstruct() {
+        let sig = test_signature();
+        let r_val: Value<ED25519RComponent> = sig.to_value();
+        let s_val: Value<ED25519SComponent> = sig.to_value();
+        let r_bytes: ComponentBytes = r_val.from_value();
+        let s_bytes: ComponentBytes = s_val.from_value();
+        let mut combined = [0u8; 64];
+        combined[..32].copy_from_slice(&r_bytes);
+        combined[32..].copy_from_slice(&s_bytes);
+        let reconstructed = Signature::from_bytes(&combined);
+        assert_eq!(sig, reconstructed);
+    }
+}
