@@ -55,12 +55,15 @@ pub struct TribleSet {
 pub struct TribleSetFingerprint(Option<u128>);
 
 impl TribleSetFingerprint {
+    /// Fingerprint of an empty set.
     pub const EMPTY: Self = Self(None);
 
+    /// Returns `true` for the empty-set fingerprint.
     pub fn is_empty(self) -> bool {
         self.0.is_none()
     }
 
+    /// Returns the raw 128-bit hash, or `None` for an empty set.
     pub fn as_u128(self) -> Option<u128> {
         self.0
     }
@@ -69,6 +72,7 @@ impl TribleSetFingerprint {
 type TribleSetInner<'a> =
     Map<crate::patch::PATCHIterator<'a, 64, EAVOrder, ()>, fn(&[u8; 64]) -> &Trible>;
 
+/// Iterator over the tribles in a [`TribleSet`], yielded in EAV order.
 pub struct TribleSetIterator<'a> {
     inner: TribleSetInner<'a>,
 }
@@ -86,6 +90,7 @@ impl TribleSet {
         self.vae.union(other.vae);
     }
 
+    /// Returns a new set containing only tribles present in both sets.
     pub fn intersect(&self, other: &Self) -> Self {
         Self {
             eav: self.eav.intersect(&other.eav),
@@ -97,6 +102,7 @@ impl TribleSet {
         }
     }
 
+    /// Returns a new set containing tribles in `self` but not in `other`.
     pub fn difference(&self, other: &Self) -> Self {
         Self {
             eav: self.eav.difference(&other.eav),
@@ -108,6 +114,7 @@ impl TribleSet {
         }
     }
 
+    /// Creates an empty set.
     pub fn new() -> TribleSet {
         TribleSet {
             eav: PATCH::<TRIBLE_LEN, EAVOrder, ()>::new(),
@@ -119,10 +126,12 @@ impl TribleSet {
         }
     }
 
+    /// Returns the number of tribles in the set.
     pub fn len(&self) -> usize {
         self.eav.len() as usize
     }
 
+    /// Returns `true` when the set contains no tribles.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -135,6 +144,7 @@ impl TribleSet {
         TribleSetFingerprint(self.eav.root_hash())
     }
 
+    /// Inserts a trible into all six covering indexes.
     pub fn insert(&mut self, trible: &Trible) {
         let key = Entry::new(&trible.data);
         self.eav.insert(&key);
@@ -145,10 +155,12 @@ impl TribleSet {
         self.vae.insert(&key);
     }
 
+    /// Returns `true` when the exact trible is present in the set.
     pub fn contains(&self, trible: &Trible) -> bool {
         self.eav.has_prefix(&trible.data)
     }
 
+    /// Iterates over all tribles in EAV order.
     pub fn iter(&self) -> TribleSetIterator<'_> {
         TribleSetIterator {
             inner: self
