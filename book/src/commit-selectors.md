@@ -64,7 +64,7 @@ commits introduced since the last checkout.
 - `CommitHandle` – a single commit.
 - `Vec<CommitHandle>` and `&[CommitHandle]` – explicit lists of commits.
 - `ancestors(commit)` – a commit and all of its ancestors.
-- `nth_ancestor(commit, n)` – follows the first-parent chain `n` steps.
+- `nth_ancestors(selector, n)` – walks every commit in `selector` back `n` parent steps through all parent links (merges included).
 - `parents(commit)` – direct parents of a commit.
 - `symmetric_diff(a, b)` – commits reachable from either `a` or `b` but not
   both.
@@ -186,7 +186,7 @@ than commits are listed for completeness but are unlikely to be implemented.
 |-----------|-------------------|-----------|--------|
 | `A` | `commit(A)` | [gitrevisions](https://git-scm.com/docs/gitrevisions#_specifying_revisions) | Implemented |
 | `A^`/`A^N` | `nth_parent(A, N)` | [gitrevisions](https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-revnegHEADv1510) | Not planned |
-| `A~N` | `nth_ancestor(A, N)` | [gitrevisions](https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-revnegHEADmaster3) | Implemented |
+| `A~N` | `nth_ancestors(A, N)` | [gitrevisions](https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-revnegHEADmaster3) | Implemented |
 | `A^@` | `parents(A)` | [gitrevisions](https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-revegHEAD) | Implemented |
 | `A^!` | `A minus parents(A)` | [gitrevisions](https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-revegHEAD-1) | Unimplemented |
 | `A^-N` | `A minus nth_parent(A, N)` | [gitrevisions](https://git-scm.com/docs/gitrevisions#Documentation/gitrevisions.txt-rev-negHEAD-HEAD-2) | Not planned |

@@ -5,7 +5,7 @@ use triblespace::core::repo::difference;
 use triblespace::core::repo::history_of;
 use triblespace::core::repo::intersect;
 use triblespace::core::repo::memoryrepo::MemoryRepo;
-use triblespace::core::repo::nth_ancestor;
+use triblespace::core::repo::nth_ancestors;
 use triblespace::core::repo::parents;
 use triblespace::core::repo::symmetric_diff;
 use triblespace::core::repo::union;
@@ -499,12 +499,12 @@ fn workspace_nth_ancestor_selector() {
     let head = ws.head().unwrap();
 
     let result = ws
-        .checkout(nth_ancestor(head, 2))
+        .checkout(nth_ancestors(head, 2))
         .expect("checkout nth ancestor");
     assert_eq!(result, sets[0]);
 
     let empty = ws
-        .checkout(nth_ancestor(head, 3))
+        .checkout(nth_ancestors(head, 3))
         .expect("checkout past root");
     assert_eq!(empty.len(), 0);
 }

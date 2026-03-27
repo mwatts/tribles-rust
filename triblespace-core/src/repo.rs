@@ -1309,12 +1309,18 @@ pub fn ancestors(commit: CommitHandle) -> Ancestors {
     Ancestors(commit)
 }
 
-/// Selector that returns the Nth ancestor along the first-parent chain.
-pub struct NthAncestor(pub CommitHandle, pub usize);
+/// Selector that walks every commit in the input set back N parent steps,
+/// following all parent links (including merge parents). Returns the set
+/// of all commits found at exactly depth N from the starting set.
+///
+/// This is a wavefront expansion: at each step, every commit in the current
+/// frontier is replaced by all of its parents. After N steps the frontier
+/// is the result.
+pub struct NthAncestors<S>(pub S, pub usize);
 
-/// Convenience function to create an [`NthAncestor`] selector.
-pub fn nth_ancestor(commit: CommitHandle, n: usize) -> NthAncestor {
-    NthAncestor(commit, n)
+/// Walk `selector` back `n` parent steps through all parent links.
+pub fn nth_ancestors<S>(selector: S, n: usize) -> NthAncestors<S> {
+    NthAncestors(selector, n)
 }
 
 /// Selector that returns the direct parents of a commit.
@@ -1491,9 +1497,10 @@ where
     }
 }
 
-impl<Blobs> CommitSelector<Blobs> for NthAncestor
+impl<Blobs, S> CommitSelector<Blobs> for NthAncestors<S>
 where
     Blobs: BlobStore<Blake3>,
+    S: CommitSelector<Blobs>,
 {
     fn select(
         self,
@@ -1502,22 +1509,26 @@ where
         CommitSet,
         WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
     > {
-        let mut current = self.0;
+        let mut frontier = self.0.select(ws)?;
         let mut remaining = self.1;
 
-        while remaining > 0 {
-            let meta: TribleSet = ws.get(current).map_err(WorkspaceCheckoutError::Storage)?;
-            let mut parents = find!((p: Value<_>), pattern!(&meta, [{ parent: ?p }]));
-            let Some((p,)) = parents.next() else {
-                return Ok(CommitSet::new());
-            };
-            current = p;
+        while remaining > 0 && !frontier.is_empty() {
+            // Collect current frontier keys before mutating.
+            let keys: Vec<[u8; VALUE_LEN]> = frontier.iter().copied().collect();
+            let mut next_frontier = CommitSet::new();
+            for raw in keys {
+                let handle = CommitHandle::new(raw);
+                let meta: TribleSet =
+                    ws.get(handle).map_err(WorkspaceCheckoutError::Storage)?;
+                for (p,) in find!((p: Value<_>), pattern!(&meta, [{ parent: ?p }])) {
+                    next_frontier.insert(&Entry::new(&p.raw));
+                }
+            }
+            frontier = next_frontier;
             remaining -= 1;
         }
 
-        let mut patch = CommitSet::new();
-        patch.insert(&Entry::new(&current.raw));
-        Ok(patch)
+        Ok(frontier)
     }
 }
 

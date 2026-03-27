@@ -37,7 +37,7 @@ authors, signatures, and optional messages. The metadata itself lives in a
 ### Commit Selector
 A query primitive that walks a repository’s commit graph to identify commits of
 interest. Selectors power history traversals such as `parents`,
-`nth_ancestor`, ranges like `a..b`, and helpers such as `history_of(entity)`.
+`nth_ancestors`, ranges like `a..b`, and helpers such as `history_of(entity)`.
 
 ### Entity
 The first position in a trible. Entities identify the subject making a
