@@ -688,6 +688,34 @@ proptest! {
     }
 
     #[test]
+    fn path_concatenation_two_hops(
+        chain_len in 3..6usize,
+    ) {
+        let mut set = TribleSet::new();
+        let entities: Vec<_> = (0..chain_len).map(|_| rngid()).collect();
+
+        // Chain: e0 → e1 → e2 → ...
+        for i in 0..chain_len - 1 {
+            set += entity! { &entities[i] @ test_ns::link: &entities[i + 1] };
+        }
+
+        // Two-hop path from e0 should reach e2
+        let start_val = (&entities[0]).to_value();
+        let results: Vec<(Value<_>, Value<_>)> = find!(
+            (s: Value<_>, d: Value<_>),
+            and!(s.is(start_val), path!(set.clone(), s (test_ns::link)(test_ns::link) d))
+        ).collect();
+
+        // e0 → e1 → e2: should find e2
+        prop_assert!(results.iter().any(|(_, d)| *d == (&entities[2]).to_value()),
+            "two-hop should reach e2");
+
+        // Should NOT find e1 (that's one hop, not two)
+        prop_assert!(!results.iter().any(|(_, d)| *d == (&entities[1]).to_value()),
+            "two-hop should not include one-hop target");
+    }
+
+    #[test]
     fn path_reflexive_closure_includes_start(
         chain_len in 2..5usize,
     ) {

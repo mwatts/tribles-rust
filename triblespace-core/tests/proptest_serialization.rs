@@ -227,4 +227,38 @@ proptest! {
         prop_assert_eq!(set_results, archive_results,
             "entity scan should match between TribleSet and SuccinctArchive");
     }
+
+    #[test]
+    fn succinct_archive_attribute_scan_matches(set in arb_tribleset(15)) {
+        use triblespace_core::blob::schemas::succinctarchive::SuccinctArchive;
+        use triblespace_core::blob::schemas::succinctarchive::OrderedUniverse;
+
+        if set.is_empty() { return Ok(()); }
+
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+
+        // Pick the first trible's attribute
+        let first = set.iter().next().unwrap();
+        let attr_val = {
+            let mut v = [0u8; 32];
+            v[16..32].copy_from_slice(&first.data[16..32]);
+            Value::<valueschemas::GenId>::new(v)
+        };
+
+        // Query with bound attribute
+        let mut set_results: Vec<_> = find!(
+            (e: Value<_>, v: Value<UnknownValue>),
+            temp!((a), and!(a.is(attr_val), set.pattern(e, a, v as Variable<UnknownValue>)))
+        ).collect();
+
+        let mut archive_results: Vec<_> = find!(
+            (e: Value<_>, v: Value<UnknownValue>),
+            temp!((a), and!(a.is(attr_val), archive.pattern(e, a, v as Variable<UnknownValue>)))
+        ).collect();
+
+        set_results.sort();
+        archive_results.sort();
+        prop_assert_eq!(set_results, archive_results,
+            "attribute-bound scan should match");
+    }
 }
