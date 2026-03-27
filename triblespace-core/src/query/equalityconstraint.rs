@@ -30,9 +30,13 @@ impl<'c> Constraint<'c> for EqualityConstraint {
         vs
     }
 
-    /// Returns `Some(1)` when the other variable is already bound
-    /// (exactly one value is possible). Returns the full domain
-    /// estimate when neither is bound.
+    /// Returns `Some(1)` when the peer variable is already bound
+    /// (exactly one candidate). Returns `None` when the peer is
+    /// unbound — the constraint has no independent opinion about the
+    /// variable's cardinality and defers to other constraints in the
+    /// intersection. This is safe as long as each variable also appears
+    /// in at least one other constraint (which the macro desugaring
+    /// guarantees).
     fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
         if variable == self.a {
             if binding.get(self.b).is_some() {

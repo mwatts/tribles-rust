@@ -854,6 +854,10 @@ pub fn pattern_changes_impl(
 
     for (entity_idx, entity) in pattern.into_iter().enumerate() {
         let e_ident = format_ident!("__e{}", entity_idx, span = Span::mixed_site());
+        let entity_local_key: Option<String> = match entity.id {
+            Some(Value::LocalVar(ref ident)) => Some(format!("_?{}", ident)),
+            _ => None,
+        };
         match entity.id {
             Some(ref id_val) => match id_val {
                 Value::Var(ref ident) => {
@@ -929,9 +933,23 @@ pub fn pattern_changes_impl(
                 }
                 Value::LocalVar(ref var_ident) => {
                     let local_ident = get_local_var(var_ident);
-                    value_decl_tokens.extend(quote! {
-                        let #v_ident = #af_ident.as_variable(#local_ident);
-                    });
+                    let value_local_key = format!("_?{}", var_ident);
+                    if entity_local_key.as_ref() == Some(&value_local_key) {
+                        // Self-referencing: create fresh alias + equality
+                        let alias_ident = format_ident!("__alias{}", value_idx, span = Span::mixed_site());
+                        value_idx += 1;
+                        value_decl_tokens.extend(quote! {
+                            let #alias_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #ctx_ident.next_variable();
+                            let #v_ident = #af_ident.as_variable(#alias_ident);
+                        });
+                        entity_const_tokens.extend(quote! {
+                            constraints.push(Box::new(#base_path::query::equalityconstraint::EqualityConstraint::new(#e_ident.index, #alias_ident.index)));
+                        });
+                    } else {
+                        value_decl_tokens.extend(quote! {
+                            let #v_ident = #af_ident.as_variable(#local_ident);
+                        });
+                    }
                 }
             }
 
