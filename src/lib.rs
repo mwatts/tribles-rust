@@ -169,7 +169,7 @@ mod readme_example {
                 println!("Collaborator recorded: '{first}'.");
             }
 
-            conflict_ws.merge(&mut ws).expect("merge");
+            // Accept their history — abandon our conflicting commit.
             ws = conflict_ws;
 
             ws.commit(

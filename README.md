@@ -167,11 +167,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Collaborator recorded: '{first}'.");
         }
 
-        // Accept their history, merge our staged commits on top, and
-        // record both names — the legal name stays, ours becomes an alias.
-        conflict_ws.merge(&mut ws).expect("merge");
+        // Accept their history — abandon our conflicting firstname
+        // commit and continue from the collaborator's state instead.
         ws = conflict_ws;
 
+        // Record our preferred name as an alias rather than overwriting.
         ws.commit(
             entity! { &herbert @ literature::alias: "Francis" },
             "keep pen-name as alias",
