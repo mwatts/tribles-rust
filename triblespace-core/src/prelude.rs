@@ -67,6 +67,8 @@ pub use crate::repo::BlobStoreGet;
 pub use crate::repo::BlobStoreList;
 pub use crate::repo::BlobStorePut;
 pub use crate::repo::BranchStore;
+pub use crate::repo::Checkout;
+pub use crate::repo::CommitSet;
 pub use crate::repo::Repository;
 pub use crate::trible::Fragment;
 pub use crate::trible::Spread;
