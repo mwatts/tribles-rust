@@ -176,8 +176,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Collaborator kept the name '{first}'.");
         }
 
-        ws.merge(&mut conflict_ws)
+        // Merge our staged work into the conflict workspace (which has
+        // the latest branch head), then continue from there.
+        conflict_ws.merge(&mut ws)
             .expect("merge conflicting history");
+        ws = conflict_ws;
 
         ws.commit(
             entity! { &author_id @ literature::alias: "Francis" },

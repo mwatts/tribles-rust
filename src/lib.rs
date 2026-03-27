@@ -198,8 +198,9 @@ mod readme_example {
                 );
             }
 
-            ws.merge(&mut conflict_ws)
+            conflict_ws.merge(&mut ws)
                 .expect("merge conflicting history");
+            ws = conflict_ws;
 
             ws.commit(
                 entity! { &author_id @ literature::alias: "Francis" },
