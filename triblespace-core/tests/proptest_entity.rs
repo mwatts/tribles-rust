@@ -204,6 +204,39 @@ proptest! {
     }
 
     #[test]
+    fn self_referencing_projected_variable(
+        names in vec("[a-z]{1,6}", 2..6),
+    ) {
+        let mut set = TribleSet::new();
+        let mut self_linker_id = None;
+
+        for (i, name) in names.iter().enumerate() {
+            let e = rngid();
+            set += entity! { &e @ test_ns::name: name.as_str() };
+            if i == 0 {
+                set += entity! { &e @ test_ns::link: &e };
+                self_linker_id = Some(e);
+            } else {
+                let other = rngid();
+                set += entity! { &e @ test_ns::link: &other };
+            }
+        }
+
+        // ?e in both entity and value positions (projected variable)
+        let results: Vec<(Value<_>, String)> = find!(
+            (e: Value<_>, name: String),
+            pattern!(&set, [
+                { ?e @ test_ns::name: ?name, test_ns::link: ?e }
+            ])
+        ).collect();
+
+        prop_assert_eq!(results.len(), 1,
+            "expected 1 self-linker, got {:?}", results);
+        let expected_id = (&self_linker_id.unwrap()).to_value();
+        prop_assert_eq!(results[0].0, expected_id);
+    }
+
+    #[test]
     fn local_var_enforces_join_across_entities(
         names in vec("[a-z]{1,6}", 2..6),
     ) {

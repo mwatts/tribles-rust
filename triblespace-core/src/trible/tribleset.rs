@@ -23,18 +23,18 @@ use std::iter::Map;
 use std::ops::Add;
 use std::ops::AddAssign;
 
-/// A collection of [Trible]s.
+/// A collection of [`Trible`]s.
 ///
-/// A [TribleSet] is a collection of [Trible]s that can be queried and manipulated.
+/// A [`TribleSet`] is a collection of [`Trible`]s that can be queried and manipulated.
 /// It supports efficient set operations like union, intersection, and difference.
 ///
-/// The stored [Trible]s are indexed by the six possible orderings of their fields
-/// in corresponding [PATCH]es.
+/// The stored [`Trible`]s are indexed by the six possible orderings of their fields
+/// in corresponding [`PATCH`]es.
 ///
-/// Clone is extremely cheap and can be used to create a snapshot of the current state of the [TribleSet].
+/// Clone is extremely cheap and can be used to create a snapshot of the current state of the [`TribleSet`].
 ///
-/// Note that the [TribleSet] does not support an explicit `delete`/`remove` operation,
-/// as this would conflict with the CRDT semantics of the [TribleSet] and CALM principles as a whole.
+/// Note that the [`TribleSet`] does not support an explicit `delete`/`remove` operation,
+/// as this would conflict with the CRDT semantics of the [`TribleSet`] and CALM principles as a whole.
 /// It does allow for set subtraction, but that operation is meant to compute the difference between two sets
 /// and not to remove elements from the set. A subtle but important distinction.
 #[derive(Debug, Clone)]
@@ -55,8 +55,8 @@ pub struct TribleSet {
 
 /// O(1) fingerprint for a [`TribleSet`], derived from the PATCH root hash.
 ///
-/// This matches the equality semantics of `TribleSet`, but it is not stable
-/// across process boundaries because PATCH uses a per-process hash key.
+/// This matches the equality semantics of [`TribleSet`], but it is not stable
+/// across process boundaries because [`PATCH`] uses a per-process hash key.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TribleSetFingerprint(Option<u128>);
 
@@ -84,9 +84,9 @@ pub struct TribleSetIterator<'a> {
 }
 
 impl TribleSet {
-    /// Union of two [TribleSet]s.
+    /// Union of two [`TribleSet`]s.
     ///
-    /// The other [TribleSet] is consumed, and this [TribleSet] is updated in place.
+    /// The other [`TribleSet`] is consumed, and this [`TribleSet`] is updated in place.
     pub fn union(&mut self, other: Self) {
         self.eav.union(other.eav);
         self.eva.union(other.eva);
@@ -144,8 +144,8 @@ impl TribleSet {
 
     /// Returns a fast fingerprint suitable for in-memory caching.
     ///
-    /// The fingerprint matches `TribleSet` equality, but it is not stable
-    /// across process boundaries because PATCH uses a per-process hash key.
+    /// The fingerprint matches [`TribleSet`] equality, but it is not stable
+    /// across process boundaries because [`PATCH`] uses a per-process hash key.
     pub fn fingerprint(&self) -> TribleSetFingerprint {
         TribleSetFingerprint(self.eav.root_hash())
     }

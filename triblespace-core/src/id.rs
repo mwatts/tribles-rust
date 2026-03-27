@@ -82,12 +82,12 @@ pub struct Id {
 }
 
 impl Id {
-    /// Creates a new `Id` from a [RawId] 16 byte array.
+    /// Creates a new [`Id`] from a [RawId] 16 byte array.
     pub const fn new(id: RawId) -> Option<Self> {
         unsafe { std::mem::transmute::<RawId, Option<Id>>(id) }
     }
 
-    /// Parses a hexadecimal identifier string into an `Id`.
+    /// Parses a hexadecimal identifier string into an [`Id`].
     ///
     /// Returns `None` if the input is not valid hexadecimal or represents the
     /// nil identifier (all zero bytes).
@@ -96,7 +96,7 @@ impl Id {
         Id::new(raw)
     }
 
-    /// Forces the creation of an `Id` from a [RawId] without checking for nil.
+    /// Forces the creation of an [`Id`] from a [RawId] without checking for nil.
     ///
     /// # Safety
     ///
@@ -105,7 +105,7 @@ impl Id {
         std::mem::transmute::<RawId, Id>(id)
     }
 
-    /// Transmutes a reference to a [RawId] into a reference to an `Id`.
+    /// Transmutes a reference to a [RawId] into a reference to an [`Id`].
     /// Returns `None` if the referenced RawId is nil (all zero).
     pub fn as_transmute_raw(id: &RawId) -> Option<&Self> {
         if *id == [0; 16] {
@@ -251,7 +251,7 @@ impl std::error::Error for NilUuidError {}
 #[doc(hidden)]
 pub use hex_literal::hex as _hex_literal_hex;
 
-/// Creates an `Id` from a hex string literal.
+/// Creates an [`Id`] from a hex string literal.
 ///
 /// # Example
 /// ```
@@ -270,14 +270,14 @@ pub use id_hex;
 
 /// Represents an ID that can only be used by a single writer at a time.
 ///
-/// `ExclusiveId`s are associated with one owning context (typically a thread) at a time.
+/// [`ExclusiveId`]s are associated with one owning context (typically a thread) at a time.
 /// Because they are `Send` and `!Sync`, they can be passed between contexts, but not used concurrently.
 /// This makes use of Rust's borrow checker to enforce a weaker form of software transactional memory (STM) without rollbacks - as these are not an issue with the heavy use of copy-on-write data structures.
 ///
 /// They are automatically associated with the thread they are dropped from, which can be used in queries via the [local_ids] constraint.
-/// You can also make use of explicit [IdOwner] containers to store them when not actively used in a transaction.
+/// You can also make use of explicit [`IdOwner`] containers to store them when not actively used in a transaction.
 ///
-/// Most methods defined on [ExclusiveId] are low-level primitives meant to be used for the implementation of new ownership management strategies,
+/// Most methods defined on [`ExclusiveId`] are low-level primitives meant to be used for the implementation of new ownership management strategies,
 /// such as a transactional database that tracks checked out IDs for ownership, or distributed ledgers like blockchains.
 ///
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -293,7 +293,7 @@ pub struct ExclusiveId {
 unsafe impl Send for ExclusiveId {}
 
 impl ExclusiveId {
-    /// Forces a regular (read-only) `Id` to become a writable `ExclusiveId`.
+    /// Forces a regular (read-only) [`Id`] to become a writable [`ExclusiveId`].
     ///
     /// This is a low-level primitive that is meant to be used for the implementation of new ownership management strategies,
     /// such as a transactional database that tracks checked out IDs for ownership, or distributed ledgers like blockchains.
@@ -303,7 +303,7 @@ impl ExclusiveId {
     ///
     /// # Arguments
     ///
-    /// * `id` - The `Id` to be forced into an `ExclusiveId`.
+    /// * `id` - The [`Id`] to be forced into an [`ExclusiveId`].
     pub fn force(id: Id) -> Self {
         Self {
             id,
@@ -311,35 +311,35 @@ impl ExclusiveId {
         }
     }
 
-    /// Safely transmutes a reference to an `Id` into a reference to an `ExclusiveId`.
+    /// Safely transmutes a reference to an [`Id`] into a reference to an [`ExclusiveId`].
     ///
     /// Similar caution should be applied when using the `force` method.
     ///
     /// # Arguments
     ///
-    /// * `id` - A reference to the `Id` to be transmuted.
+    /// * `id` - A reference to the [`Id`] to be transmuted.
     pub fn force_ref(id: &Id) -> &Self {
         unsafe { std::mem::transmute(id) }
     }
 
-    /// Releases the `ExclusiveId`, returning the underlying `Id`.
+    /// Releases the [`ExclusiveId`], returning the underlying [`Id`].
     ///
     /// # Returns
     ///
-    /// The underlying `Id`.
+    /// The underlying [`Id`].
     pub fn release(self) -> Id {
         let id = self.id;
         mem::drop(self);
         id
     }
 
-    /// Forgets the `ExclusiveId`, leaking ownership of the underlying `Id`, while returning it.
+    /// Forgets the [`ExclusiveId`], leaking ownership of the underlying [`Id`], while returning it.
     ///
-    /// This is not as potentially problematic as [force](ExclusiveId::force), because it prevents further writes with the `ExclusiveId`, thus avoiding potential conflicts.
+    /// This is not as potentially problematic as [force](ExclusiveId::force), because it prevents further writes with the [`ExclusiveId`], thus avoiding potential conflicts.
     ///
     /// # Returns
     ///
-    /// The underlying `Id`.
+    /// The underlying [`Id`].
     pub fn forget(self) -> Id {
         let id = self.id;
         mem::forget(self);
@@ -406,13 +406,13 @@ impl Display for ExclusiveId {
     }
 }
 
-/// A constraint that checks if a variable is an `ExclusiveId` associated with the current write context (i.e. thread).
+/// A constraint that checks if a variable is an [`ExclusiveId`] associated with the current write context (i.e. thread).
 pub fn local_ids(v: Variable<GenId>) -> impl Constraint<'static> {
     OWNED_IDS.with(|owner| owner.has(v))
 }
 
-/// A container for [ExclusiveId]s, allowing for explicit ownership management.
-/// There is an implicit `IdOwner` for each thread, to which `ExclusiveId`s are associated when they are dropped,
+/// A container for [`ExclusiveId`]s, allowing for explicit ownership management.
+/// There is an implicit [`IdOwner`] for each thread, to which [`ExclusiveId`]s are associated when they are dropped,
 /// and which can be queried via the [local_ids] constraint.
 ///
 /// # Example
@@ -432,8 +432,8 @@ pub struct IdOwner {
     owned_ids: RefCell<PATCH<ID_LEN, IdentitySchema, ()>>,
 }
 
-/// An `ExclusiveId` that is associated with an `IdOwner`.
-/// It is automatically returned to the `IdOwner` when dropped.
+/// An [`ExclusiveId`] that is associated with an [`IdOwner`].
+/// It is automatically returned to the [`IdOwner`] when dropped.
 pub struct OwnedId<'a> {
     /// The underlying identifier.
     pub id: Id,
@@ -447,45 +447,45 @@ impl Default for IdOwner {
 }
 
 impl IdOwner {
-    /// Creates a new `IdOwner`.
+    /// Creates a new [`IdOwner`].
     ///
-    /// This is typically not necessary, as each thread has an implicit `IdOwner` associated with it.
+    /// This is typically not necessary, as each thread has an implicit [`IdOwner`] associated with it.
     ///
     /// # Returns
     ///
-    /// A new `IdOwner`.
+    /// A new [`IdOwner`].
     pub fn new() -> Self {
         Self {
             owned_ids: RefCell::new(PATCH::<ID_LEN, IdentitySchema, ()>::new()),
         }
     }
 
-    /// Inserts an `ExclusiveId` into the `IdOwner`, returning the underlying `Id`.
+    /// Inserts an [`ExclusiveId`] into the [`IdOwner`], returning the underlying [`Id`].
     ///
     /// # Arguments
     ///
-    /// * `id` - The `ExclusiveId` to be inserted.
+    /// * `id` - The [`ExclusiveId`] to be inserted.
     ///
     /// # Returns
     ///
-    /// The underlying `Id`.
+    /// The underlying [`Id`].
     pub fn insert(&mut self, id: ExclusiveId) -> Id {
         self.force_insert(&id);
         id.forget()
     }
 
-    /// Defers inserting an `ExclusiveId` into the `IdOwner`, returning an `OwnedId`.
-    /// The `OwnedId` will return the `ExclusiveId` to the `IdOwner` when dropped.
-    /// This is useful if you generated an `ExclusiveId` that you want to use temporarily,
-    /// but want to make sure it is returned to the `IdOwner` when you are done.
+    /// Defers inserting an [`ExclusiveId`] into the [`IdOwner`], returning an [`OwnedId`].
+    /// The [`OwnedId`] will return the [`ExclusiveId`] to the [`IdOwner`] when dropped.
+    /// This is useful if you generated an [`ExclusiveId`] that you want to use temporarily,
+    /// but want to make sure it is returned to the [`IdOwner`] when you are done.
     ///
     /// # Arguments
     ///
-    /// * `id` - The `ExclusiveId` to be inserted.
+    /// * `id` - The [`ExclusiveId`] to be inserted.
     ///
     /// # Returns
     ///
-    /// An `OwnedId` that will return the `ExclusiveId` to the `IdOwner` when dropped.
+    /// An [`OwnedId`] that will return the [`ExclusiveId`] to the [`IdOwner`] when dropped.
     ///
     /// # Example
     ///
@@ -505,25 +505,25 @@ impl IdOwner {
         }
     }
 
-    /// Forces an `Id` into the `IdOwner` as an `ExclusiveId`.
+    /// Forces an [`Id`] into the [`IdOwner`] as an [`ExclusiveId`].
     ///
     /// # Arguments
     ///
-    /// * `id` - The `Id` to be forced into an `ExclusiveId`.
+    /// * `id` - The [`Id`] to be forced into an [`ExclusiveId`].
     pub fn force_insert(&self, id: &Id) {
         let entry = Entry::new(id);
         self.owned_ids.borrow_mut().insert(&entry);
     }
 
-    /// Takes an `Id` from the `IdOwner`, returning it as an `ExclusiveId`.
+    /// Takes an [`Id`] from the [`IdOwner`], returning it as an [`ExclusiveId`].
     ///
     /// # Arguments
     ///
-    /// * `id` - The `Id` to be taken.
+    /// * `id` - The [`Id`] to be taken.
     ///
     /// # Returns
     ///
-    /// An `ExclusiveId` if the `Id` was found, otherwise `None`.
+    /// An [`ExclusiveId`] if the [`Id`] was found, otherwise `None`.
     pub fn take(&self, id: &Id) -> Option<ExclusiveId> {
         if self.owned_ids.borrow().has_prefix(id) {
             self.owned_ids.borrow_mut().remove(id);
@@ -533,19 +533,19 @@ impl IdOwner {
         }
     }
 
-    /// Get an `OwnedId` from the `IdOwner`.
-    /// The `OwnedId` will return the `ExclusiveId` to the `IdOwner` when dropped.
-    /// This is useful for temporary exclusive access to an `Id`.
-    /// If you want to keep the `Id` for longer, you can use the `take` method,
-    /// but you will have to manually return it to the `IdOwner` when you are done.
+    /// Get an [`OwnedId`] from the [`IdOwner`].
+    /// The [`OwnedId`] will return the [`ExclusiveId`] to the [`IdOwner`] when dropped.
+    /// This is useful for temporary exclusive access to an [`Id`].
+    /// If you want to keep the [`Id`] for longer, you can use the `take` method,
+    /// but you will have to manually return it to the [`IdOwner`] when you are done.
     ///
     /// # Arguments
     ///
-    /// * `id` - The `Id` to be taken.
+    /// * `id` - The [`Id`] to be taken.
     ///
     /// # Returns
     ///
-    /// An `OwnedId` if the `Id` was found, otherwise `None`.
+    /// An [`OwnedId`] if the [`Id`] was found, otherwise `None`.
     ///
     /// # Example
     ///
@@ -569,15 +569,15 @@ impl IdOwner {
         })
     }
 
-    /// Checks if the `IdOwner` owns an `Id`.
+    /// Checks if the [`IdOwner`] owns an [`Id`].
     ///
     /// # Arguments
     ///
-    /// * `id` - The `Id` to be checked.
+    /// * `id` - The [`Id`] to be checked.
     ///
     /// # Returns
     ///
-    /// `true` if the `Id` is owned by the `IdOwner`, otherwise `false`.
+    /// `true` if the [`Id`] is owned by the [`IdOwner`], otherwise `false`.
     pub fn owns(&self, id: &Id) -> bool {
         self.owned_ids.borrow().has_prefix(id)
     }

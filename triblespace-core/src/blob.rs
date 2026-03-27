@@ -36,8 +36,8 @@ pub use anybytes::Bytes;
 
 /// A blob is a immutable sequence of bytes that can be used to represent any kind of data.
 /// It is the fundamental building block of data storage and transmission.
-/// The `BlobSchema` type parameter is used to define the abstract schema type of a blob.
-/// This is similar to the `Value` type and the `ValueSchema` trait in the [`value`](crate::value) module.
+/// The [`BlobSchema`] type parameter is used to define the abstract schema type of a blob.
+/// This is similar to the [`Value`] type and the [`ValueSchema`] trait in the [`value`](crate::value) module.
 #[repr(transparent)]
 pub struct Blob<S: BlobSchema> {
     /// The raw byte content of this blob.
@@ -131,7 +131,7 @@ impl<T: BlobSchema> Debug for Blob<T> {
 }
 
 /// A trait for defining the abstract schema type of a blob.
-/// This is similar to the `ValueSchema` trait in the [`value`](crate::value) module.
+/// This is similar to the [`ValueSchema`] trait in the [`value`](crate::value) module.
 pub trait BlobSchema: ConstId + Sized + 'static {
     /// Converts a concrete Rust type to a blob with this schema.
     /// If the conversion fails, this might cause a panic.

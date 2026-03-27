@@ -433,10 +433,12 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
 
     for (entity_idx, entity) in pattern.into_iter().enumerate() {
         let e_ident = format_ident!("__e{}", entity_idx, span = Span::mixed_site());
-        // Track which local var the entity came from (if any) so we can
-        // detect self-referencing patterns like `{ _?e @ attr: _?e }`.
-        let entity_local_key: Option<String> = match entity.id {
-            Some(Value::LocalVar(ref ident)) => Some(format!("_?{}", ident)),
+        // Track the entity's variable identity so we can detect
+        // self-referencing patterns like `{ _?e @ attr: _?e }` or
+        // `{ ?e @ attr: ?e }` and desugar them with EqualityConstraint.
+        let entity_var_key: Option<(bool, String)> = match entity.id {
+            Some(Value::LocalVar(ref ident)) => Some((true, ident.to_string())),
+            Some(Value::Var(ref ident)) => Some((false, ident.to_string())),
             _ => None,
         };
         let init = if let Some(ref id_val) = entity.id {
@@ -497,7 +499,29 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
             };
             let v_tmp_ident = format_ident!("__v{}", val_id, span = Span::mixed_site());
 
+            // Check if the value variable is the same as the entity variable.
+            let value_var_key: Option<(bool, String)> = match value {
+                Value::Var(ref ident) => Some((false, ident.to_string())),
+                Value::LocalVar(ref ident) => Some((true, ident.to_string())),
+                _ => None,
+            };
+            let self_ref = entity_var_key.is_some()
+                && entity_var_key == value_var_key;
+
             let triple_tokens = match value {
+                Value::Var(ref var_ident) if self_ref => {
+                    // Self-referencing via projected variable: { ?e @ attr: ?e }
+                    let alias_ident = format_ident!("__alias{}", val_id, span = Span::mixed_site());
+                    quote! {
+                        {
+                            #[allow(unused_imports)] use #base_path::query::TriblePattern;
+                            let #alias_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #ctx_ident.next_variable();
+                            let v_var = #af_ident.as_variable(#alias_ident);
+                            constraints.push(Box::new(#base_path::query::equalityconstraint::EqualityConstraint::new(#e_ident.index, #alias_ident.index)));
+                            constraints.push(Box::new(#set_ident.pattern(#e_ident, #a_var_ident, v_var)));
+                        }
+                    }
+                }
                 Value::Var(ref var_ident) => {
                     quote! {
                         {
@@ -507,32 +531,27 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
                         }
                     }
                 }
+                Value::LocalVar(ref var_ident) if self_ref => {
+                    // Self-referencing via local variable: { _?e @ attr: _?e }
+                    let _local_ident = get_local_var(var_ident);
+                    let alias_ident = format_ident!("__alias{}", val_id, span = Span::mixed_site());
+                    quote! {
+                        {
+                            #[allow(unused_imports)] use #base_path::query::TriblePattern;
+                            let #alias_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #ctx_ident.next_variable();
+                            let v_var = #af_ident.as_variable(#alias_ident);
+                            constraints.push(Box::new(#base_path::query::equalityconstraint::EqualityConstraint::new(#e_ident.index, #alias_ident.index)));
+                            constraints.push(Box::new(#set_ident.pattern(#e_ident, #a_var_ident, v_var)));
+                        }
+                    }
+                }
                 Value::LocalVar(ref var_ident) => {
                     let local_ident = get_local_var(var_ident);
-                    let value_local_key = format!("_?{}", var_ident);
-                    if entity_local_key.as_ref() == Some(&value_local_key) {
-                        // Self-referencing: entity and value are the same
-                        // local variable. TribleSetConstraint requires
-                        // distinct variable IDs, so we create a fresh
-                        // variable for the value position and add an
-                        // EqualityConstraint to keep them in sync.
-                        let alias_ident = format_ident!("__alias{}", val_id, span = Span::mixed_site());
-                        quote! {
-                            {
-                                #[allow(unused_imports)] use #base_path::query::TriblePattern;
-                                let #alias_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #ctx_ident.next_variable();
-                                let v_var = #af_ident.as_variable(#alias_ident);
-                                constraints.push(Box::new(#base_path::query::equalityconstraint::EqualityConstraint::new(#e_ident.index, #alias_ident.index)));
-                                constraints.push(Box::new(#set_ident.pattern(#e_ident, #a_var_ident, v_var)));
-                            }
-                        }
-                    } else {
-                        quote! {
-                            {
-                                #[allow(unused_imports)] use #base_path::query::TriblePattern;
-                                let v_var = { #af_ident.as_variable(#local_ident) };
-                                constraints.push(Box::new(#set_ident.pattern(#e_ident, #a_var_ident, v_var)));
-                            }
+                    quote! {
+                        {
+                            #[allow(unused_imports)] use #base_path::query::TriblePattern;
+                            let v_var = { #af_ident.as_variable(#local_ident) };
+                            constraints.push(Box::new(#set_ident.pattern(#e_ident, #a_var_ident, v_var)));
                         }
                     }
                 }
@@ -854,8 +873,9 @@ pub fn pattern_changes_impl(
 
     for (entity_idx, entity) in pattern.into_iter().enumerate() {
         let e_ident = format_ident!("__e{}", entity_idx, span = Span::mixed_site());
-        let entity_local_key: Option<String> = match entity.id {
-            Some(Value::LocalVar(ref ident)) => Some(format!("_?{}", ident)),
+        let entity_var_key: Option<(bool, String)> = match entity.id {
+            Some(Value::LocalVar(ref ident)) => Some((true, ident.to_string())),
+            Some(Value::Var(ref ident)) => Some((false, ident.to_string())),
             _ => None,
         };
         match entity.id {
@@ -914,6 +934,14 @@ pub fn pattern_changes_impl(
             let v_ident = format_ident!("__v{}", value_idx, span = Span::mixed_site());
             value_idx += 1;
 
+            let value_var_key: Option<(bool, String)> = match value {
+                Value::Var(ref ident) => Some((false, ident.to_string())),
+                Value::LocalVar(ref ident) => Some((true, ident.to_string())),
+                _ => None,
+            };
+            let self_ref = entity_var_key.is_some()
+                && entity_var_key == value_var_key;
+
             match value {
                 Value::Expr(expr) => {
                     let val_ident = format_ident!("__c{}", value_idx, span = Span::mixed_site());
@@ -926,6 +954,18 @@ pub fn pattern_changes_impl(
                         constraints.push(Box::new(#v_ident.is(#val_ident)));
                     });
                 }
+                Value::Var(_) | Value::LocalVar(_) if self_ref => {
+                    // Self-referencing: create fresh alias + equality
+                    let alias_ident = format_ident!("__alias{}", value_idx, span = Span::mixed_site());
+                    value_idx += 1;
+                    value_decl_tokens.extend(quote! {
+                        let #alias_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #ctx_ident.next_variable();
+                        let #v_ident = #af_ident.as_variable(#alias_ident);
+                    });
+                    entity_const_tokens.extend(quote! {
+                        constraints.push(Box::new(#base_path::query::equalityconstraint::EqualityConstraint::new(#e_ident.index, #alias_ident.index)));
+                    });
+                }
                 Value::Var(var_ident) => {
                     value_decl_tokens.extend(quote! {
                         let #v_ident = #af_ident.as_variable(#var_ident);
@@ -933,23 +973,9 @@ pub fn pattern_changes_impl(
                 }
                 Value::LocalVar(ref var_ident) => {
                     let local_ident = get_local_var(var_ident);
-                    let value_local_key = format!("_?{}", var_ident);
-                    if entity_local_key.as_ref() == Some(&value_local_key) {
-                        // Self-referencing: create fresh alias + equality
-                        let alias_ident = format_ident!("__alias{}", value_idx, span = Span::mixed_site());
-                        value_idx += 1;
-                        value_decl_tokens.extend(quote! {
-                            let #alias_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #ctx_ident.next_variable();
-                            let #v_ident = #af_ident.as_variable(#alias_ident);
-                        });
-                        entity_const_tokens.extend(quote! {
-                            constraints.push(Box::new(#base_path::query::equalityconstraint::EqualityConstraint::new(#e_ident.index, #alias_ident.index)));
-                        });
-                    } else {
-                        value_decl_tokens.extend(quote! {
-                            let #v_ident = #af_ident.as_variable(#local_ident);
-                        });
-                    }
+                    value_decl_tokens.extend(quote! {
+                        let #v_ident = #af_ident.as_variable(#local_ident);
+                    });
                 }
             }
 

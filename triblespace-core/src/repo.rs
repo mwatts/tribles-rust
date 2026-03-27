@@ -58,7 +58,7 @@
 //! }
 //! ```
 //!
-//! `create_branch` registers a new branch and returns an `ExclusiveId` guard.
+//! `create_branch` registers a new branch and returns an [`ExclusiveId`](crate::id::ExclusiveId) guard.
 //! `pull` creates a new workspace from an existing branch while
 //! `branch_from` can be used to start a new branch from a specific commit
 //! handle. See `examples/workspace.rs` for a more complete example.
@@ -92,8 +92,8 @@
 //!
 //! The API deliberately mirrors concepts from Git to make its usage familiar:
 //!
-//! - A `Repository` stores commits and branch metadata similar to a remote.
-//! - `Workspace` is akin to a working directory combined with an index. It
+//! - A [`Repository`] stores commits and branch metadata similar to a remote.
+//! - [`Workspace`] is akin to a working directory combined with an index. It
 //!   tracks changes against a branch head until you `push` them.
 //! - `create_branch` and `branch_from` correspond to creating new branches from
 //!   scratch or from a specific commit, respectively.
@@ -279,7 +279,7 @@ pub trait BlobStoreGet<H: HashProtocol> {
 
     /// Retrieves a blob from the repository by its handle.
     /// The handle is a unique identifier for the blob, and is used to retrieve it from the repository.
-    /// The blob is returned as a `Blob` object, which contains the raw bytes of the blob,
+    /// The blob is returned as a [`Blob`](crate::blob::Blob) object, which contains the raw bytes of the blob,
     /// which can be deserialized via the appropriate schema type, which is specified by the `T` type parameter.
     ///
     /// # Errors
@@ -716,9 +716,9 @@ where
 /// High-level wrapper combining a blob store and branch store into a usable
 /// repository API.
 ///
-/// The `Repository` type exposes convenience methods for creating branches,
+/// The [`Repository`] type exposes convenience methods for creating branches,
 /// committing data and pushing changes while delegating actual storage to the
-/// given `BlobStore` and `BranchStore` implementations.
+/// given [`BlobStore`] and [`BranchStore`] implementations.
 pub struct Repository<Storage: BlobStore<Blake3> + BranchStore<Blake3>> {
     storage: Storage,
     signing_key: SigningKey,
