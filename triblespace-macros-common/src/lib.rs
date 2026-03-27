@@ -433,6 +433,12 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
 
     for (entity_idx, entity) in pattern.into_iter().enumerate() {
         let e_ident = format_ident!("__e{}", entity_idx, span = Span::mixed_site());
+        // Track which local var the entity came from (if any) so we can
+        // detect self-referencing patterns like `{ _?e @ attr: _?e }`.
+        let entity_local_key: Option<String> = match entity.id {
+            Some(Value::LocalVar(ref ident)) => Some(format!("_?{}", ident)),
+            _ => None,
+        };
         let init = if let Some(ref id_val) = entity.id {
             match id_val {
                 Value::Var(ref ident) => {
@@ -503,11 +509,30 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
                 }
                 Value::LocalVar(ref var_ident) => {
                     let local_ident = get_local_var(var_ident);
-                    quote! {
-                        {
-                            #[allow(unused_imports)] use #base_path::query::TriblePattern;
-                            let v_var = { #af_ident.as_variable(#local_ident) };
-                            constraints.push(Box::new(#set_ident.pattern(#e_ident, #a_var_ident, v_var)));
+                    let value_local_key = format!("_?{}", var_ident);
+                    if entity_local_key.as_ref() == Some(&value_local_key) {
+                        // Self-referencing: entity and value are the same
+                        // local variable. TribleSetConstraint requires
+                        // distinct variable IDs, so we create a fresh
+                        // variable for the value position and add an
+                        // EqualityConstraint to keep them in sync.
+                        let alias_ident = format_ident!("__alias{}", val_id, span = Span::mixed_site());
+                        quote! {
+                            {
+                                #[allow(unused_imports)] use #base_path::query::TriblePattern;
+                                let #alias_ident: #base_path::query::Variable<#base_path::value::schemas::genid::GenId> = #ctx_ident.next_variable();
+                                let v_var = #af_ident.as_variable(#alias_ident);
+                                constraints.push(Box::new(#base_path::query::equalityconstraint::EqualityConstraint::new(#e_ident.index, #alias_ident.index)));
+                                constraints.push(Box::new(#set_ident.pattern(#e_ident, #a_var_ident, v_var)));
+                            }
+                        }
+                    } else {
+                        quote! {
+                            {
+                                #[allow(unused_imports)] use #base_path::query::TriblePattern;
+                                let v_var = { #af_ident.as_variable(#local_ident) };
+                                constraints.push(Box::new(#set_ident.pattern(#e_ident, #a_var_ident, v_var)));
+                            }
                         }
                     }
                 }

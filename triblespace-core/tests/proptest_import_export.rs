@@ -81,10 +81,12 @@ proptest! {
         let mut importer = JsonObjectImporter::<_, Blake3>::new(&mut store, None);
         let frag = importer.import_str(&json).expect("valid JSON array");
 
-        // Array of N objects should produce N exports
+        // Array of N objects should produce up to N exports (identical
+        // objects deduplicate because entity IDs are content-addressed).
+        let unique_values: std::collections::HashSet<&String> = values.iter().collect();
         let exports: Vec<_> = frag.exports().collect();
-        prop_assert_eq!(exports.len(), values.len(),
-            "expected {} exports for {} objects", values.len(), exports.len());
+        prop_assert_eq!(exports.len(), unique_values.len(),
+            "expected {} exports for {} unique objects", unique_values.len(), exports.len());
     }
 
     #[test]

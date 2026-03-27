@@ -17,6 +17,8 @@
 //! "Query Engine" and "Atreides Join" chapters.
 /// [`ConstantConstraint`](constantconstraint::ConstantConstraint) — pins a variable to a single value.
 pub mod constantconstraint;
+/// [`EqualityConstraint`](equalityconstraint::EqualityConstraint) — constrains two variables to have the same value.
+pub mod equalityconstraint;
 /// [`KeysConstraint`](hashmapconstraint::KeysConstraint) — constrains a variable to HashMap keys.
 pub mod hashmapconstraint;
 /// [`SetConstraint`](hashsetconstraint::SetConstraint) — constrains a variable to HashSet members.

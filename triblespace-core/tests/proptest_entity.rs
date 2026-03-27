@@ -170,11 +170,38 @@ proptest! {
 
     // ── _? local variables enforce equality ────────────────────────────
 
-    // NOTE: Self-referencing patterns like `{ _?e @ test_ns::link: _?e }`
-    // (entity links to itself) are currently unsupported — the
-    // TribleSetConstraint panics when variable_e == variable_v because
-    // the match arms don't cover that case. This was discovered by
-    // proptest and tracked as a known limitation.
+    #[test]
+    fn self_referencing_entity_via_desugaring(
+        names in vec("[a-z]{1,6}", 2..6),
+    ) {
+        let mut set = TribleSet::new();
+        let mut self_linker = None;
+
+        for (i, name) in names.iter().enumerate() {
+            let e = rngid();
+            set += entity! { &e @ test_ns::name: name.as_str() };
+            if i == 0 {
+                set += entity! { &e @ test_ns::link: &e };
+                self_linker = Some(name.clone());
+            } else {
+                let other = rngid();
+                set += entity! { &e @ test_ns::link: &other };
+            }
+        }
+
+        // _?e in both entity and value positions — the macro now
+        // desugars this to a fresh variable + EqualityConstraint.
+        let results: Vec<String> = find!(
+            name: String,
+            pattern!(&set, [
+                { _?e @ test_ns::name: ?name, test_ns::link: _?e }
+            ])
+        ).collect();
+
+        prop_assert_eq!(results.len(), 1,
+            "expected 1 self-linker, got {:?}", results);
+        prop_assert_eq!(&results[0], self_linker.as_ref().unwrap());
+    }
 
     #[test]
     fn local_var_enforces_join_across_entities(
