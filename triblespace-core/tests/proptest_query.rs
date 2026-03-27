@@ -246,6 +246,76 @@ proptest! {
         prop_assert!(inter_results.len() <= b_results.len());
     }
 
+    // ── find! fundamentals ──────────────────────────────────────────
+
+    #[test]
+    fn find_is_deterministic(set in arb_tribleset(15)) {
+        let results1: Vec<_> = find!(
+            (e: Value<_>, a: Value<_>, v: Value<UnknownValue>),
+            set.pattern(e, a, v as Variable<UnknownValue>)
+        ).collect();
+        let results2: Vec<_> = find!(
+            (e: Value<_>, a: Value<_>, v: Value<UnknownValue>),
+            set.pattern(e, a, v as Variable<UnknownValue>)
+        ).collect();
+        prop_assert_eq!(results1, results2,
+            "same query on same set should be deterministic");
+    }
+
+    #[test]
+    fn find_no_duplicates(set in arb_tribleset(15)) {
+        let results: Vec<_> = find!(
+            (e: Value<_>, a: Value<_>, v: Value<UnknownValue>),
+            set.pattern(e, a, v as Variable<UnknownValue>)
+        ).collect();
+        let unique: HashSet<_> = results.iter().collect();
+        prop_assert_eq!(results.len(), unique.len(),
+            "query should not produce duplicate results");
+    }
+
+    // ── ConstantConstraint protocol ────────────────────────────────────
+
+    #[test]
+    fn constant_constraint_always_proposes_one(val in prop::array::uniform32(any::<u8>())) {
+        use triblespace_core::query::constantconstraint::ConstantConstraint;
+
+        let c = ConstantConstraint::new(
+            Variable::<UnknownValue>::new(0),
+            Value::<UnknownValue>::new(val),
+        );
+        let binding = Binding::default();
+
+        prop_assert_eq!(c.estimate(0, &binding), Some(1));
+
+        let mut proposals = Vec::new();
+        c.propose(0, &binding, &mut proposals);
+        prop_assert_eq!(proposals.len(), 1);
+        prop_assert_eq!(proposals[0], val);
+    }
+
+    #[test]
+    fn constant_constraint_confirms_matching_only(
+        constant in prop::array::uniform32(any::<u8>()),
+        candidate in prop::array::uniform32(any::<u8>()),
+    ) {
+        use triblespace_core::query::constantconstraint::ConstantConstraint;
+
+        let c = ConstantConstraint::new(
+            Variable::<UnknownValue>::new(0),
+            Value::<UnknownValue>::new(constant),
+        );
+        let binding = Binding::default();
+
+        let mut proposals = vec![candidate];
+        c.confirm(0, &binding, &mut proposals);
+
+        if constant == candidate {
+            prop_assert_eq!(proposals.len(), 1);
+        } else {
+            prop_assert!(proposals.is_empty());
+        }
+    }
+
     // ── exists! ────────────────────────────────────────────────────────
 
     #[test]

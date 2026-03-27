@@ -372,6 +372,43 @@ proptest! {
     }
 
     #[test]
+    fn pattern_changes_via_difference(
+        base_labels in vec("[a-z]{1,6}", 1..8),
+        delta_labels in vec("[a-z]{1,6}", 1..5),
+    ) {
+        // Build base and delta as separate TribleSets
+        let mut base = TribleSet::new();
+        for label in &base_labels {
+            let e = rngid();
+            base += entity! { &e @ test_ns::label: label.as_str() };
+        }
+        let mut full = base.clone();
+        for label in &delta_labels {
+            let e = rngid();
+            full += entity! { &e @ test_ns::label: label.as_str() };
+        }
+
+        // The delta is the difference between full and base
+        let delta = full.difference(&base);
+
+        // pattern_changes with computed delta should return only the new labels
+        let mut changes: Vec<String> = find!(
+            label: String,
+            pattern_changes!(&full, &delta, [
+                { test_ns::label: ?label }
+            ])
+        ).collect();
+        changes.sort();
+
+        // Each delta entity with a label produces one result
+        let mut expected: Vec<String> = delta_labels.into_iter().collect();
+        expected.sort();
+
+        prop_assert_eq!(changes, expected,
+            "pattern_changes via difference should yield exactly the new labels");
+    }
+
+    #[test]
     fn pattern_changes_subset_of_pattern(
         base_labels in vec("[a-z]{1,8}", 1..8),
         delta_labels in vec("[a-z]{1,8}", 1..5)
