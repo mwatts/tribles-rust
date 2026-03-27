@@ -102,28 +102,20 @@ mod readme_example {
         let branch_id = repo.create_branch("main", None).expect("create branch");
         let mut ws = repo.pull(*branch_id).expect("pull workspace");
 
-        let author_id = ufoid();
+        let herbert = ufoid();
+        let dune = ufoid();
         let mut library = TribleSet::new();
 
-        library += entity! { &author_id @
+        library += entity! { &herbert @
             literature::firstname: "Frank",
             literature::lastname: "Herbert",
         };
 
-        library += entity! { &author_id @
+        library += entity! { &dune @
             literature::title: "Dune",
-            literature::author: &author_id,
+            literature::author: &herbert,
             literature::quote: ws.put(
-                "Deep in the human unconscious is a pervasive need for a logical \
-                 universe that makes sense. But the real universe is always one \
-                 step beyond logic."
-            ),
-            literature::quote: ws.put(
-                "I must not fear. Fear is the mind-killer. Fear is the little-death \
-                 that brings total obliteration. I will face my fear. I will permit \
-                 it to pass over me and through me. And when it has gone past I will \
-                 turn the inner eye to see its path. Where the fear has gone there \
-                 will be nothing. Only I will remain."
+                "I must not fear. Fear is the mind-killer."
             ),
         };
 
@@ -132,17 +124,14 @@ mod readme_example {
         let catalog = ws.checkout(..)?;
         let title = "Dune";
 
-        // Use `_?ident` when you need a fresh variable scoped to this macro call
-        // without declaring it in the find! projection list.
         for (f, l, quote) in find!(
-            (first: String, last: Value<_>, quote),
+            (first: String, last: String, quote),
             pattern!(&catalog, [
-                {
-                    _?author @
+                { _?author @
                     literature::firstname: ?first,
                     literature::lastname: ?last
                 },
-                {
+                { _?book @
                     literature::title: title,
                     literature::author: _?author,
                     literature::quote: ?quote
@@ -151,63 +140,44 @@ mod readme_example {
         ) {
             let quote: View<str> = ws.get(quote)?;
             let quote = quote.as_ref();
-
-            println!(
-                "'{quote}'\n - from {title} by {f} {}.",
-                l.try_from_value::<&str>().unwrap()
-            );
+            println!("'{quote}'\n - from {title} by {f} {l}.");
         }
 
-        // Use `push` when you want automatic retries that merge concurrent history
-        // into the workspace before publishing.
         repo.push(&mut ws).expect("publish initial library");
 
-        // Stage a non-monotonic update that we plan to reconcile manually.
         ws.commit(
-            entity! { &author_id @ literature::firstname: "Francis" },
+            entity! { &herbert @ literature::firstname: "Francis" },
             "use pen name",
         );
 
-        // Simulate a collaborator racing us with a different update.
-        let mut collaborator = repo.pull(*branch_id).expect("pull collaborator workspace");
+        let mut collaborator = repo.pull(*branch_id).expect("pull");
         collaborator.commit(
-            entity! { &author_id @ literature::firstname: "Franklin" },
+            entity! { &herbert @ literature::firstname: "Franklin" },
             "record legal first name",
         );
-        repo.push(&mut collaborator)
-            .expect("publish collaborator history");
+        repo.push(&mut collaborator).expect("publish collaborator");
 
-        // `try_push` returns a conflict workspace when the CAS fails, letting us
-        // inspect divergent history and decide how to merge it.
         if let Some(mut conflict_ws) = repo
             .try_push(&mut ws)
-            .expect("attempt manual conflict resolution")
+            .expect("attempt push")
         {
-            let conflict_catalog = conflict_ws.checkout(..)?;
-
-            for (first,) in find!(
-                (first: Value<_>),
-                pattern!(&conflict_catalog, [{
-                    literature::author: &author_id,
-                    literature::firstname: ?first
-                }])
+            let their_catalog = conflict_ws.checkout(..)?;
+            for first in find!(
+                first: String,
+                pattern!(&their_catalog, [{ &herbert @ literature::firstname: ?first }])
             ) {
-                println!(
-                    "Collaborator kept the name '{}'.",
-                    first.try_from_value::<&str>().unwrap()
-                );
+                println!("Collaborator recorded: '{first}'.");
             }
 
-            conflict_ws.merge(&mut ws)
-                .expect("merge conflicting history");
+            conflict_ws.merge(&mut ws).expect("merge");
             ws = conflict_ws;
 
             ws.commit(
-                entity! { &author_id @ literature::alias: "Francis" },
-                "keep pen-name as an alias",
+                entity! { &herbert @ literature::alias: "Francis" },
+                "keep pen-name as alias",
             );
 
-            repo.push(&mut ws).expect("publish merged aliases");
+            repo.push(&mut ws).expect("publish resolution");
         }
 
         Ok(())
