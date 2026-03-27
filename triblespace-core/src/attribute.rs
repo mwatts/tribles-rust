@@ -161,7 +161,7 @@ impl<S: ValueSchema> Attribute<S> {
         self.raw
     }
 
-    /// Convert to a runtime `Id` value. This performs the nil check and will
+    /// Convert to a runtime [`Id`](crate::id::Id) value. This performs the nil check and will
     /// panic if the raw id is the nil id (all zeros).
     pub fn id(&self) -> crate::id::Id {
         crate::id::Id::new(self.raw).unwrap()

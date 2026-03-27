@@ -737,7 +737,7 @@ use super::PushResult;
 /// Iterates over all `(Handle, Blob)` pairs currently stored in the pile.
 /// Owned iterator over all blobs currently stored in the pile. This collects
 /// a snapshot of keys/indices at iterator creation so the iterator does not
-/// borrow the underlying `PATCH` and can live independently of the `Pile`.
+/// borrow the underlying [`PATCH`] and can live independently of the [`Pile`].
 pub struct PileBlobStoreIter<H: HashProtocol> {
     mmap: Arc<MmapRaw>,
     inner: crate::patch::PATCHIntoIterator<32, IdentitySchema, IndexEntry>,
@@ -791,7 +791,7 @@ impl<H: HashProtocol> Iterator for PileBlobStoreIter<H> {
 }
 
 /// Adapter that yields only the blob handles. The iterator owns the handle
-/// list and does not borrow the backing `PATCH`.
+/// list and does not borrow the backing [`PATCH`].
 pub struct PileBlobStoreListIter<H: HashProtocol> {
     inner: crate::patch::PATCHIntoIterator<32, IdentitySchema, IndexEntry>,
     _marker: std::marker::PhantomData<H>,

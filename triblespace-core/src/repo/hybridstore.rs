@@ -24,7 +24,7 @@ pub struct HybridStore<B, R> {
 }
 
 impl<B, R> HybridStore<B, R> {
-    /// Creates a new `HybridStore` from the given blob and branch stores.
+    /// Creates a new [`HybridStore`] from the given blob and branch stores.
     pub fn new(blobs: B, branches: R) -> Self {
         Self { blobs, branches }
     }

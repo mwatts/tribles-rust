@@ -63,7 +63,7 @@ impl<S: ValueSchema> ImportAttribute<S> {
         self.raw
     }
 
-    /// Convert to a runtime `Id` value.
+    /// Convert to a runtime [`Id`](crate::id::Id) value.
     pub fn id(&self) -> Id {
         Id::new(self.raw).unwrap()
     }

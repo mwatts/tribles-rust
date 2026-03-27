@@ -279,7 +279,7 @@ pub trait BlobStoreGet<H: HashProtocol> {
 
     /// Retrieves a blob from the repository by its handle.
     /// The handle is a unique identifier for the blob, and is used to retrieve it from the repository.
-    /// The blob is returned as a [`Blob`](crate::blob::Blob) object, which contains the raw bytes of the blob,
+    /// The blob is returned as a [`Blob`] object, which contains the raw bytes of the blob,
     /// which can be deserialized via the appropriate schema type, which is specified by the `T` type parameter.
     ///
     /// # Errors
@@ -785,7 +785,7 @@ where
     /// Consume the repository and return the underlying storage backend.
     ///
     /// This is useful for callers that need to take ownership of the storage
-    /// (for example to call `close()` on a `Pile`) instead of letting the
+    /// (for example to call `close()` on a [`Pile`]) instead of letting the
     /// repository drop it implicitly.
     pub fn into_storage(self) -> Storage {
         self.storage
@@ -1175,7 +1175,7 @@ type BranchMetaHandle = Value<Handle<Blake3, SimpleArchive>>;
 /// with the set of commits that produced it. Pass the commit set as the start
 /// of a range selector to obtain incremental deltas on the next checkout.
 ///
-/// `Checkout` dereferences to `TribleSet`, so it can be used directly with
+/// [`Checkout`] dereferences to [`TribleSet`], so it can be used directly with
 /// `find!`, `pattern!`, and `pattern_changes!`.
 ///
 /// # Example: incremental updates
@@ -2009,7 +2009,7 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
 
     /// Create a merge commit that ties this workspace's current head and an
     /// arbitrary other commit (already present in the underlying blob store)
-    /// together without requiring another `Workspace` instance.
+    /// together without requiring another [`Workspace`] instance.
     ///
     /// This does not attach any content to the merge commit.
     pub fn merge_commit(
@@ -2171,7 +2171,7 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
 
     /// Returns the combined [`TribleSet`] for the specified commits or commit
     /// ranges. `spec` can be a single [`CommitHandle`], an iterator of handles
-    /// or any of the standard range types over `CommitHandle`.
+    /// or any of the standard range types over [`CommitHandle`].
     pub fn checkout<R>(
         &mut self,
         spec: R,

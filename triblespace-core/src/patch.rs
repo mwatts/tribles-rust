@@ -5,7 +5,7 @@
 //! for the full design description and hashing scheme.
 //!
 //! Values stored in leaves are not part of hashing or equality comparisons.
-//! Two [`PATCH`]es are considered equal if they contain the same set of keys,
+//! Two [`PATCH`](crate::patch::PATCH)es are considered equal if they contain the same set of keys,
 //! even if the associated values differ. This allows using the structure as an
 //! idempotent blobstore where a value's hash determines its key.
 //!

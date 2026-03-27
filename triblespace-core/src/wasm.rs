@@ -1,4 +1,4 @@
-//! WebAssembly utilities backed by the `WasmCode` blob schema.
+//! WebAssembly utilities backed by the [`WasmCode`](crate::blob::schemas::wasmcode::WasmCode) blob schema.
 //!
 //! The implementation lives alongside `blob::schemas::wasmcode` so schema
 //! conversions (e.g. `TryFromBlob<WasmCode> for wasmi::Module`) stay close to the
