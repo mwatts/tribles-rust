@@ -2,7 +2,10 @@ use proptest::prelude::*;
 use proptest::collection::vec;
 use triblespace_core::blob::ToBlob;
 use triblespace_core::prelude::*;
+use triblespace_core::query::TriblePattern;
+use triblespace_core::query::Variable;
 use triblespace_core::trible::Trible;
+use triblespace_core::value::schemas::UnknownValue;
 
 fn arb_trible() -> impl Strategy<Value = Trible> {
     (
@@ -162,5 +165,66 @@ proptest! {
         from_original.sort();
         from_restored.sort();
         prop_assert_eq!(from_original, from_restored);
+    }
+
+    // ── SuccinctArchive query consistency ──────────────────────────────
+    //
+    // The Ring index must return the same results as a TribleSet query.
+
+    #[test]
+    fn succinct_archive_full_scan_matches(set in arb_tribleset(15)) {
+        use triblespace_core::blob::schemas::succinctarchive::SuccinctArchive;
+        use triblespace_core::blob::schemas::succinctarchive::OrderedUniverse;
+
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+
+        // Full scan: query all (e, a, v) triples
+        let mut set_results: Vec<_> = find!(
+            (e: Value<_>, a: Value<_>, v: Value<UnknownValue>),
+            set.pattern(e, a, v as Variable<UnknownValue>)
+        ).collect();
+
+        let mut archive_results: Vec<_> = find!(
+            (e: Value<_>, a: Value<_>, v: Value<UnknownValue>),
+            archive.pattern(e, a, v as Variable<UnknownValue>)
+        ).collect();
+
+        set_results.sort();
+        archive_results.sort();
+        prop_assert_eq!(set_results, archive_results,
+            "full scan should match between TribleSet and SuccinctArchive");
+    }
+
+    #[test]
+    fn succinct_archive_entity_scan_matches(set in arb_tribleset(15)) {
+        use triblespace_core::blob::schemas::succinctarchive::SuccinctArchive;
+        use triblespace_core::blob::schemas::succinctarchive::OrderedUniverse;
+
+        if set.is_empty() { return Ok(()); }
+
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+
+        // Pick the first entity and query just its triples
+        let first_trible = set.iter().next().unwrap();
+        let entity_val = {
+            let mut v = [0u8; 32];
+            v[16..32].copy_from_slice(&first_trible.data[0..16]);
+            Value::<valueschemas::GenId>::new(v)
+        };
+
+        let mut set_results: Vec<_> = find!(
+            (a: Value<_>, v: Value<UnknownValue>),
+            temp!((e), and!(e.is(entity_val), set.pattern(e, a, v as Variable<UnknownValue>)))
+        ).collect();
+
+        let mut archive_results: Vec<_> = find!(
+            (a: Value<_>, v: Value<UnknownValue>),
+            temp!((e), and!(e.is(entity_val), archive.pattern(e, a, v as Variable<UnknownValue>)))
+        ).collect();
+
+        set_results.sort();
+        archive_results.sort();
+        prop_assert_eq!(set_results, archive_results,
+            "entity scan should match between TribleSet and SuccinctArchive");
     }
 }
