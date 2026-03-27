@@ -236,6 +236,74 @@ proptest! {
         prop_assert_eq!(results[0].0, expected_id);
     }
 
+    // ── Fragment spread composition ──────────────────────────────────
+
+    #[test]
+    fn fragment_spread_accumulates_child_facts(
+        parent_name in "[a-z]{1,6}",
+        child_names in vec("[a-z]{1,6}", 1..4),
+    ) {
+        // Build child fragments
+        let mut children = triblespace_core::trible::Fragment::default();
+        let mut child_ids = Vec::new();
+        for name in &child_names {
+            let child = rngid();
+            let frag = entity! { &child @ test_ns::name: name.as_str() };
+            child_ids.push(child);
+            children += frag;
+        }
+
+        // Spread children into parent via *=
+        let parent = rngid();
+        let mut set = TribleSet::new();
+        set += entity! { &parent @ test_ns::name: parent_name.as_str() };
+        // Add link from parent to each child
+        for child_id in &child_ids {
+            set += entity! { &parent @ test_ns::link: child_id };
+        }
+        // Add child facts
+        set += children.into_facts();
+
+        // Parent should have name + links
+        let parent_val = (&parent).to_value();
+        // All child names should be queryable
+        for name in &child_names {
+            let found = find!(
+                n: String,
+                pattern!(&set, [{ test_ns::name: ?n }])
+            ).any(|n| n == *name);
+            prop_assert!(found, "child name {:?} not found", name);
+        }
+    }
+
+    // ── entity! content-addressed IDs ──────────────────────────────────
+
+    #[test]
+    fn entity_intrinsic_id_deterministic(
+        name in "[a-z]{1,8}",
+    ) {
+        // entity! without explicit ID derives it from content
+        let frag1 = entity! { test_ns::name: name.as_str() };
+        let frag2 = entity! { test_ns::name: name.as_str() };
+
+        prop_assert_eq!(frag1.root(), frag2.root(),
+            "same content should produce same intrinsic ID");
+        prop_assert_eq!(frag1.facts(), frag2.facts());
+    }
+
+    #[test]
+    fn entity_intrinsic_id_differs_for_different_content(
+        name1 in "[a-z]{1,4}",
+        name2 in "[m-z]{1,4}",
+    ) {
+        prop_assume!(name1 != name2);
+        let frag1 = entity! { test_ns::name: name1.as_str() };
+        let frag2 = entity! { test_ns::name: name2.as_str() };
+
+        prop_assert_ne!(frag1.root(), frag2.root(),
+            "different content should produce different intrinsic IDs");
+    }
+
     #[test]
     fn local_var_enforces_join_across_entities(
         names in vec("[a-z]{1,6}", 2..6),
