@@ -350,6 +350,104 @@ proptest! {
 
     // ── path! reachability ─────────────────────────────────────────────
 
+    // ── EqualityConstraint ──────────────────────────────────────────
+
+    #[test]
+    fn equality_constraint_propose_mirrors_peer(
+        val in prop::array::uniform32(any::<u8>()),
+    ) {
+        use triblespace_core::query::equalityconstraint::EqualityConstraint;
+
+        let eq = EqualityConstraint::new(0, 1);
+        let mut binding = Binding::default();
+        binding.set(0, &val);
+
+        // With peer bound, estimate should be 1
+        prop_assert_eq!(eq.estimate(1, &binding), Some(1));
+
+        // Propose should yield the peer's value
+        let mut proposals = Vec::new();
+        eq.propose(1, &binding, &mut proposals);
+        prop_assert_eq!(proposals.len(), 1);
+        prop_assert_eq!(proposals[0], val);
+    }
+
+    #[test]
+    fn equality_constraint_confirm_filters(
+        peer_val in prop::array::uniform32(any::<u8>()),
+        other_val in prop::array::uniform32(any::<u8>()),
+    ) {
+        use triblespace_core::query::equalityconstraint::EqualityConstraint;
+
+        let eq = EqualityConstraint::new(0, 1);
+        let mut binding = Binding::default();
+        binding.set(0, &peer_val);
+
+        let mut proposals = vec![peer_val, other_val];
+        eq.confirm(1, &binding, &mut proposals);
+
+        if peer_val == other_val {
+            prop_assert_eq!(proposals.len(), 2); // both match
+        } else {
+            prop_assert_eq!(proposals.len(), 1);
+            prop_assert_eq!(proposals[0], peer_val);
+        }
+    }
+
+    #[test]
+    fn equality_constraint_satisfied_both_bound(
+        a_val in prop::array::uniform32(any::<u8>()),
+        b_val in prop::array::uniform32(any::<u8>()),
+    ) {
+        use triblespace_core::query::equalityconstraint::EqualityConstraint;
+
+        let eq = EqualityConstraint::new(0, 1);
+        let mut binding = Binding::default();
+        binding.set(0, &a_val);
+        binding.set(1, &b_val);
+
+        prop_assert_eq!(eq.satisfied(&binding), a_val == b_val);
+    }
+
+    #[test]
+    fn equality_constraint_satisfied_partial(_dummy in 0..1u8) {
+        use triblespace_core::query::equalityconstraint::EqualityConstraint;
+
+        let eq = EqualityConstraint::new(0, 1);
+
+        // Neither bound — optimistically true
+        let binding = Binding::default();
+        prop_assert!(eq.satisfied(&binding));
+
+        // One bound — optimistically true
+        let mut binding = Binding::default();
+        binding.set(0, &[42; 32]);
+        prop_assert!(eq.satisfied(&binding));
+    }
+
+    #[test]
+    fn equality_constraint_symmetric(
+        val in prop::array::uniform32(any::<u8>()),
+    ) {
+        use triblespace_core::query::equalityconstraint::EqualityConstraint;
+
+        let eq = EqualityConstraint::new(0, 1);
+
+        // Bind a=val, propose for b → val
+        let mut binding_a = Binding::default();
+        binding_a.set(0, &val);
+        let mut props_b = Vec::new();
+        eq.propose(1, &binding_a, &mut props_b);
+
+        // Bind b=val, propose for a → val
+        let mut binding_b = Binding::default();
+        binding_b.set(1, &val);
+        let mut props_a = Vec::new();
+        eq.propose(0, &binding_b, &mut props_a);
+
+        prop_assert_eq!(props_a, props_b);
+    }
+
     #[test]
     fn path_single_hop_finds_direct_links(
         chain_len in 2..6usize,

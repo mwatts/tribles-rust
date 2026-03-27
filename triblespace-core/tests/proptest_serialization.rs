@@ -109,4 +109,58 @@ proptest! {
         prop_assert_eq!(blob1.bytes.as_ref(), blob2.bytes.as_ref(),
             "same set should produce identical archive bytes");
     }
+
+    // ── SuccinctArchive query consistency ──────────────────────────────
+
+    #[test]
+    fn succinct_archive_iter_matches_tribleset(set in arb_tribleset(15)) {
+        use triblespace_core::blob::schemas::succinctarchive::SuccinctArchive;
+        use triblespace_core::blob::schemas::succinctarchive::OrderedUniverse;
+
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+
+        // Iter should produce the same tribles
+        let mut from_set: Vec<[u8; 64]> = set.iter().map(|t| t.data).collect();
+        let mut from_archive: Vec<[u8; 64]> = archive.iter().map(|t| t.data).collect();
+        from_set.sort();
+        from_archive.sort();
+        prop_assert_eq!(from_set, from_archive,
+            "succinct archive iter should match tribleset iter");
+    }
+
+    #[test]
+    fn succinct_archive_preserves_len(set in arb_tribleset(15)) {
+        use triblespace_core::blob::schemas::succinctarchive::SuccinctArchive;
+        use triblespace_core::blob::schemas::succinctarchive::OrderedUniverse;
+
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+        prop_assert_eq!(set.len(), archive.iter().count());
+    }
+
+    #[test]
+    fn succinct_archive_empty(_dummy in 0..1u8) {
+        use triblespace_core::blob::schemas::succinctarchive::SuccinctArchive;
+        use triblespace_core::blob::schemas::succinctarchive::OrderedUniverse;
+
+        let empty = TribleSet::new();
+        let archive: SuccinctArchive<OrderedUniverse> = (&empty).into();
+        prop_assert_eq!(archive.iter().count(), 0);
+    }
+
+    #[test]
+    fn succinct_archive_blob_roundtrip(set in arb_tribleset(15)) {
+        use triblespace_core::blob::schemas::succinctarchive::{SuccinctArchive, SuccinctArchiveBlob};
+        use triblespace_core::blob::schemas::succinctarchive::OrderedUniverse;
+
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+        let blob: triblespace_core::blob::Blob<SuccinctArchiveBlob> = archive.to_blob();
+        let restored: SuccinctArchive<OrderedUniverse> = blob.try_from_blob()
+            .expect("succinct archive blob should round-trip");
+
+        let mut from_original: Vec<[u8; 64]> = set.iter().map(|t| t.data).collect();
+        let mut from_restored: Vec<[u8; 64]> = restored.iter().map(|t| t.data).collect();
+        from_original.sort();
+        from_restored.sort();
+        prop_assert_eq!(from_original, from_restored);
+    }
 }
