@@ -38,8 +38,6 @@ staging, queries, and pushing commits to a repository.
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use triblespace::prelude::*;
-use triblespace::prelude::blobschemas::LongString;
-use triblespace::core::repo::{memoryrepo::MemoryRepo, Repository};
 
 mod literature {
     use triblespace::prelude::*;
