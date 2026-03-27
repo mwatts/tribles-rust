@@ -137,6 +137,122 @@ proptest! {
             "push then pull should preserve all data");
     }
 
+    // ── Incremental checkout via CommitSet ────────────────────────────
+
+    #[test]
+    fn incremental_checkout_excludes_seen(
+        batch1 in vec("[a-z]{1,6}", 1..5),
+        batch2 in vec("[a-z]{1,6}", 1..5),
+    ) {
+        let storage = MemoryRepo::default();
+        let mut repo = Repository::new(
+            storage,
+            SigningKey::generate(&mut OsRng),
+            TribleSet::new(),
+        ).unwrap();
+        let branch_id = repo.create_branch("test", None).expect("branch");
+
+        // First commit + push
+        let mut ws = repo.pull(*branch_id).expect("pull");
+        let mut data1 = TribleSet::new();
+        for label in &batch1 {
+            let e = rngid();
+            data1 += entity! { &e @ test_ns::label: label.as_str() };
+        }
+        ws.commit(data1.clone(), "batch 1");
+        repo.push(&mut ws).expect("push");
+
+        // First checkout — sees everything
+        let mut full = repo.pull(*branch_id).expect("pull").checkout(..).expect("checkout");
+
+        // Second commit + push
+        let mut ws = repo.pull(*branch_id).expect("pull");
+        let mut data2 = TribleSet::new();
+        for label in &batch2 {
+            let e = rngid();
+            data2 += entity! { &e @ test_ns::label: label.as_str() };
+        }
+        ws.commit(data2.clone(), "batch 2");
+        repo.push(&mut ws).expect("push");
+
+        // Incremental checkout — should only see batch2
+        let mut ws2 = repo.pull(*branch_id).expect("pull");
+        let delta = ws2.checkout(full.commits()..).expect("delta");
+
+        let delta_labels: Vec<String> = find!(
+            label: String,
+            pattern!(&delta, [{ test_ns::label: ?label }])
+        ).collect();
+
+        // Delta should contain batch2 labels
+        for label in &batch2 {
+            prop_assert!(delta_labels.contains(label),
+                "delta missing {:?}", label);
+        }
+        // Delta should NOT contain batch1 labels (unless they happen to
+        // also be in batch2 by coincidence — different entities though)
+        prop_assert_eq!(delta_labels.len(), batch2.len(),
+            "delta should have exactly batch2 count");
+
+        // Accumulate: full += &delta
+        full += &delta;
+        let all_labels: Vec<String> = find!(
+            label: String,
+            pattern!(&full, [{ test_ns::label: ?label }])
+        ).collect();
+        prop_assert_eq!(all_labels.len(), batch1.len() + batch2.len());
+    }
+
+    // ── Workspace merge ────────────────────────────────────────────────
+
+    #[test]
+    fn merge_combines_concurrent_commits(
+        labels_a in vec("[a-z]{1,6}", 1..4),
+        labels_b in vec("[m-z]{1,6}", 1..4),
+    ) {
+        let storage = MemoryRepo::default();
+        let mut repo = Repository::new(
+            storage,
+            SigningKey::generate(&mut OsRng),
+            TribleSet::new(),
+        ).unwrap();
+        let branch_id = repo.create_branch("test", None).expect("branch");
+
+        // Workspace A commits
+        let mut ws_a = repo.pull(*branch_id).expect("pull");
+        let mut data_a = TribleSet::new();
+        for label in &labels_a {
+            let e = rngid();
+            data_a += entity! { &e @ test_ns::label: label.as_str() };
+        }
+        ws_a.commit(data_a, "from A");
+        repo.push(&mut ws_a).expect("push A");
+
+        // Workspace B commits (on top of A)
+        let mut ws_b = repo.pull(*branch_id).expect("pull");
+        let mut data_b = TribleSet::new();
+        for label in &labels_b {
+            let e = rngid();
+            data_b += entity! { &e @ test_ns::label: label.as_str() };
+        }
+        ws_b.commit(data_b, "from B");
+        repo.push(&mut ws_b).expect("push B");
+
+        // Checkout should contain both
+        let mut ws_final = repo.pull(*branch_id).expect("pull");
+        let checkout = ws_final.checkout(..).expect("checkout");
+
+        let found: Vec<String> = find!(
+            label: String,
+            pattern!(&checkout, [{ test_ns::label: ?label }])
+        ).collect();
+
+        for label in labels_a.iter().chain(labels_b.iter()) {
+            prop_assert!(found.contains(label),
+                "merged checkout missing {:?}", label);
+        }
+    }
+
     #[test]
     fn checkout_commits_tracks_seen(
         labels in vec("[a-z]{1,8}", 1..5),
