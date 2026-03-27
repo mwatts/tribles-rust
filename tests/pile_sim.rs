@@ -14,6 +14,7 @@ enum Op {
     Put(Vec<u8>),
     Flush,
     Refresh,
+    Restore,
     Get(usize),
     BranchUpdate { branch: usize, handle: usize },
     BranchHead(usize),
@@ -47,6 +48,10 @@ fn actor_op_strategy(actors: usize, branches: usize) -> impl Strategy<Value = Ac
         (0..actors).prop_map(|actor| ActorOp::Run {
             actor,
             op: Op::Refresh
+        }),
+        (0..actors).prop_map(|actor| ActorOp::Run {
+            actor,
+            op: Op::Restore
         }),
         (0..actors, idx.clone()).prop_map(|(actor, i)| ActorOp::Run {
             actor,
@@ -109,6 +114,12 @@ proptest! {
                     }
                     Op::Refresh => {
                         let _ = piles[actor].refresh();
+                    }
+                    Op::Restore => {
+                        // Simulate crash recovery: close and reopen with restore
+                        let path = dir.path().join("sim.pile");
+                        piles[actor] = Pile::open(&path).unwrap();
+                        piles[actor].restore().unwrap();
                     }
                     Op::Get(i) => {
                         if !handles.is_empty() {
