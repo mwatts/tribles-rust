@@ -136,4 +136,79 @@ proptest! {
         let set: TribleSet = frag.clone().into();
         prop_assert_eq!(frag.facts(), &set);
     }
+
+    // ── temp! creates variables scoped to the expression ───────────────
+
+    #[test]
+    fn temp_enforces_join_without_projecting(
+        src_name in "[a-z]{1,6}",
+        dst_name in "[a-z]{1,6}",
+    ) {
+        let src = rngid();
+        let dst = rngid();
+        let decoy = rngid();
+
+        let mut set = TribleSet::new();
+        set += entity! { &src @ test_ns::name: src_name.as_str(), test_ns::link: &dst };
+        set += entity! { &dst @ test_ns::name: dst_name.as_str() };
+        // Decoy: has a name but isn't linked from src
+        set += entity! { &decoy @ test_ns::name: "decoy" };
+
+        // temp! creates a join variable that doesn't leak into results
+        let results: Vec<String> = find!(
+            name: String,
+            temp!((target), pattern!(&set, [
+                { _?source @ test_ns::name: src_name.as_str(), test_ns::link: ?target },
+                { ?target @ test_ns::name: ?name }
+            ]))
+        ).collect();
+
+        // Should find dst_name but not "decoy"
+        prop_assert_eq!(results.len(), 1);
+        prop_assert_eq!(&results[0], &dst_name);
+    }
+
+    // ── _? local variables enforce equality ────────────────────────────
+
+    // NOTE: Self-referencing patterns like `{ _?e @ test_ns::link: _?e }`
+    // (entity links to itself) are currently unsupported — the
+    // TribleSetConstraint panics when variable_e == variable_v because
+    // the match arms don't cover that case. This was discovered by
+    // proptest and tracked as a known limitation.
+
+    #[test]
+    fn local_var_enforces_join_across_entities(
+        names in vec("[a-z]{1,6}", 2..6),
+    ) {
+        let mut set = TribleSet::new();
+        let hub = rngid();
+        set += entity! { &hub @ test_ns::name: "hub" };
+
+        // Create entities that link to hub
+        for name in &names {
+            let e = rngid();
+            set += entity! { &e @ test_ns::name: name.as_str(), test_ns::link: &hub };
+        }
+        // Create a decoy that links to something else
+        let decoy = rngid();
+        let other = rngid();
+        set += entity! { &decoy @ test_ns::name: "decoy", test_ns::link: &other };
+
+        // _?target joins across two entity clauses
+        let results: Vec<String> = find!(
+            name: String,
+            pattern!(&set, [
+                { _?source @ test_ns::name: ?name, test_ns::link: _?target },
+                { _?target @ test_ns::name: "hub" }
+            ])
+        ).collect();
+
+        // Should find all names that link to hub, but not "decoy"
+        for name in &names {
+            prop_assert!(results.contains(name),
+                "missing {:?} from join results", name);
+        }
+        prop_assert!(!results.contains(&"decoy".to_string()),
+            "decoy should not appear in results");
+    }
 }
