@@ -167,7 +167,7 @@ impl<S: ValueSchema> Attribute<S> {
         crate::id::Id::new(self.raw).unwrap()
     }
 
-    /// Convert a host value into a typed Value<S> using the Field's schema.
+    /// Convert a host value into a typed `Value<S>` using the Field's schema.
     /// This is a small convenience wrapper around the `ToValue` trait and
     /// simplifies macro expansion: `af.value_from(expr)` preserves the
     /// schema `S` for type inference.
