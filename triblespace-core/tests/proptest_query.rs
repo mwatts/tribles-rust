@@ -422,6 +422,121 @@ proptest! {
 
     // ── EqualityConstraint ──────────────────────────────────────────
 
+    // ── Union distributes over queries ───────────────────────────────
+
+    #[test]
+    fn query_union_equals_union_of_queries(
+        a in arb_tribleset(8),
+        b in arb_tribleset(8),
+    ) {
+        // query(A ∪ B) ⊇ query(A) ∪ query(B)
+        // (equality holds for full scans)
+        let union = a.clone() + b.clone();
+
+        let mut union_results: Vec<_> = find!(
+            (e: Value<_>, attr: Value<_>, v: Value<UnknownValue>),
+            union.pattern(e, attr, v as Variable<UnknownValue>)
+        ).collect();
+
+        let a_results: Vec<_> = find!(
+            (e: Value<_>, attr: Value<_>, v: Value<UnknownValue>),
+            a.pattern(e, attr, v as Variable<UnknownValue>)
+        ).collect();
+
+        let b_results: Vec<_> = find!(
+            (e: Value<_>, attr: Value<_>, v: Value<UnknownValue>),
+            b.pattern(e, attr, v as Variable<UnknownValue>)
+        ).collect();
+
+        // Merge and deduplicate the individual results
+        let mut merged: Vec<_> = a_results.into_iter().chain(b_results).collect();
+        merged.sort();
+        merged.dedup();
+        union_results.sort();
+
+        prop_assert_eq!(union_results, merged,
+            "query(A ∪ B) should equal query(A) ∪ query(B)");
+    }
+
+    // ── ignore! hides variables without breaking joins ─────────────────
+
+    #[test]
+    fn ignore_hides_entity_but_join_works(
+        names in vec("[a-z]{1,6}", 2..6),
+    ) {
+        let hub = rngid();
+        let mut set = TribleSet::new();
+        set += entity! { &hub @ test_ns::label: "hub" };
+
+        for name in &names {
+            let e = rngid();
+            set += entity! { &e @ test_ns::label: name.as_str(), test_ns::link: &hub };
+        }
+
+        // Without ignore!: get both name and entity
+        let full_results: Vec<(Value<_>, String)> = find!(
+            (entity: Value<_>, name: String),
+            pattern!(&set, [
+                { ?entity @ test_ns::label: ?name, test_ns::link: _?target },
+                { _?target @ test_ns::label: "hub" }
+            ])
+        ).collect();
+
+        // With temp! (equivalent of ignore for our purposes): get just name
+        let name_only: Vec<String> = find!(
+            name: String,
+            pattern!(&set, [
+                { _?entity @ test_ns::label: ?name, test_ns::link: _?target },
+                { _?target @ test_ns::label: "hub" }
+            ])
+        ).collect();
+
+        // Both should find the same names
+        let mut full_names: Vec<String> = full_results.into_iter().map(|(_, n)| n).collect();
+        let mut names_only_sorted = name_only.clone();
+        full_names.sort();
+        names_only_sorted.sort();
+        prop_assert_eq!(full_names, names_only_sorted,
+            "hiding entity variable should not affect join results");
+
+        // And should find all expected names
+        for name in &names {
+            prop_assert!(name_only.contains(name),
+                "missing {:?}", name);
+        }
+    }
+
+    // ── Intersect query equals and! of queries ─────────────────────────
+
+    #[test]
+    fn intersect_query_equals_and_of_queries(
+        a in arb_tribleset(8),
+        b in arb_tribleset(8),
+    ) {
+        let intersect = a.intersect(&b);
+
+        let mut intersect_results: Vec<_> = find!(
+            (e: Value<_>, attr: Value<_>, v: Value<UnknownValue>),
+            intersect.pattern(e, attr, v as Variable<UnknownValue>)
+        ).collect();
+
+        // and! of two patterns on different sets = intersection of results
+        let mut and_results: Vec<_> = find!(
+            (e: Value<_>, attr: Value<_>, v: Value<UnknownValue>),
+            and!(
+                a.pattern(e, attr, v as Variable<UnknownValue>),
+                b.pattern(e, attr, v as Variable<UnknownValue>)
+            )
+        ).collect();
+
+        intersect_results.sort();
+        and_results.sort();
+        prop_assert_eq!(intersect_results, and_results,
+            "query(A ∩ B) should equal and!(query(A), query(B))");
+    }
+
+    // ── EqualityConstraint ──────────────────────────────────────────
+
     #[test]
     fn equality_constraint_propose_mirrors_peer(
         val in prop::array::uniform32(any::<u8>()),
