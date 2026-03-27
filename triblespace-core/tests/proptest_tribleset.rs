@@ -292,6 +292,85 @@ proptest! {
         }
     }
 
+    // ── COW / clone independence ─────────────────────────────────────
+
+    #[test]
+    fn clone_then_modify_independent(
+        base in arb_tribleset(10),
+        extra in arb_trible(),
+    ) {
+        let original = base.clone();
+        let mut modified = base;
+        modified.insert(&extra);
+        // Original should be unaffected by the insertion into modified
+        prop_assert_eq!(original.len() + if original.contains(&extra) { 0 } else { 1 },
+            modified.len());
+        // If extra wasn't in original, it should only be in modified
+        if !original.contains(&extra) {
+            prop_assert!(!original.contains(&extra));
+            prop_assert!(modified.contains(&extra));
+        }
+    }
+
+    #[test]
+    fn clone_equality_before_modification(
+        set in arb_tribleset(10),
+    ) {
+        let cloned = set.clone();
+        prop_assert_eq!(set.fingerprint(), cloned.fingerprint());
+        prop_assert_eq!(set, cloned);
+    }
+
+    // ── Union distributes over difference ──────────────────────────────
+
+    #[test]
+    fn union_distributes_over_intersect(
+        a in arb_tribleset(8),
+        b in arb_tribleset(8),
+        c in arb_tribleset(8),
+    ) {
+        // A ∪ (B ∩ C) = (A ∪ B) ∩ (A ∪ C)
+        let lhs = a.clone() + b.intersect(&c);
+        let rhs = (a.clone() + b).intersect(&(a + c));
+        prop_assert_eq!(lhs, rhs);
+    }
+
+    #[test]
+    fn intersect_distributes_over_union(
+        a in arb_tribleset(8),
+        b in arb_tribleset(8),
+        c in arb_tribleset(8),
+    ) {
+        // A ∩ (B ∪ C) = (A ∩ B) ∪ (A ∩ C)
+        let lhs = a.intersect(&(b.clone() + c.clone()));
+        let rhs = a.intersect(&b) + a.intersect(&c);
+        prop_assert_eq!(lhs, rhs);
+    }
+
+    // ── Associativity ──────────────────────────────────────────────────
+
+    #[test]
+    fn union_associative(
+        a in arb_tribleset(8),
+        b in arb_tribleset(8),
+        c in arb_tribleset(8),
+    ) {
+        let ab_c = (a.clone() + b.clone()) + c.clone();
+        let a_bc = a + (b + c);
+        prop_assert_eq!(ab_c, a_bc);
+    }
+
+    #[test]
+    fn intersect_associative(
+        a in arb_tribleset(8),
+        b in arb_tribleset(8),
+        c in arb_tribleset(8),
+    ) {
+        let ab_c = a.intersect(&b).intersect(&c);
+        let a_bc = a.intersect(&b.intersect(&c));
+        prop_assert_eq!(ab_c, a_bc);
+    }
+
     #[test]
     fn pattern_changes_subset_of_pattern(
         base_labels in vec("[a-z]{1,8}", 1..8),
