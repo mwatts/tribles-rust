@@ -13,10 +13,10 @@ use super::*;
 /// Implements [`ContainsConstraint`] so it can be used with `.has()`
 /// in queries — confirm uses binary search for O(log n) filtering
 /// instead of the O(n) linear scan of [`HashSet`](std::collections::HashSet).
+///
+/// Derefs to `&[T]` for direct access to slice methods.
 #[derive(Debug, Clone, Copy)]
-pub struct SortedSlice<'a, T> {
-    data: &'a [T],
-}
+pub struct SortedSlice<'a, T>(pub &'a [T]);
 
 /// Error returned by [`SortedSlice::new`] when the input is not sorted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,7 +34,7 @@ impl<'a, T: Ord> SortedSlice<'a, T> {
     /// Creates a sorted slice, verifying that `data` is sorted.
     pub fn new(data: &'a [T]) -> Result<Self, NotSortedError> {
         if data.windows(2).all(|w| w[0] <= w[1]) {
-            Ok(SortedSlice { data })
+            Ok(SortedSlice(data))
         } else {
             Err(NotSortedError)
         }
@@ -47,22 +47,14 @@ impl<'a, T: Ord> SortedSlice<'a, T> {
     /// The caller must ensure `data` is sorted in ascending order.
     /// Unsorted data will produce incorrect query results.
     pub fn new_unchecked(data: &'a [T]) -> Self {
-        SortedSlice { data }
+        SortedSlice(data)
     }
+}
 
-    /// Returns the number of elements.
-    pub fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    /// Returns `true` if the slice is empty.
-    pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
-
-    /// Returns `true` if the slice contains the value.
-    pub fn contains(&self, value: &T) -> bool {
-        self.data.binary_search(value).is_ok()
+impl<T> std::ops::Deref for SortedSlice<'_, T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        self.0
     }
 }
 
@@ -90,7 +82,7 @@ where
 
     fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
         if self.variable.index == variable {
-            Some(self.slice.len())
+            Some(self.slice.0.len())
         } else {
             None
         }
@@ -98,7 +90,7 @@ where
 
     fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
         if self.variable.index == variable {
-            proposals.extend(self.slice.data.iter().map(|v| ToValue::to_value(v).raw));
+            proposals.extend(self.slice.0.iter().map(|v| ToValue::to_value(v).raw));
         }
     }
 
@@ -106,7 +98,7 @@ where
         if self.variable.index == variable {
             proposals.retain(|v| {
                 match TryFromValue::try_from_value(Value::<S>::as_transmute_raw(v)) {
-                    Ok(t) => self.slice.contains(&t),
+                    Ok(t) => self.slice.0.binary_search(&t).is_ok(),
                     Err(_) => false,
                 }
             });
