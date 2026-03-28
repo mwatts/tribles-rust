@@ -31,6 +31,8 @@ pub mod intersectionconstraint;
 pub mod patchconstraint;
 /// [`RegularPathConstraint`](regularpathconstraint::RegularPathConstraint) — regular path expressions over graphs.
 pub mod regularpathconstraint;
+/// [`SortedSliceConstraint`](sortedsliceconstraint::SortedSliceConstraint) — constrains a variable to values in a sorted slice (binary search confirm).
+pub mod sortedsliceconstraint;
 /// [`UnionConstraint`](unionconstraint::UnionConstraint) — logical OR.
 pub mod unionconstraint;
 mod variableset;

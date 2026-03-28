@@ -52,6 +52,7 @@ pub use crate::metadata::{ConstDescribe, ConstId, Describe};
 pub use crate::ignore;
 pub use crate::or;
 pub use crate::query::ContainsConstraint;
+pub use crate::query::sortedsliceconstraint::SortedSlice;
 pub use crate::query::TriblePattern;
 pub use crate::query::Variable;
 pub use crate::query::exists;

@@ -535,6 +535,50 @@ proptest! {
             "query(A ∩ B) should equal and!(query(A), query(B))");
     }
 
+    // ── SortedSlice ─────────────────────────────────────────────────
+
+    #[test]
+    fn sorted_slice_same_as_hashset(
+        values in proptest::collection::hash_set("[a-z]{1,6}", 1..15),
+    ) {
+        use triblespace_core::query::sortedsliceconstraint::SortedSlice;
+        use triblespace_core::value::schemas::shortstring::ShortString;
+
+        let hash: HashSet<String> = values;
+        let mut sorted_vals: Vec<String> = hash.iter().cloned().collect();
+        sorted_vals.sort();
+        let slice = SortedSlice::new(&sorted_vals).unwrap();
+
+        let mut hash_results: Vec<Value<ShortString>> = find!(
+            v: Value<ShortString>,
+            hash.has(v)
+        ).collect();
+
+        let mut slice_results: Vec<Value<ShortString>> = find!(
+            v: Value<ShortString>,
+            slice.has(v)
+        ).collect();
+
+        hash_results.sort();
+        slice_results.sort();
+        prop_assert_eq!(hash_results, slice_results,
+            "SortedSlice should produce same results as HashSet");
+    }
+
+    #[test]
+    fn sorted_slice_rejects_unsorted(_dummy in 0..1u8) {
+        use triblespace_core::query::sortedsliceconstraint::SortedSlice;
+        let data = ["c", "a", "b"];
+        prop_assert!(SortedSlice::new(&data).is_err());
+    }
+
+    #[test]
+    fn sorted_slice_accepts_sorted(len in 0..20usize) {
+        use triblespace_core::query::sortedsliceconstraint::SortedSlice;
+        let data: Vec<String> = (0..len).map(|i| format!("{i:04}")).collect();
+        prop_assert!(SortedSlice::new(&data).is_ok());
+    }
+
     // ── EqualityConstraint ──────────────────────────────────────────
 
     #[test]
