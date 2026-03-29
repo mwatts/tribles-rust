@@ -17,28 +17,20 @@ use std::convert::TryInto;
 
 use hifitime::prelude::*;
 
-/// A value schema for a TAI interval (little-endian, legacy).
+/// A value schema for a TAI interval (order-preserving big-endian).
 ///
 /// A TAI interval is a pair of TAI epochs stored as two 128-bit signed
-/// integers (lower, upper) in **little-endian** byte order. Both bounds
-/// are inclusive.
+/// integers (lower, upper) in **order-preserving big-endian** byte order.
+/// Both bounds are inclusive.
 ///
-/// Little-endian encoding means byte-order ≠ time-order, so this schema
-/// is not suitable for range scans on the trie. For ordered queries, use
-/// [`OrderedNsTAIInterval`] instead.
+/// Each i128 is XOR'd with the sign bit (mapping i128::MIN to 0, 0 to 2^127,
+/// i128::MAX to u128::MAX) then written big-endian. Byte-lexicographic order
+/// matches numeric order across the full i128 range, enabling efficient range
+/// scans on the trie.
 pub struct NsTAIInterval;
 
-/// A value schema for a TAI interval (big-endian, sortable).
-///
-/// Same semantics as [`NsTAIInterval`] but stored in **order-preserving
-/// big-endian**: each i128 is XOR'd with the sign bit (mapping i128::MIN→0,
-/// 0→2^127, i128::MAX→u128::MAX) then written big-endian. Byte-lexicographic
-/// order matches numeric order across the full i128 range, enabling efficient
-/// range scans on the trie.
-pub struct OrderedNsTAIInterval;
-
 impl ConstId for NsTAIInterval {
-    const ID: Id = id_hex!("675A2E885B12FCBC0EEC01E6AEDD8AA8");
+    const ID: Id = id_hex!("2170014368272A2B1B18B86B1F1F1CB5");
 }
 
 impl ConstDescribe for NsTAIInterval {
@@ -48,58 +40,7 @@ impl ConstDescribe for NsTAIInterval {
     {
         let id = Self::ID;
         let description = blobs.put(
-            "Inclusive TAI interval encoded as two little-endian i128 nanosecond bounds. TAI is monotonic and does not include leap seconds, making it ideal for precise ordering.\n\nUse for time windows, scheduling, or event ranges where monotonic time matters. If you need civil time, time zones, or calendar semantics, store a separate representation alongside this interval.\n\nIntervals are inclusive on both ends. If you need half-open intervals or offsets, consider RangeU128 with your own epoch mapping.",
-        )?;
-        let tribles = entity! {
-            ExclusiveId::force_ref(&id) @
-                metadata::name: blobs.put("nstai_interval")?,
-                metadata::description: description,
-                metadata::tag: metadata::KIND_VALUE_SCHEMA,
-        };
-
-        #[cfg(feature = "wasm")]
-        let tribles = {
-            let mut tribles = tribles;
-            tribles += entity! { ExclusiveId::force_ref(&id) @
-                metadata::value_formatter: blobs.put(wasm_formatter::NSTAI_INTERVAL_WASM)?,
-            };
-            tribles
-        };
-        Ok(tribles)
-    }
-}
-
-#[cfg(feature = "wasm")]
-mod wasm_formatter {
-    use core::fmt::Write;
-
-    use triblespace_core_macros::value_formatter;
-
-    #[value_formatter]
-    pub(crate) fn nstai_interval(raw: &[u8; 32], out: &mut impl Write) -> Result<(), u32> {
-        let mut buf = [0u8; 16];
-        buf.copy_from_slice(&raw[0..16]);
-        let lower = i128::from_le_bytes(buf);
-        buf.copy_from_slice(&raw[16..32]);
-        let upper = i128::from_le_bytes(buf);
-
-        write!(out, "{lower}..={upper}").map_err(|_| 1u32)?;
-        Ok(())
-    }
-}
-
-impl ConstId for OrderedNsTAIInterval {
-    const ID: Id = id_hex!("2170014368272A2B1B18B86B1F1F1CB5");
-}
-
-impl ConstDescribe for OrderedNsTAIInterval {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-    {
-        let id = Self::ID;
-        let description = blobs.put(
-            "Inclusive TAI interval encoded as two offset-big-endian i128 nanosecond bounds. Each i128 is XOR'd with i128::MIN then stored big-endian, so byte-lexicographic order matches numeric order. This enables efficient range scans on ordered indexes.\n\nSemantically identical to NsTAIInterval — same inclusive bounds, same TAI monotonic time. Prefer this schema when range queries or sorted iteration matter.",
+            "Inclusive TAI interval encoded as two offset-big-endian i128 nanosecond bounds. Each i128 is XOR'd with i128::MIN then stored big-endian, so byte-lexicographic order matches numeric order. This enables efficient range scans on ordered indexes.\n\nSemantically identical to the legacy LE encoding — same inclusive bounds, same TAI monotonic time.",
         )?;
         Ok(entity! {
             ExclusiveId::force_ref(&id) @
@@ -123,121 +64,12 @@ fn i128_from_ordered_be(bytes: [u8; 16]) -> i128 {
     (u128::from_be_bytes(bytes) ^ SIGN_BIT) as i128
 }
 
-impl ValueSchema for OrderedNsTAIInterval {
+impl ValueSchema for NsTAIInterval {
     type ValidationError = InvertedIntervalError;
 
     fn validate(value: Value<Self>) -> Result<Value<Self>, Self::ValidationError> {
         let lower = i128_from_ordered_be(value.raw[0..16].try_into().unwrap());
         let upper = i128_from_ordered_be(value.raw[16..32].try_into().unwrap());
-        if lower > upper {
-            Err(InvertedIntervalError { lower, upper })
-        } else {
-            Ok(value)
-        }
-    }
-}
-
-impl TryToValue<OrderedNsTAIInterval> for (Epoch, Epoch) {
-    type Error = InvertedIntervalError;
-    fn try_to_value(self) -> Result<Value<OrderedNsTAIInterval>, InvertedIntervalError> {
-        let lower = self.0.to_tai_duration().total_nanoseconds();
-        let upper = self.1.to_tai_duration().total_nanoseconds();
-        if lower > upper {
-            return Err(InvertedIntervalError { lower, upper });
-        }
-        let mut value = [0; 32];
-        value[0..16].copy_from_slice(&i128_to_ordered_be(lower));
-        value[16..32].copy_from_slice(&i128_to_ordered_be(upper));
-        Ok(Value::new(value))
-    }
-}
-
-impl TryFromValue<'_, OrderedNsTAIInterval> for (Epoch, Epoch) {
-    type Error = InvertedIntervalError;
-    fn try_from_value(v: &Value<OrderedNsTAIInterval>) -> Result<Self, InvertedIntervalError> {
-        let lower = i128_from_ordered_be(v.raw[0..16].try_into().unwrap());
-        let upper = i128_from_ordered_be(v.raw[16..32].try_into().unwrap());
-        if lower > upper {
-            return Err(InvertedIntervalError { lower, upper });
-        }
-        Ok((
-            Epoch::from_tai_duration(Duration::from_total_nanoseconds(lower)),
-            Epoch::from_tai_duration(Duration::from_total_nanoseconds(upper)),
-        ))
-    }
-}
-
-impl TryFromValue<'_, OrderedNsTAIInterval> for (i128, i128) {
-    type Error = InvertedIntervalError;
-    fn try_from_value(v: &Value<OrderedNsTAIInterval>) -> Result<Self, InvertedIntervalError> {
-        let lower = i128_from_ordered_be(v.raw[0..16].try_into().unwrap());
-        let upper = i128_from_ordered_be(v.raw[16..32].try_into().unwrap());
-        if lower > upper {
-            return Err(InvertedIntervalError { lower, upper });
-        }
-        Ok((lower, upper))
-    }
-}
-
-impl TryFromValue<'_, OrderedNsTAIInterval> for Lower {
-    type Error = Infallible;
-    fn try_from_value(v: &Value<OrderedNsTAIInterval>) -> Result<Self, Infallible> {
-        Ok(Lower(i128_from_ordered_be(v.raw[0..16].try_into().unwrap())))
-    }
-}
-
-impl TryFromValue<'_, OrderedNsTAIInterval> for Upper {
-    type Error = Infallible;
-    fn try_from_value(v: &Value<OrderedNsTAIInterval>) -> Result<Self, Infallible> {
-        Ok(Upper(i128_from_ordered_be(v.raw[16..32].try_into().unwrap())))
-    }
-}
-
-impl TryFromValue<'_, OrderedNsTAIInterval> for Midpoint {
-    type Error = InvertedIntervalError;
-    fn try_from_value(v: &Value<OrderedNsTAIInterval>) -> Result<Self, InvertedIntervalError> {
-        let lower = i128_from_ordered_be(v.raw[0..16].try_into().unwrap());
-        let upper = i128_from_ordered_be(v.raw[16..32].try_into().unwrap());
-        if lower > upper {
-            return Err(InvertedIntervalError { lower, upper });
-        }
-        Ok(Midpoint(lower + (upper - lower) / 2))
-    }
-}
-
-impl TryFromValue<'_, OrderedNsTAIInterval> for Width {
-    type Error = InvertedIntervalError;
-    fn try_from_value(v: &Value<OrderedNsTAIInterval>) -> Result<Self, InvertedIntervalError> {
-        let lower = i128_from_ordered_be(v.raw[0..16].try_into().unwrap());
-        let upper = i128_from_ordered_be(v.raw[16..32].try_into().unwrap());
-        if lower > upper {
-            return Err(InvertedIntervalError { lower, upper });
-        }
-        Ok(Width(upper - lower))
-    }
-}
-
-/// The lower bound exceeds the upper bound.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InvertedIntervalError {
-    /// The lower bound that was greater than `upper`.
-    pub lower: i128,
-    /// The upper bound that was less than `lower`.
-    pub upper: i128,
-}
-
-impl std::fmt::Display for InvertedIntervalError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "inverted interval: lower {} > upper {}", self.lower, self.upper)
-    }
-}
-
-impl ValueSchema for NsTAIInterval {
-    type ValidationError = InvertedIntervalError;
-
-    fn validate(value: Value<Self>) -> Result<Value<Self>, Self::ValidationError> {
-        let lower = i128::from_le_bytes(value.raw[0..16].try_into().unwrap());
-        let upper = i128::from_le_bytes(value.raw[16..32].try_into().unwrap());
         if lower > upper {
             Err(InvertedIntervalError { lower, upper })
         } else {
@@ -255,8 +87,8 @@ impl TryToValue<NsTAIInterval> for (Epoch, Epoch) {
             return Err(InvertedIntervalError { lower, upper });
         }
         let mut value = [0; 32];
-        value[0..16].copy_from_slice(&lower.to_le_bytes());
-        value[16..32].copy_from_slice(&upper.to_le_bytes());
+        value[0..16].copy_from_slice(&i128_to_ordered_be(lower));
+        value[16..32].copy_from_slice(&i128_to_ordered_be(upper));
         Ok(Value::new(value))
     }
 }
@@ -264,8 +96,8 @@ impl TryToValue<NsTAIInterval> for (Epoch, Epoch) {
 impl TryFromValue<'_, NsTAIInterval> for (Epoch, Epoch) {
     type Error = InvertedIntervalError;
     fn try_from_value(v: &Value<NsTAIInterval>) -> Result<Self, InvertedIntervalError> {
-        let lower = i128::from_le_bytes(v.raw[0..16].try_into().unwrap());
-        let upper = i128::from_le_bytes(v.raw[16..32].try_into().unwrap());
+        let lower = i128_from_ordered_be(v.raw[0..16].try_into().unwrap());
+        let upper = i128_from_ordered_be(v.raw[16..32].try_into().unwrap());
         if lower > upper {
             return Err(InvertedIntervalError { lower, upper });
         }
@@ -279,8 +111,8 @@ impl TryFromValue<'_, NsTAIInterval> for (Epoch, Epoch) {
 impl TryFromValue<'_, NsTAIInterval> for (i128, i128) {
     type Error = InvertedIntervalError;
     fn try_from_value(v: &Value<NsTAIInterval>) -> Result<Self, InvertedIntervalError> {
-        let lower = i128::from_le_bytes(v.raw[0..16].try_into().unwrap());
-        let upper = i128::from_le_bytes(v.raw[16..32].try_into().unwrap());
+        let lower = i128_from_ordered_be(v.raw[0..16].try_into().unwrap());
+        let upper = i128_from_ordered_be(v.raw[16..32].try_into().unwrap());
         if lower > upper {
             return Err(InvertedIntervalError { lower, upper });
         }
@@ -316,24 +148,22 @@ pub struct Width(pub i128);
 impl TryFromValue<'_, NsTAIInterval> for Lower {
     type Error = Infallible;
     fn try_from_value(v: &Value<NsTAIInterval>) -> Result<Self, Infallible> {
-        let lower = i128::from_le_bytes(v.raw[0..16].try_into().unwrap());
-        Ok(Lower(lower))
+        Ok(Lower(i128_from_ordered_be(v.raw[0..16].try_into().unwrap())))
     }
 }
 
 impl TryFromValue<'_, NsTAIInterval> for Upper {
     type Error = Infallible;
     fn try_from_value(v: &Value<NsTAIInterval>) -> Result<Self, Infallible> {
-        let upper = i128::from_le_bytes(v.raw[16..32].try_into().unwrap());
-        Ok(Upper(upper))
+        Ok(Upper(i128_from_ordered_be(v.raw[16..32].try_into().unwrap())))
     }
 }
 
 impl TryFromValue<'_, NsTAIInterval> for Midpoint {
     type Error = InvertedIntervalError;
     fn try_from_value(v: &Value<NsTAIInterval>) -> Result<Self, InvertedIntervalError> {
-        let lower = i128::from_le_bytes(v.raw[0..16].try_into().unwrap());
-        let upper = i128::from_le_bytes(v.raw[16..32].try_into().unwrap());
+        let lower = i128_from_ordered_be(v.raw[0..16].try_into().unwrap());
+        let upper = i128_from_ordered_be(v.raw[16..32].try_into().unwrap());
         if lower > upper {
             return Err(InvertedIntervalError { lower, upper });
         }
@@ -344,12 +174,27 @@ impl TryFromValue<'_, NsTAIInterval> for Midpoint {
 impl TryFromValue<'_, NsTAIInterval> for Width {
     type Error = InvertedIntervalError;
     fn try_from_value(v: &Value<NsTAIInterval>) -> Result<Self, InvertedIntervalError> {
-        let lower = i128::from_le_bytes(v.raw[0..16].try_into().unwrap());
-        let upper = i128::from_le_bytes(v.raw[16..32].try_into().unwrap());
+        let lower = i128_from_ordered_be(v.raw[0..16].try_into().unwrap());
+        let upper = i128_from_ordered_be(v.raw[16..32].try_into().unwrap());
         if lower > upper {
             return Err(InvertedIntervalError { lower, upper });
         }
         Ok(Width(upper - lower))
+    }
+}
+
+/// The lower bound exceeds the upper bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvertedIntervalError {
+    /// The lower bound that was greater than `upper`.
+    pub lower: i128,
+    /// The upper bound that was less than `lower`.
+    pub upper: i128,
+}
+
+impl std::fmt::Display for InvertedIntervalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "inverted interval: lower {} > upper {}", self.lower, self.upper)
     }
 }
 
@@ -416,34 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn be_roundtrip() {
-        let lower = Epoch::from_tai_duration(Duration::from_total_nanoseconds(1_000_000_000));
-        let upper = Epoch::from_tai_duration(Duration::from_total_nanoseconds(2_000_000_000));
-        let interval: Value<OrderedNsTAIInterval> = (lower, upper).try_to_value().unwrap();
-        let (out_lower, out_upper): (Epoch, Epoch) = interval.try_from_value().unwrap();
-        assert_eq!((lower, upper), (out_lower, out_upper));
-
-        let (l, u): (i128, i128) = interval.try_from_value().unwrap();
-        assert_eq!(l, 1_000_000_000);
-        assert_eq!(u, 2_000_000_000);
-    }
-
-    #[test]
-    fn be_projection_types() {
-        let lower_ns: i128 = 1_000_000_000;
-        let upper_ns: i128 = 3_000_000_000;
-        let lower = Epoch::from_tai_duration(Duration::from_total_nanoseconds(lower_ns));
-        let upper = Epoch::from_tai_duration(Duration::from_total_nanoseconds(upper_ns));
-        let interval: Value<OrderedNsTAIInterval> = (lower, upper).try_to_value().unwrap();
-
-        let l: Lower = interval.from_value();
-        let u: Upper = interval.from_value();
-        assert_eq!(l.0, lower_ns);
-        assert_eq!(u.0, upper_ns);
-    }
-
-    #[test]
-    fn be_byte_order_matches_numeric_order() {
+    fn byte_order_matches_numeric_order() {
         // Order-preserving BE: byte order = i128 numeric order.
         let times = [i128::MIN, -1_000_000_000, -1, 0, 1, 1_000_000_000, i128::MAX];
         for pair in times.windows(2) {
@@ -454,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn be_roundtrip_edge_cases() {
+    fn roundtrip_edge_cases() {
         for v in [i128::MIN, -1, 0, 1, i128::MAX] {
             assert_eq!(i128_from_ordered_be(i128_to_ordered_be(v)), v);
         }

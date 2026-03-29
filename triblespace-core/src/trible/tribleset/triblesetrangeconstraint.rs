@@ -19,7 +19,7 @@ use crate::value::VALUE_LEN;
 /// Create via [`TribleSet::value_in_range`]:
 ///
 /// ```rust,ignore
-/// find!((id: Id, ts: Value<OrderedNsTAIInterval>),
+/// find!((id: Id, ts: Value<NsTAIInterval>),
 ///     and!(
 ///         pattern!(data, [{ ?id @ exec::requested_at: ?ts }]),
 ///         data.value_in_range(ts, min_ts, max_ts),

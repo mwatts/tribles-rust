@@ -52,5 +52,3 @@ pub use crate::value::schemas::range::{RangeInclusiveU128, RangeU128};
 pub use crate::value::schemas::shortstring::ShortString;
 /// Re-export of [`NsTAIInterval`](crate::value::schemas::time::NsTAIInterval).
 pub use crate::value::schemas::time::NsTAIInterval;
-/// Re-export of [`OrderedNsTAIInterval`](crate::value::schemas::time::OrderedNsTAIInterval).
-pub use crate::value::schemas::time::OrderedNsTAIInterval;

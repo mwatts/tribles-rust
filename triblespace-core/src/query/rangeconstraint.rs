@@ -7,7 +7,7 @@ use super::*;
 /// propose (e.g. a [`pattern!`](crate::pattern)):
 ///
 /// ```rust,ignore
-/// find!((id: Id, ts: Value<OrderedNsTAIInterval>),
+/// find!((id: Id, ts: Value<NsTAIInterval>),
 ///     and!(
 ///         pattern!(data, [{ ?id @ exec::requested_at: ?ts }]),
 ///         value_range(ts, min_ts, max_ts),

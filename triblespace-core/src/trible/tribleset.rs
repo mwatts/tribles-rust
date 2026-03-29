@@ -174,7 +174,7 @@ impl TribleSet {
     /// Use with `and!` alongside a `pattern!` for efficient range queries:
     ///
     /// ```rust,ignore
-    /// find!(ts: Value<OrderedNsTAIInterval>,
+    /// find!(ts: Value<NsTAIInterval>,
     ///     and!(
     ///         pattern!(&data, [{ ?id @ attr: ?ts }]),
     ///         data.value_in_range(ts, min_ts, max_ts),

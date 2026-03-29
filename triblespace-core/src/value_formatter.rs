@@ -347,7 +347,6 @@ mod tests {
         use crate::value::schemas::range::RangeInclusiveU128;
         use crate::value::schemas::range::RangeU128;
         use crate::value::schemas::shortstring::ShortString;
-        use crate::value::schemas::time::NsTAIInterval;
         use crate::value::schemas::UnknownValue;
         use crate::value::Value;
         use crate::value::ValueSchema;
@@ -369,7 +368,7 @@ mod tests {
         space += RangeU128::describe(&mut store).expect("rangeu128 metadata");
         space += RangeInclusiveU128::describe(&mut store).expect("rangeu128 inclusive metadata");
         space += LineLocation::describe(&mut store).expect("linelocation metadata");
-        space += NsTAIInterval::describe(&mut store).expect("nstai interval metadata");
+
         space += ED25519RComponent::describe(&mut store).expect("ed25519 r metadata");
         space += ED25519SComponent::describe(&mut store).expect("ed25519 s metadata");
         space += ED25519PublicKey::describe(&mut store).expect("ed25519 pubkey metadata");
@@ -499,15 +498,6 @@ mod tests {
                 )
                 .unwrap(),
             "1:2..3:4"
-        );
-
-        let nstai = formatter_for(NsTAIInterval::ID);
-        let mut raw = [0u8; 32];
-        raw[0..16].copy_from_slice(&5i128.to_le_bytes());
-        raw[16..32].copy_from_slice(&10i128.to_le_bytes());
-        assert_eq!(
-            nstai.format_value_with_limits(&raw, limits).unwrap(),
-            "5..=10"
         );
 
         let f256le = formatter_for(F256LE::ID);
