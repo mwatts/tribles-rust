@@ -748,6 +748,24 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
     }
 
+    pub(crate) fn infixes_range<const PREFIX_LEN: usize, const INFIX_LEN: usize, F>(
+        &self,
+        prefix: &[u8; PREFIX_LEN],
+        at_depth: usize,
+        min_infix: &[u8; INFIX_LEN],
+        max_infix: &[u8; INFIX_LEN],
+        f: &mut F,
+    ) where
+        F: FnMut(&[u8; INFIX_LEN]),
+    {
+        match self.body_ref() {
+            BodyRef::Leaf(leaf) => leaf.infixes_range::<PREFIX_LEN, INFIX_LEN, O, F>(prefix, at_depth, min_infix, max_infix, f),
+            BodyRef::Branch(branch) => {
+                branch.infixes_range::<PREFIX_LEN, INFIX_LEN, F>(prefix, at_depth, min_infix, max_infix, f)
+            }
+        }
+    }
+
     pub(crate) fn has_prefix<const PREFIX_LEN: usize>(
         &self,
         at_depth: usize,
@@ -1149,6 +1167,35 @@ where
         );
         if let Some(root) = &self.root {
             root.infixes(prefix, 0, &mut for_each);
+        }
+    }
+
+    /// Like [`infixes`](Self::infixes) but only yields infixes in the
+    /// byte range `[min_infix, max_infix]` (inclusive).
+    ///
+    /// The trie is pruned at each depth: branches whose byte key falls
+    /// outside the range at the current infix position are skipped
+    /// entirely, avoiding traversal of irrelevant subtrees.
+    pub fn infixes_range<const PREFIX_LEN: usize, const INFIX_LEN: usize, F>(
+        &self,
+        prefix: &[u8; PREFIX_LEN],
+        min_infix: &[u8; INFIX_LEN],
+        max_infix: &[u8; INFIX_LEN],
+        mut for_each: F,
+    ) where
+        F: FnMut(&[u8; INFIX_LEN]),
+    {
+        const {
+            assert!(PREFIX_LEN + INFIX_LEN <= KEY_LEN);
+        }
+        assert!(
+            O::same_segment_tree(PREFIX_LEN, PREFIX_LEN + INFIX_LEN - 1)
+                && (PREFIX_LEN + INFIX_LEN == KEY_LEN
+                    || !O::same_segment_tree(PREFIX_LEN + INFIX_LEN - 1, PREFIX_LEN + INFIX_LEN)),
+            "INFIX_LEN must cover a whole segment"
+        );
+        if let Some(root) = &self.root {
+            root.infixes_range(prefix, 0, min_infix, max_infix, &mut for_each);
         }
     }
 

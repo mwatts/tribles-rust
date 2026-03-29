@@ -476,6 +476,66 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         }
     }
 
+    /// Like [`infixes`](Self::infixes) but only yields infixes in the
+    /// byte range `[min_infix, max_infix]` (inclusive).
+    ///
+    /// In Case 3 (prefix ends in this node, infix in children), filters
+    /// children by their byte key against the range bounds at the current
+    /// depth, pruning entire subtrees outside the range.
+    pub fn infixes_range<const PREFIX_LEN: usize, const INFIX_LEN: usize, F>(
+        &self,
+        prefix: &[u8; PREFIX_LEN],
+        at_depth: usize,
+        min_infix: &[u8; INFIX_LEN],
+        max_infix: &[u8; INFIX_LEN],
+        f: &mut F,
+    ) where
+        F: FnMut(&[u8; INFIX_LEN]),
+    {
+        let node_end_depth = self.end_depth as usize;
+        let limit = std::cmp::min(PREFIX_LEN, node_end_depth);
+        if !self.childleaf().has_prefix::<O>(at_depth, &prefix[..limit]) {
+            return;
+        }
+
+        // Case 1: infix ends within this node — extract and range-check.
+        if PREFIX_LEN + INFIX_LEN <= node_end_depth {
+            let infix: [u8; INFIX_LEN] =
+                core::array::from_fn(|i| self.childleaf().key[O::TREE_TO_KEY[PREFIX_LEN + i]]);
+            if &infix >= min_infix && &infix <= max_infix {
+                f(&infix);
+            }
+            return;
+        }
+
+        // Case 2: prefix extends into a specific child.
+        if PREFIX_LEN > node_end_depth {
+            if let Some(child) = self.child_table.table_get(prefix[node_end_depth]) {
+                child.infixes_range(prefix, node_end_depth, min_infix, max_infix, f);
+            }
+            return;
+        }
+
+        // Case 3: prefix ends here, infix spans children.
+        // The byte at `node_end_depth` in the infix determines which children
+        // could possibly produce in-range results. Filter by that byte.
+        let infix_byte_idx = node_end_depth - PREFIX_LEN;
+        for entry in self.child_table.iter().flatten() {
+            let child_byte = entry.key();
+            // Prune: if this child's byte is entirely outside the range
+            // at this infix position, skip the subtree.
+            if child_byte < min_infix[infix_byte_idx] && infix_byte_idx < INFIX_LEN {
+                // Check if child_byte is below the min at this depth.
+                // Only skip if it's strictly below — at the boundary we must recurse.
+                continue;
+            }
+            if child_byte > max_infix[infix_byte_idx] && infix_byte_idx < INFIX_LEN {
+                continue;
+            }
+            entry.infixes_range(prefix, node_end_depth, min_infix, max_infix, f);
+        }
+    }
+
     pub fn has_prefix<const PREFIX_LEN: usize>(
         &self,
         at_depth: usize,
