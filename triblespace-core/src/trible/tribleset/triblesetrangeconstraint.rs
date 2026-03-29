@@ -62,12 +62,15 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
         if variable != self.variable_v {
             return None;
         }
-        // Return usize::MAX so the intersection prefers the TribleSet
-        // pattern as proposer (tighter estimate from bound entity+attribute).
-        // This constraint primarily confirms.
-        // When it IS chosen as proposer (e.g. the only constraint on V),
-        // propose() uses infixes_range for efficient trie-pruned iteration.
-        Some(usize::MAX)
+        // Use count_range on the VEA index for an accurate estimate.
+        // This counts leaves in the byte range using cached branch counts,
+        // visiting only boundary nodes — O(depth × branching) not O(n).
+        let count = self.set.vea.count_range::<0, VALUE_LEN>(
+            &[0u8; 0],
+            &self.min,
+            &self.max,
+        );
+        Some(count.min(usize::MAX as u64) as usize)
     }
 
     fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {

@@ -536,6 +536,64 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         }
     }
 
+    /// Count leaves whose infix falls within [min_infix, max_infix].
+    ///
+    /// Children fully inside the range contribute their cached `leaf_count`
+    /// without recursion. Only boundary children (byte == min or max at
+    /// the current depth) need to recurse deeper.
+    pub fn count_range<const PREFIX_LEN: usize, const INFIX_LEN: usize>(
+        &self,
+        prefix: &[u8; PREFIX_LEN],
+        at_depth: usize,
+        min_infix: &[u8; INFIX_LEN],
+        max_infix: &[u8; INFIX_LEN],
+    ) -> u64 {
+        let node_end_depth = self.end_depth as usize;
+        let limit = std::cmp::min(PREFIX_LEN, node_end_depth);
+        if !self.childleaf().has_prefix::<O>(at_depth, &prefix[..limit]) {
+            return 0;
+        }
+
+        // Case 1: infix ends within this node.
+        if PREFIX_LEN + INFIX_LEN <= node_end_depth {
+            let infix: [u8; INFIX_LEN] =
+                core::array::from_fn(|i| self.childleaf().key[O::TREE_TO_KEY[PREFIX_LEN + i]]);
+            return if &infix >= min_infix && &infix <= max_infix {
+                self.leaf_count
+            } else {
+                0
+            };
+        }
+
+        // Case 2: prefix extends into a specific child.
+        if PREFIX_LEN > node_end_depth {
+            if let Some(child) = self.child_table.table_get(prefix[node_end_depth]) {
+                return child.count_range(prefix, node_end_depth, min_infix, max_infix);
+            }
+            return 0;
+        }
+
+        // Case 3: prefix ends here, infix spans children.
+        let infix_byte_idx = node_end_depth - PREFIX_LEN;
+        let min_byte = min_infix[infix_byte_idx];
+        let max_byte = max_infix[infix_byte_idx];
+        let mut total = 0u64;
+        for entry in self.child_table.iter().flatten() {
+            let child_byte = entry.key();
+            if child_byte < min_byte || child_byte > max_byte {
+                continue; // outside range at this depth
+            }
+            if child_byte > min_byte && child_byte < max_byte {
+                // Fully inside the range — use cached count, no recursion.
+                total += entry.count();
+            } else {
+                // Boundary child — must recurse to check deeper bytes.
+                total += entry.count_range(prefix, node_end_depth, min_infix, max_infix);
+            }
+        }
+        total
+    }
+
     pub fn has_prefix<const PREFIX_LEN: usize>(
         &self,
         at_depth: usize,

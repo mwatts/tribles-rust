@@ -766,6 +766,19 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         }
     }
 
+    pub(crate) fn count_range<const PREFIX_LEN: usize, const INFIX_LEN: usize>(
+        &self,
+        prefix: &[u8; PREFIX_LEN],
+        at_depth: usize,
+        min_infix: &[u8; INFIX_LEN],
+        max_infix: &[u8; INFIX_LEN],
+    ) -> u64 {
+        match self.body_ref() {
+            BodyRef::Leaf(leaf) => leaf.count_range::<PREFIX_LEN, INFIX_LEN, O>(prefix, at_depth, min_infix, max_infix),
+            BodyRef::Branch(branch) => branch.count_range::<PREFIX_LEN, INFIX_LEN>(prefix, at_depth, min_infix, max_infix),
+        }
+    }
+
     pub(crate) fn has_prefix<const PREFIX_LEN: usize>(
         &self,
         at_depth: usize,
@@ -1196,6 +1209,26 @@ where
         );
         if let Some(root) = &self.root {
             root.infixes_range(prefix, 0, min_infix, max_infix, &mut for_each);
+        }
+    }
+
+    /// Count entries whose infix falls within [min_infix, max_infix].
+    ///
+    /// Uses cached `leaf_count` on branches to skip entire subtrees that
+    /// are fully inside the range, making the count O(boundary_nodes)
+    /// rather than O(matching_leaves).
+    pub fn count_range<const PREFIX_LEN: usize, const INFIX_LEN: usize>(
+        &self,
+        prefix: &[u8; PREFIX_LEN],
+        min_infix: &[u8; INFIX_LEN],
+        max_infix: &[u8; INFIX_LEN],
+    ) -> u64 {
+        const {
+            assert!(PREFIX_LEN + INFIX_LEN <= KEY_LEN);
+        }
+        match &self.root {
+            Some(root) => root.count_range(prefix, 0, min_infix, max_infix),
+            None => 0,
         }
     }
 

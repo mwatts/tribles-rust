@@ -127,6 +127,22 @@ impl<const KEY_LEN: usize, V> Leaf<KEY_LEN, V> {
         }
     }
 
+    /// Returns 1 if this leaf's infix falls within [min_infix, max_infix], else 0.
+    pub fn count_range<const PREFIX_LEN: usize, const INFIX_LEN: usize, O: KeySchema<KEY_LEN>>(
+        &self,
+        prefix: &[u8; PREFIX_LEN],
+        at_depth: usize,
+        min_infix: &[u8; INFIX_LEN],
+        max_infix: &[u8; INFIX_LEN],
+    ) -> u64 {
+        if !self.has_prefix::<O>(at_depth, prefix) {
+            return 0;
+        }
+        let infix: [u8; INFIX_LEN] =
+            core::array::from_fn(|i| self.key[O::TREE_TO_KEY[PREFIX_LEN + i]]);
+        if &infix >= min_infix && &infix <= max_infix { 1 } else { 0 }
+    }
+
     pub fn has_prefix<O: KeySchema<KEY_LEN>>(&self, at_depth: usize, prefix: &[u8]) -> bool {
         let limit = std::cmp::min(prefix.len(), KEY_LEN);
         for (depth, &p) in prefix.iter().enumerate().take(limit).skip(at_depth) {
