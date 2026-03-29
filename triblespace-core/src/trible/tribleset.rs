@@ -1,8 +1,10 @@
 mod triblesetconstraint;
+pub mod triblesetrangeconstraint;
 
 use triblesetconstraint::*;
 
 use crate::query::TriblePattern;
+use crate::value::Value;
 
 use crate::patch::Entry;
 use crate::patch::PATCH;
@@ -164,6 +166,28 @@ impl TribleSet {
     /// Returns `true` when the exact trible is present in the set.
     pub fn contains(&self, trible: &Trible) -> bool {
         self.eav.has_prefix(&trible.data)
+    }
+
+    /// Creates a constraint that proposes only values in the byte range
+    /// `[min, max]` (inclusive) using the VEA index with `infixes_range`.
+    ///
+    /// Use with `and!` alongside a `pattern!` for efficient range queries:
+    ///
+    /// ```rust,ignore
+    /// find!(ts: Value<OrderedNsTAIInterval>,
+    ///     and!(
+    ///         pattern!(&data, [{ ?id @ attr: ?ts }]),
+    ///         data.value_in_range(ts, min_ts, max_ts),
+    ///     )
+    /// )
+    /// ```
+    pub fn value_in_range<V: ValueSchema>(
+        &self,
+        variable: Variable<V>,
+        min: Value<V>,
+        max: Value<V>,
+    ) -> triblesetrangeconstraint::TribleSetRangeConstraint {
+        triblesetrangeconstraint::TribleSetRangeConstraint::new(variable, min, max, self.clone())
     }
 
     /// Iterates over all tribles in EAV order.
