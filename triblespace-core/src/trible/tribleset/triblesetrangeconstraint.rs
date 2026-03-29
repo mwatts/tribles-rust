@@ -1,5 +1,3 @@
-use crate::id::id_into_value;
-use crate::id::ID_LEN;
 use crate::query::Binding;
 use crate::query::Constraint;
 use crate::query::Variable;
@@ -10,8 +8,6 @@ use crate::value::RawValue;
 use crate::value::Value;
 use crate::value::ValueSchema;
 use crate::value::VALUE_LEN;
-use crate::value::schemas::genid::GenId;
-
 /// A value-range-aware constraint that uses the TribleSet's AVE index
 /// to propose only values in a byte-lexicographic range.
 ///
@@ -102,5 +98,83 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
             Some(v) => *v >= self.min && *v <= self.max,
             None => true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::prelude::*;
+    use crate::prelude::valueschemas::R256BE;
+
+    attributes! {
+        "BB00000000000000BB00000000000000" as range_test_score: R256BE;
+    }
+
+    #[test]
+    fn value_in_range_proposes_correctly() {
+        let e1 = ufoid();
+        let e2 = ufoid();
+        let e3 = ufoid();
+        let e4 = ufoid();
+
+        let v10: Value<R256BE> = 10i128.to_value();
+        let v50: Value<R256BE> = 50i128.to_value();
+        let v90: Value<R256BE> = 90i128.to_value();
+        let v100: Value<R256BE> = 100i128.to_value();
+
+        let mut data = TribleSet::new();
+        data += entity! { &e1 @ range_test_score: v10 };
+        data += entity! { &e2 @ range_test_score: v50 };
+        data += entity! { &e3 @ range_test_score: v90 };
+        data += entity! { &e4 @ range_test_score: v100 };
+
+        // Without range: all 4 results.
+        let all: Vec<Value<R256BE>> = find!(
+            v: Value<R256BE>,
+            pattern!(&data, [{ range_test_score: ?v }])
+        ).collect();
+        assert_eq!(all.len(), 4);
+
+        // With value_in_range [20..=95]: only v50 and v90.
+        let min: Value<R256BE> = 20i128.to_value();
+        let max: Value<R256BE> = 95i128.to_value();
+        let mut filtered: Vec<Value<R256BE>> = find!(
+            v: Value<R256BE>,
+            and!(
+                pattern!(&data, [{ range_test_score: ?v }]),
+                data.value_in_range(v, min, max),
+            )
+        ).collect();
+        filtered.sort();
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0], v50);
+        assert_eq!(filtered[1], v90);
+
+        // Boundary: exact match on min and max.
+        let min_exact: Value<R256BE> = 50i128.to_value();
+        let max_exact: Value<R256BE> = 90i128.to_value();
+        let mut exact: Vec<Value<R256BE>> = find!(
+            v: Value<R256BE>,
+            and!(
+                pattern!(&data, [{ range_test_score: ?v }]),
+                data.value_in_range(v, min_exact, max_exact),
+            )
+        ).collect();
+        exact.sort();
+        assert_eq!(exact.len(), 2);
+        assert_eq!(exact[0], v50);
+        assert_eq!(exact[1], v90);
+
+        // Empty range: no results.
+        let min_empty: Value<R256BE> = 91i128.to_value();
+        let max_empty: Value<R256BE> = 99i128.to_value();
+        let empty: Vec<Value<R256BE>> = find!(
+            v: Value<R256BE>,
+            and!(
+                pattern!(&data, [{ range_test_score: ?v }]),
+                data.value_in_range(v, min_empty, max_empty),
+            )
+        ).collect();
+        assert_eq!(empty.len(), 0);
     }
 }
