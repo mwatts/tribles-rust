@@ -59,6 +59,7 @@ pub use crate::query::exists;
 pub use crate::query::find;
 pub use crate::query::intersectionconstraint::and;
 pub use crate::query::intersectionconstraint::IntersectionConstraint;
+pub use crate::query::rangeconstraint::{ValueRange, value_range};
 pub use crate::query::unionconstraint::UnionConstraint;
 pub use crate::query::temp;
 pub use crate::repo::memoryrepo::MemoryRepo;

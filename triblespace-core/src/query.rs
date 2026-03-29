@@ -29,6 +29,8 @@ pub mod ignore;
 pub mod intersectionconstraint;
 /// [`PatchValueConstraint`](patchconstraint::PatchValueConstraint) and [`PatchIdConstraint`](patchconstraint::PatchIdConstraint) — constrains variables to PATCH entries.
 pub mod patchconstraint;
+/// [`ValueRange`](rangeconstraint::ValueRange) — restricts a variable to a byte-lexicographic range.
+pub mod rangeconstraint;
 /// [`RegularPathConstraint`](regularpathconstraint::RegularPathConstraint) — regular path expressions over graphs.
 pub mod regularpathconstraint;
 /// [`SortedSliceConstraint`](sortedsliceconstraint::SortedSliceConstraint) — constrains a variable to values in a sorted slice (binary search confirm).
