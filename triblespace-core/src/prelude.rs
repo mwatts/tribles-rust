@@ -101,6 +101,7 @@ pub use anybytes::View;
 // new global proc-macros ergonomically available.
 pub use crate::macros::attributes;
 pub use crate::macros::entity;
+pub use crate::macros::id_hex;
 pub use crate::macros::path;
 pub use crate::macros::pattern;
 pub use crate::macros::pattern_changes;

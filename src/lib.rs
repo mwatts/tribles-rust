@@ -14,7 +14,8 @@ pub mod macros {
 
 pub mod prelude {
     pub use crate::macros::{
-        attributes, entity, exists, find, path, pattern, pattern_changes, value_formatter,
+        attributes, entity, exists, find, id_hex, path, pattern, pattern_changes,
+        value_formatter,
     };
     pub use triblespace_core::prelude::*;
 }
