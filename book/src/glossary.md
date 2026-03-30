@@ -89,8 +89,8 @@ nodes use byte-oriented cuckoo hash tables and copy-on-write semantics. A
 `TribleSet` maintains six PATCH instances — one per permutation of entity,
 attribute, and value. Shared leaves keep permutations deduplicated, rolling
 hashes let set operations skip unchanged branches, and queries only visit the
-segments relevant to their bindings, mirroring the behaviour described in the
-deep-dive chapter.
+segments relevant to their bindings, further described in
+[the deep-dive chapter](deep-dive/patch.md).
 
 ### Pile
 An append-only collection of blobs and branch records stored in a single file.
