@@ -1301,12 +1301,12 @@ pub trait CommitSelector<Blobs: BlobStore<Blake3>> {
     >;
 }
 
-/// Selector that returns a commit along with all of its ancestors.
-pub struct Ancestors(pub CommitHandle);
+/// Selector that returns every commit reachable from a starting selector.
+pub struct Ancestors<S>(pub S);
 
 /// Convenience function to create an [`Ancestors`] selector.
-pub fn ancestors(commit: CommitHandle) -> Ancestors {
-    Ancestors(commit)
+pub fn ancestors<S>(selector: S) -> Ancestors<S> {
+    Ancestors(selector)
 }
 
 /// Selector that walks every commit in the input set back N parent steps,
@@ -1323,20 +1323,20 @@ pub fn nth_ancestors<S>(selector: S, n: usize) -> NthAncestors<S> {
     NthAncestors(selector, n)
 }
 
-/// Selector that returns the direct parents of a commit.
-pub struct Parents(pub CommitHandle);
+/// Selector that returns the direct parents of commits from a starting selector.
+pub struct Parents<S>(pub S);
 
 /// Convenience function to create a [`Parents`] selector.
-pub fn parents(commit: CommitHandle) -> Parents {
-    Parents(commit)
+pub fn parents<S>(selector: S) -> Parents<S> {
+    Parents(selector)
 }
 
-/// Selector that returns commits reachable from either of two commits but not
-/// both.
-pub struct SymmetricDiff(pub CommitHandle, pub CommitHandle);
+/// Selector that returns commits reachable from either of two selectors but
+/// not both.
+pub struct SymmetricDiff<A, B>(pub A, pub B);
 
 /// Convenience function to create a [`SymmetricDiff`] selector.
-pub fn symmetric_diff(a: CommitHandle, b: CommitHandle) -> SymmetricDiff {
+pub fn symmetric_diff<A, B>(a: A, b: B) -> SymmetricDiff<A, B> {
     SymmetricDiff(a, b)
 }
 
@@ -1482,8 +1482,9 @@ where
     }
 }
 
-impl<Blobs> CommitSelector<Blobs> for Ancestors
+impl<S, Blobs> CommitSelector<Blobs> for Ancestors<S>
 where
+    S: CommitSelector<Blobs>,
     Blobs: BlobStore<Blake3>,
 {
     fn select(
@@ -1493,7 +1494,8 @@ where
         CommitSet,
         WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
     > {
-        collect_reachable(ws, self.0)
+        let seeds = self.0.select(ws)?;
+        collect_reachable_from_patch(ws, seeds)
     }
 }
 
@@ -1532,8 +1534,9 @@ where
     }
 }
 
-impl<Blobs> CommitSelector<Blobs> for Parents
+impl<S, Blobs> CommitSelector<Blobs> for Parents<S>
 where
+    S: CommitSelector<Blobs>,
     Blobs: BlobStore<Blake3>,
 {
     fn select(
@@ -1543,17 +1546,23 @@ where
         CommitSet,
         WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
     > {
-        let meta: TribleSet = ws.get(self.0).map_err(WorkspaceCheckoutError::Storage)?;
+        let seeds = self.0.select(ws)?;
         let mut result = CommitSet::new();
-        for (p,) in find!((p: Value<_>), pattern!(&meta, [{ parent: ?p }])) {
-            result.insert(&Entry::new(&p.raw));
+        for raw in seeds.iter() {
+            let handle = Value::new(*raw);
+            let meta: TribleSet = ws.get(handle).map_err(WorkspaceCheckoutError::Storage)?;
+            for (p,) in find!((p: Value<_>), pattern!(&meta, [{ parent: ?p }])) {
+                result.insert(&Entry::new(&p.raw));
+            }
         }
         Ok(result)
     }
 }
 
-impl<Blobs> CommitSelector<Blobs> for SymmetricDiff
+impl<A, B, Blobs> CommitSelector<Blobs> for SymmetricDiff<A, B>
 where
+    A: CommitSelector<Blobs>,
+    B: CommitSelector<Blobs>,
     Blobs: BlobStore<Blake3>,
 {
     fn select(
@@ -1563,8 +1572,10 @@ where
         CommitSet,
         WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>,
     > {
-        let a = collect_reachable(ws, self.0)?;
-        let b = collect_reachable(ws, self.1)?;
+        let seeds_a = self.0.select(ws)?;
+        let seeds_b = self.1.select(ws)?;
+        let a = collect_reachable_from_patch(ws, seeds_a)?;
+        let b = collect_reachable_from_patch(ws, seeds_b)?;
         let inter = a.intersect(&b);
         let mut union = a;
         union.union(b);
