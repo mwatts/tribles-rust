@@ -517,19 +517,31 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         }
 
         // Case 3: prefix ends here, infix spans children.
-        // The byte at `node_end_depth` in the infix determines which children
-        // could possibly produce in-range results. Filter by that byte.
+        // First check the compressed path (bytes PREFIX_LEN..node_end_depth)
+        // against the range. All children share these bytes (path compression).
         let infix_byte_idx = node_end_depth - PREFIX_LEN;
+        let mut min_tight = true; // still on the min boundary
+        let mut max_tight = true; // still on the max boundary
+        for i in 0..infix_byte_idx {
+            let path_byte = self.childleaf().key[O::TREE_TO_KEY[PREFIX_LEN + i]];
+            if min_tight {
+                if path_byte < min_infix[i] { return; } // whole branch below min
+                if path_byte > min_infix[i] { min_tight = false; } // safely above min
+            }
+            if max_tight {
+                if path_byte > max_infix[i] { return; } // whole branch above max
+                if path_byte < max_infix[i] { max_tight = false; } // safely below max
+            }
+        }
+
+        // Now iterate children, filtering by their byte at infix_byte_idx
+        // only when we're still tight on that boundary.
         for entry in self.child_table.iter().flatten() {
             let child_byte = entry.key();
-            // Prune: if this child's byte is entirely outside the range
-            // at this infix position, skip the subtree.
-            if child_byte < min_infix[infix_byte_idx] && infix_byte_idx < INFIX_LEN {
-                // Check if child_byte is below the min at this depth.
-                // Only skip if it's strictly below — at the boundary we must recurse.
+            if min_tight && infix_byte_idx < INFIX_LEN && child_byte < min_infix[infix_byte_idx] {
                 continue;
             }
-            if child_byte > max_infix[infix_byte_idx] && infix_byte_idx < INFIX_LEN {
+            if max_tight && infix_byte_idx < INFIX_LEN && child_byte > max_infix[infix_byte_idx] {
                 continue;
             }
             entry.infixes_range(prefix, node_end_depth, min_infix, max_infix, f);
@@ -574,21 +586,36 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         }
 
         // Case 3: prefix ends here, infix spans children.
+        // Check compressed path against range (same logic as infixes_range).
         let infix_byte_idx = node_end_depth - PREFIX_LEN;
-        let min_byte = min_infix[infix_byte_idx];
-        let max_byte = max_infix[infix_byte_idx];
+        let mut min_tight = true;
+        let mut max_tight = true;
+        for i in 0..infix_byte_idx {
+            let path_byte = self.childleaf().key[O::TREE_TO_KEY[PREFIX_LEN + i]];
+            if min_tight {
+                if path_byte < min_infix[i] { return 0; }
+                if path_byte > min_infix[i] { min_tight = false; }
+            }
+            if max_tight {
+                if path_byte > max_infix[i] { return 0; }
+                if path_byte < max_infix[i] { max_tight = false; }
+            }
+        }
+
         let mut total = 0u64;
         for entry in self.child_table.iter().flatten() {
             let child_byte = entry.key();
-            if child_byte < min_byte || child_byte > max_byte {
-                continue; // outside range at this depth
+            let below_min = min_tight && child_byte < min_infix[infix_byte_idx];
+            let above_max = max_tight && child_byte > max_infix[infix_byte_idx];
+            if below_min || above_max {
+                continue;
             }
-            if child_byte > min_byte && child_byte < max_byte {
-                // Fully inside the range — use cached count, no recursion.
-                total += entry.count();
-            } else {
-                // Boundary child — must recurse to check deeper bytes.
+            let on_min = min_tight && child_byte == min_infix[infix_byte_idx];
+            let on_max = max_tight && child_byte == max_infix[infix_byte_idx];
+            if on_min || on_max {
                 total += entry.count_range(prefix, node_end_depth, min_infix, max_infix);
+            } else {
+                total += entry.count();
             }
         }
         total
