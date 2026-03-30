@@ -12,12 +12,10 @@ mind when exploring the API:
 * **BlobStore** – storage backend for commits and payload blobs.
 * **BranchStore** – records branch metadata and head pointers.
 
-Both stores can be in memory, on disk or backed by a remote service.
-`Repository`, `MemoryRepo`, `Checkout`, `CommitSet`, `CommitHandle`, and all
-selector functions are re-exported through the prelude
-(`use triblespace::prelude::*;`). The examples in `examples/repo.rs` and
-`examples/workspace.rs` showcase these APIs and are a great place to start if
-you are comfortable with Git but new to Tribles.
+Both stores can be in memory, on disk or backed by a remote service. The
+examples in `examples/repo.rs` and `examples/workspace.rs` showcase these APIs
+and are a great place to start if you are comfortable with Git but new to
+Tribles.
 
 ## Opening a repository
 

@@ -9,7 +9,7 @@ expressed as a negotiation between constraints, but the contract stays tiny:
 constraints report which variables they touch, estimate how many candidates
 remain for each variable, enumerate concrete values on demand, and signal
 when a fully-bound assignment is unsatisfied. Those six methods feed directly
-into the depth-first search; there is no standalone planner to build or cache.
+into the depth-first search; there is no standalone plan to build or cache.
 
 The constraint API mirrors the mental model you would use when reasoning about
 a query by hand. Constraints expose their

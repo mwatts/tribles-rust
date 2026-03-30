@@ -53,8 +53,8 @@ the original query multiple times. Each run restricts a different triple
 constraint to the changed set while the remaining constraints see the full set.
 The union of these runs yields exactly the new solutions. The process is:
 
-1. accumulate `changed` into `full` via `Checkout`'s `AddAssign`, merging both
-   `TribleSet` facts and `CommitSet`,
+1. accumulate `changed` into `full` with `full += &changed`, which merges
+   both the facts and the commit set,
 2. for every triple in the query, evaluate a variant where that triple
    matches against `changed`,
 3. union all per-triple results to obtain the incremental answers.
