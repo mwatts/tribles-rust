@@ -25,11 +25,9 @@ how to use `try_push` when you want to inspect and reconcile a conflict
 manually.
 
 ```rust,ignore
-use triblespace::prelude::*;
-use triblespace::prelude::blobschemas::LongString;
-use triblespace::core::repo::{memoryrepo::MemoryRepo, Repository};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use triblespace::prelude::*;
 
 mod literature {
     use triblespace::prelude::*;
@@ -43,9 +41,7 @@ mod literature {
         "A74AA63539354CDA47F387A4C3A8D54C" as pub title: ShortString;
 
         /// A quote from a work.
-        // For quick prototypes you can omit the id and let the macro derive it
-        // from the name and schema:
-        pub quote: Handle<Blake3, LongString>;
+        "6A03BAF6CFB822F04DA164ADAAEB53F6" as pub quote: Handle<Blake3, LongString>;
 
         /// The author of a work.
         "8F180883F9FD5F787E9E0AF0DF5866B9" as pub author: GenId;
@@ -61,8 +57,15 @@ mod literature {
 
         /// A pen name or alternate spelling for an author.
         "D2D1B857AC92CEAA45C0737147CA417E" as pub alias: ShortString;
+
+        /// A throwaway prototype field; omit the id to derive it from the name and schema.
+        pub prototype_note: Handle<Blake3, LongString>;
     }
 }
+
+// The examples pin explicit ids for shared schemas. For quick prototypes you
+// can omit the hex literal and `attributes!` will derive a deterministic id
+// from the attribute name and schema (via Attribute::from_name).
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Repositories manage shared history; MemoryRepo keeps everything in-memory
@@ -74,41 +77,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull workspace");
 
-    // Workspaces stage TribleSets before committing them. The entity! macro
-    // returns a rooted fragment; merging via `+=` unions only the facts.
-    let author_id = ufoid();
+    // The entity! macro returns a rooted fragment; merge its facts into
+    // a TribleSet via `+=`.
+    let herbert = ufoid();
+    let dune = ufoid();
     let mut library = TribleSet::new();
 
-    library += entity! { &author_id @
+    library += entity! { &herbert @
         literature::firstname: "Frank",
         literature::lastname: "Herbert",
     };
 
-    library += entity! { &author_id @
+    library += entity! { &dune @
         literature::title: "Dune",
-        literature::author: &author_id,
+        literature::author: &herbert,
         literature::quote: ws.put(
-            "Deep in the human unconscious is a pervasive need for a logical \
-             universe that makes sense. But the real universe is always one \
-             step beyond logic."
-        ),
-        literature::quote: ws.put(
-            "I must not fear. Fear is the mind-killer. Fear is the little-death \
-             that brings total obliteration. I will face my fear. I will permit \
-             it to pass over me and through me. And when it has gone past I will \
-             turn the inner eye to see its path. Where the fear has gone there \
-             will be nothing. Only I will remain."
+            "I must not fear. Fear is the mind-killer."
         ),
     };
 
     ws.commit(library, "import dune");
 
-    // `checkout(..)` returns the accumulated TribleSet for the branch.
+    // `checkout(..)` returns a Checkout — a TribleSet paired with the
+    // commits that produced it, usable for incremental delta queries.
     let catalog = ws.checkout(..)?;
     let title = "Dune";
 
-    // Use `_?ident` when you need a fresh variable scoped to this macro call
-    // without declaring it in the find! projection list.
+    // Multi-entity join: find quotes by authors of a given title.
+    // `_?author` is a pattern-local variable that joins without projecting.
     for (f, l, quote) in find!(
         (first: String, last: String, quote),
         pattern!(&catalog, [
@@ -116,7 +112,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 literature::firstname: ?first,
                 literature::lastname: ?last
             },
-            {
+            { _?book @
                 literature::title: title,
                 literature::author: _?author,
                 literature::quote: ?quote
@@ -128,55 +124,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("'{quote}'\n - from {title} by {f} {l}.");
     }
 
-    // Use `push` when you want automatic retries that merge concurrent history
-    // into the workspace before publishing.
     repo.push(&mut ws).expect("publish initial library");
 
-    // Stage a non-monotonic update that we plan to reconcile manually.
+    // ── Conflict resolution ────────────────────────────────────────
+    // We rename the author; a collaborator independently records a
+    // different name. try_push detects the conflict.
+
     ws.commit(
-        entity! { &author_id @ literature::firstname: "Francis" },
+        entity! { &herbert @ literature::firstname: "Francis" },
         "use pen name",
     );
 
-    // Simulate a collaborator racing us with a different update.
-    let mut collaborator = repo
-        .pull(*branch_id)
-        .expect("pull collaborator workspace");
+    let mut collaborator = repo.pull(*branch_id).expect("pull");
     collaborator.commit(
-        entity! { &author_id @ literature::firstname: "Franklin" },
+        entity! { &herbert @ literature::firstname: "Franklin" },
         "record legal first name",
     );
-    repo.push(&mut collaborator)
-        .expect("publish collaborator history");
+    repo.push(&mut collaborator).expect("publish collaborator");
 
-    // `try_push` returns a conflict workspace when the CAS fails, letting us
-    // inspect divergent history and decide how to merge it.
+    // try_push fails because the branch advanced. The returned
+    // workspace carries the collaborator's history.
     if let Some(mut conflict_ws) = repo
         .try_push(&mut ws)
-        .expect("attempt manual conflict resolution")
+        .expect("attempt push")
     {
-        let conflict_catalog = conflict_ws.checkout(..)?;
-
-        for (first,) in find!(
-            (first: Value<_>),
-            pattern!(&conflict_catalog, [{
-                literature::author: &author_id,
-                literature::firstname: ?first
-            }])
+        // Inspect what the collaborator wrote.
+        let their_catalog = conflict_ws.checkout(..)?;
+        for first in find!(
+            first: String,
+            pattern!(&their_catalog, [{ &herbert @ literature::firstname: ?first }])
         ) {
-            println!("Collaborator kept the name '{}'.", first.try_from_value::<&str>().unwrap());
+            println!("Collaborator recorded: '{first}'.");
         }
 
-        ws.merge(&mut conflict_ws)
-            .expect("merge conflicting history");
+        // Accept their history — abandon our conflicting firstname
+        // commit and continue from the collaborator's state instead.
+        ws = conflict_ws;
 
+        // Record our preferred name as an alias rather than overwriting.
         ws.commit(
-            entity! { &author_id @ literature::alias: "Francis" },
-            "keep pen-name as an alias",
+            entity! { &herbert @ literature::alias: "Francis" },
+            "keep pen-name as alias",
         );
 
-        repo.push(&mut ws)
-            .expect("publish merged aliases");
+        repo.push(&mut ws).expect("publish resolution");
     }
 
     Ok(())
@@ -185,16 +176,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## 3. Run the program
 
-Compile and execute the example with `cargo run`. On success it creates an
-`example.pile` file in the project directory and pushes a single entity to the
-`main` branch.
+Compile and execute the example with `cargo run`. The example uses an in-memory
+repository (`MemoryRepo`) so no files are created on disk — everything lives in
+RAM for the duration of the run.
 
 ```bash
 cargo run
 ```
 
-Afterwards you can verify the file exists with `ls example.pile`. Delete it when
-you are done experimenting to avoid accidentally reading stale state.
+To persist data across runs, swap `MemoryRepo::default()` for
+`Pile::open(&path)?` backed by a file on disk.
 
 ## Understanding the pieces
 
@@ -213,9 +204,10 @@ you are done experimenting to avoid accidentally reading stale state.
   the workspace and retries automatically, making it ideal for monotonic
   updates where you are happy to accept the merged result.
 * **Manual conflict resolution.** `Repository::try_push` performs a single
-  optimistic attempt and returns a conflict workspace when the compare-and-set
-  fails. Inspect that workspace when you want to reason about the competing
-  history—such as non-monotonic edits—before merging and retrying.
+  optimistic attempt and returns a conflict workspace when the branch has
+  advanced. Inspect that workspace to see the competing history, then decide
+  whether to merge your changes or abandon them — as the example does by
+  accepting the collaborator's name and recording ours as an alias.
 * **Closing repositories.** When working with pile-backed repositories it is
   important to close them explicitly so buffered data is flushed and any errors
   are reported while you can still decide how to handle them. Calling
