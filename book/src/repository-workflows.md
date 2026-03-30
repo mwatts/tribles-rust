@@ -12,10 +12,12 @@ mind when exploring the API:
 * **BlobStore** – storage backend for commits and payload blobs.
 * **BranchStore** – records branch metadata and head pointers.
 
-Both stores can be in memory, on disk or backed by a remote service. The
-examples in `examples/repo.rs` and `examples/workspace.rs` showcase these APIs
-and are a great place to start if you are comfortable with Git but new to
-Tribles.
+Both stores can be in memory, on disk or backed by a remote service.
+`Repository`, `MemoryRepo`, `Checkout`, `CommitSet`, `CommitHandle`, and all
+selector functions are re-exported through the prelude
+(`use triblespace::prelude::*;`). The examples in `examples/repo.rs` and
+`examples/workspace.rs` showcase these APIs and are a great place to start if
+you are comfortable with Git but new to Tribles.
 
 ## Opening a repository
 
@@ -167,12 +169,13 @@ commits with different keys. This pattern is useful when rotating credentials or
 running scheduled jobs under a service identity while preserving authorship in
 the history. You can swap identities at any time; existing workspaces keep the
 key they were created with until you explicitly call
-`Workspace::set_signing_key`.
+`Repository::set_signing_key`.
 
 ## Inspecting History
 
 You can explore previous commits using `Workspace::checkout` which returns a
-`TribleSet` with the union of the specified commit contents. Passing a single
+`Checkout` (which derefs to `TribleSet` and also tracks the `CommitSet`) with the
+union of the specified commit contents. Passing a single
 commit returns just that commit. To include its history you can use the
 `ancestors` helper. Commit ranges are supported for convenience. The expression
 `a..b` yields every commit reachable from `b` that is not reachable from `a`,

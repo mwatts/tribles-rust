@@ -28,16 +28,35 @@ An abstraction that persists blobs. Implementations back local piles, in-memory
 workspaces, or remote object stores while presenting a common `BlobStore`
 interface that handles hashing, deduplication, and retrieval.
 
+### Checkout
+The result of `Workspace::checkout`. A `Checkout` pairs a `TribleSet` with the
+`CommitSet` that produced it. It derefs to `TribleSet` for querying and its
+`AddAssign` implementation merges both facts and commit sets, making it the
+natural accumulator for incremental query loops.
+
 ### Commit
 A signed snapshot of repository state. Commits archive a `TribleSet` describing
 the workspace contents and store metadata such as parent handles, timestamps,
 authors, signatures, and optional messages. The metadata itself lives in a
 `SimpleArchive` blob whose hash becomes the commit handle.
 
+### CommitSet
+A set of commit handles. `CommitSet` implements `CommitSelector` by returning
+itself, which is useful for incremental deltas (e.g.,
+`checkout(full.commits()..)`). Supports `union`, `intersection`, and
+`difference` operations.
+
 ### Commit Selector
 A query primitive that walks a repository’s commit graph to identify commits of
 interest. Selectors power history traversals such as `parents`,
 `nth_ancestors`, ranges like `a..b`, and helpers such as `history_of(entity)`.
+
+### Constraint
+The trait that every query operator implements. A constraint exposes six methods
+— `variables`, `estimate`, `propose`, `confirm`, `satisfied`, and `influence`
+— that let the Atreides join engine navigate the search space without a
+separate planner. Custom data sources and application predicates participate in
+queries by implementing this trait.
 
 ### Entity
 The first position in a trible. Entities identify the subject making a
@@ -56,13 +75,22 @@ In practice you pick an identifier policy:
 Ownership policies and schemas determine who may mint new facts for a given
 identifier.
 
+### Fragment
+A bundle of tribles and exported IDs returned by the `entity!` macro and import
+pipelines. Fragments compose via `+=` to build larger datasets. Use
+`Fragment::root()` to extract derived IDs, `Fragment::empty()` to start
+accumulation, and spread (`*`) to pass child fragments into parent entities,
+giving Merkle trees for free.
+
 ### PATCH
 The **Persistent Adaptive Trie with Cuckoo-compression and Hash-maintenance**.
-Each PATCH stores all six permutations of a trible set in a 256-ary trie whose
-nodes use byte-oriented cuckoo hash tables and copy-on-write semantics. Shared
-leaves keep permutations deduplicated, rolling hashes let set operations skip
-unchanged branches, and queries only visit the segments relevant to their
-bindings, mirroring the behaviour described in the deep-dive chapter.
+A single PATCH stores one ordering of a trible set in a 256-ary trie whose
+nodes use byte-oriented cuckoo hash tables and copy-on-write semantics. A
+`TribleSet` maintains six PATCH instances — one per permutation of entity,
+attribute, and value. Shared leaves keep permutations deduplicated, rolling
+hashes let set operations skip unchanged branches, and queries only visit the
+segments relevant to their bindings, mirroring the behaviour described in the
+deep-dive chapter.
 
 ### Pile
 An append-only collection of blobs and branch records stored in a single file.

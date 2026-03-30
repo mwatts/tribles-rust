@@ -23,7 +23,7 @@ The walk begins with a _root set_—the handles you know must stay alive. In a
 typical repository this includes the metadata blob for each branch (which in
 turn names the commit heads), tags, or any additional anchors your deployment
 requires. Roots are cheap to enumerate: walk the branch store via
-[`BranchStore::branches`](https://docs.rs/tribles/latest/tribles/repo/trait.BranchStore.html#tymethod.branches)
+[`BranchStore::branches`](https://docs.rs/triblespace/latest/triblespace/core/repo/trait.BranchStore.html#tymethod.branches)
 and load each branch head, or read the subset of metadata relevant to the
 retention policy you are enforcing. Everything reachable from those handles
 will be retained by the traversal; everything else is eligible for forgetting.

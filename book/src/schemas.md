@@ -105,6 +105,10 @@ The crate provides the following value schemas out of the box:
 - `Hash` and `Handle` &ndash; cryptographic digests and blob handles (see [`hash.rs`](../src/value/schemas/hash.rs)).
 - `ED25519RComponent`, `ED25519SComponent` and `ED25519PublicKey` &ndash; signature fields and keys.
 - `NsTAIInterval` to encode time intervals.
+- `Boolean` &ndash; all-zero for false, all-0xFF for true.
+- `LineLocation` &ndash; a `(start_line, start_col, end_line, end_col)` span encoded as four big-endian u64 values.
+- `RangeU128` &ndash; a half-open `(start, end)` range of two big-endian u128 values.
+- `RangeInclusiveU128` &ndash; an inclusive `(start, end)` range of two big-endian u128 values.
 - `UnknownValue` as a fallback when no specific schema is known.
 
 ```rust
@@ -126,7 +130,7 @@ The crate also ships with these blob schemas:
 - `FileBytes` for opaque file-backed byte payloads.
 - `SimpleArchive` which stores a raw sequence of tribles.
 - `SuccinctArchiveBlob` which stores the [`SuccinctArchive` index
-  type](https://docs.rs/tribles/latest/tribles/blob/schemas/succinctarchive/struct.SuccinctArchive.html)
+  type](https://docs.rs/triblespace/latest/triblespace/core/blob/schemas/succinctarchive/struct.SuccinctArchive.html)
   for offline queries. The `SuccinctArchive` helper exposes high-level
   iterators while the `SuccinctArchiveBlob` schema is responsible for the
   serialized byte layout.

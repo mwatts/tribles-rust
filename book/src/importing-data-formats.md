@@ -68,7 +68,7 @@ own contextual names and descriptions.
 You can import multiple documents by merging fragments:
 
 ```rust,ignore
-let mut all = Fragment::default();
+let mut all = Fragment::empty();
 all += importer.import_str(doc1)?;
 all += importer.import_str(doc2)?;
 // all.exports() yields the root ids; all.facts() yields the merged tribles.

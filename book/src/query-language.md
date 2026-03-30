@@ -117,6 +117,9 @@ freely.
 | [`pattern_changes!`](crate::pattern_changes) | Track attribute updates incrementally | Builds a [`TriblePattern`](crate::query::TriblePattern) constraint that yields newly added triples from a change set because incremental evaluation stays monotonic; see [Incremental Queries](incremental-queries.md) for the broader evaluation workflow. |
 | `.is(...)` | Pin a variable to a constant | Wraps a [`ConstantConstraint`](crate::query::constantconstraint::ConstantConstraint) that compares the binding against a literal value. |
 | `has` | Check membership in a collection | Collections such as [`HashSet`](std::collections::HashSet) expose `.has(...)` when they implement [`ContainsConstraint`](crate::query::hashsetconstraint::ContainsConstraint); triple stores like [`TribleSet`](crate::tribleset::TribleSet) instead participate through [`pattern!`](crate::pattern). |
+| [`EqualityConstraint`](crate::query::equalityconstraint::EqualityConstraint) | Require two variables to bind the same value | Auto-desugared by `pattern!` for self-referencing patterns like `{ _?e @ link: _?e }`. |
+| [`SortedSlice`](crate::query::sortedsliceconstraint::SortedSlice) | Check membership via binary search | A binary-search alternative to `HashSet` for sorted data; implements `ContainsConstraint`. |
+| [`value_range`](crate::query::rangeconstraint::value_range) | Restrict a variable to a byte-lexicographic range | Builds a [`ValueRange`](crate::query::rangeconstraint::ValueRange) constraint between a min and max bound. |
 
 Any data structure that can iterate its contents, test membership, and report
 its size can implement `ContainsConstraint`. Membership constraints are
@@ -305,7 +308,7 @@ you need to reuse the same hidden binding across multiple patterns.
 
 ```rust,ignore
 use triblespace::prelude::*;
-use triblespace::examples::{self, literature};
+use triblespace::core::examples::{self, literature};
 
 let dataset = examples::dataset();
 
@@ -456,7 +459,7 @@ use std::collections::HashSet;
 
 use triblespace::prelude::*;
 use triblespace::prelude::valueschemas::ShortString;
-use triblespace::query::hashsetconstraint::SetConstraint;
+use triblespace::core::query::hashsetconstraint::SetConstraint;
 
 struct ExternalTags<'a> {
     tags: &'a HashSet<String>,
@@ -480,7 +483,10 @@ The example wraps an external `HashSet` so it can be queried directly.  A
 `TriblePattern` implementation follows the same shape: create a constraint
 type that reads from your backing store and return it from `pattern`.  The query
 engine drives both traits through `Constraint`, so any data source that can
-estimate, propose, and confirm candidate values can participate in `find!`.
+estimate, propose, confirm, and report `satisfied()` can participate in `find!`.
+The full protocol is: `variables`, `estimate`, `propose`, `confirm`, and
+`satisfied` (a fast consistency check that returns `false` when the current
+binding is known to have no solution).
 
 ## Regular path queries
 

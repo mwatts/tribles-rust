@@ -10,13 +10,16 @@ results.
 ## Constraints as the search frontier
 
 Every constraint implements the [`Constraint`](crate::query::Constraint) trait,
-which exposes four abilities that shape the search:
+which exposes six methods that shape the search:
 
-1. **`estimate`** – predicts how many results remain for a variable under the
+1. **`variables`** – returns the set of variables this constraint touches.
+2. **`estimate`** – predicts how many results remain for a variable under the
    current partial binding.
-2. **`propose`** – enumerates candidate values for a variable.
-3. **`confirm`** – filters a set of candidates without re-enumerating them.
-4. **`influence`** – reports which other variables need their estimates refreshed
+3. **`propose`** – enumerates candidate values for a variable.
+4. **`confirm`** – filters a set of candidates without re-enumerating them.
+5. **`satisfied`** – returns `false` when all variables are bound but the
+   constraint is unsatisfied. Used by `UnionConstraint` to prune dead variants.
+6. **`influence`** – reports which other variables need their estimates refreshed
    when this variable changes.
 
 Traditional databases rely on a query planner to combine statistics into a join

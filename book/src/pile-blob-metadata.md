@@ -64,11 +64,11 @@ use triblespace::core::repo::pile::Pile;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pile = Pile::open("/tmp/example.pile")?;
 
-    let blob = Blob::<UnknownBlob>::new(Bytes::from_static(b"hello world"));
+    let blob = Blob::<UnknownBlob>::new(Bytes::from_source(b"hello world".to_vec()));
     let handle = pile.put(blob)?;
 
     let reader = pile.reader()?;
-    if let Some(meta) = reader.metadata(handle) {
+    if let Some(meta) = reader.metadata(handle).unwrap() {
         let appended_at = UNIX_EPOCH + Duration::from_millis(meta.timestamp);
         println!(
             "Blob length: {} bytes, appended at {:?}",

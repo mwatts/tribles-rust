@@ -38,8 +38,9 @@ loop {
 
 `Checkout` dereferences to `TribleSet`, so it works directly with
 `find!`, `pattern!`, and `pattern_changes!`. The `full` accumulator is a
-plain `TribleSet` that grows monotonically. The `changed` checkout
-carries the commit set forward automatically.
+`Checkout` that grows monotonically. The `+=` operator merges both the
+`TribleSet` facts and the `CommitSet`. The `changed` checkout carries the
+commit set forward automatically.
 
 This pattern avoids building shadow data models in Rust structs.
 Query the `TribleSet` directly with `find!` — it has sub-microsecond
@@ -52,7 +53,8 @@ the original query multiple times. Each run restricts a different triple
 constraint to the changed set while the remaining constraints see the full set.
 The union of these runs yields exactly the new solutions. The process is:
 
-1. accumulate `changed` tribles into the `full` `TribleSet`,
+1. accumulate `changed` into `full` via `Checkout`'s `AddAssign`, merging both
+   `TribleSet` facts and `CommitSet`,
 2. for every triple in the query, evaluate a variant where that triple
    matches against `changed`,
 3. union all per-triple results to obtain the incremental answers.

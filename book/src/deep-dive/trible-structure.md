@@ -85,11 +85,11 @@ resistant to skew even when cardinalities vary widely.
 
 `TribleSet`s provide familiar set-theoretic helpers such as
 [`TribleSet::union`](https://docs.rs/triblespace/latest/triblespace/trible/struct.TribleSet.html#method.union),
-[`TribleSet::intersection`](https://docs.rs/triblespace/latest/triblespace/trible/struct.TribleSet.html#method.intersection)
+[`TribleSet::intersect`](https://docs.rs/triblespace/latest/triblespace/trible/struct.TribleSet.html#method.intersect)
 and
 [`TribleSet::difference`](https://docs.rs/triblespace/latest/triblespace/trible/struct.TribleSet.html#method.difference).
 `union` consumes the right-hand operand and merges its contents into the
-receiver in place, while `intersection` and `difference` each produce a fresh
+receiver in place, while `intersect` and `difference` each produce a fresh
 `TribleSet` without mutating their inputs. Together these helpers make it
 straightforward to merge datasets, locate their overlap or identify the facts
 that still need to propagate between replicas while keeping the original

@@ -89,7 +89,7 @@ names via `metadata::name`:
 
 ```rust,ignore
 // Mint a tag once
-let kind_paper = genid!("A1B2C3...");  // or use trible genid
+let kind_paper = id_hex!("A1B2C3...");  // or use trible genid for random IDs
 change += entity! { &kind_paper @ metadata::name: ws.put("paper".to_owned()) };
 
 // Tag an entity

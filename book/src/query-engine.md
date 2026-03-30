@@ -7,18 +7,22 @@ tuning. Every constraint implements the
 even alternative data sources can compose cleanly. Query evaluation is
 expressed as a negotiation between constraints, but the contract stays tiny:
 constraints report which variables they touch, estimate how many candidates
-remain for each variable, and can enumerate concrete values on demand. Those
-estimates feed directly into the depth-first search; there is no standalone
-planner to build or cache.
+remain for each variable, enumerate concrete values on demand, and signal
+when a fully-bound assignment is unsatisfied. Those six methods feed directly
+into the depth-first search; there is no standalone planner to build or cache.
 
 The constraint API mirrors the mental model you would use when reasoning about
 a query by hand. Constraints expose their
-[`VariableSet`](crate::query::VariableSet), provide `estimate` methods so the
-engine can choose the next variable to bind, and implement `propose` to extend
-partial assignments. Composite constraints, such as unions, may also override
-`confirm` to tighten previously gathered proposals. This cooperative protocol
-keeps the engine agnostic to where the data comes from—be it in-memory
-indices, remote stores, or bespoke application predicates.
+[`VariableSet`](crate::query::VariableSet) via `variables()`, provide `estimate`
+methods so the engine can choose the next variable to bind, and implement
+`propose` to extend partial assignments. Composite constraints, such as unions,
+may also override `confirm` to tighten previously gathered proposals. A fifth
+method, `satisfied()`, returns `false` when all variables are bound but the
+constraint is unsatisfied — `UnionConstraint` uses this to prune dead variants.
+Finally, `influence` reports which other variables need their estimates refreshed
+when a given variable is bound. This cooperative protocol of six methods keeps
+the engine agnostic to where the data comes from—be it in-memory indices,
+remote stores, or bespoke application predicates.
 
 ## Search Loop
 

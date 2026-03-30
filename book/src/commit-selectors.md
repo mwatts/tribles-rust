@@ -4,11 +4,11 @@ Commit selectors describe which commits to load from a workspace. They give
 callers a reusable vocabulary for requests such as *"let me work with the
 changes from last week"* or *"show the commits that touched this entity"*. The
 selector itself only decides **which** commits participate; the data behind
-those commits is materialized into a `TribleSet` by `Workspace::checkout` so the
-rest of the system can query it like any other dataset.
+those commits is materialized into a `Checkout` (which derefs to `TribleSet`) by
+`Workspace::checkout` so the rest of the system can query it like any other dataset.
 
 At checkout time the `Workspace::checkout` method accepts any type implementing
-the `CommitSelector` trait and returns a `TribleSet` built from the selected
+the `CommitSelector` trait and returns a `Checkout` built from the selected
 commits. Selectors can be as small as a single commit handle or as expressive as
 a filtered slice of history. This chapter walks through the available building
 blocks, how they compose, and how they relate to Git's revision grammar.
@@ -34,8 +34,9 @@ boundary in `ancestors` to reproduce Git's set-difference behaviour when parity
 is required: `ancestors(a)..b` matches `git log a..b`.
 
 ```rust,ignore
-// Check out the entire history of the current branch
-let history = ws.checkout(ancestors(ws.head()))?;
+// Check out the entire history of the current branch.
+// `..` walks all history from head.
+let history = ws.checkout(..)?;
 
 // Equivalent to `git log feature..main`
 let delta = ws.checkout(ancestors(feature_tip)..main_tip)?;
@@ -62,12 +63,19 @@ commits introduced since the last checkout.
 `CommitSelector` is implemented for:
 
 - `CommitHandle` – a single commit.
+- `CommitSet` – implements `CommitSelector` by returning itself. Useful as
+  `checkout(full.commits()..)` for incremental deltas.
+- `Option<CommitHandle>` – `None` returns the empty set, `Some(h)` returns
+  a singleton.
 - `Vec<CommitHandle>` and `&[CommitHandle]` – explicit lists of commits.
-- `ancestors(commit)` – a commit and all of its ancestors.
+- `ancestors(selector)` – all commits reachable from any commit in the
+  selector, plus the commits themselves. Accepts any `CommitSelector`, not
+  just `CommitHandle`.
 - `nth_ancestors(selector, n)` – walks every commit in `selector` back `n` parent steps through all parent links (merges included).
-- `parents(commit)` – direct parents of a commit.
+- `parents(selector)` – direct parents of the commits in the selector.
+  Accepts any `CommitSelector`.
 - `symmetric_diff(a, b)` – commits reachable from either `a` or `b` but not
-  both.
+  both. Both arguments accept any `CommitSelector`.
 - Set combinators that operate on two selectors:
   - `union(left, right)` – commits returned by either selector.
   - `intersect(left, right)` – commits returned by both selectors.
