@@ -1,5 +1,7 @@
 //! This is a collection of Rust types that can be (de)serialized as [crate::prelude::Blob]s.
 
+/// Flat typed array blob schema.
+pub mod array;
 /// Raw file bytes blob schema.
 pub mod filebytes;
 /// Arbitrary-length UTF-8 text blob schema.
