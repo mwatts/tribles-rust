@@ -308,7 +308,7 @@ impl<H> BlobStoreGet<H> for MemoryBlobStoreReader<H>
 where
     H: HashProtocol,
 {
-    type GetError<E: Error> = MemoryStoreGetError<E>;
+    type GetError<E: Error + Send + Sync + 'static> = MemoryStoreGetError<E>;
 
     fn get<T, S>(
         &self,

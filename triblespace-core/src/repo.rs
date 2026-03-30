@@ -275,7 +275,7 @@ pub trait BlobStoreForget<H: HashProtocol> {
 /// The `GetBlob` trait is used to retrieve blobs from a repository.
 pub trait BlobStoreGet<H: HashProtocol> {
     /// Error type for get operations, parameterised by the deserialization error.
-    type GetError<E: std::error::Error>: Error;
+    type GetError<E: std::error::Error + Send + Sync + 'static>: Error + Send + Sync + 'static;
 
     /// Retrieves a blob from the repository by its handle.
     /// The handle is a unique identifier for the blob, and is used to retrieve it from the repository.

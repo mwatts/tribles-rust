@@ -161,7 +161,7 @@ pub trait ToBlob<S: BlobSchema> {
 /// See [TryFromValue](crate::value::TryFromValue) for the counterpart trait for values.
 pub trait TryFromBlob<S: BlobSchema>: Sized {
     /// The error type returned when the conversion fails.
-    type Error: Error;
+    type Error: Error + Send + Sync + 'static;
     /// Attempts to convert a blob into this type.
     fn try_from_blob(b: Blob<S>) -> Result<Self, Self::Error>;
 }

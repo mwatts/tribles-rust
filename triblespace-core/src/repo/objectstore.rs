@@ -445,7 +445,7 @@ impl<H> BlobStoreGet<H> for ObjectStoreReader<H>
 where
     H: HashProtocol,
 {
-    type GetError<E: Error> = GetBlobErr<E>;
+    type GetError<E: Error + Send + Sync + 'static> = GetBlobErr<E>;
 
     fn get<T, S>(
         &self,

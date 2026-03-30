@@ -233,7 +233,7 @@ impl<H: HashProtocol> PileReader<H> {
 }
 
 impl<H: HashProtocol> BlobStoreGet<H> for PileReader<H> {
-    type GetError<E: Error> = GetBlobError<E>;
+    type GetError<E: Error + Send + Sync + 'static> = GetBlobError<E>;
 
     fn get<T, S>(
         &self,
