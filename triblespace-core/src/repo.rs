@@ -1246,6 +1246,23 @@ impl std::ops::AddAssign<&Checkout> for Checkout {
     }
 }
 
+impl std::ops::Add for Checkout {
+    type Output = Self;
+    fn add(mut self, rhs: Self) -> Self {
+        self.facts += rhs.facts;
+        self.commits.union(rhs.commits);
+        self
+    }
+}
+
+impl std::ops::Add<&Checkout> for Checkout {
+    type Output = Self;
+    fn add(mut self, rhs: &Checkout) -> Self {
+        self += rhs;
+        self
+    }
+}
+
 /// The Workspace represents the mutable working area or "staging" state.
 /// It was formerly known as `Head`. It is sent to worker threads,
 /// modified (via commits, merges, etc.), and then merged back into the Repository.
