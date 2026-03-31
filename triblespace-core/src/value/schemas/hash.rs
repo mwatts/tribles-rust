@@ -194,33 +194,12 @@ mod wasm_formatter {
     }
 }
 
-use blake2::Blake2b as Blake2bUnsized;
-/// Blake2b truncated to 256 bits, usable as a [`HashProtocol`].
-pub type Blake2b = Blake2bUnsized<U32>;
-
 /// Blake3 hasher, usable as a [`HashProtocol`]. This is the default
 /// hash function for content-addressed blob storage.
 pub use blake3::Hasher as Blake3;
 
-impl HashProtocol for Blake2b {
-    const NAME: &'static str = "blake2";
-}
-
 impl HashProtocol for Blake3 {
     const NAME: &'static str = "blake3";
-}
-
-impl ConstId for Blake2b {
-    const ID: Id = id_hex!("91F880222412A49F012BE999942E6199");
-}
-
-impl ConstDescribe for Blake2b {
-    fn describe<B>(blobs: &mut B) -> Result<Fragment, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-    {
-        describe_hash::<Self, B>(blobs)
-    }
 }
 
 impl ConstId for Blake3 {
