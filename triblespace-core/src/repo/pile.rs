@@ -463,7 +463,9 @@ impl std::fmt::Display for FlushError {
 impl std::error::Error for FlushError {}
 
 impl<H: HashProtocol> Pile<H> {
-    /// Opens an existing pile without scanning or repairing its contents.
+    /// Opens an existing pile file. Returns an error if the file does not
+    /// exist — create the file first with [`std::fs::File::create`] or
+    /// equivalent if you need a fresh pile.
     ///
     /// The returned pile has no in-memory index; callers should invoke
     /// [`refresh`] to load existing data or [`restore`] to repair and load
@@ -472,7 +474,6 @@ impl<H: HashProtocol> Pile<H> {
         let file = OpenOptions::new()
             .read(true)
             .append(true)
-            .create(true)
             .open(path)?;
         let length = file.metadata()?.len() as usize;
         let page_size = page_size::get();

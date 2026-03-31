@@ -18,6 +18,7 @@ fn metadata_detects_corrupted_blob() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("pile.pile");
 
+    std::fs::File::create(&path).unwrap();
     let mut pile: Pile<Blake3> = Pile::open(&path).unwrap();
     let data = b"hello metadata".to_vec();
     let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data.clone()));

@@ -94,6 +94,7 @@ proptest! {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sim.pile");
         let mut piles: Vec<Pile> =
+        std::fs::File::create(&path).unwrap();
             (0..scenario.actors).map(|_| Pile::open(&path).unwrap()).collect();
         let mut expected: HashMap<Value<Handle<Blake3, UnknownBlob>>, Vec<u8>> = HashMap::new();
         let mut handles: Vec<Value<Handle<Blake3, UnknownBlob>>> = Vec::new();

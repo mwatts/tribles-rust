@@ -14,6 +14,7 @@ fn put_and_get_empty_blob() {
     let path = dir.path().join("pile.pile");
 
     let handle = {
+        std::fs::File::create(&path).unwrap();
         let mut pile: Pile<Blake3> = Pile::open(&path).unwrap();
         let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(Vec::<u8>::new()));
         let handle = pile.put(blob).unwrap();
