@@ -117,4 +117,14 @@ attributes! {
     "A7AFC8C0FAD017CE7EC19587AF682CFF" as json_kind: valueschemas::ShortString;
     /// Generic tag edge: link any entity to a tag entity (by Id). Reusable across domains.
     "91C50E9FBB1F73E892EBD5FFDE46C251" as tag: valueschemas::GenId;
+    /// When an entity was created.
+    "9B1E79DFD065F643954141593CD8B9E0" as created_at: valueschemas::NsTAIInterval;
+    /// When an entity was last updated.
+    "93B7372E3443063392CD801B03A8D390" as updated_at: valueschemas::NsTAIInterval;
+    /// When a process or interval started.
+    "06973030ACA83A7B2B4FC8BEBB31F77A" as started_at: valueschemas::NsTAIInterval;
+    /// When a process or interval finished.
+    "9B06AA4060EF9928A923FC7E6A6B6438" as finished_at: valueschemas::NsTAIInterval;
+    /// When an entity expires or becomes invalid.
+    "89FEC3B560336BA88B10759DECD3155F" as expires_at: valueschemas::NsTAIInterval;
 }
