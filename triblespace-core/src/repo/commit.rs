@@ -55,7 +55,7 @@ pub fn commit_metadata(
     let commit_entity = crate::id::rngid();
     let now = Epoch::now().expect("system time");
 
-    commit += entity! { &commit_entity @  super::timestamp: (now, now).try_to_value().expect("point interval")  };
+    commit += entity! { &commit_entity @  crate::metadata::created_at: (now, now).try_to_value().expect("point interval")  };
 
     if let Some(content) = content {
         let handle = content.get_handle();
