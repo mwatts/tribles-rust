@@ -897,20 +897,12 @@ impl<H: HashProtocol> BlobStorePut<H> for Pile<H> {
 
             let now_in_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
             let header = BlobHeader::new(now_in_ms as u64, blob_size as u64, hash);
-            let expected = BLOB_HEADER_LEN + blob_size + padding;
             let padding_buf = [0u8; BLOB_ALIGNMENT];
-            let bufs = [
-                IoSlice::new(header.as_bytes()),
-                IoSlice::new(blob.bytes.as_ref()),
-                IoSlice::new(&padding_buf[..padding]),
-            ];
-            let written = self.file.write_vectored(&bufs)?;
-            if written != expected {
-                return Err(InsertError::IoError(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "failed to write blob record",
-                )));
-            }
+            // Use write_all for each part instead of a single write_vectored,
+            // because macOS limits single writes to ~2 GiB.
+            self.file.write_all(header.as_bytes())?;
+            self.file.write_all(blob.bytes.as_ref())?;
+            self.file.write_all(&padding_buf[..padding])?;
 
             loop {
                 match self.apply_next().map_err(InsertError::from)? {
