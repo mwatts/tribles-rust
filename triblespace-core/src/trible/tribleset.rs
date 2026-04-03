@@ -1,4 +1,5 @@
 mod triblesetconstraint;
+pub mod triblesetidrangeconstraint;
 pub mod triblesetrangeconstraint;
 
 use triblesetconstraint::*;
@@ -17,6 +18,7 @@ use crate::trible::Trible;
 use crate::trible::VAEOrder;
 use crate::trible::VEAOrder;
 use crate::trible::TRIBLE_LEN;
+use crate::id::Id;
 use crate::value::schemas::genid::GenId;
 use crate::value::ValueSchema;
 
@@ -188,6 +190,46 @@ impl TribleSet {
         max: Value<V>,
     ) -> triblesetrangeconstraint::TribleSetRangeConstraint {
         triblesetrangeconstraint::TribleSetRangeConstraint::new(variable, min, max, self.clone())
+    }
+
+    /// Creates a constraint that proposes only entity IDs in the byte range
+    /// `[min, max]` (inclusive) using the EAV index with `infixes_range`.
+    ///
+    /// ```rust,ignore
+    /// find!(id: Id,
+    ///     and!(
+    ///         pattern!(&data, [{ ?id @ attr: value }]),
+    ///         data.entity_in_range(id, min_id, max_id),
+    ///     )
+    /// )
+    /// ```
+    pub fn entity_in_range(
+        &self,
+        variable: Variable<GenId>,
+        min: Id,
+        max: Id,
+    ) -> triblesetidrangeconstraint::EntityRangeConstraint {
+        triblesetidrangeconstraint::EntityRangeConstraint::new(variable, min, max, self.clone())
+    }
+
+    /// Creates a constraint that proposes only attribute IDs in the byte range
+    /// `[min, max]` (inclusive) using the AEV index with `infixes_range`.
+    ///
+    /// ```rust,ignore
+    /// find!(attr: Id,
+    ///     and!(
+    ///         pattern!(&data, [{ entity @ ?attr: _ }]),
+    ///         data.attribute_in_range(attr, min_attr, max_attr),
+    ///     )
+    /// )
+    /// ```
+    pub fn attribute_in_range(
+        &self,
+        variable: Variable<GenId>,
+        min: Id,
+        max: Id,
+    ) -> triblesetidrangeconstraint::AttributeRangeConstraint {
+        triblesetidrangeconstraint::AttributeRangeConstraint::new(variable, min, max, self.clone())
     }
 
     /// Iterates over all tribles in EAV order.
