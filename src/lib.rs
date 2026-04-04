@@ -14,8 +14,7 @@ pub mod macros {
 
 pub mod prelude {
     pub use crate::macros::{
-        attributes, entity, exists, find, id_hex, path, pattern, pattern_changes,
-        value_formatter,
+        attributes, entity, exists, find, id_hex, path, pattern, pattern_changes, value_formatter,
     };
     pub use triblespace_core::prelude::*;
 }
@@ -31,6 +30,8 @@ mod proofs;
 mod book_doctests {
     #[doc = include_str!("../book/src/query-language.md")]
     pub struct QueryLanguage;
+    #[doc = include_str!("../book/src/macro-cookbook.md")]
+    pub struct MacroCookbook;
     #[doc = include_str!("../book/src/patterns-and-recipes.md")]
     pub struct PatternsAndRecipes;
     #[doc = include_str!("../book/src/schemas.md")]
@@ -99,7 +100,8 @@ mod readme_example {
     #[test]
     fn readme_example() -> Result<(), Box<dyn std::error::Error>> {
         let storage = MemoryRepo::default();
-        let mut repo = Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
+        let mut repo =
+            Repository::new(storage, SigningKey::generate(&mut OsRng), TribleSet::new()).unwrap();
         let branch_id = repo.create_branch("main", None).expect("create branch");
         let mut ws = repo.pull(*branch_id).expect("pull workspace");
 
@@ -158,10 +160,7 @@ mod readme_example {
         );
         repo.push(&mut collaborator).expect("publish collaborator");
 
-        if let Some(mut conflict_ws) = repo
-            .try_push(&mut ws)
-            .expect("attempt push")
-        {
+        if let Some(mut conflict_ws) = repo.try_push(&mut ws).expect("attempt push") {
             let their_catalog = conflict_ws.checkout(..)?;
             for first in find!(
                 first: String,

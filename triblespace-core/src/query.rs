@@ -164,7 +164,7 @@ impl<T: ValueSchema> Variable<T> {
     pub fn extract(self, binding: &Binding) -> &Value<T> {
         let raw = binding.get(self.index).unwrap_or_else(|| {
             panic!(
-                "query variable (idx {}) was never bound; ensure it appears in a constraint or remove it from the projection",
+                "query variable (idx {}) was never bound before projection. This usually means the variable was projected in `find!` but never appeared in any constraint. If you intended a pure existence query, use `find!((), ...)` or `exists!(constraint)`.",
                 self.index
             )
         });
@@ -665,6 +665,10 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> fmt::Debug for Quer
 /// | `name?` | inferred type, yield `Result<T, E>` (no filter) |
 /// | `name: Type?` | explicit type, yield `Result<T, E>` (no filter) |
 ///
+/// The unit form `find!((), constraint)` projects no variables and yields one
+/// `()` for every matching row. This is useful when you only care about
+/// existence, counting, or composing the query without returning values.
+///
 /// **Filter semantics (default):** when a variable's conversion fails the
 /// entire row is silently skipped — like a constraint that doesn't match.
 /// For types whose `TryFromValue::Error = Infallible` the error branch is
@@ -687,6 +691,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> fmt::Debug for Quer
 macro_rules! find {
     ($($tokens:tt)*) => {
         {
+            #[allow(unused_mut, unused_variables)]
             let mut ctx = $crate::query::VariableContext::new();
 
             macro_rules! __local_find_context {
@@ -700,15 +705,56 @@ macro_rules! find {
 /// Re-export of the [`find!`] macro.
 pub use find;
 
+/// Returns `true` when a query produces at least one row.
+///
+/// This is equivalent to calling `find!(...).next().is_some()`, but reads more
+/// directly for existence checks.
+///
+/// # Forms
+///
+/// - `exists!(constraint)` checks a pure constraint with no projected
+///   variables.
+/// - `exists!((vars...), constraint)` uses the same variable/conversion syntax
+///   as [`find!`] before checking whether any row survives projection.
+///
+/// ```rust,ignore
+/// exists!(pattern!(&kb, [{ ?person @ social::name: "Alice" }]))
+/// ```
+///
+/// ```rust,ignore
+/// exists!(
+///     (name: Value<_>),
+///     pattern!(&kb, [{ ?person @ social::name: ?name }])
+/// )
+/// ```
 #[macro_export]
 macro_rules! exists {
     (($($vars:tt)*), $Constraint:expr) => {
         $crate::query::find!(($($vars)*), $Constraint).next().is_some()
     };
+    ($Constraint:expr) => {
+        $crate::query::find!((), $Constraint).next().is_some()
+    };
 }
 /// Re-export of the [`exists!`] macro.
 pub use exists;
 
+/// Introduces one or more temporary query variables for a nested constraint.
+///
+/// `temp!` is only meaningful inside macros that provide a local query context,
+/// such as [`find!`], [`exists!`], or macros expanded from them like
+/// [`pattern!`](crate::macros::pattern). Each identifier becomes a fresh query
+/// variable that is scoped to the wrapped body.
+///
+/// ```rust,ignore
+/// find!(
+///     (person: Value<_>),
+///     temp!((friend), and!(
+///         pattern!(&kb, [{ ?person @ social::friend: ?friend }]),
+///         pattern!(&kb, [{ ?friend @ social::name: "Bob" }])
+///     ))
+/// )
+/// ```
 #[macro_export]
 macro_rules! temp {
     (($Var:ident), $body:expr) => {{
@@ -868,7 +914,8 @@ mod tests {
                 string.is(ShortString::value_from("Hello World!")),
                 number.is(I256BE::value_from(42))
             )
-        }.collect();
+        }
+        .collect();
 
         assert_eq!(1, r.len())
     }
@@ -884,6 +931,21 @@ mod tests {
             (a: Value<_>),
             and!(a.is(I256BE::value_from(1)), a.is(I256BE::value_from(2)))
         ));
+    }
+
+    #[test]
+    fn exists_no_variables_true() {
+        let mut ctx = VariableContext::new();
+        let a = ctx.next_variable::<I256BE>();
+        assert!(exists!(a.is(I256BE::value_from(42))));
+    }
+
+    #[test]
+    fn find_no_variables_yields_unit() {
+        let mut ctx = VariableContext::new();
+        let a = ctx.next_variable::<I256BE>();
+        let rows: Vec<()> = find!((), a.is(I256BE::value_from(42))).collect();
+        assert_eq!(rows, vec![()]);
     }
 
     #[test]

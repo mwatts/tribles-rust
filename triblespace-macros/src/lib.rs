@@ -286,6 +286,29 @@ fn emit_attribute_definitions(context: &mut MetadataContext<'_>) {
     }
 }
 
+/// Defines typed attributes that can be used with `entity!`, `pattern!`, and
+/// path queries.
+///
+/// Each entry has the form:
+///
+/// - `"HEX_ID" as [vis] name: Schema;` for an explicit attribute id
+/// - `[vis] name: Schema;` for a derived id based on the attribute name
+///
+/// Doc comments attached to each entry become description metadata, and the
+/// macro also generates a `describe` helper for archiving those definitions.
+///
+/// ```rust,ignore
+/// mod social {
+///     use triblespace::prelude::*;
+///     use triblespace::prelude::valueschemas::{GenId, ShortString};
+///
+///     attributes! {
+///         /// A person's display name.
+///         "A74AA63539354CDA47F387A4C3A8D54C" as pub name: ShortString;
+///         pub friend: GenId;
+///     }
+/// }
+/// ```
 #[proc_macro]
 pub fn attributes(input: TokenStream) -> TokenStream {
     let clone = input.clone();
@@ -300,6 +323,26 @@ pub fn attributes(input: TokenStream) -> TokenStream {
     }
 }
 
+/// Builds a regular-path constraint over attribute edges.
+///
+/// The syntax is:
+///
+/// `path!(set_expr, start regex end)`
+///
+/// where `start` and `end` are query variables and `regex` is a path
+/// expression over attribute names using:
+///
+/// - adjacency for concatenation
+/// - `|` for alternation
+/// - `*` and `+` for repetition
+/// - parentheses for grouping
+///
+/// ```rust,ignore
+/// find!(
+///     (src: Value<_>, dst: Value<_>),
+///     path!(kb.clone(), src (social::follows | social::likes)+ dst)
+/// )
+/// ```
 #[proc_macro]
 pub fn path(input: TokenStream) -> TokenStream {
     let clone = input.clone();
@@ -312,6 +355,28 @@ pub fn path(input: TokenStream) -> TokenStream {
     }
 }
 
+/// Expands a bracketed trible pattern into a query constraint.
+///
+/// `pattern!` is the main macro for matching entity/attribute/value structure
+/// against a set. Inside each `{ ... }` clause:
+///
+/// - `?name` refers to an existing query variable from the surrounding query
+/// - `_?name` introduces a local helper variable scoped to this pattern
+/// - literal expressions are turned into equality constraints
+///
+/// The overall form is:
+///
+/// `pattern!(set_expr, [{ entity @ attr: value, ... }, ...])`
+///
+/// ```rust,ignore
+/// find!(
+///     (person: Value<_>, friend: Value<_>),
+///     pattern!(&kb, [
+///         { ?person @ social::friend: ?friend },
+///         { ?friend @ social::name: "Bob" }
+///     ])
+/// )
+/// ```
 #[proc_macro]
 pub fn pattern(input: TokenStream) -> TokenStream {
     let clone = input.clone();
@@ -324,6 +389,28 @@ pub fn pattern(input: TokenStream) -> TokenStream {
     }
 }
 
+/// Matches a pattern against incremental changes while still joining against
+/// the full current state.
+///
+/// The syntax mirrors [`pattern!`], but takes both the current full set and a
+/// delta set:
+///
+/// `pattern_changes!(current_set, delta_set, [{ ... }])`
+///
+/// This is useful for incremental processing where at least one trible in each
+/// match must come from `delta_set`, while the rest of the join may come from
+/// `current_set`.
+///
+/// ```rust,ignore
+/// for (work,) in find!(
+///     (work: Value<_>),
+///     pattern_changes!(&full, &delta, [
+///         { ?work @ literature::author: &shakespeare }
+///     ])
+/// ) {
+///     // process only newly introduced matches
+/// }
+/// ```
 #[proc_macro]
 pub fn pattern_changes(input: TokenStream) -> TokenStream {
     let clone = input.clone();
@@ -336,6 +423,24 @@ pub fn pattern_changes(input: TokenStream) -> TokenStream {
     }
 }
 
+/// Builds a rooted fragment from entity facts.
+///
+/// The form is:
+///
+/// `entity! { [id_expr] @ attr: value, attr?: option, attr*: repeated }`
+///
+/// If the id is omitted, the macro derives a deterministic entity id from the
+/// attribute/value pairs. `attr?:` inserts a fact only when the option is
+/// `Some`, and `attr*:` spreads repeated values into multiple facts.
+///
+/// ```rust,ignore
+/// let alice = fucid();
+/// let facts = entity! { &alice @
+///     social::name: "Alice",
+///     social::nickname?: Some("Al"),
+///     social::tag*: ["friend", "researcher"],
+/// };
+/// ```
 #[proc_macro]
 pub fn entity(input: TokenStream) -> TokenStream {
     let clone = input.clone();
@@ -348,6 +453,19 @@ pub fn entity(input: TokenStream) -> TokenStream {
     }
 }
 
+/// Instrumented wrapper around the core `find!` query macro.
+///
+/// The syntax and semantics are the same as `triblespace::core::query::find!`;
+/// this wrapper exists so the facade crate can export `find!` alongside the
+/// other procedural macros while still recording compile-time macro metadata
+/// when that feature is configured.
+///
+/// ```rust,ignore
+/// let names: Vec<_> = find!(
+///     (name: Value<_>),
+///     pattern!(&kb, [{ ?person @ social::name: ?name }])
+/// ).collect();
+/// ```
 #[proc_macro]
 pub fn find(input: TokenStream) -> TokenStream {
     let clone = input.clone();
@@ -356,6 +474,13 @@ pub fn find(input: TokenStream) -> TokenStream {
     TokenStream::from(quote!(::triblespace::core::macros::find!(#inner)))
 }
 
+/// Instrumented wrapper around the core `exists!` query macro.
+///
+/// Supports both `exists!(constraint)` and `exists!((vars...), constraint)`.
+///
+/// ```rust,ignore
+/// let has_bob = exists!(pattern!(&kb, [{ ?person @ social::name: "Bob" }]));
+/// ```
 #[proc_macro]
 pub fn exists(input: TokenStream) -> TokenStream {
     let clone = input.clone();
@@ -364,6 +489,26 @@ pub fn exists(input: TokenStream) -> TokenStream {
     TokenStream::from(quote!(::triblespace::core::exists!(#inner)))
 }
 
+/// Compiles a value formatter function to a wasm byte array constant.
+///
+/// The annotated function must have the signature:
+///
+/// `fn(raw: &[u8; 32], out: &mut impl core::fmt::Write) -> Result<(), u32>`
+///
+/// Optional macro arguments:
+///
+/// - `const_wasm = NAME` to override the generated constant name
+/// - `vis(pub(...))` to override the constant visibility
+///
+/// ```rust,ignore
+/// #[value_formatter(const_wasm = MY_FORMATTER_WASM, vis(pub(crate)))]
+/// fn format_short_string(
+///     raw: &[u8; 32],
+///     out: &mut impl core::fmt::Write,
+/// ) -> Result<(), u32> {
+///     write!(out, "{raw:02X?}").map_err(|_| 1)
+/// }
+/// ```
 #[proc_macro_attribute]
 pub fn value_formatter(attr: TokenStream, item: TokenStream) -> TokenStream {
     let clone = item.clone();

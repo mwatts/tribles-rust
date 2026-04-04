@@ -471,10 +471,7 @@ impl<H: HashProtocol> Pile<H> {
     /// [`refresh`] to load existing data or [`restore`] to repair and load
     /// after a crash.
     pub fn open(path: &Path) -> Result<Self, ReadError> {
-        let file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(path)?;
+        let file = OpenOptions::new().read(true).append(true).open(path)?;
         let length = file.metadata()?.len() as usize;
         let page_size = page_size::get();
         let base_size = page_size * 1024;
@@ -1099,12 +1096,19 @@ mod tests {
     use rand::RngCore;
     use std::collections::{HashMap, HashSet};
     use std::io::Write;
+    use std::path::PathBuf;
     use std::time::SystemTime;
     use std::time::UNIX_EPOCH;
     use tempfile;
 
     use crate::repo::BlobStoreMeta;
     use crate::repo::PushResult;
+
+    fn fresh_empty_pile_path(dir: &tempfile::TempDir, name: &str) -> PathBuf {
+        let path = dir.path().join(name);
+        std::fs::File::create(&path).unwrap();
+        path
+    }
 
     #[test]
     fn open() {
@@ -1113,7 +1117,7 @@ mod tests {
 
         let mut rng = rand::thread_rng();
         let tmp_dir = tempfile::tempdir().unwrap();
-        let tmp_pile = tmp_dir.path().join("test.pile");
+        let tmp_pile = fresh_empty_pile_path(&tmp_dir, "test.pile");
         let mut pile: Pile = Pile::open(&tmp_pile).unwrap();
 
         (0..RECORD_COUNT).for_each(|_| {
@@ -1134,7 +1138,7 @@ mod tests {
     #[test]
     fn recover_shrink() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pile.pile");
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
 
         {
             let mut pile: Pile = Pile::open(&path).unwrap();
@@ -1157,7 +1161,7 @@ mod tests {
     #[test]
     fn refresh_corrupt_reports_length() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pile.pile");
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
 
         {
             let mut pile: Pile = Pile::open(&path).unwrap();
@@ -1185,7 +1189,7 @@ mod tests {
     #[test]
     fn restore_truncates_unknown_magic() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pile.pile");
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
 
         {
             let mut pile: Pile = Pile::open(&path).unwrap();
@@ -1212,7 +1216,7 @@ mod tests {
     #[test]
     fn refresh_partial_header_reports_length() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pile.pile");
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
 
         {
             let mut pile: Pile = Pile::open(&path).unwrap();
@@ -1242,7 +1246,7 @@ mod tests {
     #[test]
     fn refresh_length_beyond_file_reports_length() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pile.pile");
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
 
         {
             let mut pile: Pile = Pile::open(&path).unwrap();
@@ -1275,7 +1279,7 @@ mod tests {
     #[test]
     fn restore_truncates_length_beyond_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pile.pile");
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
 
         {
             let mut pile: Pile = Pile::open(&path).unwrap();
@@ -1306,7 +1310,7 @@ mod tests {
     #[test]
     fn put_and_get_preserves_blob_bytes() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pile.pile");
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         let data = vec![42u8; 100];
@@ -1332,7 +1336,7 @@ mod tests {
     #[test]
     fn iter_lists_all_blobs_handles() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pile.pile");
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         let blobs = vec![vec![1u8; 3], vec![2u8; 4], vec![3u8; 5]];
@@ -1358,7 +1362,7 @@ mod tests {
     #[test]
     fn metadata_reflects_length_and_timestamp() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pile.pile");
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         let before = SystemTime::now()
@@ -1384,7 +1388,7 @@ mod tests {
     #[test]
     fn metadata_returns_none_for_unflushed_blob() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pile.pile");
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         let reader = pile.reader().unwrap();
@@ -1403,7 +1407,7 @@ mod tests {
     #[test]
     fn blob_after_branch_is_clean() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pile.pile");
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
 
         let mut pile: Pile = Pile::open(&path).unwrap();
 
@@ -1424,7 +1428,7 @@ mod tests {
     #[test]
     fn insert_after_branch_preserves_head() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pile.pile");
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         let blob1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 5]));
@@ -1448,7 +1452,7 @@ mod tests {
     #[test]
     fn branch_update_survives_manual_flush() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pile.pile");
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
 
         let branch_id = Id::new([1u8; 16]).unwrap();
 
@@ -1473,7 +1477,7 @@ mod tests {
     #[test]
     fn branch_tombstone_removes_head_and_listing() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pile.pile");
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 5]));
@@ -1496,7 +1500,7 @@ mod tests {
     #[test]
     fn branch_update_detects_conflict() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pile.pile");
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         let blob1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 5]));
@@ -1530,7 +1534,7 @@ mod tests {
     #[test]
     fn branch_update_conflict_returns_current_head() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pile.pile");
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         let blob1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 5]));
@@ -1562,7 +1566,7 @@ mod tests {
     #[test]
     fn metadata_returns_length_and_timestamp() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pile.pile");
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![7u8; 32]));
@@ -1581,7 +1585,7 @@ mod tests {
     #[test]
     fn iter_lists_all_blobs() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pile.pile");
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         let blob1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 4]));
@@ -1604,7 +1608,7 @@ mod tests {
     #[test]
     fn update_conflict_returns_current_head() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pile.pile");
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         let blob1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 5]));
@@ -1630,7 +1634,7 @@ mod tests {
     #[test]
     fn refresh_errors_on_malformed_append() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pile.pile");
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 4]));
@@ -1654,7 +1658,7 @@ mod tests {
     #[test]
     fn restore_truncates_corrupt_tail() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pile.pile");
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         let data = vec![1u8; 4];
@@ -1687,7 +1691,7 @@ mod tests {
     #[test]
     fn refresh_replaces_corrupt_blob_with_new_candidate() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pile.pile");
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
 
         let mut pile1: Pile = Pile::open(&path).unwrap();
         let mut pile2: Pile = Pile::open(&path).unwrap();
@@ -1732,7 +1736,7 @@ mod tests {
     #[test]
     fn put_duplicate_blob_does_not_grow_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pile.pile");
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         let data = vec![9u8; 32];
@@ -1754,7 +1758,7 @@ mod tests {
     #[test]
     fn branch_update_conflict_returns_existing_head() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pile.pile");
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         let blob1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(vec![1u8; 8]));
@@ -1779,7 +1783,7 @@ mod tests {
     #[test]
     fn iterator_skips_missing_index_entry() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pile.pile");
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         let blob1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(b"hello".as_slice()));
@@ -1808,7 +1812,7 @@ mod tests {
     #[test]
     fn metadata_reports_blob_length() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pile.pile");
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         let data = vec![7u8; 16];

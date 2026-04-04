@@ -1,0 +1,5 @@
+error: projected variable `projected` does not appear in the constraint tokens. If this is a pure existence query, use `find!((), ...)` or `exists!(constraint)`.
+  --> tests/trybuild/find_unbound_projection.rs:18:9
+   |
+18 |         projected: Id,
+   |         ^^^^^^^^^

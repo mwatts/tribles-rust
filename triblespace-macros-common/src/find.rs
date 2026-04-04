@@ -1,5 +1,6 @@
 use proc_macro2::Span;
 use proc_macro2::TokenStream as TokenStream2;
+use proc_macro2::TokenTree;
 use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{Ident, Token};
@@ -96,11 +97,7 @@ fn gen_var_decl(ctx: &Ident, v: &FindVariable) -> TokenStream2 {
     quote! { let #name = #ctx.next_variable(); }
 }
 
-fn gen_var_conversion(
-    crate_path: &syn::Path,
-    binding: &Ident,
-    v: &FindVariable,
-) -> TokenStream2 {
+fn gen_var_conversion(crate_path: &syn::Path, binding: &Ident, v: &FindVariable) -> TokenStream2 {
     let name = &v.name;
     if v.fallible {
         if let Some(ref ty) = v.ty {
@@ -137,6 +134,35 @@ fn gen_var_conversion(
     }
 }
 
+fn mentions_ident_named(tokens: &TokenStream2, needle: &str) -> bool {
+    tokens.clone().into_iter().any(|tt| match tt {
+        TokenTree::Ident(id) => id.to_string() == needle,
+        TokenTree::Group(group) => mentions_ident_named(&group.stream(), needle),
+        _ => false,
+    })
+}
+
+fn mentions_ident(tokens: &TokenStream2, needle: &Ident) -> bool {
+    mentions_ident_named(tokens, &needle.to_string())
+}
+
+fn ensure_projected_var_mentioned(
+    constraint: &TokenStream2,
+    variable: &FindVariable,
+) -> syn::Result<()> {
+    if mentions_ident(constraint, &variable.name) {
+        Ok(())
+    } else {
+        Err(syn::Error::new(
+            variable.name.span(),
+            format!(
+                "projected variable `{}` does not appear in the constraint tokens. If this is a pure existence query, use `find!((), ...)` or `exists!(constraint)`.",
+                variable.name
+            ),
+        ))
+    }
+}
+
 pub fn find_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
     let FindImplInput {
         crate_path,
@@ -155,6 +181,7 @@ pub fn find_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
                 })
         }),
         FindMode::Bare(var) => {
+            ensure_projected_var_mentioned(&constraint, &var)?;
             let decl = gen_var_decl(&ctx, &var);
             let conversion = gen_var_conversion(&crate_path, &binding, &var);
             let name = &var.name;
@@ -171,6 +198,9 @@ pub fn find_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
             })
         }
         FindMode::Tuple(variables) => {
+            for variable in &variables {
+                ensure_projected_var_mentioned(&constraint, variable)?;
+            }
             let var_decls: Vec<TokenStream2> =
                 variables.iter().map(|v| gen_var_decl(&ctx, v)).collect();
             let var_conversions: Vec<TokenStream2> = variables

@@ -12,6 +12,7 @@
 # Queries & Data
 
 - [Query Language](query-language.md)
+- [Macro Cookbook](macro-cookbook.md)
 - [Schemas](schemas.md)
 - [Incremental Queries](incremental-queries.md)
 - [Deep Dive: Query Engine](query-engine.md)

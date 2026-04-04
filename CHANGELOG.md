@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] - 2026-03-13
+### Changed
+- **Breaking:** Renamed the `matches!` query macro to `exists!` to resolve the
+  name collision with `std::matches!` that made the macro unusable in practice.
+
+## [Unreleased]
+
+## [0.34.1] - 2026-04-04
+### Added
+- Optional `telemetry` feature in the facade crate:
+  - `triblespace::telemetry::Telemetry` for pile-backed tracing sinks
+  - `triblespace::telemetry::TelemetryLayer` for embedding into custom
+    subscribers
+  - `triblespace::telemetry::schema` metadata/attribute ids used by the sink
+  - environment controls: `TELEMETRY_PILE`,
+    `TELEMETRY_FLUSH_MS`.
+
+### Changed
+- Trimmed `triblespace::telemetry` schema to generic span/session fields by
+  removing GORBIE-specific `card_index` capture from the shared sink.
+- `exists!` now supports the zero-variable form `exists!(constraint)` for pure
+  existence checks without the tuple head ceremony.
+
+### Fixed
+- `PATCH::difference` now returns an empty set when the left-hand side is
+  empty (`∅ \ B = ∅`) instead of incorrectly cloning the right-hand side.
+- `find!` now rejects the common footgun where a projected variable never
+  appears in the constraint tokens, and the fallback unbound-variable panic now
+  points users toward `find!((), ...)` / `exists!(constraint)`.
+- Pile-backed tests now create the pile file explicitly before calling
+  `Pile::open`, matching the newer no-auto-create semantics and restoring the
+  full workspace test suite.
+
+### Documentation
+- Documented `PushError::StoragePut` guidance for large local `Pile` writes:
+  platform `writev` limits can surface `EINVAL`, and oversized payloads should
+  be chunked semantically behind a manifest/root record.
+- Added rustdoc coverage for the public macro surface and a new book chapter,
+  "Macro Cookbook", with runnable doctest examples for the main query and data
+  construction macros.
+
 ## [0.20.0] - 2026-03-14
 ### Changed
 - **Breaking:** Removed the `FromValue` trait. `TryFromValue` is now the sole
@@ -26,34 +67,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `HashSet`/`HashMap` constraint bounds relaxed from requiring
   `TryFromValue<Error = Infallible>` to accepting any `TryFromValue`; values
   that fail to convert are rejected during `confirm()`.
-
-## [0.19.0] - 2026-03-13
-### Changed
-- **Breaking:** Renamed the `matches!` query macro to `exists!` to resolve the
-  name collision with `std::matches!` that made the macro unusable in practice.
-
-## [Unreleased]
-### Added
-- Optional `telemetry` feature in the facade crate:
-  - `triblespace::telemetry::Telemetry` for pile-backed tracing sinks
-  - `triblespace::telemetry::TelemetryLayer` for embedding into custom
-    subscribers
-  - `triblespace::telemetry::schema` metadata/attribute ids used by the sink
-  - environment controls: `TELEMETRY_PILE`,
-    `TELEMETRY_FLUSH_MS`.
-
-### Changed
-- Trimmed `triblespace::telemetry` schema to generic span/session fields by
-  removing GORBIE-specific `card_index` capture from the shared sink.
-
-### Fixed
-- `PATCH::difference` now returns an empty set when the left-hand side is
-  empty (`∅ \ B = ∅`) instead of incorrectly cloning the right-hand side.
-
-### Documentation
-- Documented `PushError::StoragePut` guidance for large local `Pile` writes:
-  platform `writev` limits can surface `EINVAL`, and oversized payloads should
-  be chunked semantically behind a manifest/root record.
 
 ## [0.16.0] - 2026-02-15
 ### Changed
