@@ -40,6 +40,8 @@ The consequences are profound:
 
 Entity ownership handles per-entity consistency, but some workflows need stronger guarantees — transactions that span multiple entities, or invariants like "these two facts must be visible atomically."  For those cases the branch store's compare-and-set update provides defense in depth: a workspace stages its changes locally, and `push` only succeeds if the branch head hasn't moved since the workspace was pulled.  On conflict, the caller merges the incoming changes and retries.  This gives you serializable multi-entity transactions on top of the monotonic data model, at the cost of a retry loop under contention.
 
+Together the two layers cover the full transaction story: entity ownership for "I own this thing, let me just update it," and branch CAS for "these N things must move as one."  Neither requires the user to think about distributed coordination protocols.
+
 The ID ownership system is documented in depth in [Identifiers](deep-dive/identifiers.md); the rest of this chapter assumes these three principles as given.
 
 ## Architectural Layers
