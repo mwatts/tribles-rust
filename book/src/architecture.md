@@ -12,6 +12,34 @@ A full discussion of the motivation behind TribleSpace can be found in the [Phil
 
 These goals grew out of earlier "semantic" technologies that attempted to model knowledge as graphs.  While systems like RDF promised great flexibility, in practice they often became difficult to host, query and synchronise.  TribleSpace keeps the idea of describing the world with simple statements but stores them in a form that is easy to exchange and reason about.
 
+## Design Principles
+
+Three load-bearing decisions shape everything else in TribleSpace.  Understanding them up front makes the rest of the architecture — the six indexes, the append-only storage, the branch/commit model, the absence of `delete` — read as consequences rather than costs.
+
+### 1. Content Addressing
+
+Every blob is identified by the hash of its bytes.  Identical data deduplicates automatically, integrity is verifiable offline, and repositories can share data through any common storage without coordination.  Handles are 32-byte hashes, which means they fit inline in a trible's value slot: a value either *is* its data (for short payloads) or *points to* its data (via a blob hash).  This is what lets TribleSpace be "content-addressed all the way down" — schemas, commits, branch metadata, and application data all use the same primitive.
+
+### 2. Monotonic Facts
+
+Tribles are only added, never retracted.  A `TribleSet` is a mathematical set of facts, and merging two sets is simply set union.  There is no `delete` operation and no "latest wins" heuristic inside the data model.  This follows the [CALM principle](https://arxiv.org/abs/1901.01930): monotonic operations are coordination-free, so distributed replicas can merge without consensus.  It is also what makes `TribleSet` a CRDT — two workspaces can edit independently and always reconcile cleanly.
+
+The apparent limitation (how do you model mutable state?) is resolved by the next principle.
+
+### 3. Entity Ownership
+
+This is the decision that distinguishes TribleSpace from other triple stores.  In RDF and similar systems, triple direction has no semantics — `parentOf` and `childOf` are interchangeable and systems typically auto-infer one from the other.  TribleSpace gives direction **provenance semantics**: a trible `A → attribute → B` is always a claim made *by* A *about* B, and only the current owner of an entity ID may assert new facts with that entity in the subject position.
+
+This ownership discipline is enforced through [`ExclusiveId`](https://docs.rs/triblespace/latest/triblespace/id/struct.ExclusiveId.html) guards, which are `Send` but not `Sync` — holding one guarantees that no other process is writing about that entity.  In other words, **each entity forms its own transactional shard**.  You can think of it as Rust's ownership model applied to data: just as the borrow checker prevents two threads from mutating the same variable, the ID ownership system prevents two processes from asserting conflicting attributes about the same entity.
+
+The consequences are profound:
+
+- **Merges cannot conflict by construction.** Two workspaces that edit different entities can always merge, because neither can have written about the other's entities.  The "merge conflict resolution" problem that plagues distributed databases simply doesn't exist in this model.
+- **Non-monotonic operations become safe within an ownership scope.** While the global data model stays monotonic, an owner holding a set of `ExclusiveId`s has a closed-world view of those entities.  Operations like `if-does-not-exist` are well-defined within that transaction domain because no other writer can intervene.
+- **Mutable state is modelled as ownership + replacement.** To "update" an entity's attribute, you mint a new entity and reference it from the owner.  The old fact remains in the history; the current view is determined by what the owner currently points to.  This is the same pattern as immutable data structures: mutation becomes a new version, and the "current" value is a pointer that gets swapped.
+
+The ID ownership system is documented in depth in [Identifiers](deep-dive/identifiers.md); the rest of this chapter assumes these three principles as given.
+
 ## Architectural Layers
 
 The system is organised into a small set of layers that compose cleanly:
