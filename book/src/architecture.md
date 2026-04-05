@@ -38,6 +38,8 @@ The consequences are profound:
 - **Non-monotonic operations become safe within an ownership scope.** While the global data model stays monotonic, an owner holding a set of `ExclusiveId`s has a closed-world view of those entities.  Operations like `if-does-not-exist` are well-defined within that transaction domain because no other writer can intervene.
 - **Mutable state is modelled as ownership + replacement.** To "update" an entity's attribute, you mint a new entity and reference it from the owner.  The old fact remains in the history; the current view is determined by what the owner currently points to.  This is the same pattern as immutable data structures: mutation becomes a new version, and the "current" value is a pointer that gets swapped.
 
+Entity ownership handles per-entity consistency, but some workflows need stronger guarantees — transactions that span multiple entities, or invariants like "these two facts must be visible atomically."  For those cases the branch store's compare-and-set update provides defense in depth: a workspace stages its changes locally, and `push` only succeeds if the branch head hasn't moved since the workspace was pulled.  On conflict, the caller merges the incoming changes and retries.  This gives you serializable multi-entity transactions on top of the monotonic data model, at the cost of a retry loop under contention.
+
 The ID ownership system is documented in depth in [Identifiers](deep-dive/identifiers.md); the rest of this chapter assumes these three principles as given.
 
 ## Architectural Layers
