@@ -1,8 +1,11 @@
 //! Node identity management.
 //!
-//! Each pile gets a persistent ed25519 identity stored in a companion
-//! `.key` file. The same key signs commits and identifies the node
-//! on the network.
+//! Each node gets a persistent ed25519 identity. The key identifies
+//! the node on the network and signs commits. It is NOT tied to any
+//! specific pile or storage backend.
+//!
+//! Default location: `$TRIBLESPACE_KEY` env, or `./self.key` in the
+//! current directory, or an explicit path.
 
 use std::path::Path;
 use std::fs;
@@ -10,20 +13,23 @@ use anyhow::{Result, anyhow};
 use ed25519_dalek::SigningKey;
 use iroh_base::SecretKey;
 
-/// Load or create a persistent signing key for a pile.
+/// Load or create a persistent node identity.
 ///
-/// Resolution: explicit path → TRIBLES_SIGNING_KEY env → `<pile>.key` auto-create.
-pub fn load_or_create_pile_key(
+/// Resolution order:
+/// 1. Explicit path (if provided)
+/// 2. `TRIBLESPACE_KEY` environment variable
+/// 3. `<default_dir>/self.key` (auto-created if missing)
+pub fn load_or_create_key(
     explicit_path: &Option<std::path::PathBuf>,
-    pile_path: &Path,
+    default_dir: &Path,
 ) -> Result<SigningKey> {
     if let Some(p) = explicit_path {
         return load_key_from_file(p);
     }
-    if let Ok(s) = std::env::var("TRIBLES_SIGNING_KEY") {
+    if let Ok(s) = std::env::var("TRIBLESPACE_KEY") {
         return load_key_from_file(Path::new(&s));
     }
-    let key_path = pile_path.with_extension("pile.key");
+    let key_path = default_dir.join("self.key");
     if key_path.exists() {
         return load_key_from_file(&key_path);
     }

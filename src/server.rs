@@ -1,17 +1,15 @@
 //! Protocol handler that serves GET_BLOB, SYNC, LIST, and HEAD
-//! from a pile file.
+//! from any `BlobStore + BranchStore` implementation.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
 
 use anyhow::{Result, anyhow};
 use anybytes::Bytes;
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use triblespace_core::blob::schemas::UnknownBlob;
+use triblespace_core::id::Id;
 use triblespace_core::repo::{BlobStore, BlobStoreGet, BranchStore};
-use triblespace_core::repo::pile::Pile;
-use triblespace_core::value::schemas::hash::Blake3 as Blake3Hash;
 use triblespace_core::value::Value;
 use triblespace_core::value::schemas::hash::{Blake3, Handle};
 
@@ -19,42 +17,18 @@ use crate::protocol::*;
 
 const VALUE_LEN: usize = 32;
 
-/// Protocol handler that serves blob requests from a pile.
-#[derive(Debug, Clone)]
-pub struct PileBlobServer {
-    pub pile_path: PathBuf,
-}
-
-impl ProtocolHandler for PileBlobServer {
-    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        let pile_path = self.pile_path.clone();
-
-        let result: Result<()> = async {
-            let (mut send, mut recv) = connection.accept_bi().await
-                .map_err(|e| anyhow!("accept_bi: {e}"))?;
-
-            let mut pile = Pile::<Blake3>::open(&pile_path).map_err(|e| anyhow!("open: {e:?}"))?;
-            serve_pile(&mut pile, &mut send, &mut recv).await?;
-            send.finish().map_err(|e| anyhow!("finish: {e}"))?;
-            pile.close().map_err(|e| anyhow!("close: {e:?}"))?;
-            Ok(())
-        }.await;
-
-        if let Err(e) = &result {
-            let peer = connection.remote_id().fmt_short();
-            tracing::warn!("handler error [{peer}]: {e}");
-        }
-        connection.closed().await;
-        Ok(())
-    }
-}
-
-/// Serve requests from a pile on a bidirectional stream.
-pub async fn serve_pile(
-    pile: &mut Pile<Blake3>,
+/// Serve requests on a bidirectional stream from any `BlobStore + BranchStore`.
+///
+/// The caller is responsible for opening the storage and accepting the
+/// connection. This function handles the protocol loop.
+pub async fn serve<S>(
+    store: &mut S,
     send: &mut iroh::endpoint::SendStream,
     recv: &mut iroh::endpoint::RecvStream,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: BlobStore<Blake3> + BranchStore<Blake3>,
+{
     loop {
         let msg_type = match recv_u8(recv).await {
             Ok(t) => t,
@@ -63,11 +37,14 @@ pub async fn serve_pile(
 
         match msg_type {
             REQ_DONE => break,
+
             REQ_LIST => {
-                let iter = pile.branches().map_err(|e| anyhow!("branches: {e:?}"))?;
-                for branch_result in iter {
-                    let id = branch_result.map_err(|e| anyhow!("iter: {e:?}"))?;
-                    if let Ok(Some(head)) = pile.head(id) {
+                let branch_ids: Vec<Id> = store.branches()
+                    .map_err(|e| anyhow!("branches: {e:?}"))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                for id in branch_ids {
+                    if let Ok(Some(head)) = store.head(id) {
                         let id_bytes: [u8; 16] = id.into();
                         send_u8(send, RSP_LIST_ENTRY).await?;
                         send_branch_id(send, &id_bytes).await?;
@@ -76,13 +53,15 @@ pub async fn serve_pile(
                 }
                 send_u8(send, RSP_END_LIST).await?;
             }
+
             REQ_GET_BLOB => {
                 let hash = recv_hash(recv).await?;
-                match get_blob(pile, &hash) {
+                match get_blob(store, &hash) {
                     Some(data) => send_blob(send, &hash, &data).await?,
                     None => send_u8(send, RSP_MISSING).await?,
                 }
             }
+
             REQ_SYNC => {
                 let parent_hash = recv_hash(recv).await?;
                 let have_count = recv_u32_be(recv).await? as usize;
@@ -90,13 +69,13 @@ pub async fn serve_pile(
                 for _ in 0..have_count {
                     have_set.insert(recv_hash(recv).await?);
                 }
-                if let Some(parent_data) = get_blob(pile, &parent_hash) {
+                if let Some(parent_data) = get_blob(store, &parent_hash) {
                     for chunk in parent_data.chunks(VALUE_LEN) {
                         if chunk.len() == VALUE_LEN {
                             let mut candidate = [0u8; 32];
                             candidate.copy_from_slice(chunk);
                             if !have_set.contains(&candidate) {
-                                if let Some(data) = get_blob(pile, &candidate) {
+                                if let Some(data) = get_blob(store, &candidate) {
                                     send_blob(send, &candidate, &data).await?;
                                 }
                             }
@@ -105,13 +84,14 @@ pub async fn serve_pile(
                 }
                 send_u8(send, RSP_END_SYNC).await?;
             }
+
             REQ_HEAD => {
                 let branch_id_bytes = recv_branch_id(recv).await?;
-                let Some(branch_id) = triblespace_core::id::Id::new(branch_id_bytes) else {
+                let Some(branch_id) = Id::new(branch_id_bytes) else {
                     send_u8(send, RSP_NONE).await?;
                     continue;
                 };
-                match pile.head(branch_id) {
+                match store.head(branch_id) {
                     Ok(Some(head)) => {
                         send_u8(send, RSP_HEAD_OK).await?;
                         send_hash(send, &head.raw).await?;
@@ -119,14 +99,15 @@ pub async fn serve_pile(
                     _ => send_u8(send, RSP_NONE).await?,
                 }
             }
+
             _ => break,
         }
     }
     Ok(())
 }
 
-fn get_blob(pile: &mut Pile<Blake3>, hash: &RawHash) -> Option<Vec<u8>> {
+fn get_blob<S: BlobStore<Blake3>>(store: &mut S, hash: &RawHash) -> Option<Vec<u8>> {
     let handle = Value::<Handle<Blake3, UnknownBlob>>::new(*hash);
-    let reader = BlobStore::<Blake3>::reader(pile).ok()?;
+    let reader = store.reader().ok()?;
     reader.get::<Bytes, UnknownBlob>(handle).ok().map(|b| b.to_vec())
 }
