@@ -170,7 +170,7 @@ impl BlobChildren<Blake3> for RemoteStore {
             };
 
             // SYNC with empty HAVE set = "give me all children"
-            if send_u8(&mut send, REQ_SYNC).await.is_err() { return Vec::new(); }
+            if send_u8(&mut send, REQ_CHILDREN).await.is_err() { return Vec::new(); }
             if send_hash(&mut send, &handle.raw).await.is_err() { return Vec::new(); }
             if send_u32_be(&mut send, 0).await.is_err() { return Vec::new(); }
 
@@ -182,7 +182,7 @@ impl BlobChildren<Blake3> for RemoteStore {
                         let Ok((hash, _data)) = recv_blob_data(&mut recv).await else { break; };
                         children.push(Value::<Handle<Blake3, UnknownBlob>>::new(hash));
                     }
-                    RSP_END_SYNC => break,
+                    RSP_END_CHILDREN => break,
                     _ => break,
                 }
             }

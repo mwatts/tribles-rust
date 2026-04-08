@@ -62,7 +62,7 @@ where
                 }
             }
 
-            REQ_SYNC => {
+            REQ_CHILDREN => {
                 let parent_hash = recv_hash(recv).await?;
                 let have_count = recv_u32_be(recv).await? as usize;
                 let mut have_set: HashSet<RawHash> = HashSet::with_capacity(have_count);
@@ -82,7 +82,7 @@ where
                         }
                     }
                 }
-                send_u8(send, RSP_END_SYNC).await?;
+                send_u8(send, RSP_END_CHILDREN).await?;
             }
 
             REQ_HEAD => {

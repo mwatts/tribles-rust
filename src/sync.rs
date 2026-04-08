@@ -248,7 +248,7 @@ where
                 }
             }
 
-            send_u8(&mut send, REQ_SYNC).await?;
+            send_u8(&mut send, REQ_CHILDREN).await?;
             send_hash(&mut send, parent_hash).await?;
             send_u32_be(&mut send, have.len() as u32).await?;
             for h in &have {
@@ -265,7 +265,7 @@ where
                         put_blob(&mut local, data)?;
                         next_level.push(hash);
                     }
-                    RSP_END_SYNC => break,
+                    RSP_END_CHILDREN => break,
                     _ => return Err(anyhow!("unexpected sync response: {rsp}")),
                 }
             }

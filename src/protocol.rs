@@ -9,7 +9,7 @@ pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/1";
 pub const REQ_DONE: u8 = 0x00;
 pub const REQ_LIST: u8 = 0x01;
 pub const REQ_GET_BLOB: u8 = 0x02;
-pub const REQ_SYNC: u8 = 0x03;
+pub const REQ_CHILDREN: u8 = 0x03;
 pub const REQ_HEAD: u8 = 0x04;
 pub const REQ_CAS_PUSH: u8 = 0x05;
 
@@ -18,7 +18,7 @@ pub const RSP_LIST_ENTRY: u8 = 0x01;
 pub const RSP_END_LIST: u8 = 0x02;
 pub const RSP_BLOB: u8 = 0x03;
 pub const RSP_MISSING: u8 = 0x04;
-pub const RSP_END_SYNC: u8 = 0x05;
+pub const RSP_END_CHILDREN: u8 = 0x05;
 pub const RSP_HEAD_OK: u8 = 0x06;
 pub const RSP_NONE: u8 = 0x07;
 pub const RSP_CAS_OK: u8 = 0x08;
