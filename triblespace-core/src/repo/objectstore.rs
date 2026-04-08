@@ -487,6 +487,8 @@ impl fmt::Display for ListBlobsErr {
 }
 impl Error for ListBlobsErr {}
 
+impl<H: HashProtocol> super::BlobChildren<H> for ObjectStoreReader<H> {}
+
 /// Error returned when listing branches from the object store.
 #[derive(Debug)]
 pub enum ListBranchesErr {

@@ -18,7 +18,7 @@ winnow = "0.7.13"
 zerocopy = { version = "0.8", features = ["derive"] }
 anybytes = { version = "0.20.2", features = ["bytes", "zerocopy", "winnow", "mmap"] }
 rand = "0.8"
-digest = "0.11"
+digest = ">=0.11.0-rc.1, <0.12"
 ux = "0.1.5"
 siphasher = "1.0.1"
 arbitrary = { version = "1", features = ["derive"] }

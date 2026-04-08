@@ -64,6 +64,7 @@ pub use crate::query::unionconstraint::UnionConstraint;
 pub use crate::query::temp;
 pub use crate::repo::memoryrepo::MemoryRepo;
 pub use crate::repo::pile::Pile;
+pub use crate::repo::BlobChildren;
 pub use crate::repo::BlobStore;
 pub use crate::repo::BlobStoreGet;
 pub use crate::repo::BlobStoreList;

@@ -336,6 +336,8 @@ where
     }
 }
 
+impl<H: HashProtocol> crate::repo::BlobChildren<H> for MemoryBlobStoreReader<H> {}
+
 impl<H> BlobStorePut<H> for MemoryBlobStore<H>
 where
     H: HashProtocol,

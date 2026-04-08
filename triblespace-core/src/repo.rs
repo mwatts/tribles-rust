@@ -329,6 +329,44 @@ pub trait BlobStoreKeep<H: HashProtocol> {
         I: IntoIterator<Item = Value<Handle<H, UnknownBlob>>>;
 }
 
+/// Trait for stores that can enumerate a blob's child references.
+///
+/// "Children" are the 32-byte-aligned values in a blob that correspond
+/// to existing blobs in the store — the conservative set of references.
+///
+/// The default implementation scans the blob's bytes and checks each
+/// 32-byte chunk with [`BlobStoreGet::get`]. Backends with batch
+/// capabilities (e.g. a network store with a SYNC protocol) can
+/// override this for efficiency.
+pub trait BlobChildren<H: HashProtocol>: BlobStoreGet<H> {
+    /// Return handles of blobs referenced by `handle` that exist in this store.
+    fn children(
+        &self,
+        handle: Value<Handle<H, UnknownBlob>>,
+    ) -> Vec<Value<Handle<H, UnknownBlob>>> {
+        let Ok(blob) = self.get::<Blob<UnknownBlob>, UnknownBlob>(handle) else {
+            return Vec::new();
+        };
+        let bytes = blob.bytes.as_ref();
+        let mut result = Vec::new();
+        let mut offset = 0usize;
+        while offset + VALUE_LEN <= bytes.len() {
+            let mut raw = [0u8; VALUE_LEN];
+            raw.copy_from_slice(&bytes[offset..offset + VALUE_LEN]);
+            let candidate = Value::<Handle<H, UnknownBlob>>::new(raw);
+            if self.get::<anybytes::Bytes, UnknownBlob>(candidate).is_ok() {
+                result.push(candidate);
+            }
+            offset += VALUE_LEN;
+        }
+        result
+    }
+}
+
+// No blanket impl — types opt in explicitly so they can provide
+// optimized implementations (e.g. network stores with batch protocols).
+// Use `impl_blob_children_default!` for the scan-and-check fallback.
+
 /// Outcome of a compare-and-swap branch update.
 #[derive(Debug)]
 pub enum PushResult<H>
@@ -469,9 +507,12 @@ where
 }
 
 /// Iterator that visits every blob handle reachable from a set of roots.
+///
+/// Uses [`BlobChildren`] to enumerate references at each level,
+/// so backends with batch capabilities get efficient traversal.
 pub struct ReachableHandles<'a, BS, H>
 where
-    BS: BlobStoreGet<H>,
+    BS: BlobChildren<H>,
     H: 'static + HashProtocol,
 {
     source: &'a BS,
@@ -481,7 +522,7 @@ where
 
 impl<'a, BS, H> ReachableHandles<'a, BS, H>
 where
-    BS: BlobStoreGet<H>,
+    BS: BlobChildren<H>,
     H: 'static + HashProtocol,
 {
     fn new(source: &'a BS, roots: impl IntoIterator<Item = Value<Handle<H, UnknownBlob>>>) -> Self {
@@ -496,34 +537,11 @@ where
             visited: HashSet::new(),
         }
     }
-
-    fn enqueue_from_blob(&mut self, blob: &Blob<UnknownBlob>) {
-        let bytes = blob.bytes.as_ref();
-        let mut offset = 0usize;
-
-        while offset + VALUE_LEN <= bytes.len() {
-            let mut raw = [0u8; VALUE_LEN];
-            raw.copy_from_slice(&bytes[offset..offset + VALUE_LEN]);
-
-            if !self.visited.contains(&raw) {
-                let candidate = Value::<Handle<H, UnknownBlob>>::new(raw);
-                if self
-                    .source
-                    .get::<anybytes::Bytes, UnknownBlob>(candidate)
-                    .is_ok()
-                {
-                    self.queue.push_back(candidate);
-                }
-            }
-
-            offset += VALUE_LEN;
-        }
-    }
 }
 
 impl<'a, BS, H> Iterator for ReachableHandles<'a, BS, H>
 where
-    BS: BlobStoreGet<H>,
+    BS: BlobChildren<H>,
     H: 'static + HashProtocol,
 {
     type Item = Value<Handle<H, UnknownBlob>>;
@@ -536,8 +554,12 @@ where
                 continue;
             }
 
-            if let Ok(blob) = self.source.get(handle) {
-                self.enqueue_from_blob(&blob);
+            // Use BlobChildren to get references — backends can override
+            // with batch-optimized implementations.
+            for child in self.source.children(handle) {
+                if !self.visited.contains(&child.raw) {
+                    self.queue.push_back(child);
+                }
             }
 
             return Some(handle);
@@ -548,12 +570,15 @@ where
 }
 
 /// Create a breadth-first iterator over blob handles reachable from `roots`.
+///
+/// Uses [`BlobChildren`] for reference enumeration, so network-backed
+/// stores can provide optimized batch implementations.
 pub fn reachable<'a, BS, H>(
     source: &'a BS,
     roots: impl IntoIterator<Item = Value<Handle<H, UnknownBlob>>>,
 ) -> ReachableHandles<'a, BS, H>
 where
-    BS: BlobStoreGet<H>,
+    BS: BlobChildren<H>,
     H: 'static + HashProtocol,
 {
     ReachableHandles::new(source, roots)

@@ -278,6 +278,8 @@ impl<H: HashProtocol> BlobStoreGet<H> for PileReader<H> {
     }
 }
 
+impl<H: HashProtocol> super::BlobChildren<H> for PileReader<H> {}
+
 impl<H: HashProtocol> BlobStore<H> for Pile<H> {
     type Reader = PileReader<H>;
     type ReaderError = ReadError;
