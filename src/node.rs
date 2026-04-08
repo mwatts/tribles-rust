@@ -252,8 +252,11 @@ struct StoreHandler<S> {
     inner: Arc<Mutex<S>>,
 }
 
-/// Serve one stream: read request (async), process (sync under lock), write response (async).
-/// The MutexGuard never crosses an await point.
+/// Serve one stream using a reader snapshot.
+///
+/// Locks the store briefly to get a reader + branch info, then serves
+/// entirely from the reader (which is Send + Clone + 'static).
+/// No lock held across any await point.
 async fn serve_one_stream<S>(
     store: &Arc<Mutex<S>>,
     send: &mut iroh::endpoint::SendStream,
@@ -267,107 +270,25 @@ where
     use triblespace_core::repo::BlobStoreGet;
     use anybytes::Bytes;
 
-    // Phase 1: read request (async, no lock).
     let op = recv_u8(recv).await?;
 
-    enum Response {
-        List(Vec<([u8; 16], [u8; 32])>),
-        Head(Option<[u8; 32]>),
-        Blob(Option<Vec<u8>>),
-        Children(Vec<([u8; 32], Vec<u8>)>),
-        Unknown,
-    }
-
-    // Phase 1b: read remaining request data (async, no lock).
-    enum Request {
-        List,
-        Head([u8; 16]),
-        GetBlob([u8; 32]),
-        Children { parent: [u8; 32], have: Vec<[u8; 32]> },
-        Unknown,
-    }
-
-    let request = match op {
-        OP_LIST => Request::List,
-        OP_HEAD => Request::Head(recv_branch_id(recv).await?),
-        OP_GET_BLOB => Request::GetBlob(recv_hash(recv).await?),
-        OP_CHILDREN => {
-            let parent = recv_hash(recv).await?;
-            let have_count = recv_u32_be(recv).await? as usize;
-            let mut have = Vec::with_capacity(have_count);
-            for _ in 0..have_count {
-                have.push(recv_hash(recv).await?);
-            }
-            Request::Children { parent, have }
-        }
-        _ => Request::Unknown,
-    };
-
-    // Phase 2: process under lock (sync, no await — MutexGuard never crosses await).
-    let response = {
-        let mut guard = store.lock().unwrap();
-        match request {
-            Request::List => {
+    match op {
+        OP_LIST => {
+            // Lock: collect branch entries. Unlock: send them.
+            let entries: Vec<([u8; 16], [u8; 32])> = {
+                let mut guard = store.lock().unwrap();
                 let ids: Vec<Id> = guard.branches()
                     .map_err(|e| anyhow!("branches: {e:?}"))?
                     .filter_map(|r| r.ok())
                     .collect();
-                let mut entries = Vec::new();
+                let mut out = Vec::new();
                 for id in ids {
                     if let Ok(Some(head)) = guard.head(id) {
-                        entries.push((id.into(), head.raw));
+                        out.push((id.into(), head.raw));
                     }
                 }
-                Response::List(entries)
-            }
-            Request::Head(id_bytes) => {
-                let hash = Id::new(id_bytes).and_then(|bid| {
-                    guard.head(bid).ok().flatten().map(|h| h.raw)
-                });
-                Response::Head(hash)
-            }
-            Request::GetBlob(hash) => {
-                let handle = Value::<Handle<Blake3, UnknownBlob>>::new(hash);
-                let data = guard.reader().ok()
-                    .and_then(|r| r.get::<Bytes, UnknownBlob>(handle).ok())
-                    .map(|b: Bytes| b.to_vec());
-                Response::Blob(data)
-            }
-            Request::Children { parent, have } => {
-                let have_set: std::collections::HashSet<[u8; 32]> = have.into_iter().collect();
-                let parent_handle = Value::<Handle<Blake3, UnknownBlob>>::new(parent);
-                let parent_blob = guard.reader().ok()
-                    .and_then(|r| r.get::<Bytes, UnknownBlob>(parent_handle).ok());
-                match parent_blob {
-                    Some(blob) => {
-                        let parent_data: Vec<u8> = blob.to_vec();
-                        let mut result = Vec::new();
-                        for chunk in parent_data.chunks(32) {
-                            if chunk.len() == 32 {
-                                let mut candidate = [0u8; 32];
-                                candidate.copy_from_slice(chunk);
-                                if !have_set.contains(&candidate) {
-                                    let h = Value::<Handle<Blake3, UnknownBlob>>::new(candidate);
-                                    if let Some(data) = guard.reader().ok()
-                                        .and_then(|r| r.get::<Bytes, UnknownBlob>(h).ok())
-                                        .map(|b: Bytes| b.to_vec()) {
-                                        result.push((candidate, data));
-                                    }
-                                }
-                            }
-                        }
-                        Response::Children(result)
-                    }
-                    None => Response::Children(Vec::new()),
-                }
-            }
-            Request::Unknown => Response::Unknown,
-        }
-    }; // guard dropped here, before any await
-
-    // Phase 3: write response (async, no lock).
-    match response {
-        Response::List(entries) => {
+                out
+            };
             for (id_bytes, head) in &entries {
                 send_u8(send, RSP_BLOB).await?;
                 send_branch_id(send, id_bytes).await?;
@@ -375,31 +296,68 @@ where
             }
             send_u8(send, RSP_END).await?;
         }
-        Response::Head(Some(hash)) => {
-            send_u8(send, RSP_HEAD_OK).await?;
-            send_hash(send, &hash).await?;
+
+        OP_HEAD => {
+            let id_bytes = recv_branch_id(recv).await?;
+            // Lock briefly for head lookup.
+            let hash = Id::new(id_bytes).and_then(|bid| {
+                store.lock().unwrap().head(bid).ok().flatten().map(|h| h.raw)
+            });
+            match hash {
+                Some(h) => { send_u8(send, RSP_HEAD_OK).await?; send_hash(send, &h).await?; }
+                None => { send_u8(send, RSP_NONE).await?; }
+            }
         }
-        Response::Head(None) => {
-            send_u8(send, RSP_NONE).await?;
+
+        OP_GET_BLOB => {
+            let hash = recv_hash(recv).await?;
+            // Grab reader snapshot, lock released immediately.
+            let reader = store.lock().unwrap().reader().map_err(|e| anyhow!("reader: {e:?}"))?;
+            let handle = Value::<Handle<Blake3, UnknownBlob>>::new(hash);
+            match reader.get::<Bytes, UnknownBlob>(handle) {
+                Ok(data) => {
+                    let bytes: Vec<u8> = data.to_vec();
+                    send_u8(send, RSP_BLOB).await?;
+                    send_u32_be(send, bytes.len() as u32).await?;
+                    send.write_all(&bytes).await.map_err(|e| anyhow!("send: {e}"))?;
+                }
+                Err(_) => { send_u8(send, RSP_MISSING).await?; }
+            }
         }
-        Response::Blob(Some(data)) => {
-            send_u8(send, RSP_BLOB).await?;
-            send_u32_be(send, data.len() as u32).await?;
-            send.write_all(&data).await.map_err(|e| anyhow!("send: {e}"))?;
-        }
-        Response::Blob(None) => {
-            send_u8(send, RSP_MISSING).await?;
-        }
-        Response::Children(children) => {
-            for (hash, data) in &children {
-                send_u8(send, RSP_BLOB).await?;
-                send_hash(send, hash).await?;
-                send_u32_be(send, data.len() as u32).await?;
-                send.write_all(data).await.map_err(|e| anyhow!("send: {e}"))?;
+
+        OP_CHILDREN => {
+            let parent_hash = recv_hash(recv).await?;
+            let have_count = recv_u32_be(recv).await? as usize;
+            let mut have_set = std::collections::HashSet::with_capacity(have_count);
+            for _ in 0..have_count {
+                have_set.insert(recv_hash(recv).await?);
+            }
+            // Grab reader, lock released. All blob access via reader.
+            let reader = store.lock().unwrap().reader().map_err(|e| anyhow!("reader: {e:?}"))?;
+            let parent_handle = Value::<Handle<Blake3, UnknownBlob>>::new(parent_hash);
+            if let Ok(parent_blob) = reader.get::<Bytes, UnknownBlob>(parent_handle) {
+                let parent_data: &[u8] = parent_blob.as_ref();
+                for chunk in parent_data.chunks(32) {
+                    if chunk.len() == 32 {
+                        let mut candidate = [0u8; 32];
+                        candidate.copy_from_slice(chunk);
+                        if !have_set.contains(&candidate) {
+                            let h = Value::<Handle<Blake3, UnknownBlob>>::new(candidate);
+                            if let Ok(data) = reader.get::<Bytes, UnknownBlob>(h) {
+                                let bytes: Vec<u8> = data.to_vec();
+                                send_u8(send, RSP_BLOB).await?;
+                                send_hash(send, &candidate).await?;
+                                send_u32_be(send, bytes.len() as u32).await?;
+                                send.write_all(&bytes).await.map_err(|e| anyhow!("send: {e}"))?;
+                            }
+                        }
+                    }
+                }
             }
             send_u8(send, RSP_END).await?;
         }
-        Response::Unknown => {}
+
+        _ => {}
     }
     Ok(())
 }
@@ -421,13 +379,13 @@ where
                 Ok(pair) => pair,
                 Err(_) => break,
             };
-            // Process on the accept task — no spawn needed since one-stream-per-op
-            // means each stream is short-lived. The lock is only held during
-            // the synchronous data collection, not across network I/O.
-            if let Err(e) = serve_one_stream(&inner, &mut send, &mut recv).await {
-                eprintln!("handler error: {e}");
-            }
-            let _ = send.finish();
+            let inner = inner.clone();
+            tokio::spawn(async move {
+                if let Err(e) = serve_one_stream(&inner, &mut send, &mut recv).await {
+                    eprintln!("handler error: {e}");
+                }
+                let _ = send.finish();
+            });
         }
         Ok(())
     }
