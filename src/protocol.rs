@@ -25,7 +25,9 @@ pub const RSP_BLOB: u8 = 0x01;
 pub const RSP_MISSING: u8 = 0x02;
 pub const RSP_HEAD_OK: u8 = 0x03;
 pub const RSP_NONE: u8 = 0x04;
-pub const RSP_END: u8 = 0x00;   // end of list/children sequence
+pub const RSP_END: u8 = 0x00;       // end of list/children sequence
+pub const RSP_CAS_OK: u8 = 0x05;    // CAS_PUSH succeeded
+pub const RSP_CAS_CONFLICT: u8 = 0x06; // CAS_PUSH conflict, followed by current head:32
 
 pub type RawHash = [u8; 32];
 pub type RawBranchId = [u8; 16];
@@ -128,6 +130,36 @@ pub async fn op_get_blob(conn: &Connection, hash: &RawHash) -> Result<Option<Vec
         }
         RSP_MISSING => Ok(None),
         _ => Err(anyhow!("unexpected blob response: {rsp}")),
+    }
+}
+
+/// CAS_PUSH: compare-and-swap a branch head on the remote.
+/// Returns Ok(true) on success, Ok(false) + current head on conflict.
+pub async fn op_cas_push(
+    conn: &Connection,
+    branch_id: &RawBranchId,
+    old: Option<&RawHash>,
+    new: &RawHash,
+) -> Result<std::result::Result<(), RawHash>> {
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
+    send_u8(&mut send, OP_CAS_PUSH).await?;
+    send_branch_id(&mut send, branch_id).await?;
+    // old: 32 bytes, zero = "create new branch"
+    match old {
+        Some(h) => send_hash(&mut send, h).await?,
+        None => send_hash(&mut send, &[0u8; 32]).await?,
+    }
+    send_hash(&mut send, new).await?;
+    send.finish().map_err(|e| anyhow!("finish: {e}"))?;
+
+    let rsp = recv_u8(&mut recv).await?;
+    match rsp {
+        RSP_CAS_OK => Ok(Ok(())),
+        RSP_CAS_CONFLICT => {
+            let current = recv_hash(&mut recv).await?;
+            Ok(Err(current))
+        }
+        _ => Err(anyhow!("unexpected cas_push response: {rsp}")),
     }
 }
 

@@ -79,9 +79,7 @@ where
         let inner = Arc::new(Mutex::new(self.inner));
         let rt = tokio::runtime::Handle::current();
 
-        let handler = StoreHandler { inner: inner.clone() };
-        let mut router_builder = Router::builder(ep.clone())
-            .accept(PILE_SYNC_ALPN, handler);
+        let mut router_builder = Router::builder(ep.clone());
 
         // DHT.
         let dht_api = if !self.dht_bootstrap.is_empty() {
@@ -127,6 +125,13 @@ where
         } else {
             None
         };
+
+        // Handler — created after gossip so it can carry the sender.
+        let handler = StoreHandler {
+            inner: inner.clone(),
+            gossip_sender: gossip_sender.clone(),
+        };
+        router_builder = router_builder.accept(PILE_SYNC_ALPN, handler);
 
         let router = router_builder.spawn();
 
@@ -250,6 +255,7 @@ where
 #[derive(Clone)]
 struct StoreHandler<S> {
     inner: Arc<Mutex<S>>,
+    gossip_sender: Option<GossipSender>,
 }
 
 /// Serve one stream using a reader snapshot.
@@ -259,6 +265,7 @@ struct StoreHandler<S> {
 /// No lock held across any await point.
 async fn serve_one_stream<S>(
     store: &Arc<Mutex<S>>,
+    gossip: &Option<GossipSender>,
     send: &mut iroh::endpoint::SendStream,
     recv: &mut iroh::endpoint::RecvStream,
 ) -> Result<()>
@@ -267,7 +274,8 @@ where
 {
     use crate::protocol::*;
     use triblespace_core::blob::schemas::UnknownBlob;
-    use triblespace_core::repo::BlobStoreGet;
+    use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
+    use triblespace_core::repo::{BlobStoreGet, PushResult};
     use anybytes::Bytes;
 
     let op = recv_u8(recv).await?;
@@ -357,6 +365,56 @@ where
             send_u8(send, RSP_END).await?;
         }
 
+        OP_CAS_PUSH => {
+            // Phase 1: read request (async).
+            let branch_id_bytes = recv_branch_id(recv).await?;
+            let old_hash = recv_hash(recv).await?;
+            let new_hash = recv_hash(recv).await?;
+
+            // Phase 2: CAS under lock (sync).
+            let result = {
+                let Some(branch_id) = Id::new(branch_id_bytes) else {
+                    send_u8(send, RSP_NONE).await?;
+                    return Ok(());
+                };
+                let old = if old_hash == [0u8; 32] {
+                    None
+                } else {
+                    Some(Value::<Handle<Blake3, SimpleArchive>>::new(old_hash))
+                };
+                let new = Value::<Handle<Blake3, SimpleArchive>>::new(new_hash);
+                let mut guard = store.lock().unwrap();
+                guard.update(branch_id, old, Some(new))
+                    .map_err(|e| anyhow!("update: {e:?}"))
+            };
+
+            // Phase 3: respond + gossip (async).
+            match result {
+                Ok(PushResult::Success()) => {
+                    send_u8(send, RSP_CAS_OK).await?;
+                    // Gossip the new head.
+                    if let Some(sender) = gossip {
+                        let mut msg = Vec::with_capacity(1 + 16 + 32);
+                        msg.push(0x01);
+                        msg.extend_from_slice(&branch_id_bytes);
+                        msg.extend_from_slice(&new_hash);
+                        let sender = sender.clone();
+                        tokio::spawn(async move {
+                            let _ = sender.broadcast(msg.into()).await;
+                        });
+                    }
+                }
+                Ok(PushResult::Conflict(current)) => {
+                    send_u8(send, RSP_CAS_CONFLICT).await?;
+                    let hash = current.map(|h| h.raw).unwrap_or([0u8; 32]);
+                    send_hash(send, &hash).await?;
+                }
+                Err(_) => {
+                    send_u8(send, RSP_NONE).await?;
+                }
+            }
+        }
+
         _ => {}
     }
     Ok(())
@@ -380,8 +438,9 @@ where
                 Err(_) => break,
             };
             let inner = inner.clone();
+            let gossip = self.gossip_sender.clone();
             tokio::spawn(async move {
-                if let Err(e) = serve_one_stream(&inner, &mut send, &mut recv).await {
+                if let Err(e) = serve_one_stream(&inner, &gossip, &mut send, &mut recv).await {
                     eprintln!("handler error: {e}");
                 }
                 let _ = send.finish();
