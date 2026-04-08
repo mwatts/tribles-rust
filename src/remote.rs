@@ -186,11 +186,28 @@ impl BranchStore<Blake3> for RemoteStore {
 
     fn update(
         &mut self,
-        _id: Id,
-        _old: Option<Value<Handle<Blake3, SimpleArchive>>>,
-        _new: Option<Value<Handle<Blake3, SimpleArchive>>>,
+        id: Id,
+        old: Option<Value<Handle<Blake3, SimpleArchive>>>,
+        new: Option<Value<Handle<Blake3, SimpleArchive>>>,
     ) -> Result<PushResult<Blake3>, Self::UpdateError> {
-        // CAS_PUSH not implemented yet.
-        Err(RemoteError::Network("remote CAS_PUSH not yet supported".into()))
+        let new = new.ok_or(RemoteError::Network("delete not supported over network".into()))?;
+        let id_bytes: [u8; 16] = id.into();
+        let old_hash = old.map(|h| h.raw);
+
+        let result = self.rt.block_on(async {
+            op_cas_push(&self.conn, &id_bytes, old_hash.as_ref(), &new.raw).await
+        }).map_err(|e| RemoteError::Network(format!("{e}")))?;
+
+        match result {
+            Ok(()) => Ok(PushResult::Success()),
+            Err(current_hash) => {
+                let current = if current_hash == [0u8; 32] {
+                    None
+                } else {
+                    Some(Value::<Handle<Blake3, SimpleArchive>>::new(current_hash))
+                };
+                Ok(PushResult::Conflict(current))
+            }
+        }
     }
 }
