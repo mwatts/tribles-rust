@@ -1,28 +1,31 @@
 //! Binary wire protocol types and helpers.
 //!
-//! All messages are fixed-width headers + optional payload.
-//! No text encoding, no newlines — raw bytes throughout.
+//! One QUIC stream per operation. The first byte identifies the operation,
+//! followed by the request payload. The response follows on the same stream.
+//! Stream FIN signals completion — no explicit DONE framing needed.
+//!
+//! Operations:
+//!   LIST       → (branch_id:16, head:32)*  END
+//!   HEAD       branch_id:16 → hash:32 | NONE
+//!   GET_BLOB   hash:32 → len:32 data | MISSING
+//!   CHILDREN   parent:32 have_count:32 have* → (hash:32 len:32 data)* END
+//!   CAS_PUSH   (reserved)
 
-pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/1";
+pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/2";
 
-// Request types (client → server)
-pub const REQ_DONE: u8 = 0x00;
-pub const REQ_LIST: u8 = 0x01;
-pub const REQ_GET_BLOB: u8 = 0x02;
-pub const REQ_CHILDREN: u8 = 0x03;
-pub const REQ_HEAD: u8 = 0x04;
-pub const REQ_CAS_PUSH: u8 = 0x05;
+// Operation types — first byte on each stream.
+pub const OP_LIST: u8 = 0x01;
+pub const OP_GET_BLOB: u8 = 0x02;
+pub const OP_CHILDREN: u8 = 0x03;
+pub const OP_HEAD: u8 = 0x04;
+pub const OP_CAS_PUSH: u8 = 0x05;
 
-// Response types (server → client)
-pub const RSP_LIST_ENTRY: u8 = 0x01;
-pub const RSP_END_LIST: u8 = 0x02;
-pub const RSP_BLOB: u8 = 0x03;
-pub const RSP_MISSING: u8 = 0x04;
-pub const RSP_END_CHILDREN: u8 = 0x05;
-pub const RSP_HEAD_OK: u8 = 0x06;
-pub const RSP_NONE: u8 = 0x07;
-pub const RSP_CAS_OK: u8 = 0x08;
-pub const RSP_CAS_CONFLICT: u8 = 0x09;
+// Response markers (inline in the stream).
+pub const RSP_BLOB: u8 = 0x01;
+pub const RSP_MISSING: u8 = 0x02;
+pub const RSP_HEAD_OK: u8 = 0x03;
+pub const RSP_NONE: u8 = 0x04;
+pub const RSP_END: u8 = 0x00;   // end of list/children sequence
 
 pub type RawHash = [u8; 32];
 pub type RawBranchId = [u8; 16];
@@ -30,7 +33,7 @@ pub type RawBranchId = [u8; 16];
 // ── Send helpers ─────────────────────────────────────────────────────
 
 use anyhow::{Result, anyhow};
-use iroh::endpoint::{SendStream, RecvStream};
+use iroh::endpoint::{SendStream, RecvStream, Connection};
 
 pub async fn send_u8(send: &mut SendStream, v: u8) -> Result<()> {
     send.write_all(&[v]).await.map_err(|e| anyhow!("send: {e}"))
@@ -46,13 +49,6 @@ pub async fn send_branch_id(send: &mut SendStream, id: &RawBranchId) -> Result<(
 
 pub async fn send_u32_be(send: &mut SendStream, v: u32) -> Result<()> {
     send.write_all(&v.to_be_bytes()).await.map_err(|e| anyhow!("send: {e}"))
-}
-
-pub async fn send_blob(send: &mut SendStream, hash: &RawHash, data: &[u8]) -> Result<()> {
-    send_u8(send, RSP_BLOB).await?;
-    send_hash(send, hash).await?;
-    send_u32_be(send, data.len() as u32).await?;
-    send.write_all(data).await.map_err(|e| anyhow!("send: {e}"))
 }
 
 // ── Recv helpers ─────────────────────────────────────────────────────
@@ -81,10 +77,87 @@ pub async fn recv_u32_be(recv: &mut RecvStream) -> Result<u32> {
     Ok(u32::from_be_bytes(buf))
 }
 
-pub async fn recv_blob_data(recv: &mut RecvStream) -> Result<(RawHash, Vec<u8>)> {
-    let hash = recv_hash(recv).await?;
-    let len = recv_u32_be(recv).await? as usize;
-    let mut data = vec![0u8; len];
-    recv.read_exact(&mut data).await.map_err(|e| anyhow!("recv: {e}"))?;
-    Ok((hash, data))
+// ── Single-stream operations (client side) ───────────────────────────
+
+/// LIST: open stream, get all (branch_id, head_hash) pairs.
+pub async fn op_list(conn: &Connection) -> Result<Vec<(RawBranchId, RawHash)>> {
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
+    send_u8(&mut send, OP_LIST).await?;
+    send.finish().map_err(|e| anyhow!("finish: {e}"))?;
+
+    let mut branches = Vec::new();
+    loop {
+        let marker = recv_u8(&mut recv).await?;
+        if marker == RSP_END { break; }
+        let id = recv_branch_id(&mut recv).await?;
+        let head = recv_hash(&mut recv).await?;
+        branches.push((id, head));
+    }
+    Ok(branches)
+}
+
+/// HEAD: query head hash for a specific branch.
+pub async fn op_head(conn: &Connection, branch_id: &RawBranchId) -> Result<Option<RawHash>> {
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
+    send_u8(&mut send, OP_HEAD).await?;
+    send_branch_id(&mut send, branch_id).await?;
+    send.finish().map_err(|e| anyhow!("finish: {e}"))?;
+
+    let rsp = recv_u8(&mut recv).await?;
+    match rsp {
+        RSP_HEAD_OK => Ok(Some(recv_hash(&mut recv).await?)),
+        RSP_NONE => Ok(None),
+        _ => Err(anyhow!("unexpected head response: {rsp}")),
+    }
+}
+
+/// GET_BLOB: fetch a single blob by hash.
+pub async fn op_get_blob(conn: &Connection, hash: &RawHash) -> Result<Option<Vec<u8>>> {
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
+    send_u8(&mut send, OP_GET_BLOB).await?;
+    send_hash(&mut send, hash).await?;
+    send.finish().map_err(|e| anyhow!("finish: {e}"))?;
+
+    let rsp = recv_u8(&mut recv).await?;
+    match rsp {
+        RSP_BLOB => {
+            let len = recv_u32_be(&mut recv).await? as usize;
+            let mut data = vec![0u8; len];
+            recv.read_exact(&mut data).await.map_err(|e| anyhow!("recv: {e}"))?;
+            Ok(Some(data))
+        }
+        RSP_MISSING => Ok(None),
+        _ => Err(anyhow!("unexpected blob response: {rsp}")),
+    }
+}
+
+/// CHILDREN: given a parent blob and a HAVE set, receive missing children.
+/// Returns (hash, data) pairs for each child blob.
+pub async fn op_children(
+    conn: &Connection,
+    parent: &RawHash,
+    have: &[RawHash],
+) -> Result<Vec<(RawHash, Vec<u8>)>> {
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
+    send_u8(&mut send, OP_CHILDREN).await?;
+    send_hash(&mut send, parent).await?;
+    send_u32_be(&mut send, have.len() as u32).await?;
+    for h in have {
+        send_hash(&mut send, h).await?;
+    }
+    send.finish().map_err(|e| anyhow!("finish: {e}"))?;
+
+    let mut blobs = Vec::new();
+    loop {
+        let marker = recv_u8(&mut recv).await?;
+        if marker == RSP_END { break; }
+        if marker == RSP_BLOB {
+            let hash = recv_hash(&mut recv).await?;
+            let len = recv_u32_be(&mut recv).await? as usize;
+            let mut data = vec![0u8; len];
+            recv.read_exact(&mut data).await.map_err(|e| anyhow!("recv: {e}"))?;
+            blobs.push((hash, data));
+        }
+    }
+    Ok(blobs)
 }

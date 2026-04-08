@@ -2,6 +2,7 @@
 //!
 //! All operations use triblespace traits — no Pile dependency.
 //! Branch identification is by ID. Name resolution is a separate step.
+//! Each protocol operation gets its own QUIC stream — no multiplexing.
 
 use std::collections::HashSet;
 
@@ -48,11 +49,9 @@ pub async fn resolve_and_sync<S>(
 where
     S: BlobStore<Blake3> + BlobStorePut<Blake3> + BranchStore<Blake3>,
 {
-    // Remote: resolve name → id.
     let (remote_id, _head) = resolve_branch_name(conn, branch_name).await?
         .ok_or_else(|| anyhow!("branch '{branch_name}' not found on remote"))?;
 
-    // Local: ensure branch exists, get its id.
     let mut repo = Repository::new(local, signing_key.clone(), TribleSet::new())
         .map_err(|e| anyhow!("repo: {e:?}"))?;
     let local_id = repo.ensure_branch(branch_name, None)
@@ -63,111 +62,50 @@ where
 }
 
 /// Resolve a branch name to its ID by fetching metadata from a remote.
-///
-/// Lists branches, fetches each branch's metadata blob, reads the name,
-/// and returns the first match.
 pub async fn resolve_branch_name(
     conn: &Connection,
     name: &str,
 ) -> Result<Option<(Id, RawHash)>> {
-    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
+    let branches = op_list(conn).await?;
 
-    send_u8(&mut send, REQ_LIST).await?;
-    let mut branches: Vec<(Id, RawHash)> = Vec::new();
-    loop {
-        let rsp = recv_u8(&mut recv).await?;
-        match rsp {
-            RSP_LIST_ENTRY => {
-                let id_bytes = recv_branch_id(&mut recv).await?;
-                let head = recv_hash(&mut recv).await?;
-                if let Some(id) = Id::new(id_bytes) {
-                    branches.push((id, head));
-                }
-            }
-            RSP_END_LIST => break,
-            _ => return Err(anyhow!("unexpected list response: {rsp}")),
-        }
-    }
+    for (id_bytes, head) in &branches {
+        let Some(id) = Id::new(*id_bytes) else { continue; };
 
-    for (id, head) in &branches {
-        send_u8(&mut send, REQ_GET_BLOB).await?;
-        send_hash(&mut send, head).await?;
-        let rsp = recv_u8(&mut recv).await?;
-        if rsp == RSP_BLOB {
-            let (_hash, data) = recv_blob_data(&mut recv).await?;
-            let blob: triblespace_core::blob::Blob<SimpleArchive> =
-                triblespace_core::blob::Blob::new(data.into());
-            if let Ok(meta) = <TribleSet as triblespace_core::blob::TryFromBlob<SimpleArchive>>::try_from_blob(blob) {
-                use triblespace_core::macros::{find, pattern};
-                for name_handle in find!(
-                    h: Value<Handle<Blake3, triblespace_core::blob::schemas::longstring::LongString>>,
-                    pattern!(&meta, [{ _?e @ triblespace_core::metadata::name: ?h }])
-                ) {
-                    send_u8(&mut send, REQ_GET_BLOB).await?;
-                    send_hash(&mut send, &name_handle.raw).await?;
-                    let rsp2 = recv_u8(&mut recv).await?;
-                    if rsp2 == RSP_BLOB {
-                        let (_h2, name_data) = recv_blob_data(&mut recv).await?;
-                        if let Ok(n) = std::str::from_utf8(&name_data) {
-                            if n == name {
-                                send_u8(&mut send, REQ_DONE).await?;
-                                send.finish().map_err(|e| anyhow!("finish: {e}"))?;
-                                return Ok(Some((*id, *head)));
-                            }
-                        }
-                    }
+        // Fetch branch metadata blob.
+        let Some(meta_data) = op_get_blob(conn, head).await? else { continue; };
+        let blob: triblespace_core::blob::Blob<SimpleArchive> =
+            triblespace_core::blob::Blob::new(meta_data.into());
+        let Ok(meta) = <TribleSet as triblespace_core::blob::TryFromBlob<SimpleArchive>>::try_from_blob(blob) else { continue; };
+
+        use triblespace_core::macros::{find, pattern};
+        for name_handle in find!(
+            h: Value<Handle<Blake3, triblespace_core::blob::schemas::longstring::LongString>>,
+            pattern!(&meta, [{ _?e @ triblespace_core::metadata::name: ?h }])
+        ) {
+            // Fetch the name string blob.
+            let Some(name_data) = op_get_blob(conn, &name_handle.raw).await? else { continue; };
+            if let Ok(n) = std::str::from_utf8(&name_data) {
+                if n == name {
+                    return Ok(Some((id, *head)));
                 }
             }
         }
     }
-
-    send_u8(&mut send, REQ_DONE).await?;
-    send.finish().map_err(|e| anyhow!("finish: {e}"))?;
     Ok(None)
 }
 
 /// List remote branches: returns (branch_id, head_hash) pairs.
 pub async fn list_branches(conn: &Connection) -> Result<Vec<(Id, RawHash)>> {
-    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
-    send_u8(&mut send, REQ_LIST).await?;
-
-    let mut branches = Vec::new();
-    loop {
-        let rsp = recv_u8(&mut recv).await?;
-        match rsp {
-            RSP_LIST_ENTRY => {
-                let id_bytes = recv_branch_id(&mut recv).await?;
-                let head = recv_hash(&mut recv).await?;
-                if let Some(id) = Id::new(id_bytes) {
-                    branches.push((id, head));
-                }
-            }
-            RSP_END_LIST => break,
-            _ => return Err(anyhow!("unexpected list response: {rsp}")),
-        }
-    }
-    send_u8(&mut send, REQ_DONE).await?;
-    send.finish().map_err(|e| anyhow!("finish: {e}"))?;
-    Ok(branches)
+    let raw = op_list(conn).await?;
+    Ok(raw.into_iter()
+        .filter_map(|(id_bytes, head)| Id::new(id_bytes).map(|id| (id, head)))
+        .collect())
 }
 
 /// Query a remote peer's head for a specific branch.
 pub async fn remote_head(conn: &Connection, branch_id: Id) -> Result<Option<RawHash>> {
-    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
-    send_u8(&mut send, REQ_HEAD).await?;
     let id_bytes: [u8; 16] = branch_id.into();
-    send_branch_id(&mut send, &id_bytes).await?;
-
-    let rsp = recv_u8(&mut recv).await?;
-    let result = match rsp {
-        RSP_HEAD_OK => Some(recv_hash(&mut recv).await?),
-        RSP_NONE => None,
-        _ => return Err(anyhow!("unexpected head response: {rsp}")),
-    };
-
-    send_u8(&mut send, REQ_DONE).await?;
-    send.finish().map_err(|e| anyhow!("finish: {e}"))?;
-    Ok(result)
+    op_head(conn, &id_bytes).await
 }
 
 /// Sync a branch by ID, consuming the store and returning it.
@@ -175,8 +113,7 @@ pub async fn remote_head(conn: &Connection, branch_id: Id) -> Result<Option<RawH
 /// `remote_branch_id`: which branch to read from the remote.
 /// `local_branch_id`: which branch to merge into locally.
 ///
-/// These may be different IDs — branch IDs are local to each pile.
-/// The caller resolves names to IDs on each side before calling this.
+/// Each protocol operation gets its own QUIC stream.
 pub async fn sync_branch<S>(
     conn: &Connection,
     mut local: S,
@@ -187,28 +124,15 @@ pub async fn sync_branch<S>(
 where
     S: BlobStore<Blake3> + BlobStorePut<Blake3> + BranchStore<Blake3>,
 {
-    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
-
-    // Get remote head for this branch.
-    send_u8(&mut send, REQ_HEAD).await?;
+    // Get remote head.
     let id_bytes: [u8; 16] = remote_branch_id.into();
-    send_branch_id(&mut send, &id_bytes).await?;
-
-    let rsp = recv_u8(&mut recv).await?;
-    let remote_head = match rsp {
-        RSP_HEAD_OK => recv_hash(&mut recv).await?,
-        RSP_NONE => {
-            send_u8(&mut send, REQ_DONE).await?;
-            send.finish().map_err(|e| anyhow!("finish: {e}"))?;
-            return Ok((local, SyncResult { blobs_fetched: 0, bytes_fetched: 0 }));
-        }
-        _ => return Err(anyhow!("unexpected head response: {rsp}")),
+    let remote_head = match op_head(conn, &id_bytes).await? {
+        Some(h) => h,
+        None => return Ok((local, SyncResult { blobs_fetched: 0, bytes_fetched: 0 })),
     };
 
     // Already up to date?
     if has_blob(&mut local, &remote_head) {
-        send_u8(&mut send, REQ_DONE).await?;
-        send.finish().map_err(|e| anyhow!("finish: {e}"))?;
         return Ok((local, SyncResult { blobs_fetched: 0, bytes_fetched: 0 }));
     }
 
@@ -216,17 +140,13 @@ where
     let mut fetched_bytes = 0usize;
 
     // Fetch head blob.
-    send_u8(&mut send, REQ_GET_BLOB).await?;
-    send_hash(&mut send, &remote_head).await?;
-    let rsp = recv_u8(&mut recv).await?;
-    if rsp == RSP_BLOB {
-        let (_hash, data) = recv_blob_data(&mut recv).await?;
+    if let Some(data) = op_get_blob(conn, &remote_head).await? {
         fetched += 1;
         fetched_bytes += data.len();
         put_blob(&mut local, data)?;
     }
 
-    // BFS level by level with SYNC batches.
+    // BFS level by level using CHILDREN.
     let mut current_level = vec![remote_head];
     let mut seen: HashSet<RawHash> = HashSet::new();
     seen.insert(remote_head);
@@ -235,6 +155,7 @@ where
         let mut next_level: Vec<RawHash> = Vec::new();
 
         for parent_hash in &current_level {
+            // Build HAVE set: references we already have locally.
             let mut have: Vec<RawHash> = Vec::new();
             if let Some(data) = get_blob(&mut local, parent_hash) {
                 for chunk in data.chunks(VALUE_LEN) {
@@ -248,32 +169,19 @@ where
                 }
             }
 
-            send_u8(&mut send, REQ_CHILDREN).await?;
-            send_hash(&mut send, parent_hash).await?;
-            send_u32_be(&mut send, have.len() as u32).await?;
-            for h in &have {
-                send_hash(&mut send, h).await?;
-            }
-
-            loop {
-                let rsp = recv_u8(&mut recv).await?;
-                match rsp {
-                    RSP_BLOB => {
-                        let (hash, data) = recv_blob_data(&mut recv).await?;
-                        fetched += 1;
-                        fetched_bytes += data.len();
-                        put_blob(&mut local, data)?;
-                        next_level.push(hash);
-                    }
-                    RSP_END_CHILDREN => break,
-                    _ => return Err(anyhow!("unexpected sync response: {rsp}")),
-                }
+            // CHILDREN: one stream, one round-trip per BFS level.
+            let children = op_children(conn, parent_hash, &have).await?;
+            for (hash, data) in children {
+                fetched += 1;
+                fetched_bytes += data.len();
+                put_blob(&mut local, data)?;
+                next_level.push(hash);
             }
         }
         current_level = next_level;
     }
 
-    // Merge: read the remote branch metadata to find the actual commit hash.
+    // Merge: extract commit hash from branch metadata, adopt into local branch.
     let branch_meta_handle = Value::<Handle<Blake3, SimpleArchive>>::new(remote_head);
     {
         let reader = local.reader().map_err(|e| anyhow!("reader: {e:?}"))?;
@@ -292,9 +200,6 @@ where
         repo.push(&mut ws).map_err(|_| anyhow!("push failed"))?;
         local = repo.into_storage();
     }
-
-    send_u8(&mut send, REQ_DONE).await?;
-    send.finish().map_err(|e| anyhow!("finish: {e}"))?;
 
     Ok((local, SyncResult { blobs_fetched: fetched, bytes_fetched: fetched_bytes }))
 }

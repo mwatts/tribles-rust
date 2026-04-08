@@ -13,10 +13,6 @@
 //! layer is async (CLI's `Runtime::block_on`) but the library internals
 //! are trait-based and sync.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-
-use anybytes::Bytes;
 use iroh::endpoint::Connection;
 use triblespace_core::blob::{Blob, BlobSchema, TryFromBlob};
 use triblespace_core::blob::schemas::UnknownBlob;
@@ -59,35 +55,12 @@ impl RemoteStore {
         Self { conn, rt }
     }
 
-    /// Fetch a raw blob by hash over the network.
+    /// Fetch a raw blob by hash (one QUIC stream per call).
     fn fetch_blob(&self, hash: &RawHash) -> Result<Vec<u8>, RemoteError> {
         self.rt.block_on(async {
-            let (mut send, mut recv) = self.conn.open_bi().await
-                .map_err(|e| RemoteError::Network(format!("open_bi: {e}")))?;
-
-            send_u8(&mut send, REQ_GET_BLOB).await
-                .map_err(|e| RemoteError::Network(format!("{e}")))?;
-            send_hash(&mut send, hash).await
-                .map_err(|e| RemoteError::Network(format!("{e}")))?;
-
-            let rsp = recv_u8(&mut recv).await
-                .map_err(|e| RemoteError::Network(format!("{e}")))?;
-
-            match rsp {
-                RSP_BLOB => {
-                    let (_h, data) = recv_blob_data(&mut recv).await
-                        .map_err(|e| RemoteError::Network(format!("{e}")))?;
-                    send_u8(&mut send, REQ_DONE).await.ok();
-                    send.finish().ok();
-                    Ok(data)
-                }
-                RSP_MISSING => {
-                    send_u8(&mut send, REQ_DONE).await.ok();
-                    send.finish().ok();
-                    Err(RemoteError::NotFound)
-                }
-                _ => Err(RemoteError::Network(format!("unexpected response: {rsp}"))),
-            }
+            op_get_blob(&self.conn, hash).await
+                .map_err(|e| RemoteError::Network(format!("{e}")))?
+                .ok_or(RemoteError::NotFound)
         })
     }
 }
@@ -165,30 +138,13 @@ impl BlobChildren<Blake3> for RemoteStore {
         handle: Value<Handle<Blake3, UnknownBlob>>,
     ) -> Vec<Value<Handle<Blake3, UnknownBlob>>> {
         self.rt.block_on(async {
-            let Ok((mut send, mut recv)) = self.conn.open_bi().await else {
-                return Vec::new();
-            };
-
-            // SYNC with empty HAVE set = "give me all children"
-            if send_u8(&mut send, REQ_CHILDREN).await.is_err() { return Vec::new(); }
-            if send_hash(&mut send, &handle.raw).await.is_err() { return Vec::new(); }
-            if send_u32_be(&mut send, 0).await.is_err() { return Vec::new(); }
-
-            let mut children = Vec::new();
-            loop {
-                let Ok(rsp) = recv_u8(&mut recv).await else { break; };
-                match rsp {
-                    RSP_BLOB => {
-                        let Ok((hash, _data)) = recv_blob_data(&mut recv).await else { break; };
-                        children.push(Value::<Handle<Blake3, UnknownBlob>>::new(hash));
-                    }
-                    RSP_END_CHILDREN => break,
-                    _ => break,
-                }
+            // CHILDREN with empty HAVE set = "give me all children"
+            match op_children(&self.conn, &handle.raw, &[]).await {
+                Ok(blobs) => blobs.into_iter()
+                    .map(|(hash, _data)| Value::<Handle<Blake3, UnknownBlob>>::new(hash))
+                    .collect(),
+                Err(_) => Vec::new(),
             }
-            send_u8(&mut send, REQ_DONE).await.ok();
-            send.finish().ok();
-            children
         })
     }
 }
@@ -211,15 +167,18 @@ impl BranchStore<Blake3> for RemoteStore {
 
     fn branches<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::BranchesError> {
         let branches = self.rt.block_on(async {
-            crate::sync::list_branches(&self.conn).await
+            op_list(&self.conn).await
         }).map_err(|e| RemoteError::Network(format!("{e}")))?;
 
-        Ok(branches.into_iter().map(|(id, _head)| Ok(id)).collect::<Vec<_>>().into_iter())
+        Ok(branches.into_iter()
+            .filter_map(|(id_bytes, _head)| Id::new(id_bytes).map(|id| Ok(id)))
+            .collect::<Vec<_>>().into_iter())
     }
 
     fn head(&mut self, id: Id) -> Result<Option<Value<Handle<Blake3, SimpleArchive>>>, Self::HeadError> {
+        let id_bytes: [u8; 16] = id.into();
         let result = self.rt.block_on(async {
-            crate::sync::remote_head(&self.conn, id).await
+            op_head(&self.conn, &id_bytes).await
         }).map_err(|e| RemoteError::Network(format!("{e}")))?;
 
         Ok(result.map(|hash| Value::<Handle<Blake3, SimpleArchive>>::new(hash)))
