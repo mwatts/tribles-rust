@@ -4719,6 +4719,7 @@ dependencies = [
  "iroh-dht",
  "iroh-gossip",
  "irpc-iroh",
+ "parking_lot",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
