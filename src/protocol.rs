@@ -11,7 +11,7 @@
 //! Operations:
 //!   LIST       → (id:16 head:32)* nil_id:16         (48-byte aligned entries)
 //!   HEAD       id:16 → hash:32                      (nil = no head)
-//!   GET_BLOB   hash:32 → len:32 data | nil:32       (nil = missing)
+//!   GET_BLOB   hash:32 → len:u64 data                (u64::MAX = missing)
 //!   CHILDREN   parent:32 count:32 have* → hash* nil  (nil = end)
 //!   CAS_PUSH   id:16 old:32 new:32 → ok:1 hash:32   (ok=1 success, ok=0 conflict)
 
@@ -51,6 +51,10 @@ pub async fn send_u32_be(send: &mut SendStream, v: u32) -> Result<()> {
     send.write_all(&v.to_be_bytes()).await.map_err(|e| anyhow!("send: {e}"))
 }
 
+pub async fn send_u64_be(send: &mut SendStream, v: u64) -> Result<()> {
+    send.write_all(&v.to_be_bytes()).await.map_err(|e| anyhow!("send: {e}"))
+}
+
 pub async fn recv_u8(recv: &mut RecvStream) -> Result<u8> {
     let mut buf = [0u8; 1];
     recv.read_exact(&mut buf).await.map_err(|e| anyhow!("recv: {e}"))?;
@@ -73,6 +77,12 @@ pub async fn recv_u32_be(recv: &mut RecvStream) -> Result<u32> {
     let mut buf = [0u8; 4];
     recv.read_exact(&mut buf).await.map_err(|e| anyhow!("recv: {e}"))?;
     Ok(u32::from_be_bytes(buf))
+}
+
+pub async fn recv_u64_be(recv: &mut RecvStream) -> Result<u64> {
+    let mut buf = [0u8; 8];
+    recv.read_exact(&mut buf).await.map_err(|e| anyhow!("recv: {e}"))?;
+    Ok(u64::from_be_bytes(buf))
 }
 
 // ── Single-stream operations (client side) ───────────────────────────
@@ -104,15 +114,17 @@ pub async fn op_head(conn: &Connection, branch_id: &RawBranchId) -> Result<Optio
     if hash == NIL_HASH { Ok(None) } else { Ok(Some(hash)) }
 }
 
-/// GET_BLOB: fetch a single blob by hash. Nil hash response = missing.
+/// GET_BLOB: fetch a single blob by hash.
+/// Response: len:u64 + data. len=u64::MAX means missing.
+/// Supports empty blobs (len=0) and blobs up to 2^64-2 bytes.
 pub async fn op_get_blob(conn: &Connection, hash: &RawHash) -> Result<Option<Vec<u8>>> {
     let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
     send_u8(&mut send, OP_GET_BLOB).await?;
     send_hash(&mut send, hash).await?;
     send.finish().map_err(|e| anyhow!("finish: {e}"))?;
 
-    let len = recv_u32_be(&mut recv).await?;
-    if len == 0 { return Ok(None); }
+    let len = recv_u64_be(&mut recv).await?;
+    if len == u64::MAX { return Ok(None); }
     let mut data = vec![0u8; len as usize];
     recv.read_exact(&mut data).await.map_err(|e| anyhow!("recv: {e}"))?;
     Ok(Some(data))

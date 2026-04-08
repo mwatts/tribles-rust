@@ -318,10 +318,10 @@ where
             match reader.get::<Bytes, UnknownBlob>(handle) {
                 Ok(data) => {
                     let bytes: Vec<u8> = data.to_vec();
-                    send_u32_be(send, bytes.len() as u32).await?;
+                    send_u64_be(send, bytes.len() as u64).await?;
                     send.write_all(&bytes).await.map_err(|e| anyhow!("send: {e}"))?;
                 }
-                Err(_) => { send_u32_be(send, 0).await?; }
+                Err(_) => { send_u64_be(send, u64::MAX).await?; }
             }
         }
 

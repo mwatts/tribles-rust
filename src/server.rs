@@ -55,10 +55,10 @@ where
             let hash = recv_hash(recv).await?;
             match get_blob(store, &hash) {
                 Some(data) => {
-                    send_u32_be(send, data.len() as u32).await?;
+                    send_u64_be(send, data.len() as u64).await?;
                     send.write_all(&data).await.map_err(|e| anyhow!("send: {e}"))?;
                 }
-                None => send_u32_be(send, 0).await?,
+                None => send_u64_be(send, u64::MAX).await?,
             }
         }
 
