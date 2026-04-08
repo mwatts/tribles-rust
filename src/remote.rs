@@ -22,7 +22,7 @@ use triblespace_core::blob::{Blob, BlobSchema, TryFromBlob};
 use triblespace_core::blob::schemas::UnknownBlob;
 use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
 use triblespace_core::id::Id;
-use triblespace_core::repo::{BlobStoreGet, BlobStoreList, BranchStore, PushResult};
+use triblespace_core::repo::{BlobChildren, BlobStoreGet, BlobStoreList, BranchStore, PushResult};
 use triblespace_core::value::Value;
 use triblespace_core::value::schemas::hash::{Blake3, Handle};
 use triblespace_core::value::ValueSchema;
@@ -151,6 +151,54 @@ impl BlobStoreList<Blake3> for RemoteReader {
         // Remote listing not supported via this interface.
         // Use list_branches() for branch enumeration.
         std::iter::empty()
+    }
+}
+
+/// Optimized children enumeration using the SYNC protocol.
+///
+/// Instead of fetching each candidate individually (N round-trips),
+/// sends one SYNC request with an empty HAVE set and receives all
+/// children in a single round-trip.
+impl BlobChildren<Blake3> for RemoteStore {
+    fn children(
+        &self,
+        handle: Value<Handle<Blake3, UnknownBlob>>,
+    ) -> Vec<Value<Handle<Blake3, UnknownBlob>>> {
+        self.rt.block_on(async {
+            let Ok((mut send, mut recv)) = self.conn.open_bi().await else {
+                return Vec::new();
+            };
+
+            // SYNC with empty HAVE set = "give me all children"
+            if send_u8(&mut send, REQ_SYNC).await.is_err() { return Vec::new(); }
+            if send_hash(&mut send, &handle.raw).await.is_err() { return Vec::new(); }
+            if send_u32_be(&mut send, 0).await.is_err() { return Vec::new(); }
+
+            let mut children = Vec::new();
+            loop {
+                let Ok(rsp) = recv_u8(&mut recv).await else { break; };
+                match rsp {
+                    RSP_BLOB => {
+                        let Ok((hash, _data)) = recv_blob_data(&mut recv).await else { break; };
+                        children.push(Value::<Handle<Blake3, UnknownBlob>>::new(hash));
+                    }
+                    RSP_END_SYNC => break,
+                    _ => break,
+                }
+            }
+            send_u8(&mut send, REQ_DONE).await.ok();
+            send.finish().ok();
+            children
+        })
+    }
+}
+
+impl BlobChildren<Blake3> for RemoteReader {
+    fn children(
+        &self,
+        handle: Value<Handle<Blake3, UnknownBlob>>,
+    ) -> Vec<Value<Handle<Blake3, UnknownBlob>>> {
+        self.store.children(handle)
     }
 }
 
