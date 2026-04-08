@@ -163,13 +163,14 @@ pub async fn op_cas_push(
     }
 }
 
-/// CHILDREN: given a parent blob and a HAVE set, receive missing children.
-/// Returns (hash, data) pairs for each child blob.
+/// CHILDREN: given a parent blob and a HAVE set, receive child hashes
+/// that the remote has but aren't in the HAVE set.
+/// Returns hashes only — blob data is fetched separately via GET_BLOB.
 pub async fn op_children(
     conn: &Connection,
     parent: &RawHash,
     have: &[RawHash],
-) -> Result<Vec<(RawHash, Vec<u8>)>> {
+) -> Result<Vec<RawHash>> {
     let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
     send_u8(&mut send, OP_CHILDREN).await?;
     send_hash(&mut send, parent).await?;
@@ -179,17 +180,11 @@ pub async fn op_children(
     }
     send.finish().map_err(|e| anyhow!("finish: {e}"))?;
 
-    let mut blobs = Vec::new();
+    let mut children = Vec::new();
     loop {
         let marker = recv_u8(&mut recv).await?;
         if marker == RSP_END { break; }
-        if marker == RSP_BLOB {
-            let hash = recv_hash(&mut recv).await?;
-            let len = recv_u32_be(&mut recv).await? as usize;
-            let mut data = vec![0u8; len];
-            recv.read_exact(&mut data).await.map_err(|e| anyhow!("recv: {e}"))?;
-            blobs.push((hash, data));
-        }
+        children.push(recv_hash(&mut recv).await?);
     }
-    Ok(blobs)
+    Ok(children)
 }

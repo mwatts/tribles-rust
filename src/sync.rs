@@ -169,13 +169,15 @@ where
                 }
             }
 
-            // CHILDREN: one stream, one round-trip per BFS level.
-            let children = op_children(conn, parent_hash, &have).await?;
-            for (hash, data) in children {
-                fetched += 1;
-                fetched_bytes += data.len();
-                put_blob(&mut local, data)?;
-                next_level.push(hash);
+            // CHILDREN: get missing child hashes, then fetch each blob.
+            let child_hashes = op_children(conn, parent_hash, &have).await?;
+            for hash in child_hashes {
+                if let Some(data) = op_get_blob(conn, &hash).await? {
+                    fetched += 1;
+                    fetched_bytes += data.len();
+                    put_blob(&mut local, data)?;
+                    next_level.push(hash);
+                }
             }
         }
         current_level = next_level;

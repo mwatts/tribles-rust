@@ -340,7 +340,7 @@ where
             for _ in 0..have_count {
                 have_set.insert(recv_hash(recv).await?);
             }
-            // Grab reader, lock released. All blob access via reader.
+            // Grab reader, lock released. Collect child hashes only.
             let reader = store.lock().unwrap().reader().map_err(|e| anyhow!("reader: {e:?}"))?;
             let parent_handle = Value::<Handle<Blake3, UnknownBlob>>::new(parent_hash);
             if let Ok(parent_blob) = reader.get::<Bytes, UnknownBlob>(parent_handle) {
@@ -351,12 +351,9 @@ where
                         candidate.copy_from_slice(chunk);
                         if !have_set.contains(&candidate) {
                             let h = Value::<Handle<Blake3, UnknownBlob>>::new(candidate);
-                            if let Ok(data) = reader.get::<Bytes, UnknownBlob>(h) {
-                                let bytes: Vec<u8> = data.to_vec();
+                            if reader.get::<Bytes, UnknownBlob>(h).is_ok() {
                                 send_u8(send, RSP_BLOB).await?;
                                 send_hash(send, &candidate).await?;
-                                send_u32_be(send, bytes.len() as u32).await?;
-                                send.write_all(&bytes).await.map_err(|e| anyhow!("send: {e}"))?;
                             }
                         }
                     }
