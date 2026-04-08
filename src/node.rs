@@ -282,7 +282,6 @@ where
 
     match op {
         OP_LIST => {
-            // Lock: collect branch entries. Unlock: send them.
             let entries: Vec<([u8; 16], [u8; 32])> = {
                 let mut guard = store.lock().unwrap();
                 let ids: Vec<Id> = guard.branches()
@@ -298,38 +297,31 @@ where
                 out
             };
             for (id_bytes, head) in &entries {
-                send_u8(send, RSP_BLOB).await?;
                 send_branch_id(send, id_bytes).await?;
                 send_hash(send, head).await?;
             }
-            send_u8(send, RSP_END).await?;
+            send_branch_id(send, &NIL_BRANCH_ID).await?;
         }
 
         OP_HEAD => {
             let id_bytes = recv_branch_id(recv).await?;
-            // Lock briefly for head lookup.
             let hash = Id::new(id_bytes).and_then(|bid| {
                 store.lock().unwrap().head(bid).ok().flatten().map(|h| h.raw)
-            });
-            match hash {
-                Some(h) => { send_u8(send, RSP_HEAD_OK).await?; send_hash(send, &h).await?; }
-                None => { send_u8(send, RSP_NONE).await?; }
-            }
+            }).unwrap_or(NIL_HASH);
+            send_hash(send, &hash).await?;
         }
 
         OP_GET_BLOB => {
             let hash = recv_hash(recv).await?;
-            // Grab reader snapshot, lock released immediately.
             let reader = store.lock().unwrap().reader().map_err(|e| anyhow!("reader: {e:?}"))?;
             let handle = Value::<Handle<Blake3, UnknownBlob>>::new(hash);
             match reader.get::<Bytes, UnknownBlob>(handle) {
                 Ok(data) => {
                     let bytes: Vec<u8> = data.to_vec();
-                    send_u8(send, RSP_BLOB).await?;
                     send_u32_be(send, bytes.len() as u32).await?;
                     send.write_all(&bytes).await.map_err(|e| anyhow!("send: {e}"))?;
                 }
-                Err(_) => { send_u8(send, RSP_MISSING).await?; }
+                Err(_) => { send_u32_be(send, 0).await?; }
             }
         }
 
@@ -340,7 +332,6 @@ where
             for _ in 0..have_count {
                 have_set.insert(recv_hash(recv).await?);
             }
-            // Grab reader, lock released. Collect child hashes only.
             let reader = store.lock().unwrap().reader().map_err(|e| anyhow!("reader: {e:?}"))?;
             let parent_handle = Value::<Handle<Blake3, UnknownBlob>>::new(parent_hash);
             if let Ok(parent_blob) = reader.get::<Bytes, UnknownBlob>(parent_handle) {
@@ -358,37 +349,31 @@ where
                     }
                 }
             }
-            send_hash(send, &[0u8; 32]).await?;
+            send_hash(send, &NIL_HASH).await?;
         }
 
         OP_CAS_PUSH => {
-            // Phase 1: read request (async).
             let branch_id_bytes = recv_branch_id(recv).await?;
             let old_hash = recv_hash(recv).await?;
             let new_hash = recv_hash(recv).await?;
 
-            // Phase 2: CAS under lock (sync).
             let result = {
                 let Some(branch_id) = Id::new(branch_id_bytes) else {
-                    send_u8(send, RSP_NONE).await?;
+                    send_u8(send, 0).await?;
+                    send_hash(send, &NIL_HASH).await?;
                     return Ok(());
                 };
-                let old = if old_hash == [0u8; 32] {
-                    None
-                } else {
-                    Some(Value::<Handle<Blake3, SimpleArchive>>::new(old_hash))
-                };
+                let old = if old_hash == NIL_HASH { None }
+                    else { Some(Value::<Handle<Blake3, SimpleArchive>>::new(old_hash)) };
                 let new = Value::<Handle<Blake3, SimpleArchive>>::new(new_hash);
                 let mut guard = store.lock().unwrap();
                 guard.update(branch_id, old, Some(new))
                     .map_err(|e| anyhow!("update: {e:?}"))
             };
 
-            // Phase 3: respond + gossip (async).
             match result {
                 Ok(PushResult::Success()) => {
-                    send_u8(send, RSP_CAS_OK).await?;
-                    // Gossip the new head.
+                    send_u8(send, 1).await?;
                     if let Some(sender) = gossip {
                         let mut msg = Vec::with_capacity(1 + 16 + 32);
                         msg.push(0x01);
@@ -401,12 +386,12 @@ where
                     }
                 }
                 Ok(PushResult::Conflict(current)) => {
-                    send_u8(send, RSP_CAS_CONFLICT).await?;
-                    let hash = current.map(|h| h.raw).unwrap_or([0u8; 32]);
-                    send_hash(send, &hash).await?;
+                    send_u8(send, 0).await?;
+                    send_hash(send, &current.map(|h| h.raw).unwrap_or(NIL_HASH)).await?;
                 }
                 Err(_) => {
-                    send_u8(send, RSP_NONE).await?;
+                    send_u8(send, 0).await?;
+                    send_hash(send, &NIL_HASH).await?;
                 }
             }
         }

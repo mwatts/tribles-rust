@@ -36,38 +36,29 @@ where
             for id in branch_ids {
                 if let Ok(Some(head)) = store.head(id) {
                     let id_bytes: [u8; 16] = id.into();
-                    send_u8(send, RSP_BLOB).await?; // reuse as "entry present" marker
                     send_branch_id(send, &id_bytes).await?;
                     send_hash(send, &head.raw).await?;
                 }
             }
-            send_u8(send, RSP_END).await?;
+            send_branch_id(send, &NIL_BRANCH_ID).await?;
         }
 
         OP_HEAD => {
             let id_bytes = recv_branch_id(recv).await?;
-            let Some(branch_id) = Id::new(id_bytes) else {
-                send_u8(send, RSP_NONE).await?;
-                return Ok(());
-            };
-            match store.head(branch_id) {
-                Ok(Some(head)) => {
-                    send_u8(send, RSP_HEAD_OK).await?;
-                    send_hash(send, &head.raw).await?;
-                }
-                _ => send_u8(send, RSP_NONE).await?,
-            }
+            let hash = Id::new(id_bytes)
+                .and_then(|bid| store.head(bid).ok().flatten().map(|h| h.raw))
+                .unwrap_or(NIL_HASH);
+            send_hash(send, &hash).await?;
         }
 
         OP_GET_BLOB => {
             let hash = recv_hash(recv).await?;
             match get_blob(store, &hash) {
                 Some(data) => {
-                    send_u8(send, RSP_BLOB).await?;
                     send_u32_be(send, data.len() as u32).await?;
                     send.write_all(&data).await.map_err(|e| anyhow!("send: {e}"))?;
                 }
-                None => send_u8(send, RSP_MISSING).await?,
+                None => send_u32_be(send, 0).await?,
             }
         }
 
@@ -78,7 +69,6 @@ where
             for _ in 0..have_count {
                 have_set.insert(recv_hash(recv).await?);
             }
-            // Stream child hashes, nil hash as sentinel.
             if let Some(parent_data) = get_blob(store, &parent_hash) {
                 for chunk in parent_data.chunks(VALUE_LEN) {
                     if chunk.len() == VALUE_LEN {
@@ -90,10 +80,10 @@ where
                     }
                 }
             }
-            send_hash(send, &[0u8; 32]).await?;
+            send_hash(send, &NIL_HASH).await?;
         }
 
-        _ => {} // Unknown op — ignore, stream closes.
+        _ => {}
     }
     Ok(())
 }
