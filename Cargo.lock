@@ -4719,6 +4719,7 @@ dependencies = [
  "iroh-dht",
  "iroh-gossip",
  "irpc-iroh",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "triblespace-core",
