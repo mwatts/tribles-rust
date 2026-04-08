@@ -1,0 +1,13 @@
+/Users/jp/Desktop/chatbot/liora/triblespace-net/target/debug/deps/const_oid-5f8774263a90b9cd.d: /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/const-oid-0.10.2/src/lib.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/const-oid-0.10.2/src/checked.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/const-oid-0.10.2/src/arcs.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/const-oid-0.10.2/src/buffer.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/const-oid-0.10.2/src/encoder.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/const-oid-0.10.2/src/error.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/const-oid-0.10.2/src/parser.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/const-oid-0.10.2/src/traits.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/const-oid-0.10.2/src/../README.md
+
+/Users/jp/Desktop/chatbot/liora/triblespace-net/target/debug/deps/libconst_oid-5f8774263a90b9cd.rmeta: /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/const-oid-0.10.2/src/lib.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/const-oid-0.10.2/src/checked.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/const-oid-0.10.2/src/arcs.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/const-oid-0.10.2/src/buffer.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/const-oid-0.10.2/src/encoder.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/const-oid-0.10.2/src/error.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/const-oid-0.10.2/src/parser.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/const-oid-0.10.2/src/traits.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/const-oid-0.10.2/src/../README.md
+
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/const-oid-0.10.2/src/lib.rs:
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/const-oid-0.10.2/src/checked.rs:
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/const-oid-0.10.2/src/arcs.rs:
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/const-oid-0.10.2/src/buffer.rs:
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/const-oid-0.10.2/src/encoder.rs:
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/const-oid-0.10.2/src/error.rs:
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/const-oid-0.10.2/src/parser.rs:
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/const-oid-0.10.2/src/traits.rs:
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/const-oid-0.10.2/src/../README.md:

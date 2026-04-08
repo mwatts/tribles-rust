@@ -1,0 +1,13 @@
+/Users/jp/Desktop/chatbot/liora/triblespace-net/target/debug/deps/snafu-c08e1c57431a0d6f.d: /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.9.0/src/lib.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.9.0/src/backtrace_impl_std.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.9.0/src/once_bool.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.9.0/src/error_chain.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.9.0/src/report.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.9.0/src/boxed_impls.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.9.0/src/whatever.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.9.0/src/Snafu.md /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.9.0/src/report.md
+
+/Users/jp/Desktop/chatbot/liora/triblespace-net/target/debug/deps/libsnafu-c08e1c57431a0d6f.rmeta: /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.9.0/src/lib.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.9.0/src/backtrace_impl_std.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.9.0/src/once_bool.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.9.0/src/error_chain.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.9.0/src/report.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.9.0/src/boxed_impls.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.9.0/src/whatever.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.9.0/src/Snafu.md /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.9.0/src/report.md
+
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.9.0/src/lib.rs:
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.9.0/src/backtrace_impl_std.rs:
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.9.0/src/once_bool.rs:
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.9.0/src/error_chain.rs:
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.9.0/src/report.rs:
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.9.0/src/boxed_impls.rs:
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.9.0/src/whatever.rs:
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.9.0/src/Snafu.md:
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/snafu-0.9.0/src/report.md:

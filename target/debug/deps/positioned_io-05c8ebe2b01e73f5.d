@@ -1,0 +1,12 @@
+/Users/jp/Desktop/chatbot/liora/triblespace-net/target/debug/deps/positioned_io-05c8ebe2b01e73f5.d: /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/positioned-io-0.3.5/src/lib.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/positioned-io-0.3.5/src/cursor.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/positioned-io-0.3.5/src/slice.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/positioned-io-0.3.5/src/unix.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/positioned-io-0.3.5/src/raf.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/positioned-io-0.3.5/src/array.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/positioned-io-0.3.5/src/refs.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/positioned-io-0.3.5/src/vec.rs
+
+/Users/jp/Desktop/chatbot/liora/triblespace-net/target/debug/deps/libpositioned_io-05c8ebe2b01e73f5.rmeta: /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/positioned-io-0.3.5/src/lib.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/positioned-io-0.3.5/src/cursor.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/positioned-io-0.3.5/src/slice.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/positioned-io-0.3.5/src/unix.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/positioned-io-0.3.5/src/raf.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/positioned-io-0.3.5/src/array.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/positioned-io-0.3.5/src/refs.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/positioned-io-0.3.5/src/vec.rs
+
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/positioned-io-0.3.5/src/lib.rs:
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/positioned-io-0.3.5/src/cursor.rs:
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/positioned-io-0.3.5/src/slice.rs:
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/positioned-io-0.3.5/src/unix.rs:
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/positioned-io-0.3.5/src/raf.rs:
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/positioned-io-0.3.5/src/array.rs:
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/positioned-io-0.3.5/src/refs.rs:
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/positioned-io-0.3.5/src/vec.rs:

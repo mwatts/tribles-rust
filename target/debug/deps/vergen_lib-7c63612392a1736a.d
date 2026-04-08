@@ -1,0 +1,12 @@
+/Users/jp/Desktop/chatbot/liora/triblespace-net/target/debug/deps/vergen_lib-7c63612392a1736a.d: /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/vergen-lib-9.1.0/src/lib.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/vergen-lib-9.1.0/src/constants.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/vergen-lib-9.1.0/src/emitter.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/vergen-lib-9.1.0/src/entries.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/vergen-lib-9.1.0/src/keys.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/vergen-lib-9.1.0/src/utils.rs
+
+/Users/jp/Desktop/chatbot/liora/triblespace-net/target/debug/deps/libvergen_lib-7c63612392a1736a.rlib: /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/vergen-lib-9.1.0/src/lib.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/vergen-lib-9.1.0/src/constants.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/vergen-lib-9.1.0/src/emitter.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/vergen-lib-9.1.0/src/entries.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/vergen-lib-9.1.0/src/keys.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/vergen-lib-9.1.0/src/utils.rs
+
+/Users/jp/Desktop/chatbot/liora/triblespace-net/target/debug/deps/libvergen_lib-7c63612392a1736a.rmeta: /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/vergen-lib-9.1.0/src/lib.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/vergen-lib-9.1.0/src/constants.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/vergen-lib-9.1.0/src/emitter.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/vergen-lib-9.1.0/src/entries.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/vergen-lib-9.1.0/src/keys.rs /Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/vergen-lib-9.1.0/src/utils.rs
+
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/vergen-lib-9.1.0/src/lib.rs:
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/vergen-lib-9.1.0/src/constants.rs:
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/vergen-lib-9.1.0/src/emitter.rs:
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/vergen-lib-9.1.0/src/entries.rs:
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/vergen-lib-9.1.0/src/keys.rs:
+/Users/jp/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/vergen-lib-9.1.0/src/utils.rs:
