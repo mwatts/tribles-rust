@@ -1,9 +1,0 @@
-cargo:rustc-check-cfg=cfg(wasm_browser)
-cargo:rustc-check-cfg=cfg(with_crypto_provider)
-cargo:rustc-cfg=with_crypto_provider
-cargo:rustc-env=VERGEN_GIT_SHA=2ab12409b1c5f0d75d4d94d82b76abb53169c362
-cargo:rerun-if-changed=/Users/jp/Desktop/chatbot/liora/iroh/.git/HEAD
-cargo:rerun-if-changed=/Users/jp/Desktop/chatbot/liora/iroh/.git/refs/heads/main
-cargo:rerun-if-changed=build.rs
-cargo:rerun-if-env-changed=VERGEN_IDEMPOTENT
-cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH
