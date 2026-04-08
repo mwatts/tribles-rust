@@ -327,11 +327,6 @@ where
 
         OP_CHILDREN => {
             let parent_hash = recv_hash(recv).await?;
-            let have_count = recv_u32_be(recv).await? as usize;
-            let mut have_set = std::collections::HashSet::with_capacity(have_count);
-            for _ in 0..have_count {
-                have_set.insert(recv_hash(recv).await?);
-            }
             let reader = store.lock().unwrap().reader().map_err(|e| anyhow!("reader: {e:?}"))?;
             let parent_handle = Value::<Handle<Blake3, UnknownBlob>>::new(parent_hash);
             if let Ok(parent_blob) = reader.get::<Bytes, UnknownBlob>(parent_handle) {
@@ -340,11 +335,9 @@ where
                     if chunk.len() == 32 {
                         let mut candidate = [0u8; 32];
                         candidate.copy_from_slice(chunk);
-                        if !have_set.contains(&candidate) {
-                            let h = Value::<Handle<Blake3, UnknownBlob>>::new(candidate);
-                            if reader.get::<Bytes, UnknownBlob>(h).is_ok() {
-                                send_hash(send, &candidate).await?;
-                            }
+                        let h = Value::<Handle<Blake3, UnknownBlob>>::new(candidate);
+                        if reader.get::<Bytes, UnknownBlob>(h).is_ok() {
+                            send_hash(send, &candidate).await?;
                         }
                     }
                 }

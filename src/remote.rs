@@ -119,39 +119,11 @@ where
         &self,
         handle: Value<Handle<Blake3, UnknownBlob>>,
     ) -> Vec<Value<Handle<Blake3, UnknownBlob>>> {
-        // Build HAVE set from what's already cached.
-        let have: Vec<RawHash> = {
-            let Ok(parent_blob) = self.reader.get::<Bytes, UnknownBlob>(handle) else {
-                return Vec::new();
-            };
-            let parent_data: &[u8] = parent_blob.as_ref();
-            let mut cached = Vec::new();
-            for chunk in parent_data.chunks(32) {
-                if chunk.len() == 32 {
-                    let mut candidate = [0u8; 32];
-                    candidate.copy_from_slice(chunk);
-                    let h = Value::<Handle<Blake3, UnknownBlob>>::new(candidate);
-                    if self.reader.get::<Bytes, UnknownBlob>(h).is_ok() {
-                        cached.push(candidate);
-                    }
-                }
-            }
-            cached
-        };
-
-        // Ask remote for children we don't have.
-        let new_hashes = self.rt.block_on(async {
-            op_children(&self.conn, &handle.raw, &have).await.unwrap_or_default()
-        });
-
-        // Combine: cached + newly discovered.
-        let mut all: Vec<Value<Handle<Blake3, UnknownBlob>>> = have.iter()
-            .map(|h| Value::<Handle<Blake3, UnknownBlob>>::new(*h))
-            .collect();
-        for h in new_hashes {
-            all.push(Value::<Handle<Blake3, UnknownBlob>>::new(h));
-        }
-        all
+        self.rt.block_on(async {
+            op_children(&self.conn, &handle.raw).await.unwrap_or_default()
+        }).into_iter()
+            .map(|h| Value::<Handle<Blake3, UnknownBlob>>::new(h))
+            .collect()
     }
 }
 

@@ -155,23 +155,11 @@ where
         let mut next_level: Vec<RawHash> = Vec::new();
 
         for parent_hash in &current_level {
-            // Build HAVE set: references we already have locally.
-            let mut have: Vec<RawHash> = Vec::new();
-            if let Some(data) = get_blob(&mut local, parent_hash) {
-                for chunk in data.chunks(VALUE_LEN) {
-                    if chunk.len() == VALUE_LEN {
-                        let mut candidate = [0u8; 32];
-                        candidate.copy_from_slice(chunk);
-                        if seen.insert(candidate) && has_blob(&mut local, &candidate) {
-                            have.push(candidate);
-                        }
-                    }
-                }
-            }
-
-            // CHILDREN: get missing child hashes, then fetch each blob.
-            let child_hashes = op_children(conn, parent_hash, &have).await?;
+            // CHILDREN: get all child hashes, fetch those we don't have.
+            let child_hashes = op_children(conn, parent_hash).await?;
             for hash in child_hashes {
+                if !seen.insert(hash) { continue; }
+                if has_blob(&mut local, &hash) { continue; }
                 if let Some(data) = op_get_blob(conn, &hash).await? {
                     fetched += 1;
                     fetched_bytes += data.len();

@@ -12,7 +12,7 @@
 //!   LIST       → (id:16 head:32)* nil_id:16         (48-byte aligned entries)
 //!   HEAD       id:16 → hash:32                      (nil = no head)
 //!   GET_BLOB   hash:32 → len:u64 data                (u64::MAX = missing)
-//!   CHILDREN   parent:32 count:32 have* → hash* nil  (nil = end)
+//!   CHILDREN   parent:32 → hash* nil                  (nil = end)
 //!   CAS_PUSH   id:16 old:32 new:32 → ok:1 hash:32   (ok=1 success, ok=0 conflict)
 
 pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/3";
@@ -154,20 +154,14 @@ pub async fn op_cas_push(
     }
 }
 
-/// CHILDREN: given a parent blob and a HAVE set, receive child hashes.
-/// Nil hash terminates.
+/// CHILDREN: get child hashes of a parent blob. Nil hash terminates.
 pub async fn op_children(
     conn: &Connection,
     parent: &RawHash,
-    have: &[RawHash],
 ) -> Result<Vec<RawHash>> {
     let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
     send_u8(&mut send, OP_CHILDREN).await?;
     send_hash(&mut send, parent).await?;
-    send_u32_be(&mut send, have.len() as u32).await?;
-    for h in have {
-        send_hash(&mut send, h).await?;
-    }
     send.finish().map_err(|e| anyhow!("finish: {e}"))?;
 
     let mut children = Vec::new();
