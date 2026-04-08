@@ -101,7 +101,7 @@ pub async fn sync_branch(
     };
 
     // BFS: fetch head blob if missing.
-    let mut pile = crate::open_pile(pile_path)?;
+    let mut pile = Pile::<Blake3>::open(pile_path).map_err(|e| anyhow!("open: {e:?}"))?;
     let mut fetched = 0usize;
     let mut fetched_bytes = 0usize;
 

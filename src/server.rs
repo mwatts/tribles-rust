@@ -11,6 +11,7 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use triblespace_core::blob::schemas::UnknownBlob;
 use triblespace_core::repo::{BlobStore, BlobStoreGet, BranchStore};
 use triblespace_core::repo::pile::Pile;
+use triblespace_core::value::schemas::hash::Blake3 as Blake3Hash;
 use triblespace_core::value::Value;
 use triblespace_core::value::schemas::hash::{Blake3, Handle};
 
@@ -32,7 +33,7 @@ impl ProtocolHandler for PileBlobServer {
             let (mut send, mut recv) = connection.accept_bi().await
                 .map_err(|e| anyhow!("accept_bi: {e}"))?;
 
-            let mut pile = crate::open_pile(&pile_path)?;
+            let mut pile = Pile::<Blake3>::open(&pile_path).map_err(|e| anyhow!("open: {e:?}"))?;
             serve_pile(&mut pile, &mut send, &mut recv).await?;
             send.finish().map_err(|e| anyhow!("finish: {e}"))?;
             pile.close().map_err(|e| anyhow!("close: {e:?}"))?;

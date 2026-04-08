@@ -17,13 +17,5 @@ pub mod server;
 pub mod sync;
 pub mod identity;
 
-use std::path::PathBuf;
-use anyhow::{Result, anyhow};
-use triblespace_core::repo::pile::Pile;
-use triblespace_core::value::schemas::hash::Blake3;
-
-pub fn open_pile(path: &PathBuf) -> Result<Pile<Blake3>> {
-    let mut pile = Pile::<Blake3>::open(path).map_err(|e| anyhow!("open: {e:?}"))?;
-    pile.restore().map_err(|e| anyhow!("restore: {e:?}"))?;
-    Ok(pile)
-}
+pub use triblespace_core::repo::pile::Pile;
+pub use triblespace_core::value::schemas::hash::Blake3;
