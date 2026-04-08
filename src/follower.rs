@@ -1,9 +1,9 @@
 //! `Follower<S>`: keeps a local store in sync with a remote peer.
 //!
 //! Owns the local store, actively pulls blobs on demand or on gossip.
-//! The local store IS the API — read from it directly, always up to date.
-//! No trait implementations on Follower itself — it's a sync driver,
-//! not a store.
+//! Implements `BlobStore`, `BlobStorePut`, and `BranchStore` by
+//! delegating to the inner store — so Follower IS a store, composable
+//! with other middleware (e.g. `Follower<NetworkStore<Pile>>`).
 
 use std::collections::HashSet;
 
@@ -27,10 +27,7 @@ pub struct Follower<S> {
     rt: tokio::runtime::Handle,
 }
 
-impl<S> Follower<S>
-where
-    S: BlobStore<Blake3> + BlobStorePut<Blake3> + BranchStore<Blake3>,
-{
+impl<S> Follower<S> {
     /// Create a follower that syncs into the given store.
     pub fn new(store: S, conn: Connection, rt: tokio::runtime::Handle) -> Self {
         Self { store: Some(store), conn, rt }
@@ -44,6 +41,12 @@ where
 
     /// Consume the follower, return the store.
     pub fn into_store(self) -> S { self.store.unwrap() }
+}
+
+impl<S> Follower<S>
+where
+    S: BlobStore<Blake3> + BlobStorePut<Blake3> + BranchStore<Blake3>,
+{
 
     /// Pull all blobs reachable from a remote branch head into the local store,
     /// then merge the branch.
@@ -152,5 +155,66 @@ pub struct SyncResult {
 impl std::fmt::Display for SyncResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} blobs ({}B)", self.blobs_fetched, self.bytes_fetched)
+    }
+}
+
+// ── Trait delegations: Follower IS a store ───────────────────────────
+
+use triblespace_core::blob::{BlobSchema, ToBlob, TryFromBlob};
+use triblespace_core::repo::{BlobStoreList, PushResult};
+use triblespace_core::value::ValueSchema;
+
+impl<S> BlobStorePut<Blake3> for Follower<S>
+where
+    S: BlobStorePut<Blake3>,
+{
+    type PutError = S::PutError;
+
+    fn put<Sch, T>(&mut self, item: T) -> Result<Value<Handle<Blake3, Sch>>, Self::PutError>
+    where
+        Sch: BlobSchema + 'static,
+        T: ToBlob<Sch>,
+        Handle<Blake3, Sch>: ValueSchema,
+    {
+        self.store_mut().put(item)
+    }
+}
+
+impl<S> BlobStore<Blake3> for Follower<S>
+where
+    S: BlobStore<Blake3>,
+{
+    type Reader = S::Reader;
+    type ReaderError = S::ReaderError;
+
+    fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
+        self.store_mut().reader()
+    }
+}
+
+impl<S> BranchStore<Blake3> for Follower<S>
+where
+    S: BranchStore<Blake3>,
+{
+    type BranchesError = S::BranchesError;
+    type HeadError = S::HeadError;
+    type UpdateError = S::UpdateError;
+    type ListIter<'a> = S::ListIter<'a> where S: 'a;
+
+    fn branches<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::BranchesError> {
+        self.store_mut().branches()
+    }
+
+    fn head(&mut self, id: Id) -> Result<Option<Value<Handle<Blake3, SimpleArchive>>>, Self::HeadError> {
+        self.store_mut().head(id)
+    }
+
+    fn update(
+        &mut self,
+        id: Id,
+        old: Option<Value<Handle<Blake3, SimpleArchive>>>,
+        new: Option<Value<Handle<Blake3, SimpleArchive>>>,
+    ) -> Result<PushResult<Blake3>, Self::UpdateError> {
+        self.store_mut().update(id, old, new)
     }
 }
