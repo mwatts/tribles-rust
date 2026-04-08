@@ -1,4 +1,4 @@
-//! `NetworkStore`: middleware that wraps any `BlobStore + BranchStore`
+//! `Host`: middleware that wraps any `BlobStore + BranchStore`
 //! and makes it a full network participant.
 //!
 //! - `put()` → store locally + announce blob to DHT
@@ -30,7 +30,7 @@ use crate::identity::iroh_secret;
 use crate::protocol::PILE_SYNC_ALPN;
 
 /// A network-aware wrapper around any `BlobStore + BranchStore`.
-pub struct NetworkStore<S> {
+pub struct Host<S> {
     inner: Arc<Mutex<S>>,
     endpoint: Endpoint,
     router: Router,
@@ -40,8 +40,8 @@ pub struct NetworkStore<S> {
     rt: tokio::runtime::Handle,
 }
 
-/// Builder for constructing a `NetworkStore`.
-pub struct NetworkStoreBuilder<S> {
+/// Builder for constructing a `Host`.
+pub struct HostBuilder<S> {
     inner: S,
     signing_key: ed25519_dalek::SigningKey,
     dht_bootstrap: Vec<EndpointId>,
@@ -49,7 +49,7 @@ pub struct NetworkStoreBuilder<S> {
     gossip_peers: Vec<EndpointId>,
 }
 
-impl<S> NetworkStoreBuilder<S>
+impl<S> HostBuilder<S>
 where
     S: BlobStore<Blake3> + BranchStore<Blake3> + Send + 'static,
 {
@@ -67,7 +67,7 @@ where
     }
 
     /// Build and start the network store.
-    pub async fn build(self) -> Result<NetworkStore<S>> {
+    pub async fn build(self) -> Result<Host<S>> {
         let secret = iroh_secret(&self.signing_key);
         let public = secret.public();
         let my_id: EndpointId = public.into();
@@ -135,19 +135,19 @@ where
 
         let router = router_builder.spawn();
 
-        Ok(NetworkStore {
+        Ok(Host {
             inner, endpoint: ep, router, dht_api, gossip_sender, my_id, rt,
         })
     }
 }
 
-impl<S> NetworkStore<S>
+impl<S> Host<S>
 where
     S: BlobStore<Blake3> + BranchStore<Blake3> + Send + 'static,
 {
     /// Start building a network store.
-    pub fn builder(inner: S, signing_key: ed25519_dalek::SigningKey) -> NetworkStoreBuilder<S> {
-        NetworkStoreBuilder {
+    pub fn builder(inner: S, signing_key: ed25519_dalek::SigningKey) -> HostBuilder<S> {
+        HostBuilder {
             inner, signing_key,
             dht_bootstrap: Vec::new(),
             gossip_topic: None,
@@ -175,7 +175,7 @@ where
 
 // ── Trait implementations ────────────────────────────────────────────
 
-impl<S> BlobStorePut<Blake3> for NetworkStore<S>
+impl<S> BlobStorePut<Blake3> for Host<S>
 where
     S: BlobStorePut<Blake3> + Send + 'static,
 {
@@ -203,7 +203,7 @@ where
     }
 }
 
-impl<S> BranchStore<Blake3> for NetworkStore<S>
+impl<S> BranchStore<Blake3> for Host<S>
 where
     S: BranchStore<Blake3> + Send + 'static,
 {
