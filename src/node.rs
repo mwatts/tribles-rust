@@ -352,14 +352,13 @@ where
                         if !have_set.contains(&candidate) {
                             let h = Value::<Handle<Blake3, UnknownBlob>>::new(candidate);
                             if reader.get::<Bytes, UnknownBlob>(h).is_ok() {
-                                send_u8(send, RSP_BLOB).await?;
                                 send_hash(send, &candidate).await?;
                             }
                         }
                     }
                 }
             }
-            send_u8(send, RSP_END).await?;
+            send_hash(send, &[0u8; 32]).await?;
         }
 
         OP_CAS_PUSH => {

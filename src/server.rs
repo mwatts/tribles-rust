@@ -78,20 +78,19 @@ where
             for _ in 0..have_count {
                 have_set.insert(recv_hash(recv).await?);
             }
-            // Stream child hashes with marker framing (1 byte overhead per hash).
+            // Stream child hashes, nil hash as sentinel.
             if let Some(parent_data) = get_blob(store, &parent_hash) {
                 for chunk in parent_data.chunks(VALUE_LEN) {
                     if chunk.len() == VALUE_LEN {
                         let mut candidate = [0u8; 32];
                         candidate.copy_from_slice(chunk);
                         if !have_set.contains(&candidate) && has_blob(store, &candidate) {
-                            send_u8(send, RSP_BLOB).await?;
                             send_hash(send, &candidate).await?;
                         }
                     }
                 }
             }
-            send_u8(send, RSP_END).await?;
+            send_hash(send, &[0u8; 32]).await?;
         }
 
         _ => {} // Unknown op — ignore, stream closes.

@@ -182,9 +182,9 @@ pub async fn op_children(
 
     let mut children = Vec::new();
     loop {
-        let marker = recv_u8(&mut recv).await?;
-        if marker == RSP_END { break; }
-        children.push(recv_hash(&mut recv).await?);
+        let hash = recv_hash(&mut recv).await?;
+        if hash == [0u8; 32] { break; }
+        children.push(hash);
     }
     Ok(children)
 }
