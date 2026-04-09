@@ -181,8 +181,6 @@ async fn host_loop(
     use iroh_gossip::api::GossipSender;
     use futures::TryStreamExt;
 
-    // TODO: add mDNS when swarm-discovery compiles with our dep tree
-    // .address_lookup(iroh::address_lookup::MdnsAddressLookup::builder())
     let ep = match Endpoint::builder(presets::N0).secret_key(secret).bind().await {
         Ok(ep) => ep,
         Err(e) => { eprintln!("host: bind failed: {e}"); return; }

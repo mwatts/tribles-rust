@@ -19,7 +19,6 @@ anybytes = { version = "0.20.2", features = ["zerocopy"] }
 blake3 = "1.8"
 ed25519-dalek = "2.2.0"
 getrandom = "0.4"
-parking_lot = "0.12"
 hex = "0.4"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
