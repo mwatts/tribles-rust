@@ -53,8 +53,8 @@ impl<S> Follower<S> {
     }
 }
 
-impl<S: BlobStorePut<Blake3>> Follower<S> {
-    /// Drain pending events: store blobs, update tracking refs.
+impl<S: BlobStorePut<Blake3> + BranchStore<Blake3>> Follower<S> {
+    /// Drain pending events: store blobs, update tracking refs + branch pointers.
     /// Returns the number of events processed.
     pub fn poll(&mut self) -> usize {
         let mut count = 0;
@@ -65,6 +65,13 @@ impl<S: BlobStorePut<Blake3>> Follower<S> {
                     let _ = self.store.put::<UnknownBlob, Bytes>(bytes);
                 }
                 NetEvent::Head { branch, head } => {
+                    // Store remote HEAD as a branch pointer so Repository can pull it.
+                    if let Some(branch_id) = triblespace_core::id::Id::new(branch) {
+                        let old = self.remote_heads.get(&branch)
+                            .map(|h| Value::<Handle<Blake3, SimpleArchive>>::new(*h));
+                        let new = Value::<Handle<Blake3, SimpleArchive>>::new(head);
+                        let _ = self.store.update(branch_id, old, Some(new));
+                    }
                     self.remote_heads.insert(branch, head);
                 }
             }
