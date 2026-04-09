@@ -230,6 +230,7 @@ async fn host_loop(
     }
 
     // DHT.
+    let mut dht_api: Option<iroh_dht::api::ApiClient> = None;
     if !config.dht_bootstrap.is_empty() {
         let dht_alpn = iroh_dht::rpc::ALPN;
         let pool = iroh_blobs::util::connection_pool::ConnectionPool::new(
@@ -242,13 +243,14 @@ async fn host_loop(
             },
         );
         let iroh_pool = iroh_dht::pool::IrohPool::new(ep.clone(), pool);
-        let (rpc, _api) = iroh_dht::create_node(
+        let (rpc, api) = iroh_dht::create_node(
             my_id, iroh_pool.clone(), config.dht_bootstrap, Default::default(),
         );
         iroh_pool.set_self_client(Some(rpc.downgrade()));
         let dht_sender = rpc.inner().as_local().expect("local sender");
         router_builder = router_builder
             .accept(dht_alpn, irpc_iroh::IrohProtocol::with_sender(dht_sender));
+        dht_api = Some(api);
     }
 
     let _router = router_builder.spawn();
@@ -257,7 +259,15 @@ async fn host_loop(
     loop {
         while let Ok(cmd) = commands.try_recv() {
             match cmd {
-                NetCommand::Announce(_hash) => { /* TODO: DHT announce */ }
+                NetCommand::Announce(hash) => {
+                    if let Some(ref api) = dht_api {
+                        let api = api.clone();
+                        tokio::spawn(async move {
+                            let blake3_hash = blake3::Hash::from_bytes(hash);
+                            let _ = api.announce_provider(blake3_hash, my_id).await;
+                        });
+                    }
+                }
                 NetCommand::Gossip { branch, head } => {
                     if let Some(ref sender) = gossip_sender {
                         let mut msg = Vec::with_capacity(49);
