@@ -156,11 +156,8 @@ pub fn spawn(key: SigningKey, config: HostConfig) -> (HostSender, HostReceiver) 
     let thread_snapshot = snapshot.clone();
 
     let _thread = thread::spawn(move || {
-        eprintln!("[host-thread] starting");
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-        eprintln!("[host-thread] runtime created, entering host_loop");
         rt.block_on(host_loop(secret, config, cmd_rx, evt_tx, thread_snapshot));
-        eprintln!("[host-thread] host_loop returned");
     });
 
     let sender = HostSender { cmd_tx, snapshot, id };
@@ -184,14 +181,11 @@ async fn host_loop(
     use iroh_gossip::api::GossipSender;
     use futures::TryStreamExt;
 
-    eprintln!("[host] binding endpoint...");
     let ep = match Endpoint::builder(presets::N0).secret_key(secret).bind().await {
         Ok(ep) => ep,
         Err(e) => { eprintln!("host: bind failed: {e}"); return; }
     };
-    eprintln!("[host] bound, waiting for online...");
     ep.online().await;
-    eprintln!("[host] online!");
 
     let my_id = ep.id();
     let mut router_builder = Router::builder(ep.clone());
@@ -234,7 +228,6 @@ async fn host_loop(
         // as peers come online. subscribe_and_join blocks until at least one peer
         // is reachable, which causes hangs if peers start at different times.
         let topic = gossip.subscribe(topic_id, config.peers.clone()).await;
-        eprintln!("[host] gossip subscribe result: {}", topic.is_ok());
         if let Ok(topic) = topic {
             let (sender, receiver) = topic.split();
             gossip_sender = Some(sender);
@@ -243,11 +236,9 @@ async fn host_loop(
             let dht_api2 = dht_api.clone();
             tokio::spawn(async move {
                 let mut receiver = receiver;
-                eprintln!("[host] gossip receiver started");
                 while let Ok(Some(event)) = receiver.try_next().await {
                     match &event {
                         iroh_gossip::api::Event::Received(msg) => {
-                            eprintln!("[host] gossip received: {} bytes from {}", msg.content.len(), msg.delivered_from.fmt_short());
                             if msg.content.len() == 49 && msg.content[0] == 0x01 {
                                 let mut branch = [0u8; 16];
                                 branch.copy_from_slice(&msg.content[1..17]);
@@ -277,14 +268,12 @@ async fn host_loop(
                         _ => {}
                     }
                 }
-                eprintln!("[host] gossip receiver ended");
             });
         }
     }
 
     let _router = router_builder.spawn();
 
-    eprintln!("[host] entering command loop");
     // Command loop.
     loop {
         while let Ok(cmd) = commands.try_recv() {
@@ -304,16 +293,10 @@ async fn host_loop(
                         msg.push(0x01);
                         msg.extend_from_slice(&branch);
                         msg.extend_from_slice(&head);
-                        eprintln!("[host] broadcasting gossip HEAD {}", hex::encode(&head[..4]));
                         let sender = sender.clone();
                         tokio::spawn(async move {
-                            match sender.broadcast(msg.into()).await {
-                                Ok(()) => eprintln!("[host] gossip broadcast ok"),
-                                Err(e) => eprintln!("[host] gossip broadcast error: {e}"),
-                            }
+                            let _ = sender.broadcast(msg.into()).await;
                         });
-                    } else {
-                        eprintln!("[host] gossip command but no sender configured");
                     }
                 }
                 NetCommand::Fetch { peer, branch } => {
