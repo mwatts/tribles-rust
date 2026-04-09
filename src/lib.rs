@@ -18,8 +18,3 @@ pub mod follower;
 pub mod protocol;
 pub mod identity;
 
-// Legacy modules — will be removed once CLI migrates.
-pub mod remote;
-pub mod server;
-pub mod sync;
-pub mod node;

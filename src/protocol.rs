@@ -154,6 +154,42 @@ pub async fn op_cas_push(
     }
 }
 
+// ── Convenience wrappers ─────────────────────────────────────────────
+
+/// Resolve a branch name to its ID by fetching metadata from a remote.
+pub async fn resolve_branch_name(
+    conn: &Connection,
+    name: &str,
+) -> Result<Option<(triblespace_core::id::Id, RawHash)>> {
+    use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
+    use triblespace_core::blob::TryFromBlob;
+    use triblespace_core::trible::TribleSet;
+    use triblespace_core::value::Value;
+    use triblespace_core::value::schemas::hash::{Blake3, Handle};
+
+    let branches = op_list(conn).await?;
+    for (id_bytes, head) in &branches {
+        let Some(id) = triblespace_core::id::Id::new(*id_bytes) else { continue; };
+        let Some(meta_data) = op_get_blob(conn, head).await? else { continue; };
+        let blob: triblespace_core::blob::Blob<SimpleArchive> =
+            triblespace_core::blob::Blob::new(meta_data.into());
+        let Ok(meta) = TribleSet::try_from_blob(blob) else { continue; };
+        use triblespace_core::macros::{find, pattern};
+        for name_handle in find!(
+            h: Value<Handle<Blake3, triblespace_core::blob::schemas::longstring::LongString>>,
+            pattern!(&meta, [{ _?e @ triblespace_core::metadata::name: ?h }])
+        ) {
+            let Some(name_data) = op_get_blob(conn, &name_handle.raw).await? else { continue; };
+            if let Ok(n) = std::str::from_utf8(&name_data) {
+                if n == name {
+                    return Ok(Some((id, *head)));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// CHILDREN: get child hashes of a parent blob. Nil hash terminates.
 pub async fn op_children(
     conn: &Connection,
