@@ -19,17 +19,17 @@ use crate::protocol::*;
 
 /// Configuration for the host thread.
 pub struct HostConfig {
+    /// Peers to connect to (used for both gossip and DHT bootstrap).
+    pub peers: Vec<EndpointId>,
+    /// Gossip topic name (None = no gossip, serve-only).
     pub gossip_topic: Option<String>,
-    pub gossip_peers: Vec<EndpointId>,
-    pub dht_bootstrap: Vec<EndpointId>,
 }
 
 impl Default for HostConfig {
     fn default() -> Self {
         Self {
+            peers: Vec::new(),
             gossip_topic: None,
-            gossip_peers: Vec::new(),
-            dht_bootstrap: Vec::new(),
         }
     }
 }
@@ -200,29 +200,26 @@ async fn host_loop(
     let handler = SnapshotHandler { snapshot: snapshot.clone() };
     router_builder = router_builder.accept(PILE_SYNC_ALPN, handler);
 
-    // DHT (before gossip — gossip tasks need DHT API).
-    let mut dht_api: Option<iroh_dht::api::ApiClient> = None;
-    if !config.dht_bootstrap.is_empty() {
-        let dht_alpn = iroh_dht::rpc::ALPN;
-        let pool = iroh_blobs::util::connection_pool::ConnectionPool::new(
-            ep.clone(), dht_alpn,
-            iroh_blobs::util::connection_pool::Options {
-                max_connections: 64,
-                idle_timeout: std::time::Duration::from_secs(30),
-                connect_timeout: std::time::Duration::from_secs(10),
-                on_connected: None,
-            },
-        );
-        let iroh_pool = iroh_dht::pool::IrohPool::new(ep.clone(), pool);
-        let (rpc, api) = iroh_dht::create_node(
-            my_id, iroh_pool.clone(), config.dht_bootstrap, Default::default(),
-        );
-        iroh_pool.set_self_client(Some(rpc.downgrade()));
-        let dht_sender = rpc.inner().as_local().expect("local sender");
-        router_builder = router_builder
-            .accept(dht_alpn, irpc_iroh::IrohProtocol::with_sender(dht_sender));
-        dht_api = Some(api);
-    }
+    // DHT — always on. Peers bootstrap the routing table.
+    let dht_alpn = iroh_dht::rpc::ALPN;
+    let pool = iroh_blobs::util::connection_pool::ConnectionPool::new(
+        ep.clone(), dht_alpn,
+        iroh_blobs::util::connection_pool::Options {
+            max_connections: 64,
+            idle_timeout: std::time::Duration::from_secs(30),
+            connect_timeout: std::time::Duration::from_secs(10),
+            on_connected: None,
+        },
+    );
+    let iroh_pool = iroh_dht::pool::IrohPool::new(ep.clone(), pool);
+    let (rpc, dht_api) = iroh_dht::create_node(
+        my_id, iroh_pool.clone(), config.peers.clone(), Default::default(),
+    );
+    iroh_pool.set_self_client(Some(rpc.downgrade()));
+    let dht_sender = rpc.inner().as_local().expect("local sender");
+    router_builder = router_builder
+        .accept(dht_alpn, irpc_iroh::IrohProtocol::with_sender(dht_sender));
+    let dht_api = Some(dht_api);
 
     // Gossip.
     let mut gossip_sender: Option<GossipSender> = None;
@@ -236,7 +233,7 @@ async fn host_loop(
         // Always use subscribe (non-blocking). The join happens in the background
         // as peers come online. subscribe_and_join blocks until at least one peer
         // is reachable, which causes hangs if peers start at different times.
-        let topic = gossip.subscribe(topic_id, config.gossip_peers.clone()).await;
+        let topic = gossip.subscribe(topic_id, config.peers.clone()).await;
         eprintln!("[host] gossip subscribe result: {}", topic.is_ok());
         if let Ok(topic) = topic {
             let (sender, receiver) = topic.split();
