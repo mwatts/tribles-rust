@@ -200,64 +200,7 @@ async fn host_loop(
     let handler = SnapshotHandler { snapshot: snapshot.clone() };
     router_builder = router_builder.accept(PILE_SYNC_ALPN, handler);
 
-    // Gossip.
-    let mut gossip_sender: Option<GossipSender> = None;
-    if let Some(ref topic_name) = config.gossip_topic {
-        let gossip = Gossip::builder().spawn(ep.clone());
-        router_builder = router_builder.accept(iroh_gossip::ALPN, gossip.clone());
-
-        let topic_id = iroh_gossip::TopicId::from_bytes(
-            *blake3::hash(topic_name.as_bytes()).as_bytes()
-        );
-        // Always use subscribe (non-blocking). The join happens in the background
-        // as peers come online. subscribe_and_join blocks until at least one peer
-        // is reachable, which causes hangs if peers start at different times.
-        let topic = gossip.subscribe(topic_id, config.gossip_peers.clone()).await;
-        eprintln!("[host] gossip subscribe result: {}", topic.is_ok());
-        if let Ok(topic) = topic {
-            let (sender, receiver) = topic.split();
-            gossip_sender = Some(sender);
-            let events_tx = events.clone();
-            let ep2 = ep.clone();
-            tokio::spawn(async move {
-                let mut receiver = receiver;
-                eprintln!("[host] gossip receiver started");
-                while let Ok(Some(event)) = receiver.try_next().await {
-                    match &event {
-                        iroh_gossip::api::Event::Received(msg) => {
-                            eprintln!("[host] gossip received: {} bytes from {}", msg.content.len(), msg.delivered_from.fmt_short());
-                            if msg.content.len() == 49 && msg.content[0] == 0x01 {
-                                let mut branch = [0u8; 16];
-                                branch.copy_from_slice(&msg.content[1..17]);
-                                let mut head = [0u8; 32];
-                                head.copy_from_slice(&msg.content[17..49]);
-                                // Fetch blobs from the sender THEN send HEAD event.
-                                let ep2 = ep2.clone();
-                                let events_tx2 = events_tx.clone();
-                                let from: iroh_base::EndpointId = msg.delivered_from.into();
-                                tokio::spawn(async move {
-                                    eprintln!("[host] fetching blobs for HEAD {} from {}", hex::encode(&head[..4]), from.fmt_short());
-                                    if let Err(e) = fetch_from_peer(&ep2, from, &branch, &events_tx2).await {
-                                        eprintln!("[host] fetch error: {e}");
-                                    }
-                                });
-                            }
-                        }
-                        iroh_gossip::api::Event::NeighborUp(peer) => {
-                            eprintln!("[host] gossip neighbor up: {}", peer.fmt_short());
-                        }
-                        iroh_gossip::api::Event::NeighborDown(peer) => {
-                            eprintln!("[host] gossip neighbor down: {}", peer.fmt_short());
-                        }
-                        _ => {}
-                    }
-                }
-                eprintln!("[host] gossip receiver ended");
-            });
-        }
-    }
-
-    // DHT.
+    // DHT (before gossip — gossip tasks need DHT API).
     let mut dht_api: Option<iroh_dht::api::ApiClient> = None;
     if !config.dht_bootstrap.is_empty() {
         let dht_alpn = iroh_dht::rpc::ALPN;
@@ -279,6 +222,67 @@ async fn host_loop(
         router_builder = router_builder
             .accept(dht_alpn, irpc_iroh::IrohProtocol::with_sender(dht_sender));
         dht_api = Some(api);
+    }
+
+    // Gossip.
+    let mut gossip_sender: Option<GossipSender> = None;
+    if let Some(ref topic_name) = config.gossip_topic {
+        let gossip = Gossip::builder().spawn(ep.clone());
+        router_builder = router_builder.accept(iroh_gossip::ALPN, gossip.clone());
+
+        let topic_id = iroh_gossip::TopicId::from_bytes(
+            *blake3::hash(topic_name.as_bytes()).as_bytes()
+        );
+        // Always use subscribe (non-blocking). The join happens in the background
+        // as peers come online. subscribe_and_join blocks until at least one peer
+        // is reachable, which causes hangs if peers start at different times.
+        let topic = gossip.subscribe(topic_id, config.gossip_peers.clone()).await;
+        eprintln!("[host] gossip subscribe result: {}", topic.is_ok());
+        if let Ok(topic) = topic {
+            let (sender, receiver) = topic.split();
+            gossip_sender = Some(sender);
+            let events_tx = events.clone();
+            let ep2 = ep.clone();
+            let dht_api2 = dht_api.clone();
+            tokio::spawn(async move {
+                let mut receiver = receiver;
+                eprintln!("[host] gossip receiver started");
+                while let Ok(Some(event)) = receiver.try_next().await {
+                    match &event {
+                        iroh_gossip::api::Event::Received(msg) => {
+                            eprintln!("[host] gossip received: {} bytes from {}", msg.content.len(), msg.delivered_from.fmt_short());
+                            if msg.content.len() == 49 && msg.content[0] == 0x01 {
+                                let mut branch = [0u8; 16];
+                                branch.copy_from_slice(&msg.content[1..17]);
+                                let mut head = [0u8; 32];
+                                head.copy_from_slice(&msg.content[17..49]);
+                                // Fetch blobs THEN send HEAD event.
+                                let ep2 = ep2.clone();
+                                let events_tx2 = events_tx.clone();
+                                let dht2 = dht_api2.clone();
+                                let from: iroh_base::EndpointId = msg.delivered_from.into();
+                                tokio::spawn(async move {
+                                    eprintln!("[host] fetching blobs for HEAD {} from {}", hex::encode(&head[..4]), from.fmt_short());
+                                    if let Err(e) = fetch_reachable(&ep2, from, &head, &dht2, &events_tx2).await {
+                                        eprintln!("[host] fetch error: {e}");
+                                    } else {
+                                        let _ = events_tx2.send(NetEvent::Head { branch, head });
+                                    }
+                                });
+                            }
+                        }
+                        iroh_gossip::api::Event::NeighborUp(peer) => {
+                            eprintln!("[host] gossip neighbor up: {}", peer.fmt_short());
+                        }
+                        iroh_gossip::api::Event::NeighborDown(peer) => {
+                            eprintln!("[host] gossip neighbor down: {}", peer.fmt_short());
+                        }
+                        _ => {}
+                    }
+                }
+                eprintln!("[host] gossip receiver ended");
+            });
+        }
     }
 
     let _router = router_builder.spawn();
@@ -318,9 +322,24 @@ async fn host_loop(
                 NetCommand::Fetch { peer, branch } => {
                     let ep = ep.clone();
                     let events_tx = events.clone();
+                    let dht = dht_api.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = fetch_from_peer(&ep, peer, &branch, &events_tx).await {
+                        // Get remote HEAD first.
+                        let conn = match ep.connect(peer, PILE_SYNC_ALPN).await {
+                            Ok(c) => c,
+                            Err(e) => { eprintln!("host: connect: {e}"); return; }
+                        };
+                        let head = match op_head(&conn, &branch).await {
+                            Ok(Some(h)) => h,
+                            Ok(None) => { eprintln!("host: no head"); return; }
+                            Err(e) => { eprintln!("host: head: {e}"); return; }
+                        };
+                        conn.close(0u32.into(), b"ok");
+                        // Fetch blobs (DHT first, peer fallback).
+                        if let Err(e) = fetch_reachable(&ep, peer, &head, &dht, &events_tx).await {
                             eprintln!("host: fetch error: {e}");
+                        } else {
+                            let _ = events_tx.send(NetEvent::Head { branch, head });
                         }
                     });
                 }
@@ -330,31 +349,67 @@ async fn host_loop(
     }
 }
 
-async fn fetch_from_peer(
+/// Fetch a single blob by hash: try DHT providers first, fall back to a direct peer.
+async fn fetch_blob(
+    ep: &iroh::Endpoint,
+    hash: &RawHash,
+    dht: &Option<iroh_dht::api::ApiClient>,
+    fallback_peer: EndpointId,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    // Try DHT first.
+    if let Some(ref api) = dht {
+        let blake3_hash = blake3::Hash::from_bytes(*hash);
+        if let Ok(providers) = api.find_providers(blake3_hash).await {
+            for provider in providers {
+                if let Ok(conn) = ep.connect(provider, PILE_SYNC_ALPN).await {
+                    if let Ok(Some(data)) = op_get_blob(&conn, hash).await {
+                        conn.close(0u32.into(), b"ok");
+                        return Ok(Some(data));
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: fetch from the gossip sender directly.
+    let conn = ep.connect(fallback_peer, PILE_SYNC_ALPN).await
+        .map_err(|e| anyhow::anyhow!("connect fallback: {e}"))?;
+    let result = op_get_blob(&conn, hash).await?;
+    conn.close(0u32.into(), b"ok");
+    Ok(result)
+}
+
+/// Fetch all blobs reachable from a remote HEAD.
+/// Uses DHT for blob discovery when available, falls back to direct peer.
+async fn fetch_reachable(
     ep: &iroh::Endpoint,
     peer: EndpointId,
-    branch: &RawBranchId,
+    head: &RawHash,
+    dht: &Option<iroh_dht::api::ApiClient>,
     events: &mpsc::Sender<NetEvent>,
 ) -> anyhow::Result<()> {
-    let conn = ep.connect(peer, PILE_SYNC_ALPN).await
-        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
-
-    let Some(head) = op_head(&conn, branch).await? else { return Ok(()); };
-
     let mut seen: HashSet<RawHash> = HashSet::new();
-    seen.insert(head);
-    if let Some(data) = op_get_blob(&conn, &head).await? {
+    seen.insert(*head);
+
+    // Fetch head blob.
+    if let Some(data) = fetch_blob(ep, head, dht, peer).await? {
         let _ = events.send(NetEvent::Blob(data));
     }
 
-    let mut current_level = vec![head];
+    // BFS: use CHILDREN from the peer for structure, DHT for blob data.
+    let mut current_level = vec![*head];
     while !current_level.is_empty() {
         let mut next_level = Vec::new();
         for parent in &current_level {
+            // CHILDREN from the gossip sender (they know the structure).
+            let conn = ep.connect(peer, PILE_SYNC_ALPN).await
+                .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
             let children = op_children(&conn, parent).await?;
+            conn.close(0u32.into(), b"ok");
+
             for hash in children {
                 if !seen.insert(hash) { continue; }
-                if let Some(data) = op_get_blob(&conn, &hash).await? {
+                if let Some(data) = fetch_blob(ep, &hash, dht, peer).await? {
                     let _ = events.send(NetEvent::Blob(data));
                     next_level.push(hash);
                 }
@@ -363,8 +418,6 @@ async fn fetch_from_peer(
         current_level = next_level;
     }
 
-    let _ = events.send(NetEvent::Head { branch: *branch, head });
-    conn.close(0u32.into(), b"done");
     Ok(())
 }
 
