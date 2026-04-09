@@ -11,23 +11,23 @@ use triblespace_core::value::Value;
 use triblespace_core::value::ValueSchema;
 use triblespace_core::value::schemas::hash::{Blake3, Handle};
 
-use crate::host::{Host, StoreSnapshot};
+use crate::host::{HostSender, StoreSnapshot};
 
 /// Store wrapper that sends outgoing network effects via a Host handle.
 pub struct Leader<S> {
     inner: S,
-    host: Host,
+    host: HostSender,
 }
 
 impl<S> Leader<S> {
-    pub fn new(store: S, host: Host) -> Self {
+    pub fn new(store: S, host: HostSender) -> Self {
         Self { inner: store, host }
     }
 
     pub fn store(&self) -> &S { &self.inner }
     pub fn store_mut(&mut self) -> &mut S { &mut self.inner }
     pub fn into_store(self) -> S { self.inner }
-    pub fn host(&self) -> &Host { &self.host }
+    pub fn host(&self) -> &HostSender { &self.host }
 }
 
 impl<S: BlobStorePut<Blake3> + BlobStore<Blake3> + BranchStore<Blake3>> BlobStorePut<Blake3> for Leader<S> {

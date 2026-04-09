@@ -1,8 +1,10 @@
-//! `Host`: the network thread.
+//! Network thread: spawns iroh endpoint, gossip, DHT, protocol server.
 //!
-//! Owns the iroh endpoint, gossip, DHT, and protocol server.
-//! Runs in its own thread with its own tokio runtime.
-//! Cloneable handle (`Arc` inside) — Leader and Follower hold clones.
+//! `spawn()` returns two halves:
+//! - `HostSender`: for Leader (commands + snapshot updates)
+//! - `HostReceiver`: for Follower (events)
+//!
+//! Async is jailed inside the spawned thread.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, mpsc};
@@ -15,7 +17,7 @@ use crate::channel::{NetCommand, NetEvent};
 use crate::identity::iroh_secret;
 use crate::protocol::*;
 
-/// Configuration for the Host.
+/// Configuration for the host thread.
 pub struct HostConfig {
     pub gossip_topic: Option<String>,
     pub gossip_peers: Vec<EndpointId>,
@@ -33,14 +35,12 @@ impl Default for HostConfig {
 }
 
 /// Snapshot of store state for serving protocol requests.
-/// Captures both blob reader and branch heads at a point in time.
 pub struct StoreSnapshot<R> {
     pub reader: R,
     pub branches: Vec<(RawBranchId, RawHash)>,
 }
 
 impl StoreSnapshot<()> {
-    /// Create a snapshot from a store.
     pub fn from_store<S>(store: &mut S) -> Option<StoreSnapshot<S::Reader>>
     where
         S: triblespace_core::repo::BlobStore<triblespace_core::value::schemas::hash::Blake3>
@@ -61,7 +61,7 @@ impl StoreSnapshot<()> {
     }
 }
 
-/// Trait object for serving — type-erased snapshot.
+/// Type-erased snapshot for the host thread.
 pub trait AnySnapshot: Send + 'static {
     fn get_blob(&self, hash: &RawHash) -> Option<Vec<u8>>;
     fn has_blob(&self, hash: &RawHash) -> bool;
@@ -95,100 +95,92 @@ where
     }
 }
 
-struct HostInner {
-    reader: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
-    cmd_tx: mpsc::Sender<NetCommand>,
-    evt_rx: Mutex<mpsc::Receiver<NetEvent>>,
-    id: EndpointId,
-    _thread: thread::JoinHandle<()>,
-}
+// ── Leader's half ────────────────────────────────────────────────────
 
-/// The network presence. Cloneable handle.
+/// Send commands to the host thread + update the serving snapshot.
 #[derive(Clone)]
-pub struct Host(Arc<HostInner>);
+pub struct HostSender {
+    cmd_tx: mpsc::Sender<NetCommand>,
+    snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
+    id: EndpointId,
+}
 
-impl Host {
-    pub fn new(key: SigningKey, config: HostConfig) -> Self {
-        let secret = iroh_secret(&key);
-        let id: EndpointId = secret.public().into();
+impl HostSender {
+    pub fn id(&self) -> EndpointId { self.id }
 
-        let (cmd_tx, cmd_rx) = mpsc::channel::<NetCommand>();
-        let (evt_tx, evt_rx) = mpsc::channel::<NetEvent>();
-
-        // Shared reader — Host thread reads, Leader updates.
-        let reader = Arc::new(Mutex::new(None::<Box<dyn AnySnapshot>>));
-        let thread_reader = reader.clone();
-
-        let thread = thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-            rt.block_on(host_loop(secret, config, cmd_rx, evt_tx, thread_reader));
-        });
-
-        Host(Arc::new(HostInner {
-            reader,
-            cmd_tx,
-            evt_rx: Mutex::new(evt_rx),
-            id,
-            _thread: thread,
-        }))
-    }
-
-    /// This node's endpoint ID (public key).
-    pub fn id(&self) -> EndpointId { self.0.id }
-
-    // ── Leader interface ─────────────────────────────────────────────
-
-    /// Send a command to the network thread (non-blocking).
-    pub fn send_command(&self, cmd: NetCommand) {
-        let _ = self.0.cmd_tx.send(cmd);
-    }
-
-    /// Announce a blob hash to the DHT.
     pub fn announce(&self, hash: RawHash) {
-        self.send_command(NetCommand::Announce(hash));
+        let _ = self.cmd_tx.send(NetCommand::Announce(hash));
     }
 
-    /// Gossip a HEAD change.
     pub fn gossip(&self, branch: RawBranchId, head: RawHash) {
-        self.send_command(NetCommand::Gossip { branch, head });
+        let _ = self.cmd_tx.send(NetCommand::Gossip { branch, head });
     }
 
-    /// Update the reader snapshot used for serving protocol requests.
-    pub fn update_snapshot(&self, reader: impl AnySnapshot) {
-        *self.0.reader.lock().unwrap() = Some(Box::new(reader));
-    }
-
-    // ── Follower interface ───────────────────────────────────────────
-
-    /// Try to receive an event from the network thread (non-blocking).
-    pub fn try_recv(&self) -> Option<NetEvent> {
-        self.0.evt_rx.lock().unwrap().try_recv().ok()
-    }
-
-    // ── Control ──────────────────────────────────────────────────────
-
-    /// Request a fetch from a remote peer.
     pub fn fetch(&self, peer: EndpointId, branch: RawBranchId) {
-        self.send_command(NetCommand::Fetch { peer, branch });
+        let _ = self.cmd_tx.send(NetCommand::Fetch { peer, branch });
+    }
+
+    pub fn update_snapshot(&self, snapshot: impl AnySnapshot) {
+        *self.snapshot.lock().unwrap() = Some(Box::new(snapshot));
     }
 }
 
-/// The async event loop running inside the Host thread.
+// ── Follower's half ──────────────────────────────────────────────────
+
+/// Receive events from the host thread.
+pub struct HostReceiver {
+    evt_rx: mpsc::Receiver<NetEvent>,
+    id: EndpointId,
+}
+
+impl HostReceiver {
+    pub fn id(&self) -> EndpointId { self.id }
+
+    pub fn try_recv(&self) -> Option<NetEvent> {
+        self.evt_rx.try_recv().ok()
+    }
+}
+
+// ── Spawn ────────────────────────────────────────────────────────────
+
+/// Spawn the host thread. Returns sender (for Leader) and receiver (for Follower).
+pub fn spawn(key: SigningKey, config: HostConfig) -> (HostSender, HostReceiver) {
+    let secret = iroh_secret(&key);
+    let id: EndpointId = secret.public().into();
+
+    let (cmd_tx, cmd_rx) = mpsc::channel::<NetCommand>();
+    let (evt_tx, evt_rx) = mpsc::channel::<NetEvent>();
+
+    let snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>> =
+        Arc::new(Mutex::new(None));
+    let thread_snapshot = snapshot.clone();
+
+    let _thread = thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(host_loop(secret, config, cmd_rx, evt_tx, thread_snapshot));
+    });
+
+    let sender = HostSender { cmd_tx, snapshot, id };
+    let receiver = HostReceiver { evt_rx, id };
+    (sender, receiver)
+}
+
+// ── Host thread event loop ───────────────────────────────────────────
+
 async fn host_loop(
     secret: iroh_base::SecretKey,
     config: HostConfig,
     commands: mpsc::Receiver<NetCommand>,
     events: mpsc::Sender<NetEvent>,
-    reader: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
+    snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
 ) {
     use iroh::endpoint::presets;
-    use iroh::protocol::{AcceptError, ProtocolHandler, Router};
+    use iroh::protocol::Router;
     use iroh::Endpoint;
     use iroh_gossip::Gossip;
     use iroh_gossip::api::GossipSender;
     use futures::TryStreamExt;
 
-    // Bind endpoint.
     let ep = match Endpoint::builder(presets::N0).secret_key(secret).bind().await {
         Ok(ep) => ep,
         Err(e) => { eprintln!("host: bind failed: {e}"); return; }
@@ -198,8 +190,8 @@ async fn host_loop(
     let my_id = ep.id();
     let mut router_builder = Router::builder(ep.clone());
 
-    // Protocol handler: serves from the shared reader.
-    let handler = ReaderHandler { reader: reader.clone() };
+    // Protocol handler.
+    let handler = SnapshotHandler { snapshot: snapshot.clone() };
     router_builder = router_builder.accept(PILE_SYNC_ALPN, handler);
 
     // Gossip.
@@ -219,7 +211,6 @@ async fn host_loop(
         if let Ok(topic) = topic {
             let (sender, receiver) = topic.split();
             gossip_sender = Some(sender);
-
             let events_tx = events.clone();
             tokio::spawn(async move {
                 let mut receiver = receiver;
@@ -266,9 +257,7 @@ async fn host_loop(
     loop {
         while let Ok(cmd) = commands.try_recv() {
             match cmd {
-                NetCommand::Announce(_hash) => {
-                    // TODO: DHT announce via _api
-                }
+                NetCommand::Announce(_hash) => { /* TODO: DHT announce */ }
                 NetCommand::Gossip { branch, head } => {
                     if let Some(ref sender) = gossip_sender {
                         let mut msg = Vec::with_capacity(49);
@@ -296,7 +285,6 @@ async fn host_loop(
     }
 }
 
-/// Fetch blobs reachable from a remote branch HEAD.
 async fn fetch_from_peer(
     ep: &iroh::Endpoint,
     peer: EndpointId,
@@ -306,13 +294,10 @@ async fn fetch_from_peer(
     let conn = ep.connect(peer, PILE_SYNC_ALPN).await
         .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
 
-    let Some(head) = op_head(&conn, branch).await? else {
-        return Ok(());
-    };
+    let Some(head) = op_head(&conn, branch).await? else { return Ok(()); };
 
     let mut seen: HashSet<RawHash> = HashSet::new();
     seen.insert(head);
-
     if let Some(data) = op_get_blob(&conn, &head).await? {
         let _ = events.send(NetEvent::Blob(data));
     }
@@ -338,30 +323,30 @@ async fn fetch_from_peer(
     Ok(())
 }
 
-// ── Protocol handler serving from shared reader ─────────────────────
+// ── Protocol handler ─────────────────────────────────────────────────
 
 #[derive(Clone)]
-struct ReaderHandler {
-    reader: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
+struct SnapshotHandler {
+    snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
 }
 
-impl std::fmt::Debug for ReaderHandler {
+impl std::fmt::Debug for SnapshotHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ReaderHandler").finish()
+        f.debug_struct("SnapshotHandler").finish()
     }
 }
 
-impl iroh::protocol::ProtocolHandler for ReaderHandler {
+impl iroh::protocol::ProtocolHandler for SnapshotHandler {
     async fn accept(&self, connection: iroh::endpoint::Connection) -> Result<(), iroh::protocol::AcceptError> {
-        let reader_arc = self.reader.clone();
+        let snap = self.snapshot.clone();
         loop {
             let (mut send, mut recv) = match connection.accept_bi().await {
                 Ok(pair) => pair,
                 Err(_) => break,
             };
-            let reader_arc = reader_arc.clone();
+            let snap = snap.clone();
             tokio::spawn(async move {
-                if let Err(e) = serve_from_reader(&reader_arc, &mut send, &mut recv).await {
+                if let Err(e) = serve_from_snapshot(&snap, &mut send, &mut recv).await {
                     eprintln!("handler error: {e}");
                 }
                 let _ = send.finish();
@@ -371,8 +356,8 @@ impl iroh::protocol::ProtocolHandler for ReaderHandler {
     }
 }
 
-async fn serve_from_reader(
-    reader_arc: &Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
+async fn serve_from_snapshot(
+    snap_arc: &Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
     send: &mut iroh::endpoint::SendStream,
     recv: &mut iroh::endpoint::RecvStream,
 ) -> anyhow::Result<()> {
@@ -380,8 +365,8 @@ async fn serve_from_reader(
 
     match op {
         OP_LIST => {
-            let branches = reader_arc.lock().unwrap().as_ref()
-                .map(|r| r.list_branches().to_vec())
+            let branches = snap_arc.lock().unwrap().as_ref()
+                .map(|s| s.list_branches().to_vec())
                 .unwrap_or_default();
             for (id, head) in &branches {
                 send_branch_id(send, id).await?;
@@ -392,17 +377,16 @@ async fn serve_from_reader(
 
         OP_HEAD => {
             let id_bytes = recv_branch_id(recv).await?;
-            let hash = reader_arc.lock().unwrap().as_ref()
-                .and_then(|r| r.head(&id_bytes))
+            let hash = snap_arc.lock().unwrap().as_ref()
+                .and_then(|s| s.head(&id_bytes))
                 .unwrap_or(NIL_HASH);
             send_hash(send, &hash).await?;
         }
 
         OP_GET_BLOB => {
             let hash = recv_hash(recv).await?;
-            // Lock, read, unlock BEFORE any await.
-            let data = reader_arc.lock().unwrap().as_ref()
-                .and_then(|r| r.get_blob(&hash));
+            let data = snap_arc.lock().unwrap().as_ref()
+                .and_then(|s| s.get_blob(&hash));
             match data {
                 Some(data) => {
                     send_u64_be(send, data.len() as u64).await?;
@@ -414,13 +398,12 @@ async fn serve_from_reader(
 
         OP_CHILDREN => {
             let parent_hash = recv_hash(recv).await?;
-            // Lock, collect children, unlock BEFORE any await.
             let children: Vec<RawHash> = {
-                let guard = reader_arc.lock().unwrap();
+                let guard = snap_arc.lock().unwrap();
                 match guard.as_ref() {
                     None => Vec::new(),
-                    Some(reader) => {
-                        match reader.get_blob(&parent_hash) {
+                    Some(snap) => {
+                        match snap.get_blob(&parent_hash) {
                             None => Vec::new(),
                             Some(parent_data) => {
                                 let mut result = Vec::new();
@@ -428,7 +411,7 @@ async fn serve_from_reader(
                                     if chunk.len() == 32 {
                                         let mut candidate = [0u8; 32];
                                         candidate.copy_from_slice(chunk);
-                                        if reader.has_blob(&candidate) {
+                                        if snap.has_blob(&candidate) {
                                             result.push(candidate);
                                         }
                                     }

@@ -16,25 +16,25 @@ use triblespace_core::value::ValueSchema;
 use triblespace_core::value::schemas::hash::{Blake3, Handle};
 
 use crate::channel::NetEvent;
-use crate::host::Host;
+use crate::host::HostReceiver;
 use crate::protocol::{RawHash, RawBranchId};
 
 /// Store wrapper that receives incoming sync events from the Host.
 pub struct Follower<S> {
     store: S,
-    host: Host,
+    host: HostReceiver,
     remote_heads: HashMap<RawBranchId, RawHash>,
 }
 
 impl<S> Follower<S> {
-    pub fn new(store: S, host: Host) -> Self {
+    pub fn new(store: S, host: HostReceiver) -> Self {
         Self { store, host, remote_heads: HashMap::new() }
     }
 
     pub fn store(&self) -> &S { &self.store }
     pub fn store_mut(&mut self) -> &mut S { &mut self.store }
     pub fn into_store(self) -> S { self.store }
-    pub fn host(&self) -> &Host { &self.host }
+    pub fn host(&self) -> &HostReceiver { &self.host }
 
     /// Latest known remote HEAD for a branch (by raw branch ID).
     pub fn remote_head_raw(&self, branch: &RawBranchId) -> Option<RawHash> {
