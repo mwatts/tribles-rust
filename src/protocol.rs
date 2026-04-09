@@ -13,7 +13,7 @@
 //!   HEAD       id:16 → hash:32                      (nil = no head)
 //!   GET_BLOB   hash:32 → len:u64 data                (u64::MAX = missing)
 //!   CHILDREN   parent:32 → hash* nil                  (nil = end)
-//!   CAS_PUSH   id:16 old:32 new:32 → ok:1 hash:32   (ok=1 success, ok=0 conflict)
+//!   (protocol is read-only — no remote writes)
 
 pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/3";
 
@@ -22,7 +22,9 @@ pub const OP_LIST: u8 = 0x01;
 pub const OP_GET_BLOB: u8 = 0x02;
 pub const OP_CHILDREN: u8 = 0x03;
 pub const OP_HEAD: u8 = 0x04;
-pub const OP_CAS_PUSH: u8 = 0x05;
+// CAS_PUSH removed: the data model is monotonic (set union), merge
+// always succeeds, and each node manages its own branches locally.
+// No remote writes needed — the protocol is read-only.
 
 pub const NIL_HASH: RawHash = [0u8; 32];
 pub const NIL_BRANCH_ID: RawBranchId = [0u8; 16];
@@ -128,30 +130,6 @@ pub async fn op_get_blob(conn: &Connection, hash: &RawHash) -> Result<Option<Vec
     let mut data = vec![0u8; len as usize];
     recv.read_exact(&mut data).await.map_err(|e| anyhow!("recv: {e}"))?;
     Ok(Some(data))
-}
-
-/// CAS_PUSH: compare-and-swap a branch head on the remote.
-/// ok=1 success, ok=0 conflict (followed by current head hash).
-pub async fn op_cas_push(
-    conn: &Connection,
-    branch_id: &RawBranchId,
-    old: Option<&RawHash>,
-    new: &RawHash,
-) -> Result<std::result::Result<(), RawHash>> {
-    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
-    send_u8(&mut send, OP_CAS_PUSH).await?;
-    send_branch_id(&mut send, branch_id).await?;
-    send_hash(&mut send, old.unwrap_or(&NIL_HASH)).await?;
-    send_hash(&mut send, new).await?;
-    send.finish().map_err(|e| anyhow!("finish: {e}"))?;
-
-    let ok = recv_u8(&mut recv).await?;
-    if ok == 1 {
-        Ok(Ok(()))
-    } else {
-        let current = recv_hash(&mut recv).await?;
-        Ok(Err(current))
-    }
 }
 
 // ── Convenience wrappers ─────────────────────────────────────────────
