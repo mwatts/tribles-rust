@@ -1,10 +1,7 @@
 //! `Leader<S>`: store wrapper that sends outgoing network effects.
 //!
-//! Fully sync. `put()` stores locally + sends Announce command.
-//! `update()` CAS locally + sends Gossip command. Channel sends
-//! are non-blocking — the Host thread processes them asynchronously.
-
-use std::sync::mpsc;
+//! Fully sync. `put()` stores + announces + refreshes reader.
+//! `update()` CAS + gossips. All via the Host handle.
 
 use triblespace_core::blob::{BlobSchema, ToBlob};
 use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
@@ -14,32 +11,26 @@ use triblespace_core::value::Value;
 use triblespace_core::value::ValueSchema;
 use triblespace_core::value::schemas::hash::{Blake3, Handle};
 
-use crate::channel::NetCommand;
+use crate::host::{Host, StoreSnapshot};
 
-/// Store wrapper that sends outgoing network effects.
+/// Store wrapper that sends outgoing network effects via a Host handle.
 pub struct Leader<S> {
     inner: S,
-    commands: mpsc::Sender<NetCommand>,
+    host: Host,
 }
 
 impl<S> Leader<S> {
-    pub fn new(store: S, commands: mpsc::Sender<NetCommand>) -> Self {
-        Self { inner: store, commands }
+    pub fn new(store: S, host: Host) -> Self {
+        Self { inner: store, host }
     }
 
-    /// Access the inner store.
     pub fn store(&self) -> &S { &self.inner }
-
-    /// Access the inner store mutably.
     pub fn store_mut(&mut self) -> &mut S { &mut self.inner }
-
-    /// Consume the leader, return the inner store.
     pub fn into_store(self) -> S { self.inner }
+    pub fn host(&self) -> &Host { &self.host }
 }
 
-// ── Trait delegations with side effects ──────────────────────────────
-
-impl<S: BlobStorePut<Blake3>> BlobStorePut<Blake3> for Leader<S> {
+impl<S: BlobStorePut<Blake3> + BlobStore<Blake3> + BranchStore<Blake3>> BlobStorePut<Blake3> for Leader<S> {
     type PutError = S::PutError;
 
     fn put<Sch, T>(&mut self, item: T) -> Result<Value<Handle<Blake3, Sch>>, Self::PutError>
@@ -49,12 +40,15 @@ impl<S: BlobStorePut<Blake3>> BlobStorePut<Blake3> for Leader<S> {
         Handle<Blake3, Sch>: ValueSchema,
     {
         let handle = self.inner.put(item)?;
-        let _ = self.commands.send(NetCommand::Announce(handle.raw));
+        self.host.announce(handle.raw);
+        if let Some(snap) = StoreSnapshot::from_store(&mut self.inner) {
+            self.host.update_snapshot(snap);
+        }
         Ok(handle)
     }
 }
 
-impl<S: BlobStore<Blake3>> BlobStore<Blake3> for Leader<S> {
+impl<S: BlobStore<Blake3> + BranchStore<Blake3> + BlobStorePut<Blake3>> BlobStore<Blake3> for Leader<S> {
     type Reader = S::Reader;
     type ReaderError = S::ReaderError;
 
@@ -63,7 +57,7 @@ impl<S: BlobStore<Blake3>> BlobStore<Blake3> for Leader<S> {
     }
 }
 
-impl<S: BranchStore<Blake3>> BranchStore<Blake3> for Leader<S> {
+impl<S: BranchStore<Blake3> + BlobStore<Blake3> + BlobStorePut<Blake3>> BranchStore<Blake3> for Leader<S> {
     type BranchesError = S::BranchesError;
     type HeadError = S::HeadError;
     type UpdateError = S::UpdateError;
@@ -87,7 +81,10 @@ impl<S: BranchStore<Blake3>> BranchStore<Blake3> for Leader<S> {
         if let PushResult::Success() = &result {
             if let Some(head) = new {
                 let branch: [u8; 16] = id.into();
-                let _ = self.commands.send(NetCommand::Gossip { branch, head: head.raw });
+                self.host.gossip(branch, head.raw);
+                if let Some(snap) = StoreSnapshot::from_store(&mut self.inner) {
+                    self.host.update_snapshot(snap);
+                }
             }
         }
         Ok(result)

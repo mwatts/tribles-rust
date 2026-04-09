@@ -1,11 +1,9 @@
 //! `Follower<S>`: store wrapper that receives incoming sync events.
 //!
-//! Fully sync. `poll()` drains the event channel, puts blobs, updates
-//! tracking refs. No async, no Arc, no Mutex, no background threads.
-//! The caller drives the event loop.
+//! Fully sync. `poll()` drains events from the Host, puts blobs,
+//! updates tracking refs. No async, no Arc, no background threads.
 
 use std::collections::HashMap;
-use std::sync::mpsc;
 
 use anybytes::Bytes;
 use triblespace_core::blob::{BlobSchema, ToBlob};
@@ -18,28 +16,25 @@ use triblespace_core::value::ValueSchema;
 use triblespace_core::value::schemas::hash::{Blake3, Handle};
 
 use crate::channel::NetEvent;
+use crate::host::Host;
 use crate::protocol::{RawHash, RawBranchId};
 
-/// Store wrapper that receives incoming sync events.
+/// Store wrapper that receives incoming sync events from the Host.
 pub struct Follower<S> {
     store: S,
-    events: mpsc::Receiver<NetEvent>,
+    host: Host,
     remote_heads: HashMap<RawBranchId, RawHash>,
 }
 
 impl<S> Follower<S> {
-    pub fn new(store: S, events: mpsc::Receiver<NetEvent>) -> Self {
-        Self { store, events, remote_heads: HashMap::new() }
+    pub fn new(store: S, host: Host) -> Self {
+        Self { store, host, remote_heads: HashMap::new() }
     }
 
-    /// Access the inner store.
     pub fn store(&self) -> &S { &self.store }
-
-    /// Access the inner store mutably.
     pub fn store_mut(&mut self) -> &mut S { &mut self.store }
-
-    /// Consume the follower, return the inner store.
     pub fn into_store(self) -> S { self.store }
+    pub fn host(&self) -> &Host { &self.host }
 
     /// Latest known remote HEAD for a branch (by raw branch ID).
     pub fn remote_head_raw(&self, branch: &RawBranchId) -> Option<RawHash> {
@@ -58,15 +53,12 @@ impl<S> Follower<S> {
     }
 }
 
-impl<S> Follower<S>
-where
-    S: BlobStorePut<Blake3>,
-{
+impl<S: BlobStorePut<Blake3>> Follower<S> {
     /// Drain pending events: store blobs, update tracking refs.
     /// Returns the number of events processed.
     pub fn poll(&mut self) -> usize {
         let mut count = 0;
-        while let Ok(event) = self.events.try_recv() {
+        while let Some(event) = self.host.try_recv() {
             match event {
                 NetEvent::Blob(data) => {
                     let bytes: Bytes = data.into();
