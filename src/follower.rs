@@ -64,14 +64,12 @@ impl<S: BlobStorePut<Blake3> + BlobStore<Blake3> + BranchStore<Blake3>> Follower
                     let bytes: Bytes = data.into();
                     let _ = self.store.put::<UnknownBlob, Bytes>(bytes);
                 }
-                NetEvent::Head { branch, head } => {
+                NetEvent::Head { branch, head, publisher } => {
                     self.remote_heads.insert(branch, head);
-                    // Read the branch name from the metadata blob and
-                    // create/update a tracking branch.
                     if let Some(remote_id) = triblespace_core::id::Id::new(branch) {
                         if let Some(name) = read_remote_name(&mut self.store, &head) {
                             crate::tracking::ensure_tracking_branch(
-                                &mut self.store, remote_id, &head, &name,
+                                &mut self.store, remote_id, &head, &name, &publisher,
                             );
                         }
                     }

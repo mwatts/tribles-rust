@@ -14,16 +14,18 @@ use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut, BranchStore,
 use triblespace_core::trible::TribleSet;
 use triblespace_core::value::Value;
 use triblespace_core::value::schemas::hash::{Blake3, Handle};
-use triblespace_core::prelude::valueschemas::GenId;
+use triblespace_core::prelude::valueschemas::{GenId, ED25519PublicKey};
 use triblespace_core::prelude::attributes;
 use triblespace_core::macros::{find, pattern, entity};
 
+use crate::channel::PublisherKey;
 use crate::protocol::{RawHash, RawBranchId};
 
 // Minted attribute IDs for tracking branches.
 attributes! {
     "FD45B98C108B3F9F2D18C0B5373BC9FB" as pub remote_name: Handle<Blake3, LongString>;
     "ACEBAE99F0B5B1E12DAE3FDC1E2BC575" as pub tracking_remote_branch: GenId;
+    "C52A223988BB237B0859319661DA23F5" as pub tracking_peer: ED25519PublicKey;
 }
 
 /// Find a tracking branch for the given remote branch ID.
@@ -57,6 +59,7 @@ pub fn create_tracking_branch<S>(
     remote_branch_id: Id,
     remote_head_hash: &RawHash,
     remote_name_str: &str,
+    publisher: &PublisherKey,
 ) -> Option<Id>
 where
     S: BlobStore<Blake3> + BlobStorePut<Blake3> + BranchStore<Blake3>,
@@ -70,12 +73,14 @@ where
 
     // Build tracking branch metadata with content-derived entity ID.
     let head_handle = Value::<Handle<Blake3, SimpleArchive>>::new(*remote_head_hash);
+    let pub_key = ed25519_dalek::VerifyingKey::from_bytes(publisher).ok()?;
 
     let meta = entity! { &tracking_eid @
         triblespace_core::repo::branch: tracking_id,
         triblespace_core::repo::head: head_handle,
         remote_name: name_handle,
         tracking_remote_branch: remote_branch_id,
+        tracking_peer: pub_key,
     };
 
     let meta_set: TribleSet = meta.into();
@@ -95,6 +100,7 @@ pub fn update_tracking_branch<S>(
     remote_branch_id: Id,
     new_head_hash: &RawHash,
     remote_name_str: &str,
+    publisher: &PublisherKey,
 ) -> Option<()>
 where
     S: BlobStore<Blake3> + BlobStorePut<Blake3> + BranchStore<Blake3>,
@@ -105,12 +111,14 @@ where
     let name_handle: Value<Handle<Blake3, LongString>> = store.put::<LongString, String>(name_string).ok()?;
     let head_handle = Value::<Handle<Blake3, SimpleArchive>>::new(*new_head_hash);
 
+    let pub_key = ed25519_dalek::VerifyingKey::from_bytes(publisher).ok()?;
     let eid = genid();
     let meta = entity! { &eid @
         triblespace_core::repo::branch: tracking_branch_id,
         triblespace_core::repo::head: head_handle,
         remote_name: name_handle,
         tracking_remote_branch: remote_branch_id,
+        tracking_peer: pub_key,
     };
     let meta_set: TribleSet = meta.into();
 
@@ -128,14 +136,15 @@ pub fn ensure_tracking_branch<S>(
     remote_branch_id: Id,
     remote_head_hash: &RawHash,
     remote_name_str: &str,
+    publisher: &PublisherKey,
 ) -> Option<Id>
 where
     S: BlobStore<Blake3> + BlobStorePut<Blake3> + BranchStore<Blake3>,
 {
     if let Some(tracking_id) = find_tracking_branch(store, remote_branch_id) {
-        update_tracking_branch(store, tracking_id, remote_branch_id, remote_head_hash, remote_name_str);
+        update_tracking_branch(store, tracking_id, remote_branch_id, remote_head_hash, remote_name_str, publisher);
         Some(tracking_id)
     } else {
-        create_tracking_branch(store, remote_branch_id, remote_head_hash, remote_name_str)
+        create_tracking_branch(store, remote_branch_id, remote_head_hash, remote_name_str, publisher)
     }
 }

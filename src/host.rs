@@ -239,22 +239,30 @@ async fn host_loop(
                 while let Ok(Some(event)) = receiver.try_next().await {
                     match &event {
                         iroh_gossip::api::Event::Received(msg) => {
-                            if msg.content.len() == 49 && msg.content[0] == 0x01 {
+                            // Gossip HEAD message: 0x01 + branch(16) + head(32) + publisher(32) = 81 bytes
+                            if msg.content.len() == 81 && msg.content[0] == 0x01 {
                                 let mut branch = [0u8; 16];
                                 branch.copy_from_slice(&msg.content[1..17]);
                                 let mut head = [0u8; 32];
                                 head.copy_from_slice(&msg.content[17..49]);
-                                // Fetch blobs THEN send HEAD event.
+                                let mut publisher = [0u8; 32];
+                                publisher.copy_from_slice(&msg.content[49..81]);
+
                                 let ep2 = ep2.clone();
                                 let events_tx2 = events_tx.clone();
                                 let dht2 = dht_api2.clone();
-                                let from: iroh_base::EndpointId = msg.delivered_from.into();
+                                // Use publisher key to connect for fetch (they're the source).
+                                let fetch_peer = if let Ok(pk) = iroh_base::PublicKey::from_bytes(&publisher) {
+                                    pk.into()
+                                } else {
+                                    msg.delivered_from.into()
+                                };
                                 tokio::spawn(async move {
-                                    eprintln!("[host] fetching blobs for HEAD {} from {}", hex::encode(&head[..4]), from.fmt_short());
-                                    if let Err(e) = fetch_reachable(&ep2, from, &head, &dht2, &events_tx2).await {
+                                    eprintln!("[host] fetching HEAD {} from publisher {}", hex::encode(&head[..4]), hex::encode(&publisher[..4]));
+                                    if let Err(e) = fetch_reachable(&ep2, fetch_peer, &head, &dht2, &events_tx2).await {
                                         eprintln!("[host] fetch error: {e}");
                                     } else {
-                                        let _ = events_tx2.send(NetEvent::Head { branch, head });
+                                        let _ = events_tx2.send(NetEvent::Head { branch, head, publisher });
                                     }
                                 });
                             }
@@ -289,10 +297,11 @@ async fn host_loop(
                 }
                 NetCommand::Gossip { branch, head } => {
                     if let Some(ref sender) = gossip_sender {
-                        let mut msg = Vec::with_capacity(49);
+                        let mut msg = Vec::with_capacity(81);
                         msg.push(0x01);
                         msg.extend_from_slice(&branch);
                         msg.extend_from_slice(&head);
+                        msg.extend_from_slice(my_id.as_bytes());
                         let sender = sender.clone();
                         tokio::spawn(async move {
                             let _ = sender.broadcast(msg.into()).await;
@@ -316,10 +325,13 @@ async fn host_loop(
                         };
                         conn.close(0u32.into(), b"ok");
                         // Fetch blobs (DHT first, peer fallback).
+                        // For explicit fetch, the publisher is the peer we're fetching from.
+                        let mut publisher = [0u8; 32];
+                        publisher.copy_from_slice(peer.as_bytes());
                         if let Err(e) = fetch_reachable(&ep, peer, &head, &dht, &events_tx).await {
                             eprintln!("host: fetch error: {e}");
                         } else {
-                            let _ = events_tx.send(NetEvent::Head { branch, head });
+                            let _ = events_tx.send(NetEvent::Head { branch, head, publisher });
                         }
                     });
                 }
