@@ -342,13 +342,18 @@ async fn host_loop(
 }
 
 /// Fetch a single blob by hash from any available source.
-/// Tries DHT providers, then the hint peer (e.g. gossip sender).
+/// Tries DHT providers, then the hint peer. Verifies blake3 hash before returning.
 async fn fetch_blob(
     ep: &iroh::Endpoint,
     hash: &RawHash,
     dht: &Option<iroh_dht::api::ApiClient>,
     hint_peer: EndpointId,
 ) -> anyhow::Result<Option<Vec<u8>>> {
+    let verify = |data: &[u8]| -> bool {
+        let computed = blake3::hash(data);
+        computed.as_bytes() == hash
+    };
+
     // DHT: ask the network who has this blob.
     if let Some(ref api) = dht {
         let blake3_hash = blake3::Hash::from_bytes(*hash);
@@ -357,7 +362,10 @@ async fn fetch_blob(
                 if let Ok(conn) = ep.connect(provider, PILE_SYNC_ALPN).await {
                     if let Ok(Some(data)) = op_get_blob(&conn, hash).await {
                         conn.close(0u32.into(), b"ok");
-                        return Ok(Some(data));
+                        if verify(&data) {
+                            return Ok(Some(data));
+                        }
+                        eprintln!("[host] hash mismatch from DHT provider {}", provider.fmt_short());
                     }
                 }
             }
@@ -368,7 +376,10 @@ async fn fetch_blob(
     if let Ok(conn) = ep.connect(hint_peer, PILE_SYNC_ALPN).await {
         if let Ok(Some(data)) = op_get_blob(&conn, hash).await {
             conn.close(0u32.into(), b"ok");
-            return Ok(Some(data));
+            if verify(&data) {
+                return Ok(Some(data));
+            }
+            eprintln!("[host] hash mismatch from hint peer {}", hint_peer.fmt_short());
         }
     }
 
