@@ -1,24 +1,25 @@
-//! Distributed sync protocol for triblespace.
+//! Distributed sync for triblespace.
 //!
-//! Storage-agnostic: all operations are expressed in terms of
-//! triblespace's `BlobStore`, `BlobStorePut`, and `BranchStore` traits.
-//! Any backend (Pile, S3, in-memory) works as both local and remote
-//! storage — the `RemoteStore` is just another `BlobStore` that happens
-//! to do network I/O.
+//! Three composable types, one async boundary:
 //!
-//! The protocol has three operations:
+//! - **Host**: network thread (identity, endpoint, gossip, DHT)
+//! - **Leader\<S\>**: store wrapper, outgoing effects (announce, gossip)
+//! - **Follower\<S\>**: store wrapper, incoming sync (poll-driven)
 //!
-//! - **LIST**: enumerate branches (id + head hash)
-//! - **GET_BLOB**: fetch a blob by hash
-//! - **SYNC**: batch reference diff (client sends HAVE set, server sends complement)
+//! `Follower<Leader<Pile>>` = peer.
 //!
-//! Names are resolved externally. The protocol only sees 16-byte branch
-//! IDs and 32-byte blob hashes.
+//! All store traits (`BlobStore`, `BranchStore`) stay sync.
+//! Async is jailed inside the Host thread.
 
+pub mod channel;
+pub mod host;
+pub mod leader;
+pub mod follower;
 pub mod protocol;
+pub mod identity;
+
+// Legacy modules — will be removed once CLI migrates.
 pub mod remote;
 pub mod server;
 pub mod sync;
-pub mod identity;
 pub mod node;
-pub mod follower;
