@@ -349,14 +349,15 @@ async fn host_loop(
     }
 }
 
-/// Fetch a single blob by hash: try DHT providers first, fall back to a direct peer.
+/// Fetch a single blob by hash from any available source.
+/// Tries DHT providers, then the hint peer (e.g. gossip sender).
 async fn fetch_blob(
     ep: &iroh::Endpoint,
     hash: &RawHash,
     dht: &Option<iroh_dht::api::ApiClient>,
-    fallback_peer: EndpointId,
+    hint_peer: EndpointId,
 ) -> anyhow::Result<Option<Vec<u8>>> {
-    // Try DHT first.
+    // DHT: ask the network who has this blob.
     if let Some(ref api) = dht {
         let blake3_hash = blake3::Hash::from_bytes(*hash);
         if let Ok(providers) = api.find_providers(blake3_hash).await {
@@ -371,12 +372,15 @@ async fn fetch_blob(
         }
     }
 
-    // Fallback: fetch from the gossip sender directly.
-    let conn = ep.connect(fallback_peer, PILE_SYNC_ALPN).await
-        .map_err(|e| anyhow::anyhow!("connect fallback: {e}"))?;
-    let result = op_get_blob(&conn, hash).await?;
-    conn.close(0u32.into(), b"ok");
-    Ok(result)
+    // Hint peer: the gossip sender likely has it.
+    if let Ok(conn) = ep.connect(hint_peer, PILE_SYNC_ALPN).await {
+        if let Ok(Some(data)) = op_get_blob(&conn, hash).await {
+            conn.close(0u32.into(), b"ok");
+            return Ok(Some(data));
+        }
+    }
+
+    Ok(None)
 }
 
 /// Fetch all blobs reachable from a remote HEAD.
