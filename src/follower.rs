@@ -53,8 +53,8 @@ impl<S> Follower<S> {
     }
 }
 
-impl<S: BlobStorePut<Blake3> + BranchStore<Blake3>> Follower<S> {
-    /// Drain pending events: store blobs, update tracking refs + branch pointers.
+impl<S: BlobStorePut<Blake3> + BlobStore<Blake3> + BranchStore<Blake3>> Follower<S> {
+    /// Drain pending events: store blobs, create/update tracking branches.
     /// Returns the number of events processed.
     pub fn poll(&mut self) -> usize {
         let mut count = 0;
@@ -65,20 +65,46 @@ impl<S: BlobStorePut<Blake3> + BranchStore<Blake3>> Follower<S> {
                     let _ = self.store.put::<UnknownBlob, Bytes>(bytes);
                 }
                 NetEvent::Head { branch, head } => {
-                    // Store remote HEAD as a branch pointer so Repository can pull it.
-                    if let Some(branch_id) = triblespace_core::id::Id::new(branch) {
-                        let old = self.remote_heads.get(&branch)
-                            .map(|h| Value::<Handle<Blake3, SimpleArchive>>::new(*h));
-                        let new = Value::<Handle<Blake3, SimpleArchive>>::new(head);
-                        let _ = self.store.update(branch_id, old, Some(new));
-                    }
                     self.remote_heads.insert(branch, head);
+                    // Read the branch name from the metadata blob and
+                    // create/update a tracking branch.
+                    if let Some(remote_id) = triblespace_core::id::Id::new(branch) {
+                        if let Some(name) = read_remote_name(&mut self.store, &head) {
+                            crate::tracking::ensure_tracking_branch(
+                                &mut self.store, remote_id, &head, &name,
+                            );
+                        }
+                    }
                 }
             }
             count += 1;
         }
         count
     }
+}
+
+/// Read the branch name from a branch metadata blob.
+fn read_remote_name<S: BlobStore<Blake3>>(store: &mut S, head_hash: &RawHash) -> Option<String> {
+    use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
+    use triblespace_core::blob::schemas::longstring::LongString;
+    use triblespace_core::repo::BlobStoreGet;
+    use triblespace_core::macros::{find, pattern};
+
+    let reader = store.reader().ok()?;
+    let meta_handle = Value::<Handle<Blake3, SimpleArchive>>::new(*head_hash);
+    let meta: triblespace_core::trible::TribleSet = reader.get(meta_handle).ok()?;
+
+    // Try `name` first (normal branch), then `remote_name` (tracking branch).
+    let name_handle: Value<Handle<Blake3, LongString>> = find!(
+        h: Value<Handle<Blake3, LongString>>,
+        pattern!(&meta, [{ _?e @ triblespace_core::metadata::name: ?h }])
+    ).next().or_else(|| find!(
+        h: Value<Handle<Blake3, LongString>>,
+        pattern!(&meta, [{ _?e @ crate::tracking::remote_name: ?h }])
+    ).next())?;
+
+    let name_view: anybytes::View<str> = reader.get(name_handle).ok()?;
+    Some(name_view.as_ref().to_string())
 }
 
 // ── Trait delegations ────────────────────────────────────────────────
