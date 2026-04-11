@@ -16,20 +16,20 @@ use iroh_base::SecretKey;
 /// Load or create a persistent node identity.
 ///
 /// Resolution order:
-/// 1. Explicit path (if provided)
-/// 2. `TRIBLESPACE_KEY` environment variable
-/// 3. `<default_dir>/self.key` (auto-created if missing)
+/// 1. Explicit path (if provided) — auto-created if missing
+/// 2. `TRIBLESPACE_KEY` environment variable — auto-created if missing
+/// 3. `<default_dir>/self.key` — auto-created if missing
 pub fn load_or_create_key(
     explicit_path: &Option<std::path::PathBuf>,
     default_dir: &Path,
 ) -> Result<SigningKey> {
-    if let Some(p) = explicit_path {
-        return load_key_from_file(p);
-    }
-    if let Ok(s) = std::env::var("TRIBLESPACE_KEY") {
-        return load_key_from_file(Path::new(&s));
-    }
-    let key_path = default_dir.join("self.key");
+    let key_path = match explicit_path {
+        Some(p) => p.clone(),
+        None => match std::env::var("TRIBLESPACE_KEY") {
+            Ok(s) => std::path::PathBuf::from(s),
+            Err(_) => default_dir.join("self.key"),
+        },
+    };
     if key_path.exists() {
         return load_key_from_file(&key_path);
     }
