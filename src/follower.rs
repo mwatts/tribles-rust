@@ -1,62 +1,54 @@
 //! `Follower<S>`: store wrapper that receives incoming sync events.
 //!
-//! Fully sync. `poll()` drains events from the Host, puts blobs,
-//! updates tracking refs. No async, no Arc, no background threads.
-
-use std::collections::HashMap;
+//! Fully sync. `poll()` drains events from the Host, puts blobs into the
+//! wrapped store, and creates/updates tracking branches. The follower keeps
+//! no in-memory mirror state of its own — tracking branches in the underlying
+//! store are the canonical "what remotes do I know about" answer (queryable
+//! via [`crate::tracking::list_tracking_branches`]).
 
 use anybytes::Bytes;
 use triblespace_core::blob::{BlobSchema, ToBlob};
 use triblespace_core::blob::schemas::UnknownBlob;
 use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
 use triblespace_core::id::Id;
-use triblespace_core::repo::{BlobStore, BlobStorePut, BranchStore, PushResult};
+use triblespace_core::repo::{BlobStore, BlobStorePut, BranchStore, Poll, PushResult};
 use triblespace_core::value::Value;
 use triblespace_core::value::ValueSchema;
 use triblespace_core::value::schemas::hash::{Blake3, Handle};
 
 use crate::channel::NetEvent;
 use crate::host::HostReceiver;
-use crate::protocol::{RawHash, RawBranchId};
+use crate::protocol::RawHash;
 
 /// Store wrapper that receives incoming sync events from the Host.
 pub struct Follower<S> {
     store: S,
     host: HostReceiver,
-    remote_heads: HashMap<RawBranchId, RawHash>,
 }
 
 impl<S> Follower<S> {
     pub fn new(store: S, host: HostReceiver) -> Self {
-        Self { store, host, remote_heads: HashMap::new() }
+        Self { store, host }
     }
 
     pub fn store(&self) -> &S { &self.store }
     pub fn store_mut(&mut self) -> &mut S { &mut self.store }
     pub fn into_store(self) -> S { self.store }
     pub fn host(&self) -> &HostReceiver { &self.host }
-
-    /// Latest known remote HEAD for a branch (by raw branch ID).
-    pub fn remote_head_raw(&self, branch: &RawBranchId) -> Option<RawHash> {
-        self.remote_heads.get(branch).copied()
-    }
-
-    /// Latest known remote HEAD for a branch (by Id).
-    pub fn remote_head(&self, branch_id: Id) -> Option<RawHash> {
-        let key: [u8; 16] = branch_id.into();
-        self.remote_heads.get(&key).copied()
-    }
-
-    /// All known remote branch heads.
-    pub fn remote_heads(&self) -> &HashMap<RawBranchId, RawHash> {
-        &self.remote_heads
-    }
 }
 
-impl<S: BlobStorePut<Blake3> + BlobStore<Blake3> + BranchStore<Blake3>> Follower<S> {
-    /// Drain pending events: store blobs, create/update tracking branches.
-    /// Returns the number of events processed.
-    pub fn poll(&mut self) -> usize {
+impl<S> Poll for Follower<S>
+where
+    S: Poll + BlobStorePut<Blake3> + BlobStore<Blake3> + BranchStore<Blake3>,
+{
+    type Error = S::Error;
+
+    /// Drain pending gossip events into the wrapped store, then poll the
+    /// wrapped store itself (e.g. refresh a Pile from disk).
+    ///
+    /// Returns the total number of significant events applied across this
+    /// layer (drained gossip events) and the inner layer.
+    fn poll(&mut self) -> Result<usize, Self::Error> {
         let mut count = 0;
         while let Some(event) = self.host.try_recv() {
             match event {
@@ -65,7 +57,6 @@ impl<S: BlobStorePut<Blake3> + BlobStore<Blake3> + BranchStore<Blake3>> Follower
                     let _ = self.store.put::<UnknownBlob, Bytes>(bytes);
                 }
                 NetEvent::Head { branch, head, publisher } => {
-                    self.remote_heads.insert(branch, head);
                     if let Some(remote_id) = triblespace_core::id::Id::new(branch) {
                         if let Some(name) = read_remote_name(&mut self.store, &head) {
                             crate::tracking::ensure_tracking_branch(
@@ -77,7 +68,8 @@ impl<S: BlobStorePut<Blake3> + BlobStore<Blake3> + BranchStore<Blake3>> Follower
             }
             count += 1;
         }
-        count
+        let inner = self.store.poll()?;
+        Ok(count + inner)
     }
 }
 
