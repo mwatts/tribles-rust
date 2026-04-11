@@ -106,8 +106,44 @@ where
     /// workflows. Does not require `gossip_topic` to be set — works in
     /// pull-only mode too. The fetched data lands in the wrapped store
     /// via the same auto-drain path that `refresh` uses.
+    ///
+    /// Fire-and-forget: returns immediately. Use [`pull_branch`](Self::pull_branch)
+    /// if you want to block until the tracking branch is materialized.
     pub fn track(&self, peer: EndpointId, branch: RawBranchId) {
         self.sender.track(peer, branch);
+    }
+
+    /// High-level pull: resolve a branch by *name* on a remote peer,
+    /// kick off a reachable-closure fetch, and block until the local
+    /// tracking branch is materialized. Returns the local tracking
+    /// branch id — feed it straight into `Repository::pull` to get a
+    /// workspace that merges via `merge_commit`.
+    ///
+    /// Composes [`list_remote_branches`](Self::list_remote_branches),
+    /// [`fetch`](Self::fetch), [`track`](Self::track), and the tracking
+    /// auto-drain on reads. Times out at 30 s if the remote never sends
+    /// the HEAD.
+    pub fn pull_branch(
+        &mut self,
+        remote: EndpointId,
+        name: &str,
+    ) -> anyhow::Result<Id> {
+        let (remote_id, _head) = resolve_branch_name(self, remote, name)?
+            .ok_or_else(|| anyhow::anyhow!("branch '{name}' not found on remote"))?;
+
+        let branch_bytes: [u8; 16] = remote_id.into();
+        self.track(remote, branch_bytes);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Some(id) = crate::tracking::find_tracking_branch(self, remote_id) {
+                return Ok(id);
+            }
+            if std::time::Instant::now() > deadline {
+                return Err(anyhow::anyhow!("timed out waiting for remote HEAD"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     /// RPC: list a remote peer's branches. One protocol round trip.
