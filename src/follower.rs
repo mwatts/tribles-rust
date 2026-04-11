@@ -1,17 +1,19 @@
 //! `Follower<S>`: store wrapper that receives incoming sync events.
 //!
-//! Fully sync. `poll()` drains events from the Host, puts blobs into the
-//! wrapped store, and creates/updates tracking branches. The follower keeps
-//! no in-memory mirror state of its own — tracking branches in the underlying
-//! store are the canonical "what remotes do I know about" answer (queryable
-//! via [`crate::tracking::list_tracking_branches`]).
+//! Drains pending gossip events from the Host into the wrapped store on
+//! every read (mirroring `Pile::refresh`'s "catch up to the latest external
+//! state" pattern). Callers don't need to schedule explicit polls — using
+//! the storage normally keeps it fresh. The follower keeps no in-memory
+//! mirror state of its own; tracking branches in the underlying store are
+//! the canonical "what remotes do I know about" answer (queryable via
+//! [`crate::tracking::list_tracking_branches`]).
 
 use anybytes::Bytes;
 use triblespace_core::blob::{BlobSchema, ToBlob};
 use triblespace_core::blob::schemas::UnknownBlob;
 use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
 use triblespace_core::id::Id;
-use triblespace_core::repo::{BlobStore, BlobStorePut, BranchStore, Poll, PushResult};
+use triblespace_core::repo::{BlobStore, BlobStorePut, BranchStore, PushResult};
 use triblespace_core::value::Value;
 use triblespace_core::value::ValueSchema;
 use triblespace_core::value::schemas::hash::{Blake3, Handle};
@@ -37,18 +39,20 @@ impl<S> Follower<S> {
     pub fn host(&self) -> &HostReceiver { &self.host }
 }
 
-impl<S> Poll for Follower<S>
+impl<S> Follower<S>
 where
-    S: Poll + BlobStorePut<Blake3> + BlobStore<Blake3> + BranchStore<Blake3>,
+    S: BlobStorePut<Blake3> + BlobStore<Blake3> + BranchStore<Blake3>,
 {
-    type Error = S::Error;
-
-    /// Drain pending gossip events into the wrapped store, then poll the
-    /// wrapped store itself (e.g. refresh a Pile from disk).
+    /// Drain any pending gossip events from the Host into the wrapped store.
     ///
-    /// Returns the total number of significant events applied across this
-    /// layer (drained gossip events) and the inner layer.
-    fn poll(&mut self) -> Result<usize, Self::Error> {
+    /// This is the explicit form of the auto-refresh that the BlobStore /
+    /// BranchStore read methods do internally. It's safe to call any time
+    /// — if no events are pending it's a no-op. Returns the number of
+    /// events processed.
+    ///
+    /// Mirrors [`Pile::refresh`](triblespace_core::repo::pile::Pile::refresh):
+    /// the inherent "catch up to the latest external state" primitive.
+    pub fn refresh(&mut self) -> usize {
         let mut count = 0;
         while let Some(event) = self.host.try_recv() {
             match event {
@@ -68,8 +72,7 @@ where
             }
             count += 1;
         }
-        let inner = self.store.poll()?;
-        Ok(count + inner)
+        count
     }
 }
 
@@ -98,6 +101,11 @@ fn read_remote_name<S: BlobStore<Blake3>>(store: &mut S, head_hash: &RawHash) ->
 }
 
 // ── Trait delegations ────────────────────────────────────────────────
+//
+// Reads (`reader`, `head`, `branches`) call `refresh()` first so they always
+// see the latest gossiped state. Writes (`put`, `update`) don't need to
+// drain — `put` doesn't depend on existing state, and `update` is a CAS
+// that's invariably preceded by a read in any sane caller.
 
 impl<S: BlobStorePut<Blake3>> BlobStorePut<Blake3> for Follower<S> {
     type PutError = S::PutError;
@@ -112,26 +120,35 @@ impl<S: BlobStorePut<Blake3>> BlobStorePut<Blake3> for Follower<S> {
     }
 }
 
-impl<S: BlobStore<Blake3>> BlobStore<Blake3> for Follower<S> {
+impl<S> BlobStore<Blake3> for Follower<S>
+where
+    S: BlobStorePut<Blake3> + BlobStore<Blake3> + BranchStore<Blake3>,
+{
     type Reader = S::Reader;
     type ReaderError = S::ReaderError;
 
     fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
+        self.refresh();
         self.store.reader()
     }
 }
 
-impl<S: BranchStore<Blake3>> BranchStore<Blake3> for Follower<S> {
+impl<S> BranchStore<Blake3> for Follower<S>
+where
+    S: BlobStorePut<Blake3> + BlobStore<Blake3> + BranchStore<Blake3>,
+{
     type BranchesError = S::BranchesError;
     type HeadError = S::HeadError;
     type UpdateError = S::UpdateError;
     type ListIter<'a> = S::ListIter<'a> where S: 'a;
 
     fn branches<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::BranchesError> {
+        self.refresh();
         self.store.branches()
     }
 
     fn head(&mut self, id: Id) -> Result<Option<Value<Handle<Blake3, SimpleArchive>>>, Self::HeadError> {
+        self.refresh();
         self.store.head(id)
     }
 

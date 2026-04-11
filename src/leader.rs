@@ -6,7 +6,7 @@
 use triblespace_core::blob::{BlobSchema, ToBlob};
 use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
 use triblespace_core::id::Id;
-use triblespace_core::repo::{BlobStore, BlobStorePut, BranchStore, Poll, PushResult};
+use triblespace_core::repo::{BlobStore, BlobStorePut, BranchStore, PushResult};
 use triblespace_core::value::Value;
 use triblespace_core::value::ValueSchema;
 use triblespace_core::value::schemas::hash::{Blake3, Handle};
@@ -54,15 +54,6 @@ impl<S: BlobStore<Blake3> + BranchStore<Blake3> + BlobStorePut<Blake3>> BlobStor
 
     fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
         self.inner.reader()
-    }
-}
-
-impl<S: Poll> Poll for Leader<S> {
-    type Error = S::Error;
-    /// Delegates to the inner store. Outgoing gossip is push-driven via
-    /// `BlobStorePut::put` / `BranchStore::update`, not via polling.
-    fn poll(&mut self) -> Result<usize, Self::Error> {
-        self.inner.poll()
     }
 }
 
