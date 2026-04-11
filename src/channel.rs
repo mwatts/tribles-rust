@@ -1,7 +1,9 @@
-//! Channel types bridging the async Host thread and the sync store layer.
+//! Channel types bridging the async network thread and the sync store layer.
 //!
-//! `NetCommand`: sent from Leader → Host (outgoing effects)
-//! `NetEvent`: sent from Host → Follower (incoming data)
+//! `NetCommand`: outgoing effects sent from a [`Peer`](crate::peer::Peer)
+//! into the network thread (announce blob, gossip HEAD, fetch from remote).
+//! `NetEvent`: incoming data sent back from the network thread to be
+//! applied into the wrapped store.
 
 use crate::protocol::{RawHash, RawBranchId};
 

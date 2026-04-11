@@ -1,20 +1,16 @@
 //! Distributed sync for triblespace.
 //!
-//! Three composable types, one async boundary:
+//! The main type is [`Peer<S>`](peer::Peer): a store wrapper that owns an
+//! iroh network thread internally and exposes the standard storage traits
+//! (`BlobStore + BlobStorePut + BranchStore`). Reads auto-drain incoming
+//! gossip; writes auto-publish to the gossip topic and DHT. The user thinks
+//! of it as "my store, but networked."
 //!
-//! - **Host**: network thread (identity, endpoint, gossip, DHT)
-//! - **Leader\<S\>**: store wrapper, outgoing effects (announce, gossip)
-//! - **Follower\<S\>**: store wrapper, incoming sync (poll-driven)
-//!
-//! `Follower<Leader<Pile>>` = peer.
-//!
-//! All store traits (`BlobStore`, `BranchStore`) stay sync.
-//! Async is jailed inside the Host thread.
+//! All store traits stay sync. Async is jailed inside the network thread.
 
 pub mod channel;
 pub mod host;
-pub mod leader;
-pub mod follower;
+pub mod peer;
 pub mod protocol;
 pub mod identity;
 pub mod tracking;

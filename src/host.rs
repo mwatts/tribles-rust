@@ -1,8 +1,8 @@
 //! Network thread: spawns iroh endpoint, gossip, DHT, protocol server.
 //!
-//! `spawn()` returns two halves:
-//! - `HostSender`: for Leader (commands + snapshot updates)
-//! - `HostReceiver`: for Follower (events)
+//! Internal implementation detail of [`crate::peer::Peer`] — `spawn()`
+//! returns the two channel halves the Peer uses to communicate with the
+//! network thread (commands + snapshot updates one way, events the other).
 //!
 //! Async is jailed inside the spawned thread.
 
@@ -95,7 +95,7 @@ where
     }
 }
 
-// ── Leader's half ────────────────────────────────────────────────────
+// ── Outgoing half ────────────────────────────────────────────────────
 
 /// Send commands to the host thread + update the serving snapshot.
 #[derive(Clone)]
@@ -125,7 +125,7 @@ impl HostSender {
     }
 }
 
-// ── Follower's half ──────────────────────────────────────────────────
+// ── Incoming half ────────────────────────────────────────────────────
 
 /// Receive events from the host thread.
 pub struct HostReceiver {
@@ -143,7 +143,8 @@ impl HostReceiver {
 
 // ── Spawn ────────────────────────────────────────────────────────────
 
-/// Spawn the host thread. Returns sender (for Leader) and receiver (for Follower).
+/// Spawn the network thread. Returns the outgoing/incoming channel halves
+/// — used internally by [`Peer::new`](crate::peer::Peer::new).
 pub fn spawn(key: SigningKey, config: HostConfig) -> (HostSender, HostReceiver) {
     let secret = iroh_secret(&key);
     let id: EndpointId = secret.public().into();
