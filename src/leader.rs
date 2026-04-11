@@ -6,7 +6,7 @@
 use triblespace_core::blob::{BlobSchema, ToBlob};
 use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
 use triblespace_core::id::Id;
-use triblespace_core::repo::{BlobStore, BlobStorePut, BranchStore, PushResult};
+use triblespace_core::repo::{BlobStore, BlobStorePut, BranchStore, Poll, PushResult};
 use triblespace_core::value::Value;
 use triblespace_core::value::ValueSchema;
 use triblespace_core::value::schemas::hash::{Blake3, Handle};
@@ -57,6 +57,15 @@ impl<S: BlobStore<Blake3> + BranchStore<Blake3> + BlobStorePut<Blake3>> BlobStor
     }
 }
 
+impl<S: Poll> Poll for Leader<S> {
+    type Error = S::Error;
+    /// Delegates to the inner store. Outgoing gossip is push-driven via
+    /// `BlobStorePut::put` / `BranchStore::update`, not via polling.
+    fn poll(&mut self) -> Result<usize, Self::Error> {
+        self.inner.poll()
+    }
+}
+
 impl<S: BranchStore<Blake3> + BlobStore<Blake3> + BlobStorePut<Blake3>> BranchStore<Blake3> for Leader<S> {
     type BranchesError = S::BranchesError;
     type HeadError = S::HeadError;
@@ -80,8 +89,14 @@ impl<S: BranchStore<Blake3> + BlobStore<Blake3> + BlobStorePut<Blake3>> BranchSt
         let result = self.inner.update(id, old, new.clone())?;
         if let PushResult::Success() = &result {
             if let Some(head) = new {
-                let branch: [u8; 16] = id.into();
-                self.host.gossip(branch, head.raw);
+                // Tracking branches are local mirror state and must NOT be
+                // re-gossiped — otherwise the publisher would receive its own
+                // tracking branch back and create a tracking-of-the-tracking,
+                // ad infinitum.
+                if !crate::tracking::is_tracking_branch(&mut self.inner, id) {
+                    let branch: [u8; 16] = id.into();
+                    self.host.gossip(branch, head.raw);
+                }
                 if let Some(snap) = StoreSnapshot::from_store(&mut self.inner) {
                     self.host.update_snapshot(snap);
                 }
