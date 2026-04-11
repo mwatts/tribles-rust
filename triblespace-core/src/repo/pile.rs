@@ -823,6 +823,18 @@ impl<H: HashProtocol> BlobStoreList<H> for PileReader<H> {
             _marker: std::marker::PhantomData,
         }
     }
+
+    /// Cheap PATCH-level set difference between this reader's blob index
+    /// and `old`'s. Both readers hold copy-on-write clones of their pile's
+    /// PATCH, so this gives the exact set of blob hashes added between
+    /// the two snapshots without having to enumerate either side.
+    fn blobs_diff(&self, old: &Self) -> Self::Iter<'_> {
+        let diff = self.blobs.difference(&old.blobs);
+        PileBlobStoreListIter::<H> {
+            inner: diff.into_iter(),
+            _marker: std::marker::PhantomData,
+        }
+    }
 }
 
 /// Iterator over branch ids stored in the pile's PATCH, using the PATCH's
@@ -1357,6 +1369,54 @@ mod tests {
             assert_eq!(blob.bytes.as_ref(), data.as_slice());
         }
         assert!(expected.is_empty());
+
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn blobs_diff_returns_only_new_handles() {
+        use crate::repo::BlobStoreList;
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
+
+        let mut pile: Pile = Pile::open(&path).unwrap();
+
+        // Stage three baseline blobs and snapshot the reader.
+        let mut baseline_handles: HashSet<Value<Handle<Blake3, UnknownBlob>>> = HashSet::new();
+        for data in [vec![1u8; 3], vec![2u8; 4], vec![3u8; 5]] {
+            let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data));
+            let handle = pile.put(blob).unwrap();
+            baseline_handles.insert(handle);
+        }
+        let baseline = pile.reader().unwrap();
+
+        // Stage two more blobs after taking the baseline snapshot.
+        let mut new_handles: HashSet<Value<Handle<Blake3, UnknownBlob>>> = HashSet::new();
+        for data in [vec![4u8; 6], vec![5u8; 7]] {
+            let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data));
+            let handle = pile.put(blob).unwrap();
+            new_handles.insert(handle);
+        }
+
+        // Diff the current reader against the baseline.
+        let current = pile.reader().unwrap();
+        let diffed: HashSet<Value<Handle<Blake3, UnknownBlob>>> = current
+            .blobs_diff(&baseline)
+            .map(|r| r.expect("infallible diff iter"))
+            .collect();
+
+        // Diff should equal exactly the new blobs — none of the baseline ones.
+        assert_eq!(diffed, new_handles);
+        for h in &baseline_handles {
+            assert!(!diffed.contains(h), "baseline blob leaked into diff");
+        }
+
+        // Round-trip sanity: diffing a reader against itself yields nothing.
+        let empty: HashSet<_> = current
+            .blobs_diff(&current)
+            .map(|r| r.expect("infallible"))
+            .collect();
+        assert!(empty.is_empty());
 
         pile.close().unwrap();
     }

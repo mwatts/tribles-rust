@@ -230,6 +230,23 @@ pub trait BlobStoreList<H: HashProtocol> {
 
     /// Lists all blobs in the repository.
     fn blobs<'a>(&'a self) -> Self::Iter<'a>;
+
+    /// Lists blobs in `self` that are not in `old`.
+    ///
+    /// Backends with true snapshot semantics (e.g. [`Pile`](pile::Pile),
+    /// where each [`Reader`](BlobStore::Reader) holds a frozen clone of the
+    /// in-memory blob index) compute the difference cheaply via the index's
+    /// own set-difference operation. Backends without snapshot semantics
+    /// (e.g. an object store, where the Reader is just a handle to the live
+    /// remote) fall back to the default implementation, which lists all
+    /// current blobs — over-eager but always correct.
+    ///
+    /// Use this for "what blobs are new since I last looked" patterns
+    /// (e.g. announcing newly-imported blobs to a DHT) where holding the
+    /// previous Reader as a baseline gives you the delta.
+    fn blobs_diff<'a>(&'a self, _old: &Self) -> Self::Iter<'a> {
+        self.blobs()
+    }
 }
 
 /// Metadata about a blob in a repository.
@@ -2029,12 +2046,20 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
         self.head = Some(commit_handle);
     }
 
-    /// Merge another workspace (or its commit state) into this one.
+    /// Merge another workspace into this one.
     ///
-    /// Notes on semantics
-    /// - This operation will copy the *staged* blobs created in `other`
-    ///   (i.e., `other.local_blobs`) into `self.local_blobs`, then create a
-    ///   merge commit whose parents are `self.head` and `other.head`.
+    /// Always copies the *staged* blobs from `other.local_blobs` into
+    /// `self.local_blobs` (so standalone blobs that aren't referenced by any
+    /// commit chain still come along — useful when the other workspace was
+    /// being used to stage content).
+    ///
+    /// Then integrates `other.head` via [`merge_commit`](Self::merge_commit),
+    /// which picks no-op / fast-forward / merge commit as appropriate.
+    ///
+    /// Returns the workspace's new head, or `None` if both workspaces were
+    /// empty (nothing to merge into anything).
+    ///
+    /// Notes:
     /// - The merge does *not* automatically import the entire base history
     ///   reachable from `other`'s head. If the incoming parent commits
     ///   reference blobs that do not exist in this repository's storage,
@@ -2042,33 +2067,25 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
     ///   explicitly imported (for example via `repo::transfer(reachable(...))`).
     /// - This design keeps merge permissive and leaves cross-repository blob
     ///   import as an explicit user action.
-    pub fn merge(&mut self, other: &mut Workspace<Blobs>) -> Result<CommitHandle, MergeError> {
-        // 1. Transfer all blobs from the other workspace to self.local_blobs.
+    pub fn merge(&mut self, other: &mut Workspace<Blobs>) -> Result<Option<CommitHandle>, MergeError> {
+        // 1. Always transfer staged blobs from `other`. They may include
+        //    standalone blobs (no commit referring to them yet) that the
+        //    caller wanted to stash in the workspace independent of any
+        //    branch state.
         let other_local = other.local_blobs.reader().unwrap();
         for r in other_local.blobs() {
             let handle = r.expect("infallible blob enumeration");
             let blob: Blob<UnknownBlob> = other_local.get(handle).expect("infallible blob read");
-
-            // Store the blob in the local workspace's blob store.
             self.local_blobs.put(blob).expect("infallible blob put");
         }
-        // 2. Compute a merge commit from self.current_commit and other.current_commit.
-        let parents = self.head.iter().copied().chain(other.head.iter().copied());
-        let merge_commit = commit_metadata(
-            &self.signing_key,
-            parents,
-            None, // No message for the merge commit
-            None, // No content blob for the merge commit
-            None, // No metadata blob for the merge commit
-        );
-        // 3. Store the merge commit in self.local_blobs.
-        let commit_handle = self
-            .local_blobs
-            .put(merge_commit)
-            .expect("failed to put merge commit blob");
-        self.head = Some(commit_handle);
 
-        Ok(commit_handle)
+        // 2. Integrate `other`'s head via the smart merge_commit. If `other`
+        //    has no head, there's nothing further to integrate — just return
+        //    our current head (which may or may not exist).
+        match other.head {
+            Some(other_head) => Ok(Some(self.merge_commit(other_head)?)),
+            None => Ok(self.head),
+        }
     }
 
     /// Integrate another commit into this workspace's history.
