@@ -290,6 +290,19 @@ impl<H: HashProtocol> BlobStore<H> for Pile<H> {
     }
 }
 
+impl<H: HashProtocol> crate::repo::Poll for Pile<H> {
+    type Error = ReadError;
+
+    /// Re-reads any new records appended to the pile file by external writers.
+    ///
+    /// Returns `0` because [`Pile::refresh`] doesn't currently surface a
+    /// per-call record count.
+    fn poll(&mut self) -> Result<usize, Self::Error> {
+        self.refresh()?;
+        Ok(0)
+    }
+}
+
 /// Error returned when opening or refreshing a [`Pile`].
 #[derive(Debug)]
 pub enum ReadError {

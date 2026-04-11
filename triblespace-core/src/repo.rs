@@ -219,6 +219,33 @@ attributes! {
     "1ACE03BF70242B289FDF00E4327C3BC6" as pub signature_s: ed::ED25519SComponent;
 }
 
+/// Apply pending external state changes.
+///
+/// "Polling" means different things at different layers of a storage stack:
+///
+/// - For a [`Pile`](pile::Pile), it means re-reading new records from the
+///   file (in case another writer appended to it).
+/// - For a sync layer (e.g. `triblespace-net`'s `Follower`), it means
+///   draining incoming gossip events and applying them to the wrapped store.
+/// - For a wrapper that delegates ([`Repository`], `Leader`), it means
+///   forwarding the call to the inner storage.
+///
+/// Composing all of these, calling `poll()` on the outermost layer
+/// (typically a `Repository`) propagates down the stack so every layer
+/// catches up to the latest external state in one call.
+pub trait Poll {
+    /// Error type returned by polling.
+    type Error: Error + Send + Sync + 'static;
+
+    /// Bring this layer up to date with any pending external state.
+    ///
+    /// Returns the number of significant events applied. The unit is
+    /// implementation-defined (events drained, records applied, etc.); a
+    /// return value of `0` simply means "nothing new". Wrappers that
+    /// delegate to inner storage should sum the inner counts.
+    fn poll(&mut self) -> Result<usize, Self::Error>;
+}
+
 /// The `ListBlobs` trait is used to list all blobs in a repository.
 pub trait BlobStoreList<H: HashProtocol> {
     /// Iterator over blob handles in the store.
@@ -824,6 +851,17 @@ where
     /// Borrow the underlying storage backend mutably.
     pub fn storage_mut(&mut self) -> &mut Storage {
         &mut self.storage
+    }
+
+    /// Bring the repository up to date with any pending external state.
+    ///
+    /// Convenience method that simply forwards to the underlying storage's
+    /// [`Poll`] implementation. See [`Poll::poll`] for the layered semantics.
+    pub fn poll(&mut self) -> Result<usize, Storage::Error>
+    where
+        Storage: Poll,
+    {
+        self.storage.poll()
     }
 
     /// Replace the repository signing key.
@@ -2071,21 +2109,66 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
         Ok(commit_handle)
     }
 
-    /// Create a merge commit that ties this workspace's current head and an
-    /// arbitrary other commit (already present in the underlying blob store)
-    /// together without requiring another [`Workspace`] instance.
+    /// Integrate another commit into this workspace's history.
     ///
-    /// This does not attach any content to the merge commit.
+    /// Picks the cheapest correct strategy:
+    ///
+    /// - **No-op** if the workspace has no head and `other` *is* the head, or
+    ///   if `other` is already in the current head's ancestry.
+    /// - **Fast-forward** if the workspace has no head, or if the current head
+    ///   is in `other`'s ancestry — `self.head` is set to `other` directly.
+    /// - **Merge commit** otherwise — a new commit with `[current_head, other]`
+    ///   as parents is created and `self.head` advances to it.
+    ///
+    /// Returns the workspace's new head in all cases.
+    ///
+    /// The ancestor checks are best-effort: if the relevant commit blobs are
+    /// missing from the workspace's view, the function falls through to the
+    /// always-correct merge-commit path. Callers that mirror remote chains
+    /// should ensure reachable blobs were imported (e.g. via `reachable` +
+    /// `transfer`) for the optimization to kick in.
     pub fn merge_commit(
         &mut self,
         other: Value<Handle<Blake3, SimpleArchive>>,
     ) -> Result<CommitHandle, MergeError> {
-        // Validate that `other` can be loaded from either local or base blobs.
-        // If it cannot be loaded we still proceed with the merge; dereference
-        // failures will surface later when reading history. Callers should
-        // ensure the reachable blobs were imported beforehand (e.g. by
-        // combining `reachable` with `transfer`).
+        // Trivial cases first.
+        let local_head = match self.head {
+            None => {
+                // No local head — fast-forward to `other`.
+                self.head = Some(other);
+                return Ok(other);
+            }
+            Some(h) if h == other => {
+                // Identical — no-op.
+                return Ok(h);
+            }
+            Some(h) => h,
+        };
 
+        // Best-effort ancestry checks. If the walks fail (missing blobs,
+        // unreadable metadata), fall through to the always-correct merge.
+        let remote_in_local = ancestors(local_head)
+            .select(self)
+            .ok()
+            .map(|set| set.get(&other.raw).is_some())
+            .unwrap_or(false);
+        if remote_in_local {
+            // `other` is already in our history → no-op.
+            return Ok(local_head);
+        }
+
+        let local_in_remote = ancestors(other)
+            .select(self)
+            .ok()
+            .map(|set| set.get(&local_head.raw).is_some())
+            .unwrap_or(false);
+        if local_in_remote {
+            // We're behind `other` → fast-forward.
+            self.head = Some(other);
+            return Ok(other);
+        }
+
+        // Truly divergent — create a merge commit.
         let parents = self.head.iter().copied().chain(Some(other));
         let merge_commit = commit_metadata(&self.signing_key, parents, None, None, None);
         let commit_handle = self
@@ -2094,6 +2177,19 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
             .expect("failed to put merge commit blob");
         self.head = Some(commit_handle);
         Ok(commit_handle)
+    }
+
+    /// Move the workspace's head to `commit` without creating a new commit.
+    ///
+    /// This is the "fast-forward" case: when the new commit is a descendant
+    /// of (or equal to) the current head, you can advance directly without
+    /// a merge commit. The caller is responsible for verifying the
+    /// descendancy relationship — typically via [`ancestors`] over `commit`.
+    ///
+    /// Use this in pull/sync flows to avoid spurious merge commits when one
+    /// peer is simply behind the other.
+    pub fn set_head(&mut self, commit: CommitHandle) {
+        self.head = Some(commit);
     }
 
     /// Returns the combined [`TribleSet`] for the specified commits.

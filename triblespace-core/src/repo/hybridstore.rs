@@ -60,6 +60,19 @@ where
     }
 }
 
+impl<B, R> crate::repo::Poll for HybridStore<B, R>
+where
+    B: crate::repo::Poll,
+    R: crate::repo::Poll<Error = B::Error>,
+{
+    type Error = B::Error;
+    fn poll(&mut self) -> Result<usize, Self::Error> {
+        let blob_count = self.blobs.poll()?;
+        let branch_count = self.branches.poll()?;
+        Ok(blob_count + branch_count)
+    }
+}
+
 impl<H, B, R> BranchStore<H> for HybridStore<B, R>
 where
     H: HashProtocol,
