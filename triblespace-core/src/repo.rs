@@ -219,33 +219,6 @@ attributes! {
     "1ACE03BF70242B289FDF00E4327C3BC6" as pub signature_s: ed::ED25519SComponent;
 }
 
-/// Apply pending external state changes.
-///
-/// "Polling" means different things at different layers of a storage stack:
-///
-/// - For a [`Pile`](pile::Pile), it means re-reading new records from the
-///   file (in case another writer appended to it).
-/// - For a sync layer (e.g. `triblespace-net`'s `Follower`), it means
-///   draining incoming gossip events and applying them to the wrapped store.
-/// - For a wrapper that delegates ([`Repository`], `Leader`), it means
-///   forwarding the call to the inner storage.
-///
-/// Composing all of these, calling `poll()` on the outermost layer
-/// (typically a `Repository`) propagates down the stack so every layer
-/// catches up to the latest external state in one call.
-pub trait Poll {
-    /// Error type returned by polling.
-    type Error: Error + Send + Sync + 'static;
-
-    /// Bring this layer up to date with any pending external state.
-    ///
-    /// Returns the number of significant events applied. The unit is
-    /// implementation-defined (events drained, records applied, etc.); a
-    /// return value of `0` simply means "nothing new". Wrappers that
-    /// delegate to inner storage should sum the inner counts.
-    fn poll(&mut self) -> Result<usize, Self::Error>;
-}
-
 /// The `ListBlobs` trait is used to list all blobs in a repository.
 pub trait BlobStoreList<H: HashProtocol> {
     /// Iterator over blob handles in the store.
@@ -851,17 +824,6 @@ where
     /// Borrow the underlying storage backend mutably.
     pub fn storage_mut(&mut self) -> &mut Storage {
         &mut self.storage
-    }
-
-    /// Bring the repository up to date with any pending external state.
-    ///
-    /// Convenience method that simply forwards to the underlying storage's
-    /// [`Poll`] implementation. See [`Poll::poll`] for the layered semantics.
-    pub fn poll(&mut self) -> Result<usize, Storage::Error>
-    where
-        Storage: Poll,
-    {
-        self.storage.poll()
     }
 
     /// Replace the repository signing key.

@@ -193,17 +193,6 @@ where
     }
 }
 
-impl<H> crate::repo::Poll for ObjectStoreRemote<H>
-where
-    H: HashProtocol,
-{
-    type Error = Infallible;
-    /// Object stores fetch fresh state per request, so polling is a no-op.
-    fn poll(&mut self) -> Result<usize, Self::Error> {
-        Ok(0)
-    }
-}
-
 impl<H> BranchStore<H> for ObjectStoreRemote<H>
 where
     H: HashProtocol,

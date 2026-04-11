@@ -46,14 +46,6 @@ impl crate::repo::BlobStore<Blake3> for MemoryRepo {
     }
 }
 
-impl crate::repo::Poll for MemoryRepo {
-    type Error = Infallible;
-    /// In-memory storage has no external state to refresh.
-    fn poll(&mut self) -> Result<usize, Self::Error> {
-        Ok(0)
-    }
-}
-
 impl crate::repo::BlobStoreKeep<Blake3> for MemoryRepo {
     fn keep<I>(&mut self, handles: I)
     where
