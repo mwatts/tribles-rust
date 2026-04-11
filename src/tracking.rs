@@ -19,13 +19,81 @@ use triblespace_core::prelude::attributes;
 use triblespace_core::macros::{find, pattern, entity};
 
 use crate::channel::PublisherKey;
-use crate::protocol::{RawHash, RawBranchId};
+use crate::protocol::RawHash;
 
 // Minted attribute IDs for tracking branches.
 attributes! {
     "FD45B98C108B3F9F2D18C0B5373BC9FB" as pub remote_name: Handle<Blake3, LongString>;
     "ACEBAE99F0B5B1E12DAE3FDC1E2BC575" as pub tracking_remote_branch: GenId;
     "C52A223988BB237B0859319661DA23F5" as pub tracking_peer: ED25519PublicKey;
+}
+
+/// Returns true if the given branch is a tracking branch (has the
+/// `tracking_remote_branch` attribute in its metadata).
+///
+/// Tracking branches are local-only state that should not be re-gossipped.
+pub fn is_tracking_branch<S>(store: &mut S, branch_id: Id) -> bool
+where
+    S: BlobStore<Blake3> + BranchStore<Blake3>,
+{
+    let Ok(Some(head_handle)) = store.head(branch_id) else { return false; };
+    let Ok(reader) = store.reader() else { return false; };
+    let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(head_handle) else { return false; };
+    find!(
+        v: Id,
+        pattern!(&meta, [{ _?e @ tracking_remote_branch: ?v }])
+    ).next().is_some()
+}
+
+/// Information about a tracking branch.
+#[derive(Debug, Clone)]
+pub struct TrackingBranchInfo {
+    /// The local branch id under which the tracking branch is registered.
+    pub local_id: Id,
+    /// The remote node's branch id that this tracking branch mirrors.
+    pub remote_branch_id: Id,
+    /// The branch name on the remote (stored as `remote_name` to keep it
+    /// invisible to normal `metadata::name` lookups).
+    pub remote_name: String,
+}
+
+/// Enumerate all tracking branches currently in `store`.
+///
+/// This is the canonical "what remote branches do I know about" query —
+/// the persistent equivalent of an in-memory remote-head map. Use it from
+/// auto-merge loops, status displays, etc.
+pub fn list_tracking_branches<S>(store: &mut S) -> Vec<TrackingBranchInfo>
+where
+    S: BlobStore<Blake3> + BranchStore<Blake3>,
+{
+    let mut result = Vec::new();
+    let Ok(iter) = store.branches() else { return result; };
+    let bids: Vec<Id> = iter.filter_map(|r| r.ok()).collect();
+
+    for bid in bids {
+        let Ok(Some(meta_handle)) = store.head(bid) else { continue; };
+        let Ok(reader) = store.reader() else { continue; };
+        let Ok(meta): Result<TribleSet, _> = reader.get(meta_handle) else { continue; };
+
+        let Some(remote_branch_id) = find!(
+            v: Id,
+            pattern!(&meta, [{ _?e @ tracking_remote_branch: ?v }])
+        ).next() else { continue; };
+
+        let Some(name_handle) = find!(
+            h: Value<Handle<Blake3, LongString>>,
+            pattern!(&meta, [{ _?e @ remote_name: ?h }])
+        ).next() else { continue; };
+
+        let Ok(name_view): Result<anybytes::View<str>, _> = reader.get(name_handle) else { continue; };
+
+        result.push(TrackingBranchInfo {
+            local_id: bid,
+            remote_branch_id,
+            remote_name: name_view.as_ref().to_string(),
+        });
+    }
+    result
 }
 
 /// Find a tracking branch for the given remote branch ID.
@@ -37,23 +105,35 @@ pub fn find_tracking_branch<S>(
 where
     S: BlobStore<Blake3> + BranchStore<Blake3>,
 {
-    let branch_ids: Vec<Id> = store.branches().ok()?.filter_map(|r| r.ok()).collect();
-    for bid in branch_ids {
-        let head_handle = store.head(bid).ok()??;
-        let reader = store.reader().ok()?;
-        let meta: TribleSet = reader.get(head_handle).ok()?;
-        let tracks: Option<Id> = find!(
-            v: Id,
-            pattern!(&meta, [{ _?e @ tracking_remote_branch: ?v }])
-        ).next();
-        if tracks == Some(remote_branch_id) {
-            return Some(bid);
-        }
-    }
-    None
+    list_tracking_branches(store)
+        .into_iter()
+        .find(|info| info.remote_branch_id == remote_branch_id)
+        .map(|info| info.local_id)
+}
+
+/// Read the actual commit handle from a branch metadata blob.
+///
+/// The network protocol gossips the branch metadata blob hash as "HEAD",
+/// but `repo::head` in branch metadata points to a commit. This resolves
+/// the indirection so tracking branches store actual commit handles.
+fn resolve_commit_in_branch_meta<S: BlobStore<Blake3>>(
+    store: &mut S,
+    branch_meta_hash: &RawHash,
+) -> Option<Value<Handle<Blake3, SimpleArchive>>> {
+    let reader = store.reader().ok()?;
+    let meta_handle = Value::<Handle<Blake3, SimpleArchive>>::new(*branch_meta_hash);
+    let meta: TribleSet = reader.get(meta_handle).ok()?;
+    find!(
+        h: Value<Handle<Blake3, SimpleArchive>>,
+        pattern!(&meta, [{ _?e @ triblespace_core::repo::head: ?h }])
+    ).next()
 }
 
 /// Create a new tracking branch. Returns the local tracking branch ID.
+///
+/// `remote_head_hash` is the branch metadata blob hash gossiped over the
+/// network. The tracking branch resolves it to the inner commit handle so
+/// `Repository::pull(tracking_id).head()` returns a real commit.
 pub fn create_tracking_branch<S>(
     store: &mut S,
     remote_branch_id: Id,
@@ -64,6 +144,9 @@ pub fn create_tracking_branch<S>(
 where
     S: BlobStore<Blake3> + BlobStorePut<Blake3> + BranchStore<Blake3>,
 {
+    // Resolve the gossiped branch metadata hash to the actual commit.
+    let commit_handle = resolve_commit_in_branch_meta(store, remote_head_hash)?;
+
     let tracking_eid = genid();
     let tracking_id: Id = tracking_eid.id;
 
@@ -71,13 +154,11 @@ where
     let name_string = remote_name_str.to_string();
     let name_handle: Value<Handle<Blake3, LongString>> = store.put::<LongString, String>(name_string).ok()?;
 
-    // Build tracking branch metadata with content-derived entity ID.
-    let head_handle = Value::<Handle<Blake3, SimpleArchive>>::new(*remote_head_hash);
     let pub_key = ed25519_dalek::VerifyingKey::from_bytes(publisher).ok()?;
 
     let meta = entity! { &tracking_eid @
         triblespace_core::repo::branch: tracking_id,
-        triblespace_core::repo::head: head_handle,
+        triblespace_core::repo::head: commit_handle,
         remote_name: name_handle,
         tracking_remote_branch: remote_branch_id,
         tracking_peer: pub_key,
@@ -93,7 +174,8 @@ where
     }
 }
 
-/// Update a tracking branch's head.
+/// Update a tracking branch's head. `new_head_hash` is the gossiped branch
+/// metadata blob hash, which is resolved to the inner commit handle.
 pub fn update_tracking_branch<S>(
     store: &mut S,
     tracking_branch_id: Id,
@@ -107,15 +189,16 @@ where
 {
     let old_meta = store.head(tracking_branch_id).ok()??;
 
+    let commit_handle = resolve_commit_in_branch_meta(store, new_head_hash)?;
+
     let name_string = remote_name_str.to_string();
     let name_handle: Value<Handle<Blake3, LongString>> = store.put::<LongString, String>(name_string).ok()?;
-    let head_handle = Value::<Handle<Blake3, SimpleArchive>>::new(*new_head_hash);
 
     let pub_key = ed25519_dalek::VerifyingKey::from_bytes(publisher).ok()?;
     let eid = genid();
     let meta = entity! { &eid @
         triblespace_core::repo::branch: tracking_branch_id,
-        triblespace_core::repo::head: head_handle,
+        triblespace_core::repo::head: commit_handle,
         remote_name: name_handle,
         tracking_remote_branch: remote_branch_id,
         tracking_peer: pub_key,
@@ -146,5 +229,66 @@ where
         Some(tracking_id)
     } else {
         create_tracking_branch(store, remote_branch_id, remote_head_hash, remote_name_str, publisher)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use triblespace_core::blob::Blob;
+    use triblespace_core::id::genid;
+    use triblespace_core::repo::memoryrepo::MemoryRepo;
+
+    #[test]
+    fn find_tracking_branch_roundtrips() {
+        let mut store = MemoryRepo::default();
+
+        // Build a fake remote branch metadata blob first so we have something
+        // to point to. Use branch_unsigned to avoid signing-key plumbing.
+        use triblespace_core::repo::branch::branch_unsigned;
+        use triblespace_core::blob::ToBlob;
+        use triblespace_core::blob::schemas::longstring::LongString;
+        let name_blob = "remote-branch".to_string().to_blob();
+        let name_handle: Value<Handle<Blake3, LongString>> = store.put(name_blob).unwrap();
+        let remote_branch_id = genid();
+        // Create a dummy commit blob and set it as the remote head.
+        let commit_meta: TribleSet = TribleSet::new();
+        let commit_blob: Blob<SimpleArchive> = commit_meta.to_blob();
+        let commit_handle = store.put::<SimpleArchive, _>(commit_blob.clone()).unwrap();
+        let remote_meta = branch_unsigned(*remote_branch_id, name_handle, Some(commit_blob));
+        let remote_meta_handle = store.put::<SimpleArchive, _>(remote_meta).unwrap();
+
+        let publisher = [0u8; 32];
+        let remote_head_hash: RawHash = remote_meta_handle.raw;
+
+        // Create the tracking branch.
+        let tracking_id = create_tracking_branch(
+            &mut store, *remote_branch_id, &remote_head_hash, "remote-branch", &publisher,
+        ).expect("create");
+
+        // Now find it.
+        let found = find_tracking_branch(&mut store, *remote_branch_id);
+        assert_eq!(found, Some(tracking_id), "should find the tracking branch we just created");
+
+        // is_tracking_branch should return true for the tracking branch.
+        assert!(is_tracking_branch(&mut store, tracking_id));
+
+        // ensure should be idempotent.
+        let same = ensure_tracking_branch(
+            &mut store, *remote_branch_id, &remote_head_hash, "remote-branch", &publisher,
+        );
+        assert_eq!(same, Some(tracking_id), "ensure should return the existing tracking branch");
+
+        // Verify the tracking branch resolved the inner commit, not the metadata blob.
+        let mut store2 = store;
+        let reader = store2.reader().unwrap();
+        let track_meta_handle = store2.head(tracking_id).unwrap().unwrap();
+        let track_meta: TribleSet = reader.get(track_meta_handle).unwrap();
+        let track_head: Value<Handle<Blake3, SimpleArchive>> = find!(
+            h: Value<Handle<Blake3, SimpleArchive>>,
+            pattern!(&track_meta, [{ _?e @ triblespace_core::repo::head: ?h }])
+        ).next().expect("tracking branch should have a head");
+        assert_eq!(track_head, commit_handle,
+            "tracking branch head should be the inner commit, not the branch metadata blob");
     }
 }
