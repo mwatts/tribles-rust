@@ -120,6 +120,47 @@ impl HostSender {
         let _ = self.cmd_tx.send(NetCommand::Fetch { peer, branch });
     }
 
+    /// RPC: list a remote peer's branches. Blocks the calling thread until
+    /// the network thread completes one protocol round trip.
+    pub fn list_remote_branches(
+        &self,
+        peer: EndpointId,
+    ) -> anyhow::Result<Vec<(triblespace_core::id::Id, RawHash)>> {
+        let (tx, rx) = mpsc::channel();
+        self.cmd_tx
+            .send(NetCommand::ListBranches { peer, reply: tx })
+            .map_err(|_| anyhow::anyhow!("network thread dropped"))?;
+        rx.recv().map_err(|_| anyhow::anyhow!("network thread dropped"))?
+    }
+
+    /// RPC: query a remote peer for its current head of one branch.
+    pub fn head_of_remote(
+        &self,
+        peer: EndpointId,
+        branch: RawBranchId,
+    ) -> anyhow::Result<Option<RawHash>> {
+        let (tx, rx) = mpsc::channel();
+        self.cmd_tx
+            .send(NetCommand::HeadOfRemote { peer, branch, reply: tx })
+            .map_err(|_| anyhow::anyhow!("network thread dropped"))?;
+        rx.recv().map_err(|_| anyhow::anyhow!("network thread dropped"))?
+    }
+
+    /// RPC: fetch a single blob's bytes from a remote peer. Returns the
+    /// raw bytes (or `None` if the remote doesn't have the blob); the
+    /// caller is responsible for putting them into a local store.
+    pub fn get_blob(
+        &self,
+        peer: EndpointId,
+        hash: RawHash,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let (tx, rx) = mpsc::channel();
+        self.cmd_tx
+            .send(NetCommand::GetBlob { peer, hash, reply: tx })
+            .map_err(|_| anyhow::anyhow!("network thread dropped"))?;
+        rx.recv().map_err(|_| anyhow::anyhow!("network thread dropped"))?
+    }
+
     pub fn update_snapshot(&self, snapshot: impl AnySnapshot) {
         *self.snapshot.lock().unwrap() = Some(Box::new(snapshot));
     }
@@ -334,6 +375,46 @@ async fn host_loop(
                         } else {
                             let _ = events_tx.send(NetEvent::Head { branch, head, publisher });
                         }
+                    });
+                }
+                NetCommand::ListBranches { peer, reply } => {
+                    let ep = ep.clone();
+                    tokio::spawn(async move {
+                        let result = async {
+                            let conn = ep.connect(peer, PILE_SYNC_ALPN).await
+                                .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+                            let pairs = op_list(&conn).await?;
+                            conn.close(0u32.into(), b"ok");
+                            let out: Vec<(triblespace_core::id::Id, RawHash)> = pairs
+                                .into_iter()
+                                .filter_map(|(bid, head)| {
+                                    triblespace_core::id::Id::new(bid).map(|id| (id, head))
+                                })
+                                .collect();
+                            Ok(out)
+                        }.await;
+                        let _ = reply.send(result);
+                    });
+                }
+                NetCommand::HeadOfRemote { peer, branch, reply } => {
+                    let ep = ep.clone();
+                    tokio::spawn(async move {
+                        let result = async {
+                            let conn = ep.connect(peer, PILE_SYNC_ALPN).await
+                                .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+                            let head = op_head(&conn, &branch).await?;
+                            conn.close(0u32.into(), b"ok");
+                            Ok(head)
+                        }.await;
+                        let _ = reply.send(result);
+                    });
+                }
+                NetCommand::GetBlob { peer, hash, reply } => {
+                    let ep = ep.clone();
+                    let dht = dht_api.clone();
+                    tokio::spawn(async move {
+                        let result = fetch_blob(&ep, &hash, &dht, peer).await;
+                        let _ = reply.send(result);
                     });
                 }
             }

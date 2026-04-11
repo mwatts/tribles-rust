@@ -109,6 +109,54 @@ where
         self.sender.fetch(peer, branch);
     }
 
+    /// RPC: list a remote peer's branches. One protocol round trip.
+    ///
+    /// Primitive for building branch-discovery workflows (e.g. resolving
+    /// a branch name to its ID before calling [`fetch`](Self::fetch)).
+    pub fn list_remote_branches(
+        &self,
+        peer: EndpointId,
+    ) -> anyhow::Result<Vec<(Id, RawHash)>> {
+        self.sender.list_remote_branches(peer)
+    }
+
+    /// RPC: query a remote peer for its current head of one branch.
+    /// One protocol round trip.
+    pub fn head_of_remote(
+        &mut self,
+        peer: EndpointId,
+        branch: RawBranchId,
+    ) -> anyhow::Result<Option<RawHash>> {
+        self.sender.head_of_remote(peer, branch)
+    }
+
+    /// RPC: fetch a single blob by hash from a remote peer and insert it
+    /// into the local store. Returns a handle to the blob in the local
+    /// store, or `None` if the remote didn't have it.
+    ///
+    /// Mirrors [`fetch`](Self::fetch) in that the bytes land in the
+    /// wrapped store — the difference is that this is a single blob, not
+    /// a whole reachable closure, and it blocks until the round trip
+    /// completes.
+    pub fn fetch_blob(
+        &mut self,
+        peer: EndpointId,
+        hash: RawHash,
+    ) -> anyhow::Result<Option<Value<Handle<Blake3, UnknownBlob>>>> {
+        let Some(bytes) = self.sender.get_blob(peer, hash)? else {
+            return Ok(None);
+        };
+        let data: Bytes = bytes.into();
+        let handle = self
+            .store
+            .put::<UnknownBlob, Bytes>(data)
+            .map_err(|_| anyhow::anyhow!("store put failed"))?;
+        // Keep the blob diff baseline current so refresh doesn't
+        // re-announce this blob we just pulled.
+        self.last_blob_reader = self.store.reader().ok();
+        Ok(Some(handle))
+    }
+
     /// Reconcile this peer with the latest external state.
     ///
     /// Two phases:
@@ -330,6 +378,63 @@ where
         }
         Ok(result)
     }
+}
+
+/// Resolve a branch *name* on a remote peer to its `(Id, head)`.
+///
+/// Composes [`Peer::list_remote_branches`] and [`Peer::fetch_blob`]:
+/// lists the remote's branches, pulls each metadata blob into the local
+/// store, queries for `metadata::name`, fetches the name string blob, and
+/// matches against the requested name. Returns `Ok(None)` if no branch
+/// matches.
+///
+/// This is the name-lookup half of the `pile net pull` workflow — the
+/// caller then hands the resolved `Id` to [`Peer::fetch`] to pull the
+/// branch's reachable blob closure.
+pub fn resolve_branch_name<S>(
+    peer: &mut Peer<S>,
+    remote: EndpointId,
+    name: &str,
+) -> anyhow::Result<Option<(Id, RawHash)>>
+where
+    S: BlobStore<Blake3> + BlobStorePut<Blake3> + BranchStore<Blake3>,
+{
+    use triblespace_core::blob::schemas::longstring::LongString;
+    use triblespace_core::macros::{find, pattern};
+    use triblespace_core::repo::BlobStoreGet;
+    use triblespace_core::trible::TribleSet;
+
+    let branches = peer.list_remote_branches(remote)?;
+    for (id, head) in branches {
+        // Pull the branch metadata blob into the local store.
+        if peer.fetch_blob(remote, head)?.is_none() {
+            continue;
+        }
+
+        // Read the metadata and collect candidate name handles. Scope the
+        // reader borrow so we can call fetch_blob again in the inner loop.
+        let name_handles: Vec<Value<Handle<Blake3, LongString>>> = {
+            let Ok(reader) = peer.store_mut().reader() else { continue; };
+            let meta_handle = Value::<Handle<Blake3, SimpleArchive>>::new(head);
+            let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(meta_handle) else { continue; };
+            find!(
+                h: Value<Handle<Blake3, LongString>>,
+                pattern!(&meta, [{ _?e @ triblespace_core::metadata::name: ?h }])
+            ).collect()
+        };
+
+        for name_handle in name_handles {
+            if peer.fetch_blob(remote, name_handle.raw)?.is_none() {
+                continue;
+            }
+            let Ok(reader) = peer.store_mut().reader() else { continue; };
+            let Ok(name_view) = reader.get::<anybytes::View<str>, LongString>(name_handle) else { continue; };
+            if name_view.as_ref() == name {
+                return Ok(Some((id, head)));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Read the branch name from a branch metadata blob. Tries `metadata::name`
