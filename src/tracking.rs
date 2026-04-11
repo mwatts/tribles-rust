@@ -10,7 +10,7 @@
 use triblespace_core::blob::schemas::longstring::LongString;
 use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
 use triblespace_core::id::{Id, genid};
-use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut, BranchStore, PushResult};
+use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut, BranchStore, PushResult, Repository};
 use triblespace_core::trible::TribleSet;
 use triblespace_core::value::Value;
 use triblespace_core::value::schemas::hash::{Blake3, Handle};
@@ -232,12 +232,176 @@ where
     }
 }
 
+/// Outcome of [`merge_tracking_into_local`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeOutcome {
+    /// Tracking branch had no head — nothing to merge.
+    Empty,
+    /// Local branch was already up-to-date with the tracking branch.
+    UpToDate,
+    /// Local branch advanced to `new_head` (fast-forward or merge commit).
+    Merged { new_head: Value<Handle<Blake3, SimpleArchive>> },
+}
+
+/// Merge a tracking branch into its same-named local branch.
+///
+/// Looks up (or creates) a local branch named `local_name`, then uses
+/// [`Workspace::merge_commit`](triblespace_core::repo::Workspace::merge_commit)
+/// to decide between no-op / fast-forward / merge commit. The tracking
+/// branch itself is never modified — this is a one-way "pull from
+/// tracking into local".
+///
+/// Used by `pile net pull` (one-shot) and `pile net sync` (periodic
+/// auto-merge loop). Factored out here so both share the same semantics
+/// and a single test point.
+pub fn merge_tracking_into_local<S>(
+    repo: &mut Repository<S>,
+    tracking_id: Id,
+    local_name: &str,
+) -> anyhow::Result<MergeOutcome>
+where
+    S: BlobStore<Blake3> + BlobStorePut<Blake3> + BranchStore<Blake3>,
+{
+    let local_id = repo
+        .ensure_branch(local_name, None)
+        .map_err(|_| anyhow::anyhow!("ensure branch '{local_name}'"))?;
+    let remote_ws = repo
+        .pull(tracking_id)
+        .map_err(|_| anyhow::anyhow!("pull tracking branch"))?;
+    let Some(remote_commit) = remote_ws.head() else {
+        return Ok(MergeOutcome::Empty);
+    };
+
+    let mut local_ws = repo
+        .pull(local_id)
+        .map_err(|_| anyhow::anyhow!("pull local branch"))?;
+    let prev_head = local_ws.head();
+    let new_head = local_ws
+        .merge_commit(remote_commit)
+        .map_err(|e| anyhow::anyhow!("merge: {e:?}"))?;
+    if Some(new_head) == prev_head {
+        return Ok(MergeOutcome::UpToDate);
+    }
+    repo.push(&mut local_ws)
+        .map_err(|_| anyhow::anyhow!("push merged branch"))?;
+    Ok(MergeOutcome::Merged { new_head })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
     use triblespace_core::blob::Blob;
     use triblespace_core::id::genid;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
+
+    fn test_repo() -> Repository<MemoryRepo> {
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let store = MemoryRepo::default();
+        Repository::new(store, signing_key, TribleSet::new()).unwrap()
+    }
+
+    #[test]
+    fn merge_tracking_ff_into_empty_local() {
+        // Tracking has a commit, local "main" doesn't exist yet. Merge
+        // should create main and fast-forward it to the tracking head.
+        let mut repo = test_repo();
+
+        let source_id = repo.ensure_branch("source", None).unwrap();
+        let mut src_ws = repo.pull(source_id).unwrap();
+        src_ws.commit(TribleSet::new(), "remote commit");
+        let source_head = src_ws.head().unwrap();
+        repo.push(&mut src_ws).unwrap();
+
+        let outcome = merge_tracking_into_local(&mut repo, source_id, "main").unwrap();
+        assert_eq!(outcome, MergeOutcome::Merged { new_head: source_head });
+
+        let main_id = repo.lookup_branch("main").unwrap().expect("main exists");
+        let main_ws = repo.pull(main_id).unwrap();
+        assert_eq!(main_ws.head(), Some(source_head));
+    }
+
+    #[test]
+    fn merge_tracking_up_to_date_is_noop() {
+        // Local "main" already at the tracking head. Merge should be
+        // a no-op.
+        let mut repo = test_repo();
+
+        let source_id = repo.ensure_branch("source", None).unwrap();
+        let mut src_ws = repo.pull(source_id).unwrap();
+        src_ws.commit(TribleSet::new(), "shared commit");
+        let shared_head = src_ws.head().unwrap();
+        repo.push(&mut src_ws).unwrap();
+
+        // Seed main with the same head via a first merge.
+        let _ = merge_tracking_into_local(&mut repo, source_id, "main").unwrap();
+
+        // Second call should report UpToDate.
+        let outcome = merge_tracking_into_local(&mut repo, source_id, "main").unwrap();
+        assert_eq!(outcome, MergeOutcome::UpToDate);
+
+        let main_id = repo.lookup_branch("main").unwrap().unwrap();
+        let main_ws = repo.pull(main_id).unwrap();
+        assert_eq!(main_ws.head(), Some(shared_head));
+    }
+
+    #[test]
+    fn merge_tracking_divergent_produces_merge_commit() {
+        // Local "main" at commit_a, tracking at unrelated commit_b.
+        // Merge should produce a new merge commit with both as parents.
+        let mut repo = test_repo();
+
+        let main_id = repo.ensure_branch("main", None).unwrap();
+        let mut main_ws = repo.pull(main_id).unwrap();
+        main_ws.commit(TribleSet::new(), "local commit");
+        let commit_a = main_ws.head().unwrap();
+        repo.push(&mut main_ws).unwrap();
+
+        let source_id = repo.ensure_branch("source", None).unwrap();
+        let mut src_ws = repo.pull(source_id).unwrap();
+        src_ws.commit(TribleSet::new(), "remote commit");
+        let commit_b = src_ws.head().unwrap();
+        repo.push(&mut src_ws).unwrap();
+
+        let outcome = merge_tracking_into_local(&mut repo, source_id, "main").unwrap();
+        let merge_head = match outcome {
+            MergeOutcome::Merged { new_head } => new_head,
+            other => panic!("expected Merged, got {other:?}"),
+        };
+        assert_ne!(merge_head, commit_a, "merge commit must advance past local");
+        assert_ne!(merge_head, commit_b, "merge commit must not just fast-forward to remote");
+
+        // Local main should now be at the merge commit, and both
+        // parents should appear in its ancestor set.
+        let mut main_ws = repo.pull(main_id).unwrap();
+        assert_eq!(main_ws.head(), Some(merge_head));
+
+        use triblespace_core::repo::CommitSelector;
+        let ancestor_set = triblespace_core::repo::ancestors(merge_head)
+            .select(&mut main_ws)
+            .expect("ancestors walk");
+        assert!(ancestor_set.get(&commit_a.raw).is_some(), "commit_a in ancestry");
+        assert!(ancestor_set.get(&commit_b.raw).is_some(), "commit_b in ancestry");
+    }
+
+    #[test]
+    fn merge_tracking_empty_source_is_empty_outcome() {
+        // Tracking branch exists but has no head (no commits yet).
+        // Merge should report Empty and leave main untouched.
+        let mut repo = test_repo();
+
+        let source_id = repo.ensure_branch("source", None).unwrap();
+        let outcome = merge_tracking_into_local(&mut repo, source_id, "main").unwrap();
+        assert_eq!(outcome, MergeOutcome::Empty);
+
+        // No main branch was created either — there was nothing to
+        // fast-forward to.
+        // (ensure_branch inside the helper *does* create it though —
+        // that's fine, it's just empty.)
+        let main_id = repo.lookup_branch("main").unwrap().expect("main created");
+        let main_ws = repo.pull(main_id).unwrap();
+        assert_eq!(main_ws.head(), None);
+    }
 
     #[test]
     fn find_tracking_branch_roundtrips() {
