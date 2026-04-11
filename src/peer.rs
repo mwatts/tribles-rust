@@ -130,31 +130,49 @@ where
         self.sender.head_of_remote(peer, branch)
     }
 
-    /// RPC: fetch a single blob by hash from a remote peer and insert it
-    /// into the local store. Returns a handle to the blob in the local
-    /// store, or `None` if the remote didn't have it.
+    /// RPC: fetch a single blob from a remote peer, insert it into the
+    /// local store, and decode it to `T`. Returns `None` if the remote
+    /// didn't have it.
     ///
     /// Mirrors [`fetch`](Self::fetch) in that the bytes land in the
-    /// wrapped store — the difference is that this is a single blob, not
-    /// a whole reachable closure, and it blocks until the round trip
-    /// completes.
-    pub fn fetch_blob(
+    /// wrapped store, and mirrors [`BlobStoreGet::get`] in shape — pass
+    /// a typed handle, pick what you want out the other side. Request
+    /// `Blob<Sch>` for "just the bytes" with zero decode cost; request
+    /// `TribleSet`, `anybytes::View<str>`, etc. for the decoded value.
+    ///
+    /// Unlike `fetch`, this is a single blob (no reachable closure
+    /// traversal) and blocks until the round trip completes.
+    pub fn fetch_blob<T, Sch>(
         &mut self,
         peer: EndpointId,
-        hash: RawHash,
-    ) -> anyhow::Result<Option<Value<Handle<Blake3, UnknownBlob>>>> {
-        let Some(bytes) = self.sender.get_blob(peer, hash)? else {
+        handle: Value<Handle<Blake3, Sch>>,
+    ) -> anyhow::Result<Option<T>>
+    where
+        Sch: BlobSchema + 'static,
+        T: triblespace_core::blob::TryFromBlob<Sch>,
+        Handle<Blake3, Sch>: ValueSchema,
+    {
+        let Some(bytes) = self.sender.get_blob(peer, handle.raw)? else {
             return Ok(None);
         };
         let data: Bytes = bytes.into();
-        let handle = self
-            .store
-            .put::<UnknownBlob, Bytes>(data)
+        // Persist locally under UnknownBlob — blobs are keyed by raw
+        // hash, so the schema tag at put time doesn't affect what you
+        // can get back out.
+        self.store
+            .put::<UnknownBlob, Bytes>(data.clone())
             .map_err(|_| anyhow::anyhow!("store put failed"))?;
         // Keep the blob diff baseline current so refresh doesn't
         // re-announce this blob we just pulled.
         self.last_blob_reader = self.store.reader().ok();
-        Ok(Some(handle))
+
+        // Decode directly from the bytes we already have in hand — no
+        // second trip through the store needed.
+        let blob: triblespace_core::blob::Blob<Sch> =
+            triblespace_core::blob::Blob::new(data);
+        T::try_from_blob(blob)
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("blob decode failed"))
     }
 
     /// Reconcile this peer with the latest external state.
@@ -401,34 +419,25 @@ where
 {
     use triblespace_core::blob::schemas::longstring::LongString;
     use triblespace_core::macros::{find, pattern};
-    use triblespace_core::repo::BlobStoreGet;
     use triblespace_core::trible::TribleSet;
 
     let branches = peer.list_remote_branches(remote)?;
     for (id, head) in branches {
-        // Pull the branch metadata blob into the local store.
-        if peer.fetch_blob(remote, head)?.is_none() {
+        let meta_handle = Value::<Handle<Blake3, SimpleArchive>>::new(head);
+        let Some(meta) = peer.fetch_blob::<TribleSet, _>(remote, meta_handle)? else {
             continue;
-        }
-
-        // Read the metadata and collect candidate name handles. Scope the
-        // reader borrow so we can call fetch_blob again in the inner loop.
-        let name_handles: Vec<Value<Handle<Blake3, LongString>>> = {
-            let Ok(reader) = peer.store_mut().reader() else { continue; };
-            let meta_handle = Value::<Handle<Blake3, SimpleArchive>>::new(head);
-            let Ok(meta) = reader.get::<TribleSet, SimpleArchive>(meta_handle) else { continue; };
-            find!(
-                h: Value<Handle<Blake3, LongString>>,
-                pattern!(&meta, [{ _?e @ triblespace_core::metadata::name: ?h }])
-            ).collect()
         };
 
+        let name_handles: Vec<Value<Handle<Blake3, LongString>>> = find!(
+            h: Value<Handle<Blake3, LongString>>,
+            pattern!(&meta, [{ _?e @ triblespace_core::metadata::name: ?h }])
+        )
+        .collect();
+
         for name_handle in name_handles {
-            if peer.fetch_blob(remote, name_handle.raw)?.is_none() {
+            let Some(name_view) = peer.fetch_blob::<anybytes::View<str>, _>(remote, name_handle)? else {
                 continue;
-            }
-            let Ok(reader) = peer.store_mut().reader() else { continue; };
-            let Ok(name_view) = reader.get::<anybytes::View<str>, LongString>(name_handle) else { continue; };
+            };
             if name_view.as_ref() == name {
                 return Ok(Some((id, head)));
             }
