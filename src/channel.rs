@@ -2,7 +2,7 @@
 //!
 //! `NetCommand`: outgoing effects sent from a [`Peer`](crate::peer::Peer)
 //! into the network thread. Most are fire-and-forget (announce, gossip,
-//! fetch). The "Rpc" variants carry a `Sender` for the network thread to
+//! track). The "Rpc" variants carry a `Sender` for the network thread to
 //! reply on, which the calling Peer method blocks on.
 //! `NetEvent`: incoming data sent back from the network thread to be
 //! applied into the wrapped store.
@@ -22,9 +22,10 @@ pub enum NetCommand {
     Announce(RawHash),
     /// Gossip a HEAD change for a branch (fire-and-forget).
     Gossip { branch: RawBranchId, head: RawHash },
-    /// Kick off a recursive fetch of blobs reachable from a remote
-    /// branch's head (fire-and-forget — results arrive via `NetEvent`s).
-    Fetch { peer: iroh_base::EndpointId, branch: RawBranchId },
+    /// Start tracking a remote branch: recursively fetch the blobs
+    /// reachable from its head and materialize a tracking branch
+    /// (fire-and-forget — results arrive via `NetEvent`s).
+    Track { peer: iroh_base::EndpointId, branch: RawBranchId },
 
     /// RPC: list a remote peer's branches. One protocol round trip.
     /// Replies with the (branch_id, branch_metadata_blob_hash) pairs.
@@ -43,7 +44,7 @@ pub enum NetCommand {
     /// round trip. Replies with the blob bytes (or `None` if the remote
     /// doesn't have it). The Peer wrapper method is responsible for
     /// putting the bytes into the local store.
-    GetBlob {
+    Fetch {
         peer: iroh_base::EndpointId,
         hash: RawHash,
         reply: Sender<anyhow::Result<Option<Vec<u8>>>>,

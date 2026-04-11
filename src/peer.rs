@@ -13,10 +13,10 @@
 //!   the DHT and gossip branch updates over the topic mesh, all via the
 //!   network thread.
 //!
-//! Use [`fetch`](Peer::fetch) for one-shot pulls of a remote branch from
-//! a specific peer (the `pile net pull` workflow). Set
-//! `gossip_topic: None` in [`PeerConfig`] for pull-only mode where the
-//! peer doesn't subscribe to a flood mesh.
+//! Use [`track`](Peer::track) to start tracking a remote branch from a
+//! specific peer (the `pile net pull` workflow), and [`fetch`](Peer::fetch)
+//! for single-blob pulls. Set `gossip_topic: None` in [`PeerConfig`] for
+//! pull-only mode where the peer doesn't subscribe to a flood mesh.
 
 use std::collections::HashMap;
 
@@ -99,20 +99,21 @@ where
         self.sender.id()
     }
 
-    /// One-shot fetch of a branch from a specific peer.
+    /// Start tracking a remote branch: recursively fetch the blobs
+    /// reachable from its head and materialize a local tracking branch.
     ///
     /// Used by `pile net pull` and other "go get this from over there"
     /// workflows. Does not require `gossip_topic` to be set — works in
     /// pull-only mode too. The fetched data lands in the wrapped store
     /// via the same auto-drain path that `refresh` uses.
-    pub fn fetch(&self, peer: EndpointId, branch: RawBranchId) {
-        self.sender.fetch(peer, branch);
+    pub fn track(&self, peer: EndpointId, branch: RawBranchId) {
+        self.sender.track(peer, branch);
     }
 
     /// RPC: list a remote peer's branches. One protocol round trip.
     ///
     /// Primitive for building branch-discovery workflows (e.g. resolving
-    /// a branch name to its ID before calling [`fetch`](Self::fetch)).
+    /// a branch name to its ID before calling [`track`](Self::track)).
     pub fn list_remote_branches(
         &self,
         peer: EndpointId,
@@ -134,15 +135,15 @@ where
     /// local store, and decode it to `T`. Returns `None` if the remote
     /// didn't have it.
     ///
-    /// Mirrors [`fetch`](Self::fetch) in that the bytes land in the
-    /// wrapped store, and mirrors [`BlobStoreGet::get`] in shape — pass
-    /// a typed handle, pick what you want out the other side. Request
-    /// `Blob<Sch>` for "just the bytes" with zero decode cost; request
-    /// `TribleSet`, `anybytes::View<str>`, etc. for the decoded value.
+    /// Mirrors [`BlobStoreGet::get`] in shape — pass a typed handle,
+    /// pick what you want out the other side. Request `Blob<Sch>` for
+    /// "just the bytes" with zero decode cost; request `TribleSet`,
+    /// `anybytes::View<str>`, etc. for the decoded value.
     ///
-    /// Unlike `fetch`, this is a single blob (no reachable closure
-    /// traversal) and blocks until the round trip completes.
-    pub fn fetch_blob<T, Sch>(
+    /// Unlike [`track`](Self::track), this is a single blob (no
+    /// reachable closure traversal) and blocks until the round trip
+    /// completes.
+    pub fn fetch<T, Sch>(
         &mut self,
         peer: EndpointId,
         handle: Value<Handle<Blake3, Sch>>,
@@ -152,7 +153,7 @@ where
         T: triblespace_core::blob::TryFromBlob<Sch>,
         Handle<Blake3, Sch>: ValueSchema,
     {
-        let Some(bytes) = self.sender.get_blob(peer, handle.raw)? else {
+        let Some(bytes) = self.sender.fetch(peer, handle.raw)? else {
             return Ok(None);
         };
         let data: Bytes = bytes.into();
@@ -407,7 +408,7 @@ where
 /// matches.
 ///
 /// This is the name-lookup half of the `pile net pull` workflow — the
-/// caller then hands the resolved `Id` to [`Peer::fetch`] to pull the
+/// caller then hands the resolved `Id` to [`Peer::track`] to pull the
 /// branch's reachable blob closure.
 pub fn resolve_branch_name<S>(
     peer: &mut Peer<S>,
@@ -424,7 +425,7 @@ where
     let branches = peer.list_remote_branches(remote)?;
     for (id, head) in branches {
         let meta_handle = Value::<Handle<Blake3, SimpleArchive>>::new(head);
-        let Some(meta) = peer.fetch_blob::<TribleSet, _>(remote, meta_handle)? else {
+        let Some(meta) = peer.fetch::<TribleSet, _>(remote, meta_handle)? else {
             continue;
         };
 
@@ -435,7 +436,7 @@ where
         .collect();
 
         for name_handle in name_handles {
-            let Some(name_view) = peer.fetch_blob::<anybytes::View<str>, _>(remote, name_handle)? else {
+            let Some(name_view) = peer.fetch::<anybytes::View<str>, _>(remote, name_handle)? else {
                 continue;
             };
             if name_view.as_ref() == name {

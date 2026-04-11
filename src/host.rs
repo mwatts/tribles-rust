@@ -116,8 +116,8 @@ impl HostSender {
         let _ = self.cmd_tx.send(NetCommand::Gossip { branch, head });
     }
 
-    pub fn fetch(&self, peer: EndpointId, branch: RawBranchId) {
-        let _ = self.cmd_tx.send(NetCommand::Fetch { peer, branch });
+    pub fn track(&self, peer: EndpointId, branch: RawBranchId) {
+        let _ = self.cmd_tx.send(NetCommand::Track { peer, branch });
     }
 
     /// RPC: list a remote peer's branches. Blocks the calling thread until
@@ -149,14 +149,14 @@ impl HostSender {
     /// RPC: fetch a single blob's bytes from a remote peer. Returns the
     /// raw bytes (or `None` if the remote doesn't have the blob); the
     /// caller is responsible for putting them into a local store.
-    pub fn get_blob(
+    pub fn fetch(
         &self,
         peer: EndpointId,
         hash: RawHash,
     ) -> anyhow::Result<Option<Vec<u8>>> {
         let (tx, rx) = mpsc::channel();
         self.cmd_tx
-            .send(NetCommand::GetBlob { peer, hash, reply: tx })
+            .send(NetCommand::Fetch { peer, hash, reply: tx })
             .map_err(|_| anyhow::anyhow!("network thread dropped"))?;
         rx.recv().map_err(|_| anyhow::anyhow!("network thread dropped"))?
     }
@@ -350,7 +350,7 @@ async fn host_loop(
                         });
                     }
                 }
-                NetCommand::Fetch { peer, branch } => {
+                NetCommand::Track { peer, branch } => {
                     let ep = ep.clone();
                     let events_tx = events.clone();
                     let dht = dht_api.clone();
@@ -367,11 +367,11 @@ async fn host_loop(
                         };
                         conn.close(0u32.into(), b"ok");
                         // Fetch blobs (DHT first, peer fallback).
-                        // For explicit fetch, the publisher is the peer we're fetching from.
+                        // For tracking, the publisher is the peer we're fetching from.
                         let mut publisher = [0u8; 32];
                         publisher.copy_from_slice(peer.as_bytes());
                         if let Err(e) = fetch_reachable(&ep, peer, &head, &dht, &events_tx).await {
-                            eprintln!("host: fetch error: {e}");
+                            eprintln!("host: track error: {e}");
                         } else {
                             let _ = events_tx.send(NetEvent::Head { branch, head, publisher });
                         }
@@ -409,7 +409,7 @@ async fn host_loop(
                         let _ = reply.send(result);
                     });
                 }
-                NetCommand::GetBlob { peer, hash, reply } => {
+                NetCommand::Fetch { peer, hash, reply } => {
                     let ep = ep.clone();
                     let dht = dht_api.clone();
                     tokio::spawn(async move {
