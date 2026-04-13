@@ -299,11 +299,7 @@ async fn host_loop(
                                 };
                                 tokio::spawn(async move {
                                     eprintln!("[net] fetching HEAD {} from publisher {}", hex::encode(&head[..4]), hex::encode(&publisher[..4]));
-                                    if let Err(e) = fetch_reachable(&ep2, fetch_peer, &head, &dht2, &events_tx2).await {
-                                        eprintln!("[net] fetch error: {e}");
-                                    } else {
-                                        let _ = events_tx2.send(NetEvent::Head { branch, head, publisher });
-                                    }
+                                    track_known_head(&ep2, fetch_peer, branch, head, publisher, &dht2, &events_tx2).await;
                                 });
                             }
                         }
@@ -353,7 +349,8 @@ async fn host_loop(
                     let events_tx = events.clone();
                     let dht = dht_api.clone();
                     tokio::spawn(async move {
-                        // Get remote HEAD first.
+                        // Discover the remote HEAD (gossip would have it for
+                        // free; explicit track has to ask).
                         let conn = match ep.connect(peer, PILE_SYNC_ALPN).await {
                             Ok(c) => c,
                             Err(e) => { eprintln!("[net] connect: {e}"); return; }
@@ -364,15 +361,11 @@ async fn host_loop(
                             Err(e) => { eprintln!("[net] head: {e}"); return; }
                         };
                         conn.close(0u32.into(), b"ok");
-                        // Fetch blobs (DHT first, peer fallback).
-                        // For tracking, the publisher is the peer we're fetching from.
+                        // For explicit track, the publisher is the peer
+                        // we asked (they vouched for this head).
                         let mut publisher = [0u8; 32];
                         publisher.copy_from_slice(peer.as_bytes());
-                        if let Err(e) = fetch_reachable(&ep, peer, &head, &dht, &events_tx).await {
-                            eprintln!("[net] track error: {e}");
-                        } else {
-                            let _ = events_tx.send(NetEvent::Head { branch, head, publisher });
-                        }
+                        track_known_head(&ep, peer, branch, head, publisher, &dht, &events_tx).await;
                     });
                 }
                 NetCommand::ListBranches { peer, reply } => {
@@ -506,6 +499,30 @@ async fn fetch_reachable(
     }
 
     Ok(())
+}
+
+/// Fetch the reachable closure from `head` on `fetch_peer` and, on
+/// success, emit a [`NetEvent::Head`] so the Peer materializes a
+/// tracking branch.
+///
+/// Shared tail of the gossip-arrival handler and the `Track` command:
+/// both know (fetch_peer, branch, head, publisher) by the time they
+/// get here. Gossip gets the head directly from the broadcast message;
+/// `Track` asks the peer via `op_head` first.
+async fn track_known_head(
+    ep: &iroh::Endpoint,
+    fetch_peer: EndpointId,
+    branch: RawBranchId,
+    head: RawHash,
+    publisher: crate::channel::PublisherKey,
+    dht: &Option<iroh_dht::api::ApiClient>,
+    events: &mpsc::Sender<NetEvent>,
+) {
+    if let Err(e) = fetch_reachable(ep, fetch_peer, &head, dht, events).await {
+        eprintln!("[net] fetch error: {e}");
+    } else {
+        let _ = events.send(NetEvent::Head { branch, head, publisher });
+    }
 }
 
 // ── Protocol handler ─────────────────────────────────────────────────
