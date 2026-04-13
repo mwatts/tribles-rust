@@ -1,8 +1,9 @@
 //! Network thread: spawns iroh endpoint, gossip, DHT, protocol server.
 //!
-//! Internal implementation detail of [`crate::peer::Peer`] — `spawn()`
-//! returns the two channel halves the Peer uses to communicate with the
-//! network thread (commands + snapshot updates one way, events the other).
+//! Private implementation detail of [`crate::peer::Peer`] — `spawn()`
+//! returns the [`NetSender`] / [`NetReceiver`] pair the Peer uses to
+//! communicate with the async world (commands + snapshot updates one
+//! way, events the other).
 //!
 //! Async is jailed inside the spawned thread.
 
@@ -18,14 +19,14 @@ use crate::identity::iroh_secret;
 use crate::protocol::*;
 
 /// Configuration for the host thread.
-pub struct HostConfig {
+pub struct PeerConfig {
     /// Peers to connect to (used for both gossip and DHT bootstrap).
     pub peers: Vec<EndpointId>,
     /// Gossip topic name (None = no gossip, serve-only).
     pub gossip_topic: Option<String>,
 }
 
-impl Default for HostConfig {
+impl Default for PeerConfig {
     fn default() -> Self {
         Self {
             peers: Vec::new(),
@@ -99,13 +100,13 @@ where
 
 /// Send commands to the host thread + update the serving snapshot.
 #[derive(Clone)]
-pub struct HostSender {
+pub struct NetSender {
     cmd_tx: mpsc::Sender<NetCommand>,
     snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
     id: EndpointId,
 }
 
-impl HostSender {
+impl NetSender {
     pub fn id(&self) -> EndpointId { self.id }
 
     pub fn announce(&self, hash: RawHash) {
@@ -168,15 +169,12 @@ impl HostSender {
 
 // ── Incoming half ────────────────────────────────────────────────────
 
-/// Receive events from the host thread.
-pub struct HostReceiver {
+/// Receive events from the network thread.
+pub struct NetReceiver {
     evt_rx: mpsc::Receiver<NetEvent>,
-    id: EndpointId,
 }
 
-impl HostReceiver {
-    pub fn id(&self) -> EndpointId { self.id }
-
+impl NetReceiver {
     pub fn try_recv(&self) -> Option<NetEvent> {
         self.evt_rx.try_recv().ok()
     }
@@ -186,7 +184,7 @@ impl HostReceiver {
 
 /// Spawn the network thread. Returns the outgoing/incoming channel halves
 /// — used internally by [`Peer::new`](crate::peer::Peer::new).
-pub fn spawn(key: SigningKey, config: HostConfig) -> (HostSender, HostReceiver) {
+pub fn spawn(key: SigningKey, config: PeerConfig) -> (NetSender, NetReceiver) {
     let secret = iroh_secret(&key);
     let id: EndpointId = secret.public().into();
 
@@ -202,16 +200,16 @@ pub fn spawn(key: SigningKey, config: HostConfig) -> (HostSender, HostReceiver) 
         rt.block_on(host_loop(secret, config, cmd_rx, evt_tx, thread_snapshot));
     });
 
-    let sender = HostSender { cmd_tx, snapshot, id };
-    let receiver = HostReceiver { evt_rx, id };
+    let sender = NetSender { cmd_tx, snapshot, id };
+    let receiver = NetReceiver { evt_rx };
     (sender, receiver)
 }
 
-// ── Host thread event loop ───────────────────────────────────────────
+// ── Network thread event loop ────────────────────────────────────────
 
 async fn host_loop(
     secret: iroh_base::SecretKey,
-    config: HostConfig,
+    config: PeerConfig,
     commands: mpsc::Receiver<NetCommand>,
     events: mpsc::Sender<NetEvent>,
     snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
@@ -225,7 +223,7 @@ async fn host_loop(
 
     let ep = match Endpoint::builder(presets::N0).secret_key(secret).bind().await {
         Ok(ep) => ep,
-        Err(e) => { eprintln!("host: bind failed: {e}"); return; }
+        Err(e) => { eprintln!("[net] bind failed: {e}"); return; }
     };
     ep.online().await;
 
@@ -300,9 +298,9 @@ async fn host_loop(
                                     msg.delivered_from.into()
                                 };
                                 tokio::spawn(async move {
-                                    eprintln!("[host] fetching HEAD {} from publisher {}", hex::encode(&head[..4]), hex::encode(&publisher[..4]));
+                                    eprintln!("[net] fetching HEAD {} from publisher {}", hex::encode(&head[..4]), hex::encode(&publisher[..4]));
                                     if let Err(e) = fetch_reachable(&ep2, fetch_peer, &head, &dht2, &events_tx2).await {
-                                        eprintln!("[host] fetch error: {e}");
+                                        eprintln!("[net] fetch error: {e}");
                                     } else {
                                         let _ = events_tx2.send(NetEvent::Head { branch, head, publisher });
                                     }
@@ -310,10 +308,10 @@ async fn host_loop(
                             }
                         }
                         iroh_gossip::api::Event::NeighborUp(peer) => {
-                            eprintln!("[host] gossip neighbor up: {}", peer.fmt_short());
+                            eprintln!("[net] gossip neighbor up: {}", peer.fmt_short());
                         }
                         iroh_gossip::api::Event::NeighborDown(peer) => {
-                            eprintln!("[host] gossip neighbor down: {}", peer.fmt_short());
+                            eprintln!("[net] gossip neighbor down: {}", peer.fmt_short());
                         }
                         _ => {}
                     }
@@ -358,12 +356,12 @@ async fn host_loop(
                         // Get remote HEAD first.
                         let conn = match ep.connect(peer, PILE_SYNC_ALPN).await {
                             Ok(c) => c,
-                            Err(e) => { eprintln!("host: connect: {e}"); return; }
+                            Err(e) => { eprintln!("[net] connect: {e}"); return; }
                         };
                         let head = match op_head(&conn, &branch).await {
                             Ok(Some(h)) => h,
-                            Ok(None) => { eprintln!("host: no head"); return; }
-                            Err(e) => { eprintln!("host: head: {e}"); return; }
+                            Ok(None) => { eprintln!("[net] no head"); return; }
+                            Err(e) => { eprintln!("[net] head: {e}"); return; }
                         };
                         conn.close(0u32.into(), b"ok");
                         // Fetch blobs (DHT first, peer fallback).
@@ -371,7 +369,7 @@ async fn host_loop(
                         let mut publisher = [0u8; 32];
                         publisher.copy_from_slice(peer.as_bytes());
                         if let Err(e) = fetch_reachable(&ep, peer, &head, &dht, &events_tx).await {
-                            eprintln!("host: track error: {e}");
+                            eprintln!("[net] track error: {e}");
                         } else {
                             let _ = events_tx.send(NetEvent::Head { branch, head, publisher });
                         }
@@ -447,7 +445,7 @@ async fn fetch_blob(
                         if verify(&data) {
                             return Ok(Some(data));
                         }
-                        eprintln!("[host] hash mismatch from DHT provider {}", provider.fmt_short());
+                        eprintln!("[net] hash mismatch from DHT provider {}", provider.fmt_short());
                     }
                 }
             }
@@ -461,7 +459,7 @@ async fn fetch_blob(
             if verify(&data) {
                 return Ok(Some(data));
             }
-            eprintln!("[host] hash mismatch from hint peer {}", hint_peer.fmt_short());
+            eprintln!("[net] hash mismatch from hint peer {}", hint_peer.fmt_short());
         }
     }
 

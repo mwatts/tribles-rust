@@ -51,7 +51,7 @@ pub enum NetCommand {
     },
 }
 
-/// Events received from the Host thread.
+/// Events received from the network thread.
 #[derive(Debug)]
 pub enum NetEvent {
     /// A blob was fetched from the network.

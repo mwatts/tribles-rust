@@ -35,12 +35,10 @@ use triblespace_core::value::ValueSchema;
 use triblespace_core::value::schemas::hash::{Blake3, Handle};
 
 use crate::channel::NetEvent;
-use crate::host::{self, HostReceiver, HostSender, StoreSnapshot};
+use crate::host::{self, NetReceiver, NetSender, StoreSnapshot};
 use crate::protocol::{RawBranchId, RawHash};
 
-/// Configuration for a [`Peer`]. Re-export of `HostConfig` since the
-/// network thread is now a private implementation detail of `Peer`.
-pub use crate::host::HostConfig as PeerConfig;
+pub use crate::host::PeerConfig;
 
 /// A store wrapped in distributed network sync.
 ///
@@ -50,8 +48,8 @@ where
     S: BlobStore<Blake3> + BlobStorePut<Blake3> + BranchStore<Blake3>,
 {
     store: S,
-    sender: HostSender,
-    receiver: HostReceiver,
+    sender: NetSender,
+    receiver: NetReceiver,
 
     /// Baseline blob snapshot for diff-and-publish on `refresh`. The Reader
     /// is a frozen view (for backends with snapshot semantics like Pile) so
