@@ -1,5 +1,5 @@
-use crate::value::TryFromValue;
 use crate::value::ToValue;
+use crate::value::TryFromValue;
 
 use super::*;
 
@@ -44,6 +44,14 @@ impl<'a, T: Ord> SortedSlice<'a, T> {
     /// The caller must ensure `data` is sorted in ascending order.
     /// Unsorted data will produce incorrect query results.
     pub fn new_unchecked(data: &'a [T]) -> Self {
+        SortedSlice(data)
+    }
+
+    /// Sorts `data` in place and wraps it. Convenience for callers that
+    /// have a mutable slice (e.g. via `&mut Vec<T>`) and don't want to
+    /// manage the sort themselves.
+    pub fn from_mut(data: &'a mut [T]) -> Self {
+        data.sort_unstable();
         SortedSlice(data)
     }
 }
@@ -112,5 +120,29 @@ where
 
     fn has(self, v: Variable<S>) -> Self::Constraint {
         SortedSliceConstraint::new(v, self)
+    }
+}
+
+/// Sort-on-demand impl for any mutable slice borrow. Picks up `&mut [T]`
+/// directly, and — via `DerefMut` method-resolution — `&mut Vec<T>`,
+/// `&mut [T; N]`, `&mut Box<[T]>`, and anything else that derefs to a slice.
+///
+/// The borrowed data is sorted in place on construction; afterward the
+/// returned [`SortedSliceConstraint`] aliases the same buffer for propose and
+/// binary-search confirm. Callers who don't want their container reordered
+/// should clone first, or use [`SortedSlice::new`] / [`SortedSlice::new_unchecked`]
+/// against data they already guarantee sorted.
+///
+/// Does not conflict with the pre-sorted [`SortedSlice`] impl above:
+/// `SortedSlice<'a, T>` is not a `&mut [T]`.
+impl<'a, S: ValueSchema, T> ContainsConstraint<'a, S> for &'a mut [T]
+where
+    T: 'a + Ord + for<'b> TryFromValue<'b, S>,
+    for<'b> &'b T: ToValue<S>,
+{
+    type Constraint = SortedSliceConstraint<'a, S, T>;
+
+    fn has(self, v: Variable<S>) -> Self::Constraint {
+        SortedSliceConstraint::new(v, SortedSlice::from_mut(self))
     }
 }

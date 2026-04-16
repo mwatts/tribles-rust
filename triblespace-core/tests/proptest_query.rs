@@ -1,11 +1,13 @@
-use proptest::prelude::*;
 use proptest::collection::vec;
+use proptest::prelude::*;
+use std::collections::HashSet;
 use triblespace_core::id::rngid;
 use triblespace_core::prelude::*;
-use triblespace_core::query::{Binding, Constraint, ContainsConstraint, TriblePattern, Variable, VariableContext};
+use triblespace_core::query::{
+    Binding, Constraint, ContainsConstraint, TriblePattern, Variable, VariableContext,
+};
 use triblespace_core::trible::{Fragment, Trible};
 use triblespace_core::value::schemas::UnknownValue;
-use std::collections::HashSet;
 
 mod test_ns {
     use triblespace_core::prelude::*;
@@ -577,6 +579,49 @@ proptest! {
         use triblespace_core::query::sortedsliceconstraint::SortedSlice;
         let data: Vec<String> = (0..len).map(|i| format!("{i:04}")).collect();
         prop_assert!(SortedSlice::new(&data).is_ok());
+    }
+
+    #[test]
+    fn mut_slice_has_sorts_and_matches_sorted_slice(
+        values in proptest::collection::hash_set("[a-z]{1,6}", 1..15),
+    ) {
+        // `&mut [T]` (and anything that derefs to one) should sort on
+        // `.has()` and produce the same rows as a pre-sorted `SortedSlice`.
+        use triblespace_core::query::sortedsliceconstraint::SortedSlice;
+        use triblespace_core::value::schemas::shortstring::ShortString;
+
+        let mut shuffled: Vec<String> = values.into_iter().collect();
+        // Scramble deterministically so we have something to sort.
+        shuffled.sort_by(|a, b| b.cmp(a));
+        let mut sorted = shuffled.clone();
+        sorted.sort();
+
+        let presorted = SortedSlice::new(&sorted).unwrap();
+        let mut expected: Vec<Value<ShortString>> = find!(
+            v: Value<ShortString>,
+            presorted.has(v)
+        ).collect();
+
+        // &mut [T] — direct impl path.
+        let mut actual_slice: Vec<Value<ShortString>> = find!(
+            v: Value<ShortString>,
+            (&mut shuffled[..]).has(v)
+        ).collect();
+
+        // Reshuffle and exercise &mut Vec<T> — should reach the impl via DerefMut.
+        shuffled.sort_by(|a, b| b.cmp(a));
+        let mut actual_vec: Vec<Value<ShortString>> = find!(
+            v: Value<ShortString>,
+            (&mut shuffled).has(v)
+        ).collect();
+
+        expected.sort();
+        actual_slice.sort();
+        actual_vec.sort();
+        prop_assert_eq!(&expected, &actual_slice,
+            "&mut [T]::has should sort in place and produce the same rows as SortedSlice");
+        prop_assert_eq!(&expected, &actual_vec,
+            "&mut Vec<T>::has should route to &mut [T] via DerefMut and match");
     }
 
     // ── EqualityConstraint ──────────────────────────────────────────
