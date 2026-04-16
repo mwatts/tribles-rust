@@ -9,7 +9,7 @@ attributes, and outlines how you can extend the same patterns to new formats.
 
 The `triblespace_core::import` module collects conversion helpers that translate
 structured documents into raw tribles. Today the namespace ships with two
-deterministic JSON importers:
+deterministic JSON importers and an N-Triples (RDF) importer:
 
 - `JsonObjectImporter` hashes attribute/value pairs to derive entity identifiers
   so identical inputs reproduce the same entities. It accepts a top-level JSON
@@ -24,6 +24,12 @@ deterministic JSON importers:
   across overlapping imports. Unlike the object importer it can represent
   arbitrary JSON roots, including primitives. Each `import_*` call returns a
   rooted `Fragment` for the imported JSON value.
+- `ntriples::ingest_ntriples` (and the file-backed `ingest_ntriples_file`
+  wrapper) reads the line-oriented N-Triples serialization of an RDF graph
+  and emits one trible per statement. URIs become stable entity ids via the
+  [`import::rdf_uri`](../src/import/mod.rs) attribute; predicate URIs become
+  attribute ids via `Attribute::from_name`; literal values map into the
+  appropriate native `ValueSchema` based on their XSD datatype.
 
 `JsonObjectImporter` uses a fixed mapping for JSON primitives:
 
@@ -111,6 +117,82 @@ Each `import_*` call returns a rooted `Fragment` containing the JSON AST facts.
 Merge fragments when you ingest multiple documents. `metadata()` returns a
 fixed `Fragment` exporting the schema ids for the `json_tree::*` attributes and
 kinds. You typically merge it once alongside your lossless archive.
+
+## Importing N-Triples (RDF)
+
+The `import::ntriples` module reads the [N-Triples](https://www.w3.org/TR/n-triples/)
+serialization of an RDF graph and emits one trible per statement. The
+importer runs directly against a `Workspace<Blobs: BlobStore<Blake3>>` so
+literal blobs land in the workspace's local store alongside the emitted
+facts:
+
+```rust,ignore
+use std::io::Cursor;
+use triblespace::core::import::ntriples::ingest_ntriples;
+
+let data = br#"
+<http://example.org/frank> <http://example.org/firstname> "Frank" .
+<http://example.org/frank> <http://example.org/birthyear> "1920"^^<http://www.w3.org/2001/XMLSchema#integer> .
+"#;
+let (facts, count) = ingest_ntriples(&mut workspace, Cursor::new(&data[..]));
+assert_eq!(count, 2);
+workspace.commit(facts, "import example");
+```
+
+**URI → entity id.** Every subject and URI-valued object gets a stable
+triblespace `Id` derived from its URI via the `import::rdf_uri` attribute:
+the URI is stored as a `LongString` blob, wrapped in an `entity!` fragment
+exporting a single `rdf_uri` edge, and the fragment's content-derived root
+id becomes the entity id. The same URI always produces the same id across
+processes, so repeated imports over the same data reach the same
+TribleSet — even across machines. The `rdf_uri` edge itself is also
+emitted, so `pattern!([{ ?e @ rdf_uri: ?uri }])` recovers the original
+URI for any imported entity.
+
+**Predicate → attribute id.** Predicate URIs become attribute ids through
+`Attribute::from_name`, the same derivation JSON importers use. Because
+attribute ids are hashed together with the chosen `ValueSchema`, the same
+predicate used for two different literal types produces two different
+attribute ids — which is what you want: `:birthyear "1920"^^xsd:integer`
+and `:birthyear "1920"` (untyped string) shouldn't collide.
+
+**Literal → native value.** XSD datatypes map into the appropriate
+triblespace value schemas:
+
+| XSD datatype | triblespace schema |
+|---|---|
+| `xsd:integer`, `xsd:long`, `xsd:int`, `xsd:short`, `xsd:byte`, `xsd:negativeInteger`, `xsd:nonPositiveInteger` | `I256BE` |
+| `xsd:nonNegativeInteger`, `xsd:positiveInteger`, `xsd:unsignedInt`, `xsd:unsignedLong`, `xsd:unsignedShort`, `xsd:unsignedByte` | `U256BE` |
+| `xsd:decimal` | `R256BE` (exact rational) |
+| `xsd:float`, `xsd:double` | `F64` |
+| `xsd:boolean` | `Boolean` |
+| `xsd:string`, untyped, language-tagged | `Handle<Blake3, LongString>` |
+
+Unrecognized datatypes fall back to `Handle<Blake3, LongString>` so no
+data is lost — the lexical form ships through verbatim. Numeric parse
+failures fall back to the string path too.
+
+**Roundtrips and querying.** Because both ids and attribute ids are
+derived, you can query the imported graph without inventing a separate
+schema:
+
+```rust,ignore
+use triblespace::core::attribute::Attribute;
+use triblespace::prelude::valueschemas::I256BE;
+
+let birthyear = Attribute::<I256BE>::from_name("http://example.org/birthyear");
+for (entity, year) in find!(
+    (entity: Id, year: i128),
+    pattern!(&facts, [{ ?entity @ birthyear: ?year }])
+) {
+    println!("{entity} born in {year}");
+}
+```
+
+**N-Triples only.** The current importer handles the line-oriented
+N-Triples format: one statement per line, URIs in angle brackets,
+literals in double quotes with optional `^^<datatype>`. Turtle-style
+prefixes, blank nodes, and quad/N-Quads are not yet supported.
 
 ## Managing Entity Identifiers
 
