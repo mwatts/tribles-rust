@@ -21,6 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   truncates any partial tail after a crash. Test coverage added as
   `put_and_get_oversized_blob` (`#[ignore]`d because the exercise
   allocates ~1&nbsp;GiB of memory).
+- `branch_metadata` and `branch_unsigned` now stamp every branch
+  metadata blob with `metadata::updated_at: NsTAIInterval` from
+  `Epoch::now()`. Downstream sync layers can use this to order
+  concurrent HEAD gossips without walking ancestor chains. Tradeoff:
+  the same `(head, name, signer)` state at two different times no
+  longer produces an identical metadata blob hash — gossip
+  convergence degrades slightly (same-state dup blobs) but correctness
+  is preserved.
 
 ### Added
 - `SortedSlice::from_mut(&mut [T])`: sort-in-place constructor that mirrors
@@ -31,6 +39,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this also picks up `&mut Vec<T>`, `&mut [T; N]`, `&mut Box<[T]>`, and any
   other mutable borrow that derefs to a slice, so callers can write
   `(&mut my_vec).has(var)` without hand-rolling the sort.
+- `import::ntriples::{ingest_ntriples, ingest_ntriples_file}`: N-Triples
+  importer generic over any `Workspace<Blobs: BlobStore<Blake3>>`. XSD
+  datatypes map to native triblespace schemas (`xsd:integer` → `I256BE`,
+  `xsd:decimal` → `R256BE` exact rational, `xsd:float`/`xsd:double` → `F64`,
+  `xsd:boolean` → `Boolean`, strings → `Handle<LongString>`, URI objects
+  → `GenId`). Predicate URIs become attributes via `Attribute::from_name`
+  so repeated imports of the same data converge deterministically.
+- `import::rdf_uri`: canonical "this entity is the referent of this URI"
+  attribute, used by the N-Triples importer to derive stable entity ids
+  from URIs.
 
 ## [0.34.1] - 2026-04-04
 ### Added
