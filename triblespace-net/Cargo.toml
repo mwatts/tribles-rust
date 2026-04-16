@@ -1,0 +1,33 @@
+[package]
+name = "triblespace-net"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Distributed sync protocol for triblespace piles over iroh"
+repository = "https://github.com/triblespace/triblespace-net"
+
+[dependencies]
+triblespace-core = { path = "../triblespace-rs/triblespace-core" }
+iroh = { path = "../iroh/iroh" }
+iroh-base = { path = "../iroh/iroh-base" }
+iroh-dht = { path = "../iroh-dht" }
+iroh-blobs = { path = "../iroh-blobs", default-features = false }
+iroh-gossip = { path = "../iroh-gossip", features = ["net"] }
+irpc-iroh = "0.13.0"
+anyhow = "1"
+anybytes = { version = "0.20.2", features = ["zerocopy"] }
+blake3 = "1.8"
+ed25519-dalek = "2.2.0"
+getrandom = "0.4"
+hex = "0.4"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+tracing = "0.1"
+
+[patch.crates-io]
+noq = { git = "https://github.com/n0-computer/noq", branch = "main" }
+noq-udp = { git = "https://github.com/n0-computer/noq", branch = "main" }
+noq-proto = { git = "https://github.com/n0-computer/noq", branch = "main" }
+iroh = { path = "../iroh/iroh" }
+iroh-base = { path = "../iroh/iroh-base" }
