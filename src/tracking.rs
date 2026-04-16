@@ -12,6 +12,7 @@ use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
 use triblespace_core::id::{Id, genid};
 use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut, BranchStore, PushResult, Repository};
 use triblespace_core::trible::TribleSet;
+use triblespace_core::value::schemas::time::NsTAIInterval;
 use triblespace_core::value::Value;
 use triblespace_core::value::schemas::hash::{Blake3, Handle};
 use triblespace_core::prelude::valueschemas::{GenId, ED25519PublicKey};
@@ -129,6 +130,35 @@ fn resolve_commit_in_branch_meta<S: BlobStore<Blake3>>(
     ).next()
 }
 
+/// Read the `metadata::updated_at` attribute from a branch metadata blob,
+/// if present. Returns `None` if the blob is missing, can't be parsed, or
+/// doesn't carry a timestamp.
+fn read_updated_at<S: BlobStore<Blake3>>(
+    store: &mut S,
+    branch_meta_hash: &RawHash,
+) -> Option<Value<NsTAIInterval>> {
+    let reader = store.reader().ok()?;
+    let meta_handle = Value::<Handle<Blake3, SimpleArchive>>::new(*branch_meta_hash);
+    let meta: TribleSet = reader.get(meta_handle).ok()?;
+    find!(
+        ts: Value<NsTAIInterval>,
+        pattern!(&meta, [{ _?e @ triblespace_core::metadata::updated_at: ?ts }])
+    ).next()
+}
+
+/// Compare two `NsTAIInterval` values by their lower bound (both bounds
+/// are identical for point-in-time timestamps). Returns true iff `new` is
+/// strictly newer than `current`.
+fn is_newer(new: Value<NsTAIInterval>, current: Value<NsTAIInterval>) -> bool {
+    let Ok((new_ns, _)): Result<(i128, i128), _> = new.try_from_value() else {
+        return false;
+    };
+    let Ok((current_ns, _)): Result<(i128, i128), _> = current.try_from_value() else {
+        return false;
+    };
+    new_ns > current_ns
+}
+
 /// Create a new tracking branch. Returns the local tracking branch ID.
 ///
 /// `remote_head_hash` is the branch metadata blob hash gossiped over the
@@ -146,6 +176,9 @@ where
 {
     // Resolve the gossiped branch metadata hash to the actual commit.
     let commit_handle = resolve_commit_in_branch_meta(store, remote_head_hash)?;
+    // Mirror the remote's publication timestamp so future updates can
+    // reject stale gossips without needing an ancestry walk.
+    let remote_updated_at = read_updated_at(store, remote_head_hash);
 
     let tracking_eid = genid();
     let tracking_id: Id = tracking_eid.id;
@@ -156,15 +189,16 @@ where
 
     let pub_key = ed25519_dalek::VerifyingKey::from_bytes(publisher).ok()?;
 
-    let meta = entity! { &tracking_eid @
+    let mut meta_set: TribleSet = entity! { &tracking_eid @
         triblespace_core::repo::branch: tracking_id,
         triblespace_core::repo::head: commit_handle,
         remote_name: name_handle,
         tracking_remote_branch: remote_branch_id,
         tracking_peer: pub_key,
-    };
-
-    let meta_set: TribleSet = meta.into();
+    }.into();
+    if let Some(ts) = remote_updated_at {
+        meta_set += entity! { &tracking_eid @ triblespace_core::metadata::updated_at: ts };
+    }
     let meta_handle: Value<Handle<Blake3, SimpleArchive>> = store.put(meta_set).ok()?;
 
     // Create the branch.
@@ -189,6 +223,23 @@ where
 {
     let old_meta = store.head(tracking_branch_id).ok()??;
 
+    // Reject stale updates: if we can read a timestamp from both the
+    // currently-stored tracking metadata and the incoming remote metadata,
+    // require the incoming one to be strictly newer. This prevents a
+    // late-finishing fetch for an older HEAD from overwriting a
+    // newer HEAD that already advanced the tracking branch.
+    let new_ts = read_updated_at(store, new_head_hash);
+    let current_ts = read_updated_at(store, &old_meta.raw);
+    if let (Some(current), Some(new)) = (current_ts, new_ts) {
+        if !is_newer(new, current) {
+            eprintln!(
+                "[tracking] skip stale update for branch {} (incoming ts ≤ current)",
+                hex::encode(&remote_branch_id.raw()[..4])
+            );
+            return None;
+        }
+    }
+
     let commit_handle = resolve_commit_in_branch_meta(store, new_head_hash)?;
 
     let name_string = remote_name_str.to_string();
@@ -196,14 +247,16 @@ where
 
     let pub_key = ed25519_dalek::VerifyingKey::from_bytes(publisher).ok()?;
     let eid = genid();
-    let meta = entity! { &eid @
+    let mut meta_set: TribleSet = entity! { &eid @
         triblespace_core::repo::branch: tracking_branch_id,
         triblespace_core::repo::head: commit_handle,
         remote_name: name_handle,
         tracking_remote_branch: remote_branch_id,
         tracking_peer: pub_key,
-    };
-    let meta_set: TribleSet = meta.into();
+    }.into();
+    if let Some(ts) = new_ts {
+        meta_set += entity! { &eid @ triblespace_core::metadata::updated_at: ts };
+    }
 
     let meta_handle: Value<Handle<Blake3, SimpleArchive>> = store.put(meta_set).ok()?;
 
