@@ -6,6 +6,7 @@ use ed25519_dalek::SignatureError;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::Verifier;
 use ed25519_dalek::VerifyingKey;
+use hifitime::prelude::*;
 use itertools::Itertools;
 
 use crate::blob::schemas::longstring::LongString;
@@ -16,7 +17,22 @@ use crate::metadata;
 use crate::prelude::blobschemas::SimpleArchive;
 use crate::trible::TribleSet;
 use crate::value::schemas::hash::{Blake3, Handle};
+use crate::value::schemas::time::NsTAIInterval;
+use crate::value::TryToValue;
 use crate::value::Value;
+
+/// Current TAI time as a collapsed `NsTAIInterval`. Used as
+/// `metadata::updated_at` on every branch metadata blob so that peers can
+/// order concurrent HEAD gossips without walking ancestor chains.
+///
+/// TAI is strictly monotone (no leap-second jumps). Wall-clock regressions
+/// still mean subsequent publishes land "in the past" from the publisher's
+/// view; receivers simply hold out until the publisher's clock catches up
+/// and a fresher timestamp arrives.
+fn now_updated_at() -> Value<NsTAIInterval> {
+    let now = Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
+    (now, now).try_to_value().expect("same epoch is a valid point interval")
+}
 
 /// Compute a content-derived entity id for branch metadata so that
 /// regenerating the same (branch_id, head, signer, name) produces the
@@ -81,6 +97,7 @@ pub fn branch_metadata(
         };
     }
     metadata += entity! { &metadata_entity @  metadata::name: name  };
+    metadata += entity! { &metadata_entity @ metadata::updated_at: now_updated_at() };
 
     metadata
 }
@@ -112,6 +129,7 @@ pub fn branch_unsigned(
     }
 
     metadata += entity! { &metadata_entity @  metadata::name: name  };
+    metadata += entity! { &metadata_entity @ metadata::updated_at: now_updated_at() };
 
     metadata
 }
