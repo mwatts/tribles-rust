@@ -1,6 +1,6 @@
 use crate::macros::entity;
-use crate::value::TryToValue;
 use crate::macros::pattern;
+use crate::value::TryToValue;
 use ed25519::Signature;
 use ed25519_dalek::SignatureError;
 use ed25519_dalek::SigningKey;

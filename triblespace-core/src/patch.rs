@@ -759,10 +759,12 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         F: FnMut(&[u8; INFIX_LEN]),
     {
         match self.body_ref() {
-            BodyRef::Leaf(leaf) => leaf.infixes_range::<PREFIX_LEN, INFIX_LEN, O, F>(prefix, at_depth, min_infix, max_infix, f),
-            BodyRef::Branch(branch) => {
-                branch.infixes_range::<PREFIX_LEN, INFIX_LEN, F>(prefix, at_depth, min_infix, max_infix, f)
-            }
+            BodyRef::Leaf(leaf) => leaf.infixes_range::<PREFIX_LEN, INFIX_LEN, O, F>(
+                prefix, at_depth, min_infix, max_infix, f,
+            ),
+            BodyRef::Branch(branch) => branch.infixes_range::<PREFIX_LEN, INFIX_LEN, F>(
+                prefix, at_depth, min_infix, max_infix, f,
+            ),
         }
     }
 
@@ -774,8 +776,12 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
         max_infix: &[u8; INFIX_LEN],
     ) -> u64 {
         match self.body_ref() {
-            BodyRef::Leaf(leaf) => leaf.count_range::<PREFIX_LEN, INFIX_LEN, O>(prefix, at_depth, min_infix, max_infix),
-            BodyRef::Branch(branch) => branch.count_range::<PREFIX_LEN, INFIX_LEN>(prefix, at_depth, min_infix, max_infix),
+            BodyRef::Leaf(leaf) => {
+                leaf.count_range::<PREFIX_LEN, INFIX_LEN, O>(prefix, at_depth, min_infix, max_infix)
+            }
+            BodyRef::Branch(branch) => {
+                branch.count_range::<PREFIX_LEN, INFIX_LEN>(prefix, at_depth, min_infix, max_infix)
+            }
         }
     }
 

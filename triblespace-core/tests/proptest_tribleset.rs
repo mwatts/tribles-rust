@@ -1,5 +1,5 @@
-use proptest::prelude::*;
 use proptest::collection::vec;
+use proptest::prelude::*;
 use triblespace_core::prelude::*;
 use triblespace_core::query::TriblePattern;
 use triblespace_core::query::Variable;
@@ -18,8 +18,8 @@ mod test_ns {
 fn arb_trible() -> impl Strategy<Value = Trible> {
     // Entity: 16 bytes (at least one non-zero), Attribute: 16 bytes (at least one non-zero), Value: 32 bytes
     (
-        prop::array::uniform16(1u8..=255),  // entity (all non-zero bytes guarantees non-nil)
-        prop::array::uniform16(1u8..=255),  // attribute
+        prop::array::uniform16(1u8..=255), // entity (all non-zero bytes guarantees non-nil)
+        prop::array::uniform16(1u8..=255), // attribute
         prop::array::uniform32(any::<u8>()), // value
     )
         .prop_map(|(e, a, v)| {

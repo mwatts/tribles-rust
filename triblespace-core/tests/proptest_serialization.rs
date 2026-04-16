@@ -1,5 +1,5 @@
-use proptest::prelude::*;
 use proptest::collection::vec;
+use proptest::prelude::*;
 use triblespace_core::blob::ToBlob;
 use triblespace_core::prelude::*;
 use triblespace_core::query::TriblePattern;

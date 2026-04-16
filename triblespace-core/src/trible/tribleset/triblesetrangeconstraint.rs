@@ -61,11 +61,10 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
         // Use count_range on the VEA index for an accurate estimate.
         // This counts leaves in the byte range using cached branch counts,
         // visiting only boundary nodes — O(depth × branching) not O(n).
-        let count = self.set.vea.count_range::<0, VALUE_LEN>(
-            &[0u8; 0],
-            &self.min,
-            &self.max,
-        );
+        let count = self
+            .set
+            .vea
+            .count_range::<0, VALUE_LEN>(&[0u8; 0], &self.min, &self.max);
         Some(count.min(usize::MAX as u64) as usize)
     }
 
@@ -77,14 +76,11 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
         // VEA tree order: V(32) → E(16) → A(16).
         // With empty prefix, infixes_range on V(32 bytes) gives us all
         // values in [min, max]. The trie prunes branches outside the range.
-        self.set.vea.infixes_range::<0, VALUE_LEN, _>(
-            &[0u8; 0],
-            &self.min,
-            &self.max,
-            |v| {
+        self.set
+            .vea
+            .infixes_range::<0, VALUE_LEN, _>(&[0u8; 0], &self.min, &self.max, |v| {
                 proposals.push(*v);
-            },
-        );
+            });
     }
 
     fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
@@ -103,8 +99,8 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
 
 #[cfg(test)]
 mod tests {
-    use crate::prelude::*;
     use crate::prelude::valueschemas::R256BE;
+    use crate::prelude::*;
 
     attributes! {
         "BB00000000000000BB00000000000000" as range_test_score: R256BE;
@@ -132,7 +128,8 @@ mod tests {
         let all: Vec<Value<R256BE>> = find!(
             v: Value<R256BE>,
             pattern!(&data, [{ range_test_score: ?v }])
-        ).collect();
+        )
+        .collect();
         assert_eq!(all.len(), 4);
 
         // With value_in_range [20..=95]: only v50 and v90.
@@ -144,7 +141,8 @@ mod tests {
                 pattern!(&data, [{ range_test_score: ?v }]),
                 data.value_in_range(v, min, max),
             )
-        ).collect();
+        )
+        .collect();
         filtered.sort();
         assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0], v50);
@@ -159,7 +157,8 @@ mod tests {
                 pattern!(&data, [{ range_test_score: ?v }]),
                 data.value_in_range(v, min_exact, max_exact),
             )
-        ).collect();
+        )
+        .collect();
         exact.sort();
         assert_eq!(exact.len(), 2);
         assert_eq!(exact[0], v50);
@@ -174,7 +173,8 @@ mod tests {
                 pattern!(&data, [{ range_test_score: ?v }]),
                 data.value_in_range(v, min_empty, max_empty),
             )
-        ).collect();
+        )
+        .collect();
         assert_eq!(empty.len(), 0);
     }
 }

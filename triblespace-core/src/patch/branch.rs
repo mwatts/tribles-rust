@@ -525,12 +525,20 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         for i in 0..infix_byte_idx {
             let path_byte = self.childleaf().key[O::TREE_TO_KEY[PREFIX_LEN + i]];
             if min_tight {
-                if path_byte < min_infix[i] { return; } // whole branch below min
-                if path_byte > min_infix[i] { min_tight = false; } // safely above min
+                if path_byte < min_infix[i] {
+                    return;
+                } // whole branch below min
+                if path_byte > min_infix[i] {
+                    min_tight = false;
+                } // safely above min
             }
             if max_tight {
-                if path_byte > max_infix[i] { return; } // whole branch above max
-                if path_byte < max_infix[i] { max_tight = false; } // safely below max
+                if path_byte > max_infix[i] {
+                    return;
+                } // whole branch above max
+                if path_byte < max_infix[i] {
+                    max_tight = false;
+                } // safely below max
             }
         }
 
@@ -593,12 +601,20 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
         for i in 0..infix_byte_idx {
             let path_byte = self.childleaf().key[O::TREE_TO_KEY[PREFIX_LEN + i]];
             if min_tight {
-                if path_byte < min_infix[i] { return 0; }
-                if path_byte > min_infix[i] { min_tight = false; }
+                if path_byte < min_infix[i] {
+                    return 0;
+                }
+                if path_byte > min_infix[i] {
+                    min_tight = false;
+                }
             }
             if max_tight {
-                if path_byte > max_infix[i] { return 0; }
-                if path_byte < max_infix[i] { max_tight = false; }
+                if path_byte > max_infix[i] {
+                    return 0;
+                }
+                if path_byte < max_infix[i] {
+                    max_tight = false;
+                }
             }
         }
 

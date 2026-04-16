@@ -7,6 +7,7 @@ use triblesetconstraint::*;
 use crate::query::TriblePattern;
 use crate::value::Value;
 
+use crate::id::Id;
 use crate::patch::Entry;
 use crate::patch::PATCH;
 use crate::query::Variable;
@@ -18,7 +19,6 @@ use crate::trible::Trible;
 use crate::trible::VAEOrder;
 use crate::trible::VEAOrder;
 use crate::trible::TRIBLE_LEN;
-use crate::id::Id;
 use crate::value::schemas::genid::GenId;
 use crate::value::ValueSchema;
 

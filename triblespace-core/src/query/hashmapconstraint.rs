@@ -9,9 +9,9 @@ use crate::query::ContainsConstraint;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
-use crate::value::TryFromValue;
 use crate::value::RawValue;
 use crate::value::ToValue;
+use crate::value::TryFromValue;
 use crate::value::Value;
 use crate::value::ValueSchema;
 
@@ -68,11 +68,12 @@ where
     fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
         if self.variable.index == variable {
             proposals.retain(|v| {
-                self.map
-                    .contains_key(&match TryFromValue::try_from_value(Value::<S>::as_transmute_raw(v)) {
-                        Ok(v) => v,
-                        Err(_) => return false,
-                    })
+                self.map.contains_key(&match TryFromValue::try_from_value(
+                    Value::<S>::as_transmute_raw(v),
+                ) {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                })
             });
         }
     }

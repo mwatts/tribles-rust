@@ -8,8 +8,8 @@
 
 use core::marker::PhantomData;
 
-use anybytes::{Bytes, View};
 use anybytes::view::ViewError;
+use anybytes::{Bytes, View};
 use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
 use crate::blob::{Blob, BlobSchema, ToBlob, TryFromBlob};
@@ -120,16 +120,66 @@ pub mod elements {
         };
     }
 
-    impl_array_element!(F32, f32, "92F4DB8D84519C8D6E212CB810FF40D4", "32-bit IEEE-754 float.");
-    impl_array_element!(F64, f64, "FA3AD8DEC844D5F409AB728269B7A3FE", "64-bit IEEE-754 float.");
-    impl_array_element!(U8,  u8,  "D16AC7C02F25E4799F4D47EB1E51EF6E", "Unsigned 8-bit integer.");
-    impl_array_element!(U16, u16, "C14453D98F283B96A1010A9F24D53B17", "Unsigned 16-bit integer.");
-    impl_array_element!(U32, u32, "1B9DD214A02C58D9141EF802273120F8", "Unsigned 32-bit integer.");
-    impl_array_element!(U64, u64, "323C0143534D3AD4898D69EA5597414A", "Unsigned 64-bit integer.");
-    impl_array_element!(I8,  i8,  "E68060AF27227583CB1AEDF89E17E278", "Signed 8-bit integer.");
-    impl_array_element!(I16, i16, "E72199687209A576562B5BD7196FD755", "Signed 16-bit integer.");
-    impl_array_element!(I32, i32, "AB831A6CCDAF7F49BA5BEADEA32CA04E", "Signed 32-bit integer.");
-    impl_array_element!(I64, i64, "53426475A3C695420B23C329285DCA57", "Signed 64-bit integer.");
+    impl_array_element!(
+        F32,
+        f32,
+        "92F4DB8D84519C8D6E212CB810FF40D4",
+        "32-bit IEEE-754 float."
+    );
+    impl_array_element!(
+        F64,
+        f64,
+        "FA3AD8DEC844D5F409AB728269B7A3FE",
+        "64-bit IEEE-754 float."
+    );
+    impl_array_element!(
+        U8,
+        u8,
+        "D16AC7C02F25E4799F4D47EB1E51EF6E",
+        "Unsigned 8-bit integer."
+    );
+    impl_array_element!(
+        U16,
+        u16,
+        "C14453D98F283B96A1010A9F24D53B17",
+        "Unsigned 16-bit integer."
+    );
+    impl_array_element!(
+        U32,
+        u32,
+        "1B9DD214A02C58D9141EF802273120F8",
+        "Unsigned 32-bit integer."
+    );
+    impl_array_element!(
+        U64,
+        u64,
+        "323C0143534D3AD4898D69EA5597414A",
+        "Unsigned 64-bit integer."
+    );
+    impl_array_element!(
+        I8,
+        i8,
+        "E68060AF27227583CB1AEDF89E17E278",
+        "Signed 8-bit integer."
+    );
+    impl_array_element!(
+        I16,
+        i16,
+        "E72199687209A576562B5BD7196FD755",
+        "Signed 16-bit integer."
+    );
+    impl_array_element!(
+        I32,
+        i32,
+        "AB831A6CCDAF7F49BA5BEADEA32CA04E",
+        "Signed 32-bit integer."
+    );
+    impl_array_element!(
+        I64,
+        i64,
+        "53426475A3C695420B23C329285DCA57",
+        "Signed 64-bit integer."
+    );
 }
 
 /// Zero-copy typed view directly from an Array blob.

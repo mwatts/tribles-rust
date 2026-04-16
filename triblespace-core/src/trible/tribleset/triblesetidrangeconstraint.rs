@@ -9,8 +9,8 @@ use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
 use crate::trible::TribleSet;
-use crate::value::RawValue;
 use crate::value::schemas::genid::GenId;
+use crate::value::RawValue;
 
 /// An entity-range-aware constraint that uses the TribleSet's EAV index
 /// to propose only entity IDs in a byte-lexicographic range.
@@ -33,12 +33,7 @@ pub struct EntityRangeConstraint {
 }
 
 impl EntityRangeConstraint {
-    pub fn new(
-        variable_e: Variable<GenId>,
-        min: Id,
-        max: Id,
-        set: TribleSet,
-    ) -> Self {
+    pub fn new(variable_e: Variable<GenId>, min: Id, max: Id, set: TribleSet) -> Self {
         EntityRangeConstraint {
             variable_e: variable_e.index,
             min: min.into(),
@@ -57,11 +52,10 @@ impl<'a> Constraint<'a> for EntityRangeConstraint {
         if variable != self.variable_e {
             return None;
         }
-        let count = self.set.eav.count_range::<0, ID_LEN>(
-            &[0u8; 0],
-            &self.min,
-            &self.max,
-        );
+        let count = self
+            .set
+            .eav
+            .count_range::<0, ID_LEN>(&[0u8; 0], &self.min, &self.max);
         Some(count.min(usize::MAX as u64) as usize)
     }
 
@@ -69,14 +63,11 @@ impl<'a> Constraint<'a> for EntityRangeConstraint {
         if variable != self.variable_e {
             return;
         }
-        self.set.eav.infixes_range::<0, ID_LEN, _>(
-            &[0u8; 0],
-            &self.min,
-            &self.max,
-            |e| {
+        self.set
+            .eav
+            .infixes_range::<0, ID_LEN, _>(&[0u8; 0], &self.min, &self.max, |e| {
                 proposals.push(id_into_value(e));
-            },
-        );
+            });
     }
 
     fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
@@ -124,12 +115,7 @@ pub struct AttributeRangeConstraint {
 }
 
 impl AttributeRangeConstraint {
-    pub fn new(
-        variable_a: Variable<GenId>,
-        min: Id,
-        max: Id,
-        set: TribleSet,
-    ) -> Self {
+    pub fn new(variable_a: Variable<GenId>, min: Id, max: Id, set: TribleSet) -> Self {
         AttributeRangeConstraint {
             variable_a: variable_a.index,
             min: min.into(),
@@ -148,11 +134,10 @@ impl<'a> Constraint<'a> for AttributeRangeConstraint {
         if variable != self.variable_a {
             return None;
         }
-        let count = self.set.aev.count_range::<0, ID_LEN>(
-            &[0u8; 0],
-            &self.min,
-            &self.max,
-        );
+        let count = self
+            .set
+            .aev
+            .count_range::<0, ID_LEN>(&[0u8; 0], &self.min, &self.max);
         Some(count.min(usize::MAX as u64) as usize)
     }
 
@@ -160,14 +145,11 @@ impl<'a> Constraint<'a> for AttributeRangeConstraint {
         if variable != self.variable_a {
             return;
         }
-        self.set.aev.infixes_range::<0, ID_LEN, _>(
-            &[0u8; 0],
-            &self.min,
-            &self.max,
-            |a| {
+        self.set
+            .aev
+            .infixes_range::<0, ID_LEN, _>(&[0u8; 0], &self.min, &self.max, |a| {
                 proposals.push(id_into_value(a));
-            },
-        );
+            });
     }
 
     fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
@@ -196,8 +178,8 @@ impl<'a> Constraint<'a> for AttributeRangeConstraint {
 
 #[cfg(test)]
 mod tests {
-    use crate::prelude::*;
     use crate::prelude::valueschemas::R256BE;
+    use crate::prelude::*;
 
     attributes! {
         "CC00000000000000CC00000000000000" as id_range_test_score: R256BE;
@@ -235,14 +217,18 @@ mod tests {
                 pattern!(&data, [{ ?id @ id_range_test_score: ?v }]),
                 data.entity_in_range(id, min_id, max_id),
             )
-        ).map(|(id, _v)| id).collect();
+        )
+        .map(|(id, _v)| id)
+        .collect();
         assert_eq!(filtered.len(), 2);
 
         // All entities.
         let all: Vec<Id> = find!(
             (id: Id, v: Value<R256BE>),
             pattern!(&data, [{ ?id @ id_range_test_score: ?v }])
-        ).map(|(id, _v)| id).collect();
+        )
+        .map(|(id, _v)| id)
+        .collect();
         assert_eq!(all.len(), 4);
     }
 
@@ -266,7 +252,9 @@ mod tests {
                 pattern!(&data, [{ ?id @ id_range_test_score: ?v }]),
                 data.entity_in_range(id, id1, id1),
             )
-        ).map(|(id, _)| id).collect();
+        )
+        .map(|(id, _)| id)
+        .collect();
         assert_eq!(exact.len(), 1);
         assert_eq!(exact[0], id1);
 
@@ -280,7 +268,9 @@ mod tests {
                 pattern!(&data, [{ ?id @ id_range_test_score: ?v }]),
                 data.entity_in_range(id, id2, id2),
             )
-        ).map(|(id, _)| id).collect();
+        )
+        .map(|(id, _)| id)
+        .collect();
         assert_eq!(exact2.len(), 1);
         assert_eq!(exact2[0], id2);
     }

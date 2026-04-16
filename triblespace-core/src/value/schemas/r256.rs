@@ -191,7 +191,6 @@ impl TryFromValue<'_, R256BE> for Ratio<i128> {
     }
 }
 
-
 impl ToValue<R256BE> for Ratio<i128> {
     fn to_value(self) -> Value<R256BE> {
         let ratio = self.reduced();
@@ -237,7 +236,6 @@ impl TryFromValue<'_, R256LE> for Ratio<i128> {
     }
 }
 
-
 impl ToValue<R256LE> for Ratio<i128> {
     fn to_value(self) -> Value<R256LE> {
         let mut bytes = [0; 32];
@@ -266,7 +264,10 @@ mod tests {
     use proptest::prelude::*;
 
     fn arb_ratio() -> impl Strategy<Value = Ratio<i128>> {
-        (any::<i128>(), any::<i128>().prop_filter("non-zero", |d| *d != 0))
+        (
+            any::<i128>(),
+            any::<i128>().prop_filter("non-zero", |d| *d != 0),
+        )
             .prop_map(|(n, d)| Ratio::new(n, d))
     }
 

@@ -82,8 +82,8 @@ impl<'a> Constraint<'a> for ValueRange {
 
 #[cfg(test)]
 mod tests {
-    use crate::prelude::*;
     use crate::prelude::valueschemas::R256;
+    use crate::prelude::*;
 
     attributes! {
         "AA00000000000000AA00000000000000" as test_score: R256;
@@ -108,7 +108,8 @@ mod tests {
         let all: Vec<Value<R256>> = find!(
             v: Value<R256>,
             pattern!(&data, [{ test_score: ?v }])
-        ).collect();
+        )
+        .collect();
         assert_eq!(all.len(), 3);
 
         // With range [20..80]: only v50.
@@ -120,7 +121,8 @@ mod tests {
                 pattern!(&data, [{ test_score: ?v }]),
                 value_range(v, min, max),
             )
-        ).collect();
+        )
+        .collect();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0], v50);
     }

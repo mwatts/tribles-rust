@@ -1,5 +1,5 @@
-use proptest::prelude::*;
 use proptest::collection::hash_map;
+use proptest::prelude::*;
 use triblespace_core::blob::MemoryBlobStore;
 use triblespace_core::import::json::JsonObjectImporter;
 use triblespace_core::prelude::*;

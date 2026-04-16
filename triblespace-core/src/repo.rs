@@ -921,10 +921,7 @@ where
     /// Iterates all branches, reads each one's metadata, and returns the ID
     /// of the branch whose name matches. Returns `Ok(None)` if no branch has
     /// that name, or `LookupError::NameConflict` if multiple branches share it.
-    pub fn lookup_branch(
-        &mut self,
-        name: &str,
-    ) -> Result<Option<Id>, LookupError<Storage>> {
+    pub fn lookup_branch(&mut self, name: &str) -> Result<Option<Id>, LookupError<Storage>> {
         let branch_ids: Vec<Id> = self
             .storage
             .branches()
@@ -943,19 +940,14 @@ where
                 continue;
             };
 
-            let reader = self
-                .storage
-                .reader()
-                .map_err(LookupError::StorageReader)?;
-            let meta_set: TribleSet =
-                reader.get(meta_handle).map_err(LookupError::StorageGet)?;
+            let reader = self.storage.reader().map_err(LookupError::StorageReader)?;
+            let meta_set: TribleSet = reader.get(meta_handle).map_err(LookupError::StorageGet)?;
 
             let Ok((name_handle,)) = find!(
                 (n: Value<Handle<Blake3, LongString>>),
                 pattern!(&meta_set, [{ crate::metadata::name: ?n }])
             )
-            .exactly_one()
-            else {
+            .exactly_one() else {
                 continue;
             };
 
@@ -1579,8 +1571,7 @@ where
             let mut next_frontier = CommitSet::new();
             for raw in keys {
                 let handle = CommitHandle::new(raw);
-                let meta: TribleSet =
-                    ws.get(handle).map_err(WorkspaceCheckoutError::Storage)?;
+                let meta: TribleSet = ws.get(handle).map_err(WorkspaceCheckoutError::Storage)?;
                 for (p,) in find!((p: Value<_>), pattern!(&meta, [{ parent: ?p }])) {
                     next_frontier.insert(&Entry::new(&p.raw));
                 }
@@ -1993,11 +1984,7 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
     /// Performs a commit in the workspace.
     /// This method creates a new commit blob (stored in the local blobset)
     /// and updates the current commit handle.
-    pub fn commit(
-        &mut self,
-        content_: impl Into<TribleSet>,
-        message_: &str,
-    ) {
+    pub fn commit(&mut self, content_: impl Into<TribleSet>, message_: &str) {
         let content_ = content_.into();
         self.commit_internal(content_, Some(self.commit_metadata), Some(message_));
     }
@@ -2067,7 +2054,10 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
     ///   explicitly imported (for example via `repo::transfer(reachable(...))`).
     /// - This design keeps merge permissive and leaves cross-repository blob
     ///   import as an explicit user action.
-    pub fn merge(&mut self, other: &mut Workspace<Blobs>) -> Result<Option<CommitHandle>, MergeError> {
+    pub fn merge(
+        &mut self,
+        other: &mut Workspace<Blobs>,
+    ) -> Result<Option<CommitHandle>, MergeError> {
         // 1. Always transfer staged blobs from `other`. They may include
         //    standalone blobs (no commit referring to them yet) that the
         //    caller wanted to stash in the workspace independent of any

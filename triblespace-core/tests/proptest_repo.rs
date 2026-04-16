@@ -1,12 +1,12 @@
-use proptest::prelude::*;
+use ed25519_dalek::SigningKey;
 use proptest::collection::vec;
+use proptest::prelude::*;
+use rand::rngs::OsRng;
 use triblespace_core::id::rngid;
 use triblespace_core::prelude::*;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::Repository;
 use triblespace_core::value::schemas::hash::Blake3;
-use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
 
 mod test_ns {
     use triblespace_core::prelude::*;

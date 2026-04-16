@@ -1,5 +1,5 @@
-use proptest::prelude::*;
 use proptest::collection::vec;
+use proptest::prelude::*;
 use triblespace_core::patch::{Entry, IdentitySchema, PATCH};
 
 type TestPatch = PATCH<8, IdentitySchema, ()>;

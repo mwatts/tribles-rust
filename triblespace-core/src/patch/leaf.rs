@@ -106,7 +106,12 @@ impl<const KEY_LEN: usize, V> Leaf<KEY_LEN, V> {
 
     /// Like [`infixes`](Self::infixes) but only yields infixes in the
     /// byte range `[min_infix, max_infix]` (inclusive).
-    pub fn infixes_range<const PREFIX_LEN: usize, const INFIX_LEN: usize, O: KeySchema<KEY_LEN>, F>(
+    pub fn infixes_range<
+        const PREFIX_LEN: usize,
+        const INFIX_LEN: usize,
+        O: KeySchema<KEY_LEN>,
+        F,
+    >(
         &self,
         prefix: &[u8; PREFIX_LEN],
         at_depth: usize,
@@ -140,7 +145,11 @@ impl<const KEY_LEN: usize, V> Leaf<KEY_LEN, V> {
         }
         let infix: [u8; INFIX_LEN] =
             core::array::from_fn(|i| self.key[O::TREE_TO_KEY[PREFIX_LEN + i]]);
-        if &infix >= min_infix && &infix <= max_infix { 1 } else { 0 }
+        if &infix >= min_infix && &infix <= max_infix {
+            1
+        } else {
+            0
+        }
     }
 
     pub fn has_prefix<O: KeySchema<KEY_LEN>>(&self, at_depth: usize, prefix: &[u8]) -> bool {

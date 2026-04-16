@@ -148,14 +148,18 @@ pub struct Width(pub i128);
 impl TryFromValue<'_, NsTAIInterval> for Lower {
     type Error = Infallible;
     fn try_from_value(v: &Value<NsTAIInterval>) -> Result<Self, Infallible> {
-        Ok(Lower(i128_from_ordered_be(v.raw[0..16].try_into().unwrap())))
+        Ok(Lower(i128_from_ordered_be(
+            v.raw[0..16].try_into().unwrap(),
+        )))
     }
 }
 
 impl TryFromValue<'_, NsTAIInterval> for Upper {
     type Error = Infallible;
     fn try_from_value(v: &Value<NsTAIInterval>) -> Result<Self, Infallible> {
-        Ok(Upper(i128_from_ordered_be(v.raw[16..32].try_into().unwrap())))
+        Ok(Upper(i128_from_ordered_be(
+            v.raw[16..32].try_into().unwrap(),
+        )))
     }
 }
 
@@ -194,7 +198,11 @@ pub struct InvertedIntervalError {
 
 impl std::fmt::Display for InvertedIntervalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "inverted interval: lower {} > upper {}", self.lower, self.upper)
+        write!(
+            f,
+            "inverted interval: lower {} > upper {}",
+            self.lower, self.upper
+        )
     }
 }
 
@@ -263,7 +271,15 @@ mod tests {
     #[test]
     fn byte_order_matches_numeric_order() {
         // Order-preserving BE: byte order = i128 numeric order.
-        let times = [i128::MIN, -1_000_000_000, -1, 0, 1, 1_000_000_000, i128::MAX];
+        let times = [
+            i128::MIN,
+            -1_000_000_000,
+            -1,
+            0,
+            1,
+            1_000_000_000,
+            i128::MAX,
+        ];
         for pair in times.windows(2) {
             let a = i128_to_ordered_be(pair[0]);
             let b = i128_to_ordered_be(pair[1]);

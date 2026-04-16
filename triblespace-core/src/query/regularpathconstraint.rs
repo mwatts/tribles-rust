@@ -113,7 +113,10 @@ fn build_join(
     set: &TribleSet,
     expr: &PathExpr,
     start: &RawId,
-) -> (IntersectionConstraint<Box<dyn Constraint<'static>>>, VariableId) {
+) -> (
+    IntersectionConstraint<Box<dyn Constraint<'static>>>,
+    VariableId,
+) {
     let mut ctx = VariableContext::new();
     let start_var = ctx.next_variable::<GenId>();
     let mut constraints: Vec<Box<dyn Constraint<'static> + 'static>> = Vec::new();
@@ -195,9 +198,7 @@ fn has_path(set: &TribleSet, expr: &PathExpr, from: &RawId, to: &RawId) -> bool 
             })
             .any(|dest| dest == *to)
         }
-        PathExpr::Union(lhs, rhs) => {
-            has_path(set, lhs, from, to) || has_path(set, rhs, from, to)
-        }
+        PathExpr::Union(lhs, rhs) => has_path(set, lhs, from, to) || has_path(set, rhs, from, to),
         PathExpr::Plus(body) => {
             let mut visited: HashSet<RawId> = HashSet::new();
             let mut frontier: VecDeque<RawId> = VecDeque::new();
@@ -361,8 +362,9 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
             if let Some(start_val) = binding.get(self.start) {
                 if let Some(start_id) = id_from_value(start_val) {
                     proposals.retain(|v| {
-                        id_from_value(v)
-                            .map_or(false, |eid| has_path(&self.set, &self.expr, &start_id, &eid))
+                        id_from_value(v).map_or(false, |eid| {
+                            has_path(&self.set, &self.expr, &start_id, &eid)
+                        })
                     });
                 } else {
                     proposals.clear();
