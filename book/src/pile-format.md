@@ -42,7 +42,14 @@ refreshing state.
 4. **Append new records.** `put` (through the `BlobStorePut` trait) and branch
    update helpers extend the file via a single `write_vectored` call. Each
    append immediately feeds the bytes back through `apply_next` so in-memory
-   indices stay synchronised without waiting for a manual `refresh`.
+   indices stay synchronised without waiting for a manual `refresh`. Blobs
+   larger than ~1&nbsp;GiB can't be appended in a single atomic `writev`
+   because kernel `write_vectored` calls cap at `INT_MAX` bytes on macOS and
+   `MAX_RW_COUNT` (~2&nbsp;GiB) on Linux. In that case `put` takes an
+   exclusive file lock and issues plain `write_all` calls for header,
+   payload, and padding — still append-only, still recoverable by
+   `restore` if a crash leaves a partial tail, but serialised against
+   other writers for the duration of the append.
 5. **Read through a snapshot.** `reader` clones the memory map and PATCH indices
    into a `PileReader`, yielding iterators and metadata lookups that can execute
    without further locking.
@@ -144,8 +151,11 @@ acquires a shared lock so it cannot race with `restore`, which takes an
 exclusive lock before truncating a corrupted tail.
 
 Filesystems lacking atomic `write`/`vwrite` appends—such as some network or
-FUSE-based implementations—cannot safely host multiple writers and are not
-supported. Using such filesystems risks pile corruption.
+FUSE-based implementations—cannot safely host multiple writers for records
+below the `~1&nbsp;GiB` atomic-write threshold and are not supported in that
+mode. (Records above the threshold use the exclusive-lock fallback and don't
+rely on filesystem atomicity.) Using an atomicity-lacking filesystem for
+small records risks pile corruption.
 ## Blob Storage
 ```text
                              8 byte  8 byte

@@ -11,6 +11,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   name collision with `std::matches!` that made the macro unusable in practice.
 
 ## [Unreleased]
+### Changed
+- `Pile::put` now handles blobs larger than the kernel's atomic
+  `write_vectored` ceiling (~2&nbsp;GiB on macOS / Linux). Records below
+  a 1&nbsp;GiB threshold keep the existing shared-lock + single-`writev`
+  fast path; larger records take an exclusive lock and append via plain
+  `write_all`, lifting the previous ~2&nbsp;GiB per-blob cap. The
+  exclusive-lock path remains append-only and `Pile::restore` still
+  truncates any partial tail after a crash. Test coverage added as
+  `put_and_get_oversized_blob` (`#[ignore]`d because the exercise
+  allocates ~1&nbsp;GiB of memory).
+
+### Added
+- `SortedSlice::from_mut(&mut [T])`: sort-in-place constructor that mirrors
+  the `new_unchecked` ergonomics when the caller has a mutable slice but no
+  pre-sortedness guarantee.
+- `ContainsConstraint` impl for `&'a mut [T]` that sorts the slice in place
+  and produces a `SortedSliceConstraint`. Via `DerefMut` method resolution
+  this also picks up `&mut Vec<T>`, `&mut [T; N]`, `&mut Box<[T]>`, and any
+  other mutable borrow that derefs to a slice, so callers can write
+  `(&mut my_vec).has(var)` without hand-rolling the sort.
 
 ## [0.34.1] - 2026-04-04
 ### Added

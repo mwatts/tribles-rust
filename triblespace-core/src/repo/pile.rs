@@ -65,6 +65,17 @@ const MAGIC_MARKER_BRANCH_TOMBSTONE: RawId = hex!("E888CC787202D2AE4C654BFE9699C
 const BLOB_HEADER_LEN: usize = std::mem::size_of::<BlobHeader>();
 const BLOB_ALIGNMENT: usize = BLOB_HEADER_LEN;
 
+/// Largest single blob record we'll write with the concurrent `write_vectored`
+/// fast path. Linux caps a single `writev` at `MAX_RW_COUNT` (`INT_MAX &
+/// ~(PAGE_SIZE - 1)`, ~2 GiB) and macOS caps it at `INT_MAX`. Below this
+/// threshold we rely on kernel atomicity and let concurrent writers hold a
+/// shared lock. Above it we switch to an exclusive-lock fallback that
+/// issues plain `write_all` calls — still append-only, still recoverable
+/// via [`Pile::restore`], just serialized with other writers for the
+/// duration of the large append. The margin keeps us comfortably below
+/// any platform's single-call ceiling.
+const ATOMIC_WRITE_LIMIT: usize = 1 << 30;
+
 /// Lazily-computed validation status of a blob record in the pile.
 #[derive(Debug, Clone, Copy)]
 pub enum ValidationState {
@@ -863,21 +874,37 @@ impl<H: HashProtocol> BlobStorePut<H> for Pile<H> {
 
     /// Inserts a blob into the pile and returns its handle.
     ///
-    /// Multiple writers are safe only on filesystems guaranteeing atomic
-    /// `write`/`vwrite` appends; other filesystems may corrupt the pile.
+    /// For records up to [`ATOMIC_WRITE_LIMIT`] the append relies on the
+    /// kernel's atomic `write_vectored` guarantee, so multiple writers can
+    /// hold a shared file lock and proceed concurrently. Larger records
+    /// take an exclusive lock and append via plain `write_all`, trading
+    /// concurrency for reach — the recovery path
+    /// ([`Pile::restore`]) truncates any partial tail left by a crash,
+    /// so a multi-`write` record is still crash-safe. Multiple writers
+    /// are safe only on filesystems guaranteeing atomic `write`/`vwrite`
+    /// appends; other filesystems may corrupt the pile.
     fn put<S, T>(&mut self, item: T) -> Result<Value<Handle<H, S>>, Self::PutError>
     where
         S: BlobSchema + 'static,
         T: ToBlob<S>,
         Handle<H, S>: ValueSchema,
     {
-        self.file.lock_shared()?;
+        let blob = ToBlob::to_blob(item);
+        let blob_size = blob.bytes.len();
+        let padding = padding_for_blob(blob_size);
+        let record_size = BLOB_HEADER_LEN + blob_size + padding;
+        let use_atomic = record_size <= ATOMIC_WRITE_LIMIT;
+
+        if use_atomic {
+            self.file.lock_shared()?;
+        } else {
+            // Oversized record: exclude other writers for the duration of
+            // the multi-syscall append. Shared readers ([`refresh`]) block
+            // until unlock, so they never observe a partially-written tail.
+            self.file.lock()?;
+        }
         let res = (|| {
             self.refresh_locked().map_err(InsertError::from)?;
-
-            let blob = ToBlob::to_blob(item);
-            let blob_size = blob.bytes.len();
-            let padding = padding_for_blob(blob_size);
 
             let handle: Value<Handle<H, S>> = blob.get_handle();
             let hash: Value<Hash<H>> = handle.into();
@@ -908,19 +935,29 @@ impl<H: HashProtocol> BlobStorePut<H> for Pile<H> {
 
             let now_in_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
             let header = BlobHeader::new(now_in_ms as u64, blob_size as u64, hash);
-            let expected = BLOB_HEADER_LEN + blob_size + padding;
             let padding_buf = [0u8; BLOB_ALIGNMENT];
-            let bufs = [
-                IoSlice::new(header.as_bytes()),
-                IoSlice::new(blob.bytes.as_ref()),
-                IoSlice::new(&padding_buf[..padding]),
-            ];
-            let written = self.file.write_vectored(&bufs)?;
-            if written != expected {
-                return Err(InsertError::IoError(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "failed to write blob record",
-                )));
+            if use_atomic {
+                let bufs = [
+                    IoSlice::new(header.as_bytes()),
+                    IoSlice::new(blob.bytes.as_ref()),
+                    IoSlice::new(&padding_buf[..padding]),
+                ];
+                let written = self.file.write_vectored(&bufs)?;
+                if written != record_size {
+                    return Err(InsertError::IoError(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "failed to write blob record",
+                    )));
+                }
+            } else {
+                // Three separate `write_all` calls — payload dominates, so
+                // the extra syscalls for header/padding are negligible. Any
+                // partial completion after a crash is caught by `restore`.
+                self.file.write_all(header.as_bytes())?;
+                self.file.write_all(blob.bytes.as_ref())?;
+                if padding > 0 {
+                    self.file.write_all(&padding_buf[..padding])?;
+                }
             }
 
             loop {
@@ -1889,4 +1926,46 @@ mod tests {
     }
 
     // recover_grow test removed as growth strategy no longer exists
+
+    /// Exercise the `ATOMIC_WRITE_LIMIT` fallback: an oversized blob must
+    /// still round-trip correctly through the exclusive-lock multi-write
+    /// path. Marked `#[ignore]` because the test allocates ~1 GiB and
+    /// writes ~2 GiB to disk; run explicitly with
+    /// `cargo test --release -- --ignored put_and_get_oversized_blob`.
+    #[test]
+    #[ignore]
+    fn put_and_get_oversized_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
+
+        // Slightly over the threshold so we land in the non-atomic branch.
+        let size = ATOMIC_WRITE_LIMIT + 1_024;
+        let mut data = vec![0u8; size];
+        // Sprinkle some non-trivial pattern so `Bytes` equality has teeth.
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(13).wrapping_add(7);
+        }
+
+        let mut pile: Pile = Pile::open(&path).unwrap();
+        let blob: Blob<UnknownBlob> = Blob::new(Bytes::from_source(data.clone()));
+        let handle = pile.put(blob).unwrap();
+
+        {
+            let reader = pile.reader().unwrap();
+            let fetched: Blob<UnknownBlob> = reader.get(handle).unwrap();
+            assert_eq!(fetched.bytes.len(), size);
+            assert_eq!(fetched.bytes.as_ref(), data.as_slice());
+        }
+
+        pile.close().unwrap();
+
+        // Round-trip across open+restore to ensure the on-disk record
+        // is fully self-describing and recoverable.
+        let mut pile: Pile = Pile::open(&path).unwrap();
+        pile.restore().unwrap();
+        let reader = pile.reader().unwrap();
+        let fetched: Blob<UnknownBlob> = reader.get(handle).unwrap();
+        assert_eq!(fetched.bytes.as_ref(), data.as_slice());
+        pile.close().unwrap();
+    }
 }
