@@ -49,6 +49,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `import::rdf_uri`: canonical "this entity is the referent of this URI"
   attribute, used by the N-Triples importer to derive stable entity ids
   from URIs.
+- `triblespace-net` joins the workspace as a first-class member. The
+  facade crate gains a `net` feature (`triblespace = { version = "x",
+  features = ["net"] }`) that re-exports it as `triblespace::net`, so
+  `use triblespace::net::peer::Peer;` is the one-liner for distributed
+  sync. Ships with the full subtree history from the standalone repo
+  so blame/history are preserved.
 
 ## [0.34.1] - 2026-04-04
 ### Added

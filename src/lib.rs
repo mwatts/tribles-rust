@@ -5,6 +5,11 @@ pub use triblespace_core::arrayvec;
 
 pub use triblespace_core as core;
 
+/// Distributed sync via iroh: [`net::peer::Peer<S>`] wraps any store with
+/// gossip + DHT + tracking branches. Gated behind the `net` feature.
+#[cfg(feature = "net")]
+pub use triblespace_net as net;
+
 pub mod macros {
     pub use triblespace_core::macros::id_hex;
     pub use triblespace_macros::{
