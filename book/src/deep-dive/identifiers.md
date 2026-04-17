@@ -5,15 +5,25 @@ Keeping those pieces addressable requires names that survive replication,
 concurrent edits, and local conventions. We have found it useful to categorize
 identifier schemes along two axes:
 
-|                | **Abstract**            | **Semantic**        |
-|----------------|-------------------------|---------------------|
-| **Intrinsic**  | Hash, Signature, PubKey | Embeddings          |
-| **Extrinsic**  | UUID, UFOID, FUCID      | Names, DOI, URL     |
+|                | **Abstract**                | **Semantic**      |
+|----------------|-----------------------------|-------------------|
+| **Intrinsic**  | Hash, Signature             | Embeddings        |
+| **Extrinsic**  | UUID, UFOID, FUCID, PubKey  | Names, DOI, URL   |
 
-The rows describe how an identifier is minted while the columns describe what
-it tries to communicate. Classifying an identifier along both axes makes its
-trade-offs explicit and helps decide how to combine multiple schemes for a
-given workflow.
+- **Rows — derivability.** An *intrinsic* identifier can be recomputed
+  from the entity alone: anyone holding the bytes can produce the same
+  id independently. An *extrinsic* identifier is assigned separately
+  from the entity — the entity carries no hint of what its id should be.
+- **Columns — content encoding.** An *abstract* identifier is opaque:
+  its bits carry no readable meaning about the entity. A *semantic*
+  identifier encodes meaning (words, codes, URL paths) that humans or
+  machines can consume as signal without a lookup.
+
+The axes are independent — every cell is populated — but the quadrants
+have different structural properties (see
+[Quadrant Properties](#quadrant-properties) below). Classifying an
+identifier along both axes makes its trade-offs explicit and clarifies
+when a workflow needs to combine multiple schemes.
 
 ## Abstract vs. Semantic Identifiers
 
@@ -91,6 +101,51 @@ Thinking about the classic ship of Theseus thought experiment makes the
 distinction concrete: the restored ship and the reconstructed ship share the
 same extrinsic identity (they are both "Theseus' ship") but have different
 intrinsic identities because their planks differ.
+
+### A note on signatures and public keys
+
+Signatures are a special form of hash: a digest over `(content,
+private_key)`. Used as identifiers they sit in the intrinsic-abstract
+cell — anyone holding the content and the author's public key can
+recompute and verify.
+
+Public keys used as *actor identities* (identifying a person, agent, or
+service) are a different animal: a pubkey doesn't derive from the
+person it identifies — it's assigned by whoever generated the keypair.
+That makes pubkey-as-identity extrinsic abstract, essentially a
+high-entropy UUID with a bonus cryptographic capability.
+
+## Quadrant Properties
+
+Classifying along two independent axes leaves four quadrants, and each
+has a structural property worth calling out because it constrains
+system design.
+
+**Extrinsic + Semantic ⇒ an authority.** If an identifier carries
+meaning and *can't* be derived from the entity, someone had to assign
+that meaning. Semantic content is low-entropy by nature — the space of
+sensible names is small, so two parties minting independently will
+often collide — and avoiding collisions requires coordination. That
+coordinator is the authority, whether explicit (DOI registrar, ICANN,
+ISBN agency) or implicit (a cultural namespace, an organization's
+wiki). There is no decentralized extrinsic-semantic scheme.
+
+**Extrinsic + Abstract can be fully decentralized.** A 128-bit random
+identifier collides only statistically. Two parties minting UUIDs (or
+UFOIDs, or pubkeys) independently will never see each other's values
+in practice, so no coordinator is needed — the decentralization is
+paid for in entropy, not consensus.
+
+**Intrinsic + anything is decentralized by construction.** The entity
+is the authority: any two parties with the same bytes produce the same
+id (for hashes) or the same neighborhood in embedding space (for
+embeddings). No registrar exists, because none is needed.
+
+**The upshot:** if you want a decentralized naming system, you have to
+give up one of *extrinsic* or *semantic*. Every centralized naming
+system in practice (domains, ISBNs, DOIs, academic affiliations)
+occupies the extrinsic-semantic quadrant because that's where authority
+is structurally required.
 
 ## Picking entity ids in code
 
@@ -204,34 +259,39 @@ RNGID's fully random bits, or step up to a 256-bit cryptographic
 
 ## Example: Scientific Publishing
 
-Consider the case of published scientific papers. Each artifact, such as a `.html`
-or `.pdf` file, should be identified by its abstract intrinsic identifier,
-typically a cryptographic hash of its content. This ensures that any two
-entities referencing the same hash are referring to the exact same version of
-the artifact, providing immutability and validation.
+A published paper plays three distinct identifier roles — the
+`.html`/`.pdf` artifact, the "same paper across revisions" grouping,
+and the human-readable label in a citation — that the quadrant framing
+suggests pulling apart.
 
-Across different versions of the same paper, an abstract extrinsic identifier can
-tie these artifacts together as part of one logical entity. The identifier
-provides continuity regardless of changes to the paper’s content over time.
+- **Artifacts** belong in the *intrinsic-abstract* quadrant: identify
+  each PDF by a cryptographic hash of its bytes. Any two parties
+  referencing the same digest are looking at bit-for-bit identical
+  content, and verification is self-contained.
+- **Revision groupings** belong in the *extrinsic-abstract* quadrant:
+  mint a UFOID/FUCID when the paper is first created, and attach every
+  later revision's content hash to it. The id is stable across rewrites
+  and decentralizable (no registrar needed, just enough entropy).
+- **Human-readable labels** — citation keys, abbreviations, working
+  titles — are semantic, contextual, and deliberately local. They
+  don't carry system identity; they're just display strings that point
+  at one of the above.
 
-Semantic (human-readable) identifiers, such as abbreviations in citations or
-bibliographies, are scoped to individual papers and provide context-specific
-usability for readers. These names do not convey identity but serve as a way for
-humans to reference the persistent abstract identifiers that underlie the
-system.
+DOIs land in the *extrinsic-semantic* quadrant: a publisher prefix, a
+journal stem, often a human-recognizable slug — all assigned by a
+registrar. By the [quadrant properties](#quadrant-properties) above
+that quadrant *structurally* requires a central authority, for
+collision avoidance (low semantic entropy) and for resolution
+(translating the id to a concrete artifact). DOIs-as-centralized isn't
+a design flaw; it's the price of the quadrant. You can't have
+decentralization *and* extrinsic semantic content at once.
 
-The identifiers used in practice, such as DOIs, sit at an unusual point
-on the axes above: they're extrinsic (assigned by a registrar) and
-effectively treated as semantic (embedded in citations and scoped to
-"this paper, across revisions") while also serving as the
-system-of-record pointer. That combination inherits the drawbacks of both
-columns — no content validation (an intrinsic property) and no clean
-way to disambiguate when naming authority fragments across registrars —
-and relies on a centralized registrar to keep resolution consistent.
-Triblespace favors pairing content-addressed intrinsic handles for
-immutable artifact identity with abstract extrinsic ids for the
-"this paper across revisions" concept, letting semantic names layer on
-top as per-context labels.
+What triblespace recommends isn't "replace DOIs with something better
+in the same quadrant" — it's to *decompose* the role DOIs try to play
+into identifiers that each live in a quadrant they fit: content hashes
+for artifact identity, abstract extrinsic ids for revision grouping,
+and semantic labels (including DOIs, when you need citation
+compatibility with the outside world) as per-context references on top.
 
 ## ID Ownership
 
