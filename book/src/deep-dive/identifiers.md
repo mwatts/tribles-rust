@@ -30,22 +30,45 @@ when a workflow needs to combine multiple schemes.
 ### Semantic identifiers
 
 Semantic identifiers (names, URLs, descriptive labels, embeddings) carry meaning
-about the thing they reference. That context makes them convenient for humans
-and for search workflows where the identifier itself narrows the scope of
-possible matches. Their usefulness comes with caveats:
+about the thing they reference. Humans don't work well with opaque bit
+patterns — we think in names. Any usable system has to expose *some*
+semantic layer, which is why semantic identifiers are structurally
+essential rather than merely convenient.
 
-- Semantics drift. A name that once felt accurate can become misleading as an
-  entity evolves.
-- Semantic identifiers are rarely unique. They work best as entry points into a
-  richer dataset rather than as the source of truth for identity.
-- Without scoping, semantics clash. Two communities can reasonably reuse the
-  same word for different concepts, so the identifier must be tied to a
-  namespace, deployment, or audience.
+The power of the semantic layer scales inversely with its scope:
 
-Distributed systems reconcile those tensions by mapping many local semantic
-names to a persistent abstract identifier. Users remain free to adopt whatever
-terminology makes sense to them while the system maintains a shared canonical
-identity.
+- **Locally**, semantic names are exactly what you want. A bibliography's
+  `[Herbert1965]`, a codebase's `firstname`, a paper's "the agent" —
+  each is unique enough within its scope, collides with nothing outside
+  it, and can evolve as your understanding improves.
+- **Globally**, the same names get expensive. Semantic content is
+  low-entropy (there are only so many sensible names for a thing), so
+  two parties naming independently will collide. Avoiding collisions
+  requires coordination — an authority, or an unbounded scope prefix
+  whose root is still an authority (see
+  [Quadrant Properties](#quadrant-properties)).
+
+Distributed systems get the best of both worlds by pairing a shared
+abstract identifier for global identity with many local semantic names
+on top. The same attribute id can be `timestamp` in my codebase,
+`legacy_timestamp` in yours, and `created_at` in a third — all binding
+to the same underlying id, each name authoritative within its scope.
+Three concrete benefits fall out:
+
+- **Decoupling.** Groups don't have to agree on vocabulary to share
+  data. The id is the shared ontology; names are each group's business.
+- **Evolution.** You can rename your local label when the meaning
+  clarifies ("height" → "stature") without breaking anyone else's
+  system, because the global binding is unchanged.
+- **No bike-shedding.** The hardest coordination problem in any shared
+  system is naming. Making names purely local reduces that cost to
+  zero.
+
+Embeddings deserve a special mention. They encode meaning in a machine-friendly
+form that can be compared for similarity instead of exact equality. That makes
+them great for recommendations and clustering but still unsuitable as primary
+identifiers: two distinct entities can legitimately share similar embeddings,
+and embeddings can change whenever the underlying model is retrained.
 
 Embeddings deserve a special mention. They encode meaning in a machine-friendly
 form that can be compared for similarity instead of exact equality. That makes
@@ -121,14 +144,27 @@ Classifying along two independent axes leaves four quadrants, and each
 has a structural property worth calling out because it constrains
 system design.
 
-**Extrinsic + Semantic ⇒ an authority.** If an identifier carries
-meaning and *can't* be derived from the entity, someone had to assign
-that meaning. Semantic content is low-entropy by nature — the space of
+**Extrinsic + Semantic (global) ⇒ an authority.** If an identifier
+carries meaning, *can't* be derived from the entity, and has to be
+unique across all actors, someone had to assign that meaning
+globally. Semantic content is low-entropy by nature — the space of
 sensible names is small, so two parties minting independently will
 often collide — and avoiding collisions requires coordination. That
 coordinator is the authority, whether explicit (DOI registrar, ICANN,
-ISBN agency) or implicit (a cultural namespace, an organization's
-wiki). There is no decentralized extrinsic-semantic scheme.
+ISBN agency) or implicit. You can postpone this by adding scope prefix
+("global tree of local ids" — DNS, Java packages, DOIs with
+publisher/journal structure) but the tree has a root, and the root is
+still an authority. The identifier also grows unboundedly as scopes
+stack: `com.triblespace.core.repo.branch::metadata` is already longer
+than some of the values it names.
+
+**Extrinsic + Semantic (local) is essential and free.** The same
+property reverses once scope is bounded. A bibliography's
+`[Herbert1965]` is unique within the paper; a codebase's `firstname`
+is unique within its namespace. Local authority is trivial because it
+*is* the scope. Most of the human-facing vocabulary in any working
+system lives here, riding on top of abstract identifiers for global
+identity.
 
 **Extrinsic + Abstract can be fully decentralized.** A 128-bit random
 identifier collides only statistically. Two parties minting UUIDs (or
@@ -141,11 +177,11 @@ is the authority: any two parties with the same bytes produce the same
 id (for hashes) or the same neighborhood in embedding space (for
 embeddings). No registrar exists, because none is needed.
 
-**The upshot:** if you want a decentralized naming system, you have to
-give up one of *extrinsic* or *semantic*. Every centralized naming
-system in practice (domains, ISBNs, DOIs, academic affiliations)
-occupies the extrinsic-semantic quadrant because that's where authority
-is structurally required.
+**The upshot:** if you want a decentralized naming system, you have
+two moves: use extrinsic abstract ids globally, and extrinsic semantic
+names locally. Don't promote semantic identifiers to global scope.
+Every centralized naming system in practice (domains, ISBNs, DOIs,
+academic affiliations) exists because it violated that rule.
 
 ## Picking entity ids in code
 
@@ -259,39 +295,54 @@ RNGID's fully random bits, or step up to a 256-bit cryptographic
 
 ## Example: Scientific Publishing
 
-A published paper plays three distinct identifier roles — the
-`.html`/`.pdf` artifact, the "same paper across revisions" grouping,
-and the human-readable label in a citation — that the quadrant framing
-suggests pulling apart.
+A published paper fuses several distinct identifier roles into a single
+centralized name (the DOI) — and a single centralized registry for
+authors (the ORCID). The quadrant framing suggests pulling these apart
+so each lives where it fits:
 
-- **Artifacts** belong in the *intrinsic-abstract* quadrant: identify
-  each PDF by a cryptographic hash of its bytes. Any two parties
-  referencing the same digest are looking at bit-for-bit identical
-  content, and verification is self-contained.
-- **Revision groupings** belong in the *extrinsic-abstract* quadrant:
-  mint a UFOID/FUCID when the paper is first created, and attach every
-  later revision's content hash to it. The id is stable across rewrites
-  and decentralizable (no registrar needed, just enough entropy).
-- **Human-readable labels** — citation keys, abbreviations, working
-  titles — are semantic, contextual, and deliberately local. They
-  don't carry system identity; they're just display strings that point
-  at one of the above.
+- **Artifact identity** → *intrinsic-abstract*. Identify each
+  `.html`/`.pdf` by a cryptographic hash of its bytes. Any two parties
+  referencing the same digest look at bit-for-bit identical content;
+  verification is self-contained.
+- **Revision-group identity** ("the same paper across revisions") →
+  *extrinsic-abstract*. Mint a UFOID/FUCID at first publication and
+  attach each later revision's content hash to it. Stable across
+  rewrites, decentralizable, no registrar needed.
+- **Author identity** → *extrinsic-abstract*, specifically the
+  author's public key. A pubkey is extrinsic (you assign it by
+  generating a keypair), abstract (the bits carry no meaning about the
+  person), high-entropy (no collisions), *and* bundles a cryptographic
+  capability: the author can sign the paper and anyone can verify it
+  against their pubkey without a registrar. ORCID solves the same
+  problem with central authority; pubkeys solve it with entropy plus
+  cryptography.
+- **Human-readable labels** → *extrinsic-semantic, kept local*.
+  Citation keys (`[Herbert1965]`), reading-list tags, display titles,
+  abbreviations in a bibliography — all semantic, all scoped to the
+  document or reader that uses them. They're the human layer riding on
+  top of the three abstract ids above, free to evolve and diverge
+  across contexts without coordination.
 
-DOIs land in the *extrinsic-semantic* quadrant: a publisher prefix, a
-journal stem, often a human-recognizable slug — all assigned by a
-registrar. By the [quadrant properties](#quadrant-properties) above
+DOIs land in the *extrinsic-semantic, global-scope* quadrant: a
+publisher prefix, a journal stem, often a human-recognizable slug — all
+assigned by a registrar and meant to be unique across every paper in
+the world. By the [quadrant properties](#quadrant-properties) above
 that quadrant *structurally* requires a central authority, for
-collision avoidance (low semantic entropy) and for resolution
-(translating the id to a concrete artifact). DOIs-as-centralized isn't
-a design flaw; it's the price of the quadrant. You can't have
-decentralization *and* extrinsic semantic content at once.
+collision avoidance (low semantic entropy across a global namespace)
+and for resolution (translating the id to a concrete artifact).
+DOIs-as-centralized isn't a design flaw; it's the price of asking one
+identifier to play the artifact-identity, revision-grouping, and
+human-label roles at global scope.
 
 What triblespace recommends isn't "replace DOIs with something better
 in the same quadrant" — it's to *decompose* the role DOIs try to play
 into identifiers that each live in a quadrant they fit: content hashes
-for artifact identity, abstract extrinsic ids for revision grouping,
-and semantic labels (including DOIs, when you need citation
-compatibility with the outside world) as per-context references on top.
+for artifacts, abstract extrinsic ids (UFOID for revision groups,
+pubkeys for authors) for anything that needs global identity, and
+semantic labels (including DOIs and ORCIDs, when you need
+citation-compatibility with the outside world) as per-context
+references on top. Each role lands where decentralization is cheap
+or free.
 
 ## ID Ownership
 
