@@ -26,6 +26,7 @@
 - [Repository Workflows](repository-workflows.md)
 - [Commit Selectors](commit-selectors.md)
 - [Garbage Collection](garbage-collection.md)
+- [Distributed Sync](distributed-sync.md)
 - [Deep Dive: Descriptive Typing & find! Idioms](descriptive_types.md)
 
 # Storage & Formats
