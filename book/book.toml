@@ -5,3 +5,8 @@ description = "A guided tour of Trible Space and how to use the crate."
 [build]
 # mdBook will place the built HTML here
 build-dir = "../target/book"
+
+[output.html]
+# Enables MathJax so \( ... \) and \[ ... \] inline/block math render
+# (used in deep-dive chapters like identifiers.md).
+mathjax-support = true

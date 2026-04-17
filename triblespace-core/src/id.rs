@@ -117,8 +117,8 @@ impl Id {
 
     /// Takes ownership of this Id from the current write context (i.e. thread).
     /// Returns `None` if this Id was not found, because it is not associated with this
-    /// write context, or because it is currently aquired.
-    pub fn aquire(&self) -> Option<ExclusiveId> {
+    /// write context, or because it is currently acquired.
+    pub fn acquire(&self) -> Option<ExclusiveId> {
         OWNED_IDS.with(|owner| owner.take(self))
     }
 

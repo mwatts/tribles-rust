@@ -34,6 +34,10 @@ pub mod literature {
 
         /// The number of pages in the work.
         "FCCE870BECA333D059D5CD68C43B98F0" as pub page_count: R256;
+
+        /// An alternate name or pen name for an author. May appear
+        /// multiple times per entity (repeated facts in book examples).
+        "483C6189817E9682F13DBE537CA85924" as pub alias: ShortString;
     }
 }
 

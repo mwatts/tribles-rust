@@ -192,7 +192,7 @@ pub enum ExclusiveIdError {
     FailedParse(IdParseError),
     /// The identifier is valid but could not be exclusively acquired
     /// (another holder already owns it).
-    FailedAquire(),
+    FailedAcquire(),
 }
 
 impl From<IdParseError> for ExclusiveIdError {
@@ -206,7 +206,7 @@ impl<'a> TryFromValue<'a, GenId> for ExclusiveId {
 
     fn try_from_value(value: &'a Value<GenId>) -> Result<Self, Self::Error> {
         let id: Id = value.try_from_value()?;
-        id.aquire().ok_or(ExclusiveIdError::FailedAquire())
+        id.acquire().ok_or(ExclusiveIdError::FailedAcquire())
     }
 }
 

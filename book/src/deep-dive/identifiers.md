@@ -178,8 +178,8 @@ would halve the effective security of a 256-bit hash, reducing it to \( 2^{128} 
 current or theoretical technology. As a result, 256 bits remains a future-proof choice for intrinsic identifiers.  
 
 Such 256-bit intrinsic identifiers are represented by the types
-[`triblespace::core::value::schemas::hash::Hash`](crate::value::schemas::hash::Hash) and
-[`triblespace::core::value::schemas::hash::Handle`](crate::value::schemas::hash::Handle).  
+[`Hash`](crate::value::schemas::hash::Hash) and
+[`Handle`](crate::value::schemas::hash::Handle).  
 
 Not every workflow needs cryptographic strength. We therefore ship three
 high-entropy abstract identifier families—**RNGID, UFOID, and FUCID**—that keep
@@ -195,7 +195,14 @@ predictability to suit different scenarios.
 | Compression friendliness | None                          | Low                              | High                             |
 | Predictability         | None                            | Low (reveals mint time)          | High (per-source sequence)       |
 
-# Example: Scientific Publishing
+"Predictability" here is a tradeoff axis, not a quality: higher
+predictability enables tighter compression and cache-friendly scans, but
+reveals mint metadata (time or source) and is therefore unsuitable
+whenever adversarial unpredictability matters. For those cases prefer
+RNGID's fully random bits, or step up to a 256-bit cryptographic
+[`Hash`](crate::value::schemas::hash::Hash).
+
+## Example: Scientific Publishing
 
 Consider the case of published scientific papers. Each artifact, such as a `.html`
 or `.pdf` file, should be identified by its abstract intrinsic identifier,
@@ -213,19 +220,30 @@ usability for readers. These names do not convey identity but serve as a way for
 humans to reference the persistent abstract identifiers that underlie the
 system.
 
-Sadly the identifiers used in practice, such as DOIs, fail to align with these
-principles and strengths. They attempt to provide global extrinsic semantic
-identifiers for scientific papers, an ultimately flawed approach. They lack the
-associated guarantees of intrinsic identifiers and bring all the challenges of
-semantic identifiers. With their scope defined too broadly and their authority
-centralized, they fail to live up to the potential of distributed systems.
+The identifiers used in practice, such as DOIs, sit at an unusual point
+on the axes above: they're extrinsic (assigned by a registrar) and
+effectively treated as semantic (embedded in citations and scoped to
+"this paper, across revisions") while also serving as the
+system-of-record pointer. That combination inherits the drawbacks of both
+columns — no content validation (an intrinsic property) and no clean
+way to disambiguate when naming authority fragments across registrars —
+and relies on a centralized registrar to keep resolution consistent.
+Triblespace favors pairing content-addressed intrinsic handles for
+immutable artifact identity with abstract extrinsic ids for the
+"this paper across revisions" concept, letting semantic names layer on
+top as per-context labels.
 
-# ID Ownership
+## ID Ownership
 
-In distributed systems, consistency requires monotonicity due to the CALM principle.
-However, this is not necessary for single writer systems. By assigning each ID an owner,
-we ensure that only the current owner can write new information about an entity associated
-with that ID. This allows for fine-grained synchronization and concurrency control.
+In distributed systems, consistency requires monotonicity due to the
+[CALM principle](https://arxiv.org/abs/1901.01930) ("Consistency As
+Logical Monotonicity" — any program that only grows its state can be
+eventually consistent without coordination; anything that can retract
+state requires coordination).
+However, this is not necessary for single-writer systems. By assigning
+each ID an owner, we ensure that only the current owner can write new
+information about an entity associated with that ID. This allows for
+fine-grained synchronization and concurrency control.
 
 To create a transaction, you can uniquely own all entities involved and write new data for them
 simultaneously. Since there can only be one owner for each ID at any given time, you can be
@@ -294,7 +312,7 @@ inline without touching the outer [`find!`](crate::query::find) signature.
 Binding the variable as an [`ExclusiveId`](crate::id::ExclusiveId) means the
 closure that [`find!`](crate::query::find) installs will run the
 [`TryFromValue`](crate::value::TryFromValue) implementation for `ExclusiveId`.
-The conversion invokes [`Id::aquire`](crate::id::Id::aquire) and would silently
+The conversion invokes [`Id::acquire`](crate::id::Id::acquire) and would silently
 skip the row if the current thread did not own the identifier (filter
 semantics).  The
 [`local_ids`](crate::query::local_ids) constraint keeps the query safe by only
@@ -306,16 +324,17 @@ move the acquired guard into `txn_owner`, enabling subsequent calls to
 the identifier to its owner so you can borrow it again later.  If you only need
 the ID for a quick update you can skip the explicit owner entirely, bind the
 variable as a plain [`Id`](crate::id::Id), and call
-[`Id::aquire`](crate::id::Id::aquire) when exclusive access is required.
+[`Id::acquire`](crate::id::Id::acquire) when exclusive access is required.
 
-## Ownership and Eventual Consistency
+### Ownership and Eventual Consistency
 
-While a simple grow set like the history stored in a [Head](crate::remote::Head)
-already constitutes a conflict-free replicated data type (CRDT), it is also limited in expressiveness.
-To provide richer semantics while guaranteeing conflict-free mergeability we allow only
-"owned" IDs to be used in the `entity` position of newly generated triples.
-As owned IDs are [Send] but not [Sync] owning a
-set of them essentially constitutes a single writer transaction domain,
-allowing for some non-monotonic operations like `if-does-not-exist`, over
-the set of contained entities. Note that this does not make operations that
-would break CALM (consistency as logical monotonicity) safe, e.g. `delete`.
+While a simple grow set (like the commit histories backing a branch)
+already constitutes a conflict-free replicated data type (CRDT), it is
+also limited in expressiveness. To provide richer semantics while
+guaranteeing conflict-free mergeability we allow only "owned" IDs to be
+used in the `entity` position of newly generated triples. As owned IDs
+are [`Send`] but not [`Sync`] owning a set of them essentially
+constitutes a single-writer transaction domain, allowing for some
+non-monotonic operations like `if-does-not-exist` over the set of
+contained entities. Note that this does not make operations that would
+break CALM (consistency as logical monotonicity) safe — e.g. `delete`.
