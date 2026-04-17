@@ -140,6 +140,23 @@ fast-forward / merge commit based on ancestor-walking.
 For long-running sync daemons, the same helper runs in a loop over
 every tracking branch on every refresh tick.
 
+**Convergence rounds.** When two peers diverge on the same branch:
+
+- *Sequential gossip* (one peer's merge lands before the other's starts)
+  converges in one round-pair. The first side produces a merge commit
+  `AM` containing both original commits as parents; the second side
+  sees `AM`, finds its own head in `ancestors(AM)`, and fast-forwards.
+- *Parallel gossip* (both peers merge before either sees the other's
+  merge) produces two different merge commits with the same parent set
+  but different `created_at` and random commit-entity ids. Convergence
+  takes one extra round-pair: whichever side merges next produces a
+  merge whose direct parents include the other's prior head, and the
+  other side then fast-forwards via the direct-parent link.
+
+Either way the system converges in bounded rounds. The tests in
+`triblespace-net/tests/two_peer_convergence.rs` exercise both cases
+and serve as regression coverage for this property.
+
 ## Ordering Under Pressure
 
 Gossip is eventually consistent, which means a flood of HEAD updates
