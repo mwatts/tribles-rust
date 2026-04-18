@@ -40,7 +40,7 @@ url = "2"
 ed25519-dalek = "2.2.0"
 hifitime = "4"
 anybytes = { version = "0.20.2", features = ["zerocopy"] }
-iroh-base = { version = "0.97", path = "../../iroh/iroh-base" }
+iroh-base = "0.97"
 triblespace-net = { version = "0.2.0", path = "../triblespace-net" }
 blake3 = "1.8"
 tokio = { version = "1", features = ["full"] }
