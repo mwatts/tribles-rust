@@ -180,28 +180,28 @@ where
     // reject stale gossips without needing an ancestry walk.
     let remote_updated_at = read_updated_at(store, remote_head_hash);
 
-    let tracking_eid = genid();
-    let tracking_id: Id = tracking_eid.id;
+    // tracking_id stays random (it's the branch's identity in the local
+    // pile and must not collide across tracking setups). The metadata
+    // entity id is intrinsic — derived from the actual tribles below.
+    let tracking_id: Id = *genid();
 
-    // Store the remote name as a blob.
     let name_string = remote_name_str.to_string();
-    let name_handle: Value<Handle<Blake3, LongString>> = store.put::<LongString, String>(name_string).ok()?;
+    let name_handle: Value<Handle<Blake3, LongString>> =
+        store.put::<LongString, String>(name_string).ok()?;
 
     let pub_key = ed25519_dalek::VerifyingKey::from_bytes(publisher).ok()?;
 
-    let mut meta_set: TribleSet = entity! { &tracking_eid @
+    let meta_set: TribleSet = entity! {
         triblespace_core::repo::branch: tracking_id,
         triblespace_core::repo::head: commit_handle,
         remote_name: name_handle,
         tracking_remote_branch: remote_branch_id,
         tracking_peer: pub_key,
-    }.into();
-    if let Some(ts) = remote_updated_at {
-        meta_set += entity! { &tracking_eid @ triblespace_core::metadata::updated_at: ts };
+        triblespace_core::metadata::updated_at?: remote_updated_at,
     }
+    .into();
     let meta_handle: Value<Handle<Blake3, SimpleArchive>> = store.put(meta_set).ok()?;
 
-    // Create the branch.
     match store.update(tracking_id, None, Some(meta_handle)).ok()? {
         PushResult::Success() => Some(tracking_id),
         PushResult::Conflict(_) => None,
@@ -243,20 +243,22 @@ where
     let commit_handle = resolve_commit_in_branch_meta(store, new_head_hash)?;
 
     let name_string = remote_name_str.to_string();
-    let name_handle: Value<Handle<Blake3, LongString>> = store.put::<LongString, String>(name_string).ok()?;
+    let name_handle: Value<Handle<Blake3, LongString>> =
+        store.put::<LongString, String>(name_string).ok()?;
 
     let pub_key = ed25519_dalek::VerifyingKey::from_bytes(publisher).ok()?;
-    let eid = genid();
-    let mut meta_set: TribleSet = entity! { &eid @
+
+    // Metadata entity id is intrinsic — matches the pattern used in
+    // triblespace-core's branch_metadata / commit_metadata.
+    let meta_set: TribleSet = entity! {
         triblespace_core::repo::branch: tracking_branch_id,
         triblespace_core::repo::head: commit_handle,
         remote_name: name_handle,
         tracking_remote_branch: remote_branch_id,
         tracking_peer: pub_key,
-    }.into();
-    if let Some(ts) = new_ts {
-        meta_set += entity! { &eid @ triblespace_core::metadata::updated_at: ts };
+        triblespace_core::metadata::updated_at?: new_ts,
     }
+    .into();
 
     let meta_handle: Value<Handle<Blake3, SimpleArchive>> = store.put(meta_set).ok()?;
 
