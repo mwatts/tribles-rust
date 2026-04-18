@@ -40,10 +40,19 @@ impl From<SignatureError> for ValidationError {
 
 /// Constructs commit metadata describing `content`, optional `metadata`, and its parent commits.
 ///
-/// The resulting [`TribleSet`] is signed using `signing_key` so that its
-/// authenticity can later be verified. If `msg` is provided it is stored as a
-/// long commit message via a LongString blob handle. If `metadata` is provided
-/// it is stored as a SimpleArchive handle.
+/// The resulting [`TribleSet`] is signed using `signing_key` when content is
+/// present, so that its authenticity can later be verified. If `msg` is
+/// provided it is stored as a long commit message via a LongString blob
+/// handle. If `metadata` is provided it is stored as a SimpleArchive handle.
+///
+/// The commit's entity id is derived intrinsically from the
+/// `(attribute, value)` pairs present in the metadata — so two commits with
+/// identical content, parents, and signatures collide on entity id and blob
+/// hash alike. This matters especially for **merge commits**
+/// (`content = None`): merges carry no author-specific bits (no signature,
+/// no timestamp, no random entity id), so two peers merging the same parent
+/// set produce bit-identical merge commits, and parallel-merge scenarios
+/// converge in zero extra rounds.
 pub fn commit_metadata(
     signing_key: &SigningKey,
     parents: impl IntoIterator<Item = Value<Handle<Blake3, SimpleArchive>>>,
@@ -51,43 +60,40 @@ pub fn commit_metadata(
     content: Option<Blob<SimpleArchive>>,
     metadata: Option<Value<Handle<Blake3, SimpleArchive>>>,
 ) -> TribleSet {
-    let mut commit = TribleSet::new();
-    let commit_entity = crate::id::rngid();
-    let now = Epoch::now().expect("system time");
+    // Authored commits carry a timestamp and a signature. Merge commits
+    // (content = None) carry neither, so they stay content-deterministic.
+    let (content_handle, signed_by, signature, created_at) = match content.as_ref() {
+        Some(blob) => {
+            let now = Epoch::now().expect("system time");
+            let timestamp: Value<_> =
+                (now, now).try_to_value().expect("point interval");
+            (
+                Some(blob.get_handle()),
+                Some(signing_key.verifying_key()),
+                Some(signing_key.sign(&blob.bytes)),
+                Some(timestamp),
+            )
+        }
+        None => (None, None, None, None),
+    };
+    let parents: Vec<_> = parents.into_iter().collect();
 
-    commit += entity! { &commit_entity @  crate::metadata::created_at: (now, now).try_to_value().expect("point interval")  };
+    // `entity!` without an explicit `id @` prefix derives the entity id
+    // by hashing the sorted/deduped (attr_id, value) pairs. The resulting
+    // commit is content-addressed at both the blob level (via
+    // SimpleArchive) and the entity-id level.
+    let fragment = entity! {
+        crate::metadata::created_at?: created_at,
+        super::content?: content_handle,
+        super::signed_by?: signed_by,
+        super::signature_r?: signature,
+        super::signature_s?: signature,
+        super::message?: msg,
+        super::metadata?: metadata,
+        super::parent*: parents,
+    };
 
-    if let Some(content) = content {
-        let handle = content.get_handle();
-        let signature = signing_key.sign(&content.bytes);
-
-        commit += entity! { &commit_entity @
-           super::content: handle,
-           super::signed_by: signing_key.verifying_key(),
-           super::signature_r: signature,
-           super::signature_s: signature,
-        };
-    }
-
-    if let Some(h) = msg {
-        commit += entity! { &commit_entity @
-           super::message: h,
-        };
-    }
-
-    if let Some(handle) = metadata {
-        commit += entity! { &commit_entity @
-           super::metadata: handle,
-        };
-    }
-
-    for parent in parents {
-        commit += entity! { &commit_entity @
-           super::parent: parent,
-        };
-    }
-
-    commit
+    fragment.into()
 }
 
 /// Validates that the `metadata` blob genuinely signs the supplied commit

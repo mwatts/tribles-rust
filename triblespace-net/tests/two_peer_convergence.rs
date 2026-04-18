@@ -13,16 +13,13 @@
 //! tracking branch, finds its own head (`commit_B`) already in
 //! `ancestors(AM)`, and fast-forwards. No second merge commit is needed.
 //!
-//! Second property exercised here: **parallel gossip merges diverge for
-//! one round-pair, then converge on the next.** When both peers merge
-//! simultaneously (before either sees the other's merge), they produce
-//! two different merge commits with the same parent set. The next
-//! sync round resolves this: one side sees the other's merge, produces
-//! a merge whose direct parents include the other's prior head, and the
-//! second side fast-forwards to it (because `merge_commit`'s
-//! fast-forward check finds the local head in `ancestors(other)` via
-//! the direct parent link). No infinite divergence, just a one-round
-//! delay relative to the sequential case.
+//! Second property exercised here: **parallel gossip merges converge in
+//! zero extra rounds.** Merge commits in triblespace are content-addressed:
+//! they carry no author-specific bits (no signature, no `created_at`, no
+//! random entity id), so two peers merging the same parent set produce
+//! bit-identical merge commits that dedup via blob hash. Parallel-merge
+//! scenarios that would have diverged in any centralized-signer system
+//! just… don't.
 
 use ed25519_dalek::SigningKey;
 use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
@@ -175,14 +172,13 @@ fn sequential_sync_converges_under_divergent_commits() {
 }
 
 #[test]
-fn parallel_merges_diverge_once_then_converge() {
+fn parallel_merges_produce_identical_commits() {
     // Simulated parallel gossip: both peers see each other's original
     // commits first, then BOTH merge before either has seen the other's
-    // merge. The first cross-round leaves them at different merge
-    // commits (same parents, different `created_at` / `commit_entity`).
-    // The *next* round-pair converges: whichever side merges first
-    // produces a merge whose direct parent includes the other side's
-    // prior head, and the second side then fast-forwards.
+    // merge. Because merge commits are content-addressed (no signature,
+    // no `created_at`, entity id derived from the parent set), the two
+    // sides produce **bit-identical** merge commits and converge
+    // immediately — no extra round needed to resolve divergence.
     let mut a = new_repo(0x0A);
     let mut b = new_repo(0x0B);
     let pub_a = [0x0Au8; 32];
@@ -220,31 +216,24 @@ fn parallel_merges_diverge_once_then_converge() {
     )
     .unwrap();
 
-    // Simulated parallel merge: both merge against their pre-merge
-    // views, without seeing each other's resulting merge commits.
+    // Parallel merge: both sides merge against their pre-merge views,
+    // against the same parent set.
     merge_tracking_into_local(&mut a, tracking_in_a, "main").unwrap();
     merge_tracking_into_local(&mut b, tracking_in_b, "main").unwrap();
 
-    let a_after_parallel = head_commit(&mut a, "main");
-    let b_after_parallel = head_commit(&mut b, "main");
-    assert_ne!(
-        a_after_parallel, b_after_parallel,
-        "parallel merges produce divergent merge commits"
-    );
-
-    // Resync sequentially. A sees B's merge and produces AM' whose
-    // direct parents include both AM and BM. B then sees AM' and
-    // observes that its own local head (BM) is a direct parent of AM',
-    // so it fast-forwards — no BM' produced.
-    sync_round(&mut a, &mut b, "main", &pub_b);
-    sync_round(&mut b, &mut a, "main", &pub_a);
-
+    let a_after = head_commit(&mut a, "main");
+    let b_after = head_commit(&mut b, "main");
     assert_eq!(
-        head_commit(&mut a, "main"),
-        head_commit(&mut b, "main"),
-        "one round-pair after parallel divergence is enough to converge \
-         (direct-parent check in merge_commit's fast-forward path)"
+        a_after, b_after,
+        "content-addressed merges: same parent set → same merge commit"
     );
+
+    // And a follow-up sync is a pure no-op — both sides are already at
+    // the same head, no merge commit to produce or fast-forward to.
+    let a_next = sync_round(&mut a, &mut b, "main", &pub_b);
+    let b_next = sync_round(&mut b, &mut a, "main", &pub_a);
+    assert!(matches!(a_next, MergeOutcome::UpToDate));
+    assert!(matches!(b_next, MergeOutcome::UpToDate));
 }
 
 #[test]

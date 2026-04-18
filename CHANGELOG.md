@@ -12,6 +12,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Changed
+- **Breaking:** `commit_metadata` now derives the commit's entity id
+  intrinsically from its `(attribute, value)` pairs via `entity!`'s
+  content-hash form instead of minting a random `rngid()`. Merge commits
+  (content = None) also drop `metadata::created_at` since no authorial
+  act produced them. Net effect: two peers merging the same parent set
+  produce bit-identical merge commits, so parallel-merge scenarios in
+  distributed sync converge in zero extra rounds via content addressing.
+  Existing piles aren't invalidated — old commits with random entity ids
+  remain queryable — but newly-minted commits will have different entity
+  ids and therefore different blob hashes than the pre-change world.
 - `Pile::put` now handles blobs larger than the kernel's atomic
   `write_vectored` ceiling (~2&nbsp;GiB on macOS / Linux). Records below
   a 1&nbsp;GiB threshold keep the existing shared-lock + single-`writev`

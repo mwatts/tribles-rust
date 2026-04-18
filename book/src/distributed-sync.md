@@ -147,15 +147,18 @@ every tracking branch on every refresh tick.
   `AM` containing both original commits as parents; the second side
   sees `AM`, finds its own head in `ancestors(AM)`, and fast-forwards.
 - *Parallel gossip* (both peers merge before either sees the other's
-  merge) produces two different merge commits with the same parent set
-  but different `created_at` and random commit-entity ids. Convergence
-  takes one extra round-pair: whichever side merges next produces a
-  merge whose direct parents include the other's prior head, and the
-  other side then fast-forwards via the direct-parent link.
+  merge) also converges in one round-pair — and without producing a
+  merge commit on the second side. Merge commits are **content-addressed**:
+  they carry no author-specific bits (no signature, no `created_at`,
+  entity id derived intrinsically from the parent set via `entity!`'s
+  content-hash form), so two peers merging the same parent set produce
+  bit-identical merge commits that dedup via blob hash alone.
 
-Either way the system converges in bounded rounds. The tests in
+Either way the system converges in one round-pair. The tests in
 `triblespace-net/tests/two_peer_convergence.rs` exercise both cases
-and serve as regression coverage for this property.
+and serve as regression coverage for the property. Content-addressed
+merges are also why `merge_tracking_into_local` is safe to run in a
+tight polling loop without worrying about merge-commit churn.
 
 ## Ordering Under Pressure
 
