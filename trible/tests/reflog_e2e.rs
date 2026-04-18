@@ -11,6 +11,7 @@ use triblespace_core::value::schemas::hash::Blake3;
 fn reflog_lists_branch_updates_and_tombstones() {
     let dir = tempdir().unwrap();
     let pile_path = dir.path().join("test-reflog.pile");
+    std::fs::File::create(&pile_path).unwrap();
 
     let branch_id = id_hex!("11111111111111111111111111111111");
 

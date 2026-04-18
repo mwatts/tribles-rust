@@ -27,6 +27,7 @@ fn random_signing_key() -> SigningKey {
 fn consolidate_merges_branch_heads() {
     let dir = tempdir().unwrap();
     let pile_path = dir.path().join("test-consolidate.pile");
+    std::fs::File::create(&pile_path).unwrap();
 
     // Create a repository and three branches with the same name.
     let mut original_heads: Vec<String> = Vec::new();
@@ -156,6 +157,7 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
 
     let dir = tempdir().unwrap();
     let pile_path = dir.path().join("test-include-deleted.pile");
+    std::fs::File::create(&pile_path).unwrap();
 
     // Scenario:
     // - Create branch "alpha" (branch A) with commit C1, then tombstone it.
@@ -384,6 +386,7 @@ fn consolidate_by_name_include_deleted_detects_subsumption() {
 
     let dir = tempdir().unwrap();
     let pile_path = dir.path().join("test-subsumption.pile");
+    std::fs::File::create(&pile_path).unwrap();
 
     // Scenario:
     // - Create branch "gamma" (branch A) with commit C1, push, tombstone.
@@ -530,6 +533,7 @@ fn consolidate_by_name_merges_active_same_name_branches() {
 
     let dir = tempdir().unwrap();
     let pile_path = dir.path().join("test-by-name.pile");
+    std::fs::File::create(&pile_path).unwrap();
 
     // Create two active branches named "delta" with independent commits.
     let mut delta_heads: Vec<String> = Vec::new();

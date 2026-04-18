@@ -103,6 +103,13 @@ pub fn run(cmd: PileCommand) -> Result<()> {
                 fs::create_dir_all(parent)?;
             }
 
+            // Pile::open no longer auto-creates files (v0.32.1), so we
+            // explicitly touch the path first. Fine if the file already
+            // exists — fs::File::create truncates empty-or-not, and
+            // piles are append-only so an empty file is the initial
+            // state.
+            fs::File::create(&path)?;
+
             let pile: Pile<Blake3> = Pile::open(&path)?;
             // Explicit close makes the empty pile durable and avoids Drop warnings.
             pile.close().map_err(|e| anyhow::anyhow!("{e:?}"))?;

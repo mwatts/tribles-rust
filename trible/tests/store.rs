@@ -190,6 +190,7 @@ fn branch_push_pull_transfers_branch() {
     // const MAX_SIZE removed; new Pile API accepts a hash protocol type parameter
     let dir = tempdir().unwrap();
     let local = dir.path().join("local.pile");
+    std::fs::File::create(&local).unwrap();
     let remote_dir = dir.path().join("remote");
     std::fs::create_dir_all(remote_dir.join("branches")).unwrap();
     std::fs::create_dir_all(remote_dir.join("blobs")).unwrap();

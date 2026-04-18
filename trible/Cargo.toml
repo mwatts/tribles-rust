@@ -1,6 +1,6 @@
 [package]
 name = "trible"
-version = "0.34.0"
+version = "0.35.0"
 authors = ["⚫️ <jp@bultmann.eu>"]
 edition = "2021"
 description = "A knowledge graph and meta file system for object stores."
@@ -30,8 +30,8 @@ anyhow = "1.0.101"
 getrandom = "0.4.1"
 hex = "0.4.3"
 memchr = "2.7.6"
-triblespace = "0.34.1"
-triblespace-core = "0.34.1"
+triblespace = { version = "0.35.0", path = "..", default-features = false }
+triblespace-core = { version = "0.35.0", path = "../triblespace-core", default-features = false }
 file_type = "0.8"
 chrono = "0.4"
 object_store = { version = "0.13.1", default-features = false, features = ["aws", "fs"] }
@@ -40,25 +40,16 @@ url = "2"
 ed25519-dalek = "2.2.0"
 hifitime = "4"
 anybytes = { version = "0.20.2", features = ["zerocopy"] }
-iroh = { path = "../iroh/iroh" }
-iroh-base = { path = "../iroh/iroh-base" }
-iroh-gossip = { path = "../iroh-gossip", features = ["net"] }
-iroh-dht = { path = "../iroh-dht" }
-iroh-blobs = { path = "../iroh-blobs", default-features = false }
+iroh = { path = "../../iroh/iroh" }
+iroh-base = { path = "../../iroh/iroh-base" }
+iroh-gossip = { path = "../../iroh-gossip", features = ["net"] }
+iroh-dht = { path = "../../iroh-dht" }
+iroh-blobs = { path = "../../iroh-blobs", default-features = false }
 irpc-iroh = "0.13.0"
-triblespace-net = { path = "../triblespace-net" }
+triblespace-net = { version = "0.2.0", path = "../triblespace-net" }
 blake3 = "1.8"
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-[patch.crates-io]
-noq = { git = "https://github.com/n0-computer/noq", branch = "main" }
-noq-udp = { git = "https://github.com/n0-computer/noq", branch = "main" }
-noq-proto = { git = "https://github.com/n0-computer/noq", branch = "main" }
-iroh = { path = "../iroh/iroh" }
-iroh-base = { path = "../iroh/iroh-base" }
-triblespace-core = { path = "../triblespace-rs/triblespace-core" }
-triblespace = { path = "../triblespace-rs" }
 
 [dev-dependencies]
 assert_cmd = "2.1.2"

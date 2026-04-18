@@ -25,6 +25,7 @@ members = [
     "triblespace-macros",
     "triblespace-macros-common",
     "triblespace-net",
+    "trible",
 ]
 resolver = "2"
 

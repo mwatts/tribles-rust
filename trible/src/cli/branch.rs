@@ -82,6 +82,12 @@ pub fn run(cmd: BranchCommand) -> Result<()> {
 
             let url = Url::parse(&url)?;
             let mut remote: ObjectStoreRemote<Blake3> = ObjectStoreRemote::with_url(&url)?;
+            // Pile::open no longer auto-creates the file; if the target
+            // is a fresh path, touch it first so the pull lands in a
+            // valid empty pile.
+            if !pile.exists() {
+                std::fs::File::create(&pile)?;
+            }
             let mut pile: Pile<Blake3> = Pile::open(&pile)?;
 
             let res = (|| -> Result<(), anyhow::Error> {

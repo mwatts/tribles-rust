@@ -20,6 +20,7 @@ fn random_signing_key() -> SigningKey {
 fn list_branches_outputs_branch_id() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.pile");
+    std::fs::File::create(&path).unwrap();
 
     {
         let pile: Pile<Blake3> = Pile::open(&path).unwrap();
@@ -40,6 +41,7 @@ fn list_branches_outputs_branch_id() {
 fn delete_branch_removes_branch_id_from_list() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("delete_test.pile");
+    std::fs::File::create(&path).unwrap();
 
     let branch_id = {
         let pile: Pile<Blake3> = Pile::open(&path).unwrap();
@@ -82,6 +84,7 @@ fn branch_stats_reports_fast_and_full_counts() {
 
     let dir = tempdir().unwrap();
     let path = dir.path().join("stats_test.pile");
+    std::fs::File::create(&path).unwrap();
 
     let branch_id = {
         let pile: Pile<Blake3> = Pile::open(&path).unwrap();
@@ -140,6 +143,7 @@ fn branch_stats_reports_fast_and_full_counts() {
 fn create_initializes_empty_pile() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("create_test.pile");
+    std::fs::File::create(&path).unwrap();
 
     Command::cargo_bin("trible")
         .unwrap()
@@ -179,6 +183,7 @@ fn create_creates_parent_directories() {
 fn put_ingests_file() {
     let dir = tempdir().unwrap();
     let pile_path = dir.path().join("put_test.pile");
+    std::fs::File::create(&pile_path).unwrap();
     let input_path = dir.path().join("input.bin");
     std::fs::write(&input_path, b"hello world").unwrap();
 
@@ -210,6 +215,7 @@ fn put_ingests_file() {
 fn get_restores_blob() {
     let dir = tempdir().unwrap();
     let pile_path = dir.path().join("get_test.pile");
+    std::fs::File::create(&pile_path).unwrap();
     let input_path = dir.path().join("input.bin");
     let output_path = dir.path().join("output.bin");
     let contents = b"fetch me";
@@ -252,6 +258,7 @@ fn get_restores_blob() {
 fn list_blobs_outputs_expected_handle() {
     let dir = tempdir().unwrap();
     let pile_path = dir.path().join("list_blobs.pile");
+    std::fs::File::create(&pile_path).unwrap();
     let input_path = dir.path().join("input.bin");
     let contents = b"hello";
     std::fs::write(&input_path, contents).unwrap();
@@ -284,6 +291,7 @@ fn list_blobs_outputs_expected_handle() {
 fn list_blobs_with_metadata_outputs_details() {
     let dir = tempdir().unwrap();
     let pile_path = dir.path().join("list_blobs_meta.pile");
+    std::fs::File::create(&pile_path).unwrap();
     let input_path = dir.path().join("input.bin");
     let contents = b"hello";
     std::fs::write(&input_path, contents).unwrap();
@@ -322,6 +330,7 @@ fn list_blobs_with_metadata_outputs_details() {
 fn diagnose_reports_healthy() {
     let dir = tempdir().unwrap();
     let pile_path = dir.path().join("diag.pile");
+    std::fs::File::create(&pile_path).unwrap();
 
     // create an empty pile file
     Command::cargo_bin("trible")
@@ -345,6 +354,7 @@ fn diagnose_reports_invalid_hash() {
 
     let dir = tempdir().unwrap();
     let pile_path = dir.path().join("bad.pile");
+    std::fs::File::create(&pile_path).unwrap();
     let blob_path = dir.path().join("blob.bin");
     std::fs::write(&blob_path, b"good data").unwrap();
 
@@ -386,6 +396,7 @@ fn inspect_outputs_tribles() {
 
     let dir = tempdir().unwrap();
     let pile_path = dir.path().join("inspect.pile");
+    std::fs::File::create(&pile_path).unwrap();
 
     let dataset = examples::dataset();
     let blob = dataset.to_blob();
@@ -417,6 +428,7 @@ fn inspect_outputs_tribles() {
 fn diagnose_locate_hash_reports_header_and_payload_refs() {
     let dir = tempdir().unwrap();
     let pile_path = dir.path().join("locate_hash.pile");
+    std::fs::File::create(&pile_path).unwrap();
 
     // Put blob1 and capture its handle string.
     let blob1_path = dir.path().join("blob1.bin");
@@ -487,6 +499,7 @@ fn diagnose_locate_hash_reports_header_and_payload_refs() {
 fn pile_branch_create_outputs_id() {
     let dir = tempdir().unwrap();
     let pile_path = dir.path().join("create_branch.pile");
+    std::fs::File::create(&pile_path).unwrap();
 
     Command::cargo_bin("trible")
         .unwrap()

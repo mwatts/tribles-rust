@@ -4,16 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.35.0] - 2026-04-18
 ### Added
 - `pile branch reflog` command to list historical branch head updates (including tombstones) stored in a pile file.
 - `pile branch journal` command to scan a pile for all branch update/tombstone records and report the latest state per branch id.
 - `pile branch set` command to CAS-update a branch head to a specific branch-metadata handle (useful for recovery).
 - `pile diagnose locate-hash` to scan raw pile bytes and report where a blob handle appears (header vs payload references).
+- `pile net {identity, sync, pull}` subcommands for distributed pile sync over iroh (gossip + DHT + QUIC), built on `triblespace-net`.
 ### Changed
 - `pile diagnose` is now a subcommand group (`check`, `locate-hash`) instead of a single command.
 - `pile branch stats` now defaults to a fast path that reports accumulated content bytes and accumulated triple count from blob metadata (`length / 64`) without materializing commit payload tribles.
 - `pile branch stats --full` retains the previous deep scan behavior for unique triples/entities/attributes.
+- `trible` now lives in the `triblespace-rs` workspace as a first-class member, sharing the `Cargo.lock` with `triblespace-core` / `triblespace-net` / the facade. Dev experience: a single `cargo test --workspace` run exercises CLI, library, and protocol tests together.
+### Fixed
+- `pile create` now explicitly touches the target path before `Pile::open`. `Pile::open` stopped auto-creating files at triblespace-core 0.32.1 but the CLI hadn't been updated to match; `pile create` on a fresh path returned `No such file or directory`.
+- `branch pull` does the same touch-before-open when the local pile is a fresh path.
 
 ## [0.12.0] - 2026-02-09
 ### Changed

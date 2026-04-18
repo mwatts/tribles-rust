@@ -12,6 +12,7 @@ use triblespace_core::value::schemas::hash::Blake3;
 fn branch_set_creates_and_updates_with_cas() {
     let dir = tempdir().unwrap();
     let pile_path = dir.path().join("test-branch-set.pile");
+    std::fs::File::create(&pile_path).unwrap();
 
     let branch_id = id_hex!("22222222222222222222222222222222");
 
@@ -95,6 +96,7 @@ fn branch_set_creates_and_updates_with_cas() {
 fn branch_list_all_deleted_lists_deleted_branches() {
     let dir = tempdir().unwrap();
     let pile_path = dir.path().join("test-branch-journal.pile");
+    std::fs::File::create(&pile_path).unwrap();
 
     let branch_id = id_hex!("33333333333333333333333333333333");
 
