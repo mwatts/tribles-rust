@@ -8,7 +8,6 @@
 use std::marker::PhantomData;
 
 use anybytes::{Bytes, View};
-use digest::Digest;
 use winnow::stream::Stream;
 
 use crate::blob::schemas::longstring::LongString;
@@ -537,9 +536,9 @@ where
     }
 }
 
-fn hash_chunk<H: Digest>(hasher: &mut H, bytes: &[u8]) {
+fn hash_chunk<H: HashProtocol>(hasher: &mut H, bytes: &[u8]) {
     let len = (bytes.len() as u64).to_be_bytes();
-    hasher.update(len);
+    hasher.update(&len);
     hasher.update(bytes);
 }
 

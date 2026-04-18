@@ -16,18 +16,39 @@ use crate::value::ValueSchema;
 use std::convert::Infallible;
 
 use anybytes::Bytes;
-use digest::typenum::U32;
-use digest::Digest;
 use hex::FromHex;
 use hex::FromHexError;
 use std::marker::PhantomData;
 
-/// A trait for hash functions.
-/// This trait is implemented by hash functions that can be in a value schema
-/// for example via a [struct@Hash] or a [`Handle`].
-pub trait HashProtocol: Digest<OutputSize = U32> + Clone + Send + 'static + ConstDescribe {
+/// A trait for 32-byte content-addressed hash functions.
+///
+/// Implementors expose the minimal streaming API the rest of triblespace
+/// relies on (`new` / `update` / `finalize`) plus a one-shot `digest`
+/// helper. The previous version of this trait extended the `digest`
+/// crate's [`Digest`](https://docs.rs/digest) trait via blake3's
+/// `traits-preview` feature, but `traits-preview` is explicitly
+/// pre-stable and its pinned `digest` dependency conflicts with other
+/// iroh-ecosystem crates. Defining a minimal trait here keeps
+/// triblespace-core dep-independent from the digest crate entirely.
+pub trait HashProtocol: Clone + Send + 'static + ConstDescribe {
     /// Short lowercase name used in serialised representations (e.g. `"blake3"`).
     const NAME: &'static str;
+
+    /// Create a fresh hasher ready to accept input.
+    fn new() -> Self;
+
+    /// Feed `bytes` into the streaming state.
+    fn update(&mut self, bytes: &[u8]);
+
+    /// Return the 32-byte digest of the bytes fed so far. Takes
+    /// `&self` (not `self`) so method-resolution on `blake3::Hasher`
+    /// still prefers blake3's inherent `finalize` returning a
+    /// `blake3::Hash` — that matters for call sites (including the
+    /// `entity!` macro expansion) that want the native API.
+    fn finalize(&self) -> RawValue;
+
+    /// One-shot convenience: hash `bytes` and return the digest.
+    fn digest(bytes: &[u8]) -> RawValue;
 }
 
 /// A value schema for a hash.
@@ -71,7 +92,7 @@ where
 {
     /// Computes the hash of `blob` and returns it as a value.
     pub fn digest(blob: &Bytes) -> Value<Self> {
-        Value::new(H::digest(blob).into())
+        Value::new(H::digest(blob))
     }
 
     /// Parses a hex-encoded digest string into a hash value.
@@ -200,6 +221,22 @@ pub use blake3::Hasher as Blake3;
 
 impl HashProtocol for Blake3 {
     const NAME: &'static str = "blake3";
+
+    fn new() -> Self {
+        blake3::Hasher::new()
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        blake3::Hasher::update(self, bytes);
+    }
+
+    fn finalize(&self) -> RawValue {
+        *blake3::Hasher::finalize(self).as_bytes()
+    }
+
+    fn digest(bytes: &[u8]) -> RawValue {
+        *blake3::hash(bytes).as_bytes()
+    }
 }
 
 impl ConstId for Blake3 {

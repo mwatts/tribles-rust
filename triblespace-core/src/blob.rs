@@ -88,7 +88,7 @@ impl<S: BlobSchema> Blob<S> {
         Handle<H, S>: ValueSchema,
     {
         let digest = H::digest(&self.bytes);
-        Value::new(digest.into())
+        Value::new(digest)
     }
 
     /// Tries to convert the blob to a concrete Rust type.

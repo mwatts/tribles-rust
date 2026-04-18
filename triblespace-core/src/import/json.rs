@@ -449,7 +449,7 @@ where
             hasher.update(attr);
             hasher.update(value);
         }
-        let digest: [u8; 32] = hasher.finalize().into();
+        let digest: [u8; 32] = hasher.finalize();
         let mut raw = [0u8; ID_LEN];
         raw.copy_from_slice(&digest[digest.len() - ID_LEN..]);
         let id = Id::new(raw).ok_or(JsonImportError::PrimitiveRoot)?;
