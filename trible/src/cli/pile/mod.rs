@@ -1,0 +1,122 @@
+use anyhow::Result;
+use clap::Parser;
+use std::fs;
+use std::path::PathBuf;
+
+pub mod blob;
+pub mod branch;
+mod diagnose;
+mod merge;
+mod migrate;
+pub mod net;
+mod signing;
+mod squash;
+
+#[derive(Parser)]
+pub enum PileCommand {
+    /// Operations on branches stored in a pile file.
+    Branch {
+        #[command(subcommand)]
+        cmd: branch::Command,
+    },
+    /// Operations on blobs stored in a pile file.
+    Blob {
+        #[command(subcommand)]
+        cmd: blob::Command,
+    },
+    /// Merge source branch heads into a target branch.
+    Merge {
+        /// Path to the pile file to modify
+        pile: PathBuf,
+        /// Target branch id (hex)
+        target: String,
+        /// Source branch id(s) (hex)
+        #[arg(num_args = 1..)]
+        sources: Vec<String>,
+        /// Optional signing key path. The file should contain a 64-char hex seed.
+        #[arg(long)]
+        signing_key: Option<PathBuf>,
+    },
+    /// Create a new empty pile file.
+    ///
+    /// This is mainly a cross-platform convenience; a plain `touch` on
+    /// Unix-like systems achieves the same result.
+    Create {
+        /// Path to the pile file to create
+        path: PathBuf,
+    },
+    /// Diagnostic helpers for inspecting and repairing piles.
+    Diagnose {
+        #[command(subcommand)]
+        cmd: diagnose::Command,
+    },
+    /// Migrate legacy pile metadata to the current schemas.
+    Migrate {
+        /// Path to the pile file to modify
+        pile: PathBuf,
+        #[command(subcommand)]
+        cmd: migrate::Command,
+    },
+    /// Distributed pile sync over iroh (p2p QUIC connections).
+    Net {
+        #[command(subcommand)]
+        cmd: net::Command,
+    },
+    /// Squash all branch histories into single commits in a new pile.
+    ///
+    /// For each branch, the full accumulated content and metadata are
+    /// checked out and written as a single commit. Only blobs reachable
+    /// from the squashed content are copied. The result is a minimal
+    /// pile with clean commit timestamps and no orphaned data.
+    Squash {
+        /// Source pile file
+        source: PathBuf,
+        /// Destination pile file (will be created)
+        dest: PathBuf,
+        /// Only include these branches (by name or hex ID). If omitted, all branches are included.
+        #[arg(long)]
+        include: Vec<String>,
+        /// Exclude these branches (by name or hex ID).
+        #[arg(long)]
+        exclude: Vec<String>,
+        /// Optional signing key path
+        #[arg(long)]
+        signing_key: Option<PathBuf>,
+    },
+}
+
+pub fn run(cmd: PileCommand) -> Result<()> {
+    match cmd {
+        PileCommand::Branch { cmd } => branch::run(cmd),
+        PileCommand::Blob { cmd } => blob::run(cmd),
+        PileCommand::Merge {
+            pile,
+            target,
+            sources,
+            signing_key,
+        } => merge::run(pile, target, sources, signing_key),
+        PileCommand::Create { path } => {
+            use triblespace_core::repo::pile::Pile;
+            use triblespace_core::value::schemas::hash::Blake3;
+
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            let pile: Pile<Blake3> = Pile::open(&path)?;
+            // Explicit close makes the empty pile durable and avoids Drop warnings.
+            pile.close().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            Ok(())
+        }
+        PileCommand::Net { cmd } => net::run(cmd),
+        PileCommand::Diagnose { cmd } => diagnose::run(cmd),
+        PileCommand::Migrate { pile, cmd } => migrate::run(pile, cmd),
+        PileCommand::Squash {
+            source,
+            dest,
+            include,
+            exclude,
+            signing_key,
+        } => squash::run(source, dest, signing_key, include, exclude),
+    }
+}
