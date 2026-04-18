@@ -10,61 +10,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** Renamed the `matches!` query macro to `exists!` to resolve the
   name collision with `std::matches!` that made the macro unusable in practice.
 
-## [Unreleased]
-### Changed
-- **Breaking:** `commit_metadata` now derives the commit's entity id
-  intrinsically from its `(attribute, value)` pairs via `entity!`'s
-  content-hash form instead of minting a random `rngid()`. Merge commits
-  (content = None) also drop `metadata::created_at` since no authorial
-  act produced them. Net effect: two peers merging the same parent set
-  produce bit-identical merge commits, so parallel-merge scenarios in
-  distributed sync converge in zero extra rounds via content addressing.
-  Existing piles aren't invalidated — old commits with random entity ids
-  remain queryable — but newly-minted commits will have different entity
-  ids and therefore different blob hashes than the pre-change world.
-- `Pile::put` now handles blobs larger than the kernel's atomic
-  `write_vectored` ceiling (~2&nbsp;GiB on macOS / Linux). Records below
-  a 1&nbsp;GiB threshold keep the existing shared-lock + single-`writev`
-  fast path; larger records take an exclusive lock and append via plain
-  `write_all`, lifting the previous ~2&nbsp;GiB per-blob cap. The
-  exclusive-lock path remains append-only and `Pile::restore` still
-  truncates any partial tail after a crash. Test coverage added as
-  `put_and_get_oversized_blob` (`#[ignore]`d because the exercise
-  allocates ~1&nbsp;GiB of memory).
-- `branch_metadata` and `branch_unsigned` now stamp every branch
-  metadata blob with `metadata::updated_at: NsTAIInterval` from
-  `Epoch::now()`. Downstream sync layers can use this to order
-  concurrent HEAD gossips without walking ancestor chains. Tradeoff:
-  the same `(head, name, signer)` state at two different times no
-  longer produces an identical metadata blob hash — gossip
-  convergence degrades slightly (same-state dup blobs) but correctness
-  is preserved.
+## [0.35.0] - 2026-04-18
+### Breaking
+- **`Id::aquire` → `Id::acquire`** (fixing a long-standing typo).
+  Paired: `ExclusiveIdError::FailedAquire` → `FailedAcquire`.
+- **Commit metadata is now content-addressed.** `commit_metadata`
+  derives the commit's entity id intrinsically from its
+  `(attribute, value)` pairs via `entity!`'s content-hash form instead
+  of minting a random `rngid()`. Merge commits (content = `None`) also
+  drop `metadata::created_at` since no authorial act produced them.
+  Existing piles aren't invalidated — old commits with random entity
+  ids remain queryable — but newly-minted commits have different
+  entity ids and therefore different blob hashes than the pre-change
+  world. Payoff: two peers merging the same parent set produce
+  bit-identical merge commits, so parallel-merge scenarios in
+  distributed sync converge in zero extra rounds via content
+  addressing.
+- **Branch metadata is now content-addressed the same way.**
+  `branch_metadata` and `branch_unsigned` use `entity!`'s intrinsic id
+  form instead of the deleted `derive_metadata_entity` helper. Every
+  publish also stamps `metadata::updated_at: NsTAIInterval` so peers
+  can order concurrent HEAD gossips without an ancestor walk.
+  Tradeoff: because `updated_at` varies per publish, the same
+  `(head, name, signer)` state at two different moments no longer
+  produces an identical metadata blob hash.
 
 ### Added
-- `SortedSlice::from_mut(&mut [T])`: sort-in-place constructor that mirrors
-  the `new_unchecked` ergonomics when the caller has a mutable slice but no
-  pre-sortedness guarantee.
-- `ContainsConstraint` impl for `&'a mut [T]` that sorts the slice in place
-  and produces a `SortedSliceConstraint`. Via `DerefMut` method resolution
-  this also picks up `&mut Vec<T>`, `&mut [T; N]`, `&mut Box<[T]>`, and any
-  other mutable borrow that derefs to a slice, so callers can write
-  `(&mut my_vec).has(var)` without hand-rolling the sort.
-- `import::ntriples::{ingest_ntriples, ingest_ntriples_file}`: N-Triples
-  importer generic over any `Workspace<Blobs: BlobStore<Blake3>>`. XSD
-  datatypes map to native triblespace schemas (`xsd:integer` → `I256BE`,
-  `xsd:decimal` → `R256BE` exact rational, `xsd:float`/`xsd:double` → `F64`,
-  `xsd:boolean` → `Boolean`, strings → `Handle<LongString>`, URI objects
-  → `GenId`). Predicate URIs become attributes via `Attribute::from_name`
-  so repeated imports of the same data converge deterministically.
-- `import::rdf_uri`: canonical "this entity is the referent of this URI"
-  attribute, used by the N-Triples importer to derive stable entity ids
-  from URIs.
+- `SortedSlice::from_mut(&mut [T])`: sort-in-place constructor that
+  mirrors the `new_unchecked` ergonomics when the caller has a mutable
+  slice but no pre-sortedness guarantee.
+- `ContainsConstraint` impl for `&'a mut [T]` that sorts the slice in
+  place and produces a `SortedSliceConstraint`. Via `DerefMut` method
+  resolution this also picks up `&mut Vec<T>`, `&mut [T; N]`,
+  `&mut Box<[T]>`, and any other mutable borrow that derefs to a slice,
+  so callers can write `(&mut my_vec).has(var)` without hand-rolling
+  the sort.
+- `import::ntriples::{ingest_ntriples, ingest_ntriples_file}`:
+  N-Triples importer generic over any
+  `Workspace<Blobs: BlobStore<Blake3>>`. XSD datatypes map to native
+  triblespace schemas (`xsd:integer` → `I256BE`, `xsd:decimal` →
+  `R256BE` exact rational, `xsd:float`/`xsd:double` → `F64`,
+  `xsd:boolean` → `Boolean`, strings → `Handle<LongString>`, URI
+  objects → `GenId`). Predicate URIs become attributes via
+  `Attribute::from_name` so repeated imports of the same data converge
+  deterministically.
+- `import::rdf_uri`: canonical "this entity is the referent of this
+  URI" attribute, used by the N-Triples importer to derive stable
+  entity ids from URIs.
 - `triblespace-net` joins the workspace as a first-class member. The
-  facade crate gains a `net` feature (`triblespace = { version = "x",
-  features = ["net"] }`) that re-exports it as `triblespace::net`, so
+  facade crate gains a `net` feature
+  (`triblespace = { version = "x", features = ["net"] }`) that
+  re-exports it as `triblespace::net`, so
   `use triblespace::net::peer::Peer;` is the one-liner for distributed
-  sync. Ships with the full subtree history from the standalone repo
-  so blame/history are preserved.
+  sync. The subtree merge preserves the full commit history from the
+  previously-standalone repo.
+
+### Changed
+- `Pile::put` now handles blobs larger than the kernel's atomic
+  `write_vectored` ceiling (~2&nbsp;GiB on macOS / Linux). Records
+  below a 1&nbsp;GiB threshold keep the existing shared-lock +
+  single-`writev` fast path; larger records take an exclusive lock and
+  append via plain `write_all`, lifting the previous ~2&nbsp;GiB
+  per-blob cap. The exclusive-lock path remains append-only and
+  `Pile::restore` still truncates any partial tail after a crash.
+  Test coverage added as `put_and_get_oversized_blob`
+  (`#[ignore]`d because the exercise allocates ~1&nbsp;GiB of memory).
+
+### Documentation
+- New book chapter: **"Distributed Sync"** (under Repositories &
+  Workflows) covers the `Peer<S>` mental model, gossip / DHT / QUIC
+  transports, `track` vs `fetch` primitives, `merge_tracking_into_local`,
+  convergence rounds under sequential vs parallel gossip, and the CLI
+  surface (`trible pile net {identity, sync, pull}`).
+- "Importing Data Formats" chapter gains an "Importing N-Triples"
+  section with the XSD → triblespace schema mapping table and a query
+  roundtrip example.
+- "Deep Dive: Identifiers" chapter reframed around clearer axes:
+  *derivability* (intrinsic/extrinsic = "can the id be recomputed from
+  the entity?") and *content encoding* (abstract/semantic = "do the
+  bits carry meaning about the entity?"). New "Quadrant Properties"
+  section names the structural invariants (extrinsic + semantic +
+  global scope ⇒ authority; the other quadrants can be decentralized).
+- `book.toml` enables MathJax so the chapters' `\( 2^{128} \)` notation
+  actually renders.
 
 ## [0.34.1] - 2026-04-04
 ### Added
