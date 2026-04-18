@@ -6,3 +6,4 @@ proptest-regressions
 .vscode
 /papers
 flamegraph*
+triblespace-net/img/

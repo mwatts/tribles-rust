@@ -235,7 +235,7 @@ async fn host_loop(
     router_builder = router_builder.accept(PILE_SYNC_ALPN, handler);
 
     // DHT — always on. Peers bootstrap the routing table.
-    let dht_alpn = iroh_dht::rpc::ALPN;
+    let dht_alpn = crate::dht::rpc::ALPN;
     let pool = iroh_blobs::util::connection_pool::ConnectionPool::new(
         ep.clone(), dht_alpn,
         iroh_blobs::util::connection_pool::Options {
@@ -245,8 +245,8 @@ async fn host_loop(
             on_connected: None,
         },
     );
-    let iroh_pool = iroh_dht::pool::IrohPool::new(ep.clone(), pool);
-    let (rpc, dht_api) = iroh_dht::create_node(
+    let iroh_pool = crate::dht::pool::IrohPool::new(ep.clone(), pool);
+    let (rpc, dht_api) = crate::dht::create_node(
         my_id, iroh_pool.clone(), config.peers.clone(), Default::default(),
     );
     iroh_pool.set_self_client(Some(rpc.downgrade()));
@@ -257,7 +257,7 @@ async fn host_loop(
 
     // Gossip.
     let mut gossip_sender: Option<GossipSender> = None;
-    if let Some(ref topic_name) = config.gossip_topic {
+    if let Some(topic_name) = config.gossip_topic {
         let gossip = Gossip::builder().spawn(ep.clone());
         router_builder = router_builder.accept(iroh_gossip::ALPN, gossip.clone());
 
@@ -323,7 +323,7 @@ async fn host_loop(
         while let Ok(cmd) = commands.try_recv() {
             match cmd {
                 NetCommand::Announce(hash) => {
-                    if let Some(ref api) = dht_api {
+                    if let Some(api) = &dht_api {
                         let api = api.clone();
                         tokio::spawn(async move {
                             let blake3_hash = blake3::Hash::from_bytes(hash);
@@ -332,7 +332,7 @@ async fn host_loop(
                     }
                 }
                 NetCommand::Gossip { branch, head } => {
-                    if let Some(ref sender) = gossip_sender {
+                    if let Some(sender) = &gossip_sender {
                         let mut msg = Vec::with_capacity(81);
                         msg.push(0x01);
                         msg.extend_from_slice(&branch);
@@ -419,7 +419,7 @@ async fn host_loop(
 async fn fetch_blob(
     ep: &iroh::Endpoint,
     hash: &RawHash,
-    dht: &Option<iroh_dht::api::ApiClient>,
+    dht: &Option<crate::dht::api::ApiClient>,
     hint_peer: EndpointId,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     let verify = |data: &[u8]| -> bool {
@@ -428,7 +428,7 @@ async fn fetch_blob(
     };
 
     // DHT: ask the network who has this blob.
-    if let Some(ref api) = dht {
+    if let Some(api) = dht {
         let blake3_hash = blake3::Hash::from_bytes(*hash);
         if let Ok(providers) = api.find_providers(blake3_hash).await {
             for provider in providers {
@@ -465,7 +465,7 @@ async fn fetch_reachable(
     ep: &iroh::Endpoint,
     peer: EndpointId,
     head: &RawHash,
-    dht: &Option<iroh_dht::api::ApiClient>,
+    dht: &Option<crate::dht::api::ApiClient>,
     events: &mpsc::Sender<NetEvent>,
 ) -> anyhow::Result<()> {
     let mut seen: HashSet<RawHash> = HashSet::new();
@@ -515,7 +515,7 @@ async fn track_known_head(
     branch: RawBranchId,
     head: RawHash,
     publisher: crate::channel::PublisherKey,
-    dht: &Option<iroh_dht::api::ApiClient>,
+    dht: &Option<crate::dht::api::ApiClient>,
     events: &mpsc::Sender<NetEvent>,
 ) {
     if let Err(e) = fetch_reachable(ep, fetch_peer, &head, dht, events).await {

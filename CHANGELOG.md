@@ -64,6 +64,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `use triblespace::net::peer::Peer;` is the one-liner for distributed
   sync. The subtree merge preserves the full commit history from the
   previously-standalone repo.
+- `triblespace-net` now inlines the `iroh-dht` implementation as an
+  internal module (`triblespace_net::dht`) instead of depending on the
+  separate `iroh-dht` crate. The implementation was a triblespace fork
+  of `iroh-dht-experiment` with API migration and a `ContentDiscovery`
+  trait impl; integrating it into triblespace-net eliminates the
+  unpublished-fork blocker for the `net` feature and keeps DHT
+  evolution co-located with its only consumer.
+- **Edition bump**: `triblespace-net` is now on Rust edition 2024
+  (inherited from iroh-dht's let-chain syntax). Users depending on
+  `triblespace-net` directly or on the facade's `net` feature need
+  Rust 1.85 or newer.
 
 ### Changed
 - `Pile::put` now handles blobs larger than the kernel's atomic

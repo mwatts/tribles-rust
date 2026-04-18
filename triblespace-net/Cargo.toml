@@ -1,27 +1,36 @@
 [package]
 name = "triblespace-net"
 version = "0.2.0"
-edition = "2021"
+edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Distributed sync protocol for triblespace piles over iroh"
 repository = "https://github.com/triblespace/triblespace-net"
 
 [dependencies]
-triblespace-core = { path = "../triblespace-core" }
-iroh = { path = "../../iroh/iroh" }
-iroh-base = { path = "../../iroh/iroh-base" }
-iroh-dht = { path = "../../iroh-dht" }
-iroh-blobs = { path = "../../iroh-blobs", default-features = false }
-iroh-gossip = { path = "../../iroh-gossip", features = ["net"] }
+triblespace-core = { version = "0.35.0", path = "../triblespace-core", default-features = false }
+iroh = { version = "0.97", path = "../../iroh/iroh" }
+iroh-base = { version = "0.97", path = "../../iroh/iroh-base" }
+iroh-blobs = { version = "0.99", path = "../../iroh-blobs", default-features = false }
+iroh-gossip = { version = "0.97", path = "../../iroh-gossip", features = ["net"] }
+irpc = "0.13.0"
 irpc-iroh = "0.13.0"
 anyhow = "1"
 anybytes = { version = "0.20.2", features = ["zerocopy"] }
+arrayvec = "0.7.6"
 blake3 = "1.8"
 ed25519-dalek = "2.2.0"
+futures-buffered = "0.2.12"
 getrandom = "0.4"
 hex = "0.4"
+indexmap = "2.10.0"
+n0-future = "0.3.0"
+rand = "0.8.5"
+serde = { version = "1", features = ["derive"] }
+serde-big-array = "0.5.1"
+snafu = "0.8.6"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 tracing = "0.1"
+
 
