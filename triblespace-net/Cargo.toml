@@ -10,7 +10,7 @@ repository = "https://github.com/triblespace/triblespace-net"
 triblespace-core = { version = "0.36.0", path = "../triblespace-core", default-features = false }
 iroh = "0.97"
 iroh-base = "0.97"
-iroh-blobs = { version = "0.99", default-features = false }
+iroh-blobs = { version = "0.99", default-features = false, features = ["rpc"] }
 iroh-gossip = { version = "0.97", features = ["net"] }
 irpc = "0.13.0"
 irpc-iroh = "0.13.0"
