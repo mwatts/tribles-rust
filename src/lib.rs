@@ -16,6 +16,7 @@
 pub mod bm25;
 pub mod constraint;
 pub mod hnsw;
+pub mod schemas;
 pub mod tokens;
 
 /// Current on-disk format version for every index blob.
