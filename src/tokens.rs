@@ -67,6 +67,81 @@ pub fn hash_tokens_as_values(text: &str) -> Vec<Value<UnknownValue>> {
         .collect()
 }
 
+/// Character-level n-gram tokenizer. Returns one hashed term per
+/// sliding window of `n` characters across the lowercased text.
+///
+/// Indexing the same document with *both* `hash_tokens` and
+/// `ngram_tokens(text, 3)` (concatenating the two `Vec`s before
+/// `BM25Builder::insert`) lets the same BM25 index serve:
+/// - whole-word queries via `hash_tokens("foo")`, and
+/// - prefix / typo queries via `ngram_tokens("fox", 3)` — any
+///   shared 3-gram boosts the score even when the surface forms
+///   differ.
+///
+/// Rules:
+/// - Non-alphanumeric characters are replaced by a single space
+///   (so n-grams never cross punctuation/whitespace boundaries).
+/// - Letters are lowercased.
+/// - Runs shorter than `n` characters are dropped — no padding.
+/// - `n == 0` returns an empty `Vec`.
+///
+/// Each n-gram is namespaced to `n` before hashing, so a trigram
+/// `"fox"` and a bigram `"fo"` + `"ox"` produce distinct term
+/// values and can coexist in one index.
+///
+/// # Example
+///
+/// ```
+/// # use triblespace_search::tokens::ngram_tokens;
+/// let tris = ngram_tokens("fox", 3);
+/// assert_eq!(tris.len(), 1); // just "fox"
+///
+/// let tris = ngram_tokens("foxes", 3);
+/// // "fox", "oxe", "xes"
+/// assert_eq!(tris.len(), 3);
+///
+/// // "fox" and "foxes" share the "fox" trigram.
+/// assert!(ngram_tokens("foxes", 3).contains(&ngram_tokens("fox", 3)[0]));
+/// ```
+pub fn ngram_tokens(text: &str, n: usize) -> Vec<RawValue> {
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // Normalize: lowercase letters, replace other non-alphanumerics
+    // with a single space so runs don't merge across boundaries.
+    let mut normalized = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            for l in c.to_lowercase() {
+                normalized.push(l);
+            }
+        } else {
+            normalized.push(' ');
+        }
+    }
+
+    let mut out = Vec::new();
+    for run in normalized.split_ascii_whitespace() {
+        let chars: Vec<char> = run.chars().collect();
+        if chars.len() < n {
+            continue;
+        }
+        // Namespace by n so {n=2 "fo"} and {n=3 "foo"} don't collide.
+        let mut gram = String::with_capacity(n * 4 + 8);
+        for window in chars.windows(n) {
+            gram.clear();
+            gram.push_str(&n.to_string());
+            gram.push(':');
+            for &c in window {
+                gram.push(c);
+            }
+            out.push(*blake3::hash(gram.as_bytes()).as_bytes());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +187,63 @@ mod tests {
         let tokens = hash_tokens("hello");
         let expected = *blake3::hash(b"hello").as_bytes();
         assert_eq!(tokens[0], expected);
+    }
+
+    #[test]
+    fn ngram_empty_n_returns_nothing() {
+        assert!(ngram_tokens("anything", 0).is_empty());
+    }
+
+    #[test]
+    fn ngram_skips_short_runs() {
+        // "hi" (len 2) drops for n=3.
+        assert!(ngram_tokens("hi", 3).is_empty());
+    }
+
+    #[test]
+    fn ngram_counts() {
+        // "foxes" -> fox, oxe, xes = 3 trigrams
+        assert_eq!(ngram_tokens("foxes", 3).len(), 3);
+        // "foxes" -> fo, ox, xe, es = 4 bigrams
+        assert_eq!(ngram_tokens("foxes", 2).len(), 4);
+    }
+
+    #[test]
+    fn ngram_case_insensitive() {
+        let a = ngram_tokens("FOX", 3);
+        let b = ngram_tokens("fox", 3);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn ngram_does_not_cross_punctuation() {
+        // "foo-bar" splits on '-' so the tri-gram window doesn't
+        // span the boundary (no "oo-" or "o-b" grams).
+        let dashed = ngram_tokens("foo-bar", 3);
+        let spaced = ngram_tokens("foo bar", 3);
+        assert_eq!(dashed, spaced);
+        assert_eq!(dashed.len(), 2); // "foo" and "bar"
+    }
+
+    #[test]
+    fn ngram_size_namespaced() {
+        // "fo" as a bigram and "fo" as a prefix of a trigram
+        // produce distinct hashes — same glyphs, different n.
+        let bi = ngram_tokens("fo", 2);
+        let tri = ngram_tokens("foo", 3);
+        assert_eq!(bi.len(), 1);
+        assert_eq!(tri.len(), 1);
+        assert_ne!(bi[0], tri[0]);
+    }
+
+    #[test]
+    fn ngram_shared_prefix_matches_extension() {
+        // The key property: "fox" and "foxes" share a trigram, so
+        // a BM25 index keyed on ngram_tokens would score them
+        // relative to each other — prefix / fuzzy matching for
+        // free.
+        let short = ngram_tokens("fox", 3);
+        let long = ngram_tokens("foxes", 3);
+        assert!(long.contains(&short[0]));
     }
 }

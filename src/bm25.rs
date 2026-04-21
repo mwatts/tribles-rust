@@ -748,4 +748,35 @@ mod tests {
         let b = build_sample_index().to_bytes();
         assert_eq!(a, b);
     }
+
+    #[test]
+    fn ngrams_enable_prefix_queries() {
+        // The payoff test: index docs with hash_tokens + 3-grams
+        // concatenated, and query a prefix as 3-grams to recover
+        // the extended form. Surface-exact queries still work via
+        // the hash_tokens half.
+        use crate::tokens::ngram_tokens;
+
+        fn both(text: &str) -> Vec<RawValue> {
+            let mut v = hash_tokens(text);
+            v.extend(ngram_tokens(text, 3));
+            v
+        }
+
+        let mut b = BM25Builder::new();
+        b.insert(id(1), both("foxes are cunning"));
+        b.insert(id(2), both("the dog barks"));
+        b.insert(id(3), both("silver fox at night"));
+        let idx = b.build();
+
+        // Query "fox" as trigrams: just one gram, "fox". Both
+        // "foxes" (doc 1) and "fox" (doc 3) should score, but
+        // "dog" (doc 2) must not.
+        let q = ngram_tokens("fox", 3);
+        let hits: Vec<_> = idx.query_multi(&q);
+        let doc_ids: Vec<_> = hits.iter().map(|(d, _)| *d).collect();
+        assert!(doc_ids.contains(&id(1)), "prefix should match 'foxes'");
+        assert!(doc_ids.contains(&id(3)), "prefix should match 'fox'");
+        assert!(!doc_ids.contains(&id(2)), "must not match 'dog'");
+    }
 }

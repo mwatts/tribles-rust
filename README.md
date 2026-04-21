@@ -46,14 +46,19 @@ naive-then-succinct implementation order is the open work item.
   against `FlatIndex` ground truth at ≥ 70% top-10 recall.
 * **`tokens::hash_tokens`**: opt-in whitespace + lowercase +
   Blake3 tokenizer producing 32-byte term values.
+* **`tokens::ngram_tokens`**: character n-gram tokenizer (n
+  namespaced into the hash) for prefix / typo matching.
+  Compose with `hash_tokens` to get both exact and fuzzy
+  matching through a single BM25 index.
 * **`schemas::F32LE`**: `ValueSchema` for packing `f32` scores
   into 32-byte `Value<F32LE>`s. Used by the scored BM25
   constraint.
 * One runnable example (`cargo run --example query_demo`)
   covering text search, multi-term OR-queries, and the
   value-as-term citation-search trick.
-* 83 tests across unit, scale (1k-doc), engine-integration
-  (`IntersectionConstraint` joins), and doctests.
+* 98 tests across unit, scale (1k-doc), engine-integration
+  (`IntersectionConstraint` joins + `find!`/`pattern!` composition),
+  and doctests.
 
 ### What's next
 
@@ -61,9 +66,8 @@ naive-then-succinct implementation order is the open work item.
   + posting lists; per-layer wavelet matrices for HNSW
   neighbour graphs) via the `jerky::Serializable` pattern. Same
   API, smaller and faster.
-* Additional token helpers (prefix, n-gram, phrase rewriting).
-* Runnable example composing BM25 + TribleSet filters in a
-  single `find!`.
+* Additional token helpers (phrase rewriting, code-aware
+  splitting).
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) and
 [`docs/QUERY_ENGINE_INTEGRATION.md`](docs/QUERY_ENGINE_INTEGRATION.md).
