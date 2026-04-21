@@ -62,12 +62,14 @@ fn fake_doc(rng: &mut Rng, vocab: usize, n_words: usize) -> String {
     words.join(" ")
 }
 
-/// Read the keys-section length from an SB25 blob header. The
-/// offset (220 bytes into the header) is fixed by the v3 layout
-/// — see `src/succinct.rs` for the header-layout comment.
+/// Read the keys-section length from an SB25 blob header.
+///
+/// Offset layout (see `SuccinctBM25Index::to_bytes` in
+/// `src/succinct.rs`): 16 B scalars + 32 B × 4 jerky metas +
+/// 40 B universe meta + 8 B keys_off = 208, then 8 B keys_len.
 fn keys_len_from_header(bytes: &[u8]) -> u64 {
     let mut b = [0u8; 8];
-    b.copy_from_slice(&bytes[220..228]);
+    b.copy_from_slice(&bytes[208..216]);
     u64::from_le_bytes(b)
 }
 
