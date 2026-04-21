@@ -99,8 +99,10 @@ naive-then-succinct implementation order is the open work item.
 See
 [`docs/DESIGN.md`](docs/DESIGN.md),
 [`docs/QUERY_ENGINE_INTEGRATION.md`](docs/QUERY_ENGINE_INTEGRATION.md),
+[`docs/HNSW_GRAPH_ENCODING.md`](docs/HNSW_GRAPH_ENCODING.md),
 and
-[`docs/HNSW_GRAPH_ENCODING.md`](docs/HNSW_GRAPH_ENCODING.md).
+[`docs/FACULTY_INTEGRATION.md`](docs/FACULTY_INTEGRATION.md) for
+the rust-script faculty consumption pattern.
 
 ## License
 
