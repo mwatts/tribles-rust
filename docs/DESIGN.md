@@ -325,9 +325,15 @@ On current laptop hardware:
 - Term sort: 300 k × log₂(300 k) × 32-byte compare ≈ 50 ms.
 - Score computation: 18 M FMA-ish float ops ≈ 50 ms.
 
-So **~3 s single-threaded** for the full corpus. A multi-threaded
-builder (shard by doc, merge the per-shard tf maps) would cut
-this to ~1 s on an 8-core laptop. Not yet implemented.
+So **~3 s single-threaded** for the full corpus.
+`BM25Builder::build_with_threads(n)` shards docs across `n`
+scoped threads (std::thread::scope, no rayon dep) and merges
+per-shard tf maps at the end. Observed speedups at 4 threads
+on a laptop: ~1.2× at 10 k docs, ~1.3× at 50 k — the merge
+cost stays serial and caps the win. Byte-identical output vs.
+single-threaded. A term-partitioned variant would push further
+but needs a routing hash per insert; filed as future work when
+build-time actually bites.
 
 ### BM25 — query latency
 
