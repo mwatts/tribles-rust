@@ -43,135 +43,171 @@ The BM25 index is therefore a general `(doc: Id, term: Value, score)`
 relation with IDF and length-normalized scoring baked in at build
 time.
 
-## `SuccinctBM25Index` blob layout
+## `SuccinctBM25Index` — SB25 blob layout
 
-Single self-contained blob, loaded zero-copy via jerky/anybytes.
+Self-contained blob, zero-copy via `anybytes::Bytes`, bit-packed
+via jerky. Schema id: `68C03764D04D05DF65E49589FBBA1441` (see
+`succinct::SuccinctBM25Blob`).
 
 ```
-[header              ] 32 B
-  magic                   u32   ; "BM25"
+[header              ] 212 B (fixed)
+  magic                   u32    ; "SB25"
   version                 u16
   reserved                u16
-  n_docs                  u32
-  n_terms                 u32
-  avg_doc_len             f32   ; for length normalization
-  k1                      f32   ; BM25 tuning (default 1.5)
-  b                       f32   ; BM25 tuning (default 0.75)
+  avg_doc_len             f32    ; for length normalization
+  k1                      f32    ; BM25 tuning (default 1.5)
+  b                       f32    ; BM25 tuning (default 0.75)
+  n_docs                  u64
+  n_terms                 u64
+  doc_lens_meta           32 B   ; CompactVectorMetaOnDisk
+  postings_doc_idx_meta   32 B   ; CompactVectorMetaOnDisk
+  postings_offsets_meta   32 B   ; CompactVectorMetaOnDisk
+  (section_offset, section_len) × 5 = 80 B
 
-[doc_id_table        ] n_docs × 16 B
-  doc_id                  [u8; 16]   ; entity Ids in index-local order
-
-[doc_len_table       ] n_docs × u32
-  doc_len                 u32   ; token count (raw, pre-norm)
-
-[term_table          ] n_terms × 32 B
-  term_value              [u8; 32]   ; sorted ascending for binary search
-
-[postings_offsets    ] (n_terms + 1) × u64
-  cumulative offsets into the postings byte array
-
-[postings            ] variable
-  for each term, a sorted-doc-id posting list with per-doc score:
-    doc_idx                jerky-encoded u32
-    score                  f16 or quantized u16
+[doc_ids             ] n_docs × 16 B   ; flat RawId table
+[terms               ] n_terms × 32 B  ; sorted RawValue table
+[doc_lens            ] variable         ; jerky CompactVector body
+                                        ; width = ceil(log2(max_len + 1))
+[postings_idx        ] variable         ; jerky CompactVectors for
+                                        ;   doc_idx  (width log2(n_docs+1))
+                                        ;   offsets  (width log2(total+1))
+                                        ; both within one ByteArea
+[postings_score      ] total × 4 B      ; flat f32 LE scores
 ```
+
+The three `CompactVectorMetaOnDisk` structs are a
+[`zerocopy::IntoBytes`]-deriveable mirror of jerky's
+`CompactVectorMeta` (jerky's upstream derives only `FromBytes`).
+Four `u64` fields, 32 bytes each, `#[repr(C)]` — static asserts
+in `succinct.rs` lock the layout equivalence on 64-bit targets.
 
 Lookup algorithm:
-1. Binary-search `term_value` in `term_table` → term index *t*.
-2. Read postings slice `[offsets[t] .. offsets[t+1]]`.
-3. Iterate `(doc_idx, score)` pairs; join with `doc_id_table` to
-   get external `Id`s.
+1. Binary-search the term in `terms` (FixedBytesTable) → term
+   index *t*.
+2. Read `(offsets[t], offsets[t+1])` from the postings offsets
+   CompactVector.
+3. For each *i* in that range, read `doc_idx[i]` from the
+   postings doc_idx CompactVector and `score[i]` from the flat
+   f32 region; join `doc_ids[doc_idx]` to recover the external
+   `Id`.
 
-Write-only cost: one binary search per query term, one linear walk
-per term's posting list. No random access beyond that.
+### What's already compressed (as of the current impl)
 
-### Later compression
+- `doc_lens` → bit-packed to `ceil(log2(max_len + 1))` bits.
+  At 100k docs with avg_doc_len ≈ 180 and max ≈ 1024, ~10 bits
+  instead of 32 — 3.2× savings on that section.
+- `postings.doc_idx` → bit-packed to `ceil(log2(n_docs + 1))`.
+  At 100k docs, 17 bits instead of 32 — 1.9× savings.
+- `postings.offsets` → bit-packed likewise.
 
-The initial implementation stores `term_table` as a flat sorted
-array and postings as packed `(doc_idx, score)` pairs. A
-jerky-backed version swaps in a **wavelet matrix on `term_id`**
-for rank/select over terms and on `doc_idx` for posting lookup,
-plus ELF/Simple16 compression on score deltas. The API stays
-identical.
+### What's still flat (deliberately)
 
-The swap will follow jerky's own `Serializable` pattern:
+- `doc_ids` — 16 bytes per id is already the Id's natural size.
+  Zero-copy slicing via `FixedBytesTable<16>` is as small as we
+  can get without hashing or dedup, neither of which apply.
+- `terms` — 32 bytes each (Blake3 hash). A wavelet matrix over
+  a byte-quantized prefix + flat tails would compress the term
+  *table*, but 9.6 MiB at 100k docs is small enough that
+  correctness-first wins.
+- `postings_score` — still f32. Quantization to u16 (with a
+  global min/max scale) is the next obvious win: postings at
+  100k docs would shrink from 4 B to 2 B per score, which is
+  ~36 MiB → 18 MiB. Blocker: the constraint's `(s - bound).abs()
+  < f32::EPSILON` equality check would need to widen its
+  tolerance to roughly `(max - min) / 65535` to accept
+  dequantized scores as equal to their originals.
 
-```rust
-// Example shape — mirrors jerky/src/serialization.rs.
-#[repr(C)]
-#[derive(zerocopy::FromBytes, KnownLayout, Immutable)]
-pub struct BM25IndexMeta {
-    // Fixed-size offsets + counts into the Bytes region.
-    n_docs: u32,
-    n_terms: u32,
-    term_table_offset: u64,
-    postings_offset: u64,
-    // ... etc.
-}
+### Open compression directions
 
-impl Serializable for BM25Index {
-    type Meta = BM25IndexMeta;
-    type Error = BM25LoadError;
-    fn metadata(&self) -> Self::Meta { ... }
-    fn from_bytes(meta: Self::Meta, bytes: Bytes) -> Result<Self, Self::Error> {
-        // Slice `bytes` using offsets from `meta`, no copies.
-    }
-}
+- **Wavelet matrix on the term table** — would let rank/select
+  queries hit terms without a linear-compare binary search,
+  plus some compression via shared-prefix grouping. Worth
+  it when `n_terms * 32 B` starts to dominate.
+- **Delta-encoded posting doc_idx** — posting lists are already
+  doc-sorted, so consecutive deltas compress further via
+  Simple16 / ELF / VByte. Roughly halves the `doc_idx` section
+  at Heaps-law corpora.
+- **Score quantization** — described above; gated on the
+  constraint-tolerance question.
+
+## `SuccinctHNSWIndex` — SH25 blob layout
+
+Self-contained blob, zero-copy via `anybytes::Bytes`. Schema id:
+`7AFE59E7F895B23F05452FF7919E12E4` (see
+`succinct::SuccinctHNSWBlob`).
+
 ```
-
-The blob body will be `[meta_bytes | arena_bytes]` with the meta
-prefix at a fixed size so `try_from_bytes` can `zerocopy::from_bytes`
-the prefix, wrap the tail as a `Bytes`, and build the view in
-constant time.
-
-## `SuccinctHNSWIndex` blob layout
-
-Unlabeled-edge HNSW, inspired by SuccinctArchive's RING index but
-saving 3x the wavelet matrices since HNSW edges carry no labels
-(just node ↔ node).
-
-```
-[header              ] 64 B
-  magic                   u32   ; "HNSW"
+[header              ] 152 B (fixed)
+  magic                   u32    ; "SH25"
   version                 u16
-  n_nodes                 u32
-  n_layers                u8
+  reserved                u16
   dim                     u32
-  entry_point             u32   ; index of the top-layer entry node
-  M                       u16   ; max neighbours per layer (non-zero level)
-  M0                      u16   ; max neighbours on layer 0
-  ef_construction         u16
+  m                       u16    ; max neighbours on non-zero layers
+  m0                      u16    ; max neighbours on layer 0
+  max_level               u8
+  reserved                u8
+  has_entry_point         u8
+  reserved                u8
+  entry_point             u32
+  n_nodes                 u64
+  n_layers                u64
+  graph_neighbours_meta   32 B   ; CompactVectorMetaOnDisk
+  graph_offsets_meta      32 B   ; CompactVectorMetaOnDisk
+  (section_offset, section_len) × 3 = 48 B
 
-[doc_id_table        ] n_nodes × 16 B
-  doc_id                  [u8; 16]
-
-[embeddings          ] n_nodes × dim × f32
-  raw vectors (f32 for v1; f16 or PQ codes later)
-
-[layer_directory     ] n_layers × 4 B
-  layer_size              u32   ; number of nodes present on this layer
-
-[layer_graphs        ] per layer, a wavelet matrix over
-                       (source, neighbour) pairs — source is the
-                       node's local index on that layer, neighbour
-                       is its global node id. Rank/select gives
-                       O(log n) neighbour iteration.
+[doc_ids             ] n_nodes × 16 B
+[vectors             ] n_nodes × dim × 4 B    ; flat f32 LE,
+                                              ; L2-normalized at insert
+[graph_bytes         ] variable               ; two CompactVectors in one
+                                              ; ByteArea:
+                                              ;   neighbours (width log2(n+1))
+                                              ;   offsets    (width log2(E+1))
 ```
 
-Query algorithm (standard HNSW greedy search):
-1. Start at `entry_point` on the top layer.
-2. Greedy-descend: at each layer, iterate current node's
-   neighbours, keep the closest to the query. Walk until no
-   improvement.
-3. On layer 0, do ef-width beam search, return top-k.
+`graph_bytes` packs neighbour lists across all `(layer, node)`
+pairs into a flat CSR: `offsets[L·(n+1) + i]` gives the start of
+node *i*'s neighbour list on layer *L* inside `neighbours`. Nodes
+absent from layer *L* encode as empty slices — search walks stay
+correct because an empty neighbour list is a dead end, and the
+search always enters from the top-level entry point.
 
-### Later compression
+Query algorithm (standard Malkov-Yashunin search):
+1. Start at `entry_point` on `max_level`.
+2. Greedy-descend layer-by-layer down to 1.
+3. On layer 0, ef-width beam search, return top-k.
 
-V1 stores embeddings as raw `f32` and layer graphs via a simple
-CSR (sources offset + dense neighbour array). The jerky-backed
-version replaces CSR with one wavelet matrix per layer for
-rank-select neighbour enumeration, and may quantize embeddings
-(f16, int8, or PQ).
+The succinct path re-implements the greedy + ef-search against
+the bit-packed graph; see `SuccinctHNSWIndex::similar` in
+`src/succinct.rs`.
+
+### What's already compressed
+
+- Graph `neighbours` → `ceil(log2(n_nodes + 1))` bits per
+  neighbour index (17 bits at 100k nodes vs. 32 bits raw).
+- Graph `offsets` → `ceil(log2(total_edges + 1))` bits per
+  offset, which for `M=16` / `M0=32` averages similar savings.
+
+### What's still flat
+
+- `doc_ids` — 16-byte natural size.
+- `vectors` — raw f32. Caller-owned data; compression is the
+  caller's decision via their embedding schema choice (the
+  crate itself stays agnostic).
+
+### Open compression directions
+
+- **Wavelet matrix on the neighbour column** — exactly the RING
+  encoding, just without the predicate/label column that
+  `SuccinctArchive` needs. Gives `rank` / `select` on neighbour
+  ids for free, which helps with reverse-neighbour lookup and
+  further bit-packing via the BWT-like ordering. Saves maybe
+  another ~1.5× on the graph bytes; worth doing when the
+  HNSW graph starts to matter.
+- **Vector quantization** — the caller owns the embedding
+  schema. Future work: a `SuccinctHNSWBlob` variant (or a
+  separate schema id) that stores `[u8; dim]` quantized vectors
+  with per-component min/max scaling, or PQ codes. Keeps the
+  graph untouched.
 
 ## Query engine integration
 
