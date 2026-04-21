@@ -27,6 +27,7 @@ use triblespace::core::value::schemas::genid::GenId;
 use triblespace::core::value::RawValue;
 
 use crate::bm25::BM25Index;
+use crate::hnsw::FlatIndex;
 
 /// Constrains a `Variable<GenId>` (doc) to entity ids in the
 /// posting list of the pinned term.
@@ -74,6 +75,117 @@ fn id_to_raw_value(id: Id) -> RawValue {
     let raw: &RawId = id.as_ref();
     out[16..32].copy_from_slice(raw);
     out
+}
+
+// ── FlatIndex constraint ─────────────────────────────────────────────
+
+/// Constrains a `Variable<GenId>` (doc) to the top-`k` neighbours
+/// of a pinned query vector under cosine similarity.
+///
+/// Created via [`FlatIndex::similar_constraint`]. The `query_vec`
+/// and `k` are parameters of the constraint, not bound variables
+/// — per `docs/QUERY_ENGINE_INTEGRATION.md`'s design, this
+/// matches how similarity is actually used (the query is a
+/// concrete embedding, not something the engine solves for).
+pub struct SimilarToVector<'a> {
+    index: &'a FlatIndex,
+    doc: Variable<GenId>,
+    query: Vec<f32>,
+    k: usize,
+}
+
+impl<'a> SimilarToVector<'a> {
+    pub fn new(index: &'a FlatIndex, doc: Variable<GenId>, query: Vec<f32>, k: usize) -> Self {
+        Self {
+            index,
+            doc,
+            query,
+            k,
+        }
+    }
+}
+
+impl FlatIndex {
+    /// Build a [`SimilarToVector`] constraint for use inside
+    /// `pattern!` / `find!`.
+    pub fn similar_constraint(
+        &self,
+        doc: Variable<GenId>,
+        query: Vec<f32>,
+        k: usize,
+    ) -> SimilarToVector<'_> {
+        SimilarToVector::new(self, doc, query, k)
+    }
+}
+
+impl<'a> Constraint<'a> for SimilarToVector<'a> {
+    fn variables(&self) -> VariableSet {
+        VariableSet::new_singleton(self.doc.index)
+    }
+
+    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
+        if self.doc.index == variable {
+            // We'll emit at most `k` hits; `k` is a hard upper
+            // bound on the proposal count, so it's also our
+            // cardinality estimate.
+            Some(self.k.min(self.index.doc_count()))
+        } else {
+            None
+        }
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        _binding: &Binding,
+        proposals: &mut Vec<RawValue>,
+    ) {
+        if self.doc.index != variable {
+            return;
+        }
+        for (doc_id, _score) in self.index.similar(&self.query, self.k) {
+            proposals.push(id_to_raw_value(doc_id));
+        }
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _binding: &Binding,
+        proposals: &mut Vec<RawValue>,
+    ) {
+        if self.doc.index != variable {
+            return;
+        }
+        // Collect the top-k result ids and keep only proposals
+        // whose doc appears in that set.
+        let top: HashSet<Id> = self
+            .index
+            .similar(&self.query, self.k)
+            .into_iter()
+            .map(|(d, _)| d)
+            .collect();
+        proposals.retain(|raw| {
+            raw_value_to_id(raw)
+                .map(|id| top.contains(&id))
+                .unwrap_or(false)
+        });
+    }
+
+    fn satisfied(&self, binding: &Binding) -> bool {
+        match binding.get(self.doc.index) {
+            Some(raw) => {
+                let Some(doc_id) = raw_value_to_id(raw) else {
+                    return false;
+                };
+                self.index
+                    .similar(&self.query, self.k)
+                    .into_iter()
+                    .any(|(d, _)| d == doc_id)
+            }
+            None => true,
+        }
+    }
 }
 
 impl<'a> Constraint<'a> for DocsContainingTerm<'a> {
@@ -260,6 +372,99 @@ mod tests {
         // Bound to a non-matching doc → unsatisfied.
         let mut unmatching = Binding::default();
         unmatching.set(doc.index, &id_to_raw_value(id(2)));
+        assert!(!c.satisfied(&unmatching));
+    }
+
+    fn sample_flat() -> FlatIndex {
+        use crate::hnsw::FlatBuilder;
+        let mut b = FlatBuilder::new(3);
+        b.insert(id(1), vec![1.0, 0.0, 0.0]).unwrap();
+        b.insert(id(2), vec![0.0, 1.0, 0.0]).unwrap();
+        b.insert(id(3), vec![0.9, 0.1, 0.0]).unwrap();
+        b.insert(id(4), vec![0.0, 0.0, 1.0]).unwrap();
+        b.build()
+    }
+
+    #[test]
+    fn similar_constraint_estimate_is_k() {
+        let idx = sample_flat();
+        let mut ctx = triblespace::core::query::VariableContext::new();
+        let doc: Variable<GenId> = ctx.next_variable();
+        let c = idx.similar_constraint(doc, vec![1.0, 0.0, 0.0], 2);
+
+        let binding = Binding::default();
+        // k=2 and corpus has 4 docs → estimate is 2.
+        assert_eq!(c.estimate(doc.index, &binding), Some(2));
+    }
+
+    #[test]
+    fn similar_constraint_estimate_clamps_to_corpus() {
+        let idx = sample_flat();
+        let mut ctx = triblespace::core::query::VariableContext::new();
+        let doc: Variable<GenId> = ctx.next_variable();
+        // Larger k than corpus — estimate must clamp to doc_count.
+        let c = idx.similar_constraint(doc, vec![1.0, 0.0, 0.0], 100);
+        let binding = Binding::default();
+        assert_eq!(c.estimate(doc.index, &binding), Some(4));
+    }
+
+    #[test]
+    fn similar_constraint_proposes_top_k() {
+        let idx = sample_flat();
+        let mut ctx = triblespace::core::query::VariableContext::new();
+        let doc: Variable<GenId> = ctx.next_variable();
+        let c = idx.similar_constraint(doc, vec![1.0, 0.0, 0.0], 2);
+
+        let binding = Binding::default();
+        let mut props = Vec::new();
+        c.propose(doc.index, &binding, &mut props);
+        let ids: HashSet<Id> =
+            props.iter().map(|r| raw_value_to_id(r).unwrap()).collect();
+        // top-2 for [1,0,0] query should be id(1) (exact) and id(3) (close).
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&id(1)));
+        assert!(ids.contains(&id(3)));
+    }
+
+    #[test]
+    fn similar_constraint_confirm_filters_non_top_k() {
+        let idx = sample_flat();
+        let mut ctx = triblespace::core::query::VariableContext::new();
+        let doc: Variable<GenId> = ctx.next_variable();
+        let c = idx.similar_constraint(doc, vec![1.0, 0.0, 0.0], 2);
+
+        let binding = Binding::default();
+        let mut props: Vec<RawValue> = vec![
+            id_to_raw_value(id(1)),
+            id_to_raw_value(id(2)), // not in top-2
+            id_to_raw_value(id(3)),
+            id_to_raw_value(id(4)), // not in top-2
+        ];
+        c.confirm(doc.index, &binding, &mut props);
+        let ids: HashSet<Id> =
+            props.iter().map(|r| raw_value_to_id(r).unwrap()).collect();
+        assert!(ids.contains(&id(1)));
+        assert!(!ids.contains(&id(2)));
+        assert!(ids.contains(&id(3)));
+        assert!(!ids.contains(&id(4)));
+    }
+
+    #[test]
+    fn similar_constraint_satisfied_checks_bound_doc() {
+        let idx = sample_flat();
+        let mut ctx = triblespace::core::query::VariableContext::new();
+        let doc: Variable<GenId> = ctx.next_variable();
+        let c = idx.similar_constraint(doc, vec![1.0, 0.0, 0.0], 2);
+
+        // Unbound → trivially satisfied.
+        assert!(c.satisfied(&Binding::default()));
+        // Bound to an in-top-k doc → satisfied.
+        let mut bound = Binding::default();
+        bound.set(doc.index, &id_to_raw_value(id(1)));
+        assert!(c.satisfied(&bound));
+        // Bound to a not-in-top-k doc → unsatisfied.
+        let mut unmatching = Binding::default();
+        unmatching.set(doc.index, &id_to_raw_value(id(4)));
         assert!(!c.satisfied(&unmatching));
     }
 
