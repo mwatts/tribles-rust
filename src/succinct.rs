@@ -1562,14 +1562,12 @@ impl std::fmt::Display for SuccinctLoadError {
 
 impl std::error::Error for SuccinctLoadError {}
 
-/// Content-addressed [`BlobSchema`] marker for the real succinct
+/// Content-addressed [`BlobSchema`] marker for the succinct
 /// BM25 blob format (SB25 / 212 B header + bit-packed body).
 ///
 /// Schema id minted via `trible genid`:
-/// `68C03764D04D05DF65E49589FBBA1441`. Distinct from
-/// [`crate::bm25::SuccinctBM25Index`] (the legacy marker that
-/// currently wraps the naive format during the succinct
-/// transition).
+/// `68C03764D04D05DF65E49589FBBA1441`. This is the canonical
+/// on-pile representation of a BM25 index in this crate.
 pub enum SuccinctBM25Blob {}
 
 impl ConstId for SuccinctBM25Blob {

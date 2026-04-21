@@ -1,23 +1,15 @@
 //! Approximate nearest-neighbour search over caller-supplied
 //! embeddings.
 //!
-//! `SuccinctHNSWIndex` is the content-addressed blob;
-//! `HNSWIndex` is the zero-copy view produced by `try_from_blob`.
+//! [`HNSWIndex`] is the naive layered-graph implementation
+//! (Malkov & Yashunin 2018). It's the builder + in-memory
+//! representation; convert to [`crate::succinct::SuccinctHNSWIndex`]
+//! and use `SuccinctHNSWBlob` for the content-addressed on-pile
+//! form.
 //!
-//! The succinct encoding uses one wavelet matrix per HNSW layer
-//! for `(source, neighbour)` pairs — same RING approach as
-//! `SuccinctArchive`'s trible graph, but unlabeled (no predicate
-//! column), so we only pay for one wavelet matrix per layer
-//! instead of three.
-//!
-//! # Current status
-//!
-//! This module ships a **flat** k-NN stand-in ([`FlatIndex`])
-//! first — brute-force cosine over all vectors. Correct, simple,
-//! useful for ≤ 100k docs, and exercises the same builder/query
-//! API that the proper HNSW graph (next iteration) will
-//! implement. That keeps callers' code stable while we swap the
-//! inner data structure.
+//! [`FlatIndex`] is the brute-force exact cosine baseline — useful
+//! for ≤ 100k docs, for ground-truth recall checks, and for
+//! doctest examples without the graph build overhead.
 //!
 //! # Build and query
 //!
@@ -38,10 +30,7 @@
 //! assert_eq!(hits[1].0, Id::new([3; 16]).unwrap());
 //! ```
 
-use triblespace::core::blob::{Blob, BlobSchema, Bytes, ToBlob, TryFromBlob};
 use triblespace::core::id::{Id, RawId};
-use triblespace::core::id_hex;
-use triblespace::core::metadata::ConstId;
 
 use crate::FORMAT_VERSION;
 
@@ -119,33 +108,6 @@ impl std::fmt::Display for FlatLoadError {
 }
 
 impl std::error::Error for FlatLoadError {}
-
-/// Content-addressed `BlobSchema` marker for the (eventual)
-/// succinct HNSW index. The schema id is fixed now — minted via
-/// `trible genid` — even though the byte layout will land in a
-/// later iteration. Consumers that reference the id in metadata
-/// can do so safely today and pick up the real blob bytes when
-/// the schema is implemented.
-pub enum SuccinctHNSWIndex {}
-
-impl ConstId for SuccinctHNSWIndex {
-    const ID: Id = id_hex!("1D235813CE96AC70B8A4D0490810D720");
-}
-
-impl BlobSchema for SuccinctHNSWIndex {}
-
-impl ToBlob<SuccinctHNSWIndex> for &HNSWIndex {
-    fn to_blob(self) -> Blob<SuccinctHNSWIndex> {
-        Blob::new(Bytes::from_source(self.to_bytes()))
-    }
-}
-
-impl TryFromBlob<SuccinctHNSWIndex> for HNSWIndex {
-    type Error = HNSWLoadError;
-    fn try_from_blob(b: Blob<SuccinctHNSWIndex>) -> Result<Self, Self::Error> {
-        HNSWIndex::try_from_bytes(b.bytes.as_ref())
-    }
-}
 
 // ── Proper HNSW graph (layered, approximate k-NN) ─────────────────
 
@@ -1579,12 +1541,4 @@ mod tests {
         assert_eq!(err, HNSWLoadError::BadMagic);
     }
 
-    #[test]
-    fn hnsw_blob_schema_round_trip() {
-        use triblespace::core::blob::{ToBlob, TryFromBlob};
-        let idx = sample_hnsw();
-        let blob: triblespace::core::blob::Blob<SuccinctHNSWIndex> = (&idx).to_blob();
-        let reloaded = HNSWIndex::try_from_blob(blob).expect("valid blob");
-        assert_eq!(reloaded.doc_count(), idx.doc_count());
-    }
 }
