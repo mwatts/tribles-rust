@@ -11,6 +11,13 @@ readme = "README.md"
 keywords = ["triblespace", "bm25", "hnsw", "search", "succinct"]
 categories = ["data-structures", "text-processing"]
 
+[dev-dependencies]
+# tempfile — used by integration tests that exercise an on-disk
+# triblespace Pile round-trip. Already in the tree via triblespace
+# transitively; declaring it here keeps the tests building even
+# if the transitive chain changes.
+tempfile = "3"
+
 [dependencies]
 triblespace = "0.36"
 anybytes = "0.20"
