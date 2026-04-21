@@ -21,7 +21,6 @@
 
 use std::collections::HashSet;
 
-use triblespace::core::id::{Id, RawId};
 use triblespace::core::query::{Binding, Constraint, Variable, VariableId, VariableSet};
 use triblespace::core::value::schemas::genid::GenId;
 use triblespace::core::value::RawValue;
@@ -104,14 +103,17 @@ impl BM25Queryable for crate::succinct::SuccinctBM25Index {
 pub trait HNSWQueryable {
     /// Approximate top-`k` nearest neighbours to `query` under
     /// cosine similarity, with optional `ef` search width.
-    fn similar_for(&self, query: &[f32], k: usize, ef: Option<usize>) -> Vec<(Id, f32)>;
+    /// Returns stored 32-byte [`RawValue`] keys — callers with a
+    /// `GenId`-schema index decode via the `raw_value_to_id`
+    /// helper in `constraint.rs`.
+    fn similar_for(&self, query: &[f32], k: usize, ef: Option<usize>) -> Vec<(RawValue, f32)>;
 
     /// Total indexed docs (for cardinality estimates).
     fn doc_count_for(&self) -> usize;
 }
 
 impl HNSWQueryable for HNSWIndex {
-    fn similar_for(&self, query: &[f32], k: usize, ef: Option<usize>) -> Vec<(Id, f32)> {
+    fn similar_for(&self, query: &[f32], k: usize, ef: Option<usize>) -> Vec<(RawValue, f32)> {
         self.similar(query, k, ef)
     }
     fn doc_count_for(&self) -> usize {
@@ -121,7 +123,7 @@ impl HNSWQueryable for HNSWIndex {
 
 #[cfg(feature = "succinct")]
 impl HNSWQueryable for crate::succinct::SuccinctHNSWIndex {
-    fn similar_for(&self, query: &[f32], k: usize, ef: Option<usize>) -> Vec<(Id, f32)> {
+    fn similar_for(&self, query: &[f32], k: usize, ef: Option<usize>) -> Vec<(RawValue, f32)> {
         self.similar(query, k, ef)
     }
     fn doc_count_for(&self) -> usize {
@@ -175,25 +177,6 @@ impl BM25Index {
     {
         DocsContainingTerm::new(self, doc, term)
     }
-}
-
-/// Convert a `GenId`-schema raw value (zero-padded in bytes
-/// [0..16], Id in [16..32]) back to an `Id`. Returns `None` for
-/// malformed / nil values.
-fn raw_value_to_id(raw: &RawValue) -> Option<Id> {
-    if raw[0..16] != [0u8; 16] {
-        return None;
-    }
-    let raw_id: RawId = raw[16..32].try_into().ok()?;
-    Id::new(raw_id)
-}
-
-/// Encode an `Id` as a `GenId`-schema raw value.
-fn id_to_raw_value(id: Id) -> RawValue {
-    let mut out = [0u8; 32];
-    let raw: &RawId = id.as_ref();
-    out[16..32].copy_from_slice(raw);
-    out
 }
 
 /// Encode an `f32` as an `F32LE`-schema raw value (bytes [0..4]
@@ -419,8 +402,8 @@ impl<'a> Constraint<'a> for SimilarToVector<'a> {
         if self.doc.index != variable {
             return;
         }
-        for (doc_id, _score) in self.index.similar(&self.query, self.k) {
-            proposals.push(id_to_raw_value(doc_id));
+        for (key, _score) in self.index.similar(&self.query, self.k) {
+            proposals.push(key);
         }
     }
 
@@ -428,32 +411,24 @@ impl<'a> Constraint<'a> for SimilarToVector<'a> {
         if self.doc.index != variable {
             return;
         }
-        // Collect the top-k result ids and keep only proposals
+        // Collect the top-k result keys and keep only proposals
         // whose doc appears in that set.
-        let top: HashSet<Id> = self
+        let top: HashSet<RawValue> = self
             .index
             .similar(&self.query, self.k)
             .into_iter()
-            .map(|(d, _)| d)
+            .map(|(k, _)| k)
             .collect();
-        proposals.retain(|raw| {
-            raw_value_to_id(raw)
-                .map(|id| top.contains(&id))
-                .unwrap_or(false)
-        });
+        proposals.retain(|raw| top.contains(raw));
     }
 
     fn satisfied(&self, binding: &Binding) -> bool {
         match binding.get(self.doc.index) {
-            Some(raw) => {
-                let Some(doc_id) = raw_value_to_id(raw) else {
-                    return false;
-                };
-                self.index
-                    .similar(&self.query, self.k)
-                    .into_iter()
-                    .any(|(d, _)| d == doc_id)
-            }
+            Some(raw) => self
+                .index
+                .similar(&self.query, self.k)
+                .into_iter()
+                .any(|(k, _)| k == *raw),
             None => true,
         }
     }
@@ -522,22 +497,22 @@ impl<'a> Constraint<'a> for SimilarToVectorScored<'a> {
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
         if variable == self.doc.index {
             let bound_score = binding.get(self.score.index).map(raw_value_to_f32);
-            for (doc_id, score) in self.index.similar(&self.query, self.k) {
+            for (key, score) in self.index.similar(&self.query, self.k) {
                 if let Some(bs) = bound_score {
                     if (score - bs).abs() > f32::EPSILON {
                         continue;
                     }
                 }
-                proposals.push(id_to_raw_value(doc_id));
+                proposals.push(key);
             }
         } else if variable == self.score.index {
-            let bound_doc = binding.get(self.doc.index).and_then(raw_value_to_id);
+            let bound_doc: Option<RawValue> = binding.get(self.doc.index).copied();
             // Dedupe by bit-pattern to avoid Cartesian blow-up
             // when two neighbours share a similarity value.
             let mut seen = HashSet::new();
-            for (doc_id, score) in self.index.similar(&self.query, self.k) {
+            for (key, score) in self.index.similar(&self.query, self.k) {
                 if let Some(bd) = bound_doc {
-                    if doc_id != bd {
+                    if key != bd {
                         continue;
                     }
                 }
@@ -549,28 +524,24 @@ impl<'a> Constraint<'a> for SimilarToVectorScored<'a> {
     }
 
     fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
-        let top: Vec<(Id, f32)> = self.index.similar(&self.query, self.k);
+        let top: Vec<(RawValue, f32)> = self.index.similar(&self.query, self.k);
         if variable == self.doc.index {
             let bound_score = binding.get(self.score.index).map(raw_value_to_f32);
-            let allowed: HashSet<Id> = top
+            let allowed: HashSet<RawValue> = top
                 .iter()
                 .filter(|(_, s)| match bound_score {
                     Some(bs) => (s - bs).abs() <= f32::EPSILON,
                     None => true,
                 })
-                .map(|(d, _)| *d)
+                .map(|(k, _)| *k)
                 .collect();
-            proposals.retain(|raw| {
-                raw_value_to_id(raw)
-                    .map(|id| allowed.contains(&id))
-                    .unwrap_or(false)
-            });
+            proposals.retain(|raw| allowed.contains(raw));
         } else if variable == self.score.index {
-            let bound_doc = binding.get(self.doc.index).and_then(raw_value_to_id);
+            let bound_doc: Option<RawValue> = binding.get(self.doc.index).copied();
             let allowed: HashSet<u32> = top
                 .iter()
-                .filter(|(d, _)| match bound_doc {
-                    Some(bd) => *d == bd,
+                .filter(|(k, _)| match bound_doc {
+                    Some(bd) => *k == bd,
                     None => true,
                 })
                 .map(|(_, s)| s.to_bits())
@@ -580,7 +551,7 @@ impl<'a> Constraint<'a> for SimilarToVectorScored<'a> {
     }
 
     fn satisfied(&self, binding: &Binding) -> bool {
-        let bound_doc = binding.get(self.doc.index).and_then(raw_value_to_id);
+        let bound_doc: Option<RawValue> = binding.get(self.doc.index).copied();
         let bound_score = binding.get(self.score.index).map(raw_value_to_f32);
         match (bound_doc, bound_score) {
             (None, None) => true,
@@ -588,8 +559,8 @@ impl<'a> Constraint<'a> for SimilarToVectorScored<'a> {
                 .index
                 .similar(&self.query, self.k)
                 .iter()
-                .any(|&(d, s)| {
-                    bound_doc.map_or(true, |bd| d == bd)
+                .any(|&(k, s)| {
+                    bound_doc.map_or(true, |bd| k == bd)
                         && bound_score.map_or(true, |bs| (s - bs).abs() <= f32::EPSILON)
                 }),
         }
@@ -664,8 +635,8 @@ impl<'a, I: HNSWQueryable + ?Sized + 'a> Constraint<'a> for SimilarToVectorHNSW<
         if self.doc.index != variable {
             return;
         }
-        for (doc_id, _score) in self.index.similar_for(&self.query, self.k, self.ef) {
-            proposals.push(id_to_raw_value(doc_id));
+        for (key, _score) in self.index.similar_for(&self.query, self.k, self.ef) {
+            proposals.push(key);
         }
     }
 
@@ -673,30 +644,22 @@ impl<'a, I: HNSWQueryable + ?Sized + 'a> Constraint<'a> for SimilarToVectorHNSW<
         if self.doc.index != variable {
             return;
         }
-        let top: HashSet<Id> = self
+        let top: HashSet<RawValue> = self
             .index
             .similar_for(&self.query, self.k, self.ef)
             .into_iter()
-            .map(|(d, _)| d)
+            .map(|(k, _)| k)
             .collect();
-        proposals.retain(|raw| {
-            raw_value_to_id(raw)
-                .map(|id| top.contains(&id))
-                .unwrap_or(false)
-        });
+        proposals.retain(|raw| top.contains(raw));
     }
 
     fn satisfied(&self, binding: &Binding) -> bool {
         match binding.get(self.doc.index) {
-            Some(raw) => {
-                let Some(doc_id) = raw_value_to_id(raw) else {
-                    return false;
-                };
-                self.index
-                    .similar_for(&self.query, self.k, self.ef)
-                    .into_iter()
-                    .any(|(d, _)| d == doc_id)
-            }
+            Some(raw) => self
+                .index
+                .similar_for(&self.query, self.k, self.ef)
+                .into_iter()
+                .any(|(k, _)| k == *raw),
             None => true,
         }
     }
@@ -769,22 +732,22 @@ impl<'a, I: HNSWQueryable + ?Sized + 'a> Constraint<'a> for SimilarToVectorHNSWS
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
         if variable == self.doc.index {
             let bound_score = binding.get(self.score.index).map(raw_value_to_f32);
-            for (doc_id, score) in self.index.similar_for(&self.query, self.k, self.ef) {
+            for (key, score) in self.index.similar_for(&self.query, self.k, self.ef) {
                 if let Some(bs) = bound_score {
                     if (score - bs).abs() > f32::EPSILON {
                         continue;
                     }
                 }
-                proposals.push(id_to_raw_value(doc_id));
+                proposals.push(key);
             }
         } else if variable == self.score.index {
-            let bound_doc = binding.get(self.doc.index).and_then(raw_value_to_id);
+            let bound_doc: Option<RawValue> = binding.get(self.doc.index).copied();
             // Dedupe by bit-pattern to avoid Cartesian blow-up
             // when two neighbours share a similarity value.
             let mut seen = HashSet::new();
-            for (doc_id, score) in self.index.similar_for(&self.query, self.k, self.ef) {
+            for (key, score) in self.index.similar_for(&self.query, self.k, self.ef) {
                 if let Some(bd) = bound_doc {
-                    if doc_id != bd {
+                    if key != bd {
                         continue;
                     }
                 }
@@ -799,25 +762,21 @@ impl<'a, I: HNSWQueryable + ?Sized + 'a> Constraint<'a> for SimilarToVectorHNSWS
         let top = self.index.similar_for(&self.query, self.k, self.ef);
         if variable == self.doc.index {
             let bound_score = binding.get(self.score.index).map(raw_value_to_f32);
-            let allowed: HashSet<Id> = top
+            let allowed: HashSet<RawValue> = top
                 .iter()
                 .filter(|(_, s)| match bound_score {
                     Some(bs) => (s - bs).abs() <= f32::EPSILON,
                     None => true,
                 })
-                .map(|(d, _)| *d)
+                .map(|(k, _)| *k)
                 .collect();
-            proposals.retain(|raw| {
-                raw_value_to_id(raw)
-                    .map(|id| allowed.contains(&id))
-                    .unwrap_or(false)
-            });
+            proposals.retain(|raw| allowed.contains(raw));
         } else if variable == self.score.index {
-            let bound_doc = binding.get(self.doc.index).and_then(raw_value_to_id);
+            let bound_doc: Option<RawValue> = binding.get(self.doc.index).copied();
             let allowed: HashSet<u32> = top
                 .iter()
-                .filter(|(d, _)| match bound_doc {
-                    Some(bd) => *d == bd,
+                .filter(|(k, _)| match bound_doc {
+                    Some(bd) => *k == bd,
                     None => true,
                 })
                 .map(|(_, s)| s.to_bits())
@@ -827,7 +786,7 @@ impl<'a, I: HNSWQueryable + ?Sized + 'a> Constraint<'a> for SimilarToVectorHNSWS
     }
 
     fn satisfied(&self, binding: &Binding) -> bool {
-        let bound_doc = binding.get(self.doc.index).and_then(raw_value_to_id);
+        let bound_doc: Option<RawValue> = binding.get(self.doc.index).copied();
         let bound_score = binding.get(self.score.index).map(raw_value_to_f32);
         match (bound_doc, bound_score) {
             (None, None) => true,
@@ -835,8 +794,8 @@ impl<'a, I: HNSWQueryable + ?Sized + 'a> Constraint<'a> for SimilarToVectorHNSWS
                 .index
                 .similar_for(&self.query, self.k, self.ef)
                 .into_iter()
-                .any(|(d, s)| {
-                    bound_doc.map_or(true, |bd| d == bd)
+                .any(|(k, s)| {
+                    bound_doc.map_or(true, |bd| k == bd)
                         && bound_score.map_or(true, |bs| (s - bs).abs() <= f32::EPSILON)
                 }),
         }
@@ -899,6 +858,7 @@ mod tests {
     use super::*;
     use crate::bm25::BM25Builder;
     use crate::tokens::hash_tokens;
+    use triblespace::core::id::{Id, RawId};
 
     fn id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
@@ -913,6 +873,23 @@ mod tests {
         let id_bytes: &RawId = id.as_ref();
         raw[16..32].copy_from_slice(id_bytes);
         raw
+    }
+
+    /// `GenId`-schema RawValue → `Id` test helper.
+    fn raw_value_to_id(raw: &RawValue) -> Option<Id> {
+        if raw[0..16] != [0u8; 16] {
+            return None;
+        }
+        let raw_id: RawId = raw[16..32].try_into().ok()?;
+        Id::new(raw_id)
+    }
+
+    /// `Id` → `GenId`-schema RawValue test helper.
+    fn id_to_raw_value(id: Id) -> RawValue {
+        let mut out = [0u8; 32];
+        let raw: &RawId = id.as_ref();
+        out[16..32].copy_from_slice(raw);
+        out
     }
 
     fn sample_index() -> BM25Index {
@@ -1033,10 +1010,10 @@ mod tests {
     fn sample_flat() -> FlatIndex {
         use crate::hnsw::FlatBuilder;
         let mut b = FlatBuilder::new(3);
-        b.insert(id(1), vec![1.0, 0.0, 0.0]).unwrap();
-        b.insert(id(2), vec![0.0, 1.0, 0.0]).unwrap();
-        b.insert(id(3), vec![0.9, 0.1, 0.0]).unwrap();
-        b.insert(id(4), vec![0.0, 0.0, 1.0]).unwrap();
+        b.insert_id(id(1), vec![1.0, 0.0, 0.0]).unwrap();
+        b.insert_id(id(2), vec![0.0, 1.0, 0.0]).unwrap();
+        b.insert_id(id(3), vec![0.9, 0.1, 0.0]).unwrap();
+        b.insert_id(id(4), vec![0.0, 0.0, 1.0]).unwrap();
         b.build()
     }
 
@@ -1249,10 +1226,10 @@ mod tests {
     fn sample_hnsw() -> crate::hnsw::HNSWIndex {
         use crate::hnsw::HNSWBuilder;
         let mut b = HNSWBuilder::new(3).with_seed(42);
-        b.insert(id(1), vec![1.0, 0.0, 0.0]).unwrap();
-        b.insert(id(2), vec![0.0, 1.0, 0.0]).unwrap();
-        b.insert(id(3), vec![0.9, 0.1, 0.0]).unwrap();
-        b.insert(id(4), vec![0.0, 0.0, 1.0]).unwrap();
+        b.insert_id(id(1), vec![1.0, 0.0, 0.0]).unwrap();
+        b.insert_id(id(2), vec![0.0, 1.0, 0.0]).unwrap();
+        b.insert_id(id(3), vec![0.9, 0.1, 0.0]).unwrap();
+        b.insert_id(id(4), vec![0.0, 0.0, 1.0]).unwrap();
         b.build()
     }
 

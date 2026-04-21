@@ -252,7 +252,7 @@ fn find_hnsw_similar_on_succinct() {
     for i in 1..=16u8 {
         let f = i as f32;
         let v = vec![f.sin(), f.cos(), (f * 0.5).sin(), (f * 0.3).cos()];
-        b.insert(iid(i), v).unwrap();
+        b.insert_id(iid(i), v).unwrap();
     }
     let naive = b.build();
     let succinct = SuccinctHNSWIndex::from_naive(&naive).unwrap();
@@ -265,7 +265,7 @@ fn find_hnsw_similar_on_succinct() {
     .collect();
     let got: HashSet<Id> = rows.into_iter().map(|(d,)| d).collect();
     let expected: HashSet<Id> = naive
-        .similar(&query, 3, Some(10))
+        .similar_ids(&query, 3, Some(10))
         .into_iter()
         .map(|(d, _)| d)
         .collect();

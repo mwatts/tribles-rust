@@ -77,7 +77,7 @@ fn succinct_hnsw_survives_blob_store_roundtrip() {
     for i in 1..=12u8 {
         let f = i as f32;
         let v = vec![f.sin(), f.cos(), (f * 0.5).sin(), (f * 0.3).cos()];
-        b.insert(iid(i), v).unwrap();
+        b.insert_id(iid(i), v).unwrap();
     }
     let naive = b.build();
     let original = SuccinctHNSWIndex::from_naive(&naive).unwrap();

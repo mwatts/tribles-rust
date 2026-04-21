@@ -71,13 +71,20 @@ pub mod tokens;
 ///
 /// History:
 /// - `1`: initial layout. `doc_ids` was a 16-byte `Id` table.
-/// - `2`: generalized `doc_ids` → `keys`: 32-byte `RawValue`
-///   per entry. Unlocks string / tag / composite-key search
-///   through the same index type. See CHANGELOG.
+/// - `2`: SB25 only — generalized `doc_ids` → `keys`: 32-byte
+///   `RawValue` per entry. Unlocks string / tag / composite-key
+///   search through the same index type. See CHANGELOG.
 /// - `3`: SB25 keys table → `CompressedUniverse` (DACs-byte
 ///   fragment dictionary). Compresses correlated keys (entity
 ///   ids with shared zero-padding, sequential patterns).
 ///   Postings' `doc_idx` now references the universe code
 ///   (sorted position), not insertion order. Header grows by
 ///   40 B for the `CompressedUniverseMeta`.
-pub const FORMAT_VERSION: u16 = 3;
+/// - `4`: HNSW + FLAT blobs: same `doc_ids` → 32-byte `keys`
+///   generalization SB25 got in v2. `HNSWBuilder::insert` and
+///   `FlatBuilder::insert` now take `RawValue`; `insert_id` /
+///   `insert_value<S>` are the typed wrappers. `similar()`
+///   returns `(RawValue, f32)`; `similar_ids()` is the GenId
+///   decoder. Doubles the keys section (16 B → 32 B), ~2 % of
+///   the HNSW blob at typical embedding sizes.
+pub const FORMAT_VERSION: u16 = 4;

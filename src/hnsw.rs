@@ -17,13 +17,13 @@
 //! # use triblespace_search::hnsw::FlatBuilder;
 //! # use triblespace::core::id::Id;
 //! let mut b = FlatBuilder::new(4);
-//! b.insert(Id::new([1; 16]).unwrap(), vec![1.0, 0.0, 0.0, 0.0]).unwrap();
-//! b.insert(Id::new([2; 16]).unwrap(), vec![0.0, 1.0, 0.0, 0.0]).unwrap();
-//! b.insert(Id::new([3; 16]).unwrap(), vec![0.9, 0.1, 0.0, 0.0]).unwrap();
+//! b.insert_id(Id::new([1; 16]).unwrap(), vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+//! b.insert_id(Id::new([2; 16]).unwrap(), vec![0.0, 1.0, 0.0, 0.0]).unwrap();
+//! b.insert_id(Id::new([3; 16]).unwrap(), vec![0.9, 0.1, 0.0, 0.0]).unwrap();
 //! let idx = b.build();
 //!
 //! let query = vec![1.0, 0.0, 0.0, 0.0];
-//! let hits = idx.similar(&query, 2);
+//! let hits = idx.similar_ids(&query, 2);
 //! assert_eq!(hits.len(), 2);
 //! // doc 1 is an exact match, doc 3 nearly so.
 //! assert_eq!(hits[0].0, Id::new([1; 16]).unwrap());
@@ -31,6 +31,7 @@
 //! ```
 
 use triblespace::core::id::{Id, RawId};
+use triblespace::core::value::{RawValue, Value, ValueSchema};
 
 use crate::FORMAT_VERSION;
 
@@ -46,7 +47,6 @@ pub enum HNSWLoadError {
     BadMagic,
     VersionMismatch(u16),
     TruncatedSection(&'static str),
-    NilDocId,
     /// A stored neighbour index is `>= n_nodes`.
     OutOfRangeNeighbour(u32),
     /// A per-node neighbour count was larger than the corpus.
@@ -64,7 +64,6 @@ impl std::fmt::Display for HNSWLoadError {
             Self::TruncatedSection(name) => {
                 write!(f, "HNSW blob: truncated section `{name}`")
             }
-            Self::NilDocId => write!(f, "HNSW blob: nil doc_id"),
             Self::OutOfRangeNeighbour(i) => {
                 write!(f, "HNSW blob: neighbour index {i} ≥ n_nodes")
             }
@@ -93,7 +92,6 @@ pub enum FlatLoadError {
     BadMagic,
     VersionMismatch(u16),
     TruncatedSection(&'static str),
-    NilDocId,
 }
 
 impl std::fmt::Display for FlatLoadError {
@@ -105,7 +103,6 @@ impl std::fmt::Display for FlatLoadError {
                 write!(f, "FLAT blob: version {v} (expected {})", FORMAT_VERSION)
             }
             Self::TruncatedSection(n) => write!(f, "FLAT blob: truncated section `{n}`"),
-            Self::NilDocId => write!(f, "FLAT blob: nil doc_id found"),
         }
     }
 }
@@ -144,7 +141,7 @@ pub struct HNSWBuilder {
     /// SplitMix64 state for deterministic level sampling.
     rng: u64,
     nodes: Vec<HNSWNode>,
-    doc_ids: Vec<Id>,
+    keys: Vec<RawValue>,
     entry_point: Option<u32>,
     max_level: u8,
 }
@@ -168,7 +165,7 @@ impl HNSWBuilder {
             level_mult: 1.0 / (m as f32).ln(),
             rng: 0xC0FFEEu64,
             nodes: Vec::new(),
-            doc_ids: Vec::new(),
+            keys: Vec::new(),
             entry_point: None,
             max_level: 0,
         }
@@ -219,10 +216,17 @@ impl HNSWBuilder {
         l.clamp(0, u8::MAX as i32) as u8
     }
 
-    /// Insert a vector under `doc_id`. The vector is L2-
-    /// normalized in place before storage, so the index uses
-    /// cosine similarity as its distance.
-    pub fn insert(&mut self, doc_id: Id, mut vec: Vec<f32>) -> Result<(), DimMismatch> {
+    /// Insert a vector under `key`. `key` is any 32-byte
+    /// triblespace value identifying the doc (entity id via
+    /// `GenId`, string value, tag, composite — see
+    /// [`insert_id`] / [`insert_value`] for convenience
+    /// wrappers). The vector is L2-normalized in place before
+    /// storage, so the index uses cosine similarity as its
+    /// distance.
+    ///
+    /// [`insert_id`]: Self::insert_id
+    /// [`insert_value`]: Self::insert_value
+    pub fn insert(&mut self, key: RawValue, mut vec: Vec<f32>) -> Result<(), DimMismatch> {
         if vec.len() != self.dim {
             return Err(DimMismatch {
                 expected: self.dim,
@@ -250,7 +254,7 @@ impl HNSWBuilder {
             level: new_level,
             neighbors: vec![Vec::new(); new_level as usize + 1],
         });
-        self.doc_ids.push(doc_id);
+        self.keys.push(key);
 
         // Connect from new_level down to 0.
         if let Some(start) = curr {
@@ -290,6 +294,29 @@ impl HNSWBuilder {
         Ok(())
     }
 
+    /// Convenience: insert a vector keyed by a triblespace
+    /// [`Id`] (16 bytes). Shorthand for `insert(Value::<GenId>
+    /// ::new(id).raw, ...)` — matches the pre-generalization API
+    /// so callers keyed by entity id don't change.
+    pub fn insert_id(&mut self, doc_id: Id, vec: Vec<f32>) -> Result<(), DimMismatch> {
+        let mut raw = [0u8; 32];
+        let id_bytes: &RawId = doc_id.as_ref();
+        raw[16..32].copy_from_slice(id_bytes);
+        self.insert(raw, vec)
+    }
+
+    /// Convenience: insert a vector keyed by a typed
+    /// [`Value<S>`] for any value schema `S` — for example
+    /// `Value<ShortString>` when embedding by title, or
+    /// `Value<Tag>` when embedding by a known tag.
+    pub fn insert_value<S: ValueSchema>(
+        &mut self,
+        key: Value<S>,
+        vec: Vec<f32>,
+    ) -> Result<(), DimMismatch> {
+        self.insert(key.raw, vec)
+    }
+
     /// Consume the builder and produce an immutable [`HNSWIndex`].
     pub fn build(self) -> HNSWIndex {
         HNSWIndex {
@@ -297,7 +324,7 @@ impl HNSWBuilder {
             m: self.m,
             m0: self.m0,
             nodes: self.nodes,
-            doc_ids: self.doc_ids,
+            keys: self.keys,
             entry_point: self.entry_point,
             max_level: self.max_level,
         }
@@ -427,7 +454,7 @@ pub struct HNSWIndex {
     m: u16,
     m0: u16,
     nodes: Vec<HNSWNode>,
-    doc_ids: Vec<Id>,
+    keys: Vec<RawValue>,
     entry_point: Option<u32>,
     max_level: u8,
 }
@@ -439,7 +466,7 @@ impl HNSWIndex {
     }
     /// Number of indexed documents.
     pub fn doc_count(&self) -> usize {
-        self.doc_ids.len()
+        self.keys.len()
     }
     /// Max neighbours per non-zero layer.
     pub fn m(&self) -> u16 {
@@ -454,12 +481,12 @@ impl HNSWIndex {
         self.max_level
     }
 
-    /// Internal doc-id table: `doc_ids()[i]` is the external `Id`
-    /// for internal node index `i`. Exposed so succinct
-    /// re-encoders can snapshot the table without roundtripping
-    /// through `similar()`.
-    pub fn doc_ids(&self) -> &[Id] {
-        &self.doc_ids
+    /// Internal keys table: `keys()[i]` is the stored 32-byte
+    /// [`RawValue`] for internal node index `i`. Exposed so
+    /// succinct re-encoders can snapshot the table without
+    /// roundtripping through `similar()`.
+    pub fn keys(&self) -> &[RawValue] {
+        &self.keys
     }
 
     /// Vector for node `i`. Already L2-normalized by `insert`.
@@ -492,7 +519,7 @@ impl HNSWIndex {
     /// cosine similarity. `ef` tunes the search width (larger =
     /// better recall at higher cost); pass `None` to default to
     /// `k`.
-    pub fn similar(&self, query: &[f32], k: usize, ef: Option<usize>) -> Vec<(Id, f32)> {
+    pub fn similar(&self, query: &[f32], k: usize, ef: Option<usize>) -> Vec<(RawValue, f32)> {
         if query.len() != self.dim || k == 0 {
             return Vec::new();
         }
@@ -510,16 +537,36 @@ impl HNSWIndex {
         }
         // ef-search on layer 0.
         let candidates = self.search_layer(&q, curr, ef, 0);
-        let mut ranked: Vec<(Id, f32)> = candidates
+        let mut ranked: Vec<(RawValue, f32)> = candidates
             .into_iter()
             .map(|(i, dist)| {
                 // Convert distance back to similarity (cos = 1 - dist).
-                (self.doc_ids[i as usize], 1.0 - dist)
+                (self.keys[i as usize], 1.0 - dist)
             })
             .collect();
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         ranked.truncate(k);
         ranked
+    }
+
+    /// Convenience: [`similar`] but decode each key as a
+    /// triblespace [`Id`] (assuming the index was keyed via
+    /// [`HNSWBuilder::insert_id`] / `Value<GenId>`). Returns
+    /// `None` for stored keys that aren't valid GenIds
+    /// (non-zero leading 16 bytes or a nil tail).
+    ///
+    /// [`similar`]: Self::similar
+    pub fn similar_ids(&self, query: &[f32], k: usize, ef: Option<usize>) -> Vec<(Id, f32)> {
+        self.similar(query, k, ef)
+            .into_iter()
+            .filter_map(|(raw, s)| {
+                if raw[0..16] != [0u8; 16] {
+                    return None;
+                }
+                let id_bytes: RawId = raw[16..32].try_into().ok()?;
+                Id::new(id_bytes).map(|id| (id, s))
+            })
+            .collect()
     }
 
     /// Serialize the index to a self-contained little-endian
@@ -536,7 +583,7 @@ impl HNSWIndex {
     ///   max_level u8, has_entry u8, reserved 2 B
     ///   entry_point u32
     ///   reserved 4 B
-    /// [n_nodes × 16 B doc_ids]
+    /// [n_nodes × 32 B keys]
     /// [n_nodes × dim × 4 B f32 vectors, row-major]
     /// [n_nodes × 1 B node_level]
     /// [n_nodes × layer_count+1 × 4 B per-layer neighbour offsets
@@ -565,10 +612,9 @@ impl HNSWIndex {
         buf.extend_from_slice(&[0u8; 4]); // 4 reserved → 32
         debug_assert_eq!(buf.len(), HNSW_HEADER_LEN);
 
-        // doc_ids
-        for id in &self.doc_ids {
-            let raw: &RawId = id.as_ref();
-            buf.extend_from_slice(raw);
+        // keys
+        for key in &self.keys {
+            buf.extend_from_slice(key);
         }
         // vectors
         for node in &self.nodes {
@@ -645,17 +691,17 @@ impl HNSWIndex {
         // bytes[28..32] reserved
 
         let mut pos = HNSW_HEADER_LEN;
-        // doc_ids
-        let doc_ids_end = pos + n_nodes * 16;
-        if bytes.len() < doc_ids_end {
-            return Err(E::TruncatedSection("doc_ids"));
+        // keys
+        let keys_end = pos + n_nodes * 32;
+        if bytes.len() < keys_end {
+            return Err(E::TruncatedSection("keys"));
         }
-        let mut doc_ids: Vec<Id> = Vec::with_capacity(n_nodes);
-        for chunk in bytes[pos..doc_ids_end].chunks_exact(16) {
-            let raw: RawId = chunk.try_into().unwrap();
-            doc_ids.push(Id::new(raw).ok_or(E::NilDocId)?);
+        let mut keys: Vec<RawValue> = Vec::with_capacity(n_nodes);
+        for chunk in bytes[pos..keys_end].chunks_exact(32) {
+            let raw: RawValue = chunk.try_into().unwrap();
+            keys.push(raw);
         }
-        pos = doc_ids_end;
+        pos = keys_end;
 
         // vectors
         let vectors_end = pos + n_nodes * dim * 4;
@@ -743,7 +789,7 @@ impl HNSWIndex {
             m,
             m0,
             nodes,
-            doc_ids,
+            keys,
             entry_point: if has_entry { Some(entry_raw) } else { None },
             max_level,
         })
@@ -927,7 +973,7 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// single dot product per doc.
 pub struct FlatBuilder {
     dim: usize,
-    doc_ids: Vec<Id>,
+    keys: Vec<RawValue>,
     /// Row-major; row `i` is `vectors[i * dim .. (i + 1) * dim]`.
     vectors: Vec<f32>,
 }
@@ -938,15 +984,20 @@ impl FlatBuilder {
         assert!(dim > 0, "FlatBuilder: dim must be > 0");
         Self {
             dim,
-            doc_ids: Vec::new(),
+            keys: Vec::new(),
             vectors: Vec::new(),
         }
     }
 
-    /// Insert one vector. Returns `Err(DimMismatch)` if `vec` is
-    /// the wrong length. The caller's vector is L2-normalized in
-    /// place before storage.
-    pub fn insert(&mut self, doc_id: Id, mut vec: Vec<f32>) -> Result<(), DimMismatch> {
+    /// Insert one vector keyed by a 32-byte triblespace value.
+    /// Returns `Err(DimMismatch)` if `vec` is the wrong length.
+    /// The caller's vector is L2-normalized in place before
+    /// storage. See [`insert_id`] / [`insert_value`] for the
+    /// typed convenience wrappers.
+    ///
+    /// [`insert_id`]: Self::insert_id
+    /// [`insert_value`]: Self::insert_value
+    pub fn insert(&mut self, key: RawValue, mut vec: Vec<f32>) -> Result<(), DimMismatch> {
         if vec.len() != self.dim {
             return Err(DimMismatch {
                 expected: self.dim,
@@ -954,28 +1005,45 @@ impl FlatBuilder {
             });
         }
         normalize(&mut vec);
-        self.doc_ids.push(doc_id);
+        self.keys.push(key);
         self.vectors.extend_from_slice(&vec);
         Ok(())
+    }
+
+    /// Convenience: insert keyed by a triblespace [`Id`].
+    pub fn insert_id(&mut self, doc_id: Id, vec: Vec<f32>) -> Result<(), DimMismatch> {
+        let mut raw = [0u8; 32];
+        let id_bytes: &RawId = doc_id.as_ref();
+        raw[16..32].copy_from_slice(id_bytes);
+        self.insert(raw, vec)
+    }
+
+    /// Convenience: insert keyed by a typed [`Value<S>`].
+    pub fn insert_value<S: ValueSchema>(
+        &mut self,
+        key: Value<S>,
+        vec: Vec<f32>,
+    ) -> Result<(), DimMismatch> {
+        self.insert(key.raw, vec)
     }
 
     /// Consume the builder and produce a flat index.
     pub fn build(self) -> FlatIndex {
         FlatIndex {
             dim: self.dim,
-            doc_ids: self.doc_ids,
+            keys: self.keys,
             vectors: self.vectors,
         }
     }
 
     /// Number of vectors inserted so far.
     pub fn len(&self) -> usize {
-        self.doc_ids.len()
+        self.keys.len()
     }
 
     /// `true` if no vectors have been inserted.
     pub fn is_empty(&self) -> bool {
-        self.doc_ids.is_empty()
+        self.keys.is_empty()
     }
 
     /// Configured embedding dimensionality.
@@ -992,7 +1060,7 @@ impl FlatBuilder {
 #[derive(Debug, Clone)]
 pub struct FlatIndex {
     dim: usize,
-    doc_ids: Vec<Id>,
+    keys: Vec<RawValue>,
     vectors: Vec<f32>,
 }
 
@@ -1004,14 +1072,20 @@ impl FlatIndex {
 
     /// Number of indexed documents.
     pub fn doc_count(&self) -> usize {
-        self.doc_ids.len()
+        self.keys.len()
+    }
+
+    /// The stored 32-byte keys table. `keys()[i]` is the
+    /// [`RawValue`] for internal index `i`.
+    pub fn keys(&self) -> &[RawValue] {
+        &self.keys
     }
 
     /// Return the top `k` documents by cosine similarity to
     /// `query`. `query` is L2-normalized internally before
     /// scoring. Returns fewer than `k` results if the index has
     /// fewer docs; returns an empty vec on dim mismatch.
-    pub fn similar(&self, query: &[f32], k: usize) -> Vec<(Id, f32)> {
+    pub fn similar(&self, query: &[f32], k: usize) -> Vec<(RawValue, f32)> {
         if query.len() != self.dim || k == 0 {
             return Vec::new();
         }
@@ -1024,17 +1098,34 @@ impl FlatIndex {
         // don't bother with a fancier selection algorithm.
         let mut heap: std::collections::BinaryHeap<MinScored> =
             std::collections::BinaryHeap::with_capacity(k + 1);
-        for (i, doc_id) in self.doc_ids.iter().enumerate() {
+        for (i, key) in self.keys.iter().enumerate() {
             let row = &self.vectors[i * self.dim..(i + 1) * self.dim];
             let score = dot(&q, row);
-            heap.push(MinScored { id: *doc_id, score });
+            heap.push(MinScored { key: *key, score });
             if heap.len() > k {
                 heap.pop();
             }
         }
-        let mut out: Vec<(Id, f32)> = heap.into_iter().map(|m| (m.id, m.score)).collect();
+        let mut out: Vec<(RawValue, f32)> = heap.into_iter().map(|m| (m.key, m.score)).collect();
         out.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         out
+    }
+
+    /// Convenience: [`similar`] with GenId-typed keys decoded
+    /// back to [`Id`]; other schemas are dropped.
+    ///
+    /// [`similar`]: Self::similar
+    pub fn similar_ids(&self, query: &[f32], k: usize) -> Vec<(Id, f32)> {
+        self.similar(query, k)
+            .into_iter()
+            .filter_map(|(raw, s)| {
+                if raw[0..16] != [0u8; 16] {
+                    return None;
+                }
+                let id_bytes: RawId = raw[16..32].try_into().ok()?;
+                Id::new(id_bytes).map(|id| (id, s))
+            })
+            .collect()
     }
 }
 
@@ -1050,7 +1141,7 @@ impl FlatIndex {
     ///   n_docs u32
     ///   dim u32
     ///   reserved 12 B
-    /// [n_docs × 16 B doc_ids]
+    /// [n_docs × 32 B keys]
     /// [n_docs × dim × 4 B f32 vectors, row-major]
     /// ```
     ///
@@ -1058,11 +1149,11 @@ impl FlatIndex {
     /// `insert` stored), so round-trip preserves query results
     /// exactly — no re-normalization needed on load.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let n_docs = self.doc_ids.len() as u32;
+        let n_docs = self.keys.len() as u32;
         let dim = self.dim as u32;
 
         let mut buf =
-            Vec::with_capacity(FLAT_HEADER_LEN + self.doc_ids.len() * 16 + self.vectors.len() * 4);
+            Vec::with_capacity(FLAT_HEADER_LEN + self.keys.len() * 32 + self.vectors.len() * 4);
 
         buf.extend_from_slice(&FLAT_MAGIC.to_le_bytes()); // 4
         buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes()); // 2
@@ -1072,9 +1163,8 @@ impl FlatIndex {
         buf.extend_from_slice(&[0u8; 16]); // 16 reserved → total 32
         debug_assert_eq!(buf.len(), FLAT_HEADER_LEN);
 
-        for id in &self.doc_ids {
-            let raw: &RawId = id.as_ref();
-            buf.extend_from_slice(raw);
+        for key in &self.keys {
+            buf.extend_from_slice(key);
         }
         for &v in &self.vectors {
             buf.extend_from_slice(&v.to_le_bytes());
@@ -1103,16 +1193,16 @@ impl FlatIndex {
         let dim = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
 
         let mut pos = FLAT_HEADER_LEN;
-        let doc_ids_end = pos + n_docs * 16;
-        if bytes.len() < doc_ids_end {
-            return Err(E::TruncatedSection("doc_ids"));
+        let keys_end = pos + n_docs * 32;
+        if bytes.len() < keys_end {
+            return Err(E::TruncatedSection("keys"));
         }
-        let mut doc_ids = Vec::with_capacity(n_docs);
-        for chunk in bytes[pos..doc_ids_end].chunks_exact(16) {
-            let raw: RawId = chunk.try_into().unwrap();
-            doc_ids.push(Id::new(raw).ok_or(E::NilDocId)?);
+        let mut keys: Vec<RawValue> = Vec::with_capacity(n_docs);
+        for chunk in bytes[pos..keys_end].chunks_exact(32) {
+            let raw: RawValue = chunk.try_into().unwrap();
+            keys.push(raw);
         }
-        pos = doc_ids_end;
+        pos = keys_end;
 
         let vectors_end = pos + n_docs * dim * 4;
         if bytes.len() < vectors_end {
@@ -1123,20 +1213,16 @@ impl FlatIndex {
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
             .collect();
 
-        Ok(Self {
-            dim,
-            doc_ids,
-            vectors,
-        })
+        Ok(Self { dim, keys, vectors })
     }
 }
 
-/// A `(score, id)` wrapper whose `Ord` impl inverts score so
+/// A `(score, key)` wrapper whose `Ord` impl inverts score so
 /// pushing into a max-heap of capacity `k` yields a min-heap
 /// over scores — the top-k retention trick.
 #[derive(Clone, Copy)]
 struct MinScored {
-    id: Id,
+    key: RawValue,
     score: f32,
 }
 
@@ -1172,33 +1258,44 @@ mod tests {
         Id::new([byte; 16]).unwrap()
     }
 
+    /// Test helper: `Value<GenId>` form of `id(byte)` — the
+    /// 32-byte representation that HNSWBuilder::insert_id
+    /// stores and FlatIndex::similar returns.
+    fn id_key(byte: u8) -> RawValue {
+        let mut raw = [0u8; 32];
+        let id = id(byte);
+        let id_bytes: &RawId = id.as_ref();
+        raw[16..32].copy_from_slice(id_bytes);
+        raw
+    }
+
     #[test]
     fn exact_match_is_top() {
         let mut b = FlatBuilder::new(3);
-        b.insert(id(1), vec![1.0, 0.0, 0.0]).unwrap();
-        b.insert(id(2), vec![0.0, 1.0, 0.0]).unwrap();
-        b.insert(id(3), vec![0.0, 0.0, 1.0]).unwrap();
+        b.insert_id(id(1), vec![1.0, 0.0, 0.0]).unwrap();
+        b.insert_id(id(2), vec![0.0, 1.0, 0.0]).unwrap();
+        b.insert_id(id(3), vec![0.0, 0.0, 1.0]).unwrap();
         let idx = b.build();
 
         let hits = idx.similar(&[1.0, 0.0, 0.0], 1);
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].0, id(1));
+        assert_eq!(hits[0].0, id_key(1));
         assert!((hits[0].1 - 1.0).abs() < 1e-5);
     }
 
     #[test]
     fn ranked_by_similarity() {
         let mut b = FlatBuilder::new(2);
-        b.insert(id(1), vec![1.0, 0.0]).unwrap(); // closest
-        b.insert(id(2), vec![0.9, 0.1]).unwrap();
-        b.insert(id(3), vec![0.0, 1.0]).unwrap();
+        b.insert_id(id(1), vec![1.0, 0.0]).unwrap(); // closest
+        b.insert_id(id(2), vec![0.9, 0.1]).unwrap();
+        b.insert_id(id(3), vec![0.0, 1.0]).unwrap();
         let idx = b.build();
 
         let hits = idx.similar(&[1.0, 0.0], 3);
         assert_eq!(hits.len(), 3);
-        assert_eq!(hits[0].0, id(1));
-        assert_eq!(hits[1].0, id(2));
-        assert_eq!(hits[2].0, id(3));
+        assert_eq!(hits[0].0, id_key(1));
+        assert_eq!(hits[1].0, id_key(2));
+        assert_eq!(hits[2].0, id_key(3));
         // Scores are monotonically non-increasing.
         assert!(hits[0].1 >= hits[1].1 && hits[1].1 >= hits[2].1);
     }
@@ -1208,8 +1305,8 @@ mod tests {
         // Two inputs that are parallel but scaled differently
         // must yield identical scores against any query.
         let mut b = FlatBuilder::new(2);
-        b.insert(id(1), vec![3.0, 0.0]).unwrap();
-        b.insert(id(2), vec![100.0, 0.0]).unwrap();
+        b.insert_id(id(1), vec![3.0, 0.0]).unwrap();
+        b.insert_id(id(2), vec![100.0, 0.0]).unwrap();
         let idx = b.build();
 
         let hits = idx.similar(&[1.0, 0.0], 2);
@@ -1219,7 +1316,7 @@ mod tests {
     #[test]
     fn dim_mismatch_rejected() {
         let mut b = FlatBuilder::new(3);
-        let err = b.insert(id(1), vec![1.0, 0.0]).unwrap_err();
+        let err = b.insert_id(id(1), vec![1.0, 0.0]).unwrap_err();
         assert_eq!(err.expected, 3);
         assert_eq!(err.got, 2);
     }
@@ -1233,7 +1330,7 @@ mod tests {
     #[test]
     fn k_zero_returns_empty() {
         let mut b = FlatBuilder::new(2);
-        b.insert(id(1), vec![1.0, 0.0]).unwrap();
+        b.insert_id(id(1), vec![1.0, 0.0]).unwrap();
         let idx = b.build();
         assert!(idx.similar(&[1.0, 0.0], 0).is_empty());
     }
@@ -1241,7 +1338,7 @@ mod tests {
     #[test]
     fn wrong_dim_query_returns_empty() {
         let mut b = FlatBuilder::new(3);
-        b.insert(id(1), vec![1.0, 0.0, 0.0]).unwrap();
+        b.insert_id(id(1), vec![1.0, 0.0, 0.0]).unwrap();
         let idx = b.build();
         assert!(idx.similar(&[1.0, 0.0], 1).is_empty()); // dim 2 vs 3
     }
@@ -1249,8 +1346,8 @@ mod tests {
     #[test]
     fn k_larger_than_corpus_truncates() {
         let mut b = FlatBuilder::new(2);
-        b.insert(id(1), vec![1.0, 0.0]).unwrap();
-        b.insert(id(2), vec![0.0, 1.0]).unwrap();
+        b.insert_id(id(1), vec![1.0, 0.0]).unwrap();
+        b.insert_id(id(2), vec![0.0, 1.0]).unwrap();
         let idx = b.build();
         let hits = idx.similar(&[1.0, 0.0], 10);
         assert_eq!(hits.len(), 2);
@@ -1258,9 +1355,9 @@ mod tests {
 
     fn sample_flat() -> FlatIndex {
         let mut b = FlatBuilder::new(3);
-        b.insert(id(1), vec![1.0, 0.0, 0.0]).unwrap();
-        b.insert(id(2), vec![0.0, 1.0, 0.0]).unwrap();
-        b.insert(id(3), vec![0.5, 0.5, 0.0]).unwrap();
+        b.insert_id(id(1), vec![1.0, 0.0, 0.0]).unwrap();
+        b.insert_id(id(2), vec![0.0, 1.0, 0.0]).unwrap();
+        b.insert_id(id(3), vec![0.5, 0.5, 0.0]).unwrap();
         b.build()
     }
 
@@ -1322,25 +1419,25 @@ mod tests {
     #[test]
     fn hnsw_single_doc_returns_itself() {
         let mut b = HNSWBuilder::new(3);
-        b.insert(id(1), vec![1.0, 0.0, 0.0]).unwrap();
+        b.insert_id(id(1), vec![1.0, 0.0, 0.0]).unwrap();
         let idx = b.build();
         let hits = idx.similar(&[1.0, 0.0, 0.0], 1, None);
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].0, id(1));
+        assert_eq!(hits[0].0, id_key(1));
         assert!((hits[0].1 - 1.0).abs() < 1e-5);
     }
 
     #[test]
     fn hnsw_ranks_similar_vectors_highest() {
         let mut b = HNSWBuilder::new(2);
-        b.insert(id(1), vec![1.0, 0.0]).unwrap();
-        b.insert(id(2), vec![0.9, 0.1]).unwrap();
-        b.insert(id(3), vec![0.0, 1.0]).unwrap();
+        b.insert_id(id(1), vec![1.0, 0.0]).unwrap();
+        b.insert_id(id(2), vec![0.9, 0.1]).unwrap();
+        b.insert_id(id(3), vec![0.0, 1.0]).unwrap();
         let idx = b.build();
         let hits = idx.similar(&[1.0, 0.0], 3, None);
-        assert_eq!(hits[0].0, id(1));
-        assert_eq!(hits[1].0, id(2));
-        assert_eq!(hits[2].0, id(3));
+        assert_eq!(hits[0].0, id_key(1));
+        assert_eq!(hits[1].0, id_key(2));
+        assert_eq!(hits[2].0, id_key(3));
     }
 
     #[test]
@@ -1367,8 +1464,8 @@ mod tests {
                 .map(|_| (next(&mut rng) as i32 as f32) / (i32::MAX as f32))
                 .collect();
             let dx = id_from_u64((i + 1) as u64);
-            flat_b.insert(dx, vec.clone()).unwrap();
-            hnsw_b.insert(dx, vec).unwrap();
+            flat_b.insert_id(dx, vec.clone()).unwrap();
+            hnsw_b.insert_id(dx, vec).unwrap();
         }
         let flat = flat_b.build();
         let hnsw = hnsw_b.build();
@@ -1380,9 +1477,9 @@ mod tests {
             let q: Vec<f32> = (0..dim)
                 .map(|_| (next(&mut rng) as i32 as f32) / (i32::MAX as f32))
                 .collect();
-            let truth: std::collections::HashSet<Id> =
+            let truth: std::collections::HashSet<RawValue> =
                 flat.similar(&q, 10).into_iter().map(|(d, _)| d).collect();
-            let got: std::collections::HashSet<Id> = hnsw
+            let got: std::collections::HashSet<RawValue> = hnsw
                 .similar(&q, 10, Some(50))
                 .into_iter()
                 .map(|(d, _)| d)
@@ -1409,7 +1506,7 @@ mod tests {
         let build = |seed: u64| {
             let mut b = HNSWBuilder::new(3).with_seed(seed);
             for i in 1..=20u8 {
-                b.insert(
+                b.insert_id(
                     Id::new([i; 16]).unwrap(),
                     vec![
                         (i as f32) / 20.0,
@@ -1437,7 +1534,7 @@ mod tests {
     #[test]
     fn hnsw_dim_mismatch_rejected_at_insert() {
         let mut b = HNSWBuilder::new(3);
-        let err = b.insert(id(1), vec![1.0, 0.0]).unwrap_err();
+        let err = b.insert_id(id(1), vec![1.0, 0.0]).unwrap_err();
         assert_eq!(err.expected, 3);
         assert_eq!(err.got, 2);
     }
@@ -1445,17 +1542,17 @@ mod tests {
     #[test]
     fn hnsw_wrong_dim_query_returns_empty() {
         let mut b = HNSWBuilder::new(3);
-        b.insert(id(1), vec![1.0, 0.0, 0.0]).unwrap();
+        b.insert_id(id(1), vec![1.0, 0.0, 0.0]).unwrap();
         let idx = b.build();
         assert!(idx.similar(&[1.0, 0.0], 3, None).is_empty());
     }
 
     fn sample_hnsw() -> HNSWIndex {
         let mut b = HNSWBuilder::new(3).with_seed(42);
-        b.insert(id(1), vec![1.0, 0.0, 0.0]).unwrap();
-        b.insert(id(2), vec![0.9, 0.1, 0.0]).unwrap();
-        b.insert(id(3), vec![0.0, 1.0, 0.0]).unwrap();
-        b.insert(id(4), vec![0.0, 0.0, 1.0]).unwrap();
+        b.insert_id(id(1), vec![1.0, 0.0, 0.0]).unwrap();
+        b.insert_id(id(2), vec![0.9, 0.1, 0.0]).unwrap();
+        b.insert_id(id(3), vec![0.0, 1.0, 0.0]).unwrap();
+        b.insert_id(id(4), vec![0.0, 0.0, 1.0]).unwrap();
         b.build()
     }
 

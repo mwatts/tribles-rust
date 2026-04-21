@@ -83,7 +83,7 @@ fn succinct_hnsw_survives_pile_round_trip() {
     let mut b = HNSWBuilder::new(4).with_seed(19);
     for i in 1..=12u8 {
         let f = i as f32;
-        b.insert(
+        b.insert_id(
             iid(i),
             vec![f.sin(), f.cos(), (f * 0.5).sin(), (f * 0.3).cos()],
         )

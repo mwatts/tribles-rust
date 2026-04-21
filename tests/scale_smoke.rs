@@ -129,8 +129,8 @@ fn hnsw_1k_vectors_recall_against_flat() {
             .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
             .collect();
         let doc = id_from_u64((i + 1) as u64);
-        flat_b.insert(doc, vec.clone()).unwrap();
-        hnsw_b.insert(doc, vec).unwrap();
+        flat_b.insert_id(doc, vec.clone()).unwrap();
+        hnsw_b.insert_id(doc, vec).unwrap();
     }
     let flat = flat_b.build();
     let hnsw = hnsw_b.build();
@@ -256,7 +256,7 @@ fn succinct_hnsw_1k_docs_matches_naive() {
         let vec: Vec<f32> = (0..DIM)
             .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
             .collect();
-        builder.insert(id_from_u64((i + 1) as u64), vec).unwrap();
+        builder.insert_id(id_from_u64((i + 1) as u64), vec).unwrap();
     }
     let naive = builder.build();
     let succinct = SuccinctHNSWIndex::from_naive(&naive).unwrap();
@@ -422,24 +422,24 @@ fn flat_1k_vectors_top_k_consistent() {
     for v in target_vec.iter_mut().take(DIM / 2) {
         *v = 1.0;
     }
-    builder.insert(target, target_vec.clone()).unwrap();
+    builder.insert_id(target, target_vec.clone()).unwrap();
     for i in 0..(N_DOCS - 1) {
         let vec: Vec<f32> = (0..DIM)
             .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
             .collect();
-        builder.insert(id_from_u64(i as u64 + 100), vec).unwrap();
+        builder.insert_id(id_from_u64(i as u64 + 100), vec).unwrap();
     }
     let idx = builder.build();
 
     // The exact `target_vec` as a query should return `target` at
     // rank 1.
-    let hits = idx.similar(&target_vec, 5);
+    let hits = idx.similar_ids(&target_vec, 5);
     assert_eq!(hits.len(), 5);
     assert_eq!(hits[0].0, target);
 
     // Round-trip through bytes must preserve the top-k.
     let reloaded = FlatIndex::try_from_bytes(&idx.to_bytes()).expect("valid");
-    let hits2 = reloaded.similar(&target_vec, 5);
+    let hits2 = reloaded.similar_ids(&target_vec, 5);
     assert_eq!(hits.len(), hits2.len());
     for (a, b) in hits.iter().zip(hits2.iter()) {
         assert_eq!(a.0, b.0);

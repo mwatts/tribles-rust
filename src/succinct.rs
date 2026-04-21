@@ -824,13 +824,13 @@ impl SuccinctGraph {
 /// use triblespace_search::succinct::SuccinctHNSWIndex;
 ///
 /// let mut b = HNSWBuilder::new(4).with_seed(1);
-/// b.insert(Id::new([1; 16]).unwrap(), vec![1.0, 0.0, 0.0, 0.0]).unwrap();
-/// b.insert(Id::new([2; 16]).unwrap(), vec![0.0, 1.0, 0.0, 0.0]).unwrap();
-/// b.insert(Id::new([3; 16]).unwrap(), vec![0.9, 0.1, 0.0, 0.0]).unwrap();
+/// b.insert_id(Id::new([1; 16]).unwrap(), vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+/// b.insert_id(Id::new([2; 16]).unwrap(), vec![0.0, 1.0, 0.0, 0.0]).unwrap();
+/// b.insert_id(Id::new([3; 16]).unwrap(), vec![0.9, 0.1, 0.0, 0.0]).unwrap();
 /// let idx = SuccinctHNSWIndex::from_naive(&b.build()).unwrap();
 ///
 /// let q = vec![1.0, 0.0, 0.0, 0.0];
-/// let hits = idx.similar(&q, 2, Some(10));
+/// let hits = idx.similar_ids(&q, 2, Some(10));
 /// assert_eq!(hits.len(), 2);
 /// // doc 1 is an exact cosine match, doc 3 nearly so.
 /// assert_eq!(hits[0].0, Id::new([1; 16]).unwrap());
@@ -842,7 +842,7 @@ pub struct SuccinctHNSWIndex {
     m0: u16,
     max_level: u8,
     entry_point: Option<u32>,
-    doc_ids: FixedBytesTable<16>,
+    keys: FixedBytesTable<32>,
     /// L2-normalized vectors in flat row-major form, zero-copy
     /// viewed as `[f32]` over the backing anybytes region.
     /// `vectors_view` is `None` iff the corpus is empty (anybytes
@@ -860,10 +860,10 @@ impl SuccinctHNSWIndex {
         let max_level = idx.max_level();
         let n_layers = max_level as usize + 1;
 
-        // doc_ids.
-        let doc_id_rows: Vec<[u8; 16]> = (0..n).map(|i| *idx.doc_ids()[i].as_ref()).collect();
-        let doc_ids_bytes = FixedBytesTable::<16>::build(&doc_id_rows);
-        let doc_ids = FixedBytesTable::<16>::from_bytes(doc_ids_bytes, n)?;
+        // keys: 32-byte RawValue table.
+        let key_rows: Vec<RawValue> = idx.keys().to_vec();
+        let keys_bytes = FixedBytesTable::<32>::build(&key_rows);
+        let keys = FixedBytesTable::<32>::from_bytes(keys_bytes, n)?;
 
         // vectors: flat f32 block, zero-copy viewable as [f32].
         let mut vec_buf = Vec::with_capacity(n * dim * 4);
@@ -899,7 +899,7 @@ impl SuccinctHNSWIndex {
             m0: idx.m0(),
             max_level,
             entry_point: idx.entry_point(),
-            doc_ids,
+            keys,
             vectors,
             vectors_view,
             graph,
@@ -912,7 +912,7 @@ impl SuccinctHNSWIndex {
     }
     /// Number of indexed documents.
     pub fn doc_count(&self) -> usize {
-        self.doc_ids.len()
+        self.keys.len()
     }
     /// Max neighbours per non-zero layer.
     pub fn m(&self) -> u16 {
@@ -973,7 +973,7 @@ impl SuccinctHNSWIndex {
     /// Approximate top-k nearest neighbours to `query` under
     /// cosine similarity. Mirrors [`HNSWIndex::similar`] exactly,
     /// just against succinct storage.
-    pub fn similar(&self, query: &[f32], k: usize, ef: Option<usize>) -> Vec<(Id, f32)> {
+    pub fn similar(&self, query: &[f32], k: usize, ef: Option<usize>) -> Vec<(RawValue, f32)> {
         if query.len() != self.dim || k == 0 {
             return Vec::new();
         }
@@ -990,17 +990,33 @@ impl SuccinctHNSWIndex {
             curr = self.greedy_search_layer(&q, curr, lvl);
         }
         let candidates = self.search_layer(&q, curr, ef, 0);
-        let mut ranked: Vec<(Id, f32)> = candidates
+        let mut ranked: Vec<(RawValue, f32)> = candidates
             .into_iter()
             .map(|(i, dist)| {
-                let raw = self.doc_ids.get(i as usize).expect("in range");
-                let id = Id::new(*raw).expect("non-nil");
-                (id, 1.0 - dist)
+                let raw = self.keys.get(i as usize).expect("in range");
+                (*raw, 1.0 - dist)
             })
             .collect();
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         ranked.truncate(k);
         ranked
+    }
+
+    /// Convenience: [`similar`] with GenId-typed keys decoded
+    /// back to [`Id`]; other schemas are dropped.
+    ///
+    /// [`similar`]: Self::similar
+    pub fn similar_ids(&self, query: &[f32], k: usize, ef: Option<usize>) -> Vec<(Id, f32)> {
+        self.similar(query, k, ef)
+            .into_iter()
+            .filter_map(|(raw, s)| {
+                if raw[0..16] != [0u8; 16] {
+                    return None;
+                }
+                let id_bytes: [u8; 16] = raw[16..32].try_into().ok()?;
+                Id::new(id_bytes).map(|id| (id, s))
+            })
+            .collect()
     }
 
     fn greedy_search_layer(&self, q: &[f32], entry: u32, layer: u8) -> u32 {
@@ -1035,7 +1051,7 @@ impl SuccinctHNSWIndex {
     ///
     /// ```text
     /// [header 152 B]
-    /// [doc_ids     ] n_nodes × 16 B
+    /// [keys        ] n_nodes × 32 B
     /// [vectors     ] n_nodes × dim × 4 B (f32 LE)
     /// [graph_bytes ] variable (SuccinctGraph body)
     /// ```
@@ -1050,11 +1066,11 @@ impl SuccinctHNSWIndex {
         // Re-serialize each body region so the blob owns its
         // bytes end-to-end (the caller might have built this
         // SuccinctHNSWIndex in-memory from a naive index).
-        let doc_id_rows: Vec<[u8; 16]> = (0..self.doc_count())
-            .map(|i| self.doc_ids.get(i).copied().unwrap_or([0u8; 16]))
+        let key_rows: Vec<RawValue> = (0..self.doc_count())
+            .map(|i| self.keys.get(i).copied().unwrap_or([0u8; 32]))
             .collect();
-        let doc_ids_bytes = FixedBytesTable::<16>::build(&doc_id_rows);
-        let doc_ids_flat: Vec<u8> = doc_ids_bytes.as_ref().to_vec();
+        let keys_bytes = FixedBytesTable::<32>::build(&key_rows);
+        let keys_flat: Vec<u8> = keys_bytes.as_ref().to_vec();
         let vectors_flat: Vec<u8> = self.vectors.as_ref().to_vec();
 
         // Rebuild the graph from the current view so we get fresh
@@ -1078,9 +1094,9 @@ impl SuccinctHNSWIndex {
 
         // Section offsets inside the body (relative to end of
         // header).
-        let doc_ids_off = 0u64;
-        let doc_ids_len = doc_ids_flat.len() as u64;
-        let vectors_off = doc_ids_off + doc_ids_len;
+        let keys_off = 0u64;
+        let keys_len = keys_flat.len() as u64;
+        let vectors_off = keys_off + keys_len;
         let vectors_len = vectors_flat.len() as u64;
         let graph_off = vectors_off + vectors_len;
         let graph_len = graph_region.len() as u64;
@@ -1105,8 +1121,8 @@ impl SuccinctHNSWIndex {
         buf.extend_from_slice(&n_layers.to_le_bytes()); // 8
         buf.extend_from_slice(graph_neighbours_meta.as_bytes()); // 32
         buf.extend_from_slice(graph_offsets_meta.as_bytes()); // 32
-        buf.extend_from_slice(&doc_ids_off.to_le_bytes()); // 8
-        buf.extend_from_slice(&doc_ids_len.to_le_bytes()); // 8
+        buf.extend_from_slice(&keys_off.to_le_bytes()); // 8
+        buf.extend_from_slice(&keys_len.to_le_bytes()); // 8
         buf.extend_from_slice(&vectors_off.to_le_bytes()); // 8
         buf.extend_from_slice(&vectors_len.to_le_bytes()); // 8
         buf.extend_from_slice(&graph_off.to_le_bytes()); // 8
@@ -1114,7 +1130,7 @@ impl SuccinctHNSWIndex {
         debug_assert_eq!(buf.len(), SH25_HEADER_LEN);
 
         // ── body ──────────────────────────────────────────────
-        buf.extend_from_slice(&doc_ids_flat);
+        buf.extend_from_slice(&keys_flat);
         buf.extend_from_slice(&vectors_flat);
         buf.extend_from_slice(&graph_region);
         buf
@@ -1151,8 +1167,8 @@ impl SuccinctHNSWIndex {
             .to_jerky();
 
         let read_u64 = |off: usize| u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
-        let doc_ids_off = read_u64(104) as usize;
-        let doc_ids_len = read_u64(112) as usize;
+        let keys_off = read_u64(104) as usize;
+        let keys_len = read_u64(112) as usize;
         let vectors_off = read_u64(120) as usize;
         let vectors_len = read_u64(128) as usize;
         let graph_off = read_u64(136) as usize;
@@ -1168,17 +1184,17 @@ impl SuccinctHNSWIndex {
                 Ok(())
             }
         };
-        check(doc_ids_off + doc_ids_len, "doc_ids")?;
+        check(keys_off + keys_len, "keys")?;
         check(vectors_off + vectors_len, "vectors")?;
         check(graph_off + graph_len, "graph")?;
 
         let body_bytes = Bytes::from_source(body.to_vec());
-        let doc_ids_bytes = body_bytes.slice(doc_ids_off..doc_ids_off + doc_ids_len);
+        let keys_bytes = body_bytes.slice(keys_off..keys_off + keys_len);
         let vectors_bytes = body_bytes.slice(vectors_off..vectors_off + vectors_len);
         let graph_bytes = body_bytes.slice(graph_off..graph_off + graph_len);
 
-        let doc_ids = FixedBytesTable::<16>::from_bytes(doc_ids_bytes, n_nodes)
-            .map_err(|_| SuccinctLoadError::TruncatedSection("doc_ids"))?;
+        let keys = FixedBytesTable::<32>::from_bytes(keys_bytes, n_nodes)
+            .map_err(|_| SuccinctLoadError::TruncatedSection("keys"))?;
 
         // Validate vectors region is the right size.
         if vectors_len != n_nodes * dim * 4 {
@@ -1203,7 +1219,7 @@ impl SuccinctHNSWIndex {
             m0,
             max_level,
             entry_point,
-            doc_ids,
+            keys,
             vectors: vectors_bytes,
             vectors_view,
             graph,
@@ -2398,7 +2414,7 @@ mod tests {
         for i in 1..=16u8 {
             let f = i as f32;
             let vec = vec![f.sin(), f.cos(), (f * 0.5).sin(), (f * 0.3).cos()];
-            b.insert(iid(i), vec).unwrap();
+            b.insert_id(iid(i), vec).unwrap();
         }
         let naive = b.build();
         let succinct = SuccinctHNSWIndex::from_naive(&naive).unwrap();
@@ -2438,7 +2454,7 @@ mod tests {
         for i in 1..=20u8 {
             let f = i as f32;
             let v = vec![f.sin(), f.cos(), (f * 0.7).sin(), (f * 0.3).cos()];
-            b.insert(iid(i), v).unwrap();
+            b.insert_id(iid(i), v).unwrap();
         }
         SuccinctHNSWIndex::from_naive(&b.build()).unwrap()
     }

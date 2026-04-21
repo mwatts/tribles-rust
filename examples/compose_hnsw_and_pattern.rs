@@ -74,7 +74,7 @@ fn main() {
 
     let mut hb = HNSWBuilder::new(4).with_seed(42);
     for (bid, v) in &embeddings {
-        hb.insert(*bid, v.clone()).unwrap();
+        hb.insert_id(*bid, v.clone()).unwrap();
     }
     let naive = hb.build();
     let idx = SuccinctHNSWIndex::from_naive(&naive).unwrap();
@@ -89,8 +89,10 @@ fn main() {
     let query = vec![1.0, 0.0, 0.0, 0.0];
 
     // Standalone similarity — should surface A and C first.
+    // `similar_ids` decodes the 32-byte keys back to `Id` under
+    // the GenId schema (empty result on non-GenId keys).
     println!("\nsimilarity-only (no author filter):");
-    for (d, s) in naive.similar(&query, 4, Some(10)) {
+    for (d, s) in naive.similar_ids(&query, 4, Some(10)) {
         println!("  {d}  cos={s:.3}");
     }
 

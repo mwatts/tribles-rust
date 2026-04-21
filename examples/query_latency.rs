@@ -175,7 +175,7 @@ fn bench_hnsw(n_docs: usize, dim: usize) {
         let v: Vec<f32> = (0..dim)
             .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
             .collect();
-        builder.insert(id_from_u64(i as u64 + 1), v).unwrap();
+        builder.insert_id(id_from_u64(i as u64 + 1), v).unwrap();
     }
     let naive = builder.build();
     let succinct = SuccinctHNSWIndex::from_naive(&naive).unwrap();
