@@ -18,6 +18,10 @@ anybytes = "0.20"
 # required once we flip from flat-array prototypes to the
 # wavelet-matrix-backed blobs.
 jerky = { version = "0.9", optional = true }
+# zerocopy — safe byte<->struct conversion for serializing
+# jerky's CompactVectorMeta into the succinct blob header. Pulled
+# in along with jerky, so no added transitive cost.
+zerocopy = { version = "0.8", features = ["derive"], optional = true }
 # blake3 — for `hash_tokens` helper (callers hash their own tokens
 # into 32-byte triblespace Values).
 blake3 = "1"
@@ -27,7 +31,7 @@ default = ["succinct"]
 # Swap the naive flat-array implementations for the succinct
 # jerky-backed ones. On until we have both working; off lets us
 # test the naive path in isolation.
-succinct = ["dep:jerky"]
+succinct = ["dep:jerky", "dep:zerocopy"]
 
 [package.metadata.docs.rs]
 all-features = true
