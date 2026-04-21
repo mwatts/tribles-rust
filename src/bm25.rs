@@ -50,7 +50,7 @@
 use std::collections::HashMap;
 
 use triblespace::core::id::{Id, RawId};
-use triblespace::core::value::RawValue;
+use triblespace::core::value::{RawValue, Value, ValueSchema};
 
 use crate::FORMAT_VERSION;
 
@@ -166,6 +166,19 @@ impl BM25Builder {
         let id_bytes: &RawId = doc_id.as_ref();
         raw[16..32].copy_from_slice(id_bytes);
         self.docs.push((raw, terms));
+    }
+
+    /// Convenience: add a document keyed by a triblespace
+    /// [`Value<S>`] for any value schema `S` — for example
+    /// `Value<ShortString>` when indexing by title, or
+    /// `Value<Tag>` when indexing by a known tag. Unwraps the
+    /// 32-byte representation via `value.raw` and calls
+    /// [`insert`]; one-liner so callers don't have to reach into
+    /// the `.raw` field themselves at every call site.
+    ///
+    /// [`insert`]: Self::insert
+    pub fn insert_value<S: ValueSchema>(&mut self, key: Value<S>, terms: Vec<RawValue>) {
+        self.docs.push((key.raw, terms));
     }
 
     /// Consume the builder and produce an in-memory BM25 index
@@ -686,6 +699,37 @@ mod tests {
         assert_eq!(idx.term_count(), 0);
         let term = [0u8; 32];
         assert!(idx.query_term(&term).next().is_none());
+    }
+
+    #[test]
+    fn insert_value_indexes_by_string() {
+        use triblespace::core::value::schemas::shortstring::ShortString;
+        use triblespace::core::value::{ToValue, Value};
+
+        let mut b = BM25Builder::new();
+        let red: Value<ShortString> = "red".to_value();
+        let blue: Value<ShortString> = "blue".to_value();
+        // Two docs keyed by string value rather than entity id.
+        // The doc body is the token stream; the *key* is a
+        // `Value<ShortString>`, so a later query can find "docs
+        // whose key/field value is 'red'".
+        b.insert_value(red, hash_tokens("a tomato is red"));
+        b.insert_value(blue, hash_tokens("the ocean is blue"));
+        let idx = b.build();
+        assert_eq!(idx.doc_count(), 2);
+
+        // "red" appears in one doc, "blue" in another.
+        let red_hits: Vec<_> = idx.query_term(&hash_tokens("red")[0]).collect();
+        let blue_hits: Vec<_> = idx.query_term(&hash_tokens("blue")[0]).collect();
+        assert_eq!(red_hits.len(), 1);
+        assert_eq!(blue_hits.len(), 1);
+        // Keys come back as their 32-byte representation; the
+        // ShortString schema packs the string into the same 32
+        // bytes we stored.
+        let red_raw: Value<ShortString> = "red".to_value();
+        let blue_raw: Value<ShortString> = "blue".to_value();
+        assert_eq!(red_hits[0].0, red_raw.raw);
+        assert_eq!(blue_hits[0].0, blue_raw.raw);
     }
 
     #[test]
