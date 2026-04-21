@@ -2,14 +2,22 @@
 name = "triblespace-search"
 version = "0.0.0"
 edition = "2021"
+# `std::thread::scope` (1.63) is the oldest non-trivial feature
+# used; const assertions + zerocopy derive pull the actual
+# requirement higher. 1.80 is the lowest stable we've verified.
+rust-version = "1.80"
 license = "MIT OR Apache-2.0"
 description = "Content-addressed BM25 + HNSW indexes on top of triblespace piles."
 authors = ["Jan-Paul Bultmann <jp@bultmann.eu>"]
 homepage = "https://github.com/triblespace/triblespace-search"
 repository = "https://github.com/triblespace/triblespace-search"
+documentation = "https://docs.rs/triblespace-search"
 readme = "README.md"
 keywords = ["triblespace", "bm25", "hnsw", "search", "succinct"]
 categories = ["data-structures", "text-processing"]
+# Keep the crates.io tarball lean: tests + examples ship, but
+# generated / cache-only artifacts don't.
+exclude = ["target/", "Cargo.lock", ".git/"]
 
 [dev-dependencies]
 # tempfile — used by integration tests that exercise an on-disk
