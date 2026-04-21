@@ -141,3 +141,85 @@ fn find_intersection_of_two_terms() {
     assert!(set.contains(&id(1)));
     assert!(set.contains(&id(3)));
 }
+
+/// Headline story: BM25 lexical search composed with a `pattern!`
+/// over a real TribleSet, in a single `find!`. "Find books whose
+/// title mentions 'fox' AND are authored by the known author X."
+#[test]
+fn find_bm25_composed_with_pattern() {
+    use triblespace::core::and;
+    use triblespace::core::examples::literature;
+    use triblespace::core::id::ExclusiveId;
+    use triblespace::core::trible::TribleSet;
+    use triblespace::macros::{entity, pattern};
+
+    // Fixed Ids keep the test deterministic; `ExclusiveId::force_ref`
+    // gives `entity!` the `&ExclusiveId` it expects.
+    let target_author = id(10);
+    let other_author = id(11);
+    let book_a = id(20);
+    let book_b = id(21);
+    let book_c = id(22);
+    let book_d = id(23);
+
+    let mut kb = TribleSet::new();
+    kb += entity! { ExclusiveId::force_ref(&target_author) @
+        literature::firstname: "Target",
+        literature::lastname: "Author",
+    };
+    kb += entity! { ExclusiveId::force_ref(&other_author) @
+        literature::firstname: "Other",
+        literature::lastname: "Author",
+    };
+    kb += entity! { ExclusiveId::force_ref(&book_a) @
+        literature::title: "The Quick Fox",
+        literature::author: &target_author,
+    };
+    kb += entity! { ExclusiveId::force_ref(&book_b) @
+        literature::title: "Another Fox Book",
+        literature::author: &target_author,
+    };
+    kb += entity! { ExclusiveId::force_ref(&book_c) @
+        literature::title: "Fox Adventure",
+        literature::author: &other_author,
+    };
+    kb += entity! { ExclusiveId::force_ref(&book_d) @
+        literature::title: "Unrelated",
+        literature::author: &target_author,
+    };
+
+    // Build a BM25 index over book titles, keyed by book entity id.
+    let titles: Vec<(Id, String)> = find!(
+        (b: Id, title: String),
+        pattern!(&kb, [{ ?b @ literature::title: ?title }])
+    )
+    .collect();
+    let mut bm25 = BM25Builder::new();
+    for (b, title) in &titles {
+        bm25.insert(*b, hash_tokens(title));
+    }
+    let idx = bm25.build();
+
+    // Compose: "books that mention 'fox' AND are by target_author".
+    let fox = hash_tokens("fox")[0];
+    let rows: Vec<(Id,)> = find!(
+        (book: Id),
+        and!(
+            idx.docs_containing(book, fox),
+            pattern!(&kb, [{ ?book @ literature::author: &target_author }])
+        )
+    )
+    .collect();
+
+    let books: HashSet<Id> = rows.into_iter().map(|(b,)| b).collect();
+    assert_eq!(
+        books.len(),
+        2,
+        "expected 2 fox books by target author, got {}",
+        books.len()
+    );
+    assert!(books.contains(&book_a));
+    assert!(books.contains(&book_b));
+    assert!(!books.contains(&book_c), "should exclude wrong author");
+    assert!(!books.contains(&book_d), "should exclude no-fox title");
+}
