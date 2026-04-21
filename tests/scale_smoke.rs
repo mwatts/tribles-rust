@@ -10,6 +10,7 @@ use triblespace::core::id::{Id, RawId};
 
 use triblespace_search::bm25::{BM25Builder, BM25Index};
 use triblespace_search::hnsw::{FlatBuilder, FlatIndex, HNSWBuilder, HNSWIndex};
+use triblespace_search::succinct::{SuccinctBM25Index, SuccinctHNSWIndex};
 use triblespace_search::tokens::hash_tokens;
 
 /// Small pseudo-RNG (SplitMix64) — deterministic, no extra deps.
@@ -169,6 +170,100 @@ fn hnsw_1k_vectors_recall_against_flat() {
         .map(|(d, _)| d)
         .collect();
     assert_eq!(orig_ids, loaded_ids);
+}
+
+/// At 1k docs the succinct BM25 must answer identically to the
+/// naive one. Catches any encoding/decoding drift that a hand-
+/// picked 4-doc test wouldn't stress (long posting lists, many
+/// distinct terms, variable doc lengths).
+#[test]
+fn succinct_bm25_1k_docs_matches_naive() {
+    let mut rng = SplitMix64(0xC0FFEE);
+    let mut builder = BM25Builder::new();
+    for i in 0..1_000 {
+        let doc = fake_document(&mut rng, 500, 20);
+        builder.insert(id_from_u64(i as u64 + 1), hash_tokens(&doc));
+    }
+    let naive = builder.build();
+    let succinct = SuccinctBM25Index::from_naive(&naive).unwrap();
+
+    assert_eq!(succinct.doc_count(), naive.doc_count());
+    assert_eq!(succinct.term_count(), naive.term_count());
+
+    // Sample a handful of terms, including very common and very
+    // rare ones from the fake vocab. Every one must produce the
+    // same posting list.
+    for term_text in ["w0", "w1", "w7", "w50", "w250", "w499"] {
+        let term = hash_tokens(term_text);
+        if term.is_empty() {
+            continue;
+        }
+        let a: Vec<_> = naive.query_term(&term[0]).collect();
+        let b: Vec<_> = succinct.query_term(&term[0]).collect();
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "term {term_text}: naive {} vs succinct {} postings",
+            a.len(),
+            b.len()
+        );
+        for ((id_a, s_a), (id_b, s_b)) in a.iter().zip(b.iter()) {
+            assert_eq!(id_a, id_b);
+            assert!(
+                (s_a - s_b).abs() < 1e-6,
+                "term {term_text}: score mismatch {s_a} vs {s_b}"
+            );
+        }
+    }
+
+    // Blob round-trip at this scale.
+    let bytes = succinct.to_bytes();
+    let reloaded = SuccinctBM25Index::try_from_bytes(&bytes).expect("valid");
+    assert_eq!(reloaded.doc_count(), succinct.doc_count());
+    let term = hash_tokens("w7");
+    let a: Vec<_> = succinct.query_term(&term[0]).collect();
+    let b: Vec<_> = reloaded.query_term(&term[0]).collect();
+    assert_eq!(a.len(), b.len());
+    for ((id_a, s_a), (id_b, s_b)) in a.iter().zip(b.iter()) {
+        assert_eq!(id_a, id_b);
+        assert!((s_a - s_b).abs() < 1e-6);
+    }
+}
+
+/// Succinct HNSW must answer the same top-k as the naive one for
+/// a 1k-vector corpus. This is the scale-level sanity check for
+/// the succinct graph + vector encoding — any off-by-one in
+/// offsets / vector indexing shows up as divergent results.
+#[test]
+fn succinct_hnsw_1k_docs_matches_naive() {
+    const DIM: usize = 16;
+
+    let mut rng = SplitMix64(0xBADF00D);
+    let mut builder = HNSWBuilder::new(DIM).with_seed(11);
+    for i in 0..1_000 {
+        let vec: Vec<f32> = (0..DIM)
+            .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
+            .collect();
+        builder.insert(id_from_u64((i + 1) as u64), vec).unwrap();
+    }
+    let naive = builder.build();
+    let succinct = SuccinctHNSWIndex::from_naive(&naive).unwrap();
+
+    for _ in 0..5 {
+        let q: Vec<f32> = (0..DIM)
+            .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
+            .collect();
+        let n = naive.similar(&q, 10, Some(50));
+        let s = succinct.similar(&q, 10, Some(50));
+        assert_eq!(n.len(), s.len());
+        for ((n_id, n_s), (s_id, s_s)) in n.iter().zip(s.iter()) {
+            assert_eq!(n_id, s_id, "doc mismatch at 1k scale");
+            assert!(
+                (n_s - s_s).abs() < 1e-5,
+                "score mismatch at 1k scale: {n_s} vs {s_s}"
+            );
+        }
+    }
 }
 
 #[test]
