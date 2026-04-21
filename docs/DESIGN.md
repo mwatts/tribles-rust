@@ -141,16 +141,26 @@ Lookup algorithm:
 
 ### What keys-side compression bought us
 
-- `keys` is now a `CompressedUniverse` (Phase 2b). On the
-  synthetic `id_from_u64` corpus the blob-size ratio didn't
-  move (keys are ~4 % of the blob; postings dominate). The
-  architectural win is type-level: `keys.access(code)` goes
+- `keys` is now a `CompressedUniverse` (Phase 2b). Measured via
+  `cargo run --release --example blob_sizes_at_scale`:
+
+  | corpus           | keys section vs 32 B flat |
+  | :--------------- | :------------------------: |
+  | scattered GenIds |        0.74×–0.81×         |
+  | 11-byte-prefix   |        0.29×–0.32×         |
+
+  "Scattered" is the pseudo-random `id_from_u64` with 16 trailing
+  random bytes (worst-ish case — only the leading 16 zero bytes
+  are shared). "Correlated" shares an 11-byte prefix and varies
+  only the last 5 — simulates "one session of entity ids minted
+  from a shared namespace seed."
+- Whole-blob ratio moves too, but modestly: 0.48×→0.42× at 1 k
+  docs with correlated keys; ~0.01×–0.02× improvement at 50 k
+  because postings dominate the denominator.
+- The architectural win is type-level: `keys.access(code)` goes
   through the same universe plumbing as every other `Value`
-  table in the stack, and on naturally correlated keys (real
-  GenIds sharing trible-structured bytes, short-string titles
-  sharing prefixes, enum-like tags) the fragment dictionary
-  collapses more. Range / prefix / membership queries over
-  the keys universe now compose for free.
+  table in the stack; range / prefix / membership queries over
+  the keys universe compose for free.
 ### Open compression directions
 
 - **Delta-encoded posting doc_idx** — posting lists are now
