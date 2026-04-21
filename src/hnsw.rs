@@ -14,16 +14,26 @@
 //! # Build and query
 //!
 //! ```
-//! # use triblespace_search::hnsw::FlatBuilder;
+//! # use triblespace::core::blob::MemoryBlobStore;
 //! # use triblespace::core::id::Id;
+//! # use triblespace::core::repo::BlobStore;
+//! # use triblespace::core::value::schemas::hash::Blake3;
+//! # use triblespace_search::hnsw::FlatBuilder;
+//! # use triblespace_search::schemas::put_embedding;
+//! let mut store = MemoryBlobStore::<Blake3>::new();
+//! let h1 = put_embedding::<_, Blake3>(&mut store, vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+//! let h2 = put_embedding::<_, Blake3>(&mut store, vec![0.0, 1.0, 0.0, 0.0]).unwrap();
+//! let h3 = put_embedding::<_, Blake3>(&mut store, vec![0.9, 0.1, 0.0, 0.0]).unwrap();
+//!
 //! let mut b = FlatBuilder::new(4);
-//! b.insert_id(Id::new([1; 16]).unwrap(), vec![1.0, 0.0, 0.0, 0.0]).unwrap();
-//! b.insert_id(Id::new([2; 16]).unwrap(), vec![0.0, 1.0, 0.0, 0.0]).unwrap();
-//! b.insert_id(Id::new([3; 16]).unwrap(), vec![0.9, 0.1, 0.0, 0.0]).unwrap();
+//! b.insert_id(Id::new([1; 16]).unwrap(), h1);
+//! b.insert_id(Id::new([2; 16]).unwrap(), h2);
+//! b.insert_id(Id::new([3; 16]).unwrap(), h3);
 //! let idx = b.build();
 //!
+//! let reader = store.reader().unwrap();
 //! let query = vec![1.0, 0.0, 0.0, 0.0];
-//! let hits = idx.similar_ids(&query, 2);
+//! let hits = idx.similar_ids(&query, 2, &reader).unwrap();
 //! assert_eq!(hits.len(), 2);
 //! // doc 1 is an exact match, doc 3 nearly so.
 //! assert_eq!(hits[0].0, Id::new([1; 16]).unwrap());

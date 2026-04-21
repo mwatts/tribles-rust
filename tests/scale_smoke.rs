@@ -121,7 +121,13 @@ fn hnsw_1k_vectors_recall_against_flat() {
     const N_DOCS: usize = 1_000;
     const DIM: usize = 32;
 
+    use triblespace::core::blob::MemoryBlobStore;
+    use triblespace::core::repo::BlobStore;
+    use triblespace::core::value::schemas::hash::Blake3;
+    use triblespace_search::schemas::put_embedding;
+
     let mut rng = SplitMix64(0xFACE_FEED);
+    let mut store = MemoryBlobStore::<Blake3>::new();
     let mut flat_b = FlatBuilder::new(DIM);
     let mut hnsw_b = HNSWBuilder::new(DIM).with_seed(7);
     for i in 0..N_DOCS {
@@ -129,11 +135,13 @@ fn hnsw_1k_vectors_recall_against_flat() {
             .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
             .collect();
         let doc = id_from_u64((i + 1) as u64);
-        flat_b.insert_id(doc, vec.clone()).unwrap();
+        let h = put_embedding::<_, Blake3>(&mut store, vec.clone()).unwrap();
+        flat_b.insert_id(doc, h);
         hnsw_b.insert_id(doc, vec).unwrap();
     }
     let flat = flat_b.build();
     let hnsw = hnsw_b.build();
+    let reader = store.reader().unwrap();
 
     let mut total_overlap = 0;
     let mut total_k = 0;
@@ -141,7 +149,12 @@ fn hnsw_1k_vectors_recall_against_flat() {
         let q: Vec<f32> = (0..DIM)
             .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
             .collect();
-        let truth: HashSet<_> = flat.similar(&q, 10).into_iter().map(|(d, _)| d).collect();
+        let truth: HashSet<_> = flat
+            .similar(&q, 10, &reader)
+            .unwrap()
+            .into_iter()
+            .map(|(d, _)| d)
+            .collect();
         let got: HashSet<_> = hnsw
             .similar(&q, 10, Some(100))
             .into_iter()
@@ -413,7 +426,13 @@ fn flat_1k_vectors_top_k_consistent() {
     const N_DOCS: usize = 1_000;
     const DIM: usize = 32;
 
+    use triblespace::core::blob::MemoryBlobStore;
+    use triblespace::core::repo::BlobStore;
+    use triblespace::core::value::schemas::hash::Blake3;
+    use triblespace_search::schemas::put_embedding;
+
     let mut rng = SplitMix64(0x1234_5678);
+    let mut store = MemoryBlobStore::<Blake3>::new();
     let mut builder = FlatBuilder::new(DIM);
     let target = id_from_u64(42);
     // One vector we know the answer for — all ones in the first
@@ -422,24 +441,27 @@ fn flat_1k_vectors_top_k_consistent() {
     for v in target_vec.iter_mut().take(DIM / 2) {
         *v = 1.0;
     }
-    builder.insert_id(target, target_vec.clone()).unwrap();
+    let h_target = put_embedding::<_, Blake3>(&mut store, target_vec.clone()).unwrap();
+    builder.insert_id(target, h_target);
     for i in 0..(N_DOCS - 1) {
         let vec: Vec<f32> = (0..DIM)
             .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
             .collect();
-        builder.insert_id(id_from_u64(i as u64 + 100), vec).unwrap();
+        let h = put_embedding::<_, Blake3>(&mut store, vec).unwrap();
+        builder.insert_id(id_from_u64(i as u64 + 100), h);
     }
     let idx = builder.build();
+    let reader = store.reader().unwrap();
 
     // The exact `target_vec` as a query should return `target` at
     // rank 1.
-    let hits = idx.similar_ids(&target_vec, 5);
+    let hits = idx.similar_ids(&target_vec, 5, &reader).unwrap();
     assert_eq!(hits.len(), 5);
     assert_eq!(hits[0].0, target);
 
     // Round-trip through bytes must preserve the top-k.
     let reloaded = FlatIndex::try_from_bytes(&idx.to_bytes()).expect("valid");
-    let hits2 = reloaded.similar_ids(&target_vec, 5);
+    let hits2 = reloaded.similar_ids(&target_vec, 5, &reader).unwrap();
     assert_eq!(hits.len(), hits2.len());
     for (a, b) in hits.iter().zip(hits2.iter()) {
         assert_eq!(a.0, b.0);
