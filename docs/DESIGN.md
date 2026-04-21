@@ -243,6 +243,41 @@ the bit-packed graph; see `SuccinctHNSWIndex::similar` in
   caller's decision via their embedding schema choice (the
   crate itself stays agnostic).
 
+### Handle-indirected storage (landed for Flat; HNSW next)
+
+`FlatIndex` now stores `(key, Handle<Blake3, Embedding>)` pairs
+instead of inline vectors (format version 5; see
+`src/schemas.rs` for the `Embedding` blob schema minted via
+`trible genid` at `EEC5DFDEA2FFCED70850DF83B03CB62B`).
+Embeddings live in the pile's blob store, content-addressed and
+dedup'd across indexes:
+
+```
+pile blob store:
+  Handle<Embedding> h_a → blob_a  (one copy of vector A)
+  Handle<Embedding> h_b → blob_b  (one copy of vector B)
+
+index_1:  [(k_1, h_a), (k_2, h_b), ...]   ← 64 B per entry
+index_2:  [(k_3, h_a), (k_4, h_b), ...]   ← same handles, shared blobs
+```
+
+At query time `FlatIndex::similar(q, k, &store)` walks the
+corpus, resolves each handle through `BlobStoreGet`, and scores
+against `q`. The per-handle lookup is the hot path — the
+`BlobCache` type in `triblespace::core::blob` is the natural
+wrapper when the same index gets hit repeatedly.
+
+Blob size shrank from 32 + 4·dim bytes/doc (inline) to 64
+bytes/doc (flat — key + handle only). For 100 k × 384-dim
+MiniLM: FLAT blob drops from ~150 MiB to ~6.5 MiB; embedding
+blobs (~147 MiB total) are now dedup'd and reusable.
+
+HNSW is slated for the same migration — one iteration of work
+because the graph construction needs vectors for distance
+computations during build. Plan: `HNSWBuilder::insert(key,
+handle, vec)` takes the raw vector for build-time distance,
+stores the handle in the final index, drops the vectors.
+
 ### Open compression directions
 
 - **Wavelet matrix on the neighbour column** — would give
