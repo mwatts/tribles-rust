@@ -10,6 +10,12 @@ The pattern below is the distilled version of what
 as a runnable faculty that maintains a BM25 index over wiki
 fragments in the caller's pile.
 
+A runnable, self-contained version of the same pattern ships
+as `cargo run --example faculty_wiki_search` — it uses a
+tempdir pile, seeds a handful of fragments, runs refresh, then
+issues a few queries. If the pseudo-code below drifts, that
+example is the source of truth.
+
 ## Example: `wiki_search.rs`
 
 ```rust,ignore

@@ -45,7 +45,7 @@ use triblespace::core::blob::schemas::succinctarchive::{
 use triblespace::core::blob::{Blob, BlobSchema, ToBlob, TryFromBlob};
 use triblespace::core::id::Id;
 use triblespace::core::id_hex;
-use triblespace::core::metadata::ConstId;
+use triblespace::core::metadata::{ConstDescribe, ConstId};
 use triblespace::core::value::RawValue;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -1989,6 +1989,12 @@ impl ConstId for SuccinctBM25Blob {
 
 impl BlobSchema for SuccinctBM25Blob {}
 
+// Default `describe` — fragment rooted at `Self::ID` with an
+// empty TribleSet. Lets `attributes!` declare value types like
+// `Handle<Blake3, SuccinctBM25Blob>` without the macro complaining
+// that the schema can't describe itself.
+impl ConstDescribe for SuccinctBM25Blob {}
+
 impl ToBlob<SuccinctBM25Blob> for &SuccinctBM25Index {
     fn to_blob(self) -> Blob<SuccinctBM25Blob> {
         Blob::new(Bytes::from_source(self.to_bytes()))
@@ -2040,6 +2046,8 @@ impl ConstId for SuccinctHNSWBlob {
 }
 
 impl BlobSchema for SuccinctHNSWBlob {}
+
+impl ConstDescribe for SuccinctHNSWBlob {}
 
 impl ToBlob<SuccinctHNSWBlob> for &SuccinctHNSWIndex {
     fn to_blob(self) -> Blob<SuccinctHNSWBlob> {
