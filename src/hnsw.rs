@@ -591,11 +591,26 @@ impl HNSWIndex {
     /// let view = idx.attach(&reader);
     /// view.similar(&query, k, ef)?;
     /// ```
-    pub fn attach<'a, B>(&'a self, store: &'a B) -> AttachedHNSWIndex<'a, B>
+    ///
+    /// The view wraps `store` in an internal
+    /// [`BlobCache`][c] keyed on `Handle<Blake3, Embedding>`,
+    /// so the HNSW walk's repeated visits to the same node
+    /// (greedy + ef-search revisit neighbours) deserialize
+    /// each embedding at most once per view. `B: Clone` is
+    /// required because the cache owns the store; the
+    /// typical readers (`MemoryBlobStoreReader`, pile
+    /// readers) are cheap-clone (just a `ReadHandle`
+    /// refcount bump).
+    ///
+    /// [c]: triblespace::core::blob::BlobCache
+    pub fn attach<'a, B>(&'a self, store: &B) -> AttachedHNSWIndex<'a, B>
     where
-        B: triblespace::core::repo::BlobStoreGet<Blake3>,
+        B: triblespace::core::repo::BlobStoreGet<Blake3> + Clone,
     {
-        AttachedHNSWIndex { index: self, store }
+        AttachedHNSWIndex {
+            index: self,
+            cache: triblespace::core::blob::BlobCache::new(store.clone()),
+        }
     }
 
     /// Serialize the index to a self-contained little-endian
@@ -837,12 +852,20 @@ impl HNSWIndex {
 /// resolve against — produced by [`HNSWIndex::attach`]. All
 /// `similar_*` methods live here; the bare [`HNSWIndex`] only
 /// exposes metadata and the blob format.
+///
+/// The view owns a [`BlobCache`][c] over the provided store,
+/// specialized to `(Embedding, View<[f32]>)`. HNSW graph walks
+/// revisit neighbour nodes repeatedly — the cache collapses
+/// those into a single blob-fetch + deserialize per node per
+/// view lifetime.
+///
+/// [c]: triblespace::core::blob::BlobCache
 pub struct AttachedHNSWIndex<'a, B>
 where
     B: triblespace::core::repo::BlobStoreGet<Blake3>,
 {
     index: &'a HNSWIndex,
-    store: &'a B,
+    cache: triblespace::core::blob::BlobCache<B, Blake3, Embedding, anybytes::View<[f32]>>,
 }
 
 impl<'a, B> AttachedHNSWIndex<'a, B>
@@ -925,10 +948,8 @@ where
         i: u32,
     ) -> Result<f32, B::GetError<anybytes::view::ViewError>> {
         let handle = self.index.handles[i as usize];
-        let view: anybytes::View<[f32]> = self
-            .store
-            .get::<anybytes::View<[f32]>, Embedding>(handle)?;
-        Ok(cosine_dist(q, view.as_ref()))
+        let view = self.cache.get(handle)?;
+        Ok(cosine_dist(q, view.as_ref().as_ref()))
     }
 
     fn greedy_search_layer(
@@ -1249,29 +1270,41 @@ impl FlatIndex {
     /// view.similar(&query, k)?;
     /// ```
     ///
-    /// Queries resolve embedding handles through `store` on
-    /// every distance evaluation — wrap `store` in a
-    /// `BlobCache` when the same view will be queried
-    /// repeatedly.
-    pub fn attach<'a, B>(&'a self, store: &'a B) -> AttachedFlatIndex<'a, B>
+    /// The view wraps `store` in an internal
+    /// [`BlobCache`][c] keyed on `Handle<Blake3, Embedding>`.
+    /// Flat's brute-force scan visits each handle only once
+    /// per query, so the cache's real payoff is across
+    /// repeated queries against the same view — identical
+    /// queries reuse the cached deserializations instead of
+    /// re-fetching. `B: Clone` so the cache can own the store;
+    /// typical readers are cheap-clone.
+    ///
+    /// [c]: triblespace::core::blob::BlobCache
+    pub fn attach<'a, B>(&'a self, store: &B) -> AttachedFlatIndex<'a, B>
     where
-        B: triblespace::core::repo::BlobStoreGet<Blake3>,
+        B: triblespace::core::repo::BlobStoreGet<Blake3> + Clone,
     {
-        AttachedFlatIndex { index: self, store }
+        AttachedFlatIndex {
+            index: self,
+            cache: triblespace::core::blob::BlobCache::new(store.clone()),
+        }
     }
 }
 
 /// A [`FlatIndex`] paired with the blob store its handles
 /// resolve against — produced by [`FlatIndex::attach`].
 ///
-/// Owns no data. Queries route through the inner store;
-/// dropping the view doesn't drop the index or the store.
+/// Owns a [`BlobCache`][c] over the store, specialized to
+/// `(Embedding, View<[f32]>)`. Dropping the view drops the
+/// cache; the underlying store is unaffected.
+///
+/// [c]: triblespace::core::blob::BlobCache
 pub struct AttachedFlatIndex<'a, B>
 where
     B: triblespace::core::repo::BlobStoreGet<Blake3>,
 {
     index: &'a FlatIndex,
-    store: &'a B,
+    cache: triblespace::core::blob::BlobCache<B, Blake3, Embedding, anybytes::View<[f32]>>,
 }
 
 impl<'a, B> AttachedFlatIndex<'a, B>
@@ -1308,9 +1341,8 @@ where
             std::collections::BinaryHeap::with_capacity(k + 1);
         for (i, key) in self.index.keys.iter().enumerate() {
             let handle = self.index.handles[i];
-            let view: anybytes::View<[f32]> =
-                self.store.get::<anybytes::View<[f32]>, Embedding>(handle)?;
-            let score = dot(&q, view.as_ref());
+            let view = self.cache.get(handle)?;
+            let score = dot(&q, view.as_ref().as_ref());
             heap.push(MinScored { key: *key, score });
             if heap.len() > k {
                 heap.pop();

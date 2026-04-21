@@ -922,13 +922,25 @@ impl SuccinctHNSWIndex {
     /// let view = idx.attach(&reader);
     /// view.similar(&q, k, ef)?;
     /// ```
-    pub fn attach<'a, B>(&'a self, store: &'a B) -> AttachedSuccinctHNSWIndex<'a, B>
+    ///
+    /// The view wraps `store` in an internal
+    /// [`BlobCache`][c] keyed on `Handle<Blake3, Embedding>`,
+    /// so the HNSW walk's repeat visits to the same node
+    /// deserialize each embedding at most once per view.
+    /// `B: Clone` so the cache can own the store; typical
+    /// readers are cheap-clone.
+    ///
+    /// [c]: triblespace::core::blob::BlobCache
+    pub fn attach<'a, B>(&'a self, store: &B) -> AttachedSuccinctHNSWIndex<'a, B>
     where
         B: triblespace::core::repo::BlobStoreGet<
                 triblespace::core::value::schemas::hash::Blake3,
-            >,
+            > + Clone,
     {
-        AttachedSuccinctHNSWIndex { index: self, store }
+        AttachedSuccinctHNSWIndex {
+            index: self,
+            cache: triblespace::core::blob::BlobCache::new(store.clone()),
+        }
     }
 
     /// Serialize to a self-contained blob. Layout:
@@ -1116,6 +1128,14 @@ impl SuccinctHNSWIndex {
 /// the query constraints live here; the bare
 /// [`SuccinctHNSWIndex`] only exposes metadata and the blob
 /// format.
+///
+/// The view owns a [`BlobCache`][c] over the provided store,
+/// specialized to `(Embedding, View<[f32]>)`. HNSW walks
+/// revisit neighbour nodes repeatedly — the cache collapses
+/// those into a single blob-fetch + deserialize per node per
+/// view.
+///
+/// [c]: triblespace::core::blob::BlobCache
 pub struct AttachedSuccinctHNSWIndex<'a, B>
 where
     B: triblespace::core::repo::BlobStoreGet<
@@ -1123,7 +1143,12 @@ where
         >,
 {
     index: &'a SuccinctHNSWIndex,
-    store: &'a B,
+    cache: triblespace::core::blob::BlobCache<
+        B,
+        triblespace::core::value::schemas::hash::Blake3,
+        crate::schemas::Embedding,
+        anybytes::View<[f32]>,
+    >,
 }
 
 impl<'a, B> AttachedSuccinctHNSWIndex<'a, B>
@@ -1185,9 +1210,8 @@ where
                 crate::schemas::Embedding,
             >,
         > = triblespace::core::value::Value::new(raw);
-        let view: anybytes::View<[f32]> =
-            self.store.get::<anybytes::View<[f32]>, crate::schemas::Embedding>(handle)?;
-        Ok(crate::hnsw::cosine_dist(q, view.as_ref()))
+        let view = self.cache.get(handle)?;
+        Ok(crate::hnsw::cosine_dist(q, view.as_ref().as_ref()))
     }
 
     /// Approximate top-k nearest neighbours to `query`.
