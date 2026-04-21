@@ -32,8 +32,9 @@ naive-then-succinct implementation order is the open work item.
 
 * **`BM25Index`**: in-memory build + single- and multi-term
   query, content-addressed byte serialization, `BlobSchema`
-  impl, triblespace `Constraint` for forward lookup
-  (`docs_containing(doc_var, term_value)`).
+  impl, two triblespace `Constraint`s — `docs_containing` (just
+  `doc`) and `docs_and_scores` (`doc` + `score` as bound
+  `Variable<GenId>` and `Variable<F32LE>`).
 * **`FlatIndex`**: brute-force k-NN baseline. Build + cosine
   top-k query, byte serialization, `Constraint` for similarity
   search. Useful for ground truth and small corpora.
@@ -44,20 +45,27 @@ naive-then-succinct implementation order is the open work item.
   truth at ≥ 70% top-10 recall.
 * **`tokens::hash_tokens`**: opt-in whitespace + lowercase +
   Blake3 tokenizer producing 32-byte term values.
+* **`schemas::F32LE`**: `ValueSchema` for packing `f32` scores
+  into 32-byte `Value<F32LE>`s. Used by the scored BM25
+  constraint.
 * One runnable example (`cargo run --example query_demo`)
   covering text search, multi-term OR-queries, and the
   value-as-term citation-search trick.
-* ~70 tests across unit, scale (1k-doc), engine-integration
+* 80 tests across unit, scale (1k-doc), engine-integration
   (`IntersectionConstraint` joins), and doctests.
 
 ### What's next
 
 * Jerky-backed succinct blobs (wavelet matrices for term-table
   + posting lists; per-layer wavelet matrices for HNSW
-  neighbour graphs). Same API, smaller and faster.
-* Additional token helpers (prefix, n-gram, phrase
-  rewriting).
-* `F32LE` value schema for scores as bound query variables.
+  neighbour graphs) via the `jerky::Serializable` pattern. Same
+  API, smaller and faster.
+* Additional token helpers (prefix, n-gram, phrase rewriting).
+* Vector-similarity constraints lifting `score` to a bound
+  `Variable<F32LE>` too, parallel to
+  `BM25Index::docs_and_scores`.
+* Runnable example composing BM25 + TribleSet filters in a
+  single `find!`.
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) and
 [`docs/QUERY_ENGINE_INTEGRATION.md`](docs/QUERY_ENGINE_INTEGRATION.md).
