@@ -1399,6 +1399,27 @@ impl SuccinctBM25Index {
         }
     }
 
+    /// Score a multi-term query as the sum of per-term BM25
+    /// weights (standard OR-like bag-of-words). Mirror of
+    /// [`crate::bm25::BM25Index::query_multi`] for the succinct
+    /// view. Returned `(doc_id, score)` pairs are sorted
+    /// descending by score; no top-k truncation — caller slices
+    /// what they need.
+    pub fn query_multi(&self, terms: &[RawValue]) -> Vec<(Id, f32)> {
+        let mut acc: std::collections::HashMap<Id, f32> =
+            std::collections::HashMap::new();
+        for term in terms {
+            for (doc, score) in self.query_term(term) {
+                *acc.entry(doc).or_insert(0.0) += score;
+            }
+        }
+        let mut out: Vec<(Id, f32)> = acc.into_iter().collect();
+        out.sort_unstable_by(|a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        out
+    }
+
     /// Serialize to a self-contained blob. The layout:
     ///
     /// ```text
@@ -1943,6 +1964,46 @@ mod tests {
         assert_eq!(succinct.doc_count(), 0);
         assert_eq!(succinct.term_count(), 0);
         assert!(succinct.query_term(&[0u8; 32]).next().is_none());
+    }
+
+    #[test]
+    fn succinct_bm25_query_multi_matches_naive() {
+        // Multi-term aggregate ranking must agree with the naive
+        // implementation (within the quantization tolerance).
+        // Use docs of DIFFERENT lengths so matching docs produce
+        // distinct BM25 scores — otherwise tied docs can come
+        // out in either order and the comparison flaps.
+        use crate::bm25::BM25Builder;
+        use crate::tokens::hash_tokens;
+        use triblespace::core::id::Id;
+        fn iid(byte: u8) -> Id {
+            Id::new([byte; 16]).unwrap()
+        }
+        let mut b = BM25Builder::new();
+        b.insert(iid(1), hash_tokens("quick fox"));
+        b.insert(
+            iid(2),
+            hash_tokens("quick red rapid fox jumps high over fences"),
+        );
+        b.insert(iid(3), hash_tokens("slow brown dog"));
+        let naive = b.build();
+        let succinct = SuccinctBM25Index::from_naive(&naive).unwrap();
+
+        let q = hash_tokens("quick fox");
+        let a = naive.query_multi(&q);
+        let b = succinct.query_multi(&q);
+
+        assert_eq!(a.len(), b.len());
+        // Distinct scores → ranking is deterministic, so a.i = b.i.
+        let tol = succinct.score_tolerance() * 2.0; // two terms summed.
+        for ((a_id, a_s), (b_id, b_s)) in a.iter().zip(b.iter()) {
+            assert_eq!(a_id, b_id, "ranking order mismatch");
+            assert!(
+                (a_s - b_s).abs() <= tol,
+                "score drift: naive={a_s} succinct={b_s} > tol {tol}"
+            );
+        }
+        assert_eq!(b.len(), 2);
     }
 
     fn build_succinct_sample() -> SuccinctBM25Index {
