@@ -614,25 +614,6 @@ fn width_for(n: usize) -> usize {
     }
 }
 
-/// Try to view a byte region as `&[f32]`. Returns `None` for an
-/// empty region (anybytes refuses to view a zero-length unaligned
-/// buffer; we short-circuit and let callers handle it as "no
-/// vectors"). Returns `Err` for non-empty regions that fail the
-/// alignment / length contract.
-fn view_f32_slice(bytes: &Bytes) -> Result<Option<anybytes::View<[f32]>>, SuccinctDocLensError> {
-    if bytes.is_empty() {
-        return Ok(None);
-    }
-    bytes
-        .clone()
-        .view::<[f32]>()
-        .map(Some)
-        .map_err(|_| SuccinctDocLensError::SizeMismatch {
-            bytes: bytes.len(),
-            expected: 0,
-        })
-}
-
 /// Jerky-backed HNSW layer-graph component.
 ///
 /// Flat CSR over `(layer, node) → [neighbour_node_idx, ...]`:

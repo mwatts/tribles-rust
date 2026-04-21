@@ -119,3 +119,74 @@ fn succinct_hnsw_survives_blob_store_roundtrip() {
         );
     }
 }
+
+/// The `Embedding` blob schema is content-addressed, so two
+/// HNSW indexes that embed the same vectors under the same
+/// entities end up with the same handles — and share the same
+/// underlying blobs in the store. This is the load-bearing
+/// property behind the handle-indirected design; explicitly
+/// test it.
+#[test]
+fn hnsw_indexes_share_embedding_blobs() {
+    use triblespace::core::repo::BlobStore;
+    use triblespace::core::value::schemas::hash::Blake3;
+    use triblespace_search::schemas::put_embedding;
+
+    let embeddings: Vec<(Id, Vec<f32>)> = vec![
+        (iid(1), vec![1.0, 0.0, 0.0, 0.0]),
+        (iid(2), vec![0.0, 1.0, 0.0, 0.0]),
+        (iid(3), vec![0.0, 0.0, 1.0, 0.0]),
+    ];
+
+    // Build two independent HNSW indexes over the same
+    // embeddings. Each index owns its own graph state (M / M0,
+    // seed, neighbour lists), but the handles they store for
+    // each entity must be identical — content-addressing is
+    // deterministic on normalized bytes.
+    let mut store = MemoryBlobStore::<Blake3>::new();
+
+    let mut a_b = HNSWBuilder::new(4).with_seed(1);
+    for (pid, v) in &embeddings {
+        let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
+        a_b.insert_id(*pid, h, v.clone()).unwrap();
+    }
+    let idx_a = a_b.build();
+
+    let mut b_b = HNSWBuilder::new(4).with_seed(99); // different seed!
+    for (pid, v) in &embeddings {
+        let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
+        b_b.insert_id(*pid, h, v.clone()).unwrap();
+    }
+    let idx_b = b_b.build();
+
+    // Handles must be identical per-entity.
+    assert_eq!(idx_a.doc_count(), idx_b.doc_count());
+    for i in 0..idx_a.doc_count() {
+        assert_eq!(
+            idx_a.handles()[i],
+            idx_b.handles()[i],
+            "handle mismatch at i={i} — content-address dedup failed"
+        );
+    }
+
+    // Store size check: we did 6 `put_embedding` calls but
+    // only 3 distinct vectors were supplied, so only 3 blobs
+    // survive in the reader's view.
+    let reader = store.reader().unwrap();
+    assert_eq!(
+        reader.len(),
+        3,
+        "expected 3 unique embedding blobs, found {}",
+        reader.len()
+    );
+
+    // Both indexes, attached to the same reader, agree on top-1
+    // for the [1,0,0,0] query — entity 1 (exact match) —
+    // without any extra storage. HNSW graph differences can
+    // reorder ties lower down, but the exact match is stable.
+    let q = vec![1.0, 0.0, 0.0, 0.0];
+    let top_a = idx_a.attach(&reader).similar_ids(&q, 1, Some(10)).unwrap();
+    let top_b = idx_b.attach(&reader).similar_ids(&q, 1, Some(10)).unwrap();
+    assert_eq!(top_a[0].0, iid(1));
+    assert_eq!(top_b[0].0, iid(1));
+}
