@@ -46,6 +46,7 @@ use triblespace::core::value::RawValue;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::bm25::BM25Index;
+use crate::hnsw::HNSWIndex;
 use crate::FORMAT_VERSION;
 
 /// Byte-layout mirror of [`CompactVectorMeta`] that's safe to
@@ -669,6 +670,289 @@ impl SuccinctGraph {
             (start, end)
         };
         (start..end).map(move |i| self.neighbours.get_int(i).unwrap() as u32)
+    }
+}
+
+/// Zero-copy, jerky-backed HNSW index.
+///
+/// Same query surface as [`HNSWIndex`] (approximate top-k via
+/// Malkov-Yashunin greedy descent + ef-search), but the graph
+/// lives in a [`SuccinctGraph`] (bit-packed CSR over
+/// (layer, node) → neighbours) and doc ids in a
+/// [`FixedBytesTable<16>`]. Vectors are stored as a flat f32
+/// block — compression (f16 / int8 / PQ) is a separate decision
+/// the caller makes via the embedding schema.
+///
+/// Built via [`Self::from_naive`]; a direct builder skipping the
+/// naive intermediate is a later optimization.
+#[derive(Debug)]
+pub struct SuccinctHNSWIndex {
+    dim: usize,
+    m: u16,
+    m0: u16,
+    max_level: u8,
+    entry_point: Option<u32>,
+    doc_ids: FixedBytesTable<16>,
+    /// L2-normalized vectors in flat row-major `[u8]` form
+    /// (4 bytes per f32, `n_nodes × dim` floats).
+    vectors: Bytes,
+    graph: SuccinctGraph,
+}
+
+impl SuccinctHNSWIndex {
+    /// Re-encode a naive [`HNSWIndex`] into the succinct form.
+    pub fn from_naive(idx: &HNSWIndex) -> Result<Self, SuccinctDocLensError> {
+        let n = idx.doc_count();
+        let dim = idx.dim();
+        let max_level = idx.max_level();
+        let n_layers = max_level as usize + 1;
+
+        // doc_ids.
+        let doc_id_rows: Vec<[u8; 16]> = (0..n).map(|i| *idx.doc_ids()[i].as_ref()).collect();
+        let doc_ids_bytes = FixedBytesTable::<16>::build(&doc_id_rows);
+        let doc_ids = FixedBytesTable::<16>::from_bytes(doc_ids_bytes, n)?;
+
+        // vectors: flat f32 block.
+        let mut vec_buf = Vec::with_capacity(n * dim * 4);
+        for i in 0..n {
+            let v = idx.node_vector(i).expect("node in range");
+            for &x in v {
+                vec_buf.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        let vectors = Bytes::from_source(vec_buf);
+
+        // Build layer-major graph: layer_graph[L][i] = neighbours.
+        // Empty lists are fine for nodes not promoted to layer L —
+        // the search walks through them as dead ends.
+        let mut layer_graph: Vec<Vec<Vec<u32>>> = (0..n_layers)
+            .map(|_| (0..n).map(|_| Vec::new()).collect())
+            .collect();
+        for layer in 0..n_layers {
+            for i in 0..n {
+                let lvl = idx.node_level(i).expect("node in range") as usize;
+                if lvl >= layer {
+                    layer_graph[layer][i] = idx.node_neighbours(i, layer as u8).to_vec();
+                }
+            }
+        }
+        let (graph_bytes, graph_meta) = SuccinctGraph::build(&layer_graph, n)?;
+        let graph = SuccinctGraph::from_bytes(graph_meta, graph_bytes)?;
+
+        Ok(Self {
+            dim,
+            m: idx.m(),
+            m0: idx.m0(),
+            max_level,
+            entry_point: idx.entry_point(),
+            doc_ids,
+            vectors,
+            graph,
+        })
+    }
+
+    /// Vector dimensionality.
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+    /// Number of indexed documents.
+    pub fn doc_count(&self) -> usize {
+        self.doc_ids.len()
+    }
+    /// Max neighbours per non-zero layer.
+    pub fn m(&self) -> u16 {
+        self.m
+    }
+    /// Max neighbours on layer 0.
+    pub fn m0(&self) -> u16 {
+        self.m0
+    }
+    /// Highest layer any node was promoted to.
+    pub fn max_level(&self) -> u8 {
+        self.max_level
+    }
+
+    /// Read vector `i` as a borrowed `&[f32]` (zero-copy via
+    /// anybytes::Bytes → f32 slice cast).
+    ///
+    /// Returns `None` for out-of-range indices.
+    fn vector(&self, i: usize) -> Option<Vec<f32>> {
+        if i >= self.doc_count() {
+            return None;
+        }
+        let start = i * self.dim * 4;
+        let end = start + self.dim * 4;
+        if end > self.vectors.len() {
+            return None;
+        }
+        Some(
+            self.vectors[start..end]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect(),
+        )
+    }
+
+    /// Approximate top-k nearest neighbours to `query` under
+    /// cosine similarity. Mirrors [`HNSWIndex::similar`] exactly,
+    /// just against succinct storage.
+    pub fn similar(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: Option<usize>,
+    ) -> Vec<(Id, f32)> {
+        if query.len() != self.dim || k == 0 {
+            return Vec::new();
+        }
+        let Some(entry) = self.entry_point else {
+            return Vec::new();
+        };
+        let mut q = query.to_vec();
+        crate::hnsw::normalize(&mut q);
+        let ef = ef.unwrap_or(k).max(k);
+
+        // Greedy descent from max_level down to 1.
+        let mut curr = entry;
+        for lvl in (1..=self.max_level).rev() {
+            curr = self.greedy_search_layer(&q, curr, lvl);
+        }
+        let candidates = self.search_layer(&q, curr, ef, 0);
+        let mut ranked: Vec<(Id, f32)> = candidates
+            .into_iter()
+            .map(|(i, dist)| {
+                let raw = self.doc_ids.get(i as usize).expect("in range");
+                let id = Id::new(*raw).expect("non-nil");
+                (id, 1.0 - dist)
+            })
+            .collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        ranked.truncate(k);
+        ranked
+    }
+
+    fn greedy_search_layer(&self, q: &[f32], entry: u32, layer: u8) -> u32 {
+        let mut curr = entry;
+        let entry_vec = self
+            .vector(curr as usize)
+            .expect("entry in range");
+        let mut curr_dist = crate::hnsw::cosine_dist(q, &entry_vec);
+        loop {
+            let mut changed = false;
+            let neigh: Vec<u32> = self
+                .graph
+                .neighbours(curr as usize, layer as usize)
+                .collect();
+            if neigh.is_empty() {
+                return curr;
+            }
+            for n in neigh {
+                let v = self.vector(n as usize).expect("neighbour in range");
+                let d = crate::hnsw::cosine_dist(q, &v);
+                if d < curr_dist {
+                    curr_dist = d;
+                    curr = n;
+                    changed = true;
+                }
+            }
+            if !changed {
+                return curr;
+            }
+        }
+    }
+
+    fn search_layer(
+        &self,
+        q: &[f32],
+        entry: u32,
+        ef: usize,
+        layer: u8,
+    ) -> Vec<(u32, f32)> {
+        use std::collections::{BinaryHeap, HashSet};
+        let mut visited: HashSet<u32> = HashSet::new();
+        visited.insert(entry);
+        let d0 = crate::hnsw::cosine_dist(
+            q,
+            &self.vector(entry as usize).expect("entry in range"),
+        );
+
+        // Local heap wrappers mirroring hnsw.rs (we re-implement
+        // rather than expose the heap wrappers to keep the naive
+        // module's internals private).
+        #[derive(Clone, Copy)]
+        struct MinD {
+            idx: u32,
+            dist: f32,
+        }
+        impl PartialEq for MinD {
+            fn eq(&self, o: &Self) -> bool {
+                self.dist == o.dist
+            }
+        }
+        impl Eq for MinD {}
+        impl PartialOrd for MinD {
+            fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(o))
+            }
+        }
+        impl Ord for MinD {
+            fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+                o.dist.partial_cmp(&self.dist).unwrap_or(std::cmp::Ordering::Equal)
+            }
+        }
+        #[derive(Clone, Copy)]
+        struct MaxD {
+            idx: u32,
+            dist: f32,
+        }
+        impl PartialEq for MaxD {
+            fn eq(&self, o: &Self) -> bool {
+                self.dist == o.dist
+            }
+        }
+        impl Eq for MaxD {}
+        impl PartialOrd for MaxD {
+            fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(o))
+            }
+        }
+        impl Ord for MaxD {
+            fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+                self.dist.partial_cmp(&o.dist).unwrap_or(std::cmp::Ordering::Equal)
+            }
+        }
+
+        let mut candidates: BinaryHeap<MinD> = BinaryHeap::new();
+        candidates.push(MinD { idx: entry, dist: d0 });
+        let mut results: BinaryHeap<MaxD> = BinaryHeap::new();
+        results.push(MaxD { idx: entry, dist: d0 });
+        while let Some(c) = candidates.pop() {
+            let farthest = results.peek().map(|r| r.dist).unwrap_or(f32::INFINITY);
+            if c.dist > farthest && results.len() >= ef {
+                break;
+            }
+            let neigh: Vec<u32> = self
+                .graph
+                .neighbours(c.idx as usize, layer as usize)
+                .collect();
+            for n in neigh {
+                if !visited.insert(n) {
+                    continue;
+                }
+                let v = self.vector(n as usize).expect("neighbour in range");
+                let d = crate::hnsw::cosine_dist(q, &v);
+                let farthest =
+                    results.peek().map(|r| r.dist).unwrap_or(f32::INFINITY);
+                if d < farthest || results.len() < ef {
+                    candidates.push(MinD { idx: n, dist: d });
+                    results.push(MaxD { idx: n, dist: d });
+                    if results.len() > ef {
+                        results.pop();
+                    }
+                }
+            }
+        }
+        results.into_iter().map(|m| (m.idx, m.dist)).collect()
     }
 }
 
@@ -1489,6 +1773,65 @@ mod tests {
         let layers = vec![vec![vec![5u32], vec![0], vec![0]]];
         let err = SuccinctGraph::build(&layers, 3).unwrap_err();
         assert!(matches!(err, SuccinctDocLensError::SizeMismatch { .. }));
+    }
+
+    #[test]
+    fn succinct_hnsw_matches_naive_on_sample() {
+        use crate::hnsw::HNSWBuilder;
+        use triblespace::core::id::Id;
+
+        fn iid(byte: u8) -> Id {
+            Id::new([byte; 16]).unwrap()
+        }
+
+        // Small deterministic corpus of 4-D vectors. with_seed
+        // locks the level sampling so the graph is reproducible.
+        let mut b = HNSWBuilder::new(4).with_seed(42);
+        for i in 1..=16u8 {
+            let f = i as f32;
+            let vec = vec![
+                f.sin(),
+                f.cos(),
+                (f * 0.5).sin(),
+                (f * 0.3).cos(),
+            ];
+            b.insert(iid(i), vec).unwrap();
+        }
+        let naive = b.build();
+        let succinct = SuccinctHNSWIndex::from_naive(&naive).unwrap();
+
+        assert_eq!(succinct.doc_count(), naive.doc_count());
+        assert_eq!(succinct.dim(), naive.dim());
+        assert_eq!(succinct.max_level(), naive.max_level());
+
+        // Same queries must return the same top-k rows, in the
+        // same order, with the same similarity scores.
+        let queries = [
+            vec![1.0, 0.0, 0.5, 0.5],
+            vec![0.0, 1.0, -0.3, 0.1],
+            vec![-0.5, 0.5, 0.5, -0.5],
+        ];
+        for q in &queries {
+            let n = naive.similar(q, 5, None);
+            let s = succinct.similar(q, 5, None);
+            assert_eq!(n.len(), s.len(), "count mismatch for query {q:?}");
+            for ((n_id, n_s), (s_id, s_s)) in n.iter().zip(s.iter()) {
+                assert_eq!(n_id, s_id, "doc mismatch at top-k for {q:?}");
+                assert!(
+                    (n_s - s_s).abs() < 1e-5,
+                    "score mismatch for {q:?}: naive={n_s} succinct={s_s}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn succinct_hnsw_empty_index() {
+        use crate::hnsw::HNSWBuilder;
+        let naive = HNSWBuilder::new(3).build();
+        let succinct = SuccinctHNSWIndex::from_naive(&naive).unwrap();
+        assert_eq!(succinct.doc_count(), 0);
+        assert!(succinct.similar(&[0.0, 0.0, 0.0], 5, None).is_empty());
     }
 
     #[test]

@@ -501,6 +501,40 @@ impl HNSWIndex {
         self.max_level
     }
 
+    /// Internal doc-id table: `doc_ids()[i]` is the external `Id`
+    /// for internal node index `i`. Exposed so succinct
+    /// re-encoders can snapshot the table without roundtripping
+    /// through `similar()`.
+    pub fn doc_ids(&self) -> &[Id] {
+        &self.doc_ids
+    }
+
+    /// Vector for node `i`. Already L2-normalized by `insert`.
+    pub fn node_vector(&self, i: usize) -> Option<&[f32]> {
+        self.nodes.get(i).map(|n| n.vector.as_slice())
+    }
+
+    /// Level node `i` was sampled into.
+    pub fn node_level(&self, i: usize) -> Option<u8> {
+        self.nodes.get(i).map(|n| n.level)
+    }
+
+    /// Neighbours of node `i` on `layer`. Empty slice if the
+    /// node wasn't inserted at that layer.
+    pub fn node_neighbours(&self, i: usize, layer: u8) -> &[u32] {
+        self.nodes
+            .get(i)
+            .and_then(|n| n.neighbors.get(layer as usize))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Current entry-point node index (the last inserted node
+    /// at `max_level`), or `None` if the index is empty.
+    pub fn entry_point(&self) -> Option<u32> {
+        self.entry_point
+    }
+
     /// Approximate top-k nearest neighbours to `query` under
     /// cosine similarity. `ef` tunes the search width (larger =
     /// better recall at higher cost); pass `None` to default to
@@ -852,7 +886,7 @@ impl HNSWIndex {
 }
 
 /// Cosine distance = 1 - dot(a, b) for pre-normalized vectors.
-fn cosine_dist(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn cosine_dist(a: &[f32], b: &[f32]) -> f32 {
     1.0 - dot(a, b)
 }
 
@@ -928,7 +962,7 @@ impl std::fmt::Display for DimMismatch {
 impl std::error::Error for DimMismatch {}
 
 /// L2-normalize `v` in place. Zero vectors are left untouched.
-fn normalize(v: &mut [f32]) {
+pub(crate) fn normalize(v: &mut [f32]) {
     let norm_sq: f32 = v.iter().map(|&x| x * x).sum();
     if norm_sq > 0.0 {
         let inv = 1.0 / norm_sq.sqrt();
