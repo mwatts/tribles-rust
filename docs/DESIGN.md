@@ -94,6 +94,36 @@ for rank/select over terms and on `doc_idx` for posting lookup,
 plus ELF/Simple16 compression on score deltas. The API stays
 identical.
 
+The swap will follow jerky's own `Serializable` pattern:
+
+```rust
+// Example shape — mirrors jerky/src/serialization.rs.
+#[repr(C)]
+#[derive(zerocopy::FromBytes, KnownLayout, Immutable)]
+pub struct BM25IndexMeta {
+    // Fixed-size offsets + counts into the Bytes region.
+    n_docs: u32,
+    n_terms: u32,
+    term_table_offset: u64,
+    postings_offset: u64,
+    // ... etc.
+}
+
+impl Serializable for BM25Index {
+    type Meta = BM25IndexMeta;
+    type Error = BM25LoadError;
+    fn metadata(&self) -> Self::Meta { ... }
+    fn from_bytes(meta: Self::Meta, bytes: Bytes) -> Result<Self, Self::Error> {
+        // Slice `bytes` using offsets from `meta`, no copies.
+    }
+}
+```
+
+The blob body will be `[meta_bytes | arena_bytes]` with the meta
+prefix at a fixed size so `try_from_bytes` can `zerocopy::from_bytes`
+the prefix, wrap the tail as a `Bytes`, and build the view in
+constant time.
+
 ## `SuccinctHNSWIndex` blob layout
 
 Unlabeled-edge HNSW, inspired by SuccinctArchive's RING index but
