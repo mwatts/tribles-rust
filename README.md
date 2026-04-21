@@ -36,13 +36,14 @@ naive-then-succinct implementation order is the open work item.
   `doc`) and `docs_and_scores` (`doc` + `score` as bound
   `Variable<GenId>` and `Variable<F32LE>`).
 * **`FlatIndex`**: brute-force k-NN baseline. Build + cosine
-  top-k query, byte serialization, `Constraint` for similarity
-  search. Useful for ground truth and small corpora.
+  top-k query, byte serialization, two `Constraint`s —
+  `similar_constraint` (just `doc`) and `similar_with_scores`
+  (`doc` + `score`). Useful for ground truth and small corpora.
 * **`HNSWIndex`**: layered-graph approximate k-NN (Malkov &
   Yashunin 2018) with deterministic level sampling, ef-search,
-  byte serialization, `BlobSchema` impl, `Constraint`.
-  Validated at 1 000 docs / 32-dim against `FlatIndex` ground
-  truth at ≥ 70% top-10 recall.
+  byte serialization, `BlobSchema` impl, two `Constraint`s
+  parallel to FlatIndex's. Validated at 1 000 docs / 32-dim
+  against `FlatIndex` ground truth at ≥ 70% top-10 recall.
 * **`tokens::hash_tokens`**: opt-in whitespace + lowercase +
   Blake3 tokenizer producing 32-byte term values.
 * **`schemas::F32LE`**: `ValueSchema` for packing `f32` scores
@@ -51,7 +52,7 @@ naive-then-succinct implementation order is the open work item.
 * One runnable example (`cargo run --example query_demo`)
   covering text search, multi-term OR-queries, and the
   value-as-term citation-search trick.
-* 80 tests across unit, scale (1k-doc), engine-integration
+* 83 tests across unit, scale (1k-doc), engine-integration
   (`IntersectionConstraint` joins), and doctests.
 
 ### What's next
@@ -61,9 +62,6 @@ naive-then-succinct implementation order is the open work item.
   neighbour graphs) via the `jerky::Serializable` pattern. Same
   API, smaller and faster.
 * Additional token helpers (prefix, n-gram, phrase rewriting).
-* Vector-similarity constraints lifting `score` to a bound
-  `Variable<F32LE>` too, parallel to
-  `BM25Index::docs_and_scores`.
 * Runnable example composing BM25 + TribleSet filters in a
   single `find!`.
 
