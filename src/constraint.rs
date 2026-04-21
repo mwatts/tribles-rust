@@ -369,6 +369,159 @@ impl<'a> Constraint<'a> for SimilarToVector<'a> {
     }
 }
 
+// ── FlatIndex constraint with score ─────────────────────────────────
+
+/// Scored variant of [`SimilarToVector`]: binds both `doc` and
+/// `score` per top-`k` hit. Produced by
+/// [`FlatIndex::similar_with_scores`]. See [`BM25ScoredPostings`]
+/// for the sibling BM25 version.
+pub struct SimilarToVectorScored<'a> {
+    index: &'a FlatIndex,
+    doc: Variable<GenId>,
+    score: Variable<F32LE>,
+    query: Vec<f32>,
+    k: usize,
+}
+
+impl<'a> SimilarToVectorScored<'a> {
+    pub fn new(
+        index: &'a FlatIndex,
+        doc: Variable<GenId>,
+        score: Variable<F32LE>,
+        query: Vec<f32>,
+        k: usize,
+    ) -> Self {
+        Self {
+            index,
+            doc,
+            score,
+            query,
+            k,
+        }
+    }
+}
+
+impl FlatIndex {
+    /// Two-variable similarity constraint — binds both `doc` and
+    /// the cosine-similarity `score` for each top-k hit.
+    pub fn similar_with_scores(
+        &self,
+        doc: Variable<GenId>,
+        score: Variable<F32LE>,
+        query: Vec<f32>,
+        k: usize,
+    ) -> SimilarToVectorScored<'_> {
+        SimilarToVectorScored::new(self, doc, score, query, k)
+    }
+}
+
+impl<'a> Constraint<'a> for SimilarToVectorScored<'a> {
+    fn variables(&self) -> VariableSet {
+        VariableSet::new_singleton(self.doc.index)
+            .union(VariableSet::new_singleton(self.score.index))
+    }
+
+    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
+        if variable == self.doc.index || variable == self.score.index {
+            Some(self.k.min(self.index.doc_count()))
+        } else {
+            None
+        }
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        binding: &Binding,
+        proposals: &mut Vec<RawValue>,
+    ) {
+        if variable == self.doc.index {
+            let bound_score = binding
+                .get(self.score.index)
+                .map(raw_value_to_f32);
+            for (doc_id, score) in self.index.similar(&self.query, self.k) {
+                if let Some(bs) = bound_score {
+                    if (score - bs).abs() > f32::EPSILON {
+                        continue;
+                    }
+                }
+                proposals.push(id_to_raw_value(doc_id));
+            }
+        } else if variable == self.score.index {
+            let bound_doc = binding
+                .get(self.doc.index)
+                .and_then(raw_value_to_id);
+            for (doc_id, score) in self.index.similar(&self.query, self.k) {
+                if let Some(bd) = bound_doc {
+                    if doc_id != bd {
+                        continue;
+                    }
+                }
+                proposals.push(f32_to_raw_value(score));
+            }
+        }
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        binding: &Binding,
+        proposals: &mut Vec<RawValue>,
+    ) {
+        let top: Vec<(Id, f32)> = self.index.similar(&self.query, self.k);
+        if variable == self.doc.index {
+            let bound_score = binding
+                .get(self.score.index)
+                .map(raw_value_to_f32);
+            let allowed: HashSet<Id> = top
+                .iter()
+                .filter(|(_, s)| match bound_score {
+                    Some(bs) => (s - bs).abs() <= f32::EPSILON,
+                    None => true,
+                })
+                .map(|(d, _)| *d)
+                .collect();
+            proposals.retain(|raw| {
+                raw_value_to_id(raw)
+                    .map(|id| allowed.contains(&id))
+                    .unwrap_or(false)
+            });
+        } else if variable == self.score.index {
+            let bound_doc = binding
+                .get(self.doc.index)
+                .and_then(raw_value_to_id);
+            let allowed: HashSet<u32> = top
+                .iter()
+                .filter(|(d, _)| match bound_doc {
+                    Some(bd) => *d == bd,
+                    None => true,
+                })
+                .map(|(_, s)| s.to_bits())
+                .collect();
+            proposals.retain(|raw| allowed.contains(&raw_value_to_f32(raw).to_bits()));
+        }
+    }
+
+    fn satisfied(&self, binding: &Binding) -> bool {
+        let bound_doc = binding
+            .get(self.doc.index)
+            .and_then(raw_value_to_id);
+        let bound_score = binding
+            .get(self.score.index)
+            .map(raw_value_to_f32);
+        match (bound_doc, bound_score) {
+            (None, None) => true,
+            _ => self.index.similar(&self.query, self.k).iter().any(
+                |&(d, s)| {
+                    bound_doc.map_or(true, |bd| d == bd)
+                        && bound_score
+                            .map_or(true, |bs| (s - bs).abs() <= f32::EPSILON)
+                },
+            ),
+        }
+    }
+}
+
 // ── HNSWIndex constraint ─────────────────────────────────────────────
 
 /// HNSW version of [`SimilarToVector`]. Same shape; different
@@ -477,6 +630,167 @@ impl<'a> Constraint<'a> for SimilarToVectorHNSW<'a> {
                     .any(|(d, _)| d == doc_id)
             }
             None => true,
+        }
+    }
+}
+
+// ── HNSWIndex constraint with score ─────────────────────────────────
+
+/// Scored variant of [`SimilarToVectorHNSW`]: binds both `doc`
+/// and the cosine `score` per top-`k` hit.
+pub struct SimilarToVectorHNSWScored<'a> {
+    index: &'a HNSWIndex,
+    doc: Variable<GenId>,
+    score: Variable<F32LE>,
+    query: Vec<f32>,
+    k: usize,
+    ef: Option<usize>,
+}
+
+impl<'a> SimilarToVectorHNSWScored<'a> {
+    pub fn new(
+        index: &'a HNSWIndex,
+        doc: Variable<GenId>,
+        score: Variable<F32LE>,
+        query: Vec<f32>,
+        k: usize,
+        ef: Option<usize>,
+    ) -> Self {
+        Self {
+            index,
+            doc,
+            score,
+            query,
+            k,
+            ef,
+        }
+    }
+}
+
+impl HNSWIndex {
+    /// Two-variable similarity constraint for HNSW — binds both
+    /// `doc` and cosine `score` for each top-k hit.
+    pub fn similar_with_scores(
+        &self,
+        doc: Variable<GenId>,
+        score: Variable<F32LE>,
+        query: Vec<f32>,
+        k: usize,
+        ef: Option<usize>,
+    ) -> SimilarToVectorHNSWScored<'_> {
+        SimilarToVectorHNSWScored::new(self, doc, score, query, k, ef)
+    }
+}
+
+impl<'a> Constraint<'a> for SimilarToVectorHNSWScored<'a> {
+    fn variables(&self) -> VariableSet {
+        VariableSet::new_singleton(self.doc.index)
+            .union(VariableSet::new_singleton(self.score.index))
+    }
+
+    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
+        if variable == self.doc.index || variable == self.score.index {
+            Some(self.k.min(self.index.doc_count()))
+        } else {
+            None
+        }
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        binding: &Binding,
+        proposals: &mut Vec<RawValue>,
+    ) {
+        if variable == self.doc.index {
+            let bound_score = binding
+                .get(self.score.index)
+                .map(raw_value_to_f32);
+            for (doc_id, score) in
+                self.index.similar(&self.query, self.k, self.ef)
+            {
+                if let Some(bs) = bound_score {
+                    if (score - bs).abs() > f32::EPSILON {
+                        continue;
+                    }
+                }
+                proposals.push(id_to_raw_value(doc_id));
+            }
+        } else if variable == self.score.index {
+            let bound_doc = binding
+                .get(self.doc.index)
+                .and_then(raw_value_to_id);
+            for (doc_id, score) in
+                self.index.similar(&self.query, self.k, self.ef)
+            {
+                if let Some(bd) = bound_doc {
+                    if doc_id != bd {
+                        continue;
+                    }
+                }
+                proposals.push(f32_to_raw_value(score));
+            }
+        }
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        binding: &Binding,
+        proposals: &mut Vec<RawValue>,
+    ) {
+        let top = self.index.similar(&self.query, self.k, self.ef);
+        if variable == self.doc.index {
+            let bound_score = binding
+                .get(self.score.index)
+                .map(raw_value_to_f32);
+            let allowed: HashSet<Id> = top
+                .iter()
+                .filter(|(_, s)| match bound_score {
+                    Some(bs) => (s - bs).abs() <= f32::EPSILON,
+                    None => true,
+                })
+                .map(|(d, _)| *d)
+                .collect();
+            proposals.retain(|raw| {
+                raw_value_to_id(raw)
+                    .map(|id| allowed.contains(&id))
+                    .unwrap_or(false)
+            });
+        } else if variable == self.score.index {
+            let bound_doc = binding
+                .get(self.doc.index)
+                .and_then(raw_value_to_id);
+            let allowed: HashSet<u32> = top
+                .iter()
+                .filter(|(d, _)| match bound_doc {
+                    Some(bd) => *d == bd,
+                    None => true,
+                })
+                .map(|(_, s)| s.to_bits())
+                .collect();
+            proposals.retain(|raw| allowed.contains(&raw_value_to_f32(raw).to_bits()));
+        }
+    }
+
+    fn satisfied(&self, binding: &Binding) -> bool {
+        let bound_doc = binding
+            .get(self.doc.index)
+            .and_then(raw_value_to_id);
+        let bound_score = binding
+            .get(self.score.index)
+            .map(raw_value_to_f32);
+        match (bound_doc, bound_score) {
+            (None, None) => true,
+            _ => self
+                .index
+                .similar(&self.query, self.k, self.ef)
+                .into_iter()
+                .any(|(d, s)| {
+                    bound_doc.map_or(true, |bd| d == bd)
+                        && bound_score
+                            .map_or(true, |bs| (s - bs).abs() <= f32::EPSILON)
+                }),
         }
     }
 }
@@ -941,6 +1255,81 @@ mod tests {
 
         // Unbound → trivially satisfied.
         assert!(c.satisfied(&Binding::default()));
+    }
+
+    // ── SimilarToVectorScored (flat + score) ──────────────────
+
+    #[test]
+    fn flat_scored_constraint_proposes_both() {
+        let idx = sample_flat();
+        let mut ctx = triblespace::core::query::VariableContext::new();
+        let doc: Variable<GenId> = ctx.next_variable();
+        let score: Variable<F32LE> = ctx.next_variable();
+        let c = idx.similar_with_scores(doc, score, vec![1.0, 0.0, 0.0], 3);
+
+        let vars = c.variables();
+        assert!(vars.is_set(doc.index));
+        assert!(vars.is_set(score.index));
+
+        let mut doc_props = Vec::new();
+        c.propose(doc.index, &Binding::default(), &mut doc_props);
+        assert_eq!(doc_props.len(), 3);
+        for p in &doc_props {
+            raw_value_to_id(p).expect("genid round-trip");
+        }
+
+        let mut score_props = Vec::new();
+        c.propose(score.index, &Binding::default(), &mut score_props);
+        assert_eq!(score_props.len(), 3);
+        for p in &score_props {
+            let s = raw_value_to_f32(p);
+            assert!(s.is_finite() && s >= -1.0 && s <= 1.0);
+        }
+    }
+
+    #[test]
+    fn flat_scored_binds_doc_given_score() {
+        let idx = sample_flat();
+        let mut ctx = triblespace::core::query::VariableContext::new();
+        let doc: Variable<GenId> = ctx.next_variable();
+        let score: Variable<F32LE> = ctx.next_variable();
+        let c = idx.similar_with_scores(doc, score, vec![1.0, 0.0, 0.0], 4);
+
+        // Prime `score` to the exact-match value (1.0). Only
+        // id(1) — the [1,0,0] doc — should come back.
+        let mut binding = Binding::default();
+        binding.set(score.index, &f32_to_raw_value(1.0));
+
+        let mut props = Vec::new();
+        c.propose(doc.index, &binding, &mut props);
+        assert_eq!(props.len(), 1);
+        assert_eq!(raw_value_to_id(&props[0]).unwrap(), id(1));
+    }
+
+    // ── SimilarToVectorHNSWScored (hnsw + score) ──────────────
+
+    #[test]
+    fn hnsw_scored_constraint_proposes_both() {
+        let idx = sample_hnsw();
+        let mut ctx = triblespace::core::query::VariableContext::new();
+        let doc: Variable<GenId> = ctx.next_variable();
+        let score: Variable<F32LE> = ctx.next_variable();
+        let c = idx.similar_with_scores(doc, score, vec![1.0, 0.0, 0.0], 2, Some(10));
+
+        let vars = c.variables();
+        assert!(vars.is_set(doc.index));
+        assert!(vars.is_set(score.index));
+
+        let mut doc_props = Vec::new();
+        c.propose(doc.index, &Binding::default(), &mut doc_props);
+        assert!(!doc_props.is_empty());
+        for p in &doc_props {
+            raw_value_to_id(p).expect("genid round-trip");
+        }
+
+        let mut score_props = Vec::new();
+        c.propose(score.index, &Binding::default(), &mut score_props);
+        assert_eq!(score_props.len(), doc_props.len());
     }
 
     /// Sanity-check that `propose` yields values every consumer
