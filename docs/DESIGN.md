@@ -223,3 +223,106 @@ an `Embedding<const D: usize>` schema they control.
 - Score combinations across BM25 + HNSW (hybrid search). Caller
   writes a `bm25(...) + alpha * similar(...)` combinator in the
   query.
+
+## Worked example: 100 000 wiki fragments
+
+Sizing exercise for the canonical downstream: indexing a Liora
+pile of ≈ 100 k typst wiki fragments, average ≈ 180 words each
+(≈ 300 raw tokens with punctuation). Numbers are back-of-envelope
+for the *naive* (current) layout — the jerky succinct pass will
+shrink the term-heavy sections.
+
+### BM25 — size estimate
+
+Assume after `hash_tokens`:
+- `n_docs = 100 000`
+- `avg_doc_len ≈ 180` unique tokens per doc after trim/dedup
+- distinct terms across corpus `n_terms ≈ 300 000` (Heaps' law
+  with β ≈ 0.5, k ≈ 30 for English-ish text)
+- total postings `≈ 100 000 × 180 = 18 000 000` entries
+
+Naive layout (current `to_bytes`):
+| Section             | Per-entry | Count         | Bytes         |
+| :------------------ | --------: | ------------: | ------------: |
+| header              | —         | —             |            32 |
+| doc_ids             |     16 B  | 100 000       |       1.6 MiB |
+| doc_lens            |      4 B  | 100 000       |       0.4 MiB |
+| terms (sorted)      |     32 B  | 300 000       |       9.6 MiB |
+| postings_offsets    |      4 B  | 300 001       |       1.2 MiB |
+| postings            |      8 B  | 18 000 000    |       144 MiB |
+| **Total**           |           |               |   **~157 MiB**|
+
+The **postings table dominates** — 91 % of the blob. That's where
+the jerky succinct pass has the biggest lever: a wavelet matrix
+over `doc_idx` plus quantized (`f16`) scores would cut it to
+`≈ 18 M × 4 B ≈ 72 MiB` even without delta coding, or
+`≈ 18 M × (log₂(100k) / 8 + 2) B ≈ 36 MiB` with bit-packed
+doc_idx. Rough target: 40–60 MiB for the full blob.
+
+Term table is the second-largest chunk (9.6 MiB of 32-byte hashes).
+A wavelet matrix over byte-quantized prefixes + flat tail trades
+some rank/select cost for compression, but 10 MiB is small enough
+that the naive version is fine until someone complains.
+
+### BM25 — build time
+
+Build is O(total postings) with hashmap bookkeeping: `18 M`
+insertions into the `HashMap<RawValue, HashMap<u32, u32>>` tf
+table, then a sort over 300 k term hashes (32-byte compare).
+On current laptop hardware:
+- Hash-tokenize 100 k fragments × 180 tokens ≈ 18 M Blake3 hashes.
+  Blake3 is ~3 GB/s on short inputs → ~0.5 s.
+- Hashmap inserts: ~100 ns each × 18 M ≈ 1.8 s.
+- Term sort: 300 k × log₂(300 k) × 32-byte compare ≈ 50 ms.
+- Score computation: 18 M FMA-ish float ops ≈ 50 ms.
+
+So **~3 s single-threaded** for the full corpus. A multi-threaded
+builder (shard by doc, merge the per-shard tf maps) would cut
+this to ~1 s on an 8-core laptop. Not yet implemented.
+
+### BM25 — query latency
+
+Single-term query:
+- Binary-search `terms` (32-byte compare): ~19 iterations × ~100 ns
+  = ~2 μs.
+- Scan posting list: average `18 M / 300 k = 60` postings per
+  term, each 8 B contiguous — ~0.5 μs of memory-bandwidth-bound
+  scan.
+- Total: **~3 μs per term**, before join overhead.
+
+Intersection of two terms (`find! and!`): query engine joins the
+smaller posting list against the larger; real cost is
+O(min(|A|, |B|)) per the usual merge-join. At 60 postings per
+term, a 2-term `and!` is still comfortably sub-10 μs.
+
+### HNSW — size estimate
+
+At `n = 100 000`, `dim = 384` (MiniLM), `M = 16`, M0 = 32:
+- `doc_ids`: 100 k × 16 B = 1.6 MiB
+- `embeddings`: 100 k × 384 × 4 B = **147 MiB** (dominates)
+- `node_levels`: 100 k × 1 B = 0.1 MiB
+- `neighbour_offsets`: 100 k × 8 × 4 B ≈ 3.2 MiB (avg ~8 layers
+  at `log_M(100k) ≈ 4`, padded for uniform indexing)
+- `neighbour_array`: ~100 k × M0 × 4 B ≈ 13 MiB (mostly layer 0)
+- **Total ~165 MiB**, 89 % of which is raw f32 embeddings.
+
+Jerky-succinct pass only helps the graph (`neighbour_array` +
+`neighbour_offsets`) — the embeddings are the caller's data and
+compressing them (f16, int8, PQ) is a separate design decision
+the caller makes when choosing the `Embedding<const D: usize>`
+schema. Graph-only savings are ≈ 10 MiB → ≈ 3 MiB (wavelet
+matrix on source × target pairs), so the big-picture BM25+HNSW
+blob for 100 k frags sits around 200 MiB and the succinct pass
+takes it to ~180 MiB — embedding dominance means the compression
+win is mostly on the BM25 side.
+
+### Takeaways
+
+- Naive BM25 blob is ~1.5 KiB per doc — already shippable.
+- Postings table is where succinctness earns its keep (3–4×
+  expected).
+- For HNSW, the interesting compression sits in *caller-owned*
+  embedding bytes. This crate's succinct pass is about graph
+  compactness + rank/select speed, not bulk size.
+- At these scales a single-node mmap-backed blob is fine; the
+  "distributed indexes" non-goal holds even at 1 M docs.
