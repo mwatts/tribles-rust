@@ -50,8 +50,6 @@ use triblespace::core::value::RawValue;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use std::collections::HashMap;
-
-use crate::bm25::BM25Index;
 use crate::hnsw::HNSWIndex;
 
 /// Byte-layout mirror of [`CompactVectorMeta`] that's safe to
@@ -2731,18 +2729,16 @@ mod tests {
             .unwrap();
             b.insert_id(id, hash_tokens(&text));
         }
-        let naive = b.clone().build_naive();
-        let succinct = b.build();
-
-        let naive_bytes = naive.to_bytes();
-        let succinct_bytes = succinct.to_bytes();
+        let naive_size = b.clone().build_naive().byte_size();
+        let succinct_bytes = b.build().to_bytes();
         // The target is a real savings; at this scale we expect
-        // the succinct blob to be strictly smaller.
+        // the succinct blob to be strictly smaller than the naive
+        // flat-array baseline.
         assert!(
-            succinct_bytes.len() < naive_bytes.len(),
-            "succinct {} should be < naive {}",
+            succinct_bytes.len() < naive_size,
+            "succinct {} should be < naive baseline {}",
             succinct_bytes.len(),
-            naive_bytes.len(),
+            naive_size,
         );
     }
 

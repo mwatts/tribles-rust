@@ -54,64 +54,6 @@ use crate::schemas::Embedding;
 // identity. A breaking format change mints a new schema ID
 // and therefore a new type, so the compiler polices it.
 
-const HNSW_HEADER_LEN: usize = 24;
-
-/// Errors produced by [`HNSWIndex::try_from_bytes`].
-#[derive(Debug, Clone, PartialEq)]
-pub enum HNSWLoadError {
-    ShortHeader,
-    TruncatedSection(&'static str),
-    /// A stored neighbour index is `>= n_nodes`.
-    OutOfRangeNeighbour(u32),
-    /// A per-node neighbour count was larger than the corpus.
-    ImpossibleNeighbourCount(u32),
-}
-
-impl std::fmt::Display for HNSWLoadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ShortHeader => write!(f, "HNSW blob shorter than header"),
-            Self::TruncatedSection(name) => {
-                write!(f, "HNSW blob: truncated section `{name}`")
-            }
-            Self::OutOfRangeNeighbour(i) => {
-                write!(f, "HNSW blob: neighbour index {i} ≥ n_nodes")
-            }
-            Self::ImpossibleNeighbourCount(n) => {
-                write!(
-                    f,
-                    "HNSW blob: node has {n} neighbours but corpus is smaller"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for HNSWLoadError {}
-
-// Byte format for the flat k-NN blob — different on-disk
-// shape from HNSW (no layers, no graph). Same no-magic /
-// no-version discipline.
-const FLAT_HEADER_LEN: usize = 24;
-
-/// Errors produced by [`FlatIndex::try_from_bytes`].
-#[derive(Debug, Clone, PartialEq)]
-pub enum FlatLoadError {
-    ShortHeader,
-    TruncatedSection(&'static str),
-}
-
-impl std::fmt::Display for FlatLoadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ShortHeader => write!(f, "FLAT blob shorter than header"),
-            Self::TruncatedSection(n) => write!(f, "FLAT blob: truncated section `{n}`"),
-        }
-    }
-}
-
-impl std::error::Error for FlatLoadError {}
-
 // ── Proper HNSW graph (layered, approximate k-NN) ─────────────────
 
 /// Per-node state during build: vector lives inline so graph
@@ -604,228 +546,24 @@ impl HNSWIndex {
         }
     }
 
-    /// Serialize the index to a self-contained little-endian
-    /// byte buffer. Layout:
+    /// Theoretical size of the naive flat-array serialization in
+    /// bytes — kept as a baseline to regression-check that the
+    /// succinct HNSW blob actually saves space.
     ///
-    /// ```text
-    /// [32 B header]
-    ///   magic u32 = "HNSW"
-    ///   version u16
-    ///   reserved u16
-    ///   n_nodes u32
-    ///   dim u32
-    ///   M u16, M0 u16
-    ///   max_level u8, has_entry u8, reserved 2 B
-    ///   entry_point u32
-    ///   reserved 4 B
-    /// [n_nodes × 32 B keys]
-    /// [n_nodes × 32 B handles] — Value<Handle<Blake3, Embedding>>
-    /// [n_nodes × 1 B node_level]
-    /// [n_nodes × layer_count+1 × 4 B per-layer neighbour offsets
-    ///   — cumulative, starts at 0]
-    /// [total_neighbours × 4 B neighbour indices]
-    /// ```
-    ///
-    /// Embeddings are NOT inline — the `handles` section
-    /// references blobs in the pile's blob store. Query time
-    /// resolves handles through a caller-supplied
-    /// `BlobStoreGet` (see [`similar`]).
-    ///
-    /// [`similar`]: Self::similar
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let n_nodes = self.nodes.len() as u32;
-        let has_entry: u8 = self.entry_point.is_some() as u8;
-        let entry = self.entry_point.unwrap_or(0);
-        let dim = self.dim as u32;
-
-        let mut buf = Vec::new();
-        // Header (24 B).
-        buf.extend_from_slice(&n_nodes.to_le_bytes()); // 4
-        buf.extend_from_slice(&dim.to_le_bytes()); // 4
-        buf.extend_from_slice(&self.m.to_le_bytes()); // 2
-        buf.extend_from_slice(&self.m0.to_le_bytes()); // 2
-        buf.push(self.max_level); // 1
-        buf.push(has_entry); // 1
-        buf.extend_from_slice(&[0u8; 2]); // 2 reserved
-        buf.extend_from_slice(&entry.to_le_bytes()); // 4
-        buf.extend_from_slice(&[0u8; 4]); // 4 trailing pad → 24
-        debug_assert_eq!(buf.len(), HNSW_HEADER_LEN);
-
-        // keys
-        for key in &self.keys {
-            buf.extend_from_slice(key);
-        }
-        // handles
-        for handle in &self.handles {
-            buf.extend_from_slice(&handle.raw);
-        }
-        // node levels
-        for node in &self.nodes {
-            buf.push(node.level);
-        }
-        // per-node neighbour offsets + flat neighbour array.
-        // Per node we store `level + 2` offsets (one per layer
-        // 0..=level, plus a tail offset); neighbour indices live
-        // in a single trailing flat array.
-        let max_layer_count = (self.max_level as usize) + 1;
-        let total_neighbours: u64 = self
+    /// Layout: 24 B header + `n_nodes × 32 B` keys + `n_nodes ×
+    /// 32 B` handles + `n_nodes × 1 B` levels + per-node offset
+    /// table (`(max_level + 2) × 4 B` stride) + total neighbours
+    /// × 4 B.
+    pub fn byte_size(&self) -> usize {
+        let n = self.nodes.len();
+        let entries_per_node = (self.max_level as usize) + 2;
+        let total_neighbours: usize = self
             .nodes
             .iter()
-            .map(|n| n.neighbors.iter().map(|l| l.len() as u64).sum::<u64>())
+            .map(|n| n.neighbors.iter().map(|l| l.len()).sum::<usize>())
             .sum();
-
-        // Offsets: for each node, (level + 2) u32s. Layout puts
-        // them all first so loading can stream them without
-        // back-patching.
-        let mut neighbour_bytes: Vec<u8> = Vec::with_capacity(total_neighbours as usize * 4);
-        for node in &self.nodes {
-            let mut running: u32 = 0;
-            buf.extend_from_slice(&running.to_le_bytes());
-            for layer in &node.neighbors {
-                running += layer.len() as u32;
-                buf.extend_from_slice(&running.to_le_bytes());
-                for &n in layer {
-                    neighbour_bytes.extend_from_slice(&n.to_le_bytes());
-                }
-            }
-            // Pad the node's offset table to max_layer_count + 1
-            // entries so each node has the same offset stride —
-            // simplifies deserialization indexing.
-            let actual_entries = node.neighbors.len() + 1; // level..=level inclusive + tail
-            let padding = (max_layer_count + 1).saturating_sub(actual_entries);
-            for _ in 0..padding {
-                buf.extend_from_slice(&running.to_le_bytes());
-            }
-        }
-        buf.extend(neighbour_bytes);
-        buf
+        24 + n * 32 + n * 32 + n + n * entries_per_node * 4 + total_neighbours * 4
     }
-
-    /// Reload an index previously produced by [`to_bytes`].
-    ///
-    /// [`to_bytes`]: Self::to_bytes
-    pub fn try_from_bytes(bytes: &[u8]) -> Result<Self, HNSWLoadError> {
-        use HNSWLoadError as E;
-        if bytes.len() < HNSW_HEADER_LEN {
-            return Err(E::ShortHeader);
-        }
-        let n_nodes = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-        let dim = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
-        let m = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
-        let m0 = u16::from_le_bytes(bytes[10..12].try_into().unwrap());
-        let max_level = bytes[12];
-        let has_entry = bytes[13] != 0;
-        // bytes[14..16] reserved
-        let entry_raw = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
-        // bytes[20..24] reserved
-
-        let mut pos = HNSW_HEADER_LEN;
-        // keys
-        let keys_end = pos + n_nodes * 32;
-        if bytes.len() < keys_end {
-            return Err(E::TruncatedSection("keys"));
-        }
-        let mut keys: Vec<RawValue> = Vec::with_capacity(n_nodes);
-        for chunk in bytes[pos..keys_end].chunks_exact(32) {
-            let raw: RawValue = chunk.try_into().unwrap();
-            keys.push(raw);
-        }
-        pos = keys_end;
-
-        // handles
-        let handles_end = pos + n_nodes * 32;
-        if bytes.len() < handles_end {
-            return Err(E::TruncatedSection("handles"));
-        }
-        let mut handles: Vec<Value<Handle<Blake3, Embedding>>> = Vec::with_capacity(n_nodes);
-        for chunk in bytes[pos..handles_end].chunks_exact(32) {
-            let raw: RawValue = chunk.try_into().unwrap();
-            handles.push(Value::new(raw));
-        }
-        pos = handles_end;
-        let _ = dim; // dim stays in the header as metadata; no inline vectors to size.
-
-        // levels
-        let levels_end = pos + n_nodes;
-        if bytes.len() < levels_end {
-            return Err(E::TruncatedSection("levels"));
-        }
-        let levels: Vec<u8> = bytes[pos..levels_end].to_vec();
-        pos = levels_end;
-
-        // per-node offset tables (size = max_layer_count + 1
-        // u32 entries per node).
-        let max_layer_count = (max_level as usize) + 1;
-        let entries_per_node = max_layer_count + 1;
-        let offsets_end = pos + n_nodes * entries_per_node * 4;
-        if bytes.len() < offsets_end {
-            return Err(E::TruncatedSection("neighbour_offsets"));
-        }
-        let all_offsets: Vec<u32> = bytes[pos..offsets_end]
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-            .collect();
-        pos = offsets_end;
-
-        // flat neighbour indices
-        let remaining = &bytes[pos..];
-        let all_neighbours: Vec<u32> = remaining
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-            .collect();
-
-        // Rebuild per-node HNSWIndexNode structs.
-        let mut nodes: Vec<HNSWIndexNode> = Vec::with_capacity(n_nodes);
-        let mut neighbour_cursor: u32 = 0;
-        for i in 0..n_nodes {
-            let level = levels[i];
-            let n_layers = level as usize + 1;
-            let mut layer_lists: Vec<Vec<u32>> = Vec::with_capacity(n_layers);
-            let offset_block = &all_offsets[i * entries_per_node..(i + 1) * entries_per_node];
-            for layer_idx in 0..n_layers {
-                let start = offset_block[layer_idx];
-                let end = offset_block[layer_idx + 1];
-                if start > end {
-                    return Err(E::TruncatedSection("neighbour_offsets"));
-                }
-                let mut list: Vec<u32> = Vec::with_capacity((end - start) as usize);
-                for offset in start..end {
-                    let neighbour_pos = neighbour_cursor + (offset - start);
-                    let Some(&n) = all_neighbours.get(neighbour_pos as usize) else {
-                        return Err(E::TruncatedSection("neighbours"));
-                    };
-                    if n as usize >= n_nodes {
-                        return Err(E::OutOfRangeNeighbour(n));
-                    }
-                    list.push(n);
-                }
-                layer_lists.push(list);
-            }
-            let last = offset_block[n_layers];
-            let first = offset_block[0];
-            let span = last - first;
-            if span as usize > n_nodes * n_layers {
-                return Err(E::ImpossibleNeighbourCount(span));
-            }
-            neighbour_cursor += span;
-            nodes.push(HNSWIndexNode {
-                level,
-                neighbors: layer_lists,
-            });
-        }
-
-        Ok(Self {
-            dim,
-            m,
-            m0,
-            nodes,
-            keys,
-            handles,
-            entry_point: if has_entry { Some(entry_raw) } else { None },
-            max_level,
-        })
-    }
-
 }
 
 /// A [`HNSWIndex`] paired with the blob store its handles
@@ -1357,79 +1095,13 @@ where
 }
 
 impl FlatIndex {
-    /// Serialize to a self-contained little-endian byte buffer.
-    ///
-    /// Layout:
-    /// ```text
-    /// [32 B header]
-    ///   magic u32 = "FLAT"
-    ///   version u16
-    ///   reserved u16
-    ///   n_docs u32
-    ///   dim u32
-    ///   reserved 12 B
-    /// [n_docs × 32 B keys]
-    /// [n_docs × 32 B handles] — Value<Handle<Blake3, Embedding>>
-    /// ```
-    ///
-    /// Embeddings are NOT stored in this blob — they live in
-    /// the pile's blob store, referenced by handle. The blob
-    /// here is tiny: header + 64 bytes per doc.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let n_docs = self.keys.len() as u32;
-        let dim = self.dim as u32;
-
-        let mut buf = Vec::with_capacity(FLAT_HEADER_LEN + self.keys.len() * 64);
-
-        buf.extend_from_slice(&n_docs.to_le_bytes()); // 4
-        buf.extend_from_slice(&dim.to_le_bytes()); // 4
-        buf.extend_from_slice(&[0u8; 16]); // 16 trailing pad → total 24
-        debug_assert_eq!(buf.len(), FLAT_HEADER_LEN);
-
-        for key in &self.keys {
-            buf.extend_from_slice(key);
-        }
-        for handle in &self.handles {
-            buf.extend_from_slice(&handle.raw);
-        }
-        buf
-    }
-
-    /// Reload an index previously produced by [`to_bytes`].
-    ///
-    /// [`to_bytes`]: Self::to_bytes
-    pub fn try_from_bytes(bytes: &[u8]) -> Result<Self, FlatLoadError> {
-        use FlatLoadError as E;
-
-        if bytes.len() < FLAT_HEADER_LEN {
-            return Err(E::ShortHeader);
-        }
-        let n_docs = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-        let dim = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
-
-        let mut pos = FLAT_HEADER_LEN;
-        let keys_end = pos + n_docs * 32;
-        if bytes.len() < keys_end {
-            return Err(E::TruncatedSection("keys"));
-        }
-        let mut keys: Vec<RawValue> = Vec::with_capacity(n_docs);
-        for chunk in bytes[pos..keys_end].chunks_exact(32) {
-            let raw: RawValue = chunk.try_into().unwrap();
-            keys.push(raw);
-        }
-        pos = keys_end;
-
-        let handles_end = pos + n_docs * 32;
-        if bytes.len() < handles_end {
-            return Err(E::TruncatedSection("handles"));
-        }
-        let mut handles: Vec<Value<Handle<Blake3, Embedding>>> = Vec::with_capacity(n_docs);
-        for chunk in bytes[pos..handles_end].chunks_exact(32) {
-            let raw: RawValue = chunk.try_into().unwrap();
-            handles.push(Value::new(raw));
-        }
-
-        Ok(Self { dim, keys, handles })
+    /// Theoretical size of the naive flat-array serialization in
+    /// bytes — baseline for comparing against more compressed
+    /// forms. `24` B header + 64 B per doc (32 B key + 32 B
+    /// handle); embeddings live in the pile's blob store and
+    /// aren't counted here.
+    pub fn byte_size(&self) -> usize {
+        24 + self.keys.len() * 64
     }
 }
 
@@ -1626,47 +1298,9 @@ mod tests {
     }
 
     #[test]
-    fn flat_bytes_round_trip() {
-        let (original, mut store) = sample_flat();
-        let reloaded = FlatIndex::try_from_bytes(&original.to_bytes()).expect("valid blob");
-        assert_eq!(reloaded.dim(), original.dim());
-        assert_eq!(reloaded.doc_count(), original.doc_count());
-
-        // Query results must match exactly — handles round-trip
-        // unchanged, and the same store resolves them both.
-        let q = vec![1.0, 0.0, 0.0];
-        let a = original.attach(&reader_of(&mut store)).similar(&q, 3).unwrap();
-        let b = reloaded.attach(&reader_of(&mut store)).similar(&q, 3).unwrap();
-        assert_eq!(a.len(), b.len());
-        for (x, y) in a.iter().zip(b.iter()) {
-            assert_eq!(x.0, y.0);
-            assert!((x.1 - y.1).abs() < 1e-6);
-        }
-    }
-
-    #[test]
-    fn flat_blob_is_deterministic() {
-        let (a, _) = sample_flat();
-        let (b, _) = sample_flat();
-        assert_eq!(a.to_bytes(), b.to_bytes());
-    }
-
-    #[test]
-    fn flat_short_header_rejected() {
-        let err = FlatIndex::try_from_bytes(&[0; 8]).unwrap_err();
-        assert_eq!(err, FlatLoadError::ShortHeader);
-    }
-
-    // Magic/version rejection tests are gone — the blob no
-    // longer carries those fields. Load identity is established
-    // by the typed `BlobSchema` handle instead.
-
-    #[test]
-    fn flat_truncation_rejected() {
-        let (idx, _store) = sample_flat();
-        let bytes = idx.to_bytes();
-        let err = FlatIndex::try_from_bytes(&bytes[..bytes.len() - 1]).unwrap_err();
-        assert!(matches!(err, FlatLoadError::TruncatedSection(_)));
+    fn flat_byte_size_matches_formula() {
+        let (idx, _) = sample_flat();
+        assert_eq!(idx.byte_size(), 24 + idx.doc_count() * 64);
     }
 
     // ── HNSW tests ────────────────────────────────────────────────
@@ -1843,50 +1477,21 @@ mod tests {
     }
 
     #[test]
-    fn hnsw_empty_bytes_round_trip() {
-        let idx = HNSWBuilder::new(3).build();
-        let bytes = idx.to_bytes();
-        let reloaded = HNSWIndex::try_from_bytes(&bytes).expect("valid blob");
-        assert_eq!(reloaded.doc_count(), 0);
-        assert_eq!(reloaded.dim(), 3);
+    fn hnsw_byte_size_positive_and_growing() {
+        let (idx, _) = sample_hnsw();
+        let small = idx.byte_size();
+        assert!(small > 0);
+        // Same corpus plus one doc must be strictly larger in the
+        // naive layout — 32 B key + 32 B handle + 1 B level +
+        // whatever neighbours land on the new node.
+        let mut store = MemoryBlobStore::<Blake3>::new();
+        let mut b = HNSWBuilder::new(3).with_seed(19);
+        hnsw_insert(&mut b, &mut store, id(1), vec![1.0, 0.0, 0.0]).unwrap();
+        hnsw_insert(&mut b, &mut store, id(2), vec![0.0, 1.0, 0.0]).unwrap();
+        hnsw_insert(&mut b, &mut store, id(3), vec![0.5, 0.5, 0.0]).unwrap();
+        hnsw_insert(&mut b, &mut store, id(4), vec![0.0, 0.0, 1.0]).unwrap();
+        hnsw_insert(&mut b, &mut store, id(5), vec![0.2, 0.3, 0.5]).unwrap();
+        let larger = b.build().byte_size();
+        assert!(larger > small);
     }
-
-    #[test]
-    fn hnsw_bytes_round_trip_preserves_queries() {
-        let (idx, mut store) = sample_hnsw();
-        let bytes = idx.to_bytes();
-        let reloaded = HNSWIndex::try_from_bytes(&bytes).expect("valid blob");
-        assert_eq!(reloaded.doc_count(), idx.doc_count());
-        assert_eq!(reloaded.dim(), idx.dim());
-        assert_eq!(reloaded.m(), idx.m());
-        assert_eq!(reloaded.m0(), idx.m0());
-        assert_eq!(reloaded.max_level(), idx.max_level());
-
-        let q = vec![1.0, 0.0, 0.0];
-        let reader = store.reader().unwrap();
-        let a = idx.attach(&reader).similar(&q, 4, Some(10)).unwrap();
-        let b = reloaded.attach(&reader).similar(&q, 4, Some(10)).unwrap();
-        assert_eq!(a.len(), b.len());
-        for (x, y) in a.iter().zip(b.iter()) {
-            assert_eq!(x.0, y.0);
-            assert!((x.1 - y.1).abs() < 1e-5);
-        }
-    }
-
-    #[test]
-    fn hnsw_bytes_are_deterministic() {
-        let (a, _) = sample_hnsw();
-        let (b, _) = sample_hnsw();
-        assert_eq!(a.to_bytes(), b.to_bytes());
-    }
-
-    #[test]
-    fn hnsw_short_header_rejected() {
-        let err = HNSWIndex::try_from_bytes(&[0; 10]).unwrap_err();
-        assert_eq!(err, HNSWLoadError::ShortHeader);
-    }
-
-    // No magic/version rejection test — those fields are gone.
-    // Blob identity now comes from the typed `BlobSchema`
-    // handle, which the compiler checks for us.
 }

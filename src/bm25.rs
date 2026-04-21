@@ -57,40 +57,6 @@ use triblespace::core::value::{RawValue, Value, ValueSchema};
 const DEFAULT_K1: f32 = 1.5;
 const DEFAULT_B: f32 = 0.75;
 
-// ── Byte layout constants ────────────────────────────────────────────
-
-/// Header length in bytes. Five `u32`/`f32` fields, no magic
-/// or version — the blob-level type (e.g. a `BlobSchema` ID
-/// on a typed handle) carries that identity externally.
-const HEADER_LEN: usize = 20;
-
-/// Errors produced by [`BM25Index::try_from_bytes`].
-#[derive(Debug, Clone, PartialEq)]
-pub enum BM25LoadError {
-    /// Blob is shorter than the fixed header.
-    ShortHeader,
-    /// Declared section sizes run past the end of the blob.
-    TruncatedSection(&'static str),
-    /// A posting-list offset is not monotonically non-decreasing.
-    NonMonotonicOffsets,
-}
-
-impl std::fmt::Display for BM25LoadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ShortHeader => write!(f, "BM25 blob shorter than header"),
-            Self::TruncatedSection(name) => {
-                write!(f, "BM25 blob: truncated section `{name}`")
-            }
-            Self::NonMonotonicOffsets => {
-                write!(f, "BM25 blob: posting-list offsets are not monotonic")
-            }
-        }
-    }
-}
-
-impl std::error::Error for BM25LoadError {}
-
 /// Accumulator for documents to be indexed. Call [`insert`] once
 /// per doc, then [`build`] to produce a [`BM25Index`].
 ///
@@ -491,164 +457,53 @@ impl BM25Index {
         &self.postings[lo..hi]
     }
 
-    /// Serialize the index to a self-contained little-endian byte
-    /// buffer. The layout is documented in `docs/DESIGN.md`:
+    /// Theoretical size of the naive flat-array serialization in
+    /// bytes — the baseline the succinct blob compresses against.
+    /// Used by benchmarks and regression tests that want a "how
+    /// big would this be without jerky" number without actually
+    /// materializing the bytes.
     ///
-    /// ```text
-    /// [32 B header]
-    /// [n_docs × 32 B keys]
-    /// [n_docs ×  4 B doc_lens]
-    /// [n_terms × 32 B terms (sorted)]
-    /// [(n_terms + 1) × 4 B postings_offsets]
-    /// [total_postings × 8 B (u32 doc_idx, f32 score)]
-    /// ```
-    ///
-    /// Use [`BM25Index::try_from_bytes`] to reload.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let n_docs = self.keys.len() as u32;
-        let n_terms = self.terms.len() as u32;
-        let total_postings = self.postings.len();
-
-        let mut buf = Vec::with_capacity(
-            HEADER_LEN
-                + (self.keys.len() * 32)
-                + (self.doc_lens.len() * 4)
-                + (self.terms.len() * 32)
-                + (self.offsets.len() * 4)
-                + (total_postings * 8),
-        );
-
-        // ── header (20 B) ────────────────────────────────────────
-        buf.extend_from_slice(&n_docs.to_le_bytes()); // 4
-        buf.extend_from_slice(&n_terms.to_le_bytes()); // 4
-        buf.extend_from_slice(&self.avg_doc_len.to_le_bytes()); // 4
-        buf.extend_from_slice(&self.k1.to_le_bytes()); // 4
-        buf.extend_from_slice(&self.b.to_le_bytes()); // 4
-        debug_assert_eq!(buf.len(), HEADER_LEN);
-
-        // ── keys ─────────────────────────────────────────────────
-        for key in &self.keys {
-            buf.extend_from_slice(key);
-        }
-        // ── doc_lens ─────────────────────────────────────────────
-        for &len in &self.doc_lens {
-            buf.extend_from_slice(&len.to_le_bytes());
-        }
-        // ── terms (sorted) ───────────────────────────────────────
-        for term in &self.terms {
-            buf.extend_from_slice(term);
-        }
-        // ── postings_offsets ─────────────────────────────────────
-        for &off in &self.offsets {
-            buf.extend_from_slice(&off.to_le_bytes());
-        }
-        // ── postings ─────────────────────────────────────────────
-        for &(doc_idx, score) in &self.postings {
-            buf.extend_from_slice(&doc_idx.to_le_bytes());
-            buf.extend_from_slice(&score.to_le_bytes());
-        }
-        buf
-    }
-
-    /// Reload an index previously produced by [`to_bytes`]. Fails
-    /// cleanly on truncation and malformed offsets — the blob is
-    /// guaranteed well-formed on a successful return. Caller
-    /// identifies the blob's type externally (e.g., via a
-    /// typed `BlobSchema` handle); no magic or version field
-    /// is carried in-blob.
-    ///
-    /// [`to_bytes`]: Self::to_bytes
-    pub fn try_from_bytes(bytes: &[u8]) -> Result<Self, BM25LoadError> {
-        use BM25LoadError as E;
-
-        if bytes.len() < HEADER_LEN {
-            return Err(E::ShortHeader);
-        }
-        // Header (20 B).
-        let n_docs = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
-        let n_terms = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
-        let avg_doc_len = f32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        let k1 = f32::from_le_bytes(bytes[12..16].try_into().unwrap());
-        let b = f32::from_le_bytes(bytes[16..20].try_into().unwrap());
-
-        // Section offsets.
-        let mut pos = HEADER_LEN;
-        let keys_end = pos + n_docs * 32;
-        if bytes.len() < keys_end {
-            return Err(E::TruncatedSection("keys"));
-        }
-        let mut keys = Vec::with_capacity(n_docs);
-        for chunk in bytes[pos..keys_end].chunks_exact(32) {
-            let raw: RawValue = chunk.try_into().unwrap();
-            keys.push(raw);
-        }
-        pos = keys_end;
-
-        let doc_lens_end = pos + n_docs * 4;
-        if bytes.len() < doc_lens_end {
-            return Err(E::TruncatedSection("doc_lens"));
-        }
-        let doc_lens: Vec<u32> = bytes[pos..doc_lens_end]
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-            .collect();
-        pos = doc_lens_end;
-
-        let terms_end = pos + n_terms * 32;
-        if bytes.len() < terms_end {
-            return Err(E::TruncatedSection("terms"));
-        }
-        let mut terms: Vec<RawValue> = Vec::with_capacity(n_terms);
-        for chunk in bytes[pos..terms_end].chunks_exact(32) {
-            let raw: RawValue = chunk.try_into().unwrap();
-            terms.push(raw);
-        }
-        pos = terms_end;
-
-        let offsets_end = pos + (n_terms + 1) * 4;
-        if bytes.len() < offsets_end {
-            return Err(E::TruncatedSection("offsets"));
-        }
-        let offsets: Vec<u32> = bytes[pos..offsets_end]
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-            .collect();
-        pos = offsets_end;
-
-        // Offsets must be monotonically non-decreasing so the
-        // posting-list slicing in `query_term` is sound.
-        for pair in offsets.windows(2) {
-            if pair[0] > pair[1] {
-                return Err(E::NonMonotonicOffsets);
-            }
-        }
-
-        let total_postings = *offsets.last().unwrap_or(&0) as usize;
-        let postings_end = pos + total_postings * 8;
-        if bytes.len() < postings_end {
-            return Err(E::TruncatedSection("postings"));
-        }
-        let postings: Vec<(u32, f32)> = bytes[pos..postings_end]
-            .chunks_exact(8)
-            .map(|c| {
-                let doc_idx = u32::from_le_bytes(c[0..4].try_into().unwrap());
-                let score = f32::from_le_bytes(c[4..8].try_into().unwrap());
-                (doc_idx, score)
-            })
-            .collect();
-
-        Ok(Self {
-            keys,
-            doc_lens,
-            avg_doc_len,
-            terms,
-            offsets,
-            postings,
-            k1,
-            b,
-        })
+    /// Layout this corresponds to: 20 B scalar header + `n_docs ×
+    /// 32 B` keys + `n_docs × 4 B` doc_lens + `n_terms × 32 B`
+    /// terms + `(n_terms + 1) × 4 B` offsets + `total_postings ×
+    /// 8 B` postings.
+    pub fn byte_size(&self) -> usize {
+        20 + self.keys.len() * 32
+            + self.doc_lens.len() * 4
+            + self.terms.len() * 32
+            + self.offsets.len() * 4
+            + self.postings.len() * 8
     }
 }
+
+impl PartialEq for BM25Index {
+    /// Bit-exact equality, including on `f32` fields — used by
+    /// parallel-build tests that assert byte-identical output
+    /// across thread counts. Score computation is deterministic
+    /// when the same input docs are replayed in the same order,
+    /// so the f32s come out bit-equal.
+    fn eq(&self, other: &Self) -> bool {
+        fn f32_bit_eq(a: f32, b: f32) -> bool {
+            a.to_bits() == b.to_bits()
+        }
+        self.keys == other.keys
+            && self.doc_lens == other.doc_lens
+            && f32_bit_eq(self.avg_doc_len, other.avg_doc_len)
+            && self.terms == other.terms
+            && self.offsets == other.offsets
+            && self.postings.len() == other.postings.len()
+            && self
+                .postings
+                .iter()
+                .zip(other.postings.iter())
+                .all(|(a, b)| a.0 == b.0 && f32_bit_eq(a.1, b.1))
+            && f32_bit_eq(self.k1, other.k1)
+            && f32_bit_eq(self.b, other.b)
+    }
+}
+
+impl Eq for BM25Index {}
+
 
 #[cfg(test)]
 mod tests {
@@ -821,63 +676,30 @@ mod tests {
     }
 
     #[test]
-    fn bytes_round_trip_preserves_queries() {
-        let original = build_sample_index();
-        let bytes = original.to_bytes();
-        let reloaded = BM25Index::try_from_bytes(&bytes).expect("valid blob");
-
-        assert_eq!(reloaded.doc_count(), original.doc_count());
-        assert_eq!(reloaded.term_count(), original.term_count());
-        assert!((reloaded.avg_doc_len() - original.avg_doc_len()).abs() < 1e-6);
-        assert_eq!(reloaded.k1(), original.k1());
-        assert_eq!(reloaded.b(), original.b());
-
-        // Postings for every stored term must match exactly.
-        let fox = hash_tokens("fox");
-        let original_hits: Vec<_> = original.query_term(&fox[0]).collect();
-        let reloaded_hits: Vec<_> = reloaded.query_term(&fox[0]).collect();
-        assert_eq!(reloaded_hits.len(), original_hits.len());
-        for (a, b) in original_hits.iter().zip(reloaded_hits.iter()) {
-            assert_eq!(a.0, b.0);
-            assert!((a.1 - b.1).abs() < 1e-6);
-        }
+    fn byte_size_matches_naive_layout() {
+        // Spot-check that `byte_size()` matches the formula it
+        // documents. At 3 docs with the sample corpus we know the
+        // exact term count, so the expected number is derivable.
+        let idx = build_sample_index();
+        let expected = 20
+            + idx.keys().len() * 32
+            + idx.doc_lens().len() * 4
+            + idx.terms_slice().len() * 32
+            + (idx.terms_slice().len() + 1) * 4
+            + (0..idx.term_count())
+                .map(|t| idx.postings_for(t).len())
+                .sum::<usize>()
+                * 8;
+        assert_eq!(idx.byte_size(), expected);
     }
 
     #[test]
-    fn empty_index_bytes_round_trip() {
-        let idx = BM25Builder::new().build_naive();
-        let bytes = idx.to_bytes();
-        let reloaded = BM25Index::try_from_bytes(&bytes).expect("valid blob");
-        assert_eq!(reloaded.doc_count(), 0);
-        assert_eq!(reloaded.term_count(), 0);
-    }
-
-    #[test]
-    fn short_header_rejected() {
-        let err = BM25Index::try_from_bytes(&[0; 10]).unwrap_err();
-        assert_eq!(err, BM25LoadError::ShortHeader);
-    }
-
-    // `bad_magic_rejected` / `version_mismatch_rejected` used to
-    // live here. The blob no longer carries a magic or version;
-    // the `BlobSchema` ID on the typed handle is the identifier,
-    // and a breaking format change = a new schema ID (and
-    // therefore a new type), which the compiler polices for us.
-
-    #[test]
-    fn truncation_rejected() {
-        let bytes = build_sample_index().to_bytes();
-        let truncated = &bytes[..bytes.len() - 1];
-        let err = BM25Index::try_from_bytes(truncated).unwrap_err();
-        assert!(matches!(err, BM25LoadError::TruncatedSection(_)));
-    }
-
-    #[test]
-    fn blob_is_deterministic() {
-        // Same corpus → same bytes. Content-addressing depends on
-        // this being exactly reproducible across runs.
-        let a = build_sample_index().to_bytes();
-        let b = build_sample_index().to_bytes();
+    fn build_is_deterministic() {
+        // Same corpus → same index. Content-addressing of the
+        // succinct form depends on this being exactly reproducible
+        // across runs; PartialEq here is bit-exact including f32.
+        let a = build_sample_index();
+        let b = build_sample_index();
         assert_eq!(a, b);
     }
 
@@ -885,8 +707,8 @@ mod tests {
     fn parallel_build_matches_single_thread() {
         // Build a richer corpus so shards actually have work to
         // do. Threaded and single-threaded paths must produce
-        // byte-identical blobs.
-        fn build(threads: usize) -> Vec<u8> {
+        // bit-identical indexes.
+        fn build(threads: usize) -> BM25Index {
             let mut b = BM25Builder::new();
             for i in 1..=50u32 {
                 let text = format!(
@@ -897,14 +719,14 @@ mod tests {
                 let byte = (i as u8).max(1);
                 b.insert_id(id(byte), hash_tokens(&text));
             }
-            b.build_naive_with_threads(threads).to_bytes()
+            b.build_naive_with_threads(threads)
         }
         let serial = build(1);
         for t in [2usize, 3, 4, 8] {
             assert_eq!(
                 build(t),
                 serial,
-                "threads={t} produced different bytes than serial"
+                "threads={t} produced a different index than serial"
             );
         }
     }

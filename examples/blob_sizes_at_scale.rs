@@ -127,18 +127,18 @@ fn bench(n_docs: usize, vocab: usize, doc_len: usize, keys: KeyDist) {
     let t_par = Instant::now();
     let parallel_naive = fresh_builder().build_naive_with_threads(threads);
     let build_ms_par = t_par.elapsed().as_secs_f64() * 1000.0;
-    // Byte-identical output is the load-bearing invariant.
-    debug_assert_eq!(naive.to_bytes(), parallel_naive.to_bytes());
+    // Bit-identical output is the load-bearing invariant.
+    debug_assert_eq!(naive, parallel_naive);
 
     // Direct-to-succinct build (the production path).
     let t1 = Instant::now();
     let succinct = fresh_builder().build();
     let encode_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
-    let naive_bytes = naive.to_bytes();
+    let naive_size = naive.byte_size();
     let succinct_bytes = succinct.to_bytes();
 
-    let ratio = succinct_bytes.len() as f64 / naive_bytes.len() as f64;
+    let ratio = succinct_bytes.len() as f64 / naive_size as f64;
     let speedup = build_ms_serial / build_ms_par;
     let keys_bytes = keys_len_from_header(&succinct_bytes) as usize;
     // A flat `n_docs × 32 B` table is the Phase-1 baseline for
@@ -156,7 +156,7 @@ fn bench(n_docs: usize, vocab: usize, doc_len: usize, keys: KeyDist) {
          | build-1 {build_ms_serial:>5.0}ms  build-{threads} {build_ms_par:>5.0}ms \
          ({speedup:>3.1}×)  succinct-encode {encode_ms:>5.0}ms \
          | naive {:>8}  SB25 {:>8}  ratio {:.2}×  keys {:>8}/{:>8} ({:.2}×)",
-        fmt_bytes(naive_bytes.len()),
+        fmt_bytes(naive_size),
         fmt_bytes(succinct_bytes.len()),
         ratio,
         fmt_bytes(keys_bytes),

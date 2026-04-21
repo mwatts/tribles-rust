@@ -54,6 +54,13 @@ dates are commit dates rather than release dates.
   first, then accumulates tf and scores keyed by universe code
   from the start. No insertion-order → universe-code remap, no
   per-term resort pass.
+- Naive `to_bytes` / `try_from_bytes` on `BM25Index` /
+  `HNSWIndex` / `FlatIndex` deleted along with their
+  `BM25LoadError` / `HNSWLoadError` / `FlatLoadError` types
+  (~400 LOC gone). The naive indexes are reference oracles
+  only; persistence is always through the succinct forms.
+  `byte_size()` accessors preserve the "succinct < naive
+  baseline" regression guard without materializing bytes.
 - `BM25Builder::build_naive()` / `build_naive_with_threads(n)`
   keep the naive insertion-order [`BM25Index`] available as a
   correctness oracle (score comparisons in tests) and for

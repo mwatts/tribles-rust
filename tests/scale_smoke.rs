@@ -8,8 +8,8 @@
 
 use triblespace::core::id::{Id, RawId};
 
-use triblespace_search::bm25::{BM25Builder, BM25Index};
-use triblespace_search::hnsw::{FlatBuilder, FlatIndex, HNSWBuilder, HNSWIndex};
+use triblespace_search::bm25::BM25Builder;
+use triblespace_search::hnsw::{FlatBuilder, HNSWBuilder};
 use triblespace_search::succinct::{SuccinctBM25Index, SuccinctHNSWIndex};
 use triblespace_search::tokens::hash_tokens;
 
@@ -67,22 +67,16 @@ fn bm25_1k_docs_roundtrip_consistency() {
     assert_eq!(idx.doc_count(), N_DOCS);
     assert!(idx.term_count() > 0 && idx.term_count() <= VOCAB);
 
-    // Round-trip the naive reference format: serialize, reload,
-    // confirm query parity for a handful of terms.
-    let bytes = idx.to_bytes();
-    let reloaded = BM25Index::try_from_bytes(&bytes).expect("valid");
+    // Spot-check a few terms actually return postings — the
+    // point is that the naive reference answers consistent
+    // queries at 10k scale without blowing up.
     for term_text in ["w0", "w1", "w42", "w250", "w499"] {
         let term = hash_tokens(term_text);
         if term.is_empty() {
             continue;
         }
-        let a: Vec<_> = idx.query_term(&term[0]).collect();
-        let b: Vec<_> = reloaded.query_term(&term[0]).collect();
-        assert_eq!(a.len(), b.len(), "query {term_text} posting lengths");
-        for ((id_a, s_a), (id_b, s_b)) in a.iter().zip(b.iter()) {
-            assert_eq!(id_a, id_b);
-            assert!((s_a - s_b).abs() < 1e-6);
-        }
+        let hits: Vec<_> = idx.query_term(&term[0]).collect();
+        assert!(hits.len() <= N_DOCS, "doc_frequency can't exceed N_DOCS");
     }
 }
 
@@ -172,26 +166,9 @@ fn hnsw_1k_vectors_recall_against_flat() {
         "HNSW 1k-doc recall {recall:.2} below 0.7 threshold"
     );
 
-    // Round-trip the HNSW blob end-to-end.
-    let bytes = hnsw.to_bytes();
-    let reloaded = HNSWIndex::try_from_bytes(&bytes).expect("valid blob");
-    let q: Vec<f32> = (0..DIM)
-        .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
-        .collect();
-    let orig_ids: HashSet<_> = hnsw_view
-        .similar(&q, 5, Some(50))
-        .unwrap()
-        .into_iter()
-        .map(|(d, _)| d)
-        .collect();
-    let loaded_ids: HashSet<_> = reloaded
-        .attach(&reader)
-        .similar(&q, 5, Some(50))
-        .unwrap()
-        .into_iter()
-        .map(|(d, _)| d)
-        .collect();
-    assert_eq!(orig_ids, loaded_ids);
+    // The succinct HNSW blob round-trip is exercised by
+    // `succinct_hnsw_1k_docs_matches_naive` below and by
+    // `tests/pile_roundtrip.rs`.
 }
 
 /// At 1k docs the succinct BM25 must answer identically to the
@@ -325,13 +302,11 @@ fn succinct_bm25_blob_smaller_than_naive_at_1k() {
     let naive = builder.clone().build_naive();
     let succinct = builder.build();
 
-    let naive_bytes = naive.to_bytes();
-    let succinct_bytes = succinct.to_bytes();
+    let naive_size = naive.byte_size();
+    let succinct_size = succinct.to_bytes().len();
     assert!(
-        succinct_bytes.len() < naive_bytes.len(),
-        "succinct blob {} should be < naive blob {}",
-        succinct_bytes.len(),
-        naive_bytes.len()
+        succinct_size < naive_size,
+        "succinct blob {succinct_size} should be < naive baseline {naive_size}"
     );
 }
 
@@ -479,15 +454,6 @@ fn flat_1k_vectors_top_k_consistent() {
     assert_eq!(hits.len(), 5);
     assert_eq!(hits[0].0, target);
 
-    // Round-trip through bytes must preserve the top-k.
-    let reloaded = FlatIndex::try_from_bytes(&idx.to_bytes()).expect("valid");
-    let hits2 = reloaded
-        .attach(&reader)
-        .similar_ids(&target_vec, 5)
-        .unwrap();
-    assert_eq!(hits.len(), hits2.len());
-    for (a, b) in hits.iter().zip(hits2.iter()) {
-        assert_eq!(a.0, b.0);
-        assert!((a.1 - b.1).abs() < 1e-6);
-    }
+    // Sanity: byte_size grows linearly with doc count.
+    assert_eq!(idx.byte_size(), 24 + idx.doc_count() * 64);
 }

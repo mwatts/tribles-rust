@@ -360,10 +360,11 @@ Assume after `hash_tokens`:
   with β ≈ 0.5, k ≈ 30 for English-ish text)
 - total postings `≈ 100 000 × 180 = 18 000 000` entries
 
-Two columns: the naive `BM25Index::to_bytes` format (scaffold,
-kept for testing self-consistency) and the landed SB25 format
-(`SuccinctBM25Index::to_bytes`) with bit-packing + score
-quantization.
+Two columns: a theoretical "naive flat-array" layout (the
+pre-jerky baseline this crate started from — reported by
+[`BM25Index::byte_size`], no actual serializer ships) and the
+landed SB25 format (`SuccinctBM25Index::to_bytes`) with
+bit-packing + score quantization.
 
 | Section            | Per-entry | Count      | Naive bytes | SB25 bytes  |
 | :----------------- | --------: | ---------: | ----------: | ----------: |
