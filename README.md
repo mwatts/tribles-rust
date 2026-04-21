@@ -71,15 +71,17 @@ naive-then-succinct implementation order is the open work item.
 * **`schemas::F32LE`**: `ValueSchema` for packing `f32` scores
   into 32-byte `Value<F32LE>`s. Used by the scored BM25
   constraint.
-* Four runnable examples:
+* Five runnable examples:
   - `query_demo` — text search, multi-term OR, value-as-term
     citation search.
   - `compose_bm25_and_pattern` — BM25 + `pattern!` over a
     `TribleSet` in one `find!`.
   - `compose_hnsw_and_pattern` — vector similarity + `pattern!`
     composition.
-  - `blob_sizes_at_scale` — naive vs. SB25 blob size at 1k /
-    5k / 10k docs.
+  - `blob_sizes_at_scale` — naive vs. SB25 blob size + parallel
+    build speedup at 1k / 5k / 10k / 50k docs.
+  - `query_latency` — p50/p99 single- and multi-term query
+    latency for both BM25 and HNSW.
 * 146 tests across unit, scale (1k-doc equivalence +
   naive-vs-SB25 size guard), engine-integration
   (`IntersectionConstraint` joins + `find!` / `pattern!`

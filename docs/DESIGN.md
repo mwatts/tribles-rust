@@ -337,18 +337,28 @@ build-time actually bites.
 
 ### BM25 — query latency
 
-Single-term query:
-- Binary-search `terms` (32-byte compare): ~19 iterations × ~100 ns
-  = ~2 μs.
-- Scan posting list: average `18 M / 300 k = 60` postings per
-  term, each 8 B contiguous — ~0.5 μs of memory-bandwidth-bound
-  scan.
-- Total: **~3 μs per term**, before join overhead.
+`cargo run --release --example query_latency` on current laptop
+hardware (10 k / 50 k docs with Zipf-ish vocab):
 
-Intersection of two terms (`find! and!`): query engine joins the
-smaller posting list against the larger; real cost is
-O(min(|A|, |B|)) per the usual merge-join. At 60 postings per
-term, a 2-term `and!` is still comfortably sub-10 μs.
+| Corpus              | Path   | p50     | avg     | p99     |
+| :------------------ | :----- | ------: | ------: | ------: |
+| 10 k × 64 tokens    | naive  |  125 ns |  162 ns |  459 ns |
+| 10 k × 64 tokens    | SB25   |  875 ns | 1.06 µs | 4.04 µs |
+| 50 k × 96 tokens    | naive  |  292 ns |  417 ns | 2.29 µs |
+| 50 k × 96 tokens    | SB25   | 2.00 µs | 2.82 µs | 6.21 µs |
+
+Single-term queries stay comfortably under 3 µs on the succinct
+path even at 50 k docs — the original design estimate was a
+generous upper bound. The naive path is ~6-7× faster than SB25
+(flat `Vec` read + pre-baked `f32` vs. bit-unpacking a
+`CompactVector` + dequantizing a u16 score); SB25 trades that
+latency for ~2× smaller blobs on disk.
+
+3-term `query_multi` (OR of independent posting lists):
+~207 µs p50 at 50 k docs, dominated by the aggregation
+`HashMap<Id, f32>`. For latency-critical multi-term queries an
+`and!` via the engine is cheaper — merge-join size is
+`min(|postings|)`, not `sum(|postings|)`.
 
 ### HNSW — size estimate
 
@@ -370,6 +380,26 @@ matrix on source × target pairs), so the big-picture BM25+HNSW
 blob for 100 k frags sits around 200 MiB and the succinct pass
 takes it to ~180 MiB — embedding dominance means the compression
 win is mostly on the BM25 side.
+
+### HNSW — query latency
+
+`query_latency` example on 5 k / 10 k × 32-dim vectors, top-10 +
+ef=50:
+
+| Corpus          | Path  | p50    | avg    | p99    |
+| :-------------- | :---- | -----: | -----: | -----: |
+| 5 k × 32        | naive | 55 µs  | 55 µs  | 64 µs  |
+| 5 k × 32        | SH25  | 76 µs  | 77 µs  | 95 µs  |
+| 10 k × 32       | naive | 54 µs  | 54 µs  | 62 µs  |
+| 10 k × 32       | SH25  | 76 µs  | 77 µs  | 100 µs |
+
+SH25 path sits at ~1.4× the naive latency — the cost of slicing
+each node's `[f32; dim]` out of `anybytes::Bytes` and
+dequantizing on the fly. Since HNSW's ef-search examines ~ef×k
+neighbours per query, this dominates. A flat-f32 cache-friendly
+access path (reading the vectors via `Bytes::view::<[f32]>`
+instead of per-component LE decode) would close most of the
+gap; filed as future work.
 
 ### Takeaways
 
