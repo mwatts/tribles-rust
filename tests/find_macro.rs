@@ -48,6 +48,43 @@ fn find_docs_containing_term() {
     assert!(set.contains(&id(3)));
 }
 
+/// Regression: two docs with identical BM25 scores must yield
+/// one row per doc, not a Cartesian product within the score
+/// bucket. Early versions of `BM25ScoredPostings::propose` pushed
+/// one `score` proposal per posting, so N docs sharing a score
+/// caused N×N rows. Now the constraint dedupes by bit-pattern.
+#[test]
+fn find_docs_and_scores_shared_score_no_cartesian() {
+    let mut b = BM25Builder::new();
+    // Three docs, same length and same tf for "fox" — identical
+    // scores.
+    b.insert(id(1), hash_tokens("the quick fox"));
+    b.insert(id(2), hash_tokens("another fox book"));
+    b.insert(id(3), hash_tokens("fox adventure here"));
+    // One filler doc so corpus avg_doc_len is well-defined.
+    b.insert(id(4), hash_tokens("unrelated content only"));
+    let idx = b.build();
+    let fox = hash_tokens("fox")[0];
+
+    let postings: Vec<_> = idx.query_term(&fox).collect();
+    assert_eq!(postings.len(), 3);
+
+    let rows: Vec<(Id, f32)> = find!(
+        (doc: Id, score: f32),
+        idx.docs_and_scores(doc, score, fox)
+    )
+    .collect();
+    // Exactly 3 rows — one per doc — regardless of score equality.
+    assert_eq!(
+        rows.len(),
+        3,
+        "expected one row per doc; got {} rows (Cartesian?)",
+        rows.len()
+    );
+    let docs: HashSet<Id> = rows.iter().map(|(d, _)| *d).collect();
+    assert_eq!(docs.len(), 3);
+}
+
 /// Two-variable find!: binds both `doc` and `score`. Uses a
 /// corpus where the "fox" postings have *different* BM25 scores
 /// (doc 1 is length-1, doc 2 is length-7) so the engine can't

@@ -186,13 +186,20 @@ impl<'a> Constraint<'a> for BM25ScoredPostings<'a> {
             let bound_doc = binding
                 .get(self.doc.index)
                 .and_then(raw_value_to_id);
+            // Dedupe score bit-patterns: two docs sharing a BM25
+            // score would otherwise produce two identical score
+            // proposals, causing the engine to enumerate a
+            // Cartesian (doc, score) cross within the bucket.
+            let mut seen = HashSet::new();
             for (doc_id, score) in self.index.query_term(&self.term) {
                 if let Some(bd) = bound_doc {
                     if doc_id != bd {
                         continue;
                     }
                 }
-                proposals.push(f32_to_raw_value(score));
+                if seen.insert(score.to_bits()) {
+                    proposals.push(f32_to_raw_value(score));
+                }
             }
         }
     }
@@ -451,13 +458,18 @@ impl<'a> Constraint<'a> for SimilarToVectorScored<'a> {
             let bound_doc = binding
                 .get(self.doc.index)
                 .and_then(raw_value_to_id);
+            // Dedupe by bit-pattern to avoid Cartesian blow-up
+            // when two neighbours share a similarity value.
+            let mut seen = HashSet::new();
             for (doc_id, score) in self.index.similar(&self.query, self.k) {
                 if let Some(bd) = bound_doc {
                     if doc_id != bd {
                         continue;
                     }
                 }
-                proposals.push(f32_to_raw_value(score));
+                if seen.insert(score.to_bits()) {
+                    proposals.push(f32_to_raw_value(score));
+                }
             }
         }
     }
@@ -720,6 +732,9 @@ impl<'a> Constraint<'a> for SimilarToVectorHNSWScored<'a> {
             let bound_doc = binding
                 .get(self.doc.index)
                 .and_then(raw_value_to_id);
+            // Dedupe by bit-pattern to avoid Cartesian blow-up
+            // when two neighbours share a similarity value.
+            let mut seen = HashSet::new();
             for (doc_id, score) in
                 self.index.similar(&self.query, self.k, self.ef)
             {
@@ -728,7 +743,9 @@ impl<'a> Constraint<'a> for SimilarToVectorHNSWScored<'a> {
                         continue;
                     }
                 }
-                proposals.push(f32_to_raw_value(score));
+                if seen.insert(score.to_bits()) {
+                    proposals.push(f32_to_raw_value(score));
+                }
             }
         }
     }
@@ -1110,11 +1127,13 @@ mod tests {
             raw_value_to_id(p).expect("genid round-trip");
         }
 
-        // Propose score with no binding: 2 entries, each decodes
-        // to a positive finite f32.
+        // Propose score with no binding: the two "fox" docs in
+        // sample_index have identical BM25 scores (same length,
+        // same tf), so dedupe collapses them to one proposal.
+        // Every entry must decode to a positive finite f32.
         let mut score_props = Vec::new();
         c.propose(score.index, &Binding::default(), &mut score_props);
-        assert_eq!(score_props.len(), 2);
+        assert_eq!(score_props.len(), 1);
         for p in &score_props {
             let v = raw_value_to_f32(p);
             assert!(v.is_finite() && v > 0.0);
