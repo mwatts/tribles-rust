@@ -49,17 +49,65 @@
 
 use std::collections::HashMap;
 
-use triblespace::core::id::Id;
+use triblespace::core::id::{Id, RawId};
 use triblespace::core::value::RawValue;
+
+use crate::FORMAT_VERSION;
 
 /// Classic BM25 tuning. Defaults match Robertson & Zaragoza 2009.
 const DEFAULT_K1: f32 = 1.5;
 const DEFAULT_B: f32 = 0.75;
 
-/// Stub for the content-addressed blob type. Will serialize the
-/// layout documented in `docs/DESIGN.md` once the byte format is
-/// frozen; for now the in-memory [`BM25Index`] is the reference
-/// implementation.
+// ── Byte layout constants ────────────────────────────────────────────
+
+/// Magic four-byte header tag, little-endian.
+const MAGIC: u32 = u32::from_le_bytes(*b"BM25");
+/// Header length in bytes. Fixed; indices larger than 4 GiB would
+/// overflow the u32 length fields anyway.
+const HEADER_LEN: usize = 32;
+
+/// Errors produced by [`BM25Index::try_from_bytes`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum BM25LoadError {
+    /// Blob is shorter than the fixed header.
+    ShortHeader,
+    /// Magic bytes don't match `"BM25"`.
+    BadMagic,
+    /// Blob version is newer or older than [`FORMAT_VERSION`].
+    VersionMismatch(u16),
+    /// Declared section sizes run past the end of the blob.
+    TruncatedSection(&'static str),
+    /// A posting-list offset is not monotonically non-decreasing.
+    NonMonotonicOffsets,
+    /// A stored `doc_id` is the nil `[0; 16]` id.
+    NilDocId,
+}
+
+impl std::fmt::Display for BM25LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ShortHeader => write!(f, "BM25 blob shorter than header"),
+            Self::BadMagic => write!(f, "BM25 blob: magic mismatch"),
+            Self::VersionMismatch(v) => {
+                write!(f, "BM25 blob: version {v} (expected {})", FORMAT_VERSION)
+            }
+            Self::TruncatedSection(name) => {
+                write!(f, "BM25 blob: truncated section `{name}`")
+            }
+            Self::NonMonotonicOffsets => {
+                write!(f, "BM25 blob: posting-list offsets are not monotonic")
+            }
+            Self::NilDocId => write!(f, "BM25 blob: nil doc_id found"),
+        }
+    }
+}
+
+impl std::error::Error for BM25LoadError {}
+
+/// Placeholder for the content-addressed blob type. The real
+/// wrapper will carry its schema id and `Bytes` backing once the
+/// triblespace `BlobSchema` integration lands. For now the
+/// serialization lives as free functions on [`BM25Index`].
 pub struct SuccinctBM25Index;
 
 /// Accumulator for documents to be indexed. Call [`insert`] once
@@ -193,6 +241,7 @@ impl BM25Builder {
 /// All scores are pre-baked at build time: per-(doc, term) BM25
 /// weight with saturating term frequency (`k1`) and
 /// length-normalized doc length (`b`).
+#[derive(Debug, Clone)]
 pub struct BM25Index {
     doc_ids: Vec<Id>,
     doc_lens: Vec<u32>,
@@ -279,6 +328,182 @@ impl BM25Index {
     /// of the document at internal index `i`.
     pub fn doc_lens(&self) -> &[u32] {
         &self.doc_lens
+    }
+
+    /// Serialize the index to a self-contained little-endian byte
+    /// buffer. The layout is documented in `docs/DESIGN.md`:
+    ///
+    /// ```text
+    /// [32 B header]
+    /// [n_docs × 16 B doc_ids]
+    /// [n_docs ×  4 B doc_lens]
+    /// [n_terms × 32 B terms (sorted)]
+    /// [(n_terms + 1) × 4 B postings_offsets]
+    /// [total_postings × 8 B (u32 doc_idx, f32 score)]
+    /// ```
+    ///
+    /// Use [`BM25Index::try_from_bytes`] to reload.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let n_docs = self.doc_ids.len() as u32;
+        let n_terms = self.terms.len() as u32;
+        let total_postings = self.postings.len();
+
+        let mut buf = Vec::with_capacity(
+            HEADER_LEN
+                + (self.doc_ids.len() * 16)
+                + (self.doc_lens.len() * 4)
+                + (self.terms.len() * 32)
+                + (self.offsets.len() * 4)
+                + (total_postings * 8),
+        );
+
+        // ── header (32 B) ────────────────────────────────────────
+        // Fields occupy 28 bytes; 4 bytes of zero-padding at the
+        // end reserve space for a future field without requiring
+        // a version bump for callers that only inspect the early
+        // portion of the header.
+        buf.extend_from_slice(&MAGIC.to_le_bytes()); // 4
+        buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes()); // 2
+        buf.extend_from_slice(&0u16.to_le_bytes()); // reserved, 2
+        buf.extend_from_slice(&n_docs.to_le_bytes()); // 4
+        buf.extend_from_slice(&n_terms.to_le_bytes()); // 4
+        buf.extend_from_slice(&self.avg_doc_len.to_le_bytes()); // 4
+        buf.extend_from_slice(&self.k1.to_le_bytes()); // 4
+        buf.extend_from_slice(&self.b.to_le_bytes()); // 4
+        buf.extend_from_slice(&[0u8; 4]); // pad to 32
+        debug_assert_eq!(buf.len(), HEADER_LEN);
+
+        // ── doc_ids ──────────────────────────────────────────────
+        for id in &self.doc_ids {
+            // `Id` implements `AsRef<RawId>`, giving us the
+            // underlying 16-byte array without copy.
+            let raw: &RawId = id.as_ref();
+            buf.extend_from_slice(raw);
+        }
+        // ── doc_lens ─────────────────────────────────────────────
+        for &len in &self.doc_lens {
+            buf.extend_from_slice(&len.to_le_bytes());
+        }
+        // ── terms (sorted) ───────────────────────────────────────
+        for term in &self.terms {
+            buf.extend_from_slice(term);
+        }
+        // ── postings_offsets ─────────────────────────────────────
+        for &off in &self.offsets {
+            buf.extend_from_slice(&off.to_le_bytes());
+        }
+        // ── postings ─────────────────────────────────────────────
+        for &(doc_idx, score) in &self.postings {
+            buf.extend_from_slice(&doc_idx.to_le_bytes());
+            buf.extend_from_slice(&score.to_le_bytes());
+        }
+        buf
+    }
+
+    /// Reload an index previously produced by [`to_bytes`]. Fails
+    /// cleanly on truncation, bad magic, version mismatch, and
+    /// malformed offsets — the blob is guaranteed well-formed on
+    /// a successful return.
+    ///
+    /// [`to_bytes`]: Self::to_bytes
+    pub fn try_from_bytes(bytes: &[u8]) -> Result<Self, BM25LoadError> {
+        use BM25LoadError as E;
+
+        if bytes.len() < HEADER_LEN {
+            return Err(E::ShortHeader);
+        }
+        // Header.
+        let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        if magic != MAGIC {
+            return Err(E::BadMagic);
+        }
+        let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+        if version != FORMAT_VERSION {
+            return Err(E::VersionMismatch(version));
+        }
+        // bytes[6..8] reserved.
+        let n_docs = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let n_terms = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let avg_doc_len = f32::from_le_bytes(bytes[16..20].try_into().unwrap());
+        let k1 = f32::from_le_bytes(bytes[20..24].try_into().unwrap());
+        let b = f32::from_le_bytes(bytes[24..28].try_into().unwrap());
+
+        // Section offsets.
+        let mut pos = HEADER_LEN;
+        let doc_ids_end = pos + n_docs * 16;
+        if bytes.len() < doc_ids_end {
+            return Err(E::TruncatedSection("doc_ids"));
+        }
+        let mut doc_ids = Vec::with_capacity(n_docs);
+        for chunk in bytes[pos..doc_ids_end].chunks_exact(16) {
+            let raw: RawId = chunk.try_into().unwrap();
+            doc_ids.push(Id::new(raw).ok_or(E::NilDocId)?);
+        }
+        pos = doc_ids_end;
+
+        let doc_lens_end = pos + n_docs * 4;
+        if bytes.len() < doc_lens_end {
+            return Err(E::TruncatedSection("doc_lens"));
+        }
+        let doc_lens: Vec<u32> = bytes[pos..doc_lens_end]
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        pos = doc_lens_end;
+
+        let terms_end = pos + n_terms * 32;
+        if bytes.len() < terms_end {
+            return Err(E::TruncatedSection("terms"));
+        }
+        let mut terms: Vec<RawValue> = Vec::with_capacity(n_terms);
+        for chunk in bytes[pos..terms_end].chunks_exact(32) {
+            let raw: RawValue = chunk.try_into().unwrap();
+            terms.push(raw);
+        }
+        pos = terms_end;
+
+        let offsets_end = pos + (n_terms + 1) * 4;
+        if bytes.len() < offsets_end {
+            return Err(E::TruncatedSection("offsets"));
+        }
+        let offsets: Vec<u32> = bytes[pos..offsets_end]
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        pos = offsets_end;
+
+        // Offsets must be monotonically non-decreasing so the
+        // posting-list slicing in `query_term` is sound.
+        for pair in offsets.windows(2) {
+            if pair[0] > pair[1] {
+                return Err(E::NonMonotonicOffsets);
+            }
+        }
+
+        let total_postings = *offsets.last().unwrap_or(&0) as usize;
+        let postings_end = pos + total_postings * 8;
+        if bytes.len() < postings_end {
+            return Err(E::TruncatedSection("postings"));
+        }
+        let postings: Vec<(u32, f32)> = bytes[pos..postings_end]
+            .chunks_exact(8)
+            .map(|c| {
+                let doc_idx = u32::from_le_bytes(c[0..4].try_into().unwrap());
+                let score = f32::from_le_bytes(c[4..8].try_into().unwrap());
+                (doc_idx, score)
+            })
+            .collect();
+
+        Ok(Self {
+            doc_ids,
+            doc_lens,
+            avg_doc_len,
+            terms,
+            offsets,
+            postings,
+            k1,
+            b,
+        })
     }
 }
 
@@ -399,5 +624,85 @@ mod tests {
         let idx = b.build();
         assert!((idx.k1() - 1.2).abs() < 1e-6);
         assert!((idx.b() - 0.5).abs() < 1e-6);
+    }
+
+    fn build_sample_index() -> BM25Index {
+        let mut b = BM25Builder::new().k1(1.4).b(0.72);
+        b.insert(id(1), hash_tokens("the quick brown fox"));
+        b.insert(id(2), hash_tokens("the lazy brown dog"));
+        b.insert(id(3), hash_tokens("quick silver fox jumps"));
+        b.build()
+    }
+
+    #[test]
+    fn bytes_round_trip_preserves_queries() {
+        let original = build_sample_index();
+        let bytes = original.to_bytes();
+        let reloaded = BM25Index::try_from_bytes(&bytes).expect("valid blob");
+
+        assert_eq!(reloaded.doc_count(), original.doc_count());
+        assert_eq!(reloaded.term_count(), original.term_count());
+        assert!((reloaded.avg_doc_len() - original.avg_doc_len()).abs() < 1e-6);
+        assert_eq!(reloaded.k1(), original.k1());
+        assert_eq!(reloaded.b(), original.b());
+
+        // Postings for every stored term must match exactly.
+        let fox = hash_tokens("fox");
+        let original_hits: Vec<_> = original.query_term(&fox[0]).collect();
+        let reloaded_hits: Vec<_> = reloaded.query_term(&fox[0]).collect();
+        assert_eq!(reloaded_hits.len(), original_hits.len());
+        for (a, b) in original_hits.iter().zip(reloaded_hits.iter()) {
+            assert_eq!(a.0, b.0);
+            assert!((a.1 - b.1).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn empty_index_bytes_round_trip() {
+        let idx = BM25Builder::new().build();
+        let bytes = idx.to_bytes();
+        let reloaded = BM25Index::try_from_bytes(&bytes).expect("valid blob");
+        assert_eq!(reloaded.doc_count(), 0);
+        assert_eq!(reloaded.term_count(), 0);
+    }
+
+    #[test]
+    fn short_header_rejected() {
+        let err = BM25Index::try_from_bytes(&[0; 10]).unwrap_err();
+        assert_eq!(err, BM25LoadError::ShortHeader);
+    }
+
+    #[test]
+    fn bad_magic_rejected() {
+        let mut bytes = build_sample_index().to_bytes();
+        bytes[0] = b'X';
+        let err = BM25Index::try_from_bytes(&bytes).unwrap_err();
+        assert_eq!(err, BM25LoadError::BadMagic);
+    }
+
+    #[test]
+    fn version_mismatch_rejected() {
+        let mut bytes = build_sample_index().to_bytes();
+        // Bump the version byte to something we don't recognize.
+        bytes[4] = 99;
+        let err = BM25Index::try_from_bytes(&bytes).unwrap_err();
+        assert!(matches!(err, BM25LoadError::VersionMismatch(_)));
+    }
+
+    #[test]
+    fn truncation_rejected() {
+        let bytes = build_sample_index().to_bytes();
+        let truncated = &bytes[..bytes.len() - 1];
+        let err = BM25Index::try_from_bytes(truncated).unwrap_err();
+        assert!(matches!(err, BM25LoadError::TruncatedSection(_)));
+    }
+
+    #[test]
+    fn blob_is_deterministic() {
+        // Same corpus → same bytes. Content-addressing depends on
+        // this being exactly reproducible across runs.
+        let a = build_sample_index().to_bytes();
+        let b = build_sample_index().to_bytes();
+        assert_eq!(a, b);
     }
 }
