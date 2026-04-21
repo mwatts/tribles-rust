@@ -200,13 +200,14 @@ the bit-packed graph; see `SuccinctHNSWIndex::similar` in
 
 ### Open compression directions
 
-- **Wavelet matrix on the neighbour column** — exactly the RING
-  encoding, just without the predicate/label column that
-  `SuccinctArchive` needs. Gives `rank` / `select` on neighbour
-  ids for free, which helps with reverse-neighbour lookup and
-  further bit-packing via the BWT-like ordering. Saves maybe
-  another ~1.5× on the graph bytes; worth doing when the
-  HNSW graph starts to matter.
+- **Wavelet matrix on the neighbour column** — would give
+  `rank` / `select` for free, which opens up reverse-neighbour
+  lookup and range-filtered similarity. At current forward-only
+  HNSW traversal the CSR `CompactVector` layout is both smaller
+  and faster (no rank/select auxiliary overhead). See
+  [`docs/HNSW_GRAPH_ENCODING.md`](HNSW_GRAPH_ENCODING.md) for
+  the full tradeoff analysis and the query patterns that would
+  flip the decision.
 - **Vector quantization** — the caller owns the embedding
   schema. Future work: a `SuccinctHNSWBlob` variant (or a
   separate schema id) that stores `[u8; dim]` quantized vectors
