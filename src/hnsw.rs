@@ -38,12 +38,55 @@
 //! assert_eq!(hits[1].0, Id::new([3; 16]).unwrap());
 //! ```
 
-use triblespace::core::blob::BlobSchema;
+use triblespace::core::blob::{Blob, BlobSchema, Bytes, ToBlob, TryFromBlob};
 use triblespace::core::id::{Id, RawId};
 use triblespace::core::id_hex;
 use triblespace::core::metadata::ConstId;
 
 use crate::FORMAT_VERSION;
+
+// ── HNSW blob byte format ────────────────────────────────────────────
+
+const HNSW_MAGIC: u32 = u32::from_le_bytes(*b"HNSW");
+const HNSW_HEADER_LEN: usize = 32;
+
+/// Errors produced by [`HNSWIndex::try_from_bytes`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum HNSWLoadError {
+    ShortHeader,
+    BadMagic,
+    VersionMismatch(u16),
+    TruncatedSection(&'static str),
+    NilDocId,
+    /// A stored neighbour index is `>= n_nodes`.
+    OutOfRangeNeighbour(u32),
+    /// A per-node neighbour count was larger than the corpus.
+    ImpossibleNeighbourCount(u32),
+}
+
+impl std::fmt::Display for HNSWLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ShortHeader => write!(f, "HNSW blob shorter than header"),
+            Self::BadMagic => write!(f, "HNSW blob: magic mismatch"),
+            Self::VersionMismatch(v) => {
+                write!(f, "HNSW blob: version {v} (expected {})", FORMAT_VERSION)
+            }
+            Self::TruncatedSection(name) => {
+                write!(f, "HNSW blob: truncated section `{name}`")
+            }
+            Self::NilDocId => write!(f, "HNSW blob: nil doc_id"),
+            Self::OutOfRangeNeighbour(i) => {
+                write!(f, "HNSW blob: neighbour index {i} ≥ n_nodes")
+            }
+            Self::ImpossibleNeighbourCount(n) => {
+                write!(f, "HNSW blob: node has {n} neighbours but corpus is smaller")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HNSWLoadError {}
 
 // Byte format for the flat k-NN blob. A separate magic from the
 // eventual proper-HNSW blob ("FLAT" vs "HNSW") — they're
@@ -91,11 +134,25 @@ impl ConstId for SuccinctHNSWIndex {
 
 impl BlobSchema for SuccinctHNSWIndex {}
 
+impl ToBlob<SuccinctHNSWIndex> for &HNSWIndex {
+    fn to_blob(self) -> Blob<SuccinctHNSWIndex> {
+        Blob::new(Bytes::from_source(self.to_bytes()))
+    }
+}
+
+impl TryFromBlob<SuccinctHNSWIndex> for HNSWIndex {
+    type Error = HNSWLoadError;
+    fn try_from_blob(b: Blob<SuccinctHNSWIndex>) -> Result<Self, Self::Error> {
+        HNSWIndex::try_from_bytes(b.bytes.as_ref())
+    }
+}
+
 // ── Proper HNSW graph (layered, approximate k-NN) ─────────────────
 
 /// Per-node state in the HNSW graph. Each node lives on layers
 /// `0..=level`; `neighbors[i]` is the neighbour list for layer
 /// `i` (local to the node).
+#[derive(Debug)]
 struct HNSWNode {
     vector: Vec<f32>,
     /// Level this node was sampled into. Kept for debugging /
@@ -410,6 +467,7 @@ impl HNSWBuilder {
 /// corpus size (O(log n · degree) typical) — the trade-off is
 /// a larger up-front build cost than [`FlatIndex`] and slightly
 /// approximate recall.
+#[derive(Debug)]
 pub struct HNSWIndex {
     dim: usize,
     m: u16,
@@ -479,6 +537,235 @@ impl HNSWIndex {
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         ranked.truncate(k);
         ranked
+    }
+
+    /// Serialize the index to a self-contained little-endian
+    /// byte buffer. Layout:
+    ///
+    /// ```text
+    /// [32 B header]
+    ///   magic u32 = "HNSW"
+    ///   version u16
+    ///   reserved u16
+    ///   n_nodes u32
+    ///   dim u32
+    ///   M u16, M0 u16
+    ///   max_level u8, has_entry u8, reserved 2 B
+    ///   entry_point u32
+    ///   reserved 4 B
+    /// [n_nodes × 16 B doc_ids]
+    /// [n_nodes × dim × 4 B f32 vectors, row-major]
+    /// [n_nodes × 1 B node_level]
+    /// [n_nodes × layer_count+1 × 4 B per-layer neighbour offsets
+    ///   — cumulative, starts at 0]
+    /// [total_neighbours × 4 B neighbour indices]
+    /// ```
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let n_nodes = self.nodes.len() as u32;
+        let has_entry: u8 = self.entry_point.is_some() as u8;
+        let entry = self.entry_point.unwrap_or(0);
+        let dim = self.dim as u32;
+
+        let mut buf = Vec::new();
+        // Header.
+        buf.extend_from_slice(&HNSW_MAGIC.to_le_bytes()); // 4
+        buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes()); // 2
+        buf.extend_from_slice(&0u16.to_le_bytes()); // 2 reserved
+        buf.extend_from_slice(&n_nodes.to_le_bytes()); // 4
+        buf.extend_from_slice(&dim.to_le_bytes()); // 4
+        buf.extend_from_slice(&self.m.to_le_bytes()); // 2
+        buf.extend_from_slice(&self.m0.to_le_bytes()); // 2
+        buf.push(self.max_level); // 1
+        buf.push(has_entry); // 1
+        buf.extend_from_slice(&[0u8; 2]); // 2 reserved
+        buf.extend_from_slice(&entry.to_le_bytes()); // 4
+        buf.extend_from_slice(&[0u8; 4]); // 4 reserved → 32
+        debug_assert_eq!(buf.len(), HNSW_HEADER_LEN);
+
+        // doc_ids
+        for id in &self.doc_ids {
+            let raw: &RawId = id.as_ref();
+            buf.extend_from_slice(raw);
+        }
+        // vectors
+        for node in &self.nodes {
+            for &v in &node.vector {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        // node levels
+        for node in &self.nodes {
+            buf.push(node.level);
+        }
+        // per-node neighbour offsets + flat neighbour array.
+        // Per node we store `level + 2` offsets (one per layer
+        // 0..=level, plus a tail offset); neighbour indices live
+        // in a single trailing flat array.
+        let max_layer_count = (self.max_level as usize) + 1;
+        let total_neighbours: u64 = self
+            .nodes
+            .iter()
+            .map(|n| n.neighbors.iter().map(|l| l.len() as u64).sum::<u64>())
+            .sum();
+
+        // Offsets: for each node, (level + 2) u32s. Layout puts
+        // them all first so loading can stream them without
+        // back-patching.
+        let mut neighbour_bytes: Vec<u8> = Vec::with_capacity(total_neighbours as usize * 4);
+        for node in &self.nodes {
+            let mut running: u32 = 0;
+            buf.extend_from_slice(&running.to_le_bytes());
+            for layer in &node.neighbors {
+                running += layer.len() as u32;
+                buf.extend_from_slice(&running.to_le_bytes());
+                for &n in layer {
+                    neighbour_bytes.extend_from_slice(&n.to_le_bytes());
+                }
+            }
+            // Pad the node's offset table to max_layer_count + 1
+            // entries so each node has the same offset stride —
+            // simplifies deserialization indexing.
+            let actual_entries = node.neighbors.len() + 1; // level..=level inclusive + tail
+            let padding = (max_layer_count + 1).saturating_sub(actual_entries);
+            for _ in 0..padding {
+                buf.extend_from_slice(&running.to_le_bytes());
+            }
+        }
+        buf.extend(neighbour_bytes);
+        buf
+    }
+
+    /// Reload an index previously produced by [`to_bytes`].
+    ///
+    /// [`to_bytes`]: Self::to_bytes
+    pub fn try_from_bytes(bytes: &[u8]) -> Result<Self, HNSWLoadError> {
+        use HNSWLoadError as E;
+        if bytes.len() < HNSW_HEADER_LEN {
+            return Err(E::ShortHeader);
+        }
+        let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        if magic != HNSW_MAGIC {
+            return Err(E::BadMagic);
+        }
+        let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+        if version != FORMAT_VERSION {
+            return Err(E::VersionMismatch(version));
+        }
+        let n_nodes = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let dim = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let m = u16::from_le_bytes(bytes[16..18].try_into().unwrap());
+        let m0 = u16::from_le_bytes(bytes[18..20].try_into().unwrap());
+        let max_level = bytes[20];
+        let has_entry = bytes[21] != 0;
+        // bytes[22..24] reserved
+        let entry_raw = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
+        // bytes[28..32] reserved
+
+        let mut pos = HNSW_HEADER_LEN;
+        // doc_ids
+        let doc_ids_end = pos + n_nodes * 16;
+        if bytes.len() < doc_ids_end {
+            return Err(E::TruncatedSection("doc_ids"));
+        }
+        let mut doc_ids: Vec<Id> = Vec::with_capacity(n_nodes);
+        for chunk in bytes[pos..doc_ids_end].chunks_exact(16) {
+            let raw: RawId = chunk.try_into().unwrap();
+            doc_ids.push(Id::new(raw).ok_or(E::NilDocId)?);
+        }
+        pos = doc_ids_end;
+
+        // vectors
+        let vectors_end = pos + n_nodes * dim * 4;
+        if bytes.len() < vectors_end {
+            return Err(E::TruncatedSection("vectors"));
+        }
+        let all_vectors: Vec<f32> = bytes[pos..vectors_end]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        pos = vectors_end;
+
+        // levels
+        let levels_end = pos + n_nodes;
+        if bytes.len() < levels_end {
+            return Err(E::TruncatedSection("levels"));
+        }
+        let levels: Vec<u8> = bytes[pos..levels_end].to_vec();
+        pos = levels_end;
+
+        // per-node offset tables (size = max_layer_count + 1
+        // u32 entries per node).
+        let max_layer_count = (max_level as usize) + 1;
+        let entries_per_node = max_layer_count + 1;
+        let offsets_end = pos + n_nodes * entries_per_node * 4;
+        if bytes.len() < offsets_end {
+            return Err(E::TruncatedSection("neighbour_offsets"));
+        }
+        let all_offsets: Vec<u32> = bytes[pos..offsets_end]
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        pos = offsets_end;
+
+        // flat neighbour indices
+        let remaining = &bytes[pos..];
+        let all_neighbours: Vec<u32> = remaining
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+
+        // Rebuild per-node HNSWNode structs.
+        let mut nodes: Vec<HNSWNode> = Vec::with_capacity(n_nodes);
+        let mut neighbour_cursor: u32 = 0;
+        for i in 0..n_nodes {
+            let level = levels[i];
+            let n_layers = level as usize + 1;
+            let mut layer_lists: Vec<Vec<u32>> = Vec::with_capacity(n_layers);
+            let offset_block =
+                &all_offsets[i * entries_per_node..(i + 1) * entries_per_node];
+            for layer_idx in 0..n_layers {
+                let start = offset_block[layer_idx];
+                let end = offset_block[layer_idx + 1];
+                if start > end {
+                    return Err(E::TruncatedSection("neighbour_offsets"));
+                }
+                let mut list: Vec<u32> = Vec::with_capacity((end - start) as usize);
+                for offset in start..end {
+                    let neighbour_pos = neighbour_cursor + (offset - start);
+                    let Some(&n) = all_neighbours.get(neighbour_pos as usize)
+                    else {
+                        return Err(E::TruncatedSection("neighbours"));
+                    };
+                    if n as usize >= n_nodes {
+                        return Err(E::OutOfRangeNeighbour(n));
+                    }
+                    list.push(n);
+                }
+                layer_lists.push(list);
+            }
+            let last = offset_block[n_layers];
+            let first = offset_block[0];
+            let span = last - first;
+            if span as usize > n_nodes * n_layers {
+                return Err(E::ImpossibleNeighbourCount(span));
+            }
+            neighbour_cursor += span;
+            nodes.push(HNSWNode {
+                vector: all_vectors[i * dim..(i + 1) * dim].to_vec(),
+                level,
+                neighbors: layer_lists,
+            });
+        }
+
+        Ok(Self {
+            dim,
+            m,
+            m0,
+            nodes,
+            doc_ids,
+            entry_point: if has_entry { Some(entry_raw) } else { None },
+            max_level,
+        })
     }
 
     fn greedy_search_layer(&self, q: &[f32], entry: u32, layer: u8) -> u32 {
@@ -1183,5 +1470,74 @@ mod tests {
         b.insert(id(1), vec![1.0, 0.0, 0.0]).unwrap();
         let idx = b.build();
         assert!(idx.similar(&[1.0, 0.0], 3, None).is_empty());
+    }
+
+    fn sample_hnsw() -> HNSWIndex {
+        let mut b = HNSWBuilder::new(3).with_seed(42);
+        b.insert(id(1), vec![1.0, 0.0, 0.0]).unwrap();
+        b.insert(id(2), vec![0.9, 0.1, 0.0]).unwrap();
+        b.insert(id(3), vec![0.0, 1.0, 0.0]).unwrap();
+        b.insert(id(4), vec![0.0, 0.0, 1.0]).unwrap();
+        b.build()
+    }
+
+    #[test]
+    fn hnsw_empty_bytes_round_trip() {
+        let idx = HNSWBuilder::new(3).build();
+        let bytes = idx.to_bytes();
+        let reloaded = HNSWIndex::try_from_bytes(&bytes).expect("valid blob");
+        assert_eq!(reloaded.doc_count(), 0);
+        assert_eq!(reloaded.dim(), 3);
+    }
+
+    #[test]
+    fn hnsw_bytes_round_trip_preserves_queries() {
+        let idx = sample_hnsw();
+        let bytes = idx.to_bytes();
+        let reloaded = HNSWIndex::try_from_bytes(&bytes).expect("valid blob");
+        assert_eq!(reloaded.doc_count(), idx.doc_count());
+        assert_eq!(reloaded.dim(), idx.dim());
+        assert_eq!(reloaded.m(), idx.m());
+        assert_eq!(reloaded.m0(), idx.m0());
+        assert_eq!(reloaded.max_level(), idx.max_level());
+
+        let q = vec![1.0, 0.0, 0.0];
+        let a = idx.similar(&q, 4, Some(10));
+        let b = reloaded.similar(&q, 4, Some(10));
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(x.0, y.0);
+            assert!((x.1 - y.1).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn hnsw_bytes_are_deterministic() {
+        let a = sample_hnsw().to_bytes();
+        let b = sample_hnsw().to_bytes();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn hnsw_short_header_rejected() {
+        let err = HNSWIndex::try_from_bytes(&[0; 10]).unwrap_err();
+        assert_eq!(err, HNSWLoadError::ShortHeader);
+    }
+
+    #[test]
+    fn hnsw_bad_magic_rejected() {
+        let mut bytes = sample_hnsw().to_bytes();
+        bytes[0] = b'X';
+        let err = HNSWIndex::try_from_bytes(&bytes).unwrap_err();
+        assert_eq!(err, HNSWLoadError::BadMagic);
+    }
+
+    #[test]
+    fn hnsw_blob_schema_round_trip() {
+        use triblespace::core::blob::{ToBlob, TryFromBlob};
+        let idx = sample_hnsw();
+        let blob: triblespace::core::blob::Blob<SuccinctHNSWIndex> = (&idx).to_blob();
+        let reloaded = HNSWIndex::try_from_blob(blob).expect("valid blob");
+        assert_eq!(reloaded.doc_count(), idx.doc_count());
     }
 }
