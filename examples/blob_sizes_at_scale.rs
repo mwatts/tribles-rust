@@ -9,7 +9,6 @@ use std::time::Instant;
 
 use triblespace::core::id::{Id, RawId};
 use triblespace_search::bm25::BM25Builder;
-use triblespace_search::succinct::SuccinctBM25Index;
 use triblespace_search::tokens::hash_tokens;
 
 /// Tiny deterministic PRNG (SplitMix64) so runs are reproducible.
@@ -113,22 +112,25 @@ fn bench(n_docs: usize, vocab: usize, doc_len: usize, keys: KeyDist) {
         b
     };
 
-    // Single-threaded build.
+    // Single-threaded naive build (reference — timing the scoring
+    // loop on its own).
     let t0 = Instant::now();
-    let naive = fresh_builder().build_with_threads(1);
+    let naive = fresh_builder().build_naive_with_threads(1);
     let build_ms_serial = t0.elapsed().as_secs_f64() * 1000.0;
 
-    // Parallel build. 4 threads is a typical laptop-class sweet
-    // spot; push higher and the merge cost starts to eat the win.
+    // Parallel naive build. 4 threads is a typical laptop-class
+    // sweet spot; push higher and the merge cost starts to eat
+    // the win.
     let threads = 4;
     let t_par = Instant::now();
-    let parallel_naive = fresh_builder().build_with_threads(threads);
+    let parallel_naive = fresh_builder().build_naive_with_threads(threads);
     let build_ms_par = t_par.elapsed().as_secs_f64() * 1000.0;
     // Byte-identical output is the load-bearing invariant.
     debug_assert_eq!(naive.to_bytes(), parallel_naive.to_bytes());
 
+    // Direct-to-succinct build (the production path).
     let t1 = Instant::now();
-    let succinct = SuccinctBM25Index::from_naive(&naive).unwrap();
+    let succinct = fresh_builder().build();
     let encode_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
     let naive_bytes = naive.to_bytes();

@@ -49,6 +49,8 @@ use triblespace::core::metadata::{ConstDescribe, ConstId};
 use triblespace::core::value::RawValue;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
+use std::collections::HashMap;
+
 use crate::bm25::BM25Index;
 use crate::hnsw::HNSWIndex;
 
@@ -1432,9 +1434,12 @@ where
 /// [`Self::score_tolerance`] so query-time equality checks
 /// widen automatically.
 ///
-/// Built via [`Self::from_naive`] (takes a fully-materialized
-/// [`BM25Index`] and re-encodes it). A direct succinct builder
-/// (skipping the naive intermediate) is a later optimization.
+/// Built directly via
+/// [`BM25Builder::build`][crate::bm25::BM25Builder::build]: the
+/// builder sorts + dedups the keys into a `CompressedUniverse`
+/// first, then accumulates tf and scores keyed by the universe
+/// code from the start — no insertion-order intermediate. The
+/// naive [`BM25Index`] is kept as a pub reference oracle only.
 ///
 /// # Example
 ///
@@ -1448,7 +1453,7 @@ where
 /// b.insert_id(Id::new([1; 16]).unwrap(), hash_tokens("the quick brown fox"));
 /// b.insert_id(Id::new([2; 16]).unwrap(), hash_tokens("the lazy brown dog"));
 /// b.insert_id(Id::new([3; 16]).unwrap(), hash_tokens("quick silver fox"));
-/// let idx = SuccinctBM25Index::from_naive(&b.build()).unwrap();
+/// let idx = b.build();
 ///
 /// // Same query API as BM25Index — "fox" hits two docs.
 /// let fox = hash_tokens("fox")[0];
@@ -1492,87 +1497,112 @@ impl std::fmt::Debug for SuccinctBM25Index {
 }
 
 impl SuccinctBM25Index {
-    /// Re-encode a naive [`BM25Index`] into the succinct form.
-    /// The postings + per-doc counts shrink; scores stay as raw
-    /// f32 for now.
-    pub fn from_naive(idx: &BM25Index) -> Result<Self, SuccinctDocLensError> {
-        // keys: compressed universe. idx.keys() is in insertion
-        // order; the universe re-sorts + dedups. We record the
-        // translation `insertion_doc_idx -> universe_code` so
-        // postings + doc_lens can be remapped to match the new
-        // sorted order.
-        let (keys_bytes, keys_meta, insertion_to_code) = {
-            let naive_keys = idx.keys();
-            let mut area = ByteArea::new()?;
+    /// Direct-to-succinct builder path: consume a
+    /// [`BM25Builder`][crate::bm25::BM25Builder] and produce the
+    /// succinct index in a single pass through the docs.
+    ///
+    /// The universe is built first (sort + dedup keys into
+    /// `CompressedUniverse` codes), then tf accumulation and
+    /// scoring use those codes as the identifier from the start
+    /// — no insertion-order → universe-code remap, no per-term
+    /// resort pass. `BM25Builder::build()` delegates here.
+    pub(crate) fn from_builder(
+        builder: crate::bm25::BM25Builder,
+    ) -> Self {
+        let crate::bm25::BM25Builder { docs, k1, b } = builder;
+
+        // ── 1. keys: sort + dedup into CompressedUniverse. ─────────
+        let (keys_bytes, keys_meta) = {
+            let mut area = ByteArea::new().expect("alloc ByteArea");
             let mut sections = area.sections();
             let universe =
-                CompressedUniverse::with(naive_keys.iter().copied(), &mut sections);
-            let translation: Vec<u32> = naive_keys
-                .iter()
-                .map(|k| {
-                    universe
-                        .search(k)
-                        .map(|c| c as u32)
-                        .expect("key just inserted must be found")
-                })
-                .collect();
+                CompressedUniverse::with(docs.iter().map(|(k, _)| *k), &mut sections);
             let meta = universe.metadata();
             drop(universe);
             drop(sections);
-            (area.freeze()?, meta, translation)
+            (area.freeze().expect("freeze ByteArea"), meta)
         };
-        let keys = CompressedUniverse::from_bytes(keys_meta, keys_bytes).map_err(|_| {
-            SuccinctDocLensError::SizeMismatch {
-                bytes: 0,
-                expected: 0,
+        let keys = CompressedUniverse::from_bytes(keys_meta, keys_bytes)
+            .expect("round-trip the universe we just built");
+        let n_universe = keys.len();
+
+        // ── 2. tf accumulation keyed by universe_code from the
+        // start; doc_lens indexed by code, last-write-wins for
+        // duplicate keys (same semantics as the naive+remap
+        // flow). ───────────────────────────────────────────────────
+        let mut doc_lens_vec = vec![0u32; n_universe];
+        let mut term_to_tfs: HashMap<RawValue, HashMap<u32, u32>> = HashMap::new();
+        for (key, terms) in docs {
+            let code = keys
+                .search(&key)
+                .expect("key just inserted into universe") as u32;
+            doc_lens_vec[code as usize] = terms.len() as u32;
+            for term in terms {
+                *term_to_tfs.entry(term).or_default().entry(code).or_insert(0) += 1;
             }
-        })?;
-
-        // terms: flat 32-byte rows, sorted (idx.terms() guarantees).
-        let term_rows: Vec<[u8; 32]> = idx.terms_slice().to_vec();
-        let terms_bytes = FixedBytesTable::<32>::build(&term_rows);
-        let terms = FixedBytesTable::<32>::from_bytes(terms_bytes, term_rows.len())?;
-
-        // doc_lens: reorder from insertion-order to universe-code
-        // order so `doc_lens.get(universe_code)` returns the
-        // correct doc length.
-        let mut remapped_lens = vec![0u32; insertion_to_code.len()];
-        for (insertion_idx, &code) in insertion_to_code.iter().enumerate() {
-            remapped_lens[code as usize] = idx.doc_lens()[insertion_idx];
         }
-        let (doc_lens_bytes, doc_lens_meta) = SuccinctDocLens::build(&remapped_lens)?;
-        let doc_lens = SuccinctDocLens::from_bytes(doc_lens_meta, doc_lens_bytes)?;
+        let avg_doc_len = if n_universe == 0 {
+            0.0
+        } else {
+            doc_lens_vec.iter().map(|&n| n as f64).sum::<f64>() as f32
+                / n_universe as f32
+        };
 
-        // postings: remap each posting's doc_idx from insertion
-        // order to the corresponding universe code, then sort
-        // within each term's list to preserve the ascending-
-        // doc_idx invariant SuccinctPostings relies on.
-        let lists: Vec<Vec<(u32, f32)>> = (0..idx.term_count())
-            .map(|t| {
-                let mut postings: Vec<(u32, f32)> = idx
-                    .postings_for(t)
+        // ── 3. doc_lens → succinct. ────────────────────────────────
+        let (doc_lens_bytes, doc_lens_meta) =
+            SuccinctDocLens::build(&doc_lens_vec).expect("build doc_lens");
+        let doc_lens = SuccinctDocLens::from_bytes(doc_lens_meta, doc_lens_bytes)
+            .expect("round-trip doc_lens");
+
+        // ── 4. terms: sort ascending, pack flat. ──────────────────
+        let mut term_rows: Vec<RawValue> = term_to_tfs.keys().copied().collect();
+        term_rows.sort_unstable();
+        let terms_bytes = FixedBytesTable::<32>::build(&term_rows);
+        let terms = FixedBytesTable::<32>::from_bytes(terms_bytes, term_rows.len())
+            .expect("round-trip terms table");
+
+        // ── 5. per-term scored postings, each sorted ascending
+        // by universe_code (required by SuccinctPostings). ────────
+        let n = n_universe as f32;
+        let lists: Vec<Vec<(u32, f32)>> = term_rows
+            .iter()
+            .map(|term| {
+                let tfs = &term_to_tfs[term];
+                let df = tfs.len() as f32;
+                let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+                let mut entries: Vec<(u32, f32)> = tfs
                     .iter()
-                    .map(|&(insertion_idx, score)| {
-                        (insertion_to_code[insertion_idx as usize], score)
+                    .map(|(&code, &tf)| {
+                        let tf_f = tf as f32;
+                        let dl = doc_lens_vec[code as usize] as f32;
+                        let norm = if avg_doc_len > 0.0 {
+                            1.0 - b + b * (dl / avg_doc_len)
+                        } else {
+                            1.0
+                        };
+                        let score = idf * (tf_f * (k1 + 1.0)) / (tf_f + k1 * norm);
+                        (code, score)
                     })
                     .collect();
-                postings.sort_unstable_by_key(|&(idx, _)| idx);
-                postings
+                entries.sort_unstable_by_key(|&(code, _)| code);
+                entries
             })
             .collect();
         let (postings_bytes, postings_meta) =
-            SuccinctPostings::build(&lists, keys.len() as u32)?;
-        let postings = SuccinctPostings::from_bytes(postings_meta, postings_bytes)?;
+            SuccinctPostings::build(&lists, n_universe as u32)
+                .expect("build postings");
+        let postings = SuccinctPostings::from_bytes(postings_meta, postings_bytes)
+            .expect("round-trip postings");
 
-        Ok(Self {
+        Self {
             keys,
             doc_lens,
             terms,
             postings,
-            avg_doc_len: idx.avg_doc_len(),
-            k1: idx.k1(),
-            b: idx.b(),
-        })
+            avg_doc_len,
+            k1,
+            b,
+        }
     }
 
     /// Number of documents.
@@ -2248,8 +2278,8 @@ mod tests {
         b.insert_id(iid(2), hash_tokens("the lazy brown dog"));
         b.insert_id(iid(3), hash_tokens("quick silver fox jumps"));
         b.insert_id(iid(4), hash_tokens("unrelated filler content"));
-        let naive = b.build();
-        let succinct = SuccinctBM25Index::from_naive(&naive).unwrap();
+        let naive = b.clone().build_naive();
+        let succinct = b.build();
 
         assert_eq!(succinct.doc_count(), naive.doc_count());
         assert_eq!(succinct.term_count(), naive.term_count());
@@ -2287,8 +2317,7 @@ mod tests {
     #[test]
     fn succinct_bm25_empty_corpus() {
         use crate::bm25::BM25Builder;
-        let naive = BM25Builder::new().build();
-        let succinct = SuccinctBM25Index::from_naive(&naive).unwrap();
+        let succinct = BM25Builder::new().build();
         assert_eq!(succinct.doc_count(), 0);
         assert_eq!(succinct.term_count(), 0);
         assert!(succinct.query_term(&[0u8; 32]).next().is_none());
@@ -2314,8 +2343,8 @@ mod tests {
             hash_tokens("quick red rapid fox jumps high over fences"),
         );
         b.insert_id(iid(3), hash_tokens("slow brown dog"));
-        let naive = b.build();
-        let succinct = SuccinctBM25Index::from_naive(&naive).unwrap();
+        let naive = b.clone().build_naive();
+        let succinct = b.build();
 
         let q = hash_tokens("quick fox");
         let a = naive.query_multi(&q);
@@ -2346,7 +2375,7 @@ mod tests {
         b.insert_id(iid(2), hash_tokens("the lazy brown dog"));
         b.insert_id(iid(3), hash_tokens("quick silver fox jumps"));
         b.insert_id(iid(4), hash_tokens("completely unrelated filler content"));
-        SuccinctBM25Index::from_naive(&b.build()).unwrap()
+        b.build()
     }
 
     #[test]
@@ -2385,8 +2414,7 @@ mod tests {
     #[test]
     fn succinct_bm25_empty_round_trip() {
         use crate::bm25::BM25Builder;
-        let naive = BM25Builder::new().build();
-        let idx = SuccinctBM25Index::from_naive(&naive).unwrap();
+        let idx = BM25Builder::new().build();
         let bytes = idx.to_bytes();
         let reloaded = SuccinctBM25Index::try_from_bytes(&bytes).expect("valid blob");
         assert_eq!(reloaded.doc_count(), 0);
@@ -2703,8 +2731,8 @@ mod tests {
             .unwrap();
             b.insert_id(id, hash_tokens(&text));
         }
-        let naive = b.build();
-        let succinct = SuccinctBM25Index::from_naive(&naive).unwrap();
+        let naive = b.clone().build_naive();
+        let succinct = b.build();
 
         let naive_bytes = naive.to_bytes();
         let succinct_bytes = succinct.to_bytes();

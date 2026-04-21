@@ -18,7 +18,7 @@ use std::time::Instant;
 use triblespace::core::id::{Id, RawId};
 use triblespace_search::bm25::{BM25Builder, BM25Index};
 use triblespace_search::hnsw::HNSWBuilder;
-use triblespace_search::succinct::{SuccinctBM25Index, SuccinctHNSWIndex};
+use triblespace_search::succinct::SuccinctHNSWIndex;
 use triblespace_search::tokens::hash_tokens;
 
 struct Rng(u64);
@@ -77,8 +77,8 @@ fn bench_bm25(n_docs: usize, vocab: usize, doc_len: usize) {
         let doc = fake_doc(&mut rng, vocab, doc_len);
         builder.insert_id(id_from_u64(i as u64 + 1), hash_tokens(&doc));
     }
-    let naive = builder.build();
-    let succinct = SuccinctBM25Index::from_naive(&naive).unwrap();
+    let naive = builder.clone().build_naive();
+    let succinct = builder.build();
 
     // Sample term-hashes at a few frequency strata. Drawing
     // queries from the same generator biases toward common

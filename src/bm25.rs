@@ -103,10 +103,11 @@ impl std::error::Error for BM25LoadError {}
 ///
 /// [`insert`]: Self::insert
 /// [`build`]: Self::build
+#[derive(Clone)]
 pub struct BM25Builder {
-    docs: Vec<(RawValue, Vec<RawValue>)>,
-    k1: f32,
-    b: f32,
+    pub(crate) docs: Vec<(RawValue, Vec<RawValue>)>,
+    pub(crate) k1: f32,
+    pub(crate) b: f32,
 }
 
 impl Default for BM25Builder {
@@ -171,26 +172,31 @@ impl BM25Builder {
         self.docs.push((key.raw, terms));
     }
 
-    /// Consume the builder and produce an in-memory BM25 index
-    /// on a single thread.
-    pub fn build(self) -> BM25Index {
-        self.build_with_threads(1)
+    /// Consume the builder and produce a succinct BM25 index,
+    /// ready to `put` into a pile or query directly. This is the
+    /// production path — the naive in-memory [`BM25Index`] is
+    /// kept only as a reference oracle (see
+    /// [`build_naive`][Self::build_naive]).
+    pub fn build(self) -> crate::succinct::SuccinctBM25Index {
+        crate::succinct::SuccinctBM25Index::from_builder(self)
     }
 
-    /// Like [`build`], but shard the tf accumulation across
-    /// `threads` worker threads. `threads = 1` is identical to
-    /// single-threaded [`build`]; `threads > 1` spawns scoped
-    /// workers, each accumulates a local term→tf map over a
-    /// contiguous slice of docs, and the maps are merged at the
-    /// end.
-    ///
-    /// Output is byte-identical to [`build`] — doc ids, term
-    /// ordering, posting order, and scores all agree. Parallel
-    /// speedups depend on the cost ratio of tf-map insertion
-    /// vs. merge; tends to be worthwhile past ~5 k docs.
-    ///
-    /// [`build`]: Self::build
-    pub fn build_with_threads(self, threads: usize) -> BM25Index {
+    /// Naive insertion-order reference index. Runs BM25 scoring
+    /// in the simplest possible way (insertion-order doc ids,
+    /// flat `Vec<(doc_idx, score)>` postings) — useful as a
+    /// correctness oracle when validating the succinct form, or
+    /// when benchmarking the scoring cost independent of jerky
+    /// encoding overhead. Most callers want [`build`][Self::build].
+    pub fn build_naive(self) -> BM25Index {
+        self.build_naive_with_threads(1)
+    }
+
+    /// Parallelized naive build — reference implementation with
+    /// sharded tf accumulation across `threads` worker threads.
+    /// Output is byte-identical to single-threaded
+    /// [`build_naive`][Self::build_naive]. Use [`build`][Self::build]
+    /// for the production path.
+    pub fn build_naive_with_threads(self, threads: usize) -> BM25Index {
         let Self { docs, k1, b } = self;
         let n_docs = docs.len();
 
@@ -811,7 +817,7 @@ mod tests {
         b.insert_id(id(1), hash_tokens("the quick brown fox"));
         b.insert_id(id(2), hash_tokens("the lazy brown dog"));
         b.insert_id(id(3), hash_tokens("quick silver fox jumps"));
-        b.build()
+        b.build_naive()
     }
 
     #[test]
@@ -839,7 +845,7 @@ mod tests {
 
     #[test]
     fn empty_index_bytes_round_trip() {
-        let idx = BM25Builder::new().build();
+        let idx = BM25Builder::new().build_naive();
         let bytes = idx.to_bytes();
         let reloaded = BM25Index::try_from_bytes(&bytes).expect("valid blob");
         assert_eq!(reloaded.doc_count(), 0);
@@ -891,7 +897,7 @@ mod tests {
                 let byte = (i as u8).max(1);
                 b.insert_id(id(byte), hash_tokens(&text));
             }
-            b.build_with_threads(threads).to_bytes()
+            b.build_naive_with_threads(threads).to_bytes()
         }
         let serial = build(1);
         for t in [2usize, 3, 4, 8] {
@@ -905,7 +911,7 @@ mod tests {
 
     #[test]
     fn parallel_build_on_empty_corpus() {
-        let idx = BM25Builder::new().build_with_threads(4);
+        let idx = BM25Builder::new().build_naive_with_threads(4);
         assert_eq!(idx.doc_count(), 0);
         assert_eq!(idx.term_count(), 0);
     }
@@ -918,7 +924,7 @@ mod tests {
         b.insert_id(id(1), hash_tokens("one two three"));
         b.insert_id(id(2), hash_tokens("two three four"));
         b.insert_id(id(3), hash_tokens("three four five"));
-        let idx = b.build_with_threads(16);
+        let idx = b.build_naive_with_threads(16);
         assert_eq!(idx.doc_count(), 3);
         // "three" shows up in all 3 docs.
         let three = hash_tokens("three")[0];

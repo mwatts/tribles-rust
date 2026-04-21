@@ -6,7 +6,8 @@
 //! ```
 
 use triblespace::core::id::Id;
-use triblespace_search::bm25::{BM25Builder, BM25Index};
+use triblespace_search::bm25::BM25Builder;
+use triblespace_search::succinct::SuccinctBM25Index;
 use triblespace_search::tokens::hash_tokens;
 
 fn id(byte: u8) -> Id {
@@ -45,7 +46,7 @@ fn main() {
 
     // Serialize round-trip — the same bytes end-to-end.
     let bytes = idx.to_bytes();
-    let reloaded = BM25Index::try_from_bytes(&bytes).expect("valid blob");
+    let reloaded = SuccinctBM25Index::try_from_bytes(&bytes).expect("valid blob");
     println!("\nblob size: {} bytes", bytes.len());
     assert_eq!(reloaded.doc_count(), idx.doc_count());
 

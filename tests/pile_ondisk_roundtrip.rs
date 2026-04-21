@@ -36,8 +36,7 @@ fn succinct_bm25_survives_pile_round_trip() {
     b.insert_id(iid(1), hash_tokens("the quick brown fox"));
     b.insert_id(iid(2), hash_tokens("the lazy brown dog"));
     b.insert_id(iid(3), hash_tokens("quick silver fox jumps"));
-    let naive = b.build();
-    let original = SuccinctBM25Index::from_naive(&naive).unwrap();
+    let original = b.build();
 
     let handle = {
         let mut pile = Pile::<triblespace::core::value::schemas::hash::Blake3>::open(&pile_path)

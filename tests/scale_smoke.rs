@@ -63,12 +63,12 @@ fn bm25_1k_docs_roundtrip_consistency() {
         let doc = fake_document(&mut rng, VOCAB, DOC_LEN);
         builder.insert_id(id_from_u64(i as u64 + 1), hash_tokens(&doc));
     }
-    let idx = builder.build();
+    let idx = builder.build_naive();
     assert_eq!(idx.doc_count(), N_DOCS);
     assert!(idx.term_count() > 0 && idx.term_count() <= VOCAB);
 
-    // Round-trip: serialize, reload, confirm query parity for a
-    // handful of terms.
+    // Round-trip the naive reference format: serialize, reload,
+    // confirm query parity for a handful of terms.
     let bytes = idx.to_bytes();
     let reloaded = BM25Index::try_from_bytes(&bytes).expect("valid");
     for term_text in ["w0", "w1", "w42", "w250", "w499"] {
@@ -97,7 +97,7 @@ fn bm25_1k_docs_multi_term_ranks_sanely() {
     // Inject a unique "needle" doc.
     let needle_id = id_from_u64(999_999);
     builder.insert_id(needle_id, hash_tokens("needle needle beacon"));
-    let idx = builder.build();
+    let idx = builder.build_naive();
 
     let q = hash_tokens("needle beacon");
     let ranked = idx.query_multi(&q);
@@ -206,8 +206,8 @@ fn succinct_bm25_1k_docs_matches_naive() {
         let doc = fake_document(&mut rng, 500, 20);
         builder.insert_id(id_from_u64(i as u64 + 1), hash_tokens(&doc));
     }
-    let naive = builder.build();
-    let succinct = SuccinctBM25Index::from_naive(&naive).unwrap();
+    let naive = builder.clone().build_naive();
+    let succinct = builder.build();
 
     assert_eq!(succinct.doc_count(), naive.doc_count());
     assert_eq!(succinct.term_count(), naive.term_count());
@@ -322,8 +322,8 @@ fn succinct_bm25_blob_smaller_than_naive_at_1k() {
         let doc = fake_document(&mut rng, 400, 24);
         builder.insert_id(id_from_u64(i as u64 + 1), hash_tokens(&doc));
     }
-    let naive = builder.build();
-    let succinct = SuccinctBM25Index::from_naive(&naive).unwrap();
+    let naive = builder.clone().build_naive();
+    let succinct = builder.build();
 
     let naive_bytes = naive.to_bytes();
     let succinct_bytes = succinct.to_bytes();
@@ -357,7 +357,9 @@ fn bm25_quantization_preserves_top10() {
         let doc = fake_document(&mut rng, 400, 24);
         builder.insert_id(id_from_u64(i as u64 + 1), hash_tokens(&doc));
     }
-    let idx = builder.build();
+    // Uses raw f32 scores, so build the naive reference — the
+    // succinct form already quantizes internally.
+    let idx = builder.build_naive();
 
     // Walk every term, record the global max score and the
     // per-query top-10 on both the raw and the quantized copies.

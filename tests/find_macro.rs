@@ -15,13 +15,14 @@ use triblespace::core::find;
 use triblespace::core::id::Id;
 
 use triblespace_search::bm25::BM25Builder;
+use triblespace_search::succinct::SuccinctBM25Index;
 use triblespace_search::tokens::hash_tokens;
 
 fn id(byte: u8) -> Id {
     Id::new([byte; 16]).unwrap()
 }
 
-fn sample_index() -> triblespace_search::bm25::BM25Index {
+fn sample_index() -> SuccinctBM25Index {
     let mut b = BM25Builder::new();
     b.insert_id(id(1), hash_tokens("the quick brown fox"));
     b.insert_id(id(2), hash_tokens("the lazy brown dog"));
@@ -201,8 +202,7 @@ fn find_docs_and_scores_on_succinct() {
     b.insert_id(id(1), hash_tokens("fox"));
     b.insert_id(id(2), hash_tokens("quick brown fox jumps high today"));
     b.insert_id(id(3), hash_tokens("unrelated content"));
-    let naive = b.build();
-    let succinct = SuccinctBM25Index::from_naive(&naive).unwrap();
+    let succinct: SuccinctBM25Index = b.build();
     let fox = hash_tokens("fox")[0];
 
     let rows: Vec<(Id, f32)> = find!(
@@ -212,23 +212,21 @@ fn find_docs_and_scores_on_succinct() {
     .collect();
     assert!(!rows.is_empty(), "succinct index should produce rows");
 
-    // Every row's score must be within the succinct index's
-    // quantization tolerance of the original BM25 score for that
-    // doc. The trait-level BM25Queryable::score_tolerance is
-    // what the constraint uses to accept these matches through
-    // find!'s propose/confirm protocol.
-    let tol = succinct.score_tolerance().max(1e-4);
+    // Every row's score must match the score produced by direct
+    // `query_term` lookup on the same index — verifies the
+    // engine's propose/confirm path delivers the same result as
+    // the direct query API.
     let id_from_raw =
         |raw: &[u8; 32]| -> Id { Id::new(raw[16..32].try_into().unwrap()).unwrap() };
     for (doc, score) in &rows {
-        let expected: f32 = naive
+        let expected: f32 = succinct
             .query_term(&fox)
             .find(|(d, _)| id_from_raw(d) == *doc)
             .map(|(_, s)| s)
-            .expect("doc must be in naive postings");
+            .expect("doc must be in succinct postings");
         assert!(
-            (expected - score).abs() <= tol,
-            "succinct score {score} for {doc:?} drifted from naive {expected} beyond tol {tol}"
+            (expected - score).abs() < 1e-6,
+            "engine-path score {score} for {doc:?} diverged from direct {expected}"
         );
     }
 }
@@ -291,15 +289,16 @@ fn find_hnsw_similar_on_succinct() {
 /// against the succinct view of the same index.
 #[test]
 fn find_docs_containing_term_on_succinct() {
-    use triblespace_search::succinct::SuccinctBM25Index;
-
+    // `sample_index()` already returns a SuccinctBM25Index —
+    // kept as a distinct test alongside `find_docs_containing_term`
+    // so a future change that separates the naive and succinct
+    // engine paths doesn't silently drop coverage.
     let idx = sample_index();
-    let succinct = SuccinctBM25Index::from_naive(&idx).unwrap();
     let fox = hash_tokens("fox")[0];
 
     let rows: Vec<(Id,)> = find!(
         (doc: Id),
-        succinct.docs_containing(doc, fox)
+        idx.docs_containing(doc, fox)
     )
     .collect();
 

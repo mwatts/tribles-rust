@@ -135,7 +135,7 @@ fn refresh(
             reader.get::<View<str>, blobschemas::LongString>(*handle)?;
         builder.insert_id(*id, hash_tokens(body.as_ref()));
     }
-    let idx = SuccinctBM25Index::from_naive(&builder.build())?;
+    let idx: SuccinctBM25Index = builder.build();
     let handle = pile.put::<SuccinctBM25Blob, _>(&idx)?;
 
     // Option A from the design doc: store the current index

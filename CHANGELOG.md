@@ -49,13 +49,21 @@ dates are commit dates rather than release dates.
 
 ### Build-side
 
-- `BM25Builder::build()` for single-threaded build (~85 ms at
-  10 k × 64 tokens on current hardware).
-- `BM25Builder::build_with_threads(n)` for sharded tf
-  accumulation via `std::thread::scope` (no rayon dep);
-  byte-identical output vs. single-threaded across
-  {1, 2, 3, 4, 8} threads. Observed 4-thread speedup at 50 k
-  docs: ~1.3×. Ceiling is the serial merge.
+- `BM25Builder::build()` goes direct to `SuccinctBM25Index` in a
+  single pass: sorts + dedups keys into `CompressedUniverse`
+  first, then accumulates tf and scores keyed by universe code
+  from the start. No insertion-order → universe-code remap, no
+  per-term resort pass.
+- `BM25Builder::build_naive()` / `build_naive_with_threads(n)`
+  keep the naive insertion-order [`BM25Index`] available as a
+  correctness oracle (score comparisons in tests) and for
+  benchmarking the scoring loop in isolation from jerky
+  packing. The naive path still supports sharded tf accumulation
+  via `std::thread::scope`; byte-identical output across
+  {1, 2, 3, 4, 8} threads.
+- `SuccinctBM25Index::from_naive` retired — callers that had
+  `SuccinctBM25Index::from_naive(&b.build())` collapse to
+  `b.build()`.
 - `HNSWBuilder` with deterministic level sampling
   (`.with_seed(u64)`).
 

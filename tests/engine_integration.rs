@@ -11,7 +11,8 @@ use triblespace::core::query::{Binding, Constraint, Variable, VariableContext};
 use triblespace::core::value::schemas::genid::GenId;
 use triblespace::core::value::RawValue;
 
-use triblespace_search::bm25::{BM25Builder, BM25Index};
+use triblespace_search::bm25::BM25Builder;
+use triblespace_search::succinct::SuccinctBM25Index;
 use triblespace_search::tokens::hash_tokens;
 
 fn id(byte: u8) -> Id {
@@ -44,7 +45,7 @@ fn intersection_of_two_bm25_constraints_yields_overlap() {
     b.insert_id(id(1), hash_tokens("the quick brown fox"));
     b.insert_id(id(2), hash_tokens("the lazy brown dog"));
     b.insert_id(id(3), hash_tokens("quick silver fox jumps"));
-    let idx: BM25Index = b.build();
+    let idx: SuccinctBM25Index = b.build();
 
     let mut ctx = VariableContext::new();
     let doc: Variable<GenId> = ctx.next_variable();
@@ -85,7 +86,7 @@ fn intersection_with_absent_term_proposes_nothing() {
     let mut b = BM25Builder::new();
     b.insert_id(id(1), hash_tokens("the quick brown fox"));
     b.insert_id(id(2), hash_tokens("the lazy brown dog"));
-    let idx: BM25Index = b.build();
+    let idx: SuccinctBM25Index = b.build();
 
     let mut ctx = VariableContext::new();
     let doc: Variable<GenId> = ctx.next_variable();
@@ -116,7 +117,7 @@ fn satisfied_respects_both_clauses() {
     let mut b = BM25Builder::new();
     b.insert_id(id(1), hash_tokens("quick fox"));
     b.insert_id(id(2), hash_tokens("quick dog"));
-    let idx: BM25Index = b.build();
+    let idx: SuccinctBM25Index = b.build();
 
     let mut ctx = VariableContext::new();
     let doc: Variable<GenId> = ctx.next_variable();

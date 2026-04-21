@@ -11,10 +11,13 @@
 //!   [`succinct::SuccinctHNSWBlob`]) — approximate
 //!   k-nearest-neighbour over caller-supplied embeddings.
 //!
-//! [`bm25::BM25Index`] and [`hnsw::HNSWIndex`] are the naive
-//! in-memory builders; convert to the succinct forms via
-//! `SuccinctBM25Index::from_naive` /
-//! `SuccinctHNSWIndex::from_naive` and persist those.
+//! [`bm25::BM25Builder::build`] goes direct-to-succinct
+//! (sorts keys into a `CompressedUniverse` first, then
+//! accumulates per-term postings in universe-code order — no
+//! remap pass). The naive [`bm25::BM25Index`] is kept as a
+//! reference oracle via `build_naive`. HNSW still has a
+//! naive → succinct conversion via
+//! `SuccinctHNSWIndex::from_naive`.
 //!
 //! Both indexes are rebuilt-and-replaced (no mutation); the
 //! caller persists the resulting handle wherever appropriate
@@ -38,8 +41,8 @@
 //! b.insert_id(Id::new([2; 16]).unwrap(), hash_tokens("the lazy brown dog"));
 //! b.insert_id(Id::new([3; 16]).unwrap(), hash_tokens("quick silver fox"));
 //!
-//! // 2. Flip to the succinct form for persistence + smaller bytes.
-//! let idx = SuccinctBM25Index::from_naive(&b.build()).unwrap();
+//! // 2. Build a succinct BM25 index in a single pass.
+//! let idx: SuccinctBM25Index = b.build();
 //!
 //! // 3. Query through the normal engine — the constraint
 //! //    plugs into `find!` / `and!` / `pattern!` unchanged.

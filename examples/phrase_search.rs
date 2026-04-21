@@ -43,7 +43,7 @@ fn main() {
     for (doc_id, text) in &corpus {
         b.insert_id(*doc_id, phrase_tokens(text));
     }
-    let idx = SuccinctBM25Index::from_naive(&b.build()).unwrap();
+    let idx: SuccinctBM25Index = b.build();
     println!(
         "index: {} docs, {} terms (single-words + bigrams)\n",
         idx.doc_count(),

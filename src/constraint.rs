@@ -832,7 +832,7 @@ mod tests {
         b.insert_id(id(1), hash_tokens("the quick brown fox"));
         b.insert_id(id(2), hash_tokens("the lazy brown dog"));
         b.insert_id(id(3), hash_tokens("quick silver fox jumps"));
-        b.build()
+        b.build_naive()
     }
 
     #[test]
