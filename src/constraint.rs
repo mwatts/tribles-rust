@@ -100,36 +100,10 @@ impl BM25Queryable for crate::succinct::SuccinctBM25Index {
 /// constraints to work against it. Implemented for both the naive
 /// [`crate::hnsw::HNSWIndex`] and the succinct
 /// [`crate::succinct::SuccinctHNSWIndex`].
-pub trait HNSWQueryable {
-    /// Approximate top-`k` nearest neighbours to `query` under
-    /// cosine similarity, with optional `ef` search width.
-    /// Returns stored 32-byte [`RawValue`] keys — callers with a
-    /// `GenId`-schema index decode via the `raw_value_to_id`
-    /// helper in `constraint.rs`.
-    fn similar_for(&self, query: &[f32], k: usize, ef: Option<usize>) -> Vec<(RawValue, f32)>;
-
-    /// Total indexed docs (for cardinality estimates).
-    fn doc_count_for(&self) -> usize;
-}
-
-impl HNSWQueryable for HNSWIndex {
-    fn similar_for(&self, query: &[f32], k: usize, ef: Option<usize>) -> Vec<(RawValue, f32)> {
-        self.similar(query, k, ef)
-    }
-    fn doc_count_for(&self) -> usize {
-        self.doc_count()
-    }
-}
-
-#[cfg(feature = "succinct")]
-impl HNSWQueryable for crate::succinct::SuccinctHNSWIndex {
-    fn similar_for(&self, query: &[f32], k: usize, ef: Option<usize>) -> Vec<(RawValue, f32)> {
-        self.similar(query, k, ef)
-    }
-    fn doc_count_for(&self) -> usize {
-        self.doc_count()
-    }
-}
+/// The HNSW constraints now store eagerly-computed top-k
+/// (same shape as the Flat constraints), so there's no trait
+/// indirection at query time — the trait previously here
+/// (`HNSWQueryable`) was dropped in the HNSW handle port.
 
 /// Constrains a `Variable<S>` (doc) to the 32-byte
 /// [`RawValue`]s in the posting list of the pinned term. `S` is
@@ -562,60 +536,53 @@ impl<'a> Constraint<'a> for SimilarToVectorScored {
 /// HNSW version of [`SimilarToVector`]. Same shape; different
 /// backing index. Approximate rather than exact top-k.
 ///
-/// Generic over `I: HNSWQueryable`, so it works against
-/// [`HNSWIndex`] or
-/// [`crate::succinct::SuccinctHNSWIndex`] without duplication.
-pub struct SimilarToVectorHNSW<'a, I: HNSWQueryable + ?Sized = HNSWIndex> {
-    index: &'a I,
+/// Eagerly resolves the top-`k` against the caller-supplied
+/// blob store at construction time and caches the result.
+/// `propose` / `confirm` / `satisfied` iterate the cached
+/// list — no re-walking the HNSW graph per method call.
+pub struct SimilarToVectorHNSW {
     doc: Variable<GenId>,
-    query: Vec<f32>,
-    k: usize,
-    /// HNSW's `ef_search` parameter. Larger = better recall at
-    /// higher query cost. Defaults to `k` when `None`.
-    ef: Option<usize>,
+    top: Vec<(RawValue, f32)>,
 }
 
-impl<'a, I: HNSWQueryable + ?Sized> SimilarToVectorHNSW<'a, I> {
-    pub fn new(
-        index: &'a I,
-        doc: Variable<GenId>,
-        query: Vec<f32>,
-        k: usize,
-        ef: Option<usize>,
-    ) -> Self {
-        Self {
-            index,
-            doc,
-            query,
-            k,
-            ef,
-        }
+impl SimilarToVectorHNSW {
+    pub fn from_top(doc: Variable<GenId>, top: Vec<(RawValue, f32)>) -> Self {
+        Self { doc, top }
     }
 }
 
 impl HNSWIndex {
     /// Build a [`SimilarToVectorHNSW`] constraint for use inside
     /// `pattern!` / `find!`. Pass `ef = Some(n)` to widen search
-    /// (higher recall, slower); `None` defaults to `k`.
-    pub fn similar_constraint(
+    /// (higher recall, slower); `None` defaults to `k`. The
+    /// HNSW walk happens once at construction; `store` resolves
+    /// embedding handles during that walk.
+    pub fn similar_constraint<B>(
         &self,
         doc: Variable<GenId>,
         query: Vec<f32>,
         k: usize,
         ef: Option<usize>,
-    ) -> SimilarToVectorHNSW<'_, HNSWIndex> {
-        SimilarToVectorHNSW::new(self, doc, query, k, ef)
+        store: &B,
+    ) -> Result<SimilarToVectorHNSW, B::GetError<anybytes::view::ViewError>>
+    where
+        B: triblespace::core::repo::BlobStoreGet<
+                triblespace::core::value::schemas::hash::Blake3,
+            >,
+    {
+        let top = self.similar(&query, k, ef, store)?;
+        Ok(SimilarToVectorHNSW::from_top(doc, top))
     }
 }
 
-impl<'a, I: HNSWQueryable + ?Sized + 'a> Constraint<'a> for SimilarToVectorHNSW<'a, I> {
+impl<'a> Constraint<'a> for SimilarToVectorHNSW {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.doc.index)
     }
 
     fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
         if self.doc.index == variable {
-            Some(self.k.min(self.index.doc_count_for()))
+            Some(self.top.len())
         } else {
             None
         }
@@ -625,8 +592,8 @@ impl<'a, I: HNSWQueryable + ?Sized + 'a> Constraint<'a> for SimilarToVectorHNSW<
         if self.doc.index != variable {
             return;
         }
-        for (key, _score) in self.index.similar_for(&self.query, self.k, self.ef) {
-            proposals.push(key);
+        for (key, _score) in &self.top {
+            proposals.push(*key);
         }
     }
 
@@ -634,22 +601,13 @@ impl<'a, I: HNSWQueryable + ?Sized + 'a> Constraint<'a> for SimilarToVectorHNSW<
         if self.doc.index != variable {
             return;
         }
-        let top: HashSet<RawValue> = self
-            .index
-            .similar_for(&self.query, self.k, self.ef)
-            .into_iter()
-            .map(|(k, _)| k)
-            .collect();
+        let top: HashSet<RawValue> = self.top.iter().map(|(k, _)| *k).collect();
         proposals.retain(|raw| top.contains(raw));
     }
 
     fn satisfied(&self, binding: &Binding) -> bool {
         match binding.get(self.doc.index) {
-            Some(raw) => self
-                .index
-                .similar_for(&self.query, self.k, self.ef)
-                .into_iter()
-                .any(|(k, _)| k == *raw),
+            Some(raw) => self.top.iter().any(|(k, _)| k == raw),
             None => true,
         }
     }
@@ -658,54 +616,48 @@ impl<'a, I: HNSWQueryable + ?Sized + 'a> Constraint<'a> for SimilarToVectorHNSW<
 // ── HNSWIndex constraint with score ─────────────────────────────────
 
 /// Scored variant of [`SimilarToVectorHNSW`]: binds both `doc`
-/// and the cosine `score` per top-`k` hit.
-///
-/// Generic over `I: HNSWQueryable`.
-pub struct SimilarToVectorHNSWScored<'a, I: HNSWQueryable + ?Sized = HNSWIndex> {
-    index: &'a I,
+/// and the cosine `score` per top-`k` hit. Eagerly resolves
+/// top-`k` at construction.
+pub struct SimilarToVectorHNSWScored {
     doc: Variable<GenId>,
     score: Variable<F32LE>,
-    query: Vec<f32>,
-    k: usize,
-    ef: Option<usize>,
+    top: Vec<(RawValue, f32)>,
 }
 
-impl<'a, I: HNSWQueryable + ?Sized> SimilarToVectorHNSWScored<'a, I> {
-    pub fn new(
-        index: &'a I,
+impl SimilarToVectorHNSWScored {
+    pub fn from_top(
         doc: Variable<GenId>,
         score: Variable<F32LE>,
-        query: Vec<f32>,
-        k: usize,
-        ef: Option<usize>,
+        top: Vec<(RawValue, f32)>,
     ) -> Self {
-        Self {
-            index,
-            doc,
-            score,
-            query,
-            k,
-            ef,
-        }
+        Self { doc, score, top }
     }
 }
 
 impl HNSWIndex {
     /// Two-variable similarity constraint for HNSW — binds both
-    /// `doc` and cosine `score` for each top-k hit.
-    pub fn similar_with_scores(
+    /// `doc` and cosine `score` for each top-k hit. Eagerly
+    /// resolves against `store`.
+    pub fn similar_with_scores<B>(
         &self,
         doc: Variable<GenId>,
         score: Variable<F32LE>,
         query: Vec<f32>,
         k: usize,
         ef: Option<usize>,
-    ) -> SimilarToVectorHNSWScored<'_, HNSWIndex> {
-        SimilarToVectorHNSWScored::new(self, doc, score, query, k, ef)
+        store: &B,
+    ) -> Result<SimilarToVectorHNSWScored, B::GetError<anybytes::view::ViewError>>
+    where
+        B: triblespace::core::repo::BlobStoreGet<
+                triblespace::core::value::schemas::hash::Blake3,
+            >,
+    {
+        let top = self.similar(&query, k, ef, store)?;
+        Ok(SimilarToVectorHNSWScored::from_top(doc, score, top))
     }
 }
 
-impl<'a, I: HNSWQueryable + ?Sized + 'a> Constraint<'a> for SimilarToVectorHNSWScored<'a, I> {
+impl<'a> Constraint<'a> for SimilarToVectorHNSWScored {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.doc.index)
             .union(VariableSet::new_singleton(self.score.index))
@@ -713,7 +665,7 @@ impl<'a, I: HNSWQueryable + ?Sized + 'a> Constraint<'a> for SimilarToVectorHNSWS
 
     fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
         if variable == self.doc.index || variable == self.score.index {
-            Some(self.k.min(self.index.doc_count_for()))
+            Some(self.top.len())
         } else {
             None
         }
@@ -722,37 +674,37 @@ impl<'a, I: HNSWQueryable + ?Sized + 'a> Constraint<'a> for SimilarToVectorHNSWS
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
         if variable == self.doc.index {
             let bound_score = binding.get(self.score.index).map(raw_value_to_f32);
-            for (key, score) in self.index.similar_for(&self.query, self.k, self.ef) {
+            for (key, score) in &self.top {
                 if let Some(bs) = bound_score {
                     if (score - bs).abs() > f32::EPSILON {
                         continue;
                     }
                 }
-                proposals.push(key);
+                proposals.push(*key);
             }
         } else if variable == self.score.index {
             let bound_doc: Option<RawValue> = binding.get(self.doc.index).copied();
             // Dedupe by bit-pattern to avoid Cartesian blow-up
             // when two neighbours share a similarity value.
             let mut seen = HashSet::new();
-            for (key, score) in self.index.similar_for(&self.query, self.k, self.ef) {
+            for (key, score) in &self.top {
                 if let Some(bd) = bound_doc {
-                    if key != bd {
+                    if *key != bd {
                         continue;
                     }
                 }
                 if seen.insert(score.to_bits()) {
-                    proposals.push(f32_to_raw_value(score));
+                    proposals.push(f32_to_raw_value(*score));
                 }
             }
         }
     }
 
     fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
-        let top = self.index.similar_for(&self.query, self.k, self.ef);
         if variable == self.doc.index {
             let bound_score = binding.get(self.score.index).map(raw_value_to_f32);
-            let allowed: HashSet<RawValue> = top
+            let allowed: HashSet<RawValue> = self
+                .top
                 .iter()
                 .filter(|(_, s)| match bound_score {
                     Some(bs) => (s - bs).abs() <= f32::EPSILON,
@@ -763,7 +715,8 @@ impl<'a, I: HNSWQueryable + ?Sized + 'a> Constraint<'a> for SimilarToVectorHNSWS
             proposals.retain(|raw| allowed.contains(raw));
         } else if variable == self.score.index {
             let bound_doc: Option<RawValue> = binding.get(self.doc.index).copied();
-            let allowed: HashSet<u32> = top
+            let allowed: HashSet<u32> = self
+                .top
                 .iter()
                 .filter(|(k, _)| match bound_doc {
                     Some(bd) => *k == bd,
@@ -780,14 +733,10 @@ impl<'a, I: HNSWQueryable + ?Sized + 'a> Constraint<'a> for SimilarToVectorHNSWS
         let bound_score = binding.get(self.score.index).map(raw_value_to_f32);
         match (bound_doc, bound_score) {
             (None, None) => true,
-            _ => self
-                .index
-                .similar_for(&self.query, self.k, self.ef)
-                .into_iter()
-                .any(|(k, s)| {
-                    bound_doc.map_or(true, |bd| k == bd)
-                        && bound_score.map_or(true, |bs| (s - bs).abs() <= f32::EPSILON)
-                }),
+            _ => self.top.iter().any(|&(k, s)| {
+                bound_doc.map_or(true, |bd| k == bd)
+                    && bound_score.map_or(true, |bs| (s - bs).abs() <= f32::EPSILON)
+            }),
         }
     }
 }
@@ -1237,22 +1186,37 @@ mod tests {
         assert!((raw_value_to_f32(&props[0]) - real[0]).abs() < 1e-6);
     }
 
-    fn sample_hnsw() -> crate::hnsw::HNSWIndex {
+    fn sample_hnsw() -> (
+        crate::hnsw::HNSWIndex,
+        triblespace::core::blob::MemoryBlobStore<
+            triblespace::core::value::schemas::hash::Blake3,
+        >,
+    ) {
         use crate::hnsw::HNSWBuilder;
+        use triblespace::core::blob::MemoryBlobStore;
+        use triblespace::core::value::schemas::hash::Blake3;
+        let mut store = MemoryBlobStore::<Blake3>::new();
         let mut b = HNSWBuilder::new(3).with_seed(42);
-        b.insert_id(id(1), vec![1.0, 0.0, 0.0]).unwrap();
-        b.insert_id(id(2), vec![0.0, 1.0, 0.0]).unwrap();
-        b.insert_id(id(3), vec![0.9, 0.1, 0.0]).unwrap();
-        b.insert_id(id(4), vec![0.0, 0.0, 1.0]).unwrap();
-        b.build()
+        for (i, v) in [
+            (1u8, vec![1.0f32, 0.0, 0.0]),
+            (2, vec![0.0, 1.0, 0.0]),
+            (3, vec![0.9, 0.1, 0.0]),
+            (4, vec![0.0, 0.0, 1.0]),
+        ] {
+            let h = crate::schemas::put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
+            b.insert_id(id(i), h, v).unwrap();
+        }
+        (b.build(), store)
     }
 
     #[test]
     fn hnsw_constraint_proposes_top_k() {
-        let idx = sample_hnsw();
+        let (idx, mut store) = sample_hnsw();
         let mut ctx = triblespace::core::query::VariableContext::new();
         let doc: Variable<GenId> = ctx.next_variable();
-        let c = idx.similar_constraint(doc, vec![1.0, 0.0, 0.0], 2, Some(10));
+        let c = idx
+            .similar_constraint(doc, vec![1.0, 0.0, 0.0], 2, Some(10), &store.reader().unwrap())
+            .unwrap();
 
         let binding = Binding::default();
         let mut props = Vec::new();
@@ -1268,19 +1232,23 @@ mod tests {
 
     #[test]
     fn hnsw_constraint_estimate_clamps_to_corpus() {
-        let idx = sample_hnsw();
+        let (idx, mut store) = sample_hnsw();
         let mut ctx = triblespace::core::query::VariableContext::new();
         let doc: Variable<GenId> = ctx.next_variable();
-        let c = idx.similar_constraint(doc, vec![1.0, 0.0, 0.0], 100, None);
+        let c = idx
+            .similar_constraint(doc, vec![1.0, 0.0, 0.0], 100, None, &store.reader().unwrap())
+            .unwrap();
         assert_eq!(c.estimate(doc.index, &Binding::default()), Some(4));
     }
 
     #[test]
     fn hnsw_constraint_satisfied_respects_binding() {
-        let idx = sample_hnsw();
+        let (idx, mut store) = sample_hnsw();
         let mut ctx = triblespace::core::query::VariableContext::new();
         let doc: Variable<GenId> = ctx.next_variable();
-        let c = idx.similar_constraint(doc, vec![1.0, 0.0, 0.0], 2, Some(10));
+        let c = idx
+            .similar_constraint(doc, vec![1.0, 0.0, 0.0], 2, Some(10), &store.reader().unwrap())
+            .unwrap();
 
         // Unbound → trivially satisfied.
         assert!(c.satisfied(&Binding::default()));
@@ -1343,11 +1311,20 @@ mod tests {
 
     #[test]
     fn hnsw_scored_constraint_proposes_both() {
-        let idx = sample_hnsw();
+        let (idx, mut store) = sample_hnsw();
         let mut ctx = triblespace::core::query::VariableContext::new();
         let doc: Variable<GenId> = ctx.next_variable();
         let score: Variable<F32LE> = ctx.next_variable();
-        let c = idx.similar_with_scores(doc, score, vec![1.0, 0.0, 0.0], 2, Some(10));
+        let c = idx
+            .similar_with_scores(
+                doc,
+                score,
+                vec![1.0, 0.0, 0.0],
+                2,
+                Some(10),
+                &store.reader().unwrap(),
+            )
+            .unwrap();
 
         let vars = c.variables();
         assert!(vars.is_set(doc.index));

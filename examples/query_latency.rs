@@ -169,16 +169,24 @@ fn bench_bm25(n_docs: usize, vocab: usize, doc_len: usize) {
 }
 
 fn bench_hnsw(n_docs: usize, dim: usize) {
+    use triblespace::core::blob::MemoryBlobStore;
+    use triblespace::core::repo::BlobStore;
+    use triblespace::core::value::schemas::hash::Blake3;
+    use triblespace_search::schemas::put_embedding;
+
     let mut rng = Rng(0xBAD_F00D + n_docs as u64);
+    let mut store = MemoryBlobStore::<Blake3>::new();
     let mut builder = HNSWBuilder::new(dim).with_seed(13);
     for i in 0..n_docs {
         let v: Vec<f32> = (0..dim)
             .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
             .collect();
-        builder.insert_id(id_from_u64(i as u64 + 1), v).unwrap();
+        let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
+        builder.insert_id(id_from_u64(i as u64 + 1), h, v).unwrap();
     }
     let naive = builder.build();
     let succinct = SuccinctHNSWIndex::from_naive(&naive).unwrap();
+    let reader = store.reader().unwrap();
 
     // 100 random queries.
     let queries: Vec<Vec<f32>> = (0..100)
@@ -190,8 +198,8 @@ fn bench_hnsw(n_docs: usize, dim: usize) {
         .collect();
 
     for q in &queries {
-        let _ = naive.similar(q, 10, Some(50));
-        let _ = succinct.similar(q, 10, Some(50));
+        let _ = naive.similar(q, 10, Some(50), &reader);
+        let _ = succinct.similar(q, 10, Some(50), &reader);
     }
 
     let time = |tag: &str, f: &dyn Fn(&[f32])| {
@@ -217,10 +225,10 @@ fn bench_hnsw(n_docs: usize, dim: usize) {
 
     println!("HNSW top-10 query, ef=50  [n={n_docs}, dim={dim}]:");
     time("naive", &|q| {
-        let _ = naive.similar(q, 10, Some(50));
+        let _ = naive.similar(q, 10, Some(50), &reader);
     });
     time("SH25", &|q| {
-        let _ = succinct.similar(q, 10, Some(50));
+        let _ = succinct.similar(q, 10, Some(50), &reader);
     });
 }
 

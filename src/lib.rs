@@ -96,4 +96,14 @@ pub mod tokens;
 ///   resolve handles at query time. Blob shrinks from 16 +
 ///   4·dim B/doc to 64 B/doc. HNSW path not ported yet this
 ///   version.
-pub const FORMAT_VERSION: u16 = 5;
+/// - `6`: HNSW + SH25 blobs: same treatment. HNSWBuilder now
+///   takes `(key, handle, vec)` — the vec is used for
+///   graph-construction distances during build and stripped
+///   at `build()`, so the final index carries handles only.
+///   `HNSWIndex::similar` + `SuccinctHNSWIndex::similar` both
+///   take a `&BlobStoreGet<Blake3>`. HNSW blob: 32 B/doc keys
+///   + 32 B/doc handles + graph (was 32 B/doc keys + 4·dim
+///   B/doc vectors + graph). Constraints drop the
+///   `HNSWQueryable` trait in favour of eager top-k caching
+///   at construction, matching the Flat constraint pattern.
+pub const FORMAT_VERSION: u16 = 6;

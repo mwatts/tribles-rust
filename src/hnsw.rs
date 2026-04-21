@@ -123,15 +123,23 @@ impl std::error::Error for FlatLoadError {}
 
 // ── Proper HNSW graph (layered, approximate k-NN) ─────────────────
 
-/// Per-node state in the HNSW graph. Each node lives on layers
-/// `0..=level`; `neighbors[i]` is the neighbour list for layer
-/// `i` (local to the node).
+/// Per-node state during build: vector lives inline so graph
+/// construction can compute distances without touching a blob
+/// store. `build()` strips the vector and produces
+/// [`HNSWIndexNode`].
 #[derive(Debug)]
 struct HNSWNode {
     vector: Vec<f32>,
-    /// Level this node was sampled into. Kept for debugging /
-    /// future serialization — the neighbour lists already record
-    /// which layers the node participates in.
+    #[allow(dead_code)]
+    level: u8,
+    neighbors: Vec<Vec<u32>>,
+}
+
+/// Post-build per-node state. No vector — queries resolve
+/// embeddings through a caller-supplied blob store via the
+/// parallel `handles` table.
+#[derive(Debug)]
+struct HNSWIndexNode {
     #[allow(dead_code)]
     level: u8,
     neighbors: Vec<Vec<u32>>,
@@ -152,8 +160,17 @@ pub struct HNSWBuilder {
     level_mult: f32,
     /// SplitMix64 state for deterministic level sampling.
     rng: u64,
+    /// Per-node state, inclusive of the inline vector used for
+    /// graph-construction distance computations. The vectors
+    /// get stripped when `build()` consumes the builder —
+    /// they don't survive into `HNSWIndex`.
     nodes: Vec<HNSWNode>,
     keys: Vec<RawValue>,
+    /// Content-addressed handle for each node's embedding.
+    /// Parallel index with `keys` and `nodes`; the final
+    /// `HNSWIndex` keeps only this table for query-time
+    /// resolution.
+    handles: Vec<Value<Handle<Blake3, Embedding>>>,
     entry_point: Option<u32>,
     max_level: u8,
 }
@@ -178,6 +195,7 @@ impl HNSWBuilder {
             rng: 0xC0FFEEu64,
             nodes: Vec::new(),
             keys: Vec::new(),
+            handles: Vec::new(),
             entry_point: None,
             max_level: 0,
         }
@@ -228,17 +246,32 @@ impl HNSWBuilder {
         l.clamp(0, u8::MAX as i32) as u8
     }
 
-    /// Insert a vector under `key`. `key` is any 32-byte
-    /// triblespace value identifying the doc (entity id via
-    /// `GenId`, string value, tag, composite — see
+    /// Insert a document keyed by `key`, referenced by
+    /// `handle` (a content-addressed pointer to the
+    /// [`Embedding`] blob), with the raw `vec` supplied for
+    /// build-time distance computations. The builder keeps the
+    /// vector in RAM during graph construction and strips it at
+    /// [`build`]; the final [`HNSWIndex`] only carries the
+    /// handle, so embeddings live in the pile's blob store and
+    /// dedupe across indexes. `key` is any 32-byte triblespace
+    /// value (GenId / ShortString / tag / composite — see
     /// [`insert_id`] / [`insert_value`] for convenience
     /// wrappers). The vector is L2-normalized in place before
-    /// storage, so the index uses cosine similarity as its
-    /// distance.
+    /// distance computation, so the index treats its metric as
+    /// cosine similarity; the stored `handle` is expected to
+    /// point at an already-normalized embedding (the
+    /// [`put_embedding`] helper normalizes before put).
     ///
+    /// [`build`]: Self::build
     /// [`insert_id`]: Self::insert_id
     /// [`insert_value`]: Self::insert_value
-    pub fn insert(&mut self, key: RawValue, mut vec: Vec<f32>) -> Result<(), DimMismatch> {
+    /// [`put_embedding`]: crate::schemas::put_embedding
+    pub fn insert(
+        &mut self,
+        key: RawValue,
+        handle: Value<Handle<Blake3, Embedding>>,
+        mut vec: Vec<f32>,
+    ) -> Result<(), DimMismatch> {
         if vec.len() != self.dim {
             return Err(DimMismatch {
                 expected: self.dim,
@@ -267,6 +300,7 @@ impl HNSWBuilder {
             neighbors: vec![Vec::new(); new_level as usize + 1],
         });
         self.keys.push(key);
+        self.handles.push(handle);
 
         // Connect from new_level down to 0.
         if let Some(start) = curr {
@@ -306,37 +340,51 @@ impl HNSWBuilder {
         Ok(())
     }
 
-    /// Convenience: insert a vector keyed by a triblespace
-    /// [`Id`] (16 bytes). Shorthand for `insert(Value::<GenId>
-    /// ::new(id).raw, ...)` — matches the pre-generalization API
-    /// so callers keyed by entity id don't change.
-    pub fn insert_id(&mut self, doc_id: Id, vec: Vec<f32>) -> Result<(), DimMismatch> {
+    /// Convenience: insert keyed by a triblespace [`Id`].
+    pub fn insert_id(
+        &mut self,
+        doc_id: Id,
+        handle: Value<Handle<Blake3, Embedding>>,
+        vec: Vec<f32>,
+    ) -> Result<(), DimMismatch> {
         let mut raw = [0u8; 32];
         let id_bytes: &RawId = doc_id.as_ref();
         raw[16..32].copy_from_slice(id_bytes);
-        self.insert(raw, vec)
+        self.insert(raw, handle, vec)
     }
 
-    /// Convenience: insert a vector keyed by a typed
-    /// [`Value<S>`] for any value schema `S` — for example
-    /// `Value<ShortString>` when embedding by title, or
-    /// `Value<Tag>` when embedding by a known tag.
+    /// Convenience: insert keyed by a typed [`Value<S>`].
     pub fn insert_value<S: ValueSchema>(
         &mut self,
         key: Value<S>,
+        handle: Value<Handle<Blake3, Embedding>>,
         vec: Vec<f32>,
     ) -> Result<(), DimMismatch> {
-        self.insert(key.raw, vec)
+        self.insert(key.raw, handle, vec)
     }
 
     /// Consume the builder and produce an immutable [`HNSWIndex`].
+    /// Strips the inline build-time vectors — only the handles
+    /// survive. Embeddings are resolved at query time through
+    /// the caller-supplied blob store.
     pub fn build(self) -> HNSWIndex {
+        // Strip vectors; keep only neighbour lists and per-node
+        // level metadata for succinct encoding downstream.
+        let nodes: Vec<HNSWIndexNode> = self
+            .nodes
+            .into_iter()
+            .map(|n| HNSWIndexNode {
+                level: n.level,
+                neighbors: n.neighbors,
+            })
+            .collect();
         HNSWIndex {
             dim: self.dim,
             m: self.m,
             m0: self.m0,
-            nodes: self.nodes,
+            nodes,
             keys: self.keys,
+            handles: self.handles,
             entry_point: self.entry_point,
             max_level: self.max_level,
         }
@@ -465,8 +513,12 @@ pub struct HNSWIndex {
     dim: usize,
     m: u16,
     m0: u16,
-    nodes: Vec<HNSWNode>,
+    /// Post-build per-node state. Neighbour lists survive; the
+    /// vectors were stripped — distance evaluations resolve
+    /// handles through a caller-supplied blob store.
+    nodes: Vec<HNSWIndexNode>,
     keys: Vec<RawValue>,
+    handles: Vec<Value<Handle<Blake3, Embedding>>>,
     entry_point: Option<u32>,
     max_level: u8,
 }
@@ -501,11 +553,6 @@ impl HNSWIndex {
         &self.keys
     }
 
-    /// Vector for node `i`. Already L2-normalized by `insert`.
-    pub fn node_vector(&self, i: usize) -> Option<&[f32]> {
-        self.nodes.get(i).map(|n| n.vector.as_slice())
-    }
-
     /// Level node `i` was sampled into.
     pub fn node_level(&self, i: usize) -> Option<u8> {
         self.nodes.get(i).map(|n| n.level)
@@ -521,6 +568,15 @@ impl HNSWIndex {
             .unwrap_or(&[])
     }
 
+    /// The stored embedding-handle table. Paired index-wise
+    /// with [`keys`]; `handles()[i]` points at the blob that
+    /// holds the embedding for internal node `i`.
+    ///
+    /// [`keys`]: Self::keys
+    pub fn handles(&self) -> &[Value<Handle<Blake3, Embedding>>] {
+        &self.handles
+    }
+
     /// Current entry-point node index (the last inserted node
     /// at `max_level`), or `None` if the index is empty.
     pub fn entry_point(&self) -> Option<u32> {
@@ -528,15 +584,32 @@ impl HNSWIndex {
     }
 
     /// Approximate top-k nearest neighbours to `query` under
-    /// cosine similarity. `ef` tunes the search width (larger =
-    /// better recall at higher cost); pass `None` to default to
-    /// `k`.
-    pub fn similar(&self, query: &[f32], k: usize, ef: Option<usize>) -> Vec<(RawValue, f32)> {
+    /// cosine similarity, resolving embedding handles through
+    /// `store`. `ef` tunes the search width (larger = better
+    /// recall at higher cost); pass `None` to default to `k`.
+    ///
+    /// Handle lookups happen on every distance evaluation along
+    /// the HNSW walk. Wrap `store` in a
+    /// [`BlobCache`][c] when the same index will be queried
+    /// repeatedly — it amortizes the per-handle deserialize
+    /// across queries.
+    ///
+    /// [c]: triblespace::core::blob::BlobCache
+    pub fn similar<B>(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: Option<usize>,
+        store: &B,
+    ) -> Result<Vec<(RawValue, f32)>, B::GetError<anybytes::view::ViewError>>
+    where
+        B: triblespace::core::repo::BlobStoreGet<Blake3>,
+    {
         if query.len() != self.dim || k == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let Some(entry) = self.entry_point else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let mut q = query.to_vec();
         normalize(&mut q);
@@ -545,10 +618,10 @@ impl HNSWIndex {
         // Greedy descent from max_level down to 1.
         let mut curr = entry;
         for lvl in (1..=self.max_level).rev() {
-            curr = self.greedy_search_layer(&q, curr, lvl);
+            curr = self.greedy_search_layer(&q, curr, lvl, store)?;
         }
         // ef-search on layer 0.
-        let candidates = self.search_layer(&q, curr, ef, 0);
+        let candidates = self.search_layer(&q, curr, ef, 0, store)?;
         let mut ranked: Vec<(RawValue, f32)> = candidates
             .into_iter()
             .map(|(i, dist)| {
@@ -558,7 +631,7 @@ impl HNSWIndex {
             .collect();
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         ranked.truncate(k);
-        ranked
+        Ok(ranked)
     }
 
     /// Convenience: [`similar`] but decode each key as a
@@ -568,8 +641,18 @@ impl HNSWIndex {
     /// (non-zero leading 16 bytes or a nil tail).
     ///
     /// [`similar`]: Self::similar
-    pub fn similar_ids(&self, query: &[f32], k: usize, ef: Option<usize>) -> Vec<(Id, f32)> {
-        self.similar(query, k, ef)
+    pub fn similar_ids<B>(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: Option<usize>,
+        store: &B,
+    ) -> Result<Vec<(Id, f32)>, B::GetError<anybytes::view::ViewError>>
+    where
+        B: triblespace::core::repo::BlobStoreGet<Blake3>,
+    {
+        Ok(self
+            .similar(query, k, ef, store)?
             .into_iter()
             .filter_map(|(raw, s)| {
                 if raw[0..16] != [0u8; 16] {
@@ -578,7 +661,7 @@ impl HNSWIndex {
                 let id_bytes: RawId = raw[16..32].try_into().ok()?;
                 Id::new(id_bytes).map(|id| (id, s))
             })
-            .collect()
+            .collect())
     }
 
     /// Serialize the index to a self-contained little-endian
@@ -596,12 +679,19 @@ impl HNSWIndex {
     ///   entry_point u32
     ///   reserved 4 B
     /// [n_nodes × 32 B keys]
-    /// [n_nodes × dim × 4 B f32 vectors, row-major]
+    /// [n_nodes × 32 B handles] — Value<Handle<Blake3, Embedding>>
     /// [n_nodes × 1 B node_level]
     /// [n_nodes × layer_count+1 × 4 B per-layer neighbour offsets
     ///   — cumulative, starts at 0]
     /// [total_neighbours × 4 B neighbour indices]
     /// ```
+    ///
+    /// Embeddings are NOT inline — the `handles` section
+    /// references blobs in the pile's blob store. Query time
+    /// resolves handles through a caller-supplied
+    /// `BlobStoreGet` (see [`similar`]).
+    ///
+    /// [`similar`]: Self::similar
     pub fn to_bytes(&self) -> Vec<u8> {
         let n_nodes = self.nodes.len() as u32;
         let has_entry: u8 = self.entry_point.is_some() as u8;
@@ -628,11 +718,9 @@ impl HNSWIndex {
         for key in &self.keys {
             buf.extend_from_slice(key);
         }
-        // vectors
-        for node in &self.nodes {
-            for &v in &node.vector {
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
+        // handles
+        for handle in &self.handles {
+            buf.extend_from_slice(&handle.raw);
         }
         // node levels
         for node in &self.nodes {
@@ -715,16 +803,18 @@ impl HNSWIndex {
         }
         pos = keys_end;
 
-        // vectors
-        let vectors_end = pos + n_nodes * dim * 4;
-        if bytes.len() < vectors_end {
-            return Err(E::TruncatedSection("vectors"));
+        // handles
+        let handles_end = pos + n_nodes * 32;
+        if bytes.len() < handles_end {
+            return Err(E::TruncatedSection("handles"));
         }
-        let all_vectors: Vec<f32> = bytes[pos..vectors_end]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-            .collect();
-        pos = vectors_end;
+        let mut handles: Vec<Value<Handle<Blake3, Embedding>>> = Vec::with_capacity(n_nodes);
+        for chunk in bytes[pos..handles_end].chunks_exact(32) {
+            let raw: RawValue = chunk.try_into().unwrap();
+            handles.push(Value::new(raw));
+        }
+        pos = handles_end;
+        let _ = dim; // dim stays in the header as metadata; no inline vectors to size.
 
         // levels
         let levels_end = pos + n_nodes;
@@ -755,8 +845,8 @@ impl HNSWIndex {
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
             .collect();
 
-        // Rebuild per-node HNSWNode structs.
-        let mut nodes: Vec<HNSWNode> = Vec::with_capacity(n_nodes);
+        // Rebuild per-node HNSWIndexNode structs.
+        let mut nodes: Vec<HNSWIndexNode> = Vec::with_capacity(n_nodes);
         let mut neighbour_cursor: u32 = 0;
         for i in 0..n_nodes {
             let level = levels[i];
@@ -789,8 +879,7 @@ impl HNSWIndex {
                 return Err(E::ImpossibleNeighbourCount(span));
             }
             neighbour_cursor += span;
-            nodes.push(HNSWNode {
-                vector: all_vectors[i * dim..(i + 1) * dim].to_vec(),
+            nodes.push(HNSWIndexNode {
                 level,
                 neighbors: layer_lists,
             });
@@ -802,14 +891,42 @@ impl HNSWIndex {
             m0,
             nodes,
             keys,
+            handles,
             entry_point: if has_entry { Some(entry_raw) } else { None },
             max_level,
         })
     }
 
-    fn greedy_search_layer(&self, q: &[f32], entry: u32, layer: u8) -> u32 {
+    /// Fetch node `i`'s embedding from `store` and dot-product
+    /// it with the normalized query. Every distance evaluation
+    /// in the HNSW walk routes through this helper.
+    fn dist_to<B>(
+        &self,
+        q: &[f32],
+        i: u32,
+        store: &B,
+    ) -> Result<f32, B::GetError<anybytes::view::ViewError>>
+    where
+        B: triblespace::core::repo::BlobStoreGet<Blake3>,
+    {
+        let handle = self.handles[i as usize];
+        let view: anybytes::View<[f32]> =
+            store.get::<anybytes::View<[f32]>, Embedding>(handle)?;
+        Ok(cosine_dist(q, view.as_ref()))
+    }
+
+    fn greedy_search_layer<B>(
+        &self,
+        q: &[f32],
+        entry: u32,
+        layer: u8,
+        store: &B,
+    ) -> Result<u32, B::GetError<anybytes::view::ViewError>>
+    where
+        B: triblespace::core::repo::BlobStoreGet<Blake3>,
+    {
         let mut curr = entry;
-        let mut curr_dist = cosine_dist(q, &self.nodes[curr as usize].vector);
+        let mut curr_dist = self.dist_to(q, curr, store)?;
         loop {
             let mut changed = false;
             // Defensive bounds: a later insert can leave a stub
@@ -817,10 +934,11 @@ impl HNSWIndex {
             // lists yet. Bail out cleanly instead of panicking.
             let node = &self.nodes[curr as usize];
             let Some(neigh) = node.neighbors.get(layer as usize) else {
-                return curr;
+                return Ok(curr);
             };
-            for &n in neigh {
-                let d = cosine_dist(q, &self.nodes[n as usize].vector);
+            let neigh = neigh.clone();
+            for n in neigh {
+                let d = self.dist_to(q, n, store)?;
                 if d < curr_dist {
                     curr_dist = d;
                     curr = n;
@@ -828,16 +946,26 @@ impl HNSWIndex {
                 }
             }
             if !changed {
-                return curr;
+                return Ok(curr);
             }
         }
     }
 
-    fn search_layer(&self, q: &[f32], entry: u32, ef: usize, layer: u8) -> Vec<(u32, f32)> {
+    fn search_layer<B>(
+        &self,
+        q: &[f32],
+        entry: u32,
+        ef: usize,
+        layer: u8,
+        store: &B,
+    ) -> Result<Vec<(u32, f32)>, B::GetError<anybytes::view::ViewError>>
+    where
+        B: triblespace::core::repo::BlobStoreGet<Blake3>,
+    {
         use std::collections::BinaryHeap;
         let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
         visited.insert(entry);
-        let d0 = cosine_dist(q, &self.nodes[entry as usize].vector);
+        let d0 = self.dist_to(q, entry, store)?;
         let mut candidates: BinaryHeap<MinDist> = BinaryHeap::new();
         candidates.push(MinDist {
             idx: entry,
@@ -853,20 +981,18 @@ impl HNSWIndex {
             if c.dist > farthest && results.len() >= ef {
                 break;
             }
-            // Same defensive skip — a neighbour recorded here
-            // (bidirectionally from an insert pass) might not
-            // yet have its own layer-N list populated when a
-            // later insert promoted it to a new top layer but
-            // didn't run its own connect pass at that layer.
-            let node = &self.nodes[c.idx as usize];
-            let Some(neigh) = node.neighbors.get(layer as usize) else {
-                continue;
+            let neigh = {
+                let node = &self.nodes[c.idx as usize];
+                let Some(neigh) = node.neighbors.get(layer as usize) else {
+                    continue;
+                };
+                neigh.clone()
             };
-            for &n in neigh {
+            for n in neigh {
                 if !visited.insert(n) {
                     continue;
                 }
-                let d = cosine_dist(q, &self.nodes[n as usize].vector);
+                let d = self.dist_to(q, n, store)?;
                 let farthest = results.peek().map(|r| r.dist).unwrap_or(f32::INFINITY);
                 if d < farthest || results.len() < ef {
                     candidates.push(MinDist { idx: n, dist: d });
@@ -877,7 +1003,7 @@ impl HNSWIndex {
                 }
             }
         }
-        results.into_iter().map(|m| (m.idx, m.dist)).collect()
+        Ok(results.into_iter().map(|m| (m.idx, m.dist)).collect())
     }
 }
 
@@ -1331,6 +1457,20 @@ mod tests {
         crate::schemas::put_embedding::<_, Blake3>(store, vec).unwrap()
     }
 
+    /// Test sugar: put `vec` into `store` and insert the (id,
+    /// handle, vec) triple into `builder`. Returns the handle
+    /// for anyone who needs it.
+    fn hnsw_insert(
+        builder: &mut HNSWBuilder,
+        store: &mut MemoryBlobStore<Blake3>,
+        doc_id: Id,
+        vec: Vec<f32>,
+    ) -> Result<Value<Handle<Blake3, Embedding>>, DimMismatch> {
+        let h = put_emb(store, vec.clone());
+        builder.insert_id(doc_id, h, vec)?;
+        Ok(h)
+    }
+
     /// Build a [`FlatIndex`] from `(id, vec)` pairs. Returns
     /// the index AND the store — the writer must live for the
     /// reader to remain valid (reft_light ReadHandles are
@@ -1497,17 +1637,24 @@ mod tests {
 
     #[test]
     fn hnsw_empty_index_is_queryable() {
+        let mut store = MemoryBlobStore::<Blake3>::new();
         let idx = HNSWBuilder::new(4).build();
         assert_eq!(idx.doc_count(), 0);
-        assert!(idx.similar(&[0.0; 4], 3, None).is_empty());
+        assert!(idx
+            .similar(&[0.0; 4], 3, None, &store.reader().unwrap())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
     fn hnsw_single_doc_returns_itself() {
+        let mut store = MemoryBlobStore::<Blake3>::new();
         let mut b = HNSWBuilder::new(3);
-        b.insert_id(id(1), vec![1.0, 0.0, 0.0]).unwrap();
+        hnsw_insert(&mut b, &mut store, id(1), vec![1.0, 0.0, 0.0]).unwrap();
         let idx = b.build();
-        let hits = idx.similar(&[1.0, 0.0, 0.0], 1, None);
+        let hits = idx
+            .similar(&[1.0, 0.0, 0.0], 1, None, &store.reader().unwrap())
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, id_key(1));
         assert!((hits[0].1 - 1.0).abs() < 1e-5);
@@ -1515,12 +1662,15 @@ mod tests {
 
     #[test]
     fn hnsw_ranks_similar_vectors_highest() {
+        let mut store = MemoryBlobStore::<Blake3>::new();
         let mut b = HNSWBuilder::new(2);
-        b.insert_id(id(1), vec![1.0, 0.0]).unwrap();
-        b.insert_id(id(2), vec![0.9, 0.1]).unwrap();
-        b.insert_id(id(3), vec![0.0, 1.0]).unwrap();
+        hnsw_insert(&mut b, &mut store, id(1), vec![1.0, 0.0]).unwrap();
+        hnsw_insert(&mut b, &mut store, id(2), vec![0.9, 0.1]).unwrap();
+        hnsw_insert(&mut b, &mut store, id(3), vec![0.0, 1.0]).unwrap();
         let idx = b.build();
-        let hits = idx.similar(&[1.0, 0.0], 3, None);
+        let hits = idx
+            .similar(&[1.0, 0.0], 3, None, &store.reader().unwrap())
+            .unwrap();
         assert_eq!(hits[0].0, id_key(1));
         assert_eq!(hits[1].0, id_key(2));
         assert_eq!(hits[2].0, id_key(3));
@@ -1553,7 +1703,7 @@ mod tests {
             let dx = id_from_u64((i + 1) as u64);
             let h = put_emb(&mut store, vec.clone());
             flat_b.insert_id(dx, h);
-            hnsw_b.insert_id(dx, vec).unwrap();
+            hnsw_b.insert_id(dx, h, vec).unwrap();
         }
         let flat = flat_b.build();
         let hnsw = hnsw_b.build();
@@ -1573,7 +1723,8 @@ mod tests {
                 .map(|(d, _)| d)
                 .collect();
             let got: std::collections::HashSet<RawValue> = hnsw
-                .similar(&q, 10, Some(50))
+                .similar(&q, 10, Some(50), &reader)
+                .unwrap()
                 .into_iter()
                 .map(|(d, _)| d)
                 .collect();
@@ -1597,27 +1748,26 @@ mod tests {
     #[test]
     fn hnsw_deterministic_seed_reproduces_structure() {
         let build = |seed: u64| {
+            let mut store = MemoryBlobStore::<Blake3>::new();
             let mut b = HNSWBuilder::new(3).with_seed(seed);
             for i in 1..=20u8 {
-                b.insert_id(
-                    Id::new([i; 16]).unwrap(),
-                    vec![
-                        (i as f32) / 20.0,
-                        ((i as f32) * 2.0) % 1.0,
-                        ((i as f32) * 3.0) % 1.0,
-                    ],
-                )
-                .unwrap();
+                let v = vec![
+                    (i as f32) / 20.0,
+                    ((i as f32) * 2.0) % 1.0,
+                    ((i as f32) * 3.0) % 1.0,
+                ];
+                let h = put_emb(&mut store, v.clone());
+                b.insert_id(Id::new([i; 16]).unwrap(), h, v).unwrap();
             }
-            b.build()
+            (b.build(), store)
         };
-        let a = build(123);
-        let b = build(123);
+        let (a, mut a_store) = build(123);
+        let (b, mut b_store) = build(123);
         assert_eq!(a.doc_count(), b.doc_count());
         assert_eq!(a.max_level(), b.max_level());
         let q = vec![0.5, 0.3, 0.1];
-        let ra = a.similar(&q, 5, None);
-        let rb = b.similar(&q, 5, None);
+        let ra = a.similar(&q, 5, None, &a_store.reader().unwrap()).unwrap();
+        let rb = b.similar(&q, 5, None, &b_store.reader().unwrap()).unwrap();
         assert_eq!(ra.len(), rb.len());
         for (x, y) in ra.iter().zip(rb.iter()) {
             assert_eq!(x.0, y.0);
@@ -1626,27 +1776,36 @@ mod tests {
 
     #[test]
     fn hnsw_dim_mismatch_rejected_at_insert() {
+        let mut store = MemoryBlobStore::<Blake3>::new();
         let mut b = HNSWBuilder::new(3);
-        let err = b.insert_id(id(1), vec![1.0, 0.0]).unwrap_err();
+        // `hnsw_insert` normalizes+puts inside; the dim check
+        // fires from `insert_id` because we pass a mismatched
+        // `vec` to the builder.
+        let err = hnsw_insert(&mut b, &mut store, id(1), vec![1.0, 0.0]).unwrap_err();
         assert_eq!(err.expected, 3);
         assert_eq!(err.got, 2);
     }
 
     #[test]
     fn hnsw_wrong_dim_query_returns_empty() {
+        let mut store = MemoryBlobStore::<Blake3>::new();
         let mut b = HNSWBuilder::new(3);
-        b.insert_id(id(1), vec![1.0, 0.0, 0.0]).unwrap();
+        hnsw_insert(&mut b, &mut store, id(1), vec![1.0, 0.0, 0.0]).unwrap();
         let idx = b.build();
-        assert!(idx.similar(&[1.0, 0.0], 3, None).is_empty());
+        assert!(idx
+            .similar(&[1.0, 0.0], 3, None, &store.reader().unwrap())
+            .unwrap()
+            .is_empty());
     }
 
-    fn sample_hnsw() -> HNSWIndex {
+    fn sample_hnsw() -> (HNSWIndex, MemoryBlobStore<Blake3>) {
+        let mut store = MemoryBlobStore::<Blake3>::new();
         let mut b = HNSWBuilder::new(3).with_seed(42);
-        b.insert_id(id(1), vec![1.0, 0.0, 0.0]).unwrap();
-        b.insert_id(id(2), vec![0.9, 0.1, 0.0]).unwrap();
-        b.insert_id(id(3), vec![0.0, 1.0, 0.0]).unwrap();
-        b.insert_id(id(4), vec![0.0, 0.0, 1.0]).unwrap();
-        b.build()
+        hnsw_insert(&mut b, &mut store, id(1), vec![1.0, 0.0, 0.0]).unwrap();
+        hnsw_insert(&mut b, &mut store, id(2), vec![0.9, 0.1, 0.0]).unwrap();
+        hnsw_insert(&mut b, &mut store, id(3), vec![0.0, 1.0, 0.0]).unwrap();
+        hnsw_insert(&mut b, &mut store, id(4), vec![0.0, 0.0, 1.0]).unwrap();
+        (b.build(), store)
     }
 
     #[test]
@@ -1660,7 +1819,7 @@ mod tests {
 
     #[test]
     fn hnsw_bytes_round_trip_preserves_queries() {
-        let idx = sample_hnsw();
+        let (idx, mut store) = sample_hnsw();
         let bytes = idx.to_bytes();
         let reloaded = HNSWIndex::try_from_bytes(&bytes).expect("valid blob");
         assert_eq!(reloaded.doc_count(), idx.doc_count());
@@ -1670,8 +1829,9 @@ mod tests {
         assert_eq!(reloaded.max_level(), idx.max_level());
 
         let q = vec![1.0, 0.0, 0.0];
-        let a = idx.similar(&q, 4, Some(10));
-        let b = reloaded.similar(&q, 4, Some(10));
+        let reader = store.reader().unwrap();
+        let a = idx.similar(&q, 4, Some(10), &reader).unwrap();
+        let b = reloaded.similar(&q, 4, Some(10), &reader).unwrap();
         assert_eq!(a.len(), b.len());
         for (x, y) in a.iter().zip(b.iter()) {
             assert_eq!(x.0, y.0);
@@ -1681,9 +1841,9 @@ mod tests {
 
     #[test]
     fn hnsw_bytes_are_deterministic() {
-        let a = sample_hnsw().to_bytes();
-        let b = sample_hnsw().to_bytes();
-        assert_eq!(a, b);
+        let (a, _) = sample_hnsw();
+        let (b, _) = sample_hnsw();
+        assert_eq!(a.to_bytes(), b.to_bytes());
     }
 
     #[test]
@@ -1694,7 +1854,8 @@ mod tests {
 
     #[test]
     fn hnsw_bad_magic_rejected() {
-        let mut bytes = sample_hnsw().to_bytes();
+        let (idx, _) = sample_hnsw();
+        let mut bytes = idx.to_bytes();
         bytes[0] = b'X';
         let err = HNSWIndex::try_from_bytes(&bytes).unwrap_err();
         assert_eq!(err, HNSWLoadError::BadMagic);

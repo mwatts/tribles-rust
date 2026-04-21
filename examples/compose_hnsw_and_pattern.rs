@@ -13,13 +13,17 @@
 //! ```
 
 use triblespace::core::and;
+use triblespace::core::blob::MemoryBlobStore;
 use triblespace::core::examples::literature;
 use triblespace::core::find;
 use triblespace::core::id::{ExclusiveId, Id};
+use triblespace::core::repo::BlobStore;
 use triblespace::core::trible::TribleSet;
+use triblespace::core::value::schemas::hash::Blake3;
 use triblespace::macros::{entity, pattern};
 
 use triblespace_search::hnsw::HNSWBuilder;
+use triblespace_search::schemas::put_embedding;
 use triblespace_search::succinct::SuccinctHNSWIndex;
 
 fn id(byte: u8) -> Id {
@@ -72,12 +76,20 @@ fn main() {
         (book_d, vec![-1.0, 0.0, 0.0, 0.0]),  // opposite direction
     ];
 
+    // Put each embedding into a MemoryBlobStore and keep the
+    // handle alongside the (book_id, vec) tuple. HNSWBuilder
+    // takes (id, handle, vec) — the vec stays in RAM during
+    // build for graph-construction distances; the final index
+    // resolves handles via the store at query time.
+    let mut store = MemoryBlobStore::<Blake3>::new();
     let mut hb = HNSWBuilder::new(4).with_seed(42);
     for (bid, v) in &embeddings {
-        hb.insert_id(*bid, v.clone()).unwrap();
+        let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
+        hb.insert_id(*bid, h, v.clone()).unwrap();
     }
     let naive = hb.build();
     let idx = SuccinctHNSWIndex::from_naive(&naive).unwrap();
+    let reader = store.reader().unwrap();
     println!(
         "HNSW index built: {} docs, dim = {}, max_level = {}",
         idx.doc_count(),
@@ -92,7 +104,7 @@ fn main() {
     // `similar_ids` decodes the 32-byte keys back to `Id` under
     // the GenId schema (empty result on non-GenId keys).
     println!("\nsimilarity-only (no author filter):");
-    for (d, s) in naive.similar_ids(&query, 4, Some(10)) {
+    for (d, s) in naive.similar_ids(&query, 4, Some(10), &reader).unwrap() {
         println!("  {d}  cos={s:.3}");
     }
 
@@ -101,7 +113,7 @@ fn main() {
     let matches: Vec<(Id,)> = find!(
         (book: Id),
         and!(
-            idx.similar_constraint(book, query.clone(), 4, Some(10)),
+            idx.similar_constraint(book, query.clone(), 4, Some(10), &reader).unwrap(),
             pattern!(&kb, [{ ?book @ literature::author: &target_author }])
         )
     )
@@ -125,7 +137,7 @@ fn main() {
     let scored: Vec<(Id, f32)> = find!(
         (book: Id, score: f32),
         and!(
-            idx.similar_with_scores(book, score, query.clone(), 4, Some(10)),
+            idx.similar_with_scores(book, score, query.clone(), 4, Some(10), &reader).unwrap(),
             pattern!(&kb, [{ ?book @ literature::author: &target_author }])
         )
     )
