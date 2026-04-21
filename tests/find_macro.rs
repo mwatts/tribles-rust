@@ -48,19 +48,31 @@ fn find_docs_containing_term() {
     assert!(set.contains(&id(3)));
 }
 
-/// Two-variable find!: binds both `doc` and `score`. Our single
-/// `BM25ScoredPostings` constraint touches both variables; the
-/// engine propose/confirm protocol has to preserve the
-/// correlation ("doc i has score_i") rather than producing a
-/// Cartesian product.
-///
-/// The posting list for "fox" contains 2 entries, so a correct
-/// join produces exactly 2 rows with matching (doc, score) pairs.
-/// A broken correlation would produce 4 rows (2×2 Cartesian).
+/// Two-variable find!: binds both `doc` and `score`. Uses a
+/// corpus where the "fox" postings have *different* BM25 scores
+/// (doc 1 is length-1, doc 2 is length-7) so the engine can't
+/// collapse the score variable to a single value. Confirms the
+/// engine's propose/confirm protocol preserves the (doc, score)
+/// correlation — a broken constraint would produce 2×2 = 4
+/// Cartesian rows.
 #[test]
 fn find_docs_and_scores() {
-    let idx = sample_index();
+    let mut b = BM25Builder::new();
+    b.insert(id(1), hash_tokens("fox"));
+    b.insert(id(2), hash_tokens("quick brown fox jumps high today!"));
+    b.insert(id(3), hash_tokens("unrelated content"));
+    let idx = b.build();
     let fox = hash_tokens("fox")[0];
+
+    // Sanity: the two scores should actually differ.
+    let postings: Vec<_> = idx.query_term(&fox).collect();
+    assert_eq!(postings.len(), 2);
+    let (_, s_a) = postings[0];
+    let (_, s_b) = postings[1];
+    assert!(
+        (s_a - s_b).abs() > f32::EPSILON,
+        "test fixture: doc scores should differ"
+    );
 
     let rows: Vec<(Id, f32)> = find!(
         (doc: Id, score: f32),
@@ -68,23 +80,23 @@ fn find_docs_and_scores() {
     )
     .collect();
 
-    // This currently fails with 4 rows (2x2 cross product) —
-    // see `docs/QUERY_ENGINE_INTEGRATION.md` and wiki fragment
-    // for the investigation. Parking as a known-failing test
-    // with a permissive assertion so it still exercises the
-    // macro-level plumbing.
-    assert!(!rows.is_empty(), "expected at least one row");
-    for (_, score) in &rows {
-        assert!(score.is_finite() && *score > 0.0);
-    }
-    // Docs should all be in the fox posting list.
-    let expected_docs: HashSet<Id> =
-        idx.query_term(&fox).map(|(d, _)| d).collect();
-    for (d, _) in &rows {
+    // Map each doc to its real posting score for cross-checking.
+    let truth: std::collections::HashMap<Id, f32> =
+        postings.iter().copied().collect();
+
+    // Every row's (doc, score) must be one of the real postings.
+    assert!(!rows.is_empty());
+    for (d, s) in &rows {
+        let expected = truth.get(d).copied().expect("row doc in postings");
         assert!(
-            expected_docs.contains(d),
-            "row doc {d:?} not in posting list"
+            (expected - s).abs() < 1e-5,
+            "row has mismatched score for doc {d:?}: got {s}, expected {expected}"
         );
+    }
+    // And every posting appears at least once.
+    let row_docs: HashSet<Id> = rows.iter().map(|(d, _)| *d).collect();
+    for (d, _) in &postings {
+        assert!(row_docs.contains(d), "posting doc {d:?} missing from rows");
     }
 }
 
