@@ -748,11 +748,32 @@ impl SuccinctGraph {
 /// lives in a [`SuccinctGraph`] (bit-packed CSR over
 /// (layer, node) → neighbours) and doc ids in a
 /// [`FixedBytesTable<16>`]. Vectors are stored as a flat f32
-/// block — compression (f16 / int8 / PQ) is a separate decision
-/// the caller makes via the embedding schema.
+/// block viewed zero-copy through [`anybytes::View<[f32]>`] —
+/// compression (f16 / int8 / PQ) is a separate decision the
+/// caller makes via the embedding schema.
 ///
 /// Built via [`Self::from_naive`]; a direct builder skipping the
 /// naive intermediate is a later optimization.
+///
+/// # Example
+///
+/// ```
+/// use triblespace::core::id::Id;
+/// use triblespace_search::hnsw::HNSWBuilder;
+/// use triblespace_search::succinct::SuccinctHNSWIndex;
+///
+/// let mut b = HNSWBuilder::new(4).with_seed(1);
+/// b.insert(Id::new([1; 16]).unwrap(), vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+/// b.insert(Id::new([2; 16]).unwrap(), vec![0.0, 1.0, 0.0, 0.0]).unwrap();
+/// b.insert(Id::new([3; 16]).unwrap(), vec![0.9, 0.1, 0.0, 0.0]).unwrap();
+/// let idx = SuccinctHNSWIndex::from_naive(&b.build()).unwrap();
+///
+/// let q = vec![1.0, 0.0, 0.0, 0.0];
+/// let hits = idx.similar(&q, 2, Some(10));
+/// assert_eq!(hits.len(), 2);
+/// // doc 1 is an exact cosine match, doc 3 nearly so.
+/// assert_eq!(hits[0].0, Id::new([1; 16]).unwrap());
+/// ```
 #[derive(Debug)]
 pub struct SuccinctHNSWIndex {
     dim: usize,
@@ -1248,15 +1269,39 @@ impl SuccinctHNSWIndex {
 /// doc-id / term tables are sliced directly out of an
 /// [`anybytes::Bytes`] region without copying.
 ///
-/// For 100k wiki fragments the naive blob is ~157 MiB (91 % of
-/// which is postings); this representation cuts the posting
-/// `doc_idx` from 32 bits → `ceil(log2(n_docs))` bits — about
-/// 2.1× on the postings table and 1.3× on the whole blob before
-/// we touch score quantization.
+/// For 100k wiki fragments the naive blob is ~157 MiB; this
+/// representation cuts it to ~86 MiB via bit-packed doc_idx
+/// + u16-quantized scores. Score tolerance is exposed via
+/// [`Self::score_tolerance`] so query-time equality checks
+/// widen automatically.
 ///
 /// Built via [`Self::from_naive`] (takes a fully-materialized
 /// [`BM25Index`] and re-encodes it). A direct succinct builder
 /// (skipping the naive intermediate) is a later optimization.
+///
+/// # Example
+///
+/// ```
+/// use triblespace::core::id::Id;
+/// use triblespace_search::bm25::BM25Builder;
+/// use triblespace_search::succinct::SuccinctBM25Index;
+/// use triblespace_search::tokens::hash_tokens;
+///
+/// let mut b = BM25Builder::new();
+/// b.insert(Id::new([1; 16]).unwrap(), hash_tokens("the quick brown fox"));
+/// b.insert(Id::new([2; 16]).unwrap(), hash_tokens("the lazy brown dog"));
+/// b.insert(Id::new([3; 16]).unwrap(), hash_tokens("quick silver fox"));
+/// let idx = SuccinctBM25Index::from_naive(&b.build()).unwrap();
+///
+/// // Same query API as BM25Index — "fox" hits two docs.
+/// let fox = hash_tokens("fox")[0];
+/// let hits: Vec<_> = idx.query_term(&fox).collect();
+/// assert_eq!(hits.len(), 2);
+///
+/// // Persist via to_bytes / ToBlob<SuccinctBM25Blob> for pile storage.
+/// let blob_bytes = idx.to_bytes();
+/// assert!(blob_bytes.len() > 0);
+/// ```
 #[derive(Debug)]
 pub struct SuccinctBM25Index {
     doc_ids: FixedBytesTable<16>,
