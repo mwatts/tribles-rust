@@ -362,6 +362,35 @@ impl BM25Index {
         &self.doc_lens
     }
 
+    /// Doc-id table: `doc_ids()[i]` is the external `Id` for
+    /// internal index `i`. Exposed so succinct re-encoders can
+    /// snapshot the table without roundtripping through query_term.
+    pub fn doc_ids(&self) -> &[Id] {
+        &self.doc_ids
+    }
+
+    /// Sorted 32-byte term table. Used by succinct re-encoders
+    /// and anyone implementing a custom query plan over this
+    /// index's internals.
+    pub fn terms_slice(&self) -> &[RawValue] {
+        &self.terms
+    }
+
+    /// Per-term posting list (internal `doc_idx` + score) for the
+    /// term at sorted-table position `t`. Returns `&[]` if out of
+    /// range. Lower-level than [`query_term`], which joins on
+    /// external `Id`s.
+    ///
+    /// [`query_term`]: Self::query_term
+    pub fn postings_for(&self, t: usize) -> &[(u32, f32)] {
+        if t >= self.terms.len() {
+            return &[];
+        }
+        let lo = self.offsets[t] as usize;
+        let hi = self.offsets[t + 1] as usize;
+        &self.postings[lo..hi]
+    }
+
     /// Serialize the index to a self-contained little-endian byte
     /// buffer. The layout is documented in `docs/DESIGN.md`:
     ///

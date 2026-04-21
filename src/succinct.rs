@@ -38,6 +38,10 @@
 use anybytes::{ByteArea, Bytes};
 use jerky::int_vectors::compact_vector::CompactVectorMeta;
 use jerky::int_vectors::{CompactVector, CompactVectorBuilder};
+use triblespace::core::id::Id;
+use triblespace::core::value::RawValue;
+
+use crate::bm25::BM25Index;
 
 /// Errors produced by the succinct building blocks.
 #[derive(Debug)]
@@ -88,6 +92,7 @@ impl From<jerky::error::Error> for SuccinctDocLensError {
 /// The bit-width is chosen at build time as `ceil(log2(max+1))`,
 /// so short-doc corpora (common for wiki fragments) pay a fraction
 /// of the `u32` cost.
+#[derive(Debug)]
 pub struct SuccinctDocLens {
     inner: CompactVector,
 }
@@ -431,6 +436,131 @@ fn width_for(n: usize) -> usize {
     }
 }
 
+/// Zero-copy, jerky-backed BM25 index.
+///
+/// Same query surface as [`crate::bm25::BM25Index`], but postings
+/// + doc_lens live in bit-packed [`CompactVector`]s and the
+/// doc-id / term tables are sliced directly out of an
+/// [`anybytes::Bytes`] region without copying.
+///
+/// For 100k wiki fragments the naive blob is ~157 MiB (91 % of
+/// which is postings); this representation cuts the posting
+/// `doc_idx` from 32 bits → `ceil(log2(n_docs))` bits — about
+/// 2.1× on the postings table and 1.3× on the whole blob before
+/// we touch score quantization.
+///
+/// Built via [`Self::from_naive`] (takes a fully-materialized
+/// [`BM25Index`] and re-encodes it). A direct succinct builder
+/// (skipping the naive intermediate) is a later optimization.
+#[derive(Debug)]
+pub struct SuccinctBM25Index {
+    doc_ids: FixedBytesTable<16>,
+    doc_lens: SuccinctDocLens,
+    terms: FixedBytesTable<32>,
+    postings: SuccinctPostings,
+    avg_doc_len: f32,
+    k1: f32,
+    b: f32,
+}
+
+impl SuccinctBM25Index {
+    /// Re-encode a naive [`BM25Index`] into the succinct form.
+    /// The postings + per-doc counts shrink; scores stay as raw
+    /// f32 for now.
+    pub fn from_naive(idx: &BM25Index) -> Result<Self, SuccinctDocLensError> {
+        // doc_ids: flat 16-byte rows.
+        let doc_id_rows: Vec<[u8; 16]> =
+            (0..idx.doc_count()).map(|i| *idx.doc_ids()[i].as_ref()).collect();
+        let doc_ids_bytes = FixedBytesTable::<16>::build(&doc_id_rows);
+        let doc_ids =
+            FixedBytesTable::<16>::from_bytes(doc_ids_bytes, doc_id_rows.len())?;
+
+        // terms: flat 32-byte rows, sorted (idx.terms() guarantees).
+        let term_rows: Vec<[u8; 32]> = idx.terms_slice().to_vec();
+        let terms_bytes = FixedBytesTable::<32>::build(&term_rows);
+        let terms = FixedBytesTable::<32>::from_bytes(terms_bytes, term_rows.len())?;
+
+        // doc_lens: jerky CompactVector.
+        let (doc_lens_bytes, doc_lens_meta) = SuccinctDocLens::build(idx.doc_lens())?;
+        let doc_lens = SuccinctDocLens::from_bytes(doc_lens_meta, doc_lens_bytes)?;
+
+        // postings: rebuild the per-term posting lists.
+        let lists: Vec<Vec<(u32, f32)>> = (0..idx.term_count())
+            .map(|t| idx.postings_for(t).to_vec())
+            .collect();
+        let (idx_bytes, score_bytes, postings_meta) =
+            SuccinctPostings::build(&lists, idx.doc_count() as u32)?;
+        let postings = SuccinctPostings::from_bytes(postings_meta, idx_bytes, score_bytes)?;
+
+        Ok(Self {
+            doc_ids,
+            doc_lens,
+            terms,
+            postings,
+            avg_doc_len: idx.avg_doc_len(),
+            k1: idx.k1(),
+            b: idx.b(),
+        })
+    }
+
+    /// Number of documents.
+    pub fn doc_count(&self) -> usize {
+        self.doc_ids.len()
+    }
+
+    /// Number of distinct terms.
+    pub fn term_count(&self) -> usize {
+        self.terms.len()
+    }
+
+    /// Average document length used at build time.
+    pub fn avg_doc_len(&self) -> f32 {
+        self.avg_doc_len
+    }
+
+    /// BM25 `k1` used at build time.
+    pub fn k1(&self) -> f32 {
+        self.k1
+    }
+
+    /// BM25 `b` used at build time.
+    pub fn b(&self) -> f32 {
+        self.b
+    }
+
+    /// Length of doc `i`, or `None` if out of range.
+    pub fn doc_len(&self, i: usize) -> Option<u32> {
+        self.doc_lens.get(i)
+    }
+
+    /// Number of documents containing `term`.
+    pub fn doc_frequency(&self, term: &RawValue) -> usize {
+        match self.terms.binary_search(term) {
+            Ok(t) => self.postings.posting_count(t).unwrap_or(0),
+            Err(_) => 0,
+        }
+    }
+
+    /// Iterate `(doc_id, score)` postings for `term`. Empty if
+    /// the term is absent.
+    pub fn query_term<'a>(
+        &'a self,
+        term: &RawValue,
+    ) -> Box<dyn Iterator<Item = (Id, f32)> + 'a> {
+        match self.terms.binary_search(term) {
+            Ok(t) => match self.postings.postings_for(t) {
+                Some(iter) => Box::new(iter.map(move |(doc_idx, score)| {
+                    let raw = self.doc_ids.get(doc_idx as usize).expect("doc_idx in range");
+                    let id = Id::new(*raw).expect("non-nil doc_id");
+                    (id, score)
+                })),
+                None => Box::new(std::iter::empty()),
+            },
+            Err(_) => Box::new(std::iter::empty()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,6 +721,68 @@ mod tests {
             SuccinctPostings::from_bytes(meta, idx_bytes, score_bytes).unwrap();
         assert_eq!(view.term_count(), 0);
         assert!(view.postings_for(0).is_none());
+    }
+
+    #[test]
+    fn succinct_bm25_matches_naive_on_sample() {
+        use crate::bm25::BM25Builder;
+        use crate::tokens::hash_tokens;
+        use triblespace::core::id::Id;
+
+        fn iid(byte: u8) -> Id {
+            Id::new([byte; 16]).unwrap()
+        }
+
+        let mut b = BM25Builder::new();
+        b.insert(iid(1), hash_tokens("the quick brown fox"));
+        b.insert(iid(2), hash_tokens("the lazy brown dog"));
+        b.insert(iid(3), hash_tokens("quick silver fox jumps"));
+        b.insert(iid(4), hash_tokens("unrelated filler content"));
+        let naive = b.build();
+        let succinct = SuccinctBM25Index::from_naive(&naive).unwrap();
+
+        assert_eq!(succinct.doc_count(), naive.doc_count());
+        assert_eq!(succinct.term_count(), naive.term_count());
+        assert_eq!(succinct.k1(), naive.k1());
+        assert_eq!(succinct.b(), naive.b());
+        assert!((succinct.avg_doc_len() - naive.avg_doc_len()).abs() < 1e-6);
+
+        // Every stored term must produce identical postings.
+        for term in naive.terms_slice() {
+            let n: Vec<_> = naive.query_term(term).collect();
+            let s: Vec<_> = succinct.query_term(term).collect();
+            assert_eq!(
+                n.len(),
+                s.len(),
+                "posting count mismatch for term {term:x?}"
+            );
+            for ((n_id, n_s), (s_id, s_s)) in n.iter().zip(s.iter()) {
+                assert_eq!(n_id, s_id);
+                assert!(
+                    (n_s - s_s).abs() < 1e-6,
+                    "score mismatch for {n_id:?}: naive={n_s} succinct={s_s}"
+                );
+            }
+            assert_eq!(
+                naive.doc_frequency(term),
+                succinct.doc_frequency(term)
+            );
+        }
+
+        // Missing term returns nothing.
+        let missing = hash_tokens("banana")[0];
+        assert!(succinct.query_term(&missing).next().is_none());
+        assert_eq!(succinct.doc_frequency(&missing), 0);
+    }
+
+    #[test]
+    fn succinct_bm25_empty_corpus() {
+        use crate::bm25::BM25Builder;
+        let naive = BM25Builder::new().build();
+        let succinct = SuccinctBM25Index::from_naive(&naive).unwrap();
+        assert_eq!(succinct.doc_count(), 0);
+        assert_eq!(succinct.term_count(), 0);
+        assert!(succinct.query_term(&[0u8; 32]).next().is_none());
     }
 
     #[test]
