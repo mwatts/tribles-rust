@@ -39,20 +39,31 @@ use anybytes::{ByteArea, Bytes};
 use jerky::int_vectors::compact_vector::CompactVectorMeta;
 use jerky::int_vectors::{CompactVector, CompactVectorBuilder};
 
-/// Errors produced by [`SuccinctDocLens`].
+/// Errors produced by the succinct building blocks.
 #[derive(Debug)]
 pub enum SuccinctDocLensError {
     /// Failure propagating out of `anybytes::ByteArea`.
     Bytes(std::io::Error),
     /// Failure propagating out of `jerky` (build or view).
     Jerky(jerky::error::Error),
+    /// Declared row count does not match the byte length.
+    SizeMismatch {
+        /// Total bytes available.
+        bytes: usize,
+        /// Declared rows × row width.
+        expected: usize,
+    },
 }
 
 impl std::fmt::Display for SuccinctDocLensError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Bytes(e) => write!(f, "SuccinctDocLens: bytes error: {e}"),
-            Self::Jerky(e) => write!(f, "SuccinctDocLens: jerky error: {e}"),
+            Self::Bytes(e) => write!(f, "succinct: bytes error: {e}"),
+            Self::Jerky(e) => write!(f, "succinct: jerky error: {e}"),
+            Self::SizeMismatch { bytes, expected } => write!(
+                f,
+                "succinct: size mismatch: have {bytes} bytes, declared needs {expected}"
+            ),
         }
     }
 }
@@ -144,6 +155,112 @@ fn required_width(lens: &[u32]) -> usize {
     }
 }
 
+/// Fixed-row-size table of bytes, zero-copy loaded from a
+/// contiguous [`Bytes`] region.
+///
+/// Parameterized on the row width `N`. Used for BM25's doc-id
+/// table (`N = 16`) and term table (`N = 32`). No jerky
+/// compression — each row is already fixed-size and can be
+/// sliced out of the raw bytes with a pointer, which is what
+/// makes this "succinct" at all: the caller's `Bytes` handle is
+/// the ground truth and no data is duplicated into structs.
+///
+/// The caller is responsible for sorting the table at build time
+/// if they want binary-search lookups (see [`Self::binary_search`]).
+///
+/// # Build / view
+///
+/// ```
+/// use triblespace_search::succinct::FixedBytesTable;
+///
+/// let rows = vec![[1u8; 16], [3u8; 16], [7u8; 16]];
+/// let bytes = FixedBytesTable::<16>::build(&rows);
+/// let view = FixedBytesTable::<16>::from_bytes(bytes, rows.len()).unwrap();
+/// assert_eq!(view.binary_search(&[3u8; 16]), Ok(1));
+/// assert_eq!(view.binary_search(&[5u8; 16]), Err(2));
+/// ```
+#[derive(Debug)]
+pub struct FixedBytesTable<const N: usize> {
+    bytes: Bytes,
+    len: usize,
+}
+
+impl<const N: usize> FixedBytesTable<N> {
+    /// Serialize `rows` into a flat `Bytes` buffer. The companion
+    /// [`Self::from_bytes`] reconstructs a view; callers persist
+    /// `rows.len()` out-of-band (e.g., in a BlobHeader).
+    pub fn build(rows: &[[u8; N]]) -> Bytes {
+        let mut buf = Vec::with_capacity(rows.len() * N);
+        for row in rows {
+            buf.extend_from_slice(row);
+        }
+        Bytes::from_source(buf)
+    }
+
+    /// View `bytes` as `len` rows of `N` bytes each.
+    pub fn from_bytes(bytes: Bytes, len: usize) -> Result<Self, SuccinctDocLensError> {
+        let expected = len.checked_mul(N).ok_or(SuccinctDocLensError::SizeMismatch {
+            bytes: bytes.len(),
+            expected: usize::MAX,
+        })?;
+        if bytes.len() < expected {
+            return Err(SuccinctDocLensError::SizeMismatch {
+                bytes: bytes.len(),
+                expected,
+            });
+        }
+        Ok(Self { bytes, len })
+    }
+
+    /// Number of rows.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// `true` if the table is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Row at position `i`, or `None` if out of range. Zero-copy:
+    /// returns a reference into the backing `Bytes`.
+    pub fn get(&self, i: usize) -> Option<&[u8; N]> {
+        if i >= self.len {
+            return None;
+        }
+        let start = i * N;
+        let end = start + N;
+        // A byte array has trivial alignment, so the slice
+        // directly coerces to `&[u8; N]`.
+        self.bytes[start..end].try_into().ok()
+    }
+
+    /// Binary-search for `needle`. Returns `Ok(index)` if found,
+    /// `Err(insertion_point)` otherwise. Requires the table to be
+    /// sorted at build time.
+    pub fn binary_search(&self, needle: &[u8; N]) -> std::result::Result<usize, usize> {
+        let mut lo = 0;
+        let mut hi = self.len;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            // `.expect` is safe: mid < hi ≤ self.len, and get()
+            // validates against that.
+            let row = self.get(mid).expect("binary search in-bounds");
+            match row.as_slice().cmp(needle.as_slice()) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Ok(mid),
+            }
+        }
+        Err(lo)
+    }
+
+    /// Collect into a `Vec<[u8; N]>` for tests / inspection.
+    pub fn to_vec(&self) -> Vec<[u8; N]> {
+        (0..self.len).map(|i| *self.get(i).unwrap()).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,5 +331,60 @@ mod tests {
             bytes.len(),
             lens.len() * 4
         );
+    }
+
+    #[test]
+    fn fixed_table_16_roundtrip() {
+        let rows = vec![[7u8; 16], [3u8; 16], [99u8; 16]];
+        let bytes = FixedBytesTable::<16>::build(&rows);
+        let view = FixedBytesTable::<16>::from_bytes(bytes, rows.len()).unwrap();
+        assert_eq!(view.len(), 3);
+        assert_eq!(view.get(0), Some(&[7u8; 16]));
+        assert_eq!(view.get(2), Some(&[99u8; 16]));
+        assert_eq!(view.get(3), None);
+    }
+
+    #[test]
+    fn fixed_table_32_roundtrip() {
+        let rows = vec![[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]];
+        let bytes = FixedBytesTable::<32>::build(&rows);
+        let view = FixedBytesTable::<32>::from_bytes(bytes, rows.len()).unwrap();
+        assert_eq!(view.to_vec(), rows);
+    }
+
+    #[test]
+    fn fixed_table_binary_search_finds_term() {
+        // Sorted table of 32-byte terms — what BM25's term table
+        // wants.
+        let mut rows = vec![
+            [5u8; 32],
+            [1u8; 32],
+            [9u8; 32],
+            [3u8; 32],
+        ];
+        rows.sort();
+        let bytes = FixedBytesTable::<32>::build(&rows);
+        let view = FixedBytesTable::<32>::from_bytes(bytes, rows.len()).unwrap();
+        assert_eq!(view.binary_search(&[3u8; 32]), Ok(1));
+        assert_eq!(view.binary_search(&[5u8; 32]), Ok(2));
+        assert_eq!(view.binary_search(&[7u8; 32]), Err(3));
+    }
+
+    #[test]
+    fn fixed_table_rejects_size_mismatch() {
+        // 3 rows × 16 bytes = 48 bytes; claim 4 rows -> error.
+        let rows = vec![[0u8; 16], [1u8; 16], [2u8; 16]];
+        let bytes = FixedBytesTable::<16>::build(&rows);
+        let err = FixedBytesTable::<16>::from_bytes(bytes, 4).unwrap_err();
+        assert!(matches!(err, SuccinctDocLensError::SizeMismatch { .. }));
+    }
+
+    #[test]
+    fn fixed_table_empty_is_empty() {
+        let bytes = FixedBytesTable::<16>::build(&[]);
+        let view = FixedBytesTable::<16>::from_bytes(bytes, 0).unwrap();
+        assert!(view.is_empty());
+        assert_eq!(view.get(0), None);
+        assert_eq!(view.binary_search(&[0u8; 16]), Err(0));
     }
 }
