@@ -601,6 +601,33 @@ impl SuccinctBM25Index {
         }
     }
 
+    /// Constraint that binds `doc` to entity ids containing
+    /// `term`. Mirror of [`BM25Index::docs_containing`] for the
+    /// succinct view.
+    pub fn docs_containing(
+        &self,
+        doc: triblespace::core::query::Variable<
+            triblespace::core::value::schemas::genid::GenId,
+        >,
+        term: [u8; 32],
+    ) -> crate::constraint::DocsContainingTerm<'_, SuccinctBM25Index> {
+        crate::constraint::DocsContainingTerm::new(self, doc, term)
+    }
+
+    /// Constraint that binds both `doc` and `score` for each
+    /// posting of `term`. Mirror of [`BM25Index::docs_and_scores`]
+    /// for the succinct view.
+    pub fn docs_and_scores(
+        &self,
+        doc: triblespace::core::query::Variable<
+            triblespace::core::value::schemas::genid::GenId,
+        >,
+        score: triblespace::core::query::Variable<crate::schemas::F32LE>,
+        term: [u8; 32],
+    ) -> crate::constraint::BM25ScoredPostings<'_, SuccinctBM25Index> {
+        crate::constraint::BM25ScoredPostings::new(self, doc, score, term)
+    }
+
     /// Iterate `(doc_id, score)` postings for `term`. Empty if
     /// the term is absent.
     pub fn query_term<'a>(

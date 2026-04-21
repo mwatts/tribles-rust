@@ -179,6 +179,31 @@ fn find_intersection_of_two_terms() {
     assert!(set.contains(&id(3)));
 }
 
+/// The succinct view answers `find!` queries identically to the
+/// naive one — proves the `BM25Queryable` trait actually plugs
+/// the succinct path into the engine without regressions. Uses
+/// the same corpus as `find_docs_containing_term`, just querying
+/// against the succinct view of the same index.
+#[test]
+fn find_docs_containing_term_on_succinct() {
+    use triblespace_search::succinct::SuccinctBM25Index;
+
+    let idx = sample_index();
+    let succinct = SuccinctBM25Index::from_naive(&idx).unwrap();
+    let fox = hash_tokens("fox")[0];
+
+    let rows: Vec<(Id,)> = find!(
+        (doc: Id),
+        succinct.docs_containing(doc, fox)
+    )
+    .collect();
+
+    let set: HashSet<Id> = rows.into_iter().map(|(d,)| d).collect();
+    assert_eq!(set.len(), 2);
+    assert!(set.contains(&id(1)));
+    assert!(set.contains(&id(3)));
+}
+
 /// Headline story: BM25 lexical search composed with a `pattern!`
 /// over a real TribleSet, in a single `find!`. "Find books whose
 /// title mentions 'fox' AND are authored by the known author X."

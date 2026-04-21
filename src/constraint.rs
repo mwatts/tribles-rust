@@ -30,19 +30,69 @@ use crate::bm25::BM25Index;
 use crate::hnsw::{FlatIndex, HNSWIndex};
 use crate::schemas::F32LE;
 
+/// Minimum surface a BM25 index must expose for the
+/// [`DocsContainingTerm`] / [`BM25ScoredPostings`] constraints to
+/// work against it. Implemented for both the naive
+/// [`crate::bm25::BM25Index`] and the succinct
+/// [`crate::succinct::SuccinctBM25Index`] so either can plug
+/// into `find!` / `pattern!` without changes at the engine layer.
+pub trait BM25Queryable {
+    /// Iterate `(doc_id, score)` for the posting list of `term`.
+    /// Empty if the term is absent.
+    fn query_term_boxed<'a>(
+        &'a self,
+        term: &RawValue,
+    ) -> Box<dyn Iterator<Item = (Id, f32)> + 'a>;
+
+    /// Number of docs containing `term`. Used by `estimate`.
+    fn doc_frequency_for(&self, term: &RawValue) -> usize;
+}
+
+impl BM25Queryable for BM25Index {
+    fn query_term_boxed<'a>(
+        &'a self,
+        term: &RawValue,
+    ) -> Box<dyn Iterator<Item = (Id, f32)> + 'a> {
+        Box::new(self.query_term(term))
+    }
+
+    fn doc_frequency_for(&self, term: &RawValue) -> usize {
+        self.doc_frequency(term)
+    }
+}
+
+#[cfg(feature = "succinct")]
+impl BM25Queryable for crate::succinct::SuccinctBM25Index {
+    fn query_term_boxed<'a>(
+        &'a self,
+        term: &RawValue,
+    ) -> Box<dyn Iterator<Item = (Id, f32)> + 'a> {
+        self.query_term(term)
+    }
+
+    fn doc_frequency_for(&self, term: &RawValue) -> usize {
+        self.doc_frequency(term)
+    }
+}
+
 /// Constrains a `Variable<GenId>` (doc) to entity ids in the
 /// posting list of the pinned term.
 ///
-/// Created via [`BM25Index::docs_containing`].
-pub struct DocsContainingTerm<'a> {
-    index: &'a BM25Index,
+/// Generic over any `I: BM25Queryable`, so it works against
+/// [`BM25Index`] or
+/// [`crate::succinct::SuccinctBM25Index`] without code duplication.
+///
+/// Created via [`BM25Index::docs_containing`] (or the succinct
+/// equivalent).
+pub struct DocsContainingTerm<'a, I: BM25Queryable + ?Sized = BM25Index> {
+    index: &'a I,
     doc: Variable<GenId>,
     /// The term value is pinned at constraint-construction time.
     term: [u8; 32],
 }
 
-impl<'a> DocsContainingTerm<'a> {
-    pub fn new(index: &'a BM25Index, doc: Variable<GenId>, term: [u8; 32]) -> Self {
+impl<'a, I: BM25Queryable + ?Sized> DocsContainingTerm<'a, I> {
+    pub fn new(index: &'a I, doc: Variable<GenId>, term: [u8; 32]) -> Self {
         Self { index, doc, term }
     }
 }
@@ -54,7 +104,7 @@ impl BM25Index {
         &self,
         doc: Variable<GenId>,
         term: [u8; 32],
-    ) -> DocsContainingTerm<'_> {
+    ) -> DocsContainingTerm<'_, BM25Index> {
         DocsContainingTerm::new(self, doc, term)
     }
 }
@@ -106,16 +156,16 @@ fn raw_value_to_f32(raw: &RawValue) -> f32 {
 /// the `doc` variable; for `score` we use the same count because
 /// each (doc, term) pair has exactly one score — the cardinality
 /// is identical from the engine's perspective.
-pub struct BM25ScoredPostings<'a> {
-    index: &'a BM25Index,
+pub struct BM25ScoredPostings<'a, I: BM25Queryable + ?Sized = BM25Index> {
+    index: &'a I,
     doc: Variable<GenId>,
     score: Variable<F32LE>,
     term: [u8; 32],
 }
 
-impl<'a> BM25ScoredPostings<'a> {
+impl<'a, I: BM25Queryable + ?Sized> BM25ScoredPostings<'a, I> {
     pub fn new(
-        index: &'a BM25Index,
+        index: &'a I,
         doc: Variable<GenId>,
         score: Variable<F32LE>,
         term: [u8; 32],
@@ -139,19 +189,19 @@ impl BM25Index {
         doc: Variable<GenId>,
         score: Variable<F32LE>,
         term: [u8; 32],
-    ) -> BM25ScoredPostings<'_> {
+    ) -> BM25ScoredPostings<'_, BM25Index> {
         BM25ScoredPostings::new(self, doc, score, term)
     }
 }
 
-impl<'a> Constraint<'a> for BM25ScoredPostings<'a> {
+impl<'a, I: BM25Queryable + ?Sized + 'a> Constraint<'a> for BM25ScoredPostings<'a, I> {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.doc.index).union(VariableSet::new_singleton(self.score.index))
     }
 
     fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
         if variable == self.doc.index || variable == self.score.index {
-            Some(self.index.doc_frequency(&self.term))
+            Some(self.index.doc_frequency_for(&self.term))
         } else {
             None
         }
@@ -174,7 +224,7 @@ impl<'a> Constraint<'a> for BM25ScoredPostings<'a> {
             let bound_score = binding
                 .get(self.score.index)
                 .map(raw_value_to_f32);
-            for (doc_id, score) in self.index.query_term(&self.term) {
+            for (doc_id, score) in self.index.query_term_boxed(&self.term) {
                 if let Some(bs) = bound_score {
                     if (score - bs).abs() > f32::EPSILON {
                         continue;
@@ -191,7 +241,7 @@ impl<'a> Constraint<'a> for BM25ScoredPostings<'a> {
             // proposals, causing the engine to enumerate a
             // Cartesian (doc, score) cross within the bucket.
             let mut seen = HashSet::new();
-            for (doc_id, score) in self.index.query_term(&self.term) {
+            for (doc_id, score) in self.index.query_term_boxed(&self.term) {
                 if let Some(bd) = bound_doc {
                     if doc_id != bd {
                         continue;
@@ -217,18 +267,18 @@ impl<'a> Constraint<'a> for BM25ScoredPostings<'a> {
             let bound_score = binding
                 .get(self.score.index)
                 .map(raw_value_to_f32);
-            let valid: HashSet<(Id, u32)> = self
+            let valid: HashSet<Id> = self
                 .index
-                .query_term(&self.term)
+                .query_term_boxed(&self.term)
                 .filter(|(_, s)| match bound_score {
                     Some(bs) => (s - bs).abs() <= f32::EPSILON,
                     None => true,
                 })
-                .map(|(d, _)| (d, 0))
+                .map(|(d, _)| d)
                 .collect();
             proposals.retain(|raw| {
                 raw_value_to_id(raw)
-                    .map(|id| valid.iter().any(|(d, _)| *d == id))
+                    .map(|id| valid.contains(&id))
                     .unwrap_or(false)
             });
         } else if variable == self.score.index {
@@ -237,7 +287,7 @@ impl<'a> Constraint<'a> for BM25ScoredPostings<'a> {
                 .and_then(raw_value_to_id);
             let allowed: HashSet<u32> = self
                 .index
-                .query_term(&self.term)
+                .query_term_boxed(&self.term)
                 .filter(|(d, _)| match bound_doc {
                     Some(bd) => *d == bd,
                     None => true,
@@ -257,7 +307,7 @@ impl<'a> Constraint<'a> for BM25ScoredPostings<'a> {
             .map(raw_value_to_f32);
         match (bound_doc, bound_score) {
             (None, None) => true,
-            _ => self.index.query_term(&self.term).any(|(d, s)| {
+            _ => self.index.query_term_boxed(&self.term).any(|(d, s)| {
                 bound_doc.map_or(true, |bd| d == bd)
                     && bound_score.map_or(true, |bs| (s - bs).abs() <= f32::EPSILON)
             }),
@@ -812,14 +862,14 @@ impl<'a> Constraint<'a> for SimilarToVectorHNSWScored<'a> {
     }
 }
 
-impl<'a> Constraint<'a> for DocsContainingTerm<'a> {
+impl<'a, I: BM25Queryable + ?Sized + 'a> Constraint<'a> for DocsContainingTerm<'a, I> {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.doc.index)
     }
 
     fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
         if self.doc.index == variable {
-            Some(self.index.doc_frequency(&self.term))
+            Some(self.index.doc_frequency_for(&self.term))
         } else {
             None
         }
@@ -834,7 +884,7 @@ impl<'a> Constraint<'a> for DocsContainingTerm<'a> {
         if self.doc.index != variable {
             return;
         }
-        for (doc_id, _score) in self.index.query_term(&self.term) {
+        for (doc_id, _score) in self.index.query_term_boxed(&self.term) {
             proposals.push(id_to_raw_value(doc_id));
         }
     }
@@ -853,7 +903,7 @@ impl<'a> Constraint<'a> for DocsContainingTerm<'a> {
         // binary-search would be lighter on memory; for v1 this is
         // fine up to tens of thousands of postings.
         let docs: HashSet<Id> =
-            self.index.query_term(&self.term).map(|(d, _)| d).collect();
+            self.index.query_term_boxed(&self.term).map(|(d, _)| d).collect();
         proposals.retain(|raw| {
             raw_value_to_id(raw)
                 .map(|id| docs.contains(&id))
@@ -869,7 +919,7 @@ impl<'a> Constraint<'a> for DocsContainingTerm<'a> {
                 let Some(doc_id) = raw_value_to_id(raw) else {
                     return false;
                 };
-                self.index.query_term(&self.term).any(|(d, _)| d == doc_id)
+                self.index.query_term_boxed(&self.term).any(|(d, _)| d == doc_id)
             }
             None => true,
         }
