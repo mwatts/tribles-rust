@@ -34,9 +34,9 @@
 //!
 //! // 1. Build an in-memory index.
 //! let mut b = BM25Builder::new();
-//! b.insert(Id::new([1; 16]).unwrap(), hash_tokens("the quick brown fox"));
-//! b.insert(Id::new([2; 16]).unwrap(), hash_tokens("the lazy brown dog"));
-//! b.insert(Id::new([3; 16]).unwrap(), hash_tokens("quick silver fox"));
+//! b.insert_id(Id::new([1; 16]).unwrap(), hash_tokens("the quick brown fox"));
+//! b.insert_id(Id::new([2; 16]).unwrap(), hash_tokens("the lazy brown dog"));
+//! b.insert_id(Id::new([3; 16]).unwrap(), hash_tokens("quick silver fox"));
 //!
 //! // 2. Flip to the succinct form for persistence + smaller bytes.
 //! let idx = SuccinctBM25Index::from_naive(&b.build()).unwrap();
@@ -68,4 +68,10 @@ pub mod tokens;
 ///
 /// Bumped on any byte-layout change; `try_from_blob` refuses
 /// older/newer blobs rather than silently misreading them.
-pub const FORMAT_VERSION: u16 = 1;
+///
+/// History:
+/// - `1`: initial layout. `doc_ids` was a 16-byte `Id` table.
+/// - `2`: generalized `doc_ids` → `keys`: 32-byte `RawValue`
+///   per entry. Unlocks string / tag / composite-key search
+///   through the same index type. See CHANGELOG.
+pub const FORMAT_VERSION: u16 = 2;

@@ -23,9 +23,9 @@ fn id(byte: u8) -> Id {
 
 fn sample_index() -> triblespace_search::bm25::BM25Index {
     let mut b = BM25Builder::new();
-    b.insert(id(1), hash_tokens("the quick brown fox"));
-    b.insert(id(2), hash_tokens("the lazy brown dog"));
-    b.insert(id(3), hash_tokens("quick silver fox jumps"));
+    b.insert_id(id(1), hash_tokens("the quick brown fox"));
+    b.insert_id(id(2), hash_tokens("the lazy brown dog"));
+    b.insert_id(id(3), hash_tokens("quick silver fox jumps"));
     b.build()
 }
 
@@ -58,11 +58,11 @@ fn find_docs_and_scores_shared_score_no_cartesian() {
     let mut b = BM25Builder::new();
     // Three docs, same length and same tf for "fox" — identical
     // scores.
-    b.insert(id(1), hash_tokens("the quick fox"));
-    b.insert(id(2), hash_tokens("another fox book"));
-    b.insert(id(3), hash_tokens("fox adventure here"));
+    b.insert_id(id(1), hash_tokens("the quick fox"));
+    b.insert_id(id(2), hash_tokens("another fox book"));
+    b.insert_id(id(3), hash_tokens("fox adventure here"));
     // One filler doc so corpus avg_doc_len is well-defined.
-    b.insert(id(4), hash_tokens("unrelated content only"));
+    b.insert_id(id(4), hash_tokens("unrelated content only"));
     let idx = b.build();
     let fox = hash_tokens("fox")[0];
 
@@ -95,9 +95,9 @@ fn find_docs_and_scores_shared_score_no_cartesian() {
 #[test]
 fn find_docs_and_scores() {
     let mut b = BM25Builder::new();
-    b.insert(id(1), hash_tokens("fox"));
-    b.insert(id(2), hash_tokens("quick brown fox jumps high today!"));
-    b.insert(id(3), hash_tokens("unrelated content"));
+    b.insert_id(id(1), hash_tokens("fox"));
+    b.insert_id(id(2), hash_tokens("quick brown fox jumps high today!"));
+    b.insert_id(id(3), hash_tokens("unrelated content"));
     let idx = b.build();
     let fox = hash_tokens("fox")[0];
 
@@ -118,7 +118,16 @@ fn find_docs_and_scores() {
     .collect();
 
     // Map each doc to its real posting score for cross-checking.
-    let truth: std::collections::HashMap<Id, f32> = postings.iter().copied().collect();
+    // Postings are keyed by 32-byte RawValue now; decode back to
+    // the Id each row's `doc: Id` projects to.
+    let id_from_raw = |raw: &[u8; 32]| -> Id {
+        Id::new(raw[16..32].try_into().unwrap()).unwrap()
+    };
+    let truth: std::collections::HashMap<Id, f32> = postings
+        .iter()
+        .copied()
+        .map(|(raw, s)| (id_from_raw(&raw), s))
+        .collect();
 
     // Every row's (doc, score) must be one of the real postings.
     assert!(!rows.is_empty());
@@ -131,8 +140,9 @@ fn find_docs_and_scores() {
     }
     // And every posting appears at least once.
     let row_docs: HashSet<Id> = rows.iter().map(|(d, _)| *d).collect();
-    for (d, _) in &postings {
-        assert!(row_docs.contains(d), "posting doc {d:?} missing from rows");
+    for (raw, _) in &postings {
+        let d = id_from_raw(raw);
+        assert!(row_docs.contains(&d), "posting doc {d:?} missing from rows");
     }
 }
 
@@ -188,9 +198,9 @@ fn find_docs_and_scores_on_succinct() {
     use triblespace_search::succinct::SuccinctBM25Index;
 
     let mut b = BM25Builder::new();
-    b.insert(id(1), hash_tokens("fox"));
-    b.insert(id(2), hash_tokens("quick brown fox jumps high today"));
-    b.insert(id(3), hash_tokens("unrelated content"));
+    b.insert_id(id(1), hash_tokens("fox"));
+    b.insert_id(id(2), hash_tokens("quick brown fox jumps high today"));
+    b.insert_id(id(3), hash_tokens("unrelated content"));
     let naive = b.build();
     let succinct = SuccinctBM25Index::from_naive(&naive).unwrap();
     let fox = hash_tokens("fox")[0];
@@ -208,10 +218,12 @@ fn find_docs_and_scores_on_succinct() {
     // what the constraint uses to accept these matches through
     // find!'s propose/confirm protocol.
     let tol = succinct.score_tolerance().max(1e-4);
+    let id_from_raw =
+        |raw: &[u8; 32]| -> Id { Id::new(raw[16..32].try_into().unwrap()).unwrap() };
     for (doc, score) in &rows {
         let expected: f32 = naive
             .query_term(&fox)
-            .find(|(d, _)| d == doc)
+            .find(|(d, _)| id_from_raw(d) == *doc)
             .map(|(_, s)| s)
             .expect("doc must be in naive postings");
         assert!(
@@ -339,7 +351,7 @@ fn find_bm25_composed_with_pattern() {
     .collect();
     let mut bm25 = BM25Builder::new();
     for (b, title) in &titles {
-        bm25.insert(*b, hash_tokens(title));
+        bm25.insert_id(*b, hash_tokens(title));
     }
     let idx = bm25.build();
 

@@ -41,7 +41,7 @@ fn main() {
 
     let mut b = BM25Builder::new();
     for (doc_id, text) in &corpus {
-        b.insert(*doc_id, phrase_tokens(text));
+        b.insert_id(*doc_id, phrase_tokens(text));
     }
     let idx = SuccinctBM25Index::from_naive(&b.build()).unwrap();
     println!(
@@ -52,7 +52,7 @@ fn main() {
 
     // 1. Single-word query: "fox" hits every doc.
     let word = hash_tokens("fox");
-    let hits: Vec<_> = idx.query_term(&word[0]).collect();
+    let hits: Vec<_> = idx.query_term_ids(&word[0]).collect();
     println!("single-word query 'fox':");
     for (d, s) in &hits {
         let text = corpus
@@ -68,7 +68,7 @@ fn main() {
     //    that contain those two words in adjacent order.
     let phrase = bigram_tokens("quick brown");
     assert_eq!(phrase.len(), 1);
-    let hits: Vec<_> = idx.query_term(&phrase[0]).collect();
+    let hits: Vec<_> = idx.query_term_ids(&phrase[0]).collect();
     println!("\nphrase query 'quick brown' (adjacent only):");
     for (d, s) in &hits {
         let text = corpus
@@ -86,7 +86,7 @@ fn main() {
 
     // 3. Phrase query: "brown fox" — matches docs 1 and 3.
     let phrase = bigram_tokens("brown fox");
-    let hits: Vec<_> = idx.query_term(&phrase[0]).collect();
+    let hits: Vec<_> = idx.query_term_ids(&phrase[0]).collect();
     println!("\nphrase query 'brown fox':");
     for (d, s) in &hits {
         let text = corpus
@@ -112,7 +112,7 @@ fn main() {
     // query_multi — sum per-term would produce the same ranking.
     let mut acc: std::collections::HashMap<Id, f32> = Default::default();
     for term in &multi {
-        for (d, s) in idx.query_term(term) {
+        for (d, s) in idx.query_term_ids(term) {
             *acc.entry(d).or_default() += s;
         }
     }

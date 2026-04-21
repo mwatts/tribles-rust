@@ -61,7 +61,7 @@ fn bm25_1k_docs_roundtrip_consistency() {
     let mut builder = BM25Builder::new();
     for i in 0..N_DOCS {
         let doc = fake_document(&mut rng, VOCAB, DOC_LEN);
-        builder.insert(id_from_u64(i as u64 + 1), hash_tokens(&doc));
+        builder.insert_id(id_from_u64(i as u64 + 1), hash_tokens(&doc));
     }
     let idx = builder.build();
     assert_eq!(idx.doc_count(), N_DOCS);
@@ -92,18 +92,22 @@ fn bm25_1k_docs_multi_term_ranks_sanely() {
     let mut builder = BM25Builder::new();
     for i in 0..1_000 {
         let doc = fake_document(&mut rng, 200, 30);
-        builder.insert(id_from_u64(i as u64 + 1), hash_tokens(&doc));
+        builder.insert_id(id_from_u64(i as u64 + 1), hash_tokens(&doc));
     }
     // Inject a unique "needle" doc.
     let needle_id = id_from_u64(999_999);
-    builder.insert(needle_id, hash_tokens("needle needle beacon"));
+    builder.insert_id(needle_id, hash_tokens("needle needle beacon"));
     let idx = builder.build();
 
     let q = hash_tokens("needle beacon");
     let ranked = idx.query_multi(&q);
     // Needle doc should be the top hit since both rare tokens
     // land only there.
-    assert_eq!(ranked[0].0, needle_id);
+    // Keys are 32-byte RawValue now; compare against the
+    // Value<GenId> form of needle_id.
+    let mut needle_key = [0u8; 32];
+    needle_key[16..32].copy_from_slice(AsRef::<[u8; 16]>::as_ref(&needle_id));
+    assert_eq!(ranked[0].0, needle_key);
 }
 
 #[test]
@@ -181,7 +185,7 @@ fn succinct_bm25_1k_docs_matches_naive() {
     let mut builder = BM25Builder::new();
     for i in 0..1_000 {
         let doc = fake_document(&mut rng, 500, 20);
-        builder.insert(id_from_u64(i as u64 + 1), hash_tokens(&doc));
+        builder.insert_id(id_from_u64(i as u64 + 1), hash_tokens(&doc));
     }
     let naive = builder.build();
     let succinct = SuccinctBM25Index::from_naive(&naive).unwrap();
@@ -278,7 +282,7 @@ fn succinct_bm25_blob_smaller_than_naive_at_1k() {
     let mut builder = BM25Builder::new();
     for i in 0..1_000 {
         let doc = fake_document(&mut rng, 400, 24);
-        builder.insert(id_from_u64(i as u64 + 1), hash_tokens(&doc));
+        builder.insert_id(id_from_u64(i as u64 + 1), hash_tokens(&doc));
     }
     let naive = builder.build();
     let succinct = SuccinctBM25Index::from_naive(&naive).unwrap();
@@ -313,7 +317,7 @@ fn bm25_quantization_preserves_top10() {
     let mut builder = BM25Builder::new();
     for i in 0..1_000 {
         let doc = fake_document(&mut rng, 400, 24);
-        builder.insert(id_from_u64(i as u64 + 1), hash_tokens(&doc));
+        builder.insert_id(id_from_u64(i as u64 + 1), hash_tokens(&doc));
     }
     let idx = builder.build();
 
@@ -366,8 +370,8 @@ fn bm25_quantization_preserves_top10() {
             continue;
         }
 
-        let mut raw_scores: Vec<(triblespace::core::id::Id, f32)> = Vec::new();
-        let mut q_scores: Vec<(triblespace::core::id::Id, f32)> = Vec::new();
+        let mut raw_scores: Vec<(triblespace::core::value::RawValue, f32)> = Vec::new();
+        let mut q_scores: Vec<(triblespace::core::value::RawValue, f32)> = Vec::new();
         for term in &terms {
             for (d, s) in idx.query_term(term) {
                 match raw_scores.iter_mut().find(|(dd, _)| *dd == d) {

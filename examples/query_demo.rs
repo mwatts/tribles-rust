@@ -32,7 +32,7 @@ fn main() {
     // Build.
     let mut builder = BM25Builder::new();
     for (id, text) in &corpus {
-        builder.insert(*id, hash_tokens(text));
+        builder.insert_id(*id, hash_tokens(text));
         println!("indexed {id} ({} tokens)", hash_tokens(text).len());
     }
     let idx = builder.build();
@@ -52,14 +52,14 @@ fn main() {
     // Single-term query.
     println!("\nquery: 'typst'");
     let q = hash_tokens("typst");
-    for (doc, score) in reloaded.query_term(&q[0]) {
+    for (doc, score) in reloaded.query_term_ids(&q[0]) {
         println!("  {doc}  score={score:.3}");
     }
 
     // Multi-term OR-query with sum-of-BM25 ranking.
     println!("\nquery: 'fragment wiki'");
     let q = hash_tokens("fragment wiki");
-    for (doc, score) in reloaded.query_multi(&q).into_iter().take(3) {
+    for (doc, score) in reloaded.query_multi_ids(&q).into_iter().take(3) {
         println!("  {doc}  score={score:.3}");
     }
 
@@ -69,21 +69,21 @@ fn main() {
     // "documents citing this fragment".
     println!("\ncitation search (term = fragment id):");
     let mut cite_builder = BM25Builder::new();
-    cite_builder.insert(
+    cite_builder.insert_id(
         id(10),
         vec![*id(1).as_ref(); 1]
             .iter()
             .map(|r| raw_from_id(r))
             .collect(),
     );
-    cite_builder.insert(
+    cite_builder.insert_id(
         id(11),
         vec![id(1), id(3)]
             .iter()
             .map(|i| raw_from_id(i.as_ref()))
             .collect(),
     );
-    cite_builder.insert(
+    cite_builder.insert_id(
         id(12),
         vec![id(3)]
             .iter()
@@ -92,7 +92,7 @@ fn main() {
     );
     let cite_idx = cite_builder.build();
 
-    let cites_one: Vec<_> = cite_idx.query_term(&raw_from_id(id(1).as_ref())).collect();
+    let cites_one: Vec<_> = cite_idx.query_term_ids(&raw_from_id(id(1).as_ref())).collect();
     println!("  citations of {}: {} doc(s)", id(1), cites_one.len());
     for (doc, _) in cites_one {
         println!("    cited by {doc}");

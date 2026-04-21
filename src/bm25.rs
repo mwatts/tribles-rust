@@ -28,13 +28,13 @@
 //! ];
 //! let mut b = BM25Builder::new();
 //! for (id, text) in &docs {
-//!     b.insert(*id, hash_tokens(text));
+//!     b.insert_id(*id, hash_tokens(text));
 //! }
 //! let index = b.build();
 //!
 //! // Query: how many docs mention "fox"?
 //! let q = hash_tokens("fox");
-//! let hits: Vec<_> = index.query_term(&q[0]).collect();
+//! let hits: Vec<_> = index.query_term_ids(&q[0]).collect();
 //! assert_eq!(hits.len(), 2);
 //! ```
 //!
@@ -79,8 +79,6 @@ pub enum BM25LoadError {
     TruncatedSection(&'static str),
     /// A posting-list offset is not monotonically non-decreasing.
     NonMonotonicOffsets,
-    /// A stored `doc_id` is the nil `[0; 16]` id.
-    NilDocId,
 }
 
 impl std::fmt::Display for BM25LoadError {
@@ -97,7 +95,6 @@ impl std::fmt::Display for BM25LoadError {
             Self::NonMonotonicOffsets => {
                 write!(f, "BM25 blob: posting-list offsets are not monotonic")
             }
-            Self::NilDocId => write!(f, "BM25 blob: nil doc_id found"),
         }
     }
 }
@@ -107,10 +104,17 @@ impl std::error::Error for BM25LoadError {}
 /// Accumulator for documents to be indexed. Call [`insert`] once
 /// per doc, then [`build`] to produce a [`BM25Index`].
 ///
+/// "Doc" here is any 32-byte triblespace [`RawValue`] — same
+/// schema-erased byte array the index uses for terms. Callers
+/// typically pass entity ids via `Value::<GenId>::new(...).raw`
+/// (see [`Self::insert_id`] for a convenience wrapper), but any
+/// other schema works: string-valued keys (title search),
+/// composite keys, or raw hashes.
+///
 /// [`insert`]: Self::insert
 /// [`build`]: Self::build
 pub struct BM25Builder {
-    docs: Vec<(Id, Vec<RawValue>)>,
+    docs: Vec<(RawValue, Vec<RawValue>)>,
     k1: f32,
     b: f32,
 }
@@ -143,12 +147,25 @@ impl BM25Builder {
         self
     }
 
-    /// Add a document. `terms` is the caller's tokenization (see
-    /// [`crate::tokens::hash_tokens`] for a simple default). The
-    /// order of terms is irrelevant; duplicates contribute to
-    /// term frequency.
-    pub fn insert(&mut self, doc_id: Id, terms: Vec<RawValue>) {
-        self.docs.push((doc_id, terms));
+    /// Add a document. `key` is any 32-byte triblespace value
+    /// identifying the doc (entity id via `GenId`, hash, string
+    /// value, tag, whatever); `terms` is the caller's
+    /// tokenization (see [`crate::tokens::hash_tokens`] for a
+    /// simple default). The order of terms is irrelevant;
+    /// duplicates contribute to term frequency.
+    pub fn insert(&mut self, key: RawValue, terms: Vec<RawValue>) {
+        self.docs.push((key, terms));
+    }
+
+    /// Convenience: add a document keyed by a triblespace [`Id`]
+    /// (16 bytes). Shorthand for `insert(id_to_value(id).raw, ...)`.
+    /// Matches the pre-generalization API so migration from the
+    /// entity-keyed case is one method rename.
+    pub fn insert_id(&mut self, doc_id: Id, terms: Vec<RawValue>) {
+        let mut raw = [0u8; 32];
+        let id_bytes: &RawId = doc_id.as_ref();
+        raw[16..32].copy_from_slice(id_bytes);
+        self.docs.push((raw, terms));
     }
 
     /// Consume the builder and produce an in-memory BM25 index
@@ -182,7 +199,7 @@ impl BM25Builder {
             doc_lens.iter().map(|&n| n as f64).sum::<f64>() as f32 / n_docs as f32
         };
 
-        let doc_ids: Vec<Id> = docs.iter().map(|(id, _)| *id).collect();
+        let keys: Vec<RawValue> = docs.iter().map(|(key, _)| *key).collect();
 
         let term_to_tfs = if threads <= 1 || n_docs < 2 {
             // Single-threaded tf accumulation — cheap for small
@@ -204,7 +221,7 @@ impl BM25Builder {
             // consume. We keep the start doc_idx of each chunk
             // to preserve global indexing.
             let mut starts = Vec::with_capacity(threads);
-            let mut chunks: Vec<Vec<(Id, Vec<RawValue>)>> = Vec::with_capacity(threads);
+            let mut chunks: Vec<Vec<(RawValue, Vec<RawValue>)>> = Vec::with_capacity(threads);
             let mut docs_iter = docs.into_iter();
             let mut idx = 0usize;
             for t in 0..threads {
@@ -284,7 +301,7 @@ impl BM25Builder {
         }
 
         BM25Index {
-            doc_ids,
+            keys,
             doc_lens,
             avg_doc_len,
             terms,
@@ -315,7 +332,10 @@ fn accumulate_tfs(
 /// length-normalized doc length (`b`).
 #[derive(Debug, Clone)]
 pub struct BM25Index {
-    doc_ids: Vec<Id>,
+    /// Per-doc 32-byte keys. Any triblespace `RawValue` — most
+    /// commonly an entity id (via `Value<GenId>`), but strings,
+    /// tags, or hashes work too.
+    keys: Vec<RawValue>,
     doc_lens: Vec<u32>,
     avg_doc_len: f32,
     terms: Vec<RawValue>,
@@ -328,7 +348,7 @@ pub struct BM25Index {
 impl BM25Index {
     /// Number of documents in the index.
     pub fn doc_count(&self) -> usize {
-        self.doc_ids.len()
+        self.keys.len()
     }
 
     /// Number of distinct terms.
@@ -343,9 +363,9 @@ impl BM25Index {
 
     /// Look up a term's posting list.
     ///
-    /// Returns `(doc_id, score)` pairs in ascending-doc-id order.
+    /// Returns `(key, score)` pairs in posting-list order.
     /// Empty iterator if the term is absent.
-    pub fn query_term(&self, term: &RawValue) -> impl Iterator<Item = (Id, f32)> + '_ {
+    pub fn query_term(&self, term: &RawValue) -> impl Iterator<Item = (RawValue, f32)> + '_ {
         let lo = self.terms.binary_search(term).ok();
         let range = match lo {
             Some(i) => self.offsets[i] as usize..self.offsets[i + 1] as usize,
@@ -353,22 +373,56 @@ impl BM25Index {
         };
         self.postings[range]
             .iter()
-            .map(|&(doc_idx, score)| (self.doc_ids[doc_idx as usize], score))
+            .map(|&(doc_idx, score)| (self.keys[doc_idx as usize], score))
+    }
+
+    /// Convenience: [`query_term`] but decode each key as a
+    /// triblespace [`Id`] (assuming the index was keyed via
+    /// [`BM25Builder::insert_id`] / `Value<GenId>`). Returns
+    /// `None` if the stored key isn't a valid GenId (non-zero
+    /// first 16 bytes or nil tail).
+    pub fn query_term_ids<'a>(
+        &'a self,
+        term: &RawValue,
+    ) -> impl Iterator<Item = (Id, f32)> + 'a {
+        self.query_term(term).filter_map(|(raw, score)| {
+            if raw[0..16] != [0u8; 16] {
+                return None;
+            }
+            let id_bytes: RawId = raw[16..32].try_into().ok()?;
+            Id::new(id_bytes).map(|id| (id, score))
+        })
+    }
+
+    /// Convenience: [`query_multi`] decoded as `(Id, score)` pairs.
+    ///
+    /// [`query_multi`]: Self::query_multi
+    pub fn query_multi_ids(&self, terms: &[RawValue]) -> Vec<(Id, f32)> {
+        self.query_multi(terms)
+            .into_iter()
+            .filter_map(|(raw, s)| {
+                if raw[0..16] != [0u8; 16] {
+                    return None;
+                }
+                let id_bytes: RawId = raw[16..32].try_into().ok()?;
+                Id::new(id_bytes).map(|id| (id, s))
+            })
+            .collect()
     }
 
     /// Score a multi-term query as the sum of per-term BM25
     /// weights (standard OR-like bag-of-words).
     ///
-    /// Returned `(doc_id, score)` pairs are sorted descending by
+    /// Returned `(key, score)` pairs are sorted descending by
     /// score. No top-k truncation — caller slices what they need.
-    pub fn query_multi(&self, terms: &[RawValue]) -> Vec<(Id, f32)> {
-        let mut acc: HashMap<Id, f32> = HashMap::new();
+    pub fn query_multi(&self, terms: &[RawValue]) -> Vec<(RawValue, f32)> {
+        let mut acc: HashMap<RawValue, f32> = HashMap::new();
         for term in terms {
             for (doc, score) in self.query_term(term) {
                 *acc.entry(doc).or_insert(0.0) += score;
             }
         }
-        let mut out: Vec<(Id, f32)> = acc.into_iter().collect();
+        let mut out: Vec<(RawValue, f32)> = acc.into_iter().collect();
         out.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         out
     }
@@ -398,11 +452,12 @@ impl BM25Index {
         &self.doc_lens
     }
 
-    /// Doc-id table: `doc_ids()[i]` is the external `Id` for
-    /// internal index `i`. Exposed so succinct re-encoders can
-    /// snapshot the table without roundtripping through query_term.
-    pub fn doc_ids(&self) -> &[Id] {
-        &self.doc_ids
+    /// Doc-key table: `keys()[i]` is the external 32-byte
+    /// `RawValue` for internal index `i`. Exposed so succinct
+    /// re-encoders can snapshot the table without roundtripping
+    /// through query_term.
+    pub fn keys(&self) -> &[RawValue] {
+        &self.keys
     }
 
     /// Sorted 32-byte term table. Used by succinct re-encoders
@@ -432,7 +487,7 @@ impl BM25Index {
     ///
     /// ```text
     /// [32 B header]
-    /// [n_docs × 16 B doc_ids]
+    /// [n_docs × 32 B keys]
     /// [n_docs ×  4 B doc_lens]
     /// [n_terms × 32 B terms (sorted)]
     /// [(n_terms + 1) × 4 B postings_offsets]
@@ -441,13 +496,13 @@ impl BM25Index {
     ///
     /// Use [`BM25Index::try_from_bytes`] to reload.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let n_docs = self.doc_ids.len() as u32;
+        let n_docs = self.keys.len() as u32;
         let n_terms = self.terms.len() as u32;
         let total_postings = self.postings.len();
 
         let mut buf = Vec::with_capacity(
             HEADER_LEN
-                + (self.doc_ids.len() * 16)
+                + (self.keys.len() * 32)
                 + (self.doc_lens.len() * 4)
                 + (self.terms.len() * 32)
                 + (self.offsets.len() * 4)
@@ -470,12 +525,9 @@ impl BM25Index {
         buf.extend_from_slice(&[0u8; 4]); // pad to 32
         debug_assert_eq!(buf.len(), HEADER_LEN);
 
-        // ── doc_ids ──────────────────────────────────────────────
-        for id in &self.doc_ids {
-            // `Id` implements `AsRef<RawId>`, giving us the
-            // underlying 16-byte array without copy.
-            let raw: &RawId = id.as_ref();
-            buf.extend_from_slice(raw);
+        // ── keys ─────────────────────────────────────────────────
+        for key in &self.keys {
+            buf.extend_from_slice(key);
         }
         // ── doc_lens ─────────────────────────────────────────────
         for &len in &self.doc_lens {
@@ -527,16 +579,16 @@ impl BM25Index {
 
         // Section offsets.
         let mut pos = HEADER_LEN;
-        let doc_ids_end = pos + n_docs * 16;
-        if bytes.len() < doc_ids_end {
-            return Err(E::TruncatedSection("doc_ids"));
+        let keys_end = pos + n_docs * 32;
+        if bytes.len() < keys_end {
+            return Err(E::TruncatedSection("keys"));
         }
-        let mut doc_ids = Vec::with_capacity(n_docs);
-        for chunk in bytes[pos..doc_ids_end].chunks_exact(16) {
-            let raw: RawId = chunk.try_into().unwrap();
-            doc_ids.push(Id::new(raw).ok_or(E::NilDocId)?);
+        let mut keys = Vec::with_capacity(n_docs);
+        for chunk in bytes[pos..keys_end].chunks_exact(32) {
+            let raw: RawValue = chunk.try_into().unwrap();
+            keys.push(raw);
         }
-        pos = doc_ids_end;
+        pos = keys_end;
 
         let doc_lens_end = pos + n_docs * 4;
         if bytes.len() < doc_lens_end {
@@ -592,7 +644,7 @@ impl BM25Index {
             .collect();
 
         Ok(Self {
-            doc_ids,
+            keys,
             doc_lens,
             avg_doc_len,
             terms,
@@ -615,6 +667,18 @@ mod tests {
         Id::new([byte; 16]).unwrap()
     }
 
+    /// Test helper: the 32-byte `Value<GenId>` representation of
+    /// the Id used by `id(byte)`. Matches what `insert_id` stores
+    /// internally, so `query_term` results can be compared
+    /// against it.
+    fn id_key(byte: u8) -> RawValue {
+        let mut raw = [0u8; 32];
+        let id = id(byte);
+        let id_bytes: &RawId = id.as_ref();
+        raw[16..32].copy_from_slice(id_bytes);
+        raw
+    }
+
     #[test]
     fn empty_index_is_queryable() {
         let idx = BM25Builder::new().build();
@@ -627,9 +691,9 @@ mod tests {
     #[test]
     fn three_docs_basic() {
         let mut b = BM25Builder::new();
-        b.insert(id(1), hash_tokens("the quick brown fox"));
-        b.insert(id(2), hash_tokens("the lazy brown dog"));
-        b.insert(id(3), hash_tokens("quick silver fox"));
+        b.insert_id(id(1), hash_tokens("the quick brown fox"));
+        b.insert_id(id(2), hash_tokens("the lazy brown dog"));
+        b.insert_id(id(3), hash_tokens("quick silver fox"));
         let idx = b.build();
         assert_eq!(idx.doc_count(), 3);
 
@@ -638,8 +702,8 @@ mod tests {
         let hits: Vec<_> = idx.query_term(&fox[0]).collect();
         assert_eq!(hits.len(), 2);
         let doc_ids: Vec<_> = hits.iter().map(|(d, _)| *d).collect();
-        assert!(doc_ids.contains(&id(1)));
-        assert!(doc_ids.contains(&id(3)));
+        assert!(doc_ids.contains(&id_key(1)));
+        assert!(doc_ids.contains(&id_key(3)));
 
         // "the" is in doc 1 and doc 2.
         let the = hash_tokens("the");
@@ -655,9 +719,9 @@ mod tests {
         let mut b = BM25Builder::new();
         // "rare" appears once, "common" appears in every doc.
         for i in 1..=10 {
-            b.insert(id(i), hash_tokens("common common"));
+            b.insert_id(id(i), hash_tokens("common common"));
         }
-        b.insert(id(100), hash_tokens("common rare"));
+        b.insert_id(id(100), hash_tokens("common rare"));
         let idx = b.build();
 
         let rare = hash_tokens("rare");
@@ -680,15 +744,15 @@ mod tests {
         // k1 = 1.5 the second's score should be higher but not
         // 100x higher — saturation.
         let mut b = BM25Builder::new();
-        b.insert(id(1), hash_tokens("foo bar baz"));
+        b.insert_id(id(1), hash_tokens("foo bar baz"));
         let many: String = std::iter::repeat("foo ").take(100).collect::<String>();
-        b.insert(id(2), hash_tokens(&many));
+        b.insert_id(id(2), hash_tokens(&many));
         let idx = b.build();
 
         let foo = hash_tokens("foo");
-        let scores: HashMap<Id, f32> = idx.query_term(&foo[0]).collect();
-        let s1 = scores[&id(1)];
-        let s2 = scores[&id(2)];
+        let scores: HashMap<RawValue, f32> = idx.query_term(&foo[0]).collect();
+        let s1 = scores[&id_key(1)];
+        let s2 = scores[&id_key(2)];
         assert!(s2 > s1);
         assert!(
             s2 < s1 * 20.0,
@@ -699,9 +763,9 @@ mod tests {
     #[test]
     fn multi_term_query_sums() {
         let mut b = BM25Builder::new();
-        b.insert(id(1), hash_tokens("quick brown fox"));
-        b.insert(id(2), hash_tokens("quick red fox"));
-        b.insert(id(3), hash_tokens("slow brown dog"));
+        b.insert_id(id(1), hash_tokens("quick brown fox"));
+        b.insert_id(id(2), hash_tokens("quick red fox"));
+        b.insert_id(id(3), hash_tokens("slow brown dog"));
         let idx = b.build();
 
         let q = hash_tokens("quick fox");
@@ -709,8 +773,8 @@ mod tests {
         // Docs 1 and 2 have both terms; doc 3 has neither.
         assert_eq!(ranked.len(), 2);
         let top_ids: Vec<_> = ranked.iter().map(|(d, _)| *d).collect();
-        assert!(top_ids.contains(&id(1)));
-        assert!(top_ids.contains(&id(2)));
+        assert!(top_ids.contains(&id_key(1)));
+        assert!(top_ids.contains(&id_key(2)));
         // Results are sorted descending by score.
         assert!(ranked[0].1 >= ranked[1].1);
     }
@@ -725,9 +789,9 @@ mod tests {
 
     fn build_sample_index() -> BM25Index {
         let mut b = BM25Builder::new().k1(1.4).b(0.72);
-        b.insert(id(1), hash_tokens("the quick brown fox"));
-        b.insert(id(2), hash_tokens("the lazy brown dog"));
-        b.insert(id(3), hash_tokens("quick silver fox jumps"));
+        b.insert_id(id(1), hash_tokens("the quick brown fox"));
+        b.insert_id(id(2), hash_tokens("the lazy brown dog"));
+        b.insert_id(id(3), hash_tokens("quick silver fox jumps"));
         b.build()
     }
 
@@ -817,7 +881,7 @@ mod tests {
                     (i.wrapping_mul(7)) % 13
                 );
                 let byte = (i as u8).max(1);
-                b.insert(id(byte), hash_tokens(&text));
+                b.insert_id(id(byte), hash_tokens(&text));
             }
             b.build_with_threads(threads).to_bytes()
         }
@@ -843,9 +907,9 @@ mod tests {
         // 3 docs × 16 threads — the builder caps threads at n_docs
         // and doesn't spawn idle workers.
         let mut b = BM25Builder::new();
-        b.insert(id(1), hash_tokens("one two three"));
-        b.insert(id(2), hash_tokens("two three four"));
-        b.insert(id(3), hash_tokens("three four five"));
+        b.insert_id(id(1), hash_tokens("one two three"));
+        b.insert_id(id(2), hash_tokens("two three four"));
+        b.insert_id(id(3), hash_tokens("three four five"));
         let idx = b.build_with_threads(16);
         assert_eq!(idx.doc_count(), 3);
         // "three" shows up in all 3 docs.
@@ -868,9 +932,9 @@ mod tests {
         }
 
         let mut b = BM25Builder::new();
-        b.insert(id(1), both("foxes are cunning"));
-        b.insert(id(2), both("the dog barks"));
-        b.insert(id(3), both("silver fox at night"));
+        b.insert_id(id(1), both("foxes are cunning"));
+        b.insert_id(id(2), both("the dog barks"));
+        b.insert_id(id(3), both("silver fox at night"));
         let idx = b.build();
 
         // Query "fox" as trigrams: just one gram, "fox". Both
@@ -879,8 +943,8 @@ mod tests {
         let q = ngram_tokens("fox", 3);
         let hits: Vec<_> = idx.query_multi(&q);
         let doc_ids: Vec<_> = hits.iter().map(|(d, _)| *d).collect();
-        assert!(doc_ids.contains(&id(1)), "prefix should match 'foxes'");
-        assert!(doc_ids.contains(&id(3)), "prefix should match 'fox'");
-        assert!(!doc_ids.contains(&id(2)), "must not match 'dog'");
+        assert!(doc_ids.contains(&id_key(1)), "prefix should match 'foxes'");
+        assert!(doc_ids.contains(&id_key(3)), "prefix should match 'fox'");
+        assert!(!doc_ids.contains(&id_key(2)), "must not match 'dog'");
     }
 }

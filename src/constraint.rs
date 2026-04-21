@@ -37,9 +37,14 @@ use crate::schemas::F32LE;
 /// [`crate::succinct::SuccinctBM25Index`] so either can plug
 /// into `find!` / `pattern!` without changes at the engine layer.
 pub trait BM25Queryable {
-    /// Iterate `(doc_id, score)` for the posting list of `term`.
-    /// Empty if the term is absent.
-    fn query_term_boxed<'a>(&'a self, term: &RawValue) -> Box<dyn Iterator<Item = (Id, f32)> + 'a>;
+    /// Iterate `(key, score)` for the posting list of `term`.
+    /// Keys are 32-byte triblespace `RawValue`s — the caller's
+    /// `Variable<S>` decodes them through whatever `ValueSchema`
+    /// is appropriate. Empty iterator if the term is absent.
+    fn query_term_boxed<'a>(
+        &'a self,
+        term: &RawValue,
+    ) -> Box<dyn Iterator<Item = (RawValue, f32)> + 'a>;
 
     /// Number of docs containing `term`. Used by `estimate`.
     fn doc_frequency_for(&self, term: &RawValue) -> usize;
@@ -57,7 +62,10 @@ pub trait BM25Queryable {
 }
 
 impl BM25Queryable for BM25Index {
-    fn query_term_boxed<'a>(&'a self, term: &RawValue) -> Box<dyn Iterator<Item = (Id, f32)> + 'a> {
+    fn query_term_boxed<'a>(
+        &'a self,
+        term: &RawValue,
+    ) -> Box<dyn Iterator<Item = (RawValue, f32)> + 'a> {
         Box::new(self.query_term(term))
     }
 
@@ -68,7 +76,10 @@ impl BM25Queryable for BM25Index {
 
 #[cfg(feature = "succinct")]
 impl BM25Queryable for crate::succinct::SuccinctBM25Index {
-    fn query_term_boxed<'a>(&'a self, term: &RawValue) -> Box<dyn Iterator<Item = (Id, f32)> + 'a> {
+    fn query_term_boxed<'a>(
+        &'a self,
+        term: &RawValue,
+    ) -> Box<dyn Iterator<Item = (RawValue, f32)> + 'a> {
         self.query_term(term)
     }
 
@@ -118,8 +129,11 @@ impl HNSWQueryable for crate::succinct::SuccinctHNSWIndex {
     }
 }
 
-/// Constrains a `Variable<GenId>` (doc) to entity ids in the
-/// posting list of the pinned term.
+/// Constrains a `Variable<S>` (doc) to the 32-byte
+/// [`RawValue`]s in the posting list of the pinned term. `S` is
+/// whatever [`ValueSchema`] the caller keys the index with —
+/// typically [`GenId`] for entity-keyed indexes, but any schema
+/// works (string titles, tags, fragment hashes, etc.).
 ///
 /// Generic over any `I: BM25Queryable`, so it works against
 /// [`BM25Index`] or
@@ -127,27 +141,38 @@ impl HNSWQueryable for crate::succinct::SuccinctHNSWIndex {
 ///
 /// Created via [`BM25Index::docs_containing`] (or the succinct
 /// equivalent).
-pub struct DocsContainingTerm<'a, I: BM25Queryable + ?Sized = BM25Index> {
+pub struct DocsContainingTerm<'a, I: BM25Queryable + ?Sized = BM25Index, S = GenId>
+where
+    S: triblespace::core::value::ValueSchema,
+{
     index: &'a I,
-    doc: Variable<GenId>,
+    doc: Variable<S>,
     /// The term value is pinned at constraint-construction time.
     term: [u8; 32],
 }
 
-impl<'a, I: BM25Queryable + ?Sized> DocsContainingTerm<'a, I> {
-    pub fn new(index: &'a I, doc: Variable<GenId>, term: [u8; 32]) -> Self {
+impl<'a, I: BM25Queryable + ?Sized, S> DocsContainingTerm<'a, I, S>
+where
+    S: triblespace::core::value::ValueSchema,
+{
+    pub fn new(index: &'a I, doc: Variable<S>, term: [u8; 32]) -> Self {
         Self { index, doc, term }
     }
 }
 
 impl BM25Index {
     /// Produce a [`DocsContainingTerm`] constraint for use inside
-    /// `pattern!` / `find!`.
-    pub fn docs_containing(
+    /// `pattern!` / `find!`. `S` is the schema the caller
+    /// keyed the index with — usually [`GenId`] for entity ids,
+    /// but any [`ValueSchema`] works.
+    pub fn docs_containing<S>(
         &self,
-        doc: Variable<GenId>,
+        doc: Variable<S>,
         term: [u8; 32],
-    ) -> DocsContainingTerm<'_, BM25Index> {
+    ) -> DocsContainingTerm<'_, BM25Index, S>
+    where
+        S: triblespace::core::value::ValueSchema,
+    {
         DocsContainingTerm::new(self, doc, term)
     }
 }
@@ -199,15 +224,21 @@ fn raw_value_to_f32(raw: &RawValue) -> f32 {
 /// the `doc` variable; for `score` we use the same count because
 /// each (doc, term) pair has exactly one score — the cardinality
 /// is identical from the engine's perspective.
-pub struct BM25ScoredPostings<'a, I: BM25Queryable + ?Sized = BM25Index> {
+pub struct BM25ScoredPostings<'a, I: BM25Queryable + ?Sized = BM25Index, S = GenId>
+where
+    S: triblespace::core::value::ValueSchema,
+{
     index: &'a I,
-    doc: Variable<GenId>,
+    doc: Variable<S>,
     score: Variable<F32LE>,
     term: [u8; 32],
 }
 
-impl<'a, I: BM25Queryable + ?Sized> BM25ScoredPostings<'a, I> {
-    pub fn new(index: &'a I, doc: Variable<GenId>, score: Variable<F32LE>, term: [u8; 32]) -> Self {
+impl<'a, I: BM25Queryable + ?Sized, S> BM25ScoredPostings<'a, I, S>
+where
+    S: triblespace::core::value::ValueSchema,
+{
+    pub fn new(index: &'a I, doc: Variable<S>, score: Variable<F32LE>, term: [u8; 32]) -> Self {
         Self {
             index,
             doc,
@@ -222,17 +253,23 @@ impl BM25Index {
     /// `term`. Use this when the caller wants to project the
     /// BM25 weight into their result rows (filtering, ordering,
     /// hybrid-ranking combinators above the query).
-    pub fn docs_and_scores(
+    pub fn docs_and_scores<S>(
         &self,
-        doc: Variable<GenId>,
+        doc: Variable<S>,
         score: Variable<F32LE>,
         term: [u8; 32],
-    ) -> BM25ScoredPostings<'_, BM25Index> {
+    ) -> BM25ScoredPostings<'_, BM25Index, S>
+    where
+        S: triblespace::core::value::ValueSchema,
+    {
         BM25ScoredPostings::new(self, doc, score, term)
     }
 }
 
-impl<'a, I: BM25Queryable + ?Sized + 'a> Constraint<'a> for BM25ScoredPostings<'a, I> {
+impl<'a, I: BM25Queryable + ?Sized + 'a, S> Constraint<'a> for BM25ScoredPostings<'a, I, S>
+where
+    S: triblespace::core::value::ValueSchema + 'a,
+{
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.doc.index)
             .union(VariableSet::new_singleton(self.score.index))
@@ -247,34 +284,27 @@ impl<'a, I: BM25Queryable + ?Sized + 'a> Constraint<'a> for BM25ScoredPostings<'
     }
 
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
-        // If we're proposing `doc`, enumerate the posting list's
-        // doc ids. If proposing `score`, enumerate the distinct
-        // scores — but with doc implicitly determining score,
-        // we yield the scores of docs satisfying the current
-        // binding.
         if variable == self.doc.index {
-            // Filter by a bound score if present — otherwise
-            // yield every posting's doc.
             let bound_score = binding.get(self.score.index).map(raw_value_to_f32);
             let tol = self.index.score_tolerance();
-            for (doc_id, score) in self.index.query_term_boxed(&self.term) {
+            for (key, score) in self.index.query_term_boxed(&self.term) {
                 if let Some(bs) = bound_score {
                     if (score - bs).abs() > tol {
                         continue;
                     }
                 }
-                proposals.push(id_to_raw_value(doc_id));
+                proposals.push(key);
             }
         } else if variable == self.score.index {
-            let bound_doc = binding.get(self.doc.index).and_then(raw_value_to_id);
+            let bound_doc = binding.get(self.doc.index).copied();
             // Dedupe score bit-patterns: two docs sharing a BM25
             // score would otherwise produce two identical score
             // proposals, causing the engine to enumerate a
             // Cartesian (doc, score) cross within the bucket.
             let mut seen = HashSet::new();
-            for (doc_id, score) in self.index.query_term_boxed(&self.term) {
+            for (key, score) in self.index.query_term_boxed(&self.term) {
                 if let Some(bd) = bound_doc {
-                    if doc_id != bd {
+                    if key != bd {
                         continue;
                     }
                 }
@@ -287,32 +317,25 @@ impl<'a, I: BM25Queryable + ?Sized + 'a> Constraint<'a> for BM25ScoredPostings<'
 
     fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
         if variable == self.doc.index {
-            // Same data structure as DocsContainingTerm's confirm:
-            // retain proposals whose doc is in the posting list
-            // (and matches any bound score).
             let bound_score = binding.get(self.score.index).map(raw_value_to_f32);
             let tol = self.index.score_tolerance();
-            let valid: HashSet<Id> = self
+            let valid: HashSet<RawValue> = self
                 .index
                 .query_term_boxed(&self.term)
                 .filter(|(_, s)| match bound_score {
                     Some(bs) => (s - bs).abs() <= tol,
                     None => true,
                 })
-                .map(|(d, _)| d)
+                .map(|(k, _)| k)
                 .collect();
-            proposals.retain(|raw| {
-                raw_value_to_id(raw)
-                    .map(|id| valid.contains(&id))
-                    .unwrap_or(false)
-            });
+            proposals.retain(|raw| valid.contains(raw));
         } else if variable == self.score.index {
-            let bound_doc = binding.get(self.doc.index).and_then(raw_value_to_id);
+            let bound_doc = binding.get(self.doc.index).copied();
             let allowed: HashSet<u32> = self
                 .index
                 .query_term_boxed(&self.term)
-                .filter(|(d, _)| match bound_doc {
-                    Some(bd) => *d == bd,
+                .filter(|(k, _)| match bound_doc {
+                    Some(bd) => *k == bd,
                     None => true,
                 })
                 .map(|(_, s)| s.to_bits())
@@ -322,13 +345,13 @@ impl<'a, I: BM25Queryable + ?Sized + 'a> Constraint<'a> for BM25ScoredPostings<'
     }
 
     fn satisfied(&self, binding: &Binding) -> bool {
-        let bound_doc = binding.get(self.doc.index).and_then(raw_value_to_id);
+        let bound_doc = binding.get(self.doc.index).copied();
         let bound_score = binding.get(self.score.index).map(raw_value_to_f32);
         let tol = self.index.score_tolerance();
         match (bound_doc, bound_score) {
             (None, None) => true,
-            _ => self.index.query_term_boxed(&self.term).any(|(d, s)| {
-                bound_doc.map_or(true, |bd| d == bd)
+            _ => self.index.query_term_boxed(&self.term).any(|(k, s)| {
+                bound_doc.map_or(true, |bd| k == bd)
                     && bound_score.map_or(true, |bs| (s - bs).abs() <= tol)
             }),
         }
@@ -820,7 +843,10 @@ impl<'a, I: HNSWQueryable + ?Sized + 'a> Constraint<'a> for SimilarToVectorHNSWS
     }
 }
 
-impl<'a, I: BM25Queryable + ?Sized + 'a> Constraint<'a> for DocsContainingTerm<'a, I> {
+impl<'a, I: BM25Queryable + ?Sized + 'a, S> Constraint<'a> for DocsContainingTerm<'a, I, S>
+where
+    S: triblespace::core::value::ValueSchema + 'a,
+{
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.doc.index)
     }
@@ -837,8 +863,8 @@ impl<'a, I: BM25Queryable + ?Sized + 'a> Constraint<'a> for DocsContainingTerm<'
         if self.doc.index != variable {
             return;
         }
-        for (doc_id, _score) in self.index.query_term_boxed(&self.term) {
-            proposals.push(id_to_raw_value(doc_id));
+        for (key, _score) in self.index.query_term_boxed(&self.term) {
+            proposals.push(key);
         }
     }
 
@@ -850,30 +876,19 @@ impl<'a, I: BM25Queryable + ?Sized + 'a> Constraint<'a> for DocsContainingTerm<'
         // membership checks. For very long posting lists a sorted
         // binary-search would be lighter on memory; for v1 this is
         // fine up to tens of thousands of postings.
-        let docs: HashSet<Id> = self
-            .index
-            .query_term_boxed(&self.term)
-            .map(|(d, _)| d)
-            .collect();
-        proposals.retain(|raw| {
-            raw_value_to_id(raw)
-                .map(|id| docs.contains(&id))
-                .unwrap_or(false)
-        });
+        let docs: HashSet<RawValue> =
+            self.index.query_term_boxed(&self.term).map(|(k, _)| k).collect();
+        proposals.retain(|raw| docs.contains(raw));
     }
 
     fn satisfied(&self, binding: &Binding) -> bool {
         // If `doc` is already bound, the constraint is satisfied
         // iff that doc appears in the term's posting list.
-        match binding.get(self.doc.index) {
-            Some(raw) => {
-                let Some(doc_id) = raw_value_to_id(raw) else {
-                    return false;
-                };
-                self.index
-                    .query_term_boxed(&self.term)
-                    .any(|(d, _)| d == doc_id)
-            }
+        match binding.get(self.doc.index).copied() {
+            Some(bound_key) => self
+                .index
+                .query_term_boxed(&self.term)
+                .any(|(k, _)| k == bound_key),
             None => true,
         }
     }
@@ -889,11 +904,22 @@ mod tests {
         Id::new([byte; 16]).unwrap()
     }
 
+    /// 32-byte `Value<GenId>` form of `id(byte)` — matches what
+    /// `BM25Builder::insert_id` stores and what the index's
+    /// `query_term` returns.
+    fn id_key(byte: u8) -> RawValue {
+        let mut raw = [0u8; 32];
+        let id = id(byte);
+        let id_bytes: &RawId = id.as_ref();
+        raw[16..32].copy_from_slice(id_bytes);
+        raw
+    }
+
     fn sample_index() -> BM25Index {
         let mut b = BM25Builder::new();
-        b.insert(id(1), hash_tokens("the quick brown fox"));
-        b.insert(id(2), hash_tokens("the lazy brown dog"));
-        b.insert(id(3), hash_tokens("quick silver fox jumps"));
+        b.insert_id(id(1), hash_tokens("the quick brown fox"));
+        b.insert_id(id(2), hash_tokens("the lazy brown dog"));
+        b.insert_id(id(3), hash_tokens("quick silver fox jumps"));
         b.build()
     }
 
@@ -1144,9 +1170,9 @@ mod tests {
         // different BM25 scores and the score-filter
         // meaningfully distinguishes them.
         let mut b = BM25Builder::new();
-        b.insert(id(1), hash_tokens("fox"));
-        b.insert(id(2), hash_tokens("quick brown fox jumps high today"));
-        b.insert(id(3), hash_tokens("lazy dog"));
+        b.insert_id(id(1), hash_tokens("fox"));
+        b.insert_id(id(2), hash_tokens("quick brown fox jumps high today"));
+        b.insert_id(id(3), hash_tokens("lazy dog"));
         let idx = b.build();
 
         let mut ctx = triblespace::core::query::VariableContext::new();
@@ -1157,12 +1183,12 @@ mod tests {
 
         let doc1_score = idx
             .query_term(&term)
-            .find(|(d, _)| *d == id(1))
+            .find(|(d, _)| *d == id_key(1))
             .map(|(_, s)| s)
             .unwrap();
         let doc2_score = idx
             .query_term(&term)
-            .find(|(d, _)| *d == id(2))
+            .find(|(d, _)| *d == id_key(2))
             .map(|(_, s)| s)
             .unwrap();
         assert!(

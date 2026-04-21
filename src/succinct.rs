@@ -1258,14 +1258,14 @@ impl SuccinctHNSWIndex {
 /// use triblespace_search::tokens::hash_tokens;
 ///
 /// let mut b = BM25Builder::new();
-/// b.insert(Id::new([1; 16]).unwrap(), hash_tokens("the quick brown fox"));
-/// b.insert(Id::new([2; 16]).unwrap(), hash_tokens("the lazy brown dog"));
-/// b.insert(Id::new([3; 16]).unwrap(), hash_tokens("quick silver fox"));
+/// b.insert_id(Id::new([1; 16]).unwrap(), hash_tokens("the quick brown fox"));
+/// b.insert_id(Id::new([2; 16]).unwrap(), hash_tokens("the lazy brown dog"));
+/// b.insert_id(Id::new([3; 16]).unwrap(), hash_tokens("quick silver fox"));
 /// let idx = SuccinctBM25Index::from_naive(&b.build()).unwrap();
 ///
 /// // Same query API as BM25Index — "fox" hits two docs.
 /// let fox = hash_tokens("fox")[0];
-/// let hits: Vec<_> = idx.query_term(&fox).collect();
+/// let hits: Vec<_> = idx.query_term_ids(&fox).collect();
 /// assert_eq!(hits.len(), 2);
 ///
 /// // Persist via to_bytes / ToBlob<SuccinctBM25Blob> for pile storage.
@@ -1274,7 +1274,7 @@ impl SuccinctHNSWIndex {
 /// ```
 #[derive(Debug)]
 pub struct SuccinctBM25Index {
-    doc_ids: FixedBytesTable<16>,
+    keys: FixedBytesTable<32>,
     doc_lens: SuccinctDocLens,
     terms: FixedBytesTable<32>,
     postings: SuccinctPostings,
@@ -1288,12 +1288,11 @@ impl SuccinctBM25Index {
     /// The postings + per-doc counts shrink; scores stay as raw
     /// f32 for now.
     pub fn from_naive(idx: &BM25Index) -> Result<Self, SuccinctDocLensError> {
-        // doc_ids: flat 16-byte rows.
-        let doc_id_rows: Vec<[u8; 16]> = (0..idx.doc_count())
-            .map(|i| *idx.doc_ids()[i].as_ref())
-            .collect();
-        let doc_ids_bytes = FixedBytesTable::<16>::build(&doc_id_rows);
-        let doc_ids = FixedBytesTable::<16>::from_bytes(doc_ids_bytes, doc_id_rows.len())?;
+        // keys: flat 32-byte rows (any triblespace RawValue —
+        // most commonly Value<GenId> for entity-keyed indexes).
+        let key_rows: Vec<[u8; 32]> = idx.keys().to_vec();
+        let keys_bytes = FixedBytesTable::<32>::build(&key_rows);
+        let keys = FixedBytesTable::<32>::from_bytes(keys_bytes, key_rows.len())?;
 
         // terms: flat 32-byte rows, sorted (idx.terms() guarantees).
         let term_rows: Vec<[u8; 32]> = idx.terms_slice().to_vec();
@@ -1313,7 +1312,7 @@ impl SuccinctBM25Index {
         let postings = SuccinctPostings::from_bytes(postings_meta, postings_bytes)?;
 
         Ok(Self {
-            doc_ids,
+            keys,
             doc_lens,
             terms,
             postings,
@@ -1325,7 +1324,7 @@ impl SuccinctBM25Index {
 
     /// Number of documents.
     pub fn doc_count(&self) -> usize {
-        self.doc_ids.len()
+        self.keys.len()
     }
 
     /// Number of distinct terms.
@@ -1391,18 +1390,19 @@ impl SuccinctBM25Index {
         crate::constraint::BM25ScoredPostings::new(self, doc, score, term)
     }
 
-    /// Iterate `(doc_id, score)` postings for `term`. Empty if
-    /// the term is absent.
-    pub fn query_term<'a>(&'a self, term: &RawValue) -> Box<dyn Iterator<Item = (Id, f32)> + 'a> {
+    /// Iterate `(key, score)` postings for `term`. Empty if the
+    /// term is absent. Keys are the 32-byte `RawValue`s the
+    /// caller inserted — any `ValueSchema`, most commonly
+    /// [`GenId`].
+    pub fn query_term<'a>(
+        &'a self,
+        term: &RawValue,
+    ) -> Box<dyn Iterator<Item = (RawValue, f32)> + 'a> {
         match self.terms.binary_search(term) {
             Ok(t) => match self.postings.postings_for(t) {
                 Some(iter) => Box::new(iter.map(move |(doc_idx, score)| {
-                    let raw = self
-                        .doc_ids
-                        .get(doc_idx as usize)
-                        .expect("doc_idx in range");
-                    let id = Id::new(*raw).expect("non-nil doc_id");
-                    (id, score)
+                    let key = self.keys.get(doc_idx as usize).expect("doc_idx in range");
+                    (*key, score)
                 })),
                 None => Box::new(std::iter::empty()),
             },
@@ -1410,20 +1410,56 @@ impl SuccinctBM25Index {
         }
     }
 
+    /// Convenience: [`query_term`] decoded as `(Id, score)`
+    /// pairs for entity-keyed (`GenId`) indexes. Mirrors
+    /// [`crate::bm25::BM25Index::query_term_ids`].
+    ///
+    /// [`query_term`]: Self::query_term
+    pub fn query_term_ids<'a>(
+        &'a self,
+        term: &RawValue,
+    ) -> impl Iterator<Item = (Id, f32)> + 'a {
+        self.query_term(term).filter_map(|(raw, score)| {
+            if raw[0..16] != [0u8; 16] {
+                return None;
+            }
+            let id_bytes: [u8; 16] = raw[16..32].try_into().ok()?;
+            Id::new(id_bytes).map(|id| (id, score))
+        })
+    }
+
+    /// Convenience: [`query_multi`] decoded as `(Id, score)`
+    /// pairs for entity-keyed indexes.
+    ///
+    /// [`query_multi`]: Self::query_multi
+    pub fn query_multi_ids(&self, terms: &[RawValue]) -> Vec<(Id, f32)> {
+        self.query_multi(terms)
+            .into_iter()
+            .filter_map(|(raw, s)| {
+                if raw[0..16] != [0u8; 16] {
+                    return None;
+                }
+                let id_bytes: [u8; 16] = raw[16..32].try_into().ok()?;
+                Id::new(id_bytes).map(|id| (id, s))
+            })
+            .collect()
+    }
+
     /// Score a multi-term query as the sum of per-term BM25
     /// weights (standard OR-like bag-of-words). Mirror of
     /// [`crate::bm25::BM25Index::query_multi`] for the succinct
-    /// view. Returned `(doc_id, score)` pairs are sorted
-    /// descending by score; no top-k truncation — caller slices
-    /// what they need.
-    pub fn query_multi(&self, terms: &[RawValue]) -> Vec<(Id, f32)> {
-        let mut acc: std::collections::HashMap<Id, f32> = std::collections::HashMap::new();
+    /// view. Returned `(key, score)` pairs are sorted descending
+    /// by score; no top-k truncation — caller slices what they
+    /// need.
+    pub fn query_multi(&self, terms: &[RawValue]) -> Vec<(RawValue, f32)> {
+        let mut acc: std::collections::HashMap<RawValue, f32> =
+            std::collections::HashMap::new();
         for term in terms {
-            for (doc, score) in self.query_term(term) {
-                *acc.entry(doc).or_insert(0.0) += score;
+            for (key, score) in self.query_term(term) {
+                *acc.entry(key).or_insert(0.0) += score;
             }
         }
-        let mut out: Vec<(Id, f32)> = acc.into_iter().collect();
+        let mut out: Vec<(RawValue, f32)> = acc.into_iter().collect();
         out.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         out
     }
@@ -1432,7 +1468,7 @@ impl SuccinctBM25Index {
     ///
     /// ```text
     /// [header         ] SUCCINCT_HEADER_LEN B
-    /// [doc_ids        ] n_docs × 16 B
+    /// [keys           ] n_docs × 32 B
     /// [terms          ] n_terms × 32 B
     /// [doc_lens_bytes ] variable (CompactVector body)
     /// [postings_bytes ] variable (3 × CompactVector in one ByteArea:
@@ -1451,8 +1487,8 @@ impl SuccinctBM25Index {
         // Capture component metas.
         let doc_lens_meta: CompactVectorMetaOnDisk = self.doc_lens.inner.metadata().into();
 
-        let doc_ids_bytes: Vec<u8> = (0..self.doc_count())
-            .flat_map(|i| self.doc_ids.get(i).copied().unwrap_or([0u8; 16]))
+        let keys_bytes: Vec<u8> = (0..self.doc_count())
+            .flat_map(|i| self.keys.get(i).copied().unwrap_or([0u8; 32]))
             .collect();
         let terms_bytes: Vec<u8> = (0..self.term_count())
             .flat_map(|i| self.terms.get(i).copied().unwrap_or([0u8; 32]))
@@ -1472,9 +1508,9 @@ impl SuccinctBM25Index {
         let postings_offsets_meta: CompactVectorMetaOnDisk = postings_meta.offsets.into();
         let postings_scores_meta: CompactVectorMetaOnDisk = postings_meta.scores.into();
 
-        let doc_ids_off = 0u64;
-        let doc_ids_len = doc_ids_bytes.len() as u64;
-        let terms_off = doc_ids_off + doc_ids_len;
+        let keys_off = 0u64;
+        let keys_len = keys_bytes.len() as u64;
+        let terms_off = keys_off + keys_len;
         let terms_len = terms_bytes.len() as u64;
         let doc_lens_off = terms_off + terms_len;
         let doc_lens_len = doc_lens_region.len() as u64;
@@ -1499,8 +1535,8 @@ impl SuccinctBM25Index {
         buf.extend_from_slice(postings_doc_idx_meta.as_bytes()); // 32
         buf.extend_from_slice(postings_offsets_meta.as_bytes()); // 32
         buf.extend_from_slice(postings_scores_meta.as_bytes()); // 32
-        buf.extend_from_slice(&doc_ids_off.to_le_bytes()); // 8
-        buf.extend_from_slice(&doc_ids_len.to_le_bytes());
+        buf.extend_from_slice(&keys_off.to_le_bytes()); // 8
+        buf.extend_from_slice(&keys_len.to_le_bytes());
         buf.extend_from_slice(&terms_off.to_le_bytes());
         buf.extend_from_slice(&terms_len.to_le_bytes());
         buf.extend_from_slice(&doc_lens_off.to_le_bytes());
@@ -1510,7 +1546,7 @@ impl SuccinctBM25Index {
         debug_assert_eq!(buf.len(), SUCCINCT_HEADER_LEN);
 
         // ── body ──────────────────────────────────────────────
-        buf.extend_from_slice(&doc_ids_bytes);
+        buf.extend_from_slice(&keys_bytes);
         buf.extend_from_slice(&terms_bytes);
         buf.extend_from_slice(&doc_lens_region);
         buf.extend_from_slice(&postings_region);
@@ -1553,8 +1589,8 @@ impl SuccinctBM25Index {
             .to_jerky();
 
         let read_u64 = |off: usize| u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
-        let doc_ids_off = read_u64(172) as usize;
-        let doc_ids_len = read_u64(180) as usize;
+        let keys_off = read_u64(172) as usize;
+        let keys_len = read_u64(180) as usize;
         let terms_off = read_u64(188) as usize;
         let terms_len = read_u64(196) as usize;
         let doc_lens_off = read_u64(204) as usize;
@@ -1572,19 +1608,19 @@ impl SuccinctBM25Index {
                 Ok(())
             }
         };
-        check(doc_ids_off + doc_ids_len, "doc_ids")?;
+        check(keys_off + keys_len, "keys")?;
         check(terms_off + terms_len, "terms")?;
         check(doc_lens_off + doc_lens_len, "doc_lens")?;
         check(postings_off + postings_len, "postings")?;
 
         let body_bytes = Bytes::from_source(body.to_vec());
-        let doc_ids_bytes = body_bytes.slice(doc_ids_off..doc_ids_off + doc_ids_len);
+        let keys_bytes = body_bytes.slice(keys_off..keys_off + keys_len);
         let terms_bytes = body_bytes.slice(terms_off..terms_off + terms_len);
         let doc_lens_bytes = body_bytes.slice(doc_lens_off..doc_lens_off + doc_lens_len);
         let postings_bytes = body_bytes.slice(postings_off..postings_off + postings_len);
 
-        let doc_ids = FixedBytesTable::<16>::from_bytes(doc_ids_bytes, n_docs)
-            .map_err(|_| SuccinctLoadError::TruncatedSection("doc_ids"))?;
+        let keys = FixedBytesTable::<32>::from_bytes(keys_bytes, n_docs)
+            .map_err(|_| SuccinctLoadError::TruncatedSection("keys"))?;
         let terms = FixedBytesTable::<32>::from_bytes(terms_bytes, n_terms)
             .map_err(|_| SuccinctLoadError::TruncatedSection("terms"))?;
         let doc_lens = SuccinctDocLens::from_bytes(doc_lens_meta, doc_lens_bytes)
@@ -1600,7 +1636,7 @@ impl SuccinctBM25Index {
             .map_err(|_| SuccinctLoadError::TruncatedSection("postings"))?;
 
         Ok(Self {
-            doc_ids,
+            keys,
             doc_lens,
             terms,
             postings,
@@ -1908,10 +1944,10 @@ mod tests {
         }
 
         let mut b = BM25Builder::new();
-        b.insert(iid(1), hash_tokens("the quick brown fox"));
-        b.insert(iid(2), hash_tokens("the lazy brown dog"));
-        b.insert(iid(3), hash_tokens("quick silver fox jumps"));
-        b.insert(iid(4), hash_tokens("unrelated filler content"));
+        b.insert_id(iid(1), hash_tokens("the quick brown fox"));
+        b.insert_id(iid(2), hash_tokens("the lazy brown dog"));
+        b.insert_id(iid(3), hash_tokens("quick silver fox jumps"));
+        b.insert_id(iid(4), hash_tokens("unrelated filler content"));
         let naive = b.build();
         let succinct = SuccinctBM25Index::from_naive(&naive).unwrap();
 
@@ -1972,12 +2008,12 @@ mod tests {
             Id::new([byte; 16]).unwrap()
         }
         let mut b = BM25Builder::new();
-        b.insert(iid(1), hash_tokens("quick fox"));
-        b.insert(
+        b.insert_id(iid(1), hash_tokens("quick fox"));
+        b.insert_id(
             iid(2),
             hash_tokens("quick red rapid fox jumps high over fences"),
         );
-        b.insert(iid(3), hash_tokens("slow brown dog"));
+        b.insert_id(iid(3), hash_tokens("slow brown dog"));
         let naive = b.build();
         let succinct = SuccinctBM25Index::from_naive(&naive).unwrap();
 
@@ -2006,10 +2042,10 @@ mod tests {
             Id::new([byte; 16]).unwrap()
         }
         let mut b = BM25Builder::new().k1(1.4).b(0.72);
-        b.insert(iid(1), hash_tokens("the quick brown fox"));
-        b.insert(iid(2), hash_tokens("the lazy brown dog"));
-        b.insert(iid(3), hash_tokens("quick silver fox jumps"));
-        b.insert(iid(4), hash_tokens("completely unrelated filler content"));
+        b.insert_id(iid(1), hash_tokens("the quick brown fox"));
+        b.insert_id(iid(2), hash_tokens("the lazy brown dog"));
+        b.insert_id(iid(3), hash_tokens("quick silver fox jumps"));
+        b.insert_id(iid(4), hash_tokens("completely unrelated filler content"));
         SuccinctBM25Index::from_naive(&b.build()).unwrap()
     }
 
@@ -2350,7 +2386,7 @@ mod tests {
                 if i == 0 { 1 } else { 0xaa },
             ])
             .unwrap();
-            b.insert(id, hash_tokens(&text));
+            b.insert_id(id, hash_tokens(&text));
         }
         let naive = b.build();
         let succinct = SuccinctBM25Index::from_naive(&naive).unwrap();

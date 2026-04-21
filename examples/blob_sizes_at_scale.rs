@@ -55,7 +55,7 @@ fn bench(n_docs: usize, vocab: usize, doc_len: usize) {
     let fresh_builder = || {
         let mut b = BM25Builder::new();
         for (id_u64, doc) in &docs {
-            b.insert(id_from_u64(*id_u64), hash_tokens(doc));
+            b.insert_id(id_from_u64(*id_u64), hash_tokens(doc));
         }
         b
     };

@@ -497,9 +497,9 @@ mod tests {
             v
         }
         let mut b = BM25Builder::new();
-        b.insert(iid(1), both("the quick brown fox"));
-        b.insert(iid(2), both("fox fight club"));
-        b.insert(iid(3), both("quick silver brown fox")); // `quick` + `brown` but NOT adjacent
+        b.insert_id(iid(1), both("the quick brown fox"));
+        b.insert_id(iid(2), both("fox fight club"));
+        b.insert_id(iid(3), both("quick silver brown fox")); // `quick` + `brown` but NOT adjacent
         let idx = b.build();
 
         // Query "quick brown" as a bigram: only doc 1 contains
@@ -508,7 +508,10 @@ mod tests {
         assert_eq!(phrase.len(), 1);
         let hits: Vec<_> = idx.query_term(&phrase[0]).collect();
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].0, iid(1));
+        // Keys come back as 32-byte RawValue (Value<GenId> form).
+        let mut key1 = [0u8; 32];
+        key1[16..32].copy_from_slice(AsRef::<[u8; 16]>::as_ref(&iid(1)));
+        assert_eq!(hits[0].0, key1);
     }
 
     #[test]
