@@ -169,3 +169,49 @@ if (observed - expected).abs() <= tol { /* match */ }
   in HNSW (`SuccinctHNSWIndex`) only once the caller has an
   embedding schema they're willing to commit to — the
   embeddings are the caller's data, not this crate's.
+
+## Schema-rotation migrations
+
+`triblespace-search` identifies each blob format by a
+`BlobSchema` `ConstId`. A breaking byte-layout change rotates
+that ID. If your crate has minted an attribute whose value
+type references one of our schemas — e.g.
+
+```rust
+struct WikiBm25Handle;
+impl ConstId for WikiBm25Handle { const ID: Id = id_hex!("…"); }
+// value type: Handle<Blake3, SuccinctBM25Blob>
+```
+
+then rolling forward to a new version of this crate means:
+
+1. **Types re-derive automatically.** `Handle<Blake3,
+   SuccinctBM25Blob>::ID` cascades from our new schema id
+   on recompile — Rust's `ConstId` derivation for `Handle`
+   is `hash(H::ID, T::ID)`. The type system catches
+   callers that try to mix old-schema handles with
+   new-schema readers at compile time.
+
+2. **Stored triples do not.** Triples you already wrote
+   under the old attribute still point at *old-format*
+   blobs. The old attribute now implicitly claims to hold
+   new-format blobs (semantically — the on-disk triple is
+   unchanged), so those triples are effectively orphaned:
+   readable only by a binary pinned to the old crate
+   version. Re-ingest is the clean path.
+
+Migration recipe for any attribute that holds a handle to
+one of our schemas:
+
+1. `trible genid` → new attribute id, e.g. `wiki::bm25-v2`.
+2. Rebuild the index against the new schema, `put` the
+   blob, write the handle under the new attribute.
+3. Transition readers to the new attribute. Once no reader
+   references the old attribute, `pile keep` will sweep
+   the old blobs the next time you consolidate.
+
+Attributes whose value type is a plain `ShortString`,
+`LongString`, `GenId`, etc. (anything not parameterized on a
+crate-owned `BlobSchema`) are unaffected by our schema
+rotations — only handles to *our* blob types transitively
+depend on our IDs.
