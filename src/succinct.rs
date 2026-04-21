@@ -38,7 +38,10 @@
 use anybytes::{ByteArea, Bytes};
 use jerky::int_vectors::compact_vector::CompactVectorMeta;
 use jerky::int_vectors::{CompactVector, CompactVectorBuilder};
+use triblespace::core::blob::{Blob, BlobSchema, ToBlob, TryFromBlob};
 use triblespace::core::id::Id;
+use triblespace::core::id_hex;
+use triblespace::core::metadata::ConstId;
 use triblespace::core::value::RawValue;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -858,6 +861,42 @@ impl std::fmt::Display for SuccinctLoadError {
 
 impl std::error::Error for SuccinctLoadError {}
 
+/// Content-addressed [`BlobSchema`] marker for the real succinct
+/// BM25 blob format (SB25 / 212 B header + bit-packed body).
+///
+/// Schema id minted via `trible genid`:
+/// `68C03764D04D05DF65E49589FBBA1441`. Distinct from
+/// [`crate::bm25::SuccinctBM25Index`] (the legacy marker that
+/// currently wraps the naive format during the succinct
+/// transition).
+pub enum SuccinctBM25Blob {}
+
+impl ConstId for SuccinctBM25Blob {
+    const ID: Id = id_hex!("68C03764D04D05DF65E49589FBBA1441");
+}
+
+impl BlobSchema for SuccinctBM25Blob {}
+
+impl ToBlob<SuccinctBM25Blob> for &SuccinctBM25Index {
+    fn to_blob(self) -> Blob<SuccinctBM25Blob> {
+        Blob::new(Bytes::from_source(self.to_bytes()))
+    }
+}
+
+impl ToBlob<SuccinctBM25Blob> for SuccinctBM25Index {
+    fn to_blob(self) -> Blob<SuccinctBM25Blob> {
+        (&self).to_blob()
+    }
+}
+
+impl TryFromBlob<SuccinctBM25Blob> for SuccinctBM25Index {
+    type Error = SuccinctLoadError;
+
+    fn try_from_blob(blob: Blob<SuccinctBM25Blob>) -> Result<Self, Self::Error> {
+        SuccinctBM25Index::try_from_bytes(blob.bytes.as_ref())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1165,6 +1204,17 @@ mod tests {
         let truncated = &bytes[..bytes.len() - 2];
         let err = SuccinctBM25Index::try_from_bytes(truncated).unwrap_err();
         assert!(matches!(err, SuccinctLoadError::TruncatedSection(_)));
+    }
+
+    #[test]
+    fn succinct_bm25_blob_schema_round_trip() {
+        use triblespace::core::blob::{ToBlob, TryFromBlob};
+        let original = build_succinct_sample();
+        let blob: triblespace::core::blob::Blob<SuccinctBM25Blob> =
+            (&original).to_blob();
+        let reloaded = SuccinctBM25Index::try_from_blob(blob).expect("valid blob");
+        assert_eq!(reloaded.doc_count(), original.doc_count());
+        assert_eq!(reloaded.term_count(), original.term_count());
     }
 
     #[test]
