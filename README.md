@@ -66,10 +66,13 @@ naive-then-succinct implementation order is the open work item.
 * **`schemas::F32LE`**: `ValueSchema` for packing `f32` scores
   into 32-byte `Value<F32LE>`s. Used by the scored BM25
   constraint.
-* Two runnable examples (`cargo run --example query_demo`,
-  `cargo run --example compose_bm25_and_pattern`) covering
-  text search, multi-term OR-queries, value-as-term citation
-  search, and BM25 + `pattern!` composition in one `find!`.
+* Three runnable examples:
+  - `query_demo` — text search, multi-term OR, value-as-term
+    citation search.
+  - `compose_bm25_and_pattern` — BM25 + `pattern!` over a
+    `TribleSet` in one `find!`.
+  - `compose_hnsw_and_pattern` — vector similarity + `pattern!`
+    composition.
 * 145 tests across unit, scale (1k-doc equivalence), engine-
   integration (`IntersectionConstraint` joins + `find!` /
   `pattern!` composition + `find!` over both succinct paths),
