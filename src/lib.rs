@@ -21,6 +21,39 @@
 //! (branch metadata, commit metadata, a plain trible, or an
 //! in-memory cache).
 //!
+//! # Quickstart
+//!
+//! ```
+//! use triblespace::core::and;
+//! use triblespace::core::find;
+//! use triblespace::core::id::Id;
+//!
+//! use triblespace_search::bm25::BM25Builder;
+//! use triblespace_search::succinct::SuccinctBM25Index;
+//! use triblespace_search::tokens::hash_tokens;
+//!
+//! // 1. Build an in-memory index.
+//! let mut b = BM25Builder::new();
+//! b.insert(Id::new([1; 16]).unwrap(), hash_tokens("the quick brown fox"));
+//! b.insert(Id::new([2; 16]).unwrap(), hash_tokens("the lazy brown dog"));
+//! b.insert(Id::new([3; 16]).unwrap(), hash_tokens("quick silver fox"));
+//!
+//! // 2. Flip to the succinct form for persistence + smaller bytes.
+//! let idx = SuccinctBM25Index::from_naive(&b.build()).unwrap();
+//!
+//! // 3. Query through the normal engine — the constraint
+//! //    plugs into `find!` / `and!` / `pattern!` unchanged.
+//! let fox = hash_tokens("fox")[0];
+//! let docs: Vec<(Id,)> = find!(
+//!     (doc: Id),
+//!     idx.docs_containing(doc, fox)
+//! ).collect();
+//! assert_eq!(docs.len(), 2);
+//! ```
+//!
+//! See the `examples/` directory for TribleSet composition,
+//! vector similarity, blob-size benchmarks, and phrase search.
+//!
 //! [`jerky`]: https://docs.rs/jerky
 
 pub mod bm25;
