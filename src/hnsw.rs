@@ -350,8 +350,10 @@ impl HNSWBuilder {
         let mut curr_dist = cosine_dist(q, &self.nodes[curr as usize].vector);
         loop {
             let mut changed = false;
-            let neigh =
-                &self.nodes[curr as usize].neighbors[layer as usize];
+            let node = &self.nodes[curr as usize];
+            let Some(neigh) = node.neighbors.get(layer as usize) else {
+                return curr;
+            };
             for &n in neigh {
                 let d = cosine_dist(q, &self.nodes[n as usize].vector);
                 if d < curr_dist {
@@ -381,14 +383,11 @@ impl HNSWBuilder {
             std::collections::HashSet::new();
         visited.insert(entry);
         let d0 = cosine_dist(q, &self.nodes[entry as usize].vector);
-        // `candidates` is a min-heap by distance.
         let mut candidates: BinaryHeap<MinDist> = BinaryHeap::new();
         candidates.push(MinDist {
             idx: entry,
             dist: d0,
         });
-        // `results` is a max-heap by distance (so we can evict
-        // the farthest when we overflow `ef`).
         let mut results: BinaryHeap<MaxDist> = BinaryHeap::new();
         results.push(MaxDist {
             idx: entry,
@@ -399,8 +398,10 @@ impl HNSWBuilder {
             if c.dist > farthest && results.len() >= ef {
                 break;
             }
-            let neigh =
-                &self.nodes[c.idx as usize].neighbors[layer as usize];
+            let node = &self.nodes[c.idx as usize];
+            let Some(neigh) = node.neighbors.get(layer as usize) else {
+                continue;
+            };
             for &n in neigh {
                 if !visited.insert(n) {
                     continue;
@@ -773,8 +774,13 @@ impl HNSWIndex {
         let mut curr_dist = cosine_dist(q, &self.nodes[curr as usize].vector);
         loop {
             let mut changed = false;
-            let neigh =
-                &self.nodes[curr as usize].neighbors[layer as usize];
+            // Defensive bounds: a later insert can leave a stub
+            // entry_point that never received layer-L neighbour
+            // lists yet. Bail out cleanly instead of panicking.
+            let node = &self.nodes[curr as usize];
+            let Some(neigh) = node.neighbors.get(layer as usize) else {
+                return curr;
+            };
             for &n in neigh {
                 let d = cosine_dist(q, &self.nodes[n as usize].vector);
                 if d < curr_dist {
@@ -816,8 +822,15 @@ impl HNSWIndex {
             if c.dist > farthest && results.len() >= ef {
                 break;
             }
-            let neigh =
-                &self.nodes[c.idx as usize].neighbors[layer as usize];
+            // Same defensive skip — a neighbour recorded here
+            // (bidirectionally from an insert pass) might not
+            // yet have its own layer-N list populated when a
+            // later insert promoted it to a new top layer but
+            // didn't run its own connect pass at that layer.
+            let node = &self.nodes[c.idx as usize];
+            let Some(neigh) = node.neighbors.get(layer as usize) else {
+                continue;
+            };
             for &n in neigh {
                 if !visited.insert(n) {
                     continue;

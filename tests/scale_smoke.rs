@@ -9,7 +9,7 @@
 use triblespace::core::id::{Id, RawId};
 
 use triblespace_search::bm25::{BM25Builder, BM25Index};
-use triblespace_search::hnsw::{FlatBuilder, FlatIndex};
+use triblespace_search::hnsw::{FlatBuilder, FlatIndex, HNSWBuilder, HNSWIndex};
 use triblespace_search::tokens::hash_tokens;
 
 /// Small pseudo-RNG (SplitMix64) — deterministic, no extra deps.
@@ -103,6 +103,72 @@ fn bm25_1k_docs_multi_term_ranks_sanely() {
     // Needle doc should be the top hit since both rare tokens
     // land only there.
     assert_eq!(ranked[0].0, needle_id);
+}
+
+#[test]
+fn hnsw_1k_vectors_recall_against_flat() {
+    // Build the same 1k 32-dim vectors into both Flat (ground
+    // truth) and HNSW, then check HNSW's top-10 recalls at least
+    // 70% of Flat's top-10 across several queries. Plus confirm
+    // the HNSW blob round-trips cleanly.
+    use std::collections::HashSet;
+
+    const N_DOCS: usize = 1_000;
+    const DIM: usize = 32;
+
+    let mut rng = SplitMix64(0xFACE_FEED);
+    let mut flat_b = FlatBuilder::new(DIM);
+    let mut hnsw_b = HNSWBuilder::new(DIM).with_seed(7);
+    for i in 0..N_DOCS {
+        let vec: Vec<f32> = (0..DIM)
+            .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
+            .collect();
+        let doc = id_from_u64((i + 1) as u64);
+        flat_b.insert(doc, vec.clone()).unwrap();
+        hnsw_b.insert(doc, vec).unwrap();
+    }
+    let flat = flat_b.build();
+    let hnsw = hnsw_b.build();
+
+    let mut total_overlap = 0;
+    let mut total_k = 0;
+    for _ in 0..5 {
+        let q: Vec<f32> = (0..DIM)
+            .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
+            .collect();
+        let truth: HashSet<_> =
+            flat.similar(&q, 10).into_iter().map(|(d, _)| d).collect();
+        let got: HashSet<_> = hnsw
+            .similar(&q, 10, Some(100))
+            .into_iter()
+            .map(|(d, _)| d)
+            .collect();
+        total_overlap += truth.intersection(&got).count();
+        total_k += 10;
+    }
+    let recall = total_overlap as f32 / total_k as f32;
+    assert!(
+        recall >= 0.7,
+        "HNSW 1k-doc recall {recall:.2} below 0.7 threshold"
+    );
+
+    // Round-trip the HNSW blob end-to-end.
+    let bytes = hnsw.to_bytes();
+    let reloaded = HNSWIndex::try_from_bytes(&bytes).expect("valid blob");
+    let q: Vec<f32> = (0..DIM)
+        .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
+        .collect();
+    let orig_ids: HashSet<_> = hnsw
+        .similar(&q, 5, Some(50))
+        .into_iter()
+        .map(|(d, _)| d)
+        .collect();
+    let loaded_ids: HashSet<_> = reloaded
+        .similar(&q, 5, Some(50))
+        .into_iter()
+        .map(|(d, _)| d)
+        .collect();
+    assert_eq!(orig_ids, loaded_ids);
 }
 
 #[test]
