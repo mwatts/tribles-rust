@@ -861,6 +861,186 @@ impl SuccinctHNSWIndex {
         }
     }
 
+    /// Serialize to a self-contained blob. Layout:
+    ///
+    /// ```text
+    /// [header 152 B]
+    /// [doc_ids     ] n_nodes × 16 B
+    /// [vectors     ] n_nodes × dim × 4 B (f32 LE)
+    /// [graph_bytes ] variable (SuccinctGraph body)
+    /// ```
+    ///
+    /// The header carries scalar HNSW parameters, the graph's
+    /// two `CompactVectorMeta` structures, and `(offset, length)`
+    /// pairs for each body section.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let n_nodes = self.doc_count() as u64;
+        let n_layers = self.graph.n_layers() as u64;
+
+        // Re-serialize each body region so the blob owns its
+        // bytes end-to-end (the caller might have built this
+        // SuccinctHNSWIndex in-memory from a naive index).
+        let doc_id_rows: Vec<[u8; 16]> = (0..self.doc_count())
+            .map(|i| self.doc_ids.get(i).copied().unwrap_or([0u8; 16]))
+            .collect();
+        let doc_ids_bytes = FixedBytesTable::<16>::build(&doc_id_rows);
+        let doc_ids_flat: Vec<u8> = doc_ids_bytes.as_ref().to_vec();
+        let vectors_flat: Vec<u8> = self.vectors.as_ref().to_vec();
+
+        // Rebuild the graph from the current view so we get fresh
+        // bytes with offsets starting at 0 inside the region.
+        let mut layer_graph: Vec<Vec<Vec<u32>>> =
+            (0..self.graph.n_layers())
+                .map(|_| {
+                    (0..self.graph.n_nodes())
+                        .map(|_| Vec::new())
+                        .collect::<Vec<Vec<u32>>>()
+                })
+                .collect();
+        for l in 0..self.graph.n_layers() {
+            for i in 0..self.graph.n_nodes() {
+                layer_graph[l][i] = self.graph.neighbours(i, l).collect();
+            }
+        }
+        let (graph_region, graph_meta) =
+            SuccinctGraph::build(&layer_graph, self.graph.n_nodes())
+                .expect("re-serialize graph");
+        let graph_neighbours_meta: CompactVectorMetaOnDisk =
+            graph_meta.neighbours.into();
+        let graph_offsets_meta: CompactVectorMetaOnDisk = graph_meta.offsets.into();
+
+        // Section offsets inside the body (relative to end of
+        // header).
+        let doc_ids_off = 0u64;
+        let doc_ids_len = doc_ids_flat.len() as u64;
+        let vectors_off = doc_ids_off + doc_ids_len;
+        let vectors_len = vectors_flat.len() as u64;
+        let graph_off = vectors_off + vectors_len;
+        let graph_len = graph_region.len() as u64;
+
+        let body_len = graph_off + graph_len;
+        let mut buf = Vec::with_capacity(SH25_HEADER_LEN + body_len as usize);
+
+        // ── header ────────────────────────────────────────────
+        buf.extend_from_slice(&SH25_MAGIC.to_le_bytes()); // 4
+        buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes()); // 2
+        buf.extend_from_slice(&0u16.to_le_bytes()); // reserved, 2
+        buf.extend_from_slice(&(self.dim as u32).to_le_bytes()); // 4
+        buf.extend_from_slice(&self.m.to_le_bytes()); // 2
+        buf.extend_from_slice(&self.m0.to_le_bytes()); // 2
+        buf.push(self.max_level); // 1
+        buf.push(0u8); // reserved, 1
+        buf.push(self.entry_point.is_some() as u8); // 1
+        buf.push(0u8); // reserved, 1
+        let ep = self.entry_point.unwrap_or(u32::MAX);
+        buf.extend_from_slice(&ep.to_le_bytes()); // 4
+        buf.extend_from_slice(&n_nodes.to_le_bytes()); // 8
+        buf.extend_from_slice(&n_layers.to_le_bytes()); // 8
+        buf.extend_from_slice(graph_neighbours_meta.as_bytes()); // 32
+        buf.extend_from_slice(graph_offsets_meta.as_bytes()); // 32
+        buf.extend_from_slice(&doc_ids_off.to_le_bytes()); // 8
+        buf.extend_from_slice(&doc_ids_len.to_le_bytes()); // 8
+        buf.extend_from_slice(&vectors_off.to_le_bytes()); // 8
+        buf.extend_from_slice(&vectors_len.to_le_bytes()); // 8
+        buf.extend_from_slice(&graph_off.to_le_bytes()); // 8
+        buf.extend_from_slice(&graph_len.to_le_bytes()); // 8
+        debug_assert_eq!(buf.len(), SH25_HEADER_LEN);
+
+        // ── body ──────────────────────────────────────────────
+        buf.extend_from_slice(&doc_ids_flat);
+        buf.extend_from_slice(&vectors_flat);
+        buf.extend_from_slice(&graph_region);
+        buf
+    }
+
+    /// Reload from bytes previously produced by [`Self::to_bytes`].
+    pub fn try_from_bytes(bytes: &[u8]) -> Result<Self, SuccinctLoadError> {
+        if bytes.len() < SH25_HEADER_LEN {
+            return Err(SuccinctLoadError::ShortHeader);
+        }
+        let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        if magic != SH25_MAGIC {
+            return Err(SuccinctLoadError::BadMagic);
+        }
+        let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+        if version != FORMAT_VERSION {
+            return Err(SuccinctLoadError::VersionMismatch(version));
+        }
+        let dim = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let m = u16::from_le_bytes(bytes[12..14].try_into().unwrap());
+        let m0 = u16::from_le_bytes(bytes[14..16].try_into().unwrap());
+        let max_level = bytes[16];
+        let has_ep = bytes[18] != 0;
+        let ep_raw = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
+        let entry_point = if has_ep { Some(ep_raw) } else { None };
+        let n_nodes = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
+        let _n_layers = u64::from_le_bytes(bytes[32..40].try_into().unwrap()) as usize;
+
+        let graph_neighbours_meta =
+            CompactVectorMetaOnDisk::read_from_bytes(&bytes[40..72])
+                .map_err(|_| SuccinctLoadError::BadMeta("graph.neighbours"))?
+                .to_jerky();
+        let graph_offsets_meta =
+            CompactVectorMetaOnDisk::read_from_bytes(&bytes[72..104])
+                .map_err(|_| SuccinctLoadError::BadMeta("graph.offsets"))?
+                .to_jerky();
+
+        let read_u64 = |off: usize| u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
+        let doc_ids_off = read_u64(104) as usize;
+        let doc_ids_len = read_u64(112) as usize;
+        let vectors_off = read_u64(120) as usize;
+        let vectors_len = read_u64(128) as usize;
+        let graph_off = read_u64(136) as usize;
+        let graph_len = read_u64(144) as usize;
+        debug_assert_eq!(SH25_HEADER_LEN, 152);
+
+        let body_start = SH25_HEADER_LEN;
+        let body = &bytes[body_start..];
+        let check = |end: usize, name: &'static str| -> Result<(), SuccinctLoadError> {
+            if end > body.len() {
+                Err(SuccinctLoadError::TruncatedSection(name))
+            } else {
+                Ok(())
+            }
+        };
+        check(doc_ids_off + doc_ids_len, "doc_ids")?;
+        check(vectors_off + vectors_len, "vectors")?;
+        check(graph_off + graph_len, "graph")?;
+
+        let body_bytes = Bytes::from_source(body.to_vec());
+        let doc_ids_bytes = body_bytes.slice(doc_ids_off..doc_ids_off + doc_ids_len);
+        let vectors_bytes = body_bytes.slice(vectors_off..vectors_off + vectors_len);
+        let graph_bytes = body_bytes.slice(graph_off..graph_off + graph_len);
+
+        let doc_ids = FixedBytesTable::<16>::from_bytes(doc_ids_bytes, n_nodes)
+            .map_err(|_| SuccinctLoadError::TruncatedSection("doc_ids"))?;
+
+        // Validate vectors region is the right size.
+        if vectors_len != n_nodes * dim * 4 {
+            return Err(SuccinctLoadError::TruncatedSection("vectors"));
+        }
+
+        let graph_meta = SuccinctGraphMeta {
+            neighbours: graph_neighbours_meta,
+            offsets: graph_offsets_meta,
+            n_nodes: n_nodes as u64,
+            n_layers: _n_layers as u64,
+        };
+        let graph = SuccinctGraph::from_bytes(graph_meta, graph_bytes)
+            .map_err(|_| SuccinctLoadError::TruncatedSection("graph"))?;
+
+        Ok(Self {
+            dim,
+            m,
+            m0,
+            max_level,
+            entry_point,
+            doc_ids,
+            vectors: vectors_bytes,
+            graph,
+        })
+    }
+
     fn search_layer(
         &self,
         q: &[f32],
@@ -1384,6 +1564,50 @@ impl TryFromBlob<SuccinctBM25Blob> for SuccinctBM25Index {
     }
 }
 
+/// Magic header tag for SuccinctHNSWIndex blobs.
+const SH25_MAGIC: u32 = u32::from_le_bytes(*b"SH25");
+/// Header length in bytes.
+///
+/// Layout: 4 magic + 2 version + 2 reserved + 4 dim + 2 m + 2 m0
+/// + 1 max_level + 1 reserved + 1 has_entry + 1 reserved + 4
+/// entry_point + 8 n_nodes + 8 n_layers + 2 × 32 CompactVectorMeta
+/// + 6 × 8 section (offset, len) = 152.
+const SH25_HEADER_LEN: usize = 152;
+
+/// Content-addressed [`BlobSchema`] marker for the succinct
+/// HNSW blob format (SH25 / 152 B header + f32 vectors + jerky-
+/// packed graph).
+///
+/// Schema id minted via `trible genid`:
+/// `7AFE59E7F895B23F05452FF7919E12E4`.
+pub enum SuccinctHNSWBlob {}
+
+impl ConstId for SuccinctHNSWBlob {
+    const ID: Id = id_hex!("7AFE59E7F895B23F05452FF7919E12E4");
+}
+
+impl BlobSchema for SuccinctHNSWBlob {}
+
+impl ToBlob<SuccinctHNSWBlob> for &SuccinctHNSWIndex {
+    fn to_blob(self) -> Blob<SuccinctHNSWBlob> {
+        Blob::new(Bytes::from_source(self.to_bytes()))
+    }
+}
+
+impl ToBlob<SuccinctHNSWBlob> for SuccinctHNSWIndex {
+    fn to_blob(self) -> Blob<SuccinctHNSWBlob> {
+        (&self).to_blob()
+    }
+}
+
+impl TryFromBlob<SuccinctHNSWBlob> for SuccinctHNSWIndex {
+    type Error = SuccinctLoadError;
+
+    fn try_from_blob(blob: Blob<SuccinctHNSWBlob>) -> Result<Self, Self::Error> {
+        SuccinctHNSWIndex::try_from_bytes(blob.bytes.as_ref())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1823,6 +2047,105 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn build_succinct_hnsw_sample() -> SuccinctHNSWIndex {
+        use crate::hnsw::HNSWBuilder;
+        use triblespace::core::id::Id;
+        fn iid(byte: u8) -> Id {
+            Id::new([byte; 16]).unwrap()
+        }
+        let mut b = HNSWBuilder::new(4).with_seed(17);
+        for i in 1..=20u8 {
+            let f = i as f32;
+            let v = vec![f.sin(), f.cos(), (f * 0.7).sin(), (f * 0.3).cos()];
+            b.insert(iid(i), v).unwrap();
+        }
+        SuccinctHNSWIndex::from_naive(&b.build()).unwrap()
+    }
+
+    #[test]
+    fn succinct_hnsw_bytes_round_trip() {
+        let original = build_succinct_hnsw_sample();
+        let bytes = original.to_bytes();
+        let reloaded = SuccinctHNSWIndex::try_from_bytes(&bytes).expect("valid blob");
+        assert_eq!(reloaded.doc_count(), original.doc_count());
+        assert_eq!(reloaded.dim(), original.dim());
+        assert_eq!(reloaded.m(), original.m());
+        assert_eq!(reloaded.m0(), original.m0());
+        assert_eq!(reloaded.max_level(), original.max_level());
+
+        // Same query must return identical top-k on both.
+        let q = vec![0.5, -0.3, 0.7, 0.1];
+        let orig_hits = original.similar(&q, 5, None);
+        let load_hits = reloaded.similar(&q, 5, None);
+        assert_eq!(orig_hits.len(), load_hits.len());
+        for ((a_id, a_s), (b_id, b_s)) in orig_hits.iter().zip(load_hits.iter()) {
+            assert_eq!(a_id, b_id);
+            assert!(
+                (a_s - b_s).abs() < 1e-5,
+                "score {a_s} vs {b_s}"
+            );
+        }
+    }
+
+    #[test]
+    fn succinct_hnsw_empty_round_trip() {
+        use crate::hnsw::HNSWBuilder;
+        let naive = HNSWBuilder::new(3).build();
+        let idx = SuccinctHNSWIndex::from_naive(&naive).unwrap();
+        let bytes = idx.to_bytes();
+        let reloaded = SuccinctHNSWIndex::try_from_bytes(&bytes).expect("valid blob");
+        assert_eq!(reloaded.doc_count(), 0);
+        assert!(reloaded.similar(&[0.0, 0.0, 0.0], 5, None).is_empty());
+    }
+
+    #[test]
+    fn succinct_hnsw_rejects_short_header() {
+        let err = SuccinctHNSWIndex::try_from_bytes(&[0u8; 10]).unwrap_err();
+        assert_eq!(err, SuccinctLoadError::ShortHeader);
+    }
+
+    #[test]
+    fn succinct_hnsw_rejects_bad_magic() {
+        let mut bytes = build_succinct_hnsw_sample().to_bytes();
+        bytes[0] = b'X';
+        let err = SuccinctHNSWIndex::try_from_bytes(&bytes).unwrap_err();
+        assert_eq!(err, SuccinctLoadError::BadMagic);
+    }
+
+    #[test]
+    fn succinct_hnsw_rejects_bad_version() {
+        let mut bytes = build_succinct_hnsw_sample().to_bytes();
+        bytes[4] = 99;
+        let err = SuccinctHNSWIndex::try_from_bytes(&bytes).unwrap_err();
+        assert!(matches!(err, SuccinctLoadError::VersionMismatch(_)));
+    }
+
+    #[test]
+    fn succinct_hnsw_rejects_truncation() {
+        let bytes = build_succinct_hnsw_sample().to_bytes();
+        let truncated = &bytes[..bytes.len() - 2];
+        let err = SuccinctHNSWIndex::try_from_bytes(truncated).unwrap_err();
+        assert!(matches!(err, SuccinctLoadError::TruncatedSection(_)));
+    }
+
+    #[test]
+    fn succinct_hnsw_blob_schema_round_trip() {
+        use triblespace::core::blob::{ToBlob, TryFromBlob};
+        let original = build_succinct_hnsw_sample();
+        let blob: triblespace::core::blob::Blob<SuccinctHNSWBlob> =
+            (&original).to_blob();
+        let reloaded = SuccinctHNSWIndex::try_from_blob(blob).expect("valid blob");
+        assert_eq!(reloaded.doc_count(), original.doc_count());
+        assert_eq!(reloaded.dim(), original.dim());
+    }
+
+    #[test]
+    fn succinct_hnsw_blob_is_deterministic() {
+        let a = build_succinct_hnsw_sample().to_bytes();
+        let b = build_succinct_hnsw_sample().to_bytes();
+        assert_eq!(a, b);
     }
 
     #[test]
