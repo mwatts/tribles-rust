@@ -329,58 +329,94 @@ impl<const N: usize> FixedBytesTable<N> {
 
 /// Per-term posting lists backed by jerky primitives.
 ///
-/// Splits into two zero-copy regions:
-/// - **`idx_bytes`** — carries the jerky `CompactVector`s for
-///   `doc_idx` (per-posting document index, width
-///   `ceil(log2(n_docs+1))`) and `offsets` (per-term cumulative
-///   offset, width `ceil(log2(total+1))`). Shared `ByteArea`
-///   means both load from the same frozen bytes.
-/// - **`score_bytes`** — flat little-endian f32 scores, one per
-///   posting in the same order as `doc_idx`. Kept separate (and
-///   uncompressed) for now; a quantized variant is a future
-///   optimization.
+/// Three [`CompactVector`]s sharing one [`anybytes::ByteArea`]:
+/// - `doc_idx`: per-posting document index, width
+///   `ceil(log2(n_docs + 1))`.
+/// - `offsets`: per-term cumulative offsets into `doc_idx`, width
+///   `ceil(log2(total + 1))`.
+/// - `scores`: u16-quantized score bucket per posting, width 16.
 ///
-/// [`build`] returns both `Bytes` plus the [`SuccinctPostingsMeta`]
-/// needed to rehydrate. The caller decides how the two regions
-/// land in the final blob (typically: record their offsets +
-/// lengths in the blob header, concatenate in the body).
+/// Quantization: each original f32 score is mapped to a u16
+/// bucket via `q = round(s / max_score * 65535)`, and dequantized
+/// back to f32 via `q * max_score / 65535`. The `max_score`
+/// scalar is stored in [`SuccinctPostingsMeta`]. The
+/// half-bucket error floor is `max_score / 2 * 65535`, and the
+/// `scale_for_equality = max_score / 65534` value is what
+/// callers should use as an equality tolerance against a
+/// bound score variable.
+///
+/// [`build`] returns the combined `Bytes` plus metadata. The
+/// caller decides where it lands in the final blob.
 ///
 /// [`build`]: Self::build
 #[derive(Debug)]
 pub struct SuccinctPostings {
     doc_idx: CompactVector,
     offsets: CompactVector,
-    scores: Bytes,
+    scores: CompactVector,
+    max_score: f32,
     n_terms: usize,
 }
 
 /// Serialized layout metadata for [`SuccinctPostings`].
 #[derive(Debug, Clone, Copy)]
 pub struct SuccinctPostingsMeta {
-    /// Meta for the `doc_idx` CompactVector (carved out of
-    /// `idx_bytes`).
+    /// Meta for the `doc_idx` CompactVector.
     pub doc_idx: CompactVectorMeta,
-    /// Meta for the `offsets` CompactVector (carved out of
-    /// `idx_bytes`).
+    /// Meta for the `offsets` CompactVector.
     pub offsets: CompactVectorMeta,
+    /// Meta for the `scores` CompactVector (u16-quantized).
+    pub scores: CompactVectorMeta,
+    /// Quantization scale: the largest original score in the
+    /// corpus. Zero when no postings or all zeros.
+    pub max_score: f32,
     /// Number of terms (== `offsets.len() - 1`).
     pub n_terms: u64,
 }
 
+/// u16 quantization width.
+const SCORE_WIDTH: usize = 16;
+/// Highest u16 value.
+const SCORE_MAX_Q: u32 = u16::MAX as u32;
+
+/// Quantize a single f32 score to its u16 bucket given the
+/// corpus `max_score`. When `max_score == 0` (empty corpus, all
+/// scores zero) the bucket is always zero.
+fn quantize_score(s: f32, max_score: f32) -> u16 {
+    if max_score <= 0.0 {
+        return 0;
+    }
+    // Clamp in case of tiny numerical drift above max_score.
+    let ratio = (s / max_score).clamp(0.0, 1.0);
+    (ratio * SCORE_MAX_Q as f32).round() as u16
+}
+
+/// Dequantize a u16 bucket back to an approximate f32 score.
+fn dequantize_score(q: u16, max_score: f32) -> f32 {
+    if max_score <= 0.0 {
+        return 0.0;
+    }
+    (q as f32 / SCORE_MAX_Q as f32) * max_score
+}
+
 impl SuccinctPostings {
     /// Serialize `lists[t]` as the posting list for term index
-    /// `t`. Returns `(idx_bytes, score_bytes, meta)`. `n_docs` is
-    /// the total document count (sets the bit width for
-    /// `doc_idx`).
+    /// `t`. Returns `(bytes, meta)`. `n_docs` is the total
+    /// document count (sets the bit width for `doc_idx`).
     pub fn build(
         lists: &[Vec<(u32, f32)>],
         n_docs: u32,
-    ) -> Result<(Bytes, Bytes, SuccinctPostingsMeta), SuccinctDocLensError> {
+    ) -> Result<(Bytes, SuccinctPostingsMeta), SuccinctDocLensError> {
         let total: usize = lists.iter().map(|l| l.len()).sum();
         let doc_idx_width = width_for(n_docs as usize + 1);
         let offsets_width = width_for(total + 1);
 
-        // ─ jerky-backed sections ─
+        // Global max score for the quantization scale.
+        let max_score = lists
+            .iter()
+            .flat_map(|l| l.iter().map(|&(_, s)| s))
+            .fold(0.0f32, |acc, s| if s > acc { s } else { acc });
+
         let mut area = ByteArea::new()?;
         let mut sections = area.sections();
 
@@ -407,47 +443,45 @@ impl SuccinctPostings {
         let offsets = offsets_b.freeze();
         let offsets_meta = offsets.metadata();
 
-        // Drop sections + writer so area can freeze.
-        drop((doc_idx, offsets));
-        drop(sections);
-        let idx_bytes = area.freeze()?;
-
-        // ─ scores: flat f32 LE buffer, separate Bytes ─
-        let mut score_buf = Vec::with_capacity(total * std::mem::size_of::<f32>());
+        let mut scores_b =
+            CompactVectorBuilder::with_capacity(total, SCORE_WIDTH, &mut sections)?;
+        let mut pos = 0usize;
         for list in lists {
-            for &(_, score) in list {
-                score_buf.extend_from_slice(&score.to_le_bytes());
+            for &(_, s) in list {
+                scores_b.set_int(pos, quantize_score(s, max_score) as usize)?;
+                pos += 1;
             }
         }
-        let score_bytes = Bytes::from_source(score_buf);
+        let scores = scores_b.freeze();
+        let scores_meta = scores.metadata();
+
+        drop((doc_idx, offsets, scores));
+        drop(sections);
+        let bytes = area.freeze()?;
 
         let meta = SuccinctPostingsMeta {
             doc_idx: doc_idx_meta,
             offsets: offsets_meta,
+            scores: scores_meta,
+            max_score,
             n_terms: lists.len() as u64,
         };
-        Ok((idx_bytes, score_bytes, meta))
+        Ok((bytes, meta))
     }
 
-    /// Reconstruct from metadata + both byte regions.
+    /// Reconstruct from metadata + the combined byte region.
     pub fn from_bytes(
         meta: SuccinctPostingsMeta,
-        idx_bytes: Bytes,
-        score_bytes: Bytes,
+        bytes: Bytes,
     ) -> Result<Self, SuccinctDocLensError> {
-        let doc_idx = CompactVector::from_bytes(meta.doc_idx, idx_bytes.clone())?;
-        let offsets = CompactVector::from_bytes(meta.offsets, idx_bytes)?;
-        let expected = doc_idx.len() * std::mem::size_of::<f32>();
-        if score_bytes.len() < expected {
-            return Err(SuccinctDocLensError::SizeMismatch {
-                bytes: score_bytes.len(),
-                expected,
-            });
-        }
+        let doc_idx = CompactVector::from_bytes(meta.doc_idx, bytes.clone())?;
+        let offsets = CompactVector::from_bytes(meta.offsets, bytes.clone())?;
+        let scores = CompactVector::from_bytes(meta.scores, bytes)?;
         Ok(Self {
             doc_idx,
             offsets,
-            scores: score_bytes,
+            scores,
+            max_score: meta.max_score,
             n_terms: meta.n_terms as usize,
         })
     }
@@ -455,6 +489,22 @@ impl SuccinctPostings {
     /// Number of terms.
     pub fn term_count(&self) -> usize {
         self.n_terms
+    }
+
+    /// Corpus max score — the quantization scale.
+    pub fn max_score(&self) -> f32 {
+        self.max_score
+    }
+
+    /// Equality tolerance callers should use when matching a
+    /// bound score variable against stored values. Derived from
+    /// the quantization bucket size: `max_score / 65534`.
+    pub fn score_tolerance(&self) -> f32 {
+        if self.max_score <= 0.0 {
+            f32::EPSILON
+        } else {
+            self.max_score / 65534.0
+        }
     }
 
     /// Number of postings for term `t`. `None` if out of range.
@@ -467,7 +517,8 @@ impl SuccinctPostings {
         Some(end - start)
     }
 
-    /// Iterate `(doc_idx, score)` postings for term `t`.
+    /// Iterate `(doc_idx, score)` postings for term `t`. Scores
+    /// are dequantized from their u16 buckets.
     pub fn postings_for(
         &self,
         t: usize,
@@ -477,13 +528,11 @@ impl SuccinctPostings {
         }
         let start = self.offsets.get_int(t)?;
         let end = self.offsets.get_int(t + 1)?;
+        let max = self.max_score;
         Some((start..end).map(move |i| {
             let idx = self.doc_idx.get_int(i).unwrap() as u32;
-            let off = i * std::mem::size_of::<f32>();
-            let score = f32::from_le_bytes(
-                self.scores[off..off + 4].try_into().unwrap(),
-            );
-            (idx, score)
+            let q = self.scores.get_int(i).unwrap() as u16;
+            (idx, dequantize_score(q, max))
         }))
     }
 }
@@ -1222,9 +1271,9 @@ impl SuccinctBM25Index {
         let lists: Vec<Vec<(u32, f32)>> = (0..idx.term_count())
             .map(|t| idx.postings_for(t).to_vec())
             .collect();
-        let (idx_bytes, score_bytes, postings_meta) =
+        let (postings_bytes, postings_meta) =
             SuccinctPostings::build(&lists, idx.doc_count() as u32)?;
-        let postings = SuccinctPostings::from_bytes(postings_meta, idx_bytes, score_bytes)?;
+        let postings = SuccinctPostings::from_bytes(postings_meta, postings_bytes)?;
 
         Ok(Self {
             doc_ids,
@@ -1265,6 +1314,13 @@ impl SuccinctBM25Index {
     /// Length of doc `i`, or `None` if out of range.
     pub fn doc_len(&self, i: usize) -> Option<u32> {
         self.doc_lens.get(i)
+    }
+
+    /// Equality tolerance for bound-score matching, derived from
+    /// the stored quantization scale. See
+    /// [`SuccinctPostings::score_tolerance`].
+    pub fn score_tolerance(&self) -> f32 {
+        self.postings.score_tolerance()
     }
 
     /// Number of documents containing `term`.
@@ -1324,61 +1380,62 @@ impl SuccinctBM25Index {
     /// Serialize to a self-contained blob. The layout:
     ///
     /// ```text
-    /// [header               ] SUCCINCT_HEADER_LEN B
-    /// [doc_ids              ] n_docs × 16 B
-    /// [terms                ] n_terms × 32 B
-    /// [doc_lens_bytes       ] variable (CompactVector body)
-    /// [postings_idx_bytes   ] variable (doc_idx + offsets CompactVectors)
-    /// [postings_score_bytes ] total_postings × 4 B
+    /// [header         ] SUCCINCT_HEADER_LEN B
+    /// [doc_ids        ] n_docs × 16 B
+    /// [terms          ] n_terms × 32 B
+    /// [doc_lens_bytes ] variable (CompactVector body)
+    /// [postings_bytes ] variable (3 × CompactVector in one ByteArea:
+    ///                            doc_idx + offsets + u16 scores)
     /// ```
     ///
-    /// The header carries all scalar parameters plus the three
-    /// `CompactVectorMeta` structures (doc_lens, postings.doc_idx,
-    /// postings.offsets) and the byte-offset/length of each
-    /// section.
+    /// The header carries the scalar params, four
+    /// `CompactVectorMeta` structures (doc_lens,
+    /// postings.doc_idx, postings.offsets, postings.scores), the
+    /// score quantization scale `max_score`, and 4 section
+    /// (offset, length) pairs.
     pub fn to_bytes(&self) -> Vec<u8> {
         let n_docs = self.doc_count() as u64;
         let n_terms = self.term_count() as u64;
 
-        // Capture component metas + bytes.
+        // Capture component metas.
         let doc_lens_meta: CompactVectorMetaOnDisk =
             self.doc_lens.inner.metadata().into();
-        let postings_doc_idx_meta: CompactVectorMetaOnDisk =
-            self.postings.doc_idx.metadata().into();
-        let postings_offsets_meta: CompactVectorMetaOnDisk =
-            self.postings.offsets.metadata().into();
 
-        // Reserve room for the header, then append sections.
         let doc_ids_bytes: Vec<u8> = (0..self.doc_count())
             .flat_map(|i| self.doc_ids.get(i).copied().unwrap_or([0u8; 16]))
             .collect();
         let terms_bytes: Vec<u8> = (0..self.term_count())
             .flat_map(|i| self.terms.get(i).copied().unwrap_or([0u8; 32]))
             .collect();
-        // doc_lens: re-serialize via ByteArea so we own the bytes.
+        // doc_lens: re-serialize so the blob owns the bytes.
         let (doc_lens_region, _) =
             SuccinctDocLens::build(&self.doc_lens.to_vec()).expect("re-serialize");
-        // postings: re-serialize via ByteArea as well. Easiest to
-        // walk self.postings and round-trip through build().
+        // postings: round-trip through build to get fresh bytes
+        // + a matching meta (handle offsets re-relative to the
+        // fresh ByteArea start).
         let lists: Vec<Vec<(u32, f32)>> = (0..self.term_count())
             .map(|t| self.postings.postings_for(t).unwrap().collect())
             .collect();
-        let (postings_idx_region, postings_score_region, _) =
-            SuccinctPostings::build(&lists, self.doc_count() as u32).expect("re-serialize");
+        let (postings_region, postings_meta) =
+            SuccinctPostings::build(&lists, self.doc_count() as u32)
+                .expect("re-serialize");
+        let postings_doc_idx_meta: CompactVectorMetaOnDisk =
+            postings_meta.doc_idx.into();
+        let postings_offsets_meta: CompactVectorMetaOnDisk =
+            postings_meta.offsets.into();
+        let postings_scores_meta: CompactVectorMetaOnDisk =
+            postings_meta.scores.into();
 
-        // Offsets inside the blob body (relative to end of header).
         let doc_ids_off = 0u64;
         let doc_ids_len = doc_ids_bytes.len() as u64;
         let terms_off = doc_ids_off + doc_ids_len;
         let terms_len = terms_bytes.len() as u64;
         let doc_lens_off = terms_off + terms_len;
         let doc_lens_len = doc_lens_region.len() as u64;
-        let postings_idx_off = doc_lens_off + doc_lens_len;
-        let postings_idx_len = postings_idx_region.len() as u64;
-        let postings_score_off = postings_idx_off + postings_idx_len;
-        let postings_score_len = postings_score_region.len() as u64;
+        let postings_off = doc_lens_off + doc_lens_len;
+        let postings_len = postings_region.len() as u64;
 
-        let body_len = postings_score_off + postings_score_len;
+        let body_len = postings_off + postings_len;
         let mut buf = Vec::with_capacity(SUCCINCT_HEADER_LEN + body_len as usize);
 
         // ── header ────────────────────────────────────────────
@@ -1388,33 +1445,29 @@ impl SuccinctBM25Index {
         buf.extend_from_slice(&self.avg_doc_len.to_le_bytes()); // 4
         buf.extend_from_slice(&self.k1.to_le_bytes()); // 4
         buf.extend_from_slice(&self.b.to_le_bytes()); // 4
+        buf.extend_from_slice(&postings_meta.max_score.to_le_bytes()); // 4
+        buf.extend_from_slice(&0u32.to_le_bytes()); // reserved, 4
         buf.extend_from_slice(&n_docs.to_le_bytes()); // 8
         buf.extend_from_slice(&n_terms.to_le_bytes()); // 8
-        // doc_lens meta (32)
-        buf.extend_from_slice(doc_lens_meta.as_bytes());
-        // postings doc_idx meta (32)
-        buf.extend_from_slice(postings_doc_idx_meta.as_bytes());
-        // postings offsets meta (32)
-        buf.extend_from_slice(postings_offsets_meta.as_bytes());
-        // section offsets/lengths (10 × 8 = 80)
-        buf.extend_from_slice(&doc_ids_off.to_le_bytes());
+        buf.extend_from_slice(doc_lens_meta.as_bytes()); // 32
+        buf.extend_from_slice(postings_doc_idx_meta.as_bytes()); // 32
+        buf.extend_from_slice(postings_offsets_meta.as_bytes()); // 32
+        buf.extend_from_slice(postings_scores_meta.as_bytes()); // 32
+        buf.extend_from_slice(&doc_ids_off.to_le_bytes()); // 8
         buf.extend_from_slice(&doc_ids_len.to_le_bytes());
         buf.extend_from_slice(&terms_off.to_le_bytes());
         buf.extend_from_slice(&terms_len.to_le_bytes());
         buf.extend_from_slice(&doc_lens_off.to_le_bytes());
         buf.extend_from_slice(&doc_lens_len.to_le_bytes());
-        buf.extend_from_slice(&postings_idx_off.to_le_bytes());
-        buf.extend_from_slice(&postings_idx_len.to_le_bytes());
-        buf.extend_from_slice(&postings_score_off.to_le_bytes());
-        buf.extend_from_slice(&postings_score_len.to_le_bytes());
+        buf.extend_from_slice(&postings_off.to_le_bytes());
+        buf.extend_from_slice(&postings_len.to_le_bytes());
         debug_assert_eq!(buf.len(), SUCCINCT_HEADER_LEN);
 
         // ── body ──────────────────────────────────────────────
         buf.extend_from_slice(&doc_ids_bytes);
         buf.extend_from_slice(&terms_bytes);
         buf.extend_from_slice(&doc_lens_region);
-        buf.extend_from_slice(&postings_idx_region);
-        buf.extend_from_slice(&postings_score_region);
+        buf.extend_from_slice(&postings_region);
         buf
     }
 
@@ -1435,34 +1488,37 @@ impl SuccinctBM25Index {
         let avg_doc_len = f32::from_le_bytes(bytes[8..12].try_into().unwrap());
         let k1 = f32::from_le_bytes(bytes[12..16].try_into().unwrap());
         let b = f32::from_le_bytes(bytes[16..20].try_into().unwrap());
-        let n_docs = u64::from_le_bytes(bytes[20..28].try_into().unwrap()) as usize;
-        let n_terms = u64::from_le_bytes(bytes[28..36].try_into().unwrap()) as usize;
+        let max_score = f32::from_le_bytes(bytes[20..24].try_into().unwrap());
+        // reserved [24..28]
+        let n_docs = u64::from_le_bytes(bytes[28..36].try_into().unwrap()) as usize;
+        let n_terms = u64::from_le_bytes(bytes[36..44].try_into().unwrap()) as usize;
 
-        let doc_lens_meta = CompactVectorMetaOnDisk::read_from_bytes(&bytes[36..68])
+        let doc_lens_meta = CompactVectorMetaOnDisk::read_from_bytes(&bytes[44..76])
             .map_err(|_| SuccinctLoadError::BadMeta("doc_lens"))?
             .to_jerky();
         let postings_doc_idx_meta =
-            CompactVectorMetaOnDisk::read_from_bytes(&bytes[68..100])
+            CompactVectorMetaOnDisk::read_from_bytes(&bytes[76..108])
                 .map_err(|_| SuccinctLoadError::BadMeta("postings_doc_idx"))?
                 .to_jerky();
         let postings_offsets_meta =
-            CompactVectorMetaOnDisk::read_from_bytes(&bytes[100..132])
+            CompactVectorMetaOnDisk::read_from_bytes(&bytes[108..140])
                 .map_err(|_| SuccinctLoadError::BadMeta("postings_offsets"))?
                 .to_jerky();
+        let postings_scores_meta =
+            CompactVectorMetaOnDisk::read_from_bytes(&bytes[140..172])
+                .map_err(|_| SuccinctLoadError::BadMeta("postings_scores"))?
+                .to_jerky();
 
-        // Section offsets/lengths.
         let read_u64 = |off: usize| u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
-        let doc_ids_off = read_u64(132) as usize;
-        let doc_ids_len = read_u64(140) as usize;
-        let terms_off = read_u64(148) as usize;
-        let terms_len = read_u64(156) as usize;
-        let doc_lens_off = read_u64(164) as usize;
-        let doc_lens_len = read_u64(172) as usize;
-        let postings_idx_off = read_u64(180) as usize;
-        let postings_idx_len = read_u64(188) as usize;
-        let postings_score_off = read_u64(196) as usize;
-        let postings_score_len = read_u64(204) as usize;
-        debug_assert_eq!(SUCCINCT_HEADER_LEN, 212);
+        let doc_ids_off = read_u64(172) as usize;
+        let doc_ids_len = read_u64(180) as usize;
+        let terms_off = read_u64(188) as usize;
+        let terms_len = read_u64(196) as usize;
+        let doc_lens_off = read_u64(204) as usize;
+        let doc_lens_len = read_u64(212) as usize;
+        let postings_off = read_u64(220) as usize;
+        let postings_len = read_u64(228) as usize;
+        debug_assert_eq!(SUCCINCT_HEADER_LEN, 236);
 
         let body_start = SUCCINCT_HEADER_LEN;
         let body = &bytes[body_start..];
@@ -1476,19 +1532,13 @@ impl SuccinctBM25Index {
         check(doc_ids_off + doc_ids_len, "doc_ids")?;
         check(terms_off + terms_len, "terms")?;
         check(doc_lens_off + doc_lens_len, "doc_lens")?;
-        check(postings_idx_off + postings_idx_len, "postings_idx")?;
-        check(postings_score_off + postings_score_len, "postings_score")?;
+        check(postings_off + postings_len, "postings")?;
 
-        // Wrap the whole body in a single Bytes region so we
-        // share backing storage across sub-views.
         let body_bytes = Bytes::from_source(body.to_vec());
         let doc_ids_bytes = body_bytes.slice(doc_ids_off..doc_ids_off + doc_ids_len);
         let terms_bytes = body_bytes.slice(terms_off..terms_off + terms_len);
         let doc_lens_bytes = body_bytes.slice(doc_lens_off..doc_lens_off + doc_lens_len);
-        let postings_idx_bytes =
-            body_bytes.slice(postings_idx_off..postings_idx_off + postings_idx_len);
-        let postings_score_bytes =
-            body_bytes.slice(postings_score_off..postings_score_off + postings_score_len);
+        let postings_bytes = body_bytes.slice(postings_off..postings_off + postings_len);
 
         let doc_ids = FixedBytesTable::<16>::from_bytes(doc_ids_bytes, n_docs)
             .map_err(|_| SuccinctLoadError::TruncatedSection("doc_ids"))?;
@@ -1499,14 +1549,12 @@ impl SuccinctBM25Index {
         let postings_meta = SuccinctPostingsMeta {
             doc_idx: postings_doc_idx_meta,
             offsets: postings_offsets_meta,
+            scores: postings_scores_meta,
+            max_score,
             n_terms: n_terms as u64,
         };
-        let postings = SuccinctPostings::from_bytes(
-            postings_meta,
-            postings_idx_bytes,
-            postings_score_bytes,
-        )
-        .map_err(|_| SuccinctLoadError::TruncatedSection("postings"))?;
+        let postings = SuccinctPostings::from_bytes(postings_meta, postings_bytes)
+            .map_err(|_| SuccinctLoadError::TruncatedSection("postings"))?;
 
         Ok(Self {
             doc_ids,
@@ -1521,13 +1569,16 @@ impl SuccinctBM25Index {
 }
 
 /// Magic header tag for SuccinctBM25Index blobs.
+/// Magic tag at the start of an SB25 blob.
 const SUCCINCT_MAGIC: u32 = u32::from_le_bytes(*b"SB25");
 /// Header length in bytes.
 ///
 /// Layout: 4 magic + 2 version + 2 reserved + 4 avg_doc_len +
-/// 4 k1 + 4 b + 8 n_docs + 8 n_terms + 3 × 32 CompactVectorMeta
-/// + 10 × 8 section (offset, len) = 212.
-const SUCCINCT_HEADER_LEN: usize = 212;
+/// 4 k1 + 4 b + 4 max_score + 4 reserved + 8 n_docs + 8 n_terms
+/// + 4 × 32 CompactVectorMeta (doc_lens, postings.doc_idx,
+/// postings.offsets, postings.scores) + 4 × 16 section (offset,
+/// len) = 236.
+const SUCCINCT_HEADER_LEN: usize = 236;
 
 /// Errors loading a `SuccinctBM25Index` blob.
 #[derive(Debug, Clone, PartialEq)]
@@ -1775,10 +1826,8 @@ mod tests {
             vec![],
             vec![(4, 9.0)],
         ];
-        let (idx_bytes, score_bytes, meta) =
-            SuccinctPostings::build(&lists, 8).unwrap();
-        let view =
-            SuccinctPostings::from_bytes(meta, idx_bytes, score_bytes).unwrap();
+        let (bytes, meta) = SuccinctPostings::build(&lists, 8).unwrap();
+        let view = SuccinctPostings::from_bytes(meta, bytes).unwrap();
         assert_eq!(view.term_count(), 4);
         assert_eq!(view.posting_count(0), Some(3));
         assert_eq!(view.posting_count(1), Some(2));
@@ -1786,18 +1835,26 @@ mod tests {
         assert_eq!(view.posting_count(3), Some(1));
         assert_eq!(view.posting_count(4), None);
 
+        // Quantization is lossy: doc_idx round-trips exactly,
+        // scores match within one bucket (= max_score / 65534).
+        let tol = view.score_tolerance();
         for (t, expected) in lists.iter().enumerate() {
             let got: Vec<(u32, f32)> = view.postings_for(t).unwrap().collect();
-            assert_eq!(&got, expected, "term {t}");
+            assert_eq!(got.len(), expected.len(), "term {t} length");
+            for ((gd, gs), (ed, es)) in got.iter().zip(expected.iter()) {
+                assert_eq!(gd, ed, "term {t} doc idx");
+                assert!(
+                    (gs - es).abs() <= tol,
+                    "term {t} score drift {gs} vs {es} exceeds tol {tol}"
+                );
+            }
         }
     }
 
     #[test]
     fn postings_empty_corpus() {
-        let (idx_bytes, score_bytes, meta) =
-            SuccinctPostings::build(&[] as &[Vec<(u32, f32)>], 0).unwrap();
-        let view =
-            SuccinctPostings::from_bytes(meta, idx_bytes, score_bytes).unwrap();
+        let (bytes, meta) = SuccinctPostings::build(&[] as &[Vec<(u32, f32)>], 0).unwrap();
+        let view = SuccinctPostings::from_bytes(meta, bytes).unwrap();
         assert_eq!(view.term_count(), 0);
         assert!(view.postings_for(0).is_none());
     }
@@ -1826,7 +1883,9 @@ mod tests {
         assert_eq!(succinct.b(), naive.b());
         assert!((succinct.avg_doc_len() - naive.avg_doc_len()).abs() < 1e-6);
 
-        // Every stored term must produce identical postings.
+        // Every stored term must produce matching postings. Scores
+        // match within the succinct index's quantization tolerance.
+        let tol = succinct.score_tolerance();
         for term in naive.terms_slice() {
             let n: Vec<_> = naive.query_term(term).collect();
             let s: Vec<_> = succinct.query_term(term).collect();
@@ -1838,8 +1897,8 @@ mod tests {
             for ((n_id, n_s), (s_id, s_s)) in n.iter().zip(s.iter()) {
                 assert_eq!(n_id, s_id);
                 assert!(
-                    (n_s - s_s).abs() < 1e-6,
-                    "score mismatch for {n_id:?}: naive={n_s} succinct={s_s}"
+                    (n_s - s_s).abs() <= tol,
+                    "score drift for {n_id:?}: naive={n_s} succinct={s_s} > tol {tol}"
                 );
             }
             assert_eq!(
@@ -1892,7 +1951,11 @@ mod tests {
         assert_eq!(reloaded.b(), original.b());
         assert!((reloaded.avg_doc_len() - original.avg_doc_len()).abs() < 1e-6);
 
-        // Every term's posting list must round-trip bit-identical.
+        // Every term's posting list must round-trip. Both
+        // copies were quantized with the same scale so buckets
+        // are deterministic — scores match within a single ULP,
+        // well under the quantization tolerance.
+        let tol = original.score_tolerance().max(1e-5);
         for word in ["the", "fox", "quick", "brown", "dog"] {
             let term = hash_tokens(word)[0];
             let a: Vec<_> = original.query_term(&term).collect();
@@ -1901,8 +1964,8 @@ mod tests {
             for ((a_id, a_s), (b_id, b_s)) in a.iter().zip(b.iter()) {
                 assert_eq!(a_id, b_id);
                 assert!(
-                    (a_s - b_s).abs() < 1e-6,
-                    "term '{word}': score mismatch {a_s} vs {b_s}"
+                    (a_s - b_s).abs() <= tol,
+                    "term '{word}': score drift {a_s} vs {b_s} > tol {tol}"
                 );
             }
         }
@@ -2254,19 +2317,23 @@ mod tests {
             lists.push(l);
         }
         let total: usize = lists.iter().map(|l| l.len()).sum();
-        let (idx_bytes, score_bytes, _meta) =
-            SuccinctPostings::build(&lists, 1000).unwrap();
-        // Naive doc_idx alone would be 4 bytes × total_postings.
-        // idx_bytes holds doc_idx + offsets.
-        let naive_doc_idx = total * 4;
-        let naive_offsets = (lists.len() + 1) * 4;
+        let (bytes, _meta) = SuccinctPostings::build(&lists, 1000).unwrap();
+        // Naive layout would be:
+        //   doc_idx  = 4 B × total_postings
+        //   offsets  = 4 B × (n_terms + 1)
+        //   scores   = 4 B × total_postings (f32)
+        // = total × 8 + (n_terms + 1) × 4
+        // The succinct single-region body packs all three into
+        // bit-packed CompactVectors (doc_idx 10 bits, offsets
+        // 11 bits, scores 16 bits at this scale) plus tiny
+        // per-CompactVector overhead — strictly smaller.
+        let naive =
+            total * 4 + (lists.len() + 1) * 4 + total * 4;
         assert!(
-            idx_bytes.len() < naive_doc_idx + naive_offsets,
-            "succinct idx {} < naive idx+offsets {}",
-            idx_bytes.len(),
-            naive_doc_idx + naive_offsets
+            bytes.len() < naive,
+            "succinct body {} < naive total {}",
+            bytes.len(),
+            naive
         );
-        // Scores are still f32, no win expected on that side.
-        assert_eq!(score_bytes.len(), total * 4);
     }
 }

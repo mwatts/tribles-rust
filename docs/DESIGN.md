@@ -50,29 +50,32 @@ via jerky. Schema id: `68C03764D04D05DF65E49589FBBA1441` (see
 `succinct::SuccinctBM25Blob`).
 
 ```
-[header              ] 212 B (fixed)
+[header              ] 236 B (fixed)
   magic                   u32    ; "SB25"
   version                 u16
   reserved                u16
   avg_doc_len             f32    ; for length normalization
   k1                      f32    ; BM25 tuning (default 1.5)
   b                       f32    ; BM25 tuning (default 0.75)
+  max_score               f32    ; u16-quantization scale
+  reserved                u32
   n_docs                  u64
   n_terms                 u64
   doc_lens_meta           32 B   ; CompactVectorMetaOnDisk
   postings_doc_idx_meta   32 B   ; CompactVectorMetaOnDisk
   postings_offsets_meta   32 B   ; CompactVectorMetaOnDisk
-  (section_offset, section_len) × 5 = 80 B
+  postings_scores_meta    32 B   ; CompactVectorMetaOnDisk
+  (section_offset, section_len) × 4 = 64 B
 
 [doc_ids             ] n_docs × 16 B   ; flat RawId table
 [terms               ] n_terms × 32 B  ; sorted RawValue table
 [doc_lens            ] variable         ; jerky CompactVector body
                                         ; width = ceil(log2(max_len + 1))
-[postings_idx        ] variable         ; jerky CompactVectors for
-                                        ;   doc_idx  (width log2(n_docs+1))
-                                        ;   offsets  (width log2(total+1))
-                                        ; both within one ByteArea
-[postings_score      ] total × 4 B      ; flat f32 LE scores
+[postings            ] variable         ; three jerky CompactVectors in
+                                        ; one ByteArea:
+                                        ;   doc_idx (width log2(n_docs+1))
+                                        ;   offsets (width log2(total+1))
+                                        ;   scores  (width 16, u16-quantized)
 ```
 
 The three `CompactVectorMetaOnDisk` structs are a
@@ -99,6 +102,12 @@ Lookup algorithm:
 - `postings.doc_idx` → bit-packed to `ceil(log2(n_docs + 1))`.
   At 100k docs, 17 bits instead of 32 — 1.9× savings.
 - `postings.offsets` → bit-packed likewise.
+- `postings.scores` → u16-quantized via global `max_score`
+  scale. Half-bucket error bound = `max_score / 2 × 65535`;
+  `score_tolerance` on the index returns the full bucket
+  `max_score / 65534` for constraint equality. 2× savings
+  vs. f32 on the score section, top-10 preservation verified
+  at 1k scale.
 
 ### What's still flat (deliberately)
 
@@ -109,14 +118,6 @@ Lookup algorithm:
   a byte-quantized prefix + flat tails would compress the term
   *table*, but 9.6 MiB at 100k docs is small enough that
   correctness-first wins.
-- `postings_score` — still f32. Quantization to u16 (with a
-  global min/max scale) is the next obvious win: postings at
-  100k docs would shrink from 4 B to 2 B per score, which is
-  ~36 MiB → 18 MiB. Blocker: the constraint's `(s - bound).abs()
-  < f32::EPSILON` equality check would need to widen its
-  tolerance to roughly `(max - min) / 65535` to accept
-  dequantized scores as equal to their originals.
-
 ### Open compression directions
 
 - **Wavelet matrix on the term table** — would let rank/select
@@ -127,8 +128,11 @@ Lookup algorithm:
   doc-sorted, so consecutive deltas compress further via
   Simple16 / ELF / VByte. Roughly halves the `doc_idx` section
   at Heaps-law corpora.
-- **Score quantization** — described above; gated on the
-  constraint-tolerance question.
+- **Non-uniform score quantization** — current u16 quantization
+  uses a linear global `max_score` scale. A log-space or per-
+  term scale would preserve more precision in the high-df
+  (common-term) tail at the cost of a bigger header. Only
+  worth it if ranking drift bites at larger corpora.
 
 ## `SuccinctHNSWIndex` — SH25 blob layout
 
@@ -277,28 +281,36 @@ Assume after `hash_tokens`:
   with β ≈ 0.5, k ≈ 30 for English-ish text)
 - total postings `≈ 100 000 × 180 = 18 000 000` entries
 
-Naive layout (current `to_bytes`):
-| Section             | Per-entry | Count         | Bytes         |
-| :------------------ | --------: | ------------: | ------------: |
-| header              | —         | —             |            32 |
-| doc_ids             |     16 B  | 100 000       |       1.6 MiB |
-| doc_lens            |      4 B  | 100 000       |       0.4 MiB |
-| terms (sorted)      |     32 B  | 300 000       |       9.6 MiB |
-| postings_offsets    |      4 B  | 300 001       |       1.2 MiB |
-| postings            |      8 B  | 18 000 000    |       144 MiB |
-| **Total**           |           |               |   **~157 MiB**|
+Two columns: the naive `BM25Index::to_bytes` format (scaffold,
+kept for testing self-consistency) and the landed SB25 format
+(`SuccinctBM25Index::to_bytes`) with bit-packing + score
+quantization.
 
-The **postings table dominates** — 91 % of the blob. That's where
-the jerky succinct pass has the biggest lever: a wavelet matrix
-over `doc_idx` plus quantized (`f16`) scores would cut it to
-`≈ 18 M × 4 B ≈ 72 MiB` even without delta coding, or
-`≈ 18 M × (log₂(100k) / 8 + 2) B ≈ 36 MiB` with bit-packed
-doc_idx. Rough target: 40–60 MiB for the full blob.
+| Section            | Per-entry | Count      | Naive bytes | SB25 bytes |
+| :----------------- | --------: | ---------: | ----------: | ---------: |
+| header             | —         | —          |       32 B  |    236 B   |
+| doc_ids            |    16 B   | 100 000    |   1.6 MiB   |  1.6 MiB   |
+| doc_lens           |     4 B   | 100 000    |   0.4 MiB   | ~0.12 MiB  |
+| terms (sorted)     |    32 B   | 300 000    |   9.6 MiB   |  9.6 MiB   |
+| postings_offsets   |     4 B   | 300 001    |   1.2 MiB   | ~0.6 MiB   |
+| postings.doc_idx   |     4 B   | 18 000 000 |    72 MiB   | ~38 MiB    |
+| postings.score     |     4 B   | 18 000 000 |    72 MiB   |    36 MiB  |
+| **Total**          |           |            | **~157 MiB**| **~86 MiB**|
 
-Term table is the second-largest chunk (9.6 MiB of 32-byte hashes).
-A wavelet matrix over byte-quantized prefixes + flat tail trades
-some rank/select cost for compression, but 10 MiB is small enough
-that the naive version is fine until someone complains.
+Every row computed the same way: the bit-packed sections use
+`ceil(log2(n + 1))` bits per entry (doc_idx → 17 bits ≈ 2.12 B;
+doc_lens at max ≈ 1024 → 10 bits ≈ 1.25 B; offsets at 18M max →
+25 bits ≈ 3.1 B), and u16-quantized scores drop from 4 B to 2 B.
+
+The **postings dominate** at 85 %+ of either blob. SB25's bit-
+packed `doc_idx` plus u16 scores halves that section — the rest
+of the footprint (doc_ids, terms, docs_lens) is already as
+small as the data allows without additional structure.
+
+Term table is the second-largest chunk (9.6 MiB of 32-byte
+hashes). A wavelet matrix over byte-quantized prefixes + flat
+tail would compress it further; 10 MiB is small enough that
+correctness-first wins for now.
 
 ### BM25 — build time
 
@@ -354,9 +366,11 @@ win is mostly on the BM25 side.
 
 ### Takeaways
 
-- Naive BM25 blob is ~1.5 KiB per doc — already shippable.
-- Postings table is where succinctness earns its keep (3–4×
-  expected).
+- Naive BM25 blob is ~1.5 KiB per doc — already shippable as a
+  scaffold; SB25 halves that.
+- Postings are the biggest lever; bit-packing + u16 scores
+  already claimed it. The next step (delta-encoded `doc_idx`,
+  wavelet-matrix term table) is incremental, not transformative.
 - For HNSW, the interesting compression sits in *caller-owned*
   embedding bytes. This crate's succinct pass is about graph
   compactness + rank/select speed, not bulk size.

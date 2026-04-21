@@ -84,6 +84,13 @@ impl BM25Queryable for crate::succinct::SuccinctBM25Index {
     fn doc_frequency_for(&self, term: &RawValue) -> usize {
         self.doc_frequency(term)
     }
+
+    fn score_tolerance(&self) -> f32 {
+        // Quantization bucket size; widens the equality check to
+        // accept scores that round to different f32s after the
+        // u16 → f32 dequantization.
+        self.score_tolerance()
+    }
 }
 
 /// Minimum surface an HNSW-style index must expose for the
