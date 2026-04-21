@@ -1,0 +1,283 @@
+//! Triblespace query-engine integration.
+//!
+//! Exposes [`BM25Index`] as a first-class `Constraint` so
+//! callers can plug search into the normal `find!` / `pattern!`
+//! / `and!` / `or!` machinery.
+//!
+//! V1 ships the simplest useful shape:
+//!
+//! ```rust,ignore
+//! let docs_matching: DocsContainingTerm = index.docs_containing(doc_var, term);
+//! ```
+//!
+//! which pins `term` at construction time and constrains the
+//! `doc` variable to entity ids whose posting list includes the
+//! term. Scores live on [`BM25Index`] and are looked up via
+//! [`BM25Index::query_term`] once the caller has the doc — v2
+//! will lift `score` to a bound variable.
+//!
+//! See `docs/QUERY_ENGINE_INTEGRATION.md` for the longer-term
+//! design covering bidirectional BM25 and vector similarity.
+
+use std::collections::HashSet;
+
+use triblespace::core::id::{Id, RawId};
+use triblespace::core::query::{Binding, Constraint, Variable, VariableId, VariableSet};
+use triblespace::core::value::schemas::genid::GenId;
+use triblespace::core::value::RawValue;
+
+use crate::bm25::BM25Index;
+
+/// Constrains a `Variable<GenId>` (doc) to entity ids in the
+/// posting list of the pinned term.
+///
+/// Created via [`BM25Index::docs_containing`].
+pub struct DocsContainingTerm<'a> {
+    index: &'a BM25Index,
+    doc: Variable<GenId>,
+    /// The term value is pinned at constraint-construction time.
+    term: [u8; 32],
+}
+
+impl<'a> DocsContainingTerm<'a> {
+    pub fn new(index: &'a BM25Index, doc: Variable<GenId>, term: [u8; 32]) -> Self {
+        Self { index, doc, term }
+    }
+}
+
+impl BM25Index {
+    /// Produce a [`DocsContainingTerm`] constraint for use inside
+    /// `pattern!` / `find!`.
+    pub fn docs_containing(
+        &self,
+        doc: Variable<GenId>,
+        term: [u8; 32],
+    ) -> DocsContainingTerm<'_> {
+        DocsContainingTerm::new(self, doc, term)
+    }
+}
+
+/// Convert a `GenId`-schema raw value (zero-padded in bytes
+/// [0..16], Id in [16..32]) back to an `Id`. Returns `None` for
+/// malformed / nil values.
+fn raw_value_to_id(raw: &RawValue) -> Option<Id> {
+    if raw[0..16] != [0u8; 16] {
+        return None;
+    }
+    let raw_id: RawId = raw[16..32].try_into().ok()?;
+    Id::new(raw_id)
+}
+
+/// Encode an `Id` as a `GenId`-schema raw value.
+fn id_to_raw_value(id: Id) -> RawValue {
+    let mut out = [0u8; 32];
+    let raw: &RawId = id.as_ref();
+    out[16..32].copy_from_slice(raw);
+    out
+}
+
+impl<'a> Constraint<'a> for DocsContainingTerm<'a> {
+    fn variables(&self) -> VariableSet {
+        VariableSet::new_singleton(self.doc.index)
+    }
+
+    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
+        if self.doc.index == variable {
+            Some(self.index.doc_frequency(&self.term))
+        } else {
+            None
+        }
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        _binding: &Binding,
+        proposals: &mut Vec<RawValue>,
+    ) {
+        if self.doc.index != variable {
+            return;
+        }
+        for (doc_id, _score) in self.index.query_term(&self.term) {
+            proposals.push(id_to_raw_value(doc_id));
+        }
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _binding: &Binding,
+        proposals: &mut Vec<RawValue>,
+    ) {
+        if self.doc.index != variable {
+            return;
+        }
+        // Collect the term's posting list into a set for O(1)
+        // membership checks. For very long posting lists a sorted
+        // binary-search would be lighter on memory; for v1 this is
+        // fine up to tens of thousands of postings.
+        let docs: HashSet<Id> =
+            self.index.query_term(&self.term).map(|(d, _)| d).collect();
+        proposals.retain(|raw| {
+            raw_value_to_id(raw)
+                .map(|id| docs.contains(&id))
+                .unwrap_or(false)
+        });
+    }
+
+    fn satisfied(&self, binding: &Binding) -> bool {
+        // If `doc` is already bound, the constraint is satisfied
+        // iff that doc appears in the term's posting list.
+        match binding.get(self.doc.index) {
+            Some(raw) => {
+                let Some(doc_id) = raw_value_to_id(raw) else {
+                    return false;
+                };
+                self.index.query_term(&self.term).any(|(d, _)| d == doc_id)
+            }
+            None => true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bm25::BM25Builder;
+    use crate::tokens::hash_tokens;
+
+    fn id(byte: u8) -> Id {
+        Id::new([byte; 16]).unwrap()
+    }
+
+    fn sample_index() -> BM25Index {
+        let mut b = BM25Builder::new();
+        b.insert(id(1), hash_tokens("the quick brown fox"));
+        b.insert(id(2), hash_tokens("the lazy brown dog"));
+        b.insert(id(3), hash_tokens("quick silver fox jumps"));
+        b.build()
+    }
+
+    #[test]
+    fn constraint_variables_is_singleton_of_doc() {
+        let idx = sample_index();
+        let mut ctx = triblespace::core::query::VariableContext::new();
+        let doc: Variable<GenId> = ctx.next_variable();
+        let term = hash_tokens("fox")[0];
+        let c = idx.docs_containing(doc, term);
+
+        let vars = c.variables();
+        assert!(vars.is_set(doc.index));
+        // And no other variable is touched.
+        let mut found = 0;
+        for i in 0..32 {
+            if vars.is_set(i) {
+                found += 1;
+            }
+        }
+        assert_eq!(found, 1);
+    }
+
+    #[test]
+    fn constraint_estimate_is_doc_frequency() {
+        let idx = sample_index();
+        let mut ctx = triblespace::core::query::VariableContext::new();
+        let doc: Variable<GenId> = ctx.next_variable();
+        let term = hash_tokens("fox")[0];
+        let c = idx.docs_containing(doc, term);
+
+        let binding = Binding::default();
+        assert_eq!(c.estimate(doc.index, &binding), Some(2));
+        // Unknown variable → None.
+        let unk_binding = Binding::default();
+        // Pick an unused variable id (one past what VariableContext allocated).
+        assert_eq!(c.estimate(255, &unk_binding), None);
+    }
+
+    #[test]
+    fn constraint_proposes_posting_list_as_genid_values() {
+        let idx = sample_index();
+        let mut ctx = triblespace::core::query::VariableContext::new();
+        let doc: Variable<GenId> = ctx.next_variable();
+        let term = hash_tokens("fox")[0];
+        let c = idx.docs_containing(doc, term);
+
+        let binding = Binding::default();
+        let mut props: Vec<RawValue> = Vec::new();
+        c.propose(doc.index, &binding, &mut props);
+        assert_eq!(props.len(), 2);
+
+        // All proposals decode cleanly into Ids, and those Ids
+        // are exactly the docs that had "fox" in the posting
+        // list.
+        let ids: HashSet<Id> = props
+            .iter()
+            .map(|r| raw_value_to_id(r).expect("valid GenId value"))
+            .collect();
+        assert!(ids.contains(&id(1)));
+        assert!(ids.contains(&id(3)));
+    }
+
+    #[test]
+    fn constraint_confirm_filters_non_matching_docs() {
+        let idx = sample_index();
+        let mut ctx = triblespace::core::query::VariableContext::new();
+        let doc: Variable<GenId> = ctx.next_variable();
+        let term = hash_tokens("fox")[0];
+        let c = idx.docs_containing(doc, term);
+
+        let binding = Binding::default();
+        let mut props: Vec<RawValue> =
+            vec![id_to_raw_value(id(1)), id_to_raw_value(id(2)), id_to_raw_value(id(3))];
+        c.confirm(doc.index, &binding, &mut props);
+        // Doc 2 doesn't contain "fox" — should be filtered out.
+        // Docs 1 and 3 do.
+        let ids: HashSet<Id> =
+            props.iter().map(|r| raw_value_to_id(r).unwrap()).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&id(1)));
+        assert!(!ids.contains(&id(2)));
+        assert!(ids.contains(&id(3)));
+    }
+
+    #[test]
+    fn constraint_satisfied_checks_bound_doc() {
+        let idx = sample_index();
+        let mut ctx = triblespace::core::query::VariableContext::new();
+        let doc: Variable<GenId> = ctx.next_variable();
+        let term = hash_tokens("fox")[0];
+        let c = idx.docs_containing(doc, term);
+
+        // Unbound → trivially satisfied.
+        let empty = Binding::default();
+        assert!(c.satisfied(&empty));
+
+        // Bound to a matching doc → satisfied.
+        let mut bound = Binding::default();
+        bound.set(doc.index, &id_to_raw_value(id(1)));
+        assert!(c.satisfied(&bound));
+
+        // Bound to a non-matching doc → unsatisfied.
+        let mut unmatching = Binding::default();
+        unmatching.set(doc.index, &id_to_raw_value(id(2)));
+        assert!(!c.satisfied(&unmatching));
+    }
+
+    /// Sanity-check that `propose` yields values every consumer
+    /// will be able to decode back into `Id`s.
+    #[test]
+    fn proposed_values_decode_back_to_ids() {
+        let idx = sample_index();
+        let mut ctx = triblespace::core::query::VariableContext::new();
+        let doc: Variable<GenId> = ctx.next_variable();
+        let term = hash_tokens("fox")[0];
+        let c = idx.docs_containing(doc, term);
+
+        let binding = Binding::default();
+        let mut proposals = Vec::new();
+        c.propose(doc.index, &binding, &mut proposals);
+        for raw in &proposals {
+            raw_value_to_id(raw).expect("genid roundtrip");
+        }
+    }
+}

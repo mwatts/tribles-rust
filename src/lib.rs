@@ -14,6 +14,7 @@
 //! in-memory cache). See the design doc for layout specifics.
 
 pub mod bm25;
+pub mod constraint;
 pub mod hnsw;
 pub mod tokens;
 
