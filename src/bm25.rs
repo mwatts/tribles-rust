@@ -49,7 +49,10 @@
 
 use std::collections::HashMap;
 
+use triblespace::core::blob::{Blob, BlobSchema, Bytes, ToBlob, TryFromBlob};
 use triblespace::core::id::{Id, RawId};
+use triblespace::core::id_hex;
+use triblespace::core::metadata::ConstId;
 use triblespace::core::value::RawValue;
 
 use crate::FORMAT_VERSION;
@@ -104,11 +107,40 @@ impl std::fmt::Display for BM25LoadError {
 
 impl std::error::Error for BM25LoadError {}
 
-/// Placeholder for the content-addressed blob type. The real
-/// wrapper will carry its schema id and `Bytes` backing once the
-/// triblespace `BlobSchema` integration lands. For now the
-/// serialization lives as free functions on [`BM25Index`].
-pub struct SuccinctBM25Index;
+/// Content-addressed `BlobSchema` marker for BM25 indexes.
+///
+/// Used via `Blob<SuccinctBM25Index>`; the concrete [`BM25Index`]
+/// type implements [`ToBlob`] and [`TryFromBlob`] against this
+/// schema. The schema id was minted via `trible genid` and must
+/// never change (it's what crates-io consumers content-address
+/// against); see the commit introducing this constant.
+pub enum SuccinctBM25Index {}
+
+impl ConstId for SuccinctBM25Index {
+    const ID: Id = id_hex!("3616AE861B2935317CC2BF0AD94BF87F");
+}
+
+impl BlobSchema for SuccinctBM25Index {}
+
+impl ToBlob<SuccinctBM25Index> for &BM25Index {
+    fn to_blob(self) -> Blob<SuccinctBM25Index> {
+        Blob::new(Bytes::from_source(self.to_bytes()))
+    }
+}
+
+impl ToBlob<SuccinctBM25Index> for BM25Index {
+    fn to_blob(self) -> Blob<SuccinctBM25Index> {
+        (&self).to_blob()
+    }
+}
+
+impl TryFromBlob<SuccinctBM25Index> for BM25Index {
+    type Error = BM25LoadError;
+
+    fn try_from_blob(b: Blob<SuccinctBM25Index>) -> Result<Self, Self::Error> {
+        BM25Index::try_from_bytes(b.bytes.as_ref())
+    }
+}
 
 /// Accumulator for documents to be indexed. Call [`insert`] once
 /// per doc, then [`build`] to produce a [`BM25Index`].
@@ -695,6 +727,17 @@ mod tests {
         let truncated = &bytes[..bytes.len() - 1];
         let err = BM25Index::try_from_bytes(truncated).unwrap_err();
         assert!(matches!(err, BM25LoadError::TruncatedSection(_)));
+    }
+
+    #[test]
+    fn blob_schema_round_trip() {
+        use triblespace::core::blob::{ToBlob, TryFromBlob};
+
+        let original = build_sample_index();
+        let blob: triblespace::core::blob::Blob<SuccinctBM25Index> = (&original).to_blob();
+        let reloaded = BM25Index::try_from_blob(blob).expect("valid blob");
+        assert_eq!(reloaded.doc_count(), original.doc_count());
+        assert_eq!(reloaded.term_count(), original.term_count());
     }
 
     #[test]

@@ -38,10 +38,24 @@
 //! assert_eq!(hits[1].0, Id::new([3; 16]).unwrap());
 //! ```
 
+use triblespace::core::blob::BlobSchema;
 use triblespace::core::id::Id;
+use triblespace::core::id_hex;
+use triblespace::core::metadata::ConstId;
 
-/// Placeholder for the content-addressed succinct HNSW blob.
-pub struct SuccinctHNSWIndex;
+/// Content-addressed `BlobSchema` marker for the (eventual)
+/// succinct HNSW index. The schema id is fixed now — minted via
+/// `trible genid` — even though the byte layout will land in a
+/// later iteration. Consumers that reference the id in metadata
+/// can do so safely today and pick up the real blob bytes when
+/// the schema is implemented.
+pub enum SuccinctHNSWIndex {}
+
+impl ConstId for SuccinctHNSWIndex {
+    const ID: Id = id_hex!("1D235813CE96AC70B8A4D0490810D720");
+}
+
+impl BlobSchema for SuccinctHNSWIndex {}
 
 /// Placeholder for the zero-copy succinct HNSW view.
 pub struct HNSWIndex;
