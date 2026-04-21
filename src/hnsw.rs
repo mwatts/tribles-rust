@@ -31,8 +31,10 @@
 //! ```
 
 use triblespace::core::id::{Id, RawId};
+use triblespace::core::value::schemas::hash::{Blake3, Handle};
 use triblespace::core::value::{RawValue, Value, ValueSchema};
 
+use crate::schemas::Embedding;
 use crate::FORMAT_VERSION;
 
 // ── HNSW blob byte format ────────────────────────────────────────────
@@ -974,57 +976,56 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 pub struct FlatBuilder {
     dim: usize,
     keys: Vec<RawValue>,
-    /// Row-major; row `i` is `vectors[i * dim .. (i + 1) * dim]`.
-    vectors: Vec<f32>,
+    handles: Vec<Value<Handle<Blake3, Embedding>>>,
 }
 
 impl FlatBuilder {
-    /// Start a fresh builder for `dim`-dimensional vectors.
+    /// Start a fresh builder. `dim` is the expected embedding
+    /// length — stored in the index and checked against the
+    /// query vector at query time.
     pub fn new(dim: usize) -> Self {
         assert!(dim > 0, "FlatBuilder: dim must be > 0");
         Self {
             dim,
             keys: Vec::new(),
-            vectors: Vec::new(),
+            handles: Vec::new(),
         }
     }
 
-    /// Insert one vector keyed by a 32-byte triblespace value.
-    /// Returns `Err(DimMismatch)` if `vec` is the wrong length.
-    /// The caller's vector is L2-normalized in place before
-    /// storage. See [`insert_id`] / [`insert_value`] for the
-    /// typed convenience wrappers.
+    /// Insert a `(key, handle)` pair. `key` is any 32-byte
+    /// triblespace value (GenId / ShortString / tag / composite
+    /// — see [`insert_id`] / [`insert_value`] for typed
+    /// wrappers); `handle` points at an [`Embedding`] blob in
+    /// the pile's blob store. The builder stores neither the
+    /// raw vector nor any copy of it — the pile owns the
+    /// embedding and content-addresses it, so two indexes that
+    /// embed the same entity share storage.
+    ///
+    /// Use [`crate::schemas::put_embedding`] to put + normalize
+    /// + get a handle in one step.
     ///
     /// [`insert_id`]: Self::insert_id
     /// [`insert_value`]: Self::insert_value
-    pub fn insert(&mut self, key: RawValue, mut vec: Vec<f32>) -> Result<(), DimMismatch> {
-        if vec.len() != self.dim {
-            return Err(DimMismatch {
-                expected: self.dim,
-                got: vec.len(),
-            });
-        }
-        normalize(&mut vec);
+    pub fn insert(&mut self, key: RawValue, handle: Value<Handle<Blake3, Embedding>>) {
         self.keys.push(key);
-        self.vectors.extend_from_slice(&vec);
-        Ok(())
+        self.handles.push(handle);
     }
 
     /// Convenience: insert keyed by a triblespace [`Id`].
-    pub fn insert_id(&mut self, doc_id: Id, vec: Vec<f32>) -> Result<(), DimMismatch> {
+    pub fn insert_id(&mut self, doc_id: Id, handle: Value<Handle<Blake3, Embedding>>) {
         let mut raw = [0u8; 32];
         let id_bytes: &RawId = doc_id.as_ref();
         raw[16..32].copy_from_slice(id_bytes);
-        self.insert(raw, vec)
+        self.insert(raw, handle);
     }
 
     /// Convenience: insert keyed by a typed [`Value<S>`].
     pub fn insert_value<S: ValueSchema>(
         &mut self,
         key: Value<S>,
-        vec: Vec<f32>,
-    ) -> Result<(), DimMismatch> {
-        self.insert(key.raw, vec)
+        handle: Value<Handle<Blake3, Embedding>>,
+    ) {
+        self.insert(key.raw, handle);
     }
 
     /// Consume the builder and produce a flat index.
@@ -1032,7 +1033,7 @@ impl FlatBuilder {
         FlatIndex {
             dim: self.dim,
             keys: self.keys,
-            vectors: self.vectors,
+            handles: self.handles,
         }
     }
 
@@ -1052,16 +1053,25 @@ impl FlatBuilder {
     }
 }
 
-/// Brute-force k-NN index. O(n · d) per query; use when the
-/// corpus is small enough for that to be fine, or as a baseline
-/// against which to validate a later HNSW implementation.
+/// Brute-force k-NN index.
 ///
-/// Scores are cosine similarity in `[-1, 1]`; higher is better.
+/// Stores `(key, handle)` pairs — the embedding blobs live in
+/// the pile's blob store, content-addressed. `similar()`
+/// resolves handles through a caller-supplied
+/// [`BlobStoreGet`][g] at query time, so two indexes that
+/// embed the same entity share storage.
+///
+/// Scores are cosine similarity in `[-1, 1]` **iff** the
+/// stored embeddings are L2-normalized (the convention — see
+/// [`Embedding`]'s docs). `similar()` L2-normalizes the query
+/// itself so the dot product reads back as cosine.
+///
+/// [g]: triblespace::core::repo::BlobStoreGet
 #[derive(Debug, Clone)]
 pub struct FlatIndex {
     dim: usize,
     keys: Vec<RawValue>,
-    vectors: Vec<f32>,
+    handles: Vec<Value<Handle<Blake3, Embedding>>>,
 }
 
 impl FlatIndex {
@@ -1081,26 +1091,46 @@ impl FlatIndex {
         &self.keys
     }
 
+    /// The stored embedding-handle table. Paired index-wise
+    /// with [`keys`].
+    ///
+    /// [`keys`]: Self::keys
+    pub fn handles(&self) -> &[Value<Handle<Blake3, Embedding>>] {
+        &self.handles
+    }
+
     /// Return the top `k` documents by cosine similarity to
-    /// `query`. `query` is L2-normalized internally before
-    /// scoring. Returns fewer than `k` results if the index has
-    /// fewer docs; returns an empty vec on dim mismatch.
-    pub fn similar(&self, query: &[f32], k: usize) -> Vec<(RawValue, f32)> {
+    /// `query`, resolving embedding handles through `store`.
+    ///
+    /// The query is L2-normalized before scoring; stored
+    /// embeddings are expected to be L2-normalized already
+    /// (see [`Embedding`]'s convention doc).
+    ///
+    /// Returns fewer than `k` results if the index has fewer
+    /// docs, and an empty vec on dim mismatch. Handle-fetch
+    /// failures propagate via `B::GetError`.
+    pub fn similar<B>(
+        &self,
+        query: &[f32],
+        k: usize,
+        store: &B,
+    ) -> Result<Vec<(RawValue, f32)>, B::GetError<anybytes::view::ViewError>>
+    where
+        B: triblespace::core::repo::BlobStoreGet<Blake3>,
+    {
         if query.len() != self.dim || k == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let mut q = query.to_vec();
-        normalize(&mut q);
+        crate::schemas::l2_normalize(&mut q);
 
-        // Score every doc; retain top-k via a simple bounded
-        // heap. For a flat index the O(n log k) heap is already
-        // much cheaper than the O(n · d) scoring pass, so we
-        // don't bother with a fancier selection algorithm.
         let mut heap: std::collections::BinaryHeap<MinScored> =
             std::collections::BinaryHeap::with_capacity(k + 1);
         for (i, key) in self.keys.iter().enumerate() {
-            let row = &self.vectors[i * self.dim..(i + 1) * self.dim];
-            let score = dot(&q, row);
+            let handle = self.handles[i];
+            eprintln!("similar: try handle {:02x?}", handle.raw);
+            let view: anybytes::View<[f32]> = store.get::<anybytes::View<[f32]>, Embedding>(handle)?;
+            let score = dot(&q, view.as_ref());
             heap.push(MinScored { key: *key, score });
             if heap.len() > k {
                 heap.pop();
@@ -1108,15 +1138,24 @@ impl FlatIndex {
         }
         let mut out: Vec<(RawValue, f32)> = heap.into_iter().map(|m| (m.key, m.score)).collect();
         out.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        out
+        Ok(out)
     }
 
     /// Convenience: [`similar`] with GenId-typed keys decoded
     /// back to [`Id`]; other schemas are dropped.
     ///
     /// [`similar`]: Self::similar
-    pub fn similar_ids(&self, query: &[f32], k: usize) -> Vec<(Id, f32)> {
-        self.similar(query, k)
+    pub fn similar_ids<B>(
+        &self,
+        query: &[f32],
+        k: usize,
+        store: &B,
+    ) -> Result<Vec<(Id, f32)>, B::GetError<anybytes::view::ViewError>>
+    where
+        B: triblespace::core::repo::BlobStoreGet<Blake3>,
+    {
+        Ok(self
+            .similar(query, k, store)?
             .into_iter()
             .filter_map(|(raw, s)| {
                 if raw[0..16] != [0u8; 16] {
@@ -1125,7 +1164,7 @@ impl FlatIndex {
                 let id_bytes: RawId = raw[16..32].try_into().ok()?;
                 Id::new(id_bytes).map(|id| (id, s))
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -1142,18 +1181,17 @@ impl FlatIndex {
     ///   dim u32
     ///   reserved 12 B
     /// [n_docs × 32 B keys]
-    /// [n_docs × dim × 4 B f32 vectors, row-major]
+    /// [n_docs × 32 B handles] — Value<Handle<Blake3, Embedding>>
     /// ```
     ///
-    /// Vectors are stored post-normalization (the same form
-    /// `insert` stored), so round-trip preserves query results
-    /// exactly — no re-normalization needed on load.
+    /// Embeddings are NOT stored in this blob — they live in
+    /// the pile's blob store, referenced by handle. The blob
+    /// here is tiny: header + 64 bytes per doc.
     pub fn to_bytes(&self) -> Vec<u8> {
         let n_docs = self.keys.len() as u32;
         let dim = self.dim as u32;
 
-        let mut buf =
-            Vec::with_capacity(FLAT_HEADER_LEN + self.keys.len() * 32 + self.vectors.len() * 4);
+        let mut buf = Vec::with_capacity(FLAT_HEADER_LEN + self.keys.len() * 64);
 
         buf.extend_from_slice(&FLAT_MAGIC.to_le_bytes()); // 4
         buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes()); // 2
@@ -1166,8 +1204,8 @@ impl FlatIndex {
         for key in &self.keys {
             buf.extend_from_slice(key);
         }
-        for &v in &self.vectors {
-            buf.extend_from_slice(&v.to_le_bytes());
+        for handle in &self.handles {
+            buf.extend_from_slice(&handle.raw);
         }
         buf
     }
@@ -1204,16 +1242,17 @@ impl FlatIndex {
         }
         pos = keys_end;
 
-        let vectors_end = pos + n_docs * dim * 4;
-        if bytes.len() < vectors_end {
-            return Err(E::TruncatedSection("vectors"));
+        let handles_end = pos + n_docs * 32;
+        if bytes.len() < handles_end {
+            return Err(E::TruncatedSection("handles"));
         }
-        let vectors: Vec<f32> = bytes[pos..vectors_end]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-            .collect();
+        let mut handles: Vec<Value<Handle<Blake3, Embedding>>> = Vec::with_capacity(n_docs);
+        for chunk in bytes[pos..handles_end].chunks_exact(32) {
+            let raw: RawValue = chunk.try_into().unwrap();
+            handles.push(Value::new(raw));
+        }
 
-        Ok(Self { dim, keys, vectors })
+        Ok(Self { dim, keys, handles })
     }
 }
 
@@ -1254,6 +1293,10 @@ impl Ord for MinScored {
 mod tests {
     use super::*;
 
+    use triblespace::core::blob::MemoryBlobStore;
+    use triblespace::core::repo::BlobStore;
+    use triblespace::core::value::schemas::hash::Blake3;
+
     fn id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
     }
@@ -1269,15 +1312,49 @@ mod tests {
         raw
     }
 
+    /// Put `vec` into `store` as a normalized [`Embedding`] blob
+    /// and return the handle.
+    fn put_emb(
+        store: &mut MemoryBlobStore<Blake3>,
+        vec: Vec<f32>,
+    ) -> Value<Handle<Blake3, Embedding>> {
+        crate::schemas::put_embedding::<_, Blake3>(store, vec).unwrap()
+    }
+
+    /// Build a [`FlatIndex`] from `(id, vec)` pairs. Returns
+    /// the index AND the store — the writer must live for the
+    /// reader to remain valid (reft_light ReadHandles are
+    /// backed by the writer's allocation).
+    fn build_flat(
+        dim: usize,
+        entries: &[(Id, Vec<f32>)],
+    ) -> (FlatIndex, MemoryBlobStore<Blake3>) {
+        let mut store = MemoryBlobStore::<Blake3>::new();
+        let mut b = FlatBuilder::new(dim);
+        for (doc, vec) in entries {
+            let h = put_emb(&mut store, vec.clone());
+            b.insert_id(*doc, h);
+        }
+        (b.build(), store)
+    }
+
+    /// Take a stable reader from an existing store. Test
+    /// sugar — `store.reader().unwrap()` unwrapped for brevity.
+    fn reader_of(store: &mut MemoryBlobStore<Blake3>) -> <MemoryBlobStore<Blake3> as BlobStore<Blake3>>::Reader {
+        store.reader().unwrap()
+    }
+
     #[test]
     fn exact_match_is_top() {
-        let mut b = FlatBuilder::new(3);
-        b.insert_id(id(1), vec![1.0, 0.0, 0.0]).unwrap();
-        b.insert_id(id(2), vec![0.0, 1.0, 0.0]).unwrap();
-        b.insert_id(id(3), vec![0.0, 0.0, 1.0]).unwrap();
-        let idx = b.build();
-
-        let hits = idx.similar(&[1.0, 0.0, 0.0], 1);
+        let (idx, mut store) = build_flat(
+            3,
+            &[
+                (id(1), vec![1.0, 0.0, 0.0]),
+                (id(2), vec![0.0, 1.0, 0.0]),
+                (id(3), vec![0.0, 0.0, 1.0]),
+            ],
+        );
+        let hits = idx.similar(&[1.0, 0.0, 0.0], 1, &reader_of(&mut store)).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, id_key(1));
         assert!((hits[0].1 - 1.0).abs() < 1e-5);
@@ -1285,13 +1362,15 @@ mod tests {
 
     #[test]
     fn ranked_by_similarity() {
-        let mut b = FlatBuilder::new(2);
-        b.insert_id(id(1), vec![1.0, 0.0]).unwrap(); // closest
-        b.insert_id(id(2), vec![0.9, 0.1]).unwrap();
-        b.insert_id(id(3), vec![0.0, 1.0]).unwrap();
-        let idx = b.build();
-
-        let hits = idx.similar(&[1.0, 0.0], 3);
+        let (idx, mut store) = build_flat(
+            2,
+            &[
+                (id(1), vec![1.0, 0.0]),
+                (id(2), vec![0.9, 0.1]),
+                (id(3), vec![0.0, 1.0]),
+            ],
+        );
+        let hits = idx.similar(&[1.0, 0.0], 3, &reader_of(&mut store)).unwrap();
         assert_eq!(hits.len(), 3);
         assert_eq!(hits[0].0, id_key(1));
         assert_eq!(hits[1].0, id_key(2));
@@ -1303,75 +1382,70 @@ mod tests {
     #[test]
     fn normalizes_input_vectors() {
         // Two inputs that are parallel but scaled differently
-        // must yield identical scores against any query.
-        let mut b = FlatBuilder::new(2);
-        b.insert_id(id(1), vec![3.0, 0.0]).unwrap();
-        b.insert_id(id(2), vec![100.0, 0.0]).unwrap();
-        let idx = b.build();
-
-        let hits = idx.similar(&[1.0, 0.0], 2);
+        // must yield identical scores against any query — the
+        // `put_embedding` helper normalizes before putting, so
+        // they produce the *same* handle (dedup).
+        let (idx, mut store) = build_flat(
+            2,
+            &[(id(1), vec![3.0, 0.0]), (id(2), vec![100.0, 0.0])],
+        );
+        let hits = idx.similar(&[1.0, 0.0], 2, &reader_of(&mut store)).unwrap();
         assert!((hits[0].1 - hits[1].1).abs() < 1e-5);
     }
 
     #[test]
-    fn dim_mismatch_rejected() {
-        let mut b = FlatBuilder::new(3);
-        let err = b.insert_id(id(1), vec![1.0, 0.0]).unwrap_err();
-        assert_eq!(err.expected, 3);
-        assert_eq!(err.got, 2);
-    }
-
-    #[test]
     fn empty_index_is_queryable() {
+        let mut store = MemoryBlobStore::<Blake3>::new();
         let idx = FlatBuilder::new(4).build();
-        assert_eq!(idx.similar(&[0.0, 0.0, 0.0, 0.0], 3), vec![]);
+        let reader = store.reader().unwrap();
+        assert_eq!(idx.similar(&[0.0; 4], 3, &reader).unwrap(), vec![]);
     }
 
     #[test]
     fn k_zero_returns_empty() {
-        let mut b = FlatBuilder::new(2);
-        b.insert_id(id(1), vec![1.0, 0.0]).unwrap();
-        let idx = b.build();
-        assert!(idx.similar(&[1.0, 0.0], 0).is_empty());
+        let (idx, mut store) = build_flat(2, &[(id(1), vec![1.0, 0.0])]);
+        assert!(idx.similar(&[1.0, 0.0], 0, &reader_of(&mut store)).unwrap().is_empty());
     }
 
     #[test]
     fn wrong_dim_query_returns_empty() {
-        let mut b = FlatBuilder::new(3);
-        b.insert_id(id(1), vec![1.0, 0.0, 0.0]).unwrap();
-        let idx = b.build();
-        assert!(idx.similar(&[1.0, 0.0], 1).is_empty()); // dim 2 vs 3
+        let (idx, mut store) = build_flat(3, &[(id(1), vec![1.0, 0.0, 0.0])]);
+        assert!(idx.similar(&[1.0, 0.0], 1, &reader_of(&mut store)).unwrap().is_empty()); // dim 2 vs 3
     }
 
     #[test]
     fn k_larger_than_corpus_truncates() {
-        let mut b = FlatBuilder::new(2);
-        b.insert_id(id(1), vec![1.0, 0.0]).unwrap();
-        b.insert_id(id(2), vec![0.0, 1.0]).unwrap();
-        let idx = b.build();
-        let hits = idx.similar(&[1.0, 0.0], 10);
+        let (idx, mut store) = build_flat(
+            2,
+            &[(id(1), vec![1.0, 0.0]), (id(2), vec![0.0, 1.0])],
+        );
+        let hits = idx.similar(&[1.0, 0.0], 10, &reader_of(&mut store)).unwrap();
         assert_eq!(hits.len(), 2);
     }
 
-    fn sample_flat() -> FlatIndex {
-        let mut b = FlatBuilder::new(3);
-        b.insert_id(id(1), vec![1.0, 0.0, 0.0]).unwrap();
-        b.insert_id(id(2), vec![0.0, 1.0, 0.0]).unwrap();
-        b.insert_id(id(3), vec![0.5, 0.5, 0.0]).unwrap();
-        b.build()
+    fn sample_flat() -> (FlatIndex, MemoryBlobStore<Blake3>) {
+        build_flat(
+            3,
+            &[
+                (id(1), vec![1.0, 0.0, 0.0]),
+                (id(2), vec![0.0, 1.0, 0.0]),
+                (id(3), vec![0.5, 0.5, 0.0]),
+            ],
+        )
     }
 
     #[test]
     fn flat_bytes_round_trip() {
-        let original = sample_flat();
+        let (original, mut store) = sample_flat();
         let reloaded = FlatIndex::try_from_bytes(&original.to_bytes()).expect("valid blob");
         assert_eq!(reloaded.dim(), original.dim());
         assert_eq!(reloaded.doc_count(), original.doc_count());
 
-        // Query results must match exactly.
+        // Query results must match exactly — handles round-trip
+        // unchanged, and the same store resolves them both.
         let q = vec![1.0, 0.0, 0.0];
-        let a = original.similar(&q, 3);
-        let b = reloaded.similar(&q, 3);
+        let a = original.similar(&q, 3, &reader_of(&mut store)).unwrap();
+        let b = reloaded.similar(&q, 3, &reader_of(&mut store)).unwrap();
         assert_eq!(a.len(), b.len());
         for (x, y) in a.iter().zip(b.iter()) {
             assert_eq!(x.0, y.0);
@@ -1381,9 +1455,9 @@ mod tests {
 
     #[test]
     fn flat_blob_is_deterministic() {
-        let a = sample_flat().to_bytes();
-        let b = sample_flat().to_bytes();
-        assert_eq!(a, b);
+        let (a, _) = sample_flat();
+        let (b, _) = sample_flat();
+        assert_eq!(a.to_bytes(), b.to_bytes());
     }
 
     #[test]
@@ -1394,7 +1468,8 @@ mod tests {
 
     #[test]
     fn flat_bad_magic_rejected() {
-        let mut bytes = sample_flat().to_bytes();
+        let (idx, _store) = sample_flat();
+        let mut bytes = idx.to_bytes();
         bytes[0] = b'X';
         let err = FlatIndex::try_from_bytes(&bytes).unwrap_err();
         assert_eq!(err, FlatLoadError::BadMagic);
@@ -1402,7 +1477,8 @@ mod tests {
 
     #[test]
     fn flat_truncation_rejected() {
-        let bytes = sample_flat().to_bytes();
+        let (idx, _store) = sample_flat();
+        let bytes = idx.to_bytes();
         let err = FlatIndex::try_from_bytes(&bytes[..bytes.len() - 1]).unwrap_err();
         assert!(matches!(err, FlatLoadError::TruncatedSection(_)));
     }
@@ -1457,6 +1533,7 @@ mod tests {
             z ^ (z >> 31)
         };
         let dim = 16;
+        let mut store = MemoryBlobStore::<Blake3>::new();
         let mut flat_b = FlatBuilder::new(dim);
         let mut hnsw_b = HNSWBuilder::new(dim).with_seed(42);
         for i in 0..200 {
@@ -1464,11 +1541,13 @@ mod tests {
                 .map(|_| (next(&mut rng) as i32 as f32) / (i32::MAX as f32))
                 .collect();
             let dx = id_from_u64((i + 1) as u64);
-            flat_b.insert_id(dx, vec.clone()).unwrap();
+            let h = put_emb(&mut store, vec.clone());
+            flat_b.insert_id(dx, h);
             hnsw_b.insert_id(dx, vec).unwrap();
         }
         let flat = flat_b.build();
         let hnsw = hnsw_b.build();
+        let reader = store.reader().unwrap();
 
         // Five random queries.
         let mut total_overlap = 0;
@@ -1477,8 +1556,12 @@ mod tests {
             let q: Vec<f32> = (0..dim)
                 .map(|_| (next(&mut rng) as i32 as f32) / (i32::MAX as f32))
                 .collect();
-            let truth: std::collections::HashSet<RawValue> =
-                flat.similar(&q, 10).into_iter().map(|(d, _)| d).collect();
+            let truth: std::collections::HashSet<RawValue> = flat
+                .similar(&q, 10, &reader)
+                .unwrap()
+                .into_iter()
+                .map(|(d, _)| d)
+                .collect();
             let got: std::collections::HashSet<RawValue> = hnsw
                 .similar(&q, 10, Some(50))
                 .into_iter()

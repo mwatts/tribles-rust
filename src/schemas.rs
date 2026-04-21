@@ -74,6 +74,18 @@ impl TryFromValue<'_, F32LE> for f32 {
 /// recorded in the blob header — the HNSW index that owns the
 /// handle carries it (one `dim` per index).
 ///
+/// ### Convention: L2-normalized
+///
+/// Embeddings in this crate's indexes are **L2-normalized by
+/// the caller** at ingest time. `FlatIndex::similar` and
+/// `HNSWIndex::similar` both treat the query metric as
+/// cosine-similarity via a single dot product against the
+/// stored embedding. If a caller stores non-unit vectors,
+/// scores will be scaled by their magnitudes — still
+/// internally consistent, but not "cosine" anymore.
+///
+/// Use [`put_embedding`] to normalize + put in one step.
+///
 /// Schema id minted via `trible genid`:
 /// `EEC5DFDEA2FFCED70850DF83B03CB62B`.
 ///
@@ -123,6 +135,41 @@ impl ToBlob<Embedding> for &[f32] {
         }
         Blob::new(bytes.into())
     }
+}
+
+/// L2-normalize `vec` in place (noop on the zero vector).
+///
+/// Shared by [`put_embedding`] and by the HNSW / Flat query
+/// path, which normalize the query vector the same way.
+pub fn l2_normalize(vec: &mut [f32]) {
+    let norm: f32 = vec.iter().map(|&x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        let inv = 1.0 / norm;
+        for v in vec.iter_mut() {
+            *v *= inv;
+        }
+    }
+}
+
+/// L2-normalize `vec` and `put` it into `store` as an
+/// [`Embedding`] blob, returning the content-addressed handle.
+///
+/// Use this everywhere you ingest an embedding for a
+/// cosine-similarity index — two callers with the same raw
+/// input produce the same handle, so the pile's dedup layer
+/// stores the blob once even across distinct indexes.
+pub fn put_embedding<B, H>(
+    store: &mut B,
+    mut vec: Vec<f32>,
+) -> Result<triblespace::core::value::Value<triblespace::core::value::schemas::hash::Handle<H, Embedding>>, B::PutError>
+where
+    H: triblespace::core::value::schemas::hash::HashProtocol,
+    B: triblespace::core::repo::BlobStorePut<H>,
+    triblespace::core::value::schemas::hash::Handle<H, Embedding>:
+        triblespace::core::value::ValueSchema,
+{
+    l2_normalize(&mut vec);
+    store.put::<Embedding, _>(vec)
 }
 
 #[cfg(test)]
@@ -180,6 +227,21 @@ mod tests {
         let blob: Blob<Embedding> = original.clone().to_blob();
         let view: View<[f32]> = TryFromBlob::try_from_blob(blob).unwrap();
         assert_eq!(view.as_ref(), original.as_slice());
+    }
+
+    #[test]
+    fn put_embedding_roundtrips_through_memory_store() {
+        use triblespace::core::blob::MemoryBlobStore;
+        use triblespace::core::repo::{BlobStore, BlobStoreGet};
+        use triblespace::core::value::schemas::hash::Blake3;
+
+        let mut store = MemoryBlobStore::<Blake3>::new();
+        let vec = vec![1.0_f32, 0.0, 0.0];
+        let handle = put_embedding::<_, Blake3>(&mut store, vec.clone()).unwrap();
+        let reader = store.reader().unwrap();
+        let view: View<[f32]> = reader.get::<View<[f32]>, Embedding>(handle).unwrap();
+        // After normalize, [1,0,0] stays [1,0,0].
+        assert_eq!(view.as_ref(), &[1.0_f32, 0.0, 0.0]);
     }
 
     #[test]
