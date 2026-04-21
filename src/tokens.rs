@@ -67,6 +67,78 @@ pub fn hash_tokens_as_values(text: &str) -> Vec<Value<UnknownValue>> {
         .collect()
 }
 
+/// Word-level bigram tokenizer for phrase-aware retrieval.
+///
+/// Tokenizes `text` with the same rules as [`hash_tokens`]
+/// (whitespace split + lowercase + punctuation trim + drop
+/// empty), then emits one hashed value per *adjacent pair* of
+/// resulting tokens. Each bigram is namespaced with a `"2w:"`
+/// prefix before hashing so it lives in its own term-space
+/// separate from single-word hashes.
+///
+/// Concatenating `hash_tokens(text)` with `bigram_tokens(text)`
+/// before `BM25Builder::insert` lets the same BM25 index answer
+/// both single-word queries (via the hash_tokens half) and
+/// phrase queries (`bigram_tokens("quick brown")` produces the
+/// `(quick, brown)` bigram hash, which only matches docs that
+/// contain those two words adjacently).
+///
+/// Rules:
+/// - Fewer than 2 tokens → empty output.
+/// - Duplicates are preserved; running bigrams through the same
+///   text produces the same values across processes and crate
+///   versions.
+///
+/// # Example
+///
+/// ```
+/// # use triblespace_search::tokens::bigram_tokens;
+/// let grams = bigram_tokens("The quick brown fox");
+/// // 4 words → 3 bigrams: (the, quick), (quick, brown),
+/// // (brown, fox).
+/// assert_eq!(grams.len(), 3);
+///
+/// // Phrase match: the query shares one bigram with the doc.
+/// let doc = bigram_tokens("a quick brown dog");
+/// let qry = bigram_tokens("quick brown");
+/// assert!(doc.contains(&qry[0]));
+/// ```
+pub fn bigram_tokens(text: &str) -> Vec<RawValue> {
+    // Reuse hash_tokens' normalization pipeline but keep the
+    // pre-hash string form so we can pair adjacent tokens.
+    let words: Vec<String> = text
+        .split_ascii_whitespace()
+        .filter_map(|raw| {
+            let trimmed = raw.trim_matches(|c: char| c.is_ascii_punctuation());
+            if !trimmed.chars().any(|c| c.is_alphanumeric()) {
+                return None;
+            }
+            Some(
+                trimmed
+                    .chars()
+                    .map(|c| c.to_ascii_lowercase())
+                    .collect::<String>(),
+            )
+        })
+        .collect();
+    if words.len() < 2 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(words.len() - 1);
+    for pair in words.windows(2) {
+        // "2w:" namespace + "\x00"-delimited pair so the same
+        // glyph sequence with different word boundaries can't
+        // collide (e.g. "ab c" vs "a bc").
+        let mut buf = String::with_capacity(pair[0].len() + pair[1].len() + 4);
+        buf.push_str("2w:");
+        buf.push_str(&pair[0]);
+        buf.push('\u{0}');
+        buf.push_str(&pair[1]);
+        out.push(*blake3::hash(buf.as_bytes()).as_bytes());
+    }
+    out
+}
+
 /// Tokenizer for source-code-like identifiers. Splits on:
 /// - any non-alphanumeric character (treating underscore,
 ///   hyphen, whitespace, punctuation as boundaries), and
@@ -353,6 +425,90 @@ mod tests {
         assert_eq!(bi.len(), 1);
         assert_eq!(tri.len(), 1);
         assert_ne!(bi[0], tri[0]);
+    }
+
+    #[test]
+    fn bigram_tokens_basic_count() {
+        // 4 words → 3 bigrams.
+        assert_eq!(bigram_tokens("the quick brown fox").len(), 3);
+        assert_eq!(bigram_tokens("one two").len(), 1);
+        assert!(bigram_tokens("lonely").is_empty());
+        assert!(bigram_tokens("").is_empty());
+    }
+
+    #[test]
+    fn bigram_tokens_case_and_punctuation_normalized() {
+        // Same output after lowercase + punctuation trim —
+        // matches hash_tokens' normalization so bigrams and
+        // single-word terms share the same term-space floor.
+        let a = bigram_tokens("Hello, WORLD!");
+        let b = bigram_tokens("hello world");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn bigram_tokens_order_matters() {
+        // (a, b) ≠ (b, a): bigrams encode ordered pairs.
+        let ab = bigram_tokens("foo bar");
+        let ba = bigram_tokens("bar foo");
+        assert_ne!(ab, ba);
+    }
+
+    #[test]
+    fn bigram_tokens_namespaced_away_from_hash() {
+        // A two-word bigram must not collide with a single-word
+        // hash_tokens term even when the concatenated letters
+        // form a valid word. "foobar" single word != (foo, bar)
+        // bigram.
+        let single = hash_tokens("foobar");
+        let bigram = bigram_tokens("foo bar");
+        assert_eq!(single.len(), 1);
+        assert_eq!(bigram.len(), 1);
+        assert_ne!(single[0], bigram[0]);
+    }
+
+    #[test]
+    fn bigram_tokens_word_boundary_preserved() {
+        // "ab c" (two words) and "a bc" (two words) must produce
+        // DIFFERENT bigrams even though the concatenated glyphs
+        // are identical. The \0 delimiter in the namespace tag
+        // is what makes this safe.
+        let ab_c = bigram_tokens("ab c");
+        let a_bc = bigram_tokens("a bc");
+        assert_eq!(ab_c.len(), 1);
+        assert_eq!(a_bc.len(), 1);
+        assert_ne!(ab_c[0], a_bc[0]);
+    }
+
+    #[test]
+    fn bigram_tokens_enables_phrase_match() {
+        // Indexing with hash + bigrams, then searching for a
+        // 2-word phrase via bigrams recovers docs that contain
+        // those two words adjacently.
+        use crate::bm25::BM25Builder;
+        use triblespace::core::id::Id;
+
+        fn iid(byte: u8) -> Id {
+            Id::new([byte; 16]).unwrap()
+        }
+        fn both(text: &str) -> Vec<RawValue> {
+            let mut v = hash_tokens(text);
+            v.extend(bigram_tokens(text));
+            v
+        }
+        let mut b = BM25Builder::new();
+        b.insert(iid(1), both("the quick brown fox"));
+        b.insert(iid(2), both("fox fight club"));
+        b.insert(iid(3), both("quick silver brown fox")); // `quick` + `brown` but NOT adjacent
+        let idx = b.build();
+
+        // Query "quick brown" as a bigram: only doc 1 contains
+        // that ordered pair adjacently.
+        let phrase = bigram_tokens("quick brown");
+        assert_eq!(phrase.len(), 1);
+        let hits: Vec<_> = idx.query_term(&phrase[0]).collect();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, iid(1));
     }
 
     #[test]

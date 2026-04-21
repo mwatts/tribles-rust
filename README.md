@@ -68,6 +68,12 @@ naive-then-succinct implementation order is the open work item.
   (`HTMLParser` → `html`, `parser`). Lowercased output hashes
   the same as `hash_tokens`, so code and prose can share one
   index.
+* **`tokens::bigram_tokens`**: word-level bigram tokenizer
+  namespaced into `"2w:"` so bigrams and single-word hashes
+  coexist in one index. Compose with `hash_tokens` to answer
+  both single-word and phrase queries — `bigram_tokens("quick
+  brown")` hashes only the ordered pair, so a doc matches iff
+  the two words appear adjacently.
 * **`schemas::F32LE`**: `ValueSchema` for packing `f32` scores
   into 32-byte `Value<F32LE>`s. Used by the scored BM25
   constraint.
