@@ -63,6 +63,11 @@ naive-then-succinct implementation order is the open work item.
   namespaced into the hash) for prefix / typo matching.
   Compose with `hash_tokens` to get both exact and fuzzy
   matching through a single BM25 index.
+* **`tokens::code_tokens`**: identifier tokenizer — splits on
+  camelCase, `snake_case`, digit boundaries, and acronyms
+  (`HTMLParser` → `html`, `parser`). Lowercased output hashes
+  the same as `hash_tokens`, so code and prose can share one
+  index.
 * **`schemas::F32LE`**: `ValueSchema` for packing `f32` scores
   into 32-byte `Value<F32LE>`s. Used by the scored BM25
   constraint.

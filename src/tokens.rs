@@ -67,6 +67,125 @@ pub fn hash_tokens_as_values(text: &str) -> Vec<Value<UnknownValue>> {
         .collect()
 }
 
+/// Tokenizer for source-code-like identifiers. Splits on:
+/// - any non-alphanumeric character (treating underscore,
+///   hyphen, whitespace, punctuation as boundaries), and
+/// - camelCase / acronym transitions inside a word:
+///   - lowercase → uppercase boundary (`parseHTML` → `parse`,
+///     `HTML`)
+///   - uppercase-run → mixed-case boundary (`HTMLParser` →
+///     `HTML`, `Parser`)
+///   - letter → digit boundary (`parseV2` → `parse`, `V2`)
+///   - digit → letter boundary (`2nd` → `2`, `nd`)
+///
+/// Each resulting segment is lowercased and Blake3-hashed, giving
+/// a 32-byte term value compatible with [`hash_tokens`].
+///
+/// # Example
+///
+/// ```
+/// # use triblespace_search::tokens::code_tokens;
+/// // camelCase + acronym + snake_case all combine cleanly.
+/// // `parseHTMLResponse_v2` → parse, html, response, v, 2.
+/// let t = code_tokens("parseHTMLResponse_v2");
+/// assert_eq!(t.len(), 5);
+/// ```
+///
+/// Single-letter lowercase runs directly following an all-caps
+/// acronym (e.g. `HTMLv` in `HTMLv2`) are ambiguous; the
+/// tokenizer follows the standard convention of keeping the last
+/// uppercase with the new lowercase run, producing `HTM` + `Lv`
+/// in that case. Prefer explicit separators (`_`, case changes,
+/// or digits) when the intent matters.
+pub fn code_tokens(text: &str) -> Vec<RawValue> {
+    let mut segments: Vec<String> = Vec::new();
+    let mut cur = String::new();
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Kind {
+        Lower,
+        Upper,
+        Digit,
+        None,
+    }
+    fn kind(c: char) -> Kind {
+        if c.is_ascii_digit() {
+            Kind::Digit
+        } else if c.is_uppercase() {
+            Kind::Upper
+        } else if c.is_lowercase() {
+            Kind::Lower
+        } else {
+            Kind::None
+        }
+    }
+
+    let chars: Vec<char> = text.chars().collect();
+    let mut prev = Kind::None;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let k = kind(c);
+
+        // Non-alphanumeric: boundary. Flush and skip.
+        if !c.is_alphanumeric() {
+            if !cur.is_empty() {
+                segments.push(std::mem::take(&mut cur));
+            }
+            prev = Kind::None;
+            i += 1;
+            continue;
+        }
+
+        // Case transitions:
+        let split_here = match (prev, k) {
+            (Kind::Lower, Kind::Upper) => true,
+            (Kind::Lower, Kind::Digit) => true,
+            (Kind::Digit, Kind::Lower) => true,
+            (Kind::Digit, Kind::Upper) => true,
+            (Kind::Upper, Kind::Digit) => true,
+            // Uppercase-run → mixed-case boundary:
+            // `HTMLParser` — when we see `P` after `L`, nothing;
+            // but `r` after `P` starts a new lowercase run while
+            // `HTMLP` has already been accumulated. The
+            // standard rule: on Upper→Lower transition, if the
+            // accumulated run has ≥2 uppercase letters, pop the
+            // last upper off into the new segment.
+            (Kind::Upper, Kind::Lower) if cur.chars().count() >= 2 => {
+                // Move the last char of `cur` into a fresh
+                // segment before `c`.
+                let popped = cur.pop().unwrap();
+                segments.push(std::mem::take(&mut cur));
+                cur.push(popped);
+                false
+            }
+            _ => false,
+        };
+        if split_here && !cur.is_empty() {
+            segments.push(std::mem::take(&mut cur));
+        }
+        cur.push(c);
+        prev = k;
+        i += 1;
+    }
+    if !cur.is_empty() {
+        segments.push(cur);
+    }
+
+    segments
+        .into_iter()
+        .filter_map(|s| {
+            // Already lowercased-ready? Normalize to lowercase.
+            let lower: String = s.chars().map(|c| c.to_ascii_lowercase()).collect();
+            if lower.is_empty() {
+                None
+            } else {
+                Some(*blake3::hash(lower.as_bytes()).as_bytes())
+            }
+        })
+        .collect()
+}
+
 /// Character-level n-gram tokenizer. Returns one hashed term per
 /// sliding window of `n` characters across the lowercased text.
 ///
@@ -234,6 +353,78 @@ mod tests {
         assert_eq!(bi.len(), 1);
         assert_eq!(tri.len(), 1);
         assert_ne!(bi[0], tri[0]);
+    }
+
+    #[test]
+    fn code_tokens_snake_case() {
+        let t = code_tokens("parse_http_response");
+        let expected = ["parse", "http", "response"]
+            .iter()
+            .map(|s| *blake3::hash(s.as_bytes()).as_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(t, expected);
+    }
+
+    #[test]
+    fn code_tokens_camel_case() {
+        let t = code_tokens("parseResponseBody");
+        let expected = ["parse", "response", "body"]
+            .iter()
+            .map(|s| *blake3::hash(s.as_bytes()).as_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(t, expected);
+    }
+
+    #[test]
+    fn code_tokens_acronym_boundary() {
+        // HTMLParser — HTML stays together as an acronym, then
+        // Parser breaks off.
+        let t = code_tokens("HTMLParser");
+        let expected = ["html", "parser"]
+            .iter()
+            .map(|s| *blake3::hash(s.as_bytes()).as_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(t, expected);
+    }
+
+    #[test]
+    fn code_tokens_digits_split() {
+        let t = code_tokens("parseV2Request");
+        let expected = ["parse", "v", "2", "request"]
+            .iter()
+            .map(|s| *blake3::hash(s.as_bytes()).as_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(t, expected);
+    }
+
+    #[test]
+    fn code_tokens_mixed_separators() {
+        // Hyphens, dots, spaces all behave like snake separators.
+        let a = code_tokens("foo-bar.baz qux");
+        let b = code_tokens("foo bar baz qux");
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 4);
+    }
+
+    #[test]
+    fn code_tokens_shares_terms_with_hash_tokens() {
+        // Key property: the lowercase words coming out of
+        // code_tokens match hash_tokens on the same word, so the
+        // two tokenizers coexist in one BM25 index.
+        let code = code_tokens("parseFooBar");
+        let text = hash_tokens("parse foo bar");
+        assert_eq!(code.len(), 3);
+        assert_eq!(text.len(), 3);
+        for (c, t) in code.iter().zip(text.iter()) {
+            assert_eq!(c, t);
+        }
+    }
+
+    #[test]
+    fn code_tokens_example_in_doc() {
+        // Matches the doctest.
+        let t = code_tokens("parseHTMLResponse_v2");
+        assert_eq!(t.len(), 5);
     }
 
     #[test]
