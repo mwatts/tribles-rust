@@ -87,4 +87,13 @@ pub mod tokens;
 ///   returns `(RawValue, f32)`; `similar_ids()` is the GenId
 ///   decoder. Doubles the keys section (16 B → 32 B), ~2 % of
 ///   the HNSW blob at typical embedding sizes.
-pub const FORMAT_VERSION: u16 = 4;
+/// - `5`: FLAT blob: drop inline `vectors` section. Keys are
+///   paired with `Handle<Blake3, Embedding>` values; the
+///   embedding blobs live in the pile's blob store,
+///   content-addressed and dedup'd across indexes.
+///   `FlatBuilder::insert` now takes a handle, not a `Vec<f32>`.
+///   `FlatIndex::similar` takes a `&BlobStoreGet<Blake3>` to
+///   resolve handles at query time. Blob shrinks from 16 +
+///   4·dim B/doc to 64 B/doc. HNSW path not ported yet this
+///   version.
+pub const FORMAT_VERSION: u16 = 5;
