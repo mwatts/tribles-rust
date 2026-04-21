@@ -92,10 +92,8 @@ fn intersection_with_absent_term_proposes_nothing() {
 
     let brown_term = hash_tokens("brown")[0];
     let banana_term = hash_tokens("banana")[0];
-    let c_brown: Box<dyn Constraint> =
-        Box::new(idx.docs_containing(doc, brown_term));
-    let c_banana: Box<dyn Constraint> =
-        Box::new(idx.docs_containing(doc, banana_term));
+    let c_brown: Box<dyn Constraint> = Box::new(idx.docs_containing(doc, brown_term));
+    let c_banana: Box<dyn Constraint> = Box::new(idx.docs_containing(doc, banana_term));
     let intersection = IntersectionConstraint::new(vec![c_brown, c_banana]);
 
     let binding = Binding::default();
@@ -105,7 +103,10 @@ fn intersection_with_absent_term_proposes_nothing() {
 
     let mut props = Vec::new();
     intersection.propose(doc.index, &binding, &mut props);
-    assert!(props.is_empty(), "no proposals for absent-term intersection");
+    assert!(
+        props.is_empty(),
+        "no proposals for absent-term intersection"
+    );
 }
 
 /// Pre-binding `doc` should let `satisfied` succeed only when
@@ -122,8 +123,7 @@ fn satisfied_respects_both_clauses() {
 
     let quick_term = hash_tokens("quick")[0];
     let fox_term = hash_tokens("fox")[0];
-    let c_quick: Box<dyn Constraint> =
-        Box::new(idx.docs_containing(doc, quick_term));
+    let c_quick: Box<dyn Constraint> = Box::new(idx.docs_containing(doc, quick_term));
     let c_fox: Box<dyn Constraint> = Box::new(idx.docs_containing(doc, fox_term));
     let intersection = IntersectionConstraint::new(vec![c_quick, c_fox]);
 

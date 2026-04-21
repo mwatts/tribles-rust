@@ -118,8 +118,7 @@ fn find_docs_and_scores() {
     .collect();
 
     // Map each doc to its real posting score for cross-checking.
-    let truth: std::collections::HashMap<Id, f32> =
-        postings.iter().copied().collect();
+    let truth: std::collections::HashMap<Id, f32> = postings.iter().copied().collect();
 
     // Every row's (doc, score) must be one of the real postings.
     assert!(!rows.is_empty());

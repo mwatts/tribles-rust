@@ -69,7 +69,10 @@ impl std::fmt::Display for HNSWLoadError {
                 write!(f, "HNSW blob: neighbour index {i} ≥ n_nodes")
             }
             Self::ImpossibleNeighbourCount(n) => {
-                write!(f, "HNSW blob: node has {n} neighbours but corpus is smaller")
+                write!(
+                    f,
+                    "HNSW blob: node has {n} neighbours but corpus is smaller"
+                )
             }
         }
     }
@@ -254,8 +257,7 @@ impl HNSWBuilder {
             let mut entry = start;
             for lvl in (0..=new_level.min(self.max_level)).rev() {
                 let cap = if lvl == 0 { self.m0 } else { self.m } as usize;
-                let candidates =
-                    self.search_layer(&vec, entry, self.ef_construction as usize, lvl);
+                let candidates = self.search_layer(&vec, entry, self.ef_construction as usize, lvl);
                 let selected = Self::select_neighbours(&candidates, cap);
 
                 // Bidirectional edges.
@@ -332,17 +334,10 @@ impl HNSWBuilder {
 
     /// Standard HNSW layer ef-search. Returns a list of
     /// `(node_idx, distance)` pairs, up to `ef` of them.
-    fn search_layer(
-        &self,
-        q: &[f32],
-        entry: u32,
-        ef: usize,
-        layer: u8,
-    ) -> Vec<(u32, f32)> {
+    fn search_layer(&self, q: &[f32], entry: u32, ef: usize, layer: u8) -> Vec<(u32, f32)> {
         use std::collections::BinaryHeap;
 
-        let mut visited: std::collections::HashSet<u32> =
-            std::collections::HashSet::new();
+        let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
         visited.insert(entry);
         let d0 = cosine_dist(q, &self.nodes[entry as usize].vector);
         let mut candidates: BinaryHeap<MinDist> = BinaryHeap::new();
@@ -369,8 +364,7 @@ impl HNSWBuilder {
                     continue;
                 }
                 let d = cosine_dist(q, &self.nodes[n as usize].vector);
-                let farthest =
-                    results.peek().map(|r| r.dist).unwrap_or(f32::INFINITY);
+                let farthest = results.peek().map(|r| r.dist).unwrap_or(f32::INFINITY);
                 if d < farthest || results.len() < ef {
                     candidates.push(MinDist { idx: n, dist: d });
                     results.push(MaxDist { idx: n, dist: d });
@@ -400,12 +394,10 @@ impl HNSWBuilder {
         // Borrow-checker dance: snapshot the neighbour ids and
         // the node's vector so we can score against `self.nodes`
         // without holding a mut-borrow on the list.
-        let list_snapshot: Vec<u32> =
-            self.nodes[node as usize].neighbors[layer as usize].clone();
+        let list_snapshot: Vec<u32> = self.nodes[node as usize].neighbors[layer as usize].clone();
         if list_snapshot.len() <= cap {
             // Already small enough; just dedupe in place.
-            let list =
-                &mut self.nodes[node as usize].neighbors[layer as usize];
+            let list = &mut self.nodes[node as usize].neighbors[layer as usize];
             list.sort_unstable();
             list.dedup();
             return;
@@ -416,8 +408,7 @@ impl HNSWBuilder {
             .map(|&n| (n, cosine_dist(&q, &self.nodes[n as usize].vector)))
             .collect();
         scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        let list =
-            &mut self.nodes[node as usize].neighbors[layer as usize];
+        let list = &mut self.nodes[node as usize].neighbors[layer as usize];
         list.clear();
         list.extend(scored.into_iter().take(cap).map(|(i, _)| i));
         list.sort_unstable();
@@ -501,12 +492,7 @@ impl HNSWIndex {
     /// cosine similarity. `ef` tunes the search width (larger =
     /// better recall at higher cost); pass `None` to default to
     /// `k`.
-    pub fn similar(
-        &self,
-        query: &[f32],
-        k: usize,
-        ef: Option<usize>,
-    ) -> Vec<(Id, f32)> {
+    pub fn similar(&self, query: &[f32], k: usize, ef: Option<usize>) -> Vec<(Id, f32)> {
         if query.len() != self.dim || k == 0 {
             return Vec::new();
         }
@@ -718,8 +704,7 @@ impl HNSWIndex {
             let level = levels[i];
             let n_layers = level as usize + 1;
             let mut layer_lists: Vec<Vec<u32>> = Vec::with_capacity(n_layers);
-            let offset_block =
-                &all_offsets[i * entries_per_node..(i + 1) * entries_per_node];
+            let offset_block = &all_offsets[i * entries_per_node..(i + 1) * entries_per_node];
             for layer_idx in 0..n_layers {
                 let start = offset_block[layer_idx];
                 let end = offset_block[layer_idx + 1];
@@ -729,8 +714,7 @@ impl HNSWIndex {
                 let mut list: Vec<u32> = Vec::with_capacity((end - start) as usize);
                 for offset in start..end {
                     let neighbour_pos = neighbour_cursor + (offset - start);
-                    let Some(&n) = all_neighbours.get(neighbour_pos as usize)
-                    else {
+                    let Some(&n) = all_neighbours.get(neighbour_pos as usize) else {
                         return Err(E::TruncatedSection("neighbours"));
                     };
                     if n as usize >= n_nodes {
@@ -791,16 +775,9 @@ impl HNSWIndex {
         }
     }
 
-    fn search_layer(
-        &self,
-        q: &[f32],
-        entry: u32,
-        ef: usize,
-        layer: u8,
-    ) -> Vec<(u32, f32)> {
+    fn search_layer(&self, q: &[f32], entry: u32, ef: usize, layer: u8) -> Vec<(u32, f32)> {
         use std::collections::BinaryHeap;
-        let mut visited: std::collections::HashSet<u32> =
-            std::collections::HashSet::new();
+        let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
         visited.insert(entry);
         let d0 = cosine_dist(q, &self.nodes[entry as usize].vector);
         let mut candidates: BinaryHeap<MinDist> = BinaryHeap::new();
@@ -832,8 +809,7 @@ impl HNSWIndex {
                     continue;
                 }
                 let d = cosine_dist(q, &self.nodes[n as usize].vector);
-                let farthest =
-                    results.peek().map(|r| r.dist).unwrap_or(f32::INFINITY);
+                let farthest = results.peek().map(|r| r.dist).unwrap_or(f32::INFINITY);
                 if d < farthest || results.len() < ef {
                     candidates.push(MinDist { idx: n, dist: d });
                     results.push(MaxDist { idx: n, dist: d });
@@ -873,7 +849,9 @@ impl Ord for MinDist {
     fn cmp(&self, o: &Self) -> std::cmp::Ordering {
         // Invert so BinaryHeap (max-heap) behaves as min-heap
         // over distance.
-        o.dist.partial_cmp(&self.dist).unwrap_or(std::cmp::Ordering::Equal)
+        o.dist
+            .partial_cmp(&self.dist)
+            .unwrap_or(std::cmp::Ordering::Equal)
     }
 }
 
@@ -1055,9 +1033,7 @@ impl FlatIndex {
             }
         }
         let mut out: Vec<(Id, f32)> = heap.into_iter().map(|m| (m.id, m.score)).collect();
-        out.sort_unstable_by(|a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        out.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         out
     }
 }
@@ -1085,11 +1061,8 @@ impl FlatIndex {
         let n_docs = self.doc_ids.len() as u32;
         let dim = self.dim as u32;
 
-        let mut buf = Vec::with_capacity(
-            FLAT_HEADER_LEN
-                + self.doc_ids.len() * 16
-                + self.vectors.len() * 4,
-        );
+        let mut buf =
+            Vec::with_capacity(FLAT_HEADER_LEN + self.doc_ids.len() * 16 + self.vectors.len() * 4);
 
         buf.extend_from_slice(&FLAT_MAGIC.to_le_bytes()); // 4
         buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes()); // 2
@@ -1294,8 +1267,7 @@ mod tests {
     #[test]
     fn flat_bytes_round_trip() {
         let original = sample_flat();
-        let reloaded =
-            FlatIndex::try_from_bytes(&original.to_bytes()).expect("valid blob");
+        let reloaded = FlatIndex::try_from_bytes(&original.to_bytes()).expect("valid blob");
         assert_eq!(reloaded.dim(), original.dim());
         assert_eq!(reloaded.doc_count(), original.doc_count());
 
@@ -1422,10 +1394,7 @@ mod tests {
         // Looser bound catches blatantly broken HNSW impls while
         // tolerating the algorithm's inherent approximate-ness.
         let recall = total_overlap as f32 / total_k as f32;
-        assert!(
-            recall >= 0.7,
-            "HNSW recall {recall:.2} below 0.7 threshold"
-        );
+        assert!(recall >= 0.7, "HNSW recall {recall:.2} below 0.7 threshold");
     }
 
     fn id_from_u64(n: u64) -> Id {
@@ -1540,5 +1509,4 @@ mod tests {
         let err = HNSWIndex::try_from_bytes(&bytes).unwrap_err();
         assert_eq!(err, HNSWLoadError::BadMagic);
     }
-
 }

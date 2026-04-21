@@ -216,23 +216,20 @@ impl BM25Builder {
             }
 
             // Scoped threads so references to `chunks` stay alive.
-            let locals: Vec<HashMap<RawValue, HashMap<u32, u32>>> =
-                std::thread::scope(|s| {
-                    let mut handles = Vec::with_capacity(threads);
-                    for (shard_start, chunk) in starts.iter().zip(chunks.into_iter())
-                    {
-                        let start = *shard_start as u32;
-                        handles.push(s.spawn(move || {
-                            let mut m: HashMap<RawValue, HashMap<u32, u32>> =
-                                HashMap::new();
-                            for (i, (_, terms)) in chunk.into_iter().enumerate() {
-                                accumulate_tfs(&mut m, start + i as u32, terms);
-                            }
-                            m
-                        }));
-                    }
-                    handles.into_iter().map(|h| h.join().unwrap()).collect()
-                });
+            let locals: Vec<HashMap<RawValue, HashMap<u32, u32>>> = std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(threads);
+                for (shard_start, chunk) in starts.iter().zip(chunks.into_iter()) {
+                    let start = *shard_start as u32;
+                    handles.push(s.spawn(move || {
+                        let mut m: HashMap<RawValue, HashMap<u32, u32>> = HashMap::new();
+                        for (i, (_, terms)) in chunk.into_iter().enumerate() {
+                            accumulate_tfs(&mut m, start + i as u32, terms);
+                        }
+                        m
+                    }));
+                }
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
 
             // Merge local maps into one. Since shards cover
             // disjoint doc_idx ranges, each term's per-shard tf
@@ -306,11 +303,7 @@ fn accumulate_tfs(
     terms: Vec<RawValue>,
 ) {
     for term in terms {
-        let entry = m
-            .entry(term)
-            .or_default()
-            .entry(doc_idx)
-            .or_insert(0);
+        let entry = m.entry(term).or_default().entry(doc_idx).or_insert(0);
         *entry += 1;
     }
 }
@@ -355,9 +348,7 @@ impl BM25Index {
     pub fn query_term(&self, term: &RawValue) -> impl Iterator<Item = (Id, f32)> + '_ {
         let lo = self.terms.binary_search(term).ok();
         let range = match lo {
-            Some(i) => {
-                self.offsets[i] as usize..self.offsets[i + 1] as usize
-            }
+            Some(i) => self.offsets[i] as usize..self.offsets[i + 1] as usize,
             None => 0..0,
         };
         self.postings[range]
@@ -378,9 +369,7 @@ impl BM25Index {
             }
         }
         let mut out: Vec<(Id, f32)> = acc.into_iter().collect();
-        out.sort_unstable_by(|a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        out.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         out
     }
 

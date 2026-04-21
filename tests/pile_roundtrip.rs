@@ -42,10 +42,8 @@ fn succinct_bm25_survives_blob_store_roundtrip() {
         .expect("put should succeed");
 
     // Get → reloaded view.
-    let reader = <MemoryBlobStore<_> as triblespace::core::repo::BlobStore<_>>::reader(
-        &mut store,
-    )
-    .expect("reader");
+    let reader = <MemoryBlobStore<_> as triblespace::core::repo::BlobStore<_>>::reader(&mut store)
+        .expect("reader");
     let reloaded: SuccinctBM25Index = reader
         .get::<SuccinctBM25Index, SuccinctBM25Blob>(handle)
         .expect("get should succeed");
@@ -91,10 +89,8 @@ fn succinct_hnsw_survives_blob_store_roundtrip() {
         .expect("put should succeed");
 
     // Get → reloaded view.
-    let reader = <MemoryBlobStore<_> as triblespace::core::repo::BlobStore<_>>::reader(
-        &mut store,
-    )
-    .expect("reader");
+    let reader = <MemoryBlobStore<_> as triblespace::core::repo::BlobStore<_>>::reader(&mut store)
+        .expect("reader");
     let reloaded: SuccinctHNSWIndex = reader
         .get::<SuccinctHNSWIndex, SuccinctHNSWBlob>(handle)
         .expect("get should succeed");

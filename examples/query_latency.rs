@@ -119,9 +119,7 @@ fn bench_bm25(n_docs: usize, vocab: usize, doc_len: usize) {
         );
     };
 
-    println!(
-        "BM25 single-term query  [n={n_docs}, vocab={vocab}, avg_len={doc_len}]:"
-    );
+    println!("BM25 single-term query  [n={n_docs}, vocab={vocab}, avg_len={doc_len}]:");
     time_single("naive", &|q| {
         let _: Vec<_> = naive.query_term(q).collect();
     });

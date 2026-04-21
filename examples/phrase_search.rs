@@ -55,7 +55,11 @@ fn main() {
     let hits: Vec<_> = idx.query_term(&word[0]).collect();
     println!("single-word query 'fox':");
     for (d, s) in &hits {
-        let text = corpus.iter().find(|(i, _)| i == d).map(|(_, t)| *t).unwrap_or("?");
+        let text = corpus
+            .iter()
+            .find(|(i, _)| i == d)
+            .map(|(_, t)| *t)
+            .unwrap_or("?");
         println!("  {d}  score={s:.3}  {text}");
     }
     assert_eq!(hits.len(), 4);
@@ -67,7 +71,11 @@ fn main() {
     let hits: Vec<_> = idx.query_term(&phrase[0]).collect();
     println!("\nphrase query 'quick brown' (adjacent only):");
     for (d, s) in &hits {
-        let text = corpus.iter().find(|(i, _)| i == d).map(|(_, t)| *t).unwrap_or("?");
+        let text = corpus
+            .iter()
+            .find(|(i, _)| i == d)
+            .map(|(_, t)| *t)
+            .unwrap_or("?");
         println!("  {d}  score={s:.3}  {text}");
     }
     // doc 1: "...quick brown fox..." ✓
@@ -81,7 +89,11 @@ fn main() {
     let hits: Vec<_> = idx.query_term(&phrase[0]).collect();
     println!("\nphrase query 'brown fox':");
     for (d, s) in &hits {
-        let text = corpus.iter().find(|(i, _)| i == d).map(|(_, t)| *t).unwrap_or("?");
+        let text = corpus
+            .iter()
+            .find(|(i, _)| i == d)
+            .map(|(_, t)| *t)
+            .unwrap_or("?");
         println!("  {d}  score={s:.3}  {text}");
     }
     assert_eq!(hits.len(), 2);
@@ -107,8 +119,16 @@ fn main() {
     let mut ranked: Vec<_> = acc.into_iter().collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     for (d, s) in ranked.iter().take(3) {
-        let text = corpus.iter().find(|(i, _)| i == d).map(|(_, t)| *t).unwrap_or("?");
+        let text = corpus
+            .iter()
+            .find(|(i, _)| i == d)
+            .map(|(_, t)| *t)
+            .unwrap_or("?");
         println!("  {d}  score={s:.3}  {text}");
     }
-    assert_eq!(ranked[0].0, id(1), "doc 1 has both 'the quick' AND 'quick brown' bigrams");
+    assert_eq!(
+        ranked[0].0,
+        id(1),
+        "doc 1 has both 'the quick' AND 'quick brown' bigrams"
+    );
 }

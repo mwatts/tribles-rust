@@ -40,7 +40,8 @@ fn succinct_bm25_survives_pile_round_trip() {
     let original = SuccinctBM25Index::from_naive(&naive).unwrap();
 
     let handle = {
-        let mut pile = Pile::<triblespace::core::value::schemas::hash::Blake3>::open(&pile_path).expect("open pile");
+        let mut pile = Pile::<triblespace::core::value::schemas::hash::Blake3>::open(&pile_path)
+            .expect("open pile");
         pile.refresh().expect("refresh empty pile");
         let h = pile
             .put::<SuccinctBM25Blob, _>(&original)
@@ -50,7 +51,8 @@ fn succinct_bm25_survives_pile_round_trip() {
     };
 
     // Reopen — exercises the actual on-disk load path.
-    let mut pile = Pile::<triblespace::core::value::schemas::hash::Blake3>::open(&pile_path).expect("reopen pile");
+    let mut pile = Pile::<triblespace::core::value::schemas::hash::Blake3>::open(&pile_path)
+        .expect("reopen pile");
     pile.refresh().expect("refresh");
     let reader = pile.reader().expect("reader");
     let reloaded: SuccinctBM25Index = reader
@@ -91,7 +93,8 @@ fn succinct_hnsw_survives_pile_round_trip() {
     let original = SuccinctHNSWIndex::from_naive(&naive).unwrap();
 
     let handle = {
-        let mut pile = Pile::<triblespace::core::value::schemas::hash::Blake3>::open(&pile_path).expect("open pile");
+        let mut pile = Pile::<triblespace::core::value::schemas::hash::Blake3>::open(&pile_path)
+            .expect("open pile");
         pile.refresh().expect("refresh empty pile");
         let h = pile
             .put::<SuccinctHNSWBlob, _>(&original)
@@ -100,7 +103,8 @@ fn succinct_hnsw_survives_pile_round_trip() {
         h
     };
 
-    let mut pile = Pile::<triblespace::core::value::schemas::hash::Blake3>::open(&pile_path).expect("reopen pile");
+    let mut pile = Pile::<triblespace::core::value::schemas::hash::Blake3>::open(&pile_path)
+        .expect("reopen pile");
     pile.refresh().expect("refresh");
     let reader = pile.reader().expect("reader");
     let reloaded: SuccinctHNSWIndex = reader

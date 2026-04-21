@@ -175,10 +175,7 @@ impl SuccinctDocLens {
     }
 
     /// Reconstruct a view from the frozen bytes + metadata.
-    pub fn from_bytes(
-        meta: CompactVectorMeta,
-        bytes: Bytes,
-    ) -> Result<Self, SuccinctDocLensError> {
+    pub fn from_bytes(meta: CompactVectorMeta, bytes: Bytes) -> Result<Self, SuccinctDocLensError> {
         let inner = CompactVector::from_bytes(meta, bytes)?;
         Ok(Self { inner })
     }
@@ -265,10 +262,12 @@ impl<const N: usize> FixedBytesTable<N> {
 
     /// View `bytes` as `len` rows of `N` bytes each.
     pub fn from_bytes(bytes: Bytes, len: usize) -> Result<Self, SuccinctDocLensError> {
-        let expected = len.checked_mul(N).ok_or(SuccinctDocLensError::SizeMismatch {
-            bytes: bytes.len(),
-            expected: usize::MAX,
-        })?;
+        let expected = len
+            .checked_mul(N)
+            .ok_or(SuccinctDocLensError::SizeMismatch {
+                bytes: bytes.len(),
+                expected: usize::MAX,
+            })?;
         if bytes.len() < expected {
             return Err(SuccinctDocLensError::SizeMismatch {
                 bytes: bytes.len(),
@@ -443,8 +442,7 @@ impl SuccinctPostings {
         let offsets = offsets_b.freeze();
         let offsets_meta = offsets.metadata();
 
-        let mut scores_b =
-            CompactVectorBuilder::with_capacity(total, SCORE_WIDTH, &mut sections)?;
+        let mut scores_b = CompactVectorBuilder::with_capacity(total, SCORE_WIDTH, &mut sections)?;
         let mut pos = 0usize;
         for list in lists {
             for &(_, s) in list {
@@ -519,10 +517,7 @@ impl SuccinctPostings {
 
     /// Iterate `(doc_idx, score)` postings for term `t`. Scores
     /// are dequantized from their u16 buckets.
-    pub fn postings_for(
-        &self,
-        t: usize,
-    ) -> Option<impl Iterator<Item = (u32, f32)> + '_> {
+    pub fn postings_for(&self, t: usize) -> Option<impl Iterator<Item = (u32, f32)> + '_> {
         if t >= self.n_terms {
             return None;
         }
@@ -698,10 +693,7 @@ impl SuccinctGraph {
     }
 
     /// Reconstruct from bytes + metadata.
-    pub fn from_bytes(
-        meta: SuccinctGraphMeta,
-        bytes: Bytes,
-    ) -> Result<Self, SuccinctDocLensError> {
+    pub fn from_bytes(meta: SuccinctGraphMeta, bytes: Bytes) -> Result<Self, SuccinctDocLensError> {
         let neighbours = CompactVector::from_bytes(meta.neighbours, bytes.clone())?;
         let offsets = CompactVector::from_bytes(meta.offsets, bytes)?;
         Ok(Self {
@@ -724,11 +716,7 @@ impl SuccinctGraph {
     /// Iterate neighbours of `node` on `layer`. Empty iterator if
     /// either index is out of range (matching the naive index's
     /// "no list at layer > node.level" semantics).
-    pub fn neighbours(
-        &self,
-        node: usize,
-        layer: usize,
-    ) -> impl Iterator<Item = u32> + '_ {
+    pub fn neighbours(&self, node: usize, layer: usize) -> impl Iterator<Item = u32> + '_ {
         let (start, end) = if node >= self.n_nodes || layer >= self.n_layers {
             (0usize, 0usize)
         } else {
@@ -872,9 +860,7 @@ impl SuccinctHNSWIndex {
     /// succinct view.
     pub fn similar_constraint(
         &self,
-        doc: triblespace::core::query::Variable<
-            triblespace::core::value::schemas::genid::GenId,
-        >,
+        doc: triblespace::core::query::Variable<triblespace::core::value::schemas::genid::GenId>,
         query: Vec<f32>,
         k: usize,
         ef: Option<usize>,
@@ -887,17 +873,13 @@ impl SuccinctHNSWIndex {
     /// for the succinct view.
     pub fn similar_with_scores(
         &self,
-        doc: triblespace::core::query::Variable<
-            triblespace::core::value::schemas::genid::GenId,
-        >,
+        doc: triblespace::core::query::Variable<triblespace::core::value::schemas::genid::GenId>,
         score: triblespace::core::query::Variable<crate::schemas::F32LE>,
         query: Vec<f32>,
         k: usize,
         ef: Option<usize>,
     ) -> crate::constraint::SimilarToVectorHNSWScored<'_, SuccinctHNSWIndex> {
-        crate::constraint::SimilarToVectorHNSWScored::new(
-            self, doc, score, query, k, ef,
-        )
+        crate::constraint::SimilarToVectorHNSWScored::new(self, doc, score, query, k, ef)
     }
 
     /// Read vector `i` as a borrowed `&[f32]` sliced directly
@@ -918,12 +900,7 @@ impl SuccinctHNSWIndex {
     /// Approximate top-k nearest neighbours to `query` under
     /// cosine similarity. Mirrors [`HNSWIndex::similar`] exactly,
     /// just against succinct storage.
-    pub fn similar(
-        &self,
-        query: &[f32],
-        k: usize,
-        ef: Option<usize>,
-    ) -> Vec<(Id, f32)> {
+    pub fn similar(&self, query: &[f32], k: usize, ef: Option<usize>) -> Vec<(Id, f32)> {
         if query.len() != self.dim || k == 0 {
             return Vec::new();
         }
@@ -955,9 +932,7 @@ impl SuccinctHNSWIndex {
 
     fn greedy_search_layer(&self, q: &[f32], entry: u32, layer: u8) -> u32 {
         let mut curr = entry;
-        let entry_vec = self
-            .vector(curr as usize)
-            .expect("entry in range");
+        let entry_vec = self.vector(curr as usize).expect("entry in range");
         let mut curr_dist = crate::hnsw::cosine_dist(q, &entry_vec);
         loop {
             let mut changed = false;
@@ -1011,24 +986,21 @@ impl SuccinctHNSWIndex {
 
         // Rebuild the graph from the current view so we get fresh
         // bytes with offsets starting at 0 inside the region.
-        let mut layer_graph: Vec<Vec<Vec<u32>>> =
-            (0..self.graph.n_layers())
-                .map(|_| {
-                    (0..self.graph.n_nodes())
-                        .map(|_| Vec::new())
-                        .collect::<Vec<Vec<u32>>>()
-                })
-                .collect();
+        let mut layer_graph: Vec<Vec<Vec<u32>>> = (0..self.graph.n_layers())
+            .map(|_| {
+                (0..self.graph.n_nodes())
+                    .map(|_| Vec::new())
+                    .collect::<Vec<Vec<u32>>>()
+            })
+            .collect();
         for l in 0..self.graph.n_layers() {
             for i in 0..self.graph.n_nodes() {
                 layer_graph[l][i] = self.graph.neighbours(i, l).collect();
             }
         }
         let (graph_region, graph_meta) =
-            SuccinctGraph::build(&layer_graph, self.graph.n_nodes())
-                .expect("re-serialize graph");
-        let graph_neighbours_meta: CompactVectorMetaOnDisk =
-            graph_meta.neighbours.into();
+            SuccinctGraph::build(&layer_graph, self.graph.n_nodes()).expect("re-serialize graph");
+        let graph_neighbours_meta: CompactVectorMetaOnDisk = graph_meta.neighbours.into();
         let graph_offsets_meta: CompactVectorMetaOnDisk = graph_meta.offsets.into();
 
         // Section offsets inside the body (relative to end of
@@ -1098,14 +1070,12 @@ impl SuccinctHNSWIndex {
         let n_nodes = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
         let _n_layers = u64::from_le_bytes(bytes[32..40].try_into().unwrap()) as usize;
 
-        let graph_neighbours_meta =
-            CompactVectorMetaOnDisk::read_from_bytes(&bytes[40..72])
-                .map_err(|_| SuccinctLoadError::BadMeta("graph.neighbours"))?
-                .to_jerky();
-        let graph_offsets_meta =
-            CompactVectorMetaOnDisk::read_from_bytes(&bytes[72..104])
-                .map_err(|_| SuccinctLoadError::BadMeta("graph.offsets"))?
-                .to_jerky();
+        let graph_neighbours_meta = CompactVectorMetaOnDisk::read_from_bytes(&bytes[40..72])
+            .map_err(|_| SuccinctLoadError::BadMeta("graph.neighbours"))?
+            .to_jerky();
+        let graph_offsets_meta = CompactVectorMetaOnDisk::read_from_bytes(&bytes[72..104])
+            .map_err(|_| SuccinctLoadError::BadMeta("graph.offsets"))?
+            .to_jerky();
 
         let read_u64 = |off: usize| u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
         let doc_ids_off = read_u64(104) as usize;
@@ -1167,20 +1137,11 @@ impl SuccinctHNSWIndex {
         })
     }
 
-    fn search_layer(
-        &self,
-        q: &[f32],
-        entry: u32,
-        ef: usize,
-        layer: u8,
-    ) -> Vec<(u32, f32)> {
+    fn search_layer(&self, q: &[f32], entry: u32, ef: usize, layer: u8) -> Vec<(u32, f32)> {
         use std::collections::{BinaryHeap, HashSet};
         let mut visited: HashSet<u32> = HashSet::new();
         visited.insert(entry);
-        let d0 = crate::hnsw::cosine_dist(
-            q,
-            &self.vector(entry as usize).expect("entry in range"),
-        );
+        let d0 = crate::hnsw::cosine_dist(q, &self.vector(entry as usize).expect("entry in range"));
 
         // Local heap wrappers mirroring hnsw.rs (we re-implement
         // rather than expose the heap wrappers to keep the naive
@@ -1203,7 +1164,9 @@ impl SuccinctHNSWIndex {
         }
         impl Ord for MinD {
             fn cmp(&self, o: &Self) -> std::cmp::Ordering {
-                o.dist.partial_cmp(&self.dist).unwrap_or(std::cmp::Ordering::Equal)
+                o.dist
+                    .partial_cmp(&self.dist)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             }
         }
         #[derive(Clone, Copy)]
@@ -1224,14 +1187,22 @@ impl SuccinctHNSWIndex {
         }
         impl Ord for MaxD {
             fn cmp(&self, o: &Self) -> std::cmp::Ordering {
-                self.dist.partial_cmp(&o.dist).unwrap_or(std::cmp::Ordering::Equal)
+                self.dist
+                    .partial_cmp(&o.dist)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             }
         }
 
         let mut candidates: BinaryHeap<MinD> = BinaryHeap::new();
-        candidates.push(MinD { idx: entry, dist: d0 });
+        candidates.push(MinD {
+            idx: entry,
+            dist: d0,
+        });
         let mut results: BinaryHeap<MaxD> = BinaryHeap::new();
-        results.push(MaxD { idx: entry, dist: d0 });
+        results.push(MaxD {
+            idx: entry,
+            dist: d0,
+        });
         while let Some(c) = candidates.pop() {
             let farthest = results.peek().map(|r| r.dist).unwrap_or(f32::INFINITY);
             if c.dist > farthest && results.len() >= ef {
@@ -1247,8 +1218,7 @@ impl SuccinctHNSWIndex {
                 }
                 let v = self.vector(n as usize).expect("neighbour in range");
                 let d = crate::hnsw::cosine_dist(q, &v);
-                let farthest =
-                    results.peek().map(|r| r.dist).unwrap_or(f32::INFINITY);
+                let farthest = results.peek().map(|r| r.dist).unwrap_or(f32::INFINITY);
                 if d < farthest || results.len() < ef {
                     candidates.push(MinD { idx: n, dist: d });
                     results.push(MaxD { idx: n, dist: d });
@@ -1319,11 +1289,11 @@ impl SuccinctBM25Index {
     /// f32 for now.
     pub fn from_naive(idx: &BM25Index) -> Result<Self, SuccinctDocLensError> {
         // doc_ids: flat 16-byte rows.
-        let doc_id_rows: Vec<[u8; 16]> =
-            (0..idx.doc_count()).map(|i| *idx.doc_ids()[i].as_ref()).collect();
+        let doc_id_rows: Vec<[u8; 16]> = (0..idx.doc_count())
+            .map(|i| *idx.doc_ids()[i].as_ref())
+            .collect();
         let doc_ids_bytes = FixedBytesTable::<16>::build(&doc_id_rows);
-        let doc_ids =
-            FixedBytesTable::<16>::from_bytes(doc_ids_bytes, doc_id_rows.len())?;
+        let doc_ids = FixedBytesTable::<16>::from_bytes(doc_ids_bytes, doc_id_rows.len())?;
 
         // terms: flat 32-byte rows, sorted (idx.terms() guarantees).
         let term_rows: Vec<[u8; 32]> = idx.terms_slice().to_vec();
@@ -1403,9 +1373,7 @@ impl SuccinctBM25Index {
     /// succinct view.
     pub fn docs_containing(
         &self,
-        doc: triblespace::core::query::Variable<
-            triblespace::core::value::schemas::genid::GenId,
-        >,
+        doc: triblespace::core::query::Variable<triblespace::core::value::schemas::genid::GenId>,
         term: [u8; 32],
     ) -> crate::constraint::DocsContainingTerm<'_, SuccinctBM25Index> {
         crate::constraint::DocsContainingTerm::new(self, doc, term)
@@ -1416,9 +1384,7 @@ impl SuccinctBM25Index {
     /// for the succinct view.
     pub fn docs_and_scores(
         &self,
-        doc: triblespace::core::query::Variable<
-            triblespace::core::value::schemas::genid::GenId,
-        >,
+        doc: triblespace::core::query::Variable<triblespace::core::value::schemas::genid::GenId>,
         score: triblespace::core::query::Variable<crate::schemas::F32LE>,
         term: [u8; 32],
     ) -> crate::constraint::BM25ScoredPostings<'_, SuccinctBM25Index> {
@@ -1427,14 +1393,14 @@ impl SuccinctBM25Index {
 
     /// Iterate `(doc_id, score)` postings for `term`. Empty if
     /// the term is absent.
-    pub fn query_term<'a>(
-        &'a self,
-        term: &RawValue,
-    ) -> Box<dyn Iterator<Item = (Id, f32)> + 'a> {
+    pub fn query_term<'a>(&'a self, term: &RawValue) -> Box<dyn Iterator<Item = (Id, f32)> + 'a> {
         match self.terms.binary_search(term) {
             Ok(t) => match self.postings.postings_for(t) {
                 Some(iter) => Box::new(iter.map(move |(doc_idx, score)| {
-                    let raw = self.doc_ids.get(doc_idx as usize).expect("doc_idx in range");
+                    let raw = self
+                        .doc_ids
+                        .get(doc_idx as usize)
+                        .expect("doc_idx in range");
                     let id = Id::new(*raw).expect("non-nil doc_id");
                     (id, score)
                 })),
@@ -1451,17 +1417,14 @@ impl SuccinctBM25Index {
     /// descending by score; no top-k truncation — caller slices
     /// what they need.
     pub fn query_multi(&self, terms: &[RawValue]) -> Vec<(Id, f32)> {
-        let mut acc: std::collections::HashMap<Id, f32> =
-            std::collections::HashMap::new();
+        let mut acc: std::collections::HashMap<Id, f32> = std::collections::HashMap::new();
         for term in terms {
             for (doc, score) in self.query_term(term) {
                 *acc.entry(doc).or_insert(0.0) += score;
             }
         }
         let mut out: Vec<(Id, f32)> = acc.into_iter().collect();
-        out.sort_unstable_by(|a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        out.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         out
     }
 
@@ -1486,8 +1449,7 @@ impl SuccinctBM25Index {
         let n_terms = self.term_count() as u64;
 
         // Capture component metas.
-        let doc_lens_meta: CompactVectorMetaOnDisk =
-            self.doc_lens.inner.metadata().into();
+        let doc_lens_meta: CompactVectorMetaOnDisk = self.doc_lens.inner.metadata().into();
 
         let doc_ids_bytes: Vec<u8> = (0..self.doc_count())
             .flat_map(|i| self.doc_ids.get(i).copied().unwrap_or([0u8; 16]))
@@ -1505,14 +1467,10 @@ impl SuccinctBM25Index {
             .map(|t| self.postings.postings_for(t).unwrap().collect())
             .collect();
         let (postings_region, postings_meta) =
-            SuccinctPostings::build(&lists, self.doc_count() as u32)
-                .expect("re-serialize");
-        let postings_doc_idx_meta: CompactVectorMetaOnDisk =
-            postings_meta.doc_idx.into();
-        let postings_offsets_meta: CompactVectorMetaOnDisk =
-            postings_meta.offsets.into();
-        let postings_scores_meta: CompactVectorMetaOnDisk =
-            postings_meta.scores.into();
+            SuccinctPostings::build(&lists, self.doc_count() as u32).expect("re-serialize");
+        let postings_doc_idx_meta: CompactVectorMetaOnDisk = postings_meta.doc_idx.into();
+        let postings_offsets_meta: CompactVectorMetaOnDisk = postings_meta.offsets.into();
+        let postings_scores_meta: CompactVectorMetaOnDisk = postings_meta.scores.into();
 
         let doc_ids_off = 0u64;
         let doc_ids_len = doc_ids_bytes.len() as u64;
@@ -1584,18 +1542,15 @@ impl SuccinctBM25Index {
         let doc_lens_meta = CompactVectorMetaOnDisk::read_from_bytes(&bytes[44..76])
             .map_err(|_| SuccinctLoadError::BadMeta("doc_lens"))?
             .to_jerky();
-        let postings_doc_idx_meta =
-            CompactVectorMetaOnDisk::read_from_bytes(&bytes[76..108])
-                .map_err(|_| SuccinctLoadError::BadMeta("postings_doc_idx"))?
-                .to_jerky();
-        let postings_offsets_meta =
-            CompactVectorMetaOnDisk::read_from_bytes(&bytes[108..140])
-                .map_err(|_| SuccinctLoadError::BadMeta("postings_offsets"))?
-                .to_jerky();
-        let postings_scores_meta =
-            CompactVectorMetaOnDisk::read_from_bytes(&bytes[140..172])
-                .map_err(|_| SuccinctLoadError::BadMeta("postings_scores"))?
-                .to_jerky();
+        let postings_doc_idx_meta = CompactVectorMetaOnDisk::read_from_bytes(&bytes[76..108])
+            .map_err(|_| SuccinctLoadError::BadMeta("postings_doc_idx"))?
+            .to_jerky();
+        let postings_offsets_meta = CompactVectorMetaOnDisk::read_from_bytes(&bytes[108..140])
+            .map_err(|_| SuccinctLoadError::BadMeta("postings_offsets"))?
+            .to_jerky();
+        let postings_scores_meta = CompactVectorMetaOnDisk::read_from_bytes(&bytes[140..172])
+            .map_err(|_| SuccinctLoadError::BadMeta("postings_scores"))?
+            .to_jerky();
 
         let read_u64 = |off: usize| u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
         let doc_ids_off = read_u64(172) as usize;
@@ -1874,12 +1829,7 @@ mod tests {
     fn fixed_table_binary_search_finds_term() {
         // Sorted table of 32-byte terms — what BM25's term table
         // wants.
-        let mut rows = vec![
-            [5u8; 32],
-            [1u8; 32],
-            [9u8; 32],
-            [3u8; 32],
-        ];
+        let mut rows = vec![[5u8; 32], [1u8; 32], [9u8; 32], [3u8; 32]];
         rows.sort();
         let bytes = FixedBytesTable::<32>::build(&rows);
         let view = FixedBytesTable::<32>::from_bytes(bytes, rows.len()).unwrap();
@@ -1989,10 +1939,7 @@ mod tests {
                     "score drift for {n_id:?}: naive={n_s} succinct={s_s} > tol {tol}"
                 );
             }
-            assert_eq!(
-                naive.doc_frequency(term),
-                succinct.doc_frequency(term)
-            );
+            assert_eq!(naive.doc_frequency(term), succinct.doc_frequency(term));
         }
 
         // Missing term returns nothing.
@@ -2144,8 +2091,7 @@ mod tests {
     fn succinct_bm25_blob_schema_round_trip() {
         use triblespace::core::blob::{ToBlob, TryFromBlob};
         let original = build_succinct_sample();
-        let blob: triblespace::core::blob::Blob<SuccinctBM25Blob> =
-            (&original).to_blob();
+        let blob: triblespace::core::blob::Blob<SuccinctBM25Blob> = (&original).to_blob();
         let reloaded = SuccinctBM25Index::try_from_blob(blob).expect("valid blob");
         assert_eq!(reloaded.doc_count(), original.doc_count());
         assert_eq!(reloaded.term_count(), original.term_count());
@@ -2166,17 +2112,12 @@ mod tests {
         // Layer 0 (full graph): each node knows its two neighbours.
         // Layer 1: only 3 nodes participate; one has empty list.
         let layers = vec![
-            vec![
-                vec![1u32, 2],
-                vec![0, 3],
-                vec![0, 3],
-                vec![1, 2],
-            ],
+            vec![vec![1u32, 2], vec![0, 3], vec![0, 3], vec![1, 2]],
             vec![
                 vec![2u32],
-                vec![],      // node 1 absent → empty list
+                vec![], // node 1 absent → empty list
                 vec![0],
-                vec![],      // node 3 absent → empty list
+                vec![], // node 3 absent → empty list
             ],
         ];
         let (bytes, meta) = SuccinctGraph::build(&layers, 4).unwrap();
@@ -2188,10 +2129,7 @@ mod tests {
         for (layer_idx, layer) in layers.iter().enumerate() {
             for (i, expected) in layer.iter().enumerate() {
                 let got: Vec<u32> = view.neighbours(i, layer_idx).collect();
-                assert_eq!(
-                    &got, expected,
-                    "mismatch at (node {i}, layer {layer_idx})"
-                );
+                assert_eq!(&got, expected, "mismatch at (node {i}, layer {layer_idx})");
             }
         }
     }
@@ -2236,12 +2174,7 @@ mod tests {
         let mut b = HNSWBuilder::new(4).with_seed(42);
         for i in 1..=16u8 {
             let f = i as f32;
-            let vec = vec![
-                f.sin(),
-                f.cos(),
-                (f * 0.5).sin(),
-                (f * 0.3).cos(),
-            ];
+            let vec = vec![f.sin(), f.cos(), (f * 0.5).sin(), (f * 0.3).cos()];
             b.insert(iid(i), vec).unwrap();
         }
         let naive = b.build();
@@ -2305,10 +2238,7 @@ mod tests {
         assert_eq!(orig_hits.len(), load_hits.len());
         for ((a_id, a_s), (b_id, b_s)) in orig_hits.iter().zip(load_hits.iter()) {
             assert_eq!(a_id, b_id);
-            assert!(
-                (a_s - b_s).abs() < 1e-5,
-                "score {a_s} vs {b_s}"
-            );
+            assert!((a_s - b_s).abs() < 1e-5, "score {a_s} vs {b_s}");
         }
     }
 
@@ -2357,8 +2287,7 @@ mod tests {
     fn succinct_hnsw_blob_schema_round_trip() {
         use triblespace::core::blob::{ToBlob, TryFromBlob};
         let original = build_succinct_hnsw_sample();
-        let blob: triblespace::core::blob::Blob<SuccinctHNSWBlob> =
-            (&original).to_blob();
+        let blob: triblespace::core::blob::Blob<SuccinctHNSWBlob> = (&original).to_blob();
         let reloaded = SuccinctHNSWIndex::try_from_blob(blob).expect("valid blob");
         assert_eq!(reloaded.doc_count(), original.doc_count());
         assert_eq!(reloaded.dim(), original.dim());
@@ -2401,15 +2330,23 @@ mod tests {
         // metas).
         let mut b = BM25Builder::new();
         for i in 1..=250u16 {
-            let text = format!(
-                "doc {i} contains the quick brown fox {}",
-                i % 17
-            );
+            let text = format!("doc {i} contains the quick brown fox {}", i % 17);
             let id = Id::new([
                 (i >> 8) as u8,
                 (i & 0xff) as u8,
-                0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
-                0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+                0xaa,
+                0xaa,
+                0xaa,
+                0xaa,
+                0xaa,
+                0xaa,
+                0xaa,
+                0xaa,
+                0xaa,
+                0xaa,
+                0xaa,
+                0xaa,
+                0xaa,
                 if i == 0 { 1 } else { 0xaa },
             ])
             .unwrap();
@@ -2455,8 +2392,7 @@ mod tests {
         // bit-packed CompactVectors (doc_idx 10 bits, offsets
         // 11 bits, scores 16 bits at this scale) plus tiny
         // per-CompactVector overhead — strictly smaller.
-        let naive =
-            total * 4 + (lists.len() + 1) * 4 + total * 4;
+        let naive = total * 4 + (lists.len() + 1) * 4 + total * 4;
         assert!(
             bytes.len() < naive,
             "succinct body {} < naive total {}",

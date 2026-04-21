@@ -17,9 +17,15 @@ fn main() {
     // A corpus of five fragments.
     let corpus = [
         (id(1), "Typst is a markup-based typesetting system."),
-        (id(2), "Wiki fragments are small typst documents linked by id."),
+        (
+            id(2),
+            "Wiki fragments are small typst documents linked by id.",
+        ),
         (id(3), "BM25 scores documents by term frequency and IDF."),
-        (id(4), "Each fragment cites other fragments via wiki: links."),
+        (
+            id(4),
+            "Each fragment cites other fragments via wiki: links.",
+        ),
         (id(5), "Cosine similarity ranks embeddings by direction."),
     ];
 
@@ -63,9 +69,27 @@ fn main() {
     // "documents citing this fragment".
     println!("\ncitation search (term = fragment id):");
     let mut cite_builder = BM25Builder::new();
-    cite_builder.insert(id(10), vec![*id(1).as_ref(); 1].iter().map(|r| raw_from_id(r)).collect());
-    cite_builder.insert(id(11), vec![id(1), id(3)].iter().map(|i| raw_from_id(i.as_ref())).collect());
-    cite_builder.insert(id(12), vec![id(3)].iter().map(|i| raw_from_id(i.as_ref())).collect());
+    cite_builder.insert(
+        id(10),
+        vec![*id(1).as_ref(); 1]
+            .iter()
+            .map(|r| raw_from_id(r))
+            .collect(),
+    );
+    cite_builder.insert(
+        id(11),
+        vec![id(1), id(3)]
+            .iter()
+            .map(|i| raw_from_id(i.as_ref()))
+            .collect(),
+    );
+    cite_builder.insert(
+        id(12),
+        vec![id(3)]
+            .iter()
+            .map(|i| raw_from_id(i.as_ref()))
+            .collect(),
+    );
     let cite_idx = cite_builder.build();
 
     let cites_one: Vec<_> = cite_idx.query_term(&raw_from_id(id(1).as_ref())).collect();

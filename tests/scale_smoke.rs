@@ -137,8 +137,7 @@ fn hnsw_1k_vectors_recall_against_flat() {
         let q: Vec<f32> = (0..DIM)
             .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
             .collect();
-        let truth: HashSet<_> =
-            flat.similar(&q, 10).into_iter().map(|(d, _)| d).collect();
+        let truth: HashSet<_> = flat.similar(&q, 10).into_iter().map(|(d, _)| d).collect();
         let got: HashSet<_> = hnsw
             .similar(&q, 10, Some(100))
             .into_iter()
@@ -323,10 +322,7 @@ fn bm25_quantization_preserves_top10() {
     let all_scores: Vec<f32> = (0..idx.term_count())
         .flat_map(|t| idx.postings_for(t).iter().map(|&(_, s)| s))
         .collect();
-    let max_s = all_scores
-        .iter()
-        .copied()
-        .fold(0.0f32, |a, b| a.max(b));
+    let max_s = all_scores.iter().copied().fold(0.0f32, |a, b| a.max(b));
     assert!(max_s > 0.0, "non-trivial corpus");
 
     // Quantize a score to u16 and dequantize back to f32.
@@ -351,9 +347,18 @@ fn bm25_quantization_preserves_top10() {
     // Sample a dozen queries; top-10 must be stable under the
     // quantize/dequantize round-trip of the aggregated score.
     let queries = [
-        "w0 w1", "w10 w20", "w42", "w99 w100 w101",
-        "w200 w250", "w300", "w50 w60 w70", "w75 w5",
-        "w0 w100 w200 w300", "w12 w24 w36 w48", "w7", "w18 w29",
+        "w0 w1",
+        "w10 w20",
+        "w42",
+        "w99 w100 w101",
+        "w200 w250",
+        "w300",
+        "w50 w60 w70",
+        "w75 w5",
+        "w0 w100 w200 w300",
+        "w12 w24 w36 w48",
+        "w7",
+        "w18 w29",
     ];
     for q_text in &queries {
         let terms = hash_tokens(q_text);
