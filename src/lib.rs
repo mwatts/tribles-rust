@@ -66,46 +66,11 @@ pub mod schemas;
 pub mod succinct;
 pub mod tokens;
 
-/// Current on-disk format version for every index blob.
-///
-/// Bumped on any byte-layout change; `try_from_blob` refuses
-/// older/newer blobs rather than silently misreading them.
-///
-/// History:
-/// - `1`: initial layout. `doc_ids` was a 16-byte `Id` table.
-/// - `2`: SB25 only — generalized `doc_ids` → `keys`: 32-byte
-///   `RawValue` per entry. Unlocks string / tag / composite-key
-///   search through the same index type. See CHANGELOG.
-/// - `3`: SB25 keys table → `CompressedUniverse` (DACs-byte
-///   fragment dictionary). Compresses correlated keys (entity
-///   ids with shared zero-padding, sequential patterns).
-///   Postings' `doc_idx` now references the universe code
-///   (sorted position), not insertion order. Header grows by
-///   40 B for the `CompressedUniverseMeta`.
-/// - `4`: HNSW + FLAT blobs: same `doc_ids` → 32-byte `keys`
-///   generalization SB25 got in v2. `HNSWBuilder::insert` and
-///   `FlatBuilder::insert` now take `RawValue`; `insert_id` /
-///   `insert_value<S>` are the typed wrappers. `similar()`
-///   returns `(RawValue, f32)`; `similar_ids()` is the GenId
-///   decoder. Doubles the keys section (16 B → 32 B), ~2 % of
-///   the HNSW blob at typical embedding sizes.
-/// - `5`: FLAT blob: drop inline `vectors` section. Keys are
-///   paired with `Handle<Blake3, Embedding>` values; the
-///   embedding blobs live in the pile's blob store,
-///   content-addressed and dedup'd across indexes.
-///   `FlatBuilder::insert` now takes a handle, not a `Vec<f32>`.
-///   `FlatIndex::similar` takes a `&BlobStoreGet<Blake3>` to
-///   resolve handles at query time. Blob shrinks from 16 +
-///   4·dim B/doc to 64 B/doc. HNSW path not ported yet this
-///   version.
-/// - `6`: HNSW + SH25 blobs: same treatment. HNSWBuilder now
-///   takes `(key, handle, vec)` — the vec is used for
-///   graph-construction distances during build and stripped
-///   at `build()`, so the final index carries handles only.
-///   `HNSWIndex::similar` + `SuccinctHNSWIndex::similar` both
-///   take a `&BlobStoreGet<Blake3>`. HNSW blob: 32 B/doc keys
-///   + 32 B/doc handles + graph (was 32 B/doc keys + 4·dim
-///   B/doc vectors + graph). Constraints drop the
-///   `HNSWQueryable` trait in favour of eager top-k caching
-///   at construction, matching the Flat constraint pattern.
-pub const FORMAT_VERSION: u16 = 6;
+// Versioning policy: breaking byte-layout changes mint a new
+// `BlobSchema` id (see `SuccinctBM25Blob` / `SuccinctHNSWBlob`
+// in `succinct.rs`). The type system then rules out
+// mismatched-layout deserialization — there's no single
+// global version number. `git log docs/DESIGN.md` has the
+// progression of layout decisions; the blob schema id in
+// `succinct.rs` is authoritative for what any given binary
+// can load.

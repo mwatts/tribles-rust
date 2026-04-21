@@ -52,7 +52,6 @@ use std::collections::HashMap;
 use triblespace::core::id::{Id, RawId};
 use triblespace::core::value::{RawValue, Value, ValueSchema};
 
-use crate::FORMAT_VERSION;
 
 /// Classic BM25 tuning. Defaults match Robertson & Zaragoza 2009.
 const DEFAULT_K1: f32 = 1.5;
@@ -60,21 +59,16 @@ const DEFAULT_B: f32 = 0.75;
 
 // ── Byte layout constants ────────────────────────────────────────────
 
-/// Magic four-byte header tag, little-endian.
-const MAGIC: u32 = u32::from_le_bytes(*b"BM25");
-/// Header length in bytes. Fixed; indices larger than 4 GiB would
-/// overflow the u32 length fields anyway.
-const HEADER_LEN: usize = 32;
+/// Header length in bytes. Five `u32`/`f32` fields, no magic
+/// or version — the blob-level type (e.g. a `BlobSchema` ID
+/// on a typed handle) carries that identity externally.
+const HEADER_LEN: usize = 20;
 
 /// Errors produced by [`BM25Index::try_from_bytes`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum BM25LoadError {
     /// Blob is shorter than the fixed header.
     ShortHeader,
-    /// Magic bytes don't match `"BM25"`.
-    BadMagic,
-    /// Blob version is newer or older than [`FORMAT_VERSION`].
-    VersionMismatch(u16),
     /// Declared section sizes run past the end of the blob.
     TruncatedSection(&'static str),
     /// A posting-list offset is not monotonically non-decreasing.
@@ -85,10 +79,6 @@ impl std::fmt::Display for BM25LoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ShortHeader => write!(f, "BM25 blob shorter than header"),
-            Self::BadMagic => write!(f, "BM25 blob: magic mismatch"),
-            Self::VersionMismatch(v) => {
-                write!(f, "BM25 blob: version {v} (expected {})", FORMAT_VERSION)
-            }
             Self::TruncatedSection(name) => {
                 write!(f, "BM25 blob: truncated section `{name}`")
             }
@@ -522,20 +512,12 @@ impl BM25Index {
                 + (total_postings * 8),
         );
 
-        // ── header (32 B) ────────────────────────────────────────
-        // Fields occupy 28 bytes; 4 bytes of zero-padding at the
-        // end reserve space for a future field without requiring
-        // a version bump for callers that only inspect the early
-        // portion of the header.
-        buf.extend_from_slice(&MAGIC.to_le_bytes()); // 4
-        buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes()); // 2
-        buf.extend_from_slice(&0u16.to_le_bytes()); // reserved, 2
+        // ── header (20 B) ────────────────────────────────────────
         buf.extend_from_slice(&n_docs.to_le_bytes()); // 4
         buf.extend_from_slice(&n_terms.to_le_bytes()); // 4
         buf.extend_from_slice(&self.avg_doc_len.to_le_bytes()); // 4
         buf.extend_from_slice(&self.k1.to_le_bytes()); // 4
         buf.extend_from_slice(&self.b.to_le_bytes()); // 4
-        buf.extend_from_slice(&[0u8; 4]); // pad to 32
         debug_assert_eq!(buf.len(), HEADER_LEN);
 
         // ── keys ─────────────────────────────────────────────────
@@ -563,9 +545,11 @@ impl BM25Index {
     }
 
     /// Reload an index previously produced by [`to_bytes`]. Fails
-    /// cleanly on truncation, bad magic, version mismatch, and
-    /// malformed offsets — the blob is guaranteed well-formed on
-    /// a successful return.
+    /// cleanly on truncation and malformed offsets — the blob is
+    /// guaranteed well-formed on a successful return. Caller
+    /// identifies the blob's type externally (e.g., via a
+    /// typed `BlobSchema` handle); no magic or version field
+    /// is carried in-blob.
     ///
     /// [`to_bytes`]: Self::to_bytes
     pub fn try_from_bytes(bytes: &[u8]) -> Result<Self, BM25LoadError> {
@@ -574,21 +558,12 @@ impl BM25Index {
         if bytes.len() < HEADER_LEN {
             return Err(E::ShortHeader);
         }
-        // Header.
-        let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        if magic != MAGIC {
-            return Err(E::BadMagic);
-        }
-        let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
-        if version != FORMAT_VERSION {
-            return Err(E::VersionMismatch(version));
-        }
-        // bytes[6..8] reserved.
-        let n_docs = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
-        let n_terms = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
-        let avg_doc_len = f32::from_le_bytes(bytes[16..20].try_into().unwrap());
-        let k1 = f32::from_le_bytes(bytes[20..24].try_into().unwrap());
-        let b = f32::from_le_bytes(bytes[24..28].try_into().unwrap());
+        // Header (20 B).
+        let n_docs = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let n_terms = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let avg_doc_len = f32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let k1 = f32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        let b = f32::from_le_bytes(bytes[16..20].try_into().unwrap());
 
         // Section offsets.
         let mut pos = HEADER_LEN;
@@ -877,22 +852,11 @@ mod tests {
         assert_eq!(err, BM25LoadError::ShortHeader);
     }
 
-    #[test]
-    fn bad_magic_rejected() {
-        let mut bytes = build_sample_index().to_bytes();
-        bytes[0] = b'X';
-        let err = BM25Index::try_from_bytes(&bytes).unwrap_err();
-        assert_eq!(err, BM25LoadError::BadMagic);
-    }
-
-    #[test]
-    fn version_mismatch_rejected() {
-        let mut bytes = build_sample_index().to_bytes();
-        // Bump the version byte to something we don't recognize.
-        bytes[4] = 99;
-        let err = BM25Index::try_from_bytes(&bytes).unwrap_err();
-        assert!(matches!(err, BM25LoadError::VersionMismatch(_)));
-    }
+    // `bad_magic_rejected` / `version_mismatch_rejected` used to
+    // live here. The blob no longer carries a magic or version;
+    // the `BlobSchema` ID on the typed handle is the identifier,
+    // and a breaking format change = a new schema ID (and
+    // therefore a new type), which the compiler polices for us.
 
     #[test]
     fn truncation_rejected() {

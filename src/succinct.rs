@@ -51,7 +51,6 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::bm25::BM25Index;
 use crate::hnsw::HNSWIndex;
-use crate::FORMAT_VERSION;
 
 /// Byte-layout mirror of [`CompactVectorMeta`] that's safe to
 /// serialize through our own blob format.
@@ -1035,10 +1034,7 @@ impl SuccinctHNSWIndex {
         let body_len = graph_off + graph_len;
         let mut buf = Vec::with_capacity(SH25_HEADER_LEN + body_len as usize);
 
-        // ── header ────────────────────────────────────────────
-        buf.extend_from_slice(&SH25_MAGIC.to_le_bytes()); // 4
-        buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes()); // 2
-        buf.extend_from_slice(&0u16.to_le_bytes()); // reserved, 2
+        // ── header (144 B) ────────────────────────────────────
         buf.extend_from_slice(&(self.dim as u32).to_le_bytes()); // 4
         buf.extend_from_slice(&self.m.to_le_bytes()); // 2
         buf.extend_from_slice(&self.m0.to_le_bytes()); // 2
@@ -1072,39 +1068,31 @@ impl SuccinctHNSWIndex {
         if bytes.len() < SH25_HEADER_LEN {
             return Err(SuccinctLoadError::ShortHeader);
         }
-        let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        if magic != SH25_MAGIC {
-            return Err(SuccinctLoadError::BadMagic);
-        }
-        let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
-        if version != FORMAT_VERSION {
-            return Err(SuccinctLoadError::VersionMismatch(version));
-        }
-        let dim = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
-        let m = u16::from_le_bytes(bytes[12..14].try_into().unwrap());
-        let m0 = u16::from_le_bytes(bytes[14..16].try_into().unwrap());
-        let max_level = bytes[16];
-        let has_ep = bytes[18] != 0;
-        let ep_raw = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
+        let dim = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let m = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
+        let m0 = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
+        let max_level = bytes[8];
+        let has_ep = bytes[10] != 0;
+        let ep_raw = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
         let entry_point = if has_ep { Some(ep_raw) } else { None };
-        let n_nodes = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
-        let _n_layers = u64::from_le_bytes(bytes[32..40].try_into().unwrap()) as usize;
+        let n_nodes = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
+        let _n_layers = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
 
-        let graph_neighbours_meta = CompactVectorMetaOnDisk::read_from_bytes(&bytes[40..72])
+        let graph_neighbours_meta = CompactVectorMetaOnDisk::read_from_bytes(&bytes[32..64])
             .map_err(|_| SuccinctLoadError::BadMeta("graph.neighbours"))?
             .to_jerky();
-        let graph_offsets_meta = CompactVectorMetaOnDisk::read_from_bytes(&bytes[72..104])
+        let graph_offsets_meta = CompactVectorMetaOnDisk::read_from_bytes(&bytes[64..96])
             .map_err(|_| SuccinctLoadError::BadMeta("graph.offsets"))?
             .to_jerky();
 
         let read_u64 = |off: usize| u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
-        let keys_off = read_u64(104) as usize;
-        let keys_len = read_u64(112) as usize;
-        let handles_off = read_u64(120) as usize;
-        let handles_len = read_u64(128) as usize;
-        let graph_off = read_u64(136) as usize;
-        let graph_len = read_u64(144) as usize;
-        debug_assert_eq!(SH25_HEADER_LEN, 152);
+        let keys_off = read_u64(96) as usize;
+        let keys_len = read_u64(104) as usize;
+        let handles_off = read_u64(112) as usize;
+        let handles_len = read_u64(120) as usize;
+        let graph_off = read_u64(128) as usize;
+        let graph_len = read_u64(136) as usize;
+        debug_assert_eq!(SH25_HEADER_LEN, 144);
         let _ = dim; // dim stays header-only; no inline vectors.
 
         let body_start = SH25_HEADER_LEN;
@@ -1810,15 +1798,11 @@ impl SuccinctBM25Index {
         let body_len = postings_off + postings_len;
         let mut buf = Vec::with_capacity(SUCCINCT_HEADER_LEN + body_len as usize);
 
-        // ── header ────────────────────────────────────────────
-        buf.extend_from_slice(&SUCCINCT_MAGIC.to_le_bytes()); // 4
-        buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes()); // 2
-        buf.extend_from_slice(&0u16.to_le_bytes()); // reserved, 2
+        // ── header (264 B) ────────────────────────────────────
         buf.extend_from_slice(&self.avg_doc_len.to_le_bytes()); // 4
         buf.extend_from_slice(&self.k1.to_le_bytes()); // 4
         buf.extend_from_slice(&self.b.to_le_bytes()); // 4
         buf.extend_from_slice(&postings_meta.max_score.to_le_bytes()); // 4
-        buf.extend_from_slice(&0u32.to_le_bytes()); // reserved, 4
         buf.extend_from_slice(&n_docs.to_le_bytes()); // 8
         buf.extend_from_slice(&n_terms.to_le_bytes()); // 8
         buf.extend_from_slice(doc_lens_meta.as_bytes()); // 32
@@ -1834,9 +1818,6 @@ impl SuccinctBM25Index {
         buf.extend_from_slice(&doc_lens_len.to_le_bytes());
         buf.extend_from_slice(&postings_off.to_le_bytes());
         buf.extend_from_slice(&postings_len.to_le_bytes());
-        // 4-byte tail pad so SUCCINCT_HEADER_LEN is a multiple
-        // of 8 (see const doc for rationale).
-        buf.extend_from_slice(&[0u8; 4]);
         debug_assert_eq!(buf.len(), SUCCINCT_HEADER_LEN);
 
         // ── body ──────────────────────────────────────────────
@@ -1860,49 +1841,39 @@ impl SuccinctBM25Index {
         if bytes.len() < SUCCINCT_HEADER_LEN {
             return Err(SuccinctLoadError::ShortHeader);
         }
-        let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        if magic != SUCCINCT_MAGIC {
-            return Err(SuccinctLoadError::BadMagic);
-        }
-        let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
-        if version != FORMAT_VERSION {
-            return Err(SuccinctLoadError::VersionMismatch(version));
-        }
-        // reserved [6..8]
-        let avg_doc_len = f32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        let k1 = f32::from_le_bytes(bytes[12..16].try_into().unwrap());
-        let b = f32::from_le_bytes(bytes[16..20].try_into().unwrap());
-        let max_score = f32::from_le_bytes(bytes[20..24].try_into().unwrap());
-        // reserved [24..28]
-        let n_docs = u64::from_le_bytes(bytes[28..36].try_into().unwrap()) as usize;
-        let n_terms = u64::from_le_bytes(bytes[36..44].try_into().unwrap()) as usize;
+        let avg_doc_len = f32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let k1 = f32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        let b = f32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let max_score = f32::from_le_bytes(bytes[12..16].try_into().unwrap());
+        let n_docs = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
+        let n_terms = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
 
-        let doc_lens_meta = CompactVectorMetaOnDisk::read_from_bytes(&bytes[44..76])
+        let doc_lens_meta = CompactVectorMetaOnDisk::read_from_bytes(&bytes[32..64])
             .map_err(|_| SuccinctLoadError::BadMeta("doc_lens"))?
             .to_jerky();
-        let postings_doc_idx_meta = CompactVectorMetaOnDisk::read_from_bytes(&bytes[76..108])
+        let postings_doc_idx_meta = CompactVectorMetaOnDisk::read_from_bytes(&bytes[64..96])
             .map_err(|_| SuccinctLoadError::BadMeta("postings_doc_idx"))?
             .to_jerky();
-        let postings_offsets_meta = CompactVectorMetaOnDisk::read_from_bytes(&bytes[108..140])
+        let postings_offsets_meta = CompactVectorMetaOnDisk::read_from_bytes(&bytes[96..128])
             .map_err(|_| SuccinctLoadError::BadMeta("postings_offsets"))?
             .to_jerky();
-        let postings_scores_meta = CompactVectorMetaOnDisk::read_from_bytes(&bytes[140..172])
+        let postings_scores_meta = CompactVectorMetaOnDisk::read_from_bytes(&bytes[128..160])
             .map_err(|_| SuccinctLoadError::BadMeta("postings_scores"))?
             .to_jerky();
-        let keys_meta = CompressedUniverseMetaOnDisk::read_from_bytes(&bytes[172..212])
+        let keys_meta = CompressedUniverseMetaOnDisk::read_from_bytes(&bytes[160..200])
             .map_err(|_| SuccinctLoadError::BadMeta("keys"))?
             .to_jerky();
 
         let read_u64 = |off: usize| u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
-        let keys_off = read_u64(212) as usize;
-        let keys_len = read_u64(220) as usize;
-        let terms_off = read_u64(228) as usize;
-        let terms_len = read_u64(236) as usize;
-        let doc_lens_off = read_u64(244) as usize;
-        let doc_lens_len = read_u64(252) as usize;
-        let postings_off = read_u64(260) as usize;
-        let postings_len = read_u64(268) as usize;
-        debug_assert_eq!(SUCCINCT_HEADER_LEN, 280);
+        let keys_off = read_u64(200) as usize;
+        let keys_len = read_u64(208) as usize;
+        let terms_off = read_u64(216) as usize;
+        let terms_len = read_u64(224) as usize;
+        let doc_lens_off = read_u64(232) as usize;
+        let doc_lens_len = read_u64(240) as usize;
+        let postings_off = read_u64(248) as usize;
+        let postings_len = read_u64(256) as usize;
+        debug_assert_eq!(SUCCINCT_HEADER_LEN, 264);
 
         let body_start = SUCCINCT_HEADER_LEN;
         let body = &bytes[body_start..];
@@ -1953,34 +1924,30 @@ impl SuccinctBM25Index {
     }
 }
 
-/// Magic header tag for SuccinctBM25Index blobs.
-/// Magic tag at the start of an SB25 blob.
-const SUCCINCT_MAGIC: u32 = u32::from_le_bytes(*b"SB25");
-/// Header length in bytes.
+/// Header length in bytes for an `SuccinctBM25Index` blob.
 ///
-/// Layout: 4 magic + 2 version + 2 reserved + 4 avg_doc_len +
-/// 4 k1 + 4 b + 4 max_score + 4 reserved + 8 n_docs + 8 n_terms
-/// + 4 × 32 CompactVectorMeta (doc_lens, postings.doc_idx,
-/// postings.offsets, postings.scores) + 1 × 40
+/// Layout: 4 avg_doc_len + 4 k1 + 4 b + 4 max_score + 8 n_docs
+/// + 8 n_terms + 4 × 32 CompactVectorMeta (doc_lens,
+/// postings.doc_idx, postings.offsets, postings.scores) + 1 × 40
 /// CompressedUniverseMeta (keys) + 4 × 16 section (offset, len)
-/// + 4 B tail padding = 280.
+/// = 264.
 ///
-/// The tail pad keeps the header a multiple of 8 bytes so
-/// `body_offset = SUCCINCT_HEADER_LEN + section_offset` lands
-/// on a u64-aligned absolute address — jerky's view types
-/// reinterpret the slice as `[u64]` and refuse misaligned
-/// starts with an `Alignment` error.
-const SUCCINCT_HEADER_LEN: usize = 280;
+/// No magic, no version field — a typed `BlobSchema` handle on
+/// the pile side carries the identity. Breaking format changes
+/// mint a new schema id.
+///
+/// 264 is a multiple of 8, so `body_offset = SUCCINCT_HEADER_LEN
+/// + section_offset` lands on a u64-aligned absolute address —
+/// jerky's view types reinterpret the slice as `[u64]` and
+/// refuse misaligned starts with an `Alignment` error.
+const SUCCINCT_HEADER_LEN: usize = 264;
 
-/// Errors loading a `SuccinctBM25Index` blob.
+/// Errors loading a `SuccinctBM25Index` or `SuccinctHNSWIndex`
+/// blob.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SuccinctLoadError {
     /// Blob shorter than the fixed header.
     ShortHeader,
-    /// Magic bytes don't match `"SB25"`.
-    BadMagic,
-    /// Unknown format version.
-    VersionMismatch(u16),
     /// A declared section extends past the blob body.
     TruncatedSection(&'static str),
     /// A `CompactVectorMeta` in the header couldn't be parsed.
@@ -1990,15 +1957,11 @@ pub enum SuccinctLoadError {
 impl std::fmt::Display for SuccinctLoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::ShortHeader => write!(f, "SB25 blob shorter than header"),
-            Self::BadMagic => write!(f, "SB25 blob: magic mismatch"),
-            Self::VersionMismatch(v) => {
-                write!(f, "SB25 blob: version {v} (expected {FORMAT_VERSION})")
-            }
+            Self::ShortHeader => write!(f, "succinct blob shorter than header"),
             Self::TruncatedSection(name) => {
-                write!(f, "SB25 blob: truncated section `{name}`")
+                write!(f, "succinct blob: truncated section `{name}`")
             }
-            Self::BadMeta(name) => write!(f, "SB25 blob: bad CompactVectorMeta `{name}`"),
+            Self::BadMeta(name) => write!(f, "succinct blob: bad meta `{name}`"),
         }
     }
 }
@@ -2006,15 +1969,22 @@ impl std::fmt::Display for SuccinctLoadError {
 impl std::error::Error for SuccinctLoadError {}
 
 /// Content-addressed [`BlobSchema`] marker for the succinct
-/// BM25 blob format (SB25 / 212 B header + bit-packed body).
+/// BM25 blob format — 264 B header + bit-packed body.
 ///
-/// Schema id minted via `trible genid`:
-/// `68C03764D04D05DF65E49589FBBA1441`. This is the canonical
-/// on-pile representation of a BM25 index in this crate.
+/// Schema id minted fresh via `trible genid`:
+/// `5A1EF3FFD638B15E3EBEAA1E92660441`. Any breaking format
+/// change mints a new id (i.e. a new type), which the
+/// compiler treats as a different blob entirely — so readers
+/// can't accidentally deserialize a mismatched layout.
+///
+/// Previous id `68C03764D04D05DF65E49589FBBA1441` retired
+/// when the blob dropped its magic+version preamble and the
+/// now-unnecessary reserved u32, so it's not drop-in
+/// compatible with older blobs.
 pub enum SuccinctBM25Blob {}
 
 impl ConstId for SuccinctBM25Blob {
-    const ID: Id = id_hex!("68C03764D04D05DF65E49589FBBA1441");
+    const ID: Id = id_hex!("5A1EF3FFD638B15E3EBEAA1E92660441");
 }
 
 impl BlobSchema for SuccinctBM25Blob {}
@@ -2039,26 +2009,34 @@ impl TryFromBlob<SuccinctBM25Blob> for SuccinctBM25Index {
     }
 }
 
-/// Magic header tag for SuccinctHNSWIndex blobs.
-const SH25_MAGIC: u32 = u32::from_le_bytes(*b"SH25");
-/// Header length in bytes.
+/// Header length in bytes for a `SuccinctHNSWIndex` blob.
 ///
-/// Layout: 4 magic + 2 version + 2 reserved + 4 dim + 2 m + 2 m0
-/// + 1 max_level + 1 reserved + 1 has_entry + 1 reserved + 4
-/// entry_point + 8 n_nodes + 8 n_layers + 2 × 32 CompactVectorMeta
-/// + 6 × 8 section (offset, len) = 152.
-const SH25_HEADER_LEN: usize = 152;
+/// Layout: 4 dim + 2 m + 2 m0 + 1 max_level + 1 reserved +
+/// 1 has_entry + 1 reserved + 4 entry_point + 8 n_nodes +
+/// 8 n_layers + 2 × 32 CompactVectorMeta + 6 × 8 section
+/// (offset, len) = 144.
+///
+/// No magic, no version — schema identity is carried by the
+/// typed `BlobSchema` handle. Breaking format changes mint a
+/// new schema id.
+const SH25_HEADER_LEN: usize = 144;
 
 /// Content-addressed [`BlobSchema`] marker for the succinct
-/// HNSW blob format (SH25 / 152 B header + f32 vectors + jerky-
-/// packed graph).
+/// HNSW blob format — 144 B header + keys + handles + jerky-
+/// packed graph. Embeddings themselves live as separate blobs
+/// in the pile, referenced by handle.
 ///
-/// Schema id minted via `trible genid`:
-/// `7AFE59E7F895B23F05452FF7919E12E4`.
+/// Schema id minted fresh via `trible genid`:
+/// `27D71A473EF22DA4D916F61810AC5D86`. Any breaking format
+/// change mints a new id (i.e. a new type), so the compiler
+/// rules out mismatched-layout deserialization.
+///
+/// Previous id `7AFE59E7F895B23F05452FF7919E12E4` retired
+/// when the blob dropped its magic+version preamble.
 pub enum SuccinctHNSWBlob {}
 
 impl ConstId for SuccinctHNSWBlob {
-    const ID: Id = id_hex!("7AFE59E7F895B23F05452FF7919E12E4");
+    const ID: Id = id_hex!("27D71A473EF22DA4D916F61810AC5D86");
 }
 
 impl BlobSchema for SuccinctHNSWBlob {}
@@ -2413,21 +2391,10 @@ mod tests {
         assert_eq!(err, SuccinctLoadError::ShortHeader);
     }
 
-    #[test]
-    fn succinct_bm25_rejects_bad_magic() {
-        let mut bytes = build_succinct_sample().to_bytes();
-        bytes[0] = b'X';
-        let err = SuccinctBM25Index::try_from_bytes(&bytes).unwrap_err();
-        assert_eq!(err, SuccinctLoadError::BadMagic);
-    }
-
-    #[test]
-    fn succinct_bm25_rejects_bad_version() {
-        let mut bytes = build_succinct_sample().to_bytes();
-        bytes[4] = 99;
-        let err = SuccinctBM25Index::try_from_bytes(&bytes).unwrap_err();
-        assert!(matches!(err, SuccinctLoadError::VersionMismatch(_)));
-    }
+    // Magic/version rejection tests retired along with the
+    // fields themselves — the typed `BlobSchema` handle
+    // carries blob identity now, and a breaking layout change
+    // mints a new schema id (a different type).
 
     #[test]
     fn succinct_bm25_rejects_truncation() {
@@ -2637,23 +2604,10 @@ mod tests {
         assert_eq!(err, SuccinctLoadError::ShortHeader);
     }
 
-    #[test]
-    fn succinct_hnsw_rejects_bad_magic() {
-        let (idx, _) = build_succinct_hnsw_sample();
-        let mut bytes = idx.to_bytes();
-        bytes[0] = b'X';
-        let err = SuccinctHNSWIndex::try_from_bytes(&bytes).unwrap_err();
-        assert_eq!(err, SuccinctLoadError::BadMagic);
-    }
-
-    #[test]
-    fn succinct_hnsw_rejects_bad_version() {
-        let (idx, _) = build_succinct_hnsw_sample();
-        let mut bytes = idx.to_bytes();
-        bytes[4] = 99;
-        let err = SuccinctHNSWIndex::try_from_bytes(&bytes).unwrap_err();
-        assert!(matches!(err, SuccinctLoadError::VersionMismatch(_)));
-    }
+    // Magic/version rejection tests retired — `SuccinctHNSWBlob`
+    // (the schema) is what a typed handle commits to; old-layout
+    // blobs are literally a different type and can't reach this
+    // reader.
 
     #[test]
     fn succinct_hnsw_rejects_truncation() {

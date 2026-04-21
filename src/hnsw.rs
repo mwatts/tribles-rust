@@ -45,19 +45,21 @@ use triblespace::core::value::schemas::hash::{Blake3, Handle};
 use triblespace::core::value::{RawValue, Value, ValueSchema};
 
 use crate::schemas::Embedding;
-use crate::FORMAT_VERSION;
 
 // ── HNSW blob byte format ────────────────────────────────────────────
+//
+// No magic bytes, no version field: the blob-level type
+// (a typed `BlobSchema` / handle on the pile side, or the
+// `HNSWIndex::try_from_bytes` entry point itself) is the
+// identity. A breaking format change mints a new schema ID
+// and therefore a new type, so the compiler polices it.
 
-const HNSW_MAGIC: u32 = u32::from_le_bytes(*b"HNSW");
-const HNSW_HEADER_LEN: usize = 32;
+const HNSW_HEADER_LEN: usize = 24;
 
 /// Errors produced by [`HNSWIndex::try_from_bytes`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum HNSWLoadError {
     ShortHeader,
-    BadMagic,
-    VersionMismatch(u16),
     TruncatedSection(&'static str),
     /// A stored neighbour index is `>= n_nodes`.
     OutOfRangeNeighbour(u32),
@@ -69,10 +71,6 @@ impl std::fmt::Display for HNSWLoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ShortHeader => write!(f, "HNSW blob shorter than header"),
-            Self::BadMagic => write!(f, "HNSW blob: magic mismatch"),
-            Self::VersionMismatch(v) => {
-                write!(f, "HNSW blob: version {v} (expected {})", FORMAT_VERSION)
-            }
             Self::TruncatedSection(name) => {
                 write!(f, "HNSW blob: truncated section `{name}`")
             }
@@ -91,18 +89,15 @@ impl std::fmt::Display for HNSWLoadError {
 
 impl std::error::Error for HNSWLoadError {}
 
-// Byte format for the flat k-NN blob. A separate magic from the
-// eventual proper-HNSW blob ("FLAT" vs "HNSW") — they're
-// different on-disk shapes (flat = no layers, no graph).
-const FLAT_MAGIC: u32 = u32::from_le_bytes(*b"FLAT");
-const FLAT_HEADER_LEN: usize = 32;
+// Byte format for the flat k-NN blob — different on-disk
+// shape from HNSW (no layers, no graph). Same no-magic /
+// no-version discipline.
+const FLAT_HEADER_LEN: usize = 24;
 
 /// Errors produced by [`FlatIndex::try_from_bytes`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum FlatLoadError {
     ShortHeader,
-    BadMagic,
-    VersionMismatch(u16),
     TruncatedSection(&'static str),
 }
 
@@ -110,10 +105,6 @@ impl std::fmt::Display for FlatLoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ShortHeader => write!(f, "FLAT blob shorter than header"),
-            Self::BadMagic => write!(f, "FLAT blob: magic mismatch"),
-            Self::VersionMismatch(v) => {
-                write!(f, "FLAT blob: version {v} (expected {})", FORMAT_VERSION)
-            }
             Self::TruncatedSection(n) => write!(f, "FLAT blob: truncated section `{n}`"),
         }
     }
@@ -648,10 +639,7 @@ impl HNSWIndex {
         let dim = self.dim as u32;
 
         let mut buf = Vec::new();
-        // Header.
-        buf.extend_from_slice(&HNSW_MAGIC.to_le_bytes()); // 4
-        buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes()); // 2
-        buf.extend_from_slice(&0u16.to_le_bytes()); // 2 reserved
+        // Header (24 B).
         buf.extend_from_slice(&n_nodes.to_le_bytes()); // 4
         buf.extend_from_slice(&dim.to_le_bytes()); // 4
         buf.extend_from_slice(&self.m.to_le_bytes()); // 2
@@ -660,7 +648,7 @@ impl HNSWIndex {
         buf.push(has_entry); // 1
         buf.extend_from_slice(&[0u8; 2]); // 2 reserved
         buf.extend_from_slice(&entry.to_le_bytes()); // 4
-        buf.extend_from_slice(&[0u8; 4]); // 4 reserved → 32
+        buf.extend_from_slice(&[0u8; 4]); // 4 trailing pad → 24
         debug_assert_eq!(buf.len(), HNSW_HEADER_LEN);
 
         // keys
@@ -721,23 +709,15 @@ impl HNSWIndex {
         if bytes.len() < HNSW_HEADER_LEN {
             return Err(E::ShortHeader);
         }
-        let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        if magic != HNSW_MAGIC {
-            return Err(E::BadMagic);
-        }
-        let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
-        if version != FORMAT_VERSION {
-            return Err(E::VersionMismatch(version));
-        }
-        let n_nodes = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
-        let dim = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
-        let m = u16::from_le_bytes(bytes[16..18].try_into().unwrap());
-        let m0 = u16::from_le_bytes(bytes[18..20].try_into().unwrap());
-        let max_level = bytes[20];
-        let has_entry = bytes[21] != 0;
-        // bytes[22..24] reserved
-        let entry_raw = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
-        // bytes[28..32] reserved
+        let n_nodes = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let dim = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let m = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
+        let m0 = u16::from_le_bytes(bytes[10..12].try_into().unwrap());
+        let max_level = bytes[12];
+        let has_entry = bytes[13] != 0;
+        // bytes[14..16] reserved
+        let entry_raw = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+        // bytes[20..24] reserved
 
         let mut pos = HNSW_HEADER_LEN;
         // keys
@@ -1401,12 +1381,9 @@ impl FlatIndex {
 
         let mut buf = Vec::with_capacity(FLAT_HEADER_LEN + self.keys.len() * 64);
 
-        buf.extend_from_slice(&FLAT_MAGIC.to_le_bytes()); // 4
-        buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes()); // 2
-        buf.extend_from_slice(&0u16.to_le_bytes()); // 2 reserved
         buf.extend_from_slice(&n_docs.to_le_bytes()); // 4
         buf.extend_from_slice(&dim.to_le_bytes()); // 4
-        buf.extend_from_slice(&[0u8; 16]); // 16 reserved → total 32
+        buf.extend_from_slice(&[0u8; 16]); // 16 trailing pad → total 24
         debug_assert_eq!(buf.len(), FLAT_HEADER_LEN);
 
         for key in &self.keys {
@@ -1427,16 +1404,8 @@ impl FlatIndex {
         if bytes.len() < FLAT_HEADER_LEN {
             return Err(E::ShortHeader);
         }
-        let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        if magic != FLAT_MAGIC {
-            return Err(E::BadMagic);
-        }
-        let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
-        if version != FORMAT_VERSION {
-            return Err(E::VersionMismatch(version));
-        }
-        let n_docs = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
-        let dim = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let n_docs = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let dim = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
 
         let mut pos = FLAT_HEADER_LEN;
         let keys_end = pos + n_docs * 32;
@@ -1688,14 +1657,9 @@ mod tests {
         assert_eq!(err, FlatLoadError::ShortHeader);
     }
 
-    #[test]
-    fn flat_bad_magic_rejected() {
-        let (idx, _store) = sample_flat();
-        let mut bytes = idx.to_bytes();
-        bytes[0] = b'X';
-        let err = FlatIndex::try_from_bytes(&bytes).unwrap_err();
-        assert_eq!(err, FlatLoadError::BadMagic);
-    }
+    // Magic/version rejection tests are gone — the blob no
+    // longer carries those fields. Load identity is established
+    // by the typed `BlobSchema` handle instead.
 
     #[test]
     fn flat_truncation_rejected() {
@@ -1922,12 +1886,7 @@ mod tests {
         assert_eq!(err, HNSWLoadError::ShortHeader);
     }
 
-    #[test]
-    fn hnsw_bad_magic_rejected() {
-        let (idx, _) = sample_hnsw();
-        let mut bytes = idx.to_bytes();
-        bytes[0] = b'X';
-        let err = HNSWIndex::try_from_bytes(&bytes).unwrap_err();
-        assert_eq!(err, HNSWLoadError::BadMagic);
-    }
+    // No magic/version rejection test — those fields are gone.
+    // Blob identity now comes from the typed `BlobSchema`
+    // handle, which the compiler checks for us.
 }

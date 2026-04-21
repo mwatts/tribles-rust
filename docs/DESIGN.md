@@ -46,19 +46,17 @@ time.
 ## `SuccinctBM25Index` — SB25 blob layout
 
 Self-contained blob, zero-copy via `anybytes::Bytes`, bit-packed
-via jerky. Schema id: `68C03764D04D05DF65E49589FBBA1441` (see
-`succinct::SuccinctBM25Blob`).
+via jerky. Schema id: `5A1EF3FFD638B15E3EBEAA1E92660441` (see
+`succinct::SuccinctBM25Blob`). The typed `BlobSchema` handle is
+the identity — no magic bytes, no version field in the blob.
+A breaking format change mints a new schema id.
 
 ```
-[header              ] 280 B (fixed)
-  magic                   u32    ; "SB25"
-  version                 u16    ; FORMAT_VERSION = 3
-  reserved                u16
+[header              ] 264 B (fixed)
   avg_doc_len             f32    ; for length normalization
   k1                      f32    ; BM25 tuning (default 1.5)
   b                       f32    ; BM25 tuning (default 0.75)
   max_score               f32    ; u16-quantization scale
-  reserved                u32
   n_docs                  u64
   n_terms                 u64
   doc_lens_meta           32 B   ; CompactVectorMetaOnDisk
@@ -67,8 +65,6 @@ via jerky. Schema id: `68C03764D04D05DF65E49589FBBA1441` (see
   postings_scores_meta    32 B   ; CompactVectorMetaOnDisk
   keys_meta               40 B   ; CompressedUniverseMetaOnDisk
   (section_offset, section_len) × 4 = 64 B
-  tail pad                 4 B   ; so body starts at offset 280,
-                                  ; keeping section offsets 8-aligned
 
 [keys                ] variable         ; CompressedUniverse view:
                                         ; 4-byte fragment dictionary
@@ -89,11 +85,10 @@ via jerky. Schema id: `68C03764D04D05DF65E49589FBBA1441` (see
                                         ;   scores  (width 16, u16-quantized)
 ```
 
-Every body section starts on an 8-byte boundary; the header
-carries a 4-byte tail pad to land the first body section on an
-8-aligned absolute offset. `CompactVector` reinterprets its
-backing buffer as `[u64]`, so misalignment would panic at load
-time.
+Every body section starts on an 8-byte boundary; the header's
+264-byte length is already a multiple of 8, so no tail padding
+is needed. `CompactVector` reinterprets its backing buffer as
+`[u64]`, so misalignment would panic at load time.
 
 The four `CompactVectorMetaOnDisk` structs are a
 [`zerocopy::IntoBytes`]-deriveable mirror of jerky's
@@ -182,14 +177,12 @@ Lookup algorithm:
 ## `SuccinctHNSWIndex` — SH25 blob layout
 
 Self-contained blob, zero-copy via `anybytes::Bytes`. Schema id:
-`7AFE59E7F895B23F05452FF7919E12E4` (see
-`succinct::SuccinctHNSWBlob`).
+`27D71A473EF22DA4D916F61810AC5D86` (see
+`succinct::SuccinctHNSWBlob`). As with SB25, the typed handle
+is the identity — no in-blob magic or version.
 
 ```
-[header              ] 152 B (fixed)
-  magic                   u32    ; "SH25"
-  version                 u16
-  reserved                u16
+[header              ] 144 B (fixed)
   dim                     u32
   m                       u16    ; max neighbours on non-zero layers
   m0                      u16    ; max neighbours on layer 0
@@ -204,13 +197,12 @@ Self-contained blob, zero-copy via `anybytes::Bytes`. Schema id:
   graph_offsets_meta      32 B   ; CompactVectorMetaOnDisk
   (section_offset, section_len) × 3 = 48 B
 
-[doc_ids             ] n_nodes × 16 B
-[vectors             ] n_nodes × dim × 4 B    ; flat f32 LE,
-                                              ; L2-normalized at insert
-[graph_bytes         ] variable               ; two CompactVectors in one
-                                              ; ByteArea:
-                                              ;   neighbours (width log2(n+1))
-                                              ;   offsets    (width log2(E+1))
+[keys                ] n_nodes × 32 B
+[handles             ] n_nodes × 32 B          ; Value<Handle<Blake3, Embedding>>
+[graph_bytes         ] variable                ; two CompactVectors in one
+                                               ; ByteArea:
+                                               ;   neighbours (width log2(n+1))
+                                               ;   offsets    (width log2(E+1))
 ```
 
 `graph_bytes` packs neighbour lists across all `(layer, node)`
@@ -375,7 +367,7 @@ quantization.
 
 | Section            | Per-entry | Count      | Naive bytes | SB25 bytes  |
 | :----------------- | --------: | ---------: | ----------: | ----------: |
-| header             | —         | —          |       32 B  |     280 B   |
+| header             | —         | —          |       20 B  |     264 B   |
 | keys               |    32 B   | 100 000    |   3.2 MiB   | ~1.5–3.2 MiB|
 | doc_lens           |     4 B   | 100 000    |   0.4 MiB   | ~0.12 MiB   |
 | terms (sorted)     |    32 B   | 300 000    |   9.6 MiB   |  9.6 MiB    |
