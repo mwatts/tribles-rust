@@ -174,8 +174,36 @@ if (observed - expected).abs() <= tol { /* match */ }
 
 `triblespace-search` identifies each blob format by a
 `BlobSchema` `ConstId`. A breaking byte-layout change rotates
-that ID. If your crate has minted an attribute whose value
-type references one of our schemas — e.g.
+that ID. Understanding what that *doesn't* do is important:
+
+### `ConstId` is metadata, not a runtime type guard
+
+`SuccinctBM25Blob::ID` is used by the describe/introspection
+machinery and by derivations like `Handle<H, T>::ID =
+hash(H::ID, T::ID)`. It is **not** checked by
+`try_from_blob` — that dispatches on the Rust type
+parameter. After an ID rotation:
+
+- `SuccinctBM25Blob` is the same Rust type with the same
+  `TryFromBlob` impl.
+- `Blob<SuccinctBM25Blob>` is the same Rust type.
+- Bytes in the pile under an old handle are the same bytes.
+- `reader.get::<SuccinctBM25Index, SuccinctBM25Blob>(h)`
+  returns those bytes and happily tries to parse them. If
+  the old-format and new-format byte layouts happen to
+  alias cleanly, you'll decode wrong values with no error.
+  If they don't, you'll get a `TruncatedSection` —
+  eventually, at runtime, not at compile time.
+
+So the rotation **doesn't enforce anything on its own.** It's
+a signal that old bytes and new code aren't compatible — the
+caller has to act on that signal by rotating the identity
+that the pile *does* use for dispatch.
+
+### What the caller has to rotate
+
+If you have an attribute whose value type references one of
+our blob schemas — e.g.
 
 ```rust
 struct WikiBm25Handle;
@@ -183,32 +211,26 @@ impl ConstId for WikiBm25Handle { const ID: Id = id_hex!("…"); }
 // value type: Handle<Blake3, SuccinctBM25Blob>
 ```
 
-then rolling forward to a new version of this crate means:
+the attribute `ConstId` is your stable contract for
+"triples under this attribute hold *this* kind of value."
+When we rotate `SuccinctBM25Blob::ID`, the Rust type the
+attribute's value resolves to has changed underneath, but
+the attribute's own ID hasn't — so old triples are still
+under the same attribute, silently pointing at blobs whose
+bytes no longer match what the code thinks they are.
 
-1. **Types re-derive automatically.** `Handle<Blake3,
-   SuccinctBM25Blob>::ID` cascades from our new schema id
-   on recompile — Rust's `ConstId` derivation for `Handle`
-   is `hash(H::ID, T::ID)`. The type system catches
-   callers that try to mix old-schema handles with
-   new-schema readers at compile time.
-
-2. **Stored triples do not.** Triples you already wrote
-   under the old attribute still point at *old-format*
-   blobs. The old attribute now implicitly claims to hold
-   new-format blobs (semantically — the on-disk triple is
-   unchanged), so those triples are effectively orphaned:
-   readable only by a binary pinned to the old crate
-   version. Re-ingest is the clean path.
-
-Migration recipe for any attribute that holds a handle to
-one of our schemas:
+Migration recipe:
 
 1. `trible genid` → new attribute id, e.g. `wiki::bm25-v2`.
 2. Rebuild the index against the new schema, `put` the
    blob, write the handle under the new attribute.
-3. Transition readers to the new attribute. Once no reader
-   references the old attribute, `pile keep` will sweep
-   the old blobs the next time you consolidate.
+3. Transition readers to the new attribute. The old
+   attribute + its stored triples become inert (any binary
+   using them would have to keep the old crate version
+   pinned anyway, because the old blob schema doesn't
+   survive the rotation).
+4. Once no reader references the old attribute, `pile keep`
+   sweeps the orphaned blobs at the next consolidation.
 
 Attributes whose value type is a plain `ShortString`,
 `LongString`, `GenId`, etc. (anything not parameterized on a
