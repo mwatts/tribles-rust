@@ -1,0 +1,33 @@
+[package]
+name = "triblespace-search"
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Content-addressed BM25 + HNSW indexes on top of triblespace piles."
+authors = ["Jan-Paul Bultmann <jp@bultmann.eu>"]
+homepage = "https://github.com/triblespace/triblespace-search"
+repository = "https://github.com/triblespace/triblespace-search"
+readme = "README.md"
+keywords = ["triblespace", "bm25", "hnsw", "search", "succinct"]
+categories = ["data-structures", "text-processing"]
+
+[dependencies]
+triblespace = "0.36"
+anybytes = "0.20"
+# jerky — succinct data structures; optional for the v1 scaffold,
+# required once we flip from flat-array prototypes to the
+# wavelet-matrix-backed blobs.
+jerky = { version = "0.9", optional = true }
+# blake3 — for `hash_tokens` helper (callers hash their own tokens
+# into 32-byte triblespace Values).
+blake3 = "1"
+
+[features]
+default = ["succinct"]
+# Swap the naive flat-array implementations for the succinct
+# jerky-backed ones. On until we have both working; off lets us
+# test the naive path in isolation.
+succinct = ["dep:jerky"]
+
+[package.metadata.docs.rs]
+all-features = true
