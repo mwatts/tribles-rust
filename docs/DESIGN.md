@@ -50,9 +50,9 @@ via jerky. Schema id: `68C03764D04D05DF65E49589FBBA1441` (see
 `succinct::SuccinctBM25Blob`).
 
 ```
-[header              ] 236 B (fixed)
+[header              ] 280 B (fixed)
   magic                   u32    ; "SB25"
-  version                 u16
+  version                 u16    ; FORMAT_VERSION = 3
   reserved                u16
   avg_doc_len             f32    ; for length normalization
   k1                      f32    ; BM25 tuning (default 1.5)
@@ -65,34 +65,55 @@ via jerky. Schema id: `68C03764D04D05DF65E49589FBBA1441` (see
   postings_doc_idx_meta   32 B   ; CompactVectorMetaOnDisk
   postings_offsets_meta   32 B   ; CompactVectorMetaOnDisk
   postings_scores_meta    32 B   ; CompactVectorMetaOnDisk
+  keys_meta               40 B   ; CompressedUniverseMetaOnDisk
   (section_offset, section_len) × 4 = 64 B
+  tail pad                 4 B   ; so body starts at offset 280,
+                                  ; keeping section offsets 8-aligned
 
-[doc_ids             ] n_docs × 16 B   ; flat RawId table
+[keys                ] variable         ; CompressedUniverse view:
+                                        ; 4-byte fragment dictionary
+                                        ; (sorted, deduped) + DACs-byte
+                                        ; codes, one per unique key.
+                                        ; `keys.access(code)` decodes
+                                        ; the 32-byte RawValue.
 [terms               ] n_terms × 32 B  ; sorted RawValue table
 [doc_lens            ] variable         ; jerky CompactVector body
                                         ; width = ceil(log2(max_len + 1))
+                                        ; indexed by universe-code order
 [postings            ] variable         ; three jerky CompactVectors in
                                         ; one ByteArea:
-                                        ;   doc_idx (width log2(n_docs+1))
+                                        ;   doc_idx (width log2(n_docs+1),
+                                        ;     stores universe codes, not
+                                        ;     insertion indexes)
                                         ;   offsets (width log2(total+1))
                                         ;   scores  (width 16, u16-quantized)
 ```
 
-The three `CompactVectorMetaOnDisk` structs are a
+Every body section starts on an 8-byte boundary; the header
+carries a 4-byte tail pad to land the first body section on an
+8-aligned absolute offset. `CompactVector` reinterprets its
+backing buffer as `[u64]`, so misalignment would panic at load
+time.
+
+The four `CompactVectorMetaOnDisk` structs are a
 [`zerocopy::IntoBytes`]-deriveable mirror of jerky's
 `CompactVectorMeta` (jerky's upstream derives only `FromBytes`).
-Four `u64` fields, 32 bytes each, `#[repr(C)]` — static asserts
-in `succinct.rs` lock the layout equivalence on 64-bit targets.
+Four `u64` fields, 32 bytes each, `#[repr(C)]`. The
+`CompressedUniverseMetaOnDisk` is the same trick for
+`triblespace::core::blob::schemas::succinctarchive::CompressedUniverseMeta`
+— five `u64` fields, 40 bytes, `#[repr(C)]`. Static asserts in
+`succinct.rs` lock the size and layout equivalence.
 
 Lookup algorithm:
 1. Binary-search the term in `terms` (FixedBytesTable) → term
    index *t*.
 2. Read `(offsets[t], offsets[t+1])` from the postings offsets
    CompactVector.
-3. For each *i* in that range, read `doc_idx[i]` from the
-   postings doc_idx CompactVector and `score[i]` from the flat
-   f32 region; join `doc_ids[doc_idx]` to recover the external
-   `Id`.
+3. For each *i* in that range, read `doc_idx[i]` (a
+   `CompressedUniverse` code) from the postings doc_idx
+   CompactVector and `score[i]` from the quantized score
+   section; decode the external key via
+   `keys.access(doc_idx)`.
 
 ### What's already compressed (as of the current impl)
 
@@ -111,28 +132,42 @@ Lookup algorithm:
 
 ### What's still flat (deliberately)
 
-- `doc_ids` — 16 bytes per id is already the Id's natural size.
-  Zero-copy slicing via `FixedBytesTable<16>` is as small as we
-  can get without hashing or dedup, neither of which apply.
-- `terms` — 32 bytes each (Blake3 hash). A wavelet matrix over
-  a byte-quantized prefix + flat tails would compress the term
-  *table*, but 9.6 MiB at 100k docs is small enough that
-  correctness-first wins.
+- `terms` — 32 bytes each (Blake3 hash). We tried fragment-
+  dictionary compression here (phase 2a) and it **grew** the
+  section: Blake3 hashes have maximum entropy, so the 4-byte
+  fragment dictionary overhead exceeded any code-length win.
+  See `tests/scale_smoke.rs` and the phase 2a revert in git
+  history for the actual numbers.
+
+### What keys-side compression bought us
+
+- `keys` is now a `CompressedUniverse` (Phase 2b). On the
+  synthetic `id_from_u64` corpus the blob-size ratio didn't
+  move (keys are ~4 % of the blob; postings dominate). The
+  architectural win is type-level: `keys.access(code)` goes
+  through the same universe plumbing as every other `Value`
+  table in the stack, and on naturally correlated keys (real
+  GenIds sharing trible-structured bytes, short-string titles
+  sharing prefixes, enum-like tags) the fragment dictionary
+  collapses more. Range / prefix / membership queries over
+  the keys universe now compose for free.
 ### Open compression directions
 
-- **Wavelet matrix on the term table** — would let rank/select
-  queries hit terms without a linear-compare binary search,
-  plus some compression via shared-prefix grouping. Worth
-  it when `n_terms * 32 B` starts to dominate.
-- **Delta-encoded posting doc_idx** — posting lists are already
-  doc-sorted, so consecutive deltas compress further via
-  Simple16 / ELF / VByte. Roughly halves the `doc_idx` section
-  at Heaps-law corpora.
+- **Delta-encoded posting doc_idx** — posting lists are now
+  universe-code-sorted (Phase 2b), so consecutive deltas
+  compress further via Simple16 / ELF / VByte. Roughly halves
+  the `doc_idx` section at Heaps-law corpora. This is the
+  next-biggest win to chase — postings dominate the blob.
 - **Non-uniform score quantization** — current u16 quantization
   uses a linear global `max_score` scale. A log-space or per-
   term scale would preserve more precision in the high-df
   (common-term) tail at the cost of a bigger header. Only
   worth it if ranking drift bites at larger corpora.
+- **Wavelet matrix on the term table** — would let rank/select
+  queries hit terms without a linear-compare binary search.
+  For identification-only lookups the current FixedBytesTable
+  binary search is competitive; this unlocks range queries
+  over terms (useful for n-gram prefix scans).
 
 ## `SuccinctHNSWIndex` — SH25 blob layout
 
@@ -287,31 +322,39 @@ kept for testing self-consistency) and the landed SB25 format
 (`SuccinctBM25Index::to_bytes`) with bit-packing + score
 quantization.
 
-| Section            | Per-entry | Count      | Naive bytes | SB25 bytes |
-| :----------------- | --------: | ---------: | ----------: | ---------: |
-| header             | —         | —          |       32 B  |    236 B   |
-| doc_ids            |    16 B   | 100 000    |   1.6 MiB   |  1.6 MiB   |
-| doc_lens           |     4 B   | 100 000    |   0.4 MiB   | ~0.12 MiB  |
-| terms (sorted)     |    32 B   | 300 000    |   9.6 MiB   |  9.6 MiB   |
-| postings_offsets   |     4 B   | 300 001    |   1.2 MiB   | ~0.6 MiB   |
-| postings.doc_idx   |     4 B   | 18 000 000 |    72 MiB   | ~38 MiB    |
-| postings.score     |     4 B   | 18 000 000 |    72 MiB   |    36 MiB  |
-| **Total**          |           |            | **~157 MiB**| **~86 MiB**|
+| Section            | Per-entry | Count      | Naive bytes | SB25 bytes  |
+| :----------------- | --------: | ---------: | ----------: | ----------: |
+| header             | —         | —          |       32 B  |     280 B   |
+| keys               |    32 B   | 100 000    |   3.2 MiB   | ~1.5–3.2 MiB|
+| doc_lens           |     4 B   | 100 000    |   0.4 MiB   | ~0.12 MiB   |
+| terms (sorted)     |    32 B   | 300 000    |   9.6 MiB   |  9.6 MiB    |
+| postings_offsets   |     4 B   | 300 001    |   1.2 MiB   | ~0.6 MiB    |
+| postings.doc_idx   |     4 B   | 18 000 000 |    72 MiB   | ~38 MiB     |
+| postings.score     |     4 B   | 18 000 000 |    72 MiB   |    36 MiB   |
+| **Total**          |           |            | **~159 MiB**| **~86 MiB** |
 
 Every row computed the same way: the bit-packed sections use
 `ceil(log2(n + 1))` bits per entry (doc_idx → 17 bits ≈ 2.12 B;
 doc_lens at max ≈ 1024 → 10 bits ≈ 1.25 B; offsets at 18M max →
 25 bits ≈ 3.1 B), and u16-quantized scores drop from 4 B to 2 B.
 
+The `keys` range covers the fragment-dictionary compression
+spread: near-worst-case (random 32-byte values, no shared 4-byte
+fragments) ≈ raw 3.2 MiB plus a small DACs overhead; typical
+GenId-keyed corpora with 16 bytes of zero padding and structured
+trible bytes compress toward ~1.5 MiB. Neither end moves the
+blob total noticeably — keys are ~2 % of the 86 MiB.
+
 The **postings dominate** at 85 %+ of either blob. SB25's bit-
 packed `doc_idx` plus u16 scores halves that section — the rest
-of the footprint (doc_ids, terms, docs_lens) is already as
-small as the data allows without additional structure.
+of the footprint (keys, terms, docs_lens) is already as small as
+the data allows without additional structure.
 
 Term table is the second-largest chunk (9.6 MiB of 32-byte
-hashes). A wavelet matrix over byte-quantized prefixes + flat
-tail would compress it further; 10 MiB is small enough that
-correctness-first wins for now.
+Blake3 hashes). Phase 2a tried fragment-dictionary compression
+here and it made the section **bigger** — maximum-entropy hashes
+have no shared 4-byte fragments for the dictionary to exploit.
+Left uncompressed.
 
 ### BM25 — build time
 
