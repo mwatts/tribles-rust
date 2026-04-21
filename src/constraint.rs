@@ -28,6 +28,7 @@ use triblespace::core::value::RawValue;
 
 use crate::bm25::BM25Index;
 use crate::hnsw::{FlatIndex, HNSWIndex};
+use crate::schemas::F32LE;
 
 /// Constrains a `Variable<GenId>` (doc) to entity ids in the
 /// posting list of the pinned term.
@@ -75,6 +76,186 @@ fn id_to_raw_value(id: Id) -> RawValue {
     let raw: &RawId = id.as_ref();
     out[16..32].copy_from_slice(raw);
     out
+}
+
+/// Encode an `f32` as an `F32LE`-schema raw value (bytes [0..4]
+/// little-endian, rest zero-padded). Matches
+/// `schemas::F32LE::to_value` but avoids the schema-type wrapper
+/// for direct `RawValue` writes into the constraint's proposal
+/// vector.
+fn f32_to_raw_value(v: f32) -> RawValue {
+    let mut out = [0u8; 32];
+    out[0..4].copy_from_slice(&v.to_le_bytes());
+    out
+}
+
+/// Decode an `F32LE`-schema raw value back to `f32`.
+fn raw_value_to_f32(raw: &RawValue) -> f32 {
+    f32::from_le_bytes(raw[0..4].try_into().unwrap())
+}
+
+// ── BM25 constraint with score as a bound variable ───────────────────
+
+/// Two-variable BM25 constraint: binds both `doc` (entity id) and
+/// `score` (BM25 weight) for the pinned term. Produced by
+/// [`BM25Index::docs_and_scores`]; strict upgrade of
+/// [`DocsContainingTerm`] that lets callers project the score
+/// into their query results.
+///
+/// Cardinality (`estimate`) uses `index.doc_frequency(&term)` on
+/// the `doc` variable; for `score` we use the same count because
+/// each (doc, term) pair has exactly one score — the cardinality
+/// is identical from the engine's perspective.
+pub struct BM25ScoredPostings<'a> {
+    index: &'a BM25Index,
+    doc: Variable<GenId>,
+    score: Variable<F32LE>,
+    term: [u8; 32],
+}
+
+impl<'a> BM25ScoredPostings<'a> {
+    pub fn new(
+        index: &'a BM25Index,
+        doc: Variable<GenId>,
+        score: Variable<F32LE>,
+        term: [u8; 32],
+    ) -> Self {
+        Self {
+            index,
+            doc,
+            score,
+            term,
+        }
+    }
+}
+
+impl BM25Index {
+    /// Constraint that binds `doc` + `score` for each posting of
+    /// `term`. Use this when the caller wants to project the
+    /// BM25 weight into their result rows (filtering, ordering,
+    /// hybrid-ranking combinators above the query).
+    pub fn docs_and_scores(
+        &self,
+        doc: Variable<GenId>,
+        score: Variable<F32LE>,
+        term: [u8; 32],
+    ) -> BM25ScoredPostings<'_> {
+        BM25ScoredPostings::new(self, doc, score, term)
+    }
+}
+
+impl<'a> Constraint<'a> for BM25ScoredPostings<'a> {
+    fn variables(&self) -> VariableSet {
+        VariableSet::new_singleton(self.doc.index).union(VariableSet::new_singleton(self.score.index))
+    }
+
+    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
+        if variable == self.doc.index || variable == self.score.index {
+            Some(self.index.doc_frequency(&self.term))
+        } else {
+            None
+        }
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        binding: &Binding,
+        proposals: &mut Vec<RawValue>,
+    ) {
+        // If we're proposing `doc`, enumerate the posting list's
+        // doc ids. If proposing `score`, enumerate the distinct
+        // scores — but with doc implicitly determining score,
+        // we yield the scores of docs satisfying the current
+        // binding.
+        if variable == self.doc.index {
+            // Filter by a bound score if present — otherwise
+            // yield every posting's doc.
+            let bound_score = binding
+                .get(self.score.index)
+                .map(raw_value_to_f32);
+            for (doc_id, score) in self.index.query_term(&self.term) {
+                if let Some(bs) = bound_score {
+                    if (score - bs).abs() > f32::EPSILON {
+                        continue;
+                    }
+                }
+                proposals.push(id_to_raw_value(doc_id));
+            }
+        } else if variable == self.score.index {
+            let bound_doc = binding
+                .get(self.doc.index)
+                .and_then(raw_value_to_id);
+            for (doc_id, score) in self.index.query_term(&self.term) {
+                if let Some(bd) = bound_doc {
+                    if doc_id != bd {
+                        continue;
+                    }
+                }
+                proposals.push(f32_to_raw_value(score));
+            }
+        }
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        binding: &Binding,
+        proposals: &mut Vec<RawValue>,
+    ) {
+        if variable == self.doc.index {
+            // Same data structure as DocsContainingTerm's confirm:
+            // retain proposals whose doc is in the posting list
+            // (and matches any bound score).
+            let bound_score = binding
+                .get(self.score.index)
+                .map(raw_value_to_f32);
+            let valid: HashSet<(Id, u32)> = self
+                .index
+                .query_term(&self.term)
+                .filter(|(_, s)| match bound_score {
+                    Some(bs) => (s - bs).abs() <= f32::EPSILON,
+                    None => true,
+                })
+                .map(|(d, _)| (d, 0))
+                .collect();
+            proposals.retain(|raw| {
+                raw_value_to_id(raw)
+                    .map(|id| valid.iter().any(|(d, _)| *d == id))
+                    .unwrap_or(false)
+            });
+        } else if variable == self.score.index {
+            let bound_doc = binding
+                .get(self.doc.index)
+                .and_then(raw_value_to_id);
+            let allowed: HashSet<u32> = self
+                .index
+                .query_term(&self.term)
+                .filter(|(d, _)| match bound_doc {
+                    Some(bd) => *d == bd,
+                    None => true,
+                })
+                .map(|(_, s)| s.to_bits())
+                .collect();
+            proposals.retain(|raw| allowed.contains(&raw_value_to_f32(raw).to_bits()));
+        }
+    }
+
+    fn satisfied(&self, binding: &Binding) -> bool {
+        let bound_doc = binding
+            .get(self.doc.index)
+            .and_then(raw_value_to_id);
+        let bound_score = binding
+            .get(self.score.index)
+            .map(raw_value_to_f32);
+        match (bound_doc, bound_score) {
+            (None, None) => true,
+            _ => self.index.query_term(&self.term).any(|(d, s)| {
+                bound_doc.map_or(true, |bd| d == bd)
+                    && bound_score.map_or(true, |bs| (s - bs).abs() <= f32::EPSILON)
+            }),
+        }
+    }
 }
 
 // ── FlatIndex constraint ─────────────────────────────────────────────
@@ -578,6 +759,138 @@ mod tests {
         let mut unmatching = Binding::default();
         unmatching.set(doc.index, &id_to_raw_value(id(4)));
         assert!(!c.satisfied(&unmatching));
+    }
+
+    // ── BM25ScoredPostings (doc + score bound) ────────────────
+
+    #[test]
+    fn scored_constraint_proposes_both_variables() {
+        let idx = sample_index();
+        let mut ctx = triblespace::core::query::VariableContext::new();
+        let doc: Variable<GenId> = ctx.next_variable();
+        let score: Variable<F32LE> = ctx.next_variable();
+        let term = hash_tokens("fox")[0];
+        let c = idx.docs_and_scores(doc, score, term);
+
+        // Variables: both doc and score.
+        let vars = c.variables();
+        assert!(vars.is_set(doc.index));
+        assert!(vars.is_set(score.index));
+
+        // Cardinality: same doc_frequency for both variables.
+        assert_eq!(
+            c.estimate(doc.index, &Binding::default()),
+            Some(2)
+        );
+        assert_eq!(
+            c.estimate(score.index, &Binding::default()),
+            Some(2)
+        );
+
+        // Propose doc with no binding: 2 entries, each decodes
+        // to a real id.
+        let mut doc_props = Vec::new();
+        c.propose(doc.index, &Binding::default(), &mut doc_props);
+        assert_eq!(doc_props.len(), 2);
+        for p in &doc_props {
+            raw_value_to_id(p).expect("genid round-trip");
+        }
+
+        // Propose score with no binding: 2 entries, each decodes
+        // to a positive finite f32.
+        let mut score_props = Vec::new();
+        c.propose(score.index, &Binding::default(), &mut score_props);
+        assert_eq!(score_props.len(), 2);
+        for p in &score_props {
+            let v = raw_value_to_f32(p);
+            assert!(v.is_finite() && v > 0.0);
+        }
+    }
+
+    #[test]
+    fn scored_constraint_binds_doc_given_score() {
+        // Purpose-built corpus where "fox" appears in two docs of
+        // *different* lengths — so the two postings have
+        // different BM25 scores and the score-filter
+        // meaningfully distinguishes them.
+        let mut b = BM25Builder::new();
+        b.insert(id(1), hash_tokens("fox"));
+        b.insert(id(2), hash_tokens("quick brown fox jumps high today"));
+        b.insert(id(3), hash_tokens("lazy dog"));
+        let idx = b.build();
+
+        let mut ctx = triblespace::core::query::VariableContext::new();
+        let doc: Variable<GenId> = ctx.next_variable();
+        let score: Variable<F32LE> = ctx.next_variable();
+        let term = hash_tokens("fox")[0];
+        let c = idx.docs_and_scores(doc, score, term);
+
+        let doc1_score = idx
+            .query_term(&term)
+            .find(|(d, _)| *d == id(1))
+            .map(|(_, s)| s)
+            .unwrap();
+        let doc2_score = idx
+            .query_term(&term)
+            .find(|(d, _)| *d == id(2))
+            .map(|(_, s)| s)
+            .unwrap();
+        assert!(
+            (doc1_score - doc2_score).abs() > f32::EPSILON,
+            "test fixture: doc1 / doc2 scores should differ"
+        );
+
+        let mut binding = Binding::default();
+        binding.set(score.index, &f32_to_raw_value(doc1_score));
+        let mut props = Vec::new();
+        c.propose(doc.index, &binding, &mut props);
+        assert_eq!(props.len(), 1);
+        assert_eq!(raw_value_to_id(&props[0]).unwrap(), id(1));
+    }
+
+    #[test]
+    fn scored_constraint_binds_score_given_doc() {
+        let idx = sample_index();
+        let mut ctx = triblespace::core::query::VariableContext::new();
+        let doc: Variable<GenId> = ctx.next_variable();
+        let score: Variable<F32LE> = ctx.next_variable();
+        let term = hash_tokens("fox")[0];
+        let c = idx.docs_and_scores(doc, score, term);
+
+        let mut binding = Binding::default();
+        binding.set(doc.index, &id_to_raw_value(id(1)));
+
+        let mut props = Vec::new();
+        c.propose(score.index, &binding, &mut props);
+        // Exactly one score for (doc = id(1), term = fox).
+        assert_eq!(props.len(), 1);
+        assert!(raw_value_to_f32(&props[0]) > 0.0);
+    }
+
+    #[test]
+    fn scored_constraint_confirm_filters_bad_scores() {
+        let idx = sample_index();
+        let mut ctx = triblespace::core::query::VariableContext::new();
+        let doc: Variable<GenId> = ctx.next_variable();
+        let score: Variable<F32LE> = ctx.next_variable();
+        let term = hash_tokens("fox")[0];
+        let c = idx.docs_and_scores(doc, score, term);
+
+        // Offer a "score" proposal list mixing one real score
+        // from the index with some made-up ones. Confirm must
+        // keep only the real ones.
+        let real = idx
+            .query_term(&term)
+            .map(|(_, s)| s)
+            .collect::<Vec<f32>>();
+        let mut props = vec![
+            f32_to_raw_value(real[0]),
+            f32_to_raw_value(999.0),
+            f32_to_raw_value(0.001),
+        ];
+        c.confirm(score.index, &Binding::default(), &mut props);
+        assert_eq!(props.len(), 1);
+        assert!((raw_value_to_f32(&props[0]) - real[0]).abs() < 1e-6);
     }
 
     fn sample_hnsw() -> crate::hnsw::HNSWIndex {
