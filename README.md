@@ -25,7 +25,42 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for the full design.
 ## Status
 
 **Pre-alpha.** Public API shapes are still settling. Version 0.0.0
-until the first non-scaffold release.
+until the first non-scaffold release. The design is frozen; the
+naive-then-succinct implementation order is the open work item.
+
+### What works today
+
+* **`BM25Index`**: in-memory build + single- and multi-term
+  query, content-addressed byte serialization, `BlobSchema`
+  impl, triblespace `Constraint` for forward lookup
+  (`docs_containing(doc_var, term_value)`).
+* **`FlatIndex`**: brute-force k-NN baseline. Build + cosine
+  top-k query, byte serialization, `Constraint` for similarity
+  search. Useful for ground truth and small corpora.
+* **`HNSWIndex`**: layered-graph approximate k-NN (Malkov &
+  Yashunin 2018) with deterministic level sampling, ef-search,
+  byte serialization, `BlobSchema` impl, `Constraint`.
+  Validated at 1 000 docs / 32-dim against `FlatIndex` ground
+  truth at ≥ 70% top-10 recall.
+* **`tokens::hash_tokens`**: opt-in whitespace + lowercase +
+  Blake3 tokenizer producing 32-byte term values.
+* One runnable example (`cargo run --example query_demo`)
+  covering text search, multi-term OR-queries, and the
+  value-as-term citation-search trick.
+* ~70 tests across unit, scale (1k-doc), engine-integration
+  (`IntersectionConstraint` joins), and doctests.
+
+### What's next
+
+* Jerky-backed succinct blobs (wavelet matrices for term-table
+  + posting lists; per-layer wavelet matrices for HNSW
+  neighbour graphs). Same API, smaller and faster.
+* Additional token helpers (prefix, n-gram, phrase
+  rewriting).
+* `F32LE` value schema for scores as bound query variables.
+
+See [`docs/DESIGN.md`](docs/DESIGN.md) and
+[`docs/QUERY_ENGINE_INTEGRATION.md`](docs/QUERY_ENGINE_INTEGRATION.md).
 
 ## License
 
