@@ -88,8 +88,9 @@ impl BM25Queryable for crate::succinct::SuccinctBM25Index {
     fn score_tolerance(&self) -> f32 {
         // Quantization bucket size; widens the equality check to
         // accept scores that round to different f32s after the
-        // u16 → f32 dequantization.
-        self.score_tolerance()
+        // u16 → f32 dequantization. Call the inherent method
+        // explicitly so there's no trait-method recursion.
+        crate::succinct::SuccinctBM25Index::score_tolerance(self)
     }
 }
 

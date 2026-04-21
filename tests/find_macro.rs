@@ -179,6 +179,49 @@ fn find_intersection_of_two_terms() {
     assert!(set.contains(&id(3)));
 }
 
+/// Succinct-view BM25 answers a `find!` with a bound score
+/// variable, and returns a non-empty set of (doc, score) pairs.
+/// Exercises the `BM25Queryable::score_tolerance` trait method
+/// on the quantized-succinct path — previously the tolerance
+/// widening never actually ran through the engine in any test.
+#[test]
+fn find_docs_and_scores_on_succinct() {
+    use triblespace_search::succinct::SuccinctBM25Index;
+
+    let mut b = BM25Builder::new();
+    b.insert(id(1), hash_tokens("fox"));
+    b.insert(id(2), hash_tokens("quick brown fox jumps high today"));
+    b.insert(id(3), hash_tokens("unrelated content"));
+    let naive = b.build();
+    let succinct = SuccinctBM25Index::from_naive(&naive).unwrap();
+    let fox = hash_tokens("fox")[0];
+
+    let rows: Vec<(Id, f32)> = find!(
+        (doc: Id, score: f32),
+        succinct.docs_and_scores(doc, score, fox)
+    )
+    .collect();
+    assert!(!rows.is_empty(), "succinct index should produce rows");
+
+    // Every row's score must be within the succinct index's
+    // quantization tolerance of the original BM25 score for that
+    // doc. The trait-level BM25Queryable::score_tolerance is
+    // what the constraint uses to accept these matches through
+    // find!'s propose/confirm protocol.
+    let tol = succinct.score_tolerance().max(1e-4);
+    for (doc, score) in &rows {
+        let expected: f32 = naive
+            .query_term(&fox)
+            .find(|(d, _)| d == doc)
+            .map(|(_, s)| s)
+            .expect("doc must be in naive postings");
+        assert!(
+            (expected - score).abs() <= tol,
+            "succinct score {score} for {doc:?} drifted from naive {expected} beyond tol {tol}"
+        );
+    }
+}
+
 /// The succinct HNSW view answers `find!` queries identically
 /// to the naive one — proves the `HNSWQueryable` trait plugs the
 /// succinct path into the engine. 16 vectors, fixed seed, one
