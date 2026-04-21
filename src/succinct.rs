@@ -947,14 +947,45 @@ impl SuccinctHNSWIndex {
     ///
     /// ```text
     /// [header 152 B]
-    /// [keys        ] n_nodes × 32 B
-    /// [vectors     ] n_nodes × dim × 4 B (f32 LE)
-    /// [graph_bytes ] variable (SuccinctGraph body)
+    ///   magic u32     = "SH25"
+    ///   version u16   (FORMAT_VERSION)
+    ///   reserved u16
+    ///   dim u32                  ; embedding dimensionality
+    ///   M u16, M0 u16            ; HNSW degree caps
+    ///   max_level u8
+    ///   reserved u8
+    ///   has_entry_point u8
+    ///   reserved u8
+    ///   entry_point u32
+    ///   n_nodes u64
+    ///   n_layers u64
+    ///   graph_neighbours_meta  32 B   ; CompactVectorMetaOnDisk
+    ///   graph_offsets_meta     32 B   ; CompactVectorMetaOnDisk
+    ///   (section_offset, section_len) × 3 = 48 B
+    ///
+    /// [keys    ] n_nodes × 32 B    ; FixedBytesTable<32> raw;
+    ///                                each entry is the doc's
+    ///                                `RawValue` identifier
+    ///                                (GenId / ShortString / …).
+    /// [handles ] n_nodes × 32 B    ; Value<Handle<Blake3, Embedding>>;
+    ///                                content-addressed pointer
+    ///                                to the doc's embedding blob
+    ///                                in the pile's blob store.
+    /// [graph   ] variable          ; SuccinctGraph body = two
+    ///                                jerky CompactVectors in one
+    ///                                ByteArea:
+    ///                                  neighbours (width log₂(n+1))
+    ///                                  offsets    (width log₂(E+1))
     /// ```
     ///
     /// The header carries scalar HNSW parameters, the graph's
     /// two `CompactVectorMeta` structures, and `(offset, length)`
     /// pairs for each body section.
+    ///
+    /// Embeddings are **not** in this blob — they live in the
+    /// pile's blob store, referenced by handle. Queries resolve
+    /// handles at traversal time through
+    /// [`AttachedSuccinctHNSWIndex`]'s internal `BlobCache`.
     pub fn to_bytes(&self) -> Vec<u8> {
         let n_nodes = self.doc_count() as u64;
         let n_layers = self.graph.n_layers() as u64;
