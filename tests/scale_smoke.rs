@@ -268,6 +268,32 @@ fn succinct_hnsw_1k_docs_matches_naive() {
     }
 }
 
+/// At 1k docs, the landed SB25 blob must be strictly smaller
+/// than the naive BM25 byte-serialization — the whole point of
+/// the succinct pass. Not asserting a specific ratio (that's
+/// what the worked example in DESIGN.md is for); this is the
+/// "did someone accidentally bloat the format" guard.
+#[test]
+fn succinct_bm25_blob_smaller_than_naive_at_1k() {
+    let mut rng = SplitMix64(0xA11CE);
+    let mut builder = BM25Builder::new();
+    for i in 0..1_000 {
+        let doc = fake_document(&mut rng, 400, 24);
+        builder.insert(id_from_u64(i as u64 + 1), hash_tokens(&doc));
+    }
+    let naive = builder.build();
+    let succinct = SuccinctBM25Index::from_naive(&naive).unwrap();
+
+    let naive_bytes = naive.to_bytes();
+    let succinct_bytes = succinct.to_bytes();
+    assert!(
+        succinct_bytes.len() < naive_bytes.len(),
+        "succinct blob {} should be < naive blob {}",
+        succinct_bytes.len(),
+        naive_bytes.len()
+    );
+}
+
 /// Exploratory: establish whether u16 quantization of BM25
 /// scores would preserve top-k ranking on a real corpus, before
 /// we commit to changing the SB25 wire format. Builds a 1k-doc
