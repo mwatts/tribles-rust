@@ -388,18 +388,17 @@ ef=50:
 
 | Corpus          | Path  | p50    | avg    | p99    |
 | :-------------- | :---- | -----: | -----: | -----: |
-| 5 k × 32        | naive | 55 µs  | 55 µs  | 64 µs  |
-| 5 k × 32        | SH25  | 76 µs  | 77 µs  | 95 µs  |
-| 10 k × 32       | naive | 54 µs  | 54 µs  | 62 µs  |
-| 10 k × 32       | SH25  | 76 µs  | 77 µs  | 100 µs |
+| 5 k × 32        | naive | 54 µs  | 54 µs  | 62 µs  |
+| 5 k × 32        | SH25  | 56 µs  | 57 µs  | 66 µs  |
+| 10 k × 32       | naive | 55 µs  | 55 µs  | 60 µs  |
+| 10 k × 32       | SH25  | 57 µs  | 57 µs  | 67 µs  |
 
-SH25 path sits at ~1.4× the naive latency — the cost of slicing
-each node's `[f32; dim]` out of `anybytes::Bytes` and
-dequantizing on the fly. Since HNSW's ef-search examines ~ef×k
-neighbours per query, this dominates. A flat-f32 cache-friendly
-access path (reading the vectors via `Bytes::view::<[f32]>`
-instead of per-component LE decode) would close most of the
-gap; filed as future work.
+SH25 sits within ~4 % of the naive latency. The previous
+~1.4× gap (per-component `f32::from_le_bytes` + `Vec` alloc
+per vector read) closed once `SuccinctHNSWIndex` started
+caching an `anybytes::View<[f32]>` over the whole vectors
+section. `vector(i)` is now `&view[i*dim .. (i+1)*dim]` with
+no allocation and no decode loop.
 
 ### Takeaways
 

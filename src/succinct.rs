@@ -546,6 +546,25 @@ fn width_for(n: usize) -> usize {
     }
 }
 
+/// Try to view a byte region as `&[f32]`. Returns `None` for an
+/// empty region (anybytes refuses to view a zero-length unaligned
+/// buffer; we short-circuit and let callers handle it as "no
+/// vectors"). Returns `Err` for non-empty regions that fail the
+/// alignment / length contract.
+fn view_f32_slice(bytes: &Bytes) -> Result<Option<anybytes::View<[f32]>>, SuccinctDocLensError> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    bytes
+        .clone()
+        .view::<[f32]>()
+        .map(Some)
+        .map_err(|_| SuccinctDocLensError::SizeMismatch {
+            bytes: bytes.len(),
+            expected: 0,
+        })
+}
+
 /// Jerky-backed HNSW layer-graph component.
 ///
 /// Flat CSR over `(layer, node) → [neighbour_node_idx, ...]`:
@@ -742,9 +761,12 @@ pub struct SuccinctHNSWIndex {
     max_level: u8,
     entry_point: Option<u32>,
     doc_ids: FixedBytesTable<16>,
-    /// L2-normalized vectors in flat row-major `[u8]` form
-    /// (4 bytes per f32, `n_nodes × dim` floats).
+    /// L2-normalized vectors in flat row-major form, zero-copy
+    /// viewed as `[f32]` over the backing anybytes region.
+    /// `vectors_view` is `None` iff the corpus is empty (anybytes
+    /// won't view a zero-length buffer).
     vectors: Bytes,
+    vectors_view: Option<anybytes::View<[f32]>>,
     graph: SuccinctGraph,
 }
 
@@ -761,7 +783,7 @@ impl SuccinctHNSWIndex {
         let doc_ids_bytes = FixedBytesTable::<16>::build(&doc_id_rows);
         let doc_ids = FixedBytesTable::<16>::from_bytes(doc_ids_bytes, n)?;
 
-        // vectors: flat f32 block.
+        // vectors: flat f32 block, zero-copy viewable as [f32].
         let mut vec_buf = Vec::with_capacity(n * dim * 4);
         for i in 0..n {
             let v = idx.node_vector(i).expect("node in range");
@@ -770,6 +792,7 @@ impl SuccinctHNSWIndex {
             }
         }
         let vectors = Bytes::from_source(vec_buf);
+        let vectors_view = view_f32_slice(&vectors)?;
 
         // Build layer-major graph: layer_graph[L][i] = neighbours.
         // Empty lists are fine for nodes not promoted to layer L —
@@ -796,6 +819,7 @@ impl SuccinctHNSWIndex {
             entry_point: idx.entry_point(),
             doc_ids,
             vectors,
+            vectors_view,
             graph,
         })
     }
@@ -855,25 +879,19 @@ impl SuccinctHNSWIndex {
         )
     }
 
-    /// Read vector `i` as a borrowed `&[f32]` (zero-copy via
-    /// anybytes::Bytes → f32 slice cast).
+    /// Read vector `i` as a borrowed `&[f32]` sliced directly
+    /// from the backing [`anybytes::Bytes`]. Zero-copy on
+    /// little-endian targets (the only ones we support for f32
+    /// round-trip through `to_le_bytes` + slice cast).
     ///
     /// Returns `None` for out-of-range indices.
-    fn vector(&self, i: usize) -> Option<Vec<f32>> {
+    fn vector(&self, i: usize) -> Option<&[f32]> {
         if i >= self.doc_count() {
             return None;
         }
-        let start = i * self.dim * 4;
-        let end = start + self.dim * 4;
-        if end > self.vectors.len() {
-            return None;
-        }
-        Some(
-            self.vectors[start..end]
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-                .collect(),
-        )
+        let start = i * self.dim;
+        let end = start + self.dim;
+        self.vectors_view.as_ref()?.get(start..end)
     }
 
     /// Approximate top-k nearest neighbours to `query` under
@@ -1112,6 +1130,9 @@ impl SuccinctHNSWIndex {
         let graph = SuccinctGraph::from_bytes(graph_meta, graph_bytes)
             .map_err(|_| SuccinctLoadError::TruncatedSection("graph"))?;
 
+        let vectors_view = view_f32_slice(&vectors_bytes)
+            .map_err(|_| SuccinctLoadError::TruncatedSection("vectors"))?;
+
         Ok(Self {
             dim,
             m,
@@ -1120,6 +1141,7 @@ impl SuccinctHNSWIndex {
             entry_point,
             doc_ids,
             vectors: vectors_bytes,
+            vectors_view,
             graph,
         })
     }
