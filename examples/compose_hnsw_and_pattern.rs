@@ -103,8 +103,10 @@ fn main() {
     // Standalone similarity — should surface A and C first.
     // `similar_ids` decodes the 32-byte keys back to `Id` under
     // the GenId schema (empty result on non-GenId keys).
+    let naive_view = naive.attach(&reader);
+    let idx_view = idx.attach(&reader);
     println!("\nsimilarity-only (no author filter):");
-    for (d, s) in naive.similar_ids(&query, 4, Some(10), &reader).unwrap() {
+    for (d, s) in naive_view.similar_ids(&query, 4, Some(10)).unwrap() {
         println!("  {d}  cos={s:.3}");
     }
 
@@ -113,7 +115,7 @@ fn main() {
     let matches: Vec<(Id,)> = find!(
         (book: Id),
         and!(
-            idx.similar_constraint(book, query.clone(), 4, Some(10), &reader).unwrap(),
+            idx_view.similar_constraint(book, query.clone(), 4, Some(10)).unwrap(),
             pattern!(&kb, [{ ?book @ literature::author: &target_author }])
         )
     )
@@ -137,7 +139,7 @@ fn main() {
     let scored: Vec<(Id, f32)> = find!(
         (book: Id, score: f32),
         and!(
-            idx.similar_with_scores(book, score, query.clone(), 4, Some(10), &reader).unwrap(),
+            idx_view.similar_with_scores(book, score, query.clone(), 4, Some(10)).unwrap(),
             pattern!(&kb, [{ ?book @ literature::author: &target_author }])
         )
     )

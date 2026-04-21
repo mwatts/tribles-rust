@@ -240,32 +240,44 @@ fn find_docs_and_scores_on_succinct() {
 #[test]
 fn find_hnsw_similar_on_succinct() {
     use std::collections::HashSet;
+    use triblespace::core::blob::MemoryBlobStore;
     use triblespace::core::id::Id as TId;
+    use triblespace::core::repo::BlobStore;
+    use triblespace::core::value::schemas::hash::Blake3;
     use triblespace_search::hnsw::HNSWBuilder;
+    use triblespace_search::schemas::put_embedding;
     use triblespace_search::succinct::SuccinctHNSWIndex;
 
     fn iid(byte: u8) -> TId {
         TId::new([byte; 16]).unwrap()
     }
 
+    let mut store = MemoryBlobStore::<Blake3>::new();
     let mut b = HNSWBuilder::new(4).with_seed(23);
     for i in 1..=16u8 {
         let f = i as f32;
         let v = vec![f.sin(), f.cos(), (f * 0.5).sin(), (f * 0.3).cos()];
-        b.insert_id(iid(i), v).unwrap();
+        let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
+        b.insert_id(iid(i), h, v).unwrap();
     }
     let naive = b.build();
     let succinct = SuccinctHNSWIndex::from_naive(&naive).unwrap();
+    let reader = store.reader().unwrap();
     let query = vec![0.5, -0.2, 0.3, 0.7];
 
+    let succinct_view = succinct.attach(&reader);
     let rows: Vec<(Id,)> = find!(
         (doc: Id),
-        succinct.similar_constraint(doc, query.clone(), 3, Some(10))
+        succinct_view
+            .similar_constraint(doc, query.clone(), 3, Some(10))
+            .unwrap()
     )
     .collect();
     let got: HashSet<Id> = rows.into_iter().map(|(d,)| d).collect();
     let expected: HashSet<Id> = naive
+        .attach(&reader)
         .similar_ids(&query, 3, Some(10))
+        .unwrap()
         .into_iter()
         .map(|(d, _)| d)
         .collect();

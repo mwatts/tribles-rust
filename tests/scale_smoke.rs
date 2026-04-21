@@ -137,11 +137,13 @@ fn hnsw_1k_vectors_recall_against_flat() {
         let doc = id_from_u64((i + 1) as u64);
         let h = put_embedding::<_, Blake3>(&mut store, vec.clone()).unwrap();
         flat_b.insert_id(doc, h);
-        hnsw_b.insert_id(doc, vec).unwrap();
+        hnsw_b.insert_id(doc, h, vec).unwrap();
     }
     let flat = flat_b.build();
     let hnsw = hnsw_b.build();
     let reader = store.reader().unwrap();
+    let flat_view = flat.attach(&reader);
+    let hnsw_view = hnsw.attach(&reader);
 
     let mut total_overlap = 0;
     let mut total_k = 0;
@@ -149,14 +151,15 @@ fn hnsw_1k_vectors_recall_against_flat() {
         let q: Vec<f32> = (0..DIM)
             .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
             .collect();
-        let truth: HashSet<_> = flat
-            .similar(&q, 10, &reader)
+        let truth: HashSet<_> = flat_view
+            .similar(&q, 10)
             .unwrap()
             .into_iter()
             .map(|(d, _)| d)
             .collect();
-        let got: HashSet<_> = hnsw
+        let got: HashSet<_> = hnsw_view
             .similar(&q, 10, Some(100))
+            .unwrap()
             .into_iter()
             .map(|(d, _)| d)
             .collect();
@@ -175,13 +178,16 @@ fn hnsw_1k_vectors_recall_against_flat() {
     let q: Vec<f32> = (0..DIM)
         .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
         .collect();
-    let orig_ids: HashSet<_> = hnsw
+    let orig_ids: HashSet<_> = hnsw_view
         .similar(&q, 5, Some(50))
+        .unwrap()
         .into_iter()
         .map(|(d, _)| d)
         .collect();
     let loaded_ids: HashSet<_> = reloaded
+        .attach(&reader)
         .similar(&q, 5, Some(50))
+        .unwrap()
         .into_iter()
         .map(|(d, _)| d)
         .collect();
@@ -263,23 +269,35 @@ fn succinct_bm25_1k_docs_matches_naive() {
 fn succinct_hnsw_1k_docs_matches_naive() {
     const DIM: usize = 16;
 
+    use triblespace::core::blob::MemoryBlobStore;
+    use triblespace::core::repo::BlobStore;
+    use triblespace::core::value::schemas::hash::Blake3;
+    use triblespace_search::schemas::put_embedding;
+
     let mut rng = SplitMix64(0xBADF00D);
+    let mut store = MemoryBlobStore::<Blake3>::new();
     let mut builder = HNSWBuilder::new(DIM).with_seed(11);
     for i in 0..1_000 {
         let vec: Vec<f32> = (0..DIM)
             .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
             .collect();
-        builder.insert_id(id_from_u64((i + 1) as u64), vec).unwrap();
+        let h = put_embedding::<_, Blake3>(&mut store, vec.clone()).unwrap();
+        builder
+            .insert_id(id_from_u64((i + 1) as u64), h, vec)
+            .unwrap();
     }
     let naive = builder.build();
     let succinct = SuccinctHNSWIndex::from_naive(&naive).unwrap();
+    let reader = store.reader().unwrap();
+    let naive_view = naive.attach(&reader);
+    let succinct_view = succinct.attach(&reader);
 
     for _ in 0..5 {
         let q: Vec<f32> = (0..DIM)
             .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
             .collect();
-        let n = naive.similar(&q, 10, Some(50));
-        let s = succinct.similar(&q, 10, Some(50));
+        let n = naive_view.similar(&q, 10, Some(50)).unwrap();
+        let s = succinct_view.similar(&q, 10, Some(50)).unwrap();
         assert_eq!(n.len(), s.len());
         for ((n_id, n_s), (s_id, s_s)) in n.iter().zip(s.iter()) {
             assert_eq!(n_id, s_id, "doc mismatch at 1k scale");
@@ -455,13 +473,16 @@ fn flat_1k_vectors_top_k_consistent() {
 
     // The exact `target_vec` as a query should return `target` at
     // rank 1.
-    let hits = idx.similar_ids(&target_vec, 5, &reader).unwrap();
+    let hits = idx.attach(&reader).similar_ids(&target_vec, 5).unwrap();
     assert_eq!(hits.len(), 5);
     assert_eq!(hits[0].0, target);
 
     // Round-trip through bytes must preserve the top-k.
     let reloaded = FlatIndex::try_from_bytes(&idx.to_bytes()).expect("valid");
-    let hits2 = reloaded.similar_ids(&target_vec, 5, &reader).unwrap();
+    let hits2 = reloaded
+        .attach(&reader)
+        .similar_ids(&target_vec, 5)
+        .unwrap();
     assert_eq!(hits.len(), hits2.len());
     for (a, b) in hits.iter().zip(hits2.iter()) {
         assert_eq!(a.0, b.0);

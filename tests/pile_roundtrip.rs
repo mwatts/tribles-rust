@@ -72,23 +72,28 @@ fn succinct_bm25_survives_blob_store_roundtrip() {
 
 #[test]
 fn succinct_hnsw_survives_blob_store_roundtrip() {
+    use triblespace::core::value::schemas::hash::Blake3;
+    use triblespace_search::schemas::put_embedding;
+
     // Build a small HNSW index.
+    let mut store = MemoryBlobStore::<Blake3>::new();
     let mut b = HNSWBuilder::new(4).with_seed(9);
     for i in 1..=12u8 {
         let f = i as f32;
         let v = vec![f.sin(), f.cos(), (f * 0.5).sin(), (f * 0.3).cos()];
-        b.insert_id(iid(i), v).unwrap();
+        let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
+        b.insert_id(iid(i), h, v).unwrap();
     }
     let naive = b.build();
     let original = SuccinctHNSWIndex::from_naive(&naive).unwrap();
 
-    // Put → handle.
-    let mut store = MemoryBlobStore::<triblespace::core::value::schemas::hash::Blake3>::new();
+    // Put the index itself as a blob alongside the embedding
+    // blobs it references.
     let handle = store
         .put::<SuccinctHNSWBlob, _>(&original)
         .expect("put should succeed");
 
-    // Get → reloaded view.
+    // Get → reloaded view, then attach the reader for queries.
     let reader = <MemoryBlobStore<_> as triblespace::core::repo::BlobStore<_>>::reader(&mut store)
         .expect("reader");
     let reloaded: SuccinctHNSWIndex = reader
@@ -99,10 +104,12 @@ fn succinct_hnsw_survives_blob_store_roundtrip() {
     assert_eq!(reloaded.dim(), original.dim());
     assert_eq!(reloaded.max_level(), original.max_level());
 
-    // Same top-3 for the same query.
+    // Same top-3 for the same query — both attach to the same
+    // reader so the embedding-handle lookups resolve against
+    // the same backing pile.
     let q = vec![0.5, -0.2, 0.3, 0.7];
-    let a = original.similar(&q, 3, Some(10));
-    let r = reloaded.similar(&q, 3, Some(10));
+    let a = original.attach(&reader).similar(&q, 3, Some(10)).unwrap();
+    let r = reloaded.attach(&reader).similar(&q, 3, Some(10)).unwrap();
     assert_eq!(a.len(), r.len());
     for ((a_id, a_s), (r_id, r_s)) in a.iter().zip(r.iter()) {
         assert_eq!(a_id, r_id);

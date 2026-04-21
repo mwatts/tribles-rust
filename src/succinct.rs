@@ -819,18 +819,29 @@ impl SuccinctGraph {
 /// # Example
 ///
 /// ```
+/// use triblespace::core::blob::MemoryBlobStore;
 /// use triblespace::core::id::Id;
+/// use triblespace::core::repo::BlobStore;
+/// use triblespace::core::value::schemas::hash::Blake3;
 /// use triblespace_search::hnsw::HNSWBuilder;
+/// use triblespace_search::schemas::put_embedding;
 /// use triblespace_search::succinct::SuccinctHNSWIndex;
 ///
+/// let mut store = MemoryBlobStore::<Blake3>::new();
 /// let mut b = HNSWBuilder::new(4).with_seed(1);
-/// b.insert_id(Id::new([1; 16]).unwrap(), vec![1.0, 0.0, 0.0, 0.0]).unwrap();
-/// b.insert_id(Id::new([2; 16]).unwrap(), vec![0.0, 1.0, 0.0, 0.0]).unwrap();
-/// b.insert_id(Id::new([3; 16]).unwrap(), vec![0.9, 0.1, 0.0, 0.0]).unwrap();
+/// for (byte, v) in [
+///     (1u8, vec![1.0f32, 0.0, 0.0, 0.0]),
+///     (2, vec![0.0, 1.0, 0.0, 0.0]),
+///     (3, vec![0.9, 0.1, 0.0, 0.0]),
+/// ] {
+///     let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
+///     b.insert_id(Id::new([byte; 16]).unwrap(), h, v).unwrap();
+/// }
 /// let idx = SuccinctHNSWIndex::from_naive(&b.build()).unwrap();
 ///
+/// let reader = store.reader().unwrap();
 /// let q = vec![1.0, 0.0, 0.0, 0.0];
-/// let hits = idx.similar_ids(&q, 2, Some(10));
+/// let hits = idx.attach(&reader).similar_ids(&q, 2, Some(10)).unwrap();
 /// assert_eq!(hits.len(), 2);
 /// // doc 1 is an exact cosine match, doc 3 nearly so.
 /// assert_eq!(hits[0].0, Id::new([1; 16]).unwrap());
@@ -922,195 +933,21 @@ impl SuccinctHNSWIndex {
         self.max_level
     }
 
-    /// Constraint that binds `doc` to entity ids in the top-k
-    /// nearest neighbours under cosine similarity. Eagerly
-    /// resolves top-`k` against `store` at construction.
-    pub fn similar_constraint<B>(
-        &self,
-        doc: triblespace::core::query::Variable<triblespace::core::value::schemas::genid::GenId>,
-        query: Vec<f32>,
-        k: usize,
-        ef: Option<usize>,
-        store: &B,
-    ) -> Result<
-        crate::constraint::SimilarToVectorHNSW,
-        B::GetError<anybytes::view::ViewError>,
-    >
-    where
-        B: triblespace::core::repo::BlobStoreGet<
-                triblespace::core::value::schemas::hash::Blake3,
-            >,
-    {
-        let top = self.similar(&query, k, ef, store)?;
-        Ok(crate::constraint::SimilarToVectorHNSW::from_top(doc, top))
-    }
-
-    /// Scored variant: binds both `doc` and cosine `score`.
-    pub fn similar_with_scores<B>(
-        &self,
-        doc: triblespace::core::query::Variable<triblespace::core::value::schemas::genid::GenId>,
-        score: triblespace::core::query::Variable<crate::schemas::F32LE>,
-        query: Vec<f32>,
-        k: usize,
-        ef: Option<usize>,
-        store: &B,
-    ) -> Result<
-        crate::constraint::SimilarToVectorHNSWScored,
-        B::GetError<anybytes::view::ViewError>,
-    >
-    where
-        B: triblespace::core::repo::BlobStoreGet<
-                triblespace::core::value::schemas::hash::Blake3,
-            >,
-    {
-        let top = self.similar(&query, k, ef, store)?;
-        Ok(crate::constraint::SimilarToVectorHNSWScored::from_top(
-            doc, score, top,
-        ))
-    }
-
-    /// Read vector `i` as a borrowed `&[f32]` sliced directly
-    /// from the backing [`anybytes::Bytes`]. Zero-copy on
-    /// little-endian targets (the only ones we support for f32
-    /// round-trip through `to_le_bytes` + slice cast).
+    /// Attach a blob store to this index, returning a queryable
+    /// view. Paired with the typical load flow:
     ///
-    /// Fetch and dot-product node `i`'s embedding against the
-    /// normalized query. Routes through the caller-supplied
-    /// blob store.
-    fn dist_to<B>(
-        &self,
-        q: &[f32],
-        i: u32,
-        store: &B,
-    ) -> Result<f32, B::GetError<anybytes::view::ViewError>>
+    /// ```ignore
+    /// let idx: SuccinctHNSWIndex = reader.get(handle)?;
+    /// let view = idx.attach(&reader);
+    /// view.similar(&q, k, ef)?;
+    /// ```
+    pub fn attach<'a, B>(&'a self, store: &'a B) -> AttachedSuccinctHNSWIndex<'a, B>
     where
         B: triblespace::core::repo::BlobStoreGet<
                 triblespace::core::value::schemas::hash::Blake3,
             >,
     {
-        let raw = *self.handles.get(i as usize).expect("in range");
-        let handle: triblespace::core::value::Value<
-            triblespace::core::value::schemas::hash::Handle<
-                triblespace::core::value::schemas::hash::Blake3,
-                crate::schemas::Embedding,
-            >,
-        > = triblespace::core::value::Value::new(raw);
-        let view: anybytes::View<[f32]> =
-            store.get::<anybytes::View<[f32]>, crate::schemas::Embedding>(handle)?;
-        Ok(crate::hnsw::cosine_dist(q, view.as_ref()))
-    }
-
-    /// Approximate top-k nearest neighbours to `query` under
-    /// cosine similarity, resolving embedding handles through
-    /// `store`. Mirrors [`HNSWIndex::similar`] for the succinct
-    /// backing; wrap `store` in a `BlobCache` when querying
-    /// the same index repeatedly.
-    ///
-    /// [`HNSWIndex::similar`]: crate::hnsw::HNSWIndex::similar
-    pub fn similar<B>(
-        &self,
-        query: &[f32],
-        k: usize,
-        ef: Option<usize>,
-        store: &B,
-    ) -> Result<Vec<(RawValue, f32)>, B::GetError<anybytes::view::ViewError>>
-    where
-        B: triblespace::core::repo::BlobStoreGet<
-                triblespace::core::value::schemas::hash::Blake3,
-            >,
-    {
-        if query.len() != self.dim || k == 0 {
-            return Ok(Vec::new());
-        }
-        let Some(entry) = self.entry_point else {
-            return Ok(Vec::new());
-        };
-        let mut q = query.to_vec();
-        crate::hnsw::normalize(&mut q);
-        let ef = ef.unwrap_or(k).max(k);
-
-        // Greedy descent from max_level down to 1.
-        let mut curr = entry;
-        for lvl in (1..=self.max_level).rev() {
-            curr = self.greedy_search_layer(&q, curr, lvl, store)?;
-        }
-        let candidates = self.search_layer(&q, curr, ef, 0, store)?;
-        let mut ranked: Vec<(RawValue, f32)> = candidates
-            .into_iter()
-            .map(|(i, dist)| {
-                let raw = self.keys.get(i as usize).expect("in range");
-                (*raw, 1.0 - dist)
-            })
-            .collect();
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        ranked.truncate(k);
-        Ok(ranked)
-    }
-
-    /// Convenience: [`similar`] with GenId-typed keys decoded
-    /// back to [`Id`]; other schemas are dropped.
-    ///
-    /// [`similar`]: Self::similar
-    pub fn similar_ids<B>(
-        &self,
-        query: &[f32],
-        k: usize,
-        ef: Option<usize>,
-        store: &B,
-    ) -> Result<Vec<(Id, f32)>, B::GetError<anybytes::view::ViewError>>
-    where
-        B: triblespace::core::repo::BlobStoreGet<
-                triblespace::core::value::schemas::hash::Blake3,
-            >,
-    {
-        Ok(self
-            .similar(query, k, ef, store)?
-            .into_iter()
-            .filter_map(|(raw, s)| {
-                if raw[0..16] != [0u8; 16] {
-                    return None;
-                }
-                let id_bytes: [u8; 16] = raw[16..32].try_into().ok()?;
-                Id::new(id_bytes).map(|id| (id, s))
-            })
-            .collect())
-    }
-
-    fn greedy_search_layer<B>(
-        &self,
-        q: &[f32],
-        entry: u32,
-        layer: u8,
-        store: &B,
-    ) -> Result<u32, B::GetError<anybytes::view::ViewError>>
-    where
-        B: triblespace::core::repo::BlobStoreGet<
-                triblespace::core::value::schemas::hash::Blake3,
-            >,
-    {
-        let mut curr = entry;
-        let mut curr_dist = self.dist_to(q, curr, store)?;
-        loop {
-            let mut changed = false;
-            let neigh: Vec<u32> = self
-                .graph
-                .neighbours(curr as usize, layer as usize)
-                .collect();
-            if neigh.is_empty() {
-                return Ok(curr);
-            }
-            for n in neigh {
-                let d = self.dist_to(q, n, store)?;
-                if d < curr_dist {
-                    curr_dist = d;
-                    curr = n;
-                    changed = true;
-                }
-            }
-            if !changed {
-                return Ok(curr);
-            }
-        }
+        AttachedSuccinctHNSWIndex { index: self, store }
     }
 
     /// Serialize to a self-contained blob. Layout:
@@ -1290,27 +1127,188 @@ impl SuccinctHNSWIndex {
         })
     }
 
-    fn search_layer<B>(
+}
+
+/// A [`SuccinctHNSWIndex`] paired with the blob store its
+/// handles resolve against — produced by
+/// [`SuccinctHNSWIndex::attach`]. All `similar_*` methods and
+/// the query constraints live here; the bare
+/// [`SuccinctHNSWIndex`] only exposes metadata and the blob
+/// format.
+pub struct AttachedSuccinctHNSWIndex<'a, B>
+where
+    B: triblespace::core::repo::BlobStoreGet<
+            triblespace::core::value::schemas::hash::Blake3,
+        >,
+{
+    index: &'a SuccinctHNSWIndex,
+    store: &'a B,
+}
+
+impl<'a, B> AttachedSuccinctHNSWIndex<'a, B>
+where
+    B: triblespace::core::repo::BlobStoreGet<
+            triblespace::core::value::schemas::hash::Blake3,
+        >,
+{
+    /// Back-reference to the inner index.
+    pub fn index(&self) -> &SuccinctHNSWIndex {
+        self.index
+    }
+
+    /// Constraint binding `doc` to top-`k` nearest neighbour
+    /// keys. Eagerly resolves top-`k` against the attached
+    /// store up front; iterate-methods on the returned
+    /// constraint don't re-scan.
+    pub fn similar_constraint(
+        &self,
+        doc: triblespace::core::query::Variable<triblespace::core::value::schemas::genid::GenId>,
+        query: Vec<f32>,
+        k: usize,
+        ef: Option<usize>,
+    ) -> Result<
+        crate::constraint::SimilarToVectorHNSW,
+        B::GetError<anybytes::view::ViewError>,
+    > {
+        let top = self.similar(&query, k, ef)?;
+        Ok(crate::constraint::SimilarToVectorHNSW::from_top(doc, top))
+    }
+
+    /// Scored variant: binds both `doc` and cosine `score`.
+    pub fn similar_with_scores(
+        &self,
+        doc: triblespace::core::query::Variable<triblespace::core::value::schemas::genid::GenId>,
+        score: triblespace::core::query::Variable<crate::schemas::F32LE>,
+        query: Vec<f32>,
+        k: usize,
+        ef: Option<usize>,
+    ) -> Result<
+        crate::constraint::SimilarToVectorHNSWScored,
+        B::GetError<anybytes::view::ViewError>,
+    > {
+        let top = self.similar(&query, k, ef)?;
+        Ok(crate::constraint::SimilarToVectorHNSWScored::from_top(
+            doc, score, top,
+        ))
+    }
+
+    fn dist_to(
+        &self,
+        q: &[f32],
+        i: u32,
+    ) -> Result<f32, B::GetError<anybytes::view::ViewError>> {
+        let raw = *self.index.handles.get(i as usize).expect("in range");
+        let handle: triblespace::core::value::Value<
+            triblespace::core::value::schemas::hash::Handle<
+                triblespace::core::value::schemas::hash::Blake3,
+                crate::schemas::Embedding,
+            >,
+        > = triblespace::core::value::Value::new(raw);
+        let view: anybytes::View<[f32]> =
+            self.store.get::<anybytes::View<[f32]>, crate::schemas::Embedding>(handle)?;
+        Ok(crate::hnsw::cosine_dist(q, view.as_ref()))
+    }
+
+    /// Approximate top-k nearest neighbours to `query`.
+    pub fn similar(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: Option<usize>,
+    ) -> Result<Vec<(RawValue, f32)>, B::GetError<anybytes::view::ViewError>> {
+        if query.len() != self.index.dim || k == 0 {
+            return Ok(Vec::new());
+        }
+        let Some(entry) = self.index.entry_point else {
+            return Ok(Vec::new());
+        };
+        let mut q = query.to_vec();
+        crate::hnsw::normalize(&mut q);
+        let ef = ef.unwrap_or(k).max(k);
+
+        let mut curr = entry;
+        for lvl in (1..=self.index.max_level).rev() {
+            curr = self.greedy_search_layer(&q, curr, lvl)?;
+        }
+        let candidates = self.search_layer(&q, curr, ef, 0)?;
+        let mut ranked: Vec<(RawValue, f32)> = candidates
+            .into_iter()
+            .map(|(i, dist)| {
+                let raw = self.index.keys.get(i as usize).expect("in range");
+                (*raw, 1.0 - dist)
+            })
+            .collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        ranked.truncate(k);
+        Ok(ranked)
+    }
+
+    /// [`similar`] with GenId-typed keys decoded to [`Id`].
+    ///
+    /// [`similar`]: Self::similar
+    pub fn similar_ids(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: Option<usize>,
+    ) -> Result<Vec<(Id, f32)>, B::GetError<anybytes::view::ViewError>> {
+        Ok(self
+            .similar(query, k, ef)?
+            .into_iter()
+            .filter_map(|(raw, s)| {
+                if raw[0..16] != [0u8; 16] {
+                    return None;
+                }
+                let id_bytes: [u8; 16] = raw[16..32].try_into().ok()?;
+                Id::new(id_bytes).map(|id| (id, s))
+            })
+            .collect())
+    }
+
+    fn greedy_search_layer(
+        &self,
+        q: &[f32],
+        entry: u32,
+        layer: u8,
+    ) -> Result<u32, B::GetError<anybytes::view::ViewError>> {
+        let mut curr = entry;
+        let mut curr_dist = self.dist_to(q, curr)?;
+        loop {
+            let mut changed = false;
+            let neigh: Vec<u32> = self
+                .index
+                .graph
+                .neighbours(curr as usize, layer as usize)
+                .collect();
+            if neigh.is_empty() {
+                return Ok(curr);
+            }
+            for n in neigh {
+                let d = self.dist_to(q, n)?;
+                if d < curr_dist {
+                    curr_dist = d;
+                    curr = n;
+                    changed = true;
+                }
+            }
+            if !changed {
+                return Ok(curr);
+            }
+        }
+    }
+
+    fn search_layer(
         &self,
         q: &[f32],
         entry: u32,
         ef: usize,
         layer: u8,
-        store: &B,
-    ) -> Result<Vec<(u32, f32)>, B::GetError<anybytes::view::ViewError>>
-    where
-        B: triblespace::core::repo::BlobStoreGet<
-                triblespace::core::value::schemas::hash::Blake3,
-            >,
-    {
+    ) -> Result<Vec<(u32, f32)>, B::GetError<anybytes::view::ViewError>> {
         use std::collections::{BinaryHeap, HashSet};
         let mut visited: HashSet<u32> = HashSet::new();
         visited.insert(entry);
-        let d0 = self.dist_to(q, entry, store)?;
+        let d0 = self.dist_to(q, entry)?;
 
-        // Local heap wrappers mirroring hnsw.rs (we re-implement
-        // rather than expose the heap wrappers to keep the naive
-        // module's internals private).
         #[derive(Clone, Copy)]
         struct MinD {
             idx: u32,
@@ -1374,6 +1372,7 @@ impl SuccinctHNSWIndex {
                 break;
             }
             let neigh: Vec<u32> = self
+                .index
                 .graph
                 .neighbours(c.idx as usize, layer as usize)
                 .collect();
@@ -1381,7 +1380,7 @@ impl SuccinctHNSWIndex {
                 if !visited.insert(n) {
                     continue;
                 }
-                let d = self.dist_to(q, n, store)?;
+                let d = self.dist_to(q, n)?;
                 let farthest = results.peek().map(|r| r.dist).unwrap_or(f32::INFINITY);
                 if d < farthest || results.len() < ef {
                     candidates.push(MinD { idx: n, dist: d });
@@ -2513,9 +2512,11 @@ mod tests {
             vec![0.0, 1.0, -0.3, 0.1],
             vec![-0.5, 0.5, 0.5, -0.5],
         ];
+        let naive_view = naive.attach(&reader);
+        let succinct_view = succinct.attach(&reader);
         for q in &queries {
-            let n = naive.similar(q, 5, None, &reader).unwrap();
-            let s = succinct.similar(q, 5, None, &reader).unwrap();
+            let n = naive_view.similar(q, 5, None).unwrap();
+            let s = succinct_view.similar(q, 5, None).unwrap();
             assert_eq!(n.len(), s.len(), "count mismatch for query {q:?}");
             for ((n_id, n_s), (s_id, s_s)) in n.iter().zip(s.iter()) {
                 assert_eq!(n_id, s_id, "doc mismatch at top-k for {q:?}");
@@ -2566,8 +2567,8 @@ mod tests {
         // Same query must return identical top-k on both.
         let q = vec![0.5, -0.3, 0.7, 0.1];
         let reader = store.reader().unwrap();
-        let orig_hits = original.similar(&q, 5, None, &reader).unwrap();
-        let load_hits = reloaded.similar(&q, 5, None, &reader).unwrap();
+        let orig_hits = original.attach(&reader).similar(&q, 5, None).unwrap();
+        let load_hits = reloaded.attach(&reader).similar(&q, 5, None).unwrap();
         assert_eq!(orig_hits.len(), load_hits.len());
         for ((a_id, a_s), (b_id, b_s)) in orig_hits.iter().zip(load_hits.iter()) {
             assert_eq!(a_id, b_id);
@@ -2588,7 +2589,8 @@ mod tests {
         assert_eq!(reloaded.doc_count(), 0);
         let mut store: MemoryBlobStore<Blake3> = MemoryBlobStore::new();
         assert!(reloaded
-            .similar(&[0.0, 0.0, 0.0], 5, None, &store.reader().unwrap())
+            .attach(&store.reader().unwrap())
+            .similar(&[0.0, 0.0, 0.0], 5, None)
             .unwrap()
             .is_empty());
     }
@@ -2654,7 +2656,8 @@ mod tests {
         assert_eq!(succinct.doc_count(), 0);
         let mut store: MemoryBlobStore<Blake3> = MemoryBlobStore::new();
         assert!(succinct
-            .similar(&[0.0, 0.0, 0.0], 5, None, &store.reader().unwrap())
+            .attach(&store.reader().unwrap())
+            .similar(&[0.0, 0.0, 0.0], 5, None)
             .unwrap()
             .is_empty());
     }

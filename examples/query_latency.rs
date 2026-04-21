@@ -197,9 +197,11 @@ fn bench_hnsw(n_docs: usize, dim: usize) {
         })
         .collect();
 
+    let naive_view = naive.attach(&reader);
+    let succinct_view = succinct.attach(&reader);
     for q in &queries {
-        let _ = naive.similar(q, 10, Some(50), &reader);
-        let _ = succinct.similar(q, 10, Some(50), &reader);
+        let _ = naive_view.similar(q, 10, Some(50));
+        let _ = succinct_view.similar(q, 10, Some(50));
     }
 
     let time = |tag: &str, f: &dyn Fn(&[f32])| {
@@ -225,10 +227,10 @@ fn bench_hnsw(n_docs: usize, dim: usize) {
 
     println!("HNSW top-10 query, ef=50  [n={n_docs}, dim={dim}]:");
     time("naive", &|q| {
-        let _ = naive.similar(q, 10, Some(50), &reader);
+        let _ = naive_view.similar(q, 10, Some(50));
     });
     time("SH25", &|q| {
-        let _ = succinct.similar(q, 10, Some(50), &reader);
+        let _ = succinct_view.similar(q, 10, Some(50));
     });
 }
 

@@ -76,35 +76,35 @@ fn succinct_bm25_survives_pile_round_trip() {
 
 #[test]
 fn succinct_hnsw_survives_pile_round_trip() {
+    use triblespace::core::value::schemas::hash::Blake3;
+    use triblespace_search::schemas::put_embedding;
+
     let dir = tempdir().expect("tempdir");
     let pile_path = dir.path().join("hnsw.pile");
     std::fs::File::create(&pile_path).expect("create pile file");
 
-    let mut b = HNSWBuilder::new(4).with_seed(19);
-    for i in 1..=12u8 {
-        let f = i as f32;
-        b.insert_id(
-            iid(i),
-            vec![f.sin(), f.cos(), (f * 0.5).sin(), (f * 0.3).cos()],
-        )
-        .unwrap();
-    }
-    let naive = b.build();
-    let original = SuccinctHNSWIndex::from_naive(&naive).unwrap();
-
-    let handle = {
-        let mut pile = Pile::<triblespace::core::value::schemas::hash::Blake3>::open(&pile_path)
-            .expect("open pile");
+    let (original, handle) = {
+        let mut pile = Pile::<Blake3>::open(&pile_path).expect("open pile");
         pile.refresh().expect("refresh empty pile");
-        let h = pile
+
+        let mut b = HNSWBuilder::new(4).with_seed(19);
+        for i in 1..=12u8 {
+            let f = i as f32;
+            let v = vec![f.sin(), f.cos(), (f * 0.5).sin(), (f * 0.3).cos()];
+            let h = put_embedding::<_, Blake3>(&mut pile, v.clone()).unwrap();
+            b.insert_id(iid(i), h, v).unwrap();
+        }
+        let naive = b.build();
+        let original = SuccinctHNSWIndex::from_naive(&naive).unwrap();
+
+        let handle = pile
             .put::<SuccinctHNSWBlob, _>(&original)
             .expect("put SH25");
         pile.flush().expect("flush");
-        h
+        (original, handle)
     };
 
-    let mut pile = Pile::<triblespace::core::value::schemas::hash::Blake3>::open(&pile_path)
-        .expect("reopen pile");
+    let mut pile = Pile::<Blake3>::open(&pile_path).expect("reopen pile");
     pile.refresh().expect("refresh");
     let reader = pile.reader().expect("reader");
     let reloaded: SuccinctHNSWIndex = reader
@@ -115,8 +115,8 @@ fn succinct_hnsw_survives_pile_round_trip() {
     assert_eq!(reloaded.dim(), original.dim());
 
     let q = vec![0.5, -0.2, 0.3, 0.7];
-    let a = original.similar(&q, 3, Some(10));
-    let r = reloaded.similar(&q, 3, Some(10));
+    let a = original.attach(&reader).similar(&q, 3, Some(10)).unwrap();
+    let r = reloaded.attach(&reader).similar(&q, 3, Some(10)).unwrap();
     assert_eq!(a.len(), r.len());
     for ((a_id, a_s), (r_id, r_s)) in a.iter().zip(r.iter()) {
         assert_eq!(a_id, r_id);

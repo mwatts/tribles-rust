@@ -26,7 +26,6 @@ use triblespace::core::value::schemas::genid::GenId;
 use triblespace::core::value::RawValue;
 
 use crate::bm25::BM25Index;
-use crate::hnsw::{FlatIndex, HNSWIndex};
 use crate::schemas::F32LE;
 
 /// Minimum surface a BM25 index must expose for the
@@ -342,24 +341,23 @@ impl SimilarToVector {
     }
 }
 
-impl FlatIndex {
+impl<'a, B> crate::hnsw::AttachedFlatIndex<'a, B>
+where
+    B: triblespace::core::repo::BlobStoreGet<
+            triblespace::core::value::schemas::hash::Blake3,
+        >,
+{
     /// Build a [`SimilarToVector`] constraint for use inside
     /// `pattern!` / `find!`. Eagerly resolves the top-`k`
-    /// against `store` up front so subsequent engine calls
-    /// don't re-scan.
-    pub fn similar_constraint<B>(
+    /// against the attached store up front so subsequent
+    /// engine calls don't re-scan.
+    pub fn similar_constraint(
         &self,
         doc: Variable<GenId>,
         query: Vec<f32>,
         k: usize,
-        store: &B,
-    ) -> Result<SimilarToVector, B::GetError<anybytes::view::ViewError>>
-    where
-        B: triblespace::core::repo::BlobStoreGet<
-                triblespace::core::value::schemas::hash::Blake3,
-            >,
-    {
-        let top = self.similar(&query, k, store)?;
+    ) -> Result<SimilarToVector, B::GetError<anybytes::view::ViewError>> {
+        let top = self.similar(&query, k)?;
         Ok(SimilarToVector::from_top(doc, top))
     }
 }
@@ -425,24 +423,23 @@ impl SimilarToVectorScored {
     }
 }
 
-impl FlatIndex {
-    /// Two-variable similarity constraint — binds both `doc` and
-    /// the cosine-similarity `score` for each top-k hit. Eagerly
-    /// resolves the top-`k` against `store` up front.
-    pub fn similar_with_scores<B>(
+impl<'a, B> crate::hnsw::AttachedFlatIndex<'a, B>
+where
+    B: triblespace::core::repo::BlobStoreGet<
+            triblespace::core::value::schemas::hash::Blake3,
+        >,
+{
+    /// Two-variable similarity constraint — binds both `doc`
+    /// and the cosine-similarity `score` for each top-k hit.
+    /// Eagerly resolves the top-`k` against the attached store.
+    pub fn similar_with_scores(
         &self,
         doc: Variable<GenId>,
         score: Variable<F32LE>,
         query: Vec<f32>,
         k: usize,
-        store: &B,
-    ) -> Result<SimilarToVectorScored, B::GetError<anybytes::view::ViewError>>
-    where
-        B: triblespace::core::repo::BlobStoreGet<
-                triblespace::core::value::schemas::hash::Blake3,
-            >,
-    {
-        let top = self.similar(&query, k, store)?;
+    ) -> Result<SimilarToVectorScored, B::GetError<anybytes::view::ViewError>> {
+        let top = self.similar(&query, k)?;
         Ok(SimilarToVectorScored::from_top(doc, score, top))
     }
 }
@@ -551,26 +548,25 @@ impl SimilarToVectorHNSW {
     }
 }
 
-impl HNSWIndex {
-    /// Build a [`SimilarToVectorHNSW`] constraint for use inside
-    /// `pattern!` / `find!`. Pass `ef = Some(n)` to widen search
-    /// (higher recall, slower); `None` defaults to `k`. The
-    /// HNSW walk happens once at construction; `store` resolves
-    /// embedding handles during that walk.
-    pub fn similar_constraint<B>(
+impl<'a, B> crate::hnsw::AttachedHNSWIndex<'a, B>
+where
+    B: triblespace::core::repo::BlobStoreGet<
+            triblespace::core::value::schemas::hash::Blake3,
+        >,
+{
+    /// Build a [`SimilarToVectorHNSW`] constraint for use
+    /// inside `pattern!` / `find!`. Pass `ef = Some(n)` to
+    /// widen search (higher recall, slower); `None` defaults
+    /// to `k`. The HNSW walk happens once at construction
+    /// against the attached store.
+    pub fn similar_constraint(
         &self,
         doc: Variable<GenId>,
         query: Vec<f32>,
         k: usize,
         ef: Option<usize>,
-        store: &B,
-    ) -> Result<SimilarToVectorHNSW, B::GetError<anybytes::view::ViewError>>
-    where
-        B: triblespace::core::repo::BlobStoreGet<
-                triblespace::core::value::schemas::hash::Blake3,
-            >,
-    {
-        let top = self.similar(&query, k, ef, store)?;
+    ) -> Result<SimilarToVectorHNSW, B::GetError<anybytes::view::ViewError>> {
+        let top = self.similar(&query, k, ef)?;
         Ok(SimilarToVectorHNSW::from_top(doc, top))
     }
 }
@@ -634,25 +630,24 @@ impl SimilarToVectorHNSWScored {
     }
 }
 
-impl HNSWIndex {
-    /// Two-variable similarity constraint for HNSW — binds both
-    /// `doc` and cosine `score` for each top-k hit. Eagerly
-    /// resolves against `store`.
-    pub fn similar_with_scores<B>(
+impl<'a, B> crate::hnsw::AttachedHNSWIndex<'a, B>
+where
+    B: triblespace::core::repo::BlobStoreGet<
+            triblespace::core::value::schemas::hash::Blake3,
+        >,
+{
+    /// Two-variable similarity constraint for HNSW — binds
+    /// both `doc` and cosine `score` for each top-k hit.
+    /// Eagerly resolves against the attached store.
+    pub fn similar_with_scores(
         &self,
         doc: Variable<GenId>,
         score: Variable<F32LE>,
         query: Vec<f32>,
         k: usize,
         ef: Option<usize>,
-        store: &B,
-    ) -> Result<SimilarToVectorHNSWScored, B::GetError<anybytes::view::ViewError>>
-    where
-        B: triblespace::core::repo::BlobStoreGet<
-                triblespace::core::value::schemas::hash::Blake3,
-            >,
-    {
-        let top = self.similar(&query, k, ef, store)?;
+    ) -> Result<SimilarToVectorHNSWScored, B::GetError<anybytes::view::ViewError>> {
+        let top = self.similar(&query, k, ef)?;
         Ok(SimilarToVectorHNSWScored::from_top(doc, score, top))
     }
 }
@@ -948,7 +943,7 @@ mod tests {
     }
 
     fn sample_flat() -> (
-        FlatIndex,
+        crate::hnsw::FlatIndex,
         triblespace::core::blob::MemoryBlobStore<
             triblespace::core::value::schemas::hash::Blake3,
         >,
@@ -975,8 +970,7 @@ mod tests {
         let (idx, mut store) = sample_flat();
         let mut ctx = triblespace::core::query::VariableContext::new();
         let doc: Variable<GenId> = ctx.next_variable();
-        let c = idx
-            .similar_constraint(doc, vec![1.0, 0.0, 0.0], 2, &store.reader().unwrap())
+        let c = idx.attach(&store.reader().unwrap()).similar_constraint(doc, vec![1.0, 0.0, 0.0], 2)
             .unwrap();
 
         let binding = Binding::default();
@@ -990,8 +984,7 @@ mod tests {
         let mut ctx = triblespace::core::query::VariableContext::new();
         let doc: Variable<GenId> = ctx.next_variable();
         // Larger k than corpus — estimate must clamp to doc_count.
-        let c = idx
-            .similar_constraint(doc, vec![1.0, 0.0, 0.0], 100, &store.reader().unwrap())
+        let c = idx.attach(&store.reader().unwrap()).similar_constraint(doc, vec![1.0, 0.0, 0.0], 100)
             .unwrap();
         let binding = Binding::default();
         assert_eq!(c.estimate(doc.index, &binding), Some(4));
@@ -1002,8 +995,7 @@ mod tests {
         let (idx, mut store) = sample_flat();
         let mut ctx = triblespace::core::query::VariableContext::new();
         let doc: Variable<GenId> = ctx.next_variable();
-        let c = idx
-            .similar_constraint(doc, vec![1.0, 0.0, 0.0], 2, &store.reader().unwrap())
+        let c = idx.attach(&store.reader().unwrap()).similar_constraint(doc, vec![1.0, 0.0, 0.0], 2)
             .unwrap();
 
         let binding = Binding::default();
@@ -1021,8 +1013,7 @@ mod tests {
         let (idx, mut store) = sample_flat();
         let mut ctx = triblespace::core::query::VariableContext::new();
         let doc: Variable<GenId> = ctx.next_variable();
-        let c = idx
-            .similar_constraint(doc, vec![1.0, 0.0, 0.0], 2, &store.reader().unwrap())
+        let c = idx.attach(&store.reader().unwrap()).similar_constraint(doc, vec![1.0, 0.0, 0.0], 2)
             .unwrap();
 
         let binding = Binding::default();
@@ -1045,8 +1036,7 @@ mod tests {
         let (idx, mut store) = sample_flat();
         let mut ctx = triblespace::core::query::VariableContext::new();
         let doc: Variable<GenId> = ctx.next_variable();
-        let c = idx
-            .similar_constraint(doc, vec![1.0, 0.0, 0.0], 2, &store.reader().unwrap())
+        let c = idx.attach(&store.reader().unwrap()).similar_constraint(doc, vec![1.0, 0.0, 0.0], 2)
             .unwrap();
 
         // Unbound → trivially satisfied.
@@ -1214,8 +1204,7 @@ mod tests {
         let (idx, mut store) = sample_hnsw();
         let mut ctx = triblespace::core::query::VariableContext::new();
         let doc: Variable<GenId> = ctx.next_variable();
-        let c = idx
-            .similar_constraint(doc, vec![1.0, 0.0, 0.0], 2, Some(10), &store.reader().unwrap())
+        let c = idx.attach(&store.reader().unwrap()).similar_constraint(doc, vec![1.0, 0.0, 0.0], 2, Some(10))
             .unwrap();
 
         let binding = Binding::default();
@@ -1235,8 +1224,7 @@ mod tests {
         let (idx, mut store) = sample_hnsw();
         let mut ctx = triblespace::core::query::VariableContext::new();
         let doc: Variable<GenId> = ctx.next_variable();
-        let c = idx
-            .similar_constraint(doc, vec![1.0, 0.0, 0.0], 100, None, &store.reader().unwrap())
+        let c = idx.attach(&store.reader().unwrap()).similar_constraint(doc, vec![1.0, 0.0, 0.0], 100, None)
             .unwrap();
         assert_eq!(c.estimate(doc.index, &Binding::default()), Some(4));
     }
@@ -1246,8 +1234,7 @@ mod tests {
         let (idx, mut store) = sample_hnsw();
         let mut ctx = triblespace::core::query::VariableContext::new();
         let doc: Variable<GenId> = ctx.next_variable();
-        let c = idx
-            .similar_constraint(doc, vec![1.0, 0.0, 0.0], 2, Some(10), &store.reader().unwrap())
+        let c = idx.attach(&store.reader().unwrap()).similar_constraint(doc, vec![1.0, 0.0, 0.0], 2, Some(10))
             .unwrap();
 
         // Unbound → trivially satisfied.
@@ -1262,8 +1249,7 @@ mod tests {
         let mut ctx = triblespace::core::query::VariableContext::new();
         let doc: Variable<GenId> = ctx.next_variable();
         let score: Variable<F32LE> = ctx.next_variable();
-        let c = idx
-            .similar_with_scores(doc, score, vec![1.0, 0.0, 0.0], 3, &store.reader().unwrap())
+        let c = idx.attach(&store.reader().unwrap()).similar_with_scores(doc, score, vec![1.0, 0.0, 0.0], 3)
             .unwrap();
 
         let vars = c.variables();
@@ -1292,8 +1278,7 @@ mod tests {
         let mut ctx = triblespace::core::query::VariableContext::new();
         let doc: Variable<GenId> = ctx.next_variable();
         let score: Variable<F32LE> = ctx.next_variable();
-        let c = idx
-            .similar_with_scores(doc, score, vec![1.0, 0.0, 0.0], 4, &store.reader().unwrap())
+        let c = idx.attach(&store.reader().unwrap()).similar_with_scores(doc, score, vec![1.0, 0.0, 0.0], 4)
             .unwrap();
 
         // Prime `score` to the exact-match value (1.0). Only
@@ -1316,14 +1301,8 @@ mod tests {
         let doc: Variable<GenId> = ctx.next_variable();
         let score: Variable<F32LE> = ctx.next_variable();
         let c = idx
-            .similar_with_scores(
-                doc,
-                score,
-                vec![1.0, 0.0, 0.0],
-                2,
-                Some(10),
-                &store.reader().unwrap(),
-            )
+            .attach(&store.reader().unwrap())
+            .similar_with_scores(doc, score, vec![1.0, 0.0, 0.0], 2, Some(10))
             .unwrap();
 
         let vars = c.variables();
