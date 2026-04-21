@@ -74,4 +74,10 @@ pub mod tokens;
 /// - `2`: generalized `doc_ids` → `keys`: 32-byte `RawValue`
 ///   per entry. Unlocks string / tag / composite-key search
 ///   through the same index type. See CHANGELOG.
-pub const FORMAT_VERSION: u16 = 2;
+/// - `3`: SB25 keys table → `CompressedUniverse` (DACs-byte
+///   fragment dictionary). Compresses correlated keys (entity
+///   ids with shared zero-padding, sequential patterns).
+///   Postings' `doc_idx` now references the universe code
+///   (sorted position), not insertion order. Header grows by
+///   40 B for the `CompressedUniverseMeta`.
+pub const FORMAT_VERSION: u16 = 3;

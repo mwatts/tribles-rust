@@ -201,8 +201,13 @@ fn succinct_bm25_1k_docs_matches_naive() {
         if term.is_empty() {
             continue;
         }
-        let a: Vec<_> = naive.query_term(&term[0]).collect();
-        let b: Vec<_> = succinct.query_term(&term[0]).collect();
+        // Query result order is unspecified — succinct sorts by
+        // CompressedUniverse code, naive by insertion order — so
+        // compare as sets by sorting by key first.
+        let mut a: Vec<_> = naive.query_term(&term[0]).collect();
+        let mut b: Vec<_> = succinct.query_term(&term[0]).collect();
+        a.sort_by_key(|(k, _)| *k);
+        b.sort_by_key(|(k, _)| *k);
         assert_eq!(
             a.len(),
             b.len(),
@@ -225,8 +230,10 @@ fn succinct_bm25_1k_docs_matches_naive() {
     let reloaded = SuccinctBM25Index::try_from_bytes(&bytes).expect("valid");
     assert_eq!(reloaded.doc_count(), succinct.doc_count());
     let term = hash_tokens("w7");
-    let a: Vec<_> = succinct.query_term(&term[0]).collect();
-    let b: Vec<_> = reloaded.query_term(&term[0]).collect();
+    let mut a: Vec<_> = succinct.query_term(&term[0]).collect();
+    let mut b: Vec<_> = reloaded.query_term(&term[0]).collect();
+    a.sort_by_key(|(k, _)| *k);
+    b.sort_by_key(|(k, _)| *k);
     assert_eq!(a.len(), b.len());
     let tol = reloaded.score_tolerance().max(1e-5);
     for ((id_a, s_a), (id_b, s_b)) in a.iter().zip(b.iter()) {

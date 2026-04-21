@@ -38,6 +38,10 @@
 use anybytes::{ByteArea, Bytes};
 use jerky::int_vectors::compact_vector::CompactVectorMeta;
 use jerky::int_vectors::{CompactVector, CompactVectorBuilder};
+use jerky::serialization::Serializable;
+use triblespace::core::blob::schemas::succinctarchive::{
+    CompressedUniverse, CompressedUniverseMeta, Universe,
+};
 use triblespace::core::blob::{Blob, BlobSchema, ToBlob, TryFromBlob};
 use triblespace::core::id::Id;
 use triblespace::core::id_hex;
@@ -84,6 +88,75 @@ impl From<CompactVectorMeta> for CompactVectorMetaOnDisk {
             handle_offset: m.handle.offset as u64,
             handle_len: m.handle.len as u64,
         }
+    }
+}
+
+/// Byte-layout mirror of triblespace's [`CompressedUniverseMeta`].
+///
+/// Same upstream-frozen-derives issue as [`CompactVectorMetaOnDisk`]:
+/// the upstream meta derives `FromBytes` but not `IntoBytes`, so
+/// we can't `as_bytes` it for our own header. Mirror the layout
+/// on our side, static-assert the size, and convert via zerocopy.
+///
+/// Layout (all `#[repr(C)]` on 64-bit targets):
+/// ```text
+/// CompressedUniverseMeta:
+///   fragments: SectionHandle<[u8; 4]>  (offset: usize, len: usize, phantom)
+///   data:      DacsByteMeta
+///     num_levels: usize
+///     levels:     SectionHandle<LevelMeta>  (offset, len, phantom)
+///
+/// Total: 5 × 8 = 40 bytes.
+/// ```
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
+#[repr(C)]
+struct CompressedUniverseMetaOnDisk {
+    fragments_offset: u64,
+    fragments_len: u64,
+    dacs_num_levels: u64,
+    dacs_levels_offset: u64,
+    dacs_levels_len: u64,
+}
+
+const _: () = assert!(
+    std::mem::size_of::<CompressedUniverseMetaOnDisk>() == 40,
+    "CompressedUniverseMetaOnDisk must be 40 bytes",
+);
+const _: () = assert!(
+    std::mem::size_of::<CompressedUniverseMeta>() == 40,
+    "CompressedUniverseMeta must be 40 bytes (assumes 64-bit target)",
+);
+
+impl CompressedUniverseMetaOnDisk {
+    fn to_jerky(self) -> CompressedUniverseMeta {
+        // Both structs are #[repr(C)] and size_of == 40 with
+        // matching field order on 64-bit. read_from_bytes
+        // validates.
+        CompressedUniverseMeta::read_from_bytes(self.as_bytes())
+            .expect("CompressedUniverseMeta has same 40-byte repr(C) layout on 64-bit")
+    }
+}
+
+impl From<CompressedUniverseMeta> for CompressedUniverseMetaOnDisk {
+    fn from(m: CompressedUniverseMeta) -> Self {
+        // Upstream only derives FromBytes. Safety: both types
+        // are `#[repr(C)]`, same size (static-asserted), and
+        // every field is plain data.
+        let mut out = Self {
+            fragments_offset: 0,
+            fragments_len: 0,
+            dacs_num_levels: 0,
+            dacs_levels_offset: 0,
+            dacs_levels_len: 0,
+        };
+        let src_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                (&m as *const CompressedUniverseMeta) as *const u8,
+                std::mem::size_of::<CompressedUniverseMeta>(),
+            )
+        };
+        out.as_mut_bytes().copy_from_slice(src_bytes);
+        out
     }
 }
 
@@ -1272,9 +1345,18 @@ impl SuccinctHNSWIndex {
 /// let blob_bytes = idx.to_bytes();
 /// assert!(blob_bytes.len() > 0);
 /// ```
-#[derive(Debug)]
 pub struct SuccinctBM25Index {
-    keys: FixedBytesTable<32>,
+    /// Sorted, deduplicated, compressed doc-key table. For
+    /// entity-keyed corpora (`Value<GenId>`), 16 of the 32 bytes
+    /// per key are always zero; plus real-world ID patterns
+    /// share 4-byte fragments across docs. `CompressedUniverse`
+    /// frequency-sorts fragments and stores indices via
+    /// DACs-byte — typical 3-5× savings vs. flat `FixedBytesTable`.
+    ///
+    /// The doc_idx in the postings table is the key's position
+    /// in the sorted universe (not insertion order).
+    /// `keys.access(code)` decodes back to `RawValue`.
+    keys: CompressedUniverse,
     doc_lens: SuccinctDocLens,
     terms: FixedBytesTable<32>,
     postings: SuccinctPostings,
@@ -1283,32 +1365,89 @@ pub struct SuccinctBM25Index {
     b: f32,
 }
 
+impl std::fmt::Debug for SuccinctBM25Index {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SuccinctBM25Index")
+            .field("n_docs", &self.keys.len())
+            .field("n_terms", &self.terms.len())
+            .field("avg_doc_len", &self.avg_doc_len)
+            .field("k1", &self.k1)
+            .field("b", &self.b)
+            .finish()
+    }
+}
+
 impl SuccinctBM25Index {
     /// Re-encode a naive [`BM25Index`] into the succinct form.
     /// The postings + per-doc counts shrink; scores stay as raw
     /// f32 for now.
     pub fn from_naive(idx: &BM25Index) -> Result<Self, SuccinctDocLensError> {
-        // keys: flat 32-byte rows (any triblespace RawValue —
-        // most commonly Value<GenId> for entity-keyed indexes).
-        let key_rows: Vec<[u8; 32]> = idx.keys().to_vec();
-        let keys_bytes = FixedBytesTable::<32>::build(&key_rows);
-        let keys = FixedBytesTable::<32>::from_bytes(keys_bytes, key_rows.len())?;
+        // keys: compressed universe. idx.keys() is in insertion
+        // order; the universe re-sorts + dedups. We record the
+        // translation `insertion_doc_idx -> universe_code` so
+        // postings + doc_lens can be remapped to match the new
+        // sorted order.
+        let (keys_bytes, keys_meta, insertion_to_code) = {
+            let naive_keys = idx.keys();
+            let mut area = ByteArea::new()?;
+            let mut sections = area.sections();
+            let universe =
+                CompressedUniverse::with(naive_keys.iter().copied(), &mut sections);
+            let translation: Vec<u32> = naive_keys
+                .iter()
+                .map(|k| {
+                    universe
+                        .search(k)
+                        .map(|c| c as u32)
+                        .expect("key just inserted must be found")
+                })
+                .collect();
+            let meta = universe.metadata();
+            drop(universe);
+            drop(sections);
+            (area.freeze()?, meta, translation)
+        };
+        let keys = CompressedUniverse::from_bytes(keys_meta, keys_bytes).map_err(|_| {
+            SuccinctDocLensError::SizeMismatch {
+                bytes: 0,
+                expected: 0,
+            }
+        })?;
 
         // terms: flat 32-byte rows, sorted (idx.terms() guarantees).
         let term_rows: Vec<[u8; 32]> = idx.terms_slice().to_vec();
         let terms_bytes = FixedBytesTable::<32>::build(&term_rows);
         let terms = FixedBytesTable::<32>::from_bytes(terms_bytes, term_rows.len())?;
 
-        // doc_lens: jerky CompactVector.
-        let (doc_lens_bytes, doc_lens_meta) = SuccinctDocLens::build(idx.doc_lens())?;
+        // doc_lens: reorder from insertion-order to universe-code
+        // order so `doc_lens.get(universe_code)` returns the
+        // correct doc length.
+        let mut remapped_lens = vec![0u32; insertion_to_code.len()];
+        for (insertion_idx, &code) in insertion_to_code.iter().enumerate() {
+            remapped_lens[code as usize] = idx.doc_lens()[insertion_idx];
+        }
+        let (doc_lens_bytes, doc_lens_meta) = SuccinctDocLens::build(&remapped_lens)?;
         let doc_lens = SuccinctDocLens::from_bytes(doc_lens_meta, doc_lens_bytes)?;
 
-        // postings: rebuild the per-term posting lists.
+        // postings: remap each posting's doc_idx from insertion
+        // order to the corresponding universe code, then sort
+        // within each term's list to preserve the ascending-
+        // doc_idx invariant SuccinctPostings relies on.
         let lists: Vec<Vec<(u32, f32)>> = (0..idx.term_count())
-            .map(|t| idx.postings_for(t).to_vec())
+            .map(|t| {
+                let mut postings: Vec<(u32, f32)> = idx
+                    .postings_for(t)
+                    .iter()
+                    .map(|&(insertion_idx, score)| {
+                        (insertion_to_code[insertion_idx as usize], score)
+                    })
+                    .collect();
+                postings.sort_unstable_by_key(|&(idx, _)| idx);
+                postings
+            })
             .collect();
         let (postings_bytes, postings_meta) =
-            SuccinctPostings::build(&lists, idx.doc_count() as u32)?;
+            SuccinctPostings::build(&lists, keys.len() as u32)?;
         let postings = SuccinctPostings::from_bytes(postings_meta, postings_bytes)?;
 
         Ok(Self {
@@ -1401,8 +1540,8 @@ impl SuccinctBM25Index {
         match self.terms.binary_search(term) {
             Ok(t) => match self.postings.postings_for(t) {
                 Some(iter) => Box::new(iter.map(move |(doc_idx, score)| {
-                    let key = self.keys.get(doc_idx as usize).expect("doc_idx in range");
-                    (*key, score)
+                    let key = self.keys.access(doc_idx as usize);
+                    (key, score)
                 })),
                 None => Box::new(std::iter::empty()),
             },
@@ -1484,18 +1623,35 @@ impl SuccinctBM25Index {
         let n_docs = self.doc_count() as u64;
         let n_terms = self.term_count() as u64;
 
-        // Capture component metas.
-        let doc_lens_meta: CompactVectorMetaOnDisk = self.doc_lens.inner.metadata().into();
+        // keys: re-serialize through a fresh CompressedUniverse
+        // so the embedded section handles match the freshly-
+        // allocated ByteArea offsets.
+        let keys_sorted: Vec<RawValue> =
+            (0..self.doc_count()).map(|i| self.keys.access(i)).collect();
+        let (keys_region, keys_meta) = {
+            let mut area = ByteArea::new().expect("byte area");
+            let mut sections = area.sections();
+            let universe = CompressedUniverse::with_sorted_dedup(
+                keys_sorted.into_iter(),
+                &mut sections,
+            );
+            let meta = universe.metadata();
+            drop(universe);
+            drop(sections);
+            (area.freeze().expect("freeze"), meta)
+        };
+        let keys_meta_on_disk: CompressedUniverseMetaOnDisk = keys_meta.into();
 
-        let keys_bytes: Vec<u8> = (0..self.doc_count())
-            .flat_map(|i| self.keys.get(i).copied().unwrap_or([0u8; 32]))
-            .collect();
         let terms_bytes: Vec<u8> = (0..self.term_count())
             .flat_map(|i| self.terms.get(i).copied().unwrap_or([0u8; 32]))
             .collect();
-        // doc_lens: re-serialize so the blob owns the bytes.
-        let (doc_lens_region, _) =
+        // doc_lens: re-serialize so the blob owns the bytes
+        // AND so the meta's handle offsets match the fresh
+        // ByteArea (the stale in-memory meta points at the
+        // original area).
+        let (doc_lens_region, doc_lens_meta_fresh) =
             SuccinctDocLens::build(&self.doc_lens.to_vec()).expect("re-serialize");
+        let doc_lens_meta: CompactVectorMetaOnDisk = doc_lens_meta_fresh.into();
         // postings: round-trip through build to get fresh bytes
         // + a matching meta (handle offsets re-relative to the
         // fresh ByteArea start).
@@ -1508,13 +1664,21 @@ impl SuccinctBM25Index {
         let postings_offsets_meta: CompactVectorMetaOnDisk = postings_meta.offsets.into();
         let postings_scores_meta: CompactVectorMetaOnDisk = postings_meta.scores.into();
 
+        // Round each section's start offset up to 8-byte
+        // alignment. jerky's CompactVector / Universe views
+        // reinterpret the bytes as u64 words and fail with an
+        // `Alignment` error if the slice doesn't start on an
+        // 8-byte boundary.
+        fn align8(n: u64) -> u64 {
+            (n + 7) & !7
+        }
         let keys_off = 0u64;
-        let keys_len = keys_bytes.len() as u64;
-        let terms_off = keys_off + keys_len;
+        let keys_len = keys_region.len() as u64;
+        let terms_off = align8(keys_off + keys_len);
         let terms_len = terms_bytes.len() as u64;
-        let doc_lens_off = terms_off + terms_len;
+        let doc_lens_off = align8(terms_off + terms_len);
         let doc_lens_len = doc_lens_region.len() as u64;
-        let postings_off = doc_lens_off + doc_lens_len;
+        let postings_off = align8(doc_lens_off + doc_lens_len);
         let postings_len = postings_region.len() as u64;
 
         let body_len = postings_off + postings_len;
@@ -1535,6 +1699,7 @@ impl SuccinctBM25Index {
         buf.extend_from_slice(postings_doc_idx_meta.as_bytes()); // 32
         buf.extend_from_slice(postings_offsets_meta.as_bytes()); // 32
         buf.extend_from_slice(postings_scores_meta.as_bytes()); // 32
+        buf.extend_from_slice(keys_meta_on_disk.as_bytes()); // 40
         buf.extend_from_slice(&keys_off.to_le_bytes()); // 8
         buf.extend_from_slice(&keys_len.to_le_bytes());
         buf.extend_from_slice(&terms_off.to_le_bytes());
@@ -1543,13 +1708,24 @@ impl SuccinctBM25Index {
         buf.extend_from_slice(&doc_lens_len.to_le_bytes());
         buf.extend_from_slice(&postings_off.to_le_bytes());
         buf.extend_from_slice(&postings_len.to_le_bytes());
+        // 4-byte tail pad so SUCCINCT_HEADER_LEN is a multiple
+        // of 8 (see const doc for rationale).
+        buf.extend_from_slice(&[0u8; 4]);
         debug_assert_eq!(buf.len(), SUCCINCT_HEADER_LEN);
 
         // ── body ──────────────────────────────────────────────
-        buf.extend_from_slice(&keys_bytes);
-        buf.extend_from_slice(&terms_bytes);
-        buf.extend_from_slice(&doc_lens_region);
-        buf.extend_from_slice(&postings_region);
+        // Pad to the aligned section offsets we computed above.
+        let write_section = |buf: &mut Vec<u8>, target_off: u64, payload: &[u8]| {
+            let target = SUCCINCT_HEADER_LEN + target_off as usize;
+            if target > buf.len() {
+                buf.resize(target, 0);
+            }
+            buf.extend_from_slice(payload);
+        };
+        write_section(&mut buf, keys_off, &keys_region);
+        write_section(&mut buf, terms_off, &terms_bytes);
+        write_section(&mut buf, doc_lens_off, &doc_lens_region);
+        write_section(&mut buf, postings_off, &postings_region);
         buf
     }
 
@@ -1587,17 +1763,20 @@ impl SuccinctBM25Index {
         let postings_scores_meta = CompactVectorMetaOnDisk::read_from_bytes(&bytes[140..172])
             .map_err(|_| SuccinctLoadError::BadMeta("postings_scores"))?
             .to_jerky();
+        let keys_meta = CompressedUniverseMetaOnDisk::read_from_bytes(&bytes[172..212])
+            .map_err(|_| SuccinctLoadError::BadMeta("keys"))?
+            .to_jerky();
 
         let read_u64 = |off: usize| u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
-        let keys_off = read_u64(172) as usize;
-        let keys_len = read_u64(180) as usize;
-        let terms_off = read_u64(188) as usize;
-        let terms_len = read_u64(196) as usize;
-        let doc_lens_off = read_u64(204) as usize;
-        let doc_lens_len = read_u64(212) as usize;
-        let postings_off = read_u64(220) as usize;
-        let postings_len = read_u64(228) as usize;
-        debug_assert_eq!(SUCCINCT_HEADER_LEN, 236);
+        let keys_off = read_u64(212) as usize;
+        let keys_len = read_u64(220) as usize;
+        let terms_off = read_u64(228) as usize;
+        let terms_len = read_u64(236) as usize;
+        let doc_lens_off = read_u64(244) as usize;
+        let doc_lens_len = read_u64(252) as usize;
+        let postings_off = read_u64(260) as usize;
+        let postings_len = read_u64(268) as usize;
+        debug_assert_eq!(SUCCINCT_HEADER_LEN, 280);
 
         let body_start = SUCCINCT_HEADER_LEN;
         let body = &bytes[body_start..];
@@ -1619,8 +1798,9 @@ impl SuccinctBM25Index {
         let doc_lens_bytes = body_bytes.slice(doc_lens_off..doc_lens_off + doc_lens_len);
         let postings_bytes = body_bytes.slice(postings_off..postings_off + postings_len);
 
-        let keys = FixedBytesTable::<32>::from_bytes(keys_bytes, n_docs)
+        let keys = CompressedUniverse::from_bytes(keys_meta, keys_bytes)
             .map_err(|_| SuccinctLoadError::TruncatedSection("keys"))?;
+        debug_assert_eq!(keys.len(), n_docs);
         let terms = FixedBytesTable::<32>::from_bytes(terms_bytes, n_terms)
             .map_err(|_| SuccinctLoadError::TruncatedSection("terms"))?;
         let doc_lens = SuccinctDocLens::from_bytes(doc_lens_meta, doc_lens_bytes)
@@ -1655,9 +1835,16 @@ const SUCCINCT_MAGIC: u32 = u32::from_le_bytes(*b"SB25");
 /// Layout: 4 magic + 2 version + 2 reserved + 4 avg_doc_len +
 /// 4 k1 + 4 b + 4 max_score + 4 reserved + 8 n_docs + 8 n_terms
 /// + 4 × 32 CompactVectorMeta (doc_lens, postings.doc_idx,
-/// postings.offsets, postings.scores) + 4 × 16 section (offset,
-/// len) = 236.
-const SUCCINCT_HEADER_LEN: usize = 236;
+/// postings.offsets, postings.scores) + 1 × 40
+/// CompressedUniverseMeta (keys) + 4 × 16 section (offset, len)
+/// + 4 B tail padding = 280.
+///
+/// The tail pad keeps the header a multiple of 8 bytes so
+/// `body_offset = SUCCINCT_HEADER_LEN + section_offset` lands
+/// on a u64-aligned absolute address — jerky's view types
+/// reinterpret the slice as `[u64]` and refuse misaligned
+/// starts with an `Alignment` error.
+const SUCCINCT_HEADER_LEN: usize = 280;
 
 /// Errors loading a `SuccinctBM25Index` blob.
 #[derive(Debug, Clone, PartialEq)]
