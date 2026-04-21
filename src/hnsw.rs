@@ -91,8 +91,521 @@ impl ConstId for SuccinctHNSWIndex {
 
 impl BlobSchema for SuccinctHNSWIndex {}
 
-/// Placeholder for the zero-copy succinct HNSW view.
-pub struct HNSWIndex;
+// ── Proper HNSW graph (layered, approximate k-NN) ─────────────────
+
+/// Per-node state in the HNSW graph. Each node lives on layers
+/// `0..=level`; `neighbors[i]` is the neighbour list for layer
+/// `i` (local to the node).
+struct HNSWNode {
+    vector: Vec<f32>,
+    /// Level this node was sampled into. Kept for debugging /
+    /// future serialization — the neighbour lists already record
+    /// which layers the node participates in.
+    #[allow(dead_code)]
+    level: u8,
+    neighbors: Vec<Vec<u32>>,
+}
+
+/// Builder for a proper layered-graph HNSW index.
+///
+/// Implements the incremental insert from Malkov & Yashunin
+/// (2018) with the standard level-sampling + ef-search + simple
+/// neighbour-selection heuristic. Parameters follow the paper's
+/// defaults unless overridden on the builder.
+pub struct HNSWBuilder {
+    dim: usize,
+    m: u16,
+    m0: u16,
+    ef_construction: u16,
+    /// Level-sampling multiplier `m_L = 1 / ln(M)`.
+    level_mult: f32,
+    /// SplitMix64 state for deterministic level sampling.
+    rng: u64,
+    nodes: Vec<HNSWNode>,
+    doc_ids: Vec<Id>,
+    entry_point: Option<u32>,
+    max_level: u8,
+}
+
+impl HNSWBuilder {
+    /// Create a fresh builder with `dim`-dimensional vectors and
+    /// default HNSW parameters (`M = 16`, `M0 = 2*M = 32`,
+    /// `ef_construction = 200`). The deterministic PRNG seed
+    /// starts at `0xC0FFEE_HNSW`; override via [`with_seed`] for
+    /// reproducible but differently-ordered builds.
+    ///
+    /// [`with_seed`]: Self::with_seed
+    pub fn new(dim: usize) -> Self {
+        assert!(dim > 0, "HNSWBuilder: dim must be > 0");
+        let m = 16u16;
+        Self {
+            dim,
+            m,
+            m0: m * 2,
+            ef_construction: 200,
+            level_mult: 1.0 / (m as f32).ln(),
+            rng: 0xC0FFEEu64,
+            nodes: Vec::new(),
+            doc_ids: Vec::new(),
+            entry_point: None,
+            max_level: 0,
+        }
+    }
+
+    /// Override `M` (max neighbours on non-zero layers). `M0`
+    /// defaults to `2 * M` unless overridden separately.
+    pub fn m(mut self, m: u16) -> Self {
+        assert!(m >= 2, "HNSWBuilder: M must be ≥ 2");
+        self.m = m;
+        self.m0 = m * 2;
+        self.level_mult = 1.0 / (m as f32).ln();
+        self
+    }
+
+    /// Override `M0` (max neighbours on layer 0). Must be ≥ M.
+    pub fn m0(mut self, m0: u16) -> Self {
+        assert!(m0 >= self.m, "HNSWBuilder: M0 must be ≥ M");
+        self.m0 = m0;
+        self
+    }
+
+    /// Override `ef_construction` (search width during insert).
+    pub fn ef_construction(mut self, ef: u16) -> Self {
+        assert!(ef >= 1, "HNSWBuilder: ef_construction must be ≥ 1");
+        self.ef_construction = ef;
+        self
+    }
+
+    /// Override the level-sampling PRNG seed for reproducibility
+    /// across runs.
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.rng = seed;
+        self
+    }
+
+    /// Sample a new node level from `⌊-ln(U) * m_L⌋`.
+    fn sample_level(&mut self) -> u8 {
+        // SplitMix64 step.
+        self.rng = self.rng.wrapping_add(0x9E3779B97F4A7C15);
+        let mut z = self.rng;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+        z ^= z >> 31;
+        // Map to uniform (0, 1] so `ln` is defined.
+        let u = ((z >> 11) as f64 / (1u64 << 53) as f64).max(f64::MIN_POSITIVE);
+        let l = (-u.ln() * self.level_mult as f64).floor() as i32;
+        l.clamp(0, u8::MAX as i32) as u8
+    }
+
+    /// Insert a vector under `doc_id`. The vector is L2-
+    /// normalized in place before storage, so the index uses
+    /// cosine similarity as its distance.
+    pub fn insert(&mut self, doc_id: Id, mut vec: Vec<f32>) -> Result<(), DimMismatch> {
+        if vec.len() != self.dim {
+            return Err(DimMismatch {
+                expected: self.dim,
+                got: vec.len(),
+            });
+        }
+        normalize(&mut vec);
+        let new_level = self.sample_level();
+        let new_idx = self.nodes.len() as u32;
+
+        // Descend from entry_point down to new_level + 1 using
+        // greedy 1-step search.
+        let mut curr = self.entry_point;
+        if let Some(mut cnode) = curr {
+            for lvl in ((new_level + 1)..=self.max_level).rev() {
+                cnode = self.greedy_search_layer(&vec, cnode, lvl);
+            }
+            curr = Some(cnode);
+        }
+
+        // Allocate the new node before connecting so neighbour
+        // indexes are stable.
+        self.nodes.push(HNSWNode {
+            vector: vec.clone(),
+            level: new_level,
+            neighbors: vec![Vec::new(); new_level as usize + 1],
+        });
+        self.doc_ids.push(doc_id);
+
+        // Connect from new_level down to 0.
+        if let Some(start) = curr {
+            let mut entry = start;
+            for lvl in (0..=new_level.min(self.max_level)).rev() {
+                let cap = if lvl == 0 { self.m0 } else { self.m } as usize;
+                let candidates =
+                    self.search_layer(&vec, entry, self.ef_construction as usize, lvl);
+                let selected = Self::select_neighbours(&candidates, cap);
+
+                // Bidirectional edges.
+                for &n in &selected {
+                    self.nodes[new_idx as usize].neighbors[lvl as usize].push(n);
+                    self.nodes[n as usize].neighbors[lvl as usize].push(new_idx);
+                }
+                // Prune the new node's layer-list and the new
+                // neighbours' lists to the layer cap.
+                self.prune_neighbours(new_idx, lvl, cap);
+                for &n in &selected {
+                    self.prune_neighbours(n, lvl, cap);
+                }
+
+                // Pick the best candidate as entry for the next
+                // (lower) layer.
+                if let Some((best, _)) = candidates
+                    .iter()
+                    .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                {
+                    entry = *best;
+                }
+            }
+        }
+
+        if new_level > self.max_level || self.entry_point.is_none() {
+            self.max_level = new_level;
+            self.entry_point = Some(new_idx);
+        }
+        Ok(())
+    }
+
+    /// Consume the builder and produce an immutable [`HNSWIndex`].
+    pub fn build(self) -> HNSWIndex {
+        HNSWIndex {
+            dim: self.dim,
+            m: self.m,
+            m0: self.m0,
+            nodes: self.nodes,
+            doc_ids: self.doc_ids,
+            entry_point: self.entry_point,
+            max_level: self.max_level,
+        }
+    }
+
+    // ── HNSW primitives (shared with the immutable index) ────────
+
+    /// Walk greedily to the node with minimum distance to `q` on
+    /// `layer` starting from `entry`. O(neighbours_on_layer)
+    /// per step. Used for intermediate layers during both insert
+    /// and search.
+    fn greedy_search_layer(&self, q: &[f32], entry: u32, layer: u8) -> u32 {
+        let mut curr = entry;
+        let mut curr_dist = cosine_dist(q, &self.nodes[curr as usize].vector);
+        loop {
+            let mut changed = false;
+            let neigh =
+                &self.nodes[curr as usize].neighbors[layer as usize];
+            for &n in neigh {
+                let d = cosine_dist(q, &self.nodes[n as usize].vector);
+                if d < curr_dist {
+                    curr_dist = d;
+                    curr = n;
+                    changed = true;
+                }
+            }
+            if !changed {
+                return curr;
+            }
+        }
+    }
+
+    /// Standard HNSW layer ef-search. Returns a list of
+    /// `(node_idx, distance)` pairs, up to `ef` of them.
+    fn search_layer(
+        &self,
+        q: &[f32],
+        entry: u32,
+        ef: usize,
+        layer: u8,
+    ) -> Vec<(u32, f32)> {
+        use std::collections::BinaryHeap;
+
+        let mut visited: std::collections::HashSet<u32> =
+            std::collections::HashSet::new();
+        visited.insert(entry);
+        let d0 = cosine_dist(q, &self.nodes[entry as usize].vector);
+        // `candidates` is a min-heap by distance.
+        let mut candidates: BinaryHeap<MinDist> = BinaryHeap::new();
+        candidates.push(MinDist {
+            idx: entry,
+            dist: d0,
+        });
+        // `results` is a max-heap by distance (so we can evict
+        // the farthest when we overflow `ef`).
+        let mut results: BinaryHeap<MaxDist> = BinaryHeap::new();
+        results.push(MaxDist {
+            idx: entry,
+            dist: d0,
+        });
+        while let Some(c) = candidates.pop() {
+            let farthest = results.peek().map(|r| r.dist).unwrap_or(f32::INFINITY);
+            if c.dist > farthest && results.len() >= ef {
+                break;
+            }
+            let neigh =
+                &self.nodes[c.idx as usize].neighbors[layer as usize];
+            for &n in neigh {
+                if !visited.insert(n) {
+                    continue;
+                }
+                let d = cosine_dist(q, &self.nodes[n as usize].vector);
+                let farthest =
+                    results.peek().map(|r| r.dist).unwrap_or(f32::INFINITY);
+                if d < farthest || results.len() < ef {
+                    candidates.push(MinDist { idx: n, dist: d });
+                    results.push(MaxDist { idx: n, dist: d });
+                    if results.len() > ef {
+                        results.pop();
+                    }
+                }
+            }
+        }
+        results.into_iter().map(|m| (m.idx, m.dist)).collect()
+    }
+
+    /// Pick the `cap` closest candidates. The paper's simple
+    /// heuristic — good enough for typical embedding spaces and
+    /// the simplest thing to unit-test. The "extended" heuristic
+    /// that considers inter-candidate distances can swap in
+    /// later behind the same function signature.
+    fn select_neighbours(candidates: &[(u32, f32)], cap: usize) -> Vec<u32> {
+        let mut sorted: Vec<&(u32, f32)> = candidates.iter().collect();
+        sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        sorted.into_iter().take(cap).map(|&(i, _)| i).collect()
+    }
+
+    /// Trim `node`'s layer-`layer` neighbour list to `cap`
+    /// entries, keeping the closest by distance.
+    fn prune_neighbours(&mut self, node: u32, layer: u8, cap: usize) {
+        // Borrow-checker dance: snapshot the neighbour ids and
+        // the node's vector so we can score against `self.nodes`
+        // without holding a mut-borrow on the list.
+        let list_snapshot: Vec<u32> =
+            self.nodes[node as usize].neighbors[layer as usize].clone();
+        if list_snapshot.len() <= cap {
+            // Already small enough; just dedupe in place.
+            let list =
+                &mut self.nodes[node as usize].neighbors[layer as usize];
+            list.sort_unstable();
+            list.dedup();
+            return;
+        }
+        let q = self.nodes[node as usize].vector.clone();
+        let mut scored: Vec<(u32, f32)> = list_snapshot
+            .iter()
+            .map(|&n| (n, cosine_dist(&q, &self.nodes[n as usize].vector)))
+            .collect();
+        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let list =
+            &mut self.nodes[node as usize].neighbors[layer as usize];
+        list.clear();
+        list.extend(scored.into_iter().take(cap).map(|(i, _)| i));
+        list.sort_unstable();
+        list.dedup();
+    }
+}
+
+/// Immutable approximate-nearest-neighbour index built via
+/// [`HNSWBuilder`]. Query performance is sub-linear in the
+/// corpus size (O(log n · degree) typical) — the trade-off is
+/// a larger up-front build cost than [`FlatIndex`] and slightly
+/// approximate recall.
+pub struct HNSWIndex {
+    dim: usize,
+    m: u16,
+    m0: u16,
+    nodes: Vec<HNSWNode>,
+    doc_ids: Vec<Id>,
+    entry_point: Option<u32>,
+    max_level: u8,
+}
+
+impl HNSWIndex {
+    /// Vector dimensionality configured at build time.
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+    /// Number of indexed documents.
+    pub fn doc_count(&self) -> usize {
+        self.doc_ids.len()
+    }
+    /// Max neighbours per non-zero layer.
+    pub fn m(&self) -> u16 {
+        self.m
+    }
+    /// Max neighbours on layer 0.
+    pub fn m0(&self) -> u16 {
+        self.m0
+    }
+    /// Highest layer a node was inserted at.
+    pub fn max_level(&self) -> u8 {
+        self.max_level
+    }
+
+    /// Approximate top-k nearest neighbours to `query` under
+    /// cosine similarity. `ef` tunes the search width (larger =
+    /// better recall at higher cost); pass `None` to default to
+    /// `k`.
+    pub fn similar(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: Option<usize>,
+    ) -> Vec<(Id, f32)> {
+        if query.len() != self.dim || k == 0 {
+            return Vec::new();
+        }
+        let Some(entry) = self.entry_point else {
+            return Vec::new();
+        };
+        let mut q = query.to_vec();
+        normalize(&mut q);
+        let ef = ef.unwrap_or(k).max(k);
+
+        // Greedy descent from max_level down to 1.
+        let mut curr = entry;
+        for lvl in (1..=self.max_level).rev() {
+            curr = self.greedy_search_layer(&q, curr, lvl);
+        }
+        // ef-search on layer 0.
+        let candidates = self.search_layer(&q, curr, ef, 0);
+        let mut ranked: Vec<(Id, f32)> = candidates
+            .into_iter()
+            .map(|(i, dist)| {
+                // Convert distance back to similarity (cos = 1 - dist).
+                (self.doc_ids[i as usize], 1.0 - dist)
+            })
+            .collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        ranked.truncate(k);
+        ranked
+    }
+
+    fn greedy_search_layer(&self, q: &[f32], entry: u32, layer: u8) -> u32 {
+        let mut curr = entry;
+        let mut curr_dist = cosine_dist(q, &self.nodes[curr as usize].vector);
+        loop {
+            let mut changed = false;
+            let neigh =
+                &self.nodes[curr as usize].neighbors[layer as usize];
+            for &n in neigh {
+                let d = cosine_dist(q, &self.nodes[n as usize].vector);
+                if d < curr_dist {
+                    curr_dist = d;
+                    curr = n;
+                    changed = true;
+                }
+            }
+            if !changed {
+                return curr;
+            }
+        }
+    }
+
+    fn search_layer(
+        &self,
+        q: &[f32],
+        entry: u32,
+        ef: usize,
+        layer: u8,
+    ) -> Vec<(u32, f32)> {
+        use std::collections::BinaryHeap;
+        let mut visited: std::collections::HashSet<u32> =
+            std::collections::HashSet::new();
+        visited.insert(entry);
+        let d0 = cosine_dist(q, &self.nodes[entry as usize].vector);
+        let mut candidates: BinaryHeap<MinDist> = BinaryHeap::new();
+        candidates.push(MinDist {
+            idx: entry,
+            dist: d0,
+        });
+        let mut results: BinaryHeap<MaxDist> = BinaryHeap::new();
+        results.push(MaxDist {
+            idx: entry,
+            dist: d0,
+        });
+        while let Some(c) = candidates.pop() {
+            let farthest = results.peek().map(|r| r.dist).unwrap_or(f32::INFINITY);
+            if c.dist > farthest && results.len() >= ef {
+                break;
+            }
+            let neigh =
+                &self.nodes[c.idx as usize].neighbors[layer as usize];
+            for &n in neigh {
+                if !visited.insert(n) {
+                    continue;
+                }
+                let d = cosine_dist(q, &self.nodes[n as usize].vector);
+                let farthest =
+                    results.peek().map(|r| r.dist).unwrap_or(f32::INFINITY);
+                if d < farthest || results.len() < ef {
+                    candidates.push(MinDist { idx: n, dist: d });
+                    results.push(MaxDist { idx: n, dist: d });
+                    if results.len() > ef {
+                        results.pop();
+                    }
+                }
+            }
+        }
+        results.into_iter().map(|m| (m.idx, m.dist)).collect()
+    }
+}
+
+/// Cosine distance = 1 - dot(a, b) for pre-normalized vectors.
+fn cosine_dist(a: &[f32], b: &[f32]) -> f32 {
+    1.0 - dot(a, b)
+}
+
+/// Min-heap wrapper: smaller distance = higher priority.
+#[derive(Clone, Copy)]
+struct MinDist {
+    idx: u32,
+    dist: f32,
+}
+impl PartialEq for MinDist {
+    fn eq(&self, o: &Self) -> bool {
+        self.dist == o.dist
+    }
+}
+impl Eq for MinDist {}
+impl PartialOrd for MinDist {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for MinDist {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        // Invert so BinaryHeap (max-heap) behaves as min-heap
+        // over distance.
+        o.dist.partial_cmp(&self.dist).unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
+/// Max-heap wrapper: larger distance = higher priority (for
+/// evicting the farthest).
+#[derive(Clone, Copy)]
+struct MaxDist {
+    idx: u32,
+    dist: f32,
+}
+impl PartialEq for MaxDist {
+    fn eq(&self, o: &Self) -> bool {
+        self.dist == o.dist
+    }
+}
+impl Eq for MaxDist {}
+impl PartialOrd for MaxDist {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for MaxDist {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        self.dist
+            .partial_cmp(&o.dist)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
 
 /// Caller tried to insert a vector whose length disagrees with
 /// the index's configured dimensionality.
@@ -527,5 +1040,148 @@ mod tests {
         let bytes = sample_flat().to_bytes();
         let err = FlatIndex::try_from_bytes(&bytes[..bytes.len() - 1]).unwrap_err();
         assert!(matches!(err, FlatLoadError::TruncatedSection(_)));
+    }
+
+    // ── HNSW tests ────────────────────────────────────────────────
+
+    #[test]
+    fn hnsw_empty_index_is_queryable() {
+        let idx = HNSWBuilder::new(4).build();
+        assert_eq!(idx.doc_count(), 0);
+        assert!(idx.similar(&[0.0; 4], 3, None).is_empty());
+    }
+
+    #[test]
+    fn hnsw_single_doc_returns_itself() {
+        let mut b = HNSWBuilder::new(3);
+        b.insert(id(1), vec![1.0, 0.0, 0.0]).unwrap();
+        let idx = b.build();
+        let hits = idx.similar(&[1.0, 0.0, 0.0], 1, None);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, id(1));
+        assert!((hits[0].1 - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn hnsw_ranks_similar_vectors_highest() {
+        let mut b = HNSWBuilder::new(2);
+        b.insert(id(1), vec![1.0, 0.0]).unwrap();
+        b.insert(id(2), vec![0.9, 0.1]).unwrap();
+        b.insert(id(3), vec![0.0, 1.0]).unwrap();
+        let idx = b.build();
+        let hits = idx.similar(&[1.0, 0.0], 3, None);
+        assert_eq!(hits[0].0, id(1));
+        assert_eq!(hits[1].0, id(2));
+        assert_eq!(hits[2].0, id(3));
+    }
+
+    #[test]
+    fn hnsw_recall_matches_flat_on_small_corpus() {
+        // Build both indexes over the same vectors, run the same
+        // queries, confirm HNSW's top-3 overlaps ≥ 2 with flat's
+        // exact top-3. (With small corpora HNSW may lose one due
+        // to the level-sampling quantum, but shouldn't be wildly
+        // different.)
+        use crate::hnsw::FlatBuilder;
+        let mut rng = 0xBABE_u64;
+        let next = |r: &mut u64| {
+            *r = r.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = *r;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^ (z >> 31)
+        };
+        let dim = 16;
+        let mut flat_b = FlatBuilder::new(dim);
+        let mut hnsw_b = HNSWBuilder::new(dim).with_seed(42);
+        for i in 0..200 {
+            let vec: Vec<f32> = (0..dim)
+                .map(|_| (next(&mut rng) as i32 as f32) / (i32::MAX as f32))
+                .collect();
+            let dx = id_from_u64((i + 1) as u64);
+            flat_b.insert(dx, vec.clone()).unwrap();
+            hnsw_b.insert(dx, vec).unwrap();
+        }
+        let flat = flat_b.build();
+        let hnsw = hnsw_b.build();
+
+        // Five random queries.
+        let mut total_overlap = 0;
+        let mut total_k = 0;
+        for _ in 0..5 {
+            let q: Vec<f32> = (0..dim)
+                .map(|_| (next(&mut rng) as i32 as f32) / (i32::MAX as f32))
+                .collect();
+            let truth: std::collections::HashSet<Id> =
+                flat.similar(&q, 10).into_iter().map(|(d, _)| d).collect();
+            let got: std::collections::HashSet<Id> = hnsw
+                .similar(&q, 10, Some(50))
+                .into_iter()
+                .map(|(d, _)| d)
+                .collect();
+            total_overlap += truth.intersection(&got).count();
+            total_k += 10;
+        }
+        // Expect recall ≥ 0.7 on this dataset with ef_search=50.
+        // Looser bound catches blatantly broken HNSW impls while
+        // tolerating the algorithm's inherent approximate-ness.
+        let recall = total_overlap as f32 / total_k as f32;
+        assert!(
+            recall >= 0.7,
+            "HNSW recall {recall:.2} below 0.7 threshold"
+        );
+    }
+
+    fn id_from_u64(n: u64) -> Id {
+        let mut raw = [0u8; 16];
+        raw[..8].copy_from_slice(&n.max(1).to_le_bytes());
+        raw[8..].copy_from_slice(&n.max(1).wrapping_mul(0x9E3779B9).to_le_bytes());
+        Id::new(raw).unwrap()
+    }
+
+    #[test]
+    fn hnsw_deterministic_seed_reproduces_structure() {
+        let mut build = |seed: u64| {
+            let mut b = HNSWBuilder::new(3).with_seed(seed);
+            for i in 1..=20u8 {
+                b.insert(
+                    Id::new([i; 16]).unwrap(),
+                    vec![
+                        (i as f32) / 20.0,
+                        ((i as f32) * 2.0) % 1.0,
+                        ((i as f32) * 3.0) % 1.0,
+                    ],
+                )
+                .unwrap();
+            }
+            b.build()
+        };
+        let a = build(123);
+        let b = build(123);
+        assert_eq!(a.doc_count(), b.doc_count());
+        assert_eq!(a.max_level(), b.max_level());
+        let q = vec![0.5, 0.3, 0.1];
+        let ra = a.similar(&q, 5, None);
+        let rb = b.similar(&q, 5, None);
+        assert_eq!(ra.len(), rb.len());
+        for (x, y) in ra.iter().zip(rb.iter()) {
+            assert_eq!(x.0, y.0);
+        }
+    }
+
+    #[test]
+    fn hnsw_dim_mismatch_rejected_at_insert() {
+        let mut b = HNSWBuilder::new(3);
+        let err = b.insert(id(1), vec![1.0, 0.0]).unwrap_err();
+        assert_eq!(err.expected, 3);
+        assert_eq!(err.got, 2);
+    }
+
+    #[test]
+    fn hnsw_wrong_dim_query_returns_empty() {
+        let mut b = HNSWBuilder::new(3);
+        b.insert(id(1), vec![1.0, 0.0, 0.0]).unwrap();
+        let idx = b.build();
+        assert!(idx.similar(&[1.0, 0.0], 3, None).is_empty());
     }
 }
