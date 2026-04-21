@@ -71,17 +71,20 @@ naive-then-succinct implementation order is the open work item.
 * **`schemas::F32LE`**: `ValueSchema` for packing `f32` scores
   into 32-byte `Value<F32LE>`s. Used by the scored BM25
   constraint.
-* Three runnable examples:
+* Four runnable examples:
   - `query_demo` — text search, multi-term OR, value-as-term
     citation search.
   - `compose_bm25_and_pattern` — BM25 + `pattern!` over a
     `TribleSet` in one `find!`.
   - `compose_hnsw_and_pattern` — vector similarity + `pattern!`
     composition.
-* 145 tests across unit, scale (1k-doc equivalence), engine-
-  integration (`IntersectionConstraint` joins + `find!` /
-  `pattern!` composition + `find!` over both succinct paths),
-  and doctests.
+  - `blob_sizes_at_scale` — naive vs. SB25 blob size at 1k /
+    5k / 10k docs.
+* 146 tests across unit, scale (1k-doc equivalence +
+  naive-vs-SB25 size guard), engine-integration
+  (`IntersectionConstraint` joins + `find!` / `pattern!`
+  composition + `find!` over both succinct paths), and
+  doctests.
 
 ### What's next
 
@@ -93,8 +96,11 @@ naive-then-succinct implementation order is the open work item.
 * Additional token helpers (phrase rewriting, code-aware
   splitting).
 
-See [`docs/DESIGN.md`](docs/DESIGN.md) and
-[`docs/QUERY_ENGINE_INTEGRATION.md`](docs/QUERY_ENGINE_INTEGRATION.md).
+See
+[`docs/DESIGN.md`](docs/DESIGN.md),
+[`docs/QUERY_ENGINE_INTEGRATION.md`](docs/QUERY_ENGINE_INTEGRATION.md),
+and
+[`docs/HNSW_GRAPH_ENCODING.md`](docs/HNSW_GRAPH_ENCODING.md).
 
 ## License
 
