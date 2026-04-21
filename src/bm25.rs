@@ -151,8 +151,26 @@ impl BM25Builder {
         self.docs.push((doc_id, terms));
     }
 
-    /// Consume the builder and produce an in-memory BM25 index.
+    /// Consume the builder and produce an in-memory BM25 index
+    /// on a single thread.
     pub fn build(self) -> BM25Index {
+        self.build_with_threads(1)
+    }
+
+    /// Like [`build`], but shard the tf accumulation across
+    /// `threads` worker threads. `threads = 1` is identical to
+    /// single-threaded [`build`]; `threads > 1` spawns scoped
+    /// workers, each accumulates a local term→tf map over a
+    /// contiguous slice of docs, and the maps are merged at the
+    /// end.
+    ///
+    /// Output is byte-identical to [`build`] — doc ids, term
+    /// ordering, posting order, and scores all agree. Parallel
+    /// speedups depend on the cost ratio of tf-map insertion
+    /// vs. merge; tends to be worthwhile past ~5 k docs.
+    ///
+    /// [`build`]: Self::build
+    pub fn build_with_threads(self, threads: usize) -> BM25Index {
         let Self { docs, k1, b } = self;
         let n_docs = docs.len();
 
@@ -164,23 +182,74 @@ impl BM25Builder {
             doc_lens.iter().map(|&n| n as f64).sum::<f64>() as f32 / n_docs as f32
         };
 
-        // doc_id table and term-frequency counts per (doc_idx, term).
         let doc_ids: Vec<Id> = docs.iter().map(|(id, _)| *id).collect();
-        // term -> (doc_idx -> tf)
-        let mut term_to_tfs: HashMap<RawValue, HashMap<u32, u32>> = HashMap::new();
-        for (doc_idx, (_, terms)) in docs.into_iter().enumerate() {
-            for term in terms {
-                let entry = term_to_tfs
-                    .entry(term)
-                    .or_default()
-                    .entry(doc_idx as u32)
-                    .or_insert(0);
-                *entry += 1;
+
+        let term_to_tfs = if threads <= 1 || n_docs < 2 {
+            // Single-threaded tf accumulation — cheap for small
+            // corpora; also what we get when threads == 1.
+            let mut m: HashMap<RawValue, HashMap<u32, u32>> = HashMap::new();
+            for (doc_idx, (_, terms)) in docs.into_iter().enumerate() {
+                accumulate_tfs(&mut m, doc_idx as u32, terms);
             }
-        }
+            m
+        } else {
+            // Shard docs into `threads` contiguous ranges. Each
+            // worker builds a local map over its slice using the
+            // *global* doc_idx. Merge at the end.
+            let threads = threads.min(n_docs);
+            let base_chunk = n_docs / threads;
+            let extra = n_docs % threads;
+
+            // Partition `docs` into owned chunks the workers can
+            // consume. We keep the start doc_idx of each chunk
+            // to preserve global indexing.
+            let mut starts = Vec::with_capacity(threads);
+            let mut chunks: Vec<Vec<(Id, Vec<RawValue>)>> = Vec::with_capacity(threads);
+            let mut docs_iter = docs.into_iter();
+            let mut idx = 0usize;
+            for t in 0..threads {
+                let size = base_chunk + if t < extra { 1 } else { 0 };
+                let chunk: Vec<_> = (&mut docs_iter).take(size).collect();
+                starts.push(idx);
+                idx += size;
+                chunks.push(chunk);
+            }
+
+            // Scoped threads so references to `chunks` stay alive.
+            let locals: Vec<HashMap<RawValue, HashMap<u32, u32>>> =
+                std::thread::scope(|s| {
+                    let mut handles = Vec::with_capacity(threads);
+                    for (shard_start, chunk) in starts.iter().zip(chunks.into_iter())
+                    {
+                        let start = *shard_start as u32;
+                        handles.push(s.spawn(move || {
+                            let mut m: HashMap<RawValue, HashMap<u32, u32>> =
+                                HashMap::new();
+                            for (i, (_, terms)) in chunk.into_iter().enumerate() {
+                                accumulate_tfs(&mut m, start + i as u32, terms);
+                            }
+                            m
+                        }));
+                    }
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                });
+
+            // Merge local maps into one. Since shards cover
+            // disjoint doc_idx ranges, each term's per-shard tf
+            // submaps have disjoint keys — `extend` without
+            // collision checks is sound and avoids the per-entry
+            // hash lookup that `or_insert` costs.
+            let mut merged: HashMap<RawValue, HashMap<u32, u32>> = HashMap::new();
+            for local in locals {
+                for (term, tfs) in local {
+                    merged.entry(term).or_default().extend(tfs);
+                }
+            }
+            merged
+        };
 
         // Sort terms ascending so the term table supports binary
-        // search (matches the future succinct layout).
+        // search (matches the succinct layout).
         let mut terms: Vec<RawValue> = term_to_tfs.keys().copied().collect();
         terms.sort_unstable();
 
@@ -227,6 +296,22 @@ impl BM25Builder {
             k1,
             b,
         }
+    }
+}
+
+/// Accumulate token-frequency counts for one doc into `m`.
+fn accumulate_tfs(
+    m: &mut HashMap<RawValue, HashMap<u32, u32>>,
+    doc_idx: u32,
+    terms: Vec<RawValue>,
+) {
+    for term in terms {
+        let entry = m
+            .entry(term)
+            .or_default()
+            .entry(doc_idx)
+            .or_insert(0);
+        *entry += 1;
     }
 }
 
@@ -727,6 +812,56 @@ mod tests {
         let a = build_sample_index().to_bytes();
         let b = build_sample_index().to_bytes();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn parallel_build_matches_single_thread() {
+        // Build a richer corpus so shards actually have work to
+        // do. Threaded and single-threaded paths must produce
+        // byte-identical blobs.
+        fn build(threads: usize) -> Vec<u8> {
+            let mut b = BM25Builder::new();
+            for i in 1..=50u32 {
+                let text = format!(
+                    "doc {i} text about {} {}",
+                    (i % 5) + 1,
+                    (i.wrapping_mul(7)) % 13
+                );
+                let byte = (i as u8).max(1);
+                b.insert(id(byte), hash_tokens(&text));
+            }
+            b.build_with_threads(threads).to_bytes()
+        }
+        let serial = build(1);
+        for t in [2usize, 3, 4, 8] {
+            assert_eq!(
+                build(t),
+                serial,
+                "threads={t} produced different bytes than serial"
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_build_on_empty_corpus() {
+        let idx = BM25Builder::new().build_with_threads(4);
+        assert_eq!(idx.doc_count(), 0);
+        assert_eq!(idx.term_count(), 0);
+    }
+
+    #[test]
+    fn parallel_build_threads_cap_at_doc_count() {
+        // 3 docs × 16 threads — the builder caps threads at n_docs
+        // and doesn't spawn idle workers.
+        let mut b = BM25Builder::new();
+        b.insert(id(1), hash_tokens("one two three"));
+        b.insert(id(2), hash_tokens("two three four"));
+        b.insert(id(3), hash_tokens("three four five"));
+        let idx = b.build_with_threads(16);
+        assert_eq!(idx.doc_count(), 3);
+        // "three" shows up in all 3 docs.
+        let three = hash_tokens("three")[0];
+        assert_eq!(idx.doc_frequency(&three), 3);
     }
 
     #[test]

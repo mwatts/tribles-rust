@@ -46,14 +46,33 @@ fn fake_doc(rng: &mut Rng, vocab: usize, n_words: usize) -> String {
 
 fn bench(n_docs: usize, vocab: usize, doc_len: usize) {
     let mut rng = Rng(0xC0FFEE + n_docs as u64);
+    // Materialise the docs once and reuse across serial + parallel
+    // build paths so the measured time is build-only, not doc-gen.
+    let docs: Vec<(u64, String)> = (0..n_docs)
+        .map(|i| (i as u64 + 1, fake_doc(&mut rng, vocab, doc_len)))
+        .collect();
+
+    let fresh_builder = || {
+        let mut b = BM25Builder::new();
+        for (id_u64, doc) in &docs {
+            b.insert(id_from_u64(*id_u64), hash_tokens(doc));
+        }
+        b
+    };
+
+    // Single-threaded build.
     let t0 = Instant::now();
-    let mut builder = BM25Builder::new();
-    for i in 0..n_docs {
-        let doc = fake_doc(&mut rng, vocab, doc_len);
-        builder.insert(id_from_u64(i as u64 + 1), hash_tokens(&doc));
-    }
-    let naive = builder.build();
-    let build_naive_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let naive = fresh_builder().build_with_threads(1);
+    let build_ms_serial = t0.elapsed().as_secs_f64() * 1000.0;
+
+    // Parallel build. 4 threads is a typical laptop-class sweet
+    // spot; push higher and the merge cost starts to eat the win.
+    let threads = 4;
+    let t_par = Instant::now();
+    let parallel_naive = fresh_builder().build_with_threads(threads);
+    let build_ms_par = t_par.elapsed().as_secs_f64() * 1000.0;
+    // Byte-identical output is the load-bearing invariant.
+    debug_assert_eq!(naive.to_bytes(), parallel_naive.to_bytes());
 
     let t1 = Instant::now();
     let succinct = SuccinctBM25Index::from_naive(&naive).unwrap();
@@ -63,10 +82,12 @@ fn bench(n_docs: usize, vocab: usize, doc_len: usize) {
     let succinct_bytes = succinct.to_bytes();
 
     let ratio = succinct_bytes.len() as f64 / naive_bytes.len() as f64;
+    let speedup = build_ms_serial / build_ms_par;
 
     println!(
         "n={n_docs:>6}  vocab={vocab:>5}  avg_doc_len={doc_len:>3} \
-         | build {build_naive_ms:>6.0}ms  succinct-encode {encode_ms:>6.0}ms \
+         | build-1 {build_ms_serial:>5.0}ms  build-{threads} {build_ms_par:>5.0}ms \
+         ({speedup:>3.1}×)  succinct-encode {encode_ms:>5.0}ms \
          | naive {:>8}  SB25 {:>8}  ratio {:.2}×",
         fmt_bytes(naive_bytes.len()),
         fmt_bytes(succinct_bytes.len()),
@@ -93,7 +114,5 @@ fn main() {
     bench(1_000, 400, 24);
     bench(5_000, 1_000, 48);
     bench(10_000, 2_000, 64);
-    // Keep 50k out of the default run; uncomment for local
-    // stress-testing.
-    // bench(50_000, 5_000, 96);
+    bench(50_000, 5_000, 96);
 }
