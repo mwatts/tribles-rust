@@ -496,6 +496,182 @@ fn width_for(n: usize) -> usize {
     }
 }
 
+/// Jerky-backed HNSW layer-graph component.
+///
+/// Flat CSR over `(layer, node) → [neighbour_node_idx, ...]`:
+/// - `neighbours`: [`CompactVector`] of neighbour node indices
+///   across all (layer, node) pairs, width
+///   `ceil(log2(n_nodes + 1))`.
+/// - `offsets`: [`CompactVector`] with `n_layers × (n_nodes + 1)`
+///   entries giving cumulative starts into `neighbours`. Width
+///   `ceil(log2(total_edges + 1))`.
+///
+/// For a node `i` at layer `L`, its neighbour list spans
+/// `[offsets[L·(n+1) + i] .. offsets[L·(n+1) + i + 1])` in
+/// `neighbours`. Nodes that weren't promoted to layer `L` have an
+/// empty slice there — safe to walk, never traversed by a correct
+/// search.
+///
+/// This is the building block the eventual
+/// `SuccinctHNSWIndex::try_from_blob` will consume per the RING
+/// plan in `docs/DESIGN.md` (no labels, so one wavelet matrix
+/// per layer would be even more compact, but CSR keeps the
+/// first-cut surface small and debuggable).
+#[derive(Debug)]
+pub struct SuccinctGraph {
+    neighbours: CompactVector,
+    offsets: CompactVector,
+    n_nodes: usize,
+    n_layers: usize,
+}
+
+/// Serialized layout metadata for [`SuccinctGraph`].
+#[derive(Debug, Clone, Copy)]
+pub struct SuccinctGraphMeta {
+    /// Meta for `neighbours`.
+    pub neighbours: CompactVectorMeta,
+    /// Meta for `offsets`.
+    pub offsets: CompactVectorMeta,
+    /// Number of nodes in the graph.
+    pub n_nodes: u64,
+    /// Number of layers (0..n_layers; layer 0 is the full graph).
+    pub n_layers: u64,
+}
+
+impl SuccinctGraph {
+    /// Serialize the layer-major neighbour lists.
+    /// `layer_graph[L][i]` = neighbours of node `i` on layer `L`.
+    /// Every node must have an entry at every layer (possibly
+    /// empty) so offsets stay aligned.
+    pub fn build(
+        layer_graph: &[Vec<Vec<u32>>],
+        n_nodes: usize,
+    ) -> Result<(Bytes, SuccinctGraphMeta), SuccinctDocLensError> {
+        let n_layers = layer_graph.len();
+        // Sanity: every layer must have `n_nodes` entries.
+        for layer in layer_graph {
+            if layer.len() != n_nodes {
+                return Err(SuccinctDocLensError::SizeMismatch {
+                    bytes: layer.len(),
+                    expected: n_nodes,
+                });
+            }
+            // Out-of-range neighbour index → refuse to build.
+            for list in layer {
+                for &n in list {
+                    if (n as usize) >= n_nodes {
+                        return Err(SuccinctDocLensError::SizeMismatch {
+                            bytes: n as usize,
+                            expected: n_nodes,
+                        });
+                    }
+                }
+            }
+        }
+        let total_edges: usize = layer_graph
+            .iter()
+            .flat_map(|layer| layer.iter().map(|l| l.len()))
+            .sum();
+        let neighbours_width = width_for(n_nodes + 1);
+        let offsets_width = width_for(total_edges + 1);
+        let offsets_len = n_layers * (n_nodes + 1);
+
+        let mut area = ByteArea::new()?;
+        let mut sections = area.sections();
+
+        let mut neighbours_b =
+            CompactVectorBuilder::with_capacity(total_edges, neighbours_width, &mut sections)?;
+        let mut pos = 0usize;
+        for layer in layer_graph {
+            for list in layer {
+                for &n in list {
+                    neighbours_b.set_int(pos, n as usize)?;
+                    pos += 1;
+                }
+            }
+        }
+        let neighbours = neighbours_b.freeze();
+        let neighbours_meta = neighbours.metadata();
+
+        let mut offsets_b =
+            CompactVectorBuilder::with_capacity(offsets_len, offsets_width, &mut sections)?;
+        let mut cum = 0usize;
+        let mut slot = 0usize;
+        for layer in layer_graph {
+            offsets_b.set_int(slot, cum)?;
+            slot += 1;
+            for list in layer {
+                cum += list.len();
+                offsets_b.set_int(slot, cum)?;
+                slot += 1;
+            }
+        }
+        // Fill any trailing slots (if n_layers == 0, offsets_len
+        // is 0 and the loop was a no-op).
+        while slot < offsets_len {
+            offsets_b.set_int(slot, cum)?;
+            slot += 1;
+        }
+        let offsets = offsets_b.freeze();
+        let offsets_meta = offsets.metadata();
+
+        drop((neighbours, offsets));
+        drop(sections);
+        let bytes = area.freeze()?;
+
+        let meta = SuccinctGraphMeta {
+            neighbours: neighbours_meta,
+            offsets: offsets_meta,
+            n_nodes: n_nodes as u64,
+            n_layers: n_layers as u64,
+        };
+        Ok((bytes, meta))
+    }
+
+    /// Reconstruct from bytes + metadata.
+    pub fn from_bytes(
+        meta: SuccinctGraphMeta,
+        bytes: Bytes,
+    ) -> Result<Self, SuccinctDocLensError> {
+        let neighbours = CompactVector::from_bytes(meta.neighbours, bytes.clone())?;
+        let offsets = CompactVector::from_bytes(meta.offsets, bytes)?;
+        Ok(Self {
+            neighbours,
+            offsets,
+            n_nodes: meta.n_nodes as usize,
+            n_layers: meta.n_layers as usize,
+        })
+    }
+
+    /// Number of nodes.
+    pub fn n_nodes(&self) -> usize {
+        self.n_nodes
+    }
+    /// Number of layers.
+    pub fn n_layers(&self) -> usize {
+        self.n_layers
+    }
+
+    /// Iterate neighbours of `node` on `layer`. Empty iterator if
+    /// either index is out of range (matching the naive index's
+    /// "no list at layer > node.level" semantics).
+    pub fn neighbours(
+        &self,
+        node: usize,
+        layer: usize,
+    ) -> impl Iterator<Item = u32> + '_ {
+        let (start, end) = if node >= self.n_nodes || layer >= self.n_layers {
+            (0usize, 0usize)
+        } else {
+            let slot = layer * (self.n_nodes + 1) + node;
+            let start = self.offsets.get_int(slot).unwrap_or(0);
+            let end = self.offsets.get_int(slot + 1).unwrap_or(start);
+            (start, end)
+        };
+        (start..end).map(move |i| self.neighbours.get_int(i).unwrap() as u32)
+    }
+}
+
 /// Zero-copy, jerky-backed BM25 index.
 ///
 /// Same query surface as [`crate::bm25::BM25Index`], but postings
@@ -1251,6 +1427,76 @@ mod tests {
         let a = build_succinct_sample().to_bytes();
         let b = build_succinct_sample().to_bytes();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn graph_roundtrip_simple() {
+        // 4 nodes, 2 layers.
+        // Layer 0 (full graph): each node knows its two neighbours.
+        // Layer 1: only 3 nodes participate; one has empty list.
+        let layers = vec![
+            vec![
+                vec![1u32, 2],
+                vec![0, 3],
+                vec![0, 3],
+                vec![1, 2],
+            ],
+            vec![
+                vec![2u32],
+                vec![],      // node 1 absent → empty list
+                vec![0],
+                vec![],      // node 3 absent → empty list
+            ],
+        ];
+        let (bytes, meta) = SuccinctGraph::build(&layers, 4).unwrap();
+        let view = SuccinctGraph::from_bytes(meta, bytes).unwrap();
+
+        assert_eq!(view.n_nodes(), 4);
+        assert_eq!(view.n_layers(), 2);
+
+        for (layer_idx, layer) in layers.iter().enumerate() {
+            for (i, expected) in layer.iter().enumerate() {
+                let got: Vec<u32> = view.neighbours(i, layer_idx).collect();
+                assert_eq!(
+                    &got, expected,
+                    "mismatch at (node {i}, layer {layer_idx})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn graph_out_of_range() {
+        let layers = vec![vec![vec![1u32], vec![0]]];
+        let (bytes, meta) = SuccinctGraph::build(&layers, 2).unwrap();
+        let view = SuccinctGraph::from_bytes(meta, bytes).unwrap();
+        assert!(view.neighbours(5, 0).next().is_none());
+        assert!(view.neighbours(0, 99).next().is_none());
+    }
+
+    #[test]
+    fn graph_empty() {
+        let layers: Vec<Vec<Vec<u32>>> = vec![];
+        let (bytes, meta) = SuccinctGraph::build(&layers, 0).unwrap();
+        let view = SuccinctGraph::from_bytes(meta, bytes).unwrap();
+        assert_eq!(view.n_nodes(), 0);
+        assert_eq!(view.n_layers(), 0);
+    }
+
+    #[test]
+    fn graph_rejects_out_of_range_neighbour() {
+        // Neighbour refers to node 5 but corpus has only 3 nodes.
+        let layers = vec![vec![vec![5u32], vec![0], vec![0]]];
+        let err = SuccinctGraph::build(&layers, 3).unwrap_err();
+        assert!(matches!(err, SuccinctDocLensError::SizeMismatch { .. }));
+    }
+
+    #[test]
+    fn graph_rejects_mismatched_layer_width() {
+        // Layer has 2 node entries but n_nodes = 3.
+        let layers = vec![vec![vec![1u32], vec![0]]];
+        let err = SuccinctGraph::build(&layers, 3).unwrap_err();
+        assert!(matches!(err, SuccinctDocLensError::SizeMismatch { .. }));
     }
 
     #[test]
