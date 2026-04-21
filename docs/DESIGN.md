@@ -280,19 +280,25 @@ stores the handle in the final index, drops the vectors.
 
 ### Open compression directions
 
-- **Wavelet matrix on the neighbour column** — would give
-  `rank` / `select` for free, which opens up reverse-neighbour
-  lookup and range-filtered similarity. At current forward-only
-  HNSW traversal the CSR `CompactVector` layout is both smaller
-  and faster (no rank/select auxiliary overhead). See
-  [`docs/HNSW_GRAPH_ENCODING.md`](HNSW_GRAPH_ENCODING.md) for
-  the full tradeoff analysis and the query patterns that would
-  flip the decision.
-- **Vector quantization** — the caller owns the embedding
-  schema. Future work: a `SuccinctHNSWBlob` variant (or a
-  separate schema id) that stores `[u8; dim]` quantized vectors
-  with per-component min/max scaling, or PQ codes. Keeps the
-  graph untouched.
+- **2-ring graph encoding** — built and benchmarked in
+  `src/ring.rs` + `examples/ring_vs_csr*.rs`. The fixed-
+  predicate sub-ring from Arroyuelo et al. *The Ring* (TODS
+  2024 §4.4) halves the graph blob vs CSR at every scale
+  tested. We *didn't* adopt it as the default because it
+  costs ~3× end-to-end query latency on in-memory / warm-
+  cache workloads, and at 1B corpus scale the graph is only
+  ~4 % of total storage (embeddings dominate). `RingGraph`
+  stays as an opt-in primitive for disk-backed or
+  branch-metadata-heavy workloads. See
+  [`docs/HNSW_GRAPH_ENCODING.md`](HNSW_GRAPH_ENCODING.md)
+  for the full measurements and when-to-use-which.
+- **Vector quantization** — the biggest lever at scale.
+  The caller owns the embedding schema; we could ship
+  `EmbeddingI8` / `EmbeddingPQ` alongside `Embedding` and
+  let the distance function branch on the schema. At
+  dim=384+ the embeddings are 90 %+ of total storage, so
+  4–16× quantization shrinks wins far more than any graph
+  encoding.
 
 ## Query engine integration
 
