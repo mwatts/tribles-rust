@@ -46,6 +46,17 @@ pub trait BM25Queryable {
 
     /// Number of docs containing `term`. Used by `estimate`.
     fn doc_frequency_for(&self, term: &RawValue) -> usize;
+
+    /// Absolute tolerance the engine should use when comparing a
+    /// stored score against a bound `score` variable. Default
+    /// `f32::EPSILON` — appropriate for indexes that store
+    /// scores losslessly. Quantized / lossy backends should
+    /// widen this to their bucket size to still accept
+    /// semantically-equal scores that round to different float
+    /// representations.
+    fn score_tolerance(&self) -> f32 {
+        f32::EPSILON
+    }
 }
 
 impl BM25Queryable for BM25Index {
@@ -258,9 +269,10 @@ impl<'a, I: BM25Queryable + ?Sized + 'a> Constraint<'a> for BM25ScoredPostings<'
             let bound_score = binding
                 .get(self.score.index)
                 .map(raw_value_to_f32);
+            let tol = self.index.score_tolerance();
             for (doc_id, score) in self.index.query_term_boxed(&self.term) {
                 if let Some(bs) = bound_score {
-                    if (score - bs).abs() > f32::EPSILON {
+                    if (score - bs).abs() > tol {
                         continue;
                     }
                 }
@@ -301,11 +313,12 @@ impl<'a, I: BM25Queryable + ?Sized + 'a> Constraint<'a> for BM25ScoredPostings<'
             let bound_score = binding
                 .get(self.score.index)
                 .map(raw_value_to_f32);
+            let tol = self.index.score_tolerance();
             let valid: HashSet<Id> = self
                 .index
                 .query_term_boxed(&self.term)
                 .filter(|(_, s)| match bound_score {
-                    Some(bs) => (s - bs).abs() <= f32::EPSILON,
+                    Some(bs) => (s - bs).abs() <= tol,
                     None => true,
                 })
                 .map(|(d, _)| d)
@@ -339,11 +352,12 @@ impl<'a, I: BM25Queryable + ?Sized + 'a> Constraint<'a> for BM25ScoredPostings<'
         let bound_score = binding
             .get(self.score.index)
             .map(raw_value_to_f32);
+        let tol = self.index.score_tolerance();
         match (bound_doc, bound_score) {
             (None, None) => true,
             _ => self.index.query_term_boxed(&self.term).any(|(d, s)| {
                 bound_doc.map_or(true, |bd| d == bd)
-                    && bound_score.map_or(true, |bs| (s - bs).abs() <= f32::EPSILON)
+                    && bound_score.map_or(true, |bs| (s - bs).abs() <= tol)
             }),
         }
     }
