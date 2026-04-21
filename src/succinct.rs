@@ -772,6 +772,40 @@ impl SuccinctHNSWIndex {
         self.max_level
     }
 
+    /// Constraint that binds `doc` to entity ids in the top-k
+    /// nearest neighbours under cosine similarity. Mirror of
+    /// [`crate::hnsw::HNSWIndex::similar_constraint`] for the
+    /// succinct view.
+    pub fn similar_constraint(
+        &self,
+        doc: triblespace::core::query::Variable<
+            triblespace::core::value::schemas::genid::GenId,
+        >,
+        query: Vec<f32>,
+        k: usize,
+        ef: Option<usize>,
+    ) -> crate::constraint::SimilarToVectorHNSW<'_, SuccinctHNSWIndex> {
+        crate::constraint::SimilarToVectorHNSW::new(self, doc, query, k, ef)
+    }
+
+    /// Scored variant: binds both `doc` and cosine `score`.
+    /// Mirror of [`crate::hnsw::HNSWIndex::similar_with_scores`]
+    /// for the succinct view.
+    pub fn similar_with_scores(
+        &self,
+        doc: triblespace::core::query::Variable<
+            triblespace::core::value::schemas::genid::GenId,
+        >,
+        score: triblespace::core::query::Variable<crate::schemas::F32LE>,
+        query: Vec<f32>,
+        k: usize,
+        ef: Option<usize>,
+    ) -> crate::constraint::SimilarToVectorHNSWScored<'_, SuccinctHNSWIndex> {
+        crate::constraint::SimilarToVectorHNSWScored::new(
+            self, doc, score, query, k, ef,
+        )
+    }
+
     /// Read vector `i` as a borrowed `&[f32]` (zero-copy via
     /// anybytes::Bytes → f32 slice cast).
     ///

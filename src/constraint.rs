@@ -75,6 +75,40 @@ impl BM25Queryable for crate::succinct::SuccinctBM25Index {
     }
 }
 
+/// Minimum surface an HNSW-style index must expose for the
+/// [`SimilarToVectorHNSW`] / [`SimilarToVectorHNSWScored`]
+/// constraints to work against it. Implemented for both the naive
+/// [`crate::hnsw::HNSWIndex`] and the succinct
+/// [`crate::succinct::SuccinctHNSWIndex`].
+pub trait HNSWQueryable {
+    /// Approximate top-`k` nearest neighbours to `query` under
+    /// cosine similarity, with optional `ef` search width.
+    fn similar_for(&self, query: &[f32], k: usize, ef: Option<usize>)
+        -> Vec<(Id, f32)>;
+
+    /// Total indexed docs (for cardinality estimates).
+    fn doc_count_for(&self) -> usize;
+}
+
+impl HNSWQueryable for HNSWIndex {
+    fn similar_for(&self, query: &[f32], k: usize, ef: Option<usize>) -> Vec<(Id, f32)> {
+        self.similar(query, k, ef)
+    }
+    fn doc_count_for(&self) -> usize {
+        self.doc_count()
+    }
+}
+
+#[cfg(feature = "succinct")]
+impl HNSWQueryable for crate::succinct::SuccinctHNSWIndex {
+    fn similar_for(&self, query: &[f32], k: usize, ef: Option<usize>) -> Vec<(Id, f32)> {
+        self.similar(query, k, ef)
+    }
+    fn doc_count_for(&self) -> usize {
+        self.doc_count()
+    }
+}
+
 /// Constrains a `Variable<GenId>` (doc) to entity ids in the
 /// posting list of the pinned term.
 ///
@@ -588,8 +622,12 @@ impl<'a> Constraint<'a> for SimilarToVectorScored<'a> {
 
 /// HNSW version of [`SimilarToVector`]. Same shape; different
 /// backing index. Approximate rather than exact top-k.
-pub struct SimilarToVectorHNSW<'a> {
-    index: &'a HNSWIndex,
+///
+/// Generic over `I: HNSWQueryable`, so it works against
+/// [`HNSWIndex`] or
+/// [`crate::succinct::SuccinctHNSWIndex`] without duplication.
+pub struct SimilarToVectorHNSW<'a, I: HNSWQueryable + ?Sized = HNSWIndex> {
+    index: &'a I,
     doc: Variable<GenId>,
     query: Vec<f32>,
     k: usize,
@@ -598,9 +636,9 @@ pub struct SimilarToVectorHNSW<'a> {
     ef: Option<usize>,
 }
 
-impl<'a> SimilarToVectorHNSW<'a> {
+impl<'a, I: HNSWQueryable + ?Sized> SimilarToVectorHNSW<'a, I> {
     pub fn new(
-        index: &'a HNSWIndex,
+        index: &'a I,
         doc: Variable<GenId>,
         query: Vec<f32>,
         k: usize,
@@ -626,19 +664,19 @@ impl HNSWIndex {
         query: Vec<f32>,
         k: usize,
         ef: Option<usize>,
-    ) -> SimilarToVectorHNSW<'_> {
+    ) -> SimilarToVectorHNSW<'_, HNSWIndex> {
         SimilarToVectorHNSW::new(self, doc, query, k, ef)
     }
 }
 
-impl<'a> Constraint<'a> for SimilarToVectorHNSW<'a> {
+impl<'a, I: HNSWQueryable + ?Sized + 'a> Constraint<'a> for SimilarToVectorHNSW<'a, I> {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.doc.index)
     }
 
     fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
         if self.doc.index == variable {
-            Some(self.k.min(self.index.doc_count()))
+            Some(self.k.min(self.index.doc_count_for()))
         } else {
             None
         }
@@ -653,7 +691,7 @@ impl<'a> Constraint<'a> for SimilarToVectorHNSW<'a> {
         if self.doc.index != variable {
             return;
         }
-        for (doc_id, _score) in self.index.similar(&self.query, self.k, self.ef) {
+        for (doc_id, _score) in self.index.similar_for(&self.query, self.k, self.ef) {
             proposals.push(id_to_raw_value(doc_id));
         }
     }
@@ -669,7 +707,7 @@ impl<'a> Constraint<'a> for SimilarToVectorHNSW<'a> {
         }
         let top: HashSet<Id> = self
             .index
-            .similar(&self.query, self.k, self.ef)
+            .similar_for(&self.query, self.k, self.ef)
             .into_iter()
             .map(|(d, _)| d)
             .collect();
@@ -687,7 +725,7 @@ impl<'a> Constraint<'a> for SimilarToVectorHNSW<'a> {
                     return false;
                 };
                 self.index
-                    .similar(&self.query, self.k, self.ef)
+                    .similar_for(&self.query, self.k, self.ef)
                     .into_iter()
                     .any(|(d, _)| d == doc_id)
             }
@@ -700,8 +738,10 @@ impl<'a> Constraint<'a> for SimilarToVectorHNSW<'a> {
 
 /// Scored variant of [`SimilarToVectorHNSW`]: binds both `doc`
 /// and the cosine `score` per top-`k` hit.
-pub struct SimilarToVectorHNSWScored<'a> {
-    index: &'a HNSWIndex,
+///
+/// Generic over `I: HNSWQueryable`.
+pub struct SimilarToVectorHNSWScored<'a, I: HNSWQueryable + ?Sized = HNSWIndex> {
+    index: &'a I,
     doc: Variable<GenId>,
     score: Variable<F32LE>,
     query: Vec<f32>,
@@ -709,9 +749,9 @@ pub struct SimilarToVectorHNSWScored<'a> {
     ef: Option<usize>,
 }
 
-impl<'a> SimilarToVectorHNSWScored<'a> {
+impl<'a, I: HNSWQueryable + ?Sized> SimilarToVectorHNSWScored<'a, I> {
     pub fn new(
-        index: &'a HNSWIndex,
+        index: &'a I,
         doc: Variable<GenId>,
         score: Variable<F32LE>,
         query: Vec<f32>,
@@ -739,12 +779,14 @@ impl HNSWIndex {
         query: Vec<f32>,
         k: usize,
         ef: Option<usize>,
-    ) -> SimilarToVectorHNSWScored<'_> {
+    ) -> SimilarToVectorHNSWScored<'_, HNSWIndex> {
         SimilarToVectorHNSWScored::new(self, doc, score, query, k, ef)
     }
 }
 
-impl<'a> Constraint<'a> for SimilarToVectorHNSWScored<'a> {
+impl<'a, I: HNSWQueryable + ?Sized + 'a> Constraint<'a>
+    for SimilarToVectorHNSWScored<'a, I>
+{
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.doc.index)
             .union(VariableSet::new_singleton(self.score.index))
@@ -752,7 +794,7 @@ impl<'a> Constraint<'a> for SimilarToVectorHNSWScored<'a> {
 
     fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
         if variable == self.doc.index || variable == self.score.index {
-            Some(self.k.min(self.index.doc_count()))
+            Some(self.k.min(self.index.doc_count_for()))
         } else {
             None
         }
@@ -769,7 +811,7 @@ impl<'a> Constraint<'a> for SimilarToVectorHNSWScored<'a> {
                 .get(self.score.index)
                 .map(raw_value_to_f32);
             for (doc_id, score) in
-                self.index.similar(&self.query, self.k, self.ef)
+                self.index.similar_for(&self.query, self.k, self.ef)
             {
                 if let Some(bs) = bound_score {
                     if (score - bs).abs() > f32::EPSILON {
@@ -786,7 +828,7 @@ impl<'a> Constraint<'a> for SimilarToVectorHNSWScored<'a> {
             // when two neighbours share a similarity value.
             let mut seen = HashSet::new();
             for (doc_id, score) in
-                self.index.similar(&self.query, self.k, self.ef)
+                self.index.similar_for(&self.query, self.k, self.ef)
             {
                 if let Some(bd) = bound_doc {
                     if doc_id != bd {
@@ -806,7 +848,7 @@ impl<'a> Constraint<'a> for SimilarToVectorHNSWScored<'a> {
         binding: &Binding,
         proposals: &mut Vec<RawValue>,
     ) {
-        let top = self.index.similar(&self.query, self.k, self.ef);
+        let top = self.index.similar_for(&self.query, self.k, self.ef);
         if variable == self.doc.index {
             let bound_score = binding
                 .get(self.score.index)
@@ -851,7 +893,7 @@ impl<'a> Constraint<'a> for SimilarToVectorHNSWScored<'a> {
             (None, None) => true,
             _ => self
                 .index
-                .similar(&self.query, self.k, self.ef)
+                .similar_for(&self.query, self.k, self.ef)
                 .into_iter()
                 .any(|(d, s)| {
                     bound_doc.map_or(true, |bd| d == bd)

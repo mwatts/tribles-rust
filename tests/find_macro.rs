@@ -179,6 +179,45 @@ fn find_intersection_of_two_terms() {
     assert!(set.contains(&id(3)));
 }
 
+/// The succinct HNSW view answers `find!` queries identically
+/// to the naive one — proves the `HNSWQueryable` trait plugs the
+/// succinct path into the engine. 16 vectors, fixed seed, one
+/// query: top-3 must be the same doc set on both.
+#[test]
+fn find_hnsw_similar_on_succinct() {
+    use std::collections::HashSet;
+    use triblespace::core::id::Id as TId;
+    use triblespace_search::hnsw::HNSWBuilder;
+    use triblespace_search::succinct::SuccinctHNSWIndex;
+
+    fn iid(byte: u8) -> TId {
+        TId::new([byte; 16]).unwrap()
+    }
+
+    let mut b = HNSWBuilder::new(4).with_seed(23);
+    for i in 1..=16u8 {
+        let f = i as f32;
+        let v = vec![f.sin(), f.cos(), (f * 0.5).sin(), (f * 0.3).cos()];
+        b.insert(iid(i), v).unwrap();
+    }
+    let naive = b.build();
+    let succinct = SuccinctHNSWIndex::from_naive(&naive).unwrap();
+    let query = vec![0.5, -0.2, 0.3, 0.7];
+
+    let rows: Vec<(Id,)> = find!(
+        (doc: Id),
+        succinct.similar_constraint(doc, query.clone(), 3, Some(10))
+    )
+    .collect();
+    let got: HashSet<Id> = rows.into_iter().map(|(d,)| d).collect();
+    let expected: HashSet<Id> = naive
+        .similar(&query, 3, Some(10))
+        .into_iter()
+        .map(|(d, _)| d)
+        .collect();
+    assert_eq!(got, expected);
+}
+
 /// The succinct view answers `find!` queries identically to the
 /// naive one — proves the `BM25Queryable` trait actually plugs
 /// the succinct path into the engine without regressions. Uses
