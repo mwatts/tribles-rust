@@ -27,7 +27,7 @@ use triblespace::core::value::schemas::genid::GenId;
 use triblespace::core::value::RawValue;
 
 use crate::bm25::BM25Index;
-use crate::hnsw::FlatIndex;
+use crate::hnsw::{FlatIndex, HNSWIndex};
 
 /// Constrains a `Variable<GenId>` (doc) to entity ids in the
 /// posting list of the pinned term.
@@ -180,6 +180,118 @@ impl<'a> Constraint<'a> for SimilarToVector<'a> {
                 };
                 self.index
                     .similar(&self.query, self.k)
+                    .into_iter()
+                    .any(|(d, _)| d == doc_id)
+            }
+            None => true,
+        }
+    }
+}
+
+// ── HNSWIndex constraint ─────────────────────────────────────────────
+
+/// HNSW version of [`SimilarToVector`]. Same shape; different
+/// backing index. Approximate rather than exact top-k.
+pub struct SimilarToVectorHNSW<'a> {
+    index: &'a HNSWIndex,
+    doc: Variable<GenId>,
+    query: Vec<f32>,
+    k: usize,
+    /// HNSW's `ef_search` parameter. Larger = better recall at
+    /// higher query cost. Defaults to `k` when `None`.
+    ef: Option<usize>,
+}
+
+impl<'a> SimilarToVectorHNSW<'a> {
+    pub fn new(
+        index: &'a HNSWIndex,
+        doc: Variable<GenId>,
+        query: Vec<f32>,
+        k: usize,
+        ef: Option<usize>,
+    ) -> Self {
+        Self {
+            index,
+            doc,
+            query,
+            k,
+            ef,
+        }
+    }
+}
+
+impl HNSWIndex {
+    /// Build a [`SimilarToVectorHNSW`] constraint for use inside
+    /// `pattern!` / `find!`. Pass `ef = Some(n)` to widen search
+    /// (higher recall, slower); `None` defaults to `k`.
+    pub fn similar_constraint(
+        &self,
+        doc: Variable<GenId>,
+        query: Vec<f32>,
+        k: usize,
+        ef: Option<usize>,
+    ) -> SimilarToVectorHNSW<'_> {
+        SimilarToVectorHNSW::new(self, doc, query, k, ef)
+    }
+}
+
+impl<'a> Constraint<'a> for SimilarToVectorHNSW<'a> {
+    fn variables(&self) -> VariableSet {
+        VariableSet::new_singleton(self.doc.index)
+    }
+
+    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
+        if self.doc.index == variable {
+            Some(self.k.min(self.index.doc_count()))
+        } else {
+            None
+        }
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        _binding: &Binding,
+        proposals: &mut Vec<RawValue>,
+    ) {
+        if self.doc.index != variable {
+            return;
+        }
+        for (doc_id, _score) in self.index.similar(&self.query, self.k, self.ef) {
+            proposals.push(id_to_raw_value(doc_id));
+        }
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _binding: &Binding,
+        proposals: &mut Vec<RawValue>,
+    ) {
+        if self.doc.index != variable {
+            return;
+        }
+        let top: HashSet<Id> = self
+            .index
+            .similar(&self.query, self.k, self.ef)
+            .into_iter()
+            .map(|(d, _)| d)
+            .collect();
+        proposals.retain(|raw| {
+            raw_value_to_id(raw)
+                .map(|id| top.contains(&id))
+                .unwrap_or(false)
+        });
+    }
+
+    fn satisfied(&self, binding: &Binding) -> bool {
+        match binding.get(self.doc.index) {
+            Some(raw) => {
+                let Some(doc_id) = raw_value_to_id(raw) else {
+                    return false;
+                };
+                self.index
+                    .similar(&self.query, self.k, self.ef)
                     .into_iter()
                     .any(|(d, _)| d == doc_id)
             }
@@ -466,6 +578,56 @@ mod tests {
         let mut unmatching = Binding::default();
         unmatching.set(doc.index, &id_to_raw_value(id(4)));
         assert!(!c.satisfied(&unmatching));
+    }
+
+    fn sample_hnsw() -> crate::hnsw::HNSWIndex {
+        use crate::hnsw::HNSWBuilder;
+        let mut b = HNSWBuilder::new(3).with_seed(42);
+        b.insert(id(1), vec![1.0, 0.0, 0.0]).unwrap();
+        b.insert(id(2), vec![0.0, 1.0, 0.0]).unwrap();
+        b.insert(id(3), vec![0.9, 0.1, 0.0]).unwrap();
+        b.insert(id(4), vec![0.0, 0.0, 1.0]).unwrap();
+        b.build()
+    }
+
+    #[test]
+    fn hnsw_constraint_proposes_top_k() {
+        let idx = sample_hnsw();
+        let mut ctx = triblespace::core::query::VariableContext::new();
+        let doc: Variable<GenId> = ctx.next_variable();
+        let c = idx.similar_constraint(doc, vec![1.0, 0.0, 0.0], 2, Some(10));
+
+        let binding = Binding::default();
+        let mut props = Vec::new();
+        c.propose(doc.index, &binding, &mut props);
+        let ids: HashSet<Id> =
+            props.iter().map(|r| raw_value_to_id(r).unwrap()).collect();
+        // Top-2 neighbours of [1,0,0] should include docs 1 and 3
+        // (exact and near-exact matches respectively). HNSW is
+        // approximate; allow either to be present and just check
+        // neither of 3/4 dominates.
+        assert!(ids.len() <= 2);
+        assert!(ids.contains(&id(1)) || ids.contains(&id(3)));
+    }
+
+    #[test]
+    fn hnsw_constraint_estimate_clamps_to_corpus() {
+        let idx = sample_hnsw();
+        let mut ctx = triblespace::core::query::VariableContext::new();
+        let doc: Variable<GenId> = ctx.next_variable();
+        let c = idx.similar_constraint(doc, vec![1.0, 0.0, 0.0], 100, None);
+        assert_eq!(c.estimate(doc.index, &Binding::default()), Some(4));
+    }
+
+    #[test]
+    fn hnsw_constraint_satisfied_respects_binding() {
+        let idx = sample_hnsw();
+        let mut ctx = triblespace::core::query::VariableContext::new();
+        let doc: Variable<GenId> = ctx.next_variable();
+        let c = idx.similar_constraint(doc, vec![1.0, 0.0, 0.0], 2, Some(10));
+
+        // Unbound → trivially satisfied.
+        assert!(c.satisfied(&Binding::default()));
     }
 
     /// Sanity-check that `propose` yields values every consumer
