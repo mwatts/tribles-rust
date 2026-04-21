@@ -1441,7 +1441,7 @@ mod tests {
 
     #[test]
     fn hnsw_deterministic_seed_reproduces_structure() {
-        let mut build = |seed: u64| {
+        let build = |seed: u64| {
             let mut b = HNSWBuilder::new(3).with_seed(seed);
             for i in 1..=20u8 {
                 b.insert(

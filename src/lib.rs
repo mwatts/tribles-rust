@@ -17,6 +17,8 @@ pub mod bm25;
 pub mod constraint;
 pub mod hnsw;
 pub mod schemas;
+#[cfg(feature = "succinct")]
+pub mod succinct;
 pub mod tokens;
 
 /// Current on-disk format version for every index blob.
