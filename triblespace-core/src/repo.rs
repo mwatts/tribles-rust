@@ -1,10 +1,10 @@
+#![allow(clippy::type_complexity)]
 //! This module provides a high-level API for storing and retrieving data from repositories.
 //! The design is inspired by Git, but with a focus on object/content-addressed storage.
 //! It separates storage concerns from the data model, and reduces the mutable state of the repository,
 //! to an absolute minimum, making it easier to reason about and allowing for different storage backends.
 //!
 //! Blob repositories are collections of blobs that can be content-addressed by their hash.
-#![allow(clippy::type_complexity)]
 //! This is typically local `.pile` file or a S3 bucket or a similar service.
 //! On their own they have no notion of branches or commits, or other stateful constructs.
 //! As such they also don't have a notion of time, order or history,
@@ -65,7 +65,7 @@
 //!
 //! ## Handling conflicts
 //!
-//! The single-attempt primitive is [`Repository::try_push`]. It returns
+//! The single-attempt primitive is [`Repository::try_push`](crate::repo::Repository::try_push). It returns
 //! `Ok(None)` on success or `Ok(Some(conflict_ws))` when the branch advanced
 //! concurrently. Callers that want explicit conflict handling may use this
 //! form:
@@ -92,8 +92,8 @@
 //!
 //! The API deliberately mirrors concepts from Git to make its usage familiar:
 //!
-//! - A [`Repository`] stores commits and branch metadata similar to a remote.
-//! - [`Workspace`] is akin to a working directory combined with an index. It
+//! - A [`Repository`](crate::repo::Repository) stores commits and branch metadata similar to a remote.
+//! - [`Workspace`](crate::repo::Workspace) is akin to a working directory combined with an index. It
 //!   tracks changes against a branch head until you `push` them.
 //! - `create_branch` and `branch_from` correspond to creating new branches from
 //!   scratch or from a specific commit, respectively.
@@ -188,6 +188,7 @@ use ed25519_dalek::SigningKey;
 
 use crate::blob::schemas::longstring::LongString;
 use crate::blob::schemas::simplearchive::SimpleArchive;
+use crate::blob::schemas::succinctarchive::SuccinctArchiveBlob;
 use crate::prelude::*;
 use crate::value::schemas::ed25519 as ed;
 use crate::value::schemas::hash::Blake3;
@@ -217,6 +218,15 @@ attributes! {
     "9DF34F84959928F93A3C40AEB6E9E499" as pub signature_r: ed::ED25519RComponent;
     /// The `s` part of a ed25519 signature.
     "1ACE03BF70242B289FDF00E4327C3BC6" as pub signature_s: ed::ED25519SComponent;
+    /// Optional SuccinctArchive rollup of the branch HEAD's logical contents.
+    ///
+    /// Readers can fetch this blob via the repository's blob store to obtain
+    /// a compact, instantly-queryable representation of the branch's state
+    /// without having to materialise the TribleSet from the commit chain.
+    /// Absent on branches that haven't had a rollup built yet. Soft state:
+    /// the rollup is redundant with (and must agree with) whatever
+    /// `ws.checkout(..)` would return for the same HEAD.
+    "D7D14C6737AA27A51E1E08D380D13EF9" as pub rollup: Handle<Blake3, SuccinctArchiveBlob>;
 }
 
 /// The `ListBlobs` trait is used to list all blobs in a repository.
@@ -233,7 +243,7 @@ pub trait BlobStoreList<H: HashProtocol> {
 
     /// Lists blobs in `self` that are not in `old`.
     ///
-    /// Backends with true snapshot semantics (e.g. [`Pile`](pile::Pile),
+    /// Backends with true snapshot semantics (e.g. [`Pile`],
     /// where each [`Reader`](BlobStore::Reader) holds a frozen clone of the
     /// in-memory blob index) compute the difference cheaply via the index's
     /// own set-difference operation. Backends without snapshot semantics
@@ -658,6 +668,28 @@ pub enum MergeError {
 }
 
 /// Error returned by [`Repository::push`] and [`Repository::try_push`].
+/// Error type for [`Repository::compute_rollup`].
+#[derive(Debug)]
+pub enum RollupError<Storage: BranchStore<Blake3> + BlobStore<Blake3>> {
+    /// The branch was not found in the underlying storage.
+    UnknownBranch,
+    /// The branch is empty — no HEAD to roll up.
+    EmptyBranch,
+    /// The branch HEAD advanced between checkout and CAS-update. The
+    /// caller may retry (`compute_rollup` is content-addressed so repeat
+    /// calls dedupe against already-uploaded blobs).
+    HeadAdvanced,
+    /// Underlying push / storage error during the attach step.
+    Push(PushError<Storage>),
+    /// Could not pull the branch to obtain a workspace.
+    Pull(PullError<Storage::HeadError,
+                    <Storage as BlobStore<Blake3>>::ReaderError,
+                    <<Storage as BlobStore<Blake3>>::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>),
+    /// Could not check out the branch state to build the archive.
+    Checkout(WorkspaceCheckoutError<
+        <<Storage as BlobStore<Blake3>>::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>>),
+}
+
 #[derive(Debug)]
 pub enum PushError<Storage: BranchStore<Blake3> + BlobStore<Blake3>> {
     /// An error occurred while enumerating the branch storage branches.
@@ -874,7 +906,7 @@ where
         self.create_branch_with_key(branch_name, commit, self.signing_key.clone())
     }
 
-    /// Same as [`branch_from`] but uses the provided signing key.
+    /// Same as [`Self::create_branch`] but uses the provided signing key.
     pub fn create_branch_with_key(
         &mut self,
         branch_name: &str,
@@ -895,9 +927,15 @@ where
                 .map_err(|e| BranchError::StorageReader(e))?;
             let set: TribleSet = reader.get(commit).map_err(|e| BranchError::StorageGet(e))?;
 
-            branch::branch_metadata(&signing_key, *branch_id, name_handle, Some(set.to_blob()))
+            branch::branch_metadata(
+                &signing_key,
+                *branch_id,
+                name_handle,
+                Some(set.to_blob()),
+                None,
+            )
         } else {
-            branch::branch_unsigned(*branch_id, name_handle, None)
+            branch::branch_unsigned(*branch_id, name_handle, None, None)
         };
 
         let branch_blob = branch_set.to_blob();
@@ -1009,7 +1047,7 @@ where
         self.pull_with_key(branch_id, self.signing_key.clone())
     }
 
-    /// Same as [`pull`] but overrides the signing key.
+    /// Same as [`Self::pull`] but overrides the signing key.
     pub fn pull_with_key(
         &mut self,
         branch_id: Id,
@@ -1131,6 +1169,10 @@ where
             workspace.base_branch_id,
             branch_name,
             Some(head_.to_blob()),
+            // A fresh commit invalidates any prior rollup (it was computed
+            // against the old HEAD). Readers fall back to checkout until
+            // `compute_rollup` runs against the new HEAD.
+            None,
         );
 
         let branch_meta_handle = self
@@ -1194,6 +1236,95 @@ where
 
                 Ok(Some(conflict_ws))
             }
+        }
+    }
+
+    /// Builds a [`SuccinctArchive`](crate::blob::schemas::succinctarchive::SuccinctArchive) rollup of the branch's current HEAD,
+    /// stores it as a blob in the underlying storage, and attaches the
+    /// resulting handle to the branch metadata via CAS.
+    ///
+    /// Returns the new rollup handle on success.
+    ///
+    /// Returns [`RollupError::HeadAdvanced`] if the branch HEAD moved
+    /// between `pull` and the CAS-update. The caller may retry — the
+    /// archive blob is content-addressed, so subsequent calls dedupe
+    /// against already-uploaded blobs.
+    ///
+    /// Returns [`RollupError::EmptyBranch`] if the branch has no HEAD
+    /// commit yet (nothing to roll up).
+    ///
+    /// This is the sole public write-path for rollups. The companion
+    /// read-path is [`Workspace::rollup`].
+    pub fn compute_rollup(
+        &mut self,
+        branch_id: Id,
+    ) -> Result<
+        Value<Handle<Blake3, crate::blob::schemas::succinctarchive::SuccinctArchiveBlob>>,
+        RollupError<Storage>,
+    > {
+        use crate::blob::schemas::succinctarchive::{OrderedUniverse, SuccinctArchive};
+        use crate::blob::ToBlob;
+
+        let mut ws = self.pull(branch_id).map_err(RollupError::Pull)?;
+        let head_handle = ws.head().ok_or(RollupError::EmptyBranch)?;
+
+        // Materialise the branch state from its commit chain and build the
+        // succinct index over it.
+        let space = ws.checkout(..).map_err(RollupError::Checkout)?;
+        let archive: SuccinctArchive<OrderedUniverse> = (&*space).into();
+        drop(space);
+
+        // Upload the archive blob directly to storage — no workspace-local
+        // staging needed; the CAS below references it by handle.
+        let archive_blob = (&archive).to_blob();
+        let handle: Value<
+            Handle<Blake3, crate::blob::schemas::succinctarchive::SuccinctArchiveBlob>,
+        > = self
+            .storage
+            .put(archive_blob)
+            .map_err(|e| RollupError::Push(PushError::StoragePut(e)))?;
+
+        // Construct a fresh branch meta that carries the same head as
+        // `base_branch_meta` plus the new rollup attribute.
+        let reader = self
+            .storage
+            .reader()
+            .map_err(|e| RollupError::Push(PushError::StorageReader(e)))?;
+        let base_meta: TribleSet = reader
+            .get(ws.base_branch_meta)
+            .map_err(|e| RollupError::Push(PushError::StorageGet(e)))?;
+        let (branch_name,) = find!(
+            (name: Value<Handle<Blake3, LongString>>),
+            pattern!(&base_meta, [{ crate::metadata::name: ?name }])
+        )
+        .exactly_one()
+        .map_err(|_| RollupError::Push(PushError::BadBranchMetadata()))?;
+        let head_blob: TribleSet = reader
+            .get(head_handle)
+            .map_err(|e| RollupError::Push(PushError::StorageGet(e)))?;
+
+        let new_meta = branch::branch_metadata(
+            &ws.signing_key,
+            branch_id,
+            branch_name,
+            Some(head_blob.to_blob()),
+            Some(handle),
+        );
+        let new_meta_handle = self
+            .storage
+            .put(new_meta)
+            .map_err(|e| RollupError::Push(PushError::StoragePut(e)))?;
+
+        // CAS: swap `base_branch_meta` for the new meta. On conflict, the
+        // head advanced between our pull and this CAS — the rollup we built
+        // is stale against the new head, so report upstream.
+        let update_result = self
+            .storage
+            .update(branch_id, Some(ws.base_branch_meta), Some(new_meta_handle))
+            .map_err(|e| RollupError::Push(PushError::BranchUpdate(e)))?;
+        match update_result {
+            PushResult::Success() => Ok(handle),
+            PushResult::Conflict(_) => Err(RollupError::HeadAdvanced),
         }
     }
 }
@@ -1948,6 +2079,44 @@ impl<Blobs: BlobStore<Blake3>> Workspace<Blobs> {
     /// Returns the workspace metadata handle.
     pub fn metadata(&self) -> MetadataHandle {
         self.commit_metadata
+    }
+
+    /// Reads the rollup handle, if any, from the workspace's base branch
+    /// metadata. Returns `None` if the branch has no rollup yet or if the
+    /// metadata is missing the attribute. Readers can use this to fetch
+    /// the archive blob directly and skip `checkout(..)` for warm queries:
+    ///
+    /// ```rust,ignore
+    /// let mut ws = repo.pull(branch)?;
+    /// match ws.rollup()? {
+    ///     Some(h) => {
+    ///         let archive: SuccinctArchive<_> = ws.get(h)?;
+    ///         // query archive
+    ///     }
+    ///     None => {
+    ///         let space = ws.checkout(..)?;
+    ///         // query space (commit-chain materialisation)
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// Writers don't go through this — attach a rollup via
+    /// [`Repository::compute_rollup`] instead.
+    pub fn rollup(
+        &mut self,
+    ) -> Result<
+        Option<Value<Handle<Blake3, SuccinctArchiveBlob>>>,
+        <Blobs::Reader as BlobStoreGet<Blake3>>::GetError<UnarchiveError>,
+    > {
+        let base_meta: TribleSet = self.base_blobs.get(self.base_branch_meta)?;
+        Ok(
+            find!(
+                (r: Value<Handle<Blake3, SuccinctArchiveBlob>>),
+                pattern!(&base_meta, [{ rollup: ?r }])
+            )
+            .next()
+            .map(|(r,)| r),
+        )
     }
 
     /// Adds a blob to the workspace's local blob store.
