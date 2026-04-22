@@ -1,4 +1,5 @@
 use super::*;
+use smallvec::SmallVec;
 
 /// Logical conjunction of constraints (AND).
 ///
@@ -55,7 +56,7 @@ where
     /// confirms through the rest in ascending estimate order. Children
     /// that return `None` for this variable are skipped entirely.
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
-        let mut relevant_constraints: Vec<_> = self
+        let mut relevant_constraints: SmallVec<[(usize, &C); 8]> = self
             .constraints
             .iter()
             .filter_map(|c| Some((c.estimate(variable, binding)?, c)))
@@ -77,7 +78,7 @@ where
     /// Confirms proposals through all children that constrain `variable`,
     /// in order of increasing estimate.
     fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
-        let mut relevant_constraints: Vec<_> = self
+        let mut relevant_constraints: SmallVec<[(usize, &C); 8]> = self
             .constraints
             .iter()
             .filter_map(|c| Some((c.estimate(variable, binding)?, c)))

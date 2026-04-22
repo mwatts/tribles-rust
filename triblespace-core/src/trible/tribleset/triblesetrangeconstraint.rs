@@ -31,6 +31,10 @@ pub struct TribleSetRangeConstraint {
     min: RawValue,
     max: RawValue,
     set: TribleSet,
+    // Range bounds are constant and the set's VEA trie does not mutate during
+    // query execution, so the estimate is a pure function of construction-time
+    // inputs. Cache it to avoid re-walking the trie on every propose/confirm.
+    cached_estimate: usize,
 }
 
 impl TribleSetRangeConstraint {
@@ -40,11 +44,16 @@ impl TribleSetRangeConstraint {
         max: Value<V>,
         set: TribleSet,
     ) -> Self {
+        let cached_estimate = set
+            .vea
+            .count_range::<0, VALUE_LEN>(&[0u8; 0], &min.raw, &max.raw)
+            .min(usize::MAX as u64) as usize;
         TribleSetRangeConstraint {
             variable_v: variable_v.index,
             min: min.raw,
             max: max.raw,
             set,
+            cached_estimate,
         }
     }
 }
@@ -58,14 +67,7 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
         if variable != self.variable_v {
             return None;
         }
-        // Use count_range on the VEA index for an accurate estimate.
-        // This counts leaves in the byte range using cached branch counts,
-        // visiting only boundary nodes — O(depth × branching) not O(n).
-        let count = self
-            .set
-            .vea
-            .count_range::<0, VALUE_LEN>(&[0u8; 0], &self.min, &self.max);
-        Some(count.min(usize::MAX as u64) as usize)
+        Some(self.cached_estimate)
     }
 
     fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
