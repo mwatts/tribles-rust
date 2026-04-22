@@ -10,6 +10,54 @@ dates are commit dates rather than release dates.
 
 ## Unreleased / pre-alpha
 
+### HNSW redesign: handle-keyed, binary-relation similarity
+
+Major API shift for HNSW / Flat indexes, aligning the shape with
+TribleSpace taste:
+
+- **Doc keys removed.** `HNSWBuilder`, `HNSWIndex`, `FlatBuilder`,
+  `FlatIndex`, `SuccinctHNSWIndex` (and their `Attached*`
+  wrappers) no longer carry a `D` generic or a separate doc-key
+  table. Each node **is** a `Handle<Blake3, Embedding>` — the
+  caller's mapping from doc → embedding lives as a trible they
+  own, not as a shadow datamodel inside the index.
+- **New insert signature:** `HNSWBuilder::insert(handle, vec)` /
+  `FlatBuilder::insert(handle)`. No doc-key argument.
+- **Similarity is a binary relation.** The four old constraint
+  types (`SimilarToVector`, `SimilarToVectorScored`,
+  `SimilarToVectorHNSW`, `SimilarToVectorHNSWScored`) are
+  replaced by a single [`Similar<'_, I>`][s] constraint
+  produced by the `similar(a, b, score_floor)` method on each
+  attached view. Both `a` and `b` are `Variable<Handle<Blake3,
+  Embedding>>`; at least one must be bound at query time. The
+  relation is symmetric (cosine is symmetric), approximate
+  through HNSW.
+- **Score is fixed, not a variable.** `score_floor: f32` is a
+  query parameter pinned at constraint construction. Callers
+  who need the exact score fetch both embeddings and compute
+  cosine directly (no u16 quantization, no dedupe gymnastics).
+- **`SimilaritySearch` trait** unifies `AttachedHNSWIndex`,
+  `AttachedFlatIndex`, and `AttachedSuccinctHNSWIndex` behind
+  the constraint — two methods (`neighbours_above`,
+  `cosine_between`), infallible at the trait boundary (fetch
+  failures fail-open as "no match" per engine protocol).
+- **`candidates_above(handle, floor)`** is the core inherent
+  primitive the constraint wraps. Exposed on every attached
+  view for direct callers who want the walk without the
+  constraint. Bounded by `ef_search` (default 200, override
+  with `.with_ef_search(n)`).
+- **Blob schema rotations.** `SuccinctHNSWBlob::ID` rotates to
+  `A96890DE5F85A4F2285C365549B21BC2` (retires
+  `27D71A473EF22DA4D916F61810AC5D86`) to reflect the
+  handles-only blob layout — no keys section, header shrinks
+  from 144 B to 128 B.
+- **Embedding implements `ConstDescribe`** so callers can
+  declare `Handle<Blake3, Embedding>` attributes via the
+  `attributes!` macro (see the updated `compose_hnsw_and_pattern`
+  / `hybrid_search` examples).
+
+[s]: triblespace_search::constraint::Similar
+
 ### Blob types (the shipped surface)
 
 - **`SuccinctBM25Index`** (blob schema `SuccinctBM25Blob`, id

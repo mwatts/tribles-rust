@@ -24,7 +24,6 @@ use std::time::Instant;
 use anybytes::area::ByteArea;
 
 use triblespace::core::blob::{BlobCache, MemoryBlobStore};
-use triblespace::core::id::Id;
 use triblespace::core::repo::BlobStore;
 use triblespace::core::value::schemas::hash::{Blake3, Handle};
 use triblespace::core::value::Value;
@@ -32,7 +31,7 @@ use triblespace::core::value::Value;
 use triblespace_search::hnsw::HNSWBuilder;
 use triblespace_search::ring::RingGraph;
 use triblespace_search::schemas::{put_embedding, Embedding};
-use triblespace_search::succinct::{SuccinctGraph, SuccinctHNSWIndex};
+use triblespace_search::succinct::SuccinctGraph;
 
 /// SplitMix64 — deterministic, no extra deps.
 struct Rng(u64);
@@ -47,12 +46,6 @@ impl Rng {
     fn f32_pm1(&mut self) -> f32 {
         (self.next() as i32 as f32) / (i32::MAX as f32)
     }
-}
-
-fn id_for(i: u32) -> Id {
-    let mut raw = [0u8; 16];
-    raw[..4].copy_from_slice(&(i.max(1)).to_le_bytes());
-    Id::new(raw).unwrap()
 }
 
 /// Build an HNSW index at the given scale. Returns the
@@ -70,10 +63,10 @@ fn build_hnsw(
     let mut rng = Rng(seed);
     let mut store = MemoryBlobStore::<Blake3>::new();
     let mut b = HNSWBuilder::new(dim).with_seed(seed);
-    for i in 0..n {
+    for _ in 0..n {
         let vec: Vec<f32> = (0..dim).map(|_| rng.f32_pm1()).collect();
         let h = put_embedding::<_, Blake3>(&mut store, vec.clone()).unwrap();
-        b.insert(&id_for(i as u32 + 1), h, vec).unwrap();
+        b.insert(h, vec).unwrap();
     }
     (b.build_naive(), store)
 }
@@ -442,8 +435,4 @@ fn main() {
     // Keep the ignore-but-available; 100k gets slow on build
     // in the example but you can uncomment if you want.
     // bench(100_000, 128, 10, 50, 0xFACE);
-    // Keep `SuccinctHNSWIndex` import alive.
-    let _ = SuccinctHNSWIndex::<
-        triblespace::core::value::schemas::genid::GenId,
-    >::try_from_bytes;
 }

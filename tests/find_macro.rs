@@ -231,54 +231,58 @@ fn find_docs_and_scores_on_succinct() {
     }
 }
 
-/// The succinct HNSW view answers `find!` queries identically
-/// to the naive one — proves the `HNSWQueryable` trait plugs the
-/// succinct path into the engine. 16 vectors, fixed seed, one
-/// query: top-3 must be the same doc set on both.
+/// The succinct HNSW view plugs into `find!` via the binary
+/// [`Similar`] relation. Declare two handle variables, pin the
+/// first to a known handle with `.is()`, let the engine
+/// enumerate the second from the HNSW walk, and cross-check
+/// against the direct `candidates_above` API.
+///
+/// [`Similar`]: triblespace_search::constraint::Similar
 #[test]
 fn find_hnsw_similar_on_succinct() {
     use std::collections::HashSet;
     use triblespace::core::blob::MemoryBlobStore;
-    use triblespace::core::id::Id as TId;
     use triblespace::core::repo::BlobStore;
-    use triblespace::core::value::schemas::hash::Blake3;
+    use triblespace::core::value::schemas::hash::{Blake3, Handle};
+    use triblespace::core::value::Value;
     use triblespace_search::hnsw::HNSWBuilder;
-    use triblespace_search::schemas::put_embedding;
-
-    fn iid(byte: u8) -> TId {
-        TId::new([byte; 16]).unwrap()
-    }
+    use triblespace_search::schemas::{put_embedding, Embedding};
 
     let mut store = MemoryBlobStore::<Blake3>::new();
     let mut b = HNSWBuilder::new(4).with_seed(23);
+    let mut handles = Vec::new();
     for i in 1..=16u8 {
         let f = i as f32;
         let v = vec![f.sin(), f.cos(), (f * 0.5).sin(), (f * 0.3).cos()];
         let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
-        b.insert(&iid(i), h, v).unwrap();
+        b.insert(h, v).unwrap();
+        handles.push(h);
     }
     let succinct = b.build();
     let reader = store.reader().unwrap();
-    let query = vec![0.5, -0.2, 0.3, 0.7];
-
     let succinct_view = succinct.attach(&reader);
-    let rows: Vec<(Id,)> = find!(
-        (doc: Id),
-        succinct_view
-            .similar_constraint(doc, query.clone(), 3, Some(10))
-            .unwrap()
+    let probe = handles[0];
+    let floor = 0.4f32;
+
+    let rows: Vec<(Value<Handle<Blake3, Embedding>>,)> = find!(
+        (
+            neighbour: Value<Handle<Blake3, Embedding>>,
+        ),
+        triblespace::core::query::temp!(
+            (anchor),
+            triblespace::core::and!(
+                anchor.is(probe),
+                succinct_view.similar(anchor, neighbour, floor)
+            )
+        )
     )
     .collect();
-    let got: HashSet<Id> = rows.into_iter().map(|(d,)| d).collect();
-    // Cross-check the engine's result set against direct
-    // `similar_ids` on the same index — same index, same query,
-    // same answers. Proves the constraint plumbing doesn't drop
-    // or reorder rows relative to the direct API.
-    let expected: HashSet<Id> = succinct_view
-        .similar_ids(&query, 3, Some(10))
+    let got: HashSet<_> = rows.into_iter().map(|(h,)| h).collect();
+
+    let expected: HashSet<_> = succinct_view
+        .candidates_above(probe, floor)
         .unwrap()
         .into_iter()
-        .map(|(d, _)| d)
         .collect();
     assert_eq!(got, expected);
 }

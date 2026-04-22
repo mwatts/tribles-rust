@@ -104,6 +104,12 @@ impl ConstId for Embedding {
 
 impl BlobSchema for Embedding {}
 
+// ConstDescribe uses the default impl (an empty metadata
+// fragment keyed on the schema's ConstId) — it just has to
+// exist so `attributes!` can declare attributes whose value
+// type is `Handle<Blake3, Embedding>`.
+impl triblespace::core::metadata::ConstDescribe for Embedding {}
+
 /// Decode a blob back into a zero-copy `View<[f32]>`. Fails
 /// iff the blob's byte length isn't a multiple of 4 (malformed)
 /// or the backing buffer can't be aligned to `f32`.

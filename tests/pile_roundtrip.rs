@@ -71,17 +71,20 @@ fn succinct_bm25_survives_blob_store_roundtrip() {
 
 #[test]
 fn succinct_hnsw_survives_blob_store_roundtrip() {
+    use std::collections::HashSet;
     use triblespace::core::value::schemas::hash::Blake3;
     use triblespace_search::schemas::put_embedding;
 
     // Build a small HNSW index.
     let mut store = MemoryBlobStore::<Blake3>::new();
     let mut b = HNSWBuilder::new(4).with_seed(9);
+    let mut handles = Vec::new();
     for i in 1..=12u8 {
         let f = i as f32;
         let v = vec![f.sin(), f.cos(), (f * 0.5).sin(), (f * 0.3).cos()];
         let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
-        b.insert(&iid(i), h, v).unwrap();
+        b.insert(h, v).unwrap();
+        handles.push(h);
     }
     let original = b.build();
 
@@ -102,66 +105,66 @@ fn succinct_hnsw_survives_blob_store_roundtrip() {
     assert_eq!(reloaded.dim(), original.dim());
     assert_eq!(reloaded.max_level(), original.max_level());
 
-    // Same top-3 for the same query — both attach to the same
-    // reader so the embedding-handle lookups resolve against
-    // the same backing pile.
-    let q = vec![0.5, -0.2, 0.3, 0.7];
-    let a = original.attach(&reader).similar(&q, 3, Some(10)).unwrap();
-    let r = reloaded.attach(&reader).similar(&q, 3, Some(10)).unwrap();
-    assert_eq!(a.len(), r.len());
-    for ((a_id, a_s), (r_id, r_s)) in a.iter().zip(r.iter()) {
-        assert_eq!(a_id, r_id);
-        assert!(
-            (a_s - r_s).abs() < 1e-5,
-            "score drift after pile round-trip: {a_s} vs {r_s}"
-        );
-    }
+    // Same above-threshold set for the same probe handle — both
+    // attach to the same reader so the embedding-handle lookups
+    // resolve against the same backing pile.
+    let probe = handles[0];
+    let a: HashSet<_> = original
+        .attach(&reader)
+        .candidates_above(probe, 0.4)
+        .unwrap()
+        .into_iter()
+        .collect();
+    let r: HashSet<_> = reloaded
+        .attach(&reader)
+        .candidates_above(probe, 0.4)
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert_eq!(a, r, "pile round-trip diverged on {probe:?}");
 }
 
 /// The `Embedding` blob schema is content-addressed, so two
-/// HNSW indexes that embed the same vectors under the same
-/// entities end up with the same handles — and share the same
-/// underlying blobs in the store. This is the load-bearing
-/// property behind the handle-indirected design; explicitly
-/// test it.
+/// HNSW indexes that embed the same vectors end up with the same
+/// handles — and share the same underlying blobs in the store.
+/// Explicitly test that load-bearing property.
 #[test]
 fn hnsw_indexes_share_embedding_blobs() {
     use triblespace::core::repo::BlobStore;
     use triblespace::core::value::schemas::hash::Blake3;
     use triblespace_search::schemas::put_embedding;
 
-    let embeddings: Vec<(Id, Vec<f32>)> = vec![
-        (iid(1), vec![1.0, 0.0, 0.0, 0.0]),
-        (iid(2), vec![0.0, 1.0, 0.0, 0.0]),
-        (iid(3), vec![0.0, 0.0, 1.0, 0.0]),
+    let vecs = [
+        vec![1.0f32, 0.0, 0.0, 0.0],
+        vec![0.0, 1.0, 0.0, 0.0],
+        vec![0.0, 0.0, 1.0, 0.0],
     ];
 
     // Build two independent HNSW indexes over the same
     // embeddings. Each index owns its own graph state (M / M0,
-    // seed, neighbour lists), but the handles they store for
-    // each entity must be identical — content-addressing is
-    // deterministic on normalized bytes.
+    // seed, neighbour lists), but the stored handles must be
+    // identical — content-addressing is deterministic on
+    // normalized bytes.
     let mut store = MemoryBlobStore::<Blake3>::new();
 
     let mut a_b = HNSWBuilder::new(4).with_seed(1);
-    for (pid, v) in &embeddings {
+    for v in &vecs {
         let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
-        a_b.insert(&*pid, h, v.clone()).unwrap();
+        a_b.insert(h, v.clone()).unwrap();
     }
-    // Use `build_naive()` here because the test inspects
-    // `handles()[i]` directly, which only the naive index
-    // exposes — the succinct form wraps handles in a
+    // `build_naive()` so the test can inspect `handles()[i]`
+    // directly — the succinct form wraps handles in a
     // `FixedBytesTable`.
     let idx_a = a_b.build_naive();
 
     let mut b_b = HNSWBuilder::new(4).with_seed(99); // different seed!
-    for (pid, v) in &embeddings {
+    for v in &vecs {
         let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
-        b_b.insert(&*pid, h, v.clone()).unwrap();
+        b_b.insert(h, v.clone()).unwrap();
     }
     let idx_b = b_b.build_naive();
 
-    // Handles must be identical per-entity.
+    // Handles must be identical in the same slot order.
     assert_eq!(idx_a.doc_count(), idx_b.doc_count());
     for i in 0..idx_a.doc_count() {
         assert_eq!(
@@ -182,13 +185,12 @@ fn hnsw_indexes_share_embedding_blobs() {
         reader.len()
     );
 
-    // Both indexes, attached to the same reader, agree on top-1
-    // for the [1,0,0,0] query — entity 1 (exact match) —
-    // without any extra storage. HNSW graph differences can
-    // reorder ties lower down, but the exact match is stable.
-    let q = vec![1.0, 0.0, 0.0, 0.0];
-    let top_a = idx_a.attach(&reader).similar_ids(&q, 1, Some(10)).unwrap();
-    let top_b = idx_b.attach(&reader).similar_ids(&q, 1, Some(10)).unwrap();
-    assert_eq!(top_a[0].0, iid(1));
-    assert_eq!(top_b[0].0, iid(1));
+    // Both indexes, attached to the same reader, find the shared
+    // handle when probed from it — the exact match is always
+    // above any finite threshold.
+    let probe = idx_a.handles()[0];
+    let hits_a = idx_a.attach(&reader).candidates_above(probe, 0.99).unwrap();
+    let hits_b = idx_b.attach(&reader).candidates_above(probe, 0.99).unwrap();
+    assert!(hits_a.contains(&probe));
+    assert!(hits_b.contains(&probe));
 }

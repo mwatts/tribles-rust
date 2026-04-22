@@ -75,6 +75,7 @@ fn succinct_bm25_survives_pile_round_trip() {
 
 #[test]
 fn succinct_hnsw_survives_pile_round_trip() {
+    use std::collections::HashSet;
     use triblespace::core::value::schemas::hash::Blake3;
     use triblespace_search::schemas::put_embedding;
 
@@ -82,16 +83,18 @@ fn succinct_hnsw_survives_pile_round_trip() {
     let pile_path = dir.path().join("hnsw.pile");
     std::fs::File::create(&pile_path).expect("create pile file");
 
-    let (original, handle) = {
+    let (original, probe, handle) = {
         let mut pile = Pile::<Blake3>::open(&pile_path).expect("open pile");
         pile.refresh().expect("refresh empty pile");
 
         let mut b = HNSWBuilder::new(4).with_seed(19);
+        let mut handles = Vec::new();
         for i in 1..=12u8 {
             let f = i as f32;
             let v = vec![f.sin(), f.cos(), (f * 0.5).sin(), (f * 0.3).cos()];
             let h = put_embedding::<_, Blake3>(&mut pile, v.clone()).unwrap();
-            b.insert(&iid(i), h, v).unwrap();
+            b.insert(h, v).unwrap();
+            handles.push(h);
         }
         let original = b.build();
 
@@ -99,7 +102,7 @@ fn succinct_hnsw_survives_pile_round_trip() {
             .put::<SuccinctHNSWBlob, _>(&original)
             .expect("put SH25");
         pile.flush().expect("flush");
-        (original, handle)
+        (original, handles[0], handle)
     };
 
     let mut pile = Pile::<Blake3>::open(&pile_path).expect("reopen pile");
@@ -112,15 +115,17 @@ fn succinct_hnsw_survives_pile_round_trip() {
     assert_eq!(reloaded.doc_count(), original.doc_count());
     assert_eq!(reloaded.dim(), original.dim());
 
-    let q = vec![0.5, -0.2, 0.3, 0.7];
-    let a = original.attach(&reader).similar(&q, 3, Some(10)).unwrap();
-    let r = reloaded.attach(&reader).similar(&q, 3, Some(10)).unwrap();
-    assert_eq!(a.len(), r.len());
-    for ((a_id, a_s), (r_id, r_s)) in a.iter().zip(r.iter()) {
-        assert_eq!(a_id, r_id);
-        assert!(
-            (a_s - r_s).abs() < 1e-5,
-            "score drift on-disk: {a_s} vs {r_s}"
-        );
-    }
+    let a: HashSet<_> = original
+        .attach(&reader)
+        .candidates_above(probe, 0.4)
+        .unwrap()
+        .into_iter()
+        .collect();
+    let r: HashSet<_> = reloaded
+        .attach(&reader)
+        .candidates_above(probe, 0.4)
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert_eq!(a, r, "on-disk round-trip diverged");
 }

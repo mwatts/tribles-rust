@@ -108,9 +108,9 @@ fn bm25_1k_docs_multi_term_ranks_sanely() {
 #[test]
 fn hnsw_1k_vectors_recall_against_flat() {
     // Build the same 1k 32-dim vectors into both Flat (ground
-    // truth) and HNSW, then check HNSW's top-10 recalls at least
-    // 70% of Flat's top-10 across several queries. Plus confirm
-    // the HNSW blob round-trips cleanly.
+    // truth) and HNSW, then check that HNSW's above-threshold set
+    // recalls at least 70% of Flat's above-threshold set for a
+    // few probe handles.
     use std::collections::HashSet;
 
     const N_DOCS: usize = 1_000;
@@ -125,43 +125,41 @@ fn hnsw_1k_vectors_recall_against_flat() {
     let mut store = MemoryBlobStore::<Blake3>::new();
     let mut flat_b = FlatBuilder::new(DIM);
     let mut hnsw_b = HNSWBuilder::new(DIM).with_seed(7);
-    for i in 0..N_DOCS {
+    let mut handles = Vec::with_capacity(N_DOCS);
+    for _ in 0..N_DOCS {
         let vec: Vec<f32> = (0..DIM)
             .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
             .collect();
-        let doc = id_from_u64((i + 1) as u64);
         let h = put_embedding::<_, Blake3>(&mut store, vec.clone()).unwrap();
-        flat_b.insert(&doc, h);
-        hnsw_b.insert(&doc, h, vec).unwrap();
+        flat_b.insert(h);
+        hnsw_b.insert(h, vec).unwrap();
+        handles.push(h);
     }
     let flat = flat_b.build();
     let hnsw = hnsw_b.build();
     let reader = store.reader().unwrap();
     let flat_view = flat.attach(&reader);
-    let hnsw_view = hnsw.attach(&reader);
+    let hnsw_view = hnsw.attach(&reader).with_ef_search(100);
 
-    let mut total_overlap = 0;
-    let mut total_k = 0;
-    for _ in 0..5 {
-        let q: Vec<f32> = (0..DIM)
-            .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
-            .collect();
+    let floor = 0.4f32;
+    let mut total_truth = 0usize;
+    let mut total_overlap = 0usize;
+    for probe in handles.iter().take(5) {
         let truth: HashSet<_> = flat_view
-            .similar(&q, 10)
+            .candidates_above(*probe, floor)
             .unwrap()
             .into_iter()
-            .map(|(d, _)| d)
             .collect();
         let got: HashSet<_> = hnsw_view
-            .similar(&q, 10, Some(100))
+            .candidates_above(*probe, floor)
             .unwrap()
             .into_iter()
-            .map(|(d, _)| d)
             .collect();
+        total_truth += truth.len();
         total_overlap += truth.intersection(&got).count();
-        total_k += 10;
     }
-    let recall = total_overlap as f32 / total_k as f32;
+    assert!(total_truth > 0, "fixture: floor excluded everything");
+    let recall = total_overlap as f32 / total_truth as f32;
     assert!(
         recall >= 0.7,
         "HNSW 1k-doc recall {recall:.2} below 0.7 threshold"
@@ -239,13 +237,14 @@ fn succinct_bm25_1k_docs_matches_naive() {
     }
 }
 
-/// Succinct HNSW must answer the same top-k as the naive one for
-/// a 1k-vector corpus. This is the scale-level sanity check for
-/// the succinct graph + vector encoding — any off-by-one in
-/// offsets / vector indexing shows up as divergent results.
+/// Succinct HNSW must answer the same above-threshold set as the
+/// naive backend for a 1k-vector corpus. This is the scale-level
+/// sanity check for the succinct graph encoding — any off-by-one
+/// in offsets / handles indexing shows up as divergent results.
 #[test]
 fn succinct_hnsw_1k_docs_matches_naive() {
     const DIM: usize = 16;
+    use std::collections::HashSet;
 
     use triblespace::core::blob::MemoryBlobStore;
     use triblespace::core::repo::BlobStore;
@@ -255,35 +254,34 @@ fn succinct_hnsw_1k_docs_matches_naive() {
     let mut rng = SplitMix64(0xBADF00D);
     let mut store = MemoryBlobStore::<Blake3>::new();
     let mut builder = HNSWBuilder::new(DIM).with_seed(11);
-    for i in 0..1_000 {
+    let mut handles = Vec::new();
+    for _ in 0..1_000 {
         let vec: Vec<f32> = (0..DIM)
             .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
             .collect();
         let h = put_embedding::<_, Blake3>(&mut store, vec.clone()).unwrap();
-        builder
-            .insert(&id_from_u64((i + 1) as u64), h, vec)
-            .unwrap();
+        builder.insert(h, vec).unwrap();
+        handles.push(h);
     }
     let naive = builder.build_naive();
     let succinct = SuccinctHNSWIndex::from_naive(&naive).unwrap();
     let reader = store.reader().unwrap();
-    let naive_view = naive.attach(&reader);
-    let succinct_view = succinct.attach(&reader);
+    let naive_view = naive.attach(&reader).with_ef_search(50);
+    let succinct_view = succinct.attach(&reader).with_ef_search(50);
 
-    for _ in 0..5 {
-        let q: Vec<f32> = (0..DIM)
-            .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
+    let floor = 0.4f32;
+    for probe in handles.iter().take(5) {
+        let n: HashSet<_> = naive_view
+            .candidates_above(*probe, floor)
+            .unwrap()
+            .into_iter()
             .collect();
-        let n = naive_view.similar(&q, 10, Some(50)).unwrap();
-        let s = succinct_view.similar(&q, 10, Some(50)).unwrap();
-        assert_eq!(n.len(), s.len());
-        for ((n_id, n_s), (s_id, s_s)) in n.iter().zip(s.iter()) {
-            assert_eq!(n_id, s_id, "doc mismatch at 1k scale");
-            assert!(
-                (n_s - s_s).abs() < 1e-5,
-                "score mismatch at 1k scale: {n_s} vs {s_s}"
-            );
-        }
+        let s: HashSet<_> = succinct_view
+            .candidates_above(*probe, floor)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(n, s, "backend divergence at 1k scale for {probe:?}");
     }
 }
 
@@ -419,7 +417,7 @@ fn bm25_quantization_preserves_top10() {
 }
 
 #[test]
-fn flat_1k_vectors_top_k_consistent() {
+fn flat_1k_vectors_threshold_finds_self() {
     const N_DOCS: usize = 1_000;
     const DIM: usize = 32;
 
@@ -431,31 +429,29 @@ fn flat_1k_vectors_top_k_consistent() {
     let mut rng = SplitMix64(0x1234_5678);
     let mut store = MemoryBlobStore::<Blake3>::new();
     let mut builder = FlatBuilder::new(DIM);
-    let target = id_from_u64(42);
-    // One vector we know the answer for — all ones in the first
-    // half, zero in the second — and 999 random neighbours.
+    // One target vector we know the answer for — all ones in the
+    // first half, zero in the second — plus 999 random neighbours.
     let mut target_vec = vec![0.0f32; DIM];
     for v in target_vec.iter_mut().take(DIM / 2) {
         *v = 1.0;
     }
-    let h_target = put_embedding::<_, Blake3>(&mut store, target_vec.clone()).unwrap();
-    builder.insert(&target, h_target);
-    for i in 0..(N_DOCS - 1) {
+    let h_target = put_embedding::<_, Blake3>(&mut store, target_vec).unwrap();
+    builder.insert(h_target);
+    for _ in 0..(N_DOCS - 1) {
         let vec: Vec<f32> = (0..DIM)
             .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
             .collect();
         let h = put_embedding::<_, Blake3>(&mut store, vec).unwrap();
-        builder.insert(&id_from_u64(i as u64 + 100), h);
+        builder.insert(h);
     }
     let idx = builder.build();
     let reader = store.reader().unwrap();
 
-    // The exact `target_vec` as a query should return `target` at
-    // rank 1.
-    let hits = idx.attach(&reader).similar_ids(&target_vec, 5).unwrap();
-    assert_eq!(hits.len(), 5);
-    assert_eq!(hits[0].0, target);
+    // Probing from the target handle at a very tight threshold
+    // finds it (cos=1.0 against itself).
+    let hits = idx.attach(&reader).candidates_above(h_target, 0.999).unwrap();
+    assert!(hits.contains(&h_target));
 
-    // Sanity: byte_size grows linearly with doc count.
-    assert_eq!(idx.byte_size(), 24 + idx.doc_count() * 64);
+    // Sanity: byte_size grows linearly with handle count.
+    assert_eq!(idx.byte_size(), 24 + idx.doc_count() * 32);
 }

@@ -800,7 +800,6 @@ impl SuccinctGraph {
 ///
 /// ```
 /// use triblespace::core::blob::MemoryBlobStore;
-/// use triblespace::core::id::Id;
 /// use triblespace::core::repo::BlobStore;
 /// use triblespace::core::value::schemas::hash::Blake3;
 /// use triblespace_search::hnsw::HNSWBuilder;
@@ -809,66 +808,59 @@ impl SuccinctGraph {
 ///
 /// let mut store = MemoryBlobStore::<Blake3>::new();
 /// let mut b = HNSWBuilder::new(4).with_seed(1);
-/// for (byte, v) in [
-///     (1u8, vec![1.0f32, 0.0, 0.0, 0.0]),
-///     (2, vec![0.0, 1.0, 0.0, 0.0]),
-///     (3, vec![0.9, 0.1, 0.0, 0.0]),
+/// let mut handles = Vec::new();
+/// for v in [
+///     vec![1.0f32, 0.0, 0.0, 0.0],
+///     vec![0.0, 1.0, 0.0, 0.0],
+///     vec![0.9, 0.1, 0.0, 0.0],
 /// ] {
 ///     let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
-///     b.insert(&Id::new([byte; 16]).unwrap(), h, v).unwrap();
+///     b.insert(h, v).unwrap();
+///     handles.push(h);
 /// }
 /// let idx: SuccinctHNSWIndex = b.build();
 ///
 /// let reader = store.reader().unwrap();
-/// let q = vec![1.0, 0.0, 0.0, 0.0];
-/// let hits = idx.attach(&reader).similar_ids(&q, 2, Some(10)).unwrap();
-/// assert_eq!(hits.len(), 2);
-/// // doc 1 is an exact cosine match, doc 3 nearly so.
-/// assert_eq!(hits[0].0, Id::new([1; 16]).unwrap());
+/// let hits = idx.attach(&reader).candidates_above(handles[0], 0.8).unwrap();
+/// assert!(hits.contains(&handles[0]));
+/// assert!(hits.contains(&handles[2]));  // 0.9*1 + 0.1*0 ≈ 0.994
 /// ```
-pub struct SuccinctHNSWIndex<D: ValueSchema = triblespace::core::value::schemas::genid::GenId> {
+pub struct SuccinctHNSWIndex {
     dim: usize,
     m: u16,
     m0: u16,
     max_level: u8,
     entry_point: Option<u32>,
-    keys: FixedBytesTable<32>,
     /// Content-addressed pointer to each node's [`Embedding`]
-    /// blob. Paired index-wise with `keys`. Distance
-    /// evaluations resolve handles through a caller-supplied
-    /// [`BlobStoreGet`][g] at query time.
+    /// blob. The node IS the handle — no separate doc-key
+    /// identity. Distance evaluations resolve handles through
+    /// a caller-supplied [`BlobStoreGet`][g] at query time.
     ///
     /// [g]: triblespace::core::repo::BlobStoreGet
     handles: FixedBytesTable<32>,
     graph: SuccinctGraph,
-    _phantom: std::marker::PhantomData<D>,
 }
 
-impl<D: ValueSchema> std::fmt::Debug for SuccinctHNSWIndex<D> {
+impl std::fmt::Debug for SuccinctHNSWIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SuccinctHNSWIndex")
-            .field("n_docs", &self.keys.len())
+            .field("n_nodes", &self.handles.len())
             .field("dim", &self.dim)
             .field("max_level", &self.max_level)
             .finish()
     }
 }
 
-impl<D: ValueSchema> SuccinctHNSWIndex<D> {
+impl SuccinctHNSWIndex {
     /// Re-encode a naive [`HNSWIndex`] into the succinct form.
-    pub fn from_naive(idx: &HNSWIndex<D>) -> Result<Self, SuccinctDocLensError> {
+    pub fn from_naive(idx: &HNSWIndex) -> Result<Self, SuccinctDocLensError> {
         let n = idx.doc_count();
         let dim = idx.dim();
         let max_level = idx.max_level();
         let n_layers = max_level as usize + 1;
 
-        // keys: 32-byte RawValue table.
-        let key_rows: Vec<RawValue> = idx.keys().to_vec();
-        let keys_bytes = FixedBytesTable::<32>::build(&key_rows);
-        let keys = FixedBytesTable::<32>::from_bytes(keys_bytes, n)?;
-
         // handles: 32-byte content-addressed pointers to
-        // Embedding blobs. Index-parallel to `keys`.
+        // Embedding blobs.
         let handle_rows: Vec<RawValue> = idx.handles().iter().map(|h| h.raw).collect();
         let handles_bytes = FixedBytesTable::<32>::build(&handle_rows);
         let handles = FixedBytesTable::<32>::from_bytes(handles_bytes, n)?;
@@ -896,10 +888,8 @@ impl<D: ValueSchema> SuccinctHNSWIndex<D> {
             m0: idx.m0(),
             max_level,
             entry_point: idx.entry_point(),
-            keys,
             handles,
             graph,
-            _phantom: std::marker::PhantomData,
         })
     }
 
@@ -907,9 +897,9 @@ impl<D: ValueSchema> SuccinctHNSWIndex<D> {
     pub fn dim(&self) -> usize {
         self.dim
     }
-    /// Number of indexed documents.
+    /// Number of nodes in the graph.
     pub fn doc_count(&self) -> usize {
-        self.keys.len()
+        self.handles.len()
     }
     /// Max neighbours per non-zero layer.
     pub fn m(&self) -> u16 {
@@ -930,7 +920,7 @@ impl<D: ValueSchema> SuccinctHNSWIndex<D> {
     /// ```ignore
     /// let idx: SuccinctHNSWIndex = reader.get(handle)?;
     /// let view = idx.attach(&reader);
-    /// view.similar(&q, k, ef)?;
+    /// view.candidates_above(from_handle, 0.8)?;
     /// ```
     ///
     /// The view wraps `store` in an internal
@@ -941,7 +931,7 @@ impl<D: ValueSchema> SuccinctHNSWIndex<D> {
     /// readers are cheap-clone.
     ///
     /// [c]: triblespace::core::blob::BlobCache
-    pub fn attach<'a, B>(&'a self, store: &B) -> AttachedSuccinctHNSWIndex<'a, B, D>
+    pub fn attach<'a, B>(&'a self, store: &B) -> AttachedSuccinctHNSWIndex<'a, B>
     where
         B: triblespace::core::repo::BlobStoreGet<
                 triblespace::core::value::schemas::hash::Blake3,
@@ -950,6 +940,7 @@ impl<D: ValueSchema> SuccinctHNSWIndex<D> {
         AttachedSuccinctHNSWIndex {
             index: self,
             cache: triblespace::core::blob::BlobCache::new(store.clone()),
+            ef_search: 200,
         }
     }
 
@@ -1001,13 +992,7 @@ impl<D: ValueSchema> SuccinctHNSWIndex<D> {
         let n_layers = self.graph.n_layers() as u64;
 
         // Re-serialize each body region so the blob owns its
-        // bytes end-to-end (the caller might have built this
-        // SuccinctHNSWIndex in-memory from a naive index).
-        let key_rows: Vec<RawValue> = (0..self.doc_count())
-            .map(|i| self.keys.get(i).copied().unwrap_or([0u8; 32]))
-            .collect();
-        let keys_bytes = FixedBytesTable::<32>::build(&key_rows);
-        let keys_flat: Vec<u8> = keys_bytes.as_ref().to_vec();
+        // bytes end-to-end.
         let handle_rows: Vec<RawValue> = (0..self.doc_count())
             .map(|i| self.handles.get(i).copied().unwrap_or([0u8; 32]))
             .collect();
@@ -1035,9 +1020,7 @@ impl<D: ValueSchema> SuccinctHNSWIndex<D> {
 
         // Section offsets inside the body (relative to end of
         // header).
-        let keys_off = 0u64;
-        let keys_len = keys_flat.len() as u64;
-        let handles_off = keys_off + keys_len;
+        let handles_off = 0u64;
         let handles_len = handles_flat.len() as u64;
         let graph_off = handles_off + handles_len;
         let graph_len = graph_region.len() as u64;
@@ -1045,7 +1028,7 @@ impl<D: ValueSchema> SuccinctHNSWIndex<D> {
         let body_len = graph_off + graph_len;
         let mut buf = Vec::with_capacity(SH25_HEADER_LEN + body_len as usize);
 
-        // ── header (144 B) ────────────────────────────────────
+        // ── header (128 B) ────────────────────────────────────
         buf.extend_from_slice(&(self.dim as u32).to_le_bytes()); // 4
         buf.extend_from_slice(&self.m.to_le_bytes()); // 2
         buf.extend_from_slice(&self.m0.to_le_bytes()); // 2
@@ -1059,8 +1042,6 @@ impl<D: ValueSchema> SuccinctHNSWIndex<D> {
         buf.extend_from_slice(&n_layers.to_le_bytes()); // 8
         buf.extend_from_slice(graph_neighbours_meta.as_bytes()); // 32
         buf.extend_from_slice(graph_offsets_meta.as_bytes()); // 32
-        buf.extend_from_slice(&keys_off.to_le_bytes()); // 8
-        buf.extend_from_slice(&keys_len.to_le_bytes()); // 8
         buf.extend_from_slice(&handles_off.to_le_bytes()); // 8
         buf.extend_from_slice(&handles_len.to_le_bytes()); // 8
         buf.extend_from_slice(&graph_off.to_le_bytes()); // 8
@@ -1068,7 +1049,6 @@ impl<D: ValueSchema> SuccinctHNSWIndex<D> {
         debug_assert_eq!(buf.len(), SH25_HEADER_LEN);
 
         // ── body ──────────────────────────────────────────────
-        buf.extend_from_slice(&keys_flat);
         buf.extend_from_slice(&handles_flat);
         buf.extend_from_slice(&graph_region);
         buf
@@ -1097,13 +1077,11 @@ impl<D: ValueSchema> SuccinctHNSWIndex<D> {
             .to_jerky();
 
         let read_u64 = |off: usize| u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
-        let keys_off = read_u64(96) as usize;
-        let keys_len = read_u64(104) as usize;
-        let handles_off = read_u64(112) as usize;
-        let handles_len = read_u64(120) as usize;
-        let graph_off = read_u64(128) as usize;
-        let graph_len = read_u64(136) as usize;
-        debug_assert_eq!(SH25_HEADER_LEN, 144);
+        let handles_off = read_u64(96) as usize;
+        let handles_len = read_u64(104) as usize;
+        let graph_off = read_u64(112) as usize;
+        let graph_len = read_u64(120) as usize;
+        debug_assert_eq!(SH25_HEADER_LEN, 128);
         let _ = dim; // dim stays header-only; no inline vectors.
 
         let body_start = SH25_HEADER_LEN;
@@ -1115,17 +1093,13 @@ impl<D: ValueSchema> SuccinctHNSWIndex<D> {
                 Ok(())
             }
         };
-        check(keys_off + keys_len, "keys")?;
         check(handles_off + handles_len, "handles")?;
         check(graph_off + graph_len, "graph")?;
 
         let body_bytes = Bytes::from_source(body.to_vec());
-        let keys_bytes = body_bytes.slice(keys_off..keys_off + keys_len);
         let handles_bytes = body_bytes.slice(handles_off..handles_off + handles_len);
         let graph_bytes = body_bytes.slice(graph_off..graph_off + graph_len);
 
-        let keys = FixedBytesTable::<32>::from_bytes(keys_bytes, n_nodes)
-            .map_err(|_| SuccinctLoadError::TruncatedSection("keys"))?;
         let handles = FixedBytesTable::<32>::from_bytes(handles_bytes, n_nodes)
             .map_err(|_| SuccinctLoadError::TruncatedSection("handles"))?;
 
@@ -1144,10 +1118,8 @@ impl<D: ValueSchema> SuccinctHNSWIndex<D> {
             m0,
             max_level,
             entry_point,
-            keys,
             handles,
             graph,
-            _phantom: std::marker::PhantomData,
         })
     }
 
@@ -1167,72 +1139,113 @@ impl<D: ValueSchema> SuccinctHNSWIndex<D> {
 /// view.
 ///
 /// [c]: triblespace::core::blob::BlobCache
-pub struct AttachedSuccinctHNSWIndex<
-    'a,
-    B,
-    D: ValueSchema = triblespace::core::value::schemas::genid::GenId,
->
+pub struct AttachedSuccinctHNSWIndex<'a, B>
 where
     B: triblespace::core::repo::BlobStoreGet<
             triblespace::core::value::schemas::hash::Blake3,
         >,
 {
-    index: &'a SuccinctHNSWIndex<D>,
+    index: &'a SuccinctHNSWIndex,
     cache: triblespace::core::blob::BlobCache<
         B,
         triblespace::core::value::schemas::hash::Blake3,
         crate::schemas::Embedding,
         anybytes::View<[f32]>,
     >,
+    ef_search: usize,
 }
 
-impl<'a, B, D: ValueSchema> AttachedSuccinctHNSWIndex<'a, B, D>
+impl<'a, B> AttachedSuccinctHNSWIndex<'a, B>
 where
     B: triblespace::core::repo::BlobStoreGet<
             triblespace::core::value::schemas::hash::Blake3,
         >,
 {
     /// Back-reference to the inner index.
-    pub fn index(&self) -> &SuccinctHNSWIndex<D> {
+    pub fn index(&self) -> &SuccinctHNSWIndex {
         self.index
     }
 
-    /// Constraint binding `doc` to top-`k` nearest neighbour
-    /// keys. Eagerly resolves top-`k` against the attached
-    /// store up front; iterate-methods on the returned
-    /// constraint don't re-scan.
-    pub fn similar_constraint(
-        &self,
-        doc: triblespace::core::query::Variable<D>,
-        query: Vec<f32>,
-        k: usize,
-        ef: Option<usize>,
-    ) -> Result<
-        crate::constraint::SimilarToVectorHNSW<D>,
-        B::GetError<anybytes::view::ViewError>,
-    > {
-        let top = self.similar(&query, k, ef)?;
-        let raw_top: Vec<(RawValue, f32)> = top.into_iter().map(|(v, s)| (v.raw, s)).collect();
-        Ok(crate::constraint::SimilarToVectorHNSW::from_top(doc, raw_top))
+    /// Override the search-beam width. Larger values trade
+    /// compute for recall on high-threshold queries. Default 200.
+    pub fn with_ef_search(mut self, ef: usize) -> Self {
+        self.ef_search = ef;
+        self
     }
 
-    /// Scored variant: binds both `doc` and cosine `score`.
-    pub fn similar_with_scores(
+    /// Build a symmetric similarity constraint over two handle
+    /// variables, gated by a fixed cosine `score_floor`. See
+    /// [`crate::constraint::Similar`] for semantics and the full
+    /// `find!` / `pattern!` integration.
+    pub fn similar(
         &self,
-        doc: triblespace::core::query::Variable<D>,
-        score: triblespace::core::query::Variable<crate::schemas::F32LE>,
-        query: Vec<f32>,
-        k: usize,
-        ef: Option<usize>,
+        a: triblespace::core::query::Variable<
+            triblespace::core::value::schemas::hash::Handle<
+                triblespace::core::value::schemas::hash::Blake3,
+                crate::schemas::Embedding,
+            >,
+        >,
+        b: triblespace::core::query::Variable<
+            triblespace::core::value::schemas::hash::Handle<
+                triblespace::core::value::schemas::hash::Blake3,
+                crate::schemas::Embedding,
+            >,
+        >,
+        score_floor: f32,
+    ) -> crate::constraint::Similar<'_, Self> {
+        crate::constraint::Similar::new(self, a, b, score_floor)
+    }
+
+    /// Walk the graph from `from_handle`'s embedding and return
+    /// every handle whose cosine similarity is at least
+    /// `score_floor`. The core primitive the similarity
+    /// constraint calls; exposed for tests and for callers who
+    /// want the walk without the constraint wrapper.
+    ///
+    /// Bound by the view's `ef_search` (default 200) — callers
+    /// pushing lots of above-threshold results need a wider
+    /// beam via [`with_ef_search`][Self::with_ef_search].
+    pub fn candidates_above(
+        &self,
+        from_handle: triblespace::core::value::Value<
+            triblespace::core::value::schemas::hash::Handle<
+                triblespace::core::value::schemas::hash::Blake3,
+                crate::schemas::Embedding,
+            >,
+        >,
+        score_floor: f32,
     ) -> Result<
-        crate::constraint::SimilarToVectorHNSWScored<D>,
+        Vec<
+            triblespace::core::value::Value<
+                triblespace::core::value::schemas::hash::Handle<
+                    triblespace::core::value::schemas::hash::Blake3,
+                    crate::schemas::Embedding,
+                >,
+            >,
+        >,
         B::GetError<anybytes::view::ViewError>,
     > {
-        let top = self.similar(&query, k, ef)?;
-        let raw_top: Vec<(RawValue, f32)> = top.into_iter().map(|(v, s)| (v.raw, s)).collect();
-        Ok(crate::constraint::SimilarToVectorHNSWScored::from_top(
-            doc, score, raw_top,
-        ))
+        let Some(entry) = self.index.entry_point else {
+            return Ok(Vec::new());
+        };
+        let from = self.cache.get(from_handle)?;
+        let query: Vec<f32> = from.as_ref().as_ref().to_vec();
+        if query.len() != self.index.dim {
+            return Ok(Vec::new());
+        }
+        let mut curr = entry;
+        for lvl in (1..=self.index.max_level).rev() {
+            curr = self.greedy_search_layer(&query, curr, lvl)?;
+        }
+        let candidates = self.search_layer(&query, curr, self.ef_search, 0)?;
+        Ok(candidates
+            .into_iter()
+            .filter(|(_, dist)| 1.0 - dist >= score_floor)
+            .map(|(i, _)| {
+                let raw = *self.index.handles.get(i as usize).expect("in range");
+                triblespace::core::value::Value::new(raw)
+            })
+            .collect())
     }
 
     fn dist_to(
@@ -1249,40 +1262,6 @@ where
         > = triblespace::core::value::Value::new(raw);
         let view = self.cache.get(handle)?;
         Ok(crate::hnsw::cosine_dist(q, view.as_ref().as_ref()))
-    }
-
-    /// Approximate top-k nearest neighbours to `query`.
-    pub fn similar(
-        &self,
-        query: &[f32],
-        k: usize,
-        ef: Option<usize>,
-    ) -> Result<Vec<(Value<D>, f32)>, B::GetError<anybytes::view::ViewError>> {
-        if query.len() != self.index.dim || k == 0 {
-            return Ok(Vec::new());
-        }
-        let Some(entry) = self.index.entry_point else {
-            return Ok(Vec::new());
-        };
-        let mut q = query.to_vec();
-        crate::hnsw::normalize(&mut q);
-        let ef = ef.unwrap_or(k).max(k);
-
-        let mut curr = entry;
-        for lvl in (1..=self.index.max_level).rev() {
-            curr = self.greedy_search_layer(&q, curr, lvl)?;
-        }
-        let candidates = self.search_layer(&q, curr, ef, 0)?;
-        let mut ranked: Vec<(Value<D>, f32)> = candidates
-            .into_iter()
-            .map(|(i, dist)| {
-                let raw = self.index.keys.get(i as usize).expect("in range");
-                (Value::<D>::new(*raw), 1.0 - dist)
-            })
-            .collect();
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        ranked.truncate(k);
-        Ok(ranked)
     }
 
     fn greedy_search_layer(
@@ -1415,31 +1394,59 @@ where
     }
 }
 
-/// GenId-specific convenience: decode top-k keys as [`Id`]s.
-impl<'a, B> AttachedSuccinctHNSWIndex<'a, B, triblespace::core::value::schemas::genid::GenId>
+impl<'a, B> crate::constraint::SimilaritySearch for AttachedSuccinctHNSWIndex<'a, B>
 where
     B: triblespace::core::repo::BlobStoreGet<
             triblespace::core::value::schemas::hash::Blake3,
         >,
 {
-    /// [`similar`][Self::similar] with keys decoded as [`Id`].
-    pub fn similar_ids(
+    fn neighbours_above(
         &self,
-        query: &[f32],
-        k: usize,
-        ef: Option<usize>,
-    ) -> Result<Vec<(Id, f32)>, B::GetError<anybytes::view::ViewError>> {
-        Ok(self
-            .similar(query, k, ef)?
-            .into_iter()
-            .filter_map(|(v, s)| {
-                if v.raw[0..16] != [0u8; 16] {
-                    return None;
-                }
-                let id_bytes: [u8; 16] = v.raw[16..32].try_into().ok()?;
-                Id::new(id_bytes).map(|id| (id, s))
-            })
-            .collect())
+        from: triblespace::core::value::Value<
+            triblespace::core::value::schemas::hash::Handle<
+                triblespace::core::value::schemas::hash::Blake3,
+                crate::schemas::Embedding,
+            >,
+        >,
+        score_floor: f32,
+    ) -> Vec<
+        triblespace::core::value::Value<
+            triblespace::core::value::schemas::hash::Handle<
+                triblespace::core::value::schemas::hash::Blake3,
+                crate::schemas::Embedding,
+            >,
+        >,
+    > {
+        self.candidates_above(from, score_floor).unwrap_or_default()
+    }
+
+    fn cosine_between(
+        &self,
+        a: triblespace::core::value::Value<
+            triblespace::core::value::schemas::hash::Handle<
+                triblespace::core::value::schemas::hash::Blake3,
+                crate::schemas::Embedding,
+            >,
+        >,
+        b: triblespace::core::value::Value<
+            triblespace::core::value::schemas::hash::Handle<
+                triblespace::core::value::schemas::hash::Blake3,
+                crate::schemas::Embedding,
+            >,
+        >,
+    ) -> Option<f32> {
+        let va = self.cache.get(a).ok()?;
+        let vb = self.cache.get(b).ok()?;
+        let a_slice: &[f32] = va.as_ref().as_ref();
+        let b_slice: &[f32] = vb.as_ref().as_ref();
+        if a_slice.len() != b_slice.len() {
+            return None;
+        }
+        let mut sum = 0.0f32;
+        for (x, y) in a_slice.iter().zip(b_slice.iter()) {
+            sum += x * y;
+        }
+        Some(sum)
     }
 }
 
@@ -2073,49 +2080,56 @@ impl<D: ValueSchema, T: ValueSchema> TryFromBlob<SuccinctBM25Blob> for SuccinctB
 ///
 /// Layout: 4 dim + 2 m + 2 m0 + 1 max_level + 1 reserved +
 /// 1 has_entry + 1 reserved + 4 entry_point + 8 n_nodes +
-/// 8 n_layers + 2 × 32 CompactVectorMeta + 6 × 8 section
-/// (offset, len) = 144.
+/// 8 n_layers + 2 × 32 CompactVectorMeta + 4 × 8 section
+/// (offset, len) = 128.
 ///
 /// No magic, no version — schema identity is carried by the
 /// typed `BlobSchema` handle. Breaking format changes mint a
 /// new schema id.
-const SH25_HEADER_LEN: usize = 144;
+const SH25_HEADER_LEN: usize = 128;
 
 /// Content-addressed [`BlobSchema`] marker for the succinct
-/// HNSW blob format — 144 B header + keys + handles + jerky-
-/// packed graph. Embeddings themselves live as separate blobs
-/// in the pile, referenced by handle.
+/// HNSW blob format — 128 B header + handles + jerky-packed
+/// graph. Embeddings themselves live as separate blobs in the
+/// pile, referenced by handle.
 ///
-/// Schema id minted fresh via `trible genid`:
-/// `27D71A473EF22DA4D916F61810AC5D86`. Any breaking format
+/// Schema id minted via `trible genid`:
+/// `A96890DE5F85A4F2285C365549B21BC2`. Any breaking format
 /// change mints a new id (i.e. a new type), so the compiler
 /// rules out mismatched-layout deserialization.
 ///
-/// Previous id `7AFE59E7F895B23F05452FF7919E12E4` retired
-/// when the blob dropped its magic+version preamble.
+/// Retired IDs (bytes in the wild under these tags have the
+/// old layouts and can't be loaded by the current code):
+///
+/// - `27D71A473EF22DA4D916F61810AC5D86` — carried a keys
+///   section alongside handles (schema-tagged doc keys). The
+///   keys table was redundant with the caller's own
+///   doc↔handle tribles, so the split was dropped.
+/// - `7AFE59E7F895B23F05452FF7919E12E4` — pre-magic/version
+///   rotation.
 pub enum SuccinctHNSWBlob {}
 
 impl ConstId for SuccinctHNSWBlob {
-    const ID: Id = id_hex!("27D71A473EF22DA4D916F61810AC5D86");
+    const ID: Id = id_hex!("A96890DE5F85A4F2285C365549B21BC2");
 }
 
 impl BlobSchema for SuccinctHNSWBlob {}
 
 impl ConstDescribe for SuccinctHNSWBlob {}
 
-impl<D: ValueSchema> ToBlob<SuccinctHNSWBlob> for &SuccinctHNSWIndex<D> {
+impl ToBlob<SuccinctHNSWBlob> for &SuccinctHNSWIndex {
     fn to_blob(self) -> Blob<SuccinctHNSWBlob> {
         Blob::new(Bytes::from_source(self.to_bytes()))
     }
 }
 
-impl<D: ValueSchema> ToBlob<SuccinctHNSWBlob> for SuccinctHNSWIndex<D> {
+impl ToBlob<SuccinctHNSWBlob> for SuccinctHNSWIndex {
     fn to_blob(self) -> Blob<SuccinctHNSWBlob> {
         (&self).to_blob()
     }
 }
 
-impl<D: ValueSchema> TryFromBlob<SuccinctHNSWBlob> for SuccinctHNSWIndex<D> {
+impl TryFromBlob<SuccinctHNSWBlob> for SuccinctHNSWIndex {
     type Error = SuccinctLoadError;
 
     fn try_from_blob(blob: Blob<SuccinctHNSWBlob>) -> Result<Self, Self::Error> {
@@ -2552,12 +2566,6 @@ mod tests {
     #[test]
     fn succinct_hnsw_matches_naive_on_sample() {
         use crate::hnsw::HNSWBuilder;
-        use triblespace::core::id::Id;
-
-        fn iid(byte: u8) -> Id {
-            Id::new([byte; 16]).unwrap()
-        }
-
         use triblespace::core::blob::MemoryBlobStore;
         use triblespace::core::repo::BlobStore;
         use triblespace::core::value::schemas::hash::Blake3;
@@ -2566,11 +2574,13 @@ mod tests {
         // locks the level sampling so the graph is reproducible.
         let mut store = MemoryBlobStore::<Blake3>::new();
         let mut b = HNSWBuilder::new(4).with_seed(42);
+        let mut handles = Vec::new();
         for i in 1..=16u8 {
             let f = i as f32;
             let vec = vec![f.sin(), f.cos(), (f * 0.5).sin(), (f * 0.3).cos()];
             let h = crate::schemas::put_embedding::<_, Blake3>(&mut store, vec.clone()).unwrap();
-            b.insert(&iid(i), h, vec).unwrap();
+            b.insert(h, vec).unwrap();
+            handles.push(h);
         }
         let naive = b.build_naive();
         let succinct = SuccinctHNSWIndex::from_naive(&naive).unwrap();
@@ -2580,26 +2590,18 @@ mod tests {
         assert_eq!(succinct.dim(), naive.dim());
         assert_eq!(succinct.max_level(), naive.max_level());
 
-        // Same queries must return the same top-k rows, in the
-        // same order, with the same similarity scores.
-        let queries = [
-            vec![1.0, 0.0, 0.5, 0.5],
-            vec![0.0, 1.0, -0.3, 0.1],
-            vec![-0.5, 0.5, 0.5, -0.5],
-        ];
+        // Query from a few probe handles and check the
+        // above-threshold set matches exactly between naive and
+        // succinct backends.
         let naive_view = naive.attach(&reader);
         let succinct_view = succinct.attach(&reader);
-        for q in &queries {
-            let n = naive_view.similar(q, 5, None).unwrap();
-            let s = succinct_view.similar(q, 5, None).unwrap();
-            assert_eq!(n.len(), s.len(), "count mismatch for query {q:?}");
-            for ((n_id, n_s), (s_id, s_s)) in n.iter().zip(s.iter()) {
-                assert_eq!(n_id, s_id, "doc mismatch at top-k for {q:?}");
-                assert!(
-                    (n_s - s_s).abs() < 1e-5,
-                    "score mismatch for {q:?}: naive={n_s} succinct={s_s}"
-                );
-            }
+        let floor = 0.5f32;
+        for probe in handles.iter().take(3) {
+            let n: std::collections::HashSet<_> =
+                naive_view.candidates_above(*probe, floor).unwrap().into_iter().collect();
+            let s: std::collections::HashSet<_> =
+                succinct_view.candidates_above(*probe, floor).unwrap().into_iter().collect();
+            assert_eq!(n, s, "mismatch for probe {probe:?}");
         }
     }
 
@@ -2608,29 +2610,35 @@ mod tests {
         triblespace::core::blob::MemoryBlobStore<
             triblespace::core::value::schemas::hash::Blake3,
         >,
+        Vec<
+            triblespace::core::value::Value<
+                triblespace::core::value::schemas::hash::Handle<
+                    triblespace::core::value::schemas::hash::Blake3,
+                    crate::schemas::Embedding,
+                >,
+            >,
+        >,
     ) {
         use crate::hnsw::HNSWBuilder;
         use triblespace::core::blob::MemoryBlobStore;
-        use triblespace::core::id::Id;
         use triblespace::core::value::schemas::hash::Blake3;
-        fn iid(byte: u8) -> Id {
-            Id::new([byte; 16]).unwrap()
-        }
         let mut store = MemoryBlobStore::<Blake3>::new();
         let mut b = HNSWBuilder::new(4).with_seed(17);
+        let mut handles = Vec::new();
         for i in 1..=20u8 {
             let f = i as f32;
             let v = vec![f.sin(), f.cos(), (f * 0.7).sin(), (f * 0.3).cos()];
             let h = crate::schemas::put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
-            b.insert(&iid(i), h, v).unwrap();
+            b.insert(h, v).unwrap();
+            handles.push(h);
         }
         let idx = b.build();
-        (idx, store)
+        (idx, store, handles)
     }
 
     #[test]
     fn succinct_hnsw_bytes_round_trip() {
-        let (original, mut store) = build_succinct_hnsw_sample();
+        let (original, mut store, handles) = build_succinct_hnsw_sample();
         let bytes = original.to_bytes();
         let reloaded = SuccinctHNSWIndex::try_from_bytes(&bytes).expect("valid blob");
         assert_eq!(reloaded.doc_count(), original.doc_count());
@@ -2639,16 +2647,22 @@ mod tests {
         assert_eq!(reloaded.m0(), original.m0());
         assert_eq!(reloaded.max_level(), original.max_level());
 
-        // Same query must return identical top-k on both.
-        let q = vec![0.5, -0.3, 0.7, 0.1];
+        // Same probe handle must return identical above-threshold
+        // sets on both backends.
         let reader = store.reader().unwrap();
-        let orig_hits = original.attach(&reader).similar(&q, 5, None).unwrap();
-        let load_hits = reloaded.attach(&reader).similar(&q, 5, None).unwrap();
-        assert_eq!(orig_hits.len(), load_hits.len());
-        for ((a_id, a_s), (b_id, b_s)) in orig_hits.iter().zip(load_hits.iter()) {
-            assert_eq!(a_id, b_id);
-            assert!((a_s - b_s).abs() < 1e-5, "score {a_s} vs {b_s}");
-        }
+        let orig_hits: std::collections::HashSet<_> = original
+            .attach(&reader)
+            .candidates_above(handles[0], 0.5)
+            .unwrap()
+            .into_iter()
+            .collect();
+        let load_hits: std::collections::HashSet<_> = reloaded
+            .attach(&reader)
+            .candidates_above(handles[0], 0.5)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(orig_hits, load_hits);
     }
 
     #[test]
@@ -2663,19 +2677,21 @@ mod tests {
             SuccinctHNSWIndex::try_from_bytes(&bytes).expect("valid blob");
         assert_eq!(reloaded.doc_count(), 0);
         let mut store: MemoryBlobStore<Blake3> = MemoryBlobStore::new();
+        let probe = crate::schemas::put_embedding::<_, Blake3>(
+            &mut store,
+            vec![1.0, 0.0, 0.0],
+        )
+        .unwrap();
         assert!(reloaded
             .attach(&store.reader().unwrap())
-            .similar(&[0.0, 0.0, 0.0], 5, None)
+            .candidates_above(probe, 0.0)
             .unwrap()
             .is_empty());
     }
 
     #[test]
     fn succinct_hnsw_rejects_short_header() {
-        let err = SuccinctHNSWIndex::<
-            triblespace::core::value::schemas::genid::GenId,
-        >::try_from_bytes(&[0u8; 10])
-        .unwrap_err();
+        let err = SuccinctHNSWIndex::try_from_bytes(&[0u8; 10]).unwrap_err();
         assert_eq!(err, SuccinctLoadError::ShortHeader);
     }
 
@@ -2686,20 +2702,17 @@ mod tests {
 
     #[test]
     fn succinct_hnsw_rejects_truncation() {
-        let (idx, _) = build_succinct_hnsw_sample();
+        let (idx, _, _) = build_succinct_hnsw_sample();
         let bytes = idx.to_bytes();
         let truncated = &bytes[..bytes.len() - 2];
-        let err = SuccinctHNSWIndex::<
-            triblespace::core::value::schemas::genid::GenId,
-        >::try_from_bytes(truncated)
-        .unwrap_err();
+        let err = SuccinctHNSWIndex::try_from_bytes(truncated).unwrap_err();
         assert!(matches!(err, SuccinctLoadError::TruncatedSection(_)));
     }
 
     #[test]
     fn succinct_hnsw_blob_schema_round_trip() {
         use triblespace::core::blob::{ToBlob, TryFromBlob};
-        let (original, _) = build_succinct_hnsw_sample();
+        let (original, _, _) = build_succinct_hnsw_sample();
         let blob: triblespace::core::blob::Blob<SuccinctHNSWBlob> = (&original).to_blob();
         let reloaded: SuccinctHNSWIndex =
             SuccinctHNSWIndex::try_from_blob(blob).expect("valid blob");
@@ -2709,8 +2722,8 @@ mod tests {
 
     #[test]
     fn succinct_hnsw_blob_is_deterministic() {
-        let (a, _) = build_succinct_hnsw_sample();
-        let (b, _) = build_succinct_hnsw_sample();
+        let (a, _, _) = build_succinct_hnsw_sample();
+        let (b, _, _) = build_succinct_hnsw_sample();
         assert_eq!(a.to_bytes(), b.to_bytes());
     }
 
@@ -2723,9 +2736,14 @@ mod tests {
         let succinct = HNSWBuilder::new(3).build();
         assert_eq!(succinct.doc_count(), 0);
         let mut store: MemoryBlobStore<Blake3> = MemoryBlobStore::new();
+        let probe = crate::schemas::put_embedding::<_, Blake3>(
+            &mut store,
+            vec![1.0, 0.0, 0.0],
+        )
+        .unwrap();
         assert!(succinct
             .attach(&store.reader().unwrap())
-            .similar(&[0.0, 0.0, 0.0], 5, None)
+            .candidates_above(probe, 0.0)
             .unwrap()
             .is_empty());
     }

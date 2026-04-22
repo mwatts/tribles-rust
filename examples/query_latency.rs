@@ -174,46 +174,48 @@ fn bench_bm25(n_docs: usize, vocab: usize, doc_len: usize) {
 fn bench_hnsw(n_docs: usize, dim: usize) {
     use triblespace::core::blob::MemoryBlobStore;
     use triblespace::core::repo::BlobStore;
-    use triblespace::core::value::schemas::hash::Blake3;
-    use triblespace_search::schemas::put_embedding;
+    use triblespace::core::value::schemas::hash::{Blake3, Handle};
+    use triblespace::core::value::Value;
+    use triblespace_search::schemas::{put_embedding, Embedding};
 
     let mut rng = Rng(0xBAD_F00D + n_docs as u64);
     let mut store = MemoryBlobStore::<Blake3>::new();
     let mut builder = HNSWBuilder::new(dim).with_seed(13);
-    for i in 0..n_docs {
+    let mut handles: Vec<Value<Handle<Blake3, Embedding>>> = Vec::with_capacity(n_docs);
+    for _ in 0..n_docs {
         let v: Vec<f32> = (0..dim)
             .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
             .collect();
         let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
-        builder.insert(&id_from_u64(i as u64 + 1), h, v).unwrap();
+        builder.insert(h, v).unwrap();
+        handles.push(h);
     }
     let naive = builder.build_naive();
     let succinct = SuccinctHNSWIndex::from_naive(&naive).unwrap();
     let reader = store.reader().unwrap();
 
-    // 100 random queries.
-    let queries: Vec<Vec<f32>> = (0..100)
-        .map(|_| {
-            (0..dim)
-                .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
-                .collect()
-        })
+    // 100 probe handles sampled from the corpus. Probing from a
+    // handle rather than a raw vector is the new API; callers
+    // would typically put their query vector into the store,
+    // then probe from the resulting handle.
+    let probes: Vec<Value<Handle<Blake3, Embedding>>> = (0..100)
+        .map(|i| handles[(i * 37 + 1) % handles.len()])
         .collect();
 
-    let naive_view = naive.attach(&reader);
-    let succinct_view = succinct.attach(&reader);
-    for q in &queries {
-        let _ = naive_view.similar(q, 10, Some(50));
-        let _ = succinct_view.similar(q, 10, Some(50));
+    let naive_view = naive.attach(&reader).with_ef_search(50);
+    let succinct_view = succinct.attach(&reader).with_ef_search(50);
+    for p in &probes {
+        let _ = naive_view.candidates_above(*p, 0.5);
+        let _ = succinct_view.candidates_above(*p, 0.5);
     }
 
-    let time = |tag: &str, f: &dyn Fn(&[f32])| {
+    let time = |tag: &str, f: &dyn Fn(&Value<Handle<Blake3, Embedding>>)| {
         let reps = 5;
-        let mut samples: Vec<u128> = Vec::with_capacity(queries.len() * reps);
+        let mut samples: Vec<u128> = Vec::with_capacity(probes.len() * reps);
         for _ in 0..reps {
-            for q in &queries {
+            for p in &probes {
                 let t0 = Instant::now();
-                f(q);
+                f(p);
                 samples.push(t0.elapsed().as_nanos());
             }
         }
@@ -228,12 +230,12 @@ fn bench_hnsw(n_docs: usize, dim: usize) {
         );
     };
 
-    println!("HNSW top-10 query, ef=50  [n={n_docs}, dim={dim}]:");
-    time("naive", &|q| {
-        let _ = naive_view.similar(q, 10, Some(50));
+    println!("HNSW threshold query, cos ≥ 0.5, ef=50  [n={n_docs}, dim={dim}]:");
+    time("naive", &|p| {
+        let _ = naive_view.candidates_above(*p, 0.5);
     });
-    time("SH25", &|q| {
-        let _ = succinct_view.similar(q, 10, Some(50));
+    time("SH25", &|p| {
+        let _ = succinct_view.candidates_above(*p, 0.5);
     });
 }
 

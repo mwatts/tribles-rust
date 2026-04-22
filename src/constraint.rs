@@ -1,32 +1,35 @@
 //! Triblespace query-engine integration.
 //!
-//! Exposes [`BM25Index`] as a first-class `Constraint` so
-//! callers can plug search into the normal `find!` / `pattern!`
-//! / `and!` / `or!` machinery.
+//! Two constraint shapes currently ship:
 //!
-//! V1 ships the simplest useful shape:
+//! * [`DocsContainingTerm`] / [`BM25ScoredPostings`] — BM25
+//!   posting-list constraints produced by
+//!   [`BM25Index::docs_containing`] /
+//!   [`BM25Index::docs_and_scores`].
+//! * [`Similar`] — a binary relation
+//!   `similar(a: Variable<Handle<Blake3, Embedding>>, b:
+//!   Variable<Handle<Blake3, Embedding>>, score_floor: f32)`
+//!   produced by the `similar()` method on an
+//!   [`AttachedHNSWIndex`] / [`AttachedFlatIndex`] /
+//!   [`AttachedSuccinctHNSWIndex`]. The relation is symmetric
+//!   (cosine similarity), `a` and `b` are both embedding
+//!   handles, and `score_floor` is a fixed cosine threshold —
+//!   *not* a bound variable. Callers who need the exact score
+//!   fetch both embeddings and compute it directly (no
+//!   quantization).
 //!
-//! ```rust,ignore
-//! let docs_matching: DocsContainingTerm = index.docs_containing(doc_var, term);
-//! ```
-//!
-//! which pins `term` at construction time and constrains the
-//! `doc` variable to entity ids whose posting list includes the
-//! term. Scores live on [`BM25Index`] and are looked up via
-//! [`BM25Index::query_term`] once the caller has the doc — v2
-//! will lift `score` to a bound variable.
-//!
-//! See `docs/QUERY_ENGINE_INTEGRATION.md` for the longer-term
-//! design covering bidirectional BM25 and vector similarity.
+//! See `docs/QUERY_ENGINE_INTEGRATION.md` for the long-form
+//! design.
 
 use std::collections::HashSet;
 
 use triblespace::core::query::{Binding, Constraint, Variable, VariableId, VariableSet};
 use triblespace::core::value::schemas::genid::GenId;
-use triblespace::core::value::RawValue;
+use triblespace::core::value::schemas::hash::{Blake3, Handle};
+use triblespace::core::value::{RawValue, Value};
 
 use crate::bm25::BM25Index;
-use crate::schemas::F32LE;
+use crate::schemas::{Embedding, F32LE};
 
 /// Minimum surface a BM25 index must expose for the
 /// [`DocsContainingTerm`] / [`BM25ScoredPostings`] constraints to
@@ -68,12 +71,12 @@ impl<D: triblespace::core::value::ValueSchema, T: triblespace::core::value::Valu
     ) -> Box<dyn Iterator<Item = (RawValue, f32)> + 'a> {
         // Wrap the raw bytes in `Value<T>` at the trait boundary
         // — the typed API inside the index expects `&Value<T>`.
-        let term_val = triblespace::core::value::Value::<T>::new(*term);
+        let term_val = Value::<T>::new(*term);
         Box::new(self.query_term(&term_val).map(|(v, s)| (v.raw, s)))
     }
 
     fn doc_frequency_for(&self, term: &RawValue) -> usize {
-        let term_val = triblespace::core::value::Value::<T>::new(*term);
+        let term_val = Value::<T>::new(*term);
         self.doc_frequency(&term_val)
     }
 }
@@ -86,12 +89,12 @@ impl<D: triblespace::core::value::ValueSchema, T: triblespace::core::value::Valu
         &'a self,
         term: &RawValue,
     ) -> Box<dyn Iterator<Item = (RawValue, f32)> + 'a> {
-        let term_val = triblespace::core::value::Value::<T>::new(*term);
+        let term_val = Value::<T>::new(*term);
         Box::new(self.query_term(&term_val).map(|(v, s)| (v.raw, s)))
     }
 
     fn doc_frequency_for(&self, term: &RawValue) -> usize {
-        let term_val = triblespace::core::value::Value::<T>::new(*term);
+        let term_val = Value::<T>::new(*term);
         self.doc_frequency(&term_val)
     }
 
@@ -103,16 +106,6 @@ impl<D: triblespace::core::value::ValueSchema, T: triblespace::core::value::Valu
         crate::succinct::SuccinctBM25Index::<D, T>::score_tolerance(self)
     }
 }
-
-/// Minimum surface an HNSW-style index must expose for the
-/// [`SimilarToVectorHNSW`] / [`SimilarToVectorHNSWScored`]
-/// constraints to work against it. Implemented for both the naive
-/// [`crate::hnsw::HNSWIndex`] and the succinct
-/// [`crate::succinct::SuccinctHNSWIndex`].
-/// The HNSW constraints now store eagerly-computed top-k
-/// (same shape as the Flat constraints), so there's no trait
-/// indirection at query time — the trait previously here
-/// (`HNSWQueryable`) was dropped in the HNSW handle port.
 
 /// Constrains a `Variable<S>` (doc) to the 32-byte
 /// [`RawValue`]s in the posting list of the pinned term. `S` is
@@ -155,7 +148,7 @@ impl<D: triblespace::core::value::ValueSchema, T: triblespace::core::value::Valu
     pub fn docs_containing(
         &self,
         doc: Variable<D>,
-        term: triblespace::core::value::Value<T>,
+        term: Value<T>,
     ) -> DocsContainingTerm<'_, BM25Index<D, T>, D> {
         DocsContainingTerm::new(self, doc, term.raw)
     }
@@ -224,7 +217,7 @@ impl<D: triblespace::core::value::ValueSchema, T: triblespace::core::value::Valu
         &self,
         doc: Variable<D>,
         score: Variable<F32LE>,
-        term: triblespace::core::value::Value<T>,
+        term: Value<T>,
     ) -> BM25ScoredPostings<'_, BM25Index<D, T>, D> {
         BM25ScoredPostings::new(self, doc, score, term.raw)
     }
@@ -322,452 +315,6 @@ where
     }
 }
 
-// ── FlatIndex constraint ─────────────────────────────────────────────
-
-/// Constrains a `Variable<GenId>` (doc) to the top-`k` neighbours
-/// of a pinned query vector under cosine similarity.
-///
-/// Created via [`FlatIndex::similar_constraint`]. The `query_vec`
-/// and `k` are parameters of the constraint, not bound variables
-/// — per `docs/QUERY_ENGINE_INTEGRATION.md`'s design, this
-/// matches how similarity is actually used (the query is a
-/// concrete embedding, not something the engine solves for).
-pub struct SimilarToVector<D: triblespace::core::value::ValueSchema = GenId> {
-    doc: Variable<D>,
-    /// Top-`k` `(key, score)` pairs computed eagerly at
-    /// construction. Handle-fetching against the blob store
-    /// happens once, not once per `propose`/`confirm`/
-    /// `satisfied`.
-    top: Vec<(RawValue, f32)>,
-}
-
-impl<D: triblespace::core::value::ValueSchema> SimilarToVector<D> {
-    /// Build directly from the already-computed top-k. Used by
-    /// [`FlatIndex::similar_constraint`] internally.
-    pub fn from_top(doc: Variable<D>, top: Vec<(RawValue, f32)>) -> Self {
-        Self { doc, top }
-    }
-}
-
-impl<'a, B, D: triblespace::core::value::ValueSchema>
-    crate::hnsw::AttachedFlatIndex<'a, B, D>
-where
-    B: triblespace::core::repo::BlobStoreGet<
-            triblespace::core::value::schemas::hash::Blake3,
-        >,
-{
-    /// Build a [`SimilarToVector`] constraint for use inside
-    /// `pattern!` / `find!`. Eagerly resolves the top-`k`
-    /// against the attached store up front so subsequent
-    /// engine calls don't re-scan.
-    pub fn similar_constraint(
-        &self,
-        doc: Variable<D>,
-        query: Vec<f32>,
-        k: usize,
-    ) -> Result<SimilarToVector<D>, B::GetError<anybytes::view::ViewError>> {
-        let top_raw: Vec<(RawValue, f32)> = self
-            .similar(&query, k)?
-            .into_iter()
-            .map(|(v, s)| (v.raw, s))
-            .collect();
-        Ok(SimilarToVector::from_top(doc, top_raw))
-    }
-}
-
-impl<'a, D: triblespace::core::value::ValueSchema + 'a> Constraint<'a> for SimilarToVector<D> {
-    fn variables(&self) -> VariableSet {
-        VariableSet::new_singleton(self.doc.index)
-    }
-
-    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
-        if self.doc.index == variable {
-            Some(self.top.len())
-        } else {
-            None
-        }
-    }
-
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
-        if self.doc.index != variable {
-            return;
-        }
-        for (key, _score) in &self.top {
-            proposals.push(*key);
-        }
-    }
-
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
-        if self.doc.index != variable {
-            return;
-        }
-        let top: HashSet<RawValue> = self.top.iter().map(|(k, _)| *k).collect();
-        proposals.retain(|raw| top.contains(raw));
-    }
-
-    fn satisfied(&self, binding: &Binding) -> bool {
-        match binding.get(self.doc.index) {
-            Some(raw) => self.top.iter().any(|(k, _)| k == raw),
-            None => true,
-        }
-    }
-}
-
-// ── FlatIndex constraint with score ─────────────────────────────────
-
-/// Scored variant of [`SimilarToVector`]: binds both `doc` and
-/// `score` per top-`k` hit. Produced by
-/// [`FlatIndex::similar_with_scores`]. See [`BM25ScoredPostings`]
-/// for the sibling BM25 version.
-pub struct SimilarToVectorScored<D: triblespace::core::value::ValueSchema = GenId> {
-    doc: Variable<D>,
-    score: Variable<F32LE>,
-    /// Eagerly computed top-`k` `(key, score)` pairs.
-    top: Vec<(RawValue, f32)>,
-}
-
-impl<D: triblespace::core::value::ValueSchema> SimilarToVectorScored<D> {
-    pub fn from_top(
-        doc: Variable<D>,
-        score: Variable<F32LE>,
-        top: Vec<(RawValue, f32)>,
-    ) -> Self {
-        Self { doc, score, top }
-    }
-}
-
-impl<'a, B, D: triblespace::core::value::ValueSchema>
-    crate::hnsw::AttachedFlatIndex<'a, B, D>
-where
-    B: triblespace::core::repo::BlobStoreGet<
-            triblespace::core::value::schemas::hash::Blake3,
-        >,
-{
-    /// Two-variable similarity constraint — binds both `doc`
-    /// and the cosine-similarity `score` for each top-k hit.
-    /// Eagerly resolves the top-`k` against the attached store.
-    pub fn similar_with_scores(
-        &self,
-        doc: Variable<D>,
-        score: Variable<F32LE>,
-        query: Vec<f32>,
-        k: usize,
-    ) -> Result<SimilarToVectorScored<D>, B::GetError<anybytes::view::ViewError>> {
-        let top_raw: Vec<(RawValue, f32)> = self
-            .similar(&query, k)?
-            .into_iter()
-            .map(|(v, s)| (v.raw, s))
-            .collect();
-        Ok(SimilarToVectorScored::from_top(doc, score, top_raw))
-    }
-}
-
-impl<'a, D: triblespace::core::value::ValueSchema + 'a> Constraint<'a>
-    for SimilarToVectorScored<D>
-{
-    fn variables(&self) -> VariableSet {
-        VariableSet::new_singleton(self.doc.index)
-            .union(VariableSet::new_singleton(self.score.index))
-    }
-
-    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
-        if variable == self.doc.index || variable == self.score.index {
-            Some(self.top.len())
-        } else {
-            None
-        }
-    }
-
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
-        if variable == self.doc.index {
-            let bound_score = binding.get(self.score.index).map(raw_value_to_f32);
-            for (key, score) in &self.top {
-                if let Some(bs) = bound_score {
-                    if (score - bs).abs() > f32::EPSILON {
-                        continue;
-                    }
-                }
-                proposals.push(*key);
-            }
-        } else if variable == self.score.index {
-            let bound_doc: Option<RawValue> = binding.get(self.doc.index).copied();
-            // Dedupe by bit-pattern to avoid Cartesian blow-up
-            // when two neighbours share a similarity value.
-            let mut seen = HashSet::new();
-            for (key, score) in &self.top {
-                if let Some(bd) = bound_doc {
-                    if *key != bd {
-                        continue;
-                    }
-                }
-                if seen.insert(score.to_bits()) {
-                    proposals.push(f32_to_raw_value(*score));
-                }
-            }
-        }
-    }
-
-    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
-        if variable == self.doc.index {
-            let bound_score = binding.get(self.score.index).map(raw_value_to_f32);
-            let allowed: HashSet<RawValue> = self
-                .top
-                .iter()
-                .filter(|(_, s)| match bound_score {
-                    Some(bs) => (s - bs).abs() <= f32::EPSILON,
-                    None => true,
-                })
-                .map(|(k, _)| *k)
-                .collect();
-            proposals.retain(|raw| allowed.contains(raw));
-        } else if variable == self.score.index {
-            let bound_doc: Option<RawValue> = binding.get(self.doc.index).copied();
-            let allowed: HashSet<u32> = self
-                .top
-                .iter()
-                .filter(|(k, _)| match bound_doc {
-                    Some(bd) => *k == bd,
-                    None => true,
-                })
-                .map(|(_, s)| s.to_bits())
-                .collect();
-            proposals.retain(|raw| allowed.contains(&raw_value_to_f32(raw).to_bits()));
-        }
-    }
-
-    fn satisfied(&self, binding: &Binding) -> bool {
-        let bound_doc: Option<RawValue> = binding.get(self.doc.index).copied();
-        let bound_score = binding.get(self.score.index).map(raw_value_to_f32);
-        match (bound_doc, bound_score) {
-            (None, None) => true,
-            _ => self.top.iter().any(|&(k, s)| {
-                bound_doc.map_or(true, |bd| k == bd)
-                    && bound_score.map_or(true, |bs| (s - bs).abs() <= f32::EPSILON)
-            }),
-        }
-    }
-}
-
-// ── HNSWIndex constraint ─────────────────────────────────────────────
-
-/// HNSW version of [`SimilarToVector`]. Same shape; different
-/// backing index. Approximate rather than exact top-k.
-///
-/// Eagerly resolves the top-`k` against the caller-supplied
-/// blob store at construction time and caches the result.
-/// `propose` / `confirm` / `satisfied` iterate the cached
-/// list — no re-walking the HNSW graph per method call.
-pub struct SimilarToVectorHNSW<D: triblespace::core::value::ValueSchema = GenId> {
-    doc: Variable<D>,
-    top: Vec<(RawValue, f32)>,
-}
-
-impl<D: triblespace::core::value::ValueSchema> SimilarToVectorHNSW<D> {
-    pub fn from_top(doc: Variable<D>, top: Vec<(RawValue, f32)>) -> Self {
-        Self { doc, top }
-    }
-}
-
-impl<'a, B, D: triblespace::core::value::ValueSchema>
-    crate::hnsw::AttachedHNSWIndex<'a, B, D>
-where
-    B: triblespace::core::repo::BlobStoreGet<
-            triblespace::core::value::schemas::hash::Blake3,
-        >,
-{
-    /// Build a [`SimilarToVectorHNSW`] constraint for use
-    /// inside `pattern!` / `find!`. Pass `ef = Some(n)` to
-    /// widen search (higher recall, slower); `None` defaults
-    /// to `k`. The HNSW walk happens once at construction
-    /// against the attached store.
-    pub fn similar_constraint(
-        &self,
-        doc: Variable<D>,
-        query: Vec<f32>,
-        k: usize,
-        ef: Option<usize>,
-    ) -> Result<SimilarToVectorHNSW<D>, B::GetError<anybytes::view::ViewError>> {
-        let top_raw: Vec<(RawValue, f32)> = self
-            .similar(&query, k, ef)?
-            .into_iter()
-            .map(|(v, s)| (v.raw, s))
-            .collect();
-        Ok(SimilarToVectorHNSW::from_top(doc, top_raw))
-    }
-}
-
-impl<'a, D: triblespace::core::value::ValueSchema + 'a> Constraint<'a> for SimilarToVectorHNSW<D> {
-    fn variables(&self) -> VariableSet {
-        VariableSet::new_singleton(self.doc.index)
-    }
-
-    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
-        if self.doc.index == variable {
-            Some(self.top.len())
-        } else {
-            None
-        }
-    }
-
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
-        if self.doc.index != variable {
-            return;
-        }
-        for (key, _score) in &self.top {
-            proposals.push(*key);
-        }
-    }
-
-    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
-        if self.doc.index != variable {
-            return;
-        }
-        let top: HashSet<RawValue> = self.top.iter().map(|(k, _)| *k).collect();
-        proposals.retain(|raw| top.contains(raw));
-    }
-
-    fn satisfied(&self, binding: &Binding) -> bool {
-        match binding.get(self.doc.index) {
-            Some(raw) => self.top.iter().any(|(k, _)| k == raw),
-            None => true,
-        }
-    }
-}
-
-// ── HNSWIndex constraint with score ─────────────────────────────────
-
-/// Scored variant of [`SimilarToVectorHNSW`]: binds both `doc`
-/// and the cosine `score` per top-`k` hit. Eagerly resolves
-/// top-`k` at construction.
-pub struct SimilarToVectorHNSWScored<D: triblespace::core::value::ValueSchema = GenId> {
-    doc: Variable<D>,
-    score: Variable<F32LE>,
-    top: Vec<(RawValue, f32)>,
-}
-
-impl<D: triblespace::core::value::ValueSchema> SimilarToVectorHNSWScored<D> {
-    pub fn from_top(
-        doc: Variable<D>,
-        score: Variable<F32LE>,
-        top: Vec<(RawValue, f32)>,
-    ) -> Self {
-        Self { doc, score, top }
-    }
-}
-
-impl<'a, B, D: triblespace::core::value::ValueSchema>
-    crate::hnsw::AttachedHNSWIndex<'a, B, D>
-where
-    B: triblespace::core::repo::BlobStoreGet<
-            triblespace::core::value::schemas::hash::Blake3,
-        >,
-{
-    /// Two-variable similarity constraint for HNSW — binds
-    /// both `doc` and cosine `score` for each top-k hit.
-    /// Eagerly resolves against the attached store.
-    pub fn similar_with_scores(
-        &self,
-        doc: Variable<D>,
-        score: Variable<F32LE>,
-        query: Vec<f32>,
-        k: usize,
-        ef: Option<usize>,
-    ) -> Result<SimilarToVectorHNSWScored<D>, B::GetError<anybytes::view::ViewError>> {
-        let top_raw: Vec<(RawValue, f32)> = self
-            .similar(&query, k, ef)?
-            .into_iter()
-            .map(|(v, s)| (v.raw, s))
-            .collect();
-        Ok(SimilarToVectorHNSWScored::from_top(doc, score, top_raw))
-    }
-}
-
-impl<'a, D: triblespace::core::value::ValueSchema + 'a> Constraint<'a>
-    for SimilarToVectorHNSWScored<D>
-{
-    fn variables(&self) -> VariableSet {
-        VariableSet::new_singleton(self.doc.index)
-            .union(VariableSet::new_singleton(self.score.index))
-    }
-
-    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
-        if variable == self.doc.index || variable == self.score.index {
-            Some(self.top.len())
-        } else {
-            None
-        }
-    }
-
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
-        if variable == self.doc.index {
-            let bound_score = binding.get(self.score.index).map(raw_value_to_f32);
-            for (key, score) in &self.top {
-                if let Some(bs) = bound_score {
-                    if (score - bs).abs() > f32::EPSILON {
-                        continue;
-                    }
-                }
-                proposals.push(*key);
-            }
-        } else if variable == self.score.index {
-            let bound_doc: Option<RawValue> = binding.get(self.doc.index).copied();
-            // Dedupe by bit-pattern to avoid Cartesian blow-up
-            // when two neighbours share a similarity value.
-            let mut seen = HashSet::new();
-            for (key, score) in &self.top {
-                if let Some(bd) = bound_doc {
-                    if *key != bd {
-                        continue;
-                    }
-                }
-                if seen.insert(score.to_bits()) {
-                    proposals.push(f32_to_raw_value(*score));
-                }
-            }
-        }
-    }
-
-    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
-        if variable == self.doc.index {
-            let bound_score = binding.get(self.score.index).map(raw_value_to_f32);
-            let allowed: HashSet<RawValue> = self
-                .top
-                .iter()
-                .filter(|(_, s)| match bound_score {
-                    Some(bs) => (s - bs).abs() <= f32::EPSILON,
-                    None => true,
-                })
-                .map(|(k, _)| *k)
-                .collect();
-            proposals.retain(|raw| allowed.contains(raw));
-        } else if variable == self.score.index {
-            let bound_doc: Option<RawValue> = binding.get(self.doc.index).copied();
-            let allowed: HashSet<u32> = self
-                .top
-                .iter()
-                .filter(|(k, _)| match bound_doc {
-                    Some(bd) => *k == bd,
-                    None => true,
-                })
-                .map(|(_, s)| s.to_bits())
-                .collect();
-            proposals.retain(|raw| allowed.contains(&raw_value_to_f32(raw).to_bits()));
-        }
-    }
-
-    fn satisfied(&self, binding: &Binding) -> bool {
-        let bound_doc: Option<RawValue> = binding.get(self.doc.index).copied();
-        let bound_score = binding.get(self.score.index).map(raw_value_to_f32);
-        match (bound_doc, bound_score) {
-            (None, None) => true,
-            _ => self.top.iter().any(|&(k, s)| {
-                bound_doc.map_or(true, |bd| k == bd)
-                    && bound_score.map_or(true, |bs| (s - bs).abs() <= f32::EPSILON)
-            }),
-        }
-    }
-}
-
 impl<'a, I: BM25Queryable + ?Sized + 'a, S> Constraint<'a> for DocsContainingTerm<'a, I, S>
 where
     S: triblespace::core::value::ValueSchema + 'a,
@@ -819,11 +366,188 @@ where
     }
 }
 
+// ── Similarity constraint ───────────────────────────────────────────
+
+/// Backing surface a similarity index must expose for the
+/// [`Similar`] binary-relation constraint. Implemented for the
+/// three attached views:
+/// [`crate::hnsw::AttachedHNSWIndex`],
+/// [`crate::hnsw::AttachedFlatIndex`], and
+/// [`crate::succinct::AttachedSuccinctHNSWIndex`].
+///
+/// Both methods are infallible at the trait boundary —
+/// implementations map storage / fetch failures to "no results"
+/// (empty [`Vec`] or [`None`]). The engine's `propose` / `confirm`
+/// / `satisfied` hooks have no error channel, so failing open
+/// with "no match" is the only engine-safe choice; debug-time
+/// diagnostics belong in the concrete attached view's inherent
+/// methods, not here.
+pub trait SimilaritySearch {
+    /// Return every handle `b` in the index such that the cosine
+    /// similarity `cos(*from, *b) ≥ score_floor`. `from` may or
+    /// may not be in the index (e.g. it could be a query vector
+    /// put into the pile for this one call).
+    fn neighbours_above(
+        &self,
+        from: Value<Handle<Blake3, Embedding>>,
+        score_floor: f32,
+    ) -> Vec<Value<Handle<Blake3, Embedding>>>;
+
+    /// Exact cosine similarity between the two handles, or
+    /// [`None`] if either blob can't be fetched / parsed.
+    fn cosine_between(
+        &self,
+        a: Value<Handle<Blake3, Embedding>>,
+        b: Value<Handle<Blake3, Embedding>>,
+    ) -> Option<f32>;
+}
+
+/// Binary similarity-relation constraint:
+/// `similar(a, b, score_floor)` holds iff `a` and `b` are both
+/// embedding handles with `cosine(*a, *b) ≥ score_floor`.
+///
+/// Semantics are symmetric (cosine is symmetric). Operationally,
+/// at least one of `a` / `b` must be bound so the engine can walk
+/// the index from that side; when both are bound, the constraint
+/// fetches both embeddings and checks the threshold directly.
+///
+/// `score_floor` is fixed at constraint-construction — it's a
+/// query parameter, not a bound variable. Callers who need the
+/// exact score can fetch both handles after the query and
+/// compute it without the approximation / quantisation that a
+/// score-variable would bring in.
+///
+/// Produced by the `similar` method on an
+/// [`crate::hnsw::AttachedHNSWIndex`] /
+/// [`crate::hnsw::AttachedFlatIndex`] /
+/// [`crate::succinct::AttachedSuccinctHNSWIndex`].
+pub struct Similar<'a, I: SimilaritySearch + ?Sized> {
+    index: &'a I,
+    a: Variable<Handle<Blake3, Embedding>>,
+    b: Variable<Handle<Blake3, Embedding>>,
+    score_floor: f32,
+}
+
+impl<'a, I: SimilaritySearch + ?Sized> Similar<'a, I> {
+    /// Build a constraint. Usually invoked through the `similar`
+    /// method on an attached index rather than directly.
+    pub fn new(
+        index: &'a I,
+        a: Variable<Handle<Blake3, Embedding>>,
+        b: Variable<Handle<Blake3, Embedding>>,
+        score_floor: f32,
+    ) -> Self {
+        Self {
+            index,
+            a,
+            b,
+            score_floor,
+        }
+    }
+}
+
+impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
+    fn variables(&self) -> VariableSet {
+        VariableSet::new_singleton(self.a.index).union(VariableSet::new_singleton(self.b.index))
+    }
+
+    fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+        if variable != self.a.index && variable != self.b.index {
+            return None;
+        }
+        let other = if variable == self.a.index {
+            self.b.index
+        } else {
+            self.a.index
+        };
+        match binding.get(other).copied() {
+            // Other side bound: count the candidates from the
+            // walk and report an exact cardinality.
+            Some(from) => Some(
+                self.index
+                    .neighbours_above(Value::new(from), self.score_floor)
+                    .len(),
+            ),
+            // Other side unbound: the engine is still ordering
+            // the join — signal "expensive" so it picks a
+            // cheaper constraint first, rather than `None` which
+            // would flag the variable as unconstrained.
+            None => Some(usize::MAX),
+        }
+    }
+
+    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
+        if variable != self.a.index && variable != self.b.index {
+            return;
+        }
+        let other = if variable == self.a.index {
+            self.b.index
+        } else {
+            self.a.index
+        };
+        let Some(from) = binding.get(other).copied() else {
+            // Can't propose without a pivot; engine should pick
+            // another constraint first.
+            return;
+        };
+        for h in self
+            .index
+            .neighbours_above(Value::new(from), self.score_floor)
+        {
+            proposals.push(h.raw);
+        }
+    }
+
+    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
+        if variable != self.a.index && variable != self.b.index {
+            return;
+        }
+        let other = if variable == self.a.index {
+            self.b.index
+        } else {
+            self.a.index
+        };
+        let Some(from) = binding.get(other).copied() else {
+            // With no pivot, we can only keep proposals that pair
+            // with *something* in the index above the floor. Keep
+            // them all — the engine will revisit once the other
+            // side is bound.
+            return;
+        };
+        let allowed: HashSet<RawValue> = self
+            .index
+            .neighbours_above(Value::new(from), self.score_floor)
+            .into_iter()
+            .map(|h| h.raw)
+            .collect();
+        proposals.retain(|raw| allowed.contains(raw));
+    }
+
+    fn satisfied(&self, binding: &Binding) -> bool {
+        match (binding.get(self.a.index), binding.get(self.b.index)) {
+            (Some(a), Some(b)) => {
+                // Both bound: compute cosine directly. No engine
+                // reason to prefer the walk here — exact beats
+                // approximate once we've paid the two blob fetches.
+                match self.index.cosine_between(Value::new(*a), Value::new(*b)) {
+                    Some(sim) => sim >= self.score_floor,
+                    None => false,
+                }
+            }
+            // Only one side bound: treated as trivially satisfied
+            // — the engine will exercise propose/confirm on the
+            // free side before binding it.
+            _ => true,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bm25::BM25Builder;
     use crate::tokens::hash_tokens;
+    use triblespace::core::blob::MemoryBlobStore;
     use triblespace::core::id::{Id, RawId};
     use triblespace::core::repo::BlobStore;
 
@@ -832,7 +556,7 @@ mod tests {
     }
 
     /// 32-byte `Value<GenId>` form of `id(byte)` — matches what
-    /// `BM25Builder::insert_id` stores and what the index's
+    /// `BM25Builder::insert` stores and what the index's
     /// `query_term` returns.
     fn id_key(byte: u8) -> RawValue {
         let mut raw = [0u8; 32];
@@ -899,7 +623,6 @@ mod tests {
         assert_eq!(c.estimate(doc.index, &binding), Some(2));
         // Unknown variable → None.
         let unk_binding = Binding::default();
-        // Pick an unused variable id (one past what VariableContext allocated).
         assert_eq!(c.estimate(255, &unk_binding), None);
     }
 
@@ -916,9 +639,6 @@ mod tests {
         c.propose(doc.index, &binding, &mut props);
         assert_eq!(props.len(), 2);
 
-        // All proposals decode cleanly into Ids, and those Ids
-        // are exactly the docs that had "fox" in the posting
-        // list.
         let ids: HashSet<Id> = props
             .iter()
             .map(|r| raw_value_to_id(r).expect("valid GenId value"))
@@ -942,8 +662,6 @@ mod tests {
             id_to_raw_value(id(3)),
         ];
         c.confirm(doc.index, &binding, &mut props);
-        // Doc 2 doesn't contain "fox" — should be filtered out.
-        // Docs 1 and 3 do.
         let ids: HashSet<Id> = props.iter().map(|r| raw_value_to_id(r).unwrap()).collect();
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&id(1)));
@@ -959,127 +677,15 @@ mod tests {
         let term = hash_tokens("fox")[0];
         let c = idx.docs_containing(doc, term);
 
-        // Unbound → trivially satisfied.
         let empty = Binding::default();
         assert!(c.satisfied(&empty));
 
-        // Bound to a matching doc → satisfied.
         let mut bound = Binding::default();
         bound.set(doc.index, &id_to_raw_value(id(1)));
         assert!(c.satisfied(&bound));
 
-        // Bound to a non-matching doc → unsatisfied.
         let mut unmatching = Binding::default();
         unmatching.set(doc.index, &id_to_raw_value(id(2)));
-        assert!(!c.satisfied(&unmatching));
-    }
-
-    fn sample_flat() -> (
-        crate::hnsw::FlatIndex,
-        triblespace::core::blob::MemoryBlobStore<
-            triblespace::core::value::schemas::hash::Blake3,
-        >,
-    ) {
-        use crate::hnsw::FlatBuilder;
-        use triblespace::core::blob::MemoryBlobStore;
-        use triblespace::core::value::schemas::hash::Blake3;
-        let mut store = MemoryBlobStore::<Blake3>::new();
-        let mut b = FlatBuilder::new(3);
-        for (i, v) in [
-            (1u8, vec![1.0, 0.0, 0.0]),
-            (2, vec![0.0, 1.0, 0.0]),
-            (3, vec![0.9, 0.1, 0.0]),
-            (4, vec![0.0, 0.0, 1.0]),
-        ] {
-            let h = crate::schemas::put_embedding::<_, Blake3>(&mut store, v).unwrap();
-            b.insert(&id(i), h);
-        }
-        (b.build(), store)
-    }
-
-    #[test]
-    fn similar_constraint_estimate_is_k() {
-        let (idx, mut store) = sample_flat();
-        let mut ctx = triblespace::core::query::VariableContext::new();
-        let doc: Variable<GenId> = ctx.next_variable();
-        let c = idx.attach(&store.reader().unwrap()).similar_constraint(doc, vec![1.0, 0.0, 0.0], 2)
-            .unwrap();
-
-        let binding = Binding::default();
-        // k=2 and corpus has 4 docs → estimate is 2.
-        assert_eq!(c.estimate(doc.index, &binding), Some(2));
-    }
-
-    #[test]
-    fn similar_constraint_estimate_clamps_to_corpus() {
-        let (idx, mut store) = sample_flat();
-        let mut ctx = triblespace::core::query::VariableContext::new();
-        let doc: Variable<GenId> = ctx.next_variable();
-        // Larger k than corpus — estimate must clamp to doc_count.
-        let c = idx.attach(&store.reader().unwrap()).similar_constraint(doc, vec![1.0, 0.0, 0.0], 100)
-            .unwrap();
-        let binding = Binding::default();
-        assert_eq!(c.estimate(doc.index, &binding), Some(4));
-    }
-
-    #[test]
-    fn similar_constraint_proposes_top_k() {
-        let (idx, mut store) = sample_flat();
-        let mut ctx = triblespace::core::query::VariableContext::new();
-        let doc: Variable<GenId> = ctx.next_variable();
-        let c = idx.attach(&store.reader().unwrap()).similar_constraint(doc, vec![1.0, 0.0, 0.0], 2)
-            .unwrap();
-
-        let binding = Binding::default();
-        let mut props = Vec::new();
-        c.propose(doc.index, &binding, &mut props);
-        let ids: HashSet<Id> = props.iter().map(|r| raw_value_to_id(r).unwrap()).collect();
-        // top-2 for [1,0,0] query should be id(1) (exact) and id(3) (close).
-        assert_eq!(ids.len(), 2);
-        assert!(ids.contains(&id(1)));
-        assert!(ids.contains(&id(3)));
-    }
-
-    #[test]
-    fn similar_constraint_confirm_filters_non_top_k() {
-        let (idx, mut store) = sample_flat();
-        let mut ctx = triblespace::core::query::VariableContext::new();
-        let doc: Variable<GenId> = ctx.next_variable();
-        let c = idx.attach(&store.reader().unwrap()).similar_constraint(doc, vec![1.0, 0.0, 0.0], 2)
-            .unwrap();
-
-        let binding = Binding::default();
-        let mut props: Vec<RawValue> = vec![
-            id_to_raw_value(id(1)),
-            id_to_raw_value(id(2)), // not in top-2
-            id_to_raw_value(id(3)),
-            id_to_raw_value(id(4)), // not in top-2
-        ];
-        c.confirm(doc.index, &binding, &mut props);
-        let ids: HashSet<Id> = props.iter().map(|r| raw_value_to_id(r).unwrap()).collect();
-        assert!(ids.contains(&id(1)));
-        assert!(!ids.contains(&id(2)));
-        assert!(ids.contains(&id(3)));
-        assert!(!ids.contains(&id(4)));
-    }
-
-    #[test]
-    fn similar_constraint_satisfied_checks_bound_doc() {
-        let (idx, mut store) = sample_flat();
-        let mut ctx = triblespace::core::query::VariableContext::new();
-        let doc: Variable<GenId> = ctx.next_variable();
-        let c = idx.attach(&store.reader().unwrap()).similar_constraint(doc, vec![1.0, 0.0, 0.0], 2)
-            .unwrap();
-
-        // Unbound → trivially satisfied.
-        assert!(c.satisfied(&Binding::default()));
-        // Bound to an in-top-k doc → satisfied.
-        let mut bound = Binding::default();
-        bound.set(doc.index, &id_to_raw_value(id(1)));
-        assert!(c.satisfied(&bound));
-        // Bound to a not-in-top-k doc → unsatisfied.
-        let mut unmatching = Binding::default();
-        unmatching.set(doc.index, &id_to_raw_value(id(4)));
         assert!(!c.satisfied(&unmatching));
     }
 
@@ -1094,17 +700,13 @@ mod tests {
         let term = hash_tokens("fox")[0];
         let c = idx.docs_and_scores(doc, score, term);
 
-        // Variables: both doc and score.
         let vars = c.variables();
         assert!(vars.is_set(doc.index));
         assert!(vars.is_set(score.index));
 
-        // Cardinality: same doc_frequency for both variables.
         assert_eq!(c.estimate(doc.index, &Binding::default()), Some(2));
         assert_eq!(c.estimate(score.index, &Binding::default()), Some(2));
 
-        // Propose doc with no binding: 2 entries, each decodes
-        // to a real id.
         let mut doc_props = Vec::new();
         c.propose(doc.index, &Binding::default(), &mut doc_props);
         assert_eq!(doc_props.len(), 2);
@@ -1112,10 +714,8 @@ mod tests {
             raw_value_to_id(p).expect("genid round-trip");
         }
 
-        // Propose score with no binding: the two "fox" docs in
-        // sample_index have identical BM25 scores (same length,
-        // same tf), so dedupe collapses them to one proposal.
-        // Every entry must decode to a positive finite f32.
+        // sample_index's two "fox" docs share identical BM25
+        // scores — dedupe collapses them to one proposal.
         let mut score_props = Vec::new();
         c.propose(score.index, &Binding::default(), &mut score_props);
         assert_eq!(score_props.len(), 1);
@@ -1129,8 +729,7 @@ mod tests {
     fn scored_constraint_binds_doc_given_score() {
         // Purpose-built corpus where "fox" appears in two docs of
         // *different* lengths — so the two postings have
-        // different BM25 scores and the score-filter
-        // meaningfully distinguishes them.
+        // different BM25 scores.
         let mut b = BM25Builder::new();
         b.insert(&id(1), hash_tokens("fox"));
         b.insert(&id(2), hash_tokens("quick brown fox jumps high today"));
@@ -1180,7 +779,6 @@ mod tests {
 
         let mut props = Vec::new();
         c.propose(score.index, &binding, &mut props);
-        // Exactly one score for (doc = id(1), term = fox).
         assert_eq!(props.len(), 1);
         assert!(raw_value_to_f32(&props[0]) > 0.0);
     }
@@ -1194,9 +792,6 @@ mod tests {
         let term = hash_tokens("fox")[0];
         let c = idx.docs_and_scores(doc, score, term);
 
-        // Offer a "score" proposal list mixing one real score
-        // from the index with some made-up ones. Confirm must
-        // keep only the real ones.
         let real = idx.query_term(&term).map(|(_, s)| s).collect::<Vec<f32>>();
         let mut props = vec![
             f32_to_raw_value(real[0]),
@@ -1208,166 +803,151 @@ mod tests {
         assert!((raw_value_to_f32(&props[0]) - real[0]).abs() < 1e-6);
     }
 
-    fn sample_hnsw() -> (
+    // ── Similar (binary-relation similarity) ──────────────────
+
+    /// Build a 3-doc corpus where doc 1 = [1,0,0], doc 2 = [0,1,0],
+    /// doc 3 ≈ doc 1. Returns (flat_index, hnsw_index, store,
+    /// handles) — handles is parallel-indexed `[h1, h2, h3]`.
+    fn sample_sim() -> (
+        crate::hnsw::FlatIndex,
         crate::hnsw::HNSWIndex,
-        triblespace::core::blob::MemoryBlobStore<
-            triblespace::core::value::schemas::hash::Blake3,
-        >,
+        MemoryBlobStore<Blake3>,
+        [Value<Handle<Blake3, Embedding>>; 3],
     ) {
-        use crate::hnsw::HNSWBuilder;
-        use triblespace::core::blob::MemoryBlobStore;
-        use triblespace::core::value::schemas::hash::Blake3;
+        use crate::hnsw::{FlatBuilder, HNSWBuilder};
         let mut store = MemoryBlobStore::<Blake3>::new();
-        let mut b = HNSWBuilder::new(3).with_seed(42);
-        for (i, v) in [
-            (1u8, vec![1.0f32, 0.0, 0.0]),
-            (2, vec![0.0, 1.0, 0.0]),
-            (3, vec![0.9, 0.1, 0.0]),
-            (4, vec![0.0, 0.0, 1.0]),
-        ] {
-            let h = crate::schemas::put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
-            b.insert(&id(i), h, v).unwrap();
+        let vecs = [
+            vec![1.0f32, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.9, 0.1, 0.0],
+        ];
+        let mut handles: [Value<Handle<Blake3, Embedding>>; 3] =
+            [Value::new([0u8; 32]); 3];
+        for (i, v) in vecs.iter().enumerate() {
+            handles[i] =
+                crate::schemas::put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
         }
-        (b.build_naive(), store)
-    }
-
-    #[test]
-    fn hnsw_constraint_proposes_top_k() {
-        let (idx, mut store) = sample_hnsw();
-        let mut ctx = triblespace::core::query::VariableContext::new();
-        let doc: Variable<GenId> = ctx.next_variable();
-        let c = idx.attach(&store.reader().unwrap()).similar_constraint(doc, vec![1.0, 0.0, 0.0], 2, Some(10))
-            .unwrap();
-
-        let binding = Binding::default();
-        let mut props = Vec::new();
-        c.propose(doc.index, &binding, &mut props);
-        let ids: HashSet<Id> = props.iter().map(|r| raw_value_to_id(r).unwrap()).collect();
-        // Top-2 neighbours of [1,0,0] should include docs 1 and 3
-        // (exact and near-exact matches respectively). HNSW is
-        // approximate; allow either to be present and just check
-        // neither of 3/4 dominates.
-        assert!(ids.len() <= 2);
-        assert!(ids.contains(&id(1)) || ids.contains(&id(3)));
-    }
-
-    #[test]
-    fn hnsw_constraint_estimate_clamps_to_corpus() {
-        let (idx, mut store) = sample_hnsw();
-        let mut ctx = triblespace::core::query::VariableContext::new();
-        let doc: Variable<GenId> = ctx.next_variable();
-        let c = idx.attach(&store.reader().unwrap()).similar_constraint(doc, vec![1.0, 0.0, 0.0], 100, None)
-            .unwrap();
-        assert_eq!(c.estimate(doc.index, &Binding::default()), Some(4));
-    }
-
-    #[test]
-    fn hnsw_constraint_satisfied_respects_binding() {
-        let (idx, mut store) = sample_hnsw();
-        let mut ctx = triblespace::core::query::VariableContext::new();
-        let doc: Variable<GenId> = ctx.next_variable();
-        let c = idx.attach(&store.reader().unwrap()).similar_constraint(doc, vec![1.0, 0.0, 0.0], 2, Some(10))
-            .unwrap();
-
-        // Unbound → trivially satisfied.
-        assert!(c.satisfied(&Binding::default()));
-    }
-
-    // ── SimilarToVectorScored (flat + score) ──────────────────
-
-    #[test]
-    fn flat_scored_constraint_proposes_both() {
-        let (idx, mut store) = sample_flat();
-        let mut ctx = triblespace::core::query::VariableContext::new();
-        let doc: Variable<GenId> = ctx.next_variable();
-        let score: Variable<F32LE> = ctx.next_variable();
-        let c = idx.attach(&store.reader().unwrap()).similar_with_scores(doc, score, vec![1.0, 0.0, 0.0], 3)
-            .unwrap();
-
-        let vars = c.variables();
-        assert!(vars.is_set(doc.index));
-        assert!(vars.is_set(score.index));
-
-        let mut doc_props = Vec::new();
-        c.propose(doc.index, &Binding::default(), &mut doc_props);
-        assert_eq!(doc_props.len(), 3);
-        for p in &doc_props {
-            raw_value_to_id(p).expect("genid round-trip");
+        let mut flat = FlatBuilder::new(3);
+        for h in handles.iter() {
+            flat.insert(*h);
         }
-
-        let mut score_props = Vec::new();
-        c.propose(score.index, &Binding::default(), &mut score_props);
-        assert_eq!(score_props.len(), 3);
-        for p in &score_props {
-            let s = raw_value_to_f32(p);
-            assert!(s.is_finite() && s >= -1.0 && s <= 1.0);
+        let mut hnsw = HNSWBuilder::new(3).with_seed(42);
+        for (i, v) in vecs.iter().enumerate() {
+            hnsw.insert(handles[i], v.clone()).unwrap();
         }
+        (flat.build(), hnsw.build_naive(), store, handles)
     }
 
     #[test]
-    fn flat_scored_binds_doc_given_score() {
-        let (idx, mut store) = sample_flat();
-        let mut ctx = triblespace::core::query::VariableContext::new();
-        let doc: Variable<GenId> = ctx.next_variable();
-        let score: Variable<F32LE> = ctx.next_variable();
-        let c = idx.attach(&store.reader().unwrap()).similar_with_scores(doc, score, vec![1.0, 0.0, 0.0], 4)
-            .unwrap();
+    fn flat_similar_proposes_candidates_above_floor() {
+        let (flat, _hnsw, mut store, handles) = sample_sim();
+        let reader = store.reader().unwrap();
+        let view = flat.attach(&reader);
 
-        // Prime `score` to the exact-match value (1.0). Only
-        // id(1) — the [1,0,0] doc — should come back.
+        let mut ctx = triblespace::core::query::VariableContext::new();
+        let a: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
+        let b: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
+        let c = view.similar(a, b, 0.8);
+
+        // Bind `a` to doc 1's handle; propose `b`. Expect doc 1
+        // (cos=1.0) and doc 3 (cos≈0.994) above 0.8; doc 2
+        // (cos=0) below.
         let mut binding = Binding::default();
-        binding.set(score.index, &f32_to_raw_value(1.0));
+        binding.set(a.index, &handles[0].raw);
 
         let mut props = Vec::new();
-        c.propose(doc.index, &binding, &mut props);
-        assert_eq!(props.len(), 1);
-        assert_eq!(raw_value_to_id(&props[0]).unwrap(), id(1));
+        c.propose(b.index, &binding, &mut props);
+        let got: HashSet<RawValue> = props.iter().copied().collect();
+        assert!(got.contains(&handles[0].raw));
+        assert!(got.contains(&handles[2].raw));
+        assert!(!got.contains(&handles[1].raw));
     }
 
-    // ── SimilarToVectorHNSWScored (hnsw + score) ──────────────
-
     #[test]
-    fn hnsw_scored_constraint_proposes_both() {
-        let (idx, mut store) = sample_hnsw();
+    fn flat_similar_symmetric_bind_on_b() {
+        let (flat, _hnsw, mut store, handles) = sample_sim();
+        let reader = store.reader().unwrap();
+        let view = flat.attach(&reader);
+
         let mut ctx = triblespace::core::query::VariableContext::new();
-        let doc: Variable<GenId> = ctx.next_variable();
-        let score: Variable<F32LE> = ctx.next_variable();
-        let c = idx
-            .attach(&store.reader().unwrap())
-            .similar_with_scores(doc, score, vec![1.0, 0.0, 0.0], 2, Some(10))
-            .unwrap();
+        let a: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
+        let b: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
+        let c = view.similar(a, b, 0.8);
 
-        let vars = c.variables();
-        assert!(vars.is_set(doc.index));
-        assert!(vars.is_set(score.index));
+        let mut binding = Binding::default();
+        binding.set(b.index, &handles[2].raw);
 
-        let mut doc_props = Vec::new();
-        c.propose(doc.index, &Binding::default(), &mut doc_props);
-        assert!(!doc_props.is_empty());
-        for p in &doc_props {
-            raw_value_to_id(p).expect("genid round-trip");
-        }
-
-        let mut score_props = Vec::new();
-        c.propose(score.index, &Binding::default(), &mut score_props);
-        assert_eq!(score_props.len(), doc_props.len());
+        let mut props = Vec::new();
+        c.propose(a.index, &binding, &mut props);
+        let got: HashSet<RawValue> = props.iter().copied().collect();
+        assert!(got.contains(&handles[0].raw));
+        assert!(got.contains(&handles[2].raw));
     }
 
-    /// Sanity-check that `propose` yields values every consumer
-    /// will be able to decode back into `Id`s.
     #[test]
-    fn proposed_values_decode_back_to_ids() {
-        let idx = sample_index();
-        let mut ctx = triblespace::core::query::VariableContext::new();
-        let doc: Variable<GenId> = ctx.next_variable();
-        let term = hash_tokens("fox")[0];
-        let c = idx.docs_containing(doc, term);
+    fn flat_similar_satisfied_both_bound() {
+        let (flat, _hnsw, mut store, handles) = sample_sim();
+        let reader = store.reader().unwrap();
+        let view = flat.attach(&reader);
 
-        let binding = Binding::default();
-        let mut proposals = Vec::new();
-        c.propose(doc.index, &binding, &mut proposals);
-        for raw in &proposals {
-            raw_value_to_id(raw).expect("genid roundtrip");
-        }
+        let mut ctx = triblespace::core::query::VariableContext::new();
+        let a: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
+        let b: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
+        let c = view.similar(a, b, 0.8);
+
+        // doc 1 vs doc 3: cos ≈ 0.994, above 0.8 → satisfied.
+        let mut good = Binding::default();
+        good.set(a.index, &handles[0].raw);
+        good.set(b.index, &handles[2].raw);
+        assert!(c.satisfied(&good));
+
+        // doc 1 vs doc 2: cos = 0.0, below 0.8 → not satisfied.
+        let mut bad = Binding::default();
+        bad.set(a.index, &handles[0].raw);
+        bad.set(b.index, &handles[1].raw);
+        assert!(!c.satisfied(&bad));
+    }
+
+    #[test]
+    fn hnsw_similar_proposes_candidates_above_floor() {
+        let (_flat, hnsw, mut store, handles) = sample_sim();
+        let reader = store.reader().unwrap();
+        let view = hnsw.attach(&reader);
+
+        let mut ctx = triblespace::core::query::VariableContext::new();
+        let a: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
+        let b: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
+        let c = view.similar(a, b, 0.8);
+
+        let mut binding = Binding::default();
+        binding.set(a.index, &handles[0].raw);
+
+        let mut props = Vec::new();
+        c.propose(b.index, &binding, &mut props);
+        let got: HashSet<RawValue> = props.iter().copied().collect();
+        assert!(got.contains(&handles[0].raw));
+        assert!(got.contains(&handles[2].raw));
+        assert!(!got.contains(&handles[1].raw));
+    }
+
+    #[test]
+    fn similar_estimate_saturates_when_other_unbound() {
+        // The engine's "unconstrained variable" check rejects
+        // `None` at construction time — so `similar` reports
+        // `usize::MAX` (infinitely expensive) until the other
+        // side is bound, and `None` only for unrelated vars.
+        let (flat, _hnsw, mut store, _handles) = sample_sim();
+        let reader = store.reader().unwrap();
+        let view = flat.attach(&reader);
+
+        let mut ctx = triblespace::core::query::VariableContext::new();
+        let a: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
+        let b: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
+        let unrelated: Variable<GenId> = ctx.next_variable();
+        let c = view.similar(a, b, 0.8);
+
+        assert_eq!(c.estimate(a.index, &Binding::default()), Some(usize::MAX));
+        assert_eq!(c.estimate(b.index, &Binding::default()), Some(usize::MAX));
+        assert_eq!(c.estimate(unrelated.index, &Binding::default()), None);
     }
 }
