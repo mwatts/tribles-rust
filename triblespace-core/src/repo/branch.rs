@@ -10,6 +10,7 @@ use hifitime::prelude::*;
 use itertools::Itertools;
 
 use crate::blob::schemas::longstring::LongString;
+use crate::blob::schemas::succinctarchive::SuccinctArchiveBlob;
 use crate::blob::Blob;
 use crate::find;
 use crate::id::Id;
@@ -52,6 +53,7 @@ pub fn branch_metadata(
     branch_id: Id,
     name: Value<Handle<Blake3, LongString>>,
     commit_head: Option<Blob<SimpleArchive>>,
+    rollup: Option<Value<Handle<Blake3, SuccinctArchiveBlob>>>,
 ) -> TribleSet {
     let (head_handle, signed_by, signature) = match commit_head.as_ref() {
         Some(blob) => (
@@ -69,6 +71,7 @@ pub fn branch_metadata(
         super::signed_by?: signed_by,
         super::signature_r?: signature,
         super::signature_s?: signature,
+        super::rollup?: rollup,
         metadata::name: name,
         metadata::updated_at: updated_at,
     };
@@ -83,6 +86,7 @@ pub fn branch_unsigned(
     branch_id: Id,
     name: Value<Handle<Blake3, LongString>>,
     commit_head: Option<Blob<SimpleArchive>>,
+    rollup: Option<Value<Handle<Blake3, SuccinctArchiveBlob>>>,
 ) -> TribleSet {
     let head_handle = commit_head
         .as_ref()
@@ -92,6 +96,7 @@ pub fn branch_unsigned(
     let fragment = entity! {
         super::branch: branch_id,
         super::head?: head_handle,
+        super::rollup?: rollup,
         metadata::name: name,
         metadata::updated_at: updated_at,
     };

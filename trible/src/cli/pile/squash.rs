@@ -229,6 +229,11 @@ pub fn run(
             *branch_id,
             name_handle,
             Some(head_blob.to_blob()),
+            // Squash drops any existing rollup; the new single-commit head
+            // may not match the previous rollup's contents, and squash has
+            // no visibility into archive state. Readers fall back to
+            // checkout until a new rollup is published.
+            None,
         );
 
         let branch_meta_handle = dst_pile

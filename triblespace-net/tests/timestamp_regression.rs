@@ -41,7 +41,7 @@ fn publish_remote_meta(
     let _commit_handle: Value<Handle<Blake3, SimpleArchive>> =
         store.put(commit_blob.clone()).unwrap();
 
-    let meta_set = branch_unsigned(remote_branch_id, name_handle, Some(commit_blob));
+    let meta_set = branch_unsigned(remote_branch_id, name_handle, Some(commit_blob), None);
     let meta_handle: Value<Handle<Blake3, SimpleArchive>> = store.put(meta_set).unwrap();
     meta_handle.raw
 }
