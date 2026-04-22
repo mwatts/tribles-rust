@@ -577,9 +577,9 @@ mod tests {
     }
 
     /// Test helper: the 32-byte `Value<GenId>` representation of
-    /// the Id used by `id(byte)`. Matches what `insert_id` stores
-    /// internally, so `query_term` results can be compared
-    /// against it.
+    /// the Id used by `id(byte)`. Matches what `BM25Builder::insert`
+    /// stores internally, so `query_term` results can be
+    /// compared against it.
     fn id_key(byte: u8) -> RawValue {
         let mut raw = [0u8; 32];
         let id = id(byte);
@@ -598,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_value_indexes_by_string() {
+    fn insert_indexes_by_string_key() {
         use triblespace::core::value::schemas::shortstring::ShortString;
         use triblespace::core::value::{ToValue, Value};
 

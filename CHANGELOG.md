@@ -82,18 +82,21 @@ TribleSpace taste:
 
 ### Query engine integration
 
-- `BM25Queryable` + `HNSWQueryable` traits generalize the four
-  BM25 / HNSW constraint types over both naive and succinct
-  index representations. `find!` / `pattern!` / `and!` queries
-  work unmodified against either.
+- `BM25Queryable` generalizes the `DocsContainingTerm` /
+  `BM25ScoredPostings` constraints over the naive
+  `BM25Index<D, T>` and the succinct `SuccinctBM25Index<D, T>`.
+  `SimilaritySearch` plays the same role for the attached HNSW
+  / Flat / SuccinctHNSW views behind the binary-relation
+  `Similar` constraint. `find!` / `pattern!` / `and!` queries
+  work unmodified across backends.
 - `BM25Queryable::score_tolerance()` lets the constraint's
   score-equality check widen for quantized indexes
   automatically — lossless naive path keeps `f32::EPSILON`,
   `SuccinctBM25Index` returns `max_score / 65534`.
-- `BM25ScoredPostings`, `SimilarToVectorScored`, and
-  `SimilarToVectorHNSWScored` dedupe their score proposals by
-  bit-pattern to avoid Cartesian blow-up when multiple docs
-  share a score. Regression-locked at 1 k scale.
+- `BM25ScoredPostings` dedupes its score proposals by
+  bit-pattern so multiple docs sharing a BM25 score don't
+  expand into a Cartesian cross. Regression-locked at 1 k
+  scale.
 
 ### Build-side
 
@@ -126,27 +129,23 @@ TribleSpace taste:
 
 - `BM25Builder<D, T>` / `BM25Index<D, T>` / `SuccinctBM25Index<D, T>`
   are now generic over the doc-key schema `D` and the term
-  schema `T`. Default types are `<GenId, TokenHandle>` so
-  `BM25Builder::new()` still gives the common "entity-keyed, text-
-  token" shape; other shapes use `::typed()` + turbofish, e.g.
-  `BM25Builder::<ShortString, TokenHandle>::typed()` for a
+  schema `T`. Default types are `<GenId, WordHash>` so
+  `BM25Builder::new()` still gives the common "entity-keyed,
+  text-token" shape; other shapes use `::typed()` + turbofish,
+  e.g. `BM25Builder::<ShortString, WordHash>::typed()` for a
   title-keyed index or `BM25Builder::<GenId, GenId>::typed()`
   for entity-citation search.
-- `HNSWBuilder<D>` / `HNSWIndex<D>` / `SuccinctHNSWIndex<D>` /
-  `FlatBuilder<D>` / `FlatIndex<D>` + their `Attached*` wrappers
-  are generic over `D` only (HNSW has no term space). Same
-  `new()` / `typed()` default pattern.
 - `insert` accepts anything that `ToValue<D>`-converts — pass a
   typed `Value<D>` directly, or `&id` for the common GenId case.
-  `insert_id` and `insert_value` are gone; the single `insert`
+  `insert_id` / `insert_value` don't exist; the single `insert`
   covers both.
-- `tokens::TokenHandle` is a type alias for
-  `Handle<Blake3, LongString>`. The built-in tokenizers
-  (`hash_tokens`, `bigram_tokens`, `code_tokens`, `ngram_tokens`)
-  return `Vec<Value<TokenHandle>>`. Callers who want stricter
-  separation (e.g. "ngrams and word hashes should be different
-  term types so the compiler catches mix-ups") can define their
-  own newtype schemas.
+- Per-tokenizer term schemas: `hash_tokens` →
+  `Vec<Value<WordHash>>`, `bigram_tokens` →
+  `Vec<Value<BigramHash>>`, `ngram_tokens` →
+  `Vec<Value<NgramHash>>`. The compiler refuses to cross-feed
+  flavours into the wrong index — see
+  `examples/phrase_search.rs` for the two-index pattern when a
+  caller needs multiple tokenizer flavours.
 
 The two-schema parameterization buys compile-time safety: you
 can't accidentally feed ngram terms into a word-hash index,

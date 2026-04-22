@@ -784,14 +784,14 @@ impl SuccinctGraph {
 
 /// Zero-copy, jerky-backed HNSW index.
 ///
-/// Same query surface as [`HNSWIndex`] (approximate top-k via
-/// Malkov-Yashunin greedy descent + ef-search), but the graph
-/// lives in a [`SuccinctGraph`] (bit-packed CSR over
-/// (layer, node) → neighbours) and doc ids in a
-/// [`FixedBytesTable<16>`]. Vectors are stored as a flat f32
-/// block viewed zero-copy through [`anybytes::View<[f32]>`] —
-/// compression (f16 / int8 / PQ) is a separate decision the
-/// caller makes via the embedding schema.
+/// Same query surface as [`HNSWIndex`] (Malkov-Yashunin greedy
+/// descent + ef-search, threshold-gated via
+/// `candidates_above(handle, floor)`), but the graph lives in a
+/// [`SuccinctGraph`] (bit-packed CSR over (layer, node) →
+/// neighbours) and nodes are `Value<Handle<Blake3, Embedding>>`
+/// in a [`FixedBytesTable<32>`]. Embeddings live in the pile's
+/// blob store, content-addressed — queries resolve handles
+/// through the attached reader at walk time.
 ///
 /// Built via [`Self::from_naive`]; a direct builder skipping the
 /// naive intermediate is a later optimization.
