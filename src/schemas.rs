@@ -110,6 +110,24 @@ impl BlobSchema for Embedding {}
 // type is `Handle<Blake3, Embedding>`.
 impl triblespace::core::metadata::ConstDescribe for Embedding {}
 
+/// Shorthand for the most common embedding-handle value schema:
+/// `Handle<Blake3, Embedding>`. Use in trible attributes, in
+/// similarity constraint variables, wherever you'd otherwise
+/// spell the full type.
+///
+/// ```
+/// use triblespace::core::value::Value;
+/// use triblespace_search::schemas::EmbHandle;
+///
+/// fn keep(_h: Value<EmbHandle>) {}
+/// # keep(Value::new([0u8; 32]));
+/// ```
+pub type EmbHandle =
+    triblespace::core::value::schemas::hash::Handle<
+        triblespace::core::value::schemas::hash::Blake3,
+        Embedding,
+    >;
+
 /// Decode a blob back into a zero-copy `View<[f32]>`. Fails
 /// iff the blob's byte length isn't a multiple of 4 (malformed)
 /// or the backing buffer can't be aligned to `f32`.

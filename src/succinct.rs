@@ -47,14 +47,10 @@ use triblespace::core::id::Id;
 use triblespace::core::id_hex;
 use triblespace::core::metadata::{ConstDescribe, ConstId};
 use triblespace::core::query::Variable;
-use triblespace::core::value::schemas::hash::{Blake3, Handle};
+use triblespace::core::value::schemas::hash::Blake3;
 use triblespace::core::value::{RawValue, Value, ValueSchema};
 
-use crate::schemas::Embedding;
-
-/// Shorthand used throughout the HNSW path for the handle value
-/// schema that identifies a node.
-type EmbHandle = Handle<Blake3, Embedding>;
+use crate::schemas::{EmbHandle, Embedding};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use std::collections::HashMap;

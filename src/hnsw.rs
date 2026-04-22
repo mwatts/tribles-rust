@@ -41,10 +41,11 @@
 //! assert!(!hits.contains(&h2));
 //! ```
 
+use triblespace::core::query::Variable;
 use triblespace::core::value::schemas::hash::{Blake3, Handle};
 use triblespace::core::value::Value;
 
-use crate::schemas::Embedding;
+use crate::schemas::{EmbHandle, Embedding};
 
 // ── HNSW blob byte format ────────────────────────────────────────────
 //
@@ -596,8 +597,8 @@ where
     /// [`crate::constraint::Similar`] for the full semantics.
     pub fn similar(
         &self,
-        a: triblespace::core::query::Variable<Handle<Blake3, Embedding>>,
-        b: triblespace::core::query::Variable<Handle<Blake3, Embedding>>,
+        a: Variable<EmbHandle>,
+        b: Variable<EmbHandle>,
         score_floor: f32,
     ) -> crate::constraint::Similar<'_, Self> {
         crate::constraint::Similar::new(self, a, b, score_floor)
@@ -614,10 +615,9 @@ where
     /// beam via [`with_ef_search`][Self::with_ef_search].
     pub fn candidates_above(
         &self,
-        from_handle: Value<Handle<Blake3, Embedding>>,
+        from_handle: Value<EmbHandle>,
         score_floor: f32,
-    ) -> Result<Vec<Value<Handle<Blake3, Embedding>>>, B::GetError<anybytes::view::ViewError>>
-    {
+    ) -> Result<Vec<Value<EmbHandle>>, B::GetError<anybytes::view::ViewError>> {
         let Some(entry) = self.index.entry_point else {
             return Ok(Vec::new());
         };
@@ -982,8 +982,8 @@ where
     /// [a]: super::AttachedHNSWIndex::similar
     pub fn similar(
         &self,
-        a: triblespace::core::query::Variable<Handle<Blake3, Embedding>>,
-        b: triblespace::core::query::Variable<Handle<Blake3, Embedding>>,
+        a: Variable<EmbHandle>,
+        b: Variable<EmbHandle>,
         score_floor: f32,
     ) -> crate::constraint::Similar<'_, Self> {
         crate::constraint::Similar::new(self, a, b, score_floor)
@@ -997,10 +997,9 @@ where
     /// [a]: super::AttachedHNSWIndex::candidates_above
     pub fn candidates_above(
         &self,
-        from_handle: Value<Handle<Blake3, Embedding>>,
+        from_handle: Value<EmbHandle>,
         score_floor: f32,
-    ) -> Result<Vec<Value<Handle<Blake3, Embedding>>>, B::GetError<anybytes::view::ViewError>>
-    {
+    ) -> Result<Vec<Value<EmbHandle>>, B::GetError<anybytes::view::ViewError>> {
         let from = self.cache.get(from_handle)?;
         let query = from.as_ref().as_ref();
         if query.len() != self.index.dim {
