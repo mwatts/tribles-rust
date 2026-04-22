@@ -63,7 +63,6 @@ use crate::schemas::Embedding;
 #[derive(Debug)]
 struct HNSWNode {
     vector: Vec<f32>,
-    #[allow(dead_code)]
     level: u8,
     neighbors: Vec<Vec<u32>>,
 }
@@ -73,7 +72,6 @@ struct HNSWNode {
 /// parallel `handles` table.
 #[derive(Debug)]
 struct HNSWIndexNode {
-    #[allow(dead_code)]
     level: u8,
     neighbors: Vec<Vec<u32>>,
 }
@@ -270,11 +268,6 @@ impl HNSWBuilder {
             self.entry_point = Some(new_idx);
         }
         Ok(())
-    }
-
-    #[doc(hidden)]
-    #[allow(dead_code)]
-    fn _retained_nothing(&self) {
     }
 
     /// Consume the builder and produce a succinct HNSW index,
