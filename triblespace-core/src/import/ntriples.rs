@@ -190,7 +190,7 @@ where
 /// written into `ws`'s local blob store.
 ///
 /// Merge the returned [`TribleSet`] into a workspace via
-/// [`Workspace::commit`] or [`TribleSet::+=`] to materialize the import.
+/// [`Workspace::commit`] or `+=` to materialize the import.
 pub fn ingest_ntriples<Blobs>(
     ws: &mut Workspace<Blobs>,
     reader: impl BufRead,

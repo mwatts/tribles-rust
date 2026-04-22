@@ -17,7 +17,7 @@ use crate::value::ValueSchema;
 
 /// Constrains a variable to keys present in a [`HashMap`].
 ///
-/// Created via the [`ContainsConstraint`](crate::query::ContainsConstraint)
+/// Created via the [`ContainsConstraint`]
 /// trait (`.has(variable)`). Proposals enumerate every key in the map;
 /// confirmations retain only proposals whose key exists. Accepts
 /// `&HashMap<K,V>`, `Rc<HashMap<K,V>>`, and `Arc<HashMap<K,V>>`.

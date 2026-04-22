@@ -4,7 +4,7 @@ use super::*;
 ///
 /// Used to express variable equality when two positions in a triple
 /// share the same logical variable but need distinct [`VariableId`]s
-/// for the [`TribleSetConstraint`](crate::trible::tribleset::triblesetconstraint::TribleSetConstraint)
+/// for the `TribleSetConstraint`
 /// (which assumes its three positions have distinct ids).
 ///
 /// The macro layer emits this automatically when a `_?var` appears in

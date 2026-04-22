@@ -8,11 +8,11 @@
 //!
 //! The pile treats its file as an immutable append-only log. Once a record lies
 //! below `applied_length` and its bytes have been returned by
-//! [`get`](Pile::get) or [`apply_next`](Pile::apply_next), those bytes are
+//! `get` or `apply_next`, those bytes are
 //! assumed permanent. Modifying any part of the pile other than appending new
 //! records is undefined behaviour. The un-applied tail may hide a partial
 //! append after a crash, so validation and repair only operate on offsets
-//! beyond `applied_length`. Each record's [`ValidationState`] is cached for the
+//! beyond `applied_length`. Each record's [`ValidationState`](crate::repo::pile::ValidationState) is cached for the
 //! lifetime of the process under this immutability assumption.
 //!
 //! For layout and recovery details see the [Pile
@@ -176,7 +176,7 @@ enum Applied<H: HashProtocol> {
 ///
 /// [`Pile::refresh`] aborts immediately if the underlying file shrinks below
 /// data that has already been applied, preventing undefined behavior from
-/// dangling [`Bytes`](anybytes::Bytes) handles.
+/// dangling [`Bytes`] handles.
 pub struct Pile<H: HashProtocol = Blake3> {
     file: File,
     mmap: Arc<MmapRaw>,
@@ -481,7 +481,7 @@ impl<H: HashProtocol> Pile<H> {
     /// equivalent if you need a fresh pile.
     ///
     /// The returned pile has no in-memory index; callers should invoke
-    /// [`refresh`] to load existing data or [`restore`] to repair and load
+    /// [`Self::refresh`] to load existing data or [`Self::restore`] to repair and load
     /// after a crash.
     pub fn open(path: &Path) -> Result<Self, ReadError> {
         let file = OpenOptions::new().read(true).append(true).open(path)?;
@@ -515,7 +515,7 @@ impl<H: HashProtocol> Pile<H> {
     /// would invalidate existing `Bytes` handles and continuing would result in
     /// undefined behavior.
     ///
-    /// This acquires a shared file lock to avoid racing with [`restore`],
+    /// This acquires a shared file lock to avoid racing with [`Self::restore`],
     /// which takes an exclusive lock before truncating.
     pub fn refresh(&mut self) -> Result<(), ReadError> {
         self.file.lock_shared()?;
@@ -670,11 +670,11 @@ impl<H: HashProtocol> Pile<H> {
 
     /// Restores a pile after a partial or corrupt append.
     ///
-    /// The method first attempts a regular [`refresh`]. If corruption is
+    /// The method first attempts a regular [`Self::refresh`]. If corruption is
     /// detected, it acquires an exclusive lock, re-attempts the refresh and,
     /// upon confirming the corruption, truncates the pile to the last known
     /// good offset. The exclusive lock blocks other readers so truncation
-    /// cannot race with [`refresh`].
+    /// cannot race with [`Self::refresh`].
     pub fn restore(&mut self) -> Result<(), ReadError> {
         match self.refresh() {
             Ok(()) => Ok(()),
@@ -874,7 +874,7 @@ impl<H: HashProtocol> BlobStorePut<H> for Pile<H> {
 
     /// Inserts a blob into the pile and returns its handle.
     ///
-    /// For records up to [`ATOMIC_WRITE_LIMIT`] the append relies on the
+    /// For records up to `ATOMIC_WRITE_LIMIT` the append relies on the
     /// kernel's atomic `write_vectored` guarantee, so multiple writers can
     /// hold a shared file lock and proceed concurrently. Larger records
     /// take an exclusive lock and append via plain `write_all`, trading

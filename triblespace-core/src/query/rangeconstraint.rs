@@ -4,7 +4,7 @@ use super::*;
 ///
 /// This constraint only **confirms** — it never proposes candidates.
 /// Use it with [`and!`](crate::and) alongside a constraint that does
-/// propose (e.g. a [`pattern!`](crate::pattern)):
+/// propose (e.g. a [`pattern!`](crate::macros::pattern)):
 ///
 /// ```rust,ignore
 /// find!((id: Id, ts: Value<NsTAIInterval>),

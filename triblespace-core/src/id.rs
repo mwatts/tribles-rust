@@ -27,7 +27,7 @@ use hex::FromHex;
 pub use fucid::fucid;
 /// Re-export of [`fucid::FUCIDsource`].
 pub use fucid::FUCIDsource;
-/// Alias for [`rngid`] — generates a random 128-bit identifier.
+/// Alias for [`rngid()`] — generates a random 128-bit identifier.
 pub use rngid::rngid as genid;
 /// Re-export of [`rngid::rngid`].
 pub use rngid::rngid;

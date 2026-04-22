@@ -55,9 +55,9 @@ pub use arrayvec;
 
 /// Re-exported proc-macros and helper macros for entity, pattern, and query construction.
 pub mod macros {
-    /// Re-export of the [`id_hex`](crate::id::id_hex) macro.
+    /// Re-export of the [`id_hex`] macro.
     pub use crate::id::id_hex;
-    /// Re-export of the [`find`](crate::query::find) macro.
+    /// Re-export of the [`find`] macro.
     pub use crate::query::find;
     /// Re-export of all proc-macros from `triblespace_core_macros`.
     pub use triblespace_core_macros::*;

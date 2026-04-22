@@ -15,7 +15,7 @@
 //! For a tour of the language see the "Query Language" chapter in the book.
 //! Conceptual background on schemas and join strategy appears in the
 //! "Query Engine" and "Atreides Join" chapters.
-/// [`ConstantConstraint`](constantconstraint::ConstantConstraint) — pins a variable to a single value.
+/// [`ConstantConstraint`] — pins a variable to a single value.
 pub mod constantconstraint;
 /// [`EqualityConstraint`](equalityconstraint::EqualityConstraint) — constrains two variables to have the same value.
 pub mod equalityconstraint;
@@ -23,7 +23,7 @@ pub mod equalityconstraint;
 pub mod hashmapconstraint;
 /// [`SetConstraint`](hashsetconstraint::SetConstraint) — constrains a variable to HashSet members.
 pub mod hashsetconstraint;
-/// [`IgnoreConstraint`](ignore::IgnoreConstraint) — hides variables from the outer query.
+/// [`IgnoreConstraint`] — hides variables from the outer query.
 pub mod ignore;
 /// [`IntersectionConstraint`](intersectionconstraint::IntersectionConstraint) — logical AND.
 pub mod intersectionconstraint;
@@ -31,7 +31,7 @@ pub mod intersectionconstraint;
 pub mod patchconstraint;
 /// [`ValueRange`](rangeconstraint::ValueRange) — restricts a variable to a byte-lexicographic range.
 pub mod rangeconstraint;
-/// [`RegularPathConstraint`](regularpathconstraint::RegularPathConstraint) — regular path expressions over graphs.
+/// [`RegularPathConstraint`] — regular path expressions over graphs.
 pub mod regularpathconstraint;
 /// [`SortedSliceConstraint`](sortedsliceconstraint::SortedSliceConstraint) — constrains a variable to values in a sorted slice (binary search confirm).
 pub mod sortedsliceconstraint;
@@ -46,7 +46,7 @@ use std::marker::PhantomData;
 
 use arrayvec::ArrayVec;
 use constantconstraint::*;
-/// Re-export of [`IgnoreConstraint`](ignore::IgnoreConstraint).
+/// Re-export of [`IgnoreConstraint`].
 pub use ignore::IgnoreConstraint;
 
 use crate::value::schemas::genid::GenId;
@@ -54,9 +54,9 @@ use crate::value::RawValue;
 use crate::value::Value;
 use crate::value::ValueSchema;
 
-/// Re-export of [`PathOp`](regularpathconstraint::PathOp).
+/// Re-export of [`PathOp`].
 pub use regularpathconstraint::PathOp;
-/// Re-export of [`RegularPathConstraint`](regularpathconstraint::RegularPathConstraint).
+/// Re-export of [`RegularPathConstraint`].
 pub use regularpathconstraint::RegularPathConstraint;
 /// Re-export of [`VariableSet`](variableset::VariableSet).
 pub use variableset::VariableSet;
@@ -75,7 +75,7 @@ pub trait TriblePattern {
     /// schema can be any type implementing [ValueSchema] and is specified as a type parameter.
     ///
     /// This method is usually not called directly, but rather through typed query language
-    /// macros like [pattern!][crate::namespace].
+    /// macros like [pattern!][crate::macros::pattern].
     fn pattern<'a, V: ValueSchema>(
         &'a self,
         e: Variable<GenId>,
@@ -337,7 +337,7 @@ pub trait Constraint<'a> {
     ///
     /// The default implementation returns `true`. Override this when the
     /// constraint can cheaply detect that no solution exists — for example,
-    /// a [`TribleSetConstraint`](crate::trible::tribleset::triblesetconstraint::TribleSetConstraint)
+    /// a `TribleSetConstraint`
     /// whose entity, attribute, and value are all bound but the triple is
     /// absent from the dataset.
     ///
@@ -447,7 +447,7 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'static> for std::sync::Arc<T> {
 /// This struct is usually not created directly, but rather through the `find!` macro,
 /// which provides a convenient way to declare variables and concrete types for them.
 /// And which sets up the nessecairy context for higher-level query languages
-/// like the one provided by the [crate::namespace] module.
+/// like the one provided by the [`crate::macros`] module.
 pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     constraint: C,
     postprocessing: P,
@@ -654,7 +654,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> fmt::Debug for Quer
 /// The macro takes two arguments: a tuple of variables with optional type
 /// annotations, and a constraint expression. It injects a `__local_find_context!`
 /// macro that provides the variable context to nested query macros like
-/// [`pattern!`](crate::namespace), [`temp!`], and [`ignore!`].
+/// [`pattern!`](crate::macros::pattern) and [`ignore!`](crate::ignore).
 ///
 /// # Variable syntax
 ///

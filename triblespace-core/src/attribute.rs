@@ -252,7 +252,7 @@ where
     }
 }
 
-/// Re-export of [`RawId`](crate::id::RawId) used by generated macro code.
+/// Re-export of [`RawId`] used by generated macro code.
 pub use crate::id::RawId as RawIdAlias;
 
 #[cfg(test)]

@@ -6,7 +6,7 @@ use itertools::Itertools;
 /// Logical disjunction of constraints (OR).
 ///
 /// A value is accepted if *any* variant accepts it. Built by the
-/// [`or!`](crate::or) macro, by [`pattern_changes!`](crate::pattern_changes),
+/// [`or!`](crate::or) macro, by [`pattern_changes!`](crate::macros::pattern_changes),
 /// or directly via [`new`](Self::new).
 ///
 /// All variants must declare the same [`VariableSet`]; this is asserted at
@@ -18,7 +18,7 @@ use itertools::Itertools;
 /// [`satisfied`](Constraint::satisfied) status and skips variants that are
 /// provably dead. This prevents a value confirmed by a dead variant from
 /// leaking into the result set — the fix for spurious results in
-/// multi-entity [`pattern_changes!`](crate::pattern_changes) joins.
+/// multi-entity [`pattern_changes!`](crate::macros::pattern_changes) joins.
 pub struct UnionConstraint<C> {
     constraints: Vec<C>,
 }

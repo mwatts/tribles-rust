@@ -21,7 +21,7 @@ use crate::value::ToValue;
 
 // ── Path expression types ────────────────────────────────────────────────
 
-/// Postfix-encoded path operations (used by the [`path!`](crate::path) macro).
+/// Postfix-encoded path operations (used by the [`path!`](crate::macros::path) macro).
 ///
 /// The macro compiles a path expression into a sequence of these
 /// operations. [`RegularPathConstraint::new`] converts the postfix
@@ -257,7 +257,7 @@ fn estimate_from(set: &TribleSet, expr: &PathExpr, start: &RawId) -> usize {
 
 /// Constrains two variables to be connected by a regular path expression.
 ///
-/// Created by the [`path!`](crate::path) macro. The path expression
+/// Created by the [`path!`](crate::macros::path) macro. The path expression
 /// supports concatenation, alternation (`|`), transitive closure (`+`),
 /// and reflexive-transitive closure (`*`). Single-attribute hops use
 /// direct index scans; multi-step paths use the WCO join engine for
