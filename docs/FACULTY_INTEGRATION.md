@@ -38,9 +38,7 @@ use std::path::PathBuf;
 
 use triblespace::core::find;
 use triblespace::core::id::Id;
-use triblespace::core::query::Variable;
 use triblespace::core::repo::{BlobStoreGet, BlobStorePut};
-use triblespace::core::value::schemas::genid::GenId;
 use triblespace::macros::pattern;
 
 use triblespace_search::bm25::BM25Builder;
@@ -48,9 +46,9 @@ use triblespace_search::succinct::{SuccinctBM25Blob, SuccinctBM25Index};
 use triblespace_search::tokens::hash_tokens;
 
 // Assume a `wiki` namespace is already in the pile, providing:
-//   wiki::title:   ShortString   (fragment title)
-//   wiki::body:    LongString    (typst body)
-//   wiki::index:   SuccinctBM25Blob  (current-index handle)
+//   wiki::title:   ShortString                   (fragment title)
+//   wiki::body:    Handle<Blake3, LongString>    (typst body)
+//   wiki::index:   Handle<Blake3, SuccinctBM25Blob>  (current-index handle)
 mod wiki { /* ... */ }
 
 #[derive(Parser)]
@@ -70,29 +68,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match Cmd::parse() {
         Cmd::Refresh => {
-            // Query every (fragment_id, body) pair. No shadow
+            // Walk every (fragment_id, body) pair. No shadow
             // datamodel — the pile is the source of truth.
+            //
+            // `BM25Builder::new()` gives the default
+            // `BM25Builder<GenId, WordHash>` — entity-id doc
+            // keys, Blake3-hashed text tokens. Pass `&id` and the
+            // `ToValue<GenId>` impl handles the conversion;
+            // `hash_tokens` returns `Vec<Value<WordHash>>` so
+            // terms are typed end-to-end.
             let mut builder = BM25Builder::new();
             for (id, body) in find!(
                 (id: Id, body: String),
                 pattern!(&kb, [{ ?id @ wiki::body: ?body }])
             ) {
-                builder.insert(id, hash_tokens(&body));
+                builder.insert(&id, hash_tokens(&body));
             }
-            let idx = SuccinctBM25Index::from_naive(&builder.build())?;
+            // `.build()` goes direct to succinct — no separate
+            // naive intermediate.
+            let idx = builder.build();
             let handle = pile.put::<SuccinctBM25Blob, _>(&idx)?;
-            // Persist the handle as a single-attribute fragment
-            // under a well-known id, or as branch metadata.
+            // Persist the handle as a single-attribute trible
+            // under a well-known anchor id (see below), or in
+            // branch metadata.
             persist_index_handle(&mut pile, handle)?;
         }
         Cmd::Query { text } => {
             let handle = load_current_index_handle(&kb)?;
             let reader = pile.reader()?;
+            // The type annotation on the get line picks the
+            // D=GenId, T=WordHash defaults; an index built with
+            // different schemas would spell them here too (e.g.
+            // `SuccinctBM25Index<ShortString, WordHash>`).
             let idx: SuccinctBM25Index =
                 reader.get::<SuccinctBM25Index, SuccinctBM25Blob>(handle)?;
             let q = hash_tokens(&text);
-            for (id, score) in idx.query_multi(&q).into_iter().take(10) {
-                // Cross-reference back to the pile for display.
+            // `.query_multi_ids` is the GenId-keyed convenience
+            // that decodes the posting keys back to `Id`.
+            for (id, score) in idx.query_multi_ids(&q).into_iter().take(10) {
                 let title = lookup_title(&kb, id).unwrap_or_default();
                 println!("{score:6.2}  {id}  {title}");
             }
@@ -101,6 +114,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+## Choosing schemas
+
+`BM25Builder<D, T>` / `SuccinctBM25Index<D, T>` is generic over
+the doc-key schema `D` and the term schema `T`. Defaults are
+`<GenId, WordHash>` — what the skeleton above uses. Other
+shapes are explicit:
+
+| Use case | Type |
+|---|---|
+| Body-text search (the example) | `BM25Builder<GenId, WordHash>` |
+| Title-keyed search | `BM25Builder<ShortString, WordHash>` |
+| Phrase search (bigram terms) | `BM25Builder<GenId, BigramHash>` |
+| Prefix / fuzzy (n-gram terms) | `BM25Builder<GenId, NgramHash>` |
+| Entity co-occurrence ("which docs cite X?") | `BM25Builder<GenId, GenId>` |
+
+Each tokenizer outputs a distinct term schema —
+`hash_tokens` → `WordHash`, `bigram_tokens` → `BigramHash`,
+`ngram_tokens` → `NgramHash` — so the compiler refuses to feed
+the wrong flavour into the wrong index. Indexes that need
+multiple tokenizer flavours become multiple indexes joined
+via the query engine (`and!` / `or!`); see
+`examples/phrase_search.rs` for the two-index pattern.
 
 ## Pattern: rebuild-and-replace, no mutation
 
@@ -122,7 +158,10 @@ stores it once. That's free caching.
 ## Pattern: query-time composition with `find!`
 
 The BM25 constraint plugs into the same `find!` / `and!` /
-`pattern!` engine as everything else:
+`pattern!` engine as everything else. The typed term makes the
+composition transparent — `hash_tokens("typst")[0]` is a
+`Value<WordHash>`, which is exactly what
+`idx.docs_and_scores(..)` wants on a `<GenId, WordHash>` index:
 
 ```rust,ignore
 let rows: Vec<(Id, f32)> = find!(
