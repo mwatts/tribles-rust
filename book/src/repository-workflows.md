@@ -199,7 +199,7 @@ let entity_changes = ws.checkout(history_of(my_entity))?;
 Workspaces keep a private blob store that mirrors the repository's backing
 store. This makes it easy to stage large payloads alongside the trible sets you
 plan to commit. The [`Workspace::put`](../src/repo.rs) helper stores any type
-implementing [`ToBlob`](crate::blob::ToBlob) and returns a typed handle you can
+implementing [`ToBlob`](triblespace::core::blob::ToBlob) and returns a typed handle you can
 embed like any other value. Handles are `Copy`, so you can commit them and reuse
 them to fetch the blob later.
 

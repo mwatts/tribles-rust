@@ -3,7 +3,7 @@
 Queries describe the patterns you want to retrieve. The engine favors extreme
 simplicity and aims for predictable latency and skew resistance without any
 tuning. Every constraint implements the
-[`Constraint`](crate::query::Constraint) trait so operators, sub-languages, and
+[`Constraint`](triblespace::core::query::Constraint) trait so operators, sub-languages, and
 even alternative data sources can compose cleanly. Query evaluation is
 expressed as a negotiation between constraints, but the contract stays tiny:
 constraints report which variables they touch, estimate how many candidates
@@ -13,7 +13,7 @@ into the depth-first search; there is no standalone plan to build or cache.
 
 The constraint API mirrors the mental model you would use when reasoning about
 a query by hand. Constraints expose their
-[`VariableSet`](crate::query::VariableSet) via `variables()`, provide `estimate`
+[`VariableSet`](triblespace::core::query::VariableSet) via `variables()`, provide `estimate`
 methods so the engine can choose the next variable to bind, and implement
 `propose` to extend partial assignments. Composite constraints, such as unions,
 may also override `confirm` to tighten previously gathered proposals. A fifth
@@ -31,16 +31,16 @@ loop integrates the cardinality heuristics directly instead of running a
 separate planning phase. Picking a different heuristic simply yields another
 member of the Atreides join family:
 
-1. **Initialisation** – When a [`Query`](crate::query::Query) is constructed it
+1. **Initialisation** – When a [`Query`](triblespace::core::query::Query) is constructed it
    asks the root constraint for its variable set. The engine records each
-   variable's [`influence`](crate::query::Constraint::influence) so it knows
+   variable's [`influence`](triblespace::core::query::Constraint::influence) so it knows
    which estimates to refresh when bindings change, computes an initial
    `estimate` for every variable, and sorts the yet-unbound list using those
    numbers.
 2. **Propose (and confirm)** – The engine pops the most selective variable from
    the sorted list and calls `propose` to collect candidate values that respect
    the current binding. Intersection constraints such as those built by
-   [`and!`](crate::prelude::and) reorder their children by increasing estimate
+   [`and!`](triblespace::core::prelude::and) reorder their children by increasing estimate
    and call `confirm` on the remaining branches so inconsistent candidates are
    filtered out before the engine commits to them. Constraints that observe the
    partial assignment simply avoid proposing or confirming values they already
@@ -62,8 +62,8 @@ constraint types can participate without custom planner hooks.
 
 You might notice that trible.space does not define a global ontology or schema
 beyond associating attributes with a
-[`ValueSchema`](crate::value::ValueSchema) or
-[`BlobSchema`](crate::prelude::BlobSchema). This is deliberate. The semantic web
+[`ValueSchema`](triblespace::core::value::ValueSchema) or
+[`BlobSchema`](triblespace::core::prelude::BlobSchema). This is deliberate. The semantic web
 taught us that per-value typing, while desirable, was awkward in RDF: literal
 datatypes are optional, custom types need globally scoped IRIs and there is no
 enforcement, so most data degenerates into untyped strings. Trying to regain
@@ -102,9 +102,9 @@ styles, including graph, relational and document-oriented queries. Constraints
 may originate from the database itself (such as attribute lookups), from custom
 application logic, or from entirely external sources.
 
-For example, the [`pattern!`](crate::pattern!) and
-[`entity!`](crate::entity!) macros—available at the crate root and re-exported
-via [`triblespace::prelude`](crate::prelude) (for instance with
+For example, the [`pattern!`](triblespace::core::macros::pattern!) and
+[`entity!`](triblespace::core::macros::entity!) macros—available at the crate root and re-exported
+via [`triblespace::prelude`](triblespace::prelude) (for instance with
 `use triblespace::prelude::*;`)—generate constraints for a given trible pattern in
 a query-by-example style reminiscent of SPARQL or GraphQL but tailored to a
 document-graph data model. It would also be possible to layer a property-graph

@@ -9,7 +9,7 @@ results.
 
 ## Constraints as the search frontier
 
-Every constraint implements the [`Constraint`](crate::query::Constraint) trait,
+Every constraint implements the [`Constraint`](triblespace::core::query::Constraint) trait,
 which exposes six methods that shape the search:
 
 1. **`variables`** – returns the set of variables this constraint touches.
@@ -39,7 +39,7 @@ estimates, proposal generation, confirmation, and influence tracking.
 ## A spectrum of Atreides variants
 
 The Atreides "family" refers to the spectrum of heuristics a constraint can use
-when implementing [`Constraint::estimate`](crate::query::Constraint). Each
+when implementing [`Constraint::estimate`](triblespace::core::query::Constraint). Each
 variant exposes the same guided depth-first search, but with progressively
 tighter cardinality guidance. In practice they all revisit their estimates when
 bindings change; what differs is **what** quantity they approximate:
@@ -53,7 +53,7 @@ bindings change; what differs is **what** quantity they approximate:
 - **Distinct-value Join (Paul)** narrows the focus to a single variable at a
   time. It returns the smallest proposal buffer the constraint could produce for
   any still-unbound variable, ignoring later confirmation filters. This is the
-  behaviour exercised by [`Query::new`](crate::query::Query::new) today, which
+  behaviour exercised by [`Query::new`](triblespace::core::query::Query::new) today, which
   keeps the tightest candidate list on hand while the search walks forward.
 - **Partial-binding Join (Ghanima)** goes further by measuring the size of the
   actual proposal the composite constraint can deliver for the current binding
@@ -80,7 +80,7 @@ higher quality estimates refresh when relevant bindings change.
 
 ## Guided depth-first search
 
-When a query starts, [`Query::new`](crate::query::Query::new) collects the
+When a query starts, [`Query::new`](triblespace::core::query::Query::new) collects the
 initial estimates and influence sets, sorts the unbound variables so the
 tightest constraints are considered first, and caches per-variable proposal
 buffers that can be reused across backtracking steps. The engine then walks the

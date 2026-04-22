@@ -269,8 +269,8 @@ would halve the effective security of a 256-bit hash, reducing it to \( 2^{128} 
 current or theoretical technology. As a result, 256 bits remains a future-proof choice for intrinsic identifiers.  
 
 Such 256-bit intrinsic identifiers are represented by the types
-[`Hash`](crate::value::schemas::hash::Hash) and
-[`Handle`](crate::value::schemas::hash::Handle).  
+[`Hash`](triblespace::core::value::schemas::hash::Hash) and
+[`Handle`](triblespace::core::value::schemas::hash::Handle).  
 
 Not every workflow needs cryptographic strength. We therefore ship three
 high-entropy abstract identifier families—**RNGID, UFOID, and FUCID**—that keep
@@ -279,7 +279,7 @@ predictability to suit different scenarios.
 
 ## Comparison of Identifier Types
 
-|                        | [RNGID](crate::id::rngid::rngid) | [UFOID](crate::id::ufoid::ufoid) | [FUCID](crate::id::fucid::fucid) |
+|                        | [RNGID](triblespace::core::id::rngid::rngid) | [UFOID](triblespace::core::id::ufoid::ufoid) | [FUCID](triblespace::core::id::fucid::fucid) |
 |------------------------|----------------------------------|----------------------------------|----------------------------------|
 | Global entropy         | 128 bits                        | 96 bits random + timestamp       | 128 bits                         |
 | Locality               | None                            | High (time-ordered)              | High (monotonic counter)         |
@@ -291,7 +291,7 @@ predictability enables tighter compression and cache-friendly scans, but
 reveals mint metadata (time or source) and is therefore unsuitable
 whenever adversarial unpredictability matters. For those cases prefer
 RNGID's fully random bits, or step up to a 256-bit cryptographic
-[`Hash`](crate::value::schemas::hash::Hash).
+[`Hash`](triblespace::core::value::schemas::hash::Hash).
 
 ## Example: Scientific Publishing
 
@@ -364,8 +364,8 @@ By default, all minted `ExclusiveId`s are associated with the thread they are dr
 These IDs can be found in queries via the `local_ids` function.
 
 Once the IDs are back in scope you can either work with them directly as
-[`ExclusiveId`](crate::id::ExclusiveId)s or move them into an explicit
-[`IdOwner`](crate::id::IdOwner) for a longer lived transaction.  The example
+[`ExclusiveId`](triblespace::core::id::ExclusiveId)s or move them into an explicit
+[`IdOwner`](triblespace::core::id::IdOwner) for a longer lived transaction.  The example
 below shows both approaches in action:
 
 ```rust
@@ -418,24 +418,24 @@ variable outside the pattern. Prefixing the binding with `_?`, such as
 `_?name`, allocates a scoped variable local to the macro invocation. Both
 `pattern!` and `pattern_changes!` will reuse the same generated query variable
 whenever the `_?` form appears again, letting you express equality constraints
-inline without touching the outer [`find!`](crate::query::find) signature.
+inline without touching the outer [`find!`](triblespace::core::query::find) signature.
 
-Binding the variable as an [`ExclusiveId`](crate::id::ExclusiveId) means the
-closure that [`find!`](crate::query::find) installs will run the
-[`TryFromValue`](crate::value::TryFromValue) implementation for `ExclusiveId`.
-The conversion invokes [`Id::acquire`](crate::id::Id::acquire) and would silently
+Binding the variable as an [`ExclusiveId`](triblespace::core::id::ExclusiveId) means the
+closure that [`find!`](triblespace::core::query::find) installs will run the
+[`TryFromValue`](triblespace::core::value::TryFromValue) implementation for `ExclusiveId`.
+The conversion invokes [`Id::acquire`](triblespace::core::id::Id::acquire) and would silently
 skip the row if the current thread did not own the identifier (filter
 semantics).  The
-[`local_ids`](crate::query::local_ids) constraint keeps the query safe by only
+[`local_ids`](triblespace::core::id::local_ids) constraint keeps the query safe by only
 enumerating IDs already owned by this thread, so no rows are filtered in
 practice.  In the example we immediately
 move the acquired guard into `txn_owner`, enabling subsequent calls to
-[`IdOwner::borrow`](crate::id::IdOwner::borrow) that yield
-[`OwnedId`](crate::id::OwnedId)s.  Dropping an `OwnedId` automatically returns
+[`IdOwner::borrow`](triblespace::core::id::IdOwner::borrow) that yield
+[`OwnedId`](triblespace::core::id::OwnedId)s.  Dropping an `OwnedId` automatically returns
 the identifier to its owner so you can borrow it again later.  If you only need
 the ID for a quick update you can skip the explicit owner entirely, bind the
-variable as a plain [`Id`](crate::id::Id), and call
-[`Id::acquire`](crate::id::Id::acquire) when exclusive access is required.
+variable as a plain [`Id`](triblespace::core::id::Id), and call
+[`Id::acquire`](triblespace::core::id::Id::acquire) when exclusive access is required.
 
 ### Ownership and Eventual Consistency
 

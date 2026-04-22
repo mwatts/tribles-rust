@@ -14,7 +14,7 @@ The macros fall into three layers:
 
 ## Define attributes with `attributes!`
 
-Use [`attributes!`](crate::macros::attributes) to declare typed attributes once,
+Use [`attributes!`](triblespace::core::macros::attributes) to declare typed attributes once,
 then reuse them everywhere else.
 
 ```rust
@@ -47,7 +47,7 @@ rest of the code you are writing.
 
 ## Build facts with `entity!`
 
-Use [`entity!`](crate::macros::entity) when you want to create tribles for one
+Use [`entity!`](triblespace::core::macros::entity) when you want to create tribles for one
 entity.
 
 ```rust
@@ -109,7 +109,7 @@ Reach for this macro when:
 
 ## Match facts with `pattern!`
 
-Use [`pattern!`](crate::macros::pattern) to turn trible-shaped structure into a
+Use [`pattern!`](triblespace::core::macros::pattern) to turn trible-shaped structure into a
 query constraint.
 
 ```rust
@@ -149,7 +149,7 @@ Use `pattern!` when you are querying the current contents of a `TribleSet`,
 
 ## Query for results with `find!`
 
-Use [`find!`](crate::macros::find) when you want rows back.
+Use [`find!`](triblespace::core::macros::find) when you want rows back.
 
 ```rust
 # use triblespace::prelude::*;
@@ -205,7 +205,7 @@ Use `?` on a projected variable when you want conversion failures as
 
 ## Ask existence questions with `exists!`
 
-Use [`exists!`](crate::macros::exists) when you only need yes/no.
+Use [`exists!`](triblespace::core::prelude::exists) when you only need yes/no.
 
 ```rust
 # use triblespace::prelude::*;
@@ -241,7 +241,7 @@ Use `exists!(constraint)` for pure existence checks instead of
 
 ## Match only new results with `pattern_changes!`
 
-Use [`pattern_changes!`](crate::macros::pattern_changes) for incremental
+Use [`pattern_changes!`](triblespace::core::macros::pattern_changes) for incremental
 queries: matches are allowed to join against the full current state, but at
 least one contributing trible must come from the change set.
 
@@ -266,7 +266,7 @@ See [Incremental Queries](incremental-queries.md) for the full workflow.
 
 ## Traverse edges with `path!`
 
-Use [`path!`](crate::macros::path) when a relationship is recursive or
+Use [`path!`](triblespace::core::macros::path) when a relationship is recursive or
 variable-length.
 
 ```rust
@@ -312,7 +312,7 @@ impossible.
 
 ## Combine constraints with `and!` and `or!`
 
-Use [`and!`](crate::prelude::and) when every clause must hold:
+Use [`and!`](triblespace::core::prelude::and) when every clause must hold:
 
 ```rust,ignore
 find!(
@@ -324,7 +324,7 @@ find!(
 )
 ```
 
-Use [`or!`](crate::prelude::or) when any branch may hold:
+Use [`or!`](triblespace::core::prelude::or) when any branch may hold:
 
 ```rust,ignore
 find!(
@@ -340,7 +340,7 @@ find!(
 
 ## Introduce helpers with `temp!`
 
-Use [`temp!`](crate::prelude::temp) when you need a fresh variable only inside a
+Use [`temp!`](triblespace::core::prelude::temp) when you need a fresh variable only inside a
 sub-expression.
 
 ```rust,ignore
@@ -358,7 +358,7 @@ projected.
 
 ## Hide helpers with `ignore!`
 
-Use [`ignore!`](crate::prelude::ignore) when a constraint needs internal
+Use [`ignore!`](triblespace::core::prelude::ignore) when a constraint needs internal
 variables that should not be visible to the outer planner.
 
 ```rust,ignore

@@ -9,15 +9,15 @@ as results.  The declarative style gives the engine freedom to reorder work and
 choose efficient execution strategies.
 
 Every macro shown here is a convenience wrapper around a concrete
-[`Constraint`](crate::query::Constraint) implementation.  When you need finer
+[`Constraint`](triblespace::core::query::Constraint) implementation.  When you need finer
 control—or want to assemble constraints manually outside the provided
 macros—reach for the corresponding builder types in
-[`triblespace::query`](crate::query).
+[`triblespace::core::query`](triblespace::core::query).
 
 ## Declaring a query
 
-The [`find!`](crate::prelude::find) macro builds a
-[`Query`](crate::query::Query) by declaring variables and a constraint
+The [`find!`](triblespace::core::prelude::find) macro builds a
+[`Query`](triblespace::core::query::Query) by declaring variables and a constraint
 expression. The macro mirrors Datalog syntax: the head `((...))` lists the
 variables you want back, and the body describes the conditions they must meet.
 A minimal invocation looks like this:
@@ -61,9 +61,9 @@ destructure results.
 ### Typed variables
 
 Variables optionally include a concrete type to convert the underlying value.
-The constraint phase still works with untyped [`Value`](crate::value::Value)
+The constraint phase still works with untyped [`Value`](triblespace::core::value::Value)
 instances; conversion happens when results are emitted.  These conversions use
-[`TryFromValue`](crate::value::TryFromValue).
+[`TryFromValue`](triblespace::core::value::TryFromValue).
 
 By default, if a conversion fails the entire row is silently skipped — like a
 constraint that doesn't match.  For types whose `TryFromValue::Error` is
@@ -104,22 +104,22 @@ to avoid materializing the full result set.
 
 `find!` queries combine a small set of constraint operators to form a
 declarative language for matching tribles.  Each operator implements
-[`Constraint`](crate::query::Constraint) and can therefore be mixed and nested
+[`Constraint`](triblespace::core::query::Constraint) and can therefore be mixed and nested
 freely.
 
 | Macro | Purpose | Notes |
 | ----- | ------- | ----- |
-| [`and!`](crate::prelude::and) | Require every sub-constraint to hold | Builds an [`IntersectionConstraint`](crate::query::intersectionconstraint::IntersectionConstraint). |
-| [`or!`](crate::prelude::or) | Accept any satisfied alternative | Produces a [`UnionConstraint`](crate::query::unionconstraint::UnionConstraint) whose branches must reference the same variables. |
-| [`ignore!`](crate::ignore) | Drop variables from a sub-query | Removes the listed variables from planning so a constraint can contribute only along the remaining bindings. |
-| [`temp!`](crate::temp) | Mint hidden helper variables | Allocates fresh bindings for the nested expression so the helpers can join across patterns without being projected. |
-| [`pattern!`](crate::pattern) | Match attribute assignments in a collection | Expands to a [`TriblePattern`](crate::query::TriblePattern)-backed constraint that relates attributes and values for the same entity. |
-| [`pattern_changes!`](crate::pattern_changes) | Track attribute updates incrementally | Builds a [`TriblePattern`](crate::query::TriblePattern) constraint that yields newly added triples from a change set because incremental evaluation stays monotonic; see [Incremental Queries](incremental-queries.md) for the broader evaluation workflow. |
-| `.is(...)` | Pin a variable to a constant | Wraps a [`ConstantConstraint`](crate::query::constantconstraint::ConstantConstraint) that compares the binding against a literal value. |
-| `has` | Check membership in a collection | Collections such as [`HashSet`](std::collections::HashSet) expose `.has(...)` when they implement [`ContainsConstraint`](crate::query::hashsetconstraint::ContainsConstraint); triple stores like [`TribleSet`](crate::tribleset::TribleSet) instead participate through [`pattern!`](crate::pattern). |
-| [`EqualityConstraint`](crate::query::equalityconstraint::EqualityConstraint) | Require two variables to bind the same value | Auto-desugared by `pattern!` for self-referencing patterns like `{ _?e @ link: _?e }`. |
-| [`SortedSlice`](crate::query::sortedsliceconstraint::SortedSlice) | Check membership via binary search | A binary-search alternative to `HashSet` for sorted data; implements `ContainsConstraint`. |
-| [`value_range`](crate::query::rangeconstraint::value_range) | Restrict a variable to a byte-lexicographic range | Builds a [`ValueRange`](crate::query::rangeconstraint::ValueRange) constraint between a min and max bound. |
+| [`and!`](triblespace::core::prelude::and) | Require every sub-constraint to hold | Builds an [`IntersectionConstraint`](triblespace::core::query::intersectionconstraint::IntersectionConstraint). |
+| [`or!`](triblespace::core::prelude::or) | Accept any satisfied alternative | Produces a [`UnionConstraint`](triblespace::core::query::unionconstraint::UnionConstraint) whose branches must reference the same variables. |
+| [`ignore!`](triblespace::core::ignore) | Drop variables from a sub-query | Removes the listed variables from planning so a constraint can contribute only along the remaining bindings. |
+| [`temp!`](triblespace::core::temp) | Mint hidden helper variables | Allocates fresh bindings for the nested expression so the helpers can join across patterns without being projected. |
+| [`pattern!`](triblespace::core::macros::pattern) | Match attribute assignments in a collection | Expands to a [`TriblePattern`](triblespace::core::query::TriblePattern)-backed constraint that relates attributes and values for the same entity. |
+| [`pattern_changes!`](triblespace::core::macros::pattern_changes) | Track attribute updates incrementally | Builds a [`TriblePattern`](triblespace::core::query::TriblePattern) constraint that yields newly added triples from a change set because incremental evaluation stays monotonic; see [Incremental Queries](incremental-queries.md) for the broader evaluation workflow. |
+| `.is(...)` | Pin a variable to a constant | Wraps a [`ConstantConstraint`](triblespace::core::query::constantconstraint::ConstantConstraint) that compares the binding against a literal value. |
+| `has` | Check membership in a collection | Collections such as [`HashSet`](std::collections::HashSet) expose `.has(...)` when they implement [`ContainsConstraint`](triblespace::core::query::hashsetconstraint::ContainsConstraint); triple stores like [`TribleSet`](triblespace::core::trible::TribleSet) instead participate through [`pattern!`](triblespace::core::macros::pattern). |
+| [`EqualityConstraint`](triblespace::core::query::equalityconstraint::EqualityConstraint) | Require two variables to bind the same value | Auto-desugared by `pattern!` for self-referencing patterns like `{ _?e @ link: _?e }`. |
+| [`SortedSlice`](triblespace::core::query::sortedsliceconstraint::SortedSlice) | Check membership via binary search | A binary-search alternative to `HashSet` for sorted data; implements `ContainsConstraint`. |
+| [`value_range`](triblespace::core::query::rangeconstraint::value_range) | Restrict a variable to a byte-lexicographic range | Builds a [`ValueRange`](triblespace::core::query::rangeconstraint::ValueRange) constraint between a min and max bound. |
 
 Any data structure that can iterate its contents, test membership, and report
 its size can implement `ContainsConstraint`. Membership constraints are
@@ -129,11 +129,11 @@ attribute, and value bindings aligned.
 
 ### Constant matches (`is`)
 
-Call [`Variable::is`](crate::query::Variable::is) when you need a binding to
+Call [`Variable::is`](triblespace::core::query::Variable::is) when you need a binding to
 equal a specific value.  The method returns a
-[`ConstantConstraint`](crate::query::constantconstraint::ConstantConstraint)
+[`ConstantConstraint`](triblespace::core::query::constantconstraint::ConstantConstraint)
 that checks whether the solver can assign the variable to the provided
-[`Value`](crate::value::Value).  Constant constraints behave like any other
+[`Value`](triblespace::core::value::Value).  Constant constraints behave like any other
 clause: combine them with `and!` to narrow a variable after other constraints
 have proposed candidates, or place them inside `or!` branches to accept
 multiple literals.
@@ -166,7 +166,7 @@ several constants.
 
 ### Intersections (`and!`)
 
-[`and!`](crate::prelude::and) combines multiple constraints that must all hold
+[`and!`](triblespace::core::prelude::and) combines multiple constraints that must all hold
 simultaneously.  Each sub-clause can introduce new bindings or further narrow
 existing ones, and the solver is free to reorder the work to reduce the search
 space.  When a sub-constraint fails to produce a candidate that is compatible
@@ -193,7 +193,7 @@ structure queries however you like.
 
 ### Alternatives (`or!`)
 
-Use [`or!`](crate::prelude::or) to express alternatives. Each branch behaves
+Use [`or!`](triblespace::core::prelude::or) to express alternatives. Each branch behaves
 like an independent constraint and may introduce additional bindings that
 participate in the surrounding query, provided every branch mentions the same
 set of variables:
@@ -221,9 +221,9 @@ constraint.
 ### Ignoring bindings (ignore!)
 
 Ignored variables are handy when a sub-expression references fields you want to
-drop. The [`IgnoreConstraint`](crate::query::ignore::IgnoreConstraint)
+drop. The [`IgnoreConstraint`](triblespace::core::query::ignore::IgnoreConstraint)
 subtracts the listed bindings from the constraint's
-[`VariableSet`](crate::query::VariableSet), so the planner never attempts to
+[`VariableSet`](triblespace::core::query::VariableSet), so the planner never attempts to
 join them with the outer query, project them into the results, or even solve
 for those positions. From the solver's perspective those slots vanish
 completely—it keeps evaluating the remaining bindings while treating the
@@ -241,7 +241,7 @@ The identifiers you list inside `ignore!` expand to fresh bindings scoped to
 the nested expression, but subtracting them from the outer plan means the solver
 never unifies those bindings—or even asks the constraint to propose values for
 them. Even if you repeat the same name across multiple clauses, each occurrence
-behaves like an independent wildcard. Reach for [`temp!`](crate::temp) when you
+behaves like an independent wildcard. Reach for [`temp!`](triblespace::core::temp) when you
 want a hidden variable to participate in the surrounding plan without being
 projected; reach for `ignore!` when you want to use a multi-column constraint
 while only keeping some of its positions.
@@ -292,12 +292,12 @@ always wrap the hidden bindings in a tuple, so each invocation reads
 the `person`, `friend`, and `city` attributes. The variables adopt the value
 schemas implied by the constraints they appear in, so no extra annotations are
 required. When working outside the query macros, call
-[`VariableContext::next_variable`](crate::query::VariableContext::next_variable)
+[`VariableContext::next_variable`](triblespace::core::query::VariableContext::next_variable)
 directly instead.
 
 When the helper variable lives entirely within a single pattern, consider using
-`_?alias` instead of `temp!`. Both [`pattern!`](crate::pattern) and
-[`pattern_changes!`](crate::pattern_changes) support `_?ident` placeholders that
+`_?alias` instead of `temp!`. Both [`pattern!`](triblespace::core::macros::pattern) and
+[`pattern_changes!`](triblespace::core::macros::pattern_changes) support `_?ident` placeholders that
 mint fresh bindings scoped to that one macro invocation. They behave like
 non-projected variables: you can reuse the `_?ident` multiple times inside the
 pattern to relate attributes, but the binding vanishes once control leaves the
@@ -392,7 +392,7 @@ let author_last_names: Vec<_> = find!((last: Value<_>),
 Here `_?person` remains scoped to the pattern while ensuring both attributes are
 drawn from the same entity.  When a pattern references collections other than a
 `TribleSet`, ensure the collection implements
-[`TriblePattern`](crate::query::TriblePattern) so that the macro can materialize
+[`TriblePattern`](triblespace::core::query::TriblePattern) so that the macro can materialize
 the requested triples.
 
 To share a hidden binding across multiple patterns, declare it once with
@@ -444,15 +444,15 @@ more than the actual bindings.
 ## Custom constraints
 
 Every building block implements the
-[`Constraint`](crate::query::Constraint) trait.  You can implement this trait on
+[`Constraint`](triblespace::core::query::Constraint) trait.  You can implement this trait on
 your own types to integrate custom data sources or query operators with the
 solver. Collections that want to power `pattern!` implement
-[`TriblePattern`](crate::query::TriblePattern) so they can materialize the
+[`TriblePattern`](triblespace::core::query::TriblePattern) so they can materialize the
 entity/attribute/value triples a pattern asks for.  Membership-style helpers
 such as `has(...)` work with anything that implements
-[`ContainsConstraint`](crate::query::ContainsConstraint), making it easy to join
+[`ContainsConstraint`](triblespace::core::query::ContainsConstraint), making it easy to join
 against pre-existing indexes, caches, or service clients without copying data
-into a [`TribleSet`](crate::trible::TribleSet).
+into a [`TribleSet`](triblespace::core::trible::TribleSet).
 
 ```rust,ignore
 use std::collections::HashSet;
@@ -508,7 +508,7 @@ results, you describe the shape of the path and the engine evaluates it:
 | `a*` | zero or more | `follows*` (reflexive transitive closure) |
 
 `path!` expands to a
-[`RegularPathConstraint`](crate::query::RegularPathConstraint) and composes
+[`RegularPathConstraint`](triblespace::core::query::RegularPathConstraint) and composes
 with other constraints.  Invoke it through a namespace module
 (`social::path!`) to implicitly resolve attribute names:
 

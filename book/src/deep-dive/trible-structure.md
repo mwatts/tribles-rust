@@ -14,8 +14,8 @@ queries can be answered with as little work as possible.
 
 At a high level a trible is a three-tuple consisting of an entity, an
 attribute, and a value. The entity and attribute are both 128‑bit abstract
-extrinsic identifiers as described in [crate::id], while the value is an
-arbitrary 256‑bit [crate::value::Value]. The value width deliberately matches
+extrinsic identifiers as described in [triblespace::core::id], while the value is an
+arbitrary 256‑bit [triblespace::core::value::Value]. The value width deliberately matches
 the size of an intrinsic identifier so larger payloads can be referenced via
 blobs without inflating the inlined representation.
 
@@ -116,7 +116,7 @@ inference) or devolve into bikeshedding about the "correct" orientation.
 `tribles` avoids that trap by giving edge direction explicit semantics: the
 arrow points from the entity making the claim to the entity being described.
 The observer owns the identifier and is responsible for the consistency of the
-facts it asserts—see [ID Ownership](crate::id). This rule naturally fits the
+facts it asserts—see [ID Ownership](triblespace::core::id). This rule naturally fits the
 distributed setting where each entity has a single authoritative writer.
 
 Viewed another way, edges always flow from describing to described entities,
