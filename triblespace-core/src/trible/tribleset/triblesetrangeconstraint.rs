@@ -179,4 +179,39 @@ mod tests {
         .collect();
         assert_eq!(empty.len(), 0);
     }
+
+    /// Regression: the range-constraint estimate must report the count of
+    /// *distinct values* in range — not the count of tribles. Multiple
+    /// entities sharing the same value would otherwise inflate the
+    /// estimate and bias intersection ordering.
+    #[test]
+    fn estimate_counts_distinct_values_not_tribles() {
+        // Three distinct scores, but the middle one is shared by four
+        // entities. Tribles-in-range would be 6, distinct-values-in-range
+        // would be 3.
+        let v10: Value<R256BE> = 10i128.to_value();
+        let v50: Value<R256BE> = 50i128.to_value();
+        let v90: Value<R256BE> = 90i128.to_value();
+
+        let mut data = TribleSet::new();
+        data += entity! { &ufoid() @ range_test_score: v10 };
+        data += entity! { &ufoid() @ range_test_score: v50 };
+        data += entity! { &ufoid() @ range_test_score: v50 };
+        data += entity! { &ufoid() @ range_test_score: v50 };
+        data += entity! { &ufoid() @ range_test_score: v50 };
+        data += entity! { &ufoid() @ range_test_score: v90 };
+
+        use crate::query::Constraint;
+        use crate::query::VariableContext;
+        let mut ctx = VariableContext::new();
+        let v = ctx.next_variable::<R256BE>();
+
+        let min: Value<R256BE> = 0i128.to_value();
+        let max: Value<R256BE> = 100i128.to_value();
+        let constraint = data.value_in_range(v, min, max);
+
+        let estimate = constraint.estimate(v.index, &Default::default());
+        // Three distinct values in range. Before the fix this returned 6.
+        assert_eq!(estimate, Some(3), "estimate must count distinct values");
+    }
 }

@@ -558,9 +558,14 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
 
     /// Count leaves whose infix falls within [min_infix, max_infix].
     ///
-    /// Children fully inside the range contribute their cached `leaf_count`
-    /// without recursion. Only boundary children (byte == min or max at
-    /// the current depth) need to recurse deeper.
+    /// Counts **distinct first-segment values** under this branch whose
+    /// infix falls within `[min_infix, max_infix]` — matching the
+    /// cardinality that `infixes_range` would yield for the same range.
+    ///
+    /// Interior children (strictly inside the range at the current byte)
+    /// contribute their cached `segment_count` via [`count_segment`]
+    /// without recursion. Only the min- and max-boundary children recurse
+    /// deeper.
     pub fn count_range<const PREFIX_LEN: usize, const INFIX_LEN: usize>(
         &self,
         prefix: &[u8; PREFIX_LEN],
@@ -574,12 +579,14 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             return 0;
         }
 
-        // Case 1: infix ends within this node.
+        // Case 1: infix ends within this node's compressed path. The full
+        // infix is determined by this branch's path, so every leaf below
+        // shares it — exactly one distinct infix value exists under self.
         if PREFIX_LEN + INFIX_LEN <= node_end_depth {
             let infix: [u8; INFIX_LEN] =
                 core::array::from_fn(|i| self.childleaf().key[O::TREE_TO_KEY[PREFIX_LEN + i]]);
             return if &infix >= min_infix && &infix <= max_infix {
-                self.leaf_count
+                1
             } else {
                 0
             };
@@ -631,7 +638,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
             if on_min || on_max {
                 total += entry.count_range(prefix, node_end_depth, min_infix, max_infix);
             } else {
-                total += entry.count();
+                total += entry.count_segment(node_end_depth);
             }
         }
         total
