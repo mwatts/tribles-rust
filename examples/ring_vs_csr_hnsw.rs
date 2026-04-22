@@ -64,7 +64,7 @@ fn build_hnsw(
     dim: usize,
     seed: u64,
 ) -> (
-    triblespace_search::hnsw::HNSWIndex,
+    triblespace_search::testing::HNSWIndex,
     MemoryBlobStore<Blake3>,
 ) {
     let mut rng = Rng(seed);
@@ -81,7 +81,7 @@ fn build_hnsw(
 /// Encode the HNSW graph as the existing `SuccinctGraph`
 /// (CSR per (layer, node) with shared padding).
 fn encode_csr(
-    naive: &triblespace_search::hnsw::HNSWIndex,
+    naive: &triblespace_search::testing::HNSWIndex,
 ) -> (usize, SuccinctGraph) {
     let n = naive.doc_count();
     let n_layers = naive.max_level() as usize + 1;
@@ -103,7 +103,7 @@ fn encode_csr(
 /// Each layer's edge list is canonicalized to undirected
 /// `(low, high)` pairs, deduplicated, sorted.
 fn encode_ring(
-    naive: &triblespace_search::hnsw::HNSWIndex,
+    naive: &triblespace_search::testing::HNSWIndex,
 ) -> (usize, Vec<RingGraph>) {
     let n = naive.doc_count();
     let n_layers = naive.max_level() as usize + 1;

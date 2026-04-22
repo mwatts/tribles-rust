@@ -64,6 +64,15 @@ dates are commit dates rather than release dates.
   who already hold a naive index.
 - `HNSWBuilder::build_naive()` exposes the naive reference
   index (same ergonomics as `BM25Builder::build_naive`).
+- Naive / oracle types (`BM25Index`, `HNSWIndex`, `FlatIndex`,
+  `FlatBuilder`, `AttachedHNSWIndex`, `AttachedFlatIndex`) now
+  live at `triblespace_search::testing::*`. The types are still
+  physically declared in `bm25` / `hnsw` modules — their original
+  paths are `#[doc(hidden)]` so rustdoc only surfaces the
+  `testing::` path, signalling "reference-only, not a production
+  API." The builders themselves (`BM25Builder`, `HNSWBuilder`)
+  stay public at their canonical paths; the re-exports cover the
+  naive forms they produce via `build_naive()`.
 - Naive `to_bytes` / `try_from_bytes` on `BM25Index` /
   `HNSWIndex` / `FlatIndex` deleted along with their
   `BM25LoadError` / `HNSWLoadError` / `FlatLoadError` types

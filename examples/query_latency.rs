@@ -16,9 +16,10 @@
 use std::time::Instant;
 
 use triblespace::core::id::{Id, RawId};
-use triblespace_search::bm25::{BM25Builder, BM25Index};
+use triblespace_search::bm25::BM25Builder;
 use triblespace_search::hnsw::HNSWBuilder;
 use triblespace_search::succinct::SuccinctHNSWIndex;
+use triblespace_search::testing::BM25Index;
 use triblespace_search::tokens::hash_tokens;
 
 struct Rng(u64);

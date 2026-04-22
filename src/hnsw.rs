@@ -448,11 +448,18 @@ impl HNSWBuilder {
     }
 }
 
-/// Immutable approximate-nearest-neighbour index built via
-/// [`HNSWBuilder`]. Query performance is sub-linear in the
-/// corpus size (O(log n · degree) typical) — the trade-off is
-/// a larger up-front build cost than [`FlatIndex`] and slightly
-/// approximate recall.
+/// Naive layered-graph HNSW index — reference / oracle form.
+/// The canonical path is [`crate::testing::HNSWIndex`];
+/// `#[doc(hidden)]` here so the blessed path is the only one
+/// in rendered docs.
+///
+/// Produce via [`HNSWBuilder::build_naive`]. Query performance
+/// is sub-linear in corpus size (O(log n · degree) typical) —
+/// the trade-off is a larger up-front build cost than
+/// [`FlatIndex`] and slightly approximate recall. For persistence
+/// and production queries use
+/// [`crate::succinct::SuccinctHNSWIndex`] instead.
+#[doc(hidden)]
 #[derive(Debug)]
 pub struct HNSWIndex {
     dim: usize,
@@ -581,7 +588,8 @@ impl HNSWIndex {
 /// A [`HNSWIndex`] paired with the blob store its handles
 /// resolve against — produced by [`HNSWIndex::attach`]. All
 /// `similar_*` methods live here; the bare [`HNSWIndex`] only
-/// exposes metadata and the blob format.
+/// exposes metadata and the blob format. Canonical path:
+/// [`crate::testing::AttachedHNSWIndex`].
 ///
 /// The view owns a [`BlobCache`][c] over the provided store,
 /// specialized to `(Embedding, View<[f32]>)`. HNSW graph walks
@@ -590,6 +598,7 @@ impl HNSWIndex {
 /// view lifetime.
 ///
 /// [c]: triblespace::core::blob::BlobCache
+#[doc(hidden)]
 pub struct AttachedHNSWIndex<'a, B>
 where
     B: triblespace::core::repo::BlobStoreGet<Blake3>,
@@ -858,13 +867,15 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum()
 }
 
-/// Builder for a flat (brute-force) k-NN index.
+/// Builder for a flat (brute-force) k-NN index — reference /
+/// oracle form. Canonical path: [`crate::testing::FlatBuilder`].
 ///
 /// All vectors are L2-normalized at insert time so the distance
 /// metric at query time is exact cosine similarity (`dot(q, v) =
 /// cos(q, v)` for unit vectors). Pre-normalizing moves the
 /// division into the build pass and keeps the query hot path a
 /// single dot product per doc.
+#[doc(hidden)]
 pub struct FlatBuilder {
     dim: usize,
     keys: Vec<RawValue>,
@@ -959,6 +970,7 @@ impl FlatBuilder {
 /// itself so the dot product reads back as cosine.
 ///
 /// [g]: triblespace::core::repo::BlobStoreGet
+#[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct FlatIndex {
     dim: usize,
@@ -1029,6 +1041,7 @@ impl FlatIndex {
 /// cache; the underlying store is unaffected.
 ///
 /// [c]: triblespace::core::blob::BlobCache
+#[doc(hidden)]
 pub struct AttachedFlatIndex<'a, B>
 where
     B: triblespace::core::repo::BlobStoreGet<Blake3>,

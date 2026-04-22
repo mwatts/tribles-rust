@@ -18,9 +18,12 @@
 //! succinct form directly (delegating through today's
 //! `SuccinctHNSWIndex::from_naive` internally — the naive
 //! intermediate is a necessary buffer because HNSW levels are
-//! only revealed incrementally). The naive [`bm25::BM25Index`]
-//! / [`hnsw::HNSWIndex`] types are kept public as reference
-//! oracles, reachable via `build_naive()`.
+//! only revealed incrementally). Naive reference
+//! implementations live under [`testing`] — see
+//! [`testing::BM25Index`], [`testing::HNSWIndex`], and
+//! [`testing::FlatIndex`] for oracles + benchmarks. Reach them
+//! via `BM25Builder::build_naive()` / `HNSWBuilder::build_naive()`
+//! / `FlatBuilder::build()`.
 //!
 //! Both indexes are rebuilt-and-replaced (no mutation); the
 //! caller persists the resulting handle wherever appropriate
@@ -71,6 +74,37 @@ pub mod schemas;
 #[cfg(feature = "succinct")]
 pub mod succinct;
 pub mod tokens;
+
+/// Reference implementations for tests and benchmarks.
+///
+/// The types re-exported here are naive (insertion-order,
+/// non-packed) forms that exist only to validate the succinct
+/// builds and to measure "how much does jerky packing actually
+/// save at this scale." They are not a production persistence
+/// path — persistence always goes through the succinct forms
+/// in [`succinct`].
+///
+/// - [`BM25Index`][testing::BM25Index] — reference BM25 scoring
+///   and query implementation. Produced by
+///   [`bm25::BM25Builder::build_naive`].
+/// - [`HNSWIndex`][testing::HNSWIndex] — node-major HNSW graph
+///   with inline neighbour lists. Produced by
+///   [`hnsw::HNSWBuilder::build_naive`]; also the input to
+///   [`succinct::SuccinctHNSWIndex::from_naive`] for callers
+///   who want to hold the naive form.
+/// - [`FlatIndex`][testing::FlatIndex] /
+///   [`FlatBuilder`][testing::FlatBuilder] — brute-force exact
+///   k-NN baseline, used as HNSW's recall oracle.
+pub mod testing {
+    // `#[doc(inline)]` makes rustdoc render the re-exported
+    // types' full docs at this path despite `#[doc(hidden)]` at
+    // their original location — the blessed path shows up in
+    // docs, the original doesn't.
+    #[doc(inline)]
+    pub use crate::bm25::BM25Index;
+    #[doc(inline)]
+    pub use crate::hnsw::{AttachedFlatIndex, AttachedHNSWIndex, FlatBuilder, FlatIndex, HNSWIndex};
+}
 
 // Versioning policy: breaking byte-layout changes mint a new
 // `BlobSchema` id (see `SuccinctBM25Blob` / `SuccinctHNSWBlob`

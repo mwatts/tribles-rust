@@ -9,7 +9,8 @@
 use triblespace::core::id::{Id, RawId};
 
 use triblespace_search::bm25::BM25Builder;
-use triblespace_search::hnsw::{FlatBuilder, HNSWBuilder};
+use triblespace_search::hnsw::HNSWBuilder;
+use triblespace_search::testing::FlatBuilder;
 use triblespace_search::succinct::{SuccinctBM25Index, SuccinctHNSWIndex};
 use triblespace_search::tokens::hash_tokens;
 

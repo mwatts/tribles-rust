@@ -300,11 +300,16 @@ fn accumulate_tfs(
     }
 }
 
-/// In-memory BM25 index. Call [`BM25Builder::build`] to produce one.
+/// In-memory BM25 index — reference / oracle form. The
+/// canonical path is [`crate::testing::BM25Index`];
+/// `#[doc(hidden)]` at this location so the blessed path is
+/// the only one that shows up in rendered docs.
 ///
-/// All scores are pre-baked at build time: per-(doc, term) BM25
-/// weight with saturating term frequency (`k1`) and
-/// length-normalized doc length (`b`).
+/// Produce via [`BM25Builder::build_naive`]. All scores are
+/// pre-baked at build time: per-(doc, term) BM25 weight with
+/// saturating term frequency (`k1`) and length-normalized doc
+/// length (`b`).
+#[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct BM25Index {
     /// Per-doc 32-byte keys. Any triblespace `RawValue` — most
