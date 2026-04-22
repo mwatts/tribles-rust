@@ -12,9 +12,12 @@ Two blob types, loaded zero-copy via [anybytes] and [jerky]:
   weighting with the same schema. Postings bit-packed via jerky
   `CompactVector`.
 - **`SuccinctHNSWIndex`** (SH25 blob, schema id
-  `7AFE59E7F895B23F05452FF7919E12E4`) — approximate k-nearest-
-  neighbour over caller-supplied embeddings. Graph stored as
-  per-(layer, node) CSR in two jerky `CompactVector`s.
+  `A96890DE5F85A4F2285C365549B21BC2`) — approximate cosine
+  similarity over caller-supplied embedding handles. Graph
+  stored as per-(layer, node) CSR in two jerky `CompactVector`s.
+  Nodes are `Handle<Blake3, Embedding>` values; the caller's
+  doc-to-embedding mapping is a trible they own, not a shadow
+  datamodel inside the index.
 
 Both indexes are rebuilt-and-replaced (no mutation). The resulting
 blob handle is persisted wherever the caller likes — branch
@@ -43,20 +46,27 @@ naive-then-succinct implementation order is the open work item.
   doc-lengths + postings via `CompactVector`. Same query
   surface; SB25 blob format lands directly in a pile via
   `ToBlob`/`TryFromBlob`.
-* **`FlatIndex`**: brute-force k-NN baseline + two `Constraint`s.
-  Useful for ground truth and small corpora.
+* **`FlatIndex`**: brute-force exact cosine baseline. Same
+  `similar(a, b, score_floor)` constraint as HNSW — useful for
+  ground truth and small corpora.
 * **`HNSWIndex`** (naive Malkov & Yashunin 2018) with
-  deterministic level sampling, ef-search, byte serialization,
-  two `Constraint`s parallel to FlatIndex's. Validated at
-  1 000 docs / 32-dim against `FlatIndex` at ≥ 70 % top-10
-  recall.
-* **`SuccinctHNSWIndex`**: jerky-backed zero-copy view — doc
-  ids + flat f32 vectors + CSR graph via two `CompactVector`s.
-  SH25 blob format; same `similar()` output as the naive
-  index bit-for-bit.
-* **Shared constraint traits** `BM25Queryable` + `HNSWQueryable`
-  — the same `Constraint` implementations work against naive or
-  succinct indexes through the engine.
+  deterministic level sampling, ef-search, byte serialization.
+  Validated at 1 000 handles / 32-dim against `FlatIndex` at
+  ≥ 70 % above-threshold recall.
+* **`SuccinctHNSWIndex`**: jerky-backed zero-copy view — a
+  `FixedBytesTable<32>` of embedding handles plus a CSR graph
+  encoded as two `CompactVector`s. Nodes IS the handle; the
+  caller's doc → embedding mapping lives in their tribles, not
+  here.
+* **Binary-relation similarity constraint** `similar(a, b,
+  score_floor)` produced by the `similar()` method on any
+  attached view. `a` and `b` are `Variable<Handle<Blake3,
+  Embedding>>`; `score_floor` is a fixed cosine threshold.
+  Callers who need the exact score fetch both embeddings and
+  compute cosine directly — no u16 quantization.
+* **Shared constraint trait** `SimilaritySearch` (HNSW, Flat,
+  SuccinctHNSW) + `BM25Queryable` (naive + succinct BM25) — the
+  same constraints work against either backend.
 * **`tokens::hash_tokens`**: opt-in whitespace + lowercase +
   Blake3 tokenizer producing 32-byte term values.
 * **`tokens::ngram_tokens`**: character n-gram tokenizer (n
@@ -77,21 +87,23 @@ naive-then-succinct implementation order is the open work item.
 * **`schemas::F32LE`**: `ValueSchema` for packing `f32` scores
   into 32-byte `Value<F32LE>`s. Used by the scored BM25
   constraint.
-* Six runnable examples:
+* Seven runnable examples:
   - `query_demo` — text search, multi-term OR, value-as-term
     citation search.
   - `compose_bm25_and_pattern` — BM25 + `pattern!` over a
     `TribleSet` in one `find!`.
-  - `compose_hnsw_and_pattern` — vector similarity + `pattern!`
-    composition.
+  - `compose_hnsw_and_pattern` — similarity + `pattern!`
+    composition via the binary `Similar` relation.
+  - `hybrid_search` — BM25 + similarity + `pattern!` in one
+    `find!`; both filters active simultaneously.
   - `blob_sizes_at_scale` — naive vs. SB25 blob size + parallel
     build speedup at 1k / 5k / 10k / 50k docs.
-  - `query_latency` — p50/p99 single- and multi-term query
-    latency for both BM25 and HNSW.
-  - `phrase_search` — `hash_tokens` + `bigram_tokens` composed
-    in one index; same index answers single-word and phrase
+  - `query_latency` — p50/p99 latency for BM25 queries and
+    HNSW threshold walks.
+  - `phrase_search` — `hash_tokens` + `bigram_tokens` in two
+    typed indexes; same corpus answers single-word and phrase
     queries.
-* 146 tests across unit, scale (1k-doc equivalence +
+* 154 tests across unit, scale (1k-doc equivalence +
   naive-vs-SB25 size guard), engine-integration
   (`IntersectionConstraint` joins + `find!` / `pattern!`
   composition + `find!` over both succinct paths), and
@@ -99,13 +111,12 @@ naive-then-succinct implementation order is the open work item.
 
 ### What's next
 
-* Replace the naive blob format with `SuccinctBM25Index` end-
-  to-end (drop the transitional `bm25::SuccinctBM25Index` marker).
-* Quantized BM25 scores (u16 `CompactVector` instead of raw
-  f32) — cuts postings to ~2 bytes per entry.
-* Wavelet-matrix HNSW graph per DESIGN.md's RING plan.
-* Additional token helpers (phrase rewriting, code-aware
-  splitting).
+* A higher-level `bm25_query(?doc, "typst links", ?score)`
+  macro that tokenizes the query string and aggregates per-term
+  scores through the engine.
+* Wavelet-matrix HNSW graph per DESIGN.md's RING plan (no
+  current win under forward-only traversal; see
+  `docs/HNSW_GRAPH_ENCODING.md`).
 
 See
 [`docs/DESIGN.md`](docs/DESIGN.md),

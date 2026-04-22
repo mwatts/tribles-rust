@@ -17,12 +17,16 @@ the same invariants:
    byte buffer; a `try_from_blob` produces a view that holds an
    `anybytes::Bytes` backing and answers queries without copying.
 4. **Unordered-query shape.** Both indexes expose their query
-   primitive as a triblespace constraint where the score is a
-   bound variable:
-     `bm25(?doc, ?term, ?score)`
-     `similar(?doc, query_vec, ?score)`
-   Callers combine with `and!` / `or!` / filters / sorts in the
-   normal query engine.
+   primitive as a triblespace constraint:
+     `bm25.docs_and_scores(?doc, ?score, term)` — BM25 posting
+     list binding both `doc` and the BM25 `score`.
+     `hnsw.similar(?a, ?b, score_floor: f32)` — symmetric
+     binary relation: `a` and `b` are
+     `Variable<Handle<Blake3, Embedding>>`, `score_floor` is a
+     fixed cosine threshold. At least one of `a` / `b` must be
+     bound for the engine to walk.
+   Callers combine with `and!` / `or!` / filters in the normal
+   query engine; ordering is done in Rust after `.collect()`.
 
 ## Term is a `Value`
 
@@ -197,13 +201,19 @@ is the identity — no in-blob magic or version.
   graph_offsets_meta      32 B   ; CompactVectorMetaOnDisk
   (section_offset, section_len) × 3 = 48 B
 
-[keys                ] n_nodes × 32 B
 [handles             ] n_nodes × 32 B          ; Value<Handle<Blake3, Embedding>>
+                                               ; — the node IS the handle;
+                                               ; no separate doc-key table.
 [graph_bytes         ] variable                ; two CompactVectors in one
                                                ; ByteArea:
                                                ;   neighbours (width log2(n+1))
                                                ;   offsets    (width log2(E+1))
 ```
+
+Schema id: `A96890DE5F85A4F2285C365549B21BC2` (see
+`succinct::SuccinctHNSWBlob`; rotated from
+`27D71A473EF22DA4D916F61810AC5D86` when the keys section was
+dropped).
 
 `graph_bytes` packs neighbour lists across all `(layer, node)`
 pairs into a flat CSR: `offsets[L·(n+1) + i]` gives the start of
@@ -212,13 +222,15 @@ absent from layer *L* encode as empty slices — search walks stay
 correct because an empty neighbour list is a dead end, and the
 search always enters from the top-level entry point.
 
-Query algorithm (standard Malkov-Yashunin search):
+Query algorithm (standard Malkov-Yashunin search, threshold-gated):
 1. Start at `entry_point` on `max_level`.
 2. Greedy-descend layer-by-layer down to 1.
-3. On layer 0, ef-width beam search, return top-k.
+3. On layer 0, ef-width beam search; keep every candidate whose
+   cosine similarity clears `score_floor`.
 
 The succinct path re-implements the greedy + ef-search against
-the bit-packed graph; see `SuccinctHNSWIndex::similar` in
+the bit-packed graph; see
+`AttachedSuccinctHNSWIndex::candidates_above` in
 `src/succinct.rs`.
 
 ### What's already compressed
@@ -235,40 +247,36 @@ the bit-packed graph; see `SuccinctHNSWIndex::similar` in
   caller's decision via their embedding schema choice (the
   crate itself stays agnostic).
 
-### Handle-indirected storage (landed for Flat; HNSW next)
+### Handle-keyed storage (shipped for both FlatIndex and HNSW)
 
-`FlatIndex` now stores `(key, Handle<Blake3, Embedding>)` pairs
-instead of inline vectors (format version 5; see
-`src/schemas.rs` for the `Embedding` blob schema minted via
-`trible genid` at `EEC5DFDEA2FFCED70850DF83B03CB62B`).
-Embeddings live in the pile's blob store, content-addressed and
-dedup'd across indexes:
+Both `FlatIndex` and `SuccinctHNSWIndex` store a flat table of
+`Value<Handle<Blake3, Embedding>>` (32 B per handle). There is
+no separate "doc key" table — the node IS the handle. Callers
+who want a book-id → embedding-handle mapping keep it as a
+trible attribute they own (`book_embedding` in the examples),
+not as shadow data inside the index. Embeddings live in the
+pile's blob store, content-addressed, dedup'd across indexes:
 
 ```
 pile blob store:
   Handle<Embedding> h_a → blob_a  (one copy of vector A)
   Handle<Embedding> h_b → blob_b  (one copy of vector B)
 
-index_1:  [(k_1, h_a), (k_2, h_b), ...]   ← 64 B per entry
-index_2:  [(k_3, h_a), (k_4, h_b), ...]   ← same handles, shared blobs
+FlatIndex:         [h_a, h_b, h_c, ...]          ← 32 B per entry
+SuccinctHNSWIndex: [h_a, h_b, h_c, ...] + graph  ← 32 B per entry + bits
 ```
 
-At query time `FlatIndex::similar(q, k, &store)` walks the
-corpus, resolves each handle through `BlobStoreGet`, and scores
-against `q`. The per-handle lookup is the hot path — the
-`BlobCache` type in `triblespace::core::blob` is the natural
-wrapper when the same index gets hit repeatedly.
+The `Embedding` blob schema id is
+`EEC5DFDEA2FFCED70850DF83B03CB62B` (minted via `trible genid`).
+At query time the walk resolves each handle through
+`BlobStoreGet`, and the `BlobCache` wrapper in
+`triblespace::core::blob` collapses repeat visits into a
+single fetch per view lifetime.
 
-Blob size shrank from 32 + 4·dim bytes/doc (inline) to 64
-bytes/doc (flat — key + handle only). For 100 k × 384-dim
-MiniLM: FLAT blob drops from ~150 MiB to ~6.5 MiB; embedding
-blobs (~147 MiB total) are now dedup'd and reusable.
-
-HNSW is slated for the same migration — one iteration of work
-because the graph construction needs vectors for distance
-computations during build. Plan: `HNSWBuilder::insert(key,
-handle, vec)` takes the raw vector for build-time distance,
-stores the handle in the final index, drops the vectors.
+For 100 k × 384-dim MiniLM: the HNSW blob is handles + graph =
+~3.2 MiB + bit-packed CSR (a few more MiB); embedding blobs
+(~147 MiB total) are dedup'd across every index that references
+them.
 
 ### Open compression directions
 
@@ -294,26 +302,31 @@ stores the handle in the final index, drops the vectors.
 
 ## Query engine integration
 
-Both indexes expose their query as a `triblespace::Constraint`
-implementation. A caller loads the blob once (cheap — mmap-backed
-`anybytes::Bytes`) and produces a constraint by binding the index
-handle + query term or vector.
+Both indexes expose their query as a `triblespace::Constraint`.
+Callers load the blob once (cheap — mmap-backed
+`anybytes::Bytes`) and produce a constraint by binding the
+variables they want:
 
 ```rust
-let bm25 = BM25Index::try_from_blob(&blob)?;
-let hnsw = HNSWIndex::try_from_blob(&blob)?;
+let bm25: SuccinctBM25Index = reader.get(bm25_handle)?;
+let hnsw: SuccinctHNSWIndex = reader.get(hnsw_handle)?;
+let hnsw_view = hnsw.attach(&reader);
 
-for (doc, score) in find!(
+let rows: Vec<(Id, f32)> = find!(
     (doc: Id, score: f32),
-    pattern!(&space, [
-        { doc @ wiki::content: _ },
-        bm25.contains(&doc, &term, &score, threshold: 0.1),
-    ]),
-) { ... }
+    and!(
+        pattern!(&kb, [{ ?doc @ wiki::content: _ }]),
+        bm25.docs_and_scores(doc, score, term),
+    ),
+)
+.collect();
 ```
 
-Scores are bound variables; top-k is expressed by sorting results
-in the caller (or via a future `top_k` combinator).
+BM25 posting lists bind `doc` + `score` together; HNSW
+similarity is a binary `similar(a, b, score_floor)` relation
+over `Value<Handle<Blake3, Embedding>>` variables (see
+`docs/QUERY_ENGINE_INTEGRATION.md`). Ordering is operational —
+callers collect the iterator and slice.
 
 ## What lives where
 
@@ -339,9 +352,11 @@ an `Embedding<const D: usize>` schema they control.
   above the index API if/when it matters.
 - Language-aware tokenization. `hash_tokens` is intentionally
   minimal; callers with real NLP needs tokenize themselves.
-- Score combinations across BM25 + HNSW (hybrid search). Caller
-  writes a `bm25(...) + alpha * similar(...)` combinator in the
-  query.
+- Linear score combinations across BM25 + HNSW (hybrid search).
+  Caller composes the boolean combination through `and!` /
+  `or!` in `find!` (see `examples/hybrid_search.rs`); if they
+  want to rank on a weighted sum of scores, they do so in Rust
+  after `.collect()`.
 
 ## Worked example: 100 000 wiki fragments
 
