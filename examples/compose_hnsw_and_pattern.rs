@@ -84,7 +84,7 @@ fn main() {
     let mut hb = HNSWBuilder::new(4).with_seed(42);
     for (bid, v) in &embeddings {
         let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
-        hb.insert_id(*bid, h, v.clone()).unwrap();
+        hb.insert(&*bid, h, v.clone()).unwrap();
     }
     let idx = hb.build();
     let reader = store.reader().unwrap();

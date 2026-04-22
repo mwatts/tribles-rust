@@ -46,7 +46,7 @@ use triblespace::core::blob::{Blob, BlobSchema, ToBlob, TryFromBlob};
 use triblespace::core::id::Id;
 use triblespace::core::id_hex;
 use triblespace::core::metadata::{ConstDescribe, ConstId};
-use triblespace::core::value::RawValue;
+use triblespace::core::value::{RawValue, Value, ValueSchema};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use std::collections::HashMap;
@@ -815,7 +815,7 @@ impl SuccinctGraph {
 ///     (3, vec![0.9, 0.1, 0.0, 0.0]),
 /// ] {
 ///     let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
-///     b.insert_id(Id::new([byte; 16]).unwrap(), h, v).unwrap();
+///     b.insert(&Id::new([byte; 16]).unwrap(), h, v).unwrap();
 /// }
 /// let idx: SuccinctHNSWIndex = b.build();
 ///
@@ -826,8 +826,7 @@ impl SuccinctGraph {
 /// // doc 1 is an exact cosine match, doc 3 nearly so.
 /// assert_eq!(hits[0].0, Id::new([1; 16]).unwrap());
 /// ```
-#[derive(Debug)]
-pub struct SuccinctHNSWIndex {
+pub struct SuccinctHNSWIndex<D: ValueSchema = triblespace::core::value::schemas::genid::GenId> {
     dim: usize,
     m: u16,
     m0: u16,
@@ -842,11 +841,22 @@ pub struct SuccinctHNSWIndex {
     /// [g]: triblespace::core::repo::BlobStoreGet
     handles: FixedBytesTable<32>,
     graph: SuccinctGraph,
+    _phantom: std::marker::PhantomData<D>,
 }
 
-impl SuccinctHNSWIndex {
+impl<D: ValueSchema> std::fmt::Debug for SuccinctHNSWIndex<D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SuccinctHNSWIndex")
+            .field("n_docs", &self.keys.len())
+            .field("dim", &self.dim)
+            .field("max_level", &self.max_level)
+            .finish()
+    }
+}
+
+impl<D: ValueSchema> SuccinctHNSWIndex<D> {
     /// Re-encode a naive [`HNSWIndex`] into the succinct form.
-    pub fn from_naive(idx: &HNSWIndex) -> Result<Self, SuccinctDocLensError> {
+    pub fn from_naive(idx: &HNSWIndex<D>) -> Result<Self, SuccinctDocLensError> {
         let n = idx.doc_count();
         let dim = idx.dim();
         let max_level = idx.max_level();
@@ -889,6 +899,7 @@ impl SuccinctHNSWIndex {
             keys,
             handles,
             graph,
+            _phantom: std::marker::PhantomData,
         })
     }
 
@@ -930,7 +941,7 @@ impl SuccinctHNSWIndex {
     /// readers are cheap-clone.
     ///
     /// [c]: triblespace::core::blob::BlobCache
-    pub fn attach<'a, B>(&'a self, store: &B) -> AttachedSuccinctHNSWIndex<'a, B>
+    pub fn attach<'a, B>(&'a self, store: &B) -> AttachedSuccinctHNSWIndex<'a, B, D>
     where
         B: triblespace::core::repo::BlobStoreGet<
                 triblespace::core::value::schemas::hash::Blake3,
@@ -1136,6 +1147,7 @@ impl SuccinctHNSWIndex {
             keys,
             handles,
             graph,
+            _phantom: std::marker::PhantomData,
         })
     }
 
@@ -1155,13 +1167,17 @@ impl SuccinctHNSWIndex {
 /// view.
 ///
 /// [c]: triblespace::core::blob::BlobCache
-pub struct AttachedSuccinctHNSWIndex<'a, B>
+pub struct AttachedSuccinctHNSWIndex<
+    'a,
+    B,
+    D: ValueSchema = triblespace::core::value::schemas::genid::GenId,
+>
 where
     B: triblespace::core::repo::BlobStoreGet<
             triblespace::core::value::schemas::hash::Blake3,
         >,
 {
-    index: &'a SuccinctHNSWIndex,
+    index: &'a SuccinctHNSWIndex<D>,
     cache: triblespace::core::blob::BlobCache<
         B,
         triblespace::core::value::schemas::hash::Blake3,
@@ -1170,14 +1186,14 @@ where
     >,
 }
 
-impl<'a, B> AttachedSuccinctHNSWIndex<'a, B>
+impl<'a, B, D: ValueSchema> AttachedSuccinctHNSWIndex<'a, B, D>
 where
     B: triblespace::core::repo::BlobStoreGet<
             triblespace::core::value::schemas::hash::Blake3,
         >,
 {
     /// Back-reference to the inner index.
-    pub fn index(&self) -> &SuccinctHNSWIndex {
+    pub fn index(&self) -> &SuccinctHNSWIndex<D> {
         self.index
     }
 
@@ -1187,33 +1203,35 @@ where
     /// constraint don't re-scan.
     pub fn similar_constraint(
         &self,
-        doc: triblespace::core::query::Variable<triblespace::core::value::schemas::genid::GenId>,
+        doc: triblespace::core::query::Variable<D>,
         query: Vec<f32>,
         k: usize,
         ef: Option<usize>,
     ) -> Result<
-        crate::constraint::SimilarToVectorHNSW,
+        crate::constraint::SimilarToVectorHNSW<D>,
         B::GetError<anybytes::view::ViewError>,
     > {
         let top = self.similar(&query, k, ef)?;
-        Ok(crate::constraint::SimilarToVectorHNSW::from_top(doc, top))
+        let raw_top: Vec<(RawValue, f32)> = top.into_iter().map(|(v, s)| (v.raw, s)).collect();
+        Ok(crate::constraint::SimilarToVectorHNSW::from_top(doc, raw_top))
     }
 
     /// Scored variant: binds both `doc` and cosine `score`.
     pub fn similar_with_scores(
         &self,
-        doc: triblespace::core::query::Variable<triblespace::core::value::schemas::genid::GenId>,
+        doc: triblespace::core::query::Variable<D>,
         score: triblespace::core::query::Variable<crate::schemas::F32LE>,
         query: Vec<f32>,
         k: usize,
         ef: Option<usize>,
     ) -> Result<
-        crate::constraint::SimilarToVectorHNSWScored,
+        crate::constraint::SimilarToVectorHNSWScored<D>,
         B::GetError<anybytes::view::ViewError>,
     > {
         let top = self.similar(&query, k, ef)?;
+        let raw_top: Vec<(RawValue, f32)> = top.into_iter().map(|(v, s)| (v.raw, s)).collect();
         Ok(crate::constraint::SimilarToVectorHNSWScored::from_top(
-            doc, score, top,
+            doc, score, raw_top,
         ))
     }
 
@@ -1239,7 +1257,7 @@ where
         query: &[f32],
         k: usize,
         ef: Option<usize>,
-    ) -> Result<Vec<(RawValue, f32)>, B::GetError<anybytes::view::ViewError>> {
+    ) -> Result<Vec<(Value<D>, f32)>, B::GetError<anybytes::view::ViewError>> {
         if query.len() != self.index.dim || k == 0 {
             return Ok(Vec::new());
         }
@@ -1255,38 +1273,16 @@ where
             curr = self.greedy_search_layer(&q, curr, lvl)?;
         }
         let candidates = self.search_layer(&q, curr, ef, 0)?;
-        let mut ranked: Vec<(RawValue, f32)> = candidates
+        let mut ranked: Vec<(Value<D>, f32)> = candidates
             .into_iter()
             .map(|(i, dist)| {
                 let raw = self.index.keys.get(i as usize).expect("in range");
-                (*raw, 1.0 - dist)
+                (Value::<D>::new(*raw), 1.0 - dist)
             })
             .collect();
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         ranked.truncate(k);
         Ok(ranked)
-    }
-
-    /// [`similar`] with GenId-typed keys decoded to [`Id`].
-    ///
-    /// [`similar`]: Self::similar
-    pub fn similar_ids(
-        &self,
-        query: &[f32],
-        k: usize,
-        ef: Option<usize>,
-    ) -> Result<Vec<(Id, f32)>, B::GetError<anybytes::view::ViewError>> {
-        Ok(self
-            .similar(query, k, ef)?
-            .into_iter()
-            .filter_map(|(raw, s)| {
-                if raw[0..16] != [0u8; 16] {
-                    return None;
-                }
-                let id_bytes: [u8; 16] = raw[16..32].try_into().ok()?;
-                Id::new(id_bytes).map(|id| (id, s))
-            })
-            .collect())
     }
 
     fn greedy_search_layer(
@@ -1419,6 +1415,34 @@ where
     }
 }
 
+/// GenId-specific convenience: decode top-k keys as [`Id`]s.
+impl<'a, B> AttachedSuccinctHNSWIndex<'a, B, triblespace::core::value::schemas::genid::GenId>
+where
+    B: triblespace::core::repo::BlobStoreGet<
+            triblespace::core::value::schemas::hash::Blake3,
+        >,
+{
+    /// [`similar`][Self::similar] with keys decoded as [`Id`].
+    pub fn similar_ids(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: Option<usize>,
+    ) -> Result<Vec<(Id, f32)>, B::GetError<anybytes::view::ViewError>> {
+        Ok(self
+            .similar(query, k, ef)?
+            .into_iter()
+            .filter_map(|(v, s)| {
+                if v.raw[0..16] != [0u8; 16] {
+                    return None;
+                }
+                let id_bytes: [u8; 16] = v.raw[16..32].try_into().ok()?;
+                Id::new(id_bytes).map(|id| (id, s))
+            })
+            .collect())
+    }
+}
+
 /// Zero-copy, jerky-backed BM25 index.
 ///
 /// Same query surface as [`crate::bm25::BM25Index`], but postings
@@ -1448,9 +1472,9 @@ where
 /// use triblespace_search::tokens::hash_tokens;
 ///
 /// let mut b = BM25Builder::new();
-/// b.insert_id(Id::new([1; 16]).unwrap(), hash_tokens("the quick brown fox"));
-/// b.insert_id(Id::new([2; 16]).unwrap(), hash_tokens("the lazy brown dog"));
-/// b.insert_id(Id::new([3; 16]).unwrap(), hash_tokens("quick silver fox"));
+/// b.insert(&Id::new([1; 16]).unwrap(), hash_tokens("the quick brown fox"));
+/// b.insert(&Id::new([2; 16]).unwrap(), hash_tokens("the lazy brown dog"));
+/// b.insert(&Id::new([3; 16]).unwrap(), hash_tokens("quick silver fox"));
 /// let idx = b.build();
 ///
 /// // Same query API as BM25Index — "fox" hits two docs.
@@ -1462,7 +1486,10 @@ where
 /// let blob_bytes = idx.to_bytes();
 /// assert!(blob_bytes.len() > 0);
 /// ```
-pub struct SuccinctBM25Index {
+pub struct SuccinctBM25Index<
+    D: ValueSchema = triblespace::core::value::schemas::genid::GenId,
+    T: ValueSchema = crate::tokens::TokenHandle,
+> {
     /// Sorted, deduplicated, compressed doc-key table. For
     /// entity-keyed corpora (`Value<GenId>`), 16 of the 32 bytes
     /// per key are always zero; plus real-world ID patterns
@@ -1480,9 +1507,10 @@ pub struct SuccinctBM25Index {
     avg_doc_len: f32,
     k1: f32,
     b: f32,
+    _phantom: std::marker::PhantomData<(D, T)>,
 }
 
-impl std::fmt::Debug for SuccinctBM25Index {
+impl<D: ValueSchema, T: ValueSchema> std::fmt::Debug for SuccinctBM25Index<D, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SuccinctBM25Index")
             .field("n_docs", &self.keys.len())
@@ -1494,7 +1522,7 @@ impl std::fmt::Debug for SuccinctBM25Index {
     }
 }
 
-impl SuccinctBM25Index {
+impl<D: ValueSchema, T: ValueSchema> SuccinctBM25Index<D, T> {
     /// Direct-to-succinct builder path: consume a
     /// [`BM25Builder`][crate::bm25::BM25Builder] and produce the
     /// succinct index in a single pass through the docs.
@@ -1505,9 +1533,9 @@ impl SuccinctBM25Index {
     /// — no insertion-order → universe-code remap, no per-term
     /// resort pass. `BM25Builder::build()` delegates here.
     pub(crate) fn from_builder(
-        builder: crate::bm25::BM25Builder,
+        builder: crate::bm25::BM25Builder<D, T>,
     ) -> Self {
-        let crate::bm25::BM25Builder { docs, k1, b } = builder;
+        let crate::bm25::BM25Builder { docs, k1, b, _phantom: _ } = builder;
 
         // ── 1. keys: sort + dedup into CompressedUniverse. ─────────
         let (keys_bytes, keys_meta) = {
@@ -1600,6 +1628,7 @@ impl SuccinctBM25Index {
             avg_doc_len,
             k1,
             b,
+            _phantom: std::marker::PhantomData,
         }
     }
 
@@ -1641,22 +1670,22 @@ impl SuccinctBM25Index {
     }
 
     /// Number of documents containing `term`.
-    pub fn doc_frequency(&self, term: &RawValue) -> usize {
-        match self.terms.binary_search(term) {
+    pub fn doc_frequency(&self, term: &Value<T>) -> usize {
+        match self.terms.binary_search(&term.raw) {
             Ok(t) => self.postings.posting_count(t).unwrap_or(0),
             Err(_) => 0,
         }
     }
 
-    /// Constraint that binds `doc` to entity ids containing
-    /// `term`. Mirror of [`BM25Index::docs_containing`] for the
-    /// succinct view.
+    /// Constraint that binds `doc` to doc keys containing `term`.
+    /// Mirror of [`BM25Index::docs_containing`] for the succinct
+    /// view.
     pub fn docs_containing(
         &self,
-        doc: triblespace::core::query::Variable<triblespace::core::value::schemas::genid::GenId>,
-        term: [u8; 32],
-    ) -> crate::constraint::DocsContainingTerm<'_, SuccinctBM25Index> {
-        crate::constraint::DocsContainingTerm::new(self, doc, term)
+        doc: triblespace::core::query::Variable<D>,
+        term: Value<T>,
+    ) -> crate::constraint::DocsContainingTerm<'_, SuccinctBM25Index<D, T>, D> {
+        crate::constraint::DocsContainingTerm::new(self, doc, term.raw)
     }
 
     /// Constraint that binds both `doc` and `score` for each
@@ -1664,26 +1693,24 @@ impl SuccinctBM25Index {
     /// for the succinct view.
     pub fn docs_and_scores(
         &self,
-        doc: triblespace::core::query::Variable<triblespace::core::value::schemas::genid::GenId>,
+        doc: triblespace::core::query::Variable<D>,
         score: triblespace::core::query::Variable<crate::schemas::F32LE>,
-        term: [u8; 32],
-    ) -> crate::constraint::BM25ScoredPostings<'_, SuccinctBM25Index> {
-        crate::constraint::BM25ScoredPostings::new(self, doc, score, term)
+        term: Value<T>,
+    ) -> crate::constraint::BM25ScoredPostings<'_, SuccinctBM25Index<D, T>, D> {
+        crate::constraint::BM25ScoredPostings::new(self, doc, score, term.raw)
     }
 
-    /// Iterate `(key, score)` postings for `term`. Empty if the
-    /// term is absent. Keys are the 32-byte `RawValue`s the
-    /// caller inserted — any `ValueSchema`, most commonly
-    /// [`GenId`].
+    /// Iterate `(Value<D>, f32)` postings for `term`. Empty if
+    /// the term is absent.
     pub fn query_term<'a>(
         &'a self,
-        term: &RawValue,
-    ) -> Box<dyn Iterator<Item = (RawValue, f32)> + 'a> {
-        match self.terms.binary_search(term) {
+        term: &Value<T>,
+    ) -> Box<dyn Iterator<Item = (Value<D>, f32)> + 'a> {
+        match self.terms.binary_search(&term.raw) {
             Ok(t) => match self.postings.postings_for(t) {
                 Some(iter) => Box::new(iter.map(move |(doc_idx, score)| {
                     let key = self.keys.access(doc_idx as usize);
-                    (key, score)
+                    (Value::<D>::new(key), score)
                 })),
                 None => Box::new(std::iter::empty()),
             },
@@ -1691,56 +1718,20 @@ impl SuccinctBM25Index {
         }
     }
 
-    /// Convenience: [`query_term`] decoded as `(Id, score)`
-    /// pairs for entity-keyed (`GenId`) indexes. Mirrors
-    /// [`crate::bm25::BM25Index::query_term_ids`].
-    ///
-    /// [`query_term`]: Self::query_term
-    pub fn query_term_ids<'a>(
-        &'a self,
-        term: &RawValue,
-    ) -> impl Iterator<Item = (Id, f32)> + 'a {
-        self.query_term(term).filter_map(|(raw, score)| {
-            if raw[0..16] != [0u8; 16] {
-                return None;
-            }
-            let id_bytes: [u8; 16] = raw[16..32].try_into().ok()?;
-            Id::new(id_bytes).map(|id| (id, score))
-        })
-    }
-
-    /// Convenience: [`query_multi`] decoded as `(Id, score)`
-    /// pairs for entity-keyed indexes.
-    ///
-    /// [`query_multi`]: Self::query_multi
-    pub fn query_multi_ids(&self, terms: &[RawValue]) -> Vec<(Id, f32)> {
-        self.query_multi(terms)
-            .into_iter()
-            .filter_map(|(raw, s)| {
-                if raw[0..16] != [0u8; 16] {
-                    return None;
-                }
-                let id_bytes: [u8; 16] = raw[16..32].try_into().ok()?;
-                Id::new(id_bytes).map(|id| (id, s))
-            })
-            .collect()
-    }
-
     /// Score a multi-term query as the sum of per-term BM25
-    /// weights (standard OR-like bag-of-words). Mirror of
-    /// [`crate::bm25::BM25Index::query_multi`] for the succinct
-    /// view. Returned `(key, score)` pairs are sorted descending
-    /// by score; no top-k truncation — caller slices what they
-    /// need.
-    pub fn query_multi(&self, terms: &[RawValue]) -> Vec<(RawValue, f32)> {
+    /// weights (standard OR-like bag-of-words). Returned
+    /// `(Value<D>, f32)` pairs are sorted descending by score;
+    /// no top-k truncation — caller slices what they need.
+    pub fn query_multi(&self, terms: &[Value<T>]) -> Vec<(Value<D>, f32)> {
         let mut acc: std::collections::HashMap<RawValue, f32> =
             std::collections::HashMap::new();
         for term in terms {
             for (key, score) in self.query_term(term) {
-                *acc.entry(key).or_insert(0.0) += score;
+                *acc.entry(key.raw).or_insert(0.0) += score;
             }
         }
-        let mut out: Vec<(RawValue, f32)> = acc.into_iter().collect();
+        let mut out: Vec<(Value<D>, f32)> =
+            acc.into_iter().map(|(raw, s)| (Value::<D>::new(raw), s)).collect();
         out.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         out
     }
@@ -1948,7 +1939,42 @@ impl SuccinctBM25Index {
             avg_doc_len,
             k1,
             b,
+            _phantom: std::marker::PhantomData,
         })
+    }
+}
+
+/// GenId-specific convenience: decode posting keys as [`Id`]s.
+impl<T: ValueSchema> SuccinctBM25Index<triblespace::core::value::schemas::genid::GenId, T> {
+    /// [`query_term`][Self::query_term] with each key decoded
+    /// as an [`Id`] (empty for keys that aren't valid GenId
+    /// bit-patterns).
+    pub fn query_term_ids<'a>(
+        &'a self,
+        term: &Value<T>,
+    ) -> impl Iterator<Item = (Id, f32)> + 'a {
+        self.query_term(term).filter_map(|(v, score)| {
+            if v.raw[0..16] != [0u8; 16] {
+                return None;
+            }
+            let id_bytes: [u8; 16] = v.raw[16..32].try_into().ok()?;
+            Id::new(id_bytes).map(|id| (id, score))
+        })
+    }
+
+    /// [`query_multi`][Self::query_multi] decoded as `(Id, f32)`
+    /// pairs.
+    pub fn query_multi_ids(&self, terms: &[Value<T>]) -> Vec<(Id, f32)> {
+        self.query_multi(terms)
+            .into_iter()
+            .filter_map(|(v, s)| {
+                if v.raw[0..16] != [0u8; 16] {
+                    return None;
+                }
+                let id_bytes: [u8; 16] = v.raw[16..32].try_into().ok()?;
+                Id::new(id_bytes).map(|id| (id, s))
+            })
+            .collect()
     }
 }
 
@@ -2023,19 +2049,19 @@ impl BlobSchema for SuccinctBM25Blob {}
 // that the schema can't describe itself.
 impl ConstDescribe for SuccinctBM25Blob {}
 
-impl ToBlob<SuccinctBM25Blob> for &SuccinctBM25Index {
+impl<D: ValueSchema, T: ValueSchema> ToBlob<SuccinctBM25Blob> for &SuccinctBM25Index<D, T> {
     fn to_blob(self) -> Blob<SuccinctBM25Blob> {
         Blob::new(Bytes::from_source(self.to_bytes()))
     }
 }
 
-impl ToBlob<SuccinctBM25Blob> for SuccinctBM25Index {
+impl<D: ValueSchema, T: ValueSchema> ToBlob<SuccinctBM25Blob> for SuccinctBM25Index<D, T> {
     fn to_blob(self) -> Blob<SuccinctBM25Blob> {
         (&self).to_blob()
     }
 }
 
-impl TryFromBlob<SuccinctBM25Blob> for SuccinctBM25Index {
+impl<D: ValueSchema, T: ValueSchema> TryFromBlob<SuccinctBM25Blob> for SuccinctBM25Index<D, T> {
     type Error = SuccinctLoadError;
 
     fn try_from_blob(blob: Blob<SuccinctBM25Blob>) -> Result<Self, Self::Error> {
@@ -2077,19 +2103,19 @@ impl BlobSchema for SuccinctHNSWBlob {}
 
 impl ConstDescribe for SuccinctHNSWBlob {}
 
-impl ToBlob<SuccinctHNSWBlob> for &SuccinctHNSWIndex {
+impl<D: ValueSchema> ToBlob<SuccinctHNSWBlob> for &SuccinctHNSWIndex<D> {
     fn to_blob(self) -> Blob<SuccinctHNSWBlob> {
         Blob::new(Bytes::from_source(self.to_bytes()))
     }
 }
 
-impl ToBlob<SuccinctHNSWBlob> for SuccinctHNSWIndex {
+impl<D: ValueSchema> ToBlob<SuccinctHNSWBlob> for SuccinctHNSWIndex<D> {
     fn to_blob(self) -> Blob<SuccinctHNSWBlob> {
         (&self).to_blob()
     }
 }
 
-impl TryFromBlob<SuccinctHNSWBlob> for SuccinctHNSWIndex {
+impl<D: ValueSchema> TryFromBlob<SuccinctHNSWBlob> for SuccinctHNSWIndex<D> {
     type Error = SuccinctLoadError;
 
     fn try_from_blob(blob: Blob<SuccinctHNSWBlob>) -> Result<Self, Self::Error> {
@@ -2272,10 +2298,10 @@ mod tests {
         }
 
         let mut b = BM25Builder::new();
-        b.insert_id(iid(1), hash_tokens("the quick brown fox"));
-        b.insert_id(iid(2), hash_tokens("the lazy brown dog"));
-        b.insert_id(iid(3), hash_tokens("quick silver fox jumps"));
-        b.insert_id(iid(4), hash_tokens("unrelated filler content"));
+        b.insert(&iid(1), hash_tokens("the quick brown fox"));
+        b.insert(&iid(2), hash_tokens("the lazy brown dog"));
+        b.insert(&iid(3), hash_tokens("quick silver fox jumps"));
+        b.insert(&iid(4), hash_tokens("unrelated filler content"));
         let naive = b.clone().build_naive();
         let succinct = b.build();
 
@@ -2288,28 +2314,29 @@ mod tests {
         // Every stored term must produce matching postings. Scores
         // match within the succinct index's quantization tolerance.
         let tol = succinct.score_tolerance();
-        for term in naive.terms_slice() {
-            let n: Vec<_> = naive.query_term(term).collect();
-            let s: Vec<_> = succinct.query_term(term).collect();
+        for term_raw in naive.terms_slice() {
+            let term: Value<crate::tokens::TokenHandle> = Value::new(*term_raw);
+            let n: Vec<_> = naive.query_term(&term).collect();
+            let s: Vec<_> = succinct.query_term(&term).collect();
             assert_eq!(
                 n.len(),
                 s.len(),
-                "posting count mismatch for term {term:x?}"
+                "posting count mismatch for term {term_raw:x?}"
             );
             for ((n_id, n_s), (s_id, s_s)) in n.iter().zip(s.iter()) {
-                assert_eq!(n_id, s_id);
+                assert_eq!(n_id.raw, s_id.raw);
                 assert!(
                     (n_s - s_s).abs() <= tol,
                     "score drift for {n_id:?}: naive={n_s} succinct={s_s} > tol {tol}"
                 );
             }
-            assert_eq!(naive.doc_frequency(term), succinct.doc_frequency(term));
+            assert_eq!(naive.doc_frequency(&term), succinct.doc_frequency(&term));
         }
 
         // Missing term returns nothing.
-        let missing = hash_tokens("banana")[0];
-        assert!(succinct.query_term(&missing).next().is_none());
-        assert_eq!(succinct.doc_frequency(&missing), 0);
+        let missing = hash_tokens("banana");
+        assert!(succinct.query_term(&missing[0]).next().is_none());
+        assert_eq!(succinct.doc_frequency(&missing[0]), 0);
     }
 
     #[test]
@@ -2318,7 +2345,8 @@ mod tests {
         let succinct = BM25Builder::new().build();
         assert_eq!(succinct.doc_count(), 0);
         assert_eq!(succinct.term_count(), 0);
-        assert!(succinct.query_term(&[0u8; 32]).next().is_none());
+        let probe: Value<crate::tokens::TokenHandle> = Value::new([0u8; 32]);
+        assert!(succinct.query_term(&probe).next().is_none());
     }
 
     #[test]
@@ -2335,12 +2363,12 @@ mod tests {
             Id::new([byte; 16]).unwrap()
         }
         let mut b = BM25Builder::new();
-        b.insert_id(iid(1), hash_tokens("quick fox"));
-        b.insert_id(
+        b.insert(&iid(1), hash_tokens("quick fox"));
+        b.insert(&
             iid(2),
             hash_tokens("quick red rapid fox jumps high over fences"),
         );
-        b.insert_id(iid(3), hash_tokens("slow brown dog"));
+        b.insert(&iid(3), hash_tokens("slow brown dog"));
         let naive = b.clone().build_naive();
         let succinct = b.build();
 
@@ -2369,10 +2397,10 @@ mod tests {
             Id::new([byte; 16]).unwrap()
         }
         let mut b = BM25Builder::new().k1(1.4).b(0.72);
-        b.insert_id(iid(1), hash_tokens("the quick brown fox"));
-        b.insert_id(iid(2), hash_tokens("the lazy brown dog"));
-        b.insert_id(iid(3), hash_tokens("quick silver fox jumps"));
-        b.insert_id(iid(4), hash_tokens("completely unrelated filler content"));
+        b.insert(&iid(1), hash_tokens("the quick brown fox"));
+        b.insert(&iid(2), hash_tokens("the lazy brown dog"));
+        b.insert(&iid(3), hash_tokens("quick silver fox jumps"));
+        b.insert(&iid(4), hash_tokens("completely unrelated filler content"));
         b.build()
     }
 
@@ -2414,14 +2442,19 @@ mod tests {
         use crate::bm25::BM25Builder;
         let idx = BM25Builder::new().build();
         let bytes = idx.to_bytes();
-        let reloaded = SuccinctBM25Index::try_from_bytes(&bytes).expect("valid blob");
+        let reloaded: SuccinctBM25Index =
+            SuccinctBM25Index::try_from_bytes(&bytes).expect("valid blob");
         assert_eq!(reloaded.doc_count(), 0);
         assert_eq!(reloaded.term_count(), 0);
     }
 
     #[test]
     fn succinct_bm25_rejects_short_header() {
-        let err = SuccinctBM25Index::try_from_bytes(&[0u8; 10]).unwrap_err();
+        let err = SuccinctBM25Index::<
+            triblespace::core::value::schemas::genid::GenId,
+            crate::tokens::TokenHandle,
+        >::try_from_bytes(&[0u8; 10])
+        .unwrap_err();
         assert_eq!(err, SuccinctLoadError::ShortHeader);
     }
 
@@ -2434,7 +2467,11 @@ mod tests {
     fn succinct_bm25_rejects_truncation() {
         let bytes = build_succinct_sample().to_bytes();
         let truncated = &bytes[..bytes.len() - 2];
-        let err = SuccinctBM25Index::try_from_bytes(truncated).unwrap_err();
+        let err = SuccinctBM25Index::<
+            triblespace::core::value::schemas::genid::GenId,
+            crate::tokens::TokenHandle,
+        >::try_from_bytes(truncated)
+        .unwrap_err();
         assert!(matches!(err, SuccinctLoadError::TruncatedSection(_)));
     }
 
@@ -2443,7 +2480,8 @@ mod tests {
         use triblespace::core::blob::{ToBlob, TryFromBlob};
         let original = build_succinct_sample();
         let blob: triblespace::core::blob::Blob<SuccinctBM25Blob> = (&original).to_blob();
-        let reloaded = SuccinctBM25Index::try_from_blob(blob).expect("valid blob");
+        let reloaded: SuccinctBM25Index =
+            SuccinctBM25Index::try_from_blob(blob).expect("valid blob");
         assert_eq!(reloaded.doc_count(), original.doc_count());
         assert_eq!(reloaded.term_count(), original.term_count());
     }
@@ -2532,7 +2570,7 @@ mod tests {
             let f = i as f32;
             let vec = vec![f.sin(), f.cos(), (f * 0.5).sin(), (f * 0.3).cos()];
             let h = crate::schemas::put_embedding::<_, Blake3>(&mut store, vec.clone()).unwrap();
-            b.insert_id(iid(i), h, vec).unwrap();
+            b.insert(&iid(i), h, vec).unwrap();
         }
         let naive = b.build_naive();
         let succinct = SuccinctHNSWIndex::from_naive(&naive).unwrap();
@@ -2584,7 +2622,7 @@ mod tests {
             let f = i as f32;
             let v = vec![f.sin(), f.cos(), (f * 0.7).sin(), (f * 0.3).cos()];
             let h = crate::schemas::put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
-            b.insert_id(iid(i), h, v).unwrap();
+            b.insert(&iid(i), h, v).unwrap();
         }
         let idx = b.build();
         (idx, store)
@@ -2621,7 +2659,8 @@ mod tests {
         use triblespace::core::value::schemas::hash::Blake3;
         let idx = HNSWBuilder::new(3).build();
         let bytes = idx.to_bytes();
-        let reloaded = SuccinctHNSWIndex::try_from_bytes(&bytes).expect("valid blob");
+        let reloaded: SuccinctHNSWIndex =
+            SuccinctHNSWIndex::try_from_bytes(&bytes).expect("valid blob");
         assert_eq!(reloaded.doc_count(), 0);
         let mut store: MemoryBlobStore<Blake3> = MemoryBlobStore::new();
         assert!(reloaded
@@ -2633,7 +2672,10 @@ mod tests {
 
     #[test]
     fn succinct_hnsw_rejects_short_header() {
-        let err = SuccinctHNSWIndex::try_from_bytes(&[0u8; 10]).unwrap_err();
+        let err = SuccinctHNSWIndex::<
+            triblespace::core::value::schemas::genid::GenId,
+        >::try_from_bytes(&[0u8; 10])
+        .unwrap_err();
         assert_eq!(err, SuccinctLoadError::ShortHeader);
     }
 
@@ -2647,7 +2689,10 @@ mod tests {
         let (idx, _) = build_succinct_hnsw_sample();
         let bytes = idx.to_bytes();
         let truncated = &bytes[..bytes.len() - 2];
-        let err = SuccinctHNSWIndex::try_from_bytes(truncated).unwrap_err();
+        let err = SuccinctHNSWIndex::<
+            triblespace::core::value::schemas::genid::GenId,
+        >::try_from_bytes(truncated)
+        .unwrap_err();
         assert!(matches!(err, SuccinctLoadError::TruncatedSection(_)));
     }
 
@@ -2656,7 +2701,8 @@ mod tests {
         use triblespace::core::blob::{ToBlob, TryFromBlob};
         let (original, _) = build_succinct_hnsw_sample();
         let blob: triblespace::core::blob::Blob<SuccinctHNSWBlob> = (&original).to_blob();
-        let reloaded = SuccinctHNSWIndex::try_from_blob(blob).expect("valid blob");
+        let reloaded: SuccinctHNSWIndex =
+            SuccinctHNSWIndex::try_from_blob(blob).expect("valid blob");
         assert_eq!(reloaded.doc_count(), original.doc_count());
         assert_eq!(reloaded.dim(), original.dim());
     }
@@ -2725,7 +2771,7 @@ mod tests {
                 if i == 0 { 1 } else { 0xaa },
             ])
             .unwrap();
-            b.insert_id(id, hash_tokens(&text));
+            b.insert(&id, hash_tokens(&text));
         }
         let naive_size = b.clone().build_naive().byte_size();
         let succinct_bytes = b.build().to_bytes();

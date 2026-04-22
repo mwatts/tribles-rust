@@ -6,8 +6,15 @@
 //! stemming, typst/code-aware splitting, phrase handling) can
 //! feed `Value`s directly and skip these helpers entirely.
 
-use triblespace::core::value::schemas::UnknownValue;
-use triblespace::core::value::{RawValue, Value};
+use triblespace::core::blob::schemas::longstring::LongString;
+use triblespace::core::value::schemas::hash::{Blake3, Handle};
+use triblespace::core::value::Value;
+
+/// Alias for the term schema the built-in tokenizers produce:
+/// a Blake3 hash interpreted as a `Handle<LongString>`. The
+/// hash bytes are valid blob handles by construction — no
+/// separate schema is needed to type tokens.
+pub type TokenHandle = Handle<Blake3, LongString>;
 
 /// Tokenize `text` with a simple whitespace-and-lowercase scheme
 /// and return each token as a 32-byte Blake3 hash suitable for
@@ -37,7 +44,7 @@ use triblespace::core::value::{RawValue, Value};
 /// assert_eq!(vs[0], vs[2]);
 /// assert_ne!(vs[0], vs[1]);
 /// ```
-pub fn hash_tokens(text: &str) -> Vec<RawValue> {
+pub fn hash_tokens(text: &str) -> Vec<Value<TokenHandle>> {
     text.split_ascii_whitespace()
         .filter_map(|raw| {
             let trimmed = raw.trim_matches(|c: char| c.is_ascii_punctuation());
@@ -52,18 +59,8 @@ pub fn hash_tokens(text: &str) -> Vec<RawValue> {
             for c in trimmed.chars() {
                 lower.push(c.to_ascii_lowercase());
             }
-            Some(*blake3::hash(lower.as_bytes()).as_bytes())
+            Some(Value::<TokenHandle>::new(*blake3::hash(lower.as_bytes()).as_bytes()))
         })
-        .collect()
-}
-
-/// Tagged wrapper: hash the tokens and wrap each one as a
-/// `Value<UnknownValue>` for callers that want the triblespace
-/// `Value` type rather than the raw byte array.
-pub fn hash_tokens_as_values(text: &str) -> Vec<Value<UnknownValue>> {
-    hash_tokens(text)
-        .into_iter()
-        .map(Value::<UnknownValue>::new)
         .collect()
 }
 
@@ -103,7 +100,7 @@ pub fn hash_tokens_as_values(text: &str) -> Vec<Value<UnknownValue>> {
 /// let qry = bigram_tokens("quick brown");
 /// assert!(doc.contains(&qry[0]));
 /// ```
-pub fn bigram_tokens(text: &str) -> Vec<RawValue> {
+pub fn bigram_tokens(text: &str) -> Vec<Value<TokenHandle>> {
     // Reuse hash_tokens' normalization pipeline but keep the
     // pre-hash string form so we can pair adjacent tokens.
     let words: Vec<String> = text
@@ -134,7 +131,7 @@ pub fn bigram_tokens(text: &str) -> Vec<RawValue> {
         buf.push_str(&pair[0]);
         buf.push('\u{0}');
         buf.push_str(&pair[1]);
-        out.push(*blake3::hash(buf.as_bytes()).as_bytes());
+        out.push(Value::<TokenHandle>::new(*blake3::hash(buf.as_bytes()).as_bytes()));
     }
     out
 }
@@ -169,7 +166,7 @@ pub fn bigram_tokens(text: &str) -> Vec<RawValue> {
 /// uppercase with the new lowercase run, producing `HTM` + `Lv`
 /// in that case. Prefer explicit separators (`_`, case changes,
 /// or digits) when the intent matters.
-pub fn code_tokens(text: &str) -> Vec<RawValue> {
+pub fn code_tokens(text: &str) -> Vec<Value<TokenHandle>> {
     let mut segments: Vec<String> = Vec::new();
     let mut cur = String::new();
 
@@ -252,7 +249,7 @@ pub fn code_tokens(text: &str) -> Vec<RawValue> {
             if lower.is_empty() {
                 None
             } else {
-                Some(*blake3::hash(lower.as_bytes()).as_bytes())
+                Some(Value::<TokenHandle>::new(*blake3::hash(lower.as_bytes()).as_bytes()))
             }
         })
         .collect()
@@ -294,7 +291,7 @@ pub fn code_tokens(text: &str) -> Vec<RawValue> {
 /// // "fox" and "foxes" share the "fox" trigram.
 /// assert!(ngram_tokens("foxes", 3).contains(&ngram_tokens("fox", 3)[0]));
 /// ```
-pub fn ngram_tokens(text: &str, n: usize) -> Vec<RawValue> {
+pub fn ngram_tokens(text: &str, n: usize) -> Vec<Value<TokenHandle>> {
     if n == 0 {
         return Vec::new();
     }
@@ -327,7 +324,7 @@ pub fn ngram_tokens(text: &str, n: usize) -> Vec<RawValue> {
             for &c in window {
                 gram.push(c);
             }
-            out.push(*blake3::hash(gram.as_bytes()).as_bytes());
+            out.push(Value::<TokenHandle>::new(*blake3::hash(gram.as_bytes()).as_bytes()));
         }
     }
     out
@@ -377,7 +374,7 @@ mod tests {
         // not drift across crate versions.
         let tokens = hash_tokens("hello");
         let expected = *blake3::hash(b"hello").as_bytes();
-        assert_eq!(tokens[0], expected);
+        assert_eq!(tokens[0].raw, expected);
     }
 
     #[test]
@@ -491,15 +488,15 @@ mod tests {
         fn iid(byte: u8) -> Id {
             Id::new([byte; 16]).unwrap()
         }
-        fn both(text: &str) -> Vec<RawValue> {
+        fn both(text: &str) -> Vec<Value<TokenHandle>> {
             let mut v = hash_tokens(text);
             v.extend(bigram_tokens(text));
             v
         }
         let mut b = BM25Builder::new();
-        b.insert_id(iid(1), both("the quick brown fox"));
-        b.insert_id(iid(2), both("fox fight club"));
-        b.insert_id(iid(3), both("quick silver brown fox")); // `quick` + `brown` but NOT adjacent
+        b.insert(&iid(1), both("the quick brown fox"));
+        b.insert(&iid(2), both("fox fight club"));
+        b.insert(&iid(3), both("quick silver brown fox")); // `quick` + `brown` but NOT adjacent
         let idx = b.build();
 
         // Query "quick brown" as a bigram: only doc 1 contains
@@ -511,7 +508,7 @@ mod tests {
         // Keys come back as 32-byte RawValue (Value<GenId> form).
         let mut key1 = [0u8; 32];
         key1[16..32].copy_from_slice(AsRef::<[u8; 16]>::as_ref(&iid(1)));
-        assert_eq!(hits[0].0, key1);
+        assert_eq!(hits[0].0.raw, key1);
     }
 
     #[test]
@@ -519,7 +516,7 @@ mod tests {
         let t = code_tokens("parse_http_response");
         let expected = ["parse", "http", "response"]
             .iter()
-            .map(|s| *blake3::hash(s.as_bytes()).as_bytes())
+            .map(|s| Value::<TokenHandle>::new(*blake3::hash(s.as_bytes()).as_bytes()))
             .collect::<Vec<_>>();
         assert_eq!(t, expected);
     }
@@ -529,7 +526,7 @@ mod tests {
         let t = code_tokens("parseResponseBody");
         let expected = ["parse", "response", "body"]
             .iter()
-            .map(|s| *blake3::hash(s.as_bytes()).as_bytes())
+            .map(|s| Value::<TokenHandle>::new(*blake3::hash(s.as_bytes()).as_bytes()))
             .collect::<Vec<_>>();
         assert_eq!(t, expected);
     }
@@ -541,7 +538,7 @@ mod tests {
         let t = code_tokens("HTMLParser");
         let expected = ["html", "parser"]
             .iter()
-            .map(|s| *blake3::hash(s.as_bytes()).as_bytes())
+            .map(|s| Value::<TokenHandle>::new(*blake3::hash(s.as_bytes()).as_bytes()))
             .collect::<Vec<_>>();
         assert_eq!(t, expected);
     }
@@ -551,7 +548,7 @@ mod tests {
         let t = code_tokens("parseV2Request");
         let expected = ["parse", "v", "2", "request"]
             .iter()
-            .map(|s| *blake3::hash(s.as_bytes()).as_bytes())
+            .map(|s| Value::<TokenHandle>::new(*blake3::hash(s.as_bytes()).as_bytes()))
             .collect::<Vec<_>>();
         assert_eq!(t, expected);
     }

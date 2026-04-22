@@ -43,9 +43,9 @@
 //!
 //! // 1. Build an in-memory index.
 //! let mut b = BM25Builder::new();
-//! b.insert_id(Id::new([1; 16]).unwrap(), hash_tokens("the quick brown fox"));
-//! b.insert_id(Id::new([2; 16]).unwrap(), hash_tokens("the lazy brown dog"));
-//! b.insert_id(Id::new([3; 16]).unwrap(), hash_tokens("quick silver fox"));
+//! b.insert(&Id::new([1; 16]).unwrap(), hash_tokens("the quick brown fox"));
+//! b.insert(&Id::new([2; 16]).unwrap(), hash_tokens("the lazy brown dog"));
+//! b.insert(&Id::new([3; 16]).unwrap(), hash_tokens("quick silver fox"));
 //!
 //! // 2. Build a succinct BM25 index in a single pass.
 //! let idx: SuccinctBM25Index = b.build();

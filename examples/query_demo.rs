@@ -6,6 +6,8 @@
 //! ```
 
 use triblespace::core::id::Id;
+use triblespace::core::value::schemas::genid::GenId;
+use triblespace::core::value::{ToValue, Value};
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::succinct::SuccinctBM25Index;
 use triblespace_search::tokens::hash_tokens;
@@ -33,7 +35,7 @@ fn main() {
     // Build.
     let mut builder = BM25Builder::new();
     for (id, text) in &corpus {
-        builder.insert_id(*id, hash_tokens(text));
+        builder.insert(&*id, hash_tokens(text));
         println!("indexed {id} ({} tokens)", hash_tokens(text).len());
     }
     let idx = builder.build();
@@ -69,42 +71,19 @@ fn main() {
     // fragments it cites. The same BM25 index gives us
     // "documents citing this fragment".
     println!("\ncitation search (term = fragment id):");
-    let mut cite_builder = BM25Builder::new();
-    cite_builder.insert_id(
-        id(10),
-        vec![*id(1).as_ref(); 1]
-            .iter()
-            .map(|r| raw_from_id(r))
-            .collect(),
-    );
-    cite_builder.insert_id(
-        id(11),
-        vec![id(1), id(3)]
-            .iter()
-            .map(|i| raw_from_id(i.as_ref()))
-            .collect(),
-    );
-    cite_builder.insert_id(
-        id(12),
-        vec![id(3)]
-            .iter()
-            .map(|i| raw_from_id(i.as_ref()))
-            .collect(),
-    );
+    // When terms themselves are entity ids, both `D` and `T`
+    // are `GenId` — the same BM25 index handles "docs containing
+    // a mention-of-entity-X term."
+    let mut cite_builder: BM25Builder<GenId, GenId> = BM25Builder::typed();
+    cite_builder.insert(&id(10), vec![(&id(1)).to_value()]);
+    cite_builder.insert(&id(11), vec![(&id(1)).to_value(), (&id(3)).to_value()]);
+    cite_builder.insert(&id(12), vec![(&id(3)).to_value()]);
     let cite_idx = cite_builder.build();
 
-    let cites_one: Vec<_> = cite_idx.query_term_ids(&raw_from_id(id(1).as_ref())).collect();
+    let citation_term: Value<GenId> = (&id(1)).to_value();
+    let cites_one: Vec<_> = cite_idx.query_term_ids(&citation_term).collect();
     println!("  citations of {}: {} doc(s)", id(1), cites_one.len());
     for (doc, _) in cites_one {
         println!("    cited by {doc}");
     }
-}
-
-/// Helper: lift a 16-byte `RawId` into a 32-byte term value by
-/// zero-padding. Keeps `Id`s and hashed tokens in the same 32-byte
-/// term space.
-fn raw_from_id(id: &[u8; 16]) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    out[..16].copy_from_slice(id);
-    out
 }

@@ -62,7 +62,7 @@ fn bm25_1k_docs_roundtrip_consistency() {
     let mut builder = BM25Builder::new();
     for i in 0..N_DOCS {
         let doc = fake_document(&mut rng, VOCAB, DOC_LEN);
-        builder.insert_id(id_from_u64(i as u64 + 1), hash_tokens(&doc));
+        builder.insert(&id_from_u64(i as u64 + 1), hash_tokens(&doc));
     }
     let idx = builder.build_naive();
     assert_eq!(idx.doc_count(), N_DOCS);
@@ -87,11 +87,11 @@ fn bm25_1k_docs_multi_term_ranks_sanely() {
     let mut builder = BM25Builder::new();
     for i in 0..1_000 {
         let doc = fake_document(&mut rng, 200, 30);
-        builder.insert_id(id_from_u64(i as u64 + 1), hash_tokens(&doc));
+        builder.insert(&id_from_u64(i as u64 + 1), hash_tokens(&doc));
     }
     // Inject a unique "needle" doc.
     let needle_id = id_from_u64(999_999);
-    builder.insert_id(needle_id, hash_tokens("needle needle beacon"));
+    builder.insert(&needle_id, hash_tokens("needle needle beacon"));
     let idx = builder.build_naive();
 
     let q = hash_tokens("needle beacon");
@@ -102,7 +102,7 @@ fn bm25_1k_docs_multi_term_ranks_sanely() {
     // Value<GenId> form of needle_id.
     let mut needle_key = [0u8; 32];
     needle_key[16..32].copy_from_slice(AsRef::<[u8; 16]>::as_ref(&needle_id));
-    assert_eq!(ranked[0].0, needle_key);
+    assert_eq!(ranked[0].0.raw, needle_key);
 }
 
 #[test]
@@ -131,8 +131,8 @@ fn hnsw_1k_vectors_recall_against_flat() {
             .collect();
         let doc = id_from_u64((i + 1) as u64);
         let h = put_embedding::<_, Blake3>(&mut store, vec.clone()).unwrap();
-        flat_b.insert_id(doc, h);
-        hnsw_b.insert_id(doc, h, vec).unwrap();
+        flat_b.insert(&doc, h);
+        hnsw_b.insert(&doc, h, vec).unwrap();
     }
     let flat = flat_b.build();
     let hnsw = hnsw_b.build();
@@ -182,7 +182,7 @@ fn succinct_bm25_1k_docs_matches_naive() {
     let mut builder = BM25Builder::new();
     for i in 0..1_000 {
         let doc = fake_document(&mut rng, 500, 20);
-        builder.insert_id(id_from_u64(i as u64 + 1), hash_tokens(&doc));
+        builder.insert(&id_from_u64(i as u64 + 1), hash_tokens(&doc));
     }
     let naive = builder.clone().build_naive();
     let succinct = builder.build();
@@ -261,7 +261,7 @@ fn succinct_hnsw_1k_docs_matches_naive() {
             .collect();
         let h = put_embedding::<_, Blake3>(&mut store, vec.clone()).unwrap();
         builder
-            .insert_id(id_from_u64((i + 1) as u64), h, vec)
+            .insert(&id_from_u64((i + 1) as u64), h, vec)
             .unwrap();
     }
     let naive = builder.build_naive();
@@ -298,7 +298,7 @@ fn succinct_bm25_blob_smaller_than_naive_at_1k() {
     let mut builder = BM25Builder::new();
     for i in 0..1_000 {
         let doc = fake_document(&mut rng, 400, 24);
-        builder.insert_id(id_from_u64(i as u64 + 1), hash_tokens(&doc));
+        builder.insert(&id_from_u64(i as u64 + 1), hash_tokens(&doc));
     }
     let naive = builder.clone().build_naive();
     let succinct = builder.build();
@@ -331,7 +331,7 @@ fn bm25_quantization_preserves_top10() {
     let mut builder = BM25Builder::new();
     for i in 0..1_000 {
         let doc = fake_document(&mut rng, 400, 24);
-        builder.insert_id(id_from_u64(i as u64 + 1), hash_tokens(&doc));
+        builder.insert(&id_from_u64(i as u64 + 1), hash_tokens(&doc));
     }
     // Uses raw f32 scores, so build the naive reference — the
     // succinct form already quantizes internally.
@@ -390,14 +390,15 @@ fn bm25_quantization_preserves_top10() {
         let mut q_scores: Vec<(triblespace::core::value::RawValue, f32)> = Vec::new();
         for term in &terms {
             for (d, s) in idx.query_term(term) {
-                match raw_scores.iter_mut().find(|(dd, _)| *dd == d) {
+                let d_raw = d.raw;
+                match raw_scores.iter_mut().find(|(dd, _)| *dd == d_raw) {
                     Some(e) => e.1 += s,
-                    None => raw_scores.push((d, s)),
+                    None => raw_scores.push((d_raw, s)),
                 }
                 let qs = quantize(s);
-                match q_scores.iter_mut().find(|(dd, _)| *dd == d) {
+                match q_scores.iter_mut().find(|(dd, _)| *dd == d_raw) {
                     Some(e) => e.1 += qs,
-                    None => q_scores.push((d, qs)),
+                    None => q_scores.push((d_raw, qs)),
                 }
             }
         }
@@ -438,13 +439,13 @@ fn flat_1k_vectors_top_k_consistent() {
         *v = 1.0;
     }
     let h_target = put_embedding::<_, Blake3>(&mut store, target_vec.clone()).unwrap();
-    builder.insert_id(target, h_target);
+    builder.insert(&target, h_target);
     for i in 0..(N_DOCS - 1) {
         let vec: Vec<f32> = (0..DIM)
             .map(|_| (rng.next() as i32 as f32) / (i32::MAX as f32))
             .collect();
         let h = put_embedding::<_, Blake3>(&mut store, vec).unwrap();
-        builder.insert_id(id_from_u64(i as u64 + 100), h);
+        builder.insert(&id_from_u64(i as u64 + 100), h);
     }
     let idx = builder.build();
     let reader = store.reader().unwrap();

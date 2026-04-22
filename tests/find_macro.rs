@@ -24,9 +24,9 @@ fn id(byte: u8) -> Id {
 
 fn sample_index() -> SuccinctBM25Index {
     let mut b = BM25Builder::new();
-    b.insert_id(id(1), hash_tokens("the quick brown fox"));
-    b.insert_id(id(2), hash_tokens("the lazy brown dog"));
-    b.insert_id(id(3), hash_tokens("quick silver fox jumps"));
+    b.insert(&id(1), hash_tokens("the quick brown fox"));
+    b.insert(&id(2), hash_tokens("the lazy brown dog"));
+    b.insert(&id(3), hash_tokens("quick silver fox jumps"));
     b.build()
 }
 
@@ -59,11 +59,11 @@ fn find_docs_and_scores_shared_score_no_cartesian() {
     let mut b = BM25Builder::new();
     // Three docs, same length and same tf for "fox" — identical
     // scores.
-    b.insert_id(id(1), hash_tokens("the quick fox"));
-    b.insert_id(id(2), hash_tokens("another fox book"));
-    b.insert_id(id(3), hash_tokens("fox adventure here"));
+    b.insert(&id(1), hash_tokens("the quick fox"));
+    b.insert(&id(2), hash_tokens("another fox book"));
+    b.insert(&id(3), hash_tokens("fox adventure here"));
     // One filler doc so corpus avg_doc_len is well-defined.
-    b.insert_id(id(4), hash_tokens("unrelated content only"));
+    b.insert(&id(4), hash_tokens("unrelated content only"));
     let idx = b.build();
     let fox = hash_tokens("fox")[0];
 
@@ -96,9 +96,9 @@ fn find_docs_and_scores_shared_score_no_cartesian() {
 #[test]
 fn find_docs_and_scores() {
     let mut b = BM25Builder::new();
-    b.insert_id(id(1), hash_tokens("fox"));
-    b.insert_id(id(2), hash_tokens("quick brown fox jumps high today!"));
-    b.insert_id(id(3), hash_tokens("unrelated content"));
+    b.insert(&id(1), hash_tokens("fox"));
+    b.insert(&id(2), hash_tokens("quick brown fox jumps high today!"));
+    b.insert(&id(3), hash_tokens("unrelated content"));
     let idx = b.build();
     let fox = hash_tokens("fox")[0];
 
@@ -127,7 +127,7 @@ fn find_docs_and_scores() {
     let truth: std::collections::HashMap<Id, f32> = postings
         .iter()
         .copied()
-        .map(|(raw, s)| (id_from_raw(&raw), s))
+        .map(|(v, s)| (id_from_raw(&v.raw), s))
         .collect();
 
     // Every row's (doc, score) must be one of the real postings.
@@ -141,8 +141,8 @@ fn find_docs_and_scores() {
     }
     // And every posting appears at least once.
     let row_docs: HashSet<Id> = rows.iter().map(|(d, _)| *d).collect();
-    for (raw, _) in &postings {
-        let d = id_from_raw(raw);
+    for (v, _) in &postings {
+        let d = id_from_raw(&v.raw);
         assert!(row_docs.contains(&d), "posting doc {d:?} missing from rows");
     }
 }
@@ -199,9 +199,9 @@ fn find_docs_and_scores_on_succinct() {
     use triblespace_search::succinct::SuccinctBM25Index;
 
     let mut b = BM25Builder::new();
-    b.insert_id(id(1), hash_tokens("fox"));
-    b.insert_id(id(2), hash_tokens("quick brown fox jumps high today"));
-    b.insert_id(id(3), hash_tokens("unrelated content"));
+    b.insert(&id(1), hash_tokens("fox"));
+    b.insert(&id(2), hash_tokens("quick brown fox jumps high today"));
+    b.insert(&id(3), hash_tokens("unrelated content"));
     let succinct: SuccinctBM25Index = b.build();
     let fox = hash_tokens("fox")[0];
 
@@ -221,7 +221,7 @@ fn find_docs_and_scores_on_succinct() {
     for (doc, score) in &rows {
         let expected: f32 = succinct
             .query_term(&fox)
-            .find(|(d, _)| id_from_raw(d) == *doc)
+            .find(|(d, _)| id_from_raw(&d.raw) == *doc)
             .map(|(_, s)| s)
             .expect("doc must be in succinct postings");
         assert!(
@@ -255,7 +255,7 @@ fn find_hnsw_similar_on_succinct() {
         let f = i as f32;
         let v = vec![f.sin(), f.cos(), (f * 0.5).sin(), (f * 0.3).cos()];
         let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
-        b.insert_id(iid(i), h, v).unwrap();
+        b.insert(&iid(i), h, v).unwrap();
     }
     let succinct = b.build();
     let reader = store.reader().unwrap();
@@ -363,7 +363,7 @@ fn find_bm25_composed_with_pattern() {
     .collect();
     let mut bm25 = BM25Builder::new();
     for (b, title) in &titles {
-        bm25.insert_id(*b, hash_tokens(title));
+        bm25.insert(&*b, hash_tokens(title));
     }
     let idx = bm25.build();
 

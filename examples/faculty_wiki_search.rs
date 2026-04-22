@@ -133,7 +133,7 @@ fn refresh(
     for (id, handle) in &body_handles {
         let body: View<str> =
             reader.get::<View<str>, blobschemas::LongString>(*handle)?;
-        builder.insert_id(*id, hash_tokens(body.as_ref()));
+        builder.insert(&*id, hash_tokens(body.as_ref()));
     }
     let idx: SuccinctBM25Index = builder.build();
     let handle = pile.put::<SuccinctBM25Blob, _>(&idx)?;

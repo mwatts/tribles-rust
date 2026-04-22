@@ -26,9 +26,9 @@
 //! let h3 = put_embedding::<_, Blake3>(&mut store, vec![0.9, 0.1, 0.0, 0.0]).unwrap();
 //!
 //! let mut b = FlatBuilder::new(4);
-//! b.insert_id(Id::new([1; 16]).unwrap(), h1);
-//! b.insert_id(Id::new([2; 16]).unwrap(), h2);
-//! b.insert_id(Id::new([3; 16]).unwrap(), h3);
+//! b.insert(&Id::new([1; 16]).unwrap(), h1);
+//! b.insert(&Id::new([2; 16]).unwrap(), h2);
+//! b.insert(&Id::new([3; 16]).unwrap(), h3);
 //! let idx = b.build();
 //!
 //! let reader = store.reader().unwrap();
@@ -42,7 +42,7 @@
 
 use triblespace::core::id::{Id, RawId};
 use triblespace::core::value::schemas::hash::{Blake3, Handle};
-use triblespace::core::value::{RawValue, Value, ValueSchema};
+use triblespace::core::value::{RawValue, ToValue, Value, ValueSchema};
 
 use crate::schemas::Embedding;
 
@@ -84,7 +84,7 @@ struct HNSWIndexNode {
 /// (2018) with the standard level-sampling + ef-search + simple
 /// neighbour-selection heuristic. Parameters follow the paper's
 /// defaults unless overridden on the builder.
-pub struct HNSWBuilder {
+pub struct HNSWBuilder<D: ValueSchema = triblespace::core::value::schemas::genid::GenId> {
     dim: usize,
     m: u16,
     m0: u16,
@@ -106,17 +106,28 @@ pub struct HNSWBuilder {
     handles: Vec<Value<Handle<Blake3, Embedding>>>,
     entry_point: Option<u32>,
     max_level: u8,
+    _phantom: std::marker::PhantomData<D>,
 }
 
-impl HNSWBuilder {
+/// Default-typed convenience: `HNSWBuilder::new(dim)` is keyed
+/// by `GenId`. For other schemas, use [`HNSWBuilder::typed`] or
+/// turbofish.
+impl HNSWBuilder<triblespace::core::value::schemas::genid::GenId> {
+    /// Create an HNSWBuilder keyed by `GenId` — the common
+    /// entity-id case.
+    pub fn new(dim: usize) -> Self {
+        Self::typed(dim)
+    }
+}
+
+impl<D: ValueSchema> HNSWBuilder<D> {
     /// Create a fresh builder with `dim`-dimensional vectors and
     /// default HNSW parameters (`M = 16`, `M0 = 2*M = 32`,
-    /// `ef_construction = 200`). The deterministic PRNG seed
-    /// starts at `0xC0FFEE_HNSW`; override via [`with_seed`] for
-    /// reproducible but differently-ordered builds.
+    /// `ef_construction = 200`). Caller-chosen doc schema `D`;
+    /// use [`new`][Self::new] for the `GenId` default.
     ///
     /// [`with_seed`]: Self::with_seed
-    pub fn new(dim: usize) -> Self {
+    pub fn typed(dim: usize) -> Self {
         assert!(dim > 0, "HNSWBuilder: dim must be > 0");
         let m = 16u16;
         Self {
@@ -131,6 +142,7 @@ impl HNSWBuilder {
             handles: Vec::new(),
             entry_point: None,
             max_level: 0,
+            _phantom: std::marker::PhantomData,
         }
     }
 
@@ -199,12 +211,14 @@ impl HNSWBuilder {
     /// [`insert_id`]: Self::insert_id
     /// [`insert_value`]: Self::insert_value
     /// [`put_embedding`]: crate::schemas::put_embedding
-    pub fn insert(
+    pub fn insert<K: ToValue<D>>(
         &mut self,
-        key: RawValue,
+        key: K,
         handle: Value<Handle<Blake3, Embedding>>,
         mut vec: Vec<f32>,
     ) -> Result<(), DimMismatch> {
+        let key_val: Value<D> = key.to_value();
+        let key = key_val.raw;
         if vec.len() != self.dim {
             return Err(DimMismatch {
                 expected: self.dim,
@@ -273,27 +287,9 @@ impl HNSWBuilder {
         Ok(())
     }
 
-    /// Convenience: insert keyed by a triblespace [`Id`].
-    pub fn insert_id(
-        &mut self,
-        doc_id: Id,
-        handle: Value<Handle<Blake3, Embedding>>,
-        vec: Vec<f32>,
-    ) -> Result<(), DimMismatch> {
-        let mut raw = [0u8; 32];
-        let id_bytes: &RawId = doc_id.as_ref();
-        raw[16..32].copy_from_slice(id_bytes);
-        self.insert(raw, handle, vec)
-    }
-
-    /// Convenience: insert keyed by a typed [`Value<S>`].
-    pub fn insert_value<S: ValueSchema>(
-        &mut self,
-        key: Value<S>,
-        handle: Value<Handle<Blake3, Embedding>>,
-        vec: Vec<f32>,
-    ) -> Result<(), DimMismatch> {
-        self.insert(key.raw, handle, vec)
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    fn _retained_nothing(&self) {
     }
 
     /// Consume the builder and produce a succinct HNSW index,
@@ -301,8 +297,8 @@ impl HNSWBuilder {
     /// the production path — the naive in-memory [`HNSWIndex`]
     /// is kept only as a reference oracle (see
     /// [`build_naive`][Self::build_naive]).
-    pub fn build(self) -> crate::succinct::SuccinctHNSWIndex {
-        crate::succinct::SuccinctHNSWIndex::from_naive(&self.build_naive())
+    pub fn build(self) -> crate::succinct::SuccinctHNSWIndex<D> {
+        crate::succinct::SuccinctHNSWIndex::<D>::from_naive(&self.build_naive())
             .expect("from_naive cannot fail on a valid HNSWIndex built by HNSWBuilder")
     }
 
@@ -314,7 +310,7 @@ impl HNSWBuilder {
     /// callers already hold a naive index and want
     /// [`SuccinctHNSWIndex::from_naive`][crate::succinct::SuccinctHNSWIndex::from_naive]
     /// directly. Most callers want [`build`][Self::build].
-    pub fn build_naive(self) -> HNSWIndex {
+    pub fn build_naive(self) -> HNSWIndex<D> {
         let nodes: Vec<HNSWIndexNode> = self
             .nodes
             .into_iter()
@@ -332,6 +328,7 @@ impl HNSWBuilder {
             handles: self.handles,
             entry_point: self.entry_point,
             max_level: self.max_level,
+            _phantom: std::marker::PhantomData,
         }
     }
 
@@ -460,8 +457,7 @@ impl HNSWBuilder {
 /// and production queries use
 /// [`crate::succinct::SuccinctHNSWIndex`] instead.
 #[doc(hidden)]
-#[derive(Debug)]
-pub struct HNSWIndex {
+pub struct HNSWIndex<D: ValueSchema = triblespace::core::value::schemas::genid::GenId> {
     dim: usize,
     m: u16,
     m0: u16,
@@ -473,9 +469,20 @@ pub struct HNSWIndex {
     handles: Vec<Value<Handle<Blake3, Embedding>>>,
     entry_point: Option<u32>,
     max_level: u8,
+    _phantom: std::marker::PhantomData<D>,
 }
 
-impl HNSWIndex {
+impl<D: ValueSchema> std::fmt::Debug for HNSWIndex<D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HNSWIndex")
+            .field("n_docs", &self.keys.len())
+            .field("dim", &self.dim)
+            .field("max_level", &self.max_level)
+            .finish()
+    }
+}
+
+impl<D: ValueSchema> HNSWIndex<D> {
     /// Vector dimensionality configured at build time.
     pub fn dim(&self) -> usize {
         self.dim
@@ -555,7 +562,7 @@ impl HNSWIndex {
     /// refcount bump).
     ///
     /// [c]: triblespace::core::blob::BlobCache
-    pub fn attach<'a, B>(&'a self, store: &B) -> AttachedHNSWIndex<'a, B>
+    pub fn attach<'a, B>(&'a self, store: &B) -> AttachedHNSWIndex<'a, B, D>
     where
         B: triblespace::core::repo::BlobStoreGet<Blake3> + Clone,
     {
@@ -599,20 +606,20 @@ impl HNSWIndex {
 ///
 /// [c]: triblespace::core::blob::BlobCache
 #[doc(hidden)]
-pub struct AttachedHNSWIndex<'a, B>
+pub struct AttachedHNSWIndex<'a, B, D: ValueSchema = triblespace::core::value::schemas::genid::GenId>
 where
     B: triblespace::core::repo::BlobStoreGet<Blake3>,
 {
-    index: &'a HNSWIndex,
+    index: &'a HNSWIndex<D>,
     cache: triblespace::core::blob::BlobCache<B, Blake3, Embedding, anybytes::View<[f32]>>,
 }
 
-impl<'a, B> AttachedHNSWIndex<'a, B>
+impl<'a, B, D: ValueSchema> AttachedHNSWIndex<'a, B, D>
 where
     B: triblespace::core::repo::BlobStoreGet<Blake3>,
 {
     /// The inner index (back-reference for metadata queries).
-    pub fn index(&self) -> &HNSWIndex {
+    pub fn index(&self) -> &HNSWIndex<D> {
         self.index
     }
 
@@ -633,7 +640,7 @@ where
         query: &[f32],
         k: usize,
         ef: Option<usize>,
-    ) -> Result<Vec<(RawValue, f32)>, B::GetError<anybytes::view::ViewError>> {
+    ) -> Result<Vec<(Value<D>, f32)>, B::GetError<anybytes::view::ViewError>> {
         if query.len() != self.index.dim || k == 0 {
             return Ok(Vec::new());
         }
@@ -649,36 +656,13 @@ where
             curr = self.greedy_search_layer(&q, curr, lvl)?;
         }
         let candidates = self.search_layer(&q, curr, ef, 0)?;
-        let mut ranked: Vec<(RawValue, f32)> = candidates
+        let mut ranked: Vec<(Value<D>, f32)> = candidates
             .into_iter()
-            .map(|(i, dist)| (self.index.keys[i as usize], 1.0 - dist))
+            .map(|(i, dist)| (Value::<D>::new(self.index.keys[i as usize]), 1.0 - dist))
             .collect();
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         ranked.truncate(k);
         Ok(ranked)
-    }
-
-    /// [`similar`] with GenId-typed keys decoded back to
-    /// [`Id`]; other schemas are dropped.
-    ///
-    /// [`similar`]: Self::similar
-    pub fn similar_ids(
-        &self,
-        query: &[f32],
-        k: usize,
-        ef: Option<usize>,
-    ) -> Result<Vec<(Id, f32)>, B::GetError<anybytes::view::ViewError>> {
-        Ok(self
-            .similar(query, k, ef)?
-            .into_iter()
-            .filter_map(|(raw, s)| {
-                if raw[0..16] != [0u8; 16] {
-                    return None;
-                }
-                let id_bytes: RawId = raw[16..32].try_into().ok()?;
-                Id::new(id_bytes).map(|id| (id, s))
-            })
-            .collect())
     }
 
     fn dist_to(
@@ -769,6 +753,33 @@ where
             }
         }
         Ok(results.into_iter().map(|m| (m.idx, m.dist)).collect())
+    }
+}
+
+/// GenId-specific convenience: decode top-k keys as [`Id`]s.
+impl<'a, B> AttachedHNSWIndex<'a, B, triblespace::core::value::schemas::genid::GenId>
+where
+    B: triblespace::core::repo::BlobStoreGet<Blake3>,
+{
+    /// [`similar`][Self::similar] with GenId-typed keys decoded
+    /// back to [`Id`]; other-schema keys are dropped.
+    pub fn similar_ids(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: Option<usize>,
+    ) -> Result<Vec<(Id, f32)>, B::GetError<anybytes::view::ViewError>> {
+        Ok(self
+            .similar(query, k, ef)?
+            .into_iter()
+            .filter_map(|(v, s)| {
+                if v.raw[0..16] != [0u8; 16] {
+                    return None;
+                }
+                let id_bytes: RawId = v.raw[16..32].try_into().ok()?;
+                Id::new(id_bytes).map(|id| (id, s))
+            })
+            .collect())
     }
 }
 
@@ -876,29 +887,36 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// division into the build pass and keeps the query hot path a
 /// single dot product per doc.
 #[doc(hidden)]
-pub struct FlatBuilder {
+pub struct FlatBuilder<D: ValueSchema = triblespace::core::value::schemas::genid::GenId> {
     dim: usize,
     keys: Vec<RawValue>,
     handles: Vec<Value<Handle<Blake3, Embedding>>>,
+    _phantom: std::marker::PhantomData<D>,
 }
 
-impl FlatBuilder {
-    /// Start a fresh builder. `dim` is the expected embedding
-    /// length — stored in the index and checked against the
-    /// query vector at query time.
+impl FlatBuilder<triblespace::core::value::schemas::genid::GenId> {
+    /// Default-typed: `FlatBuilder::new(dim)` is keyed by `GenId`.
     pub fn new(dim: usize) -> Self {
+        Self::typed(dim)
+    }
+}
+
+impl<D: ValueSchema> FlatBuilder<D> {
+    /// Start a fresh builder with caller-chosen doc schema.
+    /// `dim` is the expected embedding length — stored in the
+    /// index and checked against the query vector at query time.
+    pub fn typed(dim: usize) -> Self {
         assert!(dim > 0, "FlatBuilder: dim must be > 0");
         Self {
             dim,
             keys: Vec::new(),
             handles: Vec::new(),
+            _phantom: std::marker::PhantomData,
         }
     }
 
-    /// Insert a `(key, handle)` pair. `key` is any 32-byte
-    /// triblespace value (GenId / ShortString / tag / composite
-    /// — see [`insert_id`] / [`insert_value`] for typed
-    /// wrappers); `handle` points at an [`Embedding`] blob in
+    /// Insert a `(key, handle)` pair. `key` is a typed
+    /// `Value<D>`; `handle` points at an [`Embedding`] blob in
     /// the pile's blob store. The builder stores neither the
     /// raw vector nor any copy of it — the pile owns the
     /// embedding and content-addresses it, so two indexes that
@@ -906,37 +924,19 @@ impl FlatBuilder {
     ///
     /// Use [`crate::schemas::put_embedding`] to put + normalize
     /// + get a handle in one step.
-    ///
-    /// [`insert_id`]: Self::insert_id
-    /// [`insert_value`]: Self::insert_value
-    pub fn insert(&mut self, key: RawValue, handle: Value<Handle<Blake3, Embedding>>) {
-        self.keys.push(key);
+    pub fn insert<K: ToValue<D>>(&mut self, key: K, handle: Value<Handle<Blake3, Embedding>>) {
+        let key_val: Value<D> = key.to_value();
+        self.keys.push(key_val.raw);
         self.handles.push(handle);
     }
 
-    /// Convenience: insert keyed by a triblespace [`Id`].
-    pub fn insert_id(&mut self, doc_id: Id, handle: Value<Handle<Blake3, Embedding>>) {
-        let mut raw = [0u8; 32];
-        let id_bytes: &RawId = doc_id.as_ref();
-        raw[16..32].copy_from_slice(id_bytes);
-        self.insert(raw, handle);
-    }
-
-    /// Convenience: insert keyed by a typed [`Value<S>`].
-    pub fn insert_value<S: ValueSchema>(
-        &mut self,
-        key: Value<S>,
-        handle: Value<Handle<Blake3, Embedding>>,
-    ) {
-        self.insert(key.raw, handle);
-    }
-
     /// Consume the builder and produce a flat index.
-    pub fn build(self) -> FlatIndex {
+    pub fn build(self) -> FlatIndex<D> {
         FlatIndex {
             dim: self.dim,
             keys: self.keys,
             handles: self.handles,
+            _phantom: std::marker::PhantomData,
         }
     }
 
@@ -972,13 +972,14 @@ impl FlatBuilder {
 /// [g]: triblespace::core::repo::BlobStoreGet
 #[doc(hidden)]
 #[derive(Debug, Clone)]
-pub struct FlatIndex {
+pub struct FlatIndex<D: ValueSchema = triblespace::core::value::schemas::genid::GenId> {
     dim: usize,
     keys: Vec<RawValue>,
     handles: Vec<Value<Handle<Blake3, Embedding>>>,
+    _phantom: std::marker::PhantomData<D>,
 }
 
-impl FlatIndex {
+impl<D: ValueSchema> FlatIndex<D> {
     /// Embedding dimensionality.
     pub fn dim(&self) -> usize {
         self.dim
@@ -1022,7 +1023,7 @@ impl FlatIndex {
     /// typical readers are cheap-clone.
     ///
     /// [c]: triblespace::core::blob::BlobCache
-    pub fn attach<'a, B>(&'a self, store: &B) -> AttachedFlatIndex<'a, B>
+    pub fn attach<'a, B>(&'a self, store: &B) -> AttachedFlatIndex<'a, B, D>
     where
         B: triblespace::core::repo::BlobStoreGet<Blake3> + Clone,
     {
@@ -1042,22 +1043,22 @@ impl FlatIndex {
 ///
 /// [c]: triblespace::core::blob::BlobCache
 #[doc(hidden)]
-pub struct AttachedFlatIndex<'a, B>
+pub struct AttachedFlatIndex<'a, B, D: ValueSchema = triblespace::core::value::schemas::genid::GenId>
 where
     B: triblespace::core::repo::BlobStoreGet<Blake3>,
 {
-    index: &'a FlatIndex,
+    index: &'a FlatIndex<D>,
     cache: triblespace::core::blob::BlobCache<B, Blake3, Embedding, anybytes::View<[f32]>>,
 }
 
-impl<'a, B> AttachedFlatIndex<'a, B>
+impl<'a, B, D: ValueSchema> AttachedFlatIndex<'a, B, D>
 where
     B: triblespace::core::repo::BlobStoreGet<Blake3>,
 {
     /// The inner index (back-reference, in case the caller
     /// wants metadata methods like `doc_count` without going
     /// through the view).
-    pub fn index(&self) -> &FlatIndex {
+    pub fn index(&self) -> &FlatIndex<D> {
         self.index
     }
 
@@ -1073,7 +1074,7 @@ where
         &self,
         query: &[f32],
         k: usize,
-    ) -> Result<Vec<(RawValue, f32)>, B::GetError<anybytes::view::ViewError>> {
+    ) -> Result<Vec<(Value<D>, f32)>, B::GetError<anybytes::view::ViewError>> {
         if query.len() != self.index.dim || k == 0 {
             return Ok(Vec::new());
         }
@@ -1091,15 +1092,20 @@ where
                 heap.pop();
             }
         }
-        let mut out: Vec<(RawValue, f32)> = heap.into_iter().map(|m| (m.key, m.score)).collect();
+        let mut out: Vec<(Value<D>, f32)> =
+            heap.into_iter().map(|m| (Value::<D>::new(m.key), m.score)).collect();
         out.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         Ok(out)
     }
+}
 
-    /// Convenience: [`similar`] with GenId-typed keys decoded
-    /// back to [`Id`]; other schemas are dropped.
-    ///
-    /// [`similar`]: Self::similar
+/// GenId-specific convenience: decode top-k keys as [`Id`]s.
+impl<'a, B> AttachedFlatIndex<'a, B, triblespace::core::value::schemas::genid::GenId>
+where
+    B: triblespace::core::repo::BlobStoreGet<Blake3>,
+{
+    /// [`similar`][Self::similar] with keys decoded as [`Id`];
+    /// other-schema keys are dropped.
     pub fn similar_ids(
         &self,
         query: &[f32],
@@ -1108,18 +1114,18 @@ where
         Ok(self
             .similar(query, k)?
             .into_iter()
-            .filter_map(|(raw, s)| {
-                if raw[0..16] != [0u8; 16] {
+            .filter_map(|(v, s)| {
+                if v.raw[0..16] != [0u8; 16] {
                     return None;
                 }
-                let id_bytes: RawId = raw[16..32].try_into().ok()?;
+                let id_bytes: RawId = v.raw[16..32].try_into().ok()?;
                 Id::new(id_bytes).map(|id| (id, s))
             })
             .collect())
     }
 }
 
-impl FlatIndex {
+impl<D: ValueSchema> FlatIndex<D> {
     /// Theoretical size of the naive flat-array serialization in
     /// bytes — baseline for comparing against more compressed
     /// forms. `24` B header + 64 B per doc (32 B key + 32 B
@@ -1205,7 +1211,7 @@ mod tests {
         vec: Vec<f32>,
     ) -> Result<Value<Handle<Blake3, Embedding>>, DimMismatch> {
         let h = put_emb(store, vec.clone());
-        builder.insert_id(doc_id, h, vec)?;
+        builder.insert(&doc_id, h, vec)?;
         Ok(h)
     }
 
@@ -1221,7 +1227,7 @@ mod tests {
         let mut b = FlatBuilder::new(dim);
         for (doc, vec) in entries {
             let h = put_emb(&mut store, vec.clone());
-            b.insert_id(*doc, h);
+            b.insert(&*doc, h);
         }
         (b.build(), store)
     }
@@ -1244,7 +1250,7 @@ mod tests {
         );
         let hits = idx.attach(&reader_of(&mut store)).similar(&[1.0, 0.0, 0.0], 1).unwrap();
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].0, id_key(1));
+        assert_eq!(hits[0].0.raw, id_key(1));
         assert!((hits[0].1 - 1.0).abs() < 1e-5);
     }
 
@@ -1260,9 +1266,9 @@ mod tests {
         );
         let hits = idx.attach(&reader_of(&mut store)).similar(&[1.0, 0.0], 3).unwrap();
         assert_eq!(hits.len(), 3);
-        assert_eq!(hits[0].0, id_key(1));
-        assert_eq!(hits[1].0, id_key(2));
-        assert_eq!(hits[2].0, id_key(3));
+        assert_eq!(hits[0].0.raw, id_key(1));
+        assert_eq!(hits[1].0.raw, id_key(2));
+        assert_eq!(hits[2].0.raw, id_key(3));
         // Scores are monotonically non-increasing.
         assert!(hits[0].1 >= hits[1].1 && hits[1].1 >= hits[2].1);
     }
@@ -1349,7 +1355,7 @@ mod tests {
         let hits = idx.attach(&store.reader().unwrap()).similar(&[1.0, 0.0, 0.0], 1, None)
             .unwrap();
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].0, id_key(1));
+        assert_eq!(hits[0].0.raw, id_key(1));
         assert!((hits[0].1 - 1.0).abs() < 1e-5);
     }
 
@@ -1363,9 +1369,9 @@ mod tests {
         let idx = b.build();
         let hits = idx.attach(&store.reader().unwrap()).similar(&[1.0, 0.0], 3, None)
             .unwrap();
-        assert_eq!(hits[0].0, id_key(1));
-        assert_eq!(hits[1].0, id_key(2));
-        assert_eq!(hits[2].0, id_key(3));
+        assert_eq!(hits[0].0.raw, id_key(1));
+        assert_eq!(hits[1].0.raw, id_key(2));
+        assert_eq!(hits[2].0.raw, id_key(3));
     }
 
     #[test]
@@ -1394,8 +1400,8 @@ mod tests {
                 .collect();
             let dx = id_from_u64((i + 1) as u64);
             let h = put_emb(&mut store, vec.clone());
-            flat_b.insert_id(dx, h);
-            hnsw_b.insert_id(dx, h, vec).unwrap();
+            flat_b.insert(&dx, h);
+            hnsw_b.insert(&dx, h, vec).unwrap();
         }
         let flat = flat_b.build();
         let hnsw = hnsw_b.build();
@@ -1413,14 +1419,14 @@ mod tests {
                 .similar(&q, 10)
                 .unwrap()
                 .into_iter()
-                .map(|(d, _)| d)
+                .map(|(d, _)| d.raw)
                 .collect();
             let got: std::collections::HashSet<RawValue> = hnsw
                 .attach(&reader)
                 .similar(&q, 10, Some(50))
                 .unwrap()
                 .into_iter()
-                .map(|(d, _)| d)
+                .map(|(d, _)| d.raw)
                 .collect();
             total_overlap += truth.intersection(&got).count();
             total_k += 10;
@@ -1451,7 +1457,7 @@ mod tests {
                     ((i as f32) * 3.0) % 1.0,
                 ];
                 let h = put_emb(&mut store, v.clone());
-                b.insert_id(Id::new([i; 16]).unwrap(), h, v).unwrap();
+                b.insert(&Id::new([i; 16]).unwrap(), h, v).unwrap();
             }
             (b.build(), store)
         };

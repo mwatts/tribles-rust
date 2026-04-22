@@ -11,6 +11,11 @@
 //!
 //! Other blob schemas (`SuccinctBM25Blob`, `SuccinctHNSWBlob`)
 //! live next to their index types.
+//!
+//! The built-in tokenizers in [`crate::tokens`] return
+//! `Value<Handle<Blake3, LongString>>` — the hash bytes are
+//! valid LongString-blob handles by construction, so there's
+//! no need for a bespoke "token hash" schema.
 
 use std::convert::Infallible;
 
@@ -64,6 +69,7 @@ impl TryFromValue<'_, F32LE> for f32 {
         Ok(f32::from_le_bytes(value.raw[0..4].try_into().unwrap()))
     }
 }
+
 
 /// An arbitrary-length `[f32]` (little-endian) stored as a blob.
 ///

@@ -73,7 +73,7 @@ fn build_hnsw(
     for i in 0..n {
         let vec: Vec<f32> = (0..dim).map(|_| rng.f32_pm1()).collect();
         let h = put_embedding::<_, Blake3>(&mut store, vec.clone()).unwrap();
-        b.insert_id(id_for(i as u32 + 1), h, vec).unwrap();
+        b.insert(&id_for(i as u32 + 1), h, vec).unwrap();
     }
     (b.build_naive(), store)
 }
@@ -442,5 +442,8 @@ fn main() {
     // Keep the ignore-but-available; 100k gets slow on build
     // in the example but you can uncomment if you want.
     // bench(100_000, 128, 10, 50, 0xFACE);
-    let _ = SuccinctHNSWIndex::try_from_bytes; // keep import alive
+    // Keep `SuccinctHNSWIndex` import alive.
+    let _ = SuccinctHNSWIndex::<
+        triblespace::core::value::schemas::genid::GenId,
+    >::try_from_bytes;
 }

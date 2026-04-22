@@ -109,7 +109,7 @@ fn bench(n_docs: usize, vocab: usize, doc_len: usize, keys: KeyDist) {
                 KeyDist::Scattered => id_from_u64(*id_u64),
                 KeyDist::Correlated => correlated_id(&prefix, *id_u64),
             };
-            b.insert_id(id, hash_tokens(doc));
+            b.insert(&id, hash_tokens(doc));
         }
         b
     };

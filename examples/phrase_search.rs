@@ -12,17 +12,17 @@
 //! ```
 
 use triblespace::core::id::Id;
-use triblespace::core::value::RawValue;
+use triblespace::core::value::Value;
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::succinct::SuccinctBM25Index;
-use triblespace_search::tokens::{bigram_tokens, hash_tokens};
+use triblespace_search::tokens::{bigram_tokens, hash_tokens, TokenHandle};
 
 fn id(byte: u8) -> Id {
     Id::new([byte; 16]).expect("non-nil")
 }
 
 /// Index a doc with single-word + bigram tokens combined.
-fn phrase_tokens(text: &str) -> Vec<RawValue> {
+fn phrase_tokens(text: &str) -> Vec<Value<TokenHandle>> {
     let mut v = hash_tokens(text);
     v.extend(bigram_tokens(text));
     v
@@ -41,7 +41,7 @@ fn main() {
 
     let mut b = BM25Builder::new();
     for (doc_id, text) in &corpus {
-        b.insert_id(*doc_id, phrase_tokens(text));
+        b.insert(&*doc_id, phrase_tokens(text));
     }
     let idx: SuccinctBM25Index = b.build();
     println!(

@@ -28,7 +28,7 @@
 //! ];
 //! let mut b = BM25Builder::new();
 //! for (id, text) in &docs {
-//!     b.insert_id(*id, hash_tokens(text));
+//!     b.insert(&*id, hash_tokens(text));
 //! }
 //! let index = b.build();
 //!
@@ -48,9 +48,11 @@
 //! See `docs/DESIGN.md` for the target blob layout.
 
 use std::collections::HashMap;
+use std::marker::PhantomData;
 
 use triblespace::core::id::{Id, RawId};
-use triblespace::core::value::{RawValue, Value, ValueSchema};
+use triblespace::core::value::schemas::genid::GenId;
+use triblespace::core::value::{RawValue, ToValue, Value, ValueSchema};
 
 
 /// Classic BM25 tuning. Defaults match Robertson & Zaragoza 2009.
@@ -60,35 +62,74 @@ const DEFAULT_B: f32 = 0.75;
 /// Accumulator for documents to be indexed. Call [`insert`] once
 /// per doc, then [`build`] to produce a [`BM25Index`].
 ///
-/// "Doc" here is any 32-byte triblespace [`RawValue`] — same
-/// schema-erased byte array the index uses for terms. Callers
-/// typically pass entity ids via `Value::<GenId>::new(...).raw`
-/// (see [`Self::insert_id`] for a convenience wrapper), but any
-/// other schema works: string-valued keys (title search),
-/// composite keys, or raw hashes.
+/// Generic over `D` (the doc-key [`ValueSchema`]) and `T` (the
+/// term [`ValueSchema`]). Typical shapes:
+///
+/// - `BM25Builder<GenId, TextTokenHash>` — classic text search
+///   keyed by entity id; terms come from
+///   [`crate::tokens::hash_tokens`] et al.
+/// - `BM25Builder<ShortString, TextTokenHash>` — title-indexed
+///   search.
+/// - `BM25Builder<GenId, GenId>` — entity co-occurrence; terms
+///   are themselves entity ids ("which fragments cite X?").
+///
+/// The two schemas buy compile-time safety: you can't
+/// accidentally feed ngram terms into a word-hash index, or
+/// query a title-keyed index with a GenId doc variable.
 ///
 /// [`insert`]: Self::insert
 /// [`build`]: Self::build
-#[derive(Clone)]
-pub struct BM25Builder {
+pub struct BM25Builder<D: ValueSchema = GenId, T: ValueSchema = crate::tokens::TokenHandle> {
     pub(crate) docs: Vec<(RawValue, Vec<RawValue>)>,
     pub(crate) k1: f32,
     pub(crate) b: f32,
+    pub(crate) _phantom: PhantomData<(D, T)>,
 }
 
-impl Default for BM25Builder {
+// Manual `Clone` impl (not derive) so the bound stays on
+// `D: ValueSchema, T: ValueSchema` rather than the auto-derive's
+// `D: Clone, T: Clone` — `PhantomData<(D, T)>` is `Clone`
+// regardless of `D` / `T`, and the rest of the fields are
+// already `Clone`.
+impl<D: ValueSchema, T: ValueSchema> Clone for BM25Builder<D, T> {
+    fn clone(&self) -> Self {
+        Self {
+            docs: self.docs.clone(),
+            k1: self.k1,
+            b: self.b,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+/// Default-typed convenience: `BM25Builder::new()` returns a
+/// `BM25Builder<GenId, TokenHandle>` — the common "entity-id
+/// keyed, Blake3-hashed text tokens" shape. For other schemas,
+/// use [`BM25Builder::typed`] or explicit turbofish.
+impl BM25Builder<GenId, crate::tokens::TokenHandle> {
+    /// Create an empty builder with the standard BM25 tuning,
+    /// keyed by `GenId` with `TokenHandle`-typed terms.
+    pub fn new() -> Self {
+        Self::typed()
+    }
+}
+
+impl Default for BM25Builder<GenId, crate::tokens::TokenHandle> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl BM25Builder {
-    /// Create an empty builder with the standard BM25 tuning.
-    pub fn new() -> Self {
+impl<D: ValueSchema, T: ValueSchema> BM25Builder<D, T> {
+    /// Create an empty builder with caller-chosen schemas.
+    /// `BM25Builder::<MyKey, MyTerm>::typed()` — or the implicit
+    /// [`new`][Self::new] for the `<GenId, TokenHandle>` default.
+    pub fn typed() -> Self {
         Self {
             docs: Vec::new(),
             k1: DEFAULT_K1,
             b: DEFAULT_B,
+            _phantom: PhantomData,
         }
     }
 
@@ -104,38 +145,20 @@ impl BM25Builder {
         self
     }
 
-    /// Add a document. `key` is any 32-byte triblespace value
-    /// identifying the doc (entity id via `GenId`, hash, string
-    /// value, tag, whatever); `terms` is the caller's
-    /// tokenization (see [`crate::tokens::hash_tokens`] for a
-    /// simple default). The order of terms is irrelevant;
-    /// duplicates contribute to term frequency.
-    pub fn insert(&mut self, key: RawValue, terms: Vec<RawValue>) {
-        self.docs.push((key, terms));
-    }
-
-    /// Convenience: add a document keyed by a triblespace [`Id`]
-    /// (16 bytes). Shorthand for `insert(id_to_value(id).raw, ...)`.
-    /// Matches the pre-generalization API so migration from the
-    /// entity-keyed case is one method rename.
-    pub fn insert_id(&mut self, doc_id: Id, terms: Vec<RawValue>) {
-        let mut raw = [0u8; 32];
-        let id_bytes: &RawId = doc_id.as_ref();
-        raw[16..32].copy_from_slice(id_bytes);
-        self.docs.push((raw, terms));
-    }
-
-    /// Convenience: add a document keyed by a triblespace
-    /// [`Value<S>`] for any value schema `S` — for example
-    /// `Value<ShortString>` when indexing by title, or
-    /// `Value<Tag>` when indexing by a known tag. Unwraps the
-    /// 32-byte representation via `value.raw` and calls
-    /// [`insert`]; one-liner so callers don't have to reach into
-    /// the `.raw` field themselves at every call site.
-    ///
-    /// [`insert`]: Self::insert
-    pub fn insert_value<S: ValueSchema>(&mut self, key: Value<S>, terms: Vec<RawValue>) {
-        self.docs.push((key.raw, terms));
+    /// Add a document. `key` is anything that converts to a
+    /// `Value<D>` — pass a `Value<GenId>` directly, an
+    /// `&Id` for entity-keyed indexes, or any user type that
+    /// implements `ToValue<D>`. `terms` is the caller's
+    /// tokenization under schema `T` (see
+    /// [`crate::tokens::hash_tokens`] for the usual token-handle
+    /// default). Order of terms is irrelevant; duplicates
+    /// contribute to term frequency.
+    pub fn insert<K: ToValue<D>>(&mut self, key: K, terms: Vec<Value<T>>) {
+        // Value<_> is repr(transparent) around RawValue; strip
+        // the phantom at the boundary, store raw bytes.
+        let key_val: Value<D> = key.to_value();
+        let term_rows: Vec<RawValue> = terms.into_iter().map(|v| v.raw).collect();
+        self.docs.push((key_val.raw, term_rows));
     }
 
     /// Consume the builder and produce a succinct BM25 index,
@@ -143,7 +166,7 @@ impl BM25Builder {
     /// production path — the naive in-memory [`BM25Index`] is
     /// kept only as a reference oracle (see
     /// [`build_naive`][Self::build_naive]).
-    pub fn build(self) -> crate::succinct::SuccinctBM25Index {
+    pub fn build(self) -> crate::succinct::SuccinctBM25Index<D, T> {
         crate::succinct::SuccinctBM25Index::from_builder(self)
     }
 
@@ -153,7 +176,7 @@ impl BM25Builder {
     /// correctness oracle when validating the succinct form, or
     /// when benchmarking the scoring cost independent of jerky
     /// encoding overhead. Most callers want [`build`][Self::build].
-    pub fn build_naive(self) -> BM25Index {
+    pub fn build_naive(self) -> BM25Index<D, T> {
         self.build_naive_with_threads(1)
     }
 
@@ -162,8 +185,8 @@ impl BM25Builder {
     /// Output is byte-identical to single-threaded
     /// [`build_naive`][Self::build_naive]. Use [`build`][Self::build]
     /// for the production path.
-    pub fn build_naive_with_threads(self, threads: usize) -> BM25Index {
-        let Self { docs, k1, b } = self;
+    pub fn build_naive_with_threads(self, threads: usize) -> BM25Index<D, T> {
+        let Self { docs, k1, b, _phantom } = self;
         let n_docs = docs.len();
 
         // Per-doc token count; average doc length for normalization.
@@ -284,9 +307,11 @@ impl BM25Builder {
             postings,
             k1,
             b,
+            _phantom,
         }
     }
 }
+
 
 /// Accumulate token-frequency counts for one doc into `m`.
 fn accumulate_tfs(
@@ -310,11 +335,9 @@ fn accumulate_tfs(
 /// saturating term frequency (`k1`) and length-normalized doc
 /// length (`b`).
 #[doc(hidden)]
-#[derive(Debug, Clone)]
-pub struct BM25Index {
-    /// Per-doc 32-byte keys. Any triblespace `RawValue` — most
-    /// commonly an entity id (via `Value<GenId>`), but strings,
-    /// tags, or hashes work too.
+pub struct BM25Index<D: ValueSchema = GenId, T: ValueSchema = crate::tokens::TokenHandle> {
+    /// Per-doc 32-byte keys. Stored raw; `Value<D>` at the API
+    /// boundary.
     keys: Vec<RawValue>,
     doc_lens: Vec<u32>,
     avg_doc_len: f32,
@@ -323,9 +346,38 @@ pub struct BM25Index {
     postings: Vec<(u32, f32)>,
     k1: f32,
     b: f32,
+    _phantom: PhantomData<(D, T)>,
 }
 
-impl BM25Index {
+impl<D: ValueSchema, T: ValueSchema> std::fmt::Debug for BM25Index<D, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BM25Index")
+            .field("n_docs", &self.keys.len())
+            .field("n_terms", &self.terms.len())
+            .field("avg_doc_len", &self.avg_doc_len)
+            .field("k1", &self.k1)
+            .field("b", &self.b)
+            .finish()
+    }
+}
+
+impl<D: ValueSchema, T: ValueSchema> Clone for BM25Index<D, T> {
+    fn clone(&self) -> Self {
+        Self {
+            keys: self.keys.clone(),
+            doc_lens: self.doc_lens.clone(),
+            avg_doc_len: self.avg_doc_len,
+            terms: self.terms.clone(),
+            offsets: self.offsets.clone(),
+            postings: self.postings.clone(),
+            k1: self.k1,
+            b: self.b,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<D: ValueSchema, T: ValueSchema> BM25Index<D, T> {
     /// Number of documents in the index.
     pub fn doc_count(&self) -> usize {
         self.keys.len()
@@ -343,74 +395,44 @@ impl BM25Index {
 
     /// Look up a term's posting list.
     ///
-    /// Returns `(key, score)` pairs in posting-list order.
+    /// Returns `(Value<D>, f32)` pairs in posting-list order.
     /// Empty iterator if the term is absent.
-    pub fn query_term(&self, term: &RawValue) -> impl Iterator<Item = (RawValue, f32)> + '_ {
-        let lo = self.terms.binary_search(term).ok();
+    pub fn query_term<'a>(
+        &'a self,
+        term: &Value<T>,
+    ) -> impl Iterator<Item = (Value<D>, f32)> + 'a {
+        let lo = self.terms.binary_search(&term.raw).ok();
         let range = match lo {
             Some(i) => self.offsets[i] as usize..self.offsets[i + 1] as usize,
             None => 0..0,
         };
         self.postings[range]
             .iter()
-            .map(|&(doc_idx, score)| (self.keys[doc_idx as usize], score))
-    }
-
-    /// Convenience: [`query_term`] but decode each key as a
-    /// triblespace [`Id`] (assuming the index was keyed via
-    /// [`BM25Builder::insert_id`] / `Value<GenId>`). Returns
-    /// `None` if the stored key isn't a valid GenId (non-zero
-    /// first 16 bytes or nil tail).
-    pub fn query_term_ids<'a>(
-        &'a self,
-        term: &RawValue,
-    ) -> impl Iterator<Item = (Id, f32)> + 'a {
-        self.query_term(term).filter_map(|(raw, score)| {
-            if raw[0..16] != [0u8; 16] {
-                return None;
-            }
-            let id_bytes: RawId = raw[16..32].try_into().ok()?;
-            Id::new(id_bytes).map(|id| (id, score))
-        })
-    }
-
-    /// Convenience: [`query_multi`] decoded as `(Id, score)` pairs.
-    ///
-    /// [`query_multi`]: Self::query_multi
-    pub fn query_multi_ids(&self, terms: &[RawValue]) -> Vec<(Id, f32)> {
-        self.query_multi(terms)
-            .into_iter()
-            .filter_map(|(raw, s)| {
-                if raw[0..16] != [0u8; 16] {
-                    return None;
-                }
-                let id_bytes: RawId = raw[16..32].try_into().ok()?;
-                Id::new(id_bytes).map(|id| (id, s))
-            })
-            .collect()
+            .map(|&(doc_idx, score)| (Value::<D>::new(self.keys[doc_idx as usize]), score))
     }
 
     /// Score a multi-term query as the sum of per-term BM25
     /// weights (standard OR-like bag-of-words).
     ///
-    /// Returned `(key, score)` pairs are sorted descending by
+    /// Returned `(Value<D>, f32)` pairs are sorted descending by
     /// score. No top-k truncation — caller slices what they need.
-    pub fn query_multi(&self, terms: &[RawValue]) -> Vec<(RawValue, f32)> {
+    pub fn query_multi(&self, terms: &[Value<T>]) -> Vec<(Value<D>, f32)> {
         let mut acc: HashMap<RawValue, f32> = HashMap::new();
         for term in terms {
             for (doc, score) in self.query_term(term) {
-                *acc.entry(doc).or_insert(0.0) += score;
+                *acc.entry(doc.raw).or_insert(0.0) += score;
             }
         }
-        let mut out: Vec<(RawValue, f32)> = acc.into_iter().collect();
+        let mut out: Vec<(Value<D>, f32)> =
+            acc.into_iter().map(|(raw, s)| (Value::<D>::new(raw), s)).collect();
         out.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         out
     }
 
     /// Number of documents containing this term.
-    pub fn doc_frequency(&self, term: &RawValue) -> usize {
+    pub fn doc_frequency(&self, term: &Value<T>) -> usize {
         self.terms
-            .binary_search(term)
+            .binary_search(&term.raw)
             .ok()
             .map(|i| (self.offsets[i + 1] - self.offsets[i]) as usize)
             .unwrap_or(0)
@@ -450,7 +472,7 @@ impl BM25Index {
     /// Per-term posting list (internal `doc_idx` + score) for the
     /// term at sorted-table position `t`. Returns `&[]` if out of
     /// range. Lower-level than [`query_term`], which joins on
-    /// external `Id`s.
+    /// external doc keys.
     ///
     /// [`query_term`]: Self::query_term
     pub fn postings_for(&self, t: usize) -> &[(u32, f32)] {
@@ -481,7 +503,40 @@ impl BM25Index {
     }
 }
 
-impl PartialEq for BM25Index {
+/// GenId-specific convenience: decode posting keys as [`Id`]s.
+impl<T: ValueSchema> BM25Index<GenId, T> {
+    /// [`query_term`][Self::query_term] with each key decoded as
+    /// an [`Id`] (empty if the key isn't a valid GenId bit-pattern).
+    pub fn query_term_ids<'a>(
+        &'a self,
+        term: &Value<T>,
+    ) -> impl Iterator<Item = (Id, f32)> + 'a {
+        self.query_term(term).filter_map(|(v, score)| {
+            if v.raw[0..16] != [0u8; 16] {
+                return None;
+            }
+            let id_bytes: RawId = v.raw[16..32].try_into().ok()?;
+            Id::new(id_bytes).map(|id| (id, score))
+        })
+    }
+
+    /// [`query_multi`][Self::query_multi] decoded as `(Id, f32)`
+    /// pairs.
+    pub fn query_multi_ids(&self, terms: &[Value<T>]) -> Vec<(Id, f32)> {
+        self.query_multi(terms)
+            .into_iter()
+            .filter_map(|(v, s)| {
+                if v.raw[0..16] != [0u8; 16] {
+                    return None;
+                }
+                let id_bytes: RawId = v.raw[16..32].try_into().ok()?;
+                Id::new(id_bytes).map(|id| (id, s))
+            })
+            .collect()
+    }
+}
+
+impl<D: ValueSchema, T: ValueSchema> PartialEq for BM25Index<D, T> {
     /// Bit-exact equality, including on `f32` fields — used by
     /// parallel-build tests that assert byte-identical output
     /// across thread counts. Score computation is deterministic
@@ -507,7 +562,7 @@ impl PartialEq for BM25Index {
     }
 }
 
-impl Eq for BM25Index {}
+impl<D: ValueSchema, T: ValueSchema> Eq for BM25Index<D, T> {}
 
 
 #[cfg(test)]
@@ -538,7 +593,7 @@ mod tests {
         let idx = BM25Builder::new().build();
         assert_eq!(idx.doc_count(), 0);
         assert_eq!(idx.term_count(), 0);
-        let term = [0u8; 32];
+        let term: Value<crate::tokens::TokenHandle> = Value::new([0u8; 32]);
         assert!(idx.query_term(&term).next().is_none());
     }
 
@@ -547,15 +602,15 @@ mod tests {
         use triblespace::core::value::schemas::shortstring::ShortString;
         use triblespace::core::value::{ToValue, Value};
 
-        let mut b = BM25Builder::new();
+        let mut b: BM25Builder<ShortString> = BM25Builder::typed();
         let red: Value<ShortString> = "red".to_value();
         let blue: Value<ShortString> = "blue".to_value();
         // Two docs keyed by string value rather than entity id.
         // The doc body is the token stream; the *key* is a
         // `Value<ShortString>`, so a later query can find "docs
         // whose key/field value is 'red'".
-        b.insert_value(red, hash_tokens("a tomato is red"));
-        b.insert_value(blue, hash_tokens("the ocean is blue"));
+        b.insert(red, hash_tokens("a tomato is red"));
+        b.insert(blue, hash_tokens("the ocean is blue"));
         let idx = b.build();
         assert_eq!(idx.doc_count(), 2);
 
@@ -564,21 +619,20 @@ mod tests {
         let blue_hits: Vec<_> = idx.query_term(&hash_tokens("blue")[0]).collect();
         assert_eq!(red_hits.len(), 1);
         assert_eq!(blue_hits.len(), 1);
-        // Keys come back as their 32-byte representation; the
-        // ShortString schema packs the string into the same 32
-        // bytes we stored.
+        // Keys come back as `Value<ShortString>` since that's the
+        // doc schema; compare against the expected key.
         let red_raw: Value<ShortString> = "red".to_value();
         let blue_raw: Value<ShortString> = "blue".to_value();
-        assert_eq!(red_hits[0].0, red_raw.raw);
-        assert_eq!(blue_hits[0].0, blue_raw.raw);
+        assert_eq!(red_hits[0].0, red_raw);
+        assert_eq!(blue_hits[0].0, blue_raw);
     }
 
     #[test]
     fn three_docs_basic() {
         let mut b = BM25Builder::new();
-        b.insert_id(id(1), hash_tokens("the quick brown fox"));
-        b.insert_id(id(2), hash_tokens("the lazy brown dog"));
-        b.insert_id(id(3), hash_tokens("quick silver fox"));
+        b.insert(&id(1), hash_tokens("the quick brown fox"));
+        b.insert(&id(2), hash_tokens("the lazy brown dog"));
+        b.insert(&id(3), hash_tokens("quick silver fox"));
         let idx = b.build();
         assert_eq!(idx.doc_count(), 3);
 
@@ -587,8 +641,8 @@ mod tests {
         let hits: Vec<_> = idx.query_term(&fox[0]).collect();
         assert_eq!(hits.len(), 2);
         let doc_ids: Vec<_> = hits.iter().map(|(d, _)| *d).collect();
-        assert!(doc_ids.contains(&id_key(1)));
-        assert!(doc_ids.contains(&id_key(3)));
+        assert!(doc_ids.iter().any(|v| v.raw == id_key(1)));
+        assert!(doc_ids.iter().any(|v| v.raw == id_key(3)));
 
         // "the" is in doc 1 and doc 2.
         let the = hash_tokens("the");
@@ -604,9 +658,9 @@ mod tests {
         let mut b = BM25Builder::new();
         // "rare" appears once, "common" appears in every doc.
         for i in 1..=10 {
-            b.insert_id(id(i), hash_tokens("common common"));
+            b.insert(&id(i), hash_tokens("common common"));
         }
-        b.insert_id(id(100), hash_tokens("common rare"));
+        b.insert(&id(100), hash_tokens("common rare"));
         let idx = b.build();
 
         let rare = hash_tokens("rare");
@@ -629,13 +683,16 @@ mod tests {
         // k1 = 1.5 the second's score should be higher but not
         // 100x higher — saturation.
         let mut b = BM25Builder::new();
-        b.insert_id(id(1), hash_tokens("foo bar baz"));
+        b.insert(&id(1), hash_tokens("foo bar baz"));
         let many: String = std::iter::repeat("foo ").take(100).collect::<String>();
-        b.insert_id(id(2), hash_tokens(&many));
+        b.insert(&id(2), hash_tokens(&many));
         let idx = b.build();
 
         let foo = hash_tokens("foo");
-        let scores: HashMap<RawValue, f32> = idx.query_term(&foo[0]).collect();
+        let scores: HashMap<RawValue, f32> = idx
+            .query_term(&foo[0])
+            .map(|(v, s)| (v.raw, s))
+            .collect();
         let s1 = scores[&id_key(1)];
         let s2 = scores[&id_key(2)];
         assert!(s2 > s1);
@@ -648,16 +705,16 @@ mod tests {
     #[test]
     fn multi_term_query_sums() {
         let mut b = BM25Builder::new();
-        b.insert_id(id(1), hash_tokens("quick brown fox"));
-        b.insert_id(id(2), hash_tokens("quick red fox"));
-        b.insert_id(id(3), hash_tokens("slow brown dog"));
+        b.insert(&id(1), hash_tokens("quick brown fox"));
+        b.insert(&id(2), hash_tokens("quick red fox"));
+        b.insert(&id(3), hash_tokens("slow brown dog"));
         let idx = b.build();
 
         let q = hash_tokens("quick fox");
         let ranked = idx.query_multi(&q);
         // Docs 1 and 2 have both terms; doc 3 has neither.
         assert_eq!(ranked.len(), 2);
-        let top_ids: Vec<_> = ranked.iter().map(|(d, _)| *d).collect();
+        let top_ids: Vec<[u8; 32]> = ranked.iter().map(|(d, _)| d.raw).collect();
         assert!(top_ids.contains(&id_key(1)));
         assert!(top_ids.contains(&id_key(2)));
         // Results are sorted descending by score.
@@ -674,9 +731,9 @@ mod tests {
 
     fn build_sample_index() -> BM25Index {
         let mut b = BM25Builder::new().k1(1.4).b(0.72);
-        b.insert_id(id(1), hash_tokens("the quick brown fox"));
-        b.insert_id(id(2), hash_tokens("the lazy brown dog"));
-        b.insert_id(id(3), hash_tokens("quick silver fox jumps"));
+        b.insert(&id(1), hash_tokens("the quick brown fox"));
+        b.insert(&id(2), hash_tokens("the lazy brown dog"));
+        b.insert(&id(3), hash_tokens("quick silver fox jumps"));
         b.build_naive()
     }
 
@@ -722,7 +779,7 @@ mod tests {
                     (i.wrapping_mul(7)) % 13
                 );
                 let byte = (i as u8).max(1);
-                b.insert_id(id(byte), hash_tokens(&text));
+                b.insert(&id(byte), hash_tokens(&text));
             }
             b.build_naive_with_threads(threads)
         }
@@ -748,9 +805,9 @@ mod tests {
         // 3 docs × 16 threads — the builder caps threads at n_docs
         // and doesn't spawn idle workers.
         let mut b = BM25Builder::new();
-        b.insert_id(id(1), hash_tokens("one two three"));
-        b.insert_id(id(2), hash_tokens("two three four"));
-        b.insert_id(id(3), hash_tokens("three four five"));
+        b.insert(&id(1), hash_tokens("one two three"));
+        b.insert(&id(2), hash_tokens("two three four"));
+        b.insert(&id(3), hash_tokens("three four five"));
         let idx = b.build_naive_with_threads(16);
         assert_eq!(idx.doc_count(), 3);
         // "three" shows up in all 3 docs.
@@ -766,16 +823,16 @@ mod tests {
         // the hash_tokens half.
         use crate::tokens::ngram_tokens;
 
-        fn both(text: &str) -> Vec<RawValue> {
+        fn both(text: &str) -> Vec<Value<crate::tokens::TokenHandle>> {
             let mut v = hash_tokens(text);
             v.extend(ngram_tokens(text, 3));
             v
         }
 
         let mut b = BM25Builder::new();
-        b.insert_id(id(1), both("foxes are cunning"));
-        b.insert_id(id(2), both("the dog barks"));
-        b.insert_id(id(3), both("silver fox at night"));
+        b.insert(&id(1), both("foxes are cunning"));
+        b.insert(&id(2), both("the dog barks"));
+        b.insert(&id(3), both("silver fox at night"));
         let idx = b.build();
 
         // Query "fox" as trigrams: just one gram, "fox". Both
@@ -784,8 +841,8 @@ mod tests {
         let q = ngram_tokens("fox", 3);
         let hits: Vec<_> = idx.query_multi(&q);
         let doc_ids: Vec<_> = hits.iter().map(|(d, _)| *d).collect();
-        assert!(doc_ids.contains(&id_key(1)), "prefix should match 'foxes'");
-        assert!(doc_ids.contains(&id_key(3)), "prefix should match 'fox'");
-        assert!(!doc_ids.contains(&id_key(2)), "must not match 'dog'");
+        assert!(doc_ids.iter().any(|v| v.raw == id_key(1)), "prefix should match 'foxes'");
+        assert!(doc_ids.iter().any(|v| v.raw == id_key(3)), "prefix should match 'fox'");
+        assert!(!doc_ids.iter().any(|v| v.raw == id_key(2)), "must not match 'dog'");
     }
 }

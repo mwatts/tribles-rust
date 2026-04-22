@@ -29,9 +29,9 @@ fn iid(byte: u8) -> Id {
 fn succinct_bm25_survives_blob_store_roundtrip() {
     // Build a small index.
     let mut b = BM25Builder::new();
-    b.insert_id(iid(1), hash_tokens("the quick brown fox"));
-    b.insert_id(iid(2), hash_tokens("the lazy brown dog"));
-    b.insert_id(iid(3), hash_tokens("quick silver fox jumps"));
+    b.insert(&iid(1), hash_tokens("the quick brown fox"));
+    b.insert(&iid(2), hash_tokens("the lazy brown dog"));
+    b.insert(&iid(3), hash_tokens("quick silver fox jumps"));
     let original = b.build();
 
     // Put → handle.
@@ -81,7 +81,7 @@ fn succinct_hnsw_survives_blob_store_roundtrip() {
         let f = i as f32;
         let v = vec![f.sin(), f.cos(), (f * 0.5).sin(), (f * 0.3).cos()];
         let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
-        b.insert_id(iid(i), h, v).unwrap();
+        b.insert(&iid(i), h, v).unwrap();
     }
     let original = b.build();
 
@@ -146,7 +146,7 @@ fn hnsw_indexes_share_embedding_blobs() {
     let mut a_b = HNSWBuilder::new(4).with_seed(1);
     for (pid, v) in &embeddings {
         let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
-        a_b.insert_id(*pid, h, v.clone()).unwrap();
+        a_b.insert(&*pid, h, v.clone()).unwrap();
     }
     // Use `build_naive()` here because the test inspects
     // `handles()[i]` directly, which only the naive index
@@ -157,7 +157,7 @@ fn hnsw_indexes_share_embedding_blobs() {
     let mut b_b = HNSWBuilder::new(4).with_seed(99); // different seed!
     for (pid, v) in &embeddings {
         let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
-        b_b.insert_id(*pid, h, v.clone()).unwrap();
+        b_b.insert(&*pid, h, v.clone()).unwrap();
     }
     let idx_b = b_b.build_naive();
 

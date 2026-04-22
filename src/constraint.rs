@@ -59,30 +59,40 @@ pub trait BM25Queryable {
     }
 }
 
-impl BM25Queryable for BM25Index {
+impl<D: triblespace::core::value::ValueSchema, T: triblespace::core::value::ValueSchema>
+    BM25Queryable for BM25Index<D, T>
+{
     fn query_term_boxed<'a>(
         &'a self,
         term: &RawValue,
     ) -> Box<dyn Iterator<Item = (RawValue, f32)> + 'a> {
-        Box::new(self.query_term(term))
+        // Wrap the raw bytes in `Value<T>` at the trait boundary
+        // — the typed API inside the index expects `&Value<T>`.
+        let term_val = triblespace::core::value::Value::<T>::new(*term);
+        Box::new(self.query_term(&term_val).map(|(v, s)| (v.raw, s)))
     }
 
     fn doc_frequency_for(&self, term: &RawValue) -> usize {
-        self.doc_frequency(term)
+        let term_val = triblespace::core::value::Value::<T>::new(*term);
+        self.doc_frequency(&term_val)
     }
 }
 
 #[cfg(feature = "succinct")]
-impl BM25Queryable for crate::succinct::SuccinctBM25Index {
+impl<D: triblespace::core::value::ValueSchema, T: triblespace::core::value::ValueSchema>
+    BM25Queryable for crate::succinct::SuccinctBM25Index<D, T>
+{
     fn query_term_boxed<'a>(
         &'a self,
         term: &RawValue,
     ) -> Box<dyn Iterator<Item = (RawValue, f32)> + 'a> {
-        self.query_term(term)
+        let term_val = triblespace::core::value::Value::<T>::new(*term);
+        Box::new(self.query_term(&term_val).map(|(v, s)| (v.raw, s)))
     }
 
     fn doc_frequency_for(&self, term: &RawValue) -> usize {
-        self.doc_frequency(term)
+        let term_val = triblespace::core::value::Value::<T>::new(*term);
+        self.doc_frequency(&term_val)
     }
 
     fn score_tolerance(&self) -> f32 {
@@ -90,7 +100,7 @@ impl BM25Queryable for crate::succinct::SuccinctBM25Index {
         // accept scores that round to different f32s after the
         // u16 → f32 dequantization. Call the inherent method
         // explicitly so there's no trait-method recursion.
-        crate::succinct::SuccinctBM25Index::score_tolerance(self)
+        crate::succinct::SuccinctBM25Index::<D, T>::score_tolerance(self)
     }
 }
 
@@ -116,7 +126,7 @@ impl BM25Queryable for crate::succinct::SuccinctBM25Index {
 ///
 /// Created via [`BM25Index::docs_containing`] (or the succinct
 /// equivalent).
-pub struct DocsContainingTerm<'a, I: BM25Queryable + ?Sized = BM25Index, S = GenId>
+pub struct DocsContainingTerm<'a, I: BM25Queryable + ?Sized, S = GenId>
 where
     S: triblespace::core::value::ValueSchema,
 {
@@ -135,20 +145,19 @@ where
     }
 }
 
-impl BM25Index {
+impl<D: triblespace::core::value::ValueSchema, T: triblespace::core::value::ValueSchema>
+    BM25Index<D, T>
+{
     /// Produce a [`DocsContainingTerm`] constraint for use inside
-    /// `pattern!` / `find!`. `S` is the schema the caller
-    /// keyed the index with — usually [`GenId`] for entity ids,
-    /// but any [`ValueSchema`] works.
-    pub fn docs_containing<S>(
+    /// `pattern!` / `find!`. The doc `Variable<D>` is tied to the
+    /// index's doc schema; `term` is a typed `Value<T>` from the
+    /// index's term schema.
+    pub fn docs_containing(
         &self,
-        doc: Variable<S>,
-        term: [u8; 32],
-    ) -> DocsContainingTerm<'_, BM25Index, S>
-    where
-        S: triblespace::core::value::ValueSchema,
-    {
-        DocsContainingTerm::new(self, doc, term)
+        doc: Variable<D>,
+        term: triblespace::core::value::Value<T>,
+    ) -> DocsContainingTerm<'_, BM25Index<D, T>, D> {
+        DocsContainingTerm::new(self, doc, term.raw)
     }
 }
 
@@ -180,7 +189,7 @@ fn raw_value_to_f32(raw: &RawValue) -> f32 {
 /// the `doc` variable; for `score` we use the same count because
 /// each (doc, term) pair has exactly one score — the cardinality
 /// is identical from the engine's perspective.
-pub struct BM25ScoredPostings<'a, I: BM25Queryable + ?Sized = BM25Index, S = GenId>
+pub struct BM25ScoredPostings<'a, I: BM25Queryable + ?Sized, S = GenId>
 where
     S: triblespace::core::value::ValueSchema,
 {
@@ -204,21 +213,20 @@ where
     }
 }
 
-impl BM25Index {
+impl<D: triblespace::core::value::ValueSchema, T: triblespace::core::value::ValueSchema>
+    BM25Index<D, T>
+{
     /// Constraint that binds `doc` + `score` for each posting of
     /// `term`. Use this when the caller wants to project the
     /// BM25 weight into their result rows (filtering, ordering,
     /// hybrid-ranking combinators above the query).
-    pub fn docs_and_scores<S>(
+    pub fn docs_and_scores(
         &self,
-        doc: Variable<S>,
+        doc: Variable<D>,
         score: Variable<F32LE>,
-        term: [u8; 32],
-    ) -> BM25ScoredPostings<'_, BM25Index, S>
-    where
-        S: triblespace::core::value::ValueSchema,
-    {
-        BM25ScoredPostings::new(self, doc, score, term)
+        term: triblespace::core::value::Value<T>,
+    ) -> BM25ScoredPostings<'_, BM25Index<D, T>, D> {
+        BM25ScoredPostings::new(self, doc, score, term.raw)
     }
 }
 
@@ -324,8 +332,8 @@ where
 /// — per `docs/QUERY_ENGINE_INTEGRATION.md`'s design, this
 /// matches how similarity is actually used (the query is a
 /// concrete embedding, not something the engine solves for).
-pub struct SimilarToVector {
-    doc: Variable<GenId>,
+pub struct SimilarToVector<D: triblespace::core::value::ValueSchema = GenId> {
+    doc: Variable<D>,
     /// Top-`k` `(key, score)` pairs computed eagerly at
     /// construction. Handle-fetching against the blob store
     /// happens once, not once per `propose`/`confirm`/
@@ -333,15 +341,16 @@ pub struct SimilarToVector {
     top: Vec<(RawValue, f32)>,
 }
 
-impl SimilarToVector {
+impl<D: triblespace::core::value::ValueSchema> SimilarToVector<D> {
     /// Build directly from the already-computed top-k. Used by
     /// [`FlatIndex::similar_constraint`] internally.
-    pub fn from_top(doc: Variable<GenId>, top: Vec<(RawValue, f32)>) -> Self {
+    pub fn from_top(doc: Variable<D>, top: Vec<(RawValue, f32)>) -> Self {
         Self { doc, top }
     }
 }
 
-impl<'a, B> crate::hnsw::AttachedFlatIndex<'a, B>
+impl<'a, B, D: triblespace::core::value::ValueSchema>
+    crate::hnsw::AttachedFlatIndex<'a, B, D>
 where
     B: triblespace::core::repo::BlobStoreGet<
             triblespace::core::value::schemas::hash::Blake3,
@@ -353,16 +362,20 @@ where
     /// engine calls don't re-scan.
     pub fn similar_constraint(
         &self,
-        doc: Variable<GenId>,
+        doc: Variable<D>,
         query: Vec<f32>,
         k: usize,
-    ) -> Result<SimilarToVector, B::GetError<anybytes::view::ViewError>> {
-        let top = self.similar(&query, k)?;
-        Ok(SimilarToVector::from_top(doc, top))
+    ) -> Result<SimilarToVector<D>, B::GetError<anybytes::view::ViewError>> {
+        let top_raw: Vec<(RawValue, f32)> = self
+            .similar(&query, k)?
+            .into_iter()
+            .map(|(v, s)| (v.raw, s))
+            .collect();
+        Ok(SimilarToVector::from_top(doc, top_raw))
     }
 }
 
-impl<'a> Constraint<'a> for SimilarToVector {
+impl<'a, D: triblespace::core::value::ValueSchema + 'a> Constraint<'a> for SimilarToVector<D> {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.doc.index)
     }
@@ -406,16 +419,16 @@ impl<'a> Constraint<'a> for SimilarToVector {
 /// `score` per top-`k` hit. Produced by
 /// [`FlatIndex::similar_with_scores`]. See [`BM25ScoredPostings`]
 /// for the sibling BM25 version.
-pub struct SimilarToVectorScored {
-    doc: Variable<GenId>,
+pub struct SimilarToVectorScored<D: triblespace::core::value::ValueSchema = GenId> {
+    doc: Variable<D>,
     score: Variable<F32LE>,
     /// Eagerly computed top-`k` `(key, score)` pairs.
     top: Vec<(RawValue, f32)>,
 }
 
-impl SimilarToVectorScored {
+impl<D: triblespace::core::value::ValueSchema> SimilarToVectorScored<D> {
     pub fn from_top(
-        doc: Variable<GenId>,
+        doc: Variable<D>,
         score: Variable<F32LE>,
         top: Vec<(RawValue, f32)>,
     ) -> Self {
@@ -423,7 +436,8 @@ impl SimilarToVectorScored {
     }
 }
 
-impl<'a, B> crate::hnsw::AttachedFlatIndex<'a, B>
+impl<'a, B, D: triblespace::core::value::ValueSchema>
+    crate::hnsw::AttachedFlatIndex<'a, B, D>
 where
     B: triblespace::core::repo::BlobStoreGet<
             triblespace::core::value::schemas::hash::Blake3,
@@ -434,17 +448,23 @@ where
     /// Eagerly resolves the top-`k` against the attached store.
     pub fn similar_with_scores(
         &self,
-        doc: Variable<GenId>,
+        doc: Variable<D>,
         score: Variable<F32LE>,
         query: Vec<f32>,
         k: usize,
-    ) -> Result<SimilarToVectorScored, B::GetError<anybytes::view::ViewError>> {
-        let top = self.similar(&query, k)?;
-        Ok(SimilarToVectorScored::from_top(doc, score, top))
+    ) -> Result<SimilarToVectorScored<D>, B::GetError<anybytes::view::ViewError>> {
+        let top_raw: Vec<(RawValue, f32)> = self
+            .similar(&query, k)?
+            .into_iter()
+            .map(|(v, s)| (v.raw, s))
+            .collect();
+        Ok(SimilarToVectorScored::from_top(doc, score, top_raw))
     }
 }
 
-impl<'a> Constraint<'a> for SimilarToVectorScored {
+impl<'a, D: triblespace::core::value::ValueSchema + 'a> Constraint<'a>
+    for SimilarToVectorScored<D>
+{
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.doc.index)
             .union(VariableSet::new_singleton(self.score.index))
@@ -537,18 +557,19 @@ impl<'a> Constraint<'a> for SimilarToVectorScored {
 /// blob store at construction time and caches the result.
 /// `propose` / `confirm` / `satisfied` iterate the cached
 /// list — no re-walking the HNSW graph per method call.
-pub struct SimilarToVectorHNSW {
-    doc: Variable<GenId>,
+pub struct SimilarToVectorHNSW<D: triblespace::core::value::ValueSchema = GenId> {
+    doc: Variable<D>,
     top: Vec<(RawValue, f32)>,
 }
 
-impl SimilarToVectorHNSW {
-    pub fn from_top(doc: Variable<GenId>, top: Vec<(RawValue, f32)>) -> Self {
+impl<D: triblespace::core::value::ValueSchema> SimilarToVectorHNSW<D> {
+    pub fn from_top(doc: Variable<D>, top: Vec<(RawValue, f32)>) -> Self {
         Self { doc, top }
     }
 }
 
-impl<'a, B> crate::hnsw::AttachedHNSWIndex<'a, B>
+impl<'a, B, D: triblespace::core::value::ValueSchema>
+    crate::hnsw::AttachedHNSWIndex<'a, B, D>
 where
     B: triblespace::core::repo::BlobStoreGet<
             triblespace::core::value::schemas::hash::Blake3,
@@ -561,17 +582,21 @@ where
     /// against the attached store.
     pub fn similar_constraint(
         &self,
-        doc: Variable<GenId>,
+        doc: Variable<D>,
         query: Vec<f32>,
         k: usize,
         ef: Option<usize>,
-    ) -> Result<SimilarToVectorHNSW, B::GetError<anybytes::view::ViewError>> {
-        let top = self.similar(&query, k, ef)?;
-        Ok(SimilarToVectorHNSW::from_top(doc, top))
+    ) -> Result<SimilarToVectorHNSW<D>, B::GetError<anybytes::view::ViewError>> {
+        let top_raw: Vec<(RawValue, f32)> = self
+            .similar(&query, k, ef)?
+            .into_iter()
+            .map(|(v, s)| (v.raw, s))
+            .collect();
+        Ok(SimilarToVectorHNSW::from_top(doc, top_raw))
     }
 }
 
-impl<'a> Constraint<'a> for SimilarToVectorHNSW {
+impl<'a, D: triblespace::core::value::ValueSchema + 'a> Constraint<'a> for SimilarToVectorHNSW<D> {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.doc.index)
     }
@@ -614,15 +639,15 @@ impl<'a> Constraint<'a> for SimilarToVectorHNSW {
 /// Scored variant of [`SimilarToVectorHNSW`]: binds both `doc`
 /// and the cosine `score` per top-`k` hit. Eagerly resolves
 /// top-`k` at construction.
-pub struct SimilarToVectorHNSWScored {
-    doc: Variable<GenId>,
+pub struct SimilarToVectorHNSWScored<D: triblespace::core::value::ValueSchema = GenId> {
+    doc: Variable<D>,
     score: Variable<F32LE>,
     top: Vec<(RawValue, f32)>,
 }
 
-impl SimilarToVectorHNSWScored {
+impl<D: triblespace::core::value::ValueSchema> SimilarToVectorHNSWScored<D> {
     pub fn from_top(
-        doc: Variable<GenId>,
+        doc: Variable<D>,
         score: Variable<F32LE>,
         top: Vec<(RawValue, f32)>,
     ) -> Self {
@@ -630,7 +655,8 @@ impl SimilarToVectorHNSWScored {
     }
 }
 
-impl<'a, B> crate::hnsw::AttachedHNSWIndex<'a, B>
+impl<'a, B, D: triblespace::core::value::ValueSchema>
+    crate::hnsw::AttachedHNSWIndex<'a, B, D>
 where
     B: triblespace::core::repo::BlobStoreGet<
             triblespace::core::value::schemas::hash::Blake3,
@@ -641,18 +667,24 @@ where
     /// Eagerly resolves against the attached store.
     pub fn similar_with_scores(
         &self,
-        doc: Variable<GenId>,
+        doc: Variable<D>,
         score: Variable<F32LE>,
         query: Vec<f32>,
         k: usize,
         ef: Option<usize>,
-    ) -> Result<SimilarToVectorHNSWScored, B::GetError<anybytes::view::ViewError>> {
-        let top = self.similar(&query, k, ef)?;
-        Ok(SimilarToVectorHNSWScored::from_top(doc, score, top))
+    ) -> Result<SimilarToVectorHNSWScored<D>, B::GetError<anybytes::view::ViewError>> {
+        let top_raw: Vec<(RawValue, f32)> = self
+            .similar(&query, k, ef)?
+            .into_iter()
+            .map(|(v, s)| (v.raw, s))
+            .collect();
+        Ok(SimilarToVectorHNSWScored::from_top(doc, score, top_raw))
     }
 }
 
-impl<'a> Constraint<'a> for SimilarToVectorHNSWScored {
+impl<'a, D: triblespace::core::value::ValueSchema + 'a> Constraint<'a>
+    for SimilarToVectorHNSWScored<D>
+{
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.doc.index)
             .union(VariableSet::new_singleton(self.score.index))
@@ -829,9 +861,9 @@ mod tests {
 
     fn sample_index() -> BM25Index {
         let mut b = BM25Builder::new();
-        b.insert_id(id(1), hash_tokens("the quick brown fox"));
-        b.insert_id(id(2), hash_tokens("the lazy brown dog"));
-        b.insert_id(id(3), hash_tokens("quick silver fox jumps"));
+        b.insert(&id(1), hash_tokens("the quick brown fox"));
+        b.insert(&id(2), hash_tokens("the lazy brown dog"));
+        b.insert(&id(3), hash_tokens("quick silver fox jumps"));
         b.build_naive()
     }
 
@@ -960,7 +992,7 @@ mod tests {
             (4, vec![0.0, 0.0, 1.0]),
         ] {
             let h = crate::schemas::put_embedding::<_, Blake3>(&mut store, v).unwrap();
-            b.insert_id(id(i), h);
+            b.insert(&id(i), h);
         }
         (b.build(), store)
     }
@@ -1100,9 +1132,9 @@ mod tests {
         // different BM25 scores and the score-filter
         // meaningfully distinguishes them.
         let mut b = BM25Builder::new();
-        b.insert_id(id(1), hash_tokens("fox"));
-        b.insert_id(id(2), hash_tokens("quick brown fox jumps high today"));
-        b.insert_id(id(3), hash_tokens("lazy dog"));
+        b.insert(&id(1), hash_tokens("fox"));
+        b.insert(&id(2), hash_tokens("quick brown fox jumps high today"));
+        b.insert(&id(3), hash_tokens("lazy dog"));
         let idx = b.build();
 
         let mut ctx = triblespace::core::query::VariableContext::new();
@@ -1113,12 +1145,12 @@ mod tests {
 
         let doc1_score = idx
             .query_term(&term)
-            .find(|(d, _)| *d == id_key(1))
+            .find(|(d, _)| d.raw == id_key(1))
             .map(|(_, s)| s)
             .unwrap();
         let doc2_score = idx
             .query_term(&term)
-            .find(|(d, _)| *d == id_key(2))
+            .find(|(d, _)| d.raw == id_key(2))
             .map(|(_, s)| s)
             .unwrap();
         assert!(
@@ -1194,7 +1226,7 @@ mod tests {
             (4, vec![0.0, 0.0, 1.0]),
         ] {
             let h = crate::schemas::put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
-            b.insert_id(id(i), h, v).unwrap();
+            b.insert(&id(i), h, v).unwrap();
         }
         (b.build_naive(), store)
     }

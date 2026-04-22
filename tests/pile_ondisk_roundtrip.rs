@@ -33,9 +33,9 @@ fn succinct_bm25_survives_pile_round_trip() {
 
     // Build and persist.
     let mut b = BM25Builder::new();
-    b.insert_id(iid(1), hash_tokens("the quick brown fox"));
-    b.insert_id(iid(2), hash_tokens("the lazy brown dog"));
-    b.insert_id(iid(3), hash_tokens("quick silver fox jumps"));
+    b.insert(&iid(1), hash_tokens("the quick brown fox"));
+    b.insert(&iid(2), hash_tokens("the lazy brown dog"));
+    b.insert(&iid(3), hash_tokens("quick silver fox jumps"));
     let original = b.build();
 
     let handle = {
@@ -91,7 +91,7 @@ fn succinct_hnsw_survives_pile_round_trip() {
             let f = i as f32;
             let v = vec![f.sin(), f.cos(), (f * 0.5).sin(), (f * 0.3).cos()];
             let h = put_embedding::<_, Blake3>(&mut pile, v.clone()).unwrap();
-            b.insert_id(iid(i), h, v).unwrap();
+            b.insert(&iid(i), h, v).unwrap();
         }
         let original = b.build();
 

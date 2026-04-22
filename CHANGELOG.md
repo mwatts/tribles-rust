@@ -73,6 +73,40 @@ dates are commit dates rather than release dates.
   API." The builders themselves (`BM25Builder`, `HNSWBuilder`)
   stay public at their canonical paths; the re-exports cover the
   naive forms they produce via `build_naive()`.
+
+### Type-parameterized doc keys and terms
+
+- `BM25Builder<D, T>` / `BM25Index<D, T>` / `SuccinctBM25Index<D, T>`
+  are now generic over the doc-key schema `D` and the term
+  schema `T`. Default types are `<GenId, TokenHandle>` so
+  `BM25Builder::new()` still gives the common "entity-keyed, text-
+  token" shape; other shapes use `::typed()` + turbofish, e.g.
+  `BM25Builder::<ShortString, TokenHandle>::typed()` for a
+  title-keyed index or `BM25Builder::<GenId, GenId>::typed()`
+  for entity-citation search.
+- `HNSWBuilder<D>` / `HNSWIndex<D>` / `SuccinctHNSWIndex<D>` /
+  `FlatBuilder<D>` / `FlatIndex<D>` + their `Attached*` wrappers
+  are generic over `D` only (HNSW has no term space). Same
+  `new()` / `typed()` default pattern.
+- `insert` accepts anything that `ToValue<D>`-converts — pass a
+  typed `Value<D>` directly, or `&id` for the common GenId case.
+  `insert_id` and `insert_value` are gone; the single `insert`
+  covers both.
+- `tokens::TokenHandle` is a type alias for
+  `Handle<Blake3, LongString>`. The built-in tokenizers
+  (`hash_tokens`, `bigram_tokens`, `code_tokens`, `ngram_tokens`)
+  return `Vec<Value<TokenHandle>>`. Callers who want stricter
+  separation (e.g. "ngrams and word hashes should be different
+  term types so the compiler catches mix-ups") can define their
+  own newtype schemas.
+
+The two-schema parameterization buys compile-time safety: you
+can't accidentally feed ngram terms into a word-hash index,
+query a title-keyed index with a GenId doc variable, or store
+the wrong kind of term in a compound BM25 index. The "one
+space" flexibility (mixing arbitrary 32-byte terms in one
+index) is gone by default — callers who want it wrap a union
+schema of their own.
 - Naive `to_bytes` / `try_from_bytes` on `BM25Index` /
   `HNSWIndex` / `FlatIndex` deleted along with their
   `BM25LoadError` / `HNSWLoadError` / `FlatLoadError` types

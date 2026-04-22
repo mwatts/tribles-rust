@@ -94,14 +94,14 @@ fn main() {
     let mut hnsw_b = HNSWBuilder::new(4).with_seed(42);
     for (pid, title, vec) in &papers {
         // BM25: tokenize title, key by paper id.
-        bm25_b.insert_id(*pid, hash_tokens(title));
+        bm25_b.insert(&*pid, hash_tokens(title));
         // HNSW: put the embedding (normalized) and insert the
         // resulting handle. The builder keeps the vec in memory
         // during graph construction for distance computations;
         // it drops the vec at `build()` so only the handle
         // survives into the final index.
         let h = put_embedding::<_, Blake3>(&mut store, vec.clone()).unwrap();
-        hnsw_b.insert_id(*pid, h, vec.clone()).unwrap();
+        hnsw_b.insert(&*pid, h, vec.clone()).unwrap();
     }
     let bm25 = bm25_b.build();
     let hnsw = hnsw_b.build();
