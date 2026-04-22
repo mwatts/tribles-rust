@@ -21,7 +21,7 @@ use triblespace_search::bm25::BM25Builder;
 use triblespace_search::hnsw::HNSWBuilder;
 use triblespace_search::succinct::SuccinctHNSWIndex;
 use triblespace_search::testing::BM25Index;
-use triblespace_search::tokens::TokenHandle;
+use triblespace_search::tokens::WordHash;
 use triblespace_search::tokens::hash_tokens;
 
 struct Rng(u64);
@@ -87,7 +87,7 @@ fn bench_bm25(n_docs: usize, vocab: usize, doc_len: usize) {
     // queries from the same generator biases toward common
     // terms — exactly what a BM25 caller's cache is likely to
     // hit first.
-    let queries: Vec<Value<TokenHandle>> = (0..200)
+    let queries: Vec<Value<WordHash>> = (0..200)
         .map(|i| {
             let r = ((i * 37) as f64 / 200.0).powi(2);
             let idx = (r * vocab as f64) as usize;
@@ -101,7 +101,7 @@ fn bench_bm25(n_docs: usize, vocab: usize, doc_len: usize) {
         let _: Vec<_> = succinct.query_term(q).collect();
     }
 
-    let time_single = |tag: &str, f: &dyn Fn(&Value<TokenHandle>)| {
+    let time_single = |tag: &str, f: &dyn Fn(&Value<WordHash>)| {
         let reps = 10;
         let mut samples: Vec<u128> = Vec::with_capacity(queries.len() * reps);
         for _ in 0..reps {
@@ -134,7 +134,7 @@ fn bench_bm25(n_docs: usize, vocab: usize, doc_len: usize) {
     // doesn't currently expose query_multi; sum-of-query_term is
     // equivalent).
     let multi_reps = 10;
-    let tri_queries: Vec<Vec<Value<TokenHandle>>> = (0..100)
+    let tri_queries: Vec<Vec<Value<WordHash>>> = (0..100)
         .map(|i| {
             vec![
                 hash_tokens(&format!("w{}", i * 3 % vocab))[0],

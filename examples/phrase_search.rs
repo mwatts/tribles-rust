@@ -1,37 +1,32 @@
-//! Phrase-aware BM25 retrieval via composed tokenizers.
+//! Phrase-aware BM25 retrieval via two typed indexes.
 //!
-//! Indexes each doc with both `hash_tokens` (single-word terms)
-//! and `bigram_tokens` (ordered word pairs). The same index then
-//! answers:
-//! - Single-word queries via the hash-tokens half.
-//! - Phrase queries via the bigram half — only docs that contain
-//!   the phrase's consecutive word pairs rank highly.
+//! Words and bigrams live in different term schemas
+//! ([`WordHash`] vs [`BigramHash`]), so they can't share an
+//! index — the compiler enforces the separation. The pattern is
+//! two [`BM25Builder`]s, one per tokenizer, keyed by the same
+//! doc id; hybrid queries combine both via the query engine.
 //!
 //! ```sh
 //! cargo run --example phrase_search
 //! ```
 
+use std::collections::HashMap;
+
 use triblespace::core::id::Id;
-use triblespace::core::value::Value;
+use triblespace::core::value::schemas::genid::GenId;
+
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::succinct::SuccinctBM25Index;
-use triblespace_search::tokens::{bigram_tokens, hash_tokens, TokenHandle};
+use triblespace_search::tokens::{bigram_tokens, hash_tokens, BigramHash, WordHash};
 
 fn id(byte: u8) -> Id {
     Id::new([byte; 16]).expect("non-nil")
 }
 
-/// Index a doc with single-word + bigram tokens combined.
-fn phrase_tokens(text: &str) -> Vec<Value<TokenHandle>> {
-    let mut v = hash_tokens(text);
-    v.extend(bigram_tokens(text));
-    v
-}
-
 fn main() {
-    // A corpus where the word "fox" appears in all four docs,
-    // but only two have the phrase "quick brown" as an adjacent
-    // pair, and only one has "brown fox" adjacent.
+    // A corpus where "fox" appears in all four docs, but only
+    // one has "quick brown" adjacent and two have "brown fox"
+    // adjacent.
     let corpus = [
         (id(1), "the quick brown fox jumps"),
         (id(2), "a quick silver fox"),
@@ -39,61 +34,56 @@ fn main() {
         (id(4), "quick fox and brown dog"),
     ];
 
-    let mut b = BM25Builder::new();
+    // ── Two typed indexes, same doc keys, different term
+    // schemas. The compiler will refuse to cross-query them. ─
+    let mut words_b: BM25Builder<GenId, WordHash> = BM25Builder::typed();
+    let mut bigrams_b: BM25Builder<GenId, BigramHash> = BM25Builder::typed();
     for (doc_id, text) in &corpus {
-        b.insert(&*doc_id, phrase_tokens(text));
+        words_b.insert(doc_id, hash_tokens(text));
+        bigrams_b.insert(doc_id, bigram_tokens(text));
     }
-    let idx: SuccinctBM25Index = b.build();
+    let words: SuccinctBM25Index<GenId, WordHash> = words_b.build();
+    let bigrams: SuccinctBM25Index<GenId, BigramHash> = bigrams_b.build();
     println!(
-        "index: {} docs, {} terms (single-words + bigrams)\n",
-        idx.doc_count(),
-        idx.term_count()
+        "indexes: {} docs · {} words · {} bigrams\n",
+        words.doc_count(),
+        words.term_count(),
+        bigrams.term_count(),
     );
 
-    // 1. Single-word query: "fox" hits every doc.
-    let word = hash_tokens("fox");
-    let hits: Vec<_> = idx.query_term_ids(&word[0]).collect();
+    // ── 1. Single-word query: "fox" hits every doc. Runs on the
+    // words index. `bigrams.query_term(&hash_tokens("fox")[0])`
+    // wouldn't compile — wrong term schema. ─
+    let word_fox = &hash_tokens("fox")[0];
+    let hits: Vec<_> = words.query_term_ids(word_fox).collect();
     println!("single-word query 'fox':");
     for (d, s) in &hits {
-        let text = corpus
-            .iter()
-            .find(|(i, _)| i == d)
-            .map(|(_, t)| *t)
-            .unwrap_or("?");
+        let text = text_for(&corpus, d);
         println!("  {d}  score={s:.3}  {text}");
     }
     assert_eq!(hits.len(), 4);
 
-    // 2. Phrase query: "quick brown" — one bigram. Matches docs
-    //    that contain those two words in adjacent order.
-    let phrase = bigram_tokens("quick brown");
-    assert_eq!(phrase.len(), 1);
-    let hits: Vec<_> = idx.query_term_ids(&phrase[0]).collect();
+    // ── 2. Phrase query: "quick brown" — one bigram. Runs on
+    // the bigrams index; only docs with that ordered pair
+    // adjacently match. ─
+    let phrase = &bigram_tokens("quick brown")[0];
+    let hits: Vec<_> = bigrams.query_term_ids(phrase).collect();
     println!("\nphrase query 'quick brown' (adjacent only):");
     for (d, s) in &hits {
-        let text = corpus
-            .iter()
-            .find(|(i, _)| i == d)
-            .map(|(_, t)| *t)
-            .unwrap_or("?");
+        let text = text_for(&corpus, d);
         println!("  {d}  score={s:.3}  {text}");
     }
     // doc 1: "...quick brown fox..." ✓
-    // doc 4: "quick fox and brown dog" — quick and brown are
-    //        NOT adjacent, so no match.
+    // doc 4: "quick fox and brown dog" — not adjacent, skipped.
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].0, id(1));
 
-    // 3. Phrase query: "brown fox" — matches docs 1 and 3.
-    let phrase = bigram_tokens("brown fox");
-    let hits: Vec<_> = idx.query_term_ids(&phrase[0]).collect();
+    // ── 3. Phrase query: "brown fox" — matches docs 1 and 3. ─
+    let phrase = &bigram_tokens("brown fox")[0];
+    let hits: Vec<_> = bigrams.query_term_ids(phrase).collect();
     println!("\nphrase query 'brown fox':");
     for (d, s) in &hits {
-        let text = corpus
-            .iter()
-            .find(|(i, _)| i == d)
-            .map(|(_, t)| *t)
-            .unwrap_or("?");
+        let text = text_for(&corpus, d);
         println!("  {d}  score={s:.3}  {text}");
     }
     assert_eq!(hits.len(), 2);
@@ -101,34 +91,42 @@ fn main() {
     assert!(ids.contains(&id(1)));
     assert!(ids.contains(&id(3)));
 
-    // 4. Longer phrase: two bigrams must both match. Combined
-    //    BM25 score via query_multi.
-    println!("\nlonger phrase query 'the quick brown' (chains two bigrams):");
-    let mut multi = bigram_tokens("the quick brown");
-    // Also include the words, so the single-word half
-    // contributes weight.
-    multi.extend(hash_tokens("the quick brown"));
-    // Run through naive since SuccinctBM25Index doesn't yet expose
-    // query_multi — sum per-term would produce the same ranking.
-    let mut acc: std::collections::HashMap<Id, f32> = Default::default();
-    for term in &multi {
-        for (d, s) in idx.query_term_ids(term) {
+    // ── 4. Hybrid: combine word + bigram evidence for a longer
+    // phrase. Each index contributes its own BM25 scores; we
+    // sum across the two to rank docs. In an engine-level
+    // composition you'd `or!` the two constraints and get the
+    // same shape for free. ─
+    println!("\nhybrid query 'the quick brown' (words ∪ bigrams):");
+    let word_terms = hash_tokens("the quick brown");
+    let bigram_terms = bigram_tokens("the quick brown");
+    let mut acc: HashMap<Id, f32> = HashMap::new();
+    for t in &word_terms {
+        for (d, s) in words.query_term_ids(t) {
+            *acc.entry(d).or_default() += s;
+        }
+    }
+    for t in &bigram_terms {
+        for (d, s) in bigrams.query_term_ids(t) {
             *acc.entry(d).or_default() += s;
         }
     }
     let mut ranked: Vec<_> = acc.into_iter().collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     for (d, s) in ranked.iter().take(3) {
-        let text = corpus
-            .iter()
-            .find(|(i, _)| i == d)
-            .map(|(_, t)| *t)
-            .unwrap_or("?");
+        let text = text_for(&corpus, d);
         println!("  {d}  score={s:.3}  {text}");
     }
     assert_eq!(
         ranked[0].0,
         id(1),
-        "doc 1 has both 'the quick' AND 'quick brown' bigrams"
+        "doc 1 has both 'the quick' AND 'quick brown' bigrams + all three words",
     );
+}
+
+fn text_for<'a>(corpus: &'a [(Id, &'a str)], d: &Id) -> &'a str {
+    corpus
+        .iter()
+        .find(|(i, _)| i == d)
+        .map(|(_, t)| *t)
+        .unwrap_or("?")
 }

@@ -65,10 +65,10 @@ const DEFAULT_B: f32 = 0.75;
 /// Generic over `D` (the doc-key [`ValueSchema`]) and `T` (the
 /// term [`ValueSchema`]). Typical shapes:
 ///
-/// - `BM25Builder<GenId, TextTokenHash>` — classic text search
+/// - `BM25Builder<GenId, WordHash>` — classic text search
 ///   keyed by entity id; terms come from
 ///   [`crate::tokens::hash_tokens`] et al.
-/// - `BM25Builder<ShortString, TextTokenHash>` — title-indexed
+/// - `BM25Builder<ShortString, WordHash>` — title-indexed
 ///   search.
 /// - `BM25Builder<GenId, GenId>` — entity co-occurrence; terms
 ///   are themselves entity ids ("which fragments cite X?").
@@ -79,7 +79,7 @@ const DEFAULT_B: f32 = 0.75;
 ///
 /// [`insert`]: Self::insert
 /// [`build`]: Self::build
-pub struct BM25Builder<D: ValueSchema = GenId, T: ValueSchema = crate::tokens::TokenHandle> {
+pub struct BM25Builder<D: ValueSchema = GenId, T: ValueSchema = crate::tokens::WordHash> {
     pub(crate) docs: Vec<(RawValue, Vec<RawValue>)>,
     pub(crate) k1: f32,
     pub(crate) b: f32,
@@ -103,18 +103,18 @@ impl<D: ValueSchema, T: ValueSchema> Clone for BM25Builder<D, T> {
 }
 
 /// Default-typed convenience: `BM25Builder::new()` returns a
-/// `BM25Builder<GenId, TokenHandle>` — the common "entity-id
+/// `BM25Builder<GenId, WordHash>` — the common "entity-id
 /// keyed, Blake3-hashed text tokens" shape. For other schemas,
 /// use [`BM25Builder::typed`] or explicit turbofish.
-impl BM25Builder<GenId, crate::tokens::TokenHandle> {
+impl BM25Builder<GenId, crate::tokens::WordHash> {
     /// Create an empty builder with the standard BM25 tuning,
-    /// keyed by `GenId` with `TokenHandle`-typed terms.
+    /// keyed by `GenId` with `WordHash`-typed terms.
     pub fn new() -> Self {
         Self::typed()
     }
 }
 
-impl Default for BM25Builder<GenId, crate::tokens::TokenHandle> {
+impl Default for BM25Builder<GenId, crate::tokens::WordHash> {
     fn default() -> Self {
         Self::new()
     }
@@ -123,7 +123,7 @@ impl Default for BM25Builder<GenId, crate::tokens::TokenHandle> {
 impl<D: ValueSchema, T: ValueSchema> BM25Builder<D, T> {
     /// Create an empty builder with caller-chosen schemas.
     /// `BM25Builder::<MyKey, MyTerm>::typed()` — or the implicit
-    /// [`new`][Self::new] for the `<GenId, TokenHandle>` default.
+    /// [`new`][Self::new] for the `<GenId, WordHash>` default.
     pub fn typed() -> Self {
         Self {
             docs: Vec::new(),
@@ -335,7 +335,7 @@ fn accumulate_tfs(
 /// saturating term frequency (`k1`) and length-normalized doc
 /// length (`b`).
 #[doc(hidden)]
-pub struct BM25Index<D: ValueSchema = GenId, T: ValueSchema = crate::tokens::TokenHandle> {
+pub struct BM25Index<D: ValueSchema = GenId, T: ValueSchema = crate::tokens::WordHash> {
     /// Per-doc 32-byte keys. Stored raw; `Value<D>` at the API
     /// boundary.
     keys: Vec<RawValue>,
@@ -593,7 +593,7 @@ mod tests {
         let idx = BM25Builder::new().build();
         assert_eq!(idx.doc_count(), 0);
         assert_eq!(idx.term_count(), 0);
-        let term: Value<crate::tokens::TokenHandle> = Value::new([0u8; 32]);
+        let term: Value<crate::tokens::WordHash> = Value::new([0u8; 32]);
         assert!(idx.query_term(&term).next().is_none());
     }
 
@@ -817,27 +817,17 @@ mod tests {
 
     #[test]
     fn ngrams_enable_prefix_queries() {
-        // The payoff test: index docs with hash_tokens + 3-grams
-        // concatenated, and query a prefix as 3-grams to recover
-        // the extended form. Surface-exact queries still work via
-        // the hash_tokens half.
-        use crate::tokens::ngram_tokens;
+        // Prefix / substring queries via an NgramHash index.
+        // Query "fox" as a single 3-gram and recover docs that
+        // contain the extended forms ("foxes", "fox at night").
+        use crate::tokens::{ngram_tokens, NgramHash};
 
-        fn both(text: &str) -> Vec<Value<crate::tokens::TokenHandle>> {
-            let mut v = hash_tokens(text);
-            v.extend(ngram_tokens(text, 3));
-            v
-        }
-
-        let mut b = BM25Builder::new();
-        b.insert(&id(1), both("foxes are cunning"));
-        b.insert(&id(2), both("the dog barks"));
-        b.insert(&id(3), both("silver fox at night"));
+        let mut b: BM25Builder<GenId, NgramHash> = BM25Builder::typed();
+        b.insert(&id(1), ngram_tokens("foxes are cunning", 3));
+        b.insert(&id(2), ngram_tokens("the dog barks", 3));
+        b.insert(&id(3), ngram_tokens("silver fox at night", 3));
         let idx = b.build();
 
-        // Query "fox" as trigrams: just one gram, "fox". Both
-        // "foxes" (doc 1) and "fox" (doc 3) should score, but
-        // "dog" (doc 2) must not.
         let q = ngram_tokens("fox", 3);
         let hits: Vec<_> = idx.query_multi(&q);
         let doc_ids: Vec<_> = hits.iter().map(|(d, _)| *d).collect();

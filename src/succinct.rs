@@ -1488,7 +1488,7 @@ where
 /// ```
 pub struct SuccinctBM25Index<
     D: ValueSchema = triblespace::core::value::schemas::genid::GenId,
-    T: ValueSchema = crate::tokens::TokenHandle,
+    T: ValueSchema = crate::tokens::WordHash,
 > {
     /// Sorted, deduplicated, compressed doc-key table. For
     /// entity-keyed corpora (`Value<GenId>`), 16 of the 32 bytes
@@ -2315,7 +2315,7 @@ mod tests {
         // match within the succinct index's quantization tolerance.
         let tol = succinct.score_tolerance();
         for term_raw in naive.terms_slice() {
-            let term: Value<crate::tokens::TokenHandle> = Value::new(*term_raw);
+            let term: Value<crate::tokens::WordHash> = Value::new(*term_raw);
             let n: Vec<_> = naive.query_term(&term).collect();
             let s: Vec<_> = succinct.query_term(&term).collect();
             assert_eq!(
@@ -2345,7 +2345,7 @@ mod tests {
         let succinct = BM25Builder::new().build();
         assert_eq!(succinct.doc_count(), 0);
         assert_eq!(succinct.term_count(), 0);
-        let probe: Value<crate::tokens::TokenHandle> = Value::new([0u8; 32]);
+        let probe: Value<crate::tokens::WordHash> = Value::new([0u8; 32]);
         assert!(succinct.query_term(&probe).next().is_none());
     }
 
@@ -2452,7 +2452,7 @@ mod tests {
     fn succinct_bm25_rejects_short_header() {
         let err = SuccinctBM25Index::<
             triblespace::core::value::schemas::genid::GenId,
-            crate::tokens::TokenHandle,
+            crate::tokens::WordHash,
         >::try_from_bytes(&[0u8; 10])
         .unwrap_err();
         assert_eq!(err, SuccinctLoadError::ShortHeader);
@@ -2469,7 +2469,7 @@ mod tests {
         let truncated = &bytes[..bytes.len() - 2];
         let err = SuccinctBM25Index::<
             triblespace::core::value::schemas::genid::GenId,
-            crate::tokens::TokenHandle,
+            crate::tokens::WordHash,
         >::try_from_bytes(truncated)
         .unwrap_err();
         assert!(matches!(err, SuccinctLoadError::TruncatedSection(_)));
