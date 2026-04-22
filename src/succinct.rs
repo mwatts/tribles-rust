@@ -46,7 +46,15 @@ use triblespace::core::blob::{Blob, BlobSchema, ToBlob, TryFromBlob};
 use triblespace::core::id::Id;
 use triblespace::core::id_hex;
 use triblespace::core::metadata::{ConstDescribe, ConstId};
+use triblespace::core::query::Variable;
+use triblespace::core::value::schemas::hash::{Blake3, Handle};
 use triblespace::core::value::{RawValue, Value, ValueSchema};
+
+use crate::schemas::Embedding;
+
+/// Shorthand used throughout the HNSW path for the handle value
+/// schema that identifies a node.
+type EmbHandle = Handle<Blake3, Embedding>;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use std::collections::HashMap;
@@ -933,9 +941,7 @@ impl SuccinctHNSWIndex {
     /// [c]: triblespace::core::blob::BlobCache
     pub fn attach<'a, B>(&'a self, store: &B) -> AttachedSuccinctHNSWIndex<'a, B>
     where
-        B: triblespace::core::repo::BlobStoreGet<
-                triblespace::core::value::schemas::hash::Blake3,
-            > + Clone,
+        B: triblespace::core::repo::BlobStoreGet<Blake3> + Clone,
     {
         AttachedSuccinctHNSWIndex {
             index: self,
@@ -1141,25 +1147,16 @@ impl SuccinctHNSWIndex {
 /// [c]: triblespace::core::blob::BlobCache
 pub struct AttachedSuccinctHNSWIndex<'a, B>
 where
-    B: triblespace::core::repo::BlobStoreGet<
-            triblespace::core::value::schemas::hash::Blake3,
-        >,
+    B: triblespace::core::repo::BlobStoreGet<Blake3>,
 {
     index: &'a SuccinctHNSWIndex,
-    cache: triblespace::core::blob::BlobCache<
-        B,
-        triblespace::core::value::schemas::hash::Blake3,
-        crate::schemas::Embedding,
-        anybytes::View<[f32]>,
-    >,
+    cache: triblespace::core::blob::BlobCache<B, Blake3, Embedding, anybytes::View<[f32]>>,
     ef_search: usize,
 }
 
 impl<'a, B> AttachedSuccinctHNSWIndex<'a, B>
 where
-    B: triblespace::core::repo::BlobStoreGet<
-            triblespace::core::value::schemas::hash::Blake3,
-        >,
+    B: triblespace::core::repo::BlobStoreGet<Blake3>,
 {
     /// Back-reference to the inner index.
     pub fn index(&self) -> &SuccinctHNSWIndex {
@@ -1179,18 +1176,8 @@ where
     /// `find!` / `pattern!` integration.
     pub fn similar(
         &self,
-        a: triblespace::core::query::Variable<
-            triblespace::core::value::schemas::hash::Handle<
-                triblespace::core::value::schemas::hash::Blake3,
-                crate::schemas::Embedding,
-            >,
-        >,
-        b: triblespace::core::query::Variable<
-            triblespace::core::value::schemas::hash::Handle<
-                triblespace::core::value::schemas::hash::Blake3,
-                crate::schemas::Embedding,
-            >,
-        >,
+        a: Variable<EmbHandle>,
+        b: Variable<EmbHandle>,
         score_floor: f32,
     ) -> crate::constraint::Similar<'_, Self> {
         crate::constraint::Similar::new(self, a, b, score_floor)
@@ -1207,24 +1194,9 @@ where
     /// beam via [`with_ef_search`][Self::with_ef_search].
     pub fn candidates_above(
         &self,
-        from_handle: triblespace::core::value::Value<
-            triblespace::core::value::schemas::hash::Handle<
-                triblespace::core::value::schemas::hash::Blake3,
-                crate::schemas::Embedding,
-            >,
-        >,
+        from_handle: Value<EmbHandle>,
         score_floor: f32,
-    ) -> Result<
-        Vec<
-            triblespace::core::value::Value<
-                triblespace::core::value::schemas::hash::Handle<
-                    triblespace::core::value::schemas::hash::Blake3,
-                    crate::schemas::Embedding,
-                >,
-            >,
-        >,
-        B::GetError<anybytes::view::ViewError>,
-    > {
+    ) -> Result<Vec<Value<EmbHandle>>, B::GetError<anybytes::view::ViewError>> {
         let Some(entry) = self.index.entry_point else {
             return Ok(Vec::new());
         };
@@ -1243,7 +1215,7 @@ where
             .filter(|(_, dist)| 1.0 - dist >= score_floor)
             .map(|(i, _)| {
                 let raw = *self.index.handles.get(i as usize).expect("in range");
-                triblespace::core::value::Value::new(raw)
+                Value::new(raw)
             })
             .collect())
     }
@@ -1254,12 +1226,7 @@ where
         i: u32,
     ) -> Result<f32, B::GetError<anybytes::view::ViewError>> {
         let raw = *self.index.handles.get(i as usize).expect("in range");
-        let handle: triblespace::core::value::Value<
-            triblespace::core::value::schemas::hash::Handle<
-                triblespace::core::value::schemas::hash::Blake3,
-                crate::schemas::Embedding,
-            >,
-        > = triblespace::core::value::Value::new(raw);
+        let handle: Value<EmbHandle> = Value::new(raw);
         let view = self.cache.get(handle)?;
         Ok(crate::hnsw::cosine_dist(q, view.as_ref().as_ref()))
     }
@@ -1396,44 +1363,20 @@ where
 
 impl<'a, B> crate::constraint::SimilaritySearch for AttachedSuccinctHNSWIndex<'a, B>
 where
-    B: triblespace::core::repo::BlobStoreGet<
-            triblespace::core::value::schemas::hash::Blake3,
-        >,
+    B: triblespace::core::repo::BlobStoreGet<Blake3>,
 {
     fn neighbours_above(
         &self,
-        from: triblespace::core::value::Value<
-            triblespace::core::value::schemas::hash::Handle<
-                triblespace::core::value::schemas::hash::Blake3,
-                crate::schemas::Embedding,
-            >,
-        >,
+        from: Value<EmbHandle>,
         score_floor: f32,
-    ) -> Vec<
-        triblespace::core::value::Value<
-            triblespace::core::value::schemas::hash::Handle<
-                triblespace::core::value::schemas::hash::Blake3,
-                crate::schemas::Embedding,
-            >,
-        >,
-    > {
+    ) -> Vec<Value<EmbHandle>> {
         self.candidates_above(from, score_floor).unwrap_or_default()
     }
 
     fn cosine_between(
         &self,
-        a: triblespace::core::value::Value<
-            triblespace::core::value::schemas::hash::Handle<
-                triblespace::core::value::schemas::hash::Blake3,
-                crate::schemas::Embedding,
-            >,
-        >,
-        b: triblespace::core::value::Value<
-            triblespace::core::value::schemas::hash::Handle<
-                triblespace::core::value::schemas::hash::Blake3,
-                crate::schemas::Embedding,
-            >,
-        >,
+        a: Value<EmbHandle>,
+        b: Value<EmbHandle>,
     ) -> Option<f32> {
         let va = self.cache.get(a).ok()?;
         let vb = self.cache.get(b).ok()?;
