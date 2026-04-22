@@ -296,13 +296,25 @@ impl HNSWBuilder {
         self.insert(key.raw, handle, vec)
     }
 
-    /// Consume the builder and produce an immutable [`HNSWIndex`].
-    /// Strips the inline build-time vectors — only the handles
-    /// survive. Embeddings are resolved at query time through
-    /// the caller-supplied blob store.
-    pub fn build(self) -> HNSWIndex {
-        // Strip vectors; keep only neighbour lists and per-node
-        // level metadata for succinct encoding downstream.
+    /// Consume the builder and produce a succinct HNSW index,
+    /// ready to `put` into a pile or query directly. This is
+    /// the production path — the naive in-memory [`HNSWIndex`]
+    /// is kept only as a reference oracle (see
+    /// [`build_naive`][Self::build_naive]).
+    pub fn build(self) -> crate::succinct::SuccinctHNSWIndex {
+        crate::succinct::SuccinctHNSWIndex::from_naive(&self.build_naive())
+            .expect("from_naive cannot fail on a valid HNSWIndex built by HNSWBuilder")
+    }
+
+    /// Naive layered-graph reference index. Strips the inline
+    /// build-time vectors — only the handles survive; embeddings
+    /// are resolved at query time through the caller-supplied
+    /// blob store. Kept public as a correctness oracle for tests
+    /// validating the succinct form, and as an intermediate when
+    /// callers already hold a naive index and want
+    /// [`SuccinctHNSWIndex::from_naive`][crate::succinct::SuccinctHNSWIndex::from_naive]
+    /// directly. Most callers want [`build`][Self::build].
+    pub fn build_naive(self) -> HNSWIndex {
         let nodes: Vec<HNSWIndexNode> = self
             .nodes
             .into_iter()
@@ -1473,7 +1485,7 @@ mod tests {
         hnsw_insert(&mut b, &mut store, id(2), vec![0.9, 0.1, 0.0]).unwrap();
         hnsw_insert(&mut b, &mut store, id(3), vec![0.0, 1.0, 0.0]).unwrap();
         hnsw_insert(&mut b, &mut store, id(4), vec![0.0, 0.0, 1.0]).unwrap();
-        (b.build(), store)
+        (b.build_naive(), store)
     }
 
     #[test]
@@ -1491,7 +1503,7 @@ mod tests {
         hnsw_insert(&mut b, &mut store, id(3), vec![0.5, 0.5, 0.0]).unwrap();
         hnsw_insert(&mut b, &mut store, id(4), vec![0.0, 0.0, 1.0]).unwrap();
         hnsw_insert(&mut b, &mut store, id(5), vec![0.2, 0.3, 0.5]).unwrap();
-        let larger = b.build().byte_size();
+        let larger = b.build_naive().byte_size();
         assert!(larger > small);
     }
 }

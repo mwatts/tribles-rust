@@ -184,7 +184,7 @@ fn bench_hnsw(n_docs: usize, dim: usize) {
         let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
         builder.insert_id(id_from_u64(i as u64 + 1), h, v).unwrap();
     }
-    let naive = builder.build();
+    let naive = builder.build_naive();
     let succinct = SuccinctHNSWIndex::from_naive(&naive).unwrap();
     let reader = store.reader().unwrap();
 

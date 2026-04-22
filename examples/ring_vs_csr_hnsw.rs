@@ -75,7 +75,7 @@ fn build_hnsw(
         let h = put_embedding::<_, Blake3>(&mut store, vec.clone()).unwrap();
         b.insert_id(id_for(i as u32 + 1), h, vec).unwrap();
     }
-    (b.build(), store)
+    (b.build_naive(), store)
 }
 
 /// Encode the HNSW graph as the existing `SuccinctGraph`

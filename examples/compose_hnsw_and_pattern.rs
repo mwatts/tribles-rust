@@ -24,7 +24,6 @@ use triblespace::macros::{entity, pattern};
 
 use triblespace_search::hnsw::HNSWBuilder;
 use triblespace_search::schemas::put_embedding;
-use triblespace_search::succinct::SuccinctHNSWIndex;
 
 fn id(byte: u8) -> Id {
     Id::new([byte; 16]).expect("non-nil")
@@ -87,8 +86,7 @@ fn main() {
         let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
         hb.insert_id(*bid, h, v.clone()).unwrap();
     }
-    let naive = hb.build();
-    let idx = SuccinctHNSWIndex::from_naive(&naive).unwrap();
+    let idx = hb.build();
     let reader = store.reader().unwrap();
     println!(
         "HNSW index built: {} docs, dim = {}, max_level = {}",
@@ -103,10 +101,9 @@ fn main() {
     // Standalone similarity — should surface A and C first.
     // `similar_ids` decodes the 32-byte keys back to `Id` under
     // the GenId schema (empty result on non-GenId keys).
-    let naive_view = naive.attach(&reader);
     let idx_view = idx.attach(&reader);
     println!("\nsimilarity-only (no author filter):");
-    for (d, s) in naive_view.similar_ids(&query, 4, Some(10)).unwrap() {
+    for (d, s) in idx_view.similar_ids(&query, 4, Some(10)).unwrap() {
         println!("  {d}  cos={s:.3}");
     }
 

@@ -83,8 +83,7 @@ fn succinct_hnsw_survives_blob_store_roundtrip() {
         let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
         b.insert_id(iid(i), h, v).unwrap();
     }
-    let naive = b.build();
-    let original = SuccinctHNSWIndex::from_naive(&naive).unwrap();
+    let original = b.build();
 
     // Put the index itself as a blob alongside the embedding
     // blobs it references.
@@ -149,14 +148,18 @@ fn hnsw_indexes_share_embedding_blobs() {
         let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
         a_b.insert_id(*pid, h, v.clone()).unwrap();
     }
-    let idx_a = a_b.build();
+    // Use `build_naive()` here because the test inspects
+    // `handles()[i]` directly, which only the naive index
+    // exposes — the succinct form wraps handles in a
+    // `FixedBytesTable`.
+    let idx_a = a_b.build_naive();
 
     let mut b_b = HNSWBuilder::new(4).with_seed(99); // different seed!
     for (pid, v) in &embeddings {
         let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
         b_b.insert_id(*pid, h, v.clone()).unwrap();
     }
-    let idx_b = b_b.build();
+    let idx_b = b_b.build_naive();
 
     // Handles must be identical per-entity.
     assert_eq!(idx_a.doc_count(), idx_b.doc_count());

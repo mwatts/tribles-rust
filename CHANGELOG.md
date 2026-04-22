@@ -54,6 +54,16 @@ dates are commit dates rather than release dates.
   first, then accumulates tf and scores keyed by universe code
   from the start. No insertion-order → universe-code remap, no
   per-term resort pass.
+- `HNSWBuilder::build()` returns `SuccinctHNSWIndex` for the
+  same "one blessed build method" ergonomic. Unlike BM25, there's
+  no redundant-work win — HNSW still goes through the naive
+  intermediate internally (necessary because levels are revealed
+  incrementally, see node-major-vs-layer-major discussion) —
+  but the public API now mirrors BM25's, and
+  `SuccinctHNSWIndex::from_naive` remains available for callers
+  who already hold a naive index.
+- `HNSWBuilder::build_naive()` exposes the naive reference
+  index (same ergonomics as `BM25Builder::build_naive`).
 - Naive `to_bytes` / `try_from_bytes` on `BM25Index` /
   `HNSWIndex` / `FlatIndex` deleted along with their
   `BM25LoadError` / `HNSWLoadError` / `FlatLoadError` types

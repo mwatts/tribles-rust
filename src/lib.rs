@@ -14,10 +14,13 @@
 //! [`bm25::BM25Builder::build`] goes direct-to-succinct
 //! (sorts keys into a `CompressedUniverse` first, then
 //! accumulates per-term postings in universe-code order — no
-//! remap pass). The naive [`bm25::BM25Index`] is kept as a
-//! reference oracle via `build_naive`. HNSW still has a
-//! naive → succinct conversion via
-//! `SuccinctHNSWIndex::from_naive`.
+//! remap pass). [`hnsw::HNSWBuilder::build`] also returns the
+//! succinct form directly (delegating through today's
+//! `SuccinctHNSWIndex::from_naive` internally — the naive
+//! intermediate is a necessary buffer because HNSW levels are
+//! only revealed incrementally). The naive [`bm25::BM25Index`]
+//! / [`hnsw::HNSWIndex`] types are kept public as reference
+//! oracles, reachable via `build_naive()`.
 //!
 //! Both indexes are rebuilt-and-replaced (no mutation); the
 //! caller persists the resulting handle wherever appropriate

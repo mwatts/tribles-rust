@@ -817,7 +817,7 @@ impl SuccinctGraph {
 ///     let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
 ///     b.insert_id(Id::new([byte; 16]).unwrap(), h, v).unwrap();
 /// }
-/// let idx = SuccinctHNSWIndex::from_naive(&b.build()).unwrap();
+/// let idx: SuccinctHNSWIndex = b.build();
 ///
 /// let reader = store.reader().unwrap();
 /// let q = vec![1.0, 0.0, 0.0, 0.0];
@@ -2534,7 +2534,7 @@ mod tests {
             let h = crate::schemas::put_embedding::<_, Blake3>(&mut store, vec.clone()).unwrap();
             b.insert_id(iid(i), h, vec).unwrap();
         }
-        let naive = b.build();
+        let naive = b.build_naive();
         let succinct = SuccinctHNSWIndex::from_naive(&naive).unwrap();
         let reader = store.reader().unwrap();
 
@@ -2586,7 +2586,7 @@ mod tests {
             let h = crate::schemas::put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
             b.insert_id(iid(i), h, v).unwrap();
         }
-        let idx = SuccinctHNSWIndex::from_naive(&b.build()).unwrap();
+        let idx = b.build();
         (idx, store)
     }
 
@@ -2619,8 +2619,7 @@ mod tests {
         use triblespace::core::blob::MemoryBlobStore;
         use triblespace::core::repo::BlobStore;
         use triblespace::core::value::schemas::hash::Blake3;
-        let naive = HNSWBuilder::new(3).build();
-        let idx = SuccinctHNSWIndex::from_naive(&naive).unwrap();
+        let idx = HNSWBuilder::new(3).build();
         let bytes = idx.to_bytes();
         let reloaded = SuccinctHNSWIndex::try_from_bytes(&bytes).expect("valid blob");
         assert_eq!(reloaded.doc_count(), 0);
@@ -2675,8 +2674,7 @@ mod tests {
         use triblespace::core::blob::MemoryBlobStore;
         use triblespace::core::repo::BlobStore;
         use triblespace::core::value::schemas::hash::Blake3;
-        let naive = HNSWBuilder::new(3).build();
-        let succinct = SuccinctHNSWIndex::from_naive(&naive).unwrap();
+        let succinct = HNSWBuilder::new(3).build();
         assert_eq!(succinct.doc_count(), 0);
         let mut store: MemoryBlobStore<Blake3> = MemoryBlobStore::new();
         assert!(succinct

@@ -1196,7 +1196,7 @@ mod tests {
             let h = crate::schemas::put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
             b.insert_id(id(i), h, v).unwrap();
         }
-        (b.build(), store)
+        (b.build_naive(), store)
     }
 
     #[test]

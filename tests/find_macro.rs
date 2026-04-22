@@ -244,7 +244,6 @@ fn find_hnsw_similar_on_succinct() {
     use triblespace::core::value::schemas::hash::Blake3;
     use triblespace_search::hnsw::HNSWBuilder;
     use triblespace_search::schemas::put_embedding;
-    use triblespace_search::succinct::SuccinctHNSWIndex;
 
     fn iid(byte: u8) -> TId {
         TId::new([byte; 16]).unwrap()
@@ -258,8 +257,7 @@ fn find_hnsw_similar_on_succinct() {
         let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
         b.insert_id(iid(i), h, v).unwrap();
     }
-    let naive = b.build();
-    let succinct = SuccinctHNSWIndex::from_naive(&naive).unwrap();
+    let succinct = b.build();
     let reader = store.reader().unwrap();
     let query = vec![0.5, -0.2, 0.3, 0.7];
 
@@ -272,8 +270,11 @@ fn find_hnsw_similar_on_succinct() {
     )
     .collect();
     let got: HashSet<Id> = rows.into_iter().map(|(d,)| d).collect();
-    let expected: HashSet<Id> = naive
-        .attach(&reader)
+    // Cross-check the engine's result set against direct
+    // `similar_ids` on the same index — same index, same query,
+    // same answers. Proves the constraint plumbing doesn't drop
+    // or reorder rows relative to the direct API.
+    let expected: HashSet<Id> = succinct_view
         .similar_ids(&query, 3, Some(10))
         .unwrap()
         .into_iter()

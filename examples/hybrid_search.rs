@@ -32,7 +32,6 @@ use triblespace::core::value::schemas::hash::Blake3;
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::hnsw::HNSWBuilder;
 use triblespace_search::schemas::put_embedding;
-use triblespace_search::succinct::SuccinctHNSWIndex;
 use triblespace_search::tokens::hash_tokens;
 
 fn id(byte: u8) -> Id {
@@ -105,7 +104,7 @@ fn main() {
         hnsw_b.insert_id(*pid, h, vec.clone()).unwrap();
     }
     let bm25 = bm25_b.build();
-    let hnsw = SuccinctHNSWIndex::from_naive(&hnsw_b.build()).unwrap();
+    let hnsw = hnsw_b.build();
 
     // Attach a reader so the HNSW walk can resolve embedding
     // handles at query time.

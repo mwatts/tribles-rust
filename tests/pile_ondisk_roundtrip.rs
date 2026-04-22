@@ -93,8 +93,7 @@ fn succinct_hnsw_survives_pile_round_trip() {
             let h = put_embedding::<_, Blake3>(&mut pile, v.clone()).unwrap();
             b.insert_id(iid(i), h, v).unwrap();
         }
-        let naive = b.build();
-        let original = SuccinctHNSWIndex::from_naive(&naive).unwrap();
+        let original = b.build();
 
         let handle = pile
             .put::<SuccinctHNSWBlob, _>(&original)

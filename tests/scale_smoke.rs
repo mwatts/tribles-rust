@@ -263,7 +263,7 @@ fn succinct_hnsw_1k_docs_matches_naive() {
             .insert_id(id_from_u64((i + 1) as u64), h, vec)
             .unwrap();
     }
-    let naive = builder.build();
+    let naive = builder.build_naive();
     let succinct = SuccinctHNSWIndex::from_naive(&naive).unwrap();
     let reader = store.reader().unwrap();
     let naive_view = naive.attach(&reader);
