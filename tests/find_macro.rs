@@ -313,6 +313,44 @@ fn find_docs_containing_term_on_succinct() {
     assert!(set.contains(&id(3)));
 }
 
+/// Multi-term BM25 via `bm25_query`: a bag-of-words query that
+/// binds `doc` + the summed BM25 score across every query term,
+/// running through the normal engine join machinery rather than
+/// a side-channel `query_multi` call.
+#[test]
+fn find_multi_term_bm25_scored() {
+    use triblespace_search::bm25::BM25Builder;
+
+    let mut b = BM25Builder::new();
+    b.insert(&id(1), hash_tokens("the quick brown fox"));
+    b.insert(&id(2), hash_tokens("the lazy brown dog"));
+    b.insert(&id(3), hash_tokens("quick silver fox jumps"));
+    b.insert(&id(4), hash_tokens("entirely unrelated"));
+    let idx = b.build();
+
+    let terms = hash_tokens("quick fox");
+    let rows: Vec<(Id, f32)> = find!(
+        (doc: Id, score: f32),
+        idx.bm25_query(doc, score, &terms)
+    )
+    .collect();
+
+    let ids: HashSet<Id> = rows.iter().map(|(d, _)| *d).collect();
+    // Docs 1 and 3 contain both "quick" and "fox"; docs 2 and 4
+    // contain neither — they never hit a posting list and drop
+    // out of the aggregation entirely.
+    assert!(ids.contains(&id(1)));
+    assert!(ids.contains(&id(3)));
+    assert!(!ids.contains(&id(2)));
+    assert!(!ids.contains(&id(4)));
+
+    // Every row's score must be positive (BM25 scores are
+    // positive for real term matches).
+    for (_, s) in &rows {
+        assert!(s.is_finite() && *s > 0.0);
+    }
+}
+
 /// Headline story: BM25 lexical search composed with a `pattern!`
 /// over a real TribleSet, in a single `find!`. "Find books whose
 /// title mentions 'fox' AND are authored by the known author X."

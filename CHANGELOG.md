@@ -10,6 +10,30 @@ dates are commit dates rather than release dates.
 
 ## Unreleased / pre-alpha
 
+### Higher-level BM25 query: `bm25_query(doc, score, &terms)`
+
+Closes the "two-level query API" sketch — a multi-term
+bag-of-words BM25 constraint that binds `doc` + the summed BM25
+score across every query term, joinable with `pattern!` /
+similarity / other BM25 clauses through the engine.
+
+- `BM25Index::bm25_query(doc, score, &terms)` and
+  `SuccinctBM25Index::bm25_query(doc, score, &terms)` produce a
+  new `BM25MultiTermScored<D>` constraint. Callers typically
+  feed the tokens through `hash_tokens` / `bigram_tokens` —
+  the schema-typed term values keep the right tokenizer
+  flavour paired with the right index.
+- Aggregation (per-term posting lookup + score sum) happens
+  once at construction time; triblespace has no "arithmetic
+  sum of bound variables" primitive, so pre-materialising the
+  `(doc, summed_score)` table is the cleanest way to expose
+  the result as a constraint.
+- `BM25ScoredPostings`-shaped engine behaviour: `estimate` =
+  matching-doc count, `propose`/`confirm`/`satisfied` honour
+  bound `doc` / `score` on either side, `score` proposals
+  dedupe by bit-pattern, and the succinct backend's widened
+  `score_tolerance` flows through automatically.
+
 ### HNSW redesign: handle-keyed, binary-relation similarity
 
 Major API shift for HNSW / Flat indexes, aligning the shape with

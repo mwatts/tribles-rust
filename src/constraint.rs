@@ -315,6 +315,218 @@ where
     }
 }
 
+// ── Multi-term BM25: bag-of-words query → summed score ──────────────
+
+/// Multi-term BM25 constraint: binds `doc` and the *summed*
+/// BM25 score across every term in the query. Models the
+/// standard OR-like bag-of-words retrieval as a single
+/// constraint so the engine can join it with `pattern!` /
+/// similarity / other BM25 clauses.
+///
+/// Scores are pre-aggregated at construction time — one pass
+/// over each term's posting list is the cheapest path, and
+/// materialising the result sidesteps the lack of an "arithmetic
+/// sum" primitive in the engine. That makes this the natural
+/// home for the two-level API sketch from the design notes:
+/// the higher-level `bm25_query(?doc, "typst links", ?score)`
+/// flow lives here once `hash_tokens` has turned the string
+/// into `Value<T>`s.
+///
+/// Cardinality and score dedupe follow [`BM25ScoredPostings`]:
+/// `estimate` is the number of matching docs, and score
+/// proposals are deduped by bit-pattern to avoid a Cartesian
+/// blow-up when multiple docs share a summed score.
+pub struct BM25MultiTermScored<S = GenId>
+where
+    S: triblespace::core::value::ValueSchema,
+{
+    doc: Variable<S>,
+    score: Variable<F32LE>,
+    /// Pre-aggregated `(doc_raw, summed_score)` pairs, one per
+    /// doc that matched at least one term.
+    entries: Vec<(RawValue, f32)>,
+    /// Engine's tolerance for score equality — either the
+    /// lossless `f32::EPSILON` for naive BM25 or the
+    /// quantization bucket for the succinct path.
+    score_tol: f32,
+}
+
+impl<S> BM25MultiTermScored<S>
+where
+    S: triblespace::core::value::ValueSchema,
+{
+    /// Build a multi-term scored constraint from a pre-
+    /// computed `(doc, score)` list and the tolerance the
+    /// backing index reports. Use the `bm25_query` method on
+    /// [`BM25Index`] or `SuccinctBM25Index` rather than
+    /// constructing directly.
+    pub fn from_entries(
+        doc: Variable<S>,
+        score: Variable<F32LE>,
+        entries: Vec<(RawValue, f32)>,
+        score_tol: f32,
+    ) -> Self {
+        Self {
+            doc,
+            score,
+            entries,
+            score_tol,
+        }
+    }
+}
+
+/// Aggregate a bag-of-words query's posting lists into the
+/// `(doc, summed_score)` table [`BM25MultiTermScored`] wraps.
+/// Shared by `BM25Index::bm25_query` and
+/// `SuccinctBM25Index::bm25_query` so the two backends produce
+/// identical aggregation behaviour.
+fn aggregate_multi_term<I: BM25Queryable + ?Sized>(
+    index: &I,
+    terms: &[RawValue],
+) -> Vec<(RawValue, f32)> {
+    let mut acc: std::collections::HashMap<RawValue, f32> =
+        std::collections::HashMap::new();
+    for term in terms {
+        for (doc, score) in index.query_term_boxed(term) {
+            *acc.entry(doc).or_insert(0.0) += score;
+        }
+    }
+    acc.into_iter().collect()
+}
+
+impl<D: triblespace::core::value::ValueSchema, T: triblespace::core::value::ValueSchema>
+    BM25Index<D, T>
+{
+    /// Multi-term bag-of-words query. Binds `doc` + the summed
+    /// BM25 `score` across every token in `terms`. Callers
+    /// typically feed the tokens through
+    /// [`hash_tokens`][crate::tokens::hash_tokens] or a sibling
+    /// tokenizer; the schema-typed term values keep the compiler
+    /// enforcing that the right flavour reaches the right
+    /// index.
+    pub fn bm25_query(
+        &self,
+        doc: Variable<D>,
+        score: Variable<F32LE>,
+        terms: &[Value<T>],
+    ) -> BM25MultiTermScored<D> {
+        let raw_terms: Vec<RawValue> = terms.iter().map(|t| t.raw).collect();
+        let entries = aggregate_multi_term(self, &raw_terms);
+        BM25MultiTermScored::from_entries(doc, score, entries, self.score_tolerance())
+    }
+}
+
+#[cfg(feature = "succinct")]
+impl<D: triblespace::core::value::ValueSchema, T: triblespace::core::value::ValueSchema>
+    crate::succinct::SuccinctBM25Index<D, T>
+{
+    /// Succinct-side sibling of [`BM25Index::bm25_query`]. Same
+    /// aggregation shape, same constraint type — picks up the
+    /// succinct index's widened `score_tolerance` automatically
+    /// so engine-level equality checks still bind correctly
+    /// after u16 quantisation.
+    pub fn bm25_query(
+        &self,
+        doc: Variable<D>,
+        score: Variable<F32LE>,
+        terms: &[Value<T>],
+    ) -> BM25MultiTermScored<D> {
+        let raw_terms: Vec<RawValue> = terms.iter().map(|t| t.raw).collect();
+        let entries = aggregate_multi_term(self, &raw_terms);
+        BM25MultiTermScored::from_entries(
+            doc,
+            score,
+            entries,
+            <Self as BM25Queryable>::score_tolerance(self),
+        )
+    }
+}
+
+impl<'a, S> Constraint<'a> for BM25MultiTermScored<S>
+where
+    S: triblespace::core::value::ValueSchema + 'a,
+{
+    fn variables(&self) -> VariableSet {
+        VariableSet::new_singleton(self.doc.index)
+            .union(VariableSet::new_singleton(self.score.index))
+    }
+
+    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
+        if variable == self.doc.index || variable == self.score.index {
+            Some(self.entries.len())
+        } else {
+            None
+        }
+    }
+
+    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
+        if variable == self.doc.index {
+            let bound_score = binding.get(self.score.index).map(raw_value_to_f32);
+            for (doc, score) in &self.entries {
+                if let Some(bs) = bound_score {
+                    if (score - bs).abs() > self.score_tol {
+                        continue;
+                    }
+                }
+                proposals.push(*doc);
+            }
+        } else if variable == self.score.index {
+            let bound_doc = binding.get(self.doc.index).copied();
+            let mut seen = HashSet::new();
+            for (doc, score) in &self.entries {
+                if let Some(bd) = bound_doc {
+                    if *doc != bd {
+                        continue;
+                    }
+                }
+                if seen.insert(score.to_bits()) {
+                    proposals.push(f32_to_raw_value(*score));
+                }
+            }
+        }
+    }
+
+    fn confirm(&self, variable: VariableId, binding: &Binding, proposals: &mut Vec<RawValue>) {
+        if variable == self.doc.index {
+            let bound_score = binding.get(self.score.index).map(raw_value_to_f32);
+            let valid: HashSet<RawValue> = self
+                .entries
+                .iter()
+                .filter(|(_, s)| match bound_score {
+                    Some(bs) => (s - bs).abs() <= self.score_tol,
+                    None => true,
+                })
+                .map(|(d, _)| *d)
+                .collect();
+            proposals.retain(|raw| valid.contains(raw));
+        } else if variable == self.score.index {
+            let bound_doc = binding.get(self.doc.index).copied();
+            let allowed: HashSet<u32> = self
+                .entries
+                .iter()
+                .filter(|(d, _)| match bound_doc {
+                    Some(bd) => *d == bd,
+                    None => true,
+                })
+                .map(|(_, s)| s.to_bits())
+                .collect();
+            proposals.retain(|raw| allowed.contains(&raw_value_to_f32(raw).to_bits()));
+        }
+    }
+
+    fn satisfied(&self, binding: &Binding) -> bool {
+        let bound_doc = binding.get(self.doc.index).copied();
+        let bound_score = binding.get(self.score.index).map(raw_value_to_f32);
+        match (bound_doc, bound_score) {
+            (None, None) => true,
+            _ => self.entries.iter().any(|&(d, s)| {
+                bound_doc.map_or(true, |bd| d == bd)
+                    && bound_score.map_or(true, |bs| (s - bs).abs() <= self.score_tol)
+            }),
+        }
+    }
+}
+
 impl<'a, I: BM25Queryable + ?Sized + 'a, S> Constraint<'a> for DocsContainingTerm<'a, I, S>
 where
     S: triblespace::core::value::ValueSchema + 'a,
@@ -928,6 +1140,73 @@ mod tests {
         assert!(got.contains(&handles[0].raw));
         assert!(got.contains(&handles[2].raw));
         assert!(!got.contains(&handles[1].raw));
+    }
+
+    // ── BM25MultiTermScored (bag-of-words summed scores) ─────
+
+    #[test]
+    fn multi_term_proposes_summed_scores() {
+        let idx = sample_index();
+        let mut ctx = triblespace::core::query::VariableContext::new();
+        let doc: Variable<GenId> = ctx.next_variable();
+        let score: Variable<F32LE> = ctx.next_variable();
+        // "quick fox" hits docs 1 and 3 (both contain "quick"
+        // and "fox"), and doc 2 (contains neither).
+        let terms = hash_tokens("quick fox");
+        let c = idx.bm25_query(doc, score, &terms);
+
+        let vars = c.variables();
+        assert!(vars.is_set(doc.index));
+        assert!(vars.is_set(score.index));
+
+        let mut doc_props = Vec::new();
+        c.propose(doc.index, &Binding::default(), &mut doc_props);
+        let ids: HashSet<Id> = doc_props
+            .iter()
+            .map(|r| raw_value_to_id(r).expect("genid"))
+            .collect();
+        // Docs 1 and 3 mention both "quick" and "fox" — their
+        // summed score is the strongest. Doc 2 mentions neither
+        // and is absent from the aggregation entirely.
+        assert!(ids.contains(&id(1)));
+        assert!(ids.contains(&id(3)));
+        assert!(!ids.contains(&id(2)));
+    }
+
+    #[test]
+    fn multi_term_binds_doc_given_summed_score() {
+        // Build a corpus where two-term scores diverge between
+        // two matching docs — the length-1 doc scores higher
+        // than the length-7 doc on "fox alone" because BM25
+        // penalises long docs.
+        let mut b = BM25Builder::new();
+        b.insert(&id(1), hash_tokens("fox alone"));
+        b.insert(&id(2), hash_tokens("quick brown fox jumps high today happily"));
+        b.insert(&id(3), hash_tokens("unrelated"));
+        let idx = b.build_naive();
+
+        let mut ctx = triblespace::core::query::VariableContext::new();
+        let doc: Variable<GenId> = ctx.next_variable();
+        let score: Variable<F32LE> = ctx.next_variable();
+        let terms = hash_tokens("fox alone");
+        let c = idx.bm25_query(doc, score, &terms);
+
+        // Pull the summed score for doc 1 out of the constraint
+        // directly — same path aggregate_multi_term takes — then
+        // pin `score` to it and propose `doc`. Only doc 1 should
+        // come back.
+        let terms_raw: Vec<RawValue> = terms.iter().map(|t| t.raw).collect();
+        let full: std::collections::HashMap<RawValue, f32> =
+            aggregate_multi_term(&idx, &terms_raw).into_iter().collect();
+        let doc1_raw = id_to_raw_value(id(1));
+        let doc1_score = *full.get(&doc1_raw).expect("doc 1 aggregated");
+
+        let mut binding = Binding::default();
+        binding.set(score.index, &f32_to_raw_value(doc1_score));
+        let mut props = Vec::new();
+        c.propose(doc.index, &binding, &mut props);
+        assert_eq!(props.len(), 1);
+        assert_eq!(raw_value_to_id(&props[0]).unwrap(), id(1));
     }
 
     #[test]
