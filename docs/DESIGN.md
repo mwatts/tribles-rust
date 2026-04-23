@@ -464,43 +464,60 @@ latency for ~2× smaller blobs on disk.
 
 ### HNSW — size estimate
 
-At `n = 100 000`, `dim = 384` (MiniLM), `M = 16`, M0 = 32:
-- `doc_ids`: 100 k × 16 B = 1.6 MiB
-- `embeddings`: 100 k × 384 × 4 B = **147 MiB** (dominates)
-- `node_levels`: 100 k × 1 B = 0.1 MiB
-- `neighbour_offsets`: 100 k × 8 × 4 B ≈ 3.2 MiB (avg ~8 layers
-  at `log_M(100k) ≈ 4`, padded for uniform indexing)
-- `neighbour_array`: ~100 k × M0 × 4 B ≈ 13 MiB (mostly layer 0)
-- **Total ~165 MiB**, 89 % of which is raw f32 embeddings.
+At `n = 100 000`, `dim = 384` (MiniLM), `M = 16`, M0 = 32.
+Embeddings are not in the HNSW blob — they live in the pile's
+blob store, content-addressed, and shared across every index
+that references them. The HNSW blob only carries the handles
+table and the graph:
 
-Jerky-succinct pass only helps the graph (`neighbour_array` +
-`neighbour_offsets`) — the embeddings are the caller's data and
-compressing them (f16, int8, PQ) is a separate design decision
-the caller makes when choosing the `Embedding<const D: usize>`
-schema. Graph-only savings are ≈ 10 MiB → ≈ 3 MiB (wavelet
-matrix on source × target pairs), so the big-picture BM25+HNSW
-blob for 100 k frags sits around 200 MiB and the succinct pass
-takes it to ~180 MiB — embedding dominance means the compression
-win is mostly on the BM25 side.
+- `handles`: 100 k × 32 B = **3.2 MiB** (one
+  `Value<Handle<Blake3, Embedding>>` per node, the sole
+  per-node table)
+- graph `neighbours`: ~1 M directed edges (average `M`
+  neighbours per node plus layer-0 fill-in with `M0 = 32`),
+  each packed at `ceil(log2(n + 1)) = 17` bits ≈ 2.1 MiB
+- graph `offsets`: `(layers + 1) × n` entries at
+  `ceil(log2(edges + 1)) = 20` bits; layers stay ~4–5 by
+  design (`log_M(100k) ≈ 4`), so roughly 500 k entries ≈
+  1.25 MiB
+- SH25 header: 128 B (negligible)
+- **Total HNSW blob ~6.5 MiB.**
+
+Separately, in the pile's blob store:
+- `Embedding` blobs: 100 k × 384 × 4 B = **147 MiB** (caller-
+  owned, dedup'd — two indexes over the same vectors share
+  the bytes)
+
+The handle-indirected design moves embedding compression out
+of this crate's surface: `Embedding` is agnostic to the on-
+disk encoding, so callers who care about footprint swap in
+`EmbeddingI8` / `EmbeddingPQ` schemas at their level. The
+crate's own succinct pass targets the graph — which at this
+scale is already ~4 % of the total corpus footprint, so
+there's no transformative graph win to chase.
 
 ### HNSW — query latency
 
-`query_latency` example on 5 k / 10 k × 32-dim vectors, top-10 +
-ef=50:
+`query_latency` example on 5 k / 10 k × 32-dim corpora, probes
+sampled from the indexed handles, threshold `cos ≥ 0.5`,
+`ef_search = 50`:
 
-| Corpus          | Path  | p50    | avg    | p99    |
-| :-------------- | :---- | -----: | -----: | -----: |
-| 5 k × 32        | naive | 54 µs  | 54 µs  | 62 µs  |
-| 5 k × 32        | SH25  | 56 µs  | 57 µs  | 66 µs  |
-| 10 k × 32       | naive | 55 µs  | 55 µs  | 60 µs  |
-| 10 k × 32       | SH25  | 57 µs  | 57 µs  | 67 µs  |
+| Corpus          | Path  | p50      | avg      | p99      |
+| :-------------- | :---- | -------: | -------: | -------: |
+| 5 k × 32        | naive | 190 µs   | 191 µs   | 215 µs   |
+| 5 k × 32        | SH25  | 190 µs   | 191 µs   | 222 µs   |
+| 10 k × 32       | naive | 226 µs   | 228 µs   | 273 µs   |
+| 10 k × 32       | SH25  | 220 µs   | 221 µs   | 248 µs   |
 
-SH25 sits within ~4 % of the naive latency. The previous
-~1.4× gap (per-component `f32::from_le_bytes` + `Vec` alloc
-per vector read) closed once `SuccinctHNSWIndex` started
-caching an `anybytes::View<[f32]>` over the whole vectors
-section. `vector(i)` is now `&view[i*dim .. (i+1)*dim]` with
-no allocation and no decode loop.
+SH25 tracks naive within noise — both paths fetch every
+visited embedding through the same `BlobCache<MemoryBlobStore,
+Embedding>` and compute cosine against a
+contiguous `&[f32]` view, so the graph-access difference
+(pointer hop vs. bit-unpack) is swamped by the O(ef_search ×
+dim) distance-eval work. Threshold walks visit more nodes
+than the old top-k shape did (no early exit once `k` hits),
+which accounts for the absolute-number jump versus earlier
+measurements.
 
 ### Takeaways
 
@@ -510,7 +527,7 @@ no allocation and no decode loop.
   already claimed it. The next step (delta-encoded `doc_idx`,
   wavelet-matrix term table) is incremental, not transformative.
 - For HNSW, the interesting compression sits in *caller-owned*
-  embedding bytes. This crate's succinct pass is about graph
-  compactness + rank/select speed, not bulk size.
+  embedding bytes — this crate's pass is about graph compactness
+  and graph-walk speed, not bulk size.
 - At these scales a single-node mmap-backed blob is fine; the
   "distributed indexes" non-goal holds even at 1 M docs.
