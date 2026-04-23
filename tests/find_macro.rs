@@ -351,6 +351,57 @@ fn find_multi_term_bm25_scored() {
     }
 }
 
+/// `bm25_query` (engine path) and `query_multi` (side-channel
+/// Rust helper) aggregate the same per-term posting lists, so
+/// for any query they must produce the same `(doc, score)` set.
+/// Order isn't part of the engine's contract — the engine
+/// doesn't sort, `query_multi` does — so this test compares the
+/// two as multisets of bit-exact `(RawValue, u32)` pairs where
+/// the score is the f32's bit pattern.
+#[test]
+fn bm25_query_matches_query_multi() {
+    use triblespace_search::bm25::BM25Builder;
+
+    let mut b = BM25Builder::new();
+    b.insert(id(1), hash_tokens("the quick brown fox jumps"));
+    b.insert(id(2), hash_tokens("a fox and a cat and a dog"));
+    b.insert(id(3), hash_tokens("quick silver fox"));
+    b.insert(id(4), hash_tokens("entirely unrelated"));
+    let idx = b.build();
+
+    for query in [
+        "quick fox",
+        "the brown fox",
+        "unrelated",
+        "fox dog cat",
+        "nothing here",
+    ] {
+        let terms = hash_tokens(query);
+
+        // Engine path — collected via find!.
+        let engine: Vec<(Id, f32)> = find!(
+            (doc: Id, score: f32),
+            idx.bm25_query(doc, score, &terms)
+        )
+        .collect();
+
+        // Side-channel path — the sort-and-return helper.
+        let helper: Vec<(Id, f32)> = idx.query_multi_ids(&terms);
+
+        // Bit-pattern multiset equality — float equality isn't
+        // reflexive on NaN and BM25 scores are finite, but using
+        // to_bits() gives a total order and bit-exact match.
+        let engine_set: HashSet<(Id, u32)> =
+            engine.iter().map(|(d, s)| (*d, s.to_bits())).collect();
+        let helper_set: HashSet<(Id, u32)> =
+            helper.iter().map(|(d, s)| (*d, s.to_bits())).collect();
+        assert_eq!(
+            engine_set, helper_set,
+            "bm25_query vs query_multi drift on query {query:?}"
+        );
+    }
+}
+
 /// Headline story: BM25 lexical search composed with a `pattern!`
 /// over a real TribleSet, in a single `find!`. "Find books whose
 /// title mentions 'fox' AND are authored by the known author X."
