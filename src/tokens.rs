@@ -106,23 +106,35 @@ impl ValueSchema for NgramHash {
 /// assert_ne!(vs[0], vs[1]);
 /// ```
 pub fn hash_tokens(text: &str) -> Vec<Value<WordHash>> {
-    text.split_ascii_whitespace()
-        .filter_map(|raw| {
-            let trimmed = raw.trim_matches(|c: char| c.is_ascii_punctuation());
-            // Drop tokens with no alphanumeric content at all (em-
-            // dashes, pure-symbol clusters). Pure-punctuation
-            // tokens would otherwise all hash to the same value
-            // and poison the term list.
-            if !trimmed.chars().any(|c| c.is_alphanumeric()) {
-                return None;
-            }
-            let mut lower = String::with_capacity(trimmed.len());
-            for c in trimmed.chars() {
-                lower.push(c.to_ascii_lowercase());
-            }
-            Some(Value::<WordHash>::new(*blake3::hash(lower.as_bytes()).as_bytes()))
-        })
+    normalize_words(text)
+        .map(|w| Value::<WordHash>::new(*blake3::hash(w.as_bytes()).as_bytes()))
         .collect()
+}
+
+/// Shared word-normalization pipeline used by [`hash_tokens`]
+/// and [`bigram_tokens`]: split on ASCII whitespace, trim
+/// leading/trailing ASCII punctuation, drop tokens with no
+/// alphanumeric content, lowercase ASCII letters. Returns
+/// owned `String`s since callers typically hash them (and
+/// bigram_tokens pairs them) — a &str view would borrow the
+/// source text, which we can't express across the
+/// per-character lowercase step without allocating anyway.
+fn normalize_words(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split_ascii_whitespace().filter_map(|raw| {
+        let trimmed = raw.trim_matches(|c: char| c.is_ascii_punctuation());
+        // Drop tokens with no alphanumeric content at all
+        // (em-dashes, pure-symbol clusters). Pure-punctuation
+        // tokens would otherwise all hash to the same value
+        // and poison the term list.
+        if !trimmed.chars().any(|c| c.is_alphanumeric()) {
+            return None;
+        }
+        let mut lower = String::with_capacity(trimmed.len());
+        for c in trimmed.chars() {
+            lower.push(c.to_ascii_lowercase());
+        }
+        Some(lower)
+    })
 }
 
 /// Word-level bigram tokenizer for phrase-aware retrieval.
@@ -162,23 +174,10 @@ pub fn hash_tokens(text: &str) -> Vec<Value<WordHash>> {
 /// assert!(doc.contains(&qry[0]));
 /// ```
 pub fn bigram_tokens(text: &str) -> Vec<Value<BigramHash>> {
-    // Reuse hash_tokens' normalization pipeline but keep the
-    // pre-hash string form so we can pair adjacent tokens.
-    let words: Vec<String> = text
-        .split_ascii_whitespace()
-        .filter_map(|raw| {
-            let trimmed = raw.trim_matches(|c: char| c.is_ascii_punctuation());
-            if !trimmed.chars().any(|c| c.is_alphanumeric()) {
-                return None;
-            }
-            Some(
-                trimmed
-                    .chars()
-                    .map(|c| c.to_ascii_lowercase())
-                    .collect::<String>(),
-            )
-        })
-        .collect();
+    // Same normalization pipeline as `hash_tokens`, but we pair
+    // adjacent words before hashing rather than hashing each on
+    // its own.
+    let words: Vec<String> = normalize_words(text).collect();
     if words.len() < 2 {
         return Vec::new();
     }
