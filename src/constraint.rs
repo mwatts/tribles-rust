@@ -844,8 +844,9 @@ mod tests {
     use crate::bm25::BM25Builder;
     use crate::tokens::hash_tokens;
     use triblespace::core::blob::MemoryBlobStore;
-    use triblespace::core::id::{Id, RawId};
+    use triblespace::core::id::Id;
     use triblespace::core::repo::BlobStore;
+    use triblespace::core::value::ToValue;
 
     fn id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
@@ -855,28 +856,17 @@ mod tests {
     /// `BM25Builder::insert` stores and what the index's
     /// `query_term` returns.
     fn id_key(byte: u8) -> RawValue {
-        let mut raw = [0u8; 32];
-        let id = id(byte);
-        let id_bytes: &RawId = id.as_ref();
-        raw[16..32].copy_from_slice(id_bytes);
-        raw
+        id(byte).to_value().raw
     }
 
     /// `GenId`-schema RawValue → `Id` test helper.
     fn raw_value_to_id(raw: &RawValue) -> Option<Id> {
-        if raw[0..16] != [0u8; 16] {
-            return None;
-        }
-        let raw_id: RawId = raw[16..32].try_into().ok()?;
-        Id::new(raw_id)
+        Value::<GenId>::new(*raw).try_from_value::<Id>().ok()
     }
 
     /// `Id` → `GenId`-schema RawValue test helper.
     fn id_to_raw_value(id: Id) -> RawValue {
-        let mut out = [0u8; 32];
-        let raw: &RawId = id.as_ref();
-        out[16..32].copy_from_slice(raw);
-        out
+        id.to_value().raw
     }
 
     fn sample_index() -> BM25Index {

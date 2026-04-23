@@ -511,13 +511,8 @@ impl<T: ValueSchema> BM25Index<GenId, T> {
         &'a self,
         term: &Value<T>,
     ) -> impl Iterator<Item = (Id, f32)> + 'a {
-        self.query_term(term).filter_map(|(v, score)| {
-            if v.raw[0..16] != [0u8; 16] {
-                return None;
-            }
-            let id_bytes: RawId = v.raw[16..32].try_into().ok()?;
-            Id::new(id_bytes).map(|id| (id, score))
-        })
+        self.query_term(term)
+            .filter_map(|(v, score)| v.try_from_value::<Id>().ok().map(|id| (id, score)))
     }
 
     /// [`query_multi`][Self::query_multi] decoded as `(Id, f32)`
@@ -525,13 +520,7 @@ impl<T: ValueSchema> BM25Index<GenId, T> {
     pub fn query_multi_ids(&self, terms: &[Value<T>]) -> Vec<(Id, f32)> {
         self.query_multi(terms)
             .into_iter()
-            .filter_map(|(v, s)| {
-                if v.raw[0..16] != [0u8; 16] {
-                    return None;
-                }
-                let id_bytes: RawId = v.raw[16..32].try_into().ok()?;
-                Id::new(id_bytes).map(|id| (id, s))
-            })
+            .filter_map(|(v, s)| v.try_from_value::<Id>().ok().map(|id| (id, s)))
             .collect()
     }
 }
@@ -581,11 +570,7 @@ mod tests {
     /// stores internally, so `query_term` results can be
     /// compared against it.
     fn id_key(byte: u8) -> RawValue {
-        let mut raw = [0u8; 32];
-        let id = id(byte);
-        let id_bytes: &RawId = id.as_ref();
-        raw[16..32].copy_from_slice(id_bytes);
-        raw
+        id(byte).to_value().raw
     }
 
     #[test]

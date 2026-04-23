@@ -5,11 +5,11 @@
 //! isolation; this test is the belt-and-braces check that the
 //! full protocol holds in a real join.
 
-use triblespace::core::id::{Id, RawId};
+use triblespace::core::id::Id;
 use triblespace::core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace::core::query::{Binding, Constraint, Variable, VariableContext};
 use triblespace::core::value::schemas::genid::GenId;
-use triblespace::core::value::RawValue;
+use triblespace::core::value::{RawValue, ToValue, Value};
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::succinct::SuccinctBM25Index;
@@ -20,18 +20,11 @@ fn id(byte: u8) -> Id {
 }
 
 fn id_as_raw_value(id: Id) -> RawValue {
-    let mut out = [0u8; 32];
-    let raw: &RawId = id.as_ref();
-    out[16..32].copy_from_slice(raw);
-    out
+    id.to_value().raw
 }
 
 fn raw_value_to_id(raw: &RawValue) -> Option<Id> {
-    if raw[0..16] != [0u8; 16] {
-        return None;
-    }
-    let raw16: RawId = raw[16..32].try_into().ok()?;
-    Id::new(raw16)
+    Value::<GenId>::new(*raw).try_from_value::<Id>().ok()
 }
 
 /// Build a tiny index and run two constraints through an
