@@ -233,7 +233,7 @@ impl<D: ValueSchema, T: ValueSchema> BM25Builder<D, T> {
             // Scoped threads so references to `chunks` stay alive.
             let locals: Vec<HashMap<RawValue, HashMap<u32, u32>>> = std::thread::scope(|s| {
                 let mut handles = Vec::with_capacity(threads);
-                for (shard_start, chunk) in starts.iter().zip(chunks.into_iter()) {
+                for (shard_start, chunk) in starts.iter().zip(chunks) {
                     let start = *shard_start as u32;
                     handles.push(s.spawn(move || {
                         let mut m: HashMap<RawValue, HashMap<u32, u32>> = HashMap::new();

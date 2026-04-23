@@ -290,7 +290,7 @@ fn required_width(lens: &[u32]) -> usize {
     let max = lens.iter().copied().max().unwrap_or(0);
     match max {
         0 => 1,
-        _ => 32 - (max as u32).leading_zeros() as usize,
+        _ => 32 - max.leading_zeros() as usize,
     }
 }
 
@@ -529,8 +529,10 @@ impl SuccinctPostings {
         let scores = scores_b.freeze();
         let scores_meta = scores.metadata();
 
-        drop((doc_idx, offsets, scores));
-        drop(sections);
+        // Release the section handles so `area.freeze()` can move
+        // the ByteArea; clippy flags `drop()` on non-Drop types.
+        let _ = (doc_idx, offsets, scores);
+        let _ = sections;
         let bytes = area.freeze()?;
 
         let meta = SuccinctPostingsMeta {
@@ -736,8 +738,8 @@ impl SuccinctGraph {
         let offsets = offsets_b.freeze();
         let offsets_meta = offsets.metadata();
 
-        drop((neighbours, offsets));
-        drop(sections);
+        let _ = (neighbours, offsets);
+        let _ = sections;
         let bytes = area.freeze()?;
 
         let meta = SuccinctGraphMeta {
@@ -875,11 +877,11 @@ impl SuccinctHNSWIndex {
         let mut layer_graph: Vec<Vec<Vec<u32>>> = (0..n_layers)
             .map(|_| (0..n).map(|_| Vec::new()).collect())
             .collect();
-        for layer in 0..n_layers {
-            for i in 0..n {
+        for (layer, row) in layer_graph.iter_mut().enumerate() {
+            for (i, slot) in row.iter_mut().enumerate() {
                 let lvl = idx.node_level(i).expect("node in range") as usize;
                 if lvl >= layer {
-                    layer_graph[layer][i] = idx.node_neighbours(i, layer as u8).to_vec();
+                    *slot = idx.node_neighbours(i, layer as u8).to_vec();
                 }
             }
         }
@@ -1010,9 +1012,9 @@ impl SuccinctHNSWIndex {
                     .collect::<Vec<Vec<u32>>>()
             })
             .collect();
-        for l in 0..self.graph.n_layers() {
-            for i in 0..self.graph.n_nodes() {
-                layer_graph[l][i] = self.graph.neighbours(i, l).collect();
+        for (l, row) in layer_graph.iter_mut().enumerate() {
+            for (i, slot) in row.iter_mut().enumerate() {
+                *slot = self.graph.neighbours(i, l).collect();
             }
         }
         let (graph_region, graph_meta) =
@@ -1392,13 +1394,13 @@ where
 /// Zero-copy, jerky-backed BM25 index.
 ///
 /// Same query surface as [`crate::bm25::BM25Index`], but postings
-/// + doc_lens live in bit-packed [`CompactVector`]s and the
+/// and doc_lens live in bit-packed [`CompactVector`]s and the
 /// doc-id / term tables are sliced directly out of an
 /// [`anybytes::Bytes`] region without copying.
 ///
 /// For 100k wiki fragments the naive blob is ~157 MiB; this
 /// representation cuts it to ~86 MiB via bit-packed doc_idx
-/// + u16-quantized scores. Score tolerance is exposed via
+/// and u16-quantized scores. Score tolerance is exposed via
 /// [`Self::score_tolerance`] so query-time equality checks
 /// widen automatically.
 ///
@@ -1490,8 +1492,8 @@ impl<D: ValueSchema, T: ValueSchema> SuccinctBM25Index<D, T> {
             let universe =
                 CompressedUniverse::with(docs.iter().map(|(k, _)| *k), &mut sections);
             let meta = universe.metadata();
-            drop(universe);
-            drop(sections);
+            let _ = universe;
+            let _ = sections;
             (area.freeze().expect("freeze ByteArea"), meta)
         };
         let keys = CompressedUniverse::from_bytes(keys_meta, keys_bytes)
@@ -1715,8 +1717,8 @@ impl<D: ValueSchema, T: ValueSchema> SuccinctBM25Index<D, T> {
                 &mut sections,
             );
             let meta = universe.metadata();
-            drop(universe);
-            drop(sections);
+            let _ = universe;
+            let _ = sections;
             (area.freeze().expect("freeze"), meta)
         };
         let keys_meta_on_disk: CompressedUniverseMetaOnDisk = keys_meta.into();
@@ -1926,10 +1928,10 @@ impl<T: ValueSchema> SuccinctBM25Index<triblespace::core::value::schemas::genid:
 
 /// Header length in bytes for an `SuccinctBM25Index` blob.
 ///
-/// Layout: 4 avg_doc_len + 4 k1 + 4 b + 4 max_score + 8 n_docs
-/// + 8 n_terms + 4 × 32 CompactVectorMeta (doc_lens,
-/// postings.doc_idx, postings.offsets, postings.scores) + 1 × 40
-/// CompressedUniverseMeta (keys) + 4 × 16 section (offset, len)
+/// Layout: 4 avg_doc_len, 4 k1, 4 b, 4 max_score, 8 n_docs,
+/// 8 n_terms, 4×32 CompactVectorMeta (doc_lens,
+/// postings.doc_idx, postings.offsets, postings.scores), 1×40
+/// CompressedUniverseMeta (keys), 4×16 section (offset, len)
 /// = 264.
 ///
 /// No magic, no version field — a typed `BlobSchema` handle on
