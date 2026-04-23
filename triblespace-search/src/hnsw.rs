@@ -14,9 +14,9 @@
 //! # Build and query
 //!
 //! ```
-//! # use triblespace::core::blob::MemoryBlobStore;
-//! # use triblespace::core::repo::BlobStore;
-//! # use triblespace::core::value::schemas::hash::Blake3;
+//! # use triblespace_core::blob::MemoryBlobStore;
+//! # use triblespace_core::repo::BlobStore;
+//! # use triblespace_core::value::schemas::hash::Blake3;
 //! # use triblespace_search::hnsw::FlatBuilder;
 //! # use triblespace_search::schemas::put_embedding;
 //! let mut store = MemoryBlobStore::<Blake3>::new();
@@ -41,9 +41,9 @@
 //! assert!(!hits.contains(&h2));
 //! ```
 
-use triblespace::core::query::Variable;
-use triblespace::core::value::schemas::hash::{Blake3, Handle};
-use triblespace::core::value::Value;
+use triblespace_core::query::Variable;
+use triblespace_core::value::schemas::hash::{Blake3, Handle};
+use triblespace_core::value::Value;
 
 use crate::schemas::{EmbHandle, Embedding};
 
@@ -517,14 +517,14 @@ impl HNSWIndex {
     /// to the same node during graph walks deserialize each
     /// embedding at most once per view lifetime.
     ///
-    /// [c]: triblespace::core::blob::BlobCache
+    /// [c]: triblespace_core::blob::BlobCache
     pub fn attach<'a, B>(&'a self, store: &B) -> AttachedHNSWIndex<'a, B>
     where
-        B: triblespace::core::repo::BlobStoreGet<Blake3> + Clone,
+        B: triblespace_core::repo::BlobStoreGet<Blake3> + Clone,
     {
         AttachedHNSWIndex {
             index: self,
-            cache: triblespace::core::blob::BlobCache::new(store.clone()),
+            cache: triblespace_core::blob::BlobCache::new(store.clone()),
             ef_search: 200,
         }
     }
@@ -560,20 +560,20 @@ impl HNSWIndex {
 /// those into a single blob-fetch + deserialize per node per
 /// view lifetime.
 ///
-/// [c]: triblespace::core::blob::BlobCache
+/// [c]: triblespace_core::blob::BlobCache
 #[doc(hidden)]
 pub struct AttachedHNSWIndex<'a, B>
 where
-    B: triblespace::core::repo::BlobStoreGet<Blake3>,
+    B: triblespace_core::repo::BlobStoreGet<Blake3>,
 {
     index: &'a HNSWIndex,
-    cache: triblespace::core::blob::BlobCache<B, Blake3, Embedding, anybytes::View<[f32]>>,
+    cache: triblespace_core::blob::BlobCache<B, Blake3, Embedding, anybytes::View<[f32]>>,
     ef_search: usize,
 }
 
 impl<'a, B> AttachedHNSWIndex<'a, B>
 where
-    B: triblespace::core::repo::BlobStoreGet<Blake3>,
+    B: triblespace_core::repo::BlobStoreGet<Blake3>,
 {
     /// The inner index (back-reference for metadata queries).
     pub fn index(&self) -> &HNSWIndex {
@@ -927,7 +927,7 @@ impl FlatBuilder {
 /// [`Embedding`]'s docs). `similar()` L2-normalizes the query
 /// itself so the dot product reads back as cosine.
 ///
-/// [g]: triblespace::core::repo::BlobStoreGet
+/// [g]: triblespace_core::repo::BlobStoreGet
 #[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct FlatIndex {
@@ -960,14 +960,14 @@ impl FlatIndex {
     /// `B: Clone` so the cache can own the store; typical
     /// readers are cheap-clone.
     ///
-    /// [c]: triblespace::core::blob::BlobCache
+    /// [c]: triblespace_core::blob::BlobCache
     pub fn attach<'a, B>(&'a self, store: &B) -> AttachedFlatIndex<'a, B>
     where
-        B: triblespace::core::repo::BlobStoreGet<Blake3> + Clone,
+        B: triblespace_core::repo::BlobStoreGet<Blake3> + Clone,
     {
         AttachedFlatIndex {
             index: self,
-            cache: triblespace::core::blob::BlobCache::new(store.clone()),
+            cache: triblespace_core::blob::BlobCache::new(store.clone()),
         }
     }
 }
@@ -979,19 +979,19 @@ impl FlatIndex {
 /// `(Embedding, View<[f32]>)`. Dropping the view drops the
 /// cache; the underlying store is unaffected.
 ///
-/// [c]: triblespace::core::blob::BlobCache
+/// [c]: triblespace_core::blob::BlobCache
 #[doc(hidden)]
 pub struct AttachedFlatIndex<'a, B>
 where
-    B: triblespace::core::repo::BlobStoreGet<Blake3>,
+    B: triblespace_core::repo::BlobStoreGet<Blake3>,
 {
     index: &'a FlatIndex,
-    cache: triblespace::core::blob::BlobCache<B, Blake3, Embedding, anybytes::View<[f32]>>,
+    cache: triblespace_core::blob::BlobCache<B, Blake3, Embedding, anybytes::View<[f32]>>,
 }
 
 impl<'a, B> AttachedFlatIndex<'a, B>
 where
-    B: triblespace::core::repo::BlobStoreGet<Blake3>,
+    B: triblespace_core::repo::BlobStoreGet<Blake3>,
 {
     /// The inner index.
     pub fn index(&self) -> &FlatIndex {
@@ -1075,7 +1075,7 @@ impl FlatIndex {
 
 impl<'a, B> crate::constraint::SimilaritySearch for AttachedHNSWIndex<'a, B>
 where
-    B: triblespace::core::repo::BlobStoreGet<Blake3>,
+    B: triblespace_core::repo::BlobStoreGet<Blake3>,
 {
     fn neighbours_above(
         &self,
@@ -1103,7 +1103,7 @@ where
 
 impl<'a, B> crate::constraint::SimilaritySearch for AttachedFlatIndex<'a, B>
 where
-    B: triblespace::core::repo::BlobStoreGet<Blake3>,
+    B: triblespace_core::repo::BlobStoreGet<Blake3>,
 {
     fn neighbours_above(
         &self,
@@ -1133,9 +1133,9 @@ where
 mod tests {
     use super::*;
 
-    use triblespace::core::blob::MemoryBlobStore;
-    use triblespace::core::repo::BlobStore;
-    use triblespace::core::value::schemas::hash::Blake3;
+    use triblespace_core::blob::MemoryBlobStore;
+    use triblespace_core::repo::BlobStore;
+    use triblespace_core::value::schemas::hash::Blake3;
 
     /// Put `vec` into `store` as a normalized [`Embedding`] blob
     /// and return the handle.

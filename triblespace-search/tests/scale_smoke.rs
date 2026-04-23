@@ -6,7 +6,7 @@
 //! These tests are still fast — seconds, not minutes — so they
 //! stay in the default test run.
 
-use triblespace::core::id::{Id, RawId};
+use triblespace_core::id::{Id, RawId};
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::hnsw::HNSWBuilder;
@@ -116,9 +116,9 @@ fn hnsw_1k_vectors_recall_against_flat() {
     const N_DOCS: usize = 1_000;
     const DIM: usize = 32;
 
-    use triblespace::core::blob::MemoryBlobStore;
-    use triblespace::core::repo::BlobStore;
-    use triblespace::core::value::schemas::hash::Blake3;
+    use triblespace_core::blob::MemoryBlobStore;
+    use triblespace_core::repo::BlobStore;
+    use triblespace_core::value::schemas::hash::Blake3;
     use triblespace_search::schemas::put_embedding;
 
     let mut rng = SplitMix64(0xFACE_FEED);
@@ -246,9 +246,9 @@ fn succinct_hnsw_1k_docs_matches_naive() {
     const DIM: usize = 16;
     use std::collections::HashSet;
 
-    use triblespace::core::blob::MemoryBlobStore;
-    use triblespace::core::repo::BlobStore;
-    use triblespace::core::value::schemas::hash::Blake3;
+    use triblespace_core::blob::MemoryBlobStore;
+    use triblespace_core::repo::BlobStore;
+    use triblespace_core::value::schemas::hash::Blake3;
     use triblespace_search::schemas::put_embedding;
 
     let mut rng = SplitMix64(0xBADF00D);
@@ -384,8 +384,8 @@ fn bm25_quantization_preserves_top10() {
             continue;
         }
 
-        let mut raw_scores: Vec<(triblespace::core::value::RawValue, f32)> = Vec::new();
-        let mut q_scores: Vec<(triblespace::core::value::RawValue, f32)> = Vec::new();
+        let mut raw_scores: Vec<(triblespace_core::value::RawValue, f32)> = Vec::new();
+        let mut q_scores: Vec<(triblespace_core::value::RawValue, f32)> = Vec::new();
         for term in &terms {
             for (d, s) in idx.query_term(term) {
                 let d_raw = d.raw;
@@ -421,9 +421,9 @@ fn flat_1k_vectors_threshold_finds_self() {
     const N_DOCS: usize = 1_000;
     const DIM: usize = 32;
 
-    use triblespace::core::blob::MemoryBlobStore;
-    use triblespace::core::repo::BlobStore;
-    use triblespace::core::value::schemas::hash::Blake3;
+    use triblespace_core::blob::MemoryBlobStore;
+    use triblespace_core::repo::BlobStore;
+    use triblespace_core::value::schemas::hash::Blake3;
     use triblespace_search::schemas::put_embedding;
 
     let mut rng = SplitMix64(0x1234_5678);

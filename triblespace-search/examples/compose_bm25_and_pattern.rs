@@ -12,12 +12,12 @@
 //! cargo run --example compose_bm25_and_pattern
 //! ```
 
-use triblespace::core::and;
-use triblespace::core::examples::literature;
-use triblespace::core::find;
-use triblespace::core::id::{ExclusiveId, Id};
-use triblespace::core::trible::TribleSet;
-use triblespace::macros::{entity, pattern};
+use triblespace_core::and;
+use triblespace_core::examples::literature;
+use triblespace_core::find;
+use triblespace_core::id::{ExclusiveId, Id};
+use triblespace_core::trible::TribleSet;
+use triblespace_core::macros::{entity, pattern};
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::tokens::hash_tokens;

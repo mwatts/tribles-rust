@@ -20,7 +20,7 @@
 //! ```
 //! # use triblespace_search::bm25::BM25Builder;
 //! # use triblespace_search::tokens::hash_tokens;
-//! # use triblespace::core::id::Id;
+//! # use triblespace_core::id::Id;
 //! let docs = [
 //!     (Id::new([1; 16]).unwrap(), "the quick brown fox"),
 //!     (Id::new([2; 16]).unwrap(), "the lazy brown dog"),
@@ -50,9 +50,9 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
-use triblespace::core::id::Id;
-use triblespace::core::value::schemas::genid::GenId;
-use triblespace::core::value::{RawValue, ToValue, Value, ValueSchema};
+use triblespace_core::id::Id;
+use triblespace_core::value::schemas::genid::GenId;
+use triblespace_core::value::{RawValue, ToValue, Value, ValueSchema};
 
 
 /// Classic BM25 tuning. Defaults match Robertson & Zaragoza 2009.
@@ -584,8 +584,8 @@ mod tests {
 
     #[test]
     fn insert_indexes_by_string_key() {
-        use triblespace::core::value::schemas::shortstring::ShortString;
-        use triblespace::core::value::{ToValue, Value};
+        use triblespace_core::value::schemas::shortstring::ShortString;
+        use triblespace_core::value::{ToValue, Value};
 
         let mut b: BM25Builder<ShortString> = BM25Builder::typed();
         let red: Value<ShortString> = "red".to_value();

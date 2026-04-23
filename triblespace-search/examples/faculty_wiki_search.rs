@@ -31,16 +31,16 @@ use std::error::Error;
 
 use tempfile::tempdir;
 
-use triblespace::core::find;
-use triblespace::core::id::{ExclusiveId, Id};
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
-use triblespace::core::trible::TribleSet;
-use triblespace::core::value::schemas::hash::{Blake3, Handle};
-use triblespace::core::value::Value;
+use triblespace_core::find;
+use triblespace_core::id::{ExclusiveId, Id};
+use triblespace_core::repo::pile::Pile;
+use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
+use triblespace_core::trible::TribleSet;
+use triblespace_core::value::schemas::hash::{Blake3, Handle};
+use triblespace_core::value::Value;
 use anybytes::View;
-use triblespace::macros::{entity, pattern};
-use triblespace::prelude::blobschemas;
+use triblespace_core::macros::{entity, pattern};
+use triblespace_core::prelude::blobschemas;
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::succinct::{SuccinctBM25Blob, SuccinctBM25Index};
@@ -48,7 +48,8 @@ use triblespace_search::tokens::hash_tokens;
 
 // ─ namespace ─ ids minted with `trible genid` on 2026-04-21.
 mod wiki {
-    use triblespace::prelude::*;
+    use triblespace_core::prelude::*;
+    use triblespace_core::macros::attributes;
     use triblespace_search::succinct::SuccinctBM25Blob;
 
     attributes! {
@@ -65,8 +66,8 @@ mod wiki {
     // alongside the attributes; lives in its own constant so
     // the refresh path can write the trible and the query path
     // can read it.
-    pub const INDEX_ANCHOR: triblespace::core::id::Id =
-        triblespace::core::id::id_hex!("5C6F102420709DBB910B197D4B91E83E");
+    pub const INDEX_ANCHOR: triblespace_core::id::Id =
+        triblespace_core::id::id_hex!("5C6F102420709DBB910B197D4B91E83E");
 }
 
 fn fragment_id(byte: u8) -> Id {
@@ -156,7 +157,7 @@ fn query(
     text: &str,
     top_k: usize,
 ) -> Result<Vec<(Id, f32, String)>, Box<dyn Error>> {
-    use triblespace::core::and;
+    use triblespace_core::and;
 
     // Resolve the anchor → handle.
     let anchor = wiki::INDEX_ANCHOR;

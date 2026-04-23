@@ -9,9 +9,9 @@
 //! query" flow a real faculty would use.
 
 use tempfile::tempdir;
-use triblespace::core::id::Id;
-use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
+use triblespace_core::id::Id;
+use triblespace_core::repo::pile::Pile;
+use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::hnsw::HNSWBuilder;
@@ -39,7 +39,7 @@ fn succinct_bm25_survives_pile_round_trip() {
     let original = b.build();
 
     let handle = {
-        let mut pile = Pile::<triblespace::core::value::schemas::hash::Blake3>::open(&pile_path)
+        let mut pile = Pile::<triblespace_core::value::schemas::hash::Blake3>::open(&pile_path)
             .expect("open pile");
         pile.refresh().expect("refresh empty pile");
         let h = pile
@@ -50,7 +50,7 @@ fn succinct_bm25_survives_pile_round_trip() {
     };
 
     // Reopen — exercises the actual on-disk load path.
-    let mut pile = Pile::<triblespace::core::value::schemas::hash::Blake3>::open(&pile_path)
+    let mut pile = Pile::<triblespace_core::value::schemas::hash::Blake3>::open(&pile_path)
         .expect("reopen pile");
     pile.refresh().expect("refresh");
     let reader = pile.reader().expect("reader");
@@ -76,7 +76,7 @@ fn succinct_bm25_survives_pile_round_trip() {
 #[test]
 fn succinct_hnsw_survives_pile_round_trip() {
     use std::collections::HashSet;
-    use triblespace::core::value::schemas::hash::Blake3;
+    use triblespace_core::value::schemas::hash::Blake3;
     use triblespace_search::schemas::put_embedding;
 
     let dir = tempdir().expect("tempdir");

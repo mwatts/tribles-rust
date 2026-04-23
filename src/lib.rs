@@ -10,6 +10,12 @@ pub use triblespace_core as core;
 #[cfg(feature = "net")]
 pub use triblespace_net as net;
 
+/// Content-addressed BM25 + HNSW search indexes on triblespace piles.
+/// See [`search::bm25`], [`search::hnsw`], [`search::constraint`] for the
+/// query-engine integration. Gated behind the `search` feature.
+#[cfg(feature = "search")]
+pub use triblespace_search as search;
+
 pub mod macros {
     pub use triblespace_core::macros::id_hex;
     pub use triblespace_macros::{

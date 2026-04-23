@@ -25,10 +25,10 @@
 
 use std::convert::Infallible;
 
-use triblespace::core::id::Id;
-use triblespace::core::id_hex;
-use triblespace::core::metadata::ConstId;
-use triblespace::core::value::{Value, ValueSchema};
+use triblespace_core::id::Id;
+use triblespace_core::id_hex;
+use triblespace_core::metadata::ConstId;
+use triblespace_core::value::{Value, ValueSchema};
 
 /// Term schema for [`hash_tokens`] and [`code_tokens`] — both
 /// produce Blake3 hashes of a lowercased word / code segment.
@@ -550,8 +550,8 @@ mod tests {
         // terms and querying for a 2-word phrase recovers only
         // docs that contain those two words adjacently.
         use crate::bm25::BM25Builder;
-        use triblespace::core::id::Id;
-        use triblespace::core::value::schemas::genid::GenId;
+        use triblespace_core::id::Id;
+        use triblespace_core::value::schemas::genid::GenId;
 
         fn iid(byte: u8) -> Id {
             Id::new([byte; 16]).unwrap()

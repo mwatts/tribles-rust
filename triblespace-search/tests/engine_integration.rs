@@ -5,11 +5,11 @@
 //! isolation; this test is the belt-and-braces check that the
 //! full protocol holds in a real join.
 
-use triblespace::core::id::Id;
-use triblespace::core::query::intersectionconstraint::IntersectionConstraint;
-use triblespace::core::query::{Binding, Constraint, Variable, VariableContext};
-use triblespace::core::value::schemas::genid::GenId;
-use triblespace::core::value::{RawValue, ToValue, Value};
+use triblespace_core::id::Id;
+use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
+use triblespace_core::query::{Binding, Constraint, Variable, VariableContext};
+use triblespace_core::value::schemas::genid::GenId;
+use triblespace_core::value::{RawValue, ToValue, Value};
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::succinct::SuccinctBM25Index;

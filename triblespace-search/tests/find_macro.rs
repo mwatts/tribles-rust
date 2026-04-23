@@ -11,8 +11,8 @@
 
 use std::collections::HashSet;
 
-use triblespace::core::find;
-use triblespace::core::id::Id;
+use triblespace_core::find;
+use triblespace_core::id::Id;
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::succinct::SuccinctBM25Index;
@@ -168,7 +168,7 @@ fn find_no_projection_is_existence() {
 /// intersect correctly through the macro.
 #[test]
 fn find_intersection_of_two_terms() {
-    use triblespace::core::and;
+    use triblespace_core::and;
 
     let idx = sample_index();
     let fox = hash_tokens("fox")[0];
@@ -241,10 +241,10 @@ fn find_docs_and_scores_on_succinct() {
 #[test]
 fn find_hnsw_similar_on_succinct() {
     use std::collections::HashSet;
-    use triblespace::core::blob::MemoryBlobStore;
-    use triblespace::core::repo::BlobStore;
-    use triblespace::core::value::schemas::hash::{Blake3, Handle};
-    use triblespace::core::value::Value;
+    use triblespace_core::blob::MemoryBlobStore;
+    use triblespace_core::repo::BlobStore;
+    use triblespace_core::value::schemas::hash::{Blake3, Handle};
+    use triblespace_core::value::Value;
     use triblespace_search::hnsw::HNSWBuilder;
     use triblespace_search::schemas::{put_embedding, Embedding};
 
@@ -402,11 +402,11 @@ fn bm25_query_matches_query_multi() {
 /// title mentions 'fox' AND are authored by the known author X."
 #[test]
 fn find_bm25_composed_with_pattern() {
-    use triblespace::core::and;
-    use triblespace::core::examples::literature;
-    use triblespace::core::id::ExclusiveId;
-    use triblespace::core::trible::TribleSet;
-    use triblespace::macros::{entity, pattern};
+    use triblespace_core::and;
+    use triblespace_core::examples::literature;
+    use triblespace_core::id::ExclusiveId;
+    use triblespace_core::trible::TribleSet;
+    use triblespace_core::macros::{entity, pattern};
 
     // Fixed Ids keep the test deterministic; `ExclusiveId::force_ref`
     // gives `entity!` the `&ExclusiveId` it expects.

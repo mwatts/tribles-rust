@@ -23,10 +23,10 @@ use std::time::Instant;
 
 use anybytes::area::ByteArea;
 
-use triblespace::core::blob::{BlobCache, MemoryBlobStore};
-use triblespace::core::repo::BlobStore;
-use triblespace::core::value::schemas::hash::{Blake3, Handle};
-use triblespace::core::value::Value;
+use triblespace_core::blob::{BlobCache, MemoryBlobStore};
+use triblespace_core::repo::BlobStore;
+use triblespace_core::value::schemas::hash::{Blake3, Handle};
+use triblespace_core::value::Value;
 
 use triblespace_search::hnsw::HNSWBuilder;
 use triblespace_search::ring::RingGraph;

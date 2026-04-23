@@ -39,16 +39,16 @@ use anybytes::{ByteArea, Bytes};
 use jerky::int_vectors::compact_vector::CompactVectorMeta;
 use jerky::int_vectors::{CompactVector, CompactVectorBuilder};
 use jerky::serialization::Serializable;
-use triblespace::core::blob::schemas::succinctarchive::{
+use triblespace_core::blob::schemas::succinctarchive::{
     CompressedUniverse, CompressedUniverseMeta, Universe,
 };
-use triblespace::core::blob::{Blob, BlobSchema, ToBlob, TryFromBlob};
-use triblespace::core::id::Id;
-use triblespace::core::id_hex;
-use triblespace::core::metadata::{ConstDescribe, ConstId};
-use triblespace::core::query::Variable;
-use triblespace::core::value::schemas::hash::Blake3;
-use triblespace::core::value::{RawValue, Value, ValueSchema};
+use triblespace_core::blob::{Blob, BlobSchema, ToBlob, TryFromBlob};
+use triblespace_core::id::Id;
+use triblespace_core::id_hex;
+use triblespace_core::metadata::{ConstDescribe, ConstId};
+use triblespace_core::query::Variable;
+use triblespace_core::value::schemas::hash::Blake3;
+use triblespace_core::value::{RawValue, Value, ValueSchema};
 
 use crate::schemas::{EmbHandle, Embedding};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -805,9 +805,9 @@ impl SuccinctGraph {
 /// # Example
 ///
 /// ```
-/// use triblespace::core::blob::MemoryBlobStore;
-/// use triblespace::core::repo::BlobStore;
-/// use triblespace::core::value::schemas::hash::Blake3;
+/// use triblespace_core::blob::MemoryBlobStore;
+/// use triblespace_core::repo::BlobStore;
+/// use triblespace_core::value::schemas::hash::Blake3;
 /// use triblespace_search::hnsw::HNSWBuilder;
 /// use triblespace_search::schemas::put_embedding;
 /// use triblespace_search::succinct::SuccinctHNSWIndex;
@@ -842,7 +842,7 @@ pub struct SuccinctHNSWIndex {
     /// identity. Distance evaluations resolve handles through
     /// a caller-supplied [`BlobStoreGet`][g] at query time.
     ///
-    /// [g]: triblespace::core::repo::BlobStoreGet
+    /// [g]: triblespace_core::repo::BlobStoreGet
     handles: FixedBytesTable<32>,
     graph: SuccinctGraph,
 }
@@ -936,14 +936,14 @@ impl SuccinctHNSWIndex {
     /// `B: Clone` so the cache can own the store; typical
     /// readers are cheap-clone.
     ///
-    /// [c]: triblespace::core::blob::BlobCache
+    /// [c]: triblespace_core::blob::BlobCache
     pub fn attach<'a, B>(&'a self, store: &B) -> AttachedSuccinctHNSWIndex<'a, B>
     where
-        B: triblespace::core::repo::BlobStoreGet<Blake3> + Clone,
+        B: triblespace_core::repo::BlobStoreGet<Blake3> + Clone,
     {
         AttachedSuccinctHNSWIndex {
             index: self,
-            cache: triblespace::core::blob::BlobCache::new(store.clone()),
+            cache: triblespace_core::blob::BlobCache::new(store.clone()),
             ef_search: 200,
         }
     }
@@ -1142,19 +1142,19 @@ impl SuccinctHNSWIndex {
 /// those into a single blob-fetch + deserialize per node per
 /// view.
 ///
-/// [c]: triblespace::core::blob::BlobCache
+/// [c]: triblespace_core::blob::BlobCache
 pub struct AttachedSuccinctHNSWIndex<'a, B>
 where
-    B: triblespace::core::repo::BlobStoreGet<Blake3>,
+    B: triblespace_core::repo::BlobStoreGet<Blake3>,
 {
     index: &'a SuccinctHNSWIndex,
-    cache: triblespace::core::blob::BlobCache<B, Blake3, Embedding, anybytes::View<[f32]>>,
+    cache: triblespace_core::blob::BlobCache<B, Blake3, Embedding, anybytes::View<[f32]>>,
     ef_search: usize,
 }
 
 impl<'a, B> AttachedSuccinctHNSWIndex<'a, B>
 where
-    B: triblespace::core::repo::BlobStoreGet<Blake3>,
+    B: triblespace_core::repo::BlobStoreGet<Blake3>,
 {
     /// Back-reference to the inner index.
     pub fn index(&self) -> &SuccinctHNSWIndex {
@@ -1381,7 +1381,7 @@ where
 
 impl<'a, B> crate::constraint::SimilaritySearch for AttachedSuccinctHNSWIndex<'a, B>
 where
-    B: triblespace::core::repo::BlobStoreGet<Blake3>,
+    B: triblespace_core::repo::BlobStoreGet<Blake3>,
 {
     fn neighbours_above(
         &self,
@@ -1435,7 +1435,7 @@ where
 /// # Example
 ///
 /// ```
-/// use triblespace::core::id::Id;
+/// use triblespace_core::id::Id;
 /// use triblespace_search::bm25::BM25Builder;
 /// use triblespace_search::succinct::SuccinctBM25Index;
 /// use triblespace_search::tokens::hash_tokens;
@@ -1456,7 +1456,7 @@ where
 /// assert!(blob_bytes.len() > 0);
 /// ```
 pub struct SuccinctBM25Index<
-    D: ValueSchema = triblespace::core::value::schemas::genid::GenId,
+    D: ValueSchema = triblespace_core::value::schemas::genid::GenId,
     T: ValueSchema = crate::tokens::WordHash,
 > {
     /// Sorted, deduplicated, compressed doc-key table. For
@@ -1651,7 +1651,7 @@ impl<D: ValueSchema, T: ValueSchema> SuccinctBM25Index<D, T> {
     /// the succinct view.
     pub fn docs_containing(
         &self,
-        doc: triblespace::core::query::Variable<D>,
+        doc: triblespace_core::query::Variable<D>,
         term: Value<T>,
     ) -> crate::constraint::DocsContainingTerm<'_, SuccinctBM25Index<D, T>, D> {
         crate::constraint::DocsContainingTerm::new(self, doc, term.raw)
@@ -1663,8 +1663,8 @@ impl<D: ValueSchema, T: ValueSchema> SuccinctBM25Index<D, T> {
     /// succinct view.
     pub fn docs_and_scores(
         &self,
-        doc: triblespace::core::query::Variable<D>,
-        score: triblespace::core::query::Variable<crate::schemas::F32LE>,
+        doc: triblespace_core::query::Variable<D>,
+        score: triblespace_core::query::Variable<crate::schemas::F32LE>,
         term: Value<T>,
     ) -> crate::constraint::BM25ScoredPostings<'_, SuccinctBM25Index<D, T>, D> {
         crate::constraint::BM25ScoredPostings::new(self, doc, score, term.raw)
@@ -1915,7 +1915,7 @@ impl<D: ValueSchema, T: ValueSchema> SuccinctBM25Index<D, T> {
 }
 
 /// GenId-specific convenience: decode posting keys as [`Id`]s.
-impl<T: ValueSchema> SuccinctBM25Index<triblespace::core::value::schemas::genid::GenId, T> {
+impl<T: ValueSchema> SuccinctBM25Index<triblespace_core::value::schemas::genid::GenId, T> {
     /// [`query_term`][Self::query_term] with each key decoded
     /// as an [`Id`] (empty for keys that aren't valid GenId
     /// bit-patterns).
@@ -2092,7 +2092,7 @@ impl TryFromBlob<SuccinctHNSWBlob> for SuccinctHNSWIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use triblespace::core::repo::BlobStore;
+    use triblespace_core::repo::BlobStore;
 
     #[test]
     fn empty_roundtrip() {
@@ -2257,7 +2257,7 @@ mod tests {
     fn succinct_bm25_matches_naive_on_sample() {
         use crate::bm25::BM25Builder;
         use crate::tokens::hash_tokens;
-        use triblespace::core::id::Id;
+        use triblespace_core::id::Id;
 
         fn iid(byte: u8) -> Id {
             Id::new([byte; 16]).unwrap()
@@ -2324,7 +2324,7 @@ mod tests {
         // out in either order and the comparison flaps.
         use crate::bm25::BM25Builder;
         use crate::tokens::hash_tokens;
-        use triblespace::core::id::Id;
+        use triblespace_core::id::Id;
         fn iid(byte: u8) -> Id {
             Id::new([byte; 16]).unwrap()
         }
@@ -2357,7 +2357,7 @@ mod tests {
     fn build_succinct_sample() -> SuccinctBM25Index {
         use crate::bm25::BM25Builder;
         use crate::tokens::hash_tokens;
-        use triblespace::core::id::Id;
+        use triblespace_core::id::Id;
         fn iid(byte: u8) -> Id {
             Id::new([byte; 16]).unwrap()
         }
@@ -2416,7 +2416,7 @@ mod tests {
     #[test]
     fn succinct_bm25_rejects_short_header() {
         let err = SuccinctBM25Index::<
-            triblespace::core::value::schemas::genid::GenId,
+            triblespace_core::value::schemas::genid::GenId,
             crate::tokens::WordHash,
         >::try_from_bytes(&[0u8; 10])
         .unwrap_err();
@@ -2433,7 +2433,7 @@ mod tests {
         let bytes = build_succinct_sample().to_bytes();
         let truncated = &bytes[..bytes.len() - 2];
         let err = SuccinctBM25Index::<
-            triblespace::core::value::schemas::genid::GenId,
+            triblespace_core::value::schemas::genid::GenId,
             crate::tokens::WordHash,
         >::try_from_bytes(truncated)
         .unwrap_err();
@@ -2442,9 +2442,9 @@ mod tests {
 
     #[test]
     fn succinct_bm25_blob_schema_round_trip() {
-        use triblespace::core::blob::{ToBlob, TryFromBlob};
+        use triblespace_core::blob::{ToBlob, TryFromBlob};
         let original = build_succinct_sample();
-        let blob: triblespace::core::blob::Blob<SuccinctBM25Blob> = (&original).to_blob();
+        let blob: triblespace_core::blob::Blob<SuccinctBM25Blob> = (&original).to_blob();
         let reloaded: SuccinctBM25Index =
             SuccinctBM25Index::try_from_blob(blob).expect("valid blob");
         assert_eq!(reloaded.doc_count(), original.doc_count());
@@ -2517,9 +2517,9 @@ mod tests {
     #[test]
     fn succinct_hnsw_matches_naive_on_sample() {
         use crate::hnsw::HNSWBuilder;
-        use triblespace::core::blob::MemoryBlobStore;
-        use triblespace::core::repo::BlobStore;
-        use triblespace::core::value::schemas::hash::Blake3;
+        use triblespace_core::blob::MemoryBlobStore;
+        use triblespace_core::repo::BlobStore;
+        use triblespace_core::value::schemas::hash::Blake3;
 
         // Small deterministic corpus of 4-D vectors. with_seed
         // locks the level sampling so the graph is reproducible.
@@ -2558,21 +2558,21 @@ mod tests {
 
     fn build_succinct_hnsw_sample() -> (
         SuccinctHNSWIndex,
-        triblespace::core::blob::MemoryBlobStore<
-            triblespace::core::value::schemas::hash::Blake3,
+        triblespace_core::blob::MemoryBlobStore<
+            triblespace_core::value::schemas::hash::Blake3,
         >,
         Vec<
-            triblespace::core::value::Value<
-                triblespace::core::value::schemas::hash::Handle<
-                    triblespace::core::value::schemas::hash::Blake3,
+            triblespace_core::value::Value<
+                triblespace_core::value::schemas::hash::Handle<
+                    triblespace_core::value::schemas::hash::Blake3,
                     crate::schemas::Embedding,
                 >,
             >,
         >,
     ) {
         use crate::hnsw::HNSWBuilder;
-        use triblespace::core::blob::MemoryBlobStore;
-        use triblespace::core::value::schemas::hash::Blake3;
+        use triblespace_core::blob::MemoryBlobStore;
+        use triblespace_core::value::schemas::hash::Blake3;
         let mut store = MemoryBlobStore::<Blake3>::new();
         let mut b = HNSWBuilder::new(4).with_seed(17);
         let mut handles = Vec::new();
@@ -2619,9 +2619,9 @@ mod tests {
     #[test]
     fn succinct_hnsw_empty_round_trip() {
         use crate::hnsw::HNSWBuilder;
-        use triblespace::core::blob::MemoryBlobStore;
-        use triblespace::core::repo::BlobStore;
-        use triblespace::core::value::schemas::hash::Blake3;
+        use triblespace_core::blob::MemoryBlobStore;
+        use triblespace_core::repo::BlobStore;
+        use triblespace_core::value::schemas::hash::Blake3;
         let idx = HNSWBuilder::new(3).build();
         let bytes = idx.to_bytes();
         let reloaded: SuccinctHNSWIndex =
@@ -2662,9 +2662,9 @@ mod tests {
 
     #[test]
     fn succinct_hnsw_blob_schema_round_trip() {
-        use triblespace::core::blob::{ToBlob, TryFromBlob};
+        use triblespace_core::blob::{ToBlob, TryFromBlob};
         let (original, _, _) = build_succinct_hnsw_sample();
-        let blob: triblespace::core::blob::Blob<SuccinctHNSWBlob> = (&original).to_blob();
+        let blob: triblespace_core::blob::Blob<SuccinctHNSWBlob> = (&original).to_blob();
         let reloaded: SuccinctHNSWIndex =
             SuccinctHNSWIndex::try_from_blob(blob).expect("valid blob");
         assert_eq!(reloaded.doc_count(), original.doc_count());
@@ -2681,9 +2681,9 @@ mod tests {
     #[test]
     fn succinct_hnsw_empty_index() {
         use crate::hnsw::HNSWBuilder;
-        use triblespace::core::blob::MemoryBlobStore;
-        use triblespace::core::repo::BlobStore;
-        use triblespace::core::value::schemas::hash::Blake3;
+        use triblespace_core::blob::MemoryBlobStore;
+        use triblespace_core::repo::BlobStore;
+        use triblespace_core::value::schemas::hash::Blake3;
         let succinct = HNSWBuilder::new(3).build();
         assert_eq!(succinct.doc_count(), 0);
         let mut store: MemoryBlobStore<Blake3> = MemoryBlobStore::new();
@@ -2713,7 +2713,7 @@ mod tests {
         // should fit in fewer bytes once postings bit-pack.
         use crate::bm25::BM25Builder;
         use crate::tokens::hash_tokens;
-        use triblespace::core::id::Id;
+        use triblespace_core::id::Id;
 
         // Build a corpus large enough that the bit-packing wins
         // dominate the per-blob fixed overhead (~212B header +

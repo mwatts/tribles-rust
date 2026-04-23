@@ -5,9 +5,9 @@
 //! cargo run --example query_demo
 //! ```
 
-use triblespace::core::id::Id;
-use triblespace::core::value::schemas::genid::GenId;
-use triblespace::core::value::{ToValue, Value};
+use triblespace_core::id::Id;
+use triblespace_core::value::schemas::genid::GenId;
+use triblespace_core::value::{ToValue, Value};
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::succinct::SuccinctBM25Index;
 use triblespace_search::tokens::hash_tokens;

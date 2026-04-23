@@ -19,17 +19,17 @@
 //!
 //! [s]: triblespace_search::constraint::Similar
 
-use triblespace::core::and;
-use triblespace::core::blob::MemoryBlobStore;
-use triblespace::core::find;
-use triblespace::core::id::{ExclusiveId, Id};
-use triblespace::core::query::temp;
-use triblespace::core::repo::BlobStore;
-use triblespace::core::trible::TribleSet;
-use triblespace::core::value::schemas::hash::{Blake3, Handle};
-use triblespace::core::value::Value;
-use triblespace::macros::{entity, pattern};
-use triblespace::prelude::attributes;
+use triblespace_core::and;
+use triblespace_core::blob::MemoryBlobStore;
+use triblespace_core::find;
+use triblespace_core::id::{ExclusiveId, Id};
+use triblespace_core::query::temp;
+use triblespace_core::repo::BlobStore;
+use triblespace_core::trible::TribleSet;
+use triblespace_core::value::schemas::hash::{Blake3, Handle};
+use triblespace_core::value::Value;
+use triblespace_core::macros::{entity, pattern};
+use triblespace_core::macros::attributes;
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::hnsw::HNSWBuilder;

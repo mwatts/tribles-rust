@@ -28,10 +28,10 @@
 
 use std::collections::HashSet;
 
-use triblespace::core::query::{Binding, Constraint, Variable, VariableId, VariableSet};
-use triblespace::core::value::schemas::genid::GenId;
-use triblespace::core::value::schemas::hash::{Blake3, Handle};
-use triblespace::core::value::{RawValue, Value};
+use triblespace_core::query::{Binding, Constraint, Variable, VariableId, VariableSet};
+use triblespace_core::value::schemas::genid::GenId;
+use triblespace_core::value::schemas::hash::{Blake3, Handle};
+use triblespace_core::value::{RawValue, Value};
 
 use crate::bm25::BM25Index;
 use crate::schemas::{Embedding, F32LE};
@@ -67,7 +67,7 @@ pub trait BM25Queryable {
     }
 }
 
-impl<D: triblespace::core::value::ValueSchema, T: triblespace::core::value::ValueSchema>
+impl<D: triblespace_core::value::ValueSchema, T: triblespace_core::value::ValueSchema>
     BM25Queryable for BM25Index<D, T>
 {
     fn query_term_boxed<'a>(
@@ -87,7 +87,7 @@ impl<D: triblespace::core::value::ValueSchema, T: triblespace::core::value::Valu
 }
 
 #[cfg(feature = "succinct")]
-impl<D: triblespace::core::value::ValueSchema, T: triblespace::core::value::ValueSchema>
+impl<D: triblespace_core::value::ValueSchema, T: triblespace_core::value::ValueSchema>
     BM25Queryable for crate::succinct::SuccinctBM25Index<D, T>
 {
     fn query_term_boxed<'a>(
@@ -114,7 +114,7 @@ impl<D: triblespace::core::value::ValueSchema, T: triblespace::core::value::Valu
 
 /// Constrains a `Variable<S>` (doc) to the 32-byte
 /// [`RawValue`]s in the posting list of the pinned term. `S` is
-/// whatever [`triblespace::core::value::ValueSchema`] the caller
+/// whatever [`triblespace_core::value::ValueSchema`] the caller
 /// keys the index with — typically [`GenId`] for entity-keyed
 /// indexes, but any schema works (string titles, tags, fragment
 /// hashes, etc.).
@@ -127,7 +127,7 @@ impl<D: triblespace::core::value::ValueSchema, T: triblespace::core::value::Valu
 /// equivalent).
 pub struct DocsContainingTerm<'a, I: BM25Queryable + ?Sized, S = GenId>
 where
-    S: triblespace::core::value::ValueSchema,
+    S: triblespace_core::value::ValueSchema,
 {
     index: &'a I,
     doc: Variable<S>,
@@ -137,14 +137,14 @@ where
 
 impl<'a, I: BM25Queryable + ?Sized, S> DocsContainingTerm<'a, I, S>
 where
-    S: triblespace::core::value::ValueSchema,
+    S: triblespace_core::value::ValueSchema,
 {
     pub fn new(index: &'a I, doc: Variable<S>, term: [u8; 32]) -> Self {
         Self { index, doc, term }
     }
 }
 
-impl<D: triblespace::core::value::ValueSchema, T: triblespace::core::value::ValueSchema>
+impl<D: triblespace_core::value::ValueSchema, T: triblespace_core::value::ValueSchema>
     BM25Index<D, T>
 {
     /// Produce a [`DocsContainingTerm`] constraint for use inside
@@ -163,7 +163,7 @@ impl<D: triblespace::core::value::ValueSchema, T: triblespace::core::value::Valu
 /// Encode an `f32` as an `F32LE`-schema raw value via the
 /// schema's `ToValue` impl.
 fn f32_to_raw_value(v: f32) -> RawValue {
-    triblespace::core::value::ToValue::<F32LE>::to_value(v).raw
+    triblespace_core::value::ToValue::<F32LE>::to_value(v).raw
 }
 
 /// Decode an `F32LE`-schema raw value back to `f32`. Every
@@ -188,7 +188,7 @@ fn raw_value_to_f32(raw: &RawValue) -> f32 {
 /// is identical from the engine's perspective.
 pub struct BM25ScoredPostings<'a, I: BM25Queryable + ?Sized, S = GenId>
 where
-    S: triblespace::core::value::ValueSchema,
+    S: triblespace_core::value::ValueSchema,
 {
     index: &'a I,
     doc: Variable<S>,
@@ -198,7 +198,7 @@ where
 
 impl<'a, I: BM25Queryable + ?Sized, S> BM25ScoredPostings<'a, I, S>
 where
-    S: triblespace::core::value::ValueSchema,
+    S: triblespace_core::value::ValueSchema,
 {
     pub fn new(index: &'a I, doc: Variable<S>, score: Variable<F32LE>, term: [u8; 32]) -> Self {
         Self {
@@ -210,7 +210,7 @@ where
     }
 }
 
-impl<D: triblespace::core::value::ValueSchema, T: triblespace::core::value::ValueSchema>
+impl<D: triblespace_core::value::ValueSchema, T: triblespace_core::value::ValueSchema>
     BM25Index<D, T>
 {
     /// Constraint that binds `doc` + `score` for each posting of
@@ -229,7 +229,7 @@ impl<D: triblespace::core::value::ValueSchema, T: triblespace::core::value::Valu
 
 impl<'a, I: BM25Queryable + ?Sized + 'a, S> Constraint<'a> for BM25ScoredPostings<'a, I, S>
 where
-    S: triblespace::core::value::ValueSchema + 'a,
+    S: triblespace_core::value::ValueSchema + 'a,
 {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.doc.index)
@@ -344,8 +344,8 @@ where
 /// # Example
 ///
 /// ```
-/// use triblespace::core::find;
-/// use triblespace::core::id::Id;
+/// use triblespace_core::find;
+/// use triblespace_core::id::Id;
 /// use triblespace_search::bm25::BM25Builder;
 /// use triblespace_search::tokens::hash_tokens;
 ///
@@ -370,7 +370,7 @@ where
 /// ```
 pub struct BM25MultiTermScored<S = GenId>
 where
-    S: triblespace::core::value::ValueSchema,
+    S: triblespace_core::value::ValueSchema,
 {
     doc: Variable<S>,
     score: Variable<F32LE>,
@@ -385,7 +385,7 @@ where
 
 impl<S> BM25MultiTermScored<S>
 where
-    S: triblespace::core::value::ValueSchema,
+    S: triblespace_core::value::ValueSchema,
 {
     /// Build a multi-term scored constraint from a pre-
     /// computed `(doc, score)` list and the tolerance the
@@ -426,7 +426,7 @@ fn aggregate_multi_term<I: BM25Queryable + ?Sized>(
     acc.into_iter().collect()
 }
 
-impl<D: triblespace::core::value::ValueSchema, T: triblespace::core::value::ValueSchema>
+impl<D: triblespace_core::value::ValueSchema, T: triblespace_core::value::ValueSchema>
     BM25Index<D, T>
 {
     /// Multi-term bag-of-words query. Binds `doc` + the summed
@@ -449,7 +449,7 @@ impl<D: triblespace::core::value::ValueSchema, T: triblespace::core::value::Valu
 }
 
 #[cfg(feature = "succinct")]
-impl<D: triblespace::core::value::ValueSchema, T: triblespace::core::value::ValueSchema>
+impl<D: triblespace_core::value::ValueSchema, T: triblespace_core::value::ValueSchema>
     crate::succinct::SuccinctBM25Index<D, T>
 {
     /// Succinct-side sibling of [`BM25Index::bm25_query`]. Same
@@ -476,7 +476,7 @@ impl<D: triblespace::core::value::ValueSchema, T: triblespace::core::value::Valu
 
 impl<'a, S> Constraint<'a> for BM25MultiTermScored<S>
 where
-    S: triblespace::core::value::ValueSchema + 'a,
+    S: triblespace_core::value::ValueSchema + 'a,
 {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.doc.index)
@@ -561,7 +561,7 @@ where
 
 impl<'a, I: BM25Queryable + ?Sized + 'a, S> Constraint<'a> for DocsContainingTerm<'a, I, S>
 where
-    S: triblespace::core::value::ValueSchema + 'a,
+    S: triblespace_core::value::ValueSchema + 'a,
 {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.doc.index)
@@ -674,13 +674,13 @@ pub trait SimilaritySearch {
 ///
 /// ```
 /// use std::collections::HashSet;
-/// use triblespace::core::and;
-/// use triblespace::core::blob::MemoryBlobStore;
-/// use triblespace::core::find;
-/// use triblespace::core::query::temp;
-/// use triblespace::core::repo::BlobStore;
-/// use triblespace::core::value::schemas::hash::Blake3;
-/// use triblespace::core::value::Value;
+/// use triblespace_core::and;
+/// use triblespace_core::blob::MemoryBlobStore;
+/// use triblespace_core::find;
+/// use triblespace_core::query::temp;
+/// use triblespace_core::repo::BlobStore;
+/// use triblespace_core::value::schemas::hash::Blake3;
+/// use triblespace_core::value::Value;
 /// use triblespace_search::hnsw::HNSWBuilder;
 /// use triblespace_search::schemas::{put_embedding, EmbHandle};
 ///
@@ -861,11 +861,11 @@ impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
 ///
 /// ```
 /// use std::collections::HashSet;
-/// use triblespace::core::blob::MemoryBlobStore;
-/// use triblespace::core::find;
-/// use triblespace::core::repo::BlobStore;
-/// use triblespace::core::value::schemas::hash::Blake3;
-/// use triblespace::core::value::Value;
+/// use triblespace_core::blob::MemoryBlobStore;
+/// use triblespace_core::find;
+/// use triblespace_core::repo::BlobStore;
+/// use triblespace_core::value::schemas::hash::Blake3;
+/// use triblespace_core::value::Value;
 /// use triblespace_search::hnsw::HNSWBuilder;
 /// use triblespace_search::schemas::{put_embedding, EmbHandle};
 ///
@@ -959,10 +959,10 @@ mod tests {
     use super::*;
     use crate::bm25::BM25Builder;
     use crate::tokens::hash_tokens;
-    use triblespace::core::blob::MemoryBlobStore;
-    use triblespace::core::id::Id;
-    use triblespace::core::repo::BlobStore;
-    use triblespace::core::value::ToValue;
+    use triblespace_core::blob::MemoryBlobStore;
+    use triblespace_core::id::Id;
+    use triblespace_core::repo::BlobStore;
+    use triblespace_core::value::ToValue;
 
     fn id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
@@ -996,7 +996,7 @@ mod tests {
     #[test]
     fn constraint_variables_is_singleton_of_doc() {
         let idx = sample_index();
-        let mut ctx = triblespace::core::query::VariableContext::new();
+        let mut ctx = triblespace_core::query::VariableContext::new();
         let doc: Variable<GenId> = ctx.next_variable();
         let term = hash_tokens("fox")[0];
         let c = idx.docs_containing(doc, term);
@@ -1016,7 +1016,7 @@ mod tests {
     #[test]
     fn constraint_estimate_is_doc_frequency() {
         let idx = sample_index();
-        let mut ctx = triblespace::core::query::VariableContext::new();
+        let mut ctx = triblespace_core::query::VariableContext::new();
         let doc: Variable<GenId> = ctx.next_variable();
         let term = hash_tokens("fox")[0];
         let c = idx.docs_containing(doc, term);
@@ -1031,7 +1031,7 @@ mod tests {
     #[test]
     fn constraint_proposes_posting_list_as_genid_values() {
         let idx = sample_index();
-        let mut ctx = triblespace::core::query::VariableContext::new();
+        let mut ctx = triblespace_core::query::VariableContext::new();
         let doc: Variable<GenId> = ctx.next_variable();
         let term = hash_tokens("fox")[0];
         let c = idx.docs_containing(doc, term);
@@ -1052,7 +1052,7 @@ mod tests {
     #[test]
     fn constraint_confirm_filters_non_matching_docs() {
         let idx = sample_index();
-        let mut ctx = triblespace::core::query::VariableContext::new();
+        let mut ctx = triblespace_core::query::VariableContext::new();
         let doc: Variable<GenId> = ctx.next_variable();
         let term = hash_tokens("fox")[0];
         let c = idx.docs_containing(doc, term);
@@ -1074,7 +1074,7 @@ mod tests {
     #[test]
     fn constraint_satisfied_checks_bound_doc() {
         let idx = sample_index();
-        let mut ctx = triblespace::core::query::VariableContext::new();
+        let mut ctx = triblespace_core::query::VariableContext::new();
         let doc: Variable<GenId> = ctx.next_variable();
         let term = hash_tokens("fox")[0];
         let c = idx.docs_containing(doc, term);
@@ -1096,7 +1096,7 @@ mod tests {
     #[test]
     fn scored_constraint_proposes_both_variables() {
         let idx = sample_index();
-        let mut ctx = triblespace::core::query::VariableContext::new();
+        let mut ctx = triblespace_core::query::VariableContext::new();
         let doc: Variable<GenId> = ctx.next_variable();
         let score: Variable<F32LE> = ctx.next_variable();
         let term = hash_tokens("fox")[0];
@@ -1138,7 +1138,7 @@ mod tests {
         b.insert(id(3), hash_tokens("lazy dog"));
         let idx = b.build();
 
-        let mut ctx = triblespace::core::query::VariableContext::new();
+        let mut ctx = triblespace_core::query::VariableContext::new();
         let doc: Variable<GenId> = ctx.next_variable();
         let score: Variable<F32LE> = ctx.next_variable();
         let term = hash_tokens("fox")[0];
@@ -1170,7 +1170,7 @@ mod tests {
     #[test]
     fn scored_constraint_binds_score_given_doc() {
         let idx = sample_index();
-        let mut ctx = triblespace::core::query::VariableContext::new();
+        let mut ctx = triblespace_core::query::VariableContext::new();
         let doc: Variable<GenId> = ctx.next_variable();
         let score: Variable<F32LE> = ctx.next_variable();
         let term = hash_tokens("fox")[0];
@@ -1188,7 +1188,7 @@ mod tests {
     #[test]
     fn scored_constraint_confirm_filters_bad_scores() {
         let idx = sample_index();
-        let mut ctx = triblespace::core::query::VariableContext::new();
+        let mut ctx = triblespace_core::query::VariableContext::new();
         let doc: Variable<GenId> = ctx.next_variable();
         let score: Variable<F32LE> = ctx.next_variable();
         let term = hash_tokens("fox")[0];
@@ -1246,7 +1246,7 @@ mod tests {
         let reader = store.reader().unwrap();
         let view = flat.attach(&reader);
 
-        let mut ctx = triblespace::core::query::VariableContext::new();
+        let mut ctx = triblespace_core::query::VariableContext::new();
         let a: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
         let b: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
         let c = view.similar(a, b, 0.8);
@@ -1271,7 +1271,7 @@ mod tests {
         let reader = store.reader().unwrap();
         let view = flat.attach(&reader);
 
-        let mut ctx = triblespace::core::query::VariableContext::new();
+        let mut ctx = triblespace_core::query::VariableContext::new();
         let a: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
         let b: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
         let c = view.similar(a, b, 0.8);
@@ -1292,7 +1292,7 @@ mod tests {
         let reader = store.reader().unwrap();
         let view = flat.attach(&reader);
 
-        let mut ctx = triblespace::core::query::VariableContext::new();
+        let mut ctx = triblespace_core::query::VariableContext::new();
         let a: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
         let b: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
         let c = view.similar(a, b, 0.8);
@@ -1316,7 +1316,7 @@ mod tests {
         let reader = store.reader().unwrap();
         let view = hnsw.attach(&reader);
 
-        let mut ctx = triblespace::core::query::VariableContext::new();
+        let mut ctx = triblespace_core::query::VariableContext::new();
         let a: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
         let b: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
         let c = view.similar(a, b, 0.8);
@@ -1337,7 +1337,7 @@ mod tests {
     #[test]
     fn multi_term_proposes_summed_scores() {
         let idx = sample_index();
-        let mut ctx = triblespace::core::query::VariableContext::new();
+        let mut ctx = triblespace_core::query::VariableContext::new();
         let doc: Variable<GenId> = ctx.next_variable();
         let score: Variable<F32LE> = ctx.next_variable();
         // "quick fox" hits docs 1 and 3 (both contain "quick"
@@ -1375,7 +1375,7 @@ mod tests {
         b.insert(id(3), hash_tokens("unrelated"));
         let idx = b.build_naive();
 
-        let mut ctx = triblespace::core::query::VariableContext::new();
+        let mut ctx = triblespace_core::query::VariableContext::new();
         let doc: Variable<GenId> = ctx.next_variable();
         let score: Variable<F32LE> = ctx.next_variable();
         let terms = hash_tokens("fox alone");
@@ -1405,10 +1405,10 @@ mod tests {
         // empty entry table. The engine sees `estimate == 0`
         // and skips any propose/confirm work.
         let idx = sample_index();
-        let mut ctx = triblespace::core::query::VariableContext::new();
+        let mut ctx = triblespace_core::query::VariableContext::new();
         let doc: Variable<GenId> = ctx.next_variable();
         let score: Variable<F32LE> = ctx.next_variable();
-        let terms: Vec<triblespace::core::value::Value<crate::tokens::WordHash>> = Vec::new();
+        let terms: Vec<triblespace_core::value::Value<crate::tokens::WordHash>> = Vec::new();
         let c = idx.bm25_query(doc, score, &terms);
 
         assert_eq!(c.estimate(doc.index, &Binding::default()), Some(0));
@@ -1424,7 +1424,7 @@ mod tests {
         // All terms miss the corpus entirely — aggregation comes
         // up empty, same shape as the empty-query case.
         let idx = sample_index();
-        let mut ctx = triblespace::core::query::VariableContext::new();
+        let mut ctx = triblespace_core::query::VariableContext::new();
         let doc: Variable<GenId> = ctx.next_variable();
         let score: Variable<F32LE> = ctx.next_variable();
         let terms = hash_tokens("aardvark zeppelin");
@@ -1447,7 +1447,7 @@ mod tests {
         let reader = store.reader().unwrap();
         let view = flat.attach(&reader);
 
-        let mut ctx = triblespace::core::query::VariableContext::new();
+        let mut ctx = triblespace_core::query::VariableContext::new();
         let a: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
         let b: Variable<Handle<Blake3, Embedding>> = ctx.next_variable();
         let unrelated: Variable<GenId> = ctx.next_variable();

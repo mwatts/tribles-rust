@@ -27,11 +27,14 @@ exclude = ["target/", "Cargo.lock", ".git/"]
 tempfile = "3"
 
 [dependencies]
-# `path = ".."` resolves to the workspace root (`triblespace`
-# umbrella crate); `version` is what `cargo publish` uses once
-# the path is stripped. Matches the pattern `trible` and
-# `triblespace-net` use.
-triblespace = { version = "0.36.0", path = "..", default-features = false }
+# Depend directly on `triblespace-core` rather than the umbrella
+# `triblespace` crate. The macros come from `triblespace_core::macros::*`
+# (re-exported from `triblespace-core-macros`), which emit
+# `::triblespace_core::…` absolute paths — so no umbrella
+# crate is needed in the dep graph. This avoids the
+# feature-gated cycle that would block the umbrella from
+# optionally re-exporting search at `triblespace::search`.
+triblespace-core = { version = "0.36.0", path = "../triblespace-core", default-features = false }
 anybytes = "0.20"
 # jerky — succinct data structures; optional for the v1 scaffold,
 # required once we flip from flat-array prototypes to the

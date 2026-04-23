@@ -10,9 +10,9 @@
 //! the test is about the API chain, not file I/O — the
 //! pile-backed write path exercises the same traits.
 
-use triblespace::core::blob::MemoryBlobStore;
-use triblespace::core::id::Id;
-use triblespace::core::repo::{BlobStoreGet, BlobStorePut};
+use triblespace_core::blob::MemoryBlobStore;
+use triblespace_core::id::Id;
+use triblespace_core::repo::{BlobStoreGet, BlobStorePut};
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::hnsw::HNSWBuilder;
@@ -35,13 +35,13 @@ fn succinct_bm25_survives_blob_store_roundtrip() {
     let original = b.build();
 
     // Put → handle.
-    let mut store = MemoryBlobStore::<triblespace::core::value::schemas::hash::Blake3>::new();
+    let mut store = MemoryBlobStore::<triblespace_core::value::schemas::hash::Blake3>::new();
     let handle = store
         .put::<SuccinctBM25Blob, _>(&original)
         .expect("put should succeed");
 
     // Get → reloaded view.
-    let reader = <MemoryBlobStore<_> as triblespace::core::repo::BlobStore<_>>::reader(&mut store)
+    let reader = <MemoryBlobStore<_> as triblespace_core::repo::BlobStore<_>>::reader(&mut store)
         .expect("reader");
     let reloaded: SuccinctBM25Index = reader
         .get::<SuccinctBM25Index, SuccinctBM25Blob>(handle)
@@ -72,7 +72,7 @@ fn succinct_bm25_survives_blob_store_roundtrip() {
 #[test]
 fn succinct_hnsw_survives_blob_store_roundtrip() {
     use std::collections::HashSet;
-    use triblespace::core::value::schemas::hash::Blake3;
+    use triblespace_core::value::schemas::hash::Blake3;
     use triblespace_search::schemas::put_embedding;
 
     // Build a small HNSW index.
@@ -95,7 +95,7 @@ fn succinct_hnsw_survives_blob_store_roundtrip() {
         .expect("put should succeed");
 
     // Get → reloaded view, then attach the reader for queries.
-    let reader = <MemoryBlobStore<_> as triblespace::core::repo::BlobStore<_>>::reader(&mut store)
+    let reader = <MemoryBlobStore<_> as triblespace_core::repo::BlobStore<_>>::reader(&mut store)
         .expect("reader");
     let reloaded: SuccinctHNSWIndex = reader
         .get::<SuccinctHNSWIndex, SuccinctHNSWBlob>(handle)
@@ -130,8 +130,8 @@ fn succinct_hnsw_survives_blob_store_roundtrip() {
 /// Explicitly test that load-bearing property.
 #[test]
 fn hnsw_indexes_share_embedding_blobs() {
-    use triblespace::core::repo::BlobStore;
-    use triblespace::core::value::schemas::hash::Blake3;
+    use triblespace_core::repo::BlobStore;
+    use triblespace_core::value::schemas::hash::Blake3;
     use triblespace_search::schemas::put_embedding;
 
     let vecs = [

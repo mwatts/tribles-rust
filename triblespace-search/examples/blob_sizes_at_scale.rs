@@ -7,7 +7,7 @@
 
 use std::time::Instant;
 
-use triblespace::core::id::{Id, RawId};
+use triblespace_core::id::{Id, RawId};
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::tokens::hash_tokens;
 

@@ -20,11 +20,11 @@
 use std::convert::Infallible;
 
 use anybytes::View;
-use triblespace::core::blob::{Blob, BlobSchema, ToBlob, TryFromBlob};
-use triblespace::core::id::Id;
-use triblespace::core::id_hex;
-use triblespace::core::metadata::ConstId;
-use triblespace::core::value::{ToValue, TryFromValue, Value, ValueSchema};
+use triblespace_core::blob::{Blob, BlobSchema, ToBlob, TryFromBlob};
+use triblespace_core::id::Id;
+use triblespace_core::id_hex;
+use triblespace_core::metadata::ConstId;
+use triblespace_core::value::{ToValue, TryFromValue, Value, ValueSchema};
 
 /// 32-bit IEEE-754 little-endian float packed into a 32-byte
 /// triblespace `Value`. Bytes `[0..4]` hold the raw f32 bytes;
@@ -95,7 +95,7 @@ impl TryFromValue<'_, F32LE> for f32 {
 /// Schema id minted via `trible genid`:
 /// `EEC5DFDEA2FFCED70850DF83B03CB62B`.
 ///
-/// [h]: triblespace::core::value::schemas::hash::Handle
+/// [h]: triblespace_core::value::schemas::hash::Handle
 pub struct Embedding {}
 
 impl ConstId for Embedding {
@@ -108,7 +108,7 @@ impl BlobSchema for Embedding {}
 // fragment keyed on the schema's ConstId) — it just has to
 // exist so `attributes!` can declare attributes whose value
 // type is `Handle<Blake3, Embedding>`.
-impl triblespace::core::metadata::ConstDescribe for Embedding {}
+impl triblespace_core::metadata::ConstDescribe for Embedding {}
 
 /// Shorthand for the most common embedding-handle value schema:
 /// `Handle<Blake3, Embedding>`. Use in trible attributes, in
@@ -116,15 +116,15 @@ impl triblespace::core::metadata::ConstDescribe for Embedding {}
 /// spell the full type.
 ///
 /// ```
-/// use triblespace::core::value::Value;
+/// use triblespace_core::value::Value;
 /// use triblespace_search::schemas::EmbHandle;
 ///
 /// fn keep(_h: Value<EmbHandle>) {}
 /// # keep(Value::new([0u8; 32]));
 /// ```
 pub type EmbHandle =
-    triblespace::core::value::schemas::hash::Handle<
-        triblespace::core::value::schemas::hash::Blake3,
+    triblespace_core::value::schemas::hash::Handle<
+        triblespace_core::value::schemas::hash::Blake3,
         Embedding,
     >;
 
@@ -191,12 +191,12 @@ pub fn l2_normalize(vec: &mut [f32]) {
 pub fn put_embedding<B, H>(
     store: &mut B,
     mut vec: Vec<f32>,
-) -> Result<triblespace::core::value::Value<triblespace::core::value::schemas::hash::Handle<H, Embedding>>, B::PutError>
+) -> Result<triblespace_core::value::Value<triblespace_core::value::schemas::hash::Handle<H, Embedding>>, B::PutError>
 where
-    H: triblespace::core::value::schemas::hash::HashProtocol,
-    B: triblespace::core::repo::BlobStorePut<H>,
-    triblespace::core::value::schemas::hash::Handle<H, Embedding>:
-        triblespace::core::value::ValueSchema,
+    H: triblespace_core::value::schemas::hash::HashProtocol,
+    B: triblespace_core::repo::BlobStorePut<H>,
+    triblespace_core::value::schemas::hash::Handle<H, Embedding>:
+        triblespace_core::value::ValueSchema,
 {
     l2_normalize(&mut vec);
     store.put::<Embedding, _>(vec)
@@ -263,9 +263,9 @@ mod tests {
 
     #[test]
     fn put_embedding_roundtrips_through_memory_store() {
-        use triblespace::core::blob::MemoryBlobStore;
-        use triblespace::core::repo::{BlobStore, BlobStoreGet};
-        use triblespace::core::value::schemas::hash::Blake3;
+        use triblespace_core::blob::MemoryBlobStore;
+        use triblespace_core::repo::{BlobStore, BlobStoreGet};
+        use triblespace_core::value::schemas::hash::Blake3;
 
         let mut store = MemoryBlobStore::<Blake3>::new();
         let vec = vec![1.0_f32, 0.0, 0.0];
@@ -278,7 +278,7 @@ mod tests {
 
     #[test]
     fn embedding_handle_is_content_addressed() {
-        use triblespace::core::value::schemas::hash::{Blake3, Handle};
+        use triblespace_core::value::schemas::hash::{Blake3, Handle};
 
         let v1: Vec<f32> = vec![1.0, 2.0, 3.0];
         let v2: Vec<f32> = vec![1.0, 2.0, 3.0];
