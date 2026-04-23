@@ -160,20 +160,18 @@ impl<D: triblespace::core::value::ValueSchema, T: triblespace::core::value::Valu
     }
 }
 
-/// Encode an `f32` as an `F32LE`-schema raw value (bytes [0..4]
-/// little-endian, rest zero-padded). Matches
-/// `schemas::F32LE::to_value` but avoids the schema-type wrapper
-/// for direct `RawValue` writes into the constraint's proposal
-/// vector.
+/// Encode an `f32` as an `F32LE`-schema raw value via the
+/// schema's `ToValue` impl.
 fn f32_to_raw_value(v: f32) -> RawValue {
-    let mut out = [0u8; 32];
-    out[0..4].copy_from_slice(&v.to_le_bytes());
-    out
+    triblespace::core::value::ToValue::<F32LE>::to_value(v).raw
 }
 
-/// Decode an `F32LE`-schema raw value back to `f32`.
+/// Decode an `F32LE`-schema raw value back to `f32`. Every
+/// four-byte prefix is a valid f32 (including NaN / infinity),
+/// so the schema's `try_from_value` is infallible on bytes we
+/// produced via the round-trip.
 fn raw_value_to_f32(raw: &RawValue) -> f32 {
-    f32::from_le_bytes(raw[0..4].try_into().unwrap())
+    Value::<F32LE>::new(*raw).try_from_value::<f32>().expect("F32LE round-trip is infallible")
 }
 
 // ── BM25 constraint with score as a bound variable ───────────────────
@@ -1281,6 +1279,44 @@ mod tests {
         c.propose(doc.index, &binding, &mut props);
         assert_eq!(props.len(), 1);
         assert_eq!(raw_value_to_id(&props[0]).unwrap(), id(1));
+    }
+
+    #[test]
+    fn multi_term_empty_query_yields_no_rows() {
+        // Zero terms → empty aggregation → constraint with an
+        // empty entry table. The engine sees `estimate == 0`
+        // and skips any propose/confirm work.
+        let idx = sample_index();
+        let mut ctx = triblespace::core::query::VariableContext::new();
+        let doc: Variable<GenId> = ctx.next_variable();
+        let score: Variable<F32LE> = ctx.next_variable();
+        let terms: Vec<triblespace::core::value::Value<crate::tokens::WordHash>> = Vec::new();
+        let c = idx.bm25_query(doc, score, &terms);
+
+        assert_eq!(c.estimate(doc.index, &Binding::default()), Some(0));
+        assert_eq!(c.estimate(score.index, &Binding::default()), Some(0));
+
+        let mut props = Vec::new();
+        c.propose(doc.index, &Binding::default(), &mut props);
+        assert!(props.is_empty());
+    }
+
+    #[test]
+    fn multi_term_no_matching_docs_yields_no_rows() {
+        // All terms miss the corpus entirely — aggregation comes
+        // up empty, same shape as the empty-query case.
+        let idx = sample_index();
+        let mut ctx = triblespace::core::query::VariableContext::new();
+        let doc: Variable<GenId> = ctx.next_variable();
+        let score: Variable<F32LE> = ctx.next_variable();
+        let terms = hash_tokens("aardvark zeppelin");
+        let c = idx.bm25_query(doc, score, &terms);
+
+        assert_eq!(c.estimate(doc.index, &Binding::default()), Some(0));
+
+        let mut props = Vec::new();
+        c.propose(doc.index, &Binding::default(), &mut props);
+        assert!(props.is_empty());
     }
 
     #[test]
