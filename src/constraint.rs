@@ -336,6 +336,34 @@ where
 /// `estimate` is the number of matching docs, and score
 /// proposals are deduped by bit-pattern to avoid a Cartesian
 /// blow-up when multiple docs share a summed score.
+///
+/// # Example
+///
+/// ```
+/// use triblespace::core::find;
+/// use triblespace::core::id::Id;
+/// use triblespace_search::bm25::BM25Builder;
+/// use triblespace_search::tokens::hash_tokens;
+///
+/// let mut b = BM25Builder::new();
+/// b.insert(&Id::new([1; 16]).unwrap(), hash_tokens("graph search algorithms"));
+/// b.insert(&Id::new([2; 16]).unwrap(), hash_tokens("cooking for pangrams"));
+/// b.insert(&Id::new([3; 16]).unwrap(), hash_tokens("graph search primer"));
+/// let idx = b.build();
+///
+/// let terms = hash_tokens("graph search");
+/// let mut rows: Vec<(Id, f32)> = find!(
+///     (doc: Id, score: f32),
+///     idx.bm25_query(doc, score, &terms)
+/// )
+/// .collect();
+/// rows.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+///
+/// // Doc 2 has no matching terms — absent from the aggregation.
+/// assert_eq!(rows.len(), 2);
+/// assert!(rows.iter().any(|(d, _)| *d == Id::new([1; 16]).unwrap()));
+/// assert!(rows.iter().any(|(d, _)| *d == Id::new([3; 16]).unwrap()));
+/// ```
 pub struct BM25MultiTermScored<S = GenId>
 where
     S: triblespace::core::value::ValueSchema,
