@@ -81,6 +81,47 @@ method lets quantized backends widen the equality check
 (lossless naive returns `f32::EPSILON`; succinct returns
 `max_score / 65534`).
 
+### `bm25_query(doc, score, &terms)` — bag-of-words, summed score
+
+```rust
+let c: BM25MultiTermScored<D> = idx.bm25_query(doc, score, &terms);
+```
+
+Higher-level BM25 constraint: binds `doc` + the *summed* BM25
+score across every term in `terms`. Equivalent to `or!`-ing a
+`docs_and_scores` per term and summing in Rust after `.collect()`,
+but materialised as a single constraint so it joins cleanly
+with `pattern!` / similarity / other BM25 clauses through the
+engine.
+
+Aggregation runs once at construction time. triblespace has no
+"arithmetic sum of bound variables" primitive; pre-materialising
+the `(doc, summed_score)` table is the cleanest path to a
+first-class constraint. Same score dedupe + tolerance behaviour
+as `docs_and_scores`.
+
+Typical call:
+
+```rust
+let tokens = hash_tokens("graph search algorithms");
+let rows: Vec<(Id, f32)> = find!(
+    (book: Id, score: f32),
+    and!(
+        idx.bm25_query(book, score, &tokens),
+        pattern!(&kb, [{ ?book @ literature::author: &target_author }]),
+    ),
+)
+.collect();
+```
+
+The schema-typed term values (`Value<WordHash>`,
+`Value<BigramHash>`, etc.) keep the compiler enforcing that the
+right tokenizer's output reaches the right index.
+
+See `examples/multi_term_bm25_search.rs` for the full runnable
+flow, and `BM25MultiTermScored` in the `constraint` module for
+the engine-facing type.
+
 ### Reverse lookup: doc bound, term free *(planned)*
 
 Rare: "what terms are in this doc." Requires a per-doc inverted
@@ -218,19 +259,18 @@ query picks it up by loading the updated handle.
 
 ## Open questions
 
-1. **Higher-level `bm25_query!` macro.** A single-token
-   constraint (`docs_containing`) and a per-term scored one
-   (`docs_and_scores`) are the primitives. A
-   `bm25_query(doc, "some text", score)` macro that tokenises,
-   runs `docs_and_scores` per term, sums scores through the
-   engine, and projects `doc + score` would be the natural
-   next step. Open: sum semantics (max / sum / OR-combined
-   score) and how it plays with score dedupe.
-2. **Reverse lookups.** See the BM25 section; currently
+1. **Reverse lookups.** See the BM25 section; currently
    unindexed, reported via doc-side walk if ever needed.
-3. **Async / deferred index loading.** Large blobs are
+2. **Async / deferred index loading.** Large blobs are
    mmap-backed via `anybytes::Bytes` already; a `Bytes::view`
    failure happens at load time, not at constraint use time.
+3. **String-input `bm25_query`.** `bm25_query` takes
+   `&[Value<T>]` today because the caller picks the tokenizer
+   (`hash_tokens` / `bigram_tokens` / ...); the two-line
+   `&hash_tokens("...")` pattern is the canonical call. A
+   `Tokenizable` trait keyed on `T` would let a one-arg
+   `bm25_query_text(doc, score, "...")` exist, but the
+   indirection isn't worth it until we have a caller asking.
 
 ## Non-goals (v1)
 
