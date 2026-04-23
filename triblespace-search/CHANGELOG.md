@@ -1,0 +1,299 @@
+# Changelog
+
+All notable changes to `triblespace-search`. The crate is
+pre-alpha and version-locked at `0.0.0` until the first
+non-scaffold release — entries below capture the shape of the
+crate as it is today.
+
+Format loosely follows [Keep a Changelog](https://keepachangelog.com/);
+dates are commit dates rather than release dates.
+
+## Unreleased / pre-alpha
+
+### `similar_to(probe, var, score_floor)` — unary similarity sugar
+
+Every similarity caller in the crate was writing the same
+ceremony:
+
+```rust
+temp!((anchor), and!(
+    anchor.is(query_handle),
+    view.similar(anchor, var, floor),
+))
+```
+
+That's `compose_hnsw_and_pattern`, `hybrid_search`,
+`faculty_wiki_search` (before the switch to BM25-only query),
+the `Similar` doctest, the find_macro test — every caller.
+
+Collapsed into a single method call:
+
+```rust
+view.similar_to(query_handle, var, floor)
+```
+
+- New `SimilarTo` unary constraint in the `constraint` module.
+  Candidate set pre-materialised once at construction from the
+  pinned `probe` handle; `propose` / `confirm` / `satisfied`
+  iterate the cache.
+- Method added on `AttachedHNSWIndex`,
+  `AttachedFlatIndex`, and `AttachedSuccinctHNSWIndex`.
+- Binary [`Similar`] stays the primitive — `similar_to` is
+  sugar for the case where the probe is known at constraint
+  construction. Keep the binary form for multi-probe
+  clustering, symmetric self-joins, etc.
+- Examples + find_macro test + QUERY_ENGINE_INTEGRATION doc
+  all flipped to the convenience. Doctest count 14 → 15.
+
+### Higher-level BM25 query: `bm25_query(doc, score, &terms)`
+
+Closes the "two-level query API" sketch — a multi-term
+bag-of-words BM25 constraint that binds `doc` + the summed BM25
+score across every query term, joinable with `pattern!` /
+similarity / other BM25 clauses through the engine.
+
+- `BM25Index::bm25_query(doc, score, &terms)` and
+  `SuccinctBM25Index::bm25_query(doc, score, &terms)` produce a
+  new `BM25MultiTermScored<D>` constraint. Callers typically
+  feed the tokens through `hash_tokens` / `bigram_tokens` —
+  the schema-typed term values keep the right tokenizer
+  flavour paired with the right index.
+- Aggregation (per-term posting lookup + score sum) happens
+  once at construction time; triblespace has no "arithmetic
+  sum of bound variables" primitive, so pre-materialising the
+  `(doc, summed_score)` table is the cleanest way to expose
+  the result as a constraint.
+- `BM25ScoredPostings`-shaped engine behaviour: `estimate` =
+  matching-doc count, `propose`/`confirm`/`satisfied` honour
+  bound `doc` / `score` on either side, `score` proposals
+  dedupe by bit-pattern, and the succinct backend's widened
+  `score_tolerance` flows through automatically.
+
+### HNSW redesign: handle-keyed, binary-relation similarity
+
+Major API shift for HNSW / Flat indexes, aligning the shape with
+TribleSpace taste:
+
+- **Doc keys removed.** `HNSWBuilder`, `HNSWIndex`, `FlatBuilder`,
+  `FlatIndex`, `SuccinctHNSWIndex` (and their `Attached*`
+  wrappers) no longer carry a `D` generic or a separate doc-key
+  table. Each node **is** a `Handle<Blake3, Embedding>` — the
+  caller's mapping from doc → embedding lives as a trible they
+  own, not as a shadow datamodel inside the index.
+- **New insert signature:** `HNSWBuilder::insert(handle, vec)` /
+  `FlatBuilder::insert(handle)`. No doc-key argument.
+- **Similarity is a binary relation.** The four old constraint
+  types (`SimilarToVector`, `SimilarToVectorScored`,
+  `SimilarToVectorHNSW`, `SimilarToVectorHNSWScored`) are
+  replaced by a single [`Similar<'_, I>`][s] constraint
+  produced by the `similar(a, b, score_floor)` method on each
+  attached view. Both `a` and `b` are `Variable<Handle<Blake3,
+  Embedding>>`; at least one must be bound at query time. The
+  relation is symmetric (cosine is symmetric), approximate
+  through HNSW.
+- **Score is fixed, not a variable.** `score_floor: f32` is a
+  query parameter pinned at constraint construction. Callers
+  who need the exact score fetch both embeddings and compute
+  cosine directly (no u16 quantization, no dedupe gymnastics).
+- **`SimilaritySearch` trait** unifies `AttachedHNSWIndex`,
+  `AttachedFlatIndex`, and `AttachedSuccinctHNSWIndex` behind
+  the constraint — two methods (`neighbours_above`,
+  `cosine_between`), infallible at the trait boundary (fetch
+  failures fail-open as "no match" per engine protocol).
+- **`candidates_above(handle, floor)`** is the core inherent
+  primitive the constraint wraps. Exposed on every attached
+  view for direct callers who want the walk without the
+  constraint. Bounded by `ef_search` (default 200, override
+  with `.with_ef_search(n)`).
+- **Blob schema rotations.** `SuccinctHNSWBlob::ID` rotates to
+  `A96890DE5F85A4F2285C365549B21BC2` (retires
+  `27D71A473EF22DA4D916F61810AC5D86`) to reflect the
+  handles-only blob layout — no keys section, header shrinks
+  from 144 B to 128 B.
+- **Embedding implements `ConstDescribe`** so callers can
+  declare `Handle<Blake3, Embedding>` attributes via the
+  `attributes!` macro (see the updated `compose_hnsw_and_pattern`
+  / `hybrid_search` examples).
+
+[s]: triblespace_search::constraint::Similar
+
+### Blob types (the shipped surface)
+
+- **`SuccinctBM25Index`** (blob schema `SuccinctBM25Blob`, id
+  `68C03764D04D05DF65E49589FBBA1441`) — SB25 wire format, 236 B
+  header + bit-packed body via jerky. Carries doc ids (flat),
+  terms (sorted flat), doc-lens (`CompactVector`), and postings
+  (three `CompactVector`s in one `ByteArea`: `doc_idx`,
+  cumulative `offsets`, and u16-quantized `scores` scaled by a
+  header-stored `max_score`). At 100 k docs the blob is ~86
+  MiB, roughly half the naive byte-format.
+- **`SuccinctHNSWIndex`** (blob schema `SuccinctHNSWBlob`, id
+  `7AFE59E7F895B23F05452FF7919E12E4`) — SH25 wire format, 152 B
+  header + body: doc ids, flat f32 vectors (zero-copy viewed as
+  `&[f32]` via `anybytes::View`), and a CSR-shaped graph built
+  from two jerky `CompactVector`s. Same greedy + ef-search as
+  the naive `HNSWIndex`, producing bit-identical top-k results
+  at 1 k scale.
+- Both blob types implement `ToBlob` / `TryFromBlob` against
+  their respective schemas, and survive a real
+  `triblespace::core::repo::BlobStorePut` / `BlobStoreGet`
+  round-trip (see `tests/pile_roundtrip.rs`).
+
+### Query engine integration
+
+- `BM25Queryable` generalizes the `DocsContainingTerm` /
+  `BM25ScoredPostings` constraints over the naive
+  `BM25Index<D, T>` and the succinct `SuccinctBM25Index<D, T>`.
+  `SimilaritySearch` plays the same role for the attached HNSW
+  / Flat / SuccinctHNSW views behind the binary-relation
+  `Similar` constraint. `find!` / `pattern!` / `and!` queries
+  work unmodified across backends.
+- `BM25Queryable::score_tolerance()` lets the constraint's
+  score-equality check widen for quantized indexes
+  automatically — lossless naive path keeps `f32::EPSILON`,
+  `SuccinctBM25Index` returns `max_score / 65534`.
+- `BM25ScoredPostings` dedupes its score proposals by
+  bit-pattern so multiple docs sharing a BM25 score don't
+  expand into a Cartesian cross. Regression-locked at 1 k
+  scale.
+
+### Build-side
+
+- `BM25Builder::build()` goes direct to `SuccinctBM25Index` in a
+  single pass: sorts + dedups keys into `CompressedUniverse`
+  first, then accumulates tf and scores keyed by universe code
+  from the start. No insertion-order → universe-code remap, no
+  per-term resort pass.
+- `HNSWBuilder::build()` returns `SuccinctHNSWIndex` for the
+  same "one blessed build method" ergonomic. Unlike BM25, there's
+  no redundant-work win — HNSW still goes through the naive
+  intermediate internally (necessary because levels are revealed
+  incrementally, see node-major-vs-layer-major discussion) —
+  but the public API now mirrors BM25's, and
+  `SuccinctHNSWIndex::from_naive` remains available for callers
+  who already hold a naive index.
+- `HNSWBuilder::build_naive()` exposes the naive reference
+  index (same ergonomics as `BM25Builder::build_naive`).
+- Naive / oracle types (`BM25Index`, `HNSWIndex`, `FlatIndex`,
+  `FlatBuilder`, `AttachedHNSWIndex`, `AttachedFlatIndex`) now
+  live at `triblespace_search::testing::*`. The types are still
+  physically declared in `bm25` / `hnsw` modules — their original
+  paths are `#[doc(hidden)]` so rustdoc only surfaces the
+  `testing::` path, signalling "reference-only, not a production
+  API." The builders themselves (`BM25Builder`, `HNSWBuilder`)
+  stay public at their canonical paths; the re-exports cover the
+  naive forms they produce via `build_naive()`.
+
+### Type-parameterized doc keys and terms
+
+- `BM25Builder<D, T>` / `BM25Index<D, T>` / `SuccinctBM25Index<D, T>`
+  are now generic over the doc-key schema `D` and the term
+  schema `T`. Default types are `<GenId, WordHash>` so
+  `BM25Builder::new()` still gives the common "entity-keyed,
+  text-token" shape; other shapes use `::typed()` + turbofish,
+  e.g. `BM25Builder::<ShortString, WordHash>::typed()` for a
+  title-keyed index or `BM25Builder::<GenId, GenId>::typed()`
+  for entity-citation search.
+- `insert` accepts anything that `ToValue<D>`-converts — pass a
+  typed `Value<D>` directly, or `&id` for the common GenId case.
+  `insert_id` / `insert_value` don't exist; the single `insert`
+  covers both.
+- Per-tokenizer term schemas: `hash_tokens` →
+  `Vec<Value<WordHash>>`, `bigram_tokens` →
+  `Vec<Value<BigramHash>>`, `ngram_tokens` →
+  `Vec<Value<NgramHash>>`. The compiler refuses to cross-feed
+  flavours into the wrong index — see
+  `examples/phrase_search.rs` for the two-index pattern when a
+  caller needs multiple tokenizer flavours.
+
+The two-schema parameterization buys compile-time safety: you
+can't accidentally feed ngram terms into a word-hash index,
+query a title-keyed index with a GenId doc variable, or store
+the wrong kind of term in a compound BM25 index. The "one
+space" flexibility (mixing arbitrary 32-byte terms in one
+index) is gone by default — callers who want it wrap a union
+schema of their own.
+- Naive `to_bytes` / `try_from_bytes` on `BM25Index` /
+  `HNSWIndex` / `FlatIndex` deleted along with their
+  `BM25LoadError` / `HNSWLoadError` / `FlatLoadError` types
+  (~400 LOC gone). The naive indexes are reference oracles
+  only; persistence is always through the succinct forms.
+  `byte_size()` accessors preserve the "succinct < naive
+  baseline" regression guard without materializing bytes.
+- `BM25Builder::build_naive()` / `build_naive_with_threads(n)`
+  keep the naive insertion-order [`BM25Index`] available as a
+  correctness oracle (score comparisons in tests) and for
+  benchmarking the scoring loop in isolation from jerky
+  packing. The naive path still supports sharded tf accumulation
+  via `std::thread::scope`; byte-identical output across
+  {1, 2, 3, 4, 8} threads.
+- `SuccinctBM25Index::from_naive` retired — callers that had
+  `SuccinctBM25Index::from_naive(&b.build())` collapse to
+  `b.build()`.
+- `HNSWBuilder` with deterministic level sampling
+  (`.with_seed(u64)`).
+
+### Tokenizers (`tokens::*`)
+
+- `hash_tokens` — whitespace + lowercase + Blake3.
+- `ngram_tokens(n)` — character n-grams, `n` namespaced into
+  the hash. Compose with `hash_tokens` for prefix / fuzzy
+  matching.
+- `code_tokens` — camelCase / snake_case / acronym / digit
+  splitter. Lowercased output shares term-space with
+  `hash_tokens`.
+- `bigram_tokens` — word-level bigrams, `"2w:"` namespace +
+  `\0` word-boundary delimiter. Compose with `hash_tokens` for
+  phrase-aware retrieval.
+
+### Schemas
+
+- `schemas::F32LE` — 32-byte `ValueSchema` for `f32` scores,
+  used by the scored BM25 + similarity constraints.
+
+### Examples (runnable)
+
+- `query_demo`: text search + multi-term OR + value-as-term
+  citation search.
+- `compose_bm25_and_pattern`: BM25 + `pattern!` over a
+  TribleSet in one `find!` / `and!`.
+- `compose_hnsw_and_pattern`: vector search + `pattern!`
+  composition.
+- `blob_sizes_at_scale`: naive vs. SB25 blob sizes + parallel
+  build speedup at 1 k / 5 k / 10 k / 50 k docs.
+- `query_latency`: single-term + multi-term + HNSW latency
+  p50/avg/p99 on 10 k / 50 k × 32 corpora.
+
+### Docs
+
+- `docs/DESIGN.md` — full design + 100 k worked example with
+  measured build / size / latency numbers.
+- `docs/QUERY_ENGINE_INTEGRATION.md` — constraint-trait surface.
+- `docs/HNSW_GRAPH_ENCODING.md` — why the shipped CSR is
+  the right HNSW graph encoding (not RING wavelet matrix) under
+  current forward-only traversal, with the query patterns that
+  would flip the decision.
+- `docs/FACULTY_INTEGRATION.md` — worked `wiki_search.rs`
+  rust-script template for consuming from faculties.
+
+### Tests
+
+159+ tests across unit, engine-integration (`find!`/`pattern!`
+composition + regression guards), scale (1 k-doc equivalence +
+size-regression + score-quantization top-10 preservation), and
+`BlobStore` put/get round-trip. All pass.
+
+## Not yet shipped
+
+- Wavelet-matrix term table (would shrink the 9.6 MiB at 100 k;
+  correctness-first is winning).
+- RING-style wavelet matrix on the HNSW neighbour column (no
+  win for forward-only traversal; see
+  `docs/HNSW_GRAPH_ENCODING.md`).
+- Direct `SuccinctBM25Index` builder that skips the naive
+  intermediate (memory win at large build-time scale).
+- Vector quantization for HNSW embeddings — intentionally
+  caller-owned via the embedding schema.
+- Published release / git push to
+  [github.com/triblespace/triblespace-search](https://github.com/triblespace/triblespace-search)
+  — awaiting JP's authorization.
