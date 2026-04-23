@@ -661,6 +661,56 @@ pub trait SimilaritySearch {
 /// [`crate::hnsw::AttachedHNSWIndex`] /
 /// [`crate::hnsw::AttachedFlatIndex`] /
 /// [`crate::succinct::AttachedSuccinctHNSWIndex`].
+///
+/// # Example
+///
+/// Pin the probe handle via `anchor.is(probe)` inside a
+/// `temp!` scope, then let the engine enumerate neighbours
+/// that clear the cosine floor:
+///
+/// ```
+/// use std::collections::HashSet;
+/// use triblespace::core::and;
+/// use triblespace::core::blob::MemoryBlobStore;
+/// use triblespace::core::find;
+/// use triblespace::core::query::temp;
+/// use triblespace::core::repo::BlobStore;
+/// use triblespace::core::value::schemas::hash::Blake3;
+/// use triblespace::core::value::Value;
+/// use triblespace_search::hnsw::HNSWBuilder;
+/// use triblespace_search::schemas::{put_embedding, EmbHandle};
+///
+/// let mut store = MemoryBlobStore::<Blake3>::new();
+/// let mut b = HNSWBuilder::new(3).with_seed(42);
+/// let mut handles = Vec::new();
+/// for v in [
+///     vec![1.0f32, 0.0, 0.0],
+///     vec![0.9, 0.1, 0.0],
+///     vec![0.0, 1.0, 0.0],
+/// ] {
+///     let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
+///     b.insert(h, v).unwrap();
+///     handles.push(h);
+/// }
+/// let idx = b.build();
+/// let reader = store.reader().unwrap();
+/// let view = idx.attach(&reader);
+///
+/// let probe = handles[0];
+/// let rows: Vec<(Value<EmbHandle>,)> = find!(
+///     (neighbour: Value<EmbHandle>),
+///     temp!(
+///         (anchor),
+///         and!(anchor.is(probe), view.similar(anchor, neighbour, 0.8))
+///     )
+/// )
+/// .collect();
+///
+/// let got: HashSet<_> = rows.into_iter().map(|(h,)| h).collect();
+/// assert!(got.contains(&handles[0]));
+/// assert!(got.contains(&handles[1]));
+/// assert!(!got.contains(&handles[2])); // below floor
+/// ```
 pub struct Similar<'a, I: SimilaritySearch + ?Sized> {
     index: &'a I,
     a: Variable<Handle<Blake3, Embedding>>,
