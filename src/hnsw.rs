@@ -604,6 +604,30 @@ where
         crate::constraint::Similar::new(self, a, b, score_floor)
     }
 
+    /// Convenience wrapper for the common
+    /// "search from a known handle" case. Binds `var` to every
+    /// handle whose cosine similarity to `probe` clears
+    /// `score_floor`. Equivalent to
+    /// `temp!((a), and!(a.is(probe), self.similar(a, var, floor)))`
+    /// but without the temp-variable ceremony at the call site;
+    /// see [`crate::constraint::SimilarTo`].
+    ///
+    /// Walks the index once at construction and caches the
+    /// result — subsequent engine `propose` / `confirm` calls
+    /// iterate the cached list.
+    pub fn similar_to(
+        &self,
+        probe: Value<EmbHandle>,
+        var: Variable<EmbHandle>,
+        score_floor: f32,
+    ) -> crate::constraint::SimilarTo {
+        let candidates = self
+            .candidates_above(probe, score_floor)
+            .map(|v| v.into_iter().map(|h| h.raw).collect())
+            .unwrap_or_default();
+        crate::constraint::SimilarTo::from_candidates(var, candidates)
+    }
+
     /// Walk the graph from `from_handle`'s embedding and return
     /// every handle whose cosine similarity is at least
     /// `score_floor`. The core primitive that the similarity
@@ -987,6 +1011,26 @@ where
         score_floor: f32,
     ) -> crate::constraint::Similar<'_, Self> {
         crate::constraint::Similar::new(self, a, b, score_floor)
+    }
+
+    /// Convenience wrapper for the common
+    /// "search from a known handle" case. Mirrors
+    /// [`AttachedHNSWIndex::similar_to`][a] for the brute-force
+    /// index — walks all handles once at construction, stores
+    /// the above-threshold set. See [`crate::constraint::SimilarTo`].
+    ///
+    /// [a]: crate::hnsw::AttachedHNSWIndex::similar_to
+    pub fn similar_to(
+        &self,
+        probe: Value<EmbHandle>,
+        var: Variable<EmbHandle>,
+        score_floor: f32,
+    ) -> crate::constraint::SimilarTo {
+        let candidates = self
+            .candidates_above(probe, score_floor)
+            .map(|v| v.into_iter().map(|h| h.raw).collect())
+            .unwrap_or_default();
+        crate::constraint::SimilarTo::from_candidates(var, candidates)
     }
 
     /// Walk every stored handle and return those with cosine

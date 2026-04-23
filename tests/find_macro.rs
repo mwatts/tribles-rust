@@ -264,17 +264,12 @@ fn find_hnsw_similar_on_succinct() {
     let probe = handles[0];
     let floor = 0.4f32;
 
+    // Convenience path: `similar_to(probe, var, floor)` replaces
+    // the `temp!((a), and!(a.is(probe), similar(a, var, floor)))`
+    // ceremony with a single call.
     let rows: Vec<(Value<Handle<Blake3, Embedding>>,)> = find!(
-        (
-            neighbour: Value<Handle<Blake3, Embedding>>,
-        ),
-        triblespace::core::query::temp!(
-            (anchor),
-            triblespace::core::and!(
-                anchor.is(probe),
-                succinct_view.similar(anchor, neighbour, floor)
-            )
-        )
+        (neighbour: Value<Handle<Blake3, Embedding>>),
+        succinct_view.similar_to(probe, neighbour, floor)
     )
     .collect();
     let got: HashSet<_> = rows.into_iter().map(|(h,)| h).collect();

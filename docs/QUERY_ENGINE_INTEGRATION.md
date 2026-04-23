@@ -14,12 +14,11 @@ A user writes a `find!` that composes BM25, HNSW, and arbitrary
 let hits: Vec<(Id,)> = find!(
     (paper: Id),
     temp!(
-        (anchor, emb),
+        (emb),
         and!(
-            anchor.is(query_handle),
             bm25.docs_containing(paper, graph_term),
             pattern!(&kb, [{ ?paper @ attrs::paper_embedding: ?emb }]),
-            hnsw_view.similar(anchor, emb, 0.8),
+            hnsw_view.similar_to(query_handle, emb, 0.8),
         )
     )
 )
@@ -192,6 +191,27 @@ boundary — fetch failures fail-open as "no match" (empty vec /
 `None`) because the engine's propose/confirm hooks have no
 error channel.
 
+### Convenience: `similar_to(probe, var, score_floor)`
+
+```rust
+let c: SimilarTo = view.similar_to(probe, var, score_floor);
+```
+
+Unary sugar for the common "search from a known handle" case.
+Equivalent to
+`temp!((a), and!(a.is(probe), view.similar(a, var, floor)))`,
+but the probe is pinned on the call site — no temp variable
+allocation, no `.is()` dance. Walks the index once at
+construction and caches the above-threshold set; subsequent
+engine calls iterate the cache.
+
+Use when you already hold the query handle (which covers the
+vast majority of callers). Keep [`Similar`] for the cases
+where both sides are genuinely variables — multi-probe
+clustering, symmetric self-joins, etc.
+
+[`Similar`]: #binary-relation-similara-b-score_floor
+
 ## Combinators callers actually write
 
 These compose naturally from the primitive constraints:
@@ -200,12 +220,11 @@ These compose naturally from the primitive constraints:
 // Hybrid: title mentions 'graph' AND embedding close to query.
 find!(
     (paper: Id),
-    temp!((anchor, emb),
+    temp!((emb),
         and!(
-            anchor.is(query_handle),
             bm25.docs_containing(paper, graph_term),
             pattern!(&kb, [{ ?paper @ attrs::paper_embedding: ?emb }]),
-            hnsw.similar(anchor, emb, 0.8),
+            hnsw.similar_to(query_handle, emb, 0.8),
         )
     ),
 )
@@ -222,14 +241,13 @@ find!(
 // "Similar to query, restricted to kind tag."
 find!(
     (doc: Id),
-    temp!((anchor, emb),
+    temp!((emb),
         and!(
-            anchor.is(query_handle),
             pattern!(&kb, [
                 { ?doc @ metadata::tag: &kind },
                 { ?doc @ attrs::doc_embedding: ?emb },
             ]),
-            hnsw.similar(anchor, emb, 0.7),
+            hnsw.similar_to(query_handle, emb, 0.7),
         )
     ),
 )

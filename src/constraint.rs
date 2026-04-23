@@ -836,6 +836,124 @@ impl<'a, I: SimilaritySearch + ?Sized + 'a> Constraint<'a> for Similar<'a, I> {
     }
 }
 
+/// Unary similarity constraint: `similar_to(probe, var, score_floor)`
+/// binds `var` to every handle whose cosine similarity to the
+/// pinned `probe` handle is ≥ `score_floor`.
+///
+/// Convenience over [`Similar`] for the common case where the
+/// caller already holds the query handle — collapses the
+/// `temp!((anchor), and!(anchor.is(probe), similar(anchor, var,
+/// floor)))` ceremony into a single method call. The binary
+/// [`Similar`] remains the primitive; this is sugar.
+///
+/// The candidate set is pre-materialised at construction: one
+/// walk from `probe` produces the complete above-threshold list,
+/// stored as raw bytes. `propose` / `confirm` / `satisfied`
+/// iterate the cached list — no re-walking the index per engine
+/// call.
+///
+/// Produced by the `similar_to` method on an
+/// [`crate::hnsw::AttachedHNSWIndex`] /
+/// [`crate::hnsw::AttachedFlatIndex`] /
+/// [`crate::succinct::AttachedSuccinctHNSWIndex`].
+///
+/// # Example
+///
+/// ```
+/// use std::collections::HashSet;
+/// use triblespace::core::blob::MemoryBlobStore;
+/// use triblespace::core::find;
+/// use triblespace::core::repo::BlobStore;
+/// use triblespace::core::value::schemas::hash::Blake3;
+/// use triblespace::core::value::Value;
+/// use triblespace_search::hnsw::HNSWBuilder;
+/// use triblespace_search::schemas::{put_embedding, EmbHandle};
+///
+/// let mut store = MemoryBlobStore::<Blake3>::new();
+/// let mut b = HNSWBuilder::new(3).with_seed(42);
+/// let mut handles = Vec::new();
+/// for v in [
+///     vec![1.0f32, 0.0, 0.0],
+///     vec![0.9, 0.1, 0.0],
+///     vec![0.0, 1.0, 0.0],
+/// ] {
+///     let h = put_embedding::<_, Blake3>(&mut store, v.clone()).unwrap();
+///     b.insert(h, v).unwrap();
+///     handles.push(h);
+/// }
+/// let idx = b.build();
+/// let reader = store.reader().unwrap();
+/// let view = idx.attach(&reader);
+///
+/// // No temp!, no `.is()` — the probe is pinned on the call.
+/// let rows: Vec<(Value<EmbHandle>,)> = find!(
+///     (neighbour: Value<EmbHandle>),
+///     view.similar_to(handles[0], neighbour, 0.8)
+/// )
+/// .collect();
+///
+/// let got: HashSet<_> = rows.into_iter().map(|(h,)| h).collect();
+/// assert!(got.contains(&handles[0]));
+/// assert!(got.contains(&handles[1]));
+/// assert!(!got.contains(&handles[2])); // below floor
+/// ```
+pub struct SimilarTo {
+    var: Variable<Handle<Blake3, Embedding>>,
+    /// Eagerly-computed above-threshold handle set from the one
+    /// walk at construction.
+    candidates: Vec<RawValue>,
+}
+
+impl SimilarTo {
+    /// Build from a pre-computed candidate list. Usually invoked
+    /// through the `similar_to` method on an attached index
+    /// rather than directly.
+    pub fn from_candidates(
+        var: Variable<Handle<Blake3, Embedding>>,
+        candidates: Vec<RawValue>,
+    ) -> Self {
+        Self { var, candidates }
+    }
+}
+
+impl<'a> Constraint<'a> for SimilarTo {
+    fn variables(&self) -> VariableSet {
+        VariableSet::new_singleton(self.var.index)
+    }
+
+    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
+        if variable == self.var.index {
+            Some(self.candidates.len())
+        } else {
+            None
+        }
+    }
+
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
+        if variable != self.var.index {
+            return;
+        }
+        for raw in &self.candidates {
+            proposals.push(*raw);
+        }
+    }
+
+    fn confirm(&self, variable: VariableId, _binding: &Binding, proposals: &mut Vec<RawValue>) {
+        if variable != self.var.index {
+            return;
+        }
+        let allowed: HashSet<RawValue> = self.candidates.iter().copied().collect();
+        proposals.retain(|raw| allowed.contains(raw));
+    }
+
+    fn satisfied(&self, binding: &Binding) -> bool {
+        match binding.get(self.var.index) {
+            Some(raw) => self.candidates.iter().any(|c| c == raw),
+            None => true,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

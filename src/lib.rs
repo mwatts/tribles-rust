@@ -51,12 +51,17 @@
 //!   threshold. Same method on
 //!   [`AttachedFlatIndex`][sf] and
 //!   [`AttachedSuccinctHNSWIndex`][ssh].
+//! - [`AttachedHNSWIndex::similar_to`][sth] — unary
+//!   convenience for the common "search from a known handle"
+//!   case; pins the probe on the call. Same method on the
+//!   Flat and succinct siblings.
 //!
 //! [dc]: bm25::BM25Index::docs_containing
 //! [das]: bm25::BM25Index::docs_and_scores
 //! [bq]: bm25::BM25Index::bm25_query
 //! [sbm25]: succinct::SuccinctBM25Index
 //! [sh]: hnsw::AttachedHNSWIndex::similar
+//! [sth]: hnsw::AttachedHNSWIndex::similar_to
 //! [sf]: hnsw::AttachedFlatIndex::similar
 //! [ssh]: succinct::AttachedSuccinctHNSWIndex::similar
 //! [emb]: schemas::EmbHandle

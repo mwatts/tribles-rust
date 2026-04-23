@@ -137,23 +137,21 @@ fn main() {
     }
 
     // Headline query: similar to the query AND authored by
-    // target_author. The engine joins on the shared `emb`
-    // variable; `anchor.is(query_handle)` pins the first
-    // similarity argument. `book` is the only projected
-    // variable; `emb` is bound internally and consumed by the
-    // similarity constraint.
+    // target_author. The unary `similar_to` convenience pins
+    // the probe handle on the call and binds `emb` to handles
+    // clearing the cosine floor; the pattern joins them back
+    // to book entities via the shared `emb` variable.
     println!("\nquery: similar to [1,0,0,0] AND author = target_author (cos ≥ 0.8)");
     let matches: Vec<(Id,)> = find!(
         (book: Id),
         temp!(
-            (anchor, emb),
+            (emb),
             and!(
-                anchor.is(query_handle),
+                view.similar_to(query_handle, emb, 0.8),
                 pattern!(&kb, [{ ?book @
                     literature::author: &target_author,
                     search_attrs::book_embedding: ?emb,
                 }]),
-                view.similar(anchor, emb, 0.8)
             )
         )
     )

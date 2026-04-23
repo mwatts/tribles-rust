@@ -10,6 +10,41 @@ dates are commit dates rather than release dates.
 
 ## Unreleased / pre-alpha
 
+### `similar_to(probe, var, score_floor)` — unary similarity sugar
+
+Every similarity caller in the crate was writing the same
+ceremony:
+
+```rust
+temp!((anchor), and!(
+    anchor.is(query_handle),
+    view.similar(anchor, var, floor),
+))
+```
+
+That's `compose_hnsw_and_pattern`, `hybrid_search`,
+`faculty_wiki_search` (before the switch to BM25-only query),
+the `Similar` doctest, the find_macro test — every caller.
+
+Collapsed into a single method call:
+
+```rust
+view.similar_to(query_handle, var, floor)
+```
+
+- New `SimilarTo` unary constraint in the `constraint` module.
+  Candidate set pre-materialised once at construction from the
+  pinned `probe` handle; `propose` / `confirm` / `satisfied`
+  iterate the cache.
+- Method added on `AttachedHNSWIndex`,
+  `AttachedFlatIndex`, and `AttachedSuccinctHNSWIndex`.
+- Binary [`Similar`] stays the primitive — `similar_to` is
+  sugar for the case where the probe is known at constraint
+  construction. Keep the binary form for multi-probe
+  clustering, symmetric self-joins, etc.
+- Examples + find_macro test + QUERY_ENGINE_INTEGRATION doc
+  all flipped to the convenience. Doctest count 14 → 15.
+
 ### Higher-level BM25 query: `bm25_query(doc, score, &terms)`
 
 Closes the "two-level query API" sketch — a multi-term

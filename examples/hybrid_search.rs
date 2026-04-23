@@ -135,12 +135,11 @@ fn main() {
     let hits: Vec<(Id,)> = find!(
         (paper: Id),
         temp!(
-            (anchor, emb),
+            (emb),
             and!(
-                anchor.is(query_handle),
                 bm25.docs_containing(paper, graph_term),
                 pattern!(&kb, [{ ?paper @ attrs::paper_embedding: ?emb }]),
-                hnsw_view.similar(anchor, emb, floor)
+                hnsw_view.similar_to(query_handle, emb, floor)
             )
         )
     )

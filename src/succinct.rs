@@ -1181,6 +1181,26 @@ where
         crate::constraint::Similar::new(self, a, b, score_floor)
     }
 
+    /// Convenience wrapper for the common "search from a known
+    /// handle" case. Walks the graph once at construction from
+    /// `probe`, stores the above-threshold handles, and binds
+    /// `var` to them in the engine. Equivalent to
+    /// `temp!((a), and!(a.is(probe), self.similar(a, var, floor)))`
+    /// without the temp-variable ceremony; see
+    /// [`crate::constraint::SimilarTo`].
+    pub fn similar_to(
+        &self,
+        probe: Value<EmbHandle>,
+        var: Variable<EmbHandle>,
+        score_floor: f32,
+    ) -> crate::constraint::SimilarTo {
+        let candidates = self
+            .candidates_above(probe, score_floor)
+            .map(|v| v.into_iter().map(|h| h.raw).collect())
+            .unwrap_or_default();
+        crate::constraint::SimilarTo::from_candidates(var, candidates)
+    }
+
     /// Walk the graph from `from_handle`'s embedding and return
     /// every handle whose cosine similarity is at least
     /// `score_floor`. The core primitive the similarity
