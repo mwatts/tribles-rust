@@ -1,6 +1,6 @@
 [package]
 name = "triblespace-search"
-version = "0.0.0"
+version = "0.36.0"
 edition = "2021"
 # `std::thread::scope` (1.63) is the oldest non-trivial feature
 # used; const assertions + zerocopy derive pull the actual
@@ -9,8 +9,8 @@ rust-version = "1.80"
 license = "MIT OR Apache-2.0"
 description = "Content-addressed BM25 + HNSW indexes on top of triblespace piles."
 authors = ["Jan-Paul Bultmann <jp@bultmann.eu>"]
-homepage = "https://github.com/triblespace/triblespace-search"
-repository = "https://github.com/triblespace/triblespace-search"
+homepage = "https://trible.space"
+repository = "https://github.com/triblespace/triblespace-rs"
 documentation = "https://docs.rs/triblespace-search"
 readme = "README.md"
 keywords = ["triblespace", "bm25", "hnsw", "search", "succinct"]
@@ -27,7 +27,11 @@ exclude = ["target/", "Cargo.lock", ".git/"]
 tempfile = "3"
 
 [dependencies]
-triblespace = "0.36"
+# `path = ".."` resolves to the workspace root (`triblespace`
+# umbrella crate); `version` is what `cargo publish` uses once
+# the path is stripped. Matches the pattern `trible` and
+# `triblespace-net` use.
+triblespace = { version = "0.36.0", path = "..", default-features = false }
 anybytes = "0.20"
 # jerky — succinct data structures; optional for the v1 scaffold,
 # required once we flip from flat-array prototypes to the
