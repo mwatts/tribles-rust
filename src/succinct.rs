@@ -1409,7 +1409,8 @@ where
 /// builder sorts + dedups the keys into a `CompressedUniverse`
 /// first, then accumulates tf and scores keyed by the universe
 /// code from the start — no insertion-order intermediate. The
-/// naive [`BM25Index`] is kept as a pub reference oracle only.
+/// naive [`crate::bm25::BM25Index`] is kept as a pub reference
+/// oracle only.
 ///
 /// # Example
 ///
@@ -1626,8 +1627,8 @@ impl<D: ValueSchema, T: ValueSchema> SuccinctBM25Index<D, T> {
     }
 
     /// Constraint that binds `doc` to doc keys containing `term`.
-    /// Mirror of [`BM25Index::docs_containing`] for the succinct
-    /// view.
+    /// Mirror of [`crate::bm25::BM25Index::docs_containing`] for
+    /// the succinct view.
     pub fn docs_containing(
         &self,
         doc: triblespace::core::query::Variable<D>,
@@ -1637,8 +1638,9 @@ impl<D: ValueSchema, T: ValueSchema> SuccinctBM25Index<D, T> {
     }
 
     /// Constraint that binds both `doc` and `score` for each
-    /// posting of `term`. Mirror of [`BM25Index::docs_and_scores`]
-    /// for the succinct view.
+    /// posting of `term`. Mirror of
+    /// [`crate::bm25::BM25Index::docs_and_scores`] for the
+    /// succinct view.
     pub fn docs_and_scores(
         &self,
         doc: triblespace::core::query::Variable<D>,

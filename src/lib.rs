@@ -30,10 +30,40 @@
 //! (branch metadata, commit metadata, a plain trible, or an
 //! in-memory cache).
 //!
+//! # Query surface
+//!
+//! Three constraint shapes plug into `find!` / `and!` /
+//! `pattern!` — all under the "score is a bound query
+//! variable, ordering is the caller's" tenet:
+//!
+//! - [`BM25Index::docs_containing`][dc] /
+//!   [`BM25Index::docs_and_scores`][das] — single-term BM25,
+//!   binding `doc` (and optionally `score`) for one pinned
+//!   term. Same method on [`SuccinctBM25Index`][sbm25].
+//! - [`BM25Index::bm25_query`][bq] — multi-term bag-of-words
+//!   BM25, binding `doc` and the *summed* BM25 score across
+//!   every term. Aggregation is pre-materialised at
+//!   construction; engine shape is otherwise identical to
+//!   `docs_and_scores`.
+//! - [`AttachedHNSWIndex::similar`][sh] — symmetric binary
+//!   similarity relation over two
+//!   [`EmbHandle`][emb]-typed variables with a fixed cosine
+//!   threshold. Same method on
+//!   [`AttachedFlatIndex`][sf] and
+//!   [`AttachedSuccinctHNSWIndex`][ssh].
+//!
+//! [dc]: bm25::BM25Index::docs_containing
+//! [das]: bm25::BM25Index::docs_and_scores
+//! [bq]: bm25::BM25Index::bm25_query
+//! [sbm25]: succinct::SuccinctBM25Index
+//! [sh]: hnsw::AttachedHNSWIndex::similar
+//! [sf]: hnsw::AttachedFlatIndex::similar
+//! [ssh]: succinct::AttachedSuccinctHNSWIndex::similar
+//! [emb]: schemas::EmbHandle
+//!
 //! # Quickstart
 //!
 //! ```
-//! use triblespace::core::and;
 //! use triblespace::core::find;
 //! use triblespace::core::id::Id;
 //!
@@ -43,9 +73,9 @@
 //!
 //! // 1. Build an in-memory index.
 //! let mut b = BM25Builder::new();
-//! b.insert(&Id::new([1; 16]).unwrap(), hash_tokens("the quick brown fox"));
-//! b.insert(&Id::new([2; 16]).unwrap(), hash_tokens("the lazy brown dog"));
-//! b.insert(&Id::new([3; 16]).unwrap(), hash_tokens("quick silver fox"));
+//! b.insert(Id::new([1; 16]).unwrap(), hash_tokens("the quick brown fox"));
+//! b.insert(Id::new([2; 16]).unwrap(), hash_tokens("the lazy brown dog"));
+//! b.insert(Id::new([3; 16]).unwrap(), hash_tokens("quick silver fox"));
 //!
 //! // 2. Build a succinct BM25 index in a single pass.
 //! let idx: SuccinctBM25Index = b.build();
@@ -60,8 +90,12 @@
 //! assert_eq!(docs.len(), 2);
 //! ```
 //!
-//! See the `examples/` directory for TribleSet composition,
-//! vector similarity, blob-size benchmarks, and phrase search.
+//! See the `examples/` directory for runnable walkthroughs:
+//! `compose_bm25_and_pattern` / `multi_term_bm25_search`
+//! (BM25 + pattern joins), `compose_hnsw_and_pattern`
+//! (vector similarity + pattern), `hybrid_search` (all
+//! three composed in one `find!`), and `phrase_search` for
+//! the typed-tokenizer pattern.
 //!
 //! [`jerky`]: https://docs.rs/jerky
 

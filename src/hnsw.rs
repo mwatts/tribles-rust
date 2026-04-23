@@ -979,7 +979,7 @@ where
     /// [`AttachedHNSWIndex::similar`][a] for the brute-force
     /// case — O(N) in the corpus. See [`crate::constraint::Similar`].
     ///
-    /// [a]: super::AttachedHNSWIndex::similar
+    /// [a]: crate::hnsw::AttachedHNSWIndex::similar
     pub fn similar(
         &self,
         a: Variable<EmbHandle>,
@@ -994,7 +994,7 @@ where
     /// `from_handle`. Mirrors [`AttachedHNSWIndex::candidates_above`][a]
     /// for the brute-force case — O(N) in the corpus.
     ///
-    /// [a]: super::AttachedHNSWIndex::candidates_above
+    /// [a]: crate::hnsw::AttachedHNSWIndex::candidates_above
     pub fn candidates_above(
         &self,
         from_handle: Value<EmbHandle>,

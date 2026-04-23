@@ -1,22 +1,27 @@
 //! Triblespace query-engine integration.
 //!
-//! Two constraint shapes currently ship:
+//! Three constraint shapes currently ship:
 //!
 //! * [`DocsContainingTerm`] / [`BM25ScoredPostings`] — BM25
 //!   posting-list constraints produced by
 //!   [`BM25Index::docs_containing`] /
-//!   [`BM25Index::docs_and_scores`].
+//!   [`BM25Index::docs_and_scores`]. Single pinned term, one
+//!   or two bound variables (`doc` ± `score`).
+//! * [`BM25MultiTermScored`] — multi-term bag-of-words BM25,
+//!   binding `doc` and the summed BM25 score across every
+//!   query term. Produced by [`BM25Index::bm25_query`].
 //! * [`Similar`] — a binary relation
-//!   `similar(a: Variable<Handle<Blake3, Embedding>>, b:
-//!   Variable<Handle<Blake3, Embedding>>, score_floor: f32)`
-//!   produced by the `similar()` method on an
-//!   [`AttachedHNSWIndex`] / [`AttachedFlatIndex`] /
-//!   [`AttachedSuccinctHNSWIndex`]. The relation is symmetric
-//!   (cosine similarity), `a` and `b` are both embedding
-//!   handles, and `score_floor` is a fixed cosine threshold —
-//!   *not* a bound variable. Callers who need the exact score
-//!   fetch both embeddings and compute it directly (no
-//!   quantization).
+//!   `similar(a, b, score_floor)` over two
+//!   `Variable<Handle<Blake3, Embedding>>` variables, produced
+//!   by the `similar()` method on
+//!   [`crate::hnsw::AttachedHNSWIndex`] /
+//!   [`crate::hnsw::AttachedFlatIndex`] /
+//!   [`crate::succinct::AttachedSuccinctHNSWIndex`]. The
+//!   relation is symmetric (cosine similarity), `a` and `b`
+//!   are both embedding handles, and `score_floor` is a fixed
+//!   cosine threshold — *not* a bound variable. Callers who
+//!   need the exact score fetch both embeddings and compute
+//!   it directly (no quantisation).
 //!
 //! See `docs/QUERY_ENGINE_INTEGRATION.md` for the long-form
 //! design.
@@ -109,9 +114,10 @@ impl<D: triblespace::core::value::ValueSchema, T: triblespace::core::value::Valu
 
 /// Constrains a `Variable<S>` (doc) to the 32-byte
 /// [`RawValue`]s in the posting list of the pinned term. `S` is
-/// whatever [`ValueSchema`] the caller keys the index with —
-/// typically [`GenId`] for entity-keyed indexes, but any schema
-/// works (string titles, tags, fragment hashes, etc.).
+/// whatever [`triblespace::core::value::ValueSchema`] the caller
+/// keys the index with — typically [`GenId`] for entity-keyed
+/// indexes, but any schema works (string titles, tags, fragment
+/// hashes, etc.).
 ///
 /// Generic over any `I: BM25Queryable`, so it works against
 /// [`BM25Index`] or
