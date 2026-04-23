@@ -36,6 +36,7 @@ example is the source of truth.
 use clap::Parser;
 use std::path::PathBuf;
 
+use triblespace::core::and;
 use triblespace::core::find;
 use triblespace::core::id::Id;
 use triblespace::core::repo::{BlobStoreGet, BlobStorePut};
@@ -102,11 +103,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // `SuccinctBM25Index<ShortString, WordHash>`).
             let idx: SuccinctBM25Index =
                 reader.get::<SuccinctBM25Index, SuccinctBM25Blob>(handle)?;
-            let q = hash_tokens(&text);
-            // `.query_multi_ids` is the GenId-keyed convenience
-            // that decodes the posting keys back to `Id`.
-            for (id, score) in idx.query_multi_ids(&q).into_iter().take(10) {
-                let title = lookup_title(&kb, id).unwrap_or_default();
+            let tokens = hash_tokens(&text);
+            // One engine pass: `bm25_query` binds (doc, score)
+            // for the summed BM25 score across every token,
+            // and the pattern joins on the shared ?doc to pull
+            // the title back out of the KB at the same time.
+            let mut rows: Vec<(Id, f32, String)> = find!(
+                (doc: Id, score: f32, title: String),
+                and!(
+                    idx.bm25_query(doc, score, &tokens),
+                    pattern!(&kb, [{ ?doc @ wiki::title: ?title }])
+                )
+            ).collect();
+            rows.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            for (id, score, title) in rows.into_iter().take(10) {
                 println!("{score:6.2}  {id}  {title}");
             }
         }

@@ -50,7 +50,7 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
-use triblespace::core::id::{Id, RawId};
+use triblespace::core::id::Id;
 use triblespace::core::value::schemas::genid::GenId;
 use triblespace::core::value::{RawValue, ToValue, Value, ValueSchema};
 

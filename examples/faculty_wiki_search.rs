@@ -16,8 +16,10 @@
 //!   `SuccinctBM25Index`, `put` the blob, overwrite the anchor's
 //!   `wiki::index` trible with the new handle.
 //! - Query: follow the anchor to the handle, load the index from
-//!   the pile, run `query_multi`, cross-reference titles back
-//!   through the KB to print results.
+//!   the pile, then run a single `find!` that joins
+//!   `bm25_query(?doc, ?score, tokens)` with a title
+//!   `pattern!` clause — one engine pass, `(doc, score, title)`
+//!   rows out. Sort + truncate in Rust after `.collect()`.
 //!
 //! The pile lives in a tempdir so the example is self-cleaning.
 //!
@@ -154,6 +156,8 @@ fn query(
     text: &str,
     top_k: usize,
 ) -> Result<Vec<(Id, f32, String)>, Box<dyn Error>> {
+    use triblespace::core::and;
+
     // Resolve the anchor → handle.
     let anchor = wiki::INDEX_ANCHOR;
     let handles: Vec<(Value<Handle<Blake3, SuccinctBM25Blob>>,)> = find!(
@@ -170,22 +174,23 @@ fn query(
     let idx: SuccinctBM25Index =
         reader.get::<SuccinctBM25Index, SuccinctBM25Blob>(handle)?;
 
+    // One engine pass: `bm25_query` binds (doc, score) for the
+    // summed multi-term BM25 score, the trible pattern joins on
+    // the shared `?doc` to pick the title up at the same time.
+    // Ordering is operational — sort + truncate in Rust after
+    // collecting.
     let tokens = hash_tokens(text);
-    let mut out = Vec::new();
-    for (id, score) in idx.query_multi_ids(&tokens).into_iter().take(top_k) {
-        // Cross-reference the title for pretty printing.
-        let titles: Vec<(String,)> = find!(
-            (t: String),
-            pattern!(kb, [{ &id @ wiki::title: ?t }])
+    let mut rows: Vec<(Id, f32, String)> = find!(
+        (doc: Id, score: f32, title: String),
+        and!(
+            idx.bm25_query(doc, score, &tokens),
+            pattern!(kb, [{ ?doc @ wiki::title: ?title }])
         )
-        .collect();
-        let title = titles
-            .first()
-            .map(|(t,)| t.clone())
-            .unwrap_or_else(|| "<untitled>".to_string());
-        out.push((id, score, title));
-    }
-    Ok(out)
+    )
+    .collect();
+    rows.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    rows.truncate(top_k);
+    Ok(rows)
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
