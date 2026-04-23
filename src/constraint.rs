@@ -875,9 +875,9 @@ mod tests {
 
     fn sample_index() -> BM25Index {
         let mut b = BM25Builder::new();
-        b.insert(&id(1), hash_tokens("the quick brown fox"));
-        b.insert(&id(2), hash_tokens("the lazy brown dog"));
-        b.insert(&id(3), hash_tokens("quick silver fox jumps"));
+        b.insert(id(1), hash_tokens("the quick brown fox"));
+        b.insert(id(2), hash_tokens("the lazy brown dog"));
+        b.insert(id(3), hash_tokens("quick silver fox jumps"));
         b.build_naive()
     }
 
@@ -1021,9 +1021,9 @@ mod tests {
         // *different* lengths — so the two postings have
         // different BM25 scores.
         let mut b = BM25Builder::new();
-        b.insert(&id(1), hash_tokens("fox"));
-        b.insert(&id(2), hash_tokens("quick brown fox jumps high today"));
-        b.insert(&id(3), hash_tokens("lazy dog"));
+        b.insert(id(1), hash_tokens("fox"));
+        b.insert(id(2), hash_tokens("quick brown fox jumps high today"));
+        b.insert(id(3), hash_tokens("lazy dog"));
         let idx = b.build();
 
         let mut ctx = triblespace::core::query::VariableContext::new();
@@ -1258,9 +1258,9 @@ mod tests {
         // than the length-7 doc on "fox alone" because BM25
         // penalises long docs.
         let mut b = BM25Builder::new();
-        b.insert(&id(1), hash_tokens("fox alone"));
-        b.insert(&id(2), hash_tokens("quick brown fox jumps high today happily"));
-        b.insert(&id(3), hash_tokens("unrelated"));
+        b.insert(id(1), hash_tokens("fox alone"));
+        b.insert(id(2), hash_tokens("quick brown fox jumps high today happily"));
+        b.insert(id(3), hash_tokens("unrelated"));
         let idx = b.build_naive();
 
         let mut ctx = triblespace::core::query::VariableContext::new();

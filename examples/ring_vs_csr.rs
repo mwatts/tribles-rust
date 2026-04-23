@@ -86,7 +86,7 @@ fn encode_ring(edges: &[(u32, u32)], n: u32) -> (usize, RingGraph) {
     let mut area = ByteArea::new().unwrap();
     let mut sections = area.sections();
     let (ring, _meta) = RingGraph::build(edges, n as usize, &mut sections).unwrap();
-    drop(sections);
+    let _ = sections;
     let bytes = area.freeze().unwrap();
     (bytes.len(), ring)
 }

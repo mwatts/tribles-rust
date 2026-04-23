@@ -35,7 +35,7 @@ fn main() {
     // Build.
     let mut builder = BM25Builder::new();
     for (id, text) in &corpus {
-        builder.insert(&*id, hash_tokens(text));
+        builder.insert(*id, hash_tokens(text));
         println!("indexed {id} ({} tokens)", hash_tokens(text).len());
     }
     let idx = builder.build();
@@ -75,9 +75,9 @@ fn main() {
     // are `GenId` — the same BM25 index handles "docs containing
     // a mention-of-entity-X term."
     let mut cite_builder: BM25Builder<GenId, GenId> = BM25Builder::typed();
-    cite_builder.insert(&id(10), vec![(&id(1)).to_value()]);
-    cite_builder.insert(&id(11), vec![(&id(1)).to_value(), (&id(3)).to_value()]);
-    cite_builder.insert(&id(12), vec![(&id(3)).to_value()]);
+    cite_builder.insert(id(10), vec![(&id(1)).to_value()]);
+    cite_builder.insert(id(11), vec![(&id(1)).to_value(), (&id(3)).to_value()]);
+    cite_builder.insert(id(12), vec![(&id(3)).to_value()]);
     let cite_idx = cite_builder.build();
 
     let citation_term: Value<GenId> = (&id(1)).to_value();

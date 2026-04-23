@@ -394,8 +394,8 @@ mod tests {
             adj[b as usize].push(a);
         }
         let ring = build_ring(edges, m);
-        for v in 0..m {
-            let mut expected = adj[v].clone();
+        for (v, expected_neighbours) in adj.iter().enumerate() {
+            let mut expected = expected_neighbours.clone();
             let mut got: Vec<u32> = ring.neighbours(v).collect();
             expected.sort_unstable();
             got.sort_unstable();
@@ -411,7 +411,7 @@ mod tests {
         let mut area = ByteArea::new().unwrap();
         let mut sections = area.sections();
         let (ring, meta) = RingGraph::build(&edges, 5, &mut sections).unwrap();
-        drop(sections);
+        let _ = sections;
         let bytes = area.freeze().unwrap();
 
         // Compare pre-round-trip neighbours against post.

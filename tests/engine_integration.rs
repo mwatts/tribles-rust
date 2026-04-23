@@ -42,9 +42,9 @@ fn raw_value_to_id(raw: &RawValue) -> Option<Id> {
 #[test]
 fn intersection_of_two_bm25_constraints_yields_overlap() {
     let mut b = BM25Builder::new();
-    b.insert(&id(1), hash_tokens("the quick brown fox"));
-    b.insert(&id(2), hash_tokens("the lazy brown dog"));
-    b.insert(&id(3), hash_tokens("quick silver fox jumps"));
+    b.insert(id(1), hash_tokens("the quick brown fox"));
+    b.insert(id(2), hash_tokens("the lazy brown dog"));
+    b.insert(id(3), hash_tokens("quick silver fox jumps"));
     let idx: SuccinctBM25Index = b.build();
 
     let mut ctx = VariableContext::new();
@@ -84,8 +84,8 @@ fn intersection_of_two_bm25_constraints_yields_overlap() {
 #[test]
 fn intersection_with_absent_term_proposes_nothing() {
     let mut b = BM25Builder::new();
-    b.insert(&id(1), hash_tokens("the quick brown fox"));
-    b.insert(&id(2), hash_tokens("the lazy brown dog"));
+    b.insert(id(1), hash_tokens("the quick brown fox"));
+    b.insert(id(2), hash_tokens("the lazy brown dog"));
     let idx: SuccinctBM25Index = b.build();
 
     let mut ctx = VariableContext::new();
@@ -115,8 +115,8 @@ fn intersection_with_absent_term_proposes_nothing() {
 #[test]
 fn satisfied_respects_both_clauses() {
     let mut b = BM25Builder::new();
-    b.insert(&id(1), hash_tokens("quick fox"));
-    b.insert(&id(2), hash_tokens("quick dog"));
+    b.insert(id(1), hash_tokens("quick fox"));
+    b.insert(id(2), hash_tokens("quick dog"));
     let idx: SuccinctBM25Index = b.build();
 
     let mut ctx = VariableContext::new();

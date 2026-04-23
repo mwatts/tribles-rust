@@ -126,7 +126,7 @@ fn encode_ring(
         let mut area = ByteArea::new().unwrap();
         let mut sections = area.sections();
         let (ring, _meta) = RingGraph::build(&edges, n, &mut sections).unwrap();
-        drop(sections);
+        let _ = sections;
         let bytes = area.freeze().unwrap();
         total_bytes += bytes.len();
         rings.push(ring);

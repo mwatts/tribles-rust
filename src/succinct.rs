@@ -2253,10 +2253,10 @@ mod tests {
         }
 
         let mut b = BM25Builder::new();
-        b.insert(&iid(1), hash_tokens("the quick brown fox"));
-        b.insert(&iid(2), hash_tokens("the lazy brown dog"));
-        b.insert(&iid(3), hash_tokens("quick silver fox jumps"));
-        b.insert(&iid(4), hash_tokens("unrelated filler content"));
+        b.insert(iid(1), hash_tokens("the quick brown fox"));
+        b.insert(iid(2), hash_tokens("the lazy brown dog"));
+        b.insert(iid(3), hash_tokens("quick silver fox jumps"));
+        b.insert(iid(4), hash_tokens("unrelated filler content"));
         let naive = b.clone().build_naive();
         let succinct = b.build();
 
@@ -2318,12 +2318,11 @@ mod tests {
             Id::new([byte; 16]).unwrap()
         }
         let mut b = BM25Builder::new();
-        b.insert(&iid(1), hash_tokens("quick fox"));
-        b.insert(&
-            iid(2),
+        b.insert(iid(1), hash_tokens("quick fox"));
+        b.insert(iid(2),
             hash_tokens("quick red rapid fox jumps high over fences"),
         );
-        b.insert(&iid(3), hash_tokens("slow brown dog"));
+        b.insert(iid(3), hash_tokens("slow brown dog"));
         let naive = b.clone().build_naive();
         let succinct = b.build();
 
@@ -2352,10 +2351,10 @@ mod tests {
             Id::new([byte; 16]).unwrap()
         }
         let mut b = BM25Builder::new().k1(1.4).b(0.72);
-        b.insert(&iid(1), hash_tokens("the quick brown fox"));
-        b.insert(&iid(2), hash_tokens("the lazy brown dog"));
-        b.insert(&iid(3), hash_tokens("quick silver fox jumps"));
-        b.insert(&iid(4), hash_tokens("completely unrelated filler content"));
+        b.insert(iid(1), hash_tokens("the quick brown fox"));
+        b.insert(iid(2), hash_tokens("the lazy brown dog"));
+        b.insert(iid(3), hash_tokens("quick silver fox jumps"));
+        b.insert(iid(4), hash_tokens("completely unrelated filler content"));
         b.build()
     }
 
@@ -2730,7 +2729,7 @@ mod tests {
                 if i == 0 { 1 } else { 0xaa },
             ])
             .unwrap();
-            b.insert(&id, hash_tokens(&text));
+            b.insert(id, hash_tokens(&text));
         }
         let naive_size = b.clone().build_naive().byte_size();
         let succinct_bytes = b.build().to_bytes();

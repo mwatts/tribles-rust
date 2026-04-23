@@ -240,7 +240,9 @@ mod tests {
 
     #[test]
     fn padding_is_zero() {
-        let v: Value<F32LE> = 3.14f32.to_value();
+        // Arbitrary finite non-zero value; clippy flags 3.14 as
+        // an approximation of `std::f32::consts::PI`.
+        let v: Value<F32LE> = 2.5f32.to_value();
         assert_eq!(&v.raw[4..32], &[0u8; 28]);
     }
 

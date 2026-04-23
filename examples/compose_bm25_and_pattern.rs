@@ -75,7 +75,7 @@ fn main() {
     .collect();
     let mut bm25 = BM25Builder::new();
     for (b, title) in &titles {
-        bm25.insert(&*b, hash_tokens(title));
+        bm25.insert(*b, hash_tokens(title));
     }
     let idx = bm25.build();
     println!(

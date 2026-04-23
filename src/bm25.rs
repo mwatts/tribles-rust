@@ -630,9 +630,9 @@ mod tests {
     #[test]
     fn three_docs_basic() {
         let mut b = BM25Builder::new();
-        b.insert(&id(1), hash_tokens("the quick brown fox"));
-        b.insert(&id(2), hash_tokens("the lazy brown dog"));
-        b.insert(&id(3), hash_tokens("quick silver fox"));
+        b.insert(id(1), hash_tokens("the quick brown fox"));
+        b.insert(id(2), hash_tokens("the lazy brown dog"));
+        b.insert(id(3), hash_tokens("quick silver fox"));
         let idx = b.build();
         assert_eq!(idx.doc_count(), 3);
 
@@ -658,9 +658,9 @@ mod tests {
         let mut b = BM25Builder::new();
         // "rare" appears once, "common" appears in every doc.
         for i in 1..=10 {
-            b.insert(&id(i), hash_tokens("common common"));
+            b.insert(id(i), hash_tokens("common common"));
         }
-        b.insert(&id(100), hash_tokens("common rare"));
+        b.insert(id(100), hash_tokens("common rare"));
         let idx = b.build();
 
         let rare = hash_tokens("rare");
@@ -683,9 +683,9 @@ mod tests {
         // k1 = 1.5 the second's score should be higher but not
         // 100x higher — saturation.
         let mut b = BM25Builder::new();
-        b.insert(&id(1), hash_tokens("foo bar baz"));
-        let many: String = std::iter::repeat("foo ").take(100).collect::<String>();
-        b.insert(&id(2), hash_tokens(&many));
+        b.insert(id(1), hash_tokens("foo bar baz"));
+        let many: String = "foo ".repeat(100);
+        b.insert(id(2), hash_tokens(&many));
         let idx = b.build();
 
         let foo = hash_tokens("foo");
@@ -705,9 +705,9 @@ mod tests {
     #[test]
     fn multi_term_query_sums() {
         let mut b = BM25Builder::new();
-        b.insert(&id(1), hash_tokens("quick brown fox"));
-        b.insert(&id(2), hash_tokens("quick red fox"));
-        b.insert(&id(3), hash_tokens("slow brown dog"));
+        b.insert(id(1), hash_tokens("quick brown fox"));
+        b.insert(id(2), hash_tokens("quick red fox"));
+        b.insert(id(3), hash_tokens("slow brown dog"));
         let idx = b.build();
 
         let q = hash_tokens("quick fox");
@@ -731,9 +731,9 @@ mod tests {
 
     fn build_sample_index() -> BM25Index {
         let mut b = BM25Builder::new().k1(1.4).b(0.72);
-        b.insert(&id(1), hash_tokens("the quick brown fox"));
-        b.insert(&id(2), hash_tokens("the lazy brown dog"));
-        b.insert(&id(3), hash_tokens("quick silver fox jumps"));
+        b.insert(id(1), hash_tokens("the quick brown fox"));
+        b.insert(id(2), hash_tokens("the lazy brown dog"));
+        b.insert(id(3), hash_tokens("quick silver fox jumps"));
         b.build_naive()
     }
 
@@ -779,7 +779,7 @@ mod tests {
                     (i.wrapping_mul(7)) % 13
                 );
                 let byte = (i as u8).max(1);
-                b.insert(&id(byte), hash_tokens(&text));
+                b.insert(id(byte), hash_tokens(&text));
             }
             b.build_naive_with_threads(threads)
         }
@@ -805,9 +805,9 @@ mod tests {
         // 3 docs × 16 threads — the builder caps threads at n_docs
         // and doesn't spawn idle workers.
         let mut b = BM25Builder::new();
-        b.insert(&id(1), hash_tokens("one two three"));
-        b.insert(&id(2), hash_tokens("two three four"));
-        b.insert(&id(3), hash_tokens("three four five"));
+        b.insert(id(1), hash_tokens("one two three"));
+        b.insert(id(2), hash_tokens("two three four"));
+        b.insert(id(3), hash_tokens("three four five"));
         let idx = b.build_naive_with_threads(16);
         assert_eq!(idx.doc_count(), 3);
         // "three" shows up in all 3 docs.
@@ -823,9 +823,9 @@ mod tests {
         use crate::tokens::{ngram_tokens, NgramHash};
 
         let mut b: BM25Builder<GenId, NgramHash> = BM25Builder::typed();
-        b.insert(&id(1), ngram_tokens("foxes are cunning", 3));
-        b.insert(&id(2), ngram_tokens("the dog barks", 3));
-        b.insert(&id(3), ngram_tokens("silver fox at night", 3));
+        b.insert(id(1), ngram_tokens("foxes are cunning", 3));
+        b.insert(id(2), ngram_tokens("the dog barks", 3));
+        b.insert(id(3), ngram_tokens("silver fox at night", 3));
         let idx = b.build();
 
         let q = ngram_tokens("fox", 3);

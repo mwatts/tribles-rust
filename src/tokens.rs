@@ -558,11 +558,11 @@ mod tests {
             Id::new([byte; 16]).unwrap()
         }
         let mut b: BM25Builder<GenId, BigramHash> = BM25Builder::typed();
-        b.insert(&iid(1), bigram_tokens("the quick brown fox"));
-        b.insert(&iid(2), bigram_tokens("fox fight club"));
+        b.insert(iid(1), bigram_tokens("the quick brown fox"));
+        b.insert(iid(2), bigram_tokens("fox fight club"));
         // doc 3 has `quick` + `brown` but NOT adjacent — no
         // (quick, brown) bigram.
-        b.insert(&iid(3), bigram_tokens("quick silver brown fox"));
+        b.insert(iid(3), bigram_tokens("quick silver brown fox"));
         let idx = b.build();
 
         let phrase = bigram_tokens("quick brown");

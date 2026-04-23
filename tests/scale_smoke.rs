@@ -44,7 +44,7 @@ fn fake_document(rng: &mut SplitMix64, vocab_size: usize, n_words: usize) -> Str
     for _ in 0..n_words {
         // Zipf-ish skew: square the random u32 to bias low.
         let r = rng.next() as f64 / u64::MAX as f64;
-        let biased = (r * r) as f64;
+        let biased = r * r;
         let idx = (biased * vocab_size as f64) as usize;
         let idx = idx.min(vocab_size - 1);
         words.push(format!("w{idx}"));
@@ -62,7 +62,7 @@ fn bm25_1k_docs_roundtrip_consistency() {
     let mut builder = BM25Builder::new();
     for i in 0..N_DOCS {
         let doc = fake_document(&mut rng, VOCAB, DOC_LEN);
-        builder.insert(&id_from_u64(i as u64 + 1), hash_tokens(&doc));
+        builder.insert(id_from_u64(i as u64 + 1), hash_tokens(&doc));
     }
     let idx = builder.build_naive();
     assert_eq!(idx.doc_count(), N_DOCS);
@@ -87,11 +87,11 @@ fn bm25_1k_docs_multi_term_ranks_sanely() {
     let mut builder = BM25Builder::new();
     for i in 0..1_000 {
         let doc = fake_document(&mut rng, 200, 30);
-        builder.insert(&id_from_u64(i as u64 + 1), hash_tokens(&doc));
+        builder.insert(id_from_u64(i as u64 + 1), hash_tokens(&doc));
     }
     // Inject a unique "needle" doc.
     let needle_id = id_from_u64(999_999);
-    builder.insert(&needle_id, hash_tokens("needle needle beacon"));
+    builder.insert(needle_id, hash_tokens("needle needle beacon"));
     let idx = builder.build_naive();
 
     let q = hash_tokens("needle beacon");
@@ -180,7 +180,7 @@ fn succinct_bm25_1k_docs_matches_naive() {
     let mut builder = BM25Builder::new();
     for i in 0..1_000 {
         let doc = fake_document(&mut rng, 500, 20);
-        builder.insert(&id_from_u64(i as u64 + 1), hash_tokens(&doc));
+        builder.insert(id_from_u64(i as u64 + 1), hash_tokens(&doc));
     }
     let naive = builder.clone().build_naive();
     let succinct = builder.build();
@@ -296,7 +296,7 @@ fn succinct_bm25_blob_smaller_than_naive_at_1k() {
     let mut builder = BM25Builder::new();
     for i in 0..1_000 {
         let doc = fake_document(&mut rng, 400, 24);
-        builder.insert(&id_from_u64(i as u64 + 1), hash_tokens(&doc));
+        builder.insert(id_from_u64(i as u64 + 1), hash_tokens(&doc));
     }
     let naive = builder.clone().build_naive();
     let succinct = builder.build();
@@ -329,7 +329,7 @@ fn bm25_quantization_preserves_top10() {
     let mut builder = BM25Builder::new();
     for i in 0..1_000 {
         let doc = fake_document(&mut rng, 400, 24);
-        builder.insert(&id_from_u64(i as u64 + 1), hash_tokens(&doc));
+        builder.insert(id_from_u64(i as u64 + 1), hash_tokens(&doc));
     }
     // Uses raw f32 scores, so build the naive reference — the
     // succinct form already quantizes internally.

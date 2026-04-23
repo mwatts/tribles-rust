@@ -149,7 +149,7 @@ fn main() {
     );
 }
 
-fn title_for<'a>(titles: &'a [(Id, String)], book: Id) -> &'a str {
+fn title_for(titles: &[(Id, String)], book: Id) -> &str {
     titles
         .iter()
         .find(|(b, _)| *b == book)
