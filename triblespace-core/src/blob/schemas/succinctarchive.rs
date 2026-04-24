@@ -578,7 +578,7 @@ where
 
 impl<U> TriblePattern for SuccinctArchive<U>
 where
-    U: Universe,
+    U: Universe + Send + Sync,
 {
     type PatternConstraint<'a>
         = SuccinctArchiveConstraint<'a, U>

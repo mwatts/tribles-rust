@@ -573,13 +573,15 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
 
     let output = quote! {
         {
-            let mut constraints: ::std::vec::Vec<Box<dyn #base_path::query::Constraint>> = ::std::vec::Vec::new();
+            let mut constraints: ::std::vec::Vec<Box<dyn #base_path::query::Constraint + Send + Sync>> = ::std::vec::Vec::new();
             let #ctx_ident = __local_find_context!();
             let #set_ident = #set;
             #local_tokens
             #attr_tokens
             #entity_tokens
-            #base_path::query::intersectionconstraint::IntersectionConstraint::new(constraints)
+            ::std::sync::Arc::new(
+                #base_path::query::intersectionconstraint::IntersectionConstraint::new(constraints)
+            )
         }
     };
 
@@ -1011,19 +1013,23 @@ pub fn pattern_changes_impl(
 
         let case = quote! {
             {
-                let mut constraints: ::std::vec::Vec<Box<dyn #base_path::query::Constraint>> = ::std::vec::Vec::new();
+                let mut constraints: ::std::vec::Vec<Box<dyn #base_path::query::Constraint + Send + Sync>> = ::std::vec::Vec::new();
                 #[allow(unused_imports)] use #base_path::query::TriblePattern;
                 #triple_tokens
-                #base_path::query::intersectionconstraint::IntersectionConstraint::new(constraints)
+                ::std::sync::Arc::new(
+                    #base_path::query::intersectionconstraint::IntersectionConstraint::new(constraints)
+                )
             }
         };
         case_exprs.push(case);
     }
 
     let union_expr = quote! {
-        #base_path::query::unionconstraint::UnionConstraint::new(vec![
-            #(Box::new(#case_exprs) as Box<dyn #base_path::query::Constraint>),*
-        ])
+        ::std::sync::Arc::new(
+            #base_path::query::unionconstraint::UnionConstraint::new(vec![
+                #(Box::new(#case_exprs) as Box<dyn #base_path::query::Constraint + Send + Sync>),*
+            ])
+        )
     };
 
     let output = quote! {
@@ -1035,13 +1041,15 @@ pub fn pattern_changes_impl(
             #local_decl_tokens
             #entity_decl_tokens
             #value_decl_tokens
-            let mut constraints: ::std::vec::Vec<Box<dyn #base_path::query::Constraint>> = ::std::vec::Vec::new();
+            let mut constraints: ::std::vec::Vec<Box<dyn #base_path::query::Constraint + Send + Sync>> = ::std::vec::Vec::new();
             #[allow(unused_imports)] use #base_path::query::TriblePattern;
             #attr_const_tokens
             #entity_const_tokens
             #value_const_tokens
             constraints.push(Box::new(#union_expr));
-            #base_path::query::intersectionconstraint::IntersectionConstraint::new(constraints)
+            ::std::sync::Arc::new(
+                #base_path::query::intersectionconstraint::IntersectionConstraint::new(constraints)
+            )
         }
     };
 

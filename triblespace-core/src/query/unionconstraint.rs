@@ -123,9 +123,12 @@ where
 #[macro_export]
 macro_rules! or {
     ($($c:expr),+ $(,)?) => (
-        $crate::query::unionconstraint::UnionConstraint::new(vec![
-            $(Box::new($c) as Box<dyn $crate::query::Constraint>),+
-        ])
+        ::std::sync::Arc::new(
+            $crate::query::unionconstraint::UnionConstraint::new(vec![
+                $(Box::new($c)
+                    as Box<dyn $crate::query::Constraint + Send + Sync>),+
+            ])
+        )
     )
 }
 

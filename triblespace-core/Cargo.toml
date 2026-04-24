@@ -54,6 +54,7 @@ page_size = "0.6.0"
 ryu = "1.0"
 triblespace-core-macros = { version = "0.36.0", path = "../triblespace-core-macros" }
 wasmi = { version = "0.31", optional = true }
+rayon = { version = "1", optional = true }
 
 [dev-dependencies]
 fake = "4.3.0"
@@ -70,6 +71,7 @@ proptest = ["dep:proptest"]
 object-store = ["dep:object_store", "dep:tokio", "dep:futures", "dep:url"]
 kani = []
 wasm = ["dep:wasmi"]
+parallel = ["dep:rayon"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)', 'cfg(kani)'] }

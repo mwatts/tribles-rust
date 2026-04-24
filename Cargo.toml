@@ -77,6 +77,7 @@ telemetry = [
 ]
 net = ["dep:triblespace-net"]
 search = ["dep:triblespace-search"]
+parallel = ["triblespace-core/parallel"]
 
 [[bench]]
 name = "benchmark"

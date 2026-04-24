@@ -65,7 +65,12 @@ pub use variableset::VariableSet;
 /// The trait provides a method to create a constraint for a given trible pattern.
 pub trait TriblePattern {
     /// The type of the constraint created by the pattern method.
-    type PatternConstraint<'a>: Constraint<'a>
+    ///
+    /// `Send + Sync` is required so the resulting constraint tree can be
+    /// used with the `parallel` feature's rayon iterators. Every in-tree
+    /// pattern backend (TribleSet, SuccinctArchive) satisfies this; custom
+    /// implementations should hold their data behind `Arc` or similar.
+    type PatternConstraint<'a>: Constraint<'a> + Send + Sync
     where
         Self: 'a;
 
@@ -401,7 +406,7 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
     }
 }
 
-impl<'a, T: Constraint<'a> + ?Sized> Constraint<'static> for std::sync::Arc<T> {
+impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     fn variables(&self) -> VariableSet {
         let inner: &T = self;
         inner.variables()
@@ -461,7 +466,77 @@ pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     values: ArrayVec<Option<Vec<RawValue>>, 128>,
 }
 
+// Manual `Clone` impl, because `#[derive(Clone)]` would require `R: Clone`
+// which isn't actually needed — `R` only appears in `P`'s return type.
+#[cfg(feature = "parallel")]
+impl<C, P, R> Clone for Query<C, P, R>
+where
+    C: Clone,
+    P: Fn(&Binding) -> Option<R> + Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            constraint: self.constraint.clone(),
+            postprocessing: self.postprocessing.clone(),
+            mode: self.mode,
+            binding: self.binding.clone(),
+            influences: self.influences,
+            estimates: self.estimates,
+            touched_variables: self.touched_variables,
+            stack: self.stack.clone(),
+            unbound: self.unbound.clone(),
+            values: self.values.clone(),
+        }
+    }
+}
+
 impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
+    /// Picks the next unbound variable, refreshes estimates touched by
+    /// the most recent binding, re-sorts `unbound`, pushes the chosen
+    /// variable onto the stack, and fills its proposal vector via
+    /// [`Constraint::propose`]. Leaves `mode = NextValue`. The caller is
+    /// responsible for ensuring `unbound` is non-empty.
+    ///
+    /// Shared between [`Iterator::next`]'s `NextVariable` branch and the
+    /// [`UnindexedProducer::split`](crate::query::QueryParIter) implementation
+    /// — the "push + propose" dance is identical in both.
+    fn push_next_variable(&mut self) {
+        let mut stale_estimates = VariableSet::new_empty();
+        while let Some(variable) = self.touched_variables.drain_next_ascending() {
+            stale_estimates = stale_estimates.union(self.influences[variable]);
+        }
+        // Bound variables can't be influenced by the unbound ones, so skip.
+        stale_estimates = stale_estimates.subtract(self.binding.bound);
+
+        if !stale_estimates.is_empty() {
+            while let Some(v) = stale_estimates.drain_next_ascending() {
+                self.estimates[v] = self
+                    .constraint
+                    .estimate(v, &self.binding)
+                    .expect("unconstrained variable in query");
+            }
+            self.unbound.sort_unstable_by_key(|v| {
+                (
+                    Reverse(
+                        self.estimates[*v]
+                            .checked_ilog2()
+                            .map(|magnitude| magnitude + 1)
+                            .unwrap_or(0),
+                    ),
+                    self.influences[*v].count(),
+                )
+            });
+        }
+
+        let variable = self.unbound.pop().expect("non-empty unbound");
+        let estimate = self.estimates[variable];
+        self.stack.push(variable);
+        let values = self.values[variable].get_or_insert(Vec::new());
+        values.clear();
+        values.reserve_exact(estimate.saturating_sub(values.capacity()));
+        self.constraint.propose(variable, &self.binding, values);
+    }
+
     /// Create a new query.
     /// The query takes a constraint and a post-processing function as input,
     /// and returns the results of the query as a stream of values.
@@ -549,46 +624,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
                         // searching (mode is already NextValue).
                         continue;
                     }
-
-                    let mut stale_estimates = VariableSet::new_empty();
-
-                    while let Some(variable) = self.touched_variables.drain_next_ascending() {
-                        stale_estimates = stale_estimates.union(self.influences[variable]);
-                    }
-
-                    // We remove the bound variables from the stale estimates,
-                    // as already bound variables cannot be influenced by the unbound ones.
-                    stale_estimates = stale_estimates.subtract(self.binding.bound);
-
-                    if !stale_estimates.is_empty() {
-                        while let Some(v) = stale_estimates.drain_next_ascending() {
-                            self.estimates[v] = self
-                                .constraint
-                                .estimate(v, &self.binding)
-                                .expect("unconstrained variable in query");
-                        }
-
-                        self.unbound.sort_unstable_by_key(|v| {
-                            (
-                                Reverse(
-                                    self.estimates[*v]
-                                        .checked_ilog2()
-                                        .map(|magnitude| magnitude + 1)
-                                        .unwrap_or(0),
-                                ),
-                                self.influences[*v].count(),
-                            )
-                        });
-                    }
-
-                    let variable = self.unbound.pop().expect("non-empty unbound");
-                    let estimate = self.estimates[variable];
-
-                    self.stack.push(variable);
-                    let values = self.values[variable].get_or_insert(Vec::new());
-                    values.clear();
-                    values.reserve_exact(estimate.saturating_sub(values.capacity()));
-                    self.constraint.propose(variable, &self.binding, values);
+                    self.push_next_variable();
                 }
                 Search::NextValue => {
                     if let Some(&variable) = self.stack.last() {
@@ -646,6 +682,217 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> fmt::Debug for Quer
             .field("unbound", &self.unbound)
             .finish()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Parallel execution via rayon.
+//
+// `Query` implements `IntoParallelIterator` with `Iter = QueryParIter`.
+// `QueryParIter` is a separate wrapper type implementing `ParallelIterator`
+// + `UnindexedProducer`, distinct from `Query` itself to avoid method-name
+// ambiguity between `Iterator` and `ParallelIterator` — methods like
+// `.count()`, `.collect()`, `.map()` exist on both.
+//
+// Usage: `find!(...).into_par_iter().map(...).collect::<Vec<_>>()`.
+//
+// The producer's `split` uses the "split-or-descend" rule: while the current
+// top-of-stack has a single remaining proposal, bind it and descend one level;
+// when the top has ≥2 remaining, bisect them between two sub-queries. This
+// keeps the invariant that every non-top stack level has zero remaining
+// proposals, so backtracking out of a sub-search unwinds cleanly to done
+// without any re-enumeration across clones.
+//
+// `fold_with` is the terminal leaf: it just drives the existing sequential
+// `Iterator::next()` and feeds results into the folder. No duplicated
+// execution logic.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "parallel")]
+pub use parallel::QueryParIter;
+
+#[cfg(feature = "parallel")]
+mod parallel {
+    use super::*;
+    use rayon::iter::plumbing::{
+        bridge_unindexed, Folder, UnindexedConsumer, UnindexedProducer,
+    };
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    /// Parallel iterator over the results of a [`Query`]. Obtained via
+    /// [`IntoParallelIterator::into_par_iter`] on a `Query`.
+    ///
+    /// Drives rayon's work-stealing scheduler through an `UnindexedProducer`
+    /// impl on the underlying query state. The sequential `Iterator::next`
+    /// on `Query` is reused as the fold leaf — parallel execution is purely
+    /// additional, no duplicated engine logic.
+    ///
+    /// The inner query is stored in a [`Box`] so rayon's work-stealing
+    /// `split` (which clones the producer) doesn't memcpy ~15 KB of query
+    /// state on every fork — just a Box pointer copy, with the heap alloc
+    /// paid only by the child.
+    ///
+    /// `split_budget` bounds the number of splits this sub-producer will
+    /// perform. Rayon's default `Splitter` *resets* its budget on every
+    /// stolen task, so on a busy thread pool the split tree could grow
+    /// unboundedly deep — the Query always has more proposals to bisect.
+    /// A bounded per-producer budget (`num_threads²`) caps the split tree
+    /// at ~N² leaves — enough for each worker to have roughly N chunks to
+    /// rebalance via stealing — regardless of stealing pressure.
+    pub struct QueryParIter<C, P: Fn(&Binding) -> Option<R>, R> {
+        inner: Box<Query<C, P, R>>,
+        split_budget: usize,
+    }
+
+    impl<'a, C, P, R> IntoParallelIterator for Query<C, P, R>
+    where
+        C: Constraint<'a> + Clone + Send + 'a,
+        P: Fn(&Binding) -> Option<R> + Clone + Send,
+        R: Send,
+    {
+        type Item = R;
+        type Iter = QueryParIter<C, P, R>;
+
+        fn into_par_iter(self) -> Self::Iter {
+            // num_threads² chunks: intuition is "every worker has one spare
+            // chunk for every other worker," giving N²/N = N chunks apiece
+            // for rebalancing. log₂(N²) = 2·log₂(N), so depth stays modest
+            // (8 on a 16-thread box, 10 on a 32-thread) — well below any
+            // stack concern.
+            let n = rayon::current_num_threads();
+            let split_budget = n.saturating_mul(n).max(2);
+            QueryParIter {
+                inner: Box::new(self),
+                split_budget,
+            }
+        }
+    }
+
+    impl<'a, C, P, R> UnindexedProducer for QueryParIter<C, P, R>
+    where
+        C: Constraint<'a> + Clone + Send + 'a,
+        P: Fn(&Binding) -> Option<R> + Clone + Send,
+        R: Send,
+    {
+        type Item = R;
+
+        /// Advance the Query's state machine until either the current
+        /// top-of-stack has ≥2 remaining proposals (bisect, return a
+        /// right half) or the sub-query is exhausted (return `None`,
+        /// leaving `self` as a leaf that `fold_with` will fold
+        /// sequentially). Single-value levels are descended through —
+        /// see the module doc comment for why this preserves correctness
+        /// without re-enumeration.
+        fn split(mut self) -> (Self, Option<Self>) {
+            if self.split_budget == 0 {
+                return (self, None);
+            }
+            self.split_budget -= 1;
+            let q = &mut *self.inner;
+            loop {
+                // Advance the state machine until we're in NextValue with
+                // a populated top — the only state where split-or-descend
+                // makes sense.
+                while !matches!(q.mode, Search::NextValue) {
+                    match q.mode {
+                        Search::NextVariable => {
+                            q.mode = Search::NextValue;
+                            if q.unbound.is_empty() {
+                                // All variables bound. Leaf — fold_with
+                                // will drive sequential `next()` to yield
+                                // the one postprocessed result.
+                                q.mode = Search::NextVariable;
+                                return (self, None);
+                            }
+                            q.push_next_variable();
+                        }
+                        Search::Backtrack => {
+                            if let Some(variable) = q.stack.pop() {
+                                q.binding.unset(variable);
+                                q.unbound.push(variable);
+                                q.touched_variables.set(variable);
+                                q.mode = Search::NextValue;
+                            } else {
+                                q.mode = Search::Done;
+                                return (self, None);
+                            }
+                        }
+                        Search::Done => return (self, None),
+                        Search::NextValue => unreachable!(),
+                    }
+                }
+
+                // mode == NextValue. Inspect top-of-stack's remaining
+                // proposals.
+                let Some(&top) = q.stack.last() else {
+                    return (self, None);
+                };
+                let top_len = q.values[top].as_ref().map_or(0, |v| v.len());
+                match top_len {
+                    0 => q.mode = Search::Backtrack,
+                    1 => {
+                        // Descend: pop the single value, bind it,
+                        // transition to NextVariable so the outer loop
+                        // runs propose.
+                        let assignment = q.values[top].as_mut().unwrap().pop().unwrap();
+                        q.binding.set(top, &assignment);
+                        q.touched_variables.set(top);
+                        q.mode = Search::NextVariable;
+                    }
+                    _ => {
+                        // Bisect the remaining proposals; clone the rest
+                        // of the query state into the right half. Clone
+                        // cost is one ~15 KB arraycopy per
+                        // rayon-requested split — rayon only asks under
+                        // stealing pressure.
+                        let vals = q.values[top].as_mut().unwrap();
+                        let mid = vals.len() / 2;
+                        let right_vals: Vec<RawValue> = vals.drain(mid..).collect();
+                        let mut right = q.clone();
+                        right.values[top] = Some(right_vals);
+
+                        let left_budget = self.split_budget / 2;
+                        let right_budget = self.split_budget - left_budget;
+                        self.split_budget = left_budget;
+                        return (
+                            self,
+                            Some(QueryParIter {
+                                inner: Box::new(right),
+                                split_budget: right_budget,
+                            }),
+                        );
+                    }
+                }
+            }
+        }
+
+        fn fold_with<F: Folder<R>>(self, mut folder: F) -> F {
+            let QueryParIter { inner: mut q, .. } = self;
+            while !folder.full() {
+                match q.next() {
+                    Some(item) => folder = folder.consume(item),
+                    None => break,
+                }
+            }
+            folder
+        }
+    }
+
+    impl<'a, C, P, R> ParallelIterator for QueryParIter<C, P, R>
+    where
+        C: Constraint<'a> + Clone + Send + 'a,
+        P: Fn(&Binding) -> Option<R> + Clone + Send,
+        R: Send,
+    {
+        type Item = R;
+
+        fn drive_unindexed<Con>(self, consumer: Con) -> Con::Result
+        where
+            Con: UnindexedConsumer<Self::Item>,
+        {
+            bridge_unindexed(self, consumer)
+        }
+    }
+
 }
 
 /// Iterate over query results, converting each variable via
