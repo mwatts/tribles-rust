@@ -118,10 +118,11 @@ macro_rules! and {
     // Emits `Arc<IntersectionConstraint<Box<dyn Constraint + Send + Sync>>>`.
     // The outer `Arc` makes the whole tree cheap to `Clone` (single
     // refcount bump) — required by the `parallel` feature's `Query::clone`
-    // during rayon split. The inner `Box<dyn Constraint + Send + Sync>`
-    // erases each child's concrete type; `+ Send + Sync` lets the tree
-    // cross rayon thread boundaries. Every in-tree constraint already
-    // satisfies Send + Sync (data behind `Arc`/`TribleSet` internals).
+    // during rayon split. `Send + Sync` on the trait object lets the tree
+    // cross rayon thread boundaries. Every in-tree constraint built via
+    // this macro already satisfies Send + Sync; non-thread-safe constraint
+    // types (e.g. `Rc`-backed ContainsConstraint variants) can still be
+    // used via direct `IntersectionConstraint::new` construction.
     ($($c:expr),+ $(,)?) => (
         ::std::sync::Arc::new(
             $crate::query::intersectionconstraint::IntersectionConstraint::new(vec![
