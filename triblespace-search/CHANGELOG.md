@@ -10,6 +10,23 @@ dates are commit dates rather than release dates.
 
 ## Unreleased / pre-alpha
 
+### `BM25Builder::new` merged with `::typed` — one constructor
+
+`BM25Builder::typed` was the generic constructor over `<D, T>`;
+`BM25Builder::new` was a sibling only on `<GenId, WordHash>`
+that called `typed()` internally. In practice, both `D` and `T`
+are almost always inferred from downstream `insert` calls
+(`&Id → ToValue<GenId>` pins `D`, `hash_tokens → Vec<Value<WordHash>>`
+pins `T`), so the specific-shape `new` was just sugar for the
+common case.
+
+Merged into one `new()` on the generic impl. Call sites that
+can't infer (empty builders, turbofish on the variable) now
+read `BM25Builder::<D, T>::new()` instead of
+`BM25Builder::<D, T>::typed()`. The default-typed impl and the
+specific `Default` impl are gone; `Default` is now generic over
+`<D, T>` with the struct defaults.
+
 ### `similar_to(probe, var, score_floor)` — unary similarity sugar
 
 Every similarity caller in the crate was writing the same
@@ -188,12 +205,14 @@ TribleSpace taste:
 
 - `BM25Builder<D, T>` / `BM25Index<D, T>` / `SuccinctBM25Index<D, T>`
   are now generic over the doc-key schema `D` and the term
-  schema `T`. Default types are `<GenId, WordHash>` so
-  `BM25Builder::new()` still gives the common "entity-keyed,
-  text-token" shape; other shapes use `::typed()` + turbofish,
-  e.g. `BM25Builder::<ShortString, WordHash>::typed()` for a
-  title-keyed index or `BM25Builder::<GenId, GenId>::typed()`
-  for entity-citation search.
+  schema `T`. Default struct types are `<GenId, WordHash>` —
+  `BM25Builder::new()` works bare when the type parameters are
+  inferrable from later `insert` calls (`&Id → ToValue<GenId>` /
+  `hash_tokens → Vec<Value<WordHash>>`). For other shapes,
+  spell the schemas with a turbofish:
+  `BM25Builder::<ShortString, WordHash>::new()` for a title-keyed
+  index or `BM25Builder::<GenId, GenId>::new()` for
+  entity-citation search.
 - `insert` accepts anything that `ToValue<D>`-converts — pass a
   typed `Value<D>` directly, or `&id` for the common GenId case.
   `insert_id` / `insert_value` don't exist; the single `insert`

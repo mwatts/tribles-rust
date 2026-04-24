@@ -2308,7 +2308,8 @@ mod tests {
     #[test]
     fn succinct_bm25_empty_corpus() {
         use crate::bm25::BM25Builder;
-        let succinct = BM25Builder::new().build();
+        use triblespace_core::value::schemas::genid::GenId;
+        let succinct = BM25Builder::<GenId, crate::tokens::WordHash>::new().build();
         assert_eq!(succinct.doc_count(), 0);
         assert_eq!(succinct.term_count(), 0);
         let probe: Value<crate::tokens::WordHash> = Value::new([0u8; 32]);
@@ -2405,7 +2406,8 @@ mod tests {
     #[test]
     fn succinct_bm25_empty_round_trip() {
         use crate::bm25::BM25Builder;
-        let idx = BM25Builder::new().build();
+        use triblespace_core::value::schemas::genid::GenId;
+        let idx = BM25Builder::<GenId, crate::tokens::WordHash>::new().build();
         let bytes = idx.to_bytes();
         let reloaded: SuccinctBM25Index =
             SuccinctBM25Index::try_from_bytes(&bytes).expect("valid blob");

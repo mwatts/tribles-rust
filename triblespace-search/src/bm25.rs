@@ -102,29 +102,34 @@ impl<D: ValueSchema, T: ValueSchema> Clone for BM25Builder<D, T> {
     }
 }
 
-/// Default-typed convenience: `BM25Builder::new()` returns a
-/// `BM25Builder<GenId, WordHash>` — the common "entity-id
-/// keyed, Blake3-hashed text tokens" shape. For other schemas,
-/// use [`BM25Builder::typed`] or explicit turbofish.
-impl BM25Builder<GenId, crate::tokens::WordHash> {
-    /// Create an empty builder with the standard BM25 tuning,
-    /// keyed by `GenId` with `WordHash`-typed terms.
-    pub fn new() -> Self {
-        Self::typed()
-    }
-}
-
-impl Default for BM25Builder<GenId, crate::tokens::WordHash> {
+impl<D: ValueSchema, T: ValueSchema> Default for BM25Builder<D, T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl<D: ValueSchema, T: ValueSchema> BM25Builder<D, T> {
-    /// Create an empty builder with caller-chosen schemas.
-    /// `BM25Builder::<MyKey, MyTerm>::typed()` — or the implicit
-    /// [`new`][Self::new] for the `<GenId, WordHash>` default.
-    pub fn typed() -> Self {
+    /// Create an empty builder with the standard BM25 tuning.
+    ///
+    /// Type parameters are usually inferred from downstream
+    /// [`insert`][Self::insert] calls (the doc key's
+    /// [`ToValue<D>`] impl pins `D`, the term vector pins `T`).
+    /// When you need to be explicit — e.g. for an index you'll
+    /// populate only after some plumbing — spell the schemas
+    /// with a turbofish:
+    ///
+    /// ```ignore
+    /// let mut b: BM25Builder<GenId, BigramHash> = BM25Builder::new();
+    /// ```
+    ///
+    /// The struct's own defaults (`D = GenId`, `T = WordHash`)
+    /// let you spell only one schema when the other is the
+    /// common text-search shape:
+    ///
+    /// ```ignore
+    /// let mut b: BM25Builder<ShortString> = BM25Builder::new();
+    /// ```
+    pub fn new() -> Self {
         Self {
             docs: Vec::new(),
             k1: DEFAULT_K1,
@@ -575,7 +580,7 @@ mod tests {
 
     #[test]
     fn empty_index_is_queryable() {
-        let idx = BM25Builder::new().build();
+        let idx = BM25Builder::<GenId, crate::tokens::WordHash>::new().build();
         assert_eq!(idx.doc_count(), 0);
         assert_eq!(idx.term_count(), 0);
         let term: Value<crate::tokens::WordHash> = Value::new([0u8; 32]);
@@ -587,7 +592,7 @@ mod tests {
         use triblespace_core::value::schemas::shortstring::ShortString;
         use triblespace_core::value::{ToValue, Value};
 
-        let mut b: BM25Builder<ShortString> = BM25Builder::typed();
+        let mut b: BM25Builder<ShortString> = BM25Builder::new();
         let red: Value<ShortString> = "red".to_value();
         let blue: Value<ShortString> = "blue".to_value();
         // Two docs keyed by string value rather than entity id.
@@ -708,7 +713,9 @@ mod tests {
 
     #[test]
     fn tuning_params_round_trip() {
-        let b = BM25Builder::new().k1(1.2).b(0.5);
+        let b = BM25Builder::<GenId, crate::tokens::WordHash>::new()
+            .k1(1.2)
+            .b(0.5);
         let idx = b.build();
         assert!((idx.k1() - 1.2).abs() < 1e-6);
         assert!((idx.b() - 0.5).abs() < 1e-6);
@@ -780,7 +787,8 @@ mod tests {
 
     #[test]
     fn parallel_build_on_empty_corpus() {
-        let idx = BM25Builder::new().build_naive_with_threads(4);
+        let idx = BM25Builder::<GenId, crate::tokens::WordHash>::new()
+            .build_naive_with_threads(4);
         assert_eq!(idx.doc_count(), 0);
         assert_eq!(idx.term_count(), 0);
     }
@@ -807,7 +815,7 @@ mod tests {
         // contain the extended forms ("foxes", "fox at night").
         use crate::tokens::{ngram_tokens, NgramHash};
 
-        let mut b: BM25Builder<GenId, NgramHash> = BM25Builder::typed();
+        let mut b: BM25Builder<GenId, NgramHash> = BM25Builder::new();
         b.insert(id(1), ngram_tokens("foxes are cunning", 3));
         b.insert(id(2), ngram_tokens("the dog barks", 3));
         b.insert(id(3), ngram_tokens("silver fox at night", 3));

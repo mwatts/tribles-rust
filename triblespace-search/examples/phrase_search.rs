@@ -36,8 +36,8 @@ fn main() {
 
     // ── Two typed indexes, same doc keys, different term
     // schemas. The compiler will refuse to cross-query them. ─
-    let mut words_b: BM25Builder<GenId, WordHash> = BM25Builder::typed();
-    let mut bigrams_b: BM25Builder<GenId, BigramHash> = BM25Builder::typed();
+    let mut words_b: BM25Builder<GenId, WordHash> = BM25Builder::new();
+    let mut bigrams_b: BM25Builder<GenId, BigramHash> = BM25Builder::new();
     for (doc_id, text) in &corpus {
         words_b.insert(doc_id, hash_tokens(text));
         bigrams_b.insert(doc_id, bigram_tokens(text));

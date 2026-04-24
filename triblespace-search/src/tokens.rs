@@ -556,7 +556,7 @@ mod tests {
         fn iid(byte: u8) -> Id {
             Id::new([byte; 16]).unwrap()
         }
-        let mut b: BM25Builder<GenId, BigramHash> = BM25Builder::typed();
+        let mut b: BM25Builder<GenId, BigramHash> = BM25Builder::new();
         b.insert(iid(1), bigram_tokens("the quick brown fox"));
         b.insert(iid(2), bigram_tokens("fox fight club"));
         // doc 3 has `quick` + `brown` but NOT adjacent — no

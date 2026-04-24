@@ -74,7 +74,7 @@ fn main() {
     // When terms themselves are entity ids, both `D` and `T`
     // are `GenId` — the same BM25 index handles "docs containing
     // a mention-of-entity-X term."
-    let mut cite_builder: BM25Builder<GenId, GenId> = BM25Builder::typed();
+    let mut cite_builder: BM25Builder<GenId, GenId> = BM25Builder::new();
     cite_builder.insert(id(10), vec![(&id(1)).to_value()]);
     cite_builder.insert(id(11), vec![(&id(1)).to_value(), (&id(3)).to_value()]);
     cite_builder.insert(id(12), vec![(&id(3)).to_value()]);
