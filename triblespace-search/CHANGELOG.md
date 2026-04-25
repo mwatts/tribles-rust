@@ -10,6 +10,53 @@ dates are commit dates rather than release dates.
 
 ## Unreleased / pre-alpha
 
+### BM25 redesign: `matches` filter + `score` recompute, no score variable
+
+Major API simplification, aligning BM25 with HNSW's "filter on a
+fixed floor, recompute score afterwards" pattern. Three constraints
+(`docs_containing`, `docs_and_scores`, `bm25_query`) collapse to one:
+
+```rust
+// Before:
+idx.docs_containing(doc, term)              // 1 var, no score
+idx.docs_and_scores(doc, score, term)       // 2 vars, score bound
+idx.bm25_query(doc, score, &terms)          // 2 vars, summed score
+
+// After:
+idx.matches(doc, &terms, score_floor)       // 1 var, score is a filter
+idx.score(&doc.to_value(), &terms) -> f32   // recompute precisely after
+```
+
+`score_floor = 0.0` recovers `docs_containing` semantics — BM25 is
+non-negative, so `>= 0.0` matches every doc in at least one posting
+list. `score_floor > 0.0` is "relevance threshold" filtering, which
+the old API couldn't express without the bound score variable.
+
+What this kills:
+- `BM25ScoredPostings`, `BM25MultiTermScored`, `DocsContainingTerm`
+  constraint types — collapsed into one `BM25Filter<S>`.
+- The `score: Variable<F32LE>` plumbing in every constraint — score
+  isn't a join variable anymore. One less variable per BM25 clause
+  in the engine planner; no more bidirectional propose-by-score.
+- `BM25Queryable::score_tolerance` trait method — quantisation
+  bookkeeping doesn't reach the engine path. The inherent
+  `SuccinctBM25Index::score_tolerance` helper stays for callers
+  comparing recomputed scores against an external reference.
+- `HashSet<u32>` score bit-pattern dedup (Cartesian-blowup
+  avoidance) — not needed when score isn't a variable.
+- `query_term_ids` / `query_multi_ids` GenId-specific shortcuts —
+  callers do `Id::try_from_value(v).unwrap()` once after the typed
+  `query_term` if they want `Id` instead of `Value<GenId>`.
+
+The constraint module's surface is now one structural shape on each
+side: `BM25Filter` for BM25, `Similar` (+ `similar_to` sugar) for
+HNSW. Both follow the same rule: doc/handle is the only bound
+variable, score is a fixed parameter.
+
+Test count: 122 → 119 lib (3 score-as-variable tests removed,
+2 floor + score-helper tests added); integration tests likewise
+re-shaped around the new pattern.
+
 ### `BM25Builder::new` merged with `::typed` — one constructor
 
 `BM25Builder::typed` was the generic constructor over `<D, T>`;

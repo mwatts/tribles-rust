@@ -104,17 +104,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let idx: SuccinctBM25Index =
                 reader.get::<SuccinctBM25Index, SuccinctBM25Blob>(handle)?;
             let tokens = hash_tokens(&text);
-            // One engine pass: `bm25_query` binds (doc, score)
-            // for the summed BM25 score across every token,
-            // and the pattern joins on the shared ?doc to pull
-            // the title back out of the KB at the same time.
+            // One engine pass: `matches` binds `doc` to docs that
+            // match at all (score_floor = 0.0). The pattern joins
+            // on the shared ?doc to pull the title back out of the
+            // KB at the same time. We rescore each survivor via
+            // `idx.score` afterwards for ranking — same pattern as
+            // HNSW.
+            use triblespace_core::value::ToValue;
             let mut rows: Vec<(Id, f32, String)> = find!(
-                (doc: Id, score: f32, title: String),
+                (doc: Id, title: String),
                 and!(
-                    idx.bm25_query(doc, score, &tokens),
+                    idx.matches(doc, &tokens, 0.0),
                     pattern!(&kb, [{ ?doc @ wiki::title: ?title }])
                 )
-            ).collect();
+            )
+            .map(|(d, t)| (d, idx.score(&d.to_value(), &tokens), t))
+            .collect();
             rows.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
             for (id, score, title) in rows.into_iter().take(10) {
                 println!("{score:6.2}  {id}  {title}");
@@ -168,16 +173,16 @@ stores it once. That's free caching.
 ## Pattern: query-time composition with `find!`
 
 The BM25 constraint plugs into the same `find!` / `and!` /
-`pattern!` engine as everything else. The typed term makes the
-composition transparent — `hash_tokens("typst")[0]` is a
-`Value<WordHash>`, which is exactly what
-`idx.docs_and_scores(..)` wants on a `<GenId, WordHash>` index:
+`pattern!` engine as everything else. The typed term slice makes
+the composition transparent — `&hash_tokens("typst")` is a
+`&[Value<WordHash>]`, which is exactly what `idx.matches(..)`
+wants on a `<GenId, WordHash>` index:
 
 ```rust,ignore
-let rows: Vec<(Id, f32)> = find!(
-    (doc: Id, score: f32),
+let docs: Vec<(Id,)> = find!(
+    (doc: Id),
     and!(
-        idx.docs_and_scores(doc, score, hash_tokens("typst")[0]),
+        idx.matches(doc, &hash_tokens("typst"), 0.0),
         pattern!(&kb, [{ ?doc @ wiki::tag: &some_tag }])
     )
 ).collect();
@@ -186,27 +191,39 @@ let rows: Vec<(Id, f32)> = find!(
 This is the "find docs with `typst` in the body AND tagged X"
 query, running through a single engine pass. The engine picks
 the cheaper side to iterate (`estimate()`) — either the BM25
-posting list for `typst` or the tag index — and confirms with
-the other.
+filter set for `typst` or the tag index — and confirms with the
+other.
 
 See `examples/compose_bm25_and_pattern.rs` and
 `examples/compose_hnsw_and_pattern.rs` for the full runnable
 versions with a concrete KB.
 
-## Pattern: score tolerance, not strict equality
+## Pattern: rank by post-collect `score`, not by bound variable
 
-When binding `score` as a `Variable<F32LE>` in a `find!`, scores
-are quantized (u16, scale stored in SB25 header). The
-constraint's equality check widens to
-`score_tolerance() = max_score / 65534` automatically via the
-`BM25Queryable` trait — callers writing raw equality checks
-against a score from another source should use that tolerance
-too:
+Score is **never** a bound query variable. The constraint
+filters on a fixed `score_floor` parameter; callers recompute
+exact scores afterwards via `idx.score(&doc.to_value(), terms)`.
+Same pattern as HNSW's `similar`/recompute-cosine split:
 
 ```rust,ignore
-let tol = idx.score_tolerance();
-if (observed - expected).abs() <= tol { /* match */ }
+use triblespace_core::value::ToValue;
+let mut ranked: Vec<(Id, f32)> = find!(
+    (doc: Id),
+    idx.matches(doc, &tokens, 0.0)
+)
+.map(|(d,)| (d, idx.score(&d.to_value(), &tokens)))
+.collect();
+ranked.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 ```
+
+Two reasons. First: quantisation bookkeeping disappears — the
+lossy f32-on-disk score lives only in the index storage; the
+engine sees docs only. Second: one less variable per BM25
+clause in the planner, no Cartesian-blowup dedupe needed.
+
+If you want to filter by relevance (not just presence), pass a
+non-zero floor: `idx.matches(doc, &tokens, 1.5)`. The engine
+proposes only docs whose summed BM25 ≥ 1.5.
 
 ## Open questions for faculty authors
 

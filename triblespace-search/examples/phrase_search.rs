@@ -14,10 +14,18 @@ use std::collections::HashMap;
 
 use triblespace_core::id::Id;
 use triblespace_core::value::schemas::genid::GenId;
+use triblespace_core::value::{TryFromValue, Value};
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::succinct::SuccinctBM25Index;
 use triblespace_search::tokens::{bigram_tokens, hash_tokens, BigramHash, WordHash};
+
+/// Decode a `Value<GenId>` posting key to its underlying `Id`.
+/// Helper used to recover typed `Id`s from posting iterators
+/// after the `*_ids` shortcuts were dropped.
+fn id_from_value(v: Value<GenId>) -> Id {
+    Id::try_from_value(&v).expect("genid posting")
+}
 
 fn id(byte: u8) -> Id {
     Id::new([byte; 16]).expect("non-nil")
@@ -55,7 +63,10 @@ fn main() {
     // words index. `bigrams.query_term(&hash_tokens("fox")[0])`
     // wouldn't compile — wrong term schema. ─
     let word_fox = &hash_tokens("fox")[0];
-    let hits: Vec<_> = words.query_term_ids(word_fox).collect();
+    let hits: Vec<(Id, f32)> = words
+        .query_term(word_fox)
+        .map(|(v, s)| (id_from_value(v), s))
+        .collect();
     println!("single-word query 'fox':");
     for (d, s) in &hits {
         let text = text_for(&corpus, d);
@@ -67,7 +78,10 @@ fn main() {
     // the bigrams index; only docs with that ordered pair
     // adjacently match. ─
     let phrase = &bigram_tokens("quick brown")[0];
-    let hits: Vec<_> = bigrams.query_term_ids(phrase).collect();
+    let hits: Vec<(Id, f32)> = bigrams
+        .query_term(phrase)
+        .map(|(v, s)| (id_from_value(v), s))
+        .collect();
     println!("\nphrase query 'quick brown' (adjacent only):");
     for (d, s) in &hits {
         let text = text_for(&corpus, d);
@@ -80,7 +94,10 @@ fn main() {
 
     // ── 3. Phrase query: "brown fox" — matches docs 1 and 3. ─
     let phrase = &bigram_tokens("brown fox")[0];
-    let hits: Vec<_> = bigrams.query_term_ids(phrase).collect();
+    let hits: Vec<(Id, f32)> = bigrams
+        .query_term(phrase)
+        .map(|(v, s)| (id_from_value(v), s))
+        .collect();
     println!("\nphrase query 'brown fox':");
     for (d, s) in &hits {
         let text = text_for(&corpus, d);
@@ -101,13 +118,13 @@ fn main() {
     let bigram_terms = bigram_tokens("the quick brown");
     let mut acc: HashMap<Id, f32> = HashMap::new();
     for t in &word_terms {
-        for (d, s) in words.query_term_ids(t) {
-            *acc.entry(d).or_default() += s;
+        for (v, s) in words.query_term(t) {
+            *acc.entry(id_from_value(v)).or_default() += s;
         }
     }
     for t in &bigram_terms {
-        for (d, s) in bigrams.query_term_ids(t) {
-            *acc.entry(d).or_default() += s;
+        for (v, s) in bigrams.query_term(t) {
+            *acc.entry(id_from_value(v)).or_default() += s;
         }
     }
     let mut ranked: Vec<_> = acc.into_iter().collect();

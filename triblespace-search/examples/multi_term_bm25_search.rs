@@ -1,33 +1,29 @@
 //! Multi-term BM25 search composed with a trible `pattern!`,
-//! projecting the summed BM25 score as a bound query variable.
+//! ranking by recomputed BM25 score after the engine filters.
 //!
 //! Scenario: a small book catalog where each book has a title
 //! and an author. The caller asks "books whose title matches
 //! 'graph search algorithms' AND are written by `target_author`,
-//! ranked by BM25 score". That's three constraints — the
-//! multi-term BM25 query, the author pattern — joined on the
-//! shared `?book` variable in one `find!`, with `score` bound
-//! as a query variable so the caller can sort the result rows
-//! after collecting.
-//!
-//! Contrast with `compose_bm25_and_pattern`, which uses
-//! `docs_containing` (single term, doc-only binding). This
-//! example is the same shape at the engine level but with the
-//! higher-level [`bm25_query`][q] constraint — the "two-level
-//! query API" from the design doc.
+//! ranked by BM25 score". The engine filters via
+//! [`matches`][m] (single-variable doc constraint, score floor
+//! 0.0); the caller projects each survivor through
+//! [`score`][s] for the precise rank. Same pattern as HNSW's
+//! "filter by floor, recompute score for ranking."
 //!
 //! ```sh
 //! cargo run --example multi_term_bm25_search
 //! ```
 //!
-//! [q]: triblespace_search::bm25::BM25Index::bm25_query
+//! [m]: triblespace_search::bm25::BM25Index::matches
+//! [s]: triblespace_search::bm25::BM25Index::score
 
 use triblespace_core::and;
 use triblespace_core::examples::literature;
 use triblespace_core::find;
 use triblespace_core::id::{ExclusiveId, Id};
-use triblespace_core::trible::TribleSet;
 use triblespace_core::macros::{entity, pattern};
+use triblespace_core::trible::TribleSet;
+use triblespace_core::value::ToValue;
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::tokens::hash_tokens;
@@ -87,41 +83,42 @@ fn main() {
     );
 
     // Standalone multi-term query — bag-of-words "graph search
-    // algorithms". `bm25_query` pre-aggregates the sum of
-    // per-term BM25 weights and exposes the (doc, score) table
-    // as a constraint.
+    // algorithms". `matches` filters; we recompute the precise
+    // BM25 sum afterwards for ranking.
     let query_terms = hash_tokens("graph search algorithms");
     println!("standalone multi-term query: 'graph search algorithms'");
-    let standalone: Vec<(Id, f32)> = find!(
-        (book: Id, score: f32),
-        idx.bm25_query(book, score, &query_terms)
+    let mut standalone: Vec<(Id, f32)> = find!(
+        (book: Id),
+        idx.matches(book, &query_terms, 0.0)
     )
+    .map(|(b,)| (b, idx.score(&b.to_value(), &query_terms)))
     .collect();
-    let mut ranked = standalone.clone();
-    ranked.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    for (b, s) in &ranked {
+    standalone.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    for (b, s) in &standalone {
         let title = title_for(&titles, *b);
         println!("  {s:6.3}  {b}  {title}");
     }
 
-    // Headline query: same multi-term score, gated on author.
-    // The engine joins `bm25_query` with `pattern!` on the
-    // shared ?book variable — no manual Rust-side filter.
+    // Headline query: same multi-term filter, gated on author.
+    // The engine joins `matches` with `pattern!` on the shared
+    // ?book variable — no manual Rust-side filter — then we
+    // project the survivors through `score` for ranking.
     println!("\nquery: 'graph search algorithms' AND author = target_author");
-    let matches: Vec<(Id, f32)> = find!(
-        (book: Id, score: f32),
+    let mut matches: Vec<(Id, f32)> = find!(
+        (book: Id),
         and!(
-            idx.bm25_query(book, score, &query_terms),
+            idx.matches(book, &query_terms, 0.0),
             pattern!(&kb, [{ ?book @ literature::author: &target_author }]),
         )
     )
+    .map(|(b,)| (b, idx.score(&b.to_value(), &query_terms)))
     .collect();
-    let mut matches_sorted = matches.clone();
-    matches_sorted.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    for (b, s) in &matches_sorted {
+    matches.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    for (b, s) in &matches {
         let title = title_for(&titles, *b);
         println!("  {s:6.3}  {b}  {title}");
     }
+    let matches_sorted = &matches;
 
     // Sanity:
     //   book 20 (target_author, high score)  → in

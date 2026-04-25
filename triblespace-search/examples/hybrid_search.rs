@@ -128,7 +128,7 @@ fn main() {
     // The headline query: title contains "graph" AND embedding
     // close to [1,0,0,0] (cos ≥ 0.8). One `find!`, three
     // constraints joined on `?paper` and `?emb`.
-    let graph_term = hash_tokens("graph")[0];
+    let graph_terms = hash_tokens("graph");
     let floor = 0.8f32;
     println!("\nQuery: title contains 'graph' AND embedding close to [1,0,0,0] (cos ≥ {floor})");
 
@@ -137,7 +137,7 @@ fn main() {
         temp!(
             (emb),
             and!(
-                bm25.docs_containing(paper, graph_term),
+                bm25.matches(paper, &graph_terms, 0.0),
                 pattern!(&kb, [{ ?paper @ attrs::paper_embedding: ?emb }]),
                 hnsw_view.similar_to(query_handle, emb, floor)
             )

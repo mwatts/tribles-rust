@@ -16,7 +16,7 @@ let hits: Vec<(Id,)> = find!(
     temp!(
         (emb),
         and!(
-            bm25.docs_containing(paper, graph_term),
+            bm25.matches(paper, &graph_terms, 0.0),
             pattern!(&kb, [{ ?paper @ attrs::paper_embedding: ?emb }]),
             hnsw_view.similar_to(query_handle, emb, 0.8),
         )
@@ -48,67 +48,51 @@ From `triblespace::core::query::Constraint`:
 
 ## BM25 as a `Constraint`
 
-Two constraint shapes, both generic over `(D, T)`:
+One constraint shape: `BM25Filter<S>`, generic over the doc
+schema. Same shape on both naive `BM25Index<D, T>` and succinct
+`SuccinctBM25Index<D, T>`.
 
-### `docs_containing(doc, term)`
+### `matches(doc, &terms, score_floor)`
 
 ```rust
-let c: DocsContainingTerm<'_, _, D> = idx.docs_containing(doc, term);
+let c: BM25Filter<D> = idx.matches(doc, &terms, score_floor);
 ```
 
-One variable (`doc: Variable<D>`), one pinned `term: Value<T>`.
-The engine can propose entity ids whose posting list includes
-the term, or confirm a bound doc against that posting list.
+One variable (`doc: Variable<D>`), one slice of typed terms
+`&[Value<T>]`, and one `score_floor: f32` parameter. Binds
+`doc` to documents whose summed BM25 score across every term
+in `terms` is at least `score_floor`. The engine can propose
+matching docs, or confirm a bound doc against the filter set.
 
-**Cardinality** = `doc_frequency(term)` — one posting-list
-length, no guesswork.
+**Cardinality** = number of docs that clear the floor — exact,
+computed once at construction.
 
-### `docs_and_scores(doc, score, term)`
+Aggregation runs once at construction time: walk every term's
+posting list, sum scores into a `HashMap<doc, f32>`, drop docs
+below the floor, keep the doc keys. Triblespace has no
+"arithmetic sum of bound variables" primitive, so this
+pre-materialisation is the cleanest path; the resulting
+constraint is small (`Vec<RawValue>`, one entry per matching
+doc) and the engine path needs no further lookups.
 
-```rust
-let c: BM25ScoredPostings<'_, _, D> =
-    idx.docs_and_scores(doc, score, term);
-```
-
-Two variables (`doc`, `score: Variable<F32LE>`), one pinned
-term. Every posting `(doc, score)` becomes a candidate tuple;
-the engine can project either side or drive both.
-
-Score dedupes by bit-pattern so two docs sharing a BM25 score
-don't expand into a Cartesian cross. A `BM25Queryable::score_tolerance()`
-method lets quantized backends widen the equality check
-(lossless naive returns `f32::EPSILON`; succinct returns
-`max_score / 65534`).
-
-### `bm25_query(doc, score, &terms)` — bag-of-words, summed score
+Typical calls:
 
 ```rust
-let c: BM25MultiTermScored<D> = idx.bm25_query(doc, score, &terms);
-```
-
-Higher-level BM25 constraint: binds `doc` + the *summed* BM25
-score across every term in `terms`. Equivalent to `or!`-ing a
-`docs_and_scores` per term and summing in Rust after `.collect()`,
-but materialised as a single constraint so it joins cleanly
-with `pattern!` / similarity / other BM25 clauses through the
-engine.
-
-Aggregation runs once at construction time. triblespace has no
-"arithmetic sum of bound variables" primitive; pre-materialising
-the `(doc, summed_score)` table is the cleanest path to a
-first-class constraint. Same score dedupe + tolerance behaviour
-as `docs_and_scores`.
-
-Typical call:
-
-```rust
+// "Filter only" — score_floor = 0.0 includes any matching doc.
 let tokens = hash_tokens("graph search algorithms");
-let rows: Vec<(Id, f32)> = find!(
-    (book: Id, score: f32),
+let docs: Vec<(Id,)> = find!(
+    (book: Id),
     and!(
-        idx.bm25_query(book, score, &tokens),
+        idx.matches(book, &tokens, 0.0),
         pattern!(&kb, [{ ?book @ literature::author: &target_author }]),
     ),
+)
+.collect();
+
+// "Relevance threshold" — only docs whose summed BM25 ≥ floor.
+let docs: Vec<(Id,)> = find!(
+    (book: Id),
+    idx.matches(book, &tokens, 1.5),
 )
 .collect();
 ```
@@ -117,9 +101,39 @@ The schema-typed term values (`Value<WordHash>`,
 `Value<BigramHash>`, etc.) keep the compiler enforcing that the
 right tokenizer's output reaches the right index.
 
+### `score(&doc, &terms) -> f32`
+
+```rust
+let s = idx.score(&doc.to_value(), &tokens);
+```
+
+Recompute helper for ranking. Returns the summed BM25 score for
+`doc` across `terms` — same number `matches` used internally,
+exposed as a plain function. Lossless f32 (no engine-side
+equality bookkeeping); on the succinct index the score reflects
+the stored u16 quantisation but at f32 precision.
+
+Typical use after `matches` filters through the engine:
+
+```rust
+let mut ranked: Vec<(Id, f32)> = find!(
+    (doc: Id),
+    idx.matches(doc, &tokens, 0.0)
+)
+.map(|(d,)| (d, idx.score(&d.to_value(), &tokens)))
+.collect();
+ranked.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+```
+
+Same pattern as HNSW: filter on a fixed floor, recompute the
+precise score afterwards if you need it for ranking. Score is
+never a bound query variable — quantisation bookkeeping doesn't
+reach the engine path, and the join planner stays tight (one
+less variable per BM25 clause).
+
 See `examples/multi_term_bm25_search.rs` for the full runnable
-flow, and `BM25MultiTermScored` in the `constraint` module for
-the engine-facing type.
+flow, and `BM25Filter` in the `constraint` module for the
+engine-facing type.
 
 ### Reverse lookup: doc bound, term free *(planned)*
 
@@ -222,7 +236,7 @@ find!(
     (paper: Id),
     temp!((emb),
         and!(
-            bm25.docs_containing(paper, graph_term),
+            bm25.matches(paper, &graph_terms, 0.0),
             pattern!(&kb, [{ ?paper @ attrs::paper_embedding: ?emb }]),
             hnsw.similar_to(query_handle, emb, 0.8),
         )
@@ -233,8 +247,8 @@ find!(
 find!(
     (doc: Id),
     and!(
-        bm25.docs_containing(doc, id_as_term(x)),
-        bm25.docs_containing(doc, hash_tokens("typst")[0]),
+        bm25.matches(doc, &[id_as_term(x)], 0.0),
+        bm25.matches(doc, &hash_tokens("typst"), 0.0),
     ),
 )
 
@@ -268,7 +282,7 @@ let handle: Value<Handle<Blake3, SuccinctBM25Blob>> =
 let reader = pile.reader()?;
 let idx: SuccinctBM25Index =
     reader.get::<SuccinctBM25Index, SuccinctBM25Blob>(handle)?;
-let c = idx.docs_containing(doc, term);
+let c = idx.matches(doc, &terms, 0.0);
 ```
 
 `idx` owns the data; `c` borrows it for the duration of the
@@ -282,13 +296,13 @@ query picks it up by loading the updated handle.
 2. **Async / deferred index loading.** Large blobs are
    mmap-backed via `anybytes::Bytes` already; a `Bytes::view`
    failure happens at load time, not at constraint use time.
-3. **String-input `bm25_query`.** `bm25_query` takes
-   `&[Value<T>]` today because the caller picks the tokenizer
-   (`hash_tokens` / `bigram_tokens` / ...); the two-line
-   `&hash_tokens("...")` pattern is the canonical call. A
-   `Tokenizable` trait keyed on `T` would let a one-arg
-   `bm25_query_text(doc, score, "...")` exist, but the
-   indirection isn't worth it until we have a caller asking.
+3. **String-input `matches`.** `matches` takes `&[Value<T>]`
+   today because the caller picks the tokenizer (`hash_tokens`
+   / `bigram_tokens` / ...); the two-line `&hash_tokens("...")`
+   pattern is the canonical call. A `Tokenizable` trait keyed
+   on `T` would let a one-arg `matches_text(doc, "...", floor)`
+   exist, but the indirection isn't worth it until we have a
+   caller asking.
 
 ## Non-goals (v1)
 

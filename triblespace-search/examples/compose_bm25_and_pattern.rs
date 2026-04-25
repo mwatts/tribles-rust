@@ -90,19 +90,19 @@ fn main() {
     // `target_author`." BM25 gives us lexical filtering; the
     // pattern! clause adds the author relationship. The engine
     // joins through the shared ?book variable.
-    let fox = hash_tokens("fox")[0];
+    let fox = hash_tokens("fox");
 
     println!("\nquery: title contains 'fox' AND author = target_author");
-    let matches: Vec<(Id,)> = find!(
+    let matched: Vec<(Id,)> = find!(
         (book: Id),
         and!(
-            idx.docs_containing(book, fox),
+            idx.matches(book, &fox, 0.0),
             pattern!(&kb, [{ ?book @ literature::author: &target_author }])
         )
     )
     .collect();
-    println!("  {} rows:", matches.len());
-    for (b,) in &matches {
+    println!("  {} rows:", matched.len());
+    for (b,) in &matched {
         let title = titles
             .iter()
             .find(|(id, _)| id == b)
@@ -114,15 +114,18 @@ fn main() {
     // Sanity: doc_c ("Fox Adventure") has fox in the title but
     // wrong author — excluded. doc_d ("Unrelated") has right
     // author but no fox — excluded. doc_a + doc_b survive.
-    assert_eq!(matches.len(), 2, "expected 2 surviving books");
+    assert_eq!(matched.len(), 2, "expected 2 surviving books");
 
-    // ─ Bonus: the same BM25 index drives a scored query ─
+    // ─ Bonus: filter through the engine, score precisely after ─
     println!("\nscored variant: title 'fox' with BM25 scores:");
-    let scored: Vec<(Id, f32)> = find!(
-        (book: Id, score: f32),
-        idx.docs_and_scores(book, score, fox)
+    use triblespace_core::value::ToValue;
+    let mut scored: Vec<(Id, f32)> = find!(
+        (book: Id),
+        idx.matches(book, &fox, 0.0)
     )
+    .map(|(b,)| (b, idx.score(&b.to_value(), &fox)))
     .collect();
+    scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     for (b, s) in &scored {
         let title = titles
             .iter()

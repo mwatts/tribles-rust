@@ -43,12 +43,12 @@ fn intersection_of_two_bm25_constraints_yields_overlap() {
     let mut ctx = VariableContext::new();
     let doc: Variable<GenId> = ctx.next_variable();
 
-    let fox_term = hash_tokens("fox")[0];
-    let quick_term = hash_tokens("quick")[0];
+    let fox_terms = hash_tokens("fox");
+    let quick_terms = hash_tokens("quick");
     // Both constraints touch `doc`. Box them so they share a
     // type for IntersectionConstraint<Vec<_>>.
-    let c_fox: Box<dyn Constraint> = Box::new(idx.docs_containing(doc, fox_term));
-    let c_quick: Box<dyn Constraint> = Box::new(idx.docs_containing(doc, quick_term));
+    let c_fox: Box<dyn Constraint> = Box::new(idx.matches(doc, &fox_terms, 0.0));
+    let c_quick: Box<dyn Constraint> = Box::new(idx.matches(doc, &quick_terms, 0.0));
     let intersection = IntersectionConstraint::new(vec![c_fox, c_quick]);
 
     // Sanity-check the composed variable set / estimate.
@@ -84,10 +84,10 @@ fn intersection_with_absent_term_proposes_nothing() {
     let mut ctx = VariableContext::new();
     let doc: Variable<GenId> = ctx.next_variable();
 
-    let brown_term = hash_tokens("brown")[0];
-    let banana_term = hash_tokens("banana")[0];
-    let c_brown: Box<dyn Constraint> = Box::new(idx.docs_containing(doc, brown_term));
-    let c_banana: Box<dyn Constraint> = Box::new(idx.docs_containing(doc, banana_term));
+    let brown_terms = hash_tokens("brown");
+    let banana_terms = hash_tokens("banana");
+    let c_brown: Box<dyn Constraint> = Box::new(idx.matches(doc, &brown_terms, 0.0));
+    let c_banana: Box<dyn Constraint> = Box::new(idx.matches(doc, &banana_terms, 0.0));
     let intersection = IntersectionConstraint::new(vec![c_brown, c_banana]);
 
     let binding = Binding::default();
@@ -115,10 +115,10 @@ fn satisfied_respects_both_clauses() {
     let mut ctx = VariableContext::new();
     let doc: Variable<GenId> = ctx.next_variable();
 
-    let quick_term = hash_tokens("quick")[0];
-    let fox_term = hash_tokens("fox")[0];
-    let c_quick: Box<dyn Constraint> = Box::new(idx.docs_containing(doc, quick_term));
-    let c_fox: Box<dyn Constraint> = Box::new(idx.docs_containing(doc, fox_term));
+    let quick_terms = hash_tokens("quick");
+    let fox_terms = hash_tokens("fox");
+    let c_quick: Box<dyn Constraint> = Box::new(idx.matches(doc, &quick_terms, 0.0));
+    let c_fox: Box<dyn Constraint> = Box::new(idx.matches(doc, &fox_terms, 0.0));
     let intersection = IntersectionConstraint::new(vec![c_quick, c_fox]);
 
     // doc = 1: has both "quick" and "fox" → satisfied.

@@ -36,11 +36,13 @@ naive-then-succinct implementation order is the open work item.
 
 ### What works today
 
-* **`BM25Index`** (naive in-memory): build + single- and multi-
-  term query, content-addressed byte serialization, two
-  triblespace `Constraint`s — `docs_containing` (just `doc`)
-  and `docs_and_scores` (`doc` + `score` as bound
-  `Variable<GenId>` + `Variable<F32LE>`).
+* **`BM25Index`** (naive in-memory): build + multi-term query,
+  content-addressed byte serialization, plus a single
+  triblespace `Constraint`: `matches(doc, &terms, score_floor)`
+  — binds `doc` only; score is a fixed parameter. Pair with
+  `idx.score(&doc, terms)` to recompute precise scores after
+  the engine filters, same pattern as HNSW's
+  `similar`/recompute split.
 * **`SuccinctBM25Index`**: jerky-backed zero-copy view — doc
   ids via `FixedBytesTable<16>`, terms via `FixedBytesTable<32>`,
   doc-lengths + postings via `CompactVector`. Same query
@@ -88,13 +90,13 @@ naive-then-succinct implementation order is the open work item.
   into 32-byte `Value<F32LE>`s. Used by the scored BM25
   constraint.
 * Eight runnable examples:
-  - `query_demo` — text search, multi-term OR, value-as-term
-    citation search.
+  - `query_demo` — text search, multi-term ranking via
+    filter+rescore, value-as-term citation search.
   - `compose_bm25_and_pattern` — BM25 + `pattern!` over a
     `TribleSet` in one `find!`.
-  - `multi_term_bm25_search` — higher-level `bm25_query`
-    constraint joined with a `pattern!` filter, projecting the
-    summed BM25 score as a bound engine variable.
+  - `multi_term_bm25_search` — multi-term `matches` filter
+    joined with a `pattern!` author filter, ranked by
+    post-collect `idx.score`.
   - `compose_hnsw_and_pattern` — similarity + `pattern!`
     composition via the binary `Similar` relation.
   - `hybrid_search` — BM25 + similarity + `pattern!` in one
@@ -114,9 +116,9 @@ naive-then-succinct implementation order is the open work item.
 
 ### What's next
 
-* A higher-level `bm25_query(?doc, "typst links", ?score)`
-  macro that tokenizes the query string and aggregates per-term
-  scores through the engine.
+* A higher-level `matches_text(?doc, "typst links", floor)`
+  macro that tokenizes the query string and skips the
+  `&hash_tokens(...)` ceremony.
 * Wavelet-matrix HNSW graph per DESIGN.md's RING plan (no
   current win under forward-only traversal; see
   `docs/HNSW_GRAPH_ENCODING.md`).

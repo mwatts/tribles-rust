@@ -52,17 +52,27 @@ fn main() {
     println!("\nblob size: {} bytes", bytes.len());
     assert_eq!(reloaded.doc_count(), idx.doc_count());
 
-    // Single-term query.
+    // Single-term query — iterate the posting list directly.
     println!("\nquery: 'typst'");
     let q = hash_tokens("typst");
-    for (doc, score) in reloaded.query_term_ids(&q[0]) {
-        println!("  {doc}  score={score:.3}");
+    for (doc, score) in reloaded.query_term(&q[0]) {
+        let id: Id = doc.try_from_value().expect("genid posting");
+        println!("  {id}  score={score:.3}");
     }
 
-    // Multi-term OR-query with sum-of-BM25 ranking.
+    // Multi-term ranking: filter via `matches`, score precisely
+    // via `score`, sort, truncate.
     println!("\nquery: 'fragment wiki'");
     let q = hash_tokens("fragment wiki");
-    for (doc, score) in reloaded.query_multi_ids(&q).into_iter().take(3) {
+    let mut hits: Vec<(Id, f32)> = (1u8..=20)
+        .filter_map(|byte| {
+            let id_v: Value<GenId> = (&Id::new([byte; 16])?).to_value();
+            let s = reloaded.score(&id_v, &q);
+            (s > 0.0).then_some((Id::new([byte; 16])?, s))
+        })
+        .collect();
+    hits.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    for (doc, score) in hits.into_iter().take(3) {
         println!("  {doc}  score={score:.3}");
     }
 
@@ -81,7 +91,10 @@ fn main() {
     let cite_idx = cite_builder.build();
 
     let citation_term: Value<GenId> = (&id(1)).to_value();
-    let cites_one: Vec<_> = cite_idx.query_term_ids(&citation_term).collect();
+    let cites_one: Vec<(Id, f32)> = cite_idx
+        .query_term(&citation_term)
+        .filter_map(|(v, s)| v.try_from_value().ok().map(|id: Id| (id, s)))
+        .collect();
     println!("  citations of {}: {} doc(s)", id(1), cites_one.len());
     for (doc, _) in cites_one {
         println!("    cited by {doc}");

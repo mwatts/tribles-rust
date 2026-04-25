@@ -32,19 +32,17 @@
 //!
 //! # Query surface
 //!
-//! Three constraint shapes plug into `find!` / `and!` /
-//! `pattern!` — all under the "score is a bound query
-//! variable, ordering is the caller's" tenet:
+//! Two constraint shapes plug into `find!` / `and!` /
+//! `pattern!`. Both follow the same rule: scoring is *not* a
+//! bound variable. The constraint filters on a fixed
+//! `score_floor` parameter; callers recompute the precise
+//! score afterwards if they need it for ranking.
 //!
-//! - [`BM25Index::docs_containing`][dc] /
-//!   [`BM25Index::docs_and_scores`][das] — single-term BM25,
-//!   binding `doc` (and optionally `score`) for one pinned
-//!   term. Same method on [`SuccinctBM25Index`][sbm25].
-//! - [`BM25Index::bm25_query`][bq] — multi-term bag-of-words
-//!   BM25, binding `doc` and the *summed* BM25 score across
-//!   every term. Aggregation is pre-materialised at
-//!   construction; engine shape is otherwise identical to
-//!   `docs_and_scores`.
+//! - [`BM25Index::matches`][m] — multi-term BM25 filter.
+//!   Binds `doc` to documents whose summed BM25 score across
+//!   the query terms is `>= score_floor`. Pass `0.0` for
+//!   "any matching doc". Same method on [`SuccinctBM25Index`][sbm25].
+//!   Pair with [`BM25Index::score`][s] for ranking.
 //! - [`AttachedHNSWIndex::similar`][sh] — symmetric binary
 //!   similarity relation over two
 //!   [`EmbHandle`][emb]-typed variables with a fixed cosine
@@ -53,12 +51,10 @@
 //!   [`AttachedSuccinctHNSWIndex`][ssh].
 //! - [`AttachedHNSWIndex::similar_to`][sth] — unary
 //!   convenience for the common "search from a known handle"
-//!   case; pins the probe on the call. Same method on the
-//!   Flat and succinct siblings.
+//!   case; pins the probe on the call.
 //!
-//! [dc]: bm25::BM25Index::docs_containing
-//! [das]: bm25::BM25Index::docs_and_scores
-//! [bq]: bm25::BM25Index::bm25_query
+//! [m]: bm25::BM25Index::matches
+//! [s]: bm25::BM25Index::score
 //! [sbm25]: succinct::SuccinctBM25Index
 //! [sh]: hnsw::AttachedHNSWIndex::similar
 //! [sth]: hnsw::AttachedHNSWIndex::similar_to
@@ -85,12 +81,12 @@
 //! // 2. Build a succinct BM25 index in a single pass.
 //! let idx: SuccinctBM25Index = b.build();
 //!
-//! // 3. Query through the normal engine — the constraint
-//! //    plugs into `find!` / `and!` / `pattern!` unchanged.
-//! let fox = hash_tokens("fox")[0];
+//! // 3. Filter through the engine — constraint binds `doc`
+//! //    only; `score_floor = 0.0` means "any matching doc".
+//! let terms = hash_tokens("fox");
 //! let docs: Vec<(Id,)> = find!(
 //!     (doc: Id),
-//!     idx.docs_containing(doc, fox)
+//!     idx.matches(doc, &terms, 0.0)
 //! ).collect();
 //! assert_eq!(docs.len(), 2);
 //! ```

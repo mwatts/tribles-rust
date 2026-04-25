@@ -17,9 +17,14 @@ the same invariants:
    byte buffer; a `try_from_blob` produces a view that holds an
    `anybytes::Bytes` backing and answers queries without copying.
 4. **Unordered-query shape.** Both indexes expose their query
-   primitive as a triblespace constraint:
-     `bm25.docs_and_scores(?doc, ?score, term)` — BM25 posting
-     list binding both `doc` and the BM25 `score`.
+   primitive as a triblespace constraint, and both follow the
+   same rule: doc/handle is the only bound variable, score is
+   a fixed parameter (no quantisation bookkeeping in the
+   engine path).
+     `bm25.matches(?doc, &terms, score_floor: f32)` — multi-
+     term BM25 filter. Binds `doc` to documents whose summed
+     BM25 across `terms` is `>= score_floor`. Recompute exact
+     scores via `idx.score(&doc, &terms)` for ranking.
      `hnsw.similar(?a, ?b, score_floor: f32)` — symmetric
      binary relation: `a` and `b` are
      `Variable<Handle<Blake3, Embedding>>`, `score_floor` is a
@@ -312,19 +317,21 @@ let bm25: SuccinctBM25Index = reader.get(bm25_handle)?;
 let hnsw: SuccinctHNSWIndex = reader.get(hnsw_handle)?;
 let hnsw_view = hnsw.attach(&reader);
 
-let rows: Vec<(Id, f32)> = find!(
-    (doc: Id, score: f32),
+let rows: Vec<(Id,)> = find!(
+    (doc: Id),
     and!(
         pattern!(&kb, [{ ?doc @ wiki::content: _ }]),
-        bm25.docs_and_scores(doc, score, term),
+        bm25.matches(doc, &terms, 0.0),
     ),
 )
 .collect();
 ```
 
-BM25 posting lists bind `doc` + `score` together; HNSW
-similarity is a binary `similar(a, b, score_floor)` relation
-over `Value<Handle<Blake3, Embedding>>` variables (see
+BM25 binds `doc` only — `matches(doc, &terms, score_floor)` is
+a single-variable filter; ranking happens in Rust via
+`idx.score(&doc, terms)` after `.collect()`. HNSW similarity
+is a binary `similar(a, b, score_floor)` relation over
+`Value<Handle<Blake3, Embedding>>` variables (see
 `docs/QUERY_ENGINE_INTEGRATION.md`). Ordering is operational —
 callers collect the iterator and slice.
 

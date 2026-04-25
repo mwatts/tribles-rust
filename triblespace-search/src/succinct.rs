@@ -1420,9 +1420,10 @@ where
 ///
 /// For 100k wiki fragments the naive blob is ~157 MiB; this
 /// representation cuts it to ~86 MiB via bit-packed doc_idx
-/// and u16-quantized scores. Score tolerance is exposed via
-/// [`Self::score_tolerance`] so query-time equality checks
-/// widen automatically.
+/// and u16-quantized scores. The quantization step is
+/// internal — query-time scoring goes through
+/// [`Self::score`], which returns the f32 sum derived from
+/// the stored postings.
 ///
 /// Built directly via
 /// [`BM25Builder::build`][crate::bm25::BM25Builder::build]: the
@@ -1448,7 +1449,7 @@ where
 ///
 /// // Same query API as BM25Index — "fox" hits two docs.
 /// let fox = hash_tokens("fox")[0];
-/// let hits: Vec<_> = idx.query_term_ids(&fox).collect();
+/// let hits: Vec<_> = idx.query_term(&fox).collect();
 /// assert_eq!(hits.len(), 2);
 ///
 /// // Persist via to_bytes / ToBlob<SuccinctBM25Blob> for pile storage.
@@ -1644,30 +1645,6 @@ impl<D: ValueSchema, T: ValueSchema> SuccinctBM25Index<D, T> {
             Ok(t) => self.postings.posting_count(t).unwrap_or(0),
             Err(_) => 0,
         }
-    }
-
-    /// Constraint that binds `doc` to doc keys containing `term`.
-    /// Mirror of [`crate::bm25::BM25Index::docs_containing`] for
-    /// the succinct view.
-    pub fn docs_containing(
-        &self,
-        doc: triblespace_core::query::Variable<D>,
-        term: Value<T>,
-    ) -> crate::constraint::DocsContainingTerm<'_, SuccinctBM25Index<D, T>, D> {
-        crate::constraint::DocsContainingTerm::new(self, doc, term.raw)
-    }
-
-    /// Constraint that binds both `doc` and `score` for each
-    /// posting of `term`. Mirror of
-    /// [`crate::bm25::BM25Index::docs_and_scores`] for the
-    /// succinct view.
-    pub fn docs_and_scores(
-        &self,
-        doc: triblespace_core::query::Variable<D>,
-        score: triblespace_core::query::Variable<crate::schemas::F32LE>,
-        term: Value<T>,
-    ) -> crate::constraint::BM25ScoredPostings<'_, SuccinctBM25Index<D, T>, D> {
-        crate::constraint::BM25ScoredPostings::new(self, doc, score, term.raw)
     }
 
     /// Iterate `(Value<D>, f32)` postings for `term`. Empty if
@@ -1914,28 +1891,6 @@ impl<D: ValueSchema, T: ValueSchema> SuccinctBM25Index<D, T> {
     }
 }
 
-/// GenId-specific convenience: decode posting keys as [`Id`]s.
-impl<T: ValueSchema> SuccinctBM25Index<triblespace_core::value::schemas::genid::GenId, T> {
-    /// [`query_term`][Self::query_term] with each key decoded
-    /// as an [`Id`] (empty for keys that aren't valid GenId
-    /// bit-patterns).
-    pub fn query_term_ids<'a>(
-        &'a self,
-        term: &Value<T>,
-    ) -> impl Iterator<Item = (Id, f32)> + 'a {
-        self.query_term(term)
-            .filter_map(|(v, score)| v.try_from_value::<Id>().ok().map(|id| (id, score)))
-    }
-
-    /// [`query_multi`][Self::query_multi] decoded as `(Id, f32)`
-    /// pairs.
-    pub fn query_multi_ids(&self, terms: &[Value<T>]) -> Vec<(Id, f32)> {
-        self.query_multi(terms)
-            .into_iter()
-            .filter_map(|(v, s)| v.try_from_value::<Id>().ok().map(|id| (id, s)))
-            .collect()
-    }
-}
 
 /// Header length in bytes for an `SuccinctBM25Index` blob.
 ///

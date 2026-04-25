@@ -175,19 +175,20 @@ fn query(
     let idx: SuccinctBM25Index =
         reader.get::<SuccinctBM25Index, SuccinctBM25Blob>(handle)?;
 
-    // One engine pass: `bm25_query` binds (doc, score) for the
-    // summed multi-term BM25 score, the trible pattern joins on
-    // the shared `?doc` to pick the title up at the same time.
-    // Ordering is operational — sort + truncate in Rust after
-    // collecting.
+    // One engine pass: `matches` filters by score floor 0.0, the
+    // trible pattern joins on the shared `?doc` to pick the
+    // title up at the same time. Ranking is operational — score
+    // each row through `idx.score` after collecting, then sort.
+    use triblespace_core::value::ToValue;
     let tokens = hash_tokens(text);
     let mut rows: Vec<(Id, f32, String)> = find!(
-        (doc: Id, score: f32, title: String),
+        (doc: Id, title: String),
         and!(
-            idx.bm25_query(doc, score, &tokens),
+            idx.matches(doc, &tokens, 0.0),
             pattern!(kb, [{ ?doc @ wiki::title: ?title }])
         )
     )
+    .map(|(doc, title)| (doc, idx.score(&doc.to_value(), &tokens), title))
     .collect();
     rows.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     rows.truncate(top_k);

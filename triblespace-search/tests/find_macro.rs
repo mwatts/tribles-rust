@@ -13,6 +13,7 @@ use std::collections::HashSet;
 
 use triblespace_core::find;
 use triblespace_core::id::Id;
+use triblespace_core::value::ToValue;
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::succinct::SuccinctBM25Index;
@@ -33,13 +34,13 @@ fn sample_index() -> SuccinctBM25Index {
 /// Single-variable find!: enumerate every doc that mentions
 /// "fox". Expect two rows (docs 1 and 3).
 #[test]
-fn find_docs_containing_term() {
+fn find_matches_term() {
     let idx = sample_index();
-    let fox = hash_tokens("fox")[0];
+    let fox = hash_tokens("fox");
 
     let rows: Vec<(Id,)> = find!(
         (doc: Id),
-        idx.docs_containing(doc, fox)
+        idx.matches(doc, &fox, 0.0)
     )
     .collect();
 
@@ -49,136 +50,78 @@ fn find_docs_containing_term() {
     assert!(set.contains(&id(3)));
 }
 
-/// Regression: two docs with identical BM25 scores must yield
-/// one row per doc, not a Cartesian product within the score
-/// bucket. Early versions of `BM25ScoredPostings::propose` pushed
-/// one `score` proposal per posting, so N docs sharing a score
-/// caused N×N rows. Now the constraint dedupes by bit-pattern.
+/// `matches` + post-collect `score` recompute reproduces the
+/// BM25 ranking pattern. Three docs that share posting-list
+/// membership but have different lengths should rank by their
+/// per-doc summed scores after `score()` is applied.
 #[test]
-fn find_docs_and_scores_shared_score_no_cartesian() {
+fn find_matches_then_score_for_ranking() {
     let mut b = BM25Builder::new();
-    // Three docs, same length and same tf for "fox" — identical
-    // scores.
+    // Two same-length, same-tf "fox" docs (identical scores) +
+    // one length-7 doc (lower per-term score because of length
+    // normalisation).
     b.insert(id(1), hash_tokens("the quick fox"));
     b.insert(id(2), hash_tokens("another fox book"));
-    b.insert(id(3), hash_tokens("fox adventure here"));
-    // One filler doc so corpus avg_doc_len is well-defined.
+    b.insert(id(3), hash_tokens("quick brown fox jumps high today!"));
     b.insert(id(4), hash_tokens("unrelated content only"));
     let idx = b.build();
-    let fox = hash_tokens("fox")[0];
+    let fox = hash_tokens("fox");
 
-    let postings: Vec<_> = idx.query_term(&fox).collect();
-    assert_eq!(postings.len(), 3);
-
-    let rows: Vec<(Id, f32)> = find!(
-        (doc: Id, score: f32),
-        idx.docs_and_scores(doc, score, fox)
+    // Filter through the engine.
+    let docs: Vec<Id> = find!(
+        (doc: Id),
+        idx.matches(doc, &fox, 0.0)
     )
+    .map(|(d,)| d)
     .collect();
-    // Exactly 3 rows — one per doc — regardless of score equality.
-    assert_eq!(
-        rows.len(),
-        3,
-        "expected one row per doc; got {} rows (Cartesian?)",
-        rows.len()
-    );
-    let docs: HashSet<Id> = rows.iter().map(|(d, _)| *d).collect();
     assert_eq!(docs.len(), 3);
-}
 
-/// Two-variable find!: binds both `doc` and `score`. Uses a
-/// corpus where the "fox" postings have *different* BM25 scores
-/// (doc 1 is length-1, doc 2 is length-7) so the engine can't
-/// collapse the score variable to a single value. Confirms the
-/// engine's propose/confirm protocol preserves the (doc, score)
-/// correlation — a broken constraint would produce 2×2 = 4
-/// Cartesian rows.
-#[test]
-fn find_docs_and_scores() {
-    let mut b = BM25Builder::new();
-    b.insert(id(1), hash_tokens("fox"));
-    b.insert(id(2), hash_tokens("quick brown fox jumps high today!"));
-    b.insert(id(3), hash_tokens("unrelated content"));
-    let idx = b.build();
-    let fox = hash_tokens("fox")[0];
-
-    // Sanity: the two scores should actually differ.
-    let postings: Vec<_> = idx.query_term(&fox).collect();
-    assert_eq!(postings.len(), 2);
-    let (_, s_a) = postings[0];
-    let (_, s_b) = postings[1];
-    assert!(
-        (s_a - s_b).abs() > f32::EPSILON,
-        "test fixture: doc scores should differ"
-    );
-
-    let rows: Vec<(Id, f32)> = find!(
-        (doc: Id, score: f32),
-        idx.docs_and_scores(doc, score, fox)
-    )
-    .collect();
-
-    // Map each doc to its real posting score for cross-checking.
-    // Postings are keyed by 32-byte RawValue now; decode back to
-    // the Id each row's `doc: Id` projects to.
-    let id_from_raw = |raw: &[u8; 32]| -> Id {
-        Id::new(raw[16..32].try_into().unwrap()).unwrap()
-    };
-    let truth: std::collections::HashMap<Id, f32> = postings
-        .iter()
-        .copied()
-        .map(|(v, s)| (id_from_raw(&v.raw), s))
+    // Rescore precisely after, mirroring how a faculty would
+    // present ranked results.
+    let mut ranked: Vec<(Id, f32)> = docs
+        .into_iter()
+        .map(|d| (d, idx.score(&d.to_value(), &fox)))
         .collect();
+    ranked.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
-    // Every row's (doc, score) must be one of the real postings.
-    assert!(!rows.is_empty());
-    for (d, s) in &rows {
-        let expected = truth.get(d).copied().expect("row doc in postings");
-        assert!(
-            (expected - s).abs() < 1e-5,
-            "row has mismatched score for doc {d:?}: got {s}, expected {expected}"
-        );
-    }
-    // And every posting appears at least once.
-    let row_docs: HashSet<Id> = rows.iter().map(|(d, _)| *d).collect();
-    for (v, _) in &postings {
-        let d = id_from_raw(&v.raw);
-        assert!(row_docs.contains(&d), "posting doc {d:?} missing from rows");
-    }
+    // Length-3 docs (1, 2) outrank the length-7 doc (3).
+    assert_eq!(ranked[2].0, id(3));
+    assert!((ranked[0].1 - ranked[1].1).abs() < 1e-5);
+    assert!(ranked[0].1 > ranked[2].1);
 }
 
-/// `find!` with no variables — pure existence check, matches the
-/// `exists!` pattern. Here "quick" appears in two docs, so the
-/// query has at least one row.
+/// `find!` with no projection — pure existence check, matches
+/// the `exists!` pattern. Here "quick" appears in two docs, so
+/// the query has at least one row.
 #[test]
 fn find_no_projection_is_existence() {
     let idx = sample_index();
-    let quick = hash_tokens("quick")[0];
+    let quick = hash_tokens("quick");
     let count = find!(
         (doc: Id),
-        idx.docs_containing(doc, quick)
+        idx.matches(doc, &quick, 0.0)
     )
     .count();
     assert_eq!(count, 2);
 }
 
-/// Two constraints in an `and!`: docs that contain BOTH "fox"
-/// AND "quick". Only docs 1 and 3 match in the tiny sample.
-/// Verifies that two BM25 constraints sharing a variable
+/// Two `matches` clauses in an `and!`: docs that contain BOTH
+/// "fox" AND "quick". Only docs 1 and 3 match in the tiny
+/// sample. Verifies that two BM25 constraints sharing a variable
 /// intersect correctly through the macro.
 #[test]
 fn find_intersection_of_two_terms() {
     use triblespace_core::and;
 
     let idx = sample_index();
-    let fox = hash_tokens("fox")[0];
-    let quick = hash_tokens("quick")[0];
+    let fox = hash_tokens("fox");
+    let quick = hash_tokens("quick");
 
     let rows: Vec<(Id,)> = find!(
         (doc: Id),
         and!(
-            idx.docs_containing(doc, fox),
-            idx.docs_containing(doc, quick)
+            idx.matches(doc, &fox, 0.0),
+            idx.matches(doc, &quick, 0.0)
         )
     )
     .collect();
@@ -189,46 +132,52 @@ fn find_intersection_of_two_terms() {
     assert!(set.contains(&id(3)));
 }
 
-/// Succinct-view BM25 answers a `find!` with a bound score
-/// variable, and returns a non-empty set of (doc, score) pairs.
-/// Exercises the `BM25Queryable::score_tolerance` trait method
-/// on the quantized-succinct path — previously the tolerance
-/// widening never actually ran through the engine in any test.
+/// Score-floor parameter actually filters: a floor between two
+/// docs' summed scores excludes the lower one from the engine's
+/// proposal set.
 #[test]
-fn find_docs_and_scores_on_succinct() {
-    use triblespace_search::succinct::SuccinctBM25Index;
-
+fn find_matches_with_floor_drops_low_scoring_docs() {
     let mut b = BM25Builder::new();
-    b.insert(id(1), hash_tokens("fox"));
-    b.insert(id(2), hash_tokens("quick brown fox jumps high today"));
-    b.insert(id(3), hash_tokens("unrelated content"));
-    let succinct: SuccinctBM25Index = b.build();
-    let fox = hash_tokens("fox")[0];
+    b.insert(id(1), hash_tokens("fox quick brown jumps"));
+    b.insert(id(2), hash_tokens("only fox here, nothing else"));
+    b.insert(id(3), hash_tokens("unrelated"));
+    let idx = b.build();
+    let terms = hash_tokens("fox quick brown jumps");
+    let s1 = idx.score(&id(1).to_value(), &terms);
+    let s2 = idx.score(&id(2).to_value(), &terms);
+    assert!(s1 > s2);
 
-    let rows: Vec<(Id, f32)> = find!(
-        (doc: Id, score: f32),
-        succinct.docs_and_scores(doc, score, fox)
+    let rows: Vec<(Id,)> = find!(
+        (doc: Id),
+        idx.matches(doc, &terms, (s1 + s2) / 2.0)
     )
     .collect();
-    assert!(!rows.is_empty(), "succinct index should produce rows");
+    let set: HashSet<Id> = rows.into_iter().map(|(d,)| d).collect();
+    assert_eq!(set.len(), 1);
+    assert!(set.contains(&id(1)));
+    assert!(!set.contains(&id(2)));
+}
 
-    // Every row's score must match the score produced by direct
-    // `query_term` lookup on the same index — verifies the
-    // engine's propose/confirm path delivers the same result as
-    // the direct query API.
-    let id_from_raw =
-        |raw: &[u8; 32]| -> Id { Id::new(raw[16..32].try_into().unwrap()).unwrap() };
-    for (doc, score) in &rows {
-        let expected: f32 = succinct
-            .query_term(&fox)
-            .find(|(d, _)| id_from_raw(&d.raw) == *doc)
-            .map(|(_, s)| s)
-            .expect("doc must be in succinct postings");
-        assert!(
-            (expected - score).abs() < 1e-6,
-            "engine-path score {score} for {doc:?} diverged from direct {expected}"
-        );
-    }
+/// Succinct index plugs into `find!` identically to the naive
+/// one. `sample_index()` already returns a SuccinctBM25Index —
+/// kept as a distinct test alongside `find_matches_term` so a
+/// future change that separates the naive and succinct engine
+/// paths doesn't silently drop coverage.
+#[test]
+fn find_matches_term_on_succinct() {
+    let idx = sample_index();
+    let fox = hash_tokens("fox");
+
+    let rows: Vec<(Id,)> = find!(
+        (doc: Id),
+        idx.matches(doc, &fox, 0.0)
+    )
+    .collect();
+
+    let set: HashSet<Id> = rows.into_iter().map(|(d,)| d).collect();
+    assert_eq!(set.len(), 2);
+    assert!(set.contains(&id(1)));
+    assert!(set.contains(&id(3)));
 }
 
 /// The succinct HNSW view plugs into `find!` via the binary
@@ -240,7 +189,6 @@ fn find_docs_and_scores_on_succinct() {
 /// [`Similar`]: triblespace_search::constraint::Similar
 #[test]
 fn find_hnsw_similar_on_succinct() {
-    use std::collections::HashSet;
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::repo::BlobStore;
     use triblespace_core::value::schemas::hash::{Blake3, Handle};
@@ -264,9 +212,6 @@ fn find_hnsw_similar_on_succinct() {
     let probe = handles[0];
     let floor = 0.4f32;
 
-    // Convenience path: `similar_to(probe, var, floor)` replaces
-    // the `temp!((a), and!(a.is(probe), similar(a, var, floor)))`
-    // ceremony with a single call.
     let rows: Vec<(Value<Handle<Blake3, Embedding>>,)> = find!(
         (neighbour: Value<Handle<Blake3, Embedding>>),
         succinct_view.similar_to(probe, neighbour, floor)
@@ -282,81 +227,12 @@ fn find_hnsw_similar_on_succinct() {
     assert_eq!(got, expected);
 }
 
-/// The succinct view answers `find!` queries identically to the
-/// naive one — proves the `BM25Queryable` trait actually plugs
-/// the succinct path into the engine without regressions. Uses
-/// the same corpus as `find_docs_containing_term`, just querying
-/// against the succinct view of the same index.
+/// `idx.score` (rescore helper) and `idx.matches` (engine
+/// constraint) operate on the same posting lists, so for any
+/// query the docs the constraint binds must be exactly the docs
+/// whose `score()` exceeds the floor.
 #[test]
-fn find_docs_containing_term_on_succinct() {
-    // `sample_index()` already returns a SuccinctBM25Index —
-    // kept as a distinct test alongside `find_docs_containing_term`
-    // so a future change that separates the naive and succinct
-    // engine paths doesn't silently drop coverage.
-    let idx = sample_index();
-    let fox = hash_tokens("fox")[0];
-
-    let rows: Vec<(Id,)> = find!(
-        (doc: Id),
-        idx.docs_containing(doc, fox)
-    )
-    .collect();
-
-    let set: HashSet<Id> = rows.into_iter().map(|(d,)| d).collect();
-    assert_eq!(set.len(), 2);
-    assert!(set.contains(&id(1)));
-    assert!(set.contains(&id(3)));
-}
-
-/// Multi-term BM25 via `bm25_query`: a bag-of-words query that
-/// binds `doc` + the summed BM25 score across every query term,
-/// running through the normal engine join machinery rather than
-/// a side-channel `query_multi` call.
-#[test]
-fn find_multi_term_bm25_scored() {
-    use triblespace_search::bm25::BM25Builder;
-
-    let mut b = BM25Builder::new();
-    b.insert(id(1), hash_tokens("the quick brown fox"));
-    b.insert(id(2), hash_tokens("the lazy brown dog"));
-    b.insert(id(3), hash_tokens("quick silver fox jumps"));
-    b.insert(id(4), hash_tokens("entirely unrelated"));
-    let idx = b.build();
-
-    let terms = hash_tokens("quick fox");
-    let rows: Vec<(Id, f32)> = find!(
-        (doc: Id, score: f32),
-        idx.bm25_query(doc, score, &terms)
-    )
-    .collect();
-
-    let ids: HashSet<Id> = rows.iter().map(|(d, _)| *d).collect();
-    // Docs 1 and 3 contain both "quick" and "fox"; docs 2 and 4
-    // contain neither — they never hit a posting list and drop
-    // out of the aggregation entirely.
-    assert!(ids.contains(&id(1)));
-    assert!(ids.contains(&id(3)));
-    assert!(!ids.contains(&id(2)));
-    assert!(!ids.contains(&id(4)));
-
-    // Every row's score must be positive (BM25 scores are
-    // positive for real term matches).
-    for (_, s) in &rows {
-        assert!(s.is_finite() && *s > 0.0);
-    }
-}
-
-/// `bm25_query` (engine path) and `query_multi` (side-channel
-/// Rust helper) aggregate the same per-term posting lists, so
-/// for any query they must produce the same `(doc, score)` set.
-/// Order isn't part of the engine's contract — the engine
-/// doesn't sort, `query_multi` does — so this test compares the
-/// two as multisets of bit-exact `(RawValue, u32)` pairs where
-/// the score is the f32's bit pattern.
-#[test]
-fn bm25_query_matches_query_multi() {
-    use triblespace_search::bm25::BM25Builder;
-
+fn matches_set_equals_score_threshold_set() {
     let mut b = BM25Builder::new();
     b.insert(id(1), hash_tokens("the quick brown fox jumps"));
     b.insert(id(2), hash_tokens("a fox and a cat and a dog"));
@@ -373,26 +249,27 @@ fn bm25_query_matches_query_multi() {
     ] {
         let terms = hash_tokens(query);
 
-        // Engine path — collected via find!.
-        let engine: Vec<(Id, f32)> = find!(
-            (doc: Id, score: f32),
-            idx.bm25_query(doc, score, &terms)
+        // Engine path — collected via find! at floor 0.0.
+        let engine: HashSet<Id> = find!(
+            (doc: Id),
+            idx.matches(doc, &terms, 0.0)
         )
+        .map(|(d,)| d)
         .collect();
 
-        // Side-channel path — the sort-and-return helper.
-        let helper: Vec<(Id, f32)> = idx.query_multi_ids(&terms);
-
-        // Bit-pattern multiset equality — float equality isn't
-        // reflexive on NaN and BM25 scores are finite, but using
-        // to_bits() gives a total order and bit-exact match.
-        let engine_set: HashSet<(Id, u32)> =
-            engine.iter().map(|(d, s)| (*d, s.to_bits())).collect();
-        let helper_set: HashSet<(Id, u32)> =
-            helper.iter().map(|(d, s)| (*d, s.to_bits())).collect();
+        // Reference: every doc with score > 0.0 must be in the
+        // engine set, and the engine set must contain only such
+        // docs.
+        let mut expected = HashSet::new();
+        for byte in 1u8..=4 {
+            let d = id(byte);
+            if idx.score(&d.to_value(), &terms) > 0.0 {
+                expected.insert(d);
+            }
+        }
         assert_eq!(
-            engine_set, helper_set,
-            "bm25_query vs query_multi drift on query {query:?}"
+            engine, expected,
+            "matches set diverged from score>0 set on query {query:?}"
         );
     }
 }
@@ -405,11 +282,9 @@ fn find_bm25_composed_with_pattern() {
     use triblespace_core::and;
     use triblespace_core::examples::literature;
     use triblespace_core::id::ExclusiveId;
-    use triblespace_core::trible::TribleSet;
     use triblespace_core::macros::{entity, pattern};
+    use triblespace_core::trible::TribleSet;
 
-    // Fixed Ids keep the test deterministic; `ExclusiveId::force_ref`
-    // gives `entity!` the `&ExclusiveId` it expects.
     let target_author = id(10);
     let other_author = id(11);
     let book_a = id(20);
@@ -443,7 +318,6 @@ fn find_bm25_composed_with_pattern() {
         literature::author: &target_author,
     };
 
-    // Build a BM25 index over book titles, keyed by book entity id.
     let titles: Vec<(Id, String)> = find!(
         (b: Id, title: String),
         pattern!(&kb, [{ ?b @ literature::title: ?title }])
@@ -456,11 +330,11 @@ fn find_bm25_composed_with_pattern() {
     let idx = bm25.build();
 
     // Compose: "books that mention 'fox' AND are by target_author".
-    let fox = hash_tokens("fox")[0];
+    let fox = hash_tokens("fox");
     let rows: Vec<(Id,)> = find!(
         (book: Id),
         and!(
-            idx.docs_containing(book, fox),
+            idx.matches(book, &fox, 0.0),
             pattern!(&kb, [{ ?book @ literature::author: &target_author }])
         )
     )

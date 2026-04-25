@@ -34,7 +34,7 @@
 //!
 //! // Query: how many docs mention "fox"?
 //! let q = hash_tokens("fox");
-//! let hits: Vec<_> = index.query_term_ids(&q[0]).collect();
+//! let hits: Vec<_> = index.query_term(&q[0]).collect();
 //! assert_eq!(hits.len(), 2);
 //! ```
 //!
@@ -50,7 +50,6 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
-use triblespace_core::id::Id;
 use triblespace_core::value::schemas::genid::GenId;
 use triblespace_core::value::{RawValue, ToValue, Value, ValueSchema};
 
@@ -508,28 +507,6 @@ impl<D: ValueSchema, T: ValueSchema> BM25Index<D, T> {
     }
 }
 
-/// GenId-specific convenience: decode posting keys as [`Id`]s.
-impl<T: ValueSchema> BM25Index<GenId, T> {
-    /// [`query_term`][Self::query_term] with each key decoded as
-    /// an [`Id`] (empty if the key isn't a valid GenId bit-pattern).
-    pub fn query_term_ids<'a>(
-        &'a self,
-        term: &Value<T>,
-    ) -> impl Iterator<Item = (Id, f32)> + 'a {
-        self.query_term(term)
-            .filter_map(|(v, score)| v.try_from_value::<Id>().ok().map(|id| (id, score)))
-    }
-
-    /// [`query_multi`][Self::query_multi] decoded as `(Id, f32)`
-    /// pairs.
-    pub fn query_multi_ids(&self, terms: &[Value<T>]) -> Vec<(Id, f32)> {
-        self.query_multi(terms)
-            .into_iter()
-            .filter_map(|(v, s)| v.try_from_value::<Id>().ok().map(|id| (id, s)))
-            .collect()
-    }
-}
-
 impl<D: ValueSchema, T: ValueSchema> PartialEq for BM25Index<D, T> {
     /// Bit-exact equality, including on `f32` fields — used by
     /// parallel-build tests that assert byte-identical output
@@ -563,6 +540,7 @@ impl<D: ValueSchema, T: ValueSchema> Eq for BM25Index<D, T> {}
 mod tests {
     use super::*;
     use crate::tokens::hash_tokens;
+    use triblespace_core::id::Id;
 
     fn id(byte: u8) -> Id {
         // `Id::new` returns None for the nil [0; 16] id.
