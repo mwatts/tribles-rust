@@ -304,9 +304,6 @@ fn bench(n: usize, dim: usize, k: usize, ef: usize, seed: u64) {
         ring_size as f64 / csr_size as f64,
     );
 
-    // Keep `store` alive through the whole function — its
-    // reft_light ReadHandles (what `reader.get(handle)`
-    // walks) become invalid once the writer is dropped.
     let reader = store.reader().unwrap();
 
     let mut rng = Rng(seed ^ 0xFACE_FEED);
