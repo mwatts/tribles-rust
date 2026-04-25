@@ -2,6 +2,7 @@ use crate::blob::schemas::UnknownBlob;
 use crate::blob::Blob;
 use crate::blob::BlobSchema;
 use crate::blob::ToBlob;
+use crate::patch::{Entry, IdentitySchema, PATCH};
 use crate::repo::BlobStore;
 use crate::repo::BlobStoreGet;
 use crate::repo::BlobStoreKeep;
@@ -12,108 +13,99 @@ use crate::value::schemas::hash::HashProtocol;
 use crate::value::Value;
 use crate::value::VALUE_LEN;
 
-use std::collections::{BTreeMap, HashSet};
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt::Debug;
 use std::fmt::{self};
 use std::iter::FromIterator;
-use std::ops::Bound;
-
-use reft_light::Apply;
-use reft_light::ReadHandle;
-use reft_light::WriteHandle;
+use std::marker::PhantomData;
 
 use super::TryFromBlob;
 
-enum MemoryBlobStoreOps<H: HashProtocol> {
-    Insert(Value<Handle<H, UnknownBlob>>, Blob<UnknownBlob>),
-    Keep(HashSet<[u8; VALUE_LEN]>),
-}
-
-type MemoryBlobStoreMap<H> = BTreeMap<Value<Handle<H, UnknownBlob>>, Blob<UnknownBlob>>;
-
-impl<H: HashProtocol> Apply<MemoryBlobStoreMap<H>, ()> for MemoryBlobStoreOps<H> {
-    fn apply_first(
-        &mut self,
-        first: &mut MemoryBlobStoreMap<H>,
-        _second: &MemoryBlobStoreMap<H>,
-        _auxiliary: &mut (),
-    ) {
-        match self {
-            MemoryBlobStoreOps::Insert(handle, blob) => {
-                // This operation is indempotent, so we can just
-                // ignore it if the blob is already present.
-                first.entry(*handle).or_insert(blob.clone());
-            }
-            MemoryBlobStoreOps::Keep(retain) => {
-                first.retain(|handle, _| retain.contains(&handle.raw))
-            }
-        }
-    }
-}
-
-/// A mapping from [Handle]s to [Blob]s.
+/// In-memory blob storage keyed by content-hash handle.
+///
+/// Internally a [`PATCH`] mapping the 32-byte raw handle to a
+/// [`Blob<UnknownBlob>`]. Writes go through `&mut self` (the
+/// type system enforces single-writer); [`reader`] hands out
+/// owned snapshots that are independent of the original
+/// store. PATCH's structural sharing makes those snapshots
+/// O(1) clones — the writer keeps mutating the canonical
+/// PATCH, readers each hold a pinned Arc-clone.
+///
+/// [`reader`]: BlobStore::reader
 pub struct MemoryBlobStore<H: HashProtocol> {
-    write_handle: WriteHandle<MemoryBlobStoreOps<H>, MemoryBlobStoreMap<H>, ()>,
+    blobs: PATCH<VALUE_LEN, IdentitySchema, Blob<UnknownBlob>>,
+    _marker: PhantomData<H>,
 }
 
-impl<H: HashProtocol> Debug for MemoryBlobStore<H>
-where
-    H: HashProtocol,
-{
+impl<H: HashProtocol> Debug for MemoryBlobStore<H> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "MemoryBlobStore")
     }
 }
 
 #[derive(Debug)]
-/// Clonable view into a [`MemoryBlobStore`] that only exposes read operations.
+/// Snapshot view into a [`MemoryBlobStore`]. Independent from
+/// the source store — subsequent writes to the store are not
+/// visible to a reader produced earlier; call [`reader`] again
+/// to pick them up.
 ///
-/// Clones of this struct share access to the underlying store and may be used
-/// concurrently.
+/// `Clone` is O(1) (PATCH structural sharing). The reader is
+/// `Send + Sync` and freely composes through `find!` /
+/// `pattern!` / `and!` / `or!`.
+///
+/// [`reader`]: BlobStore::reader
 pub struct MemoryBlobStoreReader<H: HashProtocol> {
-    read_handle: ReadHandle<MemoryBlobStoreMap<H>>,
+    blobs: PATCH<VALUE_LEN, IdentitySchema, Blob<UnknownBlob>>,
+    _marker: PhantomData<H>,
 }
 
 impl<H: HashProtocol> Clone for MemoryBlobStoreReader<H> {
     fn clone(&self) -> Self {
         MemoryBlobStoreReader {
-            read_handle: self.read_handle.clone(),
+            blobs: self.blobs.clone(),
+            _marker: PhantomData,
         }
     }
 }
 
 impl<H: HashProtocol> PartialEq for MemoryBlobStoreReader<H> {
     fn eq(&self, other: &Self) -> bool {
-        self.read_handle == other.read_handle
+        // PATCH equality is by key set (values aren't part of equality
+        // — see the patch module docs). Good enough for our blob-store
+        // sense of equality, since values are content-addressed by key.
+        self.blobs == other.blobs
     }
 }
 
 impl<H: HashProtocol> Eq for MemoryBlobStoreReader<H> {}
 
 impl<H: HashProtocol> MemoryBlobStoreReader<H> {
-    fn new(read_handle: ReadHandle<MemoryBlobStoreMap<H>>) -> Self {
-        MemoryBlobStoreReader { read_handle }
+    fn new(blobs: PATCH<VALUE_LEN, IdentitySchema, Blob<UnknownBlob>>) -> Self {
+        MemoryBlobStoreReader {
+            blobs,
+            _marker: PhantomData,
+        }
     }
 
-    /// Returns how many blobs are currently stored in the underlying map.
+    /// Number of blobs in this snapshot.
     pub fn len(&self) -> usize {
-        self.read_handle
-            .enter()
-            .map(|blobs| blobs.len())
-            .unwrap_or(0)
+        self.blobs.len() as usize
     }
 
-    /// Returns an iterator over all blobs currently in the store.
-    ///
-    /// The iteration order is unspecified and should not be relied on.
+    /// Iterator over `(handle, blob)` pairs in this snapshot.
+    /// Iteration order is unspecified.
     pub fn iter(&self) -> MemoryBlobStoreIter<H> {
-        let read_handle = self.read_handle.clone();
-
+        // Two clones: one drives iteration (yields keys), the
+        // other retains the values for lookup. Both are O(1)
+        // PATCH clones; the iterator owns its data so it can
+        // outlive a borrowing reference to the reader.
+        let for_iter = self.blobs.clone();
+        let lookup = for_iter.clone();
         MemoryBlobStoreIter {
-            read_handle,
-            cursor: None,
+            keys: for_iter.into_iter(),
+            lookup,
+            _marker: PhantomData,
         }
     }
 }
@@ -126,23 +118,19 @@ impl<H: HashProtocol> Default for MemoryBlobStore<H> {
 
 impl<H: HashProtocol> MemoryBlobStore<H> {
     /// Creates a new [`MemoryBlobStore`] with no blobs.
-    ///
-    /// The store keeps all data in memory and is primarily intended for tests
-    /// or other transient repositories such as workspaces.
     pub fn new() -> MemoryBlobStore<H> {
-        let write_storage = reft_light::new::<MemoryBlobStoreOps<H>, MemoryBlobStoreMap<H>, ()>(
-            MemoryBlobStoreMap::new(),
-            (),
-        );
         MemoryBlobStore {
-            write_handle: write_storage,
+            blobs: PATCH::new(),
+            _marker: PhantomData,
         }
     }
 
     /// Inserts `blob` into the store and returns the newly computed handle.
     ///
-    /// The handle is derived from hashing the blob's bytes using the hash
-    /// protocol associated with this store.
+    /// Idempotent: PATCH's `insert` is a no-op when the key is already
+    /// present, which matches blob-store semantics (handles are
+    /// content-addressed, so a duplicate-key insert is also a duplicate-value
+    /// insert).
     pub fn insert<S>(&mut self, blob: Blob<S>) -> Value<Handle<H, S>>
     where
         S: BlobSchema,
@@ -150,8 +138,8 @@ impl<H: HashProtocol> MemoryBlobStore<H> {
         let handle: Value<Handle<H, S>> = blob.get_handle();
         let unknown_handle: Value<Handle<H, UnknownBlob>> = handle.transmute();
         let blob: Blob<UnknownBlob> = blob.transmute();
-        self.write_handle
-            .append(MemoryBlobStoreOps::Insert(unknown_handle, blob));
+        let entry = Entry::with_value(&unknown_handle.raw, blob);
+        self.blobs.insert(&entry);
         handle
     }
 
@@ -163,15 +151,21 @@ impl<H: HashProtocol> MemoryBlobStore<H> {
     // allowed to write non-handle typed triples, otherwise they might as well
     // introduce blobs directly.
     /// Drops any blobs that are not referenced by one of the provided tribles.
-    ///
-    /// This is a simple mark-and-sweep style GC used to prune unreferenced
-    /// blobs from long lived stores.
     pub fn keep<I>(&mut self, handles: I)
     where
         I: IntoIterator<Item = Value<Handle<H, UnknownBlob>>>,
     {
-        let retain: HashSet<[u8; VALUE_LEN]> = handles.into_iter().map(|h| h.raw).collect();
-        self.write_handle.append(MemoryBlobStoreOps::Keep(retain));
+        // PATCH has no `retain`, so build a fresh PATCH containing only
+        // the surviving entries. Keep is rare (consolidation / explicit
+        // GC); the O(n) rebuild cost is fine.
+        let mut surviving = PATCH::new();
+        for handle in handles {
+            if let Some(blob) = self.blobs.get(&handle.raw) {
+                let entry = Entry::with_value(&handle.raw, blob.clone());
+                surviving.insert(&entry);
+            }
+        }
+        self.blobs = surviving;
     }
 }
 
@@ -191,14 +185,12 @@ where
     fn from_iter<I: IntoIterator<Item = (Value<Handle<H, UnknownBlob>>, Blob<UnknownBlob>)>>(
         iter: I,
     ) -> Self {
-        let mut set = MemoryBlobStore::new();
-
+        let mut store = MemoryBlobStore::new();
         for (handle, blob) in iter {
-            set.write_handle
-                .append(MemoryBlobStoreOps::Insert(handle, blob));
+            let entry = Entry::with_value(&handle.raw, blob);
+            store.blobs.insert(&entry);
         }
-
-        set
+        store
     }
 }
 
@@ -235,13 +227,24 @@ impl<E: Error> Error for MemoryStoreGetError<E> {}
 
 /// Iterator returned by [`MemoryBlobStoreReader::iter`].
 ///
-/// Yields `(Handle, Blob)` pairs for each entry currently in the store.
+/// Yields `(Handle, Blob)` pairs. Owned snapshot via PATCH
+/// clones — does not borrow from the source reader.
 pub struct MemoryBlobStoreIter<H>
 where
     H: HashProtocol,
 {
-    read_handle: ReadHandle<MemoryBlobStoreMap<H>>,
-    cursor: Option<Value<Handle<H, UnknownBlob>>>,
+    keys: crate::patch::PATCHIntoIterator<VALUE_LEN, IdentitySchema, Blob<UnknownBlob>>,
+    lookup: PATCH<VALUE_LEN, IdentitySchema, Blob<UnknownBlob>>,
+    _marker: PhantomData<H>,
+}
+
+impl<H> Debug for MemoryBlobStoreIter<H>
+where
+    H: HashProtocol,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MemoryBlobStoreIter").finish()
+    }
 }
 
 impl<H> Iterator for MemoryBlobStoreIter<H>
@@ -251,24 +254,14 @@ where
     type Item = (Value<Handle<H, UnknownBlob>>, Blob<UnknownBlob>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let read_handle = self.read_handle.enter()?;
-        let mut iter = if let Some(cursor) = self.cursor.take() {
-            // If we have a cursor, we start from the cursor.
-            // We use `Bound::Excluded` to skip the cursor itself.
-            read_handle.range((Bound::Excluded(cursor), Bound::Unbounded))
-        } else {
-            // If we don't have a cursor, we start from the beginning.
-            read_handle.range((
-                Bound::Unbounded::<Value<Handle<H, UnknownBlob>>>,
-                Bound::Unbounded,
-            ))
-        };
-
-        let (handle, blob) = iter.next()?;
-        self.cursor = Some(*handle);
-        Some((*handle, blob.clone()))
-        // Note: we may want to use batching in the future to gain more performance and amortize
-        // the cost of creating the iterator over the BTreeMap.
+        let key = self.keys.next()?;
+        let handle: Value<Handle<H, UnknownBlob>> = Value::new(key);
+        let blob = self
+            .lookup
+            .get(&key)
+            .cloned()
+            .expect("key from PATCH iterator must resolve in the same snapshot");
+        Some((handle, blob))
     }
 }
 
@@ -319,16 +312,10 @@ where
         T: TryFromBlob<S>,
     {
         let handle: Value<Handle<H, UnknownBlob>> = handle.transmute();
-
-        let Some(read_guard) = self.read_handle.enter() else {
+        let Some(blob) = self.blobs.get(&handle.raw) else {
             return Err(MemoryStoreGetError::NotFound());
         };
-        let Some(blob) = read_guard.get(&handle) else {
-            return Err(MemoryStoreGetError::NotFound());
-        };
-
         let blob: Blob<S> = blob.clone().transmute();
-
         match blob.try_from_blob() {
             Ok(value) => Ok(value),
             Err(e) => Err(MemoryStoreGetError::ConversionFailed(e)),
@@ -361,9 +348,9 @@ impl<H: HashProtocol> BlobStore<H> for MemoryBlobStore<H> {
     type ReaderError = Infallible;
 
     fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
-        Ok(MemoryBlobStoreReader::new(
-            self.write_handle.publish().clone(),
-        ))
+        // O(1) PATCH clone — structural sharing means readers
+        // are independent snapshots without copying the data.
+        Ok(MemoryBlobStoreReader::new(self.blobs.clone()))
     }
 }
 
@@ -398,5 +385,38 @@ mod tests {
             };
         }
         blobs.keep(potential_handles::<Blake3>(&kb));
+    }
+
+    /// `MemoryBlobStoreReader` must be `Send + Sync` so it composes
+    /// through the parallel-iter ready `and!` / `or!` macros.
+    #[test]
+    fn reader_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<MemoryBlobStoreReader<Blake3>>();
+    }
+
+    /// `reader()` returns an independent snapshot — writes after
+    /// the reader is produced are not visible to that reader.
+    /// Same shape as `PileReader`.
+    #[test]
+    fn reader_is_a_pinned_snapshot() {
+        let mut store = MemoryBlobStore::<Blake3>::new();
+        let blob_a: Value<Handle<Blake3, LongString>> =
+            store.put(Bytes::from_source("hello".to_string()).view().unwrap()).unwrap();
+        let snapshot = store.reader().unwrap();
+        assert_eq!(snapshot.len(), 1);
+
+        let _blob_b: Value<Handle<Blake3, LongString>> =
+            store.put(Bytes::from_source("world".to_string()).view().unwrap()).unwrap();
+        // The snapshot still has only the original blob.
+        assert_eq!(snapshot.len(), 1);
+        use anybytes::View;
+        let recovered: View<str> =
+            snapshot.get::<View<str>, LongString>(blob_a).unwrap();
+        assert_eq!(&*recovered, "hello");
+
+        // A fresh reader sees both.
+        let fresh = store.reader().unwrap();
+        assert_eq!(fresh.len(), 2);
     }
 }

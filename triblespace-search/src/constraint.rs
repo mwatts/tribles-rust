@@ -360,14 +360,16 @@ pub trait SimilaritySearch {
 ///
 /// # Example
 ///
-/// The vast majority of callers want the single-probe form —
-/// "find neighbours of this known handle". Use [`similar_to`]
-/// for that; it pins the probe and uses [`Similar`] internally:
+/// Pin the probe handle via `anchor.is(probe)` inside a
+/// `temp!` scope, then let the engine enumerate neighbours
+/// that clear the cosine floor:
 ///
 /// ```
 /// use std::collections::HashSet;
+/// use triblespace_core::and;
 /// use triblespace_core::blob::MemoryBlobStore;
 /// use triblespace_core::find;
+/// use triblespace_core::query::temp;
 /// use triblespace_core::repo::BlobStore;
 /// use triblespace_core::value::schemas::hash::Blake3;
 /// use triblespace_core::value::Value;
@@ -393,7 +395,10 @@ pub trait SimilaritySearch {
 /// let probe = handles[0];
 /// let rows: Vec<(Value<EmbHandle>,)> = find!(
 ///     (neighbour: Value<EmbHandle>),
-///     view.similar_to(probe, neighbour, 0.8)
+///     temp!(
+///         (anchor),
+///         and!(anchor.is(probe), view.similar(anchor, neighbour, 0.8))
+///     )
 /// )
 /// .collect();
 ///
@@ -403,29 +408,10 @@ pub trait SimilaritySearch {
 /// assert!(!got.contains(&handles[2])); // below floor
 /// ```
 ///
-/// **Binary form (both sides variables).** Useful for
-/// multi-probe clustering or symmetric self-joins.
-/// Constructing it via the `and!` macro currently requires
-/// the constraint tree to be `Send + Sync` (rayon-readiness),
-/// which most non-trivial reader types — including a
-/// `MemoryBlobStoreReader` backed by `reft_light::ReadHandle`,
-/// intentionally `!Sync` upstream — are not. Compose the
-/// pinning + similarity clauses by hand via
-/// `IntersectionConstraint::new` to bypass the macro's bound:
-///
-/// ```rust,ignore
-/// use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
-///
-/// let pin: Box<dyn Constraint> = Box::new(anchor.is(probe));
-/// let sim: Box<dyn Constraint> = Box::new(view.similar(anchor, neighbour, 0.8));
-/// let pair = IntersectionConstraint::new(vec![pin, sim]);
-/// // ... use `pair` inside `find!((neighbour), temp!((anchor), pair))` ...
-/// ```
-///
-/// See `tests/find_macro.rs::find_hnsw_similar_on_succinct`
-/// for the integration-tested form.
-///
-/// [`similar_to`]: SimilarTo
+/// For the common single-probe case, [`SimilarTo`] is unary
+/// sugar over this constraint —
+/// `view.similar_to(probe, neighbour, floor)` collapses the
+/// `temp!` + `anchor.is(...)` ceremony.
 pub struct Similar<'a, I: SimilaritySearch + ?Sized> {
     index: &'a I,
     a: Variable<Handle<Blake3, Embedding>>,
