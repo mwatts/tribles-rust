@@ -1888,7 +1888,6 @@ fn read_commit_fields(commit: &TribleSet) -> CommitInfo {
     let parent_attr = repo::parent.id();
     let message_attr = repo::message.id();
     let short_message_attr = repo::short_message.id();
-    let timestamp_attr = repo::timestamp.id();
     let created_at_attr = triblespace_core::metadata::created_at.id();
     let signed_by_attr = repo::signed_by.id();
 
@@ -1916,7 +1915,7 @@ fn read_commit_fields(commit: &TribleSet) -> CommitInfo {
         } else if a == short_message_attr {
             let v: Value<ShortString> = *t.v();
             info.short_message = v.try_from_value().ok();
-        } else if a == timestamp_attr || a == created_at_attr {
+        } else if a == created_at_attr {
             info.timestamp = Some(*t.v::<NsTAIInterval>());
         } else if a == signed_by_attr {
             let v: Value<ed::ED25519PublicKey> = *t.v();

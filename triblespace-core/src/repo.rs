@@ -210,8 +210,6 @@ attributes! {
     "272FBC56108F336C4D2E17289468C35F" as pub head: Handle<Blake3, SimpleArchive>;
     /// An id used to track the branch.
     "8694CC73AF96A5E1C7635C677D1B928A" as pub branch: GenId;
-    /// Timestamp range when this commit was created (legacy, use `metadata::created_at`).
-    "71FF566AB4E3119FC2C5E66A18979586" as pub timestamp: NsTAIInterval;
     /// The author of the signature identified by their ed25519 public key.
     "ADB4FFAD247C886848161297EFF5A05B" as pub signed_by: ed::ED25519PublicKey;
     /// The `r` part of a ed25519 signature.
