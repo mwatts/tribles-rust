@@ -76,11 +76,27 @@ pub trait AnySnapshot: Send + 'static {
     fn has_blob(&self, hash: &RawHash) -> bool;
     fn list_branches(&self) -> &[(RawBranchId, RawHash)];
     fn head(&self, branch: &RawBranchId) -> Option<RawHash>;
+    /// Enumerate every blob in this snapshot, viewed as a
+    /// `Blob<SimpleArchive>`. Blobs whose backing bytes don't even fit
+    /// the `SimpleArchive` schema (e.g. arbitrary binary payloads) are
+    /// silently skipped at the decode boundary by callers — this method
+    /// only produces the typed view, parsing happens in the consumer.
+    ///
+    /// Used by the relay's `update_snapshot` path to rescan for
+    /// revocation blob pairs after every snapshot refresh, so live
+    /// revocations gossiped into the pile take effect without a
+    /// restart. See [`triblespace_core::repo::capability::extract_revocation_pairs`].
+    fn all_simple_archive_blobs(
+        &self,
+    ) -> Vec<triblespace_core::blob::Blob<
+        triblespace_core::blob::schemas::simplearchive::SimpleArchive,
+    >>;
 }
 
 impl<R> AnySnapshot for StoreSnapshot<R>
 where
     R: triblespace_core::repo::BlobStoreGet<triblespace_core::value::schemas::hash::Blake3>
+        + triblespace_core::repo::BlobStoreList<triblespace_core::value::schemas::hash::Blake3>
         + Send + 'static,
 {
     fn get_blob(&self, hash: &RawHash) -> Option<Vec<u8>> {
@@ -102,15 +118,43 @@ where
     fn head(&self, branch: &RawBranchId) -> Option<RawHash> {
         self.branches.iter().find(|(b, _)| b == branch).map(|(_, h)| *h)
     }
+
+    fn all_simple_archive_blobs(
+        &self,
+    ) -> Vec<triblespace_core::blob::Blob<
+        triblespace_core::blob::schemas::simplearchive::SimpleArchive,
+    >> {
+        use triblespace_core::blob::Blob;
+        use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
+        use triblespace_core::value::Value;
+        use triblespace_core::value::schemas::hash::{Blake3, Handle};
+        let mut out = Vec::new();
+        for handle_result in self.reader.blobs() {
+            let Ok(handle) = handle_result else { continue };
+            let typed: Value<Handle<Blake3, SimpleArchive>> = Value::new(handle.raw);
+            if let Ok(blob) = self.reader.get::<Blob<SimpleArchive>, SimpleArchive>(typed) {
+                out.push(blob);
+            }
+        }
+        out
+    }
 }
 
 // ── Outgoing half ────────────────────────────────────────────────────
 
 /// Send commands to the host thread + update the serving snapshot.
+///
+/// `team_root` and `revoked` are carried alongside the snapshot so
+/// `update_snapshot` can rescan for new revocation blob pairs and
+/// extend the live revoked set in lockstep with the snapshot it
+/// publishes to peers. The `Arc<RwLock<...>>` is shared with the
+/// protocol handler so handler reads see the latest revocations.
 #[derive(Clone)]
 pub struct NetSender {
     cmd_tx: mpsc::Sender<NetCommand>,
     snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
+    revoked: Arc<std::sync::RwLock<HashSet<ed25519_dalek::VerifyingKey>>>,
+    team_root: ed25519_dalek::VerifyingKey,
     id: EndpointId,
 }
 
@@ -171,7 +215,36 @@ impl NetSender {
     }
 
     pub fn update_snapshot(&self, snapshot: impl AnySnapshot) {
-        *self.snapshot.lock().unwrap() = Some(Box::new(snapshot));
+        // Box first so we can both scan via the dyn-trait method AND
+        // move the same box into the snapshot Arc afterwards.
+        let boxed: Box<dyn AnySnapshot> = Box::new(snapshot);
+
+        // Rescan for revocations gossiped into the pile since the last
+        // snapshot. Authorisation policy: only revocations signed by
+        // the configured team root take effect.
+        let mut authorised: HashSet<ed25519_dalek::VerifyingKey> =
+            HashSet::new();
+        authorised.insert(self.team_root);
+        let pairs = triblespace_core::repo::capability::extract_revocation_pairs(
+            boxed.all_simple_archive_blobs(),
+        );
+        let scanned: HashSet<ed25519_dalek::VerifyingKey> =
+            triblespace_core::repo::capability::build_revocation_set(
+                &authorised, pairs,
+            );
+
+        // Union into the live set — the relay's revoked set is
+        // monotonically growing. Boot-time revocations stay in even if
+        // the corresponding blob is later GC'd from the pile, and a
+        // newly-gossiped revocation lands here without a restart.
+        if !scanned.is_empty() {
+            let mut guard = self.revoked.write().unwrap();
+            for k in scanned {
+                guard.insert(k);
+            }
+        }
+
+        *self.snapshot.lock().unwrap() = Some(boxed);
     }
 }
 
@@ -201,14 +274,31 @@ pub fn spawn(key: SigningKey, config: PeerConfig) -> (NetSender, NetReceiver) {
 
     let snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>> =
         Arc::new(Mutex::new(None));
+    let revoked: Arc<std::sync::RwLock<HashSet<ed25519_dalek::VerifyingKey>>> =
+        Arc::new(std::sync::RwLock::new(config.revoked.clone()));
+    let team_root = config.team_root;
     let thread_snapshot = snapshot.clone();
+    let thread_revoked = revoked.clone();
 
     let _thread = thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-        rt.block_on(host_loop(secret, config, cmd_rx, evt_tx, thread_snapshot));
+        rt.block_on(host_loop(
+            secret,
+            config,
+            cmd_rx,
+            evt_tx,
+            thread_snapshot,
+            thread_revoked,
+        ));
     });
 
-    let sender = NetSender { cmd_tx, snapshot, id };
+    let sender = NetSender {
+        cmd_tx,
+        snapshot,
+        revoked,
+        team_root,
+        id,
+    };
     let receiver = NetReceiver { evt_rx };
     (sender, receiver)
 }
@@ -231,12 +321,14 @@ async fn connect_authed(
     Ok(conn)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn host_loop(
     secret: iroh_base::SecretKey,
     config: PeerConfig,
     commands: mpsc::Receiver<NetCommand>,
     events: mpsc::Sender<NetEvent>,
     snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
+    revoked: Arc<std::sync::RwLock<HashSet<ed25519_dalek::VerifyingKey>>>,
 ) {
     use iroh::endpoint::presets;
     use iroh::protocol::Router;
@@ -255,12 +347,14 @@ async fn host_loop(
     let self_cap: RawHash = config.self_cap;
     let mut router_builder = Router::builder(ep.clone());
 
-    // Protocol handler.
-    let revoked_lock = Arc::new(tokio::sync::RwLock::new(config.revoked.clone()));
+    // Protocol handler. The `revoked` Arc is shared with `NetSender`
+    // so `update_snapshot` can extend it from sync code (revocations
+    // gossiped into the pile) and the handler reads the latest value
+    // on every OP_AUTH.
     let handler = SnapshotHandler {
         snapshot: snapshot.clone(),
         team_root: config.team_root,
-        revoked: revoked_lock,
+        revoked: revoked.clone(),
     };
     router_builder = router_builder.accept(PILE_SYNC_ALPN, handler);
 
@@ -569,9 +663,13 @@ struct SnapshotHandler {
     /// has mandatory auth.
     team_root: ed25519_dalek::VerifyingKey,
     /// Pubkeys whose capabilities are revoked. Cascades transitively.
-    /// `tokio::sync::RwLock` so revocations can be added at runtime
-    /// (e.g. via gossip) without restarting the handler.
-    revoked: Arc<tokio::sync::RwLock<std::collections::HashSet<ed25519_dalek::VerifyingKey>>>,
+    /// `std::sync::RwLock` (rather than `tokio::sync::RwLock`) because
+    /// the lock is also written from the sync `NetSender::update_snapshot`
+    /// path and the read inside the async `serve_stream` is brief
+    /// (read-clone-drop, no guard held across await). Revocations are
+    /// added at runtime by `update_snapshot`'s rescan, so the handler
+    /// always sees the latest set without a restart.
+    revoked: Arc<std::sync::RwLock<std::collections::HashSet<ed25519_dalek::VerifyingKey>>>,
 }
 
 impl std::fmt::Debug for SnapshotHandler {
@@ -636,7 +734,7 @@ async fn serve_stream(
     auth_state: Arc<tokio::sync::RwLock<
         Option<triblespace_core::repo::capability::VerifiedCapability>,
     >>,
-    revoked: Arc<tokio::sync::RwLock<std::collections::HashSet<ed25519_dalek::VerifyingKey>>>,
+    revoked: Arc<std::sync::RwLock<std::collections::HashSet<ed25519_dalek::VerifyingKey>>>,
     send: &mut iroh::endpoint::SendStream,
     recv: &mut iroh::endpoint::RecvStream,
 ) -> anyhow::Result<()> {
@@ -652,7 +750,9 @@ async fn serve_stream(
         let cap_handle: Value<Handle<Blake3, SimpleArchive>> =
             Value::new(cap_handle_raw);
 
-        let revoked_snapshot = revoked.read().await.clone();
+        // Brief sync read inside async — guard is dropped before any
+        // .await runs so this never blocks an async worker.
+        let revoked_snapshot = revoked.read().unwrap().clone();
         let snap_for_fetch = snap_arc.clone();
         let result = triblespace_core::repo::capability::verify_chain(
             team_root,
@@ -1150,6 +1250,139 @@ mod tests {
             "cap without read permission cannot reach any blob, even of \
              a notionally-allowed branch",
         );
+    }
+
+    /// `NetSender::update_snapshot` rescans the new snapshot for
+    /// revocation pairs signed by the configured team root and unions
+    /// them into the live `revoked` set. This is the runtime
+    /// gossip-propagation path: a revocation blob arrives in the pile
+    /// (via gossip / DHT / direct fetch), the next snapshot update
+    /// picks it up, the handler's next OP_AUTH sees the augmented
+    /// revoked set without any restart.
+    #[test]
+    fn update_snapshot_picks_up_team_root_signed_revocations() {
+        use std::sync::mpsc as std_mpsc;
+        use triblespace_core::repo::capability::build_revocation;
+
+        let team_root = SigningKey::generate(&mut OsRng);
+        let target = SigningKey::generate(&mut OsRng);
+
+        // Build a revocation pair signed by the team root.
+        let (rev_blob, rev_sig_blob) =
+            build_revocation(&team_root, target.verifying_key());
+
+        // Hand-construct the NetSender plumbing — bypassing `spawn()`
+        // because we don't need the iroh thread for this test.
+        let (cmd_tx, _cmd_rx) = std_mpsc::channel::<NetCommand>();
+        let snapshot_arc: Arc<Mutex<Option<Box<dyn AnySnapshot>>>> =
+            Arc::new(Mutex::new(None));
+        let revoked_arc: Arc<
+            std::sync::RwLock<HashSet<ed25519_dalek::VerifyingKey>>,
+        > = Arc::new(std::sync::RwLock::new(HashSet::new()));
+        // EndpointId is required by the NetSender.id field but isn't
+        // actually used by update_snapshot; derive one from a fresh key.
+        let dummy_secret = iroh_secret(&SigningKey::generate(&mut OsRng));
+        let dummy_id: EndpointId = dummy_secret.public().into();
+        let sender = NetSender {
+            cmd_tx,
+            snapshot: snapshot_arc.clone(),
+            revoked: revoked_arc.clone(),
+            team_root: team_root.verifying_key(),
+            id: dummy_id,
+        };
+
+        // Snapshot containing the revocation pair (and nothing else
+        // worth scanning).
+        let snap = snapshot_with_blobs(&[rev_blob, rev_sig_blob]);
+        let snap: Box<dyn AnySnapshot> = snap;
+
+        // Pre-state: revoked is empty.
+        assert!(revoked_arc.read().unwrap().is_empty());
+
+        // Run the rescan via the public update path.
+        sender.update_snapshot(BoxedSnap(snap));
+
+        // Post-state: target pubkey now in revoked set.
+        let revoked_after = revoked_arc.read().unwrap();
+        assert!(
+            revoked_after.contains(&target.verifying_key()),
+            "target pubkey appears in revoked set after update_snapshot",
+        );
+        assert_eq!(
+            revoked_after.len(),
+            1,
+            "exactly one new revocation, not duplicates",
+        );
+    }
+
+    /// `update_snapshot` ignores revocations signed by anyone other
+    /// than the configured team root — bystanders cannot revoke
+    /// authorised peers by gossiping their own rev blobs into the
+    /// pile.
+    #[test]
+    fn update_snapshot_ignores_bystander_signed_revocations() {
+        use std::sync::mpsc as std_mpsc;
+        use triblespace_core::repo::capability::build_revocation;
+
+        let team_root = SigningKey::generate(&mut OsRng);
+        let bystander = SigningKey::generate(&mut OsRng);
+        let target = SigningKey::generate(&mut OsRng);
+
+        let (rev_blob, rev_sig_blob) =
+            build_revocation(&bystander, target.verifying_key());
+
+        let (cmd_tx, _cmd_rx) = std_mpsc::channel::<NetCommand>();
+        let snapshot_arc: Arc<Mutex<Option<Box<dyn AnySnapshot>>>> =
+            Arc::new(Mutex::new(None));
+        let revoked_arc: Arc<
+            std::sync::RwLock<HashSet<ed25519_dalek::VerifyingKey>>,
+        > = Arc::new(std::sync::RwLock::new(HashSet::new()));
+        let dummy_secret = iroh_secret(&SigningKey::generate(&mut OsRng));
+        let dummy_id: EndpointId = dummy_secret.public().into();
+        let sender = NetSender {
+            cmd_tx,
+            snapshot: snapshot_arc,
+            revoked: revoked_arc.clone(),
+            team_root: team_root.verifying_key(),
+            id: dummy_id,
+        };
+
+        let snap = snapshot_with_blobs(&[rev_blob, rev_sig_blob]);
+        sender.update_snapshot(BoxedSnap(snap));
+
+        assert!(
+            revoked_arc.read().unwrap().is_empty(),
+            "bystander-signed revocation must not propagate into the \
+             relay's revoked set",
+        );
+    }
+
+    /// Wrapper letting us pass a pre-boxed `dyn AnySnapshot` through
+    /// the `update_snapshot(impl AnySnapshot)` API. The wrapper
+    /// implements `AnySnapshot` by delegating every method to its
+    /// inner box; `update_snapshot` re-boxes it, which is fine — the
+    /// extra indirection is only ever traversed in tests.
+    struct BoxedSnap(Box<dyn AnySnapshot>);
+    impl AnySnapshot for BoxedSnap {
+        fn get_blob(&self, hash: &RawHash) -> Option<Vec<u8>> {
+            self.0.get_blob(hash)
+        }
+        fn has_blob(&self, hash: &RawHash) -> bool {
+            self.0.has_blob(hash)
+        }
+        fn list_branches(&self) -> &[(RawBranchId, RawHash)] {
+            self.0.list_branches()
+        }
+        fn head(&self, branch: &RawBranchId) -> Option<RawHash> {
+            self.0.head(branch)
+        }
+        fn all_simple_archive_blobs(
+            &self,
+        ) -> Vec<triblespace_core::blob::Blob<
+            triblespace_core::blob::schemas::simplearchive::SimpleArchive,
+        >> {
+            self.0.all_simple_archive_blobs()
+        }
     }
 
     #[test]
