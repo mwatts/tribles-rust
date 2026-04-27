@@ -24,16 +24,19 @@ pub struct PeerConfig {
     pub peers: Vec<EndpointId>,
     /// Gossip topic name (None = no gossip, serve-only).
     pub gossip_topic: Option<String>,
+    /// The team root public key — verifies all incoming capability
+    /// chains. Every connection's first stream must present a cap that
+    /// chains back to this key. See `triblespace_core::repo::capability`.
+    pub team_root: ed25519_dalek::VerifyingKey,
+    /// Pubkeys whose capabilities are revoked. Cascades transitively
+    /// through the chain.
+    pub revoked: std::collections::HashSet<ed25519_dalek::VerifyingKey>,
 }
 
-impl Default for PeerConfig {
-    fn default() -> Self {
-        Self {
-            peers: Vec::new(),
-            gossip_topic: None,
-        }
-    }
-}
+// No `Default` impl: every PeerConfig must specify a team root because
+// auth is mandatory in protocol v4. For a single-user OSS deployment
+// the convention is `team_root = signing_key.verifying_key()` (the user
+// is the team root and the founder of a team-of-one).
 
 /// Snapshot of store state for serving protocol requests.
 pub struct StoreSnapshot<R> {
@@ -231,7 +234,12 @@ async fn host_loop(
     let mut router_builder = Router::builder(ep.clone());
 
     // Protocol handler.
-    let handler = SnapshotHandler { snapshot: snapshot.clone() };
+    let revoked_lock = Arc::new(tokio::sync::RwLock::new(config.revoked.clone()));
+    let handler = SnapshotHandler {
+        snapshot: snapshot.clone(),
+        team_root: config.team_root,
+        revoked: revoked_lock,
+    };
     router_builder = router_builder.accept(PILE_SYNC_ALPN, handler);
 
     // DHT — always on. Peers bootstrap the routing table.
@@ -530,6 +538,13 @@ async fn track_known_head(
 #[derive(Clone)]
 struct SnapshotHandler {
     snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
+    /// Verifies all incoming capability chains. Required — protocol v4
+    /// has mandatory auth.
+    team_root: ed25519_dalek::VerifyingKey,
+    /// Pubkeys whose capabilities are revoked. Cascades transitively.
+    /// `tokio::sync::RwLock` so revocations can be added at runtime
+    /// (e.g. via gossip) without restarting the handler.
+    revoked: Arc<tokio::sync::RwLock<std::collections::HashSet<ed25519_dalek::VerifyingKey>>>,
 }
 
 impl std::fmt::Debug for SnapshotHandler {
@@ -541,14 +556,43 @@ impl std::fmt::Debug for SnapshotHandler {
 impl iroh::protocol::ProtocolHandler for SnapshotHandler {
     async fn accept(&self, connection: iroh::endpoint::Connection) -> Result<(), iroh::protocol::AcceptError> {
         let snap = self.snapshot.clone();
+        let team_root = self.team_root;
+        let revoked = self.revoked.clone();
+
+        // Extract the connecting peer's verified ed25519 identity from
+        // iroh's TLS handshake.
+        let peer_endpoint = connection.remote_id();
+        let peer_pubkey = match ed25519_dalek::VerifyingKey::from_bytes(
+            peer_endpoint.as_bytes(),
+        ) {
+            Ok(k) => k,
+            Err(_) => return Ok(()),
+        };
+
+        // Per-connection auth state. Set by the first `OP_AUTH` stream;
+        // read by every subsequent stream to gate access.
+        let auth_state: Arc<tokio::sync::RwLock<
+            Option<triblespace_core::repo::capability::VerifiedCapability>,
+        >> = Arc::new(tokio::sync::RwLock::new(None));
+
         loop {
             let (mut send, mut recv) = match connection.accept_bi().await {
                 Ok(pair) => pair,
                 Err(_) => break,
             };
             let snap = snap.clone();
+            let auth_state = auth_state.clone();
+            let revoked = revoked.clone();
             tokio::spawn(async move {
-                if let Err(e) = serve_from_snapshot(&snap, &mut send, &mut recv).await {
+                if let Err(e) = serve_stream(
+                    &snap,
+                    team_root,
+                    peer_pubkey,
+                    auth_state,
+                    revoked,
+                    &mut send,
+                    &mut recv,
+                ).await {
                     eprintln!("handler error: {e}");
                 }
                 let _ = send.finish();
@@ -558,12 +602,67 @@ impl iroh::protocol::ProtocolHandler for SnapshotHandler {
     }
 }
 
-async fn serve_from_snapshot(
+async fn serve_stream(
     snap_arc: &Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
+    team_root: ed25519_dalek::VerifyingKey,
+    peer_pubkey: ed25519_dalek::VerifyingKey,
+    auth_state: Arc<tokio::sync::RwLock<
+        Option<triblespace_core::repo::capability::VerifiedCapability>,
+    >>,
+    revoked: Arc<tokio::sync::RwLock<std::collections::HashSet<ed25519_dalek::VerifyingKey>>>,
     send: &mut iroh::endpoint::SendStream,
     recv: &mut iroh::endpoint::RecvStream,
 ) -> anyhow::Result<()> {
+    use triblespace_core::blob::Blob;
+    use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
+    use triblespace_core::value::schemas::hash::{Blake3, Handle};
+    use triblespace_core::value::Value;
+
     let op = recv_u8(recv).await?;
+
+    if op == OP_AUTH {
+        let cap_handle_raw = recv_hash(recv).await?;
+        let cap_handle: Value<Handle<Blake3, SimpleArchive>> =
+            Value::new(cap_handle_raw);
+
+        let revoked_snapshot = revoked.read().await.clone();
+        let snap_for_fetch = snap_arc.clone();
+        let result = triblespace_core::repo::capability::verify_chain(
+            team_root,
+            cap_handle,
+            peer_pubkey,
+            &revoked_snapshot,
+            move |h: Value<Handle<Blake3, SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
+                let bytes = snap_for_fetch
+                    .lock()
+                    .unwrap()
+                    .as_ref()?
+                    .get_blob(&h.raw)?;
+                Some(Blob::new(anybytes::Bytes::from_source(bytes)))
+            },
+        );
+
+        match result {
+            Ok(verified) => {
+                *auth_state.write().await = Some(verified);
+                send_u8(send, AUTH_OK).await?;
+            }
+            Err(_) => {
+                send_u8(send, AUTH_REJECTED).await?;
+            }
+        }
+        return Ok(());
+    }
+
+    // All other ops require a verified cap on the connection.
+    if auth_state.read().await.is_none() {
+        // Not authenticated. Close the stream silently — the client
+        // should have presented OP_AUTH first.
+        return Ok(());
+    }
+    // For v0 every authenticated peer can do every op. Future commits
+    // will scope-gate per-op (e.g. OP_GET_BLOB only for read scope,
+    // restricting OP_HEAD to branches in scope_branch, etc.).
 
     match op {
         OP_LIST => {

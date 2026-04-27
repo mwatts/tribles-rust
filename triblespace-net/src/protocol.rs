@@ -4,27 +4,47 @@
 //! followed by the request payload. The response follows on the same stream.
 //! Stream FIN signals completion — no explicit DONE framing needed.
 //!
+//! Auth: the FIRST stream on every connection must be `OP_AUTH(cap_handle)`.
+//! The server fetches the cap chain via the local snapshot, walks it back to
+//! the configured team root, and caches the verified scope for the rest of
+//! the connection. Subsequent streams are gated on that cached scope. A
+//! connection whose first stream is not `OP_AUTH`, or whose cap fails to
+//! verify, sees every subsequent op rejected (`AUTH_REJECTED`).
+//!
 //! Nil sentinels: nil id ([0u8; 16]) and nil hash ([0u8; 32]) terminate
 //! sequences. P(collision) = 2^(-128) / 2^(-256). Content-addressed systems
 //! already assume hash uniqueness — nil sentinels are the same assumption.
 //!
 //! Operations:
+//!   AUTH       cap_handle:32 → resp:u8                (0x00 = OK, 0x01 = REJECTED)
 //!   LIST       → (id:16 head:32)* nil_id:16         (48-byte aligned entries)
 //!   HEAD       id:16 → hash:32                      (nil = no head)
 //!   GET_BLOB   hash:32 → len:u64 data                (u64::MAX = missing)
 //!   CHILDREN   parent:32 → hash* nil                  (nil = end)
 //!   (protocol is read-only — no remote writes)
 
-pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/3";
+pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/4";
 
 // Operation types — first byte on each stream.
 pub const OP_LIST: u8 = 0x01;
 pub const OP_GET_BLOB: u8 = 0x02;
 pub const OP_CHILDREN: u8 = 0x03;
 pub const OP_HEAD: u8 = 0x04;
+/// First stream on every connection. Body: cap_handle:32. Response: u8
+/// status (`AUTH_OK` or `AUTH_REJECTED`). Connection state caches the
+/// verified scope; subsequent ops on the same connection inherit it.
+pub const OP_AUTH: u8 = 0x05;
 // CAS_PUSH removed: the data model is monotonic (set union), merge
 // always succeeds, and each node manages its own branches locally.
 // No remote writes needed — the protocol is read-only.
+
+/// Auth response: capability verified, all subsequent ops on this
+/// connection are scope-gated by the verified cap.
+pub const AUTH_OK: u8 = 0x00;
+/// Auth response: capability did not verify (chain malformed, signature
+/// failed, expired, revoked, scope-not-subset, fetch failed for any
+/// link, etc.). The connection should be closed by the client.
+pub const AUTH_REJECTED: u8 = 0x01;
 
 pub const NIL_HASH: RawHash = [0u8; 32];
 pub const NIL_BRANCH_ID: RawBranchId = [0u8; 16];
@@ -88,6 +108,22 @@ pub async fn recv_u64_be(recv: &mut RecvStream) -> Result<u64> {
 }
 
 // ── Single-stream operations (client side) ───────────────────────────
+
+/// AUTH: present a capability handle. Must be the first stream opened
+/// on every new connection. Returns `Ok(())` if the server accepted the
+/// capability and the connection is authorised for subsequent ops.
+pub async fn op_auth(conn: &Connection, cap_handle: &RawHash) -> Result<()> {
+    let (mut send, mut recv) = conn.open_bi().await.map_err(|e| anyhow!("open_bi: {e}"))?;
+    send_u8(&mut send, OP_AUTH).await?;
+    send_hash(&mut send, cap_handle).await?;
+    send.finish().map_err(|e| anyhow!("finish: {e}"))?;
+    let resp = recv_u8(&mut recv).await?;
+    match resp {
+        AUTH_OK => Ok(()),
+        AUTH_REJECTED => Err(anyhow!("server rejected capability")),
+        other => Err(anyhow!("unknown auth response: {other:#x}")),
+    }
+}
 
 /// LIST: get all (branch_id, head_hash) pairs. Nil branch_id terminates.
 pub async fn op_list(conn: &Connection) -> Result<Vec<(RawBranchId, RawHash)>> {

@@ -90,9 +90,19 @@ fn run_sync(pile_path: PathBuf, peer_strs: Vec<String>, topic: Option<String>, k
     // auto-drain incoming gossip + auto-publish external writes; writes
     // auto-publish via the network thread.
     let pile = open_pile(&pile_path)?;
+    // Single-user OSS deployment convention: the user IS the team root,
+    // signs themselves a self-cap, and runs a team-of-one. Multi-user
+    // teams will set `team_root` from the team config produced by
+    // `trible team create` (forthcoming CLI work). For now this lets
+    // `trible net sync` compile against the v4 protocol; a peer that
+    // doesn't have a cap chained from this `team_root` will be
+    // rejected at handshake time.
+    let team_root = key.verifying_key();
     let peer = Peer::new(pile, key.clone(), PeerConfig {
         peers,
         gossip_topic: topic.clone(),
+        team_root,
+        revoked: std::collections::HashSet::new(),
     });
     let mut repo = Repository::new(peer, key.clone(), triblespace_core::trible::TribleSet::new())
         .map_err(|e| anyhow!("repo: {e:?}"))?;
@@ -153,10 +163,18 @@ fn run_pull(pile_path: PathBuf, remote: String, branch: String, key_path: Option
     let remote_endpoint: iroh_base::EndpointId = remote_key.into();
 
     // Spin up the Peer — pull-only mode (gossip_topic: None), no flood
-    // subscription, just direct fetch + DHT.
+    // subscription, just direct fetch + DHT. Same single-user team-root
+    // convention as `run_sync` above; multi-user teams will replace
+    // this with config-loaded values once the team CLI lands.
     use triblespace_core::repo::Repository;
     let pile = open_pile(&pile_path)?;
-    let peer = Peer::new(pile, key.clone(), PeerConfig::default());
+    let team_root = key.verifying_key();
+    let peer = Peer::new(pile, key.clone(), PeerConfig {
+        peers: Vec::new(),
+        gossip_topic: None,
+        team_root,
+        revoked: std::collections::HashSet::new(),
+    });
     let mut repo = Repository::new(peer, key.clone(), triblespace_core::trible::TribleSet::new())
         .map_err(|e| anyhow!("repo: {e:?}"))?;
 
