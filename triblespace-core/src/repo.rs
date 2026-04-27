@@ -111,6 +111,8 @@
 //!
 /// Branch metadata construction and signature verification.
 pub mod branch;
+/// Capability-based authorization for triblespace networks.
+pub mod capability;
 /// Commit metadata construction and signature verification.
 pub mod commit;
 /// Storage adapter that delegates blobs and branches to separate backends.
@@ -193,7 +195,6 @@ use crate::prelude::*;
 use crate::value::schemas::ed25519 as ed;
 use crate::value::schemas::hash::Blake3;
 use crate::value::schemas::shortstring::ShortString;
-use crate::value::schemas::time::NsTAIInterval;
 
 attributes! {
     /// The actual data of the commit.
