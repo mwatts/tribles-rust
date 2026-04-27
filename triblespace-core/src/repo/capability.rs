@@ -262,6 +262,330 @@ fn issuer_subject_value(key: VerifyingKey) -> Value<ed::ED25519PublicKey> {
     key.to_value()
 }
 
+// ── Verifier ──────────────────────────────────────────────────────────
+
+use ed25519_dalek::Verifier;
+use std::collections::HashSet;
+use crate::value::TryFromValue;
+use hifitime::Epoch;
+
+/// Errors returned by [`verify_chain`].
+#[derive(Debug)]
+pub enum VerifyError {
+    /// The leaf or some intermediate sig/cap blob could not be parsed
+    /// as a valid SimpleArchive.
+    ParseBlob(UnarchiveError),
+    /// Fetching a referenced blob (cap or sig) from the caller-supplied
+    /// fetch function failed.
+    Fetch,
+    /// A signature failed to verify against the expected pubkey + cap
+    /// blob bytes.
+    BadSignature,
+    /// The leaf cap's subject did not match the expected (connecting)
+    /// peer pubkey.
+    SubjectMismatch,
+    /// A cap's `cap_issuer` did not match the accompanying sig's
+    /// `signed_by`.
+    IssuerMismatch,
+    /// A cap or its embedded parent sig has expired.
+    Expired,
+    /// A pubkey appearing in the chain is in the revocation list.
+    Revoked,
+    /// A child cap's scope was not a subset of its parent's scope.
+    /// (Enforcement deferred to the scope-subsumption module — for now
+    /// this variant is reserved for future use.)
+    ScopeNotSubset,
+    /// A cap blob is missing required attributes (e.g. cap_subject,
+    /// cap_issuer, cap_scope_root, expires_at) or has multiple
+    /// conflicting values.
+    MalformedCap,
+    /// A sig blob is missing required attributes or has multiple
+    /// conflicting values.
+    MalformedSig,
+    /// The leaf sig blob refers to a cap blob whose handle the verifier
+    /// could not retrieve.
+    LeafCapMissing,
+    /// A non-root cap (one whose issuer differs from the team root) is
+    /// missing either `cap_parent` or `cap_embedded_parent_sig`.
+    NonRootMissingParent,
+    /// The chain exceeded a sanity-bound depth without terminating at
+    /// the team root.
+    ChainTooDeep,
+}
+
+impl From<UnarchiveError> for VerifyError {
+    fn from(e: UnarchiveError) -> Self {
+        VerifyError::ParseBlob(e)
+    }
+}
+
+/// A successfully verified leaf capability.
+#[derive(Debug, Clone)]
+pub struct VerifiedCapability {
+    /// The subject pubkey the leaf cap authorizes.
+    pub subject: VerifyingKey,
+    /// The scope root entity id within the leaf cap blob.
+    pub scope_root: crate::id::Id,
+    /// The leaf cap's full TribleSet (caller can extract its scope by
+    /// querying tribles anchored at `scope_root`).
+    pub cap_set: TribleSet,
+}
+
+/// Maximum chain depth the verifier will walk before giving up. Real
+/// chains are 1-3 deep typically; this is a sanity bound to refuse
+/// adversarial deep chains.
+pub const MAX_CHAIN_DEPTH: usize = 32;
+
+/// Verify a single signature blob's claim against a cap blob's bytes.
+///
+/// Returns the issuer pubkey (extracted from the sig blob) on success.
+/// Caller is responsible for cross-checking the issuer pubkey against
+/// the cap's `cap_issuer` attribute.
+fn verify_sig_blob(
+    sig_set: &TribleSet,
+    cap_blob: &Blob<SimpleArchive>,
+) -> Result<VerifyingKey, VerifyError> {
+    let cap_handle: Value<Handle<Blake3, SimpleArchive>> = cap_blob.get_handle();
+    let mut iter = find!(
+        (sig: crate::id::Id, signer: VerifyingKey, r, s),
+        pattern!(sig_set, [{
+            ?sig @
+            sig_signs: cap_handle,
+            crate::repo::signed_by: ?signer,
+            crate::repo::signature_r: ?r,
+            crate::repo::signature_s: ?s,
+        }])
+    );
+    let (_sig_id, signer, r, s) = match (iter.next(), iter.next()) {
+        (Some(row), None) => row,
+        _ => return Err(VerifyError::MalformedSig),
+    };
+
+    let signature = Signature::from_components(r, s);
+    signer
+        .verify(&cap_blob.bytes, &signature)
+        .map_err(|_| VerifyError::BadSignature)?;
+    Ok(signer)
+}
+
+/// Extract the leaf cap's expected attributes (subject, issuer,
+/// scope_root, expiry, optionally parent + embedded sig sub-entity).
+fn extract_cap_fields(
+    cap_set: &TribleSet,
+) -> Result<CapFields, VerifyError> {
+    let mut iter = find!(
+        (cap: crate::id::Id,
+         subject: VerifyingKey,
+         issuer: VerifyingKey,
+         scope_root: crate::id::Id,
+         expiry: Value<NsTAIInterval>),
+        pattern!(cap_set, [{
+            ?cap @
+            cap_subject: ?subject,
+            cap_issuer: ?issuer,
+            cap_scope_root: ?scope_root,
+            crate::metadata::expires_at: ?expiry,
+        }])
+    );
+    let (cap_id, subject, issuer, scope_root, expiry) = match (iter.next(), iter.next()) {
+        (Some(row), None) => row,
+        _ => return Err(VerifyError::MalformedCap),
+    };
+
+    // Optional: cap_parent + cap_embedded_parent_sig. Both present or
+    // both absent.
+    let parent_handle: Option<Value<Handle<Blake3, SimpleArchive>>> = find!(
+        (h: Value<Handle<Blake3, SimpleArchive>>),
+        pattern!(cap_set, [{ cap_id @ cap_parent: ?h }])
+    )
+    .next()
+    .map(|(h,)| h);
+
+    let embedded_sig: Option<crate::id::Id> = find!(
+        (s: crate::id::Id),
+        pattern!(cap_set, [{ cap_id @ cap_embedded_parent_sig: ?s }])
+    )
+    .next()
+    .map(|(s,)| s);
+
+    Ok(CapFields {
+        cap_id,
+        subject,
+        issuer,
+        scope_root,
+        expiry,
+        parent_handle,
+        embedded_sig,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct CapFields {
+    #[allow(dead_code)]
+    cap_id: crate::id::Id,
+    subject: VerifyingKey,
+    issuer: VerifyingKey,
+    scope_root: crate::id::Id,
+    expiry: Value<NsTAIInterval>,
+    parent_handle: Option<Value<Handle<Blake3, SimpleArchive>>>,
+    embedded_sig: Option<crate::id::Id>,
+}
+
+/// Verify that a leaf signature blob plus its referenced cap blob form
+/// a valid capability chain rooted at `team_root`, authorising the
+/// `expected_subject` to act with the leaf cap's scope.
+///
+/// `fetch_blob` is called to retrieve any cap blob referenced by a
+/// `cap_parent` handle during chain walk. The leaf sig and leaf cap
+/// blobs are also looked up via `fetch_blob`, given the
+/// `leaf_sig_handle`.
+///
+/// `revoked` is a set of pubkeys whose presence anywhere in the chain
+/// (as issuer or subject) invalidates the capability transitively.
+///
+/// Returns the verified leaf capability on success.
+pub fn verify_chain<F>(
+    team_root: VerifyingKey,
+    leaf_sig_handle: Value<Handle<Blake3, SimpleArchive>>,
+    expected_subject: VerifyingKey,
+    revoked: &HashSet<VerifyingKey>,
+    mut fetch_blob: F,
+) -> Result<VerifiedCapability, VerifyError>
+where
+    F: FnMut(Value<Handle<Blake3, SimpleArchive>>) -> Option<Blob<SimpleArchive>>,
+{
+    let now: Epoch = hifitime::Epoch::now().expect("system time");
+
+    // Helper: a cap is valid until the *upper bound* of its expiry
+    // interval. We compare that upper bound against `now`.
+    let is_expired = |expiry: &Value<NsTAIInterval>| -> bool {
+        match <(Epoch, Epoch)>::try_from_value(expiry) {
+            Ok((_lower, upper)) => upper < now,
+            // A malformed/inverted interval is treated as expired so
+            // adversarial caps can't fall through.
+            Err(_) => true,
+        }
+    };
+
+    // ── Leaf step ────────────────────────────────────────────────────
+    let leaf_sig_blob = fetch_blob(leaf_sig_handle).ok_or(VerifyError::Fetch)?;
+    let leaf_sig_set: TribleSet = TryFromBlob::try_from_blob(leaf_sig_blob)?;
+
+    // The leaf sig blob points at the leaf cap blob via sig_signs.
+    let mut leaf_cap_handle_iter = find!(
+        (sig: crate::id::Id, h: Value<Handle<Blake3, SimpleArchive>>),
+        pattern!(&leaf_sig_set, [{
+            ?sig @ sig_signs: ?h,
+        }])
+    );
+    let (_sig_id, leaf_cap_handle) = match (
+        leaf_cap_handle_iter.next(),
+        leaf_cap_handle_iter.next(),
+    ) {
+        (Some(row), None) => row,
+        _ => return Err(VerifyError::MalformedSig),
+    };
+
+    let leaf_cap_blob = fetch_blob(leaf_cap_handle).ok_or(VerifyError::LeafCapMissing)?;
+
+    // Verify the leaf signature blob against the leaf cap bytes.
+    let leaf_signer = verify_sig_blob(&leaf_sig_set, &leaf_cap_blob)?;
+
+    // Decode the leaf cap into fields.
+    let leaf_cap_set: TribleSet = TryFromBlob::try_from_blob(leaf_cap_blob.clone())?;
+    let leaf_fields = extract_cap_fields(&leaf_cap_set)?;
+
+    // Subject must match the connecting peer.
+    if leaf_fields.subject != expected_subject {
+        return Err(VerifyError::SubjectMismatch);
+    }
+    // Sig signer must match the cap's claimed issuer.
+    if leaf_signer != leaf_fields.issuer {
+        return Err(VerifyError::IssuerMismatch);
+    }
+    if is_expired(&leaf_fields.expiry) {
+        return Err(VerifyError::Expired);
+    }
+    if revoked.contains(&leaf_fields.issuer)
+        || revoked.contains(&leaf_fields.subject)
+    {
+        return Err(VerifyError::Revoked);
+    }
+
+    // ── Walk back to root ────────────────────────────────────────────
+    let mut current_set = leaf_cap_set.clone();
+    let mut current_fields = leaf_fields.clone();
+    let mut depth = 0usize;
+
+    loop {
+        if current_fields.issuer == team_root {
+            // Chain terminates at the team root.
+            return Ok(VerifiedCapability {
+                subject: leaf_fields.subject,
+                scope_root: leaf_fields.scope_root,
+                cap_set: leaf_cap_set,
+            });
+        }
+
+        depth += 1;
+        if depth > MAX_CHAIN_DEPTH {
+            return Err(VerifyError::ChainTooDeep);
+        }
+
+        // Non-root cap: must have parent + embedded sig.
+        let parent_handle = current_fields
+            .parent_handle
+            .ok_or(VerifyError::NonRootMissingParent)?;
+        let embedded_sig_id = current_fields
+            .embedded_sig
+            .ok_or(VerifyError::NonRootMissingParent)?;
+
+        // Fetch parent cap.
+        let parent_cap_blob = fetch_blob(parent_handle).ok_or(VerifyError::Fetch)?;
+
+        // Extract the embedded sig sub-entity from the *current* cap set
+        // (the parent's signature, embedded inline) and verify it
+        // attests to the parent cap's bytes.
+        let mut sig_facts = find!(
+            (signer: VerifyingKey, r, s),
+            pattern!(&current_set, [{
+                embedded_sig_id @
+                crate::repo::signed_by: ?signer,
+                crate::repo::signature_r: ?r,
+                crate::repo::signature_s: ?s,
+            }])
+        );
+        let (parent_signer, r, s) = match (sig_facts.next(), sig_facts.next()) {
+            (Some(row), None) => row,
+            _ => return Err(VerifyError::MalformedSig),
+        };
+        let signature = Signature::from_components(r, s);
+        parent_signer
+            .verify(&parent_cap_blob.bytes, &signature)
+            .map_err(|_| VerifyError::BadSignature)?;
+
+        // Decode parent cap and run the per-link checks.
+        let parent_set: TribleSet = TryFromBlob::try_from_blob(parent_cap_blob)?;
+        let parent_fields = extract_cap_fields(&parent_set)?;
+
+        if parent_signer != parent_fields.issuer {
+            return Err(VerifyError::IssuerMismatch);
+        }
+        if is_expired(&parent_fields.expiry) {
+            return Err(VerifyError::Expired);
+        }
+        if revoked.contains(&parent_fields.issuer)
+            || revoked.contains(&parent_fields.subject)
+        {
+            return Err(VerifyError::Revoked);
+        }
+
+        // Step.
+        current_set = parent_set;
+        current_fields = parent_fields;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,6 +687,260 @@ mod tests {
         )
         .count();
         assert_eq!(embedded, 0, "root cap has no embedded parent sig");
+    }
+
+    /// Helper: build an in-memory blob store keyed by handle for the
+    /// verifier's `fetch_blob` callback.
+    fn store_for(blobs: &[&Blob<SimpleArchive>])
+        -> impl FnMut(Value<Handle<Blake3, SimpleArchive>>) -> Option<Blob<SimpleArchive>>
+    {
+        let mut map = std::collections::HashMap::new();
+        for blob in blobs {
+            let handle: Value<Handle<Blake3, SimpleArchive>> = (*blob).get_handle();
+            map.insert(handle.raw, (*blob).clone());
+        }
+        move |h: Value<Handle<Blake3, SimpleArchive>>| map.get(&h.raw).cloned()
+    }
+
+    /// Verify a length-1 chain (root signs founder directly). Should
+    /// succeed and return the leaf's subject + scope_root.
+    #[test]
+    fn verify_root_chain() {
+        let team_root = signing_key();
+        let founder = signing_key();
+        let (scope_root, scope_facts) = empty_scope();
+
+        let (cap_blob, sig_blob) = build_capability(
+            &team_root,
+            founder.verifying_key(),
+            None,
+            scope_root,
+            scope_facts,
+            now_plus_24h(),
+        )
+        .expect("root cap builds");
+
+        let leaf_handle: Value<Handle<Blake3, SimpleArchive>> =
+            (&sig_blob).get_handle();
+        let revoked = HashSet::new();
+        let result = verify_chain(
+            team_root.verifying_key(),
+            leaf_handle,
+            founder.verifying_key(),
+            &revoked,
+            store_for(&[&cap_blob, &sig_blob]),
+        );
+
+        let verified = result.expect("chain verifies");
+        assert_eq!(verified.subject, founder.verifying_key());
+        assert_eq!(verified.scope_root, scope_root);
+    }
+
+    /// Verify a length-2 chain (root → founder → member). Should
+    /// succeed.
+    #[test]
+    fn verify_delegated_chain() {
+        let team_root = signing_key();
+        let founder = signing_key();
+        let member = signing_key();
+
+        let (founder_scope_root, founder_scope_facts) = empty_scope();
+        let (founder_cap, founder_sig) = build_capability(
+            &team_root,
+            founder.verifying_key(),
+            None,
+            founder_scope_root,
+            founder_scope_facts,
+            now_plus_24h(),
+        )
+        .expect("founder cap builds");
+
+        let (member_scope_root, member_scope_facts) = empty_scope();
+        let (member_cap, member_sig) = build_capability(
+            &founder,
+            member.verifying_key(),
+            Some((founder_cap.clone(), founder_sig.clone())),
+            member_scope_root,
+            member_scope_facts,
+            now_plus_24h(),
+        )
+        .expect("member cap builds");
+
+        let leaf_handle: Value<Handle<Blake3, SimpleArchive>> =
+            (&member_sig).get_handle();
+        let revoked = HashSet::new();
+        let result = verify_chain(
+            team_root.verifying_key(),
+            leaf_handle,
+            member.verifying_key(),
+            &revoked,
+            store_for(&[
+                &founder_cap,
+                &founder_sig,
+                &member_cap,
+                &member_sig,
+            ]),
+        );
+
+        let verified = result.expect("chain verifies");
+        assert_eq!(verified.subject, member.verifying_key());
+        assert_eq!(verified.scope_root, member_scope_root);
+    }
+
+    /// Subject mismatch: presenting a cap whose subject doesn't match
+    /// the connecting peer's pubkey. Should fail with SubjectMismatch.
+    #[test]
+    fn reject_subject_mismatch() {
+        let team_root = signing_key();
+        let founder = signing_key();
+        let attacker = signing_key();
+        let (scope_root, scope_facts) = empty_scope();
+
+        let (cap_blob, sig_blob) = build_capability(
+            &team_root,
+            founder.verifying_key(),
+            None,
+            scope_root,
+            scope_facts,
+            now_plus_24h(),
+        )
+        .expect("cap builds");
+
+        let leaf_handle: Value<Handle<Blake3, SimpleArchive>> =
+            (&sig_blob).get_handle();
+        let revoked = HashSet::new();
+        let result = verify_chain(
+            team_root.verifying_key(),
+            leaf_handle,
+            attacker.verifying_key(), // wrong subject
+            &revoked,
+            store_for(&[&cap_blob, &sig_blob]),
+        );
+        assert!(matches!(result, Err(VerifyError::SubjectMismatch)));
+    }
+
+    /// Wrong team root: presenting a cap signed by some other key as
+    /// the team root. Should fail with IssuerMismatch (the leaf's
+    /// issuer doesn't match the supplied team root, so chain walk
+    /// proceeds, expects a parent, finds none → NonRootMissingParent).
+    #[test]
+    fn reject_wrong_team_root() {
+        let real_root = signing_key();
+        let founder = signing_key();
+        let bogus_root = signing_key();
+        let (scope_root, scope_facts) = empty_scope();
+
+        let (cap_blob, sig_blob) = build_capability(
+            &real_root,
+            founder.verifying_key(),
+            None,
+            scope_root,
+            scope_facts,
+            now_plus_24h(),
+        )
+        .expect("cap builds");
+
+        let leaf_handle: Value<Handle<Blake3, SimpleArchive>> =
+            (&sig_blob).get_handle();
+        let revoked = HashSet::new();
+        let result = verify_chain(
+            bogus_root.verifying_key(), // wrong team root
+            leaf_handle,
+            founder.verifying_key(),
+            &revoked,
+            store_for(&[&cap_blob, &sig_blob]),
+        );
+        // The chain has issuer=real_root which != bogus_root, so the
+        // verifier tries to walk up but the cap has no parent.
+        assert!(matches!(result, Err(VerifyError::NonRootMissingParent)));
+    }
+
+    /// Revoked subject: subject pubkey appears in the revocation set.
+    /// Should fail with Revoked.
+    #[test]
+    fn reject_revoked_subject() {
+        let team_root = signing_key();
+        let founder = signing_key();
+        let (scope_root, scope_facts) = empty_scope();
+
+        let (cap_blob, sig_blob) = build_capability(
+            &team_root,
+            founder.verifying_key(),
+            None,
+            scope_root,
+            scope_facts,
+            now_plus_24h(),
+        )
+        .expect("cap builds");
+
+        let leaf_handle: Value<Handle<Blake3, SimpleArchive>> =
+            (&sig_blob).get_handle();
+        let mut revoked = HashSet::new();
+        revoked.insert(founder.verifying_key());
+
+        let result = verify_chain(
+            team_root.verifying_key(),
+            leaf_handle,
+            founder.verifying_key(),
+            &revoked,
+            store_for(&[&cap_blob, &sig_blob]),
+        );
+        assert!(matches!(result, Err(VerifyError::Revoked)));
+    }
+
+    /// Revoked transitive issuer: in a length-2 chain, revoking the
+    /// intermediate issuer (the founder, in this case) invalidates
+    /// the leaf via cascade. Should fail with Revoked at the parent
+    /// step.
+    #[test]
+    fn reject_revoked_intermediate_issuer() {
+        let team_root = signing_key();
+        let founder = signing_key();
+        let member = signing_key();
+
+        let (founder_scope_root, founder_scope_facts) = empty_scope();
+        let (founder_cap, founder_sig) = build_capability(
+            &team_root,
+            founder.verifying_key(),
+            None,
+            founder_scope_root,
+            founder_scope_facts,
+            now_plus_24h(),
+        )
+        .expect("founder cap builds");
+
+        let (member_scope_root, member_scope_facts) = empty_scope();
+        let (member_cap, member_sig) = build_capability(
+            &founder,
+            member.verifying_key(),
+            Some((founder_cap.clone(), founder_sig.clone())),
+            member_scope_root,
+            member_scope_facts,
+            now_plus_24h(),
+        )
+        .expect("member cap builds");
+
+        let leaf_handle: Value<Handle<Blake3, SimpleArchive>> =
+            (&member_sig).get_handle();
+        let mut revoked = HashSet::new();
+        // Revoke the founder's pubkey. The leaf cap's issuer is the
+        // founder, so it should be rejected at the leaf-level revocation
+        // check.
+        revoked.insert(founder.verifying_key());
+
+        let result = verify_chain(
+            team_root.verifying_key(),
+            leaf_handle,
+            member.verifying_key(),
+            &revoked,
+            store_for(&[
+                &founder_cap,
+                &founder_sig,
+                &member_cap,
+                &member_sig,
+            ]),
+        );
+        assert!(matches!(result, Err(VerifyError::Revoked)));
     }
 
     /// Length-2 chain: founder signs a member capability with the root cap
