@@ -31,6 +31,11 @@ pub struct PeerConfig {
     /// Pubkeys whose capabilities are revoked. Cascades transitively
     /// through the chain.
     pub revoked: std::collections::HashSet<ed25519_dalek::VerifyingKey>,
+    /// This node's own capability sig handle. Presented to remote peers
+    /// as the first stream on every outgoing connection so they can
+    /// authorise us. Required — protocol v4 has mandatory auth on both
+    /// directions of a connection.
+    pub self_cap: RawHash,
 }
 
 // No `Default` impl: every PeerConfig must specify a team root because
@@ -210,6 +215,22 @@ pub fn spawn(key: SigningKey, config: PeerConfig) -> (NetSender, NetReceiver) {
 
 // ── Network thread event loop ────────────────────────────────────────
 
+/// Connect to a peer over the pile-sync ALPN and immediately present
+/// our capability so subsequent ops are authorised. Protocol v4 makes
+/// this mandatory — the server rejects any op until the connection
+/// completes auth.
+async fn connect_authed(
+    ep: &iroh::Endpoint,
+    peer: EndpointId,
+    self_cap: &RawHash,
+) -> anyhow::Result<iroh::endpoint::Connection> {
+    let conn = ep.connect(peer, PILE_SYNC_ALPN).await
+        .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+    op_auth(&conn, self_cap).await
+        .map_err(|e| anyhow::anyhow!("auth: {e}"))?;
+    Ok(conn)
+}
+
 async fn host_loop(
     secret: iroh_base::SecretKey,
     config: PeerConfig,
@@ -231,6 +252,7 @@ async fn host_loop(
     ep.online().await;
 
     let my_id = ep.id();
+    let self_cap: RawHash = config.self_cap;
     let mut router_builder = Router::builder(ep.clone());
 
     // Protocol handler.
@@ -299,6 +321,7 @@ async fn host_loop(
                                 let ep2 = ep2.clone();
                                 let events_tx2 = events_tx.clone();
                                 let dht2 = dht_api2.clone();
+                                let self_cap2 = self_cap;
                                 // Use publisher key to connect for fetch (they're the source).
                                 let fetch_peer = if let Ok(pk) = iroh_base::PublicKey::from_bytes(&publisher) {
                                     pk.into()
@@ -307,7 +330,7 @@ async fn host_loop(
                                 };
                                 tokio::spawn(async move {
                                     eprintln!("[net] fetching HEAD {} from publisher {}", hex::encode(&head[..4]), hex::encode(&publisher[..4]));
-                                    track_known_head(&ep2, fetch_peer, branch, head, publisher, &dht2, &events_tx2).await;
+                                    track_known_head(&ep2, fetch_peer, branch, head, publisher, &dht2, &events_tx2, &self_cap2).await;
                                 });
                             }
                         }
@@ -356,10 +379,11 @@ async fn host_loop(
                     let ep = ep.clone();
                     let events_tx = events.clone();
                     let dht = dht_api.clone();
+                    let self_cap = self_cap;
                     tokio::spawn(async move {
                         // Discover the remote HEAD (gossip would have it for
                         // free; explicit track has to ask).
-                        let conn = match ep.connect(peer, PILE_SYNC_ALPN).await {
+                        let conn = match connect_authed(&ep, peer, &self_cap).await {
                             Ok(c) => c,
                             Err(e) => { eprintln!("[net] connect: {e}"); return; }
                         };
@@ -373,15 +397,15 @@ async fn host_loop(
                         // we asked (they vouched for this head).
                         let mut publisher = [0u8; 32];
                         publisher.copy_from_slice(peer.as_bytes());
-                        track_known_head(&ep, peer, branch, head, publisher, &dht, &events_tx).await;
+                        track_known_head(&ep, peer, branch, head, publisher, &dht, &events_tx, &self_cap).await;
                     });
                 }
                 NetCommand::ListBranches { peer, reply } => {
                     let ep = ep.clone();
+                    let self_cap = self_cap;
                     tokio::spawn(async move {
                         let result = async {
-                            let conn = ep.connect(peer, PILE_SYNC_ALPN).await
-                                .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+                            let conn = connect_authed(&ep, peer, &self_cap).await?;
                             let pairs = op_list(&conn).await?;
                             conn.close(0u32.into(), b"ok");
                             let out: Vec<(triblespace_core::id::Id, RawHash)> = pairs
@@ -397,10 +421,10 @@ async fn host_loop(
                 }
                 NetCommand::HeadOfRemote { peer, branch, reply } => {
                     let ep = ep.clone();
+                    let self_cap = self_cap;
                     tokio::spawn(async move {
                         let result = async {
-                            let conn = ep.connect(peer, PILE_SYNC_ALPN).await
-                                .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+                            let conn = connect_authed(&ep, peer, &self_cap).await?;
                             let head = op_head(&conn, &branch).await?;
                             conn.close(0u32.into(), b"ok");
                             Ok(head)
@@ -411,8 +435,9 @@ async fn host_loop(
                 NetCommand::Fetch { peer, hash, reply } => {
                     let ep = ep.clone();
                     let dht = dht_api.clone();
+                    let self_cap = self_cap;
                     tokio::spawn(async move {
-                        let result = fetch_blob(&ep, &hash, &dht, peer).await;
+                        let result = fetch_blob(&ep, &hash, &dht, peer, &self_cap).await;
                         let _ = reply.send(result);
                     });
                 }
@@ -429,6 +454,7 @@ async fn fetch_blob(
     hash: &RawHash,
     dht: &Option<crate::dht::api::ApiClient>,
     hint_peer: EndpointId,
+    self_cap: &RawHash,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     let verify = |data: &[u8]| -> bool {
         let computed = blake3::hash(data);
@@ -440,7 +466,7 @@ async fn fetch_blob(
         let blake3_hash = blake3::Hash::from_bytes(*hash);
         if let Ok(providers) = api.find_providers(blake3_hash).await {
             for provider in providers {
-                if let Ok(conn) = ep.connect(provider, PILE_SYNC_ALPN).await {
+                if let Ok(conn) = connect_authed(ep, provider, self_cap).await {
                     if let Ok(Some(data)) = op_get_blob(&conn, hash).await {
                         conn.close(0u32.into(), b"ok");
                         if verify(&data) {
@@ -454,7 +480,7 @@ async fn fetch_blob(
     }
 
     // Hint peer: the gossip sender likely has it.
-    if let Ok(conn) = ep.connect(hint_peer, PILE_SYNC_ALPN).await {
+    if let Ok(conn) = connect_authed(ep, hint_peer, self_cap).await {
         if let Ok(Some(data)) = op_get_blob(&conn, hash).await {
             conn.close(0u32.into(), b"ok");
             if verify(&data) {
@@ -475,12 +501,13 @@ async fn fetch_reachable(
     head: &RawHash,
     dht: &Option<crate::dht::api::ApiClient>,
     events: &mpsc::Sender<NetEvent>,
+    self_cap: &RawHash,
 ) -> anyhow::Result<()> {
     let mut seen: HashSet<RawHash> = HashSet::new();
     seen.insert(*head);
 
     // Fetch head blob.
-    if let Some(data) = fetch_blob(ep, head, dht, peer).await? {
+    if let Some(data) = fetch_blob(ep, head, dht, peer, self_cap).await? {
         let _ = events.send(NetEvent::Blob(data));
     }
 
@@ -490,14 +517,13 @@ async fn fetch_reachable(
         let mut next_level = Vec::new();
         for parent in &current_level {
             // CHILDREN from the gossip sender (they know the structure).
-            let conn = ep.connect(peer, PILE_SYNC_ALPN).await
-                .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+            let conn = connect_authed(ep, peer, self_cap).await?;
             let children = op_children(&conn, parent).await?;
             conn.close(0u32.into(), b"ok");
 
             for hash in children {
                 if !seen.insert(hash) { continue; }
-                if let Some(data) = fetch_blob(ep, &hash, dht, peer).await? {
+                if let Some(data) = fetch_blob(ep, &hash, dht, peer, self_cap).await? {
                     let _ = events.send(NetEvent::Blob(data));
                     next_level.push(hash);
                 }
@@ -525,8 +551,9 @@ async fn track_known_head(
     publisher: crate::channel::PublisherKey,
     dht: &Option<crate::dht::api::ApiClient>,
     events: &mpsc::Sender<NetEvent>,
+    self_cap: &RawHash,
 ) {
-    if let Err(e) = fetch_reachable(ep, fetch_peer, &head, dht, events).await {
+    if let Err(e) = fetch_reachable(ep, fetch_peer, &head, dht, events, self_cap).await {
         eprintln!("[net] fetch error: {e}");
     } else {
         let _ = events.send(NetEvent::Head { branch, head, publisher });

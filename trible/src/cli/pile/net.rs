@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use iroh_base::EndpointId;
 
 use triblespace_net::peer::{Peer, PeerConfig};
@@ -23,6 +24,46 @@ fn parse_peers(strs: &[String]) -> Vec<EndpointId> {
 
 fn key_dir(pile_path: &PathBuf) -> &std::path::Path {
     pile_path.parent().unwrap_or(pile_path.as_ref())
+}
+
+/// Read the team root pubkey from the `TRIBLE_TEAM_ROOT` env var, or
+/// fall back to the user's own pubkey for the single-user team-of-one
+/// convention. Multi-user teams MUST set the env var; if they don't,
+/// the relay will accept caps signed by their own key (treating them
+/// as the team root) and reject everyone else's caps.
+fn team_root_from_env(key: &SigningKey) -> Result<VerifyingKey> {
+    match std::env::var("TRIBLE_TEAM_ROOT") {
+        Ok(hex_str) => {
+            let bytes = hex::decode(hex_str.trim())
+                .map_err(|e| anyhow!("TRIBLE_TEAM_ROOT decode: {e}"))?;
+            let raw: [u8; 32] = bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow!("TRIBLE_TEAM_ROOT must be 32 bytes"))?;
+            VerifyingKey::from_bytes(&raw)
+                .map_err(|e| anyhow!("TRIBLE_TEAM_ROOT bad pubkey: {e}"))
+        }
+        Err(_) => Ok(key.verifying_key()),
+    }
+}
+
+/// Read this node's own capability sig handle from the
+/// `TRIBLE_TEAM_CAP` env var. Falls back to all-zeros (which the
+/// remote will reject — that's the right signal that the env var
+/// needs to be set for this node to participate in a team mesh).
+fn self_cap_from_env() -> Result<[u8; 32]> {
+    match std::env::var("TRIBLE_TEAM_CAP") {
+        Ok(hex_str) => {
+            let bytes = hex::decode(hex_str.trim())
+                .map_err(|e| anyhow!("TRIBLE_TEAM_CAP decode: {e}"))?;
+            let raw: [u8; 32] = bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow!("TRIBLE_TEAM_CAP must be 32 bytes"))?;
+            Ok(raw)
+        }
+        Err(_) => Ok([0u8; 32]),
+    }
 }
 
 // ── CLI ──────────────────────────────────────────────────────────────
@@ -90,19 +131,14 @@ fn run_sync(pile_path: PathBuf, peer_strs: Vec<String>, topic: Option<String>, k
     // auto-drain incoming gossip + auto-publish external writes; writes
     // auto-publish via the network thread.
     let pile = open_pile(&pile_path)?;
-    // Single-user OSS deployment convention: the user IS the team root,
-    // signs themselves a self-cap, and runs a team-of-one. Multi-user
-    // teams will set `team_root` from the team config produced by
-    // `trible team create` (forthcoming CLI work). For now this lets
-    // `trible net sync` compile against the v4 protocol; a peer that
-    // doesn't have a cap chained from this `team_root` will be
-    // rejected at handshake time.
-    let team_root = key.verifying_key();
+    let team_root = team_root_from_env(&key)?;
+    let self_cap = self_cap_from_env()?;
     let peer = Peer::new(pile, key.clone(), PeerConfig {
         peers,
         gossip_topic: topic.clone(),
         team_root,
         revoked: std::collections::HashSet::new(),
+        self_cap,
     });
     let mut repo = Repository::new(peer, key.clone(), triblespace_core::trible::TribleSet::new())
         .map_err(|e| anyhow!("repo: {e:?}"))?;
@@ -163,17 +199,17 @@ fn run_pull(pile_path: PathBuf, remote: String, branch: String, key_path: Option
     let remote_endpoint: iroh_base::EndpointId = remote_key.into();
 
     // Spin up the Peer — pull-only mode (gossip_topic: None), no flood
-    // subscription, just direct fetch + DHT. Same single-user team-root
-    // convention as `run_sync` above; multi-user teams will replace
-    // this with config-loaded values once the team CLI lands.
+    // subscription, just direct fetch + DHT.
     use triblespace_core::repo::Repository;
     let pile = open_pile(&pile_path)?;
-    let team_root = key.verifying_key();
+    let team_root = team_root_from_env(&key)?;
+    let self_cap = self_cap_from_env()?;
     let peer = Peer::new(pile, key.clone(), PeerConfig {
         peers: Vec::new(),
         gossip_topic: None,
         team_root,
         revoked: std::collections::HashSet::new(),
+        self_cap,
     });
     let mut repo = Repository::new(peer, key.clone(), triblespace_core::trible::TribleSet::new())
         .map_err(|e| anyhow!("repo: {e:?}"))?;
