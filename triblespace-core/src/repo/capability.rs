@@ -458,6 +458,92 @@ where
     revoked
 }
 
+/// Extract revocation `(rev_blob, sig_blob)` pairs from an arbitrary
+/// collection of `SimpleArchive` blobs.
+///
+/// A blob is treated as a candidate signature if it decodes as a
+/// `TribleSet` carrying exactly one `(?sig @ sig_signs: ?h)` triple.
+/// The referenced handle is then looked up in the same blob set; if
+/// that target blob carries a `(?rev @ rev_target: ?_)` triple, the
+/// pair is emitted.
+///
+/// Decoding failures are silently dropped — the caller is iterating
+/// over a heterogeneous blob store (caps, sigs, commits, payload data)
+/// and most blobs will not be revocation-shaped.
+///
+/// The result feeds directly into [`build_revocation_set`] so the
+/// usual call shape is:
+///
+/// ```text
+/// let pairs = extract_revocation_pairs(snapshot_blobs);
+/// let revoked = build_revocation_set(&authorised, pairs);
+/// ```
+///
+/// Independent step from `build_revocation_set` because callers
+/// commonly want to inspect / log the candidate pairs (e.g. for a
+/// "tell me what revocations my pile contains" CLI) before deciding
+/// which authorised-revoker policy to apply.
+pub fn extract_revocation_pairs<I>(
+    blobs: I,
+) -> Vec<(Blob<SimpleArchive>, Blob<SimpleArchive>)>
+where
+    I: IntoIterator<Item = Blob<SimpleArchive>>,
+{
+    let blob_map: std::collections::HashMap<[u8; 32], Blob<SimpleArchive>> = blobs
+        .into_iter()
+        .map(|b| {
+            let h: Value<Handle<Blake3, SimpleArchive>> = (&b).get_handle();
+            (h.raw, b)
+        })
+        .collect();
+
+    let mut pairs = Vec::new();
+    for candidate_sig in blob_map.values() {
+        // Try to decode as a sig blob.
+        let Ok(sig_set): Result<TribleSet, _> =
+            TryFromBlob::try_from_blob(candidate_sig.clone())
+        else {
+            continue;
+        };
+        let mut sig_iter = find!(
+            (sig: crate::id::Id, h: Value<Handle<Blake3, SimpleArchive>>),
+            pattern!(&sig_set, [{ ?sig @ sig_signs: ?h }])
+        );
+        // Exactly one sig_signs triple — anything else is non-sig-shaped
+        // (e.g. a cap blob with embedded sub-entities of its own).
+        let target_handle = match (sig_iter.next(), sig_iter.next()) {
+            (Some((_, h)), None) => h,
+            _ => continue,
+        };
+
+        // Look up the target blob in our local set. (Revocation pairs
+        // are gossiped together; if only one half made it into this
+        // collection we treat the pair as incomplete and skip.)
+        let Some(target_blob) = blob_map.get(&target_handle.raw) else {
+            continue;
+        };
+
+        // Confirm the target is a revocation blob (carries rev_target).
+        let Ok(target_set): Result<TribleSet, _> =
+            TryFromBlob::try_from_blob(target_blob.clone())
+        else {
+            continue;
+        };
+        let is_revocation = find!(
+            (e: crate::id::Id, t: VerifyingKey),
+            pattern!(&target_set, [{ ?e @ rev_target: ?t }])
+        )
+        .next()
+        .is_some();
+        if !is_revocation {
+            continue;
+        }
+
+        pairs.push((target_blob.clone(), candidate_sig.clone()));
+    }
+    pairs
+}
+
 // ── Verifier ──────────────────────────────────────────────────────────
 
 use ed25519_dalek::Verifier;
@@ -1353,6 +1439,88 @@ mod tests {
             store_for(&[&cap_blob, &sig_blob]),
         );
         assert!(matches!(result, Err(VerifyError::Revoked)));
+    }
+
+    /// `extract_revocation_pairs` finds matched (rev, sig) pairs in a
+    /// heterogeneous blob set and ignores everything else.
+    #[test]
+    fn extract_revocation_pairs_finds_matched_pair() {
+        let team_root = signing_key();
+        let target = signing_key();
+        let (rev_blob, sig_blob) =
+            build_revocation(&team_root, target.verifying_key());
+
+        // Mix in an unrelated cap blob to confirm the scanner doesn't
+        // misclassify it as a revocation.
+        let (scope_root, scope_facts) = empty_scope();
+        let founder = signing_key();
+        let (cap_blob, cap_sig_blob) = build_capability(
+            &team_root,
+            founder.verifying_key(),
+            None,
+            scope_root,
+            scope_facts,
+            now_plus_24h(),
+        )
+        .expect("cap builds");
+
+        let pairs = extract_revocation_pairs([
+            rev_blob.clone(),
+            sig_blob.clone(),
+            cap_blob,
+            cap_sig_blob,
+        ]);
+        assert_eq!(pairs.len(), 1, "exactly one revocation pair");
+        let (out_rev, out_sig) = &pairs[0];
+        assert_eq!(out_rev.bytes, rev_blob.bytes);
+        assert_eq!(out_sig.bytes, sig_blob.bytes);
+    }
+
+    /// A revocation sig blob whose target rev blob is missing from the
+    /// input set is treated as incomplete and dropped.
+    #[test]
+    fn extract_revocation_pairs_drops_orphan_sig() {
+        let team_root = signing_key();
+        let target = signing_key();
+        let (_rev_blob, sig_blob) =
+            build_revocation(&team_root, target.verifying_key());
+        // sig_blob is included but rev_blob is not.
+        let pairs = extract_revocation_pairs([sig_blob]);
+        assert!(
+            pairs.is_empty(),
+            "orphan sig (target blob missing) is not paired"
+        );
+    }
+
+    /// `extract_revocation_pairs` + `build_revocation_set` compose to
+    /// give the relay's bootstrap path: scan a pile, retain only
+    /// authorised revocations, get the revoked-key set.
+    #[test]
+    fn extract_then_build_revocation_set_round_trips() {
+        let team_root = signing_key();
+        let bystander = signing_key();
+        let target_authorised = signing_key();
+        let target_rogue = signing_key();
+
+        let (rev_a, sig_a) =
+            build_revocation(&team_root, target_authorised.verifying_key());
+        let (rev_b, sig_b) =
+            build_revocation(&bystander, target_rogue.verifying_key());
+
+        let pairs = extract_revocation_pairs([
+            rev_a, sig_a, rev_b, sig_b,
+        ]);
+        assert_eq!(pairs.len(), 2);
+
+        let mut authorised = HashSet::new();
+        authorised.insert(team_root.verifying_key());
+        let revoked = build_revocation_set(&authorised, pairs);
+
+        assert!(revoked.contains(&target_authorised.verifying_key()));
+        assert!(
+            !revoked.contains(&target_rogue.verifying_key()),
+            "bystander-signed revocation is dropped",
+        );
     }
 
     /// In a length-2 chain, a child cap claiming a permission the
