@@ -172,7 +172,7 @@ fn bench_tribles_roundtrip(c: &mut Criterion, payload: &str) {
             let fragment = importer
                 .import_blob(blob.clone())
                 .expect("import JSON-LD as JSON");
-            let archive = SimpleArchive::blob_from(&fragment);
+            let archive = SimpleArchive::blob_from(&*fragment);
             hint::black_box(archive.bytes.len());
         });
     });
