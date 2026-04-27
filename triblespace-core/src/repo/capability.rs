@@ -353,11 +353,117 @@ pub fn scope_subsumes(
     true
 }
 
+// ── Revocation blobs ─────────────────────────────────────────────────
+
+/// Build a revocation blob pair declaring `target` as revoked.
+///
+/// Returns `(rev_blob, sig_blob)`:
+/// - `rev_blob` carries `rev_target` (the pubkey being revoked) and
+///   `metadata::created_at` (when the revocation was issued).
+/// - `sig_blob` mirrors the capability sig blob shape: `sig_signs`
+///   pointing at the rev blob's handle, plus `signed_by` +
+///   `signature_r` + `signature_s` reusing the existing
+///   commit-signature attribute conventions.
+///
+/// The revoker key is whoever has authority over the revoked pubkey.
+/// For v0 that's typically the team root (for blanket revocations) or
+/// the issuer who originally issued the cap to the revoked subject.
+/// The verifier decides whether a particular revoker is authorised at
+/// verification time; this function only produces the signed
+/// statement.
+pub fn build_revocation(
+    revoker: &SigningKey,
+    target: VerifyingKey,
+) -> (Blob<SimpleArchive>, Blob<SimpleArchive>) {
+    let now = hifitime::Epoch::now().expect("system time");
+    let timestamp: Value<NsTAIInterval> =
+        (now, now).try_to_value().expect("point interval");
+
+    let rev_fragment = entity! {
+        rev_target: target.to_value(),
+        crate::metadata::created_at: timestamp,
+    };
+    let rev_blob: Blob<SimpleArchive> = TribleSet::from(rev_fragment).to_blob();
+
+    let signature: Signature = revoker.sign(&rev_blob.bytes);
+    let revoker_pubkey = revoker.verifying_key();
+    let rev_handle: Value<Handle<Blake3, SimpleArchive>> =
+        (&rev_blob).get_handle();
+
+    let sig_fragment = entity! {
+        sig_signs: rev_handle,
+        crate::repo::signed_by: revoker_pubkey,
+        crate::repo::signature_r: signature,
+        crate::repo::signature_s: signature,
+    };
+    let sig_blob: Blob<SimpleArchive> = TribleSet::from(sig_fragment).to_blob();
+
+    (rev_blob, sig_blob)
+}
+
+/// Verify a revocation blob pair: the sig blob attests to the rev
+/// blob's bytes by some pubkey. Returns `(revoker, target)` on
+/// success — the caller is responsible for deciding whether the
+/// revoker has authority to revoke the target.
+///
+/// For v0, the typical caller policy is: accept revocations signed by
+/// the team root. Future extensions (e.g. "issuer can revoke caps they
+/// originally issued") are pure caller policy — this function just
+/// confirms the signature is valid and surfaces the (who, whom) pair.
+pub fn verify_revocation(
+    rev_blob: Blob<SimpleArchive>,
+    sig_blob: Blob<SimpleArchive>,
+) -> Result<(VerifyingKey, VerifyingKey), VerifyError> {
+    let sig_set: TribleSet = TryFromBlob::try_from_blob(sig_blob)?;
+    let revoker = verify_sig_blob(&sig_set, &rev_blob)?;
+
+    let rev_set: TribleSet = TryFromBlob::try_from_blob(rev_blob)?;
+    let mut iter = find!(
+        (rev: crate::id::Id, target: VerifyingKey),
+        pattern!(&rev_set, [{ ?rev @ rev_target: ?target }])
+    );
+    let (_rev_id, target) = match (iter.next(), iter.next()) {
+        (Some(row), None) => row,
+        _ => return Err(VerifyError::MalformedCap),
+    };
+
+    Ok((revoker, target))
+}
+
+/// Build a `HashSet<VerifyingKey>` of revoked pubkeys from a collection
+/// of revocation blob pairs, accepting only revocations signed by a
+/// pubkey in `authorised_revokers`.
+///
+/// The typical v0 policy is `authorised_revokers = {team_root}`.
+/// Future extensions can pass a wider set (e.g. all admin-scoped
+/// pubkeys). Revocations signed by unauthorised pubkeys are silently
+/// dropped from the result — the caller can still pass the rejected
+/// blob through `verify_revocation` directly to surface them as
+/// diagnostic events.
+pub fn build_revocation_set<I>(
+    authorised_revokers: &HashSet<VerifyingKey>,
+    revocations: I,
+) -> HashSet<VerifyingKey>
+where
+    I: IntoIterator<Item = (Blob<SimpleArchive>, Blob<SimpleArchive>)>,
+{
+    let mut revoked: HashSet<VerifyingKey> = HashSet::new();
+    for (rev_blob, sig_blob) in revocations {
+        if let Ok((revoker, target)) = verify_revocation(rev_blob, sig_blob) {
+            if authorised_revokers.contains(&revoker) {
+                revoked.insert(target);
+            }
+        }
+    }
+    revoked
+}
+
 // ── Verifier ──────────────────────────────────────────────────────────
 
 use ed25519_dalek::Verifier;
 use std::collections::HashSet;
 use crate::value::TryFromValue;
+use crate::value::TryToValue;
 use hifitime::Epoch;
 
 /// Errors returned by [`verify_chain`].
@@ -1126,6 +1232,86 @@ mod tests {
         let (parent_root, parent_set) = scope_with(&[PERM_READ], &[branch_a]);
         let (child_root, child_set) = scope_with(&[PERM_READ], &[branch_b]);
         assert!(!scope_subsumes(&parent_set, parent_root, &child_set, child_root));
+    }
+
+    // ── Revocation tests ──────────────────────────────────────────────
+
+    #[test]
+    fn revocation_round_trip() {
+        let revoker = signing_key();
+        let target = signing_key();
+        let (rev_blob, sig_blob) =
+            build_revocation(&revoker, target.verifying_key());
+
+        let (out_revoker, out_target) =
+            verify_revocation(rev_blob, sig_blob).expect("verifies");
+        assert_eq!(out_revoker, revoker.verifying_key());
+        assert_eq!(out_target, target.verifying_key());
+    }
+
+    #[test]
+    fn revocation_set_filters_unauthorised_revokers() {
+        let team_root = signing_key();
+        let bystander = signing_key();
+        let target_a = signing_key();
+        let target_b = signing_key();
+
+        let mut authorised = HashSet::new();
+        authorised.insert(team_root.verifying_key());
+
+        let rev_a =
+            build_revocation(&team_root, target_a.verifying_key());
+        let rev_b =
+            build_revocation(&bystander, target_b.verifying_key());
+
+        let revoked =
+            build_revocation_set(&authorised, [rev_a, rev_b]);
+
+        assert!(revoked.contains(&target_a.verifying_key()));
+        assert!(!revoked.contains(&target_b.verifying_key()));
+    }
+
+    /// End-to-end: a valid chain becomes invalid once the leaf's
+    /// subject is added to the revocation set built from a team-root-
+    /// signed revocation blob.
+    #[test]
+    fn revocation_set_invalidates_chain() {
+        let team_root = signing_key();
+        let founder = signing_key();
+        let (scope_root, scope_facts) = empty_scope();
+
+        let (cap_blob, sig_blob) = build_capability(
+            &team_root,
+            founder.verifying_key(),
+            None,
+            scope_root,
+            scope_facts,
+            now_plus_24h(),
+        )
+        .expect("cap builds");
+
+        // Build a revocation against the founder, signed by the team
+        // root.
+        let (rev_blob, rev_sig_blob) =
+            build_revocation(&team_root, founder.verifying_key());
+
+        let mut authorised = HashSet::new();
+        authorised.insert(team_root.verifying_key());
+        let revoked = build_revocation_set(
+            &authorised,
+            [(rev_blob, rev_sig_blob)],
+        );
+
+        let leaf_handle: Value<Handle<Blake3, SimpleArchive>> =
+            (&sig_blob).get_handle();
+        let result = verify_chain(
+            team_root.verifying_key(),
+            leaf_handle,
+            founder.verifying_key(),
+            &revoked,
+            store_for(&[&cap_blob, &sig_blob]),
+        );
+        assert!(matches!(result, Err(VerifyError::Revoked)));
     }
 
     /// In a length-2 chain, a child cap claiming a permission the
