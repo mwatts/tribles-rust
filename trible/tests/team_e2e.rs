@@ -195,6 +195,18 @@ fn team_full_lifecycle() {
         list3_out.contains("revocations in pile:   1"),
         "post-revoke has one revocation; got:\n{list3_out}"
     );
+    // The revoked-pubkey breakdown surfaces the invitee's full pubkey,
+    // demonstrating that the (rev, sig) pairing + verify_revocation
+    // round-trip works on a real pile.
+    assert!(
+        list3_out.contains("revoked pubkeys:"),
+        "list output includes the revoked-pubkey section; got:\n{list3_out}"
+    );
+    assert!(
+        list3_out.contains(&invitee_pubkey),
+        "invitee pubkey {} appears in revoked list; got:\n{list3_out}",
+        invitee_pubkey,
+    );
 }
 
 #[test]

@@ -421,6 +421,9 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
 
     let mut caps_found = 0usize;
     let mut revocations_found = 0usize;
+    // Buffer all SimpleArchive-decodable blobs so we can pair revocation
+    // (rev, sig) blobs after the scan.
+    let mut all_blobs: Vec<Blob<SimpleArchive>> = Vec::new();
 
     use triblespace_core::blob::TryFromBlob;
     for handle_result in reader.blobs() {
@@ -436,6 +439,7 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
             Ok(b) => b,
             Err(_) => continue,
         };
+        all_blobs.push(blob.clone());
         let set: TribleSet = match TryFromBlob::try_from_blob(blob) {
             Ok(s) => s,
             Err(_) => continue,
@@ -474,5 +478,32 @@ fn run_list(pile_path: PathBuf) -> Result<()> {
 
     println!("capabilities in pile:  {caps_found}");
     println!("revocations in pile:   {revocations_found}");
+
+    if revocations_found > 0 {
+        // Pair rev+sig blobs and surface the (revoker, target) tuples.
+        // No authorisation policy applied here — `team list` is a
+        // pile-wide audit view, not a relay-policy view.
+        let pairs = capability::extract_revocation_pairs(all_blobs);
+        if !pairs.is_empty() {
+            println!("  revoked pubkeys:");
+            for (rev_blob, sig_blob) in pairs {
+                match capability::verify_revocation(rev_blob, sig_blob) {
+                    Ok((revoker, target)) => {
+                        println!(
+                            "    {}  (revoked by {})",
+                            hex::encode(target.to_bytes()),
+                            hex::encode(&revoker.to_bytes()[..4]),
+                        );
+                    }
+                    Err(_) => {
+                        // Pair didn't verify (e.g. tampered blob); skip
+                        // the line. The structural count above already
+                        // reported the rev_target, so absence here is a
+                        // useful signal something is off.
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
