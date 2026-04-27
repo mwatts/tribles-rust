@@ -692,11 +692,19 @@ async fn serve_stream(
             return Ok(());
         }
     };
-    // Branch-level scope gate: peers without read permission get
-    // empty results from `OP_LIST` and a NIL head from `OP_HEAD` for
-    // any branch outside their granted set. Blob-level ops
-    // (`OP_GET_BLOB`, `OP_CHILDREN`) currently only require auth — a
-    // tighter reachability-based gate is future work.
+    // Two-tier scope gate:
+    //
+    //  - branch level: `OP_LIST` and `OP_HEAD` are filtered by
+    //    `verified.grants_read_on(branch)`.
+    //  - blob level: `OP_GET_BLOB` and `OP_CHILDREN` are filtered by
+    //    blob-graph reachability from the allowed heads. A peer with a
+    //    cap restricted to branch X cannot fetch blobs that only branch
+    //    Y reaches, even if they probe by raw hash. Unrestricted caps
+    //    (`granted_branches() == None`) skip the reachability filter.
+    //
+    // Reachability is recomputed per OP_GET_BLOB / OP_CHILDREN call for
+    // simplicity; for chain-walk-heavy workloads, a per-stream cache
+    // would be the obvious next optimisation.
 
     match op {
         OP_LIST => {
@@ -735,8 +743,15 @@ async fn serve_stream(
 
         OP_GET_BLOB => {
             let hash = recv_hash(recv).await?;
-            let data = snap_arc.lock().unwrap().as_ref()
-                .and_then(|s| s.get_blob(&hash));
+            let data = {
+                let guard = snap_arc.lock().unwrap();
+                guard.as_ref().and_then(|snap| {
+                    if !blob_in_scope(snap.as_ref(), &verified, &hash) {
+                        return None;
+                    }
+                    snap.get_blob(&hash)
+                })
+            };
             match data {
                 Some(data) => {
                     send_u64_be(send, data.len() as u64).await?;
@@ -753,20 +768,34 @@ async fn serve_stream(
                 match guard.as_ref() {
                     None => Vec::new(),
                     Some(snap) => {
-                        match snap.get_blob(&parent_hash) {
-                            None => Vec::new(),
-                            Some(parent_data) => {
-                                let mut result = Vec::new();
-                                for chunk in parent_data.chunks(32) {
-                                    if chunk.len() == 32 {
-                                        let mut candidate = [0u8; 32];
-                                        candidate.copy_from_slice(chunk);
-                                        if snap.has_blob(&candidate) {
-                                            result.push(candidate);
+                        if !blob_in_scope(snap.as_ref(), &verified, &parent_hash) {
+                            Vec::new()
+                        } else {
+                            match snap.get_blob(&parent_hash) {
+                                None => Vec::new(),
+                                Some(parent_data) => {
+                                    let mut result = Vec::new();
+                                    for chunk in parent_data.chunks(32) {
+                                        if chunk.len() == 32 {
+                                            let mut candidate = [0u8; 32];
+                                            candidate.copy_from_slice(chunk);
+                                            // Both presence AND scope —
+                                            // a parent blob that's in
+                                            // scope can still reference
+                                            // children that aren't (it
+                                            // can't, given how piles are
+                                            // shaped, but the explicit
+                                            // check is cheap and keeps
+                                            // the gate honest).
+                                            if snap.has_blob(&candidate)
+                                                && blob_in_scope(snap.as_ref(), &verified, &candidate)
+                                            {
+                                                result.push(candidate);
+                                            }
                                         }
                                     }
+                                    result
                                 }
-                                result
                             }
                         }
                     }
@@ -781,6 +810,64 @@ async fn serve_stream(
         _ => {}
     }
     Ok(())
+}
+
+/// Returns `true` if `hash` is reachable (transitively, via 32-byte-chunk
+/// children references) from at least one branch head the `verified` cap
+/// grants read access on. Unrestricted caps short-circuit to `true` for
+/// every hash present in the snapshot.
+///
+/// O(snapshot blob count) worst case — runs once per `OP_GET_BLOB` /
+/// `OP_CHILDREN` call. A per-stream cache would amortise chain walks if
+/// this becomes a bottleneck.
+fn blob_in_scope(
+    snap: &dyn AnySnapshot,
+    verified: &triblespace_core::repo::capability::VerifiedCapability,
+    hash: &RawHash,
+) -> bool {
+    if !snap.has_blob(hash) {
+        return false;
+    }
+    if verified.granted_branches().is_none() {
+        // Unrestricted cap: every blob present in the snapshot is in
+        // scope. (The cap may still lack read permission entirely; in
+        // that case `grants_read()` is false and the branch-level gate
+        // would have filtered every head — but the granted_branches
+        // shape only tells us "no restriction", so cross-check here.)
+        return verified.grants_read();
+    }
+
+    // Walk reachable from allowed heads.
+    let mut frontier: Vec<RawHash> = snap
+        .list_branches()
+        .iter()
+        .filter_map(|(bid, head)| {
+            triblespace_core::id::Id::new(*bid)
+                .filter(|id| verified.grants_read_on(id))
+                .map(|_| *head)
+        })
+        .collect();
+    let mut seen: HashSet<RawHash> = HashSet::new();
+    while let Some(h) = frontier.pop() {
+        if !seen.insert(h) {
+            continue;
+        }
+        if h == *hash {
+            return true;
+        }
+        if let Some(data) = snap.get_blob(&h) {
+            for chunk in data.chunks(32) {
+                if chunk.len() == 32 {
+                    let mut child = [0u8; 32];
+                    child.copy_from_slice(chunk);
+                    if snap.has_blob(&child) && !seen.contains(&child) {
+                        frontier.push(child);
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -925,6 +1012,143 @@ mod tests {
             matches!(result, Err(VerifyError::Fetch)),
             "unknown handle must surface as Fetch; got {:?}",
             result,
+        );
+    }
+
+    /// Construct a `VerifiedCapability` with a hand-crafted scope facts
+    /// set, bypassing chain verification. Used to exercise scope-gating
+    /// helpers that depend only on the cap_set shape.
+    fn manual_verified_cap(
+        scope_root: triblespace_core::id::Id,
+        permissions: &[triblespace_core::id::Id],
+        branches: &[triblespace_core::id::Id],
+    ) -> triblespace_core::repo::capability::VerifiedCapability {
+        let mut cap_set = TribleSet::new();
+        for perm in permissions {
+            cap_set += TribleSet::from(entity! {
+                ExclusiveId::force_ref(&scope_root) @
+                triblespace_core::metadata::tag: *perm,
+            });
+        }
+        for b in branches {
+            cap_set += TribleSet::from(entity! {
+                ExclusiveId::force_ref(&scope_root) @
+                triblespace_core::repo::capability::scope_branch: *b,
+            });
+        }
+        let dummy_subject = SigningKey::generate(&mut OsRng).verifying_key();
+        triblespace_core::repo::capability::VerifiedCapability {
+            subject: dummy_subject,
+            scope_root,
+            cap_set,
+        }
+    }
+
+    /// Build a snapshot containing two disjoint branch subgraphs:
+    /// branch_a → head_a → leaf_a; branch_b → head_b → leaf_b.
+    /// Returns `(snap, branch_a, branch_b, head_a, leaf_a, head_b, leaf_b)`.
+    fn two_branch_snapshot() -> (
+        Box<dyn AnySnapshot>,
+        triblespace_core::id::Id,
+        triblespace_core::id::Id,
+        RawHash,
+        RawHash,
+        RawHash,
+        RawHash,
+    ) {
+        use triblespace_core::blob::schemas::UnknownBlob;
+        use triblespace_core::repo::BranchStore;
+        let mut store = MemoryRepo::default();
+
+        // Distinct content per leaf so blake3 hashes diverge.
+        let leaf_a_bytes = anybytes::Bytes::from_source(b"leaf_a".to_vec());
+        let leaf_a = store.put::<UnknownBlob, _>(leaf_a_bytes).unwrap();
+
+        let leaf_b_bytes = anybytes::Bytes::from_source(b"leaf_b".to_vec());
+        let leaf_b = store.put::<UnknownBlob, _>(leaf_b_bytes).unwrap();
+
+        // Each "head" blob is a 32-byte chunk pointing at its leaf — the
+        // same shape OP_CHILDREN walks. (Real branch metadata is richer,
+        // but the reachability gate only cares about the chunk pattern.)
+        let head_a_bytes = anybytes::Bytes::from_source(leaf_a.raw.to_vec());
+        let head_a = store.put::<UnknownBlob, _>(head_a_bytes).unwrap();
+
+        let head_b_bytes = anybytes::Bytes::from_source(leaf_b.raw.to_vec());
+        let head_b = store.put::<UnknownBlob, _>(head_b_bytes).unwrap();
+
+        let branch_a = ufoid();
+        let branch_b = ufoid();
+        let head_a_simple: Value<Handle<Blake3, SimpleArchive>> =
+            Value::new(head_a.raw);
+        let head_b_simple: Value<Handle<Blake3, SimpleArchive>> =
+            Value::new(head_b.raw);
+        store.update(*branch_a, None, Some(head_a_simple)).unwrap();
+        store.update(*branch_b, None, Some(head_b_simple)).unwrap();
+
+        let snap: Box<dyn AnySnapshot> =
+            Box::new(StoreSnapshot::from_store(&mut store).expect("snapshot"));
+        (snap, *branch_a, *branch_b, head_a.raw, leaf_a.raw, head_b.raw, leaf_b.raw)
+    }
+
+    #[test]
+    fn blob_in_scope_filters_by_branch_reachability() {
+        let (snap, branch_a, _branch_b, head_a, leaf_a, head_b, leaf_b) =
+            two_branch_snapshot();
+        let scope_root = *ufoid();
+        // Cap allows reading branch_a only.
+        let verified =
+            manual_verified_cap(scope_root, &[PERM_READ], &[branch_a]);
+
+        assert!(
+            blob_in_scope(snap.as_ref(), &verified, &head_a),
+            "head reachable from allowed branch is in scope",
+        );
+        assert!(
+            blob_in_scope(snap.as_ref(), &verified, &leaf_a),
+            "leaf reachable from allowed branch is in scope",
+        );
+        assert!(
+            !blob_in_scope(snap.as_ref(), &verified, &head_b),
+            "head of disallowed branch is out of scope",
+        );
+        assert!(
+            !blob_in_scope(snap.as_ref(), &verified, &leaf_b),
+            "leaf reachable only from disallowed branch is out of scope",
+        );
+    }
+
+    #[test]
+    fn blob_in_scope_unrestricted_admits_any_present_blob() {
+        let (snap, _branch_a, _branch_b, head_a, _leaf_a, head_b, _leaf_b) =
+            two_branch_snapshot();
+        let scope_root = *ufoid();
+        // Unrestricted: PERM_READ, no scope_branch tribles.
+        let verified = manual_verified_cap(scope_root, &[PERM_READ], &[]);
+
+        assert!(blob_in_scope(snap.as_ref(), &verified, &head_a));
+        assert!(
+            blob_in_scope(snap.as_ref(), &verified, &head_b),
+            "unrestricted cap admits all branches' heads",
+        );
+        let absent = [0xFFu8; 32];
+        assert!(
+            !blob_in_scope(snap.as_ref(), &verified, &absent),
+            "blobs absent from the snapshot are never in scope",
+        );
+    }
+
+    #[test]
+    fn blob_in_scope_with_no_read_permission_admits_nothing() {
+        let (snap, branch_a, _branch_b, head_a, _leaf_a, _head_b, _leaf_b) =
+            two_branch_snapshot();
+        let scope_root = *ufoid();
+        // Cap with branch restriction but no read permission tag.
+        let verified = manual_verified_cap(scope_root, &[], &[branch_a]);
+
+        assert!(
+            !blob_in_scope(snap.as_ref(), &verified, &head_a),
+            "cap without read permission cannot reach any blob, even of \
+             a notionally-allowed branch",
         );
     }
 
