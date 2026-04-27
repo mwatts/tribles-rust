@@ -262,6 +262,97 @@ fn issuer_subject_value(key: VerifyingKey) -> Value<ed::ED25519PublicKey> {
     key.to_value()
 }
 
+// ── Scope subsumption ────────────────────────────────────────────────
+
+/// Collect the permission tag ids and branch restrictions from a scope
+/// sub-graph anchored at `scope_root`.
+fn collect_scope_facts(
+    set: &TribleSet,
+    scope_root: crate::id::Id,
+) -> (HashSet<crate::id::Id>, HashSet<crate::id::Id>) {
+    let perms: HashSet<crate::id::Id> = find!(
+        (perm: crate::id::Id),
+        pattern!(set, [{ scope_root @ crate::metadata::tag: ?perm }])
+    )
+    .map(|(p,)| p)
+    .collect();
+
+    let branches: HashSet<crate::id::Id> = find!(
+        (branch: crate::id::Id),
+        pattern!(set, [{ scope_root @ scope_branch: ?branch }])
+    )
+    .map(|(b,)| b)
+    .collect();
+
+    (perms, branches)
+}
+
+/// Check whether a parent scope authorises a child scope.
+///
+/// Rules:
+/// - If parent grants `PERM_ADMIN`, parent subsumes every child scope.
+/// - Otherwise: every permission tag in the child must be in the
+///   parent's set (with `PERM_WRITE` implying `PERM_READ` for upgrade
+///   compatibility, but an explicit `PERM_READ`-only parent does *not*
+///   imply `PERM_WRITE` for the child).
+/// - Branch restriction: an empty `scope_branch` set means "all
+///   branches"; a non-empty set restricts the scope to those branches.
+///   The child's restriction set must be a subset of the parent's
+///   (where empty parent = all branches allowed).
+///
+/// Unknown permission tags in the child cause subsumption to fail
+/// closed.
+pub fn scope_subsumes(
+    parent_set: &TribleSet,
+    parent_scope_root: crate::id::Id,
+    child_set: &TribleSet,
+    child_scope_root: crate::id::Id,
+) -> bool {
+    let (parent_perms, parent_branches) =
+        collect_scope_facts(parent_set, parent_scope_root);
+    let (child_perms, child_branches) =
+        collect_scope_facts(child_set, child_scope_root);
+
+    if parent_perms.contains(&PERM_ADMIN) {
+        return true;
+    }
+
+    for perm in &child_perms {
+        if *perm == PERM_READ {
+            if !parent_perms.contains(&PERM_READ)
+                && !parent_perms.contains(&PERM_WRITE)
+            {
+                return false;
+            }
+        } else if *perm == PERM_WRITE {
+            if !parent_perms.contains(&PERM_WRITE) {
+                return false;
+            }
+        } else if *perm == PERM_ADMIN {
+            // Parent isn't admin (already checked), so the child can't
+            // claim admin either.
+            return false;
+        } else {
+            // Unknown permission — fail closed.
+            return false;
+        }
+    }
+
+    // Branch restriction subsumption.
+    if !parent_branches.is_empty() {
+        if child_branches.is_empty() {
+            return false;
+        }
+        for b in &child_branches {
+            if !parent_branches.contains(b) {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
 // ── Verifier ──────────────────────────────────────────────────────────
 
 use ed25519_dalek::Verifier;
@@ -579,6 +670,15 @@ where
         {
             return Err(VerifyError::Revoked);
         }
+        // Each child link's scope must be a subset of its parent's.
+        if !scope_subsumes(
+            &parent_set,
+            parent_fields.scope_root,
+            &current_set,
+            current_fields.scope_root,
+        ) {
+            return Err(VerifyError::ScopeNotSubset);
+        }
 
         // Step.
         current_set = parent_set;
@@ -611,6 +711,26 @@ mod tests {
             crate::metadata::tag: PERM_READ,
         };
         (*scope_root, TribleSet::from(scope_facts))
+    }
+
+    /// Build a scope with the given permission tags and (optionally)
+    /// branch restrictions.
+    fn scope_with(perms: &[Id], branches: &[Id]) -> (Id, TribleSet) {
+        let scope_root = crate::id::ufoid();
+        let mut facts = TribleSet::new();
+        for perm in perms {
+            facts += TribleSet::from(entity! {
+                ExclusiveId::force_ref(&scope_root) @
+                crate::metadata::tag: *perm,
+            });
+        }
+        for b in branches {
+            facts += TribleSet::from(entity! {
+                ExclusiveId::force_ref(&scope_root) @
+                scope_branch: *b,
+            });
+        }
+        (*scope_root, facts)
     }
 
     /// Length-1 chain: the team root signs the founder's cap directly.
@@ -941,6 +1061,123 @@ mod tests {
             ]),
         );
         assert!(matches!(result, Err(VerifyError::Revoked)));
+    }
+
+    // ── Scope subsumption tests ───────────────────────────────────────
+
+    #[test]
+    fn admin_subsumes_anything() {
+        let (parent_root, parent_set) = scope_with(&[PERM_ADMIN], &[]);
+        let (child_root, child_set) = scope_with(&[PERM_WRITE, PERM_READ], &[]);
+        assert!(scope_subsumes(&parent_set, parent_root, &child_set, child_root));
+    }
+
+    #[test]
+    fn write_implies_read_for_child() {
+        let (parent_root, parent_set) = scope_with(&[PERM_WRITE], &[]);
+        let (child_root, child_set) = scope_with(&[PERM_READ], &[]);
+        assert!(scope_subsumes(&parent_set, parent_root, &child_set, child_root));
+    }
+
+    #[test]
+    fn read_does_not_imply_write() {
+        let (parent_root, parent_set) = scope_with(&[PERM_READ], &[]);
+        let (child_root, child_set) = scope_with(&[PERM_WRITE], &[]);
+        assert!(!scope_subsumes(&parent_set, parent_root, &child_set, child_root));
+    }
+
+    #[test]
+    fn child_cannot_claim_admin_under_non_admin_parent() {
+        let (parent_root, parent_set) = scope_with(&[PERM_WRITE], &[]);
+        let (child_root, child_set) = scope_with(&[PERM_ADMIN], &[]);
+        assert!(!scope_subsumes(&parent_set, parent_root, &child_set, child_root));
+    }
+
+    #[test]
+    fn unrestricted_parent_subsumes_branch_restricted_child() {
+        let branch_a = *crate::id::ufoid();
+        let (parent_root, parent_set) = scope_with(&[PERM_READ], &[]);
+        let (child_root, child_set) = scope_with(&[PERM_READ], &[branch_a]);
+        assert!(scope_subsumes(&parent_set, parent_root, &child_set, child_root));
+    }
+
+    #[test]
+    fn restricted_parent_rejects_unrestricted_child() {
+        let branch_a = *crate::id::ufoid();
+        let (parent_root, parent_set) = scope_with(&[PERM_READ], &[branch_a]);
+        let (child_root, child_set) = scope_with(&[PERM_READ], &[]);
+        assert!(!scope_subsumes(&parent_set, parent_root, &child_set, child_root));
+    }
+
+    #[test]
+    fn restricted_parent_subsumes_strict_subset() {
+        let branch_a = *crate::id::ufoid();
+        let branch_b = *crate::id::ufoid();
+        let (parent_root, parent_set) =
+            scope_with(&[PERM_READ], &[branch_a, branch_b]);
+        let (child_root, child_set) = scope_with(&[PERM_READ], &[branch_a]);
+        assert!(scope_subsumes(&parent_set, parent_root, &child_set, child_root));
+    }
+
+    #[test]
+    fn restricted_parent_rejects_disjoint_child() {
+        let branch_a = *crate::id::ufoid();
+        let branch_b = *crate::id::ufoid();
+        let (parent_root, parent_set) = scope_with(&[PERM_READ], &[branch_a]);
+        let (child_root, child_set) = scope_with(&[PERM_READ], &[branch_b]);
+        assert!(!scope_subsumes(&parent_set, parent_root, &child_set, child_root));
+    }
+
+    /// In a length-2 chain, a child cap claiming a permission the
+    /// parent doesn't grant must be rejected by the verifier.
+    #[test]
+    fn verify_rejects_chain_with_scope_violation() {
+        let team_root = signing_key();
+        let founder = signing_key();
+        let member = signing_key();
+
+        // Founder gets only PERM_READ.
+        let (founder_scope_root, founder_scope_facts) =
+            scope_with(&[PERM_READ], &[]);
+        let (founder_cap, founder_sig) = build_capability(
+            &team_root,
+            founder.verifying_key(),
+            None,
+            founder_scope_root,
+            founder_scope_facts,
+            now_plus_24h(),
+        )
+        .expect("founder cap builds");
+
+        // Member tries to claim PERM_WRITE — not authorised by parent.
+        let (member_scope_root, member_scope_facts) =
+            scope_with(&[PERM_WRITE], &[]);
+        let (member_cap, member_sig) = build_capability(
+            &founder,
+            member.verifying_key(),
+            Some((founder_cap.clone(), founder_sig.clone())),
+            member_scope_root,
+            member_scope_facts,
+            now_plus_24h(),
+        )
+        .expect("member cap builds");
+
+        let leaf_handle: Value<Handle<Blake3, SimpleArchive>> =
+            (&member_sig).get_handle();
+        let revoked = HashSet::new();
+        let result = verify_chain(
+            team_root.verifying_key(),
+            leaf_handle,
+            member.verifying_key(),
+            &revoked,
+            store_for(&[
+                &founder_cap,
+                &founder_sig,
+                &member_cap,
+                &member_sig,
+            ]),
+        );
+        assert!(matches!(result, Err(VerifyError::ScopeNotSubset)));
     }
 
     /// Length-2 chain: founder signs a member capability with the root cap
