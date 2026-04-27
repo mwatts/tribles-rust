@@ -112,7 +112,344 @@ pub const KIND_CAPABILITY_SIG: Id = id_hex!("E6BB52CE6E02D51C3676ECE1EEA9094F");
 #[allow(dead_code)]
 pub const KIND_REVOCATION: Id = id_hex!("1EEAF2CF25A776547A26080E755D111C");
 
-// Suppress dead-code warnings on the auto-generated `value_schema_*`
-// helpers until the builder/verifier in subsequent commits consume them.
-#[allow(dead_code)]
-const _: () = ();
+// ── Builder ──────────────────────────────────────────────────────────
+
+use ed25519::Signature;
+use ed25519_dalek::SigningKey;
+use ed25519_dalek::VerifyingKey;
+use ed25519::signature::Signer;
+
+use crate::blob::Blob;
+use crate::blob::ToBlob;
+use crate::blob::TryFromBlob;
+use crate::blob::schemas::simplearchive::UnarchiveError;
+use crate::id::ExclusiveId;
+use crate::macros::entity;
+use crate::macros::pattern;
+use crate::query::find;
+use crate::trible::TribleSet;
+use crate::value::Value;
+use crate::value::ToValue;
+use crate::value::schemas::time::NsTAIInterval;
+
+/// Errors returned by [`build_capability`].
+#[derive(Debug)]
+pub enum BuildError {
+    /// The provided parent signature blob could not be parsed as a valid
+    /// SimpleArchive.
+    ParseParentSig(UnarchiveError),
+    /// The provided parent signature blob did not contain exactly one
+    /// signature entity (i.e. exactly one entity carrying [`sig_signs`]).
+    ParentSigShape,
+}
+
+/// Build a capability link.
+///
+/// Returns the pair `(cap_blob, sig_blob)`:
+/// - `cap_blob` carries the claim (subject pubkey, scope, expiry, parent
+///   pointer, embedded parent signature). Its content-addressed handle is
+///   what the sig blob attests to.
+/// - `sig_blob` carries the issuer's signature over `cap_blob.bytes` plus
+///   the issuer's pubkey, alongside a `sig_signs` handle pointing at the
+///   cap blob.
+///
+/// `parent = None` constructs a root-issued capability: the issuer is
+/// expected to be the team root keypair, and the resulting cap has no
+/// `cap_parent` and no embedded parent signature. Verification terminates
+/// at this link when the issuer pubkey matches the team root.
+///
+/// `parent = Some((parent_cap, parent_sig))` constructs a delegated
+/// capability: the parent's signature is embedded inline in the new cap
+/// blob (via [`cap_embedded_parent_sig`] pointing at a sub-entity carrying
+/// `signed_by` + `signature_r` + `signature_s` reusing the existing
+/// commit-signature attribute conventions) so verifiers can walk one level
+/// up the chain without a separate fetch for the parent's signature.
+///
+/// `scope_facts` should be a TribleSet anchored at `scope_root` describing
+/// the capability's scope (permission tags via [`crate::metadata::tag`],
+/// optional resource restrictions via [`scope_branch`], etc.). The caller
+/// is responsible for producing a scope that's a subset of any parent
+/// scope; this builder does not enforce subsumption.
+pub fn build_capability(
+    issuer: &SigningKey,
+    subject: VerifyingKey,
+    parent: Option<(Blob<SimpleArchive>, Blob<SimpleArchive>)>,
+    scope_root: crate::id::Id,
+    scope_facts: TribleSet,
+    expiry: Value<NsTAIInterval>,
+) -> Result<(Blob<SimpleArchive>, Blob<SimpleArchive>), BuildError> {
+    let issuer_pubkey: VerifyingKey = issuer.verifying_key();
+
+    // Build the cap entity. `entity!` without an explicit id derives the
+    // entity id by hashing the (attr, value) pairs — same trick commits
+    // use, gives us content-addressed identity at the entity level for
+    // free.
+    let cap_fragment = entity! {
+        cap_subject: issuer_subject_value(subject),
+        cap_issuer: issuer_subject_value(issuer_pubkey),
+        cap_scope_root: scope_root,
+        crate::metadata::expires_at: expiry,
+    };
+    let cap_id = cap_fragment
+        .root()
+        .expect("entity! always produces a rooted fragment");
+
+    let mut cap_set = TribleSet::from(cap_fragment);
+    cap_set += scope_facts;
+
+    if let Some((parent_cap_blob, parent_sig_blob)) = parent {
+        let parent_cap_handle: Value<Handle<Blake3, SimpleArchive>> =
+            parent_cap_blob.get_handle();
+
+        // Decode the parent signature blob into its tribles, then locate
+        // the single entity carrying `sig_signs` (the sig entity id).
+        let parent_sig_set: TribleSet = TryFromBlob::<SimpleArchive>::try_from_blob(
+            parent_sig_blob,
+        )
+        .map_err(BuildError::ParseParentSig)?;
+
+        // The parent signature blob has exactly one entity carrying
+        // sig_signs (its own sig entity). We project that id out; the
+        // signed handle is unused here.
+        let mut sig_id_iter = find!(
+            (sig: crate::id::Id, _signed: Value<Handle<Blake3, SimpleArchive>>),
+            pattern!(&parent_sig_set, [{ ?sig @ sig_signs: ?_signed }])
+        )
+        .map(|(sig, _)| sig);
+        let sig_id = match (sig_id_iter.next(), sig_id_iter.next()) {
+            (Some(sig), None) => sig,
+            _ => return Err(BuildError::ParentSigShape),
+        };
+
+        // Embed the parent signature tribles directly under their existing
+        // entity id. The verifier extracts them by querying for the
+        // sub-entity at `sig_id` inside the cap blob.
+        cap_set += parent_sig_set;
+
+        // Add cap_parent + cap_embedded_parent_sig pointing back at the
+        // cap entity (which we addressed via `cap_id`).
+        cap_set += TribleSet::from(entity! { ExclusiveId::force_ref(&cap_id) @
+            cap_parent: parent_cap_handle,
+            cap_embedded_parent_sig: sig_id,
+        });
+    }
+
+    let cap_blob: Blob<SimpleArchive> = cap_set.to_blob();
+
+    // Sign the cap blob's canonical bytes.
+    let signature: Signature = issuer.sign(&cap_blob.bytes);
+    let cap_handle: Value<Handle<Blake3, SimpleArchive>> =
+        (&cap_blob).get_handle();
+
+    // Build the sig blob: handle pointer to the cap, signer pubkey,
+    // signature components. Reuses the existing commit-signature
+    // attribute conventions.
+    let sig_fragment = entity! {
+        sig_signs: cap_handle,
+        crate::repo::signed_by: issuer_pubkey,
+        crate::repo::signature_r: signature,
+        crate::repo::signature_s: signature,
+    };
+    let sig_blob: Blob<SimpleArchive> = TribleSet::from(sig_fragment).to_blob();
+
+    Ok((cap_blob, sig_blob))
+}
+
+/// Convenience: convert a `VerifyingKey` to a `Value<ED25519PublicKey>`.
+/// Inlined to avoid an explicit `ToValue` import at the call sites in
+/// the builder above.
+fn issuer_subject_value(key: VerifyingKey) -> Value<ed::ED25519PublicKey> {
+    key.to_value()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value::TryToValue;
+    use ed25519_dalek::Verifier;
+    use hifitime::Epoch;
+    use rand::rngs::OsRng;
+
+    fn now_plus_24h() -> Value<NsTAIInterval> {
+        let now = Epoch::now().expect("system time");
+        let later = now + hifitime::Duration::from_seconds(24.0 * 3600.0);
+        (now, later).try_to_value().expect("valid interval")
+    }
+
+    fn signing_key() -> SigningKey {
+        SigningKey::generate(&mut OsRng)
+    }
+
+    fn empty_scope() -> (Id, TribleSet) {
+        // Trivial scope: a single anchor entity tagged with a permission.
+        let scope_root = crate::id::ufoid();
+        let scope_facts = entity! { ExclusiveId::force_ref(&scope_root) @
+            crate::metadata::tag: PERM_READ,
+        };
+        (*scope_root, TribleSet::from(scope_facts))
+    }
+
+    /// Length-1 chain: the team root signs the founder's cap directly.
+    /// Cap blob has no parent and no embedded sig; sig blob attests to
+    /// the cap blob's bytes.
+    #[test]
+    fn build_root_capability() {
+        let team_root = signing_key();
+        let founder = signing_key();
+        let (scope_root, scope_facts) = empty_scope();
+        let expiry = now_plus_24h();
+
+        let (cap_blob, sig_blob) = build_capability(
+            &team_root,
+            founder.verifying_key(),
+            None,
+            scope_root,
+            scope_facts,
+            expiry,
+        )
+        .expect("root cap builds");
+
+        // Sig blob must verify against cap blob's bytes.
+        let sig_set: TribleSet =
+            <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(sig_blob)
+                .expect("valid sig blob");
+        let mut sig_iter = find!(
+            (sig: Id,
+             handle: Value<Handle<Blake3, SimpleArchive>>,
+             pubkey: VerifyingKey,
+             r,
+             s),
+            pattern!(&sig_set, [{
+                ?sig @
+                sig_signs: ?handle,
+                crate::repo::signed_by: ?pubkey,
+                crate::repo::signature_r: ?r,
+                crate::repo::signature_s: ?s,
+            }])
+        );
+        let (_sig_entity, signed_handle, recovered_pubkey, r_v, s_v) =
+            sig_iter.next().expect("exactly one sig entity");
+        assert!(sig_iter.next().is_none(), "exactly one sig entity");
+
+        // sig_signs must point at the cap blob.
+        let cap_handle: Value<Handle<Blake3, SimpleArchive>> =
+            (&cap_blob).get_handle();
+        assert_eq!(signed_handle, cap_handle);
+
+        // Pubkey is the team root.
+        assert_eq!(recovered_pubkey, team_root.verifying_key());
+
+        // Signature verifies over cap_blob.bytes.
+        let signature = ed25519::Signature::from_components(r_v, s_v);
+        team_root
+            .verifying_key()
+            .verify(&cap_blob.bytes, &signature)
+            .expect("signature verifies over the cap blob bytes");
+
+        // Cap blob has no cap_parent and no cap_embedded_parent_sig.
+        let cap_set: TribleSet =
+            <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(cap_blob)
+                .expect("valid cap blob");
+        let parents: usize = find!(
+            (e: Id, h: Value<Handle<Blake3, SimpleArchive>>),
+            pattern!(&cap_set, [{ ?e @ cap_parent: ?h }])
+        )
+        .count();
+        assert_eq!(parents, 0, "root cap has no cap_parent");
+
+        let embedded: usize = find!(
+            (e: Id, sig: Id),
+            pattern!(&cap_set, [{ ?e @ cap_embedded_parent_sig: ?sig }])
+        )
+        .count();
+        assert_eq!(embedded, 0, "root cap has no embedded parent sig");
+    }
+
+    /// Length-2 chain: founder signs a member capability with the root cap
+    /// as parent. The member's cap blob carries `cap_parent` (handle of
+    /// the founder's cap) plus an embedded sub-entity carrying the
+    /// founder's signature inline.
+    #[test]
+    fn build_delegated_capability() {
+        let team_root = signing_key();
+        let founder = signing_key();
+        let member = signing_key();
+
+        // Step 1: root issues founder's cap.
+        let (founder_scope_root, founder_scope_facts) = empty_scope();
+        let (founder_cap, founder_sig) = build_capability(
+            &team_root,
+            founder.verifying_key(),
+            None,
+            founder_scope_root,
+            founder_scope_facts,
+            now_plus_24h(),
+        )
+        .expect("founder cap builds");
+
+        // Step 2: founder issues member's cap, embedding founder_sig.
+        let (member_scope_root, member_scope_facts) = empty_scope();
+        let (member_cap, _member_sig) = build_capability(
+            &founder,
+            member.verifying_key(),
+            Some((founder_cap.clone(), founder_sig.clone())),
+            member_scope_root,
+            member_scope_facts,
+            now_plus_24h(),
+        )
+        .expect("member cap builds");
+
+        // Member cap must reference the founder's cap as parent and have
+        // an embedded sig sub-entity carrying the founder's signature.
+        let member_cap_set: TribleSet =
+            <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(member_cap)
+                .expect("valid cap blob");
+
+        let founder_handle: Value<Handle<Blake3, SimpleArchive>> =
+            (&founder_cap).get_handle();
+        let mut parents = find!(
+            (e: Id, h: Value<Handle<Blake3, SimpleArchive>>),
+            pattern!(&member_cap_set, [{ ?e @ cap_parent: ?h }])
+        );
+        let (cap_entity_id, parent_handle_v) =
+            parents.next().expect("cap_parent present");
+        assert!(parents.next().is_none(), "exactly one cap_parent");
+        assert_eq!(parent_handle_v, founder_handle);
+
+        // Embedded sig sub-entity present, addressed by cap_entity_id.
+        let mut embedded = find!(
+            (sig: Id),
+            pattern!(&member_cap_set, [{
+                cap_entity_id @ cap_embedded_parent_sig: ?sig
+            }])
+        );
+        let (sig_id,) = embedded.next().expect("embedded sig pointer");
+        assert!(embedded.next().is_none(), "exactly one embedded sig");
+
+        // The embedded sig sub-entity carries the founder's signature
+        // tribles; signature must verify over founder_cap.bytes.
+        let mut sig_facts = find!(
+            (pubkey: VerifyingKey, r, s),
+            pattern!(&member_cap_set, [{
+                sig_id @
+                crate::repo::signed_by: ?pubkey,
+                crate::repo::signature_r: ?r,
+                crate::repo::signature_s: ?s,
+            }])
+        );
+        let (parent_issuer_pubkey, r_v, s_v) =
+            sig_facts.next().expect("embedded sig has sig fields");
+        assert!(sig_facts.next().is_none(), "exactly one sig sub-entity");
+
+        // The embedded parent sig is *the parent's* signature, i.e.
+        // whoever signed the founder_cap — which is the team root, not
+        // the founder.
+        assert_eq!(parent_issuer_pubkey, team_root.verifying_key());
+
+        let signature = ed25519::Signature::from_components(r_v, s_v);
+        team_root
+            .verifying_key()
+            .verify(&founder_cap.bytes, &signature)
+            .expect("embedded signature verifies over the parent cap bytes");
+    }
+}
