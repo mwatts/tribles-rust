@@ -10,6 +10,7 @@ mod cli;
 use cli::branch::BranchCommand;
 use cli::pile::PileCommand;
 use cli::store::StoreCommand;
+use cli::team::Command as TeamCommand;
 
 #[derive(Parser)]
 /// A knowledge graph and meta file system for object stores.
@@ -37,6 +38,11 @@ enum TribleCli {
         #[command(subcommand)]
         cmd: StoreCommand,
     },
+    /// Capability-based team membership management.
+    Team {
+        #[command(subcommand)]
+        cmd: TeamCommand,
+    },
 }
 
 fn main() -> Result<()> {
@@ -56,6 +62,7 @@ fn main() -> Result<()> {
         TribleCli::Branch { cmd } => cli::branch::run(cmd)?,
         TribleCli::Pile { cmd } => cli::pile::run(cmd)?,
         TribleCli::Store { cmd } => cli::store::run(cmd)?,
+        TribleCli::Team { cmd } => cli::team::run(cmd)?,
     }
     Ok(())
 }
