@@ -760,3 +760,188 @@ async fn serve_stream(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    //! Glue tests for the snapshot → verify_chain wiring.
+    //!
+    //! These cover the auth-side bridge: cap+sig blobs put into a
+    //! `MemoryRepo`, snapshotted via [`StoreSnapshot`], boxed as
+    //! [`AnySnapshot`], and used as the `fetch_blob` callback that
+    //! [`triblespace_core::repo::capability::verify_chain`] needs. That
+    //! callback is the *only* new wiring on top of what the capability
+    //! lib tests already cover; testing it in isolation pins down the
+    //! contract without dragging in iroh's QUIC / DNS / relay stack
+    //! (which is its own integration concern).
+    //!
+    //! End-to-end tests over a real iroh transport are deferred to a
+    //! separate harness — they need a relay or address-lookup service
+    //! configured for two endpoints to discover each other in-process,
+    //! and the capability-verification logic this module wires up
+    //! does not depend on the transport choice.
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+    use triblespace_core::blob::Blob;
+    use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
+    use triblespace_core::id::{ExclusiveId, ufoid};
+    use triblespace_core::macros::entity;
+    use triblespace_core::repo::BlobStorePut;
+    use triblespace_core::repo::capability::{
+        VerifyError, build_capability, verify_chain, PERM_READ,
+    };
+    use triblespace_core::repo::memoryrepo::MemoryRepo;
+    use triblespace_core::trible::TribleSet;
+    use triblespace_core::value::TryToValue;
+    use triblespace_core::value::Value;
+    use triblespace_core::value::schemas::hash::{Blake3, Handle};
+    use triblespace_core::value::schemas::time::NsTAIInterval;
+    use hifitime::Epoch;
+
+    fn now_plus_24h() -> Value<NsTAIInterval> {
+        let now = Epoch::now().expect("system time");
+        let later = now + hifitime::Duration::from_seconds(24.0 * 3600.0);
+        (now, later).try_to_value().expect("valid interval")
+    }
+
+    fn empty_scope() -> (triblespace_core::id::Id, TribleSet) {
+        let scope_root = ufoid();
+        let facts = entity! { ExclusiveId::force_ref(&scope_root) @
+            triblespace_core::metadata::tag: PERM_READ,
+        };
+        (*scope_root, TribleSet::from(facts))
+    }
+
+    /// Build a `Box<dyn AnySnapshot>` containing the given blobs — the
+    /// same shape `serve_stream` reaches into when verifying an OP_AUTH
+    /// capability handle.
+    fn snapshot_with_blobs(
+        blobs: &[Blob<SimpleArchive>],
+    ) -> Box<dyn AnySnapshot> {
+        let mut store = MemoryRepo::default();
+        for blob in blobs {
+            store
+                .put::<SimpleArchive, _>(blob.clone())
+                .expect("put blob");
+        }
+        Box::new(StoreSnapshot::from_store(&mut store).expect("snapshot"))
+    }
+
+    /// Wrap a snapshot in the `fetch_blob` callback shape that
+    /// [`verify_chain`] consumes. Mirrors the closure built inside
+    /// [`serve_stream`]: `&h.raw → snap.get_blob → Blob<SimpleArchive>`.
+    fn fetch_via_snapshot(
+        snap: &Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
+    ) -> impl FnMut(Value<Handle<Blake3, SimpleArchive>>) -> Option<Blob<SimpleArchive>>
+    {
+        let snap = snap.clone();
+        move |h: Value<Handle<Blake3, SimpleArchive>>| -> Option<Blob<SimpleArchive>> {
+            let bytes = snap.lock().unwrap().as_ref()?.get_blob(&h.raw)?;
+            Some(Blob::new(anybytes::Bytes::from_source(bytes)))
+        }
+    }
+
+    #[test]
+    fn snapshot_lookup_serves_a_valid_cap_chain_to_verify_chain() {
+        let team_root = SigningKey::generate(&mut OsRng);
+        let founder = SigningKey::generate(&mut OsRng);
+        let (scope_root, scope_facts) = empty_scope();
+        let (cap_blob, sig_blob) = build_capability(
+            &team_root,
+            founder.verifying_key(),
+            None,
+            scope_root,
+            scope_facts,
+            now_plus_24h(),
+        )
+        .expect("cap builds");
+        let sig_handle: Value<Handle<Blake3, SimpleArchive>> =
+            (&sig_blob).get_handle();
+
+        let snap_box = snapshot_with_blobs(&[cap_blob, sig_blob]);
+        let snap_arc: Arc<Mutex<Option<Box<dyn AnySnapshot>>>> =
+            Arc::new(Mutex::new(Some(snap_box)));
+
+        let revoked = HashSet::new();
+        let result = verify_chain(
+            team_root.verifying_key(),
+            sig_handle,
+            founder.verifying_key(),
+            &revoked,
+            fetch_via_snapshot(&snap_arc),
+        );
+
+        let verified = result.expect("snapshot served chain to verifier; chain valid");
+        assert_eq!(verified.subject, founder.verifying_key());
+        assert_eq!(verified.scope_root, scope_root);
+    }
+
+    #[test]
+    fn snapshot_lookup_rejects_unknown_handle_as_chain_break() {
+        let team_root = SigningKey::generate(&mut OsRng);
+        let founder = SigningKey::generate(&mut OsRng);
+        let snap_arc: Arc<Mutex<Option<Box<dyn AnySnapshot>>>> =
+            Arc::new(Mutex::new(Some(snapshot_with_blobs(&[]))));
+
+        // Empty snapshot: no blob keyed by the all-zeros handle exists,
+        // so `verify_chain` cannot fetch the leaf signature blob.
+        let zero_handle: Value<Handle<Blake3, SimpleArchive>> =
+            Value::new([0u8; 32]);
+        let revoked = HashSet::new();
+        let result = verify_chain(
+            team_root.verifying_key(),
+            zero_handle,
+            founder.verifying_key(),
+            &revoked,
+            fetch_via_snapshot(&snap_arc),
+        );
+        // The exact variant is `Fetch` (the verifier's `fetch_blob`
+        // callback returned None); what matters here is that an absent
+        // handle cleanly fails verification rather than panicking or
+        // hanging.
+        assert!(
+            matches!(result, Err(VerifyError::Fetch)),
+            "unknown handle must surface as Fetch; got {:?}",
+            result,
+        );
+    }
+
+    #[test]
+    fn snapshot_lookup_rejects_chain_signed_by_a_foreign_root() {
+        let real_team_root = SigningKey::generate(&mut OsRng);
+        let fake_team_root = SigningKey::generate(&mut OsRng);
+        let founder = SigningKey::generate(&mut OsRng);
+        let (scope_root, scope_facts) = empty_scope();
+        // Cap is structurally well-formed and chained one link deep —
+        // but the signing key is not the configured team root.
+        let (cap_blob, sig_blob) = build_capability(
+            &fake_team_root,
+            founder.verifying_key(),
+            None,
+            scope_root,
+            scope_facts,
+            now_plus_24h(),
+        )
+        .expect("cap builds");
+        let sig_handle: Value<Handle<Blake3, SimpleArchive>> =
+            (&sig_blob).get_handle();
+
+        let snap_box = snapshot_with_blobs(&[cap_blob, sig_blob]);
+        let snap_arc: Arc<Mutex<Option<Box<dyn AnySnapshot>>>> =
+            Arc::new(Mutex::new(Some(snap_box)));
+
+        let revoked = HashSet::new();
+        let result = verify_chain(
+            real_team_root.verifying_key(),
+            sig_handle,
+            founder.verifying_key(),
+            &revoked,
+            fetch_via_snapshot(&snap_arc),
+        );
+        assert!(
+            result.is_err(),
+            "chain signed by a foreign root must fail verification; got {:?}",
+            result,
+        );
+    }
+}
