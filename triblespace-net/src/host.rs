@@ -681,23 +681,39 @@ async fn serve_stream(
         return Ok(());
     }
 
-    // All other ops require a verified cap on the connection.
-    if auth_state.read().await.is_none() {
-        // Not authenticated. Close the stream silently — the client
-        // should have presented OP_AUTH first.
-        return Ok(());
-    }
-    // For v0 every authenticated peer can do every op. Future commits
-    // will scope-gate per-op (e.g. OP_GET_BLOB only for read scope,
-    // restricting OP_HEAD to branches in scope_branch, etc.).
+    // All other ops require a verified cap on the connection. Snapshot
+    // the auth state once so the scope gate sees a stable view of the
+    // verified cap for the rest of this stream's lifetime.
+    let verified = match auth_state.read().await.clone() {
+        Some(v) => v,
+        None => {
+            // Not authenticated. Close the stream silently — the client
+            // should have presented OP_AUTH first.
+            return Ok(());
+        }
+    };
+    // Branch-level scope gate: peers without read permission get
+    // empty results from `OP_LIST` and a NIL head from `OP_HEAD` for
+    // any branch outside their granted set. Blob-level ops
+    // (`OP_GET_BLOB`, `OP_CHILDREN`) currently only require auth — a
+    // tighter reachability-based gate is future work.
 
     match op {
         OP_LIST => {
             let branches = snap_arc.lock().unwrap().as_ref()
                 .map(|s| s.list_branches().to_vec())
                 .unwrap_or_default();
-            for (id, head) in &branches {
-                send_branch_id(send, id).await?;
+            for (id_bytes, head) in &branches {
+                let Some(id) = triblespace_core::id::Id::new(*id_bytes) else {
+                    // Skip malformed branch ids (the all-zeros sentinel
+                    // value `NIL_BRANCH_ID` round-trips through this path
+                    // when the snapshot accidentally yields it).
+                    continue;
+                };
+                if !verified.grants_read_on(&id) {
+                    continue;
+                }
+                send_branch_id(send, id_bytes).await?;
                 send_hash(send, head).await?;
             }
             send_branch_id(send, &NIL_BRANCH_ID).await?;
@@ -705,9 +721,15 @@ async fn serve_stream(
 
         OP_HEAD => {
             let id_bytes = recv_branch_id(recv).await?;
-            let hash = snap_arc.lock().unwrap().as_ref()
-                .and_then(|s| s.head(&id_bytes))
-                .unwrap_or(NIL_HASH);
+            let allowed = triblespace_core::id::Id::new(id_bytes)
+                .is_some_and(|id| verified.grants_read_on(&id));
+            let hash = if allowed {
+                snap_arc.lock().unwrap().as_ref()
+                    .and_then(|s| s.head(&id_bytes))
+                    .unwrap_or(NIL_HASH)
+            } else {
+                NIL_HASH
+            };
             send_hash(send, &hash).await?;
         }
 

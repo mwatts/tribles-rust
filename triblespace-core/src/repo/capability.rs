@@ -528,6 +528,47 @@ pub struct VerifiedCapability {
     pub cap_set: TribleSet,
 }
 
+impl VerifiedCapability {
+    /// Returns the set of permissions tagged on this cap's scope root
+    /// (a subset of `{`[`PERM_READ`]`,`[`PERM_WRITE`]`,`[`PERM_ADMIN`]`}`).
+    pub fn permissions(&self) -> HashSet<crate::id::Id> {
+        let (perms, _) = collect_scope_facts(&self.cap_set, self.scope_root);
+        perms
+    }
+
+    /// Returns `Some(set)` if the cap restricts itself to a specific
+    /// non-empty set of branches, or `None` if the cap is unrestricted
+    /// (i.e. applies to every branch within the granted permission set).
+    pub fn granted_branches(&self) -> Option<HashSet<crate::id::Id>> {
+        let (_, branches) = collect_scope_facts(&self.cap_set, self.scope_root);
+        if branches.is_empty() { None } else { Some(branches) }
+    }
+
+    /// Returns `true` if the cap grants any read-equivalent permission
+    /// (read, write, or admin — write/admin imply read, matching the
+    /// subsumption rules in [`scope_subsumes`]).
+    pub fn grants_read(&self) -> bool {
+        let perms = self.permissions();
+        perms.contains(&PERM_READ)
+            || perms.contains(&PERM_WRITE)
+            || perms.contains(&PERM_ADMIN)
+    }
+
+    /// Returns `true` if the cap grants read-equivalent permission on
+    /// the given branch — i.e. the cap [`grants_read`](Self::grants_read)
+    /// AND either is unrestricted or its restriction set contains
+    /// `branch`.
+    pub fn grants_read_on(&self, branch: &crate::id::Id) -> bool {
+        if !self.grants_read() {
+            return false;
+        }
+        match self.granted_branches() {
+            None => true,
+            Some(set) => set.contains(branch),
+        }
+    }
+}
+
 /// Maximum chain depth the verifier will walk before giving up. Real
 /// chains are 1-3 deep typically; this is a sanity bound to refuse
 /// adversarial deep chains.
@@ -1452,5 +1493,130 @@ mod tests {
             .verifying_key()
             .verify(&founder_cap.bytes, &signature)
             .expect("embedded signature verifies over the parent cap bytes");
+    }
+
+    /// `VerifiedCapability::permissions` extracts every `metadata::tag`
+    /// hung off the scope root. A read-only cap reports just `PERM_READ`.
+    #[test]
+    fn verified_capability_permissions_read_only() {
+        let team_root = signing_key();
+        let founder = signing_key();
+        let (scope_root, scope_facts) = scope_with(&[PERM_READ], &[]);
+        let (cap_blob, sig_blob) = build_capability(
+            &team_root,
+            founder.verifying_key(),
+            None,
+            scope_root,
+            scope_facts,
+            now_plus_24h(),
+        )
+        .expect("cap builds");
+        let leaf_handle: Value<Handle<Blake3, SimpleArchive>> =
+            (&sig_blob).get_handle();
+        let revoked = HashSet::new();
+        let verified = verify_chain(
+            team_root.verifying_key(),
+            leaf_handle,
+            founder.verifying_key(),
+            &revoked,
+            store_for(&[&cap_blob, &sig_blob]),
+        )
+        .expect("chain valid");
+
+        let perms = verified.permissions();
+        assert_eq!(perms.len(), 1);
+        assert!(perms.contains(&PERM_READ));
+        assert!(verified.grants_read());
+    }
+
+    /// Unrestricted cap (no `scope_branch` tribles) reports
+    /// `granted_branches() == None` and `grants_read_on(any)` is true.
+    #[test]
+    fn verified_capability_unrestricted_grants_read_on_any_branch() {
+        let team_root = signing_key();
+        let founder = signing_key();
+        let (scope_root, scope_facts) = scope_with(&[PERM_READ], &[]);
+        let (cap_blob, sig_blob) = build_capability(
+            &team_root,
+            founder.verifying_key(),
+            None,
+            scope_root,
+            scope_facts,
+            now_plus_24h(),
+        )
+        .expect("cap builds");
+        let leaf_handle: Value<Handle<Blake3, SimpleArchive>> =
+            (&sig_blob).get_handle();
+        let verified = verify_chain(
+            team_root.verifying_key(),
+            leaf_handle,
+            founder.verifying_key(),
+            &HashSet::new(),
+            store_for(&[&cap_blob, &sig_blob]),
+        )
+        .expect("chain valid");
+
+        assert!(verified.granted_branches().is_none(), "unrestricted");
+        let any_branch = crate::id::ufoid();
+        assert!(verified.grants_read_on(&any_branch));
+    }
+
+    /// Branch-restricted cap reports `granted_branches() == Some(set)`
+    /// and `grants_read_on` returns true only for branches in that set.
+    #[test]
+    fn verified_capability_branch_restricted_gates_correctly() {
+        let team_root = signing_key();
+        let founder = signing_key();
+        let allowed = crate::id::ufoid();
+        let blocked = crate::id::ufoid();
+        let (scope_root, scope_facts) =
+            scope_with(&[PERM_READ], &[*allowed]);
+        let (cap_blob, sig_blob) = build_capability(
+            &team_root,
+            founder.verifying_key(),
+            None,
+            scope_root,
+            scope_facts,
+            now_plus_24h(),
+        )
+        .expect("cap builds");
+        let leaf_handle: Value<Handle<Blake3, SimpleArchive>> =
+            (&sig_blob).get_handle();
+        let verified = verify_chain(
+            team_root.verifying_key(),
+            leaf_handle,
+            founder.verifying_key(),
+            &HashSet::new(),
+            store_for(&[&cap_blob, &sig_blob]),
+        )
+        .expect("chain valid");
+
+        let granted = verified.granted_branches().expect("restricted set");
+        assert!(granted.contains(&*allowed));
+        assert!(!granted.contains(&*blocked));
+        assert!(verified.grants_read_on(&*allowed));
+        assert!(!verified.grants_read_on(&*blocked));
+    }
+
+    /// A cap with no read-bearing permission (e.g. a hypothetical empty
+    /// scope) does not grant read; `grants_read_on` is false even on an
+    /// allowed branch.
+    #[test]
+    fn verified_capability_without_read_permission_blocks_reads() {
+        // Construct directly; we skip `verify_chain` here because a
+        // permission-less cap would never pass scope subsumption against
+        // a real parent. We just want to exercise the helper logic
+        // against a manually-shaped `cap_set`.
+        let scope_root = crate::id::ufoid();
+        // Empty cap_set with no tags hung off scope_root.
+        let cap_set = TribleSet::new();
+        let verified = VerifiedCapability {
+            subject: signing_key().verifying_key(),
+            scope_root: *scope_root,
+            cap_set,
+        };
+        assert!(!verified.grants_read());
+        let any_branch = crate::id::ufoid();
+        assert!(!verified.grants_read_on(&any_branch));
     }
 }
