@@ -231,6 +231,38 @@ impl<D: triblespace_core::value::ValueSchema, T: triblespace_core::value::ValueS
     }
 }
 
+/// Convenience methods for word-hash-keyed indexes — skip the
+/// `&hash_tokens(text)` ceremony at every call site.
+///
+/// `matches_text` and `score_text` are sugar over [`Self::matches`]
+/// and [`Self::score`]: tokenise the query string with
+/// [`crate::tokens::hash_tokens`] (whitespace + lowercase + Blake3),
+/// then delegate. Available only on indexes whose term schema is
+/// [`crate::tokens::WordHash`] — pair them up with
+/// `BM25Builder::<D, WordHash>::new()` builders.
+impl<D: triblespace_core::value::ValueSchema>
+    BM25Index<D, crate::tokens::WordHash>
+{
+    /// Same as [`Self::matches`], but takes a query string and
+    /// tokenises it with [`crate::tokens::hash_tokens`] internally.
+    pub fn matches_text(
+        &self,
+        doc: Variable<D>,
+        text: &str,
+        score_floor: f32,
+    ) -> BM25Filter<D> {
+        self.matches(doc, &crate::tokens::hash_tokens(text), score_floor)
+    }
+
+    /// Same as [`Self::score`], but takes a query string and
+    /// tokenises it with [`crate::tokens::hash_tokens`] internally.
+    /// Use after `find!` collects to recompute precise per-result
+    /// scores for ranking.
+    pub fn score_text(&self, doc: &Value<D>, text: &str) -> f32 {
+        self.score(doc, &crate::tokens::hash_tokens(text))
+    }
+}
+
 #[cfg(feature = "succinct")]
 impl<D: triblespace_core::value::ValueSchema, T: triblespace_core::value::ValueSchema>
     crate::succinct::SuccinctBM25Index<D, T>
@@ -260,6 +292,28 @@ impl<D: triblespace_core::value::ValueSchema, T: triblespace_core::value::ValueS
             }
         }
         sum
+    }
+}
+
+/// Word-hash convenience for the succinct path — same shape as the
+/// naive-index sugar, picks up the u16-quantised scoring transparently.
+#[cfg(feature = "succinct")]
+impl<D: triblespace_core::value::ValueSchema>
+    crate::succinct::SuccinctBM25Index<D, crate::tokens::WordHash>
+{
+    /// Succinct-side sibling of [`BM25Index::matches_text`].
+    pub fn matches_text(
+        &self,
+        doc: Variable<D>,
+        text: &str,
+        score_floor: f32,
+    ) -> BM25Filter<D> {
+        self.matches(doc, &crate::tokens::hash_tokens(text), score_floor)
+    }
+
+    /// Succinct-side sibling of [`BM25Index::score_text`].
+    pub fn score_text(&self, doc: &Value<D>, text: &str) -> f32 {
+        self.score(doc, &crate::tokens::hash_tokens(text))
     }
 }
 
@@ -801,6 +855,48 @@ mod tests {
         assert!(ids.contains(&id(1)));
         assert!(ids.contains(&id(3)));
         assert!(!ids.contains(&id(2)));
+    }
+
+    /// `matches_text` produces the same proposed-doc set as
+    /// `matches(&hash_tokens(text), ...)`, just without the explicit
+    /// tokenisation at the call site.
+    #[test]
+    fn matches_text_matches_explicit_tokens() {
+        let idx = sample_index();
+        let mut ctx = triblespace_core::query::VariableContext::new();
+        let doc_a: Variable<GenId> = ctx.next_variable();
+        let doc_b: Variable<GenId> = ctx.next_variable();
+
+        let explicit = idx.matches(doc_a, &hash_tokens("quick fox"), 0.0);
+        let sugar = idx.matches_text(doc_b, "quick fox", 0.0);
+
+        let mut props_a = Vec::new();
+        let mut props_b = Vec::new();
+        explicit.propose(doc_a.index, &Binding::default(), &mut props_a);
+        sugar.propose(doc_b.index, &Binding::default(), &mut props_b);
+
+        let set_a: HashSet<Id> = props_a
+            .iter()
+            .map(|r| raw_value_to_id(r).expect("genid"))
+            .collect();
+        let set_b: HashSet<Id> = props_b
+            .iter()
+            .map(|r| raw_value_to_id(r).expect("genid"))
+            .collect();
+        assert_eq!(
+            set_a, set_b,
+            "matches_text yields the same doc set as matches(hash_tokens(...))",
+        );
+    }
+
+    /// `score_text` agrees with `score(&hash_tokens(text))` to f32
+    /// precision — the only difference is the call-site ergonomics.
+    #[test]
+    fn score_text_matches_explicit_tokens() {
+        let idx = sample_index();
+        let s_explicit = idx.score(&id(1).to_value(), &hash_tokens("quick fox"));
+        let s_sugar = idx.score_text(&id(1).to_value(), "quick fox");
+        assert_eq!(s_explicit, s_sugar);
     }
 
     #[test]

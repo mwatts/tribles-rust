@@ -69,6 +69,10 @@ naive-then-succinct implementation order is the open work item.
 * **Shared constraint trait** `SimilaritySearch` (HNSW, Flat,
   SuccinctHNSW) + `BM25Queryable` (naive + succinct BM25) — the
   same constraints work against either backend.
+* **`matches_text(doc, text, floor)`** + **`score_text(doc, text)`**:
+  word-hash-keyed sugar over `matches` and `score` — tokenises the
+  query string with `hash_tokens` internally, available on indexes
+  whose term schema is `WordHash` (the default).
 * **`tokens::hash_tokens`**: opt-in whitespace + lowercase +
   Blake3 tokenizer producing 32-byte term values.
 * **`tokens::ngram_tokens`**: character n-gram tokenizer (n
@@ -116,12 +120,10 @@ naive-then-succinct implementation order is the open work item.
 
 ### What's next
 
-* A higher-level `matches_text(?doc, "typst links", floor)`
-  macro that tokenizes the query string and skips the
-  `&hash_tokens(...)` ceremony.
-* Wavelet-matrix HNSW graph per DESIGN.md's RING plan (no
-  current win under forward-only traversal; see
-  `docs/HNSW_GRAPH_ENCODING.md`).
+* Wavelet-matrix BM25 term table (would shrink the term column
+  at large vocabularies; correctness-first is winning today).
+* Direct `SuccinctBM25Index` builder that skips the naive
+  intermediate (memory win at large build-time scale).
 
 See
 [`docs/DESIGN.md`](docs/DESIGN.md),
