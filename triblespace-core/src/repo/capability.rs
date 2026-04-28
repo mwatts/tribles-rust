@@ -718,6 +718,74 @@ impl From<UnarchiveError> for VerifyError {
 }
 
 /// A successfully verified leaf capability.
+///
+/// Returned by [`verify_chain`] on a successful walk back to the
+/// configured `team_root`. Carries the leaf cap's full `TribleSet` so
+/// callers can ask:
+///
+/// - [`permissions`](Self::permissions) — which `PERM_*` tags are
+///   hung on the scope root
+/// - [`granted_branches`](Self::granted_branches) — `Some(set)` if the
+///   cap restricts itself to specific branches, or `None` if it's
+///   unrestricted within its permission set
+/// - [`grants_read`](Self::grants_read) — convenience for "any read-
+///   equivalent permission" (write/admin imply read)
+/// - [`grants_read_on`](Self::grants_read_on) — combines the two:
+///   read-permission AND (unrestricted OR branch-in-scope)
+///
+/// # Example
+///
+/// Build a `VerifiedCapability` directly (skipping `verify_chain` —
+/// the helpers operate on `cap_set` shape, not on the chain proof,
+/// so a hand-crafted instance suffices for testing scope predicates):
+///
+/// ```rust
+/// use std::collections::HashSet;
+/// use triblespace_core::id::{ufoid, ExclusiveId, Id};
+/// use triblespace_core::macros::entity;
+/// use triblespace_core::trible::TribleSet;
+/// use triblespace_core::repo::capability::{
+///     scope_branch, VerifiedCapability, PERM_READ,
+/// };
+/// use ed25519_dalek::SigningKey;
+/// use rand::rngs::OsRng;
+///
+/// let scope_root = ufoid();
+/// let allowed_branch = ufoid();
+/// // PERM_READ scope, restricted to one branch.
+/// let mut cap_set = TribleSet::new();
+/// cap_set += TribleSet::from(entity! {
+///     ExclusiveId::force_ref(&scope_root) @
+///     triblespace_core::metadata::tag: PERM_READ,
+/// });
+/// cap_set += TribleSet::from(entity! {
+///     ExclusiveId::force_ref(&scope_root) @
+///     scope_branch: *allowed_branch,
+/// });
+///
+/// let verified = VerifiedCapability {
+///     subject: SigningKey::generate(&mut OsRng).verifying_key(),
+///     scope_root: *scope_root,
+///     cap_set,
+/// };
+///
+/// // permissions() exposes the raw tag set.
+/// let perms = verified.permissions();
+/// assert_eq!(perms.len(), 1);
+/// assert!(perms.contains(&PERM_READ));
+///
+/// // granted_branches() returns Some(set) for restricted caps.
+/// let branches = verified.granted_branches().expect("restricted");
+/// assert!(branches.contains(&*allowed_branch));
+///
+/// // grants_read() short-circuits to "any read-equivalent perm".
+/// assert!(verified.grants_read());
+///
+/// // grants_read_on() composes both checks.
+/// assert!(verified.grants_read_on(&*allowed_branch));
+/// let other_branch: Id = *ufoid();
+/// assert!(!verified.grants_read_on(&other_branch));
+/// ```
 #[derive(Debug, Clone)]
 pub struct VerifiedCapability {
     /// The subject pubkey the leaf cap authorizes.
