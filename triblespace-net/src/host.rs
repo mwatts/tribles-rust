@@ -1465,21 +1465,27 @@ mod tests {
     /// Build both endpoints up-front (transports allocated on the
     /// shared `TestNetwork` before either endpoint binds), mount
     /// `SnapshotHandler` on the server, dial from the client.
-    /// Returns `(router, connection)` — the test holds onto the
-    /// router so it isn't dropped mid-test (which would tear down
-    /// the accept loop).
+    /// Returns `(router, client_ep, connection)` — the test holds
+    /// onto **all three**: dropping the router tears down the
+    /// accept loop, **dropping the client `Endpoint` tears down
+    /// every connection it owns** (this was the bug that made an
+    /// earlier draft of these tests deadlock — the client endpoint
+    /// dropped at the end of this helper's scope while the test
+    /// was still holding the connection).
     ///
     /// Order matters: in iroh's `test_custom_transport_only`, both
     /// transports are created before either endpoint binds, and the
-    /// Router is spawned last. Reproducing that order here avoids
-    /// a subtle hang where a transport allocated after the server
-    /// router spawns doesn't propagate.
+    /// Router is spawned last. Reproducing that order here.
     async fn dial_against_auth_server(
         team_root: ed25519_dalek::VerifyingKey,
         cap_blob: Blob<SimpleArchive>,
         sig_blob: Blob<SimpleArchive>,
         client_signing: &SigningKey,
-    ) -> (iroh::protocol::Router, iroh::endpoint::Connection) {
+    ) -> (
+        iroh::protocol::Router,
+        iroh::Endpoint,
+        iroh::endpoint::Connection,
+    ) {
         use iroh::test_utils::test_transport::{TestNetwork, to_custom_addr};
 
         let network = TestNetwork::new();
@@ -1525,7 +1531,7 @@ mod tests {
             .connect(server_addr, PILE_SYNC_ALPN)
             .await
             .expect("client connect");
-        (router, conn)
+        (router, client_ep, conn)
     }
 
     /// Smoke test: echo handler over TestNetwork with the same
@@ -1587,18 +1593,6 @@ mod tests {
         let _ = router.shutdown().await;
     }
 
-    // TODO(auth-arc): the three `e2e_auth_handshake_*` tests below
-    // hang on `accept_bi` inside `SnapshotHandler::accept` when the
-    // server is bound to iroh's `TestNetwork` custom transport.
-    // The companion `e2e_smoke_echo_over_test_network` test passes
-    // with the same harness, isolating the bug to something specific
-    // about how `SnapshotHandler` interacts with the test transport
-    // (perhaps the `loop { accept_bi }` + `tokio::spawn` shape, or
-    // the `connection.remote_id()` call before the first stream is
-    // established). Marking these `#[ignore]` so the harness stays
-    // in tree as scaffolding but the test suite stays green; pick
-    // up the investigation when the auth track has another iteration.
-    #[ignore]
     #[tokio::test]
     async fn e2e_auth_handshake_accepts_valid_cap() {
         let team_root = SigningKey::generate(&mut OsRng);
@@ -1616,7 +1610,7 @@ mod tests {
         let sig_handle: Value<Handle<Blake3, SimpleArchive>> =
             (&sig_blob).get_handle();
 
-        let (router, conn) = dial_against_auth_server(
+        let (router, _client_ep, conn) = dial_against_auth_server(
             team_root.verifying_key(),
             cap_blob,
             sig_blob,
@@ -1633,7 +1627,6 @@ mod tests {
         let _ = router.shutdown().await;
     }
 
-    #[ignore]
     #[tokio::test]
     async fn e2e_auth_handshake_rejects_zero_cap() {
         let team_root = SigningKey::generate(&mut OsRng);
@@ -1649,7 +1642,7 @@ mod tests {
         )
         .expect("cap builds");
 
-        let (router, conn) = dial_against_auth_server(
+        let (router, _client_ep, conn) = dial_against_auth_server(
             team_root.verifying_key(),
             cap_blob,
             sig_blob,
@@ -1672,7 +1665,6 @@ mod tests {
         let _ = router.shutdown().await;
     }
 
-    #[ignore]
     #[tokio::test]
     async fn e2e_auth_handshake_rejects_chain_signed_by_foreign_root() {
         let real_team_root = SigningKey::generate(&mut OsRng);
@@ -1692,7 +1684,7 @@ mod tests {
         let sig_handle: Value<Handle<Blake3, SimpleArchive>> =
             (&sig_blob).get_handle();
 
-        let (router, conn) = dial_against_auth_server(
+        let (router, _client_ep, conn) = dial_against_auth_server(
             real_team_root.verifying_key(),
             cap_blob,
             sig_blob,
