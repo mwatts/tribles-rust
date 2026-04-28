@@ -30,9 +30,12 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for the full design.
 
 ## Status
 
-**Pre-alpha.** Public API shapes are still settling. Version 0.0.0
-until the first non-scaffold release. The design is frozen; the
-naive-then-succinct implementation order is the open work item.
+**Pre-alpha.** Tracks the workspace version (`0.36.0`); the API
+shapes are settling but not yet stable for downstream pinning. Both
+the naive and succinct paths are shipped end-to-end (see
+[`docs/DESIGN.md`](docs/DESIGN.md) for the full picture and
+[`CHANGELOG.md`](CHANGELOG.md) for the recent shape changes). The
+remaining open items are perf/encoding refinements, not architecture.
 
 ### What works today
 

@@ -103,22 +103,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // `SuccinctBM25Index<ShortString, WordHash>`).
             let idx: SuccinctBM25Index =
                 reader.get::<SuccinctBM25Index, SuccinctBM25Blob>(handle)?;
-            let tokens = hash_tokens(&text);
-            // One engine pass: `matches` binds `doc` to docs that
-            // match at all (score_floor = 0.0). The pattern joins
-            // on the shared ?doc to pull the title back out of the
-            // KB at the same time. We rescore each survivor via
-            // `idx.score` afterwards for ranking — same pattern as
-            // HNSW.
+            // One engine pass: `matches_text` tokenises the query
+            // internally (whitespace + lowercase + Blake3 via
+            // `hash_tokens`) and binds `doc` to docs that match at
+            // all (score_floor = 0.0). The pattern joins on the
+            // shared ?doc to pull the title back out of the KB at
+            // the same time. We rescore each survivor via
+            // `idx.score_text` afterwards for ranking — same
+            // pattern as HNSW's similar/recompute split.
             use triblespace_core::value::ToValue;
             let mut rows: Vec<(Id, f32, String)> = find!(
                 (doc: Id, title: String),
                 and!(
-                    idx.matches(doc, &tokens, 0.0),
+                    idx.matches_text(doc, &text, 0.0),
                     pattern!(&kb, [{ ?doc @ wiki::title: ?title }])
                 )
             )
-            .map(|(d, t)| (d, idx.score(&d.to_value(), &tokens), t))
+            .map(|(d, t)| (d, idx.score_text(&d.to_value(), &text), t))
             .collect();
             rows.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
             for (id, score, title) in rows.into_iter().take(10) {
@@ -173,20 +174,24 @@ stores it once. That's free caching.
 ## Pattern: query-time composition with `find!`
 
 The BM25 constraint plugs into the same `find!` / `and!` /
-`pattern!` engine as everything else. The typed term slice makes
-the composition transparent — `&hash_tokens("typst")` is a
-`&[Value<WordHash>]`, which is exactly what `idx.matches(..)`
-wants on a `<GenId, WordHash>` index:
+`pattern!` engine as everything else. On a `WordHash`-keyed index
+the tokenisation can collapse into the constraint via
+`matches_text`:
 
 ```rust,ignore
 let docs: Vec<(Id,)> = find!(
     (doc: Id),
     and!(
-        idx.matches(doc, &hash_tokens("typst"), 0.0),
+        idx.matches_text(doc, "typst", 0.0),
         pattern!(&kb, [{ ?doc @ wiki::tag: &some_tag }])
     )
 ).collect();
 ```
+
+For other tokenisers (`bigram_tokens`, `ngram_tokens`,
+`code_tokens`) or for hand-built term slices, the explicit form
+`idx.matches(doc, &terms, 0.0)` accepts any
+`&[Value<T>]` matching the index's term schema.
 
 This is the "find docs with `typst` in the body AND tagged X"
 query, running through a single engine pass. The engine picks
@@ -202,16 +207,18 @@ versions with a concrete KB.
 
 Score is **never** a bound query variable. The constraint
 filters on a fixed `score_floor` parameter; callers recompute
-exact scores afterwards via `idx.score(&doc.to_value(), terms)`.
-Same pattern as HNSW's `similar`/recompute-cosine split:
+exact scores afterwards via `idx.score(&doc.to_value(), terms)`
+(or `idx.score_text(&doc.to_value(), text)` on a `WordHash`-keyed
+index, which tokenises internally). Same pattern as HNSW's
+`similar`/recompute-cosine split:
 
 ```rust,ignore
 use triblespace_core::value::ToValue;
 let mut ranked: Vec<(Id, f32)> = find!(
     (doc: Id),
-    idx.matches(doc, &tokens, 0.0)
+    idx.matches_text(doc, "typst links", 0.0)
 )
-.map(|(d,)| (d, idx.score(&d.to_value(), &tokens)))
+.map(|(d,)| (d, idx.score_text(&d.to_value(), "typst links")))
 .collect();
 ranked.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 ```
@@ -222,8 +229,15 @@ engine sees docs only. Second: one less variable per BM25
 clause in the planner, no Cartesian-blowup dedupe needed.
 
 If you want to filter by relevance (not just presence), pass a
-non-zero floor: `idx.matches(doc, &tokens, 1.5)`. The engine
-proposes only docs whose summed BM25 ≥ 1.5.
+non-zero floor: `idx.matches_text(doc, "typst links", 1.5)`. The
+engine proposes only docs whose summed BM25 ≥ 1.5.
+
+For perf-sensitive paths where the same query string is reused
+many times, hoist the tokenisation by hand:
+`let tokens = hash_tokens("…");` then call the explicit-terms
+methods `idx.matches(doc, &tokens, …)` and
+`idx.score(&doc, &tokens)`. The text-sugar versions re-tokenise
+on every call.
 
 ## Open questions for faculty authors
 
