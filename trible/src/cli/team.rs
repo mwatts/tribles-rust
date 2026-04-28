@@ -46,6 +46,7 @@ pub enum Command {
     /// Issue a capability for a teammate, delegating from the running
     /// node's own cap.
     Invite {
+        /// Path to the local pile file.
         #[arg(long)]
         pile: PathBuf,
         /// Team root pubkey (hex). Used to verify the issuer's cap
@@ -73,6 +74,7 @@ pub enum Command {
     /// `TRIBLE_TEAM_ROOT_SECRET`). Cascades transitively through any
     /// chain involving the revoked pubkey.
     Revoke {
+        /// Path to the local pile file.
         #[arg(long)]
         pile: PathBuf,
         /// Team root secret key (hex of the 32-byte ed25519 SecretKey).
@@ -86,6 +88,7 @@ pub enum Command {
     },
     /// List capabilities and revocations stored in the local pile.
     List {
+        /// Path to the local pile file.
         #[arg(long)]
         pile: PathBuf,
     },
