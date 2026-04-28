@@ -35,5 +35,12 @@ tracing = "0.1"
 
 [dev-dependencies]
 hifitime = "4.1.2"
+# `test-utils` exposes `iroh::test_utils::test_transport::TestNetwork`,
+# the in-memory simulated transport that lets two endpoints talk
+# without DNS or relays. The mpsc-channel transport itself lives
+# behind `unstable-custom-transports` because the custom-transport
+# API isn't stable yet — we only depend on it for the auth-handshake
+# e2e test, which is fine.
+iroh = { version = "0.97", features = ["test-utils", "unstable-custom-transports"] }
 
 
