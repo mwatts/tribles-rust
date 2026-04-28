@@ -75,15 +75,16 @@ pre-materialisation is the cleanest path; the resulting
 constraint is small (`Vec<RawValue>`, one entry per matching
 doc) and the engine path needs no further lookups.
 
-Typical calls:
+Typical calls (the `_text` forms tokenise the query string
+internally via `hash_tokens` and are available on `WordHash`-keyed
+indexes — the default):
 
 ```rust
 // "Filter only" — score_floor = 0.0 includes any matching doc.
-let tokens = hash_tokens("graph search algorithms");
 let docs: Vec<(Id,)> = find!(
     (book: Id),
     and!(
-        idx.matches(book, &tokens, 0.0),
+        idx.matches_text(book, "graph search algorithms", 0.0),
         pattern!(&kb, [{ ?book @ literature::author: &target_author }]),
     ),
 )
@@ -92,7 +93,17 @@ let docs: Vec<(Id,)> = find!(
 // "Relevance threshold" — only docs whose summed BM25 ≥ floor.
 let docs: Vec<(Id,)> = find!(
     (book: Id),
-    idx.matches(book, &tokens, 1.5),
+    idx.matches_text(book, "graph search algorithms", 1.5),
+)
+.collect();
+
+// For other tokeniser flavours (bigrams, n-grams, code tokens) or
+// when reusing the same token slice across many `score` calls,
+// the explicit form takes a pre-tokenised `&[Value<T>]`:
+let tokens = hash_tokens("graph search algorithms");
+let docs: Vec<(Id,)> = find!(
+    (book: Id),
+    idx.matches(book, &tokens, 0.0),
 )
 .collect();
 ```
@@ -248,7 +259,7 @@ find!(
     (doc: Id),
     and!(
         bm25.matches(doc, &[id_as_term(x)], 0.0),
-        bm25.matches(doc, &hash_tokens("typst"), 0.0),
+        bm25.matches_text(doc, "typst", 0.0),
     ),
 )
 
@@ -296,13 +307,13 @@ query picks it up by loading the updated handle.
 2. **Async / deferred index loading.** Large blobs are
    mmap-backed via `anybytes::Bytes` already; a `Bytes::view`
    failure happens at load time, not at constraint use time.
-3. **String-input `matches`.** `matches` takes `&[Value<T>]`
-   today because the caller picks the tokenizer (`hash_tokens`
-   / `bigram_tokens` / ...); the two-line `&hash_tokens("...")`
-   pattern is the canonical call. A `Tokenizable` trait keyed
-   on `T` would let a one-arg `matches_text(doc, "...", floor)`
-   exist, but the indirection isn't worth it until we have a
-   caller asking.
+3. **String-input `matches`.** Resolved: `WordHash`-keyed
+   indexes ship `matches_text(doc, "...", floor)` and
+   `score_text(&doc, "...")` sugar that tokenises via
+   `hash_tokens` internally. The general form `matches(doc,
+   &terms, floor)` stays the entry point for `bigram_tokens` /
+   `ngram_tokens` / `code_tokens` and for callers that want to
+   hand-hoist tokenisation across many `score` calls.
 
 ## Non-goals (v1)
 
