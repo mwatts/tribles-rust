@@ -768,6 +768,87 @@ struct CapFields {
 /// (as issuer or subject) invalidates the capability transitively.
 ///
 /// Returns the verified leaf capability on success.
+///
+/// # Example
+///
+/// End-to-end auth flow: team root mints a length-1 cap for a
+/// member, then verifies it.
+///
+/// ```rust
+/// use ed25519_dalek::SigningKey;
+/// use std::collections::{HashMap, HashSet};
+/// use triblespace_core::blob::Blob;
+/// use triblespace_core::blob::schemas::simplearchive::SimpleArchive;
+/// use triblespace_core::id::{ufoid, ExclusiveId};
+/// use triblespace_core::macros::entity;
+/// use triblespace_core::trible::TribleSet;
+/// use triblespace_core::value::TryToValue;
+/// use triblespace_core::value::Value;
+/// use triblespace_core::value::schemas::hash::{Blake3, Handle};
+/// use triblespace_core::repo::capability::{
+///     build_capability, verify_chain, PERM_READ,
+/// };
+/// use rand::rngs::OsRng;
+///
+/// // Team root mints itself; in a real deployment this happens
+/// // once at team creation and the secret is archived offline.
+/// let team_root = SigningKey::generate(&mut OsRng);
+/// let member = SigningKey::generate(&mut OsRng);
+///
+/// // Scope: a single anchor entity tagged with PERM_READ. The
+/// // anchor id goes into `cap_scope_root`; the tag triple goes
+/// // into `scope_facts` so it lives in the cap blob.
+/// let scope_root = ufoid();
+/// let scope_facts: TribleSet = entity! {
+///     ExclusiveId::force_ref(&scope_root) @
+///     triblespace_core::metadata::tag: PERM_READ,
+/// }
+/// .into();
+///
+/// // 24-hour expiry interval, anchored at "now".
+/// let now = hifitime::Epoch::now().unwrap();
+/// let expiry = (now, now + hifitime::Duration::from_seconds(24.0 * 3600.0))
+///     .try_to_value()
+///     .unwrap();
+///
+/// // Length-1 chain: team root signs the member's cap directly.
+/// let (cap_blob, sig_blob) = build_capability(
+///     &team_root,
+///     member.verifying_key(),
+///     None, // No parent — this is the founder/member directly off the root.
+///     *scope_root,
+///     scope_facts,
+///     expiry,
+/// )
+/// .unwrap();
+///
+/// // The peer presents the *sig* blob's handle on connection.
+/// let leaf_sig_handle: Value<Handle<Blake3, SimpleArchive>> =
+///     (&sig_blob).get_handle();
+///
+/// // The verifier needs both blobs available via the fetch closure.
+/// // Real callers wire this through their pile / blob store.
+/// let mut blobs: HashMap<[u8; 32], Blob<SimpleArchive>> = HashMap::new();
+/// let cap_handle: Value<Handle<Blake3, SimpleArchive>> =
+///     (&cap_blob).get_handle();
+/// blobs.insert(cap_handle.raw, cap_blob);
+/// blobs.insert(leaf_sig_handle.raw, sig_blob);
+///
+/// // No revocations in play.
+/// let revoked: HashSet<ed25519_dalek::VerifyingKey> = HashSet::new();
+///
+/// let verified = verify_chain(
+///     team_root.verifying_key(),
+///     leaf_sig_handle,
+///     member.verifying_key(),
+///     &revoked,
+///     |h| blobs.get(&h.raw).cloned(),
+/// )
+/// .expect("chain valid");
+///
+/// assert_eq!(verified.subject, member.verifying_key());
+/// assert!(verified.grants_read());
+/// ```
 pub fn verify_chain<F>(
     team_root: VerifyingKey,
     leaf_sig_handle: Value<Handle<Blake3, SimpleArchive>>,
