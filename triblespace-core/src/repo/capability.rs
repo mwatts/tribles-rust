@@ -170,6 +170,54 @@ pub enum BuildError {
 /// optional resource restrictions via [`scope_branch`], etc.). The caller
 /// is responsible for producing a scope that's a subset of any parent
 /// scope; this builder does not enforce subsumption.
+///
+/// # Example
+///
+/// Mint a length-1 capability — team root signs the founder's cap
+/// directly. The returned `(cap_blob, sig_blob)` pair is what callers
+/// persist into the pile; the founder presents the sig blob's handle
+/// at connection time.
+///
+/// ```rust
+/// use ed25519_dalek::SigningKey;
+/// use triblespace_core::id::{ufoid, ExclusiveId};
+/// use triblespace_core::macros::entity;
+/// use triblespace_core::trible::TribleSet;
+/// use triblespace_core::value::TryToValue;
+/// use triblespace_core::repo::capability::{build_capability, PERM_READ};
+/// use rand::rngs::OsRng;
+///
+/// let team_root = SigningKey::generate(&mut OsRng);
+/// let founder = SigningKey::generate(&mut OsRng);
+///
+/// // PERM_READ scope, no branch restriction (read-everything cap).
+/// let scope_root = ufoid();
+/// let scope_facts: TribleSet = entity! {
+///     ExclusiveId::force_ref(&scope_root) @
+///     triblespace_core::metadata::tag: PERM_READ,
+/// }
+/// .into();
+///
+/// let now = hifitime::Epoch::now().unwrap();
+/// let expiry = (now, now + hifitime::Duration::from_seconds(24.0 * 3600.0))
+///     .try_to_value()
+///     .unwrap();
+///
+/// let (cap_blob, sig_blob) = build_capability(
+///     &team_root,
+///     founder.verifying_key(),
+///     None, // no parent — direct child of the team root
+///     *scope_root,
+///     scope_facts,
+///     expiry,
+/// )
+/// .expect("cap builds");
+///
+/// // Both blobs go into the pile. The founder's "credential" is the
+/// // sig blob's content-addressed handle.
+/// assert!(!cap_blob.bytes.is_empty());
+/// assert!(!sig_blob.bytes.is_empty());
+/// ```
 pub fn build_capability(
     issuer: &SigningKey,
     subject: VerifyingKey,
@@ -483,6 +531,73 @@ where
 /// commonly want to inspect / log the candidate pairs (e.g. for a
 /// "tell me what revocations my pile contains" CLI) before deciding
 /// which authorised-revoker policy to apply.
+///
+/// # Example
+///
+/// Given a heterogeneous blob set containing one valid revocation
+/// pair plus an unrelated cap blob, `extract_revocation_pairs`
+/// finds exactly the rev+sig pair and skips the cap. Composing
+/// with [`build_revocation_set`] under a `{team_root}` authorised
+/// set then surfaces the revoked target pubkey:
+///
+/// ```rust
+/// use ed25519_dalek::SigningKey;
+/// use std::collections::HashSet;
+/// use triblespace_core::id::{ufoid, ExclusiveId};
+/// use triblespace_core::macros::entity;
+/// use triblespace_core::trible::TribleSet;
+/// use triblespace_core::value::TryToValue;
+/// use triblespace_core::repo::capability::{
+///     build_capability, build_revocation, build_revocation_set,
+///     extract_revocation_pairs, PERM_READ,
+/// };
+/// use rand::rngs::OsRng;
+///
+/// let team_root = SigningKey::generate(&mut OsRng);
+/// let target = SigningKey::generate(&mut OsRng);
+///
+/// // The revocation pair we care about.
+/// let (rev_blob, rev_sig_blob) =
+///     build_revocation(&team_root, target.verifying_key());
+///
+/// // Add an unrelated cap blob to confirm the scanner doesn't
+/// // misclassify it.
+/// let founder = SigningKey::generate(&mut OsRng);
+/// let scope_root = ufoid();
+/// let scope_facts: TribleSet = entity! {
+///     ExclusiveId::force_ref(&scope_root) @
+///     triblespace_core::metadata::tag: PERM_READ,
+/// }
+/// .into();
+/// let now = hifitime::Epoch::now().unwrap();
+/// let expiry = (now, now + hifitime::Duration::from_seconds(3600.0))
+///     .try_to_value()
+///     .unwrap();
+/// let (cap_blob, cap_sig_blob) = build_capability(
+///     &team_root,
+///     founder.verifying_key(),
+///     None,
+///     *scope_root,
+///     scope_facts,
+///     expiry,
+/// )
+/// .unwrap();
+///
+/// // Scan: exactly one (rev, sig) pair surfaces; the cap+cap_sig
+/// // are not revocation-shaped and get dropped.
+/// let pairs = extract_revocation_pairs([
+///     rev_blob, rev_sig_blob, cap_blob, cap_sig_blob,
+/// ]);
+/// assert_eq!(pairs.len(), 1);
+///
+/// // Apply an authorised-revoker policy: only revocations signed
+/// // by the team root take effect. (For the relay, this is the
+/// // typical v0 policy.)
+/// let mut authorised = HashSet::new();
+/// authorised.insert(team_root.verifying_key());
+/// let revoked = build_revocation_set(&authorised, pairs);
+/// assert!(revoked.contains(&target.verifying_key()));
+/// ```
 pub fn extract_revocation_pairs<I>(
     blobs: I,
 ) -> Vec<(Blob<SimpleArchive>, Blob<SimpleArchive>)>
