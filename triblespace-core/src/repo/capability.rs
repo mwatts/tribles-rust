@@ -419,6 +419,31 @@ pub fn scope_subsumes(
 /// The verifier decides whether a particular revoker is authorised at
 /// verification time; this function only produces the signed
 /// statement.
+///
+/// # Example
+///
+/// Mint a team-root-signed revocation pair, round-trip through
+/// `verify_revocation`:
+///
+/// ```rust
+/// use ed25519_dalek::SigningKey;
+/// use triblespace_core::repo::capability::{
+///     build_revocation, verify_revocation,
+/// };
+/// use rand::rngs::OsRng;
+///
+/// let team_root = SigningKey::generate(&mut OsRng);
+/// let target = SigningKey::generate(&mut OsRng);
+///
+/// let (rev_blob, sig_blob) =
+///     build_revocation(&team_root, target.verifying_key());
+///
+/// // The pair verifies cleanly: signer recovered, target recovered.
+/// let (out_revoker, out_target) =
+///     verify_revocation(rev_blob, sig_blob).expect("verifies");
+/// assert_eq!(out_revoker, team_root.verifying_key());
+/// assert_eq!(out_target, target.verifying_key());
+/// ```
 pub fn build_revocation(
     revoker: &SigningKey,
     target: VerifyingKey,
