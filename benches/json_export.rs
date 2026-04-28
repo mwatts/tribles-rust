@@ -1,7 +1,6 @@
 use anybytes::Bytes;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use serde_json::Value as JsonValue;
-use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;

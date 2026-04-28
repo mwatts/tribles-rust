@@ -321,7 +321,7 @@ proptest! {
     fn blobstore_put_get_roundtrip(
         content in vec(any::<u8>(), 0..200),
     ) {
-        use triblespace_core::blob::{MemoryBlobStore, Blob, BlobSchema, ToBlob, TryFromBlob};
+        use triblespace_core::blob::MemoryBlobStore;
         use triblespace_core::blob::schemas::longstring::LongString;
         use triblespace_core::repo::{BlobStorePut, BlobStore, BlobStoreGet};
         use anybytes::View;

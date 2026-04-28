@@ -24,12 +24,6 @@ mod bench_social {
 // Approach 1: NFA + materialized HashMap (the original)
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn raw_id_to_value(id: &RawId) -> [u8; 32] {
-    let mut v = [0u8; 32];
-    v[16..32].copy_from_slice(id);
-    v
-}
-
 fn value_to_raw_id(v: &[u8; 32]) -> Option<RawId> {
     if v[..16] == [0; 16] {
         Some(v[16..32].try_into().unwrap())

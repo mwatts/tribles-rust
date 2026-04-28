@@ -169,8 +169,8 @@ fn consolidate_by_name_include_deleted_recovers_tombstoned_branches() {
     // - "beta" group: single head C3 → branch created directly (no merge commit).
 
     let mut alpha_heads: Vec<String> = Vec::new();
-    let mut beta_head: String = String::new();
-    let mut alpha_a_id: String = String::new();
+    let beta_head: String;
+    let alpha_a_id: String;
     {
         let pile: Pile<Blake3> = Pile::open(&pile_path).unwrap();
         let mut repo = Repository::new(pile, random_signing_key(), TribleSet::new()).unwrap();
@@ -394,8 +394,7 @@ fn consolidate_by_name_include_deleted_detects_subsumption() {
     //   add commit C2 on top, push.
     // Expected: C1 is subsumed by C2. Only one non-subsumed head → no merge commit.
 
-    let mut ancestor_head: String = String::new();
-    let mut descendant_head: String = String::new();
+    let descendant_head: String;
     {
         let pile: Pile<Blake3> = Pile::open(&pile_path).unwrap();
         let mut repo = Repository::new(pile, random_signing_key(), TribleSet::new()).unwrap();
@@ -410,9 +409,6 @@ fn consolidate_by_name_include_deleted_detects_subsumption() {
         ws_a.commit(content, "gamma-A commit");
         assert!(repo.try_push(&mut ws_a).expect("push").is_none());
         let head_a = ws_a.head().expect("head");
-        let hh: Value<triblespace_core::value::schemas::hash::Hash<Blake3>> =
-            Handle::to_hash(head_a);
-        ancestor_head = hh.from_value();
 
         // Tombstone branch A.
         let old = repo.storage_mut().head(*bid_a).unwrap().unwrap();

@@ -264,8 +264,6 @@ proptest! {
         // Add child facts
         set += children.into_facts();
 
-        // Parent should have name + links
-        let parent_val = (&parent).to_value();
         // All child names should be queryable
         for name in &child_names {
             let found = find!(

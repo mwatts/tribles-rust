@@ -100,7 +100,7 @@ fn branch_list_all_deleted_lists_deleted_branches() {
 
     let branch_id = id_hex!("33333333333333333333333333333333");
 
-    let h1 = {
+    {
         let mut pile: Pile<Blake3> = Pile::open(&pile_path).unwrap();
         pile.restore().unwrap();
 
@@ -114,8 +114,7 @@ fn branch_list_all_deleted_lists_deleted_branches() {
         pile.update(branch_id, None, Some(h1)).unwrap();
         pile.update(branch_id, Some(h1), None).unwrap();
         pile.close().unwrap();
-        h1
-    };
+    }
 
     let out = Command::cargo_bin("trible")
         .unwrap()

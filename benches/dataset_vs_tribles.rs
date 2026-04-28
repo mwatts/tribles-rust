@@ -1,7 +1,6 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use oxrdf::{Dataset, GraphNameRef, NamedNode, QuadRef};
 use std::hint::black_box;
-use triblespace::core::blob::schemas::longstring::LongString;
 use triblespace::core::blob::MemoryBlobStore;
 use triblespace::core::id::fucid;
 use triblespace::core::trible::Trible;
