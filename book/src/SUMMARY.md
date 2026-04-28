@@ -27,6 +27,7 @@
 - [Commit Selectors](commit-selectors.md)
 - [Garbage Collection](garbage-collection.md)
 - [Distributed Sync](distributed-sync.md)
+- [Capability Auth](capability-auth.md)
 - [Deep Dive: Descriptive Typing & find! Idioms](descriptive_types.md)
 
 # Storage & Formats

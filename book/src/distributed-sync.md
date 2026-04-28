@@ -41,10 +41,17 @@ spawns it; `Peer::drop` winds it down. Async stays jailed inside that
 thread — the storage traits stay sync.
 
 ```rust,ignore
+use std::collections::HashSet;
+
 let pile = triblespace::core::repo::pile::Pile::open(path)?;
-let peer = Peer::new(pile, signing_key, PeerConfig {
+let peer = Peer::new(pile, signing_key.clone(), PeerConfig {
     peers: vec![bootstrap_endpoint_id],
     gossip_topic: Some("my-team-graph".into()),
+    // Auth is mandatory — see the Capability Auth chapter for the
+    // team-root + self_cap setup, or run `trible team create`.
+    team_root: signing_key.verifying_key(),  // single-user team-of-one
+    revoked: HashSet::new(),
+    self_cap: [0u8; 32],
 });
 let mut repo = Repository::new(peer, signing_key, TribleSet::new())?;
 // From here it's just a Repository — commit, push, pull, query.
@@ -80,12 +87,15 @@ Three protocols ride on the same iroh endpoint:
   read, `find_providers(blob_hash)` returns peers to fetch from.
   Content-addressed by design — any provider with the right bytes
   passes blake3 verification.
-- **Direct QUIC RPC** (`PILE_SYNC_ALPN = "/triblespace/pile-sync/3"`):
+- **Direct QUIC RPC** (`PILE_SYNC_ALPN = "/triblespace/pile-sync/4"`):
   point-to-point operations that don't fit the gossip model —
   listing a peer's branches, asking for a specific branch's HEAD,
   fetching a single blob by hash, enumerating a blob's child
   references. One stream per operation, stream FIN signals end, nil
-  sentinels (zero branch ids / zero hashes) terminate sequences.
+  sentinels (zero branch ids / zero hashes) terminate sequences. The
+  protocol's first stream on every connection must be `OP_AUTH` —
+  see the [Capability Auth](capability-auth.md) chapter for the
+  full handshake and scope-gating semantics.
 
 ## `track` vs `fetch`
 
@@ -195,14 +205,19 @@ trible pile net sync <PILE> [--peers ...] [--topic T] [--key PATH]
     Long-running bidirectional sync. Without --topic, serves only
     (accepts direct pulls but doesn't gossip). With --topic, joins
     the gossip mesh and auto-merges incoming tracking branches into
-    same-named local ones every tick.
+    same-named local ones every tick. Reads `TRIBLE_TEAM_ROOT` and
+    `TRIBLE_TEAM_CAP` env vars for multi-user team operation; falls
+    back to single-user team-of-one without them.
 
 trible pile net pull <PILE> <REMOTE> --branch NAME [--key PATH]
     One-shot pull of a named branch from a specific peer (REMOTE is
     the peer's iroh node id, 64-char hex). Pull-only mode — no gossip
     subscription, direct QUIC + DHT fetch, materialize a tracking
     branch, merge into local. Useful for "give me a copy of that
-    project" workflows.
+    project" workflows. Same env-var fallback as `sync`.
+
+trible team {create, invite, revoke, list}
+    Team capability lifecycle — see the Capability Auth chapter.
 ```
 
 ## What's Deferred
