@@ -868,7 +868,24 @@ async fn serve_stream(
                 match guard.as_ref() {
                     None => Vec::new(),
                     Some(snap) => {
-                        if !blob_in_scope(snap.as_ref(), &verified, &parent_hash) {
+                        // Compute the reachable set once for this op
+                        // and check membership against it for every
+                        // candidate — avoids the previous O(K×N) BFS
+                        // re-walk per child.
+                        let reachable = reachable_set_for(
+                            snap.as_ref(),
+                            &verified,
+                        );
+                        let in_scope = |hash: &RawHash| -> bool {
+                            if !snap.has_blob(hash) {
+                                return false;
+                            }
+                            match &reachable {
+                                None => verified.grants_read(),
+                                Some(set) => set.contains(hash),
+                            }
+                        };
+                        if !in_scope(&parent_hash) {
                             Vec::new()
                         } else {
                             match snap.get_blob(&parent_hash) {
@@ -879,17 +896,7 @@ async fn serve_stream(
                                         if chunk.len() == 32 {
                                             let mut candidate = [0u8; 32];
                                             candidate.copy_from_slice(chunk);
-                                            // Both presence AND scope —
-                                            // a parent blob that's in
-                                            // scope can still reference
-                                            // children that aren't (it
-                                            // can't, given how piles are
-                                            // shaped, but the explicit
-                                            // check is cheap and keeps
-                                            // the gate honest).
-                                            if snap.has_blob(&candidate)
-                                                && blob_in_scope(snap.as_ref(), &verified, &candidate)
-                                            {
+                                            if in_scope(&candidate) {
                                                 result.push(candidate);
                                             }
                                         }
@@ -912,32 +919,32 @@ async fn serve_stream(
     Ok(())
 }
 
-/// Returns `true` if `hash` is reachable (transitively, via 32-byte-chunk
-/// children references) from at least one branch head the `verified` cap
-/// grants read access on. Unrestricted caps short-circuit to `true` for
-/// every hash present in the snapshot.
+/// Build the reachable set for the given verified cap once. Returns
+/// `None` if the cap is unrestricted (i.e. every present blob is in
+/// scope — caller short-circuits to `snap.has_blob` checks).
+/// Returns `Some(set)` for branch-restricted caps; the BFS walks
+/// from each allowed branch's head following 32-byte child chunks
+/// in blob bytes, just like the OP_CHILDREN handler does.
 ///
-/// O(snapshot blob count) worst case — runs once per `OP_GET_BLOB` /
-/// `OP_CHILDREN` call. A per-stream cache would amortise chain walks if
-/// this becomes a bottleneck.
-fn blob_in_scope(
+/// This is a per-op O(reachable subgraph) computation. Previously
+/// `blob_in_scope` re-did this BFS for every blob a single
+/// `OP_CHILDREN` response had to test (parent + every candidate
+/// child) — worst case `O(K × N)` for K children and N reachable
+/// blobs. Computing the set once amortises the BFS across the
+/// whole response.
+fn reachable_set_for(
     snap: &dyn AnySnapshot,
     verified: &triblespace_core::repo::capability::VerifiedCapability,
-    hash: &RawHash,
-) -> bool {
-    if !snap.has_blob(hash) {
-        return false;
-    }
+) -> Option<HashSet<RawHash>> {
     if verified.granted_branches().is_none() {
         // Unrestricted cap: every blob present in the snapshot is in
-        // scope. (The cap may still lack read permission entirely; in
-        // that case `grants_read()` is false and the branch-level gate
-        // would have filtered every head — but the granted_branches
-        // shape only tells us "no restriction", so cross-check here.)
-        return verified.grants_read();
+        // scope. The cap may still lack read permission entirely; in
+        // that case `grants_read()` is false and the branch-level
+        // gate would have filtered every head — caller cross-checks
+        // via `verified.grants_read()` before consulting this set.
+        return None;
     }
 
-    // Walk reachable from allowed heads.
     let mut frontier: Vec<RawHash> = snap
         .list_branches()
         .iter()
@@ -947,27 +954,47 @@ fn blob_in_scope(
                 .map(|_| *head)
         })
         .collect();
-    let mut seen: HashSet<RawHash> = HashSet::new();
+    let mut reachable: HashSet<RawHash> = HashSet::new();
     while let Some(h) = frontier.pop() {
-        if !seen.insert(h) {
+        if !reachable.insert(h) {
             continue;
-        }
-        if h == *hash {
-            return true;
         }
         if let Some(data) = snap.get_blob(&h) {
             for chunk in data.chunks(32) {
                 if chunk.len() == 32 {
                     let mut child = [0u8; 32];
                     child.copy_from_slice(chunk);
-                    if snap.has_blob(&child) && !seen.contains(&child) {
+                    if snap.has_blob(&child) && !reachable.contains(&child) {
                         frontier.push(child);
                     }
                 }
             }
         }
     }
-    false
+    Some(reachable)
+}
+
+/// Returns `true` if `hash` is reachable (transitively, via 32-byte-chunk
+/// children references) from at least one branch head the `verified` cap
+/// grants read access on. Unrestricted caps short-circuit to `true` for
+/// every hash present in the snapshot.
+///
+/// Convenience wrapper over [`reachable_set_for`] for callers that only
+/// need to test a single hash. Multi-hash callers (e.g. `OP_CHILDREN`)
+/// should compute the set once and check membership directly to avoid
+/// recomputing the BFS per candidate.
+fn blob_in_scope(
+    snap: &dyn AnySnapshot,
+    verified: &triblespace_core::repo::capability::VerifiedCapability,
+    hash: &RawHash,
+) -> bool {
+    if !snap.has_blob(hash) {
+        return false;
+    }
+    match reachable_set_for(snap, verified) {
+        None => verified.grants_read(),
+        Some(set) => set.contains(hash),
+    }
 }
 
 #[cfg(test)]
