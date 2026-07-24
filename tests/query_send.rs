@@ -21,23 +21,15 @@ fn ordinary_query_with_non_send_output_is_send() {
 
     assert_send(query);
 
-    // Starting the full-switch default scheduler must not change the query
-    // type's auto traits: projected values are postprocessed on demand, never
-    // stored in either worklist.
+    // Starting the residual solver must not change the query type's auto
+    // traits: projected values are postprocessed on demand, never stored in
+    // the worklist.
     let mut context = VariableContext::new();
     let variable = context.next_variable::<U256BE>();
     let constraint = variable.is(U256BE::inline_from(1u64));
     let mut started = Query::new(constraint, |_| Some(Rc::new(())));
     assert!(started.next().is_some());
     assert_send(started);
-
-    // The residual runtime also stores only raw rows and planning state.
-    let mut context = VariableContext::new();
-    let variable = context.next_variable::<U256BE>();
-    let constraint = variable.is(U256BE::inline_from(1u64));
-    let mut residual = Query::new(constraint, |_| Some(Rc::new(()))).residual_state_scheduler();
-    assert!(residual.next().is_some());
-    assert_send(residual);
 }
 
 #[test]
@@ -50,7 +42,6 @@ fn ordinary_query_uses_residual_for_exposed_overlapping_and() {
 
     assert_eq!(query.next(), Some(()));
     let state = format!("{query:?}");
-    assert!(state.contains("scheduler: ResidualState"), "{state}");
     assert!(state.contains("residual_started: true"), "{state}");
 }
 
@@ -67,7 +58,6 @@ fn ordinary_query_uses_residual_for_disjoint_and_leaves() {
 
     assert_eq!(query.next(), Some(()));
     let state = format!("{query:?}");
-    assert!(state.contains("scheduler: ResidualState"), "{state}");
     assert!(state.contains("residual_started: true"), "{state}");
 }
 
@@ -80,7 +70,6 @@ fn ordinary_query_uses_residual_for_opaque_root() {
 
     assert_eq!(query.next(), Some(()));
     let state = format!("{query:?}");
-    assert!(state.contains("scheduler: ResidualState"), "{state}");
     assert!(state.contains("residual_started: true"), "{state}");
 }
 
@@ -93,7 +82,6 @@ fn ordinary_query_uses_residual_for_exposed_one_leaf_and() {
 
     assert_eq!(query.next(), Some(()));
     let state = format!("{query:?}");
-    assert!(state.contains("scheduler: ResidualState"), "{state}");
     assert!(state.contains("residual_started: true"), "{state}");
 }
 
@@ -121,11 +109,11 @@ fn clone_after_iteration_snapshots_remaining_residual_state() {
     assert_eq!(query.collect::<Vec<_>>(), cloned.collect::<Vec<_>>());
 }
 
-/// The same manual `Query::clone` bound must stay independent of `R: Clone`
-/// when the owned cursor is the residual state machine.
+/// The manual `Query::clone` bound must stay independent of `R: Clone` after
+/// the residual cursor has started.
 #[cfg(feature = "parallel")]
 #[test]
-fn residual_clone_after_iteration_does_not_require_clone_output() {
+fn clone_after_iteration_does_not_require_clone_output() {
     struct NonClone;
 
     let mut context = VariableContext::new();
@@ -137,7 +125,7 @@ fn residual_clone_after_iteration_does_not_require_clone_output() {
         variable.is(values[2]),
         variable.is(values[3])
     );
-    let mut query = Query::new(constraint, |_| Some(NonClone)).residual_state_scheduler();
+    let mut query = Query::new(constraint, |_| Some(NonClone));
 
     assert!(query.next().is_some());
     assert!(query.next().is_some());
@@ -162,7 +150,6 @@ fn ordinary_residual_projection_filter_and_panic_resume_are_exact() {
         let value = *binding.get(variable.index)?;
         (value[31] % 2 == 0).then_some(value)
     })
-    .residual_state_scheduler()
     .collect::<Vec<_>>();
     filtered.sort_unstable();
     assert_eq!(filtered, vec![values[1].raw, values[3].raw]);
@@ -183,8 +170,7 @@ fn ordinary_residual_projection_filter_and_panic_resume_are_exact() {
         projected.push(value);
         assert_ne!(projected.len(), 1, "first projection panics");
         Some(value)
-    })
-    .residual_state_scheduler();
+    });
 
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| panicking.next()));
     assert!(panic.is_err());
@@ -198,42 +184,13 @@ fn ordinary_residual_projection_filter_and_panic_resume_are_exact() {
 }
 
 /// A started query has already published progress. Ordinary Rayon conversion
-/// drains either residual or explicit scalar state as one exact leaf instead
-/// of restarting or repartitioning it.
+/// drains its residual state as one exact leaf instead of restarting or
+/// repartitioning it.
 #[cfg(feature = "parallel")]
 #[test]
 fn partially_consumed_query_into_par_iter_keeps_exact_remainder() {
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
-    for explicit_scalar in [false, true] {
-        let mut context = VariableContext::new();
-        let variable = context.next_variable::<U256BE>();
-        let values = [1u64, 2, 3, 4].map(U256BE::inline_from);
-        let constraint = or!(
-            variable.is(values[0]),
-            variable.is(values[1]),
-            variable.is(values[2]),
-            variable.is(values[3])
-        );
-        let query = Query::new(constraint, move |binding| {
-            binding.get(variable.index).copied()
-        });
-        let mut query = if explicit_scalar {
-            query.sequential()
-        } else {
-            query
-        };
-
-        assert!(query.next().is_some());
-        let expected = query.clone().collect::<Vec<_>>();
-        let actual = query.into_par_iter().collect::<Vec<_>>();
-        assert_eq!(actual, expected);
-    }
-}
-
-#[cfg(feature = "parallel")]
-#[test]
-fn pulled_query_rejects_seed_restarting_selectors() {
     let mut context = VariableContext::new();
     let variable = context.next_variable::<U256BE>();
     let values = [1u64, 2, 3, 4].map(U256BE::inline_from);
@@ -245,18 +202,37 @@ fn pulled_query_rejects_seed_restarting_selectors() {
     );
     let mut query = Query::new(constraint, move |binding| {
         binding.get(variable.index).copied()
-    })
-    .residual_state_scheduler();
+    });
+
+    assert!(query.next().is_some());
+    let expected = query.clone().collect::<Vec<_>>();
+    let actual = query.into_par_iter().collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+}
+
+#[cfg(feature = "parallel")]
+#[test]
+fn pulled_query_rejects_seed_restarting_configuration() {
+    use triblespace::core::query::residual::ResidualLowering;
+
+    let mut context = VariableContext::new();
+    let variable = context.next_variable::<U256BE>();
+    let values = [1u64, 2, 3, 4].map(U256BE::inline_from);
+    let constraint = or!(
+        variable.is(values[0]),
+        variable.is(values[1]),
+        variable.is(values[2]),
+        variable.is(values[3])
+    );
+    let mut query = Query::new(constraint, move |binding| {
+        binding.get(variable.index).copied()
+    });
     assert!(query.next().is_some());
 
     let panics = [
         std::panic::catch_unwind(std::panic::AssertUnwindSafe({
             let query = query.clone();
-            move || drop(query.sequential())
-        })),
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe({
-            let query = query.clone();
-            move || drop(query.residual_state_scheduler())
+            move || drop(query.residual_lowering(ResidualLowering::CONSERVATIVE))
         })),
         std::panic::catch_unwind(std::panic::AssertUnwindSafe({
             let query = query.clone();
@@ -284,16 +260,16 @@ fn fresh_query_into_par_iter_matches_explicit_residual_raw_set() {
         binding.get(variable.index).copied()
     });
 
-    let mut sequential = query.clone().sequential().collect::<Vec<_>>();
+    let mut expected = values.map(|value| value.raw).to_vec();
     let mut explicit_residual = query
         .clone()
         .into_par_residual_state_iter()
         .collect::<Vec<_>>();
     let mut ordinary = query.into_par_iter().collect::<Vec<_>>();
-    sequential.sort_unstable();
+    expected.sort_unstable();
     explicit_residual.sort_unstable();
     ordinary.sort_unstable();
-    assert_eq!(ordinary, sequential);
+    assert_eq!(ordinary, expected);
     assert_eq!(ordinary, explicit_residual);
 
     // An overlapping conjunction exercises residual checked-state
@@ -323,7 +299,7 @@ fn fresh_query_into_par_iter_matches_explicit_residual_raw_set() {
         .collect::<Vec<_>>();
     ordinary.sort_unstable();
     explicit_residual.sort_unstable();
-    assert_eq!(ordinary, sequential);
+    assert_eq!(ordinary, expected);
     assert_eq!(ordinary, explicit_residual);
 }
 
@@ -425,21 +401,4 @@ fn fresh_parallel_query_handles_a_deep_late_branch() {
     expected.sort_unstable();
     assert_eq!(one_actual, expected);
     assert_eq!(actual, expected);
-}
-
-#[test]
-fn sequential_opt_in_preserves_scalar_iterator() {
-    let mut context = VariableContext::new();
-    let variable = context.next_variable::<U256BE>();
-    let one = U256BE::inline_from(1u64);
-    let two = U256BE::inline_from(2u64);
-    let constraint = or!(variable.is(one), variable.is(two));
-    let mut rows = Query::new(constraint, move |binding| {
-        binding.get(variable.index).copied()
-    })
-    .sequential()
-    .collect::<Vec<_>>();
-    rows.sort_unstable();
-
-    assert_eq!(rows, vec![one.raw, two.raw]);
 }

@@ -134,12 +134,14 @@ fn project_xy(binding: &Binding) -> Option<(RawInline, RawInline)> {
     Some((binding.get(X).copied()?, binding.get(Y).copied()?))
 }
 
-fn unary_scheduler_results<C>(make: impl Fn() -> C) -> Vec<Vec<RawInline>>
+fn unary_route_results<C>(make: impl Fn() -> C) -> Vec<Vec<RawInline>>
 where
     C: Constraint<'static> + 'static,
 {
     vec![
-        Query::new(make(), project_x).sequential().collect(),
+        Query::new(make(), project_x)
+            .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+            .collect(),
         Query::new(make(), project_x)
             .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
             .cap(1)
@@ -295,7 +297,7 @@ fn composites_and_projection_have_raw_set_semantics() {
 
     let result_sets = [
         Query::new_projected(make_root(), [X], project_x)
-            .sequential()
+            .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
             .collect::<Vec<_>>(),
         Query::new_projected(make_root(), [X], project_x)
             .solve_residual_state_lazy_with(ResidualLowering::FULL)
@@ -680,15 +682,15 @@ impl Constraint<'static> for OptimisticExposedAnd {
 }
 
 #[test]
-fn covering_roots_self_confirm_before_every_scheduler_publishes() {
-    for results in unary_scheduler_results(|| ReceiptDomain::new(ProposalCoverage::Covering)) {
+fn covering_roots_self_confirm_before_every_route_publishes() {
+    for results in unary_route_results(|| ReceiptDomain::new(ProposalCoverage::Covering)) {
         assert_eq!(results, vec![MEMBER]);
     }
 }
 
 #[test]
 fn quote_less_exact_sources_remain_enabled_at_unknown_cost() {
-    for results in unary_scheduler_results(|| QuotelessExact) {
+    for results in unary_route_results(|| QuotelessExact) {
         assert_eq!(results, vec![MEMBER]);
     }
 }
@@ -696,7 +698,7 @@ fn quote_less_exact_sources_remain_enabled_at_unknown_cost() {
 #[test]
 fn exact_sources_do_not_pay_a_redundant_self_confirm() {
     let confirms = Arc::new(AtomicUsize::new(0));
-    for results in unary_scheduler_results(|| CountedExact {
+    for results in unary_route_results(|| CountedExact {
         confirms: confirms.clone(),
     }) {
         assert_eq!(results, vec![MEMBER]);
@@ -758,7 +760,7 @@ fn a_seed_proven_false_needs_no_proposal_source() {
             boxed(ProposalCoverage::None),
         ]),
     };
-    for results in unary_scheduler_results(make) {
+    for results in unary_route_results(make) {
         assert!(results.is_empty());
     }
 }
@@ -767,7 +769,7 @@ fn a_seed_proven_false_needs_no_proposal_source() {
 fn equality_becomes_a_source_only_after_its_peer_is_bound() {
     let mut result_sets = vec![
         Query::new(dynamic_equality_root(), project_xy)
-            .sequential()
+            .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
             .collect::<Vec<_>>(),
         Query::new(dynamic_equality_root(), project_xy)
             .solve_residual_state_lazy_with(ResidualLowering::FULL)
@@ -790,7 +792,7 @@ fn exposed_closed_false_child_kills_an_optimistic_seed() {
             boxed(ProposalCoverage::Exact),
         ]),
     };
-    for results in unary_scheduler_results(make) {
+    for results in unary_route_results(make) {
         assert!(results.is_empty());
     }
 }
@@ -907,7 +909,7 @@ fn nested_union_source_probe(
 fn receipt_planning_uses_only_covering_sources() {
     let validator_proposals = Arc::new(AtomicUsize::new(0));
     let exact_proposals = Arc::new(AtomicUsize::new(0));
-    for results in unary_scheduler_results(|| {
+    for results in unary_route_results(|| {
         nested_intersection_source_probe(&validator_proposals, &exact_proposals)
     }) {
         assert_eq!(results, vec![MEMBER]);
@@ -918,7 +920,7 @@ fn receipt_planning_uses_only_covering_sources() {
     let union_proposals = Arc::new(AtomicUsize::new(0));
     let sibling_proposals = Arc::new(AtomicUsize::new(0));
     for results in
-        unary_scheduler_results(|| nested_union_source_probe(&union_proposals, &sibling_proposals))
+        unary_route_results(|| nested_union_source_probe(&union_proposals, &sibling_proposals))
     {
         assert_eq!(results, vec![MEMBER]);
     }
@@ -931,7 +933,7 @@ fn opaque_transparent_wrapper_forwards_source_actions() {
     let validator_proposals = Arc::new(AtomicUsize::new(0));
     let exact_proposals = Arc::new(AtomicUsize::new(0));
 
-    for results in unary_scheduler_results(|| {
+    for results in unary_route_results(|| {
         EstimateOverrideConstraint::new(nested_intersection_source_probe(
             &validator_proposals,
             &exact_proposals,

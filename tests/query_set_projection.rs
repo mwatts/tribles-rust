@@ -170,7 +170,7 @@ impl Constraint<'_> for CountingHiddenFanout {
 }
 
 #[test]
-fn explicit_projection_is_distinct_across_serial_schedulers() {
+fn explicit_projection_is_distinct_across_residual_execution_shapes() {
     assert_eq!(projected_query().count(), 1);
 
     let mut context = VariableContext::new();
@@ -187,8 +187,6 @@ fn explicit_projection_is_distinct_across_serial_schedulers() {
         )
     };
 
-    assert_eq!(make().sequential().count(), 1);
-    assert_eq!(make().residual_state_scheduler().count(), 1);
     assert_eq!(make().solve_residual_state_lazy().count(), 1);
     assert_eq!(make().solve_residual_state().len(), 1);
 }
@@ -254,7 +252,6 @@ fn projection_key_includes_every_visible_tail_across_hidden_witnesses() {
     };
 
     assert_eq!(sorted(make().collect()), expected);
-    assert_eq!(sorted(make().sequential().collect()), expected);
     assert_eq!(
         sorted(make().solve_residual_state_lazy().collect()),
         expected
@@ -278,8 +275,6 @@ fn query_new_uses_the_complete_constraint_variable_head() {
     };
 
     assert_eq!(make().collect::<Vec<_>>(), vec![one.raw, one.raw]);
-    assert_eq!(make().sequential().count(), 2);
-    assert_eq!(make().residual_state_scheduler().count(), 2);
     assert_eq!(make().solve_residual_state_lazy().count(), 2);
     assert_eq!(make().solve_residual_state().len(), 2);
 }

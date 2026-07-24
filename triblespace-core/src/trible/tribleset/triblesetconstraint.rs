@@ -2583,27 +2583,36 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_and_residual_direct_sources_match_the_sequential_bag() {
+    fn ordinary_and_residual_direct_sources_match_the_stored_relation() {
         let (set, _, _, _) = direct_fixture();
         let e = Variable::<GenId>::new(0);
         let a = Variable::<GenId>::new(1);
         let v = Variable::<UnknownInline>::new(2);
         let make = || TribleSetConstraint::new(e, a, v, set.clone());
 
-        let mut sequential: Vec<_> = Query::new(make(), project_triple).sequential().collect();
+        let mut expected: Vec<_> = set
+            .iter()
+            .map(|trible| {
+                (
+                    id_into_value(&trible.e().raw()),
+                    id_into_value(&trible.a().raw()),
+                    trible.v::<UnknownInline>().raw,
+                )
+            })
+            .collect();
         let mut ordinary: Vec<_> = Query::new(make(), project_triple).collect();
         let mut residual: Vec<_> = Query::new(make(), project_triple)
             .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .cap(1)
             .start_width(1)
             .collect();
-        sequential.sort_unstable();
+        expected.sort_unstable();
         ordinary.sort_unstable();
         residual.sort_unstable();
 
-        assert_eq!(sequential.len(), set.len());
-        assert_eq!(ordinary, sequential);
-        assert_eq!(residual, sequential);
+        assert_eq!(expected.len(), set.len());
+        assert_eq!(ordinary, expected);
+        assert_eq!(residual, expected);
     }
 
     #[test]
@@ -2615,6 +2624,7 @@ mod tests {
         let target_attribute = Inline::<GenId>::new(id_into_value(&target_attribute_id));
         let mut set = TribleSet::new();
         let mut needed = std::collections::HashSet::new();
+        let mut expected = Vec::new();
         for ordinal in 1u64..=4096 {
             let mut entity_raw = [0; ID_LEN];
             entity_raw[ID_LEN - 8..].copy_from_slice(&ordinal.to_be_bytes());
@@ -2626,6 +2636,9 @@ mod tests {
             let mut value_raw = [0; INLINE_LEN];
             value_raw[INLINE_LEN - 8..].copy_from_slice(&ordinal.to_be_bytes());
             let value = Inline::<UnknownInline>::new(value_raw);
+            if ordinal <= 1024 {
+                expected.push((id_into_value(&entity_raw), value.raw));
+            }
             set.insert(&Trible::new(&entity, &target_attribute_id, &value));
         }
         let needed = Arc::new(needed);
@@ -2644,7 +2657,6 @@ mod tests {
         };
         let project = |binding: &Binding| Some((*binding.get(ENTITY)?, *binding.get(VALUE)?));
 
-        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
         let mut ordinary: Vec<_> = Query::new(make(), project).collect();
         let mut query = Query::new(make(), project)
             .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
@@ -2652,12 +2664,12 @@ mod tests {
             .growth(2)
             .cap(256);
         let mut residual: Vec<_> = query.by_ref().collect();
-        sequential.sort_unstable();
+        expected.sort_unstable();
         ordinary.sort_unstable();
         residual.sort_unstable();
 
-        assert_eq!(ordinary, sequential);
-        assert_eq!(residual, sequential);
+        assert_eq!(ordinary, expected);
+        assert_eq!(residual, expected);
         assert!(
             query.stats().delta_terminal_eager_cohort_admissions > 0,
             "{:#?}",
@@ -2745,14 +2757,12 @@ mod tests {
             .collect();
         assert_eq!(entity_occurrences, expected_occurrences);
 
-        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
         let mut ordinary: Vec<_> = Query::new(make(), project).collect();
         let mut residual: Vec<_> = Query::new(make(), project)
             .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .cap(1)
             .start_width(1)
             .collect();
-        sequential.sort_unstable();
         ordinary.sort_unstable();
         residual.sort_unstable();
 
@@ -2760,10 +2770,9 @@ mod tests {
             .into_iter()
             .map(|entity| (parent_value, entity))
             .collect();
-        assert_eq!(sequential, expected);
-        assert!(sequential.iter().all(|(parent, _)| *parent == parent_value));
-        assert_eq!(ordinary, sequential);
-        assert_eq!(residual, sequential);
+        assert_eq!(ordinary, expected);
+        assert!(ordinary.iter().all(|(parent, _)| *parent == parent_value));
+        assert_eq!(residual, expected);
     }
 
     #[test]
@@ -2860,9 +2869,13 @@ mod tests {
         let attribute = Id::new([0xa1; ID_LEN]).unwrap();
         let other = Id::new([0xf1; ID_LEN]).unwrap();
         let mut set = TribleSet::new();
+        let mut expected = Vec::new();
         for tag in 1..=6 {
             let entity = Id::new([tag; ID_LEN]).unwrap();
             let target = if tag % 2 == 0 { entity } else { other };
+            if tag % 2 == 0 {
+                expected.push(id_into_value(&entity.raw()));
+            }
             set.insert(&Trible::force(
                 &entity,
                 &attribute,
@@ -2879,7 +2892,6 @@ mod tests {
             ))
         };
         let project = |binding: &Binding| binding.get(0).copied();
-        let mut expected: Vec<_> = Query::new(make(), project).sequential().collect();
         expected.sort_unstable();
 
         let mut residual = Query::new(make(), project)
@@ -2984,20 +2996,18 @@ mod tests {
             .collect();
         assert_eq!(target_occurrences, expected_occurrences);
 
-        let mut expected: Vec<_> = Query::new(make(), project).sequential().collect();
         let mut residual: Vec<_> = Query::new(make(), project)
             .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .cap(1)
             .start_width(1)
             .collect();
-        expected.sort_unstable();
         residual.sort_unstable();
-        let projected: Vec<_> = targets
+        let mut projected: Vec<_> = targets
             .into_iter()
             .map(|target| (parent_value, target))
             .collect();
-        assert_eq!(expected, projected);
-        assert!(expected.iter().all(|(parent, _)| *parent == parent_value));
-        assert_eq!(residual, expected);
+        projected.sort_unstable();
+        assert!(projected.iter().all(|(parent, _)| *parent == parent_value));
+        assert_eq!(residual, projected);
     }
 }

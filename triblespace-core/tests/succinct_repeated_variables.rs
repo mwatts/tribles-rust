@@ -2,13 +2,14 @@
 //!
 //! TribleSet is the executable reference for same-variable equality. These
 //! tests exercise SuccinctArchive through the complete constraint protocol and
-//! through every public scheduler and the bounded filtered source used for
+//! through both conservative and production lowering and the bounded filtered source used for
 //! repeated-position proposals.
 
 use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::{genid::GenId, UnknownInline};
 use triblespace_core::inline::{Inline, IntoInline, RawInline};
+use triblespace_core::query::residual::ResidualLowering;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, EstimateSink, Query, RowsView, TriblePattern, Variable,
     VariableId,
@@ -213,19 +214,18 @@ fn repeated_shapes_match_tribleset_estimate_propose_and_confirm() {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum Scheduler {
-    Sequential,
-    Residual,
+enum SolveRoute {
+    Conservative,
     Ordinary,
 }
 
 fn collect_sorted<'a, C, const N: usize>(
     constraint: C,
     variables: [VariableId; N],
-    scheduler: Scheduler,
+    route: SolveRoute,
 ) -> Vec<[RawInline; N]>
 where
-    C: Constraint<'a>,
+    C: Constraint<'a> + 'a,
 {
     let query = Query::new(constraint, move |binding: &Binding| {
         let mut row = [[0; 32]; N];
@@ -234,10 +234,11 @@ where
         }
         Some(row)
     });
-    let mut rows: Vec<_> = match scheduler {
-        Scheduler::Sequential => query.sequential().collect(),
-        Scheduler::Residual => query.residual_state_scheduler().collect(),
-        Scheduler::Ordinary => query.collect(),
+    let mut rows: Vec<_> = match route {
+        SolveRoute::Conservative => query
+            .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+            .collect(),
+        SolveRoute::Ordinary => query.collect(),
     };
     rows.sort_unstable();
     rows
@@ -252,33 +253,29 @@ fn assert_query_shape<'a, FS, FA, CS, CA, const N: usize>(
 ) where
     FS: Fn() -> CS,
     FA: Fn() -> CA,
-    CS: Constraint<'a>,
-    CA: Constraint<'a>,
+    CS: Constraint<'a> + 'a,
+    CA: Constraint<'a> + 'a,
 {
     expected.sort_unstable();
-    let baseline = collect_sorted(make_set(), variables, Scheduler::Sequential);
+    let baseline = collect_sorted(make_set(), variables, SolveRoute::Conservative);
     assert_eq!(baseline, expected, "{name}: fixture expectation drifted");
 
-    for scheduler in [
-        Scheduler::Sequential,
-        Scheduler::Residual,
-        Scheduler::Ordinary,
-    ] {
+    for route in [SolveRoute::Conservative, SolveRoute::Ordinary] {
         assert_eq!(
-            collect_sorted(make_set(), variables, scheduler),
+            collect_sorted(make_set(), variables, route),
             baseline,
-            "{name}/{scheduler:?}: TribleSet scheduler changed the result set",
+            "{name}/{route:?}: TribleSet route changed the result set",
         );
         assert_eq!(
-            collect_sorted(make_archive(), variables, scheduler),
+            collect_sorted(make_archive(), variables, route),
             baseline,
-            "{name}/{scheduler:?}: SuccinctArchive changed the result set",
+            "{name}/{route:?}: SuccinctArchive changed the result set",
         );
     }
 }
 
 #[test]
-fn repeated_shapes_match_tribleset_across_all_public_schedulers() {
+fn repeated_shapes_match_tribleset_across_lowering_routes() {
     let (set, ids) = fixture();
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
     let x = Variable::<GenId>::new(0);

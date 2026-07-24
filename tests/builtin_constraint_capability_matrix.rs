@@ -1,8 +1,8 @@
-//! Executable capability and scheduler-parity matrix for built-in constraints.
+//! Executable capability and lowering-route matrix for built-in constraints.
 //!
 //! Exact projected result sets alone cannot distinguish a native residual capability
 //! from the deliberately correct opaque fallback.  These fixtures therefore
-//! pair scheduler parity with static capability receipts and residual runtime
+//! pair projected-set parity across lowering routes with static capability receipts and runtime
 //! counters.  A future capability change must update both halves consciously.
 
 use std::cell::RefCell;
@@ -37,7 +37,7 @@ fn sorted_rows<R: Ord>(mut values: Vec<R>) -> Vec<R> {
 /// The cloned remainder is deliberately taken after one successful pull.  It
 /// therefore checks an exact live affine frontier rather than merely proving
 /// that a fresh query can be cloned.
-fn assert_scheduler_matrix<'a, C, P, R, Make>(
+fn assert_route_matrix<'a, C, P, R, Make>(
     label: &str,
     expected: Vec<R>,
     make_query: Make,
@@ -45,16 +45,15 @@ fn assert_scheduler_matrix<'a, C, P, R, Make>(
 where
     C: Constraint<'a> + Clone + 'a,
     P: Fn(&Binding) -> Option<R> + Clone,
-    R: Clone + Debug + Ord,
+    R: Debug + Ord,
     Make: Fn() -> Query<C, P, R>,
 {
     let expected = sorted_rows(expected);
-    let assert_engine = |engine: &str, actual: Vec<R>| {
-        assert_eq!(sorted_rows(actual), expected, "{label}: {engine}");
+    let assert_route = |route: &str, actual: Vec<R>| {
+        assert_eq!(sorted_rows(actual), expected, "{label}: {route}");
     };
 
-    assert_engine("sequential oracle", make_query().sequential().collect());
-    assert_engine("ordinary production selection", make_query().collect());
+    assert_route("ordinary production selection", make_query().collect());
 
     let conservative_eager = make_query()
         .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
@@ -62,7 +61,7 @@ where
         .start_width(usize::MAX)
         .growth(1)
         .collect_profiled();
-    assert_engine("conservative eager residual", conservative_eager.results);
+    assert_route("conservative eager residual", conservative_eager.results);
 
     let full_eager = make_query()
         .solve_residual_state_lazy_with(ResidualLowering::FULL)
@@ -70,7 +69,7 @@ where
         .start_width(usize::MAX)
         .growth(1)
         .collect_profiled();
-    assert_engine("FULL eager residual", full_eager.results);
+    assert_route("FULL eager residual", full_eager.results);
 
     let conservative_width_one = make_query()
         .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
@@ -78,7 +77,7 @@ where
         .start_width(1)
         .growth(1)
         .collect_profiled();
-    assert_engine(
+    assert_route(
         "conservative fixed width one",
         conservative_width_one.results,
     );
@@ -89,7 +88,7 @@ where
         .start_width(1)
         .growth(1)
         .collect_profiled();
-    assert_engine("FULL fixed width one", full_width_one.results);
+    assert_route("FULL fixed width one", full_width_one.results);
 
     let conservative_geometric = make_query()
         .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
@@ -97,7 +96,7 @@ where
         .start_width(1)
         .growth(2)
         .collect_profiled();
-    assert_engine("conservative geometric", conservative_geometric.results);
+    assert_route("conservative geometric", conservative_geometric.results);
 
     let full_geometric = make_query()
         .solve_residual_state_lazy_with(ResidualLowering::FULL)
@@ -105,7 +104,7 @@ where
         .start_width(1)
         .growth(2)
         .collect_profiled();
-    assert_engine("FULL geometric", full_geometric.results);
+    assert_route("FULL geometric", full_geometric.results);
 
     let mut original = make_query()
         .solve_residual_state_lazy_with(ResidualLowering::FULL)
@@ -116,17 +115,16 @@ where
         .next()
         .unwrap_or_else(|| panic!("{label}: nonempty fixture produced no first result"));
     let cloned = original.clone();
-    let original_remainder: Vec<_> = original.collect();
-    let cloned_remainder: Vec<_> = cloned.collect();
+    let mut original_remainder: Vec<_> = original.collect();
+    let mut cloned_remainder: Vec<_> = cloned.collect();
+    original_remainder.sort_unstable();
+    cloned_remainder.sort_unstable();
     assert_eq!(
-        sorted_rows(original_remainder.clone()),
-        sorted_rows(cloned_remainder),
+        original_remainder, cloned_remainder,
         "{label}: cloned exact remainder"
     );
-    assert_engine(
-        "first pull plus cloned remainder",
-        std::iter::once(first).chain(original_remainder).collect(),
-    );
+    original_remainder.push(first);
+    assert_route("first pull plus cloned remainder", original_remainder);
 
     MatrixProfiles {
         conservative_geometric: conservative_geometric.stats,
@@ -298,7 +296,7 @@ fn atomic_constraints_have_exact_sets_across_residual_widths() {
     let c = value(3);
     let d = value(4);
 
-    let constant = assert_scheduler_matrix(
+    let constant = assert_route_matrix(
         "constant",
         vec![a],
         || find!(x: Inline<UnknownInline>, Arc::new(x.is(a))),
@@ -310,7 +308,7 @@ fn atomic_constraints_have_exact_sets_across_residual_widths() {
 
     let left = Arc::new(HashSet::from([a, b, c]));
     let right = Arc::new(HashSet::from([b, c, d]));
-    let equality = assert_scheduler_matrix("equality", vec![(b, b), (c, c)], || {
+    let equality = assert_route_matrix("equality", vec![(b, b), (c, c)], || {
         find!(
             (x: Inline<UnknownInline>, y: Inline<UnknownInline>),
             and!(
@@ -331,7 +329,7 @@ fn atomic_constraints_have_exact_sets_across_residual_widths() {
     );
 
     let domain = Arc::new(HashSet::from([a, b, c, d, value(5)]));
-    let range = assert_scheduler_matrix("inclusive inline range", vec![b, c, d], || {
+    let range = assert_route_matrix("inclusive inline range", vec![b, c, d], || {
         find!(
             x: Inline<UnknownInline>,
             and!(domain.clone().has(x), value_range(x, b, d))
@@ -348,7 +346,7 @@ fn membership_constraints_record_native_and_fallback_execution() {
     let c = value(3);
     let sorted_values = [a, a, b, c];
     let sorted = SortedSlice::new(&sorted_values).unwrap();
-    let sorted_profiles = assert_scheduler_matrix(
+    let sorted_profiles = assert_route_matrix(
         "sorted slice preserves duplicate proposal occurrences",
         vec![a, b, c],
         || find!(x: Inline<UnknownInline>, Arc::new(sorted.has(x))),
@@ -369,7 +367,7 @@ fn membership_constraints_record_native_and_fallback_execution() {
     );
 
     let set = Arc::new(HashSet::from([a, b, c]));
-    let set_profiles = assert_scheduler_matrix("hash-set membership", vec![a, b, c], || {
+    let set_profiles = assert_route_matrix("hash-set membership", vec![a, b, c], || {
         find!(
             x: Inline<UnknownInline>,
             Arc::new(set.clone().has(x))
@@ -412,7 +410,7 @@ fn membership_constraints_record_native_and_fallback_execution() {
     assert_eq!(full_set, [a, b, c].map(|value| value.raw));
 
     let map = Arc::new(HashMap::from([(a, 10_u8), (b, 20_u8), (c, 30_u8)]));
-    let map_profiles = assert_scheduler_matrix("hash-map key membership", vec![a, b, c], || {
+    let map_profiles = assert_route_matrix("hash-map key membership", vec![a, b, c], || {
         find!(
             x: Inline<UnknownInline>,
             Arc::new(map.clone().has(x))
@@ -456,7 +454,7 @@ fn finite_union_and_wrappers_have_explicit_execution_receipts() {
     let a = value(1);
     let b = value(2);
     let union_profiles =
-        assert_scheduler_matrix("finite union deduplicates per parent", vec![a, b], || {
+        assert_route_matrix("finite union deduplicates per parent", vec![a, b], || {
             find!(
                 x: Inline<UnknownInline>,
                 or!(x.is(a), x.is(b), x.is(a))
@@ -471,7 +469,7 @@ fn finite_union_and_wrappers_have_explicit_execution_receipts() {
     let sorted_values = [a, a, b];
     let sorted = SortedSlice::new(&sorted_values).unwrap();
     let debug_record = Rc::new(RefCell::new(Vec::new()));
-    let debug_profiles = assert_scheduler_matrix("debug wrapper", vec![a, b], || {
+    let debug_profiles = assert_route_matrix("debug wrapper", vec![a, b], || {
         find!(
             x: Inline<UnknownInline>,
             Arc::new(DebugConstraint::new(
@@ -487,13 +485,12 @@ fn finite_union_and_wrappers_have_explicit_execution_receipts() {
         "direct paging would bypass DebugConstraint's proposal log"
     );
 
-    let estimate_profiles =
-        assert_scheduler_matrix("estimate override wrapper", vec![a, b], || {
-            find!(
-                x: Inline<UnknownInline>,
-                Arc::new(EstimateOverrideConstraint::new(sorted.has(x)))
-            )
-        });
+    let estimate_profiles = assert_route_matrix("estimate override wrapper", vec![a, b], || {
+        find!(
+            x: Inline<UnknownInline>,
+            Arc::new(EstimateOverrideConstraint::new(sorted.has(x)))
+        )
+    });
     assert_eq!(
         estimate_profiles.conservative_geometric.delta_source_pages,
         0
@@ -513,7 +510,7 @@ fn finite_union_and_wrappers_have_explicit_execution_receipts() {
     let parents = SortedSlice::new(&parents).unwrap();
     let wrapped_values = [a, a, b];
     let wrapped_values = SortedSlice::new(&wrapped_values).unwrap();
-    let affine_profiles = assert_scheduler_matrix(
+    let affine_profiles = assert_route_matrix(
         "estimate wrapper preserves direct occurrences for every affine parent",
         vec![(parent_a, a), (parent_a, b), (parent_b, a), (parent_b, b)],
         || {
@@ -546,7 +543,7 @@ fn estimate_override_forwards_transition_programs_without_opening_its_shape() {
     insert_tag(&mut graph, &start, &middle);
     insert_tag(&mut graph, &middle, &end);
 
-    let profiles = assert_scheduler_matrix(
+    let profiles = assert_route_matrix(
         "estimate override around a repeated transition program",
         vec![(start_value, middle_value), (start_value, end_value)],
         || {
@@ -584,7 +581,7 @@ fn repeated_projected_variable_desugaring_matches_every_scheduler() {
     insert_tag(&mut data, &other, &self_a);
 
     let expected: Vec<Inline<GenId>> = vec![(&self_a).to_inline(), (&self_b).to_inline()];
-    assert_scheduler_matrix("repeated projected entity/value variable", expected, || {
+    assert_route_matrix("repeated projected entity/value variable", expected, || {
         find!(
             entity: Inline<GenId>,
             pattern!(&data, [{ ?entity @ triblespace::core::metadata::tag: ?entity }])

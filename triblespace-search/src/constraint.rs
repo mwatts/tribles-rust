@@ -1581,15 +1581,12 @@ mod tests {
                 BM25Filter::from_entries(doc, entries),
             )
         };
-        let mut sequential: Vec<_> = Query::new(make(), project_pair).sequential().collect();
         let mut residual = Query::new(make(), project_pair)
             .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .cap(1)
             .start_width(1);
         let mut full: Vec<_> = residual.by_ref().collect();
-        sequential.sort_unstable();
         full.sort_unstable();
-        assert_eq!(full, sequential);
         assert_eq!(full, expected_public_pairs);
         for parent_value in parent_rows {
             assert_eq!(
@@ -1823,15 +1820,12 @@ mod tests {
                 SimilarTo::from_candidates(neighbour, candidates.clone()),
             )
         };
-        let mut sequential: Vec<_> = Query::new(make(), project_pair).sequential().collect();
         let mut residual = Query::new(make(), project_pair)
             .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .cap(1)
             .start_width(1);
         let mut full: Vec<_> = residual.by_ref().collect();
-        sequential.sort_unstable();
         full.sort_unstable();
-        assert_eq!(full, sequential);
         assert_eq!(full, expected_public_pairs);
         for parent_value in parent_rows {
             assert_eq!(
@@ -1918,22 +1912,9 @@ mod tests {
         // Both children can propose, so adaptive execution chooses SimilarTo's
         // tighter two-row bag even though BM25 is listed first. BM25 confirms
         // each bounded page. Width one forces every Offset continuation edge.
-        let mut forward_sequential: Vec<_> = Query::new(
-            triblespace_core::and!(
-                BM25Filter::<Handle<Embedding>>::from_entries(candidate, source.clone()),
-                SimilarTo::from_candidates(candidate, allowed.clone()),
-            ),
-            project_first,
-        )
-        .sequential()
-        .collect();
-        // Public query heads are sets. Scalar DFS consumes its proposal vector
-        // LIFO while the typed residual route pages the same source forward,
-        // so only the denotation is shared across schedulers. Exact source
-        // order and occurrence multiplicity are asserted at the direct-source
-        // seams in the two tests above.
-        forward_sequential.sort_unstable();
-        assert_eq!(forward_sequential, expected);
+        // Public query heads are sets. Exact source order and occurrence
+        // multiplicity are asserted at the direct-source seams above; this
+        // end-to-end check uses the independently specified intersection.
         let forward_bm25 = BM25Filter::<Handle<Embedding>>::from_entries(candidate, source.clone());
         let forward_similar = SimilarTo::from_candidates(candidate, allowed.clone());
         assert!(forward_bm25
@@ -1962,21 +1943,10 @@ mod tests {
         assert_eq!(mirror.collect::<Vec<_>>(), remainder);
         let mut forward_results = std::iter::once(first).chain(remainder).collect::<Vec<_>>();
         forward_results.sort_unstable();
-        assert_eq!(forward_results, forward_sequential);
+        assert_eq!(forward_results, expected);
 
         // Reversing the child types makes BM25's shorter bag own proposal
         // paging while SimilarTo exercises the same pointwise confirmation.
-        let mut reverse_sequential: Vec<_> = Query::new(
-            triblespace_core::and!(
-                SimilarTo::from_candidates(candidate, source.clone()),
-                BM25Filter::<Handle<Embedding>>::from_entries(candidate, allowed.clone()),
-            ),
-            project_first,
-        )
-        .sequential()
-        .collect();
-        reverse_sequential.sort_unstable();
-        assert_eq!(reverse_sequential, expected);
         let reverse_similar = SimilarTo::from_candidates(candidate, source);
         let reverse_bm25 = BM25Filter::<Handle<Embedding>>::from_entries(candidate, allowed);
         assert!(reverse_similar
@@ -1999,7 +1969,7 @@ mod tests {
             .growth(1)
             .collect();
         reverse.sort_unstable();
-        assert_eq!(reverse, reverse_sequential);
+        assert_eq!(reverse, expected);
     }
 
     #[test]

@@ -62,7 +62,7 @@ impl Graph {
 /// A fixed-ID graph family whose levels form an inclusion chain.
 ///
 /// Keeping both the node universe and insertion order stable makes failures in
-/// the generated scheduler differential exactly reproducible. Every level
+/// the generated route differential exactly reproducible. Every level
 /// retains a secondary-attribute cycle so negated-attribute paths remain
 /// non-vacuous, while the primary relation grows by one fact at a time.
 struct GeneratedGraph {
@@ -767,10 +767,10 @@ impl<'a> Constraint<'a> for PageLocalDomain {
 }
 
 #[derive(Clone, Copy)]
-enum Scheduler {
+enum SolveRoute {
     Ordinary,
-    Residual,
-    Sequential,
+    Combined,
+    Conservative,
 }
 
 fn combined_effects() -> ResidualLowering {
@@ -1445,33 +1445,35 @@ fn project_outer(binding: &Binding) -> Option<RawInline> {
 
 fn run(
     root: Root,
-    scheduler: Scheduler,
+    route: SolveRoute,
     project: fn(&Binding) -> Option<RawInline>,
 ) -> Vec<RawInline> {
     let query = Query::new(root, project);
-    let mut results: Vec<_> = match scheduler {
-        Scheduler::Ordinary => query.collect(),
-        Scheduler::Residual => query
+    let mut results: Vec<_> = match route {
+        SolveRoute::Ordinary => query.collect(),
+        SolveRoute::Combined => query
             .solve_residual_state_lazy_with(combined_effects())
             .collect(),
-        Scheduler::Sequential => query.sequential().collect(),
+        SolveRoute::Conservative => query
+            .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+            .collect(),
     };
     results.sort_unstable();
     results
 }
 
-fn assert_all_schedulers(
+fn assert_all_routes(
     make_root: impl Fn() -> Root,
     project: fn(&Binding) -> Option<RawInline>,
     mut expected: Vec<RawInline>,
 ) {
     expected.sort_unstable();
-    for scheduler in [
-        Scheduler::Ordinary,
-        Scheduler::Residual,
-        Scheduler::Sequential,
+    for route in [
+        SolveRoute::Ordinary,
+        SolveRoute::Combined,
+        SolveRoute::Conservative,
     ] {
-        assert_eq!(run(make_root(), scheduler, project), expected);
+        assert_eq!(run(make_root(), route, project), expected);
     }
 }
 
@@ -1502,7 +1504,9 @@ fn synthetic_root_atom_same_variable_rpq_composes_capabilities() {
         )
     };
 
-    let mut expected: Vec<_> = Query::new(make(), project_start).sequential().collect();
+    let mut expected: Vec<_> = Query::new(make(), project_start)
+        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+        .collect();
     expected.sort_unstable();
 
     let cases = [
@@ -1683,10 +1687,7 @@ fn cyclic_rpq_runs_as_a_direct_finite_or_proposal_action() {
         .cap(1)
         .start_width(1);
     let mut lowered: Vec<_> = lowered_query.by_ref().collect();
-    let mut sequential: Vec<_> = Query::new(root, project_end).sequential().collect();
     lowered.sort_unstable();
-    sequential.sort_unstable();
-    assert_eq!(lowered, sequential);
     let mut expected: Vec<_> = (1..4).map(|node| graph.value(node).raw).collect();
     expected.sort_unstable();
     assert_eq!(lowered, expected);
@@ -1715,10 +1716,7 @@ fn cyclic_rpq_runs_as_a_direct_finite_or_grouped_confirm_action() {
         .cap(1)
         .start_width(1);
     let mut lowered: Vec<_> = lowered_query.by_ref().collect();
-    let mut sequential: Vec<_> = Query::new(root, project_end).sequential().collect();
     lowered.sort_unstable();
-    sequential.sort_unstable();
-    assert_eq!(lowered, sequential);
     let mut expected = vec![graph.value(1).raw, graph.value(2).raw];
     expected.sort_unstable();
     assert_eq!(lowered, expected);
@@ -1763,10 +1761,7 @@ fn cyclic_or_confirm_keeps_the_original_group_for_a_later_sibling() {
         .cap(1)
         .start_width(1);
     let mut lowered: Vec<_> = lowered_query.by_ref().collect();
-    let mut sequential: Vec<_> = Query::new(root, project_end).sequential().collect();
     lowered.sort_unstable();
-    sequential.sort_unstable();
-    assert_eq!(lowered, sequential);
     let mut expected = vec![graph.value(1).raw, graph.value(2).raw, graph.value(3).raw];
     expected.sort_unstable();
     assert_eq!(lowered, expected);
@@ -1801,11 +1796,8 @@ fn cyclic_rpq_runs_in_a_finite_and_as_proposer_and_grouped_confirmer() {
         let mut lowered_query = Query::new(Arc::clone(&root), project_end)
             .solve_residual_state_lazy_with(combined_effects());
         let mut lowered: Vec<_> = lowered_query.by_ref().collect();
-        let mut sequential: Vec<_> = Query::new(root, project_end).sequential().collect();
         lowered.sort_unstable();
-        sequential.sort_unstable();
         expected.sort_unstable();
-        assert_eq!(lowered, sequential);
         assert_eq!(lowered, expected);
         assert!(lowered_query.stats().delta_transition_pages > 0);
     }
@@ -1855,12 +1847,9 @@ fn cyclic_rpq_resumes_through_recursive_or_and_or_frames() {
             .cap(1)
             .start_width(1);
         let mut lowered: Vec<_> = lowered_query.by_ref().collect();
-        let mut sequential: Vec<_> = Query::new(root, project_end).sequential().collect();
         let mut expected = vec![graph.value(0).raw, graph.value(2).raw, graph.value(3).raw];
         lowered.sort_unstable();
-        sequential.sort_unstable();
         expected.sort_unstable();
-        assert_eq!(lowered, sequential);
         assert_eq!(lowered, expected);
         assert!(lowered_query.stats().delta_transition_pages > 0);
     }
@@ -2056,7 +2045,7 @@ fn ordinary_shape_selected_query_composes_root_formula_union_and_cyclic_rpq() {
         formula_bound_start_root(graph.set.clone(), start, &ops),
         project_end,
     )
-    .sequential()
+    .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
     .collect();
 
     let mut ordinary_query = Query::new(
@@ -2237,10 +2226,7 @@ fn formula_cyclic_activations_preserve_distinct_outer_parents() {
     let mut lowered_query = Query::new(Arc::clone(&root), project_end)
         .solve_residual_state_lazy_with(combined_effects());
     let mut lowered: Vec<_> = lowered_query.by_ref().collect();
-    let mut sequential: Vec<_> = Query::new(root, project_end).sequential().collect();
     lowered.sort_unstable();
-    sequential.sort_unstable();
-    assert_eq!(lowered, sequential);
     let mut expected = vec![
         graph.value(1).raw,
         graph.value(1).raw,
@@ -2286,21 +2272,18 @@ fn all_capability_formula_cyclic_plan_survives_clone_and_parallel_split() {
         rows
     };
 
-    let scalar = sorted(Query::new(make(), project_end).sequential().collect());
     let expected = sorted(vec![
         graph.value(1).raw,
         graph.value(1).raw,
         graph.value(2).raw,
         graph.value(2).raw,
     ]);
-    assert_eq!(scalar, expected);
-
     // `root_formula` recursively owns finite AND/OR structure, so enabling the
     // narrower `finite_unions` capability as well must not change the exact
     // raw result relation or activation multiplicity.
     let root_formula = configured(root_formula_effects());
     let root_formula = sorted(root_formula.collect());
-    assert_eq!(root_formula, scalar);
+    assert_eq!(root_formula, expected);
 
     let all_capabilities = configured(all_formula_effects());
     let exact_clone = all_capabilities.clone();
@@ -2322,7 +2305,7 @@ fn all_capability_formula_cyclic_plan_survives_clone_and_parallel_split() {
     );
     assert_eq!(
         sorted(std::iter::once(first).chain(remainder).collect()),
-        scalar
+        expected
     );
 
     for workers in [1, 4] {
@@ -2332,7 +2315,7 @@ fn all_capability_formula_cyclic_plan_survives_clone_and_parallel_split() {
             .build()
             .unwrap()
             .install(|| parallel.into_par_iter().collect::<Vec<_>>());
-        assert_eq!(sorted(parallel), scalar, "workers={workers}");
+        assert_eq!(sorted(parallel), expected, "workers={workers}");
     }
 }
 
@@ -2353,7 +2336,7 @@ fn formula_same_variable_sources_keep_novelty_separate_at_shared_terms() {
     assert_eq!(
         query.stats().delta_source_dead_pages,
         2,
-        "a page whose only accepted endpoint was admitted earlier is scheduler-negative"
+        "a page whose only accepted endpoint was admitted earlier is route-negative"
     );
 }
 
@@ -2419,7 +2402,7 @@ fn plus_attr_handles_chain_diamond_self_loop_and_long_cycle() {
             .into_iter()
             .map(|node| graph.value(node).raw)
             .collect();
-        assert_all_schedulers(
+        assert_all_routes(
             || bound_start_root(graph.set.clone(), graph.value(0), &ops),
             project_end,
             expected,
@@ -2440,7 +2423,7 @@ fn same_variable_plus_denotes_nonempty_cycles_not_general_reachability() {
         for inverse in [false, true] {
             let ops = repeated(graph.attribute, inverse);
             let expected = cyclic.iter().map(|&node| graph.value(node).raw).collect();
-            assert_all_schedulers(
+            assert_all_routes(
                 || same_variable_root(graph.set.clone(), &ops),
                 project_start,
                 expected,
@@ -2476,7 +2459,7 @@ fn same_variable_product_program_keeps_inverse_direction_inside_the_fixpoint() {
         ),
     ];
     for (ops, expected) in cases {
-        assert_all_schedulers(
+        assert_all_routes(
             || same_variable_root(graph.set.clone(), &ops),
             project_start,
             expected,
@@ -2499,7 +2482,7 @@ fn same_variable_star_admits_exactly_the_graph_term_universe() {
             vec![PathOp::Attr(graph.attribute.raw())]
         };
         ops.push(PathOp::Star);
-        assert_all_schedulers(
+        assert_all_routes(
             || same_variable_root(graph.set.clone(), &ops),
             project_start,
             expected.clone(),
@@ -2523,7 +2506,7 @@ fn nullable_source_pages_are_the_sorted_nodes_union_without_absent_terms() {
     let mut expected = vec![graph.value(0).raw, graph.value(1).raw, literal.raw];
     expected.sort_unstable();
 
-    assert_all_schedulers(
+    assert_all_routes(
         || same_variable_unknown_root(graph.set.clone(), &ops),
         project_start,
         expected,
@@ -2567,7 +2550,7 @@ fn first_union_pages_deduplicate_arms_and_match_candidate_last_filtering() {
     ];
     expected.sort_unstable();
 
-    assert_all_schedulers(
+    assert_all_routes(
         || same_variable_unknown_root(graph.set.clone(), &ops),
         project_start,
         expected,
@@ -2701,7 +2684,7 @@ fn same_variable_fixpoint_preserves_distinct_outer_activations() {
     let graph = Graph::new(2, &[(0, 1), (1, 0)]);
     let outer_values = [genid(&rngid().id).raw, genid(&rngid().id).raw];
     let ops = repeated(graph.attribute, false);
-    assert_all_schedulers(
+    assert_all_routes(
         || same_variable_outer_root(graph.set.clone(), outer_values, &ops),
         project_start,
         vec![
@@ -2813,14 +2796,14 @@ fn star_and_optional_epsilon_acceptance_obey_the_graph_term_gate() {
     ];
     let expected = vec![graph.value(0).raw, graph.value(1).raw, graph.value(2).raw];
     for ops in [&star, &optional_or_plus] {
-        assert_all_schedulers(
+        assert_all_routes(
             || bound_start_root(graph.set.clone(), graph.value(0), ops),
             project_end,
             expected.clone(),
         );
 
         let absent = genid(&rngid().id);
-        assert_all_schedulers(
+        assert_all_routes(
             || bound_start_root(graph.set.clone(), absent, ops),
             project_end,
             Vec::new(),
@@ -2829,7 +2812,7 @@ fn star_and_optional_epsilon_acceptance_obey_the_graph_term_gate() {
 
     let _ = run(
         bound_start_root(graph.set.clone(), graph.value(0), &star),
-        Scheduler::Residual,
+        SolveRoute::Combined,
         project_end,
     );
 }
@@ -3172,7 +3155,7 @@ fn one_term_at_two_program_counters_keeps_both_futures() {
         PathOp::Union,
         PathOp::Plus,
     ];
-    assert_all_schedulers(
+    assert_all_routes(
         || bound_start_root(graph.set.clone(), graph.value(0), &ops),
         project_end,
         vec![graph.value(0).raw],
@@ -3188,12 +3171,12 @@ fn compound_concat_fixpoint_runs_in_both_endpoint_orientations() {
         PathOp::Concat,
         PathOp::Plus,
     ];
-    assert_all_schedulers(
+    assert_all_routes(
         || bound_start_root(graph.set.clone(), graph.value(0), &ops),
         project_end,
         vec![graph.value(2).raw, graph.value(4).raw],
     );
-    assert_all_schedulers(
+    assert_all_routes(
         || bound_end_root(graph.set.clone(), graph.value(4), &ops),
         project_start,
         vec![graph.value(0).raw, graph.value(2).raw],
@@ -3211,12 +3194,12 @@ fn repeated_negated_attribute_uses_the_same_product_fixpoint() {
         .set
         .insert(&Trible::new(&graph.nodes[1], &other, &graph.value(2)));
     let ops = vec![PathOp::NotAttr(graph.attribute.raw()), PathOp::Plus];
-    assert_all_schedulers(
+    assert_all_routes(
         || bound_start_root(graph.set.clone(), graph.value(0), &ops),
         project_end,
         vec![graph.value(1).raw, graph.value(2).raw],
     );
-    assert_all_schedulers(
+    assert_all_routes(
         || bound_end_root(graph.set.clone(), graph.value(2), &ops),
         project_start,
         vec![graph.value(0).raw, graph.value(1).raw],
@@ -3252,9 +3235,9 @@ fn all_attr_inverse_and_bound_endpoint_routes_match_oracles() {
     ];
     for (root, project, mut expected) in cases {
         expected.sort_unstable();
-        let residual = run(Arc::clone(&root), Scheduler::Residual, project);
+        let residual = run(Arc::clone(&root), SolveRoute::Combined, project);
         assert_eq!(residual, expected);
-        assert_eq!(run(root, Scheduler::Sequential, project), expected);
+        assert_eq!(run(root, SolveRoute::Conservative, project), expected);
     }
 }
 
@@ -3327,7 +3310,7 @@ fn target_confirm_traverses_once_and_set_admits_reachable_candidates() {
             &ops,
         );
         expected.sort_unstable();
-        assert_eq!(run(root, Scheduler::Residual, project), expected);
+        assert_eq!(run(root, SolveRoute::Combined, project), expected);
     }
 }
 
@@ -3976,17 +3959,6 @@ fn positive_support_gate_precedes_partial_rpq_optimistic_support_selection() {
             }) as DynConstraint,
         ]))
     };
-    let mut sequential: Vec<_> = Query::new(make(), project_pair).sequential().collect();
-    let mut disabled: Vec<_> = Query::new(make(), project_pair)
-        .solve_residual_state_lazy_with(ResidualLowering::new(
-            FormulaScope::OpaqueLeaves,
-            ProgramScope::Disabled,
-        ))
-        .collect();
-    sequential.sort_unstable();
-    disabled.sort_unstable();
-    assert_eq!(disabled, sequential);
-
     let mut query = Query::new(make(), project_pair)
         .solve_residual_state_lazy_with(ResidualLowering::new(
             FormulaScope::OpaqueLeaves,
@@ -3996,7 +3968,6 @@ fn positive_support_gate_precedes_partial_rpq_optimistic_support_selection() {
         .cap(1);
     let mut actual: Vec<_> = query.by_ref().collect();
     actual.sort_unstable();
-    assert_eq!(actual, disabled);
     let mut expected = vec![
         (graph.value(1).raw, graph.value(2).raw),
         (graph.value(1).raw, graph.value(3).raw),
@@ -4037,7 +4008,7 @@ fn automaton_target_confirm_filters_then_set_admits_the_sequence() {
     let expected = vec![graph.value(2).raw, graph.value(0).raw, graph.value(1).raw];
     let residual = run(
         target_confirm_root(graph.set.clone(), END, graph.value(0), candidates, &ops),
-        Scheduler::Residual,
+        SolveRoute::Combined,
         project_end,
     );
     let mut expected = expected;
@@ -4065,7 +4036,7 @@ fn bound_literal_endpoint_uses_the_inverse_delta_route() {
     ]));
 
     assert_eq!(
-        run(root, Scheduler::Residual, project_start),
+        run(root, SolveRoute::Combined, project_start),
         vec![graph.value(0).raw]
     );
 }
@@ -4119,15 +4090,12 @@ fn two_free_path_end_pages_the_inverse_first_frontier() {
             )) as DynConstraint,
         ]))
     };
-    let mut sequential: Vec<_> = Query::new(make_root(), project_pair).sequential().collect();
     let mut residual: Vec<_> = Query::new(make_root(), project_pair)
         .solve_residual_state_lazy_with(ResidualLowering::FULL)
         .cap(1)
         .start_width(1)
         .collect();
-    sequential.sort_unstable();
     residual.sort_unstable();
-    assert_eq!(residual, sequential);
     let mut expected = vec![
         (graph.value(1).raw, graph.value(0).raw),
         (graph.value(1).raw, graph.value(2).raw),
@@ -4142,15 +4110,12 @@ fn nullable_two_free_first_frontier_is_exactly_the_graph_term_union() {
     let graph = Graph::new(3, &[(0, 1)]);
     let ops = vec![PathOp::Attr(graph.attribute.raw()), PathOp::Optional];
     let make_root = || two_free_root(graph.set.clone(), &ops);
-    let mut sequential: Vec<_> = Query::new(make_root(), project_pair).sequential().collect();
     let mut residual: Vec<_> = Query::new(make_root(), project_pair)
         .solve_residual_state_lazy_with(ResidualLowering::FULL)
         .cap(1)
         .start_width(1)
         .collect();
-    sequential.sort_unstable();
     residual.sort_unstable();
-    assert_eq!(residual, sequential);
     let mut expected = vec![
         (graph.value(0).raw, graph.value(0).raw),
         (graph.value(0).raw, graph.value(1).raw),
@@ -4227,7 +4192,9 @@ fn nullable_seed_is_first_result_without_transition_work_and_preserves_affine_ro
     let ops = [PathOp::Attr(graph.attribute.raw()), PathOp::Star];
     let outer_values = [genid(&rngid().id).raw, genid(&rngid().id).raw];
     let make = || duplicate_parent_root(graph.set.clone(), graph.value(0).raw, outer_values, &ops);
-    let mut expected: Vec<_> = Query::new(make(), project_end).sequential().collect();
+    let mut expected: Vec<_> = Query::new(make(), project_end)
+        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+        .collect();
     expected.sort_unstable();
     let mut query = Query::new(make(), project_end)
         .solve_residual_state_lazy_with(ResidualLowering::FULL)
@@ -4336,7 +4303,7 @@ fn clone_with_a_suspended_same_variable_cursor_has_two_exact_remainders() {
 }
 
 #[test]
-fn generated_product_programs_match_sequential_and_residual_results() {
+fn generated_product_programs_match_conservative_and_combined_routes() {
     let edge_universe = [(0, 0), (0, 1), (0, 2), (1, 2), (2, 3), (3, 0)];
     for mask in 0u16..64 {
         let edges: Vec<_> = edge_universe
@@ -4376,28 +4343,28 @@ fn generated_product_programs_match_sequential_and_residual_results() {
         ];
         for ops in expressions {
             let make_root = || bound_start_root(graph.set.clone(), graph.value(0), &ops);
-            let residual = run(make_root(), Scheduler::Residual, project_end);
+            let residual = run(make_root(), SolveRoute::Combined, project_end);
             assert_eq!(
                 residual,
-                run(make_root(), Scheduler::Sequential, project_end)
+                run(make_root(), SolveRoute::Conservative, project_end)
             );
 
             let make_same_root = || same_variable_root(graph.set.clone(), &ops);
-            let ordinary = run(make_same_root(), Scheduler::Ordinary, project_start);
+            let ordinary = run(make_same_root(), SolveRoute::Ordinary, project_start);
             assert_eq!(
                 ordinary,
-                run(make_same_root(), Scheduler::Residual, project_start)
+                run(make_same_root(), SolveRoute::Combined, project_start)
             );
             assert_eq!(
                 ordinary,
-                run(make_same_root(), Scheduler::Sequential, project_start)
+                run(make_same_root(), SolveRoute::Conservative, project_start)
             );
         }
     }
 }
 
 #[test]
-fn generated_combined_formula_rpq_matrix_matches_frozen_schedulers_and_is_monotone() {
+fn generated_combined_formula_rpq_matrix_matches_frozen_routes_and_is_monotone() {
     let programs = [
         GeneratedPathProgram::Attr,
         GeneratedPathProgram::Optional,
@@ -4447,10 +4414,10 @@ fn generated_combined_formula_rpq_matrix_matches_frozen_schedulers_and_is_monoto
                 let graph = GeneratedGraph::new(level);
                 let ops = program.ops(graph.primary, graph.secondary);
                 let make_root = || generated_formula_root(&graph, &ops, formula);
-                let expected = run(make_root(), Scheduler::Sequential, project_end);
+                let expected = run(make_root(), SolveRoute::Conservative, project_end);
 
                 assert_eq!(
-                    run(make_root(), Scheduler::Ordinary, project_end),
+                    run(make_root(), SolveRoute::Ordinary, project_end),
                     expected,
                     "level={level} program={program:?} formula={formula:?} ordinary"
                 );
@@ -4770,7 +4737,9 @@ fn paged_transitions_preserve_affine_parent_rows_and_storage_monotonicity() {
     let ops = [PathOp::Attr(graph.attribute.raw())];
     let outer_values = [genid(&rngid().id).raw, genid(&rngid().id).raw];
     let make = || duplicate_parent_root(graph.set.clone(), graph.value(0).raw, outer_values, &ops);
-    let mut expected: Vec<_> = Query::new(make(), project_end).sequential().collect();
+    let mut expected: Vec<_> = Query::new(make(), project_end)
+        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+        .collect();
     let mut residual = Query::new(make(), project_end)
         .solve_residual_state_lazy_with(ResidualLowering::FULL)
         .start_width(1)
@@ -4930,7 +4899,9 @@ fn mixed_transition_pages_preserve_cycles_clone_drop_affine_rows_and_monotonicit
         PathOp::Plus,
     ];
     let make = || bound_start_root(graph.set.clone(), graph.value(0), &ops);
-    let mut expected: Vec<_> = Query::new(make(), project_end).sequential().collect();
+    let mut expected: Vec<_> = Query::new(make(), project_end)
+        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+        .collect();
     expected.sort_unstable();
 
     let mut residual = Query::new(make(), project_end)
@@ -4961,17 +4932,17 @@ fn mixed_transition_pages_preserve_cycles_clone_drop_affine_rows_and_monotonicit
     let outer_values = [genid(&rngid().id).raw, genid(&rngid().id).raw];
     let make_affine =
         || duplicate_parent_root(graph.set.clone(), graph.value(0).raw, outer_values, &ops);
-    let mut sequential: Vec<_> = Query::new(make_affine(), project_end)
-        .sequential()
+    let mut conservative: Vec<_> = Query::new(make_affine(), project_end)
+        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
         .collect();
     let mut affine = Query::new(make_affine(), project_end)
         .solve_residual_state_lazy_with(ResidualLowering::FULL)
         .start_width(1)
         .cap(2);
     let mut actual: Vec<_> = affine.by_ref().collect();
-    sequential.sort_unstable();
+    conservative.sort_unstable();
     actual.sort_unstable();
-    assert_eq!(actual, sequential);
+    assert_eq!(actual, conservative);
     assert!(affine.stats().delta_transition_pages > 0);
 
     let mut previous = Vec::new();

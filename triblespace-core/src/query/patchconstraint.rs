@@ -793,10 +793,6 @@ mod tests {
             eager_proposal(&constraint, variable.index, &RowsView::EMPTY)
         );
 
-        let mut sequential: Vec<_> =
-            Query::new(PatchValueConstraint::new(variable, &patch), project_value)
-                .sequential()
-                .collect();
         let mut ordinary: Vec<_> =
             Query::new(PatchValueConstraint::new(variable, &patch), project_value).collect();
         let mut eager = Query::new(PatchValueConstraint::new(variable, &patch), project_value)
@@ -806,13 +802,12 @@ mod tests {
             .cap(1)
             .start_width(1);
         let mut full: Vec<_> = full_query.by_ref().collect();
-        for bag in [&mut sequential, &mut ordinary, &mut eager, &mut full] {
+        for bag in [&mut ordinary, &mut eager, &mut full] {
             bag.sort_unstable();
         }
-        assert_eq!(sequential, direct);
-        assert_eq!(ordinary, sequential);
-        assert_eq!(eager, sequential);
-        assert_eq!(full, sequential);
+        assert_eq!(ordinary, direct);
+        assert_eq!(eager, direct);
+        assert_eq!(full, direct);
         assert_eq!(full_query.stats().delta_source_pages, patch.len() as usize);
         assert_eq!(
             full_query.stats().delta_source_candidates_examined,
@@ -846,7 +841,6 @@ mod tests {
         );
 
         let make = || PatchIdConstraint::new(variable, patch.clone());
-        let mut sequential: Vec<_> = Query::new(make(), project_value).sequential().collect();
         let mut ordinary: Vec<_> = Query::new(make(), project_value).collect();
         let mut eager = Query::new(make(), project_value).solve_residual_state();
         let mut full: Vec<_> = Query::new(make(), project_value)
@@ -854,13 +848,12 @@ mod tests {
             .cap(1)
             .start_width(1)
             .collect();
-        for bag in [&mut sequential, &mut ordinary, &mut eager, &mut full] {
+        for bag in [&mut ordinary, &mut eager, &mut full] {
             bag.sort_unstable();
         }
-        assert_eq!(sequential, direct);
-        assert_eq!(ordinary, sequential);
-        assert_eq!(eager, sequential);
-        assert_eq!(full, sequential);
+        assert_eq!(ordinary, direct);
+        assert_eq!(eager, direct);
+        assert_eq!(full, direct);
     }
 
     #[test]
@@ -1051,7 +1044,6 @@ mod tests {
             "the raw protocol call still observes both duplicate parent occurrences",
         );
 
-        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
         let mut ordinary: Vec<_> = Query::new(make(), project).collect();
         let mut eager = Query::new(make(), project).solve_residual_state();
         let mut full_query = Query::new(make(), project)
@@ -1059,20 +1051,19 @@ mod tests {
             .cap(1)
             .start_width(1);
         let mut full: Vec<_> = full_query.by_ref().collect();
-        for bag in [&mut sequential, &mut ordinary, &mut eager, &mut full] {
+        for bag in [&mut ordinary, &mut eager, &mut full] {
             bag.sort_unstable();
         }
         let expected: Vec<_> = members
             .into_iter()
             .map(|member| (parent_value, member))
             .collect();
-        assert_eq!(sequential, expected);
-        assert!(sequential
+        assert_eq!(ordinary, expected);
+        assert!(ordinary
             .iter()
             .all(|(parent, _member)| *parent == parent_value));
-        assert_eq!(ordinary, sequential);
-        assert_eq!(eager, sequential);
-        assert_eq!(full, sequential);
+        assert_eq!(eager, expected);
+        assert_eq!(full, expected);
         assert_eq!(
             full_query.stats().delta_source_direct_candidates,
             3,

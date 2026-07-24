@@ -534,16 +534,6 @@ mod tests {
 
         let entity = Variable::<GenId>::new(0);
         let entity_value: Inline<GenId> = (&entity_candidate).to_inline();
-        let sequential_entities: Vec<_> = Query::new(
-            and!(
-                entity.is(entity_value),
-                data.entity_in_range(entity, entity_min, entity_max),
-            ),
-            move |binding| project(entity.index, binding),
-        )
-        .sequential()
-        .collect();
-        assert!(sequential_entities.is_empty());
         let residual_entities: Vec<_> = Query::new(
             and!(
                 entity.is(entity_value),
@@ -559,16 +549,6 @@ mod tests {
 
         let attribute = Variable::<GenId>::new(0);
         let attribute_value: Inline<GenId> = (&attribute_candidate).to_inline();
-        let sequential_attributes: Vec<_> = Query::new(
-            and!(
-                attribute.is(attribute_value),
-                data.attribute_in_range(attribute, attribute_min, attribute_max),
-            ),
-            move |binding| project(attribute.index, binding),
-        )
-        .sequential()
-        .collect();
-        assert!(sequential_attributes.is_empty());
         let residual_attributes: Vec<_> = Query::new(
             and!(
                 attribute.is(attribute_value),
@@ -718,12 +698,6 @@ mod tests {
             ]
         );
 
-        let mut expected: Vec<_> = Query::new(
-            data.attribute_in_range(attribute, attributes[1], attributes[2]),
-            move |binding| project(attribute.index, binding),
-        )
-        .sequential()
-        .collect();
         let mut actual: Vec<_> = Query::new(
             data.attribute_in_range(attribute, attributes[1], attributes[2]),
             move |binding| project(attribute.index, binding),
@@ -732,9 +706,7 @@ mod tests {
         .cap(1)
         .start_width(1)
         .collect();
-        expected.sort_unstable();
         actual.sort_unstable();
-        assert_eq!(actual, expected);
         assert_eq!(
             actual,
             [

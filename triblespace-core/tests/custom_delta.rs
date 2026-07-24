@@ -1184,7 +1184,7 @@ fn assert_recursive_support_case(include_terminal: bool) -> Vec<RawInline> {
             ),
             project_outer,
         )
-        .sequential()
+        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
         .collect(),
     );
     assert_eq!(oracle, expected);
@@ -1311,7 +1311,7 @@ fn assert_program_support_case(
             ),
             project_outer,
         )
-        .sequential()
+        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
         .collect(),
     );
     assert_eq!(oracle, expected);
@@ -1546,7 +1546,7 @@ fn assert_direct_source_case(values: Vec<RawInline>, expected: Vec<RawInline>) -
             direct_source_fixture(values.clone(), Arc::clone(&oracle_evidence)),
             project_start,
         )
-        .sequential()
+        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
         .collect(),
     );
     assert_eq!(oracle, expected);
@@ -1556,7 +1556,7 @@ fn assert_direct_source_case(values: Vec<RawInline>, expected: Vec<RawInline>) -
             .lock()
             .expect("direct source trace poisoned")
             .is_empty(),
-        "the sequential oracle must use the ordinary proposer"
+        "the conservative oracle must use the ordinary proposer"
     );
 
     let residual_evidence = Arc::new(DirectSourceEvidence::default());
@@ -1619,7 +1619,7 @@ fn custom_direct_source_duplicate_occurrences_collapse_per_parent_at_width_one()
             direct_source_fixture(values.clone(), Arc::default()),
             project_start,
         )
-        .sequential()
+        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
         .collect(),
     );
     // The two parents remain distinct complete bindings, while equal source
@@ -1657,7 +1657,7 @@ fn custom_direct_source_batches_compatible_parents_with_one_global_budget() {
             direct_source_fixture(values.clone(), Arc::default()),
             project_start,
         )
-        .sequential()
+        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
         .collect(),
     );
     let conservative = sorted(
@@ -1718,14 +1718,14 @@ fn custom_direct_source_batches_compatible_parents_with_one_global_budget() {
 }
 
 #[test]
-fn default_scalar_source_pages_consume_one_real_compatible_cohort() {
+fn default_source_pages_consume_one_real_compatible_cohort() {
     let values = vec![raw(1), raw(2), raw(3)];
     let oracle = sorted(
         Query::new(
             scalar_direct_source_fixture(values.clone(), Arc::default()),
             project_start,
         )
-        .sequential()
+        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
         .collect(),
     );
     let evidence = Arc::new(DirectSourceEvidence::default());
@@ -1826,15 +1826,18 @@ fn live_custom_direct_source_clones_exactly_and_matches_rayon_workers() {
 
 #[test]
 fn custom_cyclic_delta_composes_with_recursive_root_formula() {
-    let sequential_evidence = Arc::new(DeltaEvidence::default());
-    let sequential = sorted(
-        Query::new(fixture(Arc::clone(&sequential_evidence)), project_end)
-            .sequential()
+    let conservative_evidence = Arc::new(DeltaEvidence::default());
+    let conservative = sorted(
+        Query::new(fixture(Arc::clone(&conservative_evidence)), project_end)
+            .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
             .collect(),
     );
-    assert_eq!(sequential_evidence.seeded_roots.load(Ordering::Relaxed), 0);
     assert_eq!(
-        sequential_evidence.expanded_nodes.load(Ordering::Relaxed),
+        conservative_evidence.seeded_roots.load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        conservative_evidence.expanded_nodes.load(Ordering::Relaxed),
         0
     );
 
@@ -1856,9 +1859,9 @@ fn custom_cyclic_delta_composes_with_recursive_root_formula() {
     let residual = sorted(residual.results);
 
     let expected = sorted(vec![raw(2), raw(2), raw(6), raw(6)]);
-    assert_eq!(sequential, expected);
-    assert_eq!(hybrid, sequential);
-    assert_eq!(residual, sequential);
+    assert_eq!(conservative, expected);
+    assert_eq!(hybrid, conservative);
+    assert_eq!(residual, conservative);
     assert!(residual_evidence.seeded_roots.load(Ordering::Relaxed) > 0);
     assert!(residual_evidence.expanded_nodes.load(Ordering::Relaxed) > 0);
     assert_eq!(
@@ -1878,7 +1881,7 @@ fn custom_cyclic_delta_composes_with_recursive_root_formula() {
                 .into_par_iter()
                 .collect(),
         );
-        assert_eq!(parallel, sequential);
+        assert_eq!(parallel, conservative);
         assert!(parallel_evidence.seeded_roots.load(Ordering::Relaxed) > 0);
         assert!(parallel_evidence.expanded_nodes.load(Ordering::Relaxed) > 0);
     }

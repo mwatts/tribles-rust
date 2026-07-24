@@ -1,8 +1,8 @@
-//! Oracle-first semantic properties for the query engines.
+//! Oracle-first semantic properties for the query routes.
 //!
-//! Engine-to-engine parity can preserve a shared bug. These tests instead
+//! Route-to-route parity can preserve a shared bug. These tests instead
 //! interpret generated relations with plain Rust set algebra, then require the
-//! sequential cursor and every residual configuration to produce exactly that
+//! ordinary cursor and every residual configuration to produce exactly that
 //! distinct raw projected-row set on both in-memory and succinct backends.
 
 use std::collections::{HashMap, HashSet};
@@ -24,7 +24,7 @@ use triblespace::prelude::*;
 mod oracle {
     use triblespace::prelude::*;
 
-    // Reuse the query-engine fixture attributes. They have the same schema and
+    // Reuse the query-route fixture attributes. They have the same schema and
     // meaning here, and avoiding fresh protocol IDs keeps this test isolated.
     attributes! {
         "522EB8351DA60956D2D16E6ED9745BA7" as kind: inlineencodings::GenId;
@@ -67,9 +67,7 @@ where
     C: Constraint<'a>,
     P: Fn(&Binding) -> Option<R>,
 {
-    query
-        .residual_lowering(ResidualLowering::CONSERVATIVE)
-        .residual_state_scheduler()
+    query.residual_lowering(ResidualLowering::CONSERVATIVE)
 }
 
 #[cfg(feature = "parallel")]
@@ -94,71 +92,52 @@ fn parallel_pool(threads: usize) -> &'static rayon::ThreadPool {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum RpqEngine {
-    Sequential,
+enum RpqRoute {
     Ordinary,
-    ResidualCursor,
+    ConservativeCursor,
     ResidualEager,
     ResidualLazy,
     #[cfg(feature = "parallel")]
     ResidualParallel(usize),
 }
 
-/// Run one RPQ query shape through every scheduler relevant to residual
+/// Run one RPQ query shape through every execution route relevant to residual
 /// promotion while allocating only one `Query` local at a time. Keeping the
-/// scheduler choice in a runtime loop avoids the very large debug stack frames
+/// execution-route choice in a runtime loop avoids the very large debug stack frames
 /// produced by expanding a fresh `find!` temporary in every assertion.
-fn assert_rpq_engines<'a, C, P, R, F>(
-    label: &str,
-    expected: &[R],
-    expected_ordinary_scheduler: &str,
-    make_query: F,
-) where
+fn assert_rpq_routes<'a, C, P, R, F>(label: &str, expected: &[R], make_query: F)
+where
     C: Constraint<'a> + Clone + Send + 'a,
     P: Fn(&Binding) -> Option<R> + Clone + Send,
     R: Debug + Ord + Send,
     F: Fn() -> Query<C, P, R>,
 {
-    let mut engines = vec![
-        RpqEngine::Sequential,
-        RpqEngine::Ordinary,
-        RpqEngine::ResidualCursor,
-        RpqEngine::ResidualEager,
-        RpqEngine::ResidualLazy,
+    let mut routes = vec![
+        RpqRoute::Ordinary,
+        RpqRoute::ConservativeCursor,
+        RpqRoute::ResidualEager,
+        RpqRoute::ResidualLazy,
     ];
     #[cfg(feature = "parallel")]
-    engines.extend([
-        RpqEngine::ResidualParallel(1),
-        RpqEngine::ResidualParallel(4),
-    ]);
+    routes.extend([RpqRoute::ResidualParallel(1), RpqRoute::ResidualParallel(4)]);
 
-    for engine in engines {
-        let mut actual = match engine {
-            RpqEngine::Sequential => make_query().sequential().collect::<Vec<_>>(),
-            RpqEngine::Ordinary => {
-                let mut query = make_query();
-                let rows = query.by_ref().collect::<Vec<_>>();
-                let state = format!("{query:?}");
-                assert!(
-                    state.contains(&format!("scheduler: {expected_ordinary_scheduler}")),
-                    "{label}: unexpected ordinary scheduler: {state}"
-                );
-                rows
-            }
-            RpqEngine::ResidualCursor => {
+    for route in routes {
+        let mut actual = match route {
+            RpqRoute::Ordinary => make_query().collect::<Vec<_>>(),
+            RpqRoute::ConservativeCursor => {
                 conservative_residual_cursor(make_query()).collect::<Vec<_>>()
             }
-            RpqEngine::ResidualEager => make_query().solve_residual_state(),
-            RpqEngine::ResidualLazy => make_query().solve_residual_state_lazy().collect::<Vec<_>>(),
+            RpqRoute::ResidualEager => make_query().solve_residual_state(),
+            RpqRoute::ResidualLazy => make_query().solve_residual_state_lazy().collect::<Vec<_>>(),
             #[cfg(feature = "parallel")]
-            RpqEngine::ResidualParallel(threads) => {
+            RpqRoute::ResidualParallel(threads) => {
                 let query = make_query();
                 parallel_pool(threads)
                     .install(move || query.into_par_residual_state_iter().collect::<Vec<_>>())
             }
         };
         actual.sort_unstable();
-        assert_eq!(actual, expected, "{label}: {engine:?}");
+        assert_eq!(actual, expected, "{label}: {route:?}");
     }
 }
 
@@ -175,18 +154,12 @@ fn rpq_proptest_config() -> ProptestConfig {
     }
 }
 
-/// Assert against an independent oracle, not against another engine.
+/// Assert against an independent oracle, not against another route.
 ///
 /// `$query` must construct a fresh `Query` each time it is expanded.
 macro_rules! assert_all_engines_match {
     ($label:expr, $expected:expr, $query:expr) => {{
         let expected = multiset($expected);
-        prop_assert_eq!(
-            multiset(($query).sequential()),
-            expected.clone(),
-            "{}: sequential cursor",
-            $label
-        );
         prop_assert_eq!(
             multiset($query),
             expected.clone(),
@@ -217,12 +190,6 @@ macro_rules! assert_all_engines_match {
 macro_rules! assert_residual_engines_match {
     ($label:expr, $expected:expr, $query:expr) => {{
         let expected = multiset($expected);
-        prop_assert_eq!(
-            multiset(($query).sequential()),
-            expected.clone(),
-            "{}: scalar DFS reference",
-            $label
-        );
         prop_assert_eq!(
             multiset($query),
             expected.clone(),
@@ -448,11 +415,6 @@ fn root_formula_candidate_paging_is_storage_polymorphic() {
     macro_rules! assert_backend {
         ($label:literal, $store:expr) => {{
             assert_eq!(
-                multiset(query!($store).sequential()),
-                expected,
-                concat!($label, ": sequential")
-            );
-            assert_eq!(
                 multiset(query!($store)),
                 expected,
                 concat!($label, ": ordinary")
@@ -558,7 +520,7 @@ proptest! {
     /// row per reachable endpoint pair, so exact counted-set comparison also
     /// catches duplicate leakage from multiple witnesses.
     #[test]
-    fn rpq_schedulers_match_generated_reachability_oracle(
+    fn rpq_routes_match_generated_reachability_oracle(
         p_masks in prop::array::uniform4(0u8..16),
         r_masks in prop::array::uniform4(0u8..16),
         marked_mask in 0u8..16,
@@ -662,10 +624,9 @@ proptest! {
         // second opaque-root gate is therefore honestly an archive roundtrip
         // of the graph data followed by TribleSet RPQ execution, not a claim
         // that the RPQ itself probes SuccinctArchive natively.
-        assert_rpq_engines(
+        assert_rpq_routes(
             "opaque-rpq/tribleset",
             &expected,
-            "ResidualState",
             || {
                 find!(
                     (src: Inline<GenId>, dst: Inline<GenId>),
@@ -673,10 +634,9 @@ proptest! {
                 )
             },
         );
-        assert_rpq_engines(
+        assert_rpq_routes(
             "opaque-rpq/archive-roundtrip-graph",
             &expected,
-            "ResidualState",
             || {
                 find!(
                     (src: Inline<GenId>, dst: Inline<GenId>),
@@ -688,15 +648,13 @@ proptest! {
             },
         );
 
-        // The full-switch default also routes the exposed RPQ/pattern AND
-        // through ResidualState. The archive case is the real heterogeneous
-        // composition gate: RPQ traversal uses the roundtripped TribleSet graph
-        // while its sibling's estimate/propose/confirm verbs run natively
-        // against SuccinctArchive.
-        assert_rpq_engines(
+        // The archive case is the real heterogeneous composition gate: RPQ
+        // traversal uses the roundtripped TribleSet graph while its sibling's
+        // estimate/propose/confirm verbs run natively against
+        // SuccinctArchive.
+        assert_rpq_routes(
             "rpq-and-pattern/tribleset",
             &expected_marked,
-            "ResidualState",
             || {
                 find!(
                     dst: Inline<GenId>,
@@ -710,10 +668,9 @@ proptest! {
                 )
             },
         );
-        assert_rpq_engines(
+        assert_rpq_routes(
             "rpq-and-pattern/succinctarchive-sibling",
             &expected_marked,
-            "ResidualState",
             || {
                 find!(
                     dst: Inline<GenId>,

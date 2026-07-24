@@ -527,7 +527,7 @@ fn normalized_union_preserves_affine_parents_and_monotone_shard_growth() {
     let value = Variable::<UnknownInline>::new(0);
     let parent = Variable::<UnknownInline>::new(1);
 
-    let solve = |archives: &[SuccinctArchive<OrderedUniverse>], sequential| {
+    let solve = |archives: &[SuccinctArchive<OrderedUniverse>], conservative| {
         let union = UnionArchive::new(archives);
         let root = IntersectionConstraint::new(vec![
             Box::new(ParentDomain {
@@ -537,8 +537,10 @@ fn normalized_union_preserves_affine_parents_and_monotone_shard_growth() {
             Box::new(union.pattern(entities[0], attributes[0], value)) as DynConstraint<'_>,
         ]);
         let query = Query::new(root, project_value);
-        let mut results: Vec<_> = if sequential {
-            query.sequential().collect()
+        let mut results: Vec<_> = if conservative {
+            query
+                .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+                .collect()
         } else {
             query
                 .solve_residual_state_lazy_with(ResidualLowering::FULL)
@@ -550,15 +552,15 @@ fn normalized_union_preserves_affine_parents_and_monotone_shard_growth() {
         results
     };
 
-    let base_sequential = solve(&base_archives, true);
-    let base_residual = solve(&base_archives, false);
-    assert_eq!(base_residual, base_sequential);
+    let base_conservative = solve(&base_archives, true);
+    let base_full = solve(&base_archives, false);
+    assert_eq!(base_full, base_conservative);
     let mut expected: Vec<_> = base_values
         .iter()
         .flat_map(|value| [value.raw, value.raw])
         .collect();
     expected.sort_unstable();
-    assert_eq!(base_residual, expected);
+    assert_eq!(base_full, expected);
 
     let pages = Arc::new(Mutex::new(Vec::new()));
     let union = UnionArchive::new(&base_archives);
@@ -591,10 +593,10 @@ fn normalized_union_preserves_affine_parents_and_monotone_shard_growth() {
         "affine pages multiplied the global geometric width"
     );
 
-    let grown_residual = solve(&grown_archives, false);
-    for inherited in base_residual {
+    let grown_full = solve(&grown_archives, false);
+    for inherited in base_full {
         assert!(
-            grown_residual.contains(&inherited),
+            grown_full.contains(&inherited),
             "adding a shard retracted an affine result"
         );
     }
@@ -603,5 +605,5 @@ fn normalized_union_preserves_affine_parents_and_monotone_shard_growth() {
         .flat_map(|value| [value.raw, value.raw])
         .collect();
     grown_expected.sort_unstable();
-    assert_eq!(grown_residual, grown_expected);
+    assert_eq!(grown_full, grown_expected);
 }

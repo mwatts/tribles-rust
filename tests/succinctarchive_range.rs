@@ -133,17 +133,6 @@ fn attached_value_range_rejects_in_range_values_absent_from_the_v_axis() {
     // The candidate is in the archive universe through E but absent from V.
     // Constant has the smaller estimate, so the range must reject it while
     // acting as a confirmer rather than merely by owning its proposal source.
-    let sequential: Vec<_> = Query::new(
-        and!(
-            variable.is(candidate),
-            archive.value_in_range(variable, min, max),
-        ),
-        move |binding| project(variable.index, binding),
-    )
-    .sequential()
-    .collect();
-    assert!(sequential.is_empty());
-
     let residual: Vec<_> = Query::new(
         and!(
             variable.is(candidate),

@@ -1,9 +1,7 @@
 use std::cell::RefCell;
-use std::hint::black_box;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 
 use crate::debug::query::{DebugConstraint, EstimateOverrideConstraint};
 use crate::inline::encodings::UnknownInline;
@@ -243,47 +241,6 @@ impl Constraint<'static> for AdaptiveSource {
 }
 
 #[test]
-fn conservative_bag_receipt_keeps_reverse_stable_tail_layout() {
-    let mut query = Query::new(
-        BasicSource {
-            values: &[A, B, A],
-            layout_is_set: false,
-            coverage: ProposalCoverage::Exact,
-            accepted: &[A, B],
-            confirm_calls: None,
-        },
-        |_| Some(()),
-    );
-
-    query.push_next_variable();
-
-    assert_eq!(query.values[TARGET].as_deref(), Some(&[B, A][..]));
-    assert!(
-        query.value_admission.capacity() > 0,
-        "the conservative receipt must retain scalar hash admission"
-    );
-}
-
-#[test]
-fn grouped_set_receipt_preserves_exact_raw_tail_order_without_hashing() {
-    let mut query = Query::new(
-        BasicSource {
-            values: &[B, A],
-            layout_is_set: true,
-            coverage: ProposalCoverage::Exact,
-            accepted: &[A, B],
-            confirm_calls: None,
-        },
-        |_| Some(()),
-    );
-
-    query.push_next_variable();
-
-    assert_eq!(query.values[TARGET].as_deref(), Some(&[B, A][..]));
-    assert_eq!(query.value_admission.capacity(), 0);
-}
-
-#[test]
 fn covering_grouped_set_survives_outer_confirm_without_validation_discharge() {
     let validator_calls = Arc::new(AtomicUsize::new(0));
     let source_confirm_calls = Arc::new(AtomicUsize::new(0));
@@ -305,12 +262,9 @@ fn covering_grouped_set_survives_outer_confirm_without_validation_discharge() {
         root.proposal_coverage(TARGET, VariableSet::new_empty()),
         ProposalCoverage::Covering
     );
-    let mut query = Query::new(root, |_| Some(()));
+    let values: Vec<_> = Query::new(root, |binding| binding.get(TARGET).copied()).collect();
 
-    query.push_next_variable();
-
-    assert_eq!(query.values[TARGET].as_deref(), Some(&[A][..]));
-    assert_eq!(query.value_admission.capacity(), 0);
+    assert_eq!(values, [A]);
     assert_eq!(
         validator_calls.load(Ordering::Relaxed),
         2,
@@ -412,139 +366,14 @@ fn diagnostic_wrappers_forward_the_opaque_receipt() {
     let override_constraint = EstimateOverrideConstraint::new(inner);
     let record = Rc::new(RefCell::new(Vec::new()));
     let debug = DebugConstraint::new(override_constraint, Rc::clone(&record));
-    let mut query = Query::new(debug, |_| Some(()));
-
-    query.push_next_variable();
+    let mut values = Vec::new();
+    let layout = debug.propose_with_layout(
+        TARGET,
+        &RowsView::EMPTY,
+        &mut CandidateSink::Values(&mut values),
+    );
 
     assert_eq!(&*record.borrow(), &[TARGET]);
-    assert_eq!(query.values[TARGET].as_deref(), Some(&[B, A][..]));
-    assert_eq!(query.value_admission.capacity(), 0);
-}
-
-#[derive(Clone, Copy)]
-struct WideSource {
-    len: usize,
-    layout_is_set: bool,
-}
-
-fn ordinal_raw(ordinal: usize) -> RawInline {
-    let mut raw = [0; 32];
-    raw[24..].copy_from_slice(&(ordinal as u64).to_be_bytes());
-    raw
-}
-
-impl Constraint<'static> for WideSource {
-    fn variables(&self) -> VariableSet {
-        VariableSet::new_singleton(TARGET)
-    }
-
-    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-        if variable == TARGET && !bound.is_set(TARGET) {
-            ProposalCoverage::Exact
-        } else {
-            ProposalCoverage::None
-        }
-    }
-
-    fn estimate(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        out: &mut EstimateSink<'_>,
-    ) -> bool {
-        if variable != TARGET {
-            return false;
-        }
-        out.fill(self.len, view.len());
-        true
-    }
-
-    fn propose(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
-        if variable == TARGET {
-            for row in 0..view.len() as u32 {
-                candidates.extend_row(
-                    row,
-                    (0..self.len).map(|ordinal| black_box(ordinal_raw(ordinal))),
-                );
-            }
-        }
-    }
-
-    fn propose_with_layout(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) -> ProposalLayout {
-        self.propose(variable, view, candidates);
-        if self.layout_is_set {
-            ProposalLayout::grouped_set()
-        } else {
-            ProposalLayout::default()
-        }
-    }
-
-    fn confirm(
-        &self,
-        _variable: VariableId,
-        _view: &RowsView<'_>,
-        _candidates: &mut CandidateSink<'_>,
-    ) {
-    }
-
-    fn satisfied(&self, view: &RowsView<'_>) -> bool {
-        view.col(TARGET).is_none_or(|column| {
-            view.iter().all(|row| {
-                row[column][..24].iter().all(|byte| *byte == 0)
-                    && u64::from_be_bytes(row[column][24..].try_into().unwrap()) < self.len as u64
-            })
-        })
-    }
-}
-
-/// Release-only causal probe of the real scalar receipt path. The ABBA order
-/// alternates allocation/thermal drift; no timing threshold is a correctness
-/// condition.
-#[test]
-#[ignore = "release-only scalar GroupedSet receipt timing probe"]
-fn scalar_grouped_set_receipt_release_probe() {
-    assert!(
-        !cfg!(debug_assertions),
-        "run with cargo test --release -- --ignored --nocapture"
-    );
-    const LEN: usize = 1 << 18;
-    const ROUNDS: usize = 6;
-
-    println!("probe=scalar-grouped-set-receipt-v1 base=7bf4ac81 len={LEN} rounds={ROUNDS}");
-    for round in 0..ROUNDS {
-        for (position, layout_is_set) in [false, true, true, false].into_iter().enumerate() {
-            let mut query = Query::new(
-                WideSource {
-                    len: LEN,
-                    layout_is_set,
-                },
-                |_| Some(()),
-            );
-            let start = Instant::now();
-            query.push_next_variable();
-            let elapsed = start.elapsed();
-            assert_eq!(query.values[TARGET].as_ref().unwrap().len(), LEN);
-            if layout_is_set {
-                assert_eq!(query.value_admission.capacity(), 0);
-            } else {
-                assert!(query.value_admission.capacity() >= LEN);
-            }
-            black_box(query.values[TARGET].as_ref().unwrap().as_ptr());
-            println!(
-                "round={round} position={position} layout={} elapsed_ns={}",
-                if layout_is_set { "set" } else { "bag" },
-                elapsed.as_nanos()
-            );
-        }
-    }
+    assert!(layout.is_grouped_set());
+    assert_eq!(values, [B, A]);
 }

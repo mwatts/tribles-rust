@@ -1,9 +1,8 @@
 //! Soundness tests for `UnionConstraint` (`or!`) and the `satisfied()`
 //! protocol law.
 //!
-//! Two shipped bugs motivated these tests, and engine-vs-engine parity
-//! checks could not catch either (both engines share the composite
-//! constraints):
+//! Two shipped bugs motivated these tests, and execution-route parity
+//! could not catch either because every route shares the composite constraints:
 //!
 //! 1. `UnionConstraint::propose` let every variant work on one shared
 //!    scratch vector. A composite variant (an `and!`) filters the sink it
@@ -129,15 +128,18 @@ fn pattern_changes_monotone_growth_keeps_results() {
     let delta2 = delta1.clone() + growth;
 
     let baseline_query =
-        |full: &TribleSet, delta: &TribleSet, sequential: bool| -> HashSet<[u8; 32]> {
+        |full: &TribleSet, delta: &TribleSet, conservative: bool| -> HashSet<[u8; 32]> {
             let query = find!(
             e: Inline<GenId>,
             pattern_changes!(full, delta, [
                 { ?e @ test_ns::rel_r: _?rv, test_ns::rel_s: _?sv }
             ])
             );
-            if sequential {
-                query.sequential().map(|e: Inline<GenId>| e.raw).collect()
+            if conservative {
+                query
+                    .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+                    .map(|e: Inline<GenId>| e.raw)
+                    .collect()
             } else {
                 query.map(|e: Inline<GenId>| e.raw).collect()
             }
@@ -160,12 +162,12 @@ fn pattern_changes_monotone_growth_keeps_results() {
     assert_eq!(
         baseline_query(&full1, &delta1, true),
         ordinary_before,
-        "the ordinary and sequential schedulers must agree before growth"
+        "the production and conservative lowering routes must agree before growth"
     );
     assert_eq!(
         baseline_query(&full2, &delta2, true),
         ordinary_after,
-        "the ordinary and sequential schedulers must agree after growth"
+        "the production and conservative lowering routes must agree after growth"
     );
 
     // Transition programs cannot affect this RPQ-free fixture. Formula scope

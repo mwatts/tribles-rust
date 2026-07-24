@@ -353,17 +353,6 @@ mod tests {
 
         // The candidate is present in E but absent from V. Constant has the
         // smaller estimate, forcing the attached range to confirm it.
-        let sequential: Vec<_> = Query::new(
-            and!(
-                variable.is(candidate),
-                data.value_in_range(variable, min, max)
-            ),
-            move |binding| project(variable.index, binding),
-        )
-        .sequential()
-        .collect();
-        assert!(sequential.is_empty());
-
         let residual: Vec<_> = Query::new(
             and!(
                 variable.is(candidate),
@@ -496,12 +485,6 @@ mod tests {
         assert_eq!(second.examined, 2);
         assert_eq!(second.next, None);
 
-        let mut expected: Vec<_> =
-            Query::new(data.value_in_range(variable, v10, v90), move |binding| {
-                project(variable.index, binding)
-            })
-            .sequential()
-            .collect();
         let mut query = Query::new(data.value_in_range(variable, v10, v90), move |binding| {
             project(variable.index, binding)
         })
@@ -509,9 +492,7 @@ mod tests {
         .cap(1)
         .start_width(1);
         let mut actual: Vec<_> = query.by_ref().collect();
-        expected.sort_unstable();
         actual.sort_unstable();
-        assert_eq!(actual, expected);
         assert_eq!(actual, [v10.raw, v50.raw, v90.raw]);
         assert_eq!(query.stats().delta_source_candidates_examined, 3);
         assert_eq!(query.stats().delta_source_direct_candidates, 3);

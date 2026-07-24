@@ -435,7 +435,7 @@ fn clone_drop_and_duplicate_affine_parents_preserve_exact_sets() {
         &archive,
     ));
     let mut expected: Vec<_> = Query::new(Arc::clone(&root), project_zero)
-        .sequential()
+        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
         .collect();
     expected.sort_unstable();
 
@@ -479,17 +479,19 @@ fn clone_drop_and_duplicate_affine_parents_preserve_exact_sets() {
         ])
     };
     let project = |binding: &Binding| Some((*binding.get(PARENT)?, *binding.get(TARGET)?));
-    let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
     let mut residual: Vec<_> = Query::new(make(), project)
         .solve_residual_state_lazy_with(ResidualLowering::FULL)
         .start_width(1)
         .cap(1)
         .collect();
-    sequential.sort_unstable();
+    let mut affine_expected: Vec<_> = expected
+        .iter()
+        .copied()
+        .map(|target| (parent_value, target))
+        .collect();
+    affine_expected.sort_unstable();
     residual.sort_unstable();
-    assert_eq!(sequential.len(), expected.len());
-    assert!(sequential.iter().all(|(value, _)| *value == parent_value));
-    assert_eq!(residual, sequential);
+    assert_eq!(residual, affine_expected);
 }
 
 #[derive(Clone, Copy)]

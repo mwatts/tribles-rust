@@ -4708,11 +4708,11 @@ mod seeded_frame_tests {
     }
 
     /// The historical import boundary: capture the outer value by adding a
-    /// constant leaf, then start a fresh scalar `Query` from the empty row.
-    /// Keeping this test-only supplies an independent scheduler oracle for the
-    /// private seeded residual frame without retaining nested queries in the
-    /// production RPQ evaluator.
-    fn scalar_nested_eval_oracle(
+    /// constant leaf, then start a fresh conservative root query from the empty
+    /// row. Keeping this test-only exercises the ordinary Constraint route
+    /// independently of the private seeded residual frame without retaining
+    /// nested queries in the production RPQ evaluator.
+    fn root_query_eval_oracle(
         set: &TribleSet,
         expr: &PathExpr,
         start: RawInline,
@@ -4726,11 +4726,11 @@ mod seeded_frame_tests {
             IntersectionConstraint::new(constraints),
             move |binding: &Binding| binding.get(dest.index).copied(),
         )
-        .sequential()
+        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
         .collect()
     }
 
-    fn scalar_nested_exists_oracle(
+    fn root_query_exists_oracle(
         set: &TribleSet,
         expr: &PathExpr,
         start: RawInline,
@@ -4745,11 +4745,11 @@ mod seeded_frame_tests {
             IntersectionConstraint::new(constraints),
             move |binding: &Binding| binding.get(dest.index).copied(),
         )
-        .sequential()
+        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
         .any(|value| value == target)
     }
 
-    fn scalar_nested_selfloop_oracle(set: &TribleSet, expr: &PathExpr) -> HashSet<RawInline> {
+    fn root_query_selfloop_oracle(set: &TribleSet, expr: &PathExpr) -> HashSet<RawInline> {
         let mut ctx = VariableContext::new();
         let start = ctx.next_variable::<GenId>();
         let mut constraints: Vec<Box<dyn Constraint<'static> + 'static>> = Vec::new();
@@ -4761,7 +4761,7 @@ mod seeded_frame_tests {
             IntersectionConstraint::new(constraints),
             move |binding: &Binding| binding.get(start.index).copied(),
         )
-        .sequential()
+        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
         .collect()
     }
 
@@ -4791,14 +4791,14 @@ mod seeded_frame_tests {
             for &start in &graph.nodes {
                 assert_eq!(
                     eval_from(&graph.set, chain, &start),
-                    scalar_nested_eval_oracle(&graph.set, chain, start),
+                    root_query_eval_oracle(&graph.set, chain, start),
                 );
             }
         }
     }
 
     #[test]
-    fn seeded_exists_frame_matches_nested_scalar_query() {
+    fn seeded_exists_frame_matches_conservative_root_query() {
         let graph = GraphFixture::new();
         let chain = concat(
             PathExpr::Attr(graph.primary),
@@ -4809,7 +4809,7 @@ mod seeded_frame_tests {
             for &target in &graph.nodes {
                 assert_eq!(
                     has_path(&graph.set, &chain, &start, &target),
-                    scalar_nested_exists_oracle(&graph.set, &chain, start, target),
+                    root_query_exists_oracle(&graph.set, &chain, start, target),
                 );
             }
         }
@@ -4818,7 +4818,7 @@ mod seeded_frame_tests {
     }
 
     #[test]
-    fn seeded_selfloop_frame_matches_nested_scalar_query() {
+    fn seeded_selfloop_frame_matches_conservative_root_query() {
         let graph = GraphFixture::new();
         let chains = [
             concat(
@@ -4838,7 +4838,7 @@ mod seeded_frame_tests {
         for chain in &chains {
             assert_eq!(
                 eval_selfloop_join(&graph.set, chain),
-                scalar_nested_selfloop_oracle(&graph.set, chain),
+                root_query_selfloop_oracle(&graph.set, chain),
             );
         }
     }
@@ -4850,7 +4850,7 @@ mod seeded_frame_tests {
             PathExpr::Attr(graph.primary),
             PathExpr::InverseAttr(graph.secondary),
         );
-        let expected = scalar_nested_eval_oracle(&graph.set, &chain, graph.nodes[0]);
+        let expected = root_query_eval_oracle(&graph.set, &chain, graph.nodes[0]);
 
         for _ in 0..26 {
             assert_eq!(eval_from(&graph.set, &chain, &graph.nodes[0]), expected);

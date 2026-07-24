@@ -1,4 +1,4 @@
-//! Executable representability and scheduler-parity probes for query constraints.
+//! Executable representability and execution-parity probes for query constraints.
 //!
 //! These fixtures deliberately distinguish a canonical structural control key
 //! from activation-private affine state. These fixtures explicitly include
@@ -57,12 +57,13 @@ fn combined_effects() -> ResidualLowering {
     ResidualLowering::new(FormulaScope::UnionLeaves, ProgramScope::All)
 }
 
-/// Runs the stable schedulers around one replaceable residual-capability seam.
+/// Runs the stable execution shapes around one replaceable
+/// residual-capability seam.
 ///
 /// Union/RPQ lowering experiments can swap only `run_residual`; the oracle and
-/// all surrounding engine comparisons remain unchanged, so capability work
+/// all surrounding execution-route comparisons remain unchanged, so capability work
 /// does not proliferate public solver entry points or bespoke fixtures.
-fn assert_scheduler_matrix<'a, C, P, R, Make>(label: &str, expected: Vec<R>, make_query: Make)
+fn assert_route_matrix<'a, C, P, R, Make>(label: &str, expected: Vec<R>, make_query: Make)
 where
     C: Constraint<'a> + Clone + Send + 'a,
     P: Fn(&Binding) -> Option<R> + Clone + Send,
@@ -70,12 +71,11 @@ where
     Make: Fn() -> Query<C, P, R>,
 {
     let expected = multiset(expected);
-    let assert_engine = |engine: &str, actual: Vec<R>| {
-        assert_eq!(multiset(actual), expected, "{label}: {engine}");
+    let assert_route = |route: &str, actual: Vec<R>| {
+        assert_eq!(multiset(actual), expected, "{label}: {route}");
     };
 
-    assert_engine("sequential", make_query().sequential().collect());
-    assert_engine("ordinary residual-default", make_query().collect());
+    assert_route("ordinary residual-default", make_query().collect());
 
     let mut residual = make_query().solve_residual_state_lazy_with(combined_effects());
     let first = residual.next();
@@ -85,7 +85,7 @@ where
         "{label}: residual first-result liveness"
     );
     let resumed = first.into_iter().chain(residual).collect();
-    assert_engine("residual after first pull", resumed);
+    assert_route("residual after first pull", resumed);
 
     // This is the single integration seam for every fixture below. Composite
     // effects are selected together; adding another structural capability
@@ -95,15 +95,15 @@ where
             .solve_residual_state_lazy_with(combined_effects())
             .collect()
     };
-    assert_engine("combined residual capability", run_residual(make_query()));
+    assert_route("combined residual capability", run_residual(make_query()));
 
     #[cfg(feature = "parallel")]
     {
-        assert_engine(
+        assert_route(
             "ordinary parallel residual",
             make_query().into_par_iter().collect::<Vec<_>>(),
         );
-        assert_engine(
+        assert_route(
             "parallel residual",
             make_query()
                 .solve_residual_state_lazy_with(combined_effects())
@@ -147,7 +147,7 @@ fn union_dead_arms_are_row_local_and_duplicate_activations_are_affine() {
         (activation_2_v, a_v, y_a_v),
         (activation_3_v, b_v, y_b_v),
     ];
-    assert_scheduler_matrix("row-varying-dead-union-arm", expected, || {
+    assert_route_matrix("row-varying-dead-union-arm", expected, || {
         find!((activation: Inline<GenId>, x: Inline<GenId>, y: Inline<GenId>),
             and!(
                 pattern!(&activations, [{ ?activation @ parity::activates: ?x }]),
@@ -168,7 +168,7 @@ fn union_confirm_deduplicates_equal_candidates_within_one_parent() {
     let candidates = [a_v, a_v];
     let candidates = SortedSlice::new(&candidates).unwrap();
 
-    assert_scheduler_matrix("union-confirm-deduplicates-one-parent", vec![a_v], || {
+    assert_route_matrix("union-confirm-deduplicates-one-parent", vec![a_v], || {
         find!(x: Inline<GenId>, {
             let mut source = EstimateOverrideConstraint::new(candidates.has(x));
             source.set_estimate(x.index, 0);
@@ -220,7 +220,7 @@ fn rpq_plus_deduplicates_witnesses_not_outer_activations() {
         (activation_3_v, b_v, b_v),
         (activation_3_v, b_v, c_v),
     ];
-    assert_scheduler_matrix("rpq-plus-affine-fixpoint", expected, || {
+    assert_route_matrix("rpq-plus-affine-fixpoint", expected, || {
         find!(
             (
                 activation: Inline<GenId>,
@@ -249,7 +249,7 @@ fn rpq_confirm_equal_candidates_collapse_at_projection() {
     let target_candidates = [target_v, target_v];
     let target_candidates = SortedSlice::new(&target_candidates).unwrap();
 
-    assert_scheduler_matrix(
+    assert_route_matrix(
         "rpq-confirm-preserves-candidate-occurrences",
         vec![(source_v, target_v)],
         || {
@@ -288,7 +288,7 @@ fn finite_union_and_cyclic_rpq_coexist_in_one_root() {
     insert_edge(&mut graph, &d, &c);
 
     let expected = vec![(a_v, a_v), (a_v, b_v), (a_v, c_v), (d_v, c_v)];
-    assert_scheduler_matrix("finite-union-plus-cyclic-rpq", expected, || {
+    assert_route_matrix("finite-union-plus-cyclic-rpq", expected, || {
         find!(
             (source: Inline<GenId>, target: Inline<GenId>),
             and!(

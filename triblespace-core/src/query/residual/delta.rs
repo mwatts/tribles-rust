@@ -11578,14 +11578,14 @@ mod tests {
         assert!(fused.scheduler.is_empty());
 
         let mut fused_feedback =
-            ResidualStateMachine::new(fused.root.variables(), fused.plan.len(), Search::Done);
+            ResidualStateMachine::new(fused.root.variables(), fused.plan.len(), None);
         fused_feedback.width = 8;
         fused_feedback.cap = 64;
         fused_feedback.account_delta_feedback(&fused_outcome.outcome);
 
         let mut unfused = ReceiptProbeHarness::new(ReceiptProbeMode::DuplicateChronology, 4);
         let mut unfused_feedback =
-            ResidualStateMachine::new(unfused.root.variables(), unfused.plan.len(), Search::Done);
+            ResidualStateMachine::new(unfused.root.variables(), unfused.plan.len(), None);
         unfused_feedback.width = 8;
         unfused_feedback.cap = 64;
         for _ in 0..8 {
@@ -11737,7 +11737,7 @@ mod tests {
         assert_eq!(fused_outcome.outcome.transition_dead_pages, 1);
 
         let mut fused_feedback =
-            ResidualStateMachine::new(fused.root.variables(), fused.plan.len(), Search::Done);
+            ResidualStateMachine::new(fused.root.variables(), fused.plan.len(), None);
         fused_feedback.width = 2;
         fused_feedback.cap = 64;
         fused_feedback.account_delta_feedback(&fused_outcome.outcome);
@@ -11745,7 +11745,7 @@ mod tests {
         let mut unfused = ReceiptProbeHarness::new(ReceiptProbeMode::DuplicateDeadTail, 2);
         unfused.preaccept(value(2));
         let mut unfused_feedback =
-            ResidualStateMachine::new(unfused.root.variables(), unfused.plan.len(), Search::Done);
+            ResidualStateMachine::new(unfused.root.variables(), unfused.plan.len(), None);
         unfused_feedback.width = 2;
         unfused_feedback.cap = 64;
         for _ in 0..4 {
@@ -11780,14 +11780,14 @@ mod tests {
         assert_eq!(fused_outcome.outcome.transition_dead_pages, 0);
 
         let mut fused_feedback =
-            ResidualStateMachine::new(fused.root.variables(), fused.plan.len(), Search::Done);
+            ResidualStateMachine::new(fused.root.variables(), fused.plan.len(), None);
         fused_feedback.width = 2;
         fused_feedback.cap = 64;
         fused_feedback.account_delta_feedback(&fused_outcome.outcome);
 
         let mut unfused = ReceiptProbeHarness::new(ReceiptProbeMode::TransitionThenSourceDead, 2);
         let mut unfused_feedback =
-            ResidualStateMachine::new(unfused.root.variables(), unfused.plan.len(), Search::Done);
+            ResidualStateMachine::new(unfused.root.variables(), unfused.plan.len(), None);
         unfused_feedback.width = 2;
         unfused_feedback.cap = 64;
         for _ in 0..4 {
@@ -14815,7 +14815,7 @@ mod tests {
         assert_eq!(second_publication.origins.as_slice(), [parent.activation]);
         publication.append(second_publication);
 
-        let mut machine = ResidualStateMachine::new(terminal_positive_full(), 1, Search::Done);
+        let mut machine = ResidualStateMachine::new(terminal_positive_full(), 1, None);
         machine.stage_direct_terminal_publication(publication);
         assert_eq!(machine.emit_rows, [first, second]);
         assert_eq!(
@@ -19355,7 +19355,7 @@ mod tests {
             1
         );
 
-        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
         machine.width = 4;
         machine.cap = 64;
         machine.accept_delta_step(outcome);

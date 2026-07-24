@@ -559,17 +559,12 @@ mod tests {
         assert_eq!(second.examined, 2);
         assert_eq!(second.next, Some(ResidualDeltaSourceCursor::Offset(3)));
 
-        let mut expected: Vec<_> = Query::new(SortedSliceConstraint::new(variable, slice), project)
-            .sequential()
-            .collect();
         let mut query = Query::new(SortedSliceConstraint::new(variable, slice), project)
             .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .cap(1)
             .start_width(1);
         let mut actual: Vec<_> = query.by_ref().collect();
-        expected.sort_unstable();
         actual.sort_unstable();
-        assert_eq!(actual, expected);
         assert_eq!(actual, [value(1).raw, value(2).raw, value(3).raw]);
         assert_eq!(query.stats().propose_calls, 1);
         assert_eq!(query.stats().delta_source_pages, values.len());
@@ -627,16 +622,14 @@ mod tests {
             .collect();
         assert!(encoded.windows(2).all(|pair| pair[0] > pair[1]));
 
-        let mut expected: Vec<_> = Query::new(SortedSliceConstraint::new(variable, slice), project)
-            .sequential()
-            .collect();
         let mut query = Query::new(SortedSliceConstraint::new(variable, slice), project)
             .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .cap(1)
             .start_width(1);
         let mut actual: Vec<_> = query.by_ref().collect();
-        expected.sort_unstable();
         actual.sort_unstable();
+        let mut expected = encoded;
+        expected.sort_unstable();
         assert_eq!(actual, expected);
         assert_eq!(query.stats().delta_source_candidates_examined, values.len());
         assert_eq!(query.stats().delta_source_direct_candidates, values.len());
@@ -656,15 +649,12 @@ mod tests {
             ])
         };
 
-        let mut expected: Vec<_> = Query::new(make(), project).sequential().collect();
         let mut query = Query::new(make(), project)
             .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .cap(1)
             .start_width(1);
         let mut actual: Vec<_> = query.by_ref().collect();
-        expected.sort_unstable();
         actual.sort_unstable();
-        assert_eq!(actual, expected);
         assert_eq!(actual, [value(1).raw, value(2).raw, value(3).raw]);
         assert_eq!(query.stats().delta_source_direct_candidates, 5);
         assert_eq!(query.stats().delta_source_roots, 0);

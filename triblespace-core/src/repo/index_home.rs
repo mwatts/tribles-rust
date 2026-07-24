@@ -2911,7 +2911,7 @@ mod tests {
                 .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
                 .collect()
         } else {
-            query.sequential().collect()
+            query.collect()
         }
     }
 

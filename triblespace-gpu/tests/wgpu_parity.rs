@@ -654,17 +654,28 @@ fn wgpu_query_parallel_residual_matches_canonical_cpu_archive() {
     let entity = Inline::new(entity_value(&identity));
     let attribute = Inline::new(attribute_value(&identity));
     let allowed: HashSet<_> = values[..8].iter().copied().collect();
-    let parents = HashSet::from([
-        Id::new(trible(0xD46A_DA62, 0).data[..16].try_into().unwrap()).unwrap(),
-        Id::new(trible(0xD46A_DA62, 1).data[..16].try_into().unwrap()).unwrap(),
-    ]);
+    let parent_rows = [trible(0xD46A_DA62, 0), trible(0xD46A_DA62, 1)];
+    let parent_values = parent_rows.map(|row| entity_value(&row));
+    let parents: HashSet<_> = parent_rows
+        .iter()
+        .map(|row| Id::new(row.data[..16].try_into().unwrap()).unwrap())
+        .collect();
 
     // Production directed-action pricing naturally selects the eight-value
     // hash set as the proposal source and the 512-value Succinct occurrence as
     // its confirmer. The independent parent variable binds first, leaving a
     // real multi-row residual frontier; no estimate or lowering override is
     // involved.
-    let expected = {
+    let mut expected: Vec<_> = parent_values
+        .iter()
+        .flat_map(|&parent| values[..8].iter().map(move |value| (parent, value.raw)))
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(expected.len(), parents.len() * allowed.len());
+
+    // The CPU archive remains a useful execution control, but the fixture's
+    // direct Cartesian relation is the oracle rather than another solver lane.
+    let cpu = {
         let mut context = VariableContext::new();
         let parent: Variable<GenId> = context.next_variable();
         let value: Variable<UnknownInline> = context.next_variable();
@@ -676,11 +687,11 @@ fn wgpu_query_parallel_residual_matches_canonical_cpu_archive() {
             ),
             move |binding| Some((*binding.get(parent.index)?, *binding.get(value.index)?)),
         );
-        let mut rows = query.sequential().collect::<Vec<_>>();
+        let mut rows = query.collect::<Vec<_>>();
         rows.sort_unstable();
         rows
     };
-    assert_eq!(expected.len(), parents.len() * allowed.len());
+    assert_eq!(cpu, expected);
 
     let gpu = WgpuSuccinctArchive::new(archive)
         .unwrap()

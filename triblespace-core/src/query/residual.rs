@@ -4583,10 +4583,10 @@ impl QuotedRowBatch {
 /// Physical candidate representation, kept outside canonical state identity.
 ///
 /// A live one-parent payload has no row-coordinate information to preserve, so
-/// it stores the same plain value vector as the scalar DFS. Multi-parent
-/// payloads use the block-native tagged COO representation. The scheduler
-/// promotes only when independently affine parent domains reconverge and
-/// normalizes back after a split or compaction leaves one parent.
+/// it stores a plain value vector. Multi-parent payloads use the block-native
+/// tagged COO representation. The solver promotes only when independently
+/// affine parent domains reconverge and normalizes back after a split or
+/// compaction leaves one parent.
 #[derive(Clone, Debug)]
 enum CandidatePayload {
     Values(Vec<RawInline>),
@@ -20961,11 +20961,8 @@ mod tests {
                 ProgramScope::Disabled,
             ))
             .collect();
-        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
         residual.sort_unstable();
-        sequential.sort_unstable();
         assert_eq!(residual, [(raw(0), raw(0)), (raw(2), raw(0))]);
-        assert_eq!(residual, sequential);
     }
 
     #[test]
@@ -22510,13 +22507,12 @@ mod tests {
     }
 
     #[test]
-    fn full_switch_routes_every_live_relational_shape_to_residual() {
+    fn ordinary_query_materializes_residual_state_for_every_relational_shape() {
         fn assert_residual<C>(root: C)
         where
             C: Constraint<'static> + 'static,
         {
             let mut query = Query::new(root, |_| Some(()));
-            assert_eq!(query.scheduler, QueryScheduler::ResidualState);
             let _ = query.next();
             assert!(query.residual.is_some());
         }
@@ -22531,12 +22527,10 @@ mod tests {
         assert_residual(UnionConstraint::new(vec![source(0), source(0)]));
 
         let mut true_constant = Query::new(ZeroVariableTruth(true), |_| Some(()));
-        assert_eq!(true_constant.scheduler, QueryScheduler::ResidualState);
         assert_eq!(true_constant.next(), Some(()));
         assert!(true_constant.residual.is_some());
 
         let mut false_constant = Query::new(ZeroVariableTruth(false), |_| Some(()));
-        assert_eq!(false_constant.scheduler, QueryScheduler::ResidualState);
         assert_eq!(false_constant.next(), None);
         assert!(false_constant.residual.is_none());
     }
@@ -22548,7 +22542,6 @@ mod tests {
                 vec![Box::new(ZeroVariableTruth(false)) as ShapeConstraint],
             );
         let mut false_query = Query::new(false_root, |_| Some(()));
-        assert_eq!(false_query.scheduler, QueryScheduler::ResidualState);
         assert_eq!(false_query.next(), None);
         assert!(false_query.residual.is_none());
 
@@ -22564,7 +22557,6 @@ mod tests {
         };
         let project = |binding: &Binding| binding.get(0).copied();
         let mut ordinary = Query::new(make_true_and_one_real(), project);
-        assert_eq!(ordinary.scheduler, QueryScheduler::ResidualState);
         let mut ordinary_bag: Vec<_> = ordinary.by_ref().collect();
         assert!(ordinary.residual.is_some());
         let mut expected_bag = values.as_ref().clone();
@@ -22583,11 +22575,10 @@ mod tests {
             shape_leaf(0),
         ]);
         let mut false_overlapping = Query::new(false_overlapping, |_| Some(()));
-        assert_eq!(false_overlapping.scheduler, QueryScheduler::ResidualState);
         assert_eq!(false_overlapping.next(), None);
         assert!(false_overlapping.residual.is_none());
         let debug = format!("{false_overlapping:?}");
-        assert!(debug.contains("scheduler: ResidualState"), "{debug}");
+        assert!(debug.contains("seed: None"), "{debug}");
         assert!(debug.contains("residual_started: false"), "{debug}");
     }
 
@@ -25199,16 +25190,14 @@ mod tests {
             variable: 0,
             values: Arc::new(vec![raw(1), raw(2), raw(2)]),
         };
-        let mut atom_expected: Vec<_> = Query::new(atom(), project).sequential().collect();
         let mut atom_actual: Vec<_> = Query::new(atom(), project)
             .solve_residual_state_lazy_with(ResidualLowering::new(
                 FormulaScope::WholeRoot,
                 ProgramScope::Disabled,
             ))
             .collect();
-        atom_expected.sort_unstable();
         atom_actual.sort_unstable();
-        assert_eq!(atom_actual, atom_expected);
+        assert_eq!(atom_actual, [raw(1), raw(2)]);
 
         let union = || {
             UnionConstraint::new(vec![
@@ -25222,16 +25211,13 @@ mod tests {
                 }) as ShapeConstraint,
             ])
         };
-        let mut union_expected: Vec<_> = Query::new(union(), project).sequential().collect();
         let mut union_actual: Vec<_> = Query::new(union(), project)
             .solve_residual_state_lazy_with(ResidualLowering::new(
                 FormulaScope::WholeRoot,
                 ProgramScope::Disabled,
             ))
             .collect();
-        union_expected.sort_unstable();
         union_actual.sort_unstable();
-        assert_eq!(union_actual, union_expected);
         assert_eq!(union_actual, [raw(1), raw(2), raw(3)]);
 
         let alternating = || {
@@ -25262,17 +25248,13 @@ mod tests {
                 }) as ShapeConstraint,
             ])
         };
-        let mut alternating_expected: Vec<_> =
-            Query::new(alternating(), project).sequential().collect();
         let mut alternating_actual: Vec<_> = Query::new(alternating(), project)
             .solve_residual_state_lazy_with(ResidualLowering::new(
                 FormulaScope::WholeRoot,
                 ProgramScope::Disabled,
             ))
             .collect();
-        alternating_expected.sort_unstable();
         alternating_actual.sort_unstable();
-        assert_eq!(alternating_actual, alternating_expected);
         assert_eq!(alternating_actual, [raw(3)]);
     }
 
@@ -25333,8 +25315,7 @@ mod tests {
             }) as ShapeConstraint,
         ]));
         let mut query = Query::new(root, |binding: &Binding| binding.get(0).copied())
-            .residual_lowering(ResidualLowering::CONSERVATIVE)
-            .residual_state_scheduler();
+            .residual_lowering(ResidualLowering::CONSERVATIVE);
 
         assert_eq!(query.next(), Some(raw(63)));
         let runtime = query.residual.as_deref().expect("residual cursor started");
@@ -25402,8 +25383,7 @@ mod tests {
             variable: 0,
             values: Arc::new(values),
         });
-        let mut query = Query::new(root, |binding: &Binding| binding.get(0).copied())
-            .residual_state_scheduler();
+        let mut query = Query::new(root, |binding: &Binding| binding.get(0).copied());
 
         assert!(query.next().is_some());
         query
@@ -25520,7 +25500,6 @@ mod tests {
             ])
         };
         let project = |binding: &Binding| binding.get(0).copied();
-        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
         let mut cap_one: Vec<_> = Query::new(make(), project)
             .solve_residual_state_lazy()
             .cap(1)
@@ -25529,12 +25508,10 @@ mod tests {
             .solve_residual_state_lazy()
             .cap(64)
             .collect();
-        sequential.sort_unstable();
         cap_one.sort_unstable();
         geometric.sort_unstable();
-        assert_eq!(sequential, [raw(0), raw(1), raw(2)]);
-        assert_eq!(cap_one, sequential);
-        assert_eq!(geometric, sequential);
+        assert_eq!(cap_one, [raw(0), raw(1), raw(2)]);
+        assert_eq!(geometric, [raw(0), raw(1), raw(2)]);
     }
 
     #[test]
@@ -25595,13 +25572,8 @@ mod tests {
             .start_width(1)
             .growth(2)
             .collect();
-        let mut sequential: Vec<_> = Query::new(make(Arc::new(Mutex::new(Vec::new()))), project)
-            .sequential()
-            .collect();
         residual.sort_unstable();
-        sequential.sort_unstable();
         assert_eq!(residual, (0..8).step_by(2).map(raw).collect::<Vec<_>>());
-        assert_eq!(residual, sequential);
     }
 
     #[test]
@@ -25636,19 +25608,8 @@ mod tests {
         .solve_residual_state_lazy()
         .cap(1)
         .collect();
-        let mut sequential: Vec<_> = Query::new(
-            make(
-                Arc::new(Mutex::new(Vec::new())),
-                Arc::new(Mutex::new(Vec::new())),
-            ),
-            project,
-        )
-        .sequential()
-        .collect();
         residual.sort_unstable();
-        sequential.sort_unstable();
         assert_eq!(residual, [raw(1)]);
-        assert_eq!(residual, sequential);
         assert_candidate_page_partition(&per_row_calls, 3);
         assert_candidate_page_partition(&suffix_calls, 1);
 
@@ -25733,27 +25694,15 @@ mod tests {
         .solve_residual_state_lazy()
         .cap(1)
         .collect();
-        let mut sequential: Vec<_> = Query::new(
-            make(
-                Arc::new(Mutex::new(Vec::new())),
-                Arc::new(Mutex::new(Vec::new())),
-                Arc::new(Mutex::new(Vec::new())),
-            ),
-            project,
-        )
-        .sequential()
-        .collect();
         residual.sort_unstable();
-        sequential.sort_unstable();
         assert_eq!(residual, [raw(0), raw(1)]);
-        assert_eq!(residual, sequential);
         assert_candidate_page_partition(&left_calls, 3);
         assert_candidate_page_partition(&right_calls, 3);
         assert_candidate_page_partition(&suffix_calls, 2);
     }
 
     #[test]
-    fn finite_union_proposal_matches_sequential_and_opaque_residual() {
+    fn finite_union_proposal_matches_opaque_residual() {
         let make = || {
             UnionConstraint::new(vec![
                 FanoutLeaf {
@@ -25767,7 +25716,6 @@ mod tests {
             ])
         };
         let project = |binding: &Binding| binding.get(0).copied();
-        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
         let mut opaque: Vec<_> = Query::new(make(), project)
             .solve_residual_state_lazy()
             .collect();
@@ -25779,11 +25727,9 @@ mod tests {
             ))
             .shadow(epoch)
             .collect_profiled();
-        sequential.sort_unstable();
         opaque.sort_unstable();
         lowered.results.sort_unstable();
         assert_eq!(lowered.results, [raw(1), raw(2), raw(3)]);
-        assert_eq!(lowered.results, sequential);
         assert_eq!(lowered.results, opaque);
 
         // Entering the lowered formula is planning. Every direct OR child has
@@ -25843,9 +25789,6 @@ mod tests {
         };
         let project = |binding: &Binding| binding.get(0).copied();
         let fresh = || Arc::new(Mutex::new(Vec::new()));
-        let mut sequential: Vec<_> = Query::new(make(fresh(), fresh()), project)
-            .sequential()
-            .collect();
         let mut opaque: Vec<_> = Query::new(make(fresh(), fresh()), project)
             .solve_residual_state_lazy()
             .collect();
@@ -25860,11 +25803,9 @@ mod tests {
             ProgramScope::Disabled,
         ))
         .collect();
-        sequential.sort_unstable();
         opaque.sort_unstable();
         lowered.sort_unstable();
         assert_eq!(lowered, [raw(0), raw(1)]);
-        assert_eq!(lowered, sequential);
         assert_eq!(lowered, opaque);
         assert_candidate_page_partition(&left_calls, 3);
         assert_candidate_page_partition(&right_calls, 3);
@@ -25905,12 +25846,6 @@ mod tests {
         };
         let project =
             |binding: &Binding| Some((binding.get(0).copied()?, binding.get(1).copied()?));
-        let mut sequential: Vec<_> = Query::new(
-            make(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))),
-            project,
-        )
-        .sequential()
-        .collect();
         let mut lowered = Query::new(
             make(Arc::clone(&left_rows), Arc::clone(&right_rows)),
             project,
@@ -25923,10 +25858,8 @@ mod tests {
         .start_width(2)
         .growth(1)
         .collect_profiled();
-        sequential.sort_unstable();
         lowered.results.sort_unstable();
         assert_eq!(lowered.results, [(raw(0), raw(10)), (raw(1), raw(20))]);
-        assert_eq!(lowered.results, sequential);
         assert_eq!(left_rows.load(Ordering::Relaxed), 1);
         assert_eq!(right_rows.load(Ordering::Relaxed), 1);
         // SET projection removes duplicate terminal pulls from the demand
@@ -25965,17 +25898,14 @@ mod tests {
         };
         let project =
             |binding: &Binding| Some((binding.get(0).copied()?, binding.get(1).copied()?));
-        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
         let mut lowered: Vec<_> = Query::new(make(), project)
             .solve_residual_state_lazy_with(ResidualLowering::new(
                 FormulaScope::UnionLeaves,
                 ProgramScope::Disabled,
             ))
             .collect();
-        sequential.sort_unstable();
         lowered.sort_unstable();
         assert_eq!(lowered, [(raw(7), raw(1))]);
-        assert_eq!(lowered, sequential);
     }
 
     #[test]
@@ -26194,16 +26124,6 @@ mod tests {
         let variable = Variable::<UnknownInline>::new(0);
         let project = |binding: &Binding| binding.get(variable.index).copied();
 
-        let plain = |constant_first| {
-            let source =
-                Box::new(SortedSlice::new(values).unwrap().has(variable)) as ShapeConstraint;
-            let constant = Box::new(variable.is(a)) as ShapeConstraint;
-            IntersectionConstraint::new(if constant_first {
-                vec![constant, source]
-            } else {
-                vec![source, constant]
-            })
-        };
         let trapped = |constant_first| {
             let source = Box::new(ProgramActionTrap {
                 inner: SortedSlice::new(values).unwrap().has(variable),
@@ -26218,10 +26138,6 @@ mod tests {
             })
         };
 
-        let mut sequential_source_first: Vec<_> =
-            Query::new(plain(false), project).sequential().collect();
-        let mut sequential_constant_first: Vec<_> =
-            Query::new(plain(true), project).sequential().collect();
         let mut residual_source_first: Vec<_> = Query::new(trapped(false), project)
             .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .collect();
@@ -26229,18 +26145,14 @@ mod tests {
             .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .collect();
 
-        sequential_source_first.sort_unstable();
-        sequential_constant_first.sort_unstable();
         residual_source_first.sort_unstable();
         residual_constant_first.sort_unstable();
 
         // The constant's estimate of one wins over the two-occurrence source.
         // Confirmation is filter-only, and terminal SET projection contains
         // one raw row regardless of which child is stored first.
-        assert_eq!(sequential_source_first, vec![raw(7)]);
-        assert_eq!(sequential_constant_first, sequential_source_first);
-        assert_eq!(residual_source_first, sequential_source_first);
-        assert_eq!(residual_constant_first, sequential_source_first);
+        assert_eq!(residual_source_first, vec![raw(7)]);
+        assert_eq!(residual_constant_first, vec![raw(7)]);
     }
 
     fn preferred_fanout(
@@ -26322,7 +26234,9 @@ mod tests {
             Box::new(RegularPathConstraint::new(graph.clone(), start, end, &ops))
                 as ShapeConstraint,
         ]);
-        let mut oracle: Vec<_> = Query::new(oracle_root, project).sequential().collect();
+        let mut oracle: Vec<_> = Query::new(oracle_root, project)
+            .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+            .collect();
         residual.sort_unstable();
         oracle.sort_unstable();
         assert_eq!(residual, oracle);
@@ -26360,8 +26274,9 @@ mod tests {
             Box::new(RegularPathConstraint::new(graph.clone(), start, end, &ops))
                 as ShapeConstraint,
         ]);
-        let mut inverse_expected: Vec<_> =
-            Query::new(inverse_oracle, project).sequential().collect();
+        let mut inverse_expected: Vec<_> = Query::new(inverse_oracle, project)
+            .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+            .collect();
         inverse.sort_unstable();
         inverse_expected.sort_unstable();
         assert_eq!(inverse, inverse_expected);
@@ -26395,7 +26310,9 @@ mod tests {
                 &alternate_ops,
             )) as ShapeConstraint,
         ]);
-        let mut expected: Vec<_> = Query::new(support_oracle, project).sequential().collect();
+        let mut expected: Vec<_> = Query::new(support_oracle, project)
+            .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+            .collect();
         supported.sort_unstable();
         expected.sort_unstable();
         assert_eq!(supported, expected);
@@ -26512,7 +26429,7 @@ mod tests {
                 )) as ShapeConstraint);
                 let mut expected: Vec<_> =
                     Query::new(IntersectionConstraint::new(oracle_children), project)
-                        .sequential()
+                        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
                         .collect();
                 actual.sort_unstable();
                 expected.sort_unstable();
@@ -26694,7 +26611,9 @@ mod tests {
             Box::new(RegularPathConstraint::new(graph, variable, variable, &ops))
                 as ShapeConstraint,
         ]);
-        let mut expected: Vec<_> = Query::new(oracle, project).sequential().collect();
+        let mut expected: Vec<_> = Query::new(oracle, project)
+            .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+            .collect();
         // Confirm still receives and filters the unsorted duplicate occurrence
         // stream; only the public terminal gate collapses its raw projection.
         let mut exact_set = vec![id_into_value(&accepted_c), id_into_value(&accepted_a)];
@@ -26991,7 +26910,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_terminal_rpq_matches_sparse_and_sequential_across_path_shapes() {
+    fn typed_terminal_rpq_matches_sparse_and_conservative_across_path_shapes() {
         use crate::debug::query::EstimateOverrideConstraint;
         use crate::id::{id_into_value, ExclusiveId, Id};
         use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
@@ -27120,8 +27039,8 @@ mod tests {
         ];
 
         for (name, ops) in cases {
-            let mut sequential: Vec<_> = Query::new_projected(make(&ops), [0, 2], project)
-                .sequential()
+            let mut conservative: Vec<_> = Query::new_projected(make(&ops), [0, 2], project)
+                .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
                 .collect();
             let mut typed = Query::new_projected(make(&ops), [0, 2], project)
                 .solve_residual_state_lazy_with(ResidualLowering::new(
@@ -27143,11 +27062,11 @@ mod tests {
             sparse.state.eager_terminal_phase_enabled = false;
             let mut sparse = sparse.collect_profiled();
 
-            sequential.sort_unstable();
+            conservative.sort_unstable();
             typed.results.sort_unstable();
             sparse.results.sort_unstable();
-            assert_eq!(typed.results, sequential, "typed mismatch for {name}");
-            assert_eq!(sparse.results, sequential, "sparse mismatch for {name}");
+            assert_eq!(typed.results, conservative, "typed mismatch for {name}");
+            assert_eq!(sparse.results, conservative, "sparse mismatch for {name}");
             assert!(
                 typed.stats.delta_terminal_eager_cohort_admissions > 0,
                 "{name} never entered the complete Program phase: {:#?}",
@@ -27158,7 +27077,7 @@ mod tests {
                 "forced sparse control entered the eager phase for {name}"
             );
 
-            let expected = sequential.clone();
+            let expected = conservative.clone();
             let mut clone_source = Query::new_projected(Arc::new(make(&ops)), [0, 2], project)
                 .solve_residual_state_lazy_with(ResidualLowering::new(
                     FormulaScope::OpaqueLeaves,
@@ -27334,7 +27253,6 @@ mod tests {
                 ])
             };
 
-            let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
             let mut complete = Query::new(make(), project)
                 .solve_residual_state_lazy_with(ResidualLowering::new(
                     FormulaScope::OpaqueLeaves,
@@ -27356,10 +27274,8 @@ mod tests {
             let mut sparse = sparse.collect_profiled();
 
             expected.sort_unstable();
-            sequential.sort_unstable();
             complete.results.sort_unstable();
             sparse.results.sort_unstable();
-            assert_eq!(sequential, expected, "sequential tuple mismatch for {name}");
             assert_eq!(complete.results, expected, "complete mismatch for {name}");
             assert_eq!(
                 sparse.results, expected,
@@ -27391,17 +27307,14 @@ mod tests {
             }])
         };
         let project = |binding: &Binding| binding.get(0).copied();
-        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
         let mut lowered: Vec<_> = Query::new(make(), project)
             .solve_residual_state_lazy_with(ResidualLowering::new(
                 FormulaScope::UnionLeaves,
                 ProgramScope::Disabled,
             ))
             .collect();
-        sequential.sort_unstable();
         lowered.sort_unstable();
         assert_eq!(lowered, [raw(4), raw(5)]);
-        assert_eq!(lowered, sequential);
     }
 
     #[test]
@@ -27497,17 +27410,14 @@ mod tests {
             ])
         };
         let project = |binding: &Binding| binding.get(0).copied();
-        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
         let mut lowered = Query::new(make(), project)
             .solve_residual_state_lazy_with(ResidualLowering::new(
                 FormulaScope::UnionLeaves,
                 ProgramScope::Disabled,
             ))
             .collect_profiled();
-        sequential.sort_unstable();
         lowered.results.sort_unstable();
         assert_eq!(lowered.results, [raw(1), raw(3)]);
-        assert_eq!(lowered.results, sequential);
         assert_eq!(lowered.stats.propose_calls, 2);
         assert_eq!(lowered.stats.confirm_calls, 2);
     }
@@ -27552,16 +27462,6 @@ mod tests {
             ])
         };
         let project = |binding: &Binding| binding.get(0).copied();
-        let mut sequential: Vec<_> = Query::new(
-            make(
-                Arc::new(Mutex::new(Vec::new())),
-                Arc::new(Mutex::new(Vec::new())),
-                Arc::new(Mutex::new(Vec::new())),
-            ),
-            project,
-        )
-        .sequential()
-        .collect();
         let mut lowered: Vec<_> = Query::new(
             make(
                 Arc::clone(&first_calls),
@@ -27575,10 +27475,8 @@ mod tests {
             ProgramScope::Disabled,
         ))
         .collect();
-        sequential.sort_unstable();
         lowered.sort_unstable();
         assert_eq!(lowered, [raw(0), raw(2)]);
-        assert_eq!(lowered, sequential);
         assert_candidate_page_partition(&first_calls, 4);
         assert_candidate_page_partition(&second_calls, 1);
         assert_candidate_page_partition(&sibling_calls, 4);
@@ -27624,16 +27522,6 @@ mod tests {
             ])
         };
         let project = |binding: &Binding| binding.get(0).copied();
-        let mut sequential: Vec<_> = Query::new(
-            make(
-                Arc::new(Mutex::new(Vec::new())),
-                Arc::new(Mutex::new(Vec::new())),
-                Arc::new(Mutex::new(Vec::new())),
-            ),
-            project,
-        )
-        .sequential()
-        .collect();
         let mut lowered: Vec<_> = Query::new(
             make(
                 Arc::clone(&rejecting_calls),
@@ -27647,10 +27535,8 @@ mod tests {
             ProgramScope::Disabled,
         ))
         .collect();
-        sequential.sort_unstable();
         lowered.sort_unstable();
         assert_eq!(lowered, [raw(2)]);
-        assert_eq!(lowered, sequential);
         assert_candidate_page_partition(&rejecting_calls, 4);
         assert!(skipped_calls.lock().unwrap().is_empty());
         assert_candidate_page_partition(&sibling_calls, 4);
@@ -27688,15 +27574,6 @@ mod tests {
         };
         let project =
             |binding: &Binding| Some((binding.get(0).copied()?, binding.get(1).copied()?));
-        let mut sequential: Vec<_> = Query::new(
-            make(
-                Arc::new(Mutex::new(Vec::new())),
-                Arc::new(Mutex::new(Vec::new())),
-            ),
-            project,
-        )
-        .sequential()
-        .collect();
         let mut lowered = Query::new(
             make(Arc::clone(&left_proposals), Arc::clone(&right_proposals)),
             project,
@@ -27709,10 +27586,9 @@ mod tests {
         .start_width(2)
         .growth(1)
         .collect_profiled();
-        sequential.sort_unstable();
         lowered.results.sort_unstable();
-        assert_eq!(lowered.results, [(raw(0), raw(7)), (raw(1), raw(7))]);
-        assert_eq!(lowered.results, sequential);
+        let expected = [(raw(0), raw(7)), (raw(1), raw(7))];
+        assert_eq!(lowered.results, expected);
         assert_eq!(*left_proposals.lock().unwrap(), [vec![raw(0)]]);
         assert_eq!(*right_proposals.lock().unwrap(), [vec![raw(1)]]);
         // Duplicate public rows no longer extend the terminal-demand window;
@@ -27741,7 +27617,7 @@ mod tests {
         .growth(1)
         .collect_profiled();
         synthetic.results.sort_unstable();
-        assert_eq!(synthetic.results, sequential);
+        assert_eq!(synthetic.results, expected);
         assert_eq!(*root_left_proposals.lock().unwrap(), [vec![raw(0)]]);
         assert_eq!(*root_right_proposals.lock().unwrap(), [vec![raw(1)]]);
         assert!(
@@ -27794,13 +27670,6 @@ mod tests {
         };
         let project =
             |binding: &Binding| Some((binding.get(0).copied()?, binding.get(1).copied()?));
-        let blank = || Arc::new(Mutex::new(Vec::new()));
-        let mut sequential: Vec<_> = Query::new(make(blank(), blank(), blank()), project)
-            .sequential()
-            .collect();
-        let mut opaque: Vec<_> = Query::new(make(blank(), blank(), blank()), project)
-            .solve_residual_state_lazy()
-            .collect();
         let mut lowered = Query::new(
             make(
                 Arc::clone(&left_proposals),
@@ -27817,8 +27686,6 @@ mod tests {
         .start_width(4)
         .growth(1)
         .collect_profiled();
-        sequential.sort_unstable();
-        opaque.sort_unstable();
         lowered.results.sort_unstable();
         assert_eq!(
             lowered.results,
@@ -27829,9 +27696,6 @@ mod tests {
                 (raw(3), raw(7)),
             ]
         );
-        assert_eq!(lowered.results, sequential);
-        assert_eq!(lowered.results, opaque);
-
         let flatten = |log: &Arc<Mutex<Vec<Vec<RawInline>>>>| {
             let mut parents: Vec<_> = log.lock().unwrap().iter().flatten().copied().collect();
             parents.sort_unstable();
@@ -27899,22 +27763,14 @@ mod tests {
         );
 
         let project = |binding: &Binding| binding.get(0).copied();
-        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
-        let mut opaque: Vec<_> = Query::new(make(), project)
-            .solve_residual_state_lazy()
-            .collect();
         let mut lowered: Vec<_> = Query::new(make(), project)
             .solve_residual_state_lazy_with(ResidualLowering::new(
                 FormulaScope::UnionLeaves,
                 ProgramScope::Disabled,
             ))
             .collect();
-        sequential.sort_unstable();
-        opaque.sort_unstable();
         lowered.sort_unstable();
         assert_eq!(lowered, [raw(1), raw(3), raw(4)]);
-        assert_eq!(lowered, sequential);
-        assert_eq!(lowered, opaque);
     }
 
     #[test]
@@ -27947,16 +27803,6 @@ mod tests {
             ])
         };
         let project = |binding: &Binding| binding.get(0).copied();
-        let mut sequential: Vec<_> = Query::new(
-            make(
-                Arc::new(Mutex::new(Vec::new())),
-                Arc::new(Mutex::new(Vec::new())),
-                Arc::new(Mutex::new(Vec::new())),
-            ),
-            project,
-        )
-        .sequential()
-        .collect();
         let mut lowered: Vec<_> = Query::new(
             make(
                 Arc::clone(&zero_calls),
@@ -27970,10 +27816,8 @@ mod tests {
             ProgramScope::Disabled,
         ))
         .collect();
-        sequential.sort_unstable();
         lowered.sort_unstable();
         assert_eq!(lowered, [raw(0), raw(1), raw(2)]);
-        assert_eq!(lowered, sequential);
         assert_candidate_page_partition(&zero_calls, 4);
         assert_candidate_page_partition(&one_calls, 4);
         assert_candidate_page_partition(&two_calls, 4);
@@ -28044,7 +27888,6 @@ mod tests {
         );
 
         let project = |binding: &Binding| binding.get(0).copied();
-        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
         let mut opaque = Query::new(make(), project)
             .solve_residual_state_lazy()
             .collect_profiled();
@@ -28054,11 +27897,9 @@ mod tests {
                 ProgramScope::Disabled,
             ))
             .collect_profiled();
-        sequential.sort_unstable();
         opaque.results.sort_unstable();
         lowered.results.sort_unstable();
         assert_eq!(lowered.results, [raw(2), raw(4)]);
-        assert_eq!(lowered.results, sequential);
         assert_eq!(lowered.results, opaque.results);
         assert!(!lowered.results.contains(&raw(1)));
         assert_eq!(lowered.stats.propose_calls, 3);
@@ -28118,13 +27959,6 @@ mod tests {
             ])
         };
         let project = |binding: &Binding| binding.get(0).copied();
-        let blank = || Arc::new(Mutex::new(Vec::new()));
-        let mut sequential: Vec<_> = Query::new(make(blank(), blank(), blank(), blank()), project)
-            .sequential()
-            .collect();
-        let mut opaque: Vec<_> = Query::new(make(blank(), blank(), blank(), blank()), project)
-            .solve_residual_state_lazy()
-            .collect();
         let mut lowered: Vec<_> = Query::new(
             make(
                 Arc::clone(&zero_calls),
@@ -28139,12 +27973,8 @@ mod tests {
             ProgramScope::Disabled,
         ))
         .collect();
-        sequential.sort_unstable();
-        opaque.sort_unstable();
         lowered.sort_unstable();
         assert_eq!(lowered, [raw(1), raw(3)]);
-        assert_eq!(lowered, sequential);
-        assert_eq!(lowered, opaque);
         assert_candidate_page_partition(&zero_calls, 4);
         assert_candidate_page_partition(&one_calls, 4);
         assert_candidate_page_partition(&and_calls, 2);
@@ -28177,24 +28007,14 @@ mod tests {
             UnionConstraint::new(vec![guarded])
         };
         let project = |binding: &Binding| binding.get(0).copied();
-        let mut sequential: Vec<_> = Query::new(make(Arc::new(Mutex::new(Vec::new()))), project)
-            .sequential()
-            .collect();
-        let mut opaque: Vec<_> = Query::new(make(Arc::new(Mutex::new(Vec::new()))), project)
-            .solve_residual_state_lazy()
-            .collect();
         let mut lowered: Vec<_> = Query::new(make(Arc::clone(&sibling_calls)), project)
             .solve_residual_state_lazy_with(ResidualLowering::new(
                 FormulaScope::UnionLeaves,
                 ProgramScope::Disabled,
             ))
             .collect();
-        sequential.sort_unstable();
-        opaque.sort_unstable();
         lowered.sort_unstable();
         assert_eq!(lowered, [raw(5)]);
-        assert_eq!(lowered, sequential);
-        assert_eq!(lowered, opaque);
         assert_eq!(
             *sibling_calls.lock().unwrap(),
             [1],
@@ -28242,22 +28062,14 @@ mod tests {
             ])
         };
         let project = |binding: &Binding| binding.get(0).copied();
-        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
-        let mut opaque: Vec<_> = Query::new(make(), project)
-            .solve_residual_state_lazy()
-            .collect();
         let mut lowered: Vec<_> = Query::new(make(), project)
             .solve_residual_state_lazy_with(ResidualLowering::new(
                 FormulaScope::UnionLeaves,
                 ProgramScope::Disabled,
             ))
             .collect();
-        sequential.sort_unstable();
-        opaque.sort_unstable();
         lowered.sort_unstable();
         assert_eq!(lowered, [raw(2), raw(4)]);
-        assert_eq!(lowered, sequential);
-        assert_eq!(lowered, opaque);
     }
 
     #[test]
@@ -28292,24 +28104,14 @@ mod tests {
             ])
         };
         let project = |binding: &Binding| binding.get(0).copied();
-        let mut sequential: Vec<_> = Query::new(make(Arc::new(Mutex::new(Vec::new()))), project)
-            .sequential()
-            .collect();
-        let mut opaque: Vec<_> = Query::new(make(Arc::new(Mutex::new(Vec::new()))), project)
-            .solve_residual_state_lazy()
-            .collect();
         let mut lowered: Vec<_> = Query::new(make(Arc::clone(&skipped_calls)), project)
             .solve_residual_state_lazy_with(ResidualLowering::new(
                 FormulaScope::UnionLeaves,
                 ProgramScope::Disabled,
             ))
             .collect();
-        sequential.sort_unstable();
-        opaque.sort_unstable();
         lowered.sort_unstable();
         assert_eq!(lowered, [raw(9)]);
-        assert_eq!(lowered, sequential);
-        assert_eq!(lowered, opaque);
         assert!(
             skipped_calls.lock().unwrap().is_empty(),
             "an annihilated recursive AND continued into a sibling action"
@@ -28356,18 +28158,6 @@ mod tests {
         };
         let project =
             |binding: &Binding| Some((binding.get(0).copied()?, binding.get(1).copied()?));
-        let mut sequential: Vec<_> = Query::new(
-            make(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))),
-            project,
-        )
-        .sequential()
-        .collect();
-        let mut opaque: Vec<_> = Query::new(
-            make(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))),
-            project,
-        )
-        .solve_residual_state_lazy()
-        .collect();
         let mut lowered: Vec<_> =
             Query::new(make(Arc::clone(&even_rows), Arc::clone(&odd_rows)), project)
                 .solve_residual_state_lazy_with(ResidualLowering::new(
@@ -28375,12 +28165,8 @@ mod tests {
                     ProgramScope::Disabled,
                 ))
                 .collect();
-        sequential.sort_unstable();
-        opaque.sort_unstable();
         lowered.sort_unstable();
         assert_eq!(lowered, [(raw(0), raw(10)), (raw(1), raw(20))]);
-        assert_eq!(lowered, sequential);
-        assert_eq!(lowered, opaque);
         assert_eq!(even_rows.load(Ordering::Relaxed), 1);
         assert_eq!(odd_rows.load(Ordering::Relaxed), 1);
     }
@@ -28423,22 +28209,14 @@ mod tests {
         };
         let project =
             |binding: &Binding| Some((binding.get(0).copied()?, binding.get(1).copied()?));
-        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
-        let mut opaque: Vec<_> = Query::new(make(), project)
-            .solve_residual_state_lazy()
-            .collect();
         let mut lowered: Vec<_> = Query::new(make(), project)
             .solve_residual_state_lazy_with(ResidualLowering::new(
                 FormulaScope::UnionLeaves,
                 ProgramScope::Disabled,
             ))
             .collect();
-        sequential.sort_unstable();
-        opaque.sort_unstable();
         lowered.sort_unstable();
         assert_eq!(lowered, [(raw(7), raw(1))]);
-        assert_eq!(lowered, sequential);
-        assert_eq!(lowered, opaque);
     }
 
     #[test]
@@ -28472,17 +28250,14 @@ mod tests {
         assert_ne!(plan.leaves[0].path, plan.leaves[1].path);
 
         let project = |binding: &Binding| binding.get(0).copied();
-        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
         let mut lowered: Vec<_> = Query::new(make(), project)
             .solve_residual_state_lazy_with(ResidualLowering::new(
                 FormulaScope::UnionLeaves,
                 ProgramScope::Disabled,
             ))
             .collect();
-        sequential.sort_unstable();
         lowered.sort_unstable();
         assert_eq!(lowered, [raw(1), raw(2), raw(3)]);
-        assert_eq!(lowered, sequential);
     }
 
     #[cfg(feature = "parallel")]
@@ -28981,14 +28756,11 @@ mod tests {
                 .copied()
                 .filter(|value| *value == accepted)
                 .collect();
-            let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
             let mut residual: Vec<_> = Query::new(make(), project)
                 .solve_residual_state_lazy()
                 .collect();
             expected.sort_unstable();
-            sequential.sort_unstable();
             residual.sort_unstable();
-            assert_eq!(sequential, expected);
             assert_eq!(residual, expected);
             for workers in [1, 4] {
                 let mut parallel = with_parallel_workers(workers, || {
@@ -29003,12 +28775,6 @@ mod tests {
 
         for truth in [false, true] {
             let expected = if truth { vec![()] } else { Vec::new() };
-            assert_eq!(
-                Query::new(ZeroVariableTruth(truth), |_| Some(()))
-                    .sequential()
-                    .collect::<Vec<_>>(),
-                expected
-            );
             assert_eq!(
                 Query::new(ZeroVariableTruth(truth), |_| Some(()))
                     .solve_residual_state_lazy()

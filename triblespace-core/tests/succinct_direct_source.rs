@@ -2,7 +2,7 @@
 //!
 //! These tests keep the source contract visible: the twelve triple-pattern
 //! bound schemas are compared page-for-page with ordinary eager proposals,
-//! complete queries are checked against TribleSet's sequential scheduler, and
+//! complete queries are checked against direct fixture relations, and
 //! first-pull/drop receipts prove that width-one demand does not materialize a
 //! large archive frontier.
 
@@ -298,13 +298,11 @@ fn project_pattern(axes: [VariableId; 3]) -> impl Fn(&Binding) -> Option<[RawInl
     }
 }
 
-fn sorted_sequential<'a, C>(constraint: C, axes: [VariableId; 3]) -> Vec<[RawInline; 3]>
+fn sorted_ordinary<'a, C>(constraint: C, axes: [VariableId; 3]) -> Vec<[RawInline; 3]>
 where
     C: Constraint<'a> + 'a,
 {
-    let mut rows: Vec<_> = Query::new(constraint, project_pattern(axes))
-        .sequential()
-        .collect();
+    let mut rows: Vec<_> = Query::new(constraint, project_pattern(axes)).collect();
     rows.sort_unstable();
     rows
 }
@@ -321,9 +319,20 @@ where
 }
 
 #[test]
-fn each_zero_bound_axis_drains_to_the_tribleset_sequential_oracle() {
-    let (set, _, _, _) = fixture(3, 3, 3);
+fn each_zero_bound_axis_drains_to_the_fixture_relation() {
+    let (set, entities, attributes, values) = fixture(3, 3, 3);
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+    let mut expected: Vec<_> = entities
+        .iter()
+        .flat_map(|entity| {
+            attributes.iter().flat_map(|attribute| {
+                values
+                    .iter()
+                    .map(|value| [entity.raw, attribute.raw, value.raw])
+            })
+        })
+        .collect();
+    expected.sort_unstable();
 
     for (name, e_index, a_index, v_index) in [
         ("e-first", 0, 1, 2),
@@ -334,29 +343,34 @@ fn each_zero_bound_axis_drains_to_the_tribleset_sequential_oracle() {
         let attribute = Variable::<GenId>::new(a_index);
         let value = Variable::<UnknownInline>::new(v_index);
         let axes = [e_index, a_index, v_index];
-        let expected = sorted_sequential(set.pattern(entity, attribute, value), axes);
-        let archive_sequential = sorted_sequential(archive.pattern(entity, attribute, value), axes);
+        let archive_ordinary = sorted_ordinary(archive.pattern(entity, attribute, value), axes);
         let archive_residual = sorted_residual(archive.pattern(entity, attribute, value), axes);
         assert_eq!(
-            archive_sequential, expected,
-            "{name}: archive scalar oracle"
+            archive_ordinary, expected,
+            "{name}: archive ordinary result set"
         );
-        assert_eq!(archive_residual, expected, "{name}: residual source bag");
+        assert_eq!(archive_residual, expected, "{name}: FULL source result set");
     }
 }
 
-fn sorted_values<'a, C>(constraint: C, variable: VariableId, residual: bool) -> Vec<RawInline>
+fn sorted_values_ordinary<'a, C>(constraint: C, variable: VariableId) -> Vec<RawInline>
 where
     C: Constraint<'a> + 'a,
 {
     let project = move |binding: &Binding| binding.get(variable).copied();
-    let mut values: Vec<_> = if residual {
-        Query::new(constraint, project)
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
-            .collect()
-    } else {
-        Query::new(constraint, project).sequential().collect()
-    };
+    let mut values: Vec<_> = Query::new(constraint, project).collect();
+    values.sort_unstable();
+    values
+}
+
+fn sorted_values_full<'a, C>(constraint: C, variable: VariableId) -> Vec<RawInline>
+where
+    C: Constraint<'a> + 'a,
+{
+    let project = move |binding: &Binding| binding.get(variable).copied();
+    let mut values: Vec<_> = Query::new(constraint, project)
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .collect();
     values.sort_unstable();
     values
 }
@@ -371,22 +385,13 @@ fn succinct_value_range_pages_and_matches_the_tribleset_oracle() {
 
     let source = archive.value_in_range(variable, min, max);
     assert_pages_equal_eager("value-range", &source, variable.index, &RowsView::EMPTY);
-    let expected = sorted_values(
-        set.value_in_range(variable, min, max),
-        variable.index,
-        false,
-    );
-    let archive_sequential = sorted_values(
-        archive.value_in_range(variable, min, max),
-        variable.index,
-        false,
-    );
-    let archive_residual = sorted_values(
-        archive.value_in_range(variable, min, max),
-        variable.index,
-        true,
-    );
-    assert_eq!(archive_sequential, expected);
+    let mut expected: Vec<_> = values[1..=4].iter().map(|value| value.raw).collect();
+    expected.sort_unstable();
+    let archive_ordinary =
+        sorted_values_ordinary(archive.value_in_range(variable, min, max), variable.index);
+    let archive_residual =
+        sorted_values_full(archive.value_in_range(variable, min, max), variable.index);
+    assert_eq!(archive_ordinary, expected);
     assert_eq!(archive_residual, expected);
 }
 
@@ -592,15 +597,12 @@ fn direct_sources_preserve_affine_parent_multiplicity() {
         .solve_residual_state_lazy_with(ResidualLowering::FULL)
         .cap(1);
     let mut residual: Vec<_> = residual_query.by_ref().collect();
-    let mut sequential: Vec<_> = Query::new(make_root(), project).sequential().collect();
     residual.sort_unstable();
-    sequential.sort_unstable();
     let mut expected: Vec<_> = values
         .iter()
         .flat_map(|value| [value.raw, value.raw])
         .collect();
     expected.sort_unstable();
-    assert_eq!(residual, sequential);
     assert_eq!(residual, expected);
     assert_eq!(residual_query.stats().delta_source_candidates_examined, 8);
     assert_eq!(residual_query.stats().delta_source_direct_candidates, 8);
@@ -614,10 +616,9 @@ fn fixed_pair_results(
 ) -> Vec<RawInline> {
     let archive: SuccinctArchive<OrderedUniverse> = set.into();
     let variable = Variable::<UnknownInline>::new(0);
-    sorted_values(
+    sorted_values_full(
         SuccinctArchiveConstraint::new(entity, attribute, variable, &archive),
         variable.index,
-        true,
     )
 }
 

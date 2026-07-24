@@ -577,22 +577,21 @@ impl Clone for ProjectionGate {
 /// `vars` names the bound variables (one column per entry) and `rows`
 /// holds [`len`](Self::len) rows of [`stride`](Self::stride) values each:
 /// row `i`'s value for `vars[j]` is `rows[i * stride + j]`. Column order
-/// is caller-chosen — the sequential cursor uses binding order while
-/// residual-state cells use their canonical schema — so constraints locate
-/// columns with [`col`](Self::col) and never assume a layout.
+/// is caller-chosen; residual-state cells use their canonical schema, so
+/// constraints locate columns with [`col`](Self::col) and never assume a
+/// layout.
 ///
 /// A view constructed publicly with **no columns is the seed block: a single
 /// zero-width row** (the empty binding). Batch executors may internally carry
 /// several occurrences of that empty binding after splitting and remerging;
 /// their explicit row count preserves that multiplicity even though `rows`
 /// itself is necessarily empty. This is what makes level 0 an ordinary block
-/// instead of a special case in every engine.
+/// instead of a special case in the solver.
 ///
-/// The view is `Copy` and borrows the engine's row storage directly. A
+/// The view is `Copy` and borrows the solver's row storage directly. A
 /// single-row view ([`row_view`](Self::row_view)) is a subslice of the
 /// parent block, not a copy — the borrowed cursor that lets per-row
-/// fallbacks (and the sequential engine, which is literally a block-of-1
-/// caller) run without any scratch [`Binding`].
+/// fallbacks run without any scratch [`Binding`].
 #[derive(Clone, Copy, Debug)]
 pub struct RowsView<'v> {
     /// The bound variables — the column layout of `rows`.
@@ -600,11 +599,10 @@ pub struct RowsView<'v> {
     /// Row-major value store: `len() * stride()` entries.
     pub rows: &'v [RawInline],
     /// Optional O(1) variable→column index: `cols[v]` is the column of
-    /// variable `v`, [`COL_UNBOUND`] when unbound. The sequential engine
-    /// maintains one incrementally (its cursor changes one variable at a
-    /// time); the blocked engines pass `None` — they amortize the
-    /// [`col`](Self::col) scan over whole blocks, while the block-of-1
-    /// caller pays it per verb call without the index.
+    /// variable `v`, [`COL_UNBOUND`] when unbound. Canonical multi-parent
+    /// frontiers normally pass `None` and amortize the [`col`](Self::col)
+    /// scan over the whole block; callers with a maintained index may supply
+    /// it for O(1) lookup.
     cols: Option<&'v [u8; 128]>,
     /// Row count, computed once at construction. Kept as a field so
     /// [`len`](Self::len) — called on every verb of every constraint —
@@ -669,7 +667,7 @@ impl<'v> RowsView<'v> {
 
     /// Creates a view with a caller-maintained variable→column index
     /// (`cols[v]` = column of `v`, [`COL_UNBOUND`] otherwise), making
-    /// [`col`](Self::col) O(1). The single-row cursor engine uses this.
+    /// [`col`](Self::col) O(1).
     pub fn new_indexed(vars: &'v [VariableId], rows: &'v [RawInline], cols: &'v [u8; 128]) -> Self {
         debug_assert!(vars.is_empty() || rows.len().is_multiple_of(vars.len()));
         debug_assert!(vars.iter().enumerate().all(|(i, &v)| cols[v] as usize == i));
@@ -786,7 +784,8 @@ pub type Candidates = Vec<(u32, RawInline)>;
 /// variant **once per call** and run a monomorphized loop per arm, so
 /// nothing representation-dependent survives into the hot loops.
 pub enum CandidateSink<'s> {
-    /// `(row, value)` pairs, grouped by ascending row — blocked engines.
+    /// `(row, value)` pairs, grouped by ascending row for multi-parent
+    /// frontiers.
     Tagged(&'s mut Candidates),
     /// Plain values for any single-parent view, with implicit row index zero.
     Values(&'s mut Vec<RawInline>),
@@ -867,13 +866,12 @@ impl CandidateSink<'_> {
 /// The output sink of [`Constraint::estimate`]: one estimate per row of
 /// the block.
 ///
-/// - [`Column`](Self::Column) appends per-row estimates to a column
-///   vector — the blocked engines' shape.
+/// - [`Column`](Self::Column) appends per-row estimates to a column vector
+///   for multi-parent frontiers.
 /// - [`Scalar`](Self::Scalar) writes a single-row view's estimate
-///   straight into a stack slot — the sequential engine's shape, with no
-///   `Vec` round-trip.
+///   straight into a stack slot with no `Vec` round-trip.
 pub enum EstimateSink<'s> {
-    /// One estimate per row, appended — blocked engines.
+    /// One estimate per row, appended for a multi-parent frontier.
     Column(&'s mut Vec<usize>),
     /// A single-row view's estimate, written in place.
     Scalar(&'s mut usize),
@@ -918,12 +916,12 @@ impl EstimateSink<'_> {
 }
 
 /// Groups a candidate frontier by row and lets `f` filter each row's
-/// value group in place — the derived (scalar) case of blocked confirm.
+/// value group in place; a single-parent frontier is the untagged special
+/// case.
 /// `f` receives the row's values and the row's candidate values.
 ///
-/// For a [`CandidateSink::Values`] sink (the sequential engine's
-/// block-of-1) this is a direct call on the borrowed buffer — no
-/// grouping, no scratch, no copies.
+/// For a [`CandidateSink::Values`] sink this is a direct call on the borrowed
+/// buffer — no grouping, no scratch, no copies.
 pub fn confirm_per_row(
     view: &RowsView<'_>,
     candidates: &mut CandidateSink<'_>,
@@ -1365,12 +1363,11 @@ pub trait ConstraintChildren<'a> {
 /// [`RowsView`] — a block of sibling partial bindings that share the same
 /// bound-variable set — and candidates travel through a representation-
 /// generic [`CandidateSink`]. One binding at a time is simply the one-row
-/// special case (the sequential engine and one-parent blocked/residual
-/// frontiers pass single-row views with a plain-value
-/// [`CandidateSink::Values`] sink, paying no row tags); multi-parent frontiers
-/// use a [`CandidateSink::Tagged`] pair sink. Constraints with batchable probe
-/// streams may evaluate either representation in one pass — cache-friendly on
-/// the CPU and suitable for accelerator backends.
+/// special case: one-parent frontiers pass single-row views with a plain-value
+/// [`CandidateSink::Values`] sink and pay no row tags, while multi-parent
+/// frontiers use a [`CandidateSink::Tagged`] pair sink. Constraints with
+/// batchable probe streams may evaluate either representation in one pass —
+/// cache-friendly on the CPU and suitable for accelerator backends.
 ///
 /// # The protocol
 ///
@@ -1419,8 +1416,8 @@ pub trait ConstraintChildren<'a> {
 ///
 /// Constraints are stateless: every method receives the current block as
 /// a borrowed view rather than maintaining internal bookkeeping. This
-/// lets the engines backtrack (sequential), page actions, or reorder canonical
-/// residual-state cells freely without notifying the constraints.
+/// lets the solver page actions or reorder canonical residual-state cells
+/// freely without notifying the constraints.
 ///
 /// # Structural relevance
 ///
@@ -2554,9 +2551,9 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// Select structural lowering for the residual solver.
     ///
     /// Ordinary live queries start with [`residual::ResidualLowering::HYBRID`].
-    /// Explicit scheduler comparisons can request
+    /// Structural/compiler probes can request
     /// [`residual::ResidualLowering::CONSERVATIVE`] or any intermediate form
-    /// without changing their scheduler.
+    /// without changing execution policy.
     ///
     /// # Panics
     ///
@@ -2844,9 +2841,10 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
         }
 
         if self.residual.is_none() {
+            let seed = self.seed.take()?;
             self.residual = Some(Box::new(residual::ResidualQueryState::new(
                 &self.constraint,
-                self.seed.take(),
+                Some(seed),
                 self.residual_lowering,
             )));
         }
@@ -3030,14 +3028,13 @@ mod parallel {
         use crate::inline::encodings::iu256::U256BE;
 
         #[test]
-        fn fresh_sequential_query_routes_to_residual_parallel_producer() {
+        fn fresh_query_routes_to_residual_parallel_producer() {
             let mut context = VariableContext::new();
             let variable = context.next_variable::<U256BE>();
             let query = Query::new(
                 Arc::new(variable.is(U256BE::inline_from(1u64))),
                 move |binding: &Binding| binding.get(variable.index).copied(),
-            )
-            .sequential();
+            );
 
             let parallel = query.into_par_iter();
             assert!(matches!(parallel.inner, QueryParInner::Residual(_)));
@@ -3460,24 +3457,19 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_and_residual_lowering_are_orthogonal_controls() {
+    fn residual_lowering_configures_the_one_solver() {
         let mut context = VariableContext::new();
         let variable = context.next_variable::<U256BE>();
         let ordinary = Query::new(variable.is(U256BE::inline_from(1u64)), |_| Some(()));
-        assert_eq!(ordinary.scheduler, QueryScheduler::ResidualState);
         assert_eq!(
             ordinary.residual_lowering,
             residual::ResidualLowering::HYBRID
         );
 
-        let conservative = ordinary
-            .residual_lowering(residual::ResidualLowering::CONSERVATIVE)
-            .residual_state_scheduler();
-        assert_eq!(conservative.scheduler, QueryScheduler::ResidualState);
+        let conservative = ordinary.residual_lowering(residual::ResidualLowering::CONSERVATIVE);
         assert_eq!(
             conservative.residual_lowering,
-            residual::ResidualLowering::CONSERVATIVE,
-            "selecting a scheduler must not rewrite structural lowering"
+            residual::ResidualLowering::CONSERVATIVE
         );
 
         let mut context = VariableContext::new();
@@ -3486,13 +3478,11 @@ mod tests {
             residual::FormulaScope::UnionLeaves,
             residual::ProgramScope::All,
         );
-        let scalar = Query::new(variable.is(U256BE::inline_from(1u64)), |_| Some(()))
-            .sequential()
+        let configured = Query::new(variable.is(U256BE::inline_from(1u64)), |_| Some(()))
             .residual_lowering(intermediate);
-        assert_eq!(scalar.scheduler, QueryScheduler::Sequential);
         assert_eq!(
-            scalar.residual_lowering, intermediate,
-            "selecting lowering must not rewrite the physical scheduler"
+            configured.residual_lowering, intermediate,
+            "the selected structural lowering remains attached to the query"
         );
     }
 
@@ -3895,11 +3885,11 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct ScalarSetAdmissionProbe {
+    struct SetAdmissionProbe {
         descendants: std::sync::Arc<std::sync::Mutex<Vec<RawInline>>>,
     }
 
-    impl ScalarSetAdmissionProbe {
+    impl SetAdmissionProbe {
         const ROOT: VariableId = 0;
         const LEAF: VariableId = 1;
         const A: RawInline = [4; 32];
@@ -3907,7 +3897,7 @@ mod tests {
         const LEAF_VALUE: RawInline = [6; 32];
     }
 
-    impl Constraint<'static> for ScalarSetAdmissionProbe {
+    impl Constraint<'static> for SetAdmissionProbe {
         fn variables(&self) -> VariableSet {
             VariableSet::new_singleton(Self::ROOT).union(VariableSet::new_singleton(Self::LEAF))
         }
@@ -3982,43 +3972,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn scalar_action_admission_is_reverse_stable_before_descending() {
-        let descendants = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let rows: Vec<_> = Query::new(
-            ScalarSetAdmissionProbe {
-                descendants: descendants.clone(),
-            },
-            |binding: &Binding| {
-                Some((
-                    *binding.get(ScalarSetAdmissionProbe::ROOT)?,
-                    *binding.get(ScalarSetAdmissionProbe::LEAF)?,
-                ))
-            },
-        )
-        .sequential()
-        .collect();
-
-        assert_eq!(
-            rows,
-            [
-                (
-                    ScalarSetAdmissionProbe::A,
-                    ScalarSetAdmissionProbe::LEAF_VALUE,
-                ),
-                (
-                    ScalarSetAdmissionProbe::B,
-                    ScalarSetAdmissionProbe::LEAF_VALUE,
-                ),
-            ]
-        );
-        assert_eq!(
-            *descendants.lock().unwrap(),
-            [ScalarSetAdmissionProbe::A, ScalarSetAdmissionProbe::B],
-            "the duplicate tail occurrence must disappear before the next action"
-        );
-    }
-
     #[cfg(feature = "parallel")]
     #[test]
     fn ordinary_parallel_residual_admits_set_before_splitting() {
@@ -4026,13 +3979,13 @@ mod tests {
 
         let descendants = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut rows: Vec<_> = Query::new(
-            ScalarSetAdmissionProbe {
+            SetAdmissionProbe {
                 descendants: descendants.clone(),
             },
             |binding: &Binding| {
                 Some((
-                    *binding.get(ScalarSetAdmissionProbe::ROOT)?,
-                    *binding.get(ScalarSetAdmissionProbe::LEAF)?,
+                    *binding.get(SetAdmissionProbe::ROOT)?,
+                    *binding.get(SetAdmissionProbe::LEAF)?,
                 ))
             },
         )
@@ -4045,19 +3998,13 @@ mod tests {
         assert_eq!(
             rows,
             [
-                (
-                    ScalarSetAdmissionProbe::A,
-                    ScalarSetAdmissionProbe::LEAF_VALUE,
-                ),
-                (
-                    ScalarSetAdmissionProbe::B,
-                    ScalarSetAdmissionProbe::LEAF_VALUE,
-                ),
+                (SetAdmissionProbe::A, SetAdmissionProbe::LEAF_VALUE,),
+                (SetAdmissionProbe::B, SetAdmissionProbe::LEAF_VALUE,),
             ]
         );
         assert_eq!(
             observed,
-            [ScalarSetAdmissionProbe::A, ScalarSetAdmissionProbe::B],
+            [SetAdmissionProbe::A, SetAdmissionProbe::B],
             "residual shards must inherit SET-admitted proposal rows"
         );
     }
@@ -4111,9 +4058,6 @@ mod tests {
         ] {
             expected.sort_unstable();
 
-            let mut sequential: Vec<_> = variable_order_bag_query(tie_children)
-                .sequential()
-                .collect();
             let mut residual_narrow: Vec<_> = variable_order_bag_query(tie_children)
                 .solve_residual_state_lazy_with(residual::ResidualLowering::FULL)
                 .cap(1)
@@ -4126,7 +4070,7 @@ mod tests {
                 .start_width(8)
                 .growth(1)
                 .collect();
-            for bag in [&mut sequential, &mut residual_narrow, &mut residual_wide] {
+            for bag in [&mut residual_narrow, &mut residual_wide] {
                 bag.sort_unstable();
                 assert_eq!(bag, &expected);
             }
