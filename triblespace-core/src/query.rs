@@ -579,12 +579,12 @@ impl Clone for ProjectionGate {
 /// `vars` names the bound variables (one column per entry) and `rows`
 /// holds [`len`](Self::len) rows of [`stride`](Self::stride) values each:
 /// row `i`'s value for `vars[j]` is `rows[i * stride + j]`. Column order
-/// is caller-chosen — the sequential engine uses binding order, the DAG
-/// solver canonical ascending order — so constraints locate their columns
-/// with [`col`](Self::col) and never assume a layout.
+/// is caller-chosen — the sequential cursor uses binding order while
+/// residual-state cells use their canonical schema — so constraints locate
+/// columns with [`col`](Self::col) and never assume a layout.
 ///
 /// A view constructed publicly with **no columns is the seed block: a single
-/// zero-width row** (the empty binding). Blocked engines may internally carry
+/// zero-width row** (the empty binding). Batch executors may internally carry
 /// several occurrences of that empty binding after splitting and remerging;
 /// their explicit row count preserves that multiplicity even though `rows`
 /// itself is necessarily empty. This is what makes level 0 an ordinary block
@@ -760,10 +760,10 @@ impl<'v> RowsView<'v> {
     }
 }
 
-/// The ragged candidate matrix of the blocked engines: `(row, value)`
-/// pairs in COO form, **grouped by ascending row index**. The blocked /
-/// grouped / DAG solvers own buffers of this type and lend them to the
-/// protocol through [`CandidateSink::Tagged`].
+/// The ragged candidate matrix of batch execution: `(row, value)` pairs in COO
+/// form, **grouped by ascending row index**. The residual executor owns
+/// buffers of this type and lends them to the protocol through
+/// [`CandidateSink::Tagged`].
 pub type Candidates = Vec<(u32, RawInline)>;
 
 /// Collapses an action's occurrence bag to its SET support while preserving
@@ -1443,8 +1443,8 @@ pub trait ConstraintChildren<'a> {
 ///
 /// Constraints are stateless: every method receives the current block as
 /// a borrowed view rather than maintaining internal bookkeeping. This
-/// lets the engines backtrack (sequential), chunk (blocked), or reorder
-/// work (DAG worklist) freely without notifying the constraints.
+/// lets the engines backtrack (sequential), page actions, or reorder canonical
+/// residual-state cells freely without notifying the constraints.
 ///
 /// # Structural relevance
 ///
@@ -2088,43 +2088,6 @@ fn source_quote_scalar<'a, C: Constraint<'a> + ?Sized>(
     Some((coverage, estimate))
 }
 
-/// Coverage-based source quote column for a row block.
-///
-/// Returns the source coverage and appends exactly one cost per row. Sources
-/// without an estimate receive `usize::MAX`.
-fn source_quote_column<'a, C: Constraint<'a> + ?Sized>(
-    constraint: &C,
-    variable: VariableId,
-    bound: VariableSet,
-    view: &RowsView<'_>,
-    out: &mut Vec<usize>,
-) -> Option<ProposalCoverage> {
-    let coverage = constraint.proposal_coverage(variable, bound);
-    if coverage == ProposalCoverage::None {
-        return None;
-    }
-    debug_assert!(constraint.variables().is_set(variable));
-
-    let start = out.len();
-    let quoted = constraint.estimate(variable, view, &mut EstimateSink::Column(out));
-    if quoted {
-        assert_eq!(
-            out.len() - start,
-            view.len(),
-            "constraint estimate must append one value per row"
-        );
-        Some(coverage)
-    } else {
-        assert_eq!(
-            out.len(),
-            start,
-            "missing constraint estimate must leave its sink untouched"
-        );
-        out.resize(start + view.len(), usize::MAX);
-        Some(coverage)
-    }
-}
-
 /// Stable diagnostic for a frontier that cannot enumerate any remaining
 /// variable. A source may become available after another variable is bound
 /// (Equality is the canonical example), so callers must apply this only to the
@@ -2528,7 +2491,6 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum QueryScheduler {
-    LazyDag,
     ResidualState,
     Sequential,
 }
@@ -2546,9 +2508,8 @@ enum QueryScheduler {
 /// Explicit routes deferred by policy use the ordinary constraint action. A
 /// structurally absent route may instead retain the constraint's legacy pager
 /// or seed hooks. Seed-rejected queries start no runtime. Use
-/// [`Query::lazy_dag_scheduler`] for the bound-variable-set DAG control and
-/// [`Query::sequential`] for the scalar depth-first specialization. The
-/// Scheduler selection and structural lowering are independent controls; use
+/// [`Query::sequential`] for the scalar depth-first specialization. Scheduler
+/// selection and structural lowering are independent controls; use
 /// [`Query::residual_lowering`] to select a conservative or intermediate
 /// lowering without changing the scheduler. Fully drained scheduler results
 /// produce the same distinct raw projected-row set; their iteration order may
@@ -2579,12 +2540,11 @@ pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     mode: Search,
     /// Whether [`Iterator::next`] has ever been called on this query.
     ///
-    /// Probe solvers restart from the seed block and therefore require this
-    /// to remain `false`. Cursor shape cannot encode the same fact: an
-    /// untouched failed zero-variable settlement and a successfully drained
-    /// zero-variable query are both `Done` with empty cursor state. This bit
-    /// also records a failed `next()` call, giving freshness the simple exact
-    /// meaning "the iterator has never been pulled."
+    /// Cursor shape cannot encode freshness: an untouched failed zero-variable
+    /// settlement and a successfully drained zero-variable query are both
+    /// `Done` with empty cursor state. This bit also records a failed `next()`
+    /// call, giving freshness the simple exact meaning "the iterator has never
+    /// been pulled."
     iteration_started: bool,
     influences: [VariableSet; 128],
     estimates: [usize; 128],
@@ -2618,10 +2578,6 @@ pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     /// Emit-only scratch: filled from the cursor when a full row is
     /// postprocessed. The only place a [`Binding`] still exists.
     binding: Binding,
-    /// Lazily initialized lazy-DAG state for an explicit scheduler override.
-    /// Keeping the worklist in a box avoids growing the already-large
-    /// sequential cursor copied by rayon's DFS splitter.
-    dag: Option<Box<DagState>>,
     /// Lazily initialized canonical residual-state cursor. The box owns only
     /// a borrow-free lowering plan plus raw machine state; `constraint` and
     /// `postprocessing` remain owned by this `Query`.
@@ -2664,7 +2620,6 @@ where
             // large root proposal (especially on Rayon's first split).
             value_admission: AHashSet::new(),
             binding: self.binding.clone(),
-            dag: self.dag.clone(),
             residual: self.residual.clone(),
         }
     }
@@ -2746,37 +2701,12 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         self.projection.project(&self.binding, &self.postprocessing)
     }
 
-    /// PROBE: frontier-batched (block-at-a-time) solver — the exact-grouped,
-    /// unmerged, saturated-width configuration of the worklist core.
-    ///
-    /// The scalar [`sequential`](Self::sequential) scheduler descends one
-    /// binding at a time, so on star or filter shapes every sibling branch
-    /// runs its own tiny
-    /// propose/confirm round — the per-branch candidate sets (≤ a few
-    /// values) are far below any batching break-even. `solve_blocked`
-    /// instead carries a **block** of sibling partial bindings per level
-    /// and hands whole frontiers of `(row, candidate)` pairs to the
-    /// constraints ([`Constraint::propose`] / [`Constraint::confirm`]
-    /// over multi-row [`RowsView`]s): one ragged batch per
-    /// (constraint, level) instead of one call per branch. Each row retains
-    /// the same adaptive next-variable choice as scalar execution, and rows
-    /// batch only when that semantic action agrees.
-    ///
-    /// Semantics: yields the same distinct projected-row set as the iterator;
-    /// row order may differ (block order instead of DFS order).
-    pub fn solve_blocked(self) -> Vec<R> {
-        let mut it = self.solve_dag_lazy().start_width(usize::MAX);
-        it.state.merge = false;
-        it.collect()
-    }
-
     /// Use the scalar depth-first scheduler for this query.
     ///
     /// Every live fresh ordinary iterator uses residual states. The scalar
     /// scheduler remains useful for tiny queries, strict frontier-memory
     /// bounds, and as the block-of-one specialization of the same block-native
-    /// constraint protocol; [`Query::lazy_dag_scheduler`] selects the explicit
-    /// bound-variable-set worklist control.
+    /// constraint protocol.
     ///
     /// This selection governs direct [`Iterator`] pulls. Converting a fresh
     /// `.sequential()` query through ordinary Rayon iteration intentionally
@@ -2790,7 +2720,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// made before the first call to [`Iterator::next`].
     pub fn sequential(mut self) -> Self {
         assert!(
-            !self.iteration_started && self.dag.is_none() && self.residual.is_none(),
+            !self.iteration_started && self.residual.is_none(),
             "cannot select the sequential query scheduler after iteration has started"
         );
         self.scheduler = QueryScheduler::Sequential;
@@ -2819,7 +2749,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// made before the first call to [`Iterator::next`].
     pub fn residual_state_scheduler(mut self) -> Self {
         assert!(
-            !self.iteration_started && self.dag.is_none() && self.residual.is_none(),
+            !self.iteration_started && self.residual.is_none(),
             "cannot select the residual-state query scheduler after iteration has started"
         );
         self.scheduler = QueryScheduler::ResidualState;
@@ -2839,34 +2769,10 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// before the first call to [`Iterator::next`].
     pub fn residual_lowering(mut self, lowering: residual::ResidualLowering) -> Self {
         assert!(
-            !self.iteration_started && self.dag.is_none() && self.residual.is_none(),
+            !self.iteration_started && self.residual.is_none(),
             "cannot select residual lowering after iteration has started"
         );
         self.residual_lowering = lowering;
-        self
-    }
-
-    /// Use the lazy bound-variable-set DAG through the ordinary resumable
-    /// [`Query`] iterator.
-    ///
-    /// This is a diagnostic and behavioral control for comparing the DAG
-    /// worklist with the residual-default ordinary scheduler. It keeps its raw
-    /// resumable worklist behind `Query::next`, so cloning a started query
-    /// snapshots the exact remainder. Converting an unstarted selected query
-    /// through ordinary Rayon iteration uses the canonical residual runtime;
-    /// use `Query::into_par_dag_iter` (with the `parallel` feature) to request
-    /// affine DAG sharding explicitly.
-    ///
-    /// # Panics
-    ///
-    /// Panics if iteration has already started. Scheduler selection must be
-    /// made before the first call to [`Iterator::next`].
-    pub fn lazy_dag_scheduler(mut self) -> Self {
-        assert!(
-            !self.iteration_started && self.dag.is_none() && self.residual.is_none(),
-            "cannot select the lazy-DAG query scheduler after iteration has started"
-        );
-        self.scheduler = QueryScheduler::LazyDag;
         self
     }
 
@@ -2972,16 +2878,11 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         if matches!(mode, Search::NextVariable) && !variables.is_empty() {
             assert!(has_initial_source, "{SOURCE_FRONTIER_ERROR}");
         }
-        let scheduler = if matches!(mode, Search::NextVariable) {
-            QueryScheduler::ResidualState
-        } else {
-            QueryScheduler::LazyDag
-        };
         Query {
             constraint,
             postprocessing,
             projection,
-            scheduler,
+            scheduler: QueryScheduler::ResidualState,
             residual_lowering: residual::ResidualLowering::HYBRID,
             mode,
             iteration_started: false,
@@ -2997,7 +2898,6 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             values: ArrayVec::from([const { None }; 128]),
             value_admission: AHashSet::new(),
             binding: Binding::default(),
-            dag: None,
             residual: None,
         }
     }
@@ -3180,15 +3080,12 @@ pub mod order_trace {
     }
 }
 
-/// PROBE: maximum rows per block chunk in [`Query::solve_blocked`]. Bounds
-/// peak memory (a chunk of D-deep rows costs `CAP × D × 32 B`) while
-/// staying far above every batching break-even.
+/// Maximum affine rows considered by one residual-state action cohort.
+/// This bounds peak row storage while staying above batching break-even.
 pub const BLOCK_ROW_CAP: usize = 1 << 20;
 
-/// PROBE: effective block-row cap — [`BLOCK_ROW_CAP`] unless overridden by
-/// the `TRIBLES_BLOCK_ROW_CAP` environment variable (read once; for the
-/// blocked-vs-sequential convergence experiment, e.g. cap = 1 to measure
-/// scalar-as-block-of-1 overhead).
+/// Effective residual action-row cap: [`BLOCK_ROW_CAP`] unless overridden by
+/// `TRIBLES_BLOCK_ROW_CAP` (read once).
 pub fn block_row_cap() -> usize {
     static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CAP.get_or_init(|| {
@@ -3200,1291 +3097,25 @@ pub fn block_row_cap() -> usize {
     })
 }
 
-/// PROBE (group-by-ordering): cheap instrumentation for the blocked
-/// solvers. Off by default; benches call
-/// [`set_enabled`](blocked_stats::set_enabled) and
-/// [`reset`](blocked_stats::reset) around a measured run and print
-/// [`report`](blocked_stats::report). One mutex lock per *pop* (not per
-/// row), so the enabled overhead is negligible next to the
-/// propose/confirm work it describes.
-pub mod blocked_stats {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::Mutex;
-
-    /// One record per worklist pop that expanded a frontier.
-    #[derive(Clone, Debug)]
-    pub struct LevelRecord {
-        /// Number of variables bound on entry (search depth).
-        pub depth: usize,
-        /// Rows in the block this call handled.
-        pub rows: usize,
-        /// Slow-start chunk width in force for this pop.
-        pub chunk_width: usize,
-        /// Per-exact-variable-group row counts.
-        pub group_sizes: Vec<usize>,
-        /// Frontier size (candidate pairs) produced per group's propose.
-        pub batch_sizes: Vec<usize>,
-    }
-
-    static ENABLED: AtomicBool = AtomicBool::new(false);
-    static RECORDS: Mutex<Vec<LevelRecord>> = Mutex::new(Vec::new());
-    static MATERIALIZED: AtomicU64 = AtomicU64::new(0);
-    static LIVE_CELLS: AtomicU64 = AtomicU64::new(0);
-    static PEAK_CELLS: AtomicU64 = AtomicU64::new(0);
-
-    /// Turns recording on/off (off by default).
-    pub fn set_enabled(on: bool) {
-        ENABLED.store(on, Ordering::Relaxed);
-    }
-
-    pub(crate) fn enabled() -> bool {
-        ENABLED.load(Ordering::Relaxed)
-    }
-
-    /// Clears all recorded data.
-    pub fn reset() {
-        RECORDS.lock().unwrap().clear();
-        MATERIALIZED.store(0, Ordering::Relaxed);
-        LIVE_CELLS.store(0, Ordering::Relaxed);
-        PEAK_CELLS.store(0, Ordering::Relaxed);
-    }
-
-    /// PROBE (dag-frontier): row-store cells (`RawInline` = 32 B units)
-    /// coming alive — intermediate blocks in the recursive solvers, bucket
-    /// rows in the DAG solver. Tracks the running total and its peak so
-    /// the engines' frontier memory is comparable (proposal-pair vectors
-    /// are excluded in *all* engines).
-    pub(crate) fn cells_add(n: usize) {
-        let live = LIVE_CELLS.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
-        PEAK_CELLS.fetch_max(live, Ordering::Relaxed);
-    }
-
-    /// PROBE (dag-frontier): row-store cells released.
-    pub(crate) fn cells_sub(n: usize) {
-        LIVE_CELLS.fetch_sub(n as u64, Ordering::Relaxed);
-    }
-
-    /// Peak live row-store cells observed since [`reset`] (32 B each).
-    pub fn peak_cells() -> u64 {
-        PEAK_CELLS.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn record_level(rec: LevelRecord) {
-        RECORDS.lock().unwrap().push(rec);
-    }
-
-    pub(crate) fn record_materialized(rows: usize) {
-        MATERIALIZED.fetch_add(rows as u64, Ordering::Relaxed);
-    }
-
-    /// Total intermediate rows materialized into child blocks.
-    pub fn materialized_rows() -> u64 {
-        MATERIALIZED.load(Ordering::Relaxed)
-    }
-
-    /// Raw per-level records, for benches that want full distributions.
-    pub fn records() -> Vec<LevelRecord> {
-        RECORDS.lock().unwrap().clone()
-    }
-
-    /// Terse per-depth aggregate: calls, rows, group count/sizes, batch
-    /// size distribution, plus the global materialized-row total.
-    pub fn report() -> String {
-        use std::fmt::Write;
-        let records = RECORDS.lock().unwrap();
-        let mut depths: Vec<usize> = records.iter().map(|r| r.depth).collect();
-        depths.sort_unstable();
-        depths.dedup();
-        let mut out = String::new();
-        for d in depths {
-            let recs: Vec<&LevelRecord> = records.iter().filter(|r| r.depth == d).collect();
-            let calls = recs.len();
-            let rows: usize = recs.iter().map(|r| r.rows).sum();
-            let groups: usize = recs.iter().map(|r| r.group_sizes.len()).sum();
-            let max_groups = recs.iter().map(|r| r.group_sizes.len()).max().unwrap_or(0);
-            let mut batches: Vec<usize> = recs
-                .iter()
-                .flat_map(|r| r.batch_sizes.iter().copied())
-                .collect();
-            batches.sort_unstable();
-            let (bmin, bmed, bmax, btot) = if batches.is_empty() {
-                (0, 0, 0, 0)
-            } else {
-                (
-                    batches[0],
-                    batches[batches.len() / 2],
-                    *batches.last().unwrap(),
-                    batches.iter().sum(),
-                )
-            };
-            let _ = write!(
-                out,
-                "d{d}: {calls} calls / {rows} rows / {groups} groups (max {max_groups}/call), \
-                 batches n={} tot={btot} [min {bmin} / med {bmed} / max {bmax}]; ",
-                batches.len(),
-            );
-        }
-        let _ = write!(
-            out,
-            "materialized rows: {}; peak cells: {}",
-            materialized_rows(),
-            peak_cells()
-        );
-        out
-    }
-}
-
-/// PROBE (dag-frontier): counters specific to the bucket-worklist solver
-/// ([`Query::solve_dag`]). Off by default; benches enable/reset around a
-/// run and print [`report`](dag_stats::report). Complements
-/// [`blocked_stats`] (which the DAG solver also feeds): this module holds
-/// what only a worklist can have — bucket census and **merge events**,
-/// i.e. rows arriving at a non-empty bucket from a different pop than the
-/// one that last filed into it (the DAG's raison d'être: co-locating rows
-/// whose routes through the variable lattice reconverged).
-pub mod dag_stats {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::Mutex;
-
-    static ENABLED: AtomicBool = AtomicBool::new(false);
-    static POPS: AtomicU64 = AtomicU64::new(0);
-    static BUCKETS_CREATED: AtomicU64 = AtomicU64::new(0);
-    static MAX_LIVE_BUCKETS: AtomicU64 = AtomicU64::new(0);
-    static MERGE_EVENTS: AtomicU64 = AtomicU64::new(0);
-    static MERGED_ROWS: AtomicU64 = AtomicU64::new(0);
-    static PARALLEL_SPLITS: AtomicU64 = AtomicU64::new(0);
-    /// PROBE (lazy-dag): chunk width per engine resumption, in resumption
-    /// order — the slow-start trajectory.
-    static WIDTHS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
-
-    /// Turns recording on/off (off by default).
-    pub fn set_enabled(on: bool) {
-        ENABLED.store(on, Ordering::Relaxed);
-    }
-
-    pub(crate) fn enabled() -> bool {
-        ENABLED.load(Ordering::Relaxed)
-    }
-
-    /// Clears all counters.
-    pub fn reset() {
-        POPS.store(0, Ordering::Relaxed);
-        BUCKETS_CREATED.store(0, Ordering::Relaxed);
-        MAX_LIVE_BUCKETS.store(0, Ordering::Relaxed);
-        MERGE_EVENTS.store(0, Ordering::Relaxed);
-        MERGED_ROWS.store(0, Ordering::Relaxed);
-        PARALLEL_SPLITS.store(0, Ordering::Relaxed);
-        WIDTHS.lock().unwrap().clear();
-    }
-
-    pub(crate) fn record_width(width: usize) {
-        WIDTHS.lock().unwrap().push(width as u64);
-    }
-
-    /// PROBE (lazy-dag): the chunk-width trajectory — one entry per engine
-    /// resumption of a [`DagIter`](super::DagIter), in order.
-    pub fn widths() -> Vec<u64> {
-        WIDTHS.lock().unwrap().clone()
-    }
-
-    pub(crate) fn record_pop() {
-        POPS.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(crate) fn record_bucket_created(live: usize) {
-        BUCKETS_CREATED.fetch_add(1, Ordering::Relaxed);
-        MAX_LIVE_BUCKETS.fetch_max(live as u64, Ordering::Relaxed);
-    }
-
-    pub(crate) fn record_merge(rows: usize) {
-        MERGE_EVENTS.fetch_add(1, Ordering::Relaxed);
-        MERGED_ROWS.fetch_add(rows as u64, Ordering::Relaxed);
-    }
-
-    #[cfg(feature = "parallel")]
-    pub(crate) fn record_parallel_split() {
-        PARALLEL_SPLITS.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Number of merge events (filings that appended to a non-empty
-    /// bucket from a different pop).
-    pub fn merge_events() -> u64 {
-        MERGE_EVENTS.load(Ordering::Relaxed)
-    }
-
-    /// Number of bucket pops performed by DAG-backed query iteration.
-    pub fn pops() -> u64 {
-        POPS.load(Ordering::Relaxed)
-    }
-
-    /// Number of successful affine-frontier splits performed for fresh
-    /// parallel DAG queries while recording was enabled.
-    pub fn parallel_splits() -> u64 {
-        PARALLEL_SPLITS.load(Ordering::Relaxed)
-    }
-
-    /// Terse counter summary.
-    pub fn report() -> String {
-        let widths = WIDTHS.lock().unwrap();
-        let widths_str = if widths.is_empty() {
-            String::new()
-        } else {
-            let shown: Vec<String> = widths.iter().take(24).map(|w| w.to_string()).collect();
-            let ellipsis = if widths.len() > 24 { ", …" } else { "" };
-            format!(
-                " / widths[{}]: {}{}",
-                widths.len(),
-                shown.join(","),
-                ellipsis
-            )
-        };
-        format!(
-            "pops {} / buckets created {} / max live {} / merge events {} ({} rows merged) / parallel splits {}{}",
-            POPS.load(Ordering::Relaxed),
-            BUCKETS_CREATED.load(Ordering::Relaxed),
-            MAX_LIVE_BUCKETS.load(Ordering::Relaxed),
-            MERGE_EVENTS.load(Ordering::Relaxed),
-            MERGED_ROWS.load(Ordering::Relaxed),
-            PARALLEL_SPLITS.load(Ordering::Relaxed),
-            widths_str,
-        )
-    }
-}
-
-/// PROBE (dag-frontier): scheduling ablation — when
-/// `TRIBLES_DAG_STRICT_DEEPEST` is set, [`Query::solve_dag`] pops the
-/// globally deepest bucket **without** the readiness gate (the
-/// whiteboard's original rule). Prediction, checkable via
-/// [`dag_stats`]: cross-parent merge events collapse to ~0, because a
-/// reconvergent bucket is popped right after its first parent files —
-/// its children out-deepen every pending sibling route.
-pub fn dag_strict_deepest() -> bool {
-    static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *STRICT.get_or_init(|| std::env::var("TRIBLES_DAG_STRICT_DEEPEST").is_ok())
-}
-
-/// PROBE (dag-frontier): one pending row store in the bucket worklist.
+/// Initial action width for canonical residual-state iteration.
 ///
-/// `vars` is the bound-variable set in **ascending `VariableId` order** —
-/// the canonical column layout. Canonical order is what makes merging
-/// sound: rows arriving from parents that bound the same variable *set*
-/// in different *orders* still agree column-for-column. (Every blocked
-/// protocol method locates variables by scanning `vars`, so no constraint
-/// cares about the order — but rows sharing one store must share one
-/// layout.)
-#[derive(Clone)]
-struct DagBucket {
-    /// Bound-variable set (`vars` as a bitset) — the bucket key.
-    set: VariableSet,
-    /// Bound variables, ascending — the column layout.
-    vars: Vec<VariableId>,
-    /// Row store: `rows.len() / vars.len()` rows of `vars.len()` values.
-    rows: Vec<RawInline>,
-    /// Pop id of the last filing (merge-event detection only).
-    writer: u64,
-    /// Pending-contributor count — the number of live buckets whose set
-    /// is a **strict subset** of this bucket's set. Rows only ever gain
-    /// variables, so every future filing into this bucket must come from
-    /// such a contributor; `pending == 0` therefore *is* the readiness
-    /// gate, replacing the O(buckets²) subset scan with O(buckets)
-    /// incremental maintenance on create/retire. Maintained only in merge
-    /// mode (the gate exists to hold buckets *for* merging); invariant
-    /// checked against the scan in debug builds ([`dag_gate_check`]).
-    pending: u32,
-}
-
-/// Counting-gate maintenance — a contributor with set `retired` is gone
-/// for good (bucket fully consumed; a pop's filings complete before the
-/// next pop decision, so consumption and retirement fuse): every live
-/// strict superset loses one pending contributor.
-fn dag_gate_retire(buckets: &mut [DagBucket], retired: &VariableSet) {
-    for o in buckets.iter_mut() {
-        if o.set != *retired && retired.is_subset_of(&o.set) {
-            debug_assert!(o.pending > 0, "pending-contributor underflow");
-            o.pending -= 1;
-        }
-    }
-}
-
-/// Counting-gate maintenance for a newly created bucket — returns its
-/// initial pending count (live strict subsets) and registers it as a new
-/// pending contributor with every live strict superset.
-fn dag_gate_admit(buckets: &mut [DagBucket], new_set: &VariableSet) -> u32 {
-    let mut pending = 0u32;
-    for o in buckets.iter_mut() {
-        if o.set == *new_set {
-            continue;
-        }
-        if o.set.is_subset_of(new_set) {
-            pending += 1;
-        }
-        if new_set.is_subset_of(&o.set) {
-            o.pending += 1;
-        }
-    }
-    pending
-}
-
-/// Equivalence assertion — every live bucket's incrementally maintained
-/// `pending` must equal the O(n²) strict-subset scan the gate replaced.
-/// Debug builds run this at every pop decision in merge mode, so the
-/// whole `solve_blocked` parity corpus doubles as the counting-gate ==
-/// scan-gate proof.
-fn dag_gate_check(buckets: &[DagBucket]) {
-    for b in buckets {
-        let scan = buckets
-            .iter()
-            .filter(|o| o.set != b.set && o.set.is_subset_of(&b.set))
-            .count();
-        assert_eq!(
-            b.pending as usize, scan,
-            "counting gate diverged from the subset scan on bucket {:?}",
-            b.set
-        );
-    }
-}
-
-/// Rebuild the readiness gate after a parallel frontier split.
-///
-/// A split moves complete affine rows (or whole buckets) into an independent
-/// worklist. Cross-shard contributors can no longer reconverge, so each shard
-/// must count only the strict-subset buckets it still owns. Recomputing here is
-/// deliberately simple: splitting happens at most a bounded number of times
-/// at the Rayon boundary, while the hot worklist path keeps using incremental
-/// admit/retire maintenance.
-#[cfg(feature = "parallel")]
-fn dag_gate_rebuild(buckets: &mut [DagBucket]) {
-    for i in 0..buckets.len() {
-        let set = buckets[i].set;
-        let pending = buckets
-            .iter()
-            .filter(|other| other.set != set && other.set.is_subset_of(&set))
-            .count() as u32;
-        buckets[i].pending = pending;
-    }
-}
-
-impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
-    /// PROBE (dag-frontier): bucket-worklist solver — the tree-becomes-DAG
-    /// upgrade of [`solve_blocked`](Self::solve_blocked), i.e. the exact-grouped
-    /// worklist with merging enabled, drained eagerly at saturated width.
-    ///
-    /// Evaluation state is a worklist of **buckets keyed by
-    /// bound-variable-set** instead of a recursion stack. Pop a bucket,
-    /// partition its rows by preferred next variable, run one batched
-    /// propose+confirm per (group, variable), then **file** the extended
-    /// rows into the bucket keyed by `bound ∪ {v}` — creating it or
-    /// **appending** to it. The append is the whole point: rows whose
-    /// routes through the variable lattice bound the same set in different
-    /// orders *reconverge* into one row store and every downstream batch
-    /// is correspondingly fatter. Rows are affine — moved on pop, never
-    /// copied between buckets. Full-bound buckets emit.
-    ///
-    /// Scheduling: **deepest-first among ready buckets**, where a bucket
-    /// is *ready* iff no live bucket's set is a strict subset of its set
-    /// (tracked incrementally by the counting gate — see
-    /// [`DagBucket::pending`]). The gate is exact — rows only ever gain
-    /// variables, so any future contributor to bucket `S` is currently a
-    /// strict subset of `S`; once none exists, `S` is complete and safe
-    /// to pop. Without the gate, strict deepest-first pops a reconvergent
-    /// bucket after its *first* parent files, so cross-parent rows never
-    /// co-locate and the merge is dead machinery. The price is that
-    /// reconvergent buckets are *held* until all their feeders drain — on
-    /// a densely reconverging lattice the schedule degrades toward
-    /// breadth-first and frontier memory grows accordingly (measured, not
-    /// hidden). Where routes never reconverge the gate never blocks and
-    /// the schedule is DFS-like.
-    ///
-    /// Semantics: same distinct projected-row set as the sequential iterator
-    /// (each row still value-partitions its region of the search space;
-    /// merging is co-location only). Row order differs.
-    pub fn solve_dag(self) -> Vec<R> {
-        self.solve_dag_lazy().start_width(usize::MAX).collect()
-    }
-
-    /// PROBE (dag-frontier): [`solve_dag`](Self::solve_dag) with merging
-    /// **disabled** — every filing creates a fresh bucket (lineage-keyed),
-    /// so reconvergent routes stay in separate row stores. This is the
-    /// control that isolates what the merge itself buys (batch
-    /// re-fattening) from what the worklist restructuring costs. With no
-    /// merging there is nothing to hold buckets *for*, so the readiness
-    /// gate is off and scheduling is strict deepest-first (DFS-like) —
-    /// which also makes this configuration identical to
-    /// [`solve_blocked`](Self::solve_blocked).
-    pub fn solve_dag_unmerged(self) -> Vec<R> {
-        let mut it = self.solve_dag_lazy().start_width(usize::MAX);
-        it.state.merge = false;
-        it.collect()
-    }
-
-    /// PROBE (lazy-dag): resumable-iterator form of
-    /// [`solve_dag`](Self::solve_dag) with **demand-adaptive chunk width**
-    /// (TCP slow start).
-    ///
-    /// The worklist is explicit state, so there is no recursion to
-    /// suspend: [`DagIter`] holds the worklist and postprocessing closure;
-    /// `next()` postprocesses staged full rows one at a time, else runs pop →
-    /// group → batch → file until a full-bound bucket stages another chunk.
-    /// Dropping the iterator drops the worklist — this is the
-    /// streaming yield catch-5 called for: `exists!`-class consumers stop
-    /// the engine at the first match instead of paying for full
-    /// enumeration.
-    ///
-    /// **Slow start.** A per-iterator chunk width starts tiny
-    /// (`TRIBLES_LAZY_START_WIDTH`, default 1) and multiplies by
-    /// `TRIBLES_LAZY_GROWTH` (default 2) on each engine *resumption* (a
-    /// `next()` call that finds the staged-row buffer empty), saturating at
-    /// [`block_row_cap`]. Each pop takes at most `width` rows off the
-    /// chosen bucket's tail; the remainder stays live under the same key.
-    /// Narrow pops keep first-result latency sequential-class; sustained
-    /// pulling widens to full harvest batches.
-    ///
-    /// **Scheduling — sprint vs harvest.** Width and pop order are physical,
-    /// but each row's adaptive next-variable assignment is semantic because
-    /// the selected proposer owns its candidate support and order. The engine
-    /// therefore preserves exact per-row assignments while width and pop order interact:
-    /// a
-    /// partially drained bucket's remainder is a strict subset of its own
-    /// children, so the eager engine's readiness gate would refuse to
-    /// descend past it and partial pops would degenerate to level-drain —
-    /// exactly the latency the laziness exists to avoid. The gate is
-    /// therefore demand-adaptive too: while `width < cap` (*sprint*) the
-    /// scheduler pops strict-deepest-first, which at width 1 is the DFS
-    /// dive (the cap=1 isomorphism), at the cost of cross-parent merging
-    /// (the ablation showed strict-deepest never merges — an accelerator
-    /// throughput loss, not a CPU one); once width saturates (*harvest*) the
-    /// strict-subset readiness gate switches on and the residual
-    /// computation is the eager [`solve_dag`](Self::solve_dag) algorithm
-    /// on the remaining state.
-    ///
-    /// **Exact grouping.** A popped block is partitioned by each row's exact
-    /// preferred variable. The DAG cohorts those exact-variable groups and
-    /// delegates row-local proposer choice to the root constraint's
-    /// block-native [`Constraint::propose`]. Exposed residual planning instead
-    /// cohorts explicit `(variable, proposer occurrence)` actions. Neither path
-    /// reassigns either choice: an estimate-similar action is not
-    /// interchangeable because [`Constraint`] supplies no cross-action
-    /// occurrence-bag equivalence law.
-    ///
-    /// For `R` rows and `V ≤ 128` unbound variables, planning takes `O(RV)`
-    /// time and uses `O(RV + V)` reusable scratch space.
-    ///
-    /// Semantics: fully drained, the same distinct projected-row set as the
-    /// sequential iterator and the eager DAG solver; row order differs.
-    ///
-    /// # Panics
-    ///
-    /// Panics once [`Iterator::next`] has been called, whether that call
-    /// yielded a row or returned `None`. The probe solvers restart evaluation
-    /// from the seed block, so an explicit never-pulled rule prevents both
-    /// duplicate emission and ambiguity after exhaustion. An untouched query
-    /// is fresh, including one whose zero-variable settlement already failed
-    /// in [`Query::new`] (`Search::Done` without a `next()` call): that one
-    /// correctly yields the empty set.
-    pub fn solve_dag_lazy(self) -> DagIter<C, P, R> {
-        assert!(
-            !self.iteration_started
-                && self.stack.is_empty()
-                && self.bound.is_empty()
-                && self.touched_variables.is_empty()
-                && matches!(self.mode, Search::NextVariable | Search::Done),
-            "cannot probe-solve a Query mid-iteration: Iterator::next has already \
-             been called; probe solvers (solve_blocked/solve_dag/\
-             solve_dag_unmerged/solve_dag_lazy) restart from the seed \
-             block and require a fresh query"
-        );
-        let Query {
-            constraint,
-            postprocessing,
-            projection,
-            influences,
-            base_estimates,
-            mode,
-            ..
-        } = self;
-        let full = constraint.variables();
-        let mut state = DagState::new(full);
-        // [`Query::new`] settles zero-variable (fully-constant) constraints
-        // with one exact `satisfied` probe against the seed block; when the
-        // probe failed the query is already `Done`. The DAG worklist never
-        // consults zero-variable constraints (they have no unbound
-        // variables to propose for), so honor the settlement here by
-        // starting with an empty worklist — the DAG engine then agrees
-        // with the sequential engine's empty result set.
-        if matches!(mode, Search::Done) {
-            state.buckets.clear();
-        }
-        DagIter {
-            constraint,
-            postprocessing,
-            projection,
-            influences,
-            base_estimates,
-            state,
-        }
-    }
-}
-
-/// PROBE (lazy-dag): initial chunk width for [`Query::solve_dag_lazy`] —
-/// `TRIBLES_LAZY_START_WIDTH`, default 1. Read per iterator (not cached),
-/// so experiments can vary it within one process.
+/// Read per iterator so benchmark processes can compare widening policies
+/// without introducing process-global state.
 fn lazy_start_width() -> usize {
     std::env::var("TRIBLES_LAZY_START_WIDTH")
         .ok()
         .and_then(|s| s.parse().ok())
-        .filter(|&w| w > 0)
+        .filter(|&width| width > 0)
         .unwrap_or(1)
 }
 
-/// PROBE (lazy-dag): width growth factor per engine resumption for
-/// [`Query::solve_dag_lazy`] — `TRIBLES_LAZY_GROWTH`, default 2 (1 =
-/// fixed width). Read per iterator.
+/// Geometric action-width multiplier for canonical residual-state iteration.
 fn lazy_growth() -> usize {
     std::env::var("TRIBLES_LAZY_GROWTH")
         .ok()
         .and_then(|s| s.parse().ok())
-        .filter(|&g| g > 0)
+        .filter(|&growth| growth > 0)
         .unwrap_or(2)
-}
-
-/// PROBE (lazy-dag): the resumable bucket-worklist engine behind
-/// [`Query::solve_dag_lazy`]. See there for the design; per-instance state
-/// is exactly `{worklist buckets, raw staged rows, postprocessing, width}`.
-///
-/// Builder-style [`start_width`](Self::start_width) /
-/// [`growth`](Self::growth) override the env defaults (tests need
-/// per-instance settings; env vars are process-global).
-pub struct DagIter<C, P: Fn(&Binding) -> Option<R>, R> {
-    constraint: C,
-    postprocessing: P,
-    projection: ProjectionGate,
-    influences: [VariableSet; 128],
-    base_estimates: [usize; 128],
-    state: DagState,
-}
-
-impl<C, P: Fn(&Binding) -> Option<R>, R> DagIter<C, P, R> {
-    /// Overrides the initial chunk width (clamped to `1..=cap`).
-    pub fn start_width(mut self, width: usize) -> Self {
-        self.state.width = width.clamp(1, self.state.cap);
-        self
-    }
-
-    /// Overrides the per-resumption width growth factor (min 1 = fixed).
-    pub fn growth(mut self, growth: usize) -> Self {
-        self.state.growth = growth.max(1);
-        self
-    }
-
-    /// Overrides the width saturation cap (default [`block_row_cap`]).
-    /// Tests use a tiny cap to force the *harvest* regime (gated
-    /// scheduling at saturated width), which real workloads only reach
-    /// after ~20 doublings; the env cap is process-global and cached.
-    pub fn cap(mut self, cap: usize) -> Self {
-        self.state.cap = cap.max(1);
-        self.state.width = self.state.width.min(self.state.cap);
-        self
-    }
-
-    /// The chunk width the *next* engine resumption will use — the
-    /// slow-start observable (tests sample this per pull; benches use the
-    /// process-global [`dag_stats::widths`] trajectory instead).
-    pub fn current_width(&self) -> usize {
-        self.state.width
-    }
-}
-
-/// PROBE (lazy-dag): the constraint-agnostic core of the lazy DAG engine —
-/// exactly the resumable state (`{worklist buckets, raw staged rows, binding
-/// scratch, slow-start width}`), with the constraint,
-/// postprocessing, and the frozen `influences`/`base_estimates` tables
-/// passed in per call.
-#[derive(Clone)]
-pub(crate) struct DagState {
-    full: VariableSet,
-    buckets: Vec<DagBucket>,
-    pop_id: u64,
-    binding: Binding,
-    /// Fully-bound rows staged for demand-driven postprocessing. Results are
-    /// deliberately kept in raw form: storing projected `R`s here would make
-    /// `Query`'s auto traits depend on its output type and make an exact
-    /// mid-iteration clone require `R: Clone`.
-    emit_vars: Vec<VariableId>,
-    emit_rows: Vec<RawInline>,
-    emit_next: usize,
-    /// Row count is explicit because a zero-column block contains one virtual
-    /// row even though `emit_rows` is empty.
-    emit_count: usize,
-    width: usize,
-    growth: usize,
-    cap: usize,
-    /// File by bound-set — reconvergent routes co-locate and downstream
-    /// batches re-fatten. Off: lineage-keyed filing (a fresh bucket per
-    /// filing), the tree-shaped control.
-    merge: bool,
-    /// Pooled per-pop scratch — the worklist loop is allocation-free in
-    /// steady state (bucket row stores and their `vars` are the only
-    /// per-pop allocations left, and those are the product, not scratch).
-    scratch: DagScratch,
-}
-
-/// Per-pop scratch buffers for [`DagState::pop_once`], pooled across pops
-/// (taken with `mem::take`, returned when the pop completes).
-#[derive(Clone)]
-struct DagScratch {
-    /// Unbound variables of the popped bucket.
-    unbound: Vec<VariableId>,
-    /// Column layout of the popped rows (survives bucket removal).
-    parent_vars: Vec<VariableId>,
-    /// Flat estimate matrix, variable-major: `est[j * rows + i]` — the
-    /// columns land contiguously because [`EstimateSink::Column`] appends.
-    est: Vec<usize>,
-    /// Per-row preferred-variable index (into `unbound`).
-    preferred: Vec<u32>,
-    /// Rows per group.
-    group_counts: Vec<usize>,
-    /// Group start offsets (rows).
-    starts: Vec<usize>,
-    /// Partition write cursors (counting sort).
-    cursors: Vec<usize>,
-    /// Partitioned row store (populated only when >1 group).
-    part: Vec<RawInline>,
-    /// Copied tail rows for partial pops.
-    work: Vec<RawInline>,
-    /// Candidate frontier, reused across groups and pops.
-    pairs: Candidates,
-    /// Reused scratch for SET-admitting `(parent, value)` actions. Including
-    /// the parent tag preserves equal values belonging to distinct rows.
-    pair_admission: AHashSet<(u32, RawInline)>,
-    /// Variable→column index for the popped layout
-    /// ([`RowsView::new_indexed`]), refilled once per pop — every verb
-    /// call of every constraint at this level then locates its columns in
-    /// O(1) instead of scanning `vars`.
-    cols: [u8; 128],
-}
-
-impl Default for DagScratch {
-    fn default() -> Self {
-        DagScratch {
-            unbound: Vec::new(),
-            parent_vars: Vec::new(),
-            est: Vec::new(),
-            preferred: Vec::new(),
-            group_counts: Vec::new(),
-            starts: Vec::new(),
-            cursors: Vec::new(),
-            part: Vec::new(),
-            work: Vec::new(),
-            pairs: Vec::new(),
-            pair_admission: AHashSet::new(),
-            cols: [COL_UNBOUND; 128],
-        }
-    }
-}
-
-impl DagState {
-    fn new(full: VariableSet) -> Self {
-        let cap = block_row_cap();
-        DagState {
-            full,
-            buckets: vec![DagBucket {
-                set: VariableSet::new_empty(),
-                vars: Vec::new(),
-                rows: Vec::new(),
-                writer: 0,
-                pending: 0,
-            }],
-            pop_id: 0,
-            binding: Binding::default(),
-            emit_vars: Vec::new(),
-            emit_rows: Vec::new(),
-            emit_next: 0,
-            emit_count: 0,
-            width: lazy_start_width().clamp(1, cap),
-            growth: lazy_growth(),
-            cap,
-            merge: true,
-            scratch: DagScratch::default(),
-        }
-    }
-}
-
-#[cfg(feature = "parallel")]
-impl DagState {
-    /// Construct an empty worklist with the same scheduler policy as `self`.
-    /// Raw frontier rows are installed by [`split_for_parallel`](Self::split_for_parallel).
-    fn parallel_sibling(&self) -> Self {
-        DagState {
-            full: self.full,
-            buckets: Vec::new(),
-            pop_id: self.pop_id,
-            binding: Binding::default(),
-            emit_vars: Vec::new(),
-            emit_rows: Vec::new(),
-            emit_next: 0,
-            emit_count: 0,
-            width: self.width,
-            growth: self.growth,
-            cap: self.cap,
-            merge: self.merge,
-            scratch: DagScratch::default(),
-        }
-    }
-
-    /// Partition the current affine frontier into two independent worklists.
-    ///
-    /// Every active row represents one disjoint remainder of the search. The
-    /// worklist consumes parents when filing children, so moving rows between
-    /// shards neither duplicates nor loses a possible complete binding. Each
-    /// shard rebuilds its readiness gate because only contributors remaining
-    /// in that shard can reconverge there.
-    ///
-    /// If the frontier is still the one-row seed (or another unsplittable
-    /// one-row chain), advance it serially until a proposal creates at least
-    /// two affine rows. This is planning work only: result projection remains
-    /// deferred to the Rayon fold leaves.
-    fn split_for_parallel<'a, C: Constraint<'a>>(
-        &mut self,
-        constraint: &C,
-        influences: &[VariableSet; 128],
-        base_estimates: &[usize; 128],
-    ) -> Option<Self> {
-        loop {
-            debug_assert_eq!(self.emit_next, 0, "Rayon splits before fold consumption");
-
-            // A full-bound block is already a disjoint result frontier. Split
-            // it directly without invoking user postprocessing.
-            if self.emit_count >= 2 {
-                let right_count = self.emit_count / 2;
-                let left_count = self.emit_count - right_count;
-                let stride = self.emit_vars.len();
-                debug_assert!(stride > 0, "a zero-variable query has one result");
-
-                let mut right = self.parallel_sibling();
-                right.emit_vars = self.emit_vars.clone();
-                right.emit_rows = self.emit_rows.split_off(left_count * stride);
-                right.emit_count = right_count;
-                self.emit_count = left_count;
-                return Some(right);
-            }
-
-            // Keep a staged singleton as one shard while another shard drains
-            // the remaining worklist.
-            if self.emit_count == 1 && !self.buckets.is_empty() {
-                let mut right = self.parallel_sibling();
-                right.emit_vars = std::mem::take(&mut self.emit_vars);
-                right.emit_rows = std::mem::take(&mut self.emit_rows);
-                right.emit_count = 1;
-                self.emit_count = 0;
-                return Some(right);
-            }
-
-            // Prefer splitting rows inside one bucket: this is the common
-            // case immediately after the seed proposes its first variable and
-            // gives both workers similarly shaped block-native work.
-            if let Some(index) = self.buckets.iter().position(|bucket| {
-                let stride = bucket.vars.len();
-                stride > 0 && bucket.rows.len() / stride >= 2
-            }) {
-                let bucket = &mut self.buckets[index];
-                let stride = bucket.vars.len();
-                let rows = bucket.rows.len() / stride;
-                let left_rows = rows - rows / 2;
-                let right_rows = bucket.rows.split_off(left_rows * stride);
-                let right_bucket = DagBucket {
-                    set: bucket.set,
-                    vars: bucket.vars.clone(),
-                    rows: right_rows,
-                    writer: bucket.writer,
-                    pending: 0,
-                };
-
-                let mut right = self.parallel_sibling();
-                right.buckets.push(right_bucket);
-                if self.merge {
-                    dag_gate_rebuild(&mut self.buckets);
-                    dag_gate_rebuild(&mut right.buckets);
-                }
-                return Some(right);
-            }
-
-            // Multiple singleton buckets are also independent frontier
-            // components. Moving one whole bucket avoids descending either
-            // component merely to manufacture a split point.
-            if self.buckets.len() >= 2 {
-                let mut right = self.parallel_sibling();
-                right
-                    .buckets
-                    .push(self.buckets.pop().expect("at least two buckets"));
-                if self.merge {
-                    dag_gate_rebuild(&mut self.buckets);
-                    dag_gate_rebuild(&mut right.buckets);
-                }
-                return Some(right);
-            }
-
-            if self.buckets.is_empty() {
-                return None;
-            }
-
-            // One unsplittable row remains. Expand it through the normal DAG
-            // negotiation; a branching proposal will create the row frontier
-            // split by the next loop iteration.
-            self.pop_once(constraint, influences, base_estimates, self.width.max(1));
-        }
-    }
-}
-
-/// Files one group's `(row, value)` pairs into the bucket keyed by
-/// `parent_set ∪ {variable}` — finding it (merge mode: reconvergent routes
-/// co-locate) or creating it (always in lineage mode). New buckets are
-/// admitted to the counting gate in merge mode.
-///
-/// Note on merge stats: with partial pops, the same parent's remainder
-/// files into the same child across *different* pop ids, so [`dag_stats`]
-/// merge events count self-refills as merges under narrow widths.
-#[allow(clippy::too_many_arguments)]
-fn dag_file(
-    buckets: &mut Vec<DagBucket>,
-    merge: bool,
-    pop_id: u64,
-    parent_set: VariableSet,
-    parent_vars: &[VariableId],
-    variable: VariableId,
-    g_rows: &[RawInline],
-    pairs: &[(u32, RawInline)],
-) {
-    if pairs.is_empty() {
-        return;
-    }
-    let stats = blocked_stats::enabled();
-    let dstats = dag_stats::enabled();
-    let stride = parent_vars.len();
-    let mut child_set = parent_set;
-    child_set.set(variable);
-    // Canonical layout: insert the new value at the variable's ascending
-    // position.
-    let vpos = parent_vars
-        .iter()
-        .position(|&x| x > variable)
-        .unwrap_or(stride);
-    let child_stride = stride + 1;
-    let target = if merge {
-        buckets.iter().position(|b| b.set == child_set)
-    } else {
-        None
-    };
-    let target = match target {
-        Some(t) => {
-            if dstats && !buckets[t].rows.is_empty() && buckets[t].writer != pop_id {
-                dag_stats::record_merge(pairs.len());
-            }
-            buckets[t].writer = pop_id;
-            t
-        }
-        None => {
-            let mut child_vars = Vec::with_capacity(child_stride);
-            child_vars.extend_from_slice(&parent_vars[..vpos]);
-            child_vars.push(variable);
-            child_vars.extend_from_slice(&parent_vars[vpos..]);
-            let pending = if merge {
-                dag_gate_admit(buckets, &child_set)
-            } else {
-                0
-            };
-            buckets.push(DagBucket {
-                set: child_set,
-                vars: child_vars,
-                rows: Vec::new(),
-                writer: pop_id,
-                pending,
-            });
-            if dstats {
-                dag_stats::record_bucket_created(buckets.len());
-            }
-            buckets.len() - 1
-        }
-    };
-    let store = &mut buckets[target].rows;
-    store.reserve(pairs.len() * child_stride);
-    for &(row_idx, value) in pairs {
-        let base = row_idx as usize * stride;
-        store.extend_from_slice(&g_rows[base..base + vpos]);
-        store.push(value);
-        store.extend_from_slice(&g_rows[base + vpos..base + stride]);
-    }
-    if stats {
-        blocked_stats::record_materialized(pairs.len());
-        blocked_stats::cells_add(pairs.len() * child_stride);
-    }
-}
-
-impl DagState {
-    /// One pop: choose a bucket (sprint: strict deepest; harvest:
-    /// deepest-ready per the counting gate), take at most `width` rows off
-    /// its tail (the seed bucket is one virtual row, always consumed
-    /// whole), and either stage full-bound rows for emission or expand by
-    /// estimating every row, stable-partitioning by its exact preferred
-    /// variable, proposing once per exact-variable group, and filing the
-    /// resulting child rows.
-    fn pop_once<'a, C: Constraint<'a>>(
-        &mut self,
-        constraint: &C,
-        influences: &[VariableSet; 128],
-        base_estimates: &[usize; 128],
-        width: usize,
-    ) {
-        let stats = blocked_stats::enabled();
-        let dstats = dag_stats::enabled();
-        // Readiness gating exists to hold buckets *for merging*, and only
-        // pays once the width has saturated (harvest — see
-        // `solve_dag_lazy` docs); in sprint, and always in lineage mode,
-        // the scheduler pops strict-deepest (DFS-isomorphic). The
-        // strict-deepest env ablation forces sprint scheduling throughout.
-        let gated = self.merge && width >= self.cap && !dag_strict_deepest();
-        if cfg!(debug_assertions) && self.merge {
-            dag_gate_check(&self.buckets);
-        }
-        let mut best: Option<(usize, usize)> = None;
-        for (i, b) in self.buckets.iter().enumerate() {
-            if gated && b.pending != 0 {
-                continue;
-            }
-            let depth = b.set.count();
-            if best.is_none_or(|(_, bd)| depth > bd) {
-                best = Some((i, depth));
-            }
-        }
-        let (idx, _) = best.expect("a minimal live bucket is always ready");
-        self.pop_id += 1;
-        if dstats {
-            dag_stats::record_pop();
-        }
-
-        // Full-bound bucket: take at most `width` rows off its tail and stage
-        // them in raw form — the remainder stays live under the same key,
-        // exactly like a partial expansion pop. `pull` postprocesses staged
-        // rows one at a time, so output values never become engine state and
-        // a later row's side effects (or panic) happen only when the consumer
-        // actually pulls that far.
-        if self.buckets[idx].set == self.full {
-            let n_rows = RowsView::new(&self.buckets[idx].vars, &self.buckets[idx].rows).len();
-            let take = n_rows.min(width.max(1));
-            debug_assert!(self.emit_next >= self.emit_count);
-            self.emit_vars.clear();
-            self.emit_rows.clear();
-            self.emit_next = 0;
-            self.emit_count = take;
-            if take == n_rows {
-                let mut bucket = self.buckets.swap_remove(idx);
-                if self.merge {
-                    dag_gate_retire(&mut self.buckets, &bucket.set);
-                }
-                self.emit_vars.append(&mut bucket.vars);
-                self.emit_rows.append(&mut bucket.rows);
-            } else {
-                let b = &mut self.buckets[idx];
-                let split = (n_rows - take) * b.vars.len();
-                self.emit_vars.extend_from_slice(&b.vars);
-                self.emit_rows.extend_from_slice(&b.rows[split..]);
-                b.rows.truncate(split);
-            }
-            if stats {
-                blocked_stats::cells_sub(self.emit_rows.len());
-            }
-            return;
-        }
-
-        let stride = self.buckets[idx].vars.len();
-
-        // Take up to `width` rows off the tail; a remainder stays live
-        // under the same key (it is its own future feeder — in harvest
-        // mode the gate holds its children until it drains, in sprint
-        // mode its children out-deepen it and dive first). The seed
-        // bucket is a single virtual zero-width row, so it is always
-        // consumed whole and flows through the generic path.
-        let mut scratch = std::mem::take(&mut self.scratch);
-        let n_rows = RowsView::new(&self.buckets[idx].vars, &self.buckets[idx].rows).len();
-        let take = n_rows.min(width.max(1));
-        scratch.parent_vars.clear();
-        let owned: Vec<RawInline>;
-        let (parent_set, work): (VariableSet, &[RawInline]) = if take == n_rows {
-            let b = self.buckets.swap_remove(idx);
-            if self.merge {
-                dag_gate_retire(&mut self.buckets, &b.set);
-            }
-            scratch.parent_vars.extend_from_slice(&b.vars);
-            owned = b.rows;
-            (b.set, &owned)
-        } else {
-            let b = &mut self.buckets[idx];
-            let split = (n_rows - take) * stride;
-            scratch.work.clear();
-            scratch.work.extend_from_slice(&b.rows[split..]);
-            b.rows.truncate(split);
-            scratch.parent_vars.extend_from_slice(&b.vars);
-            (b.set, &scratch.work)
-        };
-        scratch.cols = [COL_UNBOUND; 128];
-        for (i, &v) in scratch.parent_vars.iter().enumerate() {
-            scratch.cols[v] = i as u8;
-        }
-        let view = RowsView::new_indexed(&scratch.parent_vars, work, &scratch.cols);
-        let c_rows = take;
-        scratch.unbound.clear();
-        scratch.unbound.extend(self.full.subtract(parent_set));
-        scratch.unbound.retain(|&variable| {
-            constraint.proposal_coverage(variable, parent_set) >= ProposalCoverage::Covering
-        });
-        assert!(!scratch.unbound.is_empty(), "{SOURCE_FRONTIER_ERROR}");
-        let n_unbound = scratch.unbound.len();
-
-        // A single unbound variable means there is no choice to make and
-        // no partition to build — skip the estimate pass entirely and
-        // propose over the whole block. This is every query's deepest
-        // level, which at sprint widths is also the most-popped one.
-        if n_unbound == 1 {
-            let variable = scratch.unbound[0];
-            let coverage = constraint.proposal_coverage(variable, parent_set);
-            if order_trace::enabled() {
-                order_trace::record(stride, variable, c_rows as u64);
-            }
-            scratch.pairs.clear();
-            _ = constraint.propose_with_layout(
-                variable,
-                &view,
-                &mut CandidateSink::Tagged(&mut scratch.pairs),
-            );
-            if coverage == ProposalCoverage::Covering {
-                constraint.confirm(
-                    variable,
-                    &view,
-                    &mut CandidateSink::Tagged(&mut scratch.pairs),
-                );
-            }
-            let raw_pairs =
-                admit_reverse_stable_set(&mut scratch.pairs, &mut scratch.pair_admission);
-            if stats {
-                blocked_stats::record_level(blocked_stats::LevelRecord {
-                    depth: stride,
-                    rows: c_rows,
-                    chunk_width: width,
-                    group_sizes: vec![c_rows],
-                    batch_sizes: vec![raw_pairs],
-                });
-            }
-            dag_file(
-                &mut self.buckets,
-                self.merge,
-                self.pop_id,
-                parent_set,
-                &scratch.parent_vars,
-                variable,
-                work,
-                &scratch.pairs,
-            );
-            if stats {
-                blocked_stats::cells_sub(work.len());
-            }
-            self.scratch = scratch;
-            return;
-        }
-
-        // 1. Estimate: flat variable-major matrix, one column per unbound
-        //    variable — columns land contiguously because the sink appends.
-        scratch.est.clear();
-        for &v in scratch.unbound.iter() {
-            let _ = source_quote_column(constraint, v, parent_set, &view, &mut scratch.est)
-                .expect("unconstrained variable in query");
-        }
-        debug_assert_eq!(scratch.est.len(), n_unbound * c_rows);
-
-        // 2. Per-row preferred variable: argmax of the engine's ordering
-        //    key over the row's matrix entries. This assignment is semantic:
-        //    the chosen proposer owns candidate support and first-seen order.
-        scratch.preferred.clear();
-        scratch.group_counts.clear();
-        scratch.group_counts.resize(n_unbound, 0);
-        for i in 0..c_rows {
-            let mut preferred = None;
-            for j in 0..n_unbound {
-                let estimate = scratch.est[j * c_rows + i];
-                let key = variable_choice_key(
-                    scratch.unbound[j],
-                    estimate,
-                    base_estimates[scratch.unbound[j]],
-                    influences[scratch.unbound[j]].count(),
-                );
-                if preferred.is_none_or(|(_, best_key)| key > best_key) {
-                    preferred = Some((j, key));
-                }
-            }
-            let preferred = preferred.expect("non-empty unbound").0;
-            scratch.preferred.push(preferred as u32);
-            scratch.group_counts[preferred] += 1;
-        }
-        let n_groups = scratch
-            .group_counts
-            .iter()
-            .filter(|&&count| count > 0)
-            .count();
-
-        // 3. Partition (stable counting sort); a single group borrows the
-        //    popped rows directly.
-        scratch.starts.clear();
-        let mut acc = 0usize;
-        for &c in &scratch.group_counts {
-            scratch.starts.push(acc);
-            acc += c;
-        }
-        if n_groups > 1 {
-            if stats {
-                blocked_stats::cells_add(work.len());
-            }
-            scratch.part.clear();
-            scratch.part.resize(work.len(), [0u8; 32]);
-            scratch.cursors.clear();
-            scratch.cursors.extend_from_slice(&scratch.starts);
-            for i in 0..c_rows {
-                let j = scratch.preferred[i] as usize;
-                let dst = scratch.cursors[j];
-                scratch.cursors[j] += 1;
-                scratch.part[dst * stride..(dst + 1) * stride]
-                    .copy_from_slice(&work[i * stride..(i + 1) * stride]);
-            }
-        }
-
-        // 4. One batched propose per exact-variable group; file into child
-        //    buckets.
-        let mut group_sizes_rec: Vec<usize> = Vec::new();
-        let mut batch_sizes_rec: Vec<usize> = Vec::new();
-        for j in 0..n_unbound {
-            let g_count = scratch.group_counts[j];
-            if g_count == 0 {
-                continue;
-            }
-            let variable = scratch.unbound[j];
-            let g_rows: &[RawInline] = if n_groups == 1 {
-                work
-            } else {
-                &scratch.part[scratch.starts[j] * stride..(scratch.starts[j] + g_count) * stride]
-            };
-            if order_trace::enabled() {
-                order_trace::record(stride, variable, g_count as u64);
-            }
-            scratch.pairs.clear();
-            _ = constraint.propose_with_layout(
-                variable,
-                &RowsView::new_indexed(&scratch.parent_vars, g_rows, &scratch.cols),
-                &mut CandidateSink::Tagged(&mut scratch.pairs),
-            );
-            if constraint.proposal_coverage(variable, parent_set) == ProposalCoverage::Covering {
-                constraint.confirm(
-                    variable,
-                    &RowsView::new_indexed(&scratch.parent_vars, g_rows, &scratch.cols),
-                    &mut CandidateSink::Tagged(&mut scratch.pairs),
-                );
-            }
-            let raw_pairs =
-                admit_reverse_stable_set(&mut scratch.pairs, &mut scratch.pair_admission);
-            if stats {
-                group_sizes_rec.push(g_count);
-                batch_sizes_rec.push(raw_pairs);
-            }
-            dag_file(
-                &mut self.buckets,
-                self.merge,
-                self.pop_id,
-                parent_set,
-                &scratch.parent_vars,
-                variable,
-                g_rows,
-                &scratch.pairs,
-            );
-        }
-        if stats {
-            if n_groups > 1 {
-                blocked_stats::cells_sub(work.len());
-            }
-            blocked_stats::record_level(blocked_stats::LevelRecord {
-                depth: stride,
-                rows: c_rows,
-                chunk_width: width,
-                group_sizes: group_sizes_rec,
-                batch_sizes: batch_sizes_rec,
-            });
-            blocked_stats::cells_sub(work.len());
-        }
-        self.scratch = scratch;
-    }
-}
-
-impl DagState {
-    /// One consumer pull: postprocess staged full rows one at a time, else
-    /// resume the engine — run pops at the current width until something is
-    /// staged (or the worklist drains), then grow the width (TCP slow start
-    /// on consumer demand).
-    fn pull<'a, C, P, R>(
-        &mut self,
-        constraint: &C,
-        postprocessing: &P,
-        projection: &mut ProjectionGate,
-        influences: &[VariableSet; 128],
-        base_estimates: &[usize; 128],
-    ) -> Option<R>
-    where
-        C: Constraint<'a>,
-        P: Fn(&Binding) -> Option<R>,
-    {
-        if projection.is_done() {
-            return None;
-        }
-        loop {
-            while self.emit_next < self.emit_count {
-                let row_index = self.emit_next;
-                // Consume the raw row before invoking user postprocessing. If
-                // it panics and the unwind is caught, retrying the iterator
-                // must not repeat the same row or its side effects.
-                self.emit_next += 1;
-                let stride = self.emit_vars.len();
-                let start = row_index * stride;
-                let row = &self.emit_rows[start..start + stride];
-                for (k, &v) in self.emit_vars.iter().enumerate() {
-                    self.binding.set(v, &row[k]);
-                }
-                match projection.project(&self.binding, postprocessing) {
-                    ProjectionStep::Yield(result) => return Some(result),
-                    ProjectionStep::Skip => {}
-                    ProjectionStep::Done => return None,
-                }
-            }
-            if self.buckets.is_empty() {
-                return None;
-            }
-            let width = self.width;
-            if dag_stats::enabled() {
-                dag_stats::record_width(width);
-            }
-            while self.emit_next >= self.emit_count && !self.buckets.is_empty() {
-                self.pop_once(constraint, influences, base_estimates, width);
-            }
-            self.width = self.width.saturating_mul(self.growth).clamp(1, self.cap);
-        }
-    }
-}
-
-impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for DagIter<C, P, R> {
-    type Item = R;
-
-    fn next(&mut self) -> Option<R> {
-        self.state.pull(
-            &self.constraint,
-            &self.postprocessing,
-            &mut self.projection,
-            &self.influences,
-            &self.base_estimates,
-        )
-    }
 }
 
 /// The search mode of the query engine.
@@ -4520,16 +3151,6 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
             return None;
         }
 
-        if let Some(state) = &mut self.dag {
-            return state.pull(
-                &self.constraint,
-                &self.postprocessing,
-                &mut self.projection,
-                &self.influences,
-                &self.base_estimates,
-            );
-        }
-
         if let Some(state) = &mut self.residual {
             return state.pull(
                 &self.constraint,
@@ -4542,7 +3163,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
 
         if self.scheduler == QueryScheduler::ResidualState
             && fresh
-            && matches!(self.mode, Search::NextVariable | Search::Done)
+            && matches!(self.mode, Search::NextVariable)
             && self.stack.is_empty()
             && self.bound.is_empty()
             && self.touched_variables.is_empty()
@@ -4554,28 +3175,6 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
                     self.mode,
                     self.residual_lowering,
                 )));
-            return state.pull(
-                &self.constraint,
-                &self.postprocessing,
-                &mut self.projection,
-                &self.influences,
-                &self.base_estimates,
-            );
-        }
-
-        // The lazy DAG is an explicit diagnostic selection. Fresh ordinary
-        // Rayon conversion installs a residual runtime before producer work,
-        // so this branch is reached only by direct serial pulls.
-        if self.scheduler == QueryScheduler::LazyDag
-            && fresh
-            && matches!(self.mode, Search::NextVariable)
-            && self.stack.is_empty()
-            && self.bound.is_empty()
-            && self.touched_variables.is_empty()
-        {
-            let state = self
-                .dag
-                .insert(Box::new(DagState::new(self.constraint.variables())));
             return state.pull(
                 &self.constraint,
                 &self.postprocessing,
@@ -4660,7 +3259,6 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> fmt::Debug for Quer
             .field("scheduler", &self.scheduler)
             .field("mode", &self.mode)
             .field("iteration_started", &self.iteration_started)
-            .field("dag_started", &self.dag.is_some())
             .field("residual_started", &self.residual.is_some())
             .field("stack", &self.stack)
             .field("unbound", &self.unbound)
@@ -4681,10 +3279,6 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> fmt::Debug for Quer
 //
 // Ordinary `IntoParallelIterator` installs the canonical residual runtime on
 // a fresh query and delegates partitioning to its affine splitter.
-// `Query::into_par_dag_iter` explicitly selects the comparison DAG: seed
-// negotiation runs until a bucket contains multiple rows, then Rayon bisects
-// those affine rows into independent worklists. Each DAG fold leaf therefore
-// keeps batching, per-row variable selection, and local route reconvergence.
 // A partially consumed query remains one exact-remainder leaf when converted
 // through the ordinary `IntoParallelIterator` path.
 //
@@ -4701,16 +3295,13 @@ mod parallel {
     use rayon::iter::plumbing::{bridge_unindexed, Folder, UnindexedConsumer, UnindexedProducer};
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
-    /// Parallel iterator over the results of a [`Query`]. Obtained either via
-    /// ordinary [`IntoParallelIterator::into_par_iter`] (canonical residual
-    /// affine sharding) or [`Query::into_par_dag_iter`] (affine DAG-frontier
-    /// sharding).
+    /// Parallel iterator over the results of a [`Query`], obtained via
+    /// ordinary [`IntoParallelIterator::into_par_iter`].
     ///
     /// Fresh ordinary iteration delegates directly to
     /// [`ResidualStateParIter`](residual::ResidualStateParIter), including its
     /// affine splitter and fold loop. The wrapped [`Query`] producer exists
-    /// only for the explicit comparison DAG and already-started exact
-    /// remainders.
+    /// only for already-started exact remainders.
     ///
     /// Rayon clones the constraint tree and postprocessor for each shard.
     /// Clone-local interior state is therefore clone-local by definition;
@@ -4722,70 +3313,7 @@ mod parallel {
 
     enum QueryParInner<C, P: Fn(&Binding) -> Option<R>, R> {
         Residual(residual::ResidualStateParIter<C, P, R>),
-        Query {
-            inner: Box<Query<C, P, R>>,
-            split_budget: usize,
-        },
-    }
-
-    impl<'a, C, P, R> Query<C, P, R>
-    where
-        C: Constraint<'a> + Clone + Send + 'a,
-        P: Fn(&Binding) -> Option<R> + Clone + Send,
-        R: Send,
-    {
-        /// Consume a fresh query as a block-native parallel DAG iterator.
-        ///
-        /// Unlike ordinary [`IntoParallelIterator::into_par_iter`], which uses
-        /// the adaptive-width canonical residual runtime, this explicit path
-        /// starts the lazy DAG at saturated width and partitions its affine row
-        /// frontier into at most one worklist shard per Rayon worker.
-        /// Each shard preserves backend batches, per-row variable selection,
-        /// and route reconvergence among the rows it owns; reconvergence across
-        /// shards is traded for parallelism. Fully drained results preserve the
-        /// query's distinct projected-row set, not its iteration order.
-        ///
-        /// This path remains a comparison control for the bound-variable-set
-        /// DAG.
-        ///
-        /// # Panics
-        ///
-        /// Panics once [`Iterator::next`] has been called. Initializing a new
-        /// DAG from the seed after partial consumption would duplicate prior
-        /// results; use ordinary `into_par_iter()` to drain a partially
-        /// consumed query's exact remaining state as one leaf.
-        pub fn into_par_dag_iter(mut self) -> QueryParIter<C, P, R> {
-            assert!(
-                !self.iteration_started
-                    && self.dag.is_none()
-                    && self.residual.is_none()
-                    && self.stack.is_empty()
-                    && self.bound.is_empty()
-                    && self.touched_variables.is_empty()
-                    && matches!(self.mode, Search::NextVariable | Search::Done),
-                "cannot initialize parallel DAG iteration after Iterator::next has been called; \
-                 use ordinary into_par_iter() to drain the exact remainder"
-            );
-
-            self.scheduler = QueryScheduler::LazyDag;
-            let mut state = DagState::new(self.constraint.variables());
-            // Full parallel enumeration is an explicit throughput request, so
-            // do not repeat the ordinary iterator's first-result slow start in
-            // every shard.
-            state.width = state.cap;
-            if matches!(self.mode, Search::Done) {
-                state.buckets.clear();
-            }
-            self.dag = Some(Box::new(state));
-
-            QueryParIter {
-                inner: QueryParInner::Query {
-                    inner: Box::new(self),
-                    // Filled at `drive_unindexed`, inside the consuming pool.
-                    split_budget: 0,
-                },
-            }
-        }
+        Query(Box<Query<C, P, R>>),
     }
 
     impl<'a, C, P, R> IntoParallelIterator for Query<C, P, R>
@@ -4801,7 +3329,7 @@ mod parallel {
             // Move a fresh ordinary query directly into the existing residual
             // iterator and producer. QueryParIter is only a type-level adapter;
             // it adds no residual split or execution path of its own.
-            if !self.iteration_started && self.dag.is_none() && self.residual.is_none() {
+            if !self.iteration_started && self.residual.is_none() {
                 let lowering = self.residual_lowering;
                 let residual = self.solve_residual_state_lazy_with(lowering);
                 return QueryParIter {
@@ -4810,11 +3338,8 @@ mod parallel {
             }
 
             QueryParIter {
-                inner: QueryParInner::Query {
-                    inner: Box::new(self),
-                    // An already-started exact remainder is one leaf.
-                    split_budget: 0,
-                },
+                // An already-started exact remainder is one leaf.
+                inner: QueryParInner::Query(Box::new(self)),
             }
         }
     }
@@ -4828,95 +3353,25 @@ mod parallel {
         type Item = R;
 
         fn split(self) -> (Self, Option<Self>) {
-            let (mut inner, mut split_budget) = match self.inner {
+            match self.inner {
                 QueryParInner::Residual(residual) => {
                     let (left, right) = residual.split();
-                    return (
+                    (
                         QueryParIter {
                             inner: QueryParInner::Residual(left),
                         },
                         right.map(|right| QueryParIter {
                             inner: QueryParInner::Residual(right),
                         }),
-                    );
+                    )
                 }
-                QueryParInner::Query {
-                    inner,
-                    split_budget,
-                } => (inner, split_budget),
-            };
-
-            // The empty projection has one possible public key. Sharding its
-            // hidden witnesses can only do redundant work and weakens the
-            // existence-query latency guarantee, so keep it in one leaf.
-            if inner.projection.is_empty_head()
-                || inner.iteration_started
-                || inner.dag.is_none()
-                || split_budget == 0
-            {
-                return (
+                QueryParInner::Query(inner) => (
                     QueryParIter {
-                        inner: QueryParInner::Query {
-                            inner,
-                            split_budget: 0,
-                        },
+                        inner: QueryParInner::Query(inner),
                     },
                     None,
-                );
+                ),
             }
-            split_budget -= 1;
-
-            // Explicit parallel-DAG query: split the affine frontier. `right`
-            // owns disjoint raw rows and receives its own cloned constraint
-            // and postprocessor when the surrounding Query is cloned.
-            let right_state = {
-                let q = &mut *inner;
-                q.dag.as_mut().expect("checked above").split_for_parallel(
-                    &q.constraint,
-                    &q.influences,
-                    &q.base_estimates,
-                )
-            };
-            let Some(right_state) = right_state else {
-                return (
-                    QueryParIter {
-                        inner: QueryParInner::Query {
-                            inner,
-                            split_budget: 0,
-                        },
-                    },
-                    None,
-                );
-            };
-            if dag_stats::enabled() {
-                dag_stats::record_parallel_split();
-            }
-
-            // Clone only the small Query shell plus constraint and
-            // postprocessor. Temporarily remove the left worklist so a split
-            // does not deep-clone all of its frontier rows.
-            let left_state = inner.dag.take().expect("checked above");
-            let projection = inner.projection.share_for_parallel();
-            let mut right = (*inner).clone();
-            inner.dag = Some(left_state);
-            right.dag = Some(Box::new(right_state));
-            right.projection.attach_shared(projection);
-            let left_budget = split_budget / 2;
-            let right_budget = split_budget - left_budget;
-            (
-                QueryParIter {
-                    inner: QueryParInner::Query {
-                        inner,
-                        split_budget: left_budget,
-                    },
-                },
-                Some(QueryParIter {
-                    inner: QueryParInner::Query {
-                        inner: Box::new(right),
-                        split_budget: right_budget,
-                    },
-                }),
-            )
         }
 
         fn fold_with<F: Folder<R>>(self, folder: F) -> F {
@@ -4924,7 +3379,7 @@ mod parallel {
                 QueryParInner::Residual(residual) => {
                     return UnindexedProducer::fold_with(residual, folder);
                 }
-                QueryParInner::Query { inner, .. } => inner,
+                QueryParInner::Query(inner) => inner,
             };
             let mut folder = folder;
             while !folder.full() {
@@ -4949,27 +3404,15 @@ mod parallel {
         where
             Con: UnindexedConsumer<Self::Item>,
         {
-            let inner = match self.inner {
-                QueryParInner::Residual(residual) => {
-                    return residual.drive_unindexed(consumer);
-                }
-                QueryParInner::Query { inner, .. } => inner,
-            };
-
-            let split_budget = if inner.dag.is_some() && !inner.iteration_started {
-                rayon::current_num_threads().saturating_sub(1)
-            } else {
-                0
-            };
-            bridge_unindexed(
-                QueryParIter {
-                    inner: QueryParInner::Query {
-                        inner,
-                        split_budget,
+            match self.inner {
+                QueryParInner::Residual(residual) => residual.drive_unindexed(consumer),
+                QueryParInner::Query(inner) => bridge_unindexed(
+                    QueryParIter {
+                        inner: QueryParInner::Query(inner),
                     },
-                },
-                consumer,
-            )
+                    consumer,
+                ),
+            }
         }
     }
 
@@ -5435,12 +3878,12 @@ mod tests {
             residual::FormulaScope::UnionLeaves,
             residual::ProgramScope::All,
         );
-        let dag = Query::new(variable.is(U256BE::inline_from(1u64)), |_| Some(()))
-            .lazy_dag_scheduler()
+        let scalar = Query::new(variable.is(U256BE::inline_from(1u64)), |_| Some(()))
+            .sequential()
             .residual_lowering(intermediate);
-        assert_eq!(dag.scheduler, QueryScheduler::LazyDag);
+        assert_eq!(scalar.scheduler, QueryScheduler::Sequential);
         assert_eq!(
-            dag.residual_lowering, intermediate,
+            scalar.residual_lowering, intermediate,
             "selecting lowering must not rewrite the physical scheduler"
         );
     }
@@ -6010,282 +4453,8 @@ mod tests {
             "residual shards must inherit SET-admitted proposal rows"
         );
     }
-
-    #[derive(Clone)]
-    struct DagSetAdmissionProbe {
-        descendants: std::sync::Arc<std::sync::Mutex<Vec<(RawInline, RawInline)>>>,
-    }
-
-    impl DagSetAdmissionProbe {
-        const PARENT: VariableId = 0;
-        const VALUE: VariableId = 1;
-        const LEAF: VariableId = 2;
-        const P0: RawInline = [7; 32];
-        const P1: RawInline = [8; 32];
-        const SHARED_VALUE: RawInline = [9; 32];
-        const LEAF_VALUE: RawInline = [10; 32];
-    }
-
-    impl Constraint<'static> for DagSetAdmissionProbe {
-        fn variables(&self) -> VariableSet {
-            VariableSet::new_singleton(Self::PARENT)
-                .union(VariableSet::new_singleton(Self::VALUE))
-                .union(VariableSet::new_singleton(Self::LEAF))
-        }
-
-        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-            if self.variables().is_set(variable) && !bound.is_set(variable) {
-                ProposalCoverage::Exact
-            } else {
-                ProposalCoverage::None
-            }
-        }
-
-        fn estimate(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            out: &mut EstimateSink<'_>,
-        ) -> bool {
-            match variable {
-                Self::PARENT => out.fill(1, view.len()),
-                Self::VALUE => out.fill(2, view.len()),
-                Self::LEAF => out.fill(4, view.len()),
-                _ => return false,
-            }
-            true
-        }
-
-        fn propose(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) {
-            match variable {
-                Self::PARENT => {
-                    for row in 0..view.len() {
-                        candidates.extend_row(row as u32, [Self::P0, Self::P1]);
-                    }
-                }
-                Self::VALUE => {
-                    let parent = view.col(Self::PARENT).expect("parent is bound first");
-                    for (row_index, row) in view.iter().enumerate() {
-                        let copies = if row[parent] == Self::P0 { 2 } else { 1 };
-                        candidates.extend_row(
-                            row_index as u32,
-                            std::iter::repeat_n(Self::SHARED_VALUE, copies),
-                        );
-                    }
-                }
-                Self::LEAF => {
-                    let parent = view.col(Self::PARENT).expect("parent is bound");
-                    let value = view.col(Self::VALUE).expect("value is bound");
-                    let mut descendants = self.descendants.lock().unwrap();
-                    for (row_index, row) in view.iter().enumerate() {
-                        descendants.push((row[parent], row[value]));
-                        candidates.push(row_index as u32, Self::LEAF_VALUE);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        fn confirm(
-            &self,
-            variable: VariableId,
-            _view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) {
-            candidates.retain(|_, value| match variable {
-                Self::PARENT => *value == Self::P0 || *value == Self::P1,
-                Self::VALUE => *value == Self::SHARED_VALUE,
-                Self::LEAF => *value == Self::LEAF_VALUE,
-                _ => false,
-            });
-        }
-
-        fn satisfied(&self, view: &RowsView<'_>) -> bool {
-            view.iter().all(|row| {
-                view.col(Self::PARENT)
-                    .is_none_or(|column| row[column] == Self::P0 || row[column] == Self::P1)
-                    && view
-                        .col(Self::VALUE)
-                        .is_none_or(|column| row[column] == Self::SHARED_VALUE)
-                    && view
-                        .col(Self::LEAF)
-                        .is_none_or(|column| row[column] == Self::LEAF_VALUE)
-            })
-        }
-    }
-
     #[test]
-    fn dag_action_admission_is_parent_scoped_before_filing() {
-        let descendants = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let rows: Vec<_> = Query::new(
-            DagSetAdmissionProbe {
-                descendants: descendants.clone(),
-            },
-            |binding: &Binding| {
-                Some((
-                    *binding.get(DagSetAdmissionProbe::PARENT)?,
-                    *binding.get(DagSetAdmissionProbe::VALUE)?,
-                    *binding.get(DagSetAdmissionProbe::LEAF)?,
-                ))
-            },
-        )
-        .solve_dag_lazy()
-        .start_width(usize::MAX)
-        .growth(1)
-        .collect();
-
-        assert_eq!(
-            rows,
-            [
-                (
-                    DagSetAdmissionProbe::P0,
-                    DagSetAdmissionProbe::SHARED_VALUE,
-                    DagSetAdmissionProbe::LEAF_VALUE,
-                ),
-                (
-                    DagSetAdmissionProbe::P1,
-                    DagSetAdmissionProbe::SHARED_VALUE,
-                    DagSetAdmissionProbe::LEAF_VALUE,
-                ),
-            ]
-        );
-        assert_eq!(
-            *descendants.lock().unwrap(),
-            [
-                (
-                    DagSetAdmissionProbe::P0,
-                    DagSetAdmissionProbe::SHARED_VALUE,
-                ),
-                (
-                    DagSetAdmissionProbe::P1,
-                    DagSetAdmissionProbe::SHARED_VALUE,
-                ),
-            ],
-            "an intra-parent duplicate must vanish while an equal value under another parent survives"
-        );
-    }
-
-    #[derive(Clone, Copy)]
-    struct DagTerminalSetAdmissionProbe;
-
-    impl Constraint<'static> for DagTerminalSetAdmissionProbe {
-        fn variables(&self) -> VariableSet {
-            VariableSet::new_singleton(DagSetAdmissionProbe::PARENT)
-                .union(VariableSet::new_singleton(DagSetAdmissionProbe::VALUE))
-        }
-
-        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-            if variable == DagSetAdmissionProbe::VALUE
-                && bound.is_set(DagSetAdmissionProbe::PARENT)
-                && !bound.is_set(variable)
-            {
-                ProposalCoverage::Exact
-            } else {
-                ProposalCoverage::None
-            }
-        }
-
-        fn estimate(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            out: &mut EstimateSink<'_>,
-        ) -> bool {
-            if self.variables().is_set(variable) {
-                out.fill(1, view.len());
-                true
-            } else {
-                false
-            }
-        }
-
-        fn propose(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) {
-            if variable != DagSetAdmissionProbe::VALUE {
-                return;
-            }
-            let parent = view
-                .col(DagSetAdmissionProbe::PARENT)
-                .expect("parent is already bound");
-            for (row_index, row) in view.iter().enumerate() {
-                let copies = if row[parent] == DagSetAdmissionProbe::P0 {
-                    2
-                } else {
-                    1
-                };
-                candidates.extend_row(
-                    row_index as u32,
-                    std::iter::repeat_n(DagSetAdmissionProbe::SHARED_VALUE, copies),
-                );
-            }
-        }
-
-        fn confirm(
-            &self,
-            variable: VariableId,
-            _view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) {
-            if variable == DagSetAdmissionProbe::VALUE {
-                candidates.retain(|_, value| *value == DagSetAdmissionProbe::SHARED_VALUE);
-            }
-        }
-
-        fn satisfied(&self, view: &RowsView<'_>) -> bool {
-            view.col(DagSetAdmissionProbe::VALUE).is_none_or(|column| {
-                view.iter()
-                    .all(|row| row[column] == DagSetAdmissionProbe::SHARED_VALUE)
-            })
-        }
-    }
-
-    #[test]
-    fn dag_single_unbound_fast_path_admits_before_filing() {
-        let full = DagTerminalSetAdmissionProbe.variables();
-        let mut parent_set = VariableSet::new_empty();
-        parent_set.set(DagSetAdmissionProbe::PARENT);
-        let mut state = DagState::new(full);
-        state.buckets = vec![DagBucket {
-            set: parent_set,
-            vars: vec![DagSetAdmissionProbe::PARENT],
-            rows: vec![DagSetAdmissionProbe::P0, DagSetAdmissionProbe::P1],
-            writer: 0,
-            pending: 0,
-        }];
-
-        state.pop_once(
-            &DagTerminalSetAdmissionProbe,
-            &[VariableSet::new_empty(); 128],
-            &[1; 128],
-            usize::MAX,
-        );
-
-        assert_eq!(state.buckets.len(), 1);
-        let child = &state.buckets[0];
-        assert_eq!(child.set, full);
-        assert_eq!(
-            RowsView::new(&child.vars, &child.rows)
-                .iter()
-                .map(|row| (row[0], row[1]))
-                .collect::<Vec<_>>(),
-            [
-                (DagSetAdmissionProbe::P0, DagSetAdmissionProbe::SHARED_VALUE,),
-                (DagSetAdmissionProbe::P1, DagSetAdmissionProbe::SHARED_VALUE,),
-            ]
-        );
-    }
-
-    #[test]
-    fn scheduler_width_and_equal_key_ties_preserve_semantic_variable_actions() {
+    fn residual_width_and_equal_key_ties_preserve_semantic_variable_actions() {
         let constraint = VariableOrderBagConstraint {
             tie_children: false,
         };
@@ -6349,26 +4518,7 @@ mod tests {
                 .start_width(8)
                 .growth(1)
                 .collect();
-            let mut dag_narrow: Vec<_> = variable_order_bag_query(tie_children)
-                .solve_dag_lazy()
-                .cap(1)
-                .start_width(1)
-                .growth(1)
-                .collect();
-            let mut dag_wide: Vec<_> = variable_order_bag_query(tie_children)
-                .solve_dag_lazy()
-                .cap(8)
-                .start_width(8)
-                .growth(1)
-                .collect();
-
-            for bag in [
-                &mut sequential,
-                &mut residual_narrow,
-                &mut residual_wide,
-                &mut dag_narrow,
-                &mut dag_wide,
-            ] {
+            for bag in [&mut sequential, &mut residual_narrow, &mut residual_wide] {
                 bag.sort_unstable();
                 assert_eq!(bag, &expected);
             }

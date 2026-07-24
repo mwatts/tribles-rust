@@ -215,7 +215,6 @@ fn repeated_shapes_match_tribleset_estimate_propose_and_confirm() {
 #[derive(Clone, Copy, Debug)]
 enum Scheduler {
     Sequential,
-    LazyDag,
     Residual,
     Ordinary,
 }
@@ -237,7 +236,6 @@ where
     });
     let mut rows: Vec<_> = match scheduler {
         Scheduler::Sequential => query.sequential().collect(),
-        Scheduler::LazyDag => query.lazy_dag_scheduler().collect(),
         Scheduler::Residual => query.residual_state_scheduler().collect(),
         Scheduler::Ordinary => query.collect(),
     };
@@ -263,7 +261,6 @@ fn assert_query_shape<'a, FS, FA, CS, CA, const N: usize>(
 
     for scheduler in [
         Scheduler::Sequential,
-        Scheduler::LazyDag,
         Scheduler::Residual,
         Scheduler::Ordinary,
     ] {

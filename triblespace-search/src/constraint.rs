@@ -1824,18 +1824,13 @@ mod tests {
             )
         };
         let mut sequential: Vec<_> = Query::new(make(), project_pair).sequential().collect();
-        let mut dag: Vec<_> = Query::new(make(), project_pair)
-            .lazy_dag_scheduler()
-            .collect();
         let mut residual = Query::new(make(), project_pair)
             .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .cap(1)
             .start_width(1);
         let mut full: Vec<_> = residual.by_ref().collect();
         sequential.sort_unstable();
-        dag.sort_unstable();
         full.sort_unstable();
-        assert_eq!(dag, sequential);
         assert_eq!(full, sequential);
         assert_eq!(full, expected_public_pairs);
         for parent_value in parent_rows {

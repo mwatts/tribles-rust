@@ -504,19 +504,16 @@ alter the constraint's SET meaning.
 
 The explicit `Query::sequential()` scheduler calls these methods with a one-row
 [`RowsView`](triblespace::core::query::RowsView) and scalar/plain-value sinks;
-every live fresh ordinary iterator uses canonical residual states, while
-`Query::lazy_dag_scheduler()` selects the bound-variable-set DAG explicitly for
-comparison. Both block-native engines call the same methods with row blocks and
-tagged candidate frontiers. Implementations without a
-specialized batch operation can loop over the rows, use
-`CandidateSink::extend_row`, and use the `confirm_per_row` adapter.
+every live fresh ordinary iterator uses canonical residual states with row
+blocks and tagged candidate frontiers. Implementations without a specialized
+batch operation can loop over the rows, use `CandidateSink::extend_row`, and
+use the `confirm_per_row` adapter.
 
 The four row-taking operations must also be row-homomorphic: evaluating
 non-empty consecutive sub-blocks independently and concatenating their
-row-remapped outputs must equal evaluating the original block. The blocked
+row-remapped outputs must equal evaluating the original block. The block-native
 schedulers, including ordinary `Query::into_par_iter()` and the explicit
-`Query::into_par_dag_iter()` /
-`Query::into_par_residual_state_iter()` frontier-sharding paths, are free to
+`Query::into_par_residual_state_iter()` frontier-sharding path, are free to
 change block boundaries; block-global top-k or first-row semantics would
 therefore be incorrect. Diagnostics may observe call boundaries, but must not
 feed those observations back into protocol answers.

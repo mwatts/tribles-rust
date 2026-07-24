@@ -2,7 +2,7 @@
 //!
 //! Engine-to-engine parity can preserve a shared bug. These tests instead
 //! interpret generated relations with plain Rust set algebra, then require the
-//! sequential cursor and every worklist configuration to produce exactly that
+//! sequential cursor and every residual configuration to produce exactly that
 //! distinct raw projected-row set on both in-memory and succinct backends.
 
 use std::collections::{HashMap, HashSet};
@@ -97,7 +97,6 @@ fn parallel_pool(threads: usize) -> &'static rayon::ThreadPool {
 enum RpqEngine {
     Sequential,
     Ordinary,
-    LazyDag,
     ResidualCursor,
     ResidualEager,
     ResidualLazy,
@@ -123,7 +122,6 @@ fn assert_rpq_engines<'a, C, P, R, F>(
     let mut engines = vec![
         RpqEngine::Sequential,
         RpqEngine::Ordinary,
-        RpqEngine::LazyDag,
         RpqEngine::ResidualCursor,
         RpqEngine::ResidualEager,
         RpqEngine::ResidualLazy,
@@ -147,7 +145,6 @@ fn assert_rpq_engines<'a, C, P, R, F>(
                 );
                 rows
             }
-            RpqEngine::LazyDag => make_query().solve_dag_lazy().collect::<Vec<_>>(),
             RpqEngine::ResidualCursor => {
                 conservative_residual_cursor(make_query()).collect::<Vec<_>>()
             }
@@ -197,42 +194,6 @@ macro_rules! assert_all_engines_match {
             $label
         );
         prop_assert_eq!(
-            multiset(($query).solve_blocked()),
-            expected.clone(),
-            "{}: blocked",
-            $label
-        );
-        prop_assert_eq!(
-            multiset(($query).solve_dag()),
-            expected.clone(),
-            "{}: dag",
-            $label
-        );
-        prop_assert_eq!(
-            multiset(($query).solve_dag_unmerged()),
-            expected.clone(),
-            "{}: dag-unmerged",
-            $label
-        );
-        prop_assert_eq!(
-            multiset(($query).solve_dag_lazy()),
-            expected.clone(),
-            "{}: lazy dag",
-            $label
-        );
-        prop_assert_eq!(
-            multiset(($query).solve_dag_lazy().start_width(1).growth(1)),
-            expected.clone(),
-            "{}: lazy dag fixed-width sprint",
-            $label
-        );
-        prop_assert_eq!(
-            multiset(($query).solve_dag_lazy().cap(2)),
-            expected.clone(),
-            "{}: lazy dag forced harvest",
-            $label
-        );
-        prop_assert_eq!(
             multiset(conservative_residual_cursor($query)),
             expected.clone(),
             "{}: explicit conservative Query residual state",
@@ -246,15 +207,6 @@ macro_rules! assert_all_engines_match {
                 ordinary_parallel,
                 expected.clone(),
                 "{}: ordinary parallel residual state ({} workers)",
-                $label,
-                threads
-            );
-            let dag = parallel_pool(threads)
-                .install(|| multiset(($query).into_par_dag_iter().collect::<Vec<_>>()));
-            prop_assert_eq!(
-                dag,
-                expected.clone(),
-                "{}: explicit parallel DAG ({} workers)",
                 $label,
                 threads
             );
@@ -275,12 +227,6 @@ macro_rules! assert_residual_engines_match {
             multiset($query),
             expected.clone(),
             "{}: ordinary residual-default Query",
-            $label
-        );
-        prop_assert_eq!(
-            multiset(($query).solve_dag_lazy()),
-            expected.clone(),
-            "{}: lazy DAG reference",
             $label
         );
         prop_assert_eq!(
@@ -511,12 +457,6 @@ fn root_formula_candidate_paging_is_storage_polymorphic() {
                 expected,
                 concat!($label, ": ordinary")
             );
-            assert_eq!(
-                multiset(query!($store).solve_dag_lazy()),
-                expected,
-                concat!($label, ": LazyDag")
-            );
-
             for (geometry, cap, growth) in [("width one", 1, 1), ("geometric", 64, 2)] {
                 assert_eq!(
                     multiset(

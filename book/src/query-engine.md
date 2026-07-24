@@ -9,13 +9,13 @@ adapt to the values already found instead of being fixed before evaluation.
 
 The current protocol is **block-native**. Its unit of work is not necessarily
 one partial binding, but a block of partial bindings that have the same set of
-bound variables. Every live serial ordinary
-iterator uses the canonical residual-state worklist. The bound-variable-set
-DAG and [`Query::sequential`](triblespace::core::query::Query::sequential)
-remain explicit controls; the sequential path speaks the same protocol with
-blocks of one row. This shared interface is the important part of the design:
-a constraint has one implementation whether its probes are issued one at a
-time, fused into a CPU loop, or dispatched to a batch-oriented accelerator.
+bound variables. Every live ordinary iterator uses the canonical
+residual-state worklist.
+[`Query::sequential`](triblespace::core::query::Query::sequential) remains an
+explicit scalar control and speaks the same protocol with blocks of one row.
+This shared interface is the important part of the design: a constraint has
+one implementation whether its probes are issued one at a time, fused into a
+CPU loop, or dispatched to a batch-oriented accelerator.
 
 ## Bindings as row blocks
 
@@ -139,12 +139,10 @@ An expansion still performs the familiar Atreides negotiation:
 3. Stable-partition the rows by their exact preferred variable. This preserves
    each row's selected occurrence bag while still batching rows whose preferred
    variable agrees; no row is reassigned to an estimate-similar variable.
-4. For each group, propose that variable. The DAG asks the root constraint; an
-   intersection chooses its tightest child per row and runs the remaining
-   children as whole-frontier confirmation passes. The residual engine makes
-   the same proposer and confirmer choices explicit worklist actions. A union
-   remains an opaque leaf that evaluates its still-satisfied alternatives
-   independently and merges their candidates.
+4. For each group, propose that variable. An intersection chooses its tightest
+   child per row and runs the remaining children as explicit confirmation
+   actions. A union remains an opaque leaf that evaluates its still-satisfied
+   alternatives independently and merges their candidates.
 5. Extend the parent rows with the surviving `(row, value)` pairs. Rows without
    candidates disappear.
 
@@ -217,8 +215,8 @@ keeps its newly filed continuation hot, allowing a successful path to descend
 and emit before cold siblings are evaluated. Dead actions and terminal rows
 grow the desired width geometrically; once no hot continuation can run, an
 occupancy/readiness policy harvests wider batches. This gives the state machine
-the same low-latency-to-throughput ramp as the DAG without requiring a complete
-intersection to run eagerly for one binding.
+a low-latency-to-throughput ramp without requiring a complete intersection to
+run eagerly for one binding.
 
 Regular-path product states apply that demand inside a node as well as across
 nodes. Positive, inverse, and negated attribute transitions expose an ordered
@@ -296,8 +294,7 @@ parent-major then shard-major raw occurrence bag until parent-local SET
 admission. Dense complete drains and bounded Succinct proposal pages consume
 the same already-located Ring walk. A resident WGPU two-bound proposal is a
 distinct preferred production family; a structurally declined action falls
-back to the canonical production Succinct route. The explicit lazy DAG remains
-the comparison path.
+back to the canonical production Succinct route.
 
 [`Query::residual_state_scheduler`](triblespace::core::query::Query::residual_state_scheduler)
 selects the residual cursor for any root while preserving the query's chosen
@@ -307,99 +304,19 @@ control and exposes its width policy;
 `solve_residual_state` is the eager saturated form, and
 `solve_residual_state_profiled` reports state, merge, action, and batch
 measurements. Fully drained variants preserve the distinct raw projected-row
-set, but may change result order.
-
-## DAG worklist engine
-
-The DAG engine replaces the recursive search stack with buckets keyed by the
-**set of variables already bound**. Consider two rows that reach the same
-state through different binding orders:
-
-```text
-             {p, a} ─────▶ {p, a, b}
-            /                 ▲
-          {p}                 │
-            \                 │
-             {p, b} ──────────┘
-```
-
-A multi-row `{p}` bucket can contain rows whose bound values make `a` the best
-next variable and rows that prefer `b`. A tree-shaped evaluator would retain
-two `{p, a, b}` frontiers, one for each history. The DAG evaluator stores
-columns in canonical variable order and files both into the same `{p, a, b}`
-bucket. The rows are merely co-located—each complete assignment still follows
-exactly one route—but downstream constraints now receive a fatter batch.
-
-One worklist pop performs the expansion described above: take a chunk of rows
-from a bucket, estimate and partition them, propose and confirm once per group,
-then file the extended rows under `bound ∪ {next}`. A full-bound bucket emits
-rows instead. Parent work is
-logically consumed into child buckets rather than retained as parallel search
-trees; filing materializes each extended child row in canonical column order.
-
-Reconvergence requires a scheduling rule. At full batch width, a bucket is
-ready only when no live bucket has a strict subset of its bound-variable set.
-Any future contributor must be such a subset because evaluation only adds
-bindings. Waiting until those contributors drain lets routes actually meet;
-strict deepest-first scheduling would normally consume a bucket immediately
-after its first parent filed into it. The tradeoff is explicit: highly
-reconvergent queries can retain a broader frontier and use more memory in
-exchange for larger batches.
-
-The ordinary [`Query`](triblespace::core::query::Query) uses residual states for
-every live seed;
-[`Query::lazy_dag_scheduler`](triblespace::core::query::Query::lazy_dag_scheduler)
-selects this worklist explicitly for comparison. Demand-adaptive chunk width
-starts at one row and grows geometrically whenever the consumer asks the engine
-to resume. Before
-the width cap is reached, scheduling is strict deepest-first, preserving
-sequential-class first-result behavior; after saturation, the readiness gate
-turns on and the remaining computation enters the batch-harvesting regime. An
-`exists!` or `take(1)` consumer can therefore discard the worklist after the
-first match instead of paying for full enumeration.
-
-Variable grouping preserves the exact adaptive action selected for each row.
-The selected variable and proposer occurrence own that row's candidate action;
-row-homomorphic execution only proves that identical actions may be chunked and
-rejoined. It does not make different variables commute. The scalar scheduler
-reverse-stably SET-admits a proposal's values before descending or splitting
-the cursor. The DAG partitions by exact preferred variable, delegates
-row-local proposer choice to the root constraint's block-native `propose`, and
-then SET-admits `(parent row, value)` before filing children. Consequently an
-intra-parent duplicate disappears while equal values under distinct parents
-remain independent. The residual engine cohorts explicit
-`(variable, proposer occurrence)` actions and still carries their occurrence
-payloads. Neither path moves a row to an estimate-compatible action. Exact
-ordering-key ties choose the lower variable ID in every planner. Chunk width
-and pop order remain physical choices.
-
-For `R` rows and `V ≤ 128` unbound variables, this planning is `O(RV)` time and
-uses `O(RV + V)` reusable scratch space, dominated by the per-row estimate
-matrix and stable counting partition.
-
-Both block-native engines keep fully-bound rows in raw inline form until the
-consumer pulls them. Neither worklist stores projected result values, so a
-query's `Send`/`Sync` properties do not depend on its output type and cloning a
-partially consumed query snapshots its exact remaining raw state and claimed
-projection keys without requiring the result type to implement `Clone`.
-
-[`Query::solve_dag_lazy`](triblespace::core::query::Query::solve_dag_lazy)
-exposes the same scheduler as a configurable iterator with explicit starting
-width, growth, and cap controls. Exact per-row action grouping is an invariant,
-not a selectable physical policy.
-
-[`Query::solve_dag`](triblespace::core::query::Query::solve_dag) is the eager,
-saturated-width form. Fully drained schedulers produce the same result
-**set of raw projected rows**, but worklist scheduling may produce a different
-row order.
+set, but may change result order. Fully-bound rows remain raw until the
+consumer pulls them, so the worklist never stores projected `R`s and a
+partially consumed query can snapshot its exact remainder without requiring
+`R: Clone`.
 
 ## Terminal projection and SET identity
 
-Every semantic action admits a SET before publishing successors. Scalar and
-DAG proposal actions remove duplicate values for each affine parent, and
-residual sources and transitions perform the same admission at their stable
-boundary. Internal probes may still carry occurrence bags before that boundary,
-but every complete raw binding is therefore unique when it reaches projection.
+Every semantic action admits a SET before publishing successors. Sequential
+and residual proposal actions remove duplicate values for each affine parent,
+and residual sources and transitions perform the same admission at their
+stable boundary. Internal probes may still carry occurrence bags before that
+boundary, but every complete raw binding is therefore unique when it reaches
+projection.
 
 For a strict `find!` head, projection is not injective: complete bindings that
 differ only in hidden witnesses can have the same public identity. The terminal
@@ -447,18 +364,6 @@ payload.
 Cross-shard reconvergence is traded for concurrency, but no second solver or
 seed restart is involved.
 
-[`Query::into_par_dag_iter`](triblespace::core::query::Query::into_par_dag_iter)
-is the explicit block-native alternative. It partitions a fresh query's affine
-DAG frontier into at most one worklist shard per worker. Seed negotiation
-proceeds until rows actually branch, so a deterministic prefix does not force
-the explicit path back to its scalar cursor. Every shard retains block-native
-estimation, per-row grouping, and route reconvergence among the rows it owns.
-Cross-shard reconvergence is intentionally traded for CPU concurrency, and the
-DAG starts at the configured row cap because full parallel enumeration is an
-explicit throughput request. This path preserves batches for block-oriented
-and accelerator-backed constraints even when scalar DFS is faster on CPU-only
-workloads.
-
 [`Query::into_par_residual_state_iter`](triblespace::core::query::Query::into_par_residual_state_iter)
 is the explicit saturated-width residual entry point. It uses the same affine
 splitter and executor as ordinary parallel iteration, but treats the call as a
@@ -468,9 +373,9 @@ Program may keep one complete parent activation intact for physical traversal
 reuse, and a live Formula OR frame retains its private payload. Every shard
 retains canonical state merging locally; state is moved rather than
 duplicated, and the constraint/postprocessor pair is cloned only when a real
-sibling shard is created. Both entry points preserve the query's selected
-residual lowering: fresh queries use hybrid lowering, which keeps formula
-kernels fused and enables transition Programs, while an explicit
+sibling shard is created. Both parallel entry points preserve the query's
+selected residual lowering: fresh queries use hybrid lowering, which keeps
+formula kernels fused and enables transition Programs, while an explicit
 `Query::residual_lowering` override remains in force.
 
 ### Opt-in residual action observation
@@ -565,20 +470,19 @@ route selection, aggregate-stat updates, and sample attachment are excluded.
 The adapter captures the current `ActionCorrelation` once and carries that
 capability across the synchronous WGPU round trip, so asynchronous device work
 does not depend on ambient TLS after dispatch.
-On the deterministic 1.77M-trible reconvergence probe (M4 Max, 16 Rayon
-workers), each timed run kept 371 small rank batches on CPU and sent 54 batches
-to Metal, reducing the controlled parallel-DAG median from 382 ms to 312 ms.
-Forcing all 425 non-empty rank batches emitted by the shards to WGPU instead
-took 775 ms, demonstrating that the admission boundary is part of the
-algorithm rather than a backend detail.
+The `residual_reconverge_bench` example measures this admission boundary across
+adaptive and saturated serial/Rayon residual execution. It compares exact
+sorted output before timing and reports the CPU, forced-WGPU, and thresholded
+hybrid paths separately rather than treating executor choice as a planner
+mode.
 
-A partially consumed ordinary residual or DAG query converted through
+A partially consumed ordinary residual query converted through
 `into_par_iter()` is drained as one parallel leaf so its exact remaining state
 cannot be restarted. This also applies to a partially consumed explicit scalar
 query: its exact scalar cursor is drained by one leaf rather than partitioned
-by a second solver. Both explicit block-native entry points require a fresh
-query. With one Rayon worker each block-native path has a zero split budget;
-with `N` workers each permits at most `N - 1` splits. In every case the result
+by a second solver. The explicit saturated block-native entry point requires a
+fresh query. With one Rayon worker it has a zero split budget; with `N` workers
+it permits at most `N - 1` splits. In every case the result
 guarantee is equality of the distinct raw projected-row set, not iteration
 order.
 
@@ -614,13 +518,12 @@ The query engine uses the Atreides family of worst-case optimal join
 algorithms. These algorithms leverage the same cardinality estimates surfaced
 through `Constraint::estimate` to guide variable choice over partial bindings,
 providing skew-resistant and predictable performance. The sequential scheduler
-explores those choices depth-first; the DAG stable-partitions the same exact
-per-row variable choices and files their results by bound-variable set, so
-histories may reconverge only after their selected actions run. The residual
-engine additionally makes the exact proposer occurrence and remaining
-confirmer set part of canonical state. Because every path refreshes estimates
-during evaluation, binding order adapts whenever a constraint updates its
-influence set—there is no separate planning artifact to maintain.
+explores those choices depth-first. The residual engine makes the exact
+proposer occurrence and remaining confirmer set part of canonical state so
+equivalent futures can reconverge after their selected actions run. Because
+every path refreshes estimates during evaluation, binding order adapts whenever
+a constraint updates its influence set—there is no separate planning artifact
+to maintain.
 For a detailed discussion, see the [Atreides Join](atreides-join.md) chapter.
 
 ## Query Languages

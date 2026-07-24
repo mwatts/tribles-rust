@@ -637,7 +637,7 @@ fn observed_wgpu_concurrent_epochs_keep_exact_sample_ownership() {
 
 #[test]
 #[ignore = "requires a native WGPU adapter"]
-fn wgpu_query_parallel_dag_matches_canonical_cpu_archive() {
+fn wgpu_query_parallel_residual_matches_canonical_cpu_archive() {
     let mut set = TribleSet::new();
     let mut domain = HashSet::new();
     let shared_attribute: [u8; 16] = trible(0xD46A_DA60, u64::MAX).data[16..32]
@@ -706,14 +706,14 @@ fn wgpu_query_parallel_dag_matches_canonical_cpu_archive() {
         .num_threads(4)
         .build()
         .unwrap();
-    let mut actual = pool.install(|| query.into_par_dag_iter().collect::<Vec<_>>());
+    let mut actual = pool.install(|| query.into_par_residual_state_iter().collect::<Vec<_>>());
     actual.sort_unstable();
 
     assert_eq!(actual, expected);
     let stats = gpu.stats();
     assert!(
         stats.gpu_dispatches > 0,
-        "forced parallel-DAG query never dispatched a WGPU rank batch: {stats:?}"
+        "forced parallel residual query never dispatched a WGPU rank batch: {stats:?}"
     );
     assert!(stats.gpu_probes > 0);
     assert_eq!(stats.cpu_fallback_batches, 0);

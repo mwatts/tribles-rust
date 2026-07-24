@@ -117,7 +117,6 @@ fn tally<T: std::hash::Hash>(items: impl IntoIterator<Item = T>) -> (usize, u64)
 #[derive(Clone, Copy)]
 enum Mode {
     Sequential,
-    Dag,
     Residual,
     ResidualLazy,
 }
@@ -129,7 +128,6 @@ fn run_query<S: TriblePattern>(kb: &S, mode: Mode) -> (usize, u64) {
     );
     match mode {
         Mode::Sequential => tally(query.sequential()),
-        Mode::Dag => tally(query.solve_dag()),
         Mode::Residual => tally(query.solve_residual_state()),
         Mode::ResidualLazy => tally(query.solve_residual_state_lazy()),
     }
@@ -167,7 +165,6 @@ fn run_nested_query<S: TriblePattern>(kb: &S, mode: Mode) -> (usize, u64) {
     );
     match mode {
         Mode::Sequential => tally(query.sequential()),
-        Mode::Dag => tally(query.solve_dag()),
         Mode::Residual => tally(query.solve_residual_state()),
         Mode::ResidualLazy => tally(query.solve_residual_state_lazy()),
     }
@@ -191,7 +188,6 @@ fn run_nested_residual_profiled<S: TriblePattern>(kb: &S) -> ((usize, u64), Resi
 #[derive(Clone, Copy)]
 enum FirstMode {
     Sequential,
-    DagLazy,
     ResidualEager,
     ResidualLazy,
 }
@@ -203,7 +199,6 @@ fn run_first<S: TriblePattern>(kb: &S, mode: FirstMode) -> (usize, u64) {
     );
     match mode {
         FirstMode::Sequential => tally(query.sequential().take(1)),
-        FirstMode::DagLazy => tally(query.solve_dag_lazy().take(1)),
         FirstMode::ResidualEager => tally(query.solve_residual_state().into_iter().take(1)),
         FirstMode::ResidualLazy => tally(query.solve_residual_state_lazy().take(1)),
     }
@@ -223,7 +218,6 @@ fn median(samples: &[f64]) -> f64 {
 fn bench_first_result<S: TriblePattern>(label: &str, kb: &S, reps: usize) {
     let modes = [
         ("seq", FirstMode::Sequential),
-        ("dag-lazy", FirstMode::DagLazy),
         ("res-eager", FirstMode::ResidualEager),
         ("res-lazy", FirstMode::ResidualLazy),
     ];
@@ -258,7 +252,6 @@ fn bench_first_result<S: TriblePattern>(label: &str, kb: &S, reps: usize) {
 fn bench_backend<S: TriblePattern>(label: &str, kb: &S, expected: usize, reps: usize) {
     let modes = [
         ("seq", Mode::Sequential),
-        ("dag", Mode::Dag),
         ("residual", Mode::Residual),
         ("res-lazy", Mode::ResidualLazy),
     ];
@@ -355,7 +348,6 @@ fn bench_backend<S: TriblePattern>(label: &str, kb: &S, expected: usize, reps: u
 fn bench_nested_backend<S: TriblePattern>(label: &str, kb: &S, expected: usize, reps: usize) {
     let modes = [
         ("seq", Mode::Sequential),
-        ("dag", Mode::Dag),
         ("residual", Mode::Residual),
         ("res-lazy", Mode::ResidualLazy),
     ];

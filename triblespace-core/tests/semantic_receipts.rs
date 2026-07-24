@@ -141,16 +141,6 @@ where
     vec![
         Query::new(make(), project_x).sequential().collect(),
         Query::new(make(), project_x)
-            .solve_dag_lazy()
-            .cap(1)
-            .start_width(1)
-            .growth(1)
-            .collect(),
-        Query::new(make(), project_x)
-            .solve_dag_lazy()
-            .start_width(usize::MAX)
-            .collect(),
-        Query::new(make(), project_x)
             .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
             .cap(1)
             .start_width(1)
@@ -307,9 +297,6 @@ fn composites_and_projection_have_raw_set_semantics() {
         Query::new_projected(make_root(), [X], project_x)
             .sequential()
             .collect::<Vec<_>>(),
-        Query::new_projected(make_root(), [X], project_x)
-            .lazy_dag_scheduler()
-            .collect(),
         Query::new_projected(make_root(), [X], project_x)
             .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .collect(),
@@ -782,12 +769,6 @@ fn equality_becomes_a_source_only_after_its_peer_is_bound() {
         Query::new(dynamic_equality_root(), project_xy)
             .sequential()
             .collect::<Vec<_>>(),
-        Query::new(dynamic_equality_root(), project_xy)
-            .solve_dag_lazy()
-            .cap(1)
-            .start_width(1)
-            .growth(1)
-            .collect(),
         Query::new(dynamic_equality_root(), project_xy)
             .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .cap(1)

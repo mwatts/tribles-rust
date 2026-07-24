@@ -113,42 +113,14 @@ one-time six-matrix preparation and first-query setup are not. Device/query
 failures currently panic because the `Constraint::confirm` protocol has no
 error channel.
 
-The reconvergent-DAG probe demonstrates why admission belongs at this seam.
-Measurements on an M4 Max with 16 Rayon workers (2026-07-13) use deterministic
-fixture IDs, eight timed repetitions per case and scheduler, and a balanced
-rotating order across four cases: the canonical archive, the wrapper forced
-entirely to its CPU rank path, every non-empty rank batch forced to WGPU, and
-the default 8K hybrid. After the one-time canonical/forced setup pair, each
-case receives the same exact-collection pass and tally warm-up. Exact sorted
-result vectors are compared outside timing. Values below are median
-milliseconds with `(min–max)` ranges:
-
-| fixture | scheduler | canonical CPU | wrapper CPU control | forced WGPU rank | 8K hybrid rank |
-|---|---|---:|---:|---:|---:|
-| 41,472 tribles / 1,152 rows | global DAG | 34.82 (33.58–35.56) | 34.39 (33.82–35.56) | 79.10 (77.65–82.69) | 32.21 (31.11–32.93) |
-| 41,472 tribles / 1,152 rows | Rayon DAG | 4.88 (4.78–5.88) | 4.96 (4.82–5.83) | 626.96 (555.54–673.61) | 5.02 (4.76–5.89) |
-| 1,769,472 tribles / 49,152 rows | global DAG | 3,220.11 (3,176.41–3,454.08) | 3,165.88 (3,118.05–3,491.64) | 2,585.21 (2,502.11–2,836.01) | 2,622.16 (2,520.10–2,932.40) |
-| 1,769,472 tribles / 49,152 rows | Rayon DAG | 389.77 (375.89–403.40) | 381.65 (374.00–396.83) | 775.05 (728.51–812.51) | 311.73 (295.17–323.49) |
-
-The small Rayon DAG produces 411 rank batches per timed run, all below the threshold;
-the hybrid therefore stays on CPU and tracks the wrapper control, while forcing
-those tiny batches through synchronizing device dispatches is roughly 126×
-slower. On each large Rayon-DAG timed run, the gate sends 54 batches /
-2,446,016 probes to Metal and retains 371 batches / 994,624 probes on CPU. The
-hybrid is 1.22× faster than its wrapper CPU control (1.25× versus the canonical
-archive), while forcing every non-empty rank batch emitted by the shards to
-WGPU is about 2× slower than CPU. For Rayon-sharded execution, the useful
-result is therefore hybrid admission rather than unconditional offload. The
-large global DAG is different: its 37 batches are all fat enough that forced
-WGPU has the best median, though its range overlaps the hybrid. These are
-one-machine crossover measurements, not portable constants; rerun the probe
-on deployment hardware.
-
-Adapter construction/device enqueue took 15 ms for the small fixture and 22 ms
-for the large one. Those are deliberately not called upload latency: CubeCL's
-buffer writes are asynchronous. The first forced global-DAG query, reported
-separately by the probe, synchronizes deferred transfer and pipeline setup in
-addition to executing the query.
+The `residual_reconverge_bench` example measures why admission belongs at
+this seam. It compares adaptive and saturated residual execution, serially
+and through Rayon, across four interleaved rank policies: the canonical
+archive, the wrapper forced to CPU rank, every non-empty rank batch forced to
+WGPU, and the default thresholded hybrid. Exact sorted result vectors are
+compared before timing. Because the crossover depends on archive shape,
+scheduler batch geometry, runtime, and hardware, rerun the probe on deployment
+hardware instead of treating one machine's measurements as constants.
 
 ### Resident `QueryProgram` transition
 
@@ -229,8 +201,8 @@ max-fanout scan took 1.03 ms, and the first synchronizing one-row transition
 was 7.61 ms in this cache-order observation. None is included above. The
 probe also reports canonical and hybrid `Constraint::propose` component
 baselines, but those omit scheduler estimation, variable choice,
-reconvergence, and child-row materialisation. They are not an end-to-end DAG or
-hybrid crossover measurement.
+reconvergence, and child-row materialisation. They are not an end-to-end
+residual-scheduler or hybrid crossover measurement.
 
 This is not yet a fully resident query engine. Each call still crosses the
 host/device boundary at its parent and full-capacity child allocation; a
@@ -386,7 +358,7 @@ cargo test -p triblespace-gpu --features wgpu --test wgpu_parity -- --ignored
 cargo test -p triblespace-gpu --features wgpu --test resident_transition -- --ignored
 cargo run --release -p triblespace-gpu --features wgpu --example archive_merge -- 100000
 cargo run --release -p triblespace-gpu --features wgpu --example resident_transition
-cargo run --release --features gpu --example dag_reconverge_bench -- 2048 16 8
+cargo run --release --features gpu --example residual_reconverge_bench -- 2048 16 8
 ```
 
 WGPU has runtime parity coverage on Apple Metal. CUDA exposes the same CubeCL

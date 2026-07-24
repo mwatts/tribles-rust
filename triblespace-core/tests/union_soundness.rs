@@ -500,7 +500,6 @@ fn union_of_intersections(
         x: Inline<ShortString>,
         or!(and!(s1.has(x), s2.has(x)), and!(s3.has(x), s4.has(x)))
     )
-    .solve_dag_lazy()
     .map(|x: Inline<ShortString>| x.raw)
     .collect()
 }

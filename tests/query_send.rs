@@ -4,10 +4,8 @@ use std::rc::Rc;
 use std::sync::Mutex;
 
 use triblespace::core::inline::encodings::iu256::U256BE;
-use triblespace::core::query::{dag_stats, Query, VariableContext};
+use triblespace::core::query::{Query, VariableContext};
 use triblespace::prelude::*;
-
-static DAG_STATS_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn assert_send<T: Send>(_: T) {}
 
@@ -33,15 +31,6 @@ fn ordinary_query_with_non_send_output_is_send() {
     assert!(started.next().is_some());
     assert_send(started);
 
-    // The explicit lazy-DAG control likewise stores only raw rows and
-    // planning state, never a projected `R`.
-    let mut context = VariableContext::new();
-    let variable = context.next_variable::<U256BE>();
-    let constraint = variable.is(U256BE::inline_from(1u64));
-    let mut dag = Query::new(constraint, |_| Some(Rc::new(()))).lazy_dag_scheduler();
-    assert!(dag.next().is_some());
-    assert_send(dag);
-
     // The residual runtime also stores only raw rows and planning state.
     let mut context = VariableContext::new();
     let variable = context.next_variable::<U256BE>();
@@ -63,7 +52,6 @@ fn ordinary_query_uses_residual_for_exposed_overlapping_and() {
     let state = format!("{query:?}");
     assert!(state.contains("scheduler: ResidualState"), "{state}");
     assert!(state.contains("residual_started: true"), "{state}");
-    assert!(state.contains("dag_started: false"), "{state}");
 }
 
 #[test]
@@ -81,7 +69,6 @@ fn ordinary_query_uses_residual_for_disjoint_and_leaves() {
     let state = format!("{query:?}");
     assert!(state.contains("scheduler: ResidualState"), "{state}");
     assert!(state.contains("residual_started: true"), "{state}");
-    assert!(state.contains("dag_started: false"), "{state}");
 }
 
 #[test]
@@ -95,7 +82,6 @@ fn ordinary_query_uses_residual_for_opaque_root() {
     let state = format!("{query:?}");
     assert!(state.contains("scheduler: ResidualState"), "{state}");
     assert!(state.contains("residual_started: true"), "{state}");
-    assert!(state.contains("dag_started: false"), "{state}");
 }
 
 #[test]
@@ -109,35 +95,13 @@ fn ordinary_query_uses_residual_for_exposed_one_leaf_and() {
     let state = format!("{query:?}");
     assert!(state.contains("scheduler: ResidualState"), "{state}");
     assert!(state.contains("residual_started: true"), "{state}");
-    assert!(state.contains("dag_started: false"), "{state}");
 }
 
-#[test]
-fn explicit_lazy_dag_override_bypasses_overlapping_residual_default() {
-    let _stats_guard = DAG_STATS_TEST_LOCK.lock().unwrap();
-    let mut context = VariableContext::new();
-    let variable = context.next_variable::<U256BE>();
-    let one = U256BE::inline_from(1u64);
-    let constraint = and!(variable.is(one), variable.is(one));
-
-    dag_stats::reset();
-    dag_stats::set_enabled(true);
-    let rows = Query::new(constraint, |_| Some(()))
-        .lazy_dag_scheduler()
-        .count();
-    let pops = dag_stats::pops();
-    dag_stats::set_enabled(false);
-
-    assert_eq!(rows, 1);
-    assert!(pops > 0, "explicit lazy-DAG override was ignored");
-}
-
-/// Cloning an explicit lazy-DAG iterator after a pull snapshots its raw
-/// worklist and staged rows exactly, without requiring the output type itself
-/// to implement `Clone`.
+/// Cloning an ordinary residual iterator after a pull snapshots its raw
+/// worklist and staged rows exactly.
 #[cfg(feature = "parallel")]
 #[test]
-fn clone_after_iteration_snapshots_remaining_dag_state() {
+fn clone_after_iteration_snapshots_remaining_residual_state() {
     let mut context = VariableContext::new();
     let variable = context.next_variable::<U256BE>();
     let values = [1u64, 2, 3, 4].map(U256BE::inline_from);
@@ -149,40 +113,12 @@ fn clone_after_iteration_snapshots_remaining_dag_state() {
     );
     let mut query = Query::new(constraint, move |binding| {
         binding.get(variable.index).copied()
-    })
-    .lazy_dag_scheduler();
+    });
 
     assert!(query.next().is_some());
-    // The second resumption has width two: it stages two raw rows and yields
-    // one, so the clone must include both the DAG worklist and the
-    // unconsumed staged row.
     assert!(query.next().is_some());
     let cloned = query.clone();
     assert_eq!(query.collect::<Vec<_>>(), cloned.collect::<Vec<_>>());
-}
-
-/// The clone operation snapshots raw rows, not already projected items, so its
-/// bounds must remain independent of `R: Clone` even after the DAG has started.
-#[cfg(feature = "parallel")]
-#[test]
-fn clone_after_iteration_does_not_require_clone_output() {
-    struct NonClone;
-
-    let mut context = VariableContext::new();
-    let variable = context.next_variable::<U256BE>();
-    let values = [1u64, 2, 3, 4].map(U256BE::inline_from);
-    let constraint = or!(
-        variable.is(values[0]),
-        variable.is(values[1]),
-        variable.is(values[2]),
-        variable.is(values[3])
-    );
-    let mut query = Query::new(constraint, |_| Some(NonClone)).lazy_dag_scheduler();
-
-    assert!(query.next().is_some());
-    assert!(query.next().is_some());
-    let cloned = query.clone();
-    assert_eq!(query.count(), cloned.count());
 }
 
 /// The same manual `Query::clone` bound must stay independent of `R: Clone`
@@ -261,47 +197,6 @@ fn ordinary_residual_projection_filter_and_panic_resume_are_exact() {
     assert_eq!(resumed, projected[1]);
 }
 
-/// A partially consumed explicit lazy-DAG query owns a worklist while its
-/// legacy DFS cursor is untouched. Converting it to rayon must drain that
-/// remaining worklist as one leaf, not split and restart the DFS cursor from
-/// the seed.
-#[cfg(feature = "parallel")]
-#[test]
-fn partially_consumed_dag_query_into_par_iter_keeps_exact_remainder() {
-    use rayon::iter::{IntoParallelIterator, ParallelIterator};
-
-    let mut context = VariableContext::new();
-    let variable = context.next_variable::<U256BE>();
-    let values = [1u64, 2, 3, 4].map(U256BE::inline_from);
-    let constraint = or!(
-        variable.is(values[0]),
-        variable.is(values[1]),
-        variable.is(values[2]),
-        variable.is(values[3])
-    );
-    let mut query = Query::new(constraint, move |binding| {
-        binding.get(variable.index).copied()
-    })
-    .lazy_dag_scheduler();
-
-    assert!(query.next().is_some());
-    let started_for_explicit_dag = query.clone();
-    let expected = query.clone().collect::<Vec<_>>();
-    let actual = query.into_par_iter().collect::<Vec<_>>();
-    assert_eq!(actual, expected);
-
-    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        let _ = started_for_explicit_dag.into_par_dag_iter();
-    }))
-    .expect_err("the explicit parallel DAG entry point must require a fresh query");
-    let message = err
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| err.downcast_ref::<&str>().copied())
-        .unwrap_or("");
-    assert!(message.contains("cannot initialize parallel DAG iteration"));
-}
-
 /// A started query has already published progress. Ordinary Rayon conversion
 /// drains either residual or explicit scalar state as one exact leaf instead
 /// of restarting or repartitioning it.
@@ -365,18 +260,7 @@ fn pulled_query_rejects_every_seed_restarting_selector() {
         })),
         std::panic::catch_unwind(std::panic::AssertUnwindSafe({
             let query = query.clone();
-            move || drop(query.lazy_dag_scheduler())
-        })),
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe({
-            let query = query.clone();
-            move || drop(query.solve_dag_lazy())
-        })),
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe({
-            let query = query.clone();
             move || drop(query.solve_residual_state_lazy())
-        })),
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            drop(query.into_par_dag_iter())
         })),
     ];
     assert!(panics.into_iter().all(|result| result.is_err()));
@@ -479,13 +363,13 @@ fn ordinary_parallel_residual_honors_early_consumer_cancellation() {
     );
 }
 
-/// The explicit parallel-DAG path must descend through an initially
-/// deterministic chain, split a late block-native branch within the `N - 1`
-/// budget, and preserve postprocessor filtering (`None`) in every shard.
+/// Ordinary parallel residual execution must descend through an initially
+/// deterministic chain, reach a late block-native branch, and preserve
+/// postprocessor filtering (`None`) in every shard.
 #[cfg(feature = "parallel")]
 #[test]
-fn fresh_parallel_query_splits_a_deep_late_branch() {
-    use rayon::iter::ParallelIterator;
+fn fresh_parallel_query_handles_a_deep_late_branch() {
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
     let mut context = VariableContext::new();
     let a = context.next_variable::<U256BE>();
@@ -527,21 +411,13 @@ fn fresh_parallel_query_splits_a_deep_late_branch() {
         .build()
         .unwrap();
 
-    let _stats_guard = DAG_STATS_TEST_LOCK.lock().unwrap();
-    dag_stats::reset();
-    dag_stats::set_enabled(true);
     // Construct outside the custom pool: shard budgets must be derived when
     // the iterator is consumed, not from whichever pool happened to create it.
-    let one_iter = query.clone().into_par_dag_iter();
+    let one_iter = query.clone().into_par_iter();
     let mut one_actual = one_worker.install(|| one_iter.collect::<Vec<_>>());
-    let one_splits = dag_stats::parallel_splits();
 
-    dag_stats::reset();
-    let four_iter = query.into_par_dag_iter();
+    let four_iter = query.into_par_iter();
     let mut actual = four_workers.install(|| four_iter.collect::<Vec<_>>());
-    let pops = dag_stats::pops();
-    let splits = dag_stats::parallel_splits();
-    dag_stats::set_enabled(false);
 
     one_actual.sort_unstable();
     actual.sort_unstable();
@@ -549,12 +425,6 @@ fn fresh_parallel_query_splits_a_deep_late_branch() {
     expected.sort_unstable();
     assert_eq!(one_actual, expected);
     assert_eq!(actual, expected);
-    assert_eq!(one_splits, 0, "one worker must create no DAG shards");
-    assert!(pops > 0, "parallel query bypassed the DAG worklist");
-    assert!(
-        (1..=3).contains(&splits),
-        "four-worker query must split its late affine frontier without exceeding N-1; got {splits}"
-    );
 }
 
 #[test]

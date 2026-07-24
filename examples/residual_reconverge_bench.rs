@@ -1,5 +1,4 @@
-//! PROBE (dag-frontier): the reconvergence fixture — data built so that
-//! bucket merging (the DAG solver's raison d'être) has maximal purchase.
+//! Residual-state reconvergence and WGPU rank-execution benchmark.
 //!
 //! Query (6 vars): `?e p1..p4 ?x1..?x4 . ?x_i t_i K_i . ?e s ?z . ?z tz Kz`
 //! over 24 sub-populations, one per permutation σ of the four p-attributes.
@@ -7,33 +6,27 @@
 //! `p_{σ(k)}`, exactly one of which has the marker edge — so after `?e`
 //! binds, the row walks σ exactly (ascending fans) and the marker confirm
 //! prunes the frontier back to one row per entity at every level. Routes
-//! through the bound-set lattice are therefore **thin** (n rows each) and
-//! **many** (24), reconverging pairwise at every depth and totally at
-//! `{e, x1..x4}` — where the expensive shared variable `?z` (z_fan
-//! candidates per row, marker-pruned to 1, always chosen last) is still
-//! unbound. Merged buckets re-fatten the final batch 24×; the lineage
-//! control (`solve_dag_unmerged`) and the recursive solvers keep 24 thin
-//! batches.
+//! through the canonical residual-state lattice are therefore **thin**
+//! (n rows each) and **many** (24), reconverging pairwise at every depth and
+//! totally at `{e, x1..x4}` — where the expensive shared variable `?z`
+//! (z_fan candidates per row, marker-pruned to 1, always chosen last) is
+//! still unbound.
 //!
 //! Usage:
-//!     cargo run --release --example dag_reconverge_bench -- \
+//!     cargo run --release --example residual_reconverge_bench -- \
 //!         [n_per_pop=48] [z_fan=16] [reps=5]
-//!     cargo run --release --features gpu --example dag_reconverge_bench -- \
+//!     cargo run --release --features gpu --example residual_reconverge_bench -- \
 //!         [n_per_pop=48] [z_fan=16] [reps=5]
 //!     # Fat-shard GPU comparison (~1.77M tribles):
-//!     cargo run --release --features gpu --example dag_reconverge_bench -- \
+//!     cargo run --release --features gpu --example residual_reconverge_bench -- \
 //!         2048 16 8
 //!     # Repeat only the controlled GPU matrix after the archive is built:
 //!     TRIBLES_WGPU_ONLY=1 cargo run --release --features gpu \
-//!         --example dag_reconverge_bench -- 2048 16 8
+//!         --example residual_reconverge_bench -- 2048 16 8
 //!
-//! Runs sequential / ordinary parallel adaptive residual-state /
-//! explicit parallel-DAG / explicit parallel saturated residual-state /
-//! dag / eager residual-state / lazy residual-state / dag-unmerged
-//! on both backends
-//! and prints per mode: min/median/max wall time, parity signature, and for the
-//! frontier engines the group/batch structure, materialized rows, peak live
-//! row-store cells, and the DAG's bucket/merge census.
+//! Compares the one residual-state solver under its adaptive and saturated
+//! admission policies, both serially and through Rayon. Each backend reports
+//! min/median/max wall time and an order-independent parity signature.
 //! With `--features gpu`, an additional controlled comparison interleaves the
 //! canonical CPU archive, the WGPU wrapper forced to its CPU rank path, forced
 //! WGPU rank dispatch, and the default gated hybrid. Each case is equally
@@ -47,8 +40,7 @@ use std::time::Instant;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
-use triblespace::core::query::residual::ResidualStateStats;
-use triblespace::core::query::{blocked_stats, dag_stats, TriblePattern};
+use triblespace::core::query::TriblePattern;
 use triblespace::core::trible::TribleSet;
 #[cfg(feature = "gpu")]
 use triblespace::gpu::{WgpuQueryStats, WgpuSuccinctArchive, DEFAULT_MIN_RANK_BATCH};
@@ -216,17 +208,12 @@ fn build_world(n_per_pop: usize, z_fan: usize) -> (TribleSet, (Id, Id, Id, Id, I
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
-    Seq,
+    AdaptiveSerial,
+    SaturatedSerial,
     #[cfg(feature = "parallel")]
-    ParAdaptiveResidual,
+    AdaptiveParallel,
     #[cfg(feature = "parallel")]
-    ParDag,
-    #[cfg(feature = "parallel")]
-    ParSaturatedResidual,
-    Dag,
-    Residual,
-    ResidualLazy,
-    DagU,
+    SaturatedParallel,
 }
 
 fn run_query<S: TriblePattern>(kb: &S, markers: (Id, Id, Id, Id, Id), mode: Mode) -> (usize, u64) {
@@ -243,59 +230,13 @@ fn run_query<S: TriblePattern>(kb: &S, markers: (Id, Id, Id, Id, Id), mode: Mode
         ])
     );
     match mode {
-        Mode::Seq => tally(q.sequential()),
+        Mode::AdaptiveSerial => tally(q.solve_residual_state_lazy()),
+        Mode::SaturatedSerial => tally(q.solve_residual_state()),
         #[cfg(feature = "parallel")]
-        Mode::ParAdaptiveResidual => tally_par(q.into_par_iter()),
+        Mode::AdaptiveParallel => tally_par(q.into_par_iter()),
         #[cfg(feature = "parallel")]
-        Mode::ParDag => tally_par(q.into_par_dag_iter()),
-        #[cfg(feature = "parallel")]
-        Mode::ParSaturatedResidual => tally_par(q.into_par_residual_state_iter()),
-        Mode::Dag => tally(q.solve_dag()),
-        Mode::Residual => tally(q.solve_residual_state()),
-        Mode::ResidualLazy => tally(q.solve_residual_state_lazy()),
-        Mode::DagU => tally(q.solve_dag_unmerged()),
+        Mode::SaturatedParallel => tally_par(q.into_par_residual_state_iter()),
     }
-}
-
-fn run_residual_profiled<S: TriblePattern>(
-    kb: &S,
-    markers: (Id, Id, Id, Id, Id),
-) -> ((usize, u64), ResidualStateStats) {
-    let (k1, k2, k3, k4, kz) = markers;
-    let solve = find!(
-        (e: Inline<_>, x1: Inline<_>, x2: Inline<_>, x3: Inline<_>, x4: Inline<_>, z: Inline<_>),
-        pattern!(kb, [
-            { ?e @ world::rp1: ?x1, world::rp2: ?x2, world::rp3: ?x3, world::rp4: ?x4, world::rs: ?z },
-            { ?x1 @ world::rt1: k1 },
-            { ?x2 @ world::rt2: k2 },
-            { ?x3 @ world::rt3: k3 },
-            { ?x4 @ world::rt4: k4 },
-            { ?z @ world::rtz: kz }
-        ])
-    )
-    .solve_residual_state_profiled();
-    (tally(solve.results), solve.stats)
-}
-
-fn run_lazy_residual_profiled<S: TriblePattern>(
-    kb: &S,
-    markers: (Id, Id, Id, Id, Id),
-) -> ((usize, u64), ResidualStateStats) {
-    let (k1, k2, k3, k4, kz) = markers;
-    let solve = find!(
-        (e: Inline<_>, x1: Inline<_>, x2: Inline<_>, x3: Inline<_>, x4: Inline<_>, z: Inline<_>),
-        pattern!(kb, [
-            { ?e @ world::rp1: ?x1, world::rp2: ?x2, world::rp3: ?x3, world::rp4: ?x4, world::rs: ?z },
-            { ?x1 @ world::rt1: k1 },
-            { ?x2 @ world::rt2: k2 },
-            { ?x3 @ world::rt3: k3 },
-            { ?x4 @ world::rt4: k4 },
-            { ?z @ world::rtz: kz }
-        ])
-    )
-    .solve_residual_state_lazy()
-    .collect_profiled();
-    (tally(solve.results), solve.stats)
 }
 
 fn timing_summary(v: &[f64]) -> (f64, f64, f64) {
@@ -318,18 +259,14 @@ fn bench_backend<S: TriblePattern>(
     expected: usize,
     reps: usize,
 ) {
-    let mut modes = vec![("seq", Mode::Seq)];
+    let mut modes = vec![
+        ("serial-adaptive", Mode::AdaptiveSerial),
+        ("serial-saturated", Mode::SaturatedSerial),
+    ];
     #[cfg(feature = "parallel")]
     modes.extend([
-        ("par-ordinary-adaptive", Mode::ParAdaptiveResidual),
-        ("par-dag", Mode::ParDag),
-        ("par-explicit-saturated", Mode::ParSaturatedResidual),
-    ]);
-    modes.extend([
-        ("dag", Mode::Dag),
-        ("residual", Mode::Residual),
-        ("res-lazy", Mode::ResidualLazy),
-        ("dagu", Mode::DagU),
+        ("rayon-adaptive", Mode::AdaptiveParallel),
+        ("rayon-saturated", Mode::SaturatedParallel),
     ]);
     for &(_, mode) in &modes {
         std::hint::black_box(run_query(kb, markers, mode));
@@ -363,78 +300,6 @@ fn bench_backend<S: TriblePattern>(
     for (((name, _), median), (min, max)) in modes.iter().zip(&meds).zip(&ranges) {
         println!("  {name:<24} {median:>10.3} ms  [{min:.3}..{max:.3}]");
     }
-    #[cfg(feature = "parallel")]
-    {
-        let par_adaptive_residual = meds[modes
-            .iter()
-            .position(|(name, _)| *name == "par-ordinary-adaptive")
-            .unwrap()];
-        let par_dag = meds[modes
-            .iter()
-            .position(|(name, _)| *name == "par-dag")
-            .unwrap()];
-        let par_saturated_residual = meds[modes
-            .iter()
-            .position(|(name, _)| *name == "par-explicit-saturated")
-            .unwrap()];
-        println!(
-            "  speedup vs ordinary adaptive  explicit DAG {:>7.3}x  explicit saturated {:>7.3}x",
-            par_adaptive_residual / par_dag,
-            par_adaptive_residual / par_saturated_residual,
-        );
-    }
-    // Instrumented single passes: group/batch structure, intermediates,
-    // peak cells; bucket/merge census for the dag modes.
-    blocked_stats::set_enabled(true);
-    dag_stats::set_enabled(true);
-    for &(name, mode) in &modes[1..] {
-        if mode == Mode::Residual {
-            let (_, stats) = run_residual_profiled(kb, markers);
-            println!(
-                "  residual states: {} interned / {} hits / {} bucket merges ({} rows); calls propose {} (max {} rows), confirm {} (max {} rows)",
-                stats.states_interned,
-                stats.interner_hits,
-                stats.bucket_merges,
-                stats.rows_merged,
-                stats.propose_calls,
-                stats.max_propose_rows,
-                stats.confirm_calls,
-                stats.max_confirm_rows,
-            );
-            continue;
-        }
-        if mode == Mode::ResidualLazy {
-            let (_, stats) = run_lazy_residual_profiled(kb, markers);
-            println!(
-                "  residual lazy states: {} interned / {} hits / {} reentries ({} rows); pops {} ({} full / {} readiness / {} partial); calls propose {} (max {} rows), confirm {} (max {} rows)",
-                stats.states_interned,
-                stats.interner_hits,
-                stats.state_reentries,
-                stats.rows_reentered,
-                stats.state_pops,
-                stats.full_pops,
-                stats.readiness_pops,
-                stats.partial_pops,
-                stats.propose_calls,
-                stats.max_propose_rows,
-                stats.confirm_calls,
-                stats.max_confirm_rows,
-            );
-            continue;
-        }
-        blocked_stats::reset();
-        dag_stats::reset();
-        run_query(kb, markers, mode);
-        println!("  {name}: {}", blocked_stats::report());
-        let is_dag = matches!(mode, Mode::Dag | Mode::DagU);
-        #[cfg(feature = "parallel")]
-        let is_dag = is_dag || matches!(mode, Mode::ParDag);
-        if is_dag {
-            println!("  {name} buckets: {}", dag_stats::report());
-        }
-    }
-    blocked_stats::set_enabled(false);
-    dag_stats::set_enabled(false);
 }
 
 #[cfg(feature = "gpu")]
@@ -455,10 +320,10 @@ type QueryRow = (
     Inline<inlineencodings::GenId>,
 );
 
-/// Collects a full result multiset for the global DAG, saturated serial
-/// residual, and two affine Rayon scheduler shapes used by the controlled GPU
-/// comparison. Callers sort the result before comparison, because Rayon
-/// deliberately does not promise encounter order here.
+/// Collects a full result multiset for the adaptive/saturated admission
+/// policies used by the controlled GPU comparison. Callers sort the result
+/// before comparison, because Rayon deliberately does not promise encounter
+/// order here.
 #[cfg(feature = "gpu")]
 fn collect_query<S: TriblePattern>(
     kb: &S,
@@ -478,11 +343,10 @@ fn collect_query<S: TriblePattern>(
         ])
     );
     match mode {
-        Mode::Dag => q.solve_dag(),
-        Mode::Residual => q.solve_residual_state(),
-        Mode::ParDag => q.into_par_dag_iter().collect(),
-        Mode::ParSaturatedResidual => q.into_par_residual_state_iter().collect(),
-        _ => unreachable!("controlled WGPU comparison only uses affine schedulers"),
+        Mode::AdaptiveSerial => q.solve_residual_state_lazy().collect(),
+        Mode::SaturatedSerial => q.solve_residual_state(),
+        Mode::AdaptiveParallel => q.into_par_iter().collect(),
+        Mode::SaturatedParallel => q.into_par_residual_state_iter().collect(),
     }
 }
 
@@ -589,9 +453,8 @@ fn case_threshold(case: RankCase) -> String {
     }
 }
 
-/// Measures the global DAG, saturated serial residual, and Rayon-sharded
-/// DAG/residual schedulers with a controlled, interleaved rank-executor
-/// comparison.
+/// Measures adaptive and saturated residual admission, serially and through
+/// Rayon, with a controlled, interleaved rank-executor comparison.
 ///
 /// Construction only measures host preparation and device enqueue. A separate
 /// first forced query accounts for any deferred synchronization and pipeline
@@ -615,11 +478,11 @@ fn bench_wgpu_backend(
         "WGPU host preparation: archive clone {clone_elapsed:?}; adapter construction/device enqueue {enqueue_elapsed:?}",
     );
 
-    let canonical_setup_signature = run_query(archive, markers, Mode::Dag);
+    let canonical_setup_signature = run_query(archive, markers, Mode::SaturatedSerial);
     gpu_archive.set_min_rank_batch(1);
     gpu_archive.reset_stats();
     let ready_started = Instant::now();
-    let ready_signature = run_query(&gpu_archive, markers, Mode::Dag);
+    let ready_signature = run_query(&gpu_archive, markers, Mode::SaturatedSerial);
     let ready_elapsed = ready_started.elapsed();
     let ready_stats = gpu_archive.stats();
     assert_eq!(
@@ -627,16 +490,16 @@ fn bench_wgpu_backend(
         "first WGPU setup query differed from the canonical CPU archive"
     );
     eprintln!(
-        "first forced-WGPU DAG query/setup-to-ready: {ready_elapsed:?} (outside timed reps; includes deferred synchronization/pipeline setup; {} dispatches, {} probes)",
+        "first forced-WGPU residual query/setup-to-ready: {ready_elapsed:?} (outside timed reps; includes deferred synchronization/pipeline setup; {} dispatches, {} probes)",
         ready_stats.gpu_dispatches,
         ready_stats.gpu_probes,
     );
 
     let modes = [
-        ("dag", Mode::Dag),
-        ("residual", Mode::Residual),
-        ("par-dag", Mode::ParDag),
-        ("par-explicit-saturated", Mode::ParSaturatedResidual),
+        ("serial-adaptive", Mode::AdaptiveSerial),
+        ("serial-saturated", Mode::SaturatedSerial),
+        ("rayon-adaptive", Mode::AdaptiveParallel),
+        ("rayon-saturated", Mode::SaturatedParallel),
     ];
     println!(
         "\n== Controlled SuccinctArchive rank executors ({} Rayon threads) ==",
@@ -711,7 +574,7 @@ fn bench_wgpu_backend(
             }
         }
 
-        println!("\n  scheduler: {mode_name} (exact sorted output parity: ok)");
+        println!("\n  admission/driver: {mode_name} (exact sorted output parity: ok)");
         for (case_index, case) in RANK_CASES.iter().copied().enumerate() {
             let runs = &measurements[case_index];
             let times: Vec<_> = runs.iter().map(|run| run.elapsed_ms).collect();
@@ -796,7 +659,7 @@ fn main() {
     );
 
     if !controlled_gpu_only {
-        println!("\n== TribleSet backend (default blocked delegation) ==");
+        println!("\n== TribleSet backend ==");
         bench_backend("reconverge 24-route", &kb, markers, expected, reps);
     }
 

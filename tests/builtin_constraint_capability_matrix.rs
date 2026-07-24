@@ -54,7 +54,6 @@ where
     };
 
     assert_engine("sequential oracle", make_query().sequential().collect());
-    assert_engine("eager DAG oracle", make_query().solve_dag());
     assert_engine("ordinary production selection", make_query().collect());
 
     let conservative_eager = make_query()

@@ -770,7 +770,6 @@ impl<'a> Constraint<'a> for PageLocalDomain {
 enum Scheduler {
     Ordinary,
     Residual,
-    Dag,
     Sequential,
 }
 
@@ -1455,7 +1454,6 @@ fn run(
         Scheduler::Residual => query
             .solve_residual_state_lazy_with(combined_effects())
             .collect(),
-        Scheduler::Dag => query.lazy_dag_scheduler().collect(),
         Scheduler::Sequential => query.sequential().collect(),
     };
     results.sort_unstable();
@@ -1471,7 +1469,6 @@ fn assert_all_schedulers(
     for scheduler in [
         Scheduler::Ordinary,
         Scheduler::Residual,
-        Scheduler::Dag,
         Scheduler::Sequential,
     ] {
         assert_eq!(run(make_root(), scheduler, project), expected);
@@ -3257,7 +3254,6 @@ fn all_attr_inverse_and_bound_endpoint_routes_match_oracles() {
         expected.sort_unstable();
         let residual = run(Arc::clone(&root), Scheduler::Residual, project);
         assert_eq!(residual, expected);
-        assert_eq!(run(Arc::clone(&root), Scheduler::Dag, project), expected);
         assert_eq!(run(root, Scheduler::Sequential, project), expected);
     }
 }
@@ -4040,25 +4036,13 @@ fn automaton_target_confirm_filters_then_set_admits_the_sequence() {
     ];
     let expected = vec![graph.value(2).raw, graph.value(0).raw, graph.value(1).raw];
     let residual = run(
-        target_confirm_root(
-            graph.set.clone(),
-            END,
-            graph.value(0),
-            candidates.clone(),
-            &ops,
-        ),
-        Scheduler::Residual,
-        project_end,
-    );
-    let dag = run(
         target_confirm_root(graph.set.clone(), END, graph.value(0), candidates, &ops),
-        Scheduler::Dag,
+        Scheduler::Residual,
         project_end,
     );
     let mut expected = expected;
     expected.sort_unstable();
     assert_eq!(residual, expected);
-    assert_eq!(dag, expected);
 }
 
 #[test]
@@ -4352,7 +4336,7 @@ fn clone_with_a_suspended_same_variable_cursor_has_two_exact_remainders() {
 }
 
 #[test]
-fn generated_product_programs_match_sequential_and_dag_results() {
+fn generated_product_programs_match_sequential_and_residual_results() {
     let edge_universe = [(0, 0), (0, 1), (0, 2), (1, 2), (2, 3), (3, 0)];
     for mask in 0u16..64 {
         let edges: Vec<_> = edge_universe
@@ -4393,7 +4377,6 @@ fn generated_product_programs_match_sequential_and_dag_results() {
         for ops in expressions {
             let make_root = || bound_start_root(graph.set.clone(), graph.value(0), &ops);
             let residual = run(make_root(), Scheduler::Residual, project_end);
-            assert_eq!(residual, run(make_root(), Scheduler::Dag, project_end));
             assert_eq!(
                 residual,
                 run(make_root(), Scheduler::Sequential, project_end)
@@ -4404,10 +4387,6 @@ fn generated_product_programs_match_sequential_and_dag_results() {
             assert_eq!(
                 ordinary,
                 run(make_same_root(), Scheduler::Residual, project_start)
-            );
-            assert_eq!(
-                ordinary,
-                run(make_same_root(), Scheduler::Dag, project_start)
             );
             assert_eq!(
                 ordinary,
@@ -4475,12 +4454,6 @@ fn generated_combined_formula_rpq_matrix_matches_frozen_schedulers_and_is_monoto
                     expected,
                     "level={level} program={program:?} formula={formula:?} ordinary"
                 );
-                assert_eq!(
-                    run(make_root(), Scheduler::Dag, project_end),
-                    expected,
-                    "level={level} program={program:?} formula={formula:?} LazyDag"
-                );
-
                 for &(capability, lowering) in &lowering_cases {
                     let mut query = Query::new(make_root(), project_end)
                         .solve_residual_state_lazy_with(lowering)
@@ -4618,15 +4591,6 @@ fn finite_path_families_use_native_transition_programs() {
         let mut residual: Vec<_> = query.by_ref().collect();
         residual.sort_unstable();
         assert_eq!(residual, expected, "{name}");
-        assert_eq!(
-            run(
-                bound_start_root(graph.set.clone(), start, &ops),
-                Scheduler::Dag,
-                project_end,
-            ),
-            expected,
-            "{name} DAG oracle"
-        );
         assert!(query.stats().delta_transition_pages > 0, "{name}");
     }
 }
@@ -4807,19 +4771,14 @@ fn paged_transitions_preserve_affine_parent_rows_and_storage_monotonicity() {
     let outer_values = [genid(&rngid().id).raw, genid(&rngid().id).raw];
     let make = || duplicate_parent_root(graph.set.clone(), graph.value(0).raw, outer_values, &ops);
     let mut expected: Vec<_> = Query::new(make(), project_end).sequential().collect();
-    let mut dag: Vec<_> = Query::new(make(), project_end)
-        .lazy_dag_scheduler()
-        .collect();
     let mut residual = Query::new(make(), project_end)
         .solve_residual_state_lazy_with(ResidualLowering::FULL)
         .start_width(1)
         .cap(2);
     let mut actual: Vec<_> = residual.by_ref().collect();
     expected.sort_unstable();
-    dag.sort_unstable();
     actual.sort_unstable();
     assert_eq!(actual, expected);
-    assert_eq!(dag, expected);
     for target in 1..5 {
         assert_eq!(
             actual
@@ -5005,19 +4964,14 @@ fn mixed_transition_pages_preserve_cycles_clone_drop_affine_rows_and_monotonicit
     let mut sequential: Vec<_> = Query::new(make_affine(), project_end)
         .sequential()
         .collect();
-    let mut dag: Vec<_> = Query::new(make_affine(), project_end)
-        .lazy_dag_scheduler()
-        .collect();
     let mut affine = Query::new(make_affine(), project_end)
         .solve_residual_state_lazy_with(ResidualLowering::FULL)
         .start_width(1)
         .cap(2);
     let mut actual: Vec<_> = affine.by_ref().collect();
     sequential.sort_unstable();
-    dag.sort_unstable();
     actual.sort_unstable();
     assert_eq!(actual, sequential);
-    assert_eq!(actual, dag);
     assert!(affine.stats().delta_transition_pages > 0);
 
     let mut previous = Vec::new();

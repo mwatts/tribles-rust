@@ -114,7 +114,6 @@ fn project(binding: &Binding, p: VariableId, x: VariableId) -> Option<(RawInline
 #[derive(Clone, Copy)]
 enum Mode {
     Sequential,
-    Dag,
     ResidualAtomic,
     ResidualPaged,
 }
@@ -152,7 +151,7 @@ fn run<S: TriblePattern>(store: &S, fixture: Fixture, mode: Mode, first: bool) -
                 tally(&mut iter)
             }
         }
-        Mode::Sequential | Mode::Dag | Mode::ResidualPaged => {
+        Mode::Sequential | Mode::ResidualPaged => {
             let root = IntersectionConstraint::new(vec![
                 store.pattern(p, attrs[0], x),
                 store.pattern(p, attrs[1], x),
@@ -166,13 +165,6 @@ fn run<S: TriblePattern>(store: &S, fixture: Fixture, mode: Mode, first: bool) -
                         tally(&mut iter.take(1))
                     } else {
                         tally(&mut iter)
-                    }
-                }
-                Mode::Dag => {
-                    if first {
-                        tally(&mut query.solve_dag_lazy().take(1))
-                    } else {
-                        tally(&mut query.solve_dag().into_iter())
                     }
                 }
                 Mode::ResidualPaged => {
@@ -229,7 +221,6 @@ fn bench_backend<S: TriblePattern>(
 ) {
     let modes = [
         ("seq", Mode::Sequential),
-        ("dag", Mode::Dag),
         ("res-atomic", Mode::ResidualAtomic),
         ("res-paged", Mode::ResidualPaged),
     ];

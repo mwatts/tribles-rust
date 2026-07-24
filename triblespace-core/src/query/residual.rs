@@ -12714,7 +12714,7 @@ impl ResidualStateMachine {
     /// admitted occurrences unless a selected typed route retains the complete
     /// parent activation for reuse. If two unsplittable buckets already exist, one whole bucket
     /// moves to the sibling. Cross-shard reconvergence is deliberately traded
-    /// for parallelism, just as in the affine DAG splitter.
+    /// for parallelism across the affine residual frontier.
     fn split_for_parallel_with_dispatch<'a>(
         &mut self,
         dispatch: &impl ResidualActionDispatch,
@@ -13123,8 +13123,8 @@ impl<C, P: Fn(&Binding) -> Option<R>, R> ResidualStateIter<C, P, R> {
 
     /// Overrides the geometric width-growth cap.
     ///
-    /// Like [`DagIter::cap`](super::DagIter::cap), this never raises the
-    /// current width. To start above the default cap, set the new cap first:
+    /// This never raises the current width. To start above the default cap,
+    /// set the new cap first:
     /// `.cap(new_cap).start_width(new_cap)`.
     pub fn cap(mut self, cap: usize) -> Self {
         self.state.cap = cap.max(1);
@@ -22593,7 +22593,7 @@ mod tests {
                 shape_leaf(0),
                 shape_and(vec![shape_leaf(1), shape_and(vec![shape_leaf(2)])]),
             ])),
-            "nested ANDs flatten, but disjoint variable sets remain a DAG case"
+            "nested ANDs flatten, but disjoint variable sets remain separate residual cells"
         );
         let boxed_and: Box<dyn Constraint<'static> + Send + Sync> =
             Box::new(IntersectionConstraint::new(vec![
@@ -22665,7 +22665,6 @@ mod tests {
             assert_eq!(query.scheduler, QueryScheduler::ResidualState);
             let _ = query.next();
             assert!(query.residual.is_some());
-            assert!(query.dag.is_none());
         }
 
         let source = |variable| FanoutLeaf {
@@ -22683,10 +22682,9 @@ mod tests {
         assert!(true_constant.residual.is_some());
 
         let mut false_constant = Query::new(ZeroVariableTruth(false), |_| Some(()));
-        assert_eq!(false_constant.scheduler, QueryScheduler::LazyDag);
+        assert_eq!(false_constant.scheduler, QueryScheduler::ResidualState);
         assert_eq!(false_constant.next(), None);
         assert!(false_constant.residual.is_none());
-        assert!(false_constant.dag.is_none());
     }
 
     #[test]
@@ -22696,10 +22694,9 @@ mod tests {
                 vec![Box::new(ZeroVariableTruth(false)) as ShapeConstraint],
             );
         let mut false_query = Query::new(false_root, |_| Some(()));
-        assert_eq!(false_query.scheduler, QueryScheduler::LazyDag);
+        assert_eq!(false_query.scheduler, QueryScheduler::ResidualState);
         assert_eq!(false_query.next(), None);
         assert!(false_query.residual.is_none());
-        assert!(false_query.dag.is_none());
 
         let values = Arc::new(vec![raw(3), raw(7), raw(11)]);
         let make_true_and_one_real = || {
@@ -22716,16 +22713,10 @@ mod tests {
         assert_eq!(ordinary.scheduler, QueryScheduler::ResidualState);
         let mut ordinary_bag: Vec<_> = ordinary.by_ref().collect();
         assert!(ordinary.residual.is_some());
-        let mut explicit_dag = Query::new(make_true_and_one_real(), project).lazy_dag_scheduler();
-        assert_eq!(explicit_dag.scheduler, QueryScheduler::LazyDag);
-        let mut explicit_dag_bag: Vec<_> = explicit_dag.by_ref().collect();
-        assert!(explicit_dag.dag.is_some());
         let mut expected_bag = values.as_ref().clone();
         ordinary_bag.sort_unstable();
-        explicit_dag_bag.sort_unstable();
         expected_bag.sort_unstable();
         assert_eq!(ordinary_bag, expected_bag);
-        assert_eq!(ordinary_bag, explicit_dag_bag);
 
         // A false constant must suppress residual admission even when the
         // remaining exposed shape has an overlapping-variable pair.
@@ -22739,12 +22730,11 @@ mod tests {
         ]);
         assert!(useful_default_shape(&false_overlapping));
         let mut false_overlapping = Query::new(false_overlapping, |_| Some(()));
-        assert_eq!(false_overlapping.scheduler, QueryScheduler::LazyDag);
+        assert_eq!(false_overlapping.scheduler, QueryScheduler::ResidualState);
         assert_eq!(false_overlapping.next(), None);
         assert!(false_overlapping.residual.is_none());
-        assert!(false_overlapping.dag.is_none());
         let debug = format!("{false_overlapping:?}");
-        assert!(debug.contains("scheduler: LazyDag"), "{debug}");
+        assert!(debug.contains("scheduler: ResidualState"), "{debug}");
         assert!(debug.contains("residual_started: false"), "{debug}");
     }
 
@@ -25910,7 +25900,7 @@ mod tests {
     }
 
     #[test]
-    fn finite_union_proposal_matches_sequential_dag_and_opaque_residual() {
+    fn finite_union_proposal_matches_sequential_and_opaque_residual() {
         let make = || {
             UnionConstraint::new(vec![
                 FanoutLeaf {
@@ -25925,7 +25915,6 @@ mod tests {
         };
         let project = |binding: &Binding| binding.get(0).copied();
         let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
-        let mut dag: Vec<_> = Query::new(make(), project).lazy_dag_scheduler().collect();
         let mut opaque: Vec<_> = Query::new(make(), project)
             .solve_residual_state_lazy()
             .collect();
@@ -25938,12 +25927,10 @@ mod tests {
             .shadow(epoch)
             .collect_profiled();
         sequential.sort_unstable();
-        dag.sort_unstable();
         opaque.sort_unstable();
         lowered.results.sort_unstable();
         assert_eq!(lowered.results, [raw(1), raw(2), raw(3)]);
         assert_eq!(lowered.results, sequential);
-        assert_eq!(lowered.results, dag);
         assert_eq!(lowered.results, opaque);
 
         // Entering the lowered formula is planning. Every direct OR child has
@@ -26006,9 +25993,6 @@ mod tests {
         let mut sequential: Vec<_> = Query::new(make(fresh(), fresh()), project)
             .sequential()
             .collect();
-        let mut dag: Vec<_> = Query::new(make(fresh(), fresh()), project)
-            .lazy_dag_scheduler()
-            .collect();
         let mut opaque: Vec<_> = Query::new(make(fresh(), fresh()), project)
             .solve_residual_state_lazy()
             .collect();
@@ -26024,12 +26008,10 @@ mod tests {
         ))
         .collect();
         sequential.sort_unstable();
-        dag.sort_unstable();
         opaque.sort_unstable();
         lowered.sort_unstable();
         assert_eq!(lowered, [raw(0), raw(1)]);
         assert_eq!(lowered, sequential);
-        assert_eq!(lowered, dag);
         assert_eq!(lowered, opaque);
         assert_candidate_page_partition(&left_calls, 3);
         assert_candidate_page_partition(&right_calls, 3);
@@ -28065,7 +28047,6 @@ mod tests {
 
         let project = |binding: &Binding| binding.get(0).copied();
         let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
-        let mut dag: Vec<_> = Query::new(make(), project).lazy_dag_scheduler().collect();
         let mut opaque: Vec<_> = Query::new(make(), project)
             .solve_residual_state_lazy()
             .collect();
@@ -28076,12 +28057,10 @@ mod tests {
             ))
             .collect();
         sequential.sort_unstable();
-        dag.sort_unstable();
         opaque.sort_unstable();
         lowered.sort_unstable();
         assert_eq!(lowered, [raw(1), raw(3), raw(4)]);
         assert_eq!(lowered, sequential);
-        assert_eq!(lowered, dag);
         assert_eq!(lowered, opaque);
     }
 
@@ -29150,16 +29129,13 @@ mod tests {
                 .filter(|value| *value == accepted)
                 .collect();
             let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
-            let mut dag: Vec<_> = Query::new(make(), project).solve_dag_lazy().collect();
             let mut residual: Vec<_> = Query::new(make(), project)
                 .solve_residual_state_lazy()
                 .collect();
             expected.sort_unstable();
             sequential.sort_unstable();
-            dag.sort_unstable();
             residual.sort_unstable();
             assert_eq!(sequential, expected);
-            assert_eq!(dag, expected);
             assert_eq!(residual, expected);
             for workers in [1, 4] {
                 let mut parallel = with_parallel_workers(workers, || {
@@ -29177,12 +29153,6 @@ mod tests {
             assert_eq!(
                 Query::new(ZeroVariableTruth(truth), |_| Some(()))
                     .sequential()
-                    .collect::<Vec<_>>(),
-                expected
-            );
-            assert_eq!(
-                Query::new(ZeroVariableTruth(truth), |_| Some(()))
-                    .solve_dag_lazy()
                     .collect::<Vec<_>>(),
                 expected
             );

@@ -76,17 +76,16 @@ where
 
     assert_engine("sequential", make_query().sequential().collect());
     assert_engine("ordinary residual-default", make_query().collect());
-    assert_engine("lazy DAG", make_query().solve_dag_lazy().collect());
 
-    let mut lazy = make_query().solve_dag_lazy();
-    let first = lazy.next();
+    let mut residual = make_query().solve_residual_state_lazy_with(combined_effects());
+    let first = residual.next();
     assert_eq!(
         first.is_some(),
         !expected.is_empty(),
-        "{label}: lazy DAG first-result liveness"
+        "{label}: residual first-result liveness"
     );
-    let lazy_all = first.into_iter().chain(lazy).collect();
-    assert_engine("lazy DAG after first pull", lazy_all);
+    let resumed = first.into_iter().chain(residual).collect();
+    assert_engine("residual after first pull", resumed);
 
     // This is the single integration seam for every fixture below. Composite
     // effects are selected together; adding another structural capability
@@ -103,10 +102,6 @@ where
         assert_engine(
             "ordinary parallel residual",
             make_query().into_par_iter().collect::<Vec<_>>(),
-        );
-        assert_engine(
-            "parallel DAG",
-            make_query().into_par_dag_iter().collect::<Vec<_>>(),
         );
         assert_engine(
             "parallel residual",

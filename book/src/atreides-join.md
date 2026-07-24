@@ -175,17 +175,14 @@ depth-first traversal from thrashing through unrelated values.
 - The ordinary iterator lifts the same negotiation to blocks of sibling rows
   through canonical residual states for every live root. Those states key
   future work by bound schema, planned action, and checked leaf occurrences.
-  The explicit lazy-DAG comparison instead keys buckets by bound-variable set,
-  stable-partitions rows by their exact adaptive variable, and lets the root
-  constraint preserve each row's proposer occurrence; residual planning makes
-  both choices explicit in its action state. Both worklists may reconverge
-  histories into larger downstream batches only after those actions run. They
-  never enlarge a batch by moving a row to another variable or proposer
-  occurrence. Before filing a DAG proposal, the engine admits its
-  `(parent row, value)` pairs to SET support, so an intra-parent duplicate
-  vanishes while equal values under distinct parents remain independent.
-  Residual payloads still carry occurrence bags through their explicit action
-  states until the corresponding residual admission slice is applied.
+  Planning makes both the exact adaptive variable and proposer occurrence
+  explicit in action state, so equivalent futures may reconverge into larger
+  downstream batches only after those actions run. The engine never enlarges a
+  batch by moving a row to another variable or proposer occurrence. Proposal
+  payloads carry occurrence bags until the corresponding residual admission
+  slice admits `(parent row, value)` pairs to SET support: an intra-parent
+  duplicate vanishes while equal values under distinct parents remain
+  independent.
 - Highly skewed data still behaves predictably: even if one attribute dominates
   the dataset, the other constraints continue to bound the search space tightly
   and prevent runaway exploration.
