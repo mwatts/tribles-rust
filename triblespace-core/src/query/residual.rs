@@ -4452,6 +4452,7 @@ struct RowBatch {
 }
 
 impl RowBatch {
+    #[cfg(test)]
     fn seed() -> Self {
         Self {
             rows: Vec::new(),
@@ -10442,6 +10443,7 @@ pub(super) struct ResidualQueryState {
 /// Values are stored in ascending [`VariableId`] order, exactly like every
 /// other residual-state row. The frame owns a separate plan and interner, so
 /// these local variable numbers never enter the caller's variable namespace.
+#[derive(Clone, Debug)]
 pub(super) struct FrameSeedRow {
     bound: VariableSet,
     values: Vec<RawInline>,
@@ -10501,10 +10503,10 @@ where
         // Preserve the ordinary optimistic preflight for partial bindings.
         // Typed Support owns only an explicit residual action; it does not
         // perturb admission or exact zero-variable truth at this boundary.
-        let mode = if seed_survives(&root, seed.bound, &seed_view) {
-            Search::NextVariable
+        let seed = if seed_survives(&root, seed.bound, &seed_view) {
+            Some(seed)
         } else {
-            Search::Done
+            None
         };
 
         let influences = std::array::from_fn(|variable| {
@@ -10518,12 +10520,12 @@ where
             if !full.is_set(variable) {
                 return usize::MAX;
             }
-            source_quote_scalar(&root, variable, VariableSet::new_empty(), &RowsView::EMPTY)
+            source_quote_single_row(&root, variable, VariableSet::new_empty(), &RowsView::EMPTY)
                 .map_or(usize::MAX, |(_, estimate)| estimate)
         });
 
         let plan = ResidualPlan::compile_lowering(&root, lowering);
-        let machine = ResidualStateMachine::new_seeded_for_plan(full, &plan, mode, seed);
+        let machine = ResidualStateMachine::new_seeded_for_plan(full, &plan, seed);
         Self {
             root,
             plan,
@@ -10549,11 +10551,11 @@ where
 impl ResidualQueryState {
     pub(super) fn new<'a>(
         root: &dyn Constraint<'a>,
-        mode: Search,
+        seed: Option<FrameSeedRow>,
         lowering: ResidualLowering,
     ) -> Self {
         let plan = ResidualPlan::compile_lowering(root, lowering);
-        let machine = ResidualStateMachine::new_for_plan(root.variables(), &plan, mode);
+        let machine = ResidualStateMachine::new_for_plan(root.variables(), &plan, seed);
         Self { plan, machine }
     }
 
@@ -10581,21 +10583,20 @@ impl ResidualQueryState {
 
 impl ResidualStateMachine {
     #[cfg(test)]
-    fn new(full: VariableSet, leaf_count: usize, mode: Search) -> Self {
-        Self::new_with_span(full, leaf_count, 2, mode)
+    fn new(full: VariableSet, leaf_count: usize, seed: Option<FrameSeedRow>) -> Self {
+        Self::new_with_span(full, leaf_count, 2, seed)
     }
 
-    fn new_for_plan(full: VariableSet, plan: &ResidualPlan, mode: Search) -> Self {
-        Self::new_seeded_for_plan(full, plan, mode, FrameSeedRow::empty())
+    fn new_for_plan(full: VariableSet, plan: &ResidualPlan, seed: Option<FrameSeedRow>) -> Self {
+        Self::new_seeded_for_plan(full, plan, seed)
     }
 
     fn new_seeded_for_plan(
         full: VariableSet,
         plan: &ResidualPlan,
-        mode: Search,
-        seed: FrameSeedRow,
+        seed: Option<FrameSeedRow>,
     ) -> Self {
-        Self::new_with_span_and_seed(full, plan.len(), plan.action_span(), mode, seed)
+        Self::new_with_span_and_seed(full, plan.len(), plan.action_span(), seed)
     }
 
     #[cfg(test)]
@@ -10603,17 +10604,16 @@ impl ResidualStateMachine {
         full: VariableSet,
         leaf_count: usize,
         action_span: usize,
-        mode: Search,
+        seed: Option<FrameSeedRow>,
     ) -> Self {
-        Self::new_with_span_and_seed(full, leaf_count, action_span, mode, FrameSeedRow::empty())
+        Self::new_with_span_and_seed(full, leaf_count, action_span, seed)
     }
 
     fn new_with_span_and_seed(
         full: VariableSet,
         leaf_count: usize,
         action_span: usize,
-        mode: Search,
-        seed: FrameSeedRow,
+        seed: Option<FrameSeedRow>,
     ) -> Self {
         let cap = block_row_cap();
         let mut state = Self {
@@ -10651,7 +10651,7 @@ impl ResidualStateMachine {
             growth: lazy_growth(),
             cap,
         };
-        if matches!(mode, Search::NextVariable) {
+        if let Some(seed) = seed {
             file_with_span(
                 &mut state.worklist,
                 &mut state.interner,
@@ -13212,7 +13212,7 @@ fn solve<'a, P, R>(
     mut projection: ProjectionGate,
     influences: [VariableSet; 128],
     base_estimates: [usize; 128],
-    mode: Search,
+    seed: Option<FrameSeedRow>,
 ) -> ResidualStateSolve<R>
 where
     P: Fn(&Binding) -> Option<R>,
@@ -13223,16 +13223,19 @@ where
     let mut stats = ResidualStateStats::default();
     let mut interner = StateInterner::default();
     let mut worklist = Worklist::new();
-    if matches!(mode, Search::NextVariable) {
+    if let Some(seed) = seed {
         file_with_plan(
             &mut worklist,
             &mut interner,
             &plan,
             StateDesc {
-                bound: VariableSet::new_empty(),
+                bound: seed.bound,
                 phase: ResidualPhase::Ready,
             },
-            StateBucket::Rows(RowBatch::seed()),
+            StateBucket::Rows(RowBatch {
+                rows: seed.values,
+                row_count: 1,
+            }),
             &mut stats,
         );
     }
@@ -13312,11 +13315,7 @@ where
 
 fn assert_fresh<C, P: Fn(&Binding) -> Option<R>, R>(query: &Query<C, P, R>) {
     assert!(
-        !query.iteration_started
-            && query.stack.is_empty()
-            && query.bound.is_empty()
-            && query.touched_variables.is_empty()
-            && matches!(query.mode, Search::NextVariable | Search::Done),
+        !query.iteration_started && query.residual.is_none(),
         "cannot residual-solve a Query mid-iteration: residual execution restarts from the seed"
     );
 }
@@ -13370,12 +13369,12 @@ where
             projection,
             influences,
             base_estimates,
-            mode,
+            seed,
             ..
         } = self;
         let full = constraint.variables();
         let plan = ResidualPlan::compile_lowering(&constraint, lowering);
-        let state = ResidualStateMachine::new_for_plan(full, &plan, mode);
+        let state = ResidualStateMachine::new_for_plan(full, &plan, seed);
         ResidualStateIter {
             root: constraint,
             plan,
@@ -13431,7 +13430,7 @@ where
             projection,
             influences,
             base_estimates,
-            mode,
+            seed,
             ..
         } = self;
         solve(
@@ -13440,7 +13439,7 @@ where
             projection,
             influences,
             base_estimates,
-            mode,
+            seed,
         )
     }
 }
@@ -15788,7 +15787,7 @@ mod tests {
         assert_eq!(ledger.additional_for_demand(other, 192), 0);
         ledger.families.remove(&other);
 
-        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 0, Search::Done);
+        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 0, None);
         machine.terminal_yield = ledger;
         machine.terminal_projected_rows = 64;
         machine.terminal_demand_width = 128;
@@ -15817,7 +15816,7 @@ mod tests {
     fn terminal_zero_yield_keeps_demand_width_at_scalar_miss_floor() {
         let family = StateId(10);
         let activation = DeltaActivationId::test(41);
-        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 0, Search::Done);
+        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 0, None);
         machine.terminal_yield.register(family, &[activation]);
         machine.terminal_yield.complete(activation);
         machine.terminal_projected_rows = 64;
@@ -15913,7 +15912,7 @@ mod tests {
 
     #[test]
     fn projected_demand_floor_does_not_counter_charge_when_search_is_ahead() {
-        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 0, Search::Done);
+        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 0, None);
         machine.cap = 8;
         machine.width = 8;
 
@@ -15930,7 +15929,7 @@ mod tests {
 
     #[test]
     fn projected_demand_floor_ignores_growth_and_saturates_at_cap() {
-        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 0, Search::Done);
+        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 0, None);
         machine.cap = 4;
         machine.width = 1;
         machine.growth = 1;
@@ -15959,7 +15958,7 @@ mod tests {
 
     #[test]
     fn projected_demand_floor_clones_as_an_independent_pull_boundary() {
-        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 0, Search::Done);
+        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 0, None);
         machine.cap = 8;
         machine.width = 1;
         machine.growth = 1;
@@ -15989,7 +15988,7 @@ mod tests {
     #[cfg(feature = "parallel")]
     #[test]
     fn parallel_sibling_inherits_only_already_confirmed_demand() {
-        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 0, Search::Done);
+        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 0, None);
         machine.cap = 8;
         machine.width = 1;
         machine.growth = 1;
@@ -16285,7 +16284,7 @@ mod tests {
                 proposer: 1,
             },
         };
-        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
         let (state, _) = machine
             .interner
             .intern_with_status(desc.clone(), &mut machine.stats);
@@ -16434,7 +16433,7 @@ mod tests {
                 proposer: 1,
             },
         };
-        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
         let (state, _) = machine
             .interner
             .intern_with_status(desc.clone(), &mut machine.stats);
@@ -16522,7 +16521,7 @@ mod tests {
                     proposer: 1,
                 },
             };
-            let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+            let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
             assert_eq!(machine.width, 1);
             let (state, _) = machine
                 .interner
@@ -16589,8 +16588,7 @@ mod tests {
         let mut iter = Query::new(root, postprocessing).solve_residual_state_lazy_with(
             ResidualLowering::new(FormulaScope::OpaqueLeaves, ProgramScope::All),
         );
-        iter.state =
-            ResidualStateMachine::new_for_plan(iter.root.variables(), &iter.plan, Search::Done);
+        iter.state = ResidualStateMachine::new_for_plan(iter.root.variables(), &iter.plan, None);
         let family = StateId(u32::MAX);
         let constraint = iter.plan.resolve(&iter.root, 1);
         let request = ProgramRequest {
@@ -16784,7 +16782,7 @@ mod tests {
             ResidualLowering::new(FormulaScope::OpaqueLeaves, ProgramScope::All),
         );
         let mut panicking =
-            ResidualStateMachine::new_for_plan(panic_root.variables(), &panic_plan, Search::Done);
+            ResidualStateMachine::new_for_plan(panic_root.variables(), &panic_plan, None);
         panicking.width = 2;
         let panic_request = ProgramRequest {
             action: ProgramAction::Propose(1),
@@ -16859,7 +16857,7 @@ mod tests {
             TerminalProgramMode::OutOfRange,
             TerminalProgramMode::Descending,
         ] {
-            let mut machine = ResidualStateMachine::new(full, 1, Search::Done);
+            let mut machine = ResidualStateMachine::new(full, 1, None);
             let malformed = TerminalProgramLeaf { variable: 1, mode };
             let route = TypedProgramSpec::route(&malformed, request).unwrap();
             let vars = [0];
@@ -16918,8 +16916,7 @@ mod tests {
             .cap(64)
             .start_width(1)
             .growth(2);
-        iter.state =
-            ResidualStateMachine::new_for_plan(iter.root.variables(), &iter.plan, Search::Done);
+        iter.state = ResidualStateMachine::new_for_plan(iter.root.variables(), &iter.plan, None);
         iter.state.cap = 64;
         iter.state.width = 1;
         iter.state.growth = 2;
@@ -18993,7 +18990,7 @@ mod tests {
     }
 
     fn scheduler_fixture(entries: &[(usize, usize, u8)]) -> ResidualStateMachine {
-        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 1, Search::Done);
+        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 1, None);
         for &(bound_count, row_count, marker) in entries {
             file(
                 &mut machine.worklist,
@@ -20009,7 +20006,7 @@ mod tests {
         let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
         assert!(plan.program_scope.enabled());
         assert!(plan.formula_ready_quote.is_some());
-        let mut machine = ResidualStateMachine::new_for_plan(root.variables(), &plan, Search::Done);
+        let mut machine = ResidualStateMachine::new_for_plan(root.variables(), &plan, None);
         let task = SelectedResidualTask {
             state: StateId(0),
             desc: StateDesc {
@@ -20239,8 +20236,11 @@ mod tests {
         let mut v31 = make();
         assert!(v31.plan.formula_ready_quote.is_some());
         v31.plan.formula_ready_quote = None;
-        v31.state =
-            ResidualStateMachine::new_for_plan(root.variables(), &v31.plan, Search::NextVariable);
+        v31.state = ResidualStateMachine::new_for_plan(
+            root.variables(),
+            &v31.plan,
+            Some(FrameSeedRow::empty()),
+        );
         let v31_epoch = ResidualShadowEpoch::new();
         let v31 = v31.shadow(v31_epoch).collect_profiled();
 
@@ -20326,7 +20326,7 @@ mod tests {
         v31.state = ResidualStateMachine::new_for_plan(
             v31_root.variables(),
             &v31.plan,
-            Search::NextVariable,
+            Some(FrameSeedRow::empty()),
         );
         let v31_epoch = ResidualShadowEpoch::new();
         let v31 = v31.shadow(v31_epoch).collect_profiled();
@@ -20445,7 +20445,7 @@ mod tests {
         v31.state = ResidualStateMachine::new_for_plan(
             v31_root.variables(),
             &v31.plan,
-            Search::NextVariable,
+            Some(FrameSeedRow::empty()),
         );
         let v31_epoch = ResidualShadowEpoch::new();
         let v31 = v31.shadow(v31_epoch).collect_profiled();
@@ -21422,7 +21422,7 @@ mod tests {
         );
         let mut relevant = ChildSet::empty(plan.len());
         relevant.insert(0);
-        let mut machine = ResidualStateMachine::new_for_plan(root.variables(), &plan, Search::Done);
+        let mut machine = ResidualStateMachine::new_for_plan(root.variables(), &plan, None);
         let parent = machine.interner.start_formula(
             &plan.finite_formula,
             0,
@@ -23987,7 +23987,7 @@ mod tests {
         };
         assert!(desc.uses_candidate_pages(&plan, &formula_pcs));
 
-        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
         let token = file(
             &mut machine.worklist,
             &mut machine.interner,
@@ -28706,7 +28706,7 @@ mod tests {
             values: Arc::new(Vec::new()),
         };
         let plan = ResidualPlan::compile(&root);
-        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
         machine.emit_vars = vec![0];
         machine.emit_rows = (0..7).map(raw).collect();
         machine.emit_origins = None;
@@ -28738,7 +28738,7 @@ mod tests {
         let plan = ResidualPlan::compile(&root);
         let influences = [VariableSet::new_empty(); 128];
         let base_estimates = [usize::MAX; 128];
-        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
         file(
             &mut machine.worklist,
             &mut machine.interner,
@@ -28782,7 +28782,7 @@ mod tests {
         let influences = [VariableSet::new_empty(); 128];
         let base_estimates = [usize::MAX; 128];
         let expected: Vec<_> = (0..6).map(raw).collect();
-        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
         let desc = ready_desc(1);
         let first = file(
             &mut machine.worklist,
@@ -29166,7 +29166,7 @@ mod tests {
         let root = ShapeLeaf(0);
         let plan = ResidualPlan::compile(&root);
         let desc = ready_desc(0);
-        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
 
         let zero_rows = |row_count| {
             StateBucket::Rows(RowBatch {
@@ -29243,11 +29243,8 @@ mod tests {
                 candidates: candidate_payload(row_count, candidates),
             })
         };
-        let mut candidate_machine = ResidualStateMachine::new(
-            candidate_root.variables(),
-            candidate_plan.len(),
-            Search::Done,
-        );
+        let mut candidate_machine =
+            ResidualStateMachine::new(candidate_root.variables(), candidate_plan.len(), None);
         let first = file_with_plan(
             &mut candidate_machine.worklist,
             &mut candidate_machine.interner,
@@ -29302,11 +29299,8 @@ mod tests {
             ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Disabled),
         );
         let relevant = ChildSet::empty(formula_plan.len()).with_inserted(0);
-        let mut formula_machine = ResidualStateMachine::new_for_plan(
-            formula_root.variables(),
-            &formula_plan,
-            Search::Done,
-        );
+        let mut formula_machine =
+            ResidualStateMachine::new_for_plan(formula_root.variables(), &formula_plan, None);
         let start = formula_machine.interner.start_formula(
             &formula_plan.finite_formula,
             0,
@@ -29428,7 +29422,7 @@ mod tests {
         };
         assert!(desc.uses_candidate_pages(&plan, &formula_pcs));
 
-        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
         let old = StateBucket::Candidates(CandidateBatch {
             parents: RowBatch {
                 rows: vec![raw(10)],
@@ -29509,7 +29503,7 @@ mod tests {
         let root = ShapeLeaf(0);
         let plan = ResidualPlan::compile(&root);
         let desc = ready_desc(1);
-        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
         machine.width = 8;
         machine.cap = 64;
 
@@ -29624,7 +29618,7 @@ mod tests {
 
     #[test]
     fn mixed_delta_feedback_arms_probe_without_widening() {
-        let mut machine = ResidualStateMachine::new(VariableSet::new_singleton(0), 1, Search::Done);
+        let mut machine = ResidualStateMachine::new(VariableSet::new_singleton(0), 1, None);
         machine.width = 4;
         machine.cap = 64;
         let mut relevant = ChildSet::empty(1);
@@ -29784,7 +29778,7 @@ mod tests {
     fn active_delta_seed_follows_every_exact_one_parent_activation() {
         let root = CapabilityLeaf { variable: 0 };
         let plan = ResidualPlan::compile(&root);
-        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
         let active = machine
             .delta
             .seed_source_proposals(
@@ -29864,7 +29858,7 @@ mod tests {
     fn full_action_successor_that_fills_width_returns_to_global_batching() {
         let root = CapabilityLeaf { variable: 127 };
         let plan = ResidualPlan::compile(&root);
-        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
+        let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
         let successor = file(
             &mut machine.worklist,
             &mut machine.interner,
@@ -29962,7 +29956,7 @@ mod tests {
 
     #[test]
     fn readiness_ties_use_the_same_highest_state_id_rule_as_full_ties() {
-        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 1, Search::Done);
+        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 1, None);
         let mut first_bound = VariableSet::new_empty();
         first_bound.set(0);
         let first = StateDesc {
@@ -30026,7 +30020,7 @@ mod tests {
             })
         }
 
-        let mut underfilled = ResidualStateMachine::new(VariableSet::new_empty(), 2, Search::Done);
+        let mut underfilled = ResidualStateMachine::new(VariableSet::new_empty(), 2, None);
         for (desc, bucket) in [
             (ready_desc(1), ready_bucket(1, 2, 1)),
             (confirm_desc(), candidate_bucket(1)),
@@ -30060,7 +30054,7 @@ mod tests {
             }
         }
 
-        let mut full = ResidualStateMachine::new(VariableSet::new_empty(), 2, Search::Done);
+        let mut full = ResidualStateMachine::new(VariableSet::new_empty(), 2, None);
         for (desc, bucket) in [
             (ready_desc(1), ready_bucket(1, 2, 1)),
             (confirm_desc(), candidate_bucket(2)),
@@ -30109,7 +30103,7 @@ mod tests {
         }]);
         let plan = ResidualPlan::compile(&root);
         let mut machine =
-            ResidualStateMachine::new(root.variables(), plan.len(), Search::NextVariable);
+            ResidualStateMachine::new(root.variables(), plan.len(), Some(FrameSeedRow::empty()));
         machine.cap = 1;
         let influences = [VariableSet::new_empty(); 128];
         let base_estimates = [1; 128];
@@ -30423,7 +30417,7 @@ mod tests {
 
     #[test]
     fn width_increases_count_only_numeric_growth_before_saturation() {
-        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 0, Search::Done);
+        let mut machine = ResidualStateMachine::new(VariableSet::new_empty(), 0, None);
         machine.width = 1;
         machine.growth = 1;
         machine.cap = 4;

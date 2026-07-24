@@ -45,7 +45,6 @@ pub mod unionconstraint;
 mod variableset;
 
 use std::fmt;
-use std::iter::FromIterator;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -53,7 +52,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use ahash::AHashSet;
-use arrayvec::ArrayVec;
 use constantconstraint::*;
 
 use crate::inline::encodings::genid::GenId;
@@ -766,37 +764,15 @@ impl<'v> RowsView<'v> {
 /// [`CandidateSink::Tagged`].
 pub type Candidates = Vec<(u32, RawInline)>;
 
-/// Collapses an action's occurrence bag to its SET support while preserving
-/// the order in which a tail-popping consumer would first encounter values.
-///
-/// The returned length is the raw occurrence count. Callers charge proposal
-/// work from that count before using the normalized action frontier. `seen` is
-/// cleared on return but retains its allocation for the next action.
-fn admit_reverse_stable_set<T>(occurrences: &mut Vec<T>, seen: &mut AHashSet<T>) -> usize
-where
-    T: Copy + Eq + std::hash::Hash,
-{
-    let raw_len = occurrences.len();
-    seen.clear();
-    if raw_len > 1 {
-        occurrences.reverse();
-        occurrences.retain(|occurrence| seen.insert(*occurrence));
-        occurrences.reverse();
-    }
-    seen.clear();
-    raw_len
-}
-
 /// The output sink of [`Constraint::propose`] / [`Constraint::confirm`] —
 /// the representation-generic seam that lets one protocol serve both
-/// engine families with zero ceremony on either side:
+/// tagged blocks and compact single-parent frontiers with zero ceremony:
 ///
 /// - [`Tagged`](Self::Tagged) lends a [`Candidates`] pair buffer — the
-///   blocked engines' ragged COO frontier, `(row, value)` grouped by
-///   ascending row index.
+///   residual solver's ragged COO frontier, `(row, value)` grouped by ascending
+///   row index.
 /// - [`Values`](Self::Values) lends a plain `Vec<RawInline>` for any
-///   single-parent frontier. The sequential cursor and one-parent blocked /
-///   residual frontiers use this compact representation. The row index is
+///   single-parent residual frontier. The row index is
 ///   statically 0 and **no `u32` tag is ever materialized**; callers must pass
 ///   single-row views (`view.len() == 1`). Storage shape does not select an
 ///   execution backend: a constraint may batch the values through the same
@@ -2070,8 +2046,8 @@ pub trait Constraint<'a> {
     }
 }
 
-/// Coverage-based source quote for one scalar row.
-fn source_quote_scalar<'a, C: Constraint<'a> + ?Sized>(
+/// Coverage-based source quote for one single-row view.
+fn source_quote_single_row<'a, C: Constraint<'a> + ?Sized>(
     constraint: &C,
     variable: VariableId,
     bound: VariableSet,
@@ -2489,12 +2465,6 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum QueryScheduler {
-    ResidualState,
-    Sequential,
-}
-
 /// A query is an iterator over the results of a query.
 /// It takes a constraint and a post-processing function as input,
 /// and returns the results of the query as a stream of values.
@@ -2508,12 +2478,8 @@ enum QueryScheduler {
 /// Explicit routes deferred by policy use the ordinary constraint action. A
 /// structurally absent route may instead retain the constraint's legacy pager
 /// or seed hooks. Seed-rejected queries start no runtime. Use
-/// [`Query::sequential`] for the scalar depth-first specialization. Scheduler
-/// selection and structural lowering are independent controls; use
 /// [`Query::residual_lowering`] to select a conservative or intermediate
-/// lowering without changing the scheduler. Fully drained scheduler results
-/// produce the same distinct raw projected-row set; their iteration order may
-/// differ. Strict-projection keys are claimed before Rust conversion, so
+/// lowering. Strict-projection keys are claimed before Rust conversion, so
 /// conversion failure or panic never retries the same raw row through another
 /// witness. Full heads need no terminal claim table: engine action admission
 /// already makes complete raw bindings unique, and a full projection is
@@ -2534,10 +2500,11 @@ pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     /// Raw strict-projection identity and any keys claimed by this exact
     /// iterator snapshot. Full heads carry an elided marker instead.
     projection: ProjectionGate,
-    scheduler: QueryScheduler,
-    /// Structural lowering selected independently from the physical scheduler.
+    /// Structural lowering for the one residual solver.
     residual_lowering: residual::ResidualLowering,
-    mode: Search,
+    /// Exact zero-or-one-row seed relation, retained until the residual cursor
+    /// is first materialized.
+    seed: Option<residual::FrameSeedRow>,
     /// Whether [`Iterator::next`] has ever been called on this query.
     ///
     /// Cursor shape cannot encode freshness: an untouched failed zero-variable
@@ -2547,37 +2514,10 @@ pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
     /// been pulled."
     iteration_started: bool,
     influences: [VariableSet; 128],
-    estimates: [usize; 128],
     /// PROBE (order-key experiment): each variable's estimate against the
     /// **empty** binding, frozen at [`Query::new`] — the static baseline
     /// the `ratio_first` / `influenced_only` keys compare against.
     base_estimates: [usize; 128],
-    touched_variables: VariableSet,
-    /// The borrowed cursor, half one: bound variables in binding order.
-    stack: ArrayVec<VariableId, 128>,
-    /// The borrowed cursor, half two: bound values parallel to `stack`.
-    /// `RowsView::new_indexed(&stack, &row, &cols)` is the engine's
-    /// single-row block — the sequential engine is literally a block-of-1
-    /// caller.
-    row: ArrayVec<RawInline, 128>,
-    /// Variable→column index for the cursor ([`RowsView::new_indexed`]):
-    /// `cols[v]` = position of `v` in `stack`, [`COL_UNBOUND`] otherwise.
-    /// Maintained incrementally on push/pop, so constraints locate their
-    /// columns in O(1) instead of scanning the stack per verb call.
-    cols: [u8; 128],
-    /// Bitset mirror of `stack` (estimate-staleness bookkeeping).
-    bound: VariableSet,
-    unbound: ArrayVec<VariableId, 128>,
-    /// Per-variable proposal buffers — plain values, no row tags: the
-    /// cursor is a block of one, so the row index is statically 0
-    /// ([`CandidateSink::Values`]).
-    values: ArrayVec<Option<Vec<RawInline>>, 128>,
-    /// Reused scratch for admitting one scalar proposal action to SET
-    /// support without allocating on every depth-first branch.
-    value_admission: AHashSet<RawInline>,
-    /// Emit-only scratch: filled from the cursor when a full row is
-    /// postprocessed. The only place a [`Binding`] still exists.
-    binding: Binding,
     /// Lazily initialized canonical residual-state cursor. The box owns only
     /// a borrow-free lowering plan plus raw machine state; `constraint` and
     /// `postprocessing` remain owned by this `Query`.
@@ -2593,170 +2533,25 @@ where
     P: Fn(&Binding) -> Option<R> + Clone,
 {
     fn clone(&self) -> Self {
-        // Both cursor forms contain only raw bindings, never projected `R`s,
-        // so a clone snapshots the exact remaining search without requiring
-        // the output type itself to implement `Clone`.
-        debug_assert!(self.value_admission.is_empty());
+        // The residual cursor contains only raw bindings, never projected
+        // `R`s, so a clone snapshots the exact remaining search without
+        // requiring the output type itself to implement `Clone`.
         Self {
             constraint: self.constraint.clone(),
             postprocessing: self.postprocessing.clone(),
             projection: self.projection.clone(),
-            scheduler: self.scheduler,
             residual_lowering: self.residual_lowering,
-            mode: self.mode,
+            seed: self.seed.clone(),
             iteration_started: self.iteration_started,
             influences: self.influences,
-            estimates: self.estimates,
             base_estimates: self.base_estimates,
-            touched_variables: self.touched_variables,
-            stack: self.stack.clone(),
-            row: self.row.clone(),
-            cols: self.cols,
-            bound: self.bound,
-            unbound: self.unbound.clone(),
-            values: self.values.clone(),
-            // Action admission never spans a cursor boundary. Do not clone an
-            // empty scratch table whose retained capacity may match a very
-            // large root proposal (especially on Rayon's first split).
-            value_admission: AHashSet::new(),
-            binding: self.binding.clone(),
             residual: self.residual.clone(),
         }
     }
 }
 
 impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
-    /// Picks the next unbound variable, refreshes estimates touched by
-    /// the most recent binding, re-sorts `unbound`, fills the variable's
-    /// proposal vector via [`Constraint::propose`] (on the single-row
-    /// cursor view), and pushes it onto the cursor. Leaves
-    /// `mode = NextValue`. The caller is responsible for ensuring
-    /// `unbound` is non-empty.
-    ///
-    /// Used by [`Iterator::next`]'s explicit scalar `NextVariable` branch.
-    fn push_next_variable(&mut self) {
-        // Coverage is structural in the complete bound schema and may be
-        // enabled by any newly bound peer (Equality is the smallest example).
-        // Recompute the at-most-128 source receipts rather than treating an
-        // estimate-influence cache as semantic eligibility.
-        let view = RowsView::new_indexed(&self.stack, &self.row, &self.cols);
-        self.touched_variables = VariableSet::new_empty();
-        let mut best = None;
-        for (index, &v) in self.unbound.iter().enumerate() {
-            let Some((coverage, estimate)) =
-                source_quote_scalar(&self.constraint, v, self.bound, &view)
-            else {
-                self.estimates[v] = usize::MAX;
-                continue;
-            };
-            self.estimates[v] = estimate;
-            let key = variable_choice_key(
-                v,
-                estimate,
-                self.base_estimates[v],
-                self.influences[v].count(),
-            );
-            if best.is_none_or(|(_, _, _, best_key)| key > best_key) {
-                best = Some((index, coverage, estimate, key));
-            }
-        }
-        let (index, coverage, _, _) = best.unwrap_or_else(|| panic!("{SOURCE_FRONTIER_ERROR}"));
-        let variable = self.unbound.remove(index);
-        if order_trace::enabled() {
-            order_trace::record(self.stack.len(), variable, 1);
-        }
-        let values = self.values[variable].get_or_insert(Vec::new());
-        values.clear();
-        // Estimates are ordering costs, not capacity promises. Amortized
-        // growth is the only lawful default until the protocol exposes a
-        // separate occurrence-count receipt.
-        let view = RowsView::new_indexed(&self.stack, &self.row, &self.cols);
-        let layout = self.constraint.propose_with_layout(
-            variable,
-            &view,
-            &mut CandidateSink::Values(values),
-        );
-        if coverage == ProposalCoverage::Covering {
-            self.constraint
-                .confirm(variable, &view, &mut CandidateSink::Values(values));
-        }
-        if !layout.is_grouped_set() {
-            // `values` is a tail-popped action stack. Keep each value's last
-            // stored occurrence so the first-seen DFS order remains unchanged:
-            // `[a, b, a] -> [b, a]`, then pop yields `a, b`.
-            admit_reverse_stable_set(values, &mut self.value_admission);
-        }
-        self.cols[variable] = self.stack.len() as u8;
-        self.stack.push(variable);
-        self.row.push([0; 32]);
-        self.bound.set(variable);
-    }
-
-    /// Fills the emit-only [`Binding`] from the cursor and runs the
-    /// postprocessing closure on it.
-    fn emit(&mut self) -> ProjectionStep<R> {
-        for (k, &v) in self.stack.iter().enumerate() {
-            self.binding.set(v, &self.row[k]);
-        }
-        self.projection.project(&self.binding, &self.postprocessing)
-    }
-
-    /// Use the scalar depth-first scheduler for this query.
-    ///
-    /// Every live fresh ordinary iterator uses residual states. The scalar
-    /// scheduler remains useful for tiny queries, strict frontier-memory
-    /// bounds, and as the block-of-one specialization of the same block-native
-    /// constraint protocol.
-    ///
-    /// This selection governs direct [`Iterator`] pulls. Converting a fresh
-    /// `.sequential()` query through ordinary Rayon iteration intentionally
-    /// moves it into the canonical adaptive residual producer. After scalar
-    /// iteration has started, `into_par_iter()` instead drains that exact
-    /// scalar cursor remainder as one unsplittable leaf.
-    ///
-    /// # Panics
-    ///
-    /// Panics if iteration has already started. Scheduler selection must be
-    /// made before the first call to [`Iterator::next`].
-    pub fn sequential(mut self) -> Self {
-        assert!(
-            !self.iteration_started && self.residual.is_none(),
-            "cannot select the sequential query scheduler after iteration has started"
-        );
-        self.scheduler = QueryScheduler::Sequential;
-        self
-    }
-
-    /// Force canonical residual-state execution through the ordinary
-    /// resumable [`Query`] iterator.
-    ///
-    /// Ordinary live iteration already selects residual states for every root.
-    /// This explicit selector can restore that scheduler after another builder
-    /// choice and remains useful as a completeness/comparison control. A
-    /// seed-rejected query still starts no worklist. The selector preserves the
-    /// query's structural lowering. Use
-    /// [`Query::residual_lowering`] before this method to choose another of the
-    /// nine canonical lowering forms. The runtime cursor remains behind
-    /// `Query::next`, so cloning a started query
-    /// snapshots its exact raw remainder. Ordinary Rayon conversion of a
-    /// fresh query uses the same residual runtime and its affine splitter;
-    /// `Query::into_par_residual_state_iter` (with the `parallel` feature)
-    /// remains the explicit saturated-width throughput entry point.
-    ///
-    /// # Panics
-    ///
-    /// Panics if iteration has already started. Scheduler selection must be
-    /// made before the first call to [`Iterator::next`].
-    pub fn residual_state_scheduler(mut self) -> Self {
-        assert!(
-            !self.iteration_started && self.residual.is_none(),
-            "cannot select the residual-state query scheduler after iteration has started"
-        );
-        self.scheduler = QueryScheduler::ResidualState;
-        self
-    }
-
-    /// Select structural lowering independently from the physical scheduler.
+    /// Select structural lowering for the residual solver.
     ///
     /// Ordinary live queries start with [`residual::ResidualLowering::HYBRID`].
     /// Explicit scheduler comparisons can request
@@ -2837,26 +2632,21 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         let mut has_initial_source = false;
         let estimates = std::array::from_fn(|v| {
             if variables.is_set(v) {
-                let quote =
-                    source_quote_scalar(&constraint, v, VariableSet::new_empty(), &RowsView::EMPTY);
+                let quote = source_quote_single_row(
+                    &constraint,
+                    v,
+                    VariableSet::new_empty(),
+                    &RowsView::EMPTY,
+                );
                 has_initial_source |= quote.is_some();
                 quote.map_or(usize::MAX, |(_, estimate)| estimate)
             } else {
                 usize::MAX
             }
         });
-        // The estimates just computed ARE the empty-binding baseline —
-        // freeze a copy before iteration refreshes them in place.
+        // These estimates are the empty-binding baseline used by later
+        // adaptive variable choices.
         let base_estimates = estimates;
-        let mut unbound = ArrayVec::from_iter(variables);
-        unbound.sort_unstable_by_key(|v| {
-            variable_choice_key(
-                *v,
-                estimates[*v],
-                base_estimates[*v],
-                influences[*v].count(),
-            )
-        });
 
         // Constraints whose variables are all constant [`Term`]s (e.g. a
         // fully-constant `pattern!` used as an existence check) have an
@@ -2869,35 +2659,20 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         // `RowsView::EMPTY` is the seed block (a single zero-width row —
         // the empty binding), so this is the block-native form of the
         // empty-binding probe.
-        let mode =
-            if residual::seed_survives(&constraint, VariableSet::new_empty(), &RowsView::EMPTY) {
-                Search::NextVariable
-            } else {
-                Search::Done
-            };
-        if matches!(mode, Search::NextVariable) && !variables.is_empty() {
+        let seed = residual::seed_survives(&constraint, VariableSet::new_empty(), &RowsView::EMPTY)
+            .then(residual::FrameSeedRow::empty);
+        if seed.is_some() && !variables.is_empty() {
             assert!(has_initial_source, "{SOURCE_FRONTIER_ERROR}");
         }
         Query {
             constraint,
             postprocessing,
             projection,
-            scheduler: QueryScheduler::ResidualState,
             residual_lowering: residual::ResidualLowering::HYBRID,
-            mode,
+            seed,
             iteration_started: false,
             influences,
-            estimates,
             base_estimates,
-            touched_variables: VariableSet::new_empty(),
-            stack: ArrayVec::new(),
-            row: ArrayVec::new(),
-            cols: [COL_UNBOUND; 128],
-            bound: VariableSet::new_empty(),
-            unbound,
-            values: ArrayVec::from([const { None }; 128]),
-            value_admission: AHashSet::new(),
-            binding: Binding::default(),
             residual: None,
         }
     }
@@ -3000,8 +2775,7 @@ fn variable_order_key(
 }
 
 /// Total ordering for a row's adaptive variable action. Lower variable IDs win
-/// exact ordering-key ties, so scalar sort/pop and block-native scans select the
-/// same semantic action without relying on unstable-sort tie behavior.
+/// exact ordering-key ties without relying on unstable-sort tie behavior.
 #[inline]
 fn variable_choice_key(
     variable: VariableId,
@@ -3016,68 +2790,6 @@ fn variable_choice_key(
 #[inline]
 fn estimate_magnitude(estimate: usize) -> u64 {
     estimate.checked_ilog2().map(|m| m + 1).unwrap_or(0) as u64
-}
-
-/// PROBE (order-key experiment): cheap realized-variable-order trace. Off
-/// by default; harnesses enable it around an untimed run. Each pick of a
-/// next variable records `(depth, variable, weight)` — weight 1 per
-/// branch in the sequential engine and the exact group's row count in the
-/// block-native engines. [`report`](order_trace::report) aggregates counts per
-/// `(depth, variable)` so "which variable did the engine actually bind at
-/// each level, how often" is visible per query.
-pub mod order_trace {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Mutex;
-
-    static ENABLED: AtomicBool = AtomicBool::new(false);
-    static COUNTS: Mutex<Vec<((usize, usize), u64)>> = Mutex::new(Vec::new());
-
-    /// Turns recording on/off (off by default).
-    pub fn set_enabled(on: bool) {
-        ENABLED.store(on, Ordering::Relaxed);
-    }
-
-    pub(crate) fn enabled() -> bool {
-        ENABLED.load(Ordering::Relaxed)
-    }
-
-    /// Clears all recorded picks.
-    pub fn reset() {
-        COUNTS.lock().unwrap().clear();
-    }
-
-    pub(crate) fn record(depth: usize, variable: usize, weight: u64) {
-        let mut counts = COUNTS.lock().unwrap();
-        if let Some(entry) = counts
-            .iter_mut()
-            .find(|((d, v), _)| *d == depth && *v == variable)
-        {
-            entry.1 += weight;
-        } else {
-            counts.push(((depth, variable), weight));
-        }
-    }
-
-    /// Terse per-depth pick histogram: `d0: v2 x1; d1: v0 x13056, v3 x2`.
-    pub fn report() -> String {
-        use std::fmt::Write;
-        let mut counts = COUNTS.lock().unwrap().clone();
-        counts.sort_by_key(|&((d, _), n)| (d, std::cmp::Reverse(n)));
-        let mut out = String::new();
-        let mut last_depth = usize::MAX;
-        for ((d, v), n) in counts {
-            if d != last_depth {
-                if !out.is_empty() {
-                    let _ = write!(out, "; ");
-                }
-                let _ = write!(out, "d{d}: v{v} x{n}");
-                last_depth = d;
-            } else {
-                let _ = write!(out, ", v{v} x{n}");
-            }
-        }
-        out
-    }
 }
 
 /// Maximum affine rows considered by one residual-state action cohort.
@@ -3118,137 +2830,36 @@ fn lazy_growth() -> usize {
         .unwrap_or(2)
 }
 
-/// The search mode of the query engine.
-/// The query engine uses a depth-first search to find solutions to the query,
-/// proposing values for the variables and backtracking when it reaches a dead end.
-/// The search mode is used to keep track of the current state of the search.
-/// The search mode can be one of the following:
-/// - `NextVariable` - The query engine is looking for the next variable to assign a value to.
-/// - `NextValue` - The query engine is looking for the next value to assign to a variable.
-/// - `Backtrack` - The query engine is backtracking to try a different value for a variable.
-/// - `Done` - The query engine has finished the search and there are no more results.
-#[derive(Copy, Clone, Debug)]
-enum Search {
-    NextVariable,
-    NextValue,
-    Backtrack,
-    Done,
-}
-
 impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<C, P, R> {
     type Item = R;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let fresh = !self.iteration_started;
         // Freshness is an explicit public-iterator property, not something
-        // inferred from the cursor. In particular, successful and failed
-        // zero-variable queries both have structurally empty `Done` state
-        // after a pull. Record the call before any iterator return path.
+        // inferred from the cursor. Record the call before any iterator return
+        // path, including a seed-rejected query.
         self.iteration_started = true;
 
         if self.projection.is_done() {
-            self.mode = Search::Done;
             return None;
         }
 
-        if let Some(state) = &mut self.residual {
-            return state.pull(
+        if self.residual.is_none() {
+            self.residual = Some(Box::new(residual::ResidualQueryState::new(
+                &self.constraint,
+                self.seed.take(),
+                self.residual_lowering,
+            )));
+        }
+        self.residual
+            .as_mut()
+            .expect("residual cursor was initialized")
+            .pull(
                 &self.constraint,
                 &self.postprocessing,
                 &mut self.projection,
                 &self.influences,
                 &self.base_estimates,
-            );
-        }
-
-        if self.scheduler == QueryScheduler::ResidualState
-            && fresh
-            && matches!(self.mode, Search::NextVariable)
-            && self.stack.is_empty()
-            && self.bound.is_empty()
-            && self.touched_variables.is_empty()
-        {
-            let state = self
-                .residual
-                .insert(Box::new(residual::ResidualQueryState::new(
-                    &self.constraint,
-                    self.mode,
-                    self.residual_lowering,
-                )));
-            return state.pull(
-                &self.constraint,
-                &self.postprocessing,
-                &mut self.projection,
-                &self.influences,
-                &self.base_estimates,
-            );
-        }
-
-        loop {
-            match &self.mode {
-                Search::NextVariable => {
-                    self.mode = Search::NextValue;
-                    if self.unbound.is_empty() {
-                        match self.emit() {
-                            ProjectionStep::Yield(result) => return Some(result),
-                            ProjectionStep::Skip => {}
-                            ProjectionStep::Done => {
-                                self.mode = Search::Done;
-                                return None;
-                            }
-                        }
-                        // Post-processing rejected this binding; continue
-                        // searching (mode is already NextValue).
-                        continue;
-                    }
-                    self.push_next_variable();
-                }
-                Search::NextValue => {
-                    if let Some(&variable) = self.stack.last() {
-                        if let Some(assignment) = self.values[variable]
-                            .as_mut()
-                            .expect("values should be initialized")
-                            .pop()
-                        {
-                            *self.row.last_mut().expect("cursor row parallel to stack") =
-                                assignment;
-                            self.touched_variables.set(variable);
-                            self.mode = Search::NextVariable;
-                        } else {
-                            self.mode = Search::Backtrack;
-                        }
-                    } else {
-                        self.mode = Search::Done;
-                        return None;
-                    }
-                }
-                Search::Backtrack => {
-                    if let Some(variable) = self.stack.pop() {
-                        self.row.pop();
-                        self.cols[variable] = COL_UNBOUND;
-                        self.bound.unset(variable);
-                        // Note that we did not update estiamtes for the unbound variables
-                        // as we are backtracking, so the estimates are still valid.
-                        // Since we choose this variable before, we know that it would
-                        // still go last in the unbound list.
-                        self.unbound.push(variable);
-
-                        // However, we need to update the touched variables,
-                        // as we are backtracking and the variable is no longer bound.
-                        // We're essentially restoring the estimate of the touched variables
-                        // to the state before we bound this variable.
-                        self.touched_variables.set(variable);
-                        self.mode = Search::NextValue;
-                    } else {
-                        self.mode = Search::Done;
-                        return None;
-                    }
-                }
-                Search::Done => {
-                    return None;
-                }
-            }
-        }
+            )
     }
 }
 
@@ -3256,12 +2867,9 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> fmt::Debug for Quer
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Query")
             .field("constraint", &std::any::type_name::<C>())
-            .field("scheduler", &self.scheduler)
-            .field("mode", &self.mode)
+            .field("seed", &self.seed)
             .field("iteration_started", &self.iteration_started)
             .field("residual_started", &self.residual.is_some())
-            .field("stack", &self.stack)
-            .field("unbound", &self.unbound)
             .finish()
     }
 }
