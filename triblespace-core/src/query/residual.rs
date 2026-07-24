@@ -1094,11 +1094,11 @@ impl FiniteFormulaProgram {
             })
     }
 
-    /// Proves that one focused proposal can be distributed over accepted
-    /// endpoint chunks without changing the formula continuation's bag
-    /// semantics. Every ancestor must be AND, and every sibling that remains
-    /// after the focused child must itself be an AND-only tree without a
-    /// typed activation-reuse boundary.
+    /// Proves that one focused proposal can publish independently SET-admitted
+    /// endpoint chunks without changing the formula continuation's final raw
+    /// relation. Every ancestor must be AND, and every sibling that remains
+    /// after the focused child must itself be an AND-only tree without a typed
+    /// activation-reuse boundary.
     #[cfg(test)]
     fn proposal_streamability(
         &self,
@@ -11633,9 +11633,10 @@ impl ResidualStateMachine {
     /// Suspends a currently focused formula Atom behind one transition reducer
     /// activation per affine parent. The exact Action cursor and live payload
     /// cells remain activation data; [`DeltaDesc`] names only the common
-    /// structural expansion kernel. Page-local finite confirmations retain the
-    /// formula's geometric candidate split; grouped repeated confirmations keep
-    /// their complete parent candidate sequence.
+    /// structural expansion kernel. Pageable finite confirmations retain the
+    /// formula's geometric split over admitted candidate occurrences; repeated
+    /// confirmations may keep one complete parent activation to reuse their
+    /// traversal.
     fn seed_delta_formula<'a>(
         &mut self,
         root: &dyn Constraint<'a>,

@@ -701,13 +701,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trace, while negative prefixes ramp within a single pull even when no result
   is ever projected. The deepest live state able to fill the desired width
   wins; when none can, minimum-rank readiness drains the remaining feeder
-  frontier. The saturation cap only bounds width growth. Candidate chunks keep
-  each parent and its complete ragged candidate group together; this makes a
-  parent a semantics-safe occupancy unit, though candidate fanout means it is
-  not a total-work estimate. Exact descriptors remain interned so early states
-  can safely reopen when later histories reach them. Full drains preserve the
-  eager solver's distinct raw projected-row set; partial consumers may drop
-  the remaining affine frontier after the first useful result. Ready planning retains each row's
+  frontier. The saturation cap only bounds width growth. Candidate chunks may
+  split admitted `(parent, value)` occurrences independently; a selected typed
+  Program may retain one complete parent activation solely to reuse its
+  traversal. Candidate fanout therefore remains distinct from a total-work
+  estimate. Exact descriptors remain interned so early states can safely reopen
+  when later histories reach them. Full drains preserve the eager solver's
+  distinct raw projected-row set; partial consumers may drop the remaining
+  affine frontier after the first useful result. Ready planning retains each row's
   exact adaptive variable and proposing leaf, then cohorts only rows with the
   same action.
 - **Index homes use typed artifacts over exact commit-DAG ranges.** Recipe
