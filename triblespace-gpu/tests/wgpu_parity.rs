@@ -638,82 +638,76 @@ fn observed_wgpu_concurrent_epochs_keep_exact_sample_ownership() {
 #[test]
 #[ignore = "requires a native WGPU adapter"]
 fn wgpu_query_parallel_residual_matches_canonical_cpu_archive() {
+    let identity = trible(0xD46A_DA60, 0);
     let mut set = TribleSet::new();
-    let mut domain = HashSet::new();
-    let shared_attribute: [u8; 16] = trible(0xD46A_DA60, u64::MAX).data[16..32]
-        .try_into()
-        .unwrap();
-    let attribute_domain = HashSet::from([Id::new(shared_attribute).unwrap()]);
+    let mut values = Vec::new();
     for ordinal in 0..512 {
-        let mut row = trible(0xD46A_DA60, ordinal);
-        row.data[16..32].copy_from_slice(&shared_attribute);
-        if ordinal % 2 == 0 {
-            domain.insert(Id::new(row.data[..16].try_into().unwrap()).unwrap());
-        }
+        let mut row = trible(0xD46A_DA61, ordinal);
+        row.data[..32].copy_from_slice(&identity.data[..32]);
+        values.push(Inline::<UnknownInline>::new(inline_value(&row)));
         set.insert(&row);
     }
     assert_eq!(set.len(), 512, "the parity fixture must not collapse rows");
-    assert_eq!(domain.len(), 256);
+    assert_eq!(values.iter().collect::<HashSet<_>>().len(), 512);
 
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+    let entity = Inline::new(entity_value(&identity));
+    let attribute = Inline::new(attribute_value(&identity));
+    let allowed: HashSet<_> = values[..8].iter().copied().collect();
+    let parents = HashSet::from([
+        Id::new(trible(0xD46A_DA62, 0).data[..16].try_into().unwrap()).unwrap(),
+        Id::new(trible(0xD46A_DA62, 1).data[..16].try_into().unwrap()).unwrap(),
+    ]);
+
+    // Production directed-action pricing naturally selects the eight-value
+    // hash set as the proposal source and the 512-value Succinct occurrence as
+    // its confirmer. The independent parent variable binds first, leaving a
+    // real multi-row residual frontier; no estimate or lowering override is
+    // involved.
     let expected = {
         let mut context = VariableContext::new();
-        let e: Variable<GenId> = context.next_variable();
-        let a: Variable<GenId> = context.next_variable();
-        let v: Variable<UnknownInline> = context.next_variable();
+        let parent: Variable<GenId> = context.next_variable();
+        let value: Variable<UnknownInline> = context.next_variable();
         let query = Query::new(
             and!(
-                (&domain).has(e),
-                (&attribute_domain).has(a),
-                archive.pattern(e, a, v)
+                (&parents).has(parent),
+                (&allowed).has(value),
+                archive.pattern(entity, attribute, value)
             ),
-            move |binding| {
-                Some((
-                    *binding.get(e.index)?,
-                    *binding.get(a.index)?,
-                    *binding.get(v.index)?,
-                ))
-            },
+            move |binding| Some((*binding.get(parent.index)?, *binding.get(value.index)?)),
         );
         let mut rows = query.sequential().collect::<Vec<_>>();
         rows.sort_unstable();
         rows
     };
-    assert_eq!(expected.len(), domain.len());
+    assert_eq!(expected.len(), parents.len() * allowed.len());
 
-    let gpu = WgpuSuccinctArchive::new(archive.clone())
+    let gpu = WgpuSuccinctArchive::new(archive)
         .unwrap()
         .with_min_rank_batch(1);
     let mut context = VariableContext::new();
-    let e: Variable<GenId> = context.next_variable();
-    let a: Variable<GenId> = context.next_variable();
-    let v: Variable<UnknownInline> = context.next_variable();
+    let parent: Variable<GenId> = context.next_variable();
+    let value: Variable<UnknownInline> = context.next_variable();
     let query = Query::new(
         and!(
-            (&domain).has(e),
-            (&attribute_domain).has(a),
-            gpu.pattern(e, a, v)
+            (&parents).has(parent),
+            (&allowed).has(value),
+            gpu.pattern(entity, attribute, value)
         ),
-        move |binding| {
-            Some((
-                *binding.get(e.index)?,
-                *binding.get(a.index)?,
-                *binding.get(v.index)?,
-            ))
-        },
+        move |binding| Some((*binding.get(parent.index)?, *binding.get(value.index)?)),
     );
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(4)
         .build()
         .unwrap();
-    let mut actual = pool.install(|| query.into_par_residual_state_iter().collect::<Vec<_>>());
+    let mut actual = pool.install(|| query.into_par_iter().collect::<Vec<_>>());
     actual.sort_unstable();
 
     assert_eq!(actual, expected);
     let stats = gpu.stats();
     assert!(
         stats.gpu_dispatches > 0,
-        "forced parallel residual query never dispatched a WGPU rank batch: {stats:?}"
+        "forced ordinary parallel residual query never dispatched a WGPU rank batch: {stats:?}"
     );
     assert!(stats.gpu_probes > 0);
     assert_eq!(stats.cpu_fallback_batches, 0);
