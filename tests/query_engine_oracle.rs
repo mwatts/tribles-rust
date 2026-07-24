@@ -240,12 +240,12 @@ macro_rules! assert_all_engines_match {
         );
         #[cfg(feature = "parallel")]
         for threads in [1usize, 4] {
-            let scalar = parallel_pool(threads)
+            let ordinary_parallel = parallel_pool(threads)
                 .install(|| multiset(($query).into_par_iter().collect::<Vec<_>>()));
             prop_assert_eq!(
-                scalar,
+                ordinary_parallel,
                 expected.clone(),
-                "{}: ordinary parallel scalar DFS ({} workers)",
+                "{}: ordinary parallel residual state ({} workers)",
                 $label,
                 threads
             );

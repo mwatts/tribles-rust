@@ -433,11 +433,14 @@ carry no claim state in either execution mode.
 
 ## Parallel execution
 
-With the `parallel` feature, ordinary `IntoParallelIterator` consumption keeps
-the established scalar DFS proposal splitter. This remains the CPU-oriented
-default: inexpensive one-row probes can outperform the bookkeeping and wider
-batches of either worklist. An unstarted ordinary query uses this scalar path
-even though its serial default uses residual states.
+With the `parallel` feature, ordinary `IntoParallelIterator` consumption uses
+the same canonical residual runtime as ordinary serial iteration. A fresh
+query starts with the adaptive geometric width policy and partitions its exact
+affine frontier into at most one shard per worker. Rows, complete
+candidate-parent groups, and candidates whose remaining confirmation suffix is
+page-local are the same shard atoms used by the explicit residual path.
+Cross-shard reconvergence is traded for concurrency, but no second solver or
+seed restart is involved.
 
 [`Query::into_par_dag_iter`](triblespace::core::query::Query::into_par_dag_iter)
 is the explicit block-native alternative. It partitions a fresh query's affine
@@ -452,15 +455,13 @@ and accelerator-backed constraints even when scalar DFS is faster on CPU-only
 workloads.
 
 [`Query::into_par_residual_state_iter`](triblespace::core::query::Query::into_par_residual_state_iter)
-is the corresponding explicit residual path. It advances one exact state
-machine until an affine frontier can be divided and creates at most one shard
-per worker. Rows, complete candidate-parent groups, and candidates whose entire
-remaining confirmation suffix is page-local are valid shard atoms; a
-whole-group confirmer keeps each parent's ragged candidate sequence intact.
-Every shard retains canonical state merging locally. As with the DAG splitter,
-cross-shard reconvergence is traded for concurrency, state is moved rather
-than duplicated, and the constraint/postprocessor pair is cloned only when a
-real sibling shard is created. This entry point preserves the query's selected
+is the explicit saturated-width residual entry point. It uses the same affine
+splitter and executor as ordinary parallel iteration, but treats the call as a
+full-enumeration throughput request and starts at the width cap. A whole-group
+confirmer keeps each parent's ragged candidate sequence intact. Every shard
+retains canonical state merging locally; state is moved rather than
+duplicated, and the constraint/postprocessor pair is cloned only when a real
+sibling shard is created. Both entry points preserve the query's selected
 residual lowering: fresh queries use hybrid lowering, which keeps formula
 kernels fused and enables transition Programs, while an explicit
 `Query::residual_lowering` override remains in force.
@@ -566,10 +567,13 @@ algorithm rather than a backend detail.
 
 A partially consumed ordinary residual or DAG query converted through
 `into_par_iter()` is drained as one parallel leaf so its exact remaining state
-cannot be restarted. Both explicit block-native entry points require a fresh
-query. With one Rayon worker each has a zero split budget; with `N` workers each
-permits at most `N - 1` splits. In every case the result guarantee is equality
-of the distinct raw projected-row set, not iteration order.
+cannot be restarted. This also applies to a partially consumed explicit scalar
+query: its exact scalar cursor is drained by one leaf rather than partitioned
+by a second solver. Both explicit block-native entry points require a fresh
+query. With one Rayon worker each block-native path has a zero split budget;
+with `N` workers each permits at most `N - 1` splits. In every case the result
+guarantee is equality of the distinct raw projected-row set, not iteration
+order.
 
 The parallel paths clone the constraint tree and result postprocessor per
 shard. Code that needs aggregate observations across clones should use shared

@@ -302,31 +302,38 @@ fn partially_consumed_dag_query_into_par_iter_keeps_exact_remainder() {
     assert!(message.contains("cannot initialize parallel DAG iteration"));
 }
 
-/// A started residual cursor has no scalar cursor position to split. Ordinary
-/// Rayon conversion therefore drains it as one exact leaf.
+/// A started query has already published progress. Ordinary Rayon conversion
+/// drains either residual or explicit scalar state as one exact leaf instead
+/// of restarting or repartitioning it.
 #[cfg(feature = "parallel")]
 #[test]
-fn partially_consumed_residual_query_into_par_iter_keeps_exact_remainder() {
+fn partially_consumed_query_into_par_iter_keeps_exact_remainder() {
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
-    let mut context = VariableContext::new();
-    let variable = context.next_variable::<U256BE>();
-    let values = [1u64, 2, 3, 4].map(U256BE::inline_from);
-    let constraint = or!(
-        variable.is(values[0]),
-        variable.is(values[1]),
-        variable.is(values[2]),
-        variable.is(values[3])
-    );
-    let mut query = Query::new(constraint, move |binding| {
-        binding.get(variable.index).copied()
-    })
-    .residual_state_scheduler();
+    for explicit_scalar in [false, true] {
+        let mut context = VariableContext::new();
+        let variable = context.next_variable::<U256BE>();
+        let values = [1u64, 2, 3, 4].map(U256BE::inline_from);
+        let constraint = or!(
+            variable.is(values[0]),
+            variable.is(values[1]),
+            variable.is(values[2]),
+            variable.is(values[3])
+        );
+        let query = Query::new(constraint, move |binding| {
+            binding.get(variable.index).copied()
+        });
+        let mut query = if explicit_scalar {
+            query.sequential()
+        } else {
+            query
+        };
 
-    assert!(query.next().is_some());
-    let expected = query.clone().collect::<Vec<_>>();
-    let actual = query.into_par_iter().collect::<Vec<_>>();
-    assert_eq!(actual, expected);
+        assert!(query.next().is_some());
+        let expected = query.clone().collect::<Vec<_>>();
+        let actual = query.into_par_iter().collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
 }
 
 #[cfg(feature = "parallel")]
@@ -377,7 +384,7 @@ fn pulled_query_rejects_every_seed_restarting_selector() {
 
 #[cfg(feature = "parallel")]
 #[test]
-fn fresh_query_into_par_iter_matches_scalar_scheduler() {
+fn fresh_query_into_par_iter_matches_explicit_residual_raw_set() {
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
     let mut context = VariableContext::new();
@@ -393,14 +400,20 @@ fn fresh_query_into_par_iter_matches_scalar_scheduler() {
         binding.get(variable.index).copied()
     });
 
-    let mut expected = query.clone().sequential().collect::<Vec<_>>();
-    let mut actual = query.into_par_iter().collect::<Vec<_>>();
-    expected.sort_unstable();
-    actual.sort_unstable();
-    assert_eq!(actual, expected);
+    let mut sequential = query.clone().sequential().collect::<Vec<_>>();
+    let mut explicit_residual = query
+        .clone()
+        .into_par_residual_state_iter()
+        .collect::<Vec<_>>();
+    let mut ordinary = query.into_par_iter().collect::<Vec<_>>();
+    sequential.sort_unstable();
+    explicit_residual.sort_unstable();
+    ordinary.sort_unstable();
+    assert_eq!(ordinary, sequential);
+    assert_eq!(ordinary, explicit_residual);
 
-    // Ordinary Rayon conversion remains the scalar splitter even though serial
-    // ordinary iteration defaults to residual execution.
+    // An overlapping conjunction exercises residual checked-state
+    // reconvergence while retaining the same raw SET.
     let mut context = VariableContext::new();
     let variable = context.next_variable::<U256BE>();
     let constraint = and!(
@@ -417,13 +430,53 @@ fn fresh_query_into_par_iter_matches_scalar_scheduler() {
             variable.is(values[3])
         )
     );
-    let mut selected = Query::new(constraint, move |binding| {
+    let selected_query = Query::new(constraint, move |binding| {
         binding.get(variable.index).copied()
-    })
-    .into_par_iter()
-    .collect::<Vec<_>>();
-    selected.sort_unstable();
-    assert_eq!(selected, expected);
+    });
+    let mut ordinary = selected_query.clone().into_par_iter().collect::<Vec<_>>();
+    let mut explicit_residual = selected_query
+        .into_par_residual_state_iter()
+        .collect::<Vec<_>>();
+    ordinary.sort_unstable();
+    explicit_residual.sort_unstable();
+    assert_eq!(ordinary, sequential);
+    assert_eq!(ordinary, explicit_residual);
+}
+
+#[cfg(feature = "parallel")]
+#[test]
+fn ordinary_parallel_residual_honors_early_consumer_cancellation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    let mut context = VariableContext::new();
+    let variable = context.next_variable::<U256BE>();
+    let alternatives = (0u64..128)
+        .map(|value| variable.is(U256BE::inline_from(value)))
+        .collect();
+    let projected = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::clone(&projected);
+    let query = Query::new(
+        Arc::new(triblespace::core::query::unionconstraint::UnionConstraint::new(alternatives)),
+        move |binding| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            binding.get(variable.index).copied()
+        },
+    );
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+
+    let found = pool.install(move || query.into_par_iter().find_any(|_| true));
+    assert!(found.is_some());
+    assert_eq!(
+        projected.load(Ordering::SeqCst),
+        1,
+        "a full consumer must stop the residual fold before projecting another row"
+    );
 }
 
 /// The explicit parallel-DAG path must descend through an initially

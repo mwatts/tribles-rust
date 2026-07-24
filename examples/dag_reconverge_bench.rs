@@ -27,7 +27,7 @@
 //!     TRIBLES_WGPU_ONLY=1 cargo run --release --features gpu \
 //!         --example dag_reconverge_bench -- 2048 16 8
 //!
-//! Runs sequential / ordinary parallel-scalar / explicit parallel-DAG /
+//! Runs sequential / ordinary parallel residual-state / explicit parallel-DAG /
 //! explicit parallel residual-state /
 //! dag / eager residual-state / lazy residual-state / dag-unmerged
 //! on both backends

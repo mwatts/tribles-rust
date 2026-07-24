@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Ordinary Rayon query iteration now reuses the canonical residual
+  producer.** A fresh `Query::into_par_iter()` moves directly into the
+  adaptive-width residual iterator and its affine splitter instead of entering
+  the removed scalar split-or-descend path. Already-started queries remain one
+  exact-remainder leaf, while the explicit parallel DAG stays available as a
+  comparison control.
 - **Compiled Formula proposals now record whether their outer self-confirm
   obligation is discharged.** The private boolean records that no later
   self-confirm is required—whether by an Exact source proof or validation

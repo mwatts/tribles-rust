@@ -514,12 +514,12 @@ specialized batch operation can loop over the rows, use
 The four row-taking operations must also be row-homomorphic: evaluating
 non-empty consecutive sub-blocks independently and concatenating their
 row-remapped outputs must equal evaluating the original block. The blocked
-schedulers, including the explicit `Query::into_par_dag_iter()` and
+schedulers, including ordinary `Query::into_par_iter()` and the explicit
+`Query::into_par_dag_iter()` /
 `Query::into_par_residual_state_iter()` frontier-sharding paths, are free to
 change block boundaries; block-global top-k or first-row semantics would
 therefore be incorrect. Diagnostics may observe call boundaries, but must not
-feed those observations back into protocol answers. Ordinary `into_par_iter()`
-retains the scalar DFS splitter for CPU-oriented workloads.
+feed those observations back into protocol answers.
 
 `propose` owns the empty sink it receives. `confirm` may only return a subbag
 of its input: it must retain every candidate occurrence that belongs to the

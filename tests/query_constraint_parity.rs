@@ -101,7 +101,7 @@ where
     #[cfg(feature = "parallel")]
     {
         assert_engine(
-            "parallel scalar",
+            "ordinary parallel residual",
             make_query().into_par_iter().collect::<Vec<_>>(),
         );
         assert_engine(

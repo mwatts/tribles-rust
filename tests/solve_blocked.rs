@@ -165,11 +165,11 @@ macro_rules! gate {
             // single global Rayon worker from silently exercising zero DAG
             // splits. The reconvergence gates below run both parallel paths
             // on TribleSet and SuccinctArchive.
-            let parallel_scalar =
+            let parallel_residual =
                 parallel_pool().install(|| multiset(($q).into_par_iter().collect::<Vec<_>>()));
             assert_eq!(
-                sequential, parallel_scalar,
-                "ordinary parallel scalar DFS diverged from the sequential engine on {}",
+                sequential, parallel_residual,
+                "ordinary parallel residual engine diverged from the sequential engine on {}",
                 $name
             );
             let parallel_dag =
