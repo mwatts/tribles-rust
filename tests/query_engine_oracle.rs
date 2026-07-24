@@ -157,7 +157,7 @@ fn rpq_proptest_config() -> ProptestConfig {
 /// Assert against an independent oracle, not against another route.
 ///
 /// `$query` must construct a fresh `Query` each time it is expanded.
-macro_rules! assert_all_engines_match {
+macro_rules! assert_all_routes_match {
     ($label:expr, $expected:expr, $query:expr) => {{
         let expected = multiset($expected);
         prop_assert_eq!(
@@ -187,7 +187,7 @@ macro_rules! assert_all_engines_match {
     }};
 }
 
-macro_rules! assert_residual_engines_match {
+macro_rules! assert_residual_routes_match {
     ($label:expr, $expected:expr, $query:expr) => {{
         let expected = multiset($expected);
         prop_assert_eq!(
@@ -321,22 +321,22 @@ proptest! {
             };
         }
 
-        assert_residual_engines_match!(
+        assert_residual_routes_match!(
             "residual-join/tribleset",
             join_oracle.clone(),
             join_query!(&kb)
         );
-        assert_residual_engines_match!(
+        assert_residual_routes_match!(
             "residual-join/archive",
             join_oracle,
             join_query!(&archive)
         );
-        assert_residual_engines_match!(
+        assert_residual_routes_match!(
             "residual-union/tribleset",
             union_oracle.clone(),
             union_query!(&kb)
         );
-        assert_residual_engines_match!(
+        assert_residual_routes_match!(
             "residual-union/archive",
             union_oracle,
             union_query!(&archive)
@@ -755,8 +755,8 @@ proptest! {
                 )
             };
         }
-        assert_all_engines_match!("pinned-and/tribleset", pinned_oracle.clone(), pinned_query!(&kb));
-        assert_all_engines_match!("pinned-and/archive", pinned_oracle, pinned_query!(&archive));
+        assert_all_routes_match!("pinned-and/tribleset", pinned_oracle.clone(), pinned_query!(&kb));
+        assert_all_routes_match!("pinned-and/archive", pinned_oracle, pinned_query!(&archive));
 
         // Set union of two conjunctive arms. A tuple present through both arms
         // occurs once, matching relational UNION rather than bag concatenation.
@@ -787,7 +787,7 @@ proptest! {
                 )
             };
         }
-        assert_all_engines_match!("union-of-ands/tribleset", union_oracle.clone(), union_query!(&kb));
-        assert_all_engines_match!("union-of-ands/archive", union_oracle, union_query!(&archive));
+        assert_all_routes_match!("union-of-ands/tribleset", union_oracle.clone(), union_query!(&kb));
+        assert_all_routes_match!("union-of-ands/archive", union_oracle, union_query!(&archive));
     }
 }

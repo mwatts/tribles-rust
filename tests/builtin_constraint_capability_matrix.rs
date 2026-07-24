@@ -571,7 +571,7 @@ fn estimate_override_forwards_transition_programs_without_opening_its_shape() {
 }
 
 #[test]
-fn repeated_projected_variable_desugaring_matches_every_scheduler() {
+fn repeated_projected_variable_desugaring_matches_every_execution_route() {
     let self_a = fixture_id(31);
     let self_b = fixture_id(32);
     let other = fixture_id(33);
