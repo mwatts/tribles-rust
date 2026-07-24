@@ -194,10 +194,12 @@ pub enum ProgramGrouping {
 pub enum ProgramCompletion {
     /// The route must be evaluated through its budgeted affine continuation.
     PageableOnly,
-    /// [`TypedProgramSpec::complete_typed`] returns the exact complete raw
-    /// per-parent Propose occurrence bag produced by draining this route. The
-    /// erased adapter validates that whole bag before admitting each distinct
-    /// `(parent, value)` once at the completed action boundary.
+    /// The [`TypedProgramSpec::complete_bounded_typed`] transaction returns
+    /// raw occurrences whose distinct values are the same parent-local
+    /// candidate SET as draining this route. Physical order and multiplicity
+    /// may differ. The erased adapter validates the complete transaction
+    /// before admitting each distinct `(parent, value)` once at the action
+    /// boundary.
     CompleteActionEquivalent,
 }
 
@@ -254,9 +256,6 @@ pub struct ProgramCompleteWorkQuote {
 #[doc(hidden)]
 #[derive(Debug, Eq, PartialEq)]
 pub enum ProgramCompleteWorkEvidence {
-    /// This family predates exact quoting. Preserve its established semantic
-    /// whole-batch completion policy after independent scheduler admission.
-    Unquoted,
     /// One exact quote per parent, in batch order.
     Quoted(Vec<ProgramCompleteWorkQuote>),
     /// Exact evidence is unavailable for this batch; use pageable execution.
@@ -268,16 +267,6 @@ pub enum ProgramCompleteWorkEvidence {
 pub struct ProgramCompleteEffects {
     pub occurrences: Vec<(u32, RawInline)>,
     pub raw_occurrence_count: usize,
-}
-
-/// Admission receipt retained only until the originating batch is consumed.
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) enum ProgramCompleteAdmission {
-    LegacyUnquoted,
-    Exact {
-        drain_work_units: usize,
-        raw_occurrences: usize,
-    },
 }
 
 /// Unique non-zero-sized identity for one cold completion transaction.
@@ -318,7 +307,7 @@ pub(crate) struct ProgramBoundedCompletion<'v, 'affinity, 'owner> {
     batch: ProgramCompleteBatch<'v>,
     affinity: &'affinity ProgramCompleteAffinity<'owner>,
     first_parent: usize,
-    admission: ProgramCompleteAdmission,
+    work: ProgramCompleteWorkQuote,
     raw_occurrence_count: usize,
     occurrences: Vec<(u32, RawInline)>,
 }
@@ -331,7 +320,7 @@ impl<'v> ProgramBoundedCompletion<'v, '_, '_> {
         owner: &T,
     ) -> (
         usize,
-        ProgramCompleteAdmission,
+        ProgramCompleteWorkQuote,
         usize,
         Vec<(u32, RawInline)>,
     ) {
@@ -353,7 +342,7 @@ impl<'v> ProgramBoundedCompletion<'v, '_, '_> {
         );
         (
             self.first_parent,
-            self.admission,
+            self.work,
             self.raw_occurrence_count,
             self.occurrences,
         )
@@ -417,19 +406,16 @@ struct TypedCompleteTail {
     next_parent: Option<usize>,
     stopped_at_boundary: bool,
     quotes_reversed: Vec<ProgramCompleteWorkQuote>,
-    drain_work_units: usize,
-    raw_occurrences: usize,
+    work: ProgramCompleteWorkQuote,
 }
 
 enum TypedCompleteArbiterState {
     Pending,
     Tail(TypedCompleteTail),
     Declined,
-    LegacyUnquoted,
     Exact {
         first_parent: usize,
-        drain_work_units: usize,
-        raw_occurrences: usize,
+        work: ProgramCompleteWorkQuote,
         quotes: Vec<ProgramCompleteWorkQuote>,
     },
 }
@@ -467,8 +453,10 @@ impl TypedCompleteArbiter {
                 next_parent: self.parent_count.checked_sub(1),
                 stopped_at_boundary: false,
                 quotes_reversed: Vec::new(),
-                drain_work_units: 0,
-                raw_occurrences: 0,
+                work: ProgramCompleteWorkQuote {
+                    drain_work_units: 0,
+                    raw_occurrences: 0,
+                },
             });
         }
         let TypedCompleteArbiterState::Tail(tail) = &mut self.state else {
@@ -499,11 +487,15 @@ impl TypedCompleteArbiter {
         let capacity = self.capacity;
         let tail = self.begin_tail();
         Self::check_tail_parent(tail, parent);
-        let Some(next_drain) = tail.drain_work_units.checked_add(quote.drain_work_units) else {
+        let Some(next_drain) = tail
+            .work
+            .drain_work_units
+            .checked_add(quote.drain_work_units)
+        else {
             tail.stopped_at_boundary = true;
             return false;
         };
-        let Some(next_raw) = tail.raw_occurrences.checked_add(quote.raw_occurrences) else {
+        let Some(next_raw) = tail.work.raw_occurrences.checked_add(quote.raw_occurrences) else {
             tail.stopped_at_boundary = true;
             return false;
         };
@@ -511,8 +503,10 @@ impl TypedCompleteArbiter {
             tail.stopped_at_boundary = true;
             return false;
         }
-        tail.drain_work_units = next_drain;
-        tail.raw_occurrences = next_raw;
+        tail.work = ProgramCompleteWorkQuote {
+            drain_work_units: next_drain,
+            raw_occurrences: next_raw,
+        };
         tail.quotes_reversed.push(quote);
         tail.next_parent = parent.checked_sub(1);
         true
@@ -523,6 +517,27 @@ impl TypedCompleteArbiter {
         let tail = self.begin_tail();
         Self::check_tail_parent(tail, parent);
         tail.stopped_at_boundary = true;
+    }
+
+    /// Returns the exact remaining bounds available to the next descending
+    /// parent before a family prepares that parent's complete result.
+    ///
+    /// Some families can quote from metadata alone and use
+    /// [`Self::try_admit_tail_parent`] directly. Families that must perform
+    /// bounded work to discover their exact output size use this limit to
+    /// avoid examining or retaining work the transaction cannot admit.
+    pub(crate) fn remaining_tail_capacity(&mut self, parent: usize) -> ProgramCompleteWorkQuote {
+        let capacity = self.capacity;
+        let tail = self.begin_tail();
+        Self::check_tail_parent(tail, parent);
+        ProgramCompleteWorkQuote {
+            drain_work_units: capacity
+                .checked_sub(tail.work.drain_work_units)
+                .expect("typed complete tail exceeded its drain capacity"),
+            raw_occurrences: capacity
+                .checked_sub(tail.work.raw_occurrences)
+                .expect("typed complete tail exceeded its occurrence capacity"),
+        }
     }
 
     /// Seals a maximal tail after every parent through either zero or the
@@ -539,15 +554,14 @@ impl TypedCompleteArbiter {
             tail.stopped_at_boundary || tail.next_parent.is_none(),
             "typed complete tail stopped before reaching a rejected boundary"
         );
-        if tail.quotes_reversed.len() < 2 {
+        if tail.quotes_reversed.is_empty() {
             return None;
         }
         let first_parent = self.parent_count - tail.quotes_reversed.len();
         tail.quotes_reversed.reverse();
         self.state = TypedCompleteArbiterState::Exact {
             first_parent,
-            drain_work_units: tail.drain_work_units,
-            raw_occurrences: tail.raw_occurrences,
+            work: tail.work,
             quotes: tail.quotes_reversed,
         };
         Some(TypedCompleteSelection {
@@ -561,17 +575,6 @@ impl TypedCompleteArbiter {
         evidence: ProgramCompleteWorkEvidence,
     ) -> Option<TypedCompleteSelection> {
         match evidence {
-            ProgramCompleteWorkEvidence::Unquoted => {
-                assert!(
-                    matches!(self.state, TypedCompleteArbiterState::Pending),
-                    "typed complete arbiter admission was not one-shot"
-                );
-                self.state = TypedCompleteArbiterState::LegacyUnquoted;
-                Some(TypedCompleteSelection {
-                    first_parent: 0,
-                    parent_count: self.parent_count,
-                })
-            }
             ProgramCompleteWorkEvidence::Declined => {
                 assert!(
                     matches!(self.state, TypedCompleteArbiterState::Pending),
@@ -598,37 +601,23 @@ impl TypedCompleteArbiter {
 
     pub(crate) fn effects_mut(&mut self) -> &mut TypedCompleteSink {
         assert!(
-            matches!(
-                self.state,
-                TypedCompleteArbiterState::LegacyUnquoted | TypedCompleteArbiterState::Exact { .. }
-            ),
+            matches!(self.state, TypedCompleteArbiterState::Exact { .. }),
             "typed complete effects were requested before admission"
         );
         &mut self.effects
     }
 
     fn finish(mut self) -> Option<BoundedCompleteEffects> {
-        let (first_parent, admission, quotes) = match self.state {
+        let (first_parent, work, quotes) = match self.state {
             TypedCompleteArbiterState::Pending | TypedCompleteArbiterState::Tail(_) => {
                 panic!("typed complete action returned without sealing admission")
             }
             TypedCompleteArbiterState::Declined => return None,
-            TypedCompleteArbiterState::LegacyUnquoted => {
-                (0, ProgramCompleteAdmission::LegacyUnquoted, None)
-            }
             TypedCompleteArbiterState::Exact {
                 first_parent,
-                drain_work_units,
-                raw_occurrences,
+                work,
                 quotes,
-            } => (
-                first_parent,
-                ProgramCompleteAdmission::Exact {
-                    drain_work_units,
-                    raw_occurrences,
-                },
-                Some(quotes),
-            ),
+            } => (first_parent, work, quotes),
         };
         let completed_parent_count = self.parent_count - first_parent;
         let mut previous = 0u32;
@@ -645,27 +634,25 @@ impl TypedCompleteArbiter {
         }
 
         let raw_occurrence_count = self.effects.occurrences.len();
-        if let Some(quotes) = &quotes {
-            assert_eq!(quotes.len(), completed_parent_count);
-            let mut occurrence = 0usize;
-            for (parent, quote) in quotes.iter().enumerate() {
-                let begin = occurrence;
-                while occurrence < raw_occurrence_count
-                    && self.effects.occurrences[occurrence].0 as usize == parent
-                {
-                    occurrence += 1;
-                }
-                assert_eq!(
-                    occurrence - begin,
-                    quote.raw_occurrences,
-                    "typed complete action disagreed with parent {parent}'s exact raw-occurrence quote"
-                );
+        assert_eq!(quotes.len(), completed_parent_count);
+        let mut occurrence = 0usize;
+        for (parent, quote) in quotes.iter().enumerate() {
+            let begin = occurrence;
+            while occurrence < raw_occurrence_count
+                && self.effects.occurrences[occurrence].0 as usize == parent
+            {
+                occurrence += 1;
             }
             assert_eq!(
-                occurrence, raw_occurrence_count,
-                "typed complete action emitted an unquoted parent occurrence"
+                occurrence - begin,
+                quote.raw_occurrences,
+                "typed complete action disagreed with parent {parent}'s exact raw-occurrence quote"
             );
         }
+        assert_eq!(
+            occurrence, raw_occurrence_count,
+            "typed complete action emitted an unquoted parent occurrence"
+        );
 
         let mut admitted = AHashSet::with_capacity(raw_occurrence_count);
         self.effects
@@ -673,7 +660,7 @@ impl TypedCompleteArbiter {
             .retain(|occurrence| admitted.insert(*occurrence));
         Some(BoundedCompleteEffects {
             first_parent,
-            admission,
+            work,
             raw_occurrence_count,
             occurrences: self.effects.occurrences,
         })
@@ -1121,7 +1108,7 @@ pub trait TypedProgramSpec {
 
     /// Executes one complete action certified by the selected route.
     ///
-    /// V1 deliberately supports only complete Propose occurrence bags. A
+    /// V1 deliberately supports only complete Propose candidate SETs. A
     /// family that never returns [`ProgramCompletion::CompleteActionEquivalent`]
     /// need not implement this method.
     fn complete_typed(&self, _batch: ProgramCompleteBatch<'_>, _effects: &mut TypedCompleteSink) {
@@ -1133,19 +1120,19 @@ pub trait TypedProgramSpec {
     /// A quoted family must return exactly one quote per parent. The evidence
     /// is consumed privately by the erased adapter and is deliberately not
     /// passed back to [`Self::complete_typed`]. `Declined` performs no complete
-    /// action work; `Unquoted` retains the pre-quote whole-batch policy.
+    /// action work.
     fn quote_complete_typed(
         &self,
         _batch: ProgramCompleteBatch<'_>,
     ) -> ProgramCompleteWorkEvidence {
-        ProgramCompleteWorkEvidence::Unquoted
+        ProgramCompleteWorkEvidence::Declined
     }
 
     /// Runs the engine-owned bounded complete-action transaction.
     ///
-    /// The default keeps legacy quote and completion hooks distinct. A
-    /// crate-owned physical family may override this hidden seam to retain
-    /// prepared work while the arbiter alone selects the admissible tail.
+    /// The default keeps quote and completion hooks distinct. A crate-owned
+    /// physical family may override this hidden seam to retain prepared work
+    /// while the arbiter alone selects the admissible tail.
     #[doc(hidden)]
     fn complete_bounded_typed(
         &self,
@@ -1292,7 +1279,7 @@ trait ErasedProgramSpec {
 
 struct BoundedCompleteEffects {
     first_parent: usize,
-    admission: ProgramCompleteAdmission,
+    work: ProgramCompleteWorkQuote,
     raw_occurrence_count: usize,
     occurrences: Vec<(u32, RawInline)>,
 }
@@ -1412,7 +1399,7 @@ impl<'a> ProgramRef<'a> {
                 batch,
                 affinity,
                 first_parent: effects.first_parent,
-                admission: effects.admission,
+                work: effects.work,
                 raw_occurrence_count: effects.raw_occurrence_count,
                 occurrences: effects.occurrences,
             })
@@ -3184,8 +3171,9 @@ mod tests {
 
         fn quote_complete_typed(
             &self,
-            _batch: ProgramCompleteBatch<'_>,
+            batch: ProgramCompleteBatch<'_>,
         ) -> ProgramCompleteWorkEvidence {
+            assert_eq!(batch.view.len(), 2);
             match self {
                 Self::MisattributedQuote => ProgramCompleteWorkEvidence::Quoted(vec![
                     ProgramCompleteWorkQuote {
@@ -3197,9 +3185,30 @@ mod tests {
                         raw_occurrences: 3,
                     },
                 ]),
-                Self::RepeatedInOrder | Self::OutOfRange | Self::Descending => {
-                    ProgramCompleteWorkEvidence::Unquoted
-                }
+                Self::RepeatedInOrder => ProgramCompleteWorkEvidence::Quoted(vec![
+                    ProgramCompleteWorkQuote {
+                        drain_work_units: 3,
+                        raw_occurrences: 3,
+                    },
+                    ProgramCompleteWorkQuote {
+                        drain_work_units: 2,
+                        raw_occurrences: 2,
+                    },
+                ]),
+                Self::OutOfRange => ProgramCompleteWorkEvidence::Quoted(vec![
+                    ProgramCompleteWorkQuote {
+                        drain_work_units: 0,
+                        raw_occurrences: 0,
+                    };
+                    2
+                ]),
+                Self::Descending => ProgramCompleteWorkEvidence::Quoted(vec![
+                    ProgramCompleteWorkQuote {
+                        drain_work_units: 1,
+                        raw_occurrences: 1,
+                    };
+                    2
+                ]),
             }
         }
     }
@@ -3535,12 +3544,12 @@ mod tests {
             let completion = program
                 .try_complete_bounded(batch, capacity, &affinity)
                 .expect("a multi-parent exact tail fits");
-            let (first, admission, raw_occurrence_count, occurrences) =
+            let (first, work, raw_occurrence_count, occurrences) =
                 completion.into_parts_for(batch, &affinity, &rows);
             assert_eq!(first, expected_first);
             assert_eq!(
-                admission,
-                ProgramCompleteAdmission::Exact {
+                work,
+                ProgramCompleteWorkQuote {
                     drain_work_units: expected_drain,
                     raw_occurrences: quotes.len() - expected_first,
                 }
@@ -3567,14 +3576,12 @@ mod tests {
     }
 
     #[test]
-    fn bounded_completion_decline_and_singleton_do_no_complete_work() {
+    fn bounded_completion_decline_and_empty_tail_do_no_complete_work() {
         static SINGLETON: &[(usize, usize)] = &[(1, 1), (5, 1), (1, 1)];
-        static OVERFLOW_SINGLETON: &[(usize, usize)] = &[(1, 1), (usize::MAX, 1), (1, 1)];
 
         for (mode, capacity) in [
             (BoundedQuoteMode::Declined, 8),
-            (BoundedQuoteMode::Quoted(SINGLETON), 1),
-            (BoundedQuoteMode::Quoted(OVERFLOW_SINGLETON), 2),
+            (BoundedQuoteMode::Quoted(SINGLETON), 0),
         ] {
             let calls = Arc::new(Mutex::new(BoundedQuoteCalls::default()));
             let probe = BoundedQuoteProbe {
@@ -3601,6 +3608,47 @@ mod tests {
             assert_eq!((calls.quotes, calls.completions), (1, 0));
             assert!(calls.completed_rows.is_empty());
         }
+    }
+
+    #[test]
+    fn bounded_completion_accepts_one_exact_tail_parent() {
+        static QUOTES: &[(usize, usize)] = &[(1, 1), (usize::MAX, 1), (1, 1)];
+        let calls = Arc::new(Mutex::new(BoundedQuoteCalls::default()));
+        let probe = BoundedQuoteProbe {
+            mode: BoundedQuoteMode::Quoted(QUOTES),
+            calls: Arc::clone(&calls),
+        };
+        let program = ProgramRef::new(&probe);
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(1),
+            bound: VariableSet::new_singleton(0),
+        };
+        let vars = [0];
+        let rows = [raw(10), raw(11), raw(12)];
+        let batch = ProgramCompleteBatch {
+            request,
+            route: program.route(request).unwrap(),
+            view: RowsView::new(&vars, &rows),
+        };
+        let affinity = ProgramCompleteAffinity::new(&rows);
+        let completion = program
+            .try_complete_bounded(batch, 2, &affinity)
+            .expect("the exact singleton suffix fits");
+        let (first, work, raw_occurrence_count, occurrences) =
+            completion.into_parts_for(batch, &affinity, &rows);
+        assert_eq!(first, 2);
+        assert_eq!(
+            work,
+            ProgramCompleteWorkQuote {
+                drain_work_units: 1,
+                raw_occurrences: 1,
+            }
+        );
+        assert_eq!(raw_occurrence_count, 1);
+        assert_eq!(occurrences, [(0, raw(12))]);
+        let calls = calls.lock().unwrap();
+        assert_eq!((calls.quotes, calls.completions), (1, 1));
+        assert_eq!(calls.completed_rows, [12]);
     }
 
     #[test]
@@ -4481,12 +4529,12 @@ mod tests {
         let completion = program
             .try_complete_bounded(batch, 2, &affinity)
             .expect("preferred child has an exact two-parent completion");
-        let (first, admission, raw_occurrences, occurrences) =
+        let (first, work, raw_occurrences, occurrences) =
             completion.into_parts_for(batch, &affinity, &batch);
         assert_eq!(first, 0);
         assert_eq!(
-            admission,
-            ProgramCompleteAdmission::Exact {
+            work,
+            ProgramCompleteWorkQuote {
                 drain_work_units: 2,
                 raw_occurrences: 2,
             }

@@ -2310,8 +2310,7 @@ mod tests {
     use crate::query::residual::ResidualLowering;
     use crate::query::{
         Binding, ConfirmationUnitClass, ProgramActivation, ProgramBatch, ProgramBatchEffects,
-        ProgramCompleteAdmission, ProgramCompleteAffinity, ProgramResume, ProposalUnitClass, Query,
-        Variable,
+        ProgramCompleteAffinity, ProgramResume, ProposalUnitClass, Query, Variable,
     };
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::{BlobStorePut, CommitHandle};
@@ -3344,13 +3343,13 @@ mod tests {
         let completion = program
             .try_complete_bounded(batch, 4, &affinity)
             .expect("the forwarded hooks admit the final two parents");
-        let (first_parent, admission, raw_occurrence_count, occurrences) =
+        let (first_parent, work, raw_occurrence_count, occurrences) =
             completion.into_parts_for(batch, &affinity, &rows);
 
         assert_eq!(first_parent, 1);
         assert_eq!(
-            admission,
-            ProgramCompleteAdmission::Exact {
+            work,
+            ProgramCompleteWorkQuote {
                 drain_work_units: 4,
                 raw_occurrences: 4,
             }
@@ -3404,14 +3403,14 @@ mod tests {
         let completion = program
             .try_complete_bounded(batch, 3, &affinity)
             .expect("the three exact parents fit");
-        let (first_parent, admission, raw_occurrence_count, occurrences) =
+        let (first_parent, work, raw_occurrence_count, occurrences) =
             completion.into_parts_for(batch, &affinity, &rows);
         let counts = take_union_complete_walk_counts();
 
         assert_eq!(first_parent, 0);
         assert_eq!(
-            admission,
-            ProgramCompleteAdmission::Exact {
+            work,
+            ProgramCompleteWorkQuote {
                 drain_work_units: 3,
                 raw_occurrences: 3,
             }
@@ -3484,14 +3483,14 @@ mod tests {
         let completion = program
             .try_complete_bounded(batch, 2, &affinity)
             .expect("the final two parents fit exactly");
-        let (first_parent, admission, raw_occurrence_count, occurrences) =
+        let (first_parent, work, raw_occurrence_count, occurrences) =
             completion.into_parts_for(batch, &affinity, &rows);
         let counts = take_union_complete_walk_counts();
 
         assert_eq!(first_parent, 2);
         assert_eq!(
-            admission,
-            ProgramCompleteAdmission::Exact {
+            work,
+            ProgramCompleteWorkQuote {
                 drain_work_units: 2,
                 raw_occurrences: 2,
             }

@@ -16,6 +16,8 @@ use crate::query::DispatchClass;
 use crate::query::EstimateSink;
 use crate::query::ProgramAction;
 use crate::query::ProgramCompleteBatch;
+use crate::query::ProgramCompleteWorkEvidence;
+use crate::query::ProgramCompleteWorkQuote;
 use crate::query::ProgramCompletion;
 use crate::query::ProgramExposure;
 use crate::query::ProgramGrouping;
@@ -33,6 +35,7 @@ use crate::query::ResidualDeltaSourceCursor;
 use crate::query::ResidualDeltaSourcePage;
 use crate::query::RowsView;
 use crate::query::Term;
+use crate::query::TypedCompleteArbiter;
 use crate::query::TypedCompleteSink;
 use crate::query::TypedEffectSink;
 use crate::query::TypedProgramBatch;
@@ -327,11 +330,12 @@ impl TribleSetConstraint {
         }
     }
 
-    /// Candidate count for one row. Uses the covering indexes (EAV, EVA,
-    /// AEV, AVE, VEA, VAE) to count matching entries via `segmented_len`.
-    /// The index chosen depends on which of the other two positions have
-    /// values, giving tight estimates regardless of access pattern.
-    fn estimate_row(&self, p: &Positions, row: &[RawInline]) -> usize {
+    /// Exact number of covering-index driver values examined by a full
+    /// proposal for one row. This is also the exact candidate count for a
+    /// distinct target position. Repeated-position proposals may reject
+    /// driver values while enforcing equality, so it remains a conservative
+    /// output estimate but an exact physical-work quote.
+    fn proposal_driver_len_row(&self, p: &Positions, row: &[RawInline]) -> usize {
         let Positions {
             e_var,
             a_var,
@@ -1350,6 +1354,105 @@ impl TypedProgramSpec for TribleSetConstraint {
             self.propose_row(&positions, row, &mut |value| effects.push(parent, value));
         }
     }
+
+    fn quote_complete_typed(&self, batch: ProgramCompleteBatch<'_>) -> ProgramCompleteWorkEvidence {
+        let ProgramAction::Propose(variable) = batch.request.action else {
+            return ProgramCompleteWorkEvidence::Declined;
+        };
+        assert_eq!(variable, batch.route.variable);
+        let positions = self.positions(variable, &batch.view);
+        if [positions.e_var, positions.a_var, positions.v_var]
+            .into_iter()
+            .filter(|position| *position)
+            .count()
+            != 1
+        {
+            // Repeated-position proposals filter a covering-index driver.
+            // Counting their accepted values would perform the very
+            // potentially-unbounded scan that this quote must gate.
+            return ProgramCompleteWorkEvidence::Declined;
+        }
+        ProgramCompleteWorkEvidence::Quoted(
+            batch
+                .view
+                .iter()
+                .map(|row| {
+                    let occurrences = self.proposal_driver_len_row(&positions, row);
+                    ProgramCompleteWorkQuote {
+                        drain_work_units: occurrences,
+                        raw_occurrences: occurrences,
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    fn complete_bounded_typed(
+        &self,
+        batch: ProgramCompleteBatch<'_>,
+        arbiter: &mut TypedCompleteArbiter,
+    ) {
+        let ProgramAction::Propose(variable) = batch.request.action else {
+            panic!("TribleSet complete actions support only proposals")
+        };
+        assert_eq!(variable, batch.route.variable);
+        let positions = self.positions(variable, &batch.view);
+        let mut retained = Vec::new();
+        for parent in (0..batch.view.len()).rev() {
+            let drain_work_units = self.proposal_driver_len_row(&positions, batch.view.row(parent));
+            let remaining = arbiter.remaining_tail_capacity(parent);
+            if drain_work_units > remaining.drain_work_units {
+                arbiter.reject_tail_parent(parent);
+                break;
+            }
+
+            let mut values = Vec::with_capacity(drain_work_units);
+            if drain_work_units > 0 {
+                let page = self.proposal_source_page_row(
+                    &positions,
+                    batch.view.row(parent),
+                    ResidualDeltaSourceCursor::Start,
+                    drain_work_units,
+                    &mut values,
+                );
+                assert_eq!(
+                    page.examined, drain_work_units,
+                    "bounded TribleSet completion disagreed with its exact driver length"
+                );
+                assert!(
+                    page.next.is_none(),
+                    "bounded TribleSet completion left an exact driver continuation"
+                );
+            }
+            let raw_occurrences = values.len();
+            if raw_occurrences > remaining.raw_occurrences {
+                arbiter.reject_tail_parent(parent);
+                break;
+            }
+            if !arbiter.try_admit_tail_parent(
+                parent,
+                ProgramCompleteWorkQuote {
+                    drain_work_units,
+                    raw_occurrences,
+                },
+            ) {
+                break;
+            }
+            retained.push(values);
+        }
+
+        let Some(selection) = arbiter.seal_tail_admission() else {
+            return;
+        };
+        debug_assert_eq!(retained.len(), batch.view.len() - selection.first_parent());
+        let effects = arbiter.effects_mut();
+        for (parent, values) in retained.into_iter().rev().enumerate() {
+            effects.extend_parent(
+                u32::try_from(parent).expect("too many TribleSet complete-action parents"),
+                values,
+            );
+        }
+    }
 }
 
 impl<'a> Constraint<'a> for TribleSetConstraint {
@@ -1386,7 +1489,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
             return false;
         }
         let p = self.positions(variable, view);
-        out.extend(view.iter().map(|row| self.estimate_row(&p, row)));
+        out.extend(view.iter().map(|row| self.proposal_driver_len_row(&p, row)));
         true
     }
 
@@ -1727,6 +1830,132 @@ mod tests {
     }
 
     #[test]
+    fn bounded_repeated_position_completion_quotes_driver_work_and_filtered_output() {
+        let attribute = rngid();
+        let witness = rngid();
+        let rejected_a = rngid();
+        let rejected_b = rngid();
+        let mut set = TribleSet::new();
+        for entity in [&witness, &rejected_a, &rejected_b] {
+            set.insert(&Trible::new(
+                entity,
+                &attribute,
+                &Inline::<GenId>::new(id_into_value(&witness)),
+            ));
+        }
+        let x = Variable::<GenId>::new(0);
+        let constraint =
+            TribleSetConstraint::new(x, Inline::<GenId>::new(id_into_value(&attribute)), x, set);
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(x.index),
+            bound: VariableSet::new_empty(),
+        };
+        let program = constraint.residual_program().unwrap();
+        let batch = ProgramCompleteBatch {
+            request,
+            route: program.route(request).unwrap(),
+            view: RowsView::new_with_row_count(&[], &[], 2),
+        };
+        let owner = batch;
+        let affinity = crate::query::ProgramCompleteAffinity::new(&owner);
+        let completion = program
+            .try_complete_bounded(batch, 3, &affinity)
+            .expect("one repeated-position driver fits exactly");
+        let (first_parent, work, raw_occurrence_count, occurrences) =
+            completion.into_parts_for(batch, &affinity, &owner);
+        assert_eq!(first_parent, 1);
+        assert_eq!(
+            work,
+            ProgramCompleteWorkQuote {
+                drain_work_units: 3,
+                raw_occurrences: 1,
+            }
+        );
+        assert_eq!(raw_occurrence_count, 1);
+        assert_eq!(occurrences, [(0, id_into_value(&witness))]);
+
+        assert!(program.try_complete_bounded(batch, 2, &affinity).is_none());
+    }
+
+    #[test]
+    fn bounded_tribleset_completion_selects_an_exact_tail_down_to_one_parent() {
+        let attribute = rngid();
+        let entities = [rngid(), rngid(), rngid()];
+        let values = [
+            Inline::<UnknownInline>::new([0x11; INLINE_LEN]),
+            Inline::<UnknownInline>::new([0x22; INLINE_LEN]),
+            Inline::<UnknownInline>::new([0x33; INLINE_LEN]),
+            Inline::<UnknownInline>::new([0x44; INLINE_LEN]),
+        ];
+        let mut set = TribleSet::new();
+        for (entity, fanout) in entities.iter().zip([4, 2, 1]) {
+            for value in &values[..fanout] {
+                set.insert(&Trible::new(entity, &attribute, value));
+            }
+        }
+        let entity = Variable::<GenId>::new(0);
+        let value = Variable::<UnknownInline>::new(1);
+        let constraint = TribleSetConstraint::new(
+            entity,
+            Inline::<GenId>::new(id_into_value(&attribute)),
+            value,
+            set,
+        );
+        let rows = entities.each_ref().map(|entity| id_into_value(entity));
+        let vars = [entity.index];
+        let view = RowsView::new(&vars, &rows);
+        let request = ProgramRequest {
+            action: ProgramAction::Propose(value.index),
+            bound: VariableSet::new_singleton(entity.index),
+        };
+        let program = constraint.residual_program().unwrap();
+        let batch = ProgramCompleteBatch {
+            request,
+            route: program.route(request).unwrap(),
+            view,
+        };
+        let owner = batch;
+        let affinity = crate::query::ProgramCompleteAffinity::new(&owner);
+
+        let completion = program
+            .try_complete_bounded(batch, 3, &affinity)
+            .expect("the final two parent fanouts fit");
+        let (first_parent, work, raw_occurrence_count, occurrences) =
+            completion.into_parts_for(batch, &affinity, &owner);
+        assert_eq!(first_parent, 1);
+        assert_eq!(
+            work,
+            ProgramCompleteWorkQuote {
+                drain_work_units: 3,
+                raw_occurrences: 3,
+            }
+        );
+        assert_eq!(raw_occurrence_count, 3);
+        assert_eq!(
+            occurrences,
+            [(0, values[0].raw), (0, values[1].raw), (1, values[0].raw)]
+        );
+
+        let completion = program
+            .try_complete_bounded(batch, 1, &affinity)
+            .expect("the final singleton parent is a valid exact tail");
+        let (first_parent, work, raw_occurrence_count, occurrences) =
+            completion.into_parts_for(batch, &affinity, &owner);
+        assert_eq!(first_parent, 2);
+        assert_eq!(
+            work,
+            ProgramCompleteWorkQuote {
+                drain_work_units: 1,
+                raw_occurrences: 1,
+            }
+        );
+        assert_eq!(raw_occurrence_count, 1);
+        assert_eq!(occurrences, [(0, values[0].raw)]);
+
+        assert!(program.try_complete_bounded(batch, 0, &affinity).is_none());
+    }
+
+    #[test]
     fn typed_complete_certificate_keeps_single_parent_proposals_pageable() {
         let attribute = rngid();
         let value = Inline::<UnknownInline>::new([0x5b; INLINE_LEN]);
@@ -1966,6 +2195,15 @@ mod tests {
         variable: VariableId,
         view: RowsView<'_>,
     ) -> Vec<(u32, RawInline)> {
+        try_complete_proposal(constraint, variable, view)
+            .expect("TribleSet proposal has an exact bounded completion")
+    }
+
+    fn try_complete_proposal(
+        constraint: &TribleSetConstraint,
+        variable: VariableId,
+        view: RowsView<'_>,
+    ) -> Option<Vec<(u32, RawInline)>> {
         let mut bound = VariableSet::new_empty();
         for &variable in view.vars {
             bound.set(variable);
@@ -1980,18 +2218,19 @@ mod tests {
             route.completion,
             ProgramCompletion::CompleteActionEquivalent
         );
-        let mut effects = crate::query::ProgramCompleteEffects::default();
-        program.complete_batch(
-            ProgramCompleteBatch {
-                request,
-                route,
-                view,
-            },
-            &mut effects,
-        );
-        assert_eq!(effects.raw_occurrence_count, effects.occurrences.len());
-        effects.occurrences.sort_unstable();
-        effects.occurrences
+        let batch = ProgramCompleteBatch {
+            request,
+            route,
+            view,
+        };
+        let owner = batch;
+        let affinity = crate::query::ProgramCompleteAffinity::new(&owner);
+        let completion = program.try_complete_bounded(batch, usize::MAX, &affinity)?;
+        let (_, quote, raw_occurrence_count, mut occurrences) =
+            completion.into_parts_for(batch, &affinity, &owner);
+        assert_eq!(quote.raw_occurrences, raw_occurrence_count);
+        occurrences.sort_unstable();
+        Some(occurrences)
     }
 
     #[derive(Clone, Default)]
