@@ -2841,6 +2841,12 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
     /// constraint protocol; [`Query::lazy_dag_scheduler`] selects the explicit
     /// bound-variable-set worklist control.
     ///
+    /// This selection governs direct [`Iterator`] pulls. Converting a fresh
+    /// `.sequential()` query through ordinary Rayon iteration intentionally
+    /// moves it into the canonical adaptive residual producer. After scalar
+    /// iteration has started, `into_par_iter()` instead drains that exact
+    /// scalar cursor remainder as one unsplittable leaf.
+    ///
     /// # Panics
     ///
     /// Panics if iteration has already started. Scheduler selection must be
@@ -5027,6 +5033,26 @@ mod parallel {
                 },
                 consumer,
             )
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::inline::encodings::iu256::U256BE;
+
+        #[test]
+        fn fresh_sequential_query_routes_to_residual_parallel_producer() {
+            let mut context = VariableContext::new();
+            let variable = context.next_variable::<U256BE>();
+            let query = Query::new(
+                Arc::new(variable.is(U256BE::inline_from(1u64))),
+                move |binding: &Binding| binding.get(variable.index).copied(),
+            )
+            .sequential();
+
+            let parallel = query.into_par_iter();
+            assert!(matches!(parallel.inner, QueryParInner::Residual(_)));
         }
     }
 }

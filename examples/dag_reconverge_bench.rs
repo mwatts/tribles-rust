@@ -27,8 +27,8 @@
 //!     TRIBLES_WGPU_ONLY=1 cargo run --release --features gpu \
 //!         --example dag_reconverge_bench -- 2048 16 8
 //!
-//! Runs sequential / ordinary parallel residual-state / explicit parallel-DAG /
-//! explicit parallel residual-state /
+//! Runs sequential / ordinary parallel adaptive residual-state /
+//! explicit parallel-DAG / explicit parallel saturated residual-state /
 //! dag / eager residual-state / lazy residual-state / dag-unmerged
 //! on both backends
 //! and prints per mode: min/median/max wall time, parity signature, and for the
@@ -218,11 +218,11 @@ fn build_world(n_per_pop: usize, z_fan: usize) -> (TribleSet, (Id, Id, Id, Id, I
 enum Mode {
     Seq,
     #[cfg(feature = "parallel")]
-    ParScalar,
+    ParAdaptiveResidual,
     #[cfg(feature = "parallel")]
     ParDag,
     #[cfg(feature = "parallel")]
-    ParResidual,
+    ParSaturatedResidual,
     Dag,
     Residual,
     ResidualLazy,
@@ -245,11 +245,11 @@ fn run_query<S: TriblePattern>(kb: &S, markers: (Id, Id, Id, Id, Id), mode: Mode
     match mode {
         Mode::Seq => tally(q.sequential()),
         #[cfg(feature = "parallel")]
-        Mode::ParScalar => tally_par(q.into_par_iter()),
+        Mode::ParAdaptiveResidual => tally_par(q.into_par_iter()),
         #[cfg(feature = "parallel")]
         Mode::ParDag => tally_par(q.into_par_dag_iter()),
         #[cfg(feature = "parallel")]
-        Mode::ParResidual => tally_par(q.into_par_residual_state_iter()),
+        Mode::ParSaturatedResidual => tally_par(q.into_par_residual_state_iter()),
         Mode::Dag => tally(q.solve_dag()),
         Mode::Residual => tally(q.solve_residual_state()),
         Mode::ResidualLazy => tally(q.solve_residual_state_lazy()),
@@ -321,9 +321,9 @@ fn bench_backend<S: TriblePattern>(
     let mut modes = vec![("seq", Mode::Seq)];
     #[cfg(feature = "parallel")]
     modes.extend([
-        ("par-scalar", Mode::ParScalar),
+        ("par-ordinary-adaptive", Mode::ParAdaptiveResidual),
         ("par-dag", Mode::ParDag),
-        ("par-residual", Mode::ParResidual),
+        ("par-explicit-saturated", Mode::ParSaturatedResidual),
     ]);
     modes.extend([
         ("dag", Mode::Dag),
@@ -361,26 +361,26 @@ fn bench_backend<S: TriblePattern>(
     );
     assert!(parity, "{label} result signature mismatch");
     for (((name, _), median), (min, max)) in modes.iter().zip(&meds).zip(&ranges) {
-        println!("  {name:<14} {median:>10.3} ms  [{min:.3}..{max:.3}]");
+        println!("  {name:<24} {median:>10.3} ms  [{min:.3}..{max:.3}]");
     }
     #[cfg(feature = "parallel")]
     {
-        let par_scalar = meds[modes
+        let par_adaptive_residual = meds[modes
             .iter()
-            .position(|(name, _)| *name == "par-scalar")
+            .position(|(name, _)| *name == "par-ordinary-adaptive")
             .unwrap()];
         let par_dag = meds[modes
             .iter()
             .position(|(name, _)| *name == "par-dag")
             .unwrap()];
-        let par_residual = meds[modes
+        let par_saturated_residual = meds[modes
             .iter()
-            .position(|(name, _)| *name == "par-residual")
+            .position(|(name, _)| *name == "par-explicit-saturated")
             .unwrap()];
         println!(
-            "  scheduler ratio  dag/scalar {:>7.3}x  residual/scalar {:>7.3}x",
-            par_scalar / par_dag,
-            par_scalar / par_residual,
+            "  speedup vs ordinary adaptive  explicit DAG {:>7.3}x  explicit saturated {:>7.3}x",
+            par_adaptive_residual / par_dag,
+            par_adaptive_residual / par_saturated_residual,
         );
     }
     // Instrumented single passes: group/batch structure, intermediates,
@@ -481,7 +481,7 @@ fn collect_query<S: TriblePattern>(
         Mode::Dag => q.solve_dag(),
         Mode::Residual => q.solve_residual_state(),
         Mode::ParDag => q.into_par_dag_iter().collect(),
-        Mode::ParResidual => q.into_par_residual_state_iter().collect(),
+        Mode::ParSaturatedResidual => q.into_par_residual_state_iter().collect(),
         _ => unreachable!("controlled WGPU comparison only uses affine schedulers"),
     }
 }
@@ -636,7 +636,7 @@ fn bench_wgpu_backend(
         ("dag", Mode::Dag),
         ("residual", Mode::Residual),
         ("par-dag", Mode::ParDag),
-        ("par-residual", Mode::ParResidual),
+        ("par-explicit-saturated", Mode::ParSaturatedResidual),
     ];
     println!(
         "\n== Controlled SuccinctArchive rank executors ({} Rayon threads) ==",

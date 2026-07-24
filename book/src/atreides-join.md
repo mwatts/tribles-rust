@@ -165,10 +165,13 @@ depth-first traversal from thrashing through unrelated values.
   and a parallel row of values. It presents that cursor to constraints as a
   one-row `RowsView`; `Binding` is now only reconstructed at the
   result-projection boundary. Each selected scalar proposal action is
-  reverse-stably admitted to SET support before descent or Rayon splitting.
-  The terminal gate remains the universal final guard and preserves one result
-  per distinct ordered raw query head. A `touched_variables` set marks which
-  estimates need refreshing before the next decision point.
+  reverse-stably admitted to SET support before descent. Fresh Rayon
+  consumption does not split that scalar proposal stack: `into_par_iter()`
+  moves an unstarted query into canonical residual execution, while a started
+  scalar cursor drains as one exact leaf. The terminal gate remains the
+  universal final guard and preserves one result per distinct ordered raw
+  query head. A `touched_variables` set marks which estimates need refreshing
+  before the next decision point.
 - The ordinary iterator lifts the same negotiation to blocks of sibling rows
   through canonical residual states for every live root. Those states key
   future work by bound schema, planned action, and checked leaf occurrences.
