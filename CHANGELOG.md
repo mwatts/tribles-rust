@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Compiled Formula proposals now record whether their outer self-confirm
+  obligation is discharged.** The private boolean records that no later
+  self-confirm is required—whether by an Exact source proof or validation
+  performed along the route—instead of overloading `ProposalCoverage::Exact`,
+  whose public meaning remains equality with the existential fiber. Scheduler
+  choices and checked-state transitions are unchanged.
 - **The `Constraint` protocol now has unconditional relational SET
   semantics.** Every occurrence denotes a fixed raw-inline relation shared by
   its ordinary, paged, typed-Program, and complete-equivalent routes; the

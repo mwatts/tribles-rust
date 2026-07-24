@@ -2044,38 +2044,39 @@ impl ResidualPlan {
         )
     }
 
-    /// Receipt guaranteed by the compiled formula proposal route, rather than
-    /// by treating the composite constraint as one opaque protocol action.
+    /// Whether the compiled formula proposal route discharges the occurrence's
+    /// outer self-confirm obligation.
     ///
-    /// An AND proposal chooses one covering child row-locally and confirms the
-    /// other target validators. It is therefore Exact precisely when every
-    /// child that may be chosen as its source has an Exact compiled route. An
-    /// OR visits every potentially live arm, so its route receipt is the meet
-    /// of the arm receipts. This compositional proof lets an already-validated
-    /// formula result skip the otherwise redundant outer self-confirmation.
-    fn formula_execution_proposal_coverage<'a>(
+    /// The obligation may be discharged by an Exact source proof or by
+    /// confirmations performed along the compiled route; this is not a claim
+    /// that the formula's proposal support equals its existential fiber. An
+    /// AND proposal chooses one covering child row-locally and confirms the
+    /// other target validators, so it discharges the obligation when every
+    /// child that may be chosen as its source does. An OR visits every
+    /// potentially live arm, so every arm must discharge the obligation.
+    fn formula_proposal_discharges_outer_self_confirm<'a>(
         &self,
         root: &dyn Constraint<'a>,
         occurrence: usize,
         node: FormulaNodeId,
         variable: VariableId,
         bound: VariableSet,
-    ) -> ProposalCoverage {
+    ) -> bool {
         match &self.finite_formula.node(node).kind {
             FiniteFormulaNodeKind::Atom => {
                 self.formula_node_proposal_coverage(root, occurrence, node, variable, bound)
+                    == ProposalCoverage::Exact
             }
-            FiniteFormulaNodeKind::Or { children } => children
-                .iter()
-                .map(|&child| {
-                    self.formula_execution_proposal_coverage(
-                        root, occurrence, child, variable, bound,
-                    )
-                })
-                .min()
-                .unwrap_or(ProposalCoverage::None),
+            FiniteFormulaNodeKind::Or { children } => {
+                !children.is_empty()
+                    && children.iter().all(|&child| {
+                        self.formula_proposal_discharges_outer_self_confirm(
+                            root, occurrence, child, variable, bound,
+                        )
+                    })
+            }
             FiniteFormulaNodeKind::And { children } => {
-                let mut receipt: Option<ProposalCoverage> = None;
+                let mut has_source = false;
                 for &child in children.iter() {
                     let constraint = self.resolve_formula_node(root, occurrence, child);
                     if !constraint.variables().is_set(variable)
@@ -2085,15 +2086,14 @@ impl ResidualPlan {
                     {
                         continue;
                     }
-                    let child_receipt = self.formula_execution_proposal_coverage(
+                    has_source = true;
+                    if !self.formula_proposal_discharges_outer_self_confirm(
                         root, occurrence, child, variable, bound,
-                    );
-                    receipt = Some(match receipt {
-                        Some(receipt) => receipt.min(child_receipt),
-                        None => child_receipt,
-                    });
+                    ) {
+                        return false;
+                    }
                 }
-                receipt.unwrap_or(ProposalCoverage::None)
+                has_source
             }
         }
     }
@@ -2106,8 +2106,7 @@ impl ResidualPlan {
         variable: VariableId,
         bound: VariableSet,
     ) -> bool {
-        self.formula_execution_proposal_coverage(root, occurrence, node, variable, bound)
-            == ProposalCoverage::Exact
+        self.formula_proposal_discharges_outer_self_confirm(root, occurrence, node, variable, bound)
     }
 
     /// Whether any concrete leaf in this plan owns a true transition source
@@ -3927,13 +3926,16 @@ impl FormulaPcInterner {
         FormulaCursor { pc, exit }
     }
 
-    /// Re-interns a root continuation with an exact-source discharge proof.
+    /// Re-interns a root continuation after its outer self-confirm obligation
+    /// has been discharged.
     ///
     /// A synthetic root AND starts conservatively unchecked because its
-    /// structural receipt is only Covering. Once row-local planning chooses
-    /// an Exact child as the proposer, the formula's confirmation suffix
-    /// validates every remaining target-containing child. That partition can
-    /// therefore return to the outer WCO continuation as already checked.
+    /// structural proposal coverage is only Covering. Once row-local planning
+    /// chooses an Exact child as the proposer, the formula's confirmation
+    /// suffix validates every remaining target-containing child. That
+    /// partition can therefore return to the outer WCO continuation as
+    /// already checked without claiming that its partial proposal support was
+    /// itself Exact.
     fn with_proposer_checked(
         &mut self,
         program: &FiniteFormulaProgram,
@@ -8182,9 +8184,9 @@ fn quoted_formula_propose_transition<'a>(
         variable,
         0,
         UnionVerb::Propose { relevant },
-        // Preserve the compiled root route's compositional receipt. A child
-        // can be only Covering as an opaque constraint while the recursively
-        // lowered Formula route through it is Exact.
+        // Preserve the compiled root route's self-confirm discharge. A child
+        // can be only Covering as an opaque constraint while Exact leaf proofs
+        // and Formula confirmations discharge the lowered route's obligation.
         root_checked,
     );
     let skipped = formula_ready_common_skips(root, plan, quote, variable);
@@ -14054,6 +14056,85 @@ mod tests {
         }
     }
 
+    /// The relation `{(x, 0) | x is even}`. Confirming `x` may conservatively
+    /// retain odd values until `y` is bound, while proposing `y` is exact once
+    /// `x` is bound.
+    #[derive(Clone, Copy)]
+    struct ConservativeEvenPair;
+
+    impl Constraint<'static> for ConservativeEvenPair {
+        fn variables(&self) -> VariableSet {
+            VariableSet::new_singleton(0).union(VariableSet::new_singleton(1))
+        }
+
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            if variable == 1 && bound.is_set(0) && !bound.is_set(1) {
+                ProposalCoverage::Exact
+            } else {
+                ProposalCoverage::None
+            }
+        }
+
+        fn estimate(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            out: &mut EstimateSink<'_>,
+        ) -> bool {
+            if variable != 1 {
+                return false;
+            }
+            let Some(x) = view.col(0) else {
+                return false;
+            };
+            out.extend(view.iter().map(|row| usize::from(row[x][0] & 1 == 0)));
+            true
+        }
+
+        fn propose(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            assert_eq!(variable, 1);
+            let x = view.col(0).expect("proposing y requires bound x");
+            for (parent, row) in view.iter().enumerate() {
+                if row[x][0] & 1 == 0 {
+                    candidates.push(parent as u32, raw(0));
+                }
+            }
+        }
+
+        fn confirm(
+            &self,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
+        ) {
+            if variable == 0 {
+                let Some(y) = view.col(1) else {
+                    return;
+                };
+                candidates.retain(|row, x| x[0] & 1 == 0 && view.row(row as usize)[y] == raw(0));
+            } else {
+                assert_eq!(variable, 1);
+                let Some(x) = view.col(0) else {
+                    return;
+                };
+                candidates.retain(|row, y| view.row(row as usize)[x][0] & 1 == 0 && *y == raw(0));
+            }
+        }
+
+        fn satisfied(&self, view: &RowsView<'_>) -> bool {
+            let (Some(x), Some(y)) = (view.col(0), view.col(1)) else {
+                return true;
+            };
+            view.iter()
+                .all(|row| row[x][0] & 1 == 0 && row[y] == raw(0))
+        }
+    }
+
     #[derive(Clone)]
     struct QuotedEstimateLeaf {
         parent: Option<VariableId>,
@@ -19668,7 +19749,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_ready_quote_preserves_exact_root_receipt_for_covering_child() {
+    fn deferred_ready_quote_preserves_root_self_confirm_discharge_for_covering_child() {
         const TARGET: VariableId = 0;
         let exact = || {
             Box::new(ReceiptLeaf {
@@ -19698,7 +19779,7 @@ mod tests {
                 TARGET,
                 VariableSet::new_empty(),
             ),
-            "the recursively lowered root route is Exact"
+            "the recursively lowered root route discharges the outer self-confirm obligation"
         );
 
         let mut worklist = Worklist::new();
@@ -19751,7 +19832,7 @@ mod tests {
         };
         assert!(
             interner.formula_candidate_exit(cursor).checked.contains(0),
-            "carrier entry lost the Exact root receipt and would self-confirm"
+            "carrier entry lost the root self-confirm discharge and would repeat validation"
         );
     }
 
@@ -20727,7 +20808,7 @@ mod tests {
     }
 
     #[test]
-    fn compiled_formula_receipts_discharge_only_fully_exact_proposal_routes() {
+    fn compiled_formula_proposals_discharge_outer_self_confirm_only_when_sources_do() {
         let leaf = |coverage| {
             Box::new(ReceiptLeaf {
                 variable: 0,
@@ -20746,16 +20827,13 @@ mod tests {
             ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Disabled),
         );
         let exact_formula_root = exact_plan.finite_formula.root(0).unwrap();
-        assert_eq!(
-            exact_plan.formula_execution_proposal_coverage(
-                &exact_root,
-                0,
-                exact_formula_root,
-                0,
-                VariableSet::new_empty(),
-            ),
-            ProposalCoverage::Exact
-        );
+        assert!(exact_plan.formula_proposal_discharges_outer_self_confirm(
+            &exact_root,
+            0,
+            exact_formula_root,
+            0,
+            VariableSet::new_empty(),
+        ));
 
         let desc = StateDesc {
             bound: VariableSet::new_empty(),
@@ -20800,15 +20878,14 @@ mod tests {
             ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Disabled),
         );
         let covering_formula_root = covering_plan.finite_formula.root(0).unwrap();
-        assert_eq!(
-            covering_plan.formula_execution_proposal_coverage(
+        assert!(
+            !covering_plan.formula_proposal_discharges_outer_self_confirm(
                 &covering_root,
                 0,
                 covering_formula_root,
                 0,
                 VariableSet::new_empty(),
             ),
-            ProposalCoverage::Covering,
             "one potentially selected Covering source keeps the outer self-check"
         );
 
@@ -20821,17 +20898,91 @@ mod tests {
             ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Disabled),
         );
         let validator_root = validator_plan.finite_formula.root(0).unwrap();
-        assert_eq!(
-            validator_plan.formula_execution_proposal_coverage(
+        assert!(
+            validator_plan.formula_proposal_discharges_outer_self_confirm(
                 &exact_with_validator,
                 0,
                 validator_root,
                 0,
                 VariableSet::new_empty(),
             ),
-            ProposalCoverage::Exact,
-            "a non-source validator is already run by the AND proposal route"
+            "the AND suffix runs a non-source validator without claiming composite Exact coverage"
         );
+    }
+
+    #[test]
+    fn formula_self_confirm_discharge_is_not_partial_fiber_exactness() {
+        const X: VariableId = 0;
+        const Y: VariableId = 1;
+
+        let mut y_candidates = vec![raw(0), raw(1)];
+        ConservativeEvenPair.confirm(
+            Y,
+            &RowsView::EMPTY,
+            &mut CandidateSink::Values(&mut y_candidates),
+        );
+        assert_eq!(
+            y_candidates,
+            [raw(0), raw(1)],
+            "confirming y may conservatively retain false positives while x is unbound"
+        );
+
+        let make = || {
+            IntersectionConstraint::new(vec![
+                Box::new(FanoutLeaf {
+                    variable: X,
+                    values: Arc::new(vec![raw(0), raw(1), raw(2)]),
+                }) as ShapeConstraint,
+                Box::new(ConservativeEvenPair) as ShapeConstraint,
+            ])
+        };
+
+        let root = make();
+        assert_eq!(
+            root.proposal_coverage(X, VariableSet::new_empty()),
+            ProposalCoverage::Covering
+        );
+        let plan = ResidualPlan::compile_lowering(
+            &root,
+            ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Disabled),
+        );
+        let formula_root = plan.finite_formula.root(0).unwrap();
+        assert!(
+            plan.formula_proposal_discharges_outer_self_confirm(
+                &root,
+                0,
+                formula_root,
+                X,
+                VariableSet::new_empty(),
+            ),
+            "the formula suffix runs the conservative validator, so an opaque outer self-confirm is redundant"
+        );
+
+        let mut partial_support = Vec::new();
+        root.propose(
+            X,
+            &RowsView::EMPTY,
+            &mut CandidateSink::Values(&mut partial_support),
+        );
+        assert_eq!(
+            partial_support,
+            [raw(0), raw(1), raw(2)],
+            "self-confirmation discharge does not turn a lawful conservative partial confirmation into an Exact fiber"
+        );
+
+        let project =
+            |binding: &Binding| Some((binding.get(X).copied()?, binding.get(Y).copied()?));
+        let mut residual: Vec<_> = Query::new(make(), project)
+            .solve_residual_state_lazy_with(ResidualLowering::new(
+                FormulaScope::WholeRoot,
+                ProgramScope::Disabled,
+            ))
+            .collect();
+        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
+        residual.sort_unstable();
+        sequential.sort_unstable();
+        assert_eq!(residual, [(raw(0), raw(0)), (raw(2), raw(0))]);
+        assert_eq!(residual, sequential);
     }
 
     #[test]
