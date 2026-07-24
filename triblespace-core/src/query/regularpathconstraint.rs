@@ -3967,9 +3967,9 @@ mod seeded_frame_tests {
     use crate::query::ProgramActivation;
     use crate::query::ProgramBatch;
     use crate::query::ProgramBatchEffects;
-    use crate::query::ProgramCompleteAdmission;
     use crate::query::ProgramCompleteAffinity;
     use crate::query::ProgramCompleteEffects;
+    use crate::query::ProgramCompleteWorkQuote;
     use crate::query::ProgramSeedEffects;
     use crate::query::Query;
     use crate::trible::Trible;
@@ -4605,12 +4605,12 @@ mod seeded_frame_tests {
         let completed = program
             .try_complete_bounded(batch, 3, &affinity)
             .expect("the final two parents fit exactly");
-        let (first, admission, raw_occurrence_count, mut occurrences) =
+        let (first, work, raw_occurrence_count, mut occurrences) =
             completed.into_parts_for(batch, &affinity, &rows);
         assert_eq!(first, 1);
         assert_eq!(
-            admission,
-            ProgramCompleteAdmission::Exact {
+            work,
+            ProgramCompleteWorkQuote {
                 drain_work_units: 3,
                 raw_occurrences: 3,
             }
