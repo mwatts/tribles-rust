@@ -2652,7 +2652,8 @@ impl TypedProgramSpec for RegularPathConstraint {
                         },
                         variable: self.end,
                         stratum,
-                        grouping: ProgramGrouping::ParentAtomic,
+                        // Support has no candidate relation to reuse.
+                        grouping: ProgramGrouping::PageLocal,
                         completion: ProgramCompletion::PageableOnly,
                         exposure: ProgramExposure::Production,
                     }
@@ -3371,10 +3372,6 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         });
     }
 
-    fn residual_confirm_is_page_local(&self) -> bool {
-        true
-    }
-
     fn residual_program(&self) -> Option<ProgramRef<'_>> {
         Some(ProgramRef::new(self))
     }
@@ -3493,6 +3490,7 @@ mod delta_program_tests {
         let forward_route = path.route(confirm_forward).unwrap();
         let inverse_route = path.route(confirm_inverse).unwrap();
         let support_route = path.route(support).unwrap();
+        assert_eq!(support_route.grouping, ProgramGrouping::PageLocal);
 
         assert!(path.certifies_confirm_dominates_support_positive_prefix(
             confirm_forward,
@@ -3981,11 +3979,6 @@ mod seeded_frame_tests {
             .expect("optimistic partial support is an explicit typed disposition");
         assert_eq!(support_route.grouping, ProgramGrouping::PageLocal);
         assert_eq!(support_route.stratum, ProgramStratum::Finite);
-        assert_eq!(
-            repeated.residual_delta_confirm_grouping_requirements(start.index),
-            None,
-            "RPQ no longer exposes the legacy grouped-transition hook"
-        );
 
         let direct =
             RegularPathConstraint::new(TribleSet::new(), start, end, &[PathOp::Attr(attribute)]);

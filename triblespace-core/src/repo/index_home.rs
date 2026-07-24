@@ -2226,12 +2226,6 @@ where
         self.union.influence(variable)
     }
 
-    fn residual_confirm_is_page_local(&self) -> bool {
-        self.shards
-            .iter()
-            .all(|shard| shard.residual_confirm_is_page_local())
-    }
-
     fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
         view.col(variable).is_none()
             // The shard merge consumes one emitted head per examined value.
@@ -3907,7 +3901,7 @@ mod tests {
     }
 
     #[test]
-    fn union_archive_confirm_is_page_local_over_duplicate_empty_parents() {
+    fn union_archive_confirm_preserves_results_across_candidate_pages() {
         let entity = Id::new([0x16; 16]).unwrap();
         let attribute = Id::new([0x24; 16]).unwrap();
         let archives = [
@@ -3930,8 +3924,6 @@ mod tests {
             (1, raw_value(3)),
             (1, raw_value(2)),
         ];
-        assert!(union.residual_confirm_is_page_local());
-
         let mut whole = input.clone();
         union.confirm(value.index, &view, &mut CandidateSink::Tagged(&mut whole));
         assert_eq!(

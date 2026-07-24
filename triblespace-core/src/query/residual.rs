@@ -14,9 +14,10 @@
 //! exposed root one synthetic formula occurrence after outer
 //! variable selection. It flattens only the maximal root AND region and retains
 //! candidate-occurrence paging once that AND's exact remaining confirmation
-//! suffix is page-local. The independent Program-scope chain admits disabled,
-//! production-qualified, or all typed routes; selected routes may be
-//! terminating finite automata or repeated least-fixpoint programs.
+//! suffix contains no live OR payload or activation-reuse barrier. The
+//! independent Program-scope chain admits disabled, production-qualified, or
+//! all typed routes; selected routes may be terminating finite automata or
+//! repeated least-fixpoint programs.
 //!
 //! Ready and Candidate descriptors are pure planning states: they estimate,
 //! partition rows by their exact uniform semantic action, and file explicit
@@ -35,12 +36,12 @@
 //! intentionally defer reconvergence with an older cohort in exchange for
 //! first-result latency. The token is not part of canonical state identity and
 //! never consumes that older cohort. Ready and
-//! Propose states measure parent rows. Candidate and Confirm states remain
-//! parent-atomic while any unchecked whole-group filter remains; once the
-//! residual continuation contains only page-local confirms, they measure and
-//! split candidate occurrences. Thus width one can confirm one value and
-//! descend while preserving group-global Union/custom semantics at their
-//! atomic boundary. Proposal remains eager for each selected parent block.
+//! Propose states measure parent rows. Candidate and Confirm states measure and
+//! split SET-admitted candidate occurrences. They remain parent-atomic only
+//! while a selected typed Program route must reuse one complete parent
+//! activation. Thus width one can confirm one value and descend while Formula
+//! OR retains its live-frame payload barrier. Proposal remains eager for each
+//! selected parent block.
 //! Execution classifies every pop as `Advanced`, `Dead`, or terminal `Emit`.
 //! Lazy width is unchanged while nonempty successors advance. Once a partial
 //! action activates an exact continuation cohort, that lineage outranks cold
@@ -127,8 +128,7 @@ struct FormulaPath(Box<[FormulaStep]>);
 /// Execution capabilities captured at one opaque formula occurrence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FormulaNodeCapabilities {
-    confirm_page_local: bool,
-    grouped_delta_confirm_requirements: Box<[(VariableId, VariableSet)]>,
+    parent_atomic_program_confirms: Box<[(VariableId, VariableSet)]>,
 }
 
 /// Policy result for one structurally available typed Program route.
@@ -166,12 +166,16 @@ fn select_program<'r, 'a>(
 }
 
 impl FormulaNodeCapabilities {
-    fn grouped_delta_confirm(&self, variable: VariableId, bound: VariableSet) -> bool {
-        grouped_delta_confirm_is_active(&self.grouped_delta_confirm_requirements, variable, bound)
+    fn parent_atomic_program_confirm(&self, variable: VariableId, bound: VariableSet) -> bool {
+        parent_atomic_program_confirm_is_active(
+            &self.parent_atomic_program_confirms,
+            variable,
+            bound,
+        )
     }
 }
 
-fn compile_grouped_delta_confirm_requirements<'a>(
+fn compile_parent_atomic_program_confirms<'a>(
     constraint: &dyn Constraint<'a>,
     program_scope: ProgramScope,
 ) -> Box<[(VariableId, VariableSet)]> {
@@ -193,25 +197,22 @@ fn compile_grouped_delta_confirm_requirements<'a>(
                 },
             ) {
                 ProgramOffer::Selected(_, route) => {
-                    // A selected route owns this exact confirmation action,
-                    // including its grouping law.
+                    // ParentAtomic is a physical activation-reuse boundary,
+                    // not a stronger semantic confirmation law.
                     return (route.grouping == ProgramGrouping::ParentAtomic)
                         .then_some((variable, required));
                 }
                 // A policy-deferred route executes through the ordinary
-                // protocol, not through either legacy transition substrate.
+                // protocol, not through the typed Program substrate.
                 ProgramOffer::Deferred => return None,
-                ProgramOffer::Absent => {}
+                ProgramOffer::Absent => return None,
             }
-            constraint
-                .residual_delta_confirm_grouping_requirements(variable)
-                .map(|required| (variable, required))
         })
         .collect::<Vec<_>>()
         .into_boxed_slice()
 }
 
-fn grouped_delta_confirm_is_active(
+fn parent_atomic_program_confirm_is_active(
     requirements: &[(VariableId, VariableSet)],
     variable: VariableId,
     bound: VariableSet,
@@ -227,7 +228,7 @@ fn grouped_delta_confirm_is_active(
 ///
 /// This is intentionally narrower than the set of formula contexts that might
 /// admit a specialized online reducer. The probe accepts only continuations
-/// whose remaining work is an empty-preserving composition of page-local AND
+/// whose remaining work is an empty-preserving composition of relational AND
 /// confirmations followed by the ordinary outer commit path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FormulaProposalStreamability {
@@ -239,14 +240,14 @@ enum FormulaProposalStreamability {
 /// continuation before the parent action has produced its complete result.
 ///
 /// This is continuation evidence, not a constraint or physical-executor
-/// capability. `ChunkHomomorphic` begins only at the existing parent-local
-/// candidate SET boundary, so independently published chunks cannot bypass
-/// grouped or non-page-local work.
+/// capability. `RelationalPrefix` begins only after each published candidate
+/// is a SET-admitted relation, so independently published singletons cannot
+/// bypass Formula OR state or a typed activation-reuse boundary.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ContinuationPublicationReceipt {
     Terminal,
-    ChunkHomomorphic,
+    RelationalPrefix,
     Barrier,
 }
 
@@ -255,8 +256,7 @@ enum FormulaProposalStreamBarrier {
     NotSyntheticRoot,
     NotProposalAction,
     OrFrame,
-    NonPageLocalConfirm,
-    GroupedConfirm,
+    ActivationReuse,
     OuterContinuation,
 }
 
@@ -397,8 +397,7 @@ impl FiniteFormulaProgram {
                 let id = self.reserve_node();
                 let node_path = FormulaPath(path.clone().into_boxed_slice());
                 let capabilities = FormulaNodeCapabilities {
-                    confirm_page_local: constraint.residual_confirm_is_page_local(),
-                    grouped_delta_confirm_requirements: compile_grouped_delta_confirm_requirements(
+                    parent_atomic_program_confirms: compile_parent_atomic_program_confirms(
                         constraint,
                         self.program_scope,
                     ),
@@ -462,12 +461,12 @@ impl FiniteFormulaProgram {
                 };
 
                 let id = self.reserve_node();
-                let capabilities =
-                    FormulaNodeCapabilities {
-                        confirm_page_local: root.residual_confirm_is_page_local(),
-                        grouped_delta_confirm_requirements:
-                            compile_grouped_delta_confirm_requirements(root, self.program_scope),
-                    };
+                let capabilities = FormulaNodeCapabilities {
+                    parent_atomic_program_confirms: compile_parent_atomic_program_confirms(
+                        root,
+                        self.program_scope,
+                    ),
+                };
                 let mut children = Vec::new();
                 self.compile_root_and_children(root, &mut Vec::new(), owner, &mut children);
                 let kind = FiniteFormulaNodeKind::And {
@@ -1043,8 +1042,9 @@ impl FiniteFormulaProgram {
 
     /// Whether the active synthetic-root continuation is the exact analogue
     /// of an outer Candidate state whose entire remaining confirmation suffix
-    /// is page-local. Only a maximal root AND may expose candidate pages. OR
-    /// reducers and nested formula control retain complete parent groups.
+    /// has no activation-reuse barrier. Only a maximal root AND may expose
+    /// candidate pages. OR reducers and nested formula control retain complete
+    /// parent groups.
     #[cfg(test)]
     fn root_confirm_suffix_accepts_pages(
         &self,
@@ -1088,18 +1088,17 @@ impl FiniteFormulaProgram {
             .all(|(_, &child)| {
                 let node = self.node(child);
                 matches!(node.kind, FiniteFormulaNodeKind::Atom)
-                    && node.capabilities.confirm_page_local
                     && !node
                         .capabilities
-                        .grouped_delta_confirm(counter.exit.variable, bound)
+                        .parent_atomic_program_confirm(counter.exit.variable, bound)
             })
     }
 
     /// Proves that one focused proposal can be distributed over accepted
     /// endpoint chunks without changing the formula continuation's bag
     /// semantics. Every ancestor must be AND, and every sibling that remains
-    /// after the focused child must itself be an AND-only tree of page-local,
-    /// non-grouped confirmers.
+    /// after the focused child must itself be an AND-only tree without a
+    /// typed activation-reuse boundary.
     #[cfg(test)]
     fn proposal_streamability(
         &self,
@@ -1166,13 +1165,12 @@ impl FiniteFormulaProgram {
         let node = self.node(node);
         match &node.kind {
             FiniteFormulaNodeKind::Atom => {
-                if node.capabilities.grouped_delta_confirm(variable, bound) {
+                if node
+                    .capabilities
+                    .parent_atomic_program_confirm(variable, bound)
+                {
                     FormulaProposalStreamability::Barrier(
-                        FormulaProposalStreamBarrier::GroupedConfirm,
-                    )
-                } else if !node.capabilities.confirm_page_local {
-                    FormulaProposalStreamability::Barrier(
-                        FormulaProposalStreamBarrier::NonPageLocalConfirm,
+                        FormulaProposalStreamBarrier::ActivationReuse,
                     )
                 } else {
                     FormulaProposalStreamability::Linear
@@ -1253,10 +1251,10 @@ impl FiniteFormulaProgram {
             .all(|(_, &child)| {
                 let node = self.node(child);
                 matches!(node.kind, FiniteFormulaNodeKind::Atom)
-                    && node.capabilities.confirm_page_local
-                    && !node
-                        .capabilities
-                        .grouped_delta_confirm(formula_pcs.candidate_exit(cursor).variable, bound)
+                    && !node.capabilities.parent_atomic_program_confirm(
+                        formula_pcs.candidate_exit(cursor).variable,
+                        bound,
+                    )
             })
     }
 
@@ -1568,18 +1566,15 @@ struct ResidualPlan {
     /// Structural finite-formula program below lowered Union occurrences.
     /// Runtime migration is intentionally separate from compilation.
     finite_formula: FiniteFormulaProgram,
-    /// Whether each opaque leaf's confirmation is homomorphic over ordered
-    /// pages of one parent's candidate sequence.
-    page_local_confirms: Vec<bool>,
     /// Exposure policy deciding which opaque actions may enter the residual
     /// typed Program submachine for this exact solve. Finite programs
     /// terminate; repeated programs compute their least fixpoint on the same
     /// substrate.
     program_scope: ProgramScope,
-    /// Per-variable bound-schema prerequisites under which a lowered cyclic
-    /// confirmation needs the immutable complete candidate sequence for each
-    /// parent until traversal quiescence.
-    grouped_delta_confirm_requirements: Vec<Box<[(VariableId, VariableSet)]>>,
+    /// Per-variable bound-schema prerequisites under which a selected typed
+    /// Program confirmation reuses one complete parent activation until
+    /// traversal quiescence.
+    parent_atomic_program_confirms: Vec<Box<[(VariableId, VariableSet)]>>,
     /// The nontrivial exposed root is one formula occurrence. Whole-root
     /// identity shells around one opaque atom normalize to the flat plan.
     synthetic_root_formula: bool,
@@ -1646,8 +1641,7 @@ impl ResidualPlan {
             program_scope: ProgramScope,
             path: &mut Vec<usize>,
             leaves: &mut Vec<ResidualLeaf>,
-            page_local_confirms: &mut Vec<bool>,
-            grouped_delta_confirm_requirements: &mut Vec<Box<[(VariableId, VariableSet)]>>,
+            parent_atomic_program_confirms: &mut Vec<Box<[(VariableId, VariableSet)]>>,
         ) {
             match constraint.residual_shape() {
                 ConstraintShape::And(children) => {
@@ -1659,8 +1653,7 @@ impl ResidualPlan {
                             program_scope,
                             path,
                             leaves,
-                            page_local_confirms,
-                            grouped_delta_confirm_requirements,
+                            parent_atomic_program_confirms,
                         );
                         path.pop();
                     }
@@ -1677,13 +1670,9 @@ impl ResidualPlan {
                         path: ConstraintPath(path.clone().into_boxed_slice()),
                         lowering,
                     });
-                    page_local_confirms.push(
-                        matches!(lowering, LeafLowering::Opaque)
-                            && constraint.residual_confirm_is_page_local(),
-                    );
-                    grouped_delta_confirm_requirements.push(
+                    parent_atomic_program_confirms.push(
                         if matches!(lowering, LeafLowering::Opaque) {
-                            compile_grouped_delta_confirm_requirements(constraint, program_scope)
+                            compile_parent_atomic_program_confirms(constraint, program_scope)
                         } else {
                             Box::new([])
                         },
@@ -1695,19 +1684,14 @@ impl ResidualPlan {
         let synthetic_root_formula =
             formula_scope == FormulaScope::WholeRoot && !is_formula_identity(root);
         let mut leaves = Vec::new();
-        let mut page_local_confirms = Vec::new();
-        let mut grouped_delta_confirm_requirements: Vec<Box<[(VariableId, VariableSet)]>> =
-            Vec::new();
+        let mut parent_atomic_program_confirms: Vec<Box<[(VariableId, VariableSet)]>> = Vec::new();
         if synthetic_root_formula {
             leaves.push(ResidualLeaf {
                 path: ConstraintPath(Box::new([])),
                 lowering: LeafLowering::FiniteFormula,
             });
-            // Formula control owns the exact inner action boundary. The
-            // singleton outer occurrence itself is never an ordinary
-            // page-local or grouped confirmer.
-            page_local_confirms.push(false);
-            grouped_delta_confirm_requirements.push(Box::new([]));
+            // Formula control owns the exact inner action boundary.
+            parent_atomic_program_confirms.push(Box::new([]));
         } else {
             visit(
                 root,
@@ -1715,8 +1699,7 @@ impl ResidualPlan {
                 program_scope,
                 &mut Vec::new(),
                 &mut leaves,
-                &mut page_local_confirms,
-                &mut grouped_delta_confirm_requirements,
+                &mut parent_atomic_program_confirms,
             );
         }
         let finite_formula =
@@ -1740,9 +1723,8 @@ impl ResidualPlan {
         Self {
             leaves,
             finite_formula,
-            page_local_confirms,
             program_scope,
-            grouped_delta_confirm_requirements,
+            parent_atomic_program_confirms,
             synthetic_root_formula,
             formula_ready_quote,
         }
@@ -2197,18 +2179,10 @@ impl ResidualPlan {
         })
     }
 
-    /// True exactly when every unchecked relevant confirmer can process
-    /// ordered candidate pages independently. Whole-group confirmers may run
-    /// first; paging begins only once the remaining continuation is local.
-    fn remaining_confirms_are_page_local(&self, relevant: &ChildSet, checked: &ChildSet) -> bool {
-        (0..self.len()).all(|leaf| {
-            !relevant.contains(leaf) || checked.contains(leaf) || self.page_local_confirms[leaf]
-        })
-    }
-
     /// Whether candidate occurrences may be consumed as independent pages.
-    /// A grouped delta reducer is deliberately parent-atomic even when its
-    /// ordinary protocol confirmation is elementwise.
+    /// Ordinary weak support refinement is relational over SET-admitted
+    /// `(parent, value)` occurrences. Only a selected typed Program route that
+    /// reuses one complete parent activation remains parent-atomic.
     fn remaining_confirms_accept_pages(
         &self,
         relevant: &ChildSet,
@@ -2216,16 +2190,15 @@ impl ResidualPlan {
         variable: VariableId,
         bound: VariableSet,
     ) -> bool {
-        self.remaining_confirms_are_page_local(relevant, checked)
-            && (0..self.len()).all(|leaf| {
-                !relevant.contains(leaf)
-                    || checked.contains(leaf)
-                    || !grouped_delta_confirm_is_active(
-                        &self.grouped_delta_confirm_requirements[leaf],
-                        variable,
-                        bound,
-                    )
-            })
+        (0..self.len()).all(|leaf| {
+            !relevant.contains(leaf)
+                || checked.contains(leaf)
+                || !parent_atomic_program_confirm_is_active(
+                    &self.parent_atomic_program_confirms[leaf],
+                    variable,
+                    bound,
+                )
+        })
     }
 }
 
@@ -2491,8 +2464,8 @@ pub struct ResidualStateStats {
     /// Terminal Ready-state chunks emitted for projection.
     pub emit_pops: usize,
     /// Full actionable-width chunks selected from the maximum eligible rank.
-    /// The unit is a parent row for Ready/Propose and atomic candidate states,
-    /// or a candidate occurrence for an entirely page-local continuation.
+    /// The unit is a parent row for Ready/Propose and activation-reuse
+    /// candidate states, or a candidate occurrence when paging is available.
     pub full_pops: usize,
     /// Underfilled buckets drained through the minimum-rank readiness gate
     /// because no live state could fill the desired width. The eager solver
@@ -2640,10 +2613,10 @@ pub struct ResidualStateStats {
     /// This includes both exact Confirm taps and physical Support fallbacks.
     pub delta_positive_publication_terminal_commits: usize,
     /// Positive-publication values that won their semantic parent's SET
-    /// ledger and committed through a ChunkHomomorphic continuation.
+    /// ledger and committed through a relational Candidate continuation.
     ///
     /// This includes both exact Confirm taps and physical Support fallbacks.
-    pub delta_positive_publication_chunk_homomorphic_commits: usize,
+    pub delta_positive_publication_relational_prefix_commits: usize,
     /// Public-pull demand tokens assigned to one concrete parked
     /// PositiveSupport parent. This is authoritative `D`, not a requested
     /// dispatch limit.
@@ -3714,8 +3687,9 @@ impl StateDesc {
         }
     }
 
-    /// Candidate occurrences become independent scheduling atoms only after
-    /// every confirmer still named by the continuation is page-local.
+    /// SET-admitted candidate occurrences are independent scheduling atoms
+    /// unless a selected typed Program route reuses the complete parent
+    /// activation.
     fn uses_candidate_pages(&self, plan: &ResidualPlan, formula_pcs: &FormulaPcInterner) -> bool {
         match &self.phase {
             ResidualPhase::Candidate {
@@ -3772,12 +3746,11 @@ fn crosses_candidate_set_boundary(
 
 /// Proves the publication class of one exact ordinary Confirm successor.
 ///
-/// Terminal commitment is stronger than chunkability and therefore wins even
-/// when the input was already SET-admitted. A nonterminal chunk is licensed
-/// only by the transition that first turns the parent-local occurrence bag
-/// into a relation. Formula/control transitions and malformed historical
-/// pairs are conservatively barriers. Relational semantics are independent of
-/// this physical publication classifier.
+/// Terminal commitment is stronger than prefix publication and therefore wins
+/// even when the input was already SET-admitted. A nonterminal singleton is
+/// licensed whenever its exact successor is a relational Candidate
+/// continuation. Formula/control transitions, activation-reuse barriers, and
+/// malformed historical pairs remain conservative barriers.
 #[cfg_attr(not(test), allow(dead_code))]
 fn continuation_publication_receipt(
     previous: &StateDesc,
@@ -3814,8 +3787,8 @@ fn continuation_publication_receipt(
     if commits_final_checked_candidate(successor, full) {
         return ContinuationPublicationReceipt::Terminal;
     }
-    if crosses_candidate_set_boundary(previous, successor, plan, formula_pcs) {
-        ContinuationPublicationReceipt::ChunkHomomorphic
+    if candidate_payload_is_set_admitted(successor, plan, formula_pcs) {
+        ContinuationPublicationReceipt::RelationalPrefix
     } else {
         ContinuationPublicationReceipt::Barrier
     }
@@ -5997,8 +5970,8 @@ impl CandidateBatch {
     }
 
     /// Takes at most `width` candidate occurrences from the tail, allowing a
-    /// parent group to be bisected. Callers must establish that every
-    /// remaining confirmer is page-local before using this operation.
+    /// parent group to be bisected. Callers must establish that no selected
+    /// typed Program route needs the complete parent activation for reuse.
     fn take_candidate_tail(&mut self, stride: usize, width: usize) -> Self {
         let take = self.candidate_count().min(width.max(1));
         debug_assert!(take > 0);
@@ -6736,10 +6709,11 @@ impl FormulaBatch {
         }
     }
 
-    /// Takes a disjoint tail of candidate occurrences from a synthetic root
-    /// AND. The active PC proves that every remaining confirmer is page-local
-    /// before the scheduler calls this. A bisected parent is copied into both
-    /// pages, while each speculative candidate remains affine to one page.
+    /// Takes a disjoint tail of SET-admitted candidate occurrences from a
+    /// synthetic root AND. The active PC proves that no live OR frame or
+    /// selected typed activation-reuse route blocks paging. A bisected parent
+    /// is copied into both pages, while each speculative candidate remains
+    /// affine to one page.
     fn take_candidate_tail(&mut self, stride: usize, width: usize) -> Self {
         assert!(
             self.or_count() == 0,
@@ -7117,9 +7091,9 @@ impl StateBucket {
         }
     }
 
-    /// Scheduling occupancy. Row-bearing phases are measured in parent rows;
-    /// once a candidate continuation is entirely page-local, its actionable
-    /// atoms are candidate occurrences instead.
+    /// Scheduling occupancy. Row-bearing phases and activation-reuse routes
+    /// are measured in parent rows; pageable candidate continuations use
+    /// candidate occurrences instead.
     fn occupancy(&self, candidate_pages: bool) -> usize {
         match self {
             StateBucket::Candidates(batch) if candidate_pages => batch.candidate_count(),
@@ -7141,8 +7115,8 @@ impl StateBucket {
     /// Bisects one affine payload into two independently executable shards.
     ///
     /// Row phases split on row boundaries. Candidate phases split either on
-    /// complete parent groups or, once the exact residual continuation is
-    /// page-local, on candidate-occurrence boundaries. The latter may copy
+    /// complete parent activations when a selected typed route requests reuse,
+    /// or on SET-admitted candidate-occurrence boundaries. The latter may copy
     /// one parent binding into both shards, but every speculative candidate
     /// remains owned by exactly one side.
     #[cfg(feature = "parallel")]
@@ -7257,9 +7231,9 @@ struct ResidualActionTask {
     /// Number of candidate occurrences presented to Confirm; zero for
     /// Support/Propose.
     candidate_occurrences: usize,
-    /// Scheduler occupancy consumed by this action. This is parent rows until
-    /// the remaining confirmation suffix is page-local, then candidate
-    /// occurrences.
+    /// Scheduler occupancy consumed by this action. This is parent rows for an
+    /// activation-reuse route and candidate occurrences for ordinary pageable
+    /// confirmation.
     action_atoms: usize,
 }
 
@@ -10744,9 +10718,10 @@ impl ResidualStateMachine {
     /// Removes one batch-filling chunk from the next state.
     ///
     /// The deepest bucket that can supply the complete desired actionable
-    /// width wins. Rows are the unit until a candidate continuation contains
-    /// only page-local confirms, at which point candidate occurrences are the
-    /// unit. If no bucket is large enough, the minimum-rank bucket is drained;
+    /// width wins. Rows are the unit until a candidate continuation is free of
+    /// selected activation-reuse barriers, at which point SET-admitted
+    /// candidate occurrences are the unit. If no bucket is large enough, the
+    /// minimum-rank bucket is drained;
     /// strict rank growth makes that underfilled pop readiness-safe. Thus
     /// width one preserves maximum-rank, highest-ID traversal, while a width
     /// above every live bucket is exact minimum-rank scheduling. Partial
@@ -11400,10 +11375,10 @@ impl ResidualStateMachine {
     }
 
     /// Converts one eligible confirmer into one transition activation per
-    /// parent candidate batch. The reducer retains the immutable original
-    /// candidate sequence and filters it only after traversal quiesces. Finite
-    /// page-local confirmations may receive one disjoint page; repeated paths
-    /// remain parent-grouped by their plan capability.
+    /// parent candidate batch. The reducer retains its admitted source
+    /// relation and filters it only after traversal quiesces. Ordinary typed
+    /// confirmations may receive one disjoint page; repeated RPQ routes retain
+    /// one complete parent activation to reuse graph-product traversal.
     fn seed_delta_confirm<'a>(
         &mut self,
         root: &dyn Constraint<'a>,
@@ -11431,8 +11406,8 @@ impl ResidualStateMachine {
         if plan.has_finite_formula(*confirmer) {
             return Err(task);
         }
-        if grouped_delta_confirm_is_active(
-            &plan.grouped_delta_confirm_requirements[*confirmer],
+        if parent_atomic_program_confirm_is_active(
+            &plan.parent_atomic_program_confirms[*confirmer],
             *variable,
             task.desc.bound,
         ) {
@@ -11440,7 +11415,7 @@ impl ResidualStateMachine {
                 !task
                     .desc
                     .uses_candidate_pages(plan, &self.interner.formula_pcs),
-                "grouped delta confirmation was split into candidate pages"
+                "parent-atomic typed confirmation was split into candidate pages"
             );
         }
 
@@ -12734,9 +12709,9 @@ impl ResidualStateMachine {
     ///
     /// A fresh one-row prefix is advanced through the ordinary state-machine
     /// transitions until it branches. Fully-bound staged rows split directly;
-    /// worklist rows split on row boundaries; candidate payloads preserve
-    /// whole-parent atomicity unless the plan proves the remaining confirmers
-    /// page-local. If two unsplittable buckets already exist, one whole bucket
+    /// worklist rows split on row boundaries; candidate payloads split on
+    /// admitted occurrences unless a selected typed route retains the complete
+    /// parent activation for reuse. If two unsplittable buckets already exist, one whole bucket
     /// moves to the sibling. Cross-shard reconvergence is deliberately traded
     /// for parallelism, just as in the affine DAG splitter.
     fn split_for_parallel_with_dispatch<'a>(
@@ -13517,7 +13492,7 @@ where
 //
 // A fresh residual iterator owns one affine state-machine frontier. Rayon
 // requests at most `workers - 1` splits; each split moves disjoint rows,
-// complete candidate-parent groups, or plan-proven page-local candidate
+// complete activation-reuse groups, or pageable SET-admitted candidate
 // occurrences into a sibling state machine. Constraint and postprocessor
 // clones are created only for an actual sibling, and projected `R` values are
 // never stored in either machine. A serially started iterator is still
@@ -13559,10 +13534,9 @@ mod parallel {
         /// worker is created, and fully drained output preserves the serial
         /// query's distinct projected-row set rather than its order.
         ///
-        /// Candidate payloads stay parent-atomic across whole-group
-        /// confirmers. Once the compiled continuation proves every remaining
-        /// confirmer page-local, candidate occurrences themselves become
-        /// independent shard atoms.
+        /// Candidate occurrences are independent shard atoms after SET
+        /// admission. A selected typed Program route may retain one complete
+        /// parent activation instead when that enables traversal reuse.
         ///
         /// The iterator preserves the query's selected [`ResidualLowering`].
         /// Fresh queries use [`ResidualLowering::HYBRID`] by default; an explicit
@@ -14551,7 +14525,6 @@ mod tests {
     #[derive(Clone, Copy)]
     struct CapabilityLeaf {
         variable: VariableId,
-        page_local: bool,
     }
 
     impl Constraint<'static> for CapabilityLeaf {
@@ -14587,16 +14560,58 @@ mod tests {
             _candidates: &mut CandidateSink<'_>,
         ) {
         }
+    }
 
-        fn residual_confirm_is_page_local(&self) -> bool {
-            self.page_local
+    /// Planning-only typed confirmer whose complete parent candidate relation
+    /// is retained for one activation. It models the repeated-RPQ physical
+    /// reuse boundary without inventing a semantic grouping hook.
+    #[derive(Clone, Copy)]
+    struct ParentAtomicProgramLeaf(CapabilityLeaf);
+
+    impl TypedProgramSpec for ParentAtomicProgramLeaf {
+        type State = ();
+        type NoveltyKey = ();
+        type Rank = ();
+
+        fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+            matches!(request.action, ProgramAction::Confirm(variable) if variable == self.0.variable)
+                .then_some(ProgramRoute {
+                    key: ProgramKey::new(0),
+                    variable: self.0.variable,
+                    stratum: ProgramStratum::Fixpoint,
+                    grouping: ProgramGrouping::ParentAtomic,
+                    completion: ProgramCompletion::PageableOnly,
+                    exposure: ProgramExposure::Explicit,
+                })
+        }
+
+        fn dispatch(&self, _state: &Self::State) -> DispatchClass {
+            unreachable!("planning-only ParentAtomic fixture was executed")
+        }
+
+        fn progress(&self, _state: &Self::State) -> Self::Rank {
+            unreachable!("planning-only ParentAtomic fixture was executed")
+        }
+
+        fn seed_typed(
+            &self,
+            _batch: ProgramSeedBatch<'_>,
+            _effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+        ) {
+            unreachable!("planning-only ParentAtomic fixture was executed")
+        }
+
+        fn step_typed(
+            &self,
+            _states: &mut Vec<Self::State>,
+            _batch: TypedProgramBatch<'_>,
+            _effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+        ) {
+            unreachable!("planning-only ParentAtomic fixture was executed")
         }
     }
 
-    #[derive(Clone, Copy)]
-    struct GroupedCapabilityLeaf(CapabilityLeaf);
-
-    impl Constraint<'static> for GroupedCapabilityLeaf {
+    impl Constraint<'static> for ParentAtomicProgramLeaf {
         fn variables(&self) -> VariableSet {
             self.0.variables()
         }
@@ -14628,25 +14643,62 @@ mod tests {
             self.0.confirm(variable, view, candidates);
         }
 
-        fn residual_confirm_is_page_local(&self) -> bool {
-            self.0.page_local
-        }
-
-        fn residual_delta_confirm_grouping_requirements(
-            &self,
-            variable: VariableId,
-        ) -> Option<VariableSet> {
-            (variable == self.0.variable).then_some(VariableSet::new_empty())
+        fn residual_program(&self) -> Option<ProgramRef<'_>> {
+            Some(ProgramRef::new(self))
         }
     }
 
     #[derive(Clone, Copy)]
-    struct ConditionalGroupedCapabilityLeaf {
+    struct ConditionalParentAtomicProgramLeaf {
         variable: VariableId,
         required: VariableId,
     }
 
-    impl Constraint<'static> for ConditionalGroupedCapabilityLeaf {
+    impl TypedProgramSpec for ConditionalParentAtomicProgramLeaf {
+        type State = ();
+        type NoveltyKey = ();
+        type Rank = ();
+
+        fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
+            (matches!(request.action, ProgramAction::Confirm(variable) if variable == self.variable)
+                && request.bound.is_set(self.required))
+            .then_some(ProgramRoute {
+                key: ProgramKey::new(0),
+                variable: self.variable,
+                stratum: ProgramStratum::Fixpoint,
+                grouping: ProgramGrouping::ParentAtomic,
+                completion: ProgramCompletion::PageableOnly,
+                exposure: ProgramExposure::Explicit,
+            })
+        }
+
+        fn dispatch(&self, _state: &Self::State) -> DispatchClass {
+            unreachable!("planning-only conditional ParentAtomic fixture was executed")
+        }
+
+        fn progress(&self, _state: &Self::State) -> Self::Rank {
+            unreachable!("planning-only conditional ParentAtomic fixture was executed")
+        }
+
+        fn seed_typed(
+            &self,
+            _batch: ProgramSeedBatch<'_>,
+            _effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
+        ) {
+            unreachable!("planning-only conditional ParentAtomic fixture was executed")
+        }
+
+        fn step_typed(
+            &self,
+            _states: &mut Vec<Self::State>,
+            _batch: TypedProgramBatch<'_>,
+            _effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
+        ) {
+            unreachable!("planning-only conditional ParentAtomic fixture was executed")
+        }
+    }
+
+    impl Constraint<'static> for ConditionalParentAtomicProgramLeaf {
         fn variables(&self) -> VariableSet {
             VariableSet::new_singleton(self.variable)
                 .union(VariableSet::new_singleton(self.required))
@@ -14681,15 +14733,8 @@ mod tests {
         ) {
         }
 
-        fn residual_confirm_is_page_local(&self) -> bool {
-            true
-        }
-
-        fn residual_delta_confirm_grouping_requirements(
-            &self,
-            variable: VariableId,
-        ) -> Option<VariableSet> {
-            (variable == self.variable).then_some(VariableSet::new_singleton(self.required))
+        fn residual_program(&self) -> Option<ProgramRef<'_>> {
+            Some(ProgramRef::new(self))
         }
     }
 
@@ -15295,9 +15340,9 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
-    struct DecliningProgramGroupedCapabilityLeaf(GroupedCapabilityLeaf);
+    struct DecliningProgramCapabilityLeaf(CapabilityLeaf);
 
-    impl Constraint<'static> for DecliningProgramGroupedCapabilityLeaf {
+    impl Constraint<'static> for DecliningProgramCapabilityLeaf {
         fn variables(&self) -> VariableSet {
             self.0.variables()
         }
@@ -15329,20 +15374,8 @@ mod tests {
             self.0.confirm(variable, view, candidates)
         }
 
-        fn residual_confirm_is_page_local(&self) -> bool {
-            self.0.residual_confirm_is_page_local()
-        }
-
         fn residual_program(&self) -> Option<ProgramRef<'_>> {
             Some(ProgramRef::new(&DECLINING_PROGRAM))
-        }
-
-        fn residual_delta_confirm_grouping_requirements(
-            &self,
-            variable: VariableId,
-        ) -> Option<VariableSet> {
-            self.0
-                .residual_delta_confirm_grouping_requirements(variable)
         }
     }
 
@@ -15475,10 +15508,6 @@ mod tests {
             self.ordinary_confirms.fetch_add(1, Ordering::Relaxed);
             let accepted = self.accepted;
             candidates.retain(|_, value| *value == accepted);
-        }
-
-        fn residual_confirm_is_page_local(&self) -> bool {
-            true
         }
 
         fn residual_program(&self) -> Option<ProgramRef<'_>> {
@@ -15695,16 +15724,13 @@ mod tests {
     }
 
     #[test]
-    fn declined_program_route_preserves_grouped_confirm_capability() {
-        let leaf = DecliningProgramGroupedCapabilityLeaf(GroupedCapabilityLeaf(CapabilityLeaf {
-            variable: 0,
-            page_local: true,
-        }));
+    fn declined_program_route_does_not_invent_an_activation_reuse_barrier() {
+        let leaf = DecliningProgramCapabilityLeaf(CapabilityLeaf { variable: 0 });
 
         assert_eq!(
-            compile_grouped_delta_confirm_requirements(&leaf, ProgramScope::All).as_ref(),
-            &[(0, VariableSet::new_empty())],
-            "declining Confirm must leave the legacy grouping contract visible"
+            compile_parent_atomic_program_confirms(&leaf, ProgramScope::All).as_ref(),
+            &[],
+            "only a selected typed route may retain a parent activation"
         );
     }
 
@@ -17425,10 +17451,6 @@ mod tests {
                 candidates.retain(|_, value| *value == accepted);
             }
         }
-
-        fn residual_confirm_is_page_local(&self) -> bool {
-            true
-        }
     }
 
     #[derive(Clone)]
@@ -17476,21 +17498,17 @@ mod tests {
             let parity = self.parity;
             candidates.retain(|_, value| value[0] & 1 == parity);
         }
-
-        fn residual_confirm_is_page_local(&self) -> bool {
-            true
-        }
     }
 
     #[derive(Clone)]
-    struct WholeGroupFilterLeaf {
+    struct PerRowFilterLeaf {
         variable: VariableId,
         estimate: usize,
         accepted: RawInline,
         calls: Arc<Mutex<Vec<usize>>>,
     }
 
-    impl Constraint<'static> for WholeGroupFilterLeaf {
+    impl Constraint<'static> for PerRowFilterLeaf {
         fn variables(&self) -> VariableSet {
             VariableSet::new_singleton(self.variable)
         }
@@ -18010,10 +18028,6 @@ mod tests {
                 candidates.retain(|_, value| *value == accepted);
             }
         }
-
-        fn residual_confirm_is_page_local(&self) -> bool {
-            true
-        }
     }
 
     #[derive(Clone, Copy)]
@@ -18494,6 +18508,20 @@ mod tests {
         let mut value = [0; 32];
         value[0] = byte;
         value
+    }
+
+    fn assert_candidate_page_partition(calls: &Arc<Mutex<Vec<usize>>>, expected_total: usize) {
+        let calls = calls.lock().unwrap();
+        assert!(!calls.is_empty(), "the confirmer was never called");
+        assert!(
+            calls.iter().all(|&page| page > 0),
+            "the confirmer received an empty diagnostic page: {calls:?}"
+        );
+        assert_eq!(
+            calls.iter().sum::<usize>(),
+            expected_total,
+            "candidate page shape is physical, but each admitted occurrence must be seen once"
+        );
     }
 
     #[test]
@@ -20782,10 +20810,7 @@ mod tests {
 
     #[test]
     fn synthetic_formula_repeated_occurrences_have_distinct_action_sites() {
-        let shared = Arc::new(CapabilityLeaf {
-            variable: 0,
-            page_local: true,
-        });
+        let shared = Arc::new(CapabilityLeaf { variable: 0 });
         let root = IntersectionConstraint::new(vec![shared.clone(), shared]);
         let plan = ResidualPlan::compile_lowering(
             &root,
@@ -21000,19 +21025,10 @@ mod tests {
         let lowering = ResidualLowering::FULL;
 
         let linear_root = IntersectionConstraint::new(vec![
-            Box::new(CapabilityLeaf {
-                variable: 0,
-                page_local: false,
-            }) as ShapeConstraint,
+            Box::new(CapabilityLeaf { variable: 0 }) as ShapeConstraint,
             shape_and(vec![
-                Box::new(CapabilityLeaf {
-                    variable: 0,
-                    page_local: true,
-                }),
-                Box::new(CapabilityLeaf {
-                    variable: 0,
-                    page_local: true,
-                }),
+                Box::new(CapabilityLeaf { variable: 0 }),
+                Box::new(CapabilityLeaf { variable: 0 }),
             ]),
         ]);
         let linear_plan = ResidualPlan::compile_lowering(&linear_root, lowering);
@@ -21031,59 +21047,46 @@ mod tests {
         assert_eq!(
             linear_plan.formula_proposal_streamability(&linear_action, VariableSet::new_empty(),),
             FormulaProposalStreamability::Linear,
-            "the focused proposer itself need not be a page-local confirmer"
+            "ordinary weak confirmations form a relational continuation"
         );
 
-        let non_local_root = IntersectionConstraint::new(vec![
-            Box::new(CapabilityLeaf {
-                variable: 0,
-                page_local: false,
-            }) as ShapeConstraint,
-            Box::new(CapabilityLeaf {
-                variable: 0,
-                page_local: false,
-            }),
+        let ordinary_root = IntersectionConstraint::new(vec![
+            Box::new(CapabilityLeaf { variable: 0 }) as ShapeConstraint,
+            Box::new(CapabilityLeaf { variable: 0 }),
         ]);
-        let non_local_plan = ResidualPlan::compile_lowering(&non_local_root, lowering);
-        let non_local_action = non_local_plan
+        let ordinary_plan = ResidualPlan::compile_lowering(&ordinary_root, lowering);
+        let ordinary_action = ordinary_plan
             .finite_formula
-            .select_child_as_action(&start(&non_local_plan), 0);
+            .select_child_as_action(&start(&ordinary_plan), 0);
         assert_eq!(
-            non_local_plan
-                .formula_proposal_streamability(&non_local_action, VariableSet::new_empty(),),
+            ordinary_plan
+                .formula_proposal_streamability(&ordinary_action, VariableSet::new_empty(),),
+            FormulaProposalStreamability::Linear,
+            "ordinary confirmation no longer needs a page-homomorphism capability"
+        );
+
+        let activation_reuse_root = IntersectionConstraint::new(vec![
+            Box::new(CapabilityLeaf { variable: 0 }) as ShapeConstraint,
+            Box::new(ParentAtomicProgramLeaf(CapabilityLeaf { variable: 0 })),
+        ]);
+        let activation_reuse_plan =
+            ResidualPlan::compile_lowering(&activation_reuse_root, lowering);
+        let activation_reuse_action = activation_reuse_plan
+            .finite_formula
+            .select_child_as_action(&start(&activation_reuse_plan), 0);
+        assert_eq!(
+            activation_reuse_plan.formula_proposal_streamability(
+                &activation_reuse_action,
+                VariableSet::new_empty(),
+            ),
             FormulaProposalStreamability::Barrier(
-                FormulaProposalStreamBarrier::NonPageLocalConfirm
+                FormulaProposalStreamBarrier::ActivationReuse
             )
         );
 
-        let grouped_root = IntersectionConstraint::new(vec![
-            Box::new(CapabilityLeaf {
-                variable: 0,
-                page_local: false,
-            }) as ShapeConstraint,
-            Box::new(GroupedCapabilityLeaf(CapabilityLeaf {
-                variable: 0,
-                page_local: true,
-            })),
-        ]);
-        let grouped_plan = ResidualPlan::compile_lowering(&grouped_root, lowering);
-        let grouped_action = grouped_plan
-            .finite_formula
-            .select_child_as_action(&start(&grouped_plan), 0);
-        assert_eq!(
-            grouped_plan.formula_proposal_streamability(&grouped_action, VariableSet::new_empty(),),
-            FormulaProposalStreamability::Barrier(FormulaProposalStreamBarrier::GroupedConfirm)
-        );
-
         let union = UnionConstraint::new(vec![
-            Box::new(CapabilityLeaf {
-                variable: 0,
-                page_local: true,
-            }) as ShapeConstraint,
-            Box::new(CapabilityLeaf {
-                variable: 0,
-                page_local: true,
-            }),
+            Box::new(CapabilityLeaf { variable: 0 }) as ShapeConstraint,
+            Box::new(CapabilityLeaf { variable: 0 }),
         ]);
         let union_plan = ResidualPlan::compile_lowering(&union, lowering);
         let union_action = union_plan
@@ -21109,13 +21112,10 @@ mod tests {
     }
 
     #[test]
-    fn formula_grouped_confirm_capability_depends_on_bound_schema() {
+    fn formula_activation_reuse_barrier_depends_on_selected_program_route() {
         let root = IntersectionConstraint::new(vec![
-            Box::new(CapabilityLeaf {
-                variable: 0,
-                page_local: false,
-            }) as ShapeConstraint,
-            Box::new(ConditionalGroupedCapabilityLeaf {
+            Box::new(CapabilityLeaf { variable: 0 }) as ShapeConstraint,
+            Box::new(ConditionalParentAtomicProgramLeaf {
                 variable: 0,
                 required: 1,
             }),
@@ -21133,12 +21133,12 @@ mod tests {
         assert_eq!(
             plan.formula_proposal_streamability(&action, VariableSet::new_empty()),
             FormulaProposalStreamability::Linear,
-            "an unmet grouping prerequisite leaves the continuation pageable"
+            "an unselected route leaves the ordinary continuation pageable"
         );
         assert_eq!(
             plan.formula_proposal_streamability(&action, VariableSet::new_singleton(1)),
-            FormulaProposalStreamability::Barrier(FormulaProposalStreamBarrier::GroupedConfirm),
-            "binding the prerequisite restores the parent-atomic barrier"
+            FormulaProposalStreamability::Barrier(FormulaProposalStreamBarrier::ActivationReuse),
+            "selecting ParentAtomic retains the complete activation"
         );
     }
 
@@ -21166,8 +21166,7 @@ mod tests {
         assert_eq!(
             program.node(children[0]).capabilities,
             FormulaNodeCapabilities {
-                confirm_page_local: false,
-                grouped_delta_confirm_requirements: Box::new([]),
+                parent_atomic_program_confirms: Box::new([]),
             }
         );
 
@@ -23458,22 +23457,16 @@ mod tests {
     }
 
     #[test]
-    fn paging_begins_only_after_atomic_remaining_confirms_are_checked() {
+    fn paging_waits_only_for_selected_parent_atomic_program_reuse() {
         let root = IntersectionConstraint::new(vec![
-            CapabilityLeaf {
-                variable: 0,
-                page_local: false,
-            },
-            CapabilityLeaf {
-                variable: 0,
-                page_local: false,
-            },
-            CapabilityLeaf {
-                variable: 0,
-                page_local: true,
-            },
+            Box::new(CapabilityLeaf { variable: 0 }) as ShapeConstraint,
+            Box::new(ParentAtomicProgramLeaf(CapabilityLeaf { variable: 0 })),
+            Box::new(CapabilityLeaf { variable: 0 }),
         ]);
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_lowering(
+            &root,
+            ResidualLowering::new(FormulaScope::OpaqueLeaves, ProgramScope::All),
+        );
         let formula_pcs = FormulaPcInterner::default();
         let mut relevant = ChildSet::empty(plan.len());
         relevant.insert(0);
@@ -23481,7 +23474,7 @@ mod tests {
         relevant.insert(2);
         let mut proposer_checked = ChildSet::empty(plan.len());
         proposer_checked.insert(0);
-        let before_atomic = StateDesc {
+        let before_reuse = StateDesc {
             bound: VariableSet::new_empty(),
             phase: ResidualPhase::Candidate {
                 variable: 0,
@@ -23489,14 +23482,14 @@ mod tests {
                 checked: proposer_checked.clone(),
             },
         };
-        assert!(!before_atomic.uses_candidate_pages(&plan, &formula_pcs));
+        assert!(!before_reuse.uses_candidate_pages(&plan, &formula_pcs));
         assert!(!candidate_payload_is_set_admitted(
-            &before_atomic,
+            &before_reuse,
             &plan,
             &formula_pcs
         ));
 
-        let after_atomic = StateDesc {
+        let after_reuse = StateDesc {
             bound: VariableSet::new_empty(),
             phase: ResidualPhase::Candidate {
                 variable: 0,
@@ -23504,10 +23497,10 @@ mod tests {
                 checked: proposer_checked.with_inserted(1),
             },
         };
-        assert!(after_atomic.uses_candidate_pages(&plan, &formula_pcs));
+        assert!(after_reuse.uses_candidate_pages(&plan, &formula_pcs));
         assert!(crosses_candidate_set_boundary(
-            &before_atomic,
-            &after_atomic,
+            &before_reuse,
+            &after_reuse,
             &plan,
             &formula_pcs
         ));
@@ -23526,7 +23519,7 @@ mod tests {
             &formula_pcs
         ));
         assert!(!crosses_candidate_set_boundary(
-            &after_atomic,
+            &after_reuse,
             &fully_checked,
             &plan,
             &formula_pcs
@@ -23573,10 +23566,7 @@ mod tests {
 
     #[test]
     fn continuation_publication_receipt_recognizes_exact_terminal_commit() {
-        let root = CapabilityLeaf {
-            variable: 0,
-            page_local: true,
-        };
+        let root = CapabilityLeaf { variable: 0 };
         let plan = ResidualPlan::compile(&root);
         let formula_pcs = FormulaPcInterner::default();
         let (previous, successor) =
@@ -23596,45 +23586,30 @@ mod tests {
     }
 
     #[test]
-    fn continuation_publication_receipt_requires_the_candidate_set_boundary() {
-        let page_local_root = IntersectionConstraint::new(vec![
-            Box::new(CapabilityLeaf {
-                variable: 0,
-                page_local: false,
-            }) as ShapeConstraint,
-            Box::new(CapabilityLeaf {
-                variable: 0,
-                page_local: true,
-            }),
+    fn continuation_publication_receipt_tracks_relational_successors_not_boundary_crossings() {
+        let root = IntersectionConstraint::new(vec![
+            Box::new(CapabilityLeaf { variable: 0 }) as ShapeConstraint,
+            Box::new(CapabilityLeaf { variable: 0 }),
             shape_leaf(1),
         ]);
-        let page_local_plan = ResidualPlan::compile(&page_local_root);
+        let plan = ResidualPlan::compile(&root);
         let formula_pcs = FormulaPcInterner::default();
-        let (previous, successor) = exact_confirm_transition(
-            &page_local_plan,
-            0,
-            &[0, 1],
-            &[],
-            0,
-            VariableSet::new_empty(),
-        );
+        let (previous, successor) =
+            exact_confirm_transition(&plan, 0, &[0, 1], &[], 0, VariableSet::new_empty());
         assert_eq!(
             continuation_publication_receipt(
                 &previous,
                 &successor,
-                page_local_root.variables(),
-                &page_local_plan,
+                root.variables(),
+                &plan,
                 &formula_pcs,
             ),
-            ContinuationPublicationReceipt::ChunkHomomorphic,
-            "checking the atomic confirmer exposes a page-local remaining suffix",
+            ContinuationPublicationReceipt::RelationalPrefix,
+            "the exact successor is a SET-admitted relational continuation",
         );
 
         let fully_checked_root = IntersectionConstraint::new(vec![
-            Box::new(CapabilityLeaf {
-                variable: 0,
-                page_local: false,
-            }) as ShapeConstraint,
+            Box::new(CapabilityLeaf { variable: 0 }) as ShapeConstraint,
             shape_leaf(1),
         ]);
         let fully_checked_plan = ResidualPlan::compile(&fully_checked_root);
@@ -23654,24 +23629,13 @@ mod tests {
                 &fully_checked_plan,
                 &formula_pcs,
             ),
-            ContinuationPublicationReceipt::ChunkHomomorphic,
+            ContinuationPublicationReceipt::RelationalPrefix,
             "a fully checked candidate becomes an independent nonterminal parent row",
         );
 
-        let already_pageable_root = IntersectionConstraint::new(vec![
-            Box::new(CapabilityLeaf {
-                variable: 0,
-                page_local: true,
-            }) as ShapeConstraint,
-            Box::new(CapabilityLeaf {
-                variable: 0,
-                page_local: true,
-            }),
-            shape_leaf(1),
-        ]);
-        let already_pageable_plan = ResidualPlan::compile(&already_pageable_root);
+        let already_relational_plan = ResidualPlan::compile(&root);
         let (previous, successor) = exact_confirm_transition(
-            &already_pageable_plan,
+            &already_relational_plan,
             0,
             &[0, 1],
             &[],
@@ -23682,32 +23646,29 @@ mod tests {
             continuation_publication_receipt(
                 &previous,
                 &successor,
-                already_pageable_root.variables(),
-                &already_pageable_plan,
+                root.variables(),
+                &already_relational_plan,
                 &formula_pcs,
             ),
-            ContinuationPublicationReceipt::Barrier,
-            "the receipt names the boundary crossing, not arbitrary work after it",
+            ContinuationPublicationReceipt::RelationalPrefix,
+            "later confirmations retain the same relational-prefix receipt",
         );
     }
 
     #[test]
-    fn continuation_publication_receipt_barriers_atomic_and_control_work() {
-        let non_local_root = IntersectionConstraint::new(vec![
-            Box::new(CapabilityLeaf {
-                variable: 0,
-                page_local: false,
-            }) as ShapeConstraint,
-            Box::new(CapabilityLeaf {
-                variable: 0,
-                page_local: false,
-            }),
+    fn continuation_publication_receipt_barriers_activation_reuse_and_control_work() {
+        let formula_pcs = FormulaPcInterner::default();
+        let activation_reuse_root = IntersectionConstraint::new(vec![
+            Box::new(CapabilityLeaf { variable: 0 }) as ShapeConstraint,
+            Box::new(ParentAtomicProgramLeaf(CapabilityLeaf { variable: 0 })),
             shape_leaf(1),
         ]);
-        let non_local_plan = ResidualPlan::compile(&non_local_root);
-        let formula_pcs = FormulaPcInterner::default();
+        let activation_reuse_plan = ResidualPlan::compile_lowering(
+            &activation_reuse_root,
+            ResidualLowering::new(FormulaScope::OpaqueLeaves, ProgramScope::All),
+        );
         let (previous, successor) = exact_confirm_transition(
-            &non_local_plan,
+            &activation_reuse_plan,
             0,
             &[0, 1],
             &[],
@@ -23718,41 +23679,12 @@ mod tests {
             continuation_publication_receipt(
                 &previous,
                 &successor,
-                non_local_root.variables(),
-                &non_local_plan,
+                activation_reuse_root.variables(),
+                &activation_reuse_plan,
                 &formula_pcs,
             ),
             ContinuationPublicationReceipt::Barrier,
-            "a non-page-local remaining confirmer keeps the parent private",
-        );
-
-        let grouped_root = IntersectionConstraint::new(vec![
-            Box::new(CapabilityLeaf {
-                variable: 0,
-                page_local: false,
-            }) as ShapeConstraint,
-            Box::new(GroupedCapabilityLeaf(CapabilityLeaf {
-                variable: 0,
-                page_local: true,
-            })),
-            shape_leaf(1),
-        ]);
-        let grouped_plan = ResidualPlan::compile_lowering(
-            &grouped_root,
-            ResidualLowering::new(FormulaScope::OpaqueLeaves, ProgramScope::All),
-        );
-        let (previous, successor) =
-            exact_confirm_transition(&grouped_plan, 0, &[0, 1], &[], 0, VariableSet::new_empty());
-        assert_eq!(
-            continuation_publication_receipt(
-                &previous,
-                &successor,
-                grouped_root.variables(),
-                &grouped_plan,
-                &formula_pcs,
-            ),
-            ContinuationPublicationReceipt::Barrier,
-            "a grouped remaining confirmer keeps the parent private",
+            "a selected ParentAtomic route keeps the activation private",
         );
 
         let formula_root = UnionConstraint::new(vec![shape_leaf(0), shape_leaf(0)]);
@@ -23802,16 +23734,16 @@ mod tests {
             bound: successor.bound,
             phase: ResidualPhase::Candidate {
                 variable: 0,
-                relevant: ChildSet::empty(grouped_plan.len()).with_inserted(0),
-                checked: ChildSet::empty(grouped_plan.len()).with_inserted(0),
+                relevant: ChildSet::empty(activation_reuse_plan.len()).with_inserted(0),
+                checked: ChildSet::empty(activation_reuse_plan.len()).with_inserted(0),
             },
         };
         assert_eq!(
             continuation_publication_receipt(
                 &previous,
                 &malformed_control,
-                grouped_root.variables(),
-                &grouped_plan,
+                activation_reuse_root.variables(),
+                &activation_reuse_plan,
                 &formula_pcs,
             ),
             ContinuationPublicationReceipt::Barrier,
@@ -23822,18 +23754,9 @@ mod tests {
     #[test]
     fn formula_and_live_filing_set_admits_parent_local_candidates() {
         let root = IntersectionConstraint::new(vec![
-            Box::new(CapabilityLeaf {
-                variable: 0,
-                page_local: false,
-            }) as ShapeConstraint,
-            Box::new(CapabilityLeaf {
-                variable: 0,
-                page_local: true,
-            }),
-            Box::new(CapabilityLeaf {
-                variable: 0,
-                page_local: true,
-            }),
+            Box::new(CapabilityLeaf { variable: 0 }) as ShapeConstraint,
+            Box::new(CapabilityLeaf { variable: 0 }),
+            Box::new(CapabilityLeaf { variable: 0 }),
         ]);
         let plan = ResidualPlan::compile_lowering(
             &root,
@@ -24054,16 +23977,10 @@ mod tests {
     }
 
     #[test]
-    fn formula_outer_candidate_return_set_admits_before_commit() {
+    fn formula_outer_candidate_return_reuses_the_pre_admitted_relation() {
         let root = IntersectionConstraint::new(vec![
-            Box::new(CapabilityLeaf {
-                variable: 0,
-                page_local: false,
-            }) as ShapeConstraint,
-            Box::new(CapabilityLeaf {
-                variable: 0,
-                page_local: false,
-            }),
+            Box::new(CapabilityLeaf { variable: 0 }) as ShapeConstraint,
+            Box::new(CapabilityLeaf { variable: 0 }),
         ]);
         let plan = ResidualPlan::compile_lowering(
             &root,
@@ -24111,7 +24028,7 @@ mod tests {
                 checked: relevant,
             },
         };
-        assert!(crosses_candidate_set_boundary(
+        assert!(!crosses_candidate_set_boundary(
             &previous,
             &outer,
             &plan,
@@ -24125,19 +24042,12 @@ mod tests {
             },
             candidates: candidate_payload(
                 2,
-                vec![
-                    (0, raw(4)),
-                    (0, raw(5)),
-                    (0, raw(4)),
-                    (1, raw(4)),
-                    (1, raw(6)),
-                    (1, raw(4)),
-                ],
+                vec![(0, raw(5)), (0, raw(4)), (1, raw(6)), (1, raw(4))],
             ),
         };
         let mut worklist = Worklist::new();
         let mut stats = ResidualStateStats {
-            candidates_confirmed: 6,
+            candidates_confirmed: 4,
             ..ResidualStateStats::default()
         };
         let mut reducer_seeds = Vec::new();
@@ -24166,14 +24076,7 @@ mod tests {
             [(0, raw(5)), (0, raw(4)), (1, raw(6)), (1, raw(4)),],
         );
 
-        let raw_occurrences = vec![
-            (0, raw(4)),
-            (0, raw(5)),
-            (0, raw(4)),
-            (1, raw(4)),
-            (1, raw(6)),
-            (1, raw(4)),
-        ];
+        let raw_occurrences = vec![(0, raw(5)), (0, raw(4)), (1, raw(6)), (1, raw(4))];
         let deferred = CandidateBatch {
             parents: RowBatch {
                 rows: Vec::new(),
@@ -24183,7 +24086,7 @@ mod tests {
         };
         let mut deferred_worklist = Worklist::new();
         let mut deferred_seeds = Vec::new();
-        assert!(finish_formula_candidate_transition(
+        let deferred_continuation = finish_formula_candidate_transition(
             &plan,
             &previous,
             exit,
@@ -24193,45 +24096,35 @@ mod tests {
             &mut stats,
             &mut deferred_seeds,
         )
-        .is_none());
+        .expect("an already admitted segmented relation should file directly");
         assert!(
-            deferred_worklist.is_empty(),
-            "a segmented outer result was filed before SET admission"
+            deferred_seeds.is_empty(),
+            "an already admitted relation must not open redundant SET admission"
         );
-        let [FormulaReducerSeed::SetAdmit(SetAdmissionSeed {
-            successor: queued,
-            destination: SetAdmissionDestination::Candidate(queued_batch),
-        })] = deferred_seeds.as_slice()
+        assert_eq!(interner.get(deferred_continuation.state), &outer);
+        let StateBucket::Candidates(queued_batch) = deferred_worklist
+            .get(&deferred_continuation.rank)
+            .and_then(|level| level.get(&deferred_continuation.state))
+            .expect("the deferred relation was not filed")
         else {
-            panic!("the deferred outer boundary did not queue one exact SET admission")
+            panic!("the deferred relation changed payload shape")
         };
-        assert_eq!(queued, &outer);
-        assert!(matches!(
-            queued_batch.candidates,
-            CandidatePayload::Deferred(_)
-        ));
         assert_eq!(
             queued_batch.candidates.iter().collect::<Vec<_>>(),
             raw_occurrences,
-            "queueing bounded admission must not compact or mutate its occurrence rope",
+            "filing must not mutate the pre-admitted occurrence rope",
         );
         assert_eq!(
-            stats.candidates_confirmed, 6,
-            "SET admission must not rewrite raw Formula action telemetry",
+            stats.candidates_confirmed, 4,
+            "filing must not rewrite raw Formula action telemetry",
         );
     }
 
     #[test]
-    fn page_local_candidate_state_uses_candidate_occupancy_and_keeps_remainder_live() {
+    fn relational_candidate_state_uses_candidate_occupancy_and_keeps_remainder_live() {
         let root = IntersectionConstraint::new(vec![
-            CapabilityLeaf {
-                variable: 0,
-                page_local: false,
-            },
-            CapabilityLeaf {
-                variable: 0,
-                page_local: true,
-            },
+            CapabilityLeaf { variable: 0 },
+            CapabilityLeaf { variable: 0 },
         ]);
         let plan = ResidualPlan::compile(&root);
         let formula_pcs = FormulaPcInterner::default();
@@ -24266,7 +24159,7 @@ mod tests {
 
         let task = machine
             .take_next_with_plan(&plan, 2)
-            .expect("page-local candidates are live");
+            .expect("relational candidates are live");
         assert_eq!(task.state, token.state);
         assert_eq!(task.desc, desc);
         let StateBucket::Candidates(page) = task.bucket else {
@@ -24291,14 +24184,8 @@ mod tests {
         const PARENT: VariableId = 0;
         const VARIABLE: VariableId = 1;
         let root = IntersectionConstraint::new(vec![
-            CapabilityLeaf {
-                variable: VARIABLE,
-                page_local: false,
-            },
-            CapabilityLeaf {
-                variable: VARIABLE,
-                page_local: true,
-            },
+            CapabilityLeaf { variable: VARIABLE },
+            CapabilityLeaf { variable: VARIABLE },
         ]);
         let plan = ResidualPlan::compile(&root);
         let interner = StateInterner::default();
@@ -24399,23 +24286,23 @@ mod tests {
             })
         );
 
-        let atomic_plan = ResidualPlan::compile(&IntersectionConstraint::new(vec![
-            CapabilityLeaf {
+        let atomic_root = IntersectionConstraint::new(vec![
+            Box::new(CapabilityLeaf { variable: VARIABLE }) as ShapeConstraint,
+            Box::new(ParentAtomicProgramLeaf(CapabilityLeaf {
                 variable: VARIABLE,
-                page_local: false,
-            },
-            CapabilityLeaf {
-                variable: VARIABLE,
-                page_local: false,
-            },
-        ]));
+            })),
+        ]);
+        let atomic_plan = ResidualPlan::compile_lowering(
+            &atomic_root,
+            ResidualLowering::new(FormulaScope::OpaqueLeaves, ProgramScope::All),
+        );
         assert_eq!(
             confirm
                 .action_task(&atomic_plan, &interner)
                 .expect("the same concrete confirmation remains actionable")
                 .action_atoms,
             2,
-            "whole-parent confirmations quote parent rows, not occurrences"
+            "ParentAtomic activation reuse quotes parent rows, not occurrences"
         );
 
         let ready = SelectedResidualTask {
@@ -25073,7 +24960,7 @@ mod tests {
     }
 
     #[test]
-    fn residual_shadow_reports_whole_group_confirm_geometry_with_bound_schema() {
+    fn residual_shadow_reports_paged_confirm_geometry_with_bound_schema() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let root = IntersectionConstraint::new(vec![
             Box::new(FanoutLeaf {
@@ -25084,7 +24971,7 @@ mod tests {
                 variable: 1,
                 values: Arc::new(vec![raw(8), raw(9)]),
             }) as ShapeConstraint,
-            Box::new(WholeGroupFilterLeaf {
+            Box::new(PerRowFilterLeaf {
                 variable: 1,
                 estimate: 65,
                 accepted: raw(8),
@@ -25108,11 +24995,11 @@ mod tests {
             .events
             .iter()
             .find(|event| event.site.verb == ActionVerb::Confirm && event.site.variable == 1)
-            .expect("whole-group filtering was observed");
+            .expect("paged filtering was observed");
         assert_eq!(confirmation.site.bound, VariableSet::new_singleton(0));
         assert_eq!(confirmation.geometry.parent_rows, 1);
         assert_eq!(confirmation.geometry.candidate_occurrences, 2);
-        assert_eq!(confirmation.geometry.action_atoms, 1);
+        assert_eq!(confirmation.geometry.action_atoms, 2);
     }
 
     #[test]
@@ -25445,7 +25332,7 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_root_formula_grows_page_local_misses_geometrically() {
+    fn synthetic_root_formula_grows_candidate_page_misses_geometrically() {
         for (accepted, expected) in [(raw(0), Some(raw(0))), (raw(255), None)] {
             let (result, first_calls, second_calls, stats, width) =
                 root_formula_paged_filter_first_trace(accepted);
@@ -25874,64 +25761,71 @@ mod tests {
     }
 
     #[test]
-    fn whole_group_filter_runs_atomically_before_page_local_suffix() {
-        let whole_calls = Arc::new(Mutex::new(Vec::new()));
-        let page_calls = Arc::new(Mutex::new(Vec::new()));
-        let make = || {
+    fn ordinary_filters_page_the_admitted_relation_before_the_suffix() {
+        let per_row_calls = Arc::new(Mutex::new(Vec::new()));
+        let suffix_calls = Arc::new(Mutex::new(Vec::new()));
+        let make = |per_row_calls: Arc<Mutex<Vec<usize>>>, suffix_calls: Arc<Mutex<Vec<usize>>>| {
             IntersectionConstraint::new(vec![
                 Box::new(FanoutLeaf {
                     variable: 0,
                     values: Arc::new(vec![raw(3), raw(1), raw(1), raw(2)]),
                 }) as ShapeConstraint,
-                Box::new(WholeGroupFilterLeaf {
+                Box::new(PerRowFilterLeaf {
                     variable: 0,
                     estimate: 5,
                     accepted: raw(1),
-                    calls: Arc::clone(&whole_calls),
+                    calls: per_row_calls,
                 }) as ShapeConstraint,
                 Box::new(PageFilterLeaf {
                     variable: 0,
                     estimate: 6,
                     accepted: None,
-                    calls: Arc::clone(&page_calls),
+                    calls: suffix_calls,
                 }) as ShapeConstraint,
             ])
         };
         let project = |binding: &Binding| binding.get(0).copied();
-        let mut residual: Vec<_> = Query::new(make(), project)
-            .solve_residual_state_lazy()
-            .cap(1)
-            .collect();
-        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
+        let mut residual: Vec<_> = Query::new(
+            make(Arc::clone(&per_row_calls), Arc::clone(&suffix_calls)),
+            project,
+        )
+        .solve_residual_state_lazy()
+        .cap(1)
+        .collect();
+        let mut sequential: Vec<_> = Query::new(
+            make(
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(Mutex::new(Vec::new())),
+            ),
+            project,
+        )
+        .sequential()
+        .collect();
         residual.sort_unstable();
         sequential.sort_unstable();
         assert_eq!(residual, [raw(1)]);
         assert_eq!(residual, sequential);
-        assert_eq!(*whole_calls.lock().unwrap(), [4, 4, 2]);
-        assert_eq!(
-            *page_calls.lock().unwrap(),
-            [1, 2, 2],
-            "the whole-group filter sees four raw occurrences before the page-local suffix sees its admitted relation"
-        );
+        assert_candidate_page_partition(&per_row_calls, 3);
+        assert_candidate_page_partition(&suffix_calls, 1);
 
-        let synthetic_whole_calls = Arc::new(Mutex::new(Vec::new()));
-        let synthetic_page_calls = Arc::new(Mutex::new(Vec::new()));
+        let synthetic_per_row_calls = Arc::new(Mutex::new(Vec::new()));
+        let synthetic_suffix_calls = Arc::new(Mutex::new(Vec::new()));
         let synthetic_root = IntersectionConstraint::new(vec![
             Box::new(FanoutLeaf {
                 variable: 0,
                 values: Arc::new(vec![raw(3), raw(1), raw(1), raw(2)]),
             }) as ShapeConstraint,
-            Box::new(WholeGroupFilterLeaf {
+            Box::new(PerRowFilterLeaf {
                 variable: 0,
                 estimate: 5,
                 accepted: raw(1),
-                calls: Arc::clone(&synthetic_whole_calls),
+                calls: Arc::clone(&synthetic_per_row_calls),
             }) as ShapeConstraint,
             Box::new(PageFilterLeaf {
                 variable: 0,
                 estimate: 6,
                 accepted: None,
-                calls: Arc::clone(&synthetic_page_calls),
+                calls: Arc::clone(&synthetic_suffix_calls),
             }) as ShapeConstraint,
         ]);
         let mut synthetic: Vec<_> = Query::new(synthetic_root, project)
@@ -25943,32 +25837,30 @@ mod tests {
             .collect();
         synthetic.sort_unstable();
         assert_eq!(synthetic, residual);
-        assert_eq!(*synthetic_whole_calls.lock().unwrap(), [4]);
-        assert_eq!(
-            *synthetic_page_calls.lock().unwrap(),
-            [1],
-            "the Formula whole-group action preserves its raw bag, then admits the relation before the page-local suffix",
-        );
+        assert_candidate_page_partition(&synthetic_per_row_calls, 3);
+        assert_candidate_page_partition(&synthetic_suffix_calls, 1);
     }
 
     #[test]
-    fn opaque_union_reconfirms_the_admitted_set_before_page_local_suffix() {
+    fn opaque_union_pages_the_admitted_relation_before_its_suffix() {
         let left_calls = Arc::new(Mutex::new(Vec::new()));
         let right_calls = Arc::new(Mutex::new(Vec::new()));
         let suffix_calls = Arc::new(Mutex::new(Vec::new()));
-        let make = || {
+        let make = |left_calls: Arc<Mutex<Vec<usize>>>,
+                    right_calls: Arc<Mutex<Vec<usize>>>,
+                    suffix_calls: Arc<Mutex<Vec<usize>>>| {
             let union = UnionConstraint::new(vec![
                 PageFilterLeaf {
                     variable: 0,
                     estimate: 10,
                     accepted: Some(raw(0)),
-                    calls: Arc::clone(&left_calls),
+                    calls: left_calls,
                 },
                 PageFilterLeaf {
                     variable: 0,
                     estimate: 10,
                     accepted: Some(raw(1)),
-                    calls: Arc::clone(&right_calls),
+                    calls: right_calls,
                 },
             ]);
             IntersectionConstraint::new(vec![
@@ -25981,23 +25873,39 @@ mod tests {
                     variable: 0,
                     estimate: 30,
                     accepted: None,
-                    calls: Arc::clone(&suffix_calls),
+                    calls: suffix_calls,
                 }) as ShapeConstraint,
             ])
         };
         let project = |binding: &Binding| binding.get(0).copied();
-        let mut residual: Vec<_> = Query::new(make(), project)
-            .solve_residual_state_lazy()
-            .cap(1)
-            .collect();
-        let mut sequential: Vec<_> = Query::new(make(), project).sequential().collect();
+        let mut residual: Vec<_> = Query::new(
+            make(
+                Arc::clone(&left_calls),
+                Arc::clone(&right_calls),
+                Arc::clone(&suffix_calls),
+            ),
+            project,
+        )
+        .solve_residual_state_lazy()
+        .cap(1)
+        .collect();
+        let mut sequential: Vec<_> = Query::new(
+            make(
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(Mutex::new(Vec::new())),
+            ),
+            project,
+        )
+        .sequential()
+        .collect();
         residual.sort_unstable();
         sequential.sort_unstable();
         assert_eq!(residual, [raw(0), raw(1)]);
         assert_eq!(residual, sequential);
-        assert_eq!(*left_calls.lock().unwrap(), [5, 5, 2]);
-        assert_eq!(*right_calls.lock().unwrap(), [5, 5, 2]);
-        assert_eq!(*suffix_calls.lock().unwrap(), [1, 1, 2, 2]);
+        assert_candidate_page_partition(&left_calls, 3);
+        assert_candidate_page_partition(&right_calls, 3);
+        assert_candidate_page_partition(&suffix_calls, 2);
     }
 
     #[test]
@@ -26068,7 +25976,7 @@ mod tests {
     }
 
     #[test]
-    fn finite_union_confirmation_fans_out_the_immutable_original_group() {
+    fn finite_union_confirmation_fans_out_the_admitted_relation() {
         let make = |left_calls: Arc<Mutex<Vec<usize>>>, right_calls: Arc<Mutex<Vec<usize>>>| {
             let union = UnionConstraint::new(vec![
                 PageFilterLeaf {
@@ -26122,8 +26030,8 @@ mod tests {
         assert_eq!(lowered, sequential);
         assert_eq!(lowered, dag);
         assert_eq!(lowered, opaque);
-        assert_eq!(*left_calls.lock().unwrap(), [5]);
-        assert_eq!(*right_calls.lock().unwrap(), [5]);
+        assert_candidate_page_partition(&left_calls, 3);
+        assert_candidate_page_partition(&right_calls, 3);
     }
 
     #[test]
@@ -26325,10 +26233,6 @@ mod tests {
             self.inner.confirm(variable, view, candidates);
         }
 
-        fn residual_confirm_is_page_local(&self) -> bool {
-            self.inner.residual_confirm_is_page_local()
-        }
-
         fn residual_program(&self) -> Option<ProgramRef<'_>> {
             self.inner.residual_program()
         }
@@ -26437,18 +26341,6 @@ mod tests {
 
         fn influence(&self, variable: VariableId) -> VariableSet {
             self.inner.influence(variable)
-        }
-
-        fn residual_confirm_is_page_local(&self) -> bool {
-            self.inner.residual_confirm_is_page_local()
-        }
-
-        fn residual_delta_confirm_grouping_requirements(
-            &self,
-            variable: VariableId,
-        ) -> Option<VariableSet> {
-            self.inner
-                .residual_delta_confirm_grouping_requirements(variable)
         }
 
         fn residual_program(&self) -> Option<ProgramRef<'_>> {
@@ -27851,9 +27743,9 @@ mod tests {
         lowered.sort_unstable();
         assert_eq!(lowered, [raw(0), raw(2)]);
         assert_eq!(lowered, sequential);
-        assert_eq!(*first_calls.lock().unwrap(), [4]);
-        assert_eq!(*second_calls.lock().unwrap(), [1]);
-        assert_eq!(*sibling_calls.lock().unwrap(), [4]);
+        assert_candidate_page_partition(&first_calls, 4);
+        assert_candidate_page_partition(&second_calls, 1);
+        assert_candidate_page_partition(&sibling_calls, 4);
     }
 
     #[test]
@@ -27923,9 +27815,9 @@ mod tests {
         lowered.sort_unstable();
         assert_eq!(lowered, [raw(2)]);
         assert_eq!(lowered, sequential);
-        assert_eq!(*rejecting_calls.lock().unwrap(), [4]);
+        assert_candidate_page_partition(&rejecting_calls, 4);
         assert!(skipped_calls.lock().unwrap().is_empty());
-        assert_eq!(*sibling_calls.lock().unwrap(), [4]);
+        assert_candidate_page_partition(&sibling_calls, 4);
     }
 
     #[test]
@@ -28193,7 +28085,7 @@ mod tests {
     }
 
     #[test]
-    fn recursive_union_confirm_preserves_each_nested_original_fanout() {
+    fn recursive_union_confirm_preserves_each_nested_admitted_fanout() {
         let zero_calls = Arc::new(Mutex::new(Vec::new()));
         let one_calls = Arc::new(Mutex::new(Vec::new()));
         let two_calls = Arc::new(Mutex::new(Vec::new()));
@@ -28249,9 +28141,9 @@ mod tests {
         lowered.sort_unstable();
         assert_eq!(lowered, [raw(0), raw(1), raw(2)]);
         assert_eq!(lowered, sequential);
-        assert_eq!(*zero_calls.lock().unwrap(), [5]);
-        assert_eq!(*one_calls.lock().unwrap(), [5]);
-        assert_eq!(*two_calls.lock().unwrap(), [5]);
+        assert_candidate_page_partition(&zero_calls, 4);
+        assert_candidate_page_partition(&one_calls, 4);
+        assert_candidate_page_partition(&two_calls, 4);
     }
 
     #[test]
@@ -28339,7 +28231,7 @@ mod tests {
         assert_eq!(lowered.stats.propose_calls, 3);
         assert_eq!(lowered.stats.confirm_calls, 1);
         assert_eq!(opaque.stats.propose_calls, 1);
-        assert_eq!(opaque.stats.confirm_calls, 1);
+        assert_eq!(opaque.stats.confirm_calls, 2);
     }
 
     #[test]
@@ -28420,10 +28312,10 @@ mod tests {
         assert_eq!(lowered, [raw(1), raw(3)]);
         assert_eq!(lowered, sequential);
         assert_eq!(lowered, opaque);
-        assert_eq!(*zero_calls.lock().unwrap(), [4]);
-        assert_eq!(*one_calls.lock().unwrap(), [4]);
-        assert_eq!(*and_calls.lock().unwrap(), [2]);
-        assert_eq!(*outer_calls.lock().unwrap(), [4]);
+        assert_candidate_page_partition(&zero_calls, 4);
+        assert_candidate_page_partition(&one_calls, 4);
+        assert_candidate_page_partition(&and_calls, 2);
+        assert_candidate_page_partition(&outer_calls, 4);
     }
 
     #[test]
@@ -28908,7 +28800,7 @@ mod tests {
 
     #[cfg(feature = "parallel")]
     #[test]
-    fn parallel_page_local_sharding_bisects_one_parent_admitted_set() {
+    fn parallel_candidate_sharding_bisects_one_parent_admitted_set() {
         let values = vec![
             raw(0),
             raw(0),
@@ -29133,19 +29025,19 @@ mod tests {
 
     #[cfg(feature = "parallel")]
     #[test]
-    fn parallel_atomic_custom_and_union_keep_parent_run_whole() {
-        let whole_calls = Arc::new(Mutex::new(Vec::new()));
+    fn parallel_ordinary_and_union_confirmers_share_admitted_pages_safely() {
+        let per_row_calls = Arc::new(Mutex::new(Vec::new()));
         let suffix_calls = Arc::new(Mutex::new(Vec::new()));
         let custom_root = Arc::new(IntersectionConstraint::new(vec![
             parallel_shape(FanoutLeaf {
                 variable: 0,
                 values: Arc::new(vec![raw(3), raw(1), raw(1), raw(2)]),
             }),
-            parallel_shape(WholeGroupFilterLeaf {
+            parallel_shape(PerRowFilterLeaf {
                 variable: 0,
                 estimate: 5,
                 accepted: raw(1),
-                calls: Arc::clone(&whole_calls),
+                calls: Arc::clone(&per_row_calls),
             }),
             parallel_shape(PageFilterLeaf {
                 variable: 0,
@@ -29163,10 +29055,8 @@ mod tests {
         });
         custom.sort_unstable();
         assert_eq!(custom, [raw(1)]);
-        assert_eq!(*whole_calls.lock().unwrap(), [4]);
-        let mut custom_suffix = suffix_calls.lock().unwrap().clone();
-        custom_suffix.sort_unstable();
-        assert_eq!(custom_suffix, [1]);
+        assert_candidate_page_partition(&per_row_calls, 3);
+        assert_candidate_page_partition(&suffix_calls, 1);
 
         let left_calls = Arc::new(Mutex::new(Vec::new()));
         let right_calls = Arc::new(Mutex::new(Vec::new()));
@@ -29206,11 +29096,9 @@ mod tests {
         });
         union_results.sort_unstable();
         assert_eq!(union_results, [raw(0), raw(1)]);
-        assert_eq!(*left_calls.lock().unwrap(), [5]);
-        assert_eq!(*right_calls.lock().unwrap(), [5]);
-        let mut union_suffix = union_suffix_calls.lock().unwrap().clone();
-        union_suffix.sort_unstable();
-        assert_eq!(union_suffix, [1, 1]);
+        assert_candidate_page_partition(&left_calls, 3);
+        assert_candidate_page_partition(&right_calls, 3);
+        assert_candidate_page_partition(&union_suffix_calls, 2);
     }
 
     #[cfg(feature = "parallel")]
@@ -29504,14 +29392,8 @@ mod tests {
         };
 
         let candidate_root = IntersectionConstraint::new(vec![
-            CapabilityLeaf {
-                variable: 0,
-                page_local: false,
-            },
-            CapabilityLeaf {
-                variable: 0,
-                page_local: true,
-            },
+            CapabilityLeaf { variable: 0 },
+            CapabilityLeaf { variable: 0 },
         ]);
         let candidate_plan = ResidualPlan::compile(&candidate_root);
         let candidate_formula_pcs = FormulaPcInterner::default();
@@ -29588,14 +29470,8 @@ mod tests {
         assert_eq!(remainder.candidates, [(0, raw(10))]);
 
         let formula_root = IntersectionConstraint::new(vec![
-            CapabilityLeaf {
-                variable: 0,
-                page_local: false,
-            },
-            CapabilityLeaf {
-                variable: 0,
-                page_local: true,
-            },
+            CapabilityLeaf { variable: 0 },
+            CapabilityLeaf { variable: 0 },
         ]);
         let formula_plan = ResidualPlan::compile_lowering(
             &formula_root,
@@ -29706,14 +29582,8 @@ mod tests {
         const PARENT: VariableId = 0;
         const VARIABLE: VariableId = 1;
         let root = IntersectionConstraint::new(vec![
-            CapabilityLeaf {
-                variable: VARIABLE,
-                page_local: false,
-            },
-            CapabilityLeaf {
-                variable: VARIABLE,
-                page_local: true,
-            },
+            CapabilityLeaf { variable: VARIABLE },
+            CapabilityLeaf { variable: VARIABLE },
         ]);
         let plan = ResidualPlan::compile(&root);
         let formula_pcs = FormulaPcInterner::default();
@@ -30088,10 +29958,7 @@ mod tests {
 
     #[test]
     fn active_delta_seed_follows_every_exact_one_parent_activation() {
-        let root = CapabilityLeaf {
-            variable: 0,
-            page_local: true,
-        };
+        let root = CapabilityLeaf { variable: 0 };
         let plan = ResidualPlan::compile(&root);
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
         let active = machine
@@ -30171,10 +30038,7 @@ mod tests {
 
     #[test]
     fn full_action_successor_that_fills_width_returns_to_global_batching() {
-        let root = CapabilityLeaf {
-            variable: 127,
-            page_local: true,
-        };
+        let root = CapabilityLeaf { variable: 127 };
         let plan = ResidualPlan::compile(&root);
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), Search::Done);
         let successor = file(
@@ -30495,16 +30359,13 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_confirmation_set_admits_at_the_first_page_safe_successor() {
+    fn ordinary_confirmation_reuses_the_pre_admitted_candidate_relation() {
         let root = IntersectionConstraint::new(vec![
             Box::new(FanoutLeaf {
                 variable: 0,
                 values: Arc::new(vec![raw(1), raw(2), raw(1)]),
             }) as ShapeConstraint,
-            Box::new(CapabilityLeaf {
-                variable: 0,
-                page_local: false,
-            }) as ShapeConstraint,
+            Box::new(CapabilityLeaf { variable: 0 }) as ShapeConstraint,
         ]);
         let plan = ResidualPlan::compile(&root);
         let mut relevant = ChildSet::empty(plan.len());
@@ -30536,7 +30397,7 @@ mod tests {
             1,
             CandidateBatch {
                 parents: RowBatch::seed(),
-                candidates: CandidatePayload::Values(vec![raw(1), raw(2), raw(1)]),
+                candidates: CandidatePayload::Values(vec![raw(2), raw(1)]),
             },
             &mut next_activation,
             &mut worklist,
@@ -30554,20 +30415,14 @@ mod tests {
         };
 
         assert_eq!(batch.candidates, [(0, raw(2)), (0, raw(1))]);
-        assert_eq!(stats.candidates_confirmed, 3, "raw work remains charged");
+        assert_eq!(stats.candidates_confirmed, 2, "raw work remains charged");
     }
 
     #[test]
-    fn formula_confirmation_set_admits_before_page_safe_filing() {
+    fn formula_confirmation_reuses_the_pre_admitted_candidate_relation() {
         let root = IntersectionConstraint::new(vec![
-            CapabilityLeaf {
-                variable: 0,
-                page_local: true,
-            },
-            CapabilityLeaf {
-                variable: 0,
-                page_local: true,
-            },
+            CapabilityLeaf { variable: 0 },
+            CapabilityLeaf { variable: 0 },
         ]);
         let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
         let relevant = ChildSet::empty(plan.len()).with_inserted(0);
@@ -30597,7 +30452,7 @@ mod tests {
             0,
             CandidateBatch {
                 parents: RowBatch::seed(),
-                candidates: CandidatePayload::Values(vec![raw(1), raw(2), raw(1)]),
+                candidates: CandidatePayload::Values(vec![raw(2), raw(1)]),
             },
             &mut next_activation,
             &mut worklist,

@@ -1812,10 +1812,6 @@ where
         });
     }
 
-    fn residual_confirm_is_page_local(&self) -> bool {
-        true
-    }
-
     /// Exposes the canonical CPU/Ring family as a finite typed Program.
     ///
     /// This capability belongs to `SuccinctArchiveConstraint` itself. External

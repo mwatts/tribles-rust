@@ -436,9 +436,10 @@ proptest! {
 ///
 /// Both source entities produce the same middle values, so projecting only
 /// `middle` makes every accepted value occur twice. The nested Union is a
-/// whole-group reducer; after it completes, the final pattern is a page-local
-/// confirmation suffix. A width-one residual run must therefore retain both
-/// affine source activations while descending through partial candidate tails.
+/// live Formula OR reducer; after it completes, the final pattern is an
+/// ordinary confirmation suffix. A width-one residual run must therefore
+/// retain both affine source activations while descending through partial
+/// candidate tails.
 #[test]
 fn root_formula_candidate_paging_is_storage_polymorphic() {
     let sources = [fixture_id(81), fixture_id(82)];
@@ -464,8 +465,8 @@ fn root_formula_candidate_paging_is_storage_polymorphic() {
     }
     // Keep the final membership pattern less selective globally than the
     // source-local p frontier. These unrelated entities cannot join through
-    // p, but they make p the formula proposer and leave kind as the
-    // page-local suffix after the nested Union has reduced the whole group.
+    // p, but they make p the formula proposer and leave kind as the ordinary
+    // suffix after the nested Formula OR has reduced its private payload.
     for distractor in &marker_distractors {
         insert_edge(&mut kb, distractor, &oracle::kind, &marker);
     }
@@ -589,13 +590,13 @@ fn root_formula_candidate_paging_is_storage_polymorphic() {
         formula_confirms
             .iter()
             .any(|event| event.geometry.candidate_occurrences == 1),
-        "page-local formula suffix never consumed a width-one candidate tail"
+        "formula suffix never consumed a width-one candidate tail"
     );
     assert!(
         formula_confirms
             .iter()
             .any(|event| event.geometry.candidate_occurrences > 1),
-        "nested Union unexpectedly lost its whole-group action boundary"
+        "geometric candidate paging never widened beyond one occurrence"
     );
 }
 

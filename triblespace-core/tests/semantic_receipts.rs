@@ -1080,10 +1080,6 @@ impl Constraint<'static> for CoveringProposalWithExactProgram {
             .is_none_or(|column| view.iter().all(|row| row[column] == MEMBER))
     }
 
-    fn residual_confirm_is_page_local(&self) -> bool {
-        true
-    }
-
     fn residual_program(&self) -> Option<ProgramRef<'_>> {
         Some(ProgramRef::new(self))
     }
@@ -1102,11 +1098,11 @@ impl Constraint<'static> for CoveringProposalWithExactProgram {
 }
 
 #[derive(Clone)]
-struct NonPageLocalUniversalSibling {
+struct ConfirmationOnlyUniversalSibling {
     confirms: Arc<AtomicUsize>,
 }
 
-impl Constraint<'static> for NonPageLocalUniversalSibling {
+impl Constraint<'static> for ConfirmationOnlyUniversalSibling {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(X)
     }
@@ -1147,14 +1143,10 @@ impl Constraint<'static> for NonPageLocalUniversalSibling {
     fn satisfied(&self, _view: &RowsView<'_>) -> bool {
         true
     }
-
-    fn residual_confirm_is_page_local(&self) -> bool {
-        false
-    }
 }
 
 #[test]
-fn exact_program_receipt_does_not_discharge_covering_stable_fallback() {
+fn selected_exact_program_source_composes_with_an_ordinary_weak_confirmer() {
     let ordinary_proposes = Arc::new(AtomicUsize::new(0));
     let ordinary_confirms = Arc::new(AtomicUsize::new(0));
     let program_seeds = Arc::new(AtomicUsize::new(0));
@@ -1176,7 +1168,7 @@ fn exact_program_receipt_does_not_discharge_covering_stable_fallback() {
 
     let root = IntersectionConstraint::new(vec![
         Box::new(proposer) as DynConstraint,
-        Box::new(NonPageLocalUniversalSibling {
+        Box::new(ConfirmationOnlyUniversalSibling {
             confirms: sibling_confirms.clone(),
         }) as DynConstraint,
     ]);
@@ -1188,16 +1180,21 @@ fn exact_program_receipt_does_not_discharge_covering_stable_fallback() {
         .collect();
 
     assert_eq!(results, vec![MEMBER]);
-    assert!(ordinary_proposes.load(Ordering::Relaxed) > 0);
-    assert!(
-        ordinary_confirms.load(Ordering::Relaxed) > 0,
-        "ordinary Covering output must self-confirm after Program seeding is rejected"
+    assert_eq!(
+        ordinary_proposes.load(Ordering::Relaxed),
+        0,
+        "the selected Exact Program is the source, not the ordinary Covering fallback"
+    );
+    assert_eq!(
+        ordinary_confirms.load(Ordering::Relaxed),
+        0,
+        "the selected Exact Program needs no same-constraint self-confirmation"
     );
     assert!(sibling_confirms.load(Ordering::Relaxed) > 0);
     assert_eq!(
         program_seeds.load(Ordering::Relaxed),
-        0,
-        "the non-page-local sibling must keep this proposal on stable execution"
+        1,
+        "ordinary weak confirmation must not prevent the selected Exact Program source"
     );
 }
 

@@ -1470,10 +1470,6 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         });
     }
 
-    fn residual_confirm_is_page_local(&self) -> bool {
-        true
-    }
-
     fn residual_program(&self) -> Option<ProgramRef<'_>> {
         Some(ProgramRef::new(self))
     }
@@ -2121,10 +2117,6 @@ mod tests {
 
         fn influence(&self, variable: VariableId) -> VariableSet {
             self.inner.influence(variable)
-        }
-
-        fn residual_confirm_is_page_local(&self) -> bool {
-            self.inner.residual_confirm_is_page_local()
         }
 
         fn residual_proposal_source_is_paged(

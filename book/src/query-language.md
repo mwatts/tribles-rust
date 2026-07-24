@@ -524,7 +524,12 @@ feed those observations back into protocol answers.
 `propose` owns the empty sink it receives. `confirm` may only return a subbag
 of its input: it must retain every candidate occurrence that belongs to the
 relation's existential fiber, and it must be exact once every other variable
-of the occurrence is bound. `satisfied` may conservatively return `true` while
+of the occurrence is bound. This is weak support refinement, not a
+candidate-bag homomorphism: a confirmer may conservatively retain different
+false positives when the same admitted candidate SET arrives in different
+pages. The engine SET-admits every newly proposed `(parent, value)` before
+independent paging, and only the final raw SET—not intermediate payload or call
+trace equality—is semantic. `satisfied` may conservatively return `true` while
 a relevant variable remains unbound, but `false` must prove that the row has
 no completion, and the answer must be exact once all of the constraint's
 variables are present in the view. That exactness is required for sound

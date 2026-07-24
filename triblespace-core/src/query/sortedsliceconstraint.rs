@@ -385,10 +385,6 @@ where
         }
     }
 
-    fn residual_confirm_is_page_local(&self) -> bool {
-        true
-    }
-
     fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
         self.variable.index == variable && view.col(variable).is_none()
     }

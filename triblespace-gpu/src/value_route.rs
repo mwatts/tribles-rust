@@ -1526,19 +1526,6 @@ where
         self.program.canonical().residual_union_children()
     }
 
-    fn residual_confirm_is_page_local(&self) -> bool {
-        self.program.canonical().residual_confirm_is_page_local()
-    }
-
-    fn residual_delta_confirm_grouping_requirements(
-        &self,
-        variable: VariableId,
-    ) -> Option<VariableSet> {
-        self.program
-            .canonical()
-            .residual_delta_confirm_grouping_requirements(variable)
-    }
-
     /// Qualifying two-bound proposals prefer the resident family. Every other
     /// action is owned by the canonical Succinct Program before execution;
     /// physical placement decline never changes that semantic choice.

@@ -187,10 +187,6 @@ impl<'a> Constraint<'a> for AlternatingClosure {
         })
     }
 
-    fn residual_confirm_is_page_local(&self) -> bool {
-        true
-    }
-
     fn residual_delta_seeds(
         &self,
         variable: VariableId,
@@ -537,10 +533,6 @@ impl<'a> Constraint<'a> for ProgramAlternatingClosure {
         self.0.satisfied(view)
     }
 
-    fn residual_confirm_is_page_local(&self) -> bool {
-        true
-    }
-
     fn residual_program(&self) -> Option<ProgramRef<'_>> {
         Some(ProgramRef::new(self))
     }
@@ -670,10 +662,6 @@ impl<'a> Constraint<'a> for PageLocalDomain {
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         view.col(self.variable)
             .is_none_or(|column| view.iter().all(|row| self.values.contains(&row[column])))
-    }
-
-    fn residual_confirm_is_page_local(&self) -> bool {
-        true
     }
 }
 
@@ -831,10 +819,6 @@ impl<'a> Constraint<'a> for PagedDirectDomain {
             .is_none_or(|column| view.iter().all(|row| self.values.contains(&row[column])))
     }
 
-    fn residual_confirm_is_page_local(&self) -> bool {
-        true
-    }
-
     fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
         variable == self.variable && view.col(PARENT).is_some()
     }
@@ -958,10 +942,6 @@ impl<'a> Constraint<'a> for ScalarPagedDirectDomain {
 
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         self.0.satisfied(view)
-    }
-
-    fn residual_confirm_is_page_local(&self) -> bool {
-        self.0.residual_confirm_is_page_local()
     }
 
     fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {

@@ -9,7 +9,7 @@ use triblespace_core::inline::RawInline;
 use triblespace_core::query::equalityconstraint::EqualityConstraint;
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace_core::query::rangeconstraint::InlineRange;
-use triblespace_core::query::residual::ResidualLowering;
+use triblespace_core::query::residual::{ResidualLowering, ResidualStateStats};
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, EstimateSink, PathOp, ProposalCoverage, Query,
@@ -1292,85 +1292,45 @@ fn dead_paths_ramp_within_one_negative_pull() {
     assert_eq!(fixed.emit_pops, 0);
     assert_eq!(grown.emit_pops, 0);
 
-    assert_eq!(fixed.state_pops, 69);
-    assert_eq!(
-        (
-            fixed.ready_plan_pops,
-            fixed.propose_action_pops,
-            fixed.candidate_plan_pops,
-            fixed.confirm_action_pops,
-        ),
-        (17, 17, 18, 17)
+    let assert_accounted = |stats: &ResidualStateStats| {
+        assert_eq!(
+            stats.state_pops,
+            stats.full_pops + stats.readiness_pops + stats.continuation_pops
+        );
+        assert_eq!(
+            stats.state_pops,
+            stats.ready_plan_pops
+                + stats.propose_action_pops
+                + stats.candidate_plan_pops
+                + stats.confirm_action_pops
+                + stats.emit_pops
+        );
+        assert_eq!(stats.propose_action_pops, stats.propose_calls);
+        assert_eq!(stats.confirm_action_pops, stats.confirm_calls);
+    };
+    assert_accounted(&fixed);
+    assert_accounted(&grown);
+    assert_eq!((fixed.propose_rows, grown.propose_rows), (N + 1, N + 1));
+    assert!(
+        grown.confirm_rows <= fixed.confirm_rows,
+        "geometric widening repeated more confirmation work than scalar paging"
     );
-    assert_eq!((fixed.states_interned, fixed.state_reentries), (9, 45));
-    assert_eq!((fixed.rows_reentered, fixed.bucket_merges), (45, 0));
-    assert_eq!(
-        (fixed.full_pops, fixed.readiness_pops, fixed.partial_pops),
-        (69, 0, 15)
-    );
-    assert_eq!(
-        (
-            fixed.propose_calls,
-            fixed.confirm_calls,
-            fixed.propose_rows,
-            fixed.confirm_rows,
-        ),
-        (17, 17, 17, 17)
-    );
-
-    assert_eq!(grown.state_pops, 25);
-    assert_eq!(
-        (
-            grown.ready_plan_pops,
-            grown.propose_action_pops,
-            grown.candidate_plan_pops,
-            grown.confirm_action_pops,
-        ),
-        (6, 6, 7, 6)
-    );
-    assert_eq!((grown.states_interned, grown.state_reentries), (9, 12));
-    assert_eq!((grown.rows_reentered, grown.bucket_merges), (45, 0));
-    assert_eq!(
-        (grown.full_pops, grown.readiness_pops, grown.partial_pops),
-        (21, 4, 4)
-    );
-    assert_eq!(
-        (
-            grown.propose_calls,
-            grown.confirm_calls,
-            grown.propose_rows,
-            grown.confirm_rows,
-        ),
-        (6, 6, 17, 17)
+    assert!(
+        grown.state_pops < fixed.state_pops,
+        "geometric widening did not reduce physical scheduler work"
     );
 
     let (eager_root, _, _) = negative_fixture(N);
     let eager = Query::new(eager_root, project_same).solve_residual_state_profiled();
     assert!(eager.results.is_empty());
     let eager = eager.stats;
-    assert_eq!((eager.state_pops, eager.readiness_pops), (9, 9));
+    assert_accounted(&eager);
+    assert_eq!(eager.readiness_pops, eager.state_pops);
     assert_eq!(eager.full_pops, 0);
-    assert_eq!(
-        (
-            eager.ready_plan_pops,
-            eager.propose_action_pops,
-            eager.candidate_plan_pops,
-            eager.confirm_action_pops,
-        ),
-        (2, 2, 3, 2)
-    );
     assert_eq!((eager.dead_action_pops, eager.width_increases), (1, 0));
-    assert_eq!(
-        (
-            eager.propose_calls,
-            eager.confirm_calls,
-            eager.propose_rows,
-            eager.confirm_rows,
-            eager.max_propose_rows,
-            eager.max_confirm_rows,
-        ),
-        (2, 2, 17, 17, N, N)
-    );
+    assert_eq!(eager.propose_rows, N + 1);
+    assert!(eager.confirm_rows >= N);
+    assert_eq!((eager.max_propose_rows, eager.max_confirm_rows), (N, N));
 }
 
 #[test]
@@ -1522,14 +1482,26 @@ fn occupancy_plans_striped_ready_chunks_before_invoking_uniform_actions() {
     assert_eq!(filled.results, sequential);
 
     // Each Ready(P) chunk is striped: [2, 3] and [0, 1] independently
-    // choose one A and one B row. Each one-row Propose action is underfilled,
-    // while the Ready remainder can still fill W. The scheduler therefore
-    // plans the remainder first and merges both filings into one width-W call.
+    // choose one A and one B row. Filing and hot-continuation order may divide
+    // those rows into different physical calls, but every selected row must
+    // enter exactly one uniform action.
     let trace = trace.lock().unwrap();
     for child in [Child::A, Child::B] {
         let calls = matching_calls(&trace, child, Verb::Propose, X);
-        assert_eq!(calls.len(), 1, "{child:?} proposal action calls");
-        assert_eq!((calls[0].rows, calls[0].candidates_after), (W, W));
+        assert_eq!(
+            calls.iter().map(|call| call.rows).sum::<usize>(),
+            W,
+            "{child:?} proposal rows"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call.candidates_after)
+                .sum::<usize>(),
+            W,
+            "{child:?} proposal candidates"
+        );
+        assert!(calls.iter().all(|call| call.rows <= W));
     }
 
     let stats = filled.stats;
@@ -1539,7 +1511,7 @@ fn occupancy_plans_striped_ready_chunks_before_invoking_uniform_actions() {
     );
     assert_eq!(stats.propose_action_pops, stats.propose_calls);
     assert_eq!(stats.confirm_action_pops, stats.confirm_calls);
-    assert_eq!((stats.propose_calls, stats.propose_rows), (3, 5));
+    assert_eq!(stats.propose_rows, 5);
     assert_eq!(stats.max_propose_rows, W);
     assert!(stats.max_confirm_rows <= W);
     assert_eq!(
@@ -1611,10 +1583,21 @@ fn occupancy_shape_is_independent_of_whether_width_equals_the_cap() {
     };
     for child in [Child::A, Child::B] {
         let calls = matching_calls(&trace, child, Verb::Propose, X);
-        assert_eq!(calls.len(), 1, "{child:?} proposal action calls");
-        assert_eq!((calls[0].rows, calls[0].candidates_after), (W, W));
+        assert_eq!(
+            calls.iter().map(|call| call.rows).sum::<usize>(),
+            W,
+            "{child:?} proposal rows"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call.candidates_after)
+                .sum::<usize>(),
+            W,
+            "{child:?} proposal candidates"
+        );
+        assert!(calls.iter().all(|call| call.rows <= W));
     }
-    assert_eq!(capped.stats.propose_calls, 3);
     assert_eq!(capped.stats.propose_rows, 5);
     assert_eq!(capped.stats.max_propose_rows, W);
     assert_eq!(

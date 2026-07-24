@@ -177,10 +177,6 @@ impl<'a> Constraint<'a> for EntityRangeConstraint {
         }
     }
 
-    fn residual_confirm_is_page_local(&self) -> bool {
-        true
-    }
-
     fn residual_program(&self) -> Option<ProgramRef<'_>> {
         Some(ProgramRef::new(self))
     }
@@ -363,10 +359,6 @@ impl<'a> Constraint<'a> for AttributeRangeConstraint {
         if variable == self.variable_a {
             candidates.retain(|_, v| self.contains(v));
         }
-    }
-
-    fn residual_confirm_is_page_local(&self) -> bool {
-        true
     }
 
     fn residual_program(&self) -> Option<ProgramRef<'_>> {

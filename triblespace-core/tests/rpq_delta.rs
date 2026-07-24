@@ -350,10 +350,6 @@ impl<'a> Constraint<'a> for CoveringOrderedDomain {
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         self.0.satisfied(view)
     }
-
-    fn residual_confirm_is_page_local(&self) -> bool {
-        true
-    }
 }
 
 #[derive(Clone)]
@@ -547,19 +543,6 @@ where
         self.program.fallback().influence(variable)
     }
 
-    fn residual_confirm_is_page_local(&self) -> bool {
-        self.program.fallback().residual_confirm_is_page_local()
-    }
-
-    fn residual_delta_confirm_grouping_requirements(
-        &self,
-        variable: VariableId,
-    ) -> Option<VariableSet> {
-        self.program
-            .fallback()
-            .residual_delta_confirm_grouping_requirements(variable)
-    }
-
     fn residual_program(&self) -> Option<ProgramRef<'_>> {
         Some(ProgramRef::preferred(&self.program))
     }
@@ -570,7 +553,6 @@ struct PageTraceFilter {
     variable: VariableId,
     estimate: usize,
     accepted: Option<RawInline>,
-    page_local: bool,
     calls: Arc<Mutex<Vec<usize>>>,
 }
 
@@ -625,10 +607,6 @@ impl<'a> Constraint<'a> for PageTraceFilter {
             view.col(self.variable)
                 .is_none_or(|column| view.iter().all(|row| row[column] == accepted))
         })
-    }
-
-    fn residual_confirm_is_page_local(&self) -> bool {
-        self.page_local
     }
 }
 
@@ -689,10 +667,6 @@ impl<'a> Constraint<'a> for CandidateValueTraceFilter {
         view.col(self.variable)
             .is_none_or(|column| view.iter().all(|row| row[column] == self.accepted))
     }
-
-    fn residual_confirm_is_page_local(&self) -> bool {
-        true
-    }
 }
 
 #[derive(Clone)]
@@ -746,10 +720,6 @@ impl<'a> Constraint<'a> for SupportPageTraceFilter {
     fn satisfied(&self, _view: &RowsView<'_>) -> bool {
         true
     }
-
-    fn residual_confirm_is_page_local(&self) -> bool {
-        true
-    }
 }
 
 #[derive(Clone)]
@@ -793,10 +763,6 @@ impl<'a> Constraint<'a> for PageLocalDomain {
 
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         self.0.satisfied(view)
-    }
-
-    fn residual_confirm_is_page_local(&self) -> bool {
-        true
     }
 }
 
@@ -1109,8 +1075,7 @@ fn linear_formula_bound_start_filter_root(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GeneratedFormulaCase {
     Atom,
-    PageLocalAnd,
-    BarrierAnd,
+    OrdinaryAnd,
     RepeatedRecursive,
 }
 
@@ -1128,33 +1093,29 @@ fn generated_formula_root(
         ops,
     ));
     let atom = || Box::new(Arc::clone(&path)) as DynConstraint;
-    let suffix = |page_local| {
+    let suffix = || {
         Box::new(PageTraceFilter {
             variable: END,
             estimate: usize::MAX,
             accepted: Some(graph.value(1).raw),
-            page_local,
             calls: Arc::new(Mutex::new(Vec::new())),
         }) as DynConstraint
     };
 
     let formula = match case {
         GeneratedFormulaCase::Atom => atom(),
-        GeneratedFormulaCase::PageLocalAnd => {
-            Box::new(IntersectionConstraint::new(vec![atom(), suffix(true)])) as DynConstraint
-        }
-        GeneratedFormulaCase::BarrierAnd => {
-            Box::new(IntersectionConstraint::new(vec![atom(), suffix(false)])) as DynConstraint
+        GeneratedFormulaCase::OrdinaryAnd => {
+            Box::new(IntersectionConstraint::new(vec![atom(), suffix()])) as DynConstraint
         }
         GeneratedFormulaCase::RepeatedRecursive => {
             // Both visits deliberately reference the same Arc. Compilation
             // must still allocate two formula occurrences: object identity is
             // reusable structure, not occurrence identity.
-            let local =
-                Box::new(IntersectionConstraint::new(vec![atom(), suffix(true)])) as DynConstraint;
-            let barrier =
-                Box::new(IntersectionConstraint::new(vec![atom(), suffix(false)])) as DynConstraint;
-            Box::new(UnionConstraint::new(vec![local, barrier])) as DynConstraint
+            let left =
+                Box::new(IntersectionConstraint::new(vec![atom(), suffix()])) as DynConstraint;
+            let right =
+                Box::new(IntersectionConstraint::new(vec![atom(), suffix()])) as DynConstraint;
+            Box::new(UnionConstraint::new(vec![left, right])) as DynConstraint
         }
     };
     Arc::new(IntersectionConstraint::new(vec![
@@ -1577,7 +1538,7 @@ fn synthetic_root_atom_same_variable_rpq_composes_capabilities() {
 }
 
 #[test]
-fn synthetic_root_grouped_rpq_precedes_page_local_suffix_atomically() {
+fn synthetic_root_parent_atomic_rpq_precedes_ordinary_suffix() {
     let graph = Graph::new(3, &[(0, 0)]);
     let accepted = graph.value(0).raw;
     let candidates = vec![accepted, graph.value(1).raw, accepted, graph.value(2).raw];
@@ -1600,7 +1561,6 @@ fn synthetic_root_grouped_rpq_precedes_page_local_suffix_atomically() {
             variable: START,
             estimate: usize::MAX,
             accepted: None,
-            page_local: true,
             calls: Arc::clone(&suffix_calls),
         }) as DynConstraint,
     ]));
@@ -1622,64 +1582,48 @@ fn synthetic_root_grouped_rpq_precedes_page_local_suffix_atomically() {
 }
 
 #[test]
-fn synthetic_root_cyclic_proposer_respects_the_streamability_latency_boundary() {
-    for page_local in [true, false] {
-        let edges: Vec<_> = (0..8).map(|node| (node, node)).collect();
-        let graph = Graph::new(8, &edges);
-        let suffix_calls = Arc::new(Mutex::new(Vec::new()));
-        let node = Variable::<GenId>::new(START);
-        let accepted = (0..8)
-            .map(|node| graph.value(node).raw)
-            .max()
-            .expect("nonempty source frontier");
-        let root = Arc::new(IntersectionConstraint::new(vec![
-            Box::new(RegularPathConstraint::new(
-                graph.set.clone(),
-                node,
-                node,
-                &repeated(graph.attribute, false),
-            )) as DynConstraint,
-            Box::new(PageTraceFilter {
-                variable: START,
-                estimate: usize::MAX,
-                accepted: Some(accepted),
-                page_local,
-                calls: Arc::clone(&suffix_calls),
-            }) as DynConstraint,
-        ]));
-        let mut query = Query::new(root, project_start)
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
-            .cap(8)
-            .start_width(1);
+fn synthetic_root_cyclic_proposer_streams_into_an_ordinary_relational_suffix() {
+    let edges: Vec<_> = (0..8).map(|node| (node, node)).collect();
+    let graph = Graph::new(8, &edges);
+    let suffix_calls = Arc::new(Mutex::new(Vec::new()));
+    let node = Variable::<GenId>::new(START);
+    let accepted = (0..8)
+        .map(|node| graph.value(node).raw)
+        .max()
+        .expect("nonempty source frontier");
+    let root = Arc::new(IntersectionConstraint::new(vec![
+        Box::new(RegularPathConstraint::new(
+            graph.set.clone(),
+            node,
+            node,
+            &repeated(graph.attribute, false),
+        )) as DynConstraint,
+        Box::new(PageTraceFilter {
+            variable: START,
+            estimate: usize::MAX,
+            accepted: Some(accepted),
+            calls: Arc::clone(&suffix_calls),
+        }) as DynConstraint,
+    ]));
+    let mut query = Query::new(root, project_start)
+        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .cap(8)
+        .start_width(1);
 
-        assert_eq!(query.next(), Some(accepted));
-        assert_eq!(query.stats().delta_source_pages, 4);
-        assert_eq!(query.stats().delta_source_candidates_examined, 8);
-        assert_eq!(query.stats().delta_source_roots, 8);
-        if page_local {
-            assert_eq!(
-                *suffix_calls.lock().expect("suffix recorder poisoned"),
-                [1, 1, 1, 1],
-                "each ProbeOne handoff must isolate one streamed atom"
-            );
-            assert_eq!(query.stats().delta_handoff_probe_pops, 4);
-            assert_eq!(query.stats().delta_source_dead_pages, 0);
-            assert_eq!(query.stats().delta_source_negative_steps, 0);
-            assert_eq!(query.stats().width_increases, 3);
-            assert_eq!(query.current_width(), 8);
-        } else {
-            assert_eq!(
-                *suffix_calls.lock().expect("suffix recorder poisoned"),
-                [8],
-                "an ineligible suffix must retain the frozen global-width trace"
-            );
-            assert_eq!(query.stats().delta_handoff_probe_pops, 1);
-            assert_eq!(query.stats().delta_source_dead_pages, 4);
-            assert_eq!(query.stats().delta_source_negative_steps, 4);
-            assert_eq!(query.stats().width_increases, 3);
-            assert_eq!(query.current_width(), 8);
-        }
-    }
+    assert_eq!(query.next(), Some(accepted));
+    assert_eq!(query.stats().delta_source_pages, 4);
+    assert_eq!(query.stats().delta_source_candidates_examined, 8);
+    assert_eq!(query.stats().delta_source_roots, 8);
+    assert_eq!(
+        *suffix_calls.lock().expect("suffix recorder poisoned"),
+        [1, 1, 1, 1],
+        "each ProbeOne handoff must isolate one streamed relation atom"
+    );
+    assert_eq!(query.stats().delta_handoff_probe_pops, 4);
+    assert_eq!(query.stats().delta_source_dead_pages, 0);
+    assert_eq!(query.stats().delta_source_negative_steps, 0);
+    assert_eq!(query.stats().width_increases, 3);
+    assert_eq!(query.current_width(), 8);
 }
 
 #[test]
@@ -1952,7 +1896,7 @@ fn synthetic_root_atom_streams_a_cycle_before_fixpoint_cleanup() {
 }
 
 #[test]
-fn synthetic_root_and_streams_early_and_late_page_local_survivors() {
+fn synthetic_root_and_streams_early_and_late_relational_survivors() {
     for (accepted_node, expected_before_emit, nested_and) in [(1, 1, false), (4, 4, true)] {
         let graph = Graph::new(5, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
         let ops = repeated(graph.attribute, false);
@@ -3458,8 +3402,9 @@ fn target_confirm_positive_support_publishes_early_then_exactly_drains() {
     assert_eq!(
         query
             .stats()
-            .delta_positive_publication_chunk_homomorphic_commits,
-        0
+            .delta_positive_publication_relational_prefix_commits,
+        1,
+        "the earlier exact Confirm successor is independently relational"
     );
     assert_eq!(support_routes.load(Ordering::Relaxed), 1);
     let early_examined = query.stats().delta_transition_candidates_examined;
@@ -3529,8 +3474,9 @@ fn target_confirm_positive_support_does_not_feed_past_false_occurrence_zero() {
     assert_eq!(
         query
             .stats()
-            .delta_positive_publication_chunk_homomorphic_commits,
-        0
+            .delta_positive_publication_relational_prefix_commits,
+        1,
+        "the accepted sibling may enter its exact relational continuation even though the hedge dies"
     );
     assert!(actual.contains(&graph.value(1).raw));
     assert!(query.stats().delta_transition_candidates_examined > 0);
@@ -3753,8 +3699,9 @@ fn forward_exact_confirm_chunk_tap_that_dies_is_not_replayed_from_g_minus_p() {
     assert_eq!(
         query
             .stats()
-            .delta_positive_publication_chunk_homomorphic_commits,
-        1
+            .delta_positive_publication_relational_prefix_commits,
+        2,
+        "both exact relational Confirm successors publish once"
     );
     assert_eq!(
         query.stats().delta_transition_candidates_examined,
@@ -3781,7 +3728,7 @@ fn forward_exact_confirm_chunk_tap_that_dies_is_not_replayed_from_g_minus_p() {
 }
 
 #[test]
-fn target_confirm_positive_support_classifies_a_chunk_homomorphic_commit() {
+fn target_confirm_positive_support_classifies_a_relational_prefix_commit() {
     let graph = Graph::new(4, &[(0, 1), (1, 2), (2, 3)]);
     let absent = [u8::MAX; 32];
     let candidates = vec![
@@ -3798,9 +3745,9 @@ fn target_confirm_positive_support_classifies_a_chunk_homomorphic_commit() {
             candidates.clone(),
             &repeated(graph.attribute, false),
             Arc::clone(&support_routes),
-            // This exact page-local sibling remains after the grouped RPQ
-            // confirmer, making the successful hedge's continuation
-            // ChunkHomomorphic rather than Terminal.
+            // This exact ordinary sibling remains after the RPQ activation,
+            // making the successful hedge's continuation
+            // a relational prefix rather than Terminal.
             Box::new(CoveringOrderedDomain(OrderedDomain {
                 variable: END,
                 gate: START,
@@ -3825,13 +3772,14 @@ fn target_confirm_positive_support_classifies_a_chunk_homomorphic_commit() {
         .cap(1);
     let first = query
         .next()
-        .expect("the positive chunk must survive its page-local suffix");
+        .expect("the positive candidate must survive its relational suffix");
     assert_eq!(query.stats().delta_positive_publication_terminal_commits, 0);
     assert_eq!(
         query
             .stats()
-            .delta_positive_publication_chunk_homomorphic_commits,
-        1
+            .delta_positive_publication_relational_prefix_commits,
+        2,
+        "the successful value crosses both exact relational Confirm successors"
     );
     assert_eq!(query.stats().delta_direct_terminal_publication_rows, 0);
     let early_examined = query.stats().delta_transition_candidates_examined;
@@ -3901,8 +3849,9 @@ fn target_confirm_positive_chunk_that_dies_in_suffix_is_not_retried() {
     assert_eq!(
         query
             .stats()
-            .delta_positive_publication_chunk_homomorphic_commits,
-        1
+            .delta_positive_publication_relational_prefix_commits,
+        2,
+        "both exact relational Confirm successors commit before the suffix decides survival"
     );
 
     let calls = calls.lock().expect("candidate-value trace poisoned");
@@ -4486,8 +4435,7 @@ fn generated_combined_formula_rpq_matrix_matches_frozen_schedulers_and_is_monoto
     ];
     let formulas = [
         GeneratedFormulaCase::Atom,
-        GeneratedFormulaCase::PageLocalAnd,
-        GeneratedFormulaCase::BarrierAnd,
+        GeneratedFormulaCase::OrdinaryAnd,
         GeneratedFormulaCase::RepeatedRecursive,
     ];
     let lowering_cases = [
@@ -4546,7 +4494,7 @@ fn generated_combined_formula_rpq_matrix_matches_frozen_schedulers_and_is_monoto
                     );
                     if capability == "whole-root-transitions"
                         && program == GeneratedPathProgram::Plus
-                        && formula == GeneratedFormulaCase::PageLocalAnd
+                        && formula == GeneratedFormulaCase::OrdinaryAnd
                         && query.stats().delta_handoff_probe_pops > 0
                     {
                         saw_root_cyclic_probe_one = true;
@@ -4569,7 +4517,7 @@ fn generated_combined_formula_rpq_matrix_matches_frozen_schedulers_and_is_monoto
 
         assert_eq!(
             results_by_formula[1], results_by_formula[2],
-            "page-locality changed semantics for program={program:?}"
+            "formula lowering changed semantics for program={program:?}"
         );
     }
 

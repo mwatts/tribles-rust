@@ -322,10 +322,6 @@ where
         self.inner.influence(variable)
     }
 
-    fn residual_confirm_is_page_local(&self) -> bool {
-        self.inner.residual_confirm_is_page_local()
-    }
-
     fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
         self.inner.residual_proposal_source_is_paged(variable, view)
     }

@@ -191,21 +191,6 @@ pub mod query {
 
         // EstimateOverrideConstraint changes only the planner's cardinality
         // input. Keep the wrapper structurally opaque so opening a composite
-        // child cannot bypass that override, but forward every optional
-        // execution capability whose semantics are identical to the delegated
-        // propose/confirm/satisfied verbs above.
-        fn residual_confirm_is_page_local(&self) -> bool {
-            self.constraint.residual_confirm_is_page_local()
-        }
-
-        fn residual_delta_confirm_grouping_requirements(
-            &self,
-            variable: VariableId,
-        ) -> Option<VariableSet> {
-            self.constraint
-                .residual_delta_confirm_grouping_requirements(variable)
-        }
-
         fn residual_program(&self) -> Option<ProgramRef<'_>> {
             self.constraint.residual_program()
         }

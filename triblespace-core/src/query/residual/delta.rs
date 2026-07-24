@@ -628,7 +628,6 @@ struct PositiveConfirmParentId {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PositivePublicationCertificate {
     continuation: ContinuationPublicationReceipt,
-    crosses_set_boundary: bool,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -648,19 +647,13 @@ impl PositivePublicationCertificate {
                 plan,
                 formula_pcs,
             ),
-            crosses_set_boundary: crosses_candidate_set_boundary(
-                previous,
-                successor,
-                plan,
-                formula_pcs,
-            ),
         }
     }
 
     fn eligible(self) -> bool {
         match self.continuation {
-            ContinuationPublicationReceipt::Terminal => true,
-            ContinuationPublicationReceipt::ChunkHomomorphic => self.crosses_set_boundary,
+            ContinuationPublicationReceipt::Terminal
+            | ContinuationPublicationReceipt::RelationalPrefix => true,
             ContinuationPublicationReceipt::Barrier => false,
         }
     }
@@ -819,7 +812,7 @@ enum PositivePublicationRoute {
         full: VariableSet,
         registration: Option<TerminalOriginRegistration>,
     },
-    ChunkHomomorphic,
+    RelationalPrefix,
 }
 
 /// Affine authority to release one value whose positive publication has
@@ -1074,7 +1067,8 @@ enum DeltaReducer {
     /// Accepted values may immediately enter an ordinary Candidate state.
     StreamProposal,
     /// Accepted values may immediately resume an activation-local formula
-    /// continuation whose exact PC has been proved linear and page-local.
+    /// continuation whose exact PC has been proved linear and free of a live
+    /// OR-frame or activation-reuse barrier.
     /// Emission inherits the ordinary streaming proposal's discovery order;
     /// only bag equality with the sorted quiescent formula result is promised.
     StreamFormulaProposal,
@@ -1288,8 +1282,9 @@ struct Activation {
     /// publication resets it to one, while the independent search width
     /// supplies only the hard cap.
     terminal_sparse_quantum: usize,
-    /// Sorted distinct source scope for grouped confirmation. Proposals own a
-    /// constraint-generated graph frontier and therefore store `None`.
+    /// Sorted distinct source relation retained by a confirmation activation.
+    /// Proposals own a constraint-generated graph frontier and therefore store
+    /// `None`.
     source_candidates: Option<Box<[RawInline]>>,
     /// The continuation cursor is suspended while every traversal lineage
     /// rooted in the current page owns the activation's affine credits.
@@ -2247,12 +2242,7 @@ impl ProducerRegistry {
                 return None;
             }
         }
-        let DeltaReturn::Stable {
-            desc,
-            parent,
-            set_admit_result,
-        } = &activation.return_to
-        else {
+        let DeltaReturn::Stable { desc, parent, .. } = &activation.return_to else {
             return None;
         };
         let Some(registration) = activation.positive_publication.as_deref_mut() else {
@@ -2268,7 +2258,6 @@ impl ProducerRegistry {
             || original.one_parent_values().get(occurrence) != Some(&value)
             || ledger.published.contains(&value)
             || parent.len() != desc.bound.count()
-            || *set_admit_result != ledger.certificate.crosses_set_boundary
         {
             return None;
         }
@@ -2292,13 +2281,11 @@ impl ProducerRegistry {
                     registration,
                 }
             }
-            ContinuationPublicationReceipt::ChunkHomomorphic => {
-                if !ledger.certificate.crosses_set_boundary
-                    || !matches!(&desc.phase, ResidualPhase::Candidate { .. })
-                {
+            ContinuationPublicationReceipt::RelationalPrefix => {
+                if !matches!(&desc.phase, ResidualPhase::Candidate { .. }) {
                     return None;
                 }
-                PositivePublicationRoute::ChunkHomomorphic
+                PositivePublicationRoute::RelationalPrefix
             }
             ContinuationPublicationReceipt::Barrier => return None,
         };
@@ -7493,8 +7480,8 @@ impl DeltaScheduler {
                     )),
                 }
             }
-            PositivePublicationRoute::ChunkHomomorphic => {
-                stats.delta_positive_publication_chunk_homomorphic_commits += 1;
+            PositivePublicationRoute::RelationalPrefix => {
+                stats.delta_positive_publication_relational_prefix_commits += 1;
                 // Preflight proved a Stable Candidate descriptor, and this
                 // function constructs exactly one parent with one candidate.
                 // `file_with_plan` can therefore return `None` only if that
@@ -7507,7 +7494,7 @@ impl DeltaScheduler {
                     StateBucket::Candidates(batch),
                     stats,
                 )
-                .expect("a positive ChunkHomomorphic singleton filed no continuation");
+                .expect("a positive RelationalPrefix singleton filed no continuation");
                 DeltaStableEffects {
                     continuation: Some(continuation),
                     publication: None,
@@ -12327,7 +12314,6 @@ mod tests {
     #[derive(Clone, Copy)]
     struct PositiveCertificateLeaf {
         variable: VariableId,
-        page_local: bool,
     }
 
     impl Constraint<'static> for PositiveCertificateLeaf {
@@ -12362,10 +12348,6 @@ mod tests {
             _view: &RowsView<'_>,
             _candidates: &mut CandidateSink<'_>,
         ) {
-        }
-
-        fn residual_confirm_is_page_local(&self) -> bool {
-            self.page_local
         }
     }
 
@@ -12516,10 +12498,7 @@ mod tests {
     }
 
     fn terminal_positive_certificate() -> PositivePublicationCertificate {
-        let root = PositiveCertificateLeaf {
-            variable: 0,
-            page_local: false,
-        };
+        let root = PositiveCertificateLeaf { variable: 0 };
         let plan = ResidualPlan::compile(&root);
         let relevant = ChildSet::empty(plan.len()).with_inserted(0);
         let checked = ChildSet::empty(plan.len());
@@ -12549,25 +12528,16 @@ mod tests {
         )
     }
 
-    fn chunk_positive_fixture() -> (
+    fn relational_prefix_positive_fixture() -> (
         ResidualPlan,
         StateDesc,
         PositivePublicationCertificate,
         VariableSet,
     ) {
         let root = IntersectionConstraint::new(vec![
-            PositiveCertificateLeaf {
-                variable: 0,
-                page_local: false,
-            },
-            PositiveCertificateLeaf {
-                variable: 0,
-                page_local: true,
-            },
-            PositiveCertificateLeaf {
-                variable: 1,
-                page_local: false,
-            },
+            PositiveCertificateLeaf { variable: 0 },
+            PositiveCertificateLeaf { variable: 0 },
+            PositiveCertificateLeaf { variable: 1 },
         ]);
         let plan = ResidualPlan::compile(&root);
         let relevant = ChildSet::empty(plan.len())
@@ -12601,9 +12571,8 @@ mod tests {
         );
         assert_eq!(
             certificate.continuation,
-            ContinuationPublicationReceipt::ChunkHomomorphic
+            ContinuationPublicationReceipt::RelationalPrefix
         );
-        assert!(certificate.crosses_set_boundary);
         (plan, successor, certificate, full)
     }
 
@@ -13839,10 +13808,7 @@ mod tests {
         let grant = registry
             .commit_confirm_positive_publication(witness, Some(terminal_positive_full()))
             .expect("the exact B[0] witness should win its parent SET ledger");
-        let root = PositiveCertificateLeaf {
-            variable: 0,
-            page_local: false,
-        };
+        let root = PositiveCertificateLeaf { variable: 0 };
         let plan = ResidualPlan::compile(&root);
         let released = DeltaScheduler::release_positive_publication(
             grant,
@@ -13938,10 +13904,7 @@ mod tests {
             BTreeSet::from([candidate])
         );
 
-        let root = PositiveCertificateLeaf {
-            variable: 0,
-            page_local: false,
-        };
+        let root = PositiveCertificateLeaf { variable: 0 };
         let plan = ResidualPlan::compile(&root);
         let released = DeltaScheduler::release_positive_publication(
             grant,
@@ -14017,10 +13980,7 @@ mod tests {
             BTreeSet::from([candidate])
         );
 
-        let root = PositiveCertificateLeaf {
-            variable: 0,
-            page_local: false,
-        };
+        let root = PositiveCertificateLeaf { variable: 0 };
         let plan = ResidualPlan::compile(&root);
         let released = DeltaScheduler::release_positive_publication(
             grant,
@@ -14129,7 +14089,7 @@ mod tests {
     }
 
     #[test]
-    fn positive_publication_certificate_keeps_terminal_boundary_evidence() {
+    fn positive_publication_certificate_keeps_terminal_precedence() {
         assert_eq!(
             std::mem::size_of::<Option<Box<PositivePublicationRegistration>>>(),
             std::mem::size_of::<usize>(),
@@ -14139,10 +14099,6 @@ mod tests {
         assert_eq!(
             certificate.continuation,
             ContinuationPublicationReceipt::Terminal
-        );
-        assert!(
-            certificate.crosses_set_boundary,
-            "Terminal precedence must not erase the semantic parent's SET-boundary fact"
         );
         assert!(certificate.eligible());
     }
@@ -14181,27 +14137,17 @@ mod tests {
             )
             .is_none());
 
-        let malformed_chunk = PositivePublicationCertificate {
-            continuation: ContinuationPublicationReceipt::ChunkHomomorphic,
-            crosses_set_boundary: false,
+        let relational_prefix = PositivePublicationCertificate {
+            continuation: ContinuationPublicationReceipt::RelationalPrefix,
         };
-        let (_, malformed_parent) =
-            open_positive_confirm(&mut registry, [value(3)], malformed_chunk);
+        let (_, relational_parent) =
+            open_positive_confirm(&mut registry, [value(3)], relational_prefix);
         assert!(
             registry
-                .positive_publication_snapshot(malformed_parent)
-                .is_none(),
-            "ChunkHomomorphic requires the semantic parent to cross the SET boundary"
+                .positive_publication_snapshot(relational_parent)
+                .is_some(),
+            "a relational successor needs no historical boundary bit"
         );
-        assert!(registry
-            .open_positive_support_activation(
-                malformed_parent,
-                0,
-                value(3),
-                VariableSet::new_singleton(0),
-                Some(terminal_positive_full()),
-            )
-            .is_none());
     }
 
     #[test]
@@ -14576,10 +14522,7 @@ mod tests {
 
     #[test]
     fn positive_support_witnessed_and_unwitnessed_quiescence_release_cleanup() {
-        let root = PositiveCertificateLeaf {
-            variable: 0,
-            page_local: false,
-        };
+        let root = PositiveCertificateLeaf { variable: 0 };
         let plan = ResidualPlan::compile(&root);
         for witnessed in [false, true] {
             let candidate = value(if witnessed { 91 } else { 92 });
@@ -14699,23 +14642,6 @@ mod tests {
         assert_terminal_positive_preflight_rejected(
             Some(terminal_positive_full()),
             |registry, activation| {
-                let DeltaReturn::Stable {
-                    set_admit_result, ..
-                } = &mut registry
-                    .state
-                    .activations
-                    .get_mut(&activation)
-                    .unwrap()
-                    .return_to
-                else {
-                    unreachable!()
-                };
-                *set_admit_result = false;
-            },
-        );
-        assert_terminal_positive_preflight_rejected(
-            Some(terminal_positive_full()),
-            |registry, activation| {
                 let DeltaReturn::Stable { parent, .. } = &mut registry
                     .state
                     .activations
@@ -14790,10 +14716,7 @@ mod tests {
                 ..
             }
         ));
-        let root = PositiveCertificateLeaf {
-            variable: 0,
-            page_local: false,
-        };
+        let root = PositiveCertificateLeaf { variable: 0 };
         let plan = ResidualPlan::compile(&root);
         let mut stable = Worklist::new();
         let mut stable_interner = StateInterner::default();
@@ -14826,10 +14749,7 @@ mod tests {
     fn positive_terminal_release_registers_semantic_confirm_before_real_staging() {
         let first = value(7);
         let second = value(8);
-        let root = PositiveCertificateLeaf {
-            variable: 0,
-            page_local: false,
-        };
+        let root = PositiveCertificateLeaf { variable: 0 };
         let plan = ResidualPlan::compile(&root);
         let mut registry = ProducerRegistry::new();
         let (_, parent) = open_positive_confirm(
@@ -14922,7 +14842,7 @@ mod tests {
         assert!(stable.is_empty());
         assert_eq!(stats.delta_positive_publication_terminal_commits, 2);
         assert_eq!(
-            stats.delta_positive_publication_chunk_homomorphic_commits,
+            stats.delta_positive_publication_relational_prefix_commits,
             0
         );
     }
@@ -14930,8 +14850,7 @@ mod tests {
     #[test]
     fn positive_terminal_release_accepts_an_already_set_admitted_input() {
         let candidate = value(9);
-        let mut certificate = terminal_positive_certificate();
-        certificate.crosses_set_boundary = false;
+        let certificate = terminal_positive_certificate();
         assert!(
             certificate.eligible(),
             "Terminal precedence must not require a fresh SET crossing"
@@ -14952,10 +14871,7 @@ mod tests {
         let grant = registry
             .commit_positive_publication(witness, Some(terminal_positive_full()))
             .expect("an already-SET Terminal successor should still publish");
-        let root = PositiveCertificateLeaf {
-            variable: 0,
-            page_local: false,
-        };
+        let root = PositiveCertificateLeaf { variable: 0 };
         let plan = ResidualPlan::compile(&root);
         let release = DeltaScheduler::release_positive_publication(
             grant,
@@ -14975,9 +14891,9 @@ mod tests {
     }
 
     #[test]
-    fn positive_chunk_release_files_singleton_into_exact_saved_k() {
+    fn positive_relational_prefix_release_files_singleton_into_exact_saved_k() {
         let candidate = value(11);
-        let (plan, successor, certificate, _full) = chunk_positive_fixture();
+        let (plan, successor, certificate, _full) = relational_prefix_positive_fixture();
         let mut registry = ProducerRegistry::new();
         let return_to = DeltaReturn::Stable {
             desc: successor.clone(),
@@ -14998,7 +14914,7 @@ mod tests {
             replace_positive_support_credit(&mut registry, credit, Some(candidate), false);
         let grant = registry
             .commit_positive_publication(witness, None)
-            .expect("ChunkHomomorphic publication needs no Terminal capability");
+            .expect("RelationalPrefix publication needs no Terminal capability");
         let mut stable = Worklist::new();
         let mut stable_interner = StateInterner::default();
         let mut stats = ResidualStateStats::default();
@@ -15012,10 +14928,10 @@ mod tests {
         assert!(release.publication.is_none());
         let token = release
             .continuation
-            .expect("one parent and one value make Chunk filing nonempty");
+            .expect("one parent and one value make relational filing nonempty");
         assert_eq!(stable_interner.get(token.state), &successor);
         let StateBucket::Candidates(batch) = &stable[&token.rank][&token.state] else {
-            panic!("Chunk release filed the wrong payload kind")
+            panic!("relational-prefix release filed the wrong payload kind")
         };
         assert_eq!(batch.parents.row_count, 1);
         assert!(batch.parents.rows.is_empty());
@@ -15027,7 +14943,7 @@ mod tests {
         assert_eq!(token.candidates, 1);
         assert_eq!(stats.delta_positive_publication_terminal_commits, 0);
         assert_eq!(
-            stats.delta_positive_publication_chunk_homomorphic_commits,
+            stats.delta_positive_publication_relational_prefix_commits,
             1
         );
         assert_eq!(
@@ -19546,26 +19462,26 @@ mod tests {
     }
 
     #[test]
-    fn cyclic_confirm_set_admits_each_affine_parent_at_its_candidate_boundary() {
+    fn cyclic_confirm_reuses_the_pre_admitted_affine_relation() {
         let root = MixedExpansion;
         let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
         let (previous, successor) = confirm_boundary_descs(&plan);
         let formula_pcs = FormulaPcInterner::default();
         let set_admit_result =
             crosses_candidate_set_boundary(&previous, &successor, &plan, &formula_pcs);
-        assert!(set_admit_result);
+        assert!(
+            !set_admit_result,
+            "ordinary Confirm input crossed the SET boundary before it was split"
+        );
 
         let mut scheduler = DeltaScheduler::new();
         let mut stable = Worklist::new();
         let mut stable_interner = StateInterner::default();
         let mut stats = ResidualStateStats {
-            candidates_confirmed: 5,
+            candidates_confirmed: 3,
             ..ResidualStateStats::default()
         };
-        for (activation, candidates) in [
-            (1, vec![value(1), value(2), value(1)]),
-            (2, vec![value(1), value(1)]),
-        ] {
+        for (activation, candidates) in [(1, vec![value(1), value(2)]), (2, vec![value(1)])] {
             let released = scheduler.release_completion(
                 CompletedActivation {
                     activation: ActivationId(activation),
@@ -19596,11 +19512,11 @@ mod tests {
         assert_eq!(batch.parents.row_count, 2);
         assert_eq!(
             batch.candidates.iter().collect::<Vec<_>>(),
-            vec![(0, value(2)), (0, value(1)), (1, value(1))]
+            vec![(0, value(1)), (0, value(2)), (1, value(1))]
         );
         assert_eq!(
-            stats.candidates_confirmed, 5,
-            "SET admission must not rewrite raw Confirm telemetry"
+            stats.candidates_confirmed, 3,
+            "the completion path must not rewrite raw Confirm telemetry"
         );
     }
 
@@ -19803,7 +19719,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_cyclic_confirm_routes_to_bounded_set_admission_without_materializing() {
+    fn deferred_cyclic_confirm_refiles_an_already_admitted_relation_without_rescanning() {
         let root = MixedExpansion;
         let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
         let (previous, successor) = confirm_boundary_descs(&plan);
@@ -19813,7 +19729,8 @@ mod tests {
             &plan,
             &FormulaPcInterner::default(),
         );
-        let mut result = CandidatePayload::Values(vec![value(1), value(2), value(1)]);
+        assert!(!set_admit_result);
+        let mut result = CandidatePayload::Values(vec![value(1), value(2)]);
         result.defer_for_shared_activation(1);
         assert!(matches!(result, CandidatePayload::Deferred(_)));
 
@@ -19821,7 +19738,7 @@ mod tests {
         let mut stable = Worklist::new();
         let mut stable_interner = StateInterner::default();
         let mut stats = ResidualStateStats {
-            candidates_confirmed: 3,
+            candidates_confirmed: 2,
             ..ResidualStateStats::default()
         };
         let released = scheduler.release_completion(
@@ -19839,67 +19756,20 @@ mod tests {
             &mut stable_interner,
             &mut stats,
         );
-        assert!(released.continuation.is_none());
-        let mut active = released
-            .active
-            .expect("segmented result opened bounded SET admission");
-        assert!(
-            stable.is_empty(),
-            "no partial relation may re-enter Candidate"
-        );
-        assert_eq!(
-            scheduler.interner.program(active.state),
-            Some(&ProgramAddress::Engine(EngineProgramKind::SetAdmit))
-        );
-        let activation = scheduler
-            .registry
-            .state
-            .activations
-            .get(&active.activation)
-            .expect("SET-admission activation remains live");
-        assert!(matches!(
-            &activation.reducer,
-            DeltaReducer::SetAdmit {
-                output: CandidatePayload::Deferred(_)
-            }
-        ));
-        let DeltaReturn::SetAdmission { destination, .. } = &activation.return_to else {
-            panic!("SET admission lost its candidate destination")
-        };
-        let SetAdmissionDestination::Candidate(destination) = destination else {
-            panic!("cyclic Confirm routed to a Formula destination")
-        };
-        assert!(destination.candidates.is_empty());
-
-        for _ in 0..16 {
-            let step = scheduler.step_active(
-                &root,
-                &plan,
-                active,
-                1,
-                &mut stable,
-                &mut stable_interner,
-                &mut stats,
-            );
-            if let Some(resume) = step.resume {
-                active = resume;
-                continue;
-            }
-            assert_eq!(step.status, ActiveDeltaStatus::Yielded);
-            break;
-        }
-        assert!(!stable.is_empty(), "SET admission failed to reach EOF");
+        assert!(released.continuation.is_some());
+        assert!(released.active.is_none());
         let StateBucket::Candidates(batch) =
             stable.values().flat_map(BTreeMap::values).next().unwrap()
         else {
-            panic!("SET admission returned a non-candidate payload")
+            panic!("cyclic Confirm returned a non-candidate payload")
         };
         assert!(matches!(batch.candidates, CandidatePayload::Deferred(_)));
         assert_eq!(
             batch.candidates.iter().collect::<Vec<_>>(),
-            vec![(0, value(2)), (0, value(1))]
+            vec![(0, value(1)), (0, value(2))]
         );
-        assert_eq!(stats.candidates_confirmed, 3);
+        assert_eq!(stats.candidates_confirmed, 2);
+        assert!(scheduler.is_empty());
     }
 
     #[test]

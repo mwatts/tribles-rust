@@ -92,7 +92,9 @@ Five laws are load-bearing for correctness:
 3. `confirm` must return a subbag of its input and preserve row grouping. It
    retains every candidate occurrence belonging to the relation's existential
    fiber, and becomes exact once all occurrence variables other than the
-   target are bound.
+   target are bound. It is a weak support refinement, not a candidate-bag
+   homomorphism: conservative false positives may depend on the other
+   candidates in the same call.
 4. `satisfied` may optimistically return `true` while one of the constraint's
    variables is unbound, but `false` must prove that the row has no completion.
    It **must be exact once all variables are bound**. This includes
@@ -190,24 +192,25 @@ phases:
 - `Ready` jointly chooses a row's next variable and exact proposing leaf.
 - `Propose` invokes one uniform proposer over an assembled parent-row bucket.
 - `Candidate` chooses the next unchecked relevant confirmer.
-- `Confirm` invokes one uniform confirmer over complete parent candidate
-  groups, or over candidate pages once every remaining confirmer declares that
-  operation page-local.
+- `Confirm` invokes one uniform confirmer over a disjoint page of the admitted
+  candidate relation. A selected typed Program may retain one complete parent
+  activation when doing so reuses traversal state.
 
 Planning phases only estimate, partition, and file work; protocol calls happen
 in the explicit action phases. The checked-leaf set is canonical, so histories
 that applied the same constraints in different orders can append to the same
-future state before its remaining work runs. Candidate payloads remain
-occurrence bags while a whole-group action can still distinguish them. At the
-first state where a fully checked binding may commit or the remaining
-confirmers allow independent candidate pages, the engine reverse-stably admits
-one `(parent row, value)` occurrence. This preserves tail scheduling order and
-keeps equal values under different affine parents independent. Finite Formula
-AND continuations use the same boundary; Formula OR retains its own private
-ordered-set reducer, and segmented affine payloads cross through a bounded
-engine admission phase rather than synchronous materialization. The terminal
-projection remains the universal final SET guard across hidden witnesses and
-routes.
+future state before its remaining work runs. Before newly proposed candidates
+can split into independent pages, the engine reverse-stably admits one
+`(parent row, value)` occurrence. Equal values under different affine parents
+remain independent. Confirmers may conservatively retain different false
+positives for different pages, but must preserve every true support and become
+exact under their fully bound schema, so correctness depends only on the final
+raw SET rather than intermediate payload or trace equality. Formula OR retains
+its private ordered-set reducer and live-frame payload barrier; a repeated RPQ
+may retain one complete parent activation solely to reuse graph-product
+traversal. Segmented affine payloads cross through a bounded engine admission
+phase rather than synchronous materialization. The terminal projection remains
+the universal final SET guard across hidden witnesses and routes.
 
 Lazy residual execution begins with actionable width one. A surviving action
 keeps its newly filed continuation hot, allowing a successful path to descend
@@ -239,8 +242,8 @@ creation records its endpoint in the same distinct accepted set used by later
 transition witnesses and returns a one-shot seed-effect receipt to the delta
 scheduler. A streaming proposal or fully-bound Boolean Support reducer files
 that receipt into the stable machine immediately, while the root's affine
-traversal credit remains live for non-epsilon paths. Grouped confirmation and
-non-linear formula proposal retain their existing quiescence barriers: seed
+traversal credit remains live for non-epsilon paths. Activation-reuse
+confirmation and non-linear formula proposal retain their existing quiescence barriers: seed
 acceptance is private reducer state there, not an illegally streamed result.
 This mechanism is generic to `ResidualDeltaOutput::accepted`, not an RPQ
 branch in the scheduler. It preserves NODES(G) gating, same-variable paths,
@@ -436,9 +439,11 @@ carry no claim state in either execution mode.
 With the `parallel` feature, ordinary `IntoParallelIterator` consumption uses
 the same canonical residual runtime as ordinary serial iteration. A fresh
 query starts with the adaptive geometric width policy and partitions its exact
-affine frontier into at most one shard per worker. Rows, complete
-candidate-parent groups, and candidates whose remaining confirmation suffix is
-page-local are the same shard atoms used by the explicit residual path.
+affine frontier into at most one shard per worker. Rows and SET-admitted
+candidate occurrences are the same shard atoms used by the explicit residual
+path. A selected typed Program may retain one complete parent activation for
+physical traversal reuse, and a live Formula OR frame retains its private
+payload.
 Cross-shard reconvergence is traded for concurrency, but no second solver or
 seed restart is involved.
 
@@ -457,8 +462,10 @@ workloads.
 [`Query::into_par_residual_state_iter`](triblespace::core::query::Query::into_par_residual_state_iter)
 is the explicit saturated-width residual entry point. It uses the same affine
 splitter and executor as ordinary parallel iteration, but treats the call as a
-full-enumeration throughput request and starts at the width cap. A whole-group
-confirmer keeps each parent's ragged candidate sequence intact. Every shard
+full-enumeration throughput request and starts at the width cap. Rows and
+SET-admitted candidate occurrences are valid shard atoms; a selected typed
+Program may keep one complete parent activation intact for physical traversal
+reuse, and a live Formula OR frame retains its private payload. Every shard
 retains canonical state merging locally; state is moved rather than
 duplicated, and the constraint/postprocessor pair is cloned only when a real
 sibling shard is created. Both entry points preserve the query's selected

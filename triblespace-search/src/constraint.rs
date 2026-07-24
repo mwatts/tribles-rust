@@ -473,10 +473,6 @@ where
         candidates.retain(|_, raw| self.contains_raw(raw));
     }
 
-    fn residual_confirm_is_page_local(&self) -> bool {
-        true
-    }
-
     fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
         variable == self.doc.index && view.col(variable).is_none()
     }
@@ -903,10 +899,6 @@ impl<'a, I: CosineSimilarity + ?Sized + 'a> Constraint<'a> for CosineAtLeast<'a,
         });
     }
 
-    fn residual_confirm_is_page_local(&self) -> bool {
-        true
-    }
-
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         view.iter().all(|row| self.support_row(view, row))
     }
@@ -1101,10 +1093,6 @@ impl<'a> Constraint<'a> for SimilarTo {
             return;
         }
         candidates.retain(|_, raw| self.contains_raw(raw));
-    }
-
-    fn residual_confirm_is_page_local(&self) -> bool {
-        true
     }
 
     fn residual_proposal_source_is_paged(&self, variable: VariableId, view: &RowsView<'_>) -> bool {
@@ -1727,7 +1715,7 @@ mod tests {
         );
         assert!(
             flat_constraint.residual_program().is_some(),
-            "exact cosine must expose its page-local confirmer Program",
+            "exact cosine must expose its pageable confirmer Program",
         );
 
         let hnsw_view = hnsw.attach(&reader);

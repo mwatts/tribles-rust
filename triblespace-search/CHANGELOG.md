@@ -17,7 +17,7 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 - Replaced the binding-history-dependent binary `Similar` / `.similar()` API
   with `CosineAtLeast` / `.cosine_at_least()`, an exact symmetric,
   filter-only predicate. It never enumerates a handle domain and now exposes a
-  finite page-local confirmer Program. The public `SimilaritySearch` trait is
+  finite pageable confirmer Program. The public `SimilaritySearch` trait is
   replaced by `CosineSimilarity`; its exact shared operation is
   `cosine_between`. The former `neighbours_above` operation leaves the shared
   trait; directional retrieval remains backend-specific behind `similar_to`.

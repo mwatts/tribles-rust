@@ -1429,6 +1429,11 @@ pub trait ConstraintChildren<'a> {
 /// [`confirm`](Constraint::confirm) must produce a subbag of its input, retain
 /// every occurrence whose value belongs to the existential fiber, and become
 /// exact once every occurrence variable other than the target is bound.
+/// Conservative false positives may depend on the complete candidate page
+/// supplied to one call: confirmation is not required to be a homomorphism in
+/// that candidate bag. Engines therefore SET-admit every newly proposed
+/// `(parent, value)` before independently paging it; correctness is defined by
+/// the final raw SET, not by equality of intermediate payloads or call traces.
 /// [`satisfied`](Constraint::satisfied) returning `false` must prove that the
 /// row has no completion, and it must be exact once all occurrence variables
 /// are bound. Estimates are costs only: they cannot change relevance,
@@ -1626,6 +1631,13 @@ pub trait Constraint<'a> {
     /// Called on every constraint *except* the one that proposed, in
     /// order of increasing estimate. Does nothing when `variable` is not
     /// constrained by this constraint.
+    ///
+    /// This is weak support refinement. The result must be a subbag, must keep
+    /// every candidate in this occurrence's existential fiber, and must be
+    /// exact when all of the occurrence's other variables are bound. It may
+    /// conservatively keep different false positives when the same admitted
+    /// candidate SET is presented in different pages; candidate-page
+    /// homomorphism is deliberately not part of the protocol.
     fn confirm(
         &self,
         variable: VariableId,
@@ -1753,56 +1765,6 @@ pub trait Constraint<'a> {
     /// stable for the solve.
     #[doc(hidden)]
     fn residual_union_children(&self) -> Option<&dyn ConstraintChildren<'a>> {
-        None
-    }
-
-    /// Reports whether residual execution may partition one parent's ordered
-    /// candidate sequence into disjoint pages before calling `confirm`.
-    ///
-    /// This is an opt-in execution capability, not an additional obligation
-    /// of the ordinary constraint protocol. Returning `true` promises that,
-    /// for fixed row bindings, confirming consecutive candidate pages and
-    /// concatenating their survivors preserves exactly the values, order, and
-    /// multiplicity of one confirmation over the complete parent group.
-    /// Pointwise `CandidateSink::retain` filters have this property. A
-    /// group-global operation such as sorting, deduplication, top-k, or
-    /// selecting one representative does not.
-    ///
-    /// An opted-in confirmer may receive several tagged parent rows whose
-    /// `RowsView` has zero columns. They are distinct affine occurrences even
-    /// though every row slice is empty: candidate tags still identify the
-    /// parent group, and reconvergence must preserve their multiplicity. In
-    /// particular, page-local implementations must not infer
-    /// `view.len() == 1` from `view.vars.is_empty()`.
-    ///
-    /// The conservative default keeps the complete parent group atomic.
-    /// Residual execution consults this only after any unchecked atomic
-    /// confirmer has run, so an atomic prefix may safely feed a page-local
-    /// suffix. The answer is structural and must remain stable for the solve.
-    #[doc(hidden)]
-    fn residual_confirm_is_page_local(&self) -> bool {
-        false
-    }
-
-    /// Bound-variable prerequisites for a grouped transition confirmation.
-    ///
-    /// `Some(required)` means that confirming `variable` through a supported
-    /// residual transition program needs the complete ordered candidate group
-    /// exactly when every variable in `required` is already bound. `None`
-    /// means that this confirmation never needs a grouped reducer. When the
-    /// prerequisites are not met, the constraint must either decline residual
-    /// transition seeds or provide a page-local transition confirmation.
-    ///
-    /// This is separate from `residual_confirm_is_page_local`: the ordinary
-    /// confirmation may be elementwise while the lowered implementation
-    /// intentionally traverses once and filters the immutable original group.
-    /// The conservative default declines grouped transition lowering. The
-    /// answer is structural and must remain stable for the solve.
-    #[doc(hidden)]
-    fn residual_delta_confirm_grouping_requirements(
-        &self,
-        _variable: VariableId,
-    ) -> Option<VariableSet> {
         None
     }
 
@@ -1976,10 +1938,11 @@ pub trait Constraint<'a> {
     /// ascending order. Proposal actions may append zero or more seeds per
     /// parent; repeated tags denote distinct affine producer roots inside one
     /// parent activation. That activation streams proposal effects but does not
-    /// reduce a confirmation until every root lineage quiesces. A page-local
-    /// finite confirmation owns only its disjoint candidate page; a grouped
-    /// confirmation owns the complete parent sequence. In both cases the
-    /// immutable sequence supplies exact order and multiplicity. A nullable
+    /// reduce a confirmation until every root lineage quiesces. A `PageLocal`
+    /// typed route may own one disjoint page of the already admitted candidate
+    /// relation. A `ParentAtomic` route keeps the complete relation in one
+    /// activation only to reuse traversal state; it does not strengthen the
+    /// semantic confirmation law or make order and multiplicity observable. A nullable
     /// program may mark its seed accepted without adding it to work novelty;
     /// the scheduler records that endpoint at activation creation and may
     /// publish a streaming proposal or Support witness before expanding the
@@ -2254,19 +2217,6 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.residual_union_children()
     }
 
-    fn residual_confirm_is_page_local(&self) -> bool {
-        let inner: &T = self;
-        inner.residual_confirm_is_page_local()
-    }
-
-    fn residual_delta_confirm_grouping_requirements(
-        &self,
-        variable: VariableId,
-    ) -> Option<VariableSet> {
-        let inner: &T = self;
-        inner.residual_delta_confirm_grouping_requirements(variable)
-    }
-
     fn residual_program(&self) -> Option<ProgramRef<'_>> {
         let inner: &T = self;
         inner.residual_program()
@@ -2462,19 +2412,6 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     fn residual_union_children(&self) -> Option<&dyn ConstraintChildren<'a>> {
         let inner: &T = self;
         inner.residual_union_children()
-    }
-
-    fn residual_confirm_is_page_local(&self) -> bool {
-        let inner: &T = self;
-        inner.residual_confirm_is_page_local()
-    }
-
-    fn residual_delta_confirm_grouping_requirements(
-        &self,
-        variable: VariableId,
-    ) -> Option<VariableSet> {
-        let inner: &T = self;
-        inner.residual_delta_confirm_grouping_requirements(variable)
     }
 
     fn residual_program(&self) -> Option<ProgramRef<'_>> {

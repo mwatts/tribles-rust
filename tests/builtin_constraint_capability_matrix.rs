@@ -139,7 +139,6 @@ where
 struct CapabilityReceipt {
     opaque_shape: bool,
     finite_union_arms: Option<usize>,
-    page_local_confirm: bool,
     direct_proposal_source: bool,
     typed_program: bool,
 }
@@ -153,7 +152,6 @@ fn capability_receipt<'a, C: Constraint<'a>>(
         finite_union_arms: constraint
             .residual_union_children()
             .map(|children| children.len()),
-        page_local_confirm: constraint.residual_confirm_is_page_local(),
         direct_proposal_source: constraint
             .residual_proposal_source_is_paged(variable, &RowsView::EMPTY),
         typed_program: constraint.residual_program().is_some(),
@@ -193,7 +191,6 @@ fn built_in_capability_receipts_distinguish_native_paths_from_opaque_fallbacks()
         CapabilityReceipt {
             opaque_shape: true,
             finite_union_arms: None,
-            page_local_confirm: true,
             direct_proposal_source: false,
             typed_program: true,
         },
@@ -204,7 +201,6 @@ fn built_in_capability_receipts_distinguish_native_paths_from_opaque_fallbacks()
         CapabilityReceipt {
             opaque_shape: true,
             finite_union_arms: None,
-            page_local_confirm: true,
             direct_proposal_source: false,
             typed_program: true,
         },
@@ -215,7 +211,6 @@ fn built_in_capability_receipts_distinguish_native_paths_from_opaque_fallbacks()
         CapabilityReceipt {
             opaque_shape: true,
             finite_union_arms: None,
-            page_local_confirm: true,
             direct_proposal_source: false,
             typed_program: true,
         },
@@ -226,7 +221,6 @@ fn built_in_capability_receipts_distinguish_native_paths_from_opaque_fallbacks()
         CapabilityReceipt {
             opaque_shape: true,
             finite_union_arms: None,
-            page_local_confirm: true,
             direct_proposal_source: true,
             typed_program: true,
         },
@@ -237,7 +231,6 @@ fn built_in_capability_receipts_distinguish_native_paths_from_opaque_fallbacks()
         CapabilityReceipt {
             opaque_shape: true,
             finite_union_arms: None,
-            page_local_confirm: true,
             direct_proposal_source: false,
             typed_program: true,
         },
@@ -248,7 +241,6 @@ fn built_in_capability_receipts_distinguish_native_paths_from_opaque_fallbacks()
         CapabilityReceipt {
             opaque_shape: true,
             finite_union_arms: None,
-            page_local_confirm: true,
             direct_proposal_source: false,
             typed_program: true,
         },
@@ -261,7 +253,6 @@ fn built_in_capability_receipts_distinguish_native_paths_from_opaque_fallbacks()
         CapabilityReceipt {
             opaque_shape: true,
             finite_union_arms: Some(3),
-            page_local_confirm: false,
             direct_proposal_source: false,
             typed_program: false,
         },
@@ -274,7 +265,6 @@ fn built_in_capability_receipts_distinguish_native_paths_from_opaque_fallbacks()
         CapabilityReceipt {
             opaque_shape: true,
             finite_union_arms: None,
-            page_local_confirm: false,
             direct_proposal_source: false,
             typed_program: false,
         },
@@ -286,7 +276,6 @@ fn built_in_capability_receipts_distinguish_native_paths_from_opaque_fallbacks()
         CapabilityReceipt {
             opaque_shape: true,
             finite_union_arms: None,
-            page_local_confirm: true,
             direct_proposal_source: true,
             typed_program: true,
         },

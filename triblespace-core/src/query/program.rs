@@ -161,21 +161,25 @@ pub enum ProgramStratum {
     Fixpoint,
 }
 
-/// Action-specific candidate admission law carried by a constructed route.
+/// Action-specific physical grouping preference carried by a constructed route.
+///
+/// Both variants have the same SET-valued query semantics. This hint controls
+/// only whether the scheduler may split an already admitted candidate relation
+/// before entering one typed program activation.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProgramGrouping {
-    /// Each candidate page is an independent input to the program reducer.
+    /// Candidate pages may enter independent program activations.
     PageLocal,
-    /// The complete ordered candidate bag for one parent remains atomic.
+    /// Keep one parent's complete admitted candidate relation in one activation.
     ///
-    /// V1 discovers this requirement by probing `Confirm(variable)` with all
-    /// other variables owned by the same constraint family bound. A program
-    /// must therefore keep grouping compatible as the ambient bound schema
-    /// grows: it must not introduce `ParentAtomic` only at an intermediate or
-    /// globally enriched schema after that family-local probe returned
-    /// `PageLocal`. RPQ routes satisfy this because their two endpoints make
-    /// the probe schema the only opposite-endpoint transition.
+    /// This is an activation-reuse request, not a semantic admission law:
+    /// splitting would remain correct, but could repeat family-local traversal
+    /// or destroy useful shared continuation state. The current scheduler
+    /// discovers this preference by probing `Confirm(variable)` with all other
+    /// variables owned by the same constraint family bound. A family must keep
+    /// that physical preference compatible as the ambient bound schema grows.
+    /// Repeated RPQ confirmation uses it to amortize graph-product traversal.
     ParentAtomic,
 }
 

@@ -15,6 +15,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the removed scalar split-or-descend path. Already-started queries remain one
   exact-remainder leaf, while the explicit parallel DAG stays available as a
   comparison control.
+- **Breaking: ordinary confirmation now pages under weak support refinement.**
+  The never-shipped public `Constraint::residual_confirm_is_page_local` and
+  `residual_delta_confirm_grouping_requirements` hooks are removed. Every newly
+  proposed `(parent, value)` is SET-admitted before its first independent
+  split; a confirmer may vary conservative false positives by page while
+  preserving every true support and becoming exact once its peers are bound.
+  Formula OR retains its live-frame payload barrier, and repeated RPQ
+  `ParentAtomic` grouping remains only a typed Program activation-reuse hint,
+  not a stronger semantic law. Positive Confirm publication now uses an exact
+  relational-prefix receipt rather than historical SET-boundary crossing.
 - **Compiled Formula proposals now record whether their outer self-confirm
   obligation is discharged.** The private boolean records that no later
   self-confirm is required—whether by an Exact source proof or validation
@@ -106,10 +116,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AfterChildren` propagation remains outside the Support fallback.
 - **Residual Confirm continuations now carry an executable publication
   receipt.** The private three-valued proof distinguishes an exact terminal
-  binding, a nonterminal chunk that first crosses the parent-local candidate
-  SET boundary into a page-local/non-grouped suffix, and a conservative
-  barrier. This adds no early-publication behavior or public constraint API;
-  it freezes the structural law for later PositiveHedge integration.
+  binding, a nonterminal relational prefix whose exact successor has already
+  admitted the `(parent, value)` occurrence, and a conservative barrier. This
+  freezes the structural law used by PositiveHedge integration.
 - **Directed singleton Program chains can spend one scheduler grant locally.**
   An unjoined streaming activation may consume exact same-cohort sole children
   inside its producing receipt until the original work budget is exhausted or
@@ -223,15 +232,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   receipt accounting sees only the admitted per-parent relation.
 - **Ordinary residual actions admit SET candidates at their first semantic
   boundary.** Opaque Propose and Confirm actions retain raw work telemetry,
-  then tail-stably collapse equal values per affine parent before a fully
-  checked binding is committed or page-local candidates may split. Equal
+  then tail-stably collapse equal values per affine parent before candidates
+  may split or a fully checked binding is committed. Equal
   values belonging to different parent rows remain independent. Segmented
   affine ropes are explicitly left for bounded reducer admission rather than
   being materialized merely to deduplicate them.
 - **Finite Formula actions use the same first-boundary SET admission.** An
-  exposed AND keeps raw occurrence bags through whole-group actions, then
-  tail-stably admits `(parent, value)` support before the continuation may
-  split candidate pages or commit the outer binding. Equal values under
+  exposed AND tail-stably admits `(parent, value)` support before the
+  continuation may split candidate pages or commit the outer binding. Equal values under
   distinct parents remain independent, Formula OR keeps its private ordered-
   set reducer semantics, and segmented affine ropes cross the boundary through
   bounded engine admission instead of synchronous materialization.
@@ -478,8 +486,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   underfilled outer work without wiring dynamic frame calls into production.
 - **Estimate-only wrappers preserve native residual execution.**
   `EstimateOverrideConstraint` remains a structural opaque leaf so its planner
-  cardinality overrides cannot be bypassed, while forwarding exact page-local
-  confirmation, bounded proposal sources, transition programs, and Boolean
+  cardinality overrides cannot be bypassed, while forwarding bounded proposal
+  sources, transition programs, and Boolean
   Support to its inner constraint. `DebugConstraint` remains deliberately
   opaque because native proposal execution would bypass its observation log.
 - **Built-in constraints gain an executable residual capability matrix.**
@@ -576,7 +584,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tests now pin duplicate-parent affine handling through terminal SET
   projection, nested AND/OR arm-order
   invariance, monotone graph growth, live clone and Rayon worker parity, and
-  the parent-atomic barrier before page-local candidate confirmation.
+  the activation-reuse barrier during candidate confirmation.
 - **Fully-bound constraints can expose transition-backed support seeds.** The
   hidden constraint protocol now exposes one structural expansion route for a
   block of fully-bound boolean checks.
@@ -595,7 +603,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unattributed because they may combine activations from several action sites.
 - **Cyclic RPQ actions now execute inside lowered finite formulas.** Direct
   path atoms under OR and OR-to-AND arms share the residual delta fixpoint for
-  both proposal and grouped confirmation while retaining an exact affine
+  both proposal and activation-reuse confirmation while retaining an exact affine
   formula continuation per parent. Formula proposals remain private until
   quiescence, empty root sets resume as empty branch results, and structural
   delta buckets may merge expansion work across distinct formula return masks.
@@ -631,8 +639,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   independently. Whole-root scope keeps variable selection and the commit
   barrier outside a canonical AND/OR program, flattens only the maximal exposed
   root conjunction, and preserves opaque scope and group-reducer boundaries.
-  Root-AND confirmations retain candidate-occurrence paging once the exact
-  remaining suffix is page-local, including width-one and geometric
+  Root-AND confirmations retain candidate-occurrence paging once no selected
+  activation-reuse route blocks it, including width-one and geometric
   first-result traces. Ordinary live queries use `ResidualLowering::HYBRID`;
   explicit residual probe solvers remain conservative by default.
 - **WGPU Succinct confirmation can opt into exact residual-action executor
@@ -664,8 +672,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   converts to Rayon as one exact unsplittable remainder leaf. Fresh ordinary
   Rayon conversion remains the scalar DFS splitter. The explicit
   `into_par_residual_state_iter` path instead divides one affine residual
-  frontier into at most one shard per worker, keeping candidate groups
-  parent-atomic until every remaining confirmer is page-local.
+  frontier into at most one shard per worker, paging SET-admitted candidates
+  unless a selected typed route retains one parent activation for reuse.
 - **Constraints gain an opt-in canonical residual-state solver.** Any root
   `Constraint` can use the residual APIs: roots that expose associative AND
   structure are recursively flattened, while an opaque root is represented by
@@ -880,16 +888,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by activation novelty. Syntactic Thompson branches therefore no longer make
   repeated unions traverse the same graph state once per equivalent counter;
   regular-path set semantics and first-discovery order remain unchanged.
-- **Grouped transition confirmation is a predicate of canonical bound state.**
-  The former solve-wide Boolean capability is replaced by per-variable bound
-  prerequisites compiled into the residual plan. Candidate pages remain
-  independent while those prerequisites are absent and become parent-atomic
-  exactly when the state binds them. Repeated distinct-endpoint RPQs therefore
-  use page-local first-step confirmation while the opposite endpoint is free,
-  then retain their complete ordered candidate group when that endpoint is
-  bound and a real transition reducer can run; repeated same-endpoint paths
-  remain grouped unconditionally. This restores geometric descent through a
-  mixed finite-formula/path query without weakening quiescent fixpoint filters.
+- **Typed transition activation reuse is a predicate of canonical bound
+  state.** Per-variable bound prerequisites compiled into the residual plan
+  select when an RPQ Program benefits from retaining one complete parent
+  activation. Candidate pages remain independent while those prerequisites
+  are absent. Repeated distinct-endpoint RPQs therefore page ordinary
+  first-step confirmation while the opposite endpoint is free, then retain
+  one complete admitted relation when that endpoint is bound and a real
+  transition reducer can reuse it; repeated same-endpoint paths retain the
+  activation unconditionally. This is a physical scheduling preference, not
+  an ordered-bag admission law.
 - **Finite residual formulas avoid materializing administrative row copies.**
   Uniform child selections now retain their complete affine batch, and mixed
   selections partition on compact child ordinals before constructing canonical

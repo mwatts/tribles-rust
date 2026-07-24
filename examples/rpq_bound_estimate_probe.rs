@@ -269,10 +269,6 @@ impl<'a> Constraint<'a> for OrderedCandidates<'a> {
                 .all(|row| self.values.binary_search(&row[column]).is_ok())
         })
     }
-
-    fn residual_confirm_is_page_local(&self) -> bool {
-        true
-    }
 }
 
 fn project_end(binding: &Binding) -> Option<RawInline> {
@@ -331,7 +327,7 @@ fn attribution(stats: &ResidualStateStats) -> Attribution {
         #[cfg(baseline_without_positive_publication_stats)]
         positive_terminal: 0,
         #[cfg(not(baseline_without_positive_publication_stats))]
-        positive_chunk_homomorphic: stats.delta_positive_publication_chunk_homomorphic_commits,
+        positive_relational_prefix: stats.delta_positive_publication_relational_prefix_commits,
         #[cfg(baseline_without_positive_publication_stats)]
         positive_chunk_homomorphic: 0,
         direct_terminal_rows: stats.delta_direct_terminal_publication_rows,
