@@ -36,7 +36,7 @@
 //! first-result latency. The token is not part of canonical state identity and
 //! never consumes that older cohort. Ready and
 //! Propose states measure parent rows. Candidate and Confirm states remain
-//! parent-atomic while any unchecked whole-group confirmer remains; once the
+//! parent-atomic while any unchecked whole-group filter remains; once the
 //! residual continuation contains only page-local confirms, they measure and
 //! split candidate occurrences. Thus width one can confirm one value and
 //! descend while preserving group-global Union/custom semantics at their
@@ -1564,10 +1564,6 @@ impl PartialEq<ConstraintPath> for ResidualLeaf {
 /// twice in an AND produces two independent residual occurrences.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ResidualPlan {
-    /// Whole-root receipt captured at compilation. Every leaf may use
-    /// denotational source/relevance rules only when this complete proof is
-    /// present; mixed/default-false trees retain legacy action semantics.
-    certified_denotation: bool,
     leaves: Vec<ResidualLeaf>,
     /// Structural finite-formula program below lowered Union occurrences.
     /// Runtime migration is intentionally separate from compilation.
@@ -1587,7 +1583,7 @@ struct ResidualPlan {
     /// The nontrivial exposed root is one formula occurrence. Whole-root
     /// identity shells around one opaque atom normalize to the flat plan.
     synthetic_root_formula: bool,
-    /// Certified recursive estimate quote for a maximal synthetic root AND.
+    /// Recursive estimate quote for a maximal synthetic root AND.
     /// Arbitrary exposed composites retain `None` unless every flattened AND
     /// explicitly certifies the child-minimum estimate law.
     formula_ready_quote: Option<FormulaReadyQuote>,
@@ -1725,9 +1721,7 @@ impl ResidualPlan {
         }
         let finite_formula =
             FiniteFormulaProgram::compile(root, &leaves, program_scope, synthetic_root_formula);
-        let certified_denotation = root.fixed_denotation();
         let formula_ready_quote = (synthetic_root_formula
-            && certified_denotation
             && root.residual_union_children().is_none()
             && matches!(root.residual_shape(), ConstraintShape::And(_))
             && root_and_quote_is_lawful(root))
@@ -1744,7 +1738,6 @@ impl ResidualPlan {
             }
         });
         Self {
-            certified_denotation,
             leaves,
             finite_formula,
             page_local_confirms,
@@ -1968,17 +1961,15 @@ impl ResidualPlan {
         variable: VariableId,
         bound: VariableSet,
     ) -> bool {
-        !self.certified_denotation
-            || self
-                .resolve(root, occurrence)
-                .proposal_coverage(variable, bound)
-                == ProposalCoverage::Exact
+        self.resolve(root, occurrence)
+            .proposal_coverage(variable, bound)
+            == ProposalCoverage::Exact
     }
 
     /// Whether this proposal occurrence is discharged by construction.
-    /// Legacy actions preserve their historical implicit check; certified
-    /// Exact sources do likewise, while Covering sources enter Candidate with
-    /// the proposer still unchecked so ordinary confirmation validates it.
+    /// Exact sources are discharged by construction, while Covering sources
+    /// enter Candidate with the proposer still unchecked so ordinary
+    /// confirmation validates them.
     fn proposer_starts_checked<'a>(
         &self,
         root: &dyn Constraint<'a>,
@@ -1986,9 +1977,6 @@ impl ResidualPlan {
         variable: VariableId,
         bound: VariableSet,
     ) -> bool {
-        if !self.certified_denotation {
-            return true;
-        }
         match self.execution_proposal_coverage(self.resolve(root, occurrence), variable, bound) {
             ProposalCoverage::Exact => true,
             ProposalCoverage::Covering => false,
@@ -2118,9 +2106,8 @@ impl ResidualPlan {
         variable: VariableId,
         bound: VariableSet,
     ) -> bool {
-        !self.certified_denotation
-            || self.formula_execution_proposal_coverage(root, occurrence, node, variable, bound)
-                == ProposalCoverage::Exact
+        self.formula_execution_proposal_coverage(root, occurrence, node, variable, bound)
+            == ProposalCoverage::Exact
     }
 
     /// Whether any concrete leaf in this plan owns a true transition source
@@ -2356,13 +2343,13 @@ enum SeedTruth {
     True,
 }
 
-/// Exact closure of the structurally exposed portion of a certified root.
+/// Exact closure of the structurally exposed portion of a relational root.
 ///
 /// A flattened residual plan never schedules a zero-variable atom, so root
 /// optimism alone can hide a closed false child beneath an otherwise-open
 /// wrapper. This three-valued walk settles exactly the atoms closed by the
 /// seed schema and preserves open alternatives as Unknown.
-fn certified_seed_truth<'a>(
+fn relational_seed_truth<'a>(
     constraint: &dyn Constraint<'a>,
     bound: VariableSet,
     view: &RowsView<'_>,
@@ -2374,7 +2361,7 @@ fn certified_seed_truth<'a>(
         ConstraintShape::And(children) => {
             let mut all_true = true;
             for child in 0..children.len() {
-                match certified_seed_truth(children.child(child), bound, view) {
+                match relational_seed_truth(children.child(child), bound, view) {
                     SeedTruth::False => return SeedTruth::False,
                     SeedTruth::Unknown => all_true = false,
                     SeedTruth::True => {}
@@ -2390,7 +2377,7 @@ fn certified_seed_truth<'a>(
             if let Some(children) = constraint.residual_union_children() {
                 let mut all_false = true;
                 for child in 0..children.len() {
-                    match certified_seed_truth(children.child(child), bound, view) {
+                    match relational_seed_truth(children.child(child), bound, view) {
                         SeedTruth::True => return SeedTruth::True,
                         SeedTruth::Unknown => all_false = false,
                         SeedTruth::False => {}
@@ -2417,11 +2404,7 @@ pub(super) fn seed_survives<'a>(
     bound: VariableSet,
     view: &RowsView<'_>,
 ) -> bool {
-    if !root.fixed_denotation() {
-        root.satisfied(view)
-    } else {
-        !matches!(certified_seed_truth(root, bound, view), SeedTruth::False)
-    }
+    !matches!(relational_seed_truth(root, bound, view), SeedTruth::False)
 }
 
 impl ResidualLowering {
@@ -3794,8 +3777,8 @@ fn crosses_candidate_set_boundary(
 /// when the input was already SET-admitted. A nonterminal chunk is licensed
 /// only by the transition that first turns the parent-local occurrence bag
 /// into a relation. Formula/control transitions and malformed historical
-/// pairs are conservatively barriers. `fixed_denotation` remains a caller-side
-/// hedge-eligibility gate and is deliberately outside this classifier.
+/// pairs are conservatively barriers. Relational semantics are independent of
+/// this physical publication classifier.
 #[cfg_attr(not(test), allow(dead_code))]
 fn continuation_publication_receipt(
     previous: &StateDesc,
@@ -4562,7 +4545,7 @@ impl RowBatch {
     }
 }
 
-/// Row-local first-child decision produced by a certified Ready quote.
+/// Row-local first-child decision produced by a relational Ready quote.
 ///
 /// Bits 0..=31 retain the complete compiled child ordinal. Bit 32 records
 /// whether the selected execution source is Exact, leaving the full `u32`
@@ -7670,7 +7653,6 @@ fn quote_formula_ready_and<'a>(
     aggregate: &mut [usize],
     stats: &mut ResidualStateStats,
 ) -> Option<Vec<FormulaReadyChoice>> {
-    assert!(plan.certified_denotation);
     assert_eq!(aggregate.len(), view.len());
     #[cfg(not(test))]
     let _ = stats;
@@ -7692,7 +7674,7 @@ fn quote_formula_ready_and<'a>(
         }
 
         // The aggregate Ready estimate remains identical to the ordinary
-        // certified root estimator. Formula execution may additionally admit
+        // root estimator. Formula execution may additionally admit
         // a typed-only source, so first-child selection uses the stronger
         // execution receipt while aggregation uses the ordinary one.
         let ordinary_coverage = constraint.proposal_coverage(variable, bound);
@@ -7712,13 +7694,7 @@ fn quote_formula_ready_and<'a>(
         aggregate_source |= contributes_to_aggregate;
 
         column.clear();
-        if estimate_constraint(
-            constraint,
-            true,
-            variable,
-            view,
-            &mut EstimateSink::Column(&mut column),
-        ) {
+        if constraint.estimate(variable, view, &mut EstimateSink::Column(&mut column)) {
             assert_eq!(
                 column.len(),
                 view.len(),
@@ -7774,13 +7750,7 @@ fn estimate_leaf<'a>(
     view: &RowsView<'_>,
     out: &mut EstimateSink<'_>,
 ) -> bool {
-    estimate_constraint(
-        plan.resolve(root, leaf),
-        plan.certified_denotation,
-        variable,
-        view,
-        out,
-    )
+    plan.resolve(root, leaf).estimate(variable, view, out)
 }
 
 fn propose_leaf<'a>(
@@ -7791,13 +7761,9 @@ fn propose_leaf<'a>(
     view: &RowsView<'_>,
     candidates: &mut CandidateSink<'_>,
 ) {
-    _ = propose_constraint(
-        plan.resolve(root, leaf),
-        plan.certified_denotation,
-        variable,
-        view,
-        candidates,
-    );
+    _ = plan
+        .resolve(root, leaf)
+        .propose_with_layout(variable, view, candidates);
 }
 
 fn allocate_activations(next: &mut u64, count: usize) -> Vec<ActivationId> {
@@ -7818,13 +7784,7 @@ fn confirm_leaf<'a>(
     view: &RowsView<'_>,
     candidates: &mut CandidateSink<'_>,
 ) {
-    confirm_constraint(
-        plan.resolve(root, leaf),
-        plan.certified_denotation,
-        variable,
-        view,
-        candidates,
-    );
+    plan.resolve(root, leaf).confirm(variable, view, candidates);
 }
 
 fn ready_plan_transition<'a>(
@@ -7871,112 +7831,73 @@ fn ready_plan_transition<'a>(
         estimate_matrix.resize(estimate_start + rows.row_count, usize::MAX);
         let estimates = &mut estimate_matrix[estimate_start..];
         let mut column = Vec::with_capacity(rows.row_count);
-        if plan.certified_denotation {
-            let mut peers = Vec::new();
-            for leaf in 0..leaf_count {
-                let constraint = plan.resolve(root, leaf);
-                if constraint.variables().is_set(variable) {
-                    relevant.insert(leaf);
-                    peers.push(ActionCostPeer {
-                        occurrence: leaf,
-                        coverage: plan.ready_proposal_coverage(constraint, variable, desc.bound),
-                        classes: constraint.action_unit_classes(variable, desc.bound),
-                    });
-                }
+        let mut peers = Vec::new();
+        for leaf in 0..leaf_count {
+            let constraint = plan.resolve(root, leaf);
+            if constraint.variables().is_set(variable) {
+                relevant.insert(leaf);
+                peers.push(ActionCostPeer {
+                    occurrence: leaf,
+                    coverage: plan.ready_proposal_coverage(constraint, variable, desc.bound),
+                    classes: constraint.action_unit_classes(variable, desc.bound),
+                });
             }
+        }
 
-            // A finite-formula occurrence executes an internal action program,
-            // not the opaque leaf proposal/confirmation pair priced by this
-            // model. Current formula composites already decline unit classes;
-            // keep the structural guard explicit so future forwarding cannot
-            // accidentally price the wrong physical route.
-            let directed = (!peers
-                .iter()
-                .any(|peer| plan.has_finite_formula(peer.occurrence)))
-            .then(|| DirectedActionModel::new(&peers))
-            .flatten();
-            for &peer in &peers {
-                if peer.coverage < ProposalCoverage::Covering {
-                    continue;
-                }
-                column.clear();
-                if estimate_leaf(
-                    root,
-                    plan,
-                    peer.occurrence,
-                    variable,
-                    &view,
-                    &mut EstimateSink::Column(&mut column),
-                ) {
-                    assert_eq!(
-                        column.len(),
-                        rows.row_count,
-                        "constraint estimate must append one value per row"
-                    );
-                } else {
-                    assert!(
-                        column.is_empty(),
-                        "missing constraint estimate must leave its sink untouched"
-                    );
-                    column.resize(rows.row_count, usize::MAX);
-                }
-                for row in 0..rows.row_count {
-                    let planning_cost = directed
-                        .map_or(column[row], |model| model.planning_cost(peer, column[row]));
-                    if proposers[row] == usize::MAX
-                        || (planning_cost, peer.occurrence) < (proposal_costs[row], proposers[row])
-                    {
-                        proposers[row] = peer.occurrence;
-                        proposal_costs[row] = planning_cost;
-                        // Directed work prices select the physical source for
-                        // this variable. Cross-variable ordering remains the
-                        // established cardinality heuristic: compare the raw
-                        // occurrence count quoted by each variable's selected
-                        // source, not backend-specific action units. This
-                        // keeps source direction and logical variable order
-                        // independent.
-                        estimates[row] = column[row];
-                    }
-                }
+        // A finite-formula occurrence executes an internal action program,
+        // not the opaque leaf proposal/confirmation pair priced by this
+        // model. Current formula composites already decline unit classes;
+        // keep the structural guard explicit so future forwarding cannot
+        // accidentally price the wrong physical route.
+        let directed = (!peers
+            .iter()
+            .any(|peer| plan.has_finite_formula(peer.occurrence)))
+        .then(|| DirectedActionModel::new(&peers))
+        .flatten();
+        for &peer in &peers {
+            if peer.coverage < ProposalCoverage::Covering {
+                continue;
             }
-        } else {
-            for leaf in 0..leaf_count {
-                column.clear();
-                let is_relevant = estimate_leaf(
-                    root,
-                    plan,
-                    leaf,
-                    variable,
-                    &view,
-                    &mut EstimateSink::Column(&mut column),
+            column.clear();
+            if estimate_leaf(
+                root,
+                plan,
+                peer.occurrence,
+                variable,
+                &view,
+                &mut EstimateSink::Column(&mut column),
+            ) {
+                assert_eq!(
+                    column.len(),
+                    rows.row_count,
+                    "constraint estimate must append one value per row"
                 );
-                if is_relevant {
-                    assert_eq!(
-                        column.len(),
-                        rows.row_count,
-                        "constraint estimate must append one value per row"
-                    );
-                    relevant.insert(leaf);
-                    for row in 0..rows.row_count {
-                        if proposers[row] == usize::MAX || column[row] < estimates[row] {
-                            proposers[row] = leaf;
-                            estimates[row] = column[row];
-                        }
-                    }
-                } else {
-                    assert_eq!(
-                        column.len(),
-                        0,
-                        "irrelevant constraint estimate must leave its sink untouched"
-                    );
+            } else {
+                assert!(
+                    column.is_empty(),
+                    "missing constraint estimate must leave its sink untouched"
+                );
+                column.resize(rows.row_count, usize::MAX);
+            }
+            for row in 0..rows.row_count {
+                let planning_cost =
+                    directed.map_or(column[row], |model| model.planning_cost(peer, column[row]));
+                if proposers[row] == usize::MAX
+                    || (planning_cost, peer.occurrence) < (proposal_costs[row], proposers[row])
+                {
+                    proposers[row] = peer.occurrence;
+                    proposal_costs[row] = planning_cost;
+                    // Directed work prices select the physical source for
+                    // this variable. Cross-variable ordering remains the
+                    // established cardinality heuristic: compare the raw
+                    // occurrence count quoted by each variable's selected
+                    // source, not backend-specific action units. This keeps
+                    // source direction and logical variable order independent.
+                    estimates[row] = column[row];
                 }
             }
         }
         if proposers.iter().any(|&child| child == usize::MAX) {
-            assert!(
-                plan.certified_denotation,
-                "unconstrained variable in residual-state query"
-            );
             estimate_matrix.truncate(estimate_start);
             continue;
         }
@@ -7987,7 +7908,7 @@ fn ready_plan_transition<'a>(
         });
     }
 
-    assert!(!plans.is_empty(), "{CERTIFIED_SOURCE_FRONTIER_ERROR}");
+    assert!(!plans.is_empty(), "{SOURCE_FRONTIER_ERROR}");
 
     let mut preferred = Vec::with_capacity(rows.row_count);
     let mut preferred_counts = vec![0; plans.len()];
@@ -8107,7 +8028,7 @@ fn ready_quoted_plan_transition<'a>(
         plans.push(QuotedVariablePlan { variable, choices });
     }
 
-    assert!(!plans.is_empty(), "{CERTIFIED_SOURCE_FRONTIER_ERROR}");
+    assert!(!plans.is_empty(), "{SOURCE_FRONTIER_ERROR}");
 
     let mut preferred = Vec::with_capacity(rows.row_count);
     let mut preferred_counts = vec![0; plans.len()];
@@ -8589,17 +8510,13 @@ fn candidate_plan_transition<'a>(
             &view,
             &mut EstimateSink::Column(&mut column),
         );
-        if plan.certified_denotation && !is_relevant {
+        if !is_relevant {
             assert!(
                 column.is_empty(),
                 "missing constraint estimate must leave its sink untouched"
             );
             column.resize(batch.parents.row_count, usize::MAX);
         } else {
-            assert!(
-                is_relevant,
-                "a relevant child became irrelevant before the candidate was committed"
-            );
             assert_eq!(
                 column.len(),
                 batch.parents.row_count,
@@ -9525,13 +9442,10 @@ fn formula_or_plan_transition<'a>(
             continue;
         }
         column.clear();
-        if estimate_constraint(
-            plan.resolve_formula_node(root, occurrence, children[child]),
-            plan.certified_denotation,
-            variable,
-            &view,
-            &mut EstimateSink::Column(&mut column),
-        ) {
+        if plan
+            .resolve_formula_node(root, occurrence, children[child])
+            .estimate(variable, &view, &mut EstimateSink::Column(&mut column))
+        {
             assert_eq!(
                 column.len(),
                 batch.parents.row_count,
@@ -9607,77 +9521,43 @@ fn formula_and_plan_transition<'a>(
             continue;
         }
         let constraint = plan.resolve_formula_node(root, occurrence, children[child]);
-        if plan.certified_denotation {
-            if !constraint.variables().is_set(variable) {
-                next = next.with_pc(interner.formula_pcs.skip_child(
-                    &plan.finite_formula,
-                    next.pc,
-                    child,
-                ));
-                continue;
-            }
-            if stage == FormulaStage::Propose
-                && plan.formula_node_proposal_coverage(
-                    root,
-                    occurrence,
-                    children[child],
-                    variable,
-                    desc.bound,
-                ) < ProposalCoverage::Covering
-            {
-                // Not a source, but still an unfinished validator. The first
-                // selected source changes the AND stage to Confirm, where this
-                // child must run regardless of quote availability.
-                continue;
-            }
-            let mut column = Vec::with_capacity(batch.parents.row_count);
-            if estimate_constraint(
-                constraint,
-                true,
-                variable,
-                &view,
-                &mut EstimateSink::Column(&mut column),
-            ) {
-                assert_eq!(
-                    column.len(),
-                    batch.parents.row_count,
-                    "AND child estimate must append one value per row"
-                );
-            } else {
-                assert!(
-                    column.is_empty(),
-                    "missing AND child estimate must leave its sink untouched"
-                );
-                column.resize(batch.parents.row_count, usize::MAX);
-            }
-            estimates_by_child.push((child, column));
-            continue;
-        }
-        let mut column = Vec::with_capacity(batch.parents.row_count);
-        if estimate_constraint(
-            constraint,
-            false,
-            variable,
-            &view,
-            &mut EstimateSink::Column(&mut column),
-        ) {
-            assert_eq!(
-                column.len(),
-                batch.parents.row_count,
-                "AND child estimate must append one value per row"
-            );
-            estimates_by_child.push((child, column));
-        } else {
-            assert!(
-                column.is_empty(),
-                "irrelevant AND child estimate must leave its sink untouched"
-            );
+        if !constraint.variables().is_set(variable) {
             next = next.with_pc(interner.formula_pcs.skip_child(
                 &plan.finite_formula,
                 next.pc,
                 child,
             ));
+            continue;
         }
+        if stage == FormulaStage::Propose
+            && plan.formula_node_proposal_coverage(
+                root,
+                occurrence,
+                children[child],
+                variable,
+                desc.bound,
+            ) < ProposalCoverage::Covering
+        {
+            // Not a source, but still an unfinished validator. The first
+            // selected source changes the AND stage to Confirm, where this
+            // child must run regardless of quote availability.
+            continue;
+        }
+        let mut column = Vec::with_capacity(batch.parents.row_count);
+        if constraint.estimate(variable, &view, &mut EstimateSink::Column(&mut column)) {
+            assert_eq!(
+                column.len(),
+                batch.parents.row_count,
+                "AND child estimate must append one value per row"
+            );
+        } else {
+            assert!(
+                column.is_empty(),
+                "missing AND child estimate must leave its sink untouched"
+            );
+            column.resize(batch.parents.row_count, usize::MAX);
+        }
+        estimates_by_child.push((child, column));
     }
 
     let done_count = match &interner.formula(next).focus {
@@ -9715,8 +9595,7 @@ fn formula_and_plan_transition<'a>(
     let root_proposal =
         stage == FormulaStage::Propose && interner.formula(next).return_to.is_none();
     for (child, mut batch) in batch.partition(vars.len(), &assignments) {
-        let next = if plan.certified_denotation
-            && root_proposal
+        let next = if root_proposal
             && plan.formula_node_proposal_coverage(
                 root,
                 occurrence,
@@ -9905,9 +9784,7 @@ fn formula_action_transition<'a>(
     match stage {
         FormulaStage::Support => unreachable!("support returned above"),
         FormulaStage::Propose => {
-            _ = propose_constraint(
-                constraint,
-                plan.certified_denotation,
+            _ = constraint.propose_with_layout(
                 variable,
                 &view,
                 &mut result.sink(batch.parents.row_count),
@@ -9916,13 +9793,7 @@ fn formula_action_transition<'a>(
             stats.max_propose_candidates = stats.max_propose_candidates.max(result.len());
         }
         FormulaStage::Confirm => {
-            confirm_constraint(
-                constraint,
-                plan.certified_denotation,
-                variable,
-                &view,
-                &mut result.sink(batch.parents.row_count),
-            );
+            constraint.confirm(variable, &view, &mut result.sink(batch.parents.row_count));
             stats.candidates_confirmed += candidates_before;
             stats.max_confirm_candidates = stats.max_confirm_candidates.max(candidates_before);
         }
@@ -10710,28 +10581,12 @@ where
                 VariableSet::new_empty()
             }
         });
-        let certified_denotation = root.fixed_denotation();
         let base_estimates = std::array::from_fn(|variable| {
             if !full.is_set(variable) {
                 return usize::MAX;
             }
-            source_quote_scalar(
-                &root,
-                certified_denotation,
-                variable,
-                VariableSet::new_empty(),
-                &RowsView::EMPTY,
-            )
-            .map_or_else(
-                || {
-                    assert!(
-                        certified_denotation,
-                        "unconstrained variable in residual frame"
-                    );
-                    usize::MAX
-                },
-                |(_, estimate)| estimate,
-            )
+            source_quote_scalar(&root, variable, VariableSet::new_empty(), &RowsView::EMPTY)
+                .map_or(usize::MAX, |(_, estimate)| estimate)
         });
 
         let plan = ResidualPlan::compile_lowering(&root, lowering);
@@ -11841,7 +11696,7 @@ impl ResidualStateMachine {
         if stream_proposal {
             assert!(
                 batch.or_count() == 0,
-                "a certified linear formula proposal carried an OR reducer cell"
+                "a relational linear formula proposal carried an OR reducer cell"
             );
         }
         let vars: Vec<VariableId> = task.desc.bound.into_iter().collect();
@@ -14161,10 +14016,6 @@ mod tests {
             VariableSet::new_singleton(self.variable)
         }
 
-        fn fixed_denotation(&self) -> bool {
-            true
-        }
-
         fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
             if variable == self.variable && !bound.is_set(variable) {
                 self.coverage
@@ -14221,10 +14072,6 @@ mod tests {
                         .union(VariableSet::new_singleton(self.variable))
                 },
             )
-        }
-
-        fn fixed_denotation(&self) -> bool {
-            true
         }
 
         fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
@@ -14294,7 +14141,7 @@ mod tests {
     /// already-bound parent. The denotation does not depend on those costs;
     /// they only force a deterministic heterogeneous Ready choice in tests.
     #[derive(Clone)]
-    struct CertifiedAdaptiveSource {
+    struct RelationalAdaptiveSource {
         parent: Option<VariableId>,
         variable: VariableId,
         coverage: ProposalCoverage,
@@ -14303,7 +14150,7 @@ mod tests {
         proposed_rows: Arc<AtomicUsize>,
     }
 
-    impl Constraint<'static> for CertifiedAdaptiveSource {
+    impl Constraint<'static> for RelationalAdaptiveSource {
         fn variables(&self) -> VariableSet {
             self.parent.map_or_else(
                 || VariableSet::new_singleton(self.variable),
@@ -14312,10 +14159,6 @@ mod tests {
                         .union(VariableSet::new_singleton(self.variable))
                 },
             )
-        }
-
-        fn fixed_denotation(&self) -> bool {
-            true
         }
 
         fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
@@ -14461,10 +14304,6 @@ mod tests {
             )
         }
 
-        fn fixed_denotation(&self) -> bool {
-            true
-        }
-
         fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
             if variable == self.variable
                 && !bound.is_set(variable)
@@ -14575,10 +14414,6 @@ mod tests {
             self.0.variables()
         }
 
-        fn fixed_denotation(&self) -> bool {
-            self.0.fixed_denotation()
-        }
-
         fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
             self.0.proposal_coverage(variable, bound)
         }
@@ -14610,41 +14445,13 @@ mod tests {
             self.0.confirm(variable, view, candidates);
         }
 
-        fn estimate_certified(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            out: &mut EstimateSink<'_>,
-        ) -> bool {
-            self.0.estimate_certified(variable, view, out)
-        }
-
-        fn propose_certified(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) {
-            self.0.propose_certified(variable, view, candidates);
-        }
-
-        fn propose_certified_with_receipt(
+        fn propose_with_layout(
             &self,
             variable: VariableId,
             view: &RowsView<'_>,
             candidates: &mut CandidateSink<'_>,
         ) -> ProposalLayout {
-            self.0
-                .propose_certified_with_receipt(variable, view, candidates)
-        }
-
-        fn confirm_certified(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) {
-            self.0.confirm_certified(variable, view, candidates);
+            self.0.propose_with_layout(variable, view, candidates)
         }
 
         fn satisfied(&self, view: &RowsView<'_>) -> bool {
@@ -14816,6 +14623,14 @@ mod tests {
             VariableSet::new_singleton(self.variable)
         }
 
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            if variable == self.variable && !bound.is_set(variable) {
+                ProposalCoverage::Exact
+            } else {
+                ProposalCoverage::None
+            }
+        }
+
         fn estimate(
             &self,
             variable: VariableId,
@@ -14843,10 +14658,18 @@ mod tests {
 
         fn confirm(
             &self,
-            _variable: VariableId,
+            variable: VariableId,
             _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
+            candidates: &mut CandidateSink<'_>,
         ) {
+            if variable == self.variable {
+                candidates.retain(|_, value| self.values.contains(value));
+            }
+        }
+
+        fn satisfied(&self, view: &RowsView<'_>) -> bool {
+            view.col(self.variable)
+                .is_none_or(|column| view.iter().all(|row| self.values.contains(&row[column])))
         }
     }
 
@@ -15008,6 +14831,14 @@ mod tests {
             VariableSet::new_singleton(self.variable)
         }
 
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            if variable == self.variable && !bound.is_set(variable) {
+                ProposalCoverage::Exact
+            } else {
+                ProposalCoverage::None
+            }
+        }
+
         fn estimate(
             &self,
             variable: VariableId,
@@ -15090,6 +14921,14 @@ mod tests {
             VariableSet::new_singleton(self.variable)
         }
 
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            if variable == self.variable && !bound.is_set(variable) {
+                ProposalCoverage::Exact
+            } else {
+                ProposalCoverage::None
+            }
+        }
+
         fn estimate(
             &self,
             variable: VariableId,
@@ -15119,10 +14958,18 @@ mod tests {
 
         fn confirm(
             &self,
-            _variable: VariableId,
+            variable: VariableId,
             _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
+            candidates: &mut CandidateSink<'_>,
         ) {
+            if variable == self.variable {
+                candidates.retain(|_, value| self.values.contains(value));
+            }
+        }
+
+        fn satisfied(&self, view: &RowsView<'_>) -> bool {
+            view.col(self.variable)
+                .is_none_or(|column| view.iter().all(|row| self.values.contains(&row[column])))
         }
 
         fn residual_delta_source_is_paged(
@@ -15245,6 +15092,14 @@ mod tests {
     impl Constraint<'static> for ExplicitProgramPagedProposalLeaf {
         fn variables(&self) -> VariableSet {
             VariableSet::new_singleton(self.variable)
+        }
+
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            if variable == self.variable && !bound.is_set(variable) {
+                ProposalCoverage::Exact
+            } else {
+                ProposalCoverage::None
+            }
         }
 
         fn estimate(
@@ -15416,6 +15271,10 @@ mod tests {
     impl Constraint<'static> for DecliningProgramPagedProposalLeaf {
         fn variables(&self) -> VariableSet {
             self.0.variables()
+        }
+
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            self.0.proposal_coverage(variable, bound)
         }
 
         fn estimate(
@@ -17385,6 +17244,14 @@ mod tests {
             VariableSet::new_singleton(self.variable)
         }
 
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            if variable == self.variable && !bound.is_set(variable) {
+                ProposalCoverage::Exact
+            } else {
+                ProposalCoverage::None
+            }
+        }
+
         fn estimate(
             &self,
             variable: VariableId,
@@ -17535,13 +17402,14 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct WholeGroupMinimumLeaf {
+    struct WholeGroupFilterLeaf {
         variable: VariableId,
         estimate: usize,
+        accepted: RawInline,
         calls: Arc<Mutex<Vec<usize>>>,
     }
 
-    impl Constraint<'static> for WholeGroupMinimumLeaf {
+    impl Constraint<'static> for WholeGroupFilterLeaf {
         fn variables(&self) -> VariableSet {
             VariableSet::new_singleton(self.variable)
         }
@@ -17575,9 +17443,9 @@ mod tests {
         ) {
             assert_eq!(variable, self.variable);
             self.calls.lock().unwrap().push(candidates.len());
+            let accepted = self.accepted;
             confirm_per_row(view, candidates, |_, values| {
-                let minimum = values.iter().copied().min();
-                values.retain(|value| Some(*value) == minimum);
+                values.retain(|value| *value == accepted);
             });
         }
     }
@@ -17671,7 +17539,7 @@ mod tests {
 
     #[test]
     fn private_seeded_frame_starts_at_its_local_bound_rank() {
-        let value = [7; 32];
+        let value = [9; 32];
         let mut frame = SeededResidualFrame::new(
             FanoutLeaf {
                 variable: 0,
@@ -17716,6 +17584,14 @@ mod tests {
     impl Constraint<'static> for DeltaSeedTrap {
         fn variables(&self) -> VariableSet {
             VariableSet::new_singleton(self.variable)
+        }
+
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            if variable == self.variable && !bound.is_set(variable) {
+                ProposalCoverage::Exact
+            } else {
+                ProposalCoverage::None
+            }
         }
 
         fn estimate(
@@ -17787,6 +17663,14 @@ mod tests {
             VariableSet::new_singleton(self.variable)
         }
 
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            if variable == self.variable && !bound.is_set(variable) {
+                ProposalCoverage::Exact
+            } else {
+                ProposalCoverage::None
+            }
+        }
+
         fn estimate(
             &self,
             variable: VariableId,
@@ -17843,6 +17727,14 @@ mod tests {
             VariableSet::new_singleton(self.variable)
         }
 
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            if variable == self.variable && !bound.is_set(variable) {
+                ProposalCoverage::Exact
+            } else {
+                ProposalCoverage::None
+            }
+        }
+
         fn estimate(
             &self,
             variable: VariableId,
@@ -17889,6 +17781,14 @@ mod tests {
     impl Constraint<'static> for VerbLeaf {
         fn variables(&self) -> VariableSet {
             VariableSet::new_singleton(self.variable)
+        }
+
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            if variable == self.variable && !bound.is_set(variable) {
+                ProposalCoverage::Exact
+            } else {
+                ProposalCoverage::None
+            }
         }
 
         fn estimate(
@@ -17981,6 +17881,14 @@ mod tests {
     impl Constraint<'static> for LoggedLeaf {
         fn variables(&self) -> VariableSet {
             VariableSet::new_singleton(self.variable)
+        }
+
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            if variable == self.variable && !bound.is_set(variable) {
+                ProposalCoverage::Exact
+            } else {
+                ProposalCoverage::None
+            }
         }
 
         fn estimate(
@@ -18140,6 +18048,17 @@ mod tests {
             VariableSet::new_singleton(self.parent).union(VariableSet::new_singleton(self.variable))
         }
 
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            if variable == self.variable
+                && bound.is_set(self.parent)
+                && !bound.is_set(self.variable)
+            {
+                ProposalCoverage::Exact
+            } else {
+                ProposalCoverage::None
+            }
+        }
+
         fn estimate(
             &self,
             variable: VariableId,
@@ -18161,18 +18080,31 @@ mod tests {
 
         fn propose(
             &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
+            variable: VariableId,
+            view: &RowsView<'_>,
+            candidates: &mut CandidateSink<'_>,
         ) {
+            if variable == self.variable {
+                for row in 0..view.len() as u32 {
+                    candidates.push(row, raw(42));
+                }
+            }
         }
 
         fn confirm(
             &self,
-            _variable: VariableId,
+            variable: VariableId,
             _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
+            candidates: &mut CandidateSink<'_>,
         ) {
+            if variable == self.variable {
+                candidates.retain(|_, value| *value == raw(42));
+            }
+        }
+
+        fn satisfied(&self, view: &RowsView<'_>) -> bool {
+            view.col(self.variable)
+                .is_none_or(|column| view.iter().all(|row| row[column] == raw(42)))
         }
     }
 
@@ -18186,10 +18118,6 @@ mod tests {
     impl Constraint<'static> for DirectedEstimateLeaf {
         fn variables(&self) -> VariableSet {
             VariableSet::new_singleton(self.variable)
-        }
-
-        fn fixed_denotation(&self) -> bool {
-            true
         }
 
         fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
@@ -18252,6 +18180,17 @@ mod tests {
             VariableSet::new_singleton(self.parent).union(VariableSet::new_singleton(self.variable))
         }
 
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            if variable == self.variable
+                && bound.is_set(self.parent)
+                && !bound.is_set(self.variable)
+            {
+                ProposalCoverage::Exact
+            } else {
+                ProposalCoverage::None
+            }
+        }
+
         fn estimate(
             &self,
             variable: VariableId,
@@ -18297,8 +18236,16 @@ mod tests {
             _view: &RowsView<'_>,
             candidates: &mut CandidateSink<'_>,
         ) {
-            assert_eq!(variable, self.variable);
-            candidates.retain(|_, value| *value == self.value);
+            if variable == self.variable {
+                candidates.retain(|_, value| *value == self.value);
+            } else {
+                assert_eq!(variable, self.parent);
+            }
+        }
+
+        fn satisfied(&self, view: &RowsView<'_>) -> bool {
+            view.col(self.variable)
+                .is_none_or(|column| view.iter().all(|row| row[column] == self.value))
         }
     }
 
@@ -18314,6 +18261,17 @@ mod tests {
     impl Constraint<'static> for MaskedUnionArm {
         fn variables(&self) -> VariableSet {
             VariableSet::new_singleton(self.parent).union(VariableSet::new_singleton(self.variable))
+        }
+
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            if variable == self.variable
+                && bound.is_set(self.parent)
+                && !bound.is_set(self.variable)
+            {
+                ProposalCoverage::Exact
+            } else {
+                ProposalCoverage::None
+            }
         }
 
         fn estimate(
@@ -19036,7 +18994,6 @@ mod tests {
     ) -> Vec<(VariableId, usize, usize)> {
         let root = IntersectionConstraint::new(leaves);
         let plan = ResidualPlan::compile(&root);
-        assert!(plan.certified_denotation);
         let desc = StateDesc {
             bound: VariableSet::new_empty(),
             phase: ResidualPhase::Ready,
@@ -19049,7 +19006,7 @@ mod tests {
         let influences = std::array::from_fn(|variable| root.influence(variable));
         let mut base_estimates = [usize::MAX; 128];
         for variable in full {
-            assert!(root.estimate_certified(
+            assert!(root.estimate(
                 variable,
                 &RowsView::EMPTY,
                 &mut EstimateSink::Scalar(&mut base_estimates[variable]),
@@ -19667,7 +19624,7 @@ mod tests {
         };
         let view = rows_view(&vars, &rows.rows, rows.row_count);
         let mut ordinary = Vec::new();
-        assert!(root.estimate_certified(TARGET, &view, &mut EstimateSink::Column(&mut ordinary),));
+        assert!(root.estimate(TARGET, &view, &mut EstimateSink::Column(&mut ordinary),));
         assert_eq!(ordinary, [1, 2]);
         for calls in [
             &direct_calls,
@@ -20252,7 +20209,7 @@ mod tests {
             let exact_rows = Arc::new(AtomicUsize::new(0));
             let covering_rows = Arc::new(AtomicUsize::new(0));
             let root = Arc::new(IntersectionConstraint::new(vec![
-                Box::new(CertifiedAdaptiveSource {
+                Box::new(RelationalAdaptiveSource {
                     parent: None,
                     variable: PARENT,
                     coverage: ProposalCoverage::Exact,
@@ -20260,7 +20217,7 @@ mod tests {
                     values: Arc::new(vec![raw(0), raw(1)]),
                     proposed_rows: Arc::clone(&parent_rows),
                 }) as ShapeConstraint,
-                Box::new(CertifiedAdaptiveSource {
+                Box::new(RelationalAdaptiveSource {
                     parent: Some(PARENT),
                     variable: TARGET,
                     coverage: ProposalCoverage::Exact,
@@ -20268,7 +20225,7 @@ mod tests {
                     values: Arc::new(vec![raw(42)]),
                     proposed_rows: Arc::clone(&exact_rows),
                 }),
-                Box::new(CertifiedAdaptiveSource {
+                Box::new(RelationalAdaptiveSource {
                     parent: Some(PARENT),
                     variable: TARGET,
                     coverage: ProposalCoverage::Covering,
@@ -20367,7 +20324,7 @@ mod tests {
             };
             let nested_or = Box::new(UnionConstraint::new(vec![arm(), arm()])) as ShapeConstraint;
             let root = Arc::new(IntersectionConstraint::new(vec![
-                Box::new(CertifiedAdaptiveSource {
+                Box::new(RelationalAdaptiveSource {
                     parent: None,
                     variable: PARENT,
                     coverage: ProposalCoverage::Exact,
@@ -20375,7 +20332,7 @@ mod tests {
                     values: Arc::new(vec![raw(0), raw(1)]),
                     proposed_rows: Arc::clone(&parent_rows),
                 }) as ShapeConstraint,
-                Box::new(CertifiedAdaptiveSource {
+                Box::new(RelationalAdaptiveSource {
                     parent: Some(PARENT),
                     variable: TARGET,
                     coverage: ProposalCoverage::Exact,
@@ -20556,78 +20513,6 @@ mod tests {
             [(B, 1, 1)],
             "the b source keeps its directed peer pricing, but b must beat a by raw width"
         );
-    }
-
-    #[test]
-    fn synthetic_root_formula_keeps_outer_per_row_variable_choice() {
-        const PARENT: VariableId = 0;
-        const LEFT: VariableId = 1;
-        const RIGHT: VariableId = 2;
-        let root = IntersectionConstraint::new(vec![
-            RowEstimateLeaf {
-                parent: PARENT,
-                variable: LEFT,
-                estimates: [1, 64],
-            },
-            RowEstimateLeaf {
-                parent: PARENT,
-                variable: RIGHT,
-                estimates: [64, 1],
-            },
-        ]);
-        let plan = ResidualPlan::compile_lowering(
-            &root,
-            ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Disabled),
-        );
-        assert!(
-            plan.formula_ready_quote.is_none(),
-            "an uncertified root must retain the V3.1 plain grouping path"
-        );
-        let desc = StateDesc {
-            bound: VariableSet::new_singleton(PARENT),
-            phase: ResidualPhase::Ready,
-        };
-        let rows = RowBatch {
-            rows: vec![raw(0), raw(1)],
-            row_count: 2,
-        };
-        let influences = [VariableSet::new_empty(); 128];
-        let base_estimates = [1; 128];
-        let mut worklist = Worklist::new();
-        let mut interner = StateInterner::default();
-        let mut stats = ResidualStateStats::default();
-        let _ = ready_plan_transition(
-            &root,
-            &plan,
-            &desc,
-            rows,
-            root.variables(),
-            &influences,
-            &base_estimates,
-            &mut worklist,
-            &mut interner,
-            &mut stats,
-        );
-
-        let mut actions = Vec::new();
-        for level in worklist.values() {
-            for (&id, bucket) in level {
-                let ResidualPhase::Propose {
-                    variable, proposer, ..
-                } = interner.get(id).phase
-                else {
-                    panic!("Ready planning filed a non-proposal state")
-                };
-                actions.push((variable, proposer, bucket.row_count()));
-            }
-        }
-        actions.sort_unstable();
-        assert_eq!(actions, [(LEFT, 0, 1), (RIGHT, 0, 1)]);
-        assert_eq!(stats.ready_preferred_variable_groups, 2);
-        assert_eq!(stats.formula_outer_entry_pops, 0);
-        assert_eq!(stats.formula_ready_quote_groups, 0);
-        assert_eq!(stats.formula_ready_quote_root_plan_filings_elided, 0);
-        assert_eq!(stats.formula_ready_quote_estimate_rows, 0);
     }
 
     #[test]
@@ -22620,7 +22505,7 @@ mod tests {
     }
 
     #[test]
-    fn full_switch_routes_every_live_legacy_fallback_shape_to_residual() {
+    fn full_switch_routes_every_live_relational_shape_to_residual() {
         fn assert_residual<C>(root: C)
         where
             C: Constraint<'static> + 'static,
@@ -22632,26 +22517,14 @@ mod tests {
             assert!(query.dag.is_none());
         }
 
-        assert_residual(ShapeLeaf(0));
-        assert_residual(IntersectionConstraint::new(vec![shape_leaf(0)]));
-        assert_residual(IntersectionConstraint::new(vec![
-            shape_leaf(0),
-            shape_leaf(1),
-        ]));
-        assert_residual(UnionConstraint::new(vec![ShapeLeaf(0), ShapeLeaf(0)]));
-
-        use crate::inline::encodings::genid::GenId;
-        use crate::query::regularpathconstraint::{PathOp, RegularPathConstraint};
-        use crate::trible::TribleSet;
-        let mut context = VariableContext::new();
-        let start = context.next_variable::<GenId>();
-        let end = context.next_variable::<GenId>();
-        assert_residual(RegularPathConstraint::new(
-            TribleSet::new(),
-            start,
-            end,
-            &[PathOp::Attr(crate::id::rngid().raw()), PathOp::Plus],
-        ));
+        let source = |variable| FanoutLeaf {
+            variable,
+            values: Arc::new(vec![raw(1)]),
+        };
+        assert_residual(source(0));
+        assert_residual(IntersectionConstraint::new(vec![source(0)]));
+        assert_residual(IntersectionConstraint::new(vec![source(0), source(1)]));
+        assert_residual(UnionConstraint::new(vec![source(0), source(0)]));
 
         let mut true_constant = Query::new(ZeroVariableTruth(true), |_| Some(()));
         assert_eq!(true_constant.scheduler, QueryScheduler::ResidualState);
@@ -25060,9 +24933,10 @@ mod tests {
                 variable: 1,
                 values: Arc::new(vec![raw(8), raw(9)]),
             }) as ShapeConstraint,
-            Box::new(WholeGroupMinimumLeaf {
+            Box::new(WholeGroupFilterLeaf {
                 variable: 1,
                 estimate: 65,
+                accepted: raw(8),
                 calls: Arc::clone(&calls),
             }) as ShapeConstraint,
         ]);
@@ -25083,7 +24957,7 @@ mod tests {
             .events
             .iter()
             .find(|event| event.site.verb == ActionVerb::Confirm && event.site.variable == 1)
-            .expect("whole-group confirmation was observed");
+            .expect("whole-group filtering was observed");
         assert_eq!(confirmation.site.bound, VariableSet::new_singleton(0));
         assert_eq!(confirmation.geometry.parent_rows, 1);
         assert_eq!(confirmation.geometry.candidate_occurrences, 2);
@@ -25849,7 +25723,7 @@ mod tests {
     }
 
     #[test]
-    fn whole_group_confirmer_runs_atomically_before_page_local_suffix() {
+    fn whole_group_filter_runs_atomically_before_page_local_suffix() {
         let whole_calls = Arc::new(Mutex::new(Vec::new()));
         let page_calls = Arc::new(Mutex::new(Vec::new()));
         let make = || {
@@ -25858,9 +25732,10 @@ mod tests {
                     variable: 0,
                     values: Arc::new(vec![raw(3), raw(1), raw(1), raw(2)]),
                 }) as ShapeConstraint,
-                Box::new(WholeGroupMinimumLeaf {
+                Box::new(WholeGroupFilterLeaf {
                     variable: 0,
                     estimate: 5,
+                    accepted: raw(1),
                     calls: Arc::clone(&whole_calls),
                 }) as ShapeConstraint,
                 Box::new(PageFilterLeaf {
@@ -25881,11 +25756,11 @@ mod tests {
         sequential.sort_unstable();
         assert_eq!(residual, [raw(1)]);
         assert_eq!(residual, sequential);
-        assert_eq!(*whole_calls.lock().unwrap(), [4, 4]);
+        assert_eq!(*whole_calls.lock().unwrap(), [4, 4, 2]);
         assert_eq!(
             *page_calls.lock().unwrap(),
-            [1, 2],
-            "the whole-group confirmer sees four raw occurrences before the page-local suffix sees its admitted relation"
+            [1, 2, 2],
+            "the whole-group filter sees four raw occurrences before the page-local suffix sees its admitted relation"
         );
 
         let synthetic_whole_calls = Arc::new(Mutex::new(Vec::new()));
@@ -25895,9 +25770,10 @@ mod tests {
                 variable: 0,
                 values: Arc::new(vec![raw(3), raw(1), raw(1), raw(2)]),
             }) as ShapeConstraint,
-            Box::new(WholeGroupMinimumLeaf {
+            Box::new(WholeGroupFilterLeaf {
                 variable: 0,
                 estimate: 5,
+                accepted: raw(1),
                 calls: Arc::clone(&synthetic_whole_calls),
             }) as ShapeConstraint,
             Box::new(PageFilterLeaf {
@@ -25925,7 +25801,7 @@ mod tests {
     }
 
     #[test]
-    fn opaque_union_deduplicates_whole_group_before_page_local_suffix() {
+    fn opaque_union_reconfirms_the_admitted_set_before_page_local_suffix() {
         let left_calls = Arc::new(Mutex::new(Vec::new()));
         let right_calls = Arc::new(Mutex::new(Vec::new()));
         let suffix_calls = Arc::new(Mutex::new(Vec::new()));
@@ -25968,9 +25844,9 @@ mod tests {
         sequential.sort_unstable();
         assert_eq!(residual, [raw(0), raw(1)]);
         assert_eq!(residual, sequential);
-        assert_eq!(*left_calls.lock().unwrap(), [5, 5]);
-        assert_eq!(*right_calls.lock().unwrap(), [5, 5]);
-        assert_eq!(*suffix_calls.lock().unwrap(), [1, 1, 2]);
+        assert_eq!(*left_calls.lock().unwrap(), [5, 5, 2]);
+        assert_eq!(*right_calls.lock().unwrap(), [5, 5, 2]);
+        assert_eq!(*suffix_calls.lock().unwrap(), [1, 1, 2, 2]);
     }
 
     #[test]
@@ -26257,6 +26133,10 @@ mod tests {
             self.inner.variables()
         }
 
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            self.inner.proposal_coverage(variable, bound)
+        }
+
         fn estimate(
             &self,
             variable: VariableId,
@@ -26309,10 +26189,6 @@ mod tests {
                 .all(|variable| view.col(variable).is_some());
             if fully_bound {
                 self.ordinary_support.fetch_add(1, Ordering::Relaxed);
-                assert!(
-                    self.allow_ordinary_fallback,
-                    "ordinary fully-bound RPQ support fallback"
-                );
             }
             self.inner.satisfied(view)
         }
@@ -26354,10 +26230,9 @@ mod tests {
         }
     }
 
-    fn assert_program_fallbacks_unused(counters: &ProgramFallbackCounters) {
+    fn assert_program_action_fallbacks_unused(counters: &ProgramFallbackCounters) {
         assert_eq!(counters.0.load(Ordering::Relaxed), 0);
         assert_eq!(counters.1.load(Ordering::Relaxed), 0);
-        assert_eq!(counters.2.load(Ordering::Relaxed), 0);
     }
 
     /// Keeps adaptive planning visible while proving selected actions execute
@@ -26372,6 +26247,10 @@ mod tests {
     {
         fn variables(&self) -> VariableSet {
             self.inner.variables()
+        }
+
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            self.inner.proposal_coverage(variable, bound)
         }
 
         fn estimate(
@@ -26574,7 +26453,7 @@ mod tests {
             "duplicate source candidates project once"
         );
         assert!(source_residual_query.stats().confirm_action_pops > 0);
-        assert_program_fallbacks_unused(&confirm_counters);
+        assert_program_action_fallbacks_unused(&confirm_counters);
 
         // The inverse partial-confirm route has the same internal affine
         // occurrence law: candidate offsets are neither sorted nor
@@ -26609,7 +26488,7 @@ mod tests {
         assert_eq!(inverse, inverse_expected);
         assert_eq!(inverse.len(), 2, "duplicate end candidates project once");
         assert!(inverse_query.stats().confirm_action_pops > 0);
-        assert_program_fallbacks_unused(&inverse_counters);
+        assert_program_action_fallbacks_unused(&inverse_counters);
 
         // Lowered OR atoms are guarded by Support before proposal. The RPQ
         // endpoints are absent at that point, so this exercises the explicit
@@ -26645,7 +26524,7 @@ mod tests {
         assert!(supported.contains(&(id_into_value(&nodes[2]), id_into_value(&nodes[4]))));
         assert!(supported_query.stats().support_action_pops > 0);
         assert!(supported_query.stats().delta_transition_pages > 0);
-        assert_program_fallbacks_unused(&support_counters);
+        assert_program_action_fallbacks_unused(&support_counters);
     }
 
     #[test]
@@ -26772,7 +26651,7 @@ mod tests {
                     "fixture never reached Confirm: repeated={repeated}, forward={forward}"
                 );
                 assert!(query.stats().delta_transition_pages > 0);
-                assert_program_fallbacks_unused(&counters);
+                assert_program_action_fallbacks_unused(&counters);
             }
         }
     }
@@ -26847,7 +26726,7 @@ mod tests {
             expected.sort_unstable();
             assert_eq!(actual, expected, "{name}");
             assert!(query.stats().support_action_pops > 0, "{name}");
-            assert_program_fallbacks_unused(&counters);
+            assert_program_action_fallbacks_unused(&counters);
         }
     }
 
@@ -26886,7 +26765,7 @@ mod tests {
         assert_eq!(query.next(), None);
         assert!(query.stats().propose_action_pops > 0);
         assert!(query.stats().delta_transition_pages > 0);
-        assert_program_fallbacks_unused(&counters);
+        assert_program_action_fallbacks_unused(&counters);
     }
 
     #[test]
@@ -26946,7 +26825,7 @@ mod tests {
         assert_eq!(actual, exact_set);
         assert_eq!(actual, expected);
         assert!(query.stats().delta_source_pages > 1);
-        assert_program_fallbacks_unused(&counters);
+        assert_program_action_fallbacks_unused(&counters);
     }
 
     #[test]
@@ -27223,7 +27102,7 @@ mod tests {
         assert_eq!(eager_cohort.results.len(), nodes[0].len());
         assert!(
             eager_cohort.stats.delta_terminal_eager_cohort_admissions > 0,
-            "certified RPQ never entered the complete Program phase"
+            "relational RPQ never entered the complete Program phase"
         );
         assert_eq!(
             sparse_cohort.stats.delta_terminal_eager_cohort_admissions,
@@ -28309,7 +28188,7 @@ mod tests {
         assert_eq!(lowered.stats.propose_calls, 3);
         assert_eq!(lowered.stats.confirm_calls, 1);
         assert_eq!(opaque.stats.propose_calls, 1);
-        assert_eq!(opaque.stats.confirm_calls, 0);
+        assert_eq!(opaque.stats.confirm_calls, 1);
     }
 
     #[test]
@@ -28790,7 +28669,7 @@ mod tests {
                 .into_par_residual_state_iter()
                 .collect()
         });
-        assert_program_fallbacks_unused(&full_counters);
+        assert_program_action_fallbacks_unused(&full_counters);
 
         let conservative_counters = program_fallback_counters();
         let mut conservative: Vec<_> = with_parallel_workers(4, || {
@@ -29111,9 +28990,10 @@ mod tests {
                 variable: 0,
                 values: Arc::new(vec![raw(3), raw(1), raw(1), raw(2)]),
             }),
-            parallel_shape(WholeGroupMinimumLeaf {
+            parallel_shape(WholeGroupFilterLeaf {
                 variable: 0,
                 estimate: 5,
+                accepted: raw(1),
                 calls: Arc::clone(&whole_calls),
             }),
             parallel_shape(PageFilterLeaf {

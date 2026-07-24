@@ -3301,10 +3301,6 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         vars
     }
 
-    fn fixed_denotation(&self) -> bool {
-        true
-    }
-
     /// With the opposite endpoint bound, ordinary proposal evaluates the full
     /// path expression (inverting it for a free start) and therefore returns
     /// the exact reachable endpoint set. When both distinct endpoints are

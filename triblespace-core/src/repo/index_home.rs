@@ -1379,7 +1379,7 @@ fn take_union_complete_walk_counts() -> UnionCompleteWalkCounts {
 /// per-row set-union semantics. Confirmation instead treats shard union as a
 /// physical representation detail: it filters the original candidate bag by
 /// OR-membership, preserving every surviving occurrence's tag, order, and
-/// multiplicity. The legacy proposal-page capability preserves a globally
+/// multiplicity. The normalized proposal-page capability preserves a globally
 /// ordered, duplicate-free stream by merging one head per shard. The typed
 /// Program instead drains each shard's ordered cursor in attachment order and
 /// emits raw occurrences: the residual engine's activation-local SET boundary
@@ -2090,10 +2090,6 @@ where
 {
     fn variables(&self) -> VariableSet {
         self.union.variables()
-    }
-
-    fn fixed_denotation(&self) -> bool {
-        true
     }
 
     fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {

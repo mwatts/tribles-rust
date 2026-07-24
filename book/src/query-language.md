@@ -481,13 +481,26 @@ execution methods are:
 | `satisfied` | Report exact truth once every relevant variable is bound. |
 | `influence` | Name estimates that may change after a variable is bound or unbound. |
 
-The optional `fixed_denotation` and `proposal_coverage` methods are semantic
-receipts rather than execution verbs. Their defaults retain action-defined
-planning. A complete root enters receipt-aware relational SET planning only
-when every occurrence certifies a fixed denotation; proposal coverage then
-selects sound sources independently of estimates. A transparent wrapper that
-forwards these receipts must also forward the certified estimate, proposal,
-and confirmation methods.
+Every constraint occurrence denotes one fixed raw-inline SET relation over the
+variables returned by `variables`. Its ordinary, paged, typed-Program, and
+complete-equivalent routes must agree on that relation. `estimate` supplies
+cost guidance only; it cannot change relevance, source eligibility, or query
+results.
+
+`proposal_coverage` is the structural source-eligibility receipt. It says
+whether `propose` makes no completeness claim for a target (`None`), covers
+that target's complete existential fiber and therefore requires
+self-confirmation (`Covering`), or equals that fiber (`Exact`). Coverage
+depends on the occurrence, target, and bound-variable schema, never on bound
+values or estimates. Every surviving non-full query state needs at least one
+Covering or Exact source, while a confirmation-only constraint may publish
+`None`.
+
+The engine may invoke `propose_with_layout` to receive a `ProposalLayout`
+alongside a completed proposal. That receipt describes only the physical
+uniqueness of `(parent, value)` occurrences in that particular sink, allowing
+an optional deduplication elision. It does not strengthen proposal coverage or
+alter the constraint's SET meaning.
 
 The explicit `Query::sequential()` scheduler calls these methods with a one-row
 [`RowsView`](triblespace::core::query::RowsView) and scalar/plain-value sinks;
@@ -508,13 +521,16 @@ therefore be incorrect. Diagnostics may observe call boundaries, but must not
 feed those observations back into protocol answers. Ordinary `into_par_iter()`
 retains the scalar DFS splitter for CPU-oriented workloads.
 
-`propose` owns the empty sink it receives, whereas `confirm` may only remove
-entries from an existing sink. `satisfied` may conservatively return `true`
-while a relevant variable remains unbound, but its result must be exact once
-all of the constraint's variables are present in the view. That exactness is
-required for sound composition with `or!` and for constant, zero-variable
-checks; it is not merely an optional early-pruning optimization. Zero-variable
-roots are settled once during construction. The [Query Engine](query-engine.md#the-constraint-protocol)
+`propose` owns the empty sink it receives. `confirm` may only return a subbag
+of its input: it must retain every candidate occurrence that belongs to the
+relation's existential fiber, and it must be exact once every other variable
+of the occurrence is bound. `satisfied` may conservatively return `true` while
+a relevant variable remains unbound, but `false` must prove that the row has
+no completion, and the answer must be exact once all of the constraint's
+variables are present in the view. That exactness is required for sound
+composition with `or!` and for constant, zero-variable checks; it is not
+merely an optional early-pruning optimization. Zero-variable roots are settled
+once during construction. The [Query Engine](query-engine.md#the-constraint-protocol)
 chapter explains the protocol and its schedulers in detail.
 
 ## Regular path queries

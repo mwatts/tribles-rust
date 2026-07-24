@@ -6,15 +6,13 @@ use smallvec::SmallVec;
 /// All children must agree on every variable binding. Built by the
 /// [`and!`](crate::and) macro or directly via [`new`](Self::new).
 ///
-/// A certified fixed-denotation intersection uses semantic receipts to admit
-/// only covering children as sources; every target-containing child remains a
-/// validator, whether or not it supplies an estimate, and a covering proposer
-/// validates itself. An uncertified intersection retains the action-preserving
-/// legacy rule: per row, the child with the lowest
+/// Only covering children may act as sources; every target-containing child
+/// remains a validator whether or not it supplies an estimate, and a covering
+/// proposer validates itself. Per row, the source with the lowest
 /// [`estimate`](Constraint::estimate) proposes candidates. Lower child index
 /// breaks equal estimates, and the remaining children
-/// [`confirm`](Constraint::confirm) them — not per branch, but in
-/// whole-frontier passes, one per child. That deferral is
+/// [`confirm`](Constraint::confirm) them in whole-frontier passes, one per
+/// child. That deferral is
 /// what fuses the per-branch confirm trickle into one ragged batch per
 /// (child, level), which is what makes batched probe streams and accelerator
 /// dispatch possible in the first place.
@@ -63,7 +61,7 @@ where
             .collect()
     }
 
-    fn certified_estimate(
+    fn source_estimate(
         &self,
         variable: VariableId,
         view: &RowsView<'_>,
@@ -79,7 +77,7 @@ where
                 let mut best = usize::MAX;
                 for &(index, _) in &sources {
                     let mut estimate = usize::MAX;
-                    self.constraints[index].estimate_certified(
+                    self.constraints[index].estimate(
                         variable,
                         view,
                         &mut EstimateSink::Scalar(&mut estimate),
@@ -94,7 +92,7 @@ where
                 let mut scratch = Vec::new();
                 for &(index, _) in &sources {
                     scratch.clear();
-                    if self.constraints[index].estimate_certified(
+                    if self.constraints[index].estimate(
                         variable,
                         view,
                         &mut EstimateSink::Column(&mut scratch),
@@ -111,7 +109,7 @@ where
         true
     }
 
-    fn certified_validator_order(
+    fn validator_order(
         &self,
         variable: VariableId,
         view: &RowsView<'_>,
@@ -123,7 +121,7 @@ where
                 continue;
             }
             let mut estimate = usize::MAX;
-            self.constraints[index].estimate_certified(
+            self.constraints[index].estimate(
                 variable,
                 view,
                 &mut EstimateSink::Scalar(&mut estimate),
@@ -134,7 +132,7 @@ where
         validators
     }
 
-    fn certified_propose(
+    fn propose_intersection(
         &self,
         variable: VariableId,
         view: &RowsView<'_>,
@@ -150,19 +148,18 @@ where
                 .iter()
                 .min_by_key(|&&(index, _)| {
                     let mut estimate = usize::MAX;
-                    self.constraints[index].estimate_certified(
+                    self.constraints[index].estimate(
                         variable,
                         view,
                         &mut EstimateSink::Scalar(&mut estimate),
                     );
                     (estimate, index)
                 })
-                .expect("non-empty certified sources");
-            let layout = self.constraints[proposer]
-                .propose_certified_with_receipt(variable, view, candidates);
+                .expect("non-empty covering sources");
+            let layout = self.constraints[proposer].propose_with_layout(variable, view, candidates);
             let skip = (coverage == ProposalCoverage::Exact).then_some(proposer);
-            for (_, index) in self.certified_validator_order(variable, view, skip) {
-                self.constraints[index].confirm_certified(variable, view, candidates);
+            for (_, index) in self.validator_order(variable, view, skip) {
+                self.constraints[index].confirm(variable, view, candidates);
             }
             return layout;
         }
@@ -171,7 +168,7 @@ where
         let mut columns = Vec::with_capacity(sources.len() * n_rows);
         for &(index, _) in &sources {
             let base = columns.len();
-            if !self.constraints[index].estimate_certified(
+            if !self.constraints[index].estimate(
                 variable,
                 view,
                 &mut EstimateSink::Column(&mut columns),
@@ -187,27 +184,25 @@ where
         for row in 0..n_rows {
             let source = (0..sources.len())
                 .min_by_key(|&source| (columns[source * n_rows + row], sources[source].0))
-                .expect("non-empty certified sources");
+                .expect("non-empty covering sources");
             propose_counts[source] += 1;
             proposers.push(source as u32);
         }
 
         let uniform = (0..sources.len()).find(|&source| propose_counts[source] == n_rows);
         let layout = if let Some(source) = uniform {
-            self.constraints[sources[source].0]
-                .propose_certified_with_receipt(variable, view, candidates)
+            self.constraints[sources[source].0].propose_with_layout(variable, view, candidates)
         } else {
             let mut scratch = Vec::new();
             let mut layout = ProposalLayout::grouped_set();
             for (row, &source) in proposers.iter().enumerate() {
                 let row_view = view.row_view(row);
                 scratch.clear();
-                let row_layout = self.constraints[sources[source as usize].0]
-                    .propose_certified_with_receipt(
-                        variable,
-                        &row_view,
-                        &mut CandidateSink::Values(&mut scratch),
-                    );
+                let row_layout = self.constraints[sources[source as usize].0].propose_with_layout(
+                    variable,
+                    &row_view,
+                    &mut CandidateSink::Values(&mut scratch),
+                );
                 if !row_layout.is_grouped_set() {
                     layout = ProposalLayout::default();
                 }
@@ -220,13 +215,13 @@ where
             (sources[source].1 == ProposalCoverage::Exact).then_some(sources[source].0)
         });
         let first = view.row_view(0);
-        for (_, index) in self.certified_validator_order(variable, &first, skip) {
-            self.constraints[index].confirm_certified(variable, view, candidates);
+        for (_, index) in self.validator_order(variable, &first, skip) {
+            self.constraints[index].confirm(variable, view, candidates);
         }
         layout
     }
 
-    fn certified_confirm(
+    fn confirm_intersection(
         &self,
         variable: VariableId,
         view: &RowsView<'_>,
@@ -236,8 +231,8 @@ where
             return;
         }
         let first = view.row_view(0);
-        for (_, index) in self.certified_validator_order(variable, &first, None) {
-            self.constraints[index].confirm_certified(variable, view, candidates);
+        for (_, index) in self.validator_order(variable, &first, None) {
+            self.constraints[index].confirm(variable, view, candidates);
         }
     }
 }
@@ -266,18 +261,12 @@ where
             .fold(VariableSet::new_empty(), |vs, c| vs.union(c.variables()))
     }
 
-    /// A conjunction has one fixed relation only when every child does.
-    fn fixed_denotation(&self) -> bool {
-        self.constraints.iter().all(Constraint::fixed_denotation)
-    }
-
     /// Any covering relevant child is a complete source for an intersection:
     /// the joint fiber is a subset of that child's fiber. A multi-child
     /// conjunction is not generally exact even when its source is exact,
     /// because the remaining children can eliminate proposed values.
     fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-        if !self.fixed_denotation() || bound.is_set(variable) || !self.variables().is_set(variable)
-        {
+        if bound.is_set(variable) || !self.variables().is_set(variable) {
             return ProposalCoverage::None;
         }
         if let [constraint] = self.constraints.as_slice() {
@@ -293,171 +282,27 @@ where
             .unwrap_or(ProposalCoverage::None)
     }
 
-    /// Pushes the elementwise **minimum** source estimate. For a certified
-    /// intersection, only covering children are sources and a missing quote is
-    /// represented by [`usize::MAX`]. The uncertified path retains the legacy
-    /// estimate-derived relevance rule.
-    ///
-    /// The scalar (single-row cursor) arm folds child estimates through
-    /// stack slots — no column scratch is ever allocated on the
-    /// sequential engine's path.
+    /// Pushes the elementwise **minimum** covering-source estimate. A missing
+    /// quote is represented by [`usize::MAX`].
     fn estimate(
         &self,
         variable: VariableId,
         view: &RowsView<'_>,
         out: &mut EstimateSink<'_>,
     ) -> bool {
-        match out {
-            EstimateSink::Scalar(slot) => {
-                let mut any = false;
-                let mut acc = usize::MAX;
-                for c in &self.constraints {
-                    let mut e = 0usize;
-                    if c.estimate(variable, view, &mut EstimateSink::Scalar(&mut e)) {
-                        any = true;
-                        acc = acc.min(e);
-                    }
-                }
-                if any {
-                    **slot = acc;
-                }
-                any
-            }
-            EstimateSink::Column(out) => {
-                let base = out.len();
-                let mut any = false;
-                let mut scratch: Vec<usize> = Vec::new();
-                for c in &self.constraints {
-                    if !any {
-                        any = c.estimate(variable, view, &mut EstimateSink::Column(out));
-                    } else {
-                        scratch.clear();
-                        if c.estimate(variable, view, &mut EstimateSink::Column(&mut scratch)) {
-                            for (o, &s) in out[base..].iter_mut().zip(scratch.iter()) {
-                                *o = (*o).min(s);
-                            }
-                        }
-                    }
-                }
-                any
-            }
-        }
+        self.source_estimate(variable, view, out)
     }
 
-    /// Frontier expansion: per row the tightest child proposes (one
-    /// estimate column per relevant child, argmin per row, lower child index
-    /// on an equal estimate), then the sibling confirms run as
-    /// **whole-frontier passes** — one per child, cheapest (first-row
-    /// estimate) first. The proposer tie break is semantic because a
-    /// proposer owns the occurrence multiplicity of its candidate stream.
-    ///
-    /// When one child proposes for *every* row (the common case —
-    /// proposer choice is usually structural), it receives the whole
-    /// block so its own batching kicks in, and it skips its confirm pass
-    /// (its own proposals are consistent by construction). When proposers
-    /// vary across rows each row is proposed through a single-row
-    /// borrowed view into an **isolated** scratch sink — a child must
-    /// never see candidates owned by another row, because composite
-    /// children confirm whatever sink they are handed in its entirety —
-    /// and every relevant child then confirms the full frontier.
-    /// Re-confirming a child's own pairs is a wasted-work cost, never a
-    /// correctness one.
+    /// Per row, the tightest covering child proposes and every relevant child
+    /// validates the resulting frontier. An Exact uniform source need not
+    /// validate its own output; a Covering source must.
     fn propose(
         &self,
         variable: VariableId,
         view: &RowsView<'_>,
         candidates: &mut CandidateSink<'_>,
     ) {
-        // The sequential cursor (a Values sink is always a block of 1):
-        // scalar child estimates in stack slots, argmin, propose, ordered
-        // confirms — no estimate columns, no heap scratch.
-        if matches!(candidates, CandidateSink::Values(_)) {
-            let mut relevant: SmallVec<[(usize, usize); 16]> = SmallVec::new();
-            for (ci, c) in self.constraints.iter().enumerate() {
-                let mut e = 0usize;
-                if c.estimate(variable, view, &mut EstimateSink::Scalar(&mut e)) {
-                    relevant.push((e, ci));
-                }
-            }
-            if relevant.is_empty() {
-                return;
-            }
-            relevant.sort_unstable_by_key(|&(estimate, child)| (estimate, child));
-            self.constraints[relevant[0].1].propose(variable, view, candidates);
-            for &(_, ci) in &relevant[1..] {
-                self.constraints[ci].confirm(variable, view, candidates);
-            }
-            return;
-        }
-
-        let n_rows = view.len();
-
-        // Pass 1: per-child estimate columns (flat, child-major) — the
-        // same cardinality data drives proposer choice AND confirm order.
-        let mut cols: Vec<usize> = Vec::new();
-        let mut relevant: SmallVec<[usize; 16]> = SmallVec::new();
-        for (ci, c) in self.constraints.iter().enumerate() {
-            if c.estimate(variable, view, &mut EstimateSink::Column(&mut cols)) {
-                relevant.push(ci);
-            }
-        }
-        if relevant.is_empty() {
-            return;
-        }
-
-        // Pass 2: per-row proposer = argmin across the columns.
-        let mut propose_counts: SmallVec<[usize; 16]> = SmallVec::from_elem(0, relevant.len());
-        let mut proposers: SmallVec<[u32; 32]> = SmallVec::with_capacity(n_rows);
-        for i in 0..n_rows {
-            let k = (0..relevant.len())
-                .min_by_key(|&k| (cols[k * n_rows + i], relevant[k]))
-                .expect("non-empty relevant");
-            propose_counts[k] += 1;
-            proposers.push(k as u32);
-        }
-
-        // Pass 3: expand the frontier.
-        let uniform = (0..relevant.len()).find(|&k| propose_counts[k] == n_rows);
-        if let Some(k) = uniform {
-            self.constraints[relevant[k]].propose(variable, view, candidates);
-        } else {
-            // Non-uniform proposers: each row's child proposes into an
-            // isolated, cleared single-row scratch — never into the
-            // shared, already-populated frontier sink. `propose` is not
-            // append-only for composite children: a nested intersection
-            // runs its sibling confirms over the ENTIRE sink it is
-            // handed, interpreting every row tag through the one-row
-            // view — which deletes other rows' legitimate candidates
-            // under the wrong bindings, or indexes past the end of the
-            // one-row view for tags ≥ 1. A single-row view with a
-            // Values sink is exactly the sequential-cursor contract
-            // every constraint already honors, so isolation is free;
-            // `extend_row` then applies this row's tag on the way out.
-            let mut scratch: Vec<RawInline> = Vec::new();
-            for (i, &k) in proposers.iter().enumerate() {
-                let row_view = view.row_view(i);
-                scratch.clear();
-                self.constraints[relevant[k as usize]].propose(
-                    variable,
-                    &row_view,
-                    &mut CandidateSink::Values(&mut scratch),
-                );
-                candidates.extend_row(i as u32, scratch.iter().copied());
-            }
-        }
-
-        // Pass 4: whole-frontier confirms, cheapest (first-row estimate)
-        // child first. The uniform proposer skips its own pass.
-        let mut confirmers: SmallVec<[(usize, usize); 16]> = relevant
-            .iter()
-            .enumerate()
-            .filter(|&(k, _)| uniform != Some(k))
-            .map(|(k, &ci)| (cols[k * n_rows], ci))
-            .collect();
-        confirmers.sort_unstable_by_key(|&(estimate, _)| estimate);
-        for (_, ci) in confirmers {
-            self.constraints[ci].confirm(variable, view, candidates);
-        }
+        _ = self.propose_intersection(variable, view, candidates);
     }
 
     /// Confirms a whole frontier through every relevant child in
@@ -468,54 +313,16 @@ where
         view: &RowsView<'_>,
         candidates: &mut CandidateSink<'_>,
     ) {
-        let first = view.row_view(0);
-        let mut relevant: SmallVec<[(usize, usize); 16]> = SmallVec::new();
-        for (ci, c) in self.constraints.iter().enumerate() {
-            let mut est = 0usize;
-            if c.estimate(variable, &first, &mut EstimateSink::Scalar(&mut est)) {
-                relevant.push((est, ci));
-            }
-        }
-        relevant.sort_unstable_by_key(|&(estimate, _)| estimate);
-        for (_, ci) in relevant {
-            self.constraints[ci].confirm(variable, view, candidates);
-        }
+        self.confirm_intersection(variable, view, candidates)
     }
 
-    fn estimate_certified(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        out: &mut EstimateSink<'_>,
-    ) -> bool {
-        self.certified_estimate(variable, view, out)
-    }
-
-    fn propose_certified(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
-        _ = self.certified_propose(variable, view, candidates);
-    }
-
-    fn propose_certified_with_receipt(
+    fn propose_with_layout(
         &self,
         variable: VariableId,
         view: &RowsView<'_>,
         candidates: &mut CandidateSink<'_>,
     ) -> ProposalLayout {
-        self.certified_propose(variable, view, candidates)
-    }
-
-    fn confirm_certified(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
-        self.certified_confirm(variable, view, candidates)
+        self.propose_intersection(variable, view, candidates)
     }
 
     /// Returns `true` only when **every** child is satisfied.
@@ -586,7 +393,7 @@ mod tests {
     const MEMBER_AND_OTHER: &[RawInline] = &[MEMBER, OTHER];
 
     #[derive(Clone, Copy)]
-    struct CertifiedLeaf {
+    struct RelationalLeaf {
         coverage: ProposalCoverage,
         quote: Option<usize>,
         proposals: &'static [RawInline],
@@ -594,13 +401,9 @@ mod tests {
         panic_on_propose: bool,
     }
 
-    impl Constraint<'static> for CertifiedLeaf {
+    impl Constraint<'static> for RelationalLeaf {
         fn variables(&self) -> VariableSet {
             VariableSet::new_singleton(0)
-        }
-
-        fn fixed_denotation(&self) -> bool {
-            true
         }
 
         fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
@@ -656,9 +459,9 @@ mod tests {
         }
     }
 
-    fn certified_values(constraint: &IntersectionConstraint<CertifiedLeaf>) -> Vec<RawInline> {
+    fn relational_values(constraint: &IntersectionConstraint<RelationalLeaf>) -> Vec<RawInline> {
         let mut values = Vec::new();
-        constraint.propose_certified(0, &RowsView::EMPTY, &mut CandidateSink::Values(&mut values));
+        constraint.propose(0, &RowsView::EMPTY, &mut CandidateSink::Values(&mut values));
         values
     }
 
@@ -671,10 +474,6 @@ mod tests {
     impl Constraint<'static> for RowAdaptiveSource {
         fn variables(&self) -> VariableSet {
             VariableSet::new_singleton(0).union(VariableSet::new_singleton(1))
-        }
-
-        fn fixed_denotation(&self) -> bool {
-            true
         }
 
         fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
@@ -742,10 +541,6 @@ mod tests {
             VariableSet::new_singleton(0)
         }
 
-        fn fixed_denotation(&self) -> bool {
-            true
-        }
-
         fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
             if variable == 0 && !bound.is_set(variable) {
                 ProposalCoverage::Exact
@@ -805,16 +600,16 @@ mod tests {
     }
 
     #[test]
-    fn certified_intersection_never_promotes_a_low_quoted_none_validator() {
+    fn relational_intersection_never_promotes_a_low_quoted_none_validator() {
         let constraint = IntersectionConstraint::new(vec![
-            CertifiedLeaf {
+            RelationalLeaf {
                 coverage: ProposalCoverage::None,
                 quote: Some(0),
                 proposals: NO_VALUES,
                 accepted: MEMBER_ONLY,
                 panic_on_propose: true,
             },
-            CertifiedLeaf {
+            RelationalLeaf {
                 coverage: ProposalCoverage::Exact,
                 quote: Some(9),
                 proposals: MEMBER_ONLY,
@@ -824,26 +619,26 @@ mod tests {
         ]);
 
         let mut estimate = 0;
-        assert!(constraint.estimate_certified(
+        assert!(constraint.estimate(
             0,
             &RowsView::EMPTY,
             &mut EstimateSink::Scalar(&mut estimate),
         ));
         assert_eq!(estimate, 9);
-        assert_eq!(certified_values(&constraint), vec![MEMBER]);
+        assert_eq!(relational_values(&constraint), vec![MEMBER]);
     }
 
     #[test]
-    fn certified_intersection_runs_an_unquoted_target_validator() {
+    fn relational_intersection_runs_an_unquoted_target_validator() {
         let constraint = IntersectionConstraint::new(vec![
-            CertifiedLeaf {
+            RelationalLeaf {
                 coverage: ProposalCoverage::Exact,
                 quote: Some(1),
                 proposals: MEMBER_AND_OTHER,
                 accepted: MEMBER_AND_OTHER,
                 panic_on_propose: false,
             },
-            CertifiedLeaf {
+            RelationalLeaf {
                 coverage: ProposalCoverage::None,
                 quote: None,
                 proposals: NO_VALUES,
@@ -852,12 +647,12 @@ mod tests {
             },
         ]);
 
-        assert_eq!(certified_values(&constraint), vec![MEMBER]);
+        assert_eq!(relational_values(&constraint), vec![MEMBER]);
     }
 
     #[test]
-    fn certified_intersection_self_confirms_a_covering_source() {
-        let constraint = IntersectionConstraint::new(vec![CertifiedLeaf {
+    fn relational_intersection_self_confirms_a_covering_source() {
+        let constraint = IntersectionConstraint::new(vec![RelationalLeaf {
             coverage: ProposalCoverage::Covering,
             quote: Some(1),
             proposals: MEMBER_AND_OTHER,
@@ -865,20 +660,20 @@ mod tests {
             panic_on_propose: false,
         }]);
 
-        assert_eq!(certified_values(&constraint), vec![MEMBER]);
+        assert_eq!(relational_values(&constraint), vec![MEMBER]);
     }
 
     #[test]
-    fn certified_intersection_prices_a_quote_less_source_at_max() {
+    fn relational_intersection_prices_a_quote_less_source_at_max() {
         let constraint = IntersectionConstraint::new(vec![
-            CertifiedLeaf {
+            RelationalLeaf {
                 coverage: ProposalCoverage::Exact,
                 quote: None,
                 proposals: MEMBER_TWICE,
                 accepted: MEMBER_ONLY,
                 panic_on_propose: false,
             },
-            CertifiedLeaf {
+            RelationalLeaf {
                 coverage: ProposalCoverage::Exact,
                 quote: Some(usize::MAX - 1),
                 proposals: MEMBER_ONLY,
@@ -888,22 +683,22 @@ mod tests {
         ]);
 
         let mut estimate = 0;
-        assert!(constraint.estimate_certified(
+        assert!(constraint.estimate(
             0,
             &RowsView::EMPTY,
             &mut EstimateSink::Scalar(&mut estimate),
         ));
         assert_eq!(estimate, usize::MAX - 1);
-        assert_eq!(certified_values(&constraint), vec![MEMBER]);
+        assert_eq!(relational_values(&constraint), vec![MEMBER]);
 
-        let quote_less = IntersectionConstraint::new(vec![CertifiedLeaf {
+        let quote_less = IntersectionConstraint::new(vec![RelationalLeaf {
             coverage: ProposalCoverage::Exact,
             quote: None,
             proposals: MEMBER_ONLY,
             accepted: MEMBER_ONLY,
             panic_on_propose: false,
         }]);
-        assert!(quote_less.estimate_certified(
+        assert!(quote_less.estimate(
             0,
             &RowsView::EMPTY,
             &mut EstimateSink::Scalar(&mut estimate),
@@ -912,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn certified_intersection_selects_the_cheapest_source_per_row() {
+    fn relational_intersection_selects_the_cheapest_source_per_row() {
         let constraint = IntersectionConstraint::new(vec![
             RowAdaptiveSource {
                 cheap_on: FIRST_ROW,
@@ -927,13 +722,13 @@ mod tests {
         let view = RowsView::new(&[1], &rows);
         let mut candidates = Vec::new();
 
-        constraint.propose_certified(0, &view, &mut CandidateSink::Tagged(&mut candidates));
+        constraint.propose(0, &view, &mut CandidateSink::Tagged(&mut candidates));
 
         assert_eq!(candidates, vec![(0, MEMBER), (1, MEMBER), (1, MEMBER)]);
     }
 
     #[test]
-    fn nested_certified_intersection_keeps_raw_scalar_source_order() {
+    fn nested_relational_intersection_keeps_raw_scalar_source_order() {
         type DynConstraint = Box<dyn Constraint<'static> + Send + Sync>;
 
         let inner = IntersectionConstraint::new(vec![
@@ -955,7 +750,7 @@ mod tests {
         let root = IntersectionConstraint::new(vec![Box::new(inner) as DynConstraint]);
 
         let mut estimate = usize::MAX;
-        assert!(root.estimate_certified(
+        assert!(root.estimate(
             0,
             &RowsView::EMPTY,
             &mut EstimateSink::Scalar(&mut estimate),
@@ -963,124 +758,7 @@ mod tests {
         assert_eq!(estimate, 8);
 
         let mut scalar = Vec::new();
-        root.propose_certified(0, &RowsView::EMPTY, &mut CandidateSink::Values(&mut scalar));
+        root.propose(0, &RowsView::EMPTY, &mut CandidateSink::Values(&mut scalar));
         assert_eq!(scalar, vec![MEMBER; 8]);
-    }
-
-    /// Two lawful intersection leaves with identical support and estimates,
-    /// but different proposal multiplicity. Confirm only filters, so child
-    /// order is the observable equal-estimate proposer tie break.
-    #[derive(Clone, Copy)]
-    struct EqualEstimateBagLeaf {
-        occurrences: usize,
-    }
-
-    impl EqualEstimateBagLeaf {
-        const VARIABLE: VariableId = 0;
-        const VALUE: RawInline = [7; 32];
-    }
-
-    impl Constraint<'static> for EqualEstimateBagLeaf {
-        fn variables(&self) -> VariableSet {
-            VariableSet::new_singleton(Self::VARIABLE)
-        }
-
-        fn estimate(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            out: &mut EstimateSink<'_>,
-        ) -> bool {
-            if variable != Self::VARIABLE {
-                return false;
-            }
-            out.fill(1, view.len());
-            true
-        }
-
-        fn propose(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) {
-            if variable != Self::VARIABLE {
-                return;
-            }
-            for (row_index, row) in view.iter().enumerate() {
-                if view
-                    .col(Self::VARIABLE)
-                    .is_none_or(|column| row[column] == Self::VALUE)
-                {
-                    candidates.extend_row(
-                        row_index as u32,
-                        std::iter::repeat_n(Self::VALUE, self.occurrences),
-                    );
-                }
-            }
-        }
-
-        fn confirm(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) {
-            if variable == Self::VARIABLE {
-                candidates.retain(|row, value| {
-                    *value == Self::VALUE
-                        && view
-                            .col(Self::VARIABLE)
-                            .is_none_or(|column| view.row(row as usize)[column] == Self::VALUE)
-                });
-            }
-        }
-
-        fn satisfied(&self, view: &RowsView<'_>) -> bool {
-            view.iter().all(|row| {
-                view.col(Self::VARIABLE)
-                    .is_none_or(|column| row[column] == Self::VALUE)
-            })
-        }
-    }
-
-    fn equal_estimate_occurrence_query() -> Query<
-        IntersectionConstraint<EqualEstimateBagLeaf>,
-        impl Fn(&Binding) -> Option<RawInline>,
-        RawInline,
-    > {
-        Query::new(
-            IntersectionConstraint::new(vec![
-                EqualEstimateBagLeaf { occurrences: 2 },
-                EqualEstimateBagLeaf { occurrences: 1 },
-            ]),
-            |binding: &Binding| binding.get(EqualEstimateBagLeaf::VARIABLE).copied(),
-        )
-    }
-
-    #[test]
-    fn equal_estimate_tie_preserves_child_occurrences_before_set_projection() {
-        let constraint = IntersectionConstraint::new(vec![
-            EqualEstimateBagLeaf { occurrences: 2 },
-            EqualEstimateBagLeaf { occurrences: 1 },
-        ]);
-        let mut proposed = Vec::new();
-        constraint.propose(
-            EqualEstimateBagLeaf::VARIABLE,
-            &RowsView::EMPTY,
-            &mut CandidateSink::Values(&mut proposed),
-        );
-        assert_eq!(proposed, vec![EqualEstimateBagLeaf::VALUE; 2]);
-
-        let expected = vec![EqualEstimateBagLeaf::VALUE];
-        let sequential: Vec<_> = equal_estimate_occurrence_query().sequential().collect();
-        let blocked = equal_estimate_occurrence_query().solve_blocked();
-        let residual: Vec<_> = equal_estimate_occurrence_query()
-            .solve_residual_state_lazy_with(residual::ResidualLowering::FULL)
-            .collect();
-
-        assert_eq!(sequential, expected);
-        assert_eq!(blocked, expected);
-        assert_eq!(residual, expected);
     }
 }

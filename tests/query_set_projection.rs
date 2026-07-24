@@ -4,8 +4,8 @@ use std::sync::Arc;
 use triblespace::core::inline::encodings::iu256::U256BE;
 use triblespace::core::inline::{Inline, RawInline, TryFromInline};
 use triblespace::core::query::{
-    CandidateSink, Constraint, EstimateSink, Query, RowsView, VariableContext, VariableId,
-    VariableSet,
+    CandidateSink, Constraint, EstimateSink, ProposalCoverage, Query, RowsView, VariableContext,
+    VariableId, VariableSet,
 };
 use triblespace::prelude::*;
 
@@ -94,6 +94,14 @@ impl Constraint<'_> for CountingHiddenFanout {
         VariableSet::new_singleton(self.witness).union(VariableSet::new_singleton(self.tail))
     }
 
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+        if self.variables().is_set(variable) && !bound.is_set(variable) {
+            ProposalCoverage::Exact
+        } else {
+            ProposalCoverage::None
+        }
+    }
+
     fn estimate(
         &self,
         variable: VariableId,
@@ -133,10 +141,31 @@ impl Constraint<'_> for CountingHiddenFanout {
 
     fn confirm(
         &self,
-        _variable: VariableId,
+        variable: VariableId,
         _view: &RowsView<'_>,
-        _candidates: &mut CandidateSink<'_>,
+        candidates: &mut CandidateSink<'_>,
     ) {
+        if variable == self.witness {
+            candidates.retain(|_, value| {
+                (0u64..64).any(|candidate| *value == U256BE::inline_from(candidate).raw)
+            });
+        } else if variable == self.tail {
+            let tail = U256BE::inline_from(255u64).raw;
+            candidates.retain(|_, value| *value == tail);
+        }
+    }
+
+    fn satisfied(&self, view: &RowsView<'_>) -> bool {
+        let witness_supported = view.col(self.witness).is_none_or(|column| {
+            view.iter().all(|row| {
+                (0u64..64).any(|candidate| row[column] == U256BE::inline_from(candidate).raw)
+            })
+        });
+        let tail = U256BE::inline_from(255u64).raw;
+        let tail_supported = view
+            .col(self.tail)
+            .is_none_or(|column| view.iter().all(|row| row[column] == tail));
+        witness_supported && tail_supported
     }
 }
 

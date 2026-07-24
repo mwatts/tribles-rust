@@ -65,27 +65,39 @@ Six execution methods perform the ordinary query negotiation:
 | `satisfied` | Check the truth of a constraint whose relevant variables have become bound. |
 | `influence` | Report which variables may need fresh estimates after another variable changes binding state. |
 
-Two opt-in semantic receipts let the engine plan a completely certified query
-as one fixed relation. `fixed_denotation` certifies an occurrence's relational
-SET meaning, while `proposal_coverage` says whether a proposal is absent as a
-source, covering, or exact for one target and bound schema. Their defaults keep
-the legacy action-defined protocol. Receipt-aware planning activates only when
-every occurrence in the complete root certifies its denotation. A transparent
-wrapper that forwards either receipt must also forward the certified action
-methods; otherwise its proof would describe a relation its execution does not
-implement.
+Every `Constraint` occurrence unconditionally denotes one fixed raw-inline SET
+relation over the variables it declares. `proposal_coverage` is not a second
+semantic mode: it is the structural source-eligibility receipt for one
+occurrence, target, and bound-variable schema. `None` makes no completeness
+claim, `Covering` includes the complete existential fiber and requires
+self-confirmation, and `Exact` equals that fiber. Coverage must not depend on
+bound values or estimates. Every surviving non-full query state needs at least
+one Covering or Exact source, while confirmation-only occurrences may remain
+at `None`.
 
-Four laws are load-bearing for correctness:
+`propose_with_layout` additionally returns a `ProposalLayout` for the concrete
+sink it just filled. This is only a physical uniqueness receipt: a grouped-set
+layout can let the engine elide a deduplication pass, but it does not strengthen
+coverage or change the denoted relation.
 
-1. `propose` is always given an **empty** sink. A composite must preserve that
+Five laws are load-bearing for correctness:
+
+1. Ordinary, paged, typed-Program, and complete-equivalent routes must agree on
+   the same relation. Activation-local novelty keys exposed by an accelerated
+   route must be congruent for future outputs: equal keys cannot hide states
+   with different relational futures.
+2. `propose` is always given an **empty** sink. A composite must preserve that
    ownership when delegating. In particular, each arm of a union proposes into
    its own empty buffer before the buffers are merged.
-2. `confirm` may only filter its input. It must not append candidates, and it
-   must preserve their row grouping.
-3. `satisfied` may optimistically return `true` while one of the constraint's
-   variables is unbound, but it **must be exact once all of them are bound**.
-   This includes zero-variable constraints, which are fully bound at the seed.
-4. Every row-taking verb is a **row homomorphism**. Splitting a block into
+3. `confirm` must return a subbag of its input and preserve row grouping. It
+   retains every candidate occurrence belonging to the relation's existential
+   fiber, and becomes exact once all occurrence variables other than the
+   target are bound.
+4. `satisfied` may optimistically return `true` while one of the constraint's
+   variables is unbound, but `false` must prove that the row has no completion.
+   It **must be exact once all variables are bound**. This includes
+   zero-variable constraints, which are fully bound at the seed.
+5. Every row-taking verb is a **row homomorphism**. Splitting a block into
    non-empty consecutive sub-blocks, evaluating them independently, and
    concatenating the outputs (with candidate row tags remapped) must equal
    evaluating the whole block. In particular, estimates and proposals
@@ -95,7 +107,7 @@ Four laws are load-bearing for correctness:
    decisions are invalid. Diagnostics may observe call boundaries, but those
    observations must never feed back into protocol answers.
 
-The third law is easy to mistake for an optimization hook, but it is a
+The fourth law is easy to mistake for an optimization hook, but it is a
 soundness rule. An [`or!`](triblespace::core::prelude::or) constraint uses it to
 discard alternatives contradicted by the current row before those alternatives
 propose or confirm another variable. An optimistic answer for a fully bound,
@@ -103,6 +115,11 @@ false alternative could otherwise admit a row that no single alternative
 satisfies. A fully constant pattern similarly has no variable through which the
 search could discover failure, so [`Query::new`](triblespace::core::query::Query::new)
 settles it with an exact `satisfied` call against the seed block.
+
+Estimates are cost quotes only. Returning no estimate means unknown cost, not
+irrelevance, and no estimate may authorize a different proposal, confirmation,
+route, or result. Structural relevance comes from `variables`; logical source
+eligibility comes from `proposal_coverage`.
 
 Constraints are otherwise stateless. Each method receives the current
 `RowsView`; the engine does not notify constraints when it backtracks, chunks a

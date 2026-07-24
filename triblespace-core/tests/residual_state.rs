@@ -12,8 +12,8 @@ use triblespace_core::query::rangeconstraint::InlineRange;
 use triblespace_core::query::residual::ResidualLowering;
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
-    Binding, CandidateSink, Constraint, EstimateSink, PathOp, Query, RegularPathConstraint,
-    RowsView, Variable, VariableId, VariableSet,
+    Binding, CandidateSink, Constraint, EstimateSink, PathOp, ProposalCoverage, Query,
+    RegularPathConstraint, RowsView, Variable, VariableId, VariableSet,
 };
 use triblespace_core::trible::{Trible, TribleSet};
 
@@ -232,6 +232,18 @@ impl Constraint<'_> for TableChild {
         variables
     }
 
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+        let can_source = match self.child {
+            Child::Domain => variable == P,
+            Child::A | Child::B | Child::C => variable == P || variable == X,
+        };
+        if can_source && !bound.is_set(variable) {
+            ProposalCoverage::Exact
+        } else {
+            ProposalCoverage::None
+        }
+    }
+
     fn estimate(
         &self,
         variable: VariableId,
@@ -410,6 +422,14 @@ impl Constraint<'_> for FiniteDomain {
         VariableSet::new_singleton(self.variable)
     }
 
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+        if variable == self.variable && !bound.is_set(variable) {
+            ProposalCoverage::Exact
+        } else {
+            ProposalCoverage::None
+        }
+    }
+
     fn estimate(
         &self,
         variable: VariableId,
@@ -473,6 +493,10 @@ impl<'a, C: Constraint<'a>> Constraint<'a> for Opaque<C> {
         self.0.variables()
     }
 
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+        self.0.proposal_coverage(variable, bound)
+    }
+
     fn estimate(
         &self,
         variable: VariableId,
@@ -512,6 +536,14 @@ impl<'a, C: Constraint<'a>> Constraint<'a> for Opaque<C> {
 impl<'v> Constraint<'v> for BorrowedDomain<'v> {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.variable)
+    }
+
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+        if variable == self.variable && !bound.is_set(variable) {
+            ProposalCoverage::Exact
+        } else {
+            ProposalCoverage::None
+        }
     }
 
     fn estimate(
@@ -782,10 +814,11 @@ fn top_level_constant_root_and_sourced_range_api_are_supported() {
 
     let min = Inline::<UnknownInline>::new(encoded(b'r', 1));
     let max = Inline::<UnknownInline>::new(encoded(b'r', 3));
-    // InlineRange deliberately cannot propose, so by itself it is not a
-    // complete executable query. Source-less certified roots are rejected at
-    // construction; the following test exercises the same concrete root type
-    // when an opaque boundary also supplies an enumerable domain.
+    // InlineRange deliberately cannot propose, so by itself it does not meet
+    // the source-progress requirement. Fixed relational roots without a
+    // covering proposal source are rejected at construction; the following
+    // test exercises the same concrete root type when an opaque boundary also
+    // supplies an enumerable domain.
     let range_values: Vec<_> = (0..5).map(|i| encoded(b'r', i)).collect();
     let (domain, _) = finite_domain(P, range_values, 5);
     let rooted_range = Opaque(IntersectionConstraint::new(vec![
@@ -1800,7 +1833,7 @@ fn equality_becomes_relevant_after_its_peer_is_bound() {
     );
     assert_eq!(
         (residual.stats.propose_calls, residual.stats.confirm_calls),
-        (2, 1)
+        (2, 2)
     );
 }
 

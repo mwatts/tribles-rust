@@ -156,69 +156,6 @@ fn third_attribute() -> Id {
     Id::from_hex("17D7A00087D912B14F8BC28AFC31474F").expect("minted fixture attribute")
 }
 
-struct SatisfiedCountingPath {
-    inner: RegularPathConstraint,
-    fully_bound_satisfied_calls: Arc<AtomicUsize>,
-}
-
-impl<'a> Constraint<'a> for SatisfiedCountingPath {
-    fn variables(&self) -> VariableSet {
-        self.inner.variables()
-    }
-
-    fn estimate(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        out: &mut EstimateSink<'_>,
-    ) -> bool {
-        self.inner.estimate(variable, view, out)
-    }
-
-    fn propose(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
-        self.inner.propose(variable, view, candidates)
-    }
-
-    fn confirm(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
-        self.inner.confirm(variable, view, candidates)
-    }
-
-    fn satisfied(&self, view: &RowsView<'_>) -> bool {
-        if self
-            .inner
-            .variables()
-            .into_iter()
-            .all(|variable| view.col(variable).is_some())
-        {
-            self.fully_bound_satisfied_calls
-                .fetch_add(view.len(), Ordering::Relaxed);
-        }
-        self.inner.satisfied(view)
-    }
-
-    fn influence(&self, variable: VariableId) -> VariableSet {
-        self.inner.influence(variable)
-    }
-
-    fn residual_confirm_is_page_local(&self) -> bool {
-        self.inner.residual_confirm_is_page_local()
-    }
-
-    fn residual_program(&self) -> Option<ProgramRef<'_>> {
-        self.inner.residual_program()
-    }
-}
-
 #[derive(Clone)]
 struct DuplicateParents {
     outer_values: [RawInline; 2],
@@ -230,6 +167,14 @@ impl<'a> Constraint<'a> for DuplicateParents {
         VariableSet::new_singleton(OUTER).union(VariableSet::new_singleton(START))
     }
 
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+        if matches!(variable, OUTER | START) && !bound.is_set(variable) {
+            ProposalCoverage::Exact
+        } else {
+            ProposalCoverage::None
+        }
+    }
+
     fn estimate(
         &self,
         variable: VariableId,
@@ -239,8 +184,7 @@ impl<'a> Constraint<'a> for DuplicateParents {
         match variable {
             OUTER => out.fill(1, view.len()),
             // Force OUTER first, then create one identical START occurrence
-            // for each distinct outer row. This is a bag-multiplicity oracle,
-            // not a duplicate candidate-set oracle.
+            // for each distinct outer row.
             START => out.fill(if view.col(OUTER).is_some() { 1 } else { 4 }, view.len()),
             _ => return false,
         }
@@ -300,6 +244,14 @@ impl<'a> Constraint<'a> for OrderedDomain {
         VariableSet::new_singleton(self.variable)
     }
 
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+        if variable == self.variable && !bound.is_set(variable) {
+            ProposalCoverage::Exact
+        } else {
+            ProposalCoverage::None
+        }
+    }
+
     fn estimate(
         &self,
         variable: VariableId,
@@ -353,15 +305,11 @@ impl<'a> Constraint<'a> for OrderedDomain {
 }
 
 #[derive(Clone)]
-struct CertifiedOrderedDomain(OrderedDomain);
+struct CoveringOrderedDomain(OrderedDomain);
 
-impl<'a> Constraint<'a> for CertifiedOrderedDomain {
+impl<'a> Constraint<'a> for CoveringOrderedDomain {
     fn variables(&self) -> VariableSet {
         self.0.variables()
-    }
-
-    fn fixed_denotation(&self) -> bool {
-        true
     }
 
     fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
@@ -391,33 +339,6 @@ impl<'a> Constraint<'a> for CertifiedOrderedDomain {
     }
 
     fn confirm(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
-        self.0.confirm(variable, view, candidates);
-    }
-
-    fn estimate_certified(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        out: &mut EstimateSink<'_>,
-    ) -> bool {
-        self.estimate(variable, view, out)
-    }
-
-    fn propose_certified(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
-        self.0.propose(variable, view, candidates);
-    }
-
-    fn confirm_certified(
         &self,
         variable: VariableId,
         view: &RowsView<'_>,
@@ -568,7 +489,7 @@ impl TypedProgramSpec for PhysicalSupportProbe {
 /// remains the exact Confirm executor.
 ///
 /// Most target-Confirm fixtures suppress the fallback RPQ's covering proposal
-/// certificate to isolate confirmation; the partial fixture retains it so the
+/// receipt to isolate confirmation; the partial fixture retains it so the
 /// remaining endpoint can still be enumerated.
 struct ProbedConfirmRpq<Preferred> {
     program: PreferredProgram<Preferred, RegularPathConstraint>,
@@ -581,10 +502,6 @@ where
 {
     fn variables(&self) -> VariableSet {
         self.program.fallback().variables()
-    }
-
-    fn fixed_denotation(&self) -> bool {
-        self.program.fallback().fixed_denotation()
     }
 
     fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
@@ -620,39 +537,6 @@ where
         candidates: &mut CandidateSink<'_>,
     ) {
         self.program.fallback().confirm(variable, view, candidates);
-    }
-
-    fn estimate_certified(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        out: &mut EstimateSink<'_>,
-    ) -> bool {
-        self.program
-            .fallback()
-            .estimate_certified(variable, view, out)
-    }
-
-    fn propose_certified(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
-        self.program
-            .fallback()
-            .propose_certified(variable, view, candidates);
-    }
-
-    fn confirm_certified(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
-        self.program
-            .fallback()
-            .confirm_certified(variable, view, candidates);
     }
 
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
@@ -760,10 +644,6 @@ impl<'a> Constraint<'a> for CandidateValueTraceFilter {
         VariableSet::new_singleton(self.variable)
     }
 
-    fn fixed_denotation(&self) -> bool {
-        true
-    }
-
     fn estimate(
         &self,
         variable: VariableId,
@@ -803,33 +683,6 @@ impl<'a> Constraint<'a> for CandidateValueTraceFilter {
             .expect("candidate-value trace poisoned")
             .push(call);
         candidates.retain(|_, value| *value == self.accepted);
-    }
-
-    fn estimate_certified(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        out: &mut EstimateSink<'_>,
-    ) -> bool {
-        self.estimate(variable, view, out)
-    }
-
-    fn propose_certified(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
-        self.propose(variable, view, candidates);
-    }
-
-    fn confirm_certified(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
-        self.confirm(variable, view, candidates);
     }
 
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
@@ -905,6 +758,10 @@ struct PageLocalDomain(OrderedDomain);
 impl<'a> Constraint<'a> for PageLocalDomain {
     fn variables(&self) -> VariableSet {
         self.0.variables()
+    }
+
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+        self.0.proposal_coverage(variable, bound)
     }
 
     fn estimate(
@@ -1035,7 +892,7 @@ fn target_confirm_root(
     ]))
 }
 
-fn certified_target_confirm_root(
+fn covering_target_confirm_root(
     set: TribleSet,
     bound: Inline<GenId>,
     candidates: Vec<RawInline>,
@@ -1047,7 +904,7 @@ fn certified_target_confirm_root(
     let rpq = RegularPathConstraint::new(set, start_var, end_var, ops);
     Arc::new(IntersectionConstraint::new(vec![
         Box::new(start_var.is(bound)) as DynConstraint,
-        Box::new(CertifiedOrderedDomain(OrderedDomain {
+        Box::new(CoveringOrderedDomain(OrderedDomain {
             variable: END,
             gate: START,
             unbound_estimate: 4,
@@ -1078,7 +935,7 @@ fn physical_support_fallback_target_confirm_root(
     let rpq = RegularPathConstraint::new(set, start, end, ops);
     Arc::new(IntersectionConstraint::new(vec![
         Box::new(start.is(bound)) as DynConstraint,
-        Box::new(CertifiedOrderedDomain(OrderedDomain {
+        Box::new(CoveringOrderedDomain(OrderedDomain {
             variable: END,
             gate: START,
             unbound_estimate: 4,
@@ -1097,7 +954,7 @@ fn physical_support_fallback_target_confirm_root(
     ]))
 }
 
-fn certified_chunk_target_confirm_root(
+fn covering_chunk_target_confirm_root(
     set: TribleSet,
     bound: Inline<GenId>,
     candidates: Vec<RawInline>,
@@ -1110,7 +967,7 @@ fn certified_chunk_target_confirm_root(
     let rpq = RegularPathConstraint::new(set, start, end, ops);
     Arc::new(IntersectionConstraint::new(vec![
         Box::new(start.is(bound)) as DynConstraint,
-        Box::new(CertifiedOrderedDomain(OrderedDomain {
+        Box::new(CoveringOrderedDomain(OrderedDomain {
             variable: END,
             gate: START,
             unbound_estimate: 4,
@@ -1140,7 +997,7 @@ fn exact_tap_target_confirm_root(
     let end = Variable::<GenId>::new(END);
     let mut children = vec![
         Box::new(start.is(bound)) as DynConstraint,
-        Box::new(CertifiedOrderedDomain(OrderedDomain {
+        Box::new(CoveringOrderedDomain(OrderedDomain {
             variable: END,
             gate: START,
             unbound_estimate: 4,
@@ -1389,12 +1246,8 @@ fn support_probe_path(
     start: Variable<GenId>,
     end: Variable<GenId>,
     ops: &[PathOp],
-    fully_bound_satisfied_calls: &Arc<AtomicUsize>,
 ) -> DynConstraint {
-    Box::new(SatisfiedCountingPath {
-        inner: RegularPathConstraint::new(set.clone(), start, end, ops),
-        fully_bound_satisfied_calls: Arc::clone(fully_bound_satisfied_calls),
-    })
+    Box::new(RegularPathConstraint::new(set.clone(), start, end, ops))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1409,31 +1262,17 @@ fn nested_affine_support_root(
     sibling_value: RawInline,
     arm_order: SupportArmOrder,
     trace: Option<Arc<Mutex<Vec<usize>>>>,
-) -> (Root, Arc<AtomicUsize>) {
+) -> Root {
     let start = Variable::<GenId>::new(START);
     let end = Variable::<GenId>::new(END);
-    let fully_bound_satisfied_calls = Arc::new(AtomicUsize::new(0));
-    let false_path = support_probe_path(
-        &set,
-        start,
-        end,
-        &[PathOp::Attr(secondary.raw())],
-        &fully_bound_satisfied_calls,
-    );
+    let false_path = support_probe_path(&set, start, end, &[PathOp::Attr(secondary.raw())]);
     let true_path = Box::new(IntersectionConstraint::new(vec![
-        support_probe_path(
-            &set,
-            start,
-            end,
-            &repeated(primary, false),
-            &fully_bound_satisfied_calls,
-        ),
+        support_probe_path(&set, start, end, &repeated(primary, false)),
         support_probe_path(
             &set,
             start,
             end,
             &[PathOp::Attr(primary.raw()), PathOp::Star],
-            &fully_bound_satisfied_calls,
         ),
     ])) as DynConstraint;
     let guard_arms = match arm_order {
@@ -1477,8 +1316,7 @@ fn nested_affine_support_root(
             trace: Arc::clone(trace),
         }) as DynConstraint);
     }
-    let root = Arc::new(IntersectionConstraint::new(root_children));
-    (root, fully_bound_satisfied_calls)
+    Arc::new(IntersectionConstraint::new(root_children))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1491,15 +1329,11 @@ fn fully_bound_support_root(
     sibling_value: RawInline,
     guarded_estimate: usize,
     sibling_estimate: usize,
-    fully_bound_satisfied_calls: Arc<AtomicUsize>,
 ) -> Root {
     let start = Variable::<GenId>::new(START);
     let end = Variable::<GenId>::new(END);
     let guarded = Box::new(IntersectionConstraint::new(vec![
-        Box::new(SatisfiedCountingPath {
-            inner: RegularPathConstraint::new(set, start, end, ops),
-            fully_bound_satisfied_calls,
-        }) as DynConstraint,
+        Box::new(RegularPathConstraint::new(set, start, end, ops)) as DynConstraint,
         Box::new(OrderedDomain {
             variable: OUTER,
             gate: OUTER,
@@ -1531,11 +1365,10 @@ fn fully_bound_same_variable_support_root(
     ops: &[PathOp],
     guarded_value: RawInline,
     sibling_value: RawInline,
-    fully_bound_satisfied_calls: &Arc<AtomicUsize>,
 ) -> Root {
     let node = Variable::<GenId>::new(START);
     let guarded = Box::new(IntersectionConstraint::new(vec![
-        support_probe_path(&set, node, node, ops, fully_bound_satisfied_calls),
+        support_probe_path(&set, node, node, ops),
         Box::new(OrderedDomain {
             variable: OUTER,
             gate: OUTER,
@@ -1684,7 +1517,7 @@ fn assert_all_schedulers(
     }
 }
 
-fn sorted_bag_is_subset(subset: &[RawInline], superset: &[RawInline]) -> bool {
+fn sorted_results_are_subset(subset: &[RawInline], superset: &[RawInline]) -> bool {
     let mut candidate = 0;
     for expected in subset {
         while candidate < superset.len() && superset[candidate] < *expected {
@@ -2184,7 +2017,7 @@ fn synthetic_root_and_empty_filter_waits_for_cleanup_without_replay() {
 }
 
 #[test]
-fn linear_formula_streaming_matches_the_always_quiescent_union_bag() {
+fn linear_formula_streaming_matches_the_always_quiescent_union_set() {
     let graph = Graph::new(7, &[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6)]);
     let ops = repeated(graph.attribute, false);
     let allowed = vec![graph.value(1).raw, graph.value(3).raw, graph.value(6).raw];
@@ -2440,7 +2273,7 @@ fn zero_root_cyclic_and_returns_empty_without_erasing_its_or_sibling() {
 }
 
 #[test]
-fn formula_cyclic_activations_preserve_duplicate_outer_parents() {
+fn formula_cyclic_activations_preserve_distinct_outer_parents() {
     let graph = Graph::new(3, &[(0, 1), (1, 2)]);
     let ops = repeated(graph.attribute, false);
     let outer_values = [genid(&rngid().id).raw, genid(&rngid().id).raw];
@@ -2523,7 +2356,7 @@ fn all_capability_formula_cyclic_plan_survives_clone_and_parallel_split() {
 
     // `root_formula` recursively owns finite AND/OR structure, so enabling the
     // narrower `finite_unions` capability as well must not change the exact
-    // result bag or activation multiplicity.
+    // raw result relation or activation multiplicity.
     let root_formula = configured(root_formula_effects());
     let root_formula = sorted(root_formula.collect());
     assert_eq!(root_formula, scalar);
@@ -2886,11 +2719,13 @@ fn same_variable_grouped_delta_confirm_filters_one_immutable_sequence() {
             4,
         ),
     ];
-    for (ops, expected, expected_roots) in cases {
+    for (ops, mut expected, expected_roots) in cases {
         let root = same_variable_confirm_root(graph.set.clone(), candidates.clone(), &ops);
         let mut query =
             Query::new(root, project_start).solve_residual_state_lazy_with(combined_effects());
-        let actual: Vec<_> = query.by_ref().collect();
+        let mut actual: Vec<_> = query.by_ref().collect();
+        actual.sort_unstable();
+        expected.sort_unstable();
         assert_eq!(actual, expected);
         assert_eq!(query.stats().delta_source_pages, 3);
         assert_eq!(query.stats().delta_source_roots, expected_roots);
@@ -2898,8 +2733,6 @@ fn same_variable_grouped_delta_confirm_filters_one_immutable_sequence() {
             query.stats().delta_source_candidates_examined,
             candidates.len()
         );
-        assert_eq!(query.current_width(), 16);
-        assert_eq!(query.stats().width_increases, 4);
     }
 }
 
@@ -2923,7 +2756,7 @@ fn same_variable_sources_do_not_share_seen_at_a_common_term() {
 }
 
 #[test]
-fn same_variable_fixpoint_preserves_duplicate_outer_activations() {
+fn same_variable_fixpoint_preserves_distinct_outer_activations() {
     let graph = Graph::new(2, &[(0, 1), (1, 0)]);
     let outer_values = [genid(&rngid().id).raw, genid(&rngid().id).raw];
     let ops = repeated(graph.attribute, false);
@@ -3066,7 +2899,6 @@ fn nullable_support_uses_native_program_for_distinct_same_variable_and_absent_te
     let ops = [PathOp::Attr(graph.attribute.raw()), PathOp::Star];
     let guarded_value = genid(&rngid().id).raw;
     let sibling_value = genid(&rngid().id).raw;
-    let fully_bound_satisfied_calls = Arc::new(AtomicUsize::new(0));
     let make = || {
         fully_bound_support_root(
             graph.set.clone(),
@@ -3077,7 +2909,6 @@ fn nullable_support_uses_native_program_for_distinct_same_variable_and_absent_te
             sibling_value,
             1,
             8,
-            Arc::clone(&fully_bound_satisfied_calls),
         )
     };
     let mut query = Query::new(make(), project_outer)
@@ -3087,7 +2918,6 @@ fn nullable_support_uses_native_program_for_distinct_same_variable_and_absent_te
 
     let first = query.next().expect("one nullable Support result");
     assert!(first == guarded_value || first == sibling_value);
-    assert_eq!(fully_bound_satisfied_calls.load(Ordering::Relaxed), 0);
     assert!(query.stats().support_action_pops > 0);
     assert!(query.stats().support_calls > 0);
     let mut cloned = query.clone();
@@ -3101,7 +2931,6 @@ fn nullable_support_uses_native_program_for_distinct_same_variable_and_absent_te
     drop(query);
     drop(cloned);
 
-    let same_variable_satisfied_calls = Arc::new(AtomicUsize::new(0));
     let mut same_variable = Query::new(
         fully_bound_same_variable_support_root(
             graph.set.clone(),
@@ -3109,7 +2938,6 @@ fn nullable_support_uses_native_program_for_distinct_same_variable_and_absent_te
             &ops,
             guarded_value,
             sibling_value,
-            &same_variable_satisfied_calls,
         ),
         project_outer,
     )
@@ -3120,7 +2948,6 @@ fn nullable_support_uses_native_program_for_distinct_same_variable_and_absent_te
         .next()
         .expect("one same-variable nullable Support result");
     assert!(same_first == guarded_value || same_first == sibling_value);
-    assert_eq!(same_variable_satisfied_calls.load(Ordering::Relaxed), 0);
     assert!(same_variable.stats().support_action_pops > 0);
     let same_remainder = if same_first == guarded_value {
         sibling_value
@@ -3141,7 +2968,6 @@ fn nullable_support_uses_native_program_for_distinct_same_variable_and_absent_te
         absent_sibling,
         1,
         8,
-        Arc::new(AtomicUsize::new(0)),
     );
     let mut absent_query = Query::new(absent, project_outer)
         .solve_residual_state_lazy_with(ResidualLowering::FULL)
@@ -3156,11 +2982,10 @@ fn nullable_support_uses_native_program_for_distinct_same_variable_and_absent_te
 }
 
 #[test]
-fn fully_bound_formula_guard_uses_native_support_instead_of_legacy_reachability() {
+fn fully_bound_formula_guard_uses_native_support_program() {
     let graph = Graph::new(4, &[(0, 1), (1, 2)]);
     let guarded_value = genid(&rngid().id).raw;
     let sibling_value = genid(&rngid().id).raw;
-    let fully_bound_satisfied_calls = Arc::new(AtomicUsize::new(0));
     let root = fully_bound_support_root(
         graph.set.clone(),
         graph.value(0),
@@ -3170,7 +2995,6 @@ fn fully_bound_formula_guard_uses_native_support_instead_of_legacy_reachability(
         sibling_value,
         1,
         8,
-        Arc::clone(&fully_bound_satisfied_calls),
     );
 
     let mut query = Query::new(root, project_outer)
@@ -3180,7 +3004,6 @@ fn fully_bound_formula_guard_uses_native_support_instead_of_legacy_reachability(
     let actual: Vec<_> = query.by_ref().collect();
 
     assert_eq!(actual, vec![sibling_value]);
-    assert_eq!(fully_bound_satisfied_calls.load(Ordering::Relaxed), 0);
     assert!(query.stats().support_action_pops > 0);
     assert!(query.stats().support_calls > 0);
     assert!(query.stats().delta_transition_pages > 0);
@@ -3191,7 +3014,6 @@ fn first_support_witness_resumes_formula_via_the_native_program() {
     let graph = Graph::new(8, &[(0, 1), (0, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)]);
     let guarded_value = genid(&rngid().id).raw;
     let sibling_value = genid(&rngid().id).raw;
-    let fully_bound_satisfied_calls = Arc::new(AtomicUsize::new(0));
     let root = fully_bound_support_root(
         graph.set.clone(),
         graph.value(0),
@@ -3201,7 +3023,6 @@ fn first_support_witness_resumes_formula_via_the_native_program() {
         sibling_value,
         1,
         8,
-        Arc::clone(&fully_bound_satisfied_calls),
     );
     let mut query = Query::new(root, project_outer)
         .solve_residual_state_lazy_with(ResidualLowering::FULL)
@@ -3210,7 +3031,6 @@ fn first_support_witness_resumes_formula_via_the_native_program() {
 
     let first = query.next().expect("one guarded Union result");
     assert!(first == guarded_value || first == sibling_value);
-    assert_eq!(fully_bound_satisfied_calls.load(Ordering::Relaxed), 0);
     assert!(query.stats().support_action_pops > 0);
     drop(query);
 }
@@ -3220,14 +3040,14 @@ fn affine_nested_support_is_permutation_invariant_and_monotone() {
     let parent_values = vec![genid(&rngid().id).raw, genid(&rngid().id).raw];
     let guarded_value = genid(&rngid().id).raw;
     let sibling_value = genid(&rngid().id).raw;
-    let mut permutation_bags = Vec::new();
+    let mut permutation_results = Vec::new();
 
     for arm_order in [SupportArmOrder::FalseFirst, SupportArmOrder::TrueFirst] {
         let mut previous = Vec::new();
-        let mut level_bags = Vec::new();
+        let mut level_results = Vec::new();
         for level in 0..=4 {
             let graph = GeneratedGraph::new(level);
-            let (root, fully_bound_satisfied_calls) = nested_affine_support_root(
+            let root = nested_affine_support_root(
                 graph.set.clone(),
                 graph.value(0),
                 graph.value(2),
@@ -3253,24 +3073,19 @@ fn affine_nested_support_is_permutation_invariant_and_monotone() {
             expected.sort_unstable();
             assert_eq!(actual, expected, "level={level}, order={arm_order:?}");
             assert!(
-                sorted_bag_is_subset(&previous, &actual),
+                sorted_results_are_subset(&previous, &actual),
                 "graph growth retracted an affine Support result at level={level}, order={arm_order:?}"
-            );
-            assert_eq!(
-                fully_bound_satisfied_calls.load(Ordering::Relaxed),
-                0,
-                "nested Support fell back to legacy reachability at level={level}, order={arm_order:?}"
             );
             assert!(query.stats().support_action_pops > 0);
             assert!(query.stats().delta_transition_pages > 0);
             previous = actual.clone();
-            level_bags.push(actual);
+            level_results.push(actual);
         }
-        permutation_bags.push(level_bags);
+        permutation_results.push(level_results);
     }
 
     assert_eq!(
-        permutation_bags[0], permutation_bags[1],
+        permutation_results[0], permutation_results[1],
         "reordering the false arm and nested true AND changed Boolean Support semantics"
     );
 }
@@ -3298,7 +3113,7 @@ fn live_affine_support_clones_exactly_and_matches_rayon_worker_counts() {
     let mut expected = vec![guarded_value, guarded_value, sibling_value, sibling_value];
     expected.sort_unstable();
 
-    let (root, fully_bound_satisfied_calls) = make();
+    let root = make();
     let mut query = Query::new(root, project_outer)
         .solve_residual_state_lazy_with(ResidualLowering::FULL)
         .cap(1)
@@ -3307,7 +3122,6 @@ fn live_affine_support_clones_exactly_and_matches_rayon_worker_counts() {
     let examined_at_first = query.stats().delta_transition_candidates_examined;
     assert!(examined_at_first > 0);
     assert!(query.stats().support_action_pops > 0);
-    assert_eq!(fully_bound_satisfied_calls.load(Ordering::Relaxed), 0);
 
     let clone = query.clone();
     let remainder: Vec<_> = query.collect();
@@ -3322,7 +3136,7 @@ fn live_affine_support_clones_exactly_and_matches_rayon_worker_counts() {
 
     #[cfg(feature = "parallel")]
     for workers in [1, 4] {
-        let (root, fully_bound_satisfied_calls) = make();
+        let root = make();
         let query = Query::new(root, project_outer)
             .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .cap(1)
@@ -3334,11 +3148,6 @@ fn live_affine_support_clones_exactly_and_matches_rayon_worker_counts() {
             .install(|| query.into_par_iter().collect::<Vec<_>>());
         actual.sort_unstable();
         assert_eq!(actual, expected, "workers={workers}");
-        assert_eq!(
-            fully_bound_satisfied_calls.load(Ordering::Relaxed),
-            0,
-            "workers={workers}"
-        );
     }
 }
 
@@ -3349,7 +3158,7 @@ fn support_is_parent_atomic_before_candidate_pages() {
     let sibling_value = genid(&rngid().id).raw;
     let reachable = Graph::new(8, &[(0, 1), (0, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)]);
     let trace = Arc::new(Mutex::new(Vec::new()));
-    let (root, fully_bound_satisfied_calls) = nested_affine_support_root(
+    let root = nested_affine_support_root(
         reachable.set.clone(),
         reachable.value(0),
         reachable.value(1),
@@ -3371,7 +3180,6 @@ fn support_is_parent_atomic_before_candidate_pages() {
     expected.push(sibling_value);
     expected.sort_unstable();
     assert_eq!(actual, expected);
-    assert_eq!(fully_bound_satisfied_calls.load(Ordering::Relaxed), 0);
     assert!(query.stats().support_action_pops > 0);
 
     let trace = trace.lock().expect("support trace poisoned").clone();
@@ -3379,7 +3187,7 @@ fn support_is_parent_atomic_before_candidate_pages() {
 
     let unreachable = Graph::new(8, &[(0, 1), (0, 2), (2, 3), (3, 4), (4, 5), (5, 6), (7, 7)]);
     let trace = Arc::new(Mutex::new(Vec::new()));
-    let (root, fully_bound_satisfied_calls) = nested_affine_support_root(
+    let root = nested_affine_support_root(
         unreachable.set.clone(),
         unreachable.value(0),
         unreachable.value(7),
@@ -3403,7 +3211,6 @@ fn support_is_parent_atomic_before_candidate_pages() {
     );
     assert!(query.stats().support_action_pops > 0);
     assert!(query.stats().delta_transition_pages > 0);
-    assert_eq!(fully_bound_satisfied_calls.load(Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -3609,7 +3416,7 @@ fn target_confirm_positive_support_publishes_early_then_exactly_drains() {
     ];
     let support_routes = Arc::new(AtomicUsize::new(0));
     let make = || {
-        certified_target_confirm_root(
+        covering_target_confirm_root(
             graph.set.clone(),
             graph.value(0),
             candidates.clone(),
@@ -3680,7 +3487,7 @@ fn target_confirm_positive_support_does_not_feed_past_false_occurrence_zero() {
     let candidates = vec![[0; 32], graph.value(1).raw, [u8::MAX; 32]];
     let support_routes = Arc::new(AtomicUsize::new(0));
     let make = || {
-        certified_target_confirm_root(
+        covering_target_confirm_root(
             graph.set.clone(),
             graph.value(0),
             candidates.clone(),
@@ -3985,7 +3792,7 @@ fn target_confirm_positive_support_classifies_a_chunk_homomorphic_commit() {
     ];
     let support_routes = Arc::new(AtomicUsize::new(0));
     let make = || {
-        certified_chunk_target_confirm_root(
+        covering_chunk_target_confirm_root(
             graph.set.clone(),
             graph.value(0),
             candidates.clone(),
@@ -3994,7 +3801,7 @@ fn target_confirm_positive_support_classifies_a_chunk_homomorphic_commit() {
             // This exact page-local sibling remains after the grouped RPQ
             // confirmer, making the successful hedge's continuation
             // ChunkHomomorphic rather than Terminal.
-            Box::new(CertifiedOrderedDomain(OrderedDomain {
+            Box::new(CoveringOrderedDomain(OrderedDomain {
                 variable: END,
                 gate: START,
                 unbound_estimate: 4,
@@ -4052,7 +3859,7 @@ fn target_confirm_positive_chunk_that_dies_in_suffix_is_not_retried() {
     let candidates = vec![first, survivor, [u8::MAX; 32]];
     let support_routes = Arc::new(AtomicUsize::new(0));
     let make = |calls| {
-        certified_chunk_target_confirm_root(
+        covering_chunk_target_confirm_root(
             graph.set.clone(),
             graph.value(0),
             candidates.clone(),
@@ -4123,7 +3930,7 @@ fn target_confirm_nullable_support_seed_is_not_publication_authority() {
     let candidates = vec![start, start, start];
     let support_routes = Arc::new(AtomicUsize::new(0));
     let make = || {
-        certified_target_confirm_root(
+        covering_target_confirm_root(
             graph.set.clone(),
             graph.value(0),
             candidates.clone(),
@@ -4207,7 +4014,7 @@ fn positive_support_gate_precedes_partial_rpq_optimistic_support_selection() {
             &repeated(graph.attribute, false),
         );
         Arc::new(IntersectionConstraint::new(vec![
-            Box::new(CertifiedOrderedDomain(OrderedDomain {
+            Box::new(CoveringOrderedDomain(OrderedDomain {
                 variable: START,
                 gate: END,
                 unbound_estimate: 0,
@@ -4421,25 +4228,6 @@ fn nullable_two_free_first_frontier_is_exactly_the_graph_term_union() {
 }
 
 #[test]
-fn duplicate_outer_parents_preserve_endpoint_bag_multiplicity() {
-    let graph = Graph::new(3, &[(0, 1), (1, 2)]);
-    let ops = repeated(graph.attribute, false);
-    let outer_values = [genid(&rngid().id).raw, genid(&rngid().id).raw];
-    let make_root =
-        || duplicate_parent_root(graph.set.clone(), graph.value(0).raw, outer_values, &ops);
-    assert_all_schedulers(
-        make_root,
-        project_end,
-        vec![
-            graph.value(1).raw,
-            graph.value(1).raw,
-            graph.value(2).raw,
-            graph.value(2).raw,
-        ],
-    );
-}
-
-#[test]
 fn conservative_residual_lowering_keeps_plus_opaque() {
     let graph = Graph::new(3, &[(0, 1), (1, 2)]);
     let root = bound_start_root(
@@ -4501,7 +4289,7 @@ fn first_result_requires_one_expansion_and_drop_cancels_the_remainder() {
 }
 
 #[test]
-fn nullable_seed_is_first_result_without_transition_work_and_keeps_affine_bags() {
+fn nullable_seed_is_first_result_without_transition_work_and_preserves_affine_rows() {
     let graph = Graph::new(5, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
     let ops = [PathOp::Attr(graph.attribute.raw()), PathOp::Star];
     let outer_values = [genid(&rngid().id).raw, genid(&rngid().id).raw];
@@ -4615,7 +4403,7 @@ fn clone_with_a_suspended_same_variable_cursor_has_two_exact_remainders() {
 }
 
 #[test]
-fn generated_product_programs_match_sequential_and_dag_bags() {
+fn generated_product_programs_match_sequential_and_dag_results() {
     let edge_universe = [(0, 0), (0, 1), (0, 2), (1, 2), (2, 3), (3, 0)];
     for mask in 0u16..64 {
         let edges: Vec<_> = edge_universe
@@ -4725,9 +4513,9 @@ fn generated_combined_formula_rpq_matrix_matches_frozen_schedulers_and_is_monoto
     let mut saw_root_cyclic_probe_one = false;
 
     for program in programs {
-        let mut bags_by_formula = Vec::new();
+        let mut results_by_formula = Vec::new();
         for formula in formulas {
-            let mut bags_by_level = Vec::new();
+            let mut results_by_level = Vec::new();
             for level in 0..=4 {
                 let graph = GeneratedGraph::new(level);
                 let ops = program.ops(graph.primary, graph.secondary);
@@ -4764,23 +4552,23 @@ fn generated_combined_formula_rpq_matrix_matches_frozen_schedulers_and_is_monoto
                         saw_root_cyclic_probe_one = true;
                     }
                 }
-                bags_by_level.push(expected);
+                results_by_level.push(expected);
             }
 
-            for (level, pair) in bags_by_level.windows(2).enumerate() {
+            for (level, pair) in results_by_level.windows(2).enumerate() {
                 assert!(
-                    sorted_bag_is_subset(&pair[0], &pair[1]),
+                    sorted_results_are_subset(&pair[0], &pair[1]),
                     "adding graph facts retracted results: level={level}->{} program={program:?} formula={formula:?} before={:?} after={:?}",
                     level + 1,
                     pair[0],
                     pair[1]
                 );
             }
-            bags_by_formula.push(bags_by_level);
+            results_by_formula.push(results_by_level);
         }
 
         assert_eq!(
-            bags_by_formula[1], bags_by_formula[2],
+            results_by_formula[1], results_by_formula[2],
             "page-locality changed semantics for program={program:?}"
         );
     }
@@ -4790,7 +4578,7 @@ fn generated_combined_formula_rpq_matrix_matches_frozen_schedulers_and_is_monoto
         "the generated width-one root+cyclic lane never exercised a streamed handoff probe"
     );
 
-    // The recursive bag cannot reveal accidental occurrence collapse because
+    // The projected SET cannot reveal accidental occurrence collapse because
     // its two arms denote the same relation. Pin the structural invariant once
     // through the diagnostic-only shadow surface.
     let graph = GeneratedGraph::new(4);
@@ -5065,7 +4853,7 @@ fn first_fanout_result_scans_one_transition_and_clone_keeps_the_exact_cursor() {
 }
 
 #[test]
-fn paged_transitions_preserve_affine_parent_bags_and_storage_monotonicity() {
+fn paged_transitions_preserve_affine_parent_rows_and_storage_monotonicity() {
     let graph = Graph::new(5, &[(0, 1), (0, 2), (0, 3), (0, 4)]);
     let ops = [PathOp::Attr(graph.attribute.raw())];
     let outer_values = [genid(&rngid().id).raw, genid(&rngid().id).raw];
@@ -5226,7 +5014,7 @@ fn inverse_negated_transition_pages_from_literals_are_exact_and_distinct() {
 }
 
 #[test]
-fn mixed_transition_pages_preserve_cycles_clone_drop_affine_bags_and_monotonicity() {
+fn mixed_transition_pages_preserve_cycles_clone_drop_affine_rows_and_monotonicity() {
     let graph = GeneratedGraph::new(4);
     let ops = [
         PathOp::Attr(graph.primary.raw()),

@@ -426,10 +426,6 @@ where
         VariableSet::new_singleton(self.doc.index)
     }
 
-    fn fixed_denotation(&self) -> bool {
-        true
-    }
-
     fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
         if variable == self.doc.index && !bound.is_set(variable) {
             ProposalCoverage::Exact
@@ -863,10 +859,6 @@ impl<'a, I: CosineSimilarity + ?Sized + 'a> Constraint<'a> for CosineAtLeast<'a,
         VariableSet::new_singleton(self.a.index).union(VariableSet::new_singleton(self.b.index))
     }
 
-    fn fixed_denotation(&self) -> bool {
-        true
-    }
-
     fn estimate(
         &self,
         variable: VariableId,
@@ -1062,10 +1054,6 @@ impl TypedProgramSpec for SimilarTo {
 impl<'a> Constraint<'a> for SimilarTo {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.var.index)
-    }
-
-    fn fixed_denotation(&self) -> bool {
-        true
     }
 
     fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
@@ -2235,14 +2223,12 @@ mod tests {
     fn semantic_receipts_distinguish_frozen_retrieval_from_dynamic_pair_filtering() {
         let variable = Variable::<Handle<Embedding>>::new(0);
         let bm25 = BM25Filter::from_entries(variable, Vec::<RawInline>::new());
-        assert!(bm25.fixed_denotation());
         assert_eq!(
             bm25.proposal_coverage(variable.index, VariableSet::new_empty()),
             ProposalCoverage::Exact
         );
 
         let similar = SimilarTo::from_candidates(variable, Vec::new());
-        assert!(similar.fixed_denotation());
         assert_eq!(
             similar.proposal_coverage(variable.index, VariableSet::new_empty()),
             ProposalCoverage::Exact
@@ -2262,7 +2248,6 @@ mod tests {
         let view = flat.attach(&reader);
         let peer = Variable::<Handle<Embedding>>::new(1);
         let cosine = view.cosine_at_least(variable, peer, 0.5);
-        assert!(cosine.fixed_denotation());
         assert_eq!(
             cosine.proposal_coverage(variable.index, VariableSet::new_empty()),
             ProposalCoverage::None

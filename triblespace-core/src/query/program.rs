@@ -1012,7 +1012,9 @@ impl<State, NoveltyKey> TypedEffectSink<State, NoveltyKey> {
 ///
 /// Program code can emit only typed states and novelty keys. It cannot create
 /// or inspect engine handles, and therefore cannot bypass affine take or
-/// novelty admission.
+/// novelty admission. Within one activation, equal novelty keys must identify
+/// states with the same possible future outputs; otherwise admission order
+/// would change the relation produced by the Program.
 #[doc(hidden)]
 pub trait TypedProgramSpec {
     type State: Clone + Send + 'static;

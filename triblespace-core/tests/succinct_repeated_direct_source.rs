@@ -16,7 +16,7 @@ use triblespace_core::inline::{Inline, IntoInline, RawInline};
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace_core::query::residual::ResidualLowering;
 use triblespace_core::query::{
-    Binding, CandidateSink, Constraint, EstimateSink, Query, ResidualDeltaOutput,
+    Binding, CandidateSink, Constraint, EstimateSink, ProposalCoverage, Query, ResidualDeltaOutput,
     ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, Variable, VariableId,
     VariableSet,
 };
@@ -282,6 +282,10 @@ where
         self.inner.variables()
     }
 
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+        self.inner.proposal_coverage(variable, bound)
+    }
+
     fn estimate(
         &self,
         variable: VariableId,
@@ -501,6 +505,14 @@ struct DuplicateDomain {
 impl<'a> Constraint<'a> for DuplicateDomain {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.variable)
+    }
+
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+        if variable == self.variable && !bound.is_set(variable) {
+            ProposalCoverage::Exact
+        } else {
+            ProposalCoverage::None
+        }
     }
 
     fn estimate(

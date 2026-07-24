@@ -371,10 +371,6 @@ impl<'a, S: InlineEncoding> Constraint<'a> for PatchValueConstraint<'a, S> {
         VariableSet::new_singleton(self.variable.index)
     }
 
-    fn fixed_denotation(&self) -> bool {
-        true
-    }
-
     fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
         if variable == self.variable.index && !bound.is_set(variable) {
             ProposalCoverage::Exact
@@ -575,10 +571,6 @@ where
 {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.variable.index)
-    }
-
-    fn fixed_denotation(&self) -> bool {
-        true
     }
 
     fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
@@ -945,6 +937,14 @@ mod tests {
             VariableSet::new_singleton(self.variable)
         }
 
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            if variable == self.variable && !bound.is_set(variable) {
+                ProposalCoverage::Exact
+            } else {
+                ProposalCoverage::None
+            }
+        }
+
         fn estimate(
             &self,
             variable: VariableId,
@@ -1104,6 +1104,10 @@ mod tests {
     impl<'a, C: Constraint<'a>> Constraint<'a> for CountedSource<C> {
         fn variables(&self) -> VariableSet {
             self.inner.variables()
+        }
+
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            self.inner.proposal_coverage(variable, bound)
         }
 
         fn estimate(

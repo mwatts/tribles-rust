@@ -138,10 +138,6 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
         VariableSet::new_singleton(self.variable_v)
     }
 
-    fn fixed_denotation(&self) -> bool {
-        true
-    }
-
     fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
         if variable == self.variable_v && !bound.is_set(variable) {
             ProposalCoverage::Exact

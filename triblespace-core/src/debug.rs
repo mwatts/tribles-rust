@@ -42,10 +42,6 @@ pub mod query {
             self.constraint.variables()
         }
 
-        fn fixed_denotation(&self) -> bool {
-            self.constraint.fixed_denotation()
-        }
-
         fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
             self.constraint.proposal_coverage(variable, bound)
         }
@@ -78,27 +74,7 @@ pub mod query {
             self.constraint.confirm(variable, view, candidates);
         }
 
-        fn estimate_certified(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            out: &mut EstimateSink<'_>,
-        ) -> bool {
-            self.constraint.estimate_certified(variable, view, out)
-        }
-
-        fn propose_certified(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) {
-            self.record.borrow_mut().push(variable);
-            self.constraint
-                .propose_certified(variable, view, candidates);
-        }
-
-        fn propose_certified_with_receipt(
+        fn propose_with_layout(
             &self,
             variable: VariableId,
             view: &RowsView<'_>,
@@ -106,17 +82,7 @@ pub mod query {
         ) -> ProposalLayout {
             self.record.borrow_mut().push(variable);
             self.constraint
-                .propose_certified_with_receipt(variable, view, candidates)
-        }
-
-        fn confirm_certified(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) {
-            self.constraint
-                .confirm_certified(variable, view, candidates);
+                .propose_with_layout(variable, view, candidates)
         }
 
         fn satisfied(&self, view: &RowsView<'_>) -> bool {
@@ -169,10 +135,6 @@ pub mod query {
             self.constraint.variables()
         }
 
-        fn fixed_denotation(&self) -> bool {
-            self.constraint.fixed_denotation()
-        }
-
         fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
             self.constraint.proposal_coverage(variable, bound)
         }
@@ -209,48 +171,14 @@ pub mod query {
             self.constraint.confirm(variable, view, candidates);
         }
 
-        fn estimate_certified(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            out: &mut EstimateSink<'_>,
-        ) -> bool {
-            if let Some(estimate) = self.estimates[variable] {
-                out.fill(estimate, view.len());
-                true
-            } else {
-                self.constraint.estimate_certified(variable, view, out)
-            }
-        }
-
-        fn propose_certified(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) {
-            self.constraint
-                .propose_certified(variable, view, candidates);
-        }
-
-        fn propose_certified_with_receipt(
+        fn propose_with_layout(
             &self,
             variable: VariableId,
             view: &RowsView<'_>,
             candidates: &mut CandidateSink<'_>,
         ) -> ProposalLayout {
             self.constraint
-                .propose_certified_with_receipt(variable, view, candidates)
-        }
-
-        fn confirm_certified(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) {
-            self.constraint
-                .confirm_certified(variable, view, candidates);
+                .propose_with_layout(variable, view, candidates)
         }
 
         fn satisfied(&self, view: &RowsView<'_>) -> bool {

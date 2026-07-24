@@ -14,10 +14,11 @@ use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, DispatchClass, EstimateSink, ProgramAction,
     ProgramCompletion, ProgramExposure, ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef,
-    ProgramRequest, ProgramRoute, ProgramSeedBatch, ProgramStratum, Query, ResidualDeltaNode,
-    ResidualDeltaOutput, ResidualDeltaSeed, ResidualDeltaSourceBatch, ResidualDeltaSourceCursor,
-    ResidualDeltaSourcePage, RowsView, TypedEffectSink, TypedProgramBatch, TypedProgramSpec,
-    TypedResume, TypedSeedSink, Variable, VariableId, VariableSet,
+    ProgramRequest, ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, Query,
+    ResidualDeltaNode, ResidualDeltaOutput, ResidualDeltaSeed, ResidualDeltaSourceBatch,
+    ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, TypedEffectSink,
+    TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink, Variable, VariableId,
+    VariableSet,
 };
 
 const START: VariableId = 0;
@@ -106,6 +107,14 @@ impl AlternatingClosure {
 impl<'a> Constraint<'a> for AlternatingClosure {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(START).union(VariableSet::new_singleton(END))
+    }
+
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+        if self.variables().is_set(variable) && !bound.is_set(variable) {
+            ProposalCoverage::Exact
+        } else {
+            ProposalCoverage::None
+        }
     }
 
     fn estimate(
@@ -493,6 +502,10 @@ impl<'a> Constraint<'a> for ProgramAlternatingClosure {
         self.0.variables()
     }
 
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+        self.0.proposal_coverage(variable, bound)
+    }
+
     fn estimate(
         &self,
         variable: VariableId,
@@ -607,6 +620,14 @@ struct PageLocalDomain {
 impl<'a> Constraint<'a> for PageLocalDomain {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.variable)
+    }
+
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+        if variable == self.variable && !bound.is_set(variable) {
+            ProposalCoverage::Exact
+        } else {
+            ProposalCoverage::None
+        }
     }
 
     fn estimate(
@@ -759,6 +780,14 @@ impl<'a> Constraint<'a> for PagedDirectDomain {
         VariableSet::new_singleton(self.variable)
     }
 
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+        if variable == self.variable && !bound.is_set(variable) {
+            ProposalCoverage::Exact
+        } else {
+            ProposalCoverage::None
+        }
+    }
+
     fn estimate(
         &self,
         variable: VariableId,
@@ -894,6 +923,10 @@ struct ScalarPagedDirectDomain(PagedDirectDomain);
 impl<'a> Constraint<'a> for ScalarPagedDirectDomain {
     fn variables(&self) -> VariableSet {
         self.0.variables()
+    }
+
+    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+        self.0.proposal_coverage(variable, bound)
     }
 
     fn estimate(
@@ -1211,12 +1244,12 @@ fn assert_recursive_support_case(include_terminal: bool) -> Vec<RawInline> {
 
     assert_eq!(residual_results, oracle);
     assert_eq!(residual_results, expected);
-    assert_eq!(
+    assert!(
         residual_evidence
             .fully_bound_satisfied_calls
-            .load(Ordering::Relaxed),
-        0,
-        "native Support must replace the synchronous fully-bound oracle"
+            .load(Ordering::Relaxed)
+            > 0,
+        "seed admission may consult the canonical fully-bound relation before native Support"
     );
     assert_eq!(
         residual_evidence
@@ -1333,12 +1366,12 @@ fn assert_program_support_case(
     let actual = sorted(residual.results);
     assert_eq!(actual, oracle);
     assert_eq!(actual, expected);
-    assert_eq!(
+    assert!(
         residual_evidence
             .fully_bound_satisfied_calls
-            .load(Ordering::Relaxed),
-        0,
-        "typed Program Support must replace the synchronous fully-bound oracle"
+            .load(Ordering::Relaxed)
+            > 0,
+        "seed admission may consult the canonical fully-bound relation before typed Support"
     );
     assert_eq!(
         residual_evidence

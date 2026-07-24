@@ -35,10 +35,6 @@ impl Constraint<'static> for BasicSource {
         VariableSet::new_singleton(TARGET)
     }
 
-    fn fixed_denotation(&self) -> bool {
-        true
-    }
-
     fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
         if variable == TARGET && !bound.is_set(TARGET) {
             self.coverage
@@ -73,7 +69,7 @@ impl Constraint<'static> for BasicSource {
         }
     }
 
-    fn propose_certified_with_receipt(
+    fn propose_with_layout(
         &self,
         variable: VariableId,
         view: &RowsView<'_>,
@@ -117,10 +113,6 @@ struct CountingValidator {
 impl Constraint<'static> for CountingValidator {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(TARGET)
-    }
-
-    fn fixed_denotation(&self) -> bool {
-        true
     }
 
     fn estimate(
@@ -174,10 +166,6 @@ impl Constraint<'static> for AdaptiveSource {
         VariableSet::new_singleton(SELECTOR).union(VariableSet::new_singleton(TARGET))
     }
 
-    fn fixed_denotation(&self) -> bool {
-        true
-    }
-
     fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
         if variable == TARGET && bound.is_set(SELECTOR) && !bound.is_set(TARGET) {
             ProposalCoverage::Exact
@@ -223,7 +211,7 @@ impl Constraint<'static> for AdaptiveSource {
         }
     }
 
-    fn propose_certified_with_receipt(
+    fn propose_with_layout(
         &self,
         variable: VariableId,
         view: &RowsView<'_>,
@@ -347,11 +335,8 @@ fn nonuniform_nested_layout(second_is_set: bool) -> (ProposalLayout, Candidates)
     let rows = [SELECT_LEFT, SELECT_RIGHT];
     let view = RowsView::new(&[SELECTOR], &rows);
     let mut candidates = Vec::new();
-    let layout = root.propose_certified_with_receipt(
-        TARGET,
-        &view,
-        &mut CandidateSink::Tagged(&mut candidates),
-    );
+    let layout =
+        root.propose_with_layout(TARGET, &view, &mut CandidateSink::Tagged(&mut candidates));
     (layout, candidates)
 }
 
@@ -385,7 +370,7 @@ fn union_constant_and_equality_issue_construction_proven_sets() {
         }),
     ]);
     let mut union_values = Vec::new();
-    let union_layout = union.propose_certified_with_receipt(
+    let union_layout = union.propose_with_layout(
         TARGET,
         &RowsView::EMPTY,
         &mut CandidateSink::Values(&mut union_values),
@@ -396,7 +381,7 @@ fn union_constant_and_equality_issue_construction_proven_sets() {
     let variable = Variable::<UnknownInline>::new(TARGET);
     let constant = ConstantConstraint::new(variable, Inline::new(B));
     let mut constant_values = Vec::new();
-    let constant_layout = constant.propose_certified_with_receipt(
+    let constant_layout = constant.propose_with_layout(
         TARGET,
         &RowsView::EMPTY,
         &mut CandidateSink::Values(&mut constant_values),
@@ -406,7 +391,7 @@ fn union_constant_and_equality_issue_construction_proven_sets() {
 
     let equality = EqualityConstraint::new(TARGET, SELECTOR);
     let mut equality_values = Vec::new();
-    let equality_layout = equality.propose_certified_with_receipt(
+    let equality_layout = equality.propose_with_layout(
         TARGET,
         &RowsView::new(&[SELECTOR], &[A]),
         &mut CandidateSink::Values(&mut equality_values),
@@ -453,10 +438,6 @@ impl Constraint<'static> for WideSource {
         VariableSet::new_singleton(TARGET)
     }
 
-    fn fixed_denotation(&self) -> bool {
-        true
-    }
-
     fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
         if variable == TARGET && !bound.is_set(TARGET) {
             ProposalCoverage::Exact
@@ -494,7 +475,7 @@ impl Constraint<'static> for WideSource {
         }
     }
 
-    fn propose_certified_with_receipt(
+    fn propose_with_layout(
         &self,
         variable: VariableId,
         view: &RowsView<'_>,

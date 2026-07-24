@@ -123,10 +123,6 @@ impl<'a> Constraint<'a> for EntityRangeConstraint {
         VariableSet::new_singleton(self.variable_e)
     }
 
-    fn fixed_denotation(&self) -> bool {
-        true
-    }
-
     fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
         if variable == self.variable_e && !bound.is_set(variable) {
             ProposalCoverage::Exact
@@ -313,10 +309,6 @@ impl TypedProgramSpec for AttributeRangeConstraint {
 impl<'a> Constraint<'a> for AttributeRangeConstraint {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.variable_a)
-    }
-
-    fn fixed_denotation(&self) -> bool {
-        true
     }
 
     fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {

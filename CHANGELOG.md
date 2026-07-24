@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The `Constraint` protocol now has unconditional relational SET
+  semantics.** Every occurrence denotes a fixed raw-inline relation shared by
+  its ordinary, paged, typed-Program, and complete-equivalent routes; the
+  never-shipped `fixed_denotation` switch and parallel certified action methods
+  are removed. Planning always uses `ProposalCoverage` for logical source
+  eligibility. `propose_with_layout` and its `ProposalLayout` report only
+  physical `(parent, value)` uniqueness for optional deduplication elision, and
+  estimates remain cost guidance only.
 - **Certified WholeRoot AND quotes can cross Ready as deferred affine
   choices.** The experimental residual scheduler preserves its V3.1 outer
   proposal shell while carrying each row's stable-preorder child ordinal and
@@ -68,14 +76,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lets every eligible exact RPQ Confirm reuse a real replacement receipt that
   newly accepts occurrence zero while exact Confirm remains the sole
   completeness owner. A separately authorized fully-bound Support hedge races
-  inverse, same-variable, mixed-family, and uncertified routes; a conservative
-  cumulative-work dominance receipt may elide it when retaining Support cannot
-  improve first-positive latency. That performance receipt requires no
-  internal state, page, ordering, or trace equality. Both feeders share the
-  generation-fenced parent/value SET ledger and immediate grant/release path,
-  so duplicate or stale receipts cannot publish twice, a false first
-  occurrence never feeds later candidates, and quiescent finalization receives
-  exactly `G \ P`. PositiveSupport now affinely discards queued typed handles,
+  inverse, same-variable, mixed-family, and routes without an early-publication
+  receipt; a conservative cumulative-work dominance receipt may elide it when
+  retaining Support cannot improve first-positive latency. That performance
+  receipt requires no internal state, page, ordering, or trace equality. Both
+  feeders share the generation-fenced parent/value SET ledger and immediate
+  grant/release path, so duplicate or stale receipts cannot publish twice, a
+  false first occurrence never feeds later candidates, and quiescent
+  finalization receives exactly `G \ P`. PositiveSupport now affinely discards
+  queued typed handles,
   consumes issued credits, and retires as inert cleanup after its first
   positive receipt, an exact winner, or exact quiescence; exact work is never
   cancelled. Nullable seed acceptance remains deliberately ineligible for
@@ -123,11 +132,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   physical candidate occurrences. The directed price chooses a source within
   one target variable; cross-variable ordering and generic composite estimates
   remain on raw cardinalities. Planning includes proposal, engine SET
-  admission, and every required confirmation occurrence, with an atomic legacy
-  fallback unless all relevant peers opt in. HashSet and single-position
-  Succinct sources publish broad hash/sequential versus random-rank classes;
-  finite-formula actions, repeated-position Succinct targets, and multi-shard
-  UnionArchive constraints remain on legacy estimates.
+  admission, and every required confirmation occurrence, with an atomic
+  raw-cardinality fallback unless all relevant peers opt in. HashSet and
+  single-position Succinct sources publish broad hash/sequential versus
+  random-rank classes; finite-formula actions, repeated-position Succinct
+  targets, and multi-shard UnionArchive constraints remain on raw-cardinality
+  estimates.
 - **Finite equality work and pointwise TribleSet checks stay on the ordinary
   hybrid path, while TribleSet proposal cursors remain production-resumable.**
   Equality Propose, Confirm, and Support plus TribleSet Confirm and Support are
@@ -145,7 +155,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Ordinary residual queries now use hybrid structural lowering.** Exposed
   associative AND regions remain flattened into residual occurrences, while
   other finite logical composites, including Union, stay fused behind their
-  certified constraint kernels. Production-qualified typed Programs such as
+  relational constraint kernels. Production-qualified typed Programs such as
   regular-path execution remain enabled. Explicit Program routes stay on the
   ordinary constraint protocol under `ResidualLowering::HYBRID`;
   `ResidualLowering::FULL` opts into them together with the maximally exposed
@@ -226,7 +236,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same already-located Succinct Ring walk. Sparse continuations keep their
   current shard and ordered cursor, while raw cross-shard duplicates remain
   visible to work telemetry until the engine's parent-local SET boundary. The
-  legacy proposal-page capability retains its globally ordered,
+  normalized proposal-page capability retains its globally ordered,
   duplicate-free stream.
 
 - **Exact compiled Formula proposals no longer confirm the whole Formula
@@ -236,18 +246,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Exact therefore enters its outer candidate continuation already checked;
   Covering routes retain the mandatory self-confirmation.
 
-- **Source-less certified queries now fail at construction.** A surviving,
-  non-full fixed-denotation seed must expose a covering proposal source for at
-  least one variable, so scalar, DAG, and residual execution no longer fail at
-  different late planning sites for filter-only roots. Seeds already proven
-  false remain valid empty queries, and peer-dependent sources such as
-  Equality remain eligible after another constraint binds their peer.
+- **Source-less relational queries now fail at construction.** A surviving,
+  non-full seed must expose a covering proposal source for at least one
+  variable, so scalar, DAG, and residual execution no longer fail at different
+  late planning sites for filter-only roots. Seeds already proven false remain
+  valid empty queries, and peer-dependent sources such as Equality remain
+  eligible after another constraint binds their peer.
 
 - **The residual delta handoff regression now constructs a reachable Formula
-  state.** Its streaming proposal runs through a certified linear AND suffix
-  with the irrelevant sibling already skipped, rather than manually placing a
-  streaming reducer beneath an OR barrier that the production planner cannot
-  cross.
+  state.** Its streaming proposal runs through a coverage-bearing linear AND
+  suffix with the irrelevant sibling already skipped, rather than manually
+  placing a streaming reducer beneath an OR barrier that the production
+  planner cannot cross.
 - **Search and core now share one Jerky crate identity.** The search crate is
   pinned to the same Jerky revision as core and GPU, restoring its succinct
   build and preventing `Serializable` methods from disappearing behind two
@@ -304,19 +314,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Equal novelty keys now have tests proving first-receipt ownership across
   input tags of one activation while remaining independently admissible for
   distinct activations.
-- **Constraints publish certified set-denotation receipts.**
-  `fixed_denotation` certifies one route-independent relation and
+- **Constraints publish proposal-coverage receipts.**
   `proposal_coverage` distinguishes no source proof, a covering proposal, and
-  exact proposal support. Both capabilities default conservatively, forward
-  through transparent wrappers, and compose structurally through AND/OR;
-  coherent finite, indexed, search, path, and resident-GPU constraints opt in.
-  Repaired attached range constraints certify their exact attached-axis-domain
-  intersections as well. The residual planner consumes these receipts only
-  when every occurrence in the complete query root certifies
-  `fixed_denotation`; any default-false occurrence retains legacy
-  action-defined planning. Coverage, rather than estimates, then selects a
+  exact proposal support. It defaults conservatively, forwards through
+  transparent wrappers, and composes structurally through AND/OR; coherent
+  finite, indexed, search, path, and resident-GPU constraints opt in. Repaired
+  attached range constraints publish Exact coverage for their attached-axis
+  domain intersections as well. Coverage, rather than estimates, selects a
   source; Covering proposals retain self-confirmation, while Exact proposals
-  may discharge it. Approximate ANN remains deliberately uncertified.
+  may discharge it. Approximate ANN publishes no exact source receipt.
 - **Typed Program capabilities compose by immutable semantic route arm.**
   `PreferredProgram` chooses a preferred typed family only when that family
   structurally owns an action, otherwise choosing a canonical typed fallback
@@ -482,8 +488,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   filtered shapes non-paged because their one-head merge requires rejection-free
   shard pages.
 - **Succinct shard unions page one globally normalized source.**
-  `UnionArchive`'s legacy proposal-page capability merges one ordered head per
-  shard behind a single activation-local `After(value)` cursor, preserving
+  `UnionArchive`'s normalized proposal-page capability merges one ordered head
+  per shard behind a single activation-local `After(value)` cursor, preserving
   cross-shard deduplication without materializing complete union arms. Generic
   `UnionConstraint` remains unchanged, and schemas not admitted by every shard
   remain non-paged.

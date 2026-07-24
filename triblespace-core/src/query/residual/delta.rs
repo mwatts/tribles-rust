@@ -627,7 +627,6 @@ struct PositiveConfirmParentId {
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PositivePublicationCertificate {
-    fixed_denotation: bool,
     continuation: ContinuationPublicationReceipt,
     crosses_set_boundary: bool,
 }
@@ -642,7 +641,6 @@ impl PositivePublicationCertificate {
         formula_pcs: &FormulaPcInterner,
     ) -> Self {
         Self {
-            fixed_denotation: plan.certified_denotation,
             continuation: continuation_publication_receipt(
                 previous,
                 successor,
@@ -660,12 +658,11 @@ impl PositivePublicationCertificate {
     }
 
     fn eligible(self) -> bool {
-        self.fixed_denotation
-            && match self.continuation {
-                ContinuationPublicationReceipt::Terminal => true,
-                ContinuationPublicationReceipt::ChunkHomomorphic => self.crosses_set_boundary,
-                ContinuationPublicationReceipt::Barrier => false,
-            }
+        match self.continuation {
+            ContinuationPublicationReceipt::Terminal => true,
+            ContinuationPublicationReceipt::ChunkHomomorphic => self.crosses_set_boundary,
+            ContinuationPublicationReceipt::Barrier => false,
+        }
     }
 }
 
@@ -7631,7 +7628,7 @@ impl DeltaScheduler {
         };
         assert!(
             reducer_seeds.is_empty(),
-            "a certified streaming Formula proposal reached an OR reducer"
+            "a relational streaming Formula proposal reached an OR reducer"
         );
         DeltaStreamingRelease {
             stable: DeltaStableEffects {
@@ -10165,6 +10162,14 @@ mod tests {
             VariableSet::new_singleton(0)
         }
 
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            if variable == 0 && !bound.is_set(variable) {
+                ProposalCoverage::Exact
+            } else {
+                ProposalCoverage::None
+            }
+        }
+
         fn estimate(
             &self,
             variable: VariableId,
@@ -12330,10 +12335,6 @@ mod tests {
             VariableSet::new_singleton(self.variable)
         }
 
-        fn fixed_denotation(&self) -> bool {
-            true
-        }
-
         fn estimate(
             &self,
             variable: VariableId,
@@ -14135,7 +14136,6 @@ mod tests {
             "dormant positive-publication state must cost one nullable pointer"
         );
         let certificate = terminal_positive_certificate();
-        assert!(certificate.fixed_denotation);
         assert_eq!(
             certificate.continuation,
             ContinuationPublicationReceipt::Terminal
@@ -14148,38 +14148,9 @@ mod tests {
     }
 
     #[test]
-    fn positive_publication_ledger_requires_fixed_nonbarrier_parent() {
+    fn positive_publication_ledger_requires_nonbarrier_parent() {
         let eligible = terminal_positive_certificate();
         let mut registry = ProducerRegistry::new();
-
-        let mut unfixed = eligible;
-        unfixed.fixed_denotation = false;
-        let (unfixed_activation, unfixed_parent) =
-            open_positive_confirm(&mut registry, [value(1)], unfixed);
-        assert!(matches!(
-            registry.state.activations[&unfixed_activation]
-                .positive_publication
-                .as_deref(),
-            Some(PositivePublicationRegistration::Private {
-                confirm_state: StateId(17),
-                certificate,
-            }) if *certificate == unfixed
-        ));
-        assert!(
-            registry
-                .positive_publication_snapshot(unfixed_parent)
-                .is_none(),
-            "an unfixed parent must not own a ledger"
-        );
-        assert!(registry
-            .open_positive_support_activation(
-                unfixed_parent,
-                0,
-                value(1),
-                VariableSet::new_singleton(0),
-                Some(terminal_positive_full()),
-            )
-            .is_none());
 
         let mut barrier = eligible;
         barrier.continuation = ContinuationPublicationReceipt::Barrier;
@@ -14211,7 +14182,6 @@ mod tests {
             .is_none());
 
         let malformed_chunk = PositivePublicationCertificate {
-            fixed_denotation: true,
             continuation: ContinuationPublicationReceipt::ChunkHomomorphic,
             crosses_set_boundary: false,
         };

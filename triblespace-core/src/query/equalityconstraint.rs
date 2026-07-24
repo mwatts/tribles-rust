@@ -293,10 +293,6 @@ impl<'c> Constraint<'c> for EqualityConstraint {
         vs
     }
 
-    fn fixed_denotation(&self) -> bool {
-        true
-    }
-
     /// Equality becomes an exact finite source only after the peer variable is
     /// bound. With both variables free it remains a validator rather than
     /// pretending to own the universe of raw values.
@@ -344,7 +340,7 @@ impl<'c> Constraint<'c> for EqualityConstraint {
         }
     }
 
-    fn propose_certified_with_receipt(
+    fn propose_with_layout(
         &self,
         variable: VariableId,
         view: &RowsView<'_>,

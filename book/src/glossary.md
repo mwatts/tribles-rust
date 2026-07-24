@@ -66,10 +66,12 @@ interest. Selectors power history traversals such as `parents`,
 The trait that every query operator implements. Its six ordinary execution
 methods—`variables`, `estimate`, `propose`, `confirm`, `satisfied`, and
 `influence`—let the Atreides join engine navigate the search space without a
-separate planner. Optional `fixed_denotation` and `proposal_coverage` receipts
-certify a complete tree's relational SET meaning and sound proposal sources.
-Custom data sources and application predicates participate in queries by
-implementing this trait.
+separate planner. Every occurrence denotes one fixed raw-inline SET relation,
+shared by its ordinary, paged, typed-Program, and complete-equivalent routes.
+`proposal_coverage` identifies sound proposal sources; `ProposalLayout` is only
+a physical uniqueness receipt for a completed `propose_with_layout` call.
+Estimates guide cost ordering and never change semantics. Custom data sources
+and application predicates participate in queries by implementing this trait.
 
 ### Entity
 The first position in a trible. Entities identify the subject making a

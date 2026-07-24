@@ -76,11 +76,11 @@ use triblespace_core::query::{
     CandidateSink, Constraint, ConstraintChildren, ConstraintShape, DispatchClass, EstimateSink,
     PreferredProgram, ProgramAction, ProgramCompletion, ProgramGrouping, ProgramKey, ProgramPacing,
     ProgramPhysicalReceipt, ProgramRef, ProgramRequest, ProgramRoute, ProgramSeedBatch,
-    ProgramStratum, ProposalCoverage, RawTerm, ResidualDeltaExpandBatch, ResidualDeltaExpandCursor,
-    ResidualDeltaExpandPage, ResidualDeltaNode, ResidualDeltaOutput, ResidualDeltaSeed,
-    ResidualDeltaSourceBatch, ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, Term,
-    TriblePattern, TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedResume,
-    TypedSeedSink, VariableId, VariableSet,
+    ProgramStratum, ProposalCoverage, ProposalLayout, RawTerm, ResidualDeltaExpandBatch,
+    ResidualDeltaExpandCursor, ResidualDeltaExpandPage, ResidualDeltaNode, ResidualDeltaOutput,
+    ResidualDeltaSeed, ResidualDeltaSourceBatch, ResidualDeltaSourceCursor,
+    ResidualDeltaSourcePage, RowsView, Term, TriblePattern, TypedEffectSink, TypedProgramBatch,
+    TypedProgramSpec, TypedResume, TypedSeedSink, VariableId, VariableSet,
 };
 
 use crate::budgeted::CohortGrants;
@@ -1468,10 +1468,6 @@ where
         self.program.canonical().variables()
     }
 
-    fn fixed_denotation(&self) -> bool {
-        self.program.canonical().fixed_denotation()
-    }
-
     fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
         self.program.canonical().proposal_coverage(variable, bound)
     }
@@ -1503,37 +1499,15 @@ where
         self.program.canonical().confirm(variable, view, candidates)
     }
 
-    fn estimate_certified(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        out: &mut EstimateSink<'_>,
-    ) -> bool {
-        self.program
-            .canonical()
-            .estimate_certified(variable, view, out)
-    }
-
-    fn propose_certified(
+    fn propose_with_layout(
         &self,
         variable: VariableId,
         view: &RowsView<'_>,
         candidates: &mut CandidateSink<'_>,
-    ) {
+    ) -> ProposalLayout {
         self.program
             .canonical()
-            .propose_certified(variable, view, candidates)
-    }
-
-    fn confirm_certified(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
-        self.program
-            .canonical()
-            .confirm_certified(variable, view, candidates)
+            .propose_with_layout(variable, view, candidates)
     }
 
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
@@ -1739,7 +1713,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_wrapper_forwards_certified_surface_without_device() {
+    fn canonical_wrapper_forwards_relational_surface_without_device() {
         let (archive, entities, attributes) = fixture();
         let mut context = VariableContext::new();
         let entity = context.next_variable::<GenId>();
@@ -1758,7 +1732,6 @@ mod tests {
         bound.set(entity.index);
         bound.set(attribute.index);
 
-        assert_eq!(wrapped.fixed_denotation(), canonical.fixed_denotation());
         assert_eq!(
             wrapped.proposal_coverage(value.index, bound),
             canonical.proposal_coverage(value.index, bound)
@@ -1773,13 +1746,13 @@ mod tests {
         );
 
         let mut canonical_estimate = usize::MAX;
-        let canonical_quoted = canonical.estimate_certified(
+        let canonical_quoted = canonical.estimate(
             value.index,
             &view,
             &mut EstimateSink::Scalar(&mut canonical_estimate),
         );
         let mut wrapped_estimate = usize::MAX;
-        let wrapped_quoted = wrapped.estimate_certified(
+        let wrapped_quoted = wrapped.estimate(
             value.index,
             &view,
             &mut EstimateSink::Scalar(&mut wrapped_estimate),
@@ -1788,13 +1761,13 @@ mod tests {
         assert_eq!(wrapped_estimate, canonical_estimate);
 
         let mut canonical_proposals = Vec::new();
-        canonical.propose_certified(
+        canonical.propose(
             value.index,
             &view,
             &mut CandidateSink::Values(&mut canonical_proposals),
         );
         let mut wrapped_proposals = Vec::new();
-        wrapped.propose_certified(
+        wrapped.propose(
             value.index,
             &view,
             &mut CandidateSink::Values(&mut wrapped_proposals),
@@ -1807,12 +1780,12 @@ mod tests {
             raw(fixture_id(9, 0)),
         ];
         let mut wrapped_candidates = canonical_candidates.clone();
-        canonical.confirm_certified(
+        canonical.confirm(
             value.index,
             &view,
             &mut CandidateSink::Values(&mut canonical_candidates),
         );
-        wrapped.confirm_certified(
+        wrapped.confirm(
             value.index,
             &view,
             &mut CandidateSink::Values(&mut wrapped_candidates),

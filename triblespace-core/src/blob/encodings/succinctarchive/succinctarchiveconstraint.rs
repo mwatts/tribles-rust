@@ -1536,10 +1536,6 @@ where
         variables
     }
 
-    fn fixed_denotation(&self) -> bool {
-        true
-    }
-
     fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
         if !bound.is_set(variable) && self.variables().is_set(variable) {
             ProposalCoverage::Exact

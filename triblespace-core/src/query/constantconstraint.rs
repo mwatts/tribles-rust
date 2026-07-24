@@ -219,10 +219,6 @@ impl<'a> Constraint<'a> for ConstantConstraint {
         VariableSet::new_singleton(self.variable)
     }
 
-    fn fixed_denotation(&self) -> bool {
-        true
-    }
-
     fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
         if variable == self.variable && !bound.is_set(variable) {
             ProposalCoverage::Exact
@@ -259,7 +255,7 @@ impl<'a> Constraint<'a> for ConstantConstraint {
         }
     }
 
-    fn propose_certified_with_receipt(
+    fn propose_with_layout(
         &self,
         variable: VariableId,
         view: &RowsView<'_>,

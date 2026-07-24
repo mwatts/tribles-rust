@@ -1363,10 +1363,6 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         variables
     }
 
-    fn fixed_denotation(&self) -> bool {
-        true
-    }
-
     fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
         if !bound.is_set(variable) && self.variables().is_set(variable) {
             ProposalCoverage::Exact
@@ -2028,6 +2024,14 @@ mod tests {
             variables
         }
 
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            if variable == self.variable && !bound.is_set(variable) {
+                ProposalCoverage::Exact
+            } else {
+                ProposalCoverage::None
+            }
+        }
+
         fn estimate(
             &self,
             variable: VariableId,
@@ -2077,6 +2081,10 @@ mod tests {
     {
         fn variables(&self) -> VariableSet {
             self.inner.variables()
+        }
+
+        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
+            self.inner.proposal_coverage(variable, bound)
         }
 
         fn estimate(

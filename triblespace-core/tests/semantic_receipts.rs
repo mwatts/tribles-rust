@@ -32,15 +32,13 @@ const FALSE_POSITIVE: RawInline = [0x72; 32];
 #[derive(Clone, Copy)]
 struct ReceiptDomain {
     variable: VariableId,
-    fixed: bool,
     coverage: ProposalCoverage,
 }
 
 impl ReceiptDomain {
-    fn new(fixed: bool, coverage: ProposalCoverage) -> Self {
+    fn new(coverage: ProposalCoverage) -> Self {
         Self {
             variable: X,
-            fixed,
             coverage,
         }
     }
@@ -51,12 +49,8 @@ impl Constraint<'_> for ReceiptDomain {
         VariableSet::new_singleton(self.variable)
     }
 
-    fn fixed_denotation(&self) -> bool {
-        self.fixed
-    }
-
     fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-        if self.fixed && variable == self.variable && !bound.is_set(variable) {
+        if variable == self.variable && !bound.is_set(variable) {
             self.coverage
         } else {
             ProposalCoverage::None
@@ -113,56 +107,10 @@ impl Constraint<'_> for ReceiptDomain {
     }
 }
 
-/// A coherent relation which deliberately opts into neither receipt.
-struct DefaultReceiptDomain;
-
-impl Constraint<'_> for DefaultReceiptDomain {
-    fn variables(&self) -> VariableSet {
-        VariableSet::new_singleton(X)
-    }
-
-    fn estimate(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        out: &mut EstimateSink<'_>,
-    ) -> bool {
-        if variable != X {
-            return false;
-        }
-        out.fill(1, view.len());
-        true
-    }
-
-    fn propose(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
-        if variable == X {
-            for row in 0..view.len() as u32 {
-                candidates.push(row, MEMBER);
-            }
-        }
-    }
-
-    fn confirm(
-        &self,
-        variable: VariableId,
-        _view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
-        if variable == X {
-            candidates.retain(|_, value| *value == MEMBER);
-        }
-    }
-}
-
 type DynConstraint = Box<dyn Constraint<'static>>;
 
-fn boxed(fixed: bool, coverage: ProposalCoverage) -> DynConstraint {
-    Box::new(ReceiptDomain::new(fixed, coverage))
+fn boxed(coverage: ProposalCoverage) -> DynConstraint {
+    Box::new(ReceiptDomain::new(coverage))
 }
 
 fn proposed<'a, C>(constraint: &C, variable: VariableId) -> Vec<RawInline>
@@ -226,25 +174,15 @@ fn receipt_strength_is_a_conservative_proof_order() {
 }
 
 #[test]
-fn custom_constraints_remain_uncertified_by_default() {
-    let constraint = DefaultReceiptDomain;
-    assert!(!constraint.fixed_denotation());
-    assert_eq!(
-        constraint.proposal_coverage(X, VariableSet::new_empty()),
-        ProposalCoverage::None
-    );
-}
-
-#[test]
 fn exact_and_covering_receipts_describe_support_not_multiplicity() {
-    let exact = ReceiptDomain::new(true, ProposalCoverage::Exact);
+    let exact = ReceiptDomain::new(ProposalCoverage::Exact);
     let mut exact_support = proposed(&exact, X);
     assert_eq!(exact_support, vec![MEMBER, MEMBER]);
     exact_support.sort_unstable();
     exact_support.dedup();
     assert_eq!(exact_support, vec![MEMBER]);
 
-    let covering = ReceiptDomain::new(true, ProposalCoverage::Covering);
+    let covering = ReceiptDomain::new(ProposalCoverage::Covering);
     let mut candidates = proposed(&covering, X);
     assert!(candidates.contains(&MEMBER));
     assert!(candidates.contains(&FALSE_POSITIVE));
@@ -258,7 +196,7 @@ fn exact_and_covering_receipts_describe_support_not_multiplicity() {
 
 #[test]
 fn transparent_wrappers_forward_semantic_receipts() {
-    let inner = ReceiptDomain::new(true, ProposalCoverage::Exact);
+    let inner = ReceiptDomain::new(ProposalCoverage::Exact);
     let boxed: Box<ReceiptDomain> = Box::new(inner);
     let shared = Arc::new(inner);
     let debug = DebugConstraint::new(inner, Rc::new(RefCell::new(Vec::new())));
@@ -270,7 +208,6 @@ fn transparent_wrappers_forward_semantic_receipts() {
         &debug,
         &estimated,
     ] {
-        assert!(constraint.fixed_denotation());
         assert_eq!(
             constraint.proposal_coverage(X, VariableSet::new_empty()),
             ProposalCoverage::Exact
@@ -279,17 +216,16 @@ fn transparent_wrappers_forward_semantic_receipts() {
 }
 
 #[test]
-fn conjunction_receipts_require_fixed_children_and_weaken_intersections() {
-    let singleton = IntersectionConstraint::new(vec![boxed(true, ProposalCoverage::Exact)]);
-    assert!(singleton.fixed_denotation());
+fn conjunction_receipts_weaken_intersections() {
+    let singleton = IntersectionConstraint::new(vec![boxed(ProposalCoverage::Exact)]);
     assert_eq!(
         singleton.proposal_coverage(X, VariableSet::new_empty()),
         ProposalCoverage::Exact
     );
 
     let exact_intersection = IntersectionConstraint::new(vec![
-        boxed(true, ProposalCoverage::Exact),
-        boxed(true, ProposalCoverage::Exact),
+        boxed(ProposalCoverage::Exact),
+        boxed(ProposalCoverage::Exact),
     ]);
     assert_eq!(
         exact_intersection.proposal_coverage(X, VariableSet::new_empty()),
@@ -297,8 +233,8 @@ fn conjunction_receipts_require_fixed_children_and_weaken_intersections() {
     );
 
     let one_source = IntersectionConstraint::new(vec![
-        boxed(true, ProposalCoverage::None),
-        boxed(true, ProposalCoverage::Covering),
+        boxed(ProposalCoverage::None),
+        boxed(ProposalCoverage::Covering),
     ]);
     assert_eq!(
         one_source.proposal_coverage(X, VariableSet::new_empty()),
@@ -306,21 +242,11 @@ fn conjunction_receipts_require_fixed_children_and_weaken_intersections() {
     );
 
     let validators = IntersectionConstraint::new(vec![
-        boxed(true, ProposalCoverage::None),
-        boxed(true, ProposalCoverage::None),
+        boxed(ProposalCoverage::None),
+        boxed(ProposalCoverage::None),
     ]);
     assert_eq!(
         validators.proposal_coverage(X, VariableSet::new_empty()),
-        ProposalCoverage::None
-    );
-
-    let uncertified = IntersectionConstraint::new(vec![
-        boxed(true, ProposalCoverage::Exact),
-        boxed(false, ProposalCoverage::None),
-    ]);
-    assert!(!uncertified.fixed_denotation());
-    assert_eq!(
-        uncertified.proposal_coverage(X, VariableSet::new_empty()),
         ProposalCoverage::None
     );
 }
@@ -328,18 +254,17 @@ fn conjunction_receipts_require_fixed_children_and_weaken_intersections() {
 #[test]
 fn disjunction_receipts_are_the_meet_of_all_arms() {
     let exact = UnionConstraint::new(vec![
-        boxed(true, ProposalCoverage::Exact),
-        boxed(true, ProposalCoverage::Exact),
+        boxed(ProposalCoverage::Exact),
+        boxed(ProposalCoverage::Exact),
     ]);
-    assert!(exact.fixed_denotation());
     assert_eq!(
         exact.proposal_coverage(X, VariableSet::new_empty()),
         ProposalCoverage::Exact
     );
 
     let covering = UnionConstraint::new(vec![
-        boxed(true, ProposalCoverage::Exact),
-        boxed(true, ProposalCoverage::Covering),
+        boxed(ProposalCoverage::Exact),
+        boxed(ProposalCoverage::Covering),
     ]);
     assert_eq!(
         covering.proposal_coverage(X, VariableSet::new_empty()),
@@ -347,28 +272,57 @@ fn disjunction_receipts_are_the_meet_of_all_arms() {
     );
 
     let no_source = UnionConstraint::new(vec![
-        boxed(true, ProposalCoverage::Exact),
-        boxed(true, ProposalCoverage::None),
+        boxed(ProposalCoverage::Exact),
+        boxed(ProposalCoverage::None),
     ]);
     assert_eq!(
         no_source.proposal_coverage(X, VariableSet::new_empty()),
         ProposalCoverage::None
     );
+}
 
-    let uncertified = UnionConstraint::new(vec![
-        boxed(true, ProposalCoverage::Exact),
-        boxed(false, ProposalCoverage::None),
+#[test]
+fn composites_and_projection_have_raw_set_semantics() {
+    let x = Variable::<UnknownInline>::new(X);
+    let duplicate_union = UnionConstraint::new(vec![
+        ConstantConstraint::new(x, Inline::new(MEMBER)),
+        ConstantConstraint::new(x, Inline::new(MEMBER)),
     ]);
-    assert!(!uncertified.fixed_denotation());
-    assert_eq!(
-        uncertified.proposal_coverage(X, VariableSet::new_empty()),
-        ProposalCoverage::None
-    );
+    assert_eq!(proposed(&duplicate_union, X), vec![MEMBER]);
+
+    let make_root = || {
+        let x = Variable::<UnknownInline>::new(X);
+        let y = Variable::<UnknownInline>::new(Y);
+        let witnesses = UnionConstraint::new(vec![
+            Box::new(ConstantConstraint::new(y, Inline::new([0x41; 32]))) as DynConstraint,
+            Box::new(ConstantConstraint::new(y, Inline::new([0x42; 32]))) as DynConstraint,
+        ]);
+        IntersectionConstraint::new(vec![
+            Box::new(ConstantConstraint::new(x, Inline::new(MEMBER))) as DynConstraint,
+            Box::new(witnesses) as DynConstraint,
+        ])
+    };
+
+    let result_sets = [
+        Query::new_projected(make_root(), [X], project_x)
+            .sequential()
+            .collect::<Vec<_>>(),
+        Query::new_projected(make_root(), [X], project_x)
+            .lazy_dag_scheduler()
+            .collect(),
+        Query::new_projected(make_root(), [X], project_x)
+            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .collect(),
+        Query::new_projected(make_root(), [X], project_x).collect(),
+    ];
+    for results in result_sets {
+        assert_eq!(results, [MEMBER]);
+    }
 }
 
 #[test]
 fn structural_receipts_reject_bound_or_unrelated_targets() {
-    let constraint = ReceiptDomain::new(true, ProposalCoverage::Exact);
+    let constraint = ReceiptDomain::new(ProposalCoverage::Exact);
     assert_eq!(
         constraint.proposal_coverage(Y, VariableSet::new_empty()),
         ProposalCoverage::None
@@ -383,14 +337,12 @@ fn structural_receipts_reject_bound_or_unrelated_targets() {
 fn finite_builtin_receipts_distinguish_sources_from_validators() {
     let x = Variable::<UnknownInline>::new(X);
     let constant = ConstantConstraint::new(x, Inline::new(MEMBER));
-    assert!(constant.fixed_denotation());
     assert_eq!(
         constant.proposal_coverage(X, VariableSet::new_empty()),
         ProposalCoverage::Exact
     );
 
     let equality = EqualityConstraint::new(X, Y);
-    assert!(equality.fixed_denotation());
     assert_eq!(
         equality.proposal_coverage(X, VariableSet::new_empty()),
         ProposalCoverage::None
@@ -401,7 +353,6 @@ fn finite_builtin_receipts_distinguish_sources_from_validators() {
     );
 
     let range = InlineRange::new(x, Inline::new([0x20; 32]), Inline::new([0x40; 32]));
-    assert!(range.fixed_denotation());
     assert_eq!(
         range.proposal_coverage(X, VariableSet::new_empty()),
         ProposalCoverage::None
@@ -421,7 +372,6 @@ fn indexed_patterns_and_attached_ranges_publish_exact_support() {
     let attribute = Variable::<GenId>::new(Y);
     let value = Variable::<UnknownInline>::new(2);
     let pattern = set.pattern(entity, attribute, value);
-    assert!(pattern.fixed_denotation());
     for variable in [X, Y, 2] {
         assert_eq!(
             pattern.proposal_coverage(variable, VariableSet::new_empty()),
@@ -452,7 +402,6 @@ fn indexed_patterns_and_attached_ranges_publish_exact_support() {
         (&entity_range, X, entity_constant.raw),
         (&attribute_range, Y, attribute_constant.raw),
     ] {
-        assert!(constraint.fixed_denotation());
         assert_eq!(
             constraint.proposal_coverage(variable, VariableSet::new_empty()),
             ProposalCoverage::Exact
@@ -462,7 +411,6 @@ fn indexed_patterns_and_attached_ranges_publish_exact_support() {
 
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
     let succinct = archive.pattern(entity, attribute, value);
-    assert!(succinct.fixed_denotation());
     assert_eq!(
         succinct.proposal_coverage(2, VariableSet::new_empty()),
         ProposalCoverage::Exact
@@ -475,7 +423,6 @@ fn indexed_patterns_and_attached_ranges_publish_exact_support() {
     assert_eq!(proposed(&succinct_value_fiber, 2), vec![MEMBER]);
     let succinct_range =
         archive.value_in_range(value, Inline::new([0x30; 32]), Inline::new([0x40; 32]));
-    assert!(succinct_range.fixed_denotation());
     assert_eq!(
         succinct_range.proposal_coverage(2, VariableSet::new_empty()),
         ProposalCoverage::Exact
@@ -491,7 +438,6 @@ fn regular_paths_are_covering_sources_for_free_endpoints() {
         Variable::<GenId>::new(Y),
         &[PathOp::Attr([0x44; 16])],
     );
-    assert!(path.fixed_denotation());
     assert_eq!(
         path.proposal_coverage(X, VariableSet::new_empty()),
         ProposalCoverage::Covering
@@ -542,10 +488,6 @@ struct QuotelessExact;
 impl Constraint<'static> for QuotelessExact {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(X)
-    }
-
-    fn fixed_denotation(&self) -> bool {
-        true
     }
 
     fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
@@ -605,10 +547,6 @@ impl Constraint<'static> for CountedExact {
         VariableSet::new_singleton(X)
     }
 
-    fn fixed_denotation(&self) -> bool {
-        true
-    }
-
     fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
         if variable == X && !bound.is_set(X) {
             ProposalCoverage::Exact
@@ -666,10 +604,6 @@ impl Constraint<'static> for ClosedFalse {
         VariableSet::new_empty()
     }
 
-    fn fixed_denotation(&self) -> bool {
-        true
-    }
-
     fn estimate(
         &self,
         _variable: VariableId,
@@ -708,10 +642,6 @@ struct OptimisticExposedAnd {
 impl Constraint<'static> for OptimisticExposedAnd {
     fn variables(&self) -> VariableSet {
         self.inner.variables()
-    }
-
-    fn fixed_denotation(&self) -> bool {
-        true
     }
 
     fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
@@ -764,8 +694,7 @@ impl Constraint<'static> for OptimisticExposedAnd {
 
 #[test]
 fn covering_roots_self_confirm_before_every_scheduler_publishes() {
-    for results in unary_scheduler_results(|| ReceiptDomain::new(true, ProposalCoverage::Covering))
-    {
+    for results in unary_scheduler_results(|| ReceiptDomain::new(ProposalCoverage::Covering)) {
         assert_eq!(results, vec![MEMBER]);
     }
 }
@@ -790,14 +719,14 @@ fn exact_sources_do_not_pay_a_redundant_self_confirm() {
 
 fn dynamic_equality_root() -> IntersectionConstraint<DynConstraint> {
     IntersectionConstraint::new(vec![
-        boxed(true, ProposalCoverage::Exact),
+        boxed(ProposalCoverage::Exact),
         Box::new(EqualityConstraint::new(X, Y)),
     ])
 }
 
 fn assert_missing_source_at_construction<T>(construct: impl FnOnce() -> T) {
     let payload = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(construct)) {
-        Ok(_) => panic!("source-less certified query constructed successfully"),
+        Ok(_) => panic!("source-less query constructed successfully"),
         Err(payload) => payload,
     };
     let message = payload
@@ -806,13 +735,13 @@ fn assert_missing_source_at_construction<T>(construct: impl FnOnce() -> T) {
         .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
         .unwrap_or("non-string panic payload");
     assert!(
-        message.contains("fixed-denotation query state has no covering proposal source"),
+        message.contains("query state has no covering proposal source"),
         "unexpected construction panic: {message}"
     );
 }
 
 #[test]
-fn source_less_certified_roots_fail_at_query_construction() {
+fn source_less_roots_fail_at_query_construction() {
     assert_missing_source_at_construction(|| Query::new(EqualityConstraint::new(X, Y), project_xy));
 
     let x = Variable::<UnknownInline>::new(X);
@@ -826,8 +755,8 @@ fn source_less_certified_roots_fail_at_query_construction() {
     assert_missing_source_at_construction(|| {
         Query::new(
             UnionConstraint::new(vec![
-                boxed(true, ProposalCoverage::Exact),
-                boxed(true, ProposalCoverage::None),
+                boxed(ProposalCoverage::Exact),
+                boxed(ProposalCoverage::None),
             ]),
             project_x,
         )
@@ -839,7 +768,7 @@ fn a_seed_proven_false_needs_no_proposal_source() {
     let make = || OptimisticExposedAnd {
         inner: IntersectionConstraint::new(vec![
             Box::new(ClosedFalse) as DynConstraint,
-            boxed(true, ProposalCoverage::None),
+            boxed(ProposalCoverage::None),
         ]),
     };
     for results in unary_scheduler_results(make) {
@@ -873,11 +802,11 @@ fn equality_becomes_a_source_only_after_its_peer_is_bound() {
 }
 
 #[test]
-fn exposed_closed_false_child_kills_an_optimistic_certified_seed() {
+fn exposed_closed_false_child_kills_an_optimistic_seed() {
     let make = || OptimisticExposedAnd {
         inner: IntersectionConstraint::new(vec![
             Box::new(ClosedFalse) as DynConstraint,
-            boxed(true, ProposalCoverage::Exact),
+            boxed(ProposalCoverage::Exact),
         ]),
     };
     for results in unary_scheduler_results(make) {
@@ -887,7 +816,6 @@ fn exposed_closed_false_child_kills_an_optimistic_certified_seed() {
 
 #[derive(Clone)]
 struct ProposalProbe {
-    fixed: bool,
     coverage: ProposalCoverage,
     quote: Option<usize>,
     proposals: Arc<AtomicUsize>,
@@ -898,12 +826,8 @@ impl Constraint<'static> for ProposalProbe {
         VariableSet::new_singleton(X)
     }
 
-    fn fixed_denotation(&self) -> bool {
-        self.fixed
-    }
-
     fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-        if self.fixed && variable == X && !bound.is_set(X) {
+        if variable == X && !bound.is_set(X) {
             self.coverage
         } else {
             ProposalCoverage::None
@@ -956,89 +880,65 @@ impl Constraint<'static> for ProposalProbe {
 }
 
 fn proposal_probe(
-    fixed: bool,
     coverage: ProposalCoverage,
     quote: Option<usize>,
     proposals: &Arc<AtomicUsize>,
 ) -> DynConstraint {
     Box::new(ProposalProbe {
-        fixed,
         coverage,
         quote,
         proposals: proposals.clone(),
     })
 }
 
-fn nested_intersection_mode_probe(
-    certified_root: bool,
-    legacy_proposals: &Arc<AtomicUsize>,
+fn nested_intersection_source_probe(
+    validator_proposals: &Arc<AtomicUsize>,
     exact_proposals: &Arc<AtomicUsize>,
 ) -> IntersectionConstraint<DynConstraint> {
     let passive = Arc::new(AtomicUsize::new(0));
     let nested = IntersectionConstraint::new(vec![
-        proposal_probe(true, ProposalCoverage::None, Some(1), legacy_proposals),
-        proposal_probe(true, ProposalCoverage::Exact, Some(10), exact_proposals),
+        proposal_probe(ProposalCoverage::None, Some(1), validator_proposals),
+        proposal_probe(ProposalCoverage::Exact, Some(10), exact_proposals),
     ]);
     IntersectionConstraint::new(vec![
         Box::new(nested),
-        proposal_probe(certified_root, ProposalCoverage::None, None, &passive),
+        proposal_probe(ProposalCoverage::None, None, &passive),
     ])
 }
 
-fn nested_union_mode_probe(
-    certified_root: bool,
+fn nested_union_source_probe(
     union_proposals: &Arc<AtomicUsize>,
     sibling_proposals: &Arc<AtomicUsize>,
 ) -> IntersectionConstraint<DynConstraint> {
     let passive = Arc::new(AtomicUsize::new(0));
     let nested = UnionConstraint::new(vec![
-        proposal_probe(true, ProposalCoverage::Exact, Some(1), union_proposals),
-        proposal_probe(true, ProposalCoverage::Exact, None, union_proposals),
+        proposal_probe(ProposalCoverage::Exact, Some(1), union_proposals),
+        proposal_probe(ProposalCoverage::Exact, None, union_proposals),
     ]);
     IntersectionConstraint::new(vec![
         Box::new(nested),
-        proposal_probe(true, ProposalCoverage::Exact, Some(10), sibling_proposals),
-        proposal_probe(certified_root, ProposalCoverage::None, None, &passive),
+        proposal_probe(ProposalCoverage::Exact, Some(10), sibling_proposals),
+        proposal_probe(ProposalCoverage::None, None, &passive),
     ])
 }
 
 #[test]
-fn receipt_planning_activates_only_when_the_whole_root_is_certified() {
-    let legacy_proposals = Arc::new(AtomicUsize::new(0));
+fn receipt_planning_uses_only_covering_sources() {
+    let validator_proposals = Arc::new(AtomicUsize::new(0));
     let exact_proposals = Arc::new(AtomicUsize::new(0));
     for results in unary_scheduler_results(|| {
-        nested_intersection_mode_probe(false, &legacy_proposals, &exact_proposals)
+        nested_intersection_source_probe(&validator_proposals, &exact_proposals)
     }) {
         assert_eq!(results, vec![MEMBER]);
     }
-    assert!(legacy_proposals.load(Ordering::Relaxed) > 0);
-    assert_eq!(exact_proposals.load(Ordering::Relaxed), 0);
-
-    legacy_proposals.store(0, Ordering::Relaxed);
-    exact_proposals.store(0, Ordering::Relaxed);
-    for results in unary_scheduler_results(|| {
-        nested_intersection_mode_probe(true, &legacy_proposals, &exact_proposals)
-    }) {
-        assert_eq!(results, vec![MEMBER]);
-    }
-    assert_eq!(legacy_proposals.load(Ordering::Relaxed), 0);
+    assert_eq!(validator_proposals.load(Ordering::Relaxed), 0);
     assert!(exact_proposals.load(Ordering::Relaxed) > 0);
 
     let union_proposals = Arc::new(AtomicUsize::new(0));
     let sibling_proposals = Arc::new(AtomicUsize::new(0));
-    for results in unary_scheduler_results(|| {
-        nested_union_mode_probe(false, &union_proposals, &sibling_proposals)
-    }) {
-        assert_eq!(results, vec![MEMBER]);
-    }
-    assert!(union_proposals.load(Ordering::Relaxed) > 0);
-    assert_eq!(sibling_proposals.load(Ordering::Relaxed), 0);
-
-    union_proposals.store(0, Ordering::Relaxed);
-    sibling_proposals.store(0, Ordering::Relaxed);
-    for results in unary_scheduler_results(|| {
-        nested_union_mode_probe(true, &union_proposals, &sibling_proposals)
-    }) {
+    for results in
+        unary_scheduler_results(|| nested_union_source_probe(&union_proposals, &sibling_proposals))
+    {
         assert_eq!(results, vec![MEMBER]);
     }
     assert_eq!(union_proposals.load(Ordering::Relaxed), 0);
@@ -1046,21 +946,20 @@ fn receipt_planning_activates_only_when_the_whole_root_is_certified() {
 }
 
 #[test]
-fn opaque_transparent_wrapper_forwards_certified_actions() {
-    let legacy_proposals = Arc::new(AtomicUsize::new(0));
+fn opaque_transparent_wrapper_forwards_source_actions() {
+    let validator_proposals = Arc::new(AtomicUsize::new(0));
     let exact_proposals = Arc::new(AtomicUsize::new(0));
 
     for results in unary_scheduler_results(|| {
-        EstimateOverrideConstraint::new(nested_intersection_mode_probe(
-            true,
-            &legacy_proposals,
+        EstimateOverrideConstraint::new(nested_intersection_source_probe(
+            &validator_proposals,
             &exact_proposals,
         ))
     }) {
         assert_eq!(results, vec![MEMBER]);
     }
 
-    assert_eq!(legacy_proposals.load(Ordering::Relaxed), 0);
+    assert_eq!(validator_proposals.load(Ordering::Relaxed), 0);
     assert!(exact_proposals.load(Ordering::Relaxed) > 0);
 }
 
@@ -1125,10 +1024,6 @@ impl TypedProgramSpec for CoveringProposalWithExactProgram {
 impl Constraint<'static> for CoveringProposalWithExactProgram {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(X)
-    }
-
-    fn fixed_denotation(&self) -> bool {
-        true
     }
 
     fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
@@ -1214,10 +1109,6 @@ struct NonPageLocalUniversalSibling {
 impl Constraint<'static> for NonPageLocalUniversalSibling {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(X)
-    }
-
-    fn fixed_denotation(&self) -> bool {
-        true
     }
 
     fn estimate(
