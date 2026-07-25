@@ -284,8 +284,7 @@ impl FiniteFormulaNode {
 }
 
 /// Structural finite-formula program compiled below lowered residual Union
-/// leaves or, for the explicit root-formula probe, across one synthetic whole
-/// root. Variable selection remains the outer WCO layer in either mode.
+/// leaves. Variable selection remains the outer WCO layer.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FiniteFormulaProgram {
     nodes: Vec<FiniteFormulaNode>,
@@ -295,11 +294,7 @@ struct FiniteFormulaProgram {
 }
 
 impl FiniteFormulaProgram {
-    fn compile<'a>(
-        root: &dyn Constraint<'a>,
-        leaves: &[ResidualLeaf],
-        synthetic_root: bool,
-    ) -> Self {
+    fn compile<'a>(root: &dyn Constraint<'a>, leaves: &[ResidualLeaf]) -> Self {
         struct Builder {
             nodes: Vec<Option<FiniteFormulaNode>>,
         }
@@ -415,67 +410,6 @@ impl FiniteFormulaProgram {
                 id
             }
 
-            /// Compiles one synthetic whole-query root. Only the maximal
-            /// exposed AND region at the root is flattened: an AND below an
-            /// OR remains inside that arm, preserving the union's private
-            /// candidate reducer boundary.
-            fn compile_root<'a>(
-                &mut self,
-                root: &dyn Constraint<'a>,
-                owner: usize,
-            ) -> FormulaNodeId {
-                if root.residual_union_children().is_some() {
-                    return self.compile_node(root, &mut Vec::new(), owner);
-                }
-                let ConstraintShape::And(_) = root.residual_shape() else {
-                    return self.compile_node(root, &mut Vec::new(), owner);
-                };
-
-                let id = self.reserve_node();
-                let capabilities = FormulaNodeCapabilities {
-                    parent_atomic_program_confirms: compile_parent_atomic_program_confirms(root),
-                };
-                let mut children = Vec::new();
-                self.compile_root_and_children(root, &mut Vec::new(), owner, &mut children);
-                let kind = FiniteFormulaNodeKind::And {
-                    children: children.into_boxed_slice(),
-                };
-                let (support_span, execution_span) = self.spans(&kind);
-                self.nodes[id.0 as usize] = Some(FiniteFormulaNode {
-                    kind,
-                    owner,
-                    path: FormulaPath(Box::new([])),
-                    capabilities,
-                    support_span,
-                    execution_span,
-                });
-                id
-            }
-
-            fn compile_root_and_children<'a>(
-                &mut self,
-                conjunction: &dyn Constraint<'a>,
-                path: &mut Vec<FormulaStep>,
-                owner: usize,
-                compiled: &mut Vec<FormulaNodeId>,
-            ) {
-                let ConstraintShape::And(children) = conjunction.residual_shape() else {
-                    panic!("synthetic root AND collection entered an opaque constraint")
-                };
-                for child in 0..children.len() {
-                    path.push(FormulaStep::And(child));
-                    let constraint = children.child(child);
-                    if constraint.residual_union_children().is_none()
-                        && matches!(constraint.residual_shape(), ConstraintShape::And(_))
-                    {
-                        self.compile_root_and_children(constraint, path, owner, compiled);
-                    } else {
-                        compiled.push(self.compile_node(constraint, path, owner));
-                    }
-                    path.pop();
-                }
-            }
-
             /// Union is associative in the constraint language. Compile one
             /// canonical flat child set across directly nested ORs, while a
             /// connective change (notably AND) remains a terminal node in
@@ -524,22 +458,6 @@ impl FiniteFormulaProgram {
         }
 
         let mut builder = Builder { nodes: Vec::new() };
-        if synthetic_root {
-            assert_eq!(
-                leaves.len(),
-                1,
-                "a synthetic residual formula has one outer occurrence"
-            );
-            let root = builder.compile_root(root, 0);
-            return Self {
-                nodes: builder
-                    .nodes
-                    .into_iter()
-                    .map(|node| node.expect("reserved residual formula node was not compiled"))
-                    .collect(),
-                roots: vec![Some(root)],
-            };
-        }
         let mut roots = vec![None; leaves.len()];
         for (occurrence, leaf) in leaves.iter().enumerate() {
             if leaf.lowering != LeafLowering::FiniteFormula {
@@ -886,13 +804,6 @@ impl FiniteFormulaProgram {
                 "a support traversal must return to a formula guard"
             );
             assert_eq!(self.root(self.owner(completed)), Some(completed));
-            if matches!(self.node(completed).kind, FiniteFormulaNodeKind::And { .. }) {
-                assert_eq!(
-                    completed_stage,
-                    FormulaStage::Confirm,
-                    "a root AND can complete only after entering its confirmation suffix"
-                );
-            }
             return FormulaSuccessor::Outer(counter.exit.clone());
         };
         let children = self
@@ -1005,122 +916,6 @@ impl FiniteFormulaProgram {
             .expect("residual formula grade overflow")
     }
 
-    /// Whether the active synthetic-root continuation is the exact analogue
-    /// of an outer Candidate state whose entire remaining confirmation suffix
-    /// has no activation-reuse barrier. Only a maximal root AND may expose
-    /// candidate pages. OR reducers and nested formula control retain complete
-    /// parent groups.
-    #[cfg(test)]
-    fn root_confirm_suffix_accepts_pages(
-        &self,
-        counter: &FormulaProgramCounter,
-        bound: VariableSet,
-    ) -> bool {
-        let root = self
-            .root(self.owner(counter.focus.node()))
-            .expect("a formula counter resumed an opaque residual leaf");
-        let FiniteFormulaNodeKind::And { children } = &self.node(root).kind else {
-            return false;
-        };
-
-        let done = match &counter.focus {
-            FormulaFocus::Plan {
-                node,
-                stage: FormulaStage::Confirm,
-                done,
-            } if *node == root && counter.returns.is_empty() => done,
-            FormulaFocus::Action {
-                node,
-                stage: FormulaStage::Confirm,
-            } if counter.returns.len() == 1 => {
-                let site = &counter.returns[0];
-                if site.kind != FormulaReturnKind::Child
-                    || site.parent != root
-                    || site.parent_stage != FormulaStage::Confirm
-                    || children[site.child] != *node
-                {
-                    return false;
-                }
-                &site.done
-            }
-            _ => return false,
-        };
-
-        children
-            .iter()
-            .enumerate()
-            .filter(|(child, _)| !done.contains(*child))
-            .all(|(_, &child)| {
-                let node = self.node(child);
-                matches!(node.kind, FiniteFormulaNodeKind::Atom)
-                    && !node
-                        .capabilities
-                        .parent_atomic_program_confirm(counter.exit.variable, bound)
-            })
-    }
-
-    /// Proves that one focused proposal can publish independently SET-admitted
-    /// endpoint chunks without changing the formula continuation's final raw
-    /// relation. Every ancestor must be AND, and every sibling that remains
-    /// after the focused child must itself be an AND-only tree without a typed
-    /// activation-reuse boundary.
-    #[cfg(test)]
-    fn proposal_streamability(
-        &self,
-        counter: &FormulaProgramCounter,
-        bound: VariableSet,
-    ) -> FormulaProposalStreamability {
-        let focused = match counter.focus {
-            FormulaFocus::Action {
-                node,
-                stage: FormulaStage::Propose,
-            } => node,
-            _ => {
-                return FormulaProposalStreamability::Barrier(
-                    FormulaProposalStreamBarrier::NotProposalAction,
-                );
-            }
-        };
-        if !matches!(self.node(focused).kind, FiniteFormulaNodeKind::Atom) {
-            return FormulaProposalStreamability::Barrier(
-                FormulaProposalStreamBarrier::NotProposalAction,
-            );
-        }
-
-        let mut completed = focused;
-        for site in counter.returns.iter().rev() {
-            if site.kind != FormulaReturnKind::Child || site.parent_stage != FormulaStage::Propose {
-                return FormulaProposalStreamability::Barrier(
-                    FormulaProposalStreamBarrier::NotProposalAction,
-                );
-            }
-            let parent = self.node(site.parent);
-            let FiniteFormulaNodeKind::And { children } = &parent.kind else {
-                return FormulaProposalStreamability::Barrier(
-                    FormulaProposalStreamBarrier::OrFrame,
-                );
-            };
-            assert_eq!(children[site.child], completed);
-            for (child, &node) in children.iter().enumerate() {
-                if child == site.child || site.done.contains(child) {
-                    continue;
-                }
-                let streamability =
-                    self.confirm_subtree_streamability(node, counter.exit.variable, bound);
-                if streamability != FormulaProposalStreamability::Linear {
-                    return streamability;
-                }
-            }
-            completed = site.parent;
-        }
-        assert_eq!(
-            self.root(self.owner(focused)),
-            Some(completed),
-            "formula proposal return stack did not reach its root"
-        );
-        FormulaProposalStreamability::Linear
-    }
-
     fn confirm_subtree_streamability(
         &self,
         node: FormulaNodeId,
@@ -1154,73 +949,6 @@ impl FiniteFormulaProgram {
                 FormulaProposalStreamability::Barrier(FormulaProposalStreamBarrier::OrFrame)
             }
         }
-    }
-
-    /// Root paging proof. A root Plan reads no return edge; its directly
-    /// selected Action reads exactly one edge to recover the root done mask.
-    fn interned_root_confirm_suffix_accepts_pages(
-        &self,
-        formula_pcs: &FormulaPcInterner,
-        cursor: FormulaCursor,
-        bound: VariableSet,
-    ) -> bool {
-        let record = formula_pcs.get(cursor.pc);
-        let root = self
-            .root(self.owner(record.focus.node()))
-            .expect("a formula counter resumed an opaque residual leaf");
-        let FiniteFormulaNodeKind::And { children } = &self.node(root).kind else {
-            return false;
-        };
-
-        let done = match &record.focus {
-            FormulaFocus::Plan {
-                node,
-                stage: FormulaStage::Confirm,
-                done,
-            } if *node == root && record.return_to.is_none() => done,
-            FormulaFocus::Action {
-                node,
-                stage: FormulaStage::Confirm,
-            } => {
-                let Some(return_to) = record.return_to else {
-                    return false;
-                };
-                let address = formula_pcs.return_by_id(return_to);
-                if address.kind != FormulaReturnKind::Child {
-                    return false;
-                }
-                let parent = formula_pcs.get(address.parent);
-                let FormulaFocus::Plan {
-                    node: parent_node,
-                    stage: FormulaStage::Confirm,
-                    done,
-                } = &parent.focus
-                else {
-                    return false;
-                };
-                if *parent_node != root
-                    || parent.return_to.is_some()
-                    || children[address.child] != *node
-                {
-                    return false;
-                }
-                done
-            }
-            _ => return false,
-        };
-
-        children
-            .iter()
-            .enumerate()
-            .filter(|(child, _)| !done.contains(*child))
-            .all(|(_, &child)| {
-                let node = self.node(child);
-                matches!(node.kind, FiniteFormulaNodeKind::Atom)
-                    && !node.capabilities.parent_atomic_program_confirm(
-                        formula_pcs.candidate_exit(cursor).variable,
-                        bound,
-                    )
-            })
     }
 
     /// Delta-proposal paging proof. This is the sole production operation
@@ -1524,16 +1252,6 @@ struct ResidualLeaf {
     lowering: LeafLowering,
 }
 
-/// Compiled proof that one synthetic root AND can answer Ready's aggregate
-/// estimate and choose its first Formula child from the same descendant quote
-/// columns. `children` is the maximal exposed root-AND region in stable
-/// hierarchical preorder; OR nodes remain opaque barriers.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct FormulaReadyQuote {
-    root: FormulaNodeId,
-    children: Box<[FormulaNodeId]>,
-}
-
 #[cfg(test)]
 impl PartialEq<ConstraintPath> for ResidualLeaf {
     fn eq(&self, other: &ConstraintPath) -> bool {
@@ -1560,13 +1278,6 @@ struct ResidualPlan {
     /// Program confirmation reuses one complete parent activation until that
     /// Program quiesces.
     parent_atomic_program_confirms: Vec<Box<[(VariableId, VariableSet)]>>,
-    /// The nontrivial exposed root is one formula occurrence. Whole-root
-    /// identity shells around one opaque atom normalize to the flat plan.
-    synthetic_root_formula: bool,
-    /// Recursive estimate quote for a maximal synthetic root AND.
-    /// Arbitrary exposed composites retain `None` unless every flattened AND
-    /// explicitly certifies the child-minimum estimate law.
-    formula_ready_quote: Option<FormulaReadyQuote>,
 }
 
 impl ResidualPlan {
@@ -1576,47 +1287,6 @@ impl ResidualPlan {
     /// become formula continuations, and returned typed Program routes are
     /// admitted.
     fn compile_production<'a>(root: &dyn Constraint<'a>) -> Self {
-        Self::compile(root, false)
-    }
-
-    /// Temporary test-only entrance to the not-yet-deleted whole-root
-    /// experiment. It uses the same production Program policy as the real
-    /// compiler and is not a general lowering selector.
-    #[cfg(test)]
-    fn compile_whole_root_for_test<'a>(root: &dyn Constraint<'a>) -> Self {
-        fn is_formula_identity<'a>(constraint: &dyn Constraint<'a>) -> bool {
-            match constraint.residual_shape() {
-                ConstraintShape::And(children) if children.len() == 1 => {
-                    is_formula_identity(children.child(0))
-                }
-                ConstraintShape::Opaque => constraint.residual_union_children().is_none(),
-                ConstraintShape::And(_) => false,
-            }
-        }
-        Self::compile(root, !is_formula_identity(root))
-    }
-
-    fn compile<'a>(root: &dyn Constraint<'a>, synthetic_root_formula: bool) -> Self {
-        /// Verify the stronger estimate law across exactly the maximal root
-        /// AND region that `FiniteFormulaProgram::compile_root` flattens.
-        /// Formula ORs are barriers: their composite quote remains one child
-        /// column and support machinery begins only after selection.
-        fn root_and_quote_is_lawful<'a>(constraint: &dyn Constraint<'a>) -> bool {
-            if constraint.residual_union_children().is_some() {
-                return true;
-            }
-            let ConstraintShape::And(children) = constraint.residual_shape() else {
-                return true;
-            };
-            constraint.residual_and_estimate_is_child_minimum()
-                && (0..children.len()).all(|child| {
-                    let child = children.child(child);
-                    child.residual_union_children().is_some()
-                        || !matches!(child.residual_shape(), ConstraintShape::And(_))
-                        || root_and_quote_is_lawful(child)
-                })
-        }
-
         fn visit<'a>(
             constraint: &dyn Constraint<'a>,
             path: &mut Vec<usize>,
@@ -1659,38 +1329,13 @@ impl ResidualPlan {
 
         let mut leaves = Vec::new();
         let mut parent_atomic_program_confirms: Vec<Box<[(VariableId, VariableSet)]>> = Vec::new();
-        if synthetic_root_formula {
-            leaves.push(ResidualLeaf {
-                path: ConstraintPath(Box::new([])),
-                lowering: LeafLowering::FiniteFormula,
-            });
-            // Formula control owns the exact inner action boundary.
-            parent_atomic_program_confirms.push(Box::new([]));
-        } else {
-            visit(
-                root,
-                &mut Vec::new(),
-                &mut leaves,
-                &mut parent_atomic_program_confirms,
-            );
-        }
-        let finite_formula = FiniteFormulaProgram::compile(root, &leaves, synthetic_root_formula);
-        let formula_ready_quote = (synthetic_root_formula
-            && root.residual_union_children().is_none()
-            && matches!(root.residual_shape(), ConstraintShape::And(_))
-            && root_and_quote_is_lawful(root))
-        .then(|| {
-            let root = finite_formula
-                .root(0)
-                .expect("a synthetic root formula has one compiled root");
-            let FiniteFormulaNodeKind::And { children } = &finite_formula.node(root).kind else {
-                panic!("a lawful root AND quote compiled a non-AND Formula root")
-            };
-            FormulaReadyQuote {
-                root,
-                children: children.clone(),
-            }
-        });
+        visit(
+            root,
+            &mut Vec::new(),
+            &mut leaves,
+            &mut parent_atomic_program_confirms,
+        );
+        let finite_formula = FiniteFormulaProgram::compile(root, &leaves);
         let variables = root.variables();
         let influence_counts = std::array::from_fn(|variable| {
             if variables.is_set(variable) {
@@ -1705,8 +1350,6 @@ impl ResidualPlan {
             influence_counts,
             finite_formula,
             parent_atomic_program_confirms,
-            synthetic_root_formula,
-            formula_ready_quote,
         }
     }
 
@@ -1723,70 +1366,6 @@ impl ResidualPlan {
 
     fn has_finite_formula(&self, occurrence: usize) -> bool {
         self.finite_formula.root(occurrence).is_some()
-    }
-
-    fn formula_action_occurrence(&self, node: FormulaNodeId) -> usize {
-        if self.synthetic_root_formula {
-            self.len()
-                .checked_add(node.0 as usize)
-                .expect("formula action occurrence overflow")
-        } else {
-            self.finite_formula.owner(node)
-        }
-    }
-
-    #[cfg(test)]
-    fn formula_uses_candidate_pages(
-        &self,
-        counter: &FormulaProgramCounter,
-        bound: VariableSet,
-    ) -> bool {
-        self.synthetic_root_formula
-            && self
-                .finite_formula
-                .root_confirm_suffix_accepts_pages(counter, bound)
-    }
-
-    fn interned_formula_uses_candidate_pages(
-        &self,
-        formula_pcs: &FormulaPcInterner,
-        cursor: FormulaCursor,
-        bound: VariableSet,
-    ) -> bool {
-        self.synthetic_root_formula
-            && self
-                .finite_formula
-                .interned_root_confirm_suffix_accepts_pages(formula_pcs, cursor, bound)
-    }
-
-    #[cfg(test)]
-    fn formula_proposal_streamability(
-        &self,
-        counter: &FormulaProgramCounter,
-        bound: VariableSet,
-    ) -> FormulaProposalStreamability {
-        let streamability = self.finite_formula.proposal_streamability(counter, bound);
-        if matches!(streamability, FormulaProposalStreamability::Barrier(_)) {
-            return streamability;
-        }
-
-        let owner = self.finite_formula.owner(counter.focus.node());
-        if !counter.exit.checked.contains(owner) {
-            return FormulaProposalStreamability::Barrier(
-                FormulaProposalStreamBarrier::OuterContinuation,
-            );
-        }
-        if !self.remaining_confirms_accept_pages(
-            &counter.exit.relevant,
-            &counter.exit.checked,
-            counter.exit.variable,
-            bound,
-        ) {
-            return FormulaProposalStreamability::Barrier(
-                FormulaProposalStreamBarrier::OuterContinuation,
-            );
-        }
-        streamability
     }
 
     fn interned_formula_proposal_streamability(
@@ -2178,20 +1757,6 @@ pub struct ResidualStateStats {
     /// Concrete `(preferred variable, exact proposer occurrence)` groups filed
     /// by Ready planning, summed across pops.
     pub ready_proposal_groups: usize,
-    /// Coalesced quoted-entry carrier chunks popped before Formula
-    /// materialization. This is planning control, not a protocol action.
-    #[cfg(test)]
-    pub formula_outer_entry_pops: usize,
-    /// Concrete first-child groups materialized from popped quoted carriers.
-    #[cfg(test)]
-    pub formula_ready_quote_groups: usize,
-    /// Root Formula Plan filings elided by quoted carrier pops.
-    #[cfg(test)]
-    pub formula_ready_quote_root_plan_filings_elided: usize,
-    /// Child-estimate row values computed by recursive root-AND quotes across
-    /// every variable considered by Ready.
-    #[cfg(test)]
-    pub formula_ready_quote_estimate_rows: usize,
     /// Candidate-state chunks that planned row-local confirmation actions (or
     /// committed a fully checked candidate frontier) without invoking a
     /// constraint verb.
@@ -3215,10 +2780,6 @@ impl CandidateExit {
 enum ResidualPhase {
     /// Plan one joint `(variable, proposing child)` action per row.
     Ready,
-    /// Deferred synthetic WholeRoot entry. Ready has already chosen both the
-    /// outer variable and each row's first root-AND child, but the choices
-    /// remain affine payload until this coalesced planning shell is popped.
-    QuotedFormulaPropose { variable: VariableId },
     /// Invoke one proposer over a row block whose action is uniform.
     Propose {
         variable: VariableId,
@@ -3311,13 +2872,6 @@ impl StateDesc {
 
         match &self.phase {
             ResidualPhase::Ready => {}
-            ResidualPhase::QuotedFormulaPropose { variable } => {
-                validate_variable(*variable);
-                assert_eq!(
-                    leaf_count, 1,
-                    "a quoted Formula proposal requires one synthetic outer occurrence"
-                );
-            }
             ResidualPhase::Propose {
                 variable,
                 relevant,
@@ -3397,7 +2951,7 @@ impl StateDesc {
             .expect("residual-state rank overflow");
         match &self.phase {
             ResidualPhase::Ready => base,
-            ResidualPhase::QuotedFormulaPropose { .. } | ResidualPhase::Propose { .. } => {
+            ResidualPhase::Propose { .. } => {
                 base.checked_add(1).expect("residual-state rank overflow")
             }
             ResidualPhase::Candidate { checked, .. } => checked
@@ -3452,12 +3006,9 @@ impl StateDesc {
                 checked,
                 ..
             } => plan.remaining_confirms_accept_pages(relevant, checked, *variable, self.bound),
-            ResidualPhase::Formula { cursor } => {
-                plan.interned_formula_uses_candidate_pages(formula_pcs, *cursor, self.bound)
-            }
             ResidualPhase::Ready
-            | ResidualPhase::QuotedFormulaPropose { .. }
-            | ResidualPhase::Propose { .. } => false,
+            | ResidualPhase::Propose { .. }
+            | ResidualPhase::Formula { .. } => false,
         }
     }
 }
@@ -3642,57 +3193,6 @@ impl FormulaPcInterner {
             1,
         );
         FormulaCursor { pc, exit }
-    }
-
-    /// Re-interns a root continuation after its outer self-confirm obligation
-    /// has been discharged.
-    ///
-    /// A synthetic root AND starts conservatively unchecked because its
-    /// structural proposal coverage is only Covering. Once row-local planning
-    /// chooses an Exact child as the proposer, the formula's confirmation
-    /// suffix validates every remaining target-containing child. That
-    /// partition can therefore return to the outer WCO continuation as
-    /// already checked without claiming that its partial proposal support was
-    /// itself Exact.
-    fn with_proposer_checked(
-        &mut self,
-        program: &FiniteFormulaProgram,
-        cursor: FormulaCursor,
-    ) -> FormulaCursor {
-        let record = self.get(cursor.pc);
-        assert!(
-            record.return_to.is_none(),
-            "only a formula root may discharge its outer proposer"
-        );
-        let occurrence = program.owner(record.focus.node());
-        assert_eq!(
-            program.root(occurrence),
-            Some(record.focus.node()),
-            "only a Formula root may discharge its outer proposer"
-        );
-        assert!(
-            matches!(
-                record.focus,
-                FormulaFocus::Plan {
-                    stage: FormulaStage::Propose,
-                    ..
-                }
-            ),
-            "only a root proposal Plan may discharge its outer proposer"
-        );
-        let mut exit = self.candidate_exit(cursor).clone();
-        assert!(
-            exit.relevant.contains(occurrence),
-            "Formula proposer is absent from its Candidate exit"
-        );
-        if exit.checked.contains(occurrence) {
-            return cursor;
-        }
-        exit.checked.insert(occurrence);
-        FormulaCursor {
-            pc: cursor.pc,
-            exit: self.intern_candidate_exit(exit),
-        }
     }
 
     fn select_child(
@@ -4029,16 +3529,6 @@ impl FormulaPcInterner {
                 "a support traversal must return to a formula guard"
             );
             assert_eq!(program.root(program.owner(completed)), Some(completed));
-            if matches!(
-                program.node(completed).kind,
-                FiniteFormulaNodeKind::And { .. }
-            ) {
-                assert_eq!(
-                    completed_stage,
-                    FormulaStage::Confirm,
-                    "a root AND can complete only after entering its confirmation suffix"
-                );
-            }
             return Err(cursor.exit);
         };
         let address = *self.return_by_id(return_to);
@@ -4294,108 +3784,6 @@ impl RowBatch {
     fn append(&mut self, mut other: Self) {
         self.rows.append(&mut other.rows);
         self.row_count += other.row_count;
-    }
-}
-
-/// Row-local first-child decision produced by a relational Ready quote.
-///
-/// Bits 0..=31 retain the complete compiled child ordinal. Bit 32 records
-/// whether the selected execution source is Exact, leaving the full `u32`
-/// ordinal space available instead of stealing its high bit.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct FormulaReadyChoice(u64);
-
-impl FormulaReadyChoice {
-    const EXACT: u64 = 1 << 32;
-    const CHILD: u64 = u32::MAX as u64;
-    /// Disjoint from every legal choice, which occupies only bits 0..=32.
-    const UNSELECTED: Self = Self(u64::MAX);
-
-    fn new(child: usize, exact: bool) -> Self {
-        let child = u32::try_from(child).expect("too many quoted Formula children");
-        Self(u64::from(child) | if exact { Self::EXACT } else { 0 })
-    }
-
-    fn child(self) -> usize {
-        (self.0 & Self::CHILD) as usize
-    }
-
-    fn exact(self) -> bool {
-        self.0 & Self::EXACT != 0
-    }
-}
-
-/// Affine quoted-entry payload. Choices are carried beside rows until the
-/// canonical outer Formula state has had a chance to merge independent Ready
-/// histories; every structural operation preserves positional alignment.
-#[derive(Clone, Debug)]
-struct QuotedRowBatch {
-    rows: RowBatch,
-    choices: Vec<FormulaReadyChoice>,
-}
-
-impl QuotedRowBatch {
-    fn new(rows: RowBatch, choices: Vec<FormulaReadyChoice>) -> Self {
-        assert_eq!(
-            rows.row_count,
-            choices.len(),
-            "quoted Formula choices must align with parent rows"
-        );
-        Self { rows, choices }
-    }
-
-    fn selected(
-        rows: &RowBatch,
-        choices: &[FormulaReadyChoice],
-        stride: usize,
-        indices: &[usize],
-    ) -> Self {
-        assert_eq!(
-            rows.row_count,
-            choices.len(),
-            "quoted Formula choices must align with source rows"
-        );
-        Self::new(
-            rows.selected(stride, indices),
-            indices.iter().map(|&row| choices[row]).collect(),
-        )
-    }
-
-    fn append(&mut self, mut other: Self) {
-        assert_eq!(self.rows.row_count, self.choices.len());
-        assert_eq!(other.rows.row_count, other.choices.len());
-        self.rows.append(other.rows);
-        self.choices.append(&mut other.choices);
-        assert_eq!(self.rows.row_count, self.choices.len());
-    }
-
-    fn take_tail(&mut self, stride: usize, width: usize) -> Self {
-        assert_eq!(self.rows.row_count, self.choices.len());
-        let take = self.rows.row_count.min(width.max(1));
-        debug_assert!(take > 0);
-        if take == self.rows.row_count {
-            return Self {
-                rows: std::mem::replace(
-                    &mut self.rows,
-                    RowBatch {
-                        rows: Vec::new(),
-                        row_count: 0,
-                    },
-                ),
-                choices: std::mem::take(&mut self.choices),
-            };
-        }
-        let first = self.rows.row_count - take;
-        let row_values = self.rows.rows.split_off(first * stride);
-        self.rows.row_count = first;
-        let choices = self.choices.split_off(first);
-        Self::new(
-            RowBatch {
-                rows: row_values,
-                row_count: take,
-            },
-            choices,
-        )
     }
 }
 
@@ -6305,14 +5693,6 @@ impl FormulaBatch {
         batch
     }
 
-    fn page_candidate_count(&self) -> usize {
-        if self.or_count() == 0 {
-            self.current().map_or(0, CandidatePayload::len)
-        } else {
-            0
-        }
-    }
-
     fn admit_current_or_value(&mut self, parent: u32, value: RawInline) {
         assert!(!self.has_current(), "Formula OR admitted a retained arm");
         let accumulator = self
@@ -6527,61 +5907,6 @@ impl FormulaBatch {
                 row_count: take,
             },
             cells,
-        }
-    }
-
-    /// Takes a disjoint tail of SET-admitted candidate occurrences from a
-    /// synthetic root AND. The active PC proves that no live OR frame or
-    /// selected typed activation-reuse route blocks paging. A bisected parent
-    /// is copied into both pages, while each speculative candidate remains
-    /// affine to one page.
-    fn take_candidate_tail(&mut self, stride: usize, width: usize) -> Self {
-        assert!(
-            self.or_count() == 0,
-            "only an empty-OR Formula layout may expose candidate pages"
-        );
-        let take = self.input().len().min(width.max(1));
-        debug_assert!(take > 0);
-        if take == self.input().len() {
-            return Self {
-                activations: std::mem::take(&mut self.activations),
-                parents: std::mem::replace(
-                    &mut self.parents,
-                    RowBatch {
-                        rows: Vec::new(),
-                        row_count: 0,
-                    },
-                ),
-                cells: vec![FormulaLiveCell::Current(self.take_current())],
-            };
-        }
-
-        let parent_count = self.parents.row_count;
-        let (tail_candidates, first_tail_parent, prefix_parent_count) =
-            self.input_mut().take_candidate_tail(parent_count, take);
-        assert!(
-            first_tail_parent < self.parents.row_count,
-            "constraint emitted an invalid candidate row tag"
-        );
-        assert!(
-            prefix_parent_count <= first_tail_parent + 1,
-            "candidate tags must remain grouped by ascending parent"
-        );
-
-        let tail_rows = self.parents.rows[first_tail_parent * stride..].to_vec();
-        let tail_parent_count = self.parents.row_count - first_tail_parent;
-        let tail_activations = self.activations[first_tail_parent..].to_vec();
-        self.parents.rows.truncate(prefix_parent_count * stride);
-        self.parents.row_count = prefix_parent_count;
-        self.activations.truncate(prefix_parent_count);
-
-        Self {
-            activations: tail_activations,
-            parents: RowBatch {
-                rows: tail_rows,
-                row_count: tail_parent_count,
-            },
-            cells: vec![FormulaLiveCell::Current(tail_candidates)],
         }
     }
 
@@ -6897,7 +6222,6 @@ enum FormulaReducerSeed {
 #[derive(Clone, Debug)]
 enum StateBucket {
     Rows(RowBatch),
-    QuotedRows(QuotedRowBatch),
     Candidates(CandidateBatch),
     Formula(FormulaBatch),
 }
@@ -6906,7 +6230,6 @@ impl StateBucket {
     fn row_count(&self) -> usize {
         match self {
             StateBucket::Rows(rows) => rows.row_count,
-            StateBucket::QuotedRows(batch) => batch.rows.row_count,
             StateBucket::Candidates(batch) => batch.parents.row_count,
             StateBucket::Formula(batch) => batch.parents.row_count,
         }
@@ -6918,7 +6241,6 @@ impl StateBucket {
     fn occupancy(&self, candidate_pages: bool) -> usize {
         match self {
             StateBucket::Candidates(batch) if candidate_pages => batch.candidate_count(),
-            StateBucket::Formula(batch) if candidate_pages => batch.page_candidate_count(),
             _ => self.row_count(),
         }
     }
@@ -6926,7 +6248,6 @@ impl StateBucket {
     fn append(&mut self, other: Self) {
         match (self, other) {
             (StateBucket::Rows(left), StateBucket::Rows(right)) => left.append(right),
-            (StateBucket::QuotedRows(left), StateBucket::QuotedRows(right)) => left.append(right),
             (StateBucket::Candidates(left), StateBucket::Candidates(right)) => left.append(right),
             (StateBucket::Formula(left), StateBucket::Formula(right)) => left.append(right),
             _ => panic!("one canonical residual state received incompatible payloads"),
@@ -6947,10 +6268,6 @@ impl StateBucket {
                 let right_rows = batch.row_count / 2;
                 Some(self.take_tail(stride, right_rows, false))
             }
-            StateBucket::QuotedRows(batch) if batch.rows.row_count >= 2 => {
-                let right_rows = batch.rows.row_count / 2;
-                Some(self.take_tail(stride, right_rows, false))
-            }
             StateBucket::Candidates(batch) if candidate_pages && batch.candidate_count() >= 2 => {
                 let right_candidates = batch.candidate_count() / 2;
                 Some(self.take_tail(stride, right_candidates, true))
@@ -6959,18 +6276,11 @@ impl StateBucket {
                 let right_parents = batch.parents.row_count / 2;
                 Some(self.take_tail(stride, right_parents, false))
             }
-            StateBucket::Formula(batch) if candidate_pages && batch.page_candidate_count() >= 2 => {
-                let right_candidates = batch.page_candidate_count() / 2;
-                Some(self.take_tail(stride, right_candidates, true))
-            }
             StateBucket::Formula(batch) if batch.parents.row_count >= 2 => {
                 let right_parents = batch.parents.row_count / 2;
                 Some(self.take_tail(stride, right_parents, false))
             }
-            StateBucket::Rows(_)
-            | StateBucket::QuotedRows(_)
-            | StateBucket::Candidates(_)
-            | StateBucket::Formula(_) => None,
+            StateBucket::Rows(_) | StateBucket::Candidates(_) | StateBucket::Formula(_) => None,
         }
     }
 
@@ -6997,21 +6307,11 @@ impl StateBucket {
                     row_count: take,
                 })
             }
-            StateBucket::QuotedRows(batch) => {
-                assert!(
-                    !candidate_pages,
-                    "quoted Formula rows cannot be candidate-page split"
-                );
-                StateBucket::QuotedRows(batch.take_tail(stride, width))
-            }
             StateBucket::Candidates(batch) if candidate_pages => {
                 StateBucket::Candidates(batch.take_candidate_tail(stride, width))
             }
             StateBucket::Candidates(batch) => {
                 StateBucket::Candidates(batch.take_tail(stride, width))
-            }
-            StateBucket::Formula(batch) if candidate_pages => {
-                StateBucket::Formula(batch.take_candidate_tail(stride, width))
             }
             StateBucket::Formula(batch) => StateBucket::Formula(batch.take_tail(stride, width)),
         }
@@ -7021,8 +6321,8 @@ impl StateBucket {
 /// Exact protocol verb selected by one concrete residual action state.
 ///
 /// The leaf is a compiled action occurrence, not a constraint address. Outer
-/// opaque actions use their residual-plan occurrence; synthetic-root formula
-/// atoms use their fresh formula-node occurrence. Together with
+/// opaque actions and finite-formula atoms use their owning residual-plan
+/// occurrence. Together with
 /// [`ResidualActionTask::state`], it identifies both the concrete call and the
 /// complete canonical continuation that owns it.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -7110,9 +6410,7 @@ impl SelectedResidualTask {
                     FormulaFocus::Action { .. }
                 )
             }
-            ResidualPhase::Ready
-            | ResidualPhase::QuotedFormulaPropose { .. }
-            | ResidualPhase::Candidate { .. } => false,
+            ResidualPhase::Ready | ResidualPhase::Candidate { .. } => false,
         }
     }
 
@@ -7124,9 +6422,7 @@ impl SelectedResidualTask {
                 &interner.formula(*cursor).focus,
                 FormulaFocus::Action { .. }
             ),
-            ResidualPhase::Ready
-            | ResidualPhase::QuotedFormulaPropose { .. }
-            | ResidualPhase::Candidate { .. } => false,
+            ResidualPhase::Ready | ResidualPhase::Candidate { .. } => false,
         }
     }
 
@@ -7170,7 +6466,7 @@ impl SelectedResidualTask {
                     return None;
                 };
                 let exit = interner.formula_candidate_exit(*cursor);
-                let occurrence = plan.formula_action_occurrence(*node);
+                let occurrence = plan.finite_formula.owner(*node);
                 let (action, candidates) = match stage {
                     FormulaStage::Support => (
                         ResidualAction::Support {
@@ -7196,12 +6492,7 @@ impl SelectedResidualTask {
                 };
                 (action, candidates)
             }
-            (
-                ResidualPhase::Ready
-                | ResidualPhase::QuotedFormulaPropose { .. }
-                | ResidualPhase::Candidate { .. },
-                _,
-            ) => return None,
+            (ResidualPhase::Ready | ResidualPhase::Candidate { .. }, _) => return None,
             (ResidualPhase::Propose { proposer, .. }, StateBucket::Rows(_))
                 if plan.has_finite_formula(*proposer) =>
             {
@@ -7363,9 +6654,8 @@ fn file_with_span(
         return None;
     }
     let candidates = match &bucket {
-        StateBucket::Rows(_) | StateBucket::QuotedRows(_) => 0,
+        StateBucket::Rows(_) | StateBucket::Formula(_) => 0,
         StateBucket::Candidates(batch) => batch.candidate_count(),
-        StateBucket::Formula(batch) => batch.page_candidate_count(),
     };
     let rank = desc.rank_with_span(leaf_count, action_span, formula, &interner.formula_pcs);
     let (id, known) = interner.intern_with_status(desc, stats);
@@ -7434,111 +6724,6 @@ struct VariablePlan {
     proposers: Vec<usize>,
 }
 
-struct QuotedVariablePlan {
-    variable: VariableId,
-    choices: Vec<FormulaReadyChoice>,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn quote_formula_ready_and<'a>(
-    root: &dyn Constraint<'a>,
-    plan: &ResidualPlan,
-    quote: &FormulaReadyQuote,
-    variable: VariableId,
-    bound: VariableSet,
-    view: &RowsView<'_>,
-    aggregate: &mut [usize],
-    stats: &mut ResidualStateStats,
-) -> Option<Vec<FormulaReadyChoice>> {
-    assert_eq!(aggregate.len(), view.len());
-    #[cfg(not(test))]
-    let _ = stats;
-    if root.proposal_coverage(variable, bound) < ProposalCoverage::Covering {
-        // Preserve V3.1 Ready eligibility before considering stronger typed
-        // Program receipts available only inside Formula execution.
-        return None;
-    }
-
-    let mut choices = vec![FormulaReadyChoice::UNSELECTED; view.len()];
-    let mut selected_estimates = vec![usize::MAX; view.len()];
-    let mut aggregate_source = false;
-    let mut column = Vec::with_capacity(view.len());
-
-    for (child, &node) in quote.children.iter().enumerate() {
-        let constraint = plan.resolve_formula_node(root, 0, node);
-        if !constraint.variables().is_set(variable) {
-            continue;
-        }
-
-        // The aggregate Ready estimate remains identical to the ordinary
-        // root estimator. Formula execution may additionally admit
-        // a typed-only source, so first-child selection uses the stronger
-        // execution receipt while aggregation uses the ordinary one.
-        let ordinary_coverage = constraint.proposal_coverage(variable, bound);
-        let execution_coverage = plan.execution_proposal_coverage_from_ordinary(
-            constraint,
-            variable,
-            bound,
-            ordinary_coverage,
-        );
-        let contributes_to_aggregate = ordinary_coverage >= ProposalCoverage::Covering;
-        let selectable = execution_coverage >= ProposalCoverage::Covering;
-        if !contributes_to_aggregate && !selectable {
-            // A target validator without coverage remains unfinished and runs
-            // in the Confirm stage after the selected source returns.
-            continue;
-        }
-        aggregate_source |= contributes_to_aggregate;
-
-        column.clear();
-        if constraint.estimate(variable, view, &mut EstimateSink::Column(&mut column)) {
-            assert_eq!(
-                column.len(),
-                view.len(),
-                "quoted AND child estimate must append one value per row"
-            );
-        } else {
-            assert!(
-                column.is_empty(),
-                "missing quoted AND child estimate must leave its sink untouched"
-            );
-            column.resize(view.len(), usize::MAX);
-        }
-        #[cfg(test)]
-        {
-            stats.formula_ready_quote_estimate_rows += view.len();
-        }
-
-        for row in 0..view.len() {
-            if contributes_to_aggregate {
-                aggregate[row] = aggregate[row].min(column[row]);
-            }
-            // Strict improvement preserves flattened hierarchical preorder as
-            // the stable tie break.
-            if selectable
-                && (choices[row] == FormulaReadyChoice::UNSELECTED
-                    || column[row] < selected_estimates[row])
-            {
-                choices[row] =
-                    FormulaReadyChoice::new(child, execution_coverage == ProposalCoverage::Exact);
-                selected_estimates[row] = column[row];
-            }
-        }
-    }
-
-    assert!(
-        aggregate_source,
-        "a lawful quoted root AND lost its ordinary covering descendant"
-    );
-    assert!(
-        choices
-            .iter()
-            .all(|&choice| choice != FormulaReadyChoice::UNSELECTED),
-        "an ordinary covering root-AND source was not a legal Formula source"
-    );
-    Some(choices)
-}
-
 fn estimate_leaf<'a>(
     root: &dyn Constraint<'a>,
     plan: &ResidualPlan,
@@ -7594,12 +6779,6 @@ fn ready_plan_transition<'a>(
     interner: &mut StateInterner,
     stats: &mut ResidualStateStats,
 ) -> ContinuationToken {
-    if let Some(quote) = &plan.formula_ready_quote {
-        return ready_quoted_plan_transition(
-            root, plan, quote, desc, rows, full, worklist, interner, stats,
-        );
-    }
-
     let leaf_count = plan.len();
     let vars: Vec<VariableId> = desc.bound.into_iter().collect();
     let view = rows_view(&vars, &rows.rows, rows.row_count);
@@ -7770,288 +6949,6 @@ fn ready_plan_transition<'a>(
         }
         continuation.expect("Ready planning filed no action")
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn ready_quoted_plan_transition<'a>(
-    root: &dyn Constraint<'a>,
-    plan: &ResidualPlan,
-    quote: &FormulaReadyQuote,
-    desc: &StateDesc,
-    rows: RowBatch,
-    full: VariableSet,
-    worklist: &mut Worklist,
-    interner: &mut StateInterner,
-    stats: &mut ResidualStateStats,
-) -> ContinuationToken {
-    assert!(plan.synthetic_root_formula);
-    assert_eq!(
-        plan.len(),
-        1,
-        "a compiled root-AND quote must own one outer Formula occurrence"
-    );
-
-    let vars: Vec<VariableId> = desc.bound.into_iter().collect();
-    let view = rows_view(&vars, &rows.rows, rows.row_count);
-    let unbound: Vec<VariableId> = full.subtract(desc.bound).into_iter().collect();
-    let mut plans = Vec::with_capacity(unbound.len());
-    let mut estimate_matrix = Vec::with_capacity(unbound.len() * rows.row_count);
-
-    for &variable in &unbound {
-        let estimate_start = estimate_matrix.len();
-        estimate_matrix.resize(estimate_start + rows.row_count, usize::MAX);
-        let estimates = &mut estimate_matrix[estimate_start..];
-        let Some(choices) = quote_formula_ready_and(
-            root, plan, quote, variable, desc.bound, &view, estimates, stats,
-        ) else {
-            estimate_matrix.truncate(estimate_start);
-            continue;
-        };
-        plans.push(QuotedVariablePlan { variable, choices });
-    }
-
-    assert!(!plans.is_empty(), "{SOURCE_FRONTIER_ERROR}");
-
-    let mut preferred = Vec::with_capacity(rows.row_count);
-    let mut preferred_counts = vec![0; plans.len()];
-    for row in 0..rows.row_count {
-        let mut best = None;
-        for (pi, variable_plan) in plans.iter().enumerate() {
-            let estimate = estimate_matrix[pi * rows.row_count + row];
-            let key = variable_choice_key(
-                variable_plan.variable,
-                estimate,
-                plan.influence_counts[variable_plan.variable],
-            );
-            if best.is_none_or(|(_, best_key)| key > best_key) {
-                best = Some((pi, key));
-            }
-        }
-        let variable_plan = best
-            .expect("a non-full quoted Ready state has an enabled proposal")
-            .0;
-        preferred.push(variable_plan);
-        preferred_counts[variable_plan] += 1;
-    }
-
-    let preferred_groups = preferred_counts.iter().filter(|&&count| count > 0).count();
-    stats.ready_preferred_variable_groups += preferred_groups;
-
-    // Child choice deliberately remains payload. Independent Ready histories
-    // that selected the same variable therefore meet at one canonical outer
-    // Formula state before materialization.
-    if preferred_groups == 1 {
-        let variable_plan = preferred_counts
-            .iter()
-            .position(|&count| count > 0)
-            .expect("one preferred variable group was observed");
-        debug_assert_eq!(preferred_counts[variable_plan], rows.row_count);
-        stats.ready_proposal_groups += 1;
-        let variable = plans[variable_plan].variable;
-        let choices = std::mem::take(&mut plans[variable_plan].choices);
-        return file_with_plan(
-            worklist,
-            interner,
-            plan,
-            StateDesc {
-                bound: desc.bound,
-                phase: ResidualPhase::QuotedFormulaPropose { variable },
-            },
-            StateBucket::QuotedRows(QuotedRowBatch::new(rows, choices)),
-            stats,
-        )
-        .expect("quoted Ready planning filed an empty outer state");
-    }
-
-    let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for (row, &variable_plan) in preferred.iter().enumerate() {
-        groups.entry(variable_plan).or_default().push(row);
-    }
-    debug_assert_eq!(groups.len(), preferred_groups);
-    stats.ready_proposal_groups += groups.len();
-
-    let mut continuation = None;
-    for (variable_plan, indices) in groups {
-        let variable = plans[variable_plan].variable;
-        let selected =
-            QuotedRowBatch::selected(&rows, &plans[variable_plan].choices, vars.len(), &indices);
-        prefer_continuation(
-            &mut continuation,
-            file_with_plan(
-                worklist,
-                interner,
-                plan,
-                StateDesc {
-                    bound: desc.bound,
-                    phase: ResidualPhase::QuotedFormulaPropose { variable },
-                },
-                StateBucket::QuotedRows(selected),
-                stats,
-            ),
-        );
-    }
-    continuation.expect("quoted Ready planning filed no outer state")
-}
-
-fn formula_ready_common_skips<'a>(
-    root: &dyn Constraint<'a>,
-    plan: &ResidualPlan,
-    quote: &FormulaReadyQuote,
-    variable: VariableId,
-) -> ChildSet {
-    let mut skipped = ChildSet::empty(quote.children.len());
-    for (child, &node) in quote.children.iter().enumerate() {
-        let constraint = plan.resolve_formula_node(root, 0, node);
-        if !constraint.variables().is_set(variable) {
-            skipped.insert(child);
-        }
-    }
-    skipped
-}
-
-#[allow(clippy::too_many_arguments)]
-fn quoted_formula_propose_transition<'a>(
-    root: &dyn Constraint<'a>,
-    plan: &ResidualPlan,
-    desc: &StateDesc,
-    variable: VariableId,
-    batch: QuotedRowBatch,
-    next_activation: &mut u64,
-    worklist: &mut Worklist,
-    interner: &mut StateInterner,
-    stats: &mut ResidualStateStats,
-) -> ContinuationToken {
-    assert!(plan.synthetic_root_formula);
-    assert_eq!(plan.len(), 1);
-    let quote = plan
-        .formula_ready_quote
-        .as_ref()
-        .expect("a quoted Formula carrier has no compiled root-AND quote");
-    assert_eq!(
-        plan.finite_formula.root(0),
-        Some(quote.root),
-        "quoted Formula carrier named a different root"
-    );
-    assert_eq!(batch.rows.row_count, batch.choices.len());
-
-    let first_choice = *batch
-        .choices
-        .first()
-        .expect("quoted Formula carrier is empty");
-    let mut uniform_choice = true;
-    let mut any_exact = false;
-    for &choice in &batch.choices {
-        assert!(
-            choice.child() < quote.children.len(),
-            "quoted Formula choice named an unknown root child"
-        );
-        uniform_choice &= choice == first_choice;
-        any_exact |= choice.exact();
-    }
-    #[cfg(test)]
-    {
-        stats.formula_outer_entry_pops += 1;
-        stats.formula_ready_quote_root_plan_filings_elided += 1;
-    }
-
-    let mut relevant = ChildSet::empty(1);
-    relevant.insert(0);
-    let root_checked =
-        plan.formula_proposer_starts_checked(root, 0, quote.root, variable, desc.bound);
-    let mut common_cursor = interner.start_formula_with_proposer_checked(
-        &plan.finite_formula,
-        variable,
-        0,
-        UnionVerb::Propose { relevant },
-        // Preserve the compiled root route's self-confirm discharge. A child
-        // can be only Covering as an opaque constraint while Exact leaf proofs
-        // and Formula confirmations discharge the lowered route's obligation.
-        root_checked,
-    );
-    let skipped = formula_ready_common_skips(root, plan, quote, variable);
-    for child in 0..quote.children.len() {
-        if skipped.contains(child) {
-            common_cursor = common_cursor.with_pc(interner.formula_pcs.skip_child(
-                &plan.finite_formula,
-                common_cursor.pc,
-                child,
-            ));
-        }
-    }
-    let exact_cursor = any_exact.then(|| {
-        interner
-            .formula_pcs
-            .with_proposer_checked(&plan.finite_formula, common_cursor)
-    });
-
-    let groups: Option<BTreeMap<FormulaReadyChoice, Vec<usize>>> = (!uniform_choice).then(|| {
-        let mut groups = BTreeMap::new();
-        for (row, &choice) in batch.choices.iter().enumerate() {
-            groups.entry(choice).or_insert_with(Vec::new).push(row);
-        }
-        debug_assert_eq!(
-            groups.values().map(Vec::len).sum::<usize>(),
-            batch.rows.row_count
-        );
-        groups
-    });
-    #[cfg(test)]
-    {
-        stats.formula_ready_quote_groups += groups.as_ref().map_or(1, BTreeMap::len);
-    }
-
-    let mut file_choice =
-        |choice: FormulaReadyChoice, rows: RowBatch, activations: Vec<ActivationId>| {
-            let cursor = if choice.exact() {
-                exact_cursor.expect("an Exact quoted choice has no checked root PC")
-            } else {
-                common_cursor
-            };
-            let mut formula_batch = FormulaBatch::from_proposal(
-                rows,
-                activations,
-                &plan.finite_formula.node(quote.root).kind,
-            );
-            let selected = select_interned_formula_child(
-                &plan.finite_formula,
-                &mut interner.formula_pcs,
-                cursor.pc,
-                &quote.children,
-                choice.child(),
-            );
-            let selected = cursor.with_pc(selected);
-            enter_selected_formula_node(
-                &plan.finite_formula,
-                &interner.formula_pcs,
-                selected.pc,
-                &mut formula_batch,
-            );
-            file_with_plan(
-                worklist,
-                interner,
-                plan,
-                StateDesc {
-                    bound: desc.bound,
-                    phase: ResidualPhase::Formula { cursor: selected },
-                },
-                StateBucket::Formula(formula_batch),
-                stats,
-            )
-        };
-
-    if uniform_choice {
-        let activations = allocate_activations(next_activation, batch.rows.row_count);
-        return file_choice(first_choice, batch.rows, activations)
-            .expect("quoted Formula carrier filed an empty child continuation");
-    }
-
-    let mut continuation = None;
-    for (choice, indices) in groups.expect("nonuniform carrier has child groups") {
-        let rows = batch.rows.selected(desc.bound.count(), &indices);
-        let activations = allocate_activations(next_activation, indices.len());
-        prefer_continuation(&mut continuation, file_choice(choice, rows, activations));
-    }
-    continuation.expect("quoted Formula carrier filed no child continuation")
 }
 
 fn propose_action_transition<'a>(
@@ -9373,24 +8270,7 @@ fn formula_and_plan_transition<'a>(
     }
 
     let mut continuation = None;
-    let root_proposal =
-        stage == FormulaStage::Propose && interner.formula(next).return_to.is_none();
     for (child, mut batch) in batch.partition(vars.len(), &assignments) {
-        let next = if root_proposal
-            && plan.formula_node_proposal_coverage(
-                root,
-                occurrence,
-                children[child],
-                variable,
-                desc.bound,
-            ) == ProposalCoverage::Exact
-        {
-            interner
-                .formula_pcs
-                .with_proposer_checked(&plan.finite_formula, next)
-        } else {
-            next
-        };
         let selected = next.with_pc(select_interned_formula_child(
             &plan.finite_formula,
             &mut interner.formula_pcs,
@@ -9691,20 +8571,6 @@ fn execute_task<'a>(
             stats.ready_plan_pops += 1;
             let continuation =
                 ready_plan_transition(root, plan, &desc, rows, full, worklist, interner, stats);
-            StepOutcome::Advanced(continuation)
-        }
-        (ResidualPhase::QuotedFormulaPropose { variable }, StateBucket::QuotedRows(batch)) => {
-            let continuation = quoted_formula_propose_transition(
-                root,
-                plan,
-                &desc,
-                *variable,
-                batch,
-                next_activation,
-                worklist,
-                interner,
-                stats,
-            );
             StepOutcome::Advanced(continuation)
         }
         (
@@ -12370,7 +11236,6 @@ impl ResidualStateMachine {
                         desc.uses_candidate_pages(plan, &self.interner.formula_pcs);
                     let can_split = match bucket {
                         StateBucket::Rows(batch) => batch.row_count >= 2,
-                        StateBucket::QuotedRows(batch) => batch.rows.row_count >= 2,
                         StateBucket::Candidates(batch) if candidate_pages => {
                             batch.candidate_count() >= 2
                         }
@@ -13399,13 +12264,11 @@ mod tests {
             .leaves
             .iter()
             .all(|leaf| leaf.lowering == LeafLowering::Opaque));
-        assert!(!and_plan.synthetic_root_formula);
 
         let union_root = UnionConstraint::new(vec![ShapeLeaf(0), ShapeLeaf(0)]);
         let union_plan = ResidualPlan::compile_production(&union_root);
         assert_eq!(union_plan.leaves.len(), 1);
         assert_eq!(union_plan.leaves[0].lowering, LeafLowering::FiniteFormula);
-        assert!(!union_plan.synthetic_root_formula);
     }
 
     #[derive(Clone, Copy)]
@@ -13533,89 +12396,6 @@ mod tests {
             };
             view.iter()
                 .all(|row| row[x][0] & 1 == 0 && row[y] == raw(0))
-        }
-    }
-
-    #[derive(Clone)]
-    struct QuotedEstimateLeaf {
-        parent: Option<VariableId>,
-        variable: VariableId,
-        coverage: ProposalCoverage,
-        estimates: [usize; 2],
-        estimate_calls: Arc<AtomicUsize>,
-    }
-
-    impl Constraint<'static> for QuotedEstimateLeaf {
-        fn variables(&self) -> VariableSet {
-            self.parent.map_or_else(
-                || VariableSet::new_singleton(self.variable),
-                |parent| {
-                    VariableSet::new_singleton(parent)
-                        .union(VariableSet::new_singleton(self.variable))
-                },
-            )
-        }
-
-        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-            if variable == self.variable && !bound.is_set(variable) {
-                self.coverage
-            } else {
-                ProposalCoverage::None
-            }
-        }
-
-        fn estimate(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            out: &mut EstimateSink<'_>,
-        ) -> bool {
-            if variable != self.variable {
-                return false;
-            }
-            self.estimate_calls.fetch_add(1, Ordering::Relaxed);
-            if let Some(parent) = self.parent {
-                let parent = view
-                    .col(parent)
-                    .expect("quoted row estimate requires its parent binding");
-                out.extend(
-                    view.iter()
-                        .map(|row| self.estimates[(row[parent][0] & 1) as usize]),
-                );
-            } else {
-                out.fill(self.estimates[0], view.len());
-            }
-            true
-        }
-
-        fn propose(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) {
-            assert_eq!(variable, self.variable);
-            for parent in 0..view.len() {
-                candidates.push(parent as u32, raw(42));
-            }
-        }
-
-        fn confirm(
-            &self,
-            variable: VariableId,
-            _view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) {
-            if variable == self.variable {
-                candidates.retain(|_, candidate| *candidate == raw(42));
-            } else {
-                assert_eq!(Some(variable), self.parent);
-            }
-        }
-
-        fn satisfied(&self, view: &RowsView<'_>) -> bool {
-            view.col(self.variable)
-                .is_none_or(|column| view.iter().all(|row| row[column] == raw(42)))
         }
     }
 
@@ -13883,82 +12663,6 @@ mod tests {
             } else {
                 ProposalCoverage::None
             }
-        }
-    }
-
-    struct LawlessAnd<C>(IntersectionConstraint<C>);
-
-    impl<'a, C> ConstraintChildren<'a> for LawlessAnd<C>
-    where
-        C: Constraint<'a> + 'a,
-    {
-        fn len(&self) -> usize {
-            ConstraintChildren::len(&self.0)
-        }
-
-        fn child(&self, index: usize) -> &dyn Constraint<'a> {
-            ConstraintChildren::child(&self.0, index)
-        }
-    }
-
-    impl<'a, C> Constraint<'a> for LawlessAnd<C>
-    where
-        C: Constraint<'a> + 'a,
-    {
-        fn variables(&self) -> VariableSet {
-            self.0.variables()
-        }
-
-        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-            self.0.proposal_coverage(variable, bound)
-        }
-
-        fn estimate(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            out: &mut EstimateSink<'_>,
-        ) -> bool {
-            self.0.estimate(variable, view, out)
-        }
-
-        fn propose(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) {
-            self.0.propose(variable, view, candidates);
-        }
-
-        fn confirm(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) {
-            self.0.confirm(variable, view, candidates);
-        }
-
-        fn propose_with_layout(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) -> ProposalLayout {
-            self.0.propose_with_layout(variable, view, candidates)
-        }
-
-        fn satisfied(&self, view: &RowsView<'_>) -> bool {
-            self.0.satisfied(view)
-        }
-
-        fn influence(&self, variable: VariableId) -> VariableSet {
-            self.0.influence(variable)
-        }
-
-        fn residual_shape(&self) -> ConstraintShape<'_, 'a> {
-            ConstraintShape::And(self)
         }
     }
 
@@ -17866,258 +16570,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn formula_cursor_quotients_structure_without_quotienting_candidate_future() {
-        let root = IntersectionConstraint::new(vec![shape_leaf(0), shape_leaf(0)]);
-        let plan = ResidualPlan::compile_whole_root_for_test(&root);
-        let program = &plan.finite_formula;
-        let relevant = ChildSet::empty(plan.len()).with_inserted(0);
-        let mut interner = StateInterner::default();
-        let unchecked = interner.start_formula_with_proposer_checked(
-            program,
-            0,
-            0,
-            UnionVerb::Propose {
-                relevant: relevant.clone(),
-            },
-            false,
-        );
-        let checked = interner.start_formula_with_proposer_checked(
-            program,
-            0,
-            0,
-            UnionVerb::Propose { relevant },
-            true,
-        );
-
-        assert_eq!(unchecked.pc, checked.pc);
-        assert_ne!(unchecked.exit, checked.exit);
-        assert_eq!(interner.formula_pcs.len(), 1);
-        assert_eq!(interner.formula_pcs.candidate_exit_len(), 2);
-        let structural_records = interner.formula_pcs.len();
-        assert_eq!(
-            interner
-                .formula_pcs
-                .with_proposer_checked(program, unchecked),
-            checked,
-            "discharging the proposer must swap only the Candidate exit"
-        );
-        assert_eq!(interner.formula_pcs.len(), structural_records);
-
-        let unchecked_desc = StateDesc {
-            bound: VariableSet::new_empty(),
-            phase: ResidualPhase::Formula { cursor: unchecked },
-        };
-        let checked_desc = StateDesc {
-            bound: VariableSet::new_empty(),
-            phase: ResidualPhase::Formula { cursor: checked },
-        };
-        assert_ne!(unchecked_desc, checked_desc);
-        let mut stats = ResidualStateStats::default();
-        let (unchecked_state, _) = interner.intern_with_status(unchecked_desc.clone(), &mut stats);
-        let (checked_state, _) = interner.intern_with_status(checked_desc.clone(), &mut stats);
-        assert_ne!(unchecked_state, checked_state);
-        let unchecked_rank = unchecked_desc.rank_with_span(
-            plan.len(),
-            plan.action_span(),
-            Some(program),
-            &interner.formula_pcs,
-        );
-        let checked_rank = checked_desc.rank_with_span(
-            plan.len(),
-            plan.action_span(),
-            Some(program),
-            &interner.formula_pcs,
-        );
-        assert_eq!(checked_rank - unchecked_rank, plan.action_span());
-        let expected_rank = interner
-            .formula_candidate_exit(unchecked)
-            .checked
-            .count()
-            .checked_mul(plan.action_span())
-            .and_then(|rank| rank.checked_add(1))
-            .and_then(|rank| rank.checked_add(interner.formula_pcs.grade(unchecked.pc)))
-            .unwrap();
-        assert_eq!(unchecked_rank, expected_rank);
-
-        let materialized_unchecked = interner.formula_pcs.materialize(unchecked);
-        let materialized_checked = interner.formula_pcs.materialize(checked);
-        assert_eq!(materialized_unchecked.focus, materialized_checked.focus);
-        assert_eq!(materialized_unchecked.returns, materialized_checked.returns);
-        assert!(!materialized_unchecked.exit.checked.contains(0));
-        assert!(materialized_checked.exit.checked.contains(0));
-
-        let advance_child = |interner: &mut StateInterner, cursor: FormulaCursor, child: usize| {
-            let action = cursor.with_pc(
-                interner
-                    .formula_pcs
-                    .select_child_as_action(program, cursor.pc, child),
-            );
-            let complete = action.with_pc(interner.formula_pcs.complete(program, action.pc));
-            let Ok(InternedFormulaSuccessor::Formula(parent)) =
-                interner.formula_pcs.resume_completed(program, complete)
-            else {
-                panic!("a child escaped its synthetic AND root")
-            };
-            (action, complete, parent)
-        };
-
-        let (unchecked_action, unchecked_complete, unchecked_parent) =
-            advance_child(&mut interner, unchecked, 0);
-        let records_after_first_child = interner.formula_pcs.len();
-        let returns_after_first_child = interner.formula_pcs.return_len();
-        let (checked_action, checked_complete, checked_parent) =
-            advance_child(&mut interner, checked, 0);
-        assert_eq!(unchecked_action.pc, checked_action.pc);
-        assert_eq!(unchecked_complete.pc, checked_complete.pc);
-        assert_eq!(unchecked_parent.pc, checked_parent.pc);
-        assert_ne!(unchecked_parent.exit, checked_parent.exit);
-        assert_eq!(interner.formula_pcs.len(), records_after_first_child);
-        assert_eq!(interner.formula_pcs.return_len(), returns_after_first_child);
-
-        let complete_root = |interner: &mut StateInterner,
-                             cursor: FormulaCursor|
-         -> CandidateExitId {
-            let (_, _, parent) = advance_child(interner, cursor, 1);
-            let root_complete = parent.with_pc(interner.formula_pcs.complete(program, parent.pc));
-            interner
-                .formula_pcs
-                .resume_completed(program, root_complete)
-                .expect_err("a complete synthetic root must resume outer WCO control")
-        };
-        let unchecked_outer = complete_root(&mut interner, unchecked_parent);
-        let records_after_unchecked = interner.formula_pcs.len();
-        let returns_after_unchecked = interner.formula_pcs.return_len();
-        let checked_outer = complete_root(&mut interner, checked_parent);
-        assert!(!interner
-            .formula_pcs
-            .candidate_exit_by_id(unchecked_outer)
-            .checked
-            .contains(0));
-        assert!(interner
-            .formula_pcs
-            .candidate_exit_by_id(checked_outer)
-            .checked
-            .contains(0));
-        assert_eq!(interner.formula_pcs.len(), records_after_unchecked);
-        assert_eq!(interner.formula_pcs.return_len(), returns_after_unchecked);
-    }
-
-    #[test]
-    fn exact_proposal_and_confirm_converge_on_one_formula_candidate_exit() {
-        let root = IntersectionConstraint::new(vec![shape_leaf(0), shape_leaf(0)]);
-        let plan = ResidualPlan::compile_whole_root_for_test(&root);
-        let program = &plan.finite_formula;
-        let relevant = ChildSet::empty(plan.len()).with_inserted(0);
-        let mut formula_pcs = FormulaPcInterner::default();
-        let proposal = formula_pcs.start_with_proposer_checked(
-            program,
-            0,
-            0,
-            UnionVerb::Propose {
-                relevant: relevant.clone(),
-            },
-            true,
-        );
-        let confirm = formula_pcs.start(
-            program,
-            0,
-            0,
-            UnionVerb::Confirm {
-                relevant: relevant.clone(),
-                checked: ChildSet::empty(plan.len()),
-            },
-        );
-
-        let advance_first = |formula_pcs: &mut FormulaPcInterner, cursor: FormulaCursor| {
-            let action = cursor.with_pc(formula_pcs.select_child_as_action(program, cursor.pc, 0));
-            let complete = action.with_pc(formula_pcs.complete(program, action.pc));
-            let Ok(InternedFormulaSuccessor::Formula(parent)) =
-                formula_pcs.resume_completed(program, complete)
-            else {
-                panic!("first AND child escaped its Formula root")
-            };
-            (action, parent)
-        };
-        let (proposal_action, proposal_parent) = advance_first(&mut formula_pcs, proposal);
-        let (confirm_action, confirm_parent) = advance_first(&mut formula_pcs, confirm);
-
-        assert_ne!(
-            proposal_action.pc, confirm_action.pc,
-            "entry verbs must remain distinct while their actions differ"
-        );
-        assert_eq!(proposal_parent, confirm_parent);
-        let FormulaFocus::Plan {
-            stage: FormulaStage::Confirm,
-            done,
-            ..
-        } = &formula_pcs.get(proposal_parent.pc).focus
-        else {
-            panic!("converged AND did not enter confirmation planning")
-        };
-        assert_eq!(done, &ChildSet::empty(2).with_inserted(0));
-        assert_eq!(formula_pcs.grade(proposal_parent.pc), 5);
-
-        let proposal_desc = StateDesc {
-            bound: VariableSet::new_empty(),
-            phase: ResidualPhase::Formula {
-                cursor: proposal_parent,
-            },
-        };
-        let confirm_desc = StateDesc {
-            bound: VariableSet::new_empty(),
-            phase: ResidualPhase::Formula {
-                cursor: confirm_parent,
-            },
-        };
-        assert_eq!(
-            proposal_desc.rank_with_span(
-                plan.len(),
-                plan.action_span(),
-                Some(program),
-                &formula_pcs,
-            ),
-            confirm_desc.rank_with_span(
-                plan.len(),
-                plan.action_span(),
-                Some(program),
-                &formula_pcs,
-            )
-        );
-
-        let finish = |formula_pcs: &mut FormulaPcInterner, cursor: FormulaCursor| {
-            let action = cursor.with_pc(formula_pcs.select_child_as_action(program, cursor.pc, 1));
-            let complete = action.with_pc(formula_pcs.complete(program, action.pc));
-            let Ok(InternedFormulaSuccessor::Formula(parent)) =
-                formula_pcs.resume_completed(program, complete)
-            else {
-                panic!("second AND child escaped before its root completed")
-            };
-            let complete_root = parent.with_pc(formula_pcs.complete(program, parent.pc));
-            formula_pcs
-                .resume_completed(program, complete_root)
-                .expect_err("complete root did not expose its Candidate exit")
-        };
-        let proposal_exit = finish(&mut formula_pcs, proposal_parent);
-        let confirm_exit = finish(&mut formula_pcs, confirm_parent);
-        assert_eq!(proposal_exit, confirm_exit);
-        let inline_candidate = |exit: CandidateExitId| {
-            let exit = formula_pcs.candidate_exit_by_id(exit);
-            StateDesc {
-                bound: VariableSet::new_empty(),
-                phase: ResidualPhase::Candidate {
-                    variable: exit.variable,
-                    relevant: exit.relevant.clone(),
-                    checked: exit.checked.clone(),
-                },
-            }
-        };
-        assert_eq!(
-            inline_candidate(proposal_exit),
-            inline_candidate(confirm_exit)
-        );
-    }
-
     fn candidate_payload(parent_count: usize, candidates: Candidates) -> CandidatePayload {
         CandidatePayload::from_tagged(candidates, parent_count)
     }
@@ -18351,1372 +16803,6 @@ mod tests {
     }
 
     #[test]
-    fn deferred_ready_quote_preserves_v31_plain_layouts_and_full_child_ordinal() {
-        #[allow(dead_code)]
-        enum V31ResidualPhaseLayout {
-            Ready,
-            Propose {
-                variable: VariableId,
-                relevant: ChildSet,
-                proposer: usize,
-            },
-            Candidate {
-                variable: VariableId,
-                relevant: ChildSet,
-                checked: ChildSet,
-            },
-            Confirm {
-                variable: VariableId,
-                relevant: ChildSet,
-                checked: ChildSet,
-                confirmer: usize,
-            },
-            Formula {
-                counter: FormulaPcId,
-            },
-        }
-        #[allow(dead_code)]
-        struct V31StateDescLayout {
-            bound: VariableSet,
-            phase: V31ResidualPhaseLayout,
-        }
-        #[allow(dead_code)]
-        enum V31StateBucketLayout {
-            Rows(RowBatch),
-            Candidates(CandidateBatch),
-            Formula(FormulaBatch),
-        }
-
-        assert_eq!(std::mem::size_of::<ProposeAction>(), 16);
-        assert_eq!(std::mem::size_of::<VariablePlan>(), 56);
-        assert_eq!(
-            std::mem::size_of::<StateDesc>(),
-            std::mem::size_of::<V31StateDescLayout>(),
-            "quoted control must fit inside the V3.1 descriptor envelope"
-        );
-        assert_eq!(
-            std::mem::size_of::<StateBucket>(),
-            std::mem::size_of::<V31StateBucketLayout>(),
-            "quoted payload must fit inside the V3.1 bucket envelope"
-        );
-
-        let max_plain = FormulaReadyChoice::new(u32::MAX as usize, false);
-        let max_exact = FormulaReadyChoice::new(u32::MAX as usize, true);
-        assert_eq!(max_plain.child(), u32::MAX as usize);
-        assert!(!max_plain.exact());
-        assert_eq!(max_exact.child(), u32::MAX as usize);
-        assert!(max_exact.exact());
-        assert_ne!(max_plain, max_exact);
-        assert_ne!(FormulaReadyChoice::UNSELECTED, max_plain);
-        assert_ne!(FormulaReadyChoice::UNSELECTED, max_exact);
-        assert_eq!(std::mem::size_of::<FormulaReadyChoice>(), 8);
-    }
-
-    #[test]
-    fn quoted_row_batch_append_tail_and_parallel_split_preserve_alignment() {
-        let original_rows = vec![
-            raw(0),
-            raw(10),
-            raw(1),
-            raw(11),
-            raw(2),
-            raw(12),
-            raw(3),
-            raw(13),
-        ];
-        let original_choices = vec![
-            FormulaReadyChoice::new(7, false),
-            FormulaReadyChoice::new(8, true),
-            FormulaReadyChoice::new(9, false),
-            FormulaReadyChoice::new(10, true),
-        ];
-        let mut batch = QuotedRowBatch::new(
-            RowBatch {
-                rows: original_rows.clone(),
-                row_count: 4,
-            },
-            original_choices.clone(),
-        );
-        let tail = batch.take_tail(2, 2);
-        assert_eq!(batch.rows.rows, original_rows[..4]);
-        assert_eq!(batch.choices, original_choices[..2]);
-        assert_eq!(tail.rows.rows, original_rows[4..]);
-        assert_eq!(tail.choices, original_choices[2..]);
-        batch.append(tail);
-        assert_eq!(batch.rows.rows, original_rows);
-        assert_eq!(batch.choices, original_choices);
-
-        let mut bucket = StateBucket::QuotedRows(batch);
-        assert_eq!(bucket.row_count(), 4);
-        assert_eq!(bucket.occupancy(false), 4);
-        let tail = bucket.take_tail(2, 1, false);
-        let StateBucket::QuotedRows(left) = &bucket else {
-            panic!("quoted tail left the wrong bucket kind")
-        };
-        let StateBucket::QuotedRows(right) = &tail else {
-            panic!("quoted tail returned the wrong bucket kind")
-        };
-        assert_eq!(left.rows.rows, original_rows[..6]);
-        assert_eq!(left.choices, original_choices[..3]);
-        assert_eq!(right.rows.rows, original_rows[6..]);
-        assert_eq!(right.choices, original_choices[3..]);
-        bucket.append(tail);
-
-        #[cfg(feature = "parallel")]
-        {
-            let sibling = bucket
-                .split_for_parallel(2, false)
-                .expect("four quoted rows should split");
-            let StateBucket::QuotedRows(left) = &bucket else {
-                unreachable!()
-            };
-            let StateBucket::QuotedRows(right) = sibling else {
-                unreachable!()
-            };
-            assert_eq!(left.rows.rows, original_rows[..4]);
-            assert_eq!(left.choices, original_choices[..2]);
-            assert_eq!(right.rows.rows, original_rows[4..]);
-            assert_eq!(right.choices, original_choices[2..]);
-        }
-    }
-
-    #[test]
-    fn deferred_ready_quote_coalesces_outer_state_before_one_formula_materialization() {
-        const PARENT: VariableId = 0;
-        const TARGET: VariableId = 1;
-        let exact_calls = Arc::new(AtomicUsize::new(0));
-        let covering_calls = Arc::new(AtomicUsize::new(0));
-        let validator_calls = Arc::new(AtomicUsize::new(0));
-        let quoted = |coverage, estimates, calls: &Arc<AtomicUsize>| {
-            Box::new(QuotedEstimateLeaf {
-                parent: Some(PARENT),
-                variable: TARGET,
-                coverage,
-                estimates,
-                estimate_calls: Arc::clone(calls),
-            }) as ShapeConstraint
-        };
-        let root = IntersectionConstraint::new(vec![
-            quoted(ProposalCoverage::Exact, [1, 9], &exact_calls),
-            quoted(ProposalCoverage::Covering, [1, 1], &covering_calls),
-            quoted(ProposalCoverage::None, [0, 0], &validator_calls),
-            Box::new(ReceiptLeaf {
-                variable: PARENT,
-                coverage: ProposalCoverage::Exact,
-            }) as ShapeConstraint,
-        ]);
-        let plan = ResidualPlan::compile_whole_root_for_test(&root);
-        let quote = plan
-            .formula_ready_quote
-            .as_ref()
-            .expect("standard root intersection should certify a Ready quote");
-        assert_eq!(quote.children.len(), 4);
-
-        let desc = StateDesc {
-            bound: VariableSet::new_singleton(PARENT),
-            phase: ResidualPhase::Ready,
-        };
-        let mut worklist = Worklist::new();
-        let mut interner = StateInterner::default();
-        let mut stats = ResidualStateStats::default();
-
-        let first = ready_plan_transition(
-            &root,
-            &plan,
-            &desc,
-            RowBatch {
-                rows: vec![raw(0)],
-                row_count: 1,
-            },
-            root.variables(),
-            &mut worklist,
-            &mut interner,
-            &mut stats,
-        );
-        let second = ready_plan_transition(
-            &root,
-            &plan,
-            &desc,
-            RowBatch {
-                rows: vec![raw(1)],
-                row_count: 1,
-            },
-            root.variables(),
-            &mut worklist,
-            &mut interner,
-            &mut stats,
-        );
-        assert_eq!(first.state, second.state);
-        assert_eq!(first.rank, second.rank);
-        assert_eq!(worklist.len(), 1);
-        assert_eq!(worklist[&first.rank].len(), 1);
-        assert_eq!(stats.bucket_merges, 1);
-        assert_eq!(stats.ready_proposal_groups, 2);
-        assert_eq!(stats.formula_outer_entry_pops, 0);
-        assert_eq!(stats.formula_ready_quote_estimate_rows, 4);
-        assert_eq!(exact_calls.load(Ordering::Relaxed), 2);
-        assert_eq!(covering_calls.load(Ordering::Relaxed), 2);
-        assert_eq!(validator_calls.load(Ordering::Relaxed), 0);
-
-        let carrier_desc = interner.get(first.state).clone();
-        assert!(
-            matches!(
-                &carrier_desc.phase,
-                ResidualPhase::QuotedFormulaPropose { variable } if *variable == TARGET
-            ),
-            "quoted Ready histories did not meet at their outer Formula state"
-        );
-        let carrier = worklist
-            .get_mut(&first.rank)
-            .unwrap()
-            .remove(&first.state)
-            .unwrap();
-        let StateBucket::QuotedRows(carrier) = carrier else {
-            panic!("quoted outer state lost its affine choices")
-        };
-        assert_eq!(carrier.rows.rows, [raw(0), raw(1)]);
-        assert_eq!(
-            carrier.choices,
-            [
-                FormulaReadyChoice::new(0, true),
-                FormulaReadyChoice::new(1, false)
-            ]
-        );
-
-        let calls_before_pop = (
-            exact_calls.load(Ordering::Relaxed),
-            covering_calls.load(Ordering::Relaxed),
-            validator_calls.load(Ordering::Relaxed),
-        );
-        let mut next_activation = 0;
-        quoted_formula_propose_transition(
-            &root,
-            &plan,
-            &carrier_desc,
-            TARGET,
-            carrier,
-            &mut next_activation,
-            &mut worklist,
-            &mut interner,
-            &mut stats,
-        );
-        assert_eq!(next_activation, 2);
-        assert_eq!(
-            calls_before_pop,
-            (
-                exact_calls.load(Ordering::Relaxed),
-                covering_calls.load(Ordering::Relaxed),
-                validator_calls.load(Ordering::Relaxed),
-            ),
-            "carrier pop must not re-estimate descendants"
-        );
-        assert_eq!(stats.formula_outer_entry_pops, 1);
-        assert_eq!(stats.formula_ready_quote_groups, 2);
-        assert_eq!(stats.formula_ready_quote_root_plan_filings_elided, 1);
-
-        let mut entered = Vec::new();
-        let mut activation_ids = std::collections::BTreeSet::new();
-        for level in worklist.values() {
-            for (&id, bucket) in level {
-                let ResidualPhase::Formula { cursor } = interner.get(id).phase else {
-                    panic!("quoted carrier did not enter a Formula child")
-                };
-                let StateBucket::Formula(batch) = bucket else {
-                    panic!("quoted Formula child lost its materialized payload")
-                };
-                assert_eq!(batch.parents.row_count, 1);
-                assert_eq!(batch.activations.len(), batch.parents.row_count);
-                activation_ids.extend(batch.activations.iter().copied());
-                let marker = batch.parents.rows[0][0];
-                let FormulaFocus::Action {
-                    node,
-                    stage: FormulaStage::Propose,
-                } = interner.formula(cursor).focus
-                else {
-                    panic!("quoted source did not enter its proposal Action")
-                };
-                let return_to = interner
-                    .formula(cursor)
-                    .return_to
-                    .expect("selected child should retain one root return edge");
-                let parent = interner.formula_pcs.return_by_id(return_to).parent;
-                let FormulaFocus::Plan { done, .. } =
-                    &interner.formula(cursor.with_pc(parent)).focus
-                else {
-                    panic!("selected child did not retain its root AND continuation")
-                };
-                assert!(
-                    done.contains(3),
-                    "the target-irrelevant parent child was not skipped"
-                );
-                assert!(
-                    !done.contains(2),
-                    "a target validator without coverage was incorrectly discharged"
-                );
-                entered.push((
-                    marker,
-                    node,
-                    interner.formula_candidate_exit(cursor).checked.contains(0),
-                ));
-            }
-        }
-        entered.sort_unstable_by_key(|entry| entry.0);
-        assert_eq!(
-            entered,
-            [
-                (0, quote.children[0], true),
-                (1, quote.children[1], false)
-            ],
-            "stable preorder must win the tie and only Exact choice may discharge the outer proposer"
-        );
-        assert_eq!(
-            activation_ids.len(),
-            2,
-            "each carrier row must retain one unique affine activation"
-        );
-    }
-
-    #[test]
-    fn deferred_ready_receipt_partitions_share_structural_root_pc_without_coalescing() {
-        const PARENT: VariableId = 0;
-        const TARGET: VariableId = 1;
-        let exact_calls = Arc::new(AtomicUsize::new(0));
-        let covering_calls = Arc::new(AtomicUsize::new(0));
-        let quoted = |coverage, estimates, calls: &Arc<AtomicUsize>| {
-            Box::new(QuotedEstimateLeaf {
-                parent: Some(PARENT),
-                variable: TARGET,
-                coverage,
-                estimates,
-                estimate_calls: Arc::clone(calls),
-            }) as ShapeConstraint
-        };
-        let root = IntersectionConstraint::new(vec![
-            quoted(ProposalCoverage::Exact, [1, 9], &exact_calls),
-            quoted(ProposalCoverage::Covering, [9, 1], &covering_calls),
-        ]);
-        let plan = ResidualPlan::compile_whole_root_for_test(&root);
-        let quote = plan.formula_ready_quote.as_ref().unwrap();
-        assert_eq!(quote.children.len(), 2);
-        assert!(
-            !plan.formula_proposer_starts_checked(
-                &root,
-                0,
-                quote.root,
-                TARGET,
-                VariableSet::new_singleton(PARENT),
-            ),
-            "an Exact and a Covering source have only a Covering common receipt"
-        );
-
-        let desc = StateDesc {
-            bound: VariableSet::new_singleton(PARENT),
-            phase: ResidualPhase::Ready,
-        };
-        let mut worklist = Worklist::new();
-        let mut interner = StateInterner::default();
-        let mut stats = ResidualStateStats::default();
-        let carrier = ready_plan_transition(
-            &root,
-            &plan,
-            &desc,
-            RowBatch {
-                rows: vec![raw(0), raw(1)],
-                row_count: 2,
-            },
-            root.variables(),
-            &mut worklist,
-            &mut interner,
-            &mut stats,
-        );
-        let carrier_desc = interner.get(carrier.state).clone();
-        let StateBucket::QuotedRows(batch) = worklist
-            .get_mut(&carrier.rank)
-            .unwrap()
-            .remove(&carrier.state)
-            .unwrap()
-        else {
-            panic!("Ready did not preserve its row-local Formula receipts")
-        };
-        assert_eq!(
-            batch.choices,
-            [
-                FormulaReadyChoice::new(0, true),
-                FormulaReadyChoice::new(1, false),
-            ]
-        );
-
-        let mut next_activation = 0;
-        quoted_formula_propose_transition(
-            &root,
-            &plan,
-            &carrier_desc,
-            TARGET,
-            batch,
-            &mut next_activation,
-            &mut worklist,
-            &mut interner,
-            &mut stats,
-        );
-
-        let mut partitions = Vec::new();
-        for (&rank, level) in &worklist {
-            for (&state, bucket) in level {
-                let ResidualPhase::Formula { cursor } = interner.get(state).phase else {
-                    panic!("a quoted receipt partition did not enter Formula")
-                };
-                let StateBucket::Formula(batch) = bucket else {
-                    panic!("a quoted receipt partition lost its Formula payload")
-                };
-                assert_eq!(batch.parents.row_count, 1);
-                let return_to = interner
-                    .formula(cursor)
-                    .return_to
-                    .expect("the selected child lost its root continuation");
-                let parent = interner.formula_pcs.return_by_id(return_to).parent;
-                partitions.push((
-                    batch.parents.rows[0][0],
-                    state,
-                    rank,
-                    cursor,
-                    cursor.with_pc(parent),
-                    interner.formula_candidate_exit(cursor).checked.contains(0),
-                ));
-            }
-        }
-        partitions.sort_unstable_by_key(|partition| partition.0);
-        assert_eq!(partitions.len(), 2);
-        let exact = partitions[0];
-        let covering = partitions[1];
-        assert_ne!(exact.1, covering.1, "row-local partitions became one state");
-        assert_eq!(exact.2 - covering.2, plan.action_span());
-        assert_eq!(
-            exact.4.pc, covering.4.pc,
-            "checked and unchecked Candidate exits duplicated the root PC"
-        );
-        assert_ne!(
-            exact.4.exit, covering.4.exit,
-            "row-local discharge receipts were quotiented with structure"
-        );
-        assert!(exact.5);
-        assert!(!covering.5);
-        assert_ne!(
-            StateDesc {
-                bound: desc.bound,
-                phase: ResidualPhase::Formula { cursor: exact.4 },
-            },
-            StateDesc {
-                bound: desc.bound,
-                phase: ResidualPhase::Formula { cursor: covering.4 },
-            },
-            "equal structural roots must retain distinct Candidate futures"
-        );
-
-        assert_eq!(interner.formula_pcs.candidate_exit_len(), 2);
-        assert_eq!(
-            interner.formula_pcs.len(),
-            3,
-            "one shared root and two selected children are the exact structural PCs"
-        );
-        assert_eq!(interner.formula_pcs.return_len(), 2);
-        assert_eq!(next_activation, 2);
-        assert_eq!(stats.formula_ready_quote_groups, 2);
-    }
-
-    #[test]
-    fn deferred_ready_quote_matches_nested_and_aggregate_in_stable_preorder() {
-        const PARENT: VariableId = 0;
-        const TARGET: VariableId = 1;
-        let direct_calls = Arc::new(AtomicUsize::new(0));
-        let first_nested_calls = Arc::new(AtomicUsize::new(0));
-        let tied_nested_calls = Arc::new(AtomicUsize::new(0));
-        let validator_calls = Arc::new(AtomicUsize::new(0));
-        let quoted = |coverage, estimates, calls: &Arc<AtomicUsize>| {
-            Box::new(QuotedEstimateLeaf {
-                parent: Some(PARENT),
-                variable: TARGET,
-                coverage,
-                estimates,
-                estimate_calls: Arc::clone(calls),
-            }) as ShapeConstraint
-        };
-        let root = IntersectionConstraint::new(vec![
-            quoted(ProposalCoverage::Exact, [5, 2], &direct_calls),
-            shape_and(vec![
-                quoted(ProposalCoverage::Covering, [1, 4], &first_nested_calls),
-                shape_and(vec![quoted(
-                    ProposalCoverage::Exact,
-                    [1, 3],
-                    &tied_nested_calls,
-                )]),
-            ]),
-            quoted(ProposalCoverage::None, [0, 0], &validator_calls),
-            Box::new(ReceiptLeaf {
-                variable: PARENT,
-                coverage: ProposalCoverage::Exact,
-            }) as ShapeConstraint,
-        ]);
-        let plan = ResidualPlan::compile_whole_root_for_test(&root);
-        let quote = plan.formula_ready_quote.as_ref().unwrap();
-        assert_eq!(
-            quote
-                .children
-                .iter()
-                .map(|&node| plan.finite_formula.node(node).path.0.to_vec())
-                .collect::<Vec<_>>(),
-            [
-                vec![FormulaStep::And(0)],
-                vec![FormulaStep::And(1), FormulaStep::And(0)],
-                vec![
-                    FormulaStep::And(1),
-                    FormulaStep::And(1),
-                    FormulaStep::And(0)
-                ],
-                vec![FormulaStep::And(2)],
-                vec![FormulaStep::And(3)]
-            ]
-        );
-
-        let vars = [PARENT];
-        let rows = RowBatch {
-            rows: vec![raw(0), raw(1)],
-            row_count: 2,
-        };
-        let view = rows_view(&vars, &rows.rows, rows.row_count);
-        let mut ordinary = Vec::new();
-        assert!(root.estimate(TARGET, &view, &mut EstimateSink::Column(&mut ordinary),));
-        assert_eq!(ordinary, [1, 2]);
-        for calls in [
-            &direct_calls,
-            &first_nested_calls,
-            &tied_nested_calls,
-            &validator_calls,
-        ] {
-            calls.store(0, Ordering::Relaxed);
-        }
-
-        let mut aggregate = vec![usize::MAX; rows.row_count];
-        let mut stats = ResidualStateStats::default();
-        let selection = quote_formula_ready_and(
-            &root,
-            &plan,
-            quote,
-            TARGET,
-            VariableSet::new_singleton(PARENT),
-            &view,
-            &mut aggregate,
-            &mut stats,
-        )
-        .unwrap();
-        assert_eq!(aggregate, ordinary);
-        assert_eq!(
-            selection
-                .iter()
-                .map(|choice| (choice.child(), choice.exact()))
-                .collect::<Vec<_>>(),
-            [(1, false), (0, true)],
-            "the first nested descendant wins the row-zero tie"
-        );
-        let skipped = formula_ready_common_skips(&root, &plan, quote, TARGET);
-        assert!(skipped.contains(4));
-        assert!(!skipped.contains(3));
-        assert_eq!(stats.formula_ready_quote_estimate_rows, 6);
-        assert_eq!(direct_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(first_nested_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(tied_nested_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(validator_calls.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn deferred_ready_quote_preserves_root_self_confirm_discharge_for_covering_child() {
-        const TARGET: VariableId = 0;
-        let exact = || {
-            Box::new(ReceiptLeaf {
-                variable: TARGET,
-                coverage: ProposalCoverage::Exact,
-            }) as ShapeConstraint
-        };
-        let arm = || shape_and(vec![exact(), exact()]);
-        let root = IntersectionConstraint::new(vec![Box::new(UnionConstraint::new(vec![
-            arm(),
-            arm(),
-        ])) as ShapeConstraint]);
-        let plan = ResidualPlan::compile_whole_root_for_test(&root);
-        let quote = plan.formula_ready_quote.as_ref().unwrap();
-        assert_eq!(
-            root.proposal_coverage(TARGET, VariableSet::new_empty()),
-            ProposalCoverage::Covering
-        );
-        assert!(
-            plan.formula_proposer_starts_checked(
-                &root,
-                0,
-                quote.root,
-                TARGET,
-                VariableSet::new_empty(),
-            ),
-            "the recursively lowered root route discharges the outer self-confirm obligation"
-        );
-
-        let mut worklist = Worklist::new();
-        let mut interner = StateInterner::default();
-        let mut stats = ResidualStateStats::default();
-        let carrier = ready_plan_transition(
-            &root,
-            &plan,
-            &StateDesc {
-                bound: VariableSet::new_empty(),
-                phase: ResidualPhase::Ready,
-            },
-            RowBatch::seed(),
-            root.variables(),
-            &mut worklist,
-            &mut interner,
-            &mut stats,
-        );
-        let carrier_desc = interner.get(carrier.state).clone();
-        let bucket = worklist
-            .get_mut(&carrier.rank)
-            .unwrap()
-            .remove(&carrier.state)
-            .unwrap();
-        let StateBucket::QuotedRows(batch) = bucket else {
-            panic!("quoted Ready selection did not enter its carrier")
-        };
-        assert_eq!(batch.choices.len(), 1);
-        assert!(
-            !batch.choices[0].exact(),
-            "the selected composite child is only Covering as an opaque constraint"
-        );
-
-        let mut next_activation = 0;
-        let entered = quoted_formula_propose_transition(
-            &root,
-            &plan,
-            &carrier_desc,
-            TARGET,
-            batch,
-            &mut next_activation,
-            &mut worklist,
-            &mut interner,
-            &mut stats,
-        );
-        let ResidualPhase::Formula { cursor } = interner.get(entered.state).phase else {
-            panic!("quoted carrier did not enter its selected Formula child")
-        };
-        assert!(
-            interner.formula_candidate_exit(cursor).checked.contains(0),
-            "carrier entry lost the root self-confirm discharge and would repeat validation"
-        );
-    }
-
-    #[test]
-    fn deferred_ready_quote_single_choice_moves_parent_storage_without_copying() {
-        const PARENT: VariableId = 0;
-        const TARGET: VariableId = 1;
-        let root = IntersectionConstraint::new(vec![
-            Box::new(QuotedEstimateLeaf {
-                parent: Some(PARENT),
-                variable: TARGET,
-                coverage: ProposalCoverage::Exact,
-                estimates: [1, 1],
-                estimate_calls: Arc::new(AtomicUsize::new(0)),
-            }) as ShapeConstraint,
-            Box::new(ReceiptLeaf {
-                variable: PARENT,
-                coverage: ProposalCoverage::Exact,
-            }) as ShapeConstraint,
-        ]);
-        let plan = ResidualPlan::compile_whole_root_for_test(&root);
-        let rows = vec![raw(0), raw(1)];
-        let storage = rows.as_ptr();
-        let carrier = QuotedRowBatch::new(
-            RowBatch { rows, row_count: 2 },
-            vec![
-                FormulaReadyChoice::new(0, true),
-                FormulaReadyChoice::new(0, true),
-            ],
-        );
-        let desc = StateDesc {
-            bound: VariableSet::new_singleton(PARENT),
-            phase: ResidualPhase::QuotedFormulaPropose { variable: TARGET },
-        };
-        let mut worklist = Worklist::new();
-        let mut interner = StateInterner::default();
-        let mut stats = ResidualStateStats::default();
-        let mut next_activation = 0;
-        let token = quoted_formula_propose_transition(
-            &root,
-            &plan,
-            &desc,
-            TARGET,
-            carrier,
-            &mut next_activation,
-            &mut worklist,
-            &mut interner,
-            &mut stats,
-        );
-        let StateBucket::Formula(batch) = &worklist[&token.rank][&token.state] else {
-            panic!("single quoted choice did not materialize one Formula batch")
-        };
-        assert_eq!(batch.parents.rows.as_ptr(), storage);
-        assert_eq!(batch.parents.row_count, 2);
-        assert_eq!(batch.activations.len(), batch.parents.row_count);
-        assert_eq!(
-            batch
-                .activations
-                .iter()
-                .copied()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
-            batch.parents.row_count,
-            "each moved parent row must retain one unique affine activation"
-        );
-        assert_eq!(next_activation, 2);
-        assert_eq!(stats.formula_outer_entry_pops, 1);
-        assert_eq!(stats.formula_ready_quote_groups, 1);
-    }
-
-    #[test]
-    fn deferred_ready_quote_typed_only_source_can_win_but_not_create_eligibility() {
-        const X: VariableId = 0;
-        const Y: VariableId = 1;
-        let ordinary_calls = Arc::new(AtomicUsize::new(0));
-        let typed_calls = Arc::new(AtomicUsize::new(0));
-        let root = IntersectionConstraint::new(vec![
-            Box::new(QuotedEstimateLeaf {
-                parent: None,
-                variable: X,
-                coverage: ProposalCoverage::Exact,
-                estimates: [10, 10],
-                estimate_calls: Arc::clone(&ordinary_calls),
-            }) as ShapeConstraint,
-            Box::new(TypedOnlyQuoteLeaf {
-                parent: None,
-                variable: X,
-                completion: ProgramCompletion::CompleteActionEquivalent,
-                ordinary_coverage: ProposalCoverage::None,
-                estimates: [1, 1],
-                estimate_calls: Arc::clone(&typed_calls),
-                typed_seed_rows: Arc::new(AtomicUsize::new(0)),
-                ordinary_propose_rows: Arc::new(AtomicUsize::new(0)),
-            }) as ShapeConstraint,
-        ]);
-        let plan = ResidualPlan::compile_whole_root_for_test(&root);
-        let quote = plan.formula_ready_quote.as_ref().unwrap();
-        let mut aggregate = vec![usize::MAX];
-        let mut stats = ResidualStateStats::default();
-        let selection = quote_formula_ready_and(
-            &root,
-            &plan,
-            quote,
-            X,
-            VariableSet::new_empty(),
-            &RowsView::EMPTY,
-            &mut aggregate,
-            &mut stats,
-        )
-        .unwrap();
-        assert_eq!(
-            aggregate,
-            [10],
-            "typed-only source must not enter Ready's aggregate cost"
-        );
-        assert_eq!(selection[0].child(), 1);
-        assert!(selection[0].exact());
-
-        let x_calls = Arc::new(AtomicUsize::new(0));
-        let y_calls = Arc::new(AtomicUsize::new(0));
-        let eligibility_root = IntersectionConstraint::new(vec![
-            Box::new(TypedOnlyQuoteLeaf {
-                parent: None,
-                variable: X,
-                completion: ProgramCompletion::CompleteActionEquivalent,
-                ordinary_coverage: ProposalCoverage::None,
-                estimates: [1, 1],
-                estimate_calls: Arc::clone(&x_calls),
-                typed_seed_rows: Arc::new(AtomicUsize::new(0)),
-                ordinary_propose_rows: Arc::new(AtomicUsize::new(0)),
-            }) as ShapeConstraint,
-            Box::new(QuotedEstimateLeaf {
-                parent: None,
-                variable: Y,
-                coverage: ProposalCoverage::Exact,
-                estimates: [7, 7],
-                estimate_calls: Arc::clone(&y_calls),
-            }) as ShapeConstraint,
-        ]);
-        let eligibility_plan = ResidualPlan::compile_whole_root_for_test(&eligibility_root);
-        let desc = StateDesc {
-            bound: VariableSet::new_empty(),
-            phase: ResidualPhase::Ready,
-        };
-        let mut worklist = Worklist::new();
-        let mut interner = StateInterner::default();
-        let mut eligibility_stats = ResidualStateStats::default();
-        let token = ready_plan_transition(
-            &eligibility_root,
-            &eligibility_plan,
-            &desc,
-            RowBatch {
-                rows: Vec::new(),
-                row_count: 1,
-            },
-            eligibility_root.variables(),
-            &mut worklist,
-            &mut interner,
-            &mut eligibility_stats,
-        );
-        assert!(matches!(
-            interner.get(token.state).phase,
-            ResidualPhase::QuotedFormulaPropose { variable: Y }
-        ));
-        assert_eq!(
-            x_calls.load(Ordering::Relaxed),
-            0,
-            "typed-only X must stay outside Ready eligibility"
-        );
-        assert_eq!(y_calls.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn delta_proposal_seeding_declines_quoted_planning_carrier() {
-        const TARGET: VariableId = 0;
-        let leaf = |estimate| QuotedEstimateLeaf {
-            parent: None,
-            variable: TARGET,
-            coverage: ProposalCoverage::Exact,
-            estimates: [estimate, estimate],
-            estimate_calls: Arc::new(AtomicUsize::new(0)),
-        };
-        let root = IntersectionConstraint::new(vec![leaf(1), leaf(2)]);
-        let plan = ResidualPlan::compile_whole_root_for_test(&root);
-        assert!(plan.formula_ready_quote.is_some());
-        let mut machine = ResidualStateMachine::new_for_plan(root.variables(), &plan, None);
-        let task = SelectedResidualTask {
-            state: StateId(0),
-            desc: StateDesc {
-                bound: VariableSet::new_empty(),
-                phase: ResidualPhase::QuotedFormulaPropose { variable: TARGET },
-            },
-            bucket: StateBucket::QuotedRows(QuotedRowBatch::new(
-                RowBatch {
-                    rows: Vec::new(),
-                    row_count: 1,
-                },
-                vec![FormulaReadyChoice::new(0, true)],
-            )),
-        };
-        let returned = machine
-            .seed_delta_proposal(&root, &plan, task)
-            .expect_err("quoted planning carrier is not a protocol proposal action");
-        assert!(matches!(
-            returned.desc.phase,
-            ResidualPhase::QuotedFormulaPropose { variable: TARGET }
-        ));
-        assert!(matches!(returned.bucket, StateBucket::QuotedRows(_)));
-    }
-
-    #[test]
-    fn lawless_exposed_and_retains_v31_outer_propose_path() {
-        const TARGET: VariableId = 0;
-        let left_calls = Arc::new(AtomicUsize::new(0));
-        let right_calls = Arc::new(AtomicUsize::new(0));
-        let leaf = |estimate, calls: &Arc<AtomicUsize>| QuotedEstimateLeaf {
-            parent: None,
-            variable: TARGET,
-            coverage: ProposalCoverage::Exact,
-            estimates: [estimate, estimate],
-            estimate_calls: Arc::clone(calls),
-        };
-        let root = IntersectionConstraint::new(vec![
-            Box::new(LawlessAnd(IntersectionConstraint::new(vec![leaf(
-                1,
-                &left_calls,
-            )]))) as ShapeConstraint,
-            Box::new(leaf(2, &right_calls)) as ShapeConstraint,
-        ]);
-        let plan = ResidualPlan::compile_whole_root_for_test(&root);
-        assert!(plan.synthetic_root_formula);
-        assert!(
-            plan.formula_ready_quote.is_none(),
-            "shape exposure alone must not certify estimate decomposition"
-        );
-        let mut worklist = Worklist::new();
-        let mut interner = StateInterner::default();
-        let mut stats = ResidualStateStats::default();
-        let token = ready_plan_transition(
-            &root,
-            &plan,
-            &StateDesc {
-                bound: VariableSet::new_empty(),
-                phase: ResidualPhase::Ready,
-            },
-            RowBatch {
-                rows: Vec::new(),
-                row_count: 1,
-            },
-            root.variables(),
-            &mut worklist,
-            &mut interner,
-            &mut stats,
-        );
-        assert!(matches!(
-            interner.get(token.state).phase,
-            ResidualPhase::Propose {
-                variable: TARGET,
-                proposer: 0,
-                ..
-            }
-        ));
-        assert!(matches!(
-            worklist[&token.rank][&token.state],
-            StateBucket::Rows(_)
-        ));
-        assert_eq!(left_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(right_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(stats.formula_outer_entry_pops, 0);
-        assert_eq!(stats.formula_ready_quote_groups, 0);
-        assert_eq!(stats.formula_ready_quote_root_plan_filings_elided, 0);
-        assert_eq!(stats.formula_ready_quote_estimate_rows, 0);
-    }
-
-    #[test]
-    fn deferred_ready_quote_stops_at_or_support_boundary() {
-        const TARGET: VariableId = 0;
-        let direct_calls = Arc::new(AtomicUsize::new(0));
-        let left_arm_calls = Arc::new(AtomicUsize::new(0));
-        let right_arm_calls = Arc::new(AtomicUsize::new(0));
-        let leaf = |estimate, calls: &Arc<AtomicUsize>| QuotedEstimateLeaf {
-            parent: None,
-            variable: TARGET,
-            coverage: ProposalCoverage::Exact,
-            estimates: [estimate, estimate],
-            estimate_calls: Arc::clone(calls),
-        };
-        let root = IntersectionConstraint::new(vec![
-            Box::new(leaf(10, &direct_calls)) as ShapeConstraint,
-            Box::new(UnionConstraint::new(vec![
-                leaf(2, &left_arm_calls),
-                leaf(3, &right_arm_calls),
-            ])) as ShapeConstraint,
-        ]);
-        let plan = ResidualPlan::compile_whole_root_for_test(&root);
-        let quote = plan.formula_ready_quote.as_ref().unwrap();
-        assert_eq!(quote.children.len(), 2);
-        assert!(matches!(
-            plan.finite_formula.node(quote.children[1]).kind,
-            FiniteFormulaNodeKind::Or { .. }
-        ));
-
-        let mut worklist = Worklist::new();
-        let mut interner = StateInterner::default();
-        let mut stats = ResidualStateStats::default();
-        let carrier = ready_plan_transition(
-            &root,
-            &plan,
-            &StateDesc {
-                bound: VariableSet::new_empty(),
-                phase: ResidualPhase::Ready,
-            },
-            RowBatch {
-                rows: Vec::new(),
-                row_count: 1,
-            },
-            root.variables(),
-            &mut worklist,
-            &mut interner,
-            &mut stats,
-        );
-        let carrier_desc = interner.get(carrier.state).clone();
-        let ResidualPhase::QuotedFormulaPropose { variable } = &carrier_desc.phase else {
-            panic!("quoted OR selection did not retain its outer carrier")
-        };
-        let variable = *variable;
-        let bucket = worklist
-            .get_mut(&carrier.rank)
-            .unwrap()
-            .remove(&carrier.state)
-            .unwrap();
-        let StateBucket::QuotedRows(batch) = bucket else {
-            panic!("quoted OR carrier lost its choice")
-        };
-        assert_eq!(batch.choices, [FormulaReadyChoice::new(1, true)]);
-        let calls_before_pop = (
-            direct_calls.load(Ordering::Relaxed),
-            left_arm_calls.load(Ordering::Relaxed),
-            right_arm_calls.load(Ordering::Relaxed),
-        );
-        let mut next_activation = 0;
-        let token = quoted_formula_propose_transition(
-            &root,
-            &plan,
-            &carrier_desc,
-            variable,
-            batch,
-            &mut next_activation,
-            &mut worklist,
-            &mut interner,
-            &mut stats,
-        );
-        assert_eq!(
-            calls_before_pop,
-            (
-                direct_calls.load(Ordering::Relaxed),
-                left_arm_calls.load(Ordering::Relaxed),
-                right_arm_calls.load(Ordering::Relaxed),
-            )
-        );
-        let ResidualPhase::Formula { cursor } = interner.get(token.state).phase else {
-            panic!("quoted OR carrier did not enter Formula")
-        };
-        let FormulaFocus::Plan {
-            node,
-            stage: FormulaStage::Propose,
-            ..
-        } = interner.formula(cursor).focus
-        else {
-            panic!("quote crossed through the selected OR into one of its arms")
-        };
-        assert_eq!(node, quote.children[1]);
-    }
-
-    #[test]
-    fn deferred_ready_quote_matches_forced_v31_raw_set_and_closes_affine_debt() {
-        const TARGET: VariableId = 0;
-        let make_leaf = |coverage, estimate| QuotedEstimateLeaf {
-            parent: None,
-            variable: TARGET,
-            coverage,
-            estimates: [estimate, estimate],
-            estimate_calls: Arc::new(AtomicUsize::new(0)),
-        };
-        let root = Arc::new(IntersectionConstraint::new(vec![
-            make_leaf(ProposalCoverage::Exact, 2),
-            make_leaf(ProposalCoverage::Covering, 3),
-        ]));
-        let make = || {
-            let mut iter = Query::new(Arc::clone(&root), |binding: &Binding| {
-                binding.get(TARGET).copied()
-            })
-            .solve_residual_state_lazy();
-            iter.plan = ResidualPlan::compile_whole_root_for_test(&iter.root);
-            iter.state = ResidualStateMachine::new_for_plan(
-                iter.root.variables(),
-                &iter.plan,
-                Some(FrameSeedRow::empty()),
-            );
-            iter
-        };
-
-        let quoted_epoch = ResidualShadowEpoch::new();
-        let quoted = make().shadow(quoted_epoch);
-        let quoted = quoted.collect_profiled();
-
-        let mut v31 = make();
-        assert!(v31.plan.formula_ready_quote.is_some());
-        v31.plan.formula_ready_quote = None;
-        v31.state = ResidualStateMachine::new_for_plan(
-            root.variables(),
-            &v31.plan,
-            Some(FrameSeedRow::empty()),
-        );
-        let v31_epoch = ResidualShadowEpoch::new();
-        let v31 = v31.shadow(v31_epoch).collect_profiled();
-
-        let quoted_set: BTreeSet<_> = quoted.results.into_iter().collect();
-        let v31_set: BTreeSet<_> = v31.results.into_iter().collect();
-        assert_eq!(quoted_set, v31_set);
-        assert_eq!(quoted_set, BTreeSet::from([raw(42)]));
-        assert_eq!(quoted.shadow.status, ResidualShadowStatus::Closed);
-        assert_eq!(v31.shadow.status, ResidualShadowStatus::Closed);
-        assert!(
-            quoted
-                .shadow
-                .events
-                .iter()
-                .chain(&v31.shadow.events)
-                .all(|event| event.completion.is_some()),
-            "closed affine epochs must have no outstanding action debt"
-        );
-        assert_eq!(quoted.stats.formula_outer_entry_pops, 1);
-        assert_eq!(quoted.stats.formula_ready_quote_root_plan_filings_elided, 1);
-        assert_eq!(v31.stats.formula_outer_entry_pops, 0);
-        assert_eq!(v31.stats.formula_ready_quote_groups, 0);
-        assert_eq!(v31.stats.formula_ready_quote_estimate_rows, 0);
-    }
-
-    #[test]
-    fn deferred_ready_quote_heterogeneous_receipts_full_drain_set_and_affine_closure() {
-        const PARENT: VariableId = 0;
-        const TARGET: VariableId = 1;
-
-        let fixture = || {
-            let parent_rows = Arc::new(AtomicUsize::new(0));
-            let exact_rows = Arc::new(AtomicUsize::new(0));
-            let covering_rows = Arc::new(AtomicUsize::new(0));
-            let root = Arc::new(IntersectionConstraint::new(vec![
-                Box::new(RelationalAdaptiveSource {
-                    parent: None,
-                    variable: PARENT,
-                    coverage: ProposalCoverage::Exact,
-                    estimates: [2, 2],
-                    values: Arc::new(vec![raw(0), raw(1)]),
-                    proposed_rows: Arc::clone(&parent_rows),
-                }) as ShapeConstraint,
-                Box::new(RelationalAdaptiveSource {
-                    parent: Some(PARENT),
-                    variable: TARGET,
-                    coverage: ProposalCoverage::Exact,
-                    estimates: [1, 9],
-                    values: Arc::new(vec![raw(42)]),
-                    proposed_rows: Arc::clone(&exact_rows),
-                }),
-                Box::new(RelationalAdaptiveSource {
-                    parent: Some(PARENT),
-                    variable: TARGET,
-                    coverage: ProposalCoverage::Covering,
-                    estimates: [9, 1],
-                    values: Arc::new(vec![raw(42)]),
-                    proposed_rows: Arc::clone(&covering_rows),
-                }),
-            ]));
-            (root, parent_rows, exact_rows, covering_rows)
-        };
-        let query = |root: Arc<IntersectionConstraint<ShapeConstraint>>| {
-            let mut iter = Query::new(root, |binding: &Binding| {
-                Some((binding.get(PARENT).copied()?, binding.get(TARGET).copied()?))
-            })
-            .solve_residual_state_lazy();
-            iter.plan = ResidualPlan::compile_whole_root_for_test(&iter.root);
-            iter.state = ResidualStateMachine::new_for_plan(
-                iter.root.variables(),
-                &iter.plan,
-                Some(FrameSeedRow::empty()),
-            );
-            iter
-        };
-
-        let (quoted_root, quoted_parent, quoted_exact, quoted_covering) = fixture();
-        let quoted_epoch = ResidualShadowEpoch::new();
-        let quoted = query(Arc::clone(&quoted_root))
-            .shadow(quoted_epoch)
-            .collect_profiled();
-
-        let (v31_root, v31_parent, v31_exact, v31_covering) = fixture();
-        let mut v31 = query(Arc::clone(&v31_root));
-        assert!(v31.plan.formula_ready_quote.is_some());
-        v31.plan.formula_ready_quote = None;
-        v31.state = ResidualStateMachine::new_for_plan(
-            v31_root.variables(),
-            &v31.plan,
-            Some(FrameSeedRow::empty()),
-        );
-        let v31_epoch = ResidualShadowEpoch::new();
-        let v31 = v31.shadow(v31_epoch).collect_profiled();
-
-        // Each target source owns exactly one parent row. This is the semantic
-        // action witness that both Ready receipts ran through completion; it
-        // deliberately says nothing about their physical order or state IDs.
-        assert_eq!(quoted_parent.load(Ordering::Relaxed), 1);
-        assert_eq!(quoted_exact.load(Ordering::Relaxed), 1);
-        assert_eq!(quoted_covering.load(Ordering::Relaxed), 1);
-        assert_eq!(v31_parent.load(Ordering::Relaxed), 1);
-        assert_eq!(v31_exact.load(Ordering::Relaxed), 1);
-        assert_eq!(v31_covering.load(Ordering::Relaxed), 1);
-
-        let quoted_len = quoted.results.len();
-        let v31_len = v31.results.len();
-        let quoted_set: std::collections::BTreeSet<_> = quoted.results.into_iter().collect();
-        let v31_set: std::collections::BTreeSet<_> = v31.results.into_iter().collect();
-        let expected = std::collections::BTreeSet::from([(raw(0), raw(42)), (raw(1), raw(42))]);
-        assert_eq!(
-            quoted_len,
-            quoted_set.len(),
-            "quoted projection was not a SET"
-        );
-        assert_eq!(v31_len, v31_set.len(), "V3.1 projection was not a SET");
-        assert_eq!(quoted_set, expected);
-        assert_eq!(quoted_set, v31_set);
-
-        for shadow in [&quoted.shadow, &v31.shadow] {
-            assert_eq!(shadow.status, ResidualShadowStatus::Closed);
-            assert!(!shadow.events.is_empty());
-            assert!(
-                shadow.events.iter().all(|event| event.completion.is_some()),
-                "a fully drained affine epoch retained packet/action debt"
-            );
-        }
-    }
-
-    #[test]
-    fn deferred_ready_quote_heterogeneous_nested_formula_drains_typed_delta_ownership() {
-        const PARENT: VariableId = 0;
-        const TARGET: VariableId = 1;
-
-        let fixture = || {
-            let parent_rows = Arc::new(AtomicUsize::new(0));
-            let direct_rows = Arc::new(AtomicUsize::new(0));
-            let typed_estimates = Arc::new(AtomicUsize::new(0));
-            let typed_seed_rows = Arc::new(AtomicUsize::new(0));
-            let ordinary_typed_rows = Arc::new(AtomicUsize::new(0));
-            let arm = || {
-                Box::new(IntersectionConstraint::new(vec![
-                    Box::new(TypedOnlyQuoteLeaf {
-                        parent: Some(PARENT),
-                        variable: TARGET,
-                        completion: ProgramCompletion::CompleteActionEquivalent,
-                        ordinary_coverage: ProposalCoverage::Exact,
-                        estimates: [9, 1],
-                        estimate_calls: Arc::clone(&typed_estimates),
-                        typed_seed_rows: Arc::clone(&typed_seed_rows),
-                        ordinary_propose_rows: Arc::clone(&ordinary_typed_rows),
-                    }) as ShapeConstraint,
-                ])) as ShapeConstraint
-            };
-            let nested_or = Box::new(UnionConstraint::new(vec![arm(), arm()])) as ShapeConstraint;
-            let root = Arc::new(IntersectionConstraint::new(vec![
-                Box::new(RelationalAdaptiveSource {
-                    parent: None,
-                    variable: PARENT,
-                    coverage: ProposalCoverage::Exact,
-                    estimates: [2, 2],
-                    values: Arc::new(vec![raw(0), raw(1)]),
-                    proposed_rows: Arc::clone(&parent_rows),
-                }) as ShapeConstraint,
-                Box::new(RelationalAdaptiveSource {
-                    parent: Some(PARENT),
-                    variable: TARGET,
-                    coverage: ProposalCoverage::Exact,
-                    estimates: [1, 9],
-                    values: Arc::new(vec![raw(42)]),
-                    proposed_rows: Arc::clone(&direct_rows),
-                }) as ShapeConstraint,
-                nested_or,
-            ]));
-            (
-                root,
-                parent_rows,
-                direct_rows,
-                typed_estimates,
-                typed_seed_rows,
-                ordinary_typed_rows,
-            )
-        };
-        let query = |root: Arc<IntersectionConstraint<ShapeConstraint>>| {
-            let mut iter = Query::new(root, |binding: &Binding| {
-                Some((binding.get(PARENT).copied()?, binding.get(TARGET).copied()?))
-            })
-            .solve_residual_state_lazy();
-            iter.plan = ResidualPlan::compile_whole_root_for_test(&iter.root);
-            iter.state = ResidualStateMachine::new_for_plan(
-                iter.root.variables(),
-                &iter.plan,
-                Some(FrameSeedRow::empty()),
-            );
-            iter
-        };
-
-        let (
-            quoted_root,
-            quoted_parent,
-            quoted_direct,
-            quoted_estimates,
-            quoted_typed,
-            quoted_ordinary,
-        ) = fixture();
-        let quoted_epoch = ResidualShadowEpoch::new();
-        let quoted = query(Arc::clone(&quoted_root))
-            .shadow(quoted_epoch)
-            .collect_profiled();
-
-        let (v31_root, v31_parent, v31_direct, v31_estimates, v31_typed, v31_ordinary) = fixture();
-        let mut v31 = query(Arc::clone(&v31_root));
-        assert!(v31.plan.formula_ready_quote.is_some());
-        v31.plan.formula_ready_quote = None;
-        v31.state = ResidualStateMachine::new_for_plan(
-            v31_root.variables(),
-            &v31.plan,
-            Some(FrameSeedRow::empty()),
-        );
-        let v31_epoch = ResidualShadowEpoch::new();
-        let v31 = v31.shadow(v31_epoch).collect_profiled();
-
-        for (parent, direct, estimates, typed, ordinary) in [
-            (
-                &quoted_parent,
-                &quoted_direct,
-                &quoted_estimates,
-                &quoted_typed,
-                &quoted_ordinary,
-            ),
-            (
-                &v31_parent,
-                &v31_direct,
-                &v31_estimates,
-                &v31_typed,
-                &v31_ordinary,
-            ),
-        ] {
-            assert_eq!(parent.load(Ordering::Relaxed), 1);
-            assert_eq!(
-                direct.load(Ordering::Relaxed),
-                1,
-                "exactly one heterogeneous parent must choose the direct source"
-            );
-            assert!(
-                estimates.load(Ordering::Relaxed) >= 2,
-                "both nested OR arms must participate in adaptive planning"
-            );
-            assert!(
-                typed.load(Ordering::Relaxed) >= 2,
-                "the selected nested OR must transfer each arm through typed delta ownership"
-            );
-            assert_eq!(
-                ordinary.load(Ordering::Relaxed),
-                0,
-                "ordinary proposal bypassed the admitted typed Program route"
-            );
-        }
-        assert_eq!(
-            quoted_typed.load(Ordering::Relaxed),
-            v31_typed.load(Ordering::Relaxed),
-            "deferred Ready changed typed Program proposal multiplicity"
-        );
-
-        let quoted_len = quoted.results.len();
-        let v31_len = v31.results.len();
-        let quoted_set: BTreeSet<_> = quoted.results.into_iter().collect();
-        let v31_set: BTreeSet<_> = v31.results.into_iter().collect();
-        let expected = BTreeSet::from([(raw(0), raw(42)), (raw(1), raw(42))]);
-        assert_eq!(quoted_len, quoted_set.len());
-        assert_eq!(v31_len, v31_set.len());
-        assert_eq!(quoted_set, expected);
-        assert_eq!(quoted_set, v31_set);
-
-        assert!(
-            quoted.stats.formula_ready_quote_groups > 1,
-            "the deferred carrier did not split heterogeneous Ready receipts"
-        );
-        assert!(
-            quoted.stats.delta_activations_completed > 0,
-            "the typed source never entered delta ownership"
-        );
-        assert_eq!(
-            quoted.stats.delta_activations_completed, v31.stats.delta_activations_completed,
-            "deferred Ready changed typed/delta protocol ownership"
-        );
-        for shadow in [&quoted.shadow, &v31.shadow] {
-            assert_eq!(shadow.status, ResidualShadowStatus::Closed);
-            assert!(!shadow.events.is_empty());
-            assert!(
-                shadow.events.iter().all(|event| event.completion.is_some()),
-                "nested Formula typed/delta ownership retained affine debt"
-            );
-        }
-    }
-
-    #[test]
     fn ready_directed_cost_keeps_q33_larger_archive_source_direction() {
         const VARIABLE: VariableId = 0;
         let actions = directed_ready_action_fixture(vec![
@@ -19785,7 +16871,6 @@ mod tests {
             }
         };
         assert_eq!(boxed_children.len(), 1);
-        assert!(boxed.residual_and_estimate_is_child_minimum());
         assert_eq!(
             boxed_children.child(0).variables(),
             VariableSet::new_singleton(0)
@@ -19800,7 +16885,6 @@ mod tests {
             }
         };
         assert_eq!(arc_children.len(), 1);
-        assert!(arc.residual_and_estimate_is_child_minimum());
         assert_eq!(
             arc_children.child(0).variables(),
             VariableSet::new_singleton(1)
@@ -19872,99 +16956,6 @@ mod tests {
     }
 
     #[test]
-    fn whole_root_scope_normalizes_formula_identity_shells() {
-        let opaque = ShapeLeaf(9);
-        let opaque_plan = ResidualPlan::compile_whole_root_for_test(&opaque);
-        assert!(!opaque_plan.synthetic_root_formula);
-        assert_eq!(opaque_plan.len(), 1);
-        assert!(opaque_plan.finite_formula.root(0).is_none());
-        assert!(opaque_plan.leaves[0].path.0.is_empty());
-
-        let nested = shape_and(vec![shape_and(vec![shape_leaf(9)])]);
-        let nested_plan = ResidualPlan::compile_whole_root_for_test(nested.as_ref());
-        assert!(!nested_plan.synthetic_root_formula);
-        assert_eq!(nested_plan.len(), 1);
-        assert!(nested_plan.finite_formula.root(0).is_none());
-        assert_eq!(nested_plan.leaves[0].path.0.as_ref(), [0, 0]);
-    }
-
-    #[test]
-    fn synthetic_formula_flattens_only_the_maximal_root_and() {
-        let arm = || shape_and(vec![shape_leaf(0), shape_leaf(0)]);
-        let union = UnionConstraint::new(vec![arm(), arm()]);
-        let root = IntersectionConstraint::new(vec![
-            shape_and(vec![shape_leaf(0), shape_leaf(0)]),
-            Box::new(union) as ShapeConstraint,
-        ]);
-        let plan = ResidualPlan::compile_whole_root_for_test(&root);
-        assert_eq!(plan.len(), 1);
-        assert!(plan.synthetic_root_formula);
-        let program = &plan.finite_formula;
-        let root = program.root(0).expect("synthetic formula has a root");
-        let FiniteFormulaNodeKind::And { children } = &program.node(root).kind else {
-            panic!("exposed root AND did not compile as AND")
-        };
-        assert_eq!(children.len(), 3, "direct nested AND was not flattened");
-        assert_eq!(program.node(children[0]).kind, FiniteFormulaNodeKind::Atom);
-        assert_eq!(program.node(children[1]).kind, FiniteFormulaNodeKind::Atom);
-
-        let FiniteFormulaNodeKind::Or {
-            children: union_arms,
-        } = &program.node(children[2]).kind
-        else {
-            panic!("the OR boundary disappeared")
-        };
-        assert_eq!(union_arms.len(), 2);
-        assert!(union_arms
-            .iter()
-            .all(|&arm| matches!(program.node(arm).kind, FiniteFormulaNodeKind::And { .. })));
-    }
-
-    #[test]
-    fn whole_root_scope_absorbs_union_leaf_lowering() {
-        let union = UnionConstraint::new(vec![shape_leaf(0), shape_leaf(0)]);
-        let root =
-            IntersectionConstraint::new(vec![shape_leaf(0), Box::new(union) as ShapeConstraint]);
-
-        let union_leaves = ResidualPlan::compile_production(&root);
-        assert!(!union_leaves.synthetic_root_formula);
-        assert_eq!(union_leaves.len(), 2);
-        assert!(union_leaves.finite_formula.root(0).is_none());
-        assert!(union_leaves.finite_formula.root(1).is_some());
-
-        let whole_root = ResidualPlan::compile_whole_root_for_test(&root);
-        assert!(whole_root.synthetic_root_formula);
-        assert_eq!(whole_root.len(), 1);
-        assert!(whole_root.finite_formula.root(0).is_some());
-        assert!(whole_root
-            .finite_formula
-            .nodes
-            .iter()
-            .any(|node| matches!(&node.kind, FiniteFormulaNodeKind::Or { .. })));
-    }
-
-    #[test]
-    fn synthetic_formula_repeated_occurrences_have_distinct_action_sites() {
-        let shared = Arc::new(CapabilityLeaf { variable: 0 });
-        let root = IntersectionConstraint::new(vec![shared.clone(), shared]);
-        let plan = ResidualPlan::compile_whole_root_for_test(&root);
-        let program = &plan.finite_formula;
-        let root = program.root(0).unwrap();
-        let FiniteFormulaNodeKind::And { children } = &program.node(root).kind else {
-            panic!("synthetic root is not AND")
-        };
-        assert_ne!(children[0], children[1]);
-        assert_ne!(
-            plan.formula_action_occurrence(children[0]),
-            plan.formula_action_occurrence(children[1])
-        );
-        assert_ne!(
-            program.node(children[0]).path,
-            program.node(children[1]).path
-        );
-    }
-
-    #[test]
     fn compiled_formula_proposals_discharge_outer_self_confirm_only_when_sources_do() {
         let leaf = |coverage| {
             Box::new(ReceiptLeaf {
@@ -19979,7 +16970,7 @@ mod tests {
             arm(ProposalCoverage::Exact, ProposalCoverage::Exact),
             arm(ProposalCoverage::Exact, ProposalCoverage::Exact),
         ]);
-        let exact_plan = ResidualPlan::compile_whole_root_for_test(&exact_root);
+        let exact_plan = ResidualPlan::compile_production(&exact_root);
         let exact_formula_root = exact_plan.finite_formula.root(0).unwrap();
         assert!(exact_plan.formula_proposal_discharges_outer_self_confirm(
             &exact_root,
@@ -20027,7 +17018,7 @@ mod tests {
             arm(ProposalCoverage::Exact, ProposalCoverage::Exact),
             arm(ProposalCoverage::Exact, ProposalCoverage::Covering),
         ]);
-        let covering_plan = ResidualPlan::compile_whole_root_for_test(&covering_root);
+        let covering_plan = ResidualPlan::compile_production(&covering_root);
         let covering_formula_root = covering_plan.finite_formula.root(0).unwrap();
         assert!(
             !covering_plan.formula_proposal_discharges_outer_self_confirm(
@@ -20038,23 +17029,6 @@ mod tests {
                 VariableSet::new_empty(),
             ),
             "one potentially selected Covering source keeps the outer self-check"
-        );
-
-        let exact_with_validator = IntersectionConstraint::new(vec![
-            leaf(ProposalCoverage::Exact),
-            leaf(ProposalCoverage::None),
-        ]);
-        let validator_plan = ResidualPlan::compile_whole_root_for_test(&exact_with_validator);
-        let validator_root = validator_plan.finite_formula.root(0).unwrap();
-        assert!(
-            validator_plan.formula_proposal_discharges_outer_self_confirm(
-                &exact_with_validator,
-                0,
-                validator_root,
-                0,
-                VariableSet::new_empty(),
-            ),
-            "the AND suffix runs a non-source validator without claiming composite Exact coverage"
         );
     }
 
@@ -20075,7 +17049,7 @@ mod tests {
             "confirming y may conservatively retain false positives while x is unbound"
         );
 
-        let make = || {
+        let make_arm = || {
             IntersectionConstraint::new(vec![
                 Box::new(FanoutLeaf {
                     variable: X,
@@ -20084,13 +17058,14 @@ mod tests {
                 Box::new(ConservativeEvenPair) as ShapeConstraint,
             ])
         };
+        let make = || UnionConstraint::new(vec![Box::new(make_arm()) as ShapeConstraint]);
 
         let root = make();
         assert_eq!(
             root.proposal_coverage(X, VariableSet::new_empty()),
             ProposalCoverage::Covering
         );
-        let plan = ResidualPlan::compile_whole_root_for_test(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let formula_root = plan.finite_formula.root(0).unwrap();
         assert!(
             plan.formula_proposal_discharges_outer_self_confirm(
@@ -20122,133 +17097,6 @@ mod tests {
             .collect();
         residual.sort_unstable();
         assert_eq!(residual, [(raw(0), raw(0)), (raw(2), raw(0))]);
-    }
-
-    #[test]
-    fn formula_proposal_streamability_accepts_only_linear_non_or_suffixes() {
-        fn start(plan: &ResidualPlan) -> FormulaProgramCounter {
-            plan.finite_formula.start(
-                0,
-                0,
-                UnionVerb::Propose {
-                    relevant: ChildSet::empty(plan.len()).with_inserted(0),
-                },
-            )
-        }
-
-        let linear_root = IntersectionConstraint::new(vec![
-            Box::new(CapabilityLeaf { variable: 0 }) as ShapeConstraint,
-            shape_and(vec![
-                Box::new(CapabilityLeaf { variable: 0 }),
-                Box::new(CapabilityLeaf { variable: 0 }),
-            ]),
-        ]);
-        let linear_plan = ResidualPlan::compile_whole_root_for_test(&linear_root);
-        let linear_start = start(&linear_plan);
-        let FiniteFormulaNodeKind::And { children } = &linear_plan
-            .finite_formula
-            .node(linear_plan.finite_formula.root(0).unwrap())
-            .kind
-        else {
-            panic!("synthetic conjunction did not compile as AND")
-        };
-        assert_eq!(children.len(), 3, "nested root AND should be flattened");
-        let linear_action = linear_plan
-            .finite_formula
-            .select_child_as_action(&linear_start, 0);
-        assert_eq!(
-            linear_plan.formula_proposal_streamability(&linear_action, VariableSet::new_empty(),),
-            FormulaProposalStreamability::Linear,
-            "ordinary weak confirmations form a relational continuation"
-        );
-
-        let ordinary_root = IntersectionConstraint::new(vec![
-            Box::new(CapabilityLeaf { variable: 0 }) as ShapeConstraint,
-            Box::new(CapabilityLeaf { variable: 0 }),
-        ]);
-        let ordinary_plan = ResidualPlan::compile_whole_root_for_test(&ordinary_root);
-        let ordinary_action = ordinary_plan
-            .finite_formula
-            .select_child_as_action(&start(&ordinary_plan), 0);
-        assert_eq!(
-            ordinary_plan
-                .formula_proposal_streamability(&ordinary_action, VariableSet::new_empty(),),
-            FormulaProposalStreamability::Linear,
-            "ordinary confirmation no longer needs a page-homomorphism capability"
-        );
-
-        let activation_reuse_root = IntersectionConstraint::new(vec![
-            Box::new(CapabilityLeaf { variable: 0 }) as ShapeConstraint,
-            Box::new(ParentAtomicProgramLeaf(CapabilityLeaf { variable: 0 })),
-        ]);
-        let activation_reuse_plan =
-            ResidualPlan::compile_whole_root_for_test(&activation_reuse_root);
-        let activation_reuse_action = activation_reuse_plan
-            .finite_formula
-            .select_child_as_action(&start(&activation_reuse_plan), 0);
-        assert_eq!(
-            activation_reuse_plan.formula_proposal_streamability(
-                &activation_reuse_action,
-                VariableSet::new_empty(),
-            ),
-            FormulaProposalStreamability::Barrier(
-                FormulaProposalStreamBarrier::ActivationReuse
-            )
-        );
-
-        let union = UnionConstraint::new(vec![
-            Box::new(CapabilityLeaf { variable: 0 }) as ShapeConstraint,
-            Box::new(CapabilityLeaf { variable: 0 }),
-        ]);
-        let union_plan = ResidualPlan::compile_whole_root_for_test(&union);
-        let union_action = union_plan
-            .finite_formula
-            .select_child_as_action(&start(&union_plan), 0);
-        assert_eq!(
-            union_plan.formula_proposal_streamability(&union_action, VariableSet::new_empty(),),
-            FormulaProposalStreamability::Barrier(FormulaProposalStreamBarrier::OrFrame)
-        );
-
-        let old_formula_plan = ResidualPlan::compile_production(&union);
-        let old_formula_action = old_formula_plan
-            .finite_formula
-            .select_child_as_action(&start(&old_formula_plan), 0);
-        assert_eq!(
-            old_formula_plan
-                .formula_proposal_streamability(&old_formula_action, VariableSet::new_empty(),),
-            FormulaProposalStreamability::Barrier(FormulaProposalStreamBarrier::OrFrame)
-        );
-    }
-
-    #[test]
-    fn formula_activation_reuse_barrier_depends_on_selected_program_route() {
-        let root = IntersectionConstraint::new(vec![
-            Box::new(CapabilityLeaf { variable: 0 }) as ShapeConstraint,
-            Box::new(ConditionalParentAtomicProgramLeaf {
-                variable: 0,
-                required: 1,
-            }),
-        ]);
-        let plan = ResidualPlan::compile_whole_root_for_test(&root);
-        let start = plan.finite_formula.start(
-            0,
-            0,
-            UnionVerb::Propose {
-                relevant: ChildSet::empty(plan.len()).with_inserted(0),
-            },
-        );
-        let action = plan.finite_formula.select_child_as_action(&start, 0);
-
-        assert_eq!(
-            plan.formula_proposal_streamability(&action, VariableSet::new_empty()),
-            FormulaProposalStreamability::Linear,
-            "an unselected route leaves the ordinary continuation pageable"
-        );
-        assert_eq!(
-            plan.formula_proposal_streamability(&action, VariableSet::new_singleton(1)),
-            FormulaProposalStreamability::Barrier(FormulaProposalStreamBarrier::ActivationReuse),
-            "selecting ParentAtomic retains the complete activation"
-        );
     }
 
     #[test]
@@ -20310,56 +17158,6 @@ mod tests {
             assert_eq!(arena.materialize(compact), *structural);
             assert_eq!(arena.grade(compact.pc), program.grade(structural));
         }
-
-        let and_root =
-            IntersectionConstraint::new(vec![shape_leaf(0), shape_leaf(0), shape_leaf(0)]);
-        let and_plan = ResidualPlan::compile_whole_root_for_test(&and_root);
-        let and_program = &and_plan.finite_formula;
-        let verb = UnionVerb::Propose {
-            relevant: ChildSet::empty(and_plan.len()).with_inserted(0),
-        };
-        let mut and_arena = FormulaPcInterner::default();
-        let mut run_prefix = |order: [usize; 2]| {
-            let mut structural = and_program.start(0, 0, verb.clone());
-            let mut compact = and_arena.start(and_program, 0, 0, verb.clone());
-            assert_equivalent(and_program, &and_arena, compact, &structural);
-            for child in order {
-                structural = and_program.select_child_as_action(&structural, child);
-                compact = compact.with_pc(and_arena.select_child_as_action(
-                    and_program,
-                    compact.pc,
-                    child,
-                ));
-                assert_equivalent(and_program, &and_arena, compact, &structural);
-
-                let structural_complete = and_program.complete(&structural);
-                let compact_complete = compact.with_pc(and_arena.complete(and_program, compact.pc));
-                assert_equivalent(
-                    and_program,
-                    &and_arena,
-                    compact_complete,
-                    &structural_complete,
-                );
-                let FormulaSuccessor::Formula(next_structural) =
-                    and_program.resume(&structural_complete)
-                else {
-                    panic!("a two-child prefix completed a three-child root")
-                };
-                let Ok(InternedFormulaSuccessor::Formula(next_compact)) =
-                    and_arena.resume_completed(and_program, compact_complete)
-                else {
-                    panic!("a compact two-child prefix completed a three-child root")
-                };
-                structural = next_structural;
-                compact = next_compact;
-                assert_equivalent(and_program, &and_arena, compact, &structural);
-            }
-            (structural, compact)
-        };
-        let (left_first, left_first_id) = run_prefix([0, 1]);
-        let (right_first, right_first_id) = run_prefix([1, 0]);
-        assert_eq!(left_first, right_first);
-        assert_eq!(left_first_id, right_first_id);
 
         let or_root = UnionConstraint::new(vec![shape_leaf(0), shape_leaf(0)]);
         let or_plan = ResidualPlan::compile_production(&or_root);
@@ -20450,8 +17248,6 @@ mod tests {
             }
         ));
         assert!(program.grade(&guard) > program.grade(&start));
-        assert!(!plan.formula_uses_candidate_pages(&guard, VariableSet::new_empty(),));
-
         let guard_complete = program.complete(&guard);
         assert!(program.grade(&guard_complete) > program.grade(&guard));
         let FormulaSuccessor::Guard { parent, child } = program.resume(&guard_complete) else {
@@ -22763,369 +19559,6 @@ mod tests {
     }
 
     #[test]
-    fn formula_and_live_filing_set_admits_parent_local_candidates() {
-        let root = IntersectionConstraint::new(vec![
-            Box::new(CapabilityLeaf { variable: 0 }) as ShapeConstraint,
-            Box::new(CapabilityLeaf { variable: 0 }),
-            Box::new(CapabilityLeaf { variable: 0 }),
-        ]);
-        let plan = ResidualPlan::compile_whole_root_for_test(&root);
-        let program = &plan.finite_formula;
-        let formula_root = program.root(0).expect("synthetic formula has a root");
-        let mut interner = StateInterner::default();
-        let relevant = ChildSet::empty(plan.len()).with_inserted(0);
-        let start = interner.start_formula(
-            program,
-            0,
-            0,
-            UnionVerb::Propose {
-                relevant: relevant.clone(),
-            },
-        );
-        let action = start.with_pc(
-            interner
-                .formula_pcs
-                .select_child_as_action(program, start.pc, 0),
-        );
-        let completed = action.with_pc(interner.formula_pcs.complete(program, action.pc));
-        let Ok(InternedFormulaSuccessor::Formula(next)) =
-            interner.formula_pcs.resume_completed(program, completed)
-        else {
-            panic!("the root proposer did not return to its AND suffix")
-        };
-        let previous = StateDesc {
-            bound: VariableSet::new_empty(),
-            phase: ResidualPhase::Formula { cursor: action },
-        };
-        let successor = StateDesc {
-            bound: VariableSet::new_empty(),
-            phase: ResidualPhase::Formula { cursor: next },
-        };
-        assert!(crosses_candidate_set_boundary(
-            &previous,
-            &successor,
-            &plan,
-            &interner.formula_pcs,
-        ));
-
-        let mut batch = FormulaBatch::from_proposal(
-            RowBatch {
-                rows: Vec::new(),
-                row_count: 2,
-            },
-            vec![ActivationId(0), ActivationId(1)],
-            &program.node(formula_root).kind,
-        );
-        batch.apply_action_result(
-            FormulaStage::Propose,
-            candidate_payload(
-                2,
-                vec![
-                    (0, raw(1)),
-                    (0, raw(2)),
-                    (0, raw(1)),
-                    (1, raw(1)),
-                    (1, raw(1)),
-                    (1, raw(3)),
-                ],
-            ),
-        );
-        let mut worklist = Worklist::new();
-        let mut stats = ResidualStateStats {
-            candidates_proposed: 6,
-            ..ResidualStateStats::default()
-        };
-        let mut reducer_seeds = Vec::new();
-        let continuation = continue_formula_transition(
-            &plan,
-            &previous,
-            next,
-            batch,
-            &mut worklist,
-            &mut interner,
-            &mut stats,
-            &mut reducer_seeds,
-        )
-        .expect("the live AND suffix was not filed");
-        assert!(reducer_seeds.is_empty());
-        assert_eq!(interner.get(continuation.state), &successor);
-        let StateBucket::Formula(filed) = worklist
-            .get(&continuation.rank)
-            .and_then(|level| level.get(&continuation.state))
-            .expect("the continuation receipt lost its formula batch")
-        else {
-            panic!("the Formula continuation filed the wrong payload shape")
-        };
-        assert_eq!(
-            filed.input().iter().collect::<Vec<_>>(),
-            [
-                (0, raw(2)),
-                (0, raw(1)),
-                (1, raw(1)),
-                (1, raw(3)),
-            ],
-            "tail order is stable, duplicates are parent-local, and equal values under distinct parents survive",
-        );
-
-        let raw_occurrences = vec![
-            (0, raw(1)),
-            (0, raw(2)),
-            (0, raw(1)),
-            (1, raw(1)),
-            (1, raw(1)),
-            (1, raw(3)),
-        ];
-        let mut deferred = FormulaBatch::from_proposal(
-            RowBatch {
-                rows: Vec::new(),
-                row_count: 2,
-            },
-            vec![ActivationId(2), ActivationId(3)],
-            &program.node(formula_root).kind,
-        );
-        deferred.apply_action_result(
-            FormulaStage::Propose,
-            deferred_candidate_payload(2, raw_occurrences.clone()),
-        );
-        let mut deferred_worklist = Worklist::new();
-        let mut deferred_seeds = Vec::new();
-        assert!(continue_formula_transition(
-            &plan,
-            &previous,
-            next,
-            deferred,
-            &mut deferred_worklist,
-            &mut interner,
-            &mut stats,
-            &mut deferred_seeds,
-        )
-        .is_none());
-        assert!(
-            deferred_worklist.is_empty(),
-            "a segmented occurrence bag became independently schedulable before SET admission"
-        );
-        let [FormulaReducerSeed::SetAdmit(SetAdmissionSeed {
-            successor: queued,
-            destination: SetAdmissionDestination::Formula(queued_batch),
-        })] = deferred_seeds.as_slice()
-        else {
-            panic!("the deferred Formula boundary did not queue one exact SET admission")
-        };
-        assert_eq!(queued, &successor);
-        assert!(matches!(
-            queued_batch.input(),
-            CandidatePayload::Deferred(_)
-        ));
-        assert_eq!(
-            queued_batch.input().iter().collect::<Vec<_>>(),
-            raw_occurrences,
-            "queueing bounded admission must not materialize or mutate its occurrence rope",
-        );
-
-        let mut scheduler = DeltaScheduler::new();
-        let seeded = scheduler.seed_formula_reducers(
-            deferred_seeds,
-            &plan,
-            &mut deferred_worklist,
-            &mut interner,
-            &mut stats,
-        );
-        assert!(seeded.active.is_some());
-        assert!(
-            deferred_worklist.is_empty(),
-            "SET admission exposed a partial Formula relation before EOF"
-        );
-        for _ in 0..32 {
-            if scheduler.is_empty() {
-                break;
-            }
-            let _ = scheduler.step(
-                &root,
-                &plan,
-                1,
-                &mut deferred_worklist,
-                &mut interner,
-                &mut stats,
-            );
-        }
-        assert!(
-            scheduler.is_empty(),
-            "unit grants did not drain SET admission"
-        );
-        let StateBucket::Formula(admitted) = deferred_worklist
-            .values()
-            .flat_map(BTreeMap::values)
-            .next()
-            .expect("SET admission failed to file the saved Formula successor")
-        else {
-            panic!("SET admission returned the wrong Formula payload shape")
-        };
-        assert!(matches!(admitted.input(), CandidatePayload::Deferred(_)));
-        let mut by_activation: BTreeMap<ActivationId, Vec<RawInline>> = BTreeMap::new();
-        for (parent, candidate) in admitted.input().iter() {
-            by_activation
-                .entry(admitted.activations[parent as usize])
-                .or_default()
-                .push(candidate);
-        }
-        assert_eq!(
-            by_activation[&ActivationId(2)],
-            [raw(2), raw(1)],
-            "the first affine activation lost its parent-local tail order",
-        );
-        assert_eq!(
-            by_activation[&ActivationId(3)],
-            [raw(1), raw(3)],
-            "the second affine activation lost its parent-local tail order",
-        );
-        assert_eq!(
-            stats.candidates_proposed, 6,
-            "SET admission must not rewrite raw Formula action telemetry",
-        );
-    }
-
-    #[test]
-    fn formula_outer_candidate_return_reuses_the_pre_admitted_relation() {
-        let root = IntersectionConstraint::new(vec![
-            Box::new(CapabilityLeaf { variable: 0 }) as ShapeConstraint,
-            Box::new(CapabilityLeaf { variable: 0 }),
-        ]);
-        let plan = ResidualPlan::compile_whole_root_for_test(&root);
-        let program = &plan.finite_formula;
-        let mut interner = StateInterner::default();
-        let relevant = ChildSet::empty(plan.len()).with_inserted(0);
-        let start = interner.start_formula(
-            program,
-            0,
-            0,
-            UnionVerb::Propose {
-                relevant: relevant.clone(),
-            },
-        );
-        let proposer = start.with_pc(
-            interner
-                .formula_pcs
-                .select_child_as_action(program, start.pc, 0),
-        );
-        let proposer_complete =
-            proposer.with_pc(interner.formula_pcs.complete(program, proposer.pc));
-        let Ok(InternedFormulaSuccessor::Formula(confirm_plan)) = interner
-            .formula_pcs
-            .resume_completed(program, proposer_complete)
-        else {
-            panic!("the root proposer did not return to confirmation planning")
-        };
-        let confirmer = confirm_plan.with_pc(interner.formula_pcs.select_child_as_action(
-            program,
-            confirm_plan.pc,
-            1,
-        ));
-        let previous = StateDesc {
-            bound: VariableSet::new_empty(),
-            phase: ResidualPhase::Formula { cursor: confirmer },
-        };
-        let exit = confirmer.exit;
-        let outer = StateDesc {
-            bound: VariableSet::new_empty(),
-            phase: ResidualPhase::Candidate {
-                variable: 0,
-                relevant: relevant.clone(),
-                checked: relevant,
-            },
-        };
-        assert!(!crosses_candidate_set_boundary(
-            &previous,
-            &outer,
-            &plan,
-            &interner.formula_pcs,
-        ));
-
-        let candidate = CandidateBatch {
-            parents: RowBatch {
-                rows: Vec::new(),
-                row_count: 2,
-            },
-            candidates: candidate_payload(
-                2,
-                vec![(0, raw(5)), (0, raw(4)), (1, raw(6)), (1, raw(4))],
-            ),
-        };
-        let mut worklist = Worklist::new();
-        let mut stats = ResidualStateStats {
-            candidates_confirmed: 4,
-            ..ResidualStateStats::default()
-        };
-        let mut reducer_seeds = Vec::new();
-        let continuation = finish_formula_candidate_transition(
-            &plan,
-            &previous,
-            exit,
-            candidate,
-            &mut worklist,
-            &mut interner,
-            &mut stats,
-            &mut reducer_seeds,
-        )
-        .expect("the outer Formula result was not filed");
-        assert!(reducer_seeds.is_empty());
-        assert_eq!(interner.get(continuation.state), &outer);
-        let StateBucket::Candidates(filed) = worklist
-            .get(&continuation.rank)
-            .and_then(|level| level.get(&continuation.state))
-            .expect("the continuation receipt lost its candidate batch")
-        else {
-            panic!("the outer Formula result filed the wrong payload shape")
-        };
-        assert_eq!(
-            filed.candidates.iter().collect::<Vec<_>>(),
-            [(0, raw(5)), (0, raw(4)), (1, raw(6)), (1, raw(4)),],
-        );
-
-        let raw_occurrences = vec![(0, raw(5)), (0, raw(4)), (1, raw(6)), (1, raw(4))];
-        let deferred = CandidateBatch {
-            parents: RowBatch {
-                rows: Vec::new(),
-                row_count: 2,
-            },
-            candidates: deferred_candidate_payload(2, raw_occurrences.clone()),
-        };
-        let mut deferred_worklist = Worklist::new();
-        let mut deferred_seeds = Vec::new();
-        let deferred_continuation = finish_formula_candidate_transition(
-            &plan,
-            &previous,
-            exit,
-            deferred,
-            &mut deferred_worklist,
-            &mut interner,
-            &mut stats,
-            &mut deferred_seeds,
-        )
-        .expect("an already admitted segmented relation should file directly");
-        assert!(
-            deferred_seeds.is_empty(),
-            "an already admitted relation must not open redundant SET admission"
-        );
-        assert_eq!(interner.get(deferred_continuation.state), &outer);
-        let StateBucket::Candidates(queued_batch) = deferred_worklist
-            .get(&deferred_continuation.rank)
-            .and_then(|level| level.get(&deferred_continuation.state))
-            .expect("the deferred relation was not filed")
-        else {
-            panic!("the deferred relation changed payload shape")
-        };
-        assert_eq!(
-            queued_batch.candidates.iter().collect::<Vec<_>>(),
-            raw_occurrences,
-            "filing must not mutate the pre-admitted occurrence rope",
-        );
-        assert_eq!(
-            stats.candidates_confirmed, 4,
-            "filing must not rewrite raw Formula action telemetry",
-        );
-    }
-
-    #[test]
     fn relational_candidate_state_uses_candidate_occupancy_and_keeps_remainder_live() {
         let root = IntersectionConstraint::new(vec![
             CapabilityLeaf { variable: 0 },
@@ -24277,76 +20710,8 @@ mod tests {
         )
     }
 
-    fn root_formula_paged_filter_first_trace(
-        accepted: RawInline,
-    ) -> (
-        Option<RawInline>,
-        Vec<usize>,
-        Vec<usize>,
-        ResidualStateStats,
-        usize,
-    ) {
-        let first_calls = Arc::new(Mutex::new(Vec::new()));
-        let second_calls = Arc::new(Mutex::new(Vec::new()));
-        let root = paged_filter_fixture(
-            (0..64).map(raw).collect(),
-            accepted,
-            Arc::clone(&first_calls),
-            Arc::clone(&second_calls),
-        );
-        let mut lazy = Query::new(root, |binding: &Binding| binding.get(0).copied())
-            .solve_residual_state_lazy();
-        lazy.plan = ResidualPlan::compile_whole_root_for_test(&lazy.root);
-        lazy.state = ResidualStateMachine::new_for_plan(
-            lazy.root.variables(),
-            &lazy.plan,
-            Some(FrameSeedRow::empty()),
-        );
-        let mut lazy = lazy.cap(64);
-        let result = lazy.next();
-        let first = first_calls.lock().unwrap().clone();
-        let second = second_calls.lock().unwrap().clone();
-        (
-            result,
-            first,
-            second,
-            lazy.stats().clone(),
-            lazy.current_width(),
-        )
-    }
-
     #[test]
-    fn synthetic_root_formula_width_one_preserves_candidate_descent() {
-        let (result, first_calls, second_calls, stats, width) =
-            root_formula_paged_filter_first_trace(raw(63));
-        assert_eq!(result, Some(raw(63)));
-        assert_eq!(first_calls, [1]);
-        assert_eq!(second_calls, [1]);
-        assert_eq!(stats.candidates_proposed, 64);
-        assert_eq!(stats.candidates_confirmed, 2);
-        assert_eq!(stats.max_confirm_candidates, 1);
-        assert_eq!(stats.partial_pops, 1);
-        assert_eq!(width, 1, "terminal emission must not widen search S");
-    }
-
-    #[test]
-    fn synthetic_root_formula_grows_candidate_page_misses_geometrically() {
-        for (accepted, expected) in [(raw(0), Some(raw(0))), (raw(255), None)] {
-            let (result, first_calls, second_calls, stats, width) =
-                root_formula_paged_filter_first_trace(accepted);
-            assert_eq!(result, expected);
-            assert_eq!(first_calls, [1, 2, 4, 8, 16, 32, 1]);
-            assert_eq!(second_calls, [1, 2, 4, 8, 16, 32, 1]);
-            assert_eq!(stats.candidates_proposed, 64);
-            assert_eq!(stats.candidates_confirmed, 128);
-            assert_eq!(stats.max_confirm_candidates, 32);
-            assert_eq!(stats.width_increases, 6);
-            assert_eq!(width, 64);
-        }
-    }
-
-    #[test]
-    fn synthetic_root_formula_matches_atom_or_and_alternation_oracles() {
+    fn production_residual_matches_atom_or_and_alternation_oracles() {
         let project = |binding: &Binding| binding.get(0).copied();
 
         let atom = || FanoutLeaf {
@@ -24413,7 +20778,7 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_root_formula_preserves_zero_variable_boundaries() {
+    fn production_residual_preserves_zero_variable_boundaries() {
         for truth in [false, true] {
             let expected = if truth { vec![()] } else { Vec::new() };
             let actual = Query::new(ZeroVariableTruth(truth), |_| Some(()))
@@ -27923,7 +24288,7 @@ mod tests {
     }
 
     #[test]
-    fn coalesced_candidate_page_receipts_track_candidate_and_formula_tails() {
+    fn coalesced_candidate_page_receipts_track_candidate_tails() {
         let coalesce = |first, second| {
             let mut receipt = None;
             prefer_continuation(&mut receipt, first);
@@ -28005,107 +24370,6 @@ mod tests {
         };
         assert_eq!(remainder.parents.row_count, 1);
         assert_eq!(remainder.candidates, [(0, raw(10))]);
-
-        let formula_root = IntersectionConstraint::new(vec![
-            CapabilityLeaf { variable: 0 },
-            CapabilityLeaf { variable: 0 },
-        ]);
-        let formula_plan = ResidualPlan::compile_whole_root_for_test(&formula_root);
-        let relevant = ChildSet::empty(formula_plan.len()).with_inserted(0);
-        let mut formula_machine =
-            ResidualStateMachine::new_for_plan(formula_root.variables(), &formula_plan, None);
-        let start = formula_machine.interner.start_formula(
-            &formula_plan.finite_formula,
-            0,
-            0,
-            UnionVerb::Propose { relevant },
-        );
-        let action = start.with_pc(formula_machine.interner.formula_pcs.select_child_as_action(
-            &formula_plan.finite_formula,
-            start.pc,
-            0,
-        ));
-        let completed = action.with_pc(
-            formula_machine
-                .interner
-                .formula_pcs
-                .complete(&formula_plan.finite_formula, action.pc),
-        );
-        let Ok(InternedFormulaSuccessor::Formula(cursor)) = formula_machine
-            .interner
-            .formula_pcs
-            .resume_completed(&formula_plan.finite_formula, completed)
-        else {
-            panic!("root AND proposer did not return to its confirmation suffix")
-        };
-        let formula_desc = StateDesc {
-            bound: VariableSet::new_empty(),
-            phase: ResidualPhase::Formula { cursor },
-        };
-        assert!(
-            formula_desc.uses_candidate_pages(&formula_plan, &formula_machine.interner.formula_pcs)
-        );
-        let formula_bucket = |activations, row_count, current| {
-            StateBucket::Formula(FormulaBatch {
-                activations,
-                parents: RowBatch {
-                    rows: Vec::new(),
-                    row_count,
-                },
-                cells: vec![FormulaLiveCell::Current(candidate_payload(
-                    row_count, current,
-                ))],
-            })
-        };
-        let first = file_with_plan(
-            &mut formula_machine.worklist,
-            &mut formula_machine.interner,
-            &formula_plan,
-            formula_desc.clone(),
-            formula_bucket(vec![ActivationId(10)], 1, vec![(0, raw(10)), (0, raw(11))]),
-            &mut formula_machine.stats,
-        );
-        let second = file_with_plan(
-            &mut formula_machine.worklist,
-            &mut formula_machine.interner,
-            &formula_plan,
-            formula_desc,
-            formula_bucket(
-                vec![ActivationId(11), ActivationId(12)],
-                2,
-                vec![(0, raw(12)), (1, raw(13)), (1, raw(14))],
-            ),
-            &mut formula_machine.stats,
-        );
-        let formula_receipt = coalesce(first, second);
-        assert_eq!(formula_receipt.rows, 3);
-        assert_eq!(formula_receipt.candidates, 5);
-
-        let task = formula_machine.take_continuation(
-            &formula_plan,
-            ActiveContinuation::cohort(formula_receipt),
-            8,
-        );
-        let StateBucket::Formula(page) = task.bucket else {
-            panic!("formula-page receipt changed payload shape")
-        };
-        assert_eq!(
-            page.activations,
-            [ActivationId(10), ActivationId(11), ActivationId(12)]
-        );
-        assert_eq!(page.parents.row_count, 3);
-        assert_eq!(
-            page.input().iter().collect::<Vec<_>>(),
-            vec![
-                (0, raw(10)),
-                (0, raw(11)),
-                (1, raw(12)),
-                (2, raw(13)),
-                (2, raw(14)),
-            ]
-        );
-        assert_eq!(formula_machine.stats.underfilled_continuation_pops, 1);
-        assert!(formula_machine.worklist.is_empty());
     }
 
     #[test]
@@ -28759,7 +25023,7 @@ mod tests {
                 assert!(batch.candidates.is_values());
                 assert!(batch.candidates.iter().all(|(parent, _)| parent == 0));
             }
-            StateBucket::Rows(_) | StateBucket::QuotedRows(_) | StateBucket::Formula(_) => {
+            StateBucket::Rows(_) | StateBucket::Formula(_) => {
                 panic!("confirmation returned a non-candidate payload")
             }
         }
@@ -28794,7 +25058,7 @@ mod tests {
                     Some(1)
                 );
             }
-            StateBucket::Rows(_) | StateBucket::QuotedRows(_) | StateBucket::Formula(_) => {
+            StateBucket::Rows(_) | StateBucket::Formula(_) => {
                 panic!("confirmation returned a non-candidate payload")
             }
         }
@@ -28946,11 +25210,11 @@ mod tests {
 
     #[test]
     fn formula_confirmation_reuses_the_pre_admitted_candidate_relation() {
-        let root = IntersectionConstraint::new(vec![
-            CapabilityLeaf { variable: 0 },
-            CapabilityLeaf { variable: 0 },
-        ]);
-        let plan = ResidualPlan::compile_whole_root_for_test(&root);
+        let root = UnionConstraint::new(vec![Box::new(IntersectionConstraint::new(vec![
+            Box::new(CapabilityLeaf { variable: 0 }) as ShapeConstraint,
+            Box::new(CapabilityLeaf { variable: 0 }) as ShapeConstraint,
+        ])) as ShapeConstraint]);
+        let plan = ResidualPlan::compile_production(&root);
         let relevant = ChildSet::empty(plan.len()).with_inserted(0);
         let checked = ChildSet::empty(plan.len());
         let desc = StateDesc {
