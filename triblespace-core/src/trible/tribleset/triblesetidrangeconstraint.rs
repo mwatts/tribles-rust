@@ -571,14 +571,14 @@ mod tests {
             (entity.index, &entity_range as &dyn Constraint<'_>),
             (attribute.index, &attribute_range as &dyn Constraint<'_>),
         ] {
-            let route = constraint
+            assert!(constraint
                 .residual_program()
                 .expect("id ranges expose their ordered frontier as a typed Program")
                 .route(ProgramRequest {
                     action: ProgramAction::Propose(variable),
                     bound: VariableSet::new_empty(),
                 })
-                .expect("the unbound id range has a Program route");
+                .is_some());
         }
 
         let entity_expected = [

@@ -2439,12 +2439,12 @@ mod typed_program_tests {
                 bound: empty,
             })
             .unwrap();
-        let support = program
+        assert!(program
             .route(ProgramRequest {
                 action: ProgramAction::Support,
                 bound: empty,
             })
-            .unwrap();
+            .is_some());
         let mut attribute_bound = empty;
         attribute_bound.set(a.index);
         let resolved = program

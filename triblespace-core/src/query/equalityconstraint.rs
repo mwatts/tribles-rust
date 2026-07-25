@@ -43,13 +43,6 @@ impl EqualityConstraint {
             None
         }
     }
-
-    fn support_row(&self, view: &RowsView<'_>, row: &[RawInline]) -> bool {
-        match (view.col(self.a), view.col(self.b)) {
-            (Some(a), Some(b)) => row[a] == row[b],
-            _ => true,
-        }
-    }
 }
 
 impl<'c> Constraint<'c> for EqualityConstraint {

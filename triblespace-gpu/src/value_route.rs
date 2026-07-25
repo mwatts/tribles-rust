@@ -1865,18 +1865,18 @@ mod tests {
             Variable::<GenId>::new(2),
             resident.archive(),
         );
-        let canonical_propose = canonical
+        assert!(canonical
             .route(ProgramRequest {
                 action: ProgramAction::Propose(2),
                 bound: bound(&[0]),
             })
-            .expect("canonical fallback owns insufficiently bound proposal");
-        let canonical_confirm = canonical
+            .is_some());
+        assert!(canonical
             .route(ProgramRequest {
                 action: ProgramAction::Confirm(2),
                 bound: bound(&[0, 1]),
             })
-            .expect("canonical fallback owns declined confirmation");
+            .is_some());
 
         // Constant entity and attribute: the route needs no bound variables.
         let (_, entities, attributes) = fixture();

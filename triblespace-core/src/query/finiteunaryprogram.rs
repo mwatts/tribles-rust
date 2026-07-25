@@ -260,7 +260,6 @@ pub fn step(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query::VariableSet;
 
     #[test]
     fn ordinal_proposal_progress_strictly_descends() {

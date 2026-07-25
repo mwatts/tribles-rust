@@ -764,14 +764,14 @@ mod tests {
         let patch = id_patch(&[0xf0, 0x10, 0x80, 0x10]);
         let variable = Variable::<GenId>::new(0);
         let constraint = PatchIdConstraint::new(variable, patch.clone());
-        let route = constraint
+        assert!(constraint
             .residual_program()
             .unwrap()
             .route(ProgramRequest {
                 action: ProgramAction::Propose(variable.index),
                 bound: VariableSet::new_empty(),
             })
-            .unwrap();
+            .is_some());
         let direct = bounded_proposal(|cursor, limit, values| {
             constraint.proposal_page(cursor, limit, values)
         });
