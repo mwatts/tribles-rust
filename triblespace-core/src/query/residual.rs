@@ -16946,7 +16946,6 @@ mod tests {
     struct PanicLeaf {
         variable: VariableId,
         phase: PanicPhase,
-        estimate_calls: Arc<AtomicUsize>,
     }
 
     impl Constraint<'static> for PanicLeaf {
@@ -16971,8 +16970,7 @@ mod tests {
             if variable != self.variable {
                 return false;
             }
-            let call = self.estimate_calls.fetch_add(1, Ordering::Relaxed);
-            if matches!(self.phase, PanicPhase::Planning) && call != 0 {
+            if matches!(self.phase, PanicPhase::Planning) {
                 panic!("intentional residual planning panic");
             }
             out.fill(1, view.len());
@@ -17001,11 +16999,7 @@ mod tests {
     }
 
     fn panic_leaf(phase: PanicPhase) -> PanicLeaf {
-        PanicLeaf {
-            variable: 0,
-            phase,
-            estimate_calls: Arc::new(AtomicUsize::new(0)),
-        }
+        PanicLeaf { variable: 0, phase }
     }
 
     #[derive(Clone)]
