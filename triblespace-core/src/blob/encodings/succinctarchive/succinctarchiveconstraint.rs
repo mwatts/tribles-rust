@@ -1293,7 +1293,6 @@ where
             stratum: ProgramStratum::Finite,
             grouping: ProgramGrouping::PageLocal,
             completion: ProgramCompletion::PageableOnly,
-            exposure: ProgramExposure::Production,
         })
     }
 
@@ -2491,9 +2490,6 @@ mod typed_program_tests {
         assert_eq!(propose.stratum, ProgramStratum::Finite);
         assert_eq!(propose.grouping, ProgramGrouping::PageLocal);
         assert_eq!(propose.completion, ProgramCompletion::PageableOnly);
-        assert_eq!(propose.exposure, ProgramExposure::Production);
-        assert_eq!(confirm.exposure, ProgramExposure::Production);
-        assert_eq!(support.exposure, ProgramExposure::Production);
         assert!(program
             .route(ProgramRequest {
                 action: ProgramAction::Propose(e.index),

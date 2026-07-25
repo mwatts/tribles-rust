@@ -290,7 +290,7 @@ automatic placement would still make a latency claim the runtime cannot uphold.
 
 The public parallel entry uses the same fixed production plan as serial
 queries: native AND flattening, finite Union-leaf continuations, and
-production-qualified Programs.
+the typed Program route returned for each action.
 
 The production rollup type is
 `triblespace_core::repo::index_home::AcceleratedSuccinctRollup<WgpuWaveletFreeze>`:

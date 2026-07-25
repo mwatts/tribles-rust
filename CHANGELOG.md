@@ -13,17 +13,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The ten never-shipped residual pager, seed, and expansion hooks are removed
   from `Constraint`, together with their source/transition queues, descriptor
   registry lane, and forwarding adapters. A selected typed Program enters the
-  affine scheduler; a non-production or structurally absent route uses the
-  ordinary constraint action. Custom constraints that need resumable work
-  implement a typed Program instead of a second residual protocol.
-- **Built-in finite proposal sources now use one Production typed Program
+  affine scheduler; a structurally absent route uses the ordinary constraint
+  action. Custom constraints that need resumable work implement a typed Program
+  instead of a second residual protocol.
+- **Built-in finite proposal sources now use one typed Program
   pager.** PATCH value/ID membership, sorted slices, SuccinctArchive and
   TribleSet patterns and ranges, and UnionArchive use the same typed paging
   substrate.
 - **Breaking: ordinary queries now have one fixed residual compiler policy.**
   Serial iteration, ordinary Rayon iteration, saturated parallel iteration,
   and private RPQ subframes all compile native AND regions with finite
-  Union-leaf continuations and production-qualified typed Programs.
+  Union-leaf continuations and the typed Programs returned for each action.
   `Query::residual_lowering`, `ResidualLowering`, `FormulaScope`,
   `ProgramScope`, and `solve_residual_state_lazy_with` are removed rather than
   retained as never-shipped compatibility or tuning surfaces.
@@ -153,12 +153,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   activation membership once. Every checked path validates owners before
   deleting novelty in original receipt order, removing the activation-count
   multiplier without taxing insert/take.
-- **Canonical Succinct archive paging is production-qualified.** Propose,
-  Confirm, and Support routes participate in ordinary production execution, keeping
-  their typed paging and physical-backend seam available through the one
-  production plan.
-- **Typed `UnionArchive` Propose and Support are `Production`; Confirm remains
-  `Explicit`.** Ordinary production execution keeps sparse, geometrically
+- **Canonical Succinct archive paging is selected directly.** Propose, Confirm,
+  and Support routes participate in ordinary execution, keeping their typed
+  paging and physical-backend seam available through the one plan.
+- **`UnionArchive` returns typed Propose and Support routes and declines
+  Confirm.** Ordinary execution keeps sparse, geometrically
   widened paging for low-demand and nonterminal work. A fresh multi-parent
   terminal Propose cohort may instead use its `CompleteActionEquivalent`
   certificate, preserving the exact parent-major then shard-major raw
@@ -180,31 +179,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   targets, and multi-shard UnionArchive constraints remain on raw-cardinality
   estimates.
 - **Finite equality work and pointwise TribleSet checks stay on the ordinary
-  production path, while TribleSet proposal cursors remain production-resumable.**
-  Equality Propose, Confirm, and Support plus TribleSet Confirm and Support are
-  explicitly non-production Program routes: ordinary execution uses their
-  already bounded kernels, while direct Program tests retain representation
-  coverage.
-  TribleSet Propose remains production-qualified and pageable for low-demand
+  path, while TribleSet proposal cursors remain resumable.** Equality exposes
+  no typed Program. TribleSet declines typed Confirm and Support, so ordinary
+  execution uses their already bounded kernels.
+  TribleSet Propose remains pageable for low-demand
   and high-fanout work. For multi-parent terminal cohorts, its exact complete
   occurrence-bag certificate lets the geometrically widened scheduler drain a
   batch without opening one Program activation per parent.
 - **Hash-set and hash-map membership filters stay on the ordinary production
   residual path.** Their pointwise Confirm and Support work is already bounded
-  by the scheduler's input page, so production execution does not expand each cheap hash
-  lookup into a typed Program activation. Direct Program tests retain
-  representation coverage for the filter-only routes.
+  by the scheduler's input page, so production execution does not expand each
+  cheap hash lookup into a typed Program activation. They expose no typed
+  Program.
 - **Ordinary residual queries use one production structural policy.** Exposed
   associative AND regions are flattened into residual occurrences, finite
-  Union leaves become formula continuations, and production-qualified typed
-  Programs such as regular-path execution are enabled. Explicit Program
-  routes stay on the ordinary constraint protocol.
-- **Typed Program selection now has an explicit exposure policy.** Every route
-  is `Production` or `Explicit`. The one production compiler selects only
-  `Production`; absence and explicit-only exposure both use the stable ordinary
-  action and never inherit typed grouping or a stronger Program receipt.
-  Custom typed Program specs must classify each returned route with a
-  `ProgramExposure`.
+  Union leaves become formula continuations, and typed Programs such as
+  regular-path execution are enabled when they return a route for the exact
+  action. An absent route uses the ordinary constraint protocol and cannot
+  inherit typed grouping or a stronger Program receipt.
 - **Cyclic Confirm actions now cross the same parent-local SET boundary as
   ordinary actions.** Graph traversal retains the immutable original
   occurrence bag and raw confirmation telemetry until its complete result

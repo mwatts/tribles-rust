@@ -69,7 +69,6 @@ fn patch_program_route(
         stratum: super::ProgramStratum::Finite,
         grouping: super::ProgramGrouping::PageLocal,
         completion: super::ProgramCompletion::PageableOnly,
-        exposure: super::ProgramExposure::Production,
     })
 }
 
@@ -622,8 +621,8 @@ mod tests {
     use crate::patch::Entry;
     use crate::query::intersectionconstraint::IntersectionConstraint;
     use crate::query::{
-        Binding, ProgramAction, ProgramCompletion, ProgramExposure, ProgramGrouping,
-        ProgramRequest, ProgramStratum, Query, TypedProgramSpec,
+        Binding, ProgramAction, ProgramCompletion, ProgramGrouping, ProgramRequest, ProgramStratum,
+        Query, TypedProgramSpec,
     };
 
     use super::*;
@@ -715,7 +714,6 @@ mod tests {
         assert_eq!(route.stratum, ProgramStratum::Finite);
         assert_eq!(route.grouping, ProgramGrouping::PageLocal);
         assert_eq!(route.completion, ProgramCompletion::PageableOnly);
-        assert_eq!(route.exposure, ProgramExposure::Production);
         assert!(
             constraint.progress(&PatchProgramState::Propose {
                 cursor: ResidualDeltaSourceCursor::Start,
@@ -774,7 +772,6 @@ mod tests {
                 bound: VariableSet::new_empty(),
             })
             .unwrap();
-        assert_eq!(route.exposure, ProgramExposure::Production);
         let direct = bounded_proposal(|cursor, limit, values| {
             constraint.proposal_page(cursor, limit, values)
         });

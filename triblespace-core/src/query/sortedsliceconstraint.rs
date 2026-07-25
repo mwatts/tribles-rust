@@ -175,7 +175,6 @@ where
             stratum: ProgramStratum::Finite,
             grouping: ProgramGrouping::PageLocal,
             completion: ProgramCompletion::PageableOnly,
-            exposure: ProgramExposure::Production,
         })
     }
 
@@ -485,7 +484,6 @@ mod tests {
         assert_eq!(route.stratum, ProgramStratum::Finite);
         assert_eq!(route.grouping, ProgramGrouping::PageLocal);
         assert_eq!(route.completion, ProgramCompletion::PageableOnly);
-        assert_eq!(route.exposure, ProgramExposure::Production);
         assert!(
             constraint.progress(&SortedSliceProgramState::Propose { offset: 0 })
                 > constraint.progress(&SortedSliceProgramState::Propose { offset: 1 })

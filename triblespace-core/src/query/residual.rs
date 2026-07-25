@@ -8,8 +8,8 @@
 //! unless they explicitly expose structure.
 //! Exposed Unions execute as arbitrary finite AND/OR trees through a canonical
 //! program counter, one affine candidate stream, and an OR-only reducer stack.
-//! Candidate actions descend to Atom nodes. Production-qualified typed routes
-//! may be terminating finite automata or repeated least-fixpoint programs.
+//! Candidate actions descend to Atom nodes. Returned typed routes may be
+//! terminating finite automata or repeated least-fixpoint programs.
 //!
 //! Ready and Candidate descriptors are pure planning states: they estimate,
 //! partition rows by their exact uniform semantic action, and file explicit
@@ -123,21 +123,16 @@ struct FormulaNodeCapabilities {
     parent_atomic_program_confirms: Box<[(VariableId, VariableSet)]>,
 }
 
-/// Selects the one production-qualified typed Program route for an action.
+/// Selects the typed Program route for an action.
 ///
-/// Structurally absent and non-production routes both use the ordinary
-/// constraint protocol.
+/// Structurally absent routes use the ordinary constraint protocol.
 fn select_program<'r, 'a>(
     constraint: &'r dyn Constraint<'a>,
     request: ProgramRequest,
 ) -> Option<(ProgramRef<'r>, ProgramRoute)> {
-    let Some(program) = constraint.residual_program() else {
-        return None;
-    };
-    let Some(route) = program.route(request) else {
-        return None;
-    };
-    matches!(route.exposure, ProgramExposure::Production).then_some((program, route))
+    let program = constraint.residual_program()?;
+    let route = program.route(request)?;
+    Some((program, route))
 }
 
 impl FormulaNodeCapabilities {
@@ -1578,8 +1573,8 @@ impl ResidualPlan {
     /// Compile the one plan used by production query execution.
     ///
     /// Associative AND regions are native residual leaves, finite Union leaves
-    /// become formula continuations, and only production-qualified typed
-    /// Programs are admitted.
+    /// become formula continuations, and returned typed Program routes are
+    /// admitted.
     fn compile_production<'a>(root: &dyn Constraint<'a>) -> Self {
         Self::compile(root, false)
     }
@@ -1849,8 +1844,8 @@ impl ResidualPlan {
     /// Strongest proposal receipt guaranteed by the execution route this
     /// plan will actually use. Typed Programs may publish a narrower accepted
     /// stream than ordinary eager `propose`; that stronger receipt is active
-    /// only when the exact request is structurally accepted by a
-    /// production-qualified Program family.
+    /// only when the exact request is structurally accepted by a Program
+    /// family.
     fn execution_proposal_coverage<'a>(
         &self,
         constraint: &dyn Constraint<'a>,
@@ -11199,8 +11194,8 @@ impl ResidualStateMachine {
             return Err(task);
         };
         // Lowered finite formulas own their own action reducer. Any ordinary
-        // opaque confirmer may offer a typed Program; absence or explicit-only
-        // exposure falls back to the ordinary protocol below.
+        // opaque confirmer may offer a typed Program; absence falls back to
+        // the ordinary protocol below.
         if plan.has_finite_formula(*confirmer) {
             return Err(task);
         }
@@ -13741,7 +13736,6 @@ mod tests {
                 stratum: ProgramStratum::Finite,
                 grouping: ProgramGrouping::PageLocal,
                 completion: self.completion,
-                exposure: ProgramExposure::Production,
             })
         }
 
@@ -14027,7 +14021,6 @@ mod tests {
                     stratum: ProgramStratum::Fixpoint,
                     grouping: ProgramGrouping::ParentAtomic,
                     completion: ProgramCompletion::PageableOnly,
-                    exposure: ProgramExposure::Production,
                 })
         }
 
@@ -14114,7 +14107,6 @@ mod tests {
                 stratum: ProgramStratum::Fixpoint,
                 grouping: ProgramGrouping::ParentAtomic,
                 completion: ProgramCompletion::PageableOnly,
-                exposure: ProgramExposure::Production,
             })
         }
 
@@ -14290,7 +14282,6 @@ mod tests {
                 } else {
                     ProgramCompletion::CompleteActionEquivalent
                 },
-                exposure: ProgramExposure::Production,
             })
         }
 
@@ -14528,7 +14519,6 @@ mod tests {
                 stratum: ProgramStratum::Finite,
                 grouping: ProgramGrouping::PageLocal,
                 completion: ProgramCompletion::PageableOnly,
-                exposure: ProgramExposure::Production,
             })
         }
 
@@ -14667,114 +14657,6 @@ mod tests {
             )
             .active
             .expect("one typed Program proposal was filed")
-    }
-
-    /// One explicit typed route whose ordinary implementation records when
-    /// policy defers the route.
-    #[derive(Clone)]
-    struct ExplicitProgramPagedProposalLeaf {
-        variable: VariableId,
-        value: RawInline,
-        ordinary_proposes: Arc<AtomicUsize>,
-        program_seeds: Arc<AtomicUsize>,
-    }
-
-    impl TypedProgramSpec for ExplicitProgramPagedProposalLeaf {
-        type State = ();
-        type NoveltyKey = ();
-        type Rank = ();
-
-        fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-            matches!(request.action, ProgramAction::Propose(variable) if variable == self.variable)
-                .then_some(ProgramRoute {
-                    key: ProgramKey::new(0),
-                    variable: self.variable,
-                    stratum: ProgramStratum::Finite,
-                    grouping: ProgramGrouping::PageLocal,
-                    completion: ProgramCompletion::PageableOnly,
-                    exposure: ProgramExposure::Explicit,
-                })
-        }
-
-        fn dispatch(&self, _state: &Self::State) -> DispatchClass {
-            DispatchClass::new(0)
-        }
-
-        fn progress(&self, _state: &Self::State) -> Self::Rank {}
-
-        fn seed_typed(
-            &self,
-            batch: ProgramSeedBatch<'_>,
-            effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
-        ) {
-            self.program_seeds.fetch_add(1, Ordering::Relaxed);
-            for parent in 0..batch.view.len() {
-                effects.finite_root(parent as u32, (), Some(self.value));
-            }
-        }
-
-        fn step_typed(
-            &self,
-            states: &mut Vec<Self::State>,
-            _batch: TypedProgramBatch<'_>,
-            effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
-        ) {
-            for _ in states {
-                effects.page(1, None);
-            }
-        }
-    }
-
-    impl Constraint<'static> for ExplicitProgramPagedProposalLeaf {
-        fn variables(&self) -> VariableSet {
-            VariableSet::new_singleton(self.variable)
-        }
-
-        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-            if variable == self.variable && !bound.is_set(variable) {
-                ProposalCoverage::Exact
-            } else {
-                ProposalCoverage::None
-            }
-        }
-
-        fn estimate(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            out: &mut EstimateSink<'_>,
-        ) -> bool {
-            if variable != self.variable {
-                return false;
-            }
-            out.fill(1, view.len());
-            true
-        }
-
-        fn propose(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) {
-            assert_eq!(variable, self.variable);
-            self.ordinary_proposes.fetch_add(1, Ordering::Relaxed);
-            for parent in 0..view.len() {
-                candidates.push(parent as u32, self.value);
-            }
-        }
-
-        fn confirm(
-            &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
-        ) {
-        }
-
-        fn residual_program(&self) -> Option<ProgramRef<'_>> {
-            Some(ProgramRef::new(self))
-        }
     }
 
     #[derive(Clone, Copy)]
@@ -14982,24 +14864,6 @@ mod tests {
             0,
             "a declined Program route must not enter typed paging"
         );
-    }
-
-    #[test]
-    fn deferred_explicit_program_uses_its_ordinary_action() {
-        let ordinary_proposes = Arc::new(AtomicUsize::new(0));
-        let program_seeds = Arc::new(AtomicUsize::new(0));
-        let leaf = ExplicitProgramPagedProposalLeaf {
-            variable: 0,
-            value: raw(42),
-            ordinary_proposes: Arc::clone(&ordinary_proposes),
-            program_seeds: Arc::clone(&program_seeds),
-        };
-        let results = Query::new(leaf, |binding: &Binding| binding.get(0).copied())
-            .solve_residual_state_lazy()
-            .collect::<Vec<_>>();
-        assert_eq!(results, [raw(42)]);
-        assert_eq!(ordinary_proposes.load(Ordering::Relaxed), 1);
-        assert_eq!(program_seeds.load(Ordering::Relaxed), 0);
     }
 
     #[test]

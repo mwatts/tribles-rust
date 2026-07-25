@@ -19,7 +19,6 @@ use crate::query::ProgramCompleteBatch;
 use crate::query::ProgramCompleteWorkEvidence;
 use crate::query::ProgramCompleteWorkQuote;
 use crate::query::ProgramCompletion;
-use crate::query::ProgramExposure;
 use crate::query::ProgramGrouping;
 use crate::query::ProgramKey;
 use crate::query::ProgramPacing;
@@ -279,25 +278,14 @@ struct Positions {
 }
 
 const TRIBLESET_PROPOSE_ROUTE: u32 = 1 << 8;
-const TRIBLESET_CONFIRM_ROUTE: u32 = 2 << 8;
-const TRIBLESET_SUPPORT_ROUTE: u32 = 3 << 8;
 
 const TRIBLESET_PROPOSE_DISPATCH: DispatchClass = DispatchClass::new(0);
-const TRIBLESET_CONFIRM_DISPATCH: DispatchClass = DispatchClass::new(1);
-const TRIBLESET_SUPPORT_DISPATCH: DispatchClass = DispatchClass::new(2);
 
 #[doc(hidden)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TribleSetProgramState {
-    Propose {
-        variable: VariableId,
-        cursor: ResidualDeltaSourceCursor,
-    },
-    Confirm {
-        variable: VariableId,
-        offset: usize,
-    },
-    Support,
+pub struct TribleSetProgramState {
+    variable: VariableId,
+    cursor: ResidualDeltaSourceCursor,
 }
 
 impl Positions {
@@ -857,15 +845,6 @@ impl TribleSetConstraint {
             | (u32::from(term_is_bound(&self.term_v, bound)) << 2)
     }
 
-    fn support_variable(&self) -> Option<VariableId> {
-        [&self.term_e, &self.term_a, &self.term_v]
-            .into_iter()
-            .find_map(|term| match term {
-                RawTerm::Var(variable) => Some(*variable),
-                RawTerm::Const(_) => None,
-            })
-    }
-
     /// Pages the same ordered proposal source used by ordinary `propose`, but
     /// for one already-selected parent row. Keeping this kernel on the family
     /// preserves the six-index and repeated-position semantics; the typed
@@ -1033,40 +1012,6 @@ impl TribleSetConstraint {
         }
     }
 
-    fn confirm_page_row(
-        &self,
-        p: &Positions,
-        row: &[RawInline],
-        candidates: &[RawInline],
-        offset: usize,
-        limit: usize,
-        mut accept: impl FnMut(RawInline),
-    ) -> usize {
-        assert!(offset <= candidates.len());
-        let end = offset.saturating_add(limit).min(candidates.len());
-        let e_bound = match p.e(row) {
-            Some(value) => match id_from_value(value) {
-                Some(id) => Some(id),
-                None => return end,
-            },
-            None => None,
-        };
-        let a_bound = match p.a(row) {
-            Some(value) => match id_from_value(value) {
-                Some(id) => Some(id),
-                None => return end,
-            },
-            None => None,
-        };
-        let v_bound = p.v(row).copied();
-        for &candidate in &candidates[offset..end] {
-            if self.confirm_value(p, e_bound, a_bound, v_bound, &candidate) {
-                accept(candidate);
-            }
-        }
-        end
-    }
-
     fn support_row(&self, view: &RowsView<'_>, row: &[RawInline]) -> bool {
         let (Some(se), Some(sa), Some(sv)) = (
             term_src(&self.term_e, view),
@@ -1095,58 +1040,28 @@ impl TypedProgramSpec for TribleSetConstraint {
     type Rank = [u64; 6];
 
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-        let bound_positions = self.bound_position_mask(request.bound);
-        let (key, variable, completion, exposure) = match request.action {
-            ProgramAction::Propose(variable) | ProgramAction::Confirm(variable) => {
-                let target_positions = self.variable_position_mask(variable);
-                if request.bound.is_set(variable) || target_positions == 0 {
-                    return None;
-                }
-                debug_assert_eq!(bound_positions & target_positions, 0);
-                let (action, completion, exposure) =
-                    if matches!(request.action, ProgramAction::Propose(_)) {
-                        (
-                            TRIBLESET_PROPOSE_ROUTE,
-                            ProgramCompletion::CompleteActionEquivalent,
-                            ProgramExposure::Production,
-                        )
-                    } else {
-                        (
-                            TRIBLESET_CONFIRM_ROUTE,
-                            ProgramCompletion::PageableOnly,
-                            ProgramExposure::Explicit,
-                        )
-                    };
-                (
-                    ProgramKey::new(action | (target_positions << 3) | bound_positions),
-                    variable,
-                    completion,
-                    exposure,
-                )
-            }
-            ProgramAction::Support => (
-                ProgramKey::new(TRIBLESET_SUPPORT_ROUTE | bound_positions),
-                self.support_variable()?,
-                ProgramCompletion::PageableOnly,
-                ProgramExposure::Explicit,
-            ),
+        let ProgramAction::Propose(variable) = request.action else {
+            return None;
         };
+        let bound_positions = self.bound_position_mask(request.bound);
+        let target_positions = self.variable_position_mask(variable);
+        if request.bound.is_set(variable) || target_positions == 0 {
+            return None;
+        }
+        debug_assert_eq!(bound_positions & target_positions, 0);
         Some(ProgramRoute {
-            key,
+            key: ProgramKey::new(
+                TRIBLESET_PROPOSE_ROUTE | (target_positions << 3) | bound_positions,
+            ),
             variable,
             stratum: ProgramStratum::Finite,
             grouping: ProgramGrouping::PageLocal,
-            completion,
-            exposure,
+            completion: ProgramCompletion::CompleteActionEquivalent,
         })
     }
 
-    fn dispatch(&self, state: &Self::State) -> DispatchClass {
-        match state {
-            TribleSetProgramState::Propose { .. } => TRIBLESET_PROPOSE_DISPATCH,
-            TribleSetProgramState::Confirm { .. } => TRIBLESET_CONFIRM_DISPATCH,
-            TribleSetProgramState::Support => TRIBLESET_SUPPORT_DISPATCH,
-        }
+    fn dispatch(&self, _state: &Self::State) -> DispatchClass {
+        TRIBLESET_PROPOSE_DISPATCH
     }
 
     fn pacing(&self, _state: &Self::State) -> ProgramPacing {
@@ -1162,25 +1077,15 @@ impl TypedProgramSpec for TribleSetConstraint {
         }
 
         let mut rank = [0u64; 6];
-        match state {
-            TribleSetProgramState::Support => rank[0] = 1,
-            TribleSetProgramState::Confirm { offset, .. } => {
-                rank[0] = 2;
-                rank[1] = u64::MAX
-                    - u64::try_from(*offset).expect("TribleSet candidate offset exceeds rank limb");
+        rank[0] = 3;
+        match &state.cursor {
+            ResidualDeltaSourceCursor::Start => rank[1] = u64::MAX,
+            ResidualDeltaSourceCursor::After(value) => {
+                rank[1] = u64::MAX - 1;
+                rank[2..].copy_from_slice(&complemented_value_words(value));
             }
-            TribleSetProgramState::Propose { cursor, .. } => {
-                rank[0] = 3;
-                match cursor {
-                    ResidualDeltaSourceCursor::Start => rank[1] = u64::MAX,
-                    ResidualDeltaSourceCursor::After(value) => {
-                        rank[1] = u64::MAX - 1;
-                        rank[2..].copy_from_slice(&complemented_value_words(value));
-                    }
-                    ResidualDeltaSourceCursor::Offset(_) => {
-                        panic!("ordinal cursor crossed into a typed TribleSet source")
-                    }
-                }
+            ResidualDeltaSourceCursor::Offset(_) => {
+                panic!("ordinal cursor crossed into a typed TribleSet source")
             }
         }
         rank
@@ -1193,35 +1098,19 @@ impl TypedProgramSpec for TribleSetConstraint {
     ) {
         assert_eq!(batch.route.stratum, ProgramStratum::Finite);
         assert_eq!(batch.route.grouping, ProgramGrouping::PageLocal);
-        let state = match batch.request.action {
-            ProgramAction::Propose(variable) => {
-                assert_eq!(
-                    batch.route.completion,
-                    ProgramCompletion::CompleteActionEquivalent
-                );
-                assert_eq!(batch.route.variable, variable);
-                assert!(!batch.request.bound.is_set(variable));
-                assert_ne!(self.variable_position_mask(variable), 0);
-                TribleSetProgramState::Propose {
-                    variable,
-                    cursor: ResidualDeltaSourceCursor::Start,
-                }
-            }
-            ProgramAction::Confirm(variable) => {
-                assert_eq!(batch.route.completion, ProgramCompletion::PageableOnly);
-                assert_eq!(batch.route.variable, variable);
-                assert!(!batch.request.bound.is_set(variable));
-                assert_ne!(self.variable_position_mask(variable), 0);
-                TribleSetProgramState::Confirm {
-                    variable,
-                    offset: 0,
-                }
-            }
-            ProgramAction::Support => {
-                assert_eq!(batch.route.completion, ProgramCompletion::PageableOnly);
-                assert_eq!(Some(batch.route.variable), self.support_variable());
-                TribleSetProgramState::Support
-            }
+        let ProgramAction::Propose(variable) = batch.request.action else {
+            panic!("typed TribleSet route admitted a non-proposal action")
+        };
+        assert_eq!(
+            batch.route.completion,
+            ProgramCompletion::CompleteActionEquivalent
+        );
+        assert_eq!(batch.route.variable, variable);
+        assert!(!batch.request.bound.is_set(variable));
+        assert_ne!(self.variable_position_mask(variable), 0);
+        let state = TribleSetProgramState {
+            variable,
+            cursor: ResidualDeltaSourceCursor::Start,
         };
         for parent in 0..batch.view.len() {
             effects.finite_root(
@@ -1241,104 +1130,38 @@ impl TypedProgramSpec for TribleSetConstraint {
         assert_eq!(states.len(), batch.view.len());
         assert_eq!(states.len(), batch.candidate_sets.len());
         assert_eq!(states.len(), batch.limits.len());
-        let Some(first) = states.first() else {
+        let Some(variable) = states.first().map(|state| state.variable) else {
             return;
         };
-        match first {
-            TribleSetProgramState::Propose { variable, .. } => {
-                let variable = *variable;
-                let positions = self.positions(variable, &batch.view);
-                for (input, state) in states.drain(..).enumerate() {
-                    let TribleSetProgramState::Propose {
-                        variable: state_variable,
-                        cursor,
-                    } = state
-                    else {
-                        panic!("one typed TribleSet proposal cohort mixed action variants")
-                    };
-                    assert_eq!(state_variable, variable);
-                    assert!(
-                        batch.candidate_sets[input].is_none(),
-                        "typed TribleSet proposal received a candidate group"
-                    );
-                    let mut direct = Vec::new();
-                    let page = self.proposal_source_page_row(
-                        &positions,
-                        batch.view.row(input),
-                        cursor,
-                        batch.limits[input],
-                        &mut direct,
-                    );
-                    let input = u32::try_from(input)
-                        .expect("too many typed TribleSet inputs in one cohort");
-                    for value in direct {
-                        effects.direct(input, value);
-                    }
-                    assert!(
-                        page.next.is_none() || page.examined > 0,
-                        "typed TribleSet proposal resumed without examining its source"
-                    );
-                    let resume = page.next.map(|cursor| {
-                        TypedResume::Immediate(TribleSetProgramState::Propose { variable, cursor })
-                    });
-                    effects.account_source(page.examined, 0);
-                    effects.page(page.examined, resume);
-                }
+        let positions = self.positions(variable, &batch.view);
+        for (input, state) in states.drain(..).enumerate() {
+            assert_eq!(state.variable, variable);
+            assert!(
+                batch.candidate_sets[input].is_none(),
+                "typed TribleSet proposal received a candidate group"
+            );
+            let mut direct = Vec::new();
+            let page = self.proposal_source_page_row(
+                &positions,
+                batch.view.row(input),
+                state.cursor,
+                batch.limits[input],
+                &mut direct,
+            );
+            let input =
+                u32::try_from(input).expect("too many typed TribleSet inputs in one cohort");
+            for value in direct {
+                effects.direct(input, value);
             }
-            TribleSetProgramState::Confirm { variable, .. } => {
-                let variable = *variable;
-                let positions = self.positions(variable, &batch.view);
-                for (input, state) in states.drain(..).enumerate() {
-                    let TribleSetProgramState::Confirm {
-                        variable: state_variable,
-                        offset,
-                    } = state
-                    else {
-                        panic!("one typed TribleSet confirmation cohort mixed action variants")
-                    };
-                    assert_eq!(state_variable, variable);
-                    let candidates = batch.candidate_sets[input]
-                        .expect("typed TribleSet confirmation lost its immutable candidate group");
-                    let input_tag = u32::try_from(input)
-                        .expect("too many typed TribleSet inputs in one cohort");
-                    let end = self.confirm_page_row(
-                        &positions,
-                        batch.view.row(input),
-                        candidates,
-                        offset,
-                        batch.limits[input],
-                        |value| effects.accept(input_tag, value),
-                    );
-                    let examined = end - offset;
-                    assert!(
-                        end == candidates.len() || examined > 0,
-                        "typed TribleSet confirmation resumed without examining a candidate"
-                    );
-                    let resume = (end < candidates.len()).then(|| {
-                        TypedResume::Immediate(TribleSetProgramState::Confirm {
-                            variable,
-                            offset: end,
-                        })
-                    });
-                    effects.page(examined, resume);
-                }
-            }
-            TribleSetProgramState::Support => {
-                for (input, state) in states.drain(..).enumerate() {
-                    assert_eq!(state, TribleSetProgramState::Support);
-                    assert!(
-                        batch.candidate_sets[input].is_none(),
-                        "typed TribleSet support received a candidate group"
-                    );
-                    if self.support_row(&batch.view, batch.view.row(input)) {
-                        effects.support(
-                            u32::try_from(input)
-                                .expect("too many typed TribleSet inputs in one cohort"),
-                        );
-                    }
-                    effects.page(1, None);
-                }
-            }
+            assert!(
+                page.next.is_none() || page.examined > 0,
+                "typed TribleSet proposal resumed without examining its source"
+            );
+            let resume = page
+                .next
+                .map(|cursor| TypedResume::Immediate(TribleSetProgramState { variable, cursor }));
+            effects.account_source(page.examined, 0);
+            effects.page(page.examined, resume);
         }
     }
 
@@ -1635,52 +1458,6 @@ mod tests {
         )
     }
 
-    fn one_program_step(
-        constraint: &TribleSetConstraint,
-        request: ProgramRequest,
-        view: RowsView<'_>,
-        candidate_sets: &[Option<&[RawInline]>],
-        limits: &[usize],
-    ) -> crate::query::ProgramBatchEffects {
-        let spec = constraint
-            .residual_program()
-            .expect("TribleSet exposes its typed Program");
-        let route = spec
-            .route(request)
-            .expect("test request has a total TribleSet route");
-        let activations: Vec<_> = (0..view.len())
-            .map(|activation| crate::query::ProgramActivation(activation as u64 + 1))
-            .collect();
-        let mut runtime = spec.new_runtime();
-        let mut seeded = crate::query::ProgramSeedEffects::default();
-        spec.seed_batch(
-            &mut runtime,
-            ProgramSeedBatch {
-                request,
-                route,
-                view,
-                activations: &activations,
-            },
-            &mut seeded,
-        );
-        assert_eq!(seeded.work.len(), view.len());
-        let work: Vec<_> = seeded.work.into_iter().map(|seed| seed.work).collect();
-        let mut effects = crate::query::ProgramBatchEffects::default();
-        spec.step_batch(
-            &mut runtime,
-            crate::query::ProgramBatch {
-                stratum: route.stratum,
-                view,
-                candidate_sets,
-                activations: &activations,
-                work: &work,
-                limits,
-            },
-            &mut effects,
-        );
-        effects
-    }
-
     #[test]
     fn typed_routes_are_action_and_relevant_schema_specific() {
         let (set, _, _, _) = direct_fixture();
@@ -1696,12 +1473,6 @@ mod tests {
                 bound: empty,
             })
             .unwrap();
-        let confirm = program
-            .route(ProgramRequest {
-                action: ProgramAction::Confirm(0),
-                bound: empty,
-            })
-            .unwrap();
         let mut attribute_bound = empty;
         attribute_bound.set(1);
         let bound_propose = program
@@ -1711,7 +1482,6 @@ mod tests {
             })
             .unwrap();
 
-        assert_ne!(propose.key, confirm.key);
         assert_ne!(propose.key, bound_propose.key);
         assert_eq!(propose.stratum, ProgramStratum::Finite);
         assert_eq!(propose.grouping, ProgramGrouping::PageLocal);
@@ -1723,16 +1493,18 @@ mod tests {
             bound_propose.completion,
             ProgramCompletion::CompleteActionEquivalent
         );
-        assert_eq!(propose.exposure, ProgramExposure::Production);
-        assert_eq!(bound_propose.exposure, ProgramExposure::Production);
-        assert_eq!(confirm.exposure, ProgramExposure::Explicit);
-        let support = program
+        assert!(program
+            .route(ProgramRequest {
+                action: ProgramAction::Confirm(0),
+                bound: empty,
+            })
+            .is_none());
+        assert!(program
             .route(ProgramRequest {
                 action: ProgramAction::Support,
                 bound: empty,
             })
-            .unwrap();
-        assert_eq!(support.exposure, ProgramExposure::Explicit);
+            .is_none());
         assert!(program
             .route(ProgramRequest {
                 action: ProgramAction::Propose(0),
@@ -1947,149 +1719,6 @@ mod tests {
         assert_eq!(query.stats().delta_source_pages, 2);
         assert_eq!(query.stats().delta_source_candidates_examined, 2);
         assert_eq!(query.stats().delta_terminal_eager_cohort_admissions, 0);
-    }
-
-    #[test]
-    fn typed_support_is_row_local_optimistic_partial_and_exact_when_bound() {
-        let entity = rngid();
-        let other_entity = rngid();
-        let attribute = rngid();
-        let value = Inline::<UnknownInline>::new([0x41; INLINE_LEN]);
-        let mut set = TribleSet::new();
-        set.insert(&Trible::new(&entity, &attribute, &value));
-        let e = Variable::<GenId>::new(0);
-        let a = Variable::<GenId>::new(1);
-        let v = Variable::<UnknownInline>::new(2);
-        let constraint = TribleSetConstraint::new(e, a, v, set.clone());
-
-        let vars = [0, 1, 2];
-        let rows = [
-            id_into_value(&entity),
-            id_into_value(&attribute),
-            value.raw,
-            id_into_value(&other_entity),
-            id_into_value(&attribute),
-            value.raw,
-        ];
-        let exact = one_program_step(
-            &constraint,
-            ProgramRequest {
-                action: ProgramAction::Support,
-                bound: VariableSet::new_singleton(0)
-                    .union(VariableSet::new_singleton(1))
-                    .union(VariableSet::new_singleton(2)),
-            },
-            RowsView::new(&vars, &rows),
-            &[None, None],
-            &[1, 1],
-        );
-        assert_eq!(exact.supported, vec![(0, ())]);
-        assert!(exact.pages.iter().all(|page| page.examined == 1));
-
-        // Bound schema is a physical cohort key, so partial rows form their
-        // own cohort. Both are optimistic, matching ordinary `satisfied`.
-        let partial_vars = [0];
-        let partial_rows = [id_into_value(&entity), id_into_value(&other_entity)];
-        let partial = one_program_step(
-            &constraint,
-            ProgramRequest {
-                action: ProgramAction::Support,
-                bound: VariableSet::new_singleton(0),
-            },
-            RowsView::new(&partial_vars, &partial_rows),
-            &[None, None],
-            &[1, 1],
-        );
-        assert_eq!(partial.supported, vec![(0, ()), (1, ())]);
-
-        let true_constant = TribleSetConstraint::new(
-            Inline::<GenId>::new(id_into_value(&entity)),
-            Inline::<GenId>::new(id_into_value(&attribute)),
-            value,
-            set.clone(),
-        );
-        let false_constant = TribleSetConstraint::new(
-            Inline::<GenId>::new(id_into_value(&other_entity)),
-            Inline::<GenId>::new(id_into_value(&attribute)),
-            value,
-            set,
-        );
-        let constant_request = ProgramRequest {
-            action: ProgramAction::Support,
-            bound: VariableSet::new_empty(),
-        };
-        assert!(true_constant.route(constant_request).is_none());
-        assert!(false_constant.route(constant_request).is_none());
-        assert!(true_constant.satisfied(&RowsView::EMPTY));
-        assert!(!false_constant.satisfied(&RowsView::EMPTY));
-    }
-
-    #[test]
-    fn typed_confirm_unit_pages_preserve_passing_occurrences_and_rejections() {
-        let entity = rngid();
-        let rejected = rngid();
-        let attribute = rngid();
-        let value = Inline::<UnknownInline>::new([0x51; INLINE_LEN]);
-        let mut set = TribleSet::new();
-        set.insert(&Trible::new(&entity, &attribute, &value));
-        let candidate = id_into_value(&entity);
-        let candidates = [candidate, id_into_value(&rejected), candidate];
-        let constraint = TribleSetConstraint::new(
-            Variable::<GenId>::new(0),
-            Inline::<GenId>::new(id_into_value(&attribute)),
-            value,
-            set,
-        );
-        let request = ProgramRequest {
-            action: ProgramAction::Confirm(0),
-            bound: VariableSet::new_empty(),
-        };
-        let spec = constraint.residual_program().unwrap();
-        let route = spec.route(request).unwrap();
-        let activation = crate::query::ProgramActivation(1);
-        let activations = [activation];
-        let mut runtime = spec.new_runtime();
-        let mut seeded = crate::query::ProgramSeedEffects::default();
-        spec.seed_batch(
-            &mut runtime,
-            ProgramSeedBatch {
-                request,
-                route,
-                view: RowsView::EMPTY,
-                activations: &activations,
-            },
-            &mut seeded,
-        );
-        let mut work = seeded.work.pop().unwrap().work;
-        assert!(seeded.work.is_empty());
-        let candidate_sets = [Some(candidates.as_slice())];
-        let limits = [1];
-        let mut accepted = Vec::new();
-        loop {
-            let mut effects = crate::query::ProgramBatchEffects::default();
-            spec.step_batch(
-                &mut runtime,
-                crate::query::ProgramBatch {
-                    stratum: route.stratum,
-                    view: RowsView::EMPTY,
-                    candidate_sets: &candidate_sets,
-                    activations: &activations,
-                    work: std::slice::from_ref(&work),
-                    limits: &limits,
-                },
-                &mut effects,
-            );
-            accepted.extend(effects.accepted);
-            assert_eq!(effects.pages.len(), 1);
-            assert_eq!(effects.pages[0].examined, 1);
-            work = match effects.pages.pop().unwrap().resume {
-                Some(crate::query::ProgramResume::Immediate(next)) => next,
-                None => break,
-                Some(_) => ::std::panic!("TribleSet confirm used a non-immediate continuation"),
-            };
-        }
-
-        assert_eq!(accepted, vec![(0, candidate), (0, candidate)]);
     }
 
     fn eager_proposal(

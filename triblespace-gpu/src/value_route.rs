@@ -1098,7 +1098,6 @@ impl<'a, U: Universe> TypedProgramSpec for SuccinctTwoBoundFamily<'a, U> {
             stratum: ProgramStratum::Finite,
             grouping: ProgramGrouping::PageLocal,
             completion: ProgramCompletion::PageableOnly,
-            exposure: triblespace_core::query::ProgramExposure::Production,
         })
     }
 
@@ -1552,7 +1551,7 @@ mod tests {
     use triblespace_core::id::{ExclusiveId, Id};
     use triblespace_core::inline::encodings::genid::GenId;
     use triblespace_core::inline::InlineEncoding;
-    use triblespace_core::query::{ProgramExposure, ProgramStratum, Variable, VariableContext};
+    use triblespace_core::query::{ProgramStratum, Variable, VariableContext};
     use triblespace_core::trible::{Trible, TribleSet};
 
     fn fixture_id(prefix: u8, ordinal: usize) -> Id {
@@ -1839,7 +1838,6 @@ mod tests {
             assert_eq!(admitted.stratum, ProgramStratum::Finite);
             assert_eq!(admitted.grouping, ProgramGrouping::PageLocal);
             assert_eq!(admitted.completion, ProgramCompletion::PageableOnly);
-            assert_eq!(admitted.exposure, ProgramExposure::Production);
             keys.push(admitted.key);
             assert!(route(ProgramAction::Propose(target), &[peers[0], peers[1], 7]).is_some());
         }
@@ -1873,14 +1871,12 @@ mod tests {
                 bound: bound(&[0]),
             })
             .expect("canonical fallback owns insufficiently bound proposal");
-        assert_eq!(canonical_propose.exposure, ProgramExposure::Production);
         let canonical_confirm = canonical
             .route(ProgramRequest {
                 action: ProgramAction::Confirm(2),
                 bound: bound(&[0, 1]),
             })
             .expect("canonical fallback owns declined confirmation");
-        assert_eq!(canonical_confirm.exposure, ProgramExposure::Production);
 
         // Constant entity and attribute: the route needs no bound variables.
         let (_, entities, attributes) = fixture();

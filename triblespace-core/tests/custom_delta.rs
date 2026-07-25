@@ -12,8 +12,8 @@ use triblespace_core::query::residual::{ResidualShadowEpoch, ResidualShadowStatu
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, DispatchClass, EstimateSink, ProgramAction,
-    ProgramCompletion, ProgramExposure, ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef,
-    ProgramRequest, ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, Query,
+    ProgramCompletion, ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef, ProgramRequest,
+    ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, Query,
     ResidualDeltaSourceCursor, ResidualDeltaSourcePage, RowsView, TypedEffectSink,
     TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink, Variable, VariableId,
     VariableSet,
@@ -272,7 +272,6 @@ impl TypedProgramSpec for AlternatingClosure {
             stratum: ProgramStratum::Fixpoint,
             grouping,
             completion: ProgramCompletion::PageableOnly,
-            exposure: ProgramExposure::Production,
         })
     }
 

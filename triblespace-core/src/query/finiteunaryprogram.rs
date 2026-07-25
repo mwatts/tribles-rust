@@ -10,7 +10,6 @@ use crate::inline::RawInline;
 use super::DispatchClass;
 use super::ProgramAction;
 use super::ProgramCompletion;
-use super::ProgramExposure;
 use super::ProgramGrouping;
 use super::ProgramKey;
 use super::ProgramPacing;
@@ -74,25 +73,7 @@ pub fn route(variable: VariableId, request: ProgramRequest) -> Option<ProgramRou
         stratum: ProgramStratum::Finite,
         grouping: ProgramGrouping::PageLocal,
         completion: ProgramCompletion::PageableOnly,
-        exposure: ProgramExposure::Production,
     })
-}
-
-/// Routes only the pointwise half of a unary constraint.
-///
-/// Sources without a genuinely resumable cursor must decline Propose rather
-/// than hide eager materialization inside unbudgeted Program seeding. Their
-/// Confirm and Support verbs are already bounded by the ordinary residual
-/// page, so the transition Program remains an explicit representability path
-/// instead of adding per-candidate activation overhead to production queries.
-#[doc(hidden)]
-pub fn route_filter_only(variable: VariableId, request: ProgramRequest) -> Option<ProgramRoute> {
-    if matches!(request.action, ProgramAction::Propose(_)) {
-        return None;
-    }
-    let mut route = route(variable, request)?;
-    route.exposure = ProgramExposure::Explicit;
-    Some(route)
 }
 
 #[doc(hidden)]
@@ -280,32 +261,6 @@ pub fn step(
 mod tests {
     use super::*;
     use crate::query::VariableSet;
-
-    #[test]
-    fn filter_only_routes_are_explicit() {
-        let variable = 3;
-        assert!(route_filter_only(
-            variable,
-            ProgramRequest {
-                action: ProgramAction::Propose(variable),
-                bound: VariableSet::new_empty(),
-            },
-        )
-        .is_none());
-
-        for action in [ProgramAction::Confirm(variable), ProgramAction::Support] {
-            let route = route_filter_only(
-                variable,
-                ProgramRequest {
-                    action,
-                    bound: VariableSet::new_empty(),
-                },
-            )
-            .expect("filter-only pointwise route");
-            assert_eq!(route.grouping, ProgramGrouping::PageLocal);
-            assert_eq!(route.exposure, ProgramExposure::Explicit);
-        }
-    }
 
     #[test]
     fn ordinal_proposal_progress_strictly_descends() {

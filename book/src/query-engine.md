@@ -261,16 +261,16 @@ disjoint conjunctions, finite Union roots, RPQ roots, and live zero-variable
 truths therefore all exercise the same residual substrate. A seed-rejected
 query starts no worklist at all. Production lowering flattens exposed
 associative AND regions, lowers finite Union leaves and their recursive
-AND/OR descendants into continuations, and enables production-qualified typed
-Programs for RPQs and other heterogeneous actions.
+AND/OR descendants into continuations, and admits the typed Program route
+returned for each exact action.
 Canonical single-shard SuccinctArchive Propose, Confirm, and Support routes are
-production-qualified, so their pageable typed form participates in ordinary
+returned directly, so their pageable typed form participates in ordinary
 execution. Program retirement validates a wider activation receipt with
 one arena membership pass, avoiding the previous activation-count by arena-size
 multiplier while retaining cheap singleton and fully drained paths.
-UnionArchive Propose and Support routes are `Production`; Confirm remains
-`Explicit`. Propose normally retains sparse, geometrically widened shard
-paging for low-demand and nonterminal work. A fresh multi-parent terminal
+UnionArchive returns typed Propose and Support routes and declines Confirm,
+which stays on the ordinary constraint action. Propose normally retains sparse,
+geometrically widened shard paging for low-demand and nonterminal work. A fresh multi-parent terminal
 cohort may instead use `CompleteActionEquivalent`, preserving the exact
 parent-major then shard-major raw occurrence bag until parent-local SET
 admission. Dense complete drains and bounded Succinct proposal pages consume
@@ -280,7 +280,7 @@ back to the canonical production Succinct route.
 
 Ordinary [`Query`](triblespace::core::query::Query) iteration owns the residual
 cursor for every root. Its compiler policy is fixed: native AND flattening,
-finite Union-leaf continuations, and production-qualified Programs.
+finite Union-leaf continuations, and returned typed Program routes.
 `solve_residual_state_lazy` uses the same production plan while exposing width
 controls and `collect_profiled` reports state, merge, action, and batch
 measurements. A full drain preserves the distinct raw projected-row set, but

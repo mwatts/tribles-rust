@@ -203,17 +203,10 @@ pub enum ProgramCompletion {
     CompleteActionEquivalent,
 }
 
-/// Policy tier required before the scheduler may select a constructed route.
-#[doc(hidden)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProgramExposure {
-    /// The route is part of the ordinary production execution policy.
-    Production,
-    /// The route is available only when explicitly requested by policy.
-    Explicit,
-}
-
 /// Structural route selected by an immutable program spec for one action.
+///
+/// Returning a route admits typed execution for that exact request. Returning
+/// `None` leaves the action on the ordinary [`super::Constraint`] protocol.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProgramRoute {
@@ -223,7 +216,6 @@ pub struct ProgramRoute {
     pub stratum: ProgramStratum,
     pub grouping: ProgramGrouping,
     pub completion: ProgramCompletion,
-    pub exposure: ProgramExposure,
 }
 
 /// Runtime-free complete-action call for one certified route.
@@ -2469,7 +2461,6 @@ mod tests {
                 stratum: ProgramStratum::Finite,
                 grouping: ProgramGrouping::PageLocal,
                 completion: ProgramCompletion::PageableOnly,
-                exposure: ProgramExposure::Production,
             })
         }
 
@@ -2562,7 +2553,6 @@ mod tests {
                 },
                 grouping: ProgramGrouping::PageLocal,
                 completion: ProgramCompletion::PageableOnly,
-                exposure: ProgramExposure::Production,
             })
         }
 
@@ -2781,7 +2771,6 @@ mod tests {
                 } else {
                     ProgramCompletion::PageableOnly
                 },
-                exposure: ProgramExposure::Production,
             })
         }
 
@@ -2871,7 +2860,6 @@ mod tests {
                 stratum: ProgramStratum::Finite,
                 grouping: ProgramGrouping::PageLocal,
                 completion: ProgramCompletion::PageableOnly,
-                exposure: ProgramExposure::Production,
             })
         }
 
@@ -2930,7 +2918,6 @@ mod tests {
                 stratum: ProgramStratum::Fixpoint,
                 grouping: ProgramGrouping::PageLocal,
                 completion: ProgramCompletion::PageableOnly,
-                exposure: ProgramExposure::Production,
             })
         }
 
@@ -3002,7 +2989,6 @@ mod tests {
                 stratum: ProgramStratum::Fixpoint,
                 grouping: ProgramGrouping::PageLocal,
                 completion: ProgramCompletion::PageableOnly,
-                exposure: ProgramExposure::Production,
             })
         }
 
@@ -3121,7 +3107,6 @@ mod tests {
                 stratum: ProgramStratum::Finite,
                 grouping: ProgramGrouping::PageLocal,
                 completion: ProgramCompletion::CompleteActionEquivalent,
-                exposure: ProgramExposure::Production,
             })
         }
 
@@ -3243,7 +3228,6 @@ mod tests {
                 stratum: ProgramStratum::Finite,
                 grouping: ProgramGrouping::PageLocal,
                 completion: ProgramCompletion::CompleteActionEquivalent,
-                exposure: ProgramExposure::Production,
             })
         }
 
@@ -3333,7 +3317,6 @@ mod tests {
                 stratum: ProgramStratum::Finite,
                 grouping: ProgramGrouping::PageLocal,
                 completion: ProgramCompletion::PageableOnly,
-                exposure: ProgramExposure::Production,
             })
         }
 
@@ -3385,7 +3368,6 @@ mod tests {
                 },
                 grouping: ProgramGrouping::PageLocal,
                 completion: ProgramCompletion::PageableOnly,
-                exposure: ProgramExposure::Production,
             })
         }
 
@@ -4874,7 +4856,6 @@ mod tests {
             stratum: ProgramStratum::Finite,
             grouping: ProgramGrouping::PageLocal,
             completion: ProgramCompletion::PageableOnly,
-            exposure: ProgramExposure::Production,
         };
         let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             program.seed_batch(

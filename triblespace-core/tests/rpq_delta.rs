@@ -11,10 +11,10 @@ use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, DispatchClass, EstimateSink, PathOp, PreferredProgram,
-    ProgramAction, ProgramCompletion, ProgramExposure, ProgramGrouping, ProgramKey, ProgramRef,
-    ProgramRequest, ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, Query,
-    RegularPathConstraint, RowsView, TypedEffectSink, TypedProgramBatch, TypedProgramSpec,
-    TypedSeedSink, Variable, VariableId, VariableSet,
+    ProgramAction, ProgramCompletion, ProgramGrouping, ProgramKey, ProgramRef, ProgramRequest,
+    ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, Query, RegularPathConstraint,
+    RowsView, TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedSeedSink, Variable,
+    VariableId, VariableSet,
 };
 use triblespace_core::trible::{Trible, TribleSet};
 
@@ -426,7 +426,6 @@ impl TypedProgramSpec for PhysicalSupportProbe {
             stratum: ProgramStratum::Finite,
             grouping: ProgramGrouping::PageLocal,
             completion: ProgramCompletion::PageableOnly,
-            exposure: ProgramExposure::Production,
         })
     }
 

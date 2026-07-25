@@ -370,7 +370,6 @@ mod tests {
     use crate::query::Binding;
     use crate::query::Constraint;
     use crate::query::ProgramAction;
-    use crate::query::ProgramExposure;
     use crate::query::ProgramRequest;
     use crate::query::Query;
     use crate::query::ResidualDeltaSourceCursor;
@@ -580,7 +579,6 @@ mod tests {
                     bound: VariableSet::new_empty(),
                 })
                 .expect("the unbound id range has a Program route");
-            assert_eq!(route.exposure, ProgramExposure::Production);
         }
 
         let entity_expected = [

@@ -16,10 +16,10 @@ use triblespace_core::query::rangeconstraint::InlineRange;
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, ConstraintShape, DispatchClass, EstimateSink, PathOp,
-    ProgramAction, ProgramCompletion, ProgramExposure, ProgramGrouping, ProgramKey, ProgramRef,
-    ProgramRequest, ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, Query,
-    RegularPathConstraint, RowsView, TriblePattern, TypedEffectSink, TypedProgramBatch,
-    TypedProgramSpec, TypedSeedSink, Variable, VariableId, VariableSet,
+    ProgramAction, ProgramCompletion, ProgramGrouping, ProgramKey, ProgramRef, ProgramRequest,
+    ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, Query, RegularPathConstraint,
+    RowsView, TriblePattern, TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedSeedSink,
+    Variable, VariableId, VariableSet,
 };
 use triblespace_core::trible::{Trible, TribleSet};
 
@@ -941,7 +941,7 @@ struct CoveringProposalWithExactProgram {
     ordinary_proposes: Arc<AtomicUsize>,
     ordinary_confirms: Arc<AtomicUsize>,
     program_seeds: Arc<AtomicUsize>,
-    exposure: ProgramExposure,
+    selected: bool,
 }
 
 impl TypedProgramSpec for CoveringProposalWithExactProgram {
@@ -950,7 +950,8 @@ impl TypedProgramSpec for CoveringProposalWithExactProgram {
     type Rank = u8;
 
     fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-        if request.action != ProgramAction::Propose(X) || request.bound.is_set(X) {
+        if !self.selected || request.action != ProgramAction::Propose(X) || request.bound.is_set(X)
+        {
             return None;
         }
         Some(ProgramRoute {
@@ -959,7 +960,6 @@ impl TypedProgramSpec for CoveringProposalWithExactProgram {
             stratum: ProgramStratum::Finite,
             grouping: ProgramGrouping::PageLocal,
             completion: ProgramCompletion::PageableOnly,
-            exposure: self.exposure,
         })
     }
 
@@ -1128,7 +1128,7 @@ fn selected_exact_program_source_composes_with_an_ordinary_weak_confirmer() {
         ordinary_proposes: ordinary_proposes.clone(),
         ordinary_confirms: ordinary_confirms.clone(),
         program_seeds: program_seeds.clone(),
-        exposure: ProgramExposure::Production,
+        selected: true,
     };
     assert_eq!(
         proposer.proposal_coverage(X, VariableSet::new_empty()),
@@ -1169,7 +1169,7 @@ fn selected_exact_program_source_composes_with_an_ordinary_weak_confirmer() {
 }
 
 #[test]
-fn deferred_exact_program_receipt_does_not_discharge_covering_ordinary_source() {
+fn declined_exact_program_receipt_does_not_discharge_covering_ordinary_source() {
     let ordinary_proposes = Arc::new(AtomicUsize::new(0));
     let ordinary_confirms = Arc::new(AtomicUsize::new(0));
     let program_seeds = Arc::new(AtomicUsize::new(0));
@@ -1177,7 +1177,7 @@ fn deferred_exact_program_receipt_does_not_discharge_covering_ordinary_source() 
         ordinary_proposes: ordinary_proposes.clone(),
         ordinary_confirms: ordinary_confirms.clone(),
         program_seeds: program_seeds.clone(),
-        exposure: ProgramExposure::Explicit,
+        selected: false,
     };
     assert_eq!(
         proposer.proposal_coverage(X, VariableSet::new_empty()),
@@ -1196,11 +1196,11 @@ fn deferred_exact_program_receipt_does_not_discharge_covering_ordinary_source() 
     assert!(ordinary_proposes.load(Ordering::Relaxed) > 0);
     assert!(
         ordinary_confirms.load(Ordering::Relaxed) > 0,
-        "a deferred Exact Program receipt must leave Covering self-confirmation active"
+        "a declined Exact Program receipt must leave Covering self-confirmation active"
     );
     assert_eq!(
         program_seeds.load(Ordering::Relaxed),
         0,
-        "a deferred Explicit route must not seed its Program"
+        "a declined route must not seed its Program"
     );
 }

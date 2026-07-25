@@ -221,7 +221,6 @@ mod tests {
     use crate::query::Constraint;
     use crate::query::ProgramAction;
     use crate::query::ProgramCompletion;
-    use crate::query::ProgramExposure;
     use crate::query::ProgramGrouping;
     use crate::query::ProgramRequest;
     use crate::query::ProgramStratum;
@@ -419,7 +418,6 @@ mod tests {
         assert_eq!(route.stratum, ProgramStratum::Finite);
         assert_eq!(route.grouping, ProgramGrouping::PageLocal);
         assert_eq!(route.completion, ProgramCompletion::PageableOnly);
-        assert_eq!(route.exposure, ProgramExposure::Production);
         assert!(
             constraint.progress(
                 &crate::query::finiteunaryprogram::FiniteUnaryProgramState::Propose {

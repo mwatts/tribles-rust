@@ -66,11 +66,11 @@ pub use program::ProgramCompleteEffects;
 pub use program::{
     DispatchClass, PreferredProgram, ProgramAction, ProgramActivation, ProgramBatch,
     ProgramBatchEffects, ProgramChild, ProgramCompleteBatch, ProgramCompleteWorkEvidence,
-    ProgramCompleteWorkQuote, ProgramCompletion, ProgramExposure, ProgramGrouping, ProgramKey,
-    ProgramPacing, ProgramPage, ProgramPhysicalReceipt, ProgramRef, ProgramRequest, ProgramResume,
-    ProgramRoute, ProgramRuntime, ProgramSeedBatch, ProgramSeedEffects, ProgramSeedWork,
-    ProgramStratum, ProgramWork, ProgramWorkHandle, TypedCompleteArbiter, TypedCompleteSink,
-    TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink,
+    ProgramCompleteWorkQuote, ProgramCompletion, ProgramGrouping, ProgramKey, ProgramPacing,
+    ProgramPage, ProgramPhysicalReceipt, ProgramRef, ProgramRequest, ProgramResume, ProgramRoute,
+    ProgramRuntime, ProgramSeedBatch, ProgramSeedEffects, ProgramSeedWork, ProgramStratum,
+    ProgramWork, ProgramWorkHandle, TypedCompleteArbiter, TypedCompleteSink, TypedEffectSink,
+    TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink,
 };
 /// Re-export of [`PathOp`].
 pub use regularpathconstraint::PathOp;
@@ -1661,9 +1661,9 @@ pub trait Constraint<'a> {
     /// stronger receipt. This is useful for a traversal which exposes eager
     /// covering seeds but publishes only witnessed endpoints from its typed
     /// fixpoint. The receipt is consulted only after
-    /// [`Self::residual_program`] accepts the exact `Propose(variable)` request
-    /// with a production-qualified route. It must be structural in `bound` and
-    /// identical across typed CPU and physical execution.
+    /// [`Self::residual_program`] accepts the exact `Propose(variable)` request.
+    /// It must be structural in `bound` and identical across typed CPU and
+    /// physical execution.
     #[doc(hidden)]
     fn residual_program_proposal_coverage(
         &self,
@@ -1889,10 +1889,9 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
 /// widens as the consumer keeps pulling, while histories with identical future
 /// computation can reconverge under one state identity. The production
 /// plan flattens exposed associative AND regions, lowers finite Union leaves
-/// into continuations, and executes production-qualified regular-path
-/// Programs as heterogeneous state actions. Explicit routes deferred by that
-/// fixed policy use the ordinary constraint action, as do constraints without
-/// a selected typed route. Seed-rejected queries start no runtime.
+/// into continuations, and executes returned regular-path Program routes as
+/// heterogeneous state actions. Constraints without a selected typed route
+/// use the ordinary constraint action. Seed-rejected queries start no runtime.
 /// Strict-projection keys are claimed
 /// before Rust conversion, so conversion failure or panic never retries the
 /// same raw row through another witness. Full heads need no terminal claim
