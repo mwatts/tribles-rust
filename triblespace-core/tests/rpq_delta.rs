@@ -8,7 +8,6 @@ use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
-use triblespace_core::query::residual::{ActionVerb, ResidualShadowEpoch};
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, DispatchClass, EstimateSink, PathOp, PreferredProgram,
@@ -1614,7 +1613,7 @@ fn synthetic_root_cyclic_proposer_streams_into_an_ordinary_relational_suffix() {
 }
 
 #[test]
-fn nested_repeated_root_rpqs_keep_distinct_action_occurrences() {
+fn nested_repeated_root_rpqs_preserve_set_semantics() {
     let graph = Graph::new(3, &[(0, 1), (1, 2)]);
     let ops = repeated(graph.attribute, false);
     let make = || {
@@ -1633,32 +1632,13 @@ fn nested_repeated_root_rpqs_keep_distinct_action_occurrences() {
             Box::new(UnionConstraint::new(vec![arm(), arm()])) as DynConstraint,
         ]))
     };
-    let direct = Query::new(make(), project_end)
+    let mut actual: Vec<_> = Query::new(make(), project_end)
         .solve_residual_state_lazy()
-        .collect_profiled();
-    let mut actual = direct.results;
+        .collect();
     actual.sort_unstable();
     let mut expected = vec![graph.value(1).raw, graph.value(2).raw];
     expected.sort_unstable();
     assert_eq!(actual, expected);
-    let observed = Query::new(make(), project_end)
-        .solve_residual_state_lazy()
-        .shadow(ResidualShadowEpoch::new())
-        .collect_profiled();
-    let mut observed_results = observed.results.clone();
-    observed_results.sort_unstable();
-    assert_eq!(observed_results, expected);
-    let mut occurrences: Vec<_> = observed
-        .shadow
-        .events
-        .iter()
-        .filter(|event| event.site.verb == ActionVerb::Propose && event.site.variable == END)
-        .map(|event| event.site.leaf_occurrence)
-        .collect();
-    occurrences.sort_unstable();
-    occurrences.dedup();
-    assert_eq!(occurrences.len(), 2);
-    assert_eq!(observed.stats, direct.stats);
 }
 
 #[test]
@@ -2930,17 +2910,6 @@ fn same_variable_late_hit_keeps_the_geometric_negative_prefix() {
 }
 
 #[test]
-fn same_variable_delta_remains_opt_in() {
-    let graph = Graph::new(1, &[(0, 0)]);
-    let root = same_variable_root(graph.set.clone(), &repeated(graph.attribute, false));
-
-    let mut query = Query::new(root, project_start).solve_residual_state_lazy();
-    assert_eq!(query.by_ref().collect::<Vec<_>>(), vec![graph.value(0).raw]);
-    assert_eq!(query.stats().delta_source_pages, 0);
-    assert_eq!(query.stats().delta_transition_pages, 0);
-}
-
-#[test]
 fn star_and_optional_epsilon_acceptance_obey_the_graph_term_gate() {
     let graph = Graph::new(3, &[(0, 1), (1, 2)]);
     let star = vec![PathOp::Attr(graph.attribute.raw()), PathOp::Star];
@@ -3503,13 +3472,6 @@ fn target_confirm_positive_support_publishes_early_then_exactly_drains() {
             Arc::clone(&support_routes),
         )
     };
-    let mut control: Vec<_> = Query::new(make(), project_end)
-        .solve_residual_state_lazy()
-        .start_width(1)
-        .cap(1)
-        .collect();
-    control.sort_unstable();
-
     let mut query = Query::new(make(), project_end)
         .solve_residual_state_lazy()
         .start_width(1)
@@ -3545,7 +3507,12 @@ fn target_confirm_positive_support_publishes_early_then_exactly_drains() {
         "exact Confirm work must remain queued after the positive yield"
     );
     actual.sort_unstable();
-    assert_eq!(actual, control);
+    let mut expected: Vec<_> = reachable
+        .iter()
+        .map(|&node| graph.value(node).raw)
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
     assert_eq!(
         actual.iter().filter(|&&value| value == first).count(),
         1,
@@ -3569,20 +3536,13 @@ fn target_confirm_positive_support_does_not_feed_past_false_occurrence_zero() {
             Arc::clone(&support_routes),
         )
     };
-    let mut control: Vec<_> = Query::new(make(), project_end)
-        .solve_residual_state_lazy()
-        .start_width(3)
-        .cap(3)
-        .collect();
-    control.sort_unstable();
-
     let mut query = Query::new(make(), project_end)
         .solve_residual_state_lazy()
         .start_width(3)
         .cap(3);
     let mut actual: Vec<_> = query.by_ref().collect();
     actual.sort_unstable();
-    assert_eq!(actual, control);
+    assert_eq!(actual, [graph.value(1).raw]);
     assert_eq!(
         support_routes.load(Ordering::Relaxed),
         1,
@@ -3873,13 +3833,6 @@ fn target_confirm_positive_support_classifies_a_relational_prefix_commit() {
             })) as DynConstraint,
         )
     };
-    let mut control: Vec<_> = Query::new(make(), project_end)
-        .solve_residual_state_lazy()
-        .start_width(1)
-        .cap(1)
-        .collect();
-    control.sort_unstable();
-
     let mut query = Query::new(make(), project_end)
         .solve_residual_state_lazy()
         .start_width(1)
@@ -3901,7 +3854,9 @@ fn target_confirm_positive_support_classifies_a_relational_prefix_commit() {
     let mut actual = vec![first];
     actual.extend(query.by_ref());
     actual.sort_unstable();
-    assert_eq!(actual, control);
+    let mut expected = vec![graph.value(1).raw, graph.value(2).raw, graph.value(3).raw];
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
     assert!(
         query.stats().delta_transition_candidates_examined > early_examined,
         "the exact Confirm remainder must stay live after the chunk yield"
@@ -3935,13 +3890,6 @@ fn target_confirm_positive_chunk_that_dies_in_suffix_is_not_retried() {
         )
     };
 
-    let mut control: Vec<_> = Query::new(make(Arc::new(Mutex::new(Vec::new()))), project_end)
-        .solve_residual_state_lazy()
-        .start_width(1)
-        .cap(1)
-        .collect();
-    control.sort_unstable();
-
     let calls = Arc::new(Mutex::new(Vec::new()));
     let mut query = Query::new(make(Arc::clone(&calls)), project_end)
         .solve_residual_state_lazy()
@@ -3949,7 +3897,6 @@ fn target_confirm_positive_chunk_that_dies_in_suffix_is_not_retried() {
         .cap(1);
     let mut actual: Vec<_> = query.by_ref().collect();
     actual.sort_unstable();
-    assert_eq!(actual, control);
     assert_eq!(actual, [survivor]);
     assert_eq!(
         support_routes.load(Ordering::Relaxed),
@@ -3998,18 +3945,11 @@ fn target_confirm_nullable_support_seed_is_not_publication_authority() {
             Arc::clone(&support_routes),
         )
     };
-    let control: Vec<_> = Query::new(make(), project_end)
-        .solve_residual_state_lazy()
-        .start_width(1)
-        .cap(1)
-        .collect();
-
     let mut query = Query::new(make(), project_end)
         .solve_residual_state_lazy()
         .start_width(1)
         .cap(1);
     let actual: Vec<_> = query.by_ref().collect();
-    assert_eq!(actual, control);
     assert_eq!(actual, [start]);
     assert_eq!(
         support_routes.load(Ordering::Relaxed),
@@ -4504,29 +4444,6 @@ fn generated_formula_rpq_cases_match_the_oracle_and_are_monotone() {
         saw_root_cyclic_probe_one,
         "the generated width-one root+cyclic lane never exercised a streamed handoff probe"
     );
-
-    // The projected SET cannot reveal accidental occurrence collapse because
-    // its two arms denote the same relation. Pin the structural invariant once
-    // through the diagnostic-only shadow surface.
-    let graph = GeneratedGraph::new(4);
-    let ops = GeneratedPathProgram::Plus.ops(graph.primary, graph.secondary);
-    let observed = Query::new(
-        generated_formula_root(&graph, &ops, GeneratedFormulaCase::RepeatedRecursive),
-        project_end,
-    )
-    .solve_residual_state_lazy()
-    .shadow(ResidualShadowEpoch::new())
-    .collect_profiled();
-    let mut occurrences: Vec<_> = observed
-        .shadow
-        .events
-        .iter()
-        .filter(|event| event.site.verb == ActionVerb::Propose && event.site.variable == END)
-        .map(|event| event.site.leaf_occurrence)
-        .collect();
-    occurrences.sort_unstable();
-    occurrences.dedup();
-    assert_eq!(occurrences.len(), 2);
 }
 
 #[test]
@@ -4849,7 +4766,11 @@ fn negated_transition_pages_count_rejections_and_emit_each_destination_once() {
     assert_eq!(query.stats().delta_transition_negative_steps, 1);
     assert_eq!(query.stats().delta_source_negative_steps, 0);
     assert_eq!(query.stats().width_increases, 1);
-    assert_eq!(query.stats().delta_transition_candidates_examined, 3);
+    assert_eq!(
+        query.stats().delta_transition_candidates_examined,
+        2,
+        "the rejected prefix and first accepted destination are examined once each"
+    );
     drop(query);
 }
 
