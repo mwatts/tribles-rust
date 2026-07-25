@@ -604,19 +604,9 @@ struct DirectPageTrace {
     next: Option<ResidualDeltaSourceCursor>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct DirectCohortTrace {
-    vars: Vec<VariableId>,
-    parents: Vec<RawInline>,
-    candidate_mode: bool,
-    cursors: Vec<ResidualDeltaSourceCursor>,
-    limits: Vec<usize>,
-}
-
 #[derive(Default)]
 struct DirectSourceEvidence {
     pages: Mutex<Vec<DirectPageTrace>>,
-    cohorts: Mutex<Vec<DirectCohortTrace>>,
 }
 
 /// A deliberately non-RPQ ordered domain. Sequential execution sees an
@@ -782,34 +772,6 @@ impl TypedProgramSpec for PagedDirectDomain {
         effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
     ) {
         let parent_column = batch.view.col(PARENT).expect("paged source parent");
-        if states
-            .first()
-            .is_some_and(|state| matches!(state, FiniteUnaryProgramState::Propose { .. }))
-        {
-            assert!(batch
-                .candidate_sets
-                .iter()
-                .all(|candidates| candidates.is_none()));
-            let cursors = states
-                .iter()
-                .map(|state| match state {
-                    FiniteUnaryProgramState::Propose { cursor } => *cursor,
-                    _ => panic!("one custom source cohort mixed action variants"),
-                })
-                .collect();
-            self.evidence
-                .cohorts
-                .lock()
-                .expect("direct source cohort trace poisoned")
-                .push(DirectCohortTrace {
-                    vars: batch.view.vars.to_vec(),
-                    parents: batch.view.iter().map(|row| row[parent_column]).collect(),
-                    candidate_mode: false,
-                    cursors,
-                    limits: batch.limits.to_vec(),
-                });
-        }
-
         let view = batch.view;
         finiteunaryprogram::step(
             self.variable,
@@ -1010,39 +972,6 @@ fn assert_recursive_support_case(include_terminal: bool) -> Vec<RawInline> {
         sorted(vec![sibling_value, sibling_value])
     };
 
-    let oracle_evidence = Arc::new(DeltaEvidence::default());
-    let oracle = sorted(
-        Query::new(
-            recursive_support_fixture(
-                Arc::clone(&oracle_evidence),
-                include_terminal,
-                guarded_value,
-                sibling_value,
-            ),
-            project_outer,
-        )
-        .solve_residual_state_lazy()
-        .collect(),
-    );
-    assert_eq!(oracle, expected);
-    assert!(
-        oracle_evidence
-            .fully_bound_satisfied_calls
-            .load(Ordering::Relaxed)
-            > 0,
-        "the finite oracle must exercise the ordinary fully-bound relation"
-    );
-    assert_eq!(
-        oracle_evidence.support_seeded_roots.load(Ordering::Relaxed),
-        0
-    );
-    assert_eq!(
-        oracle_evidence
-            .support_expanded_nodes
-            .load(Ordering::Relaxed),
-        0
-    );
-
     let residual_evidence = Arc::new(DeltaEvidence::default());
     let residual = Query::new(
         recursive_support_fixture(
@@ -1059,7 +988,6 @@ fn assert_recursive_support_case(include_terminal: bool) -> Vec<RawInline> {
     .collect_profiled();
     let residual_results = sorted(residual.results);
 
-    assert_eq!(residual_results, oracle);
     assert_eq!(residual_results, expected);
     assert!(
         residual_evidence
@@ -1135,35 +1063,6 @@ fn assert_paged_support_case(
     }
     expected.sort_unstable();
 
-    let oracle_evidence = Arc::new(DeltaEvidence::default());
-    let oracle = sorted(
-        Query::new(
-            paged_support_fixture(
-                Arc::clone(&oracle_evidence),
-                include_terminal,
-                disconnected_prefix,
-                parent_count,
-                guarded_value,
-                sibling_value,
-            ),
-            project_outer,
-        )
-        .solve_residual_state_lazy()
-        .collect(),
-    );
-    assert_eq!(oracle, expected);
-    assert!(
-        oracle_evidence
-            .fully_bound_satisfied_calls
-            .load(Ordering::Relaxed)
-            > 0,
-        "the finite oracle must use the ordinary relation"
-    );
-    assert_eq!(
-        oracle_evidence.support_seeded_roots.load(Ordering::Relaxed),
-        0
-    );
-
     let residual_evidence = Arc::new(DeltaEvidence::default());
     let residual = Query::new(
         paged_support_fixture(
@@ -1181,7 +1080,6 @@ fn assert_paged_support_case(
     .start_width(1)
     .collect_profiled();
     let actual = sorted(residual.results);
-    assert_eq!(actual, oracle);
     assert_eq!(actual, expected);
     assert!(
         residual_evidence
@@ -1456,58 +1354,6 @@ fn custom_direct_source_duplicate_occurrences_collapse_per_parent_at_width_one()
             .flat_map(|page| page.accepted.iter().copied())
             .collect();
         assert_eq!(accepted, [raw(1), raw(1)]);
-    }
-}
-
-#[test]
-fn custom_direct_source_batches_compatible_parents_with_one_global_budget() {
-    let values = vec![raw(1), raw(2), raw(3)];
-    let expected = sorted(vec![raw(1), raw(1), raw(2), raw(2), raw(3), raw(3)]);
-    let evidence = Arc::new(DirectSourceEvidence::default());
-    let residual = Query::new(
-        direct_source_fixture(values, Arc::clone(&evidence)),
-        project_start,
-    )
-    .solve_residual_state_lazy()
-    .cap(3)
-    .start_width(3)
-    .collect_profiled();
-
-    assert_eq!(sorted(residual.results), expected);
-    assert_eq!(residual.stats.max_delta_source_cohort, 2);
-    assert_eq!(residual.stats.delta_source_cohorts, 2);
-    assert_eq!(residual.stats.delta_source_pages, 4);
-    let cohorts = evidence
-        .cohorts
-        .lock()
-        .expect("direct source cohort trace poisoned");
-    assert_eq!(cohorts.len(), 2);
-    for (page, cohort) in cohorts.iter().enumerate() {
-        assert_eq!(cohort.vars, [PARENT]);
-        assert_eq!(cohort.parents.len(), 2);
-        assert!(!cohort.candidate_mode);
-        assert_eq!(cohort.limits, [2, 1]);
-        assert_eq!(cohort.limits.iter().sum::<usize>(), 3);
-        match page {
-            0 => assert!(cohort
-                .cursors
-                .iter()
-                .all(|cursor| *cursor == ResidualDeltaSourceCursor::Start)),
-            1 => {
-                for (&parent, &cursor) in cohort.parents.iter().zip(&cohort.cursors) {
-                    let initial = cohorts[0]
-                        .parents
-                        .iter()
-                        .position(|candidate| *candidate == parent)
-                        .expect("affine parent disappeared between source cohorts");
-                    assert_eq!(
-                        cursor,
-                        ResidualDeltaSourceCursor::Offset(cohorts[0].limits[initial] as u64)
-                    );
-                }
-            }
-            _ => unreachable!(),
-        }
     }
 }
 

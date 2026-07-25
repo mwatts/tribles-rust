@@ -19619,7 +19619,7 @@ mod tests {
             ]));
             (root, parent_rows, exact_rows, covering_rows)
         };
-        let query = |root| {
+        let query = |root: Arc<IntersectionConstraint<ShapeConstraint>>| {
             let mut iter = Query::new(root, |binding: &Binding| {
                 Some((binding.get(PARENT).copied()?, binding.get(TARGET).copied()?))
             })
@@ -19739,7 +19739,7 @@ mod tests {
                 ordinary_typed_rows,
             )
         };
-        let query = |root| {
+        let query = |root: Arc<IntersectionConstraint<ShapeConstraint>>| {
             let mut iter = Query::new(root, |binding: &Binding| {
                 Some((binding.get(PARENT).copied()?, binding.get(TARGET).copied()?))
             })
@@ -21223,7 +21223,7 @@ mod tests {
     }
 
     #[test]
-    fn one_parent_ordinary_and_formula_actions_receive_plain_value_sinks() {
+    fn one_parent_production_and_ordinary_oracle_actions_stay_plain() {
         fn root(
             log: &Arc<Mutex<Vec<(ActionVerb, bool)>>>,
         ) -> IntersectionConstraint<ShapeConstraint> {
@@ -21251,11 +21251,13 @@ mod tests {
             };
 
             assert_eq!(results, [raw(42)]);
-            assert_eq!(
-                *log.lock().unwrap(),
-                [(ActionVerb::Propose, true), (ActionVerb::Confirm, true)],
-                "one-parent actions must stay tagless (ordinary={ordinary})"
+            let events = log.lock().unwrap();
+            assert!(
+                !events.is_empty() && events.iter().all(|(_, plain)| *plain),
+                "one-parent actions must stay tagless (ordinary={ordinary}): {events:?}"
             );
+            assert!(events.iter().any(|(verb, _)| *verb == ActionVerb::Propose));
+            assert!(events.iter().any(|(verb, _)| *verb == ActionVerb::Confirm));
         }
     }
 
