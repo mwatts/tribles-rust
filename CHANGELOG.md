@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Query::residual_lowering`, `ResidualLowering`, `FormulaScope`,
   `ProgramScope`, and `solve_residual_state_lazy_with` are removed rather than
   retained as never-shipped compatibility or tuning surfaces.
+- **The residual compiler no longer carries the synthetic WholeRoot
+  experiment.** Native AND leaves remain in the ordinary residual plan, while
+  finite Formula control begins only at Union occurrences. The deferred
+  root-AND quote carrier, its direct-root candidate paging path, and the
+  never-shipped `Constraint::residual_and_estimate_is_child_minimum`
+  certificate are removed; production Union Formula and RPQ execution are
+  unchanged.
 - **Breaking: serial residual execution now has one iterator implementation.**
   The never-shipped eager `solve_residual_state` and
   `solve_residual_state_profiled` entry points, their private worklist loop,

@@ -2989,7 +2989,7 @@ impl StateDesc {
     /// SET-admitted candidate occurrences are independent scheduling atoms
     /// unless a selected typed Program route reuses the complete parent
     /// activation.
-    fn uses_candidate_pages(&self, plan: &ResidualPlan, formula_pcs: &FormulaPcInterner) -> bool {
+    fn uses_candidate_pages(&self, plan: &ResidualPlan, _formula_pcs: &FormulaPcInterner) -> bool {
         match &self.phase {
             ResidualPhase::Candidate {
                 variable,
@@ -12213,7 +12213,6 @@ mod tests {
     use crate::query::unionconstraint::UnionConstraint;
     #[cfg(feature = "parallel")]
     use rayon::prelude::*;
-    use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -12784,95 +12783,6 @@ mod tests {
             candidates: &mut CandidateSink<'_>,
         ) {
             self.0.confirm(variable, view, candidates);
-        }
-
-        fn residual_program(&self) -> Option<ProgramRef<'_>> {
-            Some(ProgramRef::new(self))
-        }
-    }
-
-    #[derive(Clone, Copy)]
-    struct ConditionalParentAtomicProgramLeaf {
-        variable: VariableId,
-        required: VariableId,
-    }
-
-    impl TypedProgramSpec for ConditionalParentAtomicProgramLeaf {
-        type State = ();
-        type NoveltyKey = ();
-        type Rank = ();
-
-        fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-            (matches!(request.action, ProgramAction::Confirm(variable) if variable == self.variable)
-                && request.bound.is_set(self.required))
-            .then_some(ProgramRoute {
-                key: ProgramKey::new(0),
-                variable: self.variable,
-                stratum: ProgramStratum::Fixpoint,
-                grouping: ProgramGrouping::ParentAtomic,
-                completion: ProgramCompletion::PageableOnly,
-            })
-        }
-
-        fn dispatch(&self, _state: &Self::State) -> DispatchClass {
-            unreachable!("planning-only conditional ParentAtomic fixture was executed")
-        }
-
-        fn progress(&self, _state: &Self::State) -> Self::Rank {
-            unreachable!("planning-only conditional ParentAtomic fixture was executed")
-        }
-
-        fn seed_typed(
-            &self,
-            _batch: ProgramSeedBatch<'_>,
-            _effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
-        ) {
-            unreachable!("planning-only conditional ParentAtomic fixture was executed")
-        }
-
-        fn step_typed(
-            &self,
-            _states: &mut Vec<Self::State>,
-            _batch: TypedProgramBatch<'_>,
-            _effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
-        ) {
-            unreachable!("planning-only conditional ParentAtomic fixture was executed")
-        }
-    }
-
-    impl Constraint<'static> for ConditionalParentAtomicProgramLeaf {
-        fn variables(&self) -> VariableSet {
-            VariableSet::new_singleton(self.variable)
-                .union(VariableSet::new_singleton(self.required))
-        }
-
-        fn estimate(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            out: &mut EstimateSink<'_>,
-        ) -> bool {
-            if variable != self.variable {
-                return false;
-            }
-            out.fill(1, view.len());
-            true
-        }
-
-        fn propose(
-            &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
-        ) {
-        }
-
-        fn confirm(
-            &self,
-            _variable: VariableId,
-            _view: &RowsView<'_>,
-            _candidates: &mut CandidateSink<'_>,
-        ) {
         }
 
         fn residual_program(&self) -> Option<ProgramRef<'_>> {
@@ -25259,10 +25169,15 @@ mod tests {
         else {
             panic!("the finite confirmer filed a non-Formula payload")
         };
-        let CandidatePayload::Values(values) = batch.input() else {
-            panic!("the singleton Formula admission changed payload representation")
-        };
-        assert_eq!(values, &[raw(2), raw(1)]);
+        let (source, accumulator) = batch
+            .last_or()
+            .expect("the production Formula root retained no Union source");
+        assert_eq!(accumulator.pending_len(), 0);
+        assert!(matches!(source, CandidatePayload::Deferred(_)));
+        assert_eq!(
+            source.iter().collect::<Vec<_>>(),
+            vec![(0, raw(2)), (0, raw(1))]
+        );
     }
 
     #[test]
