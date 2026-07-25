@@ -86,8 +86,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its ordinary, paged, typed-Program, and complete-equivalent routes; the
   never-shipped `fixed_denotation` switch and parallel certified action methods
   are removed. Planning always uses `ProposalCoverage` for logical source
-  eligibility. `propose_with_layout` and its `ProposalLayout` report only
-  physical `(parent, value)` uniqueness for optional deduplication elision, and
+  eligibility, physical proposal multiplicity remains an execution detail, and
   estimates remain cost guidance only.
 - **Finite-Formula structural control is interned independently from its
   canonical outer Candidate exit.** Residual Formula state now carries an

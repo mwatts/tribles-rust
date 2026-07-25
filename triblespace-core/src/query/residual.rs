@@ -6743,9 +6743,7 @@ fn propose_leaf<'a>(
     view: &RowsView<'_>,
     candidates: &mut CandidateSink<'_>,
 ) {
-    _ = plan
-        .resolve(root, leaf)
-        .propose_with_layout(variable, view, candidates);
+    plan.resolve(root, leaf).propose(variable, view, candidates);
 }
 
 fn allocate_activations(next: &mut u64, count: usize) -> Vec<ActivationId> {
@@ -8445,11 +8443,7 @@ fn formula_action_transition<'a>(
     match stage {
         FormulaStage::Support => unreachable!("support returned above"),
         FormulaStage::Propose => {
-            _ = constraint.propose_with_layout(
-                variable,
-                &view,
-                &mut result.sink(batch.parents.row_count),
-            );
+            constraint.propose(variable, &view, &mut result.sink(batch.parents.row_count));
             stats.candidates_proposed += result.len();
             stats.max_propose_candidates = stats.max_propose_candidates.max(result.len());
         }
@@ -11727,15 +11721,6 @@ impl<'a, C: Constraint<'a>> Constraint<'a> for OrdinaryConstraintOracle<C> {
         candidates: &mut CandidateSink<'_>,
     ) {
         self.0.confirm(variable, view, candidates);
-    }
-
-    fn propose_with_layout(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) -> ProposalLayout {
-        self.0.propose_with_layout(variable, view, candidates)
     }
 
     fn satisfied(&self, view: &RowsView<'_>) -> bool {

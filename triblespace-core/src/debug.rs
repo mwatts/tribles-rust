@@ -5,7 +5,6 @@ pub mod query {
     use crate::query::EstimateSink;
     use crate::query::ProgramRef;
     use crate::query::ProposalCoverage;
-    use crate::query::ProposalLayout;
     use crate::query::RowsView;
     use crate::query::VariableId;
     use crate::query::VariableSet;
@@ -62,17 +61,6 @@ pub mod query {
             candidates: &mut CandidateSink<'_>,
         ) {
             self.constraint.confirm(variable, view, candidates);
-        }
-
-        fn propose_with_layout(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) -> ProposalLayout {
-            self.record.borrow_mut().push(variable);
-            self.constraint
-                .propose_with_layout(variable, view, candidates)
         }
 
         fn satisfied(&self, view: &RowsView<'_>) -> bool {
@@ -159,16 +147,6 @@ pub mod query {
             candidates: &mut CandidateSink<'_>,
         ) {
             self.constraint.confirm(variable, view, candidates);
-        }
-
-        fn propose_with_layout(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) -> ProposalLayout {
-            self.constraint
-                .propose_with_layout(variable, view, candidates)
         }
 
         fn satisfied(&self, view: &RowsView<'_>) -> bool {

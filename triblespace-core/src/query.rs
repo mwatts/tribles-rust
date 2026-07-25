@@ -1045,45 +1045,6 @@ pub enum ProposalCoverage {
     Exact,
 }
 
-/// Physical multiplicity layout of one completed proposal action.
-///
-/// Every [`CandidateSink`] is grouped by parent row. `GroupedSet` strengthens
-/// that representation fact by proving that the concrete result contains at
-/// most one occurrence of each `(parent, value)` pair. `GroupedBag` makes no
-/// multiplicity claim. This receipt is affine execution evidence about the
-/// sink just filled; it is independent of the static denotational
-/// [`ProposalCoverage`] receipt. In particular, an `Exact` proposal may still
-/// contain duplicate physical occurrences.
-///
-/// Any lawful [`Constraint::confirm`] subbag preserves `GroupedSet`: deleting
-/// occurrences cannot introduce a duplicate. Appending, merging, or otherwise
-/// introducing occurrences requires a fresh receipt.
-#[doc(hidden)]
-#[derive(Default)]
-#[must_use]
-pub struct ProposalLayout(ProposalLayoutKind);
-
-#[derive(Default)]
-enum ProposalLayoutKind {
-    #[default]
-    GroupedBag,
-    GroupedSet,
-}
-
-impl ProposalLayout {
-    /// Construction proof available only to trusted in-crate issuers. Keeping
-    /// this constructor private to the crate lets the receipt evolve without
-    /// making a strong physical-layout claim part of the public Constraint
-    /// implementation surface.
-    pub(crate) const fn grouped_set() -> Self {
-        Self(ProposalLayoutKind::GroupedSet)
-    }
-
-    pub(crate) const fn is_grouped_set(&self) -> bool {
-        matches!(&self.0, ProposalLayoutKind::GroupedSet)
-    }
-}
-
 /// Logarithmic unit-work tier for one proposal candidate occurrence.
 ///
 /// Rank `r` in `0..=63` represents the broad capability class `2^r`. Ranks are
@@ -1515,28 +1476,6 @@ pub trait Constraint<'a> {
         candidates: &mut CandidateSink<'_>,
     );
 
-    /// Proposes and reports the physical layout of this concrete result.
-    ///
-    /// The conservative default executes the ordinary proposal and reports the
-    /// conservative grouped-bag layout. Trusted in-crate implementations may
-    /// report the stronger grouped-set layout only when construction of this
-    /// exact sink proves that every `(parent, value)` pair is unique.
-    /// Static proposal coverage, estimates, and the set-valued denotation do
-    /// not imply that physical fact.
-    ///
-    /// The method remains object-safe so logical composites can propagate a
-    /// selected child's concrete receipt without changing [`CandidateSink`].
-    #[doc(hidden)]
-    fn propose_with_layout(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) -> ProposalLayout {
-        self.propose(variable, view, candidates);
-        ProposalLayout::default()
-    }
-
     /// Returns whether **every row** of the block is consistent with this
     /// constraint.
     ///
@@ -1706,16 +1645,6 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.confirm(variable, view, candidates)
     }
 
-    fn propose_with_layout(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) -> ProposalLayout {
-        let inner: &T = self;
-        inner.propose_with_layout(variable, view, candidates)
-    }
-
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         let inner: &T = self;
         inner.satisfied(view)
@@ -1799,16 +1728,6 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     ) {
         let inner: &T = self;
         inner.confirm(variable, view, candidates)
-    }
-
-    fn propose_with_layout(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) -> ProposalLayout {
-        let inner: &T = self;
-        inner.propose_with_layout(variable, view, candidates)
     }
 
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
@@ -2409,9 +2328,6 @@ macro_rules! temp {
 }
 /// Re-export of the [`temp!`] macro.
 pub use temp;
-
-#[cfg(test)]
-mod proposal_layout_tests;
 
 #[cfg(test)]
 mod tests {

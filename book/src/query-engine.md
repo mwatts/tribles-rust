@@ -74,11 +74,6 @@ bound values or estimates. Every surviving non-full query state needs at least
 one Covering or Exact source, while confirmation-only occurrences may remain
 at `None`.
 
-`propose_with_layout` additionally returns a `ProposalLayout` for the concrete
-sink it just filled. This is only a physical uniqueness receipt: a grouped-set
-layout can let the engine elide a deduplication pass, but it does not strengthen
-coverage or change the denoted relation.
-
 Five laws are load-bearing for correctness:
 
 1. Ordinary, paged, typed-Program, and complete-equivalent routes must agree on

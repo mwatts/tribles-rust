@@ -496,12 +496,6 @@ values or estimates. Every surviving non-full query state needs at least one
 Covering or Exact source, while a confirmation-only constraint may publish
 `None`.
 
-The engine may invoke `propose_with_layout` to receive a `ProposalLayout`
-alongside a completed proposal. That receipt describes only the physical
-uniqueness of `(parent, value)` occurrences in that particular sink, allowing
-an optional deduplication elision. It does not strengthen proposal coverage or
-alter the constraint's SET meaning.
-
 Every live fresh ordinary iterator uses canonical residual states. A one-row
 action receives a one-row
 [`RowsView`](triblespace::core::query::RowsView) and compact plain-value sinks;

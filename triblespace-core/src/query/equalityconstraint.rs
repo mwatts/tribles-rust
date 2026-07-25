@@ -100,17 +100,6 @@ impl<'c> Constraint<'c> for EqualityConstraint {
         }
     }
 
-    fn propose_with_layout(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) -> ProposalLayout {
-        self.propose(variable, view, candidates);
-        // Each parent contributes either its one bound peer value or nothing.
-        ProposalLayout::grouped_set()
-    }
-
     /// Retains only candidates matching their row's peer value.
     fn confirm(
         &self,

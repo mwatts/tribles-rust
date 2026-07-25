@@ -137,10 +137,10 @@ where
         variable: VariableId,
         view: &RowsView<'_>,
         candidates: &mut CandidateSink<'_>,
-    ) -> ProposalLayout {
+    ) {
         let sources = self.target_sources(variable, view.bound());
         if sources.is_empty() || view.is_empty() {
-            return ProposalLayout::default();
+            return;
         }
 
         if matches!(candidates, CandidateSink::Values(_)) {
@@ -156,12 +156,12 @@ where
                     (estimate, index)
                 })
                 .expect("non-empty covering sources");
-            let layout = self.constraints[proposer].propose_with_layout(variable, view, candidates);
+            self.constraints[proposer].propose(variable, view, candidates);
             let skip = (coverage == ProposalCoverage::Exact).then_some(proposer);
             for (_, index) in self.validator_order(variable, view, skip) {
                 self.constraints[index].confirm(variable, view, candidates);
             }
-            return layout;
+            return;
         }
 
         let n_rows = view.len();
@@ -190,26 +190,21 @@ where
         }
 
         let uniform = (0..sources.len()).find(|&source| propose_counts[source] == n_rows);
-        let layout = if let Some(source) = uniform {
-            self.constraints[sources[source].0].propose_with_layout(variable, view, candidates)
+        if let Some(source) = uniform {
+            self.constraints[sources[source].0].propose(variable, view, candidates);
         } else {
             let mut scratch = Vec::new();
-            let mut layout = ProposalLayout::grouped_set();
             for (row, &source) in proposers.iter().enumerate() {
                 let row_view = view.row_view(row);
                 scratch.clear();
-                let row_layout = self.constraints[sources[source as usize].0].propose_with_layout(
+                self.constraints[sources[source as usize].0].propose(
                     variable,
                     &row_view,
                     &mut CandidateSink::Values(&mut scratch),
                 );
-                if !row_layout.is_grouped_set() {
-                    layout = ProposalLayout::default();
-                }
                 candidates.extend_row(row as u32, scratch.iter().copied());
             }
-            layout
-        };
+        }
 
         let skip = uniform.and_then(|source| {
             (sources[source].1 == ProposalCoverage::Exact).then_some(sources[source].0)
@@ -218,7 +213,6 @@ where
         for (_, index) in self.validator_order(variable, &first, skip) {
             self.constraints[index].confirm(variable, view, candidates);
         }
-        layout
     }
 
     fn confirm_intersection(
@@ -302,7 +296,7 @@ where
         view: &RowsView<'_>,
         candidates: &mut CandidateSink<'_>,
     ) {
-        _ = self.propose_intersection(variable, view, candidates);
+        self.propose_intersection(variable, view, candidates);
     }
 
     /// Confirms a whole frontier through every relevant child in
@@ -314,15 +308,6 @@ where
         candidates: &mut CandidateSink<'_>,
     ) {
         self.confirm_intersection(variable, view, candidates)
-    }
-
-    fn propose_with_layout(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) -> ProposalLayout {
-        self.propose_intersection(variable, view, candidates)
     }
 
     /// Returns `true` only when **every** child is satisfied.

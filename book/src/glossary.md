@@ -68,10 +68,9 @@ methods—`variables`, `estimate`, `propose`, `confirm`, and `satisfied`—plus 
 static `influence` dependency hint let the Atreides solver navigate the search
 space without a separate planner. Every occurrence denotes one fixed raw-inline SET relation,
 shared by its ordinary, paged, typed-Program, and complete-equivalent routes.
-`proposal_coverage` identifies sound proposal sources; `ProposalLayout` is only
-a physical uniqueness receipt for a completed `propose_with_layout` call.
-Estimates guide cost ordering and never change semantics. Custom data sources
-and application predicates participate in queries by implementing this trait.
+`proposal_coverage` identifies sound proposal sources. Estimates guide cost
+ordering and never change semantics. Custom data sources and application
+predicates participate in queries by implementing this trait.
 
 ### Entity
 The first position in a trible. Entities identify the subject making a

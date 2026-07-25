@@ -27,10 +27,8 @@ of its ordinary, paged, typed-Program, and complete-equivalent routes must
 implement that same relation. `proposal_coverage` identifies sound proposal
 sources independently of estimates: Covering proposals contain the complete
 existential fiber and are self-confirmed, while Exact proposals equal it.
-Confirmation-only occurrences may publish no source claim. A
-`ProposalLayout` returned by `propose_with_layout` describes only physical
-uniqueness in that completed proposal and can elide deduplication; it is not a
-semantic receipt.
+Confirmation-only occurrences may publish no source claim. A proposal's
+physical occurrence multiplicity does not change that SET denotation.
 
 Traditional databases rely on a query planner to combine statistics into a join
 plan. Atreides instead consults the constraints directly while it searches. Each

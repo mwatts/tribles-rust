@@ -254,17 +254,6 @@ impl<'a> Constraint<'a> for ConstantConstraint {
         }
     }
 
-    fn propose_with_layout(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) -> ProposalLayout {
-        self.propose(variable, view, candidates);
-        // Construction emits at most one value for each parent row.
-        ProposalLayout::grouped_set()
-    }
-
     /// The constant is binding-independent, so confirm is a single retain
     /// over the whole frontier — no per-row work at all.
     fn confirm(

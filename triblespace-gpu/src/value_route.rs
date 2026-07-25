@@ -76,9 +76,8 @@ use triblespace_core::query::{
     CandidateSink, Constraint, ConstraintChildren, ConstraintShape, DispatchClass, EstimateSink,
     PreferredProgram, ProgramAction, ProgramCompletion, ProgramGrouping, ProgramKey, ProgramPacing,
     ProgramPhysicalReceipt, ProgramRef, ProgramRequest, ProgramRoute, ProgramSeedBatch,
-    ProgramStratum, ProposalCoverage, ProposalLayout, RawTerm, RowsView, Term, TriblePattern,
-    TypedEffectSink, TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink, VariableId,
-    VariableSet,
+    ProgramStratum, ProposalCoverage, RawTerm, RowsView, Term, TriblePattern, TypedEffectSink,
+    TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink, VariableId, VariableSet,
 };
 
 use crate::budgeted::CohortGrants;
@@ -1494,17 +1493,6 @@ where
         candidates: &mut CandidateSink<'_>,
     ) {
         self.program.canonical().confirm(variable, view, candidates)
-    }
-
-    fn propose_with_layout(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) -> ProposalLayout {
-        self.program
-            .canonical()
-            .propose_with_layout(variable, view, candidates)
     }
 
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
