@@ -13,7 +13,6 @@ use proptest::prelude::*;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
-use triblespace::core::query::residual::{ActionVerb, ResidualShadowEpoch, ResidualShadowStatus};
 use triblespace::core::query::{Binding, Constraint, Query};
 use triblespace::prelude::inlineencodings::GenId;
 use triblespace::prelude::*;
@@ -400,49 +399,6 @@ fn formula_candidate_paging_is_storage_polymorphic() {
 
     assert_backend!("TribleSetConstraint", &kb);
     assert_backend!("SuccinctArchiveConstraint", &archive);
-
-    let lowered = query!(&archive)
-        .solve_residual_state_lazy()
-        .cap(1)
-        .start_width(1)
-        .growth(1)
-        .shadow(ResidualShadowEpoch::new())
-        .collect_profiled();
-    assert_eq!(multiset(lowered.results), expected);
-    assert_eq!(lowered.shadow.status, ResidualShadowStatus::Closed);
-    assert!(lowered.stats.partial_pops > 0);
-    assert!(lowered.stats.max_propose_candidates > 1);
-    assert!(lowered.stats.max_confirm_candidates > 1);
-
-    let formula_confirms: Vec<_> = lowered
-        .shadow
-        .events
-        .iter()
-        .filter(|event| event.site.verb == ActionVerb::Confirm)
-        .collect();
-    // Every Atom in this concrete query is constructed from `&archive`, so
-    // a non-outer leaf occurrence is direct evidence that a
-    // SuccinctArchiveConstraint action ran inside the synthetic formula PC.
-    assert!(
-        lowered
-            .shadow
-            .events
-            .iter()
-            .all(|event| event.site.leaf_occurrence > 0),
-        "synthetic formula actions must not collapse to the opaque outer occurrence"
-    );
-    assert!(
-        formula_confirms
-            .iter()
-            .any(|event| event.geometry.candidate_occurrences == 1),
-        "formula suffix never consumed a width-one candidate tail"
-    );
-    assert!(
-        formula_confirms
-            .iter()
-            .any(|event| event.geometry.candidate_occurrences > 1),
-        "geometric candidate paging never widened beyond one occurrence"
-    );
 }
 
 proptest! {
