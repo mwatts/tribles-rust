@@ -60,10 +60,6 @@ impl<'a, C: Constraint<'a>> Constraint<'a> for Atomic<C> {
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         self.0.satisfied(view)
     }
-
-    fn influence(&self, variable: VariableId) -> VariableSet {
-        self.0.influence(variable)
-    }
 }
 
 #[derive(Clone, Copy)]

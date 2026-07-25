@@ -66,10 +66,6 @@ pub mod query {
         fn satisfied(&self, view: &RowsView<'_>) -> bool {
             self.constraint.satisfied(view)
         }
-
-        fn influence(&self, variable: VariableId) -> VariableSet {
-            self.constraint.influence(variable)
-        }
     }
 
     /// Constraint wrapper that overrides cardinality estimates for selected variables.
@@ -151,10 +147,6 @@ pub mod query {
 
         fn satisfied(&self, view: &RowsView<'_>) -> bool {
             self.constraint.satisfied(view)
-        }
-
-        fn influence(&self, variable: VariableId) -> VariableSet {
-            self.constraint.influence(variable)
         }
 
         // EstimateOverrideConstraint changes only the planner's cardinality

@@ -1237,10 +1237,6 @@ pub trait ConstraintChildren<'a> {
 /// | [`confirm`](Constraint::confirm) | Filters candidates proposed by another constraint. | On all remaining constraints. |
 /// | [`satisfied`](Constraint::satisfied) | Checks whether fully-bound sub-constraints still hold. | Inside composite constraints. |
 ///
-/// [`influence`](Constraint::influence) supplies a static structural
-/// dependency hint. Its cardinality breaks ties between variable estimates in
-/// the same power-of-two magnitude bucket.
-///
 /// [`proposal_coverage`](Constraint::proposal_coverage) is the structural
 /// source-eligibility receipt. A Covering source is confirmed before its
 /// candidates cross a relational boundary.
@@ -1337,16 +1333,13 @@ pub trait ConstraintChildren<'a> {
 /// [`confirm_per_row`] adapter. Override
 /// [`satisfied`](Constraint::satisfied) when the constraint can detect
 /// unsatisfiability early (e.g. a fully-bound triple lookup that found no
-/// match). Override [`influence`](Constraint::influence) when the constraint's
-/// structural estimate dependencies are narrower or less obvious than its
-/// complete variable set. Every occurrence used as a source must publish an appropriate
+/// match). Every occurrence used as a source must publish an appropriate
 /// [`proposal_coverage`](Constraint::proposal_coverage) receipt.
 pub trait Constraint<'a> {
     /// Returns the set of variables this constraint touches.
     ///
     /// Called once at query start. The engine uses this to determine which
-    /// constraints participate when a particular variable is being bound and
-    /// which static dependency counts guide equal-magnitude choices.
+    /// constraints participate when a particular variable is being bound.
     fn variables(&self) -> VariableSet;
 
     /// Returns the proposal proof for `variable` under bound schema `bound`.
@@ -1508,26 +1501,6 @@ pub trait Constraint<'a> {
         true
     }
 
-    /// Returns the set of variables whose estimates may change when
-    /// `variable` is bound or unbound.
-    ///
-    /// The residual solver recomputes current estimates at every Ready state;
-    /// it uses this static set's cardinality only as an equal-magnitude
-    /// variable-choice tiebreak.
-    ///
-    /// The default includes every variable this constraint touches except
-    /// `variable` itself. Returns an empty set when `variable` is not part
-    /// of this constraint.
-    fn influence(&self, variable: VariableId) -> VariableSet {
-        let mut vars = self.variables();
-        if vars.is_set(variable) {
-            vars.unset(variable);
-            vars
-        } else {
-            VariableSet::new_empty()
-        }
-    }
-
     /// Exposes associative structure to shape-aware residual lowering.
     ///
     /// The default keeps the constraint opaque. Implementations must expose
@@ -1650,11 +1623,6 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.satisfied(view)
     }
 
-    fn influence(&self, variable: VariableId) -> VariableSet {
-        let inner: &T = self;
-        inner.influence(variable)
-    }
-
     fn residual_shape(&self) -> ConstraintShape<'_, 'a> {
         let inner: &T = self;
         inner.residual_shape()
@@ -1733,11 +1701,6 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         let inner: &T = self;
         inner.satisfied(view)
-    }
-
-    fn influence(&self, variable: VariableId) -> VariableSet {
-        let inner: &T = self;
-        inner.influence(variable)
     }
 
     fn residual_shape(&self) -> ConstraintShape<'_, 'a> {
@@ -1923,19 +1886,16 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
 /// Total ordering for a row's adaptive variable action. Lower variable IDs win
 /// exact ordering-key ties without relying on unstable-sort tie behavior.
 ///
-/// Smaller candidate-count magnitudes win. Within one power-of-two magnitude
-/// bucket, a variable that can affect more other variables wins; this preserves
-/// the established specificity-first policy without making insignificant
-/// count differences override structural pruning. **Larger key = picked next.**
+/// Smaller candidate-count magnitudes win. Counts in one power-of-two bucket
+/// are equally specific, so lower variable IDs break those ties.
+/// **Larger key = picked next.**
 #[inline]
 fn variable_choice_key(
     variable: VariableId,
     estimate: usize,
-    influence_count: u8,
-) -> (u64, u8, std::cmp::Reverse<VariableId>) {
+) -> (std::cmp::Reverse<u64>, std::cmp::Reverse<VariableId>) {
     (
-        u64::MAX - estimate_magnitude(estimate),
-        influence_count,
+        std::cmp::Reverse(estimate_magnitude(estimate)),
         std::cmp::Reverse(variable),
     )
 }
@@ -2357,16 +2317,16 @@ mod tests {
     }
 
     #[test]
-    fn fixed_variable_choice_key_preserves_magnitude_boundaries_and_ties() {
-        // Cardinality magnitude dominates every tiebreak, including the
-        // special zero-to-one and one-to-two boundaries.
-        assert!(variable_choice_key(2, 0, 0) > variable_choice_key(1, 1, u8::MAX));
-        assert!(variable_choice_key(2, 1, 0) > variable_choice_key(1, 2, u8::MAX));
+    fn fixed_variable_choice_key_uses_magnitude_then_lower_variable_id() {
+        // Cardinality magnitude dominates the variable-ID tiebreak, including
+        // the special zero-to-one and one-to-two boundaries.
+        assert!(variable_choice_key(2, 0) > variable_choice_key(1, 1));
+        assert!(variable_choice_key(2, 1) > variable_choice_key(1, 2));
 
-        // Counts within one power-of-two bucket compare by structural
-        // influence, then deterministically by lower VariableId.
-        assert!(variable_choice_key(2, 3, 4) > variable_choice_key(1, 2, 3));
-        assert!(variable_choice_key(1, 3, 4) > variable_choice_key(2, 2, 4));
+        // Counts within one power-of-two bucket are equally specific and lower
+        // VariableId wins deterministically.
+        assert!(variable_choice_key(1, 3) > variable_choice_key(2, 2));
+        assert!(variable_choice_key(1, 2) > variable_choice_key(2, 3));
     }
 
     fn action_peer(

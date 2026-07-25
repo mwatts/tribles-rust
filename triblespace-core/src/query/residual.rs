@@ -1267,10 +1267,6 @@ impl PartialEq<ConstraintPath> for ResidualLeaf {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ResidualPlan {
     leaves: Vec<ResidualLeaf>,
-    /// Static structural dependency count used to break ties between
-    /// equally specific variable choices. The complete influence sets are not
-    /// runtime state: residual Ready planning refreshes every unbound estimate.
-    influence_counts: [u8; 128],
     /// Structural finite-formula program below lowered Union occurrences.
     /// Runtime migration is intentionally separate from compilation.
     finite_formula: FiniteFormulaProgram,
@@ -1336,18 +1332,8 @@ impl ResidualPlan {
             &mut parent_atomic_program_confirms,
         );
         let finite_formula = FiniteFormulaProgram::compile(root, &leaves);
-        let variables = root.variables();
-        let influence_counts = std::array::from_fn(|variable| {
-            if variables.is_set(variable) {
-                u8::try_from(root.influence(variable).count())
-                    .expect("a VariableSet influence count fits in u8")
-            } else {
-                0
-            }
-        });
         Self {
             leaves,
-            influence_counts,
             finite_formula,
             parent_atomic_program_confirms,
         }
@@ -6878,11 +6864,7 @@ fn ready_plan_transition<'a>(
         let mut best = None;
         for (pi, variable_plan) in plans.iter().enumerate() {
             let estimate = estimate_matrix[pi * rows.row_count + row];
-            let key = variable_choice_key(
-                variable_plan.variable,
-                estimate,
-                plan.influence_counts[variable_plan.variable],
-            );
+            let key = variable_choice_key(variable_plan.variable, estimate);
             if best.is_none_or(|(_, best_key)| key > best_key) {
                 best = Some((pi, key));
             }
@@ -11725,10 +11707,6 @@ impl<'a, C: Constraint<'a>> Constraint<'a> for OrdinaryConstraintOracle<C> {
 
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         self.0.satisfied(view)
-    }
-
-    fn influence(&self, variable: VariableId) -> VariableSet {
-        self.0.influence(variable)
     }
 }
 
@@ -21450,10 +21428,6 @@ mod tests {
 
         fn satisfied(&self, view: &RowsView<'_>) -> bool {
             self.inner.satisfied(view)
-        }
-
-        fn influence(&self, variable: VariableId) -> VariableSet {
-            self.inner.influence(variable)
         }
 
         fn residual_program(&self) -> Option<ProgramRef<'_>> {

@@ -248,10 +248,6 @@ impl<'a> Constraint<'a> for NestedSuccinctConfirm<'a> {
     fn satisfied(&self, view: &RowsView<'_>) -> bool {
         self.inner.satisfied(view)
     }
-
-    fn influence(&self, variable: VariableId) -> VariableSet {
-        self.inner.influence(variable)
-    }
 }
 
 #[test]

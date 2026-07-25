@@ -10,7 +10,7 @@ results.
 ## Constraints as the search frontier
 
 Every constraint implements the [`Constraint`](triblespace::core::query::Constraint) trait,
-whose five operational methods and one static dependency hint shape the search:
+whose five operational methods shape the search:
 
 1. **`variables`** – returns the set of variables this constraint touches.
 2. **`estimate`** – predicts how many results remain for a variable under the
@@ -19,8 +19,6 @@ whose five operational methods and one static dependency hint shape the search:
 4. **`confirm`** – filters a set of candidates without re-enumerating them.
 5. **`satisfied`** – returns `false` when all variables are bound but the
    constraint is unsatisfied. Used by `UnionConstraint` to prune dead variants.
-6. **`influence`** – reports static estimate dependencies. Their count breaks
-   ties between candidate counts in the same power-of-two magnitude bucket.
 
 Every constraint occurrence denotes one fixed raw-inline SET relation, and all
 of its ordinary, paged, typed-Program, and complete-equivalent routes must
@@ -44,7 +42,7 @@ is relevant, whether it is a sound source, or which rows the relation contains.
 Because the heuristics are derived entirely from the constraints themselves, we
 do not need a separate query planner or multiple join implementations. Any
 custom constraint can participate in the same search by providing sensible
-estimates, proposal generation, confirmation, and a static dependency hint.
+estimates, proposal generation, and confirmation.
 
 ## A spectrum of Atreides variants
 
@@ -85,8 +83,7 @@ wrappers that only track total counts behave like Jessica, those that surface
 their tightest per-variable proposals behave like Paul, and structures capable
 of intersecting their children on the fly approach Ghanima's accuracy. The
 engine does not need to know which variant it is running—`estimate` supplies
-whatever fidelity the data structure can provide, while `influence` supplies a
-stable connectivity tiebreak when two counts have the same magnitude.
+whatever fidelity the data structure can provide.
 
 ## Guided depth-first search
 
@@ -100,9 +97,8 @@ solver then repeats one negotiation for each Ready row:
    cost. The source's raw candidate count remains that variable's logical
    specificity estimate.
 3. Choose the next variable with one fixed ordering: smaller candidate-count
-   bit length, then larger static `influence` count, then smaller
-   `VariableId`. Counts in the same power-of-two bucket are deliberately
-   treated as equally specific.
+   bit length, then smaller `VariableId`. Counts in the same power-of-two
+   bucket are deliberately treated as equally specific.
 4. File an explicit `Propose` action for the selected source, SET-admit its
    candidates, then file the remaining relevant occurrences as `Confirm`
    actions from most to least selective.

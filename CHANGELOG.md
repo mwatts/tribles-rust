@@ -52,9 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `OrderKeyMode`, `order_key_mode`, and the `TRIBLES_ORDER_KEY` environment
   switch are removed. Directed action costs still choose the proposal source
   within one variable; variables compare that source's raw candidate-count bit
-  length, then a plan-local static influence count, then `VariableId`.
-  Per-query influence sets and empty-binding base estimates are removed because
-  every Ready state already computes fresh per-row estimates.
+  length, then `VariableId`. The stranded `Constraint::influence` hook and its
+  plan-local count array are removed: every production built-in supplied the
+  same count for all of its variables, while every Ready state already computes
+  fresh per-row estimates.
 - **RPQ complete actions now obey exact scheduler work bounds.** Bound-endpoint
   graph-product traversal admits only a descending parent tail whose examined
   transitions and distinct endpoint outputs fit the current grant; positive

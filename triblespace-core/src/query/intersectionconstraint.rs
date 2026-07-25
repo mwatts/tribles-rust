@@ -315,15 +315,6 @@ where
         self.constraints.iter().all(|c| c.satisfied(view))
     }
 
-    /// Returns the union of all children's influence sets for `variable`.
-    fn influence(&self, variable: VariableId) -> VariableSet {
-        self.constraints
-            .iter()
-            .fold(VariableSet::new_empty(), |acc, c| {
-                acc.union(c.influence(variable))
-            })
-    }
-
     fn residual_shape(&self) -> ConstraintShape<'_, 'a> {
         ConstraintShape::And(self)
     }

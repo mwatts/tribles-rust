@@ -1499,10 +1499,6 @@ where
         self.program.canonical().satisfied(view)
     }
 
-    fn influence(&self, variable: VariableId) -> VariableSet {
-        self.program.canonical().influence(variable)
-    }
-
     fn residual_shape(&self) -> ConstraintShape<'_, 'a> {
         self.program.canonical().residual_shape()
     }

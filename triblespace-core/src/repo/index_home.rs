@@ -2051,10 +2051,6 @@ where
         self.union.satisfied(view)
     }
 
-    fn influence(&self, variable: VariableId) -> VariableSet {
-        self.union.influence(variable)
-    }
-
     fn residual_program(&self) -> Option<ProgramRef<'_>> {
         Some(ProgramRef::new(self))
     }

@@ -749,8 +749,8 @@ impl<'a, U: Universe> QueryProgram<'a, U> {
     /// Executes exactly one affine frontier transition.
     ///
     /// Estimates are exact per pattern. Each row chooses its next variable by
-    /// the general engine's default cardinality-magnitude/influence key; the
-    /// tightest relevant pattern proposes, and every sibling pattern confirms.
+    /// the general engine's cardinality-magnitude/variable-ID key; the tightest
+    /// relevant pattern proposes, and every sibling pattern confirms.
     /// Rows may choose different variables and are returned as one canonical
     /// child frontier per chosen variable. All operations are row-local, so
     /// splitting consecutive input rows and concatenating like child schemas is

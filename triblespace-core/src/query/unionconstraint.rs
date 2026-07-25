@@ -276,15 +276,6 @@ where
         })
     }
 
-    /// Returns the union of all variants' influence sets for `variable`.
-    fn influence(&self, variable: VariableId) -> VariableSet {
-        self.constraints
-            .iter()
-            .fold(VariableSet::new_empty(), |acc, c| {
-                acc.union(c.influence(variable))
-            })
-    }
-
     fn residual_union_children(&self) -> Option<&dyn ConstraintChildren<'a>> {
         Some(self)
     }

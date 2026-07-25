@@ -535,10 +535,6 @@ where
         self.program.fallback().satisfied(view)
     }
 
-    fn influence(&self, variable: VariableId) -> VariableSet {
-        self.program.fallback().influence(variable)
-    }
-
     fn residual_program(&self) -> Option<ProgramRef<'_>> {
         Some(ProgramRef::preferred(&self.program))
     }

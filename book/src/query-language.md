@@ -470,7 +470,7 @@ The example wraps an external `HashSet` so it can be queried directly.  A
 type that reads from your backing store and return it from `pattern`.  The query
 engine drives both traits through `Constraint`, so any data source that speaks
 the block-native protocol can participate in `find!`. Its five operational
-methods and one static dependency hint are:
+methods are:
 
 | Method | Role |
 |---|---|
@@ -479,7 +479,6 @@ methods and one static dependency hint are:
 | `propose` | Fill an initially empty sink with candidate extensions. |
 | `confirm` | Filter candidates proposed by another constraint without adding any. |
 | `satisfied` | Report exact truth once every relevant variable is bound. |
-| `influence` | Declare static estimate dependencies; their count breaks equal-magnitude variable-choice ties. |
 
 Every constraint occurrence denotes one fixed raw-inline SET relation over the
 variables returned by `variables`. Its ordinary, paged, typed-Program, and
