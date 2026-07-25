@@ -140,8 +140,9 @@ An expansion still performs the familiar Atreides negotiation:
    variable agrees; no row is reassigned to an estimate-similar variable.
 4. For each group, propose that variable. An intersection chooses its tightest
    child per row and runs the remaining children as explicit confirmation
-   actions. A union remains an opaque leaf that evaluates its still-satisfied
-   alternatives independently and merges their candidates.
+   actions. Production lowering represents finite unions as formula
+   alternatives; conservative lowering keeps a union as one protocol leaf
+   which evaluates and merges its still-satisfied alternatives.
 5. Extend the parent rows with the surviving `(row, value)` pairs. Rows without
    candidates disappear.
 
@@ -153,11 +154,12 @@ the machine can descend before harvesting wider sibling cohorts.
 ## Canonical residual-state machine
 
 The residual engine keys a bucket by its **remaining computation**, not merely
-by the bindings or the route that produced it. Its conservative explicit
-controls recursively flatten the maximal associative AND region exposed at the
-root into deterministic preorder leaf occurrences. Union, regular-path, and
-custom constraints remain opaque leaves unless a capability explicitly exposes
-more structure, so lowering never crosses an undeclared semantic boundary.
+by the bindings or the route that produced it. Its compiler recursively
+flattens the maximal associative AND region exposed at the root into
+deterministic preorder leaf occurrences. Production lowering also admits
+finite Union formula structure. Regular-path and custom constraints remain
+opaque leaves unless a capability explicitly exposes more structure, so
+lowering never crosses an undeclared semantic boundary.
 
 Every live ordinary root runs as one finite formula after variable selection.
 Exposed AND/OR progress then becomes canonical formula state, and eligible
@@ -279,14 +281,12 @@ Ordinary [`Query`](triblespace::core::query::Query) iteration owns the residual
 cursor for every root. Its compiler policy is fixed: native AND flattening,
 finite Union-leaf continuations, and production-qualified Programs.
 `solve_residual_state_lazy` uses the same production plan while exposing width
-controls; `solve_residual_state_lazy_with` remains an explicit compiler probe;
-`solve_residual_state` is the eager saturated form, and
-`solve_residual_state_profiled` reports state, merge, action, and batch
-measurements. Fully drained variants preserve the distinct raw projected-row
-set, but may change result order. Fully-bound rows remain raw until the
-consumer pulls them, so the worklist never stores projected `R`s and a
-partially consumed query can snapshot its exact remainder without requiring
-`R: Clone`.
+controls and `collect_profiled` reports state, merge, action, and batch
+measurements; `solve_residual_state_lazy_with` remains an explicit compiler
+probe. A full drain preserves the distinct raw projected-row set, but may
+change result order. Fully-bound rows remain raw until the consumer pulls
+them, so the worklist never stores projected `R`s and a partially consumed
+query can snapshot its exact remainder without requiring `R: Clone`.
 
 ## Terminal projection and SET identity
 

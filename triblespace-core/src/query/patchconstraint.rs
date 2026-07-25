@@ -700,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn value_program_pages_match_eager_and_all_residual_entry_paths() {
+    fn value_program_pages_match_fallback_and_typed_residual_paths() {
         // Repeated insertion is set-idempotent: the direct frontier must not
         // manufacture a second occurrence for the duplicate stored key.
         let patch = value_patch(&[3, 1, 2, 2]);
@@ -735,18 +735,20 @@ mod tests {
 
         let mut ordinary: Vec<_> =
             Query::new(PatchValueConstraint::new(variable, &patch), project_value).collect();
-        let mut eager = Query::new(PatchValueConstraint::new(variable, &patch), project_value)
-            .solve_residual_state();
+        let mut conservative: Vec<_> =
+            Query::new(PatchValueConstraint::new(variable, &patch), project_value)
+                .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+                .collect();
         let mut full_query = Query::new(PatchValueConstraint::new(variable, &patch), project_value)
             .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .cap(1)
             .start_width(1);
         let mut full: Vec<_> = full_query.by_ref().collect();
-        for bag in [&mut ordinary, &mut eager, &mut full] {
+        for bag in [&mut ordinary, &mut conservative, &mut full] {
             bag.sort_unstable();
         }
         assert_eq!(ordinary, direct);
-        assert_eq!(eager, direct);
+        assert_eq!(conservative, direct);
         assert_eq!(full, direct);
         assert_eq!(full_query.stats().delta_source_pages, patch.len() as usize);
         assert_eq!(
@@ -762,7 +764,7 @@ mod tests {
     }
 
     #[test]
-    fn id_program_pages_match_eager_and_all_residual_entry_paths() {
+    fn id_program_pages_match_fallback_and_typed_residual_paths() {
         let patch = id_patch(&[0xf0, 0x10, 0x80, 0x10]);
         let variable = Variable::<GenId>::new(0);
         let constraint = PatchIdConstraint::new(variable, patch.clone());
@@ -793,17 +795,19 @@ mod tests {
 
         let make = || PatchIdConstraint::new(variable, patch.clone());
         let mut ordinary: Vec<_> = Query::new(make(), project_value).collect();
-        let mut eager = Query::new(make(), project_value).solve_residual_state();
+        let mut conservative: Vec<_> = Query::new(make(), project_value)
+            .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+            .collect();
         let mut full: Vec<_> = Query::new(make(), project_value)
             .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .cap(1)
             .start_width(1)
             .collect();
-        for bag in [&mut ordinary, &mut eager, &mut full] {
+        for bag in [&mut ordinary, &mut conservative, &mut full] {
             bag.sort_unstable();
         }
         assert_eq!(ordinary, direct);
-        assert_eq!(eager, direct);
+        assert_eq!(conservative, direct);
         assert_eq!(full, direct);
     }
 
@@ -953,13 +957,15 @@ mod tests {
         );
 
         let mut ordinary: Vec<_> = Query::new(make(), project).collect();
-        let mut eager = Query::new(make(), project).solve_residual_state();
+        let mut conservative: Vec<_> = Query::new(make(), project)
+            .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+            .collect();
         let mut full_query = Query::new(make(), project)
             .solve_residual_state_lazy_with(ResidualLowering::FULL)
             .cap(1)
             .start_width(1);
         let mut full: Vec<_> = full_query.by_ref().collect();
-        for bag in [&mut ordinary, &mut eager, &mut full] {
+        for bag in [&mut ordinary, &mut conservative, &mut full] {
             bag.sort_unstable();
         }
         let expected: Vec<_> = members
@@ -970,7 +976,7 @@ mod tests {
         assert!(ordinary
             .iter()
             .all(|(parent, _member)| *parent == parent_value));
-        assert_eq!(eager, expected);
+        assert_eq!(conservative, expected);
         assert_eq!(full, expected);
         assert_eq!(
             full_query.stats().delta_source_direct_candidates,

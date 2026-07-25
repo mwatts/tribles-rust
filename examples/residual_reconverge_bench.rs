@@ -231,7 +231,12 @@ fn run_query<S: TriblePattern>(kb: &S, markers: (Id, Id, Id, Id, Id), mode: Mode
     );
     match mode {
         Mode::AdaptiveSerial => tally(q.solve_residual_state_lazy()),
-        Mode::SaturatedSerial => tally(q.solve_residual_state()),
+        Mode::SaturatedSerial => tally(
+            q.solve_residual_state_lazy()
+                .cap(usize::MAX)
+                .start_width(usize::MAX)
+                .growth(1),
+        ),
         #[cfg(feature = "parallel")]
         Mode::AdaptiveParallel => tally_par(q.into_par_iter()),
         #[cfg(feature = "parallel")]
@@ -344,7 +349,12 @@ fn collect_query<S: TriblePattern>(
     );
     match mode {
         Mode::AdaptiveSerial => q.solve_residual_state_lazy().collect(),
-        Mode::SaturatedSerial => q.solve_residual_state(),
+        Mode::SaturatedSerial => q
+            .solve_residual_state_lazy()
+            .cap(usize::MAX)
+            .start_width(usize::MAX)
+            .growth(1)
+            .collect(),
         Mode::AdaptiveParallel => q.into_par_iter().collect(),
         Mode::SaturatedParallel => q.into_par_residual_state_iter().collect(),
     }

@@ -188,7 +188,6 @@ fn explicit_projection_is_distinct_across_residual_execution_shapes() {
     };
 
     assert_eq!(make().solve_residual_state_lazy().count(), 1);
-    assert_eq!(make().solve_residual_state().len(), 1);
 }
 
 #[test]
@@ -276,7 +275,6 @@ fn query_new_uses_the_complete_constraint_variable_head() {
 
     assert_eq!(make().collect::<Vec<_>>(), vec![one.raw, one.raw]);
     assert_eq!(make().solve_residual_state_lazy().count(), 2);
-    assert_eq!(make().solve_residual_state().len(), 2);
 }
 
 #[test]

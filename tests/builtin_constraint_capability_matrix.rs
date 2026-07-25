@@ -55,21 +55,24 @@ where
 
     assert_route("ordinary production selection", make_query().collect());
 
-    let conservative_eager = make_query()
+    let conservative_saturated = make_query()
         .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
         .cap(usize::MAX)
         .start_width(usize::MAX)
         .growth(1)
         .collect_profiled();
-    assert_route("conservative eager residual", conservative_eager.results);
+    assert_route(
+        "conservative saturated residual",
+        conservative_saturated.results,
+    );
 
-    let full_eager = make_query()
+    let full_saturated = make_query()
         .solve_residual_state_lazy_with(ResidualLowering::FULL)
         .cap(usize::MAX)
         .start_width(usize::MAX)
         .growth(1)
         .collect_profiled();
-    assert_route("FULL eager residual", full_eager.results);
+    assert_route("FULL saturated residual", full_saturated.results);
 
     let conservative_width_one = make_query()
         .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)

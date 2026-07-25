@@ -127,7 +127,13 @@ fn run_query<S: TriblePattern>(kb: &S, mode: Mode) -> (usize, u64) {
     );
     match mode {
         Mode::Adaptive => tally(query),
-        Mode::Saturated => tally(query.solve_residual_state()),
+        Mode::Saturated => tally(
+            query
+                .solve_residual_state_lazy()
+                .cap(usize::MAX)
+                .start_width(usize::MAX)
+                .growth(1),
+        ),
     }
 }
 
@@ -136,7 +142,11 @@ fn run_residual_profiled<S: TriblePattern>(kb: &S) -> ((usize, u64), ResidualSta
         (p: Inline<_>, x: Inline<_>),
         pattern!(kb, [{ ?p @ world::a: ?x, world::b: ?x, world::c: ?x }])
     )
-    .solve_residual_state_profiled();
+    .solve_residual_state_lazy()
+    .cap(usize::MAX)
+    .start_width(usize::MAX)
+    .growth(1)
+    .collect_profiled();
     (tally(solve.results), solve.stats)
 }
 
@@ -163,7 +173,13 @@ fn run_nested_query<S: TriblePattern>(kb: &S, mode: Mode) -> (usize, u64) {
     );
     match mode {
         Mode::Adaptive => tally(query),
-        Mode::Saturated => tally(query.solve_residual_state()),
+        Mode::Saturated => tally(
+            query
+                .solve_residual_state_lazy()
+                .cap(usize::MAX)
+                .start_width(usize::MAX)
+                .growth(1),
+        ),
     }
 }
 
@@ -178,7 +194,11 @@ fn run_nested_residual_profiled<S: TriblePattern>(kb: &S) -> ((usize, u64), Resi
             ),
         )
     )
-    .solve_residual_state_profiled();
+    .solve_residual_state_lazy()
+    .cap(usize::MAX)
+    .start_width(usize::MAX)
+    .growth(1)
+    .collect_profiled();
     (tally(solve.results), solve.stats)
 }
 
@@ -189,7 +209,14 @@ fn run_first<S: TriblePattern>(kb: &S, mode: Mode) -> (usize, u64) {
     );
     match mode {
         Mode::Adaptive => tally(query.take(1)),
-        Mode::Saturated => tally(query.solve_residual_state().into_iter().take(1)),
+        Mode::Saturated => tally(
+            query
+                .solve_residual_state_lazy()
+                .cap(usize::MAX)
+                .start_width(usize::MAX)
+                .growth(1)
+                .take(1),
+        ),
     }
 }
 

@@ -1631,10 +1631,6 @@ impl ResidualPlan {
         Self::compile_mode(root, FormulaScope::UnionLeaves, ProgramScope::Production)
     }
 
-    fn compile<'a>(root: &dyn Constraint<'a>) -> Self {
-        Self::compile_mode(root, FormulaScope::OpaqueLeaves, ProgramScope::Disabled)
-    }
-
     #[cfg(test)]
     fn compile_finite_unions<'a>(root: &dyn Constraint<'a>) -> Self {
         Self::compile_mode(root, FormulaScope::UnionLeaves, ProgramScope::Disabled)
@@ -2372,8 +2368,7 @@ pub struct ResidualStateStats {
     /// candidate states, or a candidate occurrence when paging is available.
     pub full_pops: usize,
     /// Underfilled buckets drained through the minimum-rank readiness gate
-    /// because no live state could fill the desired width. The eager solver
-    /// counts every one of its readiness-gated pops here.
+    /// because no live state could fill the desired width.
     pub readiness_pops: usize,
     /// Physical continuation-cohort chunks selected after a full action
     /// partially survived. These pops deliberately bypass global occupancy
@@ -2603,7 +2598,7 @@ pub struct ResidualStateStats {
     pub terminal_demand_projected_rows: usize,
 }
 
-/// Results and measurements from [`Query::solve_residual_state_profiled`].
+/// Results and measurements from [`ResidualStateIter::collect_profiled`].
 #[derive(Clone, Debug)]
 #[must_use]
 #[non_exhaustive]
@@ -12837,8 +12832,7 @@ impl ResidualStateMachine {
 /// The cap only bounds geometric width growth.
 ///
 /// Dropping the iterator discards its remaining affine frontier. Fully drained,
-/// it produces the same distinct projected-row set as
-/// [`Query::solve_residual_state`].
+/// it produces the query's complete distinct projected-row set.
 #[must_use]
 pub struct ResidualStateIter<C, P: Fn(&Binding) -> Option<R>, R> {
     root: C,
@@ -13111,113 +13105,6 @@ where
     }
 }
 
-fn solve<'a, P, R>(
-    root: &dyn Constraint<'a>,
-    postprocessing: P,
-    mut projection: ProjectionGate,
-    influences: [VariableSet; 128],
-    base_estimates: [usize; 128],
-    seed: Option<FrameSeedRow>,
-) -> ResidualStateSolve<R>
-where
-    P: Fn(&Binding) -> Option<R>,
-{
-    let full = root.variables();
-    let plan = ResidualPlan::compile(root);
-    let leaf_count = plan.len();
-    let mut stats = ResidualStateStats::default();
-    let mut interner = StateInterner::default();
-    let mut worklist = Worklist::new();
-    if let Some(seed) = seed {
-        file_with_plan(
-            &mut worklist,
-            &mut interner,
-            &plan,
-            StateDesc {
-                bound: seed.bound,
-                phase: ResidualPhase::Ready,
-            },
-            StateBucket::Rows(RowBatch {
-                rows: seed.values,
-                row_count: 1,
-            }),
-            &mut stats,
-        );
-    }
-
-    let mut results = Vec::new();
-    let mut binding = Binding::default();
-    let mut next_activation = 0;
-    'search: while let Some((&rank, _)) = worklist.first_key_value() {
-        if projection.is_done() {
-            break;
-        }
-        let level = worklist
-            .remove(&rank)
-            .expect("observed worklist level exists");
-        for (id, bucket) in level {
-            let desc = interner.get(id).clone();
-            debug_assert_eq!(
-                desc.rank_with_span(
-                    leaf_count,
-                    plan.action_span(),
-                    Some(&plan.finite_formula),
-                    &interner.formula_pcs,
-                ),
-                rank
-            );
-            let emit_bound = desc.bound;
-            stats.state_pops += 1;
-            stats.readiness_pops += 1;
-            let execution = execute_task(
-                root,
-                &plan,
-                SelectedResidualTask {
-                    state: id,
-                    desc,
-                    bucket,
-                },
-                full,
-                &influences,
-                &base_estimates,
-                &mut worklist,
-                &mut interner,
-                &mut stats,
-                &mut next_activation,
-            );
-            assert!(
-                execution.reducer_seeds.is_empty(),
-                "the opaque eager solver unexpectedly produced a pageable Formula reducer"
-            );
-            match execution.stable {
-                StepOutcome::Advanced(_) | StepOutcome::Dead => {}
-                StepOutcome::Emit(rows) => {
-                    let vars: Vec<VariableId> = emit_bound.into_iter().collect();
-                    let view = rows_view(&vars, &rows.rows, rows.row_count);
-                    for row in 0..rows.row_count {
-                        let row_view = view.row_view(row);
-                        for (column, &variable) in vars.iter().enumerate() {
-                            binding.set(variable, &row_view.row(0)[column]);
-                        }
-                        match projection.project(&binding, &postprocessing) {
-                            ProjectionStep::Yield(result) => {
-                                results.push(result);
-                                if projection.is_done() {
-                                    break 'search;
-                                }
-                            }
-                            ProjectionStep::Skip => {}
-                            ProjectionStep::Done => break 'search,
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    ResidualStateSolve { results, stats }
-}
-
 fn assert_fresh<C, P: Fn(&Binding) -> Option<R>, R>(query: &Query<C, P, R>) {
     assert!(
         !query.iteration_started && query.residual.is_none(),
@@ -13313,62 +13200,6 @@ where
             state,
             iteration_started: false,
         }
-    }
-
-    /// Eagerly solves any root constraint through canonical residual states.
-    ///
-    /// This experimental path recursively flattens the maximal nested AND
-    /// region, jointly chooses the next variable and proposing leaf occurrence,
-    /// and represents planning plus uniform proposal/confirmation actions as
-    /// interned states. Planning states only estimate and partition; explicit
-    /// action states invoke one flattened leaf over their assembled row or
-    /// whole-parent candidate bucket. Histories with identical future work
-    /// append into one bucket before that state runs. Union and regular-path
-    /// constraints remain opaque semantic boundaries; custom constraints do
-    /// too unless they explicitly expose an associative AND shape. Opaque leaves continue through the ordinary [`Constraint`]
-    /// protocol.
-    ///
-    /// Result order may differ from the ordinary iterator; the result
-    /// distinct projected-row set is the same. Use
-    /// [`solve_residual_state_profiled`](Self::solve_residual_state_profiled)
-    /// to inspect reconvergence and batch measurements.
-    ///
-    /// Flattened leaves must obey [`Constraint::estimate`]'s structural,
-    /// block-uniform relevance law and remain semantically immutable during
-    /// the solve.
-    ///
-    /// # Panics
-    ///
-    /// Panics if iteration has already started on this query. Residual
-    /// execution always starts from the canonical empty binding.
-    pub fn solve_residual_state(self) -> Vec<R> {
-        self.solve_residual_state_profiled().results
-    }
-
-    /// Residual-state solve returning both results and scheduler measurements.
-    ///
-    /// # Panics
-    ///
-    /// Panics if iteration has already started on this query.
-    pub fn solve_residual_state_profiled(self) -> ResidualStateSolve<R> {
-        assert_fresh(&self);
-        let Query {
-            constraint,
-            postprocessing,
-            projection,
-            influences,
-            base_estimates,
-            seed,
-            ..
-        } = self;
-        solve(
-            &constraint,
-            postprocessing,
-            projection,
-            influences,
-            base_estimates,
-            seed,
-        )
     }
 }
 
@@ -18898,7 +18729,7 @@ mod tests {
     ) -> (Vec<(VariableId, usize, usize)>, ResidualStateStats) {
         const PARENT: VariableId = 0;
         let root = IntersectionConstraint::new(leaves);
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let desc = StateDesc {
             bound: VariableSet::new_singleton(PARENT),
             phase: ResidualPhase::Ready,
@@ -18946,7 +18777,7 @@ mod tests {
         leaves: Vec<DirectedEstimateLeaf>,
     ) -> Vec<(VariableId, usize, usize)> {
         let root = IntersectionConstraint::new(leaves);
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let desc = StateDesc {
             bound: VariableSet::new_empty(),
             phase: ResidualPhase::Ready,
@@ -20517,7 +20348,7 @@ mod tests {
             ]),
             shape_leaf(4),
         ]);
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let paths: Vec<Vec<usize>> = plan
             .leaves
             .iter()
@@ -20541,7 +20372,7 @@ mod tests {
                 shape_and(vec![shape_leaf(2), shape_leaf(3)]),
             ]),
         ])]);
-        let right_paths: Vec<Vec<usize>> = ResidualPlan::compile(&right)
+        let right_paths: Vec<Vec<usize>> = ResidualPlan::compile_production(&right)
             .leaves
             .iter()
             .map(|leaf| leaf.path.0.to_vec())
@@ -20560,7 +20391,7 @@ mod tests {
     #[test]
     fn opaque_root_is_one_empty_path_occurrence() {
         let root = ShapeLeaf(9);
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         assert_eq!(
             plan.leaves,
             vec![ConstraintPath(Vec::new().into_boxed_slice())]
@@ -22498,7 +22329,7 @@ mod tests {
     fn repeated_objects_keep_distinct_occurrence_paths() {
         let shared: Arc<dyn Constraint<'static> + Send + Sync> = Arc::new(ShapeLeaf(7));
         let root = IntersectionConstraint::new(vec![Arc::clone(&shared), Arc::clone(&shared)]);
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         assert_eq!(
             plan.leaves,
             vec![
@@ -22517,7 +22348,7 @@ mod tests {
     }
 
     #[test]
-    fn regular_path_and_union_wrappers_remain_single_opaque_occurrences() {
+    fn regular_path_is_one_occurrence_and_union_is_one_formula_leaf() {
         use crate::inline::encodings::genid::GenId;
         use crate::trible::TribleSet;
 
@@ -22529,7 +22360,7 @@ mod tests {
         );
         let root =
             IntersectionConstraint::new(vec![shape_leaf(0), Box::new(path) as ShapeConstraint]);
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         assert_eq!(
             plan.leaves,
             vec![
@@ -22544,10 +22375,18 @@ mod tests {
         ]);
         let root =
             IntersectionConstraint::new(vec![shape_and(vec![Box::new(union) as ShapeConstraint])]);
+        let plan = ResidualPlan::compile_production(&root);
         assert_eq!(
-            ResidualPlan::compile(&root).leaves,
-            vec![ConstraintPath(vec![0, 0].into_boxed_slice())],
-            "an AND may contain a union, but lowering must not enter its AND arms"
+            plan.leaves,
+            vec![ResidualLeaf {
+                path: ConstraintPath(vec![0, 0].into_boxed_slice()),
+                lowering: LeafLowering::FiniteFormula,
+            }],
+            "production keeps one outer occurrence while Formula owns the Union arms",
+        );
+        assert!(
+            plan.finite_formula.root(0).is_some(),
+            "the production Union leaf must have a compiled Formula root",
         );
     }
 
@@ -23314,7 +23153,7 @@ mod tests {
     #[test]
     fn continuation_publication_receipt_recognizes_exact_terminal_commit() {
         let root = CapabilityLeaf { variable: 0 };
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let formula_pcs = FormulaPcInterner::default();
         let (previous, successor) =
             exact_confirm_transition(&plan, 0, &[0], &[], 0, VariableSet::new_empty());
@@ -23339,7 +23178,7 @@ mod tests {
             Box::new(CapabilityLeaf { variable: 0 }),
             shape_leaf(1),
         ]);
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let formula_pcs = FormulaPcInterner::default();
         let (previous, successor) =
             exact_confirm_transition(&plan, 0, &[0, 1], &[], 0, VariableSet::new_empty());
@@ -23359,7 +23198,7 @@ mod tests {
             Box::new(CapabilityLeaf { variable: 0 }) as ShapeConstraint,
             shape_leaf(1),
         ]);
-        let fully_checked_plan = ResidualPlan::compile(&fully_checked_root);
+        let fully_checked_plan = ResidualPlan::compile_production(&fully_checked_root);
         let (previous, successor) = exact_confirm_transition(
             &fully_checked_plan,
             0,
@@ -23380,7 +23219,7 @@ mod tests {
             "a fully checked candidate becomes an independent nonterminal parent row",
         );
 
-        let already_relational_plan = ResidualPlan::compile(&root);
+        let already_relational_plan = ResidualPlan::compile_production(&root);
         let (previous, successor) = exact_confirm_transition(
             &already_relational_plan,
             0,
@@ -23873,7 +23712,7 @@ mod tests {
             CapabilityLeaf { variable: 0 },
             CapabilityLeaf { variable: 0 },
         ]);
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let formula_pcs = FormulaPcInterner::default();
         let mut relevant = ChildSet::empty(plan.len());
         relevant.insert(0);
@@ -23934,7 +23773,7 @@ mod tests {
             CapabilityLeaf { variable: VARIABLE },
             CapabilityLeaf { variable: VARIABLE },
         ]);
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let interner = StateInterner::default();
         let bound = VariableSet::new_singleton(PARENT);
         let mut relevant = ChildSet::empty(plan.len());
@@ -28353,7 +28192,7 @@ mod tests {
             variable: 0,
             values: Arc::new(Vec::new()),
         };
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
         machine.emit_vars = vec![0];
         machine.emit_rows = (0..7).map(raw).collect();
@@ -28383,7 +28222,7 @@ mod tests {
     #[test]
     fn parallel_split_drops_only_active_delta_preference() {
         let root = ShapeLeaf(0);
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let influences = [VariableSet::new_empty(); 128];
         let base_estimates = [usize::MAX; 128];
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
@@ -28423,7 +28262,7 @@ mod tests {
     #[test]
     fn parallel_split_clears_live_continuation_without_losing_affine_rows() {
         let root = ShapeLeaf(0);
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let influences = [VariableSet::new_empty(); 128];
         let base_estimates = [usize::MAX; 128];
         let expected: Vec<_> = (0..6).map(raw).collect();
@@ -28802,7 +28641,7 @@ mod tests {
     #[test]
     fn coalesced_zero_width_rows_preserve_affine_multiplicity() {
         let root = ShapeLeaf(0);
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let desc = ready_desc(0);
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
 
@@ -28857,7 +28696,7 @@ mod tests {
             CapabilityLeaf { variable: 0 },
             CapabilityLeaf { variable: 0 },
         ]);
-        let candidate_plan = ResidualPlan::compile(&candidate_root);
+        let candidate_plan = ResidualPlan::compile_production(&candidate_root);
         let candidate_formula_pcs = FormulaPcInterner::default();
         let mut relevant = ChildSet::empty(candidate_plan.len());
         relevant.insert(0);
@@ -29041,7 +28880,7 @@ mod tests {
             CapabilityLeaf { variable: VARIABLE },
             CapabilityLeaf { variable: VARIABLE },
         ]);
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let formula_pcs = FormulaPcInterner::default();
         let mut relevant = ChildSet::empty(plan.len());
         relevant.insert(0);
@@ -29139,7 +28978,7 @@ mod tests {
     #[test]
     fn probe_one_preserves_old_cold_tail_across_hit_miss_and_clone() {
         let root = ShapeLeaf(0);
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let desc = ready_desc(1);
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
         machine.width = 8;
@@ -29415,7 +29254,7 @@ mod tests {
     #[test]
     fn active_delta_seed_follows_every_exact_one_parent_activation() {
         let root = CapabilityLeaf { variable: 0 };
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
         let program = PagedProposalLeaf {
             variable: 0,
@@ -29492,7 +29331,7 @@ mod tests {
     #[test]
     fn full_action_successor_that_fills_width_returns_to_global_batching() {
         let root = CapabilityLeaf { variable: 127 };
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let mut machine = ResidualStateMachine::new(root.variables(), plan.len(), None);
         let successor = file(
             &mut machine.worklist,
@@ -29736,7 +29575,7 @@ mod tests {
             proposes: Arc::clone(&proposes),
             confirms,
         }]);
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let mut machine =
             ResidualStateMachine::new(root.variables(), plan.len(), Some(FrameSeedRow::empty()));
         machine.cap = 1;
@@ -29769,7 +29608,7 @@ mod tests {
             variable: 0,
             values: Arc::new(vec![raw(1), raw(2), raw(1)]),
         };
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let mut relevant = ChildSet::empty(plan.len());
         relevant.insert(0);
         let desc = StateDesc {
@@ -29820,7 +29659,7 @@ mod tests {
             }) as ShapeConstraint,
             Box::new(CapabilityLeaf { variable: 0 }) as ShapeConstraint,
         ]);
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let mut relevant = ChildSet::empty(plan.len());
         relevant.insert(0);
         relevant.insert(1);
@@ -29938,7 +29777,7 @@ mod tests {
             proposes: Arc::clone(&proposes),
             confirms: Arc::new(AtomicUsize::new(0)),
         }]);
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let mut relevant = ChildSet::empty(plan.len());
         relevant.insert(0);
         let mut checked = ChildSet::empty(plan.len());
@@ -30006,7 +29845,7 @@ mod tests {
             parent: PARENT,
             variable: VARIABLE,
         }]);
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let mut relevant = ChildSet::empty(plan.len());
         relevant.insert(0);
         let desc = StateDesc {
@@ -30088,7 +29927,7 @@ mod tests {
                 confirms: Arc::clone(&confirms),
             },
         ]);
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let mut relevant = ChildSet::empty(plan.len());
         relevant.insert(0);
         relevant.insert(1);
@@ -30170,7 +30009,7 @@ mod tests {
             proposes: Arc::clone(&proposes),
             confirms: Arc::clone(&confirms),
         }]);
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let mut relevant = ChildSet::empty(plan.len());
         relevant.insert(0);
         let desc = StateDesc {
@@ -30247,7 +30086,7 @@ mod tests {
                 confirms: Arc::clone(&confirms),
             },
         ]);
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let mut relevant = ChildSet::empty(plan.len());
         relevant.insert(0);
         relevant.insert(1);
@@ -30349,7 +30188,7 @@ mod tests {
                 rows: Arc::clone(&odd_rows),
             }) as ShapeConstraint,
         ]);
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let mut relevant = ChildSet::empty(plan.len());
         relevant.insert(0);
         relevant.insert(1);

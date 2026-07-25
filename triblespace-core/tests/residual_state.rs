@@ -732,7 +732,6 @@ where
     Pj: Fn(&Binding) -> Option<R> + Copy,
     R: Ord + std::fmt::Debug,
 {
-    let mut eager = Query::new(make(), project).solve_residual_state();
     let mut lazy_default: Vec<_> = Query::new(make(), project)
         .solve_residual_state_lazy()
         .collect();
@@ -743,11 +742,9 @@ where
     let mut ordinary: Vec<_> = Query::new(make(), project).collect();
 
     expected.sort_unstable();
-    eager.sort_unstable();
     lazy_default.sort_unstable();
     lazy_cap_one.sort_unstable();
     ordinary.sort_unstable();
-    assert_eq!(eager, expected, "eager residual result set");
     assert_eq!(lazy_default, expected, "default lazy residual result set");
     assert_eq!(lazy_cap_one, expected, "cap=1 lazy residual result set");
     assert_eq!(ordinary, expected, "ordinary Query residual result set");
@@ -921,7 +918,12 @@ fn flipped_proposers_remerge_before_the_last_confirmation() {
     );
 
     let (root, trace) = fixture(N);
-    let mut residual = Query::new(root, project_pair).solve_residual_state_profiled();
+    let mut residual = Query::new(root, project_pair)
+        .solve_residual_state_lazy()
+        .cap(usize::MAX)
+        .start_width(usize::MAX)
+        .growth(1)
+        .collect_profiled();
 
     let mut oracle = fixture_oracle(N);
     residual.results.sort_unstable();
@@ -983,7 +985,12 @@ fn flipped_proposers_remerge_before_the_last_confirmation() {
 fn nested_and_flipped_proposers_remerge_before_the_last_confirmation() {
     const N: usize = 12;
     let (root, trace) = nested_fixture(N);
-    let mut residual = Query::new(root, project_pair).solve_residual_state_profiled();
+    let mut residual = Query::new(root, project_pair)
+        .solve_residual_state_lazy()
+        .cap(usize::MAX)
+        .start_width(usize::MAX)
+        .growth(1)
+        .collect_profiled();
     let mut oracle = fixture_oracle(N);
     residual.results.sort_unstable();
     oracle.sort_unstable();
@@ -1014,17 +1021,13 @@ fn flat_left_and_right_nested_forms_share_set_projection() {
     ];
 
     for nesting in [AndNesting::Flat, AndNesting::Left, AndNesting::Right] {
-        let mut eager =
-            Query::new(and_nesting_fixture(nesting), project_pair).solve_residual_state();
         let mut lazy: Vec<_> = Query::new(and_nesting_fixture(nesting), project_pair)
             .solve_residual_state_lazy()
             .cap(usize::MAX)
             .start_width(1)
             .growth(1)
             .collect();
-        eager.sort_unstable();
         lazy.sort_unstable();
-        assert_eq!(eager, expected);
         assert_eq!(lazy, expected);
     }
 }
@@ -1055,16 +1058,14 @@ fn nested_and_width_one_yields_before_draining_sibling_parents() {
 }
 
 #[test]
-fn union_with_and_arms_stays_opaque_inside_a_nested_and_and_skips_dead_arms() {
+fn union_with_and_arms_uses_production_formula_and_skips_dead_arms() {
     let expected = vec![(encoded(b'u', 0), encoded(b'v', 0))];
-    let eager = Query::new(nested_dead_union_fixture(), project_pair).solve_residual_state();
     let lazy: Vec<_> = Query::new(nested_dead_union_fixture(), project_pair)
         .solve_residual_state_lazy()
         .cap(usize::MAX)
         .start_width(1)
         .growth(1)
         .collect();
-    assert_eq!(eager, expected);
     assert_eq!(lazy, expected);
 }
 
@@ -1082,19 +1083,15 @@ fn nested_zero_variable_ands_settle_true_and_false() {
         ])
     };
 
-    let eager_true = Query::new(nested_true(), project).solve_residual_state();
     let lazy_true: Vec<_> = Query::new(nested_true(), project)
         .solve_residual_state_lazy()
         .collect();
-    assert_eq!(eager_true, ["empty binding"]);
-    assert_eq!(lazy_true, eager_true);
+    assert_eq!(lazy_true, ["empty binding"]);
 
-    let eager_false = Query::new(nested_false(), project).solve_residual_state();
     let lazy_false: Vec<_> = Query::new(nested_false(), project)
         .solve_residual_state_lazy()
         .collect();
-    assert!(eager_false.is_empty());
-    assert_eq!(lazy_false, eager_false);
+    assert!(lazy_false.is_empty());
 }
 
 #[test]
@@ -1104,7 +1101,12 @@ fn repeated_shared_arc_is_executed_once_per_and_occurrence() {
     let shared = Arc::new(FiniteDomain::new(P, values.clone(), 1, Arc::clone(&calls)));
     let root = IntersectionConstraint::new(vec![Arc::clone(&shared), Arc::clone(&shared)]);
 
-    let mut residual = Query::new(root, project_parent).solve_residual_state();
+    let mut residual: Vec<_> = Query::new(root, project_parent)
+        .solve_residual_state_lazy()
+        .cap(usize::MAX)
+        .start_width(usize::MAX)
+        .growth(1)
+        .collect();
     residual.sort_unstable();
     assert_eq!(residual, values);
     let calls = calls.lock().unwrap();
@@ -1288,18 +1290,6 @@ fn dead_paths_ramp_within_one_negative_pull() {
         grown.state_pops < fixed.state_pops,
         "geometric widening did not reduce physical scheduler work"
     );
-
-    let (eager_root, _, _) = negative_fixture(N);
-    let eager = Query::new(eager_root, project_same).solve_residual_state_profiled();
-    assert!(eager.results.is_empty());
-    let eager = eager.stats;
-    assert_accounted(&eager);
-    assert_eq!(eager.readiness_pops, eager.state_pops);
-    assert_eq!(eager.full_pops, 0);
-    assert_eq!((eager.dead_action_pops, eager.width_increases), (1, 0));
-    assert_eq!(eager.propose_rows, N + 1);
-    assert!(eager.confirm_rows >= N);
-    assert_eq!((eager.max_propose_rows, eager.max_confirm_rows), (N, N));
 }
 
 #[test]
@@ -1333,14 +1323,10 @@ fn lazy_fixed_width_reopens_states_without_changing_the_result_set() {
         .growth(1)
         .collect_profiled();
 
-    let (eager_root, _) = fixture(N);
-    let mut eager = Query::new(eager_root, project_pair).solve_residual_state();
     let mut oracle = fixture_oracle(N);
     lazy.results.sort_unstable();
-    eager.sort_unstable();
     oracle.sort_unstable();
 
-    assert_eq!(lazy.results, eager);
     assert_eq!(lazy.results, oracle);
     assert_eq!(lazy.stats.readiness_pops, 0);
     assert!(lazy.stats.full_pops > 0);
@@ -1616,16 +1602,13 @@ fn reconvergence_preserves_distinct_full_bindings_under_noninjective_mapper() {
     // these N distinct bindings remain N rows even though every mapper result
     // is the same unit value.
     let (root, _) = fixture(N);
-    let residual = Query::new(root, project_same).solve_residual_state_profiled();
-    let (lazy_root, _) = fixture(N);
-    let lazy: Vec<_> = Query::new(lazy_root, project_same)
+    let residual = Query::new(root, project_same)
         .solve_residual_state_lazy()
         .cap(usize::MAX)
-        .start_width(1)
+        .start_width(usize::MAX)
         .growth(1)
-        .collect();
+        .collect_profiled();
     assert_eq!(residual.results, vec![(); N]);
-    assert_eq!(lazy, vec![(); N]);
     assert_eq!(residual.stats.bucket_merges, 1);
     assert_eq!(residual.stats.rows_merged, N / 2);
 }
@@ -1634,7 +1617,9 @@ fn reconvergence_preserves_distinct_full_bindings_under_noninjective_mapper() {
 fn an_empty_zero_estimate_route_finishes_without_a_result() {
     let trace = Arc::new(Mutex::new(Trace::default()));
     let root = IntersectionConstraint::new(vec![TableChild::domain(0, 0, Arc::clone(&trace))]);
-    let residual = Query::new(root, project_parent).solve_residual_state_profiled();
+    let residual = Query::new(root, project_parent)
+        .solve_residual_state_lazy()
+        .collect_profiled();
     assert!(residual.results.is_empty());
     assert_eq!(residual.stats.propose_calls, 1);
     assert_eq!(residual.stats.dead_action_pops, 1);
@@ -1656,8 +1641,6 @@ fn an_empty_zero_estimate_route_finishes_without_a_result() {
 fn zero_variable_intersections_emit_the_empty_binding_iff_true() {
     let project = |_: &Binding| Some("empty binding");
 
-    let residual_true = Query::new(IntersectionConstraint::<Truth>::new(Vec::new()), project)
-        .solve_residual_state_profiled();
     let mut lazy_true = Query::new(IntersectionConstraint::<Truth>::new(Vec::new()), project)
         .solve_residual_state_lazy()
         .cap(4)
@@ -1674,13 +1657,7 @@ fn zero_variable_intersections_emit_the_empty_binding_iff_true() {
     assert_eq!(lazy_true.current_width(), 1);
     assert_eq!(lazy_true.stats().width_increases, 0);
     assert_eq!(lazy_true.stats().terminal_demand_width_promotions, 0);
-    assert_eq!(residual_true.results, ["empty binding"]);
-    assert_eq!(residual_true.stats.state_pops, 1);
-
-    let residual_false = Query::new(IntersectionConstraint::new(vec![Truth(false)]), project)
-        .solve_residual_state_profiled();
-    assert!(residual_false.results.is_empty());
-    assert_eq!(residual_false.stats.state_pops, 0);
+    assert_eq!(lazy_true.stats().state_pops, 1);
 
     let mut lazy_false = Query::new(IntersectionConstraint::new(vec![Truth(false)]), project)
         .solve_residual_state_lazy()
@@ -1693,6 +1670,7 @@ fn zero_variable_intersections_emit_the_empty_binding_iff_true() {
     assert_eq!(lazy_false.stats().width_increases, 0);
     assert_eq!(lazy_false.stats().emit_pops, 0);
     assert_eq!(lazy_false.stats().dead_action_pops, 0);
+    assert_eq!(lazy_false.stats().state_pops, 0);
 }
 
 fn equality_fixture() -> (
@@ -1719,20 +1697,16 @@ fn equality_fixture() -> (
 #[test]
 fn equality_becomes_relevant_after_its_peer_is_bound() {
     let (root, parent_calls, x_calls, values) = equality_fixture();
-    let mut residual = Query::new(root, project_pair).solve_residual_state_profiled();
-    let (lazy_root, _, _, _) = equality_fixture();
-    let mut lazy: Vec<_> = Query::new(lazy_root, project_pair)
+    let mut residual = Query::new(root, project_pair)
         .solve_residual_state_lazy()
         .cap(usize::MAX)
-        .start_width(1)
+        .start_width(usize::MAX)
         .growth(1)
-        .collect();
+        .collect_profiled();
     let mut oracle: Vec<_> = values.iter().copied().map(|value| (value, value)).collect();
     residual.results.sort_unstable();
-    lazy.sort_unstable();
     oracle.sort_unstable();
     assert_eq!(residual.results, oracle);
-    assert_eq!(lazy, oracle);
 
     let parent_calls = parent_calls.lock().unwrap();
     let x_calls = x_calls.lock().unwrap();
@@ -1792,19 +1766,16 @@ fn union_fixture(
 }
 
 #[test]
-fn opaque_union_deduplicates_identical_arms_when_proposing_and_confirming() {
+fn production_formula_union_deduplicates_identical_arms_when_proposing_and_confirming() {
     for role in [UnionRole::Proposer, UnionRole::Confirmer] {
         let (root, arm_calls, value) = union_fixture(role);
-        let residual = Query::new(root, project_parent).solve_residual_state();
-        let (lazy_root, _, _) = union_fixture(role);
-        let lazy: Vec<_> = Query::new(lazy_root, project_parent)
+        let residual: Vec<_> = Query::new(root, project_parent)
             .solve_residual_state_lazy()
             .cap(usize::MAX)
             .start_width(1)
             .growth(1)
             .collect();
         assert_eq!(residual, [value], "union must preserve set semantics");
-        assert_eq!(lazy, [value], "lazy union must preserve set semantics");
         for calls in arm_calls {
             let calls = calls.lock().unwrap();
             match role {

@@ -9716,7 +9716,7 @@ mod tests {
 
     fn terminal_positive_certificate() -> PositivePublicationCertificate {
         let root = PositiveCertificateLeaf { variable: 0 };
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let relevant = ChildSet::empty(plan.len()).with_inserted(0);
         let checked = ChildSet::empty(plan.len());
         let previous = StateDesc {
@@ -9756,7 +9756,7 @@ mod tests {
             PositiveCertificateLeaf { variable: 0 },
             PositiveCertificateLeaf { variable: 1 },
         ]);
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let relevant = ChildSet::empty(plan.len())
             .with_inserted(0)
             .with_inserted(1);
@@ -11030,7 +11030,7 @@ mod tests {
             .commit_confirm_positive_publication(witness, Some(terminal_positive_full()))
             .expect("the exact B[0] witness should win its parent SET ledger");
         let root = PositiveCertificateLeaf { variable: 0 };
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let released = DeltaScheduler::release_positive_publication(
             grant,
             &plan,
@@ -11126,7 +11126,7 @@ mod tests {
         );
 
         let root = PositiveCertificateLeaf { variable: 0 };
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let released = DeltaScheduler::release_positive_publication(
             grant,
             &plan,
@@ -11202,7 +11202,7 @@ mod tests {
         );
 
         let root = PositiveCertificateLeaf { variable: 0 };
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let released = DeltaScheduler::release_positive_publication(
             grant,
             &plan,
@@ -11744,7 +11744,7 @@ mod tests {
     #[test]
     fn positive_support_witnessed_and_unwitnessed_quiescence_release_cleanup() {
         let root = PositiveCertificateLeaf { variable: 0 };
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         for witnessed in [false, true] {
             let candidate = value(if witnessed { 91 } else { 92 });
             let mut registry = ProducerRegistry::new();
@@ -11938,7 +11938,7 @@ mod tests {
             }
         ));
         let root = PositiveCertificateLeaf { variable: 0 };
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let mut stable = Worklist::new();
         let mut stable_interner = StateInterner::default();
         let mut stats = ResidualStateStats::default();
@@ -11971,7 +11971,7 @@ mod tests {
         let first = value(7);
         let second = value(8);
         let root = PositiveCertificateLeaf { variable: 0 };
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let mut registry = ProducerRegistry::new();
         let (_, parent) = open_positive_confirm(
             &mut registry,
@@ -12093,7 +12093,7 @@ mod tests {
             .commit_positive_publication(witness, Some(terminal_positive_full()))
             .expect("an already-SET Terminal successor should still publish");
         let root = PositiveCertificateLeaf { variable: 0 };
-        let plan = ResidualPlan::compile(&root);
+        let plan = ResidualPlan::compile_production(&root);
         let release = DeltaScheduler::release_positive_publication(
             grant,
             &plan,

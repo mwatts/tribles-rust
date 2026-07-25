@@ -401,7 +401,7 @@ fn serial_forced_routing_places_physically_and_stays_set_identical() {
     assert_eq!(results, expected);
 
     // The acceptance bar: real find!/pattern! value proposals reached
-    // solve_residual_state's physical Program placement stats.
+    // The production residual iterator's physical Program placement stats.
     assert!(
         solve.stats.delta_program_physical_cohorts > 0,
         "no physical Program placement: {:?}",

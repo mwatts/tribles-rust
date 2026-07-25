@@ -27,6 +27,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Query::residual_lowering` and its per-query policy state are removed.
   `solve_residual_state_lazy_with` temporarily remains as an explicit
   compiler-probe seam.
+- **Breaking: serial residual execution now has one iterator implementation.**
+  The never-shipped eager `solve_residual_state` and
+  `solve_residual_state_profiled` entry points, their private worklist loop,
+  and the obsolete opaque-plan compiler alias are removed. Full enumeration
+  drains `solve_residual_state_lazy`; profiling drains that iterator through
+  `collect_profiled`. Explicit compiler probes retain the conservative
+  ordinary-constraint oracle.
 - **RPQ complete actions now obey exact scheduler work bounds.** Bound-endpoint
   graph-product traversal admits only a descending parent tail whose examined
   transitions and distinct endpoint outputs fit the current grant; positive
@@ -681,12 +688,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicit `into_par_residual_state_iter` path uses the same splitter at
   saturated width, paging SET-admitted candidates unless a selected typed
   route retains one parent activation for reuse.
-- **Constraints gain an opt-in canonical residual-state solver.** Any root
-  `Constraint` can use the residual APIs: roots that expose associative AND
-  structure are recursively flattened, while an opaque root is represented by
-  one empty-path leaf and retains its own union, path, constant, range, or
-  custom semantics.
-  `solve_residual_state` jointly chooses each row's next variable and proposing
+- **Constraints gain a canonical residual-state solver.** Every root
+  `Constraint` participates in the same runtime: roots that expose associative
+  AND structure are recursively flattened, while an opaque root is represented
+  by one empty-path leaf and retains its own path, constant, range, or custom
+  semantics. The solver jointly chooses each row's next variable and proposing
   leaf occurrence, then interns both planning states and uniform
   `Propose`/`Confirm` protocol actions as exact control-state descriptors.
   Planning only estimates and partitions rows; a separately scheduled action
@@ -694,11 +700,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   history-independent rank gate lets variable-order, proposal, confirmation,
   and independently planned action histories reconverge before shared work
   runs, while row payloads retain multiplicity. The maximal nested AND region
-  is flattened into deterministic preorder leaf occurrences; unions and
-  path wrappers remain opaque semantic boundaries; custom constraints
-  do too unless they explicitly expose an associative AND shape. A profiled
-  entry point reports planning/action pops, interner and bucket merges, and
-  leaf-call batch measurements.
+  is flattened into deterministic preorder leaf occurrences; production
+  lowering represents finite unions as formula continuations, while path
+  wrappers and custom constraints remain opaque unless they explicitly expose
+  more structure. Profiled iterator collection reports planning/action pops,
+  interner and bucket merges, and leaf-call batch measurements.
 - **Canonical residual states gain a demand-driven batch-fill iterator.**
   `solve_residual_state_lazy` starts with a narrow desired parent-atom width so
   descendants can yield before sibling rows are evaluated. Filing a nonempty
@@ -713,8 +719,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Program may retain one complete parent activation solely to reuse its
   traversal. Candidate fanout therefore remains distinct from a total-work
   estimate. Exact descriptors remain interned so early states can safely reopen
-  when later histories reach them. Full drains preserve the eager solver's
-  distinct raw projected-row set; partial consumers may drop the remaining
+  when later histories reach them. Full drains preserve the distinct raw
+  projected-row set; partial consumers may drop the remaining
   affine frontier after the first useful result. Ready planning retains each row's
   exact adaptive variable and proposing leaf, then cohorts only rows with the
   same action.
@@ -918,7 +924,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Delta scheduling retains native successor ranges and unordered registries.**
   Transition cohorts now pass their contiguous tagged output slices directly
   into activation replacement, allocating per-task successor vectors only for
-  constraints that use the legacy eager fallback. Internal interner, credit,
+  constraints that use the legacy ordinary fallback. Internal interner, credit,
   activation, novelty, and acceptance maps use fast unordered storage wherever
   iteration order is semantically invisible, while cohort selection retains
   its canonical ordering. Complete positive-transition batches reserve their
@@ -945,8 +951,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cached PATCH segment counts and the existing bulk expansion kernel, avoiding
   per-successor trie descent and per-row scratch allocation without changing
   resumable lexical pages.
-- **Residual action dispatch now preserves an affine executor task.** Eager and
-  lazy residual execution both carry the selected interner state, canonical
+- **Residual action dispatch now preserves an affine executor task.** Every
+  residual execution shape carries the selected interner state, canonical
   descriptor, and owned row/candidate payload through one internal dispatch
   boundary. Concrete Propose and Confirm states expose a hardware-neutral
   action view with the exact state, leaf occurrence, variable, bound-row

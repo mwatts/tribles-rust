@@ -95,7 +95,6 @@ fn parallel_pool(threads: usize) -> &'static rayon::ThreadPool {
 enum RpqRoute {
     Ordinary,
     ConservativeCursor,
-    ResidualEager,
     ResidualLazy,
     #[cfg(feature = "parallel")]
     ResidualParallel(usize),
@@ -115,7 +114,6 @@ where
     let mut routes = vec![
         RpqRoute::Ordinary,
         RpqRoute::ConservativeCursor,
-        RpqRoute::ResidualEager,
         RpqRoute::ResidualLazy,
     ];
     #[cfg(feature = "parallel")]
@@ -127,7 +125,6 @@ where
             RpqRoute::ConservativeCursor => {
                 conservative_residual_cursor(make_query()).collect::<Vec<_>>()
             }
-            RpqRoute::ResidualEager => make_query().solve_residual_state(),
             RpqRoute::ResidualLazy => make_query().solve_residual_state_lazy().collect::<Vec<_>>(),
             #[cfg(feature = "parallel")]
             RpqRoute::ResidualParallel(threads) => {
@@ -197,12 +194,6 @@ macro_rules! assert_residual_routes_match {
             $label
         );
         prop_assert_eq!(
-            multiset(($query).solve_residual_state()),
-            expected.clone(),
-            "{}: eager residual state",
-            $label
-        );
-        prop_assert_eq!(
             multiset(($query).solve_residual_state_lazy()),
             expected.clone(),
             "{}: lazy residual state",
@@ -244,9 +235,9 @@ macro_rules! assert_residual_routes_match {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(96))]
 
-    /// Independently checks residual eager, geometric, fixed-width, and
-    /// forced-harvest schedules over random joins and overlapping unions on
-    /// both storage backends. Keeping this in a separate property test also
+    /// Independently checks production, conservative, geometric, fixed-width,
+    /// and forced-harvest schedules over random joins and overlapping unions
+    /// on both storage backends. Keeping this in a separate property test also
     /// keeps the generated query temporaries below the test thread's stack
     /// budget.
     #[test]
