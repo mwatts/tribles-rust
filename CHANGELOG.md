@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drains `solve_residual_state_lazy`; profiling drains that iterator through
   `collect_profiled`. Explicit compiler probes retain the conservative
   ordinary-constraint oracle.
+- **Breaking: adaptive variable choice now has one fixed specificity key.**
+  `OrderKeyMode`, `order_key_mode`, and the `TRIBLES_ORDER_KEY` environment
+  switch are removed. Directed action costs still choose the proposal source
+  within one variable; variables compare that source's raw candidate-count bit
+  length, then a plan-local static influence count, then `VariableId`.
+  Per-query influence sets and empty-binding base estimates are removed because
+  every Ready state already computes fresh per-row estimates.
 - **RPQ complete actions now obey exact scheduler work bounds.** Bound-endpoint
   graph-product traversal admits only a descending parent tail whose examined
   transitions and distinct endpoint outputs fit the current grant; positive
