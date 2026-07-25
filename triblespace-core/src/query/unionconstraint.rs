@@ -1,6 +1,5 @@
-use std::mem;
-
 use super::*;
+use ahash::AHashSet;
 use itertools::Itertools;
 
 /// Logical disjunction of constraints (OR).
@@ -18,9 +17,11 @@ use itertools::Itertools;
 /// constants and literal values into constant [`Term`](crate::query::Term)s
 /// (they never become variables), the requirement is about the *query
 /// variables the caller wrote*: every arm must mention the same ones.
-/// Estimates are summed across variants, proposals are merged and
-/// deduplicated, and confirmations are unioned via
-/// [`kmerge`](itertools::Itertools::kmerge).
+/// Estimates are summed across variants. Proposals concatenate each live
+/// arm's occurrence stream in arm order, and confirmation retains every
+/// original occurrence supported by at least one live arm. Logical
+/// idempotence belongs to the engine's SET-admission boundary rather than this
+/// physical composite.
 ///
 /// Before proposing or confirming, the union checks each variant's
 /// [`satisfied`](Constraint::satisfied) status and skips variants that are
@@ -138,27 +139,24 @@ where
             candidates.is_empty(),
             "propose expects an empty sink (see the Constraint::propose protocol law)"
         );
-        let mut row_values: Vec<RawInline> = Vec::new();
         let mut variant_values: Vec<RawInline> = Vec::new();
         for (i, row) in view.iter().enumerate() {
             let row_view = RowsView::new(view.vars, row);
-            row_values.clear();
             self.constraints
                 .iter()
                 .filter(|constraint| constraint.satisfied(&row_view))
                 .for_each(|constraint| {
+                    debug_assert!(
+                        variant_values.is_empty(),
+                        "each union arm must receive an independent empty proposal sink"
+                    );
                     constraint.propose(
                         variable,
                         &row_view,
                         &mut CandidateSink::Values(&mut variant_values),
                     );
-                    // `append` drains the buffer, leaving it empty for the
-                    // next variant.
-                    row_values.append(&mut variant_values);
+                    candidates.extend_row(i as u32, variant_values.drain(..));
                 });
-            row_values.sort_unstable();
-            row_values.dedup();
-            candidates.extend_row(i as u32, row_values.iter().copied());
         }
     }
 
@@ -170,26 +168,24 @@ where
     ) {
         confirm_per_row(view, candidates, |row, values| {
             let row_view = RowsView::new(view.vars, row);
-            values.sort_unstable();
-
-            let union: Vec<RawInline> = self
+            let mut supported = AHashSet::new();
+            for constraint in self
                 .constraints
                 .iter()
                 .filter(|constraint| constraint.satisfied(&row_view))
-                .map(|constraint| {
-                    let mut survivors: Vec<RawInline> = values.clone();
-                    constraint.confirm(
-                        variable,
-                        &row_view,
-                        &mut CandidateSink::Values(&mut survivors),
-                    );
-                    survivors
-                })
-                .kmerge()
-                .dedup()
-                .collect();
-
-            _ = mem::replace(values, union);
+            {
+                // Every arm confirms the complete original occurrence stream.
+                // The support set records only the relational union; retaining
+                // below preserves the caller's physical order and multiplicity.
+                let mut survivors = values.clone();
+                constraint.confirm(
+                    variable,
+                    &row_view,
+                    &mut CandidateSink::Values(&mut survivors),
+                );
+                supported.extend(survivors);
+            }
+            values.retain(|value| supported.contains(value));
         });
     }
 }
@@ -232,14 +228,14 @@ where
         self.source_estimate(variable, view, out)
     }
 
-    /// Per row: collects proposals from every *satisfied* variant (via a
-    /// single-row borrowed view), then sorts and deduplicates the row's
-    /// group. Dead variants (where [`satisfied`](Constraint::satisfied)
-    /// returns `false` for the row) are skipped so their stale bindings
-    /// cannot inject values that no live variant would produce.
+    /// Per row: concatenates proposals from every *satisfied* variant (via a
+    /// single-row borrowed view), preserving arm order and every physical
+    /// occurrence. Dead variants (where [`satisfied`](Constraint::satisfied)
+    /// returns `false` for the row) are skipped so their stale bindings cannot
+    /// inject values that no live variant would produce.
     ///
     /// Each variant proposes into its **own empty buffer** and the union
-    /// merges the independent per-variant outputs. This upholds the
+    /// concatenates the independent per-variant outputs. This upholds the
     /// empty-sink law of [`propose`](Constraint::propose): a composite
     /// variant (e.g. an intersection) filters the sink it is handed via its
     /// children's `confirm`, so sharing one buffer across variants would let
@@ -257,10 +253,11 @@ where
         self.propose_union(variable, view, candidates)
     }
 
-    /// Confirms each row's candidate group against every *satisfied*
-    /// variant independently, then merges the per-variant survivors via
-    /// [`kmerge`](itertools::Itertools::kmerge) and deduplicates. A value
-    /// passes if *any* live variant confirms it.
+    /// Confirms each row's complete original candidate group against every
+    /// *satisfied* variant independently. The union of survivor values is
+    /// treated as relational support, then applied to the original stream so
+    /// order and multiplicity are retained. A value passes if *any* live
+    /// variant confirms it.
     fn confirm(
         &self,
         variable: VariableId,
@@ -268,18 +265,6 @@ where
         candidates: &mut CandidateSink<'_>,
     ) {
         self.confirm_union(variable, view, candidates)
-    }
-
-    fn propose_with_layout(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) -> ProposalLayout {
-        self.propose_union(variable, view, candidates);
-        // `propose_union` sorts and deduplicates each parent group after
-        // collecting every live arm into isolated buffers.
-        ProposalLayout::grouped_set()
     }
 
     /// Returns `true` when **at least one** variant is satisfied for
@@ -344,6 +329,7 @@ pub use or;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inline::encodings::UnknownInline;
     use crate::query::constantconstraint::ConstantConstraint;
 
     const X: VariableId = 0;
@@ -461,5 +447,35 @@ mod tests {
         // Without this assert, `variables()` would later panic on
         // `self.constraints[0]` with an unhelpful index-out-of-bounds.
         let _: UnionConstraint<ConstantConstraint> = UnionConstraint::new(vec![]);
+    }
+
+    #[test]
+    fn proposal_concatenates_arm_occurrences_in_order() {
+        let x = Variable::<UnknownInline>::new(X);
+        let constraint = UnionConstraint::new(vec![
+            ConstantConstraint::new(x, Inline::new(DEAD)),
+            ConstantConstraint::new(x, Inline::new(LIVE)),
+            ConstantConstraint::new(x, Inline::new(DEAD)),
+        ]);
+        let mut values = Vec::new();
+
+        constraint.propose(X, &RowsView::EMPTY, &mut CandidateSink::Values(&mut values));
+
+        assert_eq!(values, [DEAD, LIVE, DEAD]);
+    }
+
+    #[test]
+    fn confirmation_preserves_supported_occurrence_order_and_multiplicity() {
+        let x = Variable::<UnknownInline>::new(X);
+        let constraint = UnionConstraint::new(vec![
+            ConstantConstraint::new(x, Inline::new(DEAD)),
+            ConstantConstraint::new(x, Inline::new(LIVE)),
+        ]);
+        let unsupported = [0x63; 32];
+        let mut values = vec![LIVE, DEAD, DEAD, unsupported, LIVE];
+
+        constraint.confirm(X, &RowsView::EMPTY, &mut CandidateSink::Values(&mut values));
+
+        assert_eq!(values, [LIVE, DEAD, DEAD, LIVE]);
     }
 }

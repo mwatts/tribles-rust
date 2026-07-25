@@ -298,7 +298,7 @@ fn nested_nonuniform_intersection_downgrades_if_any_selected_row_is_a_bag() {
 }
 
 #[test]
-fn union_constant_and_equality_issue_construction_proven_sets() {
+fn union_is_conservative_while_constant_and_equality_prove_sets() {
     let union: UnionConstraint<Box<dyn Constraint<'static>>> = UnionConstraint::new(vec![
         Box::new(BasicSource {
             values: &[B, A, A],
@@ -319,8 +319,8 @@ fn union_constant_and_equality_issue_construction_proven_sets() {
         &RowsView::EMPTY,
         &mut CandidateSink::Values(&mut union_values),
     );
-    assert!(union_layout.is_grouped_set());
-    assert_eq!(union_values, [A, B]);
+    assert!(!union_layout.is_grouped_set());
+    assert_eq!(union_values, [B, A, A, B, B]);
 
     let variable = Variable::<UnknownInline>::new(TARGET);
     let constant = ConstantConstraint::new(variable, Inline::new(B));

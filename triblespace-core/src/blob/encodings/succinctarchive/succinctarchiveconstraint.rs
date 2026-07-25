@@ -258,14 +258,12 @@ fn upper_bound_indexed(
 
 /// Pages one nondecreasing indexed driver through an exact secondary filter.
 ///
-/// The legacy ordinary two-bound proposal arms defensively collapsed repeated
-/// values. Keeping that semantic here makes the source exact even if an
-/// archive implementation later exposes repeated adjacent codes inside a
-/// fixed-pair range. Seeking is a binary search over the immutable
-/// wavelet/range view; no prefix of candidates is materialized or replayed.
-/// Every distinct
-/// driver value consumes demand even when `accept` rejects it, and continuation
-/// resumes strictly after the last value examined rather than the last emitted
+/// Repeated-position drivers can map several adjacent physical positions to
+/// one logical value, so this path collapses runs while applying its filter.
+/// Seeking is a binary search over the immutable wavelet/range view; no prefix
+/// of candidates is materialized or replayed. Every distinct driver value
+/// consumes demand even when `accept` rejects it, and continuation resumes
+/// strictly after the last value examined rather than the last emitted
 /// candidate. Page entry binary-seeks the public value cursor once; within the
 /// page duplicate runs advance linearly, matching the dense proposal sweep
 /// instead of paying another binary search for every distinct value.
@@ -544,9 +542,8 @@ enum LocatedProposalHead<'a> {
         last_prefix: &'a BitVector<Rank9SelIndex>,
         middle_column: &'a WaveletMatrix<Rank9SelIndex>,
     },
-    /// The last component of a fixed pair. Canonical archives are sets, hence
-    /// the last component is unique inside the pair, but consumption retains
-    /// adjacent duplicate collapse as the ordinary proposal path did.
+    /// The last component of a fixed pair. Canonical archives are sets, so
+    /// every physical position inside the pair denotes a unique last value.
     Last {
         range: Range<usize>,
         last_column: &'a WaveletMatrix<Rank9SelIndex>,
@@ -622,7 +619,7 @@ where
                 limit,
                 emit,
             ),
-            LocatedProposalHead::Last { range, last_column } => consume_indexed_distinct_filtered(
+            LocatedProposalHead::Last { range, last_column } => consume_indexed_unique(
                 range.len(),
                 |offset| {
                     self.archive
@@ -632,7 +629,6 @@ where
                 cursor,
                 limit,
                 emit,
-                |_| true,
             ),
         }
     }
@@ -2154,8 +2150,7 @@ mod typed_program_tests {
         assert_dense_equals_bounded("middle VEA", &constraint, e.index, v_view, &entities);
         assert_dense_equals_bounded("middle VAE", &constraint, a.index, v_view, &attributes);
 
-        // Three fixed-pair last walks. These retain ordinary adjacent
-        // duplicate collapse even though this set fixture proves uniqueness.
+        // Three fixed-pair last walks use their structurally unique ranges.
         let av_vars = [a.index, v.index];
         let av_rows = [attributes[0], values[0]];
         assert_dense_equals_bounded(

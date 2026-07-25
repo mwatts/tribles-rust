@@ -157,7 +157,7 @@ fn identical_shards_use_one_production_program_for_all_twelve_schemas() {
 }
 
 #[test]
-fn interleaved_shards_keep_eager_order_and_production_program_set_parity() {
+fn interleaved_shards_keep_eager_occurrences_and_production_program_set_parity() {
     let entity = id(0x41);
     let attribute = id(0x42);
     let left = fixed_shard(entity, attribute, [1, 3, 5]);
@@ -181,13 +181,16 @@ fn interleaved_shards_keep_eager_order_and_production_program_set_parity() {
         &RowsView::EMPTY,
         &mut CandidateSink::Values(&mut eager),
     );
-    assert_eq!(eager, (1..=6).map(|tag| value(tag).raw).collect::<Vec<_>>());
+    assert_eq!(
+        eager,
+        [1, 3, 5, 2, 3, 4, 6].map(|tag| value(tag).raw).to_vec()
+    );
     let mut full: Vec<_> = Query::new(constraint, project_value)
         .solve_residual_state_lazy()
         .start_width(1)
         .collect();
     full.sort_unstable();
-    assert_eq!(full, eager);
+    assert_eq!(full, (1..=6).map(|tag| value(tag).raw).collect::<Vec<_>>());
 }
 
 #[test]

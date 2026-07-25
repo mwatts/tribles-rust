@@ -152,15 +152,15 @@ fn union_dead_arms_are_row_local_and_duplicate_activations_are_affine() {
     });
 }
 
-/// Union confirmation is a finite set reducer, not a pointwise filter: equal
-/// candidate values for one parent collapse after the live arms are merged.
+/// Union confirmation preserves its physical occurrence stream, while the
+/// engine's raw-head SET boundary admits one logical result per parent/value.
 #[test]
-fn union_confirm_deduplicates_equal_candidates_within_one_parent() {
+fn union_confirm_preserves_query_set_semantics_for_duplicate_candidates() {
     let a_v: Inline<GenId> = (&fixture_id(41)).to_inline();
     let candidates = [a_v, a_v];
     let candidates = SortedSlice::new(&candidates).unwrap();
 
-    assert_route_matrix("union-confirm-deduplicates-one-parent", vec![a_v], || {
+    assert_route_matrix("union-confirm-set-admits-one-parent", vec![a_v], || {
         find!(x: Inline<GenId>, {
             let mut source = EstimateOverrideConstraint::new(candidates.has(x));
             source.set_estimate(x.index, 0);

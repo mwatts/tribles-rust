@@ -267,13 +267,13 @@ fn disjunction_receipts_are_the_meet_of_all_arms() {
 }
 
 #[test]
-fn composites_and_projection_have_raw_set_semantics() {
+fn composites_preserve_occurrences_and_projection_has_raw_set_semantics() {
     let x = Variable::<UnknownInline>::new(X);
     let duplicate_union = UnionConstraint::new(vec![
         ConstantConstraint::new(x, Inline::new(MEMBER)),
         ConstantConstraint::new(x, Inline::new(MEMBER)),
     ]);
-    assert_eq!(proposed(&duplicate_union, X), vec![MEMBER]);
+    assert_eq!(proposed(&duplicate_union, X), vec![MEMBER, MEMBER]);
 
     let make_root = || {
         let x = Variable::<UnknownInline>::new(X);

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Union constraints now expose one physical occurrence-stream protocol.**
+  Live arms propose into independent empty sinks whose occurrences concatenate
+  in arm order; confirmation derives relational support from every live arm
+  and retains the original stream's order and multiplicity. Logical
+  idempotence remains at the engine's raw-head SET-admission boundary.
+  SuccinctArchive fixed-pair walks now use their structural uniqueness
+  directly, and the stale standalone bag-scheduler model is removed.
 - **Breaking: cyclic constraint execution now has one typed Program runtime.**
   The ten never-shipped residual pager, seed, and expansion hooks are removed
   from `Constraint`, together with their source/transition queues, descriptor
@@ -477,11 +484,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reducers execute it synchronously—distinct projection drains the frame while
   existence may short-circuit and drop its private remainder—keeping local
   residual states out of the caller's ordering domain.
-- **A test-only frame scheduler model pins the asynchronous cohosting laws.**
-  Focused executable receipts cover affine queued/in-flight credits,
-  activation-local reducers and cancellation, plan-local readiness, global
-  width sharing, and the ordering boundary between hot, full, frame, and cold
-  underfilled outer work without wiring dynamic frame calls into production.
 - **Estimate-only wrappers preserve native residual execution.**
   `EstimateOverrideConstraint` remains a structural opaque leaf so its planner
   cardinality overrides cannot be bypassed, while forwarding bounded proposal
