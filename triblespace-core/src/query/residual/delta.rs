@@ -15068,23 +15068,28 @@ mod tests {
     }
 
     #[test]
-    fn online_or_direct_source_publishes_before_same_receipt_quiescence() {
+    fn online_or_accepting_seed_publishes_before_program_quiescence() {
         let exit = FormulaPcId(13);
         let mut registry = ProducerRegistry::new();
-        let (activation, generator) = registry.start_source(
+        let activation = registry.open_program_activation(
             DeltaReducer::StreamFormulaOrProposal { exit },
             support_formula_return(),
             None,
+            None,
         );
-        let outcome = registry.replace_source(generator, std::iter::empty(), [value(7)], None);
-        assert_eq!(outcome.accepted, [value(7)]);
-        let proof = outcome
-            .quiescence
-            .expect("the accepting direct source page also reached EOF");
+        let mut installed = registry.install_program_roots(
+            activation,
+            [ProgramSeedWork {
+                parent: 0,
+                work: positive_test_work(0),
+                accepted: Some(value(7)),
+            }],
+        );
+        assert_eq!(installed.initial_accepted, [value(7)]);
 
         let streamed = registry
             .take_streaming_return(activation)
-            .expect("same-step acceptance lost its online effect receipt");
+            .expect("seed acceptance lost its online effect receipt");
         assert_eq!(
             streamed.effect,
             DeltaStreamingEffect::FormulaOrCandidates { exit }
@@ -15093,7 +15098,7 @@ mod tests {
             streamed.return_to.is_none(),
             "online receipt cloned its Formula payload before master admission"
         );
-        let mut accepted = outcome.accepted;
+        let mut accepted = installed.initial_accepted;
         let admitted = registry
             .publish_formula_or_candidates(activation, &mut accepted)
             .expect("the first endpoint was not admitted");
@@ -15105,6 +15110,26 @@ mod tests {
         assert_eq!(accumulator.sets[0].len(), 1);
         assert_eq!(accumulator.pending_len(), 0);
 
+        let (_, root) = installed.roots.pop().expect("one typed seed root");
+        let outcome = registry.replace_program(
+            root,
+            DeltaStateId(0),
+            &[],
+            std::iter::empty(),
+            std::iter::empty(),
+            std::iter::empty(),
+            false,
+            false,
+            false,
+            None,
+        );
+        assert!(
+            outcome.accepted.is_empty(),
+            "the typed page replayed seed acceptance"
+        );
+        let proof = outcome
+            .quiescence
+            .expect("the accepting Program seed reached quiescence");
         let RegistrySettlement::Completed(completed) = registry.settle_quiescence(proof) else {
             panic!("online OR EOF manufactured finalizer work")
         };
