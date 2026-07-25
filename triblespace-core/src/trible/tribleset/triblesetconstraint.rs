@@ -866,10 +866,10 @@ impl TribleSetConstraint {
             })
     }
 
-    /// Pages the same ordered proposal source used by the legacy residual
-    /// hook, but for one already-selected parent row. Keeping this kernel on
-    /// the family preserves the six-index and repeated-position semantics;
-    /// the typed Program contributes only affine continuation state.
+    /// Pages the same ordered proposal source used by ordinary `propose`, but
+    /// for one already-selected parent row. Keeping this kernel on the family
+    /// preserves the six-index and repeated-position semantics; the typed
+    /// Program contributes only affine continuation state.
     fn proposal_source_page_row(
         &self,
         p: &Positions,
