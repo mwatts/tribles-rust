@@ -13,7 +13,6 @@ use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::{genid::GenId, UnknownInline};
 use triblespace_core::inline::{Inline, IntoInline, RawInline};
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
-use triblespace_core::query::residual::ResidualLowering;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, EstimateSink, ProposalCoverage, Query, RowsView, Variable,
     VariableId, VariableSet,
@@ -202,7 +201,7 @@ where
     C: Constraint<'a> + 'a,
 {
     let mut query = Query::new(root, project_zero)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .start_width(1)
         .growth(2)
         .cap(16);
@@ -251,12 +250,12 @@ fn clone_drop_and_duplicate_affine_parents_preserve_exact_sets() {
         &archive,
     ));
     let mut expected: Vec<_> = Query::new(Arc::clone(&root), project_zero)
-        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+        .solve_residual_state_lazy()
         .collect();
     expected.sort_unstable();
 
     let mut query = Query::new(root, project_zero)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .start_width(1)
         .cap(1);
     let first = query
@@ -296,7 +295,7 @@ fn clone_drop_and_duplicate_affine_parents_preserve_exact_sets() {
     };
     let project = |binding: &Binding| Some((*binding.get(PARENT)?, *binding.get(TARGET)?));
     let mut residual: Vec<_> = Query::new(make(), project)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .start_width(1)
         .cap(1)
         .collect();
@@ -377,7 +376,7 @@ fn program_snapshot(archive: &SuccinctArchive<OrderedUniverse>, attribute: Id) -
     let constraint = SuccinctArchiveConstraint::new(x, inline_id(attribute), x, &archive);
     assert_typed_program_family("snapshot/E=V", &constraint, x.index, &RowsView::EMPTY);
     let mut values: Vec<_> = Query::new(constraint, project_zero)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .start_width(1)
         .collect();
     values.sort_unstable();

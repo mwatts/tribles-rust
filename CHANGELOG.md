@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The ten never-shipped residual pager, seed, and expansion hooks are removed
   from `Constraint`, together with their source/transition queues, descriptor
   registry lane, and forwarding adapters. A selected typed Program enters the
-  affine scheduler; a policy-deferred or structurally absent route uses the
+  affine scheduler; a non-production or structurally absent route uses the
   ordinary constraint action. Custom constraints that need resumable work
   implement a typed Program instead of a second residual protocol.
 - **Built-in finite proposal sources now use one Production typed Program
@@ -24,16 +24,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Serial iteration, ordinary Rayon iteration, saturated parallel iteration,
   and private RPQ subframes all compile native AND regions with finite
   Union-leaf continuations and production-qualified typed Programs.
-  `Query::residual_lowering` and its per-query policy state are removed.
-  `solve_residual_state_lazy_with` temporarily remains as an explicit
-  compiler-probe seam.
+  `Query::residual_lowering`, `ResidualLowering`, `FormulaScope`,
+  `ProgramScope`, and `solve_residual_state_lazy_with` are removed rather than
+  retained as never-shipped compatibility or tuning surfaces.
 - **Breaking: serial residual execution now has one iterator implementation.**
   The never-shipped eager `solve_residual_state` and
   `solve_residual_state_profiled` entry points, their private worklist loop,
   and the obsolete opaque-plan compiler alias are removed. Full enumeration
   drains `solve_residual_state_lazy`; profiling drains that iterator through
-  `collect_profiled`. Explicit compiler probes retain the conservative
-  ordinary-constraint oracle.
+  `collect_profiled`. Focused unit tests retain a private opaque ordinary
+  `Constraint` oracle for differential checking.
 - **Breaking: adaptive variable choice now has one fixed specificity key.**
   `OrderKeyMode`, `order_key_mode`, and the `TRIBLES_ORDER_KEY` environment
   switch are removed. Directed action costs still choose the proposal source
@@ -75,17 +75,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   eligibility. `propose_with_layout` and its `ProposalLayout` report only
   physical `(parent, value)` uniqueness for optional deduplication elision, and
   estimates remain cost guidance only.
-- **Certified WholeRoot AND quotes can cross Ready as deferred affine
-  choices.** The experimental residual scheduler preserves its V3.1 outer
-  proposal shell while carrying each row's stable-preorder child ordinal and
-  Exact receipt beside the row. Equal outer states therefore coalesce before a
-  carrier pop partitions by child, allocates Formula activations once, skips
-  target-irrelevant children, and enters the selected child without repeating
-  root estimates or materializing the root Formula Plan. Arbitrary exposed
-  ANDs retain the ordinary path unless they explicitly certify the
-  child-minimum estimate law; OR remains a quote barrier. Plain Ready keys,
-  variable plans, canonical state descriptors, state buckets, and release
-  telemetry retain their V3.1 layouts.
 - **Finite-Formula structural control is interned independently from its
   canonical outer Candidate exit.** Residual Formula state now carries an
   exact `(program-counter, candidate-exit)` cursor. The exit records only the
@@ -166,8 +155,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   multiplier without taxing insert/take.
 - **Canonical Succinct archive paging is production-qualified.** Propose,
   Confirm, and Support routes participate in ordinary production execution, keeping
-  their typed paging and physical-backend seam available without requiring
-  maximally exposed `ResidualLowering::FULL`.
+  their typed paging and physical-backend seam available through the one
+  production plan.
 - **Typed `UnionArchive` Propose and Support are `Production`; Confirm remains
   `Explicit`.** Ordinary production execution keeps sparse, geometrically
   widened paging for low-demand and nonterminal work. A fresh multi-parent
@@ -193,8 +182,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Finite equality work and pointwise TribleSet checks stay on the ordinary
   production path, while TribleSet proposal cursors remain production-resumable.**
   Equality Propose, Confirm, and Support plus TribleSet Confirm and Support are
-  explicit Program routes: ordinary execution uses their already bounded
-  kernels, while the `FULL` probe retains typed representability.
+  explicitly non-production Program routes: ordinary execution uses their
+  already bounded kernels, while direct Program tests retain representation
+  coverage.
   TribleSet Propose remains production-qualified and pageable for low-demand
   and high-fanout work. For multi-parent terminal cohorts, its exact complete
   occurrence-bag certificate lets the geometrically widened scheduler drain a
@@ -202,24 +192,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Hash-set and hash-map membership filters stay on the ordinary production
   residual path.** Their pointwise Confirm and Support work is already bounded
   by the scheduler's input page, so production execution does not expand each cheap hash
-  lookup into a typed Program activation. The filter-only Program routes remain
-  available to `ResidualLowering::FULL` as explicit representability controls.
+  lookup into a typed Program activation. Direct Program tests retain
+  representation coverage for the filter-only routes.
 - **Ordinary residual queries use one production structural policy.** Exposed
   associative AND regions are flattened into residual occurrences, finite
   Union leaves become formula continuations, and production-qualified typed
   Programs such as regular-path execution are enabled. Explicit Program
-  routes stay on the ordinary constraint protocol; explicit compiler probes
-  may still request other `ResidualLowering` combinations.
+  routes stay on the ordinary constraint protocol.
 - **Typed Program selection now has an explicit exposure policy.** Every route
-  is `Production` or `Explicit`, and the residual lowering's `ProgramScope`
-  independently selects `Disabled`, `Production`, or `All`. The centralized
-  selector distinguishes an absent route from a policy-deferred route: absence
-  and deferral both use the stable ordinary action and never inherit typed
-  grouping or a stronger Program receipt.
-  `ResidualLowering::new` now takes a `ProgramScope` instead of a boolean
-  (`false` maps to `Disabled`, `true` to `All`), and `program_scope()` replaces
-  the old `transition_programs()` getter. Custom typed Program specs must also
-  classify each returned route with a `ProgramExposure`.
+  is `Production` or `Explicit`. The one production compiler selects only
+  `Production`; absence and explicit-only exposure both use the stable ordinary
+  action and never inherit typed grouping or a stronger Program receipt.
+  Custom typed Program specs must classify each returned route with a
+  `ProgramExposure`.
 - **Cyclic Confirm actions now cross the same parent-local SET boundary as
   ordinary actions.** Graph traversal retains the immutable original
   occurrence bag and raw confirmation telemetry until its complete result
@@ -511,14 +496,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sources, transition programs, and Boolean
   Support to its inner constraint. `DebugConstraint` remains deliberately
   opaque because native proposal execution would bypass its observation log.
-- **Built-in constraints gain an executable residual capability matrix.**
+- **Built-in constraints have executable residual-oracle parity coverage.**
   Constants, equality, inclusive ranges, sorted slices, hash-set and hash-map
   membership, finite unions, diagnostic wrappers, and repeated pattern
-  variables now have exact relational SET parity across the independent oracle,
-  conservative and full residual lowering, fixed width one, geometric growth,
-  and a cloned live remainder. Static capability assertions and runtime
-  counters distinguish native paging/formula execution from the semantically
-  exact opaque fallback.
+  variables preserve exact relational SET parity between the fixed production
+  solver and independent ordinary or plain-Rust oracles.
 - **SuccinctArchive preserves equality for repeated pattern variables.**
   Triple patterns that reuse one unbound variable across E/V, E/A, A/V, or
   all three positions now estimate, propose, and confirm through exact Ring
@@ -651,20 +633,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cohorts use these retained views to prove every fresh positive branch fits
   the geometric page budget before emitting, eliminating the former count
   descent followed by a second enumeration descent.
-- **Residual compiler probes have nine canonical, execution-independent
-  forms.**
-  `ResidualLowering` crosses the `FormulaScope` chain (`OpaqueLeaves`,
-  `UnionLeaves`, `WholeRoot`) with the independent `ProgramScope` chain
-  (`Disabled`, `Production`, `All`);
-  whole-root lowering structurally absorbs union-leaf lowering.
-  `solve_residual_state_lazy_with` selects a probe form independently of
-  geometric width. Whole-root scope keeps variable selection and the commit
-  barrier outside a canonical AND/OR program, flattens only the maximal exposed
-  root conjunction, and preserves opaque scope and group-reducer boundaries.
-  Root-AND confirmations retain candidate-occurrence paging once no selected
-  activation-reuse route blocks it, including width-one and geometric
-  first-result traces. Ordinary live queries instead use the one fixed
-  Union-leaf plus production-Program plan.
 - **WGPU Succinct confirmation can opt into exact residual-action executor
   samples.** `WgpuSuccinctArchive::observe_residual_actions()` returns a
   borrowing, non-`Deref` `ObservedWgpuSuccinctArchive` whose pattern route
@@ -808,21 +776,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Structurally absent typed Program routes retain residual paging.** A constraint may
-  expose a typed Program for only some structural actions. When its family
-  returns no route for the current request, the residual engine now continues
-  through that same constraint's paged source and seed capabilities instead
-  of dropping directly to eager ordinary execution. A route selected by the
-  active `ProgramScope` remains exclusive. A route that exists but is deferred
-  by policy instead uses the stable ordinary action and does not fall through
-  to legacy paging. This preserves geometric lazy latency for heterogeneous
-  wrappers such as the resident succinct two-bound route without bypassing
-  exposure policy.
 - **Explicit parallel residual queries use the production compiler policy.**
   `Query::into_par_residual_state_iter` carries the same fixed production plan
-  as serial and ordinary Rayon execution into its affine shards. Explicit
-  compiler probes can still convert a configured `ResidualStateIter` into
-  parallel iteration.
+  as serial and ordinary Rayon execution into its affine shards.
 - **BM25 tokenization preserves non-ASCII symbols and emoji.**
   `hash_tokens` previously discarded every token without an alphanumeric
   character, making standalone emoji queries produce an empty term list.
@@ -862,8 +818,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the monotone value/entity output-domain statistic of each possible final
   hop instead of opening a private WCO frame or recursively materializing a
   depth-bounded closure. Query execution and result semantics are unchanged;
-  `rpq_bound_estimate_probe` covers nested-closure latency and skewed ordering
-  adversaries.
+  generated RPQ tests cover nested-closure and skewed-ordering adversaries.
 - **Residual formula continuations use compact persistent arena records.**
   Canonical state descriptors now carry a four-byte query-local program-counter
   ID. Each arena record names its exact parent return edge and outer WCO resume
@@ -895,13 +850,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   residual scheduler follows the activation-local source/transition lineage it
   just seeded until its first stable effect or quiescence; canonical delta
   identity and affine work ownership remain unchanged.
-- **Whole-root lowering erases formula identity shells.** An opaque non-union
-  atom, including one wrapped only in unary exposed AND nodes, now enters the
-  flat residual action plan even when `FormulaScope::WholeRoot` is selected.
-  Multi-child conjunctions, unions, and scoped atomic boundaries retain the
-  finite formula machine. Native transition programs therefore publish
-  directly for a pure regular-path query instead of routing every accepted
-  page through an administrative formula payload and program counter.
 - **RPQ transition programs quotient equivalent residual kernels.** After
   epsilon elimination, deterministic forward-bisimulation refinement merges
   program counters with the same accepting bit and ordered labeled future.

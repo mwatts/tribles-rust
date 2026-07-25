@@ -8,9 +8,7 @@ use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
-use triblespace_core::query::residual::{
-    ActionVerb, FormulaScope, ProgramScope, ResidualLowering, ResidualShadowEpoch,
-};
+use triblespace_core::query::residual::{ActionVerb, ResidualShadowEpoch};
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, DispatchClass, EstimateSink, PathOp, PreferredProgram,
@@ -769,21 +767,7 @@ impl<'a> Constraint<'a> for PageLocalDomain {
 #[derive(Clone, Copy)]
 enum SolveRoute {
     Ordinary,
-    Combined,
-    Conservative,
-}
-
-fn combined_effects() -> ResidualLowering {
-    ResidualLowering::new(FormulaScope::UnionLeaves, ProgramScope::All)
-}
-
-fn root_formula_effects() -> ResidualLowering {
-    ResidualLowering::FULL
-}
-
-#[cfg(feature = "parallel")]
-fn all_formula_effects() -> ResidualLowering {
-    ResidualLowering::FULL
+    Residual,
 }
 
 fn repeated(attribute: Id, inverse: bool) -> Vec<PathOp> {
@@ -1481,12 +1465,7 @@ fn run(
     let query = Query::new(root, project);
     let mut results: Vec<_> = match route {
         SolveRoute::Ordinary => query.collect(),
-        SolveRoute::Combined => query
-            .solve_residual_state_lazy_with(combined_effects())
-            .collect(),
-        SolveRoute::Conservative => query
-            .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
-            .collect(),
+        SolveRoute::Residual => query.solve_residual_state_lazy().collect(),
     };
     results.sort_unstable();
     results
@@ -1498,11 +1477,7 @@ fn assert_all_routes(
     mut expected: Vec<RawInline>,
 ) {
     expected.sort_unstable();
-    for route in [
-        SolveRoute::Ordinary,
-        SolveRoute::Combined,
-        SolveRoute::Conservative,
-    ] {
+    for route in [SolveRoute::Ordinary, SolveRoute::Residual] {
         assert_eq!(run(make_root(), route, project), expected);
     }
 }
@@ -1522,7 +1497,7 @@ fn sorted_results_are_subset(subset: &[RawInline], superset: &[RawInline]) -> bo
 }
 
 #[test]
-fn synthetic_root_atom_same_variable_rpq_composes_capabilities() {
+fn same_variable_rpq_uses_the_production_program() {
     let graph = Graph::new(4, &[(0, 0), (1, 1), (2, 2), (3, 3)]);
     let ops = repeated(graph.attribute, false);
     let make = || {
@@ -1535,37 +1510,18 @@ fn synthetic_root_atom_same_variable_rpq_composes_capabilities() {
     };
 
     let mut expected: Vec<_> = Query::new(make(), project_start)
-        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+        .solve_residual_state_lazy()
         .collect();
     expected.sort_unstable();
 
-    let cases = [
-        (
-            "root-only",
-            ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Disabled),
-            false,
-        ),
-        (
-            "cyclic-only",
-            ResidualLowering::new(FormulaScope::OpaqueLeaves, ProgramScope::All),
-            true,
-        ),
-        ("whole-root-transitions", ResidualLowering::FULL, true),
-    ];
-    for (name, lowering, should_page_sources) in cases {
-        let mut query = Query::new(make(), project_start)
-            .solve_residual_state_lazy_with(lowering)
-            .cap(4)
-            .start_width(1);
-        let mut actual: Vec<_> = query.by_ref().collect();
-        actual.sort_unstable();
-        assert_eq!(actual, expected, "capability case {name}");
-        assert_eq!(
-            query.stats().delta_source_pages > 0,
-            should_page_sources,
-            "capability case {name}"
-        );
-    }
+    let mut query = Query::new(make(), project_start)
+        .solve_residual_state_lazy()
+        .cap(4)
+        .start_width(1);
+    let mut actual: Vec<_> = query.by_ref().collect();
+    actual.sort_unstable();
+    assert_eq!(actual, expected);
+    assert!(query.stats().delta_source_pages > 0);
 }
 
 #[test]
@@ -1596,7 +1552,7 @@ fn synthetic_root_parent_atomic_rpq_precedes_ordinary_suffix() {
         }) as DynConstraint,
     ]));
     let mut query = Query::new(root, project_start)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1);
 
@@ -1637,7 +1593,7 @@ fn synthetic_root_cyclic_proposer_streams_into_an_ordinary_relational_suffix() {
         }) as DynConstraint,
     ]));
     let mut query = Query::new(root, project_start)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(8)
         .start_width(1);
 
@@ -1677,9 +1633,8 @@ fn nested_repeated_root_rpqs_keep_distinct_action_occurrences() {
             Box::new(UnionConstraint::new(vec![arm(), arm()])) as DynConstraint,
         ]))
     };
-    let lowering = ResidualLowering::FULL;
     let direct = Query::new(make(), project_end)
-        .solve_residual_state_lazy_with(lowering)
+        .solve_residual_state_lazy()
         .collect_profiled();
     let mut actual = direct.results;
     actual.sort_unstable();
@@ -1687,7 +1642,7 @@ fn nested_repeated_root_rpqs_keep_distinct_action_occurrences() {
     expected.sort_unstable();
     assert_eq!(actual, expected);
     let observed = Query::new(make(), project_end)
-        .solve_residual_state_lazy_with(lowering)
+        .solve_residual_state_lazy()
         .shadow(ResidualShadowEpoch::new())
         .collect_profiled();
     let mut observed_results = observed.results.clone();
@@ -1713,7 +1668,7 @@ fn cyclic_rpq_runs_as_a_direct_finite_or_proposal_action() {
     let root = formula_bound_start_root(graph.set.clone(), graph.value(0), &ops);
 
     let mut lowered_query = Query::new(Arc::clone(&root), project_end)
-        .solve_residual_state_lazy_with(combined_effects())
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1);
     let mut lowered: Vec<_> = lowered_query.by_ref().collect();
@@ -1742,7 +1697,7 @@ fn cyclic_rpq_runs_as_a_direct_finite_or_grouped_confirm_action() {
     );
 
     let mut lowered_query = Query::new(Arc::clone(&root), project_end)
-        .solve_residual_state_lazy_with(combined_effects())
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1);
     let mut lowered: Vec<_> = lowered_query.by_ref().collect();
@@ -1787,7 +1742,7 @@ fn cyclic_or_confirm_keeps_the_original_group_for_a_later_sibling() {
     ]));
 
     let mut lowered_query = Query::new(Arc::clone(&root), project_end)
-        .solve_residual_state_lazy_with(combined_effects())
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1);
     let mut lowered: Vec<_> = lowered_query.by_ref().collect();
@@ -1823,8 +1778,8 @@ fn cyclic_rpq_runs_in_a_finite_and_as_proposer_and_grouped_confirmer() {
             path_estimate_wins,
             &ops,
         );
-        let mut lowered_query = Query::new(Arc::clone(&root), project_end)
-            .solve_residual_state_lazy_with(combined_effects());
+        let mut lowered_query =
+            Query::new(Arc::clone(&root), project_end).solve_residual_state_lazy();
         let mut lowered: Vec<_> = lowered_query.by_ref().collect();
         lowered.sort_unstable();
         expected.sort_unstable();
@@ -1873,7 +1828,7 @@ fn cyclic_rpq_resumes_through_recursive_or_and_or_frames() {
         let root = Arc::new(IntersectionConstraint::new(constraints));
 
         let mut lowered_query = Query::new(Arc::clone(&root), project_end)
-            .solve_residual_state_lazy_with(combined_effects())
+            .solve_residual_state_lazy()
             .cap(1)
             .start_width(1);
         let mut lowered: Vec<_> = lowered_query.by_ref().collect();
@@ -1896,7 +1851,7 @@ fn synthetic_root_atom_streams_a_cycle_before_fixpoint_cleanup() {
         &repeated(graph.attribute, false),
     ));
     let mut query = Query::new(root, project_start)
-        .solve_residual_state_lazy_with(root_formula_effects())
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1);
 
@@ -1925,7 +1880,7 @@ fn synthetic_root_and_streams_early_and_late_relational_survivors() {
             &ops,
         );
         let mut query = Query::new(root, project_end)
-            .solve_residual_state_lazy_with(root_formula_effects())
+            .solve_residual_state_lazy()
             .cap(1)
             .start_width(1);
 
@@ -1958,7 +1913,7 @@ fn synthetic_root_and_empty_filter_waits_for_cleanup_without_replay() {
         &ops,
     );
     let mut query = Query::new(root, project_end)
-        .solve_residual_state_lazy_with(root_formula_effects())
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1);
 
@@ -1992,12 +1947,12 @@ fn linear_formula_streaming_matches_the_always_quiescent_union_set() {
         formula_and_bound_start_root(graph.set.clone(), graph.value(0), allowed, true, &ops);
 
     let mut streamed: Vec<_> = Query::new(streaming, project_end)
-        .solve_residual_state_lazy_with(root_formula_effects())
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1)
         .collect();
     let mut always_quiescent: Vec<_> = Query::new(quiescent, project_end)
-        .solve_residual_state_lazy_with(combined_effects())
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1)
         .collect();
@@ -2018,7 +1973,7 @@ fn linear_formula_streaming_collapses_byte_identical_semantic_parents() {
         &repeated(graph.attribute, false),
     );
     let mut actual: Vec<_> = Query::new(root, project_end)
-        .solve_residual_state_lazy_with(root_formula_effects())
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1)
         .collect();
@@ -2037,7 +1992,7 @@ fn clone_and_drop_preserve_a_live_linear_formula_stream() {
         &repeated(graph.attribute, false),
     );
     let mut query = Query::new(root, project_end)
-        .solve_residual_state_lazy_with(root_formula_effects())
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1);
 
@@ -2075,7 +2030,7 @@ fn ordinary_shape_selected_query_composes_root_formula_union_and_cyclic_rpq() {
         formula_bound_start_root(graph.set.clone(), start, &ops),
         project_end,
     )
-    .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+    .solve_residual_state_lazy()
     .collect();
 
     let mut ordinary_query = Query::new(
@@ -2352,7 +2307,7 @@ fn clone_and_drop_preserve_a_live_formula_cyclic_remainder() {
         Box::new(UnionConstraint::new(vec![cyclic])) as DynConstraint,
     ]));
     let mut query = Query::new(root, project_pair)
-        .solve_residual_state_lazy_with(combined_effects())
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1);
 
@@ -2377,38 +2332,6 @@ fn clone_and_drop_preserve_a_live_formula_cyclic_remainder() {
     cloned.sort_unstable();
     assert_eq!(cloned, original);
     assert_eq!(original.len(), 6);
-}
-
-#[test]
-fn formula_transition_lowering_remains_capability_and_shape_gated() {
-    let graph = Graph::new(3, &[(0, 1), (1, 2)]);
-    let plus = repeated(graph.attribute, false);
-    let expected = {
-        let mut values = vec![graph.value(1).raw, graph.value(2).raw];
-        values.sort_unstable();
-        values
-    };
-    for lowering in [
-        ResidualLowering::new(FormulaScope::UnionLeaves, ProgramScope::Disabled),
-        ResidualLowering::new(FormulaScope::OpaqueLeaves, ProgramScope::All),
-    ] {
-        let root = formula_bound_start_root(graph.set.clone(), graph.value(0), &plus);
-        let mut query = Query::new(root, project_end).solve_residual_state_lazy_with(lowering);
-        let mut actual: Vec<_> = query.by_ref().collect();
-        actual.sort_unstable();
-        assert_eq!(actual, expected);
-        assert_eq!(query.stats().delta_transition_pages, 0);
-    }
-
-    let root = formula_bound_start_root(
-        graph.set.clone(),
-        graph.value(0),
-        &[PathOp::Attr(graph.attribute.raw())],
-    );
-    let mut query =
-        Query::new(root, project_end).solve_residual_state_lazy_with(combined_effects());
-    assert_eq!(query.by_ref().collect::<Vec<_>>(), vec![graph.value(1).raw]);
-    assert!(query.stats().delta_transition_pages > 0);
 }
 
 #[test]
@@ -2442,8 +2365,7 @@ fn zero_root_cyclic_and_returns_empty_without_erasing_its_or_sibling() {
         Box::new(UnionConstraint::new(vec![dead_and, sibling])) as DynConstraint,
     ]));
 
-    let mut query =
-        Query::new(root, project_start).solve_residual_state_lazy_with(combined_effects());
+    let mut query = Query::new(root, project_start).solve_residual_state_lazy();
     assert_eq!(query.by_ref().collect::<Vec<_>>(), vec![survivor]);
     assert_eq!(query.stats().delta_source_pages, 1);
     assert_eq!(query.stats().delta_source_dead_pages, 0);
@@ -2472,8 +2394,7 @@ fn formula_cyclic_activations_preserve_distinct_outer_parents() {
         Box::new(UnionConstraint::new(vec![arm])) as DynConstraint,
     ]));
 
-    let mut lowered_query = Query::new(Arc::clone(&root), project_end)
-        .solve_residual_state_lazy_with(combined_effects());
+    let mut lowered_query = Query::new(Arc::clone(&root), project_end).solve_residual_state_lazy();
     let mut lowered: Vec<_> = lowered_query.by_ref().collect();
     lowered.sort_unstable();
     let mut expected = vec![
@@ -2510,9 +2431,9 @@ fn all_capability_formula_cyclic_plan_survives_clone_and_parallel_split() {
             Box::new(UnionConstraint::new(vec![arm])) as DynConstraint,
         ]))
     };
-    let configured = |capabilities| {
+    let configured = || {
         Query::new(make(), project_end)
-            .solve_residual_state_lazy_with(capabilities)
+            .solve_residual_state_lazy()
             .cap(2)
             .start_width(2)
     };
@@ -2527,21 +2448,14 @@ fn all_capability_formula_cyclic_plan_survives_clone_and_parallel_split() {
         graph.value(2).raw,
         graph.value(2).raw,
     ]);
-    // `root_formula` recursively owns finite AND/OR structure, so enabling the
-    // narrower `finite_unions` capability as well must not change the exact
-    // raw result relation or activation multiplicity.
-    let root_formula = configured(root_formula_effects());
-    let root_formula = sorted(root_formula.collect());
-    assert_eq!(root_formula, expected);
-
-    let all_capabilities = configured(all_formula_effects());
-    let exact_clone = all_capabilities.clone();
-    let original = all_capabilities.collect::<Vec<_>>();
+    let production = configured();
+    let exact_clone = production.clone();
+    let original = production.collect::<Vec<_>>();
     let cloned = exact_clone.collect::<Vec<_>>();
     assert_eq!(cloned, original, "a fresh clone changed the exact stream");
-    assert_eq!(sorted(original), root_formula);
+    assert_eq!(sorted(original), expected);
 
-    let mut started = configured(all_formula_effects());
+    let mut started = configured();
     let first = started
         .next()
         .expect("the configured query has four results");
@@ -2558,7 +2472,7 @@ fn all_capability_formula_cyclic_plan_survives_clone_and_parallel_split() {
     );
 
     for workers in [1, 4] {
-        let parallel = configured(all_formula_effects());
+        let parallel = configured();
         let parallel = rayon::ThreadPoolBuilder::new()
             .num_threads(workers)
             .build()
@@ -2577,8 +2491,7 @@ fn formula_same_variable_sources_keep_novelty_separate_at_shared_terms() {
         &repeated(graph.attribute, false),
     );
 
-    let mut query =
-        Query::new(root, project_start).solve_residual_state_lazy_with(combined_effects());
+    let mut query = Query::new(root, project_start).solve_residual_state_lazy();
     assert_eq!(query.by_ref().collect::<Vec<_>>(), vec![graph.value(1).raw]);
     assert_eq!(query.stats().delta_source_roots, 2);
     assert_eq!(query.stats().delta_source_pages, 2);
@@ -2628,7 +2541,7 @@ fn formula_same_variable_fixpoint_keeps_inverse_program_direction() {
             ])) as DynConstraint,
         ]));
         let mut lowered: Vec<_> = Query::new(root, project_start)
-            .solve_residual_state_lazy_with(combined_effects())
+            .solve_residual_state_lazy()
             .collect();
         lowered.sort_unstable();
         expected.sort_unstable();
@@ -2894,8 +2807,7 @@ fn same_variable_grouped_delta_confirm_filters_one_immutable_sequence() {
     ];
     for (ops, mut expected, expected_roots) in cases {
         let root = same_variable_confirm_root(graph.set.clone(), candidates.clone(), &ops);
-        let mut query =
-            Query::new(root, project_start).solve_residual_state_lazy_with(combined_effects());
+        let mut query = Query::new(root, project_start).solve_residual_state_lazy();
         let mut actual: Vec<_> = query.by_ref().collect();
         actual.sort_unstable();
         expected.sort_unstable();
@@ -2921,8 +2833,7 @@ fn same_variable_sources_do_not_share_seen_at_a_common_term() {
         &repeated(graph.attribute, false),
     );
 
-    let mut query =
-        Query::new(root, project_start).solve_residual_state_lazy_with(combined_effects());
+    let mut query = Query::new(root, project_start).solve_residual_state_lazy();
     assert_eq!(query.by_ref().collect::<Vec<_>>(), vec![graph.value(1).raw]);
     assert_eq!(query.stats().delta_source_roots, 2);
     assert!(query.stats().delta_transition_pages > 0);
@@ -2961,8 +2872,7 @@ fn same_variable_delta_streams_after_one_lazy_source_and_one_expansion() {
         ],
     );
     let root = same_variable_root(graph.set.clone(), &repeated(graph.attribute, false));
-    let mut query =
-        Query::new(root, project_start).solve_residual_state_lazy_with(combined_effects());
+    let mut query = Query::new(root, project_start).solve_residual_state_lazy();
 
     let first = query.next().expect("every source has a self-loop");
     assert!((0..8).any(|node| first == graph.value(node).raw));
@@ -2976,8 +2886,7 @@ fn same_variable_delta_streams_after_one_lazy_source_and_one_expansion() {
 fn same_variable_negative_source_pages_grow_one_two_four() {
     let graph = Graph::new(8, &[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7)]);
     let root = same_variable_root(graph.set.clone(), &repeated(graph.attribute, false));
-    let mut query =
-        Query::new(root, project_start).solve_residual_state_lazy_with(combined_effects());
+    let mut query = Query::new(root, project_start).solve_residual_state_lazy();
 
     assert_eq!(query.next(), None);
     assert_eq!(query.current_width(), 8);
@@ -3002,8 +2911,7 @@ fn same_variable_late_hit_keeps_the_geometric_negative_prefix() {
         &graph.value(target),
     ));
     let root = same_variable_root(graph.set.clone(), &repeated(graph.attribute, false));
-    let mut query =
-        Query::new(root, project_start).solve_residual_state_lazy_with(combined_effects());
+    let mut query = Query::new(root, project_start).solve_residual_state_lazy();
 
     assert_eq!(query.next(), Some(graph.value(target).raw));
     assert_eq!(query.stats().delta_source_pages, 3);
@@ -3026,8 +2934,7 @@ fn same_variable_delta_remains_opt_in() {
     let graph = Graph::new(1, &[(0, 0)]);
     let root = same_variable_root(graph.set.clone(), &repeated(graph.attribute, false));
 
-    let mut query = Query::new(root, project_start)
-        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE);
+    let mut query = Query::new(root, project_start).solve_residual_state_lazy();
     assert_eq!(query.by_ref().collect::<Vec<_>>(), vec![graph.value(0).raw]);
     assert_eq!(query.stats().delta_source_pages, 0);
     assert_eq!(query.stats().delta_transition_pages, 0);
@@ -3062,7 +2969,7 @@ fn star_and_optional_epsilon_acceptance_obey_the_graph_term_gate() {
 
     let _ = run(
         bound_start_root(graph.set.clone(), graph.value(0), &star),
-        SolveRoute::Combined,
+        SolveRoute::Residual,
         project_end,
     );
 }
@@ -3086,7 +2993,7 @@ fn nullable_support_uses_native_program_for_distinct_same_variable_and_absent_te
         )
     };
     let mut query = Query::new(make(), project_outer)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .start_width(1)
         .cap(1);
 
@@ -3115,7 +3022,7 @@ fn nullable_support_uses_native_program_for_distinct_same_variable_and_absent_te
         ),
         project_outer,
     )
-    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .solve_residual_state_lazy()
     .start_width(1)
     .cap(1);
     let same_first = same_variable
@@ -3144,7 +3051,7 @@ fn nullable_support_uses_native_program_for_distinct_same_variable_and_absent_te
         8,
     );
     let mut absent_query = Query::new(absent, project_outer)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .start_width(1)
         .cap(1);
     assert_eq!(
@@ -3172,7 +3079,7 @@ fn fully_bound_formula_guard_uses_native_support_program() {
     );
 
     let mut query = Query::new(root, project_outer)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1);
     let actual: Vec<_> = query.by_ref().collect();
@@ -3199,7 +3106,7 @@ fn first_support_witness_resumes_formula_via_the_native_program() {
         8,
     );
     let mut query = Query::new(root, project_outer)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1);
 
@@ -3234,7 +3141,7 @@ fn affine_nested_support_is_permutation_invariant_and_monotone() {
                 None,
             );
             let mut query = Query::new(root, project_outer)
-                .solve_residual_state_lazy_with(ResidualLowering::FULL)
+                .solve_residual_state_lazy()
                 .cap(1)
                 .start_width(1);
             let mut actual: Vec<_> = query.by_ref().collect();
@@ -3289,7 +3196,7 @@ fn live_affine_support_clones_exactly_and_matches_rayon_worker_counts() {
 
     let root = make();
     let mut query = Query::new(root, project_outer)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1);
     let first = query.next().expect("the affine formula has four results");
@@ -3312,7 +3219,7 @@ fn live_affine_support_clones_exactly_and_matches_rayon_worker_counts() {
     for workers in [1, 4] {
         let root = make();
         let query = Query::new(root, project_outer)
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .solve_residual_state_lazy()
             .cap(1)
             .start_width(1);
         let mut actual = rayon::ThreadPoolBuilder::new()
@@ -3345,7 +3252,7 @@ fn support_is_parent_atomic_before_candidate_pages() {
         Some(Arc::clone(&trace)),
     );
     let mut query = Query::new(root, project_outer)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1);
     let mut actual: Vec<_> = query.by_ref().collect();
@@ -3374,7 +3281,7 @@ fn support_is_parent_atomic_before_candidate_pages() {
         Some(Arc::clone(&trace)),
     );
     let mut query = Query::new(root, project_outer)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1);
     assert_eq!(query.by_ref().collect::<Vec<_>>(), vec![sibling_value]);
@@ -3485,9 +3392,8 @@ fn all_attr_inverse_and_bound_endpoint_routes_match_oracles() {
     ];
     for (root, project, mut expected) in cases {
         expected.sort_unstable();
-        let residual = run(Arc::clone(&root), SolveRoute::Combined, project);
+        let residual = run(root, SolveRoute::Residual, project);
         assert_eq!(residual, expected);
-        assert_eq!(run(root, SolveRoute::Conservative, project), expected);
     }
 }
 
@@ -3560,7 +3466,7 @@ fn target_confirm_traverses_once_and_set_admits_reachable_candidates() {
             &ops,
         );
         expected.sort_unstable();
-        assert_eq!(run(root, SolveRoute::Combined, project), expected);
+        assert_eq!(run(root, SolveRoute::Residual, project), expected);
     }
 }
 
@@ -3598,20 +3504,14 @@ fn target_confirm_positive_support_publishes_early_then_exactly_drains() {
         )
     };
     let mut control: Vec<_> = Query::new(make(), project_end)
-        .solve_residual_state_lazy_with(ResidualLowering::new(
-            FormulaScope::OpaqueLeaves,
-            ProgramScope::Disabled,
-        ))
+        .solve_residual_state_lazy()
         .start_width(1)
         .cap(1)
         .collect();
     control.sort_unstable();
 
     let mut query = Query::new(make(), project_end)
-        .solve_residual_state_lazy_with(ResidualLowering::new(
-            FormulaScope::OpaqueLeaves,
-            ProgramScope::All,
-        ))
+        .solve_residual_state_lazy()
         .start_width(1)
         .cap(1);
     let first = query
@@ -3670,20 +3570,14 @@ fn target_confirm_positive_support_does_not_feed_past_false_occurrence_zero() {
         )
     };
     let mut control: Vec<_> = Query::new(make(), project_end)
-        .solve_residual_state_lazy_with(ResidualLowering::new(
-            FormulaScope::OpaqueLeaves,
-            ProgramScope::Disabled,
-        ))
+        .solve_residual_state_lazy()
         .start_width(3)
         .cap(3)
         .collect();
     control.sort_unstable();
 
     let mut query = Query::new(make(), project_end)
-        .solve_residual_state_lazy_with(ResidualLowering::new(
-            FormulaScope::OpaqueLeaves,
-            ProgramScope::All,
-        ))
+        .solve_residual_state_lazy()
         .start_width(3)
         .cap(3);
     let mut actual: Vec<_> = query.by_ref().collect();
@@ -3719,8 +3613,6 @@ fn mixed_arm_production_support_fallback_spends_one_public_demand_step() {
     let absent = [u8::MAX; 32];
     let accepted = vec![first, graph.value(2).raw, later];
     let ops = repeated(graph.attribute, false);
-    let lowering = ResidualLowering::new(FormulaScope::OpaqueLeaves, ProgramScope::All);
-
     let mut expected = vec![first, later];
     expected.sort_unstable();
     for (candidates, expected_commits) in [
@@ -3739,7 +3631,7 @@ fn mixed_arm_production_support_fallback_spends_one_public_demand_step() {
             ),
             project_end,
         )
-        .solve_residual_state_lazy_with(lowering)
+        .solve_residual_state_lazy()
         .start_width(1)
         .cap(1);
         let mut actual: Vec<_> = query.by_ref().collect();
@@ -3770,8 +3662,6 @@ fn forward_exact_confirm_tap_publishes_early_without_a_second_traversal() {
     let absent = [u8::MAX; 32];
     let candidates = vec![first, later, absent, first, graph.value(3).raw];
     let ops = repeated(graph.attribute, false);
-    let lowering = ResidualLowering::new(FormulaScope::OpaqueLeaves, ProgramScope::All);
-
     let mut exact_only = Query::new(
         target_confirm_root(
             graph.set.clone(),
@@ -3782,7 +3672,7 @@ fn forward_exact_confirm_tap_publishes_early_without_a_second_traversal() {
         ),
         project_end,
     )
-    .solve_residual_state_lazy_with(lowering)
+    .solve_residual_state_lazy()
     .start_width(1)
     .cap(1);
     let mut expected: Vec<_> = exact_only.by_ref().collect();
@@ -3799,7 +3689,7 @@ fn forward_exact_confirm_tap_publishes_early_without_a_second_traversal() {
         ),
         project_end,
     )
-    .solve_residual_state_lazy_with(lowering)
+    .solve_residual_state_lazy()
     .start_width(1)
     .cap(1);
     let early = query
@@ -3838,7 +3728,7 @@ fn forward_exact_confirm_tap_publishes_early_without_a_second_traversal() {
         ),
         project_end,
     )
-    .solve_residual_state_lazy_with(lowering)
+    .solve_residual_state_lazy()
     .start_width(1)
     .cap(1);
     let mut false_expected: Vec<_> = false_control.by_ref().collect();
@@ -3854,7 +3744,7 @@ fn forward_exact_confirm_tap_publishes_early_without_a_second_traversal() {
         ),
         project_end,
     )
-    .solve_residual_state_lazy_with(lowering)
+    .solve_residual_state_lazy()
     .start_width(1)
     .cap(1);
     let mut false_actual: Vec<_> = false_query.by_ref().collect();
@@ -3880,8 +3770,6 @@ fn forward_exact_confirm_chunk_tap_that_dies_is_not_replayed_from_g_minus_p() {
     let survivor = graph.value(4).raw;
     let candidates = vec![first, survivor, [u8::MAX; 32], first];
     let ops = repeated(graph.attribute, false);
-    let lowering = ResidualLowering::HYBRID;
-
     let control_calls = Arc::new(Mutex::new(Vec::new()));
     let mut control = Query::new(
         exact_only_chunk_target_confirm_root(
@@ -3897,7 +3785,7 @@ fn forward_exact_confirm_chunk_tap_that_dies_is_not_replayed_from_g_minus_p() {
         ),
         project_end,
     )
-    .solve_residual_state_lazy_with(lowering)
+    .solve_residual_state_lazy()
     .start_width(1)
     .cap(1);
     let expected: Vec<_> = control.by_ref().collect();
@@ -3918,7 +3806,7 @@ fn forward_exact_confirm_chunk_tap_that_dies_is_not_replayed_from_g_minus_p() {
         ),
         project_end,
     )
-    .solve_residual_state_lazy_with(lowering)
+    .solve_residual_state_lazy()
     .start_width(1)
     .cap(1);
     let actual: Vec<_> = query.by_ref().collect();
@@ -3986,17 +3874,14 @@ fn target_confirm_positive_support_classifies_a_relational_prefix_commit() {
         )
     };
     let mut control: Vec<_> = Query::new(make(), project_end)
-        .solve_residual_state_lazy_with(ResidualLowering::new(
-            FormulaScope::OpaqueLeaves,
-            ProgramScope::Disabled,
-        ))
+        .solve_residual_state_lazy()
         .start_width(1)
         .cap(1)
         .collect();
     control.sort_unstable();
 
     let mut query = Query::new(make(), project_end)
-        .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+        .solve_residual_state_lazy()
         .start_width(1)
         .cap(1);
     let first = query
@@ -4051,10 +3936,7 @@ fn target_confirm_positive_chunk_that_dies_in_suffix_is_not_retried() {
     };
 
     let mut control: Vec<_> = Query::new(make(Arc::new(Mutex::new(Vec::new()))), project_end)
-        .solve_residual_state_lazy_with(ResidualLowering::new(
-            FormulaScope::OpaqueLeaves,
-            ProgramScope::Disabled,
-        ))
+        .solve_residual_state_lazy()
         .start_width(1)
         .cap(1)
         .collect();
@@ -4062,7 +3944,7 @@ fn target_confirm_positive_chunk_that_dies_in_suffix_is_not_retried() {
 
     let calls = Arc::new(Mutex::new(Vec::new()));
     let mut query = Query::new(make(Arc::clone(&calls)), project_end)
-        .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+        .solve_residual_state_lazy()
         .start_width(1)
         .cap(1);
     let mut actual: Vec<_> = query.by_ref().collect();
@@ -4117,19 +3999,13 @@ fn target_confirm_nullable_support_seed_is_not_publication_authority() {
         )
     };
     let control: Vec<_> = Query::new(make(), project_end)
-        .solve_residual_state_lazy_with(ResidualLowering::new(
-            FormulaScope::OpaqueLeaves,
-            ProgramScope::Disabled,
-        ))
+        .solve_residual_state_lazy()
         .start_width(1)
         .cap(1)
         .collect();
 
     let mut query = Query::new(make(), project_end)
-        .solve_residual_state_lazy_with(ResidualLowering::new(
-            FormulaScope::OpaqueLeaves,
-            ProgramScope::All,
-        ))
+        .solve_residual_state_lazy()
         .start_width(1)
         .cap(1);
     let actual: Vec<_> = query.by_ref().collect();
@@ -4161,10 +4037,7 @@ fn forward_exact_confirm_nullable_seed_stays_on_the_late_exact_path() {
         None,
     );
     let mut query = Query::new(root, project_end)
-        .solve_residual_state_lazy_with(ResidualLowering::new(
-            FormulaScope::OpaqueLeaves,
-            ProgramScope::All,
-        ))
+        .solve_residual_state_lazy()
         .start_width(1)
         .cap(1);
     assert_eq!(query.by_ref().collect::<Vec<_>>(), [start]);
@@ -4210,10 +4083,7 @@ fn positive_support_gate_precedes_partial_rpq_optimistic_support_selection() {
         ]))
     };
     let mut query = Query::new(make(), project_pair)
-        .solve_residual_state_lazy_with(ResidualLowering::new(
-            FormulaScope::OpaqueLeaves,
-            ProgramScope::All,
-        ))
+        .solve_residual_state_lazy()
         .start_width(1)
         .cap(1);
     let mut actual: Vec<_> = query.by_ref().collect();
@@ -4258,7 +4128,7 @@ fn automaton_target_confirm_filters_then_set_admits_the_sequence() {
     let expected = vec![graph.value(2).raw, graph.value(0).raw, graph.value(1).raw];
     let residual = run(
         target_confirm_root(graph.set.clone(), END, graph.value(0), candidates, &ops),
-        SolveRoute::Combined,
+        SolveRoute::Residual,
         project_end,
     );
     let mut expected = expected;
@@ -4286,7 +4156,7 @@ fn bound_literal_endpoint_uses_the_inverse_delta_route() {
     ]));
 
     assert_eq!(
-        run(root, SolveRoute::Combined, project_start),
+        run(root, SolveRoute::Residual, project_start),
         vec![graph.value(0).raw]
     );
 }
@@ -4312,7 +4182,7 @@ fn two_free_distinct_endpoints_page_the_first_binding_before_traversal() {
         .collect();
 
     let mut query = Query::new(root, project_pair)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1);
     let first = query.next().expect("one two-free RPQ edge");
@@ -4341,7 +4211,7 @@ fn two_free_path_end_pages_the_inverse_first_frontier() {
         ]))
     };
     let mut residual: Vec<_> = Query::new(make_root(), project_pair)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1)
         .collect();
@@ -4361,7 +4231,7 @@ fn nullable_two_free_first_frontier_is_exactly_the_graph_term_union() {
     let ops = vec![PathOp::Attr(graph.attribute.raw()), PathOp::Optional];
     let make_root = || two_free_root(graph.set.clone(), &ops);
     let mut residual: Vec<_> = Query::new(make_root(), project_pair)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1)
         .collect();
@@ -4376,53 +4246,6 @@ fn nullable_two_free_first_frontier_is_exactly_the_graph_term_union() {
 }
 
 #[test]
-fn conservative_residual_lowering_keeps_plus_opaque() {
-    let graph = Graph::new(3, &[(0, 1), (1, 2)]);
-    let root = bound_start_root(
-        graph.set.clone(),
-        graph.value(0),
-        &repeated(graph.attribute, false),
-    );
-    let mut query = Query::new(root, project_end)
-        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE);
-    let mut actual: Vec<_> = query.by_ref().collect();
-    actual.sort_unstable();
-    let mut expected = [graph.value(1).raw, graph.value(2).raw];
-    expected.sort_unstable();
-    assert_eq!(actual, expected);
-    assert_eq!(
-        query.stats().delta_transition_pages,
-        0,
-        "cyclic RPQ proposal lowering must remain explicitly opt-in"
-    );
-
-    let root = target_confirm_root(
-        graph.set.clone(),
-        END,
-        graph.value(0),
-        vec![
-            graph.value(2).raw,
-            graph.value(0).raw,
-            graph.value(2).raw,
-            graph.value(1).raw,
-        ],
-        &repeated(graph.attribute, false),
-    );
-    let mut query = Query::new(root, project_end)
-        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE);
-    let mut actual: Vec<_> = query.by_ref().collect();
-    actual.sort_unstable();
-    let mut expected = [graph.value(2).raw, graph.value(1).raw];
-    expected.sort_unstable();
-    assert_eq!(actual, expected);
-    assert_eq!(
-        query.stats().delta_transition_pages,
-        0,
-        "cyclic RPQ confirmation lowering must remain explicitly opt-in"
-    );
-}
-
-#[test]
 fn first_result_requires_one_expansion_and_drop_cancels_the_remainder() {
     let graph = Graph::new(5, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
     let root = bound_start_root(
@@ -4430,8 +4253,7 @@ fn first_result_requires_one_expansion_and_drop_cancels_the_remainder() {
         graph.value(0),
         &repeated(graph.attribute, false),
     );
-    let mut query =
-        Query::new(root, project_end).solve_residual_state_lazy_with(combined_effects());
+    let mut query = Query::new(root, project_end).solve_residual_state_lazy();
 
     assert_eq!(query.next(), Some(graph.value(1).raw));
     assert_eq!(query.stats().delta_transition_candidates_examined, 1);
@@ -4445,11 +4267,11 @@ fn nullable_seed_is_first_result_without_transition_work_and_preserves_affine_ro
     let outer_values = [genid(&rngid().id).raw, genid(&rngid().id).raw];
     let make = || duplicate_parent_root(graph.set.clone(), graph.value(0).raw, outer_values, &ops);
     let mut expected: Vec<_> = Query::new(make(), project_end)
-        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+        .solve_residual_state_lazy()
         .collect();
     expected.sort_unstable();
     let mut query = Query::new(make(), project_end)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .start_width(1)
         .cap(1);
 
@@ -4482,7 +4304,7 @@ fn nullable_seed_is_first_result_without_transition_work_and_preserves_affine_ro
     }
 
     let mut dropped = Query::new(make(), project_end)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .start_width(1)
         .cap(1);
     assert_eq!(dropped.next(), Some(graph.value(0).raw));
@@ -4495,7 +4317,7 @@ fn nullable_seed_is_first_result_without_transition_work_and_preserves_affine_ro
             bound_start_root(graph.set.clone(), absent, &ops),
             project_end,
         )
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .start_width(1)
         .cap(1)
         .next()
@@ -4512,8 +4334,7 @@ fn clone_after_first_result_has_two_independent_exact_remainders() {
         graph.value(0),
         &repeated(graph.attribute, false),
     );
-    let mut query =
-        Query::new(root, project_end).solve_residual_state_lazy_with(combined_effects());
+    let mut query = Query::new(root, project_end).solve_residual_state_lazy();
     assert_eq!(query.next(), Some(graph.value(1).raw));
     let clone = query.clone();
 
@@ -4532,8 +4353,7 @@ fn clone_with_a_suspended_same_variable_cursor_has_two_exact_remainders() {
     let graph = Graph::new(5, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
     let ops = vec![PathOp::Attr(graph.attribute.raw()), PathOp::Star];
     let root = same_variable_root(graph.set.clone(), &ops);
-    let mut query =
-        Query::new(root, project_start).solve_residual_state_lazy_with(combined_effects());
+    let mut query = Query::new(root, project_start).solve_residual_state_lazy();
     let first = query
         .next()
         .expect("nullable first source is immediately stable");
@@ -4555,7 +4375,7 @@ fn clone_with_a_suspended_same_variable_cursor_has_two_exact_remainders() {
 }
 
 #[test]
-fn generated_product_programs_match_conservative_and_combined_routes() {
+fn generated_product_programs_match_the_public_iteration_surfaces() {
     let edge_universe = [(0, 0), (0, 1), (0, 2), (1, 2), (2, 3), (3, 0)];
     for mask in 0u16..64 {
         let edges: Vec<_> = edge_universe
@@ -4595,28 +4415,24 @@ fn generated_product_programs_match_conservative_and_combined_routes() {
         ];
         for ops in expressions {
             let make_root = || bound_start_root(graph.set.clone(), graph.value(0), &ops);
-            let residual = run(make_root(), SolveRoute::Combined, project_end);
+            let residual = run(make_root(), SolveRoute::Residual, project_end);
             assert_eq!(
                 residual,
-                run(make_root(), SolveRoute::Conservative, project_end)
+                run(make_root(), SolveRoute::Ordinary, project_end)
             );
 
             let make_same_root = || same_variable_root(graph.set.clone(), &ops);
             let ordinary = run(make_same_root(), SolveRoute::Ordinary, project_start);
             assert_eq!(
                 ordinary,
-                run(make_same_root(), SolveRoute::Combined, project_start)
-            );
-            assert_eq!(
-                ordinary,
-                run(make_same_root(), SolveRoute::Conservative, project_start)
+                run(make_same_root(), SolveRoute::Residual, project_start)
             );
         }
     }
 }
 
 #[test]
-fn generated_combined_formula_rpq_matrix_matches_frozen_routes_and_is_monotone() {
+fn generated_formula_rpq_cases_match_the_oracle_and_are_monotone() {
     let programs = [
         GeneratedPathProgram::Attr,
         GeneratedPathProgram::Optional,
@@ -4636,26 +4452,6 @@ fn generated_combined_formula_rpq_matrix_matches_frozen_routes_and_is_monotone()
         GeneratedFormulaCase::OrdinaryAnd,
         GeneratedFormulaCase::RepeatedRecursive,
     ];
-    let lowering_cases = [
-        ("opaque", ResidualLowering::CONSERVATIVE),
-        (
-            "union-leaves",
-            ResidualLowering::new(FormulaScope::UnionLeaves, ProgramScope::Disabled),
-        ),
-        (
-            "whole-root",
-            ResidualLowering::new(FormulaScope::WholeRoot, ProgramScope::Disabled),
-        ),
-        (
-            "opaque-transitions",
-            ResidualLowering::new(FormulaScope::OpaqueLeaves, ProgramScope::All),
-        ),
-        (
-            "union-leaves-transitions",
-            ResidualLowering::new(FormulaScope::UnionLeaves, ProgramScope::All),
-        ),
-        ("whole-root-transitions", ResidualLowering::FULL),
-    ];
     let mut saw_root_cyclic_probe_one = false;
 
     for program in programs {
@@ -4666,31 +4462,22 @@ fn generated_combined_formula_rpq_matrix_matches_frozen_routes_and_is_monotone()
                 let graph = GeneratedGraph::new(level);
                 let ops = program.ops(graph.primary, graph.secondary);
                 let make_root = || generated_formula_root(&graph, &ops, formula);
-                let expected = run(make_root(), SolveRoute::Conservative, project_end);
-
+                let expected = run(make_root(), SolveRoute::Ordinary, project_end);
+                let mut query = Query::new(make_root(), project_end)
+                    .solve_residual_state_lazy()
+                    .cap(1)
+                    .start_width(1);
+                let mut actual: Vec<_> = query.by_ref().collect();
+                actual.sort_unstable();
                 assert_eq!(
-                    run(make_root(), SolveRoute::Ordinary, project_end),
-                    expected,
-                    "level={level} program={program:?} formula={formula:?} ordinary"
+                    actual, expected,
+                    "level={level} program={program:?} formula={formula:?}"
                 );
-                for &(capability, lowering) in &lowering_cases {
-                    let mut query = Query::new(make_root(), project_end)
-                        .solve_residual_state_lazy_with(lowering)
-                        .cap(1)
-                        .start_width(1);
-                    let mut actual: Vec<_> = query.by_ref().collect();
-                    actual.sort_unstable();
-                    assert_eq!(
-                        actual, expected,
-                        "level={level} program={program:?} formula={formula:?} capability={capability}"
-                    );
-                    if capability == "whole-root-transitions"
-                        && program == GeneratedPathProgram::Plus
-                        && formula == GeneratedFormulaCase::OrdinaryAnd
-                        && query.stats().delta_handoff_probe_pops > 0
-                    {
-                        saw_root_cyclic_probe_one = true;
-                    }
+                if program == GeneratedPathProgram::Plus
+                    && formula == GeneratedFormulaCase::OrdinaryAnd
+                    && query.stats().delta_handoff_probe_pops > 0
+                {
+                    saw_root_cyclic_probe_one = true;
                 }
                 results_by_level.push(expected);
             }
@@ -4709,7 +4496,7 @@ fn generated_combined_formula_rpq_matrix_matches_frozen_routes_and_is_monotone()
 
         assert_eq!(
             results_by_formula[1], results_by_formula[2],
-            "formula lowering changed semantics for program={program:?}"
+            "formula composition changed semantics for program={program:?}"
         );
     }
 
@@ -4727,7 +4514,7 @@ fn generated_combined_formula_rpq_matrix_matches_frozen_routes_and_is_monotone()
         generated_formula_root(&graph, &ops, GeneratedFormulaCase::RepeatedRecursive),
         project_end,
     )
-    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .solve_residual_state_lazy()
     .shadow(ResidualShadowEpoch::new())
     .collect_profiled();
     let mut occurrences: Vec<_> = observed
@@ -4805,8 +4592,7 @@ fn finite_path_families_use_native_transition_programs() {
     for (name, ops, start, mut expected) in cases {
         let root = bound_start_root(graph.set.clone(), start, &ops);
         expected.sort_unstable();
-        let mut query =
-            Query::new(root, project_end).solve_residual_state_lazy_with(combined_effects());
+        let mut query = Query::new(root, project_end).solve_residual_state_lazy();
         let mut residual: Vec<_> = query.by_ref().collect();
         residual.sort_unstable();
         assert_eq!(residual, expected, "{name}");
@@ -4820,8 +4606,7 @@ fn finite_bound_end_uses_the_inverse_transition_program() {
     let ops = vec![PathOp::Attr(graph.attribute.raw())];
     let root = bound_end_root(graph.set.clone(), graph.value(2), &ops);
 
-    let mut query =
-        Query::new(root, project_start).solve_residual_state_lazy_with(combined_effects());
+    let mut query = Query::new(root, project_start).solve_residual_state_lazy();
     assert_eq!(query.by_ref().collect::<Vec<_>>(), vec![graph.value(1).raw]);
     assert!(query.stats().delta_transition_pages > 0);
 }
@@ -4836,7 +4621,7 @@ fn finite_concat_first_result_takes_only_its_two_transition_steps() {
     ];
     let root = bound_start_root(graph.set.clone(), graph.value(0), &ops);
     let mut query = Query::new(root, project_end)
-        .solve_residual_state_lazy_with(combined_effects())
+        .solve_residual_state_lazy()
         .start_width(1);
 
     assert_eq!(query.next(), Some(graph.value(2).raw));
@@ -4866,27 +4651,16 @@ fn finite_confirm_keeps_geometric_pages_then_set_admits() {
         values
     };
 
-    for (name, capabilities) in [
-        ("leaf", combined_effects()),
-        ("formula", root_formula_effects()),
-    ] {
-        let root = target_confirm_root(
-            graph.set.clone(),
-            END,
-            graph.value(0),
-            candidates.clone(),
-            &ops,
-        );
-        let mut query = Query::new(root, project_end)
-            .solve_residual_state_lazy_with(capabilities)
-            .start_width(1)
-            .cap(1);
-        let mut actual: Vec<_> = query.by_ref().collect();
-        actual.sort_unstable();
-        assert_eq!(actual, expected, "{name}");
-        assert!(query.stats().delta_transition_pages > 0, "{name}");
-        assert_eq!(query.stats().max_confirm_candidates, 1, "{name}");
-    }
+    let root = target_confirm_root(graph.set.clone(), END, graph.value(0), candidates, &ops);
+    let mut query = Query::new(root, project_end)
+        .solve_residual_state_lazy()
+        .start_width(1)
+        .cap(1);
+    let mut actual: Vec<_> = query.by_ref().collect();
+    actual.sort_unstable();
+    assert_eq!(actual, expected);
+    assert!(query.stats().delta_transition_pages > 0);
+    assert_eq!(query.stats().max_confirm_candidates, 1);
 }
 
 #[test]
@@ -4906,28 +4680,19 @@ fn finite_same_variable_optional_pages_preserve_epsilon_scope_then_set_admit() {
         values
     };
 
-    for (name, capabilities, source_work, source_roots) in [
-        ("leaf", combined_effects(), 3, 2),
-        ("formula", root_formula_effects(), 3, 2),
-    ] {
-        let root = same_variable_confirm_root(graph.set.clone(), candidates.clone(), &ops);
-        let mut query = Query::new(root, project_start)
-            .solve_residual_state_lazy_with(capabilities)
-            .start_width(1)
-            .cap(1);
-        let mut actual: Vec<_> = query.by_ref().collect();
-        actual.sort_unstable();
-        assert_eq!(actual, expected, "{name}");
-        assert_eq!(query.stats().delta_source_pages, source_work, "{name}");
-        assert_eq!(
-            query.stats().delta_source_candidates_examined,
-            source_work,
-            "{name}"
-        );
-        assert_eq!(query.stats().delta_source_roots, source_roots, "{name}");
-        assert!(query.stats().delta_transition_pages > 0, "{name}");
-        assert_eq!(query.stats().max_confirm_candidates, 1, "{name}");
-    }
+    let root = same_variable_confirm_root(graph.set.clone(), candidates, &ops);
+    let mut query = Query::new(root, project_start)
+        .solve_residual_state_lazy()
+        .start_width(1)
+        .cap(1);
+    let mut actual: Vec<_> = query.by_ref().collect();
+    actual.sort_unstable();
+    assert_eq!(actual, expected);
+    assert_eq!(query.stats().delta_source_pages, 3);
+    assert_eq!(query.stats().delta_source_candidates_examined, 3);
+    assert_eq!(query.stats().delta_source_roots, 2);
+    assert!(query.stats().delta_transition_pages > 0);
+    assert_eq!(query.stats().max_confirm_candidates, 1);
 }
 
 #[test]
@@ -4941,7 +4706,7 @@ fn positive_transition_frontiers_page_by_automaton_branch_and_value() {
         )
     };
     let mut query = Query::new(make(), project_end)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .start_width(2)
         .cap(2);
     let mut actual: Vec<_> = query.by_ref().collect();
@@ -4960,7 +4725,7 @@ fn first_fanout_result_scans_one_transition_and_clone_keeps_the_exact_cursor() {
     let ops = [PathOp::Attr(graph.attribute.raw())];
     let make = || bound_start_root(graph.set.clone(), graph.value(0), &ops);
     let mut query = Query::new(make(), project_end)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .start_width(1)
         .cap(16);
 
@@ -4990,10 +4755,10 @@ fn paged_transitions_preserve_affine_parent_rows_and_storage_monotonicity() {
     let outer_values = [genid(&rngid().id).raw, genid(&rngid().id).raw];
     let make = || duplicate_parent_root(graph.set.clone(), graph.value(0).raw, outer_values, &ops);
     let mut expected: Vec<_> = Query::new(make(), project_end)
-        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+        .solve_residual_state_lazy()
         .collect();
     let mut residual = Query::new(make(), project_end)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .start_width(1)
         .cap(2);
     let mut actual: Vec<_> = residual.by_ref().collect();
@@ -5019,7 +4784,7 @@ fn paged_transitions_preserve_affine_parent_rows_and_storage_monotonicity() {
             bound_start_root(graph.set.clone(), graph.value(0), &ops),
             project_end,
         )
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .start_width(1)
         .cap(2);
         let mut current: Vec<_> = query.by_ref().collect();
@@ -5076,7 +4841,7 @@ fn negated_transition_pages_count_rejections_and_emit_each_destination_once() {
         bound_start_root(graph.set.clone(), genid(&start), &ops),
         project_end,
     )
-    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .solve_residual_state_lazy()
     .start_width(1)
     .cap(2);
     assert!(query.next().is_some());
@@ -5127,7 +4892,7 @@ fn inverse_negated_transition_pages_from_literals_are_exact_and_distinct() {
         )) as DynConstraint,
     ]));
     let mut query = Query::new(root, project_end)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .start_width(1)
         .cap(1);
     let actual: Vec<_> = query.by_ref().collect();
@@ -5152,12 +4917,12 @@ fn mixed_transition_pages_preserve_cycles_clone_drop_affine_rows_and_monotonicit
     ];
     let make = || bound_start_root(graph.set.clone(), graph.value(0), &ops);
     let mut expected: Vec<_> = Query::new(make(), project_end)
-        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+        .solve_residual_state_lazy()
         .collect();
     expected.sort_unstable();
 
     let mut residual = Query::new(make(), project_end)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .start_width(1)
         .cap(1);
     let first = residual.next().expect("the first mixed-path endpoint");
@@ -5174,7 +4939,7 @@ fn mixed_transition_pages_preserve_cycles_clone_drop_affine_rows_and_monotonicit
     assert_eq!(clone_results, expected);
 
     let mut dropped = Query::new(make(), project_end)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .start_width(1)
         .cap(1);
     assert!(dropped.next().is_some());
@@ -5184,17 +4949,17 @@ fn mixed_transition_pages_preserve_cycles_clone_drop_affine_rows_and_monotonicit
     let outer_values = [genid(&rngid().id).raw, genid(&rngid().id).raw];
     let make_affine =
         || duplicate_parent_root(graph.set.clone(), graph.value(0).raw, outer_values, &ops);
-    let mut conservative: Vec<_> = Query::new(make_affine(), project_end)
-        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+    let mut baseline: Vec<_> = Query::new(make_affine(), project_end)
+        .solve_residual_state_lazy()
         .collect();
     let mut affine = Query::new(make_affine(), project_end)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .start_width(1)
         .cap(2);
     let mut actual: Vec<_> = affine.by_ref().collect();
-    conservative.sort_unstable();
+    baseline.sort_unstable();
     actual.sort_unstable();
-    assert_eq!(actual, conservative);
+    assert_eq!(actual, baseline);
     assert!(affine.stats().delta_transition_pages > 0);
 
     let mut previous = Vec::new();
@@ -5209,7 +4974,7 @@ fn mixed_transition_pages_preserve_cycles_clone_drop_affine_rows_and_monotonicit
             bound_start_root(graph.set.clone(), graph.value(0), &ops),
             project_end,
         )
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .start_width(1)
         .cap(2);
         let mut current: Vec<_> = query.by_ref().collect();

@@ -1595,7 +1595,6 @@ mod tests {
     use crate::inline::encodings::UnknownInline;
     use crate::inline::Inline;
     use crate::query::intersectionconstraint::IntersectionConstraint;
-    use crate::query::residual::ResidualLowering;
     use crate::query::Binding;
     use crate::query::ContainsConstraint;
     use crate::query::Query;
@@ -1933,7 +1932,7 @@ mod tests {
             set,
         ));
         let mut query = Query::new(constraint, |binding: &Binding| binding.get(0).copied())
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .solve_residual_state_lazy()
             .cap(1)
             .start_width(1);
 
@@ -2698,7 +2697,7 @@ mod tests {
             .collect();
         let mut ordinary: Vec<_> = Query::new(make(), project_triple).collect();
         let mut residual: Vec<_> = Query::new(make(), project_triple)
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .solve_residual_state_lazy()
             .cap(1)
             .start_width(1)
             .collect();
@@ -2755,7 +2754,7 @@ mod tests {
 
         let mut ordinary: Vec<_> = Query::new(make(), project).collect();
         let mut query = Query::new(make(), project)
-            .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+            .solve_residual_state_lazy()
             .start_width(1)
             .growth(2)
             .cap(256);
@@ -2855,7 +2854,7 @@ mod tests {
 
         let mut ordinary: Vec<_> = Query::new(make(), project).collect();
         let mut residual: Vec<_> = Query::new(make(), project)
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .solve_residual_state_lazy()
             .cap(1)
             .start_width(1)
             .collect();
@@ -2885,7 +2884,7 @@ mod tests {
             TribleSetConstraint::new(entity, attribute_inline, value, set),
             |binding: &Binding| binding.get(0).copied(),
         )
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1);
 
@@ -2921,7 +2920,7 @@ mod tests {
             TribleSetConstraint::new(x, Inline::<GenId>::new(id_into_value(&attribute)), x, set),
             |binding: &Binding| binding.get(0).copied(),
         )
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(16)
         .start_width(1)
         .growth(2);
@@ -2972,7 +2971,7 @@ mod tests {
         expected.sort_unstable();
 
         let mut residual = Query::new(make(), project)
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .solve_residual_state_lazy()
             .cap(1)
             .start_width(1);
         let first = residual.next().expect("the repeated source has witnesses");
@@ -3074,7 +3073,7 @@ mod tests {
         assert_eq!(target_occurrences, expected_occurrences);
 
         let mut residual: Vec<_> = Query::new(make(), project)
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .solve_residual_state_lazy()
             .cap(1)
             .start_width(1)
             .collect();

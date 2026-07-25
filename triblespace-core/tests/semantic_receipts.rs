@@ -15,7 +15,6 @@ use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace_core::query::rangeconstraint::InlineRange;
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
-    residual::{FormulaScope, ProgramScope, ResidualLowering},
     Binding, CandidateSink, Constraint, ConstraintShape, DispatchClass, EstimateSink, PathOp,
     ProgramAction, ProgramCompletion, ProgramExposure, ProgramGrouping, ProgramKey, ProgramRef,
     ProgramRequest, ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, Query,
@@ -140,16 +139,10 @@ where
 {
     vec![
         Query::new(make(), project_x)
-            .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+            .solve_residual_state_lazy()
             .collect(),
         Query::new(make(), project_x)
-            .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
-            .cap(1)
-            .start_width(1)
-            .growth(1)
-            .collect(),
-        Query::new(make(), project_x)
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .solve_residual_state_lazy()
             .cap(1)
             .start_width(1)
             .growth(1)
@@ -297,11 +290,8 @@ fn composites_and_projection_have_raw_set_semantics() {
 
     let result_sets = [
         Query::new_projected(make_root(), [X], project_x)
-            .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+            .solve_residual_state_lazy()
             .collect::<Vec<_>>(),
-        Query::new_projected(make_root(), [X], project_x)
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
-            .collect(),
         Query::new_projected(make_root(), [X], project_x).collect(),
     ];
     for results in result_sets {
@@ -769,10 +759,10 @@ fn a_seed_proven_false_needs_no_proposal_source() {
 fn equality_becomes_a_source_only_after_its_peer_is_bound() {
     let mut result_sets = vec![
         Query::new(dynamic_equality_root(), project_xy)
-            .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+            .solve_residual_state_lazy()
             .collect::<Vec<_>>(),
         Query::new(dynamic_equality_root(), project_xy)
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .solve_residual_state_lazy()
             .cap(1)
             .start_width(1)
             .growth(1)
@@ -1156,10 +1146,7 @@ fn selected_exact_program_source_composes_with_an_ordinary_weak_confirmer() {
         }) as DynConstraint,
     ]);
     let results: Vec<_> = Query::new(root, project_x)
-        .solve_residual_state_lazy_with(ResidualLowering::new(
-            FormulaScope::OpaqueLeaves,
-            ProgramScope::All,
-        ))
+        .solve_residual_state_lazy()
         .collect();
 
     assert_eq!(results, vec![MEMBER]);
@@ -1202,7 +1189,7 @@ fn deferred_exact_program_receipt_does_not_discharge_covering_ordinary_source() 
     );
 
     let results: Vec<_> = Query::new(proposer, project_x)
-        .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+        .solve_residual_state_lazy()
         .collect();
 
     assert_eq!(results, vec![MEMBER]);

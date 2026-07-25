@@ -1,7 +1,6 @@
 //! The real entry: actual `find!`/`pattern!` queries whose two-bound
-//! proposals run through the resident route inside the residual
-//! engine (production `ResidualLowering::HYBRID` and maximal
-//! `ResidualLowering::FULL`).
+//! proposals run through the resident route inside the production residual
+//! engine.
 //!
 //! Serial and parallel solves are compared bag-for-bag against the
 //! ordinary iterator over the source `TribleSet`. Physical placement
@@ -16,7 +15,6 @@ use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::InlineEncoding;
 use triblespace_core::macros::{id_hex, pattern};
-use triblespace_core::query::residual::ResidualLowering;
 use triblespace_core::query::{find, TriblePattern};
 use triblespace_core::trible::{Trible, TribleSet};
 use triblespace_gpu::{
@@ -98,9 +96,7 @@ fn explicit_preparation_is_exact_idempotent_and_keeps_force_usable() {
         (e: Id, v: Id),
         pattern!(&route, [{ ?e @ ns::fanout: ?v }])
     );
-    let mut actual = query
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
-        .collect::<Vec<_>>();
+    let mut actual = query.solve_residual_state_lazy().collect::<Vec<_>>();
     actual.sort();
     assert_eq!(actual, expected);
     assert!(route.counters().physical_cohorts > 0);
@@ -134,7 +130,7 @@ fn canonical_fallback_keeps_the_width_one_geometric_pager() {
         pattern!(&route, [{ ?e @ ns::fanout: ?v }])
     );
     let mut solve = query
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(64)
         .start_width(1)
         .growth(2);
@@ -185,14 +181,14 @@ fn repeated_pattern_uses_the_canonical_program_without_a_resident_family() {
             x,
         )
     )
-    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .solve_residual_state_lazy()
     .collect::<Vec<_>>();
     assert_eq!(result, vec![(repeated,)]);
     assert_eq!(route.counters(), Default::default());
 }
 
 #[test]
-fn serial_full_lowering_is_set_identical_and_default_off_never_places() {
+fn serial_production_route_is_set_identical_and_default_off_never_places() {
     let set = fixture_set();
     let expected = oracle_pairs(&set);
     assert_eq!(expected.len(), 60);
@@ -208,9 +204,7 @@ fn serial_full_lowering_is_set_identical_and_default_off_never_places() {
         (e: Id, v: Id),
         pattern!(&route, [{ ?e @ ns::fanout: ?v }])
     );
-    let solve = query
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
-        .collect_profiled();
+    let solve = query.solve_residual_state_lazy().collect_profiled();
 
     let mut results = solve.results;
     results.sort();
@@ -256,7 +250,7 @@ fn public_off_route_executes_all_three_two_bound_actions_exactly() {
             GenId::inline_from(value),
         )
     )
-    .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+    .solve_residual_state_lazy()
     .cap(1)
     .start_width(1)
     .growth(2)
@@ -272,7 +266,7 @@ fn public_off_route_executes_all_three_two_bound_actions_exactly() {
             GenId::inline_from(value),
         )
     )
-    .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+    .solve_residual_state_lazy()
     .cap(1)
     .start_width(1)
     .growth(2)
@@ -288,7 +282,7 @@ fn public_off_route_executes_all_three_two_bound_actions_exactly() {
             v,
         )
     )
-    .solve_residual_state_lazy_with(ResidualLowering::HYBRID)
+    .solve_residual_state_lazy()
     .cap(1)
     .start_width(1)
     .growth(2)
@@ -305,7 +299,7 @@ fn public_off_route_executes_all_three_two_bound_actions_exactly() {
     assert_eq!(counters.declined_contract, 0);
     assert!(
         counters.declined_policy >= 3,
-        "HYBRID must select every production-qualified two-bound Program before Off declines physical placement"
+        "production must select every qualified two-bound Program before Off declines physical placement"
     );
 }
 
@@ -328,7 +322,7 @@ fn public_force_route_places_all_three_two_bound_actions_without_preparation() {
             GenId::inline_from(value),
         )
     )
-    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .solve_residual_state_lazy()
     .start_width(1)
     .collect_profiled();
     assert_eq!(entities.results, vec![(entity,)]);
@@ -342,7 +336,7 @@ fn public_force_route_places_all_three_two_bound_actions_without_preparation() {
             GenId::inline_from(value),
         )
     )
-    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .solve_residual_state_lazy()
     .start_width(1)
     .collect_profiled();
     assert_eq!(attributes.results, vec![(attribute,)]);
@@ -356,7 +350,7 @@ fn public_force_route_places_all_three_two_bound_actions_without_preparation() {
             v,
         )
     )
-    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .solve_residual_state_lazy()
     .start_width(1)
     .collect_profiled();
     let mut actual_values = values.results;
@@ -391,9 +385,7 @@ fn serial_forced_routing_places_physically_and_stays_set_identical() {
         (e: Id, v: Id),
         pattern!(&route, [{ ?e @ ns::fanout: ?v }])
     );
-    let solve = query
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
-        .collect_profiled();
+    let solve = query.solve_residual_state_lazy().collect_profiled();
 
     // SET-identical to the pure-CPU oracle of the same query.
     let mut results = solve.results;
@@ -445,9 +437,8 @@ fn parallel_forced_routing_places_physically_and_stays_set_identical() {
         (e: Id, v: Id),
         pattern!(&route, [{ ?e @ ns::fanout: ?v }])
     );
-    // The public parallel residual entry preserves the query's selected
-    // lowering (HYBRID for a fresh query), so production-qualified typed
-    // Programs stay reachable.
+    // The public parallel residual entry uses the same production plan as
+    // serial execution, so production-qualified typed Programs stay reachable.
     let mut results: Vec<(Id, Id)> = query.into_par_residual_state_iter().collect();
 
     results.sort();

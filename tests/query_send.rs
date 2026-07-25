@@ -213,8 +213,6 @@ fn partially_consumed_query_into_par_iter_keeps_exact_remainder() {
 #[cfg(feature = "parallel")]
 #[test]
 fn pulled_query_rejects_seed_restarting_configuration() {
-    use triblespace::core::query::residual::ResidualLowering;
-
     let mut context = VariableContext::new();
     let variable = context.next_variable::<U256BE>();
     let values = [1u64, 2, 3, 4].map(U256BE::inline_from);
@@ -232,7 +230,7 @@ fn pulled_query_rejects_seed_restarting_configuration() {
     let panics = [
         std::panic::catch_unwind(std::panic::AssertUnwindSafe({
             let query = query.clone();
-            move || drop(query.solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE))
+            move || drop(query.solve_residual_state_lazy())
         })),
         std::panic::catch_unwind(std::panic::AssertUnwindSafe({
             let query = query.clone();

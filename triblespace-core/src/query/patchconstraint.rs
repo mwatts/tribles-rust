@@ -621,7 +621,6 @@ mod tests {
     use crate::inline::encodings::UnknownInline;
     use crate::patch::Entry;
     use crate::query::intersectionconstraint::IntersectionConstraint;
-    use crate::query::residual::ResidualLowering;
     use crate::query::{
         Binding, ProgramAction, ProgramCompletion, ProgramExposure, ProgramGrouping,
         ProgramRequest, ProgramStratum, Query, TypedProgramSpec,
@@ -700,7 +699,7 @@ mod tests {
     }
 
     #[test]
-    fn value_program_pages_match_fallback_and_typed_residual_paths() {
+    fn value_program_pages_match_default_and_width_one_production_paths() {
         // Repeated insertion is set-idempotent: the direct frontier must not
         // manufacture a second occurrence for the duplicate stored key.
         let patch = value_patch(&[3, 1, 2, 2]);
@@ -733,38 +732,37 @@ mod tests {
             eager_proposal(&constraint, variable.index, &RowsView::EMPTY)
         );
 
-        let mut ordinary: Vec<_> =
+        let mut default: Vec<_> =
             Query::new(PatchValueConstraint::new(variable, &patch), project_value).collect();
-        let mut conservative: Vec<_> =
+        let mut narrow_query =
             Query::new(PatchValueConstraint::new(variable, &patch), project_value)
-                .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
-                .collect();
-        let mut full_query = Query::new(PatchValueConstraint::new(variable, &patch), project_value)
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
-            .cap(1)
-            .start_width(1);
-        let mut full: Vec<_> = full_query.by_ref().collect();
-        for bag in [&mut ordinary, &mut conservative, &mut full] {
+                .solve_residual_state_lazy()
+                .cap(1)
+                .start_width(1);
+        let mut narrow: Vec<_> = narrow_query.by_ref().collect();
+        for bag in [&mut default, &mut narrow] {
             bag.sort_unstable();
         }
-        assert_eq!(ordinary, direct);
-        assert_eq!(conservative, direct);
-        assert_eq!(full, direct);
-        assert_eq!(full_query.stats().delta_source_pages, patch.len() as usize);
+        assert_eq!(default, direct);
+        assert_eq!(narrow, direct);
         assert_eq!(
-            full_query.stats().delta_source_candidates_examined,
+            narrow_query.stats().delta_source_pages,
             patch.len() as usize
         );
         assert_eq!(
-            full_query.stats().delta_source_direct_candidates,
+            narrow_query.stats().delta_source_candidates_examined,
             patch.len() as usize
         );
-        assert_eq!(full_query.stats().delta_source_roots, 0);
-        assert_eq!(full_query.stats().max_propose_candidates, 1);
+        assert_eq!(
+            narrow_query.stats().delta_source_direct_candidates,
+            patch.len() as usize
+        );
+        assert_eq!(narrow_query.stats().delta_source_roots, 0);
+        assert_eq!(narrow_query.stats().max_propose_candidates, 1);
     }
 
     #[test]
-    fn id_program_pages_match_fallback_and_typed_residual_paths() {
+    fn id_program_pages_match_default_and_width_one_production_paths() {
         let patch = id_patch(&[0xf0, 0x10, 0x80, 0x10]);
         let variable = Variable::<GenId>::new(0);
         let constraint = PatchIdConstraint::new(variable, patch.clone());
@@ -794,21 +792,17 @@ mod tests {
         );
 
         let make = || PatchIdConstraint::new(variable, patch.clone());
-        let mut ordinary: Vec<_> = Query::new(make(), project_value).collect();
-        let mut conservative: Vec<_> = Query::new(make(), project_value)
-            .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
-            .collect();
-        let mut full: Vec<_> = Query::new(make(), project_value)
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        let mut default: Vec<_> = Query::new(make(), project_value).collect();
+        let mut narrow: Vec<_> = Query::new(make(), project_value)
+            .solve_residual_state_lazy()
             .cap(1)
             .start_width(1)
             .collect();
-        for bag in [&mut ordinary, &mut conservative, &mut full] {
+        for bag in [&mut default, &mut narrow] {
             bag.sort_unstable();
         }
-        assert_eq!(ordinary, direct);
-        assert_eq!(conservative, direct);
-        assert_eq!(full, direct);
+        assert_eq!(default, direct);
+        assert_eq!(narrow, direct);
     }
 
     #[test]
@@ -956,34 +950,30 @@ mod tests {
             "the raw protocol call still observes both duplicate parent occurrences",
         );
 
-        let mut ordinary: Vec<_> = Query::new(make(), project).collect();
-        let mut conservative: Vec<_> = Query::new(make(), project)
-            .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
-            .collect();
-        let mut full_query = Query::new(make(), project)
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        let mut default: Vec<_> = Query::new(make(), project).collect();
+        let mut narrow_query = Query::new(make(), project)
+            .solve_residual_state_lazy()
             .cap(1)
             .start_width(1);
-        let mut full: Vec<_> = full_query.by_ref().collect();
-        for bag in [&mut ordinary, &mut conservative, &mut full] {
+        let mut narrow: Vec<_> = narrow_query.by_ref().collect();
+        for bag in [&mut default, &mut narrow] {
             bag.sort_unstable();
         }
         let expected: Vec<_> = members
             .into_iter()
             .map(|member| (parent_value, member))
             .collect();
-        assert_eq!(ordinary, expected);
-        assert!(ordinary
+        assert_eq!(default, expected);
+        assert!(default
             .iter()
             .all(|(parent, _member)| *parent == parent_value));
-        assert_eq!(conservative, expected);
-        assert_eq!(full, expected);
+        assert_eq!(narrow, expected);
         assert_eq!(
-            full_query.stats().delta_source_direct_candidates,
+            narrow_query.stats().delta_source_direct_candidates,
             3,
-            "the Formula boundary admits byte-identical semantic parents before direct source work",
+            "the SET boundary admits byte-identical semantic parents before direct source work",
         );
-        assert_eq!(full_query.stats().delta_source_roots, 0);
+        assert_eq!(narrow_query.stats().delta_source_roots, 0);
     }
 
     #[test]
@@ -994,7 +984,7 @@ mod tests {
         let variable = Variable::<UnknownInline>::new(0);
         let solve = |patch| {
             Query::new(PatchValueConstraint::new(variable, patch), project_value)
-                .solve_residual_state_lazy_with(ResidualLowering::FULL)
+                .solve_residual_state_lazy()
                 .cap(1)
                 .start_width(1)
                 .collect::<Vec<_>>()

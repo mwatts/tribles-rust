@@ -14,7 +14,6 @@ use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::{genid::GenId, UnknownInline};
 use triblespace_core::inline::{Inline, IntoInline, RawInline};
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
-use triblespace_core::query::residual::ResidualLowering;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, EstimateSink, ProposalCoverage, Query, RowsView,
     TriblePattern, Variable, VariableId, VariableSet,
@@ -265,7 +264,7 @@ where
     C: Constraint<'a> + 'a,
 {
     let mut rows: Vec<_> = Query::new(constraint, project_pattern(axes))
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .collect();
     rows.sort_unstable();
     rows
@@ -302,7 +301,10 @@ fn each_zero_bound_axis_drains_to_the_fixture_relation() {
             archive_ordinary, expected,
             "{name}: archive ordinary result set"
         );
-        assert_eq!(archive_residual, expected, "{name}: FULL source result set");
+        assert_eq!(
+            archive_residual, expected,
+            "{name}: production source result set"
+        );
     }
 }
 
@@ -322,7 +324,7 @@ where
 {
     let project = move |binding: &Binding| binding.get(variable).copied();
     let mut values: Vec<_> = Query::new(constraint, project)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .collect();
     values.sort_unstable();
     values
@@ -357,7 +359,7 @@ fn production_program_first_pull_is_one_direct_candidate() {
     let mut query = Query::new(root, move |binding: &Binding| {
         binding.get(variable.index).copied()
     })
-    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .solve_residual_state_lazy()
     .start_width(1)
     .cap(1);
 
@@ -455,7 +457,7 @@ fn direct_sources_preserve_affine_parent_multiplicity() {
     };
     let project = move |binding: &Binding| binding.get(variable.index).copied();
     let mut residual_query = Query::new(make_root(), project)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(1);
     let mut residual: Vec<_> = residual_query.by_ref().collect();
     residual.sort_unstable();

@@ -367,7 +367,6 @@ mod tests {
     use crate::inline::RawInline;
     use crate::prelude::inlineencodings::R256BE;
     use crate::prelude::*;
-    use crate::query::residual::ResidualLowering;
     use crate::query::Binding;
     use crate::query::Constraint;
     use crate::query::ProgramAction;
@@ -505,7 +504,7 @@ mod tests {
             ),
             move |binding| project(entity.index, binding),
         )
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1)
         .collect();
@@ -520,7 +519,7 @@ mod tests {
             ),
             move |binding| project(attribute.index, binding),
         )
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1)
         .collect();
@@ -629,7 +628,7 @@ mod tests {
             data.entity_in_range(entity, entity_ids[1], entity_ids[2]),
             move |binding| project(entity.index, binding),
         )
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1);
         assert_eq!(
@@ -644,7 +643,7 @@ mod tests {
             data.entity_in_range(entity, entity_ids[1], entity_ids[2]),
             move |binding| project(entity.index, binding),
         )
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1)
         .growth(1)
@@ -662,7 +661,7 @@ mod tests {
             data.attribute_in_range(attribute, attributes[1], attributes[2]),
             move |binding| project(attribute.index, binding),
         )
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1)
         .collect();

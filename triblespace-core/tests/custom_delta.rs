@@ -8,9 +8,7 @@ use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::query::finiteunaryprogram::{self, FiniteUnaryProgramState};
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
-use triblespace_core::query::residual::{
-    ResidualLowering, ResidualShadowEpoch, ResidualShadowStatus,
-};
+use triblespace_core::query::residual::{ResidualShadowEpoch, ResidualShadowStatus};
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, DispatchClass, EstimateSink, ProgramAction,
@@ -1023,7 +1021,7 @@ fn assert_recursive_support_case(include_terminal: bool) -> Vec<RawInline> {
             ),
             project_outer,
         )
-        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+        .solve_residual_state_lazy()
         .collect(),
     );
     assert_eq!(oracle, expected);
@@ -1055,7 +1053,7 @@ fn assert_recursive_support_case(include_terminal: bool) -> Vec<RawInline> {
         ),
         project_outer,
     )
-    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .solve_residual_state_lazy()
     .cap(1)
     .start_width(1)
     .collect_profiled();
@@ -1150,7 +1148,7 @@ fn assert_paged_support_case(
             ),
             project_outer,
         )
-        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+        .solve_residual_state_lazy()
         .collect(),
     );
     assert_eq!(oracle, expected);
@@ -1178,7 +1176,7 @@ fn assert_paged_support_case(
         ),
         project_outer,
     )
-    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .solve_residual_state_lazy()
     .cap(32)
     .start_width(1)
     .collect_profiled();
@@ -1270,7 +1268,7 @@ fn live_program_support_clone_is_exact_and_matches_rayon_workers() {
         ),
         project_outer,
     )
-    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .solve_residual_state_lazy()
     .cap(1)
     .start_width(1);
     let first = query
@@ -1311,7 +1309,7 @@ fn live_program_support_clone_is_exact_and_matches_rayon_workers() {
             ),
             project_outer,
         )
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(2)
         .start_width(1);
         let mut actual = rayon::ThreadPoolBuilder::new()
@@ -1340,7 +1338,7 @@ fn custom_direct_source_first_pull_is_rootless_and_drop_cancels_the_frontier() {
         direct_source_fixture(vec![raw(1), raw(2), raw(3), raw(4)], Arc::clone(&evidence)),
         project_start,
     )
-    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .solve_residual_state_lazy()
     .cap(1)
     .start_width(1);
 
@@ -1373,36 +1371,16 @@ fn custom_direct_source_first_pull_is_rootless_and_drop_cancels_the_frontier() {
 }
 
 fn assert_direct_source_case(values: Vec<RawInline>, expected: Vec<RawInline>) -> Vec<RawInline> {
-    let oracle_evidence = Arc::new(DirectSourceEvidence::default());
-    let oracle = sorted(
-        Query::new(
-            direct_source_fixture(values.clone(), Arc::clone(&oracle_evidence)),
-            project_start,
-        )
-        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
-        .collect(),
-    );
-    assert_eq!(oracle, expected);
-    assert!(
-        oracle_evidence
-            .pages
-            .lock()
-            .expect("direct source trace poisoned")
-            .is_empty(),
-        "the conservative oracle must use the ordinary proposer"
-    );
-
     let residual_evidence = Arc::new(DirectSourceEvidence::default());
     let residual = Query::new(
         direct_source_fixture(values, Arc::clone(&residual_evidence)),
         project_start,
     )
-    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .solve_residual_state_lazy()
     .cap(1)
     .start_width(1)
     .collect_profiled();
     let actual = sorted(residual.results);
-    assert_eq!(actual, oracle);
     assert_eq!(actual, expected);
     assert_eq!(residual.stats.delta_source_roots, 0);
 
@@ -1451,7 +1429,7 @@ fn custom_direct_source_duplicate_occurrences_collapse_per_parent_at_width_one()
             direct_source_fixture(values.clone(), Arc::default()),
             project_start,
         )
-        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+        .solve_residual_state_lazy()
         .collect(),
     );
     // The two parents remain distinct complete bindings, while equal source
@@ -1463,7 +1441,7 @@ fn custom_direct_source_duplicate_occurrences_collapse_per_parent_at_width_one()
         direct_source_fixture(values, Arc::clone(&evidence)),
         project_start,
     )
-    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .solve_residual_state_lazy()
     .cap(1)
     .start_width(1)
     .collect_profiled();
@@ -1484,34 +1462,18 @@ fn custom_direct_source_duplicate_occurrences_collapse_per_parent_at_width_one()
 #[test]
 fn custom_direct_source_batches_compatible_parents_with_one_global_budget() {
     let values = vec![raw(1), raw(2), raw(3)];
-    let oracle = sorted(
-        Query::new(
-            direct_source_fixture(values.clone(), Arc::default()),
-            project_start,
-        )
-        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
-        .collect(),
-    );
-    let conservative = sorted(
-        Query::new(
-            direct_source_fixture(values.clone(), Arc::default()),
-            project_start,
-        )
-        .solve_residual_state_lazy()
-        .collect(),
-    );
-    assert_eq!(conservative, oracle);
+    let expected = sorted(vec![raw(1), raw(1), raw(2), raw(2), raw(3), raw(3)]);
     let evidence = Arc::new(DirectSourceEvidence::default());
     let residual = Query::new(
         direct_source_fixture(values, Arc::clone(&evidence)),
         project_start,
     )
-    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .solve_residual_state_lazy()
     .cap(3)
     .start_width(3)
     .collect_profiled();
 
-    assert_eq!(sorted(residual.results), oracle);
+    assert_eq!(sorted(residual.results), expected);
     assert_eq!(residual.stats.max_delta_source_cohort, 2);
     assert_eq!(residual.stats.delta_source_cohorts, 2);
     assert_eq!(residual.stats.delta_source_pages, 4);
@@ -1560,7 +1522,7 @@ fn live_custom_direct_source_clones_exactly_and_matches_rayon_workers() {
         direct_source_fixture(values.clone(), Arc::clone(&evidence)),
         project_start,
     )
-    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .solve_residual_state_lazy()
     .cap(1)
     .start_width(1);
     let first = query
@@ -1589,7 +1551,7 @@ fn live_custom_direct_source_clones_exactly_and_matches_rayon_workers() {
             direct_source_fixture(values.clone(), Arc::clone(&evidence)),
             project_start,
         )
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1);
         let mut actual = rayon::ThreadPoolBuilder::new()
@@ -1612,42 +1574,26 @@ fn live_custom_direct_source_clones_exactly_and_matches_rayon_workers() {
 
 #[test]
 fn custom_cyclic_delta_composes_with_recursive_root_formula() {
-    let conservative_evidence = Arc::new(DeltaEvidence::default());
-    let conservative = sorted(
-        Query::new(fixture(Arc::clone(&conservative_evidence)), project_end)
-            .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
-            .collect(),
-    );
-    assert_eq!(
-        conservative_evidence.seeded_roots.load(Ordering::Relaxed),
-        0
-    );
-    assert_eq!(
-        conservative_evidence.expanded_nodes.load(Ordering::Relaxed),
-        0
-    );
-
     let production_evidence = Arc::new(DeltaEvidence::default());
     let production =
         sorted(Query::new(fixture(Arc::clone(&production_evidence)), project_end).collect());
     assert!(
         production_evidence.seeded_roots.load(Ordering::Relaxed) > 0,
-        "production Union-leaf lowering exposes the recursive continuation"
+        "the production Union compiler exposes the recursive continuation"
     );
     assert!(production_evidence.expanded_nodes.load(Ordering::Relaxed) > 0);
 
     let residual_evidence = Arc::new(DeltaEvidence::default());
     let residual = Query::new(fixture(Arc::clone(&residual_evidence)), project_end)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(2)
         .start_width(1)
         .collect_profiled();
     let residual = sorted(residual.results);
 
     let expected = sorted(vec![raw(2), raw(2), raw(6), raw(6)]);
-    assert_eq!(conservative, expected);
-    assert_eq!(production, conservative);
-    assert_eq!(residual, conservative);
+    assert_eq!(production, expected);
+    assert_eq!(residual, expected);
     assert!(residual_evidence.seeded_roots.load(Ordering::Relaxed) > 0);
     assert!(residual_evidence.expanded_nodes.load(Ordering::Relaxed) > 0);
     assert_eq!(
@@ -1661,13 +1607,13 @@ fn custom_cyclic_delta_composes_with_recursive_root_formula() {
         let parallel_evidence = Arc::new(DeltaEvidence::default());
         let parallel = sorted(
             Query::new(fixture(Arc::clone(&parallel_evidence)), project_end)
-                .solve_residual_state_lazy_with(ResidualLowering::FULL)
+                .solve_residual_state_lazy()
                 .cap(4)
                 .start_width(4)
                 .into_par_iter()
                 .collect(),
         );
-        assert_eq!(parallel, conservative);
+        assert_eq!(parallel, expected);
         assert!(parallel_evidence.seeded_roots.load(Ordering::Relaxed) > 0);
         assert!(parallel_evidence.expanded_nodes.load(Ordering::Relaxed) > 0);
     }
@@ -1681,7 +1627,7 @@ fn custom_cyclic_delta_confirms_a_more_specific_proposal_source() {
             fixture_with_end_estimate(Arc::clone(&evidence), 1),
             project_end,
         )
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(2)
         .start_width(1)
         .collect(),
@@ -1702,11 +1648,9 @@ fn custom_cyclic_delta_confirms_a_more_specific_proposal_source() {
 
 #[test]
 fn custom_cyclic_delta_shadow_preserves_native_execution() {
-    let lowering = ResidualLowering::FULL;
-
     let direct_evidence = Arc::new(DeltaEvidence::default());
     let direct = Query::new(fixture(Arc::clone(&direct_evidence)), project_end)
-        .solve_residual_state_lazy_with(lowering)
+        .solve_residual_state_lazy()
         .cap(2)
         .start_width(1)
         .collect_profiled();
@@ -1721,7 +1665,7 @@ fn custom_cyclic_delta_shadow_preserves_native_execution() {
     let shadow_evidence = Arc::new(DeltaEvidence::default());
     let epoch = ResidualShadowEpoch::new();
     let shadow = Query::new(fixture(Arc::clone(&shadow_evidence)), project_end)
-        .solve_residual_state_lazy_with(lowering)
+        .solve_residual_state_lazy()
         .cap(2)
         .start_width(1)
         .shadow(epoch.clone())
@@ -1751,7 +1695,7 @@ fn custom_cyclic_delta_shadow_preserves_native_execution() {
         let parallel_evidence = Arc::new(DeltaEvidence::default());
         let parallel_epoch = ResidualShadowEpoch::new();
         let mut parallel: Vec<_> = Query::new(fixture(Arc::clone(&parallel_evidence)), project_end)
-            .solve_residual_state_lazy_with(lowering)
+            .solve_residual_state_lazy()
             .cap(4)
             .start_width(4)
             .shadow(parallel_epoch.clone())

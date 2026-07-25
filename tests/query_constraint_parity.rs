@@ -15,7 +15,6 @@ use std::hash::Hash;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use triblespace::core::debug::query::EstimateOverrideConstraint;
-use triblespace::core::query::residual::{FormulaScope, ProgramScope, ResidualLowering};
 use triblespace::core::query::{Binding, Constraint, Query};
 use triblespace::prelude::inlineencodings::GenId;
 use triblespace::prelude::*;
@@ -53,16 +52,13 @@ fn multiset<T: Eq + Hash>(items: impl IntoIterator<Item = T>) -> HashMap<T, usiz
     counts
 }
 
-fn combined_effects() -> ResidualLowering {
-    ResidualLowering::new(FormulaScope::UnionLeaves, ProgramScope::All)
-}
-
 /// Runs the stable execution shapes around one replaceable
 /// residual-capability seam.
 ///
-/// Union/RPQ lowering experiments can swap only `run_residual`; the oracle and
-/// all surrounding execution-route comparisons remain unchanged, so capability work
-/// does not proliferate public solver entry points or bespoke fixtures.
+/// Residual implementation experiments can swap only `run_residual`; the
+/// oracle and all surrounding execution-route comparisons remain unchanged,
+/// so capability work does not proliferate public solver entry points or
+/// bespoke fixtures.
 fn assert_route_matrix<'a, C, P, R, Make>(label: &str, expected: Vec<R>, make_query: Make)
 where
     C: Constraint<'a> + Clone + Send + 'a,
@@ -77,7 +73,7 @@ where
 
     assert_route("ordinary residual-default", make_query().collect());
 
-    let mut residual = make_query().solve_residual_state_lazy_with(combined_effects());
+    let mut residual = make_query().solve_residual_state_lazy();
     let first = residual.next();
     assert_eq!(
         first.is_some(),
@@ -90,11 +86,7 @@ where
     // This is the single integration seam for every fixture below. Composite
     // effects are selected together; adding another structural capability
     // must extend this value rather than create a solver-specific entry point.
-    let run_residual = |query: Query<C, P, R>| {
-        query
-            .solve_residual_state_lazy_with(combined_effects())
-            .collect()
-    };
+    let run_residual = |query: Query<C, P, R>| query.solve_residual_state_lazy().collect();
     assert_route("combined residual capability", run_residual(make_query()));
 
     #[cfg(feature = "parallel")]
@@ -106,7 +98,7 @@ where
         assert_route(
             "parallel residual",
             make_query()
-                .solve_residual_state_lazy_with(combined_effects())
+                .solve_residual_state_lazy()
                 .into_par_iter()
                 .collect::<Vec<_>>(),
         );
@@ -118,9 +110,9 @@ where
 /// Three distinct projected activation entities map to values `[a, a, b]`.
 /// Unlike duplicate candidates for one parent (which set-valued constraints
 /// may legitimately deduplicate), these are three distinct relational rows.
-/// Exactly one Union arm is live for each row. Lowering is allowed to cohort
-/// their shared structural action, but must neither let a dead row-local arm
-/// contribute nor merge the two activation identities that map to `a`.
+/// Exactly one Union arm is live for each row. Execution may cohort their
+/// shared structural action differently, but must neither let a dead row-local
+/// arm contribute nor merge the two activation identities that map to `a`.
 #[test]
 fn union_dead_arms_are_row_local_and_duplicate_activations_are_affine() {
     let a = fixture_id(1);

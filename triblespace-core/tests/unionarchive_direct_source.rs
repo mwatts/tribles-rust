@@ -9,7 +9,6 @@ use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::{genid::GenId, UnknownInline};
 use triblespace_core::inline::{Inline, IntoInline, RawInline};
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
-use triblespace_core::query::residual::ResidualLowering;
 use triblespace_core::query::unionconstraint::UnionConstraint;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, EstimateSink, ProposalCoverage, Query, RowsView,
@@ -184,7 +183,7 @@ fn interleaved_shards_keep_eager_order_and_production_program_set_parity() {
     );
     assert_eq!(eager, (1..=6).map(|tag| value(tag).raw).collect::<Vec<_>>());
     let mut full: Vec<_> = Query::new(constraint, project_value)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .start_width(1)
         .collect();
     full.sort_unstable();
@@ -233,7 +232,7 @@ fn generic_union_keeps_its_boundary_and_repeated_targets_keep_full_parity() {
             Query::new(ordinary, |binding: &Binding| binding.get(x.index).copied()).collect();
         let mut full_values: Vec<_> =
             Query::new(full, |binding: &Binding| binding.get(x.index).copied())
-                .solve_residual_state_lazy_with(ResidualLowering::FULL)
+                .solve_residual_state_lazy()
                 .start_width(1)
                 .collect();
         ordinary_values.sort_unstable();
@@ -255,7 +254,7 @@ fn width_one_production_program_and_live_clone_preserve_the_exact_normalized_rem
     let value = Variable::<UnknownInline>::new(0);
     let root = Arc::new(union.pattern(entities[0], attributes[0], value));
     let mut query = Query::new(root, project_value)
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .start_width(1)
         .cap(1);
 
@@ -350,7 +349,7 @@ fn normalized_union_preserves_affine_parents_and_monotone_shard_growth() {
     let value = Variable::<UnknownInline>::new(0);
     let parent = Variable::<UnknownInline>::new(1);
 
-    let solve = |archives: &[SuccinctArchive<OrderedUniverse>], conservative| {
+    let solve = |archives: &[SuccinctArchive<OrderedUniverse>], narrow| {
         let union = UnionArchive::new(archives);
         let root = IntersectionConstraint::new(vec![
             Box::new(ParentDomain {
@@ -360,35 +359,33 @@ fn normalized_union_preserves_affine_parents_and_monotone_shard_growth() {
             Box::new(union.pattern(entities[0], attributes[0], value)) as DynConstraint<'_>,
         ]);
         let query = Query::new(root, project_value);
-        let mut results: Vec<_> = if conservative {
+        let mut results: Vec<_> = if narrow {
             query
-                .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
-                .collect()
-        } else {
-            query
-                .solve_residual_state_lazy_with(ResidualLowering::FULL)
+                .solve_residual_state_lazy()
                 .start_width(1)
                 .cap(1)
                 .collect()
+        } else {
+            query.solve_residual_state_lazy().collect()
         };
         results.sort_unstable();
         results
     };
 
-    let base_conservative = solve(&base_archives, true);
-    let base_full = solve(&base_archives, false);
-    assert_eq!(base_full, base_conservative);
+    let base_default = solve(&base_archives, false);
+    let base_narrow = solve(&base_archives, true);
+    assert_eq!(base_default, base_narrow);
     let mut expected: Vec<_> = base_values
         .iter()
         .flat_map(|value| [value.raw, value.raw])
         .collect();
     expected.sort_unstable();
-    assert_eq!(base_full, expected);
+    assert_eq!(base_default, expected);
 
-    let grown_full = solve(&grown_archives, false);
-    for inherited in base_full {
+    let grown = solve(&grown_archives, false);
+    for inherited in base_default {
         assert!(
-            grown_full.contains(&inherited),
+            grown.contains(&inherited),
             "adding a shard retracted an affine result"
         );
     }
@@ -397,5 +394,5 @@ fn normalized_union_preserves_affine_parents_and_monotone_shard_growth() {
         .flat_map(|value| [value.raw, value.raw])
         .collect();
     grown_expected.sort_unstable();
-    assert_eq!(grown_full, grown_expected);
+    assert_eq!(grown, grown_expected);
 }

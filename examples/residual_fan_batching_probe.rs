@@ -38,7 +38,7 @@
 //! cargo run --release --example residual_fan_batching_probe -- <row_budget>
 //! ```
 
-use triblespace::core::query::residual::{ResidualLowering, ResidualStateStats};
+use triblespace::core::query::residual::ResidualStateStats;
 use triblespace::core::trible::TribleSet;
 use triblespace::prelude::inlineencodings::GenId;
 use triblespace::prelude::*;
@@ -97,7 +97,7 @@ macro_rules! control_fan_query {
 /// largest observed actionable width.
 macro_rules! drain_profiled {
     ($query:expr, $oracle:expr, $budget:expr) => {{
-        let mut query = ($query).solve_residual_state_lazy_with(ResidualLowering::FULL);
+        let mut query = ($query).solve_residual_state_lazy();
         let oracle: &[Pair] = $oracle;
         let budget: usize = $budget;
         let mut rows = Vec::with_capacity(budget.min(oracle.len()));

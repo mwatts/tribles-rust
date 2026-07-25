@@ -6,7 +6,6 @@
 use triblespace::core::blob::encodings::succinctarchive::OrderedUniverse;
 use triblespace::core::blob::encodings::succinctarchive::SuccinctArchive;
 use triblespace::core::inline::RawInline;
-use triblespace::core::query::residual::ResidualLowering;
 use triblespace::core::query::Binding;
 use triblespace::core::query::Constraint;
 use triblespace::core::query::ProgramAction;
@@ -140,7 +139,7 @@ fn attached_value_range_rejects_in_range_values_absent_from_the_v_axis() {
         ),
         move |binding| project(variable.index, binding),
     )
-    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .solve_residual_state_lazy()
     .cap(1)
     .start_width(1)
     .collect();
@@ -213,7 +212,7 @@ fn project(variable: usize, binding: &Binding) -> Option<RawInline> {
 }
 
 #[test]
-fn value_range_executes_as_an_ordered_source_and_confirmer_under_full_lowering() {
+fn value_range_executes_as_a_production_ordered_source_and_confirmer() {
     let v10: Inline<R256BE> = 10i128.to_inline();
     let v50: Inline<R256BE> = 50i128.to_inline();
     let v90: Inline<R256BE> = 90i128.to_inline();
@@ -236,7 +235,7 @@ fn value_range_executes_as_an_ordered_source_and_confirmer_under_full_lowering()
     let mut source: Vec<_> = Query::new(source_constraint, move |binding| {
         project(variable.index, binding)
     })
-    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .solve_residual_state_lazy()
     .cap(1)
     .start_width(1)
     .growth(1)
@@ -254,7 +253,7 @@ fn value_range_executes_as_an_ordered_source_and_confirmer_under_full_lowering()
     let mut confirmed: Vec<_> = Query::new(and!(variable.is(v50), confirmer), move |binding| {
         project(variable.index, binding)
     })
-    .solve_residual_state_lazy_with(ResidualLowering::FULL)
+    .solve_residual_state_lazy()
     .cap(1)
     .start_width(1)
     .growth(1)

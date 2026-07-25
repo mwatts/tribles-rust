@@ -13,10 +13,7 @@ use proptest::prelude::*;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
-use triblespace::core::query::residual::{
-    ActionVerb, FormulaScope, ProgramScope, ResidualLowering, ResidualShadowEpoch,
-    ResidualShadowStatus, ResidualStateIter,
-};
+use triblespace::core::query::residual::{ActionVerb, ResidualShadowEpoch, ResidualShadowStatus};
 use triblespace::core::query::{Binding, Constraint, Query};
 use triblespace::prelude::inlineencodings::GenId;
 use triblespace::prelude::*;
@@ -58,18 +55,6 @@ fn multiset<T: Eq + Hash>(items: impl IntoIterator<Item = T>) -> HashMap<T, usiz
     counts
 }
 
-/// Keep the extra policy-builder move out of the already large generated
-/// oracle frame. Debug builds otherwise reserve another full `Query` temporary
-/// at every macro expansion and can cross the test thread's stack budget.
-#[inline(never)]
-fn conservative_residual_cursor<'a, C, P, R>(query: Query<C, P, R>) -> ResidualStateIter<C, P, R>
-where
-    C: Constraint<'a> + 'a,
-    P: Fn(&Binding) -> Option<R>,
-{
-    query.solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
-}
-
 #[cfg(feature = "parallel")]
 fn parallel_pool(threads: usize) -> &'static rayon::ThreadPool {
     static ONE: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
@@ -94,7 +79,6 @@ fn parallel_pool(threads: usize) -> &'static rayon::ThreadPool {
 #[derive(Clone, Copy, Debug)]
 enum RpqRoute {
     Ordinary,
-    ConservativeCursor,
     ResidualLazy,
     #[cfg(feature = "parallel")]
     ResidualParallel(usize),
@@ -111,20 +95,13 @@ where
     R: Debug + Ord + Send,
     F: Fn() -> Query<C, P, R>,
 {
-    let mut routes = vec![
-        RpqRoute::Ordinary,
-        RpqRoute::ConservativeCursor,
-        RpqRoute::ResidualLazy,
-    ];
+    let mut routes = vec![RpqRoute::Ordinary, RpqRoute::ResidualLazy];
     #[cfg(feature = "parallel")]
     routes.extend([RpqRoute::ResidualParallel(1), RpqRoute::ResidualParallel(4)]);
 
     for route in routes {
         let mut actual = match route {
             RpqRoute::Ordinary => make_query().collect::<Vec<_>>(),
-            RpqRoute::ConservativeCursor => {
-                conservative_residual_cursor(make_query()).collect::<Vec<_>>()
-            }
             RpqRoute::ResidualLazy => make_query().solve_residual_state_lazy().collect::<Vec<_>>(),
             #[cfg(feature = "parallel")]
             RpqRoute::ResidualParallel(threads) => {
@@ -161,12 +138,6 @@ macro_rules! assert_all_routes_match {
             multiset($query),
             expected.clone(),
             "{}: ordinary residual-default Query",
-            $label
-        );
-        prop_assert_eq!(
-            multiset(conservative_residual_cursor($query)),
-            expected.clone(),
-            "{}: explicit conservative Query residual state",
             $label
         );
         #[cfg(feature = "parallel")]
@@ -235,11 +206,11 @@ macro_rules! assert_residual_routes_match {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(96))]
 
-    /// Independently checks production, conservative, geometric, fixed-width,
-    /// and forced-harvest schedules over random joins and overlapping unions
-    /// on both storage backends. Keeping this in a separate property test also
-    /// keeps the generated query temporaries below the test thread's stack
-    /// budget.
+    /// Independently checks ordinary iteration, geometric, fixed-width, and
+    /// forced-harvest production schedules over random joins and overlapping
+    /// unions on both storage backends. Keeping this in a separate property
+    /// test also keeps the generated query temporaries below the test thread's
+    /// stack budget.
     #[test]
     fn residual_schedules_match_relational_oracles(
         p_masks in prop::array::uniform4(0u8..16),
@@ -335,7 +306,7 @@ proptest! {
     }
 }
 
-/// The synthetic formula PC and its candidate paging are independent of the
+/// The formula PC and its candidate paging are independent of the
 /// storage representation used by each Atom.
 ///
 /// Both source entities produce the same middle values, so projecting only
@@ -345,7 +316,7 @@ proptest! {
 /// retain both affine source activations while descending through partial
 /// candidate tails.
 #[test]
-fn root_formula_candidate_paging_is_storage_polymorphic() {
+fn formula_candidate_paging_is_storage_polymorphic() {
     let sources = [fixture_id(81), fixture_id(82)];
     let middles: [Id; 12] = std::array::from_fn(|i| fixture_id(91 + i as u8));
     let marker_distractors: [Id; 12] = std::array::from_fn(|i| fixture_id(121 + i as u8));
@@ -423,22 +394,6 @@ fn root_formula_candidate_paging_is_storage_polymorphic() {
                     "{}: production residual ({geometry})",
                     $label
                 );
-
-                assert_eq!(
-                    multiset(
-                        query!($store)
-                            .solve_residual_state_lazy_with(ResidualLowering::new(
-                                FormulaScope::WholeRoot,
-                                ProgramScope::Disabled,
-                            ))
-                            .cap(cap)
-                            .start_width(1)
-                            .growth(growth)
-                    ),
-                    expected,
-                    "{}: whole-root formula ({geometry})",
-                    $label
-                );
             }
         }};
     }
@@ -447,10 +402,7 @@ fn root_formula_candidate_paging_is_storage_polymorphic() {
     assert_backend!("SuccinctArchiveConstraint", &archive);
 
     let lowered = query!(&archive)
-        .solve_residual_state_lazy_with(ResidualLowering::new(
-            FormulaScope::WholeRoot,
-            ProgramScope::Disabled,
-        ))
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1)
         .growth(1)
@@ -496,8 +448,8 @@ fn root_formula_candidate_paging_is_storage_polymorphic() {
 proptest! {
     #![proptest_config(rpq_proptest_config())]
 
-    /// Generated RPQ oracle covering both opaque-root and heterogeneous
-    /// residual composition paths under the full-switch default.
+    /// Generated RPQ oracle covering both root and heterogeneous residual
+    /// composition paths under the fixed production plan.
     ///
     /// The random part is a pair of labelled relations on four nodes. The
     /// expression closes the alternation `p | ^r`, so the independent oracle

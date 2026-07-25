@@ -1086,7 +1086,6 @@ mod tests {
     use triblespace_core::id::Id;
     use triblespace_core::inline::{InlineEncoding, IntoInline, TryFromInline};
     use triblespace_core::query::hashsetconstraint::SetConstraint;
-    use triblespace_core::query::residual::ResidualLowering;
     use triblespace_core::query::{Binding, Candidates, Query};
     use triblespace_core::repo::{BlobStore, BlobStorePut};
 
@@ -1500,7 +1499,7 @@ mod tests {
             )
         };
         let mut residual = Query::new(make(), project_pair)
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .solve_residual_state_lazy()
             .cap(1)
             .start_width(1);
         let mut full: Vec<_> = residual.by_ref().collect();
@@ -1541,7 +1540,7 @@ mod tests {
             BM25Filter::from_entries(Variable::<GenId>::new(0), entries),
             project_first,
         )
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1);
         assert_eq!(first_only.next(), Some(entries[0]));
@@ -1555,7 +1554,7 @@ mod tests {
             BM25Filter::from_entries(Variable::<GenId>::new(0), base),
             project_first,
         )
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1)
         .collect();
@@ -1563,7 +1562,7 @@ mod tests {
             BM25Filter::from_entries(Variable::<GenId>::new(0), entries),
             project_first,
         )
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1)
         .collect();
@@ -1727,7 +1726,7 @@ mod tests {
             )
         };
         let mut residual = Query::new(make(), project_pair)
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .solve_residual_state_lazy()
             .cap(1)
             .start_width(1);
         let mut full: Vec<_> = residual.by_ref().collect();
@@ -1760,7 +1759,7 @@ mod tests {
             SimilarTo::from_candidates(Variable::<Handle<Embedding>>::new(0), candidates.clone()),
             project_first,
         )
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1);
         assert_eq!(first_only.next(), Some(candidates[0]));
@@ -1794,7 +1793,7 @@ mod tests {
         };
 
         let mut rows: Vec<_> = Query::new(constraint, project_first)
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .solve_residual_state_lazy()
             .cap(1)
             .start_width(1)
             .collect();
@@ -1804,7 +1803,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_search_programs_execute_as_source_and_confirmer_under_full_lowering() {
+    fn cached_search_programs_execute_as_production_source_and_confirmer() {
         let candidate = Variable::<Handle<Embedding>>::new(0);
         let source = vec![
             embedding_raw(3),
@@ -1837,13 +1836,13 @@ mod tests {
             .is_some());
         let forward_root = triblespace_core::and!(forward_bm25, forward_similar);
         let mut forward = Query::new(forward_root, project_first)
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .solve_residual_state_lazy()
             .cap(1)
             .start_width(1)
             .growth(1);
         let first = forward
             .next()
-            .expect("FULL residual cached source was empty");
+            .expect("production residual cached source was empty");
         let mirror = forward.clone();
         let remainder: Vec<_> = forward.collect();
         assert_eq!(mirror.collect::<Vec<_>>(), remainder);
@@ -1869,7 +1868,7 @@ mod tests {
             .is_some());
         let reverse_root = triblespace_core::and!(reverse_similar, reverse_bm25);
         let mut reverse: Vec<_> = Query::new(reverse_root, project_first)
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .solve_residual_state_lazy()
             .cap(1)
             .start_width(1)
             .growth(1)
@@ -2032,7 +2031,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_cosine_filters_under_full_lowering_without_a_proposal_route() {
+    fn exact_cosine_filters_in_production_without_a_proposal_route() {
         let (flat, _hnsw, mut store, handles) = sample_sim();
         let reader = store.reader().unwrap();
         let view = flat.attach(&reader);
@@ -2054,7 +2053,7 @@ mod tests {
             .is_some());
         let good = triblespace_core::and!(a.is(handles[0]), b.is(handles[2]), exact,);
         let rows: Vec<_> = Query::new(good, project_pair)
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .solve_residual_state_lazy()
             .cap(1)
             .start_width(1)
             .growth(1)
@@ -2067,13 +2066,13 @@ mod tests {
             view.cosine_at_least(a, b, 0.8),
         );
         assert!(Query::new(bad, project_pair)
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .solve_residual_state_lazy()
             .next()
             .is_none());
 
         let repeated = triblespace_core::and!(a.is(handles[0]), view.cosine_at_least(a, a, 1.01),);
         assert!(Query::new(repeated, project_first)
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .solve_residual_state_lazy()
             .next()
             .is_none());
     }

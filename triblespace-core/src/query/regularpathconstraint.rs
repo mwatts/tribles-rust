@@ -14,8 +14,6 @@ use crate::patch::PATCHBoundedInfixes;
 use crate::query::confirm_per_row;
 use crate::query::intersectionconstraint::IntersectionConstraint;
 use crate::query::residual::FrameSeedRow;
-#[cfg(test)]
-use crate::query::residual::ResidualLowering;
 use crate::query::residual::SeededResidualFrame;
 use crate::query::CandidateSink;
 use crate::query::Constraint;
@@ -4837,7 +4835,7 @@ mod seeded_frame_tests {
             IntersectionConstraint::new(constraints),
             move |binding: &Binding| binding.get(dest.index).copied(),
         )
-        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+        .solve_residual_state_lazy()
         .collect()
     }
 
@@ -4856,7 +4854,7 @@ mod seeded_frame_tests {
             IntersectionConstraint::new(constraints),
             move |binding: &Binding| binding.get(dest.index).copied(),
         )
-        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+        .solve_residual_state_lazy()
         .any(|value| value == target)
     }
 
@@ -4872,7 +4870,7 @@ mod seeded_frame_tests {
             IntersectionConstraint::new(constraints),
             move |binding: &Binding| binding.get(start.index).copied(),
         )
-        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+        .solve_residual_state_lazy()
         .collect()
     }
 

@@ -145,9 +145,8 @@ An expansion still performs the familiar Atreides negotiation:
    variable agrees; no row is reassigned to an estimate-similar variable.
 4. For each group, propose that variable. An intersection chooses its tightest
    child per row and runs the remaining children as explicit confirmation
-   actions. Production lowering represents finite unions as formula
-   alternatives; conservative lowering keeps a union as one protocol leaf
-   which evaluates and merges its still-satisfied alternatives.
+   actions. Finite unions become formula alternatives in the same residual
+   machine.
 5. Extend the parent rows with the surviving `(row, value)` pairs. Rows without
    candidates disappear.
 
@@ -159,22 +158,19 @@ the machine can descend before harvesting wider sibling cohorts.
 ## Canonical residual-state machine
 
 The residual engine keys a bucket by its **remaining computation**, not merely
-by the bindings or the route that produced it. Its compiler recursively
-flattens the maximal associative AND region exposed at the root into
-deterministic preorder leaf occurrences. Production lowering also admits
-finite Union formula structure. Regular-path and custom constraints remain
-opaque leaves unless a capability explicitly exposes more structure, so
-lowering never crosses an undeclared semantic boundary.
+by the bindings or the route that produced it. Its single compiler recursively
+flattens exposed associative AND regions into deterministic preorder leaf
+occurrences and represents finite Union leaves as formula structure.
+Regular-path and custom constraints remain opaque leaves unless a capability
+explicitly exposes more structure, so lowering never crosses an undeclared
+semantic boundary.
 
-Every live ordinary root runs as one finite formula after variable selection.
-Exposed AND/OR progress then becomes canonical formula state, and eligible
-cyclic regular paths run through the delta submachine. `ProgramScope` is an
-orthogonal three-level policy: `Disabled` admits no typed Programs,
-`Production` admits production-qualified routes, and `All` also admits
-explicit routes. A structurally absent route and a route deferred by policy
-both use the stable ordinary `Constraint` action; neither strengthens an
-ordinary proposal receipt. The formula and Program scope chains therefore form
-nine structural lowering combinations.
+Exposed Union progress becomes canonical formula state, and eligible cyclic
+regular paths run through the delta submachine. Production-qualified typed
+Programs enter that same scheduler; a structurally absent or explicitly
+non-production route uses the stable ordinary `Constraint` action and cannot
+strengthen its proposal receipt. This is one structural plan, not a public
+matrix of compiler policies.
 
 Each canonical descriptor includes the bound-variable schema and one of four
 phases:
@@ -287,9 +283,8 @@ cursor for every root. Its compiler policy is fixed: native AND flattening,
 finite Union-leaf continuations, and production-qualified Programs.
 `solve_residual_state_lazy` uses the same production plan while exposing width
 controls and `collect_profiled` reports state, merge, action, and batch
-measurements; `solve_residual_state_lazy_with` remains an explicit compiler
-probe. A full drain preserves the distinct raw projected-row set, but may
-change result order. Fully-bound rows remain raw until the consumer pulls
+measurements. A full drain preserves the distinct raw projected-row set, but
+may change result order. Fully-bound rows remain raw until the consumer pulls
 them, so the worklist never stores projected `R`s and a partially consumed
 query can snapshot its exact remainder without requiring `R: Clone`.
 
@@ -357,9 +352,7 @@ reuse, and a live Formula OR frame retains its private payload. Every shard
 retains canonical state merging locally; state is moved rather than
 duplicated, and the constraint/postprocessor pair is cloned only when a real
 sibling shard is created. Both ordinary and saturated parallel entry points
-use the same fixed production plan as serial `Query`; compiler-policy
-experiments construct a `ResidualStateIter` explicitly with
-`solve_residual_state_lazy_with`.
+use the same fixed production plan as serial `Query`.
 
 ### Opt-in residual action observation
 

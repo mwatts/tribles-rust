@@ -216,7 +216,6 @@ mod tests {
     use crate::inline::RawInline;
     use crate::prelude::inlineencodings::R256BE;
     use crate::prelude::*;
-    use crate::query::residual::ResidualLowering;
     use crate::query::Binding;
     use crate::query::CandidateSink;
     use crate::query::Constraint;
@@ -341,7 +340,7 @@ mod tests {
             ),
             move |binding| project(variable.index, binding),
         )
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1)
         .collect();
@@ -447,7 +446,7 @@ mod tests {
         let mut query = Query::new(data.value_in_range(variable, v10, v90), move |binding| {
             project(variable.index, binding)
         })
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1);
         let mut actual: Vec<_> = query.by_ref().collect();
@@ -460,7 +459,7 @@ mod tests {
         let mut first_only = Query::new(data.value_in_range(variable, v10, v90), move |binding| {
             project(variable.index, binding)
         })
-        .solve_residual_state_lazy_with(ResidualLowering::FULL)
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1);
         assert_eq!(first_only.next(), Some(v10.raw));
@@ -531,7 +530,7 @@ mod tests {
         );
         let mut actual: Vec<_> =
             Query::new(constraint, move |binding| project(value.index, binding))
-                .solve_residual_state_lazy_with(ResidualLowering::FULL)
+                .solve_residual_state_lazy()
                 .cap(1)
                 .start_width(1)
                 .collect();
@@ -543,7 +542,7 @@ mod tests {
                 Query::new(set.value_in_range(value, v10, v90), move |binding| {
                     project(value.index, binding)
                 })
-                .solve_residual_state_lazy_with(ResidualLowering::FULL)
+                .solve_residual_state_lazy()
                 .cap(1)
                 .start_width(1)
                 .collect();

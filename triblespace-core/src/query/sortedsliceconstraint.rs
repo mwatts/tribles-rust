@@ -441,7 +441,6 @@ mod tests {
     use super::*;
     use crate::inline::encodings::UnknownInline;
     use crate::inline::Encodes;
-    use crate::query::residual::ResidualLowering;
 
     #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
     struct ReverseRaw(u8);
@@ -505,7 +504,7 @@ mod tests {
         assert_eq!(second.next, Some(ResidualDeltaSourceCursor::Offset(3)));
 
         let mut query = Query::new(SortedSliceConstraint::new(variable, slice), project)
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .solve_residual_state_lazy()
             .cap(1)
             .start_width(1);
         let mut actual: Vec<_> = query.by_ref().collect();
@@ -529,7 +528,7 @@ mod tests {
                 SortedSliceConstraint::new(variable, SortedSlice::new(values).unwrap()),
                 project,
             )
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .solve_residual_state_lazy()
             .cap(1)
             .start_width(1)
         };
@@ -568,7 +567,7 @@ mod tests {
         assert!(encoded.windows(2).all(|pair| pair[0] > pair[1]));
 
         let mut query = Query::new(SortedSliceConstraint::new(variable, slice), project)
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .solve_residual_state_lazy()
             .cap(1)
             .start_width(1);
         let mut actual: Vec<_> = query.by_ref().collect();
@@ -595,7 +594,7 @@ mod tests {
         };
 
         let mut query = Query::new(make(), project)
-            .solve_residual_state_lazy_with(ResidualLowering::FULL)
+            .solve_residual_state_lazy()
             .cap(1)
             .start_width(1);
         let mut actual: Vec<_> = query.by_ref().collect();

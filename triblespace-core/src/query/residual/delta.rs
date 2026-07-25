@@ -8057,7 +8057,7 @@ mod tests {
     #[test]
     fn parked_positive_support_releases_its_lease_while_exact_remains_runnable() {
         let root = OneShotSupportProgram;
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let plan = ResidualPlan::compile_whole_root_for_test(&root);
         let mut scheduler = DeltaScheduler::new();
         let candidate = value(6);
         let (parent_activation, parent, exact_credit, initial) =
@@ -8117,7 +8117,7 @@ mod tests {
     #[test]
     fn parked_positive_support_survives_deep_clone_with_rebranded_credit() {
         let root = OneShotSupportProgram;
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let plan = ResidualPlan::compile_whole_root_for_test(&root);
         let mut scheduler = DeltaScheduler::new();
         let candidate = value(7);
         let (parent_activation, parent, exact_credit, initial) =
@@ -8361,7 +8361,7 @@ mod tests {
     #[test]
     fn exact_credit_wakes_support_and_releases_the_directed_exact_lease() {
         let root = OneShotSupportProgram;
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let plan = ResidualPlan::compile_whole_root_for_test(&root);
         let mut scheduler = DeltaScheduler::new();
         let candidate = value(41);
         let (parent_activation, parent, exact_credit, _) =
@@ -8448,7 +8448,7 @@ mod tests {
     #[test]
     fn same_batch_exact_win_cancels_support_instead_of_waking_refunded_credit() {
         let root = OneShotSupportProgram;
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let plan = ResidualPlan::compile_whole_root_for_test(&root);
         let mut scheduler = DeltaScheduler::new();
         let candidate = value(42);
         let (parent_activation, parent, exact_credit, _) =
@@ -8514,7 +8514,7 @@ mod tests {
     #[test]
     fn exact_negative_quiescence_retires_the_started_support_budget() {
         let root = OneShotSupportProgram;
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let plan = ResidualPlan::compile_whole_root_for_test(&root);
         let mut scheduler = DeltaScheduler::new();
         let candidate = value(44);
         let (parent_activation, parent, exact_credit, _) =
@@ -8596,7 +8596,7 @@ mod tests {
     #[test]
     fn natural_support_miss_retires_refunded_allowance() {
         let root = OneShotSupportProgram;
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let plan = ResidualPlan::compile_whole_root_for_test(&root);
         let mut scheduler = DeltaScheduler::new();
         let candidate = value(43);
         let (parent_activation, parent, _exact_credit, _) =
@@ -8661,7 +8661,7 @@ mod tests {
         let mut query = Query::new(ZeroProgressProgram, |binding: &crate::query::Binding| {
             binding.get(0).copied()
         })
-        .solve_residual_state_lazy_with(ResidualLowering::FULL);
+        .solve_residual_state_lazy();
         let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| query.next()));
         let payload = rejected.expect_err("zero-cost recurrence must fail closed");
         let message = payload
@@ -8951,7 +8951,7 @@ mod tests {
                 mode,
                 calls: Arc::new(AtomicUsize::new(0)),
             };
-            let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+            let plan = ResidualPlan::compile_whole_root_for_test(&root);
             let mut scheduler = DeltaScheduler::new();
             let request = ProgramRequest {
                 action: ProgramAction::Propose(0),
@@ -9958,7 +9958,7 @@ mod tests {
     #[test]
     fn formula_or_admission_is_pageable_duplicate_safe_and_clone_independent() {
         let root = MixedExpansion;
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let plan = ResidualPlan::compile_whole_root_for_test(&root);
         let mut scheduler = DeltaScheduler::new();
         let mut stable = Worklist::new();
         let mut stable_interner = StateInterner::default();
@@ -10046,7 +10046,7 @@ mod tests {
     #[test]
     fn formula_or_emission_moves_grant_sized_ordered_pages_without_graph_telemetry() {
         let root = MixedExpansion;
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let plan = ResidualPlan::compile_whole_root_for_test(&root);
         let mut scheduler = DeltaScheduler::new();
         let mut stable = Worklist::new();
         let mut stable_interner = StateInterner::default();
@@ -10161,7 +10161,7 @@ mod tests {
     #[test]
     fn proposal_materializer_drains_typed_and_direct_occurrences_without_graph_telemetry() {
         let root = MixedExpansion;
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let plan = ResidualPlan::compile_whole_root_for_test(&root);
         let mut scheduler = DeltaScheduler::new();
         let activation = scheduler.registry.open_program_activation(
             DeltaReducer::quiescent_proposal(),
@@ -10343,7 +10343,7 @@ mod tests {
     #[test]
     fn proposal_materializer_eof_retargets_nested_formula_into_or_admission() {
         let root = UnionConstraint::new(vec![MixedExpansion]);
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let plan = ResidualPlan::compile_whole_root_for_test(&root);
         let formula_root = plan
             .finite_formula
             .root(0)
@@ -10470,7 +10470,7 @@ mod tests {
         // admission complete its child and discover the empty root emission.
         // Neither zero-rank reducer may manufacture a sentinel Program task.
         let root = UnionConstraint::new(vec![MixedExpansion]);
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let plan = ResidualPlan::compile_whole_root_for_test(&root);
         let formula_root = plan
             .finite_formula
             .root(0)
@@ -10539,7 +10539,7 @@ mod tests {
             ) as AnyConstraint,
             Box::new(OneShotSupportProgram) as AnyConstraint,
         ]);
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let plan = ResidualPlan::compile_whole_root_for_test(&root);
         let formula_root = plan
             .finite_formula
             .root(0)
@@ -10683,7 +10683,7 @@ mod tests {
     #[test]
     fn positive_support_first_success_discards_its_queued_continuation_affinely() {
         let root = OneShotSupportProgram;
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let plan = ResidualPlan::compile_whole_root_for_test(&root);
         let mut scheduler = DeltaScheduler::new();
         let candidate = value(6);
         let (_parent_activation, parent, _exact_credit, initial) =
@@ -10748,7 +10748,7 @@ mod tests {
     #[test]
     fn exact_quiescence_retires_queued_support_but_preserves_exact_finalization() {
         let root = OneShotSupportProgram;
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let plan = ResidualPlan::compile_whole_root_for_test(&root);
         let mut scheduler = DeltaScheduler::new();
         let candidate = value(5);
         let (parent_activation, parent, exact_credit, initial) =
@@ -10813,7 +10813,7 @@ mod tests {
     #[test]
     fn exact_positive_win_retires_queued_support_without_cancelling_exact() {
         let root = OneShotSupportProgram;
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let plan = ResidualPlan::compile_whole_root_for_test(&root);
         let mut scheduler = DeltaScheduler::new();
         let candidate = value(4);
         let (parent_activation, parent, exact_credit, initial) =
@@ -13968,7 +13968,7 @@ mod tests {
             novelty_drops: Arc::clone(&novelty_drops),
             physical: false,
         };
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let plan = ResidualPlan::compile_whole_root_for_test(&root);
         let relevant = ChildSet::empty(plan.len()).with_inserted(0);
         let successor = StateDesc {
             bound: VariableSet::new_empty(),
@@ -14191,7 +14191,7 @@ mod tests {
     #[test]
     fn stable_confirm_finalizer_pages_occurrences_without_graph_telemetry() {
         let root = MixedExpansion;
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let plan = ResidualPlan::compile_whole_root_for_test(&root);
         let a = value(1);
         let b = value(2);
         let rejected = value(9);
@@ -14480,7 +14480,7 @@ mod tests {
         assert!(!empty.registry.is_live(empty_activation));
 
         let root = MixedExpansion;
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let plan = ResidualPlan::compile_whole_root_for_test(&root);
         let mut rejected = DeltaScheduler::new();
         let rejected_activation = rejected.registry.open_program_activation(
             DeltaReducer::Confirm {
@@ -14634,7 +14634,7 @@ mod tests {
             novelty_drops,
             physical: false,
         };
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let plan = ResidualPlan::compile_whole_root_for_test(&root);
         let relevant = ChildSet::empty(plan.len()).with_inserted(0);
         let successor = StateDesc {
             bound: VariableSet::new_empty(),
@@ -14731,7 +14731,7 @@ mod tests {
             novelty_drops,
             physical: true,
         };
-        let plan = ResidualPlan::compile_lowering(&root, ResidualLowering::FULL);
+        let plan = ResidualPlan::compile_whole_root_for_test(&root);
         let relevant = ChildSet::empty(plan.len()).with_inserted(0);
         let successor = StateDesc {
             bound: VariableSet::new_empty(),

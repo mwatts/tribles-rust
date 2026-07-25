@@ -13,7 +13,6 @@ use std::sync::{Arc, Mutex};
 use rayon::prelude::*;
 use triblespace_core::inline::RawInline;
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
-use triblespace_core::query::residual::ResidualLowering;
 use triblespace_core::query::{
     Binding, CandidateSink, Constraint, EstimateSink, ProposalCoverage, Query, RowsView,
     VariableId, VariableSet,
@@ -210,7 +209,7 @@ fn project(binding: &Binding) -> Option<(RawInline, RawInline)> {
 fn run(width: usize) -> (BTreeSet<(RawInline, RawInline)>, Vec<Vec<RawInline>>) {
     let (root, pages) = fixture();
     let profiled = Query::new(root, project)
-        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+        .solve_residual_state_lazy()
         .cap(width)
         .start_width(width)
         .growth(1)
@@ -268,7 +267,7 @@ fn ordinary_paging_set_admits_then_reaches_the_exact_raw_relation() {
 fn parallel_affine_partitioning_preserves_the_weak_refinement_set() {
     let (root, _) = fixture();
     let actual: BTreeSet<_> = Query::new(root, project)
-        .solve_residual_state_lazy_with(ResidualLowering::CONSERVATIVE)
+        .solve_residual_state_lazy()
         .cap(1)
         .start_width(1)
         .growth(1)

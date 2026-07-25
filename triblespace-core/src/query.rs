@@ -1632,9 +1632,7 @@ pub trait Constraint<'a> {
 
     /// Exposes the finite arms of an otherwise opaque logical union.
     ///
-    /// [`residual::FormulaScope::OpaqueLeaves`] deliberately ignores this
-    /// capability, so a union retains its existing indivisible [`Constraint`]
-    /// semantics. `UnionLeaves` and `WholeRoot` expose it to canonical formula
+    /// The production compiler exposes this capability to canonical formula
     /// control. The child count and order are structural facts and must remain
     /// stable for the solve.
     #[doc(hidden)]
@@ -1664,9 +1662,8 @@ pub trait Constraint<'a> {
     /// covering seeds but publishes only witnessed endpoints from its typed
     /// fixpoint. The receipt is consulted only after
     /// [`Self::residual_program`] accepts the exact `Propose(variable)` request
-    /// and the selected [`residual::ProgramScope`] admits that route. It must
-    /// be structural in `bound` and identical across typed CPU and physical
-    /// execution.
+    /// with a production-qualified route. It must be structural in `bound` and
+    /// identical across typed CPU and physical execution.
     #[doc(hidden)]
     fn residual_program_proposal_coverage(
         &self,
@@ -3310,13 +3307,13 @@ mod tests {
             expected.sort_unstable();
 
             let mut residual_narrow: Vec<_> = variable_order_bag_query(tie_children)
-                .solve_residual_state_lazy_with(residual::ResidualLowering::FULL)
+                .solve_residual_state_lazy()
                 .cap(1)
                 .start_width(1)
                 .growth(1)
                 .collect();
             let mut residual_wide: Vec<_> = variable_order_bag_query(tie_children)
-                .solve_residual_state_lazy_with(residual::ResidualLowering::FULL)
+                .solve_residual_state_lazy()
                 .cap(8)
                 .start_width(8)
                 .growth(1)
