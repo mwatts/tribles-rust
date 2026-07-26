@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 
@@ -8,6 +9,8 @@ use crate::id::id_into_value;
 use crate::id::RawId;
 use crate::id::ID_LEN;
 use crate::inline::encodings::genid::GenId;
+use crate::inline::encodings::UnknownInline;
+use crate::inline::Inline;
 use crate::inline::IntoInline;
 use crate::inline::RawInline;
 use crate::patch::PATCHBoundedInfixes;
@@ -156,12 +159,15 @@ impl PathExpr {
 
     /// Build constraints for this expression, returning the destination variable.
     /// Allocates fresh variables from `ctx` and pushes constraints.
-    fn build_constraint(
+    /// Generic over the pattern source: `TribleSet` constraints own their
+    /// (cheaply cloned) indexes, while archive constraints borrow the
+    /// source for `'s`.
+    fn build_constraint<'s, S: TriblePattern>(
         &self,
-        set: &TribleSet,
+        set: &'s S,
         ctx: &mut VariableContext,
         start: Variable<GenId>,
-        constraints: &mut Vec<Box<dyn Constraint<'static> + 'static>>,
+        constraints: &mut Vec<Box<dyn Constraint<'s> + 's>>,
     ) -> Variable<GenId> {
         match self {
             PathExpr::Attr(attr_id) => {
@@ -287,18 +293,18 @@ fn distribute_concat(l: PathExpr, r: PathExpr) -> PathExpr {
 /// The start remains an ordinary local variable and is supplied through the
 /// frame's seed row. Unlike the historical nested-query helper, this does not
 /// manufacture a `ConstantConstraint` merely to import the caller value.
-fn build_chain_frame(
-    set: &TribleSet,
+fn build_chain_frame<'s, S: TriblePattern>(
+    set: &'s S,
     expr: &PathExpr,
     close_loop: bool,
 ) -> (
-    IntersectionConstraint<Box<dyn Constraint<'static>>>,
+    IntersectionConstraint<Box<dyn Constraint<'s> + 's>>,
     VariableId,
     VariableId,
 ) {
     let mut ctx = VariableContext::new();
     let start_var = ctx.next_variable::<GenId>();
-    let mut constraints: Vec<Box<dyn Constraint<'static> + 'static>> = Vec::new();
+    let mut constraints: Vec<Box<dyn Constraint<'s> + 's>> = Vec::new();
     let dest_var = expr.build_constraint(set, &mut ctx, start_var, &mut constraints);
     if close_loop {
         constraints.push(Box::new(
@@ -407,9 +413,9 @@ fn take_pageable_transition_pages() -> usize {
     PAGEABLE_TRANSITION_PAGES.with(|pages| pages.replace(0))
 }
 
-fn run_chain_frame<C, R>(root: C, seed: FrameSeedRow, mut reducer: R) -> R::Output
+fn run_chain_frame<'a, C, R>(root: C, seed: FrameSeedRow, mut reducer: R) -> R::Output
 where
-    C: Constraint<'static> + 'static,
+    C: Constraint<'a> + 'a,
     R: ChainFrameReducer,
 {
     #[cfg(test)]
@@ -422,6 +428,505 @@ where
         }
     }
     reducer.finish()
+}
+
+// ── Generic pattern sources ──────────────────────────────────────────────
+
+/// The data source a path constraint evaluates over.
+///
+/// `TribleSet` keeps its historical direct PATCH fast paths, including the
+/// typed residual transition program. Every other [`TriblePattern`] backend
+/// evaluates through the object-safe one-pattern surface below; those
+/// constraints decline `residual_program`, so the ordinary propose/confirm
+/// protocol carries them.
+enum PathSource {
+    Set(TribleSet),
+    Pattern(Box<dyn ErasedPathSource>),
+}
+
+impl PathSource {
+    /// Poor-man's specialization: recover the `TribleSet` fast path by
+    /// downcast instead of trait specialization, which stable Rust lacks.
+    fn from_pattern<T>(source: T) -> Self
+    where
+        T: TriblePattern + Send + Sync + 'static,
+    {
+        let mut slot = Some(source);
+        let any: &mut dyn Any = &mut slot;
+        match any.downcast_mut::<Option<TribleSet>>() {
+            Some(set) => PathSource::Set(set.take().expect("downcast slot holds the source")),
+            None => PathSource::Pattern(Box::new(
+                slot.take().expect("downcast slot holds the source"),
+            )),
+        }
+    }
+
+    /// Conservative whole-source size statistic for planning.
+    fn len_estimate(&self) -> usize {
+        match self {
+            PathSource::Set(set) => set.len(),
+            PathSource::Pattern(erased) => erased.len_estimate(),
+        }
+    }
+}
+
+/// Object-safe evaluation surface for path queries over a generic
+/// [`TriblePattern`] backend. Each method is a single-pattern query; the
+/// closure walkers and dispatch logic in this file compose them exactly like
+/// the direct PATCH scans they mirror on `TribleSet`.
+trait ErasedPathSource: Send + Sync {
+    fn hop_attr(&self, attr: &RawId, start: &RawInline) -> HashSet<RawInline>;
+    fn hop_attr_inverse(&self, attr: &RawId, start: &RawInline) -> HashSet<RawInline>;
+    fn hop_not_attr(&self, excluded: &RawId, start: &RawInline) -> HashSet<RawInline>;
+    fn hop_not_attr_inverse(&self, excluded: &RawId, start: &RawInline) -> HashSet<RawInline>;
+    fn eval_chain(&self, expr: &PathExpr, start: &RawInline) -> HashSet<RawInline>;
+    fn chain_reaches(&self, expr: &PathExpr, from: &RawInline, to: &RawInline) -> bool;
+    fn selfloop_join(&self, chain: &PathExpr) -> HashSet<RawInline>;
+    fn first_step_seeds(&self, steps: &[FirstStep]) -> HashSet<RawInline>;
+    fn can_take_first_step(&self, steps: &[FirstStep], term: &RawInline) -> bool;
+    fn is_graph_term(&self, term: &RawInline) -> bool;
+    fn all_terms(&self) -> Vec<RawInline>;
+    fn estimate_atom(&self, atom: BoundEstimateAtom, source: &RawInline) -> usize;
+    fn len_estimate(&self) -> usize;
+}
+
+/// Stops at the first binding.
+struct ExistsAny {
+    found: bool,
+}
+
+impl ExistsAny {
+    fn new() -> Self {
+        Self { found: false }
+    }
+}
+
+impl ChainFrameReducer for ExistsAny {
+    type Output = bool;
+
+    fn observe(&mut self, _binding: &crate::query::Binding) -> bool {
+        self.found = true;
+        false
+    }
+
+    fn finish(self) -> Self::Output {
+        self.found
+    }
+}
+
+/// Stops at the first binding whose `variable` differs from `excluded`.
+struct ExistsOtherThan {
+    variable: VariableId,
+    excluded: RawInline,
+    found: bool,
+}
+
+impl ExistsOtherThan {
+    fn new(variable: VariableId, excluded: RawInline) -> Self {
+        Self {
+            variable,
+            excluded,
+            found: false,
+        }
+    }
+}
+
+impl ChainFrameReducer for ExistsOtherThan {
+    type Output = bool;
+
+    fn observe(&mut self, binding: &crate::query::Binding) -> bool {
+        self.found = binding
+            .get(self.variable)
+            .is_some_and(|value| *value != self.excluded);
+        !self.found
+    }
+
+    fn finish(self) -> Self::Output {
+        self.found
+    }
+}
+
+/// Projects `project` for bindings whose `variable` differs from `excluded`.
+struct ProjectWhereOther {
+    variable: VariableId,
+    excluded: RawInline,
+    project: VariableId,
+    output: HashSet<RawInline>,
+}
+
+impl ProjectWhereOther {
+    fn new(variable: VariableId, excluded: RawInline, project: VariableId) -> Self {
+        Self {
+            variable,
+            excluded,
+            project,
+            output: HashSet::new(),
+        }
+    }
+}
+
+impl ChainFrameReducer for ProjectWhereOther {
+    type Output = HashSet<RawInline>;
+
+    fn observe(&mut self, binding: &crate::query::Binding) -> bool {
+        let other = binding
+            .get(self.variable)
+            .expect("residual frame omitted its filtered variable");
+        if *other != self.excluded {
+            self.output.insert(
+                *binding
+                    .get(self.project)
+                    .expect("residual frame omitted its projected variable"),
+            );
+        }
+        true
+    }
+
+    fn finish(self) -> Self::Output {
+        self.output
+    }
+}
+
+/// One-row single-pattern frame root shared by the erased-source methods.
+fn atom_frame<'s, C>(constraint: C) -> IntersectionConstraint<Box<dyn Constraint<'s> + 's>>
+where
+    C: Constraint<'s> + 's,
+{
+    IntersectionConstraint::new(vec![Box::new(constraint) as Box<dyn Constraint<'s> + 's>])
+}
+
+/// Estimate for the complete entity (`entities`) or value axis of a source.
+fn pattern_axis_estimate<T: TriblePattern>(source: &T, entities: bool) -> usize {
+    let mut ctx = VariableContext::new();
+    let e = ctx.next_variable::<GenId>();
+    let a = ctx.next_variable::<GenId>();
+    let v = ctx.next_variable::<UnknownInline>();
+    let variable = if entities { e.index } else { v.index };
+    let mut out = 0usize;
+    if source.pattern(e, a, v).estimate(
+        variable,
+        &RowsView::new_with_row_count(&[], &[], 1),
+        &mut EstimateSink::Scalar(&mut out),
+    ) {
+        out
+    } else {
+        0
+    }
+}
+
+impl<T> ErasedPathSource for T
+where
+    T: TriblePattern + Send + Sync + 'static,
+{
+    fn hop_attr(&self, attr: &RawId, start: &RawInline) -> HashSet<RawInline> {
+        if value_as_entity(start).is_none() {
+            return HashSet::new();
+        }
+        self.eval_chain(&PathExpr::Attr(*attr), start)
+    }
+
+    fn hop_attr_inverse(&self, attr: &RawId, start: &RawInline) -> HashSet<RawInline> {
+        self.eval_chain(&PathExpr::InverseAttr(*attr), start)
+    }
+
+    fn hop_not_attr(&self, excluded: &RawId, start: &RawInline) -> HashSet<RawInline> {
+        if value_as_entity(start).is_none() {
+            return HashSet::new();
+        }
+        let mut ctx = VariableContext::new();
+        let e = ctx.next_variable::<GenId>();
+        let a = ctx.next_variable::<GenId>();
+        let v = ctx.next_variable::<UnknownInline>();
+        run_chain_frame(
+            atom_frame(self.pattern(e, a, v)),
+            FrameSeedRow::one(e.index, *start),
+            ProjectWhereOther::new(a.index, id_into_value(excluded), v.index),
+        )
+    }
+
+    fn hop_not_attr_inverse(&self, excluded: &RawId, start: &RawInline) -> HashSet<RawInline> {
+        let mut ctx = VariableContext::new();
+        let e = ctx.next_variable::<GenId>();
+        let a = ctx.next_variable::<GenId>();
+        let v = ctx.next_variable::<UnknownInline>();
+        run_chain_frame(
+            atom_frame(self.pattern(e, a, v)),
+            FrameSeedRow::one(v.index, *start),
+            ProjectWhereOther::new(a.index, id_into_value(excluded), e.index),
+        )
+    }
+
+    fn eval_chain(&self, expr: &PathExpr, start: &RawInline) -> HashSet<RawInline> {
+        let (constraint, start_idx, dest_idx) = build_chain_frame(self, expr, false);
+        run_chain_frame(
+            constraint,
+            FrameSeedRow::one(start_idx, *start),
+            DistinctProject::new(dest_idx),
+        )
+    }
+
+    fn chain_reaches(&self, expr: &PathExpr, from: &RawInline, to: &RawInline) -> bool {
+        let (constraint, start_idx, dest_idx) = build_chain_frame(self, expr, false);
+        run_chain_frame(
+            constraint,
+            FrameSeedRow::one(start_idx, *from),
+            ExistsEq::new(dest_idx, *to),
+        )
+    }
+
+    fn selfloop_join(&self, chain: &PathExpr) -> HashSet<RawInline> {
+        let (constraint, start_idx, _) = build_chain_frame(self, chain, true);
+        run_chain_frame(
+            constraint,
+            FrameSeedRow::empty(),
+            DistinctProject::new(start_idx),
+        )
+    }
+
+    fn first_step_seeds(&self, steps: &[FirstStep]) -> HashSet<RawInline> {
+        let mut seeds: HashSet<RawInline> = HashSet::new();
+        for step in steps {
+            match step {
+                FirstStep::Fwd(attr) => {
+                    let mut ctx = VariableContext::new();
+                    let e = ctx.next_variable::<GenId>();
+                    let v = ctx.next_variable::<UnknownInline>();
+                    seeds.extend(run_chain_frame(
+                        atom_frame(self.pattern(e, attr.to_inline(), v)),
+                        FrameSeedRow::empty(),
+                        DistinctProject::new(e.index),
+                    ));
+                }
+                FirstStep::Inv(attr) => {
+                    let mut ctx = VariableContext::new();
+                    let e = ctx.next_variable::<GenId>();
+                    let v = ctx.next_variable::<UnknownInline>();
+                    seeds.extend(run_chain_frame(
+                        atom_frame(self.pattern(e, attr.to_inline(), v)),
+                        FrameSeedRow::empty(),
+                        DistinctProject::new(v.index),
+                    ));
+                }
+                FirstStep::NotFwd(_) | FirstStep::AnyFwd => {
+                    let mut ctx = VariableContext::new();
+                    let e = ctx.next_variable::<GenId>();
+                    let a = ctx.next_variable::<GenId>();
+                    let v = ctx.next_variable::<UnknownInline>();
+                    seeds.extend(run_chain_frame(
+                        atom_frame(self.pattern(e, a, v)),
+                        FrameSeedRow::empty(),
+                        DistinctProject::new(e.index),
+                    ));
+                }
+                FirstStep::NotInv(_) | FirstStep::AnyInv => {
+                    let mut ctx = VariableContext::new();
+                    let e = ctx.next_variable::<GenId>();
+                    let a = ctx.next_variable::<GenId>();
+                    let v = ctx.next_variable::<UnknownInline>();
+                    seeds.extend(run_chain_frame(
+                        atom_frame(self.pattern(e, a, v)),
+                        FrameSeedRow::empty(),
+                        DistinctProject::new(v.index),
+                    ));
+                }
+            }
+        }
+        seeds
+    }
+
+    fn can_take_first_step(&self, steps: &[FirstStep], term: &RawInline) -> bool {
+        for step in steps {
+            let matched = match step {
+                FirstStep::Fwd(attr) => {
+                    if value_as_entity(term).is_none() {
+                        false
+                    } else {
+                        let mut ctx = VariableContext::new();
+                        let v = ctx.next_variable::<UnknownInline>();
+                        run_chain_frame(
+                            atom_frame(self.pattern(
+                                Inline::<GenId>::new(*term),
+                                attr.to_inline(),
+                                v,
+                            )),
+                            FrameSeedRow::empty(),
+                            ExistsAny::new(),
+                        )
+                    }
+                }
+                FirstStep::Inv(attr) => {
+                    let mut ctx = VariableContext::new();
+                    let e = ctx.next_variable::<GenId>();
+                    run_chain_frame(
+                        atom_frame(self.pattern(
+                            e,
+                            attr.to_inline(),
+                            Inline::<UnknownInline>::new(*term),
+                        )),
+                        FrameSeedRow::empty(),
+                        ExistsAny::new(),
+                    )
+                }
+                FirstStep::NotFwd(excluded) => {
+                    if value_as_entity(term).is_none() {
+                        false
+                    } else {
+                        let mut ctx = VariableContext::new();
+                        let a = ctx.next_variable::<GenId>();
+                        let v = ctx.next_variable::<UnknownInline>();
+                        run_chain_frame(
+                            atom_frame(self.pattern(Inline::<GenId>::new(*term), a, v)),
+                            FrameSeedRow::empty(),
+                            ExistsOtherThan::new(a.index, id_into_value(excluded)),
+                        )
+                    }
+                }
+                FirstStep::NotInv(excluded) => {
+                    let mut ctx = VariableContext::new();
+                    let e = ctx.next_variable::<GenId>();
+                    let a = ctx.next_variable::<GenId>();
+                    run_chain_frame(
+                        atom_frame(self.pattern(e, a, Inline::<UnknownInline>::new(*term))),
+                        FrameSeedRow::empty(),
+                        ExistsOtherThan::new(a.index, id_into_value(excluded)),
+                    )
+                }
+                FirstStep::AnyFwd => {
+                    if value_as_entity(term).is_none() {
+                        false
+                    } else {
+                        let mut ctx = VariableContext::new();
+                        let a = ctx.next_variable::<GenId>();
+                        let v = ctx.next_variable::<UnknownInline>();
+                        run_chain_frame(
+                            atom_frame(self.pattern(Inline::<GenId>::new(*term), a, v)),
+                            FrameSeedRow::empty(),
+                            ExistsAny::new(),
+                        )
+                    }
+                }
+                FirstStep::AnyInv => {
+                    let mut ctx = VariableContext::new();
+                    let e = ctx.next_variable::<GenId>();
+                    let a = ctx.next_variable::<GenId>();
+                    run_chain_frame(
+                        atom_frame(self.pattern(e, a, Inline::<UnknownInline>::new(*term))),
+                        FrameSeedRow::empty(),
+                        ExistsAny::new(),
+                    )
+                }
+            };
+            if matched {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn is_graph_term(&self, term: &RawInline) -> bool {
+        self.can_take_first_step(&[FirstStep::AnyInv], term)
+            || self.can_take_first_step(&[FirstStep::AnyFwd], term)
+    }
+
+    fn all_terms(&self) -> Vec<RawInline> {
+        let mut ctx = VariableContext::new();
+        let e = ctx.next_variable::<GenId>();
+        let a = ctx.next_variable::<GenId>();
+        let v = ctx.next_variable::<UnknownInline>();
+        let mut terms = run_chain_frame(
+            atom_frame(self.pattern(e, a, v)),
+            FrameSeedRow::empty(),
+            DistinctProject::new(v.index),
+        );
+        let mut ctx = VariableContext::new();
+        let e = ctx.next_variable::<GenId>();
+        let a = ctx.next_variable::<GenId>();
+        let v = ctx.next_variable::<UnknownInline>();
+        terms.extend(run_chain_frame(
+            atom_frame(self.pattern(e, a, v)),
+            FrameSeedRow::empty(),
+            DistinctProject::new(e.index),
+        ));
+        terms.into_iter().collect()
+    }
+
+    fn estimate_atom(&self, atom: BoundEstimateAtom, source: &RawInline) -> usize {
+        let estimate_hop = |expr: &PathExpr| {
+            let (constraint, start_idx, dest_idx) = build_chain_frame(self, expr, false);
+            let row = [*source];
+            let mut out = 0usize;
+            if constraint.estimate(
+                dest_idx,
+                &RowsView::new(&[start_idx], &row),
+                &mut EstimateSink::Scalar(&mut out),
+            ) {
+                out
+            } else {
+                0
+            }
+        };
+        match atom {
+            BoundEstimateAtom::Local(DeltaStep::Attr(attribute)) => {
+                if value_as_entity(source).is_none() {
+                    return 0;
+                }
+                estimate_hop(&PathExpr::Attr(attribute))
+            }
+            BoundEstimateAtom::Local(DeltaStep::InverseAttr(attribute)) => {
+                estimate_hop(&PathExpr::InverseAttr(attribute))
+            }
+            BoundEstimateAtom::Local(DeltaStep::NotAttr(_)) => {
+                // No native "attribute ≠ x" statistic on the one-pattern
+                // surface; the all-attribute fanout is a cheap monotone
+                // overcount of the negated-attribute fanout.
+                if value_as_entity(source).is_none() {
+                    return 0;
+                }
+                let mut ctx = VariableContext::new();
+                let e = ctx.next_variable::<GenId>();
+                let a = ctx.next_variable::<GenId>();
+                let v = ctx.next_variable::<UnknownInline>();
+                let row = [*source];
+                let mut out = 0usize;
+                if self.pattern(e, a, v).estimate(
+                    v.index,
+                    &RowsView::new(&[e.index], &row),
+                    &mut EstimateSink::Scalar(&mut out),
+                ) {
+                    out
+                } else {
+                    0
+                }
+            }
+            BoundEstimateAtom::Local(DeltaStep::InverseNotAttr(_)) => {
+                let mut ctx = VariableContext::new();
+                let e = ctx.next_variable::<GenId>();
+                let a = ctx.next_variable::<GenId>();
+                let v = ctx.next_variable::<UnknownInline>();
+                let row = [*source];
+                let mut out = 0usize;
+                if self.pattern(e, a, v).estimate(
+                    e.index,
+                    &RowsView::new(&[v.index], &row),
+                    &mut EstimateSink::Scalar(&mut out),
+                ) {
+                    out
+                } else {
+                    0
+                }
+            }
+            BoundEstimateAtom::Global(BoundEstimateAxis::Values) => {
+                pattern_axis_estimate(self, false)
+            }
+            BoundEstimateAtom::Global(BoundEstimateAxis::Entities) => {
+                pattern_axis_estimate(self, true)
+            }
+        }
+    }
+
+    fn len_estimate(&self) -> usize {
+        pattern_axis_estimate(self, true).saturating_add(pattern_axis_estimate(self, false))
+    }
 }
 
 // ── Recursive path evaluator ─────────────────────────────────────────────
@@ -459,7 +964,11 @@ fn value_as_entity(value: &RawInline) -> Option<RawId> {
 /// overhead. Emits every destination value regardless of shape —
 /// paths may END at a literal (`?x p "lit"` is a SPARQL match); the
 /// closure walkers simply find no outgoing edges there.
-fn eval_attr(set: &TribleSet, attr: &RawId, start: &RawInline) -> HashSet<RawInline> {
+fn eval_attr(source: &PathSource, attr: &RawId, start: &RawInline) -> HashSet<RawInline> {
+    let set = match source {
+        PathSource::Set(set) => set,
+        PathSource::Pattern(erased) => return erased.hop_attr(attr, start),
+    };
     let mut results = HashSet::new();
     let Some(start_id) = value_as_entity(start) else {
         return results;
@@ -482,7 +991,11 @@ fn eval_attr(set: &TribleSet, attr: &RawId, start: &RawInline) -> HashSet<RawInl
 ///   2. For each surviving attribute, enumerate GenId-encoded
 ///      values via EAV prefix `[start, attr]` and collect their
 ///      id-portion as the destination.
-fn eval_not_attr(set: &TribleSet, excluded: &RawId, start: &RawInline) -> HashSet<RawInline> {
+fn eval_not_attr(source: &PathSource, excluded: &RawId, start: &RawInline) -> HashSet<RawInline> {
+    let set = match source {
+        PathSource::Set(set) => set,
+        PathSource::Pattern(erased) => return erased.hop_not_attr(excluded, start),
+    };
     let mut results = HashSet::new();
     let Some(start_id) = value_as_entity(start) else {
         return results;
@@ -517,10 +1030,14 @@ fn eval_not_attr(set: &TribleSet, excluded: &RawId, start: &RawInline) -> HashSe
 /// `[start_as_value]`, then enumerate entities per surviving
 /// attribute via `[start_as_value, attr]`.
 fn eval_not_attr_inverse(
-    set: &TribleSet,
+    source: &PathSource,
     excluded: &RawId,
     start: &RawInline,
 ) -> HashSet<RawInline> {
+    let set = match source {
+        PathSource::Set(set) => set,
+        PathSource::Pattern(erased) => return erased.hop_not_attr_inverse(excluded, start),
+    };
     // Inverse hops take the full 32-byte value directly — walking
     // backward from a literal is the same probe as from an entity.
     let mut results = HashSet::new();
@@ -547,7 +1064,11 @@ fn eval_not_attr_inverse(
 /// `s attr start` holds. Uses the VAE index (Inline, Attribute,
 /// Entity ordering) so the prefix `[start_as_value (32B), attr
 /// (16B)]` lands directly at the slice of matching entity bytes.
-fn eval_attr_inverse(set: &TribleSet, attr: &RawId, start: &RawInline) -> HashSet<RawInline> {
+fn eval_attr_inverse(source: &PathSource, attr: &RawId, start: &RawInline) -> HashSet<RawInline> {
+    let set = match source {
+        PathSource::Set(set) => set,
+        PathSource::Pattern(erased) => return erased.hop_attr_inverse(attr, start),
+    };
     let mut results = HashSet::new();
     let mut prefix = [0u8; 32 + ID_LEN];
     prefix[..32].copy_from_slice(start);
@@ -599,12 +1120,12 @@ fn has_repetition(expr: &PathExpr) -> bool {
     }
 }
 
-fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawInline) -> HashSet<RawInline> {
+fn eval_from(source: &PathSource, expr: &PathExpr, start: &RawInline) -> HashSet<RawInline> {
     match expr {
-        PathExpr::Attr(attr) => eval_attr(set, attr, start),
-        PathExpr::InverseAttr(attr) => eval_attr_inverse(set, attr, start),
-        PathExpr::NotAttr(excluded) => eval_not_attr(set, excluded, start),
-        PathExpr::InverseNotAttr(excluded) => eval_not_attr_inverse(set, excluded, start),
+        PathExpr::Attr(attr) => eval_attr(source, attr, start),
+        PathExpr::InverseAttr(attr) => eval_attr_inverse(source, attr, start),
+        PathExpr::NotAttr(excluded) => eval_not_attr(source, excluded, start),
+        PathExpr::InverseNotAttr(excluded) => eval_not_attr_inverse(source, excluded, start),
         PathExpr::Concat(lhs, rhs) => {
             if has_unbounded_closure(lhs) || has_unbounded_closure(rhs) {
                 // Per-mid fallback: eval lhs from start, then for
@@ -612,11 +1133,15 @@ fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawInline) -> HashSet<Raw
                 // build_constraint's `unreachable!()` arm for
                 // Plus/Star inside Concat.
                 let mut results = HashSet::new();
-                for mid in eval_from(set, lhs, start) {
-                    results.extend(eval_from(set, rhs, &mid));
+                for mid in eval_from(source, lhs, start) {
+                    results.extend(eval_from(source, rhs, &mid));
                 }
                 return results;
             }
+            let set = match source {
+                PathSource::Set(set) => set,
+                PathSource::Pattern(erased) => return erased.eval_chain(expr, start),
+            };
             let (constraint, start_idx, dest_idx) = build_chain_frame(set, expr, false);
             run_chain_frame(
                 constraint,
@@ -625,8 +1150,8 @@ fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawInline) -> HashSet<Raw
             )
         }
         PathExpr::Union(lhs, rhs) => {
-            let mut results = eval_from(set, lhs, start);
-            results.extend(eval_from(set, rhs, start));
+            let mut results = eval_from(source, lhs, start);
+            results.extend(eval_from(source, rhs, start));
             results
         }
         PathExpr::Plus(body) => {
@@ -637,7 +1162,7 @@ fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawInline) -> HashSet<Raw
             visited.insert(*start);
 
             while let Some(node) = frontier.pop_front() {
-                for dest in eval_from(set, body, &node) {
+                for dest in eval_from(source, body, &node) {
                     results.insert(dest);
                     if visited.insert(dest) {
                         frontier.push_back(dest);
@@ -647,36 +1172,40 @@ fn eval_from(set: &TribleSet, expr: &PathExpr, start: &RawInline) -> HashSet<Raw
             results
         }
         PathExpr::Star(body) => {
-            let mut results = eval_from(set, &PathExpr::Plus(body.clone()), start);
+            let mut results = eval_from(source, &PathExpr::Plus(body.clone()), start);
             results.insert(*start);
             results
         }
         PathExpr::Optional(body) => {
-            let mut results = eval_from(set, body, start);
+            let mut results = eval_from(source, body, start);
             results.insert(*start);
             results
         }
     }
 }
 
-fn has_path(set: &TribleSet, expr: &PathExpr, from: &RawInline, to: &RawInline) -> bool {
+fn has_path(source: &PathSource, expr: &PathExpr, from: &RawInline, to: &RawInline) -> bool {
     match expr {
-        PathExpr::Attr(attr) => eval_attr(set, attr, from).contains(to),
-        PathExpr::InverseAttr(attr) => eval_attr_inverse(set, attr, from).contains(to),
-        PathExpr::NotAttr(excluded) => eval_not_attr(set, excluded, from).contains(to),
+        PathExpr::Attr(attr) => eval_attr(source, attr, from).contains(to),
+        PathExpr::InverseAttr(attr) => eval_attr_inverse(source, attr, from).contains(to),
+        PathExpr::NotAttr(excluded) => eval_not_attr(source, excluded, from).contains(to),
         PathExpr::InverseNotAttr(excluded) => {
-            eval_not_attr_inverse(set, excluded, from).contains(to)
+            eval_not_attr_inverse(source, excluded, from).contains(to)
         }
         PathExpr::Concat(lhs, rhs) if has_unbounded_closure(lhs) || has_unbounded_closure(rhs) => {
             // Per-mid fallback (matches eval_from arm).
-            for mid in eval_from(set, lhs, from) {
-                if has_path(set, rhs, &mid, to) {
+            for mid in eval_from(source, lhs, from) {
+                if has_path(source, rhs, &mid, to) {
                     return true;
                 }
             }
             false
         }
         PathExpr::Concat(_, _) => {
+            let set = match source {
+                PathSource::Set(set) => set,
+                PathSource::Pattern(erased) => return erased.chain_reaches(expr, from, to),
+            };
             let (constraint, start_idx, dest_idx) = build_chain_frame(set, expr, false);
             run_chain_frame(
                 constraint,
@@ -684,7 +1213,9 @@ fn has_path(set: &TribleSet, expr: &PathExpr, from: &RawInline, to: &RawInline) 
                 ExistsEq::new(dest_idx, *to),
             )
         }
-        PathExpr::Union(lhs, rhs) => has_path(set, lhs, from, to) || has_path(set, rhs, from, to),
+        PathExpr::Union(lhs, rhs) => {
+            has_path(source, lhs, from, to) || has_path(source, rhs, from, to)
+        }
         PathExpr::Plus(body) => {
             let mut visited: HashSet<RawInline> = HashSet::new();
             let mut frontier: VecDeque<RawInline> = VecDeque::new();
@@ -692,7 +1223,7 @@ fn has_path(set: &TribleSet, expr: &PathExpr, from: &RawInline, to: &RawInline) 
             visited.insert(*from);
 
             while let Some(node) = frontier.pop_front() {
-                for dest in eval_from(set, body, &node) {
+                for dest in eval_from(source, body, &node) {
                     if dest == *to {
                         return true;
                     }
@@ -707,13 +1238,13 @@ fn has_path(set: &TribleSet, expr: &PathExpr, from: &RawInline, to: &RawInline) 
             if from == to {
                 return true;
             }
-            has_path(set, &PathExpr::Plus(body.clone()), from, to)
+            has_path(source, &PathExpr::Plus(body.clone()), from, to)
         }
         PathExpr::Optional(body) => {
             if from == to {
                 return true;
             }
-            has_path(set, body, from, to)
+            has_path(source, body, from, to)
         }
     }
 }
@@ -738,26 +1269,26 @@ const RPQ_ESTIMATE_DEPTH: usize = 5;
 /// practice path expressions rarely nest beyond one closure.
 #[cfg(test)]
 fn bounded_eval_from(
-    set: &TribleSet,
+    source: &PathSource,
     expr: &PathExpr,
     start: &RawInline,
     depth: usize,
 ) -> HashSet<RawInline> {
     match expr {
-        PathExpr::Attr(attr) => eval_attr(set, attr, start),
-        PathExpr::InverseAttr(attr) => eval_attr_inverse(set, attr, start),
-        PathExpr::NotAttr(excluded) => eval_not_attr(set, excluded, start),
-        PathExpr::InverseNotAttr(excluded) => eval_not_attr_inverse(set, excluded, start),
+        PathExpr::Attr(attr) => eval_attr(source, attr, start),
+        PathExpr::InverseAttr(attr) => eval_attr_inverse(source, attr, start),
+        PathExpr::NotAttr(excluded) => eval_not_attr(source, excluded, start),
+        PathExpr::InverseNotAttr(excluded) => eval_not_attr_inverse(source, excluded, start),
         PathExpr::Concat(lhs, rhs) => {
             let mut results = HashSet::new();
-            for mid in bounded_eval_from(set, lhs, start, depth) {
-                results.extend(bounded_eval_from(set, rhs, &mid, depth));
+            for mid in bounded_eval_from(source, lhs, start, depth) {
+                results.extend(bounded_eval_from(source, rhs, &mid, depth));
             }
             results
         }
         PathExpr::Union(lhs, rhs) => {
-            let mut results = bounded_eval_from(set, lhs, start, depth);
-            results.extend(bounded_eval_from(set, rhs, start, depth));
+            let mut results = bounded_eval_from(source, lhs, start, depth);
+            results.extend(bounded_eval_from(source, rhs, start, depth));
             results
         }
         PathExpr::Plus(body) => {
@@ -768,7 +1299,7 @@ fn bounded_eval_from(
             for _ in 0..depth {
                 let mut next: Vec<RawInline> = Vec::new();
                 for node in &frontier {
-                    for dest in bounded_eval_from(set, body, node, depth) {
+                    for dest in bounded_eval_from(source, body, node, depth) {
                         results.insert(dest);
                         if visited.insert(dest) {
                             next.push(dest);
@@ -783,12 +1314,13 @@ fn bounded_eval_from(
             results
         }
         PathExpr::Star(body) => {
-            let mut results = bounded_eval_from(set, &PathExpr::Plus(body.clone()), start, depth);
+            let mut results =
+                bounded_eval_from(source, &PathExpr::Plus(body.clone()), start, depth);
             results.insert(*start);
             results
         }
         PathExpr::Optional(body) => {
-            let mut results = bounded_eval_from(set, body, start, depth);
+            let mut results = bounded_eval_from(source, body, start, depth);
             results.insert(*start);
             results
         }
@@ -834,7 +1366,7 @@ fn estimate_from(set: &TribleSet, expr: &PathExpr, start: &RawInline) -> usize {
         // here scaled with the actual closure size, defeating the
         // purpose of having a cheap estimate.)
         _ if has_unbounded_closure(body) => {
-            bounded_eval_from(set, body, start, RPQ_ESTIMATE_DEPTH).len()
+            bounded_eval_from(&PathSource::Set(set.clone()), body, start, RPQ_ESTIMATE_DEPTH).len()
         }
         _ => {
             let (constraint, start_idx, dest_idx) = build_chain_frame(set, body, false);
@@ -1014,9 +1546,13 @@ fn compile_bound_estimate(expr: &PathExpr, out: &mut Vec<BoundEstimateAtom>) {
 /// expression — the valid starts of a non-nullable expression.
 /// Index-driven: one AEV (subjects-of-attr) or AVE (values-of-attr)
 /// segment scan per FIRST entry.
-fn first_step_seeds(set: &TribleSet, expr: &PathExpr) -> HashSet<RawInline> {
+fn first_step_seeds(source: &PathSource, expr: &PathExpr) -> HashSet<RawInline> {
     let mut steps = Vec::new();
     first_steps(expr, &mut steps);
+    let set = match source {
+        PathSource::Set(set) => set,
+        PathSource::Pattern(erased) => return erased.first_step_seeds(&steps),
+    };
     let mut seeds: HashSet<RawInline> = HashSet::new();
     for step in &steps {
         match step {
@@ -1050,7 +1586,11 @@ fn first_step_seeds(set: &TribleSet, expr: &PathExpr) -> HashSet<RawInline> {
 /// Cheap necessary condition for `∃ end: (term, end) ∈ expr` when the
 /// expression is not nullable: can `term` take some FIRST step? One
 /// PATCH prefix probe per FIRST entry.
-fn can_take_first_step(set: &TribleSet, steps: &[FirstStep], term: &RawInline) -> bool {
+fn can_take_first_step(source: &PathSource, steps: &[FirstStep], term: &RawInline) -> bool {
+    let set = match source {
+        PathSource::Set(set) => set,
+        PathSource::Pattern(erased) => return erased.can_take_first_step(steps, term),
+    };
     for step in steps {
         match step {
             FirstStep::Fwd(attr) => {
@@ -1197,14 +1737,18 @@ fn is_selfloop_joinable(expr: &PathExpr) -> bool {
 /// so e.g. `?x (P/P/P/P/P/P) ?x` over an acyclic predicate costs
 /// milliseconds — candidate filtering pays per-candidate join setup
 /// across millions of candidates for the same empty answer.
-fn eval_selfloop_join(set: &TribleSet, expr: &PathExpr) -> HashSet<RawInline> {
+fn eval_selfloop_join(source: &PathSource, expr: &PathExpr) -> HashSet<RawInline> {
     match expr {
         PathExpr::Union(l, r) => {
-            let mut out = eval_selfloop_join(set, l);
-            out.extend(eval_selfloop_join(set, r));
+            let mut out = eval_selfloop_join(source, l);
+            out.extend(eval_selfloop_join(source, r));
             out
         }
         chain => {
+            let set = match source {
+                PathSource::Set(set) => set,
+                PathSource::Pattern(erased) => return erased.selfloop_join(chain),
+            };
             let (constraint, start_idx, _) = build_chain_frame(set, chain, true);
             run_chain_frame(
                 constraint,
@@ -1226,7 +1770,11 @@ fn eval_selfloop_join(set: &TribleSet, expr: &PathExpr) -> HashSet<RawInline> {
 /// implicitly (their candidates come from `all_terms()`); the
 /// bound-endpoint cases use this probe so all dispatch cases agree
 /// on one relation regardless of which constraint proposes first.
-fn is_graph_term(set: &TribleSet, term: &RawInline) -> bool {
+fn is_graph_term(source: &PathSource, term: &RawInline) -> bool {
+    let set = match source {
+        PathSource::Set(set) => set,
+        PathSource::Pattern(erased) => return erased.is_graph_term(term),
+    };
     // Value of any trible: VEA layout leads with the full 32-byte
     // value — works uniformly for entity and literal shapes.
     if set.vea.has_prefix(term) {
@@ -1248,11 +1796,11 @@ fn is_graph_term(set: &TribleSet, term: &RawInline) -> bool {
 /// the ε-branch of `*`/`?` — a genuine cycle implies an outgoing
 /// edge, which implies graph membership — so gating the `from == to`
 /// case is exact.
-fn has_path_gated(set: &TribleSet, expr: &PathExpr, from: &RawInline, to: &RawInline) -> bool {
-    if from == to && !is_graph_term(set, from) {
+fn has_path_gated(source: &PathSource, expr: &PathExpr, from: &RawInline, to: &RawInline) -> bool {
+    if from == to && !is_graph_term(source, from) {
         return false;
     }
-    has_path(set, expr, from, to)
+    has_path(source, expr, from, to)
 }
 
 // ── Constraint ───────────────────────────────────────────────────────────
@@ -1295,7 +1843,7 @@ pub struct RegularPathConstraint {
     /// least fixpoint.
     delta_program: DeltaProgram,
     inverse_delta_program: DeltaProgram,
-    set: TribleSet,
+    source: PathSource,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1749,12 +2297,20 @@ impl RegularPathConstraint {
     /// literal values (SPARQL paths can: `?x p "lit"` is a match);
     /// `Inline<GenId>` remains the natural choice for entity-only
     /// projections.
-    pub fn new<S: crate::inline::InlineEncoding, E: crate::inline::InlineEncoding>(
-        set: TribleSet,
+    ///
+    /// The source may be any [`TriblePattern`] backend. `TribleSet`
+    /// keeps its direct index fast paths (including the typed residual
+    /// transition program); other backends evaluate every hop through
+    /// their one-pattern constraint surface.
+    pub fn new<S: crate::inline::InlineEncoding, E: crate::inline::InlineEncoding, T>(
+        source: T,
         start: Variable<S>,
         end: Variable<E>,
         ops: &[PathOp],
-    ) -> Self {
+    ) -> Self
+    where
+        T: TriblePattern + Send + Sync + 'static,
+    {
         let expr = PathExpr::from_postfix(ops);
         let inverse_expr = invert(expr.clone());
         let mut first = Vec::new();
@@ -1789,7 +2345,20 @@ impl RegularPathConstraint {
             inverse_nullable,
             delta_program,
             inverse_delta_program,
-            set,
+            source: PathSource::from_pattern(source),
+        }
+    }
+
+    /// The `TribleSet` behind the typed residual routes.
+    /// `residual_program` only offers those routes for TribleSet-backed
+    /// constraints, so the typed machinery can never observe an erased
+    /// pattern source.
+    fn tribleset(&self) -> &TribleSet {
+        match &self.source {
+            PathSource::Set(set) => set,
+            PathSource::Pattern(_) => {
+                unreachable!("typed RPQ routes require a TribleSet source")
+            }
         }
     }
 
@@ -1798,8 +2367,12 @@ impl RegularPathConstraint {
     /// all subjects, in canonical 32-byte value form. Only called
     /// when neither start nor end is bound.
     fn all_terms(&self) -> Vec<RawInline> {
+        let set = match &self.source {
+            PathSource::Set(set) => set,
+            PathSource::Pattern(erased) => return erased.all_terms(),
+        };
         let mut term_set: HashSet<RawInline> = HashSet::new();
-        for t in self.set.iter() {
+        for t in set.iter() {
             let v: RawInline = t.data[32..64].try_into().unwrap();
             term_set.insert(v);
             let e: RawId = t.data[..ID_LEN].try_into().unwrap();
@@ -1818,8 +2391,8 @@ impl RegularPathConstraint {
         if self.nullable {
             self.all_terms()
         } else {
-            let firsts = first_step_seeds(&self.set, &self.expr);
-            let lasts = first_step_seeds(&self.set, &self.inverse_expr);
+            let firsts = first_step_seeds(&self.source, &self.expr);
+            let lasts = first_step_seeds(&self.source, &self.inverse_expr);
             firsts.intersection(&lasts).copied().collect()
         }
     }
@@ -1837,10 +2410,10 @@ impl RegularPathConstraint {
 
     fn same_variable_source_is_exact(&self, source: &RawInline) -> bool {
         if self.nullable {
-            is_graph_term(&self.set, source)
+            is_graph_term(&self.source, source)
         } else {
-            can_take_first_step(&self.set, &self.first, source)
-                && can_take_first_step(&self.set, &self.inverse_first, source)
+            can_take_first_step(&self.source, &self.first, source)
+                && can_take_first_step(&self.source, &self.inverse_first, source)
         }
     }
 
@@ -1895,7 +2468,8 @@ impl RegularPathConstraint {
         let mut examined = 0usize;
         let mut current = after;
         while examined < limit {
-            let Some(source) = next_first_source(&self.set, source_steps, current.as_ref()) else {
+            let Some(source) = next_first_source(self.tribleset(), source_steps, current.as_ref())
+            else {
                 return RpqSourcePage {
                     next: None,
                     examined,
@@ -1904,15 +2478,15 @@ impl RegularPathConstraint {
             current = Some(source);
             examined += 1;
             if self.nullable
-                || (can_take_first_step(&self.set, &self.first, &source)
-                    && can_take_first_step(&self.set, &self.inverse_first, &source))
+                || (can_take_first_step(&self.source, &self.first, &source)
+                    && can_take_first_step(&self.source, &self.inverse_first, &source))
             {
                 roots.push(Self::same_variable_source_output(program, source));
             }
         }
         let last_examined = current.expect("a full positive page examined a source");
         RpqSourcePage {
-            next: next_first_source(&self.set, source_steps, Some(&last_examined))
+            next: next_first_source(self.tribleset(), source_steps, Some(&last_examined))
                 .map(|_| RpqSourceCursor::After(last_examined)),
             examined,
         }
@@ -1940,9 +2514,9 @@ impl RegularPathConstraint {
         };
         let exact = |source: &RawInline| {
             if nullable {
-                is_graph_term(&self.set, source)
+                is_graph_term(&self.source, source)
             } else {
-                can_take_first_step(&self.set, first, source)
+                can_take_first_step(&self.source, first, source)
             }
         };
         let after = match cursor {
@@ -1961,7 +2535,8 @@ impl RegularPathConstraint {
         let mut examined = 0usize;
         let mut current = after;
         while examined < limit {
-            let Some(source) = next_first_source(&self.set, source_steps, current.as_ref()) else {
+            let Some(source) = next_first_source(self.tribleset(), source_steps, current.as_ref())
+            else {
                 return RpqSourcePage {
                     next: None,
                     examined,
@@ -1975,7 +2550,7 @@ impl RegularPathConstraint {
         }
         let last_examined = current.expect("a full positive page examined a source");
         RpqSourcePage {
-            next: next_first_source(&self.set, source_steps, Some(&last_examined))
+            next: next_first_source(self.tribleset(), source_steps, Some(&last_examined))
                 .map(|_| RpqSourceCursor::After(last_examined)),
             examined,
         }
@@ -2014,7 +2589,7 @@ impl RegularPathConstraint {
         prefix[..ID_LEN].copy_from_slice(entity);
         prefix[ID_LEN..].copy_from_slice(value);
         let Some(first) =
-            self.set
+            self.tribleset()
                 .eva
                 .first_infix_range(&prefix, &[u8::MIN; ID_LEN], &[u8::MAX; ID_LEN])
         else {
@@ -2022,7 +2597,7 @@ impl RegularPathConstraint {
         };
         first != *excluded
             || self
-                .set
+                .tribleset()
                 .eva
                 .next_infix_after(&prefix, excluded, &[u8::MAX; ID_LEN])
                 .is_some()
@@ -2033,7 +2608,7 @@ impl RegularPathConstraint {
         prefix[..32].copy_from_slice(value);
         prefix[32..].copy_from_slice(entity);
         let Some(first) =
-            self.set
+            self.tribleset()
                 .vea
                 .first_infix_range(&prefix, &[u8::MIN; ID_LEN], &[u8::MAX; ID_LEN])
         else {
@@ -2041,7 +2616,7 @@ impl RegularPathConstraint {
         };
         first != *excluded
             || self
-                .set
+                .tribleset()
                 .vea
                 .next_infix_after(&prefix, excluded, &[u8::MAX; ID_LEN])
                 .is_some()
@@ -2069,11 +2644,11 @@ impl RegularPathConstraint {
                 prefix[ID_LEN..].copy_from_slice(&attribute);
                 let value = match after {
                     None => self
-                        .set
+                        .tribleset()
                         .eav
                         .first_infix_range(&prefix, &[u8::MIN; 32], &[u8::MAX; 32]),
                     Some(value) => self
-                        .set
+                        .tribleset()
                         .eav
                         .next_infix_after(&prefix, value, &[u8::MAX; 32]),
                 }?;
@@ -2084,14 +2659,14 @@ impl RegularPathConstraint {
                 prefix[..32].copy_from_slice(source);
                 prefix[32..].copy_from_slice(&attribute);
                 let entity = match after {
-                    None => self.set.vae.first_infix_range(
+                    None => self.tribleset().vae.first_infix_range(
                         &prefix,
                         &[u8::MIN; ID_LEN],
                         &[u8::MAX; ID_LEN],
                     ),
                     Some(value) => {
                         let entity = value_as_entity(value)?;
-                        self.set
+                        self.tribleset()
                             .vae
                             .next_infix_after(&prefix, &entity, &[u8::MAX; ID_LEN])
                     }
@@ -2102,11 +2677,11 @@ impl RegularPathConstraint {
                 let entity = value_as_entity(source)?;
                 let value = match after {
                     None => self
-                        .set
+                        .tribleset()
                         .eva
                         .first_infix_range(&entity, &[u8::MIN; 32], &[u8::MAX; 32]),
                     Some(value) => self
-                        .set
+                        .tribleset()
                         .eva
                         .next_infix_after(&entity, value, &[u8::MAX; 32]),
                 }?;
@@ -2114,14 +2689,14 @@ impl RegularPathConstraint {
             }
             DeltaStep::InverseNotAttr(_) => {
                 let entity = match after {
-                    None => self.set.vea.first_infix_range(
+                    None => self.tribleset().vea.first_infix_range(
                         source,
                         &[u8::MIN; ID_LEN],
                         &[u8::MAX; ID_LEN],
                     ),
                     Some(value) => {
                         let entity = value_as_entity(value)?;
-                        self.set
+                        self.tribleset()
                             .vea
                             .next_infix_after(source, &entity, &[u8::MAX; ID_LEN])
                     }
@@ -2149,7 +2724,7 @@ impl RegularPathConstraint {
                 let mut prefix = [0u8; ID_LEN * 2];
                 prefix[..ID_LEN].copy_from_slice(&entity);
                 prefix[ID_LEN..].copy_from_slice(&attribute);
-                self.set
+                self.tribleset()
                     .eav
                     .bounded_infixes(&prefix, limit)
                     .map(PositiveDeltaInfixes::Attr)
@@ -2158,7 +2733,7 @@ impl RegularPathConstraint {
                 let mut prefix = [0u8; 32 + ID_LEN];
                 prefix[..32].copy_from_slice(source);
                 prefix[32..].copy_from_slice(&attribute);
-                self.set
+                self.tribleset()
                     .vae
                     .bounded_infixes(&prefix, limit)
                     .map(PositiveDeltaInfixes::InverseAttr)
@@ -2299,7 +2874,7 @@ impl RegularPathConstraint {
 
         seen.insert((root.value, root.pc));
         pending.push_back(root);
-        if program.accepting[program.start as usize] && is_graph_term(&self.set, &source) {
+        if program.accepting[program.start as usize] && is_graph_term(&self.source, &source) {
             if budget.raw_occurrences == 0 {
                 return None;
             }
@@ -2379,6 +2954,10 @@ impl RegularPathConstraint {
 impl RegularPathConstraint {
     /// Evaluates one precompiled bound-endpoint statistic.
     fn estimate_atom(&self, atom: BoundEstimateAtom, source: &RawInline) -> usize {
+        let set = match &self.source {
+            PathSource::Set(set) => set,
+            PathSource::Pattern(erased) => return erased.estimate_atom(atom, source),
+        };
         match atom {
             BoundEstimateAtom::Local(DeltaStep::Attr(attribute)) => {
                 let Some(entity) = value_as_entity(source) else {
@@ -2387,21 +2966,20 @@ impl RegularPathConstraint {
                 let mut prefix = [0u8; ID_LEN * 2];
                 prefix[..ID_LEN].copy_from_slice(&entity);
                 prefix[ID_LEN..].copy_from_slice(&attribute);
-                self.set.eav.segmented_len(&prefix) as usize
+                set.eav.segmented_len(&prefix) as usize
             }
             BoundEstimateAtom::Local(DeltaStep::InverseAttr(attribute)) => {
                 let mut prefix = [0u8; 32 + ID_LEN];
                 prefix[..32].copy_from_slice(source);
                 prefix[32..].copy_from_slice(&attribute);
-                self.set.vae.segmented_len(&prefix) as usize
+                set.vae.segmented_len(&prefix) as usize
             }
             BoundEstimateAtom::Local(DeltaStep::NotAttr(excluded)) => {
                 let Some(entity) = value_as_entity(source) else {
                     return 0;
                 };
                 let mut count = 0usize;
-                self.set
-                    .eva
+                set.eva
                     .infixes::<ID_LEN, 32, _>(&entity, |value: &[u8; 32]| {
                         count += usize::from(self.has_forward_not_attr(&entity, value, &excluded));
                     });
@@ -2409,18 +2987,17 @@ impl RegularPathConstraint {
             }
             BoundEstimateAtom::Local(DeltaStep::InverseNotAttr(excluded)) => {
                 let mut count = 0usize;
-                self.set
-                    .vea
+                set.vea
                     .infixes::<32, ID_LEN, _>(source, |entity: &[u8; ID_LEN]| {
                         count += usize::from(self.has_inverse_not_attr(source, entity, &excluded));
                     });
                 count
             }
             BoundEstimateAtom::Global(BoundEstimateAxis::Values) => {
-                self.set.vea.segmented_len(&[]) as usize
+                set.vea.segmented_len(&[]) as usize
             }
             BoundEstimateAtom::Global(BoundEstimateAxis::Entities) => {
-                self.set.eav.segmented_len(&[]) as usize
+                set.eav.segmented_len(&[]) as usize
             }
         }
     }
@@ -2442,13 +3019,13 @@ impl RegularPathConstraint {
         // exact count requires scanning self-loops. Conservative
         // estimate avoids the O(N) scan on every call.
         if self.start == self.end && variable == self.start {
-            return self.set.len();
+            return self.source.len_estimate();
         }
         if variable == self.end {
             if let Some(start_val) = start_val {
                 return self.estimate_bound(&self.estimate, start_val).max(1);
             }
-            self.set.len()
+            self.source.len_estimate()
         } else {
             if let Some(end_val) = end_val {
                 // Symmetric to the start-bound case: BFS backward
@@ -2457,7 +3034,7 @@ impl RegularPathConstraint {
                 // conservative set-len fallback.
                 return self.estimate_bound(&self.inverse_estimate, end_val).max(1);
             }
-            self.set.len()
+            self.source.len_estimate()
         }
     }
 
@@ -2482,7 +3059,7 @@ impl RegularPathConstraint {
                 // Pure chains are never nullable, and every join
                 // solution is witnessed by real tribles — no
                 // zero-length-path gate needed.
-                proposals.extend(eval_selfloop_join(&self.set, &self.expr));
+                proposals.extend(eval_selfloop_join(&self.source, &self.expr));
                 return;
             }
             // Tier 2: candidate filtering, with the candidate set
@@ -2494,13 +3071,13 @@ impl RegularPathConstraint {
             proposals.extend(
                 candidates
                     .into_iter()
-                    .filter(|v| has_path_gated(&self.set, &self.expr, v, v)),
+                    .filter(|v| has_path_gated(&self.source, &self.expr, v, v)),
             );
             return;
         }
         if variable == self.end {
             if let Some(start_val) = start_val {
-                let mut reachable = eval_from(&self.set, &self.expr, start_val);
+                let mut reachable = eval_from(&self.source, &self.expr, start_val);
                 // Zero-length-path scope rule (SPARQL §17.5):
                 // eval_from's nullable arms insert the seed
                 // unconditionally; drop it when the bound start
@@ -2512,7 +3089,7 @@ impl RegularPathConstraint {
                 // the free-endpoint cases (whose candidates come
                 // from `all_terms()`), so the constraint denotes
                 // one relation regardless of proposal order.
-                if !is_graph_term(&self.set, start_val) {
+                if !is_graph_term(&self.source, start_val) {
                     reachable.remove(start_val);
                 }
                 proposals.extend(reachable);
@@ -2527,10 +3104,10 @@ impl RegularPathConstraint {
                 // inverted expression from the bound end enumerates
                 // every valid start — including from literal ends,
                 // which inverse hops handle natively in value space.
-                let mut reachable = eval_from(&self.set, &self.inverse_expr, end_val);
+                let mut reachable = eval_from(&self.source, &self.inverse_expr, end_val);
                 // Zero-length-path scope rule — see the start-bound
                 // arm above.
-                if !is_graph_term(&self.set, end_val) {
+                if !is_graph_term(&self.source, end_val) {
                     reachable.remove(end_val);
                 }
                 proposals.extend(reachable);
@@ -2549,9 +3126,9 @@ impl RegularPathConstraint {
             if self.nullable {
                 proposals.extend(self.all_terms());
             } else if variable == self.start {
-                proposals.extend(first_step_seeds(&self.set, &self.expr));
+                proposals.extend(first_step_seeds(&self.source, &self.expr));
             } else {
-                proposals.extend(first_step_seeds(&self.set, &self.inverse_expr));
+                proposals.extend(first_step_seeds(&self.source, &self.inverse_expr));
             }
         }
     }
@@ -2598,26 +3175,26 @@ impl RegularPathConstraint {
         // Same-Variable case: filter proposals to those with a
         // self-loop via the path expression.
         if self.start == self.end && variable == self.start {
-            proposals.retain(|v| has_path_gated(&self.set, &self.expr, v, v));
+            proposals.retain(|v| has_path_gated(&self.source, &self.expr, v, v));
             return;
         }
         if variable == self.start {
             if let Some(end_val) = end_val {
                 let end_val = *end_val;
-                proposals.retain(|v| has_path_gated(&self.set, &self.expr, v, &end_val));
+                proposals.retain(|v| has_path_gated(&self.source, &self.expr, v, &end_val));
             } else if !self.nullable {
                 // End unbound: a non-nullable path from `v` exists
                 // only if `v` can take a FIRST step — one prefix
                 // probe per FIRST entry. Exact (necessary condition
                 // for ∃ end), and prunes join candidates early.
-                proposals.retain(|v| can_take_first_step(&self.set, &self.first, v));
+                proposals.retain(|v| can_take_first_step(&self.source, &self.first, v));
             }
         } else if variable == self.end {
             if let Some(start_val) = start_val {
                 let start_val = *start_val;
-                proposals.retain(|v| has_path_gated(&self.set, &self.expr, &start_val, v));
+                proposals.retain(|v| has_path_gated(&self.source, &self.expr, &start_val, v));
             } else if !self.inverse_nullable {
-                proposals.retain(|v| can_take_first_step(&self.set, &self.inverse_first, v));
+                proposals.retain(|v| can_take_first_step(&self.source, &self.inverse_first, v));
             }
         }
     }
@@ -3009,7 +3586,7 @@ impl TypedProgramSpec for RegularPathConstraint {
             };
             let accepted = program.accepting[program.start as usize]
                 && anchor.is_none_or(|target| target == value)
-                && is_graph_term(&self.set, &value);
+                && is_graph_term(&self.source, &value);
             let parent = u32::try_from(parent).expect("too many RPQ program parents");
             let state = RpqState::transition(batch.route.variable, node, RpqExpandCursor::Start);
             let accepted = accepted.then_some(value);
@@ -3077,7 +3654,7 @@ impl TypedProgramSpec for RegularPathConstraint {
                 let input_tag =
                     u32::try_from(input).expect("too many typed RPQ inputs in one cohort");
                 for &candidate in &candidates[offset..end] {
-                    if nullable || can_take_first_step(&self.set, first, &candidate) {
+                    if nullable || can_take_first_step(&self.source, first, &candidate) {
                         effects.accept(input_tag, candidate);
                     }
                 }
@@ -3402,7 +3979,13 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
     }
 
     fn residual_program(&self) -> Option<ProgramRef<'_>> {
-        Some(ProgramRef::new(self))
+        // The typed transition program pages through PATCH cursors, so it
+        // is only offered for TribleSet-backed constraints; erased pattern
+        // sources run the ordinary propose/confirm protocol instead.
+        match &self.source {
+            PathSource::Set(_) => Some(ProgramRef::new(self)),
+            PathSource::Pattern(_) => None,
+        }
     }
 
     /// The typed same-variable route publishes a source only after the graph
@@ -3431,7 +4014,7 @@ impl<'a> Constraint<'a> for RegularPathConstraint {
         match (view.col(self.start), view.col(self.end)) {
             (Some(cs), Some(ce)) => view
                 .iter()
-                .all(|row| has_path_gated(&self.set, &self.expr, &row[cs], &row[ce])),
+                .all(|row| has_path_gated(&self.source, &self.expr, &row[cs], &row[ce])),
             _ => true,
         }
     }
@@ -4476,6 +5059,10 @@ mod seeded_frame_tests {
     }
 
     impl GraphFixture {
+        fn source(&self) -> PathSource {
+            PathSource::Set(self.set.clone())
+        }
+
         fn new() -> Self {
             let primary_id = rngid();
             let secondary_id = rngid();
@@ -4680,7 +5267,7 @@ mod seeded_frame_tests {
                     })
                     .collect();
                 let actual: HashSet<_> = occurrences.iter().copied().collect();
-                let expected = eval_from(&path.set, expr, &source);
+                let expected = eval_from(&path.source, expr, &source);
                 assert_eq!(actual, expected, "parent {parent} disagreed");
                 assert_eq!(
                     occurrences.len(),
@@ -4821,7 +5408,7 @@ mod seeded_frame_tests {
     ) -> HashSet<RawInline> {
         let mut ctx = VariableContext::new();
         let start_var = ctx.next_variable::<GenId>();
-        let mut constraints: Vec<Box<dyn Constraint<'static> + 'static>> = Vec::new();
+        let mut constraints: Vec<Box<dyn Constraint<'_> + '_>> = Vec::new();
         constraints.push(Box::new(start_var.is(Inline::new(start))));
         let dest = expr.build_constraint(set, &mut ctx, start_var, &mut constraints);
         Query::new(
@@ -4840,7 +5427,7 @@ mod seeded_frame_tests {
     ) -> bool {
         let mut ctx = VariableContext::new();
         let start_var = ctx.next_variable::<GenId>();
-        let mut constraints: Vec<Box<dyn Constraint<'static> + 'static>> = Vec::new();
+        let mut constraints: Vec<Box<dyn Constraint<'_> + '_>> = Vec::new();
         constraints.push(Box::new(start_var.is(Inline::new(start))));
         let dest = expr.build_constraint(set, &mut ctx, start_var, &mut constraints);
         Query::new(
@@ -4854,7 +5441,7 @@ mod seeded_frame_tests {
     fn root_query_selfloop_oracle(set: &TribleSet, expr: &PathExpr) -> HashSet<RawInline> {
         let mut ctx = VariableContext::new();
         let start = ctx.next_variable::<GenId>();
-        let mut constraints: Vec<Box<dyn Constraint<'static> + 'static>> = Vec::new();
+        let mut constraints: Vec<Box<dyn Constraint<'_> + '_>> = Vec::new();
         let dest = expr.build_constraint(set, &mut ctx, start, &mut constraints);
         constraints.push(Box::new(
             crate::query::equalityconstraint::EqualityConstraint::new(start.index, dest.index),
@@ -4892,7 +5479,7 @@ mod seeded_frame_tests {
         for chain in &chains {
             for &start in &graph.nodes {
                 assert_eq!(
-                    eval_from(&graph.set, chain, &start),
+                    eval_from(&graph.source(), chain, &start),
                     root_query_eval_oracle(&graph.set, chain, start),
                 );
             }
@@ -4910,13 +5497,13 @@ mod seeded_frame_tests {
         for &start in &graph.nodes {
             for &target in &graph.nodes {
                 assert_eq!(
-                    has_path(&graph.set, &chain, &start, &target),
+                    has_path(&graph.source(), &chain, &start, &target),
                     root_query_exists_oracle(&graph.set, &chain, start, target),
                 );
             }
         }
         let absent = id_into_value(&rngid().id.raw());
-        assert!(!has_path(&graph.set, &chain, &graph.nodes[0], &absent));
+        assert!(!has_path(&graph.source(), &chain, &graph.nodes[0], &absent));
     }
 
     #[test]
@@ -4939,7 +5526,7 @@ mod seeded_frame_tests {
 
         for chain in &chains {
             assert_eq!(
-                eval_selfloop_join(&graph.set, chain),
+                eval_selfloop_join(&graph.source(), chain),
                 root_query_selfloop_oracle(&graph.set, chain),
             );
         }
@@ -4955,7 +5542,7 @@ mod seeded_frame_tests {
         let expected = root_query_eval_oracle(&graph.set, &chain, graph.nodes[0]);
 
         for _ in 0..26 {
-            assert_eq!(eval_from(&graph.set, &chain, &graph.nodes[0]), expected);
+            assert_eq!(eval_from(&graph.source(), &chain, &graph.nodes[0]), expected);
         }
     }
 
