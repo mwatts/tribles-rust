@@ -236,51 +236,89 @@ pub fn skip_value(bytes: &mut Bytes) -> Result<(), ScanError> {
         Some(b't') => expect_literal(bytes, b"true"),
         Some(b'f') => expect_literal(bytes, b"false"),
         Some(b'n') => expect_literal(bytes, b"null"),
-        Some(b'{') => {
-            expect(bytes, b'{')?;
-            skip_ws(bytes);
-            if bytes.peek_token() == Some(b'}') {
-                bytes.pop_front();
-                return Ok(());
-            }
-            loop {
-                skip_ws(bytes);
-                let _ = parse_string(bytes)?; // key
-                skip_ws(bytes);
-                expect(bytes, b':')?;
-                skip_ws(bytes);
-                skip_value(bytes)?;
-                skip_ws(bytes);
-                match bytes.pop_front() {
-                    Some(b',') => continue,
-                    Some(b'}') => return Ok(()),
-                    _ => return Err(syntax("expected ',' or '}' in object")),
-                }
-            }
-        }
-        Some(b'[') => {
-            expect(bytes, b'[')?;
-            skip_ws(bytes);
-            if bytes.peek_token() == Some(b']') {
-                bytes.pop_front();
-                return Ok(());
-            }
-            loop {
-                skip_ws(bytes);
-                skip_value(bytes)?;
-                skip_ws(bytes);
-                match bytes.pop_front() {
-                    Some(b',') => continue,
-                    Some(b']') => return Ok(()),
-                    _ => return Err(syntax("expected ',' or ']' in array")),
-                }
-            }
-        }
+        // Reuse the fold combinators so the recursive skipper and the public
+        // `object` / `array` share one implementation of the brace-matching
+        // structure — dropping each member/element on the floor via `skip_value`.
+        Some(b'{') => object(bytes, (), |(), _key, b| skip_value(b)),
+        Some(b'[') => array(bytes, (), |(), b| skip_value(b)),
         Some(_) => {
             let _ = parse_number(bytes)?;
             Ok(())
         }
         None => Err(syntax("expected a value")),
+    }
+}
+
+/// Parse a JSON object, folding `member` over each `"key": value` pair.
+///
+/// For each member the key string is parsed (via [`parse_string`]) and the `:`
+/// consumed, then `member(acc, key, bytes)` is called with the cursor positioned
+/// at the first byte of the value — the callback is responsible for consuming
+/// exactly one value from `bytes`. Handles the surrounding `{`, whitespace, the
+/// empty object `{}`, comma separators, and the closing `}`; a trailing comma is
+/// rejected as invalid JSON.
+///
+/// The cursor must be positioned at the opening `{` (after any leading
+/// whitespace).
+pub fn object<A>(
+    bytes: &mut Bytes,
+    init: A,
+    mut member: impl FnMut(A, Bytes, &mut Bytes) -> Result<A, ScanError>,
+) -> Result<A, ScanError> {
+    expect(bytes, b'{')?;
+    skip_ws(bytes);
+    if bytes.peek_token() == Some(b'}') {
+        bytes.pop_front();
+        return Ok(init);
+    }
+    let mut acc = init;
+    loop {
+        skip_ws(bytes);
+        let key = parse_string(bytes)?;
+        skip_ws(bytes);
+        expect(bytes, b':')?;
+        skip_ws(bytes);
+        acc = member(acc, key, bytes)?;
+        skip_ws(bytes);
+        match bytes.pop_front() {
+            Some(b',') => continue,
+            Some(b'}') => return Ok(acc),
+            _ => return Err(syntax("expected ',' or '}' in object")),
+        }
+    }
+}
+
+/// Parse a JSON array, folding `element` over each value.
+///
+/// For each element `element(acc, bytes)` is called with the cursor positioned
+/// at the first byte of the value — the callback is responsible for consuming
+/// exactly one value from `bytes`. Handles the surrounding `[`, whitespace, the
+/// empty array `[]`, comma separators, and the closing `]`; a trailing comma is
+/// rejected as invalid JSON.
+///
+/// The cursor must be positioned at the opening `[` (after any leading
+/// whitespace).
+pub fn array<A>(
+    bytes: &mut Bytes,
+    init: A,
+    mut element: impl FnMut(A, &mut Bytes) -> Result<A, ScanError>,
+) -> Result<A, ScanError> {
+    expect(bytes, b'[')?;
+    skip_ws(bytes);
+    if bytes.peek_token() == Some(b']') {
+        bytes.pop_front();
+        return Ok(init);
+    }
+    let mut acc = init;
+    loop {
+        skip_ws(bytes);
+        acc = element(acc, bytes)?;
+        skip_ws(bytes);
+        match bytes.pop_front() {
+            Some(b',') => continue,
+            Some(b']') => return Ok(acc),
+            _ => return Err(syntax("expected ',' or ']' in array")),
+        }
     }
 }
 
@@ -358,5 +396,116 @@ mod tests {
     fn f64_rejects_non_finite_shaped_and_parses_plain() {
         let mut b = bytes("3.5e2,");
         assert_eq!(parse_f64(&mut b).unwrap(), 350.0);
+    }
+
+    #[test]
+    fn object_folds_top_level_keys() {
+        // a fold that actually accumulates: collect every top-level key.
+        let mut b = bytes(r#"{"a":1,"b":"two","c":[3,3]}"#);
+        let keys = object(&mut b, Vec::new(), |mut acc, key, v| {
+            acc.push(key.view::<str>().unwrap().as_ref().to_owned());
+            skip_value(v)?;
+            Ok(acc)
+        })
+        .unwrap();
+        assert_eq!(keys, vec!["a", "b", "c"]);
+        assert_eq!(b.peek_token(), None); // cursor landed exactly past the '}'
+    }
+
+    #[test]
+    fn array_sums_numbers() {
+        let mut b = bytes("[1, 2, 3, 4]");
+        let sum = array(&mut b, 0.0, |acc, v| Ok(acc + parse_f64(v)?)).unwrap();
+        assert_eq!(sum, 10.0);
+        assert_eq!(b.peek_token(), None);
+    }
+
+    #[test]
+    fn empty_object_and_array() {
+        let mut o = bytes("{}");
+        let n = object(&mut o, 0usize, |acc, _k, v| {
+            skip_value(v)?;
+            Ok(acc + 1)
+        })
+        .unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(o.peek_token(), None);
+
+        let mut a = bytes("[]");
+        let n = array(&mut a, 0usize, |acc, v| {
+            skip_value(v)?;
+            Ok(acc + 1)
+        })
+        .unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(a.peek_token(), None);
+    }
+
+    #[test]
+    fn whitespace_in_all_positions() {
+        // whitespace before/around braces, keys, colons, commas, and values.
+        let mut b = bytes("  {  \"a\" :  1 ,  \"b\"  :  2  }  ");
+        skip_ws(&mut b);
+        let keys = object(&mut b, Vec::new(), |mut acc, key, v| {
+            acc.push(key.view::<str>().unwrap().as_ref().to_owned());
+            skip_value(v)?;
+            Ok(acc)
+        })
+        .unwrap();
+        assert_eq!(keys, vec!["a", "b"]);
+        skip_ws(&mut b);
+        assert_eq!(b.peek_token(), None);
+    }
+
+    #[test]
+    fn nested_object_in_array_in_object() {
+        // {"outer": [ {"inner": N}, ... ], "tail": 9} — fold all three levels.
+        let mut b = bytes(r#"{"outer":[{"inner":1},{"inner":2}],"tail":9}"#);
+        let mut inner_sum = 0.0;
+        let mut saw_tail = false;
+        object(&mut b, (), |(), key, v| {
+            match key.view::<str>().unwrap().as_ref() {
+                "outer" => {
+                    inner_sum = array(v, 0.0, |acc, e| {
+                        let one = object(e, 0.0, |a, k2, v2| {
+                            assert_eq!(k2.view::<str>().unwrap().as_ref(), "inner");
+                            Ok(a + parse_f64(v2)?)
+                        })?;
+                        Ok(acc + one)
+                    })?;
+                }
+                "tail" => {
+                    saw_tail = true;
+                    skip_value(v)?;
+                }
+                _ => skip_value(v)?,
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(inner_sum, 3.0);
+        assert!(saw_tail);
+        assert_eq!(b.peek_token(), None);
+    }
+
+    #[test]
+    fn rejects_trailing_comma_and_missing_colon() {
+        let mut obj_trailing = bytes(r#"{"a":1,}"#);
+        assert!(matches!(
+            object(&mut obj_trailing, (), |(), _k, v| skip_value(v)),
+            Err(ScanError::Syntax(_))
+        ));
+
+        let mut arr_trailing = bytes("[1,]");
+        assert!(matches!(
+            array(&mut arr_trailing, (), |(), v| skip_value(v)),
+            Err(ScanError::Syntax(_))
+        ));
+
+        let mut missing_colon = bytes(r#"{"a" 1}"#);
+        assert!(matches!(
+            object(&mut missing_colon, (), |(), _k, v| skip_value(v)),
+            Err(ScanError::Syntax(_))
+        ));
     }
 }
