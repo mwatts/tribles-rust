@@ -8,6 +8,7 @@ use triblespace_core::repo::pile::Pile;
 pub mod blob;
 pub mod branch;
 mod diagnose;
+mod extract;
 mod merge;
 mod migrate;
 pub mod net;
@@ -115,6 +116,25 @@ pub enum PileCommand {
         #[arg(long)]
         signing_key: Option<PathBuf>,
     },
+    /// Stream one branch's commit chain into a fresh pile.
+    ///
+    /// The scalable single-branch alternative to `squash`: the branch's
+    /// content is never materialized. Commits are walked oldest → newest
+    /// and each content delta blob is copied as raw bytes into the
+    /// destination, where a fresh commit is minted per original commit
+    /// (preserving messages and per-commit deltas). Peak memory stays
+    /// proportional to one commit's blob references, so this works on
+    /// piles far larger than RAM. Prints a per-commit ladder table with
+    /// running cumulative trible counts.
+    Extract {
+        /// Source pile file
+        source: PathBuf,
+        /// Destination pile file (will be created)
+        dest: PathBuf,
+        /// Branch to extract (name or hex id)
+        #[arg(long)]
+        branch: String,
+    },
     /// Re-id every branch into a new pile, preserving names + full history.
     ///
     /// Each branch keeps its name and head commit, but receives a freshly
@@ -213,6 +233,11 @@ pub fn run(cmd: PileCommand) -> Result<()> {
             exclude,
             signing_key,
         } => squash::run(source, dest, signing_key, include, exclude),
+        PileCommand::Extract {
+            source,
+            dest,
+            branch,
+        } => extract::run(source, dest, branch),
         PileCommand::Reid {
             source,
             dest,
