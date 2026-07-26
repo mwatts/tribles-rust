@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -1013,11 +1014,12 @@ impl SuccinctRollup {
         Self
     }
 
-    /// Union-query several attached physical shards.
-    pub fn union<'a>(
-        segments: &'a [SuccinctArchive<OrderedUniverse>],
-    ) -> UnionArchive<'a, OrderedUniverse> {
-        UnionArchive::new(segments)
+    /// Union-query several attached physical shards (shards are Arc-cheap
+    /// view clones — no data copies).
+    pub fn union(
+        segments: &[SuccinctArchive<OrderedUniverse>],
+    ) -> UnionArchive<OrderedUniverse> {
+        UnionArchive::new(segments.to_vec())
     }
 }
 
@@ -1269,18 +1271,26 @@ where
 }
 
 /// A [`TriblePattern`] view that unions several Succinct archive shards.
-pub struct UnionArchive<'a, U> {
-    segments: &'a [SuccinctArchive<U>],
+///
+/// Owns its shard list (`Arc<[SuccinctArchive]>` — the archives underneath
+/// are `Bytes`/`Arc`-backed views, so cloning shards in is a handful of
+/// refcount bumps, never a data copy). Ownership makes the union `'static`
+/// wherever its universe is, so it can flow into type-erased consumers —
+/// notably `path!`'s generic source lane — without borrowed-slice gymnastics.
+#[derive(Clone)]
+pub struct UnionArchive<U> {
+    segments: Arc<[SuccinctArchive<U>]>,
 }
 
-impl<'a, U> UnionArchive<'a, U> {
+impl<U> UnionArchive<U> {
     /// Wrap attached physical shards.
     ///
     /// # Panics
     ///
     /// Panics when `segments` is empty. A physical union requires at least
     /// one shard; use a different constraint to represent an empty relation.
-    pub fn new(segments: &'a [SuccinctArchive<U>]) -> Self {
+    pub fn new(segments: impl Into<Arc<[SuccinctArchive<U>]>>) -> Self {
+        let segments = segments.into();
         assert!(
             !segments.is_empty(),
             "UnionArchive requires at least one physical shard"
@@ -2056,7 +2066,7 @@ where
     }
 }
 
-impl<'a, U> TriblePattern for UnionArchive<'a, U>
+impl<U> TriblePattern for UnionArchive<U>
 where
     U: Universe + Send + Sync,
 {
@@ -2250,14 +2260,14 @@ mod tests {
             fixed_archive(&entity, &attribute, [2]),
         ];
 
-        assert_eq!(UnionArchive::new(&archives).segment_count(), 2);
+        assert_eq!(UnionArchive::new(archives.to_vec()).segment_count(), 2);
     }
 
     #[test]
     #[should_panic(expected = "UnionArchive requires at least one physical shard")]
     fn union_archive_rejects_an_empty_physical_union_at_construction() {
         let archives: [SuccinctArchive<OrderedUniverse>; 0] = [];
-        let _ = UnionArchive::new(&archives);
+        let _ = UnionArchive::new(archives.to_vec());
     }
 
     #[test]
@@ -2369,7 +2379,7 @@ mod tests {
         let entity: Inline<GenId> = entity_id.to_inline();
         let attribute: Inline<GenId> = attribute_id.to_inline();
         let value = Variable::<UnknownInline>::new(0);
-        let unary_archive = UnionArchive::new(&unary_segments);
+        let unary_archive = UnionArchive::new(unary_segments.to_vec());
         let unary = unary_archive.pattern(entity, attribute, value);
         let unary_program = unary.residual_program().unwrap();
         assert!(unary_program
@@ -2414,7 +2424,7 @@ mod tests {
             fixed_archive(&entity_id, &attribute_id, [1]),
             fixed_archive(&entity_id, &attribute_id, [2]),
         ];
-        let multi_archive = UnionArchive::new(&multi_segments);
+        let multi_archive = UnionArchive::new(multi_segments.to_vec());
         let multi = multi_archive.pattern(entity, attribute, value);
         assert!(
             multi
@@ -2691,7 +2701,7 @@ mod tests {
             fixed_archive(&entity_id, &attribute_id, [1]),
             fixed_archive(&entity_id, &attribute_id, [2]),
         ];
-        let union_archive = UnionArchive::new(&archives);
+        let union_archive = UnionArchive::new(archives.to_vec());
         let entity = Variable::<GenId>::new(0);
         let attribute = Variable::<GenId>::new(1);
         let value = Variable::<UnknownInline>::new(2);
@@ -2822,7 +2832,7 @@ mod tests {
             fixed_archive(&entity, &attribute, [1, 3, 5]),
             fixed_archive(&entity, &attribute, [2, 3, 4]),
         ];
-        let union_archive = UnionArchive::new(&archives);
+        let union_archive = UnionArchive::new(archives.to_vec());
         let value = Variable::<UnknownInline>::new(0);
         let entity: Inline<GenId> = entity.to_inline();
         let attribute: Inline<GenId> = attribute.to_inline();
@@ -2858,7 +2868,7 @@ mod tests {
             fixed_archive(&entity, &attribute, [1, 3]),
             fixed_archive(&entity, &attribute, [2, 3]),
         ];
-        let union_archive = UnionArchive::new(&archives);
+        let union_archive = UnionArchive::new(archives.to_vec());
         let value = Variable::<UnknownInline>::new(0);
         let entity: Inline<GenId> = entity.to_inline();
         let attribute: Inline<GenId> = attribute.to_inline();
@@ -2930,7 +2940,7 @@ mod tests {
             fixed_archive(&entity_two, &attribute, [4]),
             fixed_archive(&entity_two, &attribute, [4, 5]),
         ];
-        let union_archive = UnionArchive::new(&archives);
+        let union_archive = UnionArchive::new(archives.to_vec());
         let entity = Variable::<GenId>::new(0);
         let value = Variable::<UnknownInline>::new(1);
         let attribute: Inline<GenId> = attribute.to_inline();
@@ -3000,7 +3010,7 @@ mod tests {
             fixed_rows_archive(&attribute, facts),
             fixed_rows_archive(&attribute, facts),
         ];
-        let union_archive = UnionArchive::new(&archives);
+        let union_archive = UnionArchive::new(archives.to_vec());
         let entity = Variable::<GenId>::new(0);
         let value = Variable::<UnknownInline>::new(1);
         let attribute: Inline<GenId> = attribute.to_inline();
@@ -3060,7 +3070,7 @@ mod tests {
             ),
             fixed_rows_archive(&attribute, []),
         ];
-        let union_archive = UnionArchive::new(&archives);
+        let union_archive = UnionArchive::new(archives.to_vec());
         let entity = Variable::<GenId>::new(0);
         let value = Variable::<UnknownInline>::new(1);
         let attribute: Inline<GenId> = attribute.to_inline();
@@ -3140,7 +3150,7 @@ mod tests {
             ),
             fixed_rows_archive(&attribute, []),
         ];
-        let union_archive = UnionArchive::new(&archives);
+        let union_archive = UnionArchive::new(archives.to_vec());
         let entity = Variable::<GenId>::new(0);
         let value = Variable::<UnknownInline>::new(1);
         let attribute: Inline<GenId> = attribute.to_inline();
@@ -3204,7 +3214,7 @@ mod tests {
             fixed_archive(&entity, &attribute, []),
             fixed_archive(&entity, &attribute, [2, 3]),
         ];
-        let union_archive = UnionArchive::new(&archives);
+        let union_archive = UnionArchive::new(archives.to_vec());
         let value = Variable::<UnknownInline>::new(0);
         let entity: Inline<GenId> = entity.to_inline();
         let attribute: Inline<GenId> = attribute.to_inline();
@@ -3226,7 +3236,7 @@ mod tests {
             fixed_archive(&entity_one, &attribute, [1]),
             fixed_archive(&entity_two, &attribute, [2]),
         ];
-        let union_archive = UnionArchive::new(&archives);
+        let union_archive = UnionArchive::new(archives.to_vec());
         let entity = Variable::<GenId>::new(0);
         let attribute_variable = Variable::<GenId>::new(1);
         let value = Variable::<UnknownInline>::new(2);
@@ -3286,7 +3296,7 @@ mod tests {
         let attribute: Inline<GenId> = attribute.to_inline();
         let value = Variable::<UnknownInline>::new(0);
         let direct = archives[0].pattern(entity, attribute, value);
-        let union_archive = UnionArchive::new(&archives);
+        let union_archive = UnionArchive::new(archives.to_vec());
         let union = union_archive.pattern(entity, attribute, value);
         let input = vec![
             raw_value(4),
@@ -3326,7 +3336,7 @@ mod tests {
         let attribute: Inline<GenId> = attribute.to_inline();
         let value = Variable::<UnknownInline>::new(0);
         let direct = archives[0].pattern(entity, attribute, value);
-        let union_archive = UnionArchive::new(&archives);
+        let union_archive = UnionArchive::new(archives.to_vec());
         let union = union_archive.pattern(entity, attribute, value);
         let view = RowsView::new_with_row_count(&[], &[], 2);
         let input = vec![
@@ -3376,7 +3386,7 @@ mod tests {
         let entity: Inline<GenId> = entity.to_inline();
         let attribute: Inline<GenId> = attribute.to_inline();
         let value = Variable::<UnknownInline>::new(0);
-        let union_archive = UnionArchive::new(&archives);
+        let union_archive = UnionArchive::new(archives.to_vec());
         let union = union_archive.pattern(entity, attribute, value);
         let mut candidates = vec![
             raw_value(3),
@@ -3434,7 +3444,7 @@ mod tests {
         ];
         let expected_set = vec![raw_value(1), raw_value(2), raw_value(3)];
 
-        let union_archive = UnionArchive::new(&archives);
+        let union_archive = UnionArchive::new(archives.to_vec());
         let union = union_archive.pattern(entity, attribute, value);
         let direct = materialized.pattern(entity, attribute, value);
         let mut union_candidates = candidates.clone();
@@ -3453,7 +3463,7 @@ mod tests {
         assert_eq!(direct_candidates, expected_bag);
 
         for residual in [false, true] {
-            let union_archive = UnionArchive::new(&archives);
+            let union_archive = UnionArchive::new(archives.to_vec());
             let mut union_results = solve_projected_candidates(
                 Box::new(union_archive.pattern(entity, attribute, value)),
                 &candidates,
@@ -3486,7 +3496,7 @@ mod tests {
         let attribute_variable = Variable::<GenId>::new(1);
         let value = Variable::<UnknownInline>::new(2);
         let unrelated = Variable::<UnknownInline>::new(3);
-        let union_archive = UnionArchive::new(&archives);
+        let union_archive = UnionArchive::new(archives.to_vec());
         let union = union_archive.pattern(entity, attribute_variable, value);
         let vars = [entity.index, attribute_variable.index];
         let entity_one: Inline<GenId> = entity_one.to_inline();
@@ -3537,7 +3547,7 @@ mod tests {
         let entity: Inline<GenId> = entity.to_inline();
         let attribute: Inline<GenId> = attribute.to_inline();
         let value = Variable::<UnknownInline>::new(0);
-        let union_archive = UnionArchive::new(&archives);
+        let union_archive = UnionArchive::new(archives.to_vec());
         let union = union_archive.pattern(entity, attribute, value);
         let view = RowsView::new_with_row_count(&[], &[], 2);
         let input = vec![

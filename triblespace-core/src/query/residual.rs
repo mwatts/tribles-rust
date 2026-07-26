@@ -14093,9 +14093,9 @@ mod tests {
             }
 
             let archive: SuccinctArchive<OrderedUniverse> = (&facts).into();
-            let archives: &'static [SuccinctArchive<OrderedUniverse>] =
-                Box::leak(vec![archive].into_boxed_slice());
-            let union = Box::leak(Box::new(UnionArchive::new(archives)));
+            // UnionArchive owns its shards now — one leak (for the borrow the
+            // constraint takes) instead of two.
+            let union = Box::leak(Box::new(UnionArchive::new(vec![archive])));
             let entity = Variable::<GenId>::new(0);
             let value = Variable::<UnknownInline>::new(1);
             let attribute: Inline<GenId> = attribute.to_inline();

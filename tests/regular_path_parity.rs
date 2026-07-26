@@ -14,9 +14,9 @@ pub mod social {
     use triblespace::prelude::*;
 
     attributes! {
-        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" as follows: inlineencodings::GenId;
-        "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" as likes: inlineencodings::GenId;
-        "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC" as name: inlineencodings::ShortString;
+        "79D442FF59DF3ACE777E5D68216AB033" as follows: inlineencodings::GenId;
+        "3E9D0022B7F6DA1878A02966D0C8AAB4" as likes: inlineencodings::GenId;
+        "F4FD985FD6CBE153D6EBD1BDAF5AE4CA" as name: inlineencodings::ShortString;
     }
 }
 
@@ -248,4 +248,32 @@ fn parity_bound_end() {
         and!(e.is(c), path!(src.clone(), s social::follows+ e))
     )
     .collect());
+}
+
+#[test]
+fn parity_union_archive() {
+    // UnionArchive owns its shards now ('static), so it flows through
+    // path!'s generic source lane like any other TriblePattern backend.
+    // Two identical shards also pin cross-shard dedup: the union of a
+    // graph with itself must answer exactly like the graph.
+    let f = fixture();
+    let union = triblespace::core::repo::index_home::UnionArchive::new(vec![
+        f.archive.clone(),
+        f.archive.clone(),
+    ]);
+    let set_results: HashSet<_> = find!(
+        (s: Inline<inlineencodings::GenId>, e: Inline<inlineencodings::GenId>),
+        path!(f.set.clone(), s social::follows+ e)
+    )
+    .collect();
+    let union_results: HashSet<_> = find!(
+        (s: Inline<inlineencodings::GenId>, e: Inline<inlineencodings::GenId>),
+        path!(union.clone(), s social::follows+ e)
+    )
+    .collect();
+    assert_eq!(
+        set_results, union_results,
+        "TribleSet and UnionArchive disagreed"
+    );
+    assert!(!set_results.is_empty());
 }

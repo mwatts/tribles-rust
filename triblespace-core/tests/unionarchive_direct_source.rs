@@ -81,7 +81,7 @@ fn identical_shards_use_one_production_program_for_all_twelve_schemas() {
     let empty = TribleSet::new();
     let archives: Vec<SuccinctArchive<OrderedUniverse>> =
         vec![(&set).into(), (&empty).into(), (&set).into()];
-    let union = UnionArchive::new(&archives);
+    let union = UnionArchive::new(archives.clone());
     let entity = Variable::<GenId>::new(0);
     let attribute = Variable::<GenId>::new(1);
     let value = Variable::<UnknownInline>::new(2);
@@ -163,7 +163,7 @@ fn interleaved_shards_keep_eager_occurrences_and_production_program_set_parity()
     let left = fixed_shard(entity, attribute, [1, 3, 5]);
     let right = fixed_shard(entity, attribute, [2, 3, 4, 6]);
     let archives: Vec<SuccinctArchive<OrderedUniverse>> = vec![(&left).into(), (&right).into()];
-    let union = UnionArchive::new(&archives);
+    let union = UnionArchive::new(archives.clone());
     let variable = Variable::<UnknownInline>::new(0);
     let entity: Inline<GenId> = entity.to_inline();
     let attribute: Inline<GenId> = attribute.to_inline();
@@ -211,7 +211,7 @@ fn generic_union_keeps_its_boundary_and_repeated_targets_keep_full_parity() {
         "generic OR keeps its normalization boundary",
     );
 
-    let union = UnionArchive::new(&archives);
+    let union = UnionArchive::new(archives.clone());
     let x = Variable::<GenId>::new(1);
     for (name, ordinary, full) in [
         (
@@ -253,7 +253,7 @@ fn width_one_production_program_and_live_clone_preserve_the_exact_normalized_rem
     let (set, entities, attributes, values) = fixture(1, 1, 8);
     let archives: Vec<SuccinctArchive<OrderedUniverse>> =
         vec![(&set).into(), (&set).into(), (&set).into()];
-    let union = UnionArchive::new(&archives);
+    let union = UnionArchive::new(archives.clone());
     let value = Variable::<UnknownInline>::new(0);
     let root = Arc::new(union.pattern(entities[0], attributes[0], value));
     let mut query = Query::new(root, project_value)
