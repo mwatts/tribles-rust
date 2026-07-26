@@ -16,6 +16,7 @@ pub mod social {
     attributes! {
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" as follows: inlineencodings::GenId;
         "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" as likes: inlineencodings::GenId;
+        "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC" as name: inlineencodings::ShortString;
     }
 }
 
@@ -26,8 +27,9 @@ struct Fixture {
     c: Inline<inlineencodings::GenId>,
 }
 
-/// A small graph with a follows-cycle, a branch, and likes edges:
-/// follows: a→b, b→c, c→a, a→d; likes: b→d, d→e.
+/// A small graph with a follows-cycle, a branch, likes edges, and
+/// literal-valued name edges (paths may END at a literal):
+/// follows: a→b, b→c, c→a, a→d; likes: b→d, d→e; name: a→"alpha", b→"beta".
 fn fixture() -> Fixture {
     let ids: Vec<_> = (0..5).map(|_| fucid()).collect();
     let (a, b, c, d, e) = (&ids[0], &ids[1], &ids[2], &ids[3], &ids[4]);
@@ -38,6 +40,8 @@ fn fixture() -> Fixture {
     set += entity! { a @ social::follows: d };
     set += entity! { b @ social::likes: d };
     set += entity! { d @ social::likes: e };
+    set += entity! { a @ social::name: "alpha" };
+    set += entity! { b @ social::name: "beta" };
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
     Fixture {
         set,
@@ -209,6 +213,28 @@ fn parity_bound_start() {
     assert_parity!(f, |src| find!(
         (s: Inline<inlineencodings::GenId>, e: Inline<inlineencodings::GenId>),
         and!(s.is(a), path!(src.clone(), s social::follows+ e))
+    )
+    .collect());
+}
+
+#[test]
+fn parity_literal_endpoints() {
+    let f = fixture();
+    // Closure over mixed edges: walks dead-end naturally at literal
+    // name values, so endpoints must be declared UnknownInline.
+    assert_parity!(f, |src| find!(
+        (s: Inline<inlineencodings::GenId>, e: Inline<UnknownInline>),
+        path!(src.clone(), s (social::follows | social::name)+ e)
+    )
+    .collect());
+}
+
+#[test]
+fn parity_inverse_from_literal() {
+    let f = fixture();
+    assert_parity!(f, |src| find!(
+        (s: Inline<UnknownInline>, e: Inline<inlineencodings::GenId>),
+        path!(src.clone(), s ^social::name e)
     )
     .collect());
 }
