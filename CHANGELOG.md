@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`triblespace-paths` provides exact regular-path indexes outside the core
+  query solver.** Fixed epsilon-free automata lower graph edges into unionable
+  direct-product summaries. A single SCC/bitset kernel materializes canonical
+  forward and reverse endpoint relations, including exact cross-segment paths,
+  and exposes them through the ordinary two-variable constraint protocol.
+
 ### Changed
 
 - **Breaking: the query engine is the propose/confirm engine.** The residual /
