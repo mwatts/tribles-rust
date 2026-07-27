@@ -170,6 +170,11 @@ impl Automaton {
         self.initial.iter().copied()
     }
 
+    /// Canonically ordered accepting states.
+    pub fn accepting_states(&self) -> impl Iterator<Item = StateId> + '_ {
+        self.accepting.iter().copied()
+    }
+
     /// Whether `state` accepts a completed path.
     pub fn is_accepting(&self, state: StateId) -> bool {
         self.accepting.contains(&state)

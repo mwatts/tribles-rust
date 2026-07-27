@@ -2,6 +2,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use triblespace_core::inline::RawInline;
+use triblespace_core::trible::Trible;
 
 use crate::{Automaton, GraphEdge, PathError, PathSummary};
 
@@ -61,6 +62,14 @@ impl PathIndex {
         edges: impl IntoIterator<Item = GraphEdge>,
     ) -> Result<Self, PathError> {
         Self::from_summary(PathSummary::from_edges(automaton, edges))
+    }
+
+    /// Builds an index directly from tribles.
+    pub fn from_tribles<'a>(
+        automaton: Automaton,
+        tribles: impl IntoIterator<Item = &'a Trible>,
+    ) -> Result<Self, PathError> {
+        Self::from_summary(PathSummary::from_tribles(automaton, tribles))
     }
 
     /// Materializes one exact endpoint relation from a constructional summary.

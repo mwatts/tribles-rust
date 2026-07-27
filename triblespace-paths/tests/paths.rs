@@ -358,6 +358,54 @@ fn constraint_supports_constants_repeated_variables_and_resumable_chunks() {
     let same = index.constraint(start, start);
     assert_eq!(same.estimate(start.index, &Binding::default()), Some(0));
     assert!(!same.satisfied(&Binding::default()));
+
+    let cyclic = PathIndex::from_edges(plus(6), [edge(1, 6, 2), edge(2, 6, 1)]).unwrap();
+    let same = cyclic.constraint(start, start);
+    assert_eq!(same.estimate(start.index, &Binding::default()), Some(2));
+    assert!(same.satisfied(&Binding::default()));
+    let mut proposals = ProposalBuffer::new();
+    same.propose(start.index, &Binding::default(), &mut proposals);
+    assert_eq!(
+        proposals.live_values(0).copied().collect::<Vec<_>>(),
+        vec![vertex(1), vertex(2)]
+    );
+}
+
+#[test]
+fn zero_inline_is_not_confused_with_an_unstarted_chunk_cursor() {
+    let index = PathIndex::from_edges(
+        plus(6),
+        [GraphEdge {
+            source: [0; 32],
+            attribute: attribute(6),
+            target: vertex(1),
+        }],
+    )
+    .unwrap();
+    let start = Variable::<UnknownInline>::new(0);
+    let constraint = index.constraint(start, Inline::<UnknownInline>::new(vertex(1)));
+    let mut cursor = ProposeCursor::default();
+    let mut proposals = ProposalBuffer::new();
+
+    assert!(constraint.propose_chunk(
+        start.index,
+        &Binding::default(),
+        &mut cursor,
+        0,
+        &mut proposals,
+    ));
+    assert!(!cursor.started);
+    assert!(!constraint.propose_chunk(
+        start.index,
+        &Binding::default(),
+        &mut cursor,
+        1,
+        &mut proposals,
+    ));
+    assert_eq!(
+        proposals.live_values(0).copied().collect::<Vec<_>>(),
+        vec![[0; 32]]
+    );
 }
 
 #[test]
