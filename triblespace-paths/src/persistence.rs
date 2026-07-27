@@ -21,19 +21,20 @@ use crate::{Automaton, PathError, PathIndex, PathSummary, Step};
 const HEADER_LEN: usize = 48;
 const FINGERPRINT_VERSION: u32 = 1;
 
-// The PathRollup algorithm id doubles as the automaton wire domain separator.
-// Minted with `trible genid` on 2026-07-28.
+// The PathRollup v2 algorithm id doubles as the automaton wire domain
+// separator. Minted with `trible genid` on 2026-07-28 when canonical summaries
+// were restricted to matched support plus nullable identity.
 const AUTOMATON_FINGERPRINT_DOMAIN: [u8; 16] = [
-    0x4a, 0x16, 0x63, 0xca, 0x02, 0x77, 0xff, 0xaf, 0xfb, 0x8e, 0x8c, 0x25, 0xf1, 0x4f, 0xae, 0x8f,
+    0x34, 0x12, 0x16, 0xbf, 0xe7, 0x38, 0xe2, 0xd8, 0x2b, 0xff, 0xf9, 0x6f, 0x52, 0xe7, 0xfe, 0x06,
 ];
 
 attributes! {
     /// Canonical BLAKE3 fingerprint of the fixed path automaton. Minted with
     /// `trible genid` on 2026-07-28.
     "77DF5A905CCE3B0643BB02999F73BE4C" as pub path_automaton_fingerprint: Hash<Blake3>;
-    /// Canonical direct-product summary for one source range. Minted with
-    /// `trible genid` on 2026-07-28.
-    "331F4F0DB6FCBCA8FC7ECB9EB84B86F7" as pub seg_path_summary: Handle<PathSummaryBlob>;
+    /// Canonical v2 direct-product summary for one source range. Minted with
+    /// `trible genid` on 2026-07-28 for the matched-support value schema.
+    "743B2E1BDF3E42B867242CE0F916E7E5" as pub seg_path_summary: Handle<PathSummaryBlob>;
 }
 
 /// Canonical direct-product summary bytes for one fixed automaton.
@@ -43,10 +44,11 @@ impl BlobEncoding for PathSummaryBlob {}
 
 impl MetaDescribe for PathSummaryBlob {
     fn describe() -> Fragment {
-        // Minted with `trible genid` on 2026-07-28.
-        let id: Id = id_hex!("9FB5F003301064330FDB73F2C23DF420");
+        // Minted with `trible genid` on 2026-07-28 when canonical-domain
+        // validation changed to matched support plus nullable identity.
+        let id: Id = id_hex!("F15A8487F9372278E10F220DC37C2888");
         entity! { ExclusiveId::force_ref(&id) @
-            metadata::name: "path-summary-v1",
+            metadata::name: "path-summary-v2",
             metadata::description: "Canonical fixed-header path summary: the sorted graph-term domain required by one fixed automaton followed by sorted direct product arcs. Nullable automata retain the complete supplied endpoint universe; zero-vertex summaries are represented by an absent artifact.",
             metadata::tag: metadata::KIND_BLOB_ENCODING,
         }
@@ -350,8 +352,9 @@ pub struct PathRollup {
 }
 
 impl PathRollup {
-    /// Stable algorithm id minted with `trible genid` on 2026-07-28.
-    pub const KIND_ID_HEX: &'static str = "4A1663CA0277FFAFFB8E8C25F14FAE8F";
+    /// Stable v2 algorithm id minted with `trible genid` on 2026-07-28 for
+    /// matched-support summaries plus nullable full-domain identity.
+    pub const KIND_ID_HEX: &'static str = "341216BFE738E2D82BFFF96F52E7FE06";
 
     /// Construct one recipe. The canonical automaton fingerprint participates
     /// in recipe identity, so different path expressions never share ranges.
@@ -611,7 +614,7 @@ mod tests {
         assert_eq!(first_blob.get_handle(), second_blob.get_handle());
         assert_eq!(
             hex(first_blob.bytes.as_ref()),
-            "d11c79c5950cc7776f14b8fe95ad3a962eca85e13bd8ddb8425793ea3467533701000000020000000100000000000000010101010101010101010101010101010101010101010101010101010101010102020202020202020202020202020202020202020202020202020202020202020000000001000000"
+            "5f73d0cf0230edf0512144e14a5e96132e661e1925556060b8036f217dc9b7f801000000020000000100000000000000010101010101010101010101010101010101010101010101010101010101010102020202020202020202020202020202020202020202020202020202020202020000000001000000"
         );
 
         let ordered = plus(7);
