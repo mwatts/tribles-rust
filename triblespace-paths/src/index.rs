@@ -83,90 +83,23 @@ impl PathIndex {
         let offset_count = vertex_count
             .checked_add(1)
             .ok_or(PathError::CapacityOverflow)?;
-        let state_count = summary.automaton.state_count() as usize;
-        let product_count = vertex_count
-            .checked_mul(state_count)
-            .ok_or(PathError::CapacityOverflow)?;
-        if product_count > u32::MAX as usize {
-            return Err(PathError::ProductCarrierTooLarge {
-                vertices: vertex_count,
-                states: summary.automaton.state_count(),
-            });
-        }
+        let active_vertices = summary.active_vertices();
+        let active = materialize_active_relation(&summary, &active_vertices)?;
+        let forward = expand_relation(
+            &summary.vertices,
+            &active_vertices,
+            active,
+            summary.automaton.accepts_empty(),
+        )?;
 
-        let mut adjacency = vec![Vec::<u32>::new(); product_count];
-        for (source, target) in summary.ordinal_arcs() {
-            adjacency[source as usize].push(target);
-        }
-        for targets in &mut adjacency {
-            targets.sort_unstable();
-            targets.dedup();
-        }
-
-        let (component_of, component_count) = strongly_connected_components(&adjacency);
-        let condensation = condensation(&adjacency, &component_of, component_count);
-        let topological = topological_order(&condensation);
-
-        let row_words = vertex_count.div_ceil(u64::BITS as usize);
-        let reach_words = component_count
-            .checked_mul(row_words)
-            .ok_or(PathError::CapacityOverflow)?;
-        let mut accepting_reach = vec![0u64; reach_words];
-        for (product, &component) in component_of.iter().enumerate() {
-            let state = (product % state_count) as u32;
-            if summary.automaton.is_accepting(state) {
-                let component = component as usize;
-                set_bit(
-                    &mut accepting_reach[component * row_words..(component + 1) * row_words],
-                    product / state_count,
-                );
-            }
-        }
-        for &component in topological.iter().rev() {
-            for &successor in &condensation[component as usize] {
-                union_component_rows(
-                    &mut accepting_reach,
-                    row_words,
-                    component as usize,
-                    successor as usize,
-                );
-            }
-        }
-
-        let mut offsets = Vec::with_capacity(offset_count);
-        let mut values = Vec::new();
-        let mut starts = Vec::new();
-        let mut diagonal = Vec::new();
-        let mut row = vec![0u64; row_words];
-        offsets.push(0);
-        for source in 0..vertex_count {
-            row.fill(0);
-            for initial in summary.automaton.initial_states() {
-                let product = source * state_count + initial as usize;
-                let component = component_of[product] as usize;
-                let component_row =
-                    &accepting_reach[component * row_words..(component + 1) * row_words];
-                for (target, source) in row.iter_mut().zip(component_row) {
-                    *target |= source;
-                }
-            }
-            let before = values.len();
-            values.extend(
-                set_bits(&row)
-                    .take_while(|&target| target < vertex_count)
-                    .map(|target| {
-                        u32::try_from(target).expect("vertex count was checked against u32::MAX")
-                    }),
-            );
-            if values.len() != before {
-                starts.push(source as u32);
-            }
-            if bit_is_set(&row, source) {
-                diagonal.push(source as u32);
-            }
-            offsets.push(values.len());
-        }
-        let forward = Csr { offsets, values };
+        let starts = (0..vertex_count)
+            .filter(|&source| !forward.row(source).is_empty())
+            .map(|source| source as u32)
+            .collect();
+        let diagonal = (0..vertex_count)
+            .filter(|&source| forward.row(source).binary_search(&(source as u32)).is_ok())
+            .map(|source| source as u32)
+            .collect();
         let reverse = forward.transpose(vertex_count, offset_count);
         let ends = (0..vertex_count)
             .filter(|&target| !reverse.row(target).is_empty())
@@ -193,7 +126,7 @@ impl PathIndex {
         self.summary.automaton()
     }
 
-    /// Number of graph terms in the zero-hop universe.
+    /// Number of graph terms in the canonical endpoint domain.
     pub fn vertex_count(&self) -> usize {
         self.summary.vertices.len()
     }
@@ -321,6 +254,156 @@ impl PathIndex {
     }
 }
 
+/// Close only the endpoints that occur in a direct product arc. Every
+/// positive-length accepted path lies in this carrier. A nullable automaton's
+/// identity over the larger supplied domain is added by [`expand_relation`].
+fn materialize_active_relation(
+    summary: &PathSummary,
+    vertices: &[RawInline],
+) -> Result<Csr, PathError> {
+    let vertex_count = vertices.len();
+    let offset_count = vertex_count
+        .checked_add(1)
+        .ok_or(PathError::CapacityOverflow)?;
+    let state_count = summary.automaton.state_count() as usize;
+    let product_count = vertex_count
+        .checked_mul(state_count)
+        .ok_or(PathError::CapacityOverflow)?;
+    if product_count > u32::MAX as usize {
+        return Err(PathError::ProductCarrierTooLarge {
+            vertices: vertex_count,
+            states: summary.automaton.state_count(),
+        });
+    }
+
+    let mut adjacency = vec![Vec::<u32>::new(); product_count];
+    for (source, target) in summary.ordinal_arcs_in(vertices) {
+        adjacency[source as usize].push(target);
+    }
+    for targets in &mut adjacency {
+        targets.sort_unstable();
+        targets.dedup();
+    }
+
+    let (component_of, component_count) = strongly_connected_components(&adjacency);
+    let condensation = condensation(&adjacency, &component_of, component_count);
+    let topological = topological_order(&condensation);
+
+    let row_words = vertex_count.div_ceil(u64::BITS as usize);
+    let reach_words = component_count
+        .checked_mul(row_words)
+        .ok_or(PathError::CapacityOverflow)?;
+    let mut accepting_reach = vec![0u64; reach_words];
+    for (product, &component) in component_of.iter().enumerate() {
+        let state = (product % state_count) as u32;
+        if summary.automaton.is_accepting(state) {
+            let component = component as usize;
+            set_bit(
+                &mut accepting_reach[component * row_words..(component + 1) * row_words],
+                product / state_count,
+            );
+        }
+    }
+    for &component in topological.iter().rev() {
+        for &successor in &condensation[component as usize] {
+            union_component_rows(
+                &mut accepting_reach,
+                row_words,
+                component as usize,
+                successor as usize,
+            );
+        }
+    }
+
+    let mut offsets = Vec::with_capacity(offset_count);
+    let mut values = Vec::new();
+    let mut row = vec![0u64; row_words];
+    offsets.push(0);
+    for source in 0..vertex_count {
+        row.fill(0);
+        for initial in summary.automaton.initial_states() {
+            let product = source * state_count + initial as usize;
+            let component = component_of[product] as usize;
+            let component_row =
+                &accepting_reach[component * row_words..(component + 1) * row_words];
+            for (target, source) in row.iter_mut().zip(component_row) {
+                *target |= source;
+            }
+        }
+        values.extend(
+            set_bits(&row)
+                .take_while(|&target| target < vertex_count)
+                .map(|target| {
+                    u32::try_from(target).expect("active vertex count was checked against u32::MAX")
+                }),
+        );
+        offsets.push(values.len());
+    }
+    Ok(Csr { offsets, values })
+}
+
+fn expand_relation(
+    vertices: &[RawInline],
+    active_vertices: &[RawInline],
+    active: Csr,
+    add_identity: bool,
+) -> Result<Csr, PathError> {
+    if vertices == active_vertices {
+        return Ok(active);
+    }
+
+    let active_to_full = active_vertices
+        .iter()
+        .map(|vertex| {
+            vertices
+                .binary_search(vertex)
+                .expect("active path vertices belong to the summary domain")
+        })
+        .collect::<Vec<_>>();
+    let added_identity = if add_identity {
+        vertices.len().saturating_sub(active_vertices.len())
+    } else {
+        0
+    };
+    let capacity = active
+        .values
+        .len()
+        .checked_add(added_identity)
+        .ok_or(PathError::CapacityOverflow)?;
+    let mut offsets = Vec::with_capacity(
+        vertices
+            .len()
+            .checked_add(1)
+            .ok_or(PathError::CapacityOverflow)?,
+    );
+    let mut values = Vec::with_capacity(capacity);
+    let mut active_source = 0usize;
+    offsets.push(0);
+    for source in 0..vertices.len() {
+        if active_to_full.get(active_source).copied() == Some(source) {
+            let mut identity_written = false;
+            for &active_target in active.row(active_source) {
+                let target = active_to_full[active_target as usize];
+                if add_identity && !identity_written && source < target {
+                    values.push(source as u32);
+                    identity_written = true;
+                }
+                values.push(target as u32);
+                identity_written |= source == target;
+            }
+            if add_identity && !identity_written {
+                values.push(source as u32);
+            }
+            active_source += 1;
+        } else if add_identity {
+            values.push(source as u32);
+        }
+        offsets.push(values.len());
+    }
+    debug_assert_eq!(active_source, active_vertices.len());
+    Ok(Csr { offsets, values })
+}
+
 fn strongly_connected_components(adjacency: &[Vec<u32>]) -> (Vec<u32>, usize) {
     let mut reverse = vec![Vec::new(); adjacency.len()];
     for (source, targets) in adjacency.iter().enumerate() {
@@ -427,12 +510,6 @@ fn union_component_rows(rows: &mut [u64], width: usize, target: usize, source: u
 
 fn set_bit(words: &mut [u64], bit: usize) {
     words[bit / u64::BITS as usize] |= 1u64 << (bit % u64::BITS as usize);
-}
-
-fn bit_is_set(words: &[u64], bit: usize) -> bool {
-    words
-        .get(bit / u64::BITS as usize)
-        .is_some_and(|word| word & (1u64 << (bit % u64::BITS as usize)) != 0)
 }
 
 fn set_bits(words: &[u64]) -> impl Iterator<Item = usize> + '_ {

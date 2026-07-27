@@ -50,10 +50,11 @@ struct ProductArc {
 
 /// Canonical, unionable constructional summary for one fixed automaton.
 ///
-/// The vertex universe includes both endpoints of every supplied graph edge,
-/// even when no transition matches that edge. This is what gives nullable
-/// automata their correctly scoped zero-hop identity. The retained arcs are
-/// direct product arcs, never a transitive closure.
+/// Nullable automata retain both endpoints of every supplied graph edge so
+/// their zero-hop identity has the correct graph domain. Non-nullable
+/// automata retain only endpoints of edges matching at least one transition:
+/// every positive-length path lies entirely in that support. The retained
+/// arcs are direct product arcs, never a transitive closure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PathSummary {
     pub(crate) automaton: Automaton,
@@ -143,12 +144,14 @@ impl PathSummary {
     /// Lowers a SET of graph edges into canonical direct product arcs.
     pub fn from_edges(automaton: Automaton, edges: impl IntoIterator<Item = GraphEdge>) -> Self {
         let edges = edges.into_iter().collect::<BTreeSet<_>>();
-        let vertices = edges
-            .iter()
-            .flat_map(|edge| [edge.source, edge.target])
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
+        let mut vertices = if automaton.accepts_empty() {
+            edges
+                .iter()
+                .flat_map(|edge| [edge.source, edge.target])
+                .collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::new()
+        };
         let mut arcs = BTreeSet::new();
         for edge in edges {
             for transition in automaton.transitions() {
@@ -160,6 +163,8 @@ impl PathSummary {
                 } else {
                     (edge.source, edge.target)
                 };
+                vertices.insert(source);
+                vertices.insert(target);
                 arcs.insert(ProductArc {
                     source: ProductNode {
                         vertex: source,
@@ -174,7 +179,7 @@ impl PathSummary {
         }
         Self {
             automaton,
-            vertices,
+            vertices: vertices.into_iter().collect(),
             arcs: arcs.into_iter().collect(),
         }
     }
@@ -192,7 +197,7 @@ impl PathSummary {
         &self.automaton
     }
 
-    /// Complete sorted graph-term universe.
+    /// Sorted graph-term domain required by this fixed automaton.
     pub fn vertices(&self) -> &[RawInline] {
         &self.vertices
     }
@@ -239,17 +244,35 @@ impl PathSummary {
     }
 
     pub(crate) fn ordinal_arcs(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.ordinal_arcs_in(&self.vertices)
+    }
+
+    pub(crate) fn active_vertices(&self) -> Vec<RawInline> {
+        self.arcs
+            .iter()
+            .flat_map(|arc| [arc.source.vertex, arc.target.vertex])
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    pub(crate) fn has_canonical_domain(&self) -> bool {
+        self.automaton.accepts_empty() || self.vertices == self.active_vertices()
+    }
+
+    pub(crate) fn ordinal_arcs_in<'a>(
+        &'a self,
+        vertices: &'a [RawInline],
+    ) -> impl Iterator<Item = (u32, u32)> + 'a {
         let states = self.automaton.state_count();
         self.arcs.iter().map(move |arc| {
-            let source_vertex = self
-                .vertices
+            let source_vertex = vertices
                 .binary_search(&arc.source.vertex)
-                .expect("summary arc source belongs to its vertex universe")
+                .expect("summary arc source belongs to the requested product carrier")
                 as u32;
-            let target_vertex = self
-                .vertices
+            let target_vertex = vertices
                 .binary_search(&arc.target.vertex)
-                .expect("summary arc target belongs to its vertex universe")
+                .expect("summary arc target belongs to the requested product carrier")
                 as u32;
             (
                 source_vertex * states + arc.source.state,

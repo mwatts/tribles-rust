@@ -47,7 +47,7 @@ impl MetaDescribe for PathSummaryBlob {
         let id: Id = id_hex!("9FB5F003301064330FDB73F2C23DF420");
         entity! { ExclusiveId::force_ref(&id) @
             metadata::name: "path-summary-v1",
-            metadata::description: "Canonical fixed-header path summary: a sorted graph-term universe followed by sorted direct product arcs. The automaton is pinned by a stable BLAKE3 wire fingerprint; zero-vertex summaries are represented by an absent artifact.",
+            metadata::description: "Canonical fixed-header path summary: the sorted graph-term domain required by one fixed automaton followed by sorted direct product arcs. Nullable automata retain the complete supplied endpoint universe; zero-vertex summaries are represented by an absent artifact.",
             metadata::tag: metadata::KIND_BLOB_ENCODING,
         }
     }
@@ -62,6 +62,8 @@ pub enum PathSummaryBlobError {
     DifferentAutomaton,
     /// A zero-vertex summary must be represented by no artifact.
     NoncanonicalEmpty,
+    /// A non-nullable summary retained vertices outside matched-edge support.
+    NoncanonicalDomain,
     /// Vertex values are not strictly increasing.
     VertexOrder,
     /// Product arcs are not strictly increasing.
@@ -80,6 +82,9 @@ impl fmt::Display for PathSummaryBlobError {
             Self::BadLength => "path-summary blob has an invalid length",
             Self::DifferentAutomaton => "path-summary blob belongs to a different automaton",
             Self::NoncanonicalEmpty => "a zero-vertex path summary must be absent",
+            Self::NoncanonicalDomain => {
+                "a non-nullable path summary contains vertices outside matched-edge support"
+            }
             Self::VertexOrder => "path-summary vertices are not strictly ordered",
             Self::ArcOrder => "path-summary arcs are not strictly ordered",
             Self::ArcOutOfBounds => "path-summary arc is outside the product carrier",
@@ -97,6 +102,9 @@ impl PathSummaryBlob {
     pub fn encode(summary: &PathSummary) -> Result<Blob<Self>, PathSummaryBlobError> {
         if summary.vertices().is_empty() {
             return Err(PathSummaryBlobError::NoncanonicalEmpty);
+        }
+        if !summary.has_canonical_domain() {
+            return Err(PathSummaryBlobError::NoncanonicalDomain);
         }
         let vertex_count = u32::try_from(summary.vertices().len())
             .map_err(|_| PathSummaryBlobError::CapacityOverflow)?;
@@ -178,8 +186,12 @@ impl PathSummaryBlob {
             previous = Some(arc);
             arcs.push(arc);
         }
-        PathSummary::from_canonical_ordinals(automaton.clone(), vertices, arcs)
-            .map_err(|_| PathSummaryBlobError::CapacityOverflow)
+        let summary = PathSummary::from_canonical_ordinals(automaton.clone(), vertices, arcs)
+            .map_err(|_| PathSummaryBlobError::CapacityOverflow)?;
+        if !summary.has_canonical_domain() {
+            return Err(PathSummaryBlobError::NoncanonicalDomain);
+        }
+        Ok(summary)
     }
 }
 
@@ -671,20 +683,41 @@ mod tests {
     }
 
     #[test]
-    fn zero_vertex_is_absent_but_unmatched_vertices_persist() {
+    fn unmatched_nonnullable_is_absent_but_nullable_identity_persists() {
         let rollup = PathRollup::new(plus(7));
         assert!(rollup.build(&TribleSet::new()).unwrap().is_empty());
 
         let source = edge_facts(1, 2);
-        let [summary] = rollup.build(&source).unwrap().try_into().unwrap();
+        assert!(rollup.build(&source).unwrap().is_empty());
+
+        let noncanonical = PathSummary::from_canonical_ordinals(
+            rollup.automaton().clone(),
+            vec![vertex(1), vertex(2)],
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(
+            PathSummaryBlob::encode(&noncanonical).unwrap_err(),
+            PathSummaryBlobError::NoncanonicalDomain
+        );
+
+        let nullable = Automaton::new(1, [0], [0], []).unwrap();
+        let nullable_rollup = PathRollup::new(nullable);
+        let [summary] = nullable_rollup.build(&source).unwrap().try_into().unwrap();
         assert_eq!(summary.vertices().len(), 2);
         assert_eq!(summary.direct_arc_count(), 0);
         let decoded = PathSummaryBlob::decode(
             PathSummaryBlob::encode(&summary).unwrap(),
-            rollup.automaton(),
+            nullable_rollup.automaton(),
         )
         .unwrap();
         assert_eq!(decoded, summary);
+        assert_eq!(
+            PathIndex::from_summary(decoded)
+                .unwrap()
+                .accepted_pair_count(),
+            2
+        );
     }
 
     #[test]
@@ -716,7 +749,7 @@ mod tests {
 
     #[test]
     fn fanout_merge_preserves_lineage_and_empty_projection() {
-        let rollup = PathRollup::new(plus(9));
+        let rollup = PathRollup::new(plus_label(metadata::tag.id().into()));
         let mut storage = MemoryRepo::default();
         let mut manifest = Manifest::new(&rollup).unwrap().to_tribles();
         let mut parent = None;

@@ -1,8 +1,10 @@
 //! Exact regular-path relations kept outside the core query solver.
 //!
 //! A [`PathSummary`] is the unionable, constructional form: a canonical fixed
-//! automaton, its complete graph-term universe, and the direct arcs of their
-//! product. A [`PathIndex`] materializes one snapshot with a single algorithm:
+//! automaton, the graph-term domain it requires, and the direct arcs of their
+//! product. Nullable automata retain the complete supplied endpoint universe;
+//! non-nullable automata need only matched-edge support. A [`PathIndex`]
+//! materializes one snapshot with a single algorithm:
 //! SCC condensation followed by reverse-topological bitset propagation. No
 //! product transitive closure survives materialization: the index retains the
 //! constructional summary and the accepted endpoint relation.

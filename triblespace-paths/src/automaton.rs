@@ -175,6 +175,16 @@ impl Automaton {
         self.accepting.iter().copied()
     }
 
+    /// Whether the automaton accepts the empty path.
+    ///
+    /// The automaton is epsilon-free, so this is exactly the overlap between
+    /// its initial and accepting state sets.
+    pub fn accepts_empty(&self) -> bool {
+        self.initial
+            .iter()
+            .any(|state| self.accepting.contains(state))
+    }
+
     /// Whether `state` accepts a completed path.
     pub fn is_accepting(&self, state: StateId) -> bool {
         self.accepting.contains(&state)

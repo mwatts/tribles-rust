@@ -157,6 +157,53 @@ fn nullable_identity_is_scoped_to_the_complete_vertex_universe() {
 }
 
 #[test]
+fn nonnullable_domain_is_exactly_matched_edge_support() {
+    let automaton = plus(7);
+    let matched = [edge(1, 7, 2), edge(2, 7, 3)];
+    let all = [matched[0], edge(8, 1, 9), matched[1], edge(10, 2, 11)];
+    let filtered = PathSummary::from_edges(automaton.clone(), matched);
+    let unfiltered = PathSummary::from_edges(automaton, all);
+
+    assert_eq!(unfiltered, filtered);
+    assert_eq!(unfiltered.vertices(), &[vertex(1), vertex(2), vertex(3)]);
+    assert_eq!(
+        accepted(&PathIndex::from_summary(unfiltered).unwrap()),
+        BTreeSet::from([
+            (vertex(1), vertex(2)),
+            (vertex(1), vertex(3)),
+            (vertex(2), vertex(3)),
+        ])
+    );
+}
+
+#[test]
+fn nullable_closure_uses_matched_support_plus_full_identity() {
+    let automaton = Automaton::new(
+        2,
+        [0],
+        [0, 1],
+        [
+            Transition::new(0, 1, Step::Forward(attribute(7))),
+            Transition::new(1, 1, Step::Forward(attribute(7))),
+        ],
+    )
+    .unwrap();
+    let edges = [edge(1, 7, 2), edge(2, 7, 3), edge(8, 1, 9), edge(10, 2, 11)];
+    let index = PathIndex::from_edges(automaton.clone(), edges).unwrap();
+
+    assert_eq!(accepted(&index), bfs_oracle(&automaton, &edges));
+    assert_eq!(index.vertex_count(), 7);
+    assert_eq!(index.accepted_pair_count(), 10);
+    for unmatched in [vertex(8), vertex(9), vertex(10), vertex(11)] {
+        assert!(index.contains(&unmatched, &unmatched));
+        assert_eq!(
+            index.reachable_from(&unmatched).collect::<Vec<_>>(),
+            [unmatched]
+        );
+    }
+}
+
+#[test]
 fn inverse_negation_and_wildcards_are_automaton_semantics() {
     let automaton = Automaton::new(
         4,
