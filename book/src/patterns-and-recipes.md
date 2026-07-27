@@ -82,33 +82,37 @@ find!(grandparent: Id,
                  pattern!(&catalog, [{ ?mid @ tree::parent: ?grandparent }]))))
 ```
 
-Unbounded traversal — *all* ancestors, *all* descendants — has no query-time
-form. The engine has no recursion: the `path!` macro that used to evaluate
-regular expressions over edge attributes was removed along with the query
-engine that hosted it, because traversal needs per-activation state and the
-constraint protocol is stateless (see [Query
-Engine](query-engine.md#where-regular-paths-went)). Closure is coming back as a
-maintained index in a separate `triblespace-paths` crate, which is still under
-development.
-
-Until it lands, drive the fixpoint from application code — query one hop,
-collect the frontier, repeat until it stops growing:
+Unbounded traversal — *all* ancestors, *all* descendants — is handled by the
+standalone `triblespace-paths` closure index rather than by query-time
+recursion. Build an epsilon-free automaton for one-or-more `parent` edges,
+materialize it once, and use its endpoint relation as an ordinary constraint:
 
 ```rust,ignore
-let mut ancestors: HashSet<Id> = HashSet::new();
-let mut frontier = vec![node_id];
-while let Some(node) = frontier.pop() {
-    for (parent,) in find!((parent: Id),
-                           pattern!(&catalog, [{ node @ tree::parent: ?parent }])) {
-        if ancestors.insert(parent) {
-            frontier.push(parent);
-        }
-    }
+let parent = tree::parent.id().into();
+let parent_plus = Automaton::new(
+    2,
+    [0],
+    [1],
+    [
+        Transition::new(0, 1, Step::Forward(parent)),
+        Transition::new(1, 1, Step::Forward(parent)),
+    ],
+)?;
+let ancestors = PathIndex::from_tribles(parent_plus, catalog.iter())?;
+let node: Inline<GenId> = node_id.to_inline();
+
+for ancestor in find!(
+    ancestor: Id,
+    ancestors.constraint(node, ancestor)
+) {
+    println!("ancestor: {ancestor:?}");
 }
 ```
 
-The `HashSet` doubles as the visited set, which also terminates the loop on
-cyclic data.
+For repository-backed maintenance and the cost of a potentially dense closure,
+see [Regular Path Indexes](regular-path-indexes.md). The core query engine stays
+non-recursive and stateless; the index turns the recursive result into a normal
+relation before the query begins.
 
 ## Entity classification with tags
 

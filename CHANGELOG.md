@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   live cover on attachment. A same-metadata `IndexSnapshot` pins the branch
   metadata, source commit head, and manifest together so stale coverage fails
   closed; full cover audits remain explicit repair/verification operations.
+- **The book now teaches the stable standalone regular-path index.** A dedicated
+  chapter covers explicit epsilon-free automata, direct `PathIndex` joins,
+  `PathRollup` repository maintenance, cross-range closure, nullable universes,
+  freshness versus full cover audits, and the potentially quadratic endpoint
+  relation. Interim status guidance and its resolved documentation backlog
+  entry are removed.
 
 ### Changed
 
@@ -34,7 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   consumer's choice — collect into a set, or use an outer enumeration with an
   inner `exists!`). Constants are Term-native again, so `or!` arms with
   differing literals align. Regular paths return as a materialized closure
-  index (`triblespace-paths`, under development), not as query-time traversal.
+  index in `triblespace-paths`, not as query-time traversal.
   Measured against the engine it replaces on a 1M-trible dblp rung: interactive
   queries recover 2.5-5.7x, archive build is unchanged, and the one capability
   lost with query-time RPQ is exactly the one moving to the index.
@@ -61,9 +67,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `formal-verification.md`, `architecture.md`, `patterns-and-recipes.md`,
   and `documentation-improvements.md` drop the deleted engine's
   vocabulary. `path!` material is replaced honestly: paths moved to a
-  materialized closure index (`triblespace-paths`, under development), and
-  the book gives a fixed-depth join and an application-side fixpoint loop
-  as the interim answer rather than inventing an API.
+  materialized closure index in `triblespace-paths`; fixed-depth joins remain
+  available as ordinary explicit patterns.
 - **Bindings are paths, not value copies.** A bound variable's value
   always originates from that variable's own level buffer, so `Binding`
   now stores the `u32` index of the chosen entry and resolves it through
@@ -88,7 +93,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   real point is downstream: a batch of bindings is now a small integer
   matrix over shared, device-resident buffers — the shape GPU *descent*
   needs, not just GPU confirm.
-
 - **Pattern constants are Term-native again — `or!(pattern!, pattern!)`
   works.** Resurrects 78c1a1b7's constant folding on the June-protocol
   engine: `TribleSetConstraint`, `SuccinctArchiveConstraint`, and the GPU

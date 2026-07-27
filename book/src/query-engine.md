@@ -375,11 +375,12 @@ read the closure as an ordinary relation. Reachability becomes a lookup rather
 than a traversal, which is the right shape for a data model where facts are
 only ever added — the closure grows monotonically with the edge set.
 
-That work lives in a separate `triblespace-paths` crate and is under active
-development; it is not part of the published surface yet, and this book will
-document the API when there is a stable one to document. Until then, express
-bounded traversals as explicit pattern clauses (one clause per hop), and drive
-unbounded ones from application code.
+The stable implementation lives in the standalone `triblespace-paths` crate.
+It persists unionable direct-product summaries per repository range, closes
+their global union, and exposes the resulting endpoint relation through the
+ordinary two-variable constraint protocol. See [Regular Path
+Indexes](regular-path-indexes.md) for the API, lifecycle, freshness boundary,
+and dense-output trade-off.
 
 ## What the engine will not do
 

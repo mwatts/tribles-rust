@@ -525,13 +525,14 @@ and its evaluator have been removed: query-time traversal needs per-activation
 state, which the stateless constraint protocol has no place for, and keeping it
 inside the protocol meant every constraint paid for machinery only paths used.
 
-Regular paths are returning as a materialized closure **index** in a separate
-`triblespace-paths` crate: graph edges and an automaton are compiled into a
-product graph whose reflexive transitive closure is maintained, so a query
-reads reachability as an ordinary relation instead of traversing at search
-time. That crate is under active development and is not part of the published
-surface yet; this chapter will document the API once there is a stable one.
+The stable replacement is the standalone `triblespace-paths` crate. It compiles
+graph edges and a fixed epsilon-free automaton into a materialized accepted
+endpoint relation, exposed through an ordinary two-variable constraint. That
+constraint composes directly with `find!`, `and!`, and `pattern!`; see
+[Regular Path Indexes](regular-path-indexes.md) for direct construction and
+range-native repository maintenance.
 
-In the meantime, write bounded traversals as explicit clauses — one pattern
-clause per hop, joined on `temp!` variables — and drive unbounded ones from
-application code, re-querying a frontier until it stops growing.
+For a fixed small number of hops, explicit pattern clauses joined on `temp!`
+variables remain simpler. For unbounded traversal, use the path index or drive
+a one-off frontier search from application code when materializing a potentially
+dense endpoint relation would not pay for itself.

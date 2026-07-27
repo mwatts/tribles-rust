@@ -15,6 +15,7 @@
 - [Macro Cookbook](macro-cookbook.md)
 - [Encodings](encodings.md)
 - [Incremental Queries](incremental-queries.md)
+- [Regular Path Indexes](regular-path-indexes.md)
 - [Deep Dive: Query Engine](query-engine.md)
 - [Deep Dive: Atreides Join](atreides-join.md)
 - [Deep Dive: Type Algebra](type-algebra.md)
