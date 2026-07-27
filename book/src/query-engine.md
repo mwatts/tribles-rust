@@ -402,26 +402,23 @@ thread-local state is not propagated. Observations are diagnostics only: they
 must never feed estimates, protocol answers, state identity, action ordering,
 or scheduling decisions in the execution they observe.
 
-The optional `triblespace-gpu::WgpuSuccinctArchive` exercises that seam without
-putting a device dependency in core. It wraps the canonical archive, keeps its
-six Jerky wavelet matrices resident, and routes every nonempty `confirm` rank
-stream through a device-neutral `RingBatchQuery`; estimates, proposals, prefix
-walks, domain lookups, and satisfaction checks remain on CPU. Candidate storage
-is not an execution capability: both a one-parent plain-values stream and a
-multi-parent tagged stream reach the backend. GPU admission is per batch (8,192
-rank probes by default), so either representation may still fall back to CPU.
-This is intentional: forcing every tiny rank batch to emit synchronizing device
-work is much slower than either executor, while fat batches amortize fixed
-dispatch/readback costs and use the device's rank throughput.
-`WgpuSuccinctArchive::stats` exposes
-dispatches, fallbacks, probe totals, and batch extrema so backend/scheduler
-economics are observable rather than hidden in a planner heuristic.
-`WgpuSuccinctArchive::observe_residual_actions()` returns a borrowing,
-non-`Deref` adapter for the additional opt-in executor bridge. Bind that adapter
-before pattern construction so the GAT-produced constraint can borrow it for
-the full query lifetime. The direct `WgpuSuccinctArchive` pattern path remains
-structurally unobserved and performs no action-correlation lookup, clock read,
-or sample work.
+The optional `triblespace-gpu::WgpuSuccinctArchive` accelerates the
+succinct-archive constraint without putting a device dependency in core. The
+kill-only `confirm` contract is what makes this legal: verdicts computed
+anywhere merge back into a candidate region by word-wise AND, so a device can
+evaluate a whole region's membership probes in parallel and can never revive a
+dead entry. The wrapper keeps the archive's value universe, per-axis occupancy
+boundaries, and six Jerky wavelet matrices resident; estimates, proposals,
+prefix walks, and satisfaction checks remain on CPU. A `confirm` region with
+enough live candidates (16,384 by default, measured on Apple M4 Max Metal)
+uploads its candidate values and liveness words, runs the same probes the CPU
+arm would — a fused binary-search/occupancy kernel for unbound membership, a
+probe-fill/batched-rank/verdict-fold chain for range restriction — and reads
+back one verdict word per candidate. Everything below the threshold, and any
+device error, falls through to the canonical CPU arm, which is held to
+identical liveness words by the crate's parity suite.
+`WgpuSuccinctArchive::stats` exposes dispatch and fallback counters so the
+routing economics stay observable rather than hidden in a planner heuristic.
 
 The adapter samples every nonempty Succinct confirmation rank stream offered to
 the backend, whether its candidates use the plain-values or tagged

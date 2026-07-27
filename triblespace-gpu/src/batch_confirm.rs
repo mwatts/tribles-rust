@@ -1,0 +1,846 @@
+//! Batched WGPU confirmation for [`SuccinctArchive`] queries.
+//!
+//! The engine's [`Constraint::confirm`] protocol is kill-only: a confirmer
+//! receives one [`Candidates`] region (read-only values, killable `u32`
+//! liveness words) and may only zero words. That contract makes the archive's
+//! per-candidate membership probes embarrassingly parallel — every candidate's
+//! verdict is independent, and merging GPU verdicts back is a plain word-wise
+//! AND.
+//!
+//! [`WgpuSuccinctArchive`] wraps a CPU [`SuccinctArchive`] and keeps the
+//! structures the confirm probes touch resident on the default WGPU device:
+//! the value universe (as big-endian `u32` words for lexicographic binary
+//! search), the three axis occupancy boundaries, and the six Ring wavelet
+//! matrices. Its [`WgpuSuccinctArchiveConstraint`] mirrors the canonical
+//! constraint exactly, except that `confirm` calls whose region holds at
+//! least [`min_confirm_batch`](WgpuSuccinctArchive::min_confirm_batch) live
+//! candidates are evaluated on the device:
+//!
+//! * **Unbound membership** (no other position bound; the confirmed variable
+//!   is E, A, or V): one fused kernel per region — binary search of each
+//!   candidate value in the resident universe plus an axis-boundary
+//!   occupancy check — writes one verdict word per candidate.
+//! * **Range restriction** (one or two other positions bound): the fixed row
+//!   range is computed once on the CPU from the bound values, then three
+//!   enqueued kernels — candidate search/probe fill, Jerky's batched wavelet
+//!   rank, and verdict fold — run with a single readback of the verdict
+//!   words.
+//!
+//! Below the threshold, on any device error, and for every other protocol
+//! method, the wrapper defers to the canonical CPU constraint, so results are
+//! bit-identical either way (the parity suite in
+//! `tests/batch_confirm_parity.rs` holds the two paths to identical liveness
+//! words).
+
+use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use cubecl::prelude::*;
+use cubecl::wgpu::WgpuRuntime;
+use jerky::bit_vector::rank9sel::Rank9SelIndex;
+use jerky::bit_vector::{BitVector, Select};
+use jerky::char_sequences::WaveletMatrix;
+use jerky::gpu::{DeviceU32Buffer, GpuContext, GpuWaveletMatrix};
+use triblespace_core::blob::encodings::succinctarchive::{
+    SuccinctArchive, SuccinctArchiveConstraint, SuccinctRotation, Universe,
+};
+use triblespace_core::inline::encodings::genid::GenId;
+use triblespace_core::inline::{InlineEncoding, RawInline};
+use triblespace_core::query::{
+    and_words, Binding, Candidates, Constraint, ProposalBuffer, ProposeCursor, Term, TriblePattern,
+    Variable, VariableId, VariableSet,
+};
+
+const THREADS: u32 = super::THREADS;
+
+/// Jerky's wavelet matrix resident on the default CubeCL WGPU device.
+pub type WgpuWaveletMatrix = GpuWaveletMatrix<WgpuRuntime>;
+
+/// Jerky's shared compatibility domain on the default CubeCL WGPU device.
+pub type WgpuContext = GpuContext<WgpuRuntime>;
+
+/// Default minimum number of live candidates in a confirm region before the
+/// verdicts are computed on WGPU; smaller regions run the canonical CPU
+/// probes.
+///
+/// Measured on an Apple M4 Max (Metal via wgpu, cubecl 0.10) with the
+/// ignored `confirm_crossover_sweep` benchmark in
+/// `tests/batch_confirm_parity.rs`: a 262,135-trible / 68,422-value
+/// synthetic archive, fully-live regions, release profile, best of 5 runs
+/// per point (milliseconds):
+///
+/// | region | membership cpu | membership gpu | range cpu | range gpu |
+/// |-------:|---------------:|---------------:|----------:|----------:|
+/// |   1024 |          0.074 |          1.244 |     0.183 |     1.448 |
+/// |   4096 |          0.268 |          1.406 |     0.748 |     1.472 |
+/// |  16384 |          1.074 |          1.473 |     3.045 |     1.528 |
+/// |  65536 |          4.320 |          1.874 |    12.539 |     2.190 |
+///
+/// The GPU round trip is nearly flat (~1.4–2.2 ms) while CPU cost scales
+/// linearly, putting the crossover at ~8k live candidates for the range
+/// shape (two wavelet ranks per candidate) and ~22k for the lighter
+/// membership shape. 16384 is the single-knob compromise: the range shape
+/// is a 2x win there, membership is within dispatch jitter of par (0.73x)
+/// and wins clearly from ~22k up.
+pub const DEFAULT_MIN_CONFIRM_BATCH: usize = 16384;
+
+/// Observational dispatch counters for one [`WgpuSuccinctArchive`].
+///
+/// Counters use relaxed atomics: snapshots taken after query completion are
+/// exact, concurrent snapshots are telemetry.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WgpuConfirmStats {
+    /// Confirm calls whose verdicts were computed on the device.
+    pub gpu_confirms: u64,
+    /// Region entries (live and dead) shipped through device confirms.
+    pub gpu_candidates: u64,
+    /// Confirm calls routed to the canonical CPU constraint by the
+    /// live-candidate threshold.
+    pub cpu_fallback_confirms: u64,
+    /// Region entries handled by threshold fallbacks.
+    pub cpu_fallback_candidates: u64,
+    /// Device errors that demoted a routed confirm to the CPU path.
+    pub gpu_errors: u64,
+}
+
+#[derive(Default)]
+struct ConfirmStats {
+    gpu_confirms: AtomicU64,
+    gpu_candidates: AtomicU64,
+    cpu_fallback_confirms: AtomicU64,
+    cpu_fallback_candidates: AtomicU64,
+    gpu_errors: AtomicU64,
+}
+
+impl ConfirmStats {
+    fn record_gpu(&self, candidates: usize) {
+        self.gpu_confirms.fetch_add(1, Ordering::Relaxed);
+        self.gpu_candidates
+            .fetch_add(candidates as u64, Ordering::Relaxed);
+    }
+
+    fn record_cpu(&self, candidates: usize) {
+        self.cpu_fallback_confirms.fetch_add(1, Ordering::Relaxed);
+        self.cpu_fallback_candidates
+            .fetch_add(candidates as u64, Ordering::Relaxed);
+    }
+
+    fn record_error(&self) {
+        self.gpu_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> WgpuConfirmStats {
+        WgpuConfirmStats {
+            gpu_confirms: self.gpu_confirms.load(Ordering::Relaxed),
+            gpu_candidates: self.gpu_candidates.load(Ordering::Relaxed),
+            cpu_fallback_confirms: self.cpu_fallback_confirms.load(Ordering::Relaxed),
+            cpu_fallback_candidates: self.cpu_fallback_candidates.load(Ordering::Relaxed),
+            gpu_errors: self.gpu_errors.load(Ordering::Relaxed),
+        }
+    }
+
+    fn reset(&self) {
+        self.gpu_confirms.store(0, Ordering::Relaxed);
+        self.gpu_candidates.store(0, Ordering::Relaxed);
+        self.cpu_fallback_confirms.store(0, Ordering::Relaxed);
+        self.cpu_fallback_candidates.store(0, Ordering::Relaxed);
+        self.gpu_errors.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Byte-lexicographic three-way comparison between universe entry `d` and
+/// candidate `i`, both stored as 8 big-endian `u32` words.
+///
+/// Returns 0 when equal, 1 when the universe entry orders below the
+/// candidate, 2 when it orders above.
+#[cube]
+fn value_order(universe: &Array<u32>, d: u32, cands: &Array<u32>, i: u32) -> u32 {
+    let mut order = u32::new(0);
+    let mut w = u32::new(0);
+    while w < 8u32 {
+        if order == 0u32 {
+            let dv = universe[(d * 8u32 + w) as usize];
+            let cv = cands[(i * 8u32 + w) as usize];
+            if dv < cv {
+                order = 1u32;
+            }
+            if dv > cv {
+                order = 2u32;
+            }
+        }
+        w += 1u32;
+    }
+    order
+}
+
+/// Lower-bound binary search for candidate `i` over the sorted resident
+/// universe of `m` entries. Returns `m` when every entry orders below the
+/// candidate; equality still has to be checked at the returned slot.
+#[cube]
+fn universe_lower_bound(universe: &Array<u32>, m: u32, cands: &Array<u32>, i: u32) -> u32 {
+    let mut lo = u32::new(0);
+    let mut hi = m;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2u32;
+        if value_order(universe, mid, cands, i) == 1u32 {
+            lo = mid + 1u32;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+/// One verdict word per candidate for the unbound membership arms: live
+/// candidates keep their word at 1 exactly when their value occurs in the
+/// universe *and* the axis boundary table shows at least one row on the
+/// confirmed axis — the same probe as the CPU arm's
+/// `base_range(..).is_empty().not()`.
+#[cube(launch_unchecked)]
+fn membership_confirm_kernel(
+    cands: &Array<u32>,
+    live: &Array<u32>,
+    universe: &Array<u32>,
+    bounds: &Array<u32>,
+    verdicts: &mut Array<u32>,
+    n: u32,
+    m: u32,
+) {
+    let i = ABSOLUTE_POS as u32;
+    if i < n {
+        let mut verdict = u32::new(0);
+        if live[i as usize] != 0u32 {
+            let d = universe_lower_bound(universe, m, cands, i);
+            if d < m {
+                if value_order(universe, d, cands, i) == 0u32 {
+                    if bounds[(d + 1u32) as usize] > bounds[d as usize] {
+                        verdict = 1u32;
+                    }
+                }
+            }
+        }
+        verdicts[i as usize] = verdict;
+    }
+}
+
+/// Resolves each candidate to its universe code and fills the rank-probe
+/// pair for the range arms: probe positions are the fixed row range's
+/// endpoints, probe values the candidate's code. Dead or absent candidates
+/// get `flag = 0` and a harmless `(0, code 0)` probe pair.
+#[cube(launch_unchecked)]
+fn range_probe_fill_kernel(
+    cands: &Array<u32>,
+    live: &Array<u32>,
+    universe: &Array<u32>,
+    flags: &mut Array<u32>,
+    positions: &mut Array<u32>,
+    values: &mut Array<u32>,
+    n: u32,
+    m: u32,
+    r_start: u32,
+    r_end: u32,
+) {
+    let i = ABSOLUTE_POS as u32;
+    if i < n {
+        let mut flag = u32::new(0);
+        let mut code = u32::new(0);
+        let mut lo = u32::new(0);
+        let mut hi = u32::new(0);
+        if live[i as usize] != 0u32 {
+            let d = universe_lower_bound(universe, m, cands, i);
+            if d < m {
+                if value_order(universe, d, cands, i) == 0u32 {
+                    flag = 1u32;
+                    code = d;
+                    lo = r_start;
+                    hi = r_end;
+                }
+            }
+        }
+        flags[i as usize] = flag;
+        positions[(2u32 * i) as usize] = lo;
+        positions[(2u32 * i + 1u32) as usize] = hi;
+        values[(2u32 * i) as usize] = code;
+        values[(2u32 * i + 1u32) as usize] = code;
+    }
+}
+
+/// Folds the batched wavelet ranks into verdict words: a flagged candidate
+/// survives exactly when its code occurs inside the fixed row range —
+/// `rank(r.start, d) != rank(r.end, d)`, the CPU arm's
+/// `restrict_range(..).is_empty().not()` with the shared `select1` base
+/// offset cancelled.
+#[cube(launch_unchecked)]
+fn range_verdict_kernel(flags: &Array<u32>, ranks: &Array<u32>, verdicts: &mut Array<u32>, n: u32) {
+    let i = ABSOLUTE_POS as u32;
+    if i < n {
+        let mut verdict = u32::new(0);
+        if flags[i as usize] != 0u32 {
+            if ranks[(2u32 * i) as usize] != ranks[(2u32 * i + 1u32) as usize] {
+                verdict = 1u32;
+            }
+        }
+        verdicts[i as usize] = verdict;
+    }
+}
+
+/// The axis prefix a membership confirm probes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Axis {
+    Entity,
+    Attribute,
+    Value,
+}
+
+/// Identical to core's private `base_range`: the row range of `value` on the
+/// axis whose prefix bit vector is `a`, empty when the value is absent from
+/// the universe. Reimplemented here over the archive's public surface.
+fn base_range<U>(universe: &U, a: &BitVector<Rank9SelIndex>, value: &RawInline) -> Range<usize>
+where
+    U: Universe,
+{
+    if let Some(d) = universe.search(value) {
+        let s = a.select1(d).unwrap() - d;
+        let e = a.select1(d + 1).unwrap() - (d + 1);
+        s..e
+    } else {
+        0..0
+    }
+}
+
+/// Identical to core's private `restrict_range`: narrows row range `r`
+/// through the wavelet column `c` to the rows whose column symbol is
+/// `value`, mapped into the adjacent rotation via prefix `a`.
+fn restrict_range<U>(
+    universe: &U,
+    a: &BitVector<Rank9SelIndex>,
+    c: &WaveletMatrix<Rank9SelIndex>,
+    value: &RawInline,
+    r: &Range<usize>,
+) -> Range<usize>
+where
+    U: Universe,
+{
+    if let Some(d) = universe.search(value) {
+        let base = a.select1(d).unwrap() - d;
+        let s = base + c.rank(r.start, d).unwrap();
+        let e = base + c.rank(r.end, d).unwrap();
+        s..e
+    } else {
+        0..0
+    }
+}
+
+/// Packs candidate or universe values into big-endian `u32` words, so the
+/// kernels' word-wise `u32` comparison equals byte-lexicographic order.
+fn pack_be_words(values: &[RawInline]) -> Vec<u32> {
+    let mut words = Vec::with_capacity(values.len() * 8);
+    for value in values {
+        for chunk in value.chunks_exact(4) {
+            words.push(u32::from_be_bytes(chunk.try_into().unwrap()));
+        }
+    }
+    words
+}
+
+fn count_live(cands: &Candidates<'_>) -> usize {
+    (0..cands.len()).filter(|&i| cands.is_live(i)).count()
+}
+
+/// A [`SuccinctArchive`] whose confirm probes can run batched on the default
+/// CubeCL WGPU device.
+///
+/// Construction uploads the value universe (8 big-endian `u32` words per
+/// entry), one cumulative occupancy boundary table per axis
+/// (`bounds[d] = select1(d) - d`, so `bounds[d+1] > bounds[d]` iff code `d`
+/// occurs on that axis), and the six Ring wavelet matrices. Planning,
+/// estimates, and proposals always use the wrapped CPU archive; only
+/// [`Constraint::confirm`] regions at or above
+/// [`min_confirm_batch`](Self::min_confirm_batch) live candidates dispatch to
+/// the device.
+pub struct WgpuSuccinctArchive<U>
+where
+    U: Universe,
+{
+    archive: SuccinctArchive<U>,
+    context: WgpuContext,
+    /// Resident universe image: `domain_len * 8` big-endian words, ascending.
+    universe_words: DeviceU32Buffer<WgpuRuntime>,
+    domain_len: usize,
+    /// Per-axis cumulative row counts, `domain_len + 1` words each.
+    e_bounds: DeviceU32Buffer<WgpuRuntime>,
+    a_bounds: DeviceU32Buffer<WgpuRuntime>,
+    v_bounds: DeviceU32Buffer<WgpuRuntime>,
+    /// Resident Ring columns in canonical [`SuccinctRotation`] order.
+    ring: [WgpuWaveletMatrix; SuccinctRotation::ALL.len()],
+    min_confirm_batch: usize,
+    stats: ConfirmStats,
+}
+
+fn axis_bounds(
+    context: &WgpuContext,
+    prefix: &BitVector<Rank9SelIndex>,
+    domain_len: usize,
+    axis: &'static str,
+) -> jerky::Result<DeviceU32Buffer<WgpuRuntime>> {
+    let mut bounds = Vec::with_capacity(domain_len + 1);
+    for d in 0..=domain_len {
+        let position = prefix.select1(d).ok_or_else(|| {
+            jerky::Error::invalid_argument(format!(
+                "{axis} prefix is missing delimiter {d} of {domain_len}"
+            ))
+        })?;
+        let count = position - d;
+        bounds.push(u32::try_from(count).map_err(|_| {
+            jerky::Error::invalid_argument(format!(
+                "{axis} prefix count {count} does not fit the resident u32 domain"
+            ))
+        })?);
+    }
+    context.upload_u32(&bounds)
+}
+
+impl<U> WgpuSuccinctArchive<U>
+where
+    U: Universe,
+{
+    /// Wraps `archive`, enqueueing its universe, axis boundaries, and Ring
+    /// columns on the default WGPU device.
+    ///
+    /// Fails when the archive exceeds the resident `u32` geometry (universe
+    /// or row count near `u32::MAX`) or when the universe's `access` order
+    /// is not strictly ascending — the [`Universe`] contract the device
+    /// binary search depends on, revalidated here because a violation would
+    /// silently corrupt query results.
+    pub fn new(archive: SuccinctArchive<U>) -> jerky::Result<Self> {
+        let domain_len = archive.domain.len();
+        let triple_count = archive.eav_c.len();
+        if domain_len >= (u32::MAX as usize) / 8 {
+            return Err(jerky::Error::invalid_argument(format!(
+                "universe of {domain_len} values does not fit the resident u32 domain"
+            )));
+        }
+        if triple_count >= u32::MAX as usize {
+            return Err(jerky::Error::invalid_argument(format!(
+                "archive of {triple_count} rows does not fit the resident u32 domain"
+            )));
+        }
+
+        let mut universe_values = Vec::with_capacity(domain_len);
+        for d in 0..domain_len {
+            let value = archive.domain.access(d);
+            if let Some(previous) = universe_values.last() {
+                if *previous >= value {
+                    return Err(jerky::Error::invalid_argument(format!(
+                        "universe access order is not strictly ascending at code {d}"
+                    )));
+                }
+            }
+            universe_values.push(value);
+        }
+        let universe_image = pack_be_words(&universe_values);
+
+        let context = WgpuContext::on_wgpu();
+        let universe_words = context.upload_u32(&universe_image)?;
+        let e_bounds = axis_bounds(&context, &archive.e_a, domain_len, "entity")?;
+        let a_bounds = axis_bounds(&context, &archive.a_a, domain_len, "attribute")?;
+        let v_bounds = axis_bounds(&context, &archive.v_a, domain_len, "value")?;
+        let ring = [
+            WgpuWaveletMatrix::with_context(context.clone(), &archive.eav_c)?,
+            WgpuWaveletMatrix::with_context(context.clone(), &archive.vea_c)?,
+            WgpuWaveletMatrix::with_context(context.clone(), &archive.ave_c)?,
+            WgpuWaveletMatrix::with_context(context.clone(), &archive.vae_c)?,
+            WgpuWaveletMatrix::with_context(context.clone(), &archive.eva_c)?,
+            WgpuWaveletMatrix::with_context(context.clone(), &archive.aev_c)?,
+        ];
+        Ok(Self {
+            archive,
+            context,
+            universe_words,
+            domain_len,
+            e_bounds,
+            a_bounds,
+            v_bounds,
+            ring,
+            min_confirm_batch: DEFAULT_MIN_CONFIRM_BATCH,
+            stats: ConfirmStats::default(),
+        })
+    }
+
+    /// Sets the minimum live-candidate region size dispatched to the device.
+    ///
+    /// Zero forces every routed confirm through WGPU (parity testing);
+    /// `usize::MAX` disables the device path without dropping residency.
+    pub fn with_min_confirm_batch(mut self, min_confirm_batch: usize) -> Self {
+        self.min_confirm_batch = min_confirm_batch;
+        self
+    }
+
+    /// Changes the minimum live-candidate region size dispatched to the device.
+    pub fn set_min_confirm_batch(&mut self, min_confirm_batch: usize) {
+        self.min_confirm_batch = min_confirm_batch;
+    }
+
+    /// Returns the minimum live-candidate region size dispatched to the device.
+    pub fn min_confirm_batch(&self) -> usize {
+        self.min_confirm_batch
+    }
+
+    /// Returns the canonical CPU archive wrapped by this adapter.
+    pub fn archive(&self) -> &SuccinctArchive<U> {
+        &self.archive
+    }
+
+    /// Removes the resident adapter and returns its canonical CPU archive.
+    pub fn into_archive(self) -> SuccinctArchive<U> {
+        self.archive
+    }
+
+    /// Returns the compatibility domain shared by all resident components.
+    pub fn context(&self) -> &WgpuContext {
+        &self.context
+    }
+
+    /// Returns a snapshot of this wrapper's confirm dispatch counters.
+    pub fn stats(&self) -> WgpuConfirmStats {
+        self.stats.snapshot()
+    }
+
+    /// Resets this wrapper's confirm dispatch counters.
+    pub fn reset_stats(&self) {
+        self.stats.reset();
+    }
+
+    /// Returns the resident last-column mirror of `rotation`.
+    pub fn ring_col(&self, rotation: SuccinctRotation) -> &WgpuWaveletMatrix {
+        &self.ring[rotation.index()]
+    }
+
+    fn axis_bounds_buffer(&self, axis: Axis) -> &DeviceU32Buffer<WgpuRuntime> {
+        match axis {
+            Axis::Entity => &self.e_bounds,
+            Axis::Attribute => &self.a_bounds,
+            Axis::Value => &self.v_bounds,
+        }
+    }
+
+    /// Device evaluation of one unbound membership arm: one fused kernel,
+    /// one readback, one AND into the region's liveness.
+    fn confirm_membership_gpu(&self, axis: Axis, cands: &mut Candidates<'_>) -> jerky::Result<()> {
+        let n = cands.len();
+        if n == 0 {
+            return Ok(());
+        }
+        let cand_words = self.context.upload_u32(&pack_be_words(cands.values()))?;
+        let mut live = cands.live_words();
+        let live_words = self.context.upload_u32(&live)?;
+        let mut verdict_words = self.context.empty_u32(n)?;
+
+        let client = self.context.client();
+        let cube_dim = CubeDim::new_1d(THREADS);
+        let cube_count = cubecl::calculate_cube_count_elemwise(client, n, cube_dim);
+        unsafe {
+            membership_confirm_kernel::launch_unchecked::<WgpuRuntime>(
+                client,
+                cube_count,
+                cube_dim,
+                cand_words.input_arg(),
+                live_words.input_arg(),
+                self.universe_words.input_arg(),
+                self.axis_bounds_buffer(axis).input_arg(),
+                verdict_words.output_arg(),
+                n as u32,
+                self.domain_len as u32,
+            )
+        };
+
+        let verdicts = verdict_words.read();
+        and_words(&mut live, &verdicts);
+        cands.set_live_words(&live);
+        Ok(())
+    }
+
+    /// Device evaluation of one range arm: probe fill, Jerky's batched
+    /// wavelet rank, and verdict fold enqueued back-to-back, one readback,
+    /// one AND into the region's liveness. `r` is the fixed row range the
+    /// CPU computed from the bound positions.
+    fn confirm_range_gpu(
+        &self,
+        rotation: SuccinctRotation,
+        r: &Range<usize>,
+        cands: &mut Candidates<'_>,
+    ) -> jerky::Result<()> {
+        let n = cands.len();
+        if n == 0 {
+            return Ok(());
+        }
+        let wm = self.ring_col(rotation);
+        if r.start > r.end || r.end > wm.len() {
+            return Err(jerky::Error::invalid_argument(format!(
+                "confirm row range {}..{} exceeds the {} rows of {rotation:?}",
+                r.start,
+                r.end,
+                wm.len()
+            )));
+        }
+
+        let cand_words = self.context.upload_u32(&pack_be_words(cands.values()))?;
+        let mut live = cands.live_words();
+        let live_words = self.context.upload_u32(&live)?;
+        let mut flag_words = self.context.empty_u32(n)?;
+        let mut positions = self.context.empty_u32(2 * n)?;
+        let mut values = self.context.empty_u32(2 * n)?;
+        let mut ranks = self.context.empty_u32(2 * n)?;
+        let mut verdict_words = self.context.empty_u32(n)?;
+
+        let client = self.context.client();
+        let cube_dim = CubeDim::new_1d(THREADS);
+        let cube_count = cubecl::calculate_cube_count_elemwise(client, n, cube_dim);
+        unsafe {
+            range_probe_fill_kernel::launch_unchecked::<WgpuRuntime>(
+                client,
+                cube_count.clone(),
+                cube_dim,
+                cand_words.input_arg(),
+                live_words.input_arg(),
+                self.universe_words.input_arg(),
+                flag_words.output_arg(),
+                positions.output_arg(),
+                values.output_arg(),
+                n as u32,
+                self.domain_len as u32,
+                r.start as u32,
+                r.end as u32,
+            )
+        };
+        wm.rank_batch_into(&positions, &values, &mut ranks)?;
+        unsafe {
+            range_verdict_kernel::launch_unchecked::<WgpuRuntime>(
+                client,
+                cube_count,
+                cube_dim,
+                flag_words.input_arg(),
+                ranks.input_arg(),
+                verdict_words.output_arg(),
+                n as u32,
+            )
+        };
+
+        let verdicts = verdict_words.read();
+        and_words(&mut live, &verdicts);
+        cands.set_live_words(&live);
+        Ok(())
+    }
+}
+
+impl<U> TriblePattern for WgpuSuccinctArchive<U>
+where
+    U: Universe + Send + Sync,
+{
+    type PatternConstraint<'a>
+        = WgpuSuccinctArchiveConstraint<'a, U>
+    where
+        U: 'a;
+
+    fn pattern<'a, V: InlineEncoding>(
+        &'a self,
+        e: impl Into<Term<GenId>>,
+        a: impl Into<Term<GenId>>,
+        v: impl Into<Term<V>>,
+    ) -> Self::PatternConstraint<'a> {
+        WgpuSuccinctArchiveConstraint::new(
+            e.into().expect_variable(),
+            a.into().expect_variable(),
+            v.into().expect_variable(),
+            self,
+        )
+    }
+}
+
+/// The canonical [`SuccinctArchiveConstraint`] with device-batched confirm.
+///
+/// Every protocol method except [`confirm`](Constraint::confirm) delegates to
+/// the wrapped CPU constraint verbatim. `confirm` mirrors the CPU arm
+/// dispatch; regions with at least
+/// [`min_confirm_batch`](WgpuSuccinctArchive::min_confirm_batch) live
+/// candidates run their probes on the device, everything else (including any
+/// device error) falls back to the CPU arm. Both paths satisfy the kill-only
+/// contract — the device path merges verdicts by word-wise AND, so it can
+/// never revive a dead entry.
+pub struct WgpuSuccinctArchiveConstraint<'a, U>
+where
+    U: Universe,
+{
+    inner: SuccinctArchiveConstraint<'a, U>,
+    gpu: &'a WgpuSuccinctArchive<U>,
+    variable_e: VariableId,
+    variable_a: VariableId,
+    variable_v: VariableId,
+}
+
+impl<'a, U> WgpuSuccinctArchiveConstraint<'a, U>
+where
+    U: Universe,
+{
+    /// Builds the constraint over `gpu`'s wrapped archive.
+    pub fn new<V: InlineEncoding>(
+        variable_e: Variable<GenId>,
+        variable_a: Variable<GenId>,
+        variable_v: Variable<V>,
+        gpu: &'a WgpuSuccinctArchive<U>,
+    ) -> Self {
+        WgpuSuccinctArchiveConstraint {
+            inner: SuccinctArchiveConstraint::new(variable_e, variable_a, variable_v, &gpu.archive),
+            gpu,
+            variable_e: variable_e.index,
+            variable_a: variable_a.index,
+            variable_v: variable_v.index,
+        }
+    }
+
+    /// The device evaluation of one confirm call, mirroring the CPU arm
+    /// dispatch. Returns `false` when the binding shape has no device
+    /// lowering (never happens for the canonical twelve arms) so the caller
+    /// can fall back.
+    fn confirm_gpu(
+        &self,
+        variable: VariableId,
+        binding: &Binding,
+        cands: &mut Candidates<'_>,
+    ) -> jerky::Result<()> {
+        let e_var = self.variable_e == variable;
+        let a_var = self.variable_a == variable;
+        let v_var = self.variable_v == variable;
+
+        let e_bound = binding.get(self.variable_e);
+        let a_bound = binding.get(self.variable_a);
+        let v_bound = binding.get(self.variable_v);
+
+        let archive = self.gpu.archive();
+        let (rotation, r) = match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
+            (None, None, None, true, false, false) => {
+                return self.gpu.confirm_membership_gpu(Axis::Entity, cands);
+            }
+            (None, None, None, false, true, false) => {
+                return self.gpu.confirm_membership_gpu(Axis::Attribute, cands);
+            }
+            (None, None, None, false, false, true) => {
+                return self.gpu.confirm_membership_gpu(Axis::Value, cands);
+            }
+            (Some(e), None, None, false, true, false) => (
+                SuccinctRotation::Eva,
+                base_range(&archive.domain, &archive.e_a, e),
+            ),
+            (Some(e), None, None, false, false, true) => (
+                SuccinctRotation::Eav,
+                base_range(&archive.domain, &archive.e_a, e),
+            ),
+            (None, Some(a), None, true, false, false) => (
+                SuccinctRotation::Ave,
+                base_range(&archive.domain, &archive.a_a, a),
+            ),
+            (None, Some(a), None, false, false, true) => (
+                SuccinctRotation::Aev,
+                base_range(&archive.domain, &archive.a_a, a),
+            ),
+            (None, None, Some(v), true, false, false) => (
+                SuccinctRotation::Vae,
+                base_range(&archive.domain, &archive.v_a, v),
+            ),
+            (None, None, Some(v), false, true, false) => (
+                SuccinctRotation::Vea,
+                base_range(&archive.domain, &archive.v_a, v),
+            ),
+            (None, Some(a), Some(v), true, false, false) => {
+                let r = base_range(&archive.domain, &archive.a_a, a);
+                (
+                    SuccinctRotation::Vae,
+                    restrict_range(&archive.domain, &archive.v_a, &archive.aev_c, v, &r),
+                )
+            }
+            (Some(e), None, Some(v), false, true, false) => {
+                let r = base_range(&archive.domain, &archive.e_a, e);
+                (
+                    SuccinctRotation::Vea,
+                    restrict_range(&archive.domain, &archive.v_a, &archive.eav_c, v, &r),
+                )
+            }
+            (Some(e), Some(a), None, false, false, true) => {
+                let r = base_range(&archive.domain, &archive.e_a, e);
+                (
+                    SuccinctRotation::Aev,
+                    restrict_range(&archive.domain, &archive.a_a, &archive.eva_c, a, &r),
+                )
+            }
+            _ => unreachable!("invalid trible constraint state"),
+        };
+
+        if r.is_empty() {
+            // Every restriction through an empty row range is empty; the CPU
+            // arm kills every candidate without probing, and so do we.
+            cands.kill_all();
+            return Ok(());
+        }
+        self.gpu.confirm_range_gpu(rotation, &r, cands)
+    }
+}
+
+impl<'a, U> Constraint<'a> for WgpuSuccinctArchiveConstraint<'a, U>
+where
+    U: Universe,
+{
+    fn variables(&self) -> VariableSet {
+        self.inner.variables()
+    }
+
+    fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+        self.inner.estimate(variable, binding)
+    }
+
+    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
+        self.inner.propose(variable, binding, proposals)
+    }
+
+    fn propose_chunk(
+        &self,
+        variable: VariableId,
+        binding: &Binding,
+        cursor: &mut ProposeCursor,
+        budget: usize,
+        proposals: &mut ProposalBuffer,
+    ) -> bool {
+        self.inner
+            .propose_chunk(variable, binding, cursor, budget, proposals)
+    }
+
+    fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
+        if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
+        {
+            return;
+        }
+        let live = count_live(cands);
+        if live < self.gpu.min_confirm_batch {
+            self.gpu.stats.record_cpu(cands.len());
+            self.inner.confirm(variable, binding, cands);
+            return;
+        }
+        match self.confirm_gpu(variable, binding, cands) {
+            Ok(()) => self.gpu.stats.record_gpu(cands.len()),
+            Err(_) => {
+                // The helpers only write liveness after a complete verdict
+                // readback, so a failed dispatch left the region untouched
+                // and the CPU arm computes it from scratch.
+                self.gpu.stats.record_error();
+                self.inner.confirm(variable, binding, cands);
+            }
+        }
+    }
+
+    fn satisfied(&self, binding: &Binding) -> bool {
+        self.inner.satisfied(binding)
+    }
+
+    fn influence(&self, variable: VariableId) -> VariableSet {
+        self.inner.influence(variable)
+    }
+}

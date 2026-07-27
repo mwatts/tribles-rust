@@ -2,9 +2,13 @@
 
 `triblespace-gpu` is the opt-in accelerator companion for TribleSpace. The
 default `triblespace-core` remains GPU-free: it owns the structural
-`SuccinctArchive` merge, canonical section order, and output validation. This
-crate implements core's `WaveletMatrixFreezeBackend` seam with CubeCL and fills
-only the six packed wavelet matrices.
+`SuccinctArchive` merge, canonical section order, output validation, and the
+whole constraint protocol. This crate adds two device paths on top:
+
+* a CubeCL implementation of core's `WaveletMatrixFreezeBackend` seam for
+  structural archive merges, and
+* batched device evaluation of the succinct-archive constraint's
+  `confirm` calls.
 
 Enable exactly the runtime you need:
 
@@ -27,22 +31,47 @@ triblespace = { version = "0.47", features = ["gpu"] }
 Consequently the facade's `gpu` feature also requires Rust 1.92. This does not
 raise the GPU-free `triblespace-core` crate's Rust 1.89 MSRV.
 
-## Resident query batches
+## Batched confirm
 
-With the `wgpu` feature, `WgpuSuccinctArchive` creates resident mirrors of the
-three axis-prefix bit vectors, three derived present-code lists, all six
-ordered-pair change vectors, and six Ring wavelet matrices in one Jerky
-compatibility domain, and implements the same `TriblePattern` interface as the
-wrapped CPU archive. Construction prepares the host data and enqueues the
-device transfers; the first observed query provides the synchronization
-boundary. `pair_changes(rotation)` selects the `(first, middle)` boundary
-vector using the same `SuccinctRotation` that selects a Ring column. The
-canonical archive, query planner, domain searches, prefix navigation,
-proposals, estimates, and satisfaction checks remain on the CPU. Every
-nonempty `confirm` rank stream is offered to Jerky's resident
-`GpuWaveletMatrix::rank_batch`, whether candidates use the one-parent `Values`
-or multi-parent tagged representation. The probe-count admission threshold,
-not the storage representation, decides CPU fallback versus WGPU execution.
+The engine's `Constraint::confirm` protocol is kill-only: a confirmer receives
+one candidate region — read-only 32-byte values plus killable `u32` liveness
+words — and may only zero words. Verdicts computed anywhere therefore merge
+back by word-wise AND, which is exactly what makes batched device evaluation a
+legal schedule: the device can never revive a dead entry, and parallel lanes
+never contend.
+
+With the `wgpu` feature, `WgpuSuccinctArchive` wraps a CPU `SuccinctArchive`
+and keeps the structures its confirm probes touch resident on the default
+CubeCL WGPU device: the value universe as big-endian `u32` words (so word-wise
+comparison equals byte-lexicographic order), one occupancy boundary table per
+axis, and the six Ring wavelet matrices in one Jerky compatibility domain. It
+implements the same `TriblePattern` interface as the wrapped archive;
+estimates, proposals, prefix walks, and satisfaction checks stay on the CPU.
+
+A `confirm` region with at least `min_confirm_batch` live candidates
+(default `DEFAULT_MIN_CONFIRM_BATCH = 16_384`, measured — see below) uploads
+its candidate values and liveness words and computes one verdict word per
+candidate on the device:
+
+* **Unbound membership** (no other pattern position bound; the confirmed
+  variable is E, A, or V): one fused kernel binary-searches each candidate in
+  the resident universe and checks the axis boundary table — the CPU arm's
+  `base_range(..).is_empty().not()` — then a single readback ANDs the
+  verdicts into the region.
+* **Range restriction** (one or two other positions bound): the fixed row
+  range is computed once on the CPU from the bound values; a probe-fill
+  kernel resolves candidates to universe codes, Jerky's batched wavelet rank
+  answers `rank(r.start, d)` / `rank(r.end, d)` for all candidates in one
+  dispatch, and a fold kernel emits the verdicts — the CPU arm's
+  `restrict_range(..).is_empty().not()` with the shared `select1` base offset
+  cancelled. All three launches are enqueued back-to-back with a single
+  readback.
+
+That covers all twelve confirm arms of the canonical constraint. Regions
+below the threshold, non-confirm protocol methods, and any device error fall
+through to the canonical CPU constraint, and the parity suite
+(`tests/batch_confirm_parity.rs`) holds both paths to bit-identical liveness
+words across every arm, pre-killed entries, and duplicate candidate values.
 
 ```rust,no_run
 # use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
@@ -51,246 +80,26 @@ not the storage representation, decides CPU fallback versus WGPU execution.
 # #[cfg(feature = "wgpu")]
 # fn wrap(archive: SuccinctArchive<OrderedUniverse>) {
 let gpu = WgpuSuccinctArchive::new(archive).expect("prepare succinct archive on WGPU");
-// `pattern!(&gpu, ..)` now uses the same constraint with a WGPU rank backend.
-// `gpu.stats()` reports dispatch/fallback counts and batch-size extrema.
+// `pattern!(&gpu, ..)` routes fat confirm regions through the device kernels.
+// `gpu.stats()` reports device confirms, threshold fallbacks, and errors.
 # let _ = gpu;
 # }
 ```
 
-Residual-action executor samples are a second, explicit opt-in. Bind the
-borrowing adapter before constructing the pattern so the GAT-produced
-constraint can retain that borrow:
+The threshold is measured, not guessed. The ignored `confirm_crossover_sweep`
+benchmark sweeps fully-live regions of 1k/4k/16k/64k candidates over a
+262k-trible synthetic archive; on an Apple M4 Max (Metal, release profile,
+best of 5) the GPU round trip is nearly flat (~1.4–2.2 ms) while CPU confirm
+scales linearly, crossing at ~8k live candidates for the range shape and ~22k
+for the lighter membership shape. `16_384` is the single-knob compromise; use
+`with_min_confirm_batch(0)` to force every routed confirm through the device
+(parity measurements) and `set_min_confirm_batch` for local calibration.
 
-```rust,ignore
-let observed_gpu = gpu.observe_residual_actions();
-let query = Query::new(
-    and!(allowed.has(value), observed_gpu.pattern(entity, attribute, value)),
-    project,
-);
-let solve = query
-    .solve_residual_state_lazy()
-    .shadow(ResidualShadowEpoch::new())
-    .collect_profiled();
+```sh
+cargo test -p triblespace-gpu --release --test batch_confirm_parity -- --ignored --nocapture confirm_crossover_sweep
 ```
 
-The adapter intentionally has no `Deref` implementation: using `gpu.pattern`
-remains the direct, unobserved path and performs no residual-action TLS lookup,
-clock read, or sample work. The adapter observes only non-empty Succinct
-`confirm` rank streams, not planning, proposals, domain lookups, or unrelated
-CPU work. Candidate storage (`Values` for one parent or tagged COO for several)
-is not an execution capability; the probe-count threshold decides CPU versus
-WGPU. Outside a current observed action it executes normally without a sample,
-and an empty rank stream likewise attaches none.
-
-Each nonempty invocation records its exact probe count in `rank-probes`. A
-batch below the immutable admission threshold is labelled
-`cpu` / `wavelet-rank/threshold-fallback`; an admitted device call is labelled
-`wgpu` / `wavelet-rank/gpu-round-trip`. The route is the private per-call route
-actually executed, not an inference from aggregate statistics. Executor wall
-time covers only the CPU ranks or the synchronous WGPU
-upload/dispatch/synchronization/readback call; route selection, statistics, and
-sample attachment sit outside it. The adapter captures the action correlation
-capability before backend work and carries it explicitly across the WGPU round
-trip instead of consulting ambient TLS after dispatch.
-
-The pair vectors remain allocated for the wrapper's lifetime because generic
-one-peer resident rounds need any of the six rotations. For `T` tribles, let
-`W = 16 * ceil((ceil(T/32) + 1) / 16)`. At Jerky's current 512-bit rank-block
-layout each vector uploads `4W` bytes of padded bits plus `4(W/16)` bytes of
-rank counts. All six therefore carry `24 * (W + W/16)` bytes of logical device
-payload (408 bytes for an empty archive); mirroring the five vectors beyond the
-former EAV-only path adds `20 * (W + W/16)` bytes, asymptotically about 0.664
-bytes per trible. A backend may reserve more due to its allocation granularity.
-
-The default admission threshold is 8,192 rank probes (two probes per
-candidate), preserving the historical 4,096-candidate crossover. Smaller
-batches run against the wrapped CPU wavelet matrix. The threshold is explicit
-and hardware-dependent: `with_min_rank_batch(1)` forces every non-empty batch
-to WGPU for parity and fragmentation measurements, while
-`set_min_rank_batch` supports local calibration. Query-buffer upload, dispatch,
-synchronization, and result readback are part of every timed GPU batch; the
-one-time six-matrix preparation and first-query setup are not. Device/query
-failures currently panic because the `Constraint::confirm` protocol has no
-error channel.
-
-The `residual_reconverge_bench` example measures why admission belongs at
-this seam. It compares adaptive and saturated residual execution, serially
-and through Rayon, across four interleaved rank policies: the canonical
-archive, the wrapper forced to CPU rank, every non-empty rank batch forced to
-WGPU, and the default thresholded hybrid. Exact sorted result vectors are
-compared before timing. Because the crossover depends on archive shape,
-scheduler batch geometry, runtime, and hardware, rerun the probe on deployment
-hardware instead of treating one machine's measurements as constants.
-
-### Resident `QueryProgram` transition
-
-`WgpuQueryProgram` is the first path that uses the shared prefixes and Ring
-columns as one resident query operation. Its admission contract is narrow and
-fail-closed: the program has exactly one pattern, the caller selects one of its
-E/A/V variables, and the other two axes are already bound in every parent row
-or are constants. A target outside the pattern, an unbound peer, a sibling
-pattern, or a program over another archive snapshot is rejected rather than
-silently falling back or skipping work.
-
-```rust,no_run
-# #[cfg(feature = "wgpu")]
-# {
-# use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
-# use triblespace_gpu::query_program::{ProgramVariable, QueryPattern, QueryProgram};
-# use triblespace_core::trible::TribleSet;
-# use triblespace_gpu::{WgpuQueryProgram, WgpuSuccinctArchive};
-# let facts = TribleSet::new();
-let resident = WgpuSuccinctArchive::new(
-    SuccinctArchive::<OrderedUniverse>::from(&facts),
-).expect("prepare archive");
-let e = ProgramVariable::new(0);
-let a = ProgramVariable::new(1);
-let v = ProgramVariable::new(2);
-let program = QueryProgram::compile(
-    resident.archive(),
-    3,
-    [QueryPattern::new(e, a, v)],
-).expect("compile program");
-let backend = WgpuQueryProgram::new(&program, &resident).expect("admit resident arm");
-# let _ = (backend, v);
-// `backend.transition_on(v, &parent_frontier)` preserves the CPU frontier exactly.
-# }
-```
-
-One transition uploads the affine parent codes once as its only bulk input.
-Small dispatch/control records are also created per call. Descriptor-selected
-peer-prefix selects, Ring ranks, the stable count scan, indirect candidate
-generation, target access, and canonical child scatter remain on the device.
-The output canary is filled on device, avoiding a full poison-buffer upload.
-One packed child buffer is the only synchronization/readback, but that read covers all
-`2 + child_capacity * child_stride` allocated words—including the poison
-tail—not only the logical child prefix: the logical row count is inside the
-same buffer and is not known before synchronization. The default allocation is
-a checked `parent_rows * max_pair_fanout(rotation)` bound, whose exact fanout is
-scanned lazily once per snapshot and used rotation. An explicit smaller capacity
-reports the exact required row count after that same readback; it never returns
-a truncated prefix. All additions and dimensions are checked in the host
-admission path and guarded again in device range/scan kernels.
-
-Every canonical fixed-pair output interval contains each target once, so the
-CPU oracle's per-parent `.unique()` is a no-op. The device therefore preserves
-the CPU's first-occurrence candidate order directly. Its stable scan also
-preserves parent order and parent multiplicity: duplicate parent rows produce
-duplicate child runs, with no global deduplication.
-
-The `resident_transition` probe separates archive fixture time, asynchronous
-resident enqueue, and the first synchronizing transition from warm treatments.
-On an M4 Max (2026-07-13), 65,536 parents with fanout four used a 262,144-trible
-archive. Seven warm repetitions after two warm-ups produced these medians; the
-resident column includes the final child readback:
-
-| parent rows | child rows | CPU `QueryProgram` | resident WGPU | resident / CPU |
-|---:|---:|---:|---:|---:|
-| 64 | 256 | 0.084 ms | 1.925 ms | 22.82x |
-| 512 | 2,048 | 0.669 ms | 1.886 ms | 2.82x |
-| 1,024 | 4,096 | 1.327 ms | 1.938 ms | 1.46x |
-| 2,048 | 8,192 | 2.586 ms | 1.910 ms | **0.74x** |
-| 4,096 | 16,384 | 5.159 ms | 1.911 ms | **0.37x** |
-| 16,384 | 65,536 | 20.922 ms | 1.952 ms | **0.09x** |
-| 65,536 | 262,144 | 82.884 ms | 3.849 ms | **0.05x** |
-
-The observed forced-transition crossover lies between 1,024 and 2,048 parent
-rows for this fixture and machine. Resident archive enqueue was 26.0 ms,
-`QueryProgram` compilation rounded below 0.001 ms, resident admission plus the
-max-fanout scan took 1.03 ms, and the first synchronizing one-row transition
-was 7.61 ms in this cache-order observation. None is included above. The
-probe also reports canonical and hybrid `Constraint::propose` component
-baselines, but those omit scheduler estimation, variable choice,
-reconvergence, and child-row materialisation. They are not an end-to-end
-residual-scheduler or hybrid crossover measurement.
-
-This is not yet a fully resident query engine. Each call still crosses the
-host/device boundary at its parent and full-capacity child allocation; a
-skewed archive whose global maximum fanout is much larger than most parents can
-therefore over-allocate and over-read substantially. Only `(E,A) -> V` is
-implemented, scan hierarchy is intentionally simple, and multi-pattern
-viability/confirmation plus adaptive variable planning remain outside this
-backend. The native WGPU gate locks exact frontier parity at 0/1/63/64/65 rows,
-every split of a 65-row frontier, duplicate parents, all child-column insertion
-positions, exact/one-short/zero capacities, constant and missing peers,
-archive-identity rejection, and monotonic extension in decoded value space.
-
-Repository builds patch CubeCL 0.10's runtime and WGPU crates to the project's
-fork, which exposes immutable external-buffer registration for mmap-to-Metal
-aliasing. Cargo patches are root-local, so application workspaces that need the
-aliasing seam must select the same fork themselves. The current compaction
-backend still uploads a newly materialized `u32` rotation and reads the packed
-planes back; merely selecting the fork does not make that transient path
-zero-copy.
-
-### Typed Program family and budgeted routing
-
-`typed_program::SuccinctProgramFamily` implements the engine's typed Program
-contract over a compiled `QueryProgram`: the Native step is the exact CPU
-interpreter paginated by the scheduler's per-input grants, and
-`try_step_physical` offers admitted cohorts to the resident two-bound kernel
-through the budgeted dispatch contract (`budgeted`). Grants adopt the
-scheduler's `task_limits` verbatim, receipts come back validated and branded
-with the resident `ArchiveIdentity`, and a clamped input's `PhysicalCursor`
-becomes canonical typed state only through
-`into_typed_conversion_offset`.
-
-Routing is **off by default**: `BackendAdmissionPolicy::disabled()` never
-routes, so attaching a device is a zero-behavior-change no-op. Routing
-activates only explicitly — `with_admission(BackendAdmissionPolicy::
-route_from(n))` in code, or the `TRIBLESPACE_GPU_PROGRAM_ROUTING` environment
-variable (unset/`0`/unparsable = disabled; a positive integer = the minimum
-cohort row count that may route), read once at family construction. Admission
-is decided post-cohort-formation from cohort size, kernel capability, and the
-hard law that ready/latency-priority work never waits for an accelerator; the
-exercised kernel covers schema-uniform two-bound cohorts, and every decline
-or recoverable device failure falls back to the exact Native step with the
-batch intact. Resumed states ride the offset-aware kernel form
-(`transition_on_budgeted_from`): per-input resume bases upload with the
-grants, candidate positions shift to `range_start + base + local`, and a
-clamped input's cursor returns the absolute `base + examined`, so successive
-budgeted pages concatenate into the exact unbudgeted transition on either
-executor.
-
-### Public resident two-bound route
-
-`WgpuSuccinctArchive::two_bound_route` and `two_bound_route_with` are the first
-real `find!`/`pattern!` entry into that substrate. The returned pattern carrier
-delegates the ordinary constraint protocol unchanged and lowers exactly three
-typed Propose actions when the other two axes are bound or constant:
-`(A,V) -> E`, `(E,V) -> A`, and `(E,A) -> V`. One descriptor shared by the
-Native and physical paths selects the peer order, fanout rotation, navigation
-Ring, and output Ring. Canonical state stores that descriptor, both peer codes,
-the checked interval length, and consumed offset; both executors independently
-re-derive the interval position and must agree exactly on examined rows,
-produced rows, absolute continuation, order, and multiplicity.
-
-Placement is `TwoBoundRouteAdmission::Off` by default and does not construct
-the resident Program arm. `Force` exists for parity and acceptance probes on
-all three targets. `WarmM4` is an explicitly experimental, prewarmed-machine
-calibration using `exact_page_work + 8 * parent_rows >= 98_304` for `(E,A) -> V`
-only; entity and attribute targets decline Native until separately measured.
-
-`WgpuSuccinctArchive::prepare_value_route` is the explicit snapshot-local
-preparation seam. On a nonempty snapshot it selects one real `(E,A)` pair and
-synchronously executes one parent with grant one through the same resident
-kernel, lease, exact receipt validation, decoding, and accounting as a public
-Force route. Before committing `ValueRouteReadiness::Prepared`, it also checks
-the complete result against the canonical Native pager while the lease remains
-held; the answer itself is discarded. Errors and panics default the snapshot
-to `Failed`, repeated success returns `AlreadyPrepared`, and an empty snapshot
-returns `EmptySnapshot` while remaining `Cold`.
-
-The `TRIBLESPACE_GPU_TWO_BOUND_ROUTE=auto` spelling is deliberately rejected:
-explicit preparation proves this snapshot's exact path, and its lease can
-decline busy or poisoned work without waiting, but neither can prove that
-unrelated snapshots, rank batches, or wavelet freezes are absent from the
-shared device service. Until a device-wide cooperative submission gate exists,
-automatic placement would still make a latency claim the runtime cannot uphold.
-
-The public parallel entry uses the same fixed production plan as serial
-queries: native AND flattening, finite Union-leaf continuations, and
-the typed Program route returned for each action.
+## Structural merge acceleration
 
 The production rollup type is
 `triblespace_core::repo::index_home::AcceleratedSuccinctRollup<WgpuWaveletFreeze>`:
@@ -323,6 +132,14 @@ boundary. This CubeCL backend explicitly synchronizes queued commands before
 readback so device validation errors are returned rather than mistaken for zero
 or stale output.
 
+Repository builds patch CubeCL 0.10's runtime and WGPU crates to the project's
+fork, which exposes immutable external-buffer registration for mmap-to-Metal
+aliasing. Cargo patches are root-local, so application workspaces that need the
+aliasing seam must select the same fork themselves. The current compaction
+backend still uploads a newly materialized `u32` rotation and reads the packed
+planes back; merely selecting the fork does not make that transient path
+zero-copy.
+
 ## Runtime selection in `faculties/archive`
 
 `faculties` can keep its default build GPU-free with an optional feature:
@@ -353,11 +170,8 @@ cargo test -p triblespace-gpu --no-default-features
 The WGPU parity gate and full structural benchmark are opt-in:
 
 ```sh
-cargo test -p triblespace-gpu --features wgpu --test wgpu_parity -- --ignored
-cargo test -p triblespace-gpu --features wgpu --test resident_transition -- --ignored
+cargo test -p triblespace-gpu --features wgpu --test batch_confirm_parity
 cargo run --release -p triblespace-gpu --features wgpu --example archive_merge -- 100000
-cargo run --release -p triblespace-gpu --features wgpu --example resident_transition
-cargo run --release --features gpu --example residual_reconverge_bench -- 2048 16 8
 ```
 
 WGPU has runtime parity coverage on Apple Metal. CUDA exposes the same CubeCL

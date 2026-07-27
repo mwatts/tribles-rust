@@ -806,33 +806,6 @@ fn parse_rank9_index<D: Metadata>(
     Ok(handles)
 }
 
-/// Backend for independent batched rank queries over the six ring columns.
-///
-/// Implementations must return one exact rank for every corresponding
-/// `(positions[i], values[i])` pair, in input order. The pairs are independent:
-/// a backend may evaluate them in parallel, but must not combine state across
-/// pairs or rows. This keeps accelerated query evaluation row-homomorphic and
-/// preserves the monotonic constraint protocol.
-///
-/// A backend attached through [`SuccinctArchiveConstraint::with_ring_batch`]
-/// must rank the exact same immutable archive snapshot passed to that
-/// constraint. Core cannot type-check this identity; ranks from a different
-/// archive are a backend contract violation and can produce incorrect query
-/// results.
-pub trait RingBatchQuery: Send + Sync {
-    /// Evaluates a batch of ranks against the last column of `rotation`.
-    ///
-    /// `positions` and `values` always have the same length. Returning a
-    /// differently sized vector is a backend contract violation and causes
-    /// the caller to panic.
-    fn rank_batch(
-        &self,
-        rotation: SuccinctRotation,
-        positions: &[usize],
-        values: &[usize],
-    ) -> Vec<usize>;
-}
-
 impl<U> SuccinctArchive<U>
 where
     U: Universe,
@@ -3142,15 +3115,13 @@ where
 #[cfg(test)]
 mod tests {
     use std::convert::TryInto;
-    use std::sync::Mutex;
 
     use crate::blob::IntoBlob;
     use crate::id::fucid;
-    use crate::inline::encodings::genid::GenId;
     use crate::inline::IntoInline;
     use crate::inline::TryToInline;
     use crate::prelude::*;
-    use crate::query::{find, Constraint, VariableContext};
+    use crate::query::find;
     use crate::trible::Trible;
 
     use super::*;
@@ -3159,37 +3130,6 @@ mod tests {
     use proptest::prelude::*;
 
     struct ReferencePackedFreeze;
-
-    struct RecordingRingBatch<'a, U>
-    where
-        U: Universe,
-    {
-        archive: &'a SuccinctArchive<U>,
-        calls: Mutex<Vec<(SuccinctRotation, Vec<usize>, Vec<usize>)>>,
-    }
-
-    impl<U> RingBatchQuery for RecordingRingBatch<'_, U>
-    where
-        U: Universe + Send + Sync,
-    {
-        fn rank_batch(
-            &self,
-            rotation: SuccinctRotation,
-            positions: &[usize],
-            values: &[usize],
-        ) -> Vec<usize> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((rotation, positions.to_vec(), values.to_vec()));
-            let wavelet = self.archive.ring_col(rotation);
-            positions
-                .iter()
-                .zip(values)
-                .map(|(&position, &value)| wavelet.rank(position, value).unwrap())
-                .collect()
-        }
-    }
 
     impl WaveletMatrixFreezeBackend for ReferencePackedFreeze {
         type Error = std::convert::Infallible;

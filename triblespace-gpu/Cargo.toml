@@ -34,46 +34,6 @@ triblespace-core = { version = "0.47.0", path = "../triblespace-core", default-f
 name = "archive_merge"
 required-features = ["wgpu"]
 
-[[example]]
-name = "frontier_program"
-required-features = ["wgpu"]
-
-[[example]]
-name = "resident_transition"
-required-features = ["wgpu"]
-
-[[example]]
-name = "resident_eav_chain"
-required-features = ["wgpu"]
-
-[[example]]
-name = "resident_eav_shapes"
-required-features = ["wgpu"]
-
-[[example]]
-name = "resident_value_page_2d"
-required-features = ["wgpu"]
-
 [[test]]
-name = "wgpu_parity"
-required-features = ["wgpu"]
-
-[[test]]
-name = "resident_transition"
-required-features = ["wgpu"]
-
-[[test]]
-name = "resident_row_planner"
-required-features = ["wgpu"]
-
-[[test]]
-name = "resident_support_estimates"
-required-features = ["wgpu"]
-
-[[test]]
-name = "query_program_value_page"
-required-features = ["wgpu"]
-
-[[test]]
-name = "value_route_entry"
+name = "batch_confirm_parity"
 required-features = ["wgpu"]

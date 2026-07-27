@@ -3,58 +3,21 @@
 use std::fmt;
 
 #[cfg(feature = "wgpu")]
-pub mod budgeted;
+mod batch_confirm;
 #[cfg(any(feature = "wgpu", feature = "cuda"))]
 mod cubecl_backend;
-#[cfg(feature = "wgpu")]
-pub mod query_program;
-#[cfg(all(test, feature = "wgpu"))]
-mod resident_ordered_oracle;
-#[cfg(feature = "wgpu")]
-mod resident_program;
-#[cfg(feature = "wgpu")]
-mod resident_proposals;
-#[cfg(feature = "wgpu")]
-mod resident_round;
-#[cfg(feature = "wgpu")]
-mod resident_support;
-#[cfg(feature = "wgpu")]
-mod succinct_query;
-#[cfg(feature = "wgpu")]
-pub mod typed_program;
-#[cfg(feature = "wgpu")]
-pub mod value_route;
 
+#[cfg(feature = "wgpu")]
+pub use batch_confirm::{
+    WgpuConfirmStats, WgpuContext, WgpuSuccinctArchive, WgpuSuccinctArchiveConstraint,
+    WgpuWaveletMatrix, DEFAULT_MIN_CONFIRM_BATCH,
+};
 #[cfg(any(feature = "wgpu", feature = "cuda"))]
 pub use cubecl_backend::CubeClWaveletFreeze;
 #[cfg(feature = "cuda")]
 pub use cubecl_backend::CudaWaveletFreeze;
 #[cfg(feature = "wgpu")]
 pub use cubecl_backend::WgpuWaveletFreeze;
-#[cfg(feature = "wgpu")]
-pub use resident_program::{ResidentTransitionError, WgpuQueryProgram};
-#[cfg(feature = "wgpu")]
-pub use resident_round::{
-    ResidentRoundArm, ResidentRoundError, ResidentRoundInputs, ResidentRoundMetadata,
-    ResidentRowChoice, ResidentRowChoices, ResidentRowPlanner, WgpuResidentRowPlanner,
-    RESIDENT_U32_SENTINEL,
-};
-#[cfg(feature = "wgpu")]
-pub use resident_support::{ResidentSupportError, WgpuResidentFrontier, WgpuResidentRound};
-#[cfg(feature = "wgpu")]
-pub use succinct_query::{
-    ArchiveIdentity, DeviceLease, DeviceLeaseGuard, ObservedWgpuSuccinctArchive, ResidencyReceipt,
-    WgpuBitVector, WgpuContext, WgpuQueryStats, WgpuSuccinctArchive, WgpuWaveletMatrix,
-    DEFAULT_MIN_RANK_BATCH,
-};
-#[cfg(feature = "wgpu")]
-pub use value_route::{
-    PrepareValueRouteError, PrepareValueRouteOutcome, ResidentTwoBoundConstraint,
-    ResidentTwoBoundRoute, SuccinctTwoBoundFamily, SuccinctTwoBoundState, TwoBoundRouteAdmission,
-    TwoBoundRouteConfigError, TwoBoundRouteCounters, TwoBoundRouteCountersSnapshot,
-    ValueRouteReadiness, TWO_BOUND_ATTRIBUTE_ROUTE_OP, TWO_BOUND_ENTITY_ROUTE_OP,
-    TWO_BOUND_ROUTE_ENV, TWO_BOUND_VALUE_ROUTE_OP, WARM_M4_ELIGIBLE_SCORE, WARM_M4_ROW_WORK,
-};
 
 #[cfg(any(test, feature = "wgpu", feature = "cuda"))]
 const BLOCK_SIZE: u32 = 256;

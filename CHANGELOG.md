@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`triblespace-gpu` is rewritten around batched confirm and rejoins the
+  workspace.** The old integration served the removed engine paradigm (typed
+  Program routing, resident frontier machinery, residual-action observation)
+  and is deleted wholesale. The new `WgpuSuccinctArchive` keeps the value
+  universe, per-axis occupancy boundaries, and six Ring wavelet matrices
+  resident on WGPU; its constraint mirrors the canonical
+  `SuccinctArchiveConstraint` and evaluates `confirm` regions with at least
+  `DEFAULT_MIN_CONFIRM_BATCH` (16,384, measured on Apple M4 Max Metal) live
+  candidates on the device — one fused binary-search/occupancy kernel for the
+  three unbound membership arms, a probe-fill/batched-rank/verdict-fold chain
+  for the nine range arms — merging verdicts by the kill-only word-wise AND
+  the confirm contract guarantees. Everything below the threshold and any
+  device error falls back to the CPU arm; a parity suite holds both paths to
+  identical liveness words. The umbrella crate's `gpu` feature returns as
+  `dep:triblespace-gpu` + `parallel`. The stale device-neutral
+  `RingBatchQuery` seam is removed from core.
 - **Union constraints now expose one physical occurrence-stream protocol.**
   Live arms propose into independent empty sinks whose occurrences concatenate
   in arm order; confirmation derives relational support from every live arm
