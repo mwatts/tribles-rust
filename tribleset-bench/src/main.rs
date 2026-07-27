@@ -155,7 +155,10 @@ fn subject_commit() -> String {
 /// One measure being sampled across iterations: raw spans plus the
 /// panic/identity state that decides its outcome.
 struct Measure {
-    name: &'static str,
+    /// Owned because the archive arm derives its keys from the query
+    /// set at runtime (`arch/<query>/total`); the fixed-name measures
+    /// pass string literals unchanged.
+    name: String,
     spans: Vec<(u64, u64)>,
     panicked: Option<String>,
     ident: Option<usize>,
@@ -163,9 +166,9 @@ struct Measure {
 }
 
 impl Measure {
-    fn new(name: &'static str) -> Self {
+    fn new(name: impl Into<String>) -> Self {
         Self {
-            name,
+            name: name.into(),
             spans: Vec::new(),
             panicked: None,
             ident: None,
@@ -216,7 +219,7 @@ impl Measure {
     /// Write spans + the outcome entity; print one console line.
     fn emit(self, led: &mut ledger::ResultsLedger, rows_meaningful: bool) {
         for (begin_ns, duration_ns) in &self.spans {
-            led.span(self.name, *begin_ns, *duration_ns);
+            led.span(&self.name, *begin_ns, *duration_ns);
         }
         let (outcome, rows) = match (&self.panicked, &self.gate) {
             (Some(msg), _) => (format!("panic:{msg}"), None),
@@ -230,7 +233,7 @@ impl Measure {
                 },
             ),
         };
-        led.outcome(self.name, &outcome, rows);
+        led.outcome(&self.name, &outcome, rows);
         match rows {
             Some(n) => println!("  {:<32} {outcome} ({} spans, {n} rows)", self.name, self.spans.len()),
             None => println!("  {:<32} {outcome} ({} spans)", self.name, self.spans.len()),
