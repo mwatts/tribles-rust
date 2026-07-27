@@ -1,460 +1,410 @@
 # Query Engine
 
-Queries describe the patterns you want to retrieve. The engine favors
-predictable latency and skew resistance without a separately compiled query
-plan. Every operator and data source implements the same
+Queries describe the patterns you want to retrieve. There is no query planner
+and no compiled plan. Every operator and every data source implements the same
 [`Constraint`](triblespace::core::query::Constraint) protocol, and the engine
-consults those constraints while it searches. Binding order can therefore
-adapt to the values already found instead of being fixed before evaluation.
+consults those constraints *while* it searches, so binding order is chosen from
+the values already found instead of being fixed before evaluation.
 
-The current protocol is **block-native**. Its unit of work is not necessarily
-one partial binding, but a block of partial bindings that have the same set of
-bound variables. Every live ordinary iterator uses one canonical
-residual-state machine. Narrow states naturally call the same protocol with a
-single row; reconverged states can call it with larger row blocks. A constraint
-therefore has one implementation whether its probes are issued one at a time,
-fused into a CPU loop, or dispatched to a batch-oriented accelerator.
-
-## Bindings as row blocks
-
-A [`RowsView`](triblespace::core::query::RowsView) is a borrowed, row-major view
-of partial bindings. Its `vars` slice names the columns and every row contains
-one value for each of those variables. For example:
-
-```text
-vars = [person, city]
-
-row 0 = [P1, Bremen]
-row 1 = [P2, Arrakeen]
-row 2 = [P3, Bremen]
-```
-
-All rows have bound the same variables, although their values differ. Column
-order is not part of the protocol: constraints locate a variable with
-`RowsView::col` rather than assuming a position. A view with no columns is the
-seed block, represented as one virtual zero-width row. Consequently the empty
-binding is an ordinary input to the protocol rather than a special engine case.
-
-When the engine asks for candidates for another variable, the tagged form of
-[`CandidateSink`](triblespace::core::query::CandidateSink) stores a ragged
-matrix as `(row, value)` pairs:
-
-```text
-(0, E1), (0, E2), (2, E7)
-```
-
-Here row 0 has two extensions, row 1 dies, and row 2 has one. Pairs remain
-grouped by row. A one-row caller instead uses the plain-values sink, where the
-row index is statically zero and no tag is stored. Estimates follow the same
-pattern through [`EstimateSink`](triblespace::core::query::EstimateSink): a
-multi-row action receives one estimate per row, while a one-row action can use
-the compact scalar representation.
+This chapter describes that protocol, the search that drives it, the result
+semantics that fall out of both, and — just as importantly — the things the
+engine deliberately refuses to do. The refusals are load-bearing: each one is
+what buys a property the engine does provide.
 
 ## The constraint protocol
 
-Five operational methods perform the ordinary query negotiation:
+A constraint restricts the values that query variables may take. It is not a
+node in a plan; it is a participant the engine interrogates. The whole
+interface is seven methods, and the engine calls them in a fixed rhythm:
 
-| Method | Responsibility |
-|---|---|
-| `variables` | Declare the variables the constraint touches. |
-| `estimate` | Produce a candidate-count estimate for a variable and every input row. |
-| `propose` | Enumerate candidate values for a variable and associate each value with its parent row. |
-| `confirm` | Remove candidates that violate this constraint. |
-| `satisfied` | Check the truth of a constraint whose relevant variables have become bound. |
+| Method | Role | Called |
+|---|---|---|
+| `variables` | Declares which variables the constraint touches. | Once, at query start. |
+| `estimate` | Predicts the candidate count for one variable under the current binding. | Before each binding decision. |
+| `propose` | Enumerates candidate values for a variable into a buffer. | On the most selective constraint for that variable. |
+| `propose_chunk` | Resumable `propose`: appends up to a budget of further candidates. | Instead of `propose`, when the engine wants the level in pieces. |
+| `confirm` | Kills candidates that violate this constraint. | On every *other* constraint touching that variable. |
+| `satisfied` | Reports whether the constraint is still consistent with the binding. | Before propose/confirm, and once up front for constant subtrees. |
+| `influence` | Names the variables whose estimates go stale when one variable is bound. | Once per variable, at query start. |
 
-Every `Constraint` occurrence unconditionally denotes one fixed raw-inline SET
-relation over the variables it declares. `proposal_coverage` is not a second
-semantic mode: it is the structural source-eligibility receipt for one
-occurrence, target, and bound-variable schema. `None` makes no completeness
-claim, `Covering` includes the complete existential fiber and requires
-self-confirmation, and `Exact` equals that fiber. Coverage must not depend on
-bound values or estimates. Every surviving non-full query state needs at least
-one Covering or Exact source, while confirmation-only occurrences may remain
-at `None`.
+`estimate` returns `None` for a variable the constraint does not touch, which
+is how "irrelevant" is distinguished from "unknown cost". An estimate is a cost
+quote and nothing else: it steers variable ordering, never correctness. A
+constraint that lies about its cardinality makes the search slower, not wrong.
 
-Five laws are load-bearing for correctness:
+Only four of the seven need an implementation. `propose_chunk` defaults to
+"deliver everything on the first call and report exhaustion", `satisfied`
+defaults to `true`, and `influence` defaults to "every variable I touch except
+this one". A new data source therefore joins the engine with `variables`,
+`estimate`, `propose`, and `confirm`.
 
-1. Ordinary, paged, typed-Program, and complete-equivalent routes must agree on
-   the same relation. Activation-local novelty keys exposed by an accelerated
-   route must be congruent for future outputs: equal keys cannot hide states
-   with different relational futures.
-2. `propose` is always given an **empty** sink. A composite must preserve that
-   ownership when delegating. In particular, each arm of a union proposes into
-   its own empty buffer before the buffers are merged.
-3. `confirm` must return a subbag of its input and preserve row grouping. It
-   retains every candidate occurrence belonging to the relation's existential
-   fiber, and becomes exact once all occurrence variables other than the
-   target are bound. It is a weak support refinement, not a candidate-bag
-   homomorphism: conservative false positives may depend on the other
-   candidates in the same call.
-4. `satisfied` may optimistically return `true` while one of the constraint's
-   variables is unbound, but `false` must prove that the row has no completion.
-   It **must be exact once all variables are bound**. This includes
-   zero-variable constraints, which are fully bound at the seed.
-5. Every row-taking verb is a **row homomorphism**. Splitting a block into
-   non-empty consecutive sub-blocks, evaluating them independently, and
-   concatenating the outputs (with candidate row tags remapped) must equal
-   evaluating the whole block. In particular, estimates and proposals
-   concatenate, confirmation is local to each candidate's row, and whole-block
-   `satisfied` is the conjunction of the sub-block answers. Batched
-   implementations may fuse physical work, but block-global top-k or first-row
-   decisions are invalid. Diagnostics may observe call boundaries, but those
-   observations must never feed back into protocol answers.
+Composition is by two constraints rather than by an algebra:
+[`IntersectionConstraint`](triblespace::core::query::intersectionconstraint::IntersectionConstraint)
+(built by [`and!`](triblespace::core::prelude::and)) and
+[`UnionConstraint`](triblespace::core::query::unionconstraint::UnionConstraint)
+(built by [`or!`](triblespace::core::prelude::or)). Both are ordinary
+constraints implementing the same seven methods, so a `TribleSet` pattern, a
+`HashSet` membership test, and an application predicate mix in one query
+without any of them knowing about the others.
 
-The fourth law is easy to mistake for an optimization hook, but it is a
-soundness rule. An [`or!`](triblespace::core::prelude::or) constraint uses it to
-discard alternatives contradicted by the current row before those alternatives
-propose or confirm another variable. An optimistic answer for a fully bound,
-false alternative could otherwise admit a row that no single alternative
-satisfies. A fully constant pattern similarly has no variable through which the
-search could discover failure, so [`Query::new`](triblespace::core::query::Query::new)
-settles it with an exact `satisfied` call against the seed block.
+## Statelessness is the load-bearing choice
 
-Estimates are cost quotes only. Returning no estimate means unknown cost, not
-irrelevance, and no estimate may authorize a different proposal, confirmation,
-route, or result. Structural relevance comes from `variables`; logical source
-eligibility comes from `proposal_coverage`.
+Every method receives the current [`Binding`](triblespace::core::query::Binding)
+as a parameter. A constraint keeps no cursor, no half-finished enumeration, no
+record of where the search has been.
 
-Constraints are otherwise stateless. Each method receives the current
-`RowsView`; the engine does not notify constraints when it backtracks, chunks a
-frontier, or processes work in a different order. This is what allows the same
-constraint tree to run at every residual width and on either serial or parallel
-executors.
+That single decision pays for most of the engine's structure:
 
-## One expansion step
+- **Backtracking is free.** The engine unsets a variable in the binding and
+  moves on. There is nothing to notify, unwind, or roll back, because no
+  constraint holds state that could be stale.
+- **The constraint tree can be cloned.** Parallel execution splits by cloning
+  the *engine's* state; the constraint tree is shared behind an `Arc`. If
+  constraints held live iterators, a split would have to duplicate or hand off
+  those iterators, and a borrowed enumeration would tie the constraint's
+  lifetime to the engine's — the self-referential trap that a stateful protocol
+  cannot avoid.
+- **Resumption is plain data.** When the engine wants a level in pieces it
+  hands `propose_chunk` a
+  [`ProposeCursor`](triblespace::core::query::ProposeCursor): a `started` flag
+  and 32 opaque bytes the source interprets however it likes (a last-delivered
+  value, a rank offset). The source re-finds its place from that cursor on
+  every call. Because the cursor is POD, it survives `Query::clone` and the
+  rayon splitter without any cooperation from the source.
 
-An expansion still performs the familiar Atreides negotiation:
+The price is that a source with an expensive seek pays it again on every
+resume. That is the trade the engine takes, and the geometric chunk schedule
+below is what keeps the number of resumes logarithmic.
 
-1. Estimate each eligible proposal source for every unbound variable under the
-   current partial bindings. Directed action costs choose the physical source
-   within each variable.
-2. Choose the preferred next variable with one fixed key: the selected
-   source's raw candidate-count bit length (smaller first), then `VariableId`
-   (smaller first). In a multi-row block this decision is made per row, because
-   different bound values can imply different cardinalities.
-3. Stable-partition the rows by their exact preferred variable. This preserves
-   each row's selected occurrence bag while still batching rows whose preferred
-   variable agrees; no row is reassigned to an estimate-similar variable.
-4. For each group, propose that variable. An intersection chooses its tightest
-   child per row and runs the remaining children as explicit confirmation
-   actions. Finite unions become formula alternatives in the same residual
-   machine.
-5. Extend the parent rows with the surviving `(row, value)` pairs. Rows without
-   candidates disappear.
+## Depth-first search with dynamic variable ordering
 
-There is no standalone join plan or second depth-first engine. Width one is the
-low-latency edge of this same execution model: one-row actions use plain-value
-sinks without allocating row tags, and a surviving continuation remains hot so
-the machine can descend before harvesting wider sibling cohorts.
+The ordering is the engine's core performance idea, not an implementation
+detail.
 
-## Canonical residual-state machine
+[`Query::new`](triblespace::core::query::Query::new) asks every variable for an
+estimate against the empty binding and sorts the unbound set by it. Then the
+search repeats one step:
 
-The residual engine keys a bucket by its **remaining computation**, not merely
-by the bindings or the route that produced it. Its single compiler recursively
-flattens exposed associative AND regions into deterministic preorder leaf
-occurrences and represents finite Union leaves as formula structure.
-Regular-path and custom constraints remain opaque leaves unless a capability
-explicitly exposes more structure, so lowering never crosses an undeclared
-semantic boundary.
+1. Refresh the estimates that the most recent binding could have changed — the
+   `influence` sets of the variables bound since the last refresh, minus the
+   ones already bound.
+2. Re-sort the unbound variables and take the most specific one.
+3. Ask the constraint tree to `propose` candidates for it. An intersection
+   internally lets its tightest child propose and runs the remaining children
+   as confirmers over that child's output, so the buffer the engine sees has
+   already survived every clause.
+4. Bind the first live candidate and descend.
+5. When a level runs out of live candidates and its source is exhausted, unset
+   the variable, push it back into the unbound set, and continue with the next
+   candidate one level up.
 
-Exposed Union progress becomes canonical formula state, and eligible cyclic
-regular paths run through the delta submachine. Production-qualified typed
-Programs enter that same scheduler; a structurally absent or explicitly
-non-production route uses the stable ordinary `Constraint` action and cannot
-strengthen its proposal receipt. This is one structural plan, not a public
-matrix of compiler policies.
+Specificity is deliberately coarse. The sort key is the *bit length* of the
+estimate (`ilog2(n) + 1`), so counts inside the same power-of-two bucket are
+treated as equally specific; the tie-break then prefers the variable with the
+largest `influence` set — the one whose binding will sharpen the most other
+estimates. Two effects follow. Small differences between two sources' guesses
+cannot flip the order, which keeps the search stable when estimates are rough.
+And when the engine genuinely cannot tell two variables apart on cardinality,
+it picks the one that buys the most information.
 
-Each canonical descriptor includes the bound-variable schema and one of four
-phases:
+Re-sorting on every step is what makes the ordering *dynamic*. A planner
+chooses one order from global statistics and lives with it for the whole query;
+here each level chooses from the estimates *under the current partial binding*.
+On skewed data this is the difference between a good average and a good worst
+case: the popular entity and the rare one take different paths through the same
+query, because after binding an entity the remaining estimates are no longer
+the same numbers. Nothing is cached, so nothing has to be invalidated. See the
+[Atreides Join](atreides-join.md) chapter for how estimate fidelity ranks and
+why this is worst-case optimal.
 
-- `Ready` jointly chooses a row's next variable and exact proposing leaf.
-- `Propose` invokes one uniform proposer over an assembled parent-row bucket.
-- `Candidate` chooses the next unchecked relevant confirmer.
-- `Confirm` invokes one uniform confirmer over a disjoint page of the admitted
-  candidate relation. A selected typed Program may retain one complete parent
-  activation when doing so reuses traversal state.
+## Proposals: one write-once buffer per level
 
-Planning phases only estimate, partition, and file work; protocol calls happen
-in the explicit action phases. The checked-leaf set is canonical, so histories
-that applied the same constraints in different orders can append to the same
-future state before its remaining work runs. Before newly proposed candidates
-can split into independent pages, the engine reverse-stably admits one
-`(parent row, value)` occurrence. Equal values under different affine parents
-remain independent. Confirmers may conservatively retain different false
-positives for different pages, but must preserve every true support and become
-exact under their fully bound schema, so correctness depends only on the final
-raw SET rather than intermediate payload or trace equality. Formula OR retains
-its private ordered-set reducer and live-frame payload barrier; a repeated RPQ
-may retain one complete parent activation solely to reuse graph-product
-traversal. Segmented affine payloads cross through a bounded engine admission
-phase rather than synchronous materialization. The terminal projection remains
-the universal final SET guard across hidden witnesses and routes.
+`propose` writes into a
+[`ProposalBuffer`](triblespace::core::query::ProposalBuffer) — the engine's
+candidate store for one variable at one level. Entries are plain 32-byte
+`RawInline` values at fixed stride, appended and never moved or rewritten
+afterwards. Alongside them the buffer keeps one `u32` liveness word per entry.
 
-Lazy residual execution begins with actionable width one. A surviving action
-keeps its newly filed continuation hot, allowing a successful path to descend
-and emit before cold siblings are evaluated. Dead actions and terminal rows
-grow the desired width geometrically; once no hot continuation can run, an
-occupancy/readiness policy harvests wider batches. This gives the state machine
-a low-latency-to-throughput ramp without requiring a complete intersection to
-run eagerly for one binding.
+Nothing is ever compacted. A candidate that fails confirmation has its liveness
+word zeroed and stays exactly where it was; the engine iterates the live
+entries. That costs a scan over dead entries and buys two things: an entry's
+index is stable for the lifetime of the level, so a kill can be recorded by
+index alone, and no confirmer ever has to agree with another about where a
+candidate now lives.
 
-Regular-path product states apply that demand inside a node as well as across
-nodes. Positive, inverse, and negated attribute transitions expose an ordered
-frontier whose cursor is `(automaton branch, last value)`. A width-one pull can
-therefore inspect one distinct destination of a high-degree node, file both its
-affine expansion continuation and any novel child, and descend toward a result
-without first materializing the complete adjacency. Branch-qualified cursors
-keep distinct NFA futures separate even when they produce the same graph value.
-For `!p`, EVA pages distinct forward destinations and VEA pages distinct
-inverse subjects. The destination's attribute suffix then answers `exists a !=
-p`; because the current path algebra excludes one attribute, the exact inner
-test needs at most its first attribute and one strict successor. Destinations
-reachable only through `p` count against demand but produce no child. This
-keeps mixed positive/negated states under one global width without enlarging
-the activation-private cursor or relying on fixpoint deduplication. A
-transition page that produces no novel child, accepted endpoint, or stable
-continuation contributes negative feedback, so a rejected prefix grows from
-one to two to four destinations instead of remaining a width-one serial scan.
-An accepting initial product root is settled one step earlier. Typed Program
-seeding records its endpoint in the same distinct accepted set used by later
-pages and returns a one-shot effect receipt to the scheduler. A streaming
-proposal or fully-bound Boolean Support reducer files that receipt into the
-stable machine immediately, while the root's affine Program credit remains
-live for non-epsilon paths. Activation-reuse confirmation and non-linear
-formula proposal retain their quiescence barriers: seed acceptance is private
-reducer state there, not an illegally streamed result. This is the generic
-`ProgramSeedWork::accepted` law, not an RPQ branch in the scheduler. It
-preserves NODES(G) gating, same-variable paths, duplicate outer parent bags,
-and clone/drop remainders. Seed publication consumes no later page budget, and
-the first resumed state cannot replay it. Conversely, an independently dead
-Program page still supplies geometric negative feedback even if the activation
-published an earlier seed effect.
+The word-per-entry liveness layout, rather than a packed bitmask, is the
+deliberate baseline: every lane — CPU thread or GPU invocation — writes its own
+word, so there is no read-modify-write contention on a shared word. A packed
+representation is a plausible alternative behind the same API, to be justified
+against this baseline rather than assumed better.
 
-Paged product states cross one block-native typed Program seam. The erased
-batch carries row-aligned opaque work handles, immutable parent context, and
-ragged limits whose sum is the current global width; typed effects return with
-input tags. Storage and accelerator implementations may fuse a cohort without
-changing canonical state, novelty, rank, or producer-credit semantics.
+## Confirmation is kill-only
 
-Final-variable streaming activations use a terminal physical policy on that
-same seam. A directed hot continuation advances exactly one affine activation
-with its activation-local sparse quantum `t_a`, capped by global search width
-`S`. Cold global harvesting may instead cohort compatible terminal
-activations under `B=min(S, sum_a t_a)`, with ragged task limits that never
-spend more than one activation's `t_a` on its behalf. The backend call is
-shared, but feedback is not: an activation that publishes resets to one
-independently of a sibling whose live miss doubles its own quantum. A negative
-terminal cohort reaches outer search-width growth only after it saturates `S`
-and leaves work live.
+[`Candidates`](triblespace::core::query::Candidates) is the region handed to
+`confirm`: values are read-only, liveness words are killable, and there is no
+way to revive an entry or add one.
 
-The ordinary [`Query`](triblespace::core::query::Query) uses this engine whenever
-exact seed settlement leaves a live search. Opaque roots, one-leaf ANDs,
-disjoint conjunctions, finite Union roots, RPQ roots, and live zero-variable
-truths therefore all exercise the same residual substrate. A seed-rejected
-query starts no worklist at all. Production lowering flattens exposed
-associative AND regions, lowers finite Union leaves and their recursive
-AND/OR descendants into continuations, and admits the typed Program route
-returned for each exact action.
-Canonical single-shard SuccinctArchive Propose, Confirm, and Support routes are
-returned directly, so their pageable typed form participates in ordinary
-execution. Program retirement validates a wider activation receipt with
-one arena membership pass, avoiding the previous activation-count by arena-size
-multiplier while retaining cheap singleton and fully drained paths.
-UnionArchive returns typed Propose and Support routes and declines Confirm,
-which stays on the ordinary constraint action. Propose normally retains sparse,
-geometrically widened shard paging for low-demand and nonterminal work. A fresh multi-parent terminal
-cohort may instead use `CompleteActionEquivalent`, preserving the exact
-parent-major then shard-major raw occurrence bag until parent-local SET
-admission. Dense complete drains and bounded Succinct proposal pages consume
-the same already-located Ring walk. A resident WGPU two-bound proposal is a
-distinct preferred production family; a structurally declined action falls
-back to the canonical production Succinct route.
+That restriction is the whole reason confirmation needs no coordination. If a
+confirmer can only remove, then several confirmers writing into the same region
+compute their conjunction no matter how they are scheduled:
 
-Ordinary [`Query`](triblespace::core::query::Query) iteration owns the residual
-cursor for every root. Its compiler policy is fixed: native AND flattening,
-finite Union-leaf continuations, and returned typed Program routes.
-`solve_residual_state_lazy` uses the same production plan while exposing width
-controls and `collect_profiled` reports state, merge, action, and batch
-measurements. A full drain preserves the distinct raw projected-row set, but
-may change result order. Fully-bound rows remain raw until the consumer pulls
-them, so the worklist never stores projected `R`s and a partially consumed
-query can snapshot its exact remainder without requiring `R: Clone`.
+- **Sequentially**, each skipping entries that are already dead — the CPU path.
+- **In parallel**, each on its own copy of the liveness words, merged with
+  [`and_words`](triblespace::core::query::and_words) — the path a batching
+  accelerator takes.
 
-## Terminal projection and SET identity
+Both schedules are legal, produce identical liveness, and the engine does not
+have to choose between them ahead of time. A union inverts the merge: it runs
+each live arm on a scratch copy and combines with
+[`or_words`](triblespace::core::query::or_words), so a value survives if any
+arm accepts it.
 
-Every semantic action admits a SET before publishing successors. Proposal
-actions remove duplicate values for each affine parent, and residual sources
-and transitions perform the same admission at their stable boundary. Internal
-probes may still carry occurrence bags before that boundary, but every complete
-raw binding is therefore unique when it reaches projection.
+This is also what makes an accelerator safe to bolt on. A device that computes
+verdicts for a whole region cannot corrupt the search, because the only thing
+it can do with its answer is clear bits that the CPU would also have cleared.
 
-For a strict `find!` head, projection is not injective: complete bindings that
-differ only in hidden witnesses can have the same public identity. The terminal
-projection gate derives an ordered key from the head's raw inline bytes and
-claims it before running `TryFromInline` conversion or user mapper code. A
-second binding with that projected key is discarded, even when its hidden
-witness or route through an `or!` differs. A complete head is injective over
-the already-unique bindings, so it elides the terminal claim table, key
-allocation, and parallel claim mutex.
+## Chunked proposing
 
-This ordering gives projection ordinary relational SET semantics while keeping
-conversion outside the relational identity. Two distinct raw keys may convert
-to Rust values that compare equal and are still emitted separately. In the
-other direction, a failed conversion, mapper returning `None`, or mapper panic
-consumes a strict head's raw key; another witness cannot retry user code for
-that key. The empty head has one possible public key, so
-`find!((), constraint)` emits at most one unit value. When the constraint has
-variables, claiming that strict singleton key exhausts the public projection:
-the next pull stops before scheduler work, while `None` stops the claiming pull
-and a caught mapper panic leaves the next pull immediately exhausted. For a
-zero-variable query the empty head is also the complete head; its sole semantic
-seed provides the same at-most-once behavior without a claim table.
+A level whose source has a million candidates should not have to materialize a
+million candidates before the engine can try the first one. `propose_chunk`
+lets the engine pull a level in pieces: the first request asks for 64
+candidates, and each refill asks for four times the previous budget.
 
-The `find!` macro supplies its explicit ordered head. Direct `Query::new`
-construction uses every variable in the constraint as its conservative head,
-so it removes only byte-identical complete bindings. There is no public bag
-mode.
+Geometric growth keeps both ends bounded. Time-to-first-result at a wide level
+is bounded by the first chunk rather than by the level's cardinality, while the
+total enumeration work stays within a constant factor of eager proposing and
+the number of refill calls stays logarithmic in the level width.
 
-Cloning a serial iterator copies both its remaining raw cursor and, for a
-strict head, its claimed keys into an independent snapshot. Rayon strict-head
-sibling shards instead share one run-owned claim domain, ensuring that
-duplicates discovered by different workers are still emitted once. Full heads
-carry no claim state in either execution mode.
+The contract on the source is small but strict: never deliver the same value
+twice across the calls of one enumeration (that would inflate row multiplicity,
+see below), and always advance the cursor when the budget is nonzero, so a
+caller that loops on refill terminates.
 
 ## Parallel execution
 
-With the `parallel` feature, ordinary `IntoParallelIterator` consumption uses
-the same canonical residual runtime as ordinary serial iteration. A fresh
-query starts with the adaptive geometric width policy and partitions its exact
-affine frontier into at most one shard per worker. Rows and SET-admitted
-candidate occurrences are the same shard atoms used by the explicit residual
-path. A selected typed Program may retain one complete parent activation for
-physical traversal reuse, and a live Formula OR frame retains its private
-payload.
-Cross-shard reconvergence is traded for concurrency, but no second solver or
-seed restart is involved.
+With the `parallel` feature a query is also a rayon producer:
+`find!(...).into_par_iter()`. There is no second solver behind it. Splitting
+walks the same state machine and hands one half of a level's candidates to a
+sibling:
 
-[`Query::into_par_residual_state_iter`](triblespace::core::query::Query::into_par_residual_state_iter)
-is the explicit saturated-width residual entry point. It uses the same affine
-splitter and executor as ordinary parallel iteration, but treats the call as a
-full-enumeration throughput request and starts at the width cap. Rows and
-SET-admitted candidate occurrences are valid shard atoms; a selected typed
-Program may keep one complete parent activation intact for physical traversal
-reuse, and a live Formula OR frame retains its private payload. Every shard
-retains canonical state merging locally; state is moved rather than
-duplicated, and the constraint/postprocessor pair is cloned only when a real
-sibling shard is created. Both ordinary and saturated parallel entry points
-use the same fixed production plan as serial `Query`.
+- While the top of the search stack has a single pending candidate *and* its
+  source is exhausted, bind it and descend. Descending through a level whose
+  cursor is still live would clone that cursor into the sibling and enumerate
+  its tail twice, so such a level is bisected instead.
+- When the top has two or more pending candidates, bisect them. The right half
+  takes the materialized tail and is marked exhausted; the left half keeps the
+  cursor. Every unmaterialized candidate therefore has exactly one owner.
+- A leaf just drives the ordinary sequential `Iterator::next` and folds the
+  results. No engine logic is duplicated for the parallel path.
 
-### Opt-in residual action observation
+Because rayon resets its splitter budget on every stolen task, each producer
+carries its own bounded budget — `num_threads²`, halved at each split — so a
+busy pool cannot drive the split tree arbitrarily deep against a query that
+always has more candidates to bisect.
 
-A configured residual iterator can be wrapped with
-[`ResidualStateIter::shadow`](triblespace::core::query::residual::ResidualStateIter::shadow)
-and a fresh
-[`ResidualShadowEpoch`](triblespace::core::query::residual::ResidualShadowEpoch). The
-wrapper observes only concrete `Propose` and `Confirm` dispatches, including
-actions performed while a parallel producer negotiates its first splittable
-frontier. It records the exact leaf occurrence, variable, bound schema, input
-geometry, wall time, immediate survival or death, and any executor-local
-samples. The ordinary residual iterator and executor contain no observer
-field, clock read, thread-local lookup, observer allocation, or observer
-option branch.
+The guarantee is the same bag of rows, not the same order. Constraint trees are
+shared behind an `Arc`, so a split is a refcount bump rather than a tree clone;
+code that wants aggregate observations across shards needs its own
+synchronization (an `Arc<AtomicU64>`, say) because clone-local interior state
+is not a global counter.
 
-Action event numbers and leaf occurrences are local to one claimed epoch;
-neither exposes the machine's private interner `StateId`. Serial exhaustion
-and a fully drained Rayon drive close the epoch. `Closed` is a proof state: the
-affine frontier was exhausted and every begun action has an ordinary
-completion. Normal close is therefore private to the iterator/drive that owns
-that frontier; a live or aborted action forces `Invalidated`, and the two
-terminal states never transition into one another. Dropping an unfinished
-serial wrapper, a panic anywhere in one pull (planning, action, or projection),
-a parallel short circuit, or a parallel unwind invalidates it immediately,
-even when the caller catches the unwind and retains the wrapper. A subsequent
-pull is rejected.
+## Bag semantics at the interface
 
-Each Rayon producer carries its own armed abandonment guard. The guard is
-disarmed only after that producer observes exact exhaustion (`next() == None`),
-so a consumer that is already full, an abandoned split side, and cancellation
-without a fold all invalidate the top-level drive. Converting a serial wrapper
-that already proved exhaustion yields an empty Rayon iterator and preserves
-`Closed`.
+**The engine emits one row per complete binding.** When the unbound set empties,
+that assignment is a result. Nothing deduplicates it.
 
-An event is registered first, then its thread-local correlation scope is
-installed. Its public dispatch offset is published through the epoch's
-snapshot gate; after that gate and every observer lock are released, a
-separate private execution timer begins immediately before the unchanged task
-executor. Successful execution captures and records that duration before the
-correlation scope is removed, excluding registration, snapshot contention,
-scope setup/teardown, and outcome mapping from action wall time. A snapshot is
-a consistent copy at its terminal/open state. During the narrow
-registration-to-dispatch window, the non-optional `started` field temporarily
-uses the registration offset; dispatch replaces it with the actual offset.
-An event admitted while the epoch was open may still publish and complete
-after explicit invalidation: observation never cancels engine work, and its
-completion is retained as stale. Samples filed after a terminal transition
-likewise remain attached to their original event and are marked stale.
+Hidden variables therefore surface as multiplicity. If an entity has eight
+`follows` edges and a query projects only the entity while a `temp!` or `_?`
+variable ranges over the target, that entity is emitted eight times:
 
-[`current_residual_action`](triblespace::core::query::residual::current_residual_action)
-provides a stack-scoped correlation capability during a leaf call, so nested
-observed queries restore the outer action on return. An asynchronous backend
-must clone and carry that capability explicitly to another thread; ambient
-thread-local state is not propagated. Observations are diagnostics only: they
-must never feed estimates, protocol answers, state identity, action ordering,
-or scheduling decisions in the execution they observe.
+```rust
+use std::collections::HashSet;
 
-The optional `triblespace-gpu::WgpuSuccinctArchive` accelerates the
-succinct-archive constraint without putting a device dependency in core. The
-kill-only `confirm` contract is what makes this legal: verdicts computed
-anywhere merge back into a candidate region by word-wise AND, so a device can
-evaluate a whole region's membership probes in parallel and can never revive a
-dead entry. The wrapper keeps the archive's value universe, per-axis occupancy
-boundaries, and six Jerky wavelet matrices resident; estimates, proposals,
-prefix walks, and satisfaction checks remain on CPU. A `confirm` region with
-enough live candidates (16,384 by default, measured on Apple M4 Max Metal)
-uploads its candidate values and liveness words, runs the same probes the CPU
-arm would — a fused binary-search/occupancy kernel for unbound membership, a
-probe-fill/batched-rank/verdict-fold chain for range restriction — and reads
-back one verdict word per candidate. Everything below the threshold, and any
-device error, falls through to the canonical CPU arm, which is held to
-identical liveness words by the crate's parity suite.
-`WgpuSuccinctArchive::stats` exposes dispatch and fallback counters so the
-routing economics stay observable rather than hidden in a planner heuristic.
+use triblespace::prelude::*;
 
-The adapter samples every nonempty Succinct confirmation rank stream offered to
-the backend, whether its candidates use the plain-values or tagged
-representation. It does not reinterpret all CPU work inside the action as
-archive work, and planning, proposal, domain lookup, and satisfaction remain
-unsampled. An empty rank stream records nothing; a nonempty call outside a
-current observed action executes normally without a sample. Exact work is
-`positions.len()` in `rank-probes`. Threshold fallbacks
-are labelled `cpu` / `wavelet-rank/threshold-fallback`, while admitted device
-calls are labelled `wgpu` / `wavelet-rank/gpu-round-trip`. These labels come
-from the private per-call route that actually executes rather than from the
-racy aggregate counters. Executor wall brackets only the selected rank backend;
-route selection, aggregate-stat updates, and sample attachment are excluded.
-The adapter captures the current `ActionCorrelation` once and carries that
-capability across the synchronous WGPU round trip, so asynchronous device work
-does not depend on ambient TLS after dispatch.
-The `residual_reconverge_bench` example measures this admission boundary across
-adaptive and saturated serial/Rayon residual execution. It compares exact
-sorted output before timing and reports the CPU, forced-WGPU, and thresholded
-hybrid paths separately rather than treating executor choice as a planner
-mode.
+mod social {
+    use triblespace::prelude::*;
+    attributes! {
+        "C21DE0AA5BA3446AB886C9640BA60244" as friend: inlineencodings::GenId;
+    }
+}
 
-A partially consumed ordinary query converted through
-`into_par_iter()` is drained as one parallel leaf so its exact remaining state
-cannot be restarted or partitioned by a second solver. The explicit saturated
-block-native entry point requires a fresh query. With one Rayon worker it has a
-zero split budget; with `N` workers it permits at most `N - 1` splits. In every
-case the result
-guarantee is equality of the distinct raw projected-row set, not iteration
-order.
+let mut kb = TribleSet::new();
+let alice = ufoid();
+let bob = ufoid();
+let carol = ufoid();
+kb += entity! { &alice @ social::friend: &bob };
+kb += entity! { &alice @ social::friend: &carol };
 
-The parallel paths clone the constraint tree and result postprocessor per
-shard. Code that needs aggregate observations across clones should use shared
-synchronization such as `Arc<AtomicU64>`; clone-local interior state is not a
-global invocation counter. The row-homomorphism law above is what permits the
-engine to change chunk and shard boundaries without changing results.
+// One row per complete binding: the hidden `_?friend` multiplies `?person`.
+let rows: Vec<_> = find!(
+    (person: Id),
+    pattern!(&kb, [{ ?person @ social::friend: _?friend }])
+)
+.collect();
+assert_eq!(rows.len(), 2);
+
+// Deduplication is the consumer's job.
+let distinct: HashSet<_> = find!(
+    (person: Id),
+    pattern!(&kb, [{ ?person @ social::friend: _?friend }])
+)
+.collect();
+assert_eq!(distinct.len(), 1);
+```
+
+This replaced an engine that projected with SET semantics. That engine kept a
+claims table: an ordered key derived from the head's raw bytes, claimed before
+conversion, so a second binding with the same public identity was discarded.
+It was removed because the cost was structural rather than incidental. The
+table's memory grows with the *result* set, not with the query; under rayon the
+claim domain has to be shared across workers, which puts a synchronization
+point on the hot path of an otherwise share-nothing search; and once user code
+runs behind a claim, a conversion failure or a panic consumes the key, so
+another witness cannot retry it — a rule that is difficult to explain and
+easy to trip over. Worst of all, the multiplicity is genuine information about
+the data, and the engine was throwing it away on the way out.
+
+Bag semantics is not the absence of a feature so much as the decision about
+where the feature belongs. Two idioms cover what the claims table used to do:
+
+- **Collect into a set.** `HashSet<_>` (or `BTreeSet<_>`) after `find!` costs
+  memory proportional to the distinct results — the same memory the claims
+  table cost — but only when the caller actually wants it, and it deduplicates
+  on the converted Rust values rather than on raw bytes.
+- **Two queries.** Enumerate the outer variable, and use
+  [`exists!`](triblespace::core::prelude::exists) for the inner condition.
+  `exists!` stops at the first witness, so the fan-out is never enumerated at
+  all. This is usually the faster answer, and it is the one that reads like the
+  question being asked: "entities that have a friend", not "entities paired
+  with a friend, deduplicated".
+
+The unit head follows the same rule rather than getting an exception:
+`find!((), constraint)` yields one `()` per satisfying assignment. Use
+`exists!` when the question is existence.
+
+Note that `or!` is a genuine exception at the *binding step*, not at the
+interface: a union sorts and deduplicates the candidate values it proposes for
+a single variable, so two arms that offer the same value for the same variable
+contribute one candidate, not two. That is a property of the candidate buffer
+for one level, and it does not extend to complete rows — the same alias
+witnessed by two different entities is still two rows.
+
+## Constants live below the variable layer
+
+A pattern position is a [`Term`](triblespace::core::query::Term): either a
+`Var` the engine solves for, or a `Const` pinned at construction. The macro
+layer folds attribute constants, literal values, and constant entity ids into
+`Const` terms.
+
+Constants never enter a `Binding`, are never proposed, and are excluded from
+`variables()`. They behave exactly like a variable that was already bound —
+`RawTerm::position_value` returns the pinned value where it would return the
+binding's value — so every backend's bound/unbound dispatch handles them with
+no extra match arms.
+
+Keeping them below the variable layer is what makes `or!` usable. Every arm of
+a union must declare the same variable set, because the result schema is flat:
+one row binds one variable set exactly once, so a variable that only exists in
+some alternatives has nowhere to live. If a literal allocated a hidden
+variable, then two arms matching different attributes would declare different
+sets and the union would be rejected at construction — which was exactly the
+symptom before constants became Term-native. As folded constants they cost no
+variable, so an arm on `profile::nickname` and an arm on `profile::display_name`
+declare the identical set and compose.
+
+Two more consequences fall out. Literals do not consume the 128-variable
+budget, so a pattern with 161 constants allocates zero variables. And a pattern
+whose positions are *all* constant has an empty variable set, which the search
+would never visit — so `Query::new` settles it once, up front, with a single
+`satisfied` call against the empty binding. This is why `satisfied` must be
+exact once every variable it touches is bound: for a constant subtree there is
+no variable through which the search could later discover failure.
+
+## Where the GPU fits
+
+The optional `triblespace-gpu` crate accelerates one operation:
+`WgpuSuccinctArchive` keeps a succinct archive's value universe, per-axis
+occupancy boundaries, and six Jerky wavelet matrices resident on the device,
+and routes a `confirm` region to a kernel when it has at least
+`DEFAULT_MIN_CONFIRM_BATCH` live candidates.
+
+It is not a second engine and not a planner. Estimates, proposals, prefix
+walks, and satisfaction checks stay on the CPU; a region below the threshold
+and any device error fall through to the canonical CPU arm, which the crate's
+parity suite holds to identical liveness words. The substitution is legal
+precisely because of the kill-only contract: verdicts computed anywhere merge
+back by word-wise AND, and a device can never revive a dead entry.
+
+The threshold is measured, not guessed. On an Apple M4 Max (Metal via wgpu),
+against a 262,135-trible archive with fully live regions, the GPU round trip is
+nearly flat at ~1.4–2.2 ms while CPU cost scales linearly — putting the
+crossover near 8k live candidates for the range shape (two wavelet ranks per
+candidate) and near 22k for the lighter membership shape. 16,384 is the
+single-knob compromise between them; the full crossover table lives in the
+constant's doc comment. `WgpuSuccinctArchive::stats` exposes dispatch and
+fallback counters, so the routing economics stay observable instead of being
+hidden inside a heuristic.
+
+## Where regular paths went
+
+Regular path queries — "everyone reachable through a chain of `follows`", "all
+ancestors via repeated `parent`" — are no longer part of the engine. The
+`path!` macro and its query-time evaluator have been removed.
+
+The reason is the stateless protocol. A triple pattern is a relation over a
+fixed set of variables, and the engine can ask it for candidates under any
+binding. A regular path is an automaton product traversal: evaluating it inside
+the search needs per-activation state — where the frontier is, which automaton
+branch produced which value, what has already been visited — and that state
+belongs to one live traversal, not to a binding the engine can hand back later.
+Every attempt to keep it inside the protocol grew the protocol, and the growth
+did not stay confined to paths: pager hooks, activation receipts, and novelty
+keys became things *every* constraint had to reason about, including the ones
+that only ever wanted to answer "is this triple present".
+
+So paths moved out of query time entirely. The replacement is a materialized
+closure **index**: compile the graph edges and an epsilon-free automaton into a
+product graph and maintain its reflexive transitive closure, then let queries
+read the closure as an ordinary relation. Reachability becomes a lookup rather
+than a traversal, which is the right shape for a data model where facts are
+only ever added — the closure grows monotonically with the edge set.
+
+That work lives in a separate `triblespace-paths` crate and is under active
+development; it is not part of the published surface yet, and this book will
+document the API when there is a stable one to document. Until then, express
+bounded traversals as explicit pattern clauses (one clause per hop), and drive
+unbounded ones from application code.
+
+## What the engine will not do
+
+Four refusals, and what each one buys:
+
+- **No cost-based optimizer.** There is no plan to compile, no statistics to
+  collect, no cardinality model to keep calibrated, and no plan cache to
+  invalidate. What replaces it is the per-step ordering above, which sees the
+  actual partial binding instead of a summary of the data. The cost is that a
+  genuinely bad `estimate` cannot be corrected by anything but a better
+  `estimate`; the benefit is that adding a data source means implementing four
+  methods, not teaching a planner about a new operator.
+- **No negation.** There is no `MINUS`, no `FILTER NOT EXISTS`, no `OPTIONAL`.
+  This is a data-model decision reaching up into the engine: the trible model
+  is monotonic, and a non-monotonic operator would make a query's answer
+  depend on facts *not* being present — which stops being a stable statement
+  the moment another replica merges in. Monotonicity is what makes
+  `pattern_changes!` sound, what makes distributed merge coordination-free, and
+  what makes a query result something you can still believe after a `pull`.
+- **No query-time recursion.** See the section above. Recursion returns as a
+  maintained index, where the fixpoint is computed once against the data rather
+  than repeatedly inside every search.
+- **No projection dedup.** Covered above: the multiplicity is real, the
+  deduplication has a cost, and the consumer is the one who knows whether it
+  wants to pay it.
+
+What the engine does provide in exchange is a short list, but a durable one:
+predictable latency, skew resistance, no tuning knobs, and one protocol that a
+`TribleSet`, a compressed on-disk archive, a `HashSet`, a search index, and an
+application predicate all speak equally well.
 
 ## Queries as Schemas
 
@@ -481,14 +431,9 @@ definition, as a query only returns data satisfying its constraints.[^2]
 The query engine uses the Atreides family of worst-case optimal join
 algorithms. These algorithms leverage the same cardinality estimates surfaced
 through `Constraint::estimate` to guide variable choice over partial bindings,
-providing skew-resistant and predictable performance. The residual machine
-makes the exact proposer occurrence and remaining confirmer set part of
-canonical state so equivalent futures can reconverge after their selected
-actions run. At width one it follows the hot continuation depth-first; as width
-grows it batches equivalent futures. Every Ready state computes fresh
-per-row estimates for all unbound variables. Equal-magnitude estimates use the
-lower `VariableId` as their deterministic tiebreak. There is no cached estimate
-state or separate planning artifact to maintain.
+providing skew-resistant and predictable performance. Estimates are recomputed
+from the current binding rather than cached, so there is no invalidation
+protocol and no separate planning artifact to maintain.
 For a detailed discussion, see the [Atreides Join](atreides-join.md) chapter.
 
 ## Query Languages
