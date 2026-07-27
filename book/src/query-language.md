@@ -30,13 +30,14 @@ let results = find!((a), a.is(1.into())).collect::<Vec<_>>();
 variables. Matches can be consumed lazily or collected into common
 collections.
 
-The head is an ordered relational projection with **SET semantics**. The
-engine emits each distinct tuple of raw inline head values at most once,
-regardless of how many assignments of hidden variables prove it. Distinctness
-uses the raw inline bytes before Rust conversion, so different raw values that
-convert to equal Rust values remain different projected rows. Conversely, a
-conversion failure claims that raw tuple before filtering it: another hidden
-witness for the same tuple does not retry the conversion.
+The head is an ordered projection with **BAG semantics**. The engine emits one
+row every time a complete binding is found, and the head selects which of its
+variables you get back. Hidden variables therefore multiply: an assignment
+proved by eight different witnesses is emitted eight times. Deduplication is
+the consumer's job — collect into a `HashSet`, or ask the question with
+[`exists!`](triblespace::core::prelude::exists) so the fan-out is never
+enumerated. The [Query Engine](query-engine.md#bag-semantics-at-the-interface)
+chapter explains why the engine does not deduplicate for you.
 
 When the head declares a **single variable**, omit the parentheses to get bare
 values instead of 1-tuples:
@@ -98,17 +99,16 @@ find!((x: i32, y: Inline<ShortString>?),
 | `name: Type?` | explicit type, yield `Result<T, E>` (no filter) |
 
 The query engine explores assignments that satisfy the constraint and yields
-each distinct tuple of the declared variables in head order. Variables omitted
-from the head are existential witnesses: they affect whether a tuple exists,
-not how many times it is returned. A repeated variable in the head is rejected
-because it would not add a new projected column.
+the declared variables in head order, one row per satisfying assignment.
+Variables omitted from the head still participate in the search — they decide
+whether an assignment exists, and each distinct value they take is a separate
+row. A repeated variable in the head is rejected because it would not add a new
+projected column.
 
-The empty head `find!((), constraint)` therefore yields at most one `()`—one
-when any assignment satisfies the body, and none otherwise. It is an existence
-projection rather than a way to count satisfying assignments. Once its single
-raw key is claimed, iteration stops without draining additional hidden
-witnesses; this remains true when conversion or mapper code rejects or panics
-on that key.
+The empty head `find!((), constraint)` therefore yields one `()` per satisfying
+assignment, which makes `find!((), ...).count()` a way to count them. When you
+only want to know whether *any* assignment exists, use `exists!`: it stops at
+the first one instead of draining the fan-out.
 
 ### Collecting results
 
@@ -280,9 +280,11 @@ required. When working outside the query macros, call
 [`VariableContext::next_variable`](triblespace::core::query::VariableContext::next_variable)
 directly instead.
 
-Because temporary variables are not part of the projection head, several
-friends that prove the same projected `person` still produce that person once.
-Project the witness explicitly when its identity belongs in the result.
+Temporary variables are hidden from the result tuple, but they are not hidden
+from the search: several friends that prove the same projected `person` produce
+that person several times. Collect into a set when you want each `person` once,
+or restructure the query so the inner condition is an `exists!` check and the
+fan-out is never enumerated at all.
 
 When the helper variable lives entirely within a single pattern, consider using
 `_?alias` instead of `temp!`. Both [`pattern!`](triblespace::core::macros::pattern) and
@@ -472,138 +474,64 @@ The example wraps an external `HashSet` so it can be queried directly.  A
 `TriblePattern` implementation follows the same shape: create a constraint
 type that reads from your backing store and return it from `pattern`.  The query
 engine drives both traits through `Constraint`, so any data source that speaks
-the block-native protocol can participate in `find!`. Its five operational
-methods are:
+the protocol can participate in `find!`. Four methods are required:
 
 | Method | Role |
 |---|---|
 | `variables` | Declare the variables touched by the constraint. |
-| `estimate` | Append one candidate-count estimate per input row. |
-| `propose` | Fill an initially empty sink with candidate extensions. |
-| `confirm` | Filter candidates proposed by another constraint without adding any. |
-| `satisfied` | Report exact truth once every relevant variable is bound. |
+| `estimate` | Quote a candidate count for one variable under the current binding, or `None` if the variable is not yours. |
+| `propose` | Append candidate values for a variable to the proposal buffer. |
+| `confirm` | Kill candidates proposed by someone else that violate this constraint. |
 
-Every constraint occurrence denotes one fixed raw-inline SET relation over the
-variables returned by `variables`. Its ordinary, paged, typed-Program, and
-complete-equivalent routes must agree on that relation. `estimate` supplies
-cost guidance only; it cannot change relevance, source eligibility, or query
-results.
+Three more have defaults you can override: `propose_chunk` (resumable
+proposing, defaulting to "everything at once"), `satisfied` (defaulting to
+`true`), and `influence` (defaulting to "every variable I touch except this
+one").
 
-`proposal_coverage` is the structural source-eligibility receipt. It says
-whether `propose` makes no completeness claim for a target (`None`), covers
-that target's complete existential fiber and therefore requires
-self-confirmation (`Covering`), or equals that fiber (`Exact`). Coverage
-depends on the occurrence, target, and bound-variable schema, never on bound
-values or estimates. Every surviving non-full query state needs at least one
-Covering or Exact source, while a confirmation-only constraint may publish
-`None`.
+The rules a custom constraint has to respect are short:
 
-Every live fresh ordinary iterator uses canonical residual states. A one-row
-action receives a one-row
-[`RowsView`](triblespace::core::query::RowsView) and compact plain-value sinks;
-reconverged multi-row actions use tagged candidate frontiers. Implementations
-without a specialized batch operation can loop over the rows, use
-`CandidateSink::extend_row`, and use the `confirm_per_row` adapter.
+- **`estimate` is a cost quote.** It steers variable ordering and nothing else.
+  A wrong estimate makes the search slower, never incorrect. `None` means "not
+  my variable", not "no candidates".
+- **`propose` only appends.** Entries already in the buffer belong to a
+  sibling constraint in an enclosing composite; leave them alone. Within one
+  chunked enumeration, never deliver the same value twice — a duplicate
+  inflates row multiplicity.
+- **`confirm` only kills.** It may never add a candidate or revive a dead one,
+  and it may skip entries that are already dead. This is what lets several
+  confirmers write into the same region in any order, or in parallel, and still
+  compute their conjunction.
+- **`satisfied` may be optimistic, but only upward.** Returning `true` while a
+  relevant variable is unbound is fine; returning `false` must mean there is
+  genuinely no completion. Once every variable the constraint touches is bound,
+  the answer must be exact — `or!` relies on that to discard dead alternatives,
+  and a fully constant constraint is settled by a single `satisfied` call at
+  construction with no search to correct it later.
 
-The four row-taking operations must also be row-homomorphic: evaluating
-non-empty consecutive sub-blocks independently and concatenating their
-row-remapped outputs must equal evaluating the original block. The block-native
-runtime, including ordinary `Query::into_par_iter()` and the explicit
-`Query::into_par_residual_state_iter()` frontier-sharding path, are free to
-change block boundaries; block-global top-k or first-row semantics would
-therefore be incorrect. Diagnostics may observe call boundaries, but must not
-feed those observations back into protocol answers.
+The [Query Engine](query-engine.md#the-constraint-protocol) chapter explains the
+protocol, the search that drives it, and the reasoning behind these rules in
+detail.
 
-`propose` owns the empty sink it receives. `confirm` may only return a subbag
-of its input: it must retain every candidate occurrence that belongs to the
-relation's existential fiber, and it must be exact once every other variable
-of the occurrence is bound. This is weak support refinement, not a
-candidate-bag homomorphism: a confirmer may conservatively retain different
-false positives when the same admitted candidate SET arrives in different
-pages. The engine SET-admits every newly proposed `(parent, value)` before
-independent paging, and only the final raw SET—not intermediate payload or call
-trace equality—is semantic. `satisfied` may conservatively return `true` while
-a relevant variable remains unbound, but `false` must prove that the row has
-no completion, and the answer must be exact once all of the constraint's
-variables are present in the view. That exactness is required for sound
-composition with `or!` and for constant, zero-variable checks; it is not
-merely an optional early-pruning optimization. Zero-variable roots are settled
-once during construction. The [Query Engine](query-engine.md#the-constraint-protocol)
-chapter explains the protocol and its residual execution model in detail.
+## Recursive traversal
 
-## Regular path queries
+Queries in this chapter all have a fixed number of clauses, which means a fixed
+number of hops. Genuinely recursive questions — "everyone reachable through a
+chain of `follows`", "all ancestors via repeated `parent`" — cannot be written
+this way.
 
-Sometimes you need to traverse a graph without knowing how many hops are
-involved. "Find everyone reachable through a chain of `follows` edges" or
-"find all ancestors via repeated `parent` links" are naturally recursive — they
-cannot be expressed with a fixed number of pattern clauses.
+Earlier versions of the crate answered them with a `path!` macro that evaluated
+a regular expression over edge attributes inside the query engine. That macro
+and its evaluator have been removed: query-time traversal needs per-activation
+state, which the stateless constraint protocol has no place for, and keeping it
+inside the protocol meant every constraint paid for machinery only paths used.
 
-The `path!` macro handles these cases by matching a **regular expression over
-edge attributes**. Instead of writing recursive Rust or collecting intermediate
-results, you describe the shape of the path and the engine evaluates it:
+Regular paths are returning as a materialized closure **index** in a separate
+`triblespace-paths` crate: graph edges and an automaton are compiled into a
+product graph whose reflexive transitive closure is maintained, so a query
+reads reachability as an ordinary relation instead of traversing at search
+time. That crate is under active development and is not part of the published
+surface yet; this chapter will document the API once there is a stable one.
 
-| Operator | Meaning | Example |
-|----------|---------|---------|
-| `a` | single edge | `social::follows` |
-| `a \| b` | either edge | `follows \| likes` |
-| `a b` | concatenation | `follows likes` (follow then like) |
-| `a+` | one or more | `follows+` (transitive closure) |
-| `a*` | zero or more | `follows*` (reflexive transitive closure) |
-
-`path!` expands to a
-[`RegularPathConstraint`](triblespace::core::query::RegularPathConstraint) and composes
-with other constraints.  Invoke it through a namespace module
-(`social::path!`) to implicitly resolve attribute names:
-
-```rust,ignore
-use triblespace::prelude::*;
-
-mod social {
-  use triblespace::prelude::*;
-  use triblespace::prelude::inlineencodings::*;
-  attributes! {
-    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" as follows: GenId;
-    "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" as likes: GenId;
-  }
-}
-let mut kb = TribleSet::new();
-let a = fucid(); let b = fucid(); let c = fucid();
-kb += entity!{ &a @ social::follows: &b };
-kb += entity!{ &b @ social::likes: &c };
-
-let results: Vec<_> = find!((s: Inline<_>, e: Inline<_>),
-    path!(&kb, s (social::follows | social::likes)+ e)).collect();
-```
-
-You can omit the hex literal in `attributes!` when you only need local or
-short‑lived attributes—the macro then derives a deterministic id from the name
-and schema via the entity-core mechanism (equivalent to
-`Attribute::<S>::from(entity!{ metadata::name: <name handle>, metadata::value_encoding: <S as MetaDescribe>::id() })`).
-Stick with explicit ids when the attributes form part of a shared protocol.
-
-The middle section uses a familiar regex syntax to describe allowed edge
-sequences.  Editors with Rust macro expansion support provide highlighting and
-validation of the regular expression at compile time. Paths reference
-attributes from a single namespace; to traverse edges across multiple
-namespaces, create a new namespace that re-exports the desired attributes and
-invoke `path!` through it.
-
-The endpoints of the path behave like ordinary variables. Bind them in the
-`find!` head to join the traversal with additional constraints—for example,
-restricting the starting entity or projecting the destination's attributes. If
-you want to follow the path but keep one endpoint unprojected, wrap the
-traversal in `temp!` so the hidden binding can participate in follow-up
-clauses:
-
-```rust,ignore
-let interesting_post = fucid();
-let influencers = find!((start: Inline<_>),
-    temp!((end),
-          and!(path!(&kb, start social::follows+ end),
-               pattern!(&kb, [{ ?end @ social::likes: interesting_post.to_inline() }]))))
-    .collect::<Vec<_>>();
-```
-
-Combining `path!` with other constraints like this enables expressive graph
-queries while staying in the same declarative framework as the rest of the
-chapter.
+In the meantime, write bounded traversals as explicit clauses — one pattern
+clause per hop, joined on `temp!` variables — and drive unbounded ones from
+application code, re-querying a frontier until it stops growing.
