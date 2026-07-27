@@ -103,7 +103,11 @@ fn pattern_changes_multi_entity_delta_only_new_results() {
 }
 
 #[test]
-fn pattern_changes_set_identity_is_scoped_to_each_delta_invocation() {
+fn pattern_changes_yields_one_row_per_witness() {
+    // Bag semantics (2026-07-27): the engine yields one row per complete
+    // binding; hidden-variable witnesses surface as multiplicity and
+    // deduplication belongs to the consumer. Two distinct books with the
+    // same title are two witnesses in the first delta, one in the second.
     let first = ufoid();
     let second = ufoid();
     let third = ufoid();
@@ -120,7 +124,10 @@ fn pattern_changes_set_identity_is_scoped_to_each_delta_invocation() {
         ])
     )
     .collect::<Vec<_>>();
-    assert_eq!(first_results, vec!["Shared".to_owned()]);
+    assert_eq!(
+        first_results,
+        vec!["Shared".to_owned(), "Shared".to_owned()]
+    );
 
     let mut second_delta = TribleSet::new();
     second_delta += entity! { &third @ literature::title: "Shared" };

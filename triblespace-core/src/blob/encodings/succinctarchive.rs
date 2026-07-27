@@ -2834,7 +2834,12 @@ where
         a: impl Into<crate::query::Term<GenId>>,
         v: impl Into<crate::query::Term<V>>,
     ) -> Self::PatternConstraint<'a> {
-        SuccinctArchiveConstraint::new(e, a, v, self)
+        SuccinctArchiveConstraint::new(
+            e.into().expect_variable(),
+            a.into().expect_variable(),
+            v.into().expect_variable(),
+            self,
+        )
     }
 }
 
@@ -3145,7 +3150,7 @@ mod tests {
     use crate::inline::IntoInline;
     use crate::inline::TryToInline;
     use crate::prelude::*;
-    use crate::query::{find, CandidateSink, Candidates, Constraint, RowsView, VariableContext};
+    use crate::query::{find, Constraint, VariableContext};
     use crate::trible::Trible;
 
     use super::*;
@@ -3227,177 +3232,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn external_ring_batch_preserves_confirm_results() {
-        fn make_trible(entity: u8, attribute: u8, value: u8) -> Trible {
-            let mut data = [0; 64];
-            data[..16].fill(entity);
-            data[16..32].fill(attribute);
-            data[32..].fill(value);
-            Trible { data }
-        }
-
-        fn id_value(byte: u8) -> RawInline {
-            let mut value = [0; 32];
-            value[16..].fill(byte);
-            value
-        }
-
-        fn inline_value(value: u8) -> RawInline {
-            [value; 32]
-        }
-
-        let tribles = [
-            make_trible(1, 11, 21),
-            make_trible(1, 12, 22),
-            make_trible(2, 11, 22),
-            make_trible(3, 12, 21),
-        ];
-        let set: TribleSet = tribles.iter().copied().collect();
-        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
-        let backend = RecordingRingBatch {
-            archive: &archive,
-            calls: Mutex::new(Vec::new()),
-        };
-
-        let mut context = VariableContext::new();
-        let e: Variable<GenId> = context.next_variable();
-        let a: Variable<GenId> = context.next_variable();
-        let v: Variable<UnknownInline> = context.next_variable();
-
-        let entities = [id_value(1), id_value(2), id_value(3)];
-        let attributes = [id_value(11), id_value(12)];
-        let values = [inline_value(21), inline_value(22)];
-
-        let run_arm = |query,
-                       vars: &[usize],
-                       rows: &[RawInline],
-                       candidate_values: &[RawInline],
-                       expected_col| {
-            backend.calls.lock().unwrap().clear();
-            let view = RowsView::new(vars, rows);
-            let candidates: Candidates = (0..view.len() as u32)
-                .flat_map(|row| {
-                    candidate_values
-                        .iter()
-                        .copied()
-                        .map(move |value| (row, value))
-                })
-                .collect();
-
-            let mut expected = candidates.clone();
-            SuccinctArchiveConstraint::new(e, a, v, &archive).confirm(
-                query,
-                &view,
-                &mut CandidateSink::Tagged(&mut expected),
-            );
-            let mut actual = candidates;
-            SuccinctArchiveConstraint::with_ring_batch(e, a, v, &archive, &backend).confirm(
-                query,
-                &view,
-                &mut CandidateSink::Tagged(&mut actual),
-            );
-
-            assert_eq!(actual, expected);
-            let calls = backend.calls.lock().unwrap();
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0].0, expected_col);
-            assert_eq!(calls[0].1.len(), calls[0].2.len());
-            assert!(!calls[0].1.is_empty());
-        };
-
-        // Every one-bound and two-bound confirmation arm must route to the
-        // same canonical Ring column as the CPU implementation.
-        run_arm(
-            a.index,
-            &[e.index],
-            &[entities[0], entities[1]],
-            &attributes,
-            SuccinctRotation::Eva,
-        );
-        run_arm(
-            v.index,
-            &[e.index],
-            &[entities[0], entities[1]],
-            &values,
-            SuccinctRotation::Eav,
-        );
-        run_arm(
-            e.index,
-            &[a.index],
-            &attributes,
-            &entities,
-            SuccinctRotation::Ave,
-        );
-        run_arm(
-            v.index,
-            &[a.index],
-            &attributes,
-            &values,
-            SuccinctRotation::Aev,
-        );
-        run_arm(
-            e.index,
-            &[v.index],
-            &values,
-            &entities,
-            SuccinctRotation::Vae,
-        );
-        run_arm(
-            a.index,
-            &[v.index],
-            &values,
-            &attributes,
-            SuccinctRotation::Vea,
-        );
-        run_arm(
-            e.index,
-            &[a.index, v.index],
-            &[attributes[0], values[0], attributes[1], values[0]],
-            &entities,
-            SuccinctRotation::Vae,
-        );
-        run_arm(
-            a.index,
-            &[e.index, v.index],
-            &[entities[0], values[0], entities[1], values[1]],
-            &attributes,
-            SuccinctRotation::Vea,
-        );
-        run_arm(
-            v.index,
-            &[e.index, a.index],
-            &[entities[0], attributes[0], entities[2], attributes[1]],
-            &values,
-            SuccinctRotation::Aev,
-        );
-
-        // A one-parent residual frontier is normalized to plain values, but
-        // storage shape must not bypass an attached batch backend. Its own
-        // probe-count policy decides whether this stream stays on CPU.
-        backend.calls.lock().unwrap().clear();
-        let vars = [e.index];
-        let rows = [entities[0]];
-        let row_view = RowsView::new(&vars, &rows);
-        let mut expected_values = values.to_vec();
-        let mut actual_values = expected_values.clone();
-        SuccinctArchiveConstraint::new(e, a, v, &archive).confirm(
-            v.index,
-            &row_view,
-            &mut CandidateSink::Values(&mut expected_values),
-        );
-        SuccinctArchiveConstraint::with_ring_batch(e, a, v, &archive, &backend).confirm(
-            v.index,
-            &row_view,
-            &mut CandidateSink::Values(&mut actual_values),
-        );
-        assert_eq!(actual_values, expected_values);
-        let calls = backend.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, SuccinctRotation::Eav);
-        assert_eq!(calls[0].1.len(), calls[0].2.len());
-        assert!(!calls[0].1.is_empty());
-    }
 
     pub mod knights {
         use crate::prelude::*;

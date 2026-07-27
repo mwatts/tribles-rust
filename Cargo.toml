@@ -25,8 +25,6 @@ members = [
     "triblespace-macros",
     "triblespace-macros-common",
     "triblespace-net",
-    "triblespace-search",
-    "triblespace-gpu",
     "trible",
 ]
 resolver = "2"
@@ -35,8 +33,6 @@ resolver = "2"
 triblespace-core = { version = "0.47.0", path = "./triblespace-core", default-features = false }
 triblespace-macros = { version = "0.47.0", path = "./triblespace-macros" }
 triblespace-net = { version = "0.47.0", path = "./triblespace-net", optional = true }
-triblespace-search = { version = "0.47.0", path = "./triblespace-search", optional = true }
-triblespace-gpu = { version = "0.47.0", path = "./triblespace-gpu", default-features = false, optional = true }
 ed25519-dalek = { version = "2.1.0", features = ["rand_core"], optional = true }
 log = { version = "0.4.26", optional = true }
 rand_core06 = { package = "rand_core", version = "0.6.4", optional = true }
@@ -76,9 +72,7 @@ telemetry = [
     "dep:thread_local",
 ]
 net = ["dep:triblespace-net"]
-search = ["dep:triblespace-search"]
 parallel = ["triblespace-core/parallel"]
-gpu = ["parallel", "dep:triblespace-gpu", "triblespace-gpu/wgpu"]
 
 [[bench]]
 name = "benchmark"
@@ -112,9 +106,6 @@ harness = false
 name = "number_format"
 harness = false
 
-[[bench]]
-name = "path_query"
-harness = false
 [profile.bench]
 debug = true
 opt-level = 3

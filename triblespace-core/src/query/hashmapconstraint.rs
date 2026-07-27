@@ -3,20 +3,19 @@ use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::inline::Inline;
-use crate::inline::InlineEncoding;
-use crate::inline::IntoInline;
-use crate::inline::RawInline;
-use crate::inline::TryFromInline;
-use crate::query::CandidateSink;
+use crate::query::Binding;
 use crate::query::Constraint;
 use crate::query::ContainsConstraint;
-use crate::query::EstimateSink;
-use crate::query::ProposalCoverage;
-use crate::query::RowsView;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
+use crate::inline::RawInline;
+use crate::inline::IntoInline;
+use crate::inline::TryFromInline;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
+use crate::query::Mask;
+use crate::query::ProposalBuffer;
 
 /// Constrains a variable to keys present in a [`HashMap`].
 ///
@@ -42,19 +41,6 @@ where
     }
 }
 
-impl<S: InlineEncoding, R, K, V> KeysConstraint<S, R, K, V>
-where
-    K: std::cmp::Eq + std::hash::Hash + for<'b> TryFromInline<'b, S>,
-    R: Deref<Target = HashMap<K, V>>,
-{
-    fn contains_raw(&self, value: &RawInline) -> bool {
-        match TryFromInline::try_from_inline(Inline::<S>::as_transmute_raw(value)) {
-            Ok(key) => self.map.contains_key(&key),
-            Err(_) => false,
-        }
-    }
-}
-
 impl<'a, S: InlineEncoding, R, K, V> Constraint<'a> for KeysConstraint<S, R, K, V>
 where
     K: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromInline<'b, S>,
@@ -66,59 +52,41 @@ where
         VariableSet::new_singleton(self.variable.index)
     }
 
-    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-        if variable == self.variable.index && !bound.is_set(variable) {
-            ProposalCoverage::Exact
-        } else {
-            ProposalCoverage::None
-        }
-    }
-
-    fn estimate(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        out: &mut EstimateSink<'_>,
-    ) -> bool {
-        if self.variable.index != variable {
-            return false;
-        }
-        // The estimated proposal count equals the current number of keys.
-        out.fill(self.map.len(), view.len());
-        true
-    }
-
-    fn propose(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
+    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
         if self.variable.index == variable {
-            for i in 0..view.len() as u32 {
-                candidates.extend_row(i, self.map.keys().map(|k| IntoInline::to_inline(k).raw));
-            }
+            // the estimated proposal count equals the current number of keys
+            Some(self.map.len())
+        } else {
+            None
+        }
+    }
+
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut ProposalBuffer) {
+        if self.variable.index == variable {
+            proposals.extend(self.map.keys().map(|k| IntoInline::to_inline(k).raw));
         }
     }
 
     fn confirm(
         &self,
         variable: VariableId,
-        _view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
+        _binding: &Binding,
+        proposals: &[RawInline],
+        mask: &mut Mask,
     ) {
         if self.variable.index == variable {
-            candidates.retain(|_, value| self.contains_raw(value));
-        }
-    }
-
-    /// Exact when the variable is bound: checks whether every row's bound
-    /// value is a key of the map. Returns `true` optimistically while the
-    /// variable is unbound.
-    fn satisfied(&self, view: &RowsView<'_>) -> bool {
-        match view.col(self.variable.index) {
-            Some(c) => view.iter().all(|row| self.contains_raw(&row[c])),
-            None => true,
+            for (i, v) in proposals.iter().enumerate() {
+                if !mask.live(i) {
+                    continue;
+                }
+                let keep = match TryFromInline::try_from_inline(Inline::<S>::as_transmute_raw(v)) {
+                    Ok(key) => self.map.contains_key(&key),
+                    Err(_) => false,
+                };
+                if !keep {
+                    mask.kill(i);
+                }
+            }
         }
     }
 }

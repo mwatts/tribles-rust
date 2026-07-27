@@ -5,18 +5,11 @@
 
 use triblespace::core::blob::encodings::succinctarchive::OrderedUniverse;
 use triblespace::core::blob::encodings::succinctarchive::SuccinctArchive;
-use triblespace::core::inline::RawInline;
-use triblespace::core::query::Binding;
 use triblespace::core::query::Constraint;
-use triblespace::core::query::ProgramAction;
-use triblespace::core::query::ProgramRequest;
-use triblespace::core::query::Query;
-use triblespace::core::query::TypedProgramSpec;
 use triblespace::core::query::VariableContext;
-use triblespace::core::query::VariableSet;
-use triblespace::prelude::inlineencodings::GenId;
 use triblespace::prelude::inlineencodings::R256BE;
 use triblespace::prelude::*;
+use triblespace::core::query::ProposalBuffer;
 
 attributes! {
     "BB00000000000000BB00000000000000" as range_test_score: R256BE;
@@ -107,46 +100,6 @@ fn value_in_range_proposes_correctly() {
 }
 
 #[test]
-fn attached_value_range_rejects_in_range_values_absent_from_the_v_axis() {
-    let candidate_entity = ufoid();
-    let value_entity_1 = ufoid();
-    let value_entity_2 = ufoid();
-    let candidate_id: Inline<GenId> = (&candidate_entity).to_inline();
-    let value_id_1: Inline<GenId> = (&value_entity_1).to_inline();
-    let value_id_2: Inline<GenId> = (&value_entity_2).to_inline();
-    let candidate = Inline::<R256BE>::new(candidate_id.raw);
-    let value_1 = Inline::<R256BE>::new(value_id_1.raw);
-    let value_2 = Inline::<R256BE>::new(value_id_2.raw);
-
-    let mut set = TribleSet::new();
-    set += entity! { &candidate_entity @ range_test_score: value_1 };
-    set += entity! { &value_entity_1 @ range_test_score: value_2 };
-    let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
-
-    let min = Inline::<R256BE>::new([0; 32]);
-    let mut max_raw = [0; 32];
-    max_raw[16..].fill(u8::MAX);
-    let max = Inline::<R256BE>::new(max_raw);
-    let variable = Variable::<R256BE>::new(0);
-
-    // The candidate is in the archive universe through E but absent from V.
-    // Constant has the smaller estimate, so the range must reject it while
-    // acting as a confirmer rather than merely by owning its proposal source.
-    let residual: Vec<_> = Query::new(
-        and!(
-            variable.is(candidate),
-            archive.value_in_range(variable, min, max),
-        ),
-        move |binding| project(variable.index, binding),
-    )
-    .solve_residual_state_lazy()
-    .cap(1)
-    .start_width(1)
-    .collect();
-    assert!(residual.is_empty());
-}
-
-#[test]
 fn estimate_is_universe_code_range_upper_bound() {
     // The cardinality estimate is the *upper bound*: the count of
     // universe codes whose byte-lex value falls in [min, max], not
@@ -178,86 +131,20 @@ fn estimate_is_universe_code_range_upper_bound() {
     let max: Inline<R256BE> = 100i128.to_inline();
     let constraint = archive.value_in_range(v, min, max);
 
-    use triblespace::core::query::{CandidateSink, Candidates, EstimateSink, RowsView};
-    let mut est = Vec::new();
-    assert!(
-        constraint.estimate(
-            v.index,
-            &RowsView::EMPTY,
-            &mut EstimateSink::Column(&mut est)
-        ),
-        "estimate is relevant for the V variable"
-    );
-    let estimate = est[0];
+    let estimate = constraint
+        .estimate(v.index, &Default::default())
+        .expect("estimate is Some for the V variable");
     assert!(
         estimate >= 3,
         "estimate must upper-bound actual V-codes-in-range; got {estimate}, need >= 3"
     );
     // Verify propose enumerates exactly the 3 distinct V values.
-    let mut proposals: Candidates = Vec::new();
-    constraint.propose(
-        v.index,
-        &RowsView::EMPTY,
-        &mut CandidateSink::Tagged(&mut proposals),
-    );
+    use triblespace::core::query::Binding;
+    let mut proposals = ProposalBuffer::new();
+    constraint.propose(v.index, &Binding::default(), &mut proposals);
     assert_eq!(
         proposals.len(),
         3,
         "propose must yield exactly the V-position codes in range"
     );
-}
-
-fn project(variable: usize, binding: &Binding) -> Option<RawInline> {
-    binding.get(variable).copied()
-}
-
-#[test]
-fn value_range_executes_as_a_production_ordered_source_and_confirmer() {
-    let v10: Inline<R256BE> = 10i128.to_inline();
-    let v50: Inline<R256BE> = 50i128.to_inline();
-    let v90: Inline<R256BE> = 90i128.to_inline();
-    let v100: Inline<R256BE> = 100i128.to_inline();
-    let mut set = TribleSet::new();
-    set += entity! { &ufoid() @ range_test_score: v10 };
-    set += entity! { &ufoid() @ range_test_score: v50 };
-    set += entity! { &ufoid() @ range_test_score: v90 };
-    set += entity! { &ufoid() @ range_test_score: v100 };
-    let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
-    let variable = Variable::<R256BE>::new(0);
-
-    let source_constraint = archive.value_in_range(variable, v10, v90);
-    assert!(source_constraint
-        .route(ProgramRequest {
-            action: ProgramAction::Propose(variable.index),
-            bound: VariableSet::new_empty(),
-        })
-        .is_some());
-    let mut source: Vec<_> = Query::new(source_constraint, move |binding| {
-        project(variable.index, binding)
-    })
-    .solve_residual_state_lazy()
-    .cap(1)
-    .start_width(1)
-    .growth(1)
-    .collect();
-    source.sort_unstable();
-    assert_eq!(source, [v10.raw, v50.raw, v90.raw]);
-
-    let confirmer = archive.value_in_range(variable, v10, v90);
-    assert!(confirmer
-        .route(ProgramRequest {
-            action: ProgramAction::Confirm(variable.index),
-            bound: VariableSet::new_empty(),
-        })
-        .is_some());
-    let mut confirmed: Vec<_> = Query::new(and!(variable.is(v50), confirmer), move |binding| {
-        project(variable.index, binding)
-    })
-    .solve_residual_state_lazy()
-    .cap(1)
-    .start_width(1)
-    .growth(1)
-    .collect();
-    confirmed.sort_unstable();
-    assert_eq!(confirmed, [v50.raw]);
 }

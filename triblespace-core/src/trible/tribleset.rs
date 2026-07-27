@@ -454,7 +454,12 @@ impl TriblePattern for TribleSet {
         a: impl Into<crate::query::Term<GenId>>,
         v: impl Into<crate::query::Term<V>>,
     ) -> Self::PatternConstraint<'static> {
-        TribleSetConstraint::new(e, a, v, self.clone())
+        TribleSetConstraint::new(
+            e.into().expect_variable(),
+            a.into().expect_variable(),
+            v.into().expect_variable(),
+            self.clone(),
+        )
     }
 }
 

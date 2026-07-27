@@ -4,4 +4,4 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 284e27ac1afd2c1e8f6dd18d4ed22097e6d412e1a9e48882fd9089c4ec516518 # shrinks to masks = [(4, 0, 1, 1), (3, 0, 9, 0), (0, 0, 0, 0)]
+cc bb4086d90c9f789439ec20c6c1ecd662eb31e0038841a8b087f04cd594cb2eb4 # shrinks to assignments = []

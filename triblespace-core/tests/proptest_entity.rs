@@ -85,12 +85,13 @@ proptest! {
             pattern!(&set, [{ test_ns::name: ?n }])
         ).collect();
 
-        // The query projects only the name, so distinct entities carrying an
-        // equal raw name collapse to one public SET row.
+        // Bag semantics: one row per complete binding, so each entity is a
+        // witness even when names collide; deduplication belongs to the
+        // consumer.
         let expected: std::collections::BTreeSet<_> = names.iter().collect();
         let actual: std::collections::BTreeSet<_> = results.iter().collect();
         prop_assert_eq!(&actual, &expected);
-        prop_assert_eq!(results.len(), actual.len());
+        prop_assert_eq!(results.len(), names.len());
     }
 
     // ── Multi-entity join ──────────────────────────────────────────────

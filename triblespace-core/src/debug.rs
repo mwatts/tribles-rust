@@ -1,15 +1,14 @@
 /// Diagnostic wrappers for the query engine used in tests.
 pub mod query {
-    use crate::query::CandidateSink;
+    use crate::query::Binding;
     use crate::query::Constraint;
-    use crate::query::EstimateSink;
-    use crate::query::ProgramRef;
-    use crate::query::ProposalCoverage;
-    use crate::query::RowsView;
     use crate::query::VariableId;
     use crate::query::VariableSet;
+    use crate::inline::RawInline;
     use std::cell::RefCell;
     use std::rc::Rc;
+    use crate::query::Mask;
+use crate::query::ProposalBuffer;
 
     /// Constraint wrapper that records which variables are proposed during query execution.
     pub struct DebugConstraint<C> {
@@ -31,49 +30,31 @@ pub mod query {
             self.constraint.variables()
         }
 
-        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-            self.constraint.proposal_coverage(variable, bound)
+        fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+            self.constraint.estimate(variable, binding)
         }
 
-        fn estimate(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            out: &mut EstimateSink<'_>,
-        ) -> bool {
-            self.constraint.estimate(variable, view, out)
-        }
-
-        fn propose(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) {
+        fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
             self.record.borrow_mut().push(variable);
-            self.constraint.propose(variable, view, candidates);
+            self.constraint.propose(variable, binding, proposals);
         }
 
         fn confirm(
             &self,
             variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
+            binding: &Binding,
+            proposals: &[RawInline],
+            mask: &mut Mask,
         ) {
-            self.constraint.confirm(variable, view, candidates);
+            self.constraint.confirm(variable, binding, proposals, mask);
         }
 
-        fn satisfied(&self, view: &RowsView<'_>) -> bool {
-            self.constraint.satisfied(view)
+        fn influence(&self, variable: VariableId) -> VariableSet {
+            self.constraint.influence(variable)
         }
     }
 
     /// Constraint wrapper that overrides cardinality estimates for selected variables.
-    ///
-    /// The wrapper stays structurally opaque so residual formula descent cannot
-    /// bypass its planner input. Optional execution capabilities remain
-    /// transparent because proposal, confirmation, and truth semantics are
-    /// delegated unchanged.
     pub struct EstimateOverrideConstraint<C> {
         /// The underlying constraint whose estimates may be overridden.
         pub constraint: C,
@@ -109,59 +90,26 @@ pub mod query {
             self.constraint.variables()
         }
 
-        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-            self.constraint.proposal_coverage(variable, bound)
+        fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+            self.estimates[variable].or_else(|| self.constraint.estimate(variable, binding))
         }
 
-        fn estimate(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            out: &mut EstimateSink<'_>,
-        ) -> bool {
-            if let Some(estimate) = self.estimates[variable] {
-                out.fill(estimate, view.len());
-                true
-            } else {
-                self.constraint.estimate(variable, view, out)
-            }
-        }
-
-        fn propose(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) {
-            self.constraint.propose(variable, view, candidates);
+        fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
+            self.constraint.propose(variable, binding, proposals);
         }
 
         fn confirm(
             &self,
             variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
+            binding: &Binding,
+            proposals: &[RawInline],
+            mask: &mut Mask,
         ) {
-            self.constraint.confirm(variable, view, candidates);
+            self.constraint.confirm(variable, binding, proposals, mask);
         }
 
-        fn satisfied(&self, view: &RowsView<'_>) -> bool {
-            self.constraint.satisfied(view)
-        }
-
-        // EstimateOverrideConstraint changes only the planner's cardinality
-        // input. Keep the wrapper structurally opaque so opening a composite
-        fn residual_program(&self) -> Option<ProgramRef<'_>> {
-            self.constraint.residual_program()
-        }
-
-        fn residual_program_proposal_coverage(
-            &self,
-            variable: VariableId,
-            bound: VariableSet,
-        ) -> ProposalCoverage {
-            self.constraint
-                .residual_program_proposal_coverage(variable, bound)
+        fn influence(&self, variable: VariableId) -> VariableSet {
+            self.constraint.influence(variable)
         }
     }
 }

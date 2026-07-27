@@ -32,19 +32,6 @@ where
     }
 }
 
-impl<S: InlineEncoding, R, T> SetConstraint<S, R, T>
-where
-    T: std::cmp::Eq + std::hash::Hash + for<'b> TryFromInline<'b, S>,
-    R: Deref<Target = HashSet<T>>,
-{
-    fn contains_raw(&self, value: &RawInline) -> bool {
-        match TryFromInline::try_from_inline(Inline::<S>::as_transmute_raw(value)) {
-            Ok(value) => self.set.contains(&value),
-            Err(_) => false,
-        }
-    }
-}
-
 impl<'a, S: InlineEncoding, R, T> Constraint<'a> for SetConstraint<S, R, T>
 where
     T: 'a + std::cmp::Eq + std::hash::Hash + for<'b> TryFromInline<'b, S>,
@@ -55,72 +42,41 @@ where
         VariableSet::new_singleton(self.variable.index)
     }
 
-    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-        if variable == self.variable.index && !bound.is_set(variable) {
-            ProposalCoverage::Exact
-        } else {
-            ProposalCoverage::None
-        }
-    }
-
-    fn action_unit_classes(
-        &self,
-        variable: VariableId,
-        bound: VariableSet,
-    ) -> Option<ActionUnitClasses> {
-        (variable == self.variable.index && !bound.is_set(variable)).then_some(
-            ActionUnitClasses::new(
-                ProposalUnitClass::HASH_TABLE_ENUMERATION,
-                ConfirmationUnitClass::HASH_TABLE_MEMBERSHIP,
-            ),
-        )
-    }
-
-    fn estimate(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        out: &mut EstimateSink<'_>,
-    ) -> bool {
-        if self.variable.index != variable {
-            return false;
-        }
-        // The current set length estimates the proposal count, per row.
-        out.fill(self.set.len(), view.len());
-        true
-    }
-
-    fn propose(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
+    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
         if self.variable.index == variable {
-            for i in 0..view.len() as u32 {
-                candidates.extend_row(i, self.set.iter().map(|v| IntoInline::to_inline(v).raw));
-            }
+            // use the current set length as the estimate for proposal count
+            Some(self.set.len())
+        } else {
+            None
+        }
+    }
+
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut ProposalBuffer) {
+        if self.variable.index == variable {
+            proposals.extend(self.set.iter().map(|v| IntoInline::to_inline(v).raw));
         }
     }
 
     fn confirm(
         &self,
         variable: VariableId,
-        _view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
+        _binding: &Binding,
+        proposals: &[RawInline],
+        mask: &mut Mask,
     ) {
         if self.variable.index == variable {
-            candidates.retain(|_, value| self.contains_raw(value));
-        }
-    }
-
-    /// Exact when the variable is bound: checks whether every row's bound
-    /// value is a member of the set. Returns `true` optimistically while
-    /// the variable is unbound.
-    fn satisfied(&self, view: &RowsView<'_>) -> bool {
-        match view.col(self.variable.index) {
-            Some(c) => view.iter().all(|row| self.contains_raw(&row[c])),
-            None => true,
+            for (i, v) in proposals.iter().enumerate() {
+                if !mask.live(i) {
+                    continue;
+                }
+                let keep = match TryFromInline::try_from_inline(Inline::<S>::as_transmute_raw(v)) {
+                    Ok(t) => self.set.contains(&t),
+                    Err(_) => false,
+                };
+                if !keep {
+                    mask.kill(i);
+                }
+            }
         }
     }
 }
@@ -158,50 +114,5 @@ where
 
     fn has(self, v: Variable<S>) -> Self::Constraint {
         SetConstraint::new(v, self)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::inline::encodings::UnknownInline;
-    use crate::inline::Inline;
-
-    #[test]
-    fn hash_set_action_classes_cover_exact_proposal_occurrences() {
-        let values: HashSet<_> = [
-            Inline::<UnknownInline>::new([0x11; 32]),
-            Inline::<UnknownInline>::new([0x22; 32]),
-        ]
-        .into_iter()
-        .collect();
-        let variable = Variable::<UnknownInline>::new(0);
-        let constraint = SetConstraint::new(variable, &values);
-        let classes = constraint
-            .action_unit_classes(variable.index, VariableSet::new_empty())
-            .expect("an unbound HashSet target has exact occurrence counts");
-
-        assert_eq!(classes.proposal, ProposalUnitClass::HASH_TABLE_ENUMERATION);
-        assert_eq!(
-            classes.confirmation,
-            ConfirmationUnitClass::HASH_TABLE_MEMBERSHIP
-        );
-        let mut estimate = usize::MAX;
-        assert!(constraint.estimate(
-            variable.index,
-            &RowsView::EMPTY,
-            &mut EstimateSink::Scalar(&mut estimate),
-        ));
-        let mut proposed = Vec::new();
-        constraint.propose(
-            variable.index,
-            &RowsView::EMPTY,
-            &mut CandidateSink::Values(&mut proposed),
-        );
-        assert_eq!(estimate, proposed.len());
-        let bound = VariableSet::new_singleton(variable.index);
-        assert!(constraint
-            .action_unit_classes(variable.index, bound)
-            .is_none());
     }
 }

@@ -192,7 +192,7 @@ pub fn find_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
 
     match mode {
         FindMode::Unit => Ok(quote! {
-            #crate_path::query::Query::new_projected(#constraint, [],
+            #crate_path::query::Query::new(#constraint,
                 move |_binding| {
                     ::core::option::Option::Some(())
                 })
@@ -205,7 +205,7 @@ pub fn find_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
             Ok(quote! {
                 {
                     #decl
-                    #crate_path::query::Query::new_projected(#constraint, [#name.index],
+                    #crate_path::query::Query::new(#constraint,
                         move |#binding| {
                             #conversion
                             ::core::option::Option::Some(#name)
@@ -226,10 +226,6 @@ pub fn find_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
                 .map(|v| gen_var_conversion(&crate_path, &binding, v))
                 .collect();
             let var_names: Vec<&Ident> = variables.iter().map(|v| &v.name).collect();
-            let head: Vec<TokenStream2> = var_names
-                .iter()
-                .map(|name| quote! { #name.index })
-                .collect();
             let tuple_expr = match var_names.len() {
                 1 => {
                     let v = var_names[0];
@@ -242,7 +238,7 @@ pub fn find_impl(input: TokenStream2) -> syn::Result<TokenStream2> {
             Ok(quote! {
                 {
                     #(#var_decls)*
-                    #crate_path::query::Query::new_projected(#constraint, [#(#head),*],
+                    #crate_path::query::Query::new(#constraint,
                         move |#binding| {
                             #(#var_conversions)*
                             ::core::option::Option::Some(#tuple_expr)
