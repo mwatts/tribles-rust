@@ -55,7 +55,8 @@ struct Cfg {
     build_warmup: usize,
     /// Timed iterations of each archive-arm query, per arm. Small by
     /// default: one iteration of a wide join over a real archive costs
-    /// orders of magnitude more than a synthetic fixture.
+    /// orders of magnitude more than a synthetic fixture, and the arm
+    /// runs the same set twice (CPU and GPU).
     arch_iters: usize,
     arch_warmup: usize,
     verify: Option<std::path::PathBuf>,
@@ -227,6 +228,25 @@ impl Measure {
         }
     }
 
+    /// Gate this measure's identity count against the SAME query's
+    /// count on the sibling arm. A cross-arm disagreement is a hard
+    /// failure: the two backends must answer identically or the
+    /// comparison means nothing.
+    ///
+    /// Only the device arm has a sibling to compare against, so this
+    /// is compiled with it.
+    #[cfg(feature = "gpu")]
+    fn cross_arm(&mut self, expected: usize) {
+        if self.panicked.is_some() || self.gate.is_some() {
+            return;
+        }
+        if let Some(n) = self.ident {
+            if n != expected {
+                self.gate = Some(format!("cross-arm {n} vs {expected}"));
+            }
+        }
+    }
+
     /// Write spans + the outcome entity; print one console line.
     fn emit(self, led: &mut ledger::ResultsLedger, rows_meaningful: bool) {
         for (begin_ns, duration_ns) in &self.spans {
@@ -312,7 +332,7 @@ fn run_r2(
 /// skipped (the portable_bench `--max-ram` default).
 const MAX_RAM: usize = 20_000_000;
 
-/// The per-query suffixes of the confirm-region census.
+/// The per-query suffixes of the phase-1 confirm-region census.
 const ARCH_REGION_SUFFIXES: [&str; 6] = [
     "confirms",
     "max",
@@ -322,34 +342,61 @@ const ARCH_REGION_SUFFIXES: [&str; 6] = [
     "live_total",
 ];
 
+/// The per-query suffixes of the phase-2 GPU routing counters
+/// (`WgpuConfirmStats`), so a "no difference" timing can be told apart
+/// from "the device never ran".
+const ARCH_ROUTING_SUFFIXES: [&str; 5] = [
+    "gpu_confirms",
+    "gpu_candidates",
+    "cpu_fallback_confirms",
+    "cpu_fallback_candidates",
+    "gpu_errors",
+];
+
 /// Record `reason` against every measure the archive query arm would
 /// have produced. Keeps the census in the pile complete for runs that
 /// never reach the arm (no dataset, or a set too large to archive in
 /// RAM) — an absent measure and a skipped measure are different facts.
 fn skip_arch_queries(led: &mut ledger::ResultsLedger, reason: &str) {
+    // Without the gpu capability the device arm is not compiled at
+    // all, which is a different reason from the caller's.
+    let gpu_reason = if cfg!(feature = "gpu") { reason } else { "skip:gpu" };
     for q in archq::arch_queries::<TribleSet>() {
         for suffix in ARCH_REGION_SUFFIXES {
             led.outcome(&format!("arch_regions/{}/{suffix}", q.name), reason, None);
         }
         led.outcome(&format!("arch/{}/total", q.name), reason, None);
+        led.outcome(&format!("arch_gpu/{}/total", q.name), gpu_reason, None);
+        for suffix in ARCH_ROUTING_SUFFIXES {
+            led.outcome(
+                &format!("arch_gpu/{}/routing/{suffix}", q.name),
+                gpu_reason,
+                None,
+            );
+        }
     }
 }
 
-/// Run the archive query arm over `set`: the untimed confirm-region
-/// census, then the timed CPU arm — two passes over ONE archive build.
+/// Run the archive query arm over `set`. Returns `true` when a
+/// cross-arm identity check FAILED — the caller turns that into a
+/// non-zero exit, because two backends that disagree make every
+/// timing next to them meaningless.
 ///
-/// The census is the load-bearing half. Region size is a COUNTING
-/// property, so it survives a contended machine intact, and it is the
-/// exact quantity `triblespace-gpu` routes on: if real queries never
-/// produce regions near `DEFAULT_MIN_CONFIRM_BATCH`, no timing run can
-/// rescue the device path, and that is the answer rather than a
-/// preliminary to one.
+/// Three passes over ONE archive build:
+/// 1. the untimed confirm-region census ([`archq::CountingArchive`]),
+/// 2. the timed CPU arm (`arch/<query>/total`),
+/// 3. the timed device arm (`arch_gpu/<query>/total`) plus its routing
+///    counters, under the `gpu` capability.
 fn run_arch_queries(
     led: &mut ledger::ResultsLedger,
     cfg: &Cfg,
     base: &Instant,
     set: &TribleSet,
-) {
+) -> bool {
+    // Only the device arm can flip this; without the gpu capability
+    // there is no second arm to disagree with.
+    #[cfg_attr(not(feature = "gpu"), allow(unused_mut))]
+    let mut cross_arm_failure = false;
     let built = Instant::now();
     let archive = fixtures::build_archive(set);
     println!(
@@ -359,7 +406,7 @@ fn run_arch_queries(
         archq::CONFIRM_THRESHOLD
     );
 
-    // -- the confirm-region census (counting, not timing) ---------------
+    // -- phase 1: the confirm-region census (counting, not timing) ------
     #[cfg(feature = "protocol-v2")]
     let archive = {
         let ds = archq::shell(archq::CountingArchive::new(archive));
@@ -425,16 +472,138 @@ fn run_arch_queries(
         println!("  {:<34} SKIP (protocol: no Candidates region)", "regions/live-count");
     }
 
-    // -- the timed CPU arm ----------------------------------------------
-    let ds = archq::shell(archive);
-    for q in archq::arch_queries() {
-        let mut m = Measure::new(format!("arch/{}/total", q.name));
-        for i in 0..(cfg.arch_warmup + cfg.arch_iters) {
-            let recording = i >= cfg.arch_warmup;
-            m.iterate(recording, base, || archq::answer_count(&(q.run)(&ds)));
+    // -- phase 2a: the timed CPU arm ------------------------------------
+    let mut cpu_counts: Vec<Option<usize>> = Vec::new();
+    let archive = {
+        let ds = archq::shell(archive);
+        for q in archq::arch_queries() {
+            let mut m = Measure::new(format!("arch/{}/total", q.name));
+            for i in 0..(cfg.arch_warmup + cfg.arch_iters) {
+                let recording = i >= cfg.arch_warmup;
+                m.iterate(recording, base, || archq::answer_count(&(q.run)(&ds)));
+            }
+            cpu_counts.push(if m.panicked.is_some() { None } else { m.ident });
+            m.emit(led, true);
         }
-        m.emit(led, true);
+        ds.facts
+    };
+
+    // -- phase 2b: the timed device arm ---------------------------------
+    #[cfg(not(feature = "gpu"))]
+    {
+        drop(archive);
+        for q in archq::arch_queries::<TribleSet>() {
+            led.outcome(&format!("arch_gpu/{}/total", q.name), "skip:gpu", None);
+            for suffix in ARCH_ROUTING_SUFFIXES {
+                led.outcome(
+                    &format!("arch_gpu/{}/routing/{suffix}", q.name),
+                    "skip:gpu",
+                    None,
+                );
+            }
+            println!("  {:<32} SKIP (gpu: no triblespace-gpu on the subject)", format!("arch_gpu/{}/total", q.name));
+        }
     }
+    #[cfg(feature = "gpu")]
+    {
+        let attach_begin = base.elapsed().as_nanos() as u64;
+        let attach = Instant::now();
+        let attached = fixtures::quiet_catch(|| subject::gpu::WgpuSuccinctArchive::new(archive));
+        let attach_ns = attach.elapsed().as_nanos() as u64;
+        let gpu = match attached {
+            Ok(Ok(gpu)) => {
+                led.span("arch_gpu/attach/total", attach_begin, attach_ns);
+                led.outcome("arch_gpu/attach/total", "signal", None);
+                println!(
+                    "  {:<32} signal (1 span, {:.0} ms, min_confirm_batch {})",
+                    "arch_gpu/attach/total",
+                    attach_ns as f64 / 1e6,
+                    gpu.min_confirm_batch()
+                );
+                Some(gpu)
+            }
+            Ok(Err(e)) => {
+                let reason = format!("gate_fail:attach {e:?}");
+                led.outcome("arch_gpu/attach/total", &reason, None);
+                println!("  {:<32} {reason}", "arch_gpu/attach/total");
+                None
+            }
+            Err(msg) => {
+                let reason = format!("panic:{msg}");
+                led.outcome("arch_gpu/attach/total", &reason, None);
+                println!("  {:<32} {reason}", "arch_gpu/attach/total");
+                None
+            }
+        };
+        match gpu {
+            None => {
+                for q in archq::arch_queries::<TribleSet>() {
+                    led.outcome(&format!("arch_gpu/{}/total", q.name), "skip:attach", None);
+                    for suffix in ARCH_ROUTING_SUFFIXES {
+                        led.outcome(
+                            &format!("arch_gpu/{}/routing/{suffix}", q.name),
+                            "skip:attach",
+                            None,
+                        );
+                    }
+                }
+            }
+            Some(gpu) => {
+                let ds = archq::shell(gpu);
+                for (q, cpu) in archq::arch_queries().into_iter().zip(cpu_counts.iter()) {
+                    let mut m = Measure::new(format!("arch_gpu/{}/total", q.name));
+                    for i in 0..(cfg.arch_warmup + cfg.arch_iters) {
+                        let recording = i >= cfg.arch_warmup;
+                        m.iterate(recording, base, || {
+                            // Per-EXECUTION routing counters: the
+                            // snapshot below then describes the last
+                            // iteration, directly comparable with the
+                            // per-execution region census.
+                            ds.facts.reset_stats();
+                            archq::answer_count(&(q.run)(&ds))
+                        });
+                    }
+                    if let (Some(expected), Some(got)) = (cpu, m.ident) {
+                        if *expected != got {
+                            cross_arm_failure = true;
+                            eprintln!(
+                                "CROSS-ARM IDENTITY FAILURE: {} — cpu {expected} rows, gpu {got} rows",
+                                q.name
+                            );
+                        }
+                    }
+                    if let Some(expected) = cpu {
+                        m.cross_arm(*expected);
+                    }
+                    let s = ds.facts.stats();
+                    for (suffix, value) in [
+                        ("gpu_confirms", s.gpu_confirms),
+                        ("gpu_candidates", s.gpu_candidates),
+                        ("cpu_fallback_confirms", s.cpu_fallback_confirms),
+                        ("cpu_fallback_candidates", s.cpu_fallback_candidates),
+                        ("gpu_errors", s.gpu_errors),
+                    ] {
+                        led.outcome(
+                            &format!("arch_gpu/{}/routing/{suffix}", q.name),
+                            "signal",
+                            Some(value),
+                        );
+                    }
+                    m.emit(led, true);
+                    println!(
+                        "      routing: {} gpu confirms ({} entries), {} cpu fallbacks ({} entries), {} errors",
+                        s.gpu_confirms,
+                        s.gpu_candidates,
+                        s.cpu_fallback_confirms,
+                        s.cpu_fallback_candidates,
+                        s.gpu_errors
+                    );
+                }
+            }
+        }
+    }
+
+    cross_arm_failure
 }
 
 fn main() {
@@ -532,6 +701,7 @@ fn main() {
             }
         }
     };
+    let mut cross_arm_failure = false;
     if let Some(set) = &dataset {
         if set.len() > MAX_RAM {
             led.outcome("arch/build_ram/total", "skip:max-ram", None);
@@ -552,7 +722,7 @@ fn main() {
                 });
             }
             m.emit(&mut led, true);
-            run_arch_queries(&mut led, &cfg, &base, set);
+            cross_arm_failure = run_arch_queries(&mut led, &cfg, &base, set);
         }
     }
 
@@ -857,4 +1027,12 @@ fn main() {
         suite_start.elapsed().as_secs_f64(),
         results.display()
     );
+    // The results are written first: a cross-arm disagreement must be
+    // INSPECTABLE, not just fatal. Then the run fails loudly — two
+    // backends that answer differently invalidate every timing beside
+    // them, so this is an error exit, not a footnote in the log.
+    if cross_arm_failure {
+        eprintln!("FAIL     : cross-arm identity failed (see gate_fail outcomes above)");
+        std::process::exit(1);
+    }
 }
