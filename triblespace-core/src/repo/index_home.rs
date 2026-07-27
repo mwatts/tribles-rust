@@ -27,12 +27,12 @@ use crate::id::{ExclusiveId, Id};
 use crate::inline::encodings::genid::GenId;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::encodings::iu256::U256BE;
-use crate::inline::{Inline, InlineEncoding, RawInline};
+use crate::inline::{Inline, InlineEncoding};
 use crate::metadata;
 use crate::prelude::{attributes, entity, pattern};
 use crate::query::unionconstraint::UnionConstraint;
 use crate::query::{
-    Binding, Candidates, Constraint, ProposalBuffer, ProposeCursor, RawTerm, Term, TriblePattern,
+    Binding, Candidates, Constraint, ProposalBuffer, ProposeCursor, Term, TriblePattern,
     VariableId, VariableSet,
 };
 use crate::repo::index_range::{
@@ -1358,50 +1358,29 @@ fn take_union_complete_walk_counts() -> UnionCompleteWalkCounts {
 
 /// Atomic normalized union over one finite set of Succinct archive shards.
 ///
-/// Estimates, proposals, and satisfaction retain [`UnionConstraint`]'s
-/// per-row set-union semantics. Confirmation instead treats shard union as a
-/// physical representation detail: it filters the original candidate bag by
-/// OR-membership, preserving every surviving occurrence's tag, order, and
-/// multiplicity. Typed Propose drains each shard's ordered cursor in attachment
-/// order and emits raw occurrences: the residual engine's
-/// activation-local SET boundary removes cross-shard duplicates before stable
-/// publication. Keeping the shard index in typed continuation state avoids
-/// reprobing every shard for every emitted value without weakening the logical
-/// union. The constraint deliberately stays structurally opaque so formula
-/// lowering cannot split the normalized source back into independently
-/// materialized union arms.
+/// A thin wrapper over [`UnionConstraint`]: every shard constraint carries
+/// the pattern's [`Term`]s natively (constant positions included), so all
+/// shards declare the same variable set by construction and the union's
+/// equal-variable-set requirement holds trivially. The wrapper exists so
+/// the shard union stays structurally opaque — one logical source, not a
+/// user-visible `or!` that formula rewrites could split back into
+/// independently materialized arms.
 pub struct UnionArchiveConstraint<'a, U>
 where
     U: Universe,
 {
     union: UnionConstraint<SuccinctArchiveConstraint<'a, U>>,
-    shards: Vec<SuccinctArchiveConstraint<'a, U>>,
-    terms: [RawTerm; 3],
 }
 
 impl<'a, U> UnionArchiveConstraint<'a, U>
 where
     U: Universe,
 {
-
-    fn new(
-        constraints: Vec<SuccinctArchiveConstraint<'a, U>>,
-        term_e: RawTerm,
-        term_a: RawTerm,
-        term_v: RawTerm,
-    ) -> Self {
-        let shards = constraints.clone();
+    fn new(constraints: Vec<SuccinctArchiveConstraint<'a, U>>) -> Self {
         Self {
             union: UnionConstraint::new(constraints),
-            shards,
-            terms: [term_e, term_a, term_v],
         }
     }
-
-
-
-
-
 }
 
 
@@ -1469,9 +1448,6 @@ where
                 .iter()
                 .map(|segment| segment.pattern(e, a, v))
                 .collect(),
-            e.erase(),
-            a.erase(),
-            v.erase(),
         )
     }
 }
