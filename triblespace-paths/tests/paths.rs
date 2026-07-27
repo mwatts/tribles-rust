@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::query::{
-    Binding, Constraint, ProposalBuffer, ProposeCursor, Query, Variable,
+    Binding, BindingStore, Constraint, ProposalBuffer, ProposeCursor, Query, Variable,
 };
 use triblespace_paths::{
     Automaton, GraphEdge, PathConstraint, PathIndex, PathSummary, Step, Transition,
@@ -204,6 +204,53 @@ fn nullable_closure_uses_matched_support_plus_full_identity() {
 }
 
 #[test]
+fn nullable_unmatched_leaf_merges_into_identity_without_affecting_paths() {
+    let automaton = Automaton::new(
+        2,
+        [0],
+        [0, 1],
+        [
+            Transition::new(0, 1, Step::Forward(attribute(7))),
+            Transition::new(1, 1, Step::Forward(attribute(7))),
+        ],
+    )
+    .unwrap();
+    let matched = PathSummary::from_edges(automaton.clone(), [edge(1, 7, 2)]);
+    let unmatched = PathSummary::from_edges(automaton.clone(), [edge(8, 1, 9)]);
+    let merged = matched.merge(&unmatched).unwrap();
+    let monolithic = PathSummary::from_edges(automaton.clone(), [edge(8, 1, 9), edge(1, 7, 2)]);
+
+    assert_eq!(merged, monolithic);
+    assert_eq!(
+        accepted(&PathIndex::from_summary(merged).unwrap()),
+        bfs_oracle(&automaton, &[edge(8, 1, 9), edge(1, 7, 2)])
+    );
+}
+
+#[test]
+fn nullable_active_row_keeps_identity_sorted_between_targets() {
+    let automaton = Automaton::new(
+        1,
+        [0],
+        [0],
+        [Transition::new(0, 0, Step::Forward(attribute(7)))],
+    )
+    .unwrap();
+    let edges = [edge(2, 7, 1), edge(2, 7, 3), edge(8, 1, 9)];
+    let index = PathIndex::from_edges(automaton, edges).unwrap();
+
+    assert_eq!(
+        index.reachable_from(&vertex(2)).collect::<Vec<_>>(),
+        [vertex(1), vertex(2), vertex(3)]
+    );
+    assert!(index.contains(&vertex(2), &vertex(2)));
+    assert_eq!(
+        index.reachable_from(&vertex(8)).collect::<Vec<_>>(),
+        [vertex(8)]
+    );
+}
+
+#[test]
 fn inverse_negation_and_wildcards_are_automaton_semantics() {
     let automaton = Automaton::new(
         4,
@@ -367,26 +414,26 @@ fn constraint_supports_constants_repeated_variables_and_resumable_chunks() {
     let start = Variable::<UnknownInline>::new(0);
     let end = Variable::<UnknownInline>::new(1);
     let constraint = PathConstraint::new(&index, start, end);
-    let mut binding = Binding::default();
+    let mut binding = BindingStore::new();
 
-    assert_eq!(constraint.estimate(start.index, &binding), Some(3));
-    binding.set(start.index, &vertex(1));
-    assert_eq!(constraint.estimate(end.index, &binding), Some(3));
+    assert_eq!(constraint.estimate(start.index, &binding.view()), Some(3));
+    binding.bind(start.index, &vertex(1));
+    assert_eq!(constraint.estimate(end.index, &binding.view()), Some(3));
     let mut chunked = ProposalBuffer::new();
     let mut cursor = ProposeCursor::default();
-    assert!(constraint.propose_chunk(end.index, &binding, &mut cursor, 0, &mut chunked));
+    assert!(constraint.propose_chunk(end.index, &binding.view(), &mut cursor, 0, &mut chunked));
     assert!(!cursor.started);
-    while constraint.propose_chunk(end.index, &binding, &mut cursor, 1, &mut chunked) {}
+    while constraint.propose_chunk(end.index, &binding.view(), &mut cursor, 1, &mut chunked) {}
     assert_eq!(
         chunked.live_values(0).copied().collect::<Vec<_>>(),
         vec![vertex(2), vertex(3), vertex(4)]
     );
 
     binding.unset(start.index);
-    binding.set(end.index, &vertex(4));
+    binding.bind(end.index, &vertex(4));
     let mut candidates = ProposalBuffer::new();
     candidates.extend([vertex(1), vertex(2), vertex(4)]);
-    constraint.confirm(start.index, &binding, &mut candidates.region(0));
+    constraint.confirm(start.index, &binding.view(), &mut candidates.region(0));
     assert_eq!(
         candidates.live_values(0).copied().collect::<Vec<_>>(),
         vec![vertex(1), vertex(2)]

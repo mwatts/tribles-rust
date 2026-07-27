@@ -101,6 +101,10 @@ impl Error for PathSummaryBlobError {}
 
 impl PathSummaryBlob {
     /// Encode one nonempty canonical constructional summary.
+    ///
+    /// Product arcs use full-domain `u32` ordinals on disk. A persisted
+    /// nullable summary therefore still requires `|U| * |Q| <= u32::MAX`,
+    /// even though materialization closes only the smaller matched support.
     pub fn encode(summary: &PathSummary) -> Result<Blob<Self>, PathSummaryBlobError> {
         if summary.vertices().is_empty() {
             return Err(PathSummaryBlobError::NoncanonicalEmpty);
@@ -701,6 +705,18 @@ mod tests {
         .unwrap();
         assert_eq!(
             PathSummaryBlob::encode(&noncanonical).unwrap_err(),
+            PathSummaryBlobError::NoncanonicalDomain
+        );
+
+        let mut raw_noncanonical = Vec::new();
+        raw_noncanonical.extend_from_slice(&automaton_fingerprint(rollup.automaton()).raw);
+        raw_noncanonical.extend_from_slice(&rollup.automaton().state_count().to_le_bytes());
+        raw_noncanonical.extend_from_slice(&1u32.to_le_bytes());
+        raw_noncanonical.extend_from_slice(&0u64.to_le_bytes());
+        raw_noncanonical.extend_from_slice(&vertex(1));
+        assert_eq!(
+            PathSummaryBlob::decode(Blob::new(raw_noncanonical.into()), rollup.automaton())
+                .unwrap_err(),
             PathSummaryBlobError::NoncanonicalDomain
         );
 

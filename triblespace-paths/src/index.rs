@@ -83,14 +83,17 @@ impl PathIndex {
         let offset_count = vertex_count
             .checked_add(1)
             .ok_or(PathError::CapacityOverflow)?;
-        let active_vertices = summary.active_vertices();
-        let active = materialize_active_relation(&summary, &active_vertices)?;
-        let forward = expand_relation(
-            &summary.vertices,
-            &active_vertices,
-            active,
-            summary.automaton.accepts_empty(),
-        )?;
+        let nullable = summary.automaton.accepts_empty();
+        let active_storage;
+        let active_vertices = if nullable {
+            active_storage = summary.active_vertices();
+            active_storage.as_slice()
+        } else {
+            debug_assert!(summary.has_canonical_domain());
+            summary.vertices.as_slice()
+        };
+        let active = materialize_active_relation(&summary, active_vertices)?;
+        let forward = expand_relation(&summary.vertices, active_vertices, active, nullable)?;
 
         let starts = (0..vertex_count)
             .filter(|&source| !forward.row(source).is_empty())
