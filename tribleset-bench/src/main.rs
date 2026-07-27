@@ -584,12 +584,14 @@ fn main() {
                 expect: Some(fixtures::F11_EXPECTED_ROWS),
                 run: fixtures::f11_truth,
             },
+            #[cfg(feature = "protocol-v2")]
             R2Measure {
                 name: "harkonnen/F11/over",
                 rows_meaningful: true,
                 expect: Some(fixtures::F11_EXPECTED_ROWS),
                 run: fixtures::f11_over,
             },
+            #[cfg(feature = "protocol-v2")]
             R2Measure {
                 name: "harkonnen/F11/under",
                 rows_meaningful: true,

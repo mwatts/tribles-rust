@@ -1054,12 +1054,14 @@ pub fn f10_total(above: bool, set: &TribleSet) -> usize {
 /// `mul / div` and forwards every other method unchanged. This is the
 /// only place in the suite that implements `Constraint` by hand; it
 /// exists so a fixture can hand the planner a known-wrong number.
+#[cfg(feature = "protocol-v2")]
 pub struct LyingEstimate<C> {
     inner: C,
     mul: usize,
     div: usize,
 }
 
+#[cfg(feature = "protocol-v2")]
 impl<C> LyingEstimate<C> {
     /// Report `factor`x MORE candidates than the wrapped constraint has.
     pub fn over(inner: C, factor: usize) -> Self {
@@ -1080,6 +1082,7 @@ impl<C> LyingEstimate<C> {
     }
 }
 
+#[cfg(feature = "protocol-v2")]
 impl<'a, C: Constraint<'a>> Constraint<'a> for LyingEstimate<C> {
     fn variables(&self) -> VariableSet {
         self.inner.variables()
@@ -1179,6 +1182,7 @@ pub fn f11_truth(set: &TribleSet) -> usize {
 
 /// F11 over-estimate plan: the small side claims `F11_LIE_FACTOR`x MORE
 /// candidates than it has.
+#[cfg(feature = "protocol-v2")]
 pub fn f11_over(set: &TribleSet) -> usize {
     find!(
         (v: Inline<GenId>),
@@ -1195,6 +1199,7 @@ pub fn f11_over(set: &TribleSet) -> usize {
 
 /// F11 under-estimate plan: the large side claims `F11_LIE_FACTOR`x
 /// FEWER candidates than it has.
+#[cfg(feature = "protocol-v2")]
 pub fn f11_under(set: &TribleSet) -> usize {
     find!(
         (v: Inline<GenId>),

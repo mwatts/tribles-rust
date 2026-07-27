@@ -56,4 +56,31 @@ fi
 ln -sfn "$target" subjects/current
 echo "bench.sh : subject -> $target" >&2
 
-exec cargo run --release -- "$@"
+# Capability probe: every feature below couples the suite to an engine ERA,
+# so we ask the SUBJECT what it can do instead of assuming. Getting this
+# wrong is not a soft failure — it is a compile error against older revs,
+# which is exactly how the era-portability property gets lost.
+SUBJECT="$(cd subjects/current && pwd -P)"
+FEATURES=""
+# gpu: the subject must actually ship the triblespace-gpu crate (F10 reads
+# DEFAULT_MIN_CONFIRM_BATCH out of it rather than copying the number).
+if [ -d "$SUBJECT/triblespace-gpu" ] && grep -q '^gpu = ' "$SUBJECT/Cargo.toml" 2>/dev/null; then
+  FEATURES="$FEATURES gpu"
+fi
+# protocol-v2: F11 implements Constraint by hand, so it needs the
+# post-Candidates protocol (engine/owned-mask onward).
+if grep -q 'pub struct Candidates' "$SUBJECT/triblespace-core/src/query.rs" 2>/dev/null; then
+  FEATURES="$FEATURES protocol-v2"
+fi
+# rpq: only when the subject still has a regular-path constraint.
+if [ -f "$SUBJECT/triblespace-core/src/query/regularpathconstraint.rs" ]; then
+  FEATURES="$FEATURES rpq"
+fi
+FEATURES="${FEATURES# }"
+if [ -n "$FEATURES" ]; then
+  echo "bench.sh: subject capabilities -> ${FEATURES// /, }" >&2
+  exec cargo run --release --features "${FEATURES// /,}" -- "$@"
+else
+  echo "bench.sh: subject capabilities -> none (baseline suite only)" >&2
+  exec cargo run --release -- "$@"
+fi

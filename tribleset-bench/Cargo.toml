@@ -5,12 +5,20 @@ edition = "2021"
 description = "Engine-version-agnostic benchmark suite for triblespace. The SUBJECT engine is a repointable dependency (any checkout, any era — no history grafting); results are written as canonical telemetry sessions/spans through the stable LEDGER dependency. The minted schema ids are the contract; GORBIE's telemetry-viewer renders the axis."
 
 [features]
-default = ["gpu"]
+# EMPTY BY DESIGN. Every capability feature below couples the suite to a
+# specific engine ERA; enabling one by default would break the crate's whole
+# purpose (benchmarking any rev). bench.sh probes the subject and enables
+# exactly the ones it supports.
+default = []
 # Placeholder: compiles only once the subject engine regains a
 # regular-path constraint (`path!`). Gates the four transitive-path
 # sparqloscope translations and the path-shaped Harkonnen fixtures
 # (F1/F2/F4); with the feature off those record SKIP outcomes.
 rpq = []
+# F11 implements `Constraint` by hand, so it only compiles against the
+# post-`Candidates` protocol (engine/owned-mask, 2026-07-27 onward).
+# Subjects older than that record F11 as skip:protocol.
+protocol-v2 = []
 # F10 straddles `triblespace-gpu`'s `DEFAULT_MIN_CONFIRM_BATCH` and READS
 # the constant out of the subject rather than copying it, so the fixture
 # can only compile against a subject that ships the gpu crate (the
