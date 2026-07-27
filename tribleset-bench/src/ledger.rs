@@ -350,23 +350,38 @@ pub fn verify(path: &Path) -> Result<()> {
     // iteration is the least contaminated estimate of the work itself,
     // while the spread against `max` shows how much interference the
     // run actually absorbed.
-    let mut span_times: std::collections::BTreeMap<String, Vec<u64>> = Default::default();
-    for (_s, n, d) in find!(
-        (s: Id, n: Inline<Handle<LongString>>, d: u64),
-        pattern!(&facts, [{ ?s @ metadata::tag: kind_span, tele::name: ?n, tele::duration_ns: ?d }])
+    //
+    // Keyed by (session, name), never by name alone: a results pile
+    // accumulates every run ever made against it, so collapsing on the
+    // name would silently average one rung's arm into another's — the
+    // exact confusion a comparative arm exists to avoid.
+    let mut span_times: std::collections::BTreeMap<(Id, String), Vec<u64>> = Default::default();
+    for (_s, run, n, d) in find!(
+        (s: Id, run: Id, n: Inline<Handle<LongString>>, d: u64),
+        pattern!(&facts, [{ ?s @
+            metadata::tag: kind_span,
+            tele::session: ?run,
+            tele::name: ?n,
+            tele::duration_ns: ?d
+        }])
     ) {
         let name: anybytes::View<str> =
             reader.get(n).map_err(|e| anyhow!("span name blob: {e:?}"))?;
         span_times
-            .entry(name.as_ref().to_owned())
+            .entry((run, name.as_ref().to_owned()))
             .or_default()
             .push(d);
     }
-    println!(
-        "  {:<45}{:>4}{:>12}{:>12}{:>12}",
-        "span", "n", "min ms", "median ms", "max ms"
-    );
-    for (name, times) in &mut span_times {
+    let mut current: Option<Id> = None;
+    for ((run, name), times) in &mut span_times {
+        if current != Some(*run) {
+            current = Some(*run);
+            println!("  session {run:X}");
+            println!(
+                "  {:<45}{:>4}{:>12}{:>12}{:>12}",
+                "span", "n", "min ms", "median ms", "max ms"
+            );
+        }
         times.sort_unstable();
         let ms = |ns: u64| ns as f64 / 1e6;
         println!(
