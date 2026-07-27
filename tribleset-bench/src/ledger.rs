@@ -1,0 +1,403 @@
+//! Results ledger: canonical telemetry sessions/spans plus bench
+//! outcome entities, written DIRECTLY (no tracing) through the stable
+//! LEDGER dependency (`triblespace` 0.47) — measurement I/O never
+//! depends on the era of the subject.
+//!
+//! DISCIPLINE: this module uses ONLY the ledger's umbrella surface
+//! (`triblespace::prelude`, `triblespace::core::…`). The umbrella
+//! macros expand to absolute `::triblespace::core` paths, which in
+//! this crate resolve to the ledger; the core-macro flavor (what the
+//! subject-side modules use) expands to `::triblespace_core`, which
+//! resolves to the SUBJECT's core and must never appear here.
+//!
+//! The telemetry schema ids are declared byte-for-byte identical to
+//! `june-on-tip/src/telemetry.rs` — the minted ids are the contract;
+//! GORBIE's telemetry-viewer renders the axis.
+
+use std::path::Path;
+use std::sync::LazyLock;
+
+use anyhow::{anyhow, bail, Context, Result};
+use ed25519_dalek::SigningKey;
+use rand::rngs::OsRng;
+
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::metadata;
+use triblespace::core::repo::{self, branch, PushResult, Workspace};
+use triblespace::core::repo::pile::Pile;
+use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::inlineencodings::{Handle, ShortString};
+use triblespace::prelude::*;
+
+/// Canonical telemetry attributes — byte-for-byte the ids of
+/// `triblespace::telemetry::schema` (read from
+/// `june-on-tip/src/telemetry.rs`).
+pub mod tele {
+    use triblespace::prelude::blobencodings::LongString;
+    use triblespace::prelude::inlineencodings::{GenId, Handle, ShortString, U256BE};
+    use triblespace::prelude::*;
+
+    attributes! {
+        "3E062AA7E3554C8F2DB94883CE639BFE" as pub session: GenId;
+        "146E5AA2F7CB3D8B654BC7742A13CAB3" as pub parent: GenId;
+        "CCB0147D20C4C6FCAC0E3D87FAFF71D1" as pub name: Handle<LongString>;
+        "8A4BE2C4D0E90D2B9EE0E1A07ECA2CFA" as pub category: ShortString;
+        "E11A84A30CC112650DC860B66B8BD8A9" as pub begin_ns: U256BE;
+        "2786FA563372FB6EF469EC7710719A49" as pub end_ns: U256BE;
+        "7593602383D0B0D21BBE382A67E5BD9F" as pub duration_ns: U256BE;
+        "7E96DD9A0B5002796B645ED25F5E99AC" as pub source: Handle<LongString>;
+    }
+}
+
+/// Bench decorations — minted for this suite (`trible genid`, never
+/// guessed): session provenance (commit/engine/config) and per-measure
+/// outcome entities (of_run/workload/outcome/rows).
+pub mod bench {
+    use triblespace::prelude::blobencodings::LongString;
+    use triblespace::prelude::inlineencodings::{GenId, Handle, ShortString, U256BE};
+    use triblespace::prelude::*;
+
+    attributes! {
+        /// Subject git rev (short=12) the session measured.
+        "2C96F6429B3E772B15A0AB630C2B394F" as pub commit: ShortString;
+        /// Engine label (--label) naming the subject on the axis.
+        "2C899A2497B9565328A42A44996BD6A1" as pub engine: ShortString;
+        /// Full run configuration: CLI + dataset + suite crate version.
+        "8A3D02A290208D39DC18C69FAF38F1E1" as pub config: Handle<LongString>;
+        /// Outcome entity -> its session.
+        "75342A5BCA3BAD27285C5B76DB22CFCF" as pub of_run: GenId;
+        /// Outcome entity -> measure key (e.g. "harkonnen/F5/total").
+        "81ADFDA915ABA850EE23FEE3B88FC02F" as pub workload: Handle<LongString>;
+        /// signal | skip:<reason> | panic:<reason> | gate_fail:<reason>.
+        "5ACAF4FD8D71F0205694F646520707B5" as pub outcome: ShortString;
+        /// Result cardinality of the measure, where meaningful.
+        "B5A378BDC1A7F1C4576B2DC6902B5995" as pub rows: U256BE;
+    }
+}
+
+/// Tag id of a telemetry session entity.
+pub static KIND_SESSION: LazyLock<Id> =
+    LazyLock::new(|| Id::from_hex("2701F7019B865D461F0169B1303026D6").expect("kind_session id"));
+/// Tag id of a telemetry span entity.
+pub static KIND_SPAN: LazyLock<Id> =
+    LazyLock::new(|| Id::from_hex("0AF9FEB9A2BFEB1BE8A8229829181085").expect("kind_span id"));
+/// The results branch every suite run commits to.
+pub static RESULTS_BRANCH: LazyLock<Id> =
+    LazyLock::new(|| Id::from_hex("F6D99F76BC15E78C0BBD44F9D28A0C0A").expect("results branch id"));
+
+/// Clip a string to a ShortString-safe payload: first line, NULs
+/// stripped, at most 32 bytes on a char boundary.
+fn clip32(s: &str) -> String {
+    let line = s.lines().next().unwrap_or("").replace('\0', "");
+    let mut end = line.len().min(32);
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    line[..end].to_owned()
+}
+
+/// One open results pile + workspace on the results branch. All facts
+/// accumulate in a pending set; `finish` commits, pushes, and closes.
+pub struct ResultsLedger {
+    repo: Repository<Pile>,
+    ws: Workspace<Pile>,
+    session: Id,
+    pending: TribleSet,
+}
+
+impl ResultsLedger {
+    /// Open (creating file and results branch as needed) and start a
+    /// session entity decorated with the bench provenance attributes.
+    pub fn open(path: &Path, commit: &str, label: &str, config: &str) -> Result<Self> {
+        if !path.exists() {
+            std::fs::OpenOptions::new()
+                .create_new(true)
+                .append(true)
+                .open(path)
+                .with_context(|| format!("create results pile {}", path.display()))?;
+        }
+        let mut pile =
+            Pile::open(path).map_err(|e| anyhow!("open results pile {}: {e:?}", path.display()))?;
+        pile.refresh().map_err(|e| anyhow!("load results pile: {e:?}"))?;
+        let branch_exists = pile
+            .head(*RESULTS_BRANCH)
+            .map_err(|e| anyhow!("read results branch head: {e:?}"))?
+            .is_some();
+
+        // Commit metadata: the schema self-description — provenance as
+        // exhaust, not product.
+        let mut described = tele::describe();
+        described += bench::describe();
+        let meta: TribleSet = described.into();
+
+        let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), meta)
+            .map_err(|e| anyhow!("open repository on results pile: {e:?}"))?;
+
+        if !branch_exists {
+            // `Repository::create_branch` mints a fresh id; the suite
+            // needs the FIXED minted branch id, so replicate its steps
+            // (unsigned branch metadata, as speced).
+            let name_blob: Blob<LongString> = "tribleset-bench".to_owned().to_blob();
+            let name_handle = name_blob.get_handle();
+            repo.storage_mut()
+                .put::<LongString, _>(name_blob)
+                .map_err(|e| anyhow!("store branch name blob: {e:?}"))?;
+            let branch_set = branch::branch_unsigned(*RESULTS_BRANCH, name_handle, None);
+            let branch_handle = repo
+                .storage_mut()
+                .put(branch_set.to_blob())
+                .map_err(|e| anyhow!("store branch metadata blob: {e:?}"))?;
+            match repo
+                .storage_mut()
+                .update(*RESULTS_BRANCH, None, Some(branch_handle))
+                .map_err(|e| anyhow!("create results branch: {e:?}"))?
+            {
+                PushResult::Success() => {}
+                PushResult::Conflict(_) => bail!("results branch creation raced another writer"),
+            }
+        }
+
+        let mut ws = repo
+            .pull(*RESULTS_BRANCH)
+            .map_err(|e| anyhow!("pull results branch: {e:?}"))?;
+
+        let session_owner = ufoid();
+        let session = *session_owner;
+        let name_handle = ws.put("tribleset-bench".to_string());
+        let config_handle = ws.put(config.to_string());
+        let commit_short = clip32(commit);
+        let label_short = clip32(label);
+        let pending = entity! { &session_owner @
+            metadata::tag: *KIND_SESSION,
+            tele::category: "session",
+            tele::name: name_handle,
+            tele::begin_ns: 0u64,
+            bench::commit: commit_short.as_str(),
+            bench::engine: label_short.as_str(),
+            bench::config: config_handle,
+        }
+        .into();
+
+        Ok(Self {
+            repo,
+            ws,
+            session,
+            pending,
+        })
+    }
+
+    /// The session entity id (for logging).
+    pub fn session(&self) -> Id {
+        self.session
+    }
+
+    /// Record one measured iteration as a telemetry span.
+    pub fn span(&mut self, name: &str, begin_ns: u64, duration_ns: u64) {
+        let span_owner = ufoid();
+        let name_handle = self.ws.put(name.to_string());
+        self.pending += TribleSet::from(entity! { &span_owner @
+            metadata::tag: *KIND_SPAN,
+            tele::session: self.session,
+            tele::category: "bench",
+            tele::name: name_handle,
+            tele::begin_ns: begin_ns,
+            tele::end_ns: begin_ns + duration_ns,
+            tele::duration_ns: duration_ns,
+        });
+    }
+
+    /// Record a per-measure outcome entity.
+    pub fn outcome(&mut self, workload: &str, outcome: &str, rows: Option<u64>) {
+        let outcome_owner = ufoid();
+        let workload_handle = self.ws.put(workload.to_string());
+        let outcome_short = clip32(outcome);
+        self.pending += TribleSet::from(entity! { &outcome_owner @
+            bench::of_run: self.session,
+            bench::workload: workload_handle,
+            bench::outcome: outcome_short.as_str(),
+        });
+        if let Some(r) = rows {
+            self.pending += TribleSet::from(entity! { &outcome_owner @ bench::rows: r });
+        }
+    }
+
+    /// Close the session (end/duration), commit, push, close the pile.
+    pub fn finish(mut self, end_ns: u64) -> Result<()> {
+        let session_ref = ExclusiveId::force_ref(&self.session);
+        self.pending += TribleSet::from(entity! { session_ref @
+            tele::end_ns: end_ns,
+            tele::duration_ns: end_ns,
+        });
+        self.ws.commit(std::mem::take(&mut self.pending), "tribleset-bench run");
+        self.repo
+            .push(&mut self.ws)
+            .map_err(|e| anyhow!("push results: {e:?}"))?;
+        self.repo
+            .close()
+            .map_err(|e| anyhow!("close results pile: {e:?}"))?;
+        Ok(())
+    }
+}
+
+/// The acceptance instrument: reopen a results pile READ-ONLY (no
+/// Repository, no appends), walk the results branch, and print session
+/// + span + outcome counts.
+pub fn verify(path: &Path) -> Result<()> {
+    let mut pile =
+        Pile::open(path).map_err(|e| anyhow!("open results pile {}: {e:?}", path.display()))?;
+    pile.refresh().map_err(|e| anyhow!("load results pile: {e:?}"))?;
+    let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
+    let Some(meta_handle) = pile
+        .head(*RESULTS_BRANCH)
+        .map_err(|e| anyhow!("read results branch head: {e:?}"))?
+    else {
+        bail!("no results branch {:X} in {}", &*RESULTS_BRANCH, path.display());
+    };
+    let branch_meta: TribleSet = reader
+        .get(meta_handle)
+        .map_err(|e| anyhow!("read branch metadata: {e:?}"))?;
+
+    // Walk the linear commit chain, uniting the content sets.
+    let heads: Vec<Inline<Handle<SimpleArchive>>> = find!(
+        (c: Inline<Handle<SimpleArchive>>),
+        pattern!(&branch_meta, [{ repo::head: ?c }])
+    )
+    .map(|(c,)| c)
+    .collect();
+    let [head] = heads[..] else { bail!("results branch has no unique head commit") };
+    let mut facts = TribleSet::new();
+    let mut commits = 0usize;
+    let mut cursor = Some(head);
+    while let Some(handle) = cursor {
+        let meta: TribleSet = reader
+            .get(handle)
+            .map_err(|e| anyhow!("read commit metadata: {e:?}"))?;
+        for (content,) in find!(
+            (c: Inline<Handle<SimpleArchive>>),
+            pattern!(&meta, [{ repo::content: ?c }])
+        ) {
+            let set: TribleSet = reader
+                .get(content)
+                .map_err(|e| anyhow!("read commit content: {e:?}"))?;
+            facts += set;
+        }
+        commits += 1;
+        let parents: Vec<Inline<Handle<SimpleArchive>>> = find!(
+            (p: Inline<Handle<SimpleArchive>>),
+            pattern!(&meta, [{ repo::parent: ?p }])
+        )
+        .map(|(p,)| p)
+        .collect();
+        cursor = match parents[..] {
+            [] => None,
+            [p] => Some(p),
+            _ => bail!("merge commit on the results branch (expected a linear chain)"),
+        };
+    }
+
+    let kind_session: Id = *KIND_SESSION;
+    let kind_span: Id = *KIND_SPAN;
+
+    let sessions: Vec<Id> = find!(
+        (s: Id),
+        pattern!(&facts, [{ ?s @ metadata::tag: kind_session }])
+    )
+    .map(|(s,)| s)
+    .collect();
+
+    let span_count = find!(
+        (s: Id),
+        pattern!(&facts, [{ ?s @ metadata::tag: kind_span }])
+    )
+    .count();
+
+    println!(
+        "verify   : {} — {} commits, {} tribles on the results branch",
+        path.display(),
+        commits,
+        facts.len()
+    );
+    println!("sessions : {}", sessions.len());
+    for (s, c, eng, cfg) in find!(
+        (
+            s: Id,
+            c: Inline<ShortString>,
+            eng: Inline<ShortString>,
+            cfg: Inline<Handle<LongString>>
+        ),
+        pattern!(&facts, [{ ?s @ bench::commit: ?c, bench::engine: ?eng, bench::config: ?cfg }])
+    ) {
+        let commit: String = c.try_from_inline().map_err(|e| anyhow!("commit decode: {e:?}"))?;
+        let engine: String = eng
+            .try_from_inline()
+            .map_err(|e| anyhow!("engine decode: {e:?}"))?;
+        let config: anybytes::View<str> = reader
+            .get(cfg)
+            .map_err(|e| anyhow!("config blob: {e:?}"))?;
+        println!("  {s:X}  commit={commit} engine={engine}");
+        println!("    config: {}", config.as_ref());
+    }
+
+    println!("spans    : {span_count}");
+    // Project the span id too: find! heads have SET semantics, so a
+    // name-only head would collapse the per-iteration spans to one row
+    // per distinct name.
+    let mut span_names: std::collections::BTreeMap<String, usize> = Default::default();
+    for (_s, n) in find!(
+        (s: Id, n: Inline<Handle<LongString>>),
+        pattern!(&facts, [{ ?s @ metadata::tag: kind_span, tele::name: ?n }])
+    ) {
+        let name: anybytes::View<str> =
+            reader.get(n).map_err(|e| anyhow!("span name blob: {e:?}"))?;
+        *span_names.entry(name.as_ref().to_owned()).or_default() += 1;
+    }
+    for (name, count) in &span_names {
+        println!("  {name:<45} x{count}");
+    }
+
+    // Optional rows per outcome entity (the engine is monotone; the
+    // optional join happens here in Rust).
+    let mut rows_of: std::collections::HashMap<Id, u64> = Default::default();
+    for (o, r) in find!(
+        (o: Id, r: u64),
+        pattern!(&facts, [{ ?o @ bench::rows: ?r }])
+    ) {
+        rows_of.insert(o, r);
+    }
+
+    let mut outcome_rows: Vec<(String, String, Option<u64>)> = Vec::new();
+    for (o, w, v) in find!(
+        (o: Id, w: Inline<Handle<LongString>>, v: Inline<ShortString>),
+        pattern!(&facts, [{ ?o @ bench::workload: ?w, bench::outcome: ?v }])
+    ) {
+        let workload: anybytes::View<str> =
+            reader.get(w).map_err(|e| anyhow!("workload blob: {e:?}"))?;
+        let outcome: String = v
+            .try_from_inline()
+            .map_err(|e| anyhow!("outcome decode: {e:?}"))?;
+        outcome_rows.push((workload.as_ref().to_owned(), outcome, rows_of.get(&o).copied()));
+    }
+    println!("outcomes : {}", outcome_rows.len());
+    let mut histogram: std::collections::BTreeMap<(String, String), usize> = Default::default();
+    for (workload, outcome, _) in &outcome_rows {
+        let group = workload.split('/').next().unwrap_or(workload).to_owned();
+        *histogram.entry((group, outcome.clone())).or_default() += 1;
+    }
+    for ((group, outcome), count) in &histogram {
+        println!("  {group:<14} {outcome:<28} x{count}");
+    }
+    outcome_rows.sort();
+    let mut any_rows = false;
+    for (workload, outcome, rows) in &outcome_rows {
+        if let Some(n) = rows {
+            if !any_rows {
+                println!("rows     :");
+                any_rows = true;
+            }
+            println!("  {workload:<45} {outcome:<10} rows={n}");
+        }
+    }
+
+    pile.close().map_err(|e| anyhow!("close results pile: {e:?}"))?;
+    Ok(())
+}
