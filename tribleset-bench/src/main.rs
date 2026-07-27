@@ -33,6 +33,7 @@ use std::time::Instant;
 
 use subject::core::prelude::TribleSet;
 
+mod archq;
 mod fixtures;
 mod ledger;
 
@@ -52,6 +53,11 @@ struct Cfg {
     warmup: usize,
     build_iters: usize,
     build_warmup: usize,
+    /// Timed iterations of each archive-arm query, per arm. Small by
+    /// default: one iteration of a wide join over a real archive costs
+    /// orders of magnitude more than a synthetic fixture.
+    arch_iters: usize,
+    arch_warmup: usize,
     verify: Option<std::path::PathBuf>,
 }
 
@@ -69,7 +75,8 @@ fn usage() -> ! {
     eprintln!(
         "usage: tribleset-bench --results <pile> --label <engine label> \
          [--data <pile> --branch <name> --rung <N>] \
-         [--iters N] [--warmup N] [--build-iters N] [--build-warmup N]\n\
+         [--iters N] [--warmup N] [--build-iters N] [--build-warmup N] \
+         [--arch-iters N] [--arch-warmup N]\n\
          \x20      tribleset-bench --verify <pile>\n\
          Sizes accept k/M/G suffixes. --data must be a clonefile copy \
          (cp -c) of a dataset pile."
@@ -88,6 +95,8 @@ fn parse_cfg() -> Cfg {
         warmup: 3,
         build_iters: 8,
         build_warmup: 2,
+        arch_iters: 3,
+        arch_warmup: 1,
         verify: None,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -122,6 +131,8 @@ fn parse_cfg() -> Cfg {
             "--warmup" => cfg.warmup = take_size(&args, &mut i),
             "--build-iters" => cfg.build_iters = take_size(&args, &mut i),
             "--build-warmup" => cfg.build_warmup = take_size(&args, &mut i),
+            "--arch-iters" => cfg.arch_iters = take_size(&args, &mut i),
+            "--arch-warmup" => cfg.arch_warmup = take_size(&args, &mut i),
             "--verify" => cfg.verify = Some(take(&args, &mut i).into()),
             other => {
                 eprintln!("unrecognized arg {other:?}");
@@ -292,6 +303,140 @@ fn run_r2(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Archive query arm
+// ---------------------------------------------------------------------------
+
+/// Above this trible count the RAM archive build — and with it the
+/// archive query arm, which needs the same resident archive — is
+/// skipped (the portable_bench `--max-ram` default).
+const MAX_RAM: usize = 20_000_000;
+
+/// The per-query suffixes of the confirm-region census.
+const ARCH_REGION_SUFFIXES: [&str; 6] = [
+    "confirms",
+    "max",
+    "p95",
+    "median",
+    "ge_threshold",
+    "live_total",
+];
+
+/// Record `reason` against every measure the archive query arm would
+/// have produced. Keeps the census in the pile complete for runs that
+/// never reach the arm (no dataset, or a set too large to archive in
+/// RAM) — an absent measure and a skipped measure are different facts.
+fn skip_arch_queries(led: &mut ledger::ResultsLedger, reason: &str) {
+    for q in archq::arch_queries::<TribleSet>() {
+        for suffix in ARCH_REGION_SUFFIXES {
+            led.outcome(&format!("arch_regions/{}/{suffix}", q.name), reason, None);
+        }
+        led.outcome(&format!("arch/{}/total", q.name), reason, None);
+    }
+}
+
+/// Run the archive query arm over `set`: the untimed confirm-region
+/// census, then the timed CPU arm — two passes over ONE archive build.
+///
+/// The census is the load-bearing half. Region size is a COUNTING
+/// property, so it survives a contended machine intact, and it is the
+/// exact quantity `triblespace-gpu` routes on: if real queries never
+/// produce regions near `DEFAULT_MIN_CONFIRM_BATCH`, no timing run can
+/// rescue the device path, and that is the answer rather than a
+/// preliminary to one.
+fn run_arch_queries(
+    led: &mut ledger::ResultsLedger,
+    cfg: &Cfg,
+    base: &Instant,
+    set: &TribleSet,
+) {
+    let built = Instant::now();
+    let archive = fixtures::build_archive(set);
+    println!(
+        "arch     : query arm over a {}-trible archive (built in {:.2}s), routing threshold {}",
+        set.len(),
+        built.elapsed().as_secs_f64(),
+        archq::CONFIRM_THRESHOLD
+    );
+
+    // -- the confirm-region census (counting, not timing) ---------------
+    #[cfg(feature = "protocol-v2")]
+    let archive = {
+        let ds = archq::shell(archq::CountingArchive::new(archive));
+        println!(
+            "  {:<34}{:>10}{:>12}{:>11}{:>10}{:>10}",
+            "regions/live-count", "confirms", "max", "p95", "median", ">=thresh"
+        );
+        for q in archq::arch_queries() {
+            ds.facts.reset();
+            match fixtures::quiet_catch(|| (q.run)(&ds)) {
+                Err(msg) => {
+                    for suffix in ARCH_REGION_SUFFIXES {
+                        led.outcome(
+                            &format!("arch_regions/{}/{suffix}", q.name),
+                            &format!("panic:{msg}"),
+                            None,
+                        );
+                    }
+                    println!("  {:<34} panic ({msg})", q.name);
+                }
+                Ok(answer) => {
+                    let s = ds.facts.stats();
+                    for (suffix, value) in [
+                        ("confirms", s.confirms),
+                        ("max", s.max),
+                        ("p95", s.p95),
+                        ("median", s.median),
+                        ("ge_threshold", s.ge_threshold),
+                        ("live_total", s.live_total),
+                    ] {
+                        led.outcome(
+                            &format!("arch_regions/{}/{suffix}", q.name),
+                            "signal",
+                            Some(value),
+                        );
+                    }
+                    println!(
+                        "  {:<34}{:>10}{:>12}{:>11}{:>10}{:>10}",
+                        q.name, s.confirms, s.max, s.p95, s.median, s.ge_threshold
+                    );
+                    println!(
+                        "      {} | answer {} | widest regions (size x count) {:?}",
+                        q.shape,
+                        answer.value,
+                        ds.facts.top_regions(4)
+                    );
+                }
+            }
+        }
+        ds.facts.into_archive()
+    };
+    #[cfg(not(feature = "protocol-v2"))]
+    {
+        for q in archq::arch_queries::<TribleSet>() {
+            for suffix in ARCH_REGION_SUFFIXES {
+                led.outcome(
+                    &format!("arch_regions/{}/{suffix}", q.name),
+                    "skip:protocol",
+                    None,
+                );
+            }
+        }
+        println!("  {:<34} SKIP (protocol: no Candidates region)", "regions/live-count");
+    }
+
+    // -- the timed CPU arm ----------------------------------------------
+    let ds = archq::shell(archive);
+    for q in archq::arch_queries() {
+        let mut m = Measure::new(format!("arch/{}/total", q.name));
+        for i in 0..(cfg.arch_warmup + cfg.arch_iters) {
+            let recording = i >= cfg.arch_warmup;
+            m.iterate(recording, base, || archq::answer_count(&(q.run)(&ds)));
+        }
+        m.emit(led, true);
+    }
+}
+
 fn main() {
     let cfg = parse_cfg();
 
@@ -310,7 +455,7 @@ fn main() {
 
     let commit = subject_commit();
     let config = format!(
-        "argv: {} | data: {} branch: {} rung: {} | iters: {} warmup: {} build_iters: {} build_warmup: {} | suite: tribleset-bench {}",
+        "argv: {} | data: {} branch: {} rung: {} | iters: {} warmup: {} build_iters: {} build_warmup: {} arch_iters: {} arch_warmup: {} | suite: tribleset-bench {}",
         std::env::args().skip(1).collect::<Vec<_>>().join(" "),
         cfg.data
             .as_ref()
@@ -322,6 +467,8 @@ fn main() {
         cfg.warmup,
         cfg.build_iters,
         cfg.build_warmup,
+        cfg.arch_iters,
+        cfg.arch_warmup,
         env!("CARGO_PKG_VERSION"),
     );
 
@@ -346,6 +493,7 @@ fn main() {
             led.outcome("ladder/checkout/total", "skip:no-data", None);
             println!("  {:<32} SKIP (no --data)", "arch/build_ram/total");
             led.outcome("arch/build_ram/total", "skip:no-data", None);
+            skip_arch_queries(&mut led, "skip:no-data");
             None
         }
         Some(path) => {
@@ -385,9 +533,6 @@ fn main() {
         }
     };
     if let Some(set) = &dataset {
-        /// Above this trible count the RAM archive build is skipped
-        /// (the portable_bench --max-ram default).
-        const MAX_RAM: usize = 20_000_000;
         if set.len() > MAX_RAM {
             led.outcome("arch/build_ram/total", "skip:max-ram", None);
             println!(
@@ -395,6 +540,7 @@ fn main() {
                 "arch/build_ram/total",
                 set.len()
             );
+            skip_arch_queries(&mut led, "skip:max-ram");
         } else {
             let mut m = Measure::new("arch/build_ram/total");
             for i in 0..(cfg.build_warmup + cfg.build_iters) {
@@ -406,6 +552,7 @@ fn main() {
                 });
             }
             m.emit(&mut led, true);
+            run_arch_queries(&mut led, &cfg, &base, set);
         }
     }
 
