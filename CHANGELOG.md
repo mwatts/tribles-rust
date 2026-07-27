@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Pattern constants are Term-native again — `or!(pattern!, pattern!)`
+  works.** Resurrects 78c1a1b7's constant folding on the June-protocol
+  engine: `TribleSetConstraint`, `SuccinctArchiveConstraint`, and the GPU
+  wrapper store each position as a `RawTerm` (`Var` or `Const`), and the
+  `pattern!`/`pattern_changes!` macros emit attribute constants, literal
+  values, and constant entity ids as constant terms instead of hidden
+  variables pinned by `ConstantConstraint`. Constants live below the
+  variable layer: they never enter the `Binding`, are never proposed, and
+  `variables()` excludes them — so union arms compare only the query
+  variables the caller wrote, literals no longer consume the 128-variable
+  budget, and estimates treat constants as bound from step 0. The
+  `RawTerm::position_value` helper unifies "bound variable" and
+  "constant", so every backend's bound-position dispatch handles constants
+  with zero new arms. A fully-constant pattern has an empty variable set
+  and is settled by one exact `satisfied()` probe in `Query::new`
+  (`SuccinctArchiveConstraint` regains its fully-bound `satisfied`
+  override for this). `Term::expect_variable` — the transplant-era seam
+  that panicked on constant terms — is deleted, and
+  `UnionConstraint::new`'s mismatch panic names the offending variable
+  sets again. The `or_pattern.rs` suite returns (11 tests), extended with
+  runtime proofs that constants never enter the `Binding` and that a
+  161-constant pattern allocates zero variables.
 - **`triblespace-gpu` is rewritten around batched confirm and rejoins the
   workspace.** The old integration served the removed engine paradigm (typed
   Program routing, resident frontier machinery, residual-action observation)

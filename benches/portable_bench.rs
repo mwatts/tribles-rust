@@ -460,12 +460,11 @@ fn measure_queries<S: TriblePattern>(
         // createdBy — exercises branch pruning under a join rather than
         // pure union enumeration. KNOWN: `or!` trips the unionconstraint
         // variable-set assert at pre-2026-07-11 commits — the guard turns
-        // that into a PANIC outcome instead of a dead bench. On THIS branch
-        // the strict union asserts at CONSTRUCTION (each pattern! literal
-        // allocates its own hidden pinned variable, so the two arms declare
-        // different VariableSets); construction happens inside
-        // `q3b_union_join`, i.e. inside this guarded closure's quiet_catch,
-        // so it records as PANIC — verified 2026-07-27, no movement needed.
+        // that into a PANIC outcome instead of a dead bench. Term-native
+        // constants (2026-07-27 resurrection of 78c1a1b7) restore the
+        // literal-fold, so both arms declare exactly {s, o1} again and q3
+        // produces SIGNAL on this lineage; the guard stays for the sweep
+        // commits where the desugar-era panic is still expected.
         if let Some(n) = timed_guarded(&mut panicked[1], &mut samples[1], recording, || {
             q3b_union_join(src, qa)
         }) {

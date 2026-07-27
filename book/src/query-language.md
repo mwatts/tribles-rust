@@ -227,10 +227,13 @@ find!((alias: Inline<_>),
 ```
 
 Each branch contributes every match it can produce given the current bindings.
-The example projects each distinct alias once. A nickname and display name with
-different raw values contribute two aliases; equal values collapse, as do the
-same alias values witnessed by different hidden entities. Branches that cannot
-match simply contribute nothing.
+Results are a bag of complete bindings: one row per witness of the declared
+variables (here `entity` and `alias`), so a nickname and display name with
+different raw values contribute two rows, equal values for the same entity
+collapse (the union is a set per binding step), and the same alias witnessed
+by different entities yields one row per entity — dedup of projected columns
+belongs to the consumer. Branches that cannot match simply contribute
+nothing.
 
 All branches of an `or!` must bind exactly the same set of variables;
 branch-local variables are not supported. This is a consequence of the
