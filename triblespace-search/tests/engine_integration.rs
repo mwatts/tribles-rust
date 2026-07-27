@@ -10,7 +10,7 @@ use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::{Inline, IntoInline, RawInline};
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace_core::query::{
-    CandidateSink, Candidates, Constraint, EstimateSink, RowsView, Variable, VariableContext,
+    Binding, Constraint, ProposalBuffer, Variable, VariableContext,
 };
 
 use triblespace_search::bm25::BM25Builder;
@@ -59,26 +59,18 @@ fn intersection_of_two_bm25_constraints_yields_overlap() {
 
     // The intersection's estimate is the minimum of the two
     // children's estimates — both are 2, so 2.
-    let mut est = Vec::new();
-    assert!(intersection.estimate(
-        doc.index,
-        &RowsView::EMPTY,
-        &mut EstimateSink::Column(&mut est)
-    ));
-    assert_eq!(est, vec![2]);
+    assert_eq!(intersection.estimate(doc.index, &Binding::default()), Some(2));
 
     // `propose` should yield the intersection of the two posting
-    // lists. "fox" is in docs {1,3}; "quick" is in docs {1,3};
-    // both sets happen to be identical → proposes both.
-    let mut props: Candidates = Vec::new();
-    intersection.propose(
-        doc.index,
-        &RowsView::EMPTY,
-        &mut CandidateSink::Tagged(&mut props),
-    );
+    // lists: the tightest child appends its candidates and the other
+    // child kills non-members in the same region. "fox" is in docs
+    // {1,3}; "quick" is in docs {1,3}; both sets happen to be
+    // identical → both survive.
+    let mut props = ProposalBuffer::new();
+    intersection.propose(doc.index, &Binding::default(), &mut props);
     let ids: std::collections::HashSet<Id> = props
-        .iter()
-        .map(|(_, r)| raw_value_to_id(r).unwrap())
+        .live_values(0)
+        .map(|r| raw_value_to_id(r).unwrap())
         .collect();
     assert!(ids.contains(&id(1)));
     assert!(ids.contains(&id(3)));
@@ -106,23 +98,14 @@ fn intersection_with_absent_term_proposes_nothing() {
 
     // The "banana" constraint's estimate is 0, so the
     // intersection's minimum-estimate is 0.
-    let mut est = Vec::new();
-    assert!(intersection.estimate(
-        doc.index,
-        &RowsView::EMPTY,
-        &mut EstimateSink::Column(&mut est)
-    ));
-    assert_eq!(est, vec![0]);
+    assert_eq!(intersection.estimate(doc.index, &Binding::default()), Some(0));
 
-    let mut props: Candidates = Vec::new();
-    intersection.propose(
-        doc.index,
-        &RowsView::EMPTY,
-        &mut CandidateSink::Tagged(&mut props),
-    );
-    assert!(
-        props.is_empty(),
-        "no proposals for absent-term intersection"
+    let mut props = ProposalBuffer::new();
+    intersection.propose(doc.index, &Binding::default(), &mut props);
+    assert_eq!(
+        props.count_live(0),
+        0,
+        "no live proposals for absent-term intersection"
     );
 }
 
@@ -144,13 +127,12 @@ fn satisfied_respects_both_clauses() {
     let c_fox: Box<dyn Constraint> = Box::new(idx.matches(doc, &fox_terms, 0.0));
     let intersection = IntersectionConstraint::new(vec![c_quick, c_fox]);
 
-    let vars = [doc.index];
-
     // doc = 1: has both "quick" and "fox" → satisfied.
-    let row1 = [id_as_raw_value(id(1))];
-    assert!(intersection.satisfied(&RowsView::new(&vars, &row1)));
+    let mut binding = Binding::default();
+    binding.set(doc.index, &id_as_raw_value(id(1)));
+    assert!(intersection.satisfied(&binding));
 
     // doc = 2: has "quick" but not "fox" → unsatisfied.
-    let row2 = [id_as_raw_value(id(2))];
-    assert!(!intersection.satisfied(&RowsView::new(&vars, &row2)));
+    binding.set(doc.index, &id_as_raw_value(id(2)));
+    assert!(!intersection.satisfied(&binding));
 }

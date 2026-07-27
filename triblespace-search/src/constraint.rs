@@ -16,10 +16,17 @@
 //!   [`crate::hnsw::AttachedHNSWIndex`] /
 //!   [`crate::hnsw::AttachedFlatIndex`] /
 //!   [`crate::succinct::AttachedSuccinctHNSWIndex`]. Other constraints
-//!   source both handle domains.
-//! * [`SimilarTo`] — a unary immutable occurrence bag produced by one
+//!   source both handle domains; this constraint only confirms —
+//!   like `InlineRange` in the core engine, it estimates
+//!   `usize::MAX` and proposes nothing.
+//! * [`SimilarTo`] — a unary set constraint over the result of one
 //!   fixed-probe backend search. Flat retrieval is complete; HNSW and
 //!   succinct HNSW retrieval is approximate.
+//!
+//! All three speak the engine's cooperative protocol directly:
+//! `estimate` guides join ordering, `propose` appends candidate values
+//! into the shared [`ProposalBuffer`], `confirm` kills entries in a
+//! [`Candidates`] region, and `satisfied` checks fully-bound rows.
 //!
 //! See `docs/QUERY_ENGINE_INTEGRATION.md` for the long-form
 //! design.
@@ -30,53 +37,11 @@ use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::query::{
-    finiteunaryprogram, CandidateSink, Constraint, DispatchClass, EstimateSink, ProgramAction,
-    ProgramCompletion, ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef, ProgramRequest,
-    ProgramRoute, ProgramSeedBatch, ProgramStratum, ProposalCoverage, ResidualDeltaSourceCursor,
-    ResidualDeltaSourcePage, RowsView, TypedEffectSink, TypedProgramBatch, TypedProgramSpec,
-    TypedResume, TypedSeedSink, Variable, VariableId, VariableSet,
+    Binding, Candidates, Constraint, ProposalBuffer, Variable, VariableId, VariableSet,
 };
 
 use crate::bm25::BM25Index;
 use crate::schemas::Embedding;
-
-/// Page one immutable, already-computed candidate sequence without changing
-/// its native order or occurrence multiplicity.
-///
-/// `Offset` is intentional: BM25 aggregation order and HNSW result order are
-/// implementation-owned and need not agree with raw-inline lexicographic
-/// order. The owning constraint never mutates the sequence after construction.
-fn cached_candidate_page(
-    entries: &[RawInline],
-    cursor: ResidualDeltaSourceCursor,
-    limit: usize,
-    accepted: &mut Vec<RawInline>,
-) -> ResidualDeltaSourcePage {
-    assert!(limit > 0, "residual source pages require positive demand");
-    let begin = match cursor {
-        ResidualDeltaSourceCursor::Start => 0,
-        ResidualDeltaSourceCursor::Offset(index) => {
-            usize::try_from(index).expect("cached search source cursor exceeds usize")
-        }
-        ResidualDeltaSourceCursor::After(_) => {
-            panic!("cached search source received a raw-value cursor")
-        }
-    };
-    assert!(
-        begin <= entries.len(),
-        "cached search source cursor exceeds the immutable frontier"
-    );
-    let end = begin.saturating_add(limit).min(entries.len());
-    accepted.extend_from_slice(&entries[begin..end]);
-    ResidualDeltaSourcePage {
-        next: (end < entries.len()).then(|| {
-            ResidualDeltaSourceCursor::Offset(
-                u64::try_from(end).expect("cached search source offset exceeds u64"),
-            )
-        }),
-        examined: end - begin,
-    }
-}
 
 /// Minimum surface a BM25 index must expose for the
 /// [`BM25Filter`] constraint to work against it. Implemented
@@ -191,13 +156,12 @@ where
     S: triblespace_core::inline::InlineEncoding,
 {
     doc: Variable<S>,
-    /// Pre-filtered set of doc keys whose summed score
-    /// across the query terms is `>= score_floor`. Score is
-    /// dropped after the filter — re-derived on demand.
+    /// Pre-filtered doc keys whose summed score across the query
+    /// terms is `>= score_floor`, deduplicated in first-occurrence
+    /// order. Score is dropped after the filter — re-derived on
+    /// demand.
     entries: Vec<RawInline>,
-    /// Set-shaped companion to `entries` for pointwise confirmation. Keeping
-    /// it beside the occurrence sequence prevents width-one continuation
-    /// pages from rebuilding or linearly scanning the whole frontier.
+    /// Set-shaped companion to `entries` for pointwise confirmation.
     membership: HashSet<RawInline>,
 }
 
@@ -211,73 +175,30 @@ where
     ///
     /// Accepts any `IntoIterator<Item = RawInline>` so callers
     /// can pass a `Vec<RawInline>` or a streaming iterator
-    /// without forcing a collect.
+    /// without forcing a collect. Duplicate occurrences collapse
+    /// at construction: the constraint's denotation is the raw
+    /// value SET, and proposing a value twice would inflate the
+    /// engine's bag multiplicity.
     pub fn from_entries<I>(doc: Variable<S>, entries: I) -> Self
     where
         I: IntoIterator<Item = RawInline>,
     {
-        let entries: Vec<_> = entries.into_iter().collect();
-        let membership = entries.iter().copied().collect();
+        let mut membership = HashSet::new();
+        let mut unique = Vec::new();
+        for entry in entries {
+            if membership.insert(entry) {
+                unique.push(entry);
+            }
+        }
         Self {
             doc,
-            entries,
+            entries: unique,
             membership,
         }
     }
 
     fn contains_raw(&self, value: &RawInline) -> bool {
         self.membership.contains(value)
-    }
-}
-
-impl<S> TypedProgramSpec for BM25Filter<S>
-where
-    S: triblespace_core::inline::InlineEncoding,
-{
-    type State = finiteunaryprogram::FiniteUnaryProgramState;
-    type NoveltyKey = ();
-    type Rank = [u64; 6];
-
-    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-        finiteunaryprogram::route(self.doc.index, request)
-    }
-
-    fn dispatch(&self, state: &Self::State) -> DispatchClass {
-        finiteunaryprogram::dispatch(state)
-    }
-
-    fn pacing(&self, state: &Self::State) -> ProgramPacing {
-        finiteunaryprogram::pacing(state)
-    }
-
-    fn progress(&self, state: &Self::State) -> Self::Rank {
-        finiteunaryprogram::progress(state)
-    }
-
-    fn seed_typed(
-        &self,
-        batch: ProgramSeedBatch<'_>,
-        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
-    ) {
-        finiteunaryprogram::seed(self.doc.index, batch, effects);
-    }
-
-    fn step_typed(
-        &self,
-        states: &mut Vec<Self::State>,
-        batch: TypedProgramBatch<'_>,
-        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
-    ) {
-        finiteunaryprogram::step(
-            self.doc.index,
-            states,
-            batch,
-            effects,
-            |_input, cursor, limit, accepted| {
-                cached_candidate_page(&self.entries, cursor, limit, accepted)
-            },
-            |_input, value| self.contains_raw(value),
-        );
     }
 }
 
@@ -425,62 +346,33 @@ where
         VariableSet::new_singleton(self.doc.index)
     }
 
-    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-        if variable == self.doc.index && !bound.is_set(variable) {
-            ProposalCoverage::Exact
+    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
+        if variable == self.doc.index {
+            Some(self.entries.len())
         } else {
-            ProposalCoverage::None
+            None
         }
     }
 
-    fn estimate(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        out: &mut EstimateSink<'_>,
-    ) -> bool {
-        if variable != self.doc.index {
-            return false;
-        }
-        out.fill(self.entries.len(), view.len());
-        true
-    }
-
-    fn propose(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut ProposalBuffer) {
         if variable != self.doc.index {
             return;
         }
-        for i in 0..view.len() as u32 {
-            candidates.extend_row(i, self.entries.iter().copied());
-        }
+        proposals.extend_from_slice(&self.entries);
     }
 
-    fn confirm(
-        &self,
-        variable: VariableId,
-        _view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
+    fn confirm(&self, variable: VariableId, _binding: &Binding, cands: &mut Candidates<'_>) {
         if variable != self.doc.index {
             return;
         }
-        candidates.retain(|_, raw| self.contains_raw(raw));
+        cands.retain(|raw| self.contains_raw(raw));
     }
 
-    fn satisfied(&self, view: &RowsView<'_>) -> bool {
-        match view.col(self.doc.index) {
-            Some(col) => view.iter().all(|row| self.contains_raw(&row[col])),
+    fn satisfied(&self, binding: &Binding) -> bool {
+        match binding.get(self.doc.index) {
+            Some(bound) => self.contains_raw(bound),
             None => true,
         }
-    }
-
-    fn residual_program(&self) -> Option<ProgramRef<'_>> {
-        Some(ProgramRef::new(self))
     }
 }
 
@@ -511,8 +403,14 @@ pub trait CosineSimilarity {
 ///
 /// Semantics are symmetric and binding-history independent. This is a
 /// filter-only predicate: other constraints must source both handle domains,
-/// and this constraint checks candidate pairs pointwise. Approximate
-/// directional retrieval is exposed separately by [`SimilarTo`].
+/// and this constraint checks candidate pairs pointwise. It follows the
+/// same shape as the core engine's `InlineRange` — the estimate saturates
+/// at `usize::MAX` so the intersection never picks it as the proposer,
+/// `propose` is intentionally empty, and `confirm` kills candidates whose
+/// pair is resolved and below the floor. Candidates whose peer variable is
+/// still unbound are left alive — the predicate is unresolved until the
+/// engine binds the other side. Approximate directional retrieval is
+/// exposed separately by [`SimilarTo`].
 ///
 /// `score_floor` is fixed at constraint-construction — it's a
 /// query parameter, not a bound variable. Callers who need the
@@ -588,20 +486,6 @@ pub struct CosineAtLeast<'a, I: CosineSimilarity + ?Sized> {
     score_floor: f32,
 }
 
-/// Canonical finite continuation for [`CosineAtLeast`].
-#[doc(hidden)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CosineAtLeastProgramState {
-    Confirm { variable: VariableId, offset: usize },
-    Support,
-}
-
-const COSINE_CONFIRM_ROUTE: u32 = 1 << 4;
-const COSINE_SUPPORT_ROUTE: u32 = 2 << 4;
-
-const COSINE_CONFIRM_DISPATCH: DispatchClass = DispatchClass::new(0);
-const COSINE_SUPPORT_DISPATCH: DispatchClass = DispatchClass::new(1);
-
 impl<'a, I: CosineSimilarity + ?Sized> CosineAtLeast<'a, I> {
     /// Build a constraint. Usually invoked through the `cosine_at_least`
     /// method on an attached index rather than directly.
@@ -619,203 +503,10 @@ impl<'a, I: CosineSimilarity + ?Sized> CosineAtLeast<'a, I> {
         }
     }
 
-    fn variable_mask(&self, variable: VariableId) -> u32 {
-        u32::from(variable == self.a.index) | (u32::from(variable == self.b.index) << 1)
-    }
-
-    fn bound_mask(&self, bound: VariableSet) -> u32 {
-        u32::from(bound.is_set(self.a.index)) | (u32::from(bound.is_set(self.b.index)) << 1)
-    }
-
     fn pair_matches(&self, a: RawInline, b: RawInline) -> bool {
         self.index
             .cosine_between(Inline::new(a), Inline::new(b))
             .is_some_and(|score| score >= self.score_floor)
-    }
-
-    fn candidate_matches_or_is_unresolved(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        row: &[RawInline],
-        candidate: RawInline,
-    ) -> bool {
-        if self.a.index == self.b.index {
-            return variable == self.a.index && self.pair_matches(candidate, candidate);
-        }
-        if variable == self.a.index {
-            view.col(self.b.index)
-                .is_none_or(|column| self.pair_matches(candidate, row[column]))
-        } else if variable == self.b.index {
-            view.col(self.a.index)
-                .is_none_or(|column| self.pair_matches(row[column], candidate))
-        } else {
-            false
-        }
-    }
-
-    fn support_row(&self, view: &RowsView<'_>, row: &[RawInline]) -> bool {
-        match (view.col(self.a.index), view.col(self.b.index)) {
-            (Some(a), Some(b)) => self.pair_matches(row[a], row[b]),
-            _ => true,
-        }
-    }
-}
-
-impl<I: CosineSimilarity + ?Sized> TypedProgramSpec for CosineAtLeast<'_, I> {
-    type State = CosineAtLeastProgramState;
-    type NoveltyKey = ();
-    type Rank = [u64; 2];
-
-    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-        let bound_mask = self.bound_mask(request.bound);
-        let (key, variable) = match request.action {
-            ProgramAction::Propose(_) => return None,
-            ProgramAction::Confirm(variable) => {
-                let target_mask = self.variable_mask(variable);
-                if target_mask == 0 || request.bound.is_set(variable) {
-                    return None;
-                }
-                (
-                    COSINE_CONFIRM_ROUTE | (target_mask << 2) | bound_mask,
-                    variable,
-                )
-            }
-            ProgramAction::Support => (COSINE_SUPPORT_ROUTE | bound_mask, self.a.index),
-        };
-        Some(ProgramRoute {
-            key: ProgramKey::new(key),
-            variable,
-            stratum: ProgramStratum::Finite,
-            grouping: ProgramGrouping::PageLocal,
-            completion: ProgramCompletion::PageableOnly,
-        })
-    }
-
-    fn dispatch(&self, state: &Self::State) -> DispatchClass {
-        match state {
-            CosineAtLeastProgramState::Confirm { .. } => COSINE_CONFIRM_DISPATCH,
-            CosineAtLeastProgramState::Support => COSINE_SUPPORT_DISPATCH,
-        }
-    }
-
-    fn pacing(&self, _state: &Self::State) -> ProgramPacing {
-        ProgramPacing::Search
-    }
-
-    fn progress(&self, state: &Self::State) -> Self::Rank {
-        match state {
-            CosineAtLeastProgramState::Support => [1, 0],
-            CosineAtLeastProgramState::Confirm { offset, .. } => [
-                2,
-                u64::MAX
-                    - u64::try_from(*offset).expect("cosine candidate offset exceeds rank limb"),
-            ],
-        }
-    }
-
-    fn seed_typed(
-        &self,
-        batch: ProgramSeedBatch<'_>,
-        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
-    ) {
-        assert_eq!(batch.route.stratum, ProgramStratum::Finite);
-        assert_eq!(batch.route.grouping, ProgramGrouping::PageLocal);
-        assert_eq!(batch.route.completion, ProgramCompletion::PageableOnly);
-        let state = match batch.request.action {
-            ProgramAction::Propose(_) => panic!("filter-only cosine Program admitted a proposal"),
-            ProgramAction::Confirm(variable) => {
-                assert_ne!(self.variable_mask(variable), 0);
-                assert!(!batch.request.bound.is_set(variable));
-                assert_eq!(batch.route.variable, variable);
-                CosineAtLeastProgramState::Confirm {
-                    variable,
-                    offset: 0,
-                }
-            }
-            ProgramAction::Support => CosineAtLeastProgramState::Support,
-        };
-        for parent in 0..batch.view.len() {
-            effects.finite_root(
-                u32::try_from(parent).expect("too many exact cosine parents"),
-                state.clone(),
-                None,
-            );
-        }
-    }
-
-    fn step_typed(
-        &self,
-        states: &mut Vec<Self::State>,
-        batch: TypedProgramBatch<'_>,
-        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
-    ) {
-        assert_eq!(batch.stratum, ProgramStratum::Finite);
-        assert_eq!(states.len(), batch.view.len());
-        assert_eq!(states.len(), batch.candidate_sets.len());
-        assert_eq!(states.len(), batch.limits.len());
-        let Some(first) = states.first() else {
-            return;
-        };
-        match first {
-            CosineAtLeastProgramState::Confirm { variable, .. } => {
-                let variable = *variable;
-                for (input, state) in states.drain(..).enumerate() {
-                    let CosineAtLeastProgramState::Confirm {
-                        variable: state_variable,
-                        offset,
-                    } = state
-                    else {
-                        panic!("one exact cosine cohort mixed action variants")
-                    };
-                    assert_eq!(state_variable, variable);
-                    let candidates = batch.candidate_sets[input]
-                        .expect("exact cosine confirmation lost its candidate group");
-                    assert!(offset <= candidates.len());
-                    let end = offset
-                        .saturating_add(batch.limits[input])
-                        .min(candidates.len());
-                    let input_tag =
-                        u32::try_from(input).expect("too many exact cosine inputs in one cohort");
-                    for &candidate in &candidates[offset..end] {
-                        if self.candidate_matches_or_is_unresolved(
-                            variable,
-                            &batch.view,
-                            batch.view.row(input),
-                            candidate,
-                        ) {
-                            effects.accept(input_tag, candidate);
-                        }
-                    }
-                    let examined = end - offset;
-                    assert!(
-                        end == candidates.len() || examined > 0,
-                        "exact cosine confirmation resumed without examining a candidate"
-                    );
-                    let resume = (end < candidates.len()).then(|| {
-                        TypedResume::Immediate(CosineAtLeastProgramState::Confirm {
-                            variable,
-                            offset: end,
-                        })
-                    });
-                    effects.page(examined, resume);
-                }
-            }
-            CosineAtLeastProgramState::Support => {
-                for (input, state) in states.drain(..).enumerate() {
-                    assert_eq!(state, CosineAtLeastProgramState::Support);
-                    assert!(
-                        batch.candidate_sets[input].is_none(),
-                        "exact cosine support received a candidate group"
-                    );
-                    if self.support_row(&batch.view, batch.view.row(input)) {
-                        effects
-                            .support(u32::try_from(input).expect("too many exact cosine inputs"));
-                    }
-                    effects.page(1, None);
-                }
-            }
-        }
     }
 }
 
@@ -824,74 +515,69 @@ impl<'a, I: CosineSimilarity + ?Sized + 'a> Constraint<'a> for CosineAtLeast<'a,
         VariableSet::new_singleton(self.a.index).union(VariableSet::new_singleton(self.b.index))
     }
 
-    fn estimate(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        out: &mut EstimateSink<'_>,
-    ) -> bool {
-        if variable != self.a.index && variable != self.b.index {
-            return false;
+    /// Saturates at `usize::MAX`: this predicate owns no domain, so the
+    /// intersection must keep it behind every genuine source without
+    /// falsely marking the variable unconstrained.
+    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
+        if variable == self.a.index || variable == self.b.index {
+            Some(usize::MAX)
+        } else {
+            None
         }
-        // This predicate owns no domain. Saturation keeps it behind every
-        // genuine source without falsely marking the variable unconstrained.
-        out.fill(usize::MAX, view.len());
-        true
     }
 
-    fn propose(
-        &self,
-        _variable: VariableId,
-        _view: &RowsView<'_>,
-        _candidates: &mut CandidateSink<'_>,
-    ) {
+    fn propose(&self, _variable: VariableId, _binding: &Binding, _proposals: &mut ProposalBuffer) {
         // Intentionally empty: exact pairwise cosine is a predicate, not an
         // ANN domain source. `SimilarTo` owns directional retrieval.
     }
 
-    fn confirm(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
+    fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
         if variable != self.a.index && variable != self.b.index {
             return;
         }
-        candidates.retain(|row, candidate| {
-            self.candidate_matches_or_is_unresolved(
-                variable,
-                view,
-                view.row(row as usize),
-                *candidate,
-            )
-        });
+        if self.a.index == self.b.index {
+            // Repeated variable: the candidate must clear the floor
+            // against itself.
+            cands.retain(|candidate| self.pair_matches(*candidate, *candidate));
+            return;
+        }
+        let peer = if variable == self.a.index {
+            self.b.index
+        } else {
+            self.a.index
+        };
+        let Some(&peer_value) = binding.get(peer) else {
+            // Peer unbound: the pair is unresolved, keep every candidate
+            // alive until the engine binds the other side.
+            return;
+        };
+        if variable == self.a.index {
+            cands.retain(|candidate| self.pair_matches(*candidate, peer_value));
+        } else {
+            cands.retain(|candidate| self.pair_matches(peer_value, *candidate));
+        }
     }
 
-    fn satisfied(&self, view: &RowsView<'_>) -> bool {
-        view.iter().all(|row| self.support_row(view, row))
-    }
-
-    fn residual_program(&self) -> Option<ProgramRef<'_>> {
-        Some(ProgramRef::new(self))
+    fn satisfied(&self, binding: &Binding) -> bool {
+        match (binding.get(self.a.index), binding.get(self.b.index)) {
+            (Some(&a), Some(&b)) => self.pair_matches(a, b),
+            _ => true,
+        }
     }
 }
 
 /// Unary similarity constraint: `similar_to(probe, var, score_floor)`
-/// binds `var` to the immutable candidate occurrence bag returned by one
-/// backend search from `probe` at `score_floor`.
+/// binds `var` to the candidate set returned by one backend search
+/// from `probe` at `score_floor`.
 ///
-/// The candidate bag is pre-materialised at construction and retains the
-/// producer's native order and duplicate occurrences. Flat search produces
-/// every indexed handle above the threshold. HNSW and succinct HNSW are
-/// approximate and may omit qualifying handles. Once constructed, query
-/// semantics are exact membership in this frozen bag; no engine action
-/// re-walks the index.
-///
-/// In the relational-SET protocol this is therefore one fixed unary relation
-/// with exact proposal coverage. Native order and duplicate occurrences are
-/// physical properties of its proposal stream; the denotation is their raw
-/// [`RawInline`] support.
+/// The candidate set is pre-materialised at construction. Flat search
+/// produces every indexed handle above the threshold. HNSW and succinct
+/// HNSW are approximate and may omit qualifying handles. Once
+/// constructed, query semantics are exact membership in this frozen
+/// set; no engine action re-walks the index. Duplicate occurrences in
+/// the backend's result list collapse at construction — the constraint
+/// denotes the raw [`RawInline`] support set, exactly the rows a query
+/// head can distinguish.
 ///
 /// Produced by the `similar_to` method on an
 /// [`crate::hnsw::AttachedHNSWIndex`] /
@@ -939,22 +625,29 @@ impl<'a, I: CosineSimilarity + ?Sized + 'a> Constraint<'a> for CosineAtLeast<'a,
 /// ```
 pub struct SimilarTo {
     var: Variable<Handle<Embedding>>,
-    /// Eagerly-computed backend result bag from the one walk at construction.
+    /// Backend result list from the one walk at construction,
+    /// deduplicated in first-occurrence order.
     candidates: Vec<RawInline>,
-    /// Set-shaped companion used by pointwise confirmation without changing
-    /// the native proposal order or duplicate occurrence bag.
+    /// Set-shaped companion used by pointwise confirmation.
     membership: HashSet<RawInline>,
 }
 
 impl SimilarTo {
     /// Build from a pre-computed candidate list. Usually invoked
     /// through the `similar_to` method on an attached index
-    /// rather than directly.
+    /// rather than directly. Duplicate occurrences collapse at
+    /// construction — the constraint denotes the raw value SET.
     pub fn from_candidates(var: Variable<Handle<Embedding>>, candidates: Vec<RawInline>) -> Self {
-        let membership = candidates.iter().copied().collect();
+        let mut membership = HashSet::new();
+        let mut unique = Vec::new();
+        for candidate in candidates {
+            if membership.insert(candidate) {
+                unique.push(candidate);
+            }
+        }
         Self {
             var,
-            candidates,
+            candidates: unique,
             membership,
         }
     }
@@ -964,115 +657,38 @@ impl SimilarTo {
     }
 }
 
-impl TypedProgramSpec for SimilarTo {
-    type State = finiteunaryprogram::FiniteUnaryProgramState;
-    type NoveltyKey = ();
-    type Rank = [u64; 6];
-
-    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-        finiteunaryprogram::route(self.var.index, request)
-    }
-
-    fn dispatch(&self, state: &Self::State) -> DispatchClass {
-        finiteunaryprogram::dispatch(state)
-    }
-
-    fn pacing(&self, state: &Self::State) -> ProgramPacing {
-        finiteunaryprogram::pacing(state)
-    }
-
-    fn progress(&self, state: &Self::State) -> Self::Rank {
-        finiteunaryprogram::progress(state)
-    }
-
-    fn seed_typed(
-        &self,
-        batch: ProgramSeedBatch<'_>,
-        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
-    ) {
-        finiteunaryprogram::seed(self.var.index, batch, effects);
-    }
-
-    fn step_typed(
-        &self,
-        states: &mut Vec<Self::State>,
-        batch: TypedProgramBatch<'_>,
-        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
-    ) {
-        finiteunaryprogram::step(
-            self.var.index,
-            states,
-            batch,
-            effects,
-            |_input, cursor, limit, accepted| {
-                cached_candidate_page(&self.candidates, cursor, limit, accepted)
-            },
-            |_input, value| self.contains_raw(value),
-        );
-    }
-}
-
 impl<'a> Constraint<'a> for SimilarTo {
     fn variables(&self) -> VariableSet {
         VariableSet::new_singleton(self.var.index)
     }
 
-    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-        if variable == self.var.index && !bound.is_set(variable) {
-            ProposalCoverage::Exact
+    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
+        if variable == self.var.index {
+            Some(self.candidates.len())
         } else {
-            ProposalCoverage::None
+            None
         }
     }
 
-    fn estimate(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        out: &mut EstimateSink<'_>,
-    ) -> bool {
-        if variable != self.var.index {
-            return false;
-        }
-        out.fill(self.candidates.len(), view.len());
-        true
-    }
-
-    fn propose(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut ProposalBuffer) {
         if variable != self.var.index {
             return;
         }
-        for i in 0..view.len() as u32 {
-            candidates.extend_row(i, self.candidates.iter().copied());
-        }
+        proposals.extend_from_slice(&self.candidates);
     }
 
-    fn confirm(
-        &self,
-        variable: VariableId,
-        _view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
+    fn confirm(&self, variable: VariableId, _binding: &Binding, cands: &mut Candidates<'_>) {
         if variable != self.var.index {
             return;
         }
-        candidates.retain(|_, raw| self.contains_raw(raw));
+        cands.retain(|raw| self.contains_raw(raw));
     }
 
-    fn satisfied(&self, view: &RowsView<'_>) -> bool {
-        match view.col(self.var.index) {
-            Some(col) => view.iter().all(|row| self.contains_raw(&row[col])),
+    fn satisfied(&self, binding: &Binding) -> bool {
+        match binding.get(self.var.index) {
+            Some(bound) => self.contains_raw(bound),
             None => true,
         }
-    }
-
-    fn residual_program(&self) -> Option<ProgramRef<'_>> {
-        Some(ProgramRef::new(self))
     }
 }
 
@@ -1084,23 +700,11 @@ mod tests {
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::id::Id;
     use triblespace_core::inline::{InlineEncoding, IntoInline, TryFromInline};
-    use triblespace_core::query::hashsetconstraint::SetConstraint;
-    use triblespace_core::query::{Binding, Candidates, Query};
+    use triblespace_core::query::Query;
     use triblespace_core::repo::{BlobStore, BlobStorePut};
 
     fn id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
-    }
-
-    /// Single-row estimate helper: the old `estimate(v, &binding) ->
-    /// Option<usize>` shape, reconstructed over a view.
-    fn est<'a>(c: &impl Constraint<'a>, v: VariableId, view: &RowsView<'_>) -> Option<usize> {
-        let mut out = Vec::new();
-        if c.estimate(v, view, &mut EstimateSink::Column(&mut out)) {
-            Some(out[0])
-        } else {
-            None
-        }
     }
 
     /// `GenId`-schema RawInline → `Id` test helper.
@@ -1123,6 +727,11 @@ mod tests {
 
     fn embedding_raw(byte: u8) -> RawInline {
         Inline::<Handle<Embedding>>::new([byte; 32]).raw
+    }
+
+    /// Live survivors of a confirm pass over the whole buffer.
+    fn live(buffer: &ProposalBuffer) -> Vec<RawInline> {
+        buffer.live_values(0).copied().collect()
     }
 
     #[derive(Debug, Eq, PartialEq)]
@@ -1173,9 +782,10 @@ mod tests {
         let terms = hash_tokens("fox");
         let c = idx.matches(doc, &terms, 0.0);
 
+        let binding = Binding::default();
         // "fox" appears in doc 1 and doc 3.
-        assert_eq!(est(&c, doc.index, &RowsView::EMPTY), Some(2));
-        assert_eq!(est(&c, 255, &RowsView::EMPTY), None);
+        assert_eq!(c.estimate(doc.index, &binding), Some(2));
+        assert_eq!(c.estimate(255, &binding), None);
     }
 
     #[test]
@@ -1186,17 +796,13 @@ mod tests {
         let terms = hash_tokens("fox");
         let c = idx.matches(doc, &terms, 0.0);
 
-        let mut props: Candidates = Vec::new();
-        c.propose(
-            doc.index,
-            &RowsView::EMPTY,
-            &mut CandidateSink::Tagged(&mut props),
-        );
+        let mut props = ProposalBuffer::new();
+        c.propose(doc.index, &Binding::default(), &mut props);
         assert_eq!(props.len(), 2);
 
         let ids: HashSet<Id> = props
             .iter()
-            .map(|(_, r)| raw_value_to_id(r).expect("valid GenId value"))
+            .map(|r| raw_value_to_id(r).expect("valid GenId value"))
             .collect();
         assert!(ids.contains(&id(1)));
         assert!(ids.contains(&id(3)));
@@ -1210,21 +816,17 @@ mod tests {
         let terms = hash_tokens("fox");
         let c = idx.matches(doc, &terms, 0.0);
 
-        let mut props: Candidates = vec![
-            (0, id_to_raw_value(id(1))),
-            (0, id_to_raw_value(id(2))),
-            (0, id_to_raw_value(id(3))),
-        ];
-        c.confirm(
-            doc.index,
-            &RowsView::EMPTY,
-            &mut CandidateSink::Tagged(&mut props),
-        );
-        let ids: HashSet<Id> = props
+        let mut props = ProposalBuffer::new();
+        props.push(id_to_raw_value(id(1)));
+        props.push(id_to_raw_value(id(2)));
+        props.push(id_to_raw_value(id(3)));
+        c.confirm(doc.index, &Binding::default(), &mut props.region(0));
+
+        assert_eq!(props.count_live(0), 2);
+        let ids: HashSet<Id> = live(&props)
             .iter()
-            .map(|(_, r)| raw_value_to_id(r).unwrap())
+            .map(|r| raw_value_to_id(r).unwrap())
             .collect();
-        assert_eq!(ids.len(), 2);
         assert!(ids.contains(&id(1)));
         assert!(!ids.contains(&id(2)));
         assert!(ids.contains(&id(3)));
@@ -1238,14 +840,16 @@ mod tests {
         let terms = hash_tokens("fox");
         let c = idx.matches(doc, &terms, 0.0);
 
-        assert!(c.satisfied(&RowsView::EMPTY));
+        let empty = Binding::default();
+        assert!(c.satisfied(&empty));
 
-        let vars = [doc.index];
-        let bound = [id_to_raw_value(id(1))];
-        assert!(c.satisfied(&RowsView::new(&vars, &bound)));
+        let mut bound = Binding::default();
+        bound.set(doc.index, &id_to_raw_value(id(1)));
+        assert!(c.satisfied(&bound));
 
-        let unmatching = [id_to_raw_value(id(2))];
-        assert!(!c.satisfied(&RowsView::new(&vars, &unmatching)));
+        let mut unmatching = Binding::default();
+        unmatching.set(doc.index, &id_to_raw_value(id(2)));
+        assert!(!c.satisfied(&unmatching));
     }
 
     #[test]
@@ -1258,15 +862,11 @@ mod tests {
         let terms = hash_tokens("quick fox");
         let c = idx.matches(doc, &terms, 0.0);
 
-        let mut props: Candidates = Vec::new();
-        c.propose(
-            doc.index,
-            &RowsView::EMPTY,
-            &mut CandidateSink::Tagged(&mut props),
-        );
+        let mut props = ProposalBuffer::new();
+        c.propose(doc.index, &Binding::default(), &mut props);
         let ids: HashSet<Id> = props
             .iter()
-            .map(|(_, r)| raw_value_to_id(r).expect("genid"))
+            .map(|r| raw_value_to_id(r).expect("genid"))
             .collect();
         assert!(ids.contains(&id(1)));
         assert!(ids.contains(&id(3)));
@@ -1286,26 +886,18 @@ mod tests {
         let explicit = idx.matches(doc_a, &hash_tokens("quick fox"), 0.0);
         let sugar = idx.matches_text(doc_b, "quick fox", 0.0);
 
-        let mut props_a: Candidates = Vec::new();
-        let mut props_b: Candidates = Vec::new();
-        explicit.propose(
-            doc_a.index,
-            &RowsView::EMPTY,
-            &mut CandidateSink::Tagged(&mut props_a),
-        );
-        sugar.propose(
-            doc_b.index,
-            &RowsView::EMPTY,
-            &mut CandidateSink::Tagged(&mut props_b),
-        );
+        let mut props_a = ProposalBuffer::new();
+        let mut props_b = ProposalBuffer::new();
+        explicit.propose(doc_a.index, &Binding::default(), &mut props_a);
+        sugar.propose(doc_b.index, &Binding::default(), &mut props_b);
 
         let set_a: HashSet<Id> = props_a
             .iter()
-            .map(|(_, r)| raw_value_to_id(r).expect("genid"))
+            .map(|r| raw_value_to_id(r).expect("genid"))
             .collect();
         let set_b: HashSet<Id> = props_b
             .iter()
-            .map(|(_, r)| raw_value_to_id(r).expect("genid"))
+            .map(|r| raw_value_to_id(r).expect("genid"))
             .collect();
         assert_eq!(
             set_a, set_b,
@@ -1346,28 +938,20 @@ mod tests {
         let c_low = idx.matches(doc, &terms, 0.0);
         let c_mid = idx.matches(doc, &terms, (s1 + s2) / 2.0);
 
-        let mut low_props: Candidates = Vec::new();
-        c_low.propose(
-            doc.index,
-            &RowsView::EMPTY,
-            &mut CandidateSink::Tagged(&mut low_props),
-        );
+        let mut low_props = ProposalBuffer::new();
+        c_low.propose(doc.index, &Binding::default(), &mut low_props);
         let low_ids: HashSet<Id> = low_props
             .iter()
-            .map(|(_, r)| raw_value_to_id(r).unwrap())
+            .map(|r| raw_value_to_id(r).unwrap())
             .collect();
         assert!(low_ids.contains(&id(1)));
         assert!(low_ids.contains(&id(2)));
 
-        let mut mid_props: Candidates = Vec::new();
-        c_mid.propose(
-            doc.index,
-            &RowsView::EMPTY,
-            &mut CandidateSink::Tagged(&mut mid_props),
-        );
+        let mut mid_props = ProposalBuffer::new();
+        c_mid.propose(doc.index, &Binding::default(), &mut mid_props);
         let mid_ids: HashSet<Id> = mid_props
             .iter()
-            .map(|(_, r)| raw_value_to_id(r).unwrap())
+            .map(|r| raw_value_to_id(r).unwrap())
             .collect();
         assert!(mid_ids.contains(&id(1)));
         assert!(!mid_ids.contains(&id(2)));
@@ -1414,14 +998,10 @@ mod tests {
         let terms: Vec<triblespace_core::inline::Inline<crate::tokens::WordHash>> = Vec::new();
         let c = idx.matches(doc, &terms, 0.0);
 
-        assert_eq!(est(&c, doc.index, &RowsView::EMPTY), Some(0));
+        assert_eq!(c.estimate(doc.index, &Binding::default()), Some(0));
 
-        let mut props: Candidates = Vec::new();
-        c.propose(
-            doc.index,
-            &RowsView::EMPTY,
-            &mut CandidateSink::Tagged(&mut props),
-        );
+        let mut props = ProposalBuffer::new();
+        c.propose(doc.index, &Binding::default(), &mut props);
         assert!(props.is_empty());
     }
 
@@ -1433,23 +1013,19 @@ mod tests {
         let terms = hash_tokens("aardvark zeppelin");
         let c = idx.matches(doc, &terms, 0.0);
 
-        assert_eq!(est(&c, doc.index, &RowsView::EMPTY), Some(0));
-        let mut props: Candidates = Vec::new();
-        c.propose(
-            doc.index,
-            &RowsView::EMPTY,
-            &mut CandidateSink::Tagged(&mut props),
-        );
+        assert_eq!(c.estimate(doc.index, &Binding::default()), Some(0));
+        let mut props = ProposalBuffer::new();
+        c.propose(doc.index, &Binding::default(), &mut props);
         assert!(props.is_empty());
     }
 
+    /// `from_entries` is public and may receive duplicate occurrences;
+    /// the constraint denotes the raw SET, so duplicates collapse at
+    /// construction — estimate, propose, and the public query heads all
+    /// see each value once.
     #[test]
-    fn bm25_cached_candidates_page_exactly_across_affine_parents() {
-        let parent = Variable::<GenId>::new(0);
-        let doc = Variable::<GenId>::new(1);
-        // The repeated doc is deliberate: `from_entries` is public, and the
-        // typed Program must preserve proposal occurrences even though
-        // confirmation membership is set-like.
+    fn from_entries_collapses_duplicate_occurrences() {
+        let doc = Variable::<GenId>::new(0);
         let entries = [
             id_to_raw_value(id(3)),
             id_to_raw_value(id(1)),
@@ -1457,124 +1033,26 @@ mod tests {
             id_to_raw_value(id(2)),
         ];
         let constraint = BM25Filter::from_entries(doc, entries);
-        let mut direct = Vec::new();
-        let first =
-            cached_candidate_page(&entries, ResidualDeltaSourceCursor::Start, 2, &mut direct);
-        assert_eq!(direct, entries[..2]);
-        assert_eq!(first.examined, 2);
-        assert_eq!(first.next, Some(ResidualDeltaSourceCursor::Offset(2)));
 
-        direct.clear();
-        let second = cached_candidate_page(&entries, first.next.unwrap(), 2, &mut direct);
-        assert_eq!(direct, entries[2..]);
-        assert_eq!(second.examined, 2);
-        assert_eq!(second.next, None);
+        assert_eq!(constraint.estimate(doc.index, &Binding::default()), Some(3));
 
-        let parents: HashSet<Id> = [id(10), id(11)].into_iter().collect();
-        let parent_rows = [id_to_raw_value(id(10)), id_to_raw_value(id(11))];
-        let mut eager: Candidates = Vec::new();
-        constraint.propose(
-            doc.index,
-            &RowsView::new(&[parent.index], &parent_rows),
-            &mut CandidateSink::Tagged(&mut eager),
-        );
-        let eager_pairs: Vec<_> = eager
-            .iter()
-            .map(|&(row, value)| (parent_rows[row as usize], value))
-            .collect();
-        let expected_eager_pairs: Vec<_> = parent_rows
-            .iter()
-            .flat_map(|&parent_value| entries.iter().map(move |&entry| (parent_value, entry)))
-            .collect();
-        assert_eq!(eager_pairs, expected_eager_pairs);
-        let mut expected_public_pairs = eager_pairs.clone();
-        expected_public_pairs.sort_unstable();
-        expected_public_pairs.dedup();
-
-        let make = || {
-            triblespace_core::and!(
-                SetConstraint::new(parent, &parents),
-                BM25Filter::from_entries(doc, entries),
-            )
-        };
-        let mut residual = Query::new(make(), project_pair)
-            .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1);
-        let mut full: Vec<_> = residual.by_ref().collect();
-        full.sort_unstable();
-        assert_eq!(full, expected_public_pairs);
-        for parent_value in parent_rows {
-            assert_eq!(
-                eager_pairs
-                    .iter()
-                    .filter(|(p, d)| *p == parent_value && *d == entries[1])
-                    .count(),
-                2,
-                "the internal proposal bag retains both doc occurrences",
-            );
-            assert_eq!(
-                full.iter()
-                    .filter(|(p, d)| *p == parent_value && *d == entries[1])
-                    .count(),
-                1,
-                "the public raw head collapses repeated doc occurrences",
-            );
-        }
+        let mut props = ProposalBuffer::new();
+        constraint.propose(doc.index, &Binding::default(), &mut props);
         assert_eq!(
-            residual.stats().delta_source_pages,
-            parents.len() * entries.len()
+            &props[..],
+            [entries[0], entries[1], entries[3]],
+            "first-occurrence order, duplicates collapsed",
         );
-        assert_eq!(
-            residual.stats().delta_source_candidates_examined,
-            parents.len() * entries.len()
-        );
-        assert_eq!(
-            residual.stats().delta_source_direct_candidates,
-            parents.len() * entries.len()
-        );
-        assert_eq!(residual.stats().delta_source_roots, 0);
 
-        let mut first_only = Query::new(
-            BM25Filter::from_entries(Variable::<GenId>::new(0), entries),
+        let mut rows: Vec<_> = Query::new(
+            BM25Filter::from_entries(doc, entries),
             project_first,
         )
-        .solve_residual_state_lazy()
-        .cap(1)
-        .start_width(1);
-        assert_eq!(first_only.next(), Some(entries[0]));
-        assert_eq!(first_only.stats().delta_source_pages, 1);
-        assert_eq!(first_only.stats().delta_source_candidates_examined, 1);
-        assert_eq!(first_only.stats().delta_source_direct_candidates, 1);
-        drop(first_only);
-
-        let base = entries[..3].to_vec();
-        let mut before: Vec<_> = Query::new(
-            BM25Filter::from_entries(Variable::<GenId>::new(0), base),
-            project_first,
-        )
-        .solve_residual_state_lazy()
-        .cap(1)
-        .start_width(1)
         .collect();
-        let mut after: Vec<_> = Query::new(
-            BM25Filter::from_entries(Variable::<GenId>::new(0), entries),
-            project_first,
-        )
-        .solve_residual_state_lazy()
-        .cap(1)
-        .start_width(1)
-        .collect();
-        before.sort_unstable();
-        after.sort_unstable();
-        for old in before {
-            let position = after
-                .iter()
-                .position(|candidate| *candidate == old)
-                .expect("growing an immutable candidate snapshot removed an occurrence");
-            after.remove(position);
-        }
-        assert_eq!(after, [entries[3]]);
+        rows.sort_unstable();
+        let mut expected = vec![entries[0], entries[1], entries[3]];
+        expected.sort_unstable();
+        assert_eq!(rows, expected);
     }
 
     // ── Exact pairwise cosine + directional retrieval ─────────
@@ -1611,59 +1089,210 @@ mod tests {
     }
 
     #[test]
-    fn exact_cosine_is_a_program_confirmer_but_never_a_paged_source() {
-        let (flat, hnsw, mut store, _handles) = sample_sim();
+    fn flat_cosine_filters_candidates_exactly_in_both_binding_orders() {
+        let (flat, _hnsw, mut store, handles) = sample_sim();
         let reader = store.reader().unwrap();
-        let a = Variable::<Handle<Embedding>>::new(0);
-        let b = Variable::<Handle<Embedding>>::new(1);
-        let bound_pivot = VariableSet::new_singleton(a.index);
-        let proposal_request = ProgramRequest {
-            action: ProgramAction::Propose(b.index),
-            bound: bound_pivot,
-        };
+        let view = flat.attach(&reader);
 
-        let flat_view = flat.attach(&reader);
-        let flat_constraint = flat_view.cosine_at_least(a, b, 0.8);
+        let mut ctx = triblespace_core::query::VariableContext::new();
+        let a: Variable<Handle<Embedding>> = ctx.next_variable();
+        let b: Variable<Handle<Embedding>> = ctx.next_variable();
+        let c = view.cosine_at_least(a, b, 0.8);
+
+        let mut binding = Binding::default();
+        binding.set(a.index, &handles[0].raw);
+
+        let mut no_domain = ProposalBuffer::new();
+        c.propose(b.index, &binding, &mut no_domain);
         assert!(
-            flat_constraint.route(proposal_request).is_none(),
-            "exact cosine offers no proposal Program",
-        );
-        assert!(
-            flat_constraint.residual_program().is_some(),
-            "exact cosine must expose its pageable confirmer Program",
+            no_domain.is_empty(),
+            "exact cosine must never source an ANN domain"
         );
 
-        let hnsw_view = hnsw.attach(&reader);
-        let hnsw_constraint = hnsw_view.cosine_at_least(a, b, 0.8);
-        assert!(
-            hnsw_constraint.route(proposal_request).is_none(),
-            "an attached HNSW view does not turn exact cosine into ANN expansion",
-        );
-        assert!(
-            hnsw_constraint.residual_program().is_some(),
-            "HNSW attachment still supports exact pairwise confirmation",
-        );
-
-        #[cfg(feature = "succinct")]
-        {
-            let succinct = crate::succinct::SuccinctHNSWIndex::from_naive(&hnsw).unwrap();
-            let succinct_view = succinct.attach(&reader);
-            let succinct_constraint = succinct_view.cosine_at_least(a, b, 0.8);
-            assert!(
-                succinct_constraint.route(proposal_request).is_none(),
-                "succinct attachment keeps retrieval and exact filtering separate",
-            );
-            assert!(
-                succinct_constraint.residual_program().is_some(),
-                "succinct attachment supports exact pairwise confirmation",
-            );
+        let mut bind_b = ProposalBuffer::new();
+        for handle in handles.iter() {
+            bind_b.push(handle.raw);
         }
+        c.confirm(b.index, &binding, &mut bind_b.region(0));
+        assert_eq!(live(&bind_b), [handles[0].raw, handles[2].raw]);
+
+        let mut peer_binding = Binding::default();
+        peer_binding.set(b.index, &handles[2].raw);
+        let mut bind_a = ProposalBuffer::new();
+        for handle in handles.iter() {
+            bind_a.push(handle.raw);
+        }
+        c.confirm(a.index, &peer_binding, &mut bind_a.region(0));
+        assert_eq!(live(&bind_a), [handles[0].raw, handles[2].raw]);
+    }
+
+    /// With the peer variable unbound the pair is unresolved and every
+    /// candidate must stay alive — the engine confirms again once the
+    /// peer binds.
+    #[test]
+    fn cosine_confirm_keeps_candidates_while_peer_is_unbound() {
+        let (flat, _hnsw, mut store, handles) = sample_sim();
+        let reader = store.reader().unwrap();
+        let view = flat.attach(&reader);
+
+        let mut ctx = triblespace_core::query::VariableContext::new();
+        let a: Variable<Handle<Embedding>> = ctx.next_variable();
+        let b: Variable<Handle<Embedding>> = ctx.next_variable();
+        let c = view.cosine_at_least(a, b, 0.8);
+
+        let mut props = ProposalBuffer::new();
+        for handle in handles.iter() {
+            props.push(handle.raw);
+        }
+        c.confirm(b.index, &Binding::default(), &mut props.region(0));
+        assert_eq!(props.count_live(0), handles.len());
     }
 
     #[test]
-    fn similar_to_cached_candidates_preserve_order_multiplicity_and_affinity() {
-        let parent = Variable::<GenId>::new(0);
-        let neighbour = Variable::<Handle<Embedding>>::new(1);
+    fn flat_cosine_satisfied_checks_the_same_exact_predicate() {
+        let (flat, _hnsw, mut store, handles) = sample_sim();
+        let reader = store.reader().unwrap();
+        let view = flat.attach(&reader);
+
+        let mut ctx = triblespace_core::query::VariableContext::new();
+        let a: Variable<Handle<Embedding>> = ctx.next_variable();
+        let b: Variable<Handle<Embedding>> = ctx.next_variable();
+        let c = view.cosine_at_least(a, b, 0.8);
+
+        assert!(c.satisfied(&Binding::default()));
+
+        let mut good = Binding::default();
+        good.set(a.index, &handles[0].raw);
+        good.set(b.index, &handles[2].raw);
+        assert!(c.satisfied(&good));
+
+        let mut bad = Binding::default();
+        bad.set(a.index, &handles[0].raw);
+        bad.set(b.index, &handles[1].raw);
+        assert!(!c.satisfied(&bad));
+    }
+
+    #[test]
+    fn hnsw_cosine_accepts_an_exact_match_outside_the_ann_index() {
+        let (_flat, hnsw, mut store, handles) = sample_sim();
+        let outside =
+            crate::schemas::put_embedding::<_>(&mut store, vec![0.999, 0.001, 0.0]).unwrap();
+        let reader = store.reader().unwrap();
+        let view = hnsw.attach(&reader);
+
+        let mut ctx = triblespace_core::query::VariableContext::new();
+        let a: Variable<Handle<Embedding>> = ctx.next_variable();
+        let b: Variable<Handle<Embedding>> = ctx.next_variable();
+        let c = view.cosine_at_least(a, b, 0.99);
+
+        let mut binding = Binding::default();
+        binding.set(a.index, &handles[0].raw);
+        let mut candidates = ProposalBuffer::new();
+        candidates.push(outside.raw);
+        c.confirm(b.index, &binding, &mut candidates.region(0));
+        assert_eq!(live(&candidates), [outside.raw]);
+    }
+
+    #[test]
+    fn pairwise_cosine_divides_by_norms_for_raw_embedding_blobs() {
+        let (flat, _hnsw, mut store, _handles) = sample_sim();
+        let a_handle = store.put::<Embedding, _>(vec![2.0f32, 0.0, 0.0]).unwrap();
+        let b_handle = store.put::<Embedding, _>(vec![3.0f32, 0.0, 0.0]).unwrap();
+        let reader = store.reader().unwrap();
+        let view = flat.attach(&reader);
+        let a = Variable::<Handle<Embedding>>::new(0);
+        let b = Variable::<Handle<Embedding>>::new(1);
+
+        let mut binding = Binding::default();
+        binding.set(a.index, &a_handle.raw);
+        let mut candidates = ProposalBuffer::new();
+        candidates.push(b_handle.raw);
+        view.cosine_at_least(a, b, 1.01)
+            .confirm(b.index, &binding, &mut candidates.region(0));
+        assert_eq!(
+            candidates.count_live(0),
+            0,
+            "parallel vectors have cosine one, not dot six"
+        );
+    }
+
+    #[test]
+    fn cosine_estimate_saturates_even_when_the_peer_is_bound() {
+        let (flat, _hnsw, mut store, handles) = sample_sim();
+        let reader = store.reader().unwrap();
+        let view = flat.attach(&reader);
+
+        let mut ctx = triblespace_core::query::VariableContext::new();
+        let a: Variable<Handle<Embedding>> = ctx.next_variable();
+        let b: Variable<Handle<Embedding>> = ctx.next_variable();
+        let unrelated: Variable<GenId> = ctx.next_variable();
+        let c = view.cosine_at_least(a, b, 0.8);
+
+        let empty = Binding::default();
+        assert_eq!(c.estimate(a.index, &empty), Some(usize::MAX));
+        assert_eq!(c.estimate(b.index, &empty), Some(usize::MAX));
+
+        let mut bound = Binding::default();
+        bound.set(a.index, &handles[0].raw);
+        assert_eq!(c.estimate(b.index, &bound), Some(usize::MAX));
+        assert_eq!(c.estimate(unrelated.index, &empty), None);
+    }
+
+    #[test]
+    fn repeated_cosine_variable_is_checked_during_confirmation() {
+        let (flat, _hnsw, mut store, handles) = sample_sim();
+        let reader = store.reader().unwrap();
+        let view = flat.attach(&reader);
+        let x = Variable::<Handle<Embedding>>::new(0);
+
+        let mut accepted = ProposalBuffer::new();
+        accepted.push(handles[0].raw);
+        accepted.push(handles[1].raw);
+        view.cosine_at_least(x, x, 0.99)
+            .confirm(x.index, &Binding::default(), &mut accepted.region(0));
+        assert_eq!(accepted.count_live(0), 2);
+
+        let mut rejected = ProposalBuffer::new();
+        rejected.push(handles[0].raw);
+        view.cosine_at_least(x, x, 1.01)
+            .confirm(x.index, &Binding::default(), &mut rejected.region(0));
+        assert_eq!(rejected.count_live(0), 0);
+    }
+
+    /// End-to-end through the real engine: constant constraints source
+    /// both domains, exact cosine filters the pair.
+    #[test]
+    fn exact_cosine_filters_in_production_queries() {
+        let (flat, _hnsw, mut store, handles) = sample_sim();
+        let reader = store.reader().unwrap();
+        let view = flat.attach(&reader);
+        let a = Variable::<Handle<Embedding>>::new(0);
+        let b = Variable::<Handle<Embedding>>::new(1);
+
+        let good = triblespace_core::and!(
+            a.is(handles[0]),
+            b.is(handles[2]),
+            view.cosine_at_least(a, b, 0.8),
+        );
+        let rows: Vec<_> = Query::new(good, project_pair).collect();
+        assert_eq!(rows, [(handles[0].raw, handles[2].raw)]);
+
+        let bad = triblespace_core::and!(
+            a.is(handles[0]),
+            b.is(handles[1]),
+            view.cosine_at_least(a, b, 0.8),
+        );
+        assert!(Query::new(bad, project_pair).next().is_none());
+
+        let repeated = triblespace_core::and!(a.is(handles[0]), view.cosine_at_least(a, a, 1.01),);
+        assert!(Query::new(repeated, project_first).next().is_none());
+    }
+
+    // ── SimilarTo (unary frozen retrieval set) ─────────────────
+
+    #[test]
+    fn similar_to_collapses_duplicates_and_speaks_the_protocol() {
+        let neighbour = Variable::<Handle<Embedding>>::new(0);
         let candidates = vec![
             embedding_raw(3),
             embedding_raw(1),
@@ -1671,101 +1300,33 @@ mod tests {
             embedding_raw(2),
         ];
         let constraint = SimilarTo::from_candidates(neighbour, candidates.clone());
-        let mut direct = Vec::new();
-        let first = cached_candidate_page(
-            &candidates,
-            ResidualDeltaSourceCursor::Start,
-            1,
-            &mut direct,
-        );
-        assert_eq!(direct, candidates[..1]);
-        assert_eq!(first.examined, 1);
-        assert_eq!(first.next, Some(ResidualDeltaSourceCursor::Offset(1)));
 
-        direct.clear();
-        let rest = cached_candidate_page(
-            &candidates,
-            first.next.unwrap(),
-            candidates.len(),
-            &mut direct,
-        );
-        assert_eq!(direct, candidates[1..]);
-        assert_eq!(rest.examined, candidates.len() - 1);
-        assert_eq!(rest.next, None);
-
-        let parents: HashSet<Id> = [id(10), id(11)].into_iter().collect();
-        let parent_rows = [id_to_raw_value(id(10)), id_to_raw_value(id(11))];
-        let mut eager: Candidates = Vec::new();
-        constraint.propose(
-            neighbour.index,
-            &RowsView::new(&[parent.index], &parent_rows),
-            &mut CandidateSink::Tagged(&mut eager),
-        );
-        let eager_pairs: Vec<_> = eager
-            .iter()
-            .map(|&(row, value)| (parent_rows[row as usize], value))
-            .collect();
-        let expected_eager_pairs: Vec<_> = parent_rows
-            .iter()
-            .flat_map(|&parent_value| {
-                candidates
-                    .iter()
-                    .map(move |&candidate| (parent_value, candidate))
-            })
-            .collect();
-        assert_eq!(eager_pairs, expected_eager_pairs);
-        let mut expected_public_pairs = eager_pairs.clone();
-        expected_public_pairs.sort_unstable();
-        expected_public_pairs.dedup();
-
-        let make = || {
-            triblespace_core::and!(
-                SetConstraint::new(parent, &parents),
-                SimilarTo::from_candidates(neighbour, candidates.clone()),
-            )
-        };
-        let mut residual = Query::new(make(), project_pair)
-            .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1);
-        let mut full: Vec<_> = residual.by_ref().collect();
-        full.sort_unstable();
-        assert_eq!(full, expected_public_pairs);
-        for parent_value in parent_rows {
-            assert_eq!(
-                eager_pairs
-                    .iter()
-                    .filter(|(p, candidate)| { *p == parent_value && *candidate == candidates[1] })
-                    .count(),
-                2,
-                "the internal proposal bag retains both handle occurrences",
-            );
-            assert_eq!(
-                full.iter()
-                    .filter(|(p, candidate)| { *p == parent_value && *candidate == candidates[1] })
-                    .count(),
-                1,
-                "the public raw head collapses repeated handle occurrences",
-            );
-        }
         assert_eq!(
-            residual.stats().delta_source_direct_candidates,
-            parents.len() * candidates.len()
+            constraint.estimate(neighbour.index, &Binding::default()),
+            Some(3)
         );
-        assert_eq!(residual.stats().delta_source_roots, 0);
 
-        let mut first_only = Query::new(
-            SimilarTo::from_candidates(Variable::<Handle<Embedding>>::new(0), candidates.clone()),
-            project_first,
-        )
-        .solve_residual_state_lazy()
-        .cap(1)
-        .start_width(1);
-        assert_eq!(first_only.next(), Some(candidates[0]));
-        assert_eq!(first_only.stats().delta_source_pages, 1);
-        assert_eq!(first_only.stats().delta_source_candidates_examined, 1);
-        assert_eq!(first_only.stats().delta_source_direct_candidates, 1);
-        drop(first_only);
+        let mut props = ProposalBuffer::new();
+        constraint.propose(neighbour.index, &Binding::default(), &mut props);
+        assert_eq!(
+            &props[..],
+            [candidates[0], candidates[1], candidates[3]],
+            "first-occurrence order, duplicates collapsed",
+        );
+
+        let mut mixed = ProposalBuffer::new();
+        mixed.push(embedding_raw(1));
+        mixed.push(embedding_raw(9));
+        mixed.push(embedding_raw(2));
+        constraint.confirm(neighbour.index, &Binding::default(), &mut mixed.region(0));
+        assert_eq!(live(&mixed), [embedding_raw(1), embedding_raw(2)]);
+
+        let mut bound = Binding::default();
+        bound.set(neighbour.index, &embedding_raw(2));
+        assert!(constraint.satisfied(&bound));
+        bound.set(neighbour.index, &embedding_raw(9));
+        assert!(!constraint.satisfied(&bound));
+        assert!(constraint.satisfied(&Binding::default()));
     }
 
     #[test]
@@ -1791,18 +1352,17 @@ mod tests {
             (constraint, vec![handles[0].raw, handles[2].raw])
         };
 
-        let mut rows: Vec<_> = Query::new(constraint, project_first)
-            .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1)
-            .collect();
+        let mut rows: Vec<_> = Query::new(constraint, project_first).collect();
         rows.sort_unstable();
         expected.sort_unstable();
         assert_eq!(rows, expected);
     }
 
+    /// A BM25 bag and a SimilarTo bag over the same variable compose
+    /// through the engine's propose/confirm split in both estimate
+    /// orders: the tighter side proposes, the other confirms.
     #[test]
-    fn cached_search_programs_execute_as_production_source_and_confirmer() {
+    fn bm25_and_similar_to_intersect_in_both_orders() {
         let candidate = Variable::<Handle<Embedding>>::new(0);
         let source = vec![
             embedding_raw(3),
@@ -1813,301 +1373,24 @@ mod tests {
         let allowed = vec![embedding_raw(1), embedding_raw(2)];
         let expected = vec![embedding_raw(1), embedding_raw(2)];
 
-        // Both children can propose, so adaptive execution chooses SimilarTo's
-        // tighter two-row bag even though BM25 is listed first. BM25 confirms
-        // each bounded page. Width one forces every Offset continuation edge.
-        // Public query heads are sets. Exact source order and occurrence
-        // multiplicity are asserted at the direct-source seams above; this
-        // end-to-end check uses the independently specified intersection.
-        let forward_bm25 = BM25Filter::<Handle<Embedding>>::from_entries(candidate, source.clone());
-        let forward_similar = SimilarTo::from_candidates(candidate, allowed.clone());
-        assert!(forward_bm25
-            .route(ProgramRequest {
-                action: ProgramAction::Propose(candidate.index),
-                bound: VariableSet::new_empty(),
-            })
-            .is_some());
-        assert!(forward_similar
-            .route(ProgramRequest {
-                action: ProgramAction::Confirm(candidate.index),
-                bound: VariableSet::new_empty(),
-            })
-            .is_some());
-        let forward_root = triblespace_core::and!(forward_bm25, forward_similar);
-        let mut forward = Query::new(forward_root, project_first)
-            .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1)
-            .growth(1);
-        let first = forward
-            .next()
-            .expect("production residual cached source was empty");
-        let mirror = forward.clone();
-        let remainder: Vec<_> = forward.collect();
-        assert_eq!(mirror.collect::<Vec<_>>(), remainder);
-        let mut forward_results = std::iter::once(first).chain(remainder).collect::<Vec<_>>();
-        forward_results.sort_unstable();
-        assert_eq!(forward_results, expected);
-
-        // Reversing the child types makes BM25's shorter bag own proposal
-        // paging while SimilarTo exercises the same pointwise confirmation.
-        let reverse_similar = SimilarTo::from_candidates(candidate, source);
-        let reverse_bm25 = BM25Filter::<Handle<Embedding>>::from_entries(candidate, allowed);
-        assert!(reverse_similar
-            .route(ProgramRequest {
-                action: ProgramAction::Propose(candidate.index),
-                bound: VariableSet::new_empty(),
-            })
-            .is_some());
-        assert!(reverse_bm25
-            .route(ProgramRequest {
-                action: ProgramAction::Confirm(candidate.index),
-                bound: VariableSet::new_empty(),
-            })
-            .is_some());
-        let reverse_root = triblespace_core::and!(reverse_similar, reverse_bm25);
-        let mut reverse: Vec<_> = Query::new(reverse_root, project_first)
-            .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1)
-            .growth(1)
-            .collect();
-        reverse.sort_unstable();
-        assert_eq!(reverse, expected);
-    }
-
-    #[test]
-    fn flat_cosine_filters_candidates_exactly_in_both_binding_orders() {
-        let (flat, _hnsw, mut store, handles) = sample_sim();
-        let reader = store.reader().unwrap();
-        let view = flat.attach(&reader);
-
-        let mut ctx = triblespace_core::query::VariableContext::new();
-        let a: Variable<Handle<Embedding>> = ctx.next_variable();
-        let b: Variable<Handle<Embedding>> = ctx.next_variable();
-        let c = view.cosine_at_least(a, b, 0.8);
-
-        let mut no_domain: Candidates = Vec::new();
-        c.propose(
-            b.index,
-            &RowsView::new(&[a.index], &[handles[0].raw]),
-            &mut CandidateSink::Tagged(&mut no_domain),
+        // SimilarTo's two-value set is tighter, so it proposes and
+        // BM25 confirms.
+        let forward = triblespace_core::and!(
+            BM25Filter::<Handle<Embedding>>::from_entries(candidate, source.clone()),
+            SimilarTo::from_candidates(candidate, allowed.clone()),
         );
-        assert!(
-            no_domain.is_empty(),
-            "exact cosine must never source an ANN domain"
+        let mut forward_rows: Vec<_> = Query::new(forward, project_first).collect();
+        forward_rows.sort_unstable();
+        assert_eq!(forward_rows, expected);
+
+        // Reversing the child types makes BM25's shorter set own the
+        // proposal while SimilarTo exercises pointwise confirmation.
+        let reverse = triblespace_core::and!(
+            SimilarTo::from_candidates(candidate, source),
+            BM25Filter::<Handle<Embedding>>::from_entries(candidate, allowed),
         );
-
-        let mut bind_b: Candidates = handles.iter().map(|handle| (0, handle.raw)).collect();
-        c.confirm(
-            b.index,
-            &RowsView::new(&[a.index], &[handles[0].raw]),
-            &mut CandidateSink::Tagged(&mut bind_b),
-        );
-        assert_eq!(
-            bind_b.iter().map(|&(_, value)| value).collect::<Vec<_>>(),
-            [handles[0].raw, handles[2].raw],
-        );
-
-        let mut bind_a: Candidates = handles.iter().map(|handle| (0, handle.raw)).collect();
-        c.confirm(
-            a.index,
-            &RowsView::new(&[b.index], &[handles[2].raw]),
-            &mut CandidateSink::Tagged(&mut bind_a),
-        );
-        assert_eq!(
-            bind_a.iter().map(|&(_, value)| value).collect::<Vec<_>>(),
-            [handles[0].raw, handles[2].raw],
-        );
-    }
-
-    #[test]
-    fn flat_cosine_satisfied_checks_the_same_exact_predicate() {
-        let (flat, _hnsw, mut store, handles) = sample_sim();
-        let reader = store.reader().unwrap();
-        let view = flat.attach(&reader);
-
-        let mut ctx = triblespace_core::query::VariableContext::new();
-        let a: Variable<Handle<Embedding>> = ctx.next_variable();
-        let b: Variable<Handle<Embedding>> = ctx.next_variable();
-        let c = view.cosine_at_least(a, b, 0.8);
-
-        let vars = [a.index, b.index];
-        let good = [handles[0].raw, handles[2].raw];
-        assert!(c.satisfied(&RowsView::new(&vars, &good)));
-
-        let bad = [handles[0].raw, handles[1].raw];
-        assert!(!c.satisfied(&RowsView::new(&vars, &bad)));
-    }
-
-    #[test]
-    fn hnsw_cosine_accepts_an_exact_match_outside_the_ann_index() {
-        let (_flat, hnsw, mut store, handles) = sample_sim();
-        let outside =
-            crate::schemas::put_embedding::<_>(&mut store, vec![0.999, 0.001, 0.0]).unwrap();
-        let reader = store.reader().unwrap();
-        let view = hnsw.attach(&reader);
-
-        let mut ctx = triblespace_core::query::VariableContext::new();
-        let a: Variable<Handle<Embedding>> = ctx.next_variable();
-        let b: Variable<Handle<Embedding>> = ctx.next_variable();
-        let c = view.cosine_at_least(a, b, 0.99);
-
-        let mut candidates: Candidates = vec![(0, outside.raw)];
-        c.confirm(
-            b.index,
-            &RowsView::new(&[a.index], &[handles[0].raw]),
-            &mut CandidateSink::Tagged(&mut candidates),
-        );
-        assert_eq!(candidates, [(0, outside.raw)]);
-    }
-
-    #[test]
-    fn pairwise_cosine_divides_by_norms_for_raw_embedding_blobs() {
-        let (flat, _hnsw, mut store, _handles) = sample_sim();
-        let a_handle = store.put::<Embedding, _>(vec![2.0f32, 0.0, 0.0]).unwrap();
-        let b_handle = store.put::<Embedding, _>(vec![3.0f32, 0.0, 0.0]).unwrap();
-        let reader = store.reader().unwrap();
-        let view = flat.attach(&reader);
-        let a = Variable::<Handle<Embedding>>::new(0);
-        let b = Variable::<Handle<Embedding>>::new(1);
-
-        let mut candidates: Candidates = vec![(0, b_handle.raw)];
-        view.cosine_at_least(a, b, 1.01).confirm(
-            b.index,
-            &RowsView::new(&[a.index], &[a_handle.raw]),
-            &mut CandidateSink::Tagged(&mut candidates),
-        );
-        assert!(
-            candidates.is_empty(),
-            "parallel vectors have cosine one, not dot six"
-        );
-    }
-
-    #[test]
-    fn cosine_estimate_saturates_even_when_the_peer_is_bound() {
-        let (flat, _hnsw, mut store, handles) = sample_sim();
-        let reader = store.reader().unwrap();
-        let view = flat.attach(&reader);
-
-        let mut ctx = triblespace_core::query::VariableContext::new();
-        let a: Variable<Handle<Embedding>> = ctx.next_variable();
-        let b: Variable<Handle<Embedding>> = ctx.next_variable();
-        let unrelated: Variable<GenId> = ctx.next_variable();
-        let c = view.cosine_at_least(a, b, 0.8);
-
-        assert_eq!(est(&c, a.index, &RowsView::EMPTY), Some(usize::MAX));
-        assert_eq!(est(&c, b.index, &RowsView::EMPTY), Some(usize::MAX));
-        assert_eq!(
-            est(&c, b.index, &RowsView::new(&[a.index], &[handles[0].raw]),),
-            Some(usize::MAX),
-        );
-        assert_eq!(est(&c, unrelated.index, &RowsView::EMPTY), None);
-    }
-
-    #[test]
-    fn repeated_cosine_variable_is_checked_during_confirmation() {
-        let (flat, _hnsw, mut store, handles) = sample_sim();
-        let reader = store.reader().unwrap();
-        let view = flat.attach(&reader);
-        let x = Variable::<Handle<Embedding>>::new(0);
-
-        let mut accepted: Candidates = vec![(0, handles[0].raw), (0, handles[1].raw)];
-        view.cosine_at_least(x, x, 0.99).confirm(
-            x.index,
-            &RowsView::EMPTY,
-            &mut CandidateSink::Tagged(&mut accepted),
-        );
-        assert_eq!(accepted.len(), 2);
-
-        let mut rejected: Candidates = vec![(0, handles[0].raw)];
-        view.cosine_at_least(x, x, 1.01).confirm(
-            x.index,
-            &RowsView::EMPTY,
-            &mut CandidateSink::Tagged(&mut rejected),
-        );
-        assert!(rejected.is_empty());
-    }
-
-    #[test]
-    fn exact_cosine_filters_in_production_without_a_proposal_route() {
-        let (flat, _hnsw, mut store, handles) = sample_sim();
-        let reader = store.reader().unwrap();
-        let view = flat.attach(&reader);
-        let a = Variable::<Handle<Embedding>>::new(0);
-        let b = Variable::<Handle<Embedding>>::new(1);
-
-        let exact = view.cosine_at_least(a, b, 0.8);
-        assert!(exact
-            .route(ProgramRequest {
-                action: ProgramAction::Propose(a.index),
-                bound: VariableSet::new_empty(),
-            })
-            .is_none());
-        assert!(exact
-            .route(ProgramRequest {
-                action: ProgramAction::Confirm(a.index),
-                bound: VariableSet::new_empty(),
-            })
-            .is_some());
-        let good = triblespace_core::and!(a.is(handles[0]), b.is(handles[2]), exact,);
-        let rows: Vec<_> = Query::new(good, project_pair)
-            .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1)
-            .growth(1)
-            .collect();
-        assert_eq!(rows, [(handles[0].raw, handles[2].raw)]);
-
-        let bad = triblespace_core::and!(
-            a.is(handles[0]),
-            b.is(handles[1]),
-            view.cosine_at_least(a, b, 0.8),
-        );
-        assert!(Query::new(bad, project_pair)
-            .solve_residual_state_lazy()
-            .next()
-            .is_none());
-
-        let repeated = triblespace_core::and!(a.is(handles[0]), view.cosine_at_least(a, a, 1.01),);
-        assert!(Query::new(repeated, project_first)
-            .solve_residual_state_lazy()
-            .next()
-            .is_none());
-    }
-
-    #[test]
-    fn semantic_receipts_distinguish_frozen_retrieval_from_dynamic_pair_filtering() {
-        let variable = Variable::<Handle<Embedding>>::new(0);
-        let bm25 = BM25Filter::from_entries(variable, Vec::<RawInline>::new());
-        assert_eq!(
-            bm25.proposal_coverage(variable.index, VariableSet::new_empty()),
-            ProposalCoverage::Exact
-        );
-
-        let similar = SimilarTo::from_candidates(variable, Vec::new());
-        assert_eq!(
-            similar.proposal_coverage(variable.index, VariableSet::new_empty()),
-            ProposalCoverage::Exact
-        );
-        let bound = VariableSet::new_singleton(variable.index);
-        assert_eq!(
-            similar.proposal_coverage(variable.index, bound),
-            ProposalCoverage::None
-        );
-        assert_eq!(
-            similar.proposal_coverage(variable.index + 1, VariableSet::new_empty()),
-            ProposalCoverage::None
-        );
-
-        let (flat, _hnsw, mut store, _handles) = sample_sim();
-        let reader = store.reader().unwrap();
-        let view = flat.attach(&reader);
-        let peer = Variable::<Handle<Embedding>>::new(1);
-        let cosine = view.cosine_at_least(variable, peer, 0.5);
-        assert_eq!(
-            cosine.proposal_coverage(variable.index, VariableSet::new_empty()),
-            ProposalCoverage::None
-        );
+        let mut reverse_rows: Vec<_> = Query::new(reverse, project_first).collect();
+        reverse_rows.sort_unstable();
+        assert_eq!(reverse_rows, expected);
     }
 }
