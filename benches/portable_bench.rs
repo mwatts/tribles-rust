@@ -80,6 +80,16 @@
 //! their own outcome, excluded from the verdict), 3 workload-identity
 //! violation, 4 no measure had signal. BUILD-FAIL is expressed by
 //! compilation, not at runtime.
+//!
+//! JUNE-PROTOCOL ADAPTATION (2026-07-27, engine/june-on-tip): this branch's
+//! engine has no `path!` / RegularPathConstraint (the June-protocol
+//! transplant carries the strict-union, bag-semantics query core without the
+//! regular-path layer). Every `path!`-based measure — q2 (wired + q2b/q2c
+//! candidates) and the F1/F2/F4 transitive-closure fixtures — therefore
+//! cannot be EXPRESSED here; each SKIPs with an explicit line in the output
+//! instead of vanishing silently. F3/F5 and the full q1/q3/q4/q5 matrix run
+//! unchanged. Timing methodology, warmups, floor-rejection, and gate logic
+//! are untouched. The pristine pre-adaptation harness is commit 0fff24d0.
 
 use std::time::Instant;
 
@@ -231,6 +241,10 @@ struct DblpAttrs {
     published_in_stream: Attribute<GenId>,
     published_as_part_of: Attribute<GenId>,
     related_stream: Attribute<GenId>,
+    // Only the removed path!-based q2c consumed sub_stream; kept (like the
+    // candidates and builders) so re-wiring on a path!-bearing engine is a
+    // small edit.
+    #[allow(dead_code)]
     sub_stream: Attribute<GenId>,
     created_by: Attribute<GenId>,
     number_of_creators: Attribute<I256BE>,
@@ -327,27 +341,10 @@ fn q1c_doomed<S: TriblePattern>(src: &S, qa: &DblpAttrs) -> usize {
     .count()
 }
 
-/// CANDIDATE q2b: all-pairs transitive closure (see table).
-#[allow(dead_code)]
-fn q2b_all_pairs(set: &TribleSet, qa: &DblpAttrs) -> usize {
-    let related_stream = qa.related_stream.clone();
-    find!((s: Id, o: Id), path!(set.clone(), s related_stream+ o)).count()
-}
-
-/// CANDIDATE q2c: pattern! join feeding a path! closure (see table).
-#[allow(dead_code)]
-fn q2c_join_plus(set: &TribleSet, qa: &DblpAttrs) -> usize {
-    let sub_stream = qa.sub_stream.clone();
-    let related_stream = qa.related_stream.clone();
-    find!(
-        (s: Id, m: Id, o: Id),
-        and!(
-            pattern!(set, [{ ?s @ sub_stream: ?m }]),
-            path!(set.clone(), m related_stream+ o)
-        )
-    )
-    .count()
-}
+// CANDIDATE q2b (all-pairs closure) and q2c (join feeding a closure) are
+// REMOVED on this branch: both are `path!`-based and the June-protocol
+// engine has no `path!`/RegularPathConstraint to compile them against. See
+// the adaptation note in the module docs; the originals live at 0fff24d0.
 
 /// CANDIDATE q3b: union constrained by a GenId join (see table).
 #[allow(dead_code)]
@@ -463,7 +460,12 @@ fn measure_queries<S: TriblePattern>(
         // createdBy — exercises branch pruning under a join rather than
         // pure union enumeration. KNOWN: `or!` trips the unionconstraint
         // variable-set assert at pre-2026-07-11 commits — the guard turns
-        // that into a PANIC outcome instead of a dead bench.
+        // that into a PANIC outcome instead of a dead bench. On THIS branch
+        // the strict union asserts at CONSTRUCTION (each pattern! literal
+        // allocates its own hidden pinned variable, so the two arms declare
+        // different VariableSets); construction happens inside
+        // `q3b_union_join`, i.e. inside this guarded closure's quiet_catch,
+        // so it records as PANIC — verified 2026-07-27, no movement needed.
         if let Some(n) = timed_guarded(&mut panicked[1], &mut samples[1], recording, || {
             q3b_union_join(src, qa)
         }) {
@@ -531,49 +533,10 @@ fn measure_queries<S: TriblePattern>(
     (keyed, final_counts)
 }
 
-/// q2 — fixed-subject transitive closure via path!. TribleSet-only:
-/// RegularPathConstraint has no archive execution path, so this measure has
-/// exactly one arm (`q2_set`). Guarded like every other query measure.
-fn measure_path_query(
-    set: &TribleSet,
-    root: Id,
-    qa: &DblpAttrs,
-    iters: usize,
-    warmup: usize,
-) -> (Outcome, usize) {
-    let related_stream = qa.related_stream.clone();
-    let rooti: Inline<GenId> = root.to_inline();
-    let mut samples = Vec::new();
-    let mut panicked: Option<String> = None;
-    let mut ident: Option<usize> = None;
-    for i in 0..(warmup + iters) {
-        let recording = i >= warmup;
-        let Some(n) = timed_guarded(&mut panicked, &mut samples, recording, || {
-            find!(
-                (o: Id),
-                temp!(
-                    (s),
-                    and!(s.is(rooti), path!(set.clone(), s related_stream+ o))
-                )
-            )
-            .count()
-        }) else {
-            break; // panicked — deterministic, nothing left to sample here
-        };
-        match ident {
-            None => ident = Some(n),
-            Some(expected) if expected != n => {
-                println!("WORKLOAD IDENTITY VIOLATION (q2_set): iter {i} saw {n}, expected {expected}");
-                std::process::exit(3);
-            }
-            _ => {}
-        }
-    }
-    match panicked {
-        Some(msg) => (Outcome::Panic(msg), PANIC_COUNT),
-        None => (Outcome::Samples(samples), ident.unwrap_or(0)),
-    }
-}
+// The wired q2 (`measure_path_query`, fixed-subject transitive closure via
+// path!) is REMOVED on this branch — no `path!`/RegularPathConstraint on the
+// June-protocol engine. Its call site SKIPs explicitly and q2 keeps the
+// "never ran" sentinel in the identity line. Original at 0fff24d0.
 
 // ---------------------------------------------------------------------------
 // VENDORED: Harkonnen R1 adversarial pacing fixtures (data-generation half of
@@ -583,6 +546,9 @@ fn measure_path_query(
 // `trible genid` on 2026-07-19 — never invented.
 // ---------------------------------------------------------------------------
 mod r1_schema {
+    // mp/msrc/khop keep their minted ids although the path!-based fixtures
+    // that consume them (F1/F2/F4) are SKIPped on this branch.
+    #![allow(dead_code)]
     use triblespace_core::prelude::*;
 
     attributes! {
@@ -648,6 +614,9 @@ impl Ids {
 
 /// F1/F2 — metronome chain and ring: v0 -mp-> v1 -mp-> ...; ring closes the
 /// loop; `sources` start nodes carry `msrc` for the K>1 eager-cohort control.
+/// Unused on this branch (F1/F2 are path!-based, SKIPped) — kept, like the
+/// query candidates, so re-wiring on a path!-bearing engine is a small edit.
+#[allow(dead_code)]
 fn build_chain(n: usize, ring: bool, sources: usize) -> (TribleSet, Id) {
     let mut ids = Ids::new();
     let mut set = TribleSet::new();
@@ -696,6 +665,8 @@ fn build_oasis(k: usize, fan: usize, deaths: usize) -> (TribleSet, Id) {
 /// F4 — thin functional k-hop chain from a constant: c0 -khop-> x1 ... -> xk.
 /// The fusion-or-nothing fixture: nothing accumulates on a functional chain,
 /// so per-row pipeline overhead is measured undiluted.
+/// Unused on this branch (F4 is path!-based, SKIPped) — kept for re-wiring.
+#[allow(dead_code)]
 fn build_khop(k: usize) -> (TribleSet, Id) {
     let mut ids = Ids::new();
     let mut set = TribleSet::new();
@@ -1177,10 +1148,12 @@ fn main() {
     // Identity-tuple state (PANIC sentinels when a phase never produced it).
     let mut tribles = PANIC_COUNT;
     let mut set_counts = [PANIC_COUNT; 4];
-    let mut q2_count = PANIC_COUNT;
+    // Never assigned on this branch: q2 cannot run (no path!), so the
+    // "never ran" sentinel is q2's permanent identity value here.
+    let q2_count = PANIC_COUNT;
     let mut arch_state = "skip";
 
-    if let Some((set, q2_root)) = dataset {
+    if let Some((set, _q2_root)) = dataset {
         tribles = set.len();
 
         // -- BUILD-RAM -----------------------------------------------------
@@ -1224,9 +1197,13 @@ fn main() {
             measure_queries(&set, "set", &qa, cfg.range_min, cfg.iters, cfg.warmup);
         set_counts = counts;
         all.extend(set_outcomes);
-        let (q2_outcome, q2c) = measure_path_query(&set, q2_root, &qa, cfg.iters, cfg.warmup);
-        q2_count = q2c;
-        all.push(("q2_set".to_owned(), q2_outcome));
+        // q2 is path!-based and cannot be expressed on the June-protocol
+        // engine — explicit SKIP; q2 keeps the "never ran" sentinel in the
+        // identity line. See the adaptation note in the module docs.
+        println!(
+            "  {:<14} SKIP (no path!/RegularPathConstraint on the June-protocol engine)",
+            "q2_set"
+        );
 
         if let Some(arch) = &arch {
             let (outcomes, counts) =
@@ -1285,14 +1262,12 @@ fn main() {
     }
 
     // -- Harkonnen F1..F5 --------------------------------------------------
-    let (chain, c0) = build_chain(cfg.chain_n, false, 1);
-    let (ring, r0) = build_chain(cfg.ring_n, true, 4);
+    // F1 (chain), F2 (ring), and F4 (k-hop) are path!-based transitive-
+    // closure fixtures; without path! on the June-protocol engine they
+    // cannot be expressed, so their slots SKIP explicitly below and their
+    // sets are never built. F3/F5 are pattern!-join fixtures — unchanged.
     let (oasis, _o0) = build_oasis(cfg.oasis_k, cfg.oasis_fan, 20);
-    let (khop, k0) = build_khop(cfg.khop_k);
     let diamond = build_diamond(cfg.diamond_n);
-    let c0i: Inline<GenId> = c0.to_inline();
-    let r0i: Inline<GenId> = r0.to_inline();
-    let k0i: Inline<GenId> = k0.to_inline();
 
     let mut f_samples: Vec<Vec<f64>> = vec![Vec::new(); 10];
     let mut f_panicked: [Option<String>; 10] = Default::default();
@@ -1301,41 +1276,8 @@ fn main() {
         let recording = i >= cfg.warmup;
         let mut counts = [PANIC_COUNT; 5];
 
-        // F1 metronome chain: transitive path, TTFR + full drain.
-        timed_guarded(&mut f_panicked[0], &mut f_samples[0], recording, || {
-            find!(
-                (x: Inline<GenId>),
-                temp!((s), and!(s.is(c0i), path!(chain.clone(), s r1_schema::mp+ x)))
-            )
-            .next()
-        });
-        if let Some(n) = timed_guarded(&mut f_panicked[1], &mut f_samples[1], recording, || {
-            find!(
-                (x: Inline<GenId>),
-                temp!((s), and!(s.is(c0i), path!(chain.clone(), s r1_schema::mp+ x)))
-            )
-            .count()
-        }) {
-            counts[0] = n;
-        }
-
-        // F2 ring: novelty-saturated fixpoint.
-        timed_guarded(&mut f_panicked[2], &mut f_samples[2], recording, || {
-            find!(
-                (x: Inline<GenId>),
-                temp!((s), and!(s.is(r0i), path!(ring.clone(), s r1_schema::mp+ x)))
-            )
-            .next()
-        });
-        if let Some(n) = timed_guarded(&mut f_panicked[3], &mut f_samples[3], recording, || {
-            find!(
-                (x: Inline<GenId>),
-                temp!((s), and!(s.is(r0i), path!(ring.clone(), s r1_schema::mp+ x)))
-            )
-            .count()
-        }) {
-            counts[1] = n;
-        }
+        // F1 metronome chain / F2 ring: path!-based — SKIPped on this
+        // branch (slots 0..=3 stay empty; see the emission loop below).
 
         // F3 oasis-last: 3-way join, adversarial exploration order.
         timed_guarded(&mut f_panicked[4], &mut f_samples[4], recording, || {
@@ -1363,23 +1305,8 @@ fn main() {
             counts[2] = n;
         }
 
-        // F4 thin k-hop functional chain (fusion-or-nothing).
-        timed_guarded(&mut f_panicked[6], &mut f_samples[6], recording, || {
-            find!(
-                (x: Inline<GenId>),
-                temp!((s), and!(s.is(k0i), path!(khop.clone(), s r1_schema::khop+ x)))
-            )
-            .next()
-        });
-        if let Some(n) = timed_guarded(&mut f_panicked[7], &mut f_samples[7], recording, || {
-            find!(
-                (x: Inline<GenId>),
-                temp!((s), and!(s.is(k0i), path!(khop.clone(), s r1_schema::khop+ x)))
-            )
-            .count()
-        }) {
-            counts[3] = n;
-        }
+        // F4 thin k-hop functional chain: path!-based — SKIPped on this
+        // branch (slots 6..=7 stay empty; see the emission loop below).
 
         // F5 two-route diamond (reconvergence capture).
         timed_guarded(&mut f_panicked[8], &mut f_samples[8], recording, || {
@@ -1426,13 +1353,25 @@ fn main() {
         "F1-ttfr", "F1-total", "F2-ttfr", "F2-total", "F3-ttfr", "F3-total", "F4-ttfr",
         "F4-total", "F5-ttfr", "F5-total",
     ];
+    // F1/F2/F4 (slots 0..=3 and 6..=7) never run on this branch — their
+    // measures are path!-based. They SKIP explicitly and keep the "never
+    // ran" sentinel in the identity tuple instead of masquerading as 0-row
+    // measures (their `f_ident` entries stay `None`, so the sentinel falls
+    // out of the same `Some`-gated assignment that serves ran-measures).
+    let f_skipped = [true, true, true, true, false, false, true, true, false, false];
     let mut f_final = [PANIC_COUNT; 5];
     for (k, v) in f_ident.iter().enumerate() {
-        if f_panicked[2 * k + 1].is_none() {
-            f_final[k] = v.unwrap_or(0);
+        if let (Some(n), None) = (v, &f_panicked[2 * k + 1]) {
+            f_final[k] = *n;
         }
     }
-    for ((key, samples), p) in f_keys.iter().zip(f_samples).zip(f_panicked) {
+    for (k, ((key, samples), p)) in f_keys.iter().zip(f_samples).zip(f_panicked).enumerate() {
+        if f_skipped[k] {
+            println!(
+                "  {key:<14} SKIP (no path!/RegularPathConstraint on the June-protocol engine)"
+            );
+            continue;
+        }
         let outcome = match p {
             Some(msg) => Outcome::Panic(msg),
             None => Outcome::Samples(samples),
