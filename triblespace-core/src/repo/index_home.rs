@@ -624,6 +624,11 @@ pub enum IndexError {
     Range(ArtifactError),
     /// The mutable branch pin advanced concurrently.
     Conflict,
+    /// A present branch-metadata blob did not describe exactly one matching
+    /// branch entity with at most one source head.
+    InvalidSourceBranchMetadata,
+    /// The manifest does not certify the source head read with it.
+    StaleCoverage(CoverageMismatch),
 }
 
 impl fmt::Display for IndexError {
@@ -635,6 +640,11 @@ impl fmt::Display for IndexError {
             Self::Merge(error) => write!(f, "index merge error: {error}"),
             Self::Range(error) => write!(f, "index range error: {error}"),
             Self::Conflict => write!(f, "index-home manifest pin advanced concurrently"),
+            Self::InvalidSourceBranchMetadata => write!(
+                f,
+                "index-home pin does not contain one valid source branch entity"
+            ),
+            Self::StaleCoverage(error) => error.fmt(f),
         }
     }
 }
@@ -647,8 +657,42 @@ impl Error for IndexError {
             | Self::Merge(error)
             | Self::Range(error) => Some(error.as_ref()),
             Self::Manifest(error) => Some(error),
-            Self::Conflict => None,
+            Self::StaleCoverage(error) => Some(error),
+            Self::Conflict | Self::InvalidSourceBranchMetadata => None,
         }
+    }
+}
+
+/// One branch-metadata read and the typed manifest parsed from those exact
+/// bytes.
+///
+/// Keeping the metadata pin, source commit head, and manifest together lets a
+/// consumer freshness-check an attached index without a second branch lookup.
+pub struct IndexSnapshot<K: IndexKind> {
+    metadata_head: Option<Inline<Handle<SimpleArchive>>>,
+    source_head: Option<CommitHandle>,
+    manifest: Manifest<K>,
+}
+
+impl<K: IndexKind> IndexSnapshot<K> {
+    /// Pin value naming the branch-metadata blob read for this snapshot.
+    pub fn metadata_head(&self) -> Option<Inline<Handle<SimpleArchive>>> {
+        self.metadata_head
+    }
+
+    /// Source commit head named by the same branch-metadata blob.
+    pub fn source_head(&self) -> Option<CommitHandle> {
+        self.source_head
+    }
+
+    /// Typed manifest parsed from the same branch-metadata blob.
+    pub fn manifest(&self) -> &Manifest<K> {
+        &self.manifest
+    }
+
+    /// Consume the snapshot and return its typed manifest.
+    pub fn into_manifest(self) -> Manifest<K> {
+        self.manifest
     }
 }
 
@@ -925,20 +969,51 @@ where
         }
     }
 
-    fn head_set(&mut self) -> Result<TribleSet, IndexError> {
-        let head = self.storage.head(self.branch).map_err(storage_error)?;
-        let Some(head) = head else {
-            return Ok(TribleSet::new());
-        };
+    /// Read one branch-metadata pin and parse its source head and typed
+    /// manifest from those exact bytes.
+    pub fn read_snapshot(&mut self) -> Result<IndexSnapshot<K>, IndexError> {
+        let metadata_head = self.storage.head(self.branch).map_err(storage_error)?;
         let reader = self.storage.reader().map_err(storage_error)?;
-        reader.get(head).map_err(storage_error)
+        let set = match metadata_head {
+            Some(head) => reader.get(head).map_err(storage_error)?,
+            None => TribleSet::new(),
+        };
+        let branch_entities: Vec<Id> = find!(
+            branch_meta: Id,
+            pattern!(&set, [{ ?branch_meta @ crate::repo::branch: self.branch }])
+        )
+        .collect();
+        let branch_meta = match (metadata_head, branch_entities.as_slice()) {
+            (None, []) => None,
+            (Some(_), [branch_meta]) => Some(*branch_meta),
+            _ => return Err(IndexError::InvalidSourceBranchMetadata),
+        };
+        let source_heads: Vec<CommitHandle> = if let Some(branch_meta) = branch_meta {
+            find!(
+                source_head: CommitHandle,
+                pattern!(&set, [{ branch_meta @ crate::repo::head: ?source_head }])
+            )
+            .collect()
+        } else {
+            Vec::new()
+        };
+        let source_head = match source_heads.as_slice() {
+            [] => None,
+            [head] => Some(*head),
+            _ => return Err(IndexError::InvalidSourceBranchMetadata),
+        };
+        let manifest =
+            Manifest::from_tribles(&set, &reader, &self.kind).map_err(IndexError::Manifest)?;
+        Ok(IndexSnapshot {
+            metadata_head,
+            source_head,
+            manifest,
+        })
     }
 
     /// Parse the current typed manifest.
     pub fn read_manifest(&mut self) -> Result<Manifest<K>, IndexError> {
-        let set = self.head_set()?;
-        let reader = self.storage.reader().map_err(storage_error)?;
-        Manifest::from_tribles(&set, &reader, &self.kind).map_err(IndexError::Manifest)
+        Ok(self.read_snapshot()?.into_manifest())
     }
 
     /// Attach every physical artifact in one already-read manifest snapshot.

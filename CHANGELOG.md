@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`triblespace-paths` provides exact regular-path indexes outside the core
+  query solver.** Fixed epsilon-free automata lower graph edges into unionable
+  direct-product summaries. A single SCC/bitset kernel materializes canonical
+  forward and reverse endpoint relations, including exact cross-segment paths,
+  and exposes them through the ordinary two-variable constraint protocol.
+- **Regular-path summaries persist as typed range-native artifacts.**
+  `PathRollup` stores canonical automaton-fingerprinted direct-product summaries
+  in `IndexHome`, compacts them by set union, and globally closes the certified
+  live cover on attachment. A same-metadata `IndexSnapshot` pins the branch
+  metadata, source commit head, and manifest together so stale coverage fails
+  closed; full cover audits remain explicit repair/verification operations.
+
 ### Changed
 
 - **Breaking: the query engine is the propose/confirm engine.** The residual /
