@@ -608,6 +608,11 @@ where
     /// Walks the index once at construction and caches the
     /// result — subsequent engine `propose` / `confirm` calls
     /// iterate the cached list.
+    ///
+    /// [`Self::candidates_above`] can repeat a handle (see its docs), so
+    /// the collapse inside
+    /// [`SimilarTo::from_candidates`][crate::constraint::SimilarTo::from_candidates]
+    /// is load-bearing on this path, not defensive.
     pub fn similar_to(
         &self,
         probe: Inline<EmbHandle>,
@@ -634,6 +639,17 @@ where
     /// Bound by the view's `ef_search` (default 200) — callers
     /// pushing lots of above-threshold results need a wider
     /// beam via [`with_ef_search`][Self::with_ef_search].
+    ///
+    /// **Not distinct.** The graph walk dedups by *node index*, then maps
+    /// node → handle through [`HNSWIndex::handles`], which stores one
+    /// entry per [`HNSWBuilder::insert`] call with no collapse. Handles
+    /// are content-addressed, so two entities embedding to the same vector
+    /// share one handle and both nodes surface it. Callers that need a set
+    /// must collapse — `SimilarTo::from_candidates` does,
+    /// [`nearest_across`][n] does, and `HnswRollup::build` dedups by
+    /// handle before it ever reaches a builder.
+    ///
+    /// [n]: crate::index_hnsw::nearest_across
     #[doc(hidden)]
     pub fn candidates_above(
         &self,
@@ -1033,6 +1049,11 @@ where
     /// index — walks all handles once at construction and stores the native
     /// result bag. See [`crate::constraint::SimilarTo`].
     ///
+    /// [`Self::candidates_above`] can repeat a handle (see its docs), so
+    /// the collapse inside
+    /// [`SimilarTo::from_candidates`][crate::constraint::SimilarTo::from_candidates]
+    /// is load-bearing on this path, not defensive.
+    ///
     /// [a]: crate::hnsw::AttachedHNSWIndex::similar_to
     pub fn similar_to(
         &self,
@@ -1054,6 +1075,12 @@ where
     /// applies: production callers go through the engine via
     /// [`Self::similar_to`] inside a
     /// `find!`; this leaf is for tests and benchmarks.
+    ///
+    /// **Not distinct.** This walks [`FlatIndex::handles`] positionally,
+    /// and [`FlatBuilder::insert`] pushes one entry per call with no
+    /// collapse — so a handle inserted twice is returned twice. Content
+    /// addressing makes that ordinary, not pathological: identical vectors
+    /// are one handle.
     ///
     /// [a]: crate::hnsw::AttachedHNSWIndex::candidates_above
     #[doc(hidden)]

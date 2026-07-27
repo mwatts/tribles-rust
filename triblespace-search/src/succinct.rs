@@ -1067,6 +1067,11 @@ where
     /// handle" case. Freezes one directional graph walk at construction
     /// rather than pretending it is an exact binary predicate; see
     /// [`crate::constraint::SimilarTo`].
+    ///
+    /// [`Self::candidates_above`] can repeat a handle (see its docs), so
+    /// the collapse inside
+    /// [`SimilarTo::from_candidates`][crate::constraint::SimilarTo::from_candidates]
+    /// is load-bearing on this path, not defensive.
     pub fn similar_to(
         &self,
         probe: Inline<EmbHandle>,
@@ -1090,6 +1095,12 @@ where
     /// Bound by the view's `ef_search` (default 200) — callers
     /// pushing lots of above-threshold results need a wider
     /// beam via [`with_ef_search`][Self::with_ef_search].
+    ///
+    /// **Not distinct**, for the same reason as the naive backend: the
+    /// walk dedups by node index, but the handle table it indexes into is
+    /// `from_naive`'s verbatim copy of the builder's per-insert handles —
+    /// unlike the BM25 side's doc-key universe, it is never sorted or
+    /// deduplicated. A handle inserted twice is returned twice.
     #[doc(hidden)]
     pub fn candidates_above(
         &self,
