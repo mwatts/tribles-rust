@@ -2834,7 +2834,12 @@ where
         a: impl Into<crate::query::Term<GenId>>,
         v: impl Into<crate::query::Term<V>>,
     ) -> Self::PatternConstraint<'a> {
-        SuccinctArchiveConstraint::new(e, a, v, self)
+        SuccinctArchiveConstraint::new(
+            e.into().expect_variable(),
+            a.into().expect_variable(),
+            v.into().expect_variable(),
+            self,
+        )
     }
 }
 

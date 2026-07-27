@@ -32,12 +32,8 @@ use crate::metadata;
 use crate::prelude::{attributes, entity, pattern};
 use crate::query::unionconstraint::UnionConstraint;
 use crate::query::{
-    ActionUnitClasses, CandidateSink, Constraint, DispatchClass, EstimateSink, ProgramAction,
-    ProgramCompleteBatch, ProgramCompleteWorkEvidence, ProgramCompleteWorkQuote, ProgramCompletion,
-    ProgramGrouping, ProgramKey, ProgramPacing, ProgramRef, ProgramRequest, ProgramRoute,
-    ProgramSeedBatch, ProgramStratum, ProposalCoverage, RawTerm, ResidualDeltaSourceCursor,
-    RowsView, Term, TriblePattern, TypedCompleteArbiter, TypedCompleteSink, TypedEffectSink,
-    TypedProgramBatch, TypedProgramSpec, TypedResume, TypedSeedSink, VariableId, VariableSet,
+    Binding, Constraint, Mask, ProposalBuffer, ProposeCursor, RawTerm, Term, TriblePattern,
+    VariableId, VariableSet,
 };
 use crate::repo::index_range::{
     convex_union, is_ancestor, validate_exact_frontier_cover, RangeRecord, RangeRecordError,
@@ -1307,22 +1303,6 @@ impl<U> UnionArchive<U> {
     }
 }
 
-#[doc(hidden)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum UnionArchiveProgramState {
-    Propose {
-        variable: VariableId,
-        shard_index: usize,
-        cursor: ResidualDeltaSourceCursor,
-    },
-    Support,
-}
-
-const UNION_ARCHIVE_PROPOSE_ROUTE: u32 = 1 << 8;
-const UNION_ARCHIVE_SUPPORT_ROUTE: u32 = 3 << 8;
-
-const UNION_ARCHIVE_PROPOSE_DISPATCH: DispatchClass = DispatchClass::new(0);
-const UNION_ARCHIVE_SUPPORT_DISPATCH: DispatchClass = DispatchClass::new(2);
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1448,480 +1428,12 @@ where
         }
     }
 
-    fn variable_position_mask(&self, variable: VariableId) -> u32 {
-        u32::from(self.terms[0].is_var(variable))
-            | (u32::from(self.terms[1].is_var(variable)) << 1)
-            | (u32::from(self.terms[2].is_var(variable)) << 2)
-    }
 
-    fn resolved_position_mask(&self, bound: VariableSet) -> u32 {
-        fn term_is_resolved(term: &RawTerm, bound: VariableSet) -> bool {
-            match term {
-                RawTerm::Var(variable) => bound.is_set(*variable),
-                RawTerm::Const(_) => true,
-            }
-        }
 
-        u32::from(term_is_resolved(&self.terms[0], bound))
-            | (u32::from(term_is_resolved(&self.terms[1], bound)) << 1)
-            | (u32::from(term_is_resolved(&self.terms[2], bound)) << 2)
-    }
 
-    fn support_variable(&self) -> Option<VariableId> {
-        self.terms.iter().find_map(|term| match term {
-            RawTerm::Var(variable) => Some(*variable),
-            RawTerm::Const(_) => None,
-        })
-    }
 
-    fn support_row(&self, view: &RowsView<'_>, row: &[RawInline]) -> bool {
-        self.shards.iter().any(|shard| shard.support_row(view, row))
-    }
-
-    /// Emit the exact complete proposal occurrence bag in the same
-    /// parent-major, shard-major, Ring order as the typed pageable route.
-    /// Cross-shard duplicates stay visible here; the complete-action adapter
-    /// owns the later parent-local SET admission.
-    fn for_each_complete_proposal_occurrence(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        mut emit: impl FnMut(u32, RawInline),
-    ) {
-        assert_eq!(
-            self.variable_position_mask(variable).count_ones(),
-            1,
-            "UnionArchive complete proposal target must occupy exactly one position"
-        );
-        assert!(
-            view.col(variable).is_none(),
-            "UnionArchive complete proposal target is already bound"
-        );
-
-        // Positions are a block-schema specialization, not row state. Build
-        // one small locator per shard so parent-major emission does not pay
-        // variable-to-column resolution for every parent × shard pair.
-        let locators: Vec<_> = self
-            .shards
-            .iter()
-            .map(|shard| {
-                shard
-                    .proposal_walk_locator_single_target(variable, view)
-                    .expect("one-target Succinct shard has no proposal locator")
-            })
-            .collect();
-
-        for parent_index in 0..view.len() {
-            let parent =
-                u32::try_from(parent_index).expect("too many UnionArchive complete-action parents");
-            let row = view.row(parent_index);
-            for locator in &locators {
-                let walk = locator.locate(row);
-                let mut emitted = 0usize;
-                let page = walk.consume(ResidualDeltaSourceCursor::Start, usize::MAX, |value| {
-                    emitted += 1;
-                    emit(parent, value);
-                });
-                assert_eq!(
-                    page.examined, emitted,
-                    "a complete Succinct walk did not emit every examined value"
-                );
-                assert!(
-                    page.next.is_none(),
-                    "an unbounded complete Succinct walk retained a continuation"
-                );
-            }
-        }
-    }
 }
 
-impl<U> TypedProgramSpec for UnionArchiveConstraint<'_, U>
-where
-    U: Universe,
-{
-    type State = UnionArchiveProgramState;
-    type NoveltyKey = ();
-    type Rank = [u64; 7];
-
-    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-        let resolved_positions = self.resolved_position_mask(request.bound);
-        let (key, variable) = match request.action {
-            ProgramAction::Propose(variable) => {
-                let target_positions = self.variable_position_mask(variable);
-                if request.bound.is_set(variable) || target_positions == 0 {
-                    return None;
-                }
-                if target_positions.count_ones() != 1 {
-                    return None;
-                }
-                debug_assert_eq!(resolved_positions & target_positions, 0);
-                (
-                    ProgramKey::new(
-                        UNION_ARCHIVE_PROPOSE_ROUTE | (target_positions << 3) | resolved_positions,
-                    ),
-                    variable,
-                )
-            }
-            ProgramAction::Confirm(_) => return None,
-            ProgramAction::Support => (
-                ProgramKey::new(UNION_ARCHIVE_SUPPORT_ROUTE | resolved_positions),
-                self.support_variable()?,
-            ),
-        };
-        Some(ProgramRoute {
-            key,
-            variable,
-            stratum: ProgramStratum::Finite,
-            grouping: ProgramGrouping::PageLocal,
-            completion: if matches!(request.action, ProgramAction::Propose(_)) {
-                ProgramCompletion::CompleteActionEquivalent
-            } else {
-                ProgramCompletion::PageableOnly
-            },
-        })
-    }
-
-    fn dispatch(&self, state: &Self::State) -> DispatchClass {
-        match state {
-            UnionArchiveProgramState::Propose { .. } => UNION_ARCHIVE_PROPOSE_DISPATCH,
-            UnionArchiveProgramState::Support => UNION_ARCHIVE_SUPPORT_DISPATCH,
-        }
-    }
-
-    fn pacing(&self, _state: &Self::State) -> ProgramPacing {
-        ProgramPacing::Search
-    }
-
-    /// Semantic fallback for wrappers that compose the public typed Program
-    /// hooks while inheriting the engine-owned bounded transaction.
-    #[cold]
-    #[inline(never)]
-    fn complete_typed(&self, batch: ProgramCompleteBatch<'_>, effects: &mut TypedCompleteSink) {
-        let ProgramAction::Propose(variable) = batch.request.action else {
-            panic!("UnionArchive complete actions support only proposals")
-        };
-        assert_eq!(variable, batch.route.variable);
-
-        // Ordinary `UnionConstraint::propose` would normalize overlapping
-        // shard values too early. Preserve the exact pageable raw bag; the
-        // complete-action adapter performs parent-local SET admission later.
-        self.for_each_complete_proposal_occurrence(variable, &batch.view, |parent, value| {
-            effects.push(parent, value)
-        });
-    }
-
-    /// Exact fallback quote paired with `complete_typed`. Direct UnionArchive
-    /// dispatch still uses `complete_bounded_typed` and retains located walks.
-    #[cold]
-    #[inline(never)]
-    fn quote_complete_typed(&self, batch: ProgramCompleteBatch<'_>) -> ProgramCompleteWorkEvidence {
-        let ProgramAction::Propose(variable) = batch.request.action else {
-            return ProgramCompleteWorkEvidence::Declined;
-        };
-        assert_eq!(variable, batch.route.variable);
-
-        let locators: Vec<_> = self
-            .shards
-            .iter()
-            .map(|shard| {
-                shard
-                    .proposal_walk_locator_single_target(variable, &batch.view)
-                    .expect("one-target Succinct shard has no proposal locator")
-            })
-            .collect();
-        let mut quotes = Vec::with_capacity(batch.view.len());
-        for row in batch.view.iter() {
-            let mut raw_occurrences = 0usize;
-            for locator in &locators {
-                let Some(total) = raw_occurrences.checked_add(locator.locate(row).exact_len())
-                else {
-                    return ProgramCompleteWorkEvidence::Declined;
-                };
-                raw_occurrences = total;
-            }
-            // One-target Succinct walks emit every examined Ring value, so
-            // drain and raw bag counts are equal, including overlaps.
-            quotes.push(ProgramCompleteWorkQuote {
-                drain_work_units: raw_occurrences,
-                raw_occurrences,
-            });
-        }
-        ProgramCompleteWorkEvidence::Quoted(quotes)
-    }
-
-    fn complete_bounded_typed(
-        &self,
-        batch: ProgramCompleteBatch<'_>,
-        arbiter: &mut TypedCompleteArbiter,
-    ) {
-        let ProgramAction::Propose(variable) = batch.request.action else {
-            panic!("UnionArchive complete actions support only proposals")
-        };
-        assert_eq!(variable, batch.route.variable);
-
-        let locators: Vec<_> = self
-            .shards
-            .iter()
-            .map(|shard| {
-                shard
-                    .proposal_walk_locator_single_target(variable, &batch.view)
-                    .expect("one-target Succinct shard has no proposal locator")
-            })
-            .collect();
-        assert!(
-            !locators.is_empty(),
-            "UnionArchive complete action requires at least one shard"
-        );
-        let shard_count = locators.len();
-        let mut retained_walks = Vec::new();
-        for parent in (0..batch.view.len()).rev() {
-            let retained_start = retained_walks.len();
-            let row = batch.view.row(parent);
-            let mut raw_occurrences = Some(0usize);
-            for locator in &locators {
-                #[cfg(test)]
-                record_union_complete_walk_located();
-                let walk = locator.locate(row);
-                let exact_len = walk.exact_len();
-                raw_occurrences = raw_occurrences.and_then(|total| total.checked_add(exact_len));
-                retained_walks.push(walk);
-            }
-            let admitted = if let Some(raw_occurrences) = raw_occurrences {
-                // One-target Succinct walks emit every examined Ring value,
-                // so drain and raw bag counts are equal, including overlaps.
-                arbiter.try_admit_tail_parent(
-                    parent,
-                    ProgramCompleteWorkQuote {
-                        drain_work_units: raw_occurrences,
-                        raw_occurrences,
-                    },
-                )
-            } else {
-                arbiter.reject_tail_parent(parent);
-                false
-            };
-            if !admitted {
-                retained_walks.truncate(retained_start);
-                break;
-            }
-        }
-
-        let Some(selection) = arbiter.seal_tail_admission() else {
-            return;
-        };
-        let retained_parent_count = batch.view.len() - selection.first_parent();
-        debug_assert_eq!(retained_walks.len(), retained_parent_count * shard_count);
-        let effects = arbiter.effects_mut();
-        for (parent, walks) in retained_walks.chunks_exact(shard_count).rev().enumerate() {
-            let parent =
-                u32::try_from(parent).expect("too many UnionArchive complete-action parents");
-            for walk in walks {
-                #[cfg(test)]
-                record_union_complete_walk_consumed();
-                let mut emitted = 0usize;
-                let page = walk.consume(ResidualDeltaSourceCursor::Start, usize::MAX, |value| {
-                    emitted += 1;
-                    effects.push(parent, value);
-                });
-                assert_eq!(
-                    page.examined, emitted,
-                    "a complete Succinct walk did not emit every examined value"
-                );
-                assert!(
-                    page.next.is_none(),
-                    "an unbounded complete Succinct walk retained a continuation"
-                );
-            }
-        }
-    }
-
-    fn progress(&self, state: &Self::State) -> Self::Rank {
-        fn complemented_value_words(value: &RawInline) -> [u64; 4] {
-            std::array::from_fn(|word| {
-                let begin = word * 8;
-                !u64::from_be_bytes(value[begin..begin + 8].try_into().unwrap())
-            })
-        }
-
-        let mut rank = [0u64; 7];
-        match state {
-            UnionArchiveProgramState::Support => rank[0] = 1,
-            UnionArchiveProgramState::Propose {
-                shard_index,
-                cursor,
-                ..
-            } => {
-                rank[0] = 3;
-                rank[1] = u64::try_from(
-                    self.shards
-                        .len()
-                        .checked_sub(*shard_index)
-                        .expect("typed UnionArchive proposal named a missing shard"),
-                )
-                .expect("UnionArchive shard count exceeds rank limb");
-                match cursor {
-                    ResidualDeltaSourceCursor::Start => rank[2] = u64::MAX,
-                    ResidualDeltaSourceCursor::After(value) => {
-                        rank[2] = u64::MAX - 1;
-                        rank[3..].copy_from_slice(&complemented_value_words(value));
-                    }
-                    ResidualDeltaSourceCursor::Offset(_) => {
-                        panic!("ordinal cursor crossed into a typed UnionArchive source")
-                    }
-                }
-            }
-        }
-        rank
-    }
-
-    fn seed_typed(
-        &self,
-        batch: ProgramSeedBatch<'_>,
-        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
-    ) {
-        assert_eq!(batch.route.stratum, ProgramStratum::Finite);
-        assert_eq!(batch.route.grouping, ProgramGrouping::PageLocal);
-        assert_eq!(
-            batch.route.completion,
-            if matches!(batch.request.action, ProgramAction::Propose(_)) {
-                ProgramCompletion::CompleteActionEquivalent
-            } else {
-                ProgramCompletion::PageableOnly
-            }
-        );
-        let state = match batch.request.action {
-            ProgramAction::Propose(variable) => {
-                assert_eq!(batch.route.variable, variable);
-                assert!(!batch.request.bound.is_set(variable));
-                assert_eq!(self.variable_position_mask(variable).count_ones(), 1);
-                UnionArchiveProgramState::Propose {
-                    variable,
-                    shard_index: 0,
-                    cursor: ResidualDeltaSourceCursor::Start,
-                }
-            }
-            ProgramAction::Confirm(_) => {
-                panic!("typed UnionArchive route admitted a confirmation action")
-            }
-            ProgramAction::Support => {
-                assert_eq!(Some(batch.route.variable), self.support_variable());
-                UnionArchiveProgramState::Support
-            }
-        };
-        for parent in 0..batch.view.len() {
-            effects.finite_root(
-                u32::try_from(parent).expect("too many typed UnionArchive parents"),
-                state.clone(),
-                None,
-            );
-        }
-    }
-
-    fn step_typed(
-        &self,
-        states: &mut Vec<Self::State>,
-        batch: TypedProgramBatch<'_>,
-        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
-    ) {
-        assert_eq!(batch.stratum, ProgramStratum::Finite);
-        assert_eq!(states.len(), batch.view.len());
-        assert_eq!(states.len(), batch.candidate_sets.len());
-        assert_eq!(states.len(), batch.limits.len());
-        let Some(first) = states.first() else {
-            return;
-        };
-        match first {
-            UnionArchiveProgramState::Propose { variable, .. } => {
-                let variable = *variable;
-                for (input, state) in states.drain(..).enumerate() {
-                    let UnionArchiveProgramState::Propose {
-                        variable: state_variable,
-                        mut shard_index,
-                        mut cursor,
-                    } = state
-                    else {
-                        panic!("one typed UnionArchive proposal cohort mixed action variants")
-                    };
-                    assert_eq!(state_variable, variable);
-                    assert!(
-                        batch.candidate_sets[input].is_none(),
-                        "typed UnionArchive proposal received a candidate group"
-                    );
-                    assert!(
-                        shard_index < self.shards.len(),
-                        "typed UnionArchive proposal resumed after its final shard"
-                    );
-                    let view = batch.view.row_view(input);
-                    let limit = batch.limits[input];
-                    let mut direct = Vec::new();
-                    let mut examined = 0usize;
-                    while examined < limit && shard_index < self.shards.len() {
-                        let accepted_base = direct.len();
-                        let page = self.shards[shard_index].proposal_source_page_single(
-                            variable,
-                            &view,
-                            cursor,
-                            limit - examined,
-                            &mut direct,
-                        );
-                        assert_eq!(
-                            direct.len() - accepted_base,
-                            page.examined,
-                            "a one-target Succinct shard did not emit every examined value"
-                        );
-                        assert!(
-                            page.next.is_none() || page.examined > 0,
-                            "typed Succinct shard resumed without examining its source"
-                        );
-                        examined = examined
-                            .checked_add(page.examined)
-                            .expect("typed UnionArchive source work overflow");
-                        if let Some(next) = page.next {
-                            cursor = next;
-                        } else {
-                            shard_index += 1;
-                            cursor = ResidualDeltaSourceCursor::Start;
-                        }
-                    }
-                    let input = u32::try_from(input)
-                        .expect("too many typed UnionArchive inputs in one cohort");
-                    for value in direct {
-                        effects.direct(input, value);
-                    }
-                    let resume = (shard_index < self.shards.len()).then_some(
-                        UnionArchiveProgramState::Propose {
-                            variable,
-                            shard_index,
-                            cursor,
-                        },
-                    );
-                    assert!(
-                        resume.is_none() || examined > 0,
-                        "typed UnionArchive proposal resumed without examining its source"
-                    );
-                    effects.account_source(examined, 0);
-                    effects.page(examined, resume.map(TypedResume::Immediate));
-                }
-            }
-            UnionArchiveProgramState::Support => {
-                for (input, state) in states.drain(..).enumerate() {
-                    assert_eq!(state, UnionArchiveProgramState::Support);
-                    assert!(
-                        batch.candidate_sets[input].is_none(),
-                        "typed UnionArchive support received a candidate group"
-                    );
-                    if self.support_row(&batch.view, batch.view.row(input)) {
-                        effects.support(
-                            u32::try_from(input)
-                                .expect("too many typed UnionArchive inputs in one cohort"),
-                        );
-                    }
-                    effects.page(1, None);
-                }
-            }
-        }
-    }
-}
 
 impl<'a, U> Constraint<'a> for UnionArchiveConstraint<'a, U>
 where
@@ -1931,138 +1443,42 @@ where
         self.union.variables()
     }
 
-    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-        if !bound.is_set(variable) && self.variables().is_set(variable) {
-            ProposalCoverage::Exact
-        } else {
-            ProposalCoverage::None
-        }
+    fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+        self.union.estimate(variable, binding)
     }
 
-    fn action_unit_classes(
-        &self,
-        variable: VariableId,
-        bound: VariableSet,
-    ) -> Option<ActionUnitClasses> {
-        let [shard] = self.shards.as_slice() else {
-            return None;
-        };
-        shard.action_unit_classes(variable, bound)
+    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
+        self.union.propose(variable, binding, proposals)
     }
 
-    fn estimate(
+    fn propose_chunk(
         &self,
         variable: VariableId,
-        view: &RowsView<'_>,
-        out: &mut EstimateSink<'_>,
+        binding: &Binding,
+        cursor: &mut ProposeCursor,
+        budget: usize,
+        proposals: &mut ProposalBuffer,
     ) -> bool {
-        self.union.estimate(variable, view, out)
-    }
-
-    fn propose(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
-        self.union.propose(variable, view, candidates)
+        self.union
+            .propose_chunk(variable, binding, cursor, budget, proposals)
     }
 
     fn confirm(
         &self,
         variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
+        binding: &Binding,
+        proposals: &[RawInline],
+        mask: &mut Mask,
     ) {
-        if !self.variables().is_set(variable) {
-            return;
-        }
-        if candidates.is_empty() {
-            return;
-        }
-        // A unary set union is its sole child. `Constraint::confirm` requires
-        // an order-preserving retain of the input bag, so delegating the
-        // untouched bag is observably equivalent while avoiding a complete
-        // frontier clone and an identical witness-set reconstruction.
-        if self.shards.len() == 1 {
-            if let CandidateSink::Values(_) = candidates {
-                debug_assert_eq!(
-                    view.len(),
-                    1,
-                    "plain candidate values require one parent row"
-                );
-            }
-            self.shards[0].confirm(variable, view, candidates);
-            return;
-        }
-
-        match candidates {
-            CandidateSink::Values(values) => {
-                debug_assert_eq!(
-                    view.len(),
-                    1,
-                    "plain candidate values require one parent row"
-                );
-                let row_view = view.row_view(0);
-                // Shards normalize only the membership witnesses. Filtering
-                // the untouched input afterwards preserves its physical bag.
-                let mut witnesses = HashSet::with_capacity(values.len());
-                let mut shard_values = Vec::with_capacity(values.len());
-
-                for constraint in &self.shards {
-                    if !constraint.satisfied(&row_view) {
-                        continue;
-                    }
-                    shard_values.clone_from(values);
-                    constraint.confirm(
-                        variable,
-                        &row_view,
-                        &mut CandidateSink::Values(&mut shard_values),
-                    );
-                    witnesses.extend(shard_values.iter().copied());
-                }
-
-                values.retain(|value| witnesses.contains(value));
-            }
-            CandidateSink::Tagged(pairs) => {
-                // Keep the parent tag in the witness key: equal values on a
-                // dead row must not borrow liveness from another row. Each
-                // shard still receives one whole-frontier confirm call so its
-                // Ring probes retain their batching opportunity.
-                let mut witnesses = HashSet::with_capacity(pairs.len());
-                let mut live_rows = Vec::with_capacity(view.len());
-                let mut shard_pairs = Vec::with_capacity(pairs.len());
-
-                for constraint in &self.shards {
-                    live_rows.clear();
-                    live_rows.extend(
-                        (0..view.len()).map(|row| constraint.satisfied(&view.row_view(row))),
-                    );
-                    if !live_rows.iter().any(|live| *live) {
-                        continue;
-                    }
-
-                    shard_pairs.clone_from(pairs);
-                    shard_pairs.retain(|(row, _)| live_rows[*row as usize]);
-                    constraint.confirm(
-                        variable,
-                        view,
-                        &mut CandidateSink::Tagged(&mut shard_pairs),
-                    );
-                    witnesses.extend(shard_pairs.iter().copied());
-                }
-
-                pairs.retain(|pair| witnesses.contains(pair));
-            }
-        }
+        self.union.confirm(variable, binding, proposals, mask)
     }
 
-    fn satisfied(&self, view: &RowsView<'_>) -> bool {
-        self.union.satisfied(view)
+    fn satisfied(&self, binding: &Binding) -> bool {
+        self.union.satisfied(binding)
     }
 
-    fn residual_program(&self) -> Option<ProgramRef<'_>> {
-        Some(ProgramRef::new(self))
+    fn influence(&self, variable: VariableId) -> VariableSet {
+        self.union.influence(variable)
     }
 }
 

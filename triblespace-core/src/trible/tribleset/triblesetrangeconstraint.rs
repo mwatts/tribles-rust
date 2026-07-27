@@ -1,35 +1,17 @@
-use crate::inline::Inline;
-use crate::inline::InlineEncoding;
-use crate::inline::RawInline;
-use crate::inline::INLINE_LEN;
-use crate::query::CandidateSink;
+use crate::query::Binding;
 use crate::query::Constraint;
-use crate::query::DispatchClass;
-use crate::query::EstimateSink;
-use crate::query::ProgramPacing;
-use crate::query::ProgramRef;
-use crate::query::ProgramRequest;
-use crate::query::ProgramRoute;
-use crate::query::ProgramSeedBatch;
-use crate::query::ProposalCoverage;
-use crate::query::ResidualDeltaSourceCursor;
-use crate::query::ResidualDeltaSourcePage;
-use crate::query::RowsView;
-use crate::query::TypedEffectSink;
-use crate::query::TypedProgramBatch;
-use crate::query::TypedProgramSpec;
-use crate::query::TypedSeedSink;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
 use crate::trible::TribleSet;
-
-use super::triblesetconstraint::direct_source_page;
-use super::triblesetconstraint::next_inline_source_in_range;
-
-/// A value-range-aware constraint that uses the TribleSet's VEA index
-/// to restrict values to the intersection of its V-axis domain and an
-/// inclusive byte-lexicographic range.
+use crate::inline::RawInline;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
+use crate::inline::INLINE_LEN;
+use crate::query::Mask;
+use crate::query::ProposalBuffer;
+/// A value-range-aware constraint that uses the TribleSet's AVE index
+/// to propose only values in a byte-lexicographic range.
 ///
 /// When proposing for the value variable with the attribute bound, it
 /// calls `infixes_range` on the AVE index — the trie skips entire
@@ -76,67 +58,6 @@ impl TribleSetRangeConstraint {
             cached_estimate,
         }
     }
-
-    fn contains(&self, value: &RawInline) -> bool {
-        *value >= self.min && *value <= self.max && self.set.vea.has_prefix(value)
-    }
-
-    fn proposal_page(
-        &self,
-        cursor: ResidualDeltaSourceCursor,
-        limit: usize,
-        accepted: &mut Vec<RawInline>,
-    ) -> ResidualDeltaSourcePage {
-        direct_source_page(cursor, limit, accepted, |after| {
-            next_inline_source_in_range(&self.set.vea, &[], &self.min, &self.max, after)
-        })
-    }
-}
-
-impl TypedProgramSpec for TribleSetRangeConstraint {
-    type State = crate::query::finiteunaryprogram::FiniteUnaryProgramState;
-    type NoveltyKey = ();
-    type Rank = [u64; 6];
-
-    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-        crate::query::finiteunaryprogram::route(self.variable_v, request)
-    }
-
-    fn dispatch(&self, state: &Self::State) -> DispatchClass {
-        crate::query::finiteunaryprogram::dispatch(state)
-    }
-
-    fn pacing(&self, state: &Self::State) -> ProgramPacing {
-        crate::query::finiteunaryprogram::pacing(state)
-    }
-
-    fn progress(&self, state: &Self::State) -> Self::Rank {
-        crate::query::finiteunaryprogram::progress(state)
-    }
-
-    fn seed_typed(
-        &self,
-        batch: ProgramSeedBatch<'_>,
-        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
-    ) {
-        crate::query::finiteunaryprogram::seed(self.variable_v, batch, effects)
-    }
-
-    fn step_typed(
-        &self,
-        states: &mut Vec<Self::State>,
-        batch: TypedProgramBatch<'_>,
-        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
-    ) {
-        crate::query::finiteunaryprogram::step(
-            self.variable_v,
-            states,
-            batch,
-            effects,
-            |_input, cursor, limit, accepted| self.proposal_page(cursor, limit, accepted),
-            |_input, value| self.contains(value),
-        )
-    }
 }
 
 impl<'a> Constraint<'a> for TribleSetRangeConstraint {
@@ -144,33 +65,14 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
         VariableSet::new_singleton(self.variable_v)
     }
 
-    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-        if variable == self.variable_v && !bound.is_set(variable) {
-            ProposalCoverage::Exact
-        } else {
-            ProposalCoverage::None
-        }
-    }
-
-    fn estimate(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        out: &mut EstimateSink<'_>,
-    ) -> bool {
+    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
         if variable != self.variable_v {
-            return false;
+            return None;
         }
-        out.fill(self.cached_estimate, view.len());
-        true
+        Some(self.cached_estimate)
     }
 
-    fn propose(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut ProposalBuffer) {
         if variable != self.variable_v {
             return;
         }
@@ -178,33 +80,28 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
         // VEA tree order: V(32) → E(16) → A(16).
         // With empty prefix, infixes_range on V(32 bytes) gives us all
         // values in [min, max]. The trie prunes branches outside the range.
-        for i in 0..view.len() as u32 {
-            self.set
-                .vea
-                .infixes_range::<0, INLINE_LEN, _>(&[0u8; 0], &self.min, &self.max, |v| {
-                    candidates.push(i, *v);
-                });
-        }
+        self.set
+            .vea
+            .infixes_range::<0, INLINE_LEN, _>(&[0u8; 0], &self.min, &self.max, |v| {
+                proposals.push(*v);
+            });
     }
 
     fn confirm(
         &self,
         variable: VariableId,
-        _view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
+        _binding: &Binding,
+        proposals: &[RawInline],
+        mask: &mut Mask,
     ) {
         if variable == self.variable_v {
-            candidates.retain(|_, v| self.contains(v));
+            mask.retain(proposals, |v| *v >= self.min && *v <= self.max);
         }
     }
 
-    fn residual_program(&self) -> Option<ProgramRef<'_>> {
-        Some(ProgramRef::new(self))
-    }
-
-    fn satisfied(&self, view: &RowsView<'_>) -> bool {
-        match view.col(self.variable_v) {
-            Some(col) => view.iter().all(|row| self.contains(&row[col])),
+    fn satisfied(&self, binding: &Binding) -> bool {
+        match binding.get(self.variable_v) {
+            Some(v) => *v >= self.min && *v <= self.max,
             None => true,
         }
     }
@@ -212,25 +109,8 @@ impl<'a> Constraint<'a> for TribleSetRangeConstraint {
 
 #[cfg(test)]
 mod tests {
-    use crate::inline::encodings::genid::GenId;
-    use crate::inline::RawInline;
     use crate::prelude::inlineencodings::R256BE;
     use crate::prelude::*;
-    use crate::query::Binding;
-    use crate::query::CandidateSink;
-    use crate::query::Constraint;
-    use crate::query::ProgramAction;
-    use crate::query::ProgramCompletion;
-    use crate::query::ProgramGrouping;
-    use crate::query::ProgramRequest;
-    use crate::query::ProgramStratum;
-    use crate::query::Query;
-    use crate::query::ResidualDeltaSourceCursor;
-    use crate::query::RowsView;
-    use crate::query::TypedProgramSpec;
-    use crate::query::VariableContext;
-    use crate::query::VariableId;
-    use crate::query::VariableSet;
 
     attributes! {
         "BB00000000000000BB00000000000000" as range_test_score: R256BE;
@@ -308,44 +188,6 @@ mod tests {
         assert_eq!(empty.len(), 0);
     }
 
-    #[test]
-    fn attached_value_range_rejects_in_range_values_absent_from_the_v_axis() {
-        let candidate_entity = ufoid();
-        let value_entity_1 = ufoid();
-        let value_entity_2 = ufoid();
-        let candidate_id: Inline<GenId> = (&candidate_entity).to_inline();
-        let value_id_1: Inline<GenId> = (&value_entity_1).to_inline();
-        let value_id_2: Inline<GenId> = (&value_entity_2).to_inline();
-        let candidate = Inline::<R256BE>::new(candidate_id.raw);
-        let value_1 = Inline::<R256BE>::new(value_id_1.raw);
-        let value_2 = Inline::<R256BE>::new(value_id_2.raw);
-
-        let mut data = TribleSet::new();
-        data += entity! { &candidate_entity @ range_test_score: value_1 };
-        data += entity! { &value_entity_1 @ range_test_score: value_2 };
-
-        let min = Inline::<R256BE>::new([0; 32]);
-        let mut max_raw = [0; 32];
-        max_raw[16..].fill(u8::MAX);
-        let max = Inline::<R256BE>::new(max_raw);
-        let variable = Variable::<R256BE>::new(0);
-
-        // The candidate is present in E but absent from V. Constant has the
-        // smaller estimate, forcing the attached range to confirm it.
-        let residual: Vec<_> = Query::new(
-            and!(
-                variable.is(candidate),
-                data.value_in_range(variable, min, max)
-            ),
-            move |binding| project(variable.index, binding),
-        )
-        .solve_residual_state_lazy()
-        .cap(1)
-        .start_width(1)
-        .collect();
-        assert!(residual.is_empty());
-    }
-
     /// Regression: the range-constraint estimate must report the count of
     /// *distinct values* in range — not the count of tribles. Multiple
     /// entities sharing the same value would otherwise inflate the
@@ -376,187 +218,8 @@ mod tests {
         let max: Inline<R256BE> = 100i128.to_inline();
         let constraint = data.value_in_range(v, min, max);
 
-        use crate::query::RowsView;
-        let mut est = Vec::new();
-        assert!(constraint.estimate(
-            v.index,
-            &RowsView::EMPTY,
-            &mut crate::query::EstimateSink::Column(&mut est)
-        ));
+        let estimate = constraint.estimate(v.index, &Default::default());
         // Three distinct values in range. Before the fix this returned 6.
-        assert_eq!(est, vec![3], "estimate must count distinct values");
-    }
-
-    fn project(variable: VariableId, binding: &Binding) -> Option<RawInline> {
-        binding.get(variable).copied()
-    }
-
-    #[test]
-    fn value_range_production_program_is_strict_distinct_and_lazy() {
-        let v10: Inline<R256BE> = 10i128.to_inline();
-        let v50: Inline<R256BE> = 50i128.to_inline();
-        let v90: Inline<R256BE> = 90i128.to_inline();
-        let v100: Inline<R256BE> = 100i128.to_inline();
-        let mut data = TribleSet::new();
-        data += entity! { &ufoid() @ range_test_score: v10 };
-        data += entity! { &ufoid() @ range_test_score: v10 };
-        data += entity! { &ufoid() @ range_test_score: v50 };
-        data += entity! { &ufoid() @ range_test_score: v90 };
-        data += entity! { &ufoid() @ range_test_score: v100 };
-
-        let mut context = VariableContext::new();
-        let variable = context.next_variable::<R256BE>();
-        let constraint = data.value_in_range(variable, v10, v90);
-        let route = constraint
-            .residual_program()
-            .expect("value ranges expose a typed Program")
-            .route(ProgramRequest {
-                action: ProgramAction::Propose(variable.index),
-                bound: VariableSet::new_empty(),
-            })
-            .expect("the unbound range variable has an ordered source");
-        assert_eq!(route.stratum, ProgramStratum::Finite);
-        assert_eq!(route.grouping, ProgramGrouping::PageLocal);
-        assert_eq!(route.completion, ProgramCompletion::PageableOnly);
-        assert!(
-            constraint.progress(
-                &crate::query::finiteunaryprogram::FiniteUnaryProgramState::Propose {
-                    cursor: ResidualDeltaSourceCursor::Start,
-                }
-            ) > constraint.progress(
-                &crate::query::finiteunaryprogram::FiniteUnaryProgramState::Propose {
-                    cursor: ResidualDeltaSourceCursor::After(v10.raw),
-                }
-            )
-        );
-
-        let mut direct = Vec::new();
-        let first = constraint.proposal_page(ResidualDeltaSourceCursor::Start, 1, &mut direct);
-        assert_eq!(direct, [v10.raw]);
-        assert_eq!(first.examined, 1);
-        assert_eq!(first.next, Some(ResidualDeltaSourceCursor::After(v10.raw)));
-
-        let second = constraint.proposal_page(first.next.unwrap(), 2, &mut direct);
-        assert_eq!(direct, [v10.raw, v50.raw, v90.raw]);
-        assert_eq!(second.examined, 2);
-        assert_eq!(second.next, None);
-
-        let mut query = Query::new(data.value_in_range(variable, v10, v90), move |binding| {
-            project(variable.index, binding)
-        })
-        .solve_residual_state_lazy()
-        .cap(1)
-        .start_width(1);
-        let mut actual: Vec<_> = query.by_ref().collect();
-        actual.sort_unstable();
-        assert_eq!(actual, [v10.raw, v50.raw, v90.raw]);
-        assert_eq!(query.stats().delta_source_candidates_examined, 3);
-        assert_eq!(query.stats().delta_source_direct_candidates, 3);
-        assert_eq!(query.stats().delta_source_roots, 0);
-
-        let mut first_only = Query::new(data.value_in_range(variable, v10, v90), move |binding| {
-            project(variable.index, binding)
-        })
-        .solve_residual_state_lazy()
-        .cap(1)
-        .start_width(1);
-        assert_eq!(first_only.next(), Some(v10.raw));
-        assert_eq!(first_only.stats().delta_source_candidates_examined, 1);
-        assert_eq!(first_only.stats().delta_source_direct_candidates, 1);
-        drop(first_only);
-    }
-
-    #[test]
-    fn value_range_source_preserves_affine_parents_before_set_projection() {
-        let v10: Inline<R256BE> = 10i128.to_inline();
-        let v50: Inline<R256BE> = 50i128.to_inline();
-        let v70: Inline<R256BE> = 70i128.to_inline();
-        let v90: Inline<R256BE> = 90i128.to_inline();
-        let mut base = TribleSet::new();
-        base += entity! { &ufoid() @ range_test_score: v10 };
-        base += entity! { &ufoid() @ range_test_score: v50 };
-        base += entity! { &ufoid() @ range_test_score: v90 };
-        let mut grown = base.clone();
-        grown += entity! { &ufoid() @ range_test_score: v70 };
-
-        let mut context = VariableContext::new();
-        let parent = context.next_variable::<R256BE>();
-        let value = context.next_variable::<R256BE>();
-        let duplicate_parents = [v10, v10];
-
-        let parent_source = SortedSlice::new(&duplicate_parents).unwrap().has(parent);
-        let mut parent_occurrences = Vec::new();
-        parent_source.propose(
-            parent.index,
-            &RowsView::EMPTY,
-            &mut CandidateSink::Values(&mut parent_occurrences),
-        );
-        assert_eq!(parent_occurrences, [v10.raw, v10.raw]);
-
-        let parent_variables = [parent.index];
-        let range_source = grown.value_in_range(value, v10, v90);
-        let range_values = [v10.raw, v50.raw, v70.raw, v90.raw];
-        let mut one_parent_values = Vec::new();
-        range_source.propose(
-            value.index,
-            &RowsView::EMPTY,
-            &mut CandidateSink::Values(&mut one_parent_values),
-        );
-        let mut value_set = one_parent_values.clone();
-        value_set.sort_unstable();
-        assert_eq!(value_set, range_values);
-
-        let mut value_occurrences = Vec::new();
-        range_source.propose(
-            value.index,
-            &RowsView::new(&parent_variables, &parent_occurrences),
-            &mut CandidateSink::Tagged(&mut value_occurrences),
-        );
-        let expected_occurrences: Vec<_> = (0..2)
-            .flat_map(|row| {
-                one_parent_values
-                    .iter()
-                    .copied()
-                    .map(move |value| (row, value))
-            })
-            .collect();
-        assert_eq!(value_occurrences, expected_occurrences);
-
-        let constraint = and!(
-            SortedSlice::new(&duplicate_parents).unwrap().has(parent),
-            grown.value_in_range(value, v10, v90),
-        );
-        let mut actual: Vec<_> =
-            Query::new(constraint, move |binding| project(value.index, binding))
-                .solve_residual_state_lazy()
-                .cap(1)
-                .start_width(1)
-                .collect();
-        actual.sort_unstable();
-        assert_eq!(actual, range_values);
-
-        let collect = |set: &TribleSet| {
-            let mut values: Vec<_> =
-                Query::new(set.value_in_range(value, v10, v90), move |binding| {
-                    project(value.index, binding)
-                })
-                .solve_residual_state_lazy()
-                .cap(1)
-                .start_width(1)
-                .collect();
-            values.sort_unstable();
-            values
-        };
-        let before = collect(&base);
-        let after = collect(&grown);
-        assert_eq!(before, [v10.raw, v50.raw, v90.raw]);
-        assert_eq!(after, [v10.raw, v50.raw, v70.raw, v90.raw]);
-
-        let inverted = grown.value_in_range(value, v90, v10);
-        let mut direct = Vec::new();
-        let empty = inverted.proposal_page(ResidualDeltaSourceCursor::Start, 1, &mut direct);
-        assert_eq!(empty.examined, 0);
-        assert_eq!(empty.next, None);
-        assert!(direct.is_empty());
+        assert_eq!(estimate, Some(3), "estimate must count distinct values");
     }
 }

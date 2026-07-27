@@ -69,264 +69,10 @@ pub struct SortedSliceConstraint<'a, S: InlineEncoding, T> {
     slice: SortedSlice<'a, T>,
 }
 
-/// Canonical finite continuation for [`SortedSliceConstraint`].
-#[doc(hidden)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SortedSliceProgramState {
-    Propose { offset: usize },
-    Confirm { offset: usize },
-    Support,
-}
-
-const SORTED_SLICE_PROPOSE_ROUTE: ProgramKey = ProgramKey::new(0);
-const SORTED_SLICE_CONFIRM_ROUTE: ProgramKey = ProgramKey::new(1);
-const SORTED_SLICE_SUPPORT_UNBOUND_ROUTE: ProgramKey = ProgramKey::new(2);
-const SORTED_SLICE_SUPPORT_BOUND_ROUTE: ProgramKey = ProgramKey::new(3);
-
-const SORTED_SLICE_PROPOSE_DISPATCH: DispatchClass = DispatchClass::new(0);
-const SORTED_SLICE_CONFIRM_DISPATCH: DispatchClass = DispatchClass::new(1);
-const SORTED_SLICE_SUPPORT_DISPATCH: DispatchClass = DispatchClass::new(2);
-
 impl<'a, S: InlineEncoding, T> SortedSliceConstraint<'a, S, T> {
     /// Creates a constraint that restricts `variable` to values in `slice`.
     pub fn new(variable: Variable<S>, slice: SortedSlice<'a, T>) -> Self {
         SortedSliceConstraint { variable, slice }
-    }
-}
-
-impl<S: InlineEncoding, T> SortedSliceConstraint<'_, S, T>
-where
-    T: Ord + for<'b> TryFromInline<'b, S>,
-    for<'b> &'b T: IntoInline<S>,
-{
-    fn contains_raw(&self, value: &RawInline) -> bool {
-        match TryFromInline::try_from_inline(Inline::<S>::as_transmute_raw(value)) {
-            Ok(value) => self.slice.0.binary_search(&value).is_ok(),
-            Err(_) => false,
-        }
-    }
-
-    fn proposal_page_from_offset(
-        &self,
-        begin: usize,
-        limit: usize,
-        accepted: &mut Vec<RawInline>,
-    ) -> ResidualDeltaSourcePage {
-        assert!(
-            limit > 0,
-            "sorted-slice source pages require positive demand"
-        );
-        assert!(
-            begin <= self.slice.0.len(),
-            "sorted-slice source cursor exceeds the immutable frontier"
-        );
-        let end = begin.saturating_add(limit).min(self.slice.0.len());
-        accepted.extend(
-            self.slice.0[begin..end]
-                .iter()
-                .map(|value| IntoInline::to_inline(value).raw),
-        );
-        ResidualDeltaSourcePage {
-            next: (end < self.slice.0.len()).then(|| {
-                ResidualDeltaSourceCursor::Offset(
-                    u64::try_from(end).expect("sorted-slice source offset exceeds u64"),
-                )
-            }),
-            examined: end - begin,
-        }
-    }
-}
-
-impl<S: InlineEncoding, T> TypedProgramSpec for SortedSliceConstraint<'_, S, T>
-where
-    T: Ord + for<'b> TryFromInline<'b, S>,
-    for<'b> &'b T: IntoInline<S>,
-{
-    type State = SortedSliceProgramState;
-    type NoveltyKey = ();
-    type Rank = [u64; 2];
-
-    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-        let (key, variable) = match request.action {
-            ProgramAction::Propose(variable) => {
-                if variable != self.variable.index || request.bound.is_set(variable) {
-                    return None;
-                }
-                (SORTED_SLICE_PROPOSE_ROUTE, variable)
-            }
-            ProgramAction::Confirm(variable) => {
-                if variable != self.variable.index || request.bound.is_set(variable) {
-                    return None;
-                }
-                (SORTED_SLICE_CONFIRM_ROUTE, variable)
-            }
-            ProgramAction::Support => (
-                if request.bound.is_set(self.variable.index) {
-                    SORTED_SLICE_SUPPORT_BOUND_ROUTE
-                } else {
-                    SORTED_SLICE_SUPPORT_UNBOUND_ROUTE
-                },
-                self.variable.index,
-            ),
-        };
-        Some(ProgramRoute {
-            key,
-            variable,
-            stratum: ProgramStratum::Finite,
-            grouping: ProgramGrouping::PageLocal,
-            completion: ProgramCompletion::PageableOnly,
-        })
-    }
-
-    fn dispatch(&self, state: &Self::State) -> DispatchClass {
-        match state {
-            SortedSliceProgramState::Propose { .. } => SORTED_SLICE_PROPOSE_DISPATCH,
-            SortedSliceProgramState::Confirm { .. } => SORTED_SLICE_CONFIRM_DISPATCH,
-            SortedSliceProgramState::Support => SORTED_SLICE_SUPPORT_DISPATCH,
-        }
-    }
-
-    fn pacing(&self, _state: &Self::State) -> ProgramPacing {
-        ProgramPacing::Search
-    }
-
-    fn progress(&self, state: &Self::State) -> Self::Rank {
-        match state {
-            SortedSliceProgramState::Support => [1, 0],
-            SortedSliceProgramState::Confirm { offset } => [
-                2,
-                u64::MAX
-                    - u64::try_from(*offset)
-                        .expect("sorted-slice candidate offset exceeds rank limb"),
-            ],
-            SortedSliceProgramState::Propose { offset } => [
-                3,
-                u64::MAX - u64::try_from(*offset).expect("sorted-slice offset exceeds rank limb"),
-            ],
-        }
-    }
-
-    fn seed_typed(
-        &self,
-        batch: ProgramSeedBatch<'_>,
-        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
-    ) {
-        assert_eq!(batch.route.stratum, ProgramStratum::Finite);
-        assert_eq!(batch.route.grouping, ProgramGrouping::PageLocal);
-        assert_eq!(batch.route.completion, ProgramCompletion::PageableOnly);
-        let state = match batch.request.action {
-            ProgramAction::Propose(variable) => {
-                assert_eq!(variable, self.variable.index);
-                assert!(!batch.request.bound.is_set(variable));
-                SortedSliceProgramState::Propose { offset: 0 }
-            }
-            ProgramAction::Confirm(variable) => {
-                assert_eq!(variable, self.variable.index);
-                assert!(!batch.request.bound.is_set(variable));
-                SortedSliceProgramState::Confirm { offset: 0 }
-            }
-            ProgramAction::Support => SortedSliceProgramState::Support,
-        };
-        for parent in 0..batch.view.len() {
-            effects.finite_root(
-                u32::try_from(parent).expect("too many typed sorted-slice parents"),
-                state.clone(),
-                None,
-            );
-        }
-    }
-
-    fn step_typed(
-        &self,
-        states: &mut Vec<Self::State>,
-        batch: TypedProgramBatch<'_>,
-        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
-    ) {
-        assert_eq!(batch.stratum, ProgramStratum::Finite);
-        assert_eq!(states.len(), batch.view.len());
-        assert_eq!(states.len(), batch.candidate_sets.len());
-        assert_eq!(states.len(), batch.limits.len());
-        let Some(first) = states.first() else {
-            return;
-        };
-        match first {
-            SortedSliceProgramState::Propose { .. } => {
-                for (input, state) in states.drain(..).enumerate() {
-                    let SortedSliceProgramState::Propose { offset } = state else {
-                        panic!("one typed sorted-slice cohort mixed action variants")
-                    };
-                    assert!(
-                        batch.candidate_sets[input].is_none(),
-                        "typed sorted-slice proposal received a candidate group"
-                    );
-                    let mut direct = Vec::new();
-                    let page =
-                        self.proposal_page_from_offset(offset, batch.limits[input], &mut direct);
-                    let input_tag = u32::try_from(input)
-                        .expect("too many typed sorted-slice inputs in one cohort");
-                    for value in direct {
-                        effects.direct(input_tag, value);
-                    }
-                    let resume = page.next.map(|cursor| {
-                        let ResidualDeltaSourceCursor::Offset(offset) = cursor else {
-                            unreachable!("sorted-slice source changed cursor family")
-                        };
-                        TypedResume::Immediate(SortedSliceProgramState::Propose {
-                            offset: usize::try_from(offset)
-                                .expect("sorted-slice source offset exceeds usize"),
-                        })
-                    });
-                    effects.account_source(page.examined, 0);
-                    effects.page(page.examined, resume);
-                }
-            }
-            SortedSliceProgramState::Confirm { .. } => {
-                for (input, state) in states.drain(..).enumerate() {
-                    let SortedSliceProgramState::Confirm { offset } = state else {
-                        panic!("one typed sorted-slice cohort mixed action variants")
-                    };
-                    let candidates = batch.candidate_sets[input]
-                        .expect("typed sorted-slice confirmation lost its candidate group");
-                    assert!(offset <= candidates.len());
-                    let end = offset
-                        .saturating_add(batch.limits[input])
-                        .min(candidates.len());
-                    let input_tag = u32::try_from(input)
-                        .expect("too many typed sorted-slice inputs in one cohort");
-                    for &candidate in &candidates[offset..end] {
-                        if self.contains_raw(&candidate) {
-                            effects.accept(input_tag, candidate);
-                        }
-                    }
-                    let examined = end - offset;
-                    assert!(
-                        end == candidates.len() || examined > 0,
-                        "typed sorted-slice confirmation resumed without examining a candidate"
-                    );
-                    let resume = (end < candidates.len()).then(|| {
-                        TypedResume::Immediate(SortedSliceProgramState::Confirm { offset: end })
-                    });
-                    effects.page(examined, resume);
-                }
-            }
-            SortedSliceProgramState::Support => {
-                let column = batch.view.col(self.variable.index);
-                for (input, state) in states.drain(..).enumerate() {
-                    assert_eq!(state, SortedSliceProgramState::Support);
-                    assert!(
-                        batch.candidate_sets[input].is_none(),
-                        "typed sorted-slice support received a candidate group"
-                    );
-                    if column.is_none_or(|column| self.contains_raw(&batch.view.row(input)[column]))
-                    {
-                        effects.support(
-                            u32::try_from(input).expect("too many typed sorted-slice inputs"),
-                        );
-                    }
-                    effects.page(1, None);
-                }
-            }
-        }
     }
 }
 
@@ -339,63 +85,41 @@ where
         VariableSet::new_singleton(self.variable.index)
     }
 
-    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-        if variable == self.variable.index && !bound.is_set(variable) {
-            ProposalCoverage::Exact
-        } else {
-            ProposalCoverage::None
-        }
-    }
-
-    fn estimate(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        out: &mut EstimateSink<'_>,
-    ) -> bool {
-        if self.variable.index != variable {
-            return false;
-        }
-        out.fill(self.slice.0.len(), view.len());
-        true
-    }
-
-    fn propose(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
+    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
         if self.variable.index == variable {
-            for i in 0..view.len() as u32 {
-                candidates.extend_row(i, self.slice.0.iter().map(|v| IntoInline::to_inline(v).raw));
-            }
+            Some(self.slice.0.len())
+        } else {
+            None
+        }
+    }
+
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut ProposalBuffer) {
+        if self.variable.index == variable {
+            proposals.extend(self.slice.0.iter().map(|v| IntoInline::to_inline(v).raw));
         }
     }
 
     fn confirm(
         &self,
         variable: VariableId,
-        _view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
+        _binding: &Binding,
+        proposals: &[RawInline],
+        mask: &mut Mask,
     ) {
         if self.variable.index == variable {
-            candidates.retain(|_, value| self.contains_raw(value));
+            for (i, v) in proposals.iter().enumerate() {
+                if !mask.live(i) {
+                    continue;
+                }
+                let keep = match TryFromInline::try_from_inline(Inline::<S>::as_transmute_raw(v)) {
+                    Ok(t) => self.slice.0.binary_search(&t).is_ok(),
+                    Err(_) => false,
+                };
+                if !keep {
+                    mask.kill(i);
+                }
+            }
         }
-    }
-
-    /// Exact when the variable is bound: binary-searches the slice for
-    /// every row's bound value. Returns `true` optimistically while the
-    /// variable is unbound.
-    fn satisfied(&self, view: &RowsView<'_>) -> bool {
-        match view.col(self.variable.index) {
-            Some(c) => view.iter().all(|row| self.contains_raw(&row[c])),
-            None => true,
-        }
-    }
-
-    fn residual_program(&self) -> Option<ProgramRef<'_>> {
-        Some(ProgramRef::new(self))
     }
 }
 
@@ -432,178 +156,5 @@ where
 
     fn has(self, v: Variable<S>) -> Self::Constraint {
         SortedSliceConstraint::new(v, SortedSlice::from_mut(self))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::inline::encodings::UnknownInline;
-    use crate::inline::Encodes;
-
-    #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-    struct ReverseRaw(u8);
-
-    impl Encodes<&ReverseRaw> for UnknownInline {
-        type Output = Inline<UnknownInline>;
-
-        fn encode(source: &ReverseRaw) -> Self::Output {
-            Inline::new([u8::MAX - source.0; 32])
-        }
-    }
-
-    impl TryFromInline<'_, UnknownInline> for ReverseRaw {
-        type Error = std::convert::Infallible;
-
-        fn try_from_inline(value: &Inline<UnknownInline>) -> Result<Self, Self::Error> {
-            Ok(Self(u8::MAX - value.raw[0]))
-        }
-    }
-
-    fn value(byte: u8) -> Inline<UnknownInline> {
-        Inline::new([byte; 32])
-    }
-
-    fn project(binding: &Binding) -> Option<RawInline> {
-        binding.get(0).copied()
-    }
-
-    #[test]
-    fn ordinal_program_pages_preserve_occurrences_before_set_projection() {
-        let values = [value(1), value(1), value(2), value(3)];
-        let slice = SortedSlice::new(&values).unwrap();
-        let variable = Variable::<UnknownInline>::new(0);
-        let constraint = SortedSliceConstraint::new(variable, slice);
-        let program = constraint.residual_program().unwrap();
-        let route = program
-            .route(ProgramRequest {
-                action: ProgramAction::Propose(variable.index),
-                bound: VariableSet::new_empty(),
-            })
-            .unwrap();
-        assert_eq!(route.stratum, ProgramStratum::Finite);
-        assert_eq!(route.grouping, ProgramGrouping::PageLocal);
-        assert_eq!(route.completion, ProgramCompletion::PageableOnly);
-        assert!(
-            constraint.progress(&SortedSliceProgramState::Propose { offset: 0 })
-                > constraint.progress(&SortedSliceProgramState::Propose { offset: 1 })
-        );
-
-        let mut direct = Vec::new();
-        let first = constraint.proposal_page_from_offset(0, 1, &mut direct);
-        assert_eq!(direct, [value(1).raw]);
-        assert_eq!(first.examined, 1);
-        assert_eq!(first.next, Some(ResidualDeltaSourceCursor::Offset(1)));
-
-        direct.clear();
-        let second = constraint.proposal_page_from_offset(1, 2, &mut direct);
-        assert_eq!(direct, [value(1).raw, value(2).raw]);
-        assert_eq!(second.examined, 2);
-        assert_eq!(second.next, Some(ResidualDeltaSourceCursor::Offset(3)));
-
-        let mut query = Query::new(SortedSliceConstraint::new(variable, slice), project)
-            .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1);
-        let mut actual: Vec<_> = query.by_ref().collect();
-        actual.sort_unstable();
-        assert_eq!(actual, [value(1).raw, value(2).raw, value(3).raw]);
-        assert_eq!(query.stats().propose_calls, 1);
-        assert_eq!(query.stats().delta_source_pages, values.len());
-        assert_eq!(query.stats().delta_source_candidates_examined, values.len());
-        assert_eq!(query.stats().delta_source_direct_candidates, values.len());
-        assert_eq!(query.stats().delta_source_roots, 0);
-        assert_eq!(query.stats().max_propose_candidates, 1);
-    }
-
-    #[test]
-    fn first_pull_consumes_one_entry_and_monotone_slice_growth_only_adds_rows() {
-        let base = [value(1), value(1), value(3)];
-        let grown = [value(1), value(1), value(2), value(3)];
-        let variable = Variable::<UnknownInline>::new(0);
-        let make = |values| {
-            Query::new(
-                SortedSliceConstraint::new(variable, SortedSlice::new(values).unwrap()),
-                project,
-            )
-            .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1)
-        };
-
-        let mut first = make(&grown);
-        assert_eq!(first.next(), Some(value(1).raw));
-        assert_eq!(first.stats().delta_source_candidates_examined, 1);
-        assert_eq!(first.stats().delta_source_direct_candidates, 1);
-        assert_eq!(first.stats().delta_source_roots, 0);
-        drop(first);
-
-        let mut before: Vec<_> = make(&base).collect();
-        let mut after: Vec<_> = make(&grown).collect();
-        before.sort_unstable();
-        after.sort_unstable();
-        let mut remaining = after.clone();
-        for value in before {
-            let position = remaining
-                .iter()
-                .position(|candidate| *candidate == value)
-                .expect("monotone growth removed a prior occurrence");
-            remaining.remove(position);
-        }
-        assert_eq!(remaining, [value(2).raw]);
-    }
-
-    #[test]
-    fn ordinal_paging_does_not_assume_native_order_matches_raw_order() {
-        let values = [ReverseRaw(1), ReverseRaw(2), ReverseRaw(3)];
-        let slice = SortedSlice::new(&values).unwrap();
-        let variable = Variable::<UnknownInline>::new(0);
-        let encoded: Vec<_> = values
-            .iter()
-            .map(|value| <UnknownInline as Encodes<&ReverseRaw>>::encode(value).raw)
-            .collect();
-        assert!(encoded.windows(2).all(|pair| pair[0] > pair[1]));
-
-        let mut query = Query::new(SortedSliceConstraint::new(variable, slice), project)
-            .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1);
-        let mut actual: Vec<_> = query.by_ref().collect();
-        actual.sort_unstable();
-        let mut expected = encoded;
-        expected.sort_unstable();
-        assert_eq!(actual, expected);
-        assert_eq!(query.stats().delta_source_candidates_examined, values.len());
-        assert_eq!(query.stats().delta_source_direct_candidates, values.len());
-    }
-
-    #[test]
-    fn online_union_program_pages_publish_novel_values_without_replaying_occurrences() {
-        let left = [value(1), value(1), value(2)];
-        let right = [value(2), value(3)];
-        let left = SortedSlice::new(&left).unwrap();
-        let right = SortedSlice::new(&right).unwrap();
-        let variable = Variable::<UnknownInline>::new(0);
-        let make = || {
-            super::super::unionconstraint::UnionConstraint::new(vec![
-                SortedSliceConstraint::new(variable, left),
-                SortedSliceConstraint::new(variable, right),
-            ])
-        };
-
-        let mut query = Query::new(make(), project)
-            .solve_residual_state_lazy()
-            .cap(1)
-            .start_width(1);
-        let mut actual: Vec<_> = query.by_ref().collect();
-        actual.sort_unstable();
-        assert_eq!(actual, [value(1).raw, value(2).raw, value(3).raw]);
-        assert_eq!(query.stats().delta_source_direct_candidates, 5);
-        assert_eq!(query.stats().delta_source_roots, 0);
-        assert_eq!(query.stats().delta_source_pages, 5);
-        // Exact direct-Union admission publishes each novel value online. The
-        // duplicate source occurrences are still examined, but no normalized
-        // three-value replay page is required after both arms quiesce.
-        assert_eq!(query.stats().max_propose_candidates, 1);
     }
 }

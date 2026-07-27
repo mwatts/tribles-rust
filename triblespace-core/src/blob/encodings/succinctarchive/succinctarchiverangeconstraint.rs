@@ -1,28 +1,16 @@
 use super::*;
-use crate::inline::Inline;
-use crate::inline::InlineEncoding;
-use crate::inline::RawInline;
-use crate::query::CandidateSink;
+use crate::query::Binding;
 use crate::query::Constraint;
-use crate::query::DispatchClass;
-use crate::query::EstimateSink;
-use crate::query::ProgramPacing;
-use crate::query::ProgramRef;
-use crate::query::ProgramRequest;
-use crate::query::ProgramRoute;
-use crate::query::ProgramSeedBatch;
-use crate::query::ProposalCoverage;
-use crate::query::RowsView;
-use crate::query::TypedEffectSink;
-use crate::query::TypedProgramBatch;
-use crate::query::TypedProgramSpec;
-use crate::query::TypedSeedSink;
+use crate::query::Mask;
+use crate::query::ProposalBuffer;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
+use crate::inline::RawInline;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
 
-/// Inline-range constraint for [`SuccinctArchive`]. Its denotation is the
-/// intersection of the archive's V-axis domain and the inclusive raw range.
+/// Inline-range constraint for [`SuccinctArchive`].
 ///
 /// Mirrors [`TribleSet::value_in_range`](crate::trible::TribleSet::value_in_range).
 /// The implementation leans on two archive primitives:
@@ -87,76 +75,6 @@ where
             cached_estimate,
         }
     }
-
-    fn contains(&self, value: &RawInline) -> bool {
-        if *value < self.min || *value > self.max {
-            return false;
-        }
-        !super::succinctarchiveconstraint::base_range(
-            &self.archive.domain,
-            &self.archive.v_a,
-            value,
-        )
-        .is_empty()
-    }
-}
-
-impl<U> TypedProgramSpec for SuccinctArchiveRangeConstraint<'_, U>
-where
-    U: Universe,
-{
-    type State = crate::query::finiteunaryprogram::FiniteUnaryProgramState;
-    type NoveltyKey = ();
-    type Rank = [u64; 6];
-
-    fn route(&self, request: ProgramRequest) -> Option<ProgramRoute> {
-        crate::query::finiteunaryprogram::route(self.variable_v, request)
-    }
-
-    fn dispatch(&self, state: &Self::State) -> DispatchClass {
-        crate::query::finiteunaryprogram::dispatch(state)
-    }
-
-    fn pacing(&self, state: &Self::State) -> ProgramPacing {
-        crate::query::finiteunaryprogram::pacing(state)
-    }
-
-    fn progress(&self, state: &Self::State) -> Self::Rank {
-        crate::query::finiteunaryprogram::progress(state)
-    }
-
-    fn seed_typed(
-        &self,
-        batch: ProgramSeedBatch<'_>,
-        effects: &mut TypedSeedSink<Self::State, Self::NoveltyKey>,
-    ) {
-        crate::query::finiteunaryprogram::seed(self.variable_v, batch, effects)
-    }
-
-    fn step_typed(
-        &self,
-        states: &mut Vec<Self::State>,
-        batch: TypedProgramBatch<'_>,
-        effects: &mut TypedEffectSink<Self::State, Self::NoveltyKey>,
-    ) {
-        crate::query::finiteunaryprogram::step(
-            self.variable_v,
-            states,
-            batch,
-            effects,
-            |_input, cursor, limit, accepted| {
-                super::succinctarchiveconstraint::page_domain(
-                    self.archive,
-                    &self.archive.v_a,
-                    self.archive.domain.search_range(&self.min, &self.max),
-                    cursor,
-                    limit,
-                    accepted,
-                )
-            },
-            |_input, value| self.contains(value),
-        )
-    }
 }
 
 impl<'a, U> Constraint<'a> for SuccinctArchiveRangeConstraint<'a, U>
@@ -167,64 +85,39 @@ where
         VariableSet::new_singleton(self.variable_v)
     }
 
-    fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-        if variable == self.variable_v && !bound.is_set(variable) {
-            ProposalCoverage::Exact
-        } else {
-            ProposalCoverage::None
-        }
-    }
-
-    fn estimate(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        out: &mut EstimateSink<'_>,
-    ) -> bool {
+    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
         if variable != self.variable_v {
-            return false;
+            return None;
         }
-        out.fill(self.cached_estimate, view.len());
-        true
+        Some(self.cached_estimate)
     }
 
-    fn propose(
-        &self,
-        variable: VariableId,
-        view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
-    ) {
+    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut ProposalBuffer) {
         if variable != self.variable_v {
             return;
         }
-        for i in 0..view.len() as u32 {
-            let code_range = self.archive.domain.search_range(&self.min, &self.max);
-            candidates.extend_row(
-                i,
-                self.archive
-                    .enumerate_domain_in_range(&self.archive.v_a, code_range),
-            );
-        }
+        let code_range = self.archive.domain.search_range(&self.min, &self.max);
+        proposals.extend(
+            self.archive
+                .enumerate_domain_in_range(&self.archive.v_a, code_range),
+        );
     }
 
     fn confirm(
         &self,
         variable: VariableId,
-        _view: &RowsView<'_>,
-        candidates: &mut CandidateSink<'_>,
+        _binding: &Binding,
+        proposals: &[RawInline],
+        mask: &mut Mask,
     ) {
         if variable == self.variable_v {
-            candidates.retain(|_, v| self.contains(v));
+            mask.retain(proposals, |v| *v >= self.min && *v <= self.max);
         }
     }
 
-    fn residual_program(&self) -> Option<ProgramRef<'_>> {
-        Some(ProgramRef::new(self))
-    }
-
-    fn satisfied(&self, view: &RowsView<'_>) -> bool {
-        match view.col(self.variable_v) {
-            Some(col) => view.iter().all(|row| self.contains(&row[col])),
+    fn satisfied(&self, binding: &Binding) -> bool {
+        match binding.get(self.variable_v) {
+            Some(v) => *v >= self.min && *v <= self.max,
             None => true,
         }
     }
