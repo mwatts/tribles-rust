@@ -1399,3 +1399,93 @@ pub fn f13_vars(set: &TribleSet) -> usize {
 pub fn f13_total(set: &TribleSet) -> usize {
     f13_probe(set).1
 }
+
+// ---------------------------------------------------------------------------
+// F14 — widening ramp.
+//
+// INTERROGATES: time-to-first-result at a very wide level.
+//
+// The engine already has the machinery for lazy proposing —
+// `propose_chunk`, `ProposeCursor`, `INITIAL_CHUNK` = 64 and a x4
+// geometric widen — but no leaf SOURCE overrides `propose_chunk` yet, so
+// the default ships the entire level on the first call and TTFR at a
+// wide level costs a full enumeration. This is THE fixture that will
+// measure that when sources gain overrides: the survivors are minted
+// with order byte 0x00 so they sort FIRST in the proposer's value order,
+// which means a chunked proposer could answer from its first 64-entry
+// chunk while an eager one must materialize and mask all
+// `F14_REGION` candidates first. `ttfr` and `total` are recorded
+// separately precisely so that gap becomes visible when it opens.
+//
+// As in F9, both sides carry identical cardinality so the selectivity
+// cannot be laundered into the plan.
+// ---------------------------------------------------------------------------
+
+/// F14: candidates at the wide root level.
+pub const F14_REGION: usize = 250_000;
+/// F14: surviving candidates, all sorted to the front.
+pub const F14_SURVIVORS: usize = 16;
+
+/// F14 expected rows: the confirmer shares exactly the first
+/// `F14_SURVIVORS` values with the root and nothing else, and `?v` is
+/// the only variable. 16.
+pub const F14_EXPECTED_ROWS: usize = F14_SURVIVORS;
+
+/// F14 wide root (`w1`).
+fn f14_root() -> ExclusiveId {
+    anchor(24)
+}
+
+/// F14 selective probe (`w2`).
+fn f14_probe() -> ExclusiveId {
+    anchor(25)
+}
+
+/// F14 builder: `F14_REGION` root candidates of which the first
+/// `F14_SURVIVORS` (order byte 0x00, so first in value order) are also
+/// on the probe side; the probe carries `F14_REGION` values too, so the
+/// two estimates tie.
+pub fn build_widening_ramp() -> TribleSet {
+    let mut ids = Ids::new();
+    let mut set = TribleSet::new();
+    let root = f14_root();
+    let probe = f14_probe();
+    for i in 0..F14_REGION {
+        if i < F14_SURVIVORS {
+            let v = ids.mint_ordered(0x00);
+            set += entity! { &root @ r2_schema::w1: &v };
+            set += entity! { &probe @ r2_schema::w2: &v };
+        } else {
+            let v = ids.mint_ordered(0x40 + (i % 0xBF) as u8);
+            let miss = ids.mint_ordered(0x20);
+            set += entity! { &root @ r2_schema::w1: &v };
+            set += entity! { &probe @ r2_schema::w2: &miss };
+        }
+    }
+    set
+}
+
+/// F14 arm-to-first-row: rows drained (0 or 1).
+pub fn f14_ttfr(set: &TribleSet) -> usize {
+    find!(
+        (v: Inline<GenId>),
+        and!(
+            pattern!(set, [{ &f14_root() @ r2_schema::w1: ?v }]),
+            pattern!(set, [{ &f14_probe() @ r2_schema::w2: ?v }]),
+        )
+    )
+    .next()
+    .map_or(0, |_| 1)
+}
+
+/// F14 full drain: total row count (expected [`F14_EXPECTED_ROWS`]).
+pub fn f14_total(set: &TribleSet) -> usize {
+    find!(
+        (v: Inline<GenId>),
+        and!(
+            pattern!(set, [{ &f14_root() @ r2_schema::w1: ?v }]),
+            pattern!(set, [{ &f14_probe() @ r2_schema::w2: ?v }]),
+        )
+    )
+    .count()
+}
