@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use triblespace::core::blob::encodings::succinctarchive::OrderedUniverse;
 use triblespace::core::blob::encodings::succinctarchive::SuccinctArchive;
-use triblespace::core::query::Binding;
+use triblespace::core::query::BindingStore;
 use triblespace::core::query::Constraint;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::query::VariableContext;
@@ -39,11 +39,11 @@ fn propose_and_confirm() {
     let v_var = ctx.next_variable::<UnknownInline>();
     let constraint = archive.pattern(e_var, a_var, v_var);
 
-    let mut binding = Binding::default();
-    binding.set(e_var.index, &GenId::inline_from(e1).raw);
+    let mut binding = BindingStore::new();
+    binding.bind(e_var.index, &GenId::inline_from(e1).raw);
 
     let mut proposals = ProposalBuffer::new();
-    constraint.propose(a_var.index, &binding, &mut proposals);
+    constraint.propose(a_var.index, &binding.view(), &mut proposals);
     let attrs: HashSet<_> = proposals.iter().cloned().collect();
     assert_eq!(
         attrs,
@@ -51,7 +51,7 @@ fn propose_and_confirm() {
     );
 
     proposals.push(GenId::inline_from(e1).raw);
-    constraint.confirm(a_var.index, &binding, &mut proposals.region(0));
+    constraint.confirm(a_var.index, &binding.view(), &mut proposals.region(0));
     assert_eq!(proposals.count_live(0), 2);
 }
 
@@ -84,18 +84,18 @@ fn propose_and_confirm_bound_attribute() {
     let v_var = ctx.next_variable::<UnknownInline>();
     let constraint = archive.pattern(e_var, a_var, v_var);
 
-    let mut binding = Binding::default();
-    binding.set(a_var.index, &GenId::inline_from(a1).raw);
+    let mut binding = BindingStore::new();
+    binding.bind(a_var.index, &GenId::inline_from(a1).raw);
 
     let mut proposals = ProposalBuffer::new();
-    constraint.propose(e_var.index, &binding, &mut proposals);
+    constraint.propose(e_var.index, &binding.view(), &mut proposals);
     let entities: HashSet<_> = proposals.iter().cloned().collect();
     assert_eq!(
         entities,
         [GenId::inline_from(e1).raw, GenId::inline_from(e2).raw].into_iter().collect()
     );
 
-    constraint.confirm(e_var.index, &binding, &mut proposals.region(0));
+    constraint.confirm(e_var.index, &binding.view(), &mut proposals.region(0));
     assert_eq!(proposals.count_live(0), 2);
 }
 
@@ -128,15 +128,15 @@ fn propose_and_confirm_bound_value() {
     let v_var = ctx.next_variable::<UnknownInline>();
     let constraint = archive.pattern(e_var, a_var, v_var);
 
-    let mut binding = Binding::default();
-    binding.set(v_var.index, &v1.raw);
+    let mut binding = BindingStore::new();
+    binding.bind(v_var.index, &v1.raw);
 
     let mut proposals = ProposalBuffer::new();
-    constraint.propose(e_var.index, &binding, &mut proposals);
+    constraint.propose(e_var.index, &binding.view(), &mut proposals);
     let ents: HashSet<_> = proposals.iter().cloned().collect();
     assert_eq!(ents, [GenId::inline_from(e1).raw].into_iter().collect());
 
-    constraint.confirm(e_var.index, &binding, &mut proposals.region(0));
+    constraint.confirm(e_var.index, &binding.view(), &mut proposals.region(0));
     assert_eq!(proposals.count_live(0), 1);
 }
 
@@ -170,39 +170,39 @@ fn propose_and_confirm_two_bound() {
     let constraint = archive.pattern(e_var, a_var, v_var);
 
     // entity and attribute bound -> expect corresponding values
-    let mut binding = Binding::default();
-    binding.set(e_var.index, &GenId::inline_from(e1).raw);
-    binding.set(a_var.index, &GenId::inline_from(a1).raw);
+    let mut binding = BindingStore::new();
+    binding.bind(e_var.index, &GenId::inline_from(e1).raw);
+    binding.bind(a_var.index, &GenId::inline_from(a1).raw);
 
     let mut proposals = ProposalBuffer::new();
-    constraint.propose(v_var.index, &binding, &mut proposals);
+    constraint.propose(v_var.index, &binding.view(), &mut proposals);
     let values: HashSet<_> = proposals.iter().cloned().collect();
     assert_eq!(values, [v1.raw, v2.raw].into_iter().collect());
 
-    constraint.confirm(v_var.index, &binding, &mut proposals.region(0));
+    constraint.confirm(v_var.index, &binding.view(), &mut proposals.region(0));
     assert_eq!(proposals.count_live(0), 2);
 
     // entity and value bound -> expect attributes
-    let mut binding = Binding::default();
-    binding.set(e_var.index, &GenId::inline_from(e1).raw);
-    binding.set(v_var.index, &v3.raw);
+    let mut binding = BindingStore::new();
+    binding.bind(e_var.index, &GenId::inline_from(e1).raw);
+    binding.bind(v_var.index, &v3.raw);
 
     let mut proposals = ProposalBuffer::new();
-    constraint.propose(a_var.index, &binding, &mut proposals);
+    constraint.propose(a_var.index, &binding.view(), &mut proposals);
     assert_eq!(proposals.live_values(0).copied().collect::<Vec<_>>(), vec![GenId::inline_from(a2).raw]);
 
-    constraint.confirm(a_var.index, &binding, &mut proposals.region(0));
+    constraint.confirm(a_var.index, &binding.view(), &mut proposals.region(0));
     assert_eq!(proposals.count_live(0), 1);
 
     // attribute and value bound -> expect entities
-    let mut binding = Binding::default();
-    binding.set(a_var.index, &GenId::inline_from(a2).raw);
-    binding.set(v_var.index, &v6.raw);
+    let mut binding = BindingStore::new();
+    binding.bind(a_var.index, &GenId::inline_from(a2).raw);
+    binding.bind(v_var.index, &v6.raw);
 
     let mut proposals = ProposalBuffer::new();
-    constraint.propose(e_var.index, &binding, &mut proposals);
+    constraint.propose(e_var.index, &binding.view(), &mut proposals);
     assert_eq!(proposals.live_values(0).copied().collect::<Vec<_>>(), vec![GenId::inline_from(e2).raw]);
 
-    constraint.confirm(e_var.index, &binding, &mut proposals.region(0));
+    constraint.confirm(e_var.index, &binding.view(), &mut proposals.region(0));
     assert_eq!(proposals.count_live(0), 1);
 }

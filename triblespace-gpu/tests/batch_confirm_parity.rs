@@ -15,7 +15,7 @@ use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::inline::RawInline;
 use triblespace_core::query::{
-    Binding, Constraint, ProposalBuffer, Variable, VariableContext, VariableId,
+    Binding, BindingStore, Constraint, ProposalBuffer, Variable, VariableContext, VariableId,
 };
 use triblespace_core::trible::{Trible, TribleSet};
 use triblespace_gpu::WgpuSuccinctArchive;
@@ -283,17 +283,17 @@ fn single_bound_range_confirm_parity() {
         let kills = kills_for(seed, candidates.len());
         for (bound_var, confirm_var, bound_pool, name) in arms {
             let bound = bound_pool[(seed as usize * 5) % bound_pool.len()];
-            let mut binding = Binding::default();
-            binding.set(bound_var, &bound);
+            let mut binding = BindingStore::new();
+            binding.bind(bound_var, &bound);
             let context = format!("range/{name}/seed{seed}");
-            check_arm(&fixture, confirm_var, &binding, &candidates, &kills, &context);
+            check_arm(&fixture, confirm_var, &binding.view(), &candidates, &kills, &context);
 
             // Bound value absent from the archive: the range is empty and
             // every candidate dies on both paths.
-            let mut binding = Binding::default();
-            binding.set(bound_var, &fixture.absent[seed as usize % fixture.absent.len()]);
+            let mut binding = BindingStore::new();
+            binding.bind(bound_var, &fixture.absent[seed as usize % fixture.absent.len()]);
             let context = format!("range-empty/{name}/seed{seed}");
-            let cpu = check_arm(&fixture, confirm_var, &binding, &candidates, &kills, &context);
+            let cpu = check_arm(&fixture, confirm_var, &binding.view(), &candidates, &kills, &context);
             assert!(
                 cpu.iter().all(|w| *w == 0),
                 "{context}: empty range must kill everything"
@@ -314,39 +314,39 @@ fn double_bound_range_confirm_parity() {
         let value = fixture.values[(seed as usize * 11) % fixture.values.len()];
 
         // (a, v) bound, confirm e.
-        let mut binding = Binding::default();
-        binding.set(v.a.index, &attribute);
-        binding.set(v.v.index, &value);
+        let mut binding = BindingStore::new();
+        binding.bind(v.a.index, &attribute);
+        binding.bind(v.v.index, &value);
         check_arm(
             &fixture,
             v.e.index,
-            &binding,
+            &binding.view(),
             &candidates,
             &kills,
             &format!("range/av-bound/confirm-e/seed{seed}"),
         );
 
         // (e, v) bound, confirm a.
-        let mut binding = Binding::default();
-        binding.set(v.e.index, &entity);
-        binding.set(v.v.index, &value);
+        let mut binding = BindingStore::new();
+        binding.bind(v.e.index, &entity);
+        binding.bind(v.v.index, &value);
         check_arm(
             &fixture,
             v.a.index,
-            &binding,
+            &binding.view(),
             &candidates,
             &kills,
             &format!("range/ev-bound/confirm-a/seed{seed}"),
         );
 
         // (e, a) bound, confirm v.
-        let mut binding = Binding::default();
-        binding.set(v.e.index, &entity);
-        binding.set(v.a.index, &attribute);
+        let mut binding = BindingStore::new();
+        binding.bind(v.e.index, &entity);
+        binding.bind(v.a.index, &attribute);
         check_arm(
             &fixture,
             v.v.index,
-            &binding,
+            &binding.view(),
             &candidates,
             &kills,
             &format!("range/ea-bound/confirm-v/seed{seed}"),
@@ -500,14 +500,14 @@ fn confirm_crossover_sweep() {
         (
             "membership (confirm v, nothing bound)",
             v.v.index,
-            Box::new(|| Binding::default()) as Box<dyn Fn() -> Binding>,
+            Box::new(BindingStore::new) as Box<dyn Fn() -> BindingStore>,
         ),
         (
             "range (e bound, confirm v)",
             v.v.index,
             Box::new(|| {
-                let mut binding = Binding::default();
-                binding.set(v.e.index, &id_value(&make_id(0x01, 17)));
+                let mut binding = BindingStore::new();
+                binding.bind(v.e.index, &id_value(&make_id(0x01, 17)));
                 binding
             }),
         ),
@@ -526,7 +526,7 @@ fn confirm_crossover_sweep() {
                     }
                 })
                 .collect();
-            let (cpu_ms, gpu_ms) = bench(variable, &binding, &candidates, shape);
+            let (cpu_ms, gpu_ms) = bench(variable, &binding.view(), &candidates, shape);
             println!(
                 "{:>8} {:>12.3} {:>12.3} {:>8.2}",
                 size,

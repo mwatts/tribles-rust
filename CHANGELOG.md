@@ -50,6 +50,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   materialized closure index (`triblespace-paths`, under development), and
   the book gives a fixed-depth join and an application-side fixpoint loop
   as the interim answer rather than inventing an API.
+- **Bindings are paths, not value copies.** A bound variable's value
+  always originates from that variable's own level buffer, so `Binding`
+  now stores the `u32` index of the chosen entry and resolves it through
+  the buffers on read instead of carrying a 32-byte copy per variable.
+  Two engine properties license the swap: a level's buffer is only
+  cleared and refilled when its variable is (re-)pushed — at which moment
+  the variable is unbound — and buffers are write-once (confirmers kill
+  entries by clearing a parallel liveness word; nothing rewrites a value
+  the engine can already see). `Binding` is consequently a *view* — the
+  index row plus a borrow of the level buffers — and the new
+  `BindingStore` owns both halves; `Binding::set` is replaced by
+  `BindingStore::bind`, `Binding::get` and every `Constraint` signature
+  are unchanged (`&Binding` still elides). `size_of::<Binding>()` goes
+  4112 → 32 bytes (a view), the value-carrying part of the search state
+  goes 4 KiB → 512 bytes, a bind is a 4-byte write instead of a 32-byte
+  copy, and `Query` shrinks 22640 → 19040 bytes, which the rayon splitter
+  pays per fork. The engine gets the `&mut` on the level it is proposing
+  into by moving that level out of the array for the duration of the call
+  (no `unsafe`); widening is the exception and appends a detached chunk
+  instead, because the engine reaches a widen by exhausting a level whose
+  variable is *still bound* and whose binding must keep resolving. The
+  real point is downstream: a batch of bindings is now a small integer
+  matrix over shared, device-resident buffers — the shape GPU *descent*
+  needs, not just GPU confirm.
+
 - **Pattern constants are Term-native again — `or!(pattern!, pattern!)`
   works.** Resurrects 78c1a1b7's constant folding on the June-protocol
   engine: `TribleSetConstraint`, `SuccinctArchiveConstraint`, and the GPU

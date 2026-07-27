@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use triblespace_core::id::rngid;
 use triblespace_core::prelude::*;
 use triblespace_core::query::{
-    Binding, Candidates, Constraint, ContainsConstraint, ProposalBuffer, ProposeCursor, TriblePattern, Variable, VariableContext,
+    Binding, BindingStore, Candidates, Constraint, ContainsConstraint, ProposalBuffer, ProposeCursor, TriblePattern, Variable, VariableContext,
 };
 use triblespace_core::trible::{Fragment, Trible};
 use triblespace_core::inline::encodings::genid::GenId;
@@ -119,16 +119,16 @@ proptest! {
             let v: Variable<UnknownInline> = ctx.next_variable();
             let constraint = set.pattern(e, a, v);
 
-            let mut binding = Binding::default();
+            let mut binding = BindingStore::new();
             let mut e_val = [0u8; 32];
             e_val[16..32].copy_from_slice(&t.data[0..16]);
-            binding.set(e.index, &e_val);
+            binding.bind(e.index, &e_val);
             let mut a_val = [0u8; 32];
             a_val[16..32].copy_from_slice(&t.data[16..32]);
-            binding.set(a.index, &a_val);
-            binding.set(v.index, &t.data[32..64].try_into().unwrap());
+            binding.bind(a.index, &a_val);
+            binding.bind(v.index, &t.data[32..64].try_into().unwrap());
 
-            prop_assert!(constraint.satisfied(&binding),
+            prop_assert!(constraint.satisfied(&binding.view()),
                 "existing triple should satisfy constraint");
         }
     }
@@ -146,16 +146,16 @@ proptest! {
             let v: Variable<UnknownInline> = ctx.next_variable();
             let constraint = set.pattern(e, a, v);
 
-            let mut binding = Binding::default();
+            let mut binding = BindingStore::new();
             let mut e_val = [0u8; 32];
             e_val[16..32].copy_from_slice(&fake.data[0..16]);
-            binding.set(e.index, &e_val);
+            binding.bind(e.index, &e_val);
             let mut a_val = [0u8; 32];
             a_val[16..32].copy_from_slice(&fake.data[16..32]);
-            binding.set(a.index, &a_val);
-            binding.set(v.index, &fake.data[32..64].try_into().unwrap());
+            binding.bind(a.index, &a_val);
+            binding.bind(v.index, &fake.data[32..64].try_into().unwrap());
 
-            prop_assert!(!constraint.satisfied(&binding),
+            prop_assert!(!constraint.satisfied(&binding.view()),
                 "absent triple should not satisfy constraint");
         }
     }
@@ -635,15 +635,15 @@ proptest! {
         use triblespace_core::query::equalityconstraint::EqualityConstraint;
 
         let eq = EqualityConstraint::new(0, 1);
-        let mut binding = Binding::default();
-        binding.set(0, &val);
+        let mut binding = BindingStore::new();
+        binding.bind(0, &val);
 
         // With peer bound, estimate should be 1
-        prop_assert_eq!(eq.estimate(1, &binding), Some(1));
+        prop_assert_eq!(eq.estimate(1, &binding.view()), Some(1));
 
         // Propose should yield the peer's value
         let mut proposals = ProposalBuffer::new();
-        eq.propose(1, &binding, &mut proposals);
+        eq.propose(1, &binding.view(), &mut proposals);
         prop_assert_eq!(proposals.len(), 1);
         prop_assert_eq!(proposals[0], val);
     }
@@ -656,13 +656,13 @@ proptest! {
         use triblespace_core::query::equalityconstraint::EqualityConstraint;
 
         let eq = EqualityConstraint::new(0, 1);
-        let mut binding = Binding::default();
-        binding.set(0, &peer_val);
+        let mut binding = BindingStore::new();
+        binding.bind(0, &peer_val);
 
         let mut proposals = ProposalBuffer::new();
         proposals.push(peer_val);
         proposals.push(other_val);
-        eq.confirm(1, &binding, &mut proposals.region(0));
+        eq.confirm(1, &binding.view(), &mut proposals.region(0));
 
         if peer_val == other_val {
             prop_assert_eq!(proposals.count_live(0), 2); // both match
@@ -680,11 +680,11 @@ proptest! {
         use triblespace_core::query::equalityconstraint::EqualityConstraint;
 
         let eq = EqualityConstraint::new(0, 1);
-        let mut binding = Binding::default();
-        binding.set(0, &a_val);
-        binding.set(1, &b_val);
+        let mut binding = BindingStore::new();
+        binding.bind(0, &a_val);
+        binding.bind(1, &b_val);
 
-        prop_assert_eq!(eq.satisfied(&binding), a_val == b_val);
+        prop_assert_eq!(eq.satisfied(&binding.view()), a_val == b_val);
     }
 
     #[test]
@@ -698,9 +698,9 @@ proptest! {
         prop_assert!(eq.satisfied(&binding));
 
         // One bound — optimistically true
-        let mut binding = Binding::default();
-        binding.set(0, &[42; 32]);
-        prop_assert!(eq.satisfied(&binding));
+        let mut binding = BindingStore::new();
+        binding.bind(0, &[42; 32]);
+        prop_assert!(eq.satisfied(&binding.view()));
     }
 
     #[test]
@@ -712,16 +712,16 @@ proptest! {
         let eq = EqualityConstraint::new(0, 1);
 
         // Bind a=val, propose for b → val
-        let mut binding_a = Binding::default();
-        binding_a.set(0, &val);
+        let mut binding_a = BindingStore::new();
+        binding_a.bind(0, &val);
         let mut props_b = ProposalBuffer::new();
-        eq.propose(1, &binding_a, &mut props_b);
+        eq.propose(1, &binding_a.view(), &mut props_b);
 
         // Bind b=val, propose for a → val
-        let mut binding_b = Binding::default();
-        binding_b.set(1, &val);
+        let mut binding_b = BindingStore::new();
+        binding_b.bind(1, &val);
         let mut props_a = ProposalBuffer::new();
-        eq.propose(0, &binding_b, &mut props_a);
+        eq.propose(0, &binding_b.view(), &mut props_a);
 
         prop_assert_eq!(&props_a[..], &props_b[..]);
     }
@@ -789,18 +789,18 @@ proptest! {
 
     #[test]
     fn binding_set_get_roundtrip(idx in 0..128usize, value: [u8; 32]) {
-        let mut binding = Binding::default();
-        binding.set(idx, &value);
-        let got = binding.get(idx);
+        let mut binding = BindingStore::new();
+        binding.bind(idx, &value);
+        let got = binding.view().get(idx);
         prop_assert_eq!(got, Some(&value));
     }
 
     #[test]
     fn binding_unset_removes(idx in 0..128usize, value: [u8; 32]) {
-        let mut binding = Binding::default();
-        binding.set(idx, &value);
+        let mut binding = BindingStore::new();
+        binding.bind(idx, &value);
         binding.unset(idx);
-        prop_assert_eq!(binding.get(idx), None);
+        prop_assert_eq!(binding.view().get(idx), None);
     }
 
     #[test]
@@ -810,14 +810,14 @@ proptest! {
         vi: [u8; 32],
         vj: [u8; 32],
     ) {
-        let mut binding = Binding::default();
-        binding.set(i, &vi);
-        binding.set(j, &vj);
-        prop_assert_eq!(binding.get(i), Some(&vi));
-        prop_assert_eq!(binding.get(j), Some(&vj));
+        let mut binding = BindingStore::new();
+        binding.bind(i, &vi);
+        binding.bind(j, &vj);
+        prop_assert_eq!(binding.view().get(i), Some(&vi));
+        prop_assert_eq!(binding.view().get(j), Some(&vj));
         binding.unset(i);
-        prop_assert_eq!(binding.get(i), None);
-        prop_assert_eq!(binding.get(j), Some(&vj)); // j unaffected
+        prop_assert_eq!(binding.view().get(i), None);
+        prop_assert_eq!(binding.view().get(j), Some(&vj)); // j unaffected
     }
 
 }
@@ -942,5 +942,115 @@ proptest! {
         )
         .collect();
         prop_assert_eq!(results.len(), expected);
+    }
+}
+
+/// Chunked source that records what the binding resolved to for its own
+/// variable on every `propose_chunk` call.
+///
+/// Bindings are indexes into the per-level proposal buffers, so the level
+/// a widen request appends to is the same one the current binding reads
+/// through. This constraint pins that: the engine reaches a widen by
+/// consuming the materialized region dry, which leaves the level's
+/// variable bound to the last entry it handed out.
+struct WidenObserver {
+    variable: usize,
+    values: Vec<[u8; 32]>,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<Option<[u8; 32]>>>>,
+}
+
+impl<'a> Constraint<'a> for WidenObserver {
+    fn variables(&self) -> triblespace_core::query::VariableSet {
+        let mut set = triblespace_core::query::VariableSet::new_empty();
+        set.set(self.variable);
+        set
+    }
+
+    fn estimate(&self, variable: usize, _binding: &Binding) -> Option<usize> {
+        (variable == self.variable).then_some(self.values.len())
+    }
+
+    fn propose(&self, variable: usize, binding: &Binding, proposals: &mut ProposalBuffer) {
+        let mut cursor = ProposeCursor::default();
+        while self.propose_chunk(variable, binding, &mut cursor, usize::MAX, proposals) {}
+    }
+
+    fn propose_chunk(
+        &self,
+        variable: usize,
+        binding: &Binding,
+        cursor: &mut ProposeCursor,
+        budget: usize,
+        proposals: &mut ProposalBuffer,
+    ) -> bool {
+        if variable != self.variable {
+            return false;
+        }
+        // The observation under test: resolving the binding for the very
+        // variable being proposed for, mid-propose.
+        self.seen
+            .lock()
+            .unwrap()
+            .push(binding.get(variable).copied());
+        let mut delivered = u64::from_le_bytes(cursor.key[0..8].try_into().unwrap()) as usize;
+        if !cursor.started {
+            cursor.started = true;
+            delivered = 0;
+        }
+        let take = budget.min(self.values.len() - delivered);
+        proposals.extend_from_slice(&self.values[delivered..delivered + take]);
+        let delivered = delivered + take;
+        cursor.key[0..8].copy_from_slice(&(delivered as u64).to_le_bytes());
+        delivered < self.values.len()
+    }
+
+    fn confirm(&self, variable: usize, _binding: &Binding, cands: &mut Candidates<'_>) {
+        if variable == self.variable {
+            cands.retain(|v| self.values.binary_search(v).is_ok());
+        }
+    }
+}
+
+#[test]
+fn widening_a_level_keeps_its_variable_resolvable() {
+    // Enough values to span the 64 / 256 / 1024 geometric chunk ladder.
+    let mut values: Vec<[u8; 32]> = (0..500u32)
+        .map(|i| {
+            let mut v = [0u8; 32];
+            v[28..32].copy_from_slice(&i.to_be_bytes());
+            v
+        })
+        .collect();
+    values.sort_unstable();
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let source = WidenObserver {
+        variable: 0,
+        values: values.clone(),
+        seen: std::sync::Arc::clone(&seen),
+    };
+
+    let results: Vec<[u8; 32]> = triblespace_core::query::Query::new(source, |binding: &Binding| {
+        binding.get(0).copied()
+    })
+    .collect();
+    assert_eq!(results, values);
+
+    let seen = seen.lock().unwrap();
+    // 500 values over budgets 64, 256, 1024 — three calls, the last of
+    // which reports exhaustion.
+    assert!(seen.len() >= 3, "expected several chunks, got {}", seen.len());
+    // The level is pushed while its variable is unbound...
+    assert_eq!(seen[0], None);
+    // ...and every widen after that happens with the variable still bound
+    // to the last entry the level handed out.
+    let mut consumed = 0usize;
+    for (chunk, observed) in seen[1..].iter().enumerate() {
+        consumed += [64usize, 256, 1024][chunk].min(values.len() - consumed);
+        assert_eq!(
+            *observed,
+            Some(values[consumed - 1]),
+            "widen #{chunk} should resolve the level's current binding"
+        );
     }
 }
