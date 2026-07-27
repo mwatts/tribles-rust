@@ -342,17 +342,40 @@ pub fn verify(path: &Path) -> Result<()> {
     // Project the span id too: find! heads have SET semantics, so a
     // name-only head would collapse the per-iteration spans to one row
     // per distinct name.
-    let mut span_names: std::collections::BTreeMap<String, usize> = Default::default();
-    for (_s, n) in find!(
-        (s: Id, n: Inline<Handle<LongString>>),
-        pattern!(&facts, [{ ?s @ metadata::tag: kind_span, tele::name: ?n }])
+    //
+    // The runner deliberately stores raw per-iteration observations and
+    // never aggregates; reading a duration out of them is the viewer's
+    // job, and this is the suite's own minimal viewer. `min` leads the
+    // summary on purpose: on a contended machine the fastest observed
+    // iteration is the least contaminated estimate of the work itself,
+    // while the spread against `max` shows how much interference the
+    // run actually absorbed.
+    let mut span_times: std::collections::BTreeMap<String, Vec<u64>> = Default::default();
+    for (_s, n, d) in find!(
+        (s: Id, n: Inline<Handle<LongString>>, d: u64),
+        pattern!(&facts, [{ ?s @ metadata::tag: kind_span, tele::name: ?n, tele::duration_ns: ?d }])
     ) {
         let name: anybytes::View<str> =
             reader.get(n).map_err(|e| anyhow!("span name blob: {e:?}"))?;
-        *span_names.entry(name.as_ref().to_owned()).or_default() += 1;
+        span_times
+            .entry(name.as_ref().to_owned())
+            .or_default()
+            .push(d);
     }
-    for (name, count) in &span_names {
-        println!("  {name:<45} x{count}");
+    println!(
+        "  {:<45}{:>4}{:>12}{:>12}{:>12}",
+        "span", "n", "min ms", "median ms", "max ms"
+    );
+    for (name, times) in &mut span_times {
+        times.sort_unstable();
+        let ms = |ns: u64| ns as f64 / 1e6;
+        println!(
+            "  {name:<45}{:>4}{:>12.3}{:>12.3}{:>12.3}",
+            times.len(),
+            ms(times[0]),
+            ms(times[times.len() / 2]),
+            ms(times[times.len() - 1]),
+        );
     }
 
     // Optional rows per outcome entity (the engine is monotone; the
