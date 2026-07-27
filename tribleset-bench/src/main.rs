@@ -13,8 +13,11 @@
 //!   commits of the `--data` pile's branch at the `--rung` target.
 //! - `arch/build_ram/total` — `SuccinctArchive<OrderedUniverse>` build
 //!   over the checked-out set.
-//! - `harkonnen/F{1..5}/{ttfr,total}` — the adversarial fixtures; F3
+//! - `harkonnen/F{1..5}/{ttfr,total}` — the R1 adversarial fixtures; F3
 //!   (oasis) and F5 (diamond) run everywhere, F1/F2/F4 are rpq-gated.
+//! - `harkonnen/F{6..15}/…` — the R2 white-box fixtures, one engine
+//!   decision each. All run everywhere except F10, which is gpu-gated
+//!   because it reads the routing threshold out of `triblespace-gpu`.
 //! - `sparqloscope/<query>/total` — the vendored TRANSLATED registry;
 //!   without a wd Dataset every query records SKIP "dataset absent"
 //!   (the census still lands in the pile).
@@ -27,6 +30,8 @@
 //! commit-metadata record to the pile file on open.
 
 use std::time::Instant;
+
+use subject::core::prelude::TribleSet;
 
 mod fixtures;
 mod ledger;
@@ -233,6 +238,57 @@ impl Measure {
     }
 }
 
+/// One measure of an R2 fixture: what to call on the built set, whether
+/// its row count is a cardinality (vs. a TTFR sentinel), and the exact
+/// count its construction predicts.
+struct R2Measure {
+    name: &'static str,
+    /// Whether `rows` is meaningful telemetry (false for TTFR probes,
+    /// which only ever report 0 or 1).
+    rows_meaningful: bool,
+    /// The gate. `None` only where a fixture's construction genuinely
+    /// does not pin a count.
+    expect: Option<usize>,
+    run: fn(&TribleSet) -> usize,
+}
+
+/// Build one R2 fixture (panic-guarded, once) and iterate every measure
+/// over it, gating each on its expected row count. A panic in the
+/// builder is recorded against every measure of the fixture, matching
+/// how the F3/F5 pair is handled.
+fn run_r2(
+    led: &mut ledger::ResultsLedger,
+    warmup: usize,
+    iters: usize,
+    base: &Instant,
+    build: impl FnOnce() -> TribleSet,
+    measures: &[R2Measure],
+) {
+    let built = match fixtures::quiet_catch(build) {
+        Err(msg) => {
+            for m in measures {
+                led.outcome(m.name, &format!("panic:{msg}"), None);
+                println!("  {:<32} panic ({msg})", m.name);
+            }
+            return;
+        }
+        Ok(set) => set,
+    };
+    let mut running: Vec<Measure> = measures.iter().map(|m| Measure::new(m.name)).collect();
+    for i in 0..(warmup + iters) {
+        let recording = i >= warmup;
+        for (state, spec) in running.iter_mut().zip(measures.iter()) {
+            state.iterate(recording, base, || (spec.run)(&built));
+        }
+    }
+    for (mut state, spec) in running.into_iter().zip(measures.iter()) {
+        if let Some(expected) = spec.expect {
+            state.expect_rows(expected);
+        }
+        state.emit(led, spec.rows_meaningful);
+    }
+}
+
 fn main() {
     let cfg = parse_cfg();
 
@@ -402,6 +458,10 @@ fn main() {
         }
     }
 
+    // -- harkonnen R2 (F6..F15) --------------------------------------------
+    // One fixture at a time: each builder runs once, its measures share
+    // the built set, and every measure carries the exact row count its
+    // construction derives (see the fixture docs for each derivation).
     // -- sparqloscope ------------------------------------------------------
     // No wd Dataset loader is vendored (the pile manifest schema and
     // loaders stay in sparqloscope-bench, and no wd dataset exists on

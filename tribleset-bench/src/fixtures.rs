@@ -20,6 +20,14 @@
 //! - `commit_chain` + `pile_checkout` — the ladder phase: checkout of
 //!   the first k commits of a dataset pile's data branch, where k is
 //!   derived from a cumulative-trible rung target.
+//!
+//! Native to this crate (not vendored):
+//! - the Harkonnen R2 white-box fixtures F6..F15 (attribute ids minted
+//!   2026-07-27). Each one isolates ONE engine decision changed in the
+//!   Term-native / propose-confirm work of this week, so a regression
+//!   gets a name instead of a vibe. None is path-shaped, so none is
+//!   rpq-gated; only F10 (which reads the GPU routing threshold out of
+//!   `triblespace-gpu`) is feature-gated.
 
 use std::time::Instant;
 
@@ -33,6 +41,13 @@ use subject::core::inline::encodings::hash::Handle;
 use subject::core::metadata;
 use subject::core::prelude::inlineencodings::GenId;
 use subject::core::prelude::*;
+// Raw engine protocol surface — needed only by the R2 fixtures: F11's
+// hand-written `Constraint` wrapper, F12's programmatic chain, and F13's
+// hand-rolled variable context.
+use subject::core::query::{
+    Binding, Candidates, Constraint, ProposalBuffer, ProposeCursor, VariableContext, VariableId,
+    VariableSet,
+};
 use subject::core::repo::pile::Pile;
 use subject::core::repo::{self, Repository};
 
@@ -492,4 +507,94 @@ pub fn pile_checkout(
         return Err(g);
     }
     Ok((out.expect("at least one iteration"), spans, ident.unwrap_or(0)))
+}
+
+// ---------------------------------------------------------------------------
+// Harkonnen R2 white-box fixtures (F6..F15).
+//
+// R1 (F1..F5) probed the engine as a black box: adversarial *shapes*
+// whose cost profile exposed whatever the solver did. R2 is the
+// complement — each fixture isolates exactly ONE engine decision changed
+// in this week's Term-native / propose-confirm work, with a deterministic
+// construction and an EXACT expected row count derived from the
+// construction (never a magic number). A regression then gets a name.
+//
+// Every builder is deterministic: fixed anchors, `Ids`' splitmix walk,
+// no RNG. Sizes are deliberately modest — the whole suite must stay
+// inside seconds on a machine that is already busy — and each fixture's
+// doc records what its size buys.
+// ---------------------------------------------------------------------------
+
+mod r2_schema {
+    use subject::core::prelude::*;
+
+    attributes! {
+        // F6 — the eight `or!` arm attributes (k = F6_ARMS).
+        "84AAEA2CDB0F31C9926D5BA55DCB646B" as u0: inlineencodings::GenId;
+        "A784BFAFA148EFF689FA757C2A95EA2C" as u1: inlineencodings::GenId;
+        "2AAB1B3A425B16D9680BF525CB0A9496" as u2: inlineencodings::GenId;
+        "1A6306A5E7A469266D3F6BC3B4F0F830" as u3: inlineencodings::GenId;
+        "5478E2F71D3C8FA4FCFD72D653C2F050" as u4: inlineencodings::GenId;
+        "595533D46DA73D4D9EDAE23C69DA8B28" as u5: inlineencodings::GenId;
+        "BBB163B3E6F55B2040940AD229F012D7" as u6: inlineencodings::GenId;
+        "B358920E7B50BC2334BDBA2B9EE95D44" as u7: inlineencodings::GenId;
+        // F7 — hub skew: in-edge (source -> node) and out-edge (node -> target).
+        "0E64D47BDE5A9CCE0F41C6384BC7935F" as hs: inlineencodings::GenId;
+        "D88DE6AC745F82E035551D9D2625F976" as ht: inlineencodings::GenId;
+        // F8 — witness multiplicity: the two hidden-variable fans.
+        "52A53A202DFC13F7074E0A697ABAB30C" as wa: inlineencodings::GenId;
+        "236FC28BA8AA72FDE8E5723B403A0BD2" as wb: inlineencodings::GenId;
+        // F9 — mask density: proposer side and confirmer side.
+        "8DC793B45ADE8B81ADE789E8313BF974" as ma: inlineencodings::GenId;
+        "B0E12EFD7CF941497603F09DEDF89760" as mb: inlineencodings::GenId;
+        // F10 — GPU confirm-batch threshold: proposer side and confirmer side.
+        "3573F33EBA6E94CBAFFD27FFBAA4A0F8" as ga: inlineencodings::GenId;
+        "3E9767FEE8A1EE68C58F0419817D5140" as gb: inlineencodings::GenId;
+        // F11 — lying estimates: the small source and the large source.
+        "7503DE9B6CA70780D9096223E4DD1A08" as la: inlineencodings::GenId;
+        "EE3CC3EBE8F1E540DBC396C985E282F2" as lb: inlineencodings::GenId;
+        // F12 — deep chain: the single functional hop edge.
+        "7A7F3D3A4EBFB4FC617D063261FB592C" as hop: inlineencodings::GenId;
+        // F13 — constant pressure: five string-valued slots per entity.
+        "FCE112E22C1592CC487EF5320D9E25D7" as c0: inlineencodings::ShortString;
+        "B57751A976F6908E53938CF80A615DCC" as c1: inlineencodings::ShortString;
+        "8C72F6255184F8FA9BDBD15574F540A8" as c2: inlineencodings::ShortString;
+        "ED5816955F19EFA0C6BBA2C2F7BA77ED" as c3: inlineencodings::ShortString;
+        "61C46CDF6E77A00A3B566C5157F57EFB" as c4: inlineencodings::ShortString;
+        // F14 — widening ramp: the wide root and the selective confirmer.
+        "6389E8FE7CA25BE81A2BAFEF79C8EDBC" as w1: inlineencodings::GenId;
+        "ED3F65982ED22D4008A510A19D4798A8" as w2: inlineencodings::GenId;
+        // F15 — union dedup pressure: the two overlapping arms.
+        "32697C0766C902A3A6BEA17656631E5F" as ua: inlineencodings::GenId;
+        "CBF362B65F450B457B32C05C5198868F" as ub: inlineencodings::GenId;
+    }
+}
+
+/// Locality prefix of every R2 *anchor* — a well-known id a builder and
+/// its query both name without plumbing a value through a return type.
+/// Distinct from `Ids`' bulk prefix (`0xD46B0001`) so anchors can never
+/// collide with generated filler.
+const ANCHOR_TAG: u32 = 0xD46B_0002;
+
+/// The anchor registry (`n` -> role). Keeping every anchor in ONE
+/// numbering makes accidental reuse across fixtures impossible to write
+/// by mistake:
+///
+/// | `n`      | role |
+/// |----------|------|
+/// | 0..=7    | F6 arm hub value (the literal each arm matches) |
+/// | 8..=15   | F6 arm decoy value (same attribute, wrong literal) |
+/// | 16, 17   | F9 proposer root, confirmer probe |
+/// | 18, 19   | F10 below-threshold root, probe |
+/// | 20, 21   | F10 above-threshold root, probe |
+/// | 22, 23   | F11 small source root, large source root |
+/// | 24, 25   | F14 wide root, selective probe |
+/// | 26       | F15 shared hub value |
+/// | 100..    | F13 constant-pressure entities (`100 + i`) |
+fn anchor(n: u64) -> ExclusiveId {
+    let mut raw = [0u8; 16];
+    raw[..4].copy_from_slice(&ANCHOR_TAG.to_be_bytes());
+    raw[4..12].copy_from_slice(&Ids::splitmix64(n).to_be_bytes());
+    raw[12..].copy_from_slice(&Ids::splitmix64(n ^ 0xA5A5_5A5A).to_be_bytes()[..4]);
+    ExclusiveId::force(Id::new(raw).expect("nonzero prefix"))
 }
