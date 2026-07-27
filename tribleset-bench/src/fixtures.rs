@@ -699,3 +699,66 @@ pub fn f6_total(set: &TribleSet) -> usize {
     )
     .count()
 }
+
+// ---------------------------------------------------------------------------
+// F7 — hub skew.
+//
+// INTERROGATES: cardinality-estimate robustness and dynamic variable
+// ordering under an extreme degree distribution.
+//
+// `IntersectionConstraint` picks its proposer by minimum estimate and
+// re-sorts the unbound variables whenever a binding invalidates an
+// estimate (`push_next_variable`). A single node with a 20 000x degree
+// makes the *average* estimate a lie: any plan chosen from global
+// cardinality alone is wrong for one of the two populations. The row
+// count is invariant under every legal plan, so it gates correctness
+// while the spans record what the skew cost.
+// ---------------------------------------------------------------------------
+
+/// F7: uniform nodes (in-degree 1, out-degree 1).
+pub const F7_UNIFORM: usize = 1_000;
+/// F7: out-degree of the single hub node (in-degree 1).
+pub const F7_HUB_FANOUT: usize = 20_000;
+
+/// F7 expected rows. The join `?x -hs-> ?h -ht-> ?y` yields, per middle
+/// node, in-degree x out-degree rows: the hub contributes
+/// `1 * F7_HUB_FANOUT`, each uniform node `1 * 1`.
+/// 20 000 + 1 000 = 21 000.
+pub const F7_EXPECTED_ROWS: usize = F7_HUB_FANOUT + F7_UNIFORM;
+
+/// F7 builder: one hub with `F7_HUB_FANOUT` out-edges plus `F7_UNIFORM`
+/// degree-1 nodes; every middle node has exactly one in-edge, so the
+/// skew lives entirely in the out-degree.
+pub fn build_hub_skew() -> TribleSet {
+    let mut ids = Ids::new();
+    let mut set = TribleSet::new();
+
+    let hub = ids.mint();
+    let hub_src = ids.mint();
+    set += entity! { &hub_src @ r2_schema::hs: &hub };
+    for _ in 0..F7_HUB_FANOUT {
+        let y = ids.mint();
+        set += entity! { &hub @ r2_schema::ht: &y };
+    }
+
+    for _ in 0..F7_UNIFORM {
+        let h = ids.mint();
+        let x = ids.mint();
+        let y = ids.mint();
+        set += entity! { &x @ r2_schema::hs: &h };
+        set += entity! { &h @ r2_schema::ht: &y };
+    }
+    set
+}
+
+/// F7 full drain: total row count (expected [`F7_EXPECTED_ROWS`]).
+pub fn f7_total(set: &TribleSet) -> usize {
+    find!(
+        (x: Inline<GenId>, h: Inline<GenId>, y: Inline<GenId>),
+        and!(
+            pattern!(set, [{ ?x @ r2_schema::hs: ?h }]),
+            pattern!(set, [{ ?h @ r2_schema::ht: ?y }]),
+        )
+    )
+    .count()
+}
