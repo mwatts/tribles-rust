@@ -59,23 +59,8 @@ use crate::inline::RawInline;
 pub use variableset::VariableSet;
 
 impl<T: InlineEncoding> Term<T> {
-    /// Unwraps a variable term, panicking on constants.
-    ///
-    /// The macro layer desugars every literal to a hidden variable plus
-    /// [`ConstantConstraint`](constantconstraint::ConstantConstraint), so
-    /// pattern backends only ever see variable terms. Direct-API constant
-    /// terms are rejected here until Term-native constraints return.
-    pub fn expect_variable(self) -> Variable<T> {
-        match self {
-            Term::Var(v) => v,
-            Term::Const(_) => panic!(
-                "constant terms are not supported by this engine build; \
-                 pass a variable and pin it with ConstantConstraint"
-            ),
-        }
-    }
-
-    /// Erases the schema type, yielding the raw term.
+    /// Erases the schema type, yielding the runtime representation
+    /// constraint implementations store.
     pub fn erase(self) -> RawTerm {
         match self {
             Term::Var(v) => RawTerm::Var(v.index),

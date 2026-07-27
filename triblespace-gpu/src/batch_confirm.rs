@@ -47,8 +47,8 @@ use triblespace_core::blob::encodings::succinctarchive::{
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::{InlineEncoding, RawInline};
 use triblespace_core::query::{
-    and_words, Binding, Candidates, Constraint, ProposalBuffer, ProposeCursor, Term, TriblePattern,
-    Variable, VariableId, VariableSet,
+    and_words, Binding, Candidates, Constraint, ProposalBuffer, ProposeCursor, RawTerm, Term,
+    TriblePattern, VariableId, VariableSet,
 };
 
 const THREADS: u32 = super::THREADS;
@@ -648,12 +648,7 @@ where
         a: impl Into<Term<GenId>>,
         v: impl Into<Term<V>>,
     ) -> Self::PatternConstraint<'a> {
-        WgpuSuccinctArchiveConstraint::new(
-            e.into().expect_variable(),
-            a.into().expect_variable(),
-            v.into().expect_variable(),
-            self,
-        )
+        WgpuSuccinctArchiveConstraint::new(e, a, v, self)
     }
 }
 
@@ -673,28 +668,34 @@ where
 {
     inner: SuccinctArchiveConstraint<'a, U>,
     gpu: &'a WgpuSuccinctArchive<U>,
-    variable_e: VariableId,
-    variable_a: VariableId,
-    variable_v: VariableId,
+    term_e: RawTerm,
+    term_a: RawTerm,
+    term_v: RawTerm,
 }
 
 impl<'a, U> WgpuSuccinctArchiveConstraint<'a, U>
 where
     U: Universe,
 {
-    /// Builds the constraint over `gpu`'s wrapped archive.
+    /// Builds the constraint over `gpu`'s wrapped archive. Each position
+    /// takes a [`Term`]: a variable to solve for or a constant pinned at
+    /// construction (constants never enter the variable set and enter the
+    /// arm dispatch as born-bound, exactly as on the CPU constraint).
     pub fn new<V: InlineEncoding>(
-        variable_e: Variable<GenId>,
-        variable_a: Variable<GenId>,
-        variable_v: Variable<V>,
+        e: impl Into<Term<GenId>>,
+        a: impl Into<Term<GenId>>,
+        v: impl Into<Term<V>>,
         gpu: &'a WgpuSuccinctArchive<U>,
     ) -> Self {
+        let e: Term<GenId> = e.into();
+        let a: Term<GenId> = a.into();
+        let v: Term<V> = v.into();
         WgpuSuccinctArchiveConstraint {
-            inner: SuccinctArchiveConstraint::new(variable_e, variable_a, variable_v, &gpu.archive),
+            inner: SuccinctArchiveConstraint::new(e, a, v, &gpu.archive),
             gpu,
-            variable_e: variable_e.index,
-            variable_a: variable_a.index,
-            variable_v: variable_v.index,
+            term_e: e.erase(),
+            term_a: a.erase(),
+            term_v: v.erase(),
         }
     }
 
@@ -708,13 +709,13 @@ where
         binding: &Binding,
         cands: &mut Candidates<'_>,
     ) -> jerky::Result<()> {
-        let e_var = self.variable_e == variable;
-        let a_var = self.variable_a == variable;
-        let v_var = self.variable_v == variable;
+        let e_var = self.term_e.is_var(variable);
+        let a_var = self.term_a.is_var(variable);
+        let v_var = self.term_v.is_var(variable);
 
-        let e_bound = binding.get(self.variable_e);
-        let a_bound = binding.get(self.variable_a);
-        let v_bound = binding.get(self.variable_v);
+        let e_bound = self.term_e.position_value(binding);
+        let a_bound = self.term_a.position_value(binding);
+        let v_bound = self.term_v.position_value(binding);
 
         let archive = self.gpu.archive();
         let (rotation, r) = match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
@@ -814,7 +815,9 @@ where
     }
 
     fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
-        if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
+        if !self.term_e.is_var(variable)
+            && !self.term_a.is_var(variable)
+            && !self.term_v.is_var(variable)
         {
             return;
         }
