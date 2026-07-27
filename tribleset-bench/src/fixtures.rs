@@ -944,3 +944,79 @@ pub fn f9_total(set: &TribleSet) -> usize {
     )
     .count()
 }
+
+// ---------------------------------------------------------------------------
+// F10 — GPU confirm-batch threshold boundary.
+//
+// INTERROGATES: routing hysteresis around `DEFAULT_MIN_CONFIRM_BATCH`,
+// and threshold rot.
+//
+// `triblespace-gpu` routes a confirm region to the device only when it
+// holds at least `DEFAULT_MIN_CONFIRM_BATCH` live candidates; smaller
+// regions run the canonical CPU probes. The threshold is a MEASURED
+// crossover (an M4 Max sweep recorded in its doc comment), which means
+// it is exactly the kind of constant that silently rots. This fixture
+// straddles it: two runs whose only difference is one candidate on
+// either side of the boundary. The constant is READ from the engine
+// (never copied here), so moving it moves the fixture.
+//
+// Gate on ROWS only — the answer must be the region size on both sides,
+// which is the property routing may never change. Timings across the
+// boundary are the interesting signal but are not a gate.
+// ---------------------------------------------------------------------------
+
+/// F10: the routing threshold, read from the engine so this fixture
+/// cannot drift away from it.
+#[cfg(feature = "gpu")]
+pub const F10_THRESHOLD: usize = subject::gpu::DEFAULT_MIN_CONFIRM_BATCH;
+
+/// F10: candidates just BELOW the routing threshold (CPU probes).
+#[cfg(feature = "gpu")]
+pub const F10_BELOW: usize = F10_THRESHOLD - 1;
+
+/// F10: candidates just ABOVE the routing threshold (device confirm).
+#[cfg(feature = "gpu")]
+pub const F10_ABOVE: usize = F10_THRESHOLD + 1;
+
+/// F10 root of the region of size `n`.
+#[cfg(feature = "gpu")]
+fn f10_root(above: bool) -> ExclusiveId {
+    anchor(if above { 20 } else { 18 })
+}
+
+/// F10 probe of the region of size `n`.
+#[cfg(feature = "gpu")]
+fn f10_probe(above: bool) -> ExclusiveId {
+    anchor(if above { 21 } else { 19 })
+}
+
+/// F10 builder: a fully-live region of exactly `n` candidates —
+/// proposer and confirmer carry the same `n` values, so every candidate
+/// survives and the region handed to `confirm` is `n` entries wide.
+#[cfg(feature = "gpu")]
+pub fn build_gpu_boundary(above: bool, n: usize) -> TribleSet {
+    let mut ids = Ids::new();
+    let mut set = TribleSet::new();
+    let root = f10_root(above);
+    let probe = f10_probe(above);
+    for _ in 0..n {
+        let v = ids.mint();
+        set += entity! { &root @ r2_schema::ga: &v };
+        set += entity! { &probe @ r2_schema::gb: &v };
+    }
+    set
+}
+
+/// F10 full drain: total row count, expected to equal the region size
+/// (`F10_BELOW` / `F10_ABOVE`) on both sides of the boundary.
+#[cfg(feature = "gpu")]
+pub fn f10_total(above: bool, set: &TribleSet) -> usize {
+    find!(
+        (v: Inline<GenId>),
+        and!(
+            pattern!(set, [{ &f10_root(above) @ r2_schema::ga: ?v }]),
+            pattern!(set, [{ &f10_probe(above) @ r2_schema::gb: ?v }]),
+        )
+    )
+    .count()
+}

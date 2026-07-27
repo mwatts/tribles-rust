@@ -536,6 +536,41 @@ fn main() {
         }],
     );
 
+    #[cfg(not(feature = "gpu"))]
+    for name in ["harkonnen/F10/below", "harkonnen/F10/above"] {
+        led.outcome(name, "skip:gpu", None);
+        println!("  {name:<32} SKIP (gpu: no triblespace-gpu on the subject)");
+    }
+    #[cfg(feature = "gpu")]
+    {
+        run_r2(
+            &mut led,
+            cfg.warmup,
+            cfg.iters,
+            &base,
+            || fixtures::build_gpu_boundary(false, fixtures::F10_BELOW),
+            &[R2Measure {
+                name: "harkonnen/F10/below",
+                rows_meaningful: true,
+                expect: Some(fixtures::F10_BELOW),
+                run: |set| fixtures::f10_total(false, set),
+            }],
+        );
+        run_r2(
+            &mut led,
+            cfg.warmup,
+            cfg.iters,
+            &base,
+            || fixtures::build_gpu_boundary(true, fixtures::F10_ABOVE),
+            &[R2Measure {
+                name: "harkonnen/F10/above",
+                rows_meaningful: true,
+                expect: Some(fixtures::F10_ABOVE),
+                run: |set| fixtures::f10_total(true, set),
+            }],
+        );
+    }
+
     // -- sparqloscope ------------------------------------------------------
     // No wd Dataset loader is vendored (the pile manifest schema and
     // loaders stay in sparqloscope-bench, and no wd dataset exists on
