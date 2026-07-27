@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The book's query chapters describe the engine that exists.** Nine
+  chapters still narrated the deleted residual engine — `RowsView` row
+  blocks, canonical residual states, typed Programs, `proposal_coverage`,
+  the terminal projection gate, residual action observation, and the
+  `path!` macro. `query-engine.md` is rewritten as the flagship account of
+  the propose/confirm protocol: the seven `Constraint` methods and which
+  four a source must implement, statelessness and what it buys (free
+  backtracking, a clonable tree, a plain-data `ProposeCursor`), depth-first
+  search with dynamic variable ordering including the `ilog2` specificity
+  bucket and influence-count tie-break, the write-once `ProposalBuffer`
+  with per-entry liveness words, the kill-only `confirm` contract as the
+  reason confirmation needs no coordination, geometric chunked proposing,
+  rayon split-or-descend, BAG semantics at the interface (with a runnable
+  example and an account of why the claims table was removed), Term-native
+  constants below the variable layer, the GPU as batched confirm against a
+  measured threshold, where regular paths went, and a closing section on
+  the four refusals — no optimizer, no negation, no query-time recursion,
+  no projection dedup — and what each one buys. `query-language.md`,
+  `macro-cookbook.md`, and `incremental-queries.md` drop the stale
+  set-semantics phrasing; `atreides-join.md`, `glossary.md`,
+  `formal-verification.md`, `architecture.md`, `patterns-and-recipes.md`,
+  and `documentation-improvements.md` drop the deleted engine's
+  vocabulary. `path!` material is replaced honestly: paths moved to a
+  materialized closure index (`triblespace-paths`, under development), and
+  the book gives a fixed-depth join and an application-side fixpoint loop
+  as the interim answer rather than inventing an API.
 - **Pattern constants are Term-native again — `or!(pattern!, pattern!)`
   works.** Resurrects 78c1a1b7's constant folding on the June-protocol
   engine: `TribleSetConstraint`, `SuccinctArchiveConstraint`, and the GPU

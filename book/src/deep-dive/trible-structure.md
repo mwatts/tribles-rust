@@ -43,7 +43,7 @@ optimisations and allows the storage layer to compute sizes deterministically.
 `TribleSet`s index each fact under all six permutations of entity (E),
 attribute (A) and value (V) so any combination of bound variables can be
 resolved efficiently. Regardless of which columns a query fixes the
-planner can reach matching leaves with a handful of comparisons:
+search can reach matching leaves with a handful of comparisons:
 
 ```text
 ┌─────┐  ┌─────┐  ┌─────┐  ┌─────┐  ┌─────┐  ┌─────┐
@@ -64,7 +64,7 @@ planner can reach matching leaves with a handful of comparisons:
 
 Each permutation maintains its own inner nodes, but all six share leaf nodes
 containing the 64‑byte trible. This avoids a naïve six‑fold memory cost while
-still letting the query planner pick the most selective ordering, keeping joins
+still letting the search pick the most selective ordering, keeping joins
 resistant to skew even when cardinalities vary widely.
 
 ## Advantages

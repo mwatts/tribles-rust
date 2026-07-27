@@ -13,8 +13,7 @@
     maintaining custom delta code.
 - **Documentation polish.**
   - Draft advanced query examples that compose multiple `attributes!` modules
-    (including the regular path walkthrough) and slot them into the book
-    structure.
+    and slot them into the book structure.
   - Extract deep reference content from the API docs (`value`, `blob`, `repo`,
     and trible structure discussions) into dedicated book chapters.
   - Author the requested FAQ chapter and cross-link it from the landing page and
@@ -27,13 +26,33 @@
   - Capture any uncovered hotspots or tuning ideas back into this inventory for
     future releases.
 
+## Query engine documentation follow-ups
+- `triblespace-core/src/query/residual/` is still tracked (`delta.rs`,
+  `materialize.rs`, `positive_hedge_credit.rs`, `set_admit.rs` — ~640 KB) but
+  no `mod residual;` declaration reaches it anywhere in the crate. Orphaned by
+  the residual-engine deletion; delete it or re-attach it deliberately.
+- The `ProjectionKey` type alias in `triblespace-core/src/query.rs` is dead —
+  it keyed the terminal projection claim table, which no longer exists.
+- The `find!` macro's doc comment in `triblespace-core/src/query.rs` still
+  documents relational SET semantics, raw-head claiming before conversion, and
+  the "at most one `()`" rule for the unit head. The engine is a bag of
+  complete bindings (see the F8 fixture in `tribleset-bench`), so the doc
+  comment contradicts both the implementation and the rewritten book chapters.
+  The `Constraint` trait's own doc table likewise lists five methods for a
+  seven-method trait (`propose_chunk` and `influence` are missing).
+- The `[Unreleased]` section of `CHANGELOG.md` still carries entries describing
+  the deleted residual/typed-Program engine (residual compiler policy, typed
+  Program pagers, `OrderKeyMode`, RPQ scheduling) as if they shipped. They
+  should be reconciled before the next release notes are cut.
+- A book chapter on the `triblespace-paths` closure index is owed once that
+  crate's surface stabilises; the interim guidance lives in
+  `book/src/query-language.md#recursive-traversal`.
+
 ## Desired Functionality
 - Reconcile the residual branch's workspace-wide rustfmt baseline (or pin the
   intended formatter toolchain): `cargo fmt --all` currently rewrites many
   unrelated files, obscuring focused query-engine diffs.
 - Provide additional examples showcasing advanced queries and repository usage.
-- Include a regular path query example that combines attributes from multiple
-  `attributes!` modules in the book.
 - Helper to derive delta `TribleSet`s for `pattern_changes!` so callers don't
   have to compute them manually.
 - Add an exporter for the lossless JSON schema so archived JSON can be

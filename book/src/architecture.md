@@ -78,7 +78,7 @@ Each layer has a tight, well defined boundary.  Code that manipulates tribles ne
 
 The fundamental unit of information is a [`Trible`](https://docs.rs/triblespace/latest/triblespace/trible/struct.Trible.html).  Its 64 byte layout is described in [Trible Structure](deep-dive/trible-structure.md).  A `Trible` links a subject entity to an attribute and value.  Multiple tribles are stored in a [`TribleSet`](https://docs.rs/triblespace/latest/triblespace/trible/struct.TribleSet.html), which behaves like a hashmap with three columns — subject, attribute and value.
 
-The 64 byte boundary allows tribles to live comfortably on cache lines and makes deduplication trivial.  Because tribles are immutable, the runtime can copy, hash and serialise them without coordinating with other threads.  Higher level features like schema checking and query planning are therefore free to assume that every fact they observe is stable for the lifetime of a query.
+The 64 byte boundary allows tribles to live comfortably on cache lines and makes deduplication trivial.  Because tribles are immutable, the runtime can copy, hash and serialise them without coordinating with other threads.  Higher level features like schema checking and query evaluation are therefore free to assume that every fact they observe is stable for the lifetime of a query.
 
 ## Trible Sets
 
