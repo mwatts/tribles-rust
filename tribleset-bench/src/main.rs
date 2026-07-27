@@ -571,6 +571,33 @@ fn main() {
         );
     }
 
+    run_r2(
+        &mut led,
+        cfg.warmup,
+        cfg.iters,
+        &base,
+        fixtures::build_lying_estimates,
+        &[
+            R2Measure {
+                name: "harkonnen/F11/truth",
+                rows_meaningful: true,
+                expect: Some(fixtures::F11_EXPECTED_ROWS),
+                run: fixtures::f11_truth,
+            },
+            R2Measure {
+                name: "harkonnen/F11/over",
+                rows_meaningful: true,
+                expect: Some(fixtures::F11_EXPECTED_ROWS),
+                run: fixtures::f11_over,
+            },
+            R2Measure {
+                name: "harkonnen/F11/under",
+                rows_meaningful: true,
+                expect: Some(fixtures::F11_EXPECTED_ROWS),
+                run: fixtures::f11_under,
+            },
+        ],
+    );
     // -- sparqloscope ------------------------------------------------------
     // No wd Dataset loader is vendored (the pile manifest schema and
     // loaders stay in sparqloscope-bench, and no wd dataset exists on

@@ -1020,3 +1020,177 @@ pub fn f10_total(above: bool, set: &TribleSet) -> usize {
     )
     .count()
 }
+
+// ---------------------------------------------------------------------------
+// F11 — lying estimates.
+//
+// INTERROGATES: graceful degradation of dynamic variable ordering and of
+// the propose/confirm role choice when `Constraint::estimate` is wrong.
+//
+// The trait explicitly licenses inexact estimates ("the estimate need
+// not be exact — it guides variable ordering, not correctness"). This
+// fixture cashes that promise: the SAME query is run three times, once
+// honestly and twice through a wrapper whose `estimate` is wrong by
+// `F11_LIE_FACTOR` in each direction, forwarding every other method
+// verbatim. Both lies flip which side proposes and which side confirms.
+// All three must produce the same rows; only the spans may differ.
+// ---------------------------------------------------------------------------
+
+/// Test-only [`Constraint`] wrapper that scales the wrapped estimate by
+/// `mul / div` and forwards every other method unchanged. This is the
+/// only place in the suite that implements `Constraint` by hand; it
+/// exists so a fixture can hand the planner a known-wrong number.
+pub struct LyingEstimate<C> {
+    inner: C,
+    mul: usize,
+    div: usize,
+}
+
+impl<C> LyingEstimate<C> {
+    /// Report `factor`x MORE candidates than the wrapped constraint has.
+    pub fn over(inner: C, factor: usize) -> Self {
+        Self {
+            inner,
+            mul: factor,
+            div: 1,
+        }
+    }
+
+    /// Report `factor`x FEWER candidates than the wrapped constraint has.
+    pub fn under(inner: C, factor: usize) -> Self {
+        Self {
+            inner,
+            mul: 1,
+            div: factor,
+        }
+    }
+}
+
+impl<'a, C: Constraint<'a>> Constraint<'a> for LyingEstimate<C> {
+    fn variables(&self) -> VariableSet {
+        self.inner.variables()
+    }
+
+    /// The lie. Clamped to at least 1 so the planner's `ilog2` bucketing
+    /// still sees a well-formed magnitude.
+    fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+        self.inner
+            .estimate(variable, binding)
+            .map(|e| (e.saturating_mul(self.mul) / self.div).max(1))
+    }
+
+    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
+        self.inner.propose(variable, binding, proposals)
+    }
+
+    fn propose_chunk(
+        &self,
+        variable: VariableId,
+        binding: &Binding,
+        cursor: &mut ProposeCursor,
+        budget: usize,
+        proposals: &mut ProposalBuffer,
+    ) -> bool {
+        self.inner
+            .propose_chunk(variable, binding, cursor, budget, proposals)
+    }
+
+    fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
+        self.inner.confirm(variable, binding, cands)
+    }
+
+    fn satisfied(&self, binding: &Binding) -> bool {
+        self.inner.satisfied(binding)
+    }
+
+    fn influence(&self, variable: VariableId) -> VariableSet {
+        self.inner.influence(variable)
+    }
+}
+
+/// F11: candidates on the small (honest proposer) side.
+pub const F11_SMALL: usize = 200;
+/// F11: candidates on the large side.
+pub const F11_LARGE: usize = 10_000;
+/// F11: how far the wrapper's estimate is off, in each direction.
+pub const F11_LIE_FACTOR: usize = 100;
+
+/// F11 expected rows (identical for all three plans): the small side's
+/// values are a subset of the large side's, so the intersection is the
+/// small side. 200.
+pub const F11_EXPECTED_ROWS: usize = F11_SMALL;
+
+/// F11 small source root (`la`).
+fn f11_small_root() -> ExclusiveId {
+    anchor(22)
+}
+
+/// F11 large source root (`lb`).
+fn f11_large_root() -> ExclusiveId {
+    anchor(23)
+}
+
+/// F11 builder: the large side holds `F11_LARGE` values of which the
+/// first `F11_SMALL` are exactly the small side's.
+///
+/// Honest estimates: 200 vs 10 000, so the small side proposes.
+/// `over` (small x100 = 20 000 > 10 000) and `under` (large /100 = 100 <
+/// 200) both hand the proposer role to the large side instead.
+pub fn build_lying_estimates() -> TribleSet {
+    let mut ids = Ids::new();
+    let mut set = TribleSet::new();
+    let small = f11_small_root();
+    let large = f11_large_root();
+    for i in 0..F11_LARGE {
+        let v = ids.mint();
+        set += entity! { &large @ r2_schema::lb: &v };
+        if i < F11_SMALL {
+            set += entity! { &small @ r2_schema::la: &v };
+        }
+    }
+    set
+}
+
+/// F11 honest plan: the true estimates, small side proposes.
+pub fn f11_truth(set: &TribleSet) -> usize {
+    find!(
+        (v: Inline<GenId>),
+        and!(
+            pattern!(set, [{ &f11_small_root() @ r2_schema::la: ?v }]),
+            pattern!(set, [{ &f11_large_root() @ r2_schema::lb: ?v }]),
+        )
+    )
+    .count()
+}
+
+/// F11 over-estimate plan: the small side claims `F11_LIE_FACTOR`x MORE
+/// candidates than it has.
+pub fn f11_over(set: &TribleSet) -> usize {
+    find!(
+        (v: Inline<GenId>),
+        and!(
+            LyingEstimate::over(
+                pattern!(set, [{ &f11_small_root() @ r2_schema::la: ?v }]),
+                F11_LIE_FACTOR
+            ),
+            pattern!(set, [{ &f11_large_root() @ r2_schema::lb: ?v }]),
+        )
+    )
+    .count()
+}
+
+/// F11 under-estimate plan: the large side claims `F11_LIE_FACTOR`x
+/// FEWER candidates than it has.
+pub fn f11_under(set: &TribleSet) -> usize {
+    find!(
+        (v: Inline<GenId>),
+        and!(
+            pattern!(set, [{ &f11_small_root() @ r2_schema::la: ?v }]),
+            LyingEstimate::under(
+                pattern!(set, [{ &f11_large_root() @ r2_schema::lb: ?v }]),
+                F11_LIE_FACTOR
+            ),
+        )
+    )
+    .count()
+}
