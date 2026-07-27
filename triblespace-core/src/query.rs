@@ -482,6 +482,14 @@ impl ProposalBuffer {
         }
     }
 
+    /// Moves every entry of `other` (values and liveness together) onto
+    /// the end of this buffer, leaving `other` empty. Existing entries —
+    /// and therefore every index into them — are untouched.
+    pub fn append(&mut self, other: &mut ProposalBuffer) {
+        self.entries.append(&mut other.entries);
+        self.live.append(&mut other.live);
+    }
+
     /// Splits off and returns the tail starting at `at` (values and
     /// liveness together).
     pub fn split_off(&mut self, at: usize) -> ProposalBuffer {
