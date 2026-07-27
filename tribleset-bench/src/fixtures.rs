@@ -1273,3 +1273,129 @@ pub fn f12_total(set: &TribleSet) -> usize {
     )
     .count()
 }
+
+// ---------------------------------------------------------------------------
+// F13 — constant pressure.
+//
+// INTERROGATES: the Term-native payoff, directly.
+//
+// Under the old desugar every attribute constant and literal value took
+// a fresh hidden variable plus a `ConstantConstraint`. The pattern below
+// carries `F13_CONSTANTS` = 161 constants, so it would have blown the
+// 128-variable budget at CONSTRUCTION time — `VariableContext::
+// next_variable` panics past 128 — long before the query could run.
+// Folded as constant `Term`s they cost ZERO variables and the pattern is
+// a pure existence check.
+//
+// The gate is the variable count itself: `harkonnen/F13/vars` records
+// `VariableContext::next_index` after expanding the pattern in a
+// hand-rolled context (the same technique the engine's
+// `many_literals_do_not_consume_the_variable_budget` test uses), so the
+// number lands in the results pile as a first-class observation rather
+// than as an assertion nobody can see.
+// ---------------------------------------------------------------------------
+
+/// F13: entities named by constant id in the pattern.
+pub const F13_ENTITIES: usize = 26;
+/// F13: literal-valued attribute slots per entity.
+pub const F13_ATTRS: usize = 5;
+
+/// F13: total constants in the pattern — `F13_ENTITIES` constant entity
+/// ids + `F13_ATTRS` attribute constants + `F13_ENTITIES * F13_ATTRS`
+/// literal values. 26 + 5 + 130 = 161, i.e. 33 more than the whole
+/// variable budget.
+pub const F13_CONSTANTS: usize = F13_ENTITIES + F13_ATTRS + F13_ENTITIES * F13_ATTRS;
+
+/// The constants outnumber the whole variable budget — the property
+/// that makes F13's zero-variable result meaningful instead of trivial.
+/// If this ever stops holding, the fixture has been shrunk below the
+/// thing it is supposed to prove.
+const _: () = assert!(F13_CONSTANTS > 128);
+
+/// F13 expected variables: constants live below the variable layer, so
+/// 161 of them allocate none. 0.
+pub const F13_EXPECTED_VARS: usize = 0;
+
+/// F13 expected rows: a pattern with an empty variable set is settled by
+/// one `satisfied()` check at query start, and every fact it names is
+/// present, so `find!((), _)` yields its single unit row. 1.
+pub const F13_EXPECTED_ROWS: usize = 1;
+
+/// F13 entity `i`.
+fn f13_entity(i: usize) -> ExclusiveId {
+    anchor(100 + i as u64)
+}
+
+/// F13 builder: `F13_ENTITIES` entities, each carrying `F13_ATTRS`
+/// distinct string literals (`v<i>_<k>`) the query then names verbatim.
+pub fn build_constant_pressure() -> TribleSet {
+    let mut set = TribleSet::new();
+    for i in 0..F13_ENTITIES {
+        let e = f13_entity(i);
+        set += entity! { &e @
+            r2_schema::c0: format!("v{i}_0").as_str(),
+            r2_schema::c1: format!("v{i}_1").as_str(),
+            r2_schema::c2: format!("v{i}_2").as_str(),
+            r2_schema::c3: format!("v{i}_3").as_str(),
+            r2_schema::c4: format!("v{i}_4").as_str(),
+        };
+    }
+    set
+}
+
+/// F13 probe: expands the 161-constant pattern in a hand-rolled variable
+/// context, then runs it. Returns `(variables allocated, rows)`.
+///
+/// One function so the pattern is written exactly once; the two measures
+/// are thin projections of it.
+fn f13_probe(set: &TribleSet) -> (usize, usize) {
+    let mut ctx = VariableContext::new();
+    macro_rules! __local_find_context {
+        () => {
+            &mut ctx
+        };
+    }
+    let constraint = pattern!(set, [
+        { &f13_entity(0) @ r2_schema::c0: "v0_0", r2_schema::c1: "v0_1", r2_schema::c2: "v0_2", r2_schema::c3: "v0_3", r2_schema::c4: "v0_4" },
+        { &f13_entity(1) @ r2_schema::c0: "v1_0", r2_schema::c1: "v1_1", r2_schema::c2: "v1_2", r2_schema::c3: "v1_3", r2_schema::c4: "v1_4" },
+        { &f13_entity(2) @ r2_schema::c0: "v2_0", r2_schema::c1: "v2_1", r2_schema::c2: "v2_2", r2_schema::c3: "v2_3", r2_schema::c4: "v2_4" },
+        { &f13_entity(3) @ r2_schema::c0: "v3_0", r2_schema::c1: "v3_1", r2_schema::c2: "v3_2", r2_schema::c3: "v3_3", r2_schema::c4: "v3_4" },
+        { &f13_entity(4) @ r2_schema::c0: "v4_0", r2_schema::c1: "v4_1", r2_schema::c2: "v4_2", r2_schema::c3: "v4_3", r2_schema::c4: "v4_4" },
+        { &f13_entity(5) @ r2_schema::c0: "v5_0", r2_schema::c1: "v5_1", r2_schema::c2: "v5_2", r2_schema::c3: "v5_3", r2_schema::c4: "v5_4" },
+        { &f13_entity(6) @ r2_schema::c0: "v6_0", r2_schema::c1: "v6_1", r2_schema::c2: "v6_2", r2_schema::c3: "v6_3", r2_schema::c4: "v6_4" },
+        { &f13_entity(7) @ r2_schema::c0: "v7_0", r2_schema::c1: "v7_1", r2_schema::c2: "v7_2", r2_schema::c3: "v7_3", r2_schema::c4: "v7_4" },
+        { &f13_entity(8) @ r2_schema::c0: "v8_0", r2_schema::c1: "v8_1", r2_schema::c2: "v8_2", r2_schema::c3: "v8_3", r2_schema::c4: "v8_4" },
+        { &f13_entity(9) @ r2_schema::c0: "v9_0", r2_schema::c1: "v9_1", r2_schema::c2: "v9_2", r2_schema::c3: "v9_3", r2_schema::c4: "v9_4" },
+        { &f13_entity(10) @ r2_schema::c0: "v10_0", r2_schema::c1: "v10_1", r2_schema::c2: "v10_2", r2_schema::c3: "v10_3", r2_schema::c4: "v10_4" },
+        { &f13_entity(11) @ r2_schema::c0: "v11_0", r2_schema::c1: "v11_1", r2_schema::c2: "v11_2", r2_schema::c3: "v11_3", r2_schema::c4: "v11_4" },
+        { &f13_entity(12) @ r2_schema::c0: "v12_0", r2_schema::c1: "v12_1", r2_schema::c2: "v12_2", r2_schema::c3: "v12_3", r2_schema::c4: "v12_4" },
+        { &f13_entity(13) @ r2_schema::c0: "v13_0", r2_schema::c1: "v13_1", r2_schema::c2: "v13_2", r2_schema::c3: "v13_3", r2_schema::c4: "v13_4" },
+        { &f13_entity(14) @ r2_schema::c0: "v14_0", r2_schema::c1: "v14_1", r2_schema::c2: "v14_2", r2_schema::c3: "v14_3", r2_schema::c4: "v14_4" },
+        { &f13_entity(15) @ r2_schema::c0: "v15_0", r2_schema::c1: "v15_1", r2_schema::c2: "v15_2", r2_schema::c3: "v15_3", r2_schema::c4: "v15_4" },
+        { &f13_entity(16) @ r2_schema::c0: "v16_0", r2_schema::c1: "v16_1", r2_schema::c2: "v16_2", r2_schema::c3: "v16_3", r2_schema::c4: "v16_4" },
+        { &f13_entity(17) @ r2_schema::c0: "v17_0", r2_schema::c1: "v17_1", r2_schema::c2: "v17_2", r2_schema::c3: "v17_3", r2_schema::c4: "v17_4" },
+        { &f13_entity(18) @ r2_schema::c0: "v18_0", r2_schema::c1: "v18_1", r2_schema::c2: "v18_2", r2_schema::c3: "v18_3", r2_schema::c4: "v18_4" },
+        { &f13_entity(19) @ r2_schema::c0: "v19_0", r2_schema::c1: "v19_1", r2_schema::c2: "v19_2", r2_schema::c3: "v19_3", r2_schema::c4: "v19_4" },
+        { &f13_entity(20) @ r2_schema::c0: "v20_0", r2_schema::c1: "v20_1", r2_schema::c2: "v20_2", r2_schema::c3: "v20_3", r2_schema::c4: "v20_4" },
+        { &f13_entity(21) @ r2_schema::c0: "v21_0", r2_schema::c1: "v21_1", r2_schema::c2: "v21_2", r2_schema::c3: "v21_3", r2_schema::c4: "v21_4" },
+        { &f13_entity(22) @ r2_schema::c0: "v22_0", r2_schema::c1: "v22_1", r2_schema::c2: "v22_2", r2_schema::c3: "v22_3", r2_schema::c4: "v22_4" },
+        { &f13_entity(23) @ r2_schema::c0: "v23_0", r2_schema::c1: "v23_1", r2_schema::c2: "v23_2", r2_schema::c3: "v23_3", r2_schema::c4: "v23_4" },
+        { &f13_entity(24) @ r2_schema::c0: "v24_0", r2_schema::c1: "v24_1", r2_schema::c2: "v24_2", r2_schema::c3: "v24_3", r2_schema::c4: "v24_4" },
+        { &f13_entity(25) @ r2_schema::c0: "v25_0", r2_schema::c1: "v25_1", r2_schema::c2: "v25_2", r2_schema::c3: "v25_3", r2_schema::c4: "v25_4" },
+    ]);
+    let vars = ctx.next_index;
+    let rows = find!((), constraint).count();
+    (vars, rows)
+}
+
+/// F13 variable count: variables allocated for `F13_CONSTANTS`
+/// constants (expected [`F13_EXPECTED_VARS`]).
+pub fn f13_vars(set: &TribleSet) -> usize {
+    f13_probe(set).0
+}
+
+/// F13 full drain: rows of the fully-constant existence check (expected
+/// [`F13_EXPECTED_ROWS`]).
+pub fn f13_total(set: &TribleSet) -> usize {
+    f13_probe(set).1
+}
