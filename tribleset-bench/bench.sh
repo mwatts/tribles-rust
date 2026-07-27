@@ -3,7 +3,7 @@
 #
 #   ./bench.sh <rev-or-path> [runner args…]
 #
-#   <rev-or-path>  a git rev in ../triblespace-rs (a detached worktree
+#   <rev-or-path>  a git rev in the enclosing repo (a detached worktree
 #                  is created/reused under ./subjects/<rev12>), or a
 #                  path to any triblespace checkout.
 #   runner args    forwarded verbatim to the tribleset-bench binary
@@ -23,8 +23,10 @@
 # resolved target, so switching subjects triggers exactly the rebuild
 # it should.
 #
-# The default target (fresh clone, before any rev was requested) is
-# ../../triblespace-rs; `./bench.sh ../triblespace-rs …` recreates it.
+# The default target (checked in) is ../.. — the enclosing repo, so a
+# fresh clone benches the current checkout with no setup. `./bench.sh
+# .. …` repoints back at it after benching another subject (or
+# `git checkout -- subjects/current`).
 
 set -eu
 cd "$(dirname "$0")"
@@ -40,13 +42,13 @@ mkdir -p subjects
 if [ -d "$arg" ]; then
     target=$(cd "$arg" && pwd)
 else
-    rev=$(git -C ../triblespace-rs rev-parse --verify --short=12 "$arg^{commit}") || {
-        echo "bench.sh: '$arg' is neither a directory nor a rev in ../triblespace-rs" >&2
+    rev=$(git -C .. rev-parse --verify --short=12 "$arg^{commit}") || {
+        echo "bench.sh: '$arg' is neither a directory nor a rev in the enclosing repo" >&2
         exit 2
     }
     wt="subjects/$rev"
     if [ ! -d "$wt" ]; then
-        git -C ../triblespace-rs worktree add --detach "$(pwd)/$wt" "$rev"
+        git -C .. worktree add --detach "$(pwd)/$wt" "$rev"
     fi
     target=$(cd "$wt" && pwd)
 fi

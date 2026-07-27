@@ -13,12 +13,13 @@ rpq = []
 
 [dependencies]
 # The engine under test. `subjects/current` is a symlink managed by
-# bench.sh (default target: ../../triblespace-rs); repoint it at any
-# worktree to bench any rev. Fresh clones must run `./bench.sh <rev-or-
-# path> …` once to create the symlink before `cargo build` works. The
-# suite restricts itself to the stable macro surface (find!/pattern!/
-# TriblePattern) — the discipline proven era-portable across 441
-# commits and three engine eras.
+# bench.sh; the checked-in default target is `../..` — the enclosing
+# triblespace-rs repo, so a fresh clone builds the current checkout
+# as the subject with no setup. Repoint it at any worktree to bench
+# any rev (`./bench.sh <rev-or-path> …`; `git checkout -- subjects/
+# current` restores the default). The suite restricts itself to the
+# stable macro surface (find!/pattern!/TriblePattern) — the discipline
+# proven era-portable across 441 commits and three engine eras.
 subject = { package = "triblespace", path = "subjects/current" }
 # Direct handle on the subject's CORE crate. The core proc macros the
 # vendored queries use (pattern!/entity!/attributes! via
