@@ -25,6 +25,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identical liveness words. The umbrella crate's `gpu` feature returns as
   `dep:triblespace-gpu` + `parallel`. The stale device-neutral
   `RingBatchQuery` seam is removed from core.
+- **`triblespace-search` is ported to the propose/confirm protocol and
+  rejoins the workspace.** The crate's row-batch-era Constraint impls
+  (TypedProgramSpec, program states, route consts) are deleted and the three
+  constraint shapes now speak the cooperative protocol directly: `BM25Filter`
+  and `SimilarTo` are unary set sources (estimate = entry count, propose
+  appends the frozen entries, confirm retains membership), while
+  `CosineAtLeast` stays confirmation-only — `usize::MAX` estimate, empty
+  propose, kill-only confirm that leaves candidates alive while the peer
+  variable is unbound. Duplicate occurrences in `from_entries` /
+  `from_candidates` collapse at construction: the engine has no raw-head
+  claiming layer, so the constraints themselves enforce their raw-value SET
+  denotation. The umbrella crate's `search` feature returns as
+  `dep:triblespace-search` (not in default).
 - **Union constraints now expose one physical occurrence-stream protocol.**
   Live arms propose into independent empty sinks whose occurrences concatenate
   in arm order; confirmation derives relational support from every live arm
