@@ -357,6 +357,37 @@ fn commit_chain(
     chain
 }
 
+/// Order-independent content digest of a trible set: each trible's 64
+/// bytes folded to a `u64` (FNV-1a over its eight words) and the fold
+/// XOR-accumulated across the set.
+///
+/// Exists because SIZE is not identity. The rung machinery carves a
+/// fixed-length sorted prefix out of the checked-out set, which pins
+/// the size to the rung target no matter what the checkout returned —
+/// so a size-only gate reports identity even when the workload has
+/// changed underneath it. Observed on this suite (2026-07-27): two
+/// runs at rung 1M, same pile, same commit, identical checked-out size
+/// of 4 064 802 tribles, produced 1M-trible prefixes that answered
+/// `join_2_largest_result` 1 091 725 and 1 091 741. Recording the
+/// digest makes that drift a fact in the pile instead of a discrepancy
+/// someone notices between two report tables.
+///
+/// XOR is chosen over a sequential hash deliberately: it digests the
+/// SET, not the iteration order, so an order change alone never trips
+/// the gate. A `TribleSet` holds no duplicates, so nothing cancels.
+fn set_digest(set: &TribleSet) -> u64 {
+    let mut accumulator: u64 = 0;
+    for trible in set.iter() {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for word in trible.data.chunks_exact(8) {
+            hash ^= u64::from_le_bytes(word.try_into().expect("eight-byte word"));
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        accumulator ^= hash;
+    }
+    accumulator
+}
+
 /// Open the pile, resolve the data branch, map the rung to k commits,
 /// and measure `Workspace::checkout` of those commits — one span per
 /// warmed iteration, timestamps against `base`.
@@ -366,10 +397,11 @@ fn commit_chain(
 /// (`cp -c` on APFS, free) of the dataset pile, never at the original.
 ///
 /// Returns the checked-out set (prefix-carved for sub-first-chunk
-/// rungs), the per-iteration spans as `(begin_ns, duration_ns)`, and
-/// the identity trible count. `Err` = workload-identity gate failure;
-/// panics (API drift at hostile revs) escape to the caller's
-/// [`quiet_catch`].
+/// rungs), the per-iteration spans as `(begin_ns, duration_ns)`, the
+/// identity trible count, and the set's content digest (see
+/// [`set_digest`] — the count alone cannot identify a carved
+/// workload). `Err` = workload-identity gate failure; panics (API
+/// drift at hostile revs) escape to the caller's [`quiet_catch`].
 pub fn pile_checkout(
     path: &std::path::Path,
     branch: Option<&str>,
@@ -377,7 +409,7 @@ pub fn pile_checkout(
     iters: usize,
     warmup: usize,
     base: &Instant,
-) -> Result<(TribleSet, Vec<(u64, u64)>, usize), String> {
+) -> Result<(TribleSet, Vec<(u64, u64)>, usize, u64), String> {
     let mut pile = Pile::open(path).expect("open pile");
     pile.refresh().expect("load pile records");
     let reader = pile.reader().expect("pile reader");
@@ -474,7 +506,14 @@ pub fn pile_checkout(
     let mut ws = repo.pull(branch_id).expect("pull branch");
     let mut spans: Vec<(u64, u64)> = Vec::new();
     let mut out: Option<TribleSet> = None;
-    let mut ident: Option<usize> = None;
+    // (checked-out size, carved size, carved content digest). The
+    // carved size ALONE is a vacuous gate: carving to a fixed `n`
+    // makes it exactly `n` no matter what came out of the checkout, so
+    // a checkout that returned a different set would slide the cut
+    // point and silently change the workload while the gate reported
+    // identity. All three are checked and printed, so the same rung is
+    // comparable across RUNS as well as across iterations.
+    let mut ident: Option<(usize, usize, u64)> = None;
     let mut gate: Option<String> = None;
     for i in 0..(warmup + iters) {
         let recording = i >= warmup;
@@ -482,6 +521,7 @@ pub fn pile_checkout(
         let t = Instant::now();
         let co = ws.checkout(&handles[..k]).expect("checkout");
         let mut set = co.into_facts();
+        let checked_out = set.len();
         if let Some(n) = carve {
             let mut prefix = TribleSet::new();
             for t in set.iter().take(n) {
@@ -492,12 +532,12 @@ pub fn pile_checkout(
         if recording {
             spans.push((begin_ns, t.elapsed().as_nanos() as u64));
         }
+        let seen = (checked_out, set.len(), set_digest(&set));
         match ident {
-            None => ident = Some(set.len()),
-            Some(expected) if expected != set.len() => {
+            None => ident = Some(seen),
+            Some(expected) if expected != seen => {
                 gate = Some(format!(
-                    "checkout-identity: iter {i} saw {} tribles, expected {expected}",
-                    set.len()
+                    "checkout-identity: iter {i} saw {seen:?}, expected {expected:?}"
                 ));
             }
             _ => {}
@@ -509,7 +549,11 @@ pub fn pile_checkout(
     if let Some(g) = gate {
         return Err(g);
     }
-    Ok((out.expect("at least one iteration"), spans, ident.unwrap_or(0)))
+    let (checked_out, carved, digest) = ident.unwrap_or((0, 0, 0));
+    println!(
+        "checkout : {checked_out} tribles from {k} commit(s) -> {carved} after carve, digest {digest:016X}"
+    );
+    Ok((out.expect("at least one iteration"), spans, carved, digest))
 }
 
 // ---------------------------------------------------------------------------

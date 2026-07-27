@@ -721,6 +721,7 @@ fn main() {
         None => {
             println!("  {:<32} SKIP (no --data)", "ladder/checkout/total");
             led.outcome("ladder/checkout/total", "skip:no-data", None);
+            led.outcome("ladder/checkout/digest", "skip:no-data", None);
             println!("  {:<32} SKIP (no --data)", "arch/build_ram/total");
             led.outcome("arch/build_ram/total", "skip:no-data", None);
             skip_arch_queries(&mut led, "skip:no-data");
@@ -737,25 +738,34 @@ fn main() {
                     &base,
                 )
             }) {
-                Ok(Ok((set, spans, tribles))) => {
+                Ok(Ok((set, spans, tribles, digest))) => {
                     for (begin_ns, duration_ns) in &spans {
                         led.span("ladder/checkout/total", *begin_ns, *duration_ns);
                     }
                     led.outcome("ladder/checkout/total", "signal", Some(tribles as u64));
+                    // The workload's identity, not just its size — a
+                    // carved rung has a fixed size by construction, so
+                    // only the digest tells two runs of the same rung
+                    // apart (see fixtures::set_digest).
+                    led.outcome("ladder/checkout/digest", "signal", Some(digest));
                     println!(
-                        "  {:<32} signal ({} spans, {tribles} tribles)",
+                        "  {:<32} signal ({} spans, {tribles} tribles, digest {digest:016X})",
                         "ladder/checkout/total",
                         spans.len()
                     );
                     Some(set)
                 }
                 Ok(Err(gate)) => {
-                    led.outcome("ladder/checkout/total", &format!("gate_fail:{gate}"), None);
+                    let reason = format!("gate_fail:{gate}");
+                    led.outcome("ladder/checkout/total", &reason, None);
+                    led.outcome("ladder/checkout/digest", &reason, None);
                     println!("  {:<32} gate_fail ({gate})", "ladder/checkout/total");
                     None
                 }
                 Err(msg) => {
-                    led.outcome("ladder/checkout/total", &format!("panic:{msg}"), None);
+                    let reason = format!("panic:{msg}");
+                    led.outcome("ladder/checkout/total", &reason, None);
+                    led.outcome("ladder/checkout/digest", &reason, None);
                     println!("  {:<32} panic ({msg})", "ladder/checkout/total");
                     None
                 }
