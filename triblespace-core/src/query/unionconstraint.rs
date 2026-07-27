@@ -40,11 +40,16 @@ where
             "UnionConstraint requires at least one variant; \
              use a different constraint type for the empty case"
         );
-        assert!(constraints
-            .iter()
-            .map(|c| c.variables())
-            .tuple_windows()
-            .all(|(a, b)| a == b));
+        assert!(
+            constraints
+                .iter()
+                .map(|c| c.variables())
+                .tuple_windows()
+                .all(|(a, b)| a == b),
+            "all union (or!) arms must mention the same query variables; \
+             note that pattern! literals allocate hidden pinned variables in \
+             this engine build, so arms with different literals differ"
+        );
         UnionConstraint { constraints }
     }
 }

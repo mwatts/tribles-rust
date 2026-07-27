@@ -849,9 +849,17 @@ pub fn pattern_changes_impl(
                     entity_decl_tokens.extend(quote! { let #e_ident = #local_ident; });
                 }
                 Inline::Expr(ref id_expr) => {
-                    // Constant entity id: folded as a constant term.
+                    // Constant entity id: desugared to a hidden variable
+                    // pinned by ConstantConstraint at the outer
+                    // intersection (no constant terms in this engine).
                     entity_decl_tokens.extend(quote! {
-                        let #e_ident: #base_path::inline::Inline<#base_path::inline::encodings::genid::GenId> = #base_path::inline::IntoInline::to_inline(#id_expr);
+                        let #e_ident: #base_path::query::Variable<#base_path::inline::encodings::genid::GenId> = #ctx_ident.next_variable();
+                    });
+                    entity_const_tokens.extend(quote! {
+                        constraints.push(Box::new(#base_path::query::constantconstraint::ConstantConstraint::new(
+                            #e_ident,
+                            #base_path::inline::IntoInline::to_inline(#id_expr),
+                        )));
                     });
                 }
             },
@@ -901,11 +909,18 @@ pub fn pattern_changes_impl(
                     let a_ident = format_ident!("__a{}", attr_idx, span = Span::mixed_site());
                     let af_ident = format_ident!("__af{}", attr_idx, span = Span::mixed_site());
                     attr_idx += 1;
-                    // Attribute constant: folded as a constant term —
-                    // no hidden variable, no ConstantConstraint.
+                    // Attribute constant: desugared to a hidden variable
+                    // pinned by ConstantConstraint at the outer
+                    // intersection.
                     attr_decl_tokens.extend(quote! {
                         let #af_ident = &#attr_expr;
-                        let #a_ident: #base_path::inline::Inline<#base_path::inline::encodings::genid::GenId> = #base_path::inline::IntoInline::to_inline(#af_ident.id());
+                        let #a_ident: #base_path::query::Variable<#base_path::inline::encodings::genid::GenId> = #ctx_ident.next_variable();
+                    });
+                    entity_const_tokens.extend(quote! {
+                        constraints.push(Box::new(#base_path::query::constantconstraint::ConstantConstraint::new(
+                            #a_ident,
+                            #base_path::inline::IntoInline::to_inline(#af_ident.id()),
+                        )));
                     });
                     (a_ident, af_ident)
                 })
@@ -923,9 +938,16 @@ pub fn pattern_changes_impl(
 
             match value {
                 Inline::Expr(expr) => {
-                    // Literal value: folded as a constant term.
+                    // Literal value: desugared to a hidden variable pinned
+                    // by ConstantConstraint at the outer intersection.
                     value_decl_tokens.extend(quote! {
-                        let #v_ident = #af_ident.inline_from(#expr);
+                        let #v_ident = #af_ident.as_variable(#ctx_ident.next_variable());
+                    });
+                    entity_const_tokens.extend(quote! {
+                        constraints.push(Box::new(#base_path::query::constantconstraint::ConstantConstraint::new(
+                            #v_ident,
+                            #af_ident.inline_from(#expr),
+                        )));
                     });
                 }
                 Inline::Var(_) | Inline::LocalVar(_) if self_ref => {

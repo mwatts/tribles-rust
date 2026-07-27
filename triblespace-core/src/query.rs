@@ -59,6 +59,9 @@ use crate::inline::RawInline;
 pub use variableset::VariableSet;
 
 impl<T: InlineEncoding> Term<T> {
+}
+
+impl<T: InlineEncoding> Term<T> {
     /// Unwraps a variable term, panicking on constants.
     ///
     /// The macro layer desugars every literal to a hidden variable plus
@@ -72,6 +75,14 @@ impl<T: InlineEncoding> Term<T> {
                 "constant terms are not supported by this engine build; \
                  pass a variable and pin it with ConstantConstraint"
             ),
+        }
+    }
+
+    /// Erases the schema type, yielding the raw term.
+    pub fn erase(self) -> RawTerm {
+        match self {
+            Term::Var(v) => RawTerm::Var(v.index),
+            Term::Const(c) => RawTerm::Const(c.raw),
         }
     }
 }
@@ -231,20 +242,12 @@ impl<T: InlineEncoding> From<Variable<T>> for Term<T> {
 }
 
 impl<T: InlineEncoding> From<Inline<T>> for Term<T> {
-    fn from(c: Inline<T>) -> Self {
-        Term::Const(c)
+    fn from(value: Inline<T>) -> Self {
+        Term::Const(value)
     }
 }
 
 impl<T: InlineEncoding> Term<T> {
-    /// Erases the schema type, yielding the runtime representation
-    /// constraint implementations store.
-    pub fn erase(self) -> RawTerm {
-        match self {
-            Term::Var(v) => RawTerm::Var(v.index),
-            Term::Const(c) => RawTerm::Const(c.raw),
-        }
-    }
 }
 
 /// Untyped runtime form of a [`Term`]: a variable slot index or a pinned
@@ -260,31 +263,6 @@ pub enum RawTerm {
     Const(RawInline),
 }
 
-impl RawTerm {
-    /// Returns `true` when this term is the given variable.
-    #[inline]
-    pub fn is_var(&self, variable: VariableId) -> bool {
-        matches!(self, RawTerm::Var(v) if *v == variable)
-    }
-
-    /// Returns the term's value under `binding`: the pinned value for a
-    /// constant, the binding's value (if any) for a variable.
-    #[inline]
-    pub fn bound<'b>(&'b self, binding: &'b Binding) -> Option<&'b RawInline> {
-        match self {
-            RawTerm::Var(v) => binding.get(*v),
-            RawTerm::Const(c) => Some(c),
-        }
-    }
-
-    /// Adds the term's variable (if it is one) to `set`.
-    #[inline]
-    pub fn add_to(&self, set: &mut VariableSet) {
-        if let RawTerm::Var(v) = self {
-            set.set(*v);
-        }
-    }
-}
 
 /// Collections can implement this trait so that they can be used in queries.
 /// The returned constraint will filter the values assigned to the variable
@@ -1561,281 +1539,22 @@ mod tests {
         variables
     }
 
-    #[test]
-    fn fixed_variable_choice_key_uses_magnitude_then_lower_variable_id() {
-        // Cardinality magnitude dominates the variable-ID tiebreak, including
-        // the special zero-to-one and one-to-two boundaries.
-        assert!(variable_choice_key(2, 0) > variable_choice_key(1, 1));
-        assert!(variable_choice_key(2, 1) > variable_choice_key(1, 2));
 
-        // Counts within one power-of-two bucket are equally specific and lower
-        // VariableId wins deterministically.
-        assert!(variable_choice_key(1, 3) > variable_choice_key(2, 2));
-        assert!(variable_choice_key(1, 2) > variable_choice_key(2, 3));
-    }
 
-    fn action_peer(
-        occurrence: usize,
-        coverage: ProposalCoverage,
-        proposal_rank: u8,
-        confirmation_rank: u8,
-    ) -> ActionCostPeer {
-        ActionCostPeer {
-            occurrence,
-            coverage,
-            classes: Some(ActionUnitClasses::new(
-                ProposalUnitClass::from_log2_rank(proposal_rank),
-                ConfirmationUnitClass::from_log2_rank(confirmation_rank),
-            )),
-        }
-    }
 
-    #[test]
-    fn directed_action_model_requires_every_relevant_occurrence() {
-        let mut peers = vec![action_peer(0, ProposalCoverage::Exact, 0, 0)];
-        peers.push(ActionCostPeer {
-            occurrence: 1,
-            coverage: ProposalCoverage::None,
-            classes: None,
-        });
 
-        assert!(DirectedActionModel::new(&peers).is_none());
-    }
 
-    #[test]
-    fn directed_action_model_prices_engine_set_admission_explicitly() {
-        let source = action_peer(0, ProposalCoverage::Exact, 0, 6);
-        let model = DirectedActionModel::new(&[source]).expect("complete classes");
 
-        assert_eq!(model.planning_cost(source, 7), 14);
-    }
 
-    #[test]
-    fn directed_action_model_prices_proposal_and_confirmation_direction() {
-        let expensive_to_confirm = action_peer(0, ProposalCoverage::Exact, 0, 6);
-        let cheap_to_confirm = action_peer(1, ProposalCoverage::Exact, 0, 0);
-        let model = DirectedActionModel::new(&[expensive_to_confirm, cheap_to_confirm])
-            .expect("complete classes");
 
-        assert_eq!(model.planning_cost(expensive_to_confirm, 32), 96);
-        assert_eq!(model.planning_cost(cheap_to_confirm, 16), 1_056);
-    }
 
-    #[test]
-    fn directed_cost_can_choose_a_larger_ordered_source() {
-        let hash = ActionCostPeer {
-            occurrence: 0,
-            coverage: ProposalCoverage::Exact,
-            classes: Some(ActionUnitClasses::new(
-                ProposalUnitClass::HASH_TABLE_ENUMERATION,
-                ConfirmationUnitClass::HASH_TABLE_MEMBERSHIP,
-            )),
-        };
-        let archive = ActionCostPeer {
-            occurrence: 1,
-            coverage: ProposalCoverage::Exact,
-            classes: Some(ActionUnitClasses::new(
-                ProposalUnitClass::SUCCINCT_ORDERED_ENUMERATION,
-                ConfirmationUnitClass::SUCCINCT_RANDOM_MEMBERSHIP,
-            )),
-        };
-        let model = DirectedActionModel::new(&[hash, archive]).expect("complete classes");
-        let hash_cost = model.planning_cost(hash, 8);
 
-        for archive_count in [9, 16, 21, 29] {
-            assert!(
-                model.planning_cost(archive, archive_count) < hash_cost,
-                "ordered source width {archive_count} should avoid random succinct confirmation"
-            );
-        }
-    }
 
-    #[test]
-    fn directed_action_model_covering_source_confirms_itself() {
-        let covering = action_peer(0, ProposalCoverage::Covering, 0, 6);
-        let peer = action_peer(1, ProposalCoverage::Exact, 0, 0);
-        let model = DirectedActionModel::new(&[covering, peer]).expect("complete classes");
 
-        assert_eq!(model.planning_cost(covering, 32), 2_144);
-    }
 
-    #[test]
-    fn directed_action_model_counts_repeated_occurrences() {
-        let source = action_peer(0, ProposalCoverage::Exact, 0, 0);
-        let validator = action_peer(1, ProposalCoverage::None, 0, 2);
-        let repeated_validator = action_peer(2, ProposalCoverage::None, 0, 2);
-        let once = DirectedActionModel::new(&[source, validator]).expect("complete classes");
-        let twice = DirectedActionModel::new(&[source, validator, repeated_validator])
-            .expect("complete classes");
 
-        assert_eq!(once.planning_cost(source, 3), 18);
-        assert_eq!(twice.planning_cost(source, 3), 30);
-    }
 
-    #[test]
-    fn directed_action_model_is_monotone_and_preserves_unknown_sentinel() {
-        let source = action_peer(
-            0,
-            ProposalCoverage::Exact,
-            ProposalUnitClass::MAX_LOG2_RANK,
-            0,
-        );
-        let model = DirectedActionModel::new(&[source]).expect("complete classes");
 
-        assert_eq!(model.planning_cost(source, 0), 0);
-        let one = ((1u128 << ProposalUnitClass::MAX_LOG2_RANK) + 1).min((usize::MAX - 1) as u128)
-            as usize;
-        assert_eq!(model.planning_cost(source, 1), one);
-        assert_eq!(model.planning_cost(source, 2), usize::MAX - 1);
-        assert_eq!(model.planning_cost(source, usize::MAX), usize::MAX);
-    }
-
-    #[test]
-    #[should_panic(expected = "unit-work rank exceeds 63")]
-    fn proposal_unit_class_rejects_unlawful_rank() {
-        ProposalUnitClass::from_log2_rank(ProposalUnitClass::MAX_LOG2_RANK + 1);
-    }
-
-    #[test]
-    #[should_panic(expected = "unit-work rank exceeds 63")]
-    fn confirmation_unit_class_rejects_unlawful_rank() {
-        ConfirmationUnitClass::from_log2_rank(ConfirmationUnitClass::MAX_LOG2_RANK + 1);
-    }
-
-    #[test]
-    fn projection_gate_elides_exact_full_head_masks() {
-        let variables = variable_set([0, 3, 7]);
-        let mut full = ProjectionGate::new([0, 3, 7], variables);
-        let reordered = ProjectionGate::new([7, 0, 3], variables);
-
-        assert!(matches!(&full.claims, ProjectionClaims::Elided));
-        assert!(matches!(&reordered.claims, ProjectionClaims::Elided));
-        assert!(matches!(
-            &reordered.clone().claims,
-            ProjectionClaims::Elided
-        ));
-
-        let mut binding = Binding::default();
-        binding.set(0, &[1; 32]);
-        binding.set(3, &[2; 32]);
-        binding.set(7, &[3; 32]);
-        assert!(full.claim(&binding));
-        assert!(
-            full.claim(&binding),
-            "an elided full head must not allocate or consult a terminal key table"
-        );
-
-        #[cfg(feature = "parallel")]
-        {
-            let transfer = full.share_for_parallel();
-            assert!(transfer.is_none());
-            assert!(matches!(&full.claims, ProjectionClaims::Elided));
-            let mut sibling = full.clone();
-            sibling.attach_shared(transfer);
-            assert!(matches!(&sibling.claims, ProjectionClaims::Elided));
-        }
-    }
-
-    #[test]
-    fn projection_gate_keeps_strict_claims_and_snapshots_clones() {
-        let variables = variable_set([0, 1]);
-        let mut strict = ProjectionGate::new([0], variables);
-        assert!(matches!(&strict.claims, ProjectionClaims::Owned(claims) if claims.is_empty()));
-
-        let mut first = Binding::default();
-        first.set(0, &[1; 32]);
-        first.set(1, &[10; 32]);
-        assert!(strict.claim(&first));
-        assert!(!strict.claim(&first));
-
-        let mut snapshot = strict.clone();
-        let mut second = Binding::default();
-        second.set(0, &[2; 32]);
-        second.set(1, &[20; 32]);
-        assert!(strict.claim(&second));
-        assert!(
-            snapshot.claim(&second),
-            "an ordinary clone must own an independent strict-projection snapshot"
-        );
-        assert!(matches!(
-            &snapshot.claims,
-            ProjectionClaims::Owned(claims) if claims.len() == 2
-        ));
-    }
-
-    #[test]
-    fn projection_gate_distinguishes_full_and_strict_zero_heads() {
-        let mut full_zero = ProjectionGate::new([], VariableSet::new_empty());
-        assert!(matches!(&full_zero.claims, ProjectionClaims::Elided));
-        assert!(full_zero.claim(&Binding::default()));
-        assert!(full_zero.claim(&Binding::default()));
-        assert!(!full_zero.is_done());
-
-        let mut strict_zero = ProjectionGate::new([], variable_set([0]));
-        assert!(matches!(
-            &strict_zero.claims,
-            ProjectionClaims::Owned(claims) if claims.is_empty()
-        ));
-        assert!(strict_zero.claim(&Binding::default()));
-        assert!(strict_zero.is_done());
-        assert!(!strict_zero.claim(&Binding::default()));
-        assert!(strict_zero.clone().is_done());
-    }
-
-    #[cfg(feature = "parallel")]
-    #[test]
-    fn projection_gate_snapshots_shared_strict_claims_without_eliding_them() {
-        let variables = variable_set([0, 1]);
-        let mut strict = ProjectionGate::new([0], variables);
-        let mut first = Binding::default();
-        first.set(0, &[1; 32]);
-        first.set(1, &[10; 32]);
-        assert!(strict.claim(&first));
-
-        let transfer = strict
-            .share_for_parallel()
-            .expect("a strict projection has a shared claim domain");
-        assert!(matches!(&strict.claims, ProjectionClaims::Shared(_)));
-        let mut snapshot = strict.clone();
-        assert!(matches!(&snapshot.claims, ProjectionClaims::Owned(_)));
-
-        let mut second = Binding::default();
-        second.set(0, &[2; 32]);
-        second.set(1, &[20; 32]);
-        assert!(strict.claim(&second));
-        assert!(snapshot.claim(&second));
-
-        let mut sibling = snapshot.clone();
-        sibling.attach_shared(Some(transfer));
-        assert!(matches!(&sibling.claims, ProjectionClaims::Shared(_)));
-        assert!(!sibling.claim(&second));
-    }
-
-    #[cfg(feature = "parallel")]
-    #[test]
-    #[should_panic(expected = "parallel projection transfer cannot elide")]
-    fn projection_gate_rejects_a_missing_strict_parallel_claim_transfer() {
-        let mut strict = ProjectionGate::new([0], variable_set([0, 1]));
-        strict.attach_shared(None);
-    }
-
-    #[test]
-    fn rows_view_preserves_explicit_zero_width_row_multiplicity() {
-        assert_eq!(RowsView::EMPTY.len(), 1);
-        assert_eq!(RowsView::new(&[], &[]).len(), 1);
-
-        let three = RowsView::new_with_row_count(&[], &[], 3);
-        assert_eq!(three.len(), 3);
-        assert!(!three.is_empty());
-        let empty: &[RawInline] = &[];
-        assert_eq!(three.iter().collect::<Vec<_>>(), vec![empty; 3]);
-        assert_eq!(three.row(2), empty);
-        assert_eq!(three.row_view(2).len(), 1);
-
-        let zero = RowsView::new_with_row_count(&[], &[], 0);
-        assert!(zero.is_empty());
-        assert_eq!(zero.iter().count(), 0);
-    }
 
     pub mod knights {
         use crate::prelude::*;
@@ -2044,178 +1763,9 @@ mod tests {
         assert_eq!(&*record.borrow(), &[b.index, a.index]);
     }
 
-    /// A lawful row-homomorphic constraint whose occurrence bag depends on
-    /// which adaptive variable is proposed first. The support relation is the
-    /// same along every path; only duplicate proposal occurrences differ.
-    #[derive(Clone, Copy)]
-    struct VariableOrderBagConstraint {
-        tie_children: bool,
-    }
 
-    impl VariableOrderBagConstraint {
-        const PARENT: VariableId = 0;
-        const LEFT: VariableId = 1;
-        const RIGHT: VariableId = 2;
-        const P0: RawInline = [0; 32];
-        const P1: RawInline = [1; 32];
-        const LEFT_VALUE: RawInline = [2; 32];
-        const RIGHT_VALUE: RawInline = [3; 32];
 
-        fn allowed(variable: VariableId, value: &RawInline) -> bool {
-            match variable {
-                Self::PARENT => *value == Self::P0 || *value == Self::P1,
-                Self::LEFT => *value == Self::LEFT_VALUE,
-                Self::RIGHT => *value == Self::RIGHT_VALUE,
-                _ => false,
-            }
-        }
 
-        fn row_valid_so_far(view: &RowsView<'_>, row: &[RawInline]) -> bool {
-            [Self::PARENT, Self::LEFT, Self::RIGHT]
-                .into_iter()
-                .all(|variable| {
-                    view.col(variable)
-                        .is_none_or(|column| Self::allowed(variable, &row[column]))
-                })
-        }
-    }
-
-    impl Constraint<'static> for VariableOrderBagConstraint {
-        fn variables(&self) -> VariableSet {
-            VariableSet::new_singleton(Self::PARENT)
-                .union(VariableSet::new_singleton(Self::LEFT))
-                .union(VariableSet::new_singleton(Self::RIGHT))
-        }
-
-        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-            if self.variables().is_set(variable) && !bound.is_set(variable) {
-                ProposalCoverage::Exact
-            } else {
-                ProposalCoverage::None
-            }
-        }
-
-        fn estimate(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            out: &mut EstimateSink<'_>,
-        ) -> bool {
-            match variable {
-                Self::PARENT => out.fill(2, view.len()),
-                Self::LEFT | Self::RIGHT => {
-                    let Some(parent) = view.col(Self::PARENT) else {
-                        out.fill(8, view.len());
-                        return true;
-                    };
-                    let other = if variable == Self::LEFT {
-                        Self::RIGHT
-                    } else {
-                        Self::LEFT
-                    };
-                    if view.col(other).is_some() {
-                        out.fill(1, view.len());
-                    } else if self.tie_children {
-                        out.fill(1, view.len());
-                    } else {
-                        out.extend(view.iter().map(|row| {
-                            let even_parent = row[parent][0] & 1 == 0;
-                            usize::from(
-                                (variable == Self::RIGHT && even_parent)
-                                    || (variable == Self::LEFT && !even_parent),
-                            ) + 1
-                        }));
-                    }
-                }
-                _ => return false,
-            }
-            true
-        }
-
-        fn propose(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) {
-            if variable == Self::PARENT {
-                for (row_index, row) in view.iter().enumerate() {
-                    if Self::row_valid_so_far(view, row) {
-                        candidates.extend_row(row_index as u32, [Self::P0, Self::P1]);
-                    }
-                }
-                return;
-            }
-
-            let value = match variable {
-                Self::LEFT => Self::LEFT_VALUE,
-                Self::RIGHT => Self::RIGHT_VALUE,
-                _ => return,
-            };
-            let Some(parent) = view.col(Self::PARENT) else {
-                for (row_index, row) in view.iter().enumerate() {
-                    if Self::row_valid_so_far(view, row) {
-                        candidates.push(row_index as u32, value);
-                    }
-                }
-                return;
-            };
-            let other = if variable == Self::LEFT {
-                Self::RIGHT
-            } else {
-                Self::LEFT
-            };
-            let other_is_bound = view.col(other).is_some();
-            for (row_index, row) in view.iter().enumerate() {
-                if !Self::row_valid_so_far(view, row) {
-                    continue;
-                }
-                let even_parent = row[parent][0] & 1 == 0;
-                let duplicates = !other_is_bound
-                    && ((variable == Self::RIGHT && even_parent)
-                        || (variable == Self::LEFT && !even_parent));
-                candidates.extend_row(
-                    row_index as u32,
-                    std::iter::repeat_n(value, usize::from(duplicates) + 1),
-                );
-            }
-        }
-
-        fn confirm(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) {
-            candidates.retain(|row, value| {
-                Self::allowed(variable, value)
-                    && Self::row_valid_so_far(view, view.row(row as usize))
-            });
-        }
-
-        fn satisfied(&self, view: &RowsView<'_>) -> bool {
-            view.iter().all(|row| Self::row_valid_so_far(view, row))
-        }
-    }
-
-    fn variable_order_bag_query(
-        tie_children: bool,
-    ) -> Query<
-        VariableOrderBagConstraint,
-        impl Fn(&Binding) -> Option<(RawInline, RawInline, RawInline)>,
-        (RawInline, RawInline, RawInline),
-    > {
-        Query::new(
-            VariableOrderBagConstraint { tie_children },
-            |binding: &Binding| {
-                Some((
-                    *binding.get(VariableOrderBagConstraint::PARENT)?,
-                    *binding.get(VariableOrderBagConstraint::LEFT)?,
-                    *binding.get(VariableOrderBagConstraint::RIGHT)?,
-                ))
-            },
-        )
-    }
 
     #[derive(Clone)]
     struct SetAdmissionProbe {
@@ -2230,183 +1780,5 @@ mod tests {
         const LEAF_VALUE: RawInline = [6; 32];
     }
 
-    impl Constraint<'static> for SetAdmissionProbe {
-        fn variables(&self) -> VariableSet {
-            VariableSet::new_singleton(Self::ROOT).union(VariableSet::new_singleton(Self::LEAF))
-        }
 
-        fn proposal_coverage(&self, variable: VariableId, bound: VariableSet) -> ProposalCoverage {
-            if self.variables().is_set(variable) && !bound.is_set(variable) {
-                ProposalCoverage::Exact
-            } else {
-                ProposalCoverage::None
-            }
-        }
-
-        fn estimate(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            out: &mut EstimateSink<'_>,
-        ) -> bool {
-            match variable {
-                Self::ROOT => out.fill(1, view.len()),
-                Self::LEAF => out.fill(2, view.len()),
-                _ => return false,
-            }
-            true
-        }
-
-        fn propose(
-            &self,
-            variable: VariableId,
-            view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) {
-            match variable {
-                Self::ROOT => {
-                    for row in 0..view.len() {
-                        candidates.extend_row(row as u32, [Self::A, Self::B, Self::A]);
-                    }
-                }
-                Self::LEAF => {
-                    let root = view.col(Self::ROOT).expect("root is bound first");
-                    let mut descendants = self.descendants.lock().unwrap();
-                    for (row_index, row) in view.iter().enumerate() {
-                        descendants.push(row[root]);
-                        candidates.push(row_index as u32, Self::LEAF_VALUE);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        fn confirm(
-            &self,
-            variable: VariableId,
-            _view: &RowsView<'_>,
-            candidates: &mut CandidateSink<'_>,
-        ) {
-            candidates.retain(|_, value| match variable {
-                Self::ROOT => *value == Self::A || *value == Self::B,
-                Self::LEAF => *value == Self::LEAF_VALUE,
-                _ => false,
-            });
-        }
-
-        fn satisfied(&self, view: &RowsView<'_>) -> bool {
-            view.iter().all(|row| {
-                view.col(Self::ROOT)
-                    .is_none_or(|column| row[column] == Self::A || row[column] == Self::B)
-                    && view
-                        .col(Self::LEAF)
-                        .is_none_or(|column| row[column] == Self::LEAF_VALUE)
-            })
-        }
-    }
-
-    #[cfg(feature = "parallel")]
-    #[test]
-    fn ordinary_parallel_residual_admits_set_before_splitting() {
-        use rayon::prelude::*;
-
-        let descendants = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut rows: Vec<_> = Query::new(
-            SetAdmissionProbe {
-                descendants: descendants.clone(),
-            },
-            |binding: &Binding| {
-                Some((
-                    *binding.get(SetAdmissionProbe::ROOT)?,
-                    *binding.get(SetAdmissionProbe::LEAF)?,
-                ))
-            },
-        )
-        .into_par_iter()
-        .collect();
-        rows.sort_unstable();
-
-        let mut observed = descendants.lock().unwrap().clone();
-        observed.sort_unstable();
-        assert_eq!(
-            rows,
-            [
-                (SetAdmissionProbe::A, SetAdmissionProbe::LEAF_VALUE,),
-                (SetAdmissionProbe::B, SetAdmissionProbe::LEAF_VALUE,),
-            ]
-        );
-        assert_eq!(
-            observed,
-            [SetAdmissionProbe::A, SetAdmissionProbe::B],
-            "residual shards must inherit SET-admitted proposal rows"
-        );
-    }
-    #[test]
-    fn residual_width_and_equal_key_ties_preserve_semantic_variable_actions() {
-        let constraint = VariableOrderBagConstraint {
-            tie_children: false,
-        };
-        let invalid: RawInline = [9; 32];
-        let invalid_vars = [VariableOrderBagConstraint::PARENT];
-        let invalid_rows = [invalid];
-        let invalid_view = RowsView::new(&invalid_vars, &invalid_rows);
-        assert!(!constraint.satisfied(&invalid_view));
-        let mut proposed = Vec::new();
-        constraint.propose(
-            VariableOrderBagConstraint::LEFT,
-            &invalid_view,
-            &mut CandidateSink::Tagged(&mut proposed),
-        );
-        assert!(proposed.is_empty());
-        let mut confirmed = vec![(0, VariableOrderBagConstraint::RIGHT_VALUE)];
-        constraint.confirm(
-            VariableOrderBagConstraint::RIGHT,
-            &invalid_view,
-            &mut CandidateSink::Tagged(&mut confirmed),
-        );
-        assert!(confirmed.is_empty());
-
-        let row = |parent| {
-            (
-                parent,
-                VariableOrderBagConstraint::LEFT_VALUE,
-                VariableOrderBagConstraint::RIGHT_VALUE,
-            )
-        };
-        for (tie_children, mut expected) in [
-            (
-                false,
-                vec![
-                    row(VariableOrderBagConstraint::P0),
-                    row(VariableOrderBagConstraint::P1),
-                ],
-            ),
-            (
-                true,
-                vec![
-                    row(VariableOrderBagConstraint::P0),
-                    row(VariableOrderBagConstraint::P1),
-                ],
-            ),
-        ] {
-            expected.sort_unstable();
-
-            let mut residual_narrow: Vec<_> = variable_order_bag_query(tie_children)
-                .solve_residual_state_lazy()
-                .cap(1)
-                .start_width(1)
-                .growth(1)
-                .collect();
-            let mut residual_wide: Vec<_> = variable_order_bag_query(tie_children)
-                .solve_residual_state_lazy()
-                .cap(8)
-                .start_width(8)
-                .growth(1)
-                .collect();
-            for bag in [&mut residual_narrow, &mut residual_wide] {
-                bag.sort_unstable();
-                assert_eq!(bag, &expected);
-            }
-        }
-    }
 }
