@@ -6,6 +6,26 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## Unreleased
 
+### Candidate distinctness is proven at its source
+
+- `aggregate_above` sums each query term's postings into a `HashMap` keyed by
+  doc, so its output is distinct by construction and all four `matches` /
+  `matches_text` entry points inherit that. A `debug_assert!` pins the property
+  where it is established. Nothing at the index layer supplies it:
+  `BM25Builder::insert` appends one row per call, so the naive index can hold
+  one doc key at two doc indices and a single term's posting list then yields it
+  twice.
+- `SimilarTo::from_candidates` keeps its collapse because the crate's own
+  producers can repeat. Embedding handles are content-addressed, so two entities
+  embedding to the same vector share one handle, and neither `FlatBuilder` nor
+  `HNSWBuilder` collapses a repeated insert — `candidates_above` hands both
+  copies through on all three backends. Documented at each leaf.
+- `BM25Filter::from_entries` keeps its collapse too: it is public, and the
+  collapse costs nothing, since `confirm` / `satisfied` need a set-shaped
+  `membership` regardless and building it with `HashSet::insert` yields the
+  distinct entry order as the same pass's byproduct. Both constructors now size
+  their allocations from the input rather than growing incrementally.
+
 ### Build integration
 
 - Aligned the Jerky revision with `triblespace-core` and `triblespace-gpu`, so

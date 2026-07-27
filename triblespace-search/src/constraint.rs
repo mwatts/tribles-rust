@@ -109,7 +109,9 @@ impl<D: triblespace_core::inline::InlineEncoding, T: triblespace_core::inline::I
 /// scores below `score_floor`, keep just the doc keys.
 /// `score_floor = 0.0` is the natural "any matching doc" form
 /// — BM25 scores are non-negative, so `>= 0.0` matches every
-/// doc that appears in at least one posting list.
+/// doc that appears in at least one posting list. Keying the sum
+/// by doc is also what makes the doc list a *set*: see
+/// `aggregate_above`.
 ///
 /// Generic over any `I: BM25Queryable`, so it works against
 /// [`BM25Index`] or [`crate::succinct::SuccinctBM25Index`]
@@ -179,12 +181,24 @@ where
     /// at construction: the constraint's denotation is the raw
     /// value SET, and proposing a value twice would inflate the
     /// engine's bag multiplicity.
+    ///
+    /// The collapse is kept even though every in-crate producer
+    /// ([`BM25Index::matches`] and friends) is already distinct by
+    /// construction — see `aggregate_above` — for two reasons. It is a
+    /// public constructor, so the input is whatever a caller hands it; and
+    /// it is *free*: `confirm` / `satisfied` need a set-shaped
+    /// `membership` anyway, and building it with `HashSet::insert` yields
+    /// the distinct `entries` order as the same pass's byproduct. There is
+    /// no separable "dedup pass" here to trade away — dropping the
+    /// distinctness guarantee would not save a single hash.
     pub fn from_entries<I>(doc: Variable<S>, entries: I) -> Self
     where
         I: IntoIterator<Item = RawInline>,
     {
-        let mut membership = HashSet::new();
-        let mut unique = Vec::new();
+        let entries = entries.into_iter();
+        let hint = entries.size_hint().0;
+        let mut membership = HashSet::with_capacity(hint);
+        let mut unique = Vec::with_capacity(hint);
         for entry in entries {
             if membership.insert(entry) {
                 unique.push(entry);
@@ -207,6 +221,16 @@ where
 /// Shared by `BM25Index::matches` and
 /// `SuccinctBM25Index::matches` so the two backends produce
 /// identical filtering behaviour.
+///
+/// **The output is distinct by construction**: every doc key is a
+/// `HashMap` key here, so a doc that appears under several query terms
+/// — or twice inside one posting list — is one entry with the summed
+/// score. That last case is not hypothetical: `BM25Builder::insert`
+/// appends to a doc-keyed `Vec` without collapsing repeats, so the
+/// naive index's `keys` table can hold the same key at two doc indices
+/// and `query_term` then yields it twice for a single term. The
+/// aggregation is what makes the constraint's input a set — nothing at
+/// the index layer guarantees it.
 fn aggregate_above<I: BM25Queryable + ?Sized>(
     index: &I,
     terms: &[RawInline],
@@ -218,9 +242,19 @@ fn aggregate_above<I: BM25Queryable + ?Sized>(
             *acc.entry(doc).or_insert(0.0) += score;
         }
     }
-    acc.into_iter()
+    let out: Vec<RawInline> = acc
+        .into_iter()
         .filter_map(|(doc, sum)| (sum >= score_floor).then_some(doc))
-        .collect()
+        .collect();
+    // Locks the invariant the four `matches` / `matches_text` entry points
+    // rely on, so a future streaming posting-list merge here can't quietly
+    // start inflating public row multiplicity.
+    debug_assert_eq!(
+        out.iter().collect::<HashSet<_>>().len(),
+        out.len(),
+        "aggregate_above must key by doc, so its output is distinct"
+    );
+    out
 }
 
 impl<D: triblespace_core::inline::InlineEncoding, T: triblespace_core::inline::InlineEncoding>
@@ -637,9 +671,23 @@ impl SimilarTo {
     /// through the `similar_to` method on an attached index
     /// rather than directly. Duplicate occurrences collapse at
     /// construction — the constraint denotes the raw value SET.
+    ///
+    /// Unlike [`BM25Filter::from_entries`], whose in-crate producers are
+    /// all distinct by construction, this collapse is **load-bearing for
+    /// the crate's own callers**. Embedding handles are content-addressed,
+    /// so two entities that embed to the same vector share one handle, and
+    /// neither `HNSWBuilder::insert` nor `FlatBuilder::insert` collapses a
+    /// repeated handle — the index's handle table stores it once per
+    /// insert. `candidates_above` then maps node → handle on all three
+    /// backends and hands the repeat straight through. (The index-home
+    /// rollups already know this: `HnswRollup::build` dedups by handle
+    /// before inserting, "two entities can share one content-addressed
+    /// vector", and `nearest_across` dedups across segments.) Nothing
+    /// downstream would collapse it — the engine has no head-claiming
+    /// layer, so a repeated proposal is a repeated row.
     pub fn from_candidates(var: Variable<Handle<Embedding>>, candidates: Vec<RawInline>) -> Self {
-        let mut membership = HashSet::new();
-        let mut unique = Vec::new();
+        let mut membership = HashSet::with_capacity(candidates.len());
+        let mut unique = Vec::with_capacity(candidates.len());
         for candidate in candidates {
             if membership.insert(candidate) {
                 unique.push(candidate);
@@ -1392,5 +1440,135 @@ mod tests {
         let mut reverse_rows: Vec<_> = Query::new(reverse, project_first).collect();
         reverse_rows.sort_unstable();
         assert_eq!(reverse_rows, expected);
+    }
+
+    // ── Source distinctness: where the collapse is load-bearing ────
+    //
+    // The engine has no head-claiming layer, so a value proposed twice is a
+    // row emitted twice: multiplicity may only come from joins, never from a
+    // source repeating itself. These two tests pin down which producers can
+    // repeat and prove the interface property holds either way.
+
+    /// `BM25Builder::insert` appends one row per call without collapsing a
+    /// repeated doc key, so the naive index can hold the same key at two doc
+    /// indices and one term's posting list then yields it twice. Distinctness
+    /// is restored by `aggregate_above` keying its score sum by doc — not by
+    /// anything at the index layer — which is exactly why `matches` may hand
+    /// `BM25Filter::from_entries` an input it has already made distinct.
+    #[test]
+    fn bm25_aggregate_collapses_a_doc_key_repeated_in_one_posting_list() {
+        fn corpus() -> BM25Builder {
+            let mut b: BM25Builder = BM25Builder::new();
+            b.insert(id(1), hash_tokens("the quick brown fox"));
+            b.insert(id(1), hash_tokens("the quick brown fox again"));
+            b.insert(id(2), hash_tokens("the lazy brown dog"));
+            b
+        }
+        let fox = hash_tokens("fox");
+        let naive = corpus().build_naive();
+
+        // The raw posting-list walk really does repeat the doc key.
+        let postings: Vec<_> = naive.query_term(&fox[0]).collect();
+        assert_eq!(postings.len(), 2, "two doc indices share one key");
+        let distinct: HashSet<RawInline> = postings.iter().map(|(k, _)| k.raw).collect();
+        assert_eq!(distinct.len(), 1);
+
+        // The constraint denotes the set, so the query head sees one row.
+        let rows: Vec<Id> = triblespace_core::find!(
+            (doc: Id),
+            naive.matches(doc, &fox, 0.0)
+        )
+        .map(|(d,)| d)
+        .collect();
+        assert_eq!(rows, [id(1)]);
+
+        #[cfg(feature = "succinct")]
+        {
+            // The succinct backend sorts + dedups doc keys into a
+            // `CompressedUniverse` and accumulates tf by universe code, so its
+            // posting list is already distinct one layer earlier. Same rows.
+            let succinct = corpus().build();
+            assert_eq!(succinct.query_term(&fox[0]).count(), 1);
+            let rows: Vec<Id> = triblespace_core::find!(
+                (doc: Id),
+                succinct.matches(doc, &fox, 0.0)
+            )
+            .map(|(d,)| d)
+            .collect();
+            assert_eq!(rows, [id(1)]);
+        }
+    }
+
+    /// Embedding handles are content-addressed, so two entities that embed to
+    /// the same vector share one handle — and neither `FlatBuilder::insert`
+    /// nor `HNSWBuilder::insert` collapses a repeat, so the handle table holds
+    /// it twice and `candidates_above` hands both copies through. Nothing
+    /// downstream would collapse them, which makes the dedup inside
+    /// `SimilarTo::from_candidates` load-bearing rather than defensive on all
+    /// three retrieval backends.
+    #[test]
+    fn similar_to_collapses_a_handle_the_index_stores_twice() {
+        use crate::hnsw::{FlatBuilder, HNSWBuilder};
+
+        let mut store = MemoryBlobStore::new();
+        let near = vec![1.0f32, 0.0, 0.0];
+        let far = vec![0.0f32, 1.0, 0.0];
+        let near_h = crate::schemas::put_embedding::<_>(&mut store, near.clone()).unwrap();
+        let far_h = crate::schemas::put_embedding::<_>(&mut store, far.clone()).unwrap();
+
+        let mut flat_b = FlatBuilder::new(3);
+        flat_b.insert(near_h);
+        flat_b.insert(near_h);
+        flat_b.insert(far_h);
+        let flat = flat_b.build();
+
+        let mut hnsw_b = HNSWBuilder::new(3).with_seed(42);
+        hnsw_b.insert(near_h, near.clone()).unwrap();
+        hnsw_b.insert(near_h, near.clone()).unwrap();
+        hnsw_b.insert(far_h, far).unwrap();
+        let hnsw = hnsw_b.build_naive();
+
+        let reader = store.reader().unwrap();
+        let flat_view = flat.attach(&reader);
+        let hnsw_view = hnsw.attach(&reader);
+
+        // Both leaf walks repeat the shared handle.
+        assert_eq!(flat_view.candidates_above(near_h, 0.8).unwrap().len(), 2);
+        assert_eq!(hnsw_view.candidates_above(near_h, 0.8).unwrap().len(), 2);
+
+        // One row per distinct handle through the engine, on every backend.
+        let expected = [near_h.raw];
+        let neighbour = Variable::<Handle<Embedding>>::new(0);
+        assert_eq!(
+            Query::new(
+                flat_view.similar_to(near_h, neighbour, 0.8),
+                project_first
+            )
+            .collect::<Vec<_>>(),
+            expected
+        );
+        let rows: Vec<Inline<Handle<Embedding>>> = triblespace_core::find!(
+            (n: Inline<Handle<Embedding>>),
+            hnsw_view.similar_to(near_h, n, 0.8)
+        )
+        .map(|(h,)| h)
+        .collect();
+        assert_eq!(rows, [near_h]);
+
+        #[cfg(feature = "succinct")]
+        {
+            // `from_naive` copies the handle table verbatim — no universe, no
+            // sort, no dedup — so the succinct walk repeats it too.
+            let succinct = crate::succinct::SuccinctHNSWIndex::from_naive(&hnsw).unwrap();
+            let succinct_view = succinct.attach(&reader);
+            assert_eq!(succinct_view.candidates_above(near_h, 0.8).unwrap().len(), 2);
+            let rows: Vec<Inline<Handle<Embedding>>> = triblespace_core::find!(
+                (n: Inline<Handle<Embedding>>),
+                succinct_view.similar_to(near_h, n, 0.8)
+            )
+            .map(|(h,)| h)
+            .collect();
+            assert_eq!(rows, [near_h]);
+        }
     }
 }
