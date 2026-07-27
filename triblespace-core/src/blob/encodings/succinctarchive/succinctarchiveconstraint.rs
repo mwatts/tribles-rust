@@ -12,9 +12,9 @@ pub struct SuccinctArchiveConstraint<'a, U>
 where
     U: Universe,
 {
-    variable_e: VariableId,
-    variable_a: VariableId,
-    variable_v: VariableId,
+    term_e: RawTerm,
+    term_a: RawTerm,
+    term_v: RawTerm,
     archive: &'a SuccinctArchive<U>,
 }
 
@@ -24,9 +24,9 @@ where
 {
     fn clone(&self) -> Self {
         SuccinctArchiveConstraint {
-            variable_e: self.variable_e,
-            variable_a: self.variable_a,
-            variable_v: self.variable_v,
+            term_e: self.term_e,
+            term_a: self.term_a,
+            term_v: self.term_v,
             archive: self.archive,
         }
     }
@@ -36,27 +36,16 @@ impl<'a, U> SuccinctArchiveConstraint<'a, U>
 where
     U: Universe,
 {
-    /// Ordered raw terms of this constraint's trible positions. Constants
-    /// are desugared to fresh variables plus [`ConstantConstraint`] by the
-    /// macro layer, so every position is a variable here.
-    pub(crate) fn raw_terms(&self) -> [crate::query::RawTerm; 3] {
-        [
-            crate::query::RawTerm::Var(self.variable_e),
-            crate::query::RawTerm::Var(self.variable_a),
-            crate::query::RawTerm::Var(self.variable_v),
-        ]
-    }
-
     pub fn new<V: InlineEncoding>(
-        variable_e: Variable<GenId>,
-        variable_a: Variable<GenId>,
-        variable_v: Variable<V>,
+        e: impl Into<Term<GenId>>,
+        a: impl Into<Term<GenId>>,
+        v: impl Into<Term<V>>,
         archive: &'a SuccinctArchive<U>,
     ) -> Self {
         SuccinctArchiveConstraint {
-            variable_e: variable_e.index,
-            variable_a: variable_a.index,
-            variable_v: variable_v.index,
+            term_e: e.into().erase(),
+            term_a: a.into().erase(),
+            term_v: v.into().erase(),
             archive,
         }
     }
@@ -103,25 +92,24 @@ where
 {
     fn variables(&self) -> VariableSet {
         let mut variables = VariableSet::new_empty();
-        variables.set(self.variable_e);
-        variables.set(self.variable_a);
-        variables.set(self.variable_v);
+        self.term_e.add_to(&mut variables);
+        self.term_a.add_to(&mut variables);
+        self.term_v.add_to(&mut variables);
         variables
     }
 
     fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
-        if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
-        {
+        let e_var = self.term_e.is_var(variable);
+        let a_var = self.term_a.is_var(variable);
+        let v_var = self.term_v.is_var(variable);
+
+        if !e_var && !a_var && !v_var {
             return None;
         }
 
-        let e_var = self.variable_e == variable;
-        let a_var = self.variable_a == variable;
-        let v_var = self.variable_v == variable;
-
-        let e_bound = binding.get(self.variable_e);
-        let a_bound = binding.get(self.variable_a);
-        let v_bound = binding.get(self.variable_v);
+        let e_bound = self.term_e.position_value(binding);
+        let a_bound = self.term_a.position_value(binding);
+        let v_bound = self.term_v.position_value(binding);
 
         Some(match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
             (None, None, None, true, false, false) => self.archive.entity_count,
@@ -189,18 +177,17 @@ where
     }
 
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
-        if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
-        {
+        let e_var = self.term_e.is_var(variable);
+        let a_var = self.term_a.is_var(variable);
+        let v_var = self.term_v.is_var(variable);
+
+        if !e_var && !a_var && !v_var {
             return;
         }
 
-        let e_var = self.variable_e == variable;
-        let a_var = self.variable_a == variable;
-        let v_var = self.variable_v == variable;
-
-        let e_bound = binding.get(self.variable_e);
-        let a_bound = binding.get(self.variable_a);
-        let v_bound = binding.get(self.variable_v);
+        let e_bound = self.term_e.position_value(binding);
+        let a_bound = self.term_a.position_value(binding);
+        let v_bound = self.term_v.position_value(binding);
 
         match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
             (None, None, None, true, false, false) => {
@@ -348,18 +335,17 @@ where
     }
 
     fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
-        if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
-        {
+        let e_var = self.term_e.is_var(variable);
+        let a_var = self.term_a.is_var(variable);
+        let v_var = self.term_v.is_var(variable);
+
+        if !e_var && !a_var && !v_var {
             return;
         }
 
-        let e_var = self.variable_e == variable;
-        let a_var = self.variable_a == variable;
-        let v_var = self.variable_v == variable;
-
-        let e_bound = binding.get(self.variable_e);
-        let a_bound = binding.get(self.variable_a);
-        let v_bound = binding.get(self.variable_v);
+        let e_bound = self.term_e.position_value(binding);
+        let a_bound = self.term_a.position_value(binding);
+        let v_bound = self.term_v.position_value(binding);
 
         match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
             (None, None, None, true, false, false) => {
@@ -531,6 +517,41 @@ where
                 });
             }
             _ => unreachable!("invalid trible constraint state"),
+        }
+    }
+
+    /// When all three positions have values (bound or constant), checks
+    /// whether the triple exists in the archive. Returns `true`
+    /// optimistically when any position is still unbound. Exactness in
+    /// the fully-bound case is what lets `Query::new` settle
+    /// fully-constant patterns with a single probe, and what lets
+    /// composite constraints prune dead branches.
+    fn satisfied(&self, binding: &Binding) -> bool {
+        match (
+            self.term_e.position_value(binding),
+            self.term_a.position_value(binding),
+            self.term_v.position_value(binding),
+        ) {
+            (Some(e), Some(a), Some(v)) => {
+                let r = base_range(&self.archive.domain, &self.archive.e_a, e);
+                let r = restrict_range(
+                    &self.archive.domain,
+                    &self.archive.a_a,
+                    &self.archive.eva_c,
+                    a,
+                    &r,
+                );
+                restrict_range(
+                    &self.archive.domain,
+                    &self.archive.v_a,
+                    &self.archive.aev_c,
+                    v,
+                    &r,
+                )
+                .is_empty()
+                .not()
+            }
+            _ => true,
         }
     }
 }
