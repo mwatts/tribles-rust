@@ -598,3 +598,104 @@ fn anchor(n: u64) -> ExclusiveId {
     raw[12..].copy_from_slice(&Ids::splitmix64(n ^ 0xA5A5_5A5A).to_be_bytes()[..4]);
     ExclusiveId::force(Id::new(raw).expect("nonzero prefix"))
 }
+
+// ---------------------------------------------------------------------------
+// F6 — union fan.
+//
+// INTERROGATES: the `or!` aligned-arms path, and dead-variant gating.
+//
+// Before the Term-native fold every attribute constant and literal value
+// became a fresh hidden variable, so two structurally identical
+// `pattern!` invocations never declared the same variable set and
+// `UnionConstraint::new` panicked — the documented `or!(pattern!(..),
+// pattern!(..))` form was dead code. The fold makes constants Terms
+// below the variable layer, so all k arms here declare exactly `{e}`
+// even though each carries a DIFFERENT attribute constant AND a
+// DIFFERENT literal value. This is the synthetic twin of sparqloscope
+// q3.
+//
+// Dead-variant gating: with `?e` the only variable, every arm's
+// `satisfied()` is exact the moment `?e` binds (entity, attribute and
+// value all pinned), so k-1 arms are *provably* dead at confirm time.
+// The decoy entities below make the literal load-bearing: they carry the
+// right attribute with the wrong value and must contribute no rows.
+// ---------------------------------------------------------------------------
+
+/// F6: number of `or!` arms — one per minted arm attribute.
+pub const F6_ARMS: usize = 8;
+/// F6: matching entities per arm.
+pub const F6_PER_ARM: usize = 256;
+/// F6: decoy entities per arm (right attribute, wrong literal).
+pub const F6_DECOYS_PER_ARM: usize = 32;
+
+/// F6 expected rows. Each of the `F6_ARMS * F6_PER_ARM` matching
+/// entities carries exactly one arm edge, so it satisfies exactly one
+/// arm and yields exactly one binding of the single query variable
+/// `?e`; the `F6_ARMS * F6_DECOYS_PER_ARM` decoys satisfy no arm.
+/// 8 * 256 = 2048.
+pub const F6_EXPECTED_ROWS: usize = F6_ARMS * F6_PER_ARM;
+
+/// The literal value arm `j` matches.
+fn f6_hub(j: usize) -> ExclusiveId {
+    anchor(j as u64)
+}
+
+/// The literal value arm `j`'s decoys carry instead.
+fn f6_decoy(j: usize) -> ExclusiveId {
+    anchor(8 + j as u64)
+}
+
+/// One arm-`j` edge. The attribute must be a literal constant at each
+/// call site (that is the whole point of the fixture), so the arm index
+/// is dispatched rather than indexed.
+fn f6_edge(j: usize, e: &ExclusiveId, v: &ExclusiveId) -> Fragment {
+    match j {
+        0 => entity! { e @ r2_schema::u0: v },
+        1 => entity! { e @ r2_schema::u1: v },
+        2 => entity! { e @ r2_schema::u2: v },
+        3 => entity! { e @ r2_schema::u3: v },
+        4 => entity! { e @ r2_schema::u4: v },
+        5 => entity! { e @ r2_schema::u5: v },
+        6 => entity! { e @ r2_schema::u6: v },
+        7 => entity! { e @ r2_schema::u7: v },
+        _ => unreachable!("F6 has exactly {F6_ARMS} arms"),
+    }
+}
+
+/// F6 builder: per arm, `F6_PER_ARM` entities pointing at that arm's hub
+/// value and `F6_DECOYS_PER_ARM` entities pointing at its decoy value.
+pub fn build_union_fan() -> TribleSet {
+    let mut ids = Ids::new();
+    let mut set = TribleSet::new();
+    for j in 0..F6_ARMS {
+        let hub = f6_hub(j);
+        let decoy = f6_decoy(j);
+        for _ in 0..F6_PER_ARM {
+            let e = ids.mint();
+            set += f6_edge(j, &e, &hub);
+        }
+        for _ in 0..F6_DECOYS_PER_ARM {
+            let e = ids.mint();
+            set += f6_edge(j, &e, &decoy);
+        }
+    }
+    set
+}
+
+/// F6 full drain: total row count (expected [`F6_EXPECTED_ROWS`]).
+pub fn f6_total(set: &TribleSet) -> usize {
+    find!(
+        (e: Inline<GenId>),
+        or!(
+            pattern!(set, [{ ?e @ r2_schema::u0: &f6_hub(0) }]),
+            pattern!(set, [{ ?e @ r2_schema::u1: &f6_hub(1) }]),
+            pattern!(set, [{ ?e @ r2_schema::u2: &f6_hub(2) }]),
+            pattern!(set, [{ ?e @ r2_schema::u3: &f6_hub(3) }]),
+            pattern!(set, [{ ?e @ r2_schema::u4: &f6_hub(4) }]),
+            pattern!(set, [{ ?e @ r2_schema::u5: &f6_hub(5) }]),
+            pattern!(set, [{ ?e @ r2_schema::u6: &f6_hub(6) }]),
+            pattern!(set, [{ ?e @ r2_schema::u7: &f6_hub(7) }]),
+        )
+    )
+    .count()
+}

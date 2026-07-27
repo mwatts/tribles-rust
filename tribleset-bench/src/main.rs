@@ -462,6 +462,19 @@ fn main() {
     // One fixture at a time: each builder runs once, its measures share
     // the built set, and every measure carries the exact row count its
     // construction derives (see the fixture docs for each derivation).
+    run_r2(
+        &mut led,
+        cfg.warmup,
+        cfg.iters,
+        &base,
+        fixtures::build_union_fan,
+        &[R2Measure {
+            name: "harkonnen/F6/total",
+            rows_meaningful: true,
+            expect: Some(fixtures::F6_EXPECTED_ROWS),
+            run: fixtures::f6_total,
+        }],
+    );
     // -- sparqloscope ------------------------------------------------------
     // No wd Dataset loader is vendored (the pile manifest schema and
     // loaders stay in sparqloscope-bench, and no wd dataset exists on
