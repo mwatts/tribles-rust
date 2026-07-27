@@ -847,3 +847,100 @@ pub fn f8_distinct(set: &TribleSet) -> usize {
     .collect();
     seen.len()
 }
+
+// ---------------------------------------------------------------------------
+// F9 — mask density extremes.
+//
+// INTERROGATES: the engine-owned liveness design (`ProposalBuffer` +
+// `Candidates`), generalizing the F5 lesson.
+//
+// Confirmers kill entries in place and nothing is ever compacted, so the
+// engine scans over dead entries. That is a deliberate trade: no
+// compaction cost, no index invalidation, one word per entry writable
+// without contention. Its two worst cases are the two variants here — a
+// mask that kills nearly everything (a long scan over corpses to reach
+// each survivor) and a mask that kills nothing (pure overhead on the
+// liveness words).
+//
+// Both variants are built so the two sides carry IDENTICAL cardinality
+// (`F9_REGION` entries each). That matters: `IntersectionConstraint`
+// always lets the *lowest*-estimate child propose, so a merely-small
+// confirmer would simply become the proposer and the mask would never
+// run. Equal estimates force a genuine mask over a full-size region and
+// make selectivity a property of the data, not of the plan.
+// ---------------------------------------------------------------------------
+
+/// F9: candidates on each side of both variants.
+pub const F9_REGION: usize = 20_000;
+/// F9 sparse: every `F9_SPARSE_STRIDE`-th candidate survives.
+pub const F9_SPARSE_STRIDE: usize = 1_000;
+
+/// F9 sparse expected rows: the confirmer shares exactly the candidates
+/// at CONSTRUCTION indices `0, F9_SPARSE_STRIDE, 2*F9_SPARSE_STRIDE,
+/// ...` — `Ids::mint`'s splitmix suffix scatters those through the
+/// proposal's value order, so the survivors are spread across the region
+/// rather than clustered, which is what makes this a density test and
+/// not a prefix test. 20 000 / 1 000 = 20 survivors (a 99.9% kill
+/// rate).
+pub const F9_SPARSE_EXPECTED_ROWS: usize = F9_REGION / F9_SPARSE_STRIDE;
+
+/// F9 dense expected rows: both sides carry the same `F9_REGION` values,
+/// so the mask kills nothing. 20 000.
+pub const F9_DENSE_EXPECTED_ROWS: usize = F9_REGION;
+
+/// F9 proposer root (the `ma` side).
+fn f9_root() -> ExclusiveId {
+    anchor(16)
+}
+
+/// F9 confirmer probe (the `mb` side).
+fn f9_probe() -> ExclusiveId {
+    anchor(17)
+}
+
+/// F9 sparse builder: both sides hold `F9_REGION` values but only every
+/// `F9_SPARSE_STRIDE`-th one coincides.
+pub fn build_mask_sparse() -> TribleSet {
+    let mut ids = Ids::new();
+    let mut set = TribleSet::new();
+    let root = f9_root();
+    let probe = f9_probe();
+    for i in 0..F9_REGION {
+        let v = ids.mint();
+        set += entity! { &root @ r2_schema::ma: &v };
+        if i % F9_SPARSE_STRIDE == 0 {
+            set += entity! { &probe @ r2_schema::mb: &v };
+        } else {
+            let miss = ids.mint();
+            set += entity! { &probe @ r2_schema::mb: &miss };
+        }
+    }
+    set
+}
+
+/// F9 dense builder: both sides hold exactly the same `F9_REGION`
+/// values, so no candidate is ever killed.
+pub fn build_mask_dense() -> TribleSet {
+    let mut ids = Ids::new();
+    let mut set = TribleSet::new();
+    let root = f9_root();
+    let probe = f9_probe();
+    for _ in 0..F9_REGION {
+        let v = ids.mint();
+        set += entity! { &root @ r2_schema::ma: &v };
+        set += entity! { &probe @ r2_schema::mb: &v };
+    }
+    set
+}
+
+/// F9 full drain (either variant): total row count.
+pub fn f9_total(set: &TribleSet) -> usize {
+    find!(
+        (v: Inline<GenId>),
+        and!(
+            pattern!(set, [{ &f9_root() @ r2_schema::ma: ?v }]),
+            pattern!(set, [{ &f9_probe() @ r2_schema::mb: ?v }]),
+        )
+    )
+    .count()
+}

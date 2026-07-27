@@ -509,6 +509,33 @@ fn main() {
             },
         ],
     );
+    run_r2(
+        &mut led,
+        cfg.warmup,
+        cfg.iters,
+        &base,
+        fixtures::build_mask_sparse,
+        &[R2Measure {
+            name: "harkonnen/F9/sparse",
+            rows_meaningful: true,
+            expect: Some(fixtures::F9_SPARSE_EXPECTED_ROWS),
+            run: fixtures::f9_total,
+        }],
+    );
+    run_r2(
+        &mut led,
+        cfg.warmup,
+        cfg.iters,
+        &base,
+        fixtures::build_mask_dense,
+        &[R2Measure {
+            name: "harkonnen/F9/dense",
+            rows_meaningful: true,
+            expect: Some(fixtures::F9_DENSE_EXPECTED_ROWS),
+            run: fixtures::f9_total,
+        }],
+    );
+
     // -- sparqloscope ------------------------------------------------------
     // No wd Dataset loader is vendored (the pile manifest schema and
     // loaders stay in sparqloscope-bench, and no wd dataset exists on
