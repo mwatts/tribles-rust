@@ -109,7 +109,9 @@ impl<D: triblespace_core::inline::InlineEncoding, T: triblespace_core::inline::I
 /// scores below `score_floor`, keep just the doc keys.
 /// `score_floor = 0.0` is the natural "any matching doc" form
 /// — BM25 scores are non-negative, so `>= 0.0` matches every
-/// doc that appears in at least one posting list.
+/// doc that appears in at least one posting list. Keying the sum
+/// by doc is also what makes the doc list a *set*: see
+/// `aggregate_above`.
 ///
 /// Generic over any `I: BM25Queryable`, so it works against
 /// [`BM25Index`] or [`crate::succinct::SuccinctBM25Index`]
@@ -179,12 +181,24 @@ where
     /// at construction: the constraint's denotation is the raw
     /// value SET, and proposing a value twice would inflate the
     /// engine's bag multiplicity.
+    ///
+    /// The collapse is kept even though every in-crate producer
+    /// ([`BM25Index::matches`] and friends) is already distinct by
+    /// construction — see `aggregate_above` — for two reasons. It is a
+    /// public constructor, so the input is whatever a caller hands it; and
+    /// it is *free*: `confirm` / `satisfied` need a set-shaped
+    /// `membership` anyway, and building it with `HashSet::insert` yields
+    /// the distinct `entries` order as the same pass's byproduct. There is
+    /// no separable "dedup pass" here to trade away — dropping the
+    /// distinctness guarantee would not save a single hash.
     pub fn from_entries<I>(doc: Variable<S>, entries: I) -> Self
     where
         I: IntoIterator<Item = RawInline>,
     {
-        let mut membership = HashSet::new();
-        let mut unique = Vec::new();
+        let entries = entries.into_iter();
+        let hint = entries.size_hint().0;
+        let mut membership = HashSet::with_capacity(hint);
+        let mut unique = Vec::with_capacity(hint);
         for entry in entries {
             if membership.insert(entry) {
                 unique.push(entry);
@@ -207,6 +221,16 @@ where
 /// Shared by `BM25Index::matches` and
 /// `SuccinctBM25Index::matches` so the two backends produce
 /// identical filtering behaviour.
+///
+/// **The output is distinct by construction**: every doc key is a
+/// `HashMap` key here, so a doc that appears under several query terms
+/// — or twice inside one posting list — is one entry with the summed
+/// score. That last case is not hypothetical: `BM25Builder::insert`
+/// appends to a doc-keyed `Vec` without collapsing repeats, so the
+/// naive index's `keys` table can hold the same key at two doc indices
+/// and `query_term` then yields it twice for a single term. The
+/// aggregation is what makes the constraint's input a set — nothing at
+/// the index layer guarantees it.
 fn aggregate_above<I: BM25Queryable + ?Sized>(
     index: &I,
     terms: &[RawInline],
@@ -218,9 +242,19 @@ fn aggregate_above<I: BM25Queryable + ?Sized>(
             *acc.entry(doc).or_insert(0.0) += score;
         }
     }
-    acc.into_iter()
+    let out: Vec<RawInline> = acc
+        .into_iter()
         .filter_map(|(doc, sum)| (sum >= score_floor).then_some(doc))
-        .collect()
+        .collect();
+    // Locks the invariant the four `matches` / `matches_text` entry points
+    // rely on, so a future streaming posting-list merge here can't quietly
+    // start inflating public row multiplicity.
+    debug_assert_eq!(
+        out.iter().collect::<HashSet<_>>().len(),
+        out.len(),
+        "aggregate_above must key by doc, so its output is distinct"
+    );
+    out
 }
 
 impl<D: triblespace_core::inline::InlineEncoding, T: triblespace_core::inline::InlineEncoding>
@@ -637,9 +671,23 @@ impl SimilarTo {
     /// through the `similar_to` method on an attached index
     /// rather than directly. Duplicate occurrences collapse at
     /// construction — the constraint denotes the raw value SET.
+    ///
+    /// Unlike [`BM25Filter::from_entries`], whose in-crate producers are
+    /// all distinct by construction, this collapse is **load-bearing for
+    /// the crate's own callers**. Embedding handles are content-addressed,
+    /// so two entities that embed to the same vector share one handle, and
+    /// neither `HNSWBuilder::insert` nor `FlatBuilder::insert` collapses a
+    /// repeated handle — the index's handle table stores it once per
+    /// insert. `candidates_above` then maps node → handle on all three
+    /// backends and hands the repeat straight through. (The index-home
+    /// rollups already know this: `HnswRollup::build` dedups by handle
+    /// before inserting, "two entities can share one content-addressed
+    /// vector", and `nearest_across` dedups across segments.) Nothing
+    /// downstream would collapse it — the engine has no head-claiming
+    /// layer, so a repeated proposal is a repeated row.
     pub fn from_candidates(var: Variable<Handle<Embedding>>, candidates: Vec<RawInline>) -> Self {
-        let mut membership = HashSet::new();
-        let mut unique = Vec::new();
+        let mut membership = HashSet::with_capacity(candidates.len());
+        let mut unique = Vec::with_capacity(candidates.len());
         for candidate in candidates {
             if membership.insert(candidate) {
                 unique.push(candidate);
@@ -1393,4 +1441,5 @@ mod tests {
         reverse_rows.sort_unstable();
         assert_eq!(reverse_rows, expected);
     }
+
 }
