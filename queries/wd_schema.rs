@@ -12,27 +12,27 @@
 //! There are no minted ids here to preserve: every query attribute is
 //! *derived* by [`attr`] from the pair (predicate IRI, value schema)
 //! through `metadata::iri` + `metadata::value_encoding` — the same
-//! entity-core derivation `triblespace::core::import::ntriples`
+//! entity-core derivation `subject::core::import::ntriples`
 //! performs — so query constants line up with imported data by
 //! construction. The IRIs in [`voc`] are vendored byte-for-byte.
 
-use triblespace::core::attribute::Attribute;
-use triblespace::core::blob::MemoryBlobStore;
-use triblespace::core::blob::TryFromBlob;
+use subject::core::attribute::Attribute;
+use subject::core::blob::MemoryBlobStore;
+use subject::core::blob::TryFromBlob;
 #[cfg(feature = "rpq")]
-use triblespace::core::id::Id;
+use subject::core::id::Id;
 #[cfg(feature = "rpq")]
-use triblespace::core::import::ntriples::uri_to_id_pure;
-use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::Inline;
-use triblespace::core::inline::InlineEncoding;
-use triblespace::core::macros::entity;
-use triblespace::core::metadata::{self, MetaDescribe};
-use triblespace::core::prelude::BlobStore;
-use triblespace::core::prelude::BlobStoreGet;
-use triblespace::core::prelude::IntoBlob;
-use triblespace::core::repo::pile::PileReader;
-use triblespace::core::trible::TribleSet;
+use subject::core::import::ntriples::uri_to_id_pure;
+use subject::core::inline::encodings::hash::Handle;
+use subject::core::inline::Inline;
+use subject::core::inline::InlineEncoding;
+use subject::core::macros::entity;
+use subject::core::metadata::{self, MetaDescribe};
+use subject::core::prelude::BlobStore;
+use subject::core::prelude::BlobStoreGet;
+use subject::core::prelude::IntoBlob;
+use subject::core::repo::pile::PileReader;
+use subject::core::trible::TribleSet;
 
 /// Blob reader over either backing store the harness supports: the
 /// importer's in-memory store (a fresh `.nt` import) or a pile's mmap
@@ -55,7 +55,7 @@ pub enum AnyBlobReader {
 #[derive(Debug)]
 pub enum AnyGetError<E: std::error::Error + Send + Sync + 'static> {
     Memory(<<MemoryBlobStore as BlobStore>::Reader as BlobStoreGet>::GetError<E>),
-    Pile(triblespace::core::repo::pile::GetBlobError<E>),
+    Pile(subject::core::repo::pile::GetBlobError<E>),
 }
 
 impl<E: std::error::Error + Send + Sync + 'static> std::fmt::Display for AnyGetError<E> {
@@ -77,7 +77,7 @@ impl BlobStoreGet for AnyBlobReader {
         handle: Inline<Handle<S>>,
     ) -> Result<T, Self::GetError<<T as TryFromBlob<S>>::Error>>
     where
-        S: triblespace::core::blob::BlobEncoding + 'static,
+        S: subject::core::blob::BlobEncoding + 'static,
         T: TryFromBlob<S>,
         Handle<S>: InlineEncoding,
     {
@@ -181,7 +181,7 @@ pub mod voc {
 /// An imported N-Triples graph, ready for querying.
 ///
 /// Generic over the pattern-matching backend `B` — anything
-/// implementing [`TriblePattern`](triblespace::core::query::TriblePattern).
+/// implementing [`TriblePattern`](subject::core::query::TriblePattern).
 /// The vendored suite monomorphizes against the six-PATCH
 /// [`TribleSet`] only.
 ///

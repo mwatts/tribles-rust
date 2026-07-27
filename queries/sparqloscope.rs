@@ -69,6 +69,17 @@
 //! the umbrella crate (`triblespace::core::…`, `triblespace::prelude`)
 //! and to `super::wd_schema`:
 //!
+//! **TRIBLESET-BENCH ADAPTATION.** In this crate the engine under test
+//! is the renamed dependency `subject` (any checkout of triblespace),
+//! while the plain name `triblespace` is the results LEDGER (published
+//! 0.47). All engine imports are therefore rewritten
+//! `triblespace::…` → `subject::…`, and the prelude glob targets the
+//! *core* prelude (`subject::core::prelude::*`): the umbrella-crate
+//! macros expand to absolute `::triblespace::core` paths, which here
+//! would resolve to the ledger — the core-prelude macros expand to
+//! `::triblespace_core` (this crate's direct dep on the subject's
+//! core) or use `$crate`, both of which stay on the subject engine.
+//!
 //! - The four `transitive-path-*` translations use `path!`, which the
 //!   June-protocol engine does not provide (no `path!` macro, no
 //!   regular-path constraint). They are `#[cfg(feature = "rpq")]`-gated
@@ -90,23 +101,23 @@ use std::collections::{HashMap, HashSet};
 use anybytes::View;
 use hifitime::Epoch;
 use regex::Regex;
-use triblespace::core::blob::encodings::longstring::LongString;
-use triblespace::core::import::{rdf_lang, rdf_text, rdf_uri};
-use triblespace::core::metadata::MetaDescribe;
-use triblespace::core::inline::encodings::time::NsTAIInterval;
-use triblespace::core::macros::pattern;
+use subject::core::blob::encodings::longstring::LongString;
+use subject::core::import::{rdf_lang, rdf_text, rdf_uri};
+use subject::core::metadata::MetaDescribe;
+use subject::core::inline::encodings::time::NsTAIInterval;
+use subject::core::macros::pattern;
 #[cfg(feature = "rpq")]
-use triblespace::core::macros::path;
-use triblespace::core::metadata;
-use triblespace::core::prelude::inlineencodings::{GenId, I256BE};
-use triblespace::prelude::*;
+use subject::core::macros::path;
+use subject::core::metadata;
+use subject::core::prelude::inlineencodings::{GenId, I256BE};
+use subject::core::prelude::*;
 
 #[cfg(feature = "rpq")]
 use crate::wd_schema::entity_id;
 use crate::wd_schema::{attr, voc, Dataset};
 
-use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::query::{Binding, Constraint, Query};
+use subject::core::inline::encodings::hash::Handle;
+use subject::core::query::{Binding, Constraint, Query};
 
 // ────────────────────────────────────────────────────────────────────
 // Engine seam
@@ -331,7 +342,7 @@ where
 /// below use this seam without per-site changes.
 macro_rules! find {
     ($($t:tt)*) => {
-        crate::queries::run(::triblespace::core::query::find!($($t)*))
+        crate::queries::run(::subject::core::query::find!($($t)*))
     };
 }
 
