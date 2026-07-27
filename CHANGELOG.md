@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: the query engine is the propose/confirm engine.** The residual /
+  typed-Program engine is gone — `residual.rs`, the Program VM, query-time
+  regular-path evaluation (`path!` and `RegularPathConstraint`), and the
+  terminal projection claims table are deleted, roughly 70k lines net. What
+  replaces it: stateless constraints speaking a seven-method protocol over
+  write-once `ProposalBuffer`s and kill-only `Candidates` liveness, a
+  depth-first driver with dynamic cardinality ordering, and
+  bag-of-complete-bindings semantics at the interface (deduplication is the
+  consumer's choice — collect into a set, or use an outer enumeration with an
+  inner `exists!`). Constants are Term-native again, so `or!` arms with
+  differing literals align. Regular paths return as a materialized closure
+  index (`triblespace-paths`, under development), not as query-time traversal.
+  Measured against the engine it replaces on a 1M-trible dblp rung: interactive
+  queries recover 2.5-5.7x, archive build is unchanged, and the one capability
+  lost with query-time RPQ is exactly the one moving to the index.
 - **The book's query chapters describe the engine that exists.** Nine
   chapters still narrated the deleted residual engine — `RowsView` row
   blocks, canonical residual states, typed Programs, `proposal_coverage`,
@@ -86,6 +101,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   claiming layer, so the constraints themselves enforce their raw-value SET
   denotation. The umbrella crate's `search` feature returns as
   `dep:triblespace-search` (not in default).
+<!-- ------------------------------------------------------------------ -->
+<!-- SUPERSEDED: everything below this line documents the residual /      -->
+<!-- typed-Program engine, which was replaced before it was ever          -->
+<!-- released. The entries are kept as the record of that work, but they  -->
+<!-- describe machinery that no longer exists: typed Programs, residual   -->
+<!-- states, projection claims, SET head semantics, RPQ scheduler bounds. -->
+<!-- The entries ABOVE are authoritative for the current engine. Drop     -->
+<!-- this block deliberately when release notes are cut.                  -->
+<!-- ------------------------------------------------------------------ -->
+
 - **Union constraints now expose one physical occurrence-stream protocol.**
   Live arms propose into independent empty sinks whose occurrences concatenate
   in arm order; confirmation derives relational support from every live arm

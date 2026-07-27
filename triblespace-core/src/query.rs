@@ -344,7 +344,6 @@ impl Default for Binding {
     }
 }
 
-type ProjectionKey = Box<[RawInline]>;
 
 /// Resume state for chunked proposing — plain data held by the engine,
 /// interpreted by the proposing constraint.
@@ -1452,22 +1451,22 @@ mod parallel {
 /// | `name?` | inferred type, yield `Result<T, E>` (no filter) |
 /// | `name: Type?` | explicit type, yield `Result<T, E>` (no filter) |
 ///
-/// Query heads have relational SET semantics. Two satisfying assignments with
-/// the same ordered raw inline values for every declared head variable produce
-/// one result, even when they differ in hidden variables. Distinctness is
-/// decided before [`TryFromInline`](crate::inline::TryFromInline) conversion;
-/// two different raw values may therefore still convert to equal Rust values.
-/// A raw head is claimed before conversion or mapper code runs, so a conversion
-/// failure, filtered row, or panic is not retried through another hidden
-/// witness. Every projected variable must be unique; repeating a variable in
-/// the head is a compile error because it would not add a projected column.
+/// Query heads have BAG semantics: one row per complete satisfying assignment.
+/// Two assignments that agree on every declared head variable but differ in
+/// hidden variables therefore produce two rows — hidden-variable multiplicity
+/// is visible in the output, and the engine performs no deduplication. That is
+/// deliberate: deduplicating would mean carrying a claim table proportional to
+/// the distinct result set, sharing it across rayon shards, and deciding what a
+/// panicking or filtered row does to a claimed key. Dedup is the consumer's
+/// choice instead: collect into a set, or use two queries (an outer enumeration
+/// over the values you want distinct, with an inner [`exists!`](crate::exists)
+/// for the witness). Every projected variable must be unique; repeating a
+/// variable in the head is a compile error because it would not add a column.
 ///
-/// The unit form `find!((), constraint)` projects no variables and consequently
-/// yields at most one `()`: one if any assignment satisfies the constraint and
-/// none otherwise. Claiming that singleton key stops the search without
-/// draining additional hidden witnesses, including when mapper code returns
-/// `None` or panics. Use an explicitly projected witness when its distinct
-/// values need to be counted.
+/// The unit form `find!((), constraint)` projects no variables and yields one
+/// `()` per satisfying assignment — it counts witnesses rather than answering a
+/// yes/no question. Use [`exists!`](crate::exists) for existence, which stops
+/// at the first witness.
 ///
 /// **Filter semantics (default):** when a variable's conversion fails the
 /// entire row is silently skipped — like a constraint that doesn't match.
