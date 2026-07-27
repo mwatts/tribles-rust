@@ -762,3 +762,88 @@ pub fn f7_total(set: &TribleSet) -> usize {
     )
     .count()
 }
+
+// ---------------------------------------------------------------------------
+// F8 — witness multiplicity.
+//
+// INTERROGATES: the bag-semantics contract.
+//
+// The engine is a bag of COMPLETE bindings: `Query::next` emits a row
+// every time the unbound set empties, with no projection dedup, so
+// hidden (`temp!`) variables multiply the visible head. Dedup belongs to
+// the consumer. This fixture pins both halves of that contract at once
+// with the two-query idiom — the same constraint drained as a bag and
+// collected into a set — and is the fixture that fails loudly if head
+// dedup is ever reintroduced inside the engine (the bag measure would
+// collapse onto the distinct one).
+// ---------------------------------------------------------------------------
+
+/// F8: entities carrying both fans.
+pub const F8_ENTITIES: usize = 256;
+/// F8: `wa` out-degree per entity (hidden witness `?m`).
+pub const F8_WA_DEG: usize = 8;
+/// F8: `wb` out-degree per entity (hidden witness `?n`).
+pub const F8_WB_DEG: usize = 8;
+
+/// F8 expected BAG rows: per entity every `(?m, ?n)` pair is a distinct
+/// complete binding, so `F8_WA_DEG * F8_WB_DEG` = 64 rows per entity.
+/// 256 * 8 * 8 = 16 384 — exactly 64x the projected-distinct count.
+pub const F8_EXPECTED_BAG_ROWS: usize = F8_ENTITIES * F8_WA_DEG * F8_WB_DEG;
+
+/// F8 expected DISTINCT rows: the head is `?e` alone and every entity
+/// has both fans, so the client-side set has one member per entity.
+/// 256.
+pub const F8_EXPECTED_DISTINCT_ROWS: usize = F8_ENTITIES;
+
+/// F8 builder: `F8_ENTITIES` entities, each with `F8_WA_DEG` `wa` edges
+/// and `F8_WB_DEG` `wb` edges to fresh targets.
+pub fn build_witness_multiplicity() -> TribleSet {
+    let mut ids = Ids::new();
+    let mut set = TribleSet::new();
+    for _ in 0..F8_ENTITIES {
+        let e = ids.mint();
+        for _ in 0..F8_WA_DEG {
+            let m = ids.mint();
+            set += entity! { &e @ r2_schema::wa: &m };
+        }
+        for _ in 0..F8_WB_DEG {
+            let n = ids.mint();
+            set += entity! { &e @ r2_schema::wb: &n };
+        }
+    }
+    set
+}
+
+/// F8 bag drain: one row per complete `(e, m, n)` binding, projected to
+/// `?e` (expected [`F8_EXPECTED_BAG_ROWS`]).
+pub fn f8_bag(set: &TribleSet) -> usize {
+    find!(
+        (e: Inline<GenId>),
+        temp!(
+            (m, n),
+            and!(
+                pattern!(set, [{ ?e @ r2_schema::wa: ?m }]),
+                pattern!(set, [{ ?e @ r2_schema::wb: ?n }]),
+            )
+        )
+    )
+    .count()
+}
+
+/// F8 client-side distinct: the SAME constraint, deduplicated by the
+/// consumer (expected [`F8_EXPECTED_DISTINCT_ROWS`]).
+pub fn f8_distinct(set: &TribleSet) -> usize {
+    let seen: std::collections::HashSet<[u8; 32]> = find!(
+        (e: Inline<GenId>),
+        temp!(
+            (m, n),
+            and!(
+                pattern!(set, [{ ?e @ r2_schema::wa: ?m }]),
+                pattern!(set, [{ ?e @ r2_schema::wb: ?n }]),
+            )
+        )
+    )
+    .map(|(e,)| e.raw)
+    .collect();
+    seen.len()
+}

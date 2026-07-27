@@ -488,6 +488,27 @@ fn main() {
             run: fixtures::f7_total,
         }],
     );
+    run_r2(
+        &mut led,
+        cfg.warmup,
+        cfg.iters,
+        &base,
+        fixtures::build_witness_multiplicity,
+        &[
+            R2Measure {
+                name: "harkonnen/F8/bag",
+                rows_meaningful: true,
+                expect: Some(fixtures::F8_EXPECTED_BAG_ROWS),
+                run: fixtures::f8_bag,
+            },
+            R2Measure {
+                name: "harkonnen/F8/distinct",
+                rows_meaningful: true,
+                expect: Some(fixtures::F8_EXPECTED_DISTINCT_ROWS),
+                run: fixtures::f8_distinct,
+            },
+        ],
+    );
     // -- sparqloscope ------------------------------------------------------
     // No wd Dataset loader is vendored (the pile manifest schema and
     // loaders stay in sparqloscope-bench, and no wd dataset exists on
