@@ -72,15 +72,43 @@ attributes! {
 change += entity! { &child @ tree::parent: &parent_node };
 ```
 
-For recursive traversal (all ancestors, all descendants), use `path!`:
+A fixed number of hops is just a chain of clauses, joined on `temp!` variables:
 
 ```rust,ignore
-// All ancestors of this node
-find!(ancestor: Id, path!(&catalog, node_id tree::parent+ ancestor))
-
-// All descendants (reverse: who has me as ancestor?)
-find!(desc: Id, path!(&catalog, desc tree::parent+ node_id))
+// Grandparents: two hops up.
+find!(grandparent: Id,
+      temp!((mid),
+            and!(pattern!(&catalog, [{ node_id @ tree::parent: ?mid }]),
+                 pattern!(&catalog, [{ ?mid @ tree::parent: ?grandparent }]))))
 ```
+
+Unbounded traversal — *all* ancestors, *all* descendants — has no query-time
+form. The engine has no recursion: the `path!` macro that used to evaluate
+regular expressions over edge attributes was removed along with the query
+engine that hosted it, because traversal needs per-activation state and the
+constraint protocol is stateless (see [Query
+Engine](query-engine.md#where-regular-paths-went)). Closure is coming back as a
+maintained index in a separate `triblespace-paths` crate, which is still under
+development.
+
+Until it lands, drive the fixpoint from application code — query one hop,
+collect the frontier, repeat until it stops growing:
+
+```rust,ignore
+let mut ancestors: HashSet<Id> = HashSet::new();
+let mut frontier = vec![node_id];
+while let Some(node) = frontier.pop() {
+    for (parent,) in find!((parent: Id),
+                           pattern!(&catalog, [{ node @ tree::parent: ?parent }])) {
+        if ancestors.insert(parent) {
+            frontier.push(parent);
+        }
+    }
+}
+```
+
+The `HashSet` doubles as the visited set, which also terminates the loop on
+cyclic data.
 
 ## Entity classification with tags
 

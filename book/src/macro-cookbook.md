@@ -10,7 +10,7 @@ The macros fall into three layers:
 - **Encoding definition**: `attributes!`
 - **Fact construction**: `entity!`
 - **Query construction**: `find!`, `exists!`, `pattern!`, `pattern_changes!`,
-  `path!`, `and!`, `or!`, `temp!`
+  `and!`, `or!`, `temp!`
 
 ## Define attributes with `attributes!`
 
@@ -176,20 +176,15 @@ There are three common shapes:
 
 - `find!(value, constraint)` for one projected variable as a bare value
 - `find!((a, b), constraint)` for tuples
-- `find!((), constraint)` when you care only that at least one match exists
+- `find!((), constraint)` when you want to count satisfying assignments
+  without projecting any of them (reach for `exists!` if you only need yes/no)
 
-`find!` heads have relational SET semantics: each distinct ordered tuple of
-raw projected values is emitted once. Hidden variables introduced by
-`temp!` or `_?name` are existential witnesses and do not multiply an otherwise
-identical result. The empty head consequently returns either one `()` or no
-row, never one unit per witness, and stops once its singleton raw key has been
-claimed instead of draining the hidden fanout. Project a witness explicitly
-when its distinct values should remain visible.
-
-The engine claims raw projected identity before converting the head to Rust
-types. A failed conversion filters that tuple without allowing another hidden
-witness to retry it; different raw tuples remain distinct even if their Rust
-conversions compare equal.
+`find!` heads have BAG semantics: one row per complete binding, with the head
+selecting which variables come back. Hidden variables introduced by `temp!` or
+`_?name` still multiply the result — an entity proved by eight witnesses is
+emitted eight times, and the empty head returns one `()` per satisfying
+assignment. Deduplicate on your side (`collect::<HashSet<_>>()`), or use
+`exists!` for the inner condition so the fan-out is never enumerated.
 
 Typed projections happen in the head:
 

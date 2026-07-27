@@ -63,13 +63,13 @@ interest. Selectors power history traversals such as `parents`,
 `nth_ancestors`, ranges like `a..b`, and helpers such as `history_of(entity)`.
 
 ### Constraint
-The trait that every query operator implements. Its five operational
-methods—`variables`, `estimate`, `propose`, `confirm`, and `satisfied`—let the
-Atreides solver navigate the search space without a separate planner. Every
-occurrence denotes one fixed raw-inline SET relation,
-shared by its ordinary, paged, typed-Program, and complete-equivalent routes.
-`proposal_coverage` identifies sound proposal sources. Estimates guide cost
-ordering and never change semantics. Custom data sources and application
+The trait that every query operator implements. Its methods—`variables`,
+`estimate`, `propose`/`propose_chunk`, `confirm`, `satisfied`, and
+`influence`—let the Atreides solver navigate the search space without a
+separate planner. Constraints are stateless: every method receives the current
+binding, so the engine can backtrack, chunk, and split without telling anyone.
+Estimates guide variable ordering and never change results; `confirm` may only
+kill candidates, never add or revive them. Custom data sources and application
 predicates participate in queries by implementing this trait.
 
 ### Entity

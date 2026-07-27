@@ -62,12 +62,16 @@ blob, and querying it directly through `SuccinctArchiveConstraint` so readers
 can reuse the on-disk index without round-tripping through `TribleSet`
 conversions. 【F:src/blob/encodings/succinctarchive.rs†L100-L529】 【F:src/blob/encodings/succinctarchive/universe.rs†L16-L265】 【F:src/blob/encodings/succinctarchive/succinctarchiveconstraint.rs†L9-L200】
 
-### Extensible path engines
-Regular path queries run through `RegularPathConstraint`, which delegates edge
-checks to the `PathEngine` trait. The book should document how the built-in
-`ThompsonEngine` constructs NFAs from a `TribleSet` and demonstrate how to plug
-in alternative engines backed by other graph stores so readers can extend the
-regex-based traversal beyond in-memory datasets. 【F:src/query/regularpathconstraint.rs†L1-L200】
+### Regular paths as a closure index
+Query-time regular path evaluation was removed together with the engine that
+hosted it; `path!` and `RegularPathConstraint` no longer exist. The replacement
+is a materialized closure index in the separate `triblespace-paths` crate,
+which compiles graph edges and an epsilon-free automaton into a product graph
+and maintains its reflexive transitive closure. Once that surface stabilises
+the book needs a chapter covering how a closure index is built, kept current
+against a growing `TribleSet`, and joined against ordinary `pattern!` clauses.
+Until then, the [Query Language](query-language.md#recursive-traversal) chapter
+carries the interim guidance.
 
 ## How to keep this list fresh
 

@@ -10,34 +10,31 @@ results.
 ## Constraints as the search frontier
 
 Every constraint implements the [`Constraint`](triblespace::core::query::Constraint) trait,
-whose five operational methods shape the search:
+whose methods shape the search:
 
 1. **`variables`** – returns the set of variables this constraint touches.
-2. **`estimate`** – predicts how many results remain for a variable under the
-   current partial binding.
-3. **`propose`** – enumerates candidate values for a variable.
-4. **`confirm`** – filters a set of candidates without re-enumerating them.
-5. **`satisfied`** – returns `false` when all variables are bound but the
-   constraint is unsatisfied. Used by `UnionConstraint` to prune dead variants.
-
-Every constraint occurrence denotes one fixed raw-inline SET relation, and all
-of its ordinary, paged, typed-Program, and complete-equivalent routes must
-implement that same relation. `proposal_coverage` identifies sound proposal
-sources independently of estimates: Covering proposals contain the complete
-existential fiber and are self-confirmed, while Exact proposals equal it.
-Confirmation-only occurrences may publish no source claim. A proposal's
-physical occurrence multiplicity does not change that SET denotation.
+2. **`estimate`** – predicts how many candidates remain for a variable under the
+   current partial binding, or `None` when the variable is not this
+   constraint's business.
+3. **`propose`** – enumerates candidate values for a variable (with
+   `propose_chunk` as its resumable form).
+4. **`confirm`** – kills candidates proposed by another constraint, without
+   re-enumerating them.
+5. **`satisfied`** – returns `false` when the constraint has no completion from
+   the current binding. Used by `UnionConstraint` to prune dead variants.
 
 Traditional databases rely on a query planner to combine statistics into a join
 plan. Atreides instead consults the constraints directly while it searches. Each
 constraint can base its estimates on whatever structure it maintains—hash maps,
 precomputed counts, or even constant values for predicates that admit at most
-one match—so long as it can provide a quick cost quote. Each canonical Ready
-state asks every eligible source for fresh per-row estimates. No cached
-estimate or invalidation protocol participates in correctness.
+one match—so long as it can provide a quick cost quote. Every binding decision
+asks for fresh estimates under the binding that exists at that moment. Nothing
+is cached, so there is no invalidation protocol to get wrong.
 
-An estimate affects cost ordering only. It cannot change whether an occurrence
-is relevant, whether it is a sound source, or which rows the relation contains.
+An estimate affects cost ordering only. It cannot change whether a constraint
+is relevant, which candidates it proposes, or which rows the query returns. A
+constraint that misreports its cardinality by a large factor makes the search
+slower; it does not make it wrong.
 
 Because the heuristics are derived entirely from the constraints themselves, we
 do not need a separate query planner or multiple join implementations. Any
@@ -49,8 +46,8 @@ estimates, proposal generation, and confirmation.
 The Atreides "family" refers to the spectrum of heuristics a constraint can use
 when implementing [`Constraint::estimate`](triblespace::core::query::Constraint). Each
 variant exposes the same guided depth-first search, but with progressively
-tighter cardinality guidance. In practice every Ready state revisits its
-estimates; what differs is **what** quantity they approximate:
+tighter cardinality guidance. Every binding decision revisits its estimates;
+what differs is **what** quantity they approximate:
 
 - **Row-count Join (Jessica)** estimates the remaining search volume for the
   *entire* constraint. If one variable is bound but two others are not, Jessica
@@ -87,25 +84,25 @@ whatever fidelity the data structure can provide.
 
 ## Guided depth-first search
 
-At query start, [`Query::new`](triblespace::core::query::Query::new) checks the
-seed and compiles the constraint tree into canonical residual states. The
-solver then repeats one negotiation for each Ready row:
+At query start, [`Query::new`](triblespace::core::query::Query::new) asks every
+variable for an estimate against the empty binding, settles any constraint that
+is already fully determined by its constants, and orders the unbound variables.
+The solver then repeats one negotiation per binding:
 
-1. Inspect every unbound variable and ask all structurally eligible sources
-   for fresh estimates.
-2. Within each variable, choose the source with the smallest directed action
-   cost. The source's raw candidate count remains that variable's logical
-   specificity estimate.
-3. Choose the next variable with one fixed ordering: smaller candidate-count
-   bit length, then smaller `VariableId`. Counts in the same power-of-two
-   bucket are deliberately treated as equally specific.
-4. File an explicit `Propose` action for the selected source, SET-admit its
-   candidates, then file the remaining relevant occurrences as `Confirm`
-   actions from most to least selective.
-5. Extend surviving rows and return them to Ready. Equal descriptions of the
-   remaining computation share one bucket, so independently reached futures
-   reconverge; width one follows a hot continuation depth-first, while
-   geometrically wider execution batches the same states.
+1. Refresh the estimates that the most recent binding could have disturbed —
+   the `influence` sets of the variables bound since the last refresh, minus
+   the ones already bound.
+2. Re-sort the unbound variables and take the most specific one. The ordering
+   is by candidate-count *bit length* (smaller first), so counts in the same
+   power-of-two bucket are deliberately treated as equally specific; ties go to
+   the variable that influences the most others.
+3. Ask the constraint tree to propose for that variable. An intersection lets
+   its tightest child propose and runs the remaining children as confirmers
+   over that child's output, most selective first, so what reaches the engine
+   has already survived every clause.
+4. Bind the first surviving candidate and descend.
+5. When a level's candidates are exhausted, unbind the variable, return it to
+   the unbound set, and continue one level up.
 
 Traditional databases rely on sorted indexes to make the above iteration
 tractable. Atreides still performs random lookups when confirming each
@@ -155,31 +152,25 @@ depth-first traversal from thrashing through unrelated values.
 
 ## Implementation notes
 
-- The ordinary iterator negotiates blocks of sibling rows through canonical
-  residual states for every live root. Those states key
-  future work by bound schema, planned action, and checked leaf occurrences.
-  Planning makes both the exact adaptive variable and proposer occurrence
-  explicit in action state, so equivalent futures may reconverge into larger
-  downstream batches only after those actions run. The engine never enlarges a
-  batch by moving a row to another variable or proposer occurrence. Proposal
-  payloads carry occurrence bags until the corresponding residual admission
-  slice admits `(parent row, value)` pairs to SET support: an intra-parent
-  duplicate vanishes while equal values under distinct parents remain
-  independent. Width-one actions use the compact one-row protocol shape and
-  keep a successful continuation hot; geometric widening later harvests larger
-  compatible blocks without switching solvers.
-- `Binding` is reconstructed only at the result-projection boundary. The
-  terminal gate remains the universal final guard and preserves one result per
-  distinct ordered raw query head. A fresh query converted through
-  `into_par_iter()` moves the same affine residual frontier into Rayon; a
-  started query drains its exact remainder as one leaf rather than restarting
-  the search.
+- The search state is one `Binding` plus a stack of per-level candidate
+  buffers. Backtracking unsets a variable and pops; because constraints are
+  stateless, nothing has to be notified or unwound.
+- A level can be enumerated in geometrically growing chunks (64 candidates,
+  then four times as many each refill) so time-to-first-result at a wide level
+  is bounded by the first chunk rather than by the level's cardinality, while
+  total enumeration work stays within a constant factor of proposing eagerly.
 - Highly skewed data still behaves predictably: even if one attribute dominates
   the dataset, the other constraints continue to bound the search space tightly
-  and prevent runaway exploration.
-- The per-variable proposal buffers allow repeated proposals without
-  reallocating, which is especially helpful when backtracking over large
-  domains.
+  and prevent runaway exploration. This is the payoff of re-estimating per
+  binding rather than once per query — the popular entity and the rare one take
+  different orders through the same query text.
+- The per-variable proposal buffers are reused across sibling levels, so
+  repeated proposals do not reallocate. This is especially helpful when
+  backtracking over large domains.
+- Under the `parallel` feature the same state machine is the rayon producer:
+  splitting bisects a level's materialized candidates and clones the engine
+  state, while the constraint tree is shared behind an `Arc`. Results are the
+  same bag of rows in an unspecified order.
 
 ## Why worst-case optimal?
 

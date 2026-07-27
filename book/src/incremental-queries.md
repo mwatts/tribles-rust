@@ -65,20 +65,24 @@ Because each variant touches only one triple from the changed set, the work
 grows with the number of constraints and the size of the delta
 rather than the size of the full dataset.
 
-`find!` applies its normal SET projection to the union of variants. If several
-changed triples or several restricted variants prove the same ordered raw head
-tuple during one `pattern_changes!` query, that tuple is returned once. Hidden
-variables remain existential witnesses and do not multiply the projected
-answer.
+The variants are combined with `or!`, and a union deduplicates the candidate
+values it proposes for each variable before the search descends. Two variants
+that support the same assignment therefore contribute one candidate at every
+level, so that assignment is enumerated once per query rather than once per
+supporting variant.
 
-The claim domain belongs to one query invocation, not to the lifetime of an
-incremental stream. A later delta can therefore return the same projected tuple
-again when a newly added fact supplies a new proof. This reports support that
-is new in that delta; it does not claim the tuple was absent from all earlier
-results. Applications that need global once-only delivery should retain the
-projected keys they have already consumed (for example in a set), while
-applications that need distinct witness events should project the relevant
-witness identity explicitly.
+That is the only deduplication involved. `find!` heads have bag semantics like
+everywhere else: hidden variables still multiply the projected answer, so an
+entity proved by several changed witnesses is emitted once per witness.
+Collect into a set when you want each projected tuple once.
+
+Nothing is remembered between invocations. A later delta can return the same
+projected tuple again when a newly added fact supplies a new proof — that
+reports support which is new in *that* delta, not a claim that the tuple was
+absent from every earlier result. Applications that need global once-only
+delivery should retain the tuples they have already consumed (in a set, say),
+while applications that need distinct witness events should project the witness
+identity explicitly.
 
 ## Monotonicity and CALM
 
