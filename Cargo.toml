@@ -1,0 +1,17 @@
+[package]
+name = "tribleset-bench"
+version = "0.1.0"
+edition = "2021"
+description = "Engine-version-agnostic benchmark suite for triblespace. The SUBJECT engine is a repointable dependency (any checkout, any era — no history grafting); results are written as canonical telemetry sessions/spans through the stable LEDGER dependency. The minted schema ids are the contract; GORBIE's telemetry-viewer renders the axis."
+
+[dependencies]
+# The engine under test. Repoint at any rev via a worktree path (bench.sh
+# does this). The suite restricts itself to the stable macro surface
+# (find!/pattern!/TriblePattern) — the discipline proven era-portable
+# across 441 commits and three engine eras.
+subject = { package = "triblespace", path = "../triblespace-rs" }
+# The results ledger: stable published triblespace, used ONLY to write
+# sessions/spans/outcome entities. Measurement I/O never depends on the
+# era of the subject.
+triblespace = "0.47"
+anyhow = "1"
