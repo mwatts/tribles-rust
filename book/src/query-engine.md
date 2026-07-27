@@ -21,10 +21,10 @@ interface is seven methods, and the engine calls them in a fixed rhythm:
 |---|---|---|
 | `variables` | Declares which variables the constraint touches. | Once, at query start. |
 | `estimate` | Predicts the candidate count for one variable under the current binding. | Before each binding decision. |
-| `propose` | Enumerates candidate values for a variable into a buffer. | On the most selective constraint for that variable. |
+| `propose` | Enumerates candidate values for a variable into a buffer. | On the tightest constraint for that variable — an intersection picks it among its children. |
 | `propose_chunk` | Resumable `propose`: appends up to a budget of further candidates. | Instead of `propose`, when the engine wants the level in pieces. |
 | `confirm` | Kills candidates that violate this constraint. | On every *other* constraint touching that variable. |
-| `satisfied` | Reports whether the constraint is still consistent with the binding. | Before propose/confirm, and once up front for constant subtrees. |
+| `satisfied` | Reports whether the constraint is still consistent with the binding. | Once at query start on the whole tree; then by a union before it proposes or confirms, to skip dead arms. |
 | `influence` | Names the variables whose estimates go stale when one variable is bound. | Once per variable, at query start. |
 
 `estimate` returns `None` for a variable the constraint does not touch, which
@@ -122,8 +122,13 @@ why this is worst-case optimal.
 `propose` writes into a
 [`ProposalBuffer`](triblespace::core::query::ProposalBuffer) — the engine's
 candidate store for one variable at one level. Entries are plain 32-byte
-`RawInline` values at fixed stride, appended and never moved or rewritten
-afterwards. Alongside them the buffer keeps one `u32` liveness word per entry.
+`RawInline` values at fixed stride. Alongside them the buffer keeps one `u32`
+liveness word per entry.
+
+Entries are effectively write-once. A proposer may rewrite the region it
+appended in the current call before it returns — that is how a union applies
+its sort-dedup — but once the caller can see the region, the indices are
+frozen, because kills bind to them.
 
 Nothing is ever compacted. A candidate that fails confirmation has its liveness
 word zeroed and stays exactly where it was; the engine iterates the live
@@ -213,9 +218,9 @@ is not a global counter.
 **The engine emits one row per complete binding.** When the unbound set empties,
 that assignment is a result. Nothing deduplicates it.
 
-Hidden variables therefore surface as multiplicity. If an entity has eight
-`follows` edges and a query projects only the entity while a `temp!` or `_?`
-variable ranges over the target, that entity is emitted eight times:
+Hidden variables therefore surface as multiplicity. If an entity has *n*
+outgoing edges and a query projects only the entity while a `temp!` or `_?`
+variable ranges over the target, that entity is emitted *n* times:
 
 ```rust
 use std::collections::HashSet;
