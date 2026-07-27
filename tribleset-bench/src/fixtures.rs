@@ -1194,3 +1194,82 @@ pub fn f11_under(set: &TribleSet) -> usize {
     )
     .count()
 }
+
+// ---------------------------------------------------------------------------
+// F12 — deep chain.
+//
+// INTERROGATES: search-stack depth and the approach to the 128-variable
+// ceiling.
+//
+// `Binding` is a fixed `[RawInline; 128]`, `VariableContext` asserts
+// `next_index < 128`, and the search stack / unbound list are
+// `ArrayVec<_, 128>`. A 60-hop chain allocates 61 variables — just under
+// half the budget, deep enough that every level of the DFS stack is
+// exercised and cheap enough to stay in the suite's time envelope. The
+// chain is built programmatically through `TriblePattern::pattern` (not
+// 60 lines of `pattern!`), which keeps the hop count a knob.
+// ---------------------------------------------------------------------------
+
+/// F12: hops in each chain (variables allocated = `F12_HOPS + 1`).
+pub const F12_HOPS: usize = 60;
+/// F12: complete chains of exactly `F12_HOPS` edges.
+pub const F12_CHAINS: usize = 2;
+/// F12: decoy chains, half the required length — they force the search
+/// to unwind from deep in the stack without ever completing.
+pub const F12_DECOYS: usize = 8;
+
+/// F12 expected rows: a `hop` edge is functional (out-degree 1) and the
+/// chains are disjoint, so a path of exactly `F12_HOPS` edges exists
+/// once per complete chain, starting at its head; the decoy chains are
+/// `F12_HOPS / 2` edges long and complete none. 2.
+pub const F12_EXPECTED_ROWS: usize = F12_CHAINS;
+
+/// F12 builder: `F12_CHAINS` disjoint chains of `F12_HOPS` edges plus
+/// `F12_DECOYS` half-length chains.
+pub fn build_deep_chain() -> TribleSet {
+    let mut ids = Ids::new();
+    let mut set = TribleSet::new();
+    let chain = |set: &mut TribleSet, ids: &mut Ids, edges: usize| {
+        let mut prev = ids.mint();
+        for _ in 0..edges {
+            let next = ids.mint();
+            *set += entity! { &prev @ r2_schema::hop: &next };
+            prev = next;
+        }
+    };
+    for _ in 0..F12_CHAINS {
+        chain(&mut set, &mut ids, F12_HOPS);
+    }
+    for _ in 0..F12_DECOYS {
+        chain(&mut set, &mut ids, F12_HOPS / 2);
+    }
+    set
+}
+
+/// F12 full drain: total row count (expected [`F12_EXPECTED_ROWS`]).
+///
+/// The head projects the two ends of the chain; the `F12_HOPS - 1`
+/// interior variables are allocated from the `find!` context inside the
+/// constraint expression, exactly as `temp!` would, so the query really
+/// does carry `F12_HOPS + 1` variables.
+pub fn f12_total(set: &TribleSet) -> usize {
+    find!(
+        (head: Inline<GenId>, tail: Inline<GenId>),
+        {
+            let hop: Inline<GenId> = IntoInline::to_inline(r2_schema::hop.id());
+            let mut constraints: Vec<Box<dyn Constraint + Send + Sync>> = Vec::new();
+            let mut prev: Variable<GenId> = head;
+            for i in 0..F12_HOPS {
+                let next: Variable<GenId> = if i + 1 == F12_HOPS {
+                    tail
+                } else {
+                    __local_find_context!().next_variable()
+                };
+                constraints.push(Box::new(set.pattern(prev, hop, next)));
+                prev = next;
+            }
+            std::sync::Arc::new(IntersectionConstraint::new(constraints))
+        }
+    )
+    .count()
+}
