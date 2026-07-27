@@ -339,10 +339,13 @@ pub fn verify(path: &Path) -> Result<()> {
     }
 
     println!("spans    : {span_count}");
+    // Project the span id too: find! heads have SET semantics, so a
+    // name-only head would collapse the per-iteration spans to one row
+    // per distinct name.
     let mut span_names: std::collections::BTreeMap<String, usize> = Default::default();
-    for (n,) in find!(
-        (n: Inline<Handle<LongString>>),
-        pattern!(&facts, [{ _?s @ metadata::tag: kind_span, tele::name: ?n }])
+    for (_s, n) in find!(
+        (s: Id, n: Inline<Handle<LongString>>),
+        pattern!(&facts, [{ ?s @ metadata::tag: kind_span, tele::name: ?n }])
     ) {
         let name: anybytes::View<str> =
             reader.get(n).map_err(|e| anyhow!("span name blob: {e:?}"))?;
@@ -352,26 +355,49 @@ pub fn verify(path: &Path) -> Result<()> {
         println!("  {name:<45} x{count}");
     }
 
-    let mut outcome_rows: Vec<(String, String)> = Vec::new();
-    for (w, v) in find!(
-        (w: Inline<Handle<LongString>>, v: Inline<ShortString>),
-        pattern!(&facts, [{ _?o @ bench::workload: ?w, bench::outcome: ?v }])
+    // Optional rows per outcome entity (the engine is monotone; the
+    // optional join happens here in Rust).
+    let mut rows_of: std::collections::HashMap<Id, u64> = Default::default();
+    for (o, r) in find!(
+        (o: Id, r: u64),
+        pattern!(&facts, [{ ?o @ bench::rows: ?r }])
+    ) {
+        rows_of.insert(o, r);
+    }
+
+    let mut outcome_rows: Vec<(String, String, Option<u64>)> = Vec::new();
+    for (o, w, v) in find!(
+        (o: Id, w: Inline<Handle<LongString>>, v: Inline<ShortString>),
+        pattern!(&facts, [{ ?o @ bench::workload: ?w, bench::outcome: ?v }])
     ) {
         let workload: anybytes::View<str> =
             reader.get(w).map_err(|e| anyhow!("workload blob: {e:?}"))?;
         let outcome: String = v
             .try_from_inline()
             .map_err(|e| anyhow!("outcome decode: {e:?}"))?;
-        outcome_rows.push((workload.as_ref().to_owned(), outcome));
+        outcome_rows.push((workload.as_ref().to_owned(), outcome, rows_of.get(&o).copied()));
     }
     println!("outcomes : {}", outcome_rows.len());
     let mut histogram: std::collections::BTreeMap<(String, String), usize> = Default::default();
-    for (workload, outcome) in &outcome_rows {
+    for (workload, outcome, _) in &outcome_rows {
         let group = workload.split('/').next().unwrap_or(workload).to_owned();
         *histogram.entry((group, outcome.clone())).or_default() += 1;
     }
     for ((group, outcome), count) in &histogram {
         println!("  {group:<14} {outcome:<28} x{count}");
     }
+    outcome_rows.sort();
+    let mut any_rows = false;
+    for (workload, outcome, rows) in &outcome_rows {
+        if let Some(n) = rows {
+            if !any_rows {
+                println!("rows     :");
+                any_rows = true;
+            }
+            println!("  {workload:<45} {outcome:<10} rows={n}");
+        }
+    }
+
+    pile.close().map_err(|e| anyhow!("close results pile: {e:?}"))?;
     Ok(())
 }
