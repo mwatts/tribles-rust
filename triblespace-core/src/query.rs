@@ -59,9 +59,6 @@ use crate::inline::RawInline;
 pub use variableset::VariableSet;
 
 impl<T: InlineEncoding> Term<T> {
-}
-
-impl<T: InlineEncoding> Term<T> {
     /// Unwraps a variable term, panicking on constants.
     ///
     /// The macro layer desugars every literal to a hidden variable plus
@@ -247,9 +244,6 @@ impl<T: InlineEncoding> From<Inline<T>> for Term<T> {
     }
 }
 
-impl<T: InlineEncoding> Term<T> {
-}
-
 /// Untyped runtime form of a [`Term`]: a variable slot index or a pinned
 /// 32-byte value. Constraint implementations store this and use
 /// [`is_var`](RawTerm::is_var) / [`bound`](RawTerm::bound) in place of the
@@ -263,6 +257,36 @@ pub enum RawTerm {
     Const(RawInline),
 }
 
+impl RawTerm {
+    /// Returns `true` when this term is the given variable.
+    #[inline]
+    pub fn is_var(&self, variable: VariableId) -> bool {
+        matches!(self, RawTerm::Var(v) if *v == variable)
+    }
+
+    /// Returns the value this position holds under `binding`: the pinned
+    /// value for a constant, the binding's value (if any) for a variable.
+    ///
+    /// This is the helper that unifies "bound variable" and "constant" —
+    /// backend dispatch keyed on "is this position bound?" treats a
+    /// constant as a position that is born bound, with no extra match arms.
+    #[inline]
+    pub fn position_value<'b>(&'b self, binding: &'b Binding) -> Option<&'b RawInline> {
+        match self {
+            RawTerm::Var(v) => binding.get(*v),
+            RawTerm::Const(c) => Some(c),
+        }
+    }
+
+    /// Adds the term's variable (if it is one) to `set`. Constants stay
+    /// below the variable layer and are never added.
+    #[inline]
+    pub fn add_to(&self, set: &mut VariableSet) {
+        if let RawTerm::Var(v) = self {
+            set.set(*v);
+        }
+    }
+}
 
 /// Collections can implement this trait so that they can be used in queries.
 /// The returned constraint will filter the values assigned to the variable
@@ -1058,10 +1082,24 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             )
         });
 
+        // Constraints whose positions are all constant [`Term`]s (e.g. a
+        // fully-constant `pattern!` used as an existence check) have an
+        // empty variable set, so the propose/confirm search never consults
+        // them. Their truth is binding-independent and `satisfied` is exact
+        // for them from the start (the fully-bound exactness law: zero
+        // unbound variables). One check up front settles every such
+        // subtree; constraints with unbound variables answer an optimistic
+        // `true` here and are validated by the search as usual.
+        let mode = if constraint.satisfied(&binding) {
+            Search::NextVariable
+        } else {
+            Search::Done
+        };
+
         Query {
             constraint,
             postprocessing,
-            mode: Search::NextVariable,
+            mode,
             binding,
             influences,
             estimates,
