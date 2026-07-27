@@ -104,6 +104,42 @@ impl fmt::Display for PathError {
 impl Error for PathError {}
 
 impl PathSummary {
+    pub(crate) fn from_canonical_ordinals(
+        automaton: Automaton,
+        vertices: Vec<RawInline>,
+        arcs: Vec<(u32, u32)>,
+    ) -> Result<Self, PathError> {
+        let state_count = automaton.state_count();
+        let product_count = vertices
+            .len()
+            .checked_mul(state_count as usize)
+            .ok_or(PathError::CapacityOverflow)?;
+        let mut product_arcs = Vec::with_capacity(arcs.len());
+        for (source, target) in arcs {
+            if source as usize >= product_count || target as usize >= product_count {
+                return Err(PathError::ProductCarrierTooLarge {
+                    vertices: vertices.len(),
+                    states: state_count,
+                });
+            }
+            product_arcs.push(ProductArc {
+                source: ProductNode {
+                    vertex: vertices[source as usize / state_count as usize],
+                    state: source % state_count,
+                },
+                target: ProductNode {
+                    vertex: vertices[target as usize / state_count as usize],
+                    state: target % state_count,
+                },
+            });
+        }
+        Ok(Self {
+            automaton,
+            vertices,
+            arcs: product_arcs,
+        })
+    }
+
     /// Lowers a SET of graph edges into canonical direct product arcs.
     pub fn from_edges(automaton: Automaton, edges: impl IntoIterator<Item = GraphEdge>) -> Self {
         let edges = edges.into_iter().collect::<BTreeSet<_>>();

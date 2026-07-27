@@ -10,9 +10,14 @@
 mod automaton;
 mod constraint;
 mod index;
+mod persistence;
 mod summary;
 
 pub use automaton::{Automaton, AutomatonError, StateId, Step, Transition};
 pub use constraint::PathConstraint;
 pub use index::PathIndex;
+pub use persistence::{
+    automaton_fingerprint, path_automaton_fingerprint, seg_path_summary, PathRollup,
+    PathSummaryBlob, PathSummaryBlobError,
+};
 pub use summary::{GraphEdge, PathError, PathSummary};
