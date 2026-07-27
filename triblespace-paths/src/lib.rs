@@ -11,12 +11,14 @@
 
 mod automaton;
 mod constraint;
+mod expr;
 mod index;
 mod persistence;
 mod summary;
 
 pub use automaton::{Automaton, AutomatonError, StateId, Step, Transition};
 pub use constraint::PathConstraint;
+pub use expr::PathExpr;
 pub use index::PathIndex;
 pub use persistence::{
     automaton_fingerprint, path_automaton_fingerprint, seg_path_summary, PathRollup,
