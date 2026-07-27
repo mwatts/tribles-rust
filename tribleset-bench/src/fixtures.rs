@@ -45,9 +45,12 @@ use subject::core::prelude::*;
 // hand-written `Constraint` wrapper, F12's programmatic chain, and F13's
 // hand-rolled variable context.
 use subject::core::query::{
-    Binding, Candidates, Constraint, ProposalBuffer, ProposeCursor, VariableContext, VariableId,
-    VariableSet,
+    Binding, Constraint, ProposalBuffer, ProposeCursor, VariableContext, VariableId, VariableSet,
 };
+// `Candidates` is the post-owned-mask confirm region; only F11's hand-written
+// Constraint impl names it, and it does not exist on older subjects.
+#[cfg(feature = "protocol-v2")]
+use subject::core::query::Candidates;
 use subject::core::repo::pile::Pile;
 use subject::core::repo::{self, Repository};
 
