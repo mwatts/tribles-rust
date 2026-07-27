@@ -963,6 +963,20 @@ pub fn f9_total(set: &TribleSet) -> usize {
 // Gate on ROWS only — the answer must be the region size on both sides,
 // which is the property routing may never change. Timings across the
 // boundary are the interesting signal but are not a gate.
+//
+// !!! SIZING CAVEAT, to be revisited when leaf sources gain
+// `propose_chunk` overrides (see F14). Today no source overrides it, so
+// the default ships a whole level in one call and the confirm region
+// `IntersectionConstraint` hands its siblings IS the level size — which
+// is why a level of `F10_BELOW` / `F10_ABOVE` candidates straddles the
+// threshold exactly. Once sources chunk, the regions become the engine's
+// geometric budgets (`INITIAL_CHUNK` 64, then x`WIDEN_FACTOR`: 256,
+// 1024, 4096, 16384, ...), and a level only produces a full
+// 16384-entry region once it exceeds 64 + 256 + 1024 + 4096 = 5440
+// candidates *plus* the threshold, i.e. 21 824. At that point these two
+// levels would BOTH sit below the routing boundary and the fixture would
+// silently stop straddling anything: re-derive `F10_BELOW` /
+// `F10_ABOVE` from the chunk schedule rather than from the level size.
 // ---------------------------------------------------------------------------
 
 /// F10: the routing threshold, read from the engine so this fixture
