@@ -10,7 +10,7 @@ use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::{Inline, IntoInline, RawInline};
 use triblespace_core::query::intersectionconstraint::IntersectionConstraint;
 use triblespace_core::query::{
-    Binding, Constraint, ProposalBuffer, Variable, VariableContext,
+    Binding, BindingStore, Constraint, ProposalBuffer, Variable, VariableContext,
 };
 
 use triblespace_search::bm25::BM25Builder;
@@ -128,11 +128,11 @@ fn satisfied_respects_both_clauses() {
     let intersection = IntersectionConstraint::new(vec![c_quick, c_fox]);
 
     // doc = 1: has both "quick" and "fox" → satisfied.
-    let mut binding = Binding::default();
-    binding.set(doc.index, &id_as_raw_value(id(1)));
-    assert!(intersection.satisfied(&binding));
+    let mut binding = BindingStore::new();
+    binding.bind(doc.index, &id_as_raw_value(id(1)));
+    assert!(intersection.satisfied(&binding.view()));
 
     // doc = 2: has "quick" but not "fox" → unsatisfied.
-    binding.set(doc.index, &id_as_raw_value(id(2)));
-    assert!(!intersection.satisfied(&binding));
+    binding.bind(doc.index, &id_as_raw_value(id(2)));
+    assert!(!intersection.satisfied(&binding.view()));
 }

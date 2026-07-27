@@ -178,7 +178,7 @@ impl<T: InlineEncoding> Variable<T> {
     /// # Panics
     ///
     /// Panics if the variable has not been bound.
-    pub fn extract(self, binding: &Binding) -> &Inline<T> {
+    pub fn extract<'b>(self, binding: &Binding<'b>) -> &'b Inline<T> {
         let raw = binding.get(self.index).unwrap_or_else(|| {
             panic!(
                 "query variable (idx {}) was never bound before projection. This usually means the variable was projected in `find!` but never appeared in any constraint. If you intended a pure existence query, use `find!((), ...)` or `exists!(constraint)`.",
@@ -296,51 +296,291 @@ impl<T: InlineEncoding> Variable<T> {
     }
 }
 
-/// The binding keeps track of the values assigned to variables in a query.
-/// It maps variables to values - by their index - via a simple array,
-/// and keeps track of which variables are bound.
-/// It is used to store intermediate results and to pass information
-/// between different constraints.
-/// The binding is mutable, as it is modified by the query engine.
-/// It is not thread-safe and should not be shared between threads.
-/// The binding is a simple data structure that is cheap to clone.
-/// It is not intended to be used as a long-term storage for query results.
-#[derive(Clone, Debug)]
-pub struct Binding {
+/// The values assigned to the variables of a query — stored as **paths,
+/// not copies**.
+///
+/// A bound variable's value always *originates* from that variable's own
+/// level buffer: [`propose`](Constraint::propose) fills the buffer and
+/// the engine binds by consuming one of its entries. So a binding does
+/// not need to carry the 32 bytes; it carries the `u32` index of the
+/// chosen entry and resolves it through the buffers on read. Two
+/// properties make the index as good as the value:
+///
+/// * A level's buffer is cleared and refilled only when its variable is
+///   (re-)pushed, and the engine only ever pushes a variable that is
+///   currently unbound (deeper levels are unset by backtracking before
+///   their level is re-pushed). While a variable is bound, its buffer is
+///   stable, so its index stays valid for exactly the lifetime of the
+///   binding.
+/// * Buffers are write-once: confirmers kill entries by clearing a
+///   parallel liveness word, and nothing ever moves or rewrites a stored
+///   value once the engine can see it.
+///
+/// `Binding` is therefore a *view* — the index row plus a borrow of the
+/// buffers it indexes into — constructed for the duration of one
+/// constraint call. [`BindingStore`] owns both halves.
+///
+/// The payoff is size: an assignment is 128 `u32`s (512 bytes) instead of
+/// 128 raw inline values (4 KiB), a bind is a 4-byte write instead of a
+/// 32-byte copy, cloning the search state no longer memcpies the values,
+/// and a *batch* of bindings becomes a small integer matrix over shared
+/// buffers rather than a pile of value copies.
+#[derive(Clone, Copy)]
+pub struct Binding<'a> {
     /// Bitset tracking which variables have been assigned a value.
     pub bound: VariableSet,
-    values: [RawInline; 128],
+    indexes: &'a [u32; 128],
+    levels: &'a [LevelValues; 128],
 }
 
-impl Binding {
-    /// Binds `variable` to `value`.
-    pub fn set(&mut self, variable: VariableId, value: &RawInline) {
-        self.values[variable] = *value;
-        self.bound.set(variable);
+impl fmt::Debug for Binding<'_> {
+    /// Prints the bound variables and the values they resolve to — the
+    /// assignment, not the buffers it is a path through.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map()
+            .entries(self.bound.into_iter().map(|v| (v, self.get(v))))
+            .finish()
     }
+}
 
-    /// Unset a variable in the binding.
-    /// This is used to backtrack in the query engine.
-    pub fn unset(&mut self, variable: VariableId) {
-        self.bound.unset(variable);
-    }
-
-    /// Check if a variable is bound in the binding.
-    pub fn get(&self, variable: VariableId) -> Option<&RawInline> {
+impl<'a> Binding<'a> {
+    /// Returns the value bound to `variable`, or `None` when it is
+    /// unbound — resolved through `variable`'s level buffer.
+    pub fn get(&self, variable: VariableId) -> Option<&'a RawInline> {
         if self.bound.is_set(variable) {
-            Some(&self.values[variable])
+            Some(&self.levels[variable].buffer[self.indexes[variable] as usize])
         } else {
             None
         }
     }
 }
 
-impl Default for Binding {
+/// Backing for the empty [`Binding`]: nothing is bound, so nothing ever
+/// resolves through them, but a view needs something to point at.
+static NO_LEVELS: [LevelValues; 128] = [const { LevelValues::empty() }; 128];
+static NO_INDEXES: [u32; 128] = [0; 128];
+
+impl Default for Binding<'_> {
+    /// The empty binding — no variable is bound.
     fn default() -> Self {
-        Self {
+        Binding {
             bound: VariableSet::new_empty(),
-            values: [[0; 32]; 128],
+            indexes: &NO_INDEXES,
+            levels: &NO_LEVELS,
         }
+    }
+}
+
+/// Owns what a [`Binding`] is a view of: the per-variable level buffers
+/// and the index row that picks one entry out of each.
+///
+/// This is the query engine's search state. It is also how code outside
+/// the engine builds a binding over values it picked itself — see
+/// [`bind`](BindingStore::bind).
+#[derive(Clone)]
+pub struct BindingStore {
+    bound: VariableSet,
+    indexes: [u32; 128],
+    levels: [LevelValues; 128],
+}
+
+impl fmt::Debug for BindingStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.view(), f)
+    }
+}
+
+impl Default for BindingStore {
+    fn default() -> Self {
+        BindingStore {
+            bound: VariableSet::new_empty(),
+            indexes: [0; 128],
+            levels: std::array::from_fn(|_| LevelValues::default()),
+        }
+    }
+}
+
+impl BindingStore {
+    /// An empty store: nothing bound, every level empty.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The current assignment, as constraints see it.
+    pub fn view(&self) -> Binding<'_> {
+        Binding {
+            bound: self.bound,
+            indexes: &self.indexes,
+            levels: &self.levels,
+        }
+    }
+
+    /// Binds `variable` to `value` by appending it to that variable's
+    /// level buffer and pointing the index row at it.
+    ///
+    /// The engine never needs this — its candidates are already in the
+    /// buffer, so it binds by index. This is the entry point for callers
+    /// outside the search (tests, tools) that want a binding over values
+    /// of their own choosing.
+    pub fn bind(&mut self, variable: VariableId, value: &RawInline) {
+        let level = &mut self.levels[variable];
+        let index = level.buffer.len();
+        level.buffer.push(*value);
+        self.indexes[variable] = index as u32;
+        self.bound.set(variable);
+    }
+
+    /// Unbinds `variable` — the engine's backtracking step.
+    pub fn unset(&mut self, variable: VariableId) {
+        self.bound.unset(variable);
+    }
+
+    /// The set of currently bound variables.
+    pub fn bound(&self) -> VariableSet {
+        self.bound
+    }
+
+    /// Live candidates still pending at `variable`'s level.
+    #[cfg(feature = "parallel")]
+    fn pending(&self, variable: VariableId) -> usize {
+        let level = &self.levels[variable];
+        level.buffer.count_live(level.pos)
+    }
+
+    /// Whether `variable`'s source may still deliver candidates beyond
+    /// what is materialized.
+    fn more(&self, variable: VariableId) -> bool {
+        self.levels[variable].more
+    }
+
+    /// Consumes the next live candidate at `variable`'s level and binds
+    /// `variable` to it. Returns `false` when the materialized region is
+    /// spent.
+    fn advance(&mut self, variable: VariableId) -> bool {
+        let level = &mut self.levels[variable];
+        match level.buffer.next_live(level.pos) {
+            Some(i) => {
+                level.pos = i + 1;
+                self.indexes[variable] = i as u32;
+                self.bound.set(variable);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Clears `variable`'s level and refills it from `propose`.
+    ///
+    /// The level is moved *out* of the array for the duration of the
+    /// call, so `propose` gets `&mut` on it while the remaining levels
+    /// lend immutably through the [`Binding`] view — the borrow split the
+    /// search needs, with no `unsafe` and no second copy of the
+    /// candidates. This is sound precisely because the engine only ever
+    /// refills the level of a variable it is about to push, which is by
+    /// construction unbound: nothing can be resolving through this level
+    /// while it is away.
+    fn refill(
+        &mut self,
+        variable: VariableId,
+        reserve: usize,
+        propose: impl FnOnce(&Binding<'_>, &mut ProposeCursor, usize, &mut ProposalBuffer) -> bool,
+    ) {
+        debug_assert!(
+            !self.bound.is_set(variable),
+            "refilling a bound variable's level would strand its binding"
+        );
+        let mut level = std::mem::take(&mut self.levels[variable]);
+        level.buffer.clear();
+        level.pos = 0;
+        level.cursor = ProposeCursor::default();
+        level.widen = INITIAL_CHUNK;
+        level
+            .buffer
+            .reserve_exact(reserve.saturating_sub(level.buffer.capacity()));
+        level.more = propose(
+            &Binding {
+                bound: self.bound,
+                indexes: &self.indexes,
+                levels: &self.levels,
+            },
+            &mut level.cursor,
+            level.widen,
+            &mut level.buffer,
+        );
+        self.levels[variable] = level;
+    }
+
+    /// Requests the next geometric chunk for `variable`'s level and
+    /// appends it to what is already materialized. Returns whether the
+    /// level may still produce more.
+    ///
+    /// Unlike [`refill`](BindingStore::refill) the level stays in the
+    /// array, because widening *can* happen while `variable` is still
+    /// bound: the engine reaches here by backtracking into a level whose
+    /// materialized region ran dry, and that binding has to keep
+    /// resolving while the source is asked for more. The chunk is
+    /// therefore proposed into a detached buffer and appended, which
+    /// leaves every existing index — including the bound one — pointing
+    /// at the same entry.
+    fn widen(
+        &mut self,
+        variable: VariableId,
+        propose: impl FnOnce(&Binding<'_>, &mut ProposeCursor, usize, &mut ProposalBuffer) -> bool,
+    ) -> bool {
+        let widen = self.levels[variable].widen.saturating_mul(WIDEN_FACTOR);
+        let mut cursor = self.levels[variable].cursor;
+        let mut chunk = ProposalBuffer::new();
+        let more = propose(
+            &Binding {
+                bound: self.bound,
+                indexes: &self.indexes,
+                levels: &self.levels,
+            },
+            &mut cursor,
+            widen,
+            &mut chunk,
+        );
+        let level = &mut self.levels[variable];
+        level.widen = widen;
+        level.cursor = cursor;
+        level.more = more;
+        level.buffer.append(&mut chunk);
+        more
+    }
+
+    /// Bisects `variable`'s materialized region, returning the tail as a
+    /// fresh level for the right half of a parallel split.
+    ///
+    /// The left half keeps entries `[0..mid)`, and every consumed entry
+    /// (and hence every index any binding holds for this level) sits
+    /// below `pos <= mid` — so the left half's indexes stay valid. The
+    /// returned tail re-indexes from zero, which is why the right half
+    /// must [`unset`](BindingStore::unset) `variable` when it installs
+    /// it.
+    #[cfg(feature = "parallel")]
+    fn bisect(&mut self, variable: VariableId) -> LevelValues {
+        let level = &mut self.levels[variable];
+        let pending_start = level
+            .buffer
+            .next_live(level.pos)
+            .expect("bisect requires pending candidates");
+        let mid = pending_start + (level.buffer.len() - pending_start) / 2;
+        LevelValues {
+            buffer: level.buffer.split_off(mid),
+            pos: 0,
+            cursor: ProposeCursor::default(),
+            more: false,
+            widen: INITIAL_CHUNK,
+        }
+    }
+
+    /// Installs `level` as `variable`'s level and unbinds `variable`:
+    /// the incoming buffer has its own coordinates, so any index the
+    /// index row still holds for it is meaningless.
+    #[cfg(feature = "parallel")]
+    fn install(&mut self, variable: VariableId, level: LevelValues) {
+        self.levels[variable] = level;
+        self.bound.unset(variable);
     }
 }
 
@@ -484,7 +724,8 @@ impl ProposalBuffer {
 
     /// Moves every entry of `other` (values and liveness together) onto
     /// the end of this buffer, leaving `other` empty. Existing entries —
-    /// and therefore every index into them — are untouched.
+    /// and therefore every index a binding holds into them — are
+    /// untouched.
     pub fn append(&mut self, other: &mut ProposalBuffer) {
         self.entries.append(&mut other.entries);
         self.live.append(&mut other.live);
@@ -898,15 +1139,29 @@ struct LevelValues {
     widen: usize,
 }
 
-impl Default for LevelValues {
-    fn default() -> Self {
+impl LevelValues {
+    /// An empty level, const-constructible so the empty [`Binding`] can
+    /// borrow a `static` array of them.
+    const fn empty() -> Self {
         LevelValues {
-            buffer: ProposalBuffer::new(),
+            buffer: ProposalBuffer {
+                entries: Vec::new(),
+                live: Vec::new(),
+            },
             pos: 0,
-            cursor: ProposeCursor::default(),
+            cursor: ProposeCursor {
+                started: false,
+                key: [0; 32],
+            },
             more: false,
             widen: INITIAL_CHUNK,
         }
+    }
+}
+
+impl Default for LevelValues {
+    fn default() -> Self {
+        Self::empty()
     }
 }
 
@@ -925,17 +1180,16 @@ impl Default for LevelValues {
 /// which provides a convenient way to declare variables and concrete types for them.
 /// And which sets up the nessecairy context for higher-level query languages
 /// like the one provided by the [`crate::macros`] module.
-pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
+pub struct Query<C, P: Fn(&Binding<'_>) -> Option<R>, R> {
     constraint: C,
     postprocessing: P,
     mode: Search,
-    binding: Binding,
+    bindings: BindingStore,
     influences: [VariableSet; 128],
     estimates: [usize; 128],
     touched_variables: VariableSet,
     stack: ArrayVec<VariableId, 128>,
     unbound: ArrayVec<VariableId, 128>,
-    values: ArrayVec<Option<LevelValues>, 128>,
 }
 
 // Manual `Clone` impl, because `#[derive(Clone)]` would require `R: Clone`
@@ -944,25 +1198,24 @@ pub struct Query<C, P: Fn(&Binding) -> Option<R>, R> {
 impl<C, P, R> Clone for Query<C, P, R>
 where
     C: Clone,
-    P: Fn(&Binding) -> Option<R> + Clone,
+    P: Fn(&Binding<'_>) -> Option<R> + Clone,
 {
     fn clone(&self) -> Self {
         Self {
             constraint: self.constraint.clone(),
             postprocessing: self.postprocessing.clone(),
             mode: self.mode,
-            binding: self.binding.clone(),
+            bindings: self.bindings.clone(),
             influences: self.influences,
             estimates: self.estimates,
             touched_variables: self.touched_variables,
             stack: self.stack.clone(),
             unbound: self.unbound.clone(),
-            values: self.values.clone(),
         }
     }
 }
 
-impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
+impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> {
     /// Picks the next unbound variable, refreshes estimates touched by
     /// the most recent binding, re-sorts `unbound`, pushes the chosen
     /// variable onto the stack, and fills its proposal vector via
@@ -978,13 +1231,13 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             stale_estimates = stale_estimates.union(self.influences[variable]);
         }
         // Bound variables can't be influenced by the unbound ones, so skip.
-        stale_estimates = stale_estimates.subtract(self.binding.bound);
+        stale_estimates = stale_estimates.subtract(self.bindings.bound());
 
         if !stale_estimates.is_empty() {
             while let Some(v) = stale_estimates.drain_next_ascending() {
                 self.estimates[v] = self
                     .constraint
-                    .estimate(v, &self.binding)
+                    .estimate(v, &self.bindings.view())
                     .expect("unconstrained variable in query");
             }
             self.unbound.sort_unstable_by_key(|v| {
@@ -1003,37 +1256,24 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         let variable = self.unbound.pop().expect("non-empty unbound");
         let estimate = self.estimates[variable];
         self.stack.push(variable);
-        let slot = self.values[variable].get_or_insert_with(LevelValues::default);
-        slot.buffer.clear();
-        slot.pos = 0;
-        slot.cursor = ProposeCursor::default();
-        slot.widen = INITIAL_CHUNK;
-        slot.buffer
-            .reserve_exact(estimate.min(INITIAL_CHUNK).saturating_sub(slot.buffer.capacity()));
-        slot.more = self.constraint.propose_chunk(
+        let constraint = &self.constraint;
+        self.bindings.refill(
             variable,
-            &self.binding,
-            &mut slot.cursor,
-            slot.widen,
-            &mut slot.buffer,
+            estimate.min(INITIAL_CHUNK),
+            |binding, cursor, budget, proposals| {
+                constraint.propose_chunk(variable, binding, cursor, budget, proposals)
+            },
         );
     }
 
     /// Requests the next geometric chunk for `variable`'s level. Returns
     /// whether the level may still produce more after this call.
     fn widen_level(&mut self, variable: VariableId) -> bool {
-        let slot = self.values[variable]
-            .as_mut()
-            .expect("values should be initialized");
-        slot.widen = slot.widen.saturating_mul(WIDEN_FACTOR);
-        slot.more = self.constraint.propose_chunk(
-            variable,
-            &self.binding,
-            &mut slot.cursor,
-            slot.widen,
-            &mut slot.buffer,
-        );
-        slot.more
+        let constraint = &self.constraint;
+        self.bindings
+            .widen(variable, |binding, cursor, budget, proposals| {
+                constraint.propose_chunk(variable, binding, cursor, budget, proposals)
+            })
     }
 
     /// Create a new query.
@@ -1052,11 +1292,11 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
                 VariableSet::new_empty()
             }
         });
-        let binding = Binding::default();
+        let bindings = BindingStore::new();
         let estimates = std::array::from_fn(|v| {
             if variables.is_set(v) {
                 constraint
-                    .estimate(v, &binding)
+                    .estimate(v, &bindings.view())
                     .expect("unconstrained variable in query")
             } else {
                 usize::MAX
@@ -1083,7 +1323,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
         // unbound variables). One check up front settles every such
         // subtree; constraints with unbound variables answer an optimistic
         // `true` here and are validated by the search as usual.
-        let mode = if constraint.satisfied(&binding) {
+        let mode = if constraint.satisfied(&bindings.view()) {
             Search::NextVariable
         } else {
             Search::Done
@@ -1093,13 +1333,12 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Query<C, P, R> {
             constraint,
             postprocessing,
             mode,
-            binding,
+            bindings,
             influences,
             estimates,
             touched_variables: VariableSet::new_empty(),
             stack: ArrayVec::new(),
             unbound,
-            values: ArrayVec::from([const { None }; 128]),
         }
     }
 }
@@ -1121,7 +1360,7 @@ enum Search {
     Done,
 }
 
-impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<C, P, R> {
+impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Iterator for Query<C, P, R> {
     type Item = R;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1130,7 +1369,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
                 Search::NextVariable => {
                     self.mode = Search::NextValue;
                     if self.unbound.is_empty() {
-                        if let Some(result) = (self.postprocessing)(&self.binding) {
+                        if let Some(result) = (self.postprocessing)(&self.bindings.view()) {
                             return Some(result);
                         }
                         // Post-processing rejected this binding; continue
@@ -1141,16 +1380,10 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
                 }
                 Search::NextValue => {
                     if let Some(&variable) = self.stack.last() {
-                        let slot = self.values[variable]
-                            .as_mut()
-                            .expect("values should be initialized");
-                        if let Some(i) = slot.buffer.next_live(slot.pos) {
-                            let assignment = slot.buffer[i];
-                            slot.pos = i + 1;
-                            self.binding.set(variable, &assignment);
+                        if self.bindings.advance(variable) {
                             self.touched_variables.set(variable);
                             self.mode = Search::NextVariable;
-                        } else if slot.more {
+                        } else if self.bindings.more(variable) {
                             // Materialized candidates ran dry but the source
                             // has (or may have) more: request the next
                             // geometric chunk and re-enter this arm.
@@ -1165,7 +1398,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
                 }
                 Search::Backtrack => {
                     if let Some(variable) = self.stack.pop() {
-                        self.binding.unset(variable);
+                        self.bindings.unset(variable);
                         // Note that we did not update estiamtes for the unbound variables
                         // as we are backtracking, so the estimates are still valid.
                         // Since we choose this variable before, we know that it would
@@ -1191,12 +1424,12 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> Iterator for Query<
     }
 }
 
-impl<'a, C: Constraint<'a>, P: Fn(&Binding) -> Option<R>, R> fmt::Debug for Query<C, P, R> {
+impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> fmt::Debug for Query<C, P, R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Query")
             .field("constraint", &std::any::type_name::<C>())
             .field("mode", &self.mode)
-            .field("binding", &self.binding)
+            .field("binding", &self.bindings.view())
             .field("stack", &self.stack)
             .field("unbound", &self.unbound)
             .finish()
@@ -1257,7 +1490,7 @@ mod parallel {
     /// A bounded per-producer budget (`num_threads²`) caps the split tree
     /// at ~N² leaves — enough for each worker to have roughly N chunks to
     /// rebalance via stealing — regardless of stealing pressure.
-    pub struct QueryParIter<C, P: Fn(&Binding) -> Option<R>, R> {
+    pub struct QueryParIter<C, P: Fn(&Binding<'_>) -> Option<R>, R> {
         inner: Box<Query<C, P, R>>,
         split_budget: usize,
     }
@@ -1265,7 +1498,7 @@ mod parallel {
     impl<'a, C, P, R> IntoParallelIterator for Query<C, P, R>
     where
         C: Constraint<'a> + Clone + Send + 'a,
-        P: Fn(&Binding) -> Option<R> + Clone + Send,
+        P: Fn(&Binding<'_>) -> Option<R> + Clone + Send,
         R: Send,
     {
         type Item = R;
@@ -1289,7 +1522,7 @@ mod parallel {
     impl<'a, C, P, R> UnindexedProducer for QueryParIter<C, P, R>
     where
         C: Constraint<'a> + Clone + Send + 'a,
-        P: Fn(&Binding) -> Option<R> + Clone + Send,
+        P: Fn(&Binding<'_>) -> Option<R> + Clone + Send,
         R: Send,
     {
         type Item = R;
@@ -1326,7 +1559,7 @@ mod parallel {
                         }
                         Search::Backtrack => {
                             if let Some(variable) = q.stack.pop() {
-                                q.binding.unset(variable);
+                                q.bindings.unset(variable);
                                 q.unbound.push(variable);
                                 q.touched_variables.set(variable);
                                 q.mode = Search::NextValue;
@@ -1352,9 +1585,7 @@ mod parallel {
                 let Some(&top) = q.stack.last() else {
                     return (self, None);
                 };
-                let (top_live, top_more) = q.values[top]
-                    .as_ref()
-                    .map_or((0, false), |s| (s.buffer.count_live(s.pos), s.more));
+                let (top_live, top_more) = (q.bindings.pending(top), q.bindings.more(top));
                 match (top_live, top_more) {
                     (0, false) => q.mode = Search::Backtrack,
                     (0, true) => {
@@ -1366,36 +1597,32 @@ mod parallel {
                         // Descend: consume the single pending value, bind
                         // it, transition to NextVariable so the outer loop
                         // runs propose.
-                        let slot = q.values[top].as_mut().unwrap();
-                        let i = slot.buffer.next_live(slot.pos).unwrap();
-                        let assignment = slot.buffer[i];
-                        slot.pos = i + 1;
-                        q.binding.set(top, &assignment);
+                        let advanced = q.bindings.advance(top);
+                        debug_assert!(advanced, "a pending candidate must bind");
                         q.touched_variables.set(top);
                         q.mode = Search::NextVariable;
                     }
                     _ => {
                         // Bisect the materialized proposals; clone the
                         // rest of the query state into the right half.
-                        // Clone cost is one ~15 KB arraycopy per
+                        // Clone cost is one ~11 KB arraycopy per
                         // rayon-requested split — rayon only asks under
                         // stealing pressure. The right half never drives
                         // the cursor (its slice is fixed); the left half
                         // retains it, so every unmaterialized candidate
                         // still has exactly one owner.
-                        let slot = q.values[top].as_mut().unwrap();
-                        let pending_start = slot.buffer.next_live(slot.pos).unwrap();
-                        let mid = pending_start
-                            + (slot.buffer.len() - pending_start) / 2;
-                        let right_vals = slot.buffer.split_off(mid);
+                        //
+                        // Bindings are indexes into the level buffers, so
+                        // the halves' coordinate systems matter here. The
+                        // left half keeps entries [0..mid) and every
+                        // consumed entry sits below `pos <= mid`, so its
+                        // indexes still resolve to the same values. The
+                        // right half's buffer re-indexes from zero, which
+                        // is why `install` unbinds `top` there — it is
+                        // about to be re-bound out of the tail anyway.
+                        let right_level = q.bindings.bisect(top);
                         let mut right = q.clone();
-                        right.values[top] = Some(LevelValues {
-                            buffer: right_vals,
-                            pos: 0,
-                            cursor: ProposeCursor::default(),
-                            more: false,
-                            widen: INITIAL_CHUNK,
-                        });
+                        right.bindings.install(top, right_level);
 
                         let left_budget = self.split_budget / 2;
                         let right_budget = self.split_budget - left_budget;
@@ -1427,7 +1654,7 @@ mod parallel {
     impl<'a, C, P, R> ParallelIterator for QueryParIter<C, P, R>
     where
         C: Constraint<'a> + Clone + Send + 'a,
-        P: Fn(&Binding) -> Option<R> + Clone + Send,
+        P: Fn(&Binding<'_>) -> Option<R> + Clone + Send,
         R: Send,
     {
         type Item = R;

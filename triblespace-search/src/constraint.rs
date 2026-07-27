@@ -748,6 +748,7 @@ mod tests {
     use triblespace_core::blob::MemoryBlobStore;
     use triblespace_core::id::Id;
     use triblespace_core::inline::{InlineEncoding, IntoInline, TryFromInline};
+    use triblespace_core::query::BindingStore;
     use triblespace_core::query::Query;
     use triblespace_core::repo::{BlobStore, BlobStorePut};
 
@@ -891,13 +892,13 @@ mod tests {
         let empty = Binding::default();
         assert!(c.satisfied(&empty));
 
-        let mut bound = Binding::default();
-        bound.set(doc.index, &id_to_raw_value(id(1)));
-        assert!(c.satisfied(&bound));
+        let mut bound = BindingStore::new();
+        bound.bind(doc.index, &id_to_raw_value(id(1)));
+        assert!(c.satisfied(&bound.view()));
 
-        let mut unmatching = Binding::default();
-        unmatching.set(doc.index, &id_to_raw_value(id(2)));
-        assert!(!c.satisfied(&unmatching));
+        let mut unmatching = BindingStore::new();
+        unmatching.bind(doc.index, &id_to_raw_value(id(2)));
+        assert!(!c.satisfied(&unmatching.view()));
     }
 
     #[test]
@@ -1147,11 +1148,11 @@ mod tests {
         let b: Variable<Handle<Embedding>> = ctx.next_variable();
         let c = view.cosine_at_least(a, b, 0.8);
 
-        let mut binding = Binding::default();
-        binding.set(a.index, &handles[0].raw);
+        let mut binding = BindingStore::new();
+        binding.bind(a.index, &handles[0].raw);
 
         let mut no_domain = ProposalBuffer::new();
-        c.propose(b.index, &binding, &mut no_domain);
+        c.propose(b.index, &binding.view(), &mut no_domain);
         assert!(
             no_domain.is_empty(),
             "exact cosine must never source an ANN domain"
@@ -1161,16 +1162,16 @@ mod tests {
         for handle in handles.iter() {
             bind_b.push(handle.raw);
         }
-        c.confirm(b.index, &binding, &mut bind_b.region(0));
+        c.confirm(b.index, &binding.view(), &mut bind_b.region(0));
         assert_eq!(live(&bind_b), [handles[0].raw, handles[2].raw]);
 
-        let mut peer_binding = Binding::default();
-        peer_binding.set(b.index, &handles[2].raw);
+        let mut peer_binding = BindingStore::new();
+        peer_binding.bind(b.index, &handles[2].raw);
         let mut bind_a = ProposalBuffer::new();
         for handle in handles.iter() {
             bind_a.push(handle.raw);
         }
-        c.confirm(a.index, &peer_binding, &mut bind_a.region(0));
+        c.confirm(a.index, &peer_binding.view(), &mut bind_a.region(0));
         assert_eq!(live(&bind_a), [handles[0].raw, handles[2].raw]);
     }
 
@@ -1209,15 +1210,15 @@ mod tests {
 
         assert!(c.satisfied(&Binding::default()));
 
-        let mut good = Binding::default();
-        good.set(a.index, &handles[0].raw);
-        good.set(b.index, &handles[2].raw);
-        assert!(c.satisfied(&good));
+        let mut good = BindingStore::new();
+        good.bind(a.index, &handles[0].raw);
+        good.bind(b.index, &handles[2].raw);
+        assert!(c.satisfied(&good.view()));
 
-        let mut bad = Binding::default();
-        bad.set(a.index, &handles[0].raw);
-        bad.set(b.index, &handles[1].raw);
-        assert!(!c.satisfied(&bad));
+        let mut bad = BindingStore::new();
+        bad.bind(a.index, &handles[0].raw);
+        bad.bind(b.index, &handles[1].raw);
+        assert!(!c.satisfied(&bad.view()));
     }
 
     #[test]
@@ -1233,11 +1234,11 @@ mod tests {
         let b: Variable<Handle<Embedding>> = ctx.next_variable();
         let c = view.cosine_at_least(a, b, 0.99);
 
-        let mut binding = Binding::default();
-        binding.set(a.index, &handles[0].raw);
+        let mut binding = BindingStore::new();
+        binding.bind(a.index, &handles[0].raw);
         let mut candidates = ProposalBuffer::new();
         candidates.push(outside.raw);
-        c.confirm(b.index, &binding, &mut candidates.region(0));
+        c.confirm(b.index, &binding.view(), &mut candidates.region(0));
         assert_eq!(live(&candidates), [outside.raw]);
     }
 
@@ -1251,12 +1252,12 @@ mod tests {
         let a = Variable::<Handle<Embedding>>::new(0);
         let b = Variable::<Handle<Embedding>>::new(1);
 
-        let mut binding = Binding::default();
-        binding.set(a.index, &a_handle.raw);
+        let mut binding = BindingStore::new();
+        binding.bind(a.index, &a_handle.raw);
         let mut candidates = ProposalBuffer::new();
         candidates.push(b_handle.raw);
         view.cosine_at_least(a, b, 1.01)
-            .confirm(b.index, &binding, &mut candidates.region(0));
+            .confirm(b.index, &binding.view(), &mut candidates.region(0));
         assert_eq!(
             candidates.count_live(0),
             0,
@@ -1280,9 +1281,9 @@ mod tests {
         assert_eq!(c.estimate(a.index, &empty), Some(usize::MAX));
         assert_eq!(c.estimate(b.index, &empty), Some(usize::MAX));
 
-        let mut bound = Binding::default();
-        bound.set(a.index, &handles[0].raw);
-        assert_eq!(c.estimate(b.index, &bound), Some(usize::MAX));
+        let mut bound = BindingStore::new();
+        bound.bind(a.index, &handles[0].raw);
+        assert_eq!(c.estimate(b.index, &bound.view()), Some(usize::MAX));
         assert_eq!(c.estimate(unrelated.index, &empty), None);
     }
 
@@ -1369,11 +1370,11 @@ mod tests {
         constraint.confirm(neighbour.index, &Binding::default(), &mut mixed.region(0));
         assert_eq!(live(&mixed), [embedding_raw(1), embedding_raw(2)]);
 
-        let mut bound = Binding::default();
-        bound.set(neighbour.index, &embedding_raw(2));
-        assert!(constraint.satisfied(&bound));
-        bound.set(neighbour.index, &embedding_raw(9));
-        assert!(!constraint.satisfied(&bound));
+        let mut bound = BindingStore::new();
+        bound.bind(neighbour.index, &embedding_raw(2));
+        assert!(constraint.satisfied(&bound.view()));
+        bound.bind(neighbour.index, &embedding_raw(9));
+        assert!(!constraint.satisfied(&bound.view()));
         assert!(constraint.satisfied(&Binding::default()));
     }
 
