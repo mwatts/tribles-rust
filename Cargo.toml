@@ -29,6 +29,11 @@ members = [
     "triblespace-search",
     "trible",
 ]
+# Deliberately NOT a member: the bench suite's `subject` dep is a
+# repointable symlink (tribleset-bench/subjects/current) that may aim at
+# any checkout of any era — it must never be resolved as part of this
+# workspace. It builds standalone from inside tribleset-bench/.
+exclude = ["tribleset-bench"]
 resolver = "2"
 
 [dependencies]

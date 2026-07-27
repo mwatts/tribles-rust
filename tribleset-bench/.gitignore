@@ -1,0 +1,4 @@
+/target
+*.pile
+/subjects/*
+!/subjects/current

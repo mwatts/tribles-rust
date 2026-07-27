@@ -1,0 +1,52 @@
+[package]
+name = "tribleset-bench"
+version = "0.1.0"
+edition = "2021"
+description = "Engine-version-agnostic benchmark suite for triblespace. The SUBJECT engine is a repointable dependency (any checkout, any era — no history grafting); results are written as canonical telemetry sessions/spans through the stable LEDGER dependency. The minted schema ids are the contract; GORBIE's telemetry-viewer renders the axis."
+
+[features]
+# Placeholder: compiles only once the subject engine regains a
+# regular-path constraint (`path!`). Gates the four transitive-path
+# sparqloscope translations and the path-shaped Harkonnen fixtures
+# (F1/F2/F4); with the feature off those record SKIP outcomes.
+rpq = []
+
+[dependencies]
+# The engine under test. `subjects/current` is a symlink managed by
+# bench.sh; the checked-in default target is `../..` — the enclosing
+# triblespace-rs repo, so a fresh clone builds the current checkout
+# as the subject with no setup. Repoint it at any worktree to bench
+# any rev (`./bench.sh <rev-or-path> …`; `git checkout -- subjects/
+# current` restores the default). The suite restricts itself to the
+# stable macro surface (find!/pattern!/TriblePattern) — the discipline
+# proven era-portable across 441 commits and three engine eras.
+subject = { package = "triblespace", path = "subjects/current" }
+# Direct handle on the subject's CORE crate. The core proc macros the
+# vendored queries use (pattern!/entity!/attributes! via
+# subject::core::prelude) expand to absolute `::triblespace_core::…`
+# paths, which must resolve in THIS crate's extern prelude — to the
+# same crate instance `subject::core` re-exports. Pointing at the same
+# path the subject's own core dep uses makes cargo unify the two.
+triblespace_core = { package = "triblespace-core", path = "subjects/current/triblespace-core" }
+# The results ledger: stable triblespace 0.47, used ONLY to write
+# sessions/spans/outcome entities. Measurement I/O never depends on the
+# era of the subject. 0.47.0 is not on crates.io (0.46.4 is the newest
+# published version), so the ledger pins the exact upstream rev whose
+# Cargo.toml carries 0.47.0 — an immutable commit, same stability
+# guarantee as a registry version. Ledger-side code (src/ledger.rs)
+# must use ONLY the umbrella macros (`triblespace::prelude`/
+# `triblespace::macros`) — they expand to `::triblespace::core` paths,
+# which resolve to this dep; the core-macro flavor would leak to the
+# subject's core.
+triblespace = { git = "https://github.com/triblespace/triblespace-rs", rev = "6c346e045b33a2e1112fcf48a712ec1db6779c46" }
+anyhow = "1"
+# Serve the vendored queries: blob views, SPARQL regex functions, and
+# the NsTAIInterval date folds. anybytes must unify with the subject
+# core's own requirement so `View` is one type.
+anybytes = "0.20.2"
+regex = "1"
+hifitime = "4.1.2"
+# Repository signing (both the subject's checkout phase and the ledger
+# writer create throwaway signing keys). 2.1 unifies with both graphs.
+ed25519-dalek = { version = "2.1.0", features = ["rand_core"] }
+rand = "0.8"
