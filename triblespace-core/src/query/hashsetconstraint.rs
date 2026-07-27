@@ -57,16 +57,11 @@ where
         }
     }
 
-    fn confirm(
-        &self,
-        variable: VariableId,
-        _binding: &Binding,
-        proposals: &[RawInline],
-        mask: &mut Mask,
-    ) {
+    fn confirm(&self, variable: VariableId, _binding: &Binding, cands: &mut Candidates<'_>) {
         if self.variable.index == variable {
-            for (i, v) in proposals.iter().enumerate() {
-                if !mask.live(i) {
+            for i in 0..cands.len() {
+                let v = &cands.values()[i];
+                if !cands.is_live(i) {
                     continue;
                 }
                 let keep = match TryFromInline::try_from_inline(Inline::<S>::as_transmute_raw(v)) {
@@ -74,7 +69,7 @@ where
                     Err(_) => false,
                 };
                 if !keep {
-                    mask.kill(i);
+                    cands.kill(i);
                 }
             }
         }

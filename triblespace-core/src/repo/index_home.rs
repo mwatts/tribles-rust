@@ -32,7 +32,7 @@ use crate::metadata;
 use crate::prelude::{attributes, entity, pattern};
 use crate::query::unionconstraint::UnionConstraint;
 use crate::query::{
-    Binding, Constraint, Mask, ProposalBuffer, ProposeCursor, RawTerm, Term, TriblePattern,
+    Binding, Candidates, Constraint, ProposalBuffer, ProposeCursor, RawTerm, Term, TriblePattern,
     VariableId, VariableSet,
 };
 use crate::repo::index_range::{
@@ -1433,14 +1433,8 @@ where
             .propose_chunk(variable, binding, cursor, budget, proposals)
     }
 
-    fn confirm(
-        &self,
-        variable: VariableId,
-        binding: &Binding,
-        proposals: &[RawInline],
-        mask: &mut Mask,
-    ) {
-        self.union.confirm(variable, binding, proposals, mask)
+    fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
+        self.union.confirm(variable, binding, cands)
     }
 
     fn satisfied(&self, binding: &Binding) -> bool {

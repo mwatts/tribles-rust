@@ -53,12 +53,12 @@ where
     }
 
     /// Sorts children by estimate, lets the tightest one propose, then
-    /// confirms through the rest in ascending estimate order and compacts
-    /// the survivors once. Children that return `None` for this variable
+    /// confirms through the rest in ascending estimate order — kills land
+    /// in the region's liveness words; nothing is compacted. Children that return `None` for this variable
     /// are skipped entirely.
     ///
     /// Only the tail region this call appended (from the incoming buffer
-    /// length onward) is confirmed and compacted, so proposals appended by
+    /// length onward) is confirmed, so proposals appended by
     /// sibling constraints in an enclosing composite are never filtered
     /// through this intersection's children.
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
@@ -95,24 +95,16 @@ where
             .1
             .propose_chunk(variable, binding, cursor, budget, proposals);
 
-        let mut mask = Mask::new();
-        mask.reset(proposals.len() - base);
-        relevant_constraints[1..]
-            .iter()
-            .for_each(|(_, c)| c.confirm(variable, binding, &proposals[base..], &mut mask));
-        proposals.compact(&mask, base);
+        let mut region = proposals.region(base);
+        for (_, c) in relevant_constraints[1..].iter() {
+            c.confirm(variable, binding, &mut region);
+        }
         more
     }
 
     /// Confirms proposals through all children that constrain `variable`,
     /// in order of increasing estimate, all killing into the shared mask.
-    fn confirm(
-        &self,
-        variable: VariableId,
-        binding: &Binding,
-        proposals: &[RawInline],
-        mask: &mut Mask,
-    ) {
+    fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
         let mut relevant_constraints: SmallVec<[(usize, &C); 8]> = self
             .constraints
             .iter()
@@ -120,9 +112,9 @@ where
             .collect();
         relevant_constraints.sort_unstable_by_key(|(estimate, _)| *estimate);
 
-        relevant_constraints
-            .iter()
-            .for_each(|(_, c)| c.confirm(variable, binding, proposals, mask));
+        for (_, c) in relevant_constraints.iter() {
+            c.confirm(variable, binding, cands);
+        }
     }
 
     /// Returns `true` only when **every** child is satisfied.

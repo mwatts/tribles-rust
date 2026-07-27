@@ -78,37 +78,36 @@ where
     /// returns `false`) are skipped so their stale bindings cannot inject
     /// values that no live variant would produce.
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
+        let base = proposals.len();
         self.constraints
             .iter()
             .filter(|c| c.satisfied(binding))
             .for_each(|c| c.propose(variable, binding, proposals));
-        proposals.sort_unstable();
-        proposals.dedup();
+        // Freshness rule: a proposer may rewrite its own freshly-appended
+        // region before returning — indices freeze once the caller can see
+        // them. The union's set semantics need the sort-dedup.
+        let mut fresh: Vec<RawInline> = proposals[base..].to_vec();
+        fresh.sort_unstable();
+        fresh.dedup();
+        proposals.rewrite_region(base, fresh);
     }
 
     /// Confirms proposals against every *satisfied* variant independently
-    /// (each on a scratch copy of the incoming mask) and ors the per-variant
+    /// (each on a scratch copy of the region's liveness) and ors the per-variant
     /// survivors together. A value passes if *any* live variant confirms it.
-    fn confirm(
-        &self,
-        variable: VariableId,
-        binding: &Binding,
-        proposals: &[RawInline],
-        mask: &mut Mask,
-    ) {
-        let mut any = Mask::new();
-        any.reset(mask.len());
-        any.clear_all();
-        let mut scratch = Mask::new();
-        self.constraints
-            .iter()
-            .filter(|c| c.satisfied(binding))
-            .for_each(|c| {
-                scratch.copy_from(mask);
-                c.confirm(variable, binding, proposals, &mut scratch);
-                any.or_from(&scratch);
-            });
-        mask.and_from(&any);
+    fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
+        let mut any = vec![0u32; cands.len()];
+        let mut scratch;
+        for c in self.constraints.iter().filter(|c| c.satisfied(binding)) {
+            scratch = cands.live_words();
+            c.confirm(variable, binding, &mut cands.scratch(&mut scratch));
+            or_words(&mut any, &scratch);
+        }
+        for i in 0..cands.len() {
+            if any[i] == 0 {
+                cands.kill(i);
+            }
+        }
     }
 
     /// Returns `true` when **at least one** variant is satisfied.

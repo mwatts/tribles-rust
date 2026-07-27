@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use triblespace_core::id::rngid;
 use triblespace_core::prelude::*;
 use triblespace_core::query::{
-    Binding, Constraint, ContainsConstraint, Mask, ProposalBuffer, ProposeCursor, TriblePattern, Variable, VariableContext,
+    Binding, Candidates, Constraint, ContainsConstraint, ProposalBuffer, ProposeCursor, TriblePattern, Variable, VariableContext,
 };
 use triblespace_core::trible::{Fragment, Trible};
 use triblespace_core::inline::encodings::genid::GenId;
@@ -312,15 +312,12 @@ proptest! {
 
         let mut proposals = ProposalBuffer::new();
         proposals.push(candidate);
-        let mut mask = Mask::new();
-        mask.reset(proposals.len());
-        c.confirm(0, &binding, &proposals, &mut mask);
-        proposals.compact(&mask, 0);
+        c.confirm(0, &binding, &mut proposals.region(0));
 
         if constant == candidate {
-            prop_assert_eq!(proposals.len(), 1);
+            prop_assert_eq!(proposals.count_live(0), 1);
         } else {
-            prop_assert!(proposals.is_empty());
+            prop_assert_eq!(proposals.count_live(0), 0);
         }
     }
 
@@ -665,16 +662,13 @@ proptest! {
         let mut proposals = ProposalBuffer::new();
         proposals.push(peer_val);
         proposals.push(other_val);
-        let mut mask = Mask::new();
-        mask.reset(proposals.len());
-        eq.confirm(1, &binding, &proposals, &mut mask);
-        proposals.compact(&mask, 0);
+        eq.confirm(1, &binding, &mut proposals.region(0));
 
         if peer_val == other_val {
-            prop_assert_eq!(proposals.len(), 2); // both match
+            prop_assert_eq!(proposals.count_live(0), 2); // both match
         } else {
-            prop_assert_eq!(proposals.len(), 1);
-            prop_assert_eq!(proposals[0], peer_val);
+            prop_assert_eq!(proposals.count_live(0), 1);
+            prop_assert!(proposals.is_live(0));
         }
     }
 
@@ -875,15 +869,9 @@ impl<'a> Constraint<'a> for ChunkedValues {
         delivered < self.values.len()
     }
 
-    fn confirm(
-        &self,
-        variable: usize,
-        _binding: &Binding,
-        proposals: &[triblespace_core::inline::RawInline],
-        mask: &mut Mask,
-    ) {
+    fn confirm(&self, variable: usize, _binding: &Binding, cands: &mut Candidates<'_>) {
         if variable == self.variable {
-            mask.retain(proposals, |v| self.values.binary_search(v).is_ok());
+            cands.retain(|v| self.values.binary_search(v).is_ok());
         }
     }
 }

@@ -13,7 +13,7 @@ use super::ContainsConstraint;
 use super::Variable;
 use super::VariableId;
 use super::VariableSet;
-use crate::query::Mask;
+use crate::query::Candidates;
 use crate::query::ProposalBuffer;
 
 /// Constrains a variable to full-width values present in a [`PATCH`].
@@ -51,17 +51,12 @@ impl<'a, S: InlineEncoding> Constraint<'a> for PatchValueConstraint<'a, S> {
         }
     }
 
-    fn confirm(
-        &self,
-        variable: VariableId,
-        _binding: &Binding,
-        proposals: &[RawInline],
-        mask: &mut Mask,
-    ) {
+    fn confirm(&self, variable: VariableId, _binding: &Binding, cands: &mut Candidates<'_>) {
         if self.variable.index == variable {
-            for (i, v) in proposals.iter().enumerate() {
-                if mask.live(i) && !self.patch.has_prefix(v) {
-                    mask.kill(i);
+            for i in 0..cands.len() {
+                let v = &cands.values()[i];
+                if cands.is_live(i) && !self.patch.has_prefix(v) {
+                    cands.kill(i);
                 }
             }
         }
@@ -123,15 +118,10 @@ where
         }
     }
 
-    fn confirm(
-        &self,
-        _variable: VariableId,
-        _binding: &Binding,
-        proposals: &[RawInline],
-        mask: &mut Mask,
-    ) {
-        for (i, v) in proposals.iter().enumerate() {
-            if !mask.live(i) {
+    fn confirm(&self, _variable: VariableId, _binding: &Binding, cands: &mut Candidates<'_>) {
+        for i in 0..cands.len() {
+                let v = &cands.values()[i];
+            if !cands.is_live(i) {
                 continue;
             }
             let keep = if let Some(id) = id_from_value(v) {
@@ -140,7 +130,7 @@ where
                 false
             };
             if !keep {
-                mask.kill(i);
+                cands.kill(i);
             }
         }
     }

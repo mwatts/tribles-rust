@@ -5,7 +5,7 @@ use super::*;
 use crate::query::*;
 use crate::inline::encodings::genid::GenId;
 use jerky::bit_vector::Select;
-use crate::query::Mask;
+use crate::query::Candidates;
 use crate::query::ProposalBuffer;
 
 pub struct SuccinctArchiveConstraint<'a, U>
@@ -347,13 +347,7 @@ where
         }
     }
 
-    fn confirm(
-        &self,
-        variable: VariableId,
-        binding: &Binding,
-        proposals: &[RawInline],
-        mask: &mut Mask,
-    ) {
+    fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
         if self.variable_e != variable && self.variable_a != variable && self.variable_v != variable
         {
             return;
@@ -369,21 +363,21 @@ where
 
         match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
             (None, None, None, true, false, false) => {
-                mask.retain(proposals, |e| {
+                cands.retain(|e| {
                     base_range(&self.archive.domain, &self.archive.e_a, e)
                         .is_empty()
                         .not()
                 });
             }
             (None, None, None, false, true, false) => {
-                mask.retain(proposals, |a| {
+                cands.retain(|a| {
                     base_range(&self.archive.domain, &self.archive.a_a, a)
                         .is_empty()
                         .not()
                 });
             }
             (None, None, None, false, false, true) => {
-                mask.retain(proposals, |v| {
+                cands.retain(|v| {
                     base_range(&self.archive.domain, &self.archive.v_a, v)
                         .is_empty()
                         .not()
@@ -391,7 +385,7 @@ where
             }
             (Some(e), None, None, false, true, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                mask.retain(proposals, |a| {
+                cands.retain(|a| {
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.a_a,
@@ -405,7 +399,7 @@ where
             }
             (Some(e), None, None, false, false, true) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                mask.retain(proposals, |v| {
+                cands.retain(|v| {
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.v_a,
@@ -419,7 +413,7 @@ where
             }
             (None, Some(a), None, true, false, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.a_a, a);
-                mask.retain(proposals, |e| {
+                cands.retain(|e| {
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.e_a,
@@ -433,7 +427,7 @@ where
             }
             (None, Some(a), None, false, false, true) => {
                 let r = base_range(&self.archive.domain, &self.archive.a_a, a);
-                mask.retain(proposals, |v| {
+                cands.retain(|v| {
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.v_a,
@@ -447,7 +441,7 @@ where
             }
             (None, None, Some(v), true, false, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.v_a, v);
-                mask.retain(proposals, |e| {
+                cands.retain(|e| {
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.e_a,
@@ -461,7 +455,7 @@ where
             }
             (None, None, Some(v), false, true, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.v_a, v);
-                mask.retain(proposals, |a| {
+                cands.retain(|a| {
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.a_a,
@@ -482,7 +476,7 @@ where
                     v,
                     &r,
                 );
-                mask.retain(proposals, |e| {
+                cands.retain(|e| {
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.e_a,
@@ -503,7 +497,7 @@ where
                     v,
                     &r,
                 );
-                mask.retain(proposals, |a| {
+                cands.retain(|a| {
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.a_a,
@@ -524,7 +518,7 @@ where
                     a,
                     &r,
                 );
-                mask.retain(proposals, |v| {
+                cands.retain(|v| {
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.v_a,

@@ -1,7 +1,7 @@
 use super::*;
 use crate::query::Binding;
 use crate::query::Constraint;
-use crate::query::Mask;
+use crate::query::Candidates;
 use crate::query::ProposalBuffer;
 use crate::query::Variable;
 use crate::query::VariableId;
@@ -103,15 +103,9 @@ where
         );
     }
 
-    fn confirm(
-        &self,
-        variable: VariableId,
-        _binding: &Binding,
-        proposals: &[RawInline],
-        mask: &mut Mask,
-    ) {
+    fn confirm(&self, variable: VariableId, _binding: &Binding, cands: &mut Candidates<'_>) {
         if variable == self.variable_v {
-            mask.retain(proposals, |v| *v >= self.min && *v <= self.max);
+            cands.retain(|v| *v >= self.min && *v <= self.max);
         }
     }
 

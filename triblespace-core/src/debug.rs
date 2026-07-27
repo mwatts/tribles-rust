@@ -7,7 +7,7 @@ pub mod query {
     use crate::inline::RawInline;
     use std::cell::RefCell;
     use std::rc::Rc;
-    use crate::query::Mask;
+    use crate::query::Candidates;
 use crate::query::ProposalBuffer;
 
     /// Constraint wrapper that records which variables are proposed during query execution.
@@ -39,14 +39,8 @@ use crate::query::ProposalBuffer;
             self.constraint.propose(variable, binding, proposals);
         }
 
-        fn confirm(
-            &self,
-            variable: VariableId,
-            binding: &Binding,
-            proposals: &[RawInline],
-            mask: &mut Mask,
-        ) {
-            self.constraint.confirm(variable, binding, proposals, mask);
+        fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
+            self.constraint.confirm(variable, binding, cands);
         }
 
         fn influence(&self, variable: VariableId) -> VariableSet {
@@ -98,14 +92,8 @@ use crate::query::ProposalBuffer;
             self.constraint.propose(variable, binding, proposals);
         }
 
-        fn confirm(
-            &self,
-            variable: VariableId,
-            binding: &Binding,
-            proposals: &[RawInline],
-            mask: &mut Mask,
-        ) {
-            self.constraint.confirm(variable, binding, proposals, mask);
+        fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
+            self.constraint.confirm(variable, binding, cands);
         }
 
         fn influence(&self, variable: VariableId) -> VariableSet {

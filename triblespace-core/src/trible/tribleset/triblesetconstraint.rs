@@ -13,7 +13,7 @@ use crate::inline::encodings::genid::GenId;
 use crate::inline::RawInline;
 use crate::inline::InlineEncoding;
 use crate::inline::INLINE_LEN;
-use crate::query::Mask;
+use crate::query::Candidates;
 use crate::query::ProposalBuffer;
 
 /// A triple-pattern lookup against a [`TribleSet`].
@@ -394,20 +394,14 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
 
     /// Retains only proposals whose combined key (bound positions +
     /// proposed value) has a matching prefix in the appropriate index.
-    fn confirm(
-        &self,
-        variable: VariableId,
-        binding: &Binding,
-        proposals: &[RawInline],
-        mask: &mut Mask,
-    ) {
+    fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
         let e_var = self.variable_e == variable;
         let a_var = self.variable_a == variable;
         let v_var = self.variable_v == variable;
 
         let e_bound = if let Some(e) = binding.get(self.variable_e) {
             let Some(e) = id_from_value(e) else {
-                mask.clear_all();
+                cands.kill_all();
                 return;
             };
             Some(e)
@@ -416,7 +410,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         };
         let a_bound = if let Some(a) = binding.get(self.variable_a) {
             let Some(a) = id_from_value(a) else {
-                mask.clear_all();
+                cands.kill_all();
                 return;
             };
             Some(a)
@@ -426,22 +420,22 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         let v_bound = binding.get(self.variable_v);
 
         match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
-            (None, None, None, true, false, false) => mask.retain(proposals, |value| {
+            (None, None, None, true, false, false) => cands.retain(|value| {
                 let Some(id) = id_from_value(value) else {
                     return false;
                 };
                 self.set.eav.has_prefix(&id)
             }),
-            (None, None, None, false, true, false) => mask.retain(proposals, |value| {
+            (None, None, None, false, true, false) => cands.retain(|value| {
                 let Some(id) = id_from_value(value) else {
                     return false;
                 };
                 self.set.aev.has_prefix(&id)
             }),
             (None, None, None, false, false, true) => {
-                mask.retain(proposals, |value| self.set.vea.has_prefix(value))
+                cands.retain(|value| self.set.vea.has_prefix(value))
             }
-            (Some(e), None, None, false, true, false) => mask.retain(proposals, |value| {
+            (Some(e), None, None, false, true, false) => cands.retain(|value| {
                 let Some(id) = id_from_value(value) else {
                     return false;
                 };
@@ -450,13 +444,13 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&id);
                 self.set.eav.has_prefix(&prefix)
             }),
-            (Some(e), None, None, false, false, true) => mask.retain(proposals, |value| {
+            (Some(e), None, None, false, false, true) => cands.retain(|value| {
                 let mut prefix = [0u8; ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&e[..]);
                 prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(value);
                 self.set.eva.has_prefix(&prefix)
             }),
-            (None, Some(a), None, true, false, false) => mask.retain(proposals, |value| {
+            (None, Some(a), None, true, false, false) => cands.retain(|value| {
                 let Some(id) = id_from_value(value) else {
                     return false;
                 };
@@ -465,13 +459,13 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&id);
                 self.set.aev.has_prefix(&prefix)
             }),
-            (None, Some(a), None, false, false, true) => mask.retain(proposals, |value| {
+            (None, Some(a), None, false, false, true) => cands.retain(|value| {
                 let mut prefix = [0u8; ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&a[..]);
                 prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(value);
                 self.set.ave.has_prefix(&prefix)
             }),
-            (None, None, Some(v), true, false, false) => mask.retain(proposals, |value| {
+            (None, None, Some(v), true, false, false) => cands.retain(|value| {
                 let Some(id) = id_from_value(value) else {
                     return false;
                 };
@@ -480,7 +474,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 prefix[INLINE_LEN..INLINE_LEN + ID_LEN].copy_from_slice(&id);
                 self.set.vea.has_prefix(&prefix)
             }),
-            (None, None, Some(v), false, true, false) => mask.retain(proposals, |value| {
+            (None, None, Some(v), false, true, false) => cands.retain(|value| {
                 let Some(id) = id_from_value(value) else {
                     return false;
                 };
@@ -489,7 +483,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 prefix[INLINE_LEN..INLINE_LEN + ID_LEN].copy_from_slice(&id);
                 self.set.vae.has_prefix(&prefix)
             }),
-            (None, Some(a), Some(v), true, false, false) => mask.retain(proposals, |value: &[u8; 32]| {
+            (None, Some(a), Some(v), true, false, false) => cands.retain(|value: &[u8; 32]| {
                 let Some(id) = id_from_value(value) else {
                     return false;
                 };
@@ -499,7 +493,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 prefix[ID_LEN + INLINE_LEN..ID_LEN + INLINE_LEN + ID_LEN].copy_from_slice(&id);
                 self.set.ave.has_prefix(&prefix)
             }),
-            (Some(e), None, Some(v), false, true, false) => mask.retain(proposals, |value: &[u8; 32]| {
+            (Some(e), None, Some(v), false, true, false) => cands.retain(|value: &[u8; 32]| {
                 let Some(id) = id_from_value(value) else {
                     return false;
                 };
@@ -509,7 +503,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 prefix[ID_LEN + INLINE_LEN..ID_LEN + INLINE_LEN + ID_LEN].copy_from_slice(&id);
                 self.set.eva.has_prefix(&prefix)
             }),
-            (Some(e), Some(a), None, false, false, true) => mask.retain(proposals, |value: &[u8; 32]| {
+            (Some(e), Some(a), None, false, false, true) => cands.retain(|value: &[u8; 32]| {
                 let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&e);
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&a);
@@ -521,7 +515,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
             // (e and v, or e and a, or a and v); we build a full
             // 64-byte trible key from each proposal and check
             // `has_prefix` against the appropriate index.
-            (_, Some(a), _, true, false, true) => mask.retain(proposals, |value| {
+            (_, Some(a), _, true, false, true) => cands.retain(|value| {
                 // pattern(x, a, x): proposal is both entity and value.
                 let Some(id) = id_from_value(value) else { return false; };
                 let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
@@ -530,7 +524,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 prefix[ID_LEN + ID_LEN..].copy_from_slice(&id_into_value(&id));
                 self.set.eav.has_prefix(&prefix)
             }),
-            (_, None, _, true, false, true) => mask.retain(proposals, |value| {
+            (_, None, _, true, false, true) => cands.retain(|value| {
                 // pattern(x, ?, x): proposal is entity == value, any attr.
                 let Some(id) = id_from_value(value) else { return false; };
                 let mut prefix = [0u8; ID_LEN + INLINE_LEN];
@@ -538,7 +532,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 prefix[ID_LEN..].copy_from_slice(&id_into_value(&id));
                 self.set.eva.has_prefix(&prefix)
             }),
-            (_, _, Some(v), true, true, false) => mask.retain(proposals, |value| {
+            (_, _, Some(v), true, true, false) => cands.retain(|value| {
                 // pattern(x, x, v): proposal is entity == attribute.
                 let Some(id) = id_from_value(value) else { return false; };
                 let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
@@ -547,7 +541,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 prefix[ID_LEN + ID_LEN..].copy_from_slice(&v[..]);
                 self.set.eav.has_prefix(&prefix)
             }),
-            (_, _, None, true, true, false) => mask.retain(proposals, |value| {
+            (_, _, None, true, true, false) => cands.retain(|value| {
                 // pattern(x, x, ?): proposal is entity == attribute, any v.
                 let Some(id) = id_from_value(value) else { return false; };
                 let mut prefix = [0u8; ID_LEN + ID_LEN];
@@ -555,7 +549,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&id);
                 self.set.eav.has_prefix(&prefix)
             }),
-            (Some(e), _, _, false, true, true) => mask.retain(proposals, |value| {
+            (Some(e), _, _, false, true, true) => cands.retain(|value| {
                 // pattern(e, x, x): proposal is attribute == value.
                 let Some(id) = id_from_value(value) else { return false; };
                 let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
@@ -564,7 +558,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 prefix[ID_LEN + ID_LEN..].copy_from_slice(&id_into_value(&id));
                 self.set.eav.has_prefix(&prefix)
             }),
-            (None, _, _, false, true, true) => mask.retain(proposals, |value| {
+            (None, _, _, false, true, true) => cands.retain(|value| {
                 // pattern(?, x, x): proposal is attribute == value, any e.
                 let Some(id) = id_from_value(value) else { return false; };
                 let mut prefix = [0u8; ID_LEN + INLINE_LEN];
@@ -572,7 +566,7 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
                 prefix[ID_LEN..].copy_from_slice(&id_into_value(&id));
                 self.set.ave.has_prefix(&prefix)
             }),
-            (_, _, _, true, true, true) => mask.retain(proposals, |value| {
+            (_, _, _, true, true, true) => cands.retain(|value| {
                 // pattern(x, x, x): proposal plays all three roles.
                 let Some(id) = id_from_value(value) else { return false; };
                 let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];

@@ -1,0 +1,30 @@
+engine   : current (query)
+config   : rung=1000000 iters=12 warmup=3 build_iters=8 build_warmup=2 max_ram=20000000 range_min=2
+fixtures : chain=20000 ring=5000 oasis_k=4000 fan=32 khop=256 diamond=256
+rung     : target 1000000 -> k=1/137 commits (~4064802 cumulative tribles, carving a 1000000-trible sorted prefix) on branch "dblp-2026-06-01"
+dataset  : pile checkout, 1000000 tribles
+  q2_set         SKIP (no path!/RegularPathConstraint on the June-protocol engine)
+  F1-ttfr        SKIP (no path!/RegularPathConstraint on the June-protocol engine)
+  F1-total       SKIP (no path!/RegularPathConstraint on the June-protocol engine)
+  F2-ttfr        SKIP (no path!/RegularPathConstraint on the June-protocol engine)
+  F2-total       SKIP (no path!/RegularPathConstraint on the June-protocol engine)
+  F4-ttfr        SKIP (no path!/RegularPathConstraint on the June-protocol engine)
+  F4-total       SKIP (no path!/RegularPathConstraint on the June-protocol engine)
+identity : tribles=1000000 q[1,3,4,5]=[0, 18446744073709551615, 10474, 31518] q2=18446744073709551615 arch=ok F=[18446744073709551615, 18446744073709551615, 1, 18446744073709551615, 1536]  (runs comparable ONLY if ALL match; 18446744073709551615 = PANIC sentinel)
+  checkout       min  2722.391  p50  2761.264  p95  2881.257  max  2881.257  n=8     floor-drift   0.4%
+  build_ram      min  1491.868  p50  1494.064  p95  1508.175  max  1508.175  n=8     floor-drift   0.1%
+  q1_set         min     0.220  p50     0.226  p95     0.235  max     0.250  n=12    floor-drift   0.1%
+  q3_set         PANIC (all union (or!) arms must mention the same query variables; note that pattern! literals allocate hidden pinned variables in this engine build, so arms with different literals differ)
+  q4_set         min     0.285  p50     0.297  p95     0.318  max     0.324  n=12    floor-drift   2.9%
+  q5_set         min    22.265  p50    22.830  p95    23.099  max    23.998  n=12    floor-drift   1.0%
+  q1_arch        min     2.244  p50     2.397  p95     2.450  max     2.464  n=12    floor-drift   2.2%
+  q3_arch        PANIC (all union (or!) arms must mention the same query variables; note that pattern! literals allocate hidden pinned variables in this engine build, so arms with different literals differ)
+  q4_arch        min     2.230  p50     2.276  p95     2.293  max     2.326  n=12    floor-drift   0.5%
+  q5_arch        min    81.251  p50    81.726  p95    82.591  max    87.335  n=12    floor-drift   0.1%
+  F3-ttfr        min     0.004  p50     0.004  p95     0.004  max     0.004  n=12    floor-drift   1.1%
+  F3-total       min     0.004  p50     0.004  p95     0.004  max     0.004  n=12    floor-drift   2.4%
+  F5-ttfr        min     0.032  p50     0.032  p95     0.032  max     0.032  n=12    floor-drift   0.4%
+  F5-total       min     0.292  p50     0.295  p95     0.297  max     0.299  n=12    floor-drift   1.1%
+SIGNAL   : checkout build_ram q1_set q4_set q5_set q1_arch q4_arch q5_arch F3-ttfr F3-total F5-ttfr F5-total
+PANIC    : q3_set q3_arch
+VERDICT  : usable (12/12 measures with signal, 2 panicked)
