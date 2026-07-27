@@ -13,6 +13,19 @@
 //!   commits of the `--data` pile's branch at the `--rung` target.
 //! - `arch/build_ram/total` — `SuccinctArchive<OrderedUniverse>` build
 //!   over the checked-out set.
+//! - `arch_regions/<query>/{confirms,max,p95,median,ge_threshold,
+//!   live_total}` — the confirm-region census (see [`archq`]): the
+//!   distribution of LIVE candidate counts real queries hand the
+//!   archive's `confirm`, which is the quantity `triblespace-gpu`
+//!   routes on. Counting, never timing, so it reads the same on a
+//!   loaded machine as on a quiet one. `protocol-v2`-gated.
+//! - `arch/<query>/total` — the same queries timed against the CPU
+//!   archive; `arch_gpu/<query>/total` beside it against a
+//!   `WgpuSuccinctArchive` (gpu-gated), with
+//!   `arch_gpu/<query>/routing/*` recording how many confirms actually
+//!   reached the device. The two arms must return identical row
+//!   counts: a mismatch records `gate_fail:cross-arm …` AND exits
+//!   non-zero.
 //! - `harkonnen/F{1..5}/{ttfr,total}` — the R1 adversarial fixtures; F3
 //!   (oasis) and F5 (diamond) run everywhere, F1/F2/F4 are rpq-gated.
 //! - `harkonnen/F{6..15}/…` — the R2 white-box fixtures, one engine
@@ -28,6 +41,11 @@
 //! !!! Always point `--data` at a clonefile copy (`cp -c`) of a
 //! dataset pile — the checkout phase's `Repository::new` appends a
 //! commit-metadata record to the pile file on open.
+//!
+//! A run is reproducible from its own results: the session records
+//! the subject rev, the full argv, and the machine's load at start,
+//! so `--verify` shows what was measured and under how much
+//! contention. Re-running is the same argv against the same rev.
 
 use std::time::Instant;
 
@@ -162,6 +180,48 @@ fn subject_commit() -> String {
             "unknown".to_owned()
         }
     }
+}
+
+/// The machine's load at the start of the run — the 1/5/15-minute
+/// averages and the parallelism they are relative to.
+///
+/// Recorded in the session config because a benchmark's timings are
+/// only readable against the contention they were taken under, and
+/// "the machine was busy" belongs in the ledger as a fact about the
+/// run, not in whatever prose later quotes the numbers. Read from
+/// `/proc/loadavg` (Linux) or `sysctl -n vm.loadavg` (macOS/BSD);
+/// unavailable is recorded as unknown rather than guessed.
+fn load_average() -> String {
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get().to_string())
+        .unwrap_or_else(|_| "?".to_owned());
+    let averages = std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|text| {
+            let fields: Vec<String> = text
+                .split_whitespace()
+                .take(3)
+                .map(str::to_owned)
+                .collect();
+            (fields.len() == 3).then(|| fields.join(" "))
+        })
+        .or_else(|| {
+            let out = std::process::Command::new("sysctl")
+                .args(["-n", "vm.loadavg"])
+                .output()
+                .ok()?;
+            out.status.success().then_some(())?;
+            // macOS prints `{ 11.98 12.12 10.08 }`.
+            let text = String::from_utf8_lossy(&out.stdout);
+            let fields: Vec<&str> = text
+                .trim()
+                .trim_matches(|c| c == '{' || c == '}')
+                .split_whitespace()
+                .collect();
+            (fields.len() >= 3).then(|| fields[..3].join(" "))
+        })
+        .unwrap_or_else(|| "unknown".to_owned());
+    format!("{averages} over {cpus} cpus")
 }
 
 /// One measure being sampled across iterations: raw spans plus the
@@ -624,7 +684,7 @@ fn main() {
 
     let commit = subject_commit();
     let config = format!(
-        "argv: {} | data: {} branch: {} rung: {} | iters: {} warmup: {} build_iters: {} build_warmup: {} arch_iters: {} arch_warmup: {} | suite: tribleset-bench {}",
+        "argv: {} | data: {} branch: {} rung: {} | iters: {} warmup: {} build_iters: {} build_warmup: {} arch_iters: {} arch_warmup: {} | load: {} | suite: tribleset-bench {}",
         std::env::args().skip(1).collect::<Vec<_>>().join(" "),
         cfg.data
             .as_ref()
@@ -638,6 +698,7 @@ fn main() {
         cfg.build_warmup,
         cfg.arch_iters,
         cfg.arch_warmup,
+        load_average(),
         env!("CARGO_PKG_VERSION"),
     );
 
