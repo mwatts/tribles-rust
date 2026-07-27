@@ -1489,3 +1489,69 @@ pub fn f14_total(set: &TribleSet) -> usize {
     )
     .count()
 }
+
+// ---------------------------------------------------------------------------
+// F15 — union dedup pressure.
+//
+// INTERROGATES: the cost of `UnionConstraint`'s sort-dedup under heavy
+// arm overlap.
+//
+// `UnionConstraint::propose` collects every satisfied variant's
+// proposals into one region, then sorts, dedups and calls
+// `ProposalBuffer::rewrite_region` — legal only because a proposer may
+// still rewrite the region it just appended, before indices freeze. The
+// pathological input is arms that agree: the sort sees the full
+// concatenation and the dedup throws most of it away. Here the arms
+// overlap by exactly `F15_BOTH / (F15_BOTH + F15_ONLY)` = 90%.
+// ---------------------------------------------------------------------------
+
+/// F15: entities carrying BOTH arm attributes.
+pub const F15_BOTH: usize = 18_000;
+/// F15: entities carrying only one arm attribute (per arm).
+pub const F15_ONLY: usize = 2_000;
+
+/// F15 expected rows: `?e` is the only variable, so the row count is
+/// `|A u B|` = `(F15_BOTH + F15_ONLY) + (F15_BOTH + F15_ONLY) -
+/// F15_BOTH` = `F15_BOTH + 2 * F15_ONLY`. Each arm proposes 20 000
+/// entities and 18 000 of those (90%) are proposed twice.
+/// 18 000 + 4 000 = 22 000.
+pub const F15_EXPECTED_ROWS: usize = F15_BOTH + 2 * F15_ONLY;
+
+/// F15 shared hub value both arms match against.
+fn f15_hub() -> ExclusiveId {
+    anchor(26)
+}
+
+/// F15 builder: `F15_BOTH` entities on both arms plus `F15_ONLY` on each
+/// arm alone.
+pub fn build_union_dedup() -> TribleSet {
+    let mut ids = Ids::new();
+    let mut set = TribleSet::new();
+    let hub = f15_hub();
+    for _ in 0..F15_BOTH {
+        let e = ids.mint();
+        set += entity! { &e @ r2_schema::ua: &hub };
+        set += entity! { &e @ r2_schema::ub: &hub };
+    }
+    for _ in 0..F15_ONLY {
+        let e = ids.mint();
+        set += entity! { &e @ r2_schema::ua: &hub };
+    }
+    for _ in 0..F15_ONLY {
+        let e = ids.mint();
+        set += entity! { &e @ r2_schema::ub: &hub };
+    }
+    set
+}
+
+/// F15 full drain: total row count (expected [`F15_EXPECTED_ROWS`]).
+pub fn f15_total(set: &TribleSet) -> usize {
+    find!(
+        (e: Inline<GenId>),
+        or!(
+            pattern!(set, [{ ?e @ r2_schema::ua: &f15_hub() }]),
+            pattern!(set, [{ ?e @ r2_schema::ub: &f15_hub() }]),
+        )
+    )
+    .count()
+}
