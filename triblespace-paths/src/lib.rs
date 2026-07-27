@@ -3,8 +3,9 @@
 //! A [`PathSummary`] is the unionable, constructional form: a canonical fixed
 //! automaton, its complete graph-term universe, and the direct arcs of their
 //! product. A [`PathIndex`] materializes one snapshot with a single algorithm:
-//! SCC condensation followed by reverse-topological bitset propagation. Only
-//! the accepted endpoint relation survives materialization.
+//! SCC condensation followed by reverse-topological bitset propagation. No
+//! product transitive closure survives materialization: the index retains the
+//! constructional summary and the accepted endpoint relation.
 
 mod automaton;
 mod constraint;

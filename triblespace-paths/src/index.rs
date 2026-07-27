@@ -17,12 +17,12 @@ impl Csr {
         &self.values[self.offsets[ordinal]..self.offsets[ordinal + 1]]
     }
 
-    fn transpose(&self, rows: usize) -> Self {
+    fn transpose(&self, rows: usize, offset_count: usize) -> Self {
         let mut counts = vec![0usize; rows];
         for &target in &self.values {
             counts[target as usize] += 1;
         }
-        let mut offsets = Vec::with_capacity(rows + 1);
+        let mut offsets = Vec::with_capacity(offset_count);
         offsets.push(0);
         for count in counts {
             offsets.push(offsets.last().copied().unwrap() + count);
@@ -80,6 +80,9 @@ impl PathIndex {
                 count: vertex_count,
             });
         }
+        let offset_count = vertex_count
+            .checked_add(1)
+            .ok_or(PathError::CapacityOverflow)?;
         let state_count = summary.automaton.state_count() as usize;
         let product_count = vertex_count
             .checked_mul(state_count)
@@ -130,7 +133,7 @@ impl PathIndex {
             }
         }
 
-        let mut offsets = Vec::with_capacity(vertex_count + 1);
+        let mut offsets = Vec::with_capacity(offset_count);
         let mut values = Vec::new();
         let mut starts = Vec::new();
         let mut diagonal = Vec::new();
@@ -164,7 +167,7 @@ impl PathIndex {
             offsets.push(values.len());
         }
         let forward = Csr { offsets, values };
-        let reverse = forward.transpose(vertex_count);
+        let reverse = forward.transpose(vertex_count, offset_count);
         let ends = (0..vertex_count)
             .filter(|&target| !reverse.row(target).is_empty())
             .map(|target| target as u32)
