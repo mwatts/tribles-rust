@@ -171,6 +171,12 @@ universe includes both endpoints of every supplied trible, even when that
 trible's attribute matches no automaton transition. Without those unmatched
 terms, a nullable index would incorrectly lose valid zero-hop answers.
 
+Non-nullable summaries omit those unmatched endpoints entirely. Nullable
+summaries retain them as the identity universe, but the SCC and bitset closure
+still runs only over endpoints incident to matching product arcs; the index
+then maps that relation back into the full universe and adds the diagonal.
+Unrelated attributes therefore do not widen the quadratic closure workspace.
+
 An entirely empty source has no graph terms and therefore no identity pairs. Its
 range still exists as a certified contentless record, but it has no
 `PathSummaryBlob` handle. “Covered and empty” is distinct from “not indexed.”
@@ -200,6 +206,12 @@ reverse and domain views. Some regular paths accept every pair of vertices,
 making that relation Θ(|V|²). No exact materialized representation can avoid
 paying for that output, and the closure construction also uses bitset scratch
 space.
+
+The current canonical blob stores product endpoints as full-domain `u32`
+ordinals. Persisted nullable summaries consequently require
+`|universe| × |automaton states| <= u32::MAX`, even though attachment closes
+only the smaller matched support. Crossing that format ceiling is an explicit
+error rather than ordinal truncation.
 
 Use a `PathRollup` when the automaton is stable and many queries will amortize
 attachment, or when fast membership and joins matter. For a
