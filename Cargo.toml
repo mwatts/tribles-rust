@@ -125,3 +125,11 @@ cubecl-wgpu = { git = "https://github.com/erlkonig-ai/cubecl.git", rev = "f299ae
 
 [package.metadata.kani.flags]
 default-unwind = "1"
+
+[[bench]]
+name = "portable_bench"
+harness = false
+
+[[bench]]
+name = "portable_bench_lsm"
+harness = false

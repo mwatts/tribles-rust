@@ -1,0 +1,156 @@
+warning: patch `cubecl-runtime v0.10.0 (https://github.com/erlkonig-ai/cubecl.git?rev=f299aed551ec97bf28b779bfed6e88a484a167e4#f299aed5)` was not used in the crate graph
+warning: patch `cubecl-wgpu v0.10.0 (https://github.com/erlkonig-ai/cubecl.git?rev=f299aed551ec97bf28b779bfed6e88a484a167e4#f299aed5)` was not used in the crate graph
+help: Check that the patched package version and available features are compatible
+      with the dependency requirements. If the patch has a different version from
+      what is locked in the Cargo.lock file, run `cargo update` to use the new
+      version. This may also occur with an optional dependency that is not enabled.
+warning: unused import: `proc_macro2::Delimiter`
+ --> triblespace-macros-common/src/lib.rs:1:5
+  |
+1 | use proc_macro2::Delimiter;
+  |     ^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `proc_macro2::TokenTree`
+ --> triblespace-macros-common/src/lib.rs:4:5
+  |
+4 | use proc_macro2::TokenTree;
+  |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `syn::Path`
+  --> triblespace-macros-common/src/lib.rs:15:5
+   |
+15 | use syn::Path;
+   |     ^^^^^^^^^
+
+warning: `triblespace-macros-common` (lib) generated 3 warnings (run `cargo fix --lib -p triblespace-macros-common` to apply 3 suggestions)
+warning: unused import: `std::mem`
+ --> triblespace-core/src/query/unionconstraint.rs:1:5
+  |
+1 | use std::mem;
+  |     ^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `std::sync::Arc`
+  --> triblespace-core/src/query.rs:45:5
+   |
+45 | use std::sync::Arc;
+   |     ^^^^^^^^^^^^^^
+
+warning: method `raw_terms` is never used
+  --> triblespace-core/src/blob/encodings/succinctarchive/succinctarchiveconstraint.rs:42:19
+   |
+35 | / impl<'a, U> SuccinctArchiveConstraint<'a, U>
+36 | | where
+37 | |     U: Universe,
+   | |________________- method in this implementation
+...
+42 |       pub(crate) fn raw_terms(&self) -> [crate::query::RawTerm; 3] {
+   |                     ^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: type alias `ProjectionKey` is never used
+   --> triblespace-core/src/query.rs:338:6
+    |
+338 | type ProjectionKey = Box<[RawInline]>;
+    |      ^^^^^^^^^^^^^
+
+warning: fields `shards` and `terms` are never read
+    --> triblespace-core/src/repo/index_home.rs:1378:5
+     |
+1373 | pub struct UnionArchiveConstraint<'a, U>
+     |            ---------------------- fields in this struct
+...
+1378 |     shards: Vec<SuccinctArchiveConstraint<'a, U>>,
+     |     ^^^^^^
+1379 |     terms: [RawTerm; 3],
+     |     ^^^^^
+
+warning: `triblespace-core` (lib) generated 5 warnings (run `cargo fix --lib -p triblespace-core` to apply 2 suggestions)
+warning: unused import: `std::sync::Mutex`
+  --> triblespace-core/src/query.rs:48:5
+   |
+48 | use std::sync::Mutex;
+   |     ^^^^^^^^^^^^^^^^
+
+warning: `triblespace-core` (lib) generated 6 warnings (5 duplicates) (run `cargo fix --lib -p triblespace-core` to apply 1 suggestion)
+warning: unexpected `cfg` condition value: `search`
+  --> src/lib.rs:16:7
+   |
+16 | #[cfg(feature = "search")]
+   |       ^^^^^^^^^^^^^^^^^^
+   |
+   = note: expected values for `feature` are: `default`, `kani`, `net`, `object-store`, `parallel`, `proptest`, `telemetry`, and `wasm`
+   = help: consider adding `search` as a feature in `Cargo.toml`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+   = note: requested on the command line with `-W unexpected-cfgs`
+
+warning: unexpected `cfg` condition value: `gpu`
+  --> src/lib.rs:22:7
+   |
+22 | #[cfg(feature = "gpu")]
+   |       ^^^^^^^^^^^^^^^
+   |
+   = note: expected values for `feature` are: `default`, `kani`, `net`, `object-store`, `parallel`, `proptest`, `telemetry`, and `wasm`
+   = help: consider adding `gpu` as a feature in `Cargo.toml`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: `triblespace` (lib) generated 2 warnings
+warning: unexpected `cfg` condition value: `gpu`
+   --> benches/portable_bench.rs:115:7
+    |
+115 | #[cfg(feature = "gpu")]
+    |       ^^^^^^^^^^^^^^^
+    |
+    = note: expected values for `feature` are: `default`, `kani`, `net`, `object-store`, `parallel`, `proptest`, `telemetry`, and `wasm`
+    = help: consider adding `gpu` as a feature in `Cargo.toml`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+    = note: requested on the command line with `-W unexpected-cfgs`
+
+warning: unexpected `cfg` condition value: `gpu`
+    --> benches/portable_bench.rs:1221:15
+     |
+1221 |         #[cfg(feature = "gpu")]
+     |               ^^^^^^^^^^^^^^^
+     |
+     = note: expected values for `feature` are: `default`, `kani`, `net`, `object-store`, `parallel`, `proptest`, `telemetry`, and `wasm`
+     = help: consider adding `gpu` as a feature in `Cargo.toml`
+     = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: `triblespace` (bench "portable_bench") generated 2 warnings
+    Finished `bench` profile [optimized + debuginfo] target(s) in 0.30s
+     Running benches/portable_bench.rs (target/release/deps/portable_bench-d57cf8c2508739b0)
+note     : skipping unrecognized arg "--bench"
+engine   : current (query)
+config   : rung=1000000 iters=12 warmup=3 build_iters=8 build_warmup=2 max_ram=20000000 range_min=2
+fixtures : chain=20000 ring=5000 oasis_k=4000 fan=32 khop=256 diamond=256
+rung     : target 1000000 -> k=1/137 commits (~4064802 cumulative tribles, carving a 1000000-trible sorted prefix) on branch "dblp-2026-06-01"
+dataset  : pile checkout, 1000000 tribles
+  q2_set         SKIP (no path!/RegularPathConstraint on the June-protocol engine)
+  F1-ttfr        SKIP (no path!/RegularPathConstraint on the June-protocol engine)
+  F1-total       SKIP (no path!/RegularPathConstraint on the June-protocol engine)
+  F2-ttfr        SKIP (no path!/RegularPathConstraint on the June-protocol engine)
+  F2-total       SKIP (no path!/RegularPathConstraint on the June-protocol engine)
+  F4-ttfr        SKIP (no path!/RegularPathConstraint on the June-protocol engine)
+  F4-total       SKIP (no path!/RegularPathConstraint on the June-protocol engine)
+identity : tribles=1000000 q[1,3,4,5]=[0, 18446744073709551615, 10474, 31518] q2=18446744073709551615 arch=ok F=[18446744073709551615, 18446744073709551615, 1, 18446744073709551615, 1536]  (runs comparable ONLY if ALL match; 18446744073709551615 = PANIC sentinel)
+  checkout       min  2745.106  p50  2800.660  p95  2901.654  max  2901.654  n=8     floor-drift   2.0%
+  build_ram      min  1476.549  p50  1488.194  p95  1513.883  max  1513.883  n=8     floor-drift   0.6%
+  q1_set         min     0.208  p50     0.212  p95     0.218  max     0.224  n=12    floor-drift   0.7%
+  q3_set         PANIC (all union (or!) arms must mention the same query variables; note that pattern! literals allocate hidden pinned variables in this engine build, so arms with different literals differ)
+  q4_set         min     0.283  p50     0.288  p95     0.297  max     0.303  n=12    floor-drift   0.0%
+  q5_set         min    21.254  p50    21.601  p95    22.233  max    22.263  n=12    floor-drift   1.1%
+  q1_arch        min     2.278  p50     2.387  p95     2.452  max     2.454  n=12    floor-drift   2.7%
+  q3_arch        PANIC (all union (or!) arms must mention the same query variables; note that pattern! literals allocate hidden pinned variables in this engine build, so arms with different literals differ)
+  q4_arch        min     2.167  p50     2.201  p95     2.214  max     2.224  n=12    floor-drift   0.7%
+  q5_arch        min    81.483  p50    82.098  p95    83.088  max    84.655  n=12    floor-drift   0.2%
+  F3-ttfr        min     0.004  p50     0.004  p95     0.004  max     0.004  n=12    floor-drift   1.2%
+  F3-total       min     0.004  p50     0.004  p95     0.004  max     0.004  n=12    floor-drift   3.6%
+  F5-ttfr        min     0.032  p50     0.032  p95     0.033  max     0.033  n=12    floor-drift   0.5%
+  F5-total       min     0.350  p50     0.353  p95     0.357  max     0.361  n=12    floor-drift   0.5%
+SIGNAL   : checkout build_ram q1_set q4_set q5_set q1_arch q4_arch q5_arch F3-ttfr F3-total F5-ttfr F5-total
+PANIC    : q3_set q3_arch
+VERDICT  : usable (12/12 measures with signal, 2 panicked)
