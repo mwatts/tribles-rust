@@ -46,6 +46,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `FrontierStats` reports how often that fragmented. Bag semantics and
   worst-case optimality are unchanged; the cost is frontier memory,
   `O(width × variables × depth)`.
+- **The frontier width is a ceiling reached by a ramp, not a flat first
+  batch.** A level's first chunk is `INITIAL_FRONTIER_WIDTH` = 1 binding and
+  grows by `FRONTIER_RAMP` = 2 up to the query's width, so a query the caller
+  stops after one row — `exists!`, `.next()`, `.take(n)` — does exactly the
+  work the pre-batching engine did instead of materialising a 16384-wide root
+  frontier it will throw away. A full drain still reaches the ceiling after
+  `log2(width)` chunks, which costs a logarithmic number of extra propose
+  calls and no extra per-candidate work. This is the same insight as the
+  `INITIAL_CHUNK`/`WIDEN_FACTOR` pair removed with the widening path, and as
+  the residual engine's rule that search width grows geometrically after
+  negative work — recovered at the frontier, which is the layer that can
+  actually carry it, rather than at per-parent chunking, which could not.
+- **A 1:1 descent reuses the parent frontier's matrices instead of copying
+  them.** When a level's draw yields exactly one surviving child per parent
+  row, in order, over the whole frontier, with nothing left pending, no row
+  was gained, lost or reordered — so the child block *is* the parent block
+  with one more slot written, and the child estimate rows are bit-identical
+  to the parent's. Both matrices are handed down rather than rebuilt. The
+  engine's standing invariants are what license it: confirmers may only kill
+  candidates and never revive them, and buffers are write-once, so the newly
+  bound variable's slot was previously unwritten. Ownership needs no separate
+  flag — the matrices already sit behind `Arc`, so `Arc::get_mut` succeeds
+  exactly when no rayon split holds the other half and the copying path runs
+  when it does not. `FrontierStats::inplace_descents`/`copied_descents`
+  report the split. This is what a chain-shaped query (fan-out 1 at every
+  level, where batching can never pay because there are no sibling parents)
+  stops being charged for.
 - **Breaking: `propose_chunk`, `ProposeCursor` and the widening path are
   removed.** No leaf source ever overrode them, they addressed a
   time-to-first-result problem that pure conjunctive queries do not have

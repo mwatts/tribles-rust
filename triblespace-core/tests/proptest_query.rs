@@ -921,7 +921,10 @@ proptest! {
         // whole point: with a frontier of one, every deeper propose sees a
         // single parent binding.
         prop_assert!(narrow_widths.lock().unwrap().iter().all(|&w| w == 1));
-        if values.len() > 1 {
+        // Two candidates is not enough to see the ramp leave 1: the level
+        // hands down chunks of 1 then 2, and the second chunk holds only
+        // the one candidate that is left.
+        if values.len() > 2 {
             prop_assert!(wide_widths.lock().unwrap().iter().any(|&w| w > 1));
         }
     }
@@ -930,8 +933,9 @@ proptest! {
 #[test]
 fn deep_levels_see_a_wide_frontier() {
     // Two levels of 40 values each: at width 1 the inner level is proposed
-    // over one binding 40 times; batched, it is proposed over all 40 at
-    // once.
+    // over one binding 40 times; batched, the root level ramps its chunks
+    // 1, 2, 4, 8, 16 up toward the ceiling, so the inner level is proposed
+    // over an ever-wider batch until the root's 40 candidates run out.
     let values: Vec<[u8; 32]> = (0..40u32)
         .map(|i| {
             let mut v = [0u8; 32];
@@ -945,7 +949,62 @@ fn deep_levels_see_a_wide_frontier() {
     assert_eq!(rows.len(), 40 * 40);
 
     let widths = widths.lock().unwrap();
-    assert_eq!(widths.as_slice(), &[1, 40], "root then one 40-wide expansion");
+    assert_eq!(
+        widths.as_slice(),
+        &[1, 1, 2, 4, 8, 16, 9],
+        "root, then the ramp: 1, 2, 4, 8, 16, and the 9 candidates left over"
+    );
+    // The ramp is a schedule, not a cap — every root candidate is still
+    // expanded exactly once.
+    assert_eq!(widths[1..].iter().sum::<usize>(), 40);
+}
+
+#[test]
+fn the_ramp_keeps_a_short_circuiting_query_narrow() {
+    // A wide root feeding a second level. Taking ONE row must not
+    // materialise a full-width frontier first: with the ramp, the root's
+    // first chunk is a single binding, exactly what the pre-batching
+    // engine descended through.
+    let values: Vec<[u8; 32]> = (0..512u32)
+        .map(|i| {
+            let mut v = [0u8; 32];
+            v[28..32].copy_from_slice(&i.to_be_bytes());
+            v
+        })
+        .collect();
+
+    let widths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let outer = WidthObserver {
+        variable: 0,
+        values: values.clone(),
+        widths: std::sync::Arc::clone(&widths),
+    };
+    let inner = WidthObserver {
+        variable: 1,
+        values: values.clone(),
+        widths: std::sync::Arc::clone(&widths),
+    };
+    let mut query = triblespace_core::query::Query::new(
+        triblespace_core::query::intersectionconstraint::IntersectionConstraint::new(vec![
+            Box::new(outer) as Box<dyn Constraint + Send + Sync>,
+            Box::new(inner),
+        ]),
+        |binding: &Binding| Some((*binding.get(0)?, *binding.get(1)?)),
+    );
+    let stats = query.stats();
+    assert!(query.next().is_some());
+
+    // Root expansion (one row) plus the depth-1 expansion of the root's
+    // first chunk — which the ramp holds to a single row.
+    assert_eq!(
+        widths.lock().unwrap().as_slice(),
+        &[1, 1],
+        "a first-row-only query must not propose over a wide batch"
+    );
+    assert_eq!(stats.rows(), 2, "two expansions of one row each");
+    // Both levels proposed their 512 candidates once. A flat-width engine
+    // would have expanded the root's whole chunk and proposed 512 x 512.
+    assert_eq!(stats.proposals(), 2 * 512);
 }
 
 #[test]
@@ -980,12 +1039,174 @@ fn frontier_stats_report_an_unfragmented_batch() {
     let rows: Vec<_> = query.collect();
 
     assert_eq!(rows.len(), 64);
-    // Root expansion (1 row) plus one 8-row expansion; both agreed on the
-    // variable to bind, so the batch never fragmented.
-    assert_eq!(stats.expansions(), 2);
+    // Root expansion (1 row), then the root's 8 candidates handed down in
+    // ramped chunks of 1, 2, 4, 1 — four more expansions. Every row is
+    // still expanded exactly once; the ramp only changes how many batches
+    // that takes.
+    assert_eq!(stats.expansions(), 5);
     assert_eq!(stats.rows(), 1 + 8);
-    assert_eq!(stats.variable_groups(), 2);
+    // Every expansion agreed on the variable to bind, so no batch ever
+    // fragmented.
+    assert_eq!(stats.variable_groups(), 5);
     assert_eq!(stats.mean_variable_groups(), 1.0);
+}
+
+/// A chain link: `variable` is proposed as the single successor of the
+/// value bound to `variable - 1` (or the one seed value at the root).
+struct Chain {
+    variable: usize,
+    /// Successor of value `i` is value `i + 1`; the chain is `len` long.
+    len: u32,
+}
+
+impl Chain {
+    fn node(i: u32) -> [u8; 32] {
+        let mut v = [0u8; 32];
+        v[28..32].copy_from_slice(&i.to_be_bytes());
+        v
+    }
+
+    /// The one value this link proposes under `binding`, if any.
+    fn successor(&self, binding: &Binding) -> Option<[u8; 32]> {
+        if self.variable == 0 {
+            return Some(Self::node(0));
+        }
+        let previous = u32::from_be_bytes(binding.get(self.variable - 1)?[28..32].try_into().ok()?);
+        (previous + 1 < self.len).then(|| Self::node(previous + 1))
+    }
+}
+
+impl<'a> Constraint<'a> for Chain {
+    fn variables(&self) -> triblespace_core::query::VariableSet {
+        let mut set = triblespace_core::query::VariableSet::new_empty();
+        set.set(self.variable);
+        set
+    }
+
+    /// One successor once the predecessor is bound, and expensive before —
+    /// which is what walks the engine down the chain in link order.
+    fn estimate(&self, variable: usize, binding: &Binding) -> Option<usize> {
+        if variable != self.variable {
+            return None;
+        }
+        if self.variable == 0 {
+            return Some(1);
+        }
+        Some(if binding.get(self.variable - 1).is_some() {
+            1
+        } else {
+            1 << 20
+        })
+    }
+
+    /// Binding the predecessor is what moves this link's estimate, and the
+    /// engine only refreshes what `influence` names.
+    fn influence(&self, variable: usize) -> triblespace_core::query::VariableSet {
+        let mut set = triblespace_core::query::VariableSet::new_empty();
+        if self.variable > 0 && variable + 1 == self.variable {
+            set.set(self.variable);
+        }
+        set
+    }
+
+    fn propose(
+        &self,
+        variable: usize,
+        frontier: &triblespace_core::query::Frontier<'_>,
+        proposals: &mut ProposalBuffer,
+    ) {
+        if variable != self.variable {
+            return;
+        }
+        for row in 0..frontier.len() {
+            proposals.open(row as u32);
+            if let Some(value) = self.successor(&frontier.row(row)) {
+                proposals.push(value);
+            }
+        }
+    }
+
+    fn confirm(
+        &self,
+        variable: usize,
+        frontier: &triblespace_core::query::Frontier<'_>,
+        cands: &mut Candidates<'_>,
+    ) {
+        if variable != self.variable {
+            return;
+        }
+        cands.for_each_parent(|row, run| {
+            let successor = self.successor(&frontier.row(row as usize));
+            run.retain(|v| Some(*v) == successor);
+        });
+    }
+}
+
+#[test]
+fn a_one_to_one_chain_descends_in_place() {
+    // A 60-hop chain: fan-out is exactly one at every level, so each
+    // descent carries the same single row forward with one more slot
+    // filled in. Nothing is gained, lost or reordered, so no child
+    // frontier ever has to be built — the parent's matrices are handed
+    // down untouched.
+    const HOPS: usize = 60;
+    let links: Vec<Box<dyn Constraint + Send + Sync>> = (0..HOPS)
+        .map(|variable| {
+            Box::new(Chain {
+                variable,
+                len: HOPS as u32,
+            }) as Box<dyn Constraint + Send + Sync>
+        })
+        .collect();
+    let query = triblespace_core::query::Query::new(
+        triblespace_core::query::intersectionconstraint::IntersectionConstraint::new(links),
+        |binding: &Binding| Some(*binding.get(HOPS - 1)?),
+    );
+    let stats = query.stats();
+    let rows: Vec<_> = query.collect();
+
+    assert_eq!(rows, vec![Chain::node(HOPS as u32 - 1)]);
+    // One descent per hop below the root, every one of them 1:1.
+    assert_eq!(stats.inplace_descents(), HOPS as u64);
+    assert_eq!(
+        stats.copied_descents(),
+        0,
+        "a 1:1 chain must not build a single child frontier"
+    );
+}
+
+#[test]
+fn a_branching_descent_still_copies() {
+    // The control for `a_one_to_one_chain_descends_in_place`: as soon as a
+    // level fans out, the child frontier holds rows the parent's block
+    // cannot represent and the copying path has to run.
+    let values: Vec<[u8; 32]> = (0..8u32).map(Chain::node).collect();
+    let widths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let outer = WidthObserver {
+        variable: 0,
+        values: values.clone(),
+        widths: std::sync::Arc::clone(&widths),
+    };
+    let inner = WidthObserver {
+        variable: 1,
+        values: values.clone(),
+        widths,
+    };
+    let query = triblespace_core::query::Query::new(
+        triblespace_core::query::intersectionconstraint::IntersectionConstraint::new(vec![
+            Box::new(outer) as Box<dyn Constraint + Send + Sync>,
+            Box::new(inner),
+        ]),
+        |binding: &Binding| Some((*binding.get(0)?, *binding.get(1)?)),
+    );
+    let stats = query.stats();
+    let rows: Vec<_> = query.collect();
+
+    assert_eq!(rows.len(), 64);
+    assert!(
+        stats.copied_descents() > 0,
+        "a fan-out of 8 cannot descend in place"
+    );
 }
 
 /// A source whose estimate for its own variable depends on the *value*

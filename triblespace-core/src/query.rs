@@ -643,42 +643,41 @@ impl BindingStore {
     }
 
     /// Consumes up to `width` further live candidates from `variable`'s
-    /// level and writes the child frontier's rows into `out`, recording
-    /// each child row's parent row number in `parents_out`.
+    /// level, recording each drawn entry's index in `drawn_out` and the
+    /// frontier row it was proposed for in `parents_out`.
     ///
     /// Each consumed candidate `i` carries the parent tag its proposer
-    /// wrote; the child row is that parent's index row with `variable`'s
-    /// slot pointed at `i`. Returns how many rows were produced (zero
-    /// means the level is spent).
-    pub(crate) fn take_chunk(
+    /// wrote, which `parent_select` lifts back into parent-block row
+    /// numbers. Drawing is separated from *materialising* the child rows
+    /// so the engine can look at the shape of the draw first — a 1:1 draw
+    /// needs no new rows at all, see [`Query::next_chunk`].
+    ///
+    /// Returns whether the level is now spent (no live candidate is left
+    /// beyond this draw).
+    pub(crate) fn draw(
         &mut self,
         variable: VariableId,
         width: usize,
-        parent_block: &[u32],
         parent_select: &[u32],
-        stride: usize,
-        out: &mut Vec<u32>,
+        drawn_out: &mut Vec<u32>,
         parents_out: &mut Vec<u32>,
-    ) -> usize {
-        out.clear();
+    ) -> bool {
+        drawn_out.clear();
         parents_out.clear();
-        let level = &mut self.levels[variable];
-        let mut rows = 0;
-        while rows < width {
-            let Some(i) = level.buffer.next_live(level.pos) else {
-                break;
-            };
-            level.pos = i + 1;
-            let parent = parent_select[level.buffer.parent_of(i) as usize];
-            let parent = parent as usize;
-            out.extend_from_slice(&parent_block[parent * stride..(parent + 1) * stride]);
-            let base = out.len() - stride;
-            out[base + variable] = i as u32;
-            parents_out.push(parent as u32);
-            rows += 1;
-        }
-        self.bound.set_value(variable, rows != 0);
-        rows
+        let spent = {
+            let level = &mut self.levels[variable];
+            while drawn_out.len() < width {
+                let Some(i) = level.buffer.next_live(level.pos) else {
+                    break;
+                };
+                level.pos = i + 1;
+                drawn_out.push(i as u32);
+                parents_out.push(parent_select[level.buffer.parent_of(i) as usize]);
+            }
+            level.buffer.next_live(level.pos).is_none()
+        };
+        self.bound.set_value(variable, !drawn_out.is_empty());
+        spent
     }
 
     /// Bisects `variable`'s materialized region, returning the tail as a
@@ -1389,7 +1388,7 @@ impl Default for LevelValues {
     }
 }
 
-/// Number of parent bindings the engine expands at once.
+/// Widest frontier the engine expands at once.
 ///
 /// The search keeps a *frontier* — all the rows sitting at one point of the
 /// tree — and expands up to this many of them in a single
@@ -1407,6 +1406,9 @@ impl Default for LevelValues {
 /// rows, so the batched tier is reachable at *every* depth rather than only
 /// at a wide root.
 ///
+/// It is a *ceiling*, not the first batch: a level starts at
+/// [`INITIAL_FRONTIER_WIDTH`] and ramps by [`FRONTIER_RAMP`] toward it.
+///
 /// The cost is frontier memory: one index row plus one estimate row per
 /// live row per depth, i.e. `O(width · variables · depth)` — the price of
 /// trading depth-first's `O(depth)` frontier for a wide one. Worst-case
@@ -1416,6 +1418,28 @@ impl Default for LevelValues {
 ///
 /// Tune per query with [`Query::with_frontier_width`].
 pub const DEFAULT_FRONTIER_WIDTH: usize = 16384;
+
+/// Width of the *first* chunk a level draws; chunks then grow by
+/// [`FRONTIER_RAMP`] up to the query's frontier width.
+///
+/// Starting at one keeps time-to-first-result identical to plain
+/// depth-first search. A query the caller stops after one row — `exists!`,
+/// `.next()`, `.take(n)` — must not pay to materialise a full-width
+/// frontier it will throw away, and with a first chunk of one it does
+/// exactly the work the pre-batching engine did. A full drain still
+/// reaches the ceiling after `log2(width)` chunks, so the ramp costs a
+/// logarithmic number of extra propose calls at the top of the tree and no
+/// extra per-candidate work at all.
+///
+/// This is the same insight as the `INITIAL_CHUNK`/`WIDEN_FACTOR` pair this
+/// branch deleted, and as the deleted residual engine's rule that search
+/// width grows geometrically after negative work — recovered at the right
+/// layer (the frontier) instead of the wrong one (per-parent chunking).
+pub const INITIAL_FRONTIER_WIDTH: usize = 1;
+
+/// Growth factor of the frontier-width ramp. See
+/// [`INITIAL_FRONTIER_WIDTH`].
+pub const FRONTIER_RAMP: usize = 2;
 
 /// A query is an iterator over the results of a query.
 /// It takes a constraint and a post-processing function as input,
@@ -1442,7 +1466,7 @@ pub struct Query<C, P: Fn(&Binding<'_>) -> Option<R>, R> {
     /// Index-row width: one slot per variable the query mentions.
     slots: usize,
     width: usize,
-    stack: ArrayVec<VariableId, 128>,
+    stack: ArrayVec<Level, 128>,
     /// Frontier stack. `depths[0]` is the root (one empty row); `depths[d]`
     /// holds the rows with `d` variables bound. Entries above `depth` are
     /// retired but keep their allocations for the next descent.
@@ -1450,9 +1474,24 @@ pub struct Query<C, P: Fn(&Binding<'_>) -> Option<R>, R> {
     depth: usize,
     /// Per-row preferred variable, rebuilt on every expansion.
     choice: Vec<u32>,
-    /// Scratch: each freshly-taken child row's parent row number.
+    /// Scratch: the level-buffer entry index of each freshly-drawn child row.
+    drawn: Vec<u32>,
+    /// Scratch: each freshly-drawn child row's parent row number.
     parents: Vec<u32>,
     stats: Arc<FrontierStats>,
+}
+
+/// One pushed search level: the variable it binds and how wide its *next*
+/// chunk may be.
+///
+/// The width is per level rather than per query because the ramp is a
+/// statement about one level's drain: the first chunk a level hands down is
+/// a single row, so a caller who stops after one result never pays for a
+/// batch it will not look at. See [`INITIAL_FRONTIER_WIDTH`].
+#[derive(Clone, Copy, Debug)]
+struct Level {
+    variable: VariableId,
+    width: usize,
 }
 
 /// One frontier: the index matrix of the rows sitting at one point of the
@@ -1503,6 +1542,8 @@ pub struct FrontierStats {
     rows: AtomicU64,
     variable_groups: AtomicU64,
     proposals: AtomicU64,
+    inplace_descents: AtomicU64,
+    copied_descents: AtomicU64,
 }
 
 impl FrontierStats {
@@ -1525,6 +1566,19 @@ impl FrontierStats {
     /// Total candidates proposed across all levels.
     pub fn proposals(&self) -> u64 {
         self.proposals.load(Ordering::Relaxed)
+    }
+
+    /// Descents that reused the parent frontier's matrices in place — the
+    /// 1:1 case, where the child block *is* the parent block with one more
+    /// slot filled in and nothing is allocated or copied.
+    pub fn inplace_descents(&self) -> u64 {
+        self.inplace_descents.load(Ordering::Relaxed)
+    }
+
+    /// Descents that had to build a fresh child frontier by copying each
+    /// row of the parent.
+    pub fn copied_descents(&self) -> u64 {
+        self.copied_descents.load(Ordering::Relaxed)
     }
 
     /// Mean rows per expansion — the width the search actually achieved.
@@ -1576,6 +1630,7 @@ where
             depths: self.depths[..=self.depth].to_vec(),
             depth: self.depth,
             choice: Vec::new(),
+            drawn: Vec::new(),
             parents: Vec::new(),
             stats: Arc::clone(&self.stats),
         }
@@ -1650,17 +1705,20 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             depths: vec![root],
             depth: 0,
             choice: Vec::new(),
+            drawn: Vec::new(),
             parents: Vec::new(),
             stats: Arc::new(FrontierStats::default()),
         }
     }
 
-    /// Sets how many parent bindings this query expands at once. See
-    /// [`DEFAULT_FRONTIER_WIDTH`] for what the number buys.
+    /// Sets the *widest* frontier this query expands at once. See
+    /// [`DEFAULT_FRONTIER_WIDTH`] for what the number buys and
+    /// [`INITIAL_FRONTIER_WIDTH`] for the ramp that leads up to it.
     ///
     /// A width of 1 reduces the engine to expanding one binding at a time —
     /// the shape the protocol had before frontiers — which is what the
-    /// equivalence tests pin.
+    /// equivalence tests pin. The ramp is a no-op at that ceiling, so the
+    /// reduction is exact.
     ///
     /// # Panics
     ///
@@ -1798,7 +1856,10 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         let variable = depth.groups[group].0;
         self.depths[self.depth].group += 1;
 
-        self.stack.push(variable);
+        self.stack.push(Level {
+            variable,
+            width: INITIAL_FRONTIER_WIDTH.min(self.width),
+        });
         self.unbound.unset(variable);
 
         let constraint = &self.constraint;
@@ -1818,11 +1879,41 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         self.mode = Search::NextChunk;
     }
 
-    /// Consumes the next chunk of the top level's candidates into a fresh
-    /// child frontier. When the level is spent the group is retired and the
-    /// next one gets its turn.
+    /// Consumes the next chunk of the top level's candidates into the child
+    /// frontier. When the level is spent the group is retired and the next
+    /// one gets its turn.
+    ///
+    /// # In-place 1:1 descent
+    ///
+    /// The child frontier is normally built by copying each drawn
+    /// candidate's parent row and filling in the newly bound variable's
+    /// slot. When the draw is **1:1** — one surviving child per parent row,
+    /// in order, covering the whole parent frontier, with nothing left over
+    /// — no row was gained, lost or reordered, so the child block *is* the
+    /// parent block with one more slot written. The engine's two standing
+    /// invariants are what make that safe: confirmers may only kill
+    /// candidates and never revive them (so a surviving row keeps its
+    /// identity), and buffers are write-once (so `variable`'s slot in every
+    /// row was previously unwritten and filling it destroys nothing). The
+    /// same argument covers the estimate matrix: the rows the child would
+    /// have copied are bit-identical to the parent's, and the only slots it
+    /// then overwrites are the ones the influence refresh recomputes
+    /// anyway.
+    ///
+    /// A 1:1 draw that leaves the level spent is also the last thing the
+    /// parent frontier is ever asked for, so the matrices are handed *down*
+    /// (swapped with the child's retired allocations) rather than shared —
+    /// which is what lets a whole chain of 1:1 descents run without a
+    /// single matrix copy, instead of only the first one.
+    ///
+    /// Ownership is not tracked separately: the frontier matrices already
+    /// sit behind `Arc` so a rayon split copies refcounts, and
+    /// [`Arc::get_mut`] therefore succeeds exactly when no split or steal
+    /// is holding the other half. Let the `Arc` be the guard; when it says
+    /// no, take the copying path.
     fn next_chunk(&mut self) {
-        let variable = *self.stack.last().expect("a level to chunk");
+        let level = *self.stack.last().expect("a level to chunk");
+        let variable = level.variable;
         let parent = self.depth;
         let group = self.depths[parent].group - 1;
         let range = self.depths[parent].group_range(group);
@@ -1831,19 +1922,21 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         if self.depths.len() <= parent + 1 {
             self.depths.push(Depth::default());
         }
-        let (head, tail) = self.depths.split_at_mut(parent + 1);
-        let source = &head[parent];
-        let child = &mut tail[0];
 
-        let rows = self.bindings.take_chunk(
+        let spent = self.bindings.draw(
             variable,
-            self.width,
-            &source.block,
-            &source.order[range],
-            slots,
-            Arc::make_mut(&mut child.block),
+            level.width,
+            &self.depths[parent].order[range],
+            &mut self.drawn,
             &mut self.parents,
         );
+        // Widen the next chunk this level hands down. Growth is per level,
+        // so a query stopped after one row never widens at all.
+        if let Some(top) = self.stack.last_mut() {
+            top.width = top.width.saturating_mul(FRONTIER_RAMP).min(self.width);
+        }
+
+        let rows = self.drawn.len();
         if rows == 0 {
             self.stack.pop();
             self.bindings.unset(variable);
@@ -1851,24 +1944,70 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             self.mode = Search::NextGroup;
             return;
         }
+
+        // 1:1 and terminal: every parent row produced exactly one child, in
+        // order, and neither this level nor this frontier has anything left
+        // to hand down.
+        let reusable = spent
+            && rows == self.depths[parent].rows
+            && self.depths[parent].group >= self.depths[parent].groups.len()
+            && self
+                .parents
+                .iter()
+                .enumerate()
+                .all(|(row, &parent_row)| parent_row as usize == row);
+
+        let (head, tail) = self.depths.split_at_mut(parent + 1);
+        let source = &mut head[parent];
+        let child = &mut tail[0];
+
+        let inplace = reusable
+            && Arc::get_mut(&mut source.block).is_some()
+            && Arc::get_mut(&mut source.estimates).is_some();
+
+        if inplace {
+            // Hand the matrices down and take the child's retired
+            // allocations in exchange, so the next 1:1 descent finds a
+            // uniquely-owned block again and the chain stays copy-free.
+            std::mem::swap(&mut source.block, &mut child.block);
+            std::mem::swap(&mut source.estimates, &mut child.estimates);
+            let block = Arc::get_mut(&mut child.block).expect("unique across the swap");
+            for (row, &entry) in self.drawn.iter().enumerate() {
+                block[row * slots + variable] = entry;
+            }
+            self.stats.inplace_descents.fetch_add(1, Ordering::Relaxed);
+        } else {
+            let block = Arc::make_mut(&mut child.block);
+            block.clear();
+            block.reserve(rows * slots);
+            for (&entry, &parent_row) in self.drawn.iter().zip(self.parents.iter()) {
+                let parent_row = parent_row as usize;
+                block.extend_from_slice(&source.block[parent_row * slots..(parent_row + 1) * slots]);
+                let base = block.len() - slots;
+                block[base + variable] = entry;
+            }
+            // Inherit each child row's estimates from its parent; the
+            // refresh below then updates exactly the ones binding
+            // `variable` can have changed — the same influence-driven
+            // refresh the single-binding engine did, now once per row of
+            // the batch. Nothing else can have gone stale: a row's
+            // estimates were computed against its own binding, so
+            // backtracking never invalidates them.
+            let estimates = Arc::make_mut(&mut child.estimates);
+            estimates.clear();
+            estimates.reserve(rows * slots);
+            for &parent_row in self.parents.iter() {
+                let parent_row = parent_row as usize;
+                estimates.extend_from_slice(
+                    &source.estimates[parent_row * slots..(parent_row + 1) * slots],
+                );
+            }
+            self.stats.copied_descents.fetch_add(1, Ordering::Relaxed);
+        }
         child.rows = rows;
         child.group = 0;
         child.emit = 0;
 
-        // Inherit each child row's estimates from its parent, then refresh
-        // exactly the ones binding `variable` can have changed — the same
-        // influence-driven refresh the single-binding engine did, now once
-        // per row of the batch. Nothing else can have gone stale: a row's
-        // estimates were computed against its own binding, so backtracking
-        // never invalidates them.
-        let estimates = Arc::make_mut(&mut child.estimates);
-        estimates.clear();
-        estimates.reserve(rows * slots);
-        for &parent_row in &self.parents[..rows] {
-            let parent_row = parent_row as usize;
-            estimates
-                .extend_from_slice(&source.estimates[parent_row * slots..(parent_row + 1) * slots]);
-        }
         let order = Arc::make_mut(&mut child.order);
         order.clear();
         order.extend(0..rows as u32);
@@ -2102,7 +2241,7 @@ mod parallel {
                     // leaves for the sequential folder.
                     Search::Emit | Search::Done => return (self, None),
                     Search::NextChunk => {
-                        let top = *q.stack.last().expect("a level to chunk");
+                        let top = q.stack.last().expect("a level to chunk").variable;
                         if q.bindings.pending(top) < 2 {
                             // Nothing to cut: either the level is spent
                             // (the step retires it) or a single candidate

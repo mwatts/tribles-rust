@@ -126,12 +126,53 @@ whole frontier at a time:
    each row's tightest child propose and runs the remaining children as
    confirmers over that output, so the buffer the engine sees has already
    survived every clause.
-4. Turn the next `DEFAULT_FRONTIER_WIDTH` surviving candidates into the child
-   frontier and descend. Each child row inherits its parent's estimates and
-   refreshes exactly the ones the new binding could have changed — the
-   `influence` set of the variable just bound.
+4. Turn the next chunk of surviving candidates into the child frontier and
+   descend. Each child row inherits its parent's estimates and refreshes
+   exactly the ones the new binding could have changed — the `influence` set
+   of the variable just bound.
 5. When a level runs out of live candidates, retire it and continue with the
    next group, then with the next chunk one level up.
+
+### The width is a ceiling, reached by a ramp
+
+`DEFAULT_FRONTIER_WIDTH` is how wide a chunk may *get*, not how wide the first
+one is. A level's first chunk is `INITIAL_FRONTIER_WIDTH` = 1 binding and
+doubles (`FRONTIER_RAMP`) until it hits the ceiling.
+
+That is what keeps time-to-first-result honest. A caller who stops after one
+row — `exists!`, `.next()`, `.take(n)` — must not pay to build a 16 384-wide
+frontier it will never look at, and with a first chunk of one it does exactly
+the work the single-binding engine did. A full drain reaches the ceiling after
+`log2(width)` chunks, so the ramp costs a logarithmic number of extra propose
+calls near the top of the tree and no extra per-candidate work anywhere.
+
+### A 1:1 descent copies nothing
+
+Step 4 normally builds the child frontier by copying each drawn candidate's
+parent row and filling in the newly bound slot. When the draw is **1:1** — one
+surviving child per parent row, in order, covering the whole frontier, with
+nothing left pending — that copy is pure waste: no row was gained, lost or
+reordered, so the child block *is* the parent block with one more slot
+written, and the child's estimate rows are bit-identical to the parent's.
+
+The two standing invariants are what make it sound. Confirmers may only kill
+candidates, never revive them, so a surviving row keeps its identity. Buffers
+are write-once, so the newly bound variable's slot in every row was previously
+unwritten and filling it destroys nothing. And because such a draw leaves the
+level spent, the parent frontier is never asked for anything again, so its
+matrices are handed *down* rather than shared — which is what lets a whole
+chain of 1:1 descents run without a single matrix copy instead of only the
+first one.
+
+Ownership needs no separate flag. The matrices already sit behind `Arc` so a
+rayon split copies refcounts, and `Arc::get_mut` therefore succeeds exactly
+when no split or steal holds the other half; when it says no, the copying path
+runs. `FrontierStats` counts both paths.
+
+This matters most for the shape batching can never help: a chain with fan-out
+one at every level has no sibling parents to widen the frontier with, so it
+can only ever be *charged* for the machinery. Removing the per-level row copy
+is what brings it back to the single-binding engine's cost.
 
 **A row is never moved onto a variable it did not choose**, however tempting
 that is for batch size. `propose` owns candidate support and first-seen order,
@@ -226,6 +267,15 @@ stack bottoms out, and the measurement bore that out (0.004 ms against 0.017 ms
 for the design it was meant to improve). And its one real case, a wide root, is
 a lottery on iteration order rather than a saving: chunking helps only if the
 surviving candidates happen to sort early.
+
+What did survive is the *geometric* part. The deleted cursor carried an
+`INITIAL_CHUNK`/`WIDEN_FACTOR` pair, and the residual engine before it grew its
+search width geometrically after negative work; both are the same idea, and
+both were attached to the wrong object. Attached to a *level*, growth asks a
+source to resume. Attached to the *frontier*, it asks nothing of anyone — the
+engine already owns how many parent rows it expands at a time, so
+`INITIAL_FRONTIER_WIDTH` and `FRONTIER_RAMP` buy the time-to-first-result
+property the cursor was reaching for with none of its protocol cost.
 
 Narrowing a wide level is still a real problem; galloping intersection is the
 standing candidate for it. What the engine will not do is require a *seek* from
