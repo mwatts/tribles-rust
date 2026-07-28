@@ -72,6 +72,12 @@ fi
 if grep -q 'pub struct Candidates' "$SUBJECT/triblespace-core/src/query.rs" 2>/dev/null; then
   FEATURES="$FEATURES protocol-v2"
 fi
+# frontier: propose/confirm take a batch of parent bindings rather than
+# one (engine/batched-frontier onward). Refines protocol-v2, so it is
+# only ever probed for alongside it.
+if grep -q 'pub struct Frontier' "$SUBJECT/triblespace-core/src/query.rs" 2>/dev/null; then
+  FEATURES="$FEATURES frontier"
+fi
 # rpq: only when the subject still has a regular-path constraint.
 if [ -f "$SUBJECT/triblespace-core/src/query/regularpathconstraint.rs" ]; then
   FEATURES="$FEATURES rpq"

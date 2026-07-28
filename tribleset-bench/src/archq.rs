@@ -51,8 +51,12 @@ use subject::core::prelude::BlobStore;
 use subject::core::prelude::TribleSet;
 #[cfg(feature = "protocol-v2")]
 use subject::core::query::{
-    Binding, Candidates, Constraint, ProposalBuffer, ProposeCursor, Term, VariableId, VariableSet,
+    Binding, Candidates, Constraint, ProposalBuffer, Term, VariableId, VariableSet,
 };
+#[cfg(all(feature = "protocol-v2", not(feature = "frontier")))]
+use subject::core::query::ProposeCursor;
+#[cfg(feature = "frontier")]
+use subject::core::query::Frontier;
 use subject::core::query::TriblePattern;
 
 use crate::queries::{self, Answer};
@@ -362,10 +366,12 @@ where
         self.inner.estimate(variable, binding)
     }
 
+    #[cfg(not(feature = "frontier"))]
     fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
         self.inner.propose(variable, binding, proposals)
     }
 
+    #[cfg(not(feature = "frontier"))]
     fn propose_chunk(
         &self,
         variable: VariableId,
@@ -378,6 +384,16 @@ where
             .propose_chunk(variable, binding, cursor, budget, proposals)
     }
 
+    #[cfg(feature = "frontier")]
+    fn propose(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        proposals: &mut ProposalBuffer,
+    ) {
+        self.inner.propose(variable, frontier, proposals)
+    }
+
     /// Records the region's LIVE count, then confirms exactly as the
     /// canonical constraint does.
     ///
@@ -385,6 +401,7 @@ where
     /// mirrors `WgpuSuccinctArchiveConstraint::confirm`: those calls
     /// never reach the routing decision there either, so counting them
     /// would inflate the census with regions the GPU never sees.
+    #[cfg(not(feature = "frontier"))]
     fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
         if !self.variables().is_set(variable) {
             return;
@@ -392,6 +409,19 @@ where
         let live = (0..cands.len()).filter(|&i| cands.is_live(i)).count();
         self.owner.record(live);
         self.inner.confirm(variable, binding, cands)
+    }
+
+    /// Batched protocol: the region now spans a whole frontier, so this
+    /// census measures exactly what the routing decision sees — one
+    /// number per `confirm` call, not per parent binding.
+    #[cfg(feature = "frontier")]
+    fn confirm(&self, variable: VariableId, frontier: &Frontier<'_>, cands: &mut Candidates<'_>) {
+        if !self.variables().is_set(variable) {
+            return;
+        }
+        let live = (0..cands.len()).filter(|&i| cands.is_live(i)).count();
+        self.owner.record(live);
+        self.inner.confirm(variable, frontier, cands)
     }
 
     fn satisfied(&self, binding: &Binding) -> bool {
