@@ -9,6 +9,7 @@ use triblespace::core::query::Constraint;
 use triblespace::core::query::VariableContext;
 use triblespace::prelude::inlineencodings::R256BE;
 use triblespace::prelude::*;
+use triblespace::core::query::Frontier;
 use triblespace::core::query::ProposalBuffer;
 
 attributes! {
@@ -141,7 +142,7 @@ fn estimate_is_universe_code_range_upper_bound() {
     // Verify propose enumerates exactly the 3 distinct V values.
     use triblespace::core::query::Binding;
     let mut proposals = ProposalBuffer::new();
-    constraint.propose(v.index, &Binding::default(), &mut proposals);
+    constraint.propose(v.index, &Frontier::default(), &mut proposals);
     assert_eq!(
         proposals.len(),
         3,
