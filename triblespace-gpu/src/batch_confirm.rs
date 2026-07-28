@@ -47,7 +47,7 @@ use triblespace_core::blob::encodings::succinctarchive::{
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::{InlineEncoding, RawInline};
 use triblespace_core::query::{
-    and_words, Binding, Candidates, Constraint, ProposalBuffer, ProposeCursor, RawTerm, Term,
+    and_words, Binding, Candidates, Constraint, Frontier, ProposalBuffer, RawTerm, Term,
     TriblePattern, VariableId, VariableSet,
 };
 
@@ -224,21 +224,28 @@ fn membership_confirm_kernel(
 }
 
 /// Resolves each candidate to its universe code and fills the rank-probe
-/// pair for the range arms: probe positions are the fixed row range's
-/// endpoints, probe values the candidate's code. Dead or absent candidates
-/// get `flag = 0` and a harmless `(0, code 0)` probe pair.
+/// pair for the range arms: probe positions are that candidate's own row
+/// range, probe values the candidate's code. Dead, absent, or
+/// empty-range candidates get `flag = 0` and a harmless `(0, code 0)`
+/// probe pair.
+///
+/// The range is **per candidate**, not per dispatch: a confirm region
+/// spans a whole frontier, and each frontier row's bound positions restrict
+/// the archive to a different band of rows. The CPU computes one band per
+/// row and expands it through the region's parent tags, which is what lets
+/// one device dispatch serve a batch instead of one parent.
 #[cube(launch_unchecked)]
 fn range_probe_fill_kernel(
     cands: &Array<u32>,
     live: &Array<u32>,
     universe: &Array<u32>,
+    r_starts: &Array<u32>,
+    r_ends: &Array<u32>,
     flags: &mut Array<u32>,
     positions: &mut Array<u32>,
     values: &mut Array<u32>,
     n: u32,
     m: u32,
-    r_start: u32,
-    r_end: u32,
 ) {
     let i = ABSOLUTE_POS as u32;
     if i < n {
@@ -250,10 +257,16 @@ fn range_probe_fill_kernel(
             let d = universe_lower_bound(universe, m, cands, i);
             if d < m {
                 if value_order(universe, d, cands, i) == 0u32 {
-                    flag = 1u32;
-                    code = d;
-                    lo = r_start;
-                    hi = r_end;
+                    let start = r_starts[i as usize];
+                    let end = r_ends[i as usize];
+                    // An empty band restricts to nothing, exactly as the
+                    // CPU arm's `restrict_range(..).is_empty()` does.
+                    if start < end {
+                        flag = 1u32;
+                        code = d;
+                        lo = start;
+                        hi = end;
+                    }
                 }
             }
         }
@@ -562,12 +575,13 @@ where
 
     /// Device evaluation of one range arm: probe fill, Jerky's batched
     /// wavelet rank, and verdict fold enqueued back-to-back, one readback,
-    /// one AND into the region's liveness. `r` is the fixed row range the
-    /// CPU computed from the bound positions.
+    /// one AND into the region's liveness. `rows` holds one row range per
+    /// frontier row — the CPU's reading of that row's bound positions —
+    /// which the region's parent tags expand to one range per candidate.
     fn confirm_range_gpu(
         &self,
         rotation: SuccinctRotation,
-        r: &Range<usize>,
+        rows: &[Range<usize>],
         cands: &mut Candidates<'_>,
     ) -> jerky::Result<()> {
         let n = cands.len();
@@ -575,14 +589,23 @@ where
             return Ok(());
         }
         let wm = self.ring_col(rotation);
-        if r.start > r.end || r.end > wm.len() {
-            return Err(jerky::Error::invalid_argument(format!(
-                "confirm row range {}..{} exceeds the {} rows of {rotation:?}",
-                r.start,
-                r.end,
-                wm.len()
-            )));
+        let mut r_starts = Vec::with_capacity(n);
+        let mut r_ends = Vec::with_capacity(n);
+        for &parent in cands.parents() {
+            let r = &rows[parent as usize];
+            if r.start > r.end || r.end > wm.len() {
+                return Err(jerky::Error::invalid_argument(format!(
+                    "confirm row range {}..{} exceeds the {} rows of {rotation:?}",
+                    r.start,
+                    r.end,
+                    wm.len()
+                )));
+            }
+            r_starts.push(r.start as u32);
+            r_ends.push(r.end as u32);
         }
+        let r_start_words = self.context.upload_u32(&r_starts)?;
+        let r_end_words = self.context.upload_u32(&r_ends)?;
 
         let cand_words = self.context.upload_u32(&pack_be_words(cands.values()))?;
         let mut live = cands.live_words();
@@ -604,13 +627,13 @@ where
                 cand_words.input_arg(),
                 live_words.input_arg(),
                 self.universe_words.input_arg(),
+                r_start_words.input_arg(),
+                r_end_words.input_arg(),
                 flag_words.output_arg(),
                 positions.output_arg(),
                 values.output_arg(),
                 n as u32,
                 self.domain_len as u32,
-                r.start as u32,
-                r.end as u32,
             )
         };
         wm.rank_batch_into(&positions, &values, &mut ranks)?;
@@ -699,16 +722,18 @@ where
         }
     }
 
-    /// The device evaluation of one confirm call, mirroring the CPU arm
-    /// dispatch. Returns `false` when the binding shape has no device
-    /// lowering (never happens for the canonical twelve arms) so the caller
-    /// can fall back.
-    fn confirm_gpu(
+    /// The row range one binding's bound positions restrict the archive
+    /// to, together with the rotation to probe.
+    ///
+    /// Returns `None` for the three unbound-membership arms, which have no
+    /// row range at all — they are classified once for the whole batch
+    /// (the bound *set* is shared across a frontier, so the arm is too;
+    /// only the bound *values*, and hence the range, vary by row).
+    fn row_range(
         &self,
         variable: VariableId,
         binding: &Binding,
-        cands: &mut Candidates<'_>,
-    ) -> jerky::Result<()> {
+    ) -> Option<(SuccinctRotation, Range<usize>)> {
         let e_var = self.term_e.is_var(variable);
         let a_var = self.term_a.is_var(variable);
         let v_var = self.term_v.is_var(variable);
@@ -718,71 +743,103 @@ where
         let v_bound = self.term_v.position_value(binding);
 
         let archive = self.gpu.archive();
-        let (rotation, r) = match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
-            (None, None, None, true, false, false) => {
-                return self.gpu.confirm_membership_gpu(Axis::Entity, cands);
-            }
-            (None, None, None, false, true, false) => {
-                return self.gpu.confirm_membership_gpu(Axis::Attribute, cands);
-            }
-            (None, None, None, false, false, true) => {
-                return self.gpu.confirm_membership_gpu(Axis::Value, cands);
-            }
-            (Some(e), None, None, false, true, false) => (
-                SuccinctRotation::Eva,
-                base_range(&archive.domain, &archive.e_a, e),
-            ),
-            (Some(e), None, None, false, false, true) => (
-                SuccinctRotation::Eav,
-                base_range(&archive.domain, &archive.e_a, e),
-            ),
-            (None, Some(a), None, true, false, false) => (
-                SuccinctRotation::Ave,
-                base_range(&archive.domain, &archive.a_a, a),
-            ),
-            (None, Some(a), None, false, false, true) => (
-                SuccinctRotation::Aev,
-                base_range(&archive.domain, &archive.a_a, a),
-            ),
-            (None, None, Some(v), true, false, false) => (
-                SuccinctRotation::Vae,
-                base_range(&archive.domain, &archive.v_a, v),
-            ),
-            (None, None, Some(v), false, true, false) => (
-                SuccinctRotation::Vea,
-                base_range(&archive.domain, &archive.v_a, v),
-            ),
-            (None, Some(a), Some(v), true, false, false) => {
-                let r = base_range(&archive.domain, &archive.a_a, a);
-                (
-                    SuccinctRotation::Vae,
-                    restrict_range(&archive.domain, &archive.v_a, &archive.aev_c, v, &r),
-                )
-            }
-            (Some(e), None, Some(v), false, true, false) => {
-                let r = base_range(&archive.domain, &archive.e_a, e);
-                (
-                    SuccinctRotation::Vea,
-                    restrict_range(&archive.domain, &archive.v_a, &archive.eav_c, v, &r),
-                )
-            }
-            (Some(e), Some(a), None, false, false, true) => {
-                let r = base_range(&archive.domain, &archive.e_a, e);
-                (
+        Some(
+            match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
+                (None, None, None, _, _, _) => return None,
+                (Some(e), None, None, false, true, false) => (
+                    SuccinctRotation::Eva,
+                    base_range(&archive.domain, &archive.e_a, e),
+                ),
+                (Some(e), None, None, false, false, true) => (
+                    SuccinctRotation::Eav,
+                    base_range(&archive.domain, &archive.e_a, e),
+                ),
+                (None, Some(a), None, true, false, false) => (
+                    SuccinctRotation::Ave,
+                    base_range(&archive.domain, &archive.a_a, a),
+                ),
+                (None, Some(a), None, false, false, true) => (
                     SuccinctRotation::Aev,
-                    restrict_range(&archive.domain, &archive.a_a, &archive.eva_c, a, &r),
-                )
-            }
-            _ => unreachable!("invalid trible constraint state"),
-        };
+                    base_range(&archive.domain, &archive.a_a, a),
+                ),
+                (None, None, Some(v), true, false, false) => (
+                    SuccinctRotation::Vae,
+                    base_range(&archive.domain, &archive.v_a, v),
+                ),
+                (None, None, Some(v), false, true, false) => (
+                    SuccinctRotation::Vea,
+                    base_range(&archive.domain, &archive.v_a, v),
+                ),
+                (None, Some(a), Some(v), true, false, false) => {
+                    let r = base_range(&archive.domain, &archive.a_a, a);
+                    (
+                        SuccinctRotation::Vae,
+                        restrict_range(&archive.domain, &archive.v_a, &archive.aev_c, v, &r),
+                    )
+                }
+                (Some(e), None, Some(v), false, true, false) => {
+                    let r = base_range(&archive.domain, &archive.e_a, e);
+                    (
+                        SuccinctRotation::Vea,
+                        restrict_range(&archive.domain, &archive.v_a, &archive.eav_c, v, &r),
+                    )
+                }
+                (Some(e), Some(a), None, false, false, true) => {
+                    let r = base_range(&archive.domain, &archive.e_a, e);
+                    (
+                        SuccinctRotation::Aev,
+                        restrict_range(&archive.domain, &archive.a_a, &archive.eva_c, a, &r),
+                    )
+                }
+                _ => unreachable!("invalid trible constraint state"),
+            },
+        )
+    }
 
-        if r.is_empty() {
-            // Every restriction through an empty row range is empty; the CPU
-            // arm kills every candidate without probing, and so do we.
-            cands.kill_all();
+    /// The axis an unbound-membership confirm probes for `variable`.
+    fn membership_axis(&self, variable: VariableId) -> Axis {
+        if self.term_e.is_var(variable) {
+            Axis::Entity
+        } else if self.term_a.is_var(variable) {
+            Axis::Attribute
+        } else {
+            Axis::Value
+        }
+    }
+
+    /// The device evaluation of one confirm call over a whole frontier,
+    /// mirroring the CPU arm dispatch.
+    ///
+    /// The two shapes batch differently. **Membership** (no other position
+    /// bound) is parent-independent, so one dispatch already covers the
+    /// batch. **Range** restriction depends on each row's bound values, so
+    /// the CPU computes one row range per frontier row and the device
+    /// resolves each candidate through its own parent tag — which is what
+    /// makes a batched confirm reachable below the root, where every row
+    /// contributes only a handful of candidates on its own.
+    fn confirm_gpu(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        cands: &mut Candidates<'_>,
+    ) -> jerky::Result<()> {
+        if frontier.is_empty() || cands.is_empty() {
             return Ok(());
         }
-        self.gpu.confirm_range_gpu(rotation, &r, cands)
+        let Some((rotation, first)) = self.row_range(variable, &frontier.row(0)) else {
+            return self
+                .gpu
+                .confirm_membership_gpu(self.membership_axis(variable), cands);
+        };
+        let mut rows = Vec::with_capacity(frontier.len());
+        rows.push(first);
+        for row in 1..frontier.len() {
+            let (_, r) = self
+                .row_range(variable, &frontier.row(row))
+                .expect("a frontier shares one bound set, so one arm");
+            rows.push(r);
+        }
+        self.gpu.confirm_range_gpu(rotation, &rows, cands)
     }
 }
 
@@ -798,23 +855,16 @@ where
         self.inner.estimate(variable, binding)
     }
 
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
-        self.inner.propose(variable, binding, proposals)
-    }
-
-    fn propose_chunk(
+    fn propose(
         &self,
         variable: VariableId,
-        binding: &Binding,
-        cursor: &mut ProposeCursor,
-        budget: usize,
+        frontier: &Frontier<'_>,
         proposals: &mut ProposalBuffer,
-    ) -> bool {
-        self.inner
-            .propose_chunk(variable, binding, cursor, budget, proposals)
+    ) {
+        self.inner.propose(variable, frontier, proposals)
     }
 
-    fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
+    fn confirm(&self, variable: VariableId, frontier: &Frontier<'_>, cands: &mut Candidates<'_>) {
         if !self.term_e.is_var(variable)
             && !self.term_a.is_var(variable)
             && !self.term_v.is_var(variable)
@@ -824,17 +874,17 @@ where
         let live = count_live(cands);
         if live < self.gpu.min_confirm_batch {
             self.gpu.stats.record_cpu(cands.len());
-            self.inner.confirm(variable, binding, cands);
+            self.inner.confirm(variable, frontier, cands);
             return;
         }
-        match self.confirm_gpu(variable, binding, cands) {
+        match self.confirm_gpu(variable, frontier, cands) {
             Ok(()) => self.gpu.stats.record_gpu(cands.len()),
             Err(_) => {
                 // The helpers only write liveness after a complete verdict
                 // readback, so a failed dispatch left the region untouched
                 // and the CPU arm computes it from scratch.
                 self.gpu.stats.record_error();
-                self.inner.confirm(variable, binding, cands);
+                self.inner.confirm(variable, frontier, cands);
             }
         }
     }
