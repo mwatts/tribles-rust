@@ -1578,6 +1578,30 @@ struct Level {
     proposed: usize,
 }
 
+/// Empties one of a [`Depth`]'s `Arc`-shared buffers for rewriting, without
+/// copying the contents it is about to discard.
+///
+/// `Arc::make_mut` deep-clones whenever the `Arc` is shared — which is the
+/// normal state right after a rayon split, since splitting hands both halves
+/// the same matrices — and every caller here clears the result on the next
+/// line. That copy is pure waste, and it is proportional to the frontier:
+/// `rows * slots` entries, so it grows with exactly the width the engine
+/// exists to make large.
+///
+/// When we are the sole owner the allocation is reused. When we are not, a
+/// fresh empty buffer replaces our handle and the other half keeps the old
+/// one untouched, which is the same outcome `make_mut` produces minus the
+/// memcpy.
+fn reset_shared<T: Clone>(slot: &mut Arc<Vec<T>>, capacity: usize) -> &mut Vec<T> {
+    if Arc::get_mut(slot).is_none() {
+        *slot = Arc::new(Vec::with_capacity(capacity));
+    }
+    let buffer = Arc::get_mut(slot).expect("sole owner after replacement");
+    buffer.clear();
+    buffer.reserve(capacity);
+    buffer
+}
+
 /// One frontier: the index matrix of the rows sitting at one point of the
 /// search, their per-row estimates, and the partition into groups that
 /// agree on which variable to bind next.
@@ -1894,10 +1918,8 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             self.choice.push(variable);
         }
 
-        let order = Arc::make_mut(&mut depth.order);
-        let groups = Arc::make_mut(&mut depth.groups);
-        order.clear();
-        groups.clear();
+        let order = reset_shared(&mut depth.order, 0);
+        let groups = reset_shared(&mut depth.groups, 0);
         if single {
             // The whole block travels as one batch: only row numbers are
             // written, never a row.
@@ -2113,9 +2135,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             if speculate {
                 // Speculated and lost: the rows still have to be written,
                 // just from the deferred draw rather than fused with it.
-                let block = Arc::make_mut(&mut child.block);
-                block.clear();
-                block.reserve(rows * slots);
+                let block = reset_shared(&mut child.block, rows * slots);
                 for (&entry, &parent_row) in self.drawn.iter().zip(self.parents.iter()) {
                     let parent_row = parent_row as usize;
                     block.extend_from_slice(
@@ -2132,9 +2152,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             // the batch. Nothing else can have gone stale: a row's
             // estimates were computed against its own binding, so
             // backtracking never invalidates them.
-            let estimates = Arc::make_mut(&mut child.estimates);
-            estimates.clear();
-            estimates.reserve(rows * slots);
+            let estimates = reset_shared(&mut child.estimates, rows * slots);
             for &parent_row in self.parents.iter() {
                 let parent_row = parent_row as usize;
                 estimates.extend_from_slice(
