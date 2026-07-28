@@ -325,11 +325,19 @@ fn phase_row() {
 /// Only one arm survives the lean-core cut (see [`Engine`]'s doc
 /// comment); the `match` stays so a future second engine slots back in
 /// at this one seam instead of at every call site.
+///
+/// The seam is also where the frontier census taps the engine's own
+/// counters: `Query::stats` hands out an `Arc` shared with every rayon
+/// clone, so stashing it here — before the iterator is consumed —
+/// makes `FrontierStats::widest` readable afterwards for every query
+/// in this module, with no per-call-site instrumentation.
 pub fn run<'a, C, P, R>(q: Query<C, P, R>) -> Rows<C, P, R>
 where
     C: Constraint<'a> + 'a,
     P: Fn(&Binding) -> Option<R>,
 {
+    #[cfg(feature = "frontier")]
+    crate::archq::note_frontier_stats(q.stats());
     match current_engine() {
         Engine::Residual => Rows(q),
     }

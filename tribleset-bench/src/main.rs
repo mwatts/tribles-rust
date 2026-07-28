@@ -471,8 +471,8 @@ fn run_arch_queries(
     let archive = {
         let ds = archq::shell(archq::CountingArchive::new(archive));
         println!(
-            "  {:<34}{:>10}{:>12}{:>11}{:>10}{:>10}",
-            "regions/live-count", "confirms", "max", "p95", "median", ">=thresh"
+            "  {:<34}{:>10}{:>12}{:>11}{:>10}{:>10}{:>10}",
+            "regions/live-count", "confirms", "max", "p95", "median", ">=thresh", "width"
         );
         for q in archq::arch_queries() {
             ds.facts.reset();
@@ -513,6 +513,54 @@ fn run_arch_queries(
                         answer.value,
                         ds.facts.top_regions(4)
                     );
+                    // The claim under test is "wide regions at EVERY
+                    // level", which the flat histogram above cannot
+                    // distinguish from "one enormous root region".
+                    // Depth = variables already bound at the confirm.
+                    #[cfg(feature = "frontier")]
+                    let widths: std::collections::BTreeMap<usize, u64> =
+                        ds.facts.depth_widths().into_iter().collect();
+                    for (depth, d) in ds.facts.depth_rows() {
+                        #[cfg(feature = "frontier")]
+                        let width = format!(
+                            "{:>10}",
+                            widths.get(&depth).copied().unwrap_or(0)
+                        );
+                        #[cfg(not(feature = "frontier"))]
+                        let width = format!("{:>10}", "n/a");
+                        println!(
+                            "      depth {depth:<2}{:>26}{:>12}{:>11}{:>10}{:>10}{width}",
+                            d.confirms, d.max, d.p95, d.median, d.ge_threshold
+                        );
+                    }
+                    // The engine's own view of the same quantity.
+                    #[cfg(feature = "frontier")]
+                    {
+                        let f = archq::frontier_summary();
+                        println!(
+                            "      frontier: widest {} | expansions {} | mean width {:.1} \
+                             | proposals {} | descents {} in-place / {} copied",
+                            f.widest,
+                            f.expansions,
+                            f.mean_width(),
+                            f.proposals,
+                            f.inplace_descents,
+                            f.copied_descents
+                        );
+                        for (suffix, value) in [
+                            ("frontier_widest", f.widest),
+                            ("frontier_expansions", f.expansions),
+                            ("frontier_rows", f.rows),
+                            ("frontier_inplace", f.inplace_descents),
+                            ("frontier_copied", f.copied_descents),
+                        ] {
+                            led.outcome(
+                                &format!("arch_regions/{}/{suffix}", q.name),
+                                "signal",
+                                Some(value),
+                            );
+                        }
+                    }
                 }
             }
         }
