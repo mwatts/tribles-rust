@@ -105,6 +105,21 @@
   locate the relevant code without spelunking.
 
 ### Harness Work
+- Make the public `triblespace-paths` product-oracle harness tractable for
+  full CBMC verification. `cargo kani -q --package=triblespace-paths --harness
+  path_index_matches_two_vertex_product_oracle --only-codegen` succeeds, but a
+  32-subgraph solve was capped after 347 seconds without a verdict, and the
+  original 256-graph symbolic family was capped after ten minutes while using
+  roughly 16 GiB. The same 256 cases pass instantly as a native exhaustive
+  test. The fixed closure carrier has only four product nodes; the dominant
+  formula comes from the public `Automaton`/`PathSummary` path through `Vec`
+  allocation and `BTreeSet` canonicalization/destruction. Investigate a sound
+  proof-only abstraction for those already-tested canonical containers, or a
+  separately callable fixed-carrier closure kernel, before increasing bounds.
+- Generalise the `triblespace-paths` product-oracle rung beyond its exhaustive
+  two-vertex, fixed two-state automaton: first add a non-nullable automaton rung,
+  then bound symbolic transition tables without making private closure
+  internals part of the verification surface.
 - Build shared bounded-data generators for Kani harnesses (tribles, PATCH
   entries, commit DAGs) and publish them under `proofs/util.rs`.
 - Add `proofs/tribleset_harness.rs` validating ordering-preserving union,

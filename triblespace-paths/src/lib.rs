@@ -25,3 +25,7 @@ pub use persistence::{
     PathSummaryBlob, PathSummaryBlobError,
 };
 pub use summary::{GraphEdge, PathError, PathSummary};
+
+#[cfg(any(kani, test))]
+#[path = "../proofs/mod.rs"]
+mod proofs;

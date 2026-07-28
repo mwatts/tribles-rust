@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A bounded oracle checks the regular-path closure kernel.** A Kani harness
+  symbolically selects every subgraph of a five-edge, two-vertex labeled
+  universe, while an ordinary deterministic test exhausts all 256 graphs whose
+  directed cells independently select no edge, a forward label, a reverse
+  label, or an unmatched label. Both lower through the public
+  `PathSummary`/`PathIndex` API and compare with an independent direct-product
+  Floyd--Warshall relation. The nullable fixed automaton covers matched
+  support, the complete supplied identity domain, reverse traversal, SCC
+  closure, and the canonical accepted-pair stream.
 - **Canonical property-path expressions compile directly to epsilon-free
   automata.** `triblespace-paths::PathExpr` composes `Step`s with sequence,
   alternative, repetition, optionality, and structural inversion, normalizes
