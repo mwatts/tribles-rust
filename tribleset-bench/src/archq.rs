@@ -564,7 +564,9 @@ where
             return;
         }
         let live = (0..cands.len()).filter(|&i| cands.is_live(i)).count();
-        self.owner.record(live, binding.bound().count());
+        // Pre-frontier `Binding` exposes the bitset as a field, not a
+        // method — the census stays era-portable by naming the field.
+        self.owner.record(live, binding.bound.count());
         self.inner.confirm(variable, binding, cands)
     }
 
