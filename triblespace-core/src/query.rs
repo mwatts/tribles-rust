@@ -1548,6 +1548,7 @@ pub struct FrontierStats {
     rows: AtomicU64,
     variable_groups: AtomicU64,
     proposals: AtomicU64,
+    widest: AtomicU64,
     inplace_descents: AtomicU64,
     copied_descents: AtomicU64,
 }
@@ -1572,6 +1573,19 @@ impl FrontierStats {
     /// Total candidates proposed across all levels.
     pub fn proposals(&self) -> u64 {
         self.proposals.load(Ordering::Relaxed)
+    }
+
+    /// Rows in the widest single expansion — the widest frontier the
+    /// search actually reached.
+    ///
+    /// [`mean_width`](Self::mean_width) says what the typical expansion
+    /// looked like; this says whether the ceiling was ever approached at
+    /// all. The difference matters when reading a benchmark: a query whose
+    /// widest frontier is far below `DEFAULT_FRONTIER_WIDTH` cannot
+    /// demonstrate anything about batch-width thresholds, however the
+    /// engine behaves — the data simply never filled a batch.
+    pub fn widest(&self) -> u64 {
+        self.widest.load(Ordering::Relaxed)
     }
 
     /// Descents that reused the parent frontier's matrices in place — the
@@ -1837,6 +1851,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
 
         self.stats.expansions.fetch_add(1, Ordering::Relaxed);
         self.stats.rows.fetch_add(rows as u64, Ordering::Relaxed);
+        self.stats.widest.fetch_max(rows as u64, Ordering::Relaxed);
         self.stats
             .variable_groups
             .fetch_add(self.depths[self.depth].groups.len() as u64, Ordering::Relaxed);
