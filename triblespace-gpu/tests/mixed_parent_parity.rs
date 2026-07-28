@@ -74,16 +74,20 @@ struct Fixture {
     entities: Vec<RawInline>,
     attributes: Vec<RawInline>,
     values: Vec<RawInline>,
+    /// Values carried by *every* entity, so a candidate pool can guarantee
+    /// survivors at each level however sparse the rest of the archive is.
+    hubs: Vec<RawInline>,
     absent: Vec<RawInline>,
 }
 
-/// `entities` × `attributes` with a shared value pool, sparse enough that
-/// plenty of (entity, attribute) and (entity, value) pairs are missing — so
-/// the confirms actually kill.
+/// `entities` × `attributes` over a value pool, sparse enough that plenty of
+/// (entity, attribute) and (entity, value) pairs are missing — so the
+/// confirms actually kill — plus four hub values every entity carries.
 fn fixture(entities: u32, attributes: u32, values: u32) -> Fixture {
     let entity_ids: Vec<[u8; 16]> = (0..entities).map(|k| make_id(0x01, k)).collect();
     let attribute_ids: Vec<[u8; 16]> = (0..attributes).map(|k| make_id(0x02, k)).collect();
     let value_pool: Vec<RawInline> = (0..values).map(|k| free_value(0x10, k)).collect();
+    let hubs: Vec<RawInline> = (0..4).map(|k| free_value(0x11, k)).collect();
 
     let mut state = 0x5EED_1234u64;
     let mut set = TribleSet::new();
@@ -102,6 +106,14 @@ fn fixture(entities: u32, attributes: u32, values: u32) -> Fixture {
                 set.insert(&Trible { data });
             }
         }
+        // Hubs, one per hub value under a rotating attribute.
+        for (k, hub) in hubs.iter().enumerate() {
+            let mut data = [0u8; 64];
+            data[..16].copy_from_slice(entity);
+            data[16..32].copy_from_slice(&attribute_ids[k % attribute_ids.len()]);
+            data[32..].copy_from_slice(hub);
+            set.insert(&Trible { data });
+        }
     }
 
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
@@ -113,6 +125,7 @@ fn fixture(entities: u32, attributes: u32, values: u32) -> Fixture {
         entities: entity_ids.iter().map(id_value).collect(),
         attributes: attribute_ids.iter().map(id_value).collect(),
         values: value_pool,
+        hubs,
         absent: (0..24)
             .map(|k| free_value(0x20, k))
             .chain((0..8).map(|k| id_value(&make_id(0x03, k))))
@@ -407,13 +420,17 @@ fn vars() -> Vars {
     }
 }
 
-/// A candidate pool with duplicates, values that occur in the archive, and
-/// values absent from the universe entirely.
+/// A candidate pool mixing the three kinds a confirm has to tell apart: a hub
+/// value (present for every parent, so every parent keeps a survivor), values
+/// present in the universe but usually outside the parent's band, and values
+/// absent from the universe entirely. Duplicates are guaranteed.
 fn mixed_pool(fixture: &Fixture, seed: u64, len: usize) -> Vec<RawInline> {
     let mut state = seed;
     let mut pool = Vec::with_capacity(len);
-    for _ in 0..len {
-        pool.push(if splitmix(&mut state) % 4 == 0 {
+    for i in 0..len {
+        pool.push(if i == 0 {
+            fixture.hubs[(splitmix(&mut state) % fixture.hubs.len() as u64) as usize]
+        } else if splitmix(&mut state) % 4 == 0 {
             fixture.absent[(splitmix(&mut state) % fixture.absent.len() as u64) as usize]
         } else {
             fixture.values[(splitmix(&mut state) % fixture.values.len() as u64) as usize]
@@ -498,12 +515,47 @@ fn mixed_parent_range_arms_match_cpu() {
         stats.cpu_fallback_confirms, 0,
         "a confirm skipped the device: {stats:?}"
     );
+    // The parent table the device resolved really was a batch: the two range
+    // arms alone contributed more rows than they made confirm calls.
+    assert!(
+        stats.gpu_parents > (log.arms[1].confirms + log.arms[2].confirms) as u64,
+        "parent tables were width-1: {stats:?}"
+    );
+}
+
+/// The threshold still governs a mixed-parent region: raised above every
+/// region the query produces, nothing reaches the device and the rows are
+/// unchanged.
+#[test]
+fn mixed_parent_regions_fall_back_below_threshold() {
+    let mut fixture = fixture(512, 8, 96);
+    let pool = mixed_pool(&fixture, 0xFA11, 12);
+
+    let routed = pinned_arms(&fixture, 256, pool.clone(), false);
+    let routed_stats = fixture.gpu.stats();
+    assert!(routed_stats.gpu_confirms > 0, "{routed_stats:?}");
+
+    fixture.gpu.reset_stats();
+    fixture.gpu.set_min_confirm_batch(usize::MAX);
+    let fallback = pinned_arms(&fixture, 256, pool, false);
+    let fallback_stats = fixture.gpu.stats();
+
+    assert_eq!(fallback_stats.gpu_confirms, 0, "{fallback_stats:?}");
+    assert_eq!(fallback_stats.gpu_parents, 0, "{fallback_stats:?}");
+    assert!(fallback_stats.cpu_fallback_confirms > 0, "{fallback_stats:?}");
+    for (arm, (routed, fallback)) in routed.arms.iter().zip(fallback.arms.iter()).enumerate() {
+        assert_eq!(
+            (routed.confirms, routed.candidates),
+            (fallback.confirms, fallback.candidates),
+            "arm {arm}: routing changed the search itself"
+        );
+    }
 }
 
 #[test]
 fn mixed_parent_range_arms_match_cpu_with_dead_entries() {
     let fixture = fixture(512, 8, 96);
-    let pool = mixed_pool(&fixture, 0xDEAD_1, 13);
+    let pool = mixed_pool(&fixture, 0xDEAD_BE11, 13);
     let log = pinned_arms(&fixture, 300, pool, true);
     println!("pinned arms (prekilled): {log:?}");
     assert!(log.arms[1].mixed > 0 && log.arms[2].mixed > 0, "{log:?}");
