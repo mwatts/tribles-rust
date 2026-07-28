@@ -650,6 +650,10 @@ impl BindingStore {
     /// wrote; the child row is that parent's index row with `variable`'s
     /// slot pointed at `i`. Returns how many rows were produced (zero
     /// means the level is spent).
+    ///
+    /// This is the fused path: one pass, no intermediate. A descent that
+    /// might be 1:1 uses [`draw`](BindingStore::draw) instead, which defers
+    /// the write until the shape of the draw is known.
     pub(crate) fn take_chunk(
         &mut self,
         variable: VariableId,
@@ -669,8 +673,7 @@ impl BindingStore {
                 break;
             };
             level.pos = i + 1;
-            let parent = parent_select[level.buffer.parent_of(i) as usize];
-            let parent = parent as usize;
+            let parent = parent_select[level.buffer.parent_of(i) as usize] as usize;
             out.extend_from_slice(&parent_block[parent * stride..(parent + 1) * stride]);
             let base = out.len() - stride;
             out[base + variable] = i as u32;
@@ -679,6 +682,51 @@ impl BindingStore {
         }
         self.bound.set_value(variable, rows != 0);
         rows
+    }
+
+    /// Consumes up to `width` further live candidates from `variable`'s
+    /// level *without* materialising any child row: each drawn entry's
+    /// index lands in `drawn_out` and the frontier row it was proposed for
+    /// in `parents_out`.
+    ///
+    /// Deferring the write is what lets the engine look at the shape of a
+    /// draw before paying for it — a 1:1 draw needs no new rows at all,
+    /// see [`Query::next_chunk`]. It is not free (two passes instead of
+    /// one), which is exactly why the caller only takes this path when a
+    /// 1:1 draw is *possible*.
+    pub(crate) fn draw(
+        &mut self,
+        variable: VariableId,
+        width: usize,
+        parent_select: &[u32],
+        drawn_out: &mut Vec<u32>,
+        parents_out: &mut Vec<u32>,
+    ) {
+        drawn_out.clear();
+        parents_out.clear();
+        let level = &mut self.levels[variable];
+        while drawn_out.len() < width {
+            let Some(i) = level.buffer.next_live(level.pos) else {
+                break;
+            };
+            level.pos = i + 1;
+            drawn_out.push(i as u32);
+            parents_out.push(parent_select[level.buffer.parent_of(i) as usize]);
+        }
+        self.bound.set_value(variable, !drawn_out.is_empty());
+    }
+
+    /// Whether `variable`'s level has no live candidate left beyond what
+    /// has already been drawn.
+    ///
+    /// Deliberately *not* folded into [`draw`](BindingStore::draw): it is a
+    /// forward scan over the liveness words, so asking after every draw
+    /// would pay a second pass over a level's dead tail that the next draw
+    /// pays anyway. The one caller asks only once the cheap `O(1)`
+    /// conditions for an in-place descent already hold.
+    pub(crate) fn spent(&self, variable: VariableId) -> bool {
+        let level = &self.levels[variable];
+        level.buffer.next_live(level.pos).is_none()
     }
 
     /// Bisects `variable`'s materialized region, returning the tail as a
@@ -1389,7 +1437,7 @@ impl Default for LevelValues {
     }
 }
 
-/// Number of parent bindings the engine expands at once.
+/// Widest frontier the engine expands at once.
 ///
 /// The search keeps a *frontier* — all the rows sitting at one point of the
 /// tree — and expands up to this many of them in a single
@@ -1407,6 +1455,9 @@ impl Default for LevelValues {
 /// rows, so the batched tier is reachable at *every* depth rather than only
 /// at a wide root.
 ///
+/// It is a *ceiling*, not the first batch: a level's first chunk is
+/// [`INITIAL_FRONTIER_WIDTH`] and every chunk after it is this wide.
+///
 /// The cost is frontier memory: one index row plus one estimate row per
 /// live row per depth, i.e. `O(width · variables · depth)` — the price of
 /// trading depth-first's `O(depth)` frontier for a wide one. Worst-case
@@ -1416,6 +1467,48 @@ impl Default for LevelValues {
 ///
 /// Tune per query with [`Query::with_frontier_width`].
 pub const DEFAULT_FRONTIER_WIDTH: usize = 16384;
+
+/// Width of the *first* chunk a level draws. Every chunk after it is
+/// [`DEFAULT_FRONTIER_WIDTH`] (or whatever
+/// [`Query::with_frontier_width`] set).
+///
+/// Starting at one keeps time-to-first-result identical to plain
+/// depth-first search. A query the caller stops after one row — `exists!`,
+/// `.next()` — must not pay to materialise a full-width frontier it will
+/// throw away, and with a first chunk of one it does exactly the work the
+/// pre-batching engine did. Measured on a first-row-only join, a flat
+/// full-width engine is **8.8x** slower than the pre-batching engine;
+/// one narrow chunk closes the whole gap.
+///
+/// This is the same insight as the `INITIAL_CHUNK`/`WIDEN_FACTOR` pair this
+/// branch deleted, and as the deleted residual engine's rule that search
+/// width grows geometrically after negative work — recovered at the right
+/// layer (the frontier) instead of the wrong one (per-parent chunking).
+///
+/// # Why one step and not a geometric ramp
+///
+/// The obvious schedule is geometric — 1, 2, 4, … up to the ceiling — and
+/// it was measured and rejected. Doubling reaches the ceiling in
+/// `log2(width)` chunks, but the *last* chunk of a geometric drain is only
+/// about half the candidates, so a level never produces a frontier wider
+/// than half of what a flat schedule would, and every level pays
+/// `log2(width)` expansions instead of one. On a fan-out join that took a
+/// fixture's widest frontier from 2048 rows down to 512, its mean frontier
+/// from 768 rows down to 31, and its expansions from 3 up to 74 — for the
+/// same total rows and the same total proposals. A quarter of the peak
+/// width and a twenty-fifth of the mean is a direct attack on the reason
+/// batching exists, and it cost 10% on a full drain to buy it.
+///
+/// Stepping straight to the ceiling after one narrow chunk gives the same
+/// time-to-first-result — the first chunk is what a one-row caller pays,
+/// and it is one binding either way — while keeping the peak frontier
+/// (measured 2039 against the flat schedule's 2048) and adding one extra
+/// expansion per level rather than fourteen. The price is a caller who
+/// wants a handful of rows but not all of them: `take(2)` now pays a
+/// full-width batch where a geometric ramp would have paid two rows. That
+/// is the deliberate trade — `exists!` and `next()` are the short-circuit
+/// shapes that actually occur, and they are exactly protected.
+pub const INITIAL_FRONTIER_WIDTH: usize = 1;
 
 /// A query is an iterator over the results of a query.
 /// It takes a constraint and a post-processing function as input,
@@ -1442,7 +1535,7 @@ pub struct Query<C, P: Fn(&Binding<'_>) -> Option<R>, R> {
     /// Index-row width: one slot per variable the query mentions.
     slots: usize,
     width: usize,
-    stack: ArrayVec<VariableId, 128>,
+    stack: ArrayVec<Level, 128>,
     /// Frontier stack. `depths[0]` is the root (one empty row); `depths[d]`
     /// holds the rows with `d` variables bound. Entries above `depth` are
     /// retired but keep their allocations for the next descent.
@@ -1450,9 +1543,29 @@ pub struct Query<C, P: Fn(&Binding<'_>) -> Option<R>, R> {
     depth: usize,
     /// Per-row preferred variable, rebuilt on every expansion.
     choice: Vec<u32>,
-    /// Scratch: each freshly-taken child row's parent row number.
+    /// Scratch: the level-buffer entry index of each freshly-drawn child row.
+    drawn: Vec<u32>,
+    /// Scratch: each freshly-drawn child row's parent row number.
     parents: Vec<u32>,
     stats: Arc<FrontierStats>,
+}
+
+/// One pushed search level: the variable it binds, how wide its *next*
+/// chunk may be, and how many candidates its proposer produced.
+///
+/// The width is per level rather than per query because the schedule is a
+/// statement about one level's drain: the first chunk a level hands down is
+/// a single row, so a caller who stops after one result never pays for a
+/// batch it will not look at. See [`INITIAL_FRONTIER_WIDTH`].
+///
+/// `proposed` is the `O(1)` gate on the in-place descent: a level with more
+/// candidates than parent rows cannot possibly yield one child per parent,
+/// so the engine never pays to check. See [`Query::next_chunk`].
+#[derive(Clone, Copy, Debug)]
+struct Level {
+    variable: VariableId,
+    width: usize,
+    proposed: usize,
 }
 
 /// One frontier: the index matrix of the rows sitting at one point of the
@@ -1503,6 +1616,9 @@ pub struct FrontierStats {
     rows: AtomicU64,
     variable_groups: AtomicU64,
     proposals: AtomicU64,
+    widest: AtomicU64,
+    inplace_descents: AtomicU64,
+    copied_descents: AtomicU64,
 }
 
 impl FrontierStats {
@@ -1525,6 +1641,32 @@ impl FrontierStats {
     /// Total candidates proposed across all levels.
     pub fn proposals(&self) -> u64 {
         self.proposals.load(Ordering::Relaxed)
+    }
+
+    /// Rows in the widest single expansion — the widest frontier the
+    /// search actually reached.
+    ///
+    /// [`mean_width`](Self::mean_width) says what the typical expansion
+    /// looked like; this says whether the ceiling was ever approached at
+    /// all. The difference matters when reading a benchmark: a query whose
+    /// widest frontier is far below `DEFAULT_FRONTIER_WIDTH` cannot
+    /// demonstrate anything about batch-width thresholds, however the
+    /// engine behaves — the data simply never filled a batch.
+    pub fn widest(&self) -> u64 {
+        self.widest.load(Ordering::Relaxed)
+    }
+
+    /// Descents that reused the parent frontier's matrices in place — the
+    /// 1:1 case, where the child block *is* the parent block with one more
+    /// slot filled in and nothing is allocated or copied.
+    pub fn inplace_descents(&self) -> u64 {
+        self.inplace_descents.load(Ordering::Relaxed)
+    }
+
+    /// Descents that had to build a fresh child frontier by copying each
+    /// row of the parent.
+    pub fn copied_descents(&self) -> u64 {
+        self.copied_descents.load(Ordering::Relaxed)
     }
 
     /// Mean rows per expansion — the width the search actually achieved.
@@ -1576,6 +1718,7 @@ where
             depths: self.depths[..=self.depth].to_vec(),
             depth: self.depth,
             choice: Vec::new(),
+            drawn: Vec::new(),
             parents: Vec::new(),
             stats: Arc::clone(&self.stats),
         }
@@ -1650,17 +1793,20 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             depths: vec![root],
             depth: 0,
             choice: Vec::new(),
+            drawn: Vec::new(),
             parents: Vec::new(),
             stats: Arc::new(FrontierStats::default()),
         }
     }
 
-    /// Sets how many parent bindings this query expands at once. See
-    /// [`DEFAULT_FRONTIER_WIDTH`] for what the number buys.
+    /// Sets the *widest* frontier this query expands at once. See
+    /// [`DEFAULT_FRONTIER_WIDTH`] for what the number buys and
+    /// [`INITIAL_FRONTIER_WIDTH`] for the ramp that leads up to it.
     ///
     /// A width of 1 reduces the engine to expanding one binding at a time —
     /// the shape the protocol had before frontiers — which is what the
-    /// equivalence tests pin.
+    /// equivalence tests pin. The ramp is a no-op at that ceiling, so the
+    /// reduction is exact.
     ///
     /// # Panics
     ///
@@ -1773,6 +1919,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
 
         self.stats.expansions.fetch_add(1, Ordering::Relaxed);
         self.stats.rows.fetch_add(rows as u64, Ordering::Relaxed);
+        self.stats.widest.fetch_max(rows as u64, Ordering::Relaxed);
         self.stats
             .variable_groups
             .fetch_add(self.depths[self.depth].groups.len() as u64, Ordering::Relaxed);
@@ -1798,7 +1945,6 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         let variable = depth.groups[group].0;
         self.depths[self.depth].group += 1;
 
-        self.stack.push(variable);
         self.unbound.unset(variable);
 
         let constraint = &self.constraint;
@@ -1812,17 +1958,62 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             self.slots,
             |frontier, proposals| constraint.propose(variable, frontier, proposals),
         );
+        self.stack.push(Level {
+            variable,
+            width: INITIAL_FRONTIER_WIDTH.min(self.width),
+            proposed,
+        });
         self.stats
             .proposals
             .fetch_add(proposed as u64, Ordering::Relaxed);
         self.mode = Search::NextChunk;
     }
 
-    /// Consumes the next chunk of the top level's candidates into a fresh
-    /// child frontier. When the level is spent the group is retired and the
-    /// next one gets its turn.
+    /// Consumes the next chunk of the top level's candidates into the child
+    /// frontier. When the level is spent the group is retired and the next
+    /// one gets its turn.
+    ///
+    /// # In-place 1:1 descent
+    ///
+    /// The child frontier is normally built by copying each drawn
+    /// candidate's parent row and filling in the newly bound variable's
+    /// slot. When the draw is **1:1** — one surviving child per parent row,
+    /// in order, covering the whole parent frontier, with nothing left over
+    /// — no row was gained, lost or reordered, so the child block *is* the
+    /// parent block with one more slot written. The engine's two standing
+    /// invariants are what make that safe: confirmers may only kill
+    /// candidates and never revive them (so a surviving row keeps its
+    /// identity), and buffers are write-once (so `variable`'s slot in every
+    /// row was previously unwritten and filling it destroys nothing). The
+    /// same argument covers the estimate matrix: the rows the child would
+    /// have copied are bit-identical to the parent's, and the only slots it
+    /// then overwrites are the ones the influence refresh recomputes
+    /// anyway.
+    ///
+    /// A 1:1 draw that leaves the level spent is also the last thing the
+    /// parent frontier is ever asked for, so the matrices are handed *down*
+    /// (swapped with the child's retired allocations) rather than shared —
+    /// which is what lets a whole chain of 1:1 descents run without a
+    /// single matrix copy, instead of only the first one.
+    ///
+    /// Ownership is not tracked separately: the frontier matrices already
+    /// sit behind `Arc` so a rayon split copies refcounts, and
+    /// [`Arc::get_mut`] therefore succeeds exactly when no split or steal
+    /// is holding the other half. Let the `Arc` be the guard; when it says
+    /// no, take the copying path.
+    ///
+    /// **The fast path is gated so it costs nothing when it cannot fire.**
+    /// Recognising a 1:1 draw means deferring the child rows until the
+    /// draw's shape is known, and that deferral is a second pass — measured
+    /// at +10% on F10 and +20% on F6 when charged to every descent. So the
+    /// engine asks first, from what it already knows: a level holding
+    /// `proposed` candidates for `rows` parents can only yield one child
+    /// per parent if `proposed == rows`. Fan-out levels fail that `O(1)`
+    /// test and run the fused [`take_chunk`](BindingStore::take_chunk)
+    /// exactly as before.
     fn next_chunk(&mut self) {
-        let variable = *self.stack.last().expect("a level to chunk");
+        let level = *self.stack.last().expect("a level to chunk");
+        let variable = level.variable;
         let parent = self.depth;
         let group = self.depths[parent].group - 1;
         let range = self.depths[parent].group_range(group);
@@ -1831,19 +2022,43 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         if self.depths.len() <= parent + 1 {
             self.depths.push(Depth::default());
         }
-        let (head, tail) = self.depths.split_at_mut(parent + 1);
-        let source = &head[parent];
-        let child = &mut tail[0];
 
-        let rows = self.bindings.take_chunk(
-            variable,
-            self.width,
-            &source.block,
-            &source.order[range],
-            slots,
-            Arc::make_mut(&mut child.block),
-            &mut self.parents,
-        );
+        // Could this draw possibly be 1:1? One child per parent needs
+        // exactly as many candidates as there are parent rows, and a chunk
+        // wide enough to take them all. Both are known before drawing, and
+        // both are `O(1)`.
+        let source_rows = self.depths[parent].rows;
+        let speculate = level.proposed == source_rows
+            && level.width >= source_rows
+            && self.depths[parent].group >= self.depths[parent].groups.len();
+
+        let rows = if speculate {
+            self.bindings.draw(
+                variable,
+                level.width,
+                &self.depths[parent].order[range],
+                &mut self.drawn,
+                &mut self.parents,
+            );
+            self.drawn.len()
+        } else {
+            let (head, tail) = self.depths.split_at_mut(parent + 1);
+            self.bindings.take_chunk(
+                variable,
+                level.width,
+                &head[parent].block,
+                &head[parent].order[range],
+                slots,
+                Arc::make_mut(&mut tail[0].block),
+                &mut self.parents,
+            )
+        };
+        // Widen the next chunk this level hands down: one narrow chunk to
+        // protect the caller who wants a single row, then the ceiling.
+        if let Some(top) = self.stack.last_mut() {
+            top.width = self.width;
+        }
+
         if rows == 0 {
             self.stack.pop();
             self.bindings.unset(variable);
@@ -1851,24 +2066,77 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             self.mode = Search::NextGroup;
             return;
         }
+
+        // The speculation paid off when every parent really did produce
+        // exactly one child, in order, and nothing is left pending.
+        // `spent` is last because it scans the level's remaining liveness
+        // words.
+        let reusable = speculate
+            && rows == source_rows
+            && self
+                .parents
+                .iter()
+                .enumerate()
+                .all(|(row, &parent_row)| parent_row as usize == row)
+            && self.bindings.spent(variable);
+
+        let (head, tail) = self.depths.split_at_mut(parent + 1);
+        let source = &mut head[parent];
+        let child = &mut tail[0];
+
+        let inplace = reusable
+            && Arc::get_mut(&mut source.block).is_some()
+            && Arc::get_mut(&mut source.estimates).is_some();
+
+        if inplace {
+            // Hand the matrices down and take the child's retired
+            // allocations in exchange, so the next 1:1 descent finds a
+            // uniquely-owned block again and the chain stays copy-free.
+            std::mem::swap(&mut source.block, &mut child.block);
+            std::mem::swap(&mut source.estimates, &mut child.estimates);
+            let block = Arc::get_mut(&mut child.block).expect("unique across the swap");
+            for (row, &entry) in self.drawn.iter().enumerate() {
+                block[row * slots + variable] = entry;
+            }
+            self.stats.inplace_descents.fetch_add(1, Ordering::Relaxed);
+        } else {
+            if speculate {
+                // Speculated and lost: the rows still have to be written,
+                // just from the deferred draw rather than fused with it.
+                let block = Arc::make_mut(&mut child.block);
+                block.clear();
+                block.reserve(rows * slots);
+                for (&entry, &parent_row) in self.drawn.iter().zip(self.parents.iter()) {
+                    let parent_row = parent_row as usize;
+                    block.extend_from_slice(
+                        &source.block[parent_row * slots..(parent_row + 1) * slots],
+                    );
+                    let base = block.len() - slots;
+                    block[base + variable] = entry;
+                }
+            }
+            // Inherit each child row's estimates from its parent; the
+            // refresh below then updates exactly the ones binding
+            // `variable` can have changed — the same influence-driven
+            // refresh the single-binding engine did, now once per row of
+            // the batch. Nothing else can have gone stale: a row's
+            // estimates were computed against its own binding, so
+            // backtracking never invalidates them.
+            let estimates = Arc::make_mut(&mut child.estimates);
+            estimates.clear();
+            estimates.reserve(rows * slots);
+            for &parent_row in self.parents.iter() {
+                let parent_row = parent_row as usize;
+                estimates.extend_from_slice(
+                    &source.estimates[parent_row * slots..(parent_row + 1) * slots],
+                );
+            }
+            self.stats.copied_descents.fetch_add(1, Ordering::Relaxed);
+        }
         child.rows = rows;
         child.group = 0;
         child.emit = 0;
 
-        // Inherit each child row's estimates from its parent, then refresh
-        // exactly the ones binding `variable` can have changed — the same
-        // influence-driven refresh the single-binding engine did, now once
-        // per row of the batch. Nothing else can have gone stale: a row's
-        // estimates were computed against its own binding, so backtracking
-        // never invalidates them.
-        let estimates = Arc::make_mut(&mut child.estimates);
-        estimates.clear();
-        estimates.reserve(rows * slots);
-        for &parent_row in &self.parents[..rows] {
-            let parent_row = parent_row as usize;
-            estimates
-                .extend_from_slice(&source.estimates[parent_row * slots..(parent_row + 1) * slots]);
-        }
         let order = Arc::make_mut(&mut child.order);
         order.clear();
         order.extend(0..rows as u32);
@@ -2102,7 +2370,7 @@ mod parallel {
                     // leaves for the sequential folder.
                     Search::Emit | Search::Done => return (self, None),
                     Search::NextChunk => {
-                        let top = *q.stack.last().expect("a level to chunk");
+                        let top = q.stack.last().expect("a level to chunk").variable;
                         if q.bindings.pending(top) < 2 {
                             // Nothing to cut: either the level is spent
                             // (the step retires it) or a single candidate
