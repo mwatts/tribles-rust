@@ -136,18 +136,21 @@ where
         }
     }
 
-    /// Prefix membership does not depend on the parent binding.
-    fn confirm(
-        &self,
-        _variable: VariableId,
-        _frontier: &Frontier<'_>,
-        cands: &mut Candidates<'_>,
-    ) {
+    /// Prefix membership does not depend on the parent binding — but it does
+    /// depend on the variable, so guard on it as `estimate` and `propose`
+    /// already do. Composites only reach `confirm` for constraints whose
+    /// `estimate` returned `Some`, which made the missing check harmless;
+    /// relying on a caller's gating for correctness is the kind of coupling
+    /// that survives right up until someone changes the caller.
+    fn confirm(&self, variable: VariableId, _frontier: &Frontier<'_>, cands: &mut Candidates<'_>) {
+        if self.variable.index != variable {
+            return;
+        }
         for i in 0..cands.len() {
-                let v = &cands.values()[i];
             if !cands.is_live(i) {
                 continue;
             }
+            let v = &cands.values()[i];
             let keep = if let Some(id) = id_from_value(v) {
                 self.patch.has_prefix(&id)
             } else {

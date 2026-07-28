@@ -1416,7 +1416,10 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
 
 /// Per-variable candidate storage for one search level: the proposals for
 /// the whole batch that produced them, plus how far the engine has consumed
-/// them. Slots are reused across sibling levels for their buffer capacity.
+/// them. Slots are indexed by [`VariableId`], so siblings — different
+/// variables chosen at the same depth — never share one; what a slot is
+/// reused for is the *next* binding of its own variable, whose refill keeps
+/// the buffer's capacity.
 #[derive(Clone, Debug)]
 struct LevelValues {
     buffer: ProposalBuffer,
