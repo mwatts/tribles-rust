@@ -100,7 +100,14 @@ where
         // Freshness rule: a proposer may rewrite its own freshly-appended
         // region before returning — indices freeze once the caller can see
         // them. The union's set semantics need the sort-dedup.
-        let mut fresh: Vec<RawInline> = proposals[base..].to_vec();
+        //
+        // Read `live_values`, not the values alone: a variant is free to kill
+        // inside its own propose (an `and!` arm whose narrow side confirms as
+        // it goes), and `rewrite_region` republishes everything it is handed
+        // as live. Collecting through the `Deref` would carry those corpses
+        // back in — the buffer is kill-only, so a value that died here must
+        // stay dead.
+        let mut fresh: Vec<RawInline> = proposals.live_values(base).copied().collect();
         fresh.sort_unstable();
         fresh.dedup();
         proposals.rewrite_region(base, fresh);
