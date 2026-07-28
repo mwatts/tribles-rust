@@ -24,27 +24,23 @@ use crate::query::ProposalBuffer;
 /// probes in **index order** instead.
 ///
 /// A batched `propose`/`confirm` is N covering-index lookups for N
-/// parent bindings. Taken in frontier order those are N independent
-/// descents from the root of a PATCH — pointer chasing, one cache miss
-/// per level per probe, nothing shared between consecutive probes. The
-/// keys are byte arrays and the PATCH is ordered on exactly those bytes
-/// (a prefix passed to `has_prefix`/`infixes` is in *tree* order, so a
-/// lexicographic sort of the prefixes is the tree's own descent order),
-/// so sorting the batch's keys first turns N random descents into one
-/// ordered walk: consecutive probes share their upper path, which stays
-/// in cache, and the leaves are visited in address order the prefetcher
-/// can follow.
-///
-/// Sorting buys two further things that are not about locality at all:
+/// parent bindings, taken in whatever order the frontier happens to
+/// hold them. Ordering them by key buys two things:
 ///
 /// * **Duplicate keys collapse.** Several frontier rows routinely
 ///   project to the *same* key — a join whose parents fan in, or a
 ///   pattern with no bound position at all, where every row's key is
-///   empty. Sorted, they are adjacent, so the index is walked once and
-///   the result is fanned out to each row's segment.
-/// * **Duplicate candidates collapse.** That fan-out puts the same
-///   value under several rows of one key-run, and a sorted run presents
-///   them adjacently, so the confirming probe is memoised across them.
+///   empty and the loop re-enumerated the whole relation once per row.
+///   Sorted, those rows are adjacent, so the index is walked once and
+///   the result is fanned out to each row's own segment. This is the
+///   half that pays.
+/// * **Locality.** The keys are byte arrays and the PATCH is ordered on
+///   exactly those bytes (a prefix passed to `has_prefix`/`infixes` is
+///   in *tree* order, so a lexicographic sort of the prefixes is the
+///   tree's own descent order), so consecutive probes share their upper
+///   path. Measured, this half is worth little here — see
+///   [`SORTED_REGION_MIN`], which is the same idea applied where there
+///   is much more of it to do, and which is off.
 ///
 /// The two halves have different economics, so they have their own
 /// thresholds. Ordering the *rows* costs `O(rows log rows)` — bounded by
@@ -70,17 +66,27 @@ const SORTED_PROBE_MIN: usize = 2;
 /// than walking the region as it lies. See [`SORTED_PROBE_MIN`] for what
 /// the ordering buys.
 ///
-/// Off for this source, and measured. A PATCH prefix check is a handful
-/// of node hops whose upper levels stay hot whatever order the probes
-/// arrive in, so there is little locality left to buy and a comparison
-/// is not cheap against the probe it saves. Ordering the region costs
-/// 31-40% on the Harkonnen fixtures with regions big enough to sort
-/// (F9, F11, F14) and 3-9% on a 2.8M-trible synthetic set built to
-/// exceed cache — while the archive gains up to 20% on the same switch.
-/// The number therefore lives per source rather than per protocol.
+/// **Off, and measured off in both sources.** The idea is sound — the
+/// archive's domain and the PATCH's leaves are both laid out in value
+/// order, so probing a region in value order should sweep them — but as
+/// written it does not pay anywhere: within 3% on every archive query at
+/// 4M and at 8M tribles, and 33-46% *worse* on the Harkonnen fixtures
+/// whose regions are large enough to sort (F9, F11, F14).
 ///
-/// Note that the *row* ordering above is on: the two halves were
-/// measured separately precisely because they do not agree.
+/// The reason looks structural rather than incidental, which is why the
+/// switch is off rather than tuned: sorting a region means sorting an
+/// index permutation, and the comparator then gathers from `parents`
+/// and the values through those indices. Both arrays are region-sized,
+/// so at exactly the width where the ordering was supposed to earn its
+/// keep, the sort itself misses cache once or twice per comparison —
+/// and it does that `n log n` times to save `n` probes. A version worth
+/// re-measuring would sort *packed keys* (a `(group, value-prefix,
+/// index)` record) so the sort streams instead of gathering, or would
+/// leave the ordering to a tier that wants the region sorted anyway.
+///
+/// The row ordering above is a different trade and is on: it sorts at
+/// most `frontier width` entries and saves whole index walks rather
+/// than cache misses.
 const SORTED_REGION_MIN: usize = usize::MAX;
 
 /// Kills every entry named by `order` whose value fails `keep`, skipping

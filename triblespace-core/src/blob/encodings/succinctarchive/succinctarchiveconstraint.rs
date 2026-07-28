@@ -15,30 +15,24 @@ use crate::query::ProposalBuffer;
 /// probes in **index order** instead.
 ///
 /// A batched `propose`/`confirm` is N archive lookups for N parent
-/// bindings, and every one of them starts by translating a value into a
+/// bindings, and every one of them opens by translating a value into a
 /// domain code — [`Universe::search`], a binary search over the whole
-/// domain, followed by a `select1` on the axis bit vector. Taken in
-/// frontier order those are N independent binary searches: each walks
-/// the domain from its midpoint down, touching a different cache line at
-/// every step, and shares nothing with its neighbour. The archive is
-/// ordered on exactly the bytes being searched for, so sorting the
-/// batch's keys first turns those N searches into one ordered sweep —
-/// the upper levels of every search collapse onto the same few lines,
-/// the lower levels advance monotonically, and the `select1`s that
-/// follow run in increasing code order.
-///
-/// Sorting buys two further things that are not about locality at all:
+/// domain, then a `select1` on the axis bit vector. Ordering them by key
+/// buys two things:
 ///
 /// * **Duplicate keys collapse.** Several frontier rows routinely
 ///   project to the *same* key — a join whose parents fan in, or a
-///   pattern with no bound position, where every row's key is empty.
-///   Sorted, they are adjacent, so the archive is walked once and the
-///   result fanned out to each row's segment; and in `confirm` a single
+///   pattern with no bound position, where every row's key is empty and
+///   the loop re-walked the whole rotation once per row. Sorted, those
+///   rows are adjacent, so the archive is walked once and the result
+///   fanned out to each row's own segment; and in `confirm` one
 ///   `base_range` covers the whole group instead of one per parent.
-/// * **Duplicate candidates collapse.** That fan-out puts the same value
-///   under several rows of one key-run, and a sorted run presents them
-///   adjacently, so the `search` + range restriction is memoised across
-///   them.
+///   This is the half that pays, and it pays a lot.
+/// * **Locality.** The domain is sorted on exactly the bytes being
+///   searched for, so consecutive searches share their upper levels.
+///   Measured, this half is worth little — see [`SORTED_REGION_MIN`],
+///   which is the same idea applied where there is far more of it to do,
+///   and which is off.
 ///
 /// The two halves have different economics, so they have their own
 /// thresholds. Ordering the *rows* costs `O(rows log rows)` — bounded by
@@ -65,18 +59,28 @@ const SORTED_PROBE_MIN: usize = 2;
 /// than walking the region as it lies. See [`SORTED_PROBE_MIN`] for what
 /// the ordering buys.
 ///
-/// On for this source, and measured on the suite's archive arm over
-/// DBLP. An archive probe opens with a binary search over the whole
-/// domain — some twenty random reads before the wavelet ranks even
-/// start — so a comparison is cheap against it, and the deeper the
-/// domain the cheaper it gets relative to the probe. That shows up as a
-/// threshold effect rather than a constant: over a 2M-trible archive the
-/// ordering is a wash (within 0.4% on every query), over an 8M-trible
-/// one it is worth 20%, 14%, 12% and 6% on the arm's four non-empty
-/// queries. The PATCH-backed source runs the same switch and measures
-/// the opposite, so it keeps this off; the number lives per source for
-/// exactly that reason.
-const SORTED_REGION_MIN: usize = 2;
+/// **Off, and measured off in both sources.** The idea is sound — the
+/// archive's domain and the PATCH's leaves are both laid out in value
+/// order, so probing a region in value order should sweep them — but as
+/// written it does not pay anywhere: within 3% on every archive query at
+/// 4M and at 8M tribles, and 33-46% *worse* on the Harkonnen fixtures
+/// whose regions are large enough to sort (F9, F11, F14).
+///
+/// The reason looks structural rather than incidental, which is why the
+/// switch is off rather than tuned: sorting a region means sorting an
+/// index permutation, and the comparator then gathers from `parents`
+/// and the values through those indices. Both arrays are region-sized,
+/// so at exactly the width where the ordering was supposed to earn its
+/// keep, the sort itself misses cache once or twice per comparison —
+/// and it does that `n log n` times to save `n` probes. A version worth
+/// re-measuring would sort *packed keys* (a `(group, value-prefix,
+/// index)` record) so the sort streams instead of gathering, or would
+/// leave the ordering to a tier that wants the region sorted anyway.
+///
+/// The row ordering above is a different trade and is on: it sorts at
+/// most `frontier width` entries and saves whole index walks rather
+/// than cache misses.
+const SORTED_REGION_MIN: usize = usize::MAX;
 
 /// Kills every entry named by `order` whose value fails `keep`, skipping
 /// entries that are already dead — [`Candidates::retain`] over a
