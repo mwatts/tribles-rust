@@ -33,6 +33,12 @@ frontier = []
 # ceiling question only against one that can answer it. Refines
 # `frontier`; never enable it alone.
 frontier-widest = []
+# The W=1 control arm: pins every translated query to
+# `with_frontier_width(1)`, reducing the SAME engine to expanding one
+# binding at a time. Not a capability probe — a deliberate ablation, so
+# bench.sh never enables it; build the control arm by hand. See the note
+# at `queries::run` for what the resulting gap does and does not measure.
+frontier-w1 = ["frontier"]
 # F10 straddles `triblespace-gpu`'s `DEFAULT_MIN_CONFIRM_BATCH` and READS
 # the constant out of the subject rather than copying it, so the fixture
 # can only compile against a subject that ships the gpu crate (the

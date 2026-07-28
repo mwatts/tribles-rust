@@ -532,6 +532,30 @@ fn run_arch_queries(
                             "      depth {depth:<2}{:>26}{:>12}{:>11}{:>10}{:>10}{width}",
                             d.confirms, d.max, d.p95, d.median, d.ge_threshold
                         );
+                        // The depth resolution is the whole claim ("wide
+                        // regions at EVERY level", not one big root), so
+                        // it belongs on the session axis in the pile and
+                        // not only in this run's stdout.
+                        for (suffix, value) in [
+                            ("confirms", d.confirms),
+                            ("max", d.max),
+                            ("p95", d.p95),
+                            ("median", d.median),
+                            ("ge_threshold", d.ge_threshold),
+                            ("live_total", d.live_total),
+                        ] {
+                            led.outcome(
+                                &format!("arch_regions/{}/depth{depth}/{suffix}", q.name),
+                                "signal",
+                                Some(value),
+                            );
+                        }
+                        #[cfg(feature = "frontier")]
+                        led.outcome(
+                            &format!("arch_regions/{}/depth{depth}/width", q.name),
+                            "signal",
+                            Some(widths.get(&depth).copied().unwrap_or(0)),
+                        );
                     }
                     // The engine's own view of the same quantity.
                     #[cfg(feature = "frontier")]

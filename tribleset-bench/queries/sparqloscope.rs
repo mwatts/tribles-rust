@@ -336,6 +336,18 @@ where
     C: Constraint<'a> + 'a,
     P: Fn(&Binding) -> Option<R>,
 {
+    // The W=1 control: the SAME engine, restricted to expanding one
+    // binding at a time. It is the only way to ask what the batch width
+    // bought without changing the code under it — but read the answer
+    // carefully. Index-order probing has nothing to sort when the batch
+    // holds one row and no duplicate keys to collapse, and a
+    // device-resolved parent band is resolving a single band. At W=1
+    // those two are not switched off; there is simply nothing for them
+    // to do. So `integrated - w1` is the gap between a batched engine
+    // and a single-binding one — three changes that only make sense
+    // together — and NOT a measurement of width as a tunable.
+    #[cfg(feature = "frontier-w1")]
+    let q = q.with_frontier_width(1);
     #[cfg(feature = "frontier")]
     crate::archq::note_frontier_stats(q.stats());
     match current_engine() {
