@@ -694,7 +694,6 @@ proptest! {
         let eq = EqualityConstraint::new(0, 1);
 
         // Neither bound — optimistically true
-        let frontier = Frontier::default();
         prop_assert!(eq.satisfied(&Binding::default()));
 
         // One bound — optimistically true
@@ -987,4 +986,140 @@ fn frontier_stats_report_an_unfragmented_batch() {
     assert_eq!(stats.rows(), 1 + 8);
     assert_eq!(stats.variable_groups(), 2);
     assert_eq!(stats.mean_variable_groups(), 1.0);
+}
+
+/// A source whose estimate for its own variable depends on the *value*
+/// bound to variable 0 — so the rows of one frontier disagree about which
+/// variable to bind next, and the batch has to fragment.
+struct Skewed {
+    variable: usize,
+    values: Vec<[u8; 32]>,
+    /// The low-byte parity of variable 0's value that makes this source
+    /// look cheap.
+    cheap_parity: u8,
+}
+
+impl<'a> Constraint<'a> for Skewed {
+    fn variables(&self) -> triblespace_core::query::VariableSet {
+        let mut set = triblespace_core::query::VariableSet::new_empty();
+        set.set(self.variable);
+        set
+    }
+
+    fn estimate(&self, variable: usize, binding: &Binding) -> Option<usize> {
+        if variable != self.variable {
+            return None;
+        }
+        Some(match binding.get(0) {
+            Some(anchor) if anchor[31] % 2 == self.cheap_parity => 1,
+            // Expensive both when the anchor has the wrong parity and
+            // before it is bound at all, so the root binds variable 0
+            // first and the disagreement appears one level down.
+            _ => 4096,
+        })
+    }
+
+    /// Binding variable 0 is what moves this source's estimate, and the
+    /// engine only refreshes what `influence` names.
+    fn influence(&self, variable: usize) -> triblespace_core::query::VariableSet {
+        if variable == 0 {
+            let mut set = triblespace_core::query::VariableSet::new_empty();
+            set.set(self.variable);
+            set
+        } else {
+            let mut set = self.variables();
+            set.unset(variable);
+            set
+        }
+    }
+
+    fn propose(
+        &self,
+        variable: usize,
+        frontier: &triblespace_core::query::Frontier<'_>,
+        proposals: &mut ProposalBuffer,
+    ) {
+        if variable != self.variable {
+            return;
+        }
+        for row in 0..frontier.len() {
+            proposals.open(row as u32);
+            proposals.extend_from_slice(&self.values);
+        }
+    }
+
+    fn confirm(
+        &self,
+        variable: usize,
+        _frontier: &triblespace_core::query::Frontier<'_>,
+        cands: &mut Candidates<'_>,
+    ) {
+        if variable == self.variable {
+            cands.retain(|v| self.values.binary_search(v).is_ok());
+        }
+    }
+}
+
+fn value(tag: u8, i: u32) -> [u8; 32] {
+    let mut v = [0u8; 32];
+    v[0] = tag;
+    v[27..31].copy_from_slice(&i.to_be_bytes());
+    v[31] = i as u8;
+    v
+}
+
+fn skewed_rows(width: usize) -> (Vec<([u8; 32], [u8; 32], [u8; 32])>, (u64, u64)) {
+    // Four anchors, alternating parity, so the frontier at depth 1 splits
+    // evenly between "bind ?b next" and "bind ?c next".
+    let anchors: Vec<[u8; 32]> = (0..4u32).map(|i| value(0xA0, i)).collect();
+    let bs: Vec<[u8; 32]> = (0..3u32).map(|i| value(0xB0, i)).collect();
+    let cs: Vec<[u8; 32]> = (0..3u32).map(|i| value(0xC0, i)).collect();
+
+    let root = WidthObserver {
+        variable: 0,
+        values: anchors,
+        widths: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+    let query = triblespace_core::query::Query::new(
+        triblespace_core::query::intersectionconstraint::IntersectionConstraint::new(vec![
+            Box::new(root) as Box<dyn Constraint + Send + Sync>,
+            Box::new(Skewed {
+                variable: 1,
+                values: bs,
+                cheap_parity: 0,
+            }),
+            Box::new(Skewed {
+                variable: 2,
+                values: cs,
+                cheap_parity: 1,
+            }),
+        ]),
+        |binding: &Binding| Some((*binding.get(0)?, *binding.get(1)?, *binding.get(2)?)),
+    )
+    .with_frontier_width(width);
+    let stats = query.stats();
+    let mut rows: Vec<_> = query.collect();
+    rows.sort_unstable();
+    (rows, (stats.expansions(), stats.variable_groups()))
+}
+
+#[test]
+fn a_fragmented_frontier_keeps_every_row() {
+    let (narrow, narrow_stats) = skewed_rows(1);
+    let (wide, wide_stats) = skewed_rows(4096);
+
+    // 4 anchors x 3 x 3.
+    assert_eq!(narrow.len(), 36);
+    assert_eq!(narrow, wide, "batch width must not change the bag");
+
+    // A frontier of one can never fragment: one row, one group.
+    assert_eq!(narrow_stats.0, narrow_stats.1);
+    // The wide run really did hit the split path — the depth-1 frontier of
+    // four rows disagreed, so it cost more groups than expansions.
+    assert!(
+        wide_stats.1 > wide_stats.0,
+        "expected a fragmented expansion, saw {} groups over {} expansions",
+        wide_stats.1,
+        wide_stats.0
+    );
 }

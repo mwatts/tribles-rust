@@ -1763,7 +1763,6 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
                     groups.push((variable, offset));
                 }
             }
-            order.clear();
             order.resize(rows, 0);
             for (row, &variable) in self.choice.iter().enumerate() {
                 order[starts[variable as usize]] = row as u32;

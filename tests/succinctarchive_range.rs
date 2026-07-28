@@ -140,7 +140,6 @@ fn estimate_is_universe_code_range_upper_bound() {
         "estimate must upper-bound actual V-codes-in-range; got {estimate}, need >= 3"
     );
     // Verify propose enumerates exactly the 3 distinct V values.
-    use triblespace::core::query::Binding;
     let mut proposals = ProposalBuffer::new();
     constraint.propose(v.index, &Frontier::default(), &mut proposals);
     assert_eq!(

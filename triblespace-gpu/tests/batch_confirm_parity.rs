@@ -15,7 +15,7 @@ use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::inline::RawInline;
 use triblespace_core::query::{
-    Binding, BindingStore, Constraint, Frontier, ProposalBuffer, Variable, VariableContext, VariableId,
+    BindingStore, Constraint, Frontier, ProposalBuffer, Variable, VariableContext, VariableId,
 };
 use triblespace_core::trible::{Trible, TribleSet};
 use triblespace_gpu::WgpuSuccinctArchive;
