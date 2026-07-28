@@ -46,18 +46,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `FrontierStats` reports how often that fragmented. Bag semantics and
   worst-case optimality are unchanged; the cost is frontier memory,
   `O(width × variables × depth)`.
-- **The frontier width is a ceiling reached by a ramp, not a flat first
-  batch.** A level's first chunk is `INITIAL_FRONTIER_WIDTH` = 1 binding and
-  grows by `FRONTIER_RAMP` = 2 up to the query's width, so a query the caller
-  stops after one row — `exists!`, `.next()`, `.take(n)` — does exactly the
-  work the pre-batching engine did instead of materialising a 16384-wide root
-  frontier it will throw away. A full drain still reaches the ceiling after
-  `log2(width)` chunks, which costs a logarithmic number of extra propose
-  calls and no extra per-candidate work. This is the same insight as the
+- **The frontier width is a ceiling, and a level's first chunk is one
+  binding.** `INITIAL_FRONTIER_WIDTH` = 1; every chunk after it is the query's
+  full width. A query the caller stops after one row — `exists!`, `.next()` —
+  now does exactly the work the pre-batching engine did instead of
+  materialising a 16384-wide root frontier it will throw away; measured on a
+  first-row-only join, the flat engine was **8.8x** slower than pre-batching
+  and one narrow chunk closes the whole gap. This is the same insight as the
   `INITIAL_CHUNK`/`WIDEN_FACTOR` pair removed with the widening path, and as
   the residual engine's rule that search width grows geometrically after
   negative work — recovered at the frontier, which is the layer that can
   actually carry it, rather than at per-parent chunking, which could not.
+  A geometric 1, 2, 4, … ramp was measured and rejected: its last chunk holds
+  only half a level's candidates, so it took a fixture's widest frontier from
+  2048 rows to 512 and its mean from 768 to 31 while raising expansions from 3
+  to 74, for the same rows and proposals — a quarter of the peak width, and
+  10% slower on a full drain.
 - **A 1:1 descent reuses the parent frontier's matrices instead of copying
   them.** When a level's draw yields exactly one surviving child per parent
   row, in order, over the whole frontier, with nothing left pending, no row
@@ -72,7 +76,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when it does not. `FrontierStats::inplace_descents`/`copied_descents`
   report the split. This is what a chain-shaped query (fan-out 1 at every
   level, where batching can never pay because there are no sibling parents)
-  stops being charged for.
+  stops being charged for. The fast path is gated on `proposed == rows`, an
+  `O(1)` test from what the engine already knows, so a fan-out descent never
+  pays for a path it cannot take: recognising a 1:1 draw needs the child rows
+  deferred until its shape is known, and charging that second pass to every
+  descent measured +10% and +20% on two fixtures.
+- **`FrontierStats::widest` reports the widest frontier a search reached.**
+  `mean_width` says what the typical expansion looked like; it cannot say
+  whether the ceiling was ever approached, and without that a benchmark
+  cannot distinguish "the engine does not scale with depth" from "the fixture
+  never filled a batch".
 - **Breaking: `propose_chunk`, `ProposeCursor` and the widening path are
   removed.** No leaf source ever overrode them, they addressed a
   time-to-first-result problem that pure conjunctive queries do not have

@@ -133,18 +133,32 @@ whole frontier at a time:
 5. When a level runs out of live candidates, retire it and continue with the
    next group, then with the next chunk one level up.
 
-### The width is a ceiling, reached by a ramp
+### The width is a ceiling, and the first chunk is one row
 
 `DEFAULT_FRONTIER_WIDTH` is how wide a chunk may *get*, not how wide the first
-one is. A level's first chunk is `INITIAL_FRONTIER_WIDTH` = 1 binding and
-doubles (`FRONTIER_RAMP`) until it hits the ceiling.
+one is. A level's first chunk is `INITIAL_FRONTIER_WIDTH` = 1 binding; every
+chunk after it is the full width.
 
 That is what keeps time-to-first-result honest. A caller who stops after one
-row — `exists!`, `.next()`, `.take(n)` — must not pay to build a 16 384-wide
-frontier it will never look at, and with a first chunk of one it does exactly
-the work the single-binding engine did. A full drain reaches the ceiling after
-`log2(width)` chunks, so the ramp costs a logarithmic number of extra propose
-calls near the top of the tree and no extra per-candidate work anywhere.
+row — `exists!`, `.next()` — must not pay to build a 16 384-wide frontier it
+will never look at, and with a first chunk of one it does exactly the work the
+single-binding engine did. Measured on a first-row-only join, a flat
+full-width engine is 8.8x slower than the pre-batching engine; one narrow
+chunk closes the entire gap.
+
+The obvious schedule is geometric — 1, 2, 4, … up to the ceiling — and it was
+measured and rejected. Doubling reaches the ceiling in `log2(width)` chunks,
+but the last chunk of a geometric drain holds only about half the candidates,
+so a level never builds a frontier wider than half of what a flat schedule
+would, and every level pays `log2(width)` expansions instead of one. On a
+fan-out join that took a fixture's widest frontier from 2048 rows to 512, its
+mean frontier from 768 to 31, and its expansions from 3 to 74 — for the same
+rows and the same proposals. A quarter of the peak width is a direct attack on
+the reason batching exists, and it cost 10% on a full drain to buy it. One
+step gives the same first-row latency (the first chunk is one binding either
+way) and keeps the peak. The price is `take(2..width)`, which now pays a full
+batch — the deliberate trade, since `exists!` and `next()` are the
+short-circuit shapes that actually occur.
 
 ### A 1:1 descent copies nothing
 
@@ -168,6 +182,15 @@ Ownership needs no separate flag. The matrices already sit behind `Arc` so a
 rayon split copies refcounts, and `Arc::get_mut` therefore succeeds exactly
 when no split or steal holds the other half; when it says no, the copying path
 runs. `FrontierStats` counts both paths.
+
+The fast path is gated so that it costs nothing when it cannot fire.
+Recognising a 1:1 draw means deferring the child rows until the draw's shape
+is known, and that deferral is a second pass — measured at +10% and +20% on
+two fixtures when charged to every descent. So the engine asks first, from
+what it already knows: a level holding `proposed` candidates for `rows`
+parents can only yield one child per parent if `proposed == rows`. Every
+fan-out level fails that `O(1)` test and runs the fused single-pass build
+exactly as before.
 
 This matters most for the shape batching can never help: a chain with fan-out
 one at every level has no sibling parents to widen the frontier with, so it

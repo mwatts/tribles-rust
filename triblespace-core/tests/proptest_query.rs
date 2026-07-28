@@ -933,9 +933,9 @@ proptest! {
 #[test]
 fn deep_levels_see_a_wide_frontier() {
     // Two levels of 40 values each: at width 1 the inner level is proposed
-    // over one binding 40 times; batched, the root level ramps its chunks
-    // 1, 2, 4, 8, 16 up toward the ceiling, so the inner level is proposed
-    // over an ever-wider batch until the root's 40 candidates run out.
+    // over one binding 40 times; batched, the root hands down one narrow
+    // chunk (so a caller who stops at the first row pays nothing extra)
+    // and then everything that is left in one wide batch.
     let values: Vec<[u8; 32]> = (0..40u32)
         .map(|i| {
             let mut v = [0u8; 32];
@@ -951,11 +951,12 @@ fn deep_levels_see_a_wide_frontier() {
     let widths = widths.lock().unwrap();
     assert_eq!(
         widths.as_slice(),
-        &[1, 1, 2, 4, 8, 16, 9],
-        "root, then the ramp: 1, 2, 4, 8, 16, and the 9 candidates left over"
+        &[1, 1, 39],
+        "root, then one narrow chunk, then the remaining 39 in one batch"
     );
-    // The ramp is a schedule, not a cap — every root candidate is still
-    // expanded exactly once.
+    // The schedule is a schedule, not a cap — every root candidate is
+    // still expanded exactly once, and the widest batch is within one row
+    // of what a flat full-width engine would have built.
     assert_eq!(widths[1..].iter().sum::<usize>(), 40);
 }
 
@@ -1039,15 +1040,16 @@ fn frontier_stats_report_an_unfragmented_batch() {
     let rows: Vec<_> = query.collect();
 
     assert_eq!(rows.len(), 64);
-    // Root expansion (1 row), then the root's 8 candidates handed down in
-    // ramped chunks of 1, 2, 4, 1 — four more expansions. Every row is
-    // still expanded exactly once; the ramp only changes how many batches
-    // that takes.
-    assert_eq!(stats.expansions(), 5);
+    // Root expansion (1 row), then the root's 8 candidates handed down as
+    // one narrow chunk and one batch of 7. Every row is still expanded
+    // exactly once; the schedule only changes how many batches that takes,
+    // and it costs exactly one extra expansion per level.
+    assert_eq!(stats.expansions(), 3);
     assert_eq!(stats.rows(), 1 + 8);
+    assert_eq!(stats.widest(), 7);
     // Every expansion agreed on the variable to bind, so no batch ever
     // fragmented.
-    assert_eq!(stats.variable_groups(), 5);
+    assert_eq!(stats.variable_groups(), 3);
     assert_eq!(stats.mean_variable_groups(), 1.0);
 }
 
@@ -1206,6 +1208,48 @@ fn a_branching_descent_still_copies() {
     assert!(
         stats.copied_descents() > 0,
         "a fan-out of 8 cannot descend in place"
+    );
+    assert_eq!(
+        stats.inplace_descents(),
+        0,
+        "and must never take the in-place path"
+    );
+}
+
+#[test]
+fn the_short_circuiting_query_still_sees_the_full_width_afterwards() {
+    // The narrow first chunk is a latency guard, not a width cap: once the
+    // caller keeps pulling, the level must hand down the ceiling. This is
+    // what a geometric ramp gets wrong — it would need log2(width) chunks
+    // to get here and would top out at half the width.
+    let values: Vec<[u8; 32]> = (0..512u32).map(Chain::node).collect();
+    let widths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let outer = WidthObserver {
+        variable: 0,
+        values: values.clone(),
+        widths: std::sync::Arc::clone(&widths),
+    };
+    let inner = WidthObserver {
+        variable: 1,
+        values: values.clone(),
+        widths: std::sync::Arc::clone(&widths),
+    };
+    let query = triblespace_core::query::Query::new(
+        triblespace_core::query::intersectionconstraint::IntersectionConstraint::new(vec![
+            Box::new(outer) as Box<dyn Constraint + Send + Sync>,
+            Box::new(inner),
+        ]),
+        |binding: &Binding| Some((*binding.get(0)?, *binding.get(1)?)),
+    );
+    let stats = query.stats();
+    assert_eq!(query.count(), 512 * 512);
+
+    // Root, the one-row chunk, then the other 511 in a single batch.
+    assert_eq!(widths.lock().unwrap().as_slice(), &[1, 1, 511]);
+    assert_eq!(
+        stats.widest(),
+        511,
+        "the batch must reach the ceiling the fixture allows, not half of it"
     );
 }
 

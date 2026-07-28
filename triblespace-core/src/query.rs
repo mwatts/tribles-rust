@@ -643,14 +643,57 @@ impl BindingStore {
     }
 
     /// Consumes up to `width` further live candidates from `variable`'s
-    /// level, recording each drawn entry's index in `drawn_out` and the
-    /// frontier row it was proposed for in `parents_out`.
+    /// level and writes the child frontier's rows into `out`, recording
+    /// each child row's parent row number in `parents_out`.
     ///
     /// Each consumed candidate `i` carries the parent tag its proposer
-    /// wrote, which `parent_select` lifts back into parent-block row
-    /// numbers. Drawing is separated from *materialising* the child rows
-    /// so the engine can look at the shape of the draw first — a 1:1 draw
-    /// needs no new rows at all, see [`Query::next_chunk`].
+    /// wrote; the child row is that parent's index row with `variable`'s
+    /// slot pointed at `i`. Returns how many rows were produced (zero
+    /// means the level is spent).
+    ///
+    /// This is the fused path: one pass, no intermediate. A descent that
+    /// might be 1:1 uses [`draw`](BindingStore::draw) instead, which defers
+    /// the write until the shape of the draw is known.
+    pub(crate) fn take_chunk(
+        &mut self,
+        variable: VariableId,
+        width: usize,
+        parent_block: &[u32],
+        parent_select: &[u32],
+        stride: usize,
+        out: &mut Vec<u32>,
+        parents_out: &mut Vec<u32>,
+    ) -> usize {
+        out.clear();
+        parents_out.clear();
+        let level = &mut self.levels[variable];
+        let mut rows = 0;
+        while rows < width {
+            let Some(i) = level.buffer.next_live(level.pos) else {
+                break;
+            };
+            level.pos = i + 1;
+            let parent = parent_select[level.buffer.parent_of(i) as usize] as usize;
+            out.extend_from_slice(&parent_block[parent * stride..(parent + 1) * stride]);
+            let base = out.len() - stride;
+            out[base + variable] = i as u32;
+            parents_out.push(parent as u32);
+            rows += 1;
+        }
+        self.bound.set_value(variable, rows != 0);
+        rows
+    }
+
+    /// Consumes up to `width` further live candidates from `variable`'s
+    /// level *without* materialising any child row: each drawn entry's
+    /// index lands in `drawn_out` and the frontier row it was proposed for
+    /// in `parents_out`.
+    ///
+    /// Deferring the write is what lets the engine look at the shape of a
+    /// draw before paying for it — a 1:1 draw needs no new rows at all,
+    /// see [`Query::next_chunk`]. It is not free (two passes instead of
+    /// one), which is exactly why the caller only takes this path when a
+    /// 1:1 draw is *possible*.
     pub(crate) fn draw(
         &mut self,
         variable: VariableId,
@@ -1412,8 +1455,8 @@ impl Default for LevelValues {
 /// rows, so the batched tier is reachable at *every* depth rather than only
 /// at a wide root.
 ///
-/// It is a *ceiling*, not the first batch: a level starts at
-/// [`INITIAL_FRONTIER_WIDTH`] and ramps by [`FRONTIER_RAMP`] toward it.
+/// It is a *ceiling*, not the first batch: a level's first chunk is
+/// [`INITIAL_FRONTIER_WIDTH`] and every chunk after it is this wide.
 ///
 /// The cost is frontier memory: one index row plus one estimate row per
 /// live row per depth, i.e. `O(width · variables · depth)` — the price of
@@ -1425,27 +1468,47 @@ impl Default for LevelValues {
 /// Tune per query with [`Query::with_frontier_width`].
 pub const DEFAULT_FRONTIER_WIDTH: usize = 16384;
 
-/// Width of the *first* chunk a level draws; chunks then grow by
-/// [`FRONTIER_RAMP`] up to the query's frontier width.
+/// Width of the *first* chunk a level draws. Every chunk after it is
+/// [`DEFAULT_FRONTIER_WIDTH`] (or whatever
+/// [`Query::with_frontier_width`] set).
 ///
 /// Starting at one keeps time-to-first-result identical to plain
 /// depth-first search. A query the caller stops after one row — `exists!`,
-/// `.next()`, `.take(n)` — must not pay to materialise a full-width
-/// frontier it will throw away, and with a first chunk of one it does
-/// exactly the work the pre-batching engine did. A full drain still
-/// reaches the ceiling after `log2(width)` chunks, so the ramp costs a
-/// logarithmic number of extra propose calls at the top of the tree and no
-/// extra per-candidate work at all.
+/// `.next()` — must not pay to materialise a full-width frontier it will
+/// throw away, and with a first chunk of one it does exactly the work the
+/// pre-batching engine did. Measured on a first-row-only join, a flat
+/// full-width engine is **8.8x** slower than the pre-batching engine;
+/// one narrow chunk closes the whole gap.
 ///
 /// This is the same insight as the `INITIAL_CHUNK`/`WIDEN_FACTOR` pair this
 /// branch deleted, and as the deleted residual engine's rule that search
 /// width grows geometrically after negative work — recovered at the right
 /// layer (the frontier) instead of the wrong one (per-parent chunking).
+///
+/// # Why one step and not a geometric ramp
+///
+/// The obvious schedule is geometric — 1, 2, 4, … up to the ceiling — and
+/// it was measured and rejected. Doubling reaches the ceiling in
+/// `log2(width)` chunks, but the *last* chunk of a geometric drain is only
+/// about half the candidates, so a level never produces a frontier wider
+/// than half of what a flat schedule would, and every level pays
+/// `log2(width)` expansions instead of one. On a fan-out join that took a
+/// fixture's widest frontier from 2048 rows down to 512, its mean frontier
+/// from 768 rows down to 31, and its expansions from 3 up to 74 — for the
+/// same total rows and the same total proposals. A quarter of the peak
+/// width and a twenty-fifth of the mean is a direct attack on the reason
+/// batching exists, and it cost 10% on a full drain to buy it.
+///
+/// Stepping straight to the ceiling after one narrow chunk gives the same
+/// time-to-first-result — the first chunk is what a one-row caller pays,
+/// and it is one binding either way — while keeping the peak frontier
+/// (measured 2039 against the flat schedule's 2048) and adding one extra
+/// expansion per level rather than fourteen. The price is a caller who
+/// wants a handful of rows but not all of them: `take(2)` now pays a
+/// full-width batch where a geometric ramp would have paid two rows. That
+/// is the deliberate trade — `exists!` and `next()` are the short-circuit
+/// shapes that actually occur, and they are exactly protected.
 pub const INITIAL_FRONTIER_WIDTH: usize = 1;
-
-/// Growth factor of the frontier-width ramp. See
-/// [`INITIAL_FRONTIER_WIDTH`].
-pub const FRONTIER_RAMP: usize = 2;
 
 /// A query is an iterator over the results of a query.
 /// It takes a constraint and a post-processing function as input,
@@ -1487,17 +1550,22 @@ pub struct Query<C, P: Fn(&Binding<'_>) -> Option<R>, R> {
     stats: Arc<FrontierStats>,
 }
 
-/// One pushed search level: the variable it binds and how wide its *next*
-/// chunk may be.
+/// One pushed search level: the variable it binds, how wide its *next*
+/// chunk may be, and how many candidates its proposer produced.
 ///
-/// The width is per level rather than per query because the ramp is a
+/// The width is per level rather than per query because the schedule is a
 /// statement about one level's drain: the first chunk a level hands down is
 /// a single row, so a caller who stops after one result never pays for a
 /// batch it will not look at. See [`INITIAL_FRONTIER_WIDTH`].
+///
+/// `proposed` is the `O(1)` gate on the in-place descent: a level with more
+/// candidates than parent rows cannot possibly yield one child per parent,
+/// so the engine never pays to check. See [`Query::next_chunk`].
 #[derive(Clone, Copy, Debug)]
 struct Level {
     variable: VariableId,
     width: usize,
+    proposed: usize,
 }
 
 /// One frontier: the index matrix of the rows sitting at one point of the
@@ -1877,10 +1945,6 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         let variable = depth.groups[group].0;
         self.depths[self.depth].group += 1;
 
-        self.stack.push(Level {
-            variable,
-            width: INITIAL_FRONTIER_WIDTH.min(self.width),
-        });
         self.unbound.unset(variable);
 
         let constraint = &self.constraint;
@@ -1894,6 +1958,11 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             self.slots,
             |frontier, proposals| constraint.propose(variable, frontier, proposals),
         );
+        self.stack.push(Level {
+            variable,
+            width: INITIAL_FRONTIER_WIDTH.min(self.width),
+            proposed,
+        });
         self.stats
             .proposals
             .fetch_add(proposed as u64, Ordering::Relaxed);
@@ -1932,6 +2001,16 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
     /// [`Arc::get_mut`] therefore succeeds exactly when no split or steal
     /// is holding the other half. Let the `Arc` be the guard; when it says
     /// no, take the copying path.
+    ///
+    /// **The fast path is gated so it costs nothing when it cannot fire.**
+    /// Recognising a 1:1 draw means deferring the child rows until the
+    /// draw's shape is known, and that deferral is a second pass — measured
+    /// at +10% on F10 and +20% on F6 when charged to every descent. So the
+    /// engine asks first, from what it already knows: a level holding
+    /// `proposed` candidates for `rows` parents can only yield one child
+    /// per parent if `proposed == rows`. Fan-out levels fail that `O(1)`
+    /// test and run the fused [`take_chunk`](BindingStore::take_chunk)
+    /// exactly as before.
     fn next_chunk(&mut self) {
         let level = *self.stack.last().expect("a level to chunk");
         let variable = level.variable;
@@ -1944,20 +2023,42 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             self.depths.push(Depth::default());
         }
 
-        self.bindings.draw(
-            variable,
-            level.width,
-            &self.depths[parent].order[range],
-            &mut self.drawn,
-            &mut self.parents,
-        );
-        // Widen the next chunk this level hands down. Growth is per level,
-        // so a query stopped after one row never widens at all.
+        // Could this draw possibly be 1:1? One child per parent needs
+        // exactly as many candidates as there are parent rows, and a chunk
+        // wide enough to take them all. Both are known before drawing, and
+        // both are `O(1)`.
+        let source_rows = self.depths[parent].rows;
+        let speculate = level.proposed == source_rows
+            && level.width >= source_rows
+            && self.depths[parent].group >= self.depths[parent].groups.len();
+
+        let rows = if speculate {
+            self.bindings.draw(
+                variable,
+                level.width,
+                &self.depths[parent].order[range],
+                &mut self.drawn,
+                &mut self.parents,
+            );
+            self.drawn.len()
+        } else {
+            let (head, tail) = self.depths.split_at_mut(parent + 1);
+            self.bindings.take_chunk(
+                variable,
+                level.width,
+                &head[parent].block,
+                &head[parent].order[range],
+                slots,
+                Arc::make_mut(&mut tail[0].block),
+                &mut self.parents,
+            )
+        };
+        // Widen the next chunk this level hands down: one narrow chunk to
+        // protect the caller who wants a single row, then the ceiling.
         if let Some(top) = self.stack.last_mut() {
-            top.width = top.width.saturating_mul(FRONTIER_RAMP).min(self.width);
+            top.width = self.width;
         }
 
-        let rows = self.drawn.len();
         if rows == 0 {
             self.stack.pop();
             self.bindings.unset(variable);
@@ -1966,17 +2067,12 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             return;
         }
 
-        // 1:1 and terminal: every parent row produced exactly one child, in
-        // order, and neither this level nor this frontier has anything left
-        // to hand down.
-        //
-        // Ordered cheapest-first on purpose. The two `O(1)` tests reject
-        // every fan-out descent — the overwhelming majority — before
-        // anything walks the batch, so a wide frontier never pays for a
-        // fast path it cannot take. `spent` is last because it scans the
-        // level's remaining liveness words.
-        let reusable = rows == self.depths[parent].rows
-            && self.depths[parent].group >= self.depths[parent].groups.len()
+        // The speculation paid off when every parent really did produce
+        // exactly one child, in order, and nothing is left pending.
+        // `spent` is last because it scans the level's remaining liveness
+        // words.
+        let reusable = speculate
+            && rows == source_rows
             && self
                 .parents
                 .iter()
@@ -2004,14 +2100,20 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             }
             self.stats.inplace_descents.fetch_add(1, Ordering::Relaxed);
         } else {
-            let block = Arc::make_mut(&mut child.block);
-            block.clear();
-            block.reserve(rows * slots);
-            for (&entry, &parent_row) in self.drawn.iter().zip(self.parents.iter()) {
-                let parent_row = parent_row as usize;
-                block.extend_from_slice(&source.block[parent_row * slots..(parent_row + 1) * slots]);
-                let base = block.len() - slots;
-                block[base + variable] = entry;
+            if speculate {
+                // Speculated and lost: the rows still have to be written,
+                // just from the deferred draw rather than fused with it.
+                let block = Arc::make_mut(&mut child.block);
+                block.clear();
+                block.reserve(rows * slots);
+                for (&entry, &parent_row) in self.drawn.iter().zip(self.parents.iter()) {
+                    let parent_row = parent_row as usize;
+                    block.extend_from_slice(
+                        &source.block[parent_row * slots..(parent_row + 1) * slots],
+                    );
+                    let base = block.len() - slots;
+                    block[base + variable] = entry;
+                }
             }
             // Inherit each child row's estimates from its parent; the
             // refresh below then updates exactly the ones binding
