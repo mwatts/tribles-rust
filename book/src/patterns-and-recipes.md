@@ -84,21 +84,14 @@ find!(grandparent: Id,
 
 Unbounded traversal — *all* ancestors, *all* descendants — is handled by the
 standalone `triblespace-paths` closure index rather than by query-time
-recursion. Build an epsilon-free automaton for one-or-more `parent` edges,
-materialize it once, and use its endpoint relation as an ordinary constraint:
+recursion. Describe one-or-more `parent` edges with `PathExpr`, compile the
+expression, materialize it once, and use its endpoint relation as an ordinary
+constraint:
 
 ```rust,ignore
 let parent = tree::parent.id().into();
-let parent_plus = Automaton::new(
-    2,
-    [0],
-    [1],
-    [
-        Transition::new(0, 1, Step::Forward(parent)),
-        Transition::new(1, 1, Step::Forward(parent)),
-    ],
-)?;
-let ancestors = PathIndex::from_tribles(parent_plus, catalog.iter())?;
+let parent_plus = PathExpr::from(Step::Forward(parent)).plus();
+let ancestors = PathIndex::from_tribles(parent_plus.compile(), catalog.iter())?;
 let node: Inline<GenId> = node_id.to_inline();
 
 for ancestor in find!(

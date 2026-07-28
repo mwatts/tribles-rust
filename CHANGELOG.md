@@ -27,11 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   metadata, source commit head, and manifest together so stale coverage fails
   closed; full cover audits remain explicit repair/verification operations.
 - **The book now teaches the stable standalone regular-path index.** A dedicated
-  chapter covers explicit epsilon-free automata, direct `PathIndex` joins,
-  `PathRollup` repository maintenance, cross-range closure, nullable universes,
-  freshness versus full cover audits, and the potentially quadratic endpoint
-  relation. Interim status guidance and its resolved documentation backlog
-  entry are removed.
+  chapter leads with canonical `PathExpr` construction and Glushkov lowering,
+  retains explicit epsilon-free automata as the low-level escape hatch, and
+  covers direct `PathIndex` joins, `PathRollup` repository maintenance,
+  cross-range closure, nullable universes, freshness versus full cover audits,
+  and the potentially quadratic endpoint relation. Interim status guidance and
+  its resolved documentation backlog entry are removed.
 
 ### Changed
 

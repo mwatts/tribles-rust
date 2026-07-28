@@ -525,12 +525,14 @@ and its evaluator have been removed: query-time traversal needs per-activation
 state, which the stateless constraint protocol has no place for, and keeping it
 inside the protocol meant every constraint paid for machinery only paths used.
 
-The stable replacement is the standalone `triblespace-paths` crate. It compiles
-graph edges and a fixed epsilon-free automaton into a materialized accepted
+The stable replacement is the standalone `triblespace-paths` crate. Its
+`PathExpr` builder describes sequence, alternatives, repetition, optionality,
+and inverse steps, then compiles them to a fixed epsilon-free automaton. The
+crate combines that automaton with graph edges to materialize an accepted
 endpoint relation, exposed through an ordinary two-variable constraint. That
 constraint composes directly with `find!`, `and!`, and `pattern!`; see
-[Regular Path Indexes](regular-path-indexes.md) for direct construction and
-range-native repository maintenance.
+[Regular Path Indexes](regular-path-indexes.md) for expression construction,
+the low-level automaton escape hatch, and range-native repository maintenance.
 
 For a fixed small number of hops, explicit pattern clauses joined on `temp!`
 variables remain simpler. For unbounded traversal, use the path index or drive

@@ -18,17 +18,19 @@ triblespace = "0.47"
 triblespace-paths = "0.47"
 ```
 
-## Build a path relation directly
+## Describe the path, then materialize it
 
-`Automaton` is deliberately low-level: callers supply a fixed, epsilon-free
-nondeterministic automaton. For example, `friend+` (one or more forward
-`friend` edges) has two states. State 0 is initial, state 1 is accepting, and
-state 1 loops:
+Most callers describe a regular path with `PathExpr`. Each leaf is a graph
+property `Step`; the expression builders add concatenation, alternatives, and
+repetition. `compile` freezes that description into the fixed, epsilon-free
+automaton consumed by `PathIndex` and `PathRollup`.
+
+For example, `friend+` means one or more forward `friend` edges:
 
 ```rust,ignore
 use triblespace::prelude::*;
 use triblespace::prelude::inlineencodings::GenId;
-use triblespace_paths::{Automaton, PathIndex, Step, Transition};
+use triblespace_paths::{PathExpr, PathIndex, Step};
 
 mod social {
     use triblespace::prelude::*;
@@ -41,15 +43,8 @@ mod social {
 }
 
 let friend = social::friend.id().into();
-let friend_plus = Automaton::new(
-    2,
-    [0],
-    [1],
-    [
-        Transition::new(0, 1, Step::Forward(friend)),
-        Transition::new(1, 1, Step::Forward(friend)),
-    ],
-)?;
+let friend_plus = PathExpr::from(Step::Forward(friend)).plus();
+let friend_automaton = friend_plus.compile();
 
 let alice = fucid();
 let bob = fucid();
@@ -59,7 +54,7 @@ graph += entity! { &alice @ social::friend: &bob };
 graph += entity! { &bob @ social::friend: &carol, social::name: "Bob" };
 graph += entity! { &carol @ social::name: "Carol" };
 
-let paths = PathIndex::from_tribles(friend_plus.clone(), graph.iter())?;
+let paths = PathIndex::from_tribles(friend_automaton.clone(), graph.iter())?;
 ```
 
 Every trible is viewed as a directed graph edge from its entity to its inline
@@ -67,12 +62,74 @@ value, labeled by its attribute id. Values do not have to encode entity ids,
 although a path endpoint must use a compatible inline encoding when it shares a
 query variable with another constraint.
 
-`Step` supports exact forward and reverse labels, exclusion lists
-(`ForwardExcept` and `ReverseExcept`), and the empty-exclusion wildcard helpers
-`forward_any` and `reverse_any`. `Automaton::new` validates state numbers and
-canonicalizes duplicate or out-of-order transitions. Epsilon transitions are
-not part of the representation: eliminate them while compiling the expression,
-and represent nullability by making an initial state accepting.
+The expression operations are regular-language operations:
+
+- `a.then(b)` matches `a` followed by `b`;
+- `a.or(b)` matches either expression;
+- `star`, `plus`, and `optional` mean zero-or-more, one-or-more, and
+  zero-or-one repetitions; and
+- `inverse` reverses the complete path. It flips each atomic step, reverses
+  sequence order, distributes over alternatives, and preserves repetition.
+
+`Step::Forward` and `Step::Reverse` match one exact attribute in either graph
+direction. `ForwardExcept` and `ReverseExcept` match every attribute except a
+provided list; an empty exclusion list is a wildcard, available as
+`Step::forward_any()` or `Step::reverse_any()`. Inverting an exclusion or
+wildcard changes only its direction.
+
+## Canonical expressions and compilation
+
+`PathExpr` canonicalizes structure as it is assembled. Nested sequences are
+flattened while retaining their order. Nested alternatives are flattened,
+sorted by a stable explicit order, and deduplicated. Exclusion lists are also
+sorted and deduplicated. Thus independently assembled expressions that differ
+only by alternative ordering, duplicate alternatives, sequence association, or
+exclusion ordering compile to the same canonical automaton and fingerprint.
+
+This is **structural** canonicalization, not regular-language minimization.
+Distributively equivalent expressions, or identities such as a nested star,
+may still compile to different language-equivalent automata. Do not use
+automaton equality to decide arbitrary regular-language equivalence.
+
+Compilation uses the Glushkov position construction. State zero is the sole
+initial state, and each atomic `Step` occurrence contributes one additional
+state. First-position and follow-position relations become transitions;
+nullable expressions make state zero accepting. The result is a fixed NFA with
+no epsilon transitions and no determinization pass. Repetition changes the
+finite follow relation rather than unrolling an unbounded machine.
+
+The current high-level surface is the Rust builder API, not a string parser or
+`path!` macro. Every `PathExpr` contains at least one atomic step, so a pure
+epsilon language or the empty language must be expressed with a manual
+automaton. State ids are `u32`; `compile` panics if the expression contains
+`u32::MAX` atomic occurrences, because no valid `Automaton` can represent it.
+
+## Manual automata are the low-level escape hatch
+
+Construct `Automaton` directly when importing the output of another compiler,
+when a deliberately shared state topology matters, or when the language has no
+atomic step. The `friend+` expression above is equivalent to this explicit
+two-state NFA:
+
+```rust,ignore
+use triblespace_paths::{Automaton, Step, Transition};
+
+let friend_automaton = Automaton::new(
+    2,
+    [0],
+    [1],
+    [
+        Transition::new(0, 1, Step::Forward(friend)),
+        Transition::new(1, 1, Step::Forward(friend)),
+    ],
+)?;
+```
+
+`Automaton::new` validates state numbers and canonicalizes duplicate or
+out-of-order transitions and exclusion lists. Its input must already be
+epsilon-free. Represent nullability by making an initial state accepting; for
+example, one initial-and-accepting state with no transitions accepts only the
+empty path.
 
 ## Join paths with ordinary constraints
 
@@ -109,7 +166,7 @@ before the branch's first data push:
 ```rust,ignore
 use triblespace_paths::PathRollup;
 
-let rollup = PathRollup::new(friend_plus);
+let rollup = PathRollup::new(friend_automaton);
 repo.register_index(rollup.clone());
 
 let branch_id = *repo.create_branch("main", None)?;

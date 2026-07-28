@@ -376,11 +376,13 @@ than a traversal, which is the right shape for a data model where facts are
 only ever added — the closure grows monotonically with the edge set.
 
 The stable implementation lives in the standalone `triblespace-paths` crate.
-It persists unionable direct-product summaries per repository range, closes
-their global union, and exposes the resulting endpoint relation through the
-ordinary two-variable constraint protocol. See [Regular Path
-Indexes](regular-path-indexes.md) for the API, lifecycle, freshness boundary,
-and dense-output trade-off.
+Its `PathExpr` builder compiles the normal regular-language operations into a
+fixed epsilon-free automaton; direct `Automaton` construction remains the
+low-level escape hatch. The crate persists unionable direct-product summaries
+per repository range, closes their global union, and exposes the resulting
+endpoint relation through the ordinary two-variable constraint protocol. See
+[Regular Path Indexes](regular-path-indexes.md) for the expression API,
+lifecycle, freshness boundary, and dense-output trade-off.
 
 ## What the engine will not do
 
