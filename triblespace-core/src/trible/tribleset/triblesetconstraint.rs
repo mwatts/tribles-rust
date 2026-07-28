@@ -24,34 +24,70 @@ use crate::query::ProposalBuffer;
 /// probes in **index order** instead.
 ///
 /// A batched `propose`/`confirm` is N covering-index lookups for N
-/// parent bindings. Taken in frontier order those are N independent
-/// descents from the root of a PATCH — pointer chasing, one cache miss
-/// per level per probe, nothing shared between consecutive probes. The
-/// keys are byte arrays and the PATCH is ordered on exactly those bytes
-/// (a prefix passed to `has_prefix`/`infixes` is in *tree* order, so a
-/// lexicographic sort of the prefixes is the tree's own descent order),
-/// so sorting the batch's keys first turns N random descents into one
-/// ordered walk: consecutive probes share their upper path, which stays
-/// in cache, and the leaves are visited in address order the prefetcher
-/// can follow.
-///
-/// Sorting buys two further things that are not about locality at all:
+/// parent bindings, taken in whatever order the frontier happens to
+/// hold them. Ordering them by key buys two things:
 ///
 /// * **Duplicate keys collapse.** Several frontier rows routinely
 ///   project to the *same* key — a join whose parents fan in, or a
 ///   pattern with no bound position at all, where every row's key is
-///   empty. Sorted, they are adjacent, so the index is walked once and
-///   the result is fanned out to each row's segment.
-/// * **Duplicate candidates collapse.** That fan-out puts the same
-///   value under several rows of one key-run, and a sorted run presents
-///   them adjacently, so the confirming probe is memoised across them.
+///   empty and the loop re-enumerated the whole relation once per row.
+///   Sorted, those rows are adjacent, so the index is walked once and
+///   the result is fanned out to each row's own segment. This is the
+///   half that pays.
+/// * **Locality.** The keys are byte arrays and the PATCH is ordered on
+///   exactly those bytes (a prefix passed to `has_prefix`/`infixes` is
+///   in *tree* order, so a lexicographic sort of the prefixes is the
+///   tree's own descent order), so consecutive probes share their upper
+///   path. Measured, this half is worth little here — see
+///   [`SORTED_REGION_MIN`], which is the same idea applied where there
+///   is much more of it to do, and which is off.
 ///
-/// This is the boundary between the two strategies, and the only thing
-/// that separates them: both paths run the same code over a permutation
-/// of the batch, and differ solely in whether that permutation is
-/// sorted. Set it to `usize::MAX` to measure the plain frontier-order
-/// loop.
+/// The two halves have different economics, so they have their own
+/// thresholds. Ordering the *rows* costs `O(rows log rows)` — bounded by
+/// the frontier width — and buys the collapses above, which are savings
+/// in work rather than in cache misses. Ordering a *region* costs
+/// `O(candidates log candidates)`, which is unbounded by the frontier
+/// and buys only locality: it is worth it exactly when a probe is
+/// expensive enough to amortise a comparison.
+///
+/// This pair is the whole boundary between the two strategies: both
+/// paths run the same code over a permutation of the batch and differ
+/// solely in whether that permutation is sorted. Set either to
+/// `usize::MAX` to measure that half as the plain frontier-order loop.
+///
+/// On for this source, and measured on the suite's Harkonnen fixtures:
+/// the collapses are worth 16% and 12% on F8 (bag and distinct) and 6%
+/// on F14, against 11% on F5 and 6% on F12 where the rows have distinct
+/// keys and the sort only reorders. Net favourable, and the shapes it
+/// loses on are the ones a wider frontier makes rarer, not commoner.
 const SORTED_PROBE_MIN: usize = 2;
+
+/// Region size at which `confirm` orders its candidates by value rather
+/// than walking the region as it lies. See [`SORTED_PROBE_MIN`] for what
+/// the ordering buys.
+///
+/// **Off, and measured off in both sources.** The idea is sound — the
+/// archive's domain and the PATCH's leaves are both laid out in value
+/// order, so probing a region in value order should sweep them — but as
+/// written it does not pay anywhere: within 3% on every archive query at
+/// 4M and at 8M tribles, and 33-46% *worse* on the Harkonnen fixtures
+/// whose regions are large enough to sort (F9, F11, F14).
+///
+/// The reason looks structural rather than incidental, which is why the
+/// switch is off rather than tuned: sorting a region means sorting an
+/// index permutation, and the comparator then gathers from `parents`
+/// and the values through those indices. Both arrays are region-sized,
+/// so at exactly the width where the ordering was supposed to earn its
+/// keep, the sort itself misses cache once or twice per comparison —
+/// and it does that `n log n` times to save `n` probes. A version worth
+/// re-measuring would sort *packed keys* (a `(group, value-prefix,
+/// index)` record) so the sort streams instead of gathering, or would
+/// leave the ordering to a tier that wants the region sorted anyway.
+///
+/// The row ordering above is a different trade and is on: it sorts at
+/// most `frontier width` entries and saves whole index walks rather
+/// than cache misses.
+const SORTED_REGION_MIN: usize = usize::MAX;
 
 /// Kills every entry named by `order` whose value fails `keep`, skipping
 /// entries that are already dead — [`Candidates::retain`] over a
@@ -565,30 +601,60 @@ impl TribleSetConstraint {
         }
     }
 
-    /// The frontier's probe keys as a fixed-stride matrix, plus the row
-    /// permutation that visits them in key order (or in frontier order,
-    /// below [`SORTED_PROBE_MIN`]).
-    fn probe_keys(&self, frontier: &Frontier<'_>) -> (SmallVec<[u8; 128]>, usize, Vec<u32>) {
+    /// Labels the frontier's rows by **probe group** — rows that project
+    /// to the same probe key share a label — and returns the labels
+    /// alongside the row permutation that visits the groups in key order.
+    ///
+    /// The label is what the batch is actually sorted and grouped on
+    /// afterwards, so the byte keys are compared exactly once per row
+    /// here rather than once per comparison in the region-sized sort
+    /// below: a group is a `u32`, and a region of a quarter-million
+    /// candidates then sorts on integers instead of on 32- to 64-byte
+    /// keys reached through their parent row.
+    ///
+    /// Below [`SORTED_PROBE_MIN`] no keys are built at all and every row
+    /// is its own group, which is exactly the frontier-order loop: one
+    /// index walk per row in `propose`, and one run per parent tag in
+    /// `confirm`. The threshold therefore costs nothing on the side it
+    /// turns off, which is what makes the two strategies comparable.
+    fn probe_groups(&self, frontier: &Frontier<'_>) -> (Vec<u32>, Vec<u32>) {
         let rows = frontier.len();
+        let order: Vec<u32> = (0..rows as u32).collect();
+        if rows < SORTED_PROBE_MIN {
+            // Below the threshold nothing is gained by asking what the
+            // keys are, so we do not build them: every row is its own
+            // group, which makes `propose` a plain per-row loop and
+            // `confirm` a walk of the region's own parent runs.
+            return (order.clone(), order);
+        }
+
         let mut keys: SmallVec<[u8; 128]> = SmallVec::new();
         for row in 0..rows {
             self.write_probe_key(&frontier.row(row), &mut keys);
         }
-        let stride = if rows == 0 { 0 } else { keys.len() / rows };
-        let mut order: Vec<u32> = (0..rows as u32).collect();
-        if stride != 0 && rows >= SORTED_PROBE_MIN {
+        let stride = keys.len() / rows;
+        let key = |row: u32| {
+            let row = row as usize;
+            &keys[row * stride..(row + 1) * stride]
+        };
+
+        let mut order = order;
+        if stride != 0 {
             // Ties break on the row number, so the permutation is a
             // deterministic function of the frontier rather than of the
             // sort's internal choices.
-            order.sort_unstable_by(|&a, &b| {
-                let a = a as usize;
-                let b = b as usize;
-                keys[a * stride..(a + 1) * stride]
-                    .cmp(&keys[b * stride..(b + 1) * stride])
-                    .then(a.cmp(&b))
-            });
+            order.sort_unstable_by(|&a, &b| key(a).cmp(key(b)).then(a.cmp(&b)));
         }
-        (keys, stride, order)
+
+        let mut group = vec![0u32; rows];
+        let mut label = 0u32;
+        for i in 1..rows {
+            if key(order[i]) != key(order[i - 1]) {
+                label += 1;
+            }
+            group[order[i] as usize] = label;
+        }
+        (group, order)
     }
 }
 
@@ -759,18 +825,15 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         if rows == 0 || !self.touches(variable) {
             return;
         }
-        let (keys, stride, order) = self.probe_keys(frontier);
-        let key = |row: u32| {
-            let row = row as usize;
-            &keys[row * stride..(row + 1) * stride]
-        };
+        let (group, order) = self.probe_groups(frontier);
 
         let mut shared: Vec<RawInline> = Vec::new();
         let mut run_start = 0;
         while run_start < rows {
             let lead = order[run_start];
+            let label = group[lead as usize];
             let mut run_end = run_start + 1;
-            while run_end < rows && key(order[run_end]) == key(lead) {
+            while run_end < rows && group[order[run_end] as usize] == label {
                 run_end += 1;
             }
 
@@ -808,25 +871,17 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         if entries == 0 || frontier.is_empty() || !self.touches(variable) {
             return;
         }
-        let mut keys: SmallVec<[u8; 128]> = SmallVec::new();
-        for row in 0..frontier.len() {
-            self.write_probe_key(&frontier.row(row), &mut keys);
-        }
-        let stride = keys.len() / frontier.len();
-        let key = |row: u32| {
-            let row = row as usize;
-            &keys[row * stride..(row + 1) * stride]
-        };
+        let (group, _) = self.probe_groups(frontier);
         // The tags are read after the region turns mutable, so take a
         // copy of them rather than holding a borrow across the kills.
         let parents: SmallVec<[u32; 64]> = SmallVec::from_slice(cands.parents());
 
         let mut order: SmallVec<[u32; 64]> = (0..entries as u32).collect();
-        if entries >= SORTED_PROBE_MIN {
+        if entries >= SORTED_REGION_MIN {
             let values = cands.values();
             order.sort_unstable_by(|&a, &b| {
-                key(parents[a as usize])
-                    .cmp(key(parents[b as usize]))
+                group[parents[a as usize] as usize]
+                    .cmp(&group[parents[b as usize] as usize])
                     .then_with(|| values[a as usize].cmp(&values[b as usize]))
                     .then(a.cmp(&b))
             });
@@ -835,8 +890,9 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
         let mut run_start = 0;
         while run_start < entries {
             let lead = parents[order[run_start] as usize];
+            let label = group[lead as usize];
             let mut run_end = run_start + 1;
-            while run_end < entries && key(parents[order[run_end] as usize]) == key(lead) {
+            while run_end < entries && group[parents[order[run_end] as usize] as usize] == label {
                 run_end += 1;
             }
             let binding = frontier.row(lead as usize);
