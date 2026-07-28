@@ -651,9 +651,6 @@ impl BindingStore {
     /// numbers. Drawing is separated from *materialising* the child rows
     /// so the engine can look at the shape of the draw first — a 1:1 draw
     /// needs no new rows at all, see [`Query::next_chunk`].
-    ///
-    /// Returns whether the level is now spent (no live candidate is left
-    /// beyond this draw).
     pub(crate) fn draw(
         &mut self,
         variable: VariableId,
@@ -661,23 +658,32 @@ impl BindingStore {
         parent_select: &[u32],
         drawn_out: &mut Vec<u32>,
         parents_out: &mut Vec<u32>,
-    ) -> bool {
+    ) {
         drawn_out.clear();
         parents_out.clear();
-        let spent = {
-            let level = &mut self.levels[variable];
-            while drawn_out.len() < width {
-                let Some(i) = level.buffer.next_live(level.pos) else {
-                    break;
-                };
-                level.pos = i + 1;
-                drawn_out.push(i as u32);
-                parents_out.push(parent_select[level.buffer.parent_of(i) as usize]);
-            }
-            level.buffer.next_live(level.pos).is_none()
-        };
+        let level = &mut self.levels[variable];
+        while drawn_out.len() < width {
+            let Some(i) = level.buffer.next_live(level.pos) else {
+                break;
+            };
+            level.pos = i + 1;
+            drawn_out.push(i as u32);
+            parents_out.push(parent_select[level.buffer.parent_of(i) as usize]);
+        }
         self.bound.set_value(variable, !drawn_out.is_empty());
-        spent
+    }
+
+    /// Whether `variable`'s level has no live candidate left beyond what
+    /// has already been drawn.
+    ///
+    /// Deliberately *not* folded into [`draw`](BindingStore::draw): it is a
+    /// forward scan over the liveness words, so asking after every draw
+    /// would pay a second pass over a level's dead tail that the next draw
+    /// pays anyway. The one caller asks only once the cheap `O(1)`
+    /// conditions for an in-place descent already hold.
+    pub(crate) fn spent(&self, variable: VariableId) -> bool {
+        let level = &self.levels[variable];
+        level.buffer.next_live(level.pos).is_none()
     }
 
     /// Bisects `variable`'s materialized region, returning the tail as a
@@ -1923,7 +1929,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             self.depths.push(Depth::default());
         }
 
-        let spent = self.bindings.draw(
+        self.bindings.draw(
             variable,
             level.width,
             &self.depths[parent].order[range],
@@ -1948,14 +1954,20 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         // 1:1 and terminal: every parent row produced exactly one child, in
         // order, and neither this level nor this frontier has anything left
         // to hand down.
-        let reusable = spent
-            && rows == self.depths[parent].rows
+        //
+        // Ordered cheapest-first on purpose. The two `O(1)` tests reject
+        // every fan-out descent — the overwhelming majority — before
+        // anything walks the batch, so a wide frontier never pays for a
+        // fast path it cannot take. `spent` is last because it scans the
+        // level's remaining liveness words.
+        let reusable = rows == self.depths[parent].rows
             && self.depths[parent].group >= self.depths[parent].groups.len()
             && self
                 .parents
                 .iter()
                 .enumerate()
-                .all(|(row, &parent_row)| parent_row as usize == row);
+                .all(|(row, &parent_row)| parent_row as usize == row)
+            && self.bindings.spent(variable);
 
         let (head, tail) = self.depths.split_at_mut(parent + 1);
         let source = &mut head[parent];
