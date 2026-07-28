@@ -278,12 +278,18 @@ pub fn frontier_summary() -> FrontierSummary {
     let sink = FRONTIER_SINK.lock().expect("frontier sink");
     let mut out = FrontierSummary::default();
     for s in sink.iter() {
-        out.widest = out.widest.max(s.widest());
         out.expansions += s.expansions();
         out.rows += s.rows();
         out.proposals += s.proposals();
-        out.inplace_descents += s.inplace_descents();
-        out.copied_descents += s.copied_descents();
+        // The ceiling question needs counters the batched protocol
+        // shipped without; a subject that cannot answer reports zero
+        // rather than a guess.
+        #[cfg(feature = "frontier-widest")]
+        {
+            out.widest = out.widest.max(s.widest());
+            out.inplace_descents += s.inplace_descents();
+            out.copied_descents += s.copied_descents();
+        }
     }
     out
 }

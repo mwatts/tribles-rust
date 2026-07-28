@@ -77,6 +77,12 @@ fi
 # only ever probed for alongside it.
 if grep -q 'pub struct Frontier' "$SUBJECT/triblespace-core/src/query.rs" 2>/dev/null; then
   FEATURES="$FEATURES frontier"
+  # frontier-widest: FrontierStats gained widest/inplace_descents/
+  # copied_descents after the batched protocol landed, so the ceiling
+  # half of the census is probed separately from the protocol itself.
+  if grep -q 'pub fn widest' "$SUBJECT/triblespace-core/src/query.rs" 2>/dev/null; then
+    FEATURES="$FEATURES frontier-widest"
+  fi
 fi
 # rpq: only when the subject still has a regular-path constraint.
 if [ -f "$SUBJECT/triblespace-core/src/query/regularpathconstraint.rs" ]; then
