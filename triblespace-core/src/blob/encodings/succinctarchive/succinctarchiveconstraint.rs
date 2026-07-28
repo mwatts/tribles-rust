@@ -2,12 +2,81 @@ use crate::query::Frontier;
 use std::ops::Not;
 use std::ops::Range;
 
+use smallvec::SmallVec;
+
 use super::*;
 use crate::query::*;
 use crate::inline::encodings::genid::GenId;
 use jerky::bit_vector::Select;
 use crate::query::Candidates;
 use crate::query::ProposalBuffer;
+
+/// Batch size at which this source stops probing in frontier order and
+/// probes in **index order** instead.
+///
+/// A batched `propose`/`confirm` is N archive lookups for N parent
+/// bindings, and every one of them starts by translating a value into a
+/// domain code — [`Universe::search`], a binary search over the whole
+/// domain, followed by a `select1` on the axis bit vector. Taken in
+/// frontier order those are N independent binary searches: each walks
+/// the domain from its midpoint down, touching a different cache line at
+/// every step, and shares nothing with its neighbour. The archive is
+/// ordered on exactly the bytes being searched for, so sorting the
+/// batch's keys first turns those N searches into one ordered sweep —
+/// the upper levels of every search collapse onto the same few lines,
+/// the lower levels advance monotonically, and the `select1`s that
+/// follow run in increasing code order.
+///
+/// Sorting buys two further things that are not about locality at all:
+///
+/// * **Duplicate keys collapse.** Several frontier rows routinely
+///   project to the *same* key — a join whose parents fan in, or a
+///   pattern with no bound position, where every row's key is empty.
+///   Sorted, they are adjacent, so the archive is walked once and the
+///   result fanned out to each row's segment; and in `confirm` a single
+///   `base_range` covers the whole group instead of one per parent.
+/// * **Duplicate candidates collapse.** That fan-out puts the same value
+///   under several rows of one key-run, and a sorted run presents them
+///   adjacently, so the `search` + range restriction is memoised across
+///   them.
+///
+/// This is the boundary between the two strategies, and the only thing
+/// that separates them: both paths run the same code over a permutation
+/// of the batch, and differ solely in whether that permutation is
+/// sorted. Set it to `usize::MAX` to measure the plain frontier-order
+/// loop.
+const SORTED_PROBE_MIN: usize = 2;
+
+/// Kills every entry named by `order` whose value fails `keep`, skipping
+/// entries that are already dead — [`Candidates::retain`] over a
+/// permutation instead of the region's own order.
+///
+/// The verdict is memoised across *adjacent equal values*, which costs
+/// one 32-byte compare and saves a domain binary search: a key-run
+/// fanned out over several frontier rows carries each candidate once per
+/// row, and sorted they arrive back to back.
+#[inline]
+fn retain_at(cands: &mut Candidates<'_>, order: &[u32], mut keep: impl FnMut(&RawInline) -> bool) {
+    let mut memo: Option<(RawInline, bool)> = None;
+    for &i in order {
+        let i = i as usize;
+        if !cands.is_live(i) {
+            continue;
+        }
+        let value = cands.values()[i];
+        let verdict = match memo {
+            Some((seen, verdict)) if seen == value => verdict,
+            _ => {
+                let verdict = keep(&value);
+                memo = Some((value, verdict));
+                verdict
+            }
+        };
+        if !verdict {
+            cands.kill(i);
+        }
+    }
+}
 
 pub struct SuccinctArchiveConstraint<'a, U>
 where
@@ -249,7 +318,23 @@ where
         }
     }
 
-    fn confirm_row(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
+    /// Kills the entries `order` names — indices into `cands` — whose
+    /// value is inconsistent with `binding`.
+    ///
+    /// `order` is a permutation of some part of the region rather than a
+    /// range, because the region spans a whole [`Frontier`] and the
+    /// caller decides in which order the archive is probed. Every entry
+    /// it names must belong to a row whose bound positions equal
+    /// `binding`'s; the caller establishes that by grouping the region by
+    /// probe key — which is also what makes the parent's `base_range`
+    /// worth computing once here.
+    fn confirm_at(
+        &self,
+        variable: VariableId,
+        binding: &Binding,
+        cands: &mut Candidates<'_>,
+        order: &[u32],
+    ) {
         let e_var = self.term_e.is_var(variable);
         let a_var = self.term_a.is_var(variable);
         let v_var = self.term_v.is_var(variable);
@@ -264,21 +349,21 @@ where
 
         match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
             (None, None, None, true, false, false) => {
-                cands.retain(|e| {
+                retain_at(cands, order, |e| {
                     base_range(&self.archive.domain, &self.archive.e_a, e)
                         .is_empty()
                         .not()
                 });
             }
             (None, None, None, false, true, false) => {
-                cands.retain(|a| {
+                retain_at(cands, order, |a| {
                     base_range(&self.archive.domain, &self.archive.a_a, a)
                         .is_empty()
                         .not()
                 });
             }
             (None, None, None, false, false, true) => {
-                cands.retain(|v| {
+                retain_at(cands, order, |v| {
                     base_range(&self.archive.domain, &self.archive.v_a, v)
                         .is_empty()
                         .not()
@@ -286,7 +371,7 @@ where
             }
             (Some(e), None, None, false, true, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                cands.retain(|a| {
+                retain_at(cands, order, |a| {
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.a_a,
@@ -300,7 +385,7 @@ where
             }
             (Some(e), None, None, false, false, true) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                cands.retain(|v| {
+                retain_at(cands, order, |v| {
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.v_a,
@@ -314,7 +399,7 @@ where
             }
             (None, Some(a), None, true, false, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.a_a, a);
-                cands.retain(|e| {
+                retain_at(cands, order, |e| {
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.e_a,
@@ -328,7 +413,7 @@ where
             }
             (None, Some(a), None, false, false, true) => {
                 let r = base_range(&self.archive.domain, &self.archive.a_a, a);
-                cands.retain(|v| {
+                retain_at(cands, order, |v| {
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.v_a,
@@ -342,7 +427,7 @@ where
             }
             (None, None, Some(v), true, false, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.v_a, v);
-                cands.retain(|e| {
+                retain_at(cands, order, |e| {
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.e_a,
@@ -356,7 +441,7 @@ where
             }
             (None, None, Some(v), false, true, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.v_a, v);
-                cands.retain(|a| {
+                retain_at(cands, order, |a| {
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.a_a,
@@ -377,7 +462,7 @@ where
                     v,
                     &r,
                 );
-                cands.retain(|e| {
+                retain_at(cands, order, |e| {
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.e_a,
@@ -398,7 +483,7 @@ where
                     v,
                     &r,
                 );
-                cands.retain(|a| {
+                retain_at(cands, order, |a| {
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.a_a,
@@ -419,7 +504,7 @@ where
                     a,
                     &r,
                 );
-                cands.retain(|v| {
+                retain_at(cands, order, |v| {
                     restrict_range(
                         &self.archive.domain,
                         &self.archive.v_a,
@@ -433,6 +518,66 @@ where
             }
             _ => unreachable!("invalid trible constraint state"),
         }
+    }
+
+    /// Whether `variable` occupies any position of this pattern — the
+    /// relevance check every protocol method opens with, hoisted so the
+    /// batched entry points can skip building a probe-key matrix for a
+    /// variable they have no opinion about.
+    fn touches(&self, variable: VariableId) -> bool {
+        self.term_e.is_var(variable)
+            || self.term_a.is_var(variable)
+            || self.term_v.is_var(variable)
+    }
+
+    /// Appends the bytes of every position this constraint reads under
+    /// `binding` — the bound ones and the constants, in e-a-v order — to
+    /// `out`. This is the row's **probe key**.
+    ///
+    /// Two rows with the same key are indistinguishable to
+    /// [`propose_row`](Self::propose_row) and
+    /// [`confirm_at`](Self::confirm_at): both dispatch on *which*
+    /// positions have a value, which a [`Frontier`] shares by
+    /// construction, and read nothing else from the binding. So the key
+    /// is a complete summary of a row for this source's purposes — equal
+    /// keys may be answered once, and the key's byte order is the
+    /// domain's own order, which is the order the archive wants to be
+    /// probed in.
+    ///
+    /// Every row of a frontier writes the same number of bytes, so the
+    /// keys form a fixed-stride matrix.
+    fn write_probe_key(&self, binding: &Binding, out: &mut SmallVec<[u8; 128]>) {
+        for term in [&self.term_e, &self.term_a, &self.term_v] {
+            if let Some(value) = term.position_value(binding) {
+                out.extend_from_slice(value);
+            }
+        }
+    }
+
+    /// The frontier's probe keys as a fixed-stride matrix, plus the row
+    /// permutation that visits them in key order (or in frontier order,
+    /// below [`SORTED_PROBE_MIN`]).
+    fn probe_keys(&self, frontier: &Frontier<'_>) -> (SmallVec<[u8; 128]>, usize, Vec<u32>) {
+        let rows = frontier.len();
+        let mut keys: SmallVec<[u8; 128]> = SmallVec::new();
+        for row in 0..rows {
+            self.write_probe_key(&frontier.row(row), &mut keys);
+        }
+        let stride = if rows == 0 { 0 } else { keys.len() / rows };
+        let mut order: Vec<u32> = (0..rows as u32).collect();
+        if stride != 0 && rows >= SORTED_PROBE_MIN {
+            // Ties break on the row number, so the permutation is a
+            // deterministic function of the frontier rather than of the
+            // sort's internal choices.
+            order.sort_unstable_by(|&a, &b| {
+                let a = a as usize;
+                let b = b as usize;
+                keys[a * stride..(a + 1) * stride]
+                    .cmp(&keys[b * stride..(b + 1) * stride])
+                    .then(a.cmp(&b))
+            });
+        }
+        (keys, stride, order)
     }
 }
 
@@ -526,26 +671,110 @@ where
         })
     }
 
-    /// Enumerates matching values for every row of the batch. Which
-    /// rotation the enumeration walks depends only on the bound *set*,
-    /// which the frontier shares, so this is a plain loop over rows.
+    /// Enumerates matching values for every row of the batch: N archive
+    /// lookups for N parent bindings, into one segmented buffer.
+    ///
+    /// Which rotation the enumeration walks depends only on the bound
+    /// *set*, which the frontier shares, so the rows differ only in the
+    /// value each one looks up. Those values are looked up in **key
+    /// order** rather than frontier order (see [`SORTED_PROBE_MIN`]),
+    /// which makes the domain searches an ordered sweep instead of N
+    /// independent binary searches, and lets rows that share a value be
+    /// answered once and fanned out. Segment order follows the probe
+    /// order; a proposer may visit rows in any order, and each row's
+    /// candidates still arrive contiguously under its own tag.
     fn propose(
         &self,
         variable: VariableId,
         frontier: &Frontier<'_>,
         proposals: &mut ProposalBuffer,
     ) {
-        for row in 0..frontier.len() {
-            proposals.open(row as u32);
-            self.propose_row(variable, &frontier.row(row), proposals);
+        let rows = frontier.len();
+        if rows == 0 || !self.touches(variable) {
+            return;
+        }
+        let (keys, stride, order) = self.probe_keys(frontier);
+        let key = |row: u32| {
+            let row = row as usize;
+            &keys[row * stride..(row + 1) * stride]
+        };
+
+        let mut shared: Vec<RawInline> = Vec::new();
+        let mut run_start = 0;
+        while run_start < rows {
+            let lead = order[run_start];
+            let mut run_end = run_start + 1;
+            while run_end < rows && key(order[run_end]) == key(lead) {
+                run_end += 1;
+            }
+
+            let base = proposals.len();
+            proposals.open(lead);
+            self.propose_row(variable, &frontier.row(lead as usize), proposals);
+            if run_end - run_start > 1 {
+                // The remaining rows of the run look the same value up,
+                // so they have the same candidates: copy rather than walk
+                // the archive again.
+                shared.clear();
+                shared.extend_from_slice(&proposals[base..]);
+                for &row in &order[run_start + 1..run_end] {
+                    proposals.open(row);
+                    proposals.extend_from_slice(&shared);
+                }
+            }
+            run_start = run_end;
         }
     }
 
     /// Confirms each candidate against its own row's bound positions.
+    ///
+    /// The region spans the whole batch, so it is walked in **probe
+    /// order**: grouped by probe key — coarser than by parent tag, since
+    /// distinct rows that agree on this constraint's positions confirm
+    /// identically and can share one `base_range` — and, within a group,
+    /// in value order, which is the domain's own order. Below
+    /// [`SORTED_PROBE_MIN`] the region is walked in its own order
+    /// instead, which is the same grouping the tags already carry.
     fn confirm(&self, variable: VariableId, frontier: &Frontier<'_>, cands: &mut Candidates<'_>) {
-        cands.for_each_parent(|row, run| {
-            self.confirm_row(variable, &frontier.row(row as usize), run)
-        });
+        let entries = cands.len();
+        if entries == 0 || frontier.is_empty() || !self.touches(variable) {
+            return;
+        }
+        let mut keys: SmallVec<[u8; 128]> = SmallVec::new();
+        for row in 0..frontier.len() {
+            self.write_probe_key(&frontier.row(row), &mut keys);
+        }
+        let stride = keys.len() / frontier.len();
+        let key = |row: u32| {
+            let row = row as usize;
+            &keys[row * stride..(row + 1) * stride]
+        };
+        // The tags are read after the region turns mutable, so take a
+        // copy of them rather than holding a borrow across the kills.
+        let parents: SmallVec<[u32; 64]> = SmallVec::from_slice(cands.parents());
+
+        let mut order: SmallVec<[u32; 64]> = (0..entries as u32).collect();
+        if entries >= SORTED_PROBE_MIN {
+            let values = cands.values();
+            order.sort_unstable_by(|&a, &b| {
+                key(parents[a as usize])
+                    .cmp(key(parents[b as usize]))
+                    .then_with(|| values[a as usize].cmp(&values[b as usize]))
+                    .then(a.cmp(&b))
+            });
+        }
+
+        let mut run_start = 0;
+        while run_start < entries {
+            let lead = parents[order[run_start] as usize];
+            let mut run_end = run_start + 1;
+            while run_end < entries && key(parents[order[run_end] as usize]) == key(lead) {
+                run_end += 1;
+            }
+            let binding = frontier.row(lead as usize);
+            self.confirm_at(variable, &binding, cands, &order[run_start..run_end]);
+            run_start = run_end;
+        }
     }
 
 
