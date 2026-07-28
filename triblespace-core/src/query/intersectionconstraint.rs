@@ -1,6 +1,44 @@
 use super::*;
 use smallvec::SmallVec;
 
+/// Debug check for the `estimate` relevance contract: whether a constraint
+/// answers `Some` or `None` must depend only on *which* variables are bound,
+/// never on their values. Composites read relevance off one row of the batch,
+/// so a constraint that flips mid-frontier silently changes the bag — and in
+/// either direction, which is why it is worth catching rather than
+/// documenting alone.
+///
+/// Sampled rather than exhaustive: checking every row of a 16k frontier on
+/// every confirm would make debug builds unusable. Rows are walked with a
+/// stride so the sample spans the whole batch and always includes the last
+/// row, and frontiers of `MAX_ROWS` or fewer are checked completely. A
+/// violation that is uniform across the sampled rows but not the skipped ones
+/// would slip through; a constraint whose relevance depends on values is
+/// overwhelmingly unlikely to agree on a spread this wide by accident.
+///
+/// Not `#[cfg(debug_assertions)]`: `debug_assert!` still *compiles* its body
+/// in release (it expands to `if cfg!(debug_assertions)`), so gating this
+/// would break the release build. It is simply never called there.
+fn frontier_relevance_is_uniform<'a, C: Constraint<'a>>(
+    constraints: &[C],
+    variable: VariableId,
+    frontier: &Frontier<'_>,
+) -> bool {
+    const MAX_ROWS: usize = 64;
+    let rows = frontier.len();
+    if rows < 2 {
+        return true;
+    }
+    let stride = rows.div_ceil(MAX_ROWS);
+    constraints.iter().all(|c| {
+        let expected = c.estimate(variable, &frontier.row(0)).is_some();
+        (0..rows)
+            .step_by(stride)
+            .chain(std::iter::once(rows - 1))
+            .all(|i| c.estimate(variable, &frontier.row(i)).is_some() == expected)
+    })
+}
+
 /// Logical conjunction of constraints (AND).
 ///
 /// All children must agree on every variable binding. Built by the
@@ -85,6 +123,11 @@ where
         // about `variable` at all.
         let mut choice: Vec<usize> = Vec::with_capacity(rows);
         let mut relevant: SmallVec<[bool; 8]> = SmallVec::from_elem(false, self.constraints.len());
+        // Rows on which each child claimed the variable. Only read by the
+        // debug assertion below — this loop already visits every row, so the
+        // contract check is exhaustive here rather than sampled.
+        let mut relevant_rows: SmallVec<[usize; 8]> =
+            SmallVec::from_elem(0, self.constraints.len());
         for row in 0..rows {
             let binding = frontier.row(row);
             let mut best = usize::MAX;
@@ -92,6 +135,7 @@ where
             for (i, c) in self.constraints.iter().enumerate() {
                 if let Some(estimate) = c.estimate(variable, &binding) {
                     relevant[i] = true;
+                    relevant_rows[i] += 1;
                     if best_child == usize::MAX || estimate < best {
                         best = estimate;
                         best_child = i;
@@ -100,6 +144,15 @@ where
             }
             choice.push(best_child);
         }
+        debug_assert!(
+            relevant_rows.iter().all(|&n| n == 0 || n == rows),
+            "Constraint::estimate returned Some for some rows of a frontier \
+             and None for others on variable {variable}. Whether the answer \
+             is Some or None must depend only on which variables are bound, \
+             not on their values (see Constraint::estimate). This propose \
+             ORs relevance across the batch, so a child that claims the \
+             variable on any row is then allowed to confirm every row."
+        );
 
         // No child constrains this variable anywhere in the batch.
         if choice.iter().all(|&c| c == usize::MAX) {
@@ -165,6 +218,14 @@ where
             return;
         }
         let binding = frontier.row(0);
+        debug_assert!(
+            frontier_relevance_is_uniform(&self.constraints, variable, frontier),
+            "Constraint::estimate returned Some for some rows of a frontier \
+             and None for others on variable {variable}. Whether the answer \
+             is Some or None must depend only on which variables are bound, \
+             not on their values (see Constraint::estimate). Reading \
+             relevance off row 0 — as this does — otherwise changes the bag."
+        );
         let mut relevant_constraints: SmallVec<[(usize, &C); 8]> = self
             .constraints
             .iter()

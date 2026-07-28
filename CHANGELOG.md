@@ -46,6 +46,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `FrontierStats` reports how often that fragmented. Bag semantics and
   worst-case optimality are unchanged; the cost is frontier memory,
   `O(width × variables × depth)`.
+- **Breaking: `Constraint::estimate`'s relevance must not depend on bound
+  *values*.** Whether it answers `Some` or `None` may depend only on *which*
+  variables are bound, never on what they are bound to. Composites now read
+  relevance off the batch rather than per binding — `IntersectionConstraint`
+  ORs it across the rows in `propose` and takes it from row 0 in `confirm` —
+  and both are exact only under this rule. Every in-tree constraint already
+  satisfies it, including `EqualityConstraint`, whose `None` keys on a peer's
+  *boundness* and so is uniform across a frontier; but an out-of-tree
+  constraint that keys on the bound value instead is the natural way to get
+  this wrong, and it fails as **wrong rows in either direction**, not as a
+  panic. Debug builds now assert it (exhaustively in `propose`, which visits
+  every row anyway; sampled with a stride in `confirm`), and
+  `tests/estimate_relevance_contract.rs` pins the enforcement.
 - **The frontier width is a ceiling, and a level's first chunk is one
   binding.** `INITIAL_FRONTIER_WIDTH` = 1; every chunk after it is the query's
   full width. A query the caller stops after one row — `exists!`, `.next()` —
