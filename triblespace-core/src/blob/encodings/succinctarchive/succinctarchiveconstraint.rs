@@ -1,3 +1,4 @@
+use crate::query::Frontier;
 use std::ops::Not;
 use std::ops::Range;
 
@@ -86,97 +87,11 @@ where
     }
 }
 
-impl<'a, U> Constraint<'a> for SuccinctArchiveConstraint<'a, U>
+impl<'a, U> SuccinctArchiveConstraint<'a, U>
 where
     U: Universe,
 {
-    fn variables(&self) -> VariableSet {
-        let mut variables = VariableSet::new_empty();
-        self.term_e.add_to(&mut variables);
-        self.term_a.add_to(&mut variables);
-        self.term_v.add_to(&mut variables);
-        variables
-    }
-
-    fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
-        let e_var = self.term_e.is_var(variable);
-        let a_var = self.term_a.is_var(variable);
-        let v_var = self.term_v.is_var(variable);
-
-        if !e_var && !a_var && !v_var {
-            return None;
-        }
-
-        let e_bound = self.term_e.position_value(binding);
-        let a_bound = self.term_a.position_value(binding);
-        let v_bound = self.term_v.position_value(binding);
-
-        Some(match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
-            (None, None, None, true, false, false) => self.archive.entity_count,
-            (None, None, None, false, true, false) => self.archive.attribute_count,
-            (None, None, None, false, false, true) => self.archive.value_count,
-            (Some(e), None, None, false, true, false) => {
-                let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                self.archive.distinct_in(&self.archive.changed_e_a, &r)
-            }
-            (Some(e), None, None, false, false, true) => {
-                let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                self.archive.distinct_in(&self.archive.changed_e_v, &r)
-            }
-            (None, Some(a), None, true, false, false) => {
-                let r = base_range(&self.archive.domain, &self.archive.a_a, a);
-                self.archive.distinct_in(&self.archive.changed_a_e, &r)
-            }
-            (None, Some(a), None, false, false, true) => {
-                let r = base_range(&self.archive.domain, &self.archive.a_a, a);
-                self.archive.distinct_in(&self.archive.changed_a_v, &r)
-            }
-            (None, None, Some(v), true, false, false) => {
-                let r = base_range(&self.archive.domain, &self.archive.v_a, v);
-                self.archive.distinct_in(&self.archive.changed_v_e, &r)
-            }
-            (None, None, Some(v), false, true, false) => {
-                let r = base_range(&self.archive.domain, &self.archive.v_a, v);
-                self.archive.distinct_in(&self.archive.changed_v_a, &r)
-            }
-            (None, Some(a), Some(v), true, false, false) => {
-                let r = base_range(&self.archive.domain, &self.archive.a_a, a);
-                let r = restrict_range(
-                    &self.archive.domain,
-                    &self.archive.v_a,
-                    &self.archive.aev_c,
-                    v,
-                    &r,
-                );
-                r.len()
-            }
-            (Some(e), None, Some(v), false, true, false) => {
-                let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                let r = restrict_range(
-                    &self.archive.domain,
-                    &self.archive.v_a,
-                    &self.archive.eav_c,
-                    v,
-                    &r,
-                );
-                r.len()
-            }
-            (Some(e), Some(a), None, false, false, true) => {
-                let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                let r = restrict_range(
-                    &self.archive.domain,
-                    &self.archive.a_a,
-                    &self.archive.eva_c,
-                    a,
-                    &r,
-                );
-                r.len()
-            }
-            _ => unreachable!(),
-        })
-    }
-
-    fn propose(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
+    fn propose_row(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
         let e_var = self.term_e.is_var(variable);
         let a_var = self.term_a.is_var(variable);
         let v_var = self.term_v.is_var(variable);
@@ -334,7 +249,7 @@ where
         }
     }
 
-    fn confirm(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
+    fn confirm_row(&self, variable: VariableId, binding: &Binding, cands: &mut Candidates<'_>) {
         let e_var = self.term_e.is_var(variable);
         let a_var = self.term_a.is_var(variable);
         let v_var = self.term_v.is_var(variable);
@@ -519,6 +434,121 @@ where
             _ => unreachable!("invalid trible constraint state"),
         }
     }
+}
+
+impl<'a, U> Constraint<'a> for SuccinctArchiveConstraint<'a, U>
+where
+    U: Universe,
+{
+    fn variables(&self) -> VariableSet {
+        let mut variables = VariableSet::new_empty();
+        self.term_e.add_to(&mut variables);
+        self.term_a.add_to(&mut variables);
+        self.term_v.add_to(&mut variables);
+        variables
+    }
+
+    fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+        let e_var = self.term_e.is_var(variable);
+        let a_var = self.term_a.is_var(variable);
+        let v_var = self.term_v.is_var(variable);
+
+        if !e_var && !a_var && !v_var {
+            return None;
+        }
+
+        let e_bound = self.term_e.position_value(binding);
+        let a_bound = self.term_a.position_value(binding);
+        let v_bound = self.term_v.position_value(binding);
+
+        Some(match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
+            (None, None, None, true, false, false) => self.archive.entity_count,
+            (None, None, None, false, true, false) => self.archive.attribute_count,
+            (None, None, None, false, false, true) => self.archive.value_count,
+            (Some(e), None, None, false, true, false) => {
+                let r = base_range(&self.archive.domain, &self.archive.e_a, e);
+                self.archive.distinct_in(&self.archive.changed_e_a, &r)
+            }
+            (Some(e), None, None, false, false, true) => {
+                let r = base_range(&self.archive.domain, &self.archive.e_a, e);
+                self.archive.distinct_in(&self.archive.changed_e_v, &r)
+            }
+            (None, Some(a), None, true, false, false) => {
+                let r = base_range(&self.archive.domain, &self.archive.a_a, a);
+                self.archive.distinct_in(&self.archive.changed_a_e, &r)
+            }
+            (None, Some(a), None, false, false, true) => {
+                let r = base_range(&self.archive.domain, &self.archive.a_a, a);
+                self.archive.distinct_in(&self.archive.changed_a_v, &r)
+            }
+            (None, None, Some(v), true, false, false) => {
+                let r = base_range(&self.archive.domain, &self.archive.v_a, v);
+                self.archive.distinct_in(&self.archive.changed_v_e, &r)
+            }
+            (None, None, Some(v), false, true, false) => {
+                let r = base_range(&self.archive.domain, &self.archive.v_a, v);
+                self.archive.distinct_in(&self.archive.changed_v_a, &r)
+            }
+            (None, Some(a), Some(v), true, false, false) => {
+                let r = base_range(&self.archive.domain, &self.archive.a_a, a);
+                let r = restrict_range(
+                    &self.archive.domain,
+                    &self.archive.v_a,
+                    &self.archive.aev_c,
+                    v,
+                    &r,
+                );
+                r.len()
+            }
+            (Some(e), None, Some(v), false, true, false) => {
+                let r = base_range(&self.archive.domain, &self.archive.e_a, e);
+                let r = restrict_range(
+                    &self.archive.domain,
+                    &self.archive.v_a,
+                    &self.archive.eav_c,
+                    v,
+                    &r,
+                );
+                r.len()
+            }
+            (Some(e), Some(a), None, false, false, true) => {
+                let r = base_range(&self.archive.domain, &self.archive.e_a, e);
+                let r = restrict_range(
+                    &self.archive.domain,
+                    &self.archive.a_a,
+                    &self.archive.eva_c,
+                    a,
+                    &r,
+                );
+                r.len()
+            }
+            _ => unreachable!(),
+        })
+    }
+
+    /// Enumerates matching values for every row of the batch. Which
+    /// rotation the enumeration walks depends only on the bound *set*,
+    /// which the frontier shares, so this is a plain loop over rows.
+    fn propose(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        proposals: &mut ProposalBuffer,
+    ) {
+        for row in 0..frontier.len() {
+            proposals.open(row as u32);
+            self.propose_row(variable, &frontier.row(row), proposals);
+        }
+    }
+
+    /// Confirms each candidate against its own row's bound positions.
+    fn confirm(&self, variable: VariableId, frontier: &Frontier<'_>, cands: &mut Candidates<'_>) {
+        cands.for_each_parent(|row, run| {
+            self.confirm_row(variable, &frontier.row(row as usize), run)
+        });
+    }
+
+
 
     /// When all three positions have values (bound or constant), checks
     /// whether the triple exists in the archive. Returns `true`

@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use triblespace_core::id::rngid;
 use triblespace_core::prelude::*;
 use triblespace_core::query::{
-    Binding, BindingStore, Candidates, Constraint, ContainsConstraint, ProposalBuffer, ProposeCursor, TriblePattern, Variable, VariableContext,
+    Binding, BindingStore, Candidates, Constraint, ContainsConstraint, Frontier, ProposalBuffer, TriblePattern, Variable, VariableContext,
 };
 use triblespace_core::trible::{Fragment, Trible};
 use triblespace_core::inline::encodings::genid::GenId;
@@ -55,12 +55,12 @@ proptest! {
         let v: Variable<UnknownInline> = ctx.next_variable();
         let constraint = set.pattern(e, a, v);
 
-        let binding = Binding::default();
-        let estimate = constraint.estimate(e.index, &binding).unwrap();
+        let frontier = Frontier::default();
+        let estimate = constraint.estimate(e.index, &Binding::default()).unwrap();
 
         // Estimate should be >= actual distinct entity count
         let mut proposals = ProposalBuffer::new();
-        constraint.propose(e.index, &binding, &mut proposals);
+        constraint.propose(e.index, &frontier, &mut proposals);
         prop_assert!(estimate >= proposals.len(),
             "estimate {} < actual proposals {}", estimate, proposals.len());
     }
@@ -73,9 +73,9 @@ proptest! {
         let v: Variable<UnknownInline> = ctx.next_variable();
         let constraint = set.pattern(e, a, v);
 
-        let binding = Binding::default();
+        let frontier = Frontier::default();
         let mut proposals = ProposalBuffer::new();
-        constraint.propose(e.index, &binding, &mut proposals);
+        constraint.propose(e.index, &frontier, &mut proposals);
 
         // Every proposed entity must appear in at least one trible
         for entity_raw in &proposals {
@@ -287,12 +287,12 @@ proptest! {
             Variable::<UnknownInline>::new(0),
             Inline::<UnknownInline>::new(val),
         );
-        let binding = Binding::default();
+        let frontier = Frontier::default();
 
-        prop_assert_eq!(c.estimate(0, &binding), Some(1));
+        prop_assert_eq!(c.estimate(0, &Binding::default()), Some(1));
 
         let mut proposals = ProposalBuffer::new();
-        c.propose(0, &binding, &mut proposals);
+        c.propose(0, &frontier, &mut proposals);
         prop_assert_eq!(proposals.len(), 1);
         prop_assert_eq!(proposals[0], val);
     }
@@ -308,11 +308,11 @@ proptest! {
             Variable::<UnknownInline>::new(0),
             Inline::<UnknownInline>::new(constant),
         );
-        let binding = Binding::default();
+        let frontier = Frontier::default();
 
         let mut proposals = ProposalBuffer::new();
         proposals.push(candidate);
-        c.confirm(0, &binding, &mut proposals.region(0));
+        c.confirm(0, &frontier, &mut proposals.region(0));
 
         if constant == candidate {
             prop_assert_eq!(proposals.count_live(0), 1);
@@ -643,7 +643,7 @@ proptest! {
 
         // Propose should yield the peer's value
         let mut proposals = ProposalBuffer::new();
-        eq.propose(1, &binding.view(), &mut proposals);
+        eq.propose(1, &binding.frontier(), &mut proposals);
         prop_assert_eq!(proposals.len(), 1);
         prop_assert_eq!(proposals[0], val);
     }
@@ -662,7 +662,7 @@ proptest! {
         let mut proposals = ProposalBuffer::new();
         proposals.push(peer_val);
         proposals.push(other_val);
-        eq.confirm(1, &binding.view(), &mut proposals.region(0));
+        eq.confirm(1, &binding.frontier(), &mut proposals.region(0));
 
         if peer_val == other_val {
             prop_assert_eq!(proposals.count_live(0), 2); // both match
@@ -694,8 +694,8 @@ proptest! {
         let eq = EqualityConstraint::new(0, 1);
 
         // Neither bound — optimistically true
-        let binding = Binding::default();
-        prop_assert!(eq.satisfied(&binding));
+        let frontier = Frontier::default();
+        prop_assert!(eq.satisfied(&Binding::default()));
 
         // One bound — optimistically true
         let mut binding = BindingStore::new();
@@ -715,13 +715,13 @@ proptest! {
         let mut binding_a = BindingStore::new();
         binding_a.bind(0, &val);
         let mut props_b = ProposalBuffer::new();
-        eq.propose(1, &binding_a.view(), &mut props_b);
+        eq.propose(1, &binding_a.frontier(), &mut props_b);
 
         // Bind b=val, propose for a → val
         let mut binding_b = BindingStore::new();
         binding_b.bind(1, &val);
         let mut props_a = ProposalBuffer::new();
-        eq.propose(0, &binding_b.view(), &mut props_a);
+        eq.propose(0, &binding_b.frontier(), &mut props_a);
 
         prop_assert_eq!(&props_a[..], &props_b[..]);
     }
@@ -822,15 +822,15 @@ proptest! {
 
 }
 
-/// Test-only constraint that delivers a fixed sorted value set in cursor-
-/// resumable chunks — exercises the widening path end to end (the library
-/// sources all default to one-shot delivery today).
-struct ChunkedValues {
+/// Test-only source that records the *width* of every frontier it is
+/// proposed over — the thing the batched protocol exists to make large.
+struct WidthObserver {
     variable: usize,
     values: Vec<[u8; 32]>,
+    widths: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
 }
 
-impl<'a> Constraint<'a> for ChunkedValues {
+impl<'a> Constraint<'a> for WidthObserver {
     fn variables(&self) -> triblespace_core::query::VariableSet {
         let mut set = triblespace_core::query::VariableSet::new_empty();
         set.set(self.variable);
@@ -841,216 +841,150 @@ impl<'a> Constraint<'a> for ChunkedValues {
         (variable == self.variable).then_some(self.values.len())
     }
 
-    fn propose(&self, variable: usize, binding: &Binding, proposals: &mut ProposalBuffer) {
-        let mut cursor = ProposeCursor::default();
-        while self.propose_chunk(variable, binding, &mut cursor, usize::MAX, proposals) {}
-    }
-
-    fn propose_chunk(
+    fn propose(
         &self,
         variable: usize,
-        _binding: &Binding,
-        cursor: &mut ProposeCursor,
-        budget: usize,
+        frontier: &triblespace_core::query::Frontier<'_>,
         proposals: &mut ProposalBuffer,
-    ) -> bool {
+    ) {
         if variable != self.variable {
-            return false;
+            return;
         }
-        let mut delivered = u64::from_le_bytes(cursor.key[0..8].try_into().unwrap()) as usize;
-        if !cursor.started {
-            cursor.started = true;
-            delivered = 0;
+        self.widths.lock().unwrap().push(frontier.len());
+        for row in 0..frontier.len() {
+            proposals.open(row as u32);
+            proposals.extend_from_slice(&self.values);
         }
-        let take = budget.min(self.values.len() - delivered);
-        proposals.extend_from_slice(&self.values[delivered..delivered + take]);
-        let delivered = delivered + take;
-        cursor.key[0..8].copy_from_slice(&(delivered as u64).to_le_bytes());
-        delivered < self.values.len()
     }
 
-    fn confirm(&self, variable: usize, _binding: &Binding, cands: &mut Candidates<'_>) {
+    fn confirm(
+        &self,
+        variable: usize,
+        _frontier: &triblespace_core::query::Frontier<'_>,
+        cands: &mut Candidates<'_>,
+    ) {
         if variable == self.variable {
             cands.retain(|v| self.values.binary_search(v).is_ok());
         }
     }
+}
+
+/// A two-variable query over `values`, run at the given frontier width.
+fn cross_product_rows(
+    values: &[[u8; 32]],
+    width: usize,
+    widths: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+) -> Vec<([u8; 32], [u8; 32])> {
+    let outer = WidthObserver {
+        variable: 0,
+        values: values.to_vec(),
+        widths: std::sync::Arc::clone(&widths),
+    };
+    let inner = WidthObserver {
+        variable: 1,
+        values: values.to_vec(),
+        widths,
+    };
+    triblespace_core::query::Query::new(
+        triblespace_core::query::intersectionconstraint::IntersectionConstraint::new(vec![
+            Box::new(outer) as Box<dyn Constraint + Send + Sync>,
+            Box::new(inner),
+        ]),
+        |binding: &Binding| Some((*binding.get(0)?, *binding.get(1)?)),
+    )
+    .with_frontier_width(width)
+    .collect()
 }
 
 proptest! {
+    /// The batch width is an execution choice, not a semantic one: a
+    /// frontier of one (the pre-batching shape) and a wide frontier must
+    /// produce the very same bag of rows.
     #[test]
-    fn chunked_proposing_matches_eager(
-        seed_values in vec(prop::array::uniform32(any::<u8>()), 1..600),
-        allowed in vec(prop::array::uniform32(any::<u8>()), 0..40),
-    ) {
-        // Values large enough to span several geometric chunks (64, 256, ...).
-        let mut values: Vec<[u8; 32]> = seed_values;
-        // Guarantee some accepted candidates so the query has results.
-        values.extend(allowed.iter().copied());
-        values.sort_unstable();
-        values.dedup();
-
-        let mut accept: Vec<[u8; 32]> = allowed;
-        accept.sort_unstable();
-        accept.dedup();
-
-        let chunked = ChunkedValues { variable: 0, values: values.clone() };
-        // Byte-lexicographic band as the confirmer: estimate usize::MAX, so
-        // the chunked source is always the proposer and the range confirms
-        // each chunk through the mask path.
-        let lo = accept.first().copied().unwrap_or([0x40; 32]);
-        let hi = accept.last().copied().unwrap_or([0xC0; 32]);
-        let range = triblespace_core::query::rangeconstraint::InlineRange::new(
-            Variable::<UnknownInline>::new(0),
-            Inline::<UnknownInline>::new(lo),
-            Inline::<UnknownInline>::new(hi),
-        );
-
-        // Chunked source joined with the range filter, driven by the engine.
-        let results: HashSet<[u8; 32]> = triblespace_core::query::Query::new(
-            triblespace_core::query::intersectionconstraint::IntersectionConstraint::new(vec![
-                Box::new(chunked) as Box<dyn Constraint + Send + Sync>,
-                Box::new(range),
-            ]),
-            |binding: &Binding| binding.get(0).copied(),
-        )
-        .collect();
-
-        // Eager oracle: plain filter.
-        let expected: HashSet<[u8; 32]> = values
-            .iter()
-            .filter(|v| **v >= lo && **v <= hi)
-            .copied()
-            .collect();
-        prop_assert_eq!(results, expected);
-    }
-
-    #[test]
-    fn chunked_proposing_no_duplicate_delivery(
-        seed_values in vec(prop::array::uniform32(any::<u8>()), 1..600),
+    fn frontier_width_preserves_the_bag(
+        seed_values in vec(prop::array::uniform32(any::<u8>()), 1..24),
     ) {
         let mut values: Vec<[u8; 32]> = seed_values;
         values.sort_unstable();
         values.dedup();
-        let expected = values.len();
 
-        let chunked = ChunkedValues { variable: 0, values };
-        // Bag semantics: each complete binding must surface exactly once —
-        // duplicate chunk delivery would inflate this count.
-        let results: Vec<[u8; 32]> = triblespace_core::query::Query::new(
-            chunked,
-            |binding: &Binding| binding.get(0).copied(),
-        )
-        .collect();
-        prop_assert_eq!(results.len(), expected);
-    }
-}
+        let narrow_widths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let wide_widths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut narrow = cross_product_rows(&values, 1, std::sync::Arc::clone(&narrow_widths));
+        let mut wide = cross_product_rows(&values, 4096, std::sync::Arc::clone(&wide_widths));
 
-/// Chunked source that records what the binding resolved to for its own
-/// variable on every `propose_chunk` call.
-///
-/// Bindings are indexes into the per-level proposal buffers, so the level
-/// a widen request appends to is the same one the current binding reads
-/// through. This constraint pins that: the engine reaches a widen by
-/// consuming the materialized region dry, which leaves the level's
-/// variable bound to the last entry it handed out.
-struct WidenObserver {
-    variable: usize,
-    values: Vec<[u8; 32]>,
-    seen: std::sync::Arc<std::sync::Mutex<Vec<Option<[u8; 32]>>>>,
-}
+        prop_assert_eq!(narrow.len(), values.len() * values.len());
+        narrow.sort_unstable();
+        wide.sort_unstable();
+        prop_assert_eq!(narrow, wide);
 
-impl<'a> Constraint<'a> for WidenObserver {
-    fn variables(&self) -> triblespace_core::query::VariableSet {
-        let mut set = triblespace_core::query::VariableSet::new_empty();
-        set.set(self.variable);
-        set
-    }
-
-    fn estimate(&self, variable: usize, _binding: &Binding) -> Option<usize> {
-        (variable == self.variable).then_some(self.values.len())
-    }
-
-    fn propose(&self, variable: usize, binding: &Binding, proposals: &mut ProposalBuffer) {
-        let mut cursor = ProposeCursor::default();
-        while self.propose_chunk(variable, binding, &mut cursor, usize::MAX, proposals) {}
-    }
-
-    fn propose_chunk(
-        &self,
-        variable: usize,
-        binding: &Binding,
-        cursor: &mut ProposeCursor,
-        budget: usize,
-        proposals: &mut ProposalBuffer,
-    ) -> bool {
-        if variable != self.variable {
-            return false;
-        }
-        // The observation under test: resolving the binding for the very
-        // variable being proposed for, mid-propose.
-        self.seen
-            .lock()
-            .unwrap()
-            .push(binding.get(variable).copied());
-        let mut delivered = u64::from_le_bytes(cursor.key[0..8].try_into().unwrap()) as usize;
-        if !cursor.started {
-            cursor.started = true;
-            delivered = 0;
-        }
-        let take = budget.min(self.values.len() - delivered);
-        proposals.extend_from_slice(&self.values[delivered..delivered + take]);
-        let delivered = delivered + take;
-        cursor.key[0..8].copy_from_slice(&(delivered as u64).to_le_bytes());
-        delivered < self.values.len()
-    }
-
-    fn confirm(&self, variable: usize, _binding: &Binding, cands: &mut Candidates<'_>) {
-        if variable == self.variable {
-            cands.retain(|v| self.values.binary_search(v).is_ok());
+        // ... and the width actually reached the second level, which is the
+        // whole point: with a frontier of one, every deeper propose sees a
+        // single parent binding.
+        prop_assert!(narrow_widths.lock().unwrap().iter().all(|&w| w == 1));
+        if values.len() > 1 {
+            prop_assert!(wide_widths.lock().unwrap().iter().any(|&w| w > 1));
         }
     }
 }
 
 #[test]
-fn widening_a_level_keeps_its_variable_resolvable() {
-    // Enough values to span the 64 / 256 / 1024 geometric chunk ladder.
-    let mut values: Vec<[u8; 32]> = (0..500u32)
+fn deep_levels_see_a_wide_frontier() {
+    // Two levels of 40 values each: at width 1 the inner level is proposed
+    // over one binding 40 times; batched, it is proposed over all 40 at
+    // once.
+    let values: Vec<[u8; 32]> = (0..40u32)
         .map(|i| {
             let mut v = [0u8; 32];
             v[28..32].copy_from_slice(&i.to_be_bytes());
             v
         })
         .collect();
-    values.sort_unstable();
 
-    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let source = WidenObserver {
+    let widths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let rows = cross_product_rows(&values, 4096, std::sync::Arc::clone(&widths));
+    assert_eq!(rows.len(), 40 * 40);
+
+    let widths = widths.lock().unwrap();
+    assert_eq!(widths.as_slice(), &[1, 40], "root then one 40-wide expansion");
+}
+
+#[test]
+fn frontier_stats_report_an_unfragmented_batch() {
+    let values: Vec<[u8; 32]> = (0..8u32)
+        .map(|i| {
+            let mut v = [0u8; 32];
+            v[28..32].copy_from_slice(&i.to_be_bytes());
+            v
+        })
+        .collect();
+
+    let widths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let outer = WidthObserver {
         variable: 0,
         values: values.clone(),
-        seen: std::sync::Arc::clone(&seen),
+        widths: std::sync::Arc::clone(&widths),
     };
+    let inner = WidthObserver {
+        variable: 1,
+        values: values.clone(),
+        widths,
+    };
+    let query = triblespace_core::query::Query::new(
+        triblespace_core::query::intersectionconstraint::IntersectionConstraint::new(vec![
+            Box::new(outer) as Box<dyn Constraint + Send + Sync>,
+            Box::new(inner),
+        ]),
+        |binding: &Binding| Some((*binding.get(0)?, *binding.get(1)?)),
+    );
+    let stats = query.stats();
+    let rows: Vec<_> = query.collect();
 
-    let results: Vec<[u8; 32]> = triblespace_core::query::Query::new(source, |binding: &Binding| {
-        binding.get(0).copied()
-    })
-    .collect();
-    assert_eq!(results, values);
-
-    let seen = seen.lock().unwrap();
-    // 500 values over budgets 64, 256, 1024 — three calls, the last of
-    // which reports exhaustion.
-    assert!(seen.len() >= 3, "expected several chunks, got {}", seen.len());
-    // The level is pushed while its variable is unbound...
-    assert_eq!(seen[0], None);
-    // ...and every widen after that happens with the variable still bound
-    // to the last entry the level handed out.
-    let mut consumed = 0usize;
-    for (chunk, observed) in seen[1..].iter().enumerate() {
-        consumed += [64usize, 256, 1024][chunk].min(values.len() - consumed);
-        assert_eq!(
-            *observed,
-            Some(values[consumed - 1]),
-            "widen #{chunk} should resolve the level's current binding"
-        );
-    }
+    assert_eq!(rows.len(), 64);
+    // Root expansion (1 row) plus one 8-row expansion; both agreed on the
+    // variable to bind, so the batch never fragmented.
+    assert_eq!(stats.expansions(), 2);
+    assert_eq!(stats.rows(), 1 + 8);
+    assert_eq!(stats.variable_groups(), 2);
+    assert_eq!(stats.mean_variable_groups(), 1.0);
 }

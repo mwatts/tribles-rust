@@ -9,6 +9,7 @@ use crate::inline::INLINE_LEN;
 
 use super::Binding;
 use super::Constraint;
+use super::Frontier;
 use super::ContainsConstraint;
 use super::Variable;
 use super::VariableId;
@@ -44,14 +45,23 @@ impl<'a, S: InlineEncoding> Constraint<'a> for PatchValueConstraint<'a, S> {
         }
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut ProposalBuffer) {
+    fn propose(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        proposals: &mut ProposalBuffer,
+    ) {
         if self.variable.index == variable {
-            self.patch
-                .infixes(&[0; 0], &mut |&k: &[u8; 32]| proposals.push(k));
+            for row in 0..frontier.len() {
+                proposals.open(row as u32);
+                self.patch
+                    .infixes(&[0; 0], &mut |&k: &[u8; 32]| proposals.push(k));
+            }
         }
     }
 
-    fn confirm(&self, variable: VariableId, _binding: &Binding, cands: &mut Candidates<'_>) {
+    /// Prefix membership does not depend on the parent binding.
+    fn confirm(&self, variable: VariableId, _frontier: &Frontier<'_>, cands: &mut Candidates<'_>) {
         if self.variable.index == variable {
             for i in 0..cands.len() {
                 let v = &cands.values()[i];
@@ -110,15 +120,29 @@ where
         }
     }
 
-    fn propose(&self, variable: VariableId, _binding: &Binding, proposals: &mut ProposalBuffer) {
+    fn propose(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        proposals: &mut ProposalBuffer,
+    ) {
         if self.variable.index == variable {
-            self.patch.infixes(&[0; 0], &mut |id: &[u8; 16]| {
-                proposals.push(id_into_value(id))
-            });
+            for row in 0..frontier.len() {
+                proposals.open(row as u32);
+                self.patch.infixes(&[0; 0], &mut |id: &[u8; 16]| {
+                    proposals.push(id_into_value(id))
+                });
+            }
         }
     }
 
-    fn confirm(&self, _variable: VariableId, _binding: &Binding, cands: &mut Candidates<'_>) {
+    /// Prefix membership does not depend on the parent binding.
+    fn confirm(
+        &self,
+        _variable: VariableId,
+        _frontier: &Frontier<'_>,
+        cands: &mut Candidates<'_>,
+    ) {
         for i in 0..cands.len() {
                 let v = &cands.values()[i];
             if !cands.is_live(i) {
