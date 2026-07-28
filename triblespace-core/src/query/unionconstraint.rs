@@ -126,6 +126,11 @@ where
         // them. The union's set semantics need the sort-dedup, and the key
         // is `(row, value)`: the set is per parent binding, not across the
         // batch. Sorting by that key also restores contiguous segments.
+        // `tagged` yields only live entries, which matters here: a variant
+        // may kill inside its own propose (an `and!` arm whose narrow side
+        // confirms as it goes), and `rewrite_region` republishes everything
+        // it is handed as live, so reading the dead back would resurrect
+        // them.
         let mut fresh: Vec<(u32, RawInline)> = proposals.tagged(base).collect();
         fresh.sort_unstable();
         fresh.dedup();

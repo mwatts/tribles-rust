@@ -923,14 +923,24 @@ impl ProposalBuffer {
         }
     }
 
-    /// The freshly-proposed region `[base..]` as `(parent tag, value)`
-    /// pairs — the form [`rewrite_region`](ProposalBuffer::rewrite_region)
-    /// takes back.
+    /// The **live** entries of the freshly-proposed region `[base..]` as
+    /// `(parent tag, value)` pairs — the form
+    /// [`rewrite_region`](ProposalBuffer::rewrite_region) takes back.
+    ///
+    /// Killed entries are skipped, which is what makes the round trip
+    /// through `rewrite_region` safe: that call republishes everything it is
+    /// handed as live, so yielding the dead here would resurrect them. The
+    /// buffer is kill-only, and this pair of methods is the only place that
+    /// invariant could be broken — a variant is free to kill inside its own
+    /// propose, and those kills must survive the region being rebuilt.
     pub fn tagged(&self, base: usize) -> impl Iterator<Item = (u32, RawInline)> + '_ {
         self.parents[base..]
             .iter()
             .copied()
             .zip(self.entries[base..].iter().copied())
+            .zip(self.live[base..].iter())
+            .filter(|(_, w)| **w != 0)
+            .map(|(pair, _)| pair)
     }
 
     /// Drops entries of the freshly-proposed region `[base..]` for which
