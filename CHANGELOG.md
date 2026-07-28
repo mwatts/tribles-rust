@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alternative, repetition, optionality, and structural inversion, normalizes
   associative/commutative structure deterministically, and lowers with the
   Glushkov position construction without restoring query-time traversal or a
-  path macro.
+  path macro. Regression coverage pins repeated multi-position cycles and the
+  complete expression-to-rollup-to-query lifecycle.
 - **`triblespace-paths` provides exact regular-path indexes outside the core
   query solver.** Fixed epsilon-free automata lower graph edges into unionable
   direct-product summaries. A single SCC/bitset kernel materializes canonical

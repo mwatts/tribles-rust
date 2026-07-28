@@ -1,7 +1,16 @@
 use std::collections::BTreeSet;
 
-use triblespace_core::inline::RawInline;
-use triblespace_paths::{automaton_fingerprint, GraphEdge, PathExpr, PathIndex, Step};
+use ed25519_dalek::SigningKey;
+use triblespace_core::id::{ExclusiveId, Id};
+use triblespace_core::inline::encodings::UnknownInline;
+use triblespace_core::inline::{Inline, RawInline};
+use triblespace_core::macros::entity;
+use triblespace_core::metadata;
+use triblespace_core::query::{Binding, Query, Variable};
+use triblespace_core::repo::memoryrepo::MemoryRepo;
+use triblespace_core::repo::Repository;
+use triblespace_core::trible::TribleSet;
+use triblespace_paths::{automaton_fingerprint, GraphEdge, PathExpr, PathIndex, PathRollup, Step};
 
 fn vertex(byte: u8) -> RawInline {
     [byte; 32]
@@ -17,6 +26,16 @@ fn edge(source: u8, label: u8, target: u8) -> GraphEdge {
         attribute: attribute(label),
         target: vertex(target),
     }
+}
+
+fn id(byte: u8) -> Id {
+    Id::new([byte; 16]).unwrap()
+}
+
+fn tagged_edge(source: u8, target: u8) -> TribleSet {
+    let source = id(source);
+    let target = id(target);
+    entity! { ExclusiveId::force_ref(&source) @ metadata::tag: target }.into_facts()
 }
 
 #[test]
@@ -57,4 +76,38 @@ fn canonical_expression_construction_stabilizes_automaton_fingerprints() {
 
     assert_eq!(left, right);
     assert_eq!(automaton_fingerprint(&left), automaton_fingerprint(&right));
+}
+
+#[test]
+fn compiled_expression_roundtrips_through_rollup_and_query_constraint() {
+    let expression = PathExpr::from(Step::Forward(metadata::tag.id().into())).plus();
+    let rollup = PathRollup::new(expression.compile());
+    let mut repo = Repository::new(
+        MemoryRepo::default(),
+        SigningKey::from_bytes(&[17; 32]),
+        TribleSet::new(),
+    )
+    .unwrap();
+    repo.register_index(rollup.clone());
+    let branch_id = *repo.create_branch("path-expr", None).unwrap();
+
+    let mut graph = tagged_edge(1, 2);
+    graph += tagged_edge(2, 3);
+    let mut workspace = repo.pull(branch_id).unwrap();
+    workspace.commit(graph, "materialize compiled path expression");
+    repo.push(&mut workspace).unwrap();
+    assert!(repo.take_hook_errors().is_empty());
+
+    let index = rollup.attach_exact(repo.storage_mut(), branch_id).unwrap();
+    let end = Variable::<UnknownInline>::new(0);
+    let start = Inline::<UnknownInline>::new(RawInline::from(id(1)));
+    let reachable = Query::new(index.constraint(start, end), |binding: &Binding| {
+        binding.get(end.index).copied()
+    })
+    .collect::<BTreeSet<_>>();
+
+    assert_eq!(
+        reachable,
+        BTreeSet::from([RawInline::from(id(2)), RawInline::from(id(3))])
+    );
 }

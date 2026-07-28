@@ -186,7 +186,8 @@ impl PathExpr {
     /// Atomic occurrences are numbered deterministically in canonical-tree
     /// order. State zero is the sole initial state; every other state denotes
     /// the most recently consumed atomic occurrence. The construction is
-    /// linear in the expression plus its `follow` relation and introduces no
+    /// output-sensitive in the expression and generated `follow` relation;
+    /// ordered-set maintenance may add logarithmic factors. It introduces no
     /// epsilon transitions or determinization step.
     ///
     /// # Panics
@@ -558,6 +559,20 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn repeated_sequence_completes_a_second_cycle() {
+        let expression = atom(1).then(atom(2)).star();
+        let word = [
+            (false, label(1)),
+            (false, label(2)),
+            (false, label(1)),
+            (false, label(2)),
+        ];
+
+        assert!(direct_ends(&expression, &word, 0).contains(&word.len()));
+        assert!(automaton_accepts(&expression.compile(), &word));
     }
 
     #[test]
