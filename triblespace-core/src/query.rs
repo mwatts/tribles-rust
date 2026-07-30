@@ -44,9 +44,6 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-#[cfg(feature = "parallel")]
-use std::sync::Mutex;
-
 use arrayvec::ArrayVec;
 use constantconstraint::*;
 
@@ -769,8 +766,6 @@ impl BindingStore {
         self.bound.unset(variable);
     }
 }
-
-type ProjectionKey = Box<[RawInline]>;
 
 /// Growable buffer of candidate values for one variable at one search level
 /// — the write target of [`Constraint::propose`] and the engine's per-level
@@ -2899,19 +2894,6 @@ mod tests {
         let r: Vec<_> = q.collect();
         assert_eq!(1, r.len());
         assert_eq!(&*record.borrow(), &[b.index, a.index]);
-    }
-
-    #[derive(Clone)]
-    struct SetAdmissionProbe {
-        descendants: std::sync::Arc<std::sync::Mutex<Vec<RawInline>>>,
-    }
-
-    impl SetAdmissionProbe {
-        const ROOT: VariableId = 0;
-        const LEAF: VariableId = 1;
-        const A: RawInline = [4; 32];
-        const B: RawInline = [5; 32];
-        const LEAF_VALUE: RawInline = [6; 32];
     }
 
     #[cfg(feature = "parallel")]

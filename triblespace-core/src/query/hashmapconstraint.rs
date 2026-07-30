@@ -6,7 +6,6 @@ use std::sync::Arc;
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
 use crate::inline::IntoInline;
-use crate::inline::RawInline;
 use crate::inline::TryFromInline;
 use crate::query::Binding;
 use crate::query::Candidates;

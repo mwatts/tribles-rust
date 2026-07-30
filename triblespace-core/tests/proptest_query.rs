@@ -2,7 +2,6 @@ use proptest::collection::vec;
 use proptest::prelude::*;
 use std::collections::HashSet;
 use triblespace_core::id::rngid;
-use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::prelude::*;
 use triblespace_core::query::{

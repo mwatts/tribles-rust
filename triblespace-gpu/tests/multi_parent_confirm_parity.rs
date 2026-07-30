@@ -8,7 +8,6 @@
 use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::RawInline;
-use triblespace_core::prelude::*;
 use triblespace_core::query::{Binding, Constraint, TriblePattern, VariableContext};
 use triblespace_core::trible::{Trible, TribleSet};
 use triblespace_gpu::WgpuSuccinctArchive;

@@ -215,10 +215,6 @@ impl PathIndex {
             .map(|&ordinal| self.summary.vertices[ordinal as usize])
     }
 
-    pub(crate) fn value(&self, ordinal: u32) -> RawInline {
-        self.summary.vertices[ordinal as usize]
-    }
-
     pub(crate) fn forward_ordinals(&self, source: &RawInline) -> &[u32] {
         self.summary
             .vertices

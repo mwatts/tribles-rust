@@ -1,6 +1,5 @@
 /// Diagnostic wrappers for the query engine used in tests.
 pub mod query {
-    use crate::inline::RawInline;
     use crate::query::Binding;
     use crate::query::Candidates;
     use crate::query::Constraint;

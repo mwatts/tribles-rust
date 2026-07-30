@@ -1,7 +1,5 @@
-use proc_macro2::Delimiter;
 use proc_macro2::Span;
 use proc_macro2::TokenStream as TokenStream2;
-use proc_macro2::TokenTree;
 use quote::format_ident;
 use quote::quote;
 use quote::ToTokens;
@@ -12,7 +10,6 @@ use syn::parse::ParseStream;
 use syn::punctuated::Punctuated;
 use syn::Expr;
 use syn::Ident;
-use syn::Path;
 use syn::Token;
 
 mod attributes;

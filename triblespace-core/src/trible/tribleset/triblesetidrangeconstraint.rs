@@ -4,7 +4,6 @@ use crate::id::Id;
 use crate::id::RawId;
 use crate::id::ID_LEN;
 use crate::inline::encodings::genid::GenId;
-use crate::inline::RawInline;
 use crate::query::Binding;
 use crate::query::Candidates;
 use crate::query::Constraint;

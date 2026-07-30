@@ -12,9 +12,6 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-#[cfg(test)]
-use std::cell::Cell;
-
 use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
 use crate::blob::encodings::succinctarchive::{
     merge_ordered_archives, merge_ordered_archives_with_backend, OrderedUniverse, SuccinctArchive,
@@ -1374,58 +1371,6 @@ impl<U> UnionArchive<U> {
     pub fn segment_count(&self) -> usize {
         self.segments.len()
     }
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct UnionCompleteWalkCounts {
-    located: usize,
-    consumed: usize,
-}
-
-#[cfg(test)]
-thread_local! {
-    static UNION_COMPLETE_WALK_COUNTS: Cell<Option<UnionCompleteWalkCounts>> = const {
-        Cell::new(None)
-    };
-}
-
-#[cfg(test)]
-fn arm_union_complete_walk_counts() {
-    UNION_COMPLETE_WALK_COUNTS.with(|counts| {
-        assert!(counts
-            .replace(Some(UnionCompleteWalkCounts::default()))
-            .is_none());
-    });
-}
-
-#[cfg(test)]
-fn record_union_complete_walk_located() {
-    UNION_COMPLETE_WALK_COUNTS.with(|counts| {
-        if let Some(mut count) = counts.get() {
-            count.located += 1;
-            counts.set(Some(count));
-        }
-    });
-}
-
-#[cfg(test)]
-fn record_union_complete_walk_consumed() {
-    UNION_COMPLETE_WALK_COUNTS.with(|counts| {
-        if let Some(mut count) = counts.get() {
-            count.consumed += 1;
-            counts.set(Some(count));
-        }
-    });
-}
-
-#[cfg(test)]
-fn take_union_complete_walk_counts() -> UnionCompleteWalkCounts {
-    UNION_COMPLETE_WALK_COUNTS.with(|counts| {
-        counts
-            .take()
-            .expect("Union complete walk counter was not armed")
-    })
 }
 
 /// Atomic normalized union over one finite set of Succinct archive shards.
