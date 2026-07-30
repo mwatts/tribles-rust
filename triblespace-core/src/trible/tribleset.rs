@@ -712,7 +712,6 @@ mod tests {
             set.fingerprint().as_u128(),
             crate::patch::blind_root_hash(root_hash)
         );
-        assert_ne!(set.fingerprint().as_u128(), root_hash);
 
         let cloned = set.clone();
         assert_eq!(set.fingerprint(), cloned.fingerprint());

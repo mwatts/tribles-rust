@@ -500,6 +500,8 @@ fn hash_keys() -> &'static HashKeys {
         let mut leaf = [0u8; 16];
         let mut exported_fingerprint = [0u8; 16];
         rng.fill_bytes(&mut leaf);
+        // Make key separation exact rather than adding a second, avoidable
+        // 2^-128 assumption to the public-boundary argument.
         loop {
             rng.fill_bytes(&mut exported_fingerprint);
             if exported_fingerprint != leaf {
@@ -563,7 +565,7 @@ pub(crate) fn blind_root_hash(root_hash: Option<u128>) -> Option<u128> {
     ))
 }
 
-/// Hash one PATCH key with the process-local set-fingerprint key.
+/// Hash one PATCH key with the process-local internal leaf key.
 ///
 /// Bulk archive construction calls this once per source row and shares the
 /// result across all six index builds. Initializing here is important because
