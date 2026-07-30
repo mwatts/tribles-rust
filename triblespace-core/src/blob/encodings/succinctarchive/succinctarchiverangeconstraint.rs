@@ -1,15 +1,15 @@
 use super::*;
+use crate::inline::Inline;
+use crate::inline::InlineEncoding;
+use crate::inline::RawInline;
 use crate::query::Binding;
+use crate::query::Candidates;
 use crate::query::Constraint;
 use crate::query::Frontier;
-use crate::query::Candidates;
 use crate::query::ProposalBuffer;
 use crate::query::Variable;
 use crate::query::VariableId;
 use crate::query::VariableSet;
-use crate::inline::RawInline;
-use crate::inline::Inline;
-use crate::inline::InlineEncoding;
 
 /// Inline-range constraint for [`SuccinctArchive`].
 ///

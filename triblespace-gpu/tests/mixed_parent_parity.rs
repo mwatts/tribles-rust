@@ -510,7 +510,10 @@ fn mixed_parent_range_arms_match_cpu() {
         "double-bound parents all shared one row band: {log:?}"
     );
     let stats = fixture.gpu.stats();
-    assert_eq!(stats.gpu_errors, 0, "device errors demoted confirms: {stats:?}");
+    assert_eq!(
+        stats.gpu_errors, 0,
+        "device errors demoted confirms: {stats:?}"
+    );
     assert_eq!(
         stats.cpu_fallback_confirms, 0,
         "a confirm skipped the device: {stats:?}"
@@ -542,7 +545,10 @@ fn mixed_parent_regions_fall_back_below_threshold() {
 
     assert_eq!(fallback_stats.gpu_confirms, 0, "{fallback_stats:?}");
     assert_eq!(fallback_stats.gpu_parents, 0, "{fallback_stats:?}");
-    assert!(fallback_stats.cpu_fallback_confirms > 0, "{fallback_stats:?}");
+    assert!(
+        fallback_stats.cpu_fallback_confirms > 0,
+        "{fallback_stats:?}"
+    );
     for (arm, (routed, fallback)) in routed.arms.iter().zip(fallback.arms.iter()).enumerate() {
         assert_eq!(
             (routed.confirms, routed.candidates),

@@ -117,12 +117,7 @@ fn rows(dataset: &TribleSet) -> HashSet<([u8; 32], String)> {
             pattern!(dataset, [{ ?p @ profile::nickname: "Bob", profile::display_name: ?out }])
         )
     )
-    .map(|(p, out)| {
-        (
-            p.raw,
-            out.try_from_inline::<&str>().unwrap().to_string(),
-        )
-    })
+    .map(|(p, out)| (p.raw, out.try_from_inline::<&str>().unwrap().to_string()))
     .collect()
 }
 
@@ -178,7 +173,11 @@ fn or_of_gated_arms_equals_the_union_of_the_arms() {
     .collect();
 
     let oracle: HashSet<_> = arm_a.union(&arm_b).cloned().collect();
-    assert_eq!(rows(&dataset), oracle, "or! must equal the set-union oracle");
+    assert_eq!(
+        rows(&dataset),
+        oracle,
+        "or! must equal the set-union oracle"
+    );
 }
 
 /// The same leak reached through `UnionConstraint::confirm` instead of

@@ -5,11 +5,11 @@ use std::ops::Range;
 use smallvec::SmallVec;
 
 use super::*;
-use crate::query::*;
 use crate::inline::encodings::genid::GenId;
-use jerky::bit_vector::Select;
 use crate::query::Candidates;
 use crate::query::ProposalBuffer;
+use crate::query::*;
+use jerky::bit_vector::Select;
 
 /// Batch size at which this source stops probing in frontier order and
 /// probes in **index order** instead.
@@ -156,7 +156,11 @@ where
     }
 }
 
-pub(super) fn base_range<U>(universe: &U, a: &BitVector<Rank9SelIndex>, value: &RawInline) -> Range<usize>
+pub(super) fn base_range<U>(
+    universe: &U,
+    a: &BitVector<Rank9SelIndex>,
+    value: &RawInline,
+) -> Range<usize>
 where
     U: Universe,
 {
@@ -560,9 +564,7 @@ where
     /// batched entry points can skip building a probe-key matrix for a
     /// variable they have no opinion about.
     fn touches(&self, variable: VariableId) -> bool {
-        self.term_e.is_var(variable)
-            || self.term_a.is_var(variable)
-            || self.term_v.is_var(variable)
+        self.term_e.is_var(variable) || self.term_a.is_var(variable) || self.term_v.is_var(variable)
     }
 
     /// Appends the bytes of every position this constraint reads under
@@ -831,8 +833,6 @@ where
             run_start = run_end;
         }
     }
-
-
 
     /// When all three positions have values (bound or constant), checks
     /// whether the triple exists in the archive. Returns `true`

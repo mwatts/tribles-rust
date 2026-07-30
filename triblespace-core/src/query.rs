@@ -1173,7 +1173,6 @@ pub fn or_words(words: &mut [u32], other: &[u32]) {
     }
 }
 
-
 /// The cooperative protocol that every query participant implements.
 ///
 /// A constraint restricts the values that can be assigned to query variables.
@@ -1302,12 +1301,7 @@ pub trait Constraint<'a> {
     /// ignores the tags.
     ///
     /// Does nothing when `variable` is not constrained by this constraint.
-    fn confirm(
-        &self,
-        variable: VariableId,
-        frontier: &Frontier<'_>,
-        cands: &mut Candidates<'_>,
-    );
+    fn confirm(&self, variable: VariableId, frontier: &Frontier<'_>, cands: &mut Candidates<'_>);
 
     /// Returns whether this constraint is consistent with the current
     /// `binding`.
@@ -2009,9 +2003,10 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         self.stats.expansions.fetch_add(1, Ordering::Relaxed);
         self.stats.rows.fetch_add(rows as u64, Ordering::Relaxed);
         self.stats.widest.fetch_max(rows as u64, Ordering::Relaxed);
-        self.stats
-            .variable_groups
-            .fetch_add(self.depths[self.depth].groups.len() as u64, Ordering::Relaxed);
+        self.stats.variable_groups.fetch_add(
+            self.depths[self.depth].groups.len() as u64,
+            Ordering::Relaxed,
+        );
         self.mode = Search::NextGroup;
     }
 
@@ -2150,10 +2145,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         // `FRONTIER_RAMP_BASE` for why the base is what decides that).
         let consumed = self.bindings.consumed(variable);
         if let Some(top) = self.stack.last_mut() {
-            let next = top
-                .width
-                .saturating_mul(FRONTIER_RAMP_BASE)
-                .min(self.width);
+            let next = top.width.saturating_mul(FRONTIER_RAMP_BASE).min(self.width);
             // Never leave a tail smaller than the chunk that would precede
             // it. `proposed - consumed` over-counts (it cannot see which
             // entries confirm already killed), so this merges conservatively
@@ -2403,9 +2395,7 @@ pub use parallel::QueryParIter;
 #[cfg(feature = "parallel")]
 mod parallel {
     use super::*;
-    use rayon::iter::plumbing::{
-        bridge_unindexed, Folder, UnindexedConsumer, UnindexedProducer,
-    };
+    use rayon::iter::plumbing::{bridge_unindexed, Folder, UnindexedConsumer, UnindexedProducer};
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
     /// Parallel iterator over the results of a [`Query`]. Obtained via
@@ -2536,9 +2526,7 @@ mod parallel {
             bridge_unindexed(self, consumer)
         }
     }
-
 }
-
 
 /// Iterate over query results, converting each variable via
 /// [`TryFromInline`](crate::inline::TryFromInline).
@@ -2705,23 +2693,6 @@ mod tests {
         }
         variables
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     pub mod knights {
         use crate::prelude::*;
@@ -2929,10 +2900,6 @@ mod tests {
         assert_eq!(1, r.len());
         assert_eq!(&*record.borrow(), &[b.index, a.index]);
     }
-
-
-
-
 
     #[derive(Clone)]
     struct SetAdmissionProbe {

@@ -107,8 +107,7 @@ fn join_rows<B: TriblePattern>(
     let v = ctx.next_variable::<UnknownInline>();
     Query::new(
         IntersectionConstraint::new(vec![
-            Box::new(backend.pattern(e, as_genid(&id(a1)), m))
-                as Box<dyn Constraint + Send + Sync>,
+            Box::new(backend.pattern(e, as_genid(&id(a1)), m)) as Box<dyn Constraint + Send + Sync>,
             Box::new(backend.pattern(m, as_genid(&id(a2)), v)),
         ]),
         |binding: &Binding| Some((*binding.get(0)?, *binding.get(1)?, *binding.get(2)?)),

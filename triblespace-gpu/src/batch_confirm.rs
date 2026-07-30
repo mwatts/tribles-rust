@@ -176,7 +176,8 @@ impl ConfirmStats {
         self.gpu_confirms.fetch_add(1, Ordering::Relaxed);
         self.gpu_candidates
             .fetch_add(candidates as u64, Ordering::Relaxed);
-        self.gpu_parents.fetch_add(parents as u64, Ordering::Relaxed);
+        self.gpu_parents
+            .fetch_add(parents as u64, Ordering::Relaxed);
     }
 
     fn record_cpu(&self, candidates: usize) {
@@ -572,7 +573,10 @@ fn count_live(cands: &Candidates<'_>) -> usize {
 /// of a 16k-wide frontier costs three; and the device receives `slots.len()`
 /// plus `rows.len()` words instead of a band per candidate. Correct for any
 /// tag order — runs are the common shape, but nothing here assumes them.
-fn parent_table(frontier: &Frontier<'_>, cands: &Candidates<'_>) -> jerky::Result<(Vec<u32>, Vec<u32>)> {
+fn parent_table(
+    frontier: &Frontier<'_>,
+    cands: &Candidates<'_>,
+) -> jerky::Result<(Vec<u32>, Vec<u32>)> {
     let width = frontier.len();
     let mut slot_of_row = vec![u32::MAX; width];
     let mut slots = Vec::with_capacity(cands.len());
@@ -775,7 +779,8 @@ where
 
     fn elemwise(&self, len: usize) -> (CubeCount, CubeDim) {
         let cube_dim = CubeDim::new_1d(THREADS);
-        let cube_count = cubecl::calculate_cube_count_elemwise(self.context.client(), len, cube_dim);
+        let cube_count =
+            cubecl::calculate_cube_count_elemwise(self.context.client(), len, cube_dim);
         (cube_count, cube_dim)
     }
 
@@ -1065,15 +1070,15 @@ where
         let v_bound = self.term_v.position_value(binding).is_some();
 
         match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
-            (false, false, false, true, false, false) => ConfirmPlan::Membership {
-                axis: Axis::Entity,
-            },
+            (false, false, false, true, false, false) => {
+                ConfirmPlan::Membership { axis: Axis::Entity }
+            }
             (false, false, false, false, true, false) => ConfirmPlan::Membership {
                 axis: Axis::Attribute,
             },
-            (false, false, false, false, false, true) => ConfirmPlan::Membership {
-                axis: Axis::Value,
-            },
+            (false, false, false, false, false, true) => {
+                ConfirmPlan::Membership { axis: Axis::Value }
+            }
             (true, false, false, false, true, false) => ConfirmPlan::Base {
                 bound: Axis::Entity,
                 rotation: SuccinctRotation::Eva,

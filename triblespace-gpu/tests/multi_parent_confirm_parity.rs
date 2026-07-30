@@ -86,7 +86,11 @@ fn multi_parent_gpu_confirm_matches_cpu_and_width_one() {
 
     let cpu_base = rows(&archive, 1);
     assert!(!cpu_base.is_empty(), "fixture produced no rows");
-    assert_eq!(rows(&archive, 16384), cpu_base, "CPU archive: width changed the bag");
+    assert_eq!(
+        rows(&archive, 16384),
+        cpu_base,
+        "CPU archive: width changed the bag"
+    );
     assert_eq!(rows(&set, 1), cpu_base, "TribleSet and archive disagree");
 
     // min_confirm_batch = 0 forces EVERY confirm onto the device, so even a
@@ -108,9 +112,6 @@ fn multi_parent_gpu_confirm_matches_cpu_and_width_one() {
         wide, cpu_base,
         "GPU multi-parent confirm diverges from the CPU bag"
     );
-    assert!(
-        s2.gpu_confirms > 0,
-        "no device confirm dispatched: {s2:?}"
-    );
+    assert!(s2.gpu_confirms > 0, "no device confirm dispatched: {s2:?}");
     assert_eq!(s2.gpu_errors, 0, "device errors demoted confirms: {s2:?}");
 }

@@ -430,11 +430,7 @@ fn constraint_supports_constants_and_repeated_variables() {
     binding.bind(end.index, &vertex(4));
     let mut candidates = ProposalBuffer::new();
     candidates.extend([vertex(1), vertex(2), vertex(4)]);
-    constraint.confirm(
-        start.index,
-        &binding.frontier(),
-        &mut candidates.region(0),
-    );
+    constraint.confirm(start.index, &binding.frontier(), &mut candidates.region(0));
     assert_eq!(
         candidates.live_values(0).copied().collect::<Vec<_>>(),
         vec![vertex(1), vertex(2)]
@@ -519,7 +515,9 @@ fn propose_segments_a_batch_by_parent_row() {
         proposals.live_values(0).copied().collect::<Vec<_>>(),
         vec![vertex(2), vertex(3), vertex(4), vertex(3), vertex(4)]
     );
-    let tags: Vec<u32> = (0..proposals.len()).map(|i| proposals.parent_of(i)).collect();
+    let tags: Vec<u32> = (0..proposals.len())
+        .map(|i| proposals.parent_of(i))
+        .collect();
     assert_eq!(tags, vec![0, 0, 0, 1, 1]);
 }
 

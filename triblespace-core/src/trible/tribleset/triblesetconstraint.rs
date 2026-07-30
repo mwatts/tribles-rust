@@ -5,20 +5,20 @@ use smallvec::SmallVec;
 use crate::id::id_from_value;
 use crate::id::id_into_value;
 use crate::id::ID_LEN;
+use crate::inline::encodings::genid::GenId;
+use crate::inline::InlineEncoding;
+use crate::inline::RawInline;
+use crate::inline::INLINE_LEN;
 use crate::query::Binding;
+use crate::query::Candidates;
 use crate::query::Constraint;
 use crate::query::Frontier;
+use crate::query::ProposalBuffer;
 use crate::query::RawTerm;
 use crate::query::Term;
 use crate::query::VariableId;
 use crate::query::VariableSet;
 use crate::trible::TribleSet;
-use crate::inline::encodings::genid::GenId;
-use crate::inline::InlineEncoding;
-use crate::inline::RawInline;
-use crate::inline::INLINE_LEN;
-use crate::query::Candidates;
-use crate::query::ProposalBuffer;
 
 /// Batch size at which this source stops probing in frontier order and
 /// probes in **index order** instead.
@@ -276,33 +276,39 @@ impl TribleSetConstraint {
                 prefix[INLINE_LEN..INLINE_LEN + ID_LEN].copy_from_slice(&id);
                 self.set.vae.has_prefix(&prefix)
             }),
-            (None, Some(a), Some(v), true, false, false) => retain_at(cands, order, |value: &[u8; 32]| {
-                let Some(id) = id_from_value(value) else {
-                    return false;
-                };
-                let mut prefix = [0u8; ID_LEN + INLINE_LEN + ID_LEN];
-                prefix[0..ID_LEN].copy_from_slice(&a);
-                prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(v);
-                prefix[ID_LEN + INLINE_LEN..ID_LEN + INLINE_LEN + ID_LEN].copy_from_slice(&id);
-                self.set.ave.has_prefix(&prefix)
-            }),
-            (Some(e), None, Some(v), false, true, false) => retain_at(cands, order, |value: &[u8; 32]| {
-                let Some(id) = id_from_value(value) else {
-                    return false;
-                };
-                let mut prefix = [0u8; ID_LEN + INLINE_LEN + ID_LEN];
-                prefix[0..ID_LEN].copy_from_slice(&e);
-                prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(v);
-                prefix[ID_LEN + INLINE_LEN..ID_LEN + INLINE_LEN + ID_LEN].copy_from_slice(&id);
-                self.set.eva.has_prefix(&prefix)
-            }),
-            (Some(e), Some(a), None, false, false, true) => retain_at(cands, order, |value: &[u8; 32]| {
-                let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
-                prefix[0..ID_LEN].copy_from_slice(&e);
-                prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&a);
-                prefix[ID_LEN + ID_LEN..ID_LEN + ID_LEN + INLINE_LEN].copy_from_slice(value);
-                self.set.eav.has_prefix(&prefix)
-            }),
+            (None, Some(a), Some(v), true, false, false) => {
+                retain_at(cands, order, |value: &[u8; 32]| {
+                    let Some(id) = id_from_value(value) else {
+                        return false;
+                    };
+                    let mut prefix = [0u8; ID_LEN + INLINE_LEN + ID_LEN];
+                    prefix[0..ID_LEN].copy_from_slice(&a);
+                    prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(v);
+                    prefix[ID_LEN + INLINE_LEN..ID_LEN + INLINE_LEN + ID_LEN].copy_from_slice(&id);
+                    self.set.ave.has_prefix(&prefix)
+                })
+            }
+            (Some(e), None, Some(v), false, true, false) => {
+                retain_at(cands, order, |value: &[u8; 32]| {
+                    let Some(id) = id_from_value(value) else {
+                        return false;
+                    };
+                    let mut prefix = [0u8; ID_LEN + INLINE_LEN + ID_LEN];
+                    prefix[0..ID_LEN].copy_from_slice(&e);
+                    prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(v);
+                    prefix[ID_LEN + INLINE_LEN..ID_LEN + INLINE_LEN + ID_LEN].copy_from_slice(&id);
+                    self.set.eva.has_prefix(&prefix)
+                })
+            }
+            (Some(e), Some(a), None, false, false, true) => {
+                retain_at(cands, order, |value: &[u8; 32]| {
+                    let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
+                    prefix[0..ID_LEN].copy_from_slice(&e);
+                    prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&a);
+                    prefix[ID_LEN + ID_LEN..ID_LEN + ID_LEN + INLINE_LEN].copy_from_slice(value);
+                    self.set.eav.has_prefix(&prefix)
+                })
+            }
 
             // Same-Variable arms. The proposal value plays two roles
             // (e and v, or e and a, or a and v); we build a full
@@ -310,7 +316,9 @@ impl TribleSetConstraint {
             // `has_prefix` against the appropriate index.
             (_, Some(a), _, true, false, true) => retain_at(cands, order, |value| {
                 // pattern(x, a, x): proposal is both entity and value.
-                let Some(id) = id_from_value(value) else { return false; };
+                let Some(id) = id_from_value(value) else {
+                    return false;
+                };
                 let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&id);
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&a[..]);
@@ -319,7 +327,9 @@ impl TribleSetConstraint {
             }),
             (_, None, _, true, false, true) => retain_at(cands, order, |value| {
                 // pattern(x, ?, x): proposal is entity == value, any attr.
-                let Some(id) = id_from_value(value) else { return false; };
+                let Some(id) = id_from_value(value) else {
+                    return false;
+                };
                 let mut prefix = [0u8; ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&id);
                 prefix[ID_LEN..].copy_from_slice(&id_into_value(&id));
@@ -327,7 +337,9 @@ impl TribleSetConstraint {
             }),
             (_, _, Some(v), true, true, false) => retain_at(cands, order, |value| {
                 // pattern(x, x, v): proposal is entity == attribute.
-                let Some(id) = id_from_value(value) else { return false; };
+                let Some(id) = id_from_value(value) else {
+                    return false;
+                };
                 let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&id);
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&id);
@@ -336,7 +348,9 @@ impl TribleSetConstraint {
             }),
             (_, _, None, true, true, false) => retain_at(cands, order, |value| {
                 // pattern(x, x, ?): proposal is entity == attribute, any v.
-                let Some(id) = id_from_value(value) else { return false; };
+                let Some(id) = id_from_value(value) else {
+                    return false;
+                };
                 let mut prefix = [0u8; ID_LEN + ID_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&id);
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&id);
@@ -344,7 +358,9 @@ impl TribleSetConstraint {
             }),
             (Some(e), _, _, false, true, true) => retain_at(cands, order, |value| {
                 // pattern(e, x, x): proposal is attribute == value.
-                let Some(id) = id_from_value(value) else { return false; };
+                let Some(id) = id_from_value(value) else {
+                    return false;
+                };
                 let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&e);
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&id);
@@ -353,7 +369,9 @@ impl TribleSetConstraint {
             }),
             (None, _, _, false, true, true) => retain_at(cands, order, |value| {
                 // pattern(?, x, x): proposal is attribute == value, any e.
-                let Some(id) = id_from_value(value) else { return false; };
+                let Some(id) = id_from_value(value) else {
+                    return false;
+                };
                 let mut prefix = [0u8; ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&id);
                 prefix[ID_LEN..].copy_from_slice(&id_into_value(&id));
@@ -361,7 +379,9 @@ impl TribleSetConstraint {
             }),
             (_, _, _, true, true, true) => retain_at(cands, order, |value| {
                 // pattern(x, x, x): proposal plays all three roles.
-                let Some(id) = id_from_value(value) else { return false; };
+                let Some(id) = id_from_value(value) else {
+                    return false;
+                };
                 let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&id);
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&id);
@@ -573,9 +593,7 @@ impl TribleSetConstraint {
     /// batched entry points can skip building a probe-key matrix for a
     /// variable they have no opinion about.
     fn touches(&self, variable: VariableId) -> bool {
-        self.term_e.is_var(variable)
-            || self.term_a.is_var(variable)
-            || self.term_v.is_var(variable)
+        self.term_e.is_var(variable) || self.term_a.is_var(variable) || self.term_v.is_var(variable)
     }
 
     /// Appends the bytes of every position this constraint reads under
@@ -659,7 +677,6 @@ impl TribleSetConstraint {
 }
 
 impl<'a> Constraint<'a> for TribleSetConstraint {
-
     /// Returns the set of variable positions (constant positions are
     /// invisible to the engine).
     fn variables(&self) -> VariableSet {
@@ -931,12 +948,12 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
 mod tests {
     use crate::find;
     use crate::id::rngid;
+    use crate::inline::encodings::UnknownInline;
+    use crate::inline::Inline;
     use crate::query::TriblePattern;
     use crate::query::Variable;
     use crate::trible::Trible;
     use crate::trible::TribleSet;
-    use crate::inline::encodings::UnknownInline;
-    use crate::inline::Inline;
 
     #[test]
     fn constant() {
@@ -962,8 +979,8 @@ mod tests {
         // value positions) enumerates self-edge entities without
         // panicking. Adds 3 self-edges and 2 non-self tribles for
         // the same attribute; the query should return exactly 3.
-        use crate::inline::encodings::genid::GenId;
         use crate::and;
+        use crate::inline::encodings::genid::GenId;
 
         // Helper: encode a 16-byte id as a GenId-style Inline value
         // (32 bytes: upper 16 zero, lower 16 = id).
@@ -1006,7 +1023,12 @@ mod tests {
             )
         };
         let r: Vec<_> = q.collect();
-        assert_eq!(3, r.len(), "expected 3 self-edges with bound attr, got {}", r.len());
+        assert_eq!(
+            3,
+            r.len(),
+            "expected 3 self-edges with bound attr, got {}",
+            r.len()
+        );
     }
 
     #[test]
@@ -1113,6 +1135,11 @@ mod tests {
             set.pattern(x, x, x)
         };
         let r: Vec<_> = q.collect();
-        assert_eq!(2, r.len(), "expected 2 self-self-self triples, got {}", r.len());
+        assert_eq!(
+            2,
+            r.len(),
+            "expected 2 self-self-self triples, got {}",
+            r.len()
+        );
     }
 }

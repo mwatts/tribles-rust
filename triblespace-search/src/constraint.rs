@@ -1120,11 +1120,8 @@ mod tests {
             "first-occurrence order, duplicates collapsed",
         );
 
-        let mut rows: Vec<_> = Query::new(
-            BM25Filter::from_entries(doc, entries),
-            project_first,
-        )
-        .collect();
+        let mut rows: Vec<_> =
+            Query::new(BM25Filter::from_entries(doc, entries), project_first).collect();
         rows.sort_unstable();
         let mut expected = vec![entries[0], entries[1], entries[3]];
         expected.sort_unstable();
@@ -1283,8 +1280,11 @@ mod tests {
         binding.bind(a.index, &a_handle.raw);
         let mut candidates = ProposalBuffer::new();
         candidates.push(b_handle.raw);
-        view.cosine_at_least(a, b, 1.01)
-            .confirm(b.index, &binding.frontier(), &mut candidates.region(0));
+        view.cosine_at_least(a, b, 1.01).confirm(
+            b.index,
+            &binding.frontier(),
+            &mut candidates.region(0),
+        );
         assert_eq!(
             candidates.count_live(0),
             0,
@@ -1324,14 +1324,20 @@ mod tests {
         let mut accepted = ProposalBuffer::new();
         accepted.push(handles[0].raw);
         accepted.push(handles[1].raw);
-        view.cosine_at_least(x, x, 0.99)
-            .confirm(x.index, &Frontier::default(), &mut accepted.region(0));
+        view.cosine_at_least(x, x, 0.99).confirm(
+            x.index,
+            &Frontier::default(),
+            &mut accepted.region(0),
+        );
         assert_eq!(accepted.count_live(0), 2);
 
         let mut rejected = ProposalBuffer::new();
         rejected.push(handles[0].raw);
-        view.cosine_at_least(x, x, 1.01)
-            .confirm(x.index, &Frontier::default(), &mut rejected.region(0));
+        view.cosine_at_least(x, x, 1.01).confirm(
+            x.index,
+            &Frontier::default(),
+            &mut rejected.region(0),
+        );
         assert_eq!(rejected.count_live(0), 0);
     }
 
@@ -1568,11 +1574,8 @@ mod tests {
         let expected = [near_h.raw];
         let neighbour = Variable::<Handle<Embedding>>::new(0);
         assert_eq!(
-            Query::new(
-                flat_view.similar_to(near_h, neighbour, 0.8),
-                project_first
-            )
-            .collect::<Vec<_>>(),
+            Query::new(flat_view.similar_to(near_h, neighbour, 0.8), project_first)
+                .collect::<Vec<_>>(),
             expected
         );
         let rows: Vec<Inline<Handle<Embedding>>> = triblespace_core::find!(
@@ -1589,7 +1592,10 @@ mod tests {
             // sort, no dedup — so the succinct walk repeats it too.
             let succinct = crate::succinct::SuccinctHNSWIndex::from_naive(&hnsw).unwrap();
             let succinct_view = succinct.attach(&reader);
-            assert_eq!(succinct_view.candidates_above(near_h, 0.8).unwrap().len(), 2);
+            assert_eq!(
+                succinct_view.candidates_above(near_h, 0.8).unwrap().len(),
+                2
+            );
             let rows: Vec<Inline<Handle<Embedding>>> = triblespace_core::find!(
                 (n: Inline<Handle<Embedding>>),
                 succinct_view.similar_to(near_h, n, 0.8)

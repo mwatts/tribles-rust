@@ -23,7 +23,6 @@ pub use attributes::attributes_impl;
 pub use find::find_impl;
 pub use value_formatter::value_formatter_impl;
 
-
 struct PatternInput {
     set: Expr,
     pattern: Vec<Entity>,
