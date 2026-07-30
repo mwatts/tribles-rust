@@ -3306,6 +3306,98 @@ mod tests {
     use std::iter::FromIterator;
     use std::mem;
 
+    #[repr(C, align(16))]
+    struct AlignedArchivePair([[u8; 16]; 2]);
+
+    /// Build the smallest all-LocalLeaf PATCH and return a weak witness for
+    /// its backing allocation. The returned PATCH is the allocation's only
+    /// strong owner, so liveness assertions fail before a dangling pointer is
+    /// ever dereferenced.
+    fn owned_archive_pair(
+        keys: [[u8; 16]; 2],
+    ) -> (
+        PATCH<16, IdentitySchema>,
+        std::sync::Weak<AlignedArchivePair>,
+    ) {
+        let storage = std::sync::Arc::new(AlignedArchivePair(keys));
+        let weak = std::sync::Arc::downgrade(&storage);
+        let owner: std::sync::Arc<dyn ArchiveOwner> = storage.clone();
+        let hashes = [hash_key(&storage.0[0]), hash_key(&storage.0[1])];
+        let mut rows = [0, 1];
+        // SAFETY: AlignedArchivePair is 16-byte aligned, each 16-byte row has
+        // the same alignment, the two keys are distinct in every fixture, and
+        // `owner` retains the immutable storage throughout construction.
+        let patch = unsafe {
+            PATCH::from_archive_partition(&storage.0, &hashes, &mut rows, &owner)
+        };
+        assert_eq!(patch.node_stats(), (1, 2, 0, 2));
+        drop(owner);
+        drop(storage);
+        (patch, weak)
+    }
+
+    fn key(byte: u8) -> [u8; 16] {
+        [byte; 16]
+    }
+
+    #[test]
+    fn disjoint_cross_owner_union_retains_both_archives() {
+        let (mut left, left_owner) = owned_archive_pair([key(0x10), key(0x20)]);
+        let (right, right_owner) = owned_archive_pair([key(0x30), key(0x40)]);
+
+        left.union(right);
+
+        assert!(left_owner.upgrade().is_some(), "union dropped its left archive");
+        assert!(
+            right_owner.upgrade().is_some(),
+            "union dropped its consumed right archive"
+        );
+        assert_eq!(
+            left.iter().copied().collect::<HashSet<_>>(),
+            HashSet::from([key(0x10), key(0x20), key(0x30), key(0x40)])
+        );
+    }
+
+    #[test]
+    fn one_key_intersection_retains_both_source_archives() {
+        let (left, left_owner) = owned_archive_pair([key(0x10), key(0x20)]);
+        let (right, right_owner) = owned_archive_pair([key(0x10), key(0x30)]);
+
+        let intersection = left.intersect(&right);
+        drop(left);
+        drop(right);
+
+        assert!(
+            left_owner.upgrade().is_some(),
+            "intersection dropped the archive backing its surviving LocalLeaf"
+        );
+        assert!(
+            right_owner.upgrade().is_some(),
+            "intersection must conservatively retain both source covers"
+        );
+        assert_eq!(intersection.iter().copied().collect_vec(), vec![key(0x10)]);
+    }
+
+    #[test]
+    fn one_key_difference_retains_its_left_archive() {
+        let (left, left_owner) = owned_archive_pair([key(0x10), key(0x20)]);
+        let (right, right_owner) = owned_archive_pair([key(0x10), key(0x30)]);
+
+        let difference = left.difference(&right);
+        drop(left);
+        drop(right);
+
+        assert!(
+            left_owner.upgrade().is_some(),
+            "difference dropped the archive backing its surviving LocalLeaf"
+        );
+        assert!(
+            right_owner.upgrade().is_none(),
+            "difference should not retain an archive used only for subtraction"
+        );
+        assert_eq!(difference.iter().copied().collect_vec(), vec![key(0x20)]);
+    }
+
     #[test]
     fn head_tag() {
         let head = Head::<64, IdentitySchema, ()>::new::<Leaf<64, ()>>(0, NonNull::dangling());
