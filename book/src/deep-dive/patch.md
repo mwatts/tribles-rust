@@ -29,6 +29,9 @@ instead stores every branch in the same representation:
 * Children live in a byte-oriented cuckoo hash table backed by a single
   slice of `Option<Head>`. Each bucket holds two slots and the table grows in
   powers of two up to 256 entries.
+* A heap `Leaf` owns its key and value. An archive-backed `LocalLeaf` is instead
+  a tagged pointer directly into immutable archive bytes. It has no allocation
+  or reference count of its own; the enclosing `PATCH` keeps the archive alive.
 
 Insertions reuse the generic `modify_child` helper, which drives the cuckoo loop
 and performs copy-on-write if a branch is shared. When the existing allocation
@@ -77,16 +80,64 @@ path-compressed header only materialises a table when needed, while the largest
 table reaches full occupancy without growing past 256 entries. These predictable fill
 factors keep memory usage steady without ART’s specialised node types.
 
+## Archive-backed leaf lifetimes
+
+A `LocalLeaf` is safe only while the allocation containing its bytes remains
+alive. Each `PATCH` therefore carries an exact persistent owner cover: a binary
+Patricia trie keyed by the data address of each retained `Arc<dyn
+ArchiveOwner>`. Retaining the owner also prevents its address from being reused.
+The cover is deduplicated by address and structurally shared across snapshots.
+Its governing invariant is
+
+```text
+owners(LocalLeaves(root)) ⊆ cover
+```
+
+Structural operations preserve that invariant as follows:
+
+* archive insertion retains the owner before publishing its `LocalLeaf`;
+* cloning clones the root and cover together;
+* union joins both covers before either root is moved or detached;
+* intersection retains both input covers, because it may reuse a leaf from
+  either side;
+* difference retains the left cover, because it can only reuse left-hand
+  leaves; and
+* consuming iterators carry the cover beside their detached traversal queue
+  until every queued key has been copied out or dropped.
+
+The cover is a lifetime receipt rather than a reachability index. Operations
+may conservatively retain an owner whose leaves disappeared from the result;
+that provenance can remain until the `PATCH` becomes empty, at which point the
+cover is cleared. A `TribleSet` shares one such cover across all six PATCH
+indexes, joining any divergent covers once at aggregate set-operation
+boundaries.
+
 ## Hash maintenance
 
-Every leaf stores a SipHash-2-4 fingerprint of its key, and each branch XORs
-its children’s 128-bit hashes together. On insert or delete the previous hash
-contribution is XORed out and the new value XORed in, so updates run in constant
-time. Set operations such as `difference` compare these fingerprints first:
-matching hashes short-circuit because the subtrees are assumed identical, while
-differing hashes force a walk to compute the result. SipHash collisions are
-astronomically unlikely for these 128-bit values, so the shortcut is safe in
-practice.
+On first use in a process, PATCH samples a private random key. Each leaf
+fingerprint is the 128-bit output of SipHash-2-4 under that key, and each branch
+stores the XOR of its children’s fingerprints. On insert or delete, the old
+contribution is XORed out and the new one XORed in, so aggregate maintenance is
+constant-time. Set operations compare aggregates first: equal fingerprints
+short-circuit under the practical assumption that they denote equal key sets,
+while unequal ones force a structural walk. For any fixed pair of unequal sets,
+the false-positive probability is approximately 2^-128 under the keyed-hash
+assumption.
+
+These fingerprints are process-local implementation values, not serialized
+identities. They must remain opaque to untrusted chosen-input callers. Although
+XOR is linear, the usual linear-dependency construction requires observing the
+fingerprints of chosen keys; the private key makes that attack inapplicable
+without such an exposure oracle. Fingerprints must therefore not be used as
+durable content identifiers or sent across a trust boundary.
+
+Archive-backed leaves do not cache their fingerprint, so PATCH avoids hashing
+them when an exact, cheaper decision is available. Pairs of leaf nodes involving
+a `LocalLeaf` compare key bytes directly. A `LocalLeaf` paired with a subtree of
+cardinality other than one rejects fingerprint equality from the cached count;
+a unary branch remains eligible for the ordinary fingerprint path. These are
+performance shortcuts only, not collision remediation. Pairs without a
+`LocalLeaf` retain the normal cached-fingerprint path.
 
 Consumers can reorder or segment keys through the [`KeySchema`](../../src/patch.rs)
 and [`KeySegmentation`](../../src/patch.rs) traits. Prefix queries reuse the
