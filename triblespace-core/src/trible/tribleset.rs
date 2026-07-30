@@ -214,28 +214,40 @@ impl TribleSet {
     /// property as `union`. Threshold gates on `min(self, other)`
     /// because intersect work is bounded by the smaller side.
     pub fn intersect(&self, other: &Self) -> Self {
+        // Join all twelve receipts once. This is a conservative superset for
+        // every result index because intersection may reuse a LocalLeaf from
+        // either source trie.
+        let owners = self
+            .combined_owner_guard()
+            .join(other.combined_owner_guard());
+        macro_rules! intersect_index {
+            ($left:expr, $right:expr) => {{
+                // SAFETY: `owners` joins every receipt in both aggregates.
+                unsafe { $left.intersect_with_guard($right, &owners) }
+            }};
+        }
         #[cfg(feature = "parallel")]
         {
             if self.len().min(other.len()) >= PARALLEL_UNION_THRESHOLD {
                 let ((eav, eva), ((aev, ave), (vea, vae))) = rayon::join(
                     || {
                         rayon::join(
-                            || self.eav.intersect(&other.eav),
-                            || self.eva.intersect(&other.eva),
+                            || intersect_index!(&self.eav, &other.eav),
+                            || intersect_index!(&self.eva, &other.eva),
                         )
                     },
                     || {
                         rayon::join(
                             || {
                                 rayon::join(
-                                    || self.aev.intersect(&other.aev),
-                                    || self.ave.intersect(&other.ave),
+                                    || intersect_index!(&self.aev, &other.aev),
+                                    || intersect_index!(&self.ave, &other.ave),
                                 )
                             },
                             || {
                                 rayon::join(
-                                    || self.vea.intersect(&other.vea),
-                                    || self.vae.intersect(&other.vae),
+                                    || intersect_index!(&self.vea, &other.vea),
+                                    || intersect_index!(&self.vae, &other.vae),
                                 )
                             },
                         )
@@ -252,12 +264,12 @@ impl TribleSet {
             }
         }
         Self {
-            eav: self.eav.intersect(&other.eav),
-            eva: self.eva.intersect(&other.eva),
-            aev: self.aev.intersect(&other.aev),
-            ave: self.ave.intersect(&other.ave),
-            vea: self.vea.intersect(&other.vea),
-            vae: self.vae.intersect(&other.vae),
+            eav: intersect_index!(&self.eav, &other.eav),
+            eva: intersect_index!(&self.eva, &other.eva),
+            aev: intersect_index!(&self.aev, &other.aev),
+            ave: intersect_index!(&self.ave, &other.ave),
+            vea: intersect_index!(&self.vea, &other.vea),
+            vae: intersect_index!(&self.vae, &other.vae),
         }
     }
 
@@ -269,28 +281,37 @@ impl TribleSet {
     /// `self.len()` because difference work is bounded by the left
     /// side (each key from `self` is either kept or filtered).
     pub fn difference(&self, other: &Self) -> Self {
+        // Difference can only reuse LocalLeaves from the left aggregate, so
+        // combine its six receipts once and share that cover across results.
+        let owners = self.combined_owner_guard();
+        macro_rules! difference_index {
+            ($left:expr, $right:expr) => {{
+                // SAFETY: `owners` joins every left-aggregate receipt.
+                unsafe { $left.difference_with_guard($right, &owners) }
+            }};
+        }
         #[cfg(feature = "parallel")]
         {
             if self.len() >= PARALLEL_UNION_THRESHOLD {
                 let ((eav, eva), ((aev, ave), (vea, vae))) = rayon::join(
                     || {
                         rayon::join(
-                            || self.eav.difference(&other.eav),
-                            || self.eva.difference(&other.eva),
+                            || difference_index!(&self.eav, &other.eav),
+                            || difference_index!(&self.eva, &other.eva),
                         )
                     },
                     || {
                         rayon::join(
                             || {
                                 rayon::join(
-                                    || self.aev.difference(&other.aev),
-                                    || self.ave.difference(&other.ave),
+                                    || difference_index!(&self.aev, &other.aev),
+                                    || difference_index!(&self.ave, &other.ave),
                                 )
                             },
                             || {
                                 rayon::join(
-                                    || self.vea.difference(&other.vea),
-                                    || self.vae.difference(&other.vae),
+                                    || difference_index!(&self.vea, &other.vea),
+                                    || difference_index!(&self.vae, &other.vae),
                                 )
                             },
                         )
@@ -307,12 +328,12 @@ impl TribleSet {
             }
         }
         Self {
-            eav: self.eav.difference(&other.eav),
-            eva: self.eva.difference(&other.eva),
-            aev: self.aev.difference(&other.aev),
-            ave: self.ave.difference(&other.ave),
-            vea: self.vea.difference(&other.vea),
-            vae: self.vae.difference(&other.vae),
+            eav: difference_index!(&self.eav, &other.eav),
+            eva: difference_index!(&self.eva, &other.eva),
+            aev: difference_index!(&self.aev, &other.aev),
+            ave: difference_index!(&self.ave, &other.ave),
+            vea: difference_index!(&self.vea, &other.vea),
+            vae: difference_index!(&self.vae, &other.vae),
         }
     }
 
@@ -647,26 +668,41 @@ mod tests {
         unsafe { TribleSet::from_archive_partition(&storage.0, &hashes, &owner) }
     }
 
-    #[test]
-    fn archive_build_and_union_share_one_owner_cover_across_all_indexes() {
-        let mut left = archive_set(0x11, 0x22);
-        let right = archive_set(0x33, 0x44);
-        assert!(left.owner_guards_are_shared());
-        assert!(right.owner_guards_are_shared());
-
-        left.union(right);
-
-        assert!(left.owner_guards_are_shared());
-        let guard = left.eav.owner_guard();
+    fn assert_shared_owner_guard(set: &TribleSet, owner_count: usize) {
+        assert!(set.owner_guards_are_shared());
+        let guard = set.eav.owner_guard();
+        assert_eq!(guard.owner_count(), owner_count);
         for index_guard in [
-            left.eva.owner_guard(),
-            left.aev.owner_guard(),
-            left.ave.owner_guard(),
-            left.vea.owner_guard(),
-            left.vae.owner_guard(),
+            set.eva.owner_guard(),
+            set.aev.owner_guard(),
+            set.ave.owner_guard(),
+            set.vea.owner_guard(),
+            set.vae.owner_guard(),
         ] {
             assert!(guard.ptr_eq(&index_guard));
         }
+    }
+
+    #[test]
+    fn archive_set_algebra_shares_one_owner_cover_across_all_indexes() {
+        let mut unioned = archive_set(0x11, 0x22);
+        let union_right = archive_set(0x33, 0x44);
+        assert_shared_owner_guard(&unioned, 1);
+        assert_shared_owner_guard(&union_right, 1);
+
+        unioned.union(union_right);
+        assert_eq!(unioned.len(), 4);
+        assert_shared_owner_guard(&unioned, 2);
+
+        let left = archive_set(0x11, 0x22);
+        let right = archive_set(0x11, 0x33);
+        let intersection = left.intersect(&right);
+        assert_eq!(intersection.len(), 1);
+        assert_shared_owner_guard(&intersection, 2);
+
+        let difference = left.difference(&right);
+        assert_eq!(difference.len(), 1);
+        assert_shared_owner_guard(&difference, 1);
     }
 
     #[test]

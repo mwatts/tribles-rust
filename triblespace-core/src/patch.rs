@@ -356,6 +356,11 @@ impl PATCHOwnerGuard {
             _ => false,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn owner_count(&self) -> usize {
+        self.0.as_ref().map_or(0, |cover| cover.len)
+    }
 }
 
 #[cfg(not(target_pointer_width = "64"))]
@@ -2887,22 +2892,41 @@ where
         O: Send + Sync,
         V: Send + Sync,
     {
-        if let Some(root) = &self.root {
-            if let Some(other_root) = &other.root {
+        let guard = self.owner_guard().join(other.owner_guard());
+        // SAFETY: the exact union retains every owner held by either source.
+        unsafe { self.intersect_with_guard(other, &guard) }
+    }
+
+    /// Intersect under an owner receipt already joined by an aggregate.
+    ///
+    /// # Safety
+    ///
+    /// `guard` must retain every archive allocation retained by either input.
+    /// Intersection may reuse a LocalLeaf from either trie.
+    pub(crate) unsafe fn intersect_with_guard(&self, other: &Self, guard: &PATCHOwnerGuard) -> Self
+    where
+        O: Send + Sync,
+        V: Send + Sync,
+    {
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            guard.covers(&self.owners) && guard.covers(&other.owners),
+            "an intersection guard must cover both source PATCHes",
+        );
+        let root = match (&self.root, &other.root) {
+            (Some(root), Some(other_root)) => {
                 #[cfg(feature = "parallel")]
                 let result = root.par_intersect(other_root, 0);
                 #[cfg(not(feature = "parallel"))]
                 let result = root.intersect(other_root, 0);
-                let root = result.map(|root| root.with_start(0));
-                let owners = root
-                    .as_ref()
-                    .and_then(|_| OwnerCover::union(self.owners.clone(), &other.owners));
-                let result = Self { root, owners };
-                result.debug_check_owner_invariant();
-                return result;
+                result.map(|root| root.with_start(0))
             }
-        }
-        Self::new()
+            _ => None,
+        };
+        let owners = root.as_ref().and(guard.0.clone());
+        let result = Self { root, owners };
+        result.debug_check_owner_invariant();
+        result
     }
 
     /// Returns the difference between this PATCH and another PATCH.
@@ -2914,25 +2938,42 @@ where
         O: Send + Sync,
         V: Send + Sync,
     {
-        if let Some(root) = &self.root {
-            if let Some(other_root) = &other.root {
+        let guard = self.owner_guard();
+        // SAFETY: difference can only reuse LocalLeaves from its left source.
+        unsafe { self.difference_with_guard(other, &guard) }
+    }
+
+    /// Subtract under a left-owner receipt already combined by an aggregate.
+    ///
+    /// # Safety
+    ///
+    /// `guard` must retain every archive allocation retained by `self`.
+    /// Difference never introduces a LocalLeaf from `other`.
+    pub(crate) unsafe fn difference_with_guard(&self, other: &Self, guard: &PATCHOwnerGuard) -> Self
+    where
+        O: Send + Sync,
+        V: Send + Sync,
+    {
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            guard.covers(&self.owners),
+            "a difference guard must cover its left source PATCH",
+        );
+        let root = match (&self.root, &other.root) {
+            (Some(root), Some(other_root)) => {
                 #[cfg(feature = "parallel")]
                 let result = root.par_difference(other_root, 0);
                 #[cfg(not(feature = "parallel"))]
                 let result = root.difference(other_root, 0);
-                let owners = result.as_ref().and(self.owners.clone());
-                let result = Self {
-                    root: result,
-                    owners,
-                };
-                result.debug_check_owner_invariant();
                 result
-            } else {
-                (*self).clone()
             }
-        } else {
-            Self::new()
-        }
+            (Some(root), None) => Some(root.clone()),
+            (None, _) => None,
+        };
+        let owners = root.as_ref().and(guard.0.clone());
+        let result = Self { root, owners };
+        result.debug_check_owner_invariant();
+        result
     }
 
     /// Calculates the average fill level for branch nodes grouped by their
