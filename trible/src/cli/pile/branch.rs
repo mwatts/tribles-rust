@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::path::PathBuf;
 
@@ -17,6 +17,7 @@ use triblespace_core::blob::IntoBlob;
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::{Blake3, Handle, Hash};
 use triblespace_core::inline::Inline;
+use triblespace_core::macros::{find, pattern};
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::Repository;
 use triblespace_core::trible::TribleSet;
@@ -2007,11 +2008,7 @@ struct ConsolidateMember {
 }
 
 fn extract_repo_head(meta: &TribleSet, branch_id: Id) -> BranchHead {
-    use triblespace::prelude::blobencodings::SimpleArchive;
-    use triblespace::prelude::inlineencodings::Handle;
     use triblespace_core::repo;
-
-    use triblespace_core::inline::Inline;
 
     let Ok(branch_entity) = repo::branch::branch_entity(meta, branch_id) else {
         return BranchHead::Malformed;
@@ -2533,6 +2530,7 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+    use triblespace_core::macros::entity;
 
     /// A missing commit blob must NOT read as "not an ancestor".
     ///
@@ -2687,12 +2685,12 @@ mod tests {
             .put::<SimpleArchive, _>(second_set.to_blob())
             .unwrap();
         meta.insert(&triblespace_core::trible::Trible::new(
-            &branch_entity,
+            triblespace_core::id::ExclusiveId::force_ref(&branch_entity),
             &head_attr,
             &first,
         ));
         meta.insert(&triblespace_core::trible::Trible::new(
-            &branch_entity,
+            triblespace_core::id::ExclusiveId::force_ref(&branch_entity),
             &head_attr,
             &second,
         ));
@@ -2788,7 +2786,9 @@ mod tests {
         let name_attr = triblespace_core::metadata::name.id();
         let branch_attr = triblespace_core::repo::branch.id();
         let e = triblespace_core::id::fucid();
-        let branch_id = triblespace_core::id::fucid();
+        let branch_id = *triblespace_core::id::fucid();
+        let branch_value: Inline<triblespace::prelude::inlineencodings::GenId> =
+            triblespace_core::inline::IntoInline::to_inline(branch_id);
 
         let mut store = MemoryBlobStore::new();
         let h_a: BranchNameHandle = store
@@ -2805,21 +2805,21 @@ mod tests {
 
         // Exactly one name, resolvable.
         let mut named = TribleSet::new();
-        named.insert(&Trible::new(&e, &branch_attr, &branch_id));
+        named.insert(&Trible::new(&e, &branch_attr, &branch_value));
         named.insert(&Trible::new(&e, &name_attr, &h_a));
         let r = load_branch_name(&reader, &named, branch_id);
         assert_eq!(r.named(), Some("main"), "one resolvable name must resolve");
 
         // No name trible at all — legitimate, and NOT groupable.
         let mut unnamed = TribleSet::new();
-        unnamed.insert(&Trible::new(&e, &branch_attr, &branch_id));
+        unnamed.insert(&Trible::new(&e, &branch_attr, &branch_value));
         let r = load_branch_name(&reader, &unnamed, branch_id);
         assert!(matches!(r, BranchName::Unnamed));
         assert_eq!(r.named(), None, "an unnamed branch must not be groupable");
 
         // Two names — malformed metadata. Must not silently pick one.
         let mut ambiguous = TribleSet::new();
-        ambiguous.insert(&Trible::new(&e, &branch_attr, &branch_id));
+        ambiguous.insert(&Trible::new(&e, &branch_attr, &branch_value));
         ambiguous.insert(&Trible::new(&e, &name_attr, &h_a));
         ambiguous.insert(&Trible::new(&e, &name_attr, &h_b));
         let r = load_branch_name(&reader, &ambiguous, branch_id);
@@ -2836,7 +2836,7 @@ mod tests {
 
         // One name, blob unreadable. The branch HAS a name; we cannot see it.
         let mut unreadable = TribleSet::new();
-        unreadable.insert(&Trible::new(&e, &branch_attr, &branch_id));
+        unreadable.insert(&Trible::new(&e, &branch_attr, &branch_value));
         unreadable.insert(&Trible::new(&e, &name_attr, &h_missing));
         let r = load_branch_name(&reader, &unreadable, branch_id);
         assert!(
