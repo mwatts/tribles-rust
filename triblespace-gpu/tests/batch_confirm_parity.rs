@@ -500,14 +500,8 @@ fn all_dead_region_stays_all_dead() {
         &fixture.gpu,
     );
     for base in BASES {
-        let outcome = confirm_liveness(
-            &constraint,
-            v.v.index,
-            &frontier,
-            base,
-            &candidates,
-            &kills,
-        );
+        let outcome =
+            confirm_liveness(&constraint, v.v.index, &frontier, base, &candidates, &kills);
         assert!(
             outcome.region.iter().all(|live| !*live),
             "an all-dead region gained a survivor at base {base}"
@@ -537,8 +531,22 @@ fn below_threshold_falls_back_to_cpu() {
 
     for base in BASES {
         let before = fixture.gpu.stats();
-        let cpu = confirm_liveness(&cpu_constraint, v.v.index, &frontier, base, &candidates, &[]);
-        let gpu = confirm_liveness(&gpu_constraint, v.v.index, &frontier, base, &candidates, &[]);
+        let cpu = confirm_liveness(
+            &cpu_constraint,
+            v.v.index,
+            &frontier,
+            base,
+            &candidates,
+            &[],
+        );
+        let gpu = confirm_liveness(
+            &gpu_constraint,
+            v.v.index,
+            &frontier,
+            base,
+            &candidates,
+            &[],
+        );
         let after = fixture.gpu.stats();
 
         assert_eq!(

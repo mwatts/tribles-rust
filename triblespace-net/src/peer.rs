@@ -45,13 +45,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use anybytes::Bytes;
 use ed25519_dalek::SigningKey;
 use iroh_base::EndpointId;
-use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::UnknownBlob;
+use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{BlobEncoding, IntoBlob, TryFromBlob};
 use triblespace_core::id::Id;
-use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::InlineEncoding;
+use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::lazy::WantRecordError;
 use triblespace_core::repo::{
     BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, PinStore, PushResult,
@@ -390,8 +390,8 @@ where
                     // subject + latest_sig and mark the entry delivered
                     // so the daemon's next tick skips it from the
                     // re-dispatch set.
-                    use triblespace_core::inline::encodings::hash::Handle;
                     use triblespace_core::inline::Inline;
+                    use triblespace_core::inline::encodings::hash::Handle;
                     let subject_key = match ed25519_dalek::VerifyingKey::from_bytes(&subject) {
                         Ok(k) => k,
                         Err(_) => continue,
@@ -494,8 +494,8 @@ where
     /// consumes; the partial-cap blob is recoverable from the entity's
     /// `request_partial_cap` handle.
     fn absorb_cap_request(&mut self, requester: PublisherKey, partial_cap_bytes: anybytes::Bytes) {
-        use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
         use triblespace_core::blob::Blob;
+        use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
         use triblespace_core::inline::TryToInline;
 
         // Reconstitute the requester pubkey from bytes. If the bytes
@@ -640,8 +640,8 @@ where
     ///
     /// Returns the count of entries dispatched this tick.
     fn redispatch_undelivered(&mut self) -> usize {
-        use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
         use triblespace_core::blob::Blob;
+        use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
         use triblespace_core::repo::BlobStoreGet;
 
         let mut store = self.store.lock().expect("store mutex");

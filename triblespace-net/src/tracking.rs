@@ -17,10 +17,10 @@
 
 use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::id::{genid, Id};
+use triblespace_core::id::{Id, genid};
+use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::encodings::time::NsTAIInterval;
-use triblespace_core::inline::Inline;
 use triblespace_core::macros::{entity, find, pattern};
 use triblespace_core::prelude::attributes;
 use triblespace_core::prelude::inlineencodings::{ED25519PublicKey, GenId};
@@ -618,8 +618,8 @@ mod tests {
 
         // Build a fake remote branch metadata blob first so we have something
         // to point to. Use branch_unsigned to avoid signing-key plumbing.
-        use triblespace_core::blob::encodings::longstring::LongString;
         use triblespace_core::blob::IntoBlob;
+        use triblespace_core::blob::encodings::longstring::LongString;
         use triblespace_core::repo::branch::branch_unsigned;
         let name_blob = "remote-branch".to_string().to_blob();
         let name_handle: Inline<Handle<LongString>> = store.put(name_blob).unwrap();

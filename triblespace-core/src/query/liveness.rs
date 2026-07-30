@@ -304,7 +304,8 @@ impl ProposalBuffer {
         // for the shortfall between the words we hold and the words the
         // grown buffer will need.
         let needed = words_for(self.entries.len() + additional);
-        self.live.reserve_exact(needed.saturating_sub(self.live.len()));
+        self.live
+            .reserve_exact(needed.saturating_sub(self.live.len()));
     }
 
     /// Index of the first live entry at or after `from`, if any.
@@ -1085,9 +1086,7 @@ mod tests {
             }
             r.set_live_words(&all);
         }
-        let expected: Vec<usize> = (0..5)
-            .chain((5..70).filter(|i| (i - 5) % 6 == 0))
-            .collect();
+        let expected: Vec<usize> = (0..5).chain((5..70).filter(|i| (i - 5) % 6 == 0)).collect();
         assert_eq!(live_indices(&b), expected);
     }
 
