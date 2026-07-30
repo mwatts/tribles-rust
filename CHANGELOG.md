@@ -51,9 +51,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validate and hash every canonical row once, reuse one `u32` permutation
   across all six PATCH orderings, and construct path-compressed branches with
   an in-place sparse MSD partition. Known fanout preallocates branch tables,
-  eager subtree hashes are carried through construction, and only branches
-  with direct archive-backed leaves retain an owner. Small, unaligned, and
-  oversized inputs keep their existing serial or heap-leaf fallbacks.
+  eager subtree hashes are carried through construction, and every archive
+  branch retains the shared owner so later same-archive unions preserve the
+  nearest-ancestor lifetime invariant. Small, unaligned, and oversized inputs
+  keep their existing serial or heap-leaf fallbacks.
 - **Breaking: the query engine is the propose/confirm engine.** The residual /
   typed-Program engine is gone — `residual.rs`, the Program VM, query-time
   regular-path evaluation (`path!` and `RegularPathConstraint`), and the

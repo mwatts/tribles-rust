@@ -342,8 +342,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V>
     /// hold their known fanout and grow only if cuckoo placement still needs
     /// it.
     ///
-    /// `owner` is present only when one of the Branch's direct children is a
-    /// `LocalLeaf`. Descendant Branches retain their own archive owners.
+    /// `owner` retains the archive for this complete subtree. Bottom-up archive
+    /// construction gives every Branch the same owner so a later union may
+    /// move a `LocalLeaf` into an empty child slot without losing its nearest
+    /// owning ancestor.
     #[cfg(any(test, feature = "parallel"))]
     pub(super) fn new_with_owner_and_child_hashes_capacity(
         end_depth: usize,

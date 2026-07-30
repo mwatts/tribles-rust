@@ -2245,10 +2245,11 @@ where
     }
 
     /// Test-only census of archive-owner placement:
-    /// `(direct_and_retained, direct_but_missing, retained_without_direct)`.
+    /// `(direct_and_retained, direct_but_missing, retained_without_direct,
+    /// missing_without_direct)`.
     #[cfg(test)]
-    pub(crate) fn archive_owner_placement_stats(&self) -> (u64, u64, u64) {
-        let mut stats = (0, 0, 0);
+    pub(crate) fn archive_owner_placement_stats(&self) -> (u64, u64, u64, u64) {
+        let mut stats = (0, 0, 0, 0);
         let mut stack = Vec::new();
         if let Some(root) = self.root.as_ref() {
             stack.push(root);
@@ -2264,7 +2265,7 @@ where
                     (true, true) => stats.0 += 1,
                     (true, false) => stats.1 += 1,
                     (false, true) => stats.2 += 1,
-                    (false, false) => {}
+                    (false, false) => stats.3 += 1,
                 }
                 stack.extend(branch.child_table.iter().flatten());
             }
@@ -2752,9 +2753,10 @@ where
     /// Representative-LCP plus in-place MSD-radix worker for
     /// [`Self::from_archive_partition`].
     ///
-    /// A Branch retains `owner` exactly when one of its direct children is a
-    /// LocalLeaf. Higher Branches whose children are all Branches stay
-    /// owner-free; each descendant is responsible for its own direct leaves.
+    /// Every Branch retains `owner`. Main's archive-lifetime protocol is an
+    /// ancestor cover rather than a property of the immediate parent: later
+    /// same-archive unions may move a LocalLeaf into an empty slot at any
+    /// level, so each possible destination must remain an owning ancestor.
     #[cfg(any(test, feature = "parallel"))]
     unsafe fn build_archive_partition_head(
         keys: &[[u8; KEY_LEN]],
@@ -2879,15 +2881,12 @@ where
             )
         };
 
-        let direct_owner = (first_head.tag() == HeadTag::LocalLeaf
-            || second_head.tag() == HeadTag::LocalLeaf)
-            .then(|| owner.clone());
         let body = if initial_slots == 2 {
             Branch::new_with_owner_and_child_hashes(
                 end_depth,
                 first_head.with_key(first_bucket),
                 second_head.with_key(second_bucket),
-                direct_owner,
+                Some(owner.clone()),
                 first_hash,
                 second_hash,
             )
@@ -2896,7 +2895,7 @@ where
                 end_depth,
                 first_head.with_key(first_bucket),
                 second_head.with_key(second_bucket),
-                direct_owner,
+                Some(owner.clone()),
                 first_hash,
                 second_hash,
                 initial_slots,
@@ -2923,12 +2922,6 @@ where
                 )
             };
             hash ^= child_hash;
-            if child.tag() == HeadTag::LocalLeaf {
-                match editor.owner.as_ref() {
-                    Some(retained) => debug_assert!(std::sync::Arc::ptr_eq(retained, owner)),
-                    None => editor.owner = Some(owner.clone()),
-                }
-            }
             editor.install_child_growing(child.with_key(byte));
             range_start = range_end;
             let Some(next_byte) = child_buckets.drain_next_ascending() else {

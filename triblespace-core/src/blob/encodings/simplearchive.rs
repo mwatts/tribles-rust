@@ -405,7 +405,7 @@ mod tests {
     }
 
     #[test]
-    fn bottom_up_owner_guards_cover_only_direct_local_leaves() {
+    fn bottom_up_owner_guards_cover_every_archive_branch() {
         let set = bottom_up_for_test(fixture_blob(8_192)).unwrap();
         for stats in [
             set.eav.archive_owner_placement_stats(),
@@ -417,7 +417,14 @@ mod tests {
         ] {
             assert!(stats.0 > 0, "fixture did not exercise direct LocalLeaves");
             assert_eq!(stats.1, 0, "a direct LocalLeaf has no owner guard");
-            assert_eq!(stats.2, 0, "a Branch retained an unnecessary owner guard");
+            assert!(
+                stats.2 > 0,
+                "fixture did not exercise owning ancestor-only Branches",
+            );
+            assert_eq!(
+                stats.3, 0,
+                "an archive Branch has no owner for later LocalLeaf movement",
+            );
         }
     }
 
