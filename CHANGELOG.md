@@ -63,9 +63,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Set operations may conservatively retain provenance no longer reachable
   from their result, but cannot omit a reachable owner or accumulate duplicate
   owners through overlapping diamond unions. `TribleSet` joins provenance once
-  and shares the resulting cover across all six indexes. This adds one thin
-  eight-byte Arc to PATCH while restoring the ownership-neutral 48-byte Branch
-  header (sixteen bytes smaller than the per-Branch owner design).
+  and shares the resulting cover across all six indexes. Asymmetric difference
+  also collapses its edited root when only one child survives, preserving the
+  compressed-trie shape invariant. This adds one thin eight-byte Arc to PATCH
+  while restoring the ownership-neutral 48-byte Branch header (sixteen bytes
+  smaller than the per-Branch owner design).
 - **Breaking: the query engine is the propose/confirm engine.** The residual /
   typed-Program engine is gone — `residual.rs`, the Program VM, query-time
   regular-path evaluation (`path!` and `RegularPathConstraint`), and the

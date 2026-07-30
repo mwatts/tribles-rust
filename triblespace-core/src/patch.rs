@@ -2166,6 +2166,27 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
                 ed.modify_child(other_byte_key, |opt| {
                     opt.and_then(|child| child.difference(other, self_depth))
                 });
+
+                // The asymmetric edit can delete the only matching child
+                // subtree. Preserve the compressed-trie invariant instead of
+                // returning a Branch with zero or one child.
+                let child_count = ed
+                    .child_table
+                    .iter()
+                    .filter(|child| child.is_some())
+                    .take(2)
+                    .count();
+                if child_count <= 1 {
+                    let mut remaining = None;
+                    for slot in &mut ed.child_table {
+                        if let Some(child) = slot.take() {
+                            remaining = Some(child.with_start(at_depth));
+                            break;
+                        }
+                    }
+                    drop(ed);
+                    return remaining;
+                }
             }
             return Some(new_branch);
         }
@@ -3702,6 +3723,13 @@ mod tests {
         [byte; 16]
     }
 
+    fn singleton_patch(key: [u8; 16]) -> PATCH<16, IdentitySchema> {
+        let mut patch = PATCH::new();
+        let entry = Entry::new(&key);
+        patch.insert(&entry);
+        patch
+    }
+
     #[test]
     fn owner_cover_shape_is_canonical_and_membership_is_exact() {
         let owners: Vec<Arc<dyn ArchiveOwner>> = (0u8..8)
@@ -3909,6 +3937,36 @@ mod tests {
     }
 
     #[test]
+    fn asymmetric_difference_collapses_its_surviving_child() {
+        let (left, owner) = owned_archive_pair([key(0x10), key(0x20)]);
+        assert_eq!(left.root.as_ref().map(Head::tag), Some(HeadTag::Branch2));
+        let removed = singleton_patch(key(0x10));
+
+        let survivor = left.difference(&removed);
+        drop(left);
+        drop(removed);
+
+        assert_eq!(survivor.len(), 1);
+        assert_eq!(survivor.node_stats(), (0, 0, 0, 1));
+        assert_eq!(
+            survivor.root.as_ref().map(Head::tag),
+            Some(HeadTag::LocalLeaf),
+            "Branch-minus-Leaf left a unary Branch instead of its child",
+        );
+        assert_eq!(survivor.iter().copied().collect_vec(), vec![key(0x20)]);
+        assert!(owner.upgrade().is_some());
+
+        let final_key = singleton_patch(key(0x20));
+        let empty = survivor.difference(&final_key);
+        drop(survivor);
+        drop(final_key);
+
+        assert!(empty.root.is_none());
+        assert!(empty.owners.is_none());
+        assert!(owner.upgrade().is_none());
+    }
+
+    #[test]
     fn clone_and_consuming_iterator_retain_the_archive() {
         let (patch, owner) = owned_archive_pair([key(0x10), key(0x20)]);
         let clone = patch.clone();
@@ -3921,6 +3979,20 @@ mod tests {
             "consuming iterator lost the archive owner"
         );
         assert!(matches!(iter.next(), Some(value) if value == key(0x10) || value == key(0x20)));
+        drop(iter);
+        assert!(owner.upgrade().is_none());
+    }
+
+    #[test]
+    fn ordered_consuming_iterator_retains_the_archive() {
+        let (patch, owner) = owned_archive_pair([key(0x10), key(0x20)]);
+
+        let mut iter = patch.into_iter_ordered();
+        assert!(
+            owner.upgrade().is_some(),
+            "ordered consuming iterator lost the archive owner"
+        );
+        assert_eq!(iter.next(), Some(key(0x10)));
         drop(iter);
         assert!(owner.upgrade().is_none());
     }

@@ -683,6 +683,18 @@ mod tests {
         }
     }
 
+    fn insert_archive_row_into_eav_only(set: &mut TribleSet, byte: u8) {
+        let storage = Arc::new(AlignedRows([
+            [byte; TRIBLE_LEN],
+            [byte.wrapping_add(1); TRIBLE_LEN],
+        ]));
+        let owner: Arc<dyn ArchiveOwner> = storage.clone();
+        // SAFETY: AlignedRows makes this immutable row 16-byte aligned, and
+        // `owner` retains its allocation while EAV adopts the LocalLeaf.
+        let entry = unsafe { ArchiveEntry::new(std::ptr::NonNull::from(&storage.0[0]), &owner) };
+        set.eav.insert_archive(&entry);
+    }
+
     #[test]
     fn archive_set_algebra_shares_one_owner_cover_across_all_indexes() {
         let mut unioned = archive_set(0x11, 0x22);
@@ -703,6 +715,15 @@ mod tests {
         let difference = left.difference(&right);
         assert_eq!(difference.len(), 1);
         assert_shared_owner_guard(&difference, 1);
+
+        // Public indexes can be mutated independently. Difference must first
+        // reconcile all six left receipts, not merely preserve six divergent
+        // per-index covers.
+        let mut divergent = archive_set(0x11, 0x22);
+        insert_archive_row_into_eav_only(&mut divergent, 0x55);
+        assert!(!divergent.owner_guards_are_shared());
+        let reconciled = divergent.difference(&TribleSet::new());
+        assert_shared_owner_guard(&reconciled, 2);
     }
 
     #[test]
