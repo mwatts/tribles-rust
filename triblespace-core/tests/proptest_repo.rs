@@ -389,7 +389,8 @@ proptest! {
 mod branch_head_carry {
     use super::*;
     use triblespace_core::blob::encodings::longstring::LongString;
-    use triblespace_core::repo::branch;
+    use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+    use triblespace_core::inline::encodings::hash::Handle;
 
     mod ann {
         use triblespace_core::prelude::*;

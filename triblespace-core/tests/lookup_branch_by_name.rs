@@ -22,6 +22,8 @@
 
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use triblespace_core::blob::encodings::longstring::LongString;
+use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::prelude::*;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{LookupError, Repository};
