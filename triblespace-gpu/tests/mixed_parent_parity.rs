@@ -266,7 +266,7 @@ where
             }
         }
 
-        let before = cands.live_words();
+        let before: Vec<bool> = (0..cands.len()).map(|i| cands.is_live(i)).collect();
         // Replay the region — values *and* parent tags — onto a scratch
         // buffer so the CPU verdict is computed over exactly the same input.
         let mut scratch = ProposalBuffer::new();
@@ -275,17 +275,26 @@ where
             scratch.push(cands.values()[i]);
         }
         let mut mirror = scratch.region(0);
-        mirror.set_live_words(&before);
+        // Copy liveness by *index*, not by word: `cands` starts wherever its
+        // proposer left off in the level buffer while the mirror starts at
+        // index 0, and packed liveness words only line up when the two
+        // regions share a bit offset. Everything the mirror holds is live to
+        // begin with, so replaying the kills is enough.
+        for (i, live) in before.iter().enumerate() {
+            if !*live {
+                mirror.kill(i);
+            }
+        }
 
         let started = Instant::now();
         self.cpu.confirm(variable, frontier, &mut mirror);
         let cpu_elapsed = started.elapsed();
-        let expected = mirror.live_words();
+        let expected: Vec<bool> = (0..mirror.len()).map(|i| mirror.is_live(i)).collect();
 
         let started = Instant::now();
         self.gpu.confirm(variable, frontier, cands);
         let gpu_elapsed = started.elapsed();
-        let actual = cands.live_words();
+        let actual: Vec<bool> = (0..cands.len()).map(|i| cands.is_live(i)).collect();
 
         let arm = self.arm(variable, frontier);
         let mut parents: Vec<u32> = cands.parents().to_vec();
@@ -306,9 +315,9 @@ where
             parents.len(),
             bands.len(),
         );
-        for (i, &word) in before.iter().enumerate() {
-            if word == 0 {
-                assert_eq!(actual[i], 0, "entry {i} was revived (arm {arm})");
+        for (i, &was_live) in before.iter().enumerate() {
+            if !was_live {
+                assert!(!actual[i], "entry {i} was revived (arm {arm})");
             }
         }
 

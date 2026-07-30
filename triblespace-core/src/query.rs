@@ -27,6 +27,9 @@ pub mod hashmapconstraint;
 pub mod hashsetconstraint;
 /// [`IntersectionConstraint`](intersectionconstraint::IntersectionConstraint) — logical AND.
 pub mod intersectionconstraint;
+/// [`ProposalBuffer`] and [`Candidates`] — candidate storage and bit-packed
+/// liveness for one search level.
+mod liveness;
 /// [`PatchValueConstraint`](patchconstraint::PatchValueConstraint) and [`PatchIdConstraint`](patchconstraint::PatchIdConstraint) — constrains variables to PATCH entries.
 pub mod patchconstraint;
 #[doc(hidden)]
@@ -54,6 +57,14 @@ use crate::inline::RawInline;
 
 /// Re-export of [`VariableSet`](variableset::VariableSet).
 pub use variableset::VariableSet;
+
+/// Re-exports of the candidate/liveness pair. The module they come from is
+/// private on purpose: the bit-packed representation and the region-boundary
+/// invariants that keep it honest are enforced at the boundary of these two
+/// types, so nothing outside `query::liveness` can reach them. Its
+/// module-level comment is the reference for anyone editing it — or writing a
+/// device kernel against [`LIVENESS_WORD_BITS`].
+pub use liveness::{and_words, or_words, Candidates, ProposalBuffer, LIVENESS_WORD_BITS};
 
 impl<T: InlineEncoding> Term<T> {
     /// Erases the schema type, yielding the runtime representation
@@ -767,407 +778,6 @@ impl BindingStore {
     }
 }
 
-/// Growable buffer of candidate values for one variable at one search level
-/// — the write target of [`Constraint::propose`] and the engine's per-level
-/// candidate store.
-///
-/// Entries are plain `RawInline` (fixed-stride 32-byte POD), stored
-/// contiguously and **write-once**: nothing ever moves or rewrites a stored
-/// value. Each entry carries a parallel liveness word (`u32`, nonzero =
-/// live): confirmers kill entries instead of removing them, and the engine
-/// iterates live entries directly — there is no compaction. The pairing of
-/// value and liveness is structural (one type owns both), and the buffer
-/// derefs to `[RawInline]` for reading.
-///
-/// The buffer is **segmented**: a proposer expanding a [`Frontier`] calls
-/// [`open`](ProposalBuffer::open) with the row it is about to expand, and
-/// every candidate appended afterwards carries that row as its **parent
-/// tag**. The tag is what lets one region hold the candidates of a whole
-/// batch: confirmers read it to find which binding a candidate belongs to,
-/// and the engine reads it to reconstruct the child row. Tags are stored
-/// per entry rather than as segment offsets because that is the form both
-/// readers want — random access, and no requirement that a proposer emit
-/// its segments contiguously (see
-/// [`UnionConstraint`](unionconstraint::UnionConstraint), which interleaves
-/// variants and then sorts).
-///
-/// The word-per-entry liveness layout is the deliberate baseline: every
-/// lane — CPU or GPU — writes its own word with no read-modify-write
-/// contention. A bit-packed representation is a planned alternative behind
-/// this same API, to be justified against this baseline.
-#[derive(Clone, Debug, Default)]
-pub struct ProposalBuffer {
-    entries: Vec<RawInline>,
-    live: Vec<u32>,
-    parents: Vec<u32>,
-    parent: u32,
-}
-
-impl ProposalBuffer {
-    /// Creates an empty buffer.
-    pub fn new() -> Self {
-        ProposalBuffer {
-            entries: Vec::new(),
-            live: Vec::new(),
-            parents: Vec::new(),
-            parent: 0,
-        }
-    }
-
-    /// Opens the segment for frontier row `parent`: every candidate
-    /// appended until the next `open` is tagged as belonging to it.
-    ///
-    /// A proposer handed a frontier of `n` rows calls this once per row.
-    /// The default tag is row 0, so a proposer that only ever sees a
-    /// frontier of one needs no call at all.
-    pub fn open(&mut self, parent: u32) {
-        self.parent = parent;
-    }
-
-    /// The frontier row entry `i` was proposed for.
-    pub fn parent_of(&self, i: usize) -> u32 {
-        self.parents[i]
-    }
-
-    /// Appends a candidate, live, tagged with the open segment.
-    pub fn push(&mut self, value: RawInline) {
-        self.entries.push(value);
-        self.live.push(1);
-        self.parents.push(self.parent);
-    }
-
-    /// Appends every candidate from `iter`, live, tagged with the open
-    /// segment.
-    pub fn extend(&mut self, iter: impl IntoIterator<Item = RawInline>) {
-        for value in iter {
-            self.push(value);
-        }
-    }
-
-    /// Appends every candidate from `slice`, live, tagged with the open
-    /// segment.
-    pub fn extend_from_slice(&mut self, slice: &[RawInline]) {
-        self.entries.extend_from_slice(slice);
-        self.live.resize(self.entries.len(), 1);
-        self.parents.resize(self.entries.len(), self.parent);
-    }
-
-    /// Drops all candidates, keeping capacity.
-    pub fn clear(&mut self) {
-        self.entries.clear();
-        self.live.clear();
-        self.parents.clear();
-        self.parent = 0;
-    }
-
-    /// Current capacity in entries.
-    pub fn capacity(&self) -> usize {
-        self.entries.capacity()
-    }
-
-    /// Reserves capacity for exactly `additional` further entries.
-    pub fn reserve_exact(&mut self, additional: usize) {
-        self.entries.reserve_exact(additional);
-        self.live.reserve_exact(additional);
-        self.parents.reserve_exact(additional);
-    }
-
-    /// Index of the first live entry at or after `from`, if any.
-    pub fn next_live(&self, from: usize) -> Option<usize> {
-        self.live[from.min(self.live.len())..]
-            .iter()
-            .position(|w| *w != 0)
-            .map(|offset| from + offset)
-    }
-
-    /// Number of live entries at or after `from`.
-    pub fn count_live(&self, from: usize) -> usize {
-        self.live[from.min(self.live.len())..]
-            .iter()
-            .filter(|w| **w != 0)
-            .count()
-    }
-
-    /// Whether entry `i` is live.
-    pub fn is_live(&self, i: usize) -> bool {
-        self.live[i] != 0
-    }
-
-    /// Iterates the live entry values at or after `from` — the engine's own
-    /// consumption view, also handy for inspecting survivors in tests.
-    pub fn live_values(&self, from: usize) -> impl Iterator<Item = &RawInline> {
-        self.entries[from..]
-            .iter()
-            .zip(self.live[from..].iter())
-            .filter(|(_, w)| **w != 0)
-            .map(|(v, _)| v)
-    }
-
-    /// The confirmable region from `base` onward: entry values and their
-    /// parent tags paired with their killable liveness words.
-    pub fn region(&mut self, base: usize) -> Candidates<'_> {
-        Candidates {
-            values: &self.entries[base..],
-            parents: &self.parents[base..],
-            live: &mut self.live[base..],
-        }
-    }
-
-    /// Splits off and returns the tail starting at `at` (values, parent
-    /// tags and liveness together).
-    pub fn split_off(&mut self, at: usize) -> ProposalBuffer {
-        ProposalBuffer {
-            entries: self.entries.split_off(at),
-            live: self.live.split_off(at),
-            parents: self.parents.split_off(at),
-            parent: self.parent,
-        }
-    }
-
-    /// The **live** entries of the freshly-proposed region `[base..]` as
-    /// `(parent tag, value)` pairs — the form
-    /// [`rewrite_region`](ProposalBuffer::rewrite_region) takes back.
-    ///
-    /// Killed entries are skipped, which is what makes the round trip
-    /// through `rewrite_region` safe: that call republishes everything it is
-    /// handed as live, so yielding the dead here would resurrect them. The
-    /// buffer is kill-only, and this pair of methods is the only place that
-    /// invariant could be broken — a variant is free to kill inside its own
-    /// propose, and those kills must survive the region being rebuilt.
-    pub fn tagged(&self, base: usize) -> impl Iterator<Item = (u32, RawInline)> + '_ {
-        self.parents[base..]
-            .iter()
-            .copied()
-            .zip(self.entries[base..].iter().copied())
-            .zip(self.live[base..].iter())
-            .filter(|(_, w)| **w != 0)
-            .map(|(pair, _)| pair)
-    }
-
-    /// Drops entries of the freshly-proposed region `[base..]` for which
-    /// `keep` returns `false`, compacting the survivors.
-    ///
-    /// Only a proposer may call this, and only on the region it appended
-    /// in the current call, before returning — see
-    /// [`rewrite_region`](ProposalBuffer::rewrite_region) for why.
-    pub fn retain_region(&mut self, base: usize, mut keep: impl FnMut(u32, &RawInline) -> bool) {
-        let mut write = base;
-        for read in base..self.entries.len() {
-            if keep(self.parents[read], &self.entries[read]) {
-                self.entries[write] = self.entries[read];
-                self.parents[write] = self.parents[read];
-                self.live[write] = self.live[read];
-                write += 1;
-            }
-        }
-        self.entries.truncate(write);
-        self.parents.truncate(write);
-        self.live.truncate(write);
-    }
-
-    /// Rewrites the freshly-proposed region `[base..]` with `values`, all
-    /// live, each carrying its own parent tag. Only a proposer may call
-    /// this, and only on the region it appended in the current call,
-    /// before returning — after that, indices are frozen because kills
-    /// bind to them. Used by
-    /// [`UnionConstraint`](unionconstraint::UnionConstraint) for its
-    /// per-row sort-dedup.
-    pub fn rewrite_region(&mut self, base: usize, values: Vec<(u32, RawInline)>) {
-        self.entries.truncate(base);
-        self.live.truncate(base);
-        self.parents.truncate(base);
-        for (parent, value) in values {
-            self.entries.push(value);
-            self.live.push(1);
-            self.parents.push(parent);
-        }
-    }
-
-    /// Rewrites the parent tags of the freshly-proposed region `[base..]`
-    /// through `map`, which translates the sub-frontier row numbers a
-    /// child wrote into this proposer's own frontier coordinates.
-    ///
-    /// This is the counterpart of [`Frontier::compose`]: a composite that
-    /// hands a child a sub-batch gets tags in the sub-batch's numbering
-    /// back and must lift them before the region reaches its own caller.
-    pub fn remap_region(&mut self, base: usize, map: &[u32]) {
-        for parent in &mut self.parents[base..] {
-            *parent = map[*parent as usize];
-        }
-    }
-}
-
-impl std::ops::Deref for ProposalBuffer {
-    type Target = [RawInline];
-
-    fn deref(&self) -> &[RawInline] {
-        &self.entries
-    }
-}
-
-impl<'a> IntoIterator for &'a ProposalBuffer {
-    type Item = &'a RawInline;
-    type IntoIter = std::slice::Iter<'a, RawInline>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.entries.iter()
-    }
-}
-
-/// A confirmable view over one proposal region: entry values and parent
-/// tags read-only, liveness killable — the argument of
-/// [`Constraint::confirm`].
-///
-/// Confirmers may only kill entries, never revive them, so any number of
-/// confirmers writing into the same region compute their conjunction —
-/// sequentially (each skipping already-dead entries) or in parallel over
-/// copies merged with [`and_words`]/[`or_words`]. Index `i` refers to
-/// `values()[i]`.
-///
-/// A region spans a whole [`Frontier`]: entry `i`'s
-/// [`parent`](Candidates::parent) is the frontier row it was proposed
-/// for. Confirmers whose verdict depends on the parent binding walk the
-/// region with [`for_each_parent`](Candidates::for_each_parent); those
-/// whose verdict is parent-independent (set membership, a range, a
-/// constant) ignore the tags entirely and use
-/// [`retain`](Candidates::retain).
-pub struct Candidates<'a> {
-    values: &'a [RawInline],
-    parents: &'a [u32],
-    live: &'a mut [u32],
-}
-
-impl<'a> Candidates<'a> {
-    /// The candidate values of this region.
-    pub fn values(&self) -> &[RawInline] {
-        self.values
-    }
-
-    /// The frontier row entry `i` was proposed for.
-    pub fn parent(&self, i: usize) -> u32 {
-        self.parents[i]
-    }
-
-    /// The parent tags of this region, one per entry.
-    pub fn parents(&self) -> &[u32] {
-        self.parents
-    }
-
-    /// Splits the region into maximal runs of equal parent tag and calls
-    /// `confirm` on each with the run's own sub-region.
-    ///
-    /// This is how a parent-dependent confirmer amortises its per-binding
-    /// setup across a batch: one setup per run instead of one per
-    /// candidate. Correct for any tag order — an interleaved region just
-    /// yields more, shorter runs — and each sub-region's kills land
-    /// directly in this region's liveness words.
-    pub fn for_each_parent(&mut self, mut confirm: impl FnMut(u32, &mut Candidates<'_>)) {
-        let mut start = 0;
-        while start < self.parents.len() {
-            let parent = self.parents[start];
-            let mut end = start + 1;
-            while end < self.parents.len() && self.parents[end] == parent {
-                end += 1;
-            }
-            let mut run = Candidates {
-                values: &self.values[start..end],
-                parents: &self.parents[start..end],
-                live: &mut self.live[start..end],
-            };
-            confirm(parent, &mut run);
-            start = end;
-        }
-    }
-
-    /// Number of entries (live and dead) in this region.
-    pub fn len(&self) -> usize {
-        self.values.len()
-    }
-
-    /// True when the region has no entries.
-    pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
-    }
-
-    /// Whether entry `i` is still live.
-    pub fn is_live(&self, i: usize) -> bool {
-        self.live[i] != 0
-    }
-
-    /// Marks entry `i` dead.
-    pub fn kill(&mut self, i: usize) {
-        self.live[i] = 0;
-    }
-
-    /// Kills every live entry whose value fails `keep` — the region-side
-    /// equivalent of `Vec::retain`, skipping entries already dead. Lives on
-    /// the pair type deliberately: values and liveness are one object here,
-    /// so there is no loose pairing to misalign.
-    pub fn retain(&mut self, mut keep: impl FnMut(&RawInline) -> bool) {
-        for (i, value) in self.values.iter().enumerate() {
-            if self.live[i] != 0 && !keep(value) {
-                self.live[i] = 0;
-            }
-        }
-    }
-
-    /// Kills every entry (a confirmer that can prove total inconsistency).
-    pub fn kill_all(&mut self) {
-        self.live.fill(0);
-    }
-
-    /// Reborrows this region mutably (for passing to several confirmers in
-    /// sequence).
-    pub fn reborrow(&mut self) -> Candidates<'_> {
-        Candidates {
-            values: self.values,
-            parents: self.parents,
-            live: self.live,
-        }
-    }
-
-    /// Copies the liveness words out (scratch for OR-composition).
-    pub fn live_words(&self) -> Vec<u32> {
-        self.live.to_vec()
-    }
-
-    /// Replaces the liveness words (merge result of OR-composition).
-    pub fn set_live_words(&mut self, words: &[u32]) {
-        debug_assert_eq!(words.len(), self.live.len());
-        self.live.copy_from_slice(words);
-    }
-
-    /// A detached scratch region over `words` with the same values and
-    /// parent tags — used by OR-composition to collect per-variant
-    /// verdicts.
-    pub fn scratch<'b>(&self, words: &'b mut [u32]) -> Candidates<'b>
-    where
-        'a: 'b,
-    {
-        Candidates {
-            values: self.values,
-            parents: self.parents,
-            live: words,
-        }
-    }
-}
-
-/// Word-wise AND of `other` into `words` (conjunction of live sets).
-pub fn and_words(words: &mut [u32], other: &[u32]) {
-    debug_assert_eq!(words.len(), other.len());
-    for (w, o) in words.iter_mut().zip(other.iter()) {
-        *w &= *o;
-    }
-}
-
-/// Word-wise OR of `other` into `words` (disjunction of live sets).
-pub fn or_words(words: &mut [u32], other: &[u32]) {
-    debug_assert_eq!(words.len(), other.len());
-    for (w, o) in words.iter_mut().zip(other.iter()) {
-        *w |= *o;
-    }
-}
-
 /// The cooperative protocol that every query participant implements.
 ///
 /// A constraint restricts the values that can be assigned to query variables.
@@ -1428,12 +1038,7 @@ impl LevelValues {
     /// borrow a `static` array of them.
     const fn empty() -> Self {
         LevelValues {
-            buffer: ProposalBuffer {
-                entries: Vec::new(),
-                live: Vec::new(),
-                parents: Vec::new(),
-                parent: 0,
-            },
+            buffer: ProposalBuffer::new(),
             pos: 0,
         }
     }
@@ -3030,9 +2635,11 @@ mod tests {
                 (2, 2)
             );
             assert!(Arc::ptr_eq(&left.depths[1].block, &right.depths[0].block));
+            // `ProposalBuffer` derefs to its entry slice, so this compares
+            // the two buffers' storage without naming a private field.
             assert!(!std::ptr::eq(
-                left.bindings.levels[0].buffer.entries.as_ptr(),
-                right.bindings.levels[0].buffer.entries.as_ptr(),
+                left.bindings.levels[0].buffer.as_ptr(),
+                right.bindings.levels[0].buffer.as_ptr(),
             ));
 
             // Fencing an already-fenced sibling cannot restore continuation.
