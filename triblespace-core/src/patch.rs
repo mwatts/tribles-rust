@@ -3517,7 +3517,11 @@ where
 /// An iterator over all keys in a PATCH.
 /// The keys are returned in key ordering but in random order.
 pub struct PATCHIterator<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
+    // Root-to-leaf branch depths strictly increase within 0..KEY_LEN, so
+    // seeding from the real root branch keeps the live stack within KEY_LEN.
     stack: ArrayVec<std::slice::Iter<'a, Option<Head<KEY_LEN, O, V>>>, KEY_LEN>,
+    // A singleton root has no branch frame, including when KEY_LEN is zero.
+    pending_leaf: Option<&'a [u8; KEY_LEN]>,
     remaining: usize,
 }
 
@@ -3526,9 +3530,16 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> PATCHIterator<'a, KEY_L
     pub fn new(patch: &'a PATCH<KEY_LEN, O, V>) -> Self {
         let mut r = PATCHIterator {
             stack: ArrayVec::new(),
+            pending_leaf: None,
             remaining: patch.len().min(usize::MAX as u64) as usize,
         };
-        r.stack.push(std::slice::from_ref(&patch.root).iter());
+        if let Some(root) = &patch.root {
+            match root.body_ref() {
+                BodyRef::Leaf(leaf) => r.pending_leaf = Some(&leaf.key),
+                BodyRef::LocalLeaf(key) => r.pending_leaf = Some(key),
+                BodyRef::Branch(branch) => r.stack.push(branch.child_table.iter()),
+            }
+        }
         r
     }
 }
@@ -3539,6 +3550,10 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator
     type Item = &'a [u8; KEY_LEN];
 
     fn next(&mut self) -> Option<Self::Item> {
+        if let Some(key) = self.pending_leaf.take() {
+            self.remaining = self.remaining.saturating_sub(1);
+            return Some(key);
+        }
         let mut iter = self.stack.last_mut()?;
         loop {
             if let Some(child) = iter.next() {

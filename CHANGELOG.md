@@ -469,6 +469,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Borrowing PATCH iteration now reaches the maximum trie depth.** The
+  stack-allocated iterator seeds its traversal from the root branch's child
+  table instead of spending one of its `KEY_LEN` frames on a synthetic root.
+  A path may therefore contain a branch at every key byte without overflowing;
+  empty and singleton zero-length-key PATCHes also require no stack frame.
+
 - **PATCH thread-safety now follows its associated values.** Persistent PATCH
   snapshots may share a leaf across threads, so both `Send` and `Sync` now
   require `V: Send + Sync`; compile-time coverage includes the important
