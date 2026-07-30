@@ -475,7 +475,8 @@ mod branch_head_carry {
             .get(after_handle)
             .expect("read head meta");
         let notes: Vec<Inline<triblespace_core::inline::encodings::shortstring::ShortString>> =
-            find!(n: Inline<ShortString>, pattern!(&after, [{ marker @ ann::note: ?n }])).collect();
+            find!(n: Inline<ShortString>, pattern!(&after, [{ &marker @ ann::note: ?n }]))
+                .collect();
         assert_eq!(
             notes.len(),
             1,
@@ -483,15 +484,15 @@ mod branch_head_carry {
         );
         let annotation_names: Vec<Inline<Handle<LongString>>> = find!(
             name: Inline<Handle<LongString>>,
-            pattern!(&after, [{ marker @ triblespace_core::metadata::name: ?name }])
+            pattern!(&after, [{ &marker @ triblespace_core::metadata::name: ?name }])
         )
         .collect();
         assert_eq!(annotation_names, vec![annotation_name]);
         assert!(exists!(pattern!(&after, [{
-            marker @ triblespace_core::repo::branch: unrelated_branch_id
+            &marker @ triblespace_core::repo::branch: unrelated_branch_id
         }])));
         assert!(exists!(pattern!(&after, [{
-            marker @ triblespace_core::repo::head: decoy_head
+            &marker @ triblespace_core::repo::head: decoy_head
         }])));
 
         // And the head genuinely advanced — otherwise this proves nothing.
