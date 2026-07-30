@@ -1,14 +1,16 @@
 //! Measures heap-allocation behaviour of `SimpleArchive` ingestion to
 //! verify the `LocalLeaf` path actually eliminates per-trible heap
-//! `Leaf` allocations.
+//! `Leaf` allocations. Above the parallel archive threshold, the public path
+//! also uses the bottom-up constructor, so those larger cases are end-to-end
+//! decoder regressions rather than a representation-only comparison.
 //!
 //! Strategy: install a counting global allocator, build a TribleSet
 //! through the normal `insert` path (forcing heap Leaves), encode to
 //! a `SimpleArchive` blob, then decode through `try_from_blob` while
 //! counting allocations performed during the decode. The Leaf-heap
-//! path costs ~96 bytes per trible; the LocalLeaf path costs zero
-//! per-trible alloc bytes (Branch overhead grows with tree shape,
-//! not trible count).
+//! path costs ~96 bytes per trible. The archive path avoids those persistent
+//! Leaf allocations, while its transient hash/permutation buffers and Branch
+//! allocation still scale with input and trie shape.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -136,18 +138,17 @@ fn measure<R>(f: impl FnOnce() -> R) -> (R, usize, usize) {
 #[test]
 fn simplearchive_decode_uses_archive_owner() {
     let _guard = COUNTING_LOCK.lock().expect("counting mutex poisoned");
-    // Both paths share the same parallel-reduce gate, so at small N
-    // they're naturally serial. At large N the heap path goes parallel
-    // via rayon while the archive path stays serial (LocalLeaf-aware
-    // `union` not yet implemented). To keep the *per-trible* signal
-    // comparable across scales, set `RAYON_NUM_THREADS=1` when running
-    // this test:
+    // Below 4096 rows both paths use the same serial online decoder and isolate
+    // heap Leaf versus archive LocalLeaf representation. At and above the
+    // threshold, heap-only keeps the online worker while the public archive
+    // path builds each worker chunk bottom-up; those cases deliberately guard
+    // the complete decoders rather than attributing the difference to leaves.
+    // Set `RAYON_NUM_THREADS=1` for less noisy local measurements:
     //
     //     RAYON_NUM_THREADS=1 cargo test --release --test simplearchive_localleaf
     //
-    // Otherwise expect the archive vs heap ratio to widen as N
-    // crosses the rayon threshold purely due to thread count, not
-    // per-insert cost.
+    // Parallel runs remain valid regression checks, but are not a causal
+    // representation benchmark above the threshold.
     measure_at(1_024);
     measure_at(4_095);
     measure_at(10_000);
@@ -175,8 +176,8 @@ fn measure_at(n: usize) {
         measure(|| -> TribleSet { try_from_blob_heap_only(archive.clone()).unwrap() });
     assert_eq!(heap_set.len(), N);
 
-    // LocalLeaf archive ingest: identical validation/iteration, but
-    // each trible lands as a LocalLeaf backed by the shared owner Arc.
+    // Public archive ingest. Below the threshold this differs only in
+    // LocalLeaf representation; above it the bottom-up worker is also active.
     let (archive_set, archive_allocs, archive_bytes) =
         measure(|| -> TribleSet { archive.clone().try_from_blob().unwrap() });
     assert_eq!(archive_set.len(), N);

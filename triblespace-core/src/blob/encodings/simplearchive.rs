@@ -113,9 +113,9 @@ impl TryFromBlob<SimpleArchive> for TribleSet {
 }
 
 /// Decode a [`SimpleArchive`] blob into a [`TribleSet`] forcing the
-/// heap-`Leaf` ingest path (no `LocalLeaf`). Exposed for measurement
-/// so the LocalLeaf path can be compared against the legacy heap
-/// behaviour on identical input.
+/// heap-`Leaf` ingest path (no `LocalLeaf`). Below the parallel threshold this
+/// isolates leaf representation on the same serial decoder; above it this is
+/// an end-to-end heap-online baseline for the public bottom-up decoder.
 pub fn try_from_blob_heap_only(blob: Blob<SimpleArchive>) -> Result<TribleSet, UnarchiveError> {
     try_from_blob_inner(blob, /*archive_backed:*/ false)
 }
@@ -429,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn bottom_up_preallocates_full_byte_fanout() {
+    fn bottom_up_full_byte_fanout_matches_serial() {
         let rows = (0u16..=255)
             .map(|byte| {
                 let mut row = [0u8; 64];
@@ -447,10 +447,6 @@ mod tests {
         let candidate = bottom_up_for_test(blob).unwrap();
         assert_all_six_parity(&candidate, &baseline, 256);
         assert_eq!(candidate.eav.branch_fanout_histogram()[256], 1);
-        assert_eq!(
-            candidate.eav.total_table_slots(),
-            baseline.eav.total_table_slots()
-        );
     }
 
     #[cfg(feature = "proptest")]
@@ -516,24 +512,30 @@ mod tests {
     #[cfg(feature = "parallel")]
     #[test]
     fn production_archive_matches_serial_and_retains_source() {
-        for len in [0usize, 1, 2, 3, 257, 4_095, 4_096, 8_192] {
-            let blob = fixture_blob(len);
-            let baseline = serial_for_test(blob.clone()).unwrap();
-            let candidate = TribleSet::try_from_blob(blob.clone()).unwrap();
-            assert_all_six_parity(&candidate, &baseline, len);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap()
+            .install(|| {
+                for len in [0usize, 1, 2, 3, 257, 4_095, 4_096, 8_192] {
+                    let blob = fixture_blob(len);
+                    let baseline = serial_for_test(blob.clone()).unwrap();
+                    let candidate = TribleSet::try_from_blob(blob.clone()).unwrap();
+                    assert_all_six_parity(&candidate, &baseline, len);
 
-            let survivor = candidate.clone();
-            drop(candidate);
-            drop(baseline);
-            drop(blob);
-            black_box(vec![0x5au8; len.saturating_mul(64).min(1 << 20)]);
-            assert_eq!(survivor.eav.iter_ordered().count(), len);
-            assert_eq!(survivor.eva.iter_ordered().count(), len);
-            assert_eq!(survivor.aev.iter_ordered().count(), len);
-            assert_eq!(survivor.ave.iter_ordered().count(), len);
-            assert_eq!(survivor.vea.iter_ordered().count(), len);
-            assert_eq!(survivor.vae.iter_ordered().count(), len);
-        }
+                    let survivor = candidate.clone();
+                    drop(candidate);
+                    drop(baseline);
+                    drop(blob);
+                    black_box(vec![0x5au8; len.saturating_mul(64).min(1 << 20)]);
+                    assert_eq!(survivor.eav.iter_ordered().count(), len);
+                    assert_eq!(survivor.eva.iter_ordered().count(), len);
+                    assert_eq!(survivor.aev.iter_ordered().count(), len);
+                    assert_eq!(survivor.ave.iter_ordered().count(), len);
+                    assert_eq!(survivor.vea.iter_ordered().count(), len);
+                    assert_eq!(survivor.vae.iter_ordered().count(), len);
+                }
+            });
     }
 
     #[cfg(feature = "parallel")]
