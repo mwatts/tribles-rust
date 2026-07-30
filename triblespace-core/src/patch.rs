@@ -20,7 +20,6 @@ mod leaf;
 use arrayvec::ArrayVec;
 
 /// Re-export of [`Entry`](entry::Entry).
-pub use branch::ArchiveOwner;
 use branch::*;
 pub use entry::{ArchiveEntry, Entry};
 use leaf::*;
@@ -35,7 +34,329 @@ use std::fmt;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
-use std::sync::Once;
+use std::sync::{Arc, Once};
+
+/// Marker trait for opaque owners of bytes referenced by archive-backed
+/// PATCH leaves. An owner exists solely to keep its allocation alive while a
+/// [`HeadTag::LocalLeaf`] points into it.
+pub trait ArchiveOwner: Send + Sync + 'static {}
+
+impl<T: Send + Sync + 'static + ?Sized> ArchiveOwner for T {}
+
+/// One node in the exact persistent set of retained archive allocations.
+///
+/// Owners are stored inline in their parent (or directly in [`OwnerCover`]);
+/// only branches allocate an [`Arc`]. This is a binary Patricia trie over
+/// owner allocation addresses. Masks strictly decrease on each root-to-leaf
+/// path, so the shape is canonical for an address set and its height is at
+/// most [`usize::BITS`]. Rebuilt paths share every untouched branch Arc with
+/// older PATCH snapshots.
+#[derive(Clone)]
+enum OwnerNode {
+    Owner(Arc<dyn ArchiveOwner>),
+    Branch(Arc<OwnerBranch>),
+}
+
+struct OwnerBranch {
+    mask: usize,
+    zero: OwnerNode,
+    one: OwnerNode,
+}
+
+/// Exact persistent set of archive allocations retained by one PATCH.
+///
+/// Membership is keyed by an allocation's data address. Each address remains
+/// unavailable for reuse while its owner leaf is present. `latest_address`
+/// keeps repeated archive ingestion O(1) without weakening exact membership
+/// for older owners or repeated diamond unions.
+#[derive(Clone)]
+struct OwnerCover {
+    latest_address: usize,
+    len: usize,
+    root: OwnerNode,
+}
+
+impl core::fmt::Debug for OwnerCover {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("OwnerCover")
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
+impl OwnerNode {
+    #[inline]
+    fn takes_one(address: usize, mask: usize) -> bool {
+        address & mask != 0
+    }
+
+    #[inline]
+    fn critical_mask(left: usize, right: usize) -> usize {
+        let differing = left ^ right;
+        debug_assert_ne!(differing, 0);
+        1usize << (usize::BITS - 1 - differing.leading_zeros())
+    }
+
+    fn matching_owner(&self, address: usize) -> &Arc<dyn ArchiveOwner> {
+        let mut node = self;
+        loop {
+            match node {
+                Self::Owner(owner) => return owner,
+                Self::Branch(branch) => {
+                    node = if Self::takes_one(address, branch.mask) {
+                        &branch.one
+                    } else {
+                        &branch.zero
+                    };
+                }
+            }
+        }
+    }
+
+    #[cfg(any(debug_assertions, test))]
+    fn contains(&self, address: usize) -> bool {
+        OwnerCover::address(self.matching_owner(address)) == address
+    }
+
+    #[cfg(test)]
+    fn same_shape(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Owner(left), Self::Owner(right)) => {
+                OwnerCover::address(left) == OwnerCover::address(right)
+            }
+            (Self::Branch(left), Self::Branch(right)) => {
+                left.mask == right.mask
+                    && left.zero.same_shape(&right.zero)
+                    && left.one.same_shape(&right.one)
+            }
+            _ => false,
+        }
+    }
+
+    /// Persistently insert one owner, returning the unchanged root on a hit.
+    fn insert(&self, owner: &Arc<dyn ArchiveOwner>) -> (Self, bool) {
+        let address = OwnerCover::address(owner);
+        let matching = self.matching_owner(address);
+        let existing_address = OwnerCover::address(matching);
+        if existing_address == address {
+            debug_assert!(Arc::ptr_eq(matching, owner));
+            return (self.clone(), false);
+        }
+
+        let critical_mask = Self::critical_mask(address, existing_address);
+        (
+            Self::insert_at(
+                self,
+                Self::Owner(owner.clone()),
+                address,
+                existing_address,
+                critical_mask,
+            ),
+            true,
+        )
+    }
+
+    fn insert_at(
+        root: &Self,
+        inserted: Self,
+        inserted_address: usize,
+        existing_address: usize,
+        critical_mask: usize,
+    ) -> Self {
+        if let Self::Branch(branch) = root {
+            if branch.mask > critical_mask {
+                if Self::takes_one(inserted_address, branch.mask) {
+                    return Self::Branch(Arc::new(OwnerBranch {
+                        mask: branch.mask,
+                        zero: branch.zero.clone(),
+                        one: Self::insert_at(
+                            &branch.one,
+                            inserted,
+                            inserted_address,
+                            existing_address,
+                            critical_mask,
+                        ),
+                    }));
+                }
+                return Self::Branch(Arc::new(OwnerBranch {
+                    mask: branch.mask,
+                    zero: Self::insert_at(
+                        &branch.zero,
+                        inserted,
+                        inserted_address,
+                        existing_address,
+                        critical_mask,
+                    ),
+                    one: branch.one.clone(),
+                }));
+            }
+            debug_assert_ne!(branch.mask, critical_mask);
+        }
+
+        debug_assert_ne!(
+            Self::takes_one(inserted_address, critical_mask),
+            Self::takes_one(existing_address, critical_mask),
+        );
+        let (zero, one) = if Self::takes_one(inserted_address, critical_mask) {
+            (root.clone(), inserted)
+        } else {
+            (inserted, root.clone())
+        };
+        Self::Branch(Arc::new(OwnerBranch {
+            mask: critical_mask,
+            zero,
+            one,
+        }))
+    }
+
+    fn for_each_owner<F>(&self, f: &mut F)
+    where
+        F: FnMut(&Arc<dyn ArchiveOwner>),
+    {
+        match self {
+            Self::Owner(owner) => f(owner),
+            Self::Branch(branch) => {
+                branch.zero.for_each_owner(f);
+                branch.one.for_each_owner(f);
+            }
+        }
+    }
+}
+
+impl OwnerCover {
+    #[inline]
+    fn address(owner: &Arc<dyn ArchiveOwner>) -> usize {
+        Arc::as_ptr(owner) as *const () as usize
+    }
+
+    fn singleton(owner: &Arc<dyn ArchiveOwner>) -> Arc<Self> {
+        Arc::new(Self {
+            latest_address: Self::address(owner),
+            len: 1,
+            root: OwnerNode::Owner(owner.clone()),
+        })
+    }
+
+    fn retain(current: &mut Option<Arc<Self>>, owner: &Arc<dyn ArchiveOwner>) {
+        let address = Self::address(owner);
+        let Some(existing) = current.as_mut() else {
+            *current = Some(Self::singleton(owner));
+            return;
+        };
+        if existing.latest_address == address {
+            return;
+        }
+
+        // Finish the persistent path before publishing it. A caught allocation
+        // panic therefore leaves the installed lifetime receipt unchanged.
+        let (root, inserted) = existing.root.insert(owner);
+        let cover = Arc::make_mut(existing);
+        cover.root = root;
+        cover.len += usize::from(inserted);
+        cover.latest_address = address;
+    }
+
+    /// Transactionally replace `current` with its exact union with `other`.
+    fn merge_into(current: &mut Option<Arc<Self>>, other: &Option<Arc<Self>>) {
+        *current = Self::union(current.clone(), other);
+    }
+
+    fn union(left: Option<Arc<Self>>, right: &Option<Arc<Self>>) -> Option<Arc<Self>> {
+        let Some(right) = right.as_ref() else {
+            return left;
+        };
+        let Some(left) = left else {
+            return Some(right.clone());
+        };
+        if Arc::ptr_eq(&left, right) {
+            return Some(left);
+        }
+
+        // Insert the smaller exact set into the larger. The canonical Patricia
+        // shape makes the result independent of this directional choice.
+        let (mut result, additions) = if left.len >= right.len {
+            (left.clone(), right)
+        } else {
+            (right.clone(), &left)
+        };
+        additions.root.for_each_owner(&mut |owner| {
+            let (root, inserted) = result.root.insert(owner);
+            if inserted {
+                let cover = Arc::make_mut(&mut result);
+                cover.root = root;
+                cover.len += 1;
+            }
+        });
+        if result.latest_address != right.latest_address {
+            Arc::make_mut(&mut result).latest_address = right.latest_address;
+        }
+        Some(result)
+    }
+
+    /// Exact subset check for auditing unsafe cover replacement in debug
+    /// builds. Production callers rely on the construction proof documented
+    /// at [`PATCH::set_owner_guard`].
+    #[cfg(debug_assertions)]
+    fn covers(&self, covered: &Self) -> bool {
+        if self.len < covered.len {
+            return false;
+        }
+        let mut covers = true;
+        covered.root.for_each_owner(&mut |owner| {
+            covers &= self.root.contains(Self::address(owner));
+        });
+        covers
+    }
+}
+
+// Keep the intended structural cost visible. Owner leaves live inline; only
+// Patricia branches and the outer cover allocate.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(std::mem::size_of::<OwnerNode>() == 2 * std::mem::size_of::<usize>());
+    assert!(std::mem::size_of::<OwnerBranch>() == 5 * std::mem::size_of::<usize>());
+    assert!(std::mem::size_of::<OwnerCover>() == 4 * std::mem::size_of::<usize>());
+};
+
+/// Opaque lifetime receipt for archive-backed PATCH leaves.
+///
+/// Aggregate structures can exactly deduplicate retained provenance, add one
+/// archive owner, and install a proved conservative superset. Trie Heads and
+/// concrete Patricia nodes remain private to PATCH.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PATCHOwnerGuard(Option<Arc<OwnerCover>>);
+
+impl PATCHOwnerGuard {
+    /// Retain the exact deduplicated union of owners in both receipts.
+    pub(crate) fn join(self, other: Self) -> Self {
+        Self(OwnerCover::union(self.0, &other.0))
+    }
+
+    /// Add one archive allocation before any LocalLeaf into it is installed.
+    pub(crate) fn retain_archive_owner(&mut self, owner: &Arc<dyn ArchiveOwner>) {
+        OwnerCover::retain(&mut self.0, owner);
+    }
+
+    #[cfg(debug_assertions)]
+    fn covers(&self, current: &Option<Arc<OwnerCover>>) -> bool {
+        let Some(current) = current else {
+            return true;
+        };
+        let Some(replacement) = self.0.as_ref() else {
+            return false;
+        };
+        Arc::ptr_eq(current, replacement) || replacement.covers(current)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (None, None) => true,
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+}
 
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("PATCH tagged pointers require 64-bit targets");
@@ -461,8 +782,8 @@ pub(crate) enum HeadTag {
     // arithmetic and the Leaf-vs-Branch threshold comparisons are unaffected.
     // It represents a leaf whose key bytes live in an archive's mmap'd buffer,
     // referenced via a thin pointer in the Head body slot rather than via a
-    // heap-allocated `Leaf<KEY_LEN, V>`. Lifetime is guaranteed by the nearest
-    // ancestor `Branch` whose `owner` is `Some(_)`.
+    // heap-allocated `Leaf<KEY_LEN, V>`. Lifetime is guaranteed by the exact
+    // owner set on the enclosing PATCH value.
     Leaf = 0,
     Branch2 = 1,
     Branch4 = 2,
@@ -489,8 +810,8 @@ impl HeadTag {
 pub(crate) enum BodyPtr<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
     Leaf(NonNull<Leaf<KEY_LEN, V>>),
     /// Thin pointer to a `[u8; KEY_LEN]` trible living in an archive's
-    /// mmap'd buffer. Lifetime is implicit — guaranteed by the nearest
-    /// ancestor `Branch` whose `owner` is `Some(_)`.
+    /// mmap'd buffer. Lifetime is implicit — guaranteed by the enclosing
+    /// PATCH's owner set.
     LocalLeaf(NonNull<[u8; KEY_LEN]>),
     Branch(branch::BranchNN<KEY_LEN, O, V>),
 }
@@ -501,8 +822,7 @@ pub(crate) enum BodyRef<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
     Leaf(&'a Leaf<KEY_LEN, V>),
     /// Reference to a trible's bytes within an archive. The slice's
     /// lifetime is bound to `&'a Head` via the body pointer; the actual
-    /// underlying allocation is kept alive by an ancestor Branch's
-    /// `owner` Arc.
+    /// underlying allocation is kept alive by the enclosing PATCH.
     LocalLeaf(&'a [u8; KEY_LEN]),
     Branch(&'a Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>),
 }
@@ -513,8 +833,8 @@ pub(crate) enum BodyMut<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
     Leaf(&'a mut Leaf<KEY_LEN, V>),
     /// `LocalLeaf` is read-only by construction (it points into immutable
     /// archive bytes), so the mutable view yields a shared reference.
-    /// Callers attempting to mutate a `LocalLeaf` must first reify it
-    /// into a heap-allocated `Leaf`.
+    /// Structural operations may move the Head while its PATCH owner guard
+    /// remains live.
     LocalLeaf(&'a [u8; KEY_LEN]),
     Branch(&'a mut Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V>>], V>),
 }
@@ -571,8 +891,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     /// # Safety
     /// - `trible_ptr` must remain valid for at least as long as this Head
     ///   exists, which is the caller's responsibility to arrange — typically
-    ///   by holding an `Arc<dyn ArchiveOwner>` in the nearest ancestor
-    ///   `Branch`'s `owner` slot.
+    ///   by retaining its `Arc<dyn ArchiveOwner>` in the enclosing PATCH's
+    ///   root owner set.
     /// - The pointer must be 16-byte aligned; this is debug-asserted.
     pub(crate) unsafe fn new_local_leaf(key: u8, trible_ptr: NonNull<[u8; KEY_LEN]>) -> Self {
         unsafe {
@@ -803,7 +1123,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
             if !this.has_prefix::<KEY_LEN>(start_depth, leaf_key) {
                 return;
             }
-            if this.tag() == HeadTag::Leaf {
+            if matches!(this.tag(), HeadTag::Leaf | HeadTag::LocalLeaf) {
                 slot.take();
             } else {
                 let mut ed = crate::patch::branch::BranchMut::from_head(this);
@@ -875,44 +1195,25 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     }
 }
 
-// Archive-aware insertion path, available only when V = (). LocalLeaf
-// machinery requires the value type to be zero-sized so reification
-// (constructing a heap Leaf with `()` as the value) is well-defined.
+// Archive-aware insertion path, available only when V = ().
 impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
-    /// Inserts a new leaf into a PATCH while keeping owner-aware
-    /// invariants intact. `this` is guaranteed by the call protocol
-    /// to be a heap `Leaf` or a `Branch` — never a `LocalLeaf`,
-    /// because LocalLeaf children are handled inline by their parent
-    /// Branch's `modify_child` closure (the only level where the
-    /// LocalLeaf's owner identity is locally known).
-    ///
-    /// `leaf_owner` is `Some(arc)` when the new leaf is an archive
-    /// `LocalLeaf` backed by that owner Arc, and `None` for plain
-    /// heap leaves.
-    pub(crate) fn insert_leaf_with_owner(
+    /// Inserts a LocalLeaf whose hash was already computed by ArchiveEntry.
+    /// The enclosing PATCH retains the leaf's owner independently of trie
+    /// shape, so LocalLeaves can use the ordinary structural operations.
+    pub(crate) fn insert_archive_leaf(
         mut this: Self,
-        mut leaf: Self,
-        mut leaf_owner: Option<&std::sync::Arc<dyn crate::patch::branch::ArchiveOwner>>,
+        leaf: Self,
         leaf_hash: u128,
         start_depth: usize,
     ) -> Self {
-        // Top-level divergence: `this` is a heap Leaf or a Branch
-        // (never LocalLeaf per the protocol above). The only side
-        // that can be a LocalLeaf at this level is `leaf` — so the
-        // new parent Branch only needs to host whatever owner backs
-        // it. A `this = Branch` keeps its own owner field for its
-        // own subtree; the new parent doesn't inherit responsibility
-        // for that.
         if let Some((depth, this_byte_key, leaf_byte_key)) =
             this.first_divergence(&leaf, start_depth)
         {
             let old_key = this.key();
-            let new_branch_owner = leaf_owner.cloned();
-            let new_body = crate::patch::branch::Branch::new_with_owner_and_rchild_hash(
+            let new_body = crate::patch::branch::Branch::new_with_rchild_hash(
                 depth,
                 this.with_key(this_byte_key),
                 leaf.with_key(leaf_byte_key),
-                new_branch_owner,
                 leaf_hash,
             );
             return Head::new(old_key, new_body);
@@ -921,85 +1222,16 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>> Head<KEY_LEN, O, ()> {
         let end_depth = this.end_depth();
         if end_depth != KEY_LEN {
             let mut ed = crate::patch::branch::BranchMut::from_head(&mut this);
-
-            // Owner reconciliation at this Branch — single match block
-            // so the no-op (matched / both-None) case is one
-            // pattern-match comparison with no extra Arc traffic.
-            match (ed.owner.as_ref(), leaf_owner) {
-                (None, Some(lo)) => ed.owner = Some(lo.clone()),
-                (Some(bo), Some(lo)) if !std::sync::Arc::ptr_eq(bo, lo) => {
-                    leaf = Self::reify_local_leaf_unit(leaf);
-                    leaf_owner = None;
-                }
-                _ => {}
-            }
-
-            // Raw pointer into `ed.owner` so the inline-LocalLeaf
-            // closure path can clone the Arc without re-borrowing
-            // `ed` (which is uniquely held by `modify_child`).
-            // SAFETY: the Arc lives on the Branch for the whole
-            // descent; we read through this pointer only inside the
-            // closure body before it returns.
-            let branch_owner_ptr: *const Option<
-                std::sync::Arc<dyn crate::patch::branch::ArchiveOwner>,
-            > = &ed.owner;
             let inserted = leaf.with_start(ed.end_depth as usize);
             let key = inserted.key();
             ed.modify_child_with_inserted_hint(key, leaf_hash, |opt| match opt {
                 None => Some(inserted),
-                Some(old) => Some(if old.tag() == HeadTag::LocalLeaf {
-                    // Direct-child LocalLeaf: its owner is THIS
-                    // Branch's owner. Build the divergence sub-Branch
-                    // inline and stop the recursion. `tag()` is a
-                    // pointer-bits check (no deref) — cheaper than
-                    // `body_ref()` for the common non-LocalLeaf case.
-                    let (depth, old_byte_key, leaf_byte_key) =
-                        old.first_divergence(&inserted, end_depth).expect(
-                            "LocalLeaf and the inserted leaf must \
-                             diverge at some depth — equal keys \
-                             would have been a no-op upstream",
-                        );
-                    let old_top_key = old.key();
-                    let sub_owner = unsafe { (*branch_owner_ptr).clone() };
-                    let new_body = crate::patch::branch::Branch::new_with_owner_and_rchild_hash(
-                        depth,
-                        old.with_key(old_byte_key),
-                        inserted.with_key(leaf_byte_key),
-                        sub_owner,
-                        leaf_hash,
-                    );
-                    Head::new(old_top_key, new_body)
-                } else {
-                    // `old` is a heap Leaf or a Branch — recurse with
-                    // the protocol-conforming shape, threading the
-                    // precomputed leaf hash through.
-                    Head::insert_leaf_with_owner(old, inserted, leaf_owner, leaf_hash, end_depth)
-                }),
+                Some(old) => Some(Head::insert_archive_leaf(
+                    old, inserted, leaf_hash, end_depth,
+                )),
             });
         }
         this
-    }
-
-    /// Reifies a LocalLeaf head into a heap `Leaf<KEY_LEN, ()>` head.
-    /// Leaf and Branch heads pass through unchanged. Specialized to
-    /// V = () so no `V: Default` bound leaks into generic call sites.
-    fn reify_local_leaf_unit(head: Self) -> Self {
-        match head.body_ref() {
-            BodyRef::Leaf(_) | BodyRef::Branch(_) => head,
-            BodyRef::LocalLeaf(bytes) => {
-                let key_byte = head.key();
-                let key_copy = *bytes;
-                drop(head);
-                let new_leaf = unsafe { Leaf::<KEY_LEN, ()>::new(&key_copy, ()) };
-                Head::new(key_byte, new_leaf)
-            }
-        }
-    }
-
-    /// Public re-export for the root-reification path used by
-    /// `PATCH::insert_archive` when the PATCH is empty.
-    pub(crate) fn reify_local_leaf_unit_for_root(head: Self) -> Self {
-        Self::reify_local_leaf_unit(head)
     }
 }
 
@@ -2021,10 +2253,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Clone for Head<KEY_LEN, O, 
             match self.body() {
                 BodyPtr::Leaf(leaf) => Self::new(self.key(), Leaf::rc_inc(leaf)),
                 BodyPtr::LocalLeaf(ptr) => {
-                    // LocalLeaf has no refcount — its lifetime is managed by
-                    // the nearest ancestor Branch's `owner`. Cloning the Head
-                    // just copies the tagged pointer; both Heads will read
-                    // the same archive bytes.
+                    // LocalLeaf has no refcount. Its enclosing PATCH snapshots
+                    // clone the root owner set alongside the tagged pointer.
                     Self::new_local_leaf(self.key(), ptr)
                 }
                 BodyPtr::Branch(branch) => Self::new(self.key(), Branch::rc_inc(branch)),
@@ -2043,8 +2273,8 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Drop for Head<KEY_LEN, O, V
             match self.body() {
                 BodyPtr::Leaf(leaf) => Leaf::rc_dec(leaf),
                 BodyPtr::LocalLeaf(_) => {
-                    // No-op: LocalLeaf's bytes are owned by an ancestor
-                    // Branch's `owner` Arc, not refcounted per-leaf.
+                    // No-op: LocalLeaf bytes are retained by the enclosing
+                    // PATCH's root owner set, not refcounted per leaf.
                 }
                 BodyPtr::Branch(branch) => Branch::rc_dec(branch),
             }
@@ -2072,7 +2302,14 @@ pub struct PATCH<const KEY_LEN: usize, O = IdentitySchema, V = ()>
 where
     O: KeySchema<KEY_LEN>,
 {
+    // Field order is deliberate: Heads drop before the owner cover.
     root: Option<Head<KEY_LEN, O, V>>,
+    /// Deduplicated conservative lifetime cover for every LocalLeaf anywhere
+    /// below `root`. Set operations may retain provenance no longer reachable
+    /// from the result, but never duplicate an owner or omit a reachable one.
+    /// This thin Arc adds eight bytes per PATCH while removing sixteen bytes
+    /// from every Branch.
+    owners: Option<Arc<OwnerCover>>,
 }
 
 /// A prefix-located PATCH infix traversal whose exact cardinality has already
@@ -2131,6 +2368,7 @@ where
     fn clone(&self) -> Self {
         Self {
             root: self.root.clone(),
+            owners: self.owners.clone(),
         }
     }
 }
@@ -2151,7 +2389,10 @@ where
     /// Creates a new empty PATCH.
     pub fn new() -> Self {
         init_sip_key();
-        PATCH { root: None }
+        PATCH {
+            root: None,
+            owners: None,
+        }
     }
 
     /// Inserts a shared key into the PATCH.
@@ -2168,6 +2409,7 @@ where
         } else {
             self.root.replace(entry.leaf());
         }
+        self.debug_check_owner_invariant();
     }
 
     /// Inserts a key into the PATCH, replacing the value if it already exists.
@@ -2179,6 +2421,7 @@ where
         } else {
             self.root.replace(entry.leaf());
         }
+        self.debug_check_owner_invariant();
     }
 
     /// Removes a key from the PATCH.
@@ -2186,6 +2429,10 @@ where
     /// If the key is not present, this is a no-op.
     pub fn remove(&mut self, key: &[u8; KEY_LEN]) {
         Head::remove_leaf(&mut self.root, key, 0);
+        if self.root.is_none() {
+            self.owners = None;
+        }
+        self.debug_check_owner_invariant();
     }
 
     /// Returns the number of keys in the PATCH.
@@ -2209,6 +2456,19 @@ where
         }
         acc
     }
+
+    #[cfg(debug_assertions)]
+    fn debug_check_owner_invariant(&self) {
+        debug_assert!(
+            self.root.as_ref().map(|root| root.tag()) != Some(HeadTag::LocalLeaf)
+                || self.owners.is_some(),
+            "a root LocalLeaf must retain its archive owner",
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[inline]
+    fn debug_check_owner_invariant(&self) {}
 
     /// Returns the total capacity of all branch child tables.
     ///
@@ -2244,33 +2504,10 @@ where
         hist
     }
 
-    /// Test-only census of archive-owner placement:
-    /// `(direct_and_retained, direct_but_missing, retained_without_direct,
-    /// missing_without_direct)`.
+    /// Test-only root ownership receipt and LocalLeaf count.
     #[cfg(test)]
-    pub(crate) fn archive_owner_placement_stats(&self) -> (u64, u64, u64, u64) {
-        let mut stats = (0, 0, 0, 0);
-        let mut stack = Vec::new();
-        if let Some(root) = self.root.as_ref() {
-            stack.push(root);
-        }
-        while let Some(head) = stack.pop() {
-            if let BodyRef::Branch(branch) = head.body_ref() {
-                let has_direct_local_leaf = branch
-                    .child_table
-                    .iter()
-                    .flatten()
-                    .any(|child| child.tag() == HeadTag::LocalLeaf);
-                match (has_direct_local_leaf, branch.owner.is_some()) {
-                    (true, true) => stats.0 += 1,
-                    (true, false) => stats.1 += 1,
-                    (false, true) => stats.2 += 1,
-                    (false, false) => stats.3 += 1,
-                }
-                stack.extend(branch.child_table.iter().flatten());
-            }
-        }
-        stats
+    pub(crate) fn archive_owner_guard_stats(&self) -> (bool, u64) {
+        (self.owners.is_some(), self.node_stats().3)
     }
 
     /// Returns true if the PATCH contains no keys.
@@ -2280,6 +2517,55 @@ where
 
     pub(crate) fn root_hash(&self) -> Option<u128> {
         self.root.as_ref().map(|root| root.hash())
+    }
+
+    /// Clone the opaque archive-owner receipt without exposing the root Head.
+    pub(crate) fn owner_guard(&self) -> PATCHOwnerGuard {
+        PATCHOwnerGuard(self.owners.clone())
+    }
+
+    /// Whether this PATCH and another PATCH share one owner-cover Arc.
+    pub(crate) fn shares_owner_guard<OO, VV>(&self, other: &PATCH<KEY_LEN, OO, VV>) -> bool
+    where
+        OO: KeySchema<KEY_LEN>,
+    {
+        match (&self.owners, &other.owners) {
+            (None, None) => true,
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+
+    /// Whether `owner` is the most recently adopted member of this cover.
+    pub(crate) fn owner_guard_latest_is(&self, owner: &Arc<dyn ArchiveOwner>) -> bool {
+        self.owners
+            .as_ref()
+            .is_some_and(|cover| cover.latest_address == OwnerCover::address(owner))
+    }
+
+    /// Install an owner cover proved to be a conservative superset of this
+    /// PATCH's current receipt. Empty PATCHes may retain a receipt so all
+    /// indexes of an aggregate can share one Arc.
+    ///
+    /// # Safety
+    ///
+    /// `guard` must retain every archive allocation retained by the current
+    /// owner cover. Violating this can leave a LocalLeaf dangling.
+    pub(crate) unsafe fn set_owner_guard(&mut self, guard: &PATCHOwnerGuard) {
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            guard.covers(&self.owners),
+            "a PATCH owner guard may only be replaced by an owner-cover superset",
+        );
+        let already_installed = match (&self.owners, &guard.0) {
+            (None, None) => true,
+            (Some(current), Some(replacement)) => Arc::ptr_eq(current, replacement),
+            _ => false,
+        };
+        if !already_installed {
+            self.owners = guard.0.clone();
+        }
+        self.debug_check_owner_invariant();
     }
 
     /// Returns the value associated with `key` if present.
@@ -2568,23 +2854,29 @@ where
     /// Unions this PATCH with another PATCH.
     ///
     /// The other PATCH is consumed, and this PATCH is updated in place.
-    pub fn union(&mut self, other: Self)
+    pub fn union(&mut self, mut other: Self)
     where
         O: Send + Sync,
         V: Send + Sync,
     {
-        if let Some(other) = other.root {
+        if let Some(other_root) = other.root.take() {
             if self.root.is_some() {
+                // Install the complete lifetime union before either Head can
+                // detach or move LocalLeaves. `other` keeps its own cover
+                // until the trie merge completes, including on unwind.
+                OwnerCover::merge_into(&mut self.owners, &other.owners);
                 let this = self.root.take().expect("root should not be empty");
                 #[cfg(feature = "parallel")]
-                let merged = Head::par_union(this, other, 0);
+                let merged = Head::par_union(this, other_root, 0);
                 #[cfg(not(feature = "parallel"))]
-                let merged = Head::union(this, other, 0);
+                let merged = Head::union(this, other_root, 0);
                 self.root.replace(merged);
             } else {
-                self.root.replace(other);
+                self.root.replace(other_root);
+                self.owners = other.owners.take();
             }
         }
+        self.debug_check_owner_invariant();
     }
 
     /// Intersects this PATCH with another PATCH.
@@ -2601,9 +2893,13 @@ where
                 let result = root.par_intersect(other_root, 0);
                 #[cfg(not(feature = "parallel"))]
                 let result = root.intersect(other_root, 0);
-                return Self {
-                    root: result.map(|root| root.with_start(0)),
-                };
+                let root = result.map(|root| root.with_start(0));
+                let owners = root
+                    .as_ref()
+                    .and_then(|_| OwnerCover::union(self.owners.clone(), &other.owners));
+                let result = Self { root, owners };
+                result.debug_check_owner_invariant();
+                return result;
             }
         }
         Self::new()
@@ -2624,7 +2920,13 @@ where
                 let result = root.par_difference(other_root, 0);
                 #[cfg(not(feature = "parallel"))]
                 let result = root.difference(other_root, 0);
-                Self { root: result }
+                let owners = result.as_ref().and(self.owners.clone());
+                let result = Self {
+                    root: result,
+                    owners,
+                };
+                result.debug_check_owner_invariant();
+                result
             } else {
                 (*self).clone()
             }
@@ -2673,31 +2975,25 @@ where
 }
 
 /// Archive-backed insertion path, available only for `V = ()` because
-/// [`ArchiveEntry`] does not carry a value. The leaf appears as a
-/// `LocalLeaf` head if the receiving Branch's `owner` matches the
-/// entry's; otherwise it is reified into a heap-allocated `Leaf<KEY_LEN,
-/// ()>` automatically.
+/// [`ArchiveEntry`] does not carry a value. Newly inserted archive keys remain
+/// LocalLeaves while the PATCH's deduplicated root cover retains their
+/// allocations.
 impl<const KEY_LEN: usize, O> PATCH<KEY_LEN, O, ()>
 where
     O: KeySchema<KEY_LEN>,
 {
-    /// Inserts an archive-backed key. See [`ArchiveEntry`] for the
-    /// owner semantics and the materialization rule for owner
-    /// mismatches.
+    /// Inserts an archive-backed key and retains its allocation before the
+    /// LocalLeaf becomes reachable from the root.
     pub fn insert_archive(&mut self, entry: &ArchiveEntry<'_, KEY_LEN>) {
         let (leaf_head, leaf_owner, leaf_hash) = entry.leaf::<O>();
+        OwnerCover::retain(&mut self.owners, leaf_owner);
         if let Some(this) = self.root.take() {
-            let new_head =
-                Head::insert_leaf_with_owner(this, leaf_head, Some(leaf_owner), leaf_hash, 0);
+            let new_head = Head::insert_archive_leaf(this, leaf_head, leaf_hash, 0);
             self.root.replace(new_head);
         } else {
-            // Empty PATCH: the standalone root can't host an owner field
-            // (only Branches carry `owner`), so reify the single entry
-            // into a heap Leaf. The next insertion creates a Branch
-            // which can adopt the owner cleanly.
-            self.root
-                .replace(Head::reify_local_leaf_unit_for_root(leaf_head));
+            self.root.replace(leaf_head);
         }
+        self.debug_check_owner_invariant();
     }
 
     /// Builds a canonical PATCH directly from an unordered row permutation by
@@ -2715,12 +3011,34 @@ where
     ///   by `owner`.
     /// - `keys` must contain no duplicates.
     /// - `hashes[row]` must be the PATCH key hash of `keys[row]`.
-    #[cfg(any(test, feature = "parallel"))]
+    #[cfg(test)]
     pub(crate) unsafe fn from_archive_partition(
         keys: &[[u8; KEY_LEN]],
         hashes: &[u128],
         rows: &mut [u32],
         owner: &std::sync::Arc<dyn ArchiveOwner>,
+    ) -> Self {
+        unsafe {
+            Self::from_archive_partition_with_guard(
+                keys,
+                hashes,
+                rows,
+                owner,
+                &PATCHOwnerGuard::default(),
+            )
+        }
+    }
+
+    /// Build an archive partition under a receipt already shared by an
+    /// aggregate. Retaining `owner` is idempotent when it is already the
+    /// receipt's latest member, preserving the shared cover Arc.
+    #[cfg(any(test, feature = "parallel"))]
+    pub(crate) unsafe fn from_archive_partition_with_guard(
+        keys: &[[u8; KEY_LEN]],
+        hashes: &[u128],
+        rows: &mut [u32],
+        owner: &std::sync::Arc<dyn ArchiveOwner>,
+        guard: &PATCHOwnerGuard,
     ) -> Self {
         // Branch child tables use randomness initialized alongside the SIP
         // key. A pre-hashed caller may reach this constructor before PATCH::new.
@@ -2734,44 +3052,51 @@ where
         if rows.is_empty() {
             return Self::new();
         }
+        let mut guard = guard.clone();
+        guard.retain_archive_owner(owner);
+        let owners = guard.0;
         if rows.len() == 1 {
-            // A root Head has no owner slot on main. Preserve the established
-            // singleton behavior by materializing one heap Leaf instead of
-            // constructing an unsound ownerless LocalLeaf.
             let row = rows[0] as usize;
-            let entry = Entry::new(&keys[row]);
-            return Self {
-                root: Some(entry.leaf::<O>()),
+            let ptr = NonNull::from(&keys[row]);
+            // SAFETY: the caller proves alignment and `owners` retains the
+            // archive allocation for the returned PATCH's lifetime.
+            let root = unsafe { Head::new_local_leaf(0, ptr) };
+            let result = Self {
+                root: Some(root),
+                owners,
             };
+            result.debug_check_owner_invariant();
+            return result;
         }
 
-        let (root, _) = unsafe { Self::build_archive_partition_head(keys, hashes, rows, owner, 0) };
-        Self {
+        let (root, _) = unsafe { Self::build_archive_partition_head(keys, hashes, rows, 0) };
+        let result = Self {
             root: Some(root.with_start(0)),
-        }
+            owners,
+        };
+        result.debug_check_owner_invariant();
+        result
     }
 
     /// Representative-LCP plus in-place MSD-radix worker for
     /// [`Self::from_archive_partition`].
     ///
-    /// Every Branch retains `owner`. Main's archive-lifetime protocol is an
-    /// ancestor cover rather than a property of the immediate parent: later
-    /// same-archive unions may move a LocalLeaf into an empty slot at any
-    /// level, so each possible destination must remain an owning ancestor.
+    /// Trie construction is ownership-neutral. One deduplicated conservative
+    /// owner cover on the returned PATCH guards every LocalLeaf regardless of
+    /// later reshaping.
     #[cfg(any(test, feature = "parallel"))]
     unsafe fn build_archive_partition_head(
         keys: &[[u8; KEY_LEN]],
         hashes: &[u128],
         rows: &mut [u32],
-        owner: &std::sync::Arc<dyn ArchiveOwner>,
         depth: usize,
     ) -> (Head<KEY_LEN, O, ()>, u128) {
         debug_assert!(!rows.is_empty());
         if rows.len() == 1 {
             let row = rows[0] as usize;
             let ptr = NonNull::from(&keys[row]);
-            // SAFETY: the caller proves that every archive key stays aligned,
-            // immutable, and alive through `owner`.
+            // SAFETY: the outer constructor installs its owner cover before
+            // returning this LocalLeaf to safe code.
             let head = unsafe { Head::new_local_leaf(0, ptr) };
             return (head, hashes[row]);
         }
@@ -2863,13 +3188,7 @@ where
 
         let first_end = ends[first_bucket as usize] as usize;
         let (first_head, first_hash) = unsafe {
-            Self::build_archive_partition_head(
-                keys,
-                hashes,
-                &mut rows[..first_end],
-                owner,
-                end_depth + 1,
-            )
+            Self::build_archive_partition_head(keys, hashes, &mut rows[..first_end], end_depth + 1)
         };
         let second_end = ends[second_bucket as usize] as usize;
         let (second_head, second_hash) = unsafe {
@@ -2877,26 +3196,23 @@ where
                 keys,
                 hashes,
                 &mut rows[first_end..second_end],
-                owner,
                 end_depth + 1,
             )
         };
 
         let body = if initial_slots == 2 {
-            Branch::new_with_owner_and_child_hashes(
+            Branch::new_with_child_hashes(
                 end_depth,
                 first_head.with_key(first_bucket),
                 second_head.with_key(second_bucket),
-                Some(owner.clone()),
                 first_hash,
                 second_hash,
             )
         } else {
-            Branch::new_with_owner_and_child_hashes_capacity(
+            Branch::new_with_child_hashes_capacity(
                 end_depth,
                 first_head.with_key(first_bucket),
                 second_head.with_key(second_bucket),
-                Some(owner.clone()),
                 first_hash,
                 second_hash,
                 initial_slots,
@@ -2918,7 +3234,6 @@ where
                     keys,
                     hashes,
                     &mut rows[range_start..range_end],
-                    owner,
                     end_depth + 1,
                 )
             };
@@ -3061,12 +3376,13 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> PATCHOrderedIterator<'a
 }
 
 // --- Owned consuming iterators ---
-/// Iterator that owns a PATCH and yields keys in key-order. The iterator
-/// consumes the PATCH and stores it on the heap (Box) so it can safely hold
-/// raw pointers into the patch memory while the iterator is moved.
+/// Iterator that owns a PATCH and yields keys in key-order. The owner set is
+/// retained until every queued LocalLeaf has been copied out.
 pub struct PATCHIntoIterator<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
+    // Field order is deliberate: queued Heads drop before the owner cover.
     queue: Vec<Head<KEY_LEN, O, V>>,
     remaining: usize,
+    _owners: Option<Arc<OwnerCover>>,
 }
 
 impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> PATCHIntoIterator<KEY_LEN, O, V> {}
@@ -3105,8 +3421,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator for PATCHIntoItera
 
 /// Iterator that owns a PATCH and yields keys in key order.
 pub struct PATCHIntoOrderedIterator<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> {
+    // Field order is deliberate: queued Heads drop before the owner cover.
     queue: Vec<Head<KEY_LEN, O, V>>,
     remaining: usize,
+    _owners: Option<Arc<OwnerCover>>,
 }
 
 impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Iterator
@@ -3158,13 +3476,15 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> IntoIterator for PATCH<KEY_
 
     fn into_iter(self) -> Self::IntoIter {
         let remaining = self.len().min(usize::MAX as u64) as usize;
+        let PATCH { root, owners } = self;
         let mut q = Vec::new();
-        if let Some(root) = self.root {
+        if let Some(root) = root {
             q.push(root);
         }
         PATCHIntoIterator {
             queue: q,
             remaining,
+            _owners: owners,
         }
     }
 }
@@ -3173,13 +3493,15 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> PATCH<KEY_LEN, O, V> {
     /// Consume and return an iterator that yields keys in key order.
     pub fn into_iter_ordered(self) -> PATCHIntoOrderedIterator<KEY_LEN, O, V> {
         let remaining = self.len().min(usize::MAX as u64) as usize;
+        let PATCH { root, owners } = self;
         let mut q = Vec::new();
-        if let Some(root) = self.root {
+        if let Some(root) = root {
             q.push(root);
         }
         PATCHIntoOrderedIterator {
             queue: q,
             remaining,
+            _owners: owners,
         }
     }
 }
@@ -3327,9 +3649,8 @@ mod tests {
         // SAFETY: AlignedArchivePair is 16-byte aligned, each 16-byte row has
         // the same alignment, the two keys are distinct in every fixture, and
         // `owner` retains the immutable storage throughout construction.
-        let patch = unsafe {
-            PATCH::from_archive_partition(&storage.0, &hashes, &mut rows, &owner)
-        };
+        let patch =
+            unsafe { PATCH::from_archive_partition(&storage.0, &hashes, &mut rows, &owner) };
         assert_eq!(patch.node_stats(), (1, 2, 0, 2));
         drop(owner);
         drop(storage);
@@ -3341,13 +3662,152 @@ mod tests {
     }
 
     #[test]
+    fn owner_cover_shape_is_canonical_and_membership_is_exact() {
+        let owners: Vec<Arc<dyn ArchiveOwner>> = (0u8..8)
+            .map(|byte| Arc::new([byte]) as Arc<dyn ArchiveOwner>)
+            .collect();
+        let build = |order: &[usize]| {
+            let mut cover = None;
+            for &index in order {
+                OwnerCover::retain(&mut cover, &owners[index]);
+            }
+            cover.unwrap()
+        };
+
+        let forward = build(&[0, 1, 2, 3, 4, 5, 6, 7]);
+        let shuffled = build(&[6, 2, 7, 0, 5, 1, 4, 3]);
+        assert_eq!(forward.len, owners.len());
+        assert_eq!(shuffled.len, owners.len());
+        assert!(forward.root.same_shape(&shuffled.root));
+        for owner in &owners {
+            assert!(forward.root.contains(OwnerCover::address(owner)));
+        }
+        let unrelated: Arc<dyn ArchiveOwner> = Arc::new([0xff]);
+        assert!(!forward.root.contains(OwnerCover::address(&unrelated)));
+    }
+
+    #[test]
+    fn owner_cover_overlapping_diamond_does_not_accumulate_duplicates() {
+        let first_backing = Arc::new([0x11]);
+        let second_backing = Arc::new([0x22]);
+        let first_weak = Arc::downgrade(&first_backing);
+        let second_weak = Arc::downgrade(&second_backing);
+        let first: Arc<dyn ArchiveOwner> = first_backing.clone();
+        let second: Arc<dyn ArchiveOwner> = second_backing.clone();
+
+        let mut left = Some(OwnerCover::singleton(&first));
+        OwnerCover::retain(&mut left, &second);
+        let mut right = Some(OwnerCover::singleton(&second));
+        OwnerCover::retain(&mut right, &first);
+        let left_root = match &left.as_ref().unwrap().root {
+            OwnerNode::Branch(branch) => Arc::downgrade(branch),
+            OwnerNode::Owner(_) => panic!("two owners require one Patricia branch"),
+        };
+        let right_root = match &right.as_ref().unwrap().root {
+            OwnerNode::Branch(branch) => Arc::downgrade(branch),
+            OwnerNode::Owner(_) => panic!("two owners require one Patricia branch"),
+        };
+
+        for _ in 0..4_096 {
+            let next_left = OwnerCover::union(left.clone(), &right);
+            let next_right = OwnerCover::union(right.clone(), &left);
+            left = next_left;
+            right = next_right;
+            assert_eq!(left.as_ref().unwrap().len, 2);
+            assert_eq!(right.as_ref().unwrap().len, 2);
+            assert!(matches!(
+                &left.as_ref().unwrap().root,
+                OwnerNode::Branch(branch) if Arc::as_ptr(branch) == left_root.as_ptr()
+            ));
+            assert!(matches!(
+                &right.as_ref().unwrap().root,
+                OwnerNode::Branch(branch) if Arc::as_ptr(branch) == right_root.as_ptr()
+            ));
+        }
+
+        drop(first);
+        drop(second);
+        drop(first_backing);
+        drop(second_backing);
+        assert!(first_weak.upgrade().is_some());
+        assert!(second_weak.upgrade().is_some());
+        drop(left);
+        drop(right);
+        assert!(first_weak.upgrade().is_none());
+        assert!(second_weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn repeated_latest_owner_retention_reuses_the_cover() {
+        let owner: Arc<dyn ArchiveOwner> = Arc::new([0x55]);
+        let mut cover = None;
+        OwnerCover::retain(&mut cover, &owner);
+        let original = cover.as_ref().unwrap().clone();
+
+        for _ in 0..4_096 {
+            OwnerCover::retain(&mut cover, &owner);
+        }
+
+        let cover = cover.unwrap();
+        assert!(Arc::ptr_eq(&cover, &original));
+        assert_eq!(cover.len, 1);
+        assert!(matches!(&cover.root, OwnerNode::Owner(_)));
+    }
+
+    proptest! {
+        #[test]
+        fn owner_cover_union_matches_address_set(
+            left in prop::collection::btree_set(0usize..24, 0..24),
+            right in prop::collection::btree_set(0usize..24, 0..24),
+        ) {
+            let owners: Vec<Arc<dyn ArchiveOwner>> = (0u8..24)
+                .map(|byte| Arc::new([byte]) as Arc<dyn ArchiveOwner>)
+                .collect();
+            let build = |indices: Vec<usize>| {
+                let mut cover = None;
+                for index in indices {
+                    OwnerCover::retain(&mut cover, &owners[index]);
+                }
+                cover
+            };
+            let left_cover = build(left.iter().copied().collect());
+            let right_cover = build(right.iter().rev().copied().collect());
+            let joined = OwnerCover::union(left_cover, &right_cover);
+            let expected: std::collections::BTreeSet<_> =
+                left.union(&right).copied().collect();
+
+            if expected.is_empty() {
+                prop_assert!(joined.is_none());
+            } else {
+                let joined = joined.unwrap();
+                let mut actual = HashSet::new();
+                joined.root.for_each_owner(&mut |owner| {
+                    assert!(actual.insert(OwnerCover::address(owner)));
+                });
+                let expected_addresses: HashSet<_> = expected
+                    .iter()
+                    .map(|&index| OwnerCover::address(&owners[index]))
+                    .collect();
+                prop_assert_eq!(actual, expected_addresses);
+                prop_assert_eq!(joined.len, expected.len());
+
+                let canonical = build(expected.iter().copied().collect()).unwrap();
+                prop_assert!(joined.root.same_shape(&canonical.root));
+            }
+        }
+    }
+
+    #[test]
     fn disjoint_cross_owner_union_retains_both_archives() {
         let (mut left, left_owner) = owned_archive_pair([key(0x10), key(0x20)]);
         let (right, right_owner) = owned_archive_pair([key(0x30), key(0x40)]);
 
         left.union(right);
 
-        assert!(left_owner.upgrade().is_some(), "union dropped its left archive");
+        assert!(
+            left_owner.upgrade().is_some(),
+            "union dropped its left archive"
+        );
         assert!(
             right_owner.upgrade().is_some(),
             "union dropped its consumed right archive"
@@ -3356,6 +3816,9 @@ mod tests {
             left.iter().copied().collect::<HashSet<_>>(),
             HashSet::from([key(0x10), key(0x20), key(0x30), key(0x40)])
         );
+        drop(left);
+        assert!(left_owner.upgrade().is_none());
+        assert!(right_owner.upgrade().is_none());
     }
 
     #[test]
@@ -3376,6 +3839,9 @@ mod tests {
             "intersection must conservatively retain both source covers"
         );
         assert_eq!(intersection.iter().copied().collect_vec(), vec![key(0x10)]);
+        drop(intersection);
+        assert!(left_owner.upgrade().is_none());
+        assert!(right_owner.upgrade().is_none());
     }
 
     #[test]
@@ -3396,6 +3862,42 @@ mod tests {
             "difference should not retain an archive used only for subtraction"
         );
         assert_eq!(difference.iter().copied().collect_vec(), vec![key(0x20)]);
+        drop(difference);
+        assert!(left_owner.upgrade().is_none());
+        assert!(right_owner.upgrade().is_none());
+    }
+
+    #[test]
+    fn clone_and_consuming_iterator_retain_the_archive() {
+        let (patch, owner) = owned_archive_pair([key(0x10), key(0x20)]);
+        let clone = patch.clone();
+        drop(patch);
+        assert!(owner.upgrade().is_some(), "clone lost the archive owner");
+
+        let mut iter = clone.into_iter();
+        assert!(
+            owner.upgrade().is_some(),
+            "consuming iterator lost the archive owner"
+        );
+        assert!(matches!(iter.next(), Some(value) if value == key(0x10) || value == key(0x20)));
+        drop(iter);
+        assert!(owner.upgrade().is_none());
+    }
+
+    #[test]
+    fn removal_retains_collapsed_local_root_and_releases_empty_cover() {
+        let (mut patch, owner) = owned_archive_pair([key(0x10), key(0x20)]);
+
+        patch.remove(&key(0x10));
+        assert!(
+            owner.upgrade().is_some(),
+            "removal lost the owner of the surviving LocalLeaf"
+        );
+        assert_eq!(patch.iter().copied().collect_vec(), vec![key(0x20)]);
+
+        patch.remove(&key(0x20));
+        assert!(patch.is_empty());
+        assert!(owner.upgrade().is_none(), "empty PATCH retained its cover");
     }
 
     #[test]
@@ -3651,53 +4153,60 @@ mod tests {
 
     #[test]
     fn branch_size() {
-        // Base = 64 bytes (was 48; +16 for `Option<Arc<dyn ArchiveOwner>>`).
-        // Each child is an 8-byte tagged Head.
+        // Ownership lives once on PATCH, leaving the original 48-byte Branch
+        // header. Each child is an 8-byte tagged Head.
         assert_eq!(
             mem::size_of::<Branch<64, IdentitySchema, [Option<Head<64, IdentitySchema, ()>>; 2], ()>>(
             ),
-            64 + 8 * 2
+            48 + 8 * 2
         );
         assert_eq!(
             mem::size_of::<Branch<64, IdentitySchema, [Option<Head<64, IdentitySchema, ()>>; 4], ()>>(
             ),
-            64 + 8 * 4
+            48 + 8 * 4
         );
         assert_eq!(
             mem::size_of::<Branch<64, IdentitySchema, [Option<Head<64, IdentitySchema, ()>>; 8], ()>>(
             ),
-            64 + 8 * 8
+            48 + 8 * 8
         );
         assert_eq!(
             mem::size_of::<
                 Branch<64, IdentitySchema, [Option<Head<64, IdentitySchema, ()>>; 16], ()>,
             >(),
-            64 + 8 * 16
+            48 + 8 * 16
         );
         assert_eq!(
             mem::size_of::<
                 Branch<64, IdentitySchema, [Option<Head<32, IdentitySchema, ()>>; 32], ()>,
             >(),
-            64 + 8 * 32
+            48 + 8 * 32
         );
         assert_eq!(
             mem::size_of::<
                 Branch<64, IdentitySchema, [Option<Head<64, IdentitySchema, ()>>; 64], ()>,
             >(),
-            64 + 8 * 64
+            48 + 8 * 64
         );
         assert_eq!(
             mem::size_of::<
                 Branch<64, IdentitySchema, [Option<Head<64, IdentitySchema, ()>>; 128], ()>,
             >(),
-            64 + 8 * 128
+            48 + 8 * 128
         );
         assert_eq!(
             mem::size_of::<
                 Branch<64, IdentitySchema, [Option<Head<64, IdentitySchema, ()>>; 256], ()>,
             >(),
-            64 + 8 * 256
+            48 + 8 * 256
         );
+    }
+
+    #[test]
+    fn patch_root_owner_cover_is_one_thin_arc() {
+        assert_eq!(mem::size_of::<Head<64, IdentitySchema, ()>>(), 8);
+        assert_eq!(mem::size_of::<Option<Arc<OwnerCover>>>(), 8);
+        assert_eq!(mem::size_of::<PATCH<64, IdentitySchema, ()>>(), 16);
     }
 
     /// Checks what happens if we join two PATCHes that

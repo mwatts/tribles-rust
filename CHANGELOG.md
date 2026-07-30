@@ -52,9 +52,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reuses one `u32` permutation across all six PATCH orderings, and constructs
   path-compressed branches with an in-place sparse MSD partition. Known fanout
   preallocates tables, eager subtree hashes are carried through construction,
-  and every bottom-up-built archive Branch retains the shared owner, matching
-  the cover expected by the existing same-archive union path. Small, unaligned,
-  and oversized inputs keep their existing serial or heap-leaf fallbacks.
+  and one root owner cover is shared across all six bottom-up-built indexes.
+  Small, unaligned, and oversized inputs keep their existing serial or
+  heap-leaf fallbacks.
+- **Archive-backed PATCH ownership is closed under every structural
+  operation.** `LocalLeaf` lifetime is now independent of trie shape: each
+  PATCH root carries a persistent binary Patricia set of retained archive
+  allocations, keyed by allocation address and exactly deduplicated across
+  clone, union, intersection, difference, removal, and consuming iteration.
+  Set operations may conservatively retain provenance no longer reachable
+  from their result, but cannot omit a reachable owner or accumulate duplicate
+  owners through overlapping diamond unions. `TribleSet` joins provenance once
+  and shares the resulting cover across all six indexes. This adds one thin
+  eight-byte Arc to PATCH while restoring the ownership-neutral 48-byte Branch
+  header (sixteen bytes smaller than the per-Branch owner design).
 - **Breaking: the query engine is the propose/confirm engine.** The residual /
   typed-Program engine is gone — `residual.rs`, the Program VM, query-time
   regular-path evaluation (`path!` and `RegularPathConstraint`), and the

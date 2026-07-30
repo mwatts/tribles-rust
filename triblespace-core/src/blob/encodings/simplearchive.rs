@@ -405,26 +405,30 @@ mod tests {
     }
 
     #[test]
-    fn bottom_up_owner_guards_cover_every_archive_branch() {
+    fn bottom_up_root_owner_guards_cover_every_local_leaf() {
         let set = bottom_up_for_test(fixture_blob(8_192)).unwrap();
+        let guards = [
+            set.eav.owner_guard(),
+            set.eva.owner_guard(),
+            set.aev.owner_guard(),
+            set.ave.owner_guard(),
+            set.vea.owner_guard(),
+            set.vae.owner_guard(),
+        ];
+        assert!(
+            guards[1..].iter().all(|guard| guard.ptr_eq(&guards[0])),
+            "the six archive indexes duplicated their owner cover",
+        );
         for stats in [
-            set.eav.archive_owner_placement_stats(),
-            set.eva.archive_owner_placement_stats(),
-            set.aev.archive_owner_placement_stats(),
-            set.ave.archive_owner_placement_stats(),
-            set.vea.archive_owner_placement_stats(),
-            set.vae.archive_owner_placement_stats(),
+            set.eav.archive_owner_guard_stats(),
+            set.eva.archive_owner_guard_stats(),
+            set.aev.archive_owner_guard_stats(),
+            set.ave.archive_owner_guard_stats(),
+            set.vea.archive_owner_guard_stats(),
+            set.vae.archive_owner_guard_stats(),
         ] {
-            assert!(stats.0 > 0, "fixture did not exercise direct LocalLeaves");
-            assert_eq!(stats.1, 0, "a direct LocalLeaf has no owner guard");
-            assert!(
-                stats.2 > 0,
-                "fixture did not exercise owning ancestor-only Branches",
-            );
-            assert_eq!(
-                stats.3, 0,
-                "an archive Branch has no owner for later LocalLeaf movement",
-            );
+            assert!(stats.0, "archive PATCH has no root owner guard");
+            assert_eq!(stats.1, 8_192, "not every archive row remained local");
         }
     }
 

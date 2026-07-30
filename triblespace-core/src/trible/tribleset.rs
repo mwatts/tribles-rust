@@ -11,9 +11,9 @@ use crate::id::Id;
 use crate::inline::encodings::genid::GenId;
 use crate::inline::InlineEncoding;
 use crate::patch::ArchiveEntry;
-#[cfg(any(test, feature = "parallel"))]
 use crate::patch::ArchiveOwner;
 use crate::patch::Entry;
+use crate::patch::PATCHOwnerGuard;
 use crate::patch::PATCH;
 use crate::query::Variable;
 use crate::trible::AEVOrder;
@@ -29,6 +29,7 @@ use std::iter::FromIterator;
 use std::iter::Map;
 use std::ops::Add;
 use std::ops::AddAssign;
+use std::sync::Arc;
 
 /// A collection of [`Trible`]s.
 ///
@@ -97,6 +98,48 @@ pub struct TribleSetIterator<'a> {
 pub const PARALLEL_UNION_THRESHOLD: usize = 4096;
 
 impl TribleSet {
+    /// Whether all six public indexes share one owner-cover Arc.
+    fn owner_guards_are_shared(&self) -> bool {
+        self.eav.shares_owner_guard(&self.eva)
+            && self.eav.shares_owner_guard(&self.aev)
+            && self.eav.shares_owner_guard(&self.ave)
+            && self.eav.shares_owner_guard(&self.vea)
+            && self.eav.shares_owner_guard(&self.vae)
+    }
+
+    /// The common-case archive-adoption check. Older owners remain exactly
+    /// deduplicated inside the Patricia cover; only the latest member is O(1).
+    fn shared_owner_guard_latest_is(&self, owner: &Arc<dyn ArchiveOwner>) -> bool {
+        self.owner_guards_are_shared() && self.eav.owner_guard_latest_is(owner)
+    }
+
+    /// Deduplicate retained provenance from all six publicly mutable indexes.
+    fn combined_owner_guard(&self) -> PATCHOwnerGuard {
+        let guard = self.eav.owner_guard();
+        if self.owner_guards_are_shared() {
+            return guard;
+        }
+        guard
+            .join(self.eva.owner_guard())
+            .join(self.aev.owner_guard())
+            .join(self.ave.owner_guard())
+            .join(self.vea.owner_guard())
+            .join(self.vae.owner_guard())
+    }
+
+    fn set_owner_guard(&mut self, guard: &PATCHOwnerGuard) {
+        // SAFETY: callers construct `guard` by joining every existing index
+        // receipt before optionally retaining more owners.
+        unsafe {
+            self.eav.set_owner_guard(guard);
+            self.eva.set_owner_guard(guard);
+            self.aev.set_owner_guard(guard);
+            self.ave.set_owner_guard(guard);
+            self.vea.set_owner_guard(guard);
+            self.vae.set_owner_guard(guard);
+        }
+    }
+
     /// Union of two [`TribleSet`]s.
     ///
     /// The other [`TribleSet`] is consumed, and this [`TribleSet`] is updated
@@ -111,7 +154,16 @@ impl TribleSet {
     /// is inserted into `self`); when `other` is tiny (e.g. the per-
     /// `entity!{}` `+=` in a serial fold) the rayon overhead would
     /// dominate even at large `self`.
-    pub fn union(&mut self, other: Self) {
+    pub fn union(&mut self, mut other: Self) {
+        // Join all twelve receipts once. Per-index PATCH unions then hit the
+        // shared Arc identity path instead of rebuilding the same Patricia
+        // union six times.
+        let owners = self
+            .combined_owner_guard()
+            .join(other.combined_owner_guard());
+        self.set_owner_guard(&owners);
+        other.set_owner_guard(&owners);
+
         #[cfg(feature = "parallel")]
         {
             if other.len() >= PARALLEL_UNION_THRESHOLD {
@@ -332,9 +384,8 @@ impl TribleSet {
             return Self::new();
         }
         if rows.len() == 1 {
-            // Main's PATCH root cannot retain an archive owner. Use the
-            // established heap singleton path, which also shares one Leaf
-            // allocation across all six indexes.
+            // Preserve the established heap singleton path: all six indexes
+            // share one Leaf allocation and need no archive-owner receipt.
             let trible = Trible::as_transmute_force_raw(&rows[0])
                 .expect("validated archive rows are well-formed tribles");
             let mut set = Self::new();
@@ -343,6 +394,8 @@ impl TribleSet {
         }
 
         let mut permutation = vec![0u32; rows.len()];
+        let mut owner_guard = PATCHOwnerGuard::default();
+        owner_guard.retain_archive_owner(owner);
         fn reset(permutation: &mut [u32]) {
             for (row, slot) in permutation.iter_mut().enumerate() {
                 *slot = row as u32;
@@ -353,11 +406,12 @@ impl TribleSet {
             ($order:ty) => {{
                 reset(&mut permutation);
                 unsafe {
-                    PATCH::<TRIBLE_LEN, $order>::from_archive_partition(
+                    PATCH::<TRIBLE_LEN, $order>::from_archive_partition_with_guard(
                         rows,
                         hashes,
                         &mut permutation,
                         owner,
+                        &owner_guard,
                     )
                 }
             }};
@@ -383,9 +437,14 @@ impl TribleSet {
     /// Inserts an archive-backed trible into all six covering indexes
     /// using [`PATCH::insert_archive`], so each index may land the new
     /// entry as a `LocalLeaf` instead of a freshly allocated heap
-    /// `Leaf`. The receiving Branches' `owner` fields keep the
-    /// underlying archive bytes alive.
+    /// `Leaf`. Each PATCH's root owner set keeps the underlying archive
+    /// bytes alive independently of trie shape.
     pub fn insert_archive(&mut self, entry: &ArchiveEntry<'_, TRIBLE_LEN>) {
+        if !self.shared_owner_guard_latest_is(entry.owner()) {
+            let mut owners = self.combined_owner_guard();
+            owners.retain_archive_owner(entry.owner());
+            self.set_owner_guard(&owners);
+        }
         self.eav.insert_archive(entry);
         self.eva.insert_archive(entry);
         self.aev.insert_archive(entry);
@@ -572,6 +631,43 @@ mod tests {
 
     use rayon::iter::IntoParallelIterator;
     use rayon::iter::ParallelIterator;
+
+    #[repr(C, align(16))]
+    struct AlignedRows([[u8; TRIBLE_LEN]; 2]);
+
+    fn archive_set(first: u8, second: u8) -> TribleSet {
+        let storage = Arc::new(AlignedRows([[first; TRIBLE_LEN], [second; TRIBLE_LEN]]));
+        let owner: Arc<dyn ArchiveOwner> = storage.clone();
+        let hashes = [
+            crate::patch::hash_key(&storage.0[0]),
+            crate::patch::hash_key(&storage.0[1]),
+        ];
+        // SAFETY: the wrapper and both 64-byte rows are 16-byte aligned, the
+        // keys are distinct, immutable, and retained by `owner` during build.
+        unsafe { TribleSet::from_archive_partition(&storage.0, &hashes, &owner) }
+    }
+
+    #[test]
+    fn archive_build_and_union_share_one_owner_cover_across_all_indexes() {
+        let mut left = archive_set(0x11, 0x22);
+        let right = archive_set(0x33, 0x44);
+        assert!(left.owner_guards_are_shared());
+        assert!(right.owner_guards_are_shared());
+
+        left.union(right);
+
+        assert!(left.owner_guards_are_shared());
+        let guard = left.eav.owner_guard();
+        for index_guard in [
+            left.eva.owner_guard(),
+            left.aev.owner_guard(),
+            left.ave.owner_guard(),
+            left.vea.owner_guard(),
+            left.vae.owner_guard(),
+        ] {
+            assert!(guard.ptr_eq(&index_guard));
+        }
+    }
 
     #[test]
     fn union() {
