@@ -2714,6 +2714,7 @@ where
     /// - Every key pointer must be 16-byte aligned, immutable, and kept alive
     ///   by `owner`.
     /// - `keys` must contain no duplicates.
+    /// - `hashes[row]` must be the PATCH key hash of `keys[row]`.
     #[cfg(any(test, feature = "parallel"))]
     pub(crate) unsafe fn from_archive_partition(
         keys: &[[u8; KEY_LEN]],
