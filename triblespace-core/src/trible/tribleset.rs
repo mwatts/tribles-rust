@@ -11,6 +11,8 @@ use crate::id::Id;
 use crate::inline::encodings::genid::GenId;
 use crate::inline::InlineEncoding;
 use crate::patch::ArchiveEntry;
+#[cfg(any(test, feature = "parallel"))]
+use crate::patch::ArchiveOwner;
 use crate::patch::Entry;
 use crate::patch::PATCH;
 use crate::query::Variable;
@@ -301,6 +303,81 @@ impl TribleSet {
         self.ave.insert(&key);
         self.vea.insert(&key);
         self.vae.insert(&key);
+    }
+
+    /// Builds all six indexes over one validated archive slice.
+    ///
+    /// A single `u32` row permutation is reset to archive order and
+    /// partitioned in place for each schema. Resetting preserves source-row
+    /// locality for each build, while `hashes` is shared across all six so no
+    /// per-index leaf descriptors or hash arrays survive construction.
+    ///
+    /// # Safety
+    ///
+    /// Every row must be 16-byte aligned, immutable, duplicate-free, and kept
+    /// alive by `owner`. `hashes[row]` must be the PATCH key hash of
+    /// `rows[row]`.
+    #[cfg(any(test, feature = "parallel"))]
+    pub(crate) unsafe fn from_archive_partition(
+        rows: &[[u8; TRIBLE_LEN]],
+        hashes: &[u128],
+        owner: &std::sync::Arc<dyn ArchiveOwner>,
+    ) -> Self {
+        assert_eq!(rows.len(), hashes.len());
+        assert!(
+            u32::try_from(rows.len()).is_ok(),
+            "archive row ordinals must fit the partition metadata",
+        );
+        if rows.is_empty() {
+            return Self::new();
+        }
+        if rows.len() == 1 {
+            // Main's PATCH root cannot retain an archive owner. Use the
+            // established heap singleton path, which also shares one Leaf
+            // allocation across all six indexes.
+            let trible = Trible::as_transmute_force_raw(&rows[0])
+                .expect("validated archive rows are well-formed tribles");
+            let mut set = Self::new();
+            set.insert(trible);
+            return set;
+        }
+
+        let mut permutation = vec![0u32; rows.len()];
+        fn reset(permutation: &mut [u32]) {
+            for (row, slot) in permutation.iter_mut().enumerate() {
+                *slot = row as u32;
+            }
+        }
+
+        macro_rules! build_index {
+            ($order:ty) => {{
+                reset(&mut permutation);
+                unsafe {
+                    PATCH::<TRIBLE_LEN, $order>::from_archive_partition(
+                        rows,
+                        hashes,
+                        &mut permutation,
+                        owner,
+                    )
+                }
+            }};
+        }
+
+        let eav = build_index!(EAVOrder);
+        let aev = build_index!(AEVOrder);
+        let vae = build_index!(VAEOrder);
+        let eva = build_index!(EVAOrder);
+        let vea = build_index!(VEAOrder);
+        let ave = build_index!(AVEOrder);
+
+        Self {
+            eav,
+            eva,
+            aev,
+            ave,
+            vea,
+            vae,
+        }
     }
 
     /// Inserts an archive-backed trible into all six covering indexes

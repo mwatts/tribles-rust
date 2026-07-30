@@ -167,6 +167,24 @@ pub(crate) fn init_sip_key() {
     });
 }
 
+/// Hash one PATCH key with the process-local set-fingerprint key.
+///
+/// Bulk archive construction calls this once per source row and shares the
+/// result across all six index builds. Initializing here is important because
+/// that path hashes before it constructs its first [`PATCH`].
+#[cfg(any(test, feature = "parallel"))]
+#[inline]
+pub(crate) fn hash_key(bytes: &[u8]) -> u128 {
+    init_sip_key();
+    use siphasher::sip128::SipHasher24;
+    use std::ptr::addr_of;
+
+    // SAFETY: `init_sip_key` completed the `Once`; the key is immutable after
+    // publication and every subsequent access is read-only.
+    let key = unsafe { *addr_of!(SIP_KEY) };
+    SipHasher24::new_with_key(&key).hash(bytes).into()
+}
+
 /// Builds a per-byte segment map from the segment lengths.
 ///
 /// The returned table maps each key byte to its segment index.
@@ -2226,6 +2244,34 @@ where
         hist
     }
 
+    /// Test-only census of archive-owner placement:
+    /// `(direct_and_retained, direct_but_missing, retained_without_direct)`.
+    #[cfg(test)]
+    pub(crate) fn archive_owner_placement_stats(&self) -> (u64, u64, u64) {
+        let mut stats = (0, 0, 0);
+        let mut stack = Vec::new();
+        if let Some(root) = self.root.as_ref() {
+            stack.push(root);
+        }
+        while let Some(head) = stack.pop() {
+            if let BodyRef::Branch(branch) = head.body_ref() {
+                let has_direct_local_leaf = branch
+                    .child_table
+                    .iter()
+                    .flatten()
+                    .any(|child| child.tag() == HeadTag::LocalLeaf);
+                match (has_direct_local_leaf, branch.owner.is_some()) {
+                    (true, true) => stats.0 += 1,
+                    (true, false) => stats.1 += 1,
+                    (false, true) => stats.2 += 1,
+                    (false, false) => {}
+                }
+                stack.extend(branch.child_table.iter().flatten());
+            }
+        }
+        stats
+    }
+
     /// Returns true if the PATCH contains no keys.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -2651,6 +2697,252 @@ where
             self.root
                 .replace(Head::reify_local_leaf_unit_for_root(leaf_head));
         }
+    }
+
+    /// Builds a canonical PATCH directly from an unordered row permutation by
+    /// partitioning that one buffer in place at each trie depth.
+    ///
+    /// Archive construction fuses ordering and trie construction: no sorted
+    /// pointer array or per-row leaf descriptor is retained. `hashes[row]` is
+    /// the one transient key hash shared by every TribleSet index build.
+    ///
+    /// # Safety
+    ///
+    /// - `rows` must contain every valid index into `keys` and `hashes` exactly
+    ///   once.
+    /// - Every key pointer must be 16-byte aligned, immutable, and kept alive
+    ///   by `owner`.
+    /// - `keys` must contain no duplicates.
+    #[cfg(any(test, feature = "parallel"))]
+    pub(crate) unsafe fn from_archive_partition(
+        keys: &[[u8; KEY_LEN]],
+        hashes: &[u128],
+        rows: &mut [u32],
+        owner: &std::sync::Arc<dyn ArchiveOwner>,
+    ) -> Self {
+        // Branch child tables use randomness initialized alongside the SIP
+        // key. A pre-hashed caller may reach this constructor before PATCH::new.
+        init_sip_key();
+        assert_eq!(keys.len(), hashes.len());
+        assert_eq!(keys.len(), rows.len());
+        assert!(
+            u32::try_from(rows.len()).is_ok(),
+            "archive row ordinals must fit the partition metadata",
+        );
+        if rows.is_empty() {
+            return Self::new();
+        }
+        if rows.len() == 1 {
+            // A root Head has no owner slot on main. Preserve the established
+            // singleton behavior by materializing one heap Leaf instead of
+            // constructing an unsound ownerless LocalLeaf.
+            let row = rows[0] as usize;
+            let entry = Entry::new(&keys[row]);
+            return Self {
+                root: Some(entry.leaf::<O>()),
+            };
+        }
+
+        let (root, _) = unsafe { Self::build_archive_partition_head(keys, hashes, rows, owner, 0) };
+        Self {
+            root: Some(root.with_start(0)),
+        }
+    }
+
+    /// Representative-LCP plus in-place MSD-radix worker for
+    /// [`Self::from_archive_partition`].
+    ///
+    /// A Branch retains `owner` exactly when one of its direct children is a
+    /// LocalLeaf. Higher Branches whose children are all Branches stay
+    /// owner-free; each descendant is responsible for its own direct leaves.
+    #[cfg(any(test, feature = "parallel"))]
+    unsafe fn build_archive_partition_head(
+        keys: &[[u8; KEY_LEN]],
+        hashes: &[u128],
+        rows: &mut [u32],
+        owner: &std::sync::Arc<dyn ArchiveOwner>,
+        depth: usize,
+    ) -> (Head<KEY_LEN, O, ()>, u128) {
+        debug_assert!(!rows.is_empty());
+        if rows.len() == 1 {
+            let row = rows[0] as usize;
+            let ptr = NonNull::from(&keys[row]);
+            // SAFETY: the caller proves that every archive key stays aligned,
+            // immutable, and alive through `owner`.
+            let head = unsafe { Head::new_local_leaf(0, ptr) };
+            return (head, hashes[row]);
+        }
+
+        // Tighten the representative's common prefix row-by-row. Once the
+        // candidate reaches the incoming depth, no later row can shorten it.
+        let representative = &keys[rows[0] as usize];
+        let mut end_depth = KEY_LEN;
+        for &row in &rows[1..] {
+            let key = &keys[row as usize];
+            let mut candidate_depth = depth;
+            while candidate_depth < end_depth {
+                let key_index = O::TREE_TO_KEY[candidate_depth];
+                if representative[key_index] != key[key_index] {
+                    end_depth = candidate_depth;
+                    break;
+                }
+                candidate_depth += 1;
+            }
+            if end_depth == depth {
+                break;
+            }
+        }
+        assert!(
+            end_depth < KEY_LEN,
+            "duplicate archive keys cannot form a finite trie",
+        );
+
+        let key_index = O::TREE_TO_KEY[end_depth];
+        let mut ends = [0u32; 256];
+        let mut occupied = ByteSet::new_empty();
+        for &row in rows.iter() {
+            let byte = keys[row as usize][key_index];
+            let count = &mut ends[byte as usize];
+            if *count == 0 {
+                occupied.insert(byte);
+            }
+            *count += 1;
+        }
+
+        let mut child_buckets = occupied;
+        let first_bucket = child_buckets
+            .drain_next_ascending()
+            .expect("a non-empty partition has one bucket");
+        let second_bucket = child_buckets
+            .drain_next_ascending()
+            .expect("a unique multi-row node has two buckets");
+        let first_extra = child_buckets.drain_next_ascending();
+        let fanout = first_extra.map_or(2, |_| 3 + child_buckets.popcount() as usize);
+        debug_assert!((2..=256).contains(&fanout));
+        let initial_slots = if first_extra.is_none() {
+            2
+        } else {
+            fanout.next_power_of_two()
+        };
+
+        // Convert counts into cumulative exclusive ends. `next` tracks the
+        // first unfilled position in each occupied interval.
+        let mut next = [0u32; 256];
+        let mut offset = 0u32;
+        let mut prefix_buckets = occupied;
+        while let Some(byte) = prefix_buckets.drain_next_ascending() {
+            let count = ends[byte as usize];
+            next[byte as usize] = offset;
+            offset += count;
+            ends[byte as usize] = offset;
+        }
+        debug_assert_eq!(offset as usize, rows.len());
+
+        // American-flag partition. Every swap permanently fills one
+        // destination position, so this is linear and needs no second buffer.
+        let mut partition_buckets = occupied;
+        while let Some(byte) = partition_buckets.drain_next_ascending() {
+            let bucket = byte as usize;
+            while next[bucket] < ends[bucket] {
+                let position = next[bucket] as usize;
+                let row = rows[position] as usize;
+                let destination = keys[row][key_index] as usize;
+                if destination == bucket {
+                    next[bucket] += 1;
+                } else {
+                    let destination_slot = next[destination] as usize;
+                    debug_assert!(destination_slot < ends[destination] as usize);
+                    rows.swap(position, destination_slot);
+                    next[destination] += 1;
+                }
+            }
+        }
+
+        let first_end = ends[first_bucket as usize] as usize;
+        let (first_head, first_hash) = unsafe {
+            Self::build_archive_partition_head(
+                keys,
+                hashes,
+                &mut rows[..first_end],
+                owner,
+                end_depth + 1,
+            )
+        };
+        let second_end = ends[second_bucket as usize] as usize;
+        let (second_head, second_hash) = unsafe {
+            Self::build_archive_partition_head(
+                keys,
+                hashes,
+                &mut rows[first_end..second_end],
+                owner,
+                end_depth + 1,
+            )
+        };
+
+        let direct_owner = (first_head.tag() == HeadTag::LocalLeaf
+            || second_head.tag() == HeadTag::LocalLeaf)
+            .then(|| owner.clone());
+        let body = if initial_slots == 2 {
+            Branch::new_with_owner_and_child_hashes(
+                end_depth,
+                first_head.with_key(first_bucket),
+                second_head.with_key(second_bucket),
+                direct_owner,
+                first_hash,
+                second_hash,
+            )
+        } else {
+            Branch::new_with_owner_and_child_hashes_capacity(
+                end_depth,
+                first_head.with_key(first_bucket),
+                second_head.with_key(second_bucket),
+                direct_owner,
+                first_hash,
+                second_hash,
+                initial_slots,
+            )
+        };
+        let mut root = Head::new(0, body);
+        let mut hash = first_hash ^ second_hash;
+        let Some(mut byte) = first_extra else {
+            debug_assert_eq!(second_end, rows.len());
+            return (root, hash);
+        };
+
+        let mut editor = BranchMut::from_head(&mut root);
+        let mut range_start = second_end;
+        loop {
+            let range_end = ends[byte as usize] as usize;
+            let (child, child_hash) = unsafe {
+                Self::build_archive_partition_head(
+                    keys,
+                    hashes,
+                    &mut rows[range_start..range_end],
+                    owner,
+                    end_depth + 1,
+                )
+            };
+            hash ^= child_hash;
+            if child.tag() == HeadTag::LocalLeaf {
+                match editor.owner.as_ref() {
+                    Some(retained) => debug_assert!(std::sync::Arc::ptr_eq(retained, owner)),
+                    None => editor.owner = Some(owner.clone()),
+                }
+            }
+            editor.install_child_growing(child.with_key(byte));
+            range_start = range_end;
+            let Some(next_byte) = child_buckets.drain_next_ascending() else {
+                break;
+            };
+            byte = next_byte;
+        }
+        debug_assert_eq!(range_start, rows.len());
+
+        // Rebuild structural aggregates once and install the exact XOR carried
+        // by recursion, avoiding another hash read from direct LocalLeaves.
+        editor.finish_bulk_aggregates(hash);
+        drop(editor);
+        (root, hash)
     }
 }
 

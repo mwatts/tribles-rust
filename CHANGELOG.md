@@ -46,6 +46,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Parallel SimpleArchive decoding builds each chunk bottom-up.** Aligned
+  archive chunks at or above the existing 4,096-row parallel threshold now
+  validate and hash every canonical row once, reuse one `u32` permutation
+  across all six PATCH orderings, and construct path-compressed branches with
+  an in-place sparse MSD partition. Known fanout preallocates branch tables,
+  eager subtree hashes are carried through construction, and only branches
+  with direct archive-backed leaves retain an owner. Small, unaligned, and
+  oversized inputs keep their existing serial or heap-leaf fallbacks.
 - **Breaking: the query engine is the propose/confirm engine.** The residual /
   typed-Program engine is gone — `residual.rs`, the Program VM, query-time
   regular-path evaluation (`path!` and `RegularPathConstraint`), and the
