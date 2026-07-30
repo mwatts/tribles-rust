@@ -124,12 +124,21 @@ while unequal ones force a structural walk. For any fixed pair of unequal sets,
 the false-positive probability is approximately 2^-128 under the keyed-hash
 assumption.
 
-These fingerprints are process-local implementation values, not serialized
-identities. They must remain opaque to untrusted chosen-input callers. Although
-XOR is linear, the usual linear-dependency construction requires observing the
-fingerprints of chosen keys; the private key makes that attack inapplicable
-without such an exposure oracle. Fingerprints must therefore not be used as
-durable content identifiers or sent across a trust boundary.
+The raw subtree fingerprints are process-local implementation values, not
+serialized identities. They must remain opaque to untrusted chosen-input
+callers. Although XOR is linear, the usual linear-dependency construction
+requires observing the fingerprints of chosen keys; the private key makes that
+attack inapplicable without such an exposure oracle. PATCH's raw root aggregate
+therefore stays crate-private.
+
+`TribleSet::fingerprint` preserves the useful O(1) public cache-key API without
+opening that oracle. It applies a domain-separated SipHash-2-4 PRF to the root
+aggregate under a second process-random key initialized beside the leaf key.
+`TribleSetFingerprint::as_u128`, `Debug`, and `Hash` expose only this nonlinear
+blinding. Equal sets retain equal tokens within one process, while the XOR of
+public singleton tokens reveals nothing useful about the aggregate of their
+union. The token remains a 128-bit cache hint, not a durable content identifier
+or proof of equality.
 
 Archive-backed leaves do not cache their fingerprint, so PATCH avoids hashing
 them when an exact, cheaper decision is available. Pairs of leaf nodes involving

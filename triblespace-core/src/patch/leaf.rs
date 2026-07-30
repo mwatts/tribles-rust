@@ -2,12 +2,10 @@ use core::sync::atomic;
 use core::sync::atomic::Ordering::Acquire;
 use core::sync::atomic::Ordering::Relaxed;
 use core::sync::atomic::Ordering::Release;
-use siphasher::sip128::SipHasher24;
 use std::alloc::alloc;
 use std::alloc::dealloc;
 use std::alloc::handle_alloc_error;
 use std::alloc::Layout;
-use std::ptr::addr_of;
 
 use super::*;
 
@@ -33,9 +31,7 @@ impl<const KEY_LEN: usize, V> Leaf<KEY_LEN, V> {
             let Some(ptr) = NonNull::new(alloc(layout) as *mut Self) else {
                 handle_alloc_error(layout);
             };
-            let hash = SipHasher24::new_with_key(&*addr_of!(SIP_KEY))
-                .hash(&key[..])
-                .into();
+            let hash = hash_leaf_bytes(&key[..]);
 
             ptr.write(Self {
                 key: *key,

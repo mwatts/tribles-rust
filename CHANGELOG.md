@@ -46,6 +46,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Public `TribleSet` fingerprints no longer expose PATCH's linear root
+  aggregate.** The O(1), process-local cache token is now a domain-separated
+  SipHash-2-4 PRF of the internal XOR under a distinct random key. `as_u128`,
+  `Debug`, and `Hash` retain their API while revealing only the blinded value,
+  closing the chosen-singleton linear-dependency oracle.
 - **PATCH rejects unequal LocalLeaf/Branch cardinalities before hashing.** Set
   operations skip the uncached `LocalLeaf` fingerprint when the other subtree's
   cached count is not one. Unary Branches remain eligible for fingerprint
@@ -463,6 +468,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Query` results expose each distinct raw head exactly once.
 
 ### Fixed
+
+- **Safe PATCH entries cannot observe an uninitialized or racing hash key.**
+  The internal leaf key and independent public-fingerprint key now live in one
+  immutable `OnceLock` bundle. Heap entries, archive entries, bulk hashing,
+  LocalLeaf fallback hashing, and public blinding all initialize through that
+  accessor, so constructing an `Entry` before the first `PATCH` produces the
+  same cached hash as every later construction.
 
 - **Typed `UnionArchive` proposals no longer re-scan every attached shard for
   every emitted value.** Bounded shard paging and dense complete drains share

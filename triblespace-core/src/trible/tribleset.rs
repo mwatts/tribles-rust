@@ -61,10 +61,13 @@ pub struct TribleSet {
     pub aev: PATCH<TRIBLE_LEN, AEVOrder, ()>,
 }
 
-/// O(1) fingerprint for a [`TribleSet`], derived from the PATCH root hash.
+/// O(1) opaque cache token for a [`TribleSet`].
 ///
-/// This matches the equality semantics of [`TribleSet`], but it is not stable
-/// across process boundaries because [`PATCH`] uses a per-process hash key.
+/// Equal sets have equal fingerprints within one process. The token is a
+/// distinct-key, nonlinear blinding of PATCH's internal root aggregate, so it
+/// neither exposes the aggregate's XOR structure nor remains stable across
+/// process boundaries. As with any 128-bit fingerprint, a match is a cache
+/// hint rather than proof of set equality.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TribleSetFingerprint(Option<u128>);
 
@@ -77,7 +80,11 @@ impl TribleSetFingerprint {
         self.0.is_none()
     }
 
-    /// Returns the raw 128-bit hash, or `None` for an empty set.
+    /// Returns the opaque 128-bit process-local token, or `None` for an empty
+    /// set.
+    ///
+    /// The returned value is already nonlinearly blinded; PATCH's internal
+    /// XOR aggregate is never exposed through this API.
     pub fn as_u128(self) -> Option<u128> {
         self.0
     }
@@ -361,10 +368,11 @@ impl TribleSet {
 
     /// Returns a fast fingerprint suitable for in-memory caching.
     ///
-    /// The fingerprint matches [`TribleSet`] equality, but it is not stable
-    /// across process boundaries because [`PATCH`] uses a per-process hash key.
+    /// Equal sets have equal fingerprints within this process. The value is an
+    /// opaque, nonlinear keyed blinding of PATCH's internal aggregate and is
+    /// neither a durable identity nor proof that two sets are equal.
     pub fn fingerprint(&self) -> TribleSetFingerprint {
-        TribleSetFingerprint(self.eav.root_hash())
+        TribleSetFingerprint(crate::patch::blind_root_hash(self.eav.root_hash()))
     }
 
     /// Inserts a trible into all six covering indexes.
@@ -693,6 +701,22 @@ mod tests {
         // `owner` retains its allocation while EAV adopts the LocalLeaf.
         let entry = unsafe { ArchiveEntry::new(std::ptr::NonNull::from(&storage.0[0]), &owner) };
         set.eav.insert_archive(&entry);
+    }
+
+    #[test]
+    fn public_fingerprint_blinds_the_internal_root_aggregate() {
+        let set = archive_set(0x11, 0x22);
+        let root_hash = set.eav.root_hash();
+
+        assert_eq!(
+            set.fingerprint().as_u128(),
+            crate::patch::blind_root_hash(root_hash)
+        );
+        assert_ne!(set.fingerprint().as_u128(), root_hash);
+
+        let cloned = set.clone();
+        assert_eq!(set.fingerprint(), cloned.fingerprint());
+        assert_eq!(TribleSet::new().fingerprint(), TribleSetFingerprint::EMPTY);
     }
 
     #[test]

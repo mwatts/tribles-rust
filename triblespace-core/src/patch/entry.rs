@@ -105,14 +105,7 @@ impl<'a, const KEY_LEN: usize> ArchiveEntry<'a, KEY_LEN> {
             0,
             "ArchiveEntry pointer must be 16-byte aligned"
         );
-        let hash = unsafe {
-            use siphasher::sip128::SipHasher24;
-            use std::ptr::addr_of;
-            let key = *addr_of!(crate::patch::SIP_KEY);
-            SipHasher24::new_with_key(&key)
-                .hash(&ptr.as_ref()[..])
-                .into()
-        };
+        let hash = unsafe { hash_leaf_bytes(&ptr.as_ref()[..]) };
         Self { ptr, owner, hash }
     }
 

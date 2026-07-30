@@ -34,7 +34,7 @@ use std::fmt;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ptr::NonNull;
-use std::sync::{Arc, Once};
+use std::sync::{Arc, OnceLock};
 
 /// Marker trait for opaque owners of bytes referenced by archive-backed
 /// PATCH leaves. An owner exists solely to keep its allocation alive while a
@@ -366,8 +366,21 @@ impl PATCHOwnerGuard {
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("PATCH tagged pointers require 64-bit targets");
 
-static mut SIP_KEY: [u8; 16] = [0; 16];
-static INIT: Once = Once::new();
+struct HashKeys {
+    leaf: [u8; 16],
+    exported_fingerprint: [u8; 16],
+}
+
+static HASH_KEYS: OnceLock<HashKeys> = OnceLock::new();
+
+/// Fixed input-domain marker for the public
+/// [`TribleSetFingerprint`](crate::trible::TribleSetFingerprint)
+/// blinding PRF.
+///
+/// A distinct random key already separates this use from PATCH leaf hashing;
+/// the marker additionally prevents this output from being confused with a
+/// future use of the same key over an untyped 128-bit value.
+const EXPORTED_FINGERPRINT_DOMAIN: [u8; 16] = *b"TribleSet.fp.v1\0";
 
 /// Minimum `other.leaf_count` at which [`Head::par_union`] takes the
 /// scatter + bitset + rayon::scope-spawn path on the equal-depth-
@@ -477,20 +490,77 @@ mod parallel_union {
     }
 }
 
-/// Initializes the SIP key used for key hashing.
-/// This function is called automatically when a new PATCH is created.
-///
-/// `pub(crate)` (was private) so the `vwpatch` clone can route its own SIP-key
-/// initialization through this single `Once`, guaranteeing one shared key.
-pub(crate) fn init_sip_key() {
-    INIT.call_once(|| {
+/// Return the immutable process-local PATCH hash-key bundle, initializing all
+/// randomness PATCH construction relies on exactly once.
+fn hash_keys() -> &'static HashKeys {
+    HASH_KEYS.get_or_init(|| {
         bytetable::init();
 
         let mut rng = thread_rng();
-        unsafe {
-            rng.fill_bytes(&mut SIP_KEY[..]);
+        let mut leaf = [0u8; 16];
+        let mut exported_fingerprint = [0u8; 16];
+        rng.fill_bytes(&mut leaf);
+        loop {
+            rng.fill_bytes(&mut exported_fingerprint);
+            if exported_fingerprint != leaf {
+                break;
+            }
         }
-    });
+        HashKeys {
+            leaf,
+            exported_fingerprint,
+        }
+    })
+}
+
+/// Initialize PATCH's process-local hash and byte-table randomness.
+///
+/// Hashing entry points also call [`hash_keys`] themselves, so safe `Entry`
+/// construction before the first [`PATCH`] cannot observe an uninitialized
+/// key.
+pub(crate) fn init_hash_keys() {
+    let _ = hash_keys();
+}
+
+/// Hash one PATCH leaf through the initialized process-local key accessor.
+#[inline]
+fn hash_leaf_bytes(bytes: &[u8]) -> u128 {
+    use siphasher::sip128::SipHasher24;
+
+    SipHasher24::new_with_key(&hash_keys().leaf)
+        .hash(bytes)
+        .into()
+}
+
+/// Apply the public-fingerprint PRF under an explicit key.
+///
+/// Keeping this transformation separate makes the proof boundary visible:
+/// PATCH's internal aggregate is linear, while values crossing the public API
+/// pass through this nonlinear keyed function first.
+#[inline]
+fn blind_root_hash_with_key(root_hash: u128, key: &[u8; 16]) -> u128 {
+    use siphasher::sip128::SipHasher24;
+
+    let mut input = [0u8; 32];
+    input[..16].copy_from_slice(&EXPORTED_FINGERPRINT_DOMAIN);
+    input[16..].copy_from_slice(&root_hash.to_le_bytes());
+    SipHasher24::new_with_key(key).hash(&input).into()
+}
+
+/// Blind PATCH's internal root aggregate for public, process-local cache keys.
+///
+/// The raw root is an XOR of keyed leaf hashes and must not be exposed: chosen
+/// singleton outputs would reveal vectors from which a linear dependency can
+/// be constructed. This distinct-key, domain-separated PRF preserves equality
+/// within the process without exposing that algebra. `None` remains the unique
+/// empty-set representation.
+#[inline]
+pub(crate) fn blind_root_hash(root_hash: Option<u128>) -> Option<u128> {
+    let root_hash = root_hash?;
+    Some(blind_root_hash_with_key(
+        root_hash,
+        &hash_keys().exported_fingerprint,
+    ))
 }
 
 /// Hash one PATCH key with the process-local set-fingerprint key.
@@ -501,14 +571,7 @@ pub(crate) fn init_sip_key() {
 #[cfg(any(test, feature = "parallel"))]
 #[inline]
 pub(crate) fn hash_key(bytes: &[u8]) -> u128 {
-    init_sip_key();
-    use siphasher::sip128::SipHasher24;
-    use std::ptr::addr_of;
-
-    // SAFETY: `init_sip_key` completed the `Once`; the key is immutable after
-    // publication and every subsequent access is read-only.
-    let key = unsafe { *addr_of!(SIP_KEY) };
-    SipHasher24::new_with_key(&key).hash(bytes).into()
+    hash_leaf_bytes(bytes)
 }
 
 /// Builds a per-byte segment map from the segment lengths.
@@ -1055,13 +1118,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V> Head<KEY_LEN, O, V> {
     pub(crate) fn hash(&self) -> u128 {
         match self.body_ref() {
             BodyRef::Leaf(leaf) => leaf.hash,
-            BodyRef::LocalLeaf(bytes) => {
-                use siphasher::sip128::SipHasher24;
-                use std::ptr::addr_of;
-                // SAFETY: SIP_KEY is initialized at startup; we only read it.
-                let key = unsafe { *addr_of!(SIP_KEY) };
-                SipHasher24::new_with_key(&key).hash(&bytes[..]).into()
-            }
+            BodyRef::LocalLeaf(bytes) => hash_leaf_bytes(&bytes[..]),
             BodyRef::Branch(branch) => branch.hash,
         }
     }
@@ -2485,7 +2542,7 @@ where
 {
     /// Creates a new empty PATCH.
     pub fn new() -> Self {
-        init_sip_key();
+        init_hash_keys();
         PATCH {
             root: None,
             owners: None,
@@ -2612,6 +2669,11 @@ where
         self.len() == 0
     }
 
+    /// Return PATCH's internal linear root aggregate.
+    ///
+    /// This value is crate-private deliberately. Public cache keys must pass
+    /// through [`blind_root_hash`] so callers cannot observe chosen leaf-hash
+    /// vectors and exploit the XOR maintenance law.
     pub(crate) fn root_hash(&self) -> Option<u128> {
         self.root.as_ref().map(|root| root.hash())
     }
@@ -3173,9 +3235,10 @@ where
         owner: &std::sync::Arc<dyn ArchiveOwner>,
         guard: &PATCHOwnerGuard,
     ) -> Self {
-        // Branch child tables use randomness initialized alongside the SIP
-        // key. A pre-hashed caller may reach this constructor before PATCH::new.
-        init_sip_key();
+        // Branch child tables use randomness initialized alongside the
+        // hash-key bundle. A pre-hashed caller may reach this constructor
+        // before PATCH::new.
+        init_hash_keys();
         assert_eq!(keys.len(), hashes.len());
         assert_eq!(keys.len(), rows.len());
         assert!(
@@ -3799,6 +3862,21 @@ mod tests {
         let entry = Entry::new(&key);
         patch.insert(&entry);
         patch
+    }
+
+    #[test]
+    fn exported_fingerprint_blinding_is_not_xor_homomorphic() {
+        let key = [0x5au8; 16];
+        let left = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210u128;
+        let right = 0xfedc_ba98_7654_3210_0123_4567_89ab_cdefu128;
+        let blind_left = blind_root_hash_with_key(left, &key);
+        let blind_right = blind_root_hash_with_key(right, &key);
+
+        assert_ne!(blind_left, left);
+        assert_ne!(
+            blind_root_hash_with_key(left ^ right, &key),
+            blind_left ^ blind_right
+        );
     }
 
     #[test]
