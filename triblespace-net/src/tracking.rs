@@ -443,6 +443,7 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
     use triblespace_core::blob::Blob;
+    use triblespace_core::blob::IntoBlob;
     use triblespace_core::id::genid;
     use triblespace_core::inline::TryToInline;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
