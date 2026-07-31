@@ -66,6 +66,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kill in place without atomics, scratch verdicts, or a merge pass. Proposal
   batches and descendant frontiers remain whole, and WGPU still decides its
   route from the complete candidate region before any CPU fallback.
+- **TribleSet confirmation no longer builds a disabled candidate-sort
+  permutation.** The value-order region sort was permanently set to
+  `usize::MAX` after losing 33--46% on the fixtures that exercised it, yet its
+  unsorted path still copied every parent tag and allocated an identity index
+  vector. Confirmation now walks proposer order directly, recognizes the same
+  adjacent probe-key runs, and passes ordinary index ranges to the unchanged
+  membership dispatch. This removes two region-sized allocations from serial
+  confirmation and from every leaf-local Rayon shard without restoring the
+  rejected sorting strategy.
 - **Breaking: candidate liveness is bit-packed.** The query engine's
   one-`u32`-per-candidate liveness becomes 32 candidates per `u32`, with
   `count_live`/`next_live` folding whole words through

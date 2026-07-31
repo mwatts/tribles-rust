@@ -1,3 +1,4 @@
+use core::ops::Range;
 use core::panic;
 
 use smallvec::SmallVec;
@@ -38,22 +39,17 @@ use crate::trible::TribleSet;
 ///   exactly those bytes (a prefix passed to `has_prefix`/`infixes` is
 ///   in *tree* order, so a lexicographic sort of the prefixes is the
 ///   tree's own descent order), so consecutive probes share their upper
-///   path. Measured, this half is worth little here — see
-///   [`SORTED_REGION_MIN`], which is the same idea applied where there
-///   is much more of it to do, and which is off.
+///   path. Measured, this half is worth less than duplicate collapse but
+///   comes with the same bounded row permutation.
 ///
-/// The two halves have different economics, so they have their own
-/// thresholds. Ordering the *rows* costs `O(rows log rows)` — bounded by
-/// the frontier width — and buys the collapses above, which are savings
-/// in work rather than in cache misses. Ordering a *region* costs
-/// `O(candidates log candidates)`, which is unbounded by the frontier
-/// and buys only locality: it is worth it exactly when a probe is
-/// expensive enough to amortise a comparison.
-///
-/// This pair is the whole boundary between the two strategies: both
-/// paths run the same code over a permutation of the batch and differ
-/// solely in whether that permutation is sorted. Set either to
-/// `usize::MAX` to measure that half as the plain frontier-order loop.
+/// Ordering the rows costs `O(rows log rows)` — bounded by the frontier
+/// width — and buys the collapses above, which are savings in work rather
+/// than only cache misses. Candidate regions deliberately stay in proposer
+/// order: the former region-sized sort cost `O(candidates log candidates)`
+/// and lost 33--46% on the Harkonnen fixtures that crossed it, while buying
+/// no more than 3% anywhere measured. Keeping that disabled machinery still
+/// forced every CPU-confirm shard to allocate and copy an index permutation,
+/// so it is removed rather than retained behind a dead threshold.
 ///
 /// On for this source, and measured on the suite's Harkonnen fixtures:
 /// the collapses are worth 16% and 12% on F8 (bag and distinct) and 6%
@@ -61,33 +57,6 @@ use crate::trible::TribleSet;
 /// keys and the sort only reorders. Net favourable, and the shapes it
 /// loses on are the ones a wider frontier makes rarer, not commoner.
 const SORTED_PROBE_MIN: usize = 2;
-
-/// Region size at which `confirm` orders its candidates by value rather
-/// than walking the region as it lies. See [`SORTED_PROBE_MIN`] for what
-/// the ordering buys.
-///
-/// **Off, and measured off in both sources.** The idea is sound — the
-/// archive's domain and the PATCH's leaves are both laid out in value
-/// order, so probing a region in value order should sweep them — but as
-/// written it does not pay anywhere: within 3% on every archive query at
-/// 4M and at 8M tribles, and 33-46% *worse* on the Harkonnen fixtures
-/// whose regions are large enough to sort (F9, F11, F14).
-///
-/// The reason looks structural rather than incidental, which is why the
-/// switch is off rather than tuned: sorting a region means sorting an
-/// index permutation, and the comparator then gathers from `parents`
-/// and the values through those indices. Both arrays are region-sized,
-/// so at exactly the width where the ordering was supposed to earn its
-/// keep, the sort itself misses cache once or twice per comparison —
-/// and it does that `n log n` times to save `n` probes. A version worth
-/// re-measuring would sort *packed keys* (a `(group, value-prefix,
-/// index)` record) so the sort streams instead of gathering, or would
-/// leave the ordering to a tier that wants the region sorted anyway.
-///
-/// The row ordering above is a different trade and is on: it sorts at
-/// most `frontier width` entries and saves whole index walks rather
-/// than cache misses.
-const SORTED_REGION_MIN: usize = usize::MAX;
 
 /// Candidate-region size at which a CPU confirmation becomes worth dividing
 /// across the current Rayon pool.
@@ -106,19 +75,20 @@ const PARALLEL_CONFIRM_MIN: usize = 4096;
 static PARALLEL_CONFIRM_SPLITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Kills every entry named by `order` whose value fails `keep`, skipping
-/// entries that are already dead — [`Candidates::retain`] over a
-/// permutation instead of the region's own order.
+/// Kills every entry in `range` whose value fails `keep`, skipping entries
+/// that are already dead.
 ///
 /// The verdict is memoised across *adjacent equal values*, which costs
-/// one 32-byte compare and pays for itself whenever the permutation is
-/// sorted: a key-run fanned out over several frontier rows carries each
-/// candidate once per row, and sorted they arrive back to back.
+/// one 32-byte compare and pays for itself when a proposer fanned the same
+/// candidate run out to adjacent rows of one probe group.
 #[inline]
-fn retain_at(cands: &mut Candidates<'_>, order: &[u32], mut keep: impl FnMut(&RawInline) -> bool) {
+fn retain_range(
+    cands: &mut Candidates<'_>,
+    range: Range<usize>,
+    mut keep: impl FnMut(&RawInline) -> bool,
+) {
     let mut memo: Option<(RawInline, bool)> = None;
-    for &i in order {
-        let i = i as usize;
+    for i in range {
         if !cands.is_live(i) {
             continue;
         }
@@ -137,12 +107,12 @@ fn retain_at(cands: &mut Candidates<'_>, order: &[u32], mut keep: impl FnMut(&Ra
     }
 }
 
-/// Kills every entry named by `order` — the [`Candidates::kill_all`] of
-/// a permutation, used where a row's own bound positions are malformed.
+/// Kills every entry in `range`, used where a row's own bound positions are
+/// malformed.
 #[inline]
-fn kill_at(cands: &mut Candidates<'_>, order: &[u32]) {
-    for &i in order {
-        cands.kill(i as usize);
+fn kill_range(cands: &mut Candidates<'_>, range: Range<usize>) {
+    for i in range {
+        cands.kill(i);
     }
 }
 
@@ -185,21 +155,18 @@ impl TribleSetConstraint {
 }
 
 impl TribleSetConstraint {
-    /// Kills the entries `order` names — indices into `cands` — whose
-    /// value is inconsistent with `binding`.
+    /// Kills the entries in `range` whose value is inconsistent with
+    /// `binding`.
     ///
-    /// `order` is a permutation of some part of the region rather than a
-    /// range, because the region spans a whole [`Frontier`] and the
-    /// caller decides in which order the covering index is probed. Every
-    /// entry it names must belong to a row whose bound positions equal
-    /// `binding`'s; the caller establishes that by grouping the region by
-    /// probe key.
+    /// Every entry in the range belongs to a row whose bound positions equal
+    /// `binding`'s; the caller establishes that by walking adjacent probe-key
+    /// groups in the region's existing order.
     fn confirm_at(
         &self,
         variable: VariableId,
         binding: &Binding,
         cands: &mut Candidates<'_>,
-        order: &[u32],
+        range: Range<usize>,
     ) {
         let e_var = self.term_e.is_var(variable);
         let a_var = self.term_a.is_var(variable);
@@ -211,7 +178,7 @@ impl TribleSetConstraint {
 
         let e_bound = if let Some(e) = self.term_e.position_value(binding) {
             let Some(e) = id_from_value(e) else {
-                kill_at(cands, order);
+                kill_range(cands, range);
                 return;
             };
             Some(e)
@@ -220,7 +187,7 @@ impl TribleSetConstraint {
         };
         let a_bound = if let Some(a) = self.term_a.position_value(binding) {
             let Some(a) = id_from_value(a) else {
-                kill_at(cands, order);
+                kill_range(cands, range);
                 return;
             };
             Some(a)
@@ -230,22 +197,22 @@ impl TribleSetConstraint {
         let v_bound = self.term_v.position_value(binding);
 
         match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
-            (None, None, None, true, false, false) => retain_at(cands, order, |value| {
+            (None, None, None, true, false, false) => retain_range(cands, range, |value| {
                 let Some(id) = id_from_value(value) else {
                     return false;
                 };
                 self.set.eav.has_prefix(&id)
             }),
-            (None, None, None, false, true, false) => retain_at(cands, order, |value| {
+            (None, None, None, false, true, false) => retain_range(cands, range, |value| {
                 let Some(id) = id_from_value(value) else {
                     return false;
                 };
                 self.set.aev.has_prefix(&id)
             }),
             (None, None, None, false, false, true) => {
-                retain_at(cands, order, |value| self.set.vea.has_prefix(value))
+                retain_range(cands, range, |value| self.set.vea.has_prefix(value))
             }
-            (Some(e), None, None, false, true, false) => retain_at(cands, order, |value| {
+            (Some(e), None, None, false, true, false) => retain_range(cands, range, |value| {
                 let Some(id) = id_from_value(value) else {
                     return false;
                 };
@@ -254,13 +221,13 @@ impl TribleSetConstraint {
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&id);
                 self.set.eav.has_prefix(&prefix)
             }),
-            (Some(e), None, None, false, false, true) => retain_at(cands, order, |value| {
+            (Some(e), None, None, false, false, true) => retain_range(cands, range, |value| {
                 let mut prefix = [0u8; ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&e[..]);
                 prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(value);
                 self.set.eva.has_prefix(&prefix)
             }),
-            (None, Some(a), None, true, false, false) => retain_at(cands, order, |value| {
+            (None, Some(a), None, true, false, false) => retain_range(cands, range, |value| {
                 let Some(id) = id_from_value(value) else {
                     return false;
                 };
@@ -269,13 +236,13 @@ impl TribleSetConstraint {
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&id);
                 self.set.aev.has_prefix(&prefix)
             }),
-            (None, Some(a), None, false, false, true) => retain_at(cands, order, |value| {
+            (None, Some(a), None, false, false, true) => retain_range(cands, range, |value| {
                 let mut prefix = [0u8; ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&a[..]);
                 prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(value);
                 self.set.ave.has_prefix(&prefix)
             }),
-            (None, None, Some(v), true, false, false) => retain_at(cands, order, |value| {
+            (None, None, Some(v), true, false, false) => retain_range(cands, range, |value| {
                 let Some(id) = id_from_value(value) else {
                     return false;
                 };
@@ -284,7 +251,7 @@ impl TribleSetConstraint {
                 prefix[INLINE_LEN..INLINE_LEN + ID_LEN].copy_from_slice(&id);
                 self.set.vea.has_prefix(&prefix)
             }),
-            (None, None, Some(v), false, true, false) => retain_at(cands, order, |value| {
+            (None, None, Some(v), false, true, false) => retain_range(cands, range, |value| {
                 let Some(id) = id_from_value(value) else {
                     return false;
                 };
@@ -294,7 +261,7 @@ impl TribleSetConstraint {
                 self.set.vae.has_prefix(&prefix)
             }),
             (None, Some(a), Some(v), true, false, false) => {
-                retain_at(cands, order, |value: &[u8; 32]| {
+                retain_range(cands, range, |value: &[u8; 32]| {
                     let Some(id) = id_from_value(value) else {
                         return false;
                     };
@@ -306,7 +273,7 @@ impl TribleSetConstraint {
                 })
             }
             (Some(e), None, Some(v), false, true, false) => {
-                retain_at(cands, order, |value: &[u8; 32]| {
+                retain_range(cands, range, |value: &[u8; 32]| {
                     let Some(id) = id_from_value(value) else {
                         return false;
                     };
@@ -318,7 +285,7 @@ impl TribleSetConstraint {
                 })
             }
             (Some(e), Some(a), None, false, false, true) => {
-                retain_at(cands, order, |value: &[u8; 32]| {
+                retain_range(cands, range, |value: &[u8; 32]| {
                     let mut prefix = [0u8; ID_LEN + ID_LEN + INLINE_LEN];
                     prefix[0..ID_LEN].copy_from_slice(&e);
                     prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&a);
@@ -331,7 +298,7 @@ impl TribleSetConstraint {
             // (e and v, or e and a, or a and v); we build a full
             // 64-byte trible key from each proposal and check
             // `has_prefix` against the appropriate index.
-            (_, Some(a), _, true, false, true) => retain_at(cands, order, |value| {
+            (_, Some(a), _, true, false, true) => retain_range(cands, range, |value| {
                 // pattern(x, a, x): proposal is both entity and value.
                 let Some(id) = id_from_value(value) else {
                     return false;
@@ -342,7 +309,7 @@ impl TribleSetConstraint {
                 prefix[ID_LEN + ID_LEN..].copy_from_slice(&id_into_value(&id));
                 self.set.eav.has_prefix(&prefix)
             }),
-            (_, None, _, true, false, true) => retain_at(cands, order, |value| {
+            (_, None, _, true, false, true) => retain_range(cands, range, |value| {
                 // pattern(x, ?, x): proposal is entity == value, any attr.
                 let Some(id) = id_from_value(value) else {
                     return false;
@@ -352,7 +319,7 @@ impl TribleSetConstraint {
                 prefix[ID_LEN..].copy_from_slice(&id_into_value(&id));
                 self.set.eva.has_prefix(&prefix)
             }),
-            (_, _, Some(v), true, true, false) => retain_at(cands, order, |value| {
+            (_, _, Some(v), true, true, false) => retain_range(cands, range, |value| {
                 // pattern(x, x, v): proposal is entity == attribute.
                 let Some(id) = id_from_value(value) else {
                     return false;
@@ -363,7 +330,7 @@ impl TribleSetConstraint {
                 prefix[ID_LEN + ID_LEN..].copy_from_slice(&v[..]);
                 self.set.eav.has_prefix(&prefix)
             }),
-            (_, _, None, true, true, false) => retain_at(cands, order, |value| {
+            (_, _, None, true, true, false) => retain_range(cands, range, |value| {
                 // pattern(x, x, ?): proposal is entity == attribute, any v.
                 let Some(id) = id_from_value(value) else {
                     return false;
@@ -373,7 +340,7 @@ impl TribleSetConstraint {
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&id);
                 self.set.eav.has_prefix(&prefix)
             }),
-            (Some(e), _, _, false, true, true) => retain_at(cands, order, |value| {
+            (Some(e), _, _, false, true, true) => retain_range(cands, range, |value| {
                 // pattern(e, x, x): proposal is attribute == value.
                 let Some(id) = id_from_value(value) else {
                     return false;
@@ -384,7 +351,7 @@ impl TribleSetConstraint {
                 prefix[ID_LEN + ID_LEN..].copy_from_slice(&id_into_value(&id));
                 self.set.eav.has_prefix(&prefix)
             }),
-            (None, _, _, false, true, true) => retain_at(cands, order, |value| {
+            (None, _, _, false, true, true) => retain_range(cands, range, |value| {
                 // pattern(?, x, x): proposal is attribute == value, any e.
                 let Some(id) = id_from_value(value) else {
                     return false;
@@ -394,7 +361,7 @@ impl TribleSetConstraint {
                 prefix[ID_LEN..].copy_from_slice(&id_into_value(&id));
                 self.set.ave.has_prefix(&prefix)
             }),
-            (_, _, _, true, true, true) => retain_at(cands, order, |value| {
+            (_, _, _, true, true, true) => retain_range(cands, range, |value| {
                 // pattern(x, x, x): proposal plays all three roles.
                 let Some(id) = id_from_value(value) else {
                     return false;
@@ -414,9 +381,10 @@ impl TribleSetConstraint {
     ///
     /// Keeping this as the leaf of both execution paths makes the
     /// non-parallel build and every below-crossover region run the exact same
-    /// code as before. Candidate order remains the current unsorted order
-    /// (`SORTED_REGION_MIN` is disabled); a parallel division merely creates
-    /// two shorter regions in that same order.
+    /// code. Candidate order is the proposer's order; a parallel division
+    /// merely creates two shorter regions in that same order. Reading parent
+    /// tags one at a time avoids the former region-sized parent copy and dead
+    /// sort permutation.
     fn confirm_grouped(
         &self,
         variable: VariableId,
@@ -425,31 +393,16 @@ impl TribleSetConstraint {
         cands: &mut Candidates<'_>,
     ) {
         let entries = cands.len();
-        // The tags are read after the region turns mutable, so take a
-        // copy of them rather than holding a borrow across the kills.
-        let parents: SmallVec<[u32; 64]> = SmallVec::from_slice(cands.parents());
-
-        let mut order: SmallVec<[u32; 64]> = (0..entries as u32).collect();
-        if entries >= SORTED_REGION_MIN {
-            let values = cands.values();
-            order.sort_unstable_by(|&a, &b| {
-                group[parents[a as usize] as usize]
-                    .cmp(&group[parents[b as usize] as usize])
-                    .then_with(|| values[a as usize].cmp(&values[b as usize]))
-                    .then(a.cmp(&b))
-            });
-        }
-
         let mut run_start = 0;
         while run_start < entries {
-            let lead = parents[order[run_start] as usize];
+            let lead = cands.parent(run_start);
             let label = group[lead as usize];
             let mut run_end = run_start + 1;
-            while run_end < entries && group[parents[order[run_end] as usize] as usize] == label {
+            while run_end < entries && group[cands.parent(run_end) as usize] == label {
                 run_end += 1;
             }
             let binding = frontier.row(lead as usize);
-            self.confirm_at(variable, &binding, cands, &order[run_start..run_end]);
+            self.confirm_at(variable, &binding, cands, run_start..run_end);
             run_start = run_end;
         }
     }
@@ -979,13 +932,12 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
     /// positions + the proposed value) has a matching prefix in the
     /// appropriate index.
     ///
-    /// The region spans the whole batch, so it is walked in **probe
-    /// order**: grouped by probe key — coarser than by parent tag, since
-    /// distinct rows that agree on this constraint's positions confirm
-    /// identically — and, within a group, in value order, which is the
-    /// order the covering index is laid out in. Below
-    /// [`SORTED_PROBE_MIN`] the region is walked in its own order
-    /// instead, which is the same grouping the tags already carry.
+    /// The region spans the whole batch and stays in proposer order. Adjacent
+    /// entries whose parent rows agree on this constraint's probe key share
+    /// one bound-position setup; non-adjacent equal keys are still correct,
+    /// but form separate runs. This intentionally avoids the former
+    /// region-sized candidate permutation: it never paid for its sort and
+    /// made parallel CPU leaves allocate and copy an index array per shard.
     fn confirm(&self, variable: VariableId, frontier: &Frontier<'_>, cands: &mut Candidates<'_>) {
         let entries = cands.len();
         if entries == 0 || frontier.is_empty() || !self.touches(variable) {
