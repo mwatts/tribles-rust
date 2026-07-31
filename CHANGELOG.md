@@ -56,6 +56,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Rayon can divide a TribleSet CPU confirmation without fragmenting its
+  frontier.** Queries explicitly converted with `into_par_iter()` carry that
+  intent through their frontier views; ordinary iterators remain serial even
+  when invoked inside a Rayon pool. Above an internal crossover, a TribleSet
+  confirmer computes the logical frontier's probe groups once and recursively
+  divides only its CPU membership work at packed-liveness word boundaries.
+  The resulting `Candidates` regions own disjoint mutable words, so workers
+  kill in place without atomics, scratch verdicts, or a merge pass. Proposal
+  batches and descendant frontiers remain whole, and WGPU still decides its
+  route from the complete candidate region before any CPU fallback.
 - **Breaking: candidate liveness is bit-packed.** The query engine's
   one-`u32`-per-candidate liveness becomes 32 candidates per `u32`, with
   `count_live`/`next_live` folding whole words through

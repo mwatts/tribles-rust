@@ -681,6 +681,62 @@ impl<'a> Candidates<'a> {
         self.bit_offset
     }
 
+    /// Consumes this region and divides it at candidate index `mid`, where
+    /// the division falls exactly between two packed liveness words.
+    ///
+    /// The alignment requirement is `(bit_offset() + mid) % 32 == 0`, not
+    /// merely `mid % 32 == 0`: a region may itself start in the middle of a
+    /// word. At an aligned division the two returned regions borrow disjoint
+    /// `&mut [u32]` slices, so separate workers may kill candidates in them
+    /// concurrently without atomics, scratch masks, or a merge pass. The
+    /// left region keeps this region's bit offset; the right begins at bit
+    /// zero of its first word.
+    ///
+    /// This is deliberately crate-private. It is an ownership primitive for
+    /// CPU constraint implementations, not another way for the query engine
+    /// to fragment a logical proposal batch.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `mid` is an endpoint or does not lie on a packed-word
+    /// boundary in this region's coordinate system.
+    #[cfg(feature = "parallel")]
+    #[track_caller]
+    pub(crate) fn split_at_word_boundary(self, mid: usize) -> (Candidates<'a>, Candidates<'a>) {
+        assert!(mid > 0 && mid < self.values.len(), "split must be interior");
+        let word_mid_bits = self.bit_offset + mid;
+        assert!(
+            word_mid_bits.is_multiple_of(BITS),
+            "candidate split does not fall on a liveness-word boundary"
+        );
+        let word_mid = word_mid_bits / BITS;
+
+        let Candidates {
+            values,
+            parents,
+            words,
+            bit_offset,
+        } = self;
+        let (left_values, right_values) = values.split_at(mid);
+        let (left_parents, right_parents) = parents.split_at(mid);
+        let (left_words, right_words) = words.split_at_mut(word_mid);
+
+        (
+            Candidates {
+                values: left_values,
+                parents: left_parents,
+                words: left_words,
+                bit_offset,
+            },
+            Candidates {
+                values: right_values,
+                parents: right_parents,
+                words: right_words,
+                bit_offset: 0,
+            },
+        )
+    }
+
     /// Copies the liveness words out (scratch for OR-composition).
     ///
     /// NEUTRAL MASKING (read side): the bits this region does not own are
@@ -958,6 +1014,67 @@ mod tests {
                 (offset + r.len()).div_ceil(LIVENESS_WORD_BITS)
             );
         }
+    }
+
+    /// An aligned split is an ownership split, not a copied verdict: kills in
+    /// either half land directly in the original buffer while neither half
+    /// can reach the other's packed words (or the prefix below the region).
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn word_boundary_split_yields_disjoint_killable_regions() {
+        let mut b = ProposalBuffer::new();
+        for row in 0..5u32 {
+            b.open(row);
+            for i in 0..20 {
+                b.push(v(row as usize * 100 + i));
+            }
+        }
+        // Preserve a dead bit through the split as well as the live ones.
+        {
+            let mut all = b.region(0);
+            all.kill(40);
+        }
+        {
+            let region = b.region(5);
+            // Region index 27 is absolute buffer index 32: exactly the next
+            // packed-word boundary despite `27` itself not being aligned.
+            let (mut left, mut right) = region.split_at_word_boundary(27);
+            assert_eq!((left.len(), left.bit_offset()), (27, 5));
+            assert_eq!((right.len(), right.bit_offset()), (68, 0));
+            assert_eq!((left.live_word_len(), right.live_word_len()), (1, 3));
+            assert_eq!(left.parent(0), 0);
+            assert_eq!(left.parent(14), 0);
+            assert_eq!(left.parent(15), 1);
+            assert_eq!(right.parent(0), 1);
+            assert_eq!(right.parent(67), 4);
+
+            for i in (0..left.len()).step_by(2) {
+                left.kill(i);
+            }
+            for i in (0..right.len()).step_by(3) {
+                right.kill(i);
+            }
+        }
+
+        for i in 0..100 {
+            let want = if i < 5 {
+                true
+            } else if i < 32 {
+                (i - 5) % 2 != 0
+            } else {
+                i != 40 && (i - 32) % 3 != 0
+            };
+            assert_eq!(b.is_live(i), want, "entry {i}");
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    #[should_panic(expected = "liveness-word boundary")]
+    fn word_boundary_split_rejects_a_shared_boundary_word() {
+        let mut b = filled(70);
+        let region = b.region(5);
+        let _ = region.split_at_word_boundary(32);
     }
 
     /// The reconstruction a packed device kernel performs, pinned on the host:

@@ -406,6 +406,13 @@ pub struct Frontier<'a> {
     stride: usize,
     select: &'a [u32],
     levels: &'a [LevelValues],
+    /// Whether this frontier is being driven by `QueryParIter`.
+    ///
+    /// Crate-private execution intent lets built-in CPU constraints expose
+    /// work to the same Rayon pool without making ordinary `Iterator`
+    /// queries parallel merely because the crate was built with the
+    /// `parallel` feature.
+    parallel: bool,
 }
 
 impl fmt::Debug for Frontier<'_> {
@@ -424,6 +431,7 @@ impl Default for Frontier<'_> {
             stride: NO_INDEXES.len(),
             select: &SINGLE_ROW,
             levels: &NO_LEVELS,
+            parallel: false,
         }
     }
 }
@@ -442,6 +450,13 @@ impl<'a> Frontier<'a> {
     /// The variables bound in *every* row of this batch.
     pub fn bound(&self) -> VariableSet {
         self.bound
+    }
+
+    /// Whether this batch belongs to a query explicitly converted with
+    /// `into_par_iter`.
+    #[cfg(feature = "parallel")]
+    pub(crate) fn parallel(&self) -> bool {
+        self.parallel
     }
 
     /// The binding of row `i`.
@@ -485,6 +500,7 @@ impl<'a> Frontier<'a> {
             stride: self.stride,
             select,
             levels: self.levels,
+            parallel: self.parallel,
         }
     }
 }
@@ -551,6 +567,7 @@ impl BindingStore {
             stride: self.indexes.len(),
             select: &SINGLE_ROW,
             levels: &self.levels,
+            parallel: false,
         }
     }
 
@@ -613,6 +630,7 @@ impl BindingStore {
         block: &[u32],
         select: &[u32],
         stride: usize,
+        parallel: bool,
         propose: impl FnOnce(&Frontier<'_>, &mut ProposalBuffer),
     ) -> usize {
         debug_assert!(
@@ -642,6 +660,7 @@ impl BindingStore {
                     stride,
                     select,
                     levels: &self.levels,
+                    parallel,
                 },
                 buffer,
             );
@@ -659,6 +678,7 @@ impl BindingStore {
         block: &'s [u32],
         select: &'s [u32],
         stride: usize,
+        parallel: bool,
     ) -> Frontier<'s> {
         Frontier {
             bound: self.bound,
@@ -666,6 +686,7 @@ impl BindingStore {
             stride,
             select,
             levels: &self.levels,
+            parallel,
         }
     }
 
@@ -1164,6 +1185,10 @@ pub struct Query<C, P: Fn(&Binding<'_>) -> Option<R>, R> {
     /// Index-row width: one slot per variable the query mentions.
     slots: usize,
     width: usize,
+    /// Set only by `IntoParallelIterator`; carried into every frontier so a
+    /// built-in leaf may join the same pool without changing ordinary
+    /// iterator execution.
+    parallel: bool,
     stack: ArrayVec<Level, 128>,
     /// Frontier stack. `depths[0]` is the root (one empty row); `depths[d]`
     /// holds the rows with `d` variables bound. Entries above `depth` are
@@ -1372,6 +1397,7 @@ where
             unbound: self.unbound,
             slots: self.slots,
             width: self.width,
+            parallel: self.parallel,
             stack: self.stack.clone(),
             // Only the live prefix of the frontier stack matters; the
             // retired tail is scratch. Each `Depth`'s matrices sit behind
@@ -1555,6 +1581,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             unbound: variables,
             slots,
             width: DEFAULT_FRONTIER_WIDTH,
+            parallel: false,
             stack: ArrayVec::new(),
             depths: vec![root],
             depth: 0,
@@ -1593,8 +1620,12 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
     /// The frontier currently at the top of the stack, unrestricted.
     fn frontier(&self) -> Frontier<'_> {
         let depth = &self.depths[self.depth];
-        self.bindings
-            .batch(&depth.block, &depth.order[..depth.rows], self.slots)
+        self.bindings.batch(
+            &depth.block,
+            &depth.order[..depth.rows],
+            self.slots,
+            self.parallel,
+        )
     }
 
     /// Partitions the top frontier by each row's preferred variable.
@@ -1722,6 +1753,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             &block,
             &order[range],
             self.slots,
+            self.parallel,
             |frontier, proposals| constraint.propose(variable, frontier, proposals),
         );
         self.stack.push(Level {
@@ -1936,7 +1968,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             let block = Arc::clone(&child.block);
             let order = Arc::clone(&child.order);
             let estimates = Arc::make_mut(&mut child.estimates);
-            let batch = self.bindings.batch(&block, &order, slots);
+            let batch = self.bindings.batch(&block, &order, slots, self.parallel);
             for row in 0..rows {
                 let binding = batch.row(row);
                 for v in stale {
@@ -2058,6 +2090,15 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> fmt::Debug for 
 // A heavy sole root group is honestly serial until executing it produces a
 // child group with a source continuation; the parallel path does not invent a
 // destructive intra-group split merely to keep rayon busy.
+//
+// A built-in CPU constraint may nevertheless expose *work inside one logical
+// confirm call* to the same pool. `IntoParallelIterator` marks the query's
+// frontier views with crate-private execution intent; ordinary `Iterator`
+// queries do not acquire that intent merely because they happen to run on a
+// Rayon worker. TribleSet confirmation uses it to divide packed liveness at
+// word boundaries, where each worker owns disjoint killable words. That leaves
+// the frontier, proposal buffer, and any accelerator routing whole: it is data
+// parallelism inside a leaf, not another search-state split.
 // Every successful split advances the original owner's group/page cursor and
 // fences that unit out of the sibling's future, so ownership is a strict
 // progress measure. Rayon's pressure splitter needs no engine-specific split
@@ -2102,7 +2143,8 @@ mod parallel {
         type Item = R;
         type Iter = QueryParIter<C, P, R>;
 
-        fn into_par_iter(self) -> Self::Iter {
+        fn into_par_iter(mut self) -> Self::Iter {
+            self.parallel = true;
             QueryParIter {
                 inner: Box::new(self),
             }
@@ -2374,7 +2416,7 @@ mod tests {
         }
 
         fn refill(store: &mut BindingStore, values: &[RawInline]) {
-            store.refill(0, &[0], &[0], 1, |frontier, proposals| {
+            store.refill(0, &[0], &[0], 1, false, |frontier, proposals| {
                 assert_eq!(frontier.len(), 1);
                 proposals.open(0);
                 proposals.extend(values.iter().copied());
@@ -2636,6 +2678,7 @@ mod tests {
         use super::*;
         use rayon::iter::plumbing::UnindexedProducer;
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        use std::sync::atomic::{AtomicU8, Ordering};
 
         #[derive(Clone)]
         struct Fixture(u32);
@@ -2646,6 +2689,46 @@ mod tests {
         /// descending in place even though no parallel work exists.
         #[derive(Clone)]
         struct OneToOne(usize);
+
+        /// Records whether the frontier handed to a constraint carried the
+        /// explicit parallel-query intent. Bit 0 is sequential, bit 1 is
+        /// parallel.
+        #[derive(Clone)]
+        struct IntentRecorder(Arc<AtomicU8>);
+
+        impl<'a> Constraint<'a> for IntentRecorder {
+            fn variables(&self) -> VariableSet {
+                variable_set([0])
+            }
+
+            fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
+                (variable == 0).then_some(1)
+            }
+
+            fn propose(
+                &self,
+                _variable: VariableId,
+                frontier: &Frontier<'_>,
+                proposals: &mut ProposalBuffer,
+            ) {
+                self.0.fetch_or(
+                    if frontier.parallel() { 0b10 } else { 0b01 },
+                    Ordering::Relaxed,
+                );
+                for row in 0..frontier.len() {
+                    proposals.open(row as u32);
+                    proposals.push(Fixture::value(0x55, row as u32));
+                }
+            }
+
+            fn confirm(
+                &self,
+                _variable: VariableId,
+                _frontier: &Frontier<'_>,
+                _candidates: &mut Candidates<'_>,
+            ) {
+            }
+        }
 
         impl<'a> Constraint<'a> for OneToOne {
             fn variables(&self) -> VariableSet {
@@ -2763,6 +2846,34 @@ mod tests {
                 project as fn(&Binding<'_>) -> Option<RawInline>,
             )
             .with_frontier_width(4)
+        }
+
+        #[test]
+        fn only_into_par_iter_sets_parallel_frontier_intent() {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .build()
+                .unwrap();
+
+            let sequential = Arc::new(AtomicU8::new(0));
+            let sequential_rows = pool.install(|| {
+                Query::new(IntentRecorder(Arc::clone(&sequential)), |_| Some(())).count()
+            });
+            assert_eq!(sequential_rows, 1);
+            assert_eq!(
+                sequential.load(Ordering::Relaxed),
+                0b01,
+                "an ordinary iterator stays serial even inside a Rayon pool"
+            );
+
+            let parallel = Arc::new(AtomicU8::new(0));
+            let parallel_rows = pool.install(|| {
+                Query::new(IntentRecorder(Arc::clone(&parallel)), |_| Some(()))
+                    .into_par_iter()
+                    .count()
+            });
+            assert_eq!(parallel_rows, 1);
+            assert_eq!(parallel.load(Ordering::Relaxed), 0b10);
         }
 
         fn advance_to_three_groups(query: &mut TestQuery) {

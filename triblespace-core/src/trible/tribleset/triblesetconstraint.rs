@@ -89,6 +89,23 @@ const SORTED_PROBE_MIN: usize = 2;
 /// than cache misses.
 const SORTED_REGION_MIN: usize = usize::MAX;
 
+/// Candidate-region size at which a CPU confirmation becomes worth dividing
+/// across the current Rayon pool.
+///
+/// This is an internal execution crossover, not a query-planning knob. The
+/// logical frontier remains whole: proposal, probe grouping, and any device
+/// routing happen before this point. Only the CPU membership probes divide,
+/// at packed-word boundaries, into disjoint kill-only regions. With a 4096
+/// crossover the recursive leaves are about 2048 candidates wide — enough
+/// PATCH work to dominate a nested-join handoff while exposing useful work at
+/// the 16K frontier where accelerator routing begins.
+#[cfg(feature = "parallel")]
+const PARALLEL_CONFIRM_MIN: usize = 4096;
+
+#[cfg(all(test, feature = "parallel"))]
+static PARALLEL_CONFIRM_SPLITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Kills every entry named by `order` whose value fails `keep`, skipping
 /// entries that are already dead — [`Candidates::retain`] over a
 /// permutation instead of the region's own order.
@@ -390,6 +407,92 @@ impl TribleSetConstraint {
             }),
             _ => panic!("invalid trible constraint state"),
         }
+    }
+
+    /// Serial confirmation over one candidate region, given the probe-group
+    /// labels already computed for the region's logical frontier.
+    ///
+    /// Keeping this as the leaf of both execution paths makes the
+    /// non-parallel build and every below-crossover region run the exact same
+    /// code as before. Candidate order remains the current unsorted order
+    /// (`SORTED_REGION_MIN` is disabled); a parallel division merely creates
+    /// two shorter regions in that same order.
+    fn confirm_grouped(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        group: &[u32],
+        cands: &mut Candidates<'_>,
+    ) {
+        let entries = cands.len();
+        // The tags are read after the region turns mutable, so take a
+        // copy of them rather than holding a borrow across the kills.
+        let parents: SmallVec<[u32; 64]> = SmallVec::from_slice(cands.parents());
+
+        let mut order: SmallVec<[u32; 64]> = (0..entries as u32).collect();
+        if entries >= SORTED_REGION_MIN {
+            let values = cands.values();
+            order.sort_unstable_by(|&a, &b| {
+                group[parents[a as usize] as usize]
+                    .cmp(&group[parents[b as usize] as usize])
+                    .then_with(|| values[a as usize].cmp(&values[b as usize]))
+                    .then(a.cmp(&b))
+            });
+        }
+
+        let mut run_start = 0;
+        while run_start < entries {
+            let lead = parents[order[run_start] as usize];
+            let label = group[lead as usize];
+            let mut run_end = run_start + 1;
+            while run_end < entries && group[parents[order[run_end] as usize] as usize] == label {
+                run_end += 1;
+            }
+            let binding = frontier.row(lead as usize);
+            self.confirm_at(variable, &binding, cands, &order[run_start..run_end]);
+            run_start = run_end;
+        }
+    }
+
+    /// Confirms one logical region with nested Rayon work only inside the
+    /// CPU leaf. The split consumes `Candidates`, so Rust itself proves that
+    /// the two closures own disjoint packed liveness words.
+    #[cfg(feature = "parallel")]
+    fn confirm_parallel(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        group: &[u32],
+        cands: Candidates<'_>,
+    ) {
+        if cands.len() < PARALLEL_CONFIRM_MIN || rayon::current_num_threads() == 1 {
+            let mut cands = cands;
+            self.confirm_grouped(variable, frontier, group, &mut cands);
+            return;
+        }
+
+        // Choose the packed-word boundary nearest the region midpoint. At
+        // this crossover the rounded division is necessarily interior; keep
+        // the check explicit so the ownership law remains local if the
+        // crossover or liveness geometry ever changes.
+        let bit_offset = cands.bit_offset();
+        let midpoint = bit_offset + cands.len() / 2;
+        let boundary =
+            midpoint / crate::query::LIVENESS_WORD_BITS * crate::query::LIVENESS_WORD_BITS;
+        let mid = boundary.saturating_sub(bit_offset);
+        if mid == 0 || mid >= cands.len() {
+            let mut cands = cands;
+            self.confirm_grouped(variable, frontier, group, &mut cands);
+            return;
+        }
+
+        let (left, right) = cands.split_at_word_boundary(mid);
+        #[cfg(test)]
+        PARALLEL_CONFIRM_SPLITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        rayon::join(
+            || self.confirm_parallel(variable, frontier, group, left),
+            || self.confirm_parallel(variable, frontier, group, right),
+        );
     }
 
     fn propose_row(&self, variable: VariableId, binding: &Binding, proposals: &mut ProposalBuffer) {
@@ -889,32 +992,17 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
             return;
         }
         let (group, _) = self.probe_groups(frontier);
-        // The tags are read after the region turns mutable, so take a
-        // copy of them rather than holding a borrow across the kills.
-        let parents: SmallVec<[u32; 64]> = SmallVec::from_slice(cands.parents());
-
-        let mut order: SmallVec<[u32; 64]> = (0..entries as u32).collect();
-        if entries >= SORTED_REGION_MIN {
-            let values = cands.values();
-            order.sort_unstable_by(|&a, &b| {
-                group[parents[a as usize] as usize]
-                    .cmp(&group[parents[b as usize] as usize])
-                    .then_with(|| values[a as usize].cmp(&values[b as usize]))
-                    .then(a.cmp(&b))
-            });
-        }
-
-        let mut run_start = 0;
-        while run_start < entries {
-            let lead = parents[order[run_start] as usize];
-            let label = group[lead as usize];
-            let mut run_end = run_start + 1;
-            while run_end < entries && group[parents[order[run_end] as usize] as usize] == label {
-                run_end += 1;
+        #[cfg(feature = "parallel")]
+        {
+            if frontier.parallel() {
+                self.confirm_parallel(variable, frontier, &group, cands.reborrow());
+            } else {
+                self.confirm_grouped(variable, frontier, &group, cands);
             }
-            let binding = frontier.row(lead as usize);
-            self.confirm_at(variable, &binding, cands, &order[run_start..run_end]);
-            run_start = run_end;
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            self.confirm_grouped(variable, frontier, &group, cands);
         }
     }
 
@@ -946,6 +1034,11 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "parallel")]
+    use std::collections::BTreeSet;
+
+    #[cfg(feature = "parallel")]
+    use crate::and;
     use crate::find;
     use crate::id::rngid;
     use crate::inline::encodings::UnknownInline;
@@ -954,6 +1047,129 @@ mod tests {
     use crate::query::Variable;
     use crate::trible::Trible;
     use crate::trible::TribleSet;
+
+    #[cfg(feature = "parallel")]
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    #[cfg(feature = "parallel")]
+    fn raw_value(i: u64) -> Inline<UnknownInline> {
+        let mut raw = [0u8; 32];
+        raw[24..].copy_from_slice(&i.to_be_bytes());
+        Inline::new(raw)
+    }
+
+    #[cfg(feature = "parallel")]
+    fn id_inline(id: &[u8; 16]) -> Inline<crate::inline::encodings::genid::GenId> {
+        let mut raw = [0u8; 32];
+        raw[16..].copy_from_slice(id);
+        Inline::new(raw)
+    }
+
+    #[cfg(feature = "parallel")]
+    fn row_digest(rows: &[(Inline<UnknownInline>,)]) -> blake3::Hash {
+        let mut hasher = blake3::Hasher::new();
+        for (value,) in rows {
+            hasher.update(&value.raw);
+        }
+        hasher.finalize()
+    }
+
+    /// Exercises the leaf-local split through the public query path. The
+    /// smaller relation proposes 8192 values; the larger relation confirms
+    /// them and retains exactly the even half. Sequential iteration is the
+    /// control, parallel iteration must produce the identical ordered bag
+    /// after normalization, and early cancellation may return any unique
+    /// subset of that bag.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_confirm_preserves_bag_set_digest_and_cancellation() {
+        const PROPOSALS: u64 = 8192;
+        let entity = rngid();
+        let attribute = rngid();
+        let entity_inline = id_inline(&entity);
+        let attribute_inline = id_inline(&attribute);
+
+        let mut proposer = TribleSet::new();
+        for i in 0..PROPOSALS {
+            proposer.insert(&Trible::new(&entity, &attribute, &raw_value(i)));
+        }
+
+        let mut confirmer = TribleSet::new();
+        for i in (0..PROPOSALS).step_by(2) {
+            confirmer.insert(&Trible::new(&entity, &attribute, &raw_value(i)));
+        }
+        // Keep this source's estimate above the proposer's while adding no
+        // further intersection results.
+        for i in PROPOSALS * 2..PROPOSALS * 3 {
+            confirmer.insert(&Trible::new(&entity, &attribute, &raw_value(i)));
+        }
+
+        let mut expected: Vec<_> = (0..PROPOSALS).step_by(2).map(|i| (raw_value(i),)).collect();
+        expected.sort_unstable();
+
+        let mut sequential: Vec<_> = find! {
+            (value: Inline<UnknownInline>),
+            and!(
+                proposer.pattern(entity_inline, attribute_inline, value),
+                confirmer.pattern(entity_inline, attribute_inline, value)
+            )
+        }
+        .collect();
+        sequential.sort_unstable();
+        assert_eq!(sequential, expected);
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let splits_before =
+            super::PARALLEL_CONFIRM_SPLITS.load(std::sync::atomic::Ordering::Relaxed);
+        let mut parallel: Vec<_> = pool.install(|| {
+            find! {
+                (value: Inline<UnknownInline>),
+                and!(
+                    proposer.pattern(entity_inline, attribute_inline, value),
+                    confirmer.pattern(entity_inline, attribute_inline, value)
+                )
+            }
+            .into_par_iter()
+            .collect()
+        });
+        assert!(
+            super::PARALLEL_CONFIRM_SPLITS.load(std::sync::atomic::Ordering::Relaxed)
+                > splits_before,
+            "fixture did not cross the leaf-local parallel-confirm boundary"
+        );
+        parallel.sort_unstable();
+        assert_eq!(parallel, sequential, "parallel execution changed the bag");
+        assert_eq!(row_digest(&parallel), row_digest(&sequential));
+        assert_eq!(
+            parallel.iter().copied().collect::<BTreeSet<_>>(),
+            sequential.iter().copied().collect::<BTreeSet<_>>()
+        );
+
+        let partial: Vec<_> = pool.install(|| {
+            find! {
+                (value: Inline<UnknownInline>),
+                and!(
+                    proposer.pattern(entity_inline, attribute_inline, value),
+                    confirmer.pattern(entity_inline, attribute_inline, value)
+                )
+            }
+            .into_par_iter()
+            .take_any(17)
+            .collect()
+        });
+        assert_eq!(partial.len(), 17);
+        let expected_set: BTreeSet<_> = expected.iter().copied().collect();
+        let partial_set: BTreeSet<_> = partial.iter().copied().collect();
+        assert_eq!(
+            partial_set.len(),
+            partial.len(),
+            "cancellation duplicated rows"
+        );
+        assert!(partial_set.is_subset(&expected_set));
+    }
 
     #[test]
     fn constant() {
