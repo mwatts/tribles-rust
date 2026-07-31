@@ -359,7 +359,7 @@ impl<'a> Binding<'a> {
     /// unbound — resolved through `variable`'s level buffer.
     pub fn get(&self, variable: VariableId) -> Option<&'a RawInline> {
         if self.bound.is_set(variable) {
-            Some(&self.levels[variable].buffer[self.indexes[variable] as usize])
+            Some(&self.levels[variable].buffer()[self.indexes[variable] as usize])
         } else {
             None
         }
@@ -563,8 +563,13 @@ impl BindingStore {
     /// of their own choosing.
     pub fn bind(&mut self, variable: VariableId, value: &RawInline) {
         let level = &mut self.levels[variable];
-        let index = level.buffer.len();
-        level.buffer.push(*value);
+        let buffer = Arc::make_mut(
+            level
+                .buffer
+                .get_or_insert_with(|| Arc::new(ProposalBuffer::new())),
+        );
+        let index = buffer.len();
+        buffer.push(*value);
         self.indexes[variable] = index as u32;
         self.bound.set(variable);
     }
@@ -596,6 +601,12 @@ impl BindingStore {
     /// its variable is bound, so "a bound variable's buffer is stable for
     /// the lifetime of its binding" holds unconditionally — the
     /// `debug_assert` below is that invariant.
+    ///
+    /// A uniquely owned buffer is cleared in place so ordinary backtracking
+    /// retains its capacity. If a rayon sibling shares the published buffer,
+    /// refill replaces this branch's handle with a fresh empty buffer before
+    /// calling `propose`; cloning and then clearing the old contents would be
+    /// both slower and semantically unnecessary.
     pub(crate) fn refill(
         &mut self,
         variable: VariableId,
@@ -609,19 +620,34 @@ impl BindingStore {
             "refilling a bound variable's level would strand its binding"
         );
         let mut level = std::mem::take(&mut self.levels[variable]);
-        level.buffer.clear();
+        let mut buffer = level
+            .buffer
+            .take()
+            .unwrap_or_else(|| Arc::new(ProposalBuffer::new()));
+        if Arc::get_mut(&mut buffer).is_none() {
+            // A rayon sibling still resolves indexes through the published
+            // buffer. Refill discards every old entry, so cloning it before
+            // `clear` would be pure waste: replace our handle with a fresh
+            // empty allocation and leave the sibling's snapshot untouched.
+            buffer = Arc::new(ProposalBuffer::new());
+        }
         level.pos = 0;
-        propose(
-            &Frontier {
-                bound: self.bound,
-                block,
-                stride,
-                select,
-                levels: &self.levels,
-            },
-            &mut level.buffer,
-        );
-        let proposed = level.buffer.len();
+        let proposed = {
+            let buffer = Arc::get_mut(&mut buffer).expect("sole owner after replacement");
+            buffer.clear();
+            propose(
+                &Frontier {
+                    bound: self.bound,
+                    block,
+                    stride,
+                    select,
+                    levels: &self.levels,
+                },
+                buffer,
+            );
+            buffer.len()
+        };
+        level.buffer = Some(buffer);
         self.levels[variable] = level;
         proposed
     }
@@ -675,13 +701,18 @@ impl BindingStore {
         out.clear();
         parents_out.clear();
         let level = &mut self.levels[variable];
+        let buffer = level
+            .buffer
+            .as_deref()
+            .expect("an active level must have a proposal buffer");
+        let pos = &mut level.pos;
         let mut rows = 0;
         while rows < width {
-            let Some(i) = level.buffer.next_live(level.pos) else {
+            let Some(i) = buffer.next_live(*pos) else {
                 break;
             };
-            level.pos = i + 1;
-            let parent = parent_select[level.buffer.parent_of(i) as usize] as usize;
+            *pos = i + 1;
+            let parent = parent_select[buffer.parent_of(i) as usize] as usize;
             out.extend_from_slice(&parent_block[parent * stride..(parent + 1) * stride]);
             let base = out.len() - stride;
             out[base + variable] = i as u32;
@@ -713,13 +744,18 @@ impl BindingStore {
         drawn_out.clear();
         parents_out.clear();
         let level = &mut self.levels[variable];
+        let buffer = level
+            .buffer
+            .as_deref()
+            .expect("an active level must have a proposal buffer");
+        let pos = &mut level.pos;
         while drawn_out.len() < width {
-            let Some(i) = level.buffer.next_live(level.pos) else {
+            let Some(i) = buffer.next_live(*pos) else {
                 break;
             };
-            level.pos = i + 1;
+            *pos = i + 1;
             drawn_out.push(i as u32);
-            parents_out.push(parent_select[level.buffer.parent_of(i) as usize]);
+            parents_out.push(parent_select[buffer.parent_of(i) as usize]);
         }
         self.bound.set_value(variable, !drawn_out.is_empty());
     }
@@ -734,7 +770,7 @@ impl BindingStore {
     /// conditions for an in-place descent already hold.
     pub(crate) fn spent(&self, variable: VariableId) -> bool {
         let level = &self.levels[variable];
-        level.buffer.next_live(level.pos).is_none()
+        level.buffer().next_live(level.pos).is_none()
     }
 }
 
@@ -987,7 +1023,11 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
 /// the buffer's capacity.
 #[derive(Clone, Debug)]
 struct LevelValues {
-    buffer: ProposalBuffer,
+    /// Once proposed and confirmed, a buffer is immutable. Rayon siblings
+    /// therefore share it and keep only their consumption cursor local.
+    /// `None` is the never-used state, so an empty [`BindingStore`] needs no
+    /// heap allocation for its 128 variable slots.
+    buffer: Option<Arc<ProposalBuffer>>,
     /// Consumption position: entries before it are consumed, live entries at
     /// or after it are pending. Dead entries are skipped, never moved.
     pos: usize,
@@ -998,9 +1038,16 @@ impl LevelValues {
     /// borrow a `static` array of them.
     const fn empty() -> Self {
         LevelValues {
-            buffer: ProposalBuffer::new(),
+            buffer: None,
             pos: 0,
         }
+    }
+
+    /// The published, immutable proposals for this level.
+    fn buffer(&self) -> &ProposalBuffer {
+        self.buffer
+            .as_deref()
+            .expect("a bound or active level must have a proposal buffer")
     }
 }
 
@@ -1318,6 +1365,8 @@ where
             constraint: self.constraint.clone(),
             postprocessing: self.postprocessing.clone(),
             mode: self.mode,
+            // Consumption cursors are branch-local; immutable published
+            // proposal buffers are shared by refcount.
             bindings: self.bindings.clone(),
             influences: self.influences,
             unbound: self.unbound,
@@ -2037,9 +2086,9 @@ mod parallel {
     /// additional, no duplicated engine logic.
     ///
     /// The inner query is stored in a [`Box`] so rayon's work-stealing
-    /// `split` (which clones the producer) doesn't memcpy ~15 KB of query
-    /// state on every fork — just a Box pointer copy, with the heap alloc
-    /// paid only by the child.
+    /// `split` (which clones the producer) doesn't memcpy the query's large
+    /// fixed state on every fork — just a Box pointer copy, with the heap
+    /// allocation paid only by the child.
     pub struct QueryParIter<C, P: Fn(&Binding<'_>) -> Option<R>, R> {
         inner: Box<Query<C, P, R>>,
     }
@@ -2312,6 +2361,75 @@ mod tests {
         attributes! {
             "8143F46E812E88C4544E7094080EC523" as loves: inlineencodings::GenId;
             "D6E0F2A6E5214E1330565B4D4138E55C" as name: inlineencodings::ShortString;
+        }
+    }
+
+    mod shared_level_buffers {
+        use super::*;
+
+        fn value(byte: u8) -> RawInline {
+            let mut value = [0; 32];
+            value[31] = byte;
+            value
+        }
+
+        fn refill(store: &mut BindingStore, values: &[RawInline]) {
+            store.refill(0, &[0], &[0], 1, |frontier, proposals| {
+                assert_eq!(frontier.len(), 1);
+                proposals.open(0);
+                proposals.extend(values.iter().copied());
+            });
+        }
+
+        #[test]
+        fn clone_shares_published_buffer_but_not_consumption_cursor() {
+            let mut left = BindingStore::new();
+            refill(&mut left, &[value(1), value(2), value(3)]);
+            let right = left.clone();
+
+            assert!(Arc::ptr_eq(
+                left.levels[0].buffer.as_ref().unwrap(),
+                right.levels[0].buffer.as_ref().unwrap(),
+            ));
+
+            let mut drawn = Vec::new();
+            let mut parents = Vec::new();
+            left.draw(0, 1, &[0], &mut drawn, &mut parents);
+            assert_eq!(left.levels[0].pos, 1);
+            assert_eq!(right.levels[0].pos, 0);
+            assert_eq!(right.levels[0].buffer()[0], value(1));
+        }
+
+        #[test]
+        fn refill_replaces_a_shared_buffer_without_touching_its_sibling() {
+            let mut left = BindingStore::new();
+            refill(&mut left, &[value(1), value(2)]);
+            let right = left.clone();
+
+            refill(&mut left, &[value(9)]);
+
+            assert!(!Arc::ptr_eq(
+                left.levels[0].buffer.as_ref().unwrap(),
+                right.levels[0].buffer.as_ref().unwrap(),
+            ));
+            assert_eq!(&right.levels[0].buffer()[..], &[value(1), value(2)]);
+            assert_eq!(&left.levels[0].buffer()[..], &[value(9)]);
+        }
+
+        #[test]
+        fn refill_reuses_a_uniquely_owned_buffer() {
+            let mut store = BindingStore::new();
+            refill(&mut store, &[value(1), value(2), value(3)]);
+            let allocation = Arc::as_ptr(store.levels[0].buffer.as_ref().unwrap());
+
+            refill(&mut store, &[value(4)]);
+
+            assert_eq!(
+                Arc::as_ptr(store.levels[0].buffer.as_ref().unwrap()),
+                allocation,
+                "unique refill should retain the ProposalBuffer allocation",
+            );
+            assert_eq!(&store.levels[0].buffer()[..], &[value(4)]);
         }
     }
 
@@ -2674,7 +2792,7 @@ mod tests {
 
             let mut left = query(FANOUT);
             advance_to_three_groups(&mut left);
-            let source_len = left.bindings.levels[0].buffer.len();
+            let source_len = left.bindings.levels[0].buffer().len();
             let source_pos = left.bindings.levels[0].pos;
             let right = left.split_pending_group().expect("transfer first group");
 
@@ -2698,8 +2816,8 @@ mod tests {
             // The ancestor source was cloned intact, not bisected. Both
             // halves retain the same complete proposal region and cursor;
             // only their continuation ownership differs.
-            assert_eq!(left.bindings.levels[0].buffer.len(), source_len);
-            assert_eq!(right.bindings.levels[0].buffer.len(), source_len);
+            assert_eq!(left.bindings.levels[0].buffer().len(), source_len);
+            assert_eq!(right.bindings.levels[0].buffer().len(), source_len);
             assert_eq!(left.bindings.levels[0].pos, source_pos);
             assert_eq!(right.bindings.levels[0].pos, source_pos);
 

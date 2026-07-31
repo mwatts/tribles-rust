@@ -157,6 +157,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   candidate-buffer `split_off` machinery are gone. An indivisible 1:1 chain
   remains serial and keeps its zero-copy in-place descents rather than cloning
   useless siblings at every depth.
+- **Rayon siblings share immutable proposal buffers.** `LevelValues` now holds
+  `Option<Arc<ProposalBuffer>>` plus its branch-local consumption cursor, so a
+  query split bumps refcounts instead of deep-cloning every live variable's
+  values, parent tags, and liveness words. `None` keeps an empty 128-slot
+  `BindingStore` allocation-free. Refill reuses a uniquely owned buffer, but
+  replaces a shared buffer *before* clearing or proposing, preserving the
+  sibling snapshot without copying data that is about to be discarded.
 - **Breaking: `propose` and `confirm` operate on a frontier of bindings.** Both
   methods take a `Frontier` — the whole collection of parent bindings at one
   point of the search — instead of a single `Binding`; a single binding is a

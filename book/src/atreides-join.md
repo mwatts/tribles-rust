@@ -165,9 +165,11 @@ depth-first traversal from thrashing through unrelated values.
   and prevent runaway exploration. This is the payoff of re-estimating per
   binding rather than once per query — the popular entity and the rare one take
   different orders through the same query text.
-- The per-variable proposal buffers are reused across sibling levels, so
-  repeated proposals do not reallocate. This is especially helpful when
-  backtracking over large domains.
+- A uniquely owned per-variable proposal buffer is reused across sibling
+  levels, so ordinary backtracking does not reallocate. Rayon clones share a
+  published buffer immutably and keep independent cursors; the first clone to
+  refill that slot installs a fresh buffer rather than copying data it will
+  immediately clear.
 - Under the `parallel` feature the same state machine is the rayon producer:
   splitting transfers one whole preferred-variable group (or terminal page)
   to a fenced sibling only when the left side retains another continuation.

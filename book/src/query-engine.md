@@ -323,6 +323,11 @@ walks the same state machine and transfers a *whole frontier unit* to a sibling:
   its group cursor; the sibling is re-rooted at that frontier and fenced to the
   single group it received. Both share the immutable plan and frontier
   matrices behind `Arc`; proposal buffers are not divided.
+- A published proposal buffer is immutable, so sibling binding stores share it
+  behind `Arc` and copy only their consumption cursors. If one sibling later
+  refills that variable, it installs a fresh empty buffer before proposing;
+  the other sibling's indexes keep resolving through the old snapshot. A
+  uniquely owned buffer keeps and reuses its allocation.
 - A complete terminal page may likewise be transferred as one unit. This is
   how a one-variable query can expose parallel work without slicing its result
   frontier.
