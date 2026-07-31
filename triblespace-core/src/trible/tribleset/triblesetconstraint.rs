@@ -1029,9 +1029,10 @@ mod tests {
     /// Exercises the leaf-local split through the public query path. The
     /// smaller relation proposes 8192 values; the larger relation confirms
     /// them and retains exactly the even half. Sequential iteration is the
-    /// control, parallel iteration must produce the identical ordered bag
-    /// after normalization, and early cancellation may return any unique
-    /// subset of that bag.
+    /// control. Parallel iteration on a one-thread pool must stay on the
+    /// serial leaf, while two- and four-thread pools must cross the split
+    /// boundary and produce the identical ordered bag after normalization.
+    /// Early cancellation may return any unique subset of that bag.
     #[cfg(feature = "parallel")]
     #[test]
     fn parallel_confirm_preserves_bag_set_digest_and_cancellation() {
@@ -1070,57 +1071,83 @@ mod tests {
         sequential.sort_unstable();
         assert_eq!(sequential, expected);
 
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(4)
+        let expected_set: BTreeSet<_> = expected.iter().copied().collect();
+
+        macro_rules! collect_parallel {
+            ($pool:expr) => {
+                $pool.install(|| {
+                    find! {
+                        (value: Inline<UnknownInline>),
+                        and!(
+                            proposer.pattern(entity_inline, attribute_inline, value),
+                            confirmer.pattern(entity_inline, attribute_inline, value)
+                        )
+                    }
+                    .into_par_iter()
+                    .collect::<Vec<_>>()
+                })
+            };
+        }
+
+        let one_thread = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
             .build()
             .unwrap();
         let splits_before =
             super::PARALLEL_CONFIRM_SPLITS.load(std::sync::atomic::Ordering::Relaxed);
-        let mut parallel: Vec<_> = pool.install(|| {
-            find! {
-                (value: Inline<UnknownInline>),
-                and!(
-                    proposer.pattern(entity_inline, attribute_inline, value),
-                    confirmer.pattern(entity_inline, attribute_inline, value)
-                )
-            }
-            .into_par_iter()
-            .collect()
-        });
-        assert!(
-            super::PARALLEL_CONFIRM_SPLITS.load(std::sync::atomic::Ordering::Relaxed)
-                > splits_before,
-            "fixture did not cross the leaf-local parallel-confirm boundary"
-        );
-        parallel.sort_unstable();
-        assert_eq!(parallel, sequential, "parallel execution changed the bag");
-        assert_eq!(row_digest(&parallel), row_digest(&sequential));
+        let mut one_thread_rows = collect_parallel!(&one_thread);
         assert_eq!(
-            parallel.iter().copied().collect::<BTreeSet<_>>(),
-            sequential.iter().copied().collect::<BTreeSet<_>>()
+            super::PARALLEL_CONFIRM_SPLITS.load(std::sync::atomic::Ordering::Relaxed),
+            splits_before,
+            "a one-thread pool should use the serial confirm leaf"
         );
+        one_thread_rows.sort_unstable();
+        assert_eq!(one_thread_rows, sequential);
 
-        let partial: Vec<_> = pool.install(|| {
-            find! {
-                (value: Inline<UnknownInline>),
-                and!(
-                    proposer.pattern(entity_inline, attribute_inline, value),
-                    confirmer.pattern(entity_inline, attribute_inline, value)
-                )
+        for threads in [2, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let splits_before =
+                super::PARALLEL_CONFIRM_SPLITS.load(std::sync::atomic::Ordering::Relaxed);
+            let mut parallel = collect_parallel!(&pool);
+            assert!(
+                super::PARALLEL_CONFIRM_SPLITS.load(std::sync::atomic::Ordering::Relaxed)
+                    > splits_before,
+                "fixture did not split on a {threads}-thread pool"
+            );
+            parallel.sort_unstable();
+            assert_eq!(parallel, sequential, "parallel execution changed the bag");
+            assert_eq!(row_digest(&parallel), row_digest(&sequential));
+            assert_eq!(
+                parallel.iter().copied().collect::<BTreeSet<_>>(),
+                expected_set
+            );
+
+            if threads == 4 {
+                let partial: Vec<_> = pool.install(|| {
+                    find! {
+                        (value: Inline<UnknownInline>),
+                        and!(
+                            proposer.pattern(entity_inline, attribute_inline, value),
+                            confirmer.pattern(entity_inline, attribute_inline, value)
+                        )
+                    }
+                    .into_par_iter()
+                    .take_any(17)
+                    .collect()
+                });
+                assert_eq!(partial.len(), 17);
+                let partial_set: BTreeSet<_> = partial.iter().copied().collect();
+                assert_eq!(
+                    partial_set.len(),
+                    partial.len(),
+                    "cancellation duplicated rows"
+                );
+                assert!(partial_set.is_subset(&expected_set));
             }
-            .into_par_iter()
-            .take_any(17)
-            .collect()
-        });
-        assert_eq!(partial.len(), 17);
-        let expected_set: BTreeSet<_> = expected.iter().copied().collect();
-        let partial_set: BTreeSet<_> = partial.iter().copied().collect();
-        assert_eq!(
-            partial_set.len(),
-            partial.len(),
-            "cancellation duplicated rows"
-        );
-        assert!(partial_set.is_subset(&expected_set));
+        }
     }
 
     #[test]
