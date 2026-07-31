@@ -65,7 +65,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The resulting `Candidates` regions own disjoint mutable words, so workers
   kill in place without atomics, scratch verdicts, or a merge pass. Proposal
   batches and descendant frontiers remain whole, and WGPU still decides its
-  route from the complete candidate region before any CPU fallback.
+  route from the complete candidate region before any CPU fallback. A frozen
+  threshold sweep selected a 1,024-candidate CPU crossover: against the 8,192
+  baseline it cut the dense common-plan full drain by 25% and the causal
+  parent-batch full drain by 5%, without a repeatable regression at demands
+  one through eight.
 - **TribleSet confirmation no longer builds a disabled candidate-sort
   permutation.** The value-order region sort was permanently set to
   `usize::MAX` after losing 33--46% on the fixtures that exercised it, yet its
