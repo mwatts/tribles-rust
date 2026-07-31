@@ -34,8 +34,8 @@ fn clone_after_iteration_does_not_require_clone_output() {
 }
 
 /// A started query has already published progress. Ordinary Rayon conversion
-/// drains its residual state as one exact leaf instead of restarting or
-/// repartitioning it.
+/// continues that exact residual state instead of restarting or replaying its
+/// emitted prefix.
 #[cfg(feature = "parallel")]
 #[test]
 fn partially_consumed_query_into_par_iter_keeps_exact_remainder() {
@@ -111,8 +111,8 @@ fn fresh_parallel_query_handles_a_deep_late_branch() {
         .build()
         .unwrap();
 
-    // Construct outside the custom pool: shard budgets must be derived when
-    // the iterator is consumed, not from whichever pool happened to create it.
+    // Construct outside the custom pool: a producer must remain independent
+    // of whichever pool happened to create it.
     let one_iter = query.clone().into_par_iter();
     let mut one_actual = one_worker.install(|| one_iter.collect::<Vec<_>>());
 

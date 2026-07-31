@@ -386,51 +386,6 @@ impl ProposalBuffer {
         }
     }
 
-    /// Splits off and returns the tail starting at `at` (values, parent
-    /// tags and liveness together).
-    ///
-    /// # Cost
-    ///
-    /// Values and tags split with a `Vec::split_off` each. Liveness cannot:
-    /// the tail has to be re-based to bit 0, so unless `at` is a multiple of
-    /// 32 every word is shifted right by `at % 32` with the low bits of the
-    /// following word pulled into its top. O(words) — 1/32 of the words a
-    /// word-per-candidate layout would move — but a read-modify-write per
-    /// word instead of a `memcpy`.
-    pub fn split_off(&mut self, at: usize) -> ProposalBuffer {
-        let entries = self.entries.split_off(at);
-        let parents = self.parents.split_off(at);
-        let n = entries.len();
-        let shift = at % BITS;
-        let first = at / BITS;
-        let mut live = vec![0u32; words_for(n)];
-        for (k, out) in live.iter_mut().enumerate() {
-            // `first + k` is always in range: floor(at/32) + ceil(n/32)
-            // <= ceil((at + n)/32) == self.live.len().
-            let low = self.live[first + k] >> shift;
-            let high = if shift == 0 {
-                // Shifting a u32 by 32 is not allowed; word-aligned splits
-                // have nothing to pull down anyway.
-                0
-            } else {
-                // `BITS - shift` is 1..=31 here, so the shift is legal.
-                // A missing successor word means there are no further
-                // entries, so the bits it would contribute are zero.
-                self.live.get(first + k + 1).copied().unwrap_or(0) << (BITS - shift)
-            };
-            *out = low | high;
-        }
-        // Drop the tail's words from the head and clear the tail's bits out
-        // of the head's now-last partial word (tail-zero invariant).
-        truncate_live(&mut self.live, at);
-        ProposalBuffer {
-            entries,
-            live,
-            parents,
-            parent: self.parent,
-        }
-    }
-
     /// The **live** entries of the freshly-proposed region `[base..]` as
     /// `(parent tag, value)` pairs — the form
     /// [`rewrite_region`](ProposalBuffer::rewrite_region) takes back.
@@ -805,9 +760,9 @@ impl<'a> Candidates<'a> {
 // word-per-candidate baseline still existed alongside this one, which is why
 // the cases concentrate on exactly what packing makes hard: regions that start
 // mid-word (so their first word is shared with a neighbour), per-parent runs
-// that start mid-word inside such a region, `split_off` / `retain_region` /
-// `rewrite_region` at non-word-aligned indices (so words have to be shifted or
-// masked), and anything that hands liveness words in or out.
+// that start mid-word inside such a region, `retain_region` / `rewrite_region`
+// at non-word-aligned indices (so words have to be shifted or masked), and
+// anything that hands liveness words in or out.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -1088,82 +1043,6 @@ mod tests {
         }
         let expected: Vec<usize> = (0..5).chain((5..70).filter(|i| (i - 5) % 6 == 0)).collect();
         assert_eq!(live_indices(&b), expected);
-    }
-
-    #[test]
-    fn split_off_rebases_the_tail_and_trims_the_head() {
-        let mut b = filled(70);
-        {
-            let mut r = b.region(0);
-            r.kill(0);
-            r.kill(4);
-            r.kill(37);
-            r.kill(69);
-        }
-        let tail = b.split_off(5);
-        assert_eq!(b.len(), 5);
-        assert_eq!(tail.len(), 65);
-        // The head must not keep the tail's liveness bits in its last word.
-        assert_eq!(live_indices(&b), vec![1, 2, 3]);
-        assert_eq!(b.count_live(0), 3);
-        assert_eq!(tail[0], v(5));
-        assert_eq!(tail[64], v(69));
-        assert!(!tail.is_live(32));
-        assert!(!tail.is_live(64));
-        assert_eq!(tail.count_live(0), 63);
-    }
-
-    #[test]
-    fn split_off_at_a_word_boundary() {
-        let mut b = filled(70);
-        {
-            let mut r = b.region(0);
-            r.kill(32);
-        }
-        let tail = b.split_off(32);
-        assert_eq!(b.len(), 32);
-        assert_eq!(b.count_live(0), 32);
-        assert_eq!(tail.len(), 38);
-        assert!(!tail.is_live(0));
-        assert_eq!(tail.count_live(0), 37);
-    }
-
-    #[test]
-    fn split_off_at_zero_and_at_the_end() {
-        let mut b = filled(70);
-        let all = b.split_off(0);
-        assert_eq!(b.len(), 0);
-        assert_eq!(b.count_live(0), 0);
-        assert_eq!(all.len(), 70);
-        assert_eq!(all.count_live(0), 70);
-
-        let mut c = filled(70);
-        let empty = c.split_off(70);
-        assert_eq!(empty.len(), 0);
-        assert_eq!(empty.count_live(0), 0);
-        assert_eq!(c.count_live(0), 70);
-    }
-
-    /// `split_off` carries the parent tags with the values, re-based to the
-    /// tail's own indices.
-    #[test]
-    fn split_off_carries_the_parent_tags() {
-        let mut b = ProposalBuffer::new();
-        for row in 0..5u32 {
-            b.open(row);
-            for i in 0..14 {
-                b.push(v(row as usize * 100 + i));
-            }
-        }
-        let tail = b.split_off(37);
-        assert_eq!(b.len(), 37);
-        assert_eq!(tail.len(), 33);
-        for i in 0..37 {
-            assert_eq!(b.parent_of(i), (i / 14) as u32);
-        }
-        for i in 0..33 {
-            assert_eq!(tail.parent_of(i), ((i + 37) / 14) as u32);
-        }
     }
 
     #[test]

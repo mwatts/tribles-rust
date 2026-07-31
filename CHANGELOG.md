@@ -147,12 +147,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compressed-trie shape invariant. This adds one thin eight-byte Arc to PATCH
   while restoring the ownership-neutral 48-byte Branch header (sixteen bytes
   smaller than the per-Branch owner design).
-- **Parallel query splits own exactly one source suffix.** A rayon sibling is
-  now re-rooted at the current parent frontier and fenced when its source is
-  bisected; later preferred-variable groups and ancestor continuations remain
-  solely with the left half. This makes recursive splitting safe by
-  construction instead of depending on the splitter having happened to drain
-  every surrounding continuation.
+- **Parallel query splits transfer whole frontier units.** Rayon now steals one
+  complete preferred-variable group, or one complete terminal page, instead of
+  bisecting a proposal buffer. Geometric pages and accelerator-sized batches
+  stay intact. The sibling is re-rooted and fenced to its unit; a split is
+  admitted only when the left producer retains a later group or ancestor
+  candidate continuation. Every successful split therefore removes work from
+  the left and cannot rediscover it, so the old `num_threads²` split budget and
+  candidate-buffer `split_off` machinery are gone. An indivisible 1:1 chain
+  remains serial and keeps its zero-copy in-place descents rather than cloning
+  useless siblings at every depth.
 - **Breaking: `propose` and `confirm` operate on a frontier of bindings.** Both
   methods take a `Frontier` — the whole collection of parent bindings at one
   point of the search — instead of a single `Binding`; a single binding is a

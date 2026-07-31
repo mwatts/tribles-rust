@@ -579,13 +579,6 @@ impl BindingStore {
         self.bound
     }
 
-    /// Live candidates still pending at `variable`'s level.
-    #[cfg(feature = "parallel")]
-    fn pending(&self, variable: VariableId) -> usize {
-        let level = &self.levels[variable];
-        level.buffer.count_live(level.pos)
-    }
-
     /// Clears `variable`'s level and refills it by proposing over the
     /// frontier `block`/`select`/`stride` describe.
     ///
@@ -742,39 +735,6 @@ impl BindingStore {
     pub(crate) fn spent(&self, variable: VariableId) -> bool {
         let level = &self.levels[variable];
         level.buffer.next_live(level.pos).is_none()
-    }
-
-    /// Bisects `variable`'s materialized region, returning the tail as a
-    /// fresh level for the right half of a parallel split.
-    ///
-    /// The left half keeps entries `[0..mid)`, and every consumed entry
-    /// (and hence every index any binding holds for this level) sits
-    /// below `pos <= mid` — so the left half's indexes stay valid. The
-    /// returned tail re-indexes from zero, which is why the right half
-    /// must [`unset`](BindingStore::unset) `variable` when it installs
-    /// it. The parent tags travel with the values and still address the
-    /// same fenced parent frontier in the right half.
-    #[cfg(feature = "parallel")]
-    fn bisect(&mut self, variable: VariableId) -> LevelValues {
-        let level = &mut self.levels[variable];
-        let pending_start = level
-            .buffer
-            .next_live(level.pos)
-            .expect("bisect requires pending candidates");
-        let mid = pending_start + (level.buffer.len() - pending_start) / 2;
-        LevelValues {
-            buffer: level.buffer.split_off(mid),
-            pos: 0,
-        }
-    }
-
-    /// Installs `level` as `variable`'s level and unbinds `variable`:
-    /// the incoming buffer has its own coordinates, so any index a
-    /// frontier row still holds for it is meaningless.
-    #[cfg(feature = "parallel")]
-    fn install(&mut self, variable: VariableId, level: LevelValues) {
-        self.levels[variable] = level;
-        self.bound.unset(variable);
     }
 }
 
@@ -1230,6 +1190,14 @@ struct Depth {
     groups: Arc<Vec<(VariableId, usize)>>,
     /// Next group to expand.
     group: usize,
+    /// Exclusive end of the group range this query owns.
+    ///
+    /// Normally this is `groups.len()`. A rayon sibling is fenced to one
+    /// shared-plan group by setting `group_limit = group + 1`; the original
+    /// advances `group` and retains everything after it. Keeping ownership as
+    /// a cursor interval lets both halves share `order` and `groups` without
+    /// copying or truncating either plan.
+    group_limit: usize,
     /// Emission cursor, used only when every variable is bound.
     emit: usize,
 }
@@ -1358,9 +1326,9 @@ where
             stack: self.stack.clone(),
             // Only the live prefix of the frontier stack matters; the
             // retired tail is scratch. Each `Depth`'s matrices sit behind
-            // `Arc`, so a split copies refcounts, not megabytes — the
-            // copy-on-write lands on whichever half rewrites a frontier
-            // first.
+            // `Arc`, so transferring a planned group copies refcounts, not
+            // megabytes — the copy-on-write lands on whichever owner
+            // rewrites a frontier first.
             depths: self.depths[..=self.depth].to_vec(),
             depth: self.depth,
             choice: Vec::new(),
@@ -1377,36 +1345,99 @@ where
     C: Clone,
     P: Fn(&Binding<'_>) -> Option<R> + Clone,
 {
-    /// Bisects the pending candidates of the current source, leaving the
-    /// prefix in `self` and returning the suffix as a fenced sibling query.
+    /// Whether retiring the current frontier would expose work still owned
+    /// by this query.
     ///
-    /// Only the left query owns the continuation after this source: later
-    /// groups of the parent frontier and every ancestor sibling. The right
-    /// query is re-rooted at the current parent frontier and ends when its
-    /// source suffix is exhausted. This makes split ownership structural
-    /// instead of relying on the splitter having drained every ancestor.
-    ///
-    /// `BindingStore::clone` deliberately deep-copies its level buffers;
-    /// descendants in either half may refill an ancestor variable without
-    /// invalidating the other half's row indexes. Frontier matrices remain
-    /// cheap to share through their `Arc`s.
-    fn split_current_source(&mut self, variable: VariableId) -> Self {
-        let right_level = self.bindings.bisect(variable);
-        let mut right = self.clone();
-        right.bindings.install(variable, right_level);
+    /// A split is useful only when the left producer has a distinct future
+    /// after transferring the right producer's frontier unit. That future
+    /// can be a later group in an ancestor frontier, or candidates from the
+    /// ancestor's already-proposed level that its geometric cursor has not
+    /// consumed yet. `proposed > consumed` is intentionally conservative:
+    /// the unseen suffix may contain only dead candidates, but discovering
+    /// that is precisely the left continuation's work.
+    fn has_ancestor_continuation(&self) -> bool {
+        (0..self.depth).any(|depth| {
+            let frontier = &self.depths[depth];
+            frontier.group < frontier.group_limit
+                || self
+                    .stack
+                    .get(depth)
+                    .is_some_and(|level| level.proposed > self.bindings.consumed(level.variable))
+        })
+    }
 
-        let depth = right.depth;
+    /// Transfers the next *whole planned group* to a fenced sibling query.
+    ///
+    /// A group is all rows of one frontier that chose the same next
+    /// variable under the same ordered binding history. The sibling owns
+    /// that group in its entirety; `self` advances past it and retains the
+    /// continuation — later groups at this depth and, once they are spent,
+    /// the ancestor source that can draw the next geometric page. No
+    /// proposal buffer is bisected, so a source's batch remains intact.
+    ///
+    /// The sibling is re-rooted at the group's frontier and fenced there:
+    /// ancestor `Level`s are discarded, while their `LevelValues` remain in
+    /// the cloned [`BindingStore`] because the group's rows resolve bound
+    /// indexes through them. Once the owned group is exhausted, the sibling
+    /// ends instead of replaying an ancestor continuation still owned by
+    /// `self`.
+    ///
+    /// A sole group at the root cannot be transferred: neither half would
+    /// retain a distinct continuation, and repeated rayon splitting would
+    /// merely hand the same indivisible work back and forth. Entering it
+    /// serially may create child groups/pages that *do* have a continuation
+    /// and can then be transferred safely.
+    fn split_pending_group(&mut self) -> Option<Self> {
+        debug_assert_eq!(self.mode, Search::NextGroup);
+
+        let depth = self.depth;
+        let current = self.depths[depth].group;
+        let group_limit = self.depths[depth].group_limit;
+        let later_group = current + 1 < group_limit;
+        if current >= group_limit || !(later_group || self.has_ancestor_continuation()) {
+            return None;
+        }
+
+        let mut right = self.clone();
+        self.depths[depth].group += 1;
+
         drop(right.stack.drain(..depth));
         drop(right.depths.drain(..depth));
         right.depth = 0;
 
-        debug_assert_eq!(right.stack[0].variable, variable);
         let root = &mut right.depths[0];
-        let group = root.group;
-        debug_assert!(group > 0 && group <= root.groups.len());
-        debug_assert_eq!(root.groups[group - 1].0, variable);
-        Arc::make_mut(&mut root.groups).truncate(group);
-        right
+        root.group_limit = root.group + 1;
+        Some(right)
+    }
+
+    /// Transfers the un-emitted remainder of a complete frontier page to a
+    /// fenced sibling, leaving `self` at the parent source continuation.
+    ///
+    /// Terminal pages have no `NextGroup` state — planning moves them
+    /// straight to [`Search::Emit`] — but they are still whole products of a
+    /// planned group. Treating the page as one indivisible unit is what lets
+    /// single-variable queries participate in rayon without slicing their
+    /// proposal buffers or their result frontiers. The sibling preserves the
+    /// current emission cursor, so the operation is correct even if a future
+    /// caller exposes splitting after partial consumption.
+    fn split_terminal_frontier(&mut self) -> Option<Self> {
+        debug_assert_eq!(self.mode, Search::Emit);
+        let depth = self.depth;
+        if depth == 0
+            || self.depths[depth].emit >= self.depths[depth].rows
+            || !self.has_ancestor_continuation()
+        {
+            return None;
+        }
+
+        let mut right = self.clone();
+        self.depth -= 1;
+        self.mode = Search::NextChunk;
+
+        drop(right.stack.drain(..depth));
+        drop(right.depths.drain(..depth));
+        right.depth = 0;
+        Some(right)
     }
 }
 
@@ -1462,6 +1493,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             order: Arc::new(vec![0u32]),
             groups: Arc::new(Vec::new()),
             group: 0,
+            group_limit: 0,
             emit: 0,
         };
 
@@ -1599,6 +1631,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
             }
         }
         depth.group = 0;
+        depth.group_limit = depth.groups.len();
 
         self.stats.expansions.fetch_add(1, Ordering::Relaxed);
         self.stats.rows.fetch_add(rows as u64, Ordering::Relaxed);
@@ -1615,7 +1648,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
     /// groups are exhausted the frontier itself is retired.
     fn next_group(&mut self) {
         let depth = &self.depths[self.depth];
-        if depth.group >= depth.groups.len() {
+        if depth.group >= depth.group_limit {
             if self.depth == 0 {
                 self.mode = Search::Done;
             } else {
@@ -1711,10 +1744,10 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         // exactly as many candidates as there are parent rows, and a chunk
         // wide enough to take them all. Both are known before drawing, and
         // both are `O(1)`.
-        let source_rows = self.depths[parent].rows;
+        let source_rows = range.len();
         let speculate = level.proposed == source_rows
             && level.width >= source_rows
-            && self.depths[parent].group >= self.depths[parent].groups.len();
+            && self.depths[parent].group >= self.depths[parent].group_limit;
 
         let rows = if speculate {
             self.bindings.draw(
@@ -1841,6 +1874,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         }
         child.rows = rows;
         child.group = 0;
+        child.group_limit = 0;
         child.emit = 0;
 
         let order = Arc::make_mut(&mut child.order);
@@ -1885,7 +1919,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
 ///   child frontier, or retire the group when they run out.
 /// - `Emit` — every variable is bound; stream the frontier's rows out.
 /// - `Done` — the search is finished.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum Search {
     Plan,
     NextGroup,
@@ -1962,27 +1996,23 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> fmt::Debug for 
 //
 // Usage: `find!(...).into_par_iter().map(...).collect::<Vec<_>>()`.
 //
-// The producer's `split` bisects a *frontier's source*: the pending
-// candidates of the top level — the entries that will become the next
-// chunks of the child frontier. While the top has a single pending
-// candidate the producer descends through it; with two or more it cuts the
-// pending region in half and hands the tail to a new sub-query. That sibling
-// is fenced at the current source: it keeps the current parent frontier and
-// source level, but not later groups or ancestor continuations. The left half
-// is their sole owner, so a sibling cannot replay work when it unwinds.
+// The producer's `split` transfers one *whole planned frontier group* to a
+// sibling. A group is the rows sharing both an ordered variable-choice prefix
+// and their preferred next variable. The original producer skips that group
+// and retains the source continuation, so it can draw the next geometric page
+// while the sibling evaluates the current one. The sibling is re-rooted and
+// fenced at the group: it cannot replay later groups or ancestor work.
 //
-// Why the indexes stay valid across the cut: a candidate's parent tag names
-// a row of the *parent frontier*, which the right half keeps verbatim. Its
-// matrices are shared `Arc`s, so the clone is refcounts, not copies; level
-// buffers are deep-cloned because bound row indexes must remain valid if the
-// other half refills a level. The left half keeps entries `[0..mid)` and every
-// consumed entry sits below `pos <= mid`, so its own indexes still resolve to
-// the same values.
-//
-// Splitting narrows the frontier — the two halves each expand a slice of
-// what one would have expanded together. That is the deliberate trade:
-// batch width buys per-level dispatch size, work-stealing buys core
-// utilisation, and rayon only asks for a split under stealing pressure.
+// No proposal buffer is bisected. This is the load-bearing difference from
+// candidate sharding: every owned group reaches `propose`/`confirm` at its
+// natural width, preserving geometric widening and accelerator-sized batches.
+// A heavy sole root group is honestly serial until executing it produces a
+// child group with a source continuation; the parallel path does not invent a
+// destructive intra-group split merely to keep rayon busy.
+// Every successful split advances the original owner's group/page cursor and
+// fences that unit out of the sibling's future, so ownership is a strict
+// progress measure. Rayon's pressure splitter needs no engine-specific split
+// budget.
 //
 // `fold_with` is the terminal leaf: it just drives the existing sequential
 // `Iterator::next()` and feeds results into the folder. No duplicated
@@ -2010,17 +2040,8 @@ mod parallel {
     /// `split` (which clones the producer) doesn't memcpy ~15 KB of query
     /// state on every fork — just a Box pointer copy, with the heap alloc
     /// paid only by the child.
-    ///
-    /// `split_budget` bounds the number of splits this sub-producer will
-    /// perform. Rayon's default `Splitter` *resets* its budget on every
-    /// stolen task, so on a busy thread pool the split tree could grow
-    /// unboundedly deep — the Query always has more proposals to bisect.
-    /// A bounded per-producer budget (`num_threads²`) caps the split tree
-    /// at ~N² leaves — enough for each worker to have roughly N chunks to
-    /// rebalance via stealing — regardless of stealing pressure.
     pub struct QueryParIter<C, P: Fn(&Binding<'_>) -> Option<R>, R> {
         inner: Box<Query<C, P, R>>,
-        split_budget: usize,
     }
 
     impl<'a, C, P, R> IntoParallelIterator for Query<C, P, R>
@@ -2033,16 +2054,8 @@ mod parallel {
         type Iter = QueryParIter<C, P, R>;
 
         fn into_par_iter(self) -> Self::Iter {
-            // num_threads² chunks: intuition is "every worker has one spare
-            // chunk for every other worker," giving N²/N = N chunks apiece
-            // for rebalancing. log₂(N²) = 2·log₂(N), so depth stays modest
-            // (8 on a 16-thread box, 10 on a 32-thread) — well below any
-            // stack concern.
-            let n = rayon::current_num_threads();
-            let split_budget = n.saturating_mul(n).max(2);
             QueryParIter {
                 inner: Box::new(self),
-                split_budget,
             }
         }
     }
@@ -2055,52 +2068,51 @@ mod parallel {
     {
         type Item = R;
 
-        /// Advance the Query's state machine until either the current
-        /// top level has ≥2 pending candidates (bisect, return a right
-        /// half) or the sub-query is exhausted / has reached a batch of
-        /// complete rows (return `None`, leaving `self` as a leaf that
-        /// `fold_with` will fold sequentially).
+        /// Advance the Query's state machine until either a whole planned
+        /// group can be transferred to a sibling or the sub-query is
+        /// exhausted / has reached a batch of complete rows (return `None`,
+        /// leaving `self` as a leaf that `fold_with` will fold sequentially).
         fn split(mut self) -> (Self, Option<Self>) {
-            if self.split_budget == 0 {
-                return (self, None);
-            }
-            self.split_budget -= 1;
             let q = &mut *self.inner;
             loop {
                 match q.mode {
                     Search::Plan => q.plan(),
-                    Search::NextGroup => q.next_group(),
-                    // A batch of complete rows, or nothing left: both are
-                    // leaves for the sequential folder.
-                    Search::Emit | Search::Done => return (self, None),
-                    Search::NextChunk => {
-                        let top = q.stack.last().expect("a level to chunk").variable;
-                        if q.bindings.pending(top) < 2 {
-                            // Nothing to cut: either the level is spent
-                            // (the step retires it) or a single candidate
-                            // remains (the step descends through it).
-                            q.next_chunk();
-                            continue;
+                    Search::NextGroup => {
+                        if let Some(right) = q.split_pending_group() {
+                            return (
+                                self,
+                                Some(QueryParIter {
+                                    inner: Box::new(right),
+                                }),
+                            );
                         }
-                        let right = q.split_current_source(top);
-
-                        let left_budget = self.split_budget / 2;
-                        let right_budget = self.split_budget - left_budget;
-                        self.split_budget = left_budget;
-                        return (
-                            self,
-                            Some(QueryParIter {
-                                inner: Box::new(right),
-                                split_budget: right_budget,
-                            }),
-                        );
+                        q.next_group();
+                    }
+                    Search::Emit => {
+                        if let Some(right) = q.split_terminal_frontier() {
+                            return (
+                                self,
+                                Some(QueryParIter {
+                                    inner: Box::new(right),
+                                }),
+                            );
+                        }
+                        return (self, None);
+                    }
+                    Search::Done => return (self, None),
+                    Search::NextChunk => {
+                        // Draw the next geometric page intact. Planning its
+                        // child frontier exposes one or more whole groups on
+                        // the next loop iteration; those are the stealable
+                        // units, not slices of this proposal buffer.
+                        q.next_chunk();
                     }
                 }
             }
         }
 
         fn fold_with<F: Folder<R>>(self, mut folder: F) -> F {
-            let QueryParIter { inner: mut q, .. } = self;
+            let QueryParIter { inner: mut q } = self;
             while !folder.full() {
                 match q.next() {
                     Some(item) => folder = folder.consume(item),
@@ -2504,9 +2516,52 @@ mod tests {
     #[cfg(feature = "parallel")]
     mod split_fence {
         use super::*;
+        use rayon::iter::plumbing::UnindexedProducer;
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
         #[derive(Clone)]
         struct Fixture(u32);
+
+        /// One proposal per level and no alternate continuation anywhere.
+        /// This is the shape on which speculative splitting is most harmful:
+        /// cloning a query at every depth prevents the frontier matrices from
+        /// descending in place even though no parallel work exists.
+        #[derive(Clone)]
+        struct OneToOne(usize);
+
+        impl<'a> Constraint<'a> for OneToOne {
+            fn variables(&self) -> VariableSet {
+                variable_set(0..self.0)
+            }
+
+            fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+                (variable < self.0).then_some(if variable == binding.bound.count() {
+                    1
+                } else {
+                    1 << 20
+                })
+            }
+
+            fn propose(
+                &self,
+                variable: VariableId,
+                frontier: &Frontier<'_>,
+                proposals: &mut ProposalBuffer,
+            ) {
+                for row in 0..frontier.len() {
+                    proposals.open(row as u32);
+                    proposals.push(Fixture::value(0x7f, variable as u32));
+                }
+            }
+
+            fn confirm(
+                &self,
+                _variable: VariableId,
+                _frontier: &Frontier<'_>,
+                _candidates: &mut Candidates<'_>,
+            ) {
+            }
+        }
 
         impl Fixture {
             fn value(tag: u8, index: u32) -> RawInline {
@@ -2592,7 +2647,7 @@ mod tests {
             .with_frontier_width(4)
         }
 
-        fn advance_to_second_of_three_groups(query: &mut TestQuery) {
+        fn advance_to_three_groups(query: &mut TestQuery) {
             query.plan();
             query.next_group();
             query.next_chunk();
@@ -2606,51 +2661,165 @@ mod tests {
             query.next_chunk();
             query.plan();
             assert_eq!(query.depths[query.depth].groups.len(), 3);
-
-            // Retire the empty first group and stop inside the second.
-            query.next_group();
-            query.next_chunk();
-            query.next_group();
-            assert_eq!(query.depths[query.depth].group, 2);
-            assert_eq!(query.stack.last().unwrap().variable, 2);
+            assert_eq!(query.depths[query.depth].group, 0);
+            assert_eq!(query.depths[query.depth].group_limit, 3);
         }
 
         #[test]
-        fn split_owns_only_its_current_fragmented_group() {
+        fn split_transfers_one_whole_group_and_fences_it() {
             const FANOUT: u32 = 64;
             let mut expected: Vec<_> = query(FANOUT).collect();
             expected.sort_unstable();
             assert_eq!(expected.len(), FANOUT as usize + 1);
 
             let mut left = query(FANOUT);
-            advance_to_second_of_three_groups(&mut left);
-            let mut right = left.split_current_source(2);
+            advance_to_three_groups(&mut left);
+            let source_len = left.bindings.levels[0].buffer.len();
+            let source_pos = left.bindings.levels[0].pos;
+            let right = left.split_pending_group().expect("transfer first group");
 
             assert_eq!(
                 (right.depth, right.depths.len(), right.stack.len()),
-                (0, 1, 1)
+                (0, 1, 0)
             );
             assert_eq!(
-                (right.depths[0].group, right.depths[0].groups.len()),
-                (2, 2)
+                (
+                    right.depths[0].group,
+                    right.depths[0].group_limit,
+                    right.depths[0].groups.len(),
+                ),
+                (0, 1, 3)
             );
             assert!(Arc::ptr_eq(&left.depths[1].block, &right.depths[0].block));
-            // `ProposalBuffer` derefs to its entry slice, so this compares
-            // the two buffers' storage without naming a private field.
-            assert!(!std::ptr::eq(
-                left.bindings.levels[0].buffer.as_ptr(),
-                right.bindings.levels[0].buffer.as_ptr(),
-            ));
+            assert!(Arc::ptr_eq(&left.depths[1].order, &right.depths[0].order));
+            assert!(Arc::ptr_eq(&left.depths[1].groups, &right.depths[0].groups));
+            assert_eq!(left.depths[1].group, 1, "left skips the owned group");
 
-            // Fencing an already-fenced sibling cannot restore continuation.
-            let rightmost = right.split_current_source(2);
-            assert_eq!((right.depth, right.depths[0].groups.len()), (0, 2));
-            assert_eq!((rightmost.depth, rightmost.depths[0].groups.len()), (0, 2));
+            // The ancestor source was cloned intact, not bisected. Both
+            // halves retain the same complete proposal region and cursor;
+            // only their continuation ownership differs.
+            assert_eq!(left.bindings.levels[0].buffer.len(), source_len);
+            assert_eq!(right.bindings.levels[0].buffer.len(), source_len);
+            assert_eq!(left.bindings.levels[0].pos, source_pos);
+            assert_eq!(right.bindings.levels[0].pos, source_pos);
 
-            let mut actual: Vec<_> = left.chain(right).chain(rightmost).collect();
+            // A fenced sole root group is indivisible. Trying to split it
+            // again must enter the work rather than hand the same group back.
+            let mut fenced = right.clone();
+            assert!(fenced.split_pending_group().is_none());
+
+            let second = left.split_pending_group().expect("transfer second group");
+            assert!(
+                left.split_pending_group().is_none(),
+                "the last group stays with the only producer that can execute it"
+            );
+            assert_eq!(left.depths[1].group + 1, left.depths[1].group_limit);
+
+            let mut actual: Vec<_> = left.chain(right).chain(second).collect();
             actual.sort_unstable();
             assert_eq!(actual, expected, "splitting must preserve the exact bag");
             assert_eq!(actual.iter().filter(|row| row[31] == 2).count(), 1);
+        }
+
+        fn advance_to_emit(query: &mut TestQuery) {
+            loop {
+                match query.mode {
+                    Search::Plan => query.plan(),
+                    Search::NextGroup => query.next_group(),
+                    Search::NextChunk => query.next_chunk(),
+                    Search::Emit => return,
+                    Search::Done => panic!("fixture ended before a terminal frontier"),
+                }
+            }
+        }
+
+        #[test]
+        fn terminal_page_is_transferred_without_slicing_rows() {
+            let mut left = query(32);
+            advance_to_emit(&mut left);
+            assert!(left.depth > 0);
+            let terminal_rows = left.depths[left.depth].rows;
+            let terminal_block = Arc::clone(&left.depths[left.depth].block);
+            let mut expected = left.clone().collect::<Vec<_>>();
+
+            let right = left
+                .split_terminal_frontier()
+                .expect("terminal page has a parent continuation");
+            assert_eq!(right.depth, 0);
+            assert_eq!(right.stack.len(), 0);
+            assert_eq!(right.mode, Search::Emit);
+            assert_eq!(right.depths[0].rows, terminal_rows);
+            assert!(Arc::ptr_eq(&terminal_block, &right.depths[0].block));
+
+            let mut actual: Vec<_> = left.chain(right).collect();
+            expected.sort_unstable();
+            actual.sort_unstable();
+            assert_eq!(actual, expected);
+        }
+
+        #[test]
+        fn indivisible_one_to_one_chain_never_splits_or_forces_copies() {
+            const HOPS: usize = 60;
+            let query = Query::new(OneToOne(HOPS), |binding: &Binding| {
+                binding.get(HOPS - 1).copied()
+            });
+            let stats = query.stats();
+
+            // `UnindexedProducer::split` is allowed to drive the state
+            // machine looking for a stealable unit. This chain has none:
+            // every frontier is one sole group/page and every ancestor is
+            // already spent. It must therefore stay one producer all the
+            // way down rather than manufacture an empty left sibling at
+            // each depth.
+            let (producer, right) = query.into_par_iter().split();
+            assert!(right.is_none());
+            let rows = producer.collect::<Vec<_>>();
+
+            assert_eq!(rows, vec![Fixture::value(0x7f, HOPS as u32 - 1)]);
+            assert_eq!(stats.inplace_descents(), HOPS as u64);
+            assert_eq!(
+                stats.copied_descents(),
+                0,
+                "a fruitless split search must not destroy Arc uniqueness"
+            );
+        }
+
+        #[test]
+        fn repeated_manual_producer_splits_preserve_dead_groups_and_bag() {
+            let mut expected: Vec<_> = query(96).collect();
+            expected.sort_unstable();
+
+            let mut queue = vec![query(96).into_par_iter()];
+            let mut leaves = Vec::new();
+            for _ in 0..64 {
+                let Some(producer) = queue.pop() else {
+                    break;
+                };
+                let (left, right) = producer.split();
+                if let Some(right) = right {
+                    queue.push(left);
+                    queue.push(right);
+                } else {
+                    leaves.push(left);
+                }
+            }
+
+            let mut actual = Vec::new();
+            for producer in queue.into_iter().chain(leaves) {
+                actual.extend(producer.collect::<Vec<_>>());
+            }
+            actual.sort_unstable();
+            assert_eq!(actual, expected);
+
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .build()
+                .unwrap();
+            for _ in 0..8 {
+                let mut scheduled = pool.install(|| query(96).into_par_iter().collect::<Vec<_>>());
+                scheduled.sort_unstable();
+                assert_eq!(scheduled, expected);
+            }
         }
     }
 }

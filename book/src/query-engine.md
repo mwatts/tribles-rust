@@ -316,37 +316,34 @@ sources, because that requirement is what would disqualify half of them.
 
 With the `parallel` feature a query is also a rayon producer:
 `find!(...).into_par_iter()`. There is no second solver behind it. Splitting
-walks the same state machine and hands one half of a level's candidates to a
-sibling:
+walks the same state machine and transfers a *whole frontier unit* to a sibling:
 
-- While the top of the search stack has fewer than two pending candidates, take
-  the step: either the level is spent and gets retired, or the single candidate
-  becomes a one-row child frontier and the search descends.
-- When the top has two or more pending candidates, bisect them and hand the
-  tail to a sibling. A candidate's parent tag names a row of the *parent*
-  frontier, which the sibling keeps verbatim — its matrices sit behind `Arc`,
-  so the clone is refcounts rather than megabytes — so the tags address exactly
-  the same rows on both sides. Level buffers are deep-cloned because those rows
-  contain indexes into them and either half may refill a level later. The left
-  half keeps entries `[0..mid)` and every consumed entry sits below its
-  consumption watermark, so its own indexes still resolve to the same values.
-- The sibling is **fenced at that source**. It keeps only the current parent
-  frontier and current level; later preferred-variable groups and every
-  ancestor continuation remain owned by the left half. When the sibling's
-  suffix is exhausted it is done, rather than unwinding into work another
-  clone also owns. Applying the same rule to a sibling of a sibling is
-  idempotent: discarded continuation cannot reappear.
-- Splitting narrows the frontier: the two halves each expand a slice of what
-  one would have expanded together. That is the deliberate trade — batch width
-  buys per-level dispatch size, work-stealing buys core utilisation — and rayon
-  only asks for a split under stealing pressure.
+- Once planning has partitioned a frontier by the rows' preferred next
+  variable, one complete group may be transferred. The left producer advances
+  its group cursor; the sibling is re-rooted at that frontier and fenced to the
+  single group it received. Both share the immutable plan and frontier
+  matrices behind `Arc`; proposal buffers are not divided.
+- A complete terminal page may likewise be transferred as one unit. This is
+  how a one-variable query can expose parallel work without slicing its result
+  frontier.
+- A transfer is admitted only when the left producer has a distinct future:
+  another group at this frontier, or an ancestor level with an unconsumed
+  candidate suffix. A sole group or page with no such continuation stays in
+  place and the producer descends serially; that descent may expose genuinely
+  independent groups deeper in the search.
+- The sibling owns no ancestor continuation. Once its fenced group or page is
+  exhausted it ends instead of unwinding into work still owned by the left
+  producer.
+- Geometric pages and preferred-variable groups therefore remain intact. A
+  split never turns one accelerator-sized proposal/confirmation batch into two
+  smaller batches merely to feed rayon.
 - A leaf just drives the ordinary sequential `Iterator::next` and folds the
   results. No engine logic is duplicated for the parallel path.
 
-Because rayon resets its splitter budget on every stolen task, each producer
-carries its own bounded budget — `num_threads²`, halved at each split — so a
-busy pool cannot drive the split tree arbitrarily deep against a query that
-always has more candidates to bisect.
+The ownership rule is itself the split bound: every successful split removes
+one group or page from the left producer and fences it into the right. Work
+cannot be handed back or rediscovered, so rayon's pressure splitter needs no
+engine-specific budget or thread-count tuning knob.
 
 The guarantee is the same bag of rows, not the same order. Constraint trees are
 shared behind an `Arc`, so a split is a refcount bump rather than a tree clone;

@@ -169,8 +169,9 @@ depth-first traversal from thrashing through unrelated values.
   repeated proposals do not reallocate. This is especially helpful when
   backtracking over large domains.
 - Under the `parallel` feature the same state machine is the rayon producer:
-  splitting bisects a level's materialized candidates and clones the engine
-  state, while the constraint tree is shared behind an `Arc`. Results are the
+  splitting transfers one whole preferred-variable group (or terminal page)
+  to a fenced sibling only when the left side retains another continuation.
+  Candidate regions and geometric frontier pages stay intact. Results are the
   same bag of rows in an unspecified order.
 
 ## Why worst-case optimal?
