@@ -56,6 +56,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **SuccinctArchive CPU range confirmation batches wavelet descents.** The
+  frontier still forms and routes each complete candidate region before any
+  fallback, while the canonical CPU path resolves adjacent distinct values in
+  bounded 1,024-probe tiles and carries their row-range endpoints through one
+  layer-major Jerky descent. This removes the terminal select and second rank,
+  preserves probe-group ordering, pre-killed candidates, and adjacent-value
+  memoization, and adds no public tuning surface.
+
 - **Rayon can divide a TribleSet CPU confirmation without fragmenting its
   frontier.** Queries explicitly converted with `into_par_iter()` carry that
   intent through their frontier views; ordinary iterators remain serial even

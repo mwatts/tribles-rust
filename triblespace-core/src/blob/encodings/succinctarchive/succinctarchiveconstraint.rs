@@ -82,6 +82,22 @@ const SORTED_PROBE_MIN: usize = 2;
 /// than cache misses.
 const SORTED_REGION_MIN: usize = usize::MAX;
 
+/// Live candidates at or above which a range confirm collects independent
+/// wavelet probes and descends them layer-major.
+///
+/// Small confirms stay allocation-free. Jerky uses the same floor inside its
+/// batched entry point; keeping it here avoids building scratch for a call
+/// that Jerky would answer with its scalar loop anyway.
+const MIN_BATCHED_CONFIRM: usize = 8;
+
+/// Distinct adjacent values carried through one batched wavelet descent.
+///
+/// A frontier region can contain hundreds of thousands of candidates. This
+/// bound keeps the caller's scratch in tens of KiB while remaining much wider
+/// than the memory system can keep in flight. Runs of equal live values are
+/// never cut at this boundary, so the existing adjacent-value reuse survives.
+const CONFIRM_CHUNK: usize = 1024;
+
 /// Kills every entry named by `order` whose value fails `keep`, skipping
 /// entries that are already dead — [`Candidates::retain`] over a
 /// permutation instead of the region's own order.
@@ -109,6 +125,136 @@ fn retain_at(cands: &mut Candidates<'_>, order: &[u32], mut keep: impl FnMut(&Ra
         };
         if !verdict {
             cands.kill(i);
+        }
+    }
+}
+
+/// Kills the candidates named by `order` that do not occur in row range `r`
+/// of wavelet column `column`.
+///
+/// This is deliberately narrower than [`restrict_range`]. A confirm only
+/// asks whether the restricted range is empty, so its prefix-bitvector base
+/// cancels and `rank_range` carries both endpoints through one wavelet descent
+/// instead of performing two ranks plus a select. For a sufficiently wide
+/// run the independent descents are issued layer-major through Jerky's batch
+/// API, exposing memory-level parallelism without changing the frontier or
+/// accelerator routing.
+///
+/// `order` is the current probe group's permutation. Runs are formed over its
+/// live subsequence, exactly like [`retain_at`]: dead entries neither revive
+/// nor break adjacent duplicate reuse. A batch boundary is placed only after
+/// a complete run, and verdicts are fanned back over that run's original
+/// candidate indices.
+fn retain_occurring_at<U>(
+    domain: &U,
+    column: &WaveletMatrix<Rank9SelIndex>,
+    r: &Range<usize>,
+    cands: &mut Candidates<'_>,
+    order: &[u32],
+) where
+    U: Universe,
+{
+    if r.is_empty() {
+        for &candidate in order {
+            let candidate = candidate as usize;
+            if cands.is_live(candidate) {
+                cands.kill(candidate);
+            }
+        }
+        return;
+    }
+
+    let live = order
+        .iter()
+        .filter(|&&candidate| cands.is_live(candidate as usize))
+        .count();
+    if live < MIN_BATCHED_CONFIRM {
+        retain_at(cands, order, |value| {
+            let Some(code) = domain.search(value) else {
+                return false;
+            };
+            column
+                .rank_range(r.clone(), code)
+                .expect("archive-derived row range stays inside its wavelet column")
+                != 0
+        });
+        return;
+    }
+
+    #[derive(Clone, Copy)]
+    struct Run {
+        start: usize,
+        end: usize,
+        probe: Option<usize>,
+    }
+
+    let cap = live.min(CONFIRM_CHUNK);
+    let mut runs = Vec::with_capacity(cap);
+    let mut codes = Vec::with_capacity(cap);
+    let mut ranks = vec![None; cap];
+    let mut cursor = 0usize;
+
+    while cursor < order.len() {
+        runs.clear();
+        codes.clear();
+
+        while cursor < order.len() && runs.len() < cap {
+            while cursor < order.len() && !cands.is_live(order[cursor] as usize) {
+                cursor += 1;
+            }
+            if cursor == order.len() {
+                break;
+            }
+
+            let start = cursor;
+            let value = cands.values()[order[cursor] as usize];
+            cursor += 1;
+            while cursor < order.len() {
+                let candidate = order[cursor] as usize;
+                if !cands.is_live(candidate) {
+                    cursor += 1;
+                    continue;
+                }
+                if cands.values()[candidate] != value {
+                    break;
+                }
+                cursor += 1;
+            }
+
+            let probe = domain.search(&value).map(|code| {
+                let slot = codes.len();
+                codes.push(code);
+                slot
+            });
+            runs.push(Run {
+                start,
+                end: cursor,
+                probe,
+            });
+        }
+
+        if !codes.is_empty() {
+            column
+                .rank_range_batch_into(r.clone(), &codes, &mut ranks[..codes.len()])
+                .expect("probe and verdict slices are built with equal lengths");
+        }
+
+        for run in &runs {
+            let keep = match run.probe {
+                Some(slot) => {
+                    ranks[slot].expect("archive-derived row range stays inside its wavelet column")
+                        != 0
+                }
+                None => false,
+            };
+            if !keep {
+                for &candidate in &order[run.start..run.end] {
+                    let candidate = candidate as usize;
+                    if cands.is_live(candidate) {
+                        cands.kill(candidate);
+                    }
+                }
+            }
         }
     }
 }
@@ -410,87 +556,27 @@ where
             }
             (Some(e), None, None, false, true, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                retain_at(cands, order, |a| {
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.a_a,
-                        &self.archive.eva_c,
-                        a,
-                        &r,
-                    )
-                    .is_empty()
-                    .not()
-                });
+                retain_occurring_at(&self.archive.domain, &self.archive.eva_c, &r, cands, order);
             }
             (Some(e), None, None, false, false, true) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
-                retain_at(cands, order, |v| {
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.v_a,
-                        &self.archive.eav_c,
-                        v,
-                        &r,
-                    )
-                    .is_empty()
-                    .not()
-                });
+                retain_occurring_at(&self.archive.domain, &self.archive.eav_c, &r, cands, order);
             }
             (None, Some(a), None, true, false, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.a_a, a);
-                retain_at(cands, order, |e| {
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.e_a,
-                        &self.archive.ave_c,
-                        e,
-                        &r,
-                    )
-                    .is_empty()
-                    .not()
-                });
+                retain_occurring_at(&self.archive.domain, &self.archive.ave_c, &r, cands, order);
             }
             (None, Some(a), None, false, false, true) => {
                 let r = base_range(&self.archive.domain, &self.archive.a_a, a);
-                retain_at(cands, order, |v| {
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.v_a,
-                        &self.archive.aev_c,
-                        v,
-                        &r,
-                    )
-                    .is_empty()
-                    .not()
-                });
+                retain_occurring_at(&self.archive.domain, &self.archive.aev_c, &r, cands, order);
             }
             (None, None, Some(v), true, false, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.v_a, v);
-                retain_at(cands, order, |e| {
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.e_a,
-                        &self.archive.vae_c,
-                        e,
-                        &r,
-                    )
-                    .is_empty()
-                    .not()
-                });
+                retain_occurring_at(&self.archive.domain, &self.archive.vae_c, &r, cands, order);
             }
             (None, None, Some(v), false, true, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.v_a, v);
-                retain_at(cands, order, |a| {
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.a_a,
-                        &self.archive.vea_c,
-                        a,
-                        &r,
-                    )
-                    .is_empty()
-                    .not()
-                });
+                retain_occurring_at(&self.archive.domain, &self.archive.vea_c, &r, cands, order);
             }
             (None, Some(a), Some(v), true, false, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.a_a, a);
@@ -501,17 +587,7 @@ where
                     v,
                     &r,
                 );
-                retain_at(cands, order, |e| {
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.e_a,
-                        &self.archive.vae_c,
-                        e,
-                        &r,
-                    )
-                    .is_empty()
-                    .not()
-                });
+                retain_occurring_at(&self.archive.domain, &self.archive.vae_c, &r, cands, order);
             }
             (Some(e), None, Some(v), false, true, false) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
@@ -522,17 +598,7 @@ where
                     v,
                     &r,
                 );
-                retain_at(cands, order, |a| {
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.a_a,
-                        &self.archive.vea_c,
-                        a,
-                        &r,
-                    )
-                    .is_empty()
-                    .not()
-                });
+                retain_occurring_at(&self.archive.domain, &self.archive.vea_c, &r, cands, order);
             }
             (Some(e), Some(a), None, false, false, true) => {
                 let r = base_range(&self.archive.domain, &self.archive.e_a, e);
@@ -543,17 +609,7 @@ where
                     a,
                     &r,
                 );
-                retain_at(cands, order, |v| {
-                    restrict_range(
-                        &self.archive.domain,
-                        &self.archive.v_a,
-                        &self.archive.aev_c,
-                        v,
-                        &r,
-                    )
-                    .is_empty()
-                    .not()
-                });
+                retain_occurring_at(&self.archive.domain, &self.archive.aev_c, &r, cands, order);
             }
             _ => unreachable!("invalid trible constraint state"),
         }
@@ -867,5 +923,310 @@ where
             }
             _ => true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "parallel")]
+    use std::collections::BTreeSet;
+
+    use super::*;
+    #[cfg(feature = "parallel")]
+    use crate::and;
+    #[cfg(feature = "parallel")]
+    use crate::find;
+    #[cfg(feature = "parallel")]
+    use crate::id::rngid;
+    #[cfg(feature = "parallel")]
+    use crate::inline::encodings::UnknownInline;
+    #[cfg(feature = "parallel")]
+    use crate::inline::Inline;
+    #[cfg(feature = "parallel")]
+    use crate::query::TriblePattern;
+    use crate::trible::{Trible, TribleSet};
+    #[cfg(feature = "parallel")]
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    fn id(tag: u8, ordinal: u32) -> [u8; 16] {
+        let mut id = [0u8; 16];
+        id[0] = 0x80 | tag;
+        id[12..].copy_from_slice(&ordinal.to_be_bytes());
+        id
+    }
+
+    fn id_value(id: [u8; 16]) -> RawInline {
+        let mut value = [0u8; 32];
+        value[16..].copy_from_slice(&id);
+        value
+    }
+
+    fn value(tag: u8, ordinal: u32) -> RawInline {
+        let mut value = [0u8; 32];
+        value[0] = tag;
+        value[28..].copy_from_slice(&ordinal.to_be_bytes());
+        value
+    }
+
+    fn insert(set: &mut TribleSet, e: [u8; 16], a: [u8; 16], v: RawInline) {
+        let mut data = [0u8; 64];
+        data[..16].copy_from_slice(&e);
+        data[16..32].copy_from_slice(&a);
+        data[32..].copy_from_slice(&v);
+        set.insert(&Trible { data });
+    }
+
+    /// Exercises the actual batching boundary rather than only Jerky's batch
+    /// primitive: more than one caller chunk, duplicate live values separated
+    /// by dead entries, absent domain values, a non-identity order, and packed
+    /// candidate regions beginning at several bit offsets.
+    #[test]
+    fn batched_occurrence_matches_two_scalar_ranks_in_bounded_regions() {
+        let target = id(1, 0);
+        let other = id(1, 1);
+        let attribute = id(2, 0);
+        let mut set = TribleSet::new();
+        for ordinal in 0..(CONFIRM_CHUNK as u32 + 193) {
+            let candidate = value(0x10, ordinal);
+            insert(&mut set, other, attribute, candidate);
+            if ordinal % 2 == 0 {
+                insert(&mut set, target, attribute, candidate);
+            }
+        }
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+        let range = base_range(&archive.domain, &archive.e_a, &id_value(target));
+        assert!(!range.is_empty());
+
+        let mut candidates = Vec::new();
+        let mut prekill = Vec::new();
+        for ordinal in 0..(CONFIRM_CHUNK as u32 + 193) {
+            let candidate = value(0x10, ordinal);
+            candidates.push(candidate);
+            if ordinal % 17 == 0 {
+                // `retain_at` treats these equal values as adjacent in the
+                // live subsequence; the batching path must do the same.
+                let dead = candidates.len();
+                candidates.push(value(0x30, ordinal));
+                prekill.push(dead);
+                candidates.push(candidate);
+            }
+            if ordinal % 29 == 0 {
+                candidates.push(value(0x40, ordinal));
+            }
+        }
+
+        let mut order: Vec<u32> = (0..candidates.len() as u32).collect();
+        order.reverse();
+
+        for base in [0usize, 1, 31, 33, 1000] {
+            let prefix: Vec<_> = (0..base as u32).map(|i| value(0x70, i)).collect();
+            let mut buffer = ProposalBuffer::new();
+            buffer.extend_from_slice(&prefix);
+            buffer.extend_from_slice(&candidates);
+            let mut region = buffer.region(base);
+            for &candidate in &prekill {
+                region.kill(candidate);
+            }
+
+            let mut expected: Vec<_> = (0..region.len()).map(|i| region.is_live(i)).collect();
+            for &candidate in &order {
+                let candidate = candidate as usize;
+                if !expected[candidate] {
+                    continue;
+                }
+                expected[candidate] = match archive.domain.search(&candidates[candidate]) {
+                    Some(code) => {
+                        let start = archive.eav_c.rank(range.start, code).unwrap();
+                        let end = archive.eav_c.rank(range.end, code).unwrap();
+                        let one_descent = archive
+                            .eav_c
+                            .rank_range(range.clone(), code)
+                            .expect("archive-derived range is in bounds");
+                        assert_eq!(one_descent, end - start);
+                        one_descent != 0
+                    }
+                    None => false,
+                };
+            }
+
+            retain_occurring_at(&archive.domain, &archive.eav_c, &range, &mut region, &order);
+            let actual: Vec<_> = (0..region.len()).map(|i| region.is_live(i)).collect();
+            assert_eq!(actual, expected, "region base {base}");
+            drop(region);
+            assert!(
+                (0..base).all(|i| buffer.is_live(i)),
+                "confirm touched the packed prefix at base {base}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_range_kills_only_named_live_candidates() {
+        let set = {
+            let mut set = TribleSet::new();
+            insert(&mut set, id(1, 0), id(2, 0), value(0x10, 0));
+            set
+        };
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+        let candidates: Vec<_> = (0..12).map(|i| value(0x10, i)).collect();
+        let mut buffer = ProposalBuffer::new();
+        buffer.extend_from_slice(&candidates);
+        let mut region = buffer.region(0);
+        region.kill(3);
+
+        retain_occurring_at(
+            &archive.domain,
+            &archive.eav_c,
+            &(0..0),
+            &mut region,
+            &[1, 3, 8],
+        );
+
+        for i in 0..region.len() {
+            assert_eq!(region.is_live(i), !matches!(i, 1 | 3 | 8), "candidate {i}");
+        }
+    }
+
+    #[test]
+    fn nonempty_range_touches_only_named_live_candidates() {
+        let target = id(1, 0);
+        let attribute = id(2, 0);
+        let mut set = TribleSet::new();
+        for ordinal in (0..12).step_by(2) {
+            insert(&mut set, target, attribute, value(0x10, ordinal));
+        }
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+        let range = base_range(&archive.domain, &archive.e_a, &id_value(target));
+        assert!(!range.is_empty());
+
+        let candidates: Vec<_> = (0..12).map(|i| value(0x10, i)).collect();
+        let mut buffer = ProposalBuffer::new();
+        buffer.extend_from_slice(&candidates);
+        let mut region = buffer.region(0);
+        region.kill(3);
+
+        // Nine named entries with one pre-kill leave eight live probes, so
+        // this exercises the batched path. Indices 0, 10, and 11 are not
+        // owned by this frontier group and must remain untouched, including
+        // the absent value at 11.
+        retain_occurring_at(
+            &archive.domain,
+            &archive.eav_c,
+            &range,
+            &mut region,
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9],
+        );
+
+        for i in 0..region.len() {
+            let expected = match i {
+                1 | 3 | 5 | 7 | 9 => false,
+                _ => true,
+            };
+            assert_eq!(region.is_live(i), expected, "candidate {i}");
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    fn inline(i: u64) -> Inline<UnknownInline> {
+        let mut raw = [0u8; 32];
+        raw[24..].copy_from_slice(&i.to_be_bytes());
+        Inline::new(raw)
+    }
+
+    #[cfg(feature = "parallel")]
+    fn id_inline(id: &[u8; 16]) -> Inline<GenId> {
+        Inline::new(id_value(*id))
+    }
+
+    #[cfg(feature = "parallel")]
+    fn row_digest(rows: &[(Inline<UnknownInline>,)]) -> blake3::Hash {
+        let mut hasher = blake3::Hasher::new();
+        for (value,) in rows {
+            hasher.update(&value.raw);
+        }
+        hasher.finalize()
+    }
+
+    /// The CPU batch is an implementation detail inside one canonical
+    /// confirm. Sequential solving and every Rayon pool size must therefore
+    /// emit exactly the same bag; set and digest checks make accidental
+    /// duplication and omission explicit, while `take_any` covers early
+    /// cancellation.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn succinct_batched_confirm_preserves_parallel_bag_set_and_digest() {
+        const PROPOSALS: u64 = 8192;
+        let entity = rngid();
+        let attribute = rngid();
+        let entity_inline = id_inline(&entity);
+        let attribute_inline = id_inline(&attribute);
+
+        let mut proposer = TribleSet::new();
+        for i in 0..PROPOSALS {
+            proposer.insert(&Trible::new(&entity, &attribute, &inline(i)));
+        }
+
+        let mut confirmer = TribleSet::new();
+        for i in (0..PROPOSALS).step_by(2) {
+            confirmer.insert(&Trible::new(&entity, &attribute, &inline(i)));
+        }
+        // Keep the archive's estimate above the proposer's while adding no
+        // further intersection results, so the TribleSet proposes and the
+        // SuccinctArchive exercises its range-confirm path.
+        for i in PROPOSALS * 2..PROPOSALS * 3 {
+            confirmer.insert(&Trible::new(&entity, &attribute, &inline(i)));
+        }
+        let confirmer: SuccinctArchive<OrderedUniverse> = (&confirmer).into();
+
+        let mut expected: Vec<_> = (0..PROPOSALS).step_by(2).map(|i| (inline(i),)).collect();
+        expected.sort_unstable();
+        let expected_set: BTreeSet<_> = expected.iter().copied().collect();
+
+        macro_rules! query {
+            () => {
+                find! {
+                    (value: Inline<UnknownInline>),
+                    and!(
+                        proposer.pattern(entity_inline, attribute_inline, value),
+                        confirmer.pattern(entity_inline, attribute_inline, value)
+                    )
+                }
+            };
+        }
+
+        let mut sequential: Vec<_> = query!().collect();
+        sequential.sort_unstable();
+        assert_eq!(sequential, expected);
+        let digest = row_digest(&sequential);
+
+        for threads in [1, 2, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let mut parallel = pool.install(|| query!().into_par_iter().collect::<Vec<_>>());
+            parallel.sort_unstable();
+            assert_eq!(parallel, sequential, "{threads}-thread bag");
+            assert_eq!(row_digest(&parallel), digest, "{threads}-thread digest");
+            assert_eq!(
+                parallel.iter().copied().collect::<BTreeSet<_>>(),
+                expected_set,
+                "{threads}-thread set"
+            );
+        }
+
+        let four = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let partial: Vec<_> = four.install(|| query!().into_par_iter().take_any(17).collect());
+        assert_eq!(partial.len(), 17);
+        let partial_set: BTreeSet<_> = partial.iter().copied().collect();
+        assert_eq!(
+            partial_set.len(),
+            partial.len(),
+            "cancellation duplicated rows"
+        );
+        assert!(partial_set.is_subset(&expected_set));
     }
 }
