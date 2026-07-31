@@ -10,6 +10,13 @@ description = "Engine-version-agnostic benchmark suite for triblespace. The SUBJ
 # purpose (benchmarking any rev). bench.sh probes the subject and enables
 # exactly the ones it supports.
 default = []
+# The performance fingerprint is a reader for benchmark receipts, not part of
+# the measured process. Keeping it behind a feature means ordinary subject
+# builds never compile an eframe/wgpu UI into the benchmark runner.
+fingerprint-notebook = ["dep:GORBIE", "dep:egui", "dep:egui_plot"]
+# Marker consumed by GORBIE's notebook macro when its `--export` path is used.
+# Declaring it also lets Cargo's check-cfg understand the macro expansion.
+web-export = []
 # Placeholder: compiles only once the subject engine regains a
 # regular-path constraint (`path!`). Gates the four transitive-path
 # sparqloscope translations and the path-shaped Harkonnen fixtures
@@ -88,3 +95,13 @@ hifitime = "4.1.2"
 # writer create throwaway signing keys). 2.1 unifies with both graphs.
 ed25519-dalek = { version = "2.1.0", features = ["rand_core"] }
 rand = "0.8"
+# GORBIE 0.18.1's CardCtx calls its markdown helper unconditionally, so this
+# feature is required even though the fingerprint itself uses plain egui text.
+GORBIE = { version = "0.18.1", features = ["markdown"], optional = true }
+egui = { version = "0.34", optional = true }
+egui_plot = { version = "0.35", optional = true }
+
+[[bin]]
+name = "performance-fingerprint"
+path = "src/bin/performance-fingerprint/main.rs"
+required-features = ["fingerprint-notebook"]

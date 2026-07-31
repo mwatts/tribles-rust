@@ -1,0 +1,18 @@
+record	engine	engine_variant	harness	corpus	scale	backend	substrate	parallelism	execution_path	shape	demand	elapsed_ns	rows	result_digest	status
+identity	demo-a1b2c3	default	demo-harness	demo-corpus	tiny	tribleset	cpu	sequential	cpu	bound_star	full	0	16	bound-star-tiny	-
+sample	demo-a1b2c3	default	demo-harness	demo-corpus	tiny	tribleset	cpu	sequential	cpu	bound_star	construct	4900	0	-	-
+sample	demo-a1b2c3	default	demo-harness	demo-corpus	tiny	tribleset	cpu	sequential	cpu	bound_star	1	907	1	-	-
+sample	demo-a1b2c3	default	demo-harness	demo-corpus	tiny	tribleset	cpu	sequential	cpu	bound_star	4	3188	4	-	-
+sample	demo-a1b2c3	default	demo-harness	demo-corpus	tiny	tribleset	cpu	sequential	cpu	bound_star	full	6928	16	-	-
+identity	demo-a1b2c3	default	demo-harness	demo-corpus	wide	tribleset	cpu	sequential	cpu	bound_star	full	0	48	bound-star-wide	-
+sample	demo-a1b2c3	default	demo-harness	demo-corpus	wide	tribleset	cpu	sequential	cpu	bound_star	construct	6700	0	-	-
+sample	demo-a1b2c3	default	demo-harness	demo-corpus	wide	tribleset	cpu	sequential	cpu	bound_star	1	1170	1	-	-
+sample	demo-a1b2c3	default	demo-harness	demo-corpus	wide	tribleset	cpu	sequential	cpu	bound_star	4	3448	4	-	-
+sample	demo-a1b2c3	default	demo-harness	demo-corpus	wide	tribleset	cpu	sequential	cpu	bound_star	full	20688	48	-	-
+identity	demo-a1b2c3	default	demo-harness	demo-corpus	tiny	succinct	wgpu	rayon	gpu	bound_star	full	0	16	bound-star-tiny	-
+sample	demo-a1b2c3	default	demo-harness	demo-corpus	tiny	succinct	wgpu	rayon	gpu	bound_star	1	667	1	-	-
+unsupported	demo-a1b2c3	default	demo-harness	demo-corpus	tiny	succinct	wgpu	rayon	gpu	bound_star	4	-	-	-	unsupported:demo execution route
+cardinality_mismatch	demo-a1b2c3	default	demo-harness	demo-corpus	tiny	succinct	wgpu	rayon	gpu	bound_star	full	-	-	-	cardinality mismatch:demo expected 16 observed 15
+identity	demo-a1b2c3	default	demo-harness	demo-corpus	wide	succinct	wgpu	rayon	gpu	bound_star	full	0	48	bound-star-wide	-
+error	demo-a1b2c3	default	demo-harness	demo-corpus	wide	succinct	wgpu	rayon	gpu	bound_star	4	-	-	-	producer error:demo adapter failure
+sample	demo-a1b2c3	default	demo-harness	demo-corpus	wide	succinct	wgpu	rayon	gpu	bound_star	full	14400	48	-	-

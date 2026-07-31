@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Demand-curve receipts render as explicit performance fingerprints.** The
+  feature-gated `tribleset-bench` GORBIE notebook normalizes fragmented TSV
+  axes in memory and gives every engine/storage/execution subject the same
+  query-shape × scale × demand panel. Its primary curve is median
+  `c(k)=T(k)/k`, with `full` retained as terminal iterator exhaustion and setup
+  kept separate. Exact matrices keep missing, unsupported, producer-error,
+  and cardinality-mismatch cells visible instead of silently dropping them
+  from successful timing curves, and partial ABBA/repetition or identity grids
+  cannot masquerade as medians. An embedded demo and headless renderer make the
+  view testable without a benchmark run.
 - **A bounded oracle checks the regular-path closure kernel.** A Kani harness
   symbolically selects every subgraph of a five-edge, two-vertex labeled
   universe, while an ordinary deterministic test exhausts all 256 graphs whose
