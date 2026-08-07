@@ -46,6 +46,10 @@ use zerocopy::IntoBytes;
 /// The leading NIL bytes deliberately participate in the hash. Consequently
 /// this identity scheme is not compatible with the historical `A || V`
 /// stream used by `entity!`.
+///
+/// The returned root is a reproducible plain [`Id`], never an exclusive write
+/// capability. This function materializes exactly the canonical rows whose
+/// bytes define that root and does not register it with an ID owner.
 #[doc(hidden)]
 pub fn build_intrinsic_entity(mut rows: Vec<IntrinsicEntityRow>) -> (Id, TribleSet) {
     rows.sort_unstable();

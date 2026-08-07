@@ -251,6 +251,17 @@ id, and fills that id into every row. Identity therefore depends on the raw
 projected facts, not source order or Rust conversion history. An explicit
 entity id bypasses this derivation.
 
+These two forms intentionally have different ownership types. An explicit
+subject must be supplied as an [`ExclusiveId`](triblespace::core::id::ExclusiveId),
+which is the capability to add facts to that extrinsic identity. An intrinsic
+entity instead exports its reproducible root as a plain
+[`Id`](triblespace::core::id::Id). Its defining rows are exactly the rows that
+participated in the hash; constructing it does not mint, acquire, or register
+an `ExclusiveId`. Turning that root into an `ExclusiveId` merely to append
+unhashed facts would break the content-addressed meaning of the root. Choose an
+explicit subject from the beginning when an entity needs to grow independently
+of its current facts.
+
 This canonical-row protocol deliberately defines a new intrinsic-identity
 epoch relative to the historical hash of concatenated `attribute || value`
 pairs. Existing persisted intrinsic ids must be migrated or re-ingested when

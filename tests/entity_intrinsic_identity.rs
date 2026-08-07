@@ -121,6 +121,25 @@ fn explicit_entity_identity_is_unchanged() {
 }
 
 #[test]
+fn intrinsic_root_is_reproducible_plain_id_not_an_owned_write_capability() {
+    let first = entity! {
+        fields::alpha: "alpha",
+        fields::beta: "beta",
+    };
+    let second = entity! {
+        fields::beta: "beta",
+        fields::alpha: "alpha",
+    };
+
+    let root: Id = first.root().expect("intrinsic entities export a root");
+    assert_eq!(Some(root), second.root());
+    assert!(
+        root.acquire().is_none(),
+        "intrinsic construction must not register its reproducible root as an ExclusiveId"
+    );
+}
+
+#[test]
 fn short_string_encoding_used_by_the_oracle_is_exact() {
     let expected: Inline<ShortString> = ShortString::inline_from("alpha");
     assert_eq!(encoded("alpha"), expected.raw);
