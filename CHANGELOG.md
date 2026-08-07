@@ -71,8 +71,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Implicit whole-set construction exports a reproducible plain `Id`
   and emits exactly its hashed defining rows; incremental explicit subjects
   still require an `ExclusiveId`. JSON namespace salts remain supported over
-  the new canonical row stream, while N-Triples' random orphan salt remains a
-  deliberately separate fresh-existential protocol.
+  the new canonical row stream. N-Triples orphan blank nodes remain on a
+  deliberately separate, domain-separated protocol, now scoped by the
+  byte-exact source-document hash so retrying identical input is idempotent.
 
 - **SuccinctArchive CPU range confirmation batches wavelet descents.** The
   frontier still forms and routes each complete candidate region before any

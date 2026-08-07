@@ -53,8 +53,9 @@ fresh run (drop the per-field attribute caches and multi-value tracking).
 Attributes are derived through the entity-core mechanism —
 `Attribute::<S>::from(entity!{ metadata::name: <field handle>,
 metadata::value_encoding: <S as MetaDescribe>::id() })` — which hashes the
-sorted+deduped `(attr, value)` pairs to produce a stable attribute id from
-the JSON field name and its fixed `InlineEncoding`. The importer caches the
+sorted and deduplicated canonical `NIL || attribute || value` rows to produce a
+stable attribute id from the JSON field name and its fixed `InlineEncoding`.
+The importer caches the
 resulting `Attribute<S>` per field so the hash only has to be computed once
 per run. Arrays are treated as multi-valued fields: every item is
 encoded and stored under the same attribute identifier, producing one trible per
@@ -154,6 +155,17 @@ TribleSet — even across machines. The `rdf_uri` edge itself is also
 emitted, so `pattern!([{ ?e @ rdf_uri: ?uri }])` recovers the original
 URI for any imported entity.
 
+**Orphan blank nodes.** A blank node that is referenced as an object but has no
+outgoing facts cannot use the normal intrinsic-entity derivation: every such
+factless node would otherwise collapse to the same empty entity. Instead, the
+importer retains a separate, domain-separated skolem protocol over the immutable
+source-document content hash and the literal blank-node label. Importing the
+same byte-identical document repeatedly therefore reproduces the same ids and
+converges under set union. Different labels remain distinct, as do labels in
+documents with different serialized content. This is deliberately content
+addressing of the N-Triples document, not RDF graph canonicalization: changing
+comments or whitespace creates a new document scope.
+
 **Predicate → attribute id.** Predicate URIs become attribute ids through
 the entity-core derivation rooted at `metadata::iri` —
 `Attribute::<S>::from(entity!{ metadata::iri: <iri handle>,
@@ -208,8 +220,9 @@ for (entity, year) in find!(
 
 **N-Triples only.** The current importer handles the line-oriented
 N-Triples format: one statement per line, URIs in angle brackets,
-literals in double quotes with optional `^^<datatype>`. Turtle-style
-prefixes, blank nodes, and quad/N-Quads are not yet supported.
+literals in double quotes with optional `^^<datatype>`, and acyclic blank-node
+graphs. Turtle-style prefixes and quad/N-Quads are not supported; cyclic
+blank-node graphs are rejected rather than assigned arbitrary identities.
 
 ## Managing Entity Identifiers
 
