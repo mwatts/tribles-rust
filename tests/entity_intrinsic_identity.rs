@@ -9,9 +9,10 @@ mod fields {
     use triblespace::prelude::inlineencodings::ShortString;
     use triblespace::prelude::*;
 
+    // Golden-vector fixture IDs minted with `trible genid` on 2026-08-07.
     attributes! {
-        pub alpha: ShortString;
-        pub beta: ShortString;
+        "2751005841B8C6B799E24D12B58B950B" as pub alpha: ShortString;
+        "0177C46AF9CA63B1AB039F73E3A65D2D" as pub beta: ShortString;
     }
 }
 
@@ -72,6 +73,11 @@ fn intrinsic_root_hashes_canonical_nil_attribute_value_rows() {
     };
 
     assert_eq!(fragment.root(), Some(canonical_row_id(pairs.clone())));
+    assert_eq!(
+        fragment.root(),
+        Id::from_hex("30BC3B11909CDDB8204F995D38D9DB14"),
+        "Identity Epoch 2 golden vector changed"
+    );
     assert_ne!(fragment.root(), Some(legacy_pair_id(pairs)));
 }
 
