@@ -364,21 +364,15 @@ impl Yard {
         Ok(())
     }
 
-    /// Recompute the keep set and logically collect cold weak pins and orphans.
-    pub fn collect(&mut self) -> Result<(), YardCollectError> {
-        self.collect_with_retention(&RetentionRoots::new())
-    }
-
-    /// Recompute the keep set with additional explicit policy roots.
+    /// Recompute the keep set with explicit policy roots and logically collect
+    /// cold weak pins and orphans.
     ///
     /// The supplied roots are strong for this pass. Direct roots retain only
     /// themselves; recursive roots retain their resident descendants. Callers
     /// must supply the same policy on every later collection pass for the
-    /// corresponding data to remain live.
-    pub fn collect_with_retention(
-        &mut self,
-        retention: &RetentionRoots,
-    ) -> Result<(), YardCollectError> {
+    /// corresponding data to remain live. Pass an empty [`RetentionRoots`]
+    /// explicitly when legacy strong pins are the only desired strong roots.
+    pub fn collect(&mut self, retention: &RetentionRoots) -> Result<(), YardCollectError> {
         let reader = self.reader().map_err(YardCollectError::Reader)?;
         let strong_keep = self.strong_keep_set(&reader, retention);
         let present = reader.live_set();
@@ -398,20 +392,15 @@ impl Yard {
         Ok(())
     }
 
-    /// Run one compaction pass.
+    /// Run one compaction pass with explicit policy roots.
     ///
-    /// Strong survivors descend when a level exceeds its strong budget. Weak
-    /// pins are only retained in the young generation and never copied down.
-    pub fn compact(&mut self) -> Result<(), YardCollectError> {
-        self.compact_with_retention(&RetentionRoots::new())
-    }
-
-    /// Run one compaction pass with additional explicit policy roots.
-    pub fn compact_with_retention(
-        &mut self,
-        retention: &RetentionRoots,
-    ) -> Result<(), YardCollectError> {
-        self.collect_with_retention(retention)?;
+    /// Strong survivors descend when a level exceeds its strong budget. The
+    /// whole surviving tier moves together; weak survivors remain evictable
+    /// under the weak budget after they descend. Pass an empty
+    /// [`RetentionRoots`] explicitly when legacy strong pins are the only
+    /// desired strong roots.
+    pub fn compact(&mut self, retention: &RetentionRoots) -> Result<(), YardCollectError> {
+        self.collect(retention)?;
         let last = self.generations.len().saturating_sub(1);
         let mut dumped = Vec::new();
 
@@ -428,7 +417,7 @@ impl Yard {
                 }
 
                 // Overflow: dump the whole tier down — strong *and* weak
-                // survivors. `collect()` above already dropped dead, so the
+                // survivors. `collect(retention)` above already dropped dead, so the
                 // segment's `live` is exactly the survivors. Weak descends to
                 // use space in lower tiers rather than being pinned to the
                 // youngest generation; it stays evictable everywhere and is
@@ -486,7 +475,7 @@ impl Yard {
             }
         }
 
-        self.collect_with_retention(retention)
+        self.collect(retention)
     }
 
     /// Physically rewrite each generation's pile to contain only its live set.
@@ -1271,7 +1260,7 @@ mod tests {
         yard.put::<RawBytes, _>(raw_blob(b"weak")).unwrap();
 
         yard.pin_strong(pin_id(1), strong);
-        yard.collect().unwrap();
+        yard.collect(&RetentionRoots::new()).unwrap();
         let reader = yard.reader().unwrap();
 
         assert_eq!(get_raw(&reader, strong).unwrap(), raw_blob(b"strong"));
@@ -1302,7 +1291,7 @@ mod tests {
             .unwrap();
 
         yard.pin_strong(pin_id(2), parent);
-        yard.collect().unwrap();
+        yard.collect(&RetentionRoots::new()).unwrap();
         let reader = yard.reader().unwrap();
 
         assert!(reader.get::<Blob<UnknownBlob>, UnknownBlob>(parent).is_ok());
@@ -1345,7 +1334,7 @@ mod tests {
         let mut roots = RetentionRoots::new();
         roots.retain_recursive(owned_parent);
         roots.retain_direct(ledger_record);
-        yard.collect_with_retention(&roots).unwrap();
+        yard.collect(&roots).unwrap();
         let reader = yard.reader().unwrap();
 
         for retained in [owned_parent, owned_child, ledger_record] {
@@ -1371,7 +1360,7 @@ mod tests {
         yard.pin_strong(pin_id(3), parent);
         yard.pin_weak(absent).unwrap();
 
-        yard.collect().unwrap();
+        yard.collect(&RetentionRoots::new()).unwrap();
         let reader = yard.reader().unwrap();
 
         assert!(reader.get::<Blob<UnknownBlob>, UnknownBlob>(parent).is_ok());
@@ -1399,7 +1388,7 @@ mod tests {
         yard.put::<RawBytes, _>(raw_blob(b"cache")).unwrap();
         yard.pin_strong(pin_id(4), strong);
 
-        yard.compact().unwrap();
+        yard.compact(&RetentionRoots::new()).unwrap();
 
         // With a zero strong budget everything overflows downward; weak now
         // rides the flow to the bottom alongside strong (it is not pinned to
@@ -1440,7 +1429,7 @@ mod tests {
             get_raw(&reader, strong).unwrap()
         };
 
-        yard.compact().unwrap();
+        yard.compact(&RetentionRoots::new()).unwrap();
 
         // No separate reclaim(): the merge itself recycled gen 0's pile, so it
         // is physically empty, while the live blob moved down to gen 1 and
@@ -1458,7 +1447,7 @@ mod tests {
         let pin = pin_id(5);
 
         yard.pin_strong(pin, old);
-        yard.collect().unwrap();
+        yard.collect(&RetentionRoots::new()).unwrap();
         assert_eq!(
             get_raw(&yard.reader().unwrap(), old).unwrap(),
             raw_blob(b"old")
@@ -1466,7 +1455,7 @@ mod tests {
 
         let new = yard.put::<RawBytes, _>(raw_blob(b"new")).unwrap();
         yard.pin_strong(pin, new);
-        yard.collect().unwrap();
+        yard.collect(&RetentionRoots::new()).unwrap();
         let reader = yard.reader().unwrap();
 
         assert!(matches!(get_raw(&reader, old), Err(YardGetError::NotFound)));
@@ -1490,7 +1479,7 @@ mod tests {
             .unwrap();
 
         yard.pin_strong(pin_id(6), live);
-        yard.collect().unwrap();
+        yard.collect(&RetentionRoots::new()).unwrap();
         let before_size = fs::metadata(&paths[0]).unwrap().len();
         let before_count = pile_blob_count(&paths[0]);
         let before_reader = yard.reader().unwrap();
@@ -1576,7 +1565,7 @@ mod tests {
 
         // The reloaded weak pin still works as a retention marker: the
         // cached blob survives collection under the default budget.
-        reopened.collect().unwrap();
+        reopened.collect(&RetentionRoots::new()).unwrap();
         let reader = reopened.reader().unwrap();
         assert_eq!(get_raw(&reader, cached).unwrap(), raw_blob(b"cached"));
     }
@@ -2140,12 +2129,12 @@ mod tests {
                     }
                     6 => {
                         let expected = expected_live_after_collect(&yard, &model);
-                        yard.collect().unwrap();
+                        yard.collect(&RetentionRoots::new()).unwrap();
                         assert_exact_collect_result(&mut yard, &expected, &model, seed, step);
                     }
                     7 => {
                         let expected = expected_live_after_collect(&yard, &model);
-                        yard.compact().unwrap();
+                        yard.compact(&RetentionRoots::new()).unwrap();
                         assert_exact_collect_result(&mut yard, &expected, &model, seed, step);
                     }
                     8 => {
@@ -2230,7 +2219,7 @@ mod tests {
                 .unwrap();
 
             yard.pin_strong(pin_id(0), tenured);
-            yard.compact().unwrap();
+            yard.compact(&RetentionRoots::new()).unwrap();
             assert!(yard.contains_in_generation(2, tenured));
 
             // Weak-pinning a blob you already hold is a no-op: the want
@@ -2239,7 +2228,7 @@ mod tests {
             // tag — which is exactly why "weak never tenures" holds by
             // construction rather than needing eviction machinery here.
             yard.pin_weak(tenured).unwrap();
-            yard.compact().unwrap();
+            yard.compact(&RetentionRoots::new()).unwrap();
 
             assert!(
                 yard.contains_in_generation(2, tenured),

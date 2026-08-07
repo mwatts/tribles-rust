@@ -16,10 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   views. The conservative validation policy keeps every admitted `COMMIT`,
   `MERGE`, and `DERIVE` endpoint reproducible; endpoints may disappear only
   when callers supply exact durable claim verdicts that future readers also
-  consume. Yard collection accepts the same policy roots, and Pile can rewrite
-  them into another append-only store while composing in active legacy strong
-  pins. Weak wants are handled explicitly: they may be preserved as demand
-  markers without silently becoming ownership roots.
+  consume. Yard `collect` and `compact` require the same policy roots, and Pile
+  can rewrite them into another append-only store while composing in active
+  legacy strong pins. Weak wants are handled explicitly: they may be preserved
+  as demand markers without silently becoming ownership roots.
 - **Resolved `SimpleArchive` collections have one narrow read-side
   materializer.** It probes residency only for known semantic members, selects
   the deterministic overlap-aware physical cover, reports uncovered frontier
@@ -145,6 +145,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its resolved documentation backlog entry are removed.
 
 ### Changed
+
+- **Breaking: Yard collection and compaction now require an explicit retention
+  plan.** The parameterless `Yard::collect()` and `Yard::compact()` shortcuts
+  are removed, and the duplicate `collect_with_retention` and
+  `compact_with_retention` names become the singular `collect(&RetentionRoots)`
+  and `compact(&RetentionRoots)` APIs. Callers that intentionally rely only on
+  legacy strong pins must now say so by passing an empty plan.
 
 - **Breaking: blob enumeration now returns lightweight handle-and-length
   metadata.** Sync and async `BlobStoreList` implementations yield `BlobInfo`

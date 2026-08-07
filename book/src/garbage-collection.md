@@ -57,9 +57,10 @@ claim's obsolete inputs to disappear only when the caller has persistent
 positive evidence and all future readers consume that same evidence. An
 in-memory set used for one rewrite is not durable evidence.
 
-The resulting roots compose with both storage paths. Yard's
-`collect_with_retention` and `compact_with_retention` treat them as explicit
-policy roots. `Pile::rewrite_retained_into` copies the selected state into
+The resulting roots compose with both storage paths. Yard's `collect` and
+`compact` require them as explicit policy roots; callers pass an empty
+`RetentionRoots` deliberately when legacy strong pins are the only strong
+roots. `Pile::rewrite_retained_into` copies the selected state into
 another append-only pile and also recursively retains and recreates every active
 legacy strong-pin mapping, which allows pinned branches and collection scopes to
 coexist during migration. Weak wants are an explicit rewrite choice. Preserving
