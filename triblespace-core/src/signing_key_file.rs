@@ -2,9 +2,9 @@
 //!
 //! Loading and initialization are deliberately separate operations. Ordinary
 //! loading never creates a key or falls back to an ephemeral identity. Explicit
-//! initialization writes a mode-0600 temporary file beside the destination,
-//! makes its contents durable, and installs it atomically without replacing an
-//! existing winner.
+//! initialization writes a private mode-0600 temporary file without an
+//! access-granting ACL beside the destination, makes its contents durable, and
+//! installs it atomically without replacing an existing winner.
 
 use std::env;
 use std::error::Error as StdError;
@@ -30,6 +30,254 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+#[cfg(target_vendor = "apple")]
+mod platform_acl {
+    use std::ffi::c_void;
+    use std::fs::File;
+    use std::io;
+    use std::os::fd::AsRawFd;
+    use std::path::Path;
+    use std::ptr::NonNull;
+
+    use super::{Error, Operation};
+
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+
+    unsafe extern "C" {
+        fn acl_free(object: *mut c_void) -> libc::c_int;
+        fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> *mut c_void;
+        fn acl_init(count: libc::c_int) -> *mut c_void;
+        fn acl_set_fd_np(fd: libc::c_int, acl: *mut c_void, acl_type: libc::c_int) -> libc::c_int;
+    }
+
+    struct Acl(NonNull<c_void>);
+
+    impl Acl {
+        fn get(file: &File) -> io::Result<Option<Self>> {
+            // SAFETY: `file` owns a live descriptor and the returned ACL, when
+            // non-null, is released by `Drop`.
+            let raw = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+            let Some(raw) = NonNull::new(raw) else {
+                let error = io::Error::last_os_error();
+                return match error.raw_os_error() {
+                    // Darwin reports ENOENT when no extended ACL exists. A
+                    // filesystem that does not support ACLs cannot grant
+                    // additional access through one.
+                    Some(libc::ENOENT) | Some(libc::EOPNOTSUPP) => Ok(None),
+                    _ => Err(error),
+                };
+            };
+            Ok(Some(Self(raw)))
+        }
+
+        fn empty() -> io::Result<Self> {
+            // SAFETY: `acl_init` returns either null or a newly allocated ACL.
+            let raw = unsafe { acl_init(0) };
+            NonNull::new(raw)
+                .map(Self)
+                .ok_or_else(io::Error::last_os_error)
+        }
+
+        fn as_ptr(&self) -> *mut c_void {
+            self.0.as_ptr()
+        }
+    }
+
+    impl Drop for Acl {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` came from an ACL allocation function and has not
+            // been released yet.
+            let _ = unsafe { acl_free(self.0.as_ptr()) };
+        }
+    }
+
+    pub(super) fn ensure_private(file: &File, path: &Path) -> Result<(), Error> {
+        if Acl::get(file)
+            .map_err(|source| Error::io(Operation::InspectAccessControlList, path, source))?
+            .is_some()
+        {
+            return Err(Error::InsecureAccessControlList {
+                path: path.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(super) fn normalize_private(file: &File, path: &Path) -> Result<(), Error> {
+        if Acl::get(file)
+            .map_err(|source| Error::io(Operation::InspectAccessControlList, path, source))?
+            .is_none()
+        {
+            return Ok(());
+        }
+
+        let empty = Acl::empty()
+            .map_err(|source| Error::io(Operation::NormalizeAccessControlList, path, source))?;
+        // SAFETY: the descriptor is live and `empty` is a valid extended ACL.
+        let result = unsafe { acl_set_fd_np(file.as_raw_fd(), empty.as_ptr(), ACL_TYPE_EXTENDED) };
+        if result == -1 {
+            return Err(Error::io(
+                Operation::NormalizeAccessControlList,
+                path,
+                io::Error::last_os_error(),
+            ));
+        }
+        ensure_private(file, path)
+    }
+}
+
+#[cfg(target_os = "freebsd")]
+mod platform_acl {
+    use std::ffi::c_void;
+    use std::fs::File;
+    use std::io;
+    use std::os::fd::AsRawFd;
+    use std::path::Path;
+    use std::ptr::NonNull;
+
+    use super::{Error, Operation};
+
+    const ACL_TYPE_ACCESS: libc::c_int = 2;
+    const ACL_TYPE_NFS4: libc::c_int = 4;
+
+    unsafe extern "C" {
+        fn acl_free(object: *mut c_void) -> libc::c_int;
+        fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> *mut c_void;
+        fn acl_is_trivial_np(acl: *mut c_void, trivial: *mut libc::c_int) -> libc::c_int;
+        fn acl_set_fd_np(fd: libc::c_int, acl: *mut c_void, acl_type: libc::c_int) -> libc::c_int;
+        fn acl_strip_np(acl: *mut c_void, recalculate_mask: libc::c_int) -> *mut c_void;
+    }
+
+    struct Acl {
+        raw: NonNull<c_void>,
+        acl_type: libc::c_int,
+    }
+
+    impl Acl {
+        fn get(file: &File) -> io::Result<Option<Self>> {
+            // `acl_get_fd` is specified only for POSIX.1e access ACLs even
+            // though some FreeBSD libc versions infer NFSv4 via fpathconf.
+            // Probe both explicitly so ZFS NFSv4 ACLs cannot disappear behind
+            // an implementation detail.
+            for acl_type in [ACL_TYPE_NFS4, ACL_TYPE_ACCESS] {
+                // SAFETY: `file` owns a live descriptor and the returned ACL,
+                // when non-null, is released by `Drop`.
+                let raw = unsafe { acl_get_fd_np(file.as_raw_fd(), acl_type) };
+                if let Some(raw) = NonNull::new(raw) {
+                    return Ok(Some(Self { raw, acl_type }));
+                }
+
+                let error = io::Error::last_os_error();
+                match error.raw_os_error() {
+                    // The object/filesystem does not implement this ACL
+                    // dialect. Try the other one before concluding that ACLs
+                    // cannot grant access here.
+                    Some(libc::EINVAL) | Some(libc::EOPNOTSUPP) => {}
+                    _ => return Err(error),
+                }
+            }
+            Ok(None)
+        }
+
+        fn is_trivial(&self) -> io::Result<bool> {
+            let mut trivial = 0;
+            // SAFETY: `self.raw` is a live ACL and `trivial` is writable.
+            let result = unsafe { acl_is_trivial_np(self.raw.as_ptr(), &mut trivial) };
+            if result == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(trivial == 1)
+            }
+        }
+
+        fn strip(&self) -> io::Result<Self> {
+            // SAFETY: `self.raw` is a live ACL. A false `recalculate_mask`
+            // produces the minimal three-entry POSIX ACL; NFSv4 ignores it and
+            // produces its mode-equivalent trivial ACL.
+            let raw = unsafe { acl_strip_np(self.raw.as_ptr(), 0) };
+            NonNull::new(raw)
+                .map(|raw| Self {
+                    raw,
+                    acl_type: self.acl_type,
+                })
+                .ok_or_else(io::Error::last_os_error)
+        }
+
+        fn install(&self, file: &File) -> io::Result<()> {
+            // SAFETY: `file` owns a live descriptor, `self.raw` is a live ACL,
+            // and `self.acl_type` is the type through which it was retrieved.
+            let result =
+                unsafe { acl_set_fd_np(file.as_raw_fd(), self.raw.as_ptr(), self.acl_type) };
+            if result == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl Drop for Acl {
+        fn drop(&mut self) {
+            // SAFETY: `self.raw` came from an ACL allocation function and has
+            // not been released.
+            let _ = unsafe { acl_free(self.raw.as_ptr()) };
+        }
+    }
+
+    pub(super) fn ensure_private(file: &File, path: &Path) -> Result<(), Error> {
+        let Some(acl) = Acl::get(file)
+            .map_err(|source| Error::io(Operation::InspectAccessControlList, path, source))?
+        else {
+            return Ok(());
+        };
+        if !acl
+            .is_trivial()
+            .map_err(|source| Error::io(Operation::InspectAccessControlList, path, source))?
+        {
+            return Err(Error::InsecureAccessControlList {
+                path: path.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(super) fn normalize_private(file: &File, path: &Path) -> Result<(), Error> {
+        let Some(acl) = Acl::get(file)
+            .map_err(|source| Error::io(Operation::InspectAccessControlList, path, source))?
+        else {
+            return Ok(());
+        };
+        if acl
+            .is_trivial()
+            .map_err(|source| Error::io(Operation::InspectAccessControlList, path, source))?
+        {
+            return Ok(());
+        }
+        let stripped = acl
+            .strip()
+            .map_err(|source| Error::io(Operation::NormalizeAccessControlList, path, source))?;
+        stripped
+            .install(file)
+            .map_err(|source| Error::io(Operation::NormalizeAccessControlList, path, source))
+    }
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "freebsd")))]
+mod platform_acl {
+    use std::fs::File;
+    use std::path::Path;
+
+    use super::Error;
+
+    pub(super) fn ensure_private(_file: &File, _path: &Path) -> Result<(), Error> {
+        Ok(())
+    }
+
+    pub(super) fn normalize_private(_file: &File, _path: &Path) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
 /// Environment variable consulted when no explicit key path is supplied.
 pub const KEY_PATH_ENV: &str = "TRIBLESPACE_KEY";
 
@@ -44,10 +292,12 @@ const TEMP_ATTEMPTS: u64 = 128;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Operation {
     Inspect,
+    InspectAccessControlList,
     Open,
     Read,
     CreateTemporary,
     SetPermissions,
+    NormalizeAccessControlList,
     WriteTemporary,
     SyncTemporary,
     Install,
@@ -60,10 +310,12 @@ impl fmt::Display for Operation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let label = match self {
             Self::Inspect => "inspect",
+            Self::InspectAccessControlList => "inspect access control list of",
             Self::Open => "open",
             Self::Read => "read",
             Self::CreateTemporary => "create temporary file for",
             Self::SetPermissions => "set permissions on temporary file for",
+            Self::NormalizeAccessControlList => "normalize access control list of",
             Self::WriteTemporary => "write temporary file for",
             Self::SyncTemporary => "sync temporary file for",
             Self::Install => "install",
@@ -91,6 +343,8 @@ pub enum Error {
     NotRegularFile { path: PathBuf },
     /// A Unix key file grants any group or world permission.
     InsecurePermissions { path: PathBuf, mode: u32 },
+    /// A key file has an access-control list beyond its private mode bits.
+    InsecureAccessControlList { path: PathBuf },
     /// The file is not exactly 64 ASCII hexadecimal seed characters.
     InvalidFormat { path: PathBuf },
     /// The destination has no usable final path component.
@@ -141,6 +395,11 @@ impl fmt::Display for Error {
                 "signing-key file {} has group or world permissions ({mode:#05o})",
                 path.display()
             ),
+            Self::InsecureAccessControlList { path } => write!(
+                f,
+                "signing-key file {} has a nontrivial access control list",
+                path.display()
+            ),
             Self::InvalidFormat { path } => write!(
                 f,
                 "signing-key file {} is not exactly 64 hexadecimal seed characters",
@@ -168,6 +427,7 @@ impl StdError for Error {
             Self::Entropy { source } => Some(source),
             Self::NotRegularFile { .. }
             | Self::InsecurePermissions { .. }
+            | Self::InsecureAccessControlList { .. }
             | Self::InvalidFormat { .. }
             | Self::InvalidPath { .. }
             | Self::TemporaryNameExhausted { .. } => None,
@@ -195,9 +455,10 @@ pub fn resolve_path(explicit: Option<&Path>, pile: &Path) -> PathBuf {
 /// Load an existing durable Ed25519 signing key.
 ///
 /// The file must itself be a regular file (not a symlink), contain exactly 64
-/// ASCII hexadecimal characters with no surrounding whitespace, and, on Unix,
-/// grant no permissions to group or world. Missing files are ordinary typed
-/// I/O errors; this function never creates or substitutes a key.
+/// ASCII hexadecimal characters with no surrounding whitespace, and grant no
+/// access beyond the owner through Unix mode bits or a nontrivial ACL. Missing
+/// files are ordinary typed I/O errors; this function never creates or
+/// substitutes a key.
 pub fn load_existing(path: &Path) -> Result<SigningKey, Error> {
     let (parent_path, file_name) = destination_parts(path)?;
     let parent = ParentDirectory::open(parent_path, path)?;
@@ -224,6 +485,8 @@ fn decode_signing_key(mut file: File, path: &Path) -> Result<SigningKey, Error> 
             });
         }
     }
+
+    platform_acl::ensure_private(&file, path)?;
 
     if metadata.len() != ENCODED_SEED_LEN as u64 {
         return Err(Error::InvalidFormat {
@@ -261,13 +524,14 @@ fn decode_signing_key(mut file: File, path: &Path) -> Result<SigningKey, Error> 
 /// Explicitly initialize a durable signing-key file, or load its valid winner.
 ///
 /// Initialization never replaces an existing path. A newly generated seed is
-/// written to a same-directory mode-0600 temporary file and synced before an
-/// atomic hard-link installation. Concurrent initializers race only at that
-/// no-replace installation point; losers discard their temporary file, sync
-/// the parent directory, and strictly load the winner. On Unix, initialization
-/// opens the lexical parent once and performs every child operation relative to
-/// that stable directory handle, so a concurrent rename or symlink retarget
-/// cannot redirect later stages of the transaction.
+/// written to a same-directory mode-0600 temporary file, stripped of an
+/// inherited access-granting ACL before the write, and synced before an atomic
+/// hard-link installation. Concurrent initializers race only at that no-replace
+/// installation point; losers discard their temporary file, sync the parent
+/// directory, and strictly load the winner. On Unix, initialization opens the
+/// lexical parent once and performs every child operation relative to that
+/// stable directory handle, so a concurrent rename or symlink retarget cannot
+/// redirect later stages of the transaction.
 pub fn init(path: &Path) -> Result<SigningKey, Error> {
     init_with_hook(path, |_| {})
 }
@@ -604,12 +868,12 @@ fn create_temporary<'a>(
             Ok(file) => {
                 let mut guard = TemporaryGuard::new(parent, temporary_name);
                 #[cfg(unix)]
-                if let Err(source) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
+                if let Err(error) = prepare_private_temporary(&file, destination) {
                     drop(file);
                     let _ = guard.remove();
                     drop(guard);
                     let _ = parent.sync();
-                    return Err(Error::io(Operation::SetPermissions, destination, source));
+                    return Err(error);
                 }
                 return Ok((file, guard));
             }
@@ -622,6 +886,19 @@ fn create_temporary<'a>(
     Err(Error::TemporaryNameExhausted {
         path: destination.to_owned(),
     })
+}
+
+#[cfg(unix)]
+fn prepare_private_temporary(file: &File, destination: &Path) -> Result<(), Error> {
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|source| Error::io(Operation::SetPermissions, destination, source))?;
+    platform_acl::normalize_private(file, destination)?;
+    // FreeBSD installs a mode-equivalent trivial ACL; reapplying 0600 pins that
+    // mode after normalization. On Darwin this is harmless and keeps the
+    // post-normalization invariant uniform.
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|source| Error::io(Operation::SetPermissions, destination, source))?;
+    platform_acl::ensure_private(file, destination)
 }
 
 fn cleanup_after_error<T>(
@@ -705,6 +982,9 @@ mod tests {
     use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
 
+    #[cfg(target_os = "macos")]
+    use std::process::Command;
+
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct EnvRestore(Option<OsString>);
@@ -722,6 +1002,17 @@ mod tests {
         fs::write(path, bytes).unwrap();
         #[cfg(unix)]
         fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn add_darwin_acl(path: &Path, entry: &str) {
+        let status = Command::new("/bin/chmod")
+            .arg("+a")
+            .arg(entry)
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     #[test]
@@ -833,6 +1124,54 @@ mod tests {
             load_existing(&link),
             Err(Error::NotRegularFile { .. })
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn strict_load_rejects_extended_access_control_lists() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = directory.path().join("key");
+        private_write(
+            &key,
+            b"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        );
+        add_darwin_acl(&key, "everyone allow read");
+
+        assert_eq!(
+            fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(matches!(
+            load_existing(&key),
+            Err(Error::InsecureAccessControlList { .. })
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn explicit_init_removes_an_inherited_access_control_list() {
+        let directory = tempfile::tempdir().unwrap();
+        add_darwin_acl(directory.path(), "everyone allow read,file_inherit");
+
+        // Prove the fixture really gives a mode-0600 child an access-granting
+        // ACL. Darwin preserves this inherited entry across chmod(0600).
+        let inherited = directory.path().join("inherited");
+        private_write(
+            &inherited,
+            b"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        );
+        assert!(matches!(
+            load_existing(&inherited),
+            Err(Error::InsecureAccessControlList { .. })
+        ));
+        fs::remove_file(inherited).unwrap();
+
+        let path = directory.path().join("new.key");
+        let initialized = init(&path).unwrap();
+        assert_eq!(
+            load_existing(&path).unwrap().to_bytes(),
+            initialized.to_bytes()
+        );
     }
 
     #[cfg(unix)]
