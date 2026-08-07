@@ -231,8 +231,8 @@ impl<D> CollectionResolution<D> {
     ///
     /// This includes accepted equations whose membership prerequisites are
     /// not active yet. Unauthorized commits are absent, as are pending and
-    /// rejected claims. Retention policies use this set to distinguish
-    /// admitted ledger records from arbitrary append noise.
+    /// rejected claims. Strong retention consumes only the commit ids in this
+    /// set; admitted unsigned equations remain collectable cache work.
     pub fn admitted_claims(&self) -> &BTreeSet<Id> {
         &self.admitted_claims
     }

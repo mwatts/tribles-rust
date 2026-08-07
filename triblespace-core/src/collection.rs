@@ -10,7 +10,7 @@ pub mod discovery;
 pub mod records;
 /// Stateless semantic admission, closure, provenance, and physical-cover view.
 pub mod resolution;
-/// Policy-driven retention planning for admitted collection views.
+/// Strong retention planning for authorized collection commits.
 pub mod retention;
 /// Canonical `SimpleArchive` set-union collection kind.
 pub mod simplearchive_union;

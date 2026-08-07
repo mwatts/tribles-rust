@@ -40,22 +40,21 @@ has two sorts:
 - a **recursive** root retains the blob and all resident descendants found by
   conservative traversal.
 
-Collection definitions and admitted `COMMIT`, `MERGE`, and `DERIVE` records are
-direct roots. Accepted commit metadata, the selected physical cover, validation
-endpoints, and their attachments are recursive roots. This division keeps the
-ledger available without silently turning descriptive hashes into ownership.
-Only claims admitted by the caller's authorization and validation policy can
-create roots, so unrelated self-signed records in an append-only pile do not
-retain arbitrary data.
+Strong collection retention follows only signed ground truth. For every
+locally authorized, admitted `COMMIT`, its collection definition and canonical
+commit record are direct roots. The commit's signed data and metadata are
+recursive roots, so their resident attachments remain owned. Planning fails if
+any required definition, data, or metadata blob is absent.
 
-Validation adds one necessary conservative seam. Resolution is stateless: if a
-claim was accepted by examining endpoint bytes, a later reader cannot repeat
-that verdict after those bytes have been collected. The default
-`ValidationRetentionPolicy::RetainAllEndpoints` therefore retains the endpoint
-bytes of every admitted claim. `DurableValidationEvidence` permits an exact
-claim's obsolete inputs to disappear only when the caller has persistent
-positive evidence and all future readers consume that same evidence. An
-in-memory set used for one rewrite is not durable evidence.
+Unsigned `MERGE` and `DERIVE` records are reproducible cache work. They add no
+strong roots even when validation accepts them and their equations are active;
+their records, intermediate inputs, results, and derived collection
+definitions may all be collected. A future cache planner can choose useful
+equations or materializations under a separate budget without letting
+append-only unsigned claims manufacture durable ownership. This boundary also
+means the strong planner needs neither a requested-view set nor persistent
+validation-verdict machinery: admitted commits themselves determine the
+collections that are retained.
 
 The resulting roots compose with both storage paths. Yard's `collect` and
 `compact` require them as explicit policy roots; callers pass an empty
@@ -68,12 +67,12 @@ them copies their demand markers but does not promote the requested blob to an
 ownership root; dropping them omits the markers entirely.
 
 `RetentionRoots` is deliberately a pure, ephemeral plan rather than a retained
-scope registry. Every later collection or rewrite must rediscover the locally
-selected collections, apply the local signer/authorization policy, resolve the
-claims, and supply a fresh plan. Do not remove the last legacy strong pin for a
-dataset until a higher-level service durably owns that recurring policy. It is
-safe to publish and validate the collection while leaving the pin in place
-during this transition; both root sources compose idempotently.
+scope registry. Every later collection or rewrite must rediscover records,
+apply the local signer/authorization policy, resolve the claims, and supply a
+fresh plan for all admitted commits. Do not remove the last legacy strong pin
+for a dataset until a higher-level service durably owns that recurring policy.
+It is safe to publish and validate the collection while leaving the pin in
+place during this transition; both root sources compose idempotently.
 
 ## Conservative Reachability
 

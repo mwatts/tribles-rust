@@ -10,16 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Collection retention is now an explicit two-edge policy rather than a
-  blind hash walk.** `RetentionRoots` distinguishes direct ledger-record roots
-  from recursively owned data and metadata, while resolved collections expose
-  their admitted claims and produce complete retention plans for selected
-  views. The conservative validation policy keeps every admitted `COMMIT`,
-  `MERGE`, and `DERIVE` endpoint reproducible; endpoints may disappear only
-  when callers supply exact durable claim verdicts that future readers also
-  consume. Yard `collect` and `compact` require the same policy roots, and Pile
-  can rewrite them into another append-only store while composing in active
-  legacy strong pins. Weak wants are handled explicitly: they may be preserved
-  as demand markers without silently becoming ownership roots.
+  blind hash walk.** `RetentionRoots` distinguishes direct record roots from
+  recursively owned blobs. The strong planner retains only locally authorized,
+  admitted `COMMIT` ground truth: each referenced collection definition and
+  commit record directly, and each signed data and metadata blob recursively
+  with its resident attachments. Unsigned `MERGE` and `DERIVE` equations add no
+  roots even when accepted and active; they remain collectable cache work for a
+  separate future policy. Yard `collect` and `compact` require those policy
+  roots explicitly, and Pile can rewrite them into another append-only store
+  while composing in active legacy strong pins. Weak wants are handled
+  explicitly: they may be preserved as demand markers without silently
+  becoming ownership roots.
 - **Resolved `SimpleArchive` collections have one narrow read-side
   materializer.** It probes residency only for known semantic members, selects
   the deterministic overlap-aware physical cover, reports uncovered frontier
