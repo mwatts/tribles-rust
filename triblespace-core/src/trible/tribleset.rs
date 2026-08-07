@@ -51,11 +51,38 @@ use zerocopy::IntoBytes;
 /// capability. This function materializes exactly the canonical rows whose
 /// bytes define that root and does not register it with an ID owner.
 #[doc(hidden)]
-pub fn build_intrinsic_entity(mut rows: Vec<IntrinsicEntityRow>) -> (Id, TribleSet) {
+pub fn build_intrinsic_entity(rows: Vec<IntrinsicEntityRow>) -> (Id, TribleSet) {
+    build_intrinsic_entity_inner(rows, None)
+}
+
+/// Canonicalizes and stores a content-derived entity inside a caller-supplied
+/// namespace. The namespace prefixes the same canonical row byte stream used
+/// by [`build_intrinsic_entity`]. Because the namespace is configuration rather
+/// than an emitted fact, the result is reproducible only within that namespace;
+/// it is not self-certifying from the returned rows alone.
+pub(crate) fn build_namespaced_intrinsic_entity(
+    rows: Vec<IntrinsicEntityRow>,
+    namespace: &[u8],
+) -> (Id, TribleSet) {
+    build_intrinsic_entity_inner(rows, Some(namespace))
+}
+
+fn build_intrinsic_entity_inner(
+    mut rows: Vec<IntrinsicEntityRow>,
+    namespace: Option<&[u8]>,
+) -> (Id, TribleSet) {
     rows.sort_unstable();
     rows.dedup();
 
-    let digest = Blake3::digest(rows.as_slice().as_bytes());
+    let digest = match namespace {
+        Some(namespace) => {
+            let mut hasher = Blake3::new();
+            hasher.update(namespace);
+            hasher.update(rows.as_slice().as_bytes());
+            hasher.finalize()
+        }
+        None => Blake3::digest(rows.as_slice().as_bytes()),
+    };
     let mut raw_id: RawId = [0; crate::id::ID_LEN];
     raw_id.copy_from_slice(&digest[digest.len() - crate::id::ID_LEN..]);
     let id = Id::new(raw_id).expect("BLAKE3-derived entity ids must be non-nil");

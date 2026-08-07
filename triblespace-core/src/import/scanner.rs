@@ -6,7 +6,7 @@
 //! # Why this exists
 //!
 //! Both packaged importers *consume* every value in a document and impose one
-//! identity model (content-addressed hash of all attribute/value pairs, or a
+//! identity model (content-addressed hash of canonical fact rows, or a
 //! lossless tree). An importer that wants to *project* — read the handful of
 //! fields it cares about and ignore the rest — had no ingredient to reach for,
 //! so importers outside this crate reached for `serde_json::Value` instead:

@@ -42,8 +42,8 @@ impl From<SignatureError> for ValidationError {
 /// provided it is stored as a long commit message via a LongString blob
 /// handle. If `metadata` is provided it is stored as a SimpleArchive handle.
 ///
-/// The commit's entity id is derived intrinsically from the
-/// `(attribute, value)` pairs present in the metadata — so two commits with
+/// The commit's entity id is derived intrinsically from the metadata's sorted,
+/// deduplicated `NIL || attribute || value` rows — so two commits with
 /// identical content, parents, and signatures collide on entity id and blob
 /// hash alike. This matters especially for **merge commits**
 /// (`content = None`): merges carry no author-specific bits (no signature,
@@ -77,8 +77,8 @@ pub fn commit_metadata(
     };
     let parents: Vec<_> = parents.into_iter().collect();
 
-    // `entity!` without an explicit `id @` prefix derives the entity id
-    // by hashing the sorted/deduped (attr_id, value) pairs. The resulting
+    // `entity!` without an explicit `id @` prefix derives the entity id by
+    // hashing the sorted/deduped NIL || attr_id || value rows. The resulting
     // commit is content-addressed at both the blob level (via
     // SimpleArchive) and the entity-id level.
     let fragment = entity! {

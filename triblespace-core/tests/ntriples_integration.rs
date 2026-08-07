@@ -414,6 +414,14 @@ _:c <http://ex/age> "43"^^<http://www.w3.org/2001/XMLSchema#integer> .
         2,
         "(_:a, age=42) and (_:b, age=42) share an id; (_:c, age=43) is distinct"
     );
+
+    let expected_42 = entity! { age: 42i128 }
+        .root()
+        .expect("entity! produces the canonical one-row identity");
+    assert!(
+        subjects.contains(&expected_42),
+        "non-orphan bnodes must use the byte-exact entity! identity protocol"
+    );
 }
 
 #[test]
@@ -456,6 +464,50 @@ _:b1 <http://ex/q> "x" .
     assert_eq!(
         outgoing_count, 1,
         "bnode's outgoing fact uses the same id the incoming reference resolved to"
+    );
+}
+
+#[test]
+fn acyclic_bnode_dependencies_resolve_leaf_first_with_entity_parity() {
+    let data = br#"
+_:parent <http://ex/child> _:child .
+_:child <http://ex/name> "leaf" .
+"#;
+    let facts = ingest_ntriples(Cursor::new(&data[..]))
+        .expect("acyclic bnode graph")
+        .facts
+        .into_facts();
+
+    let child_attr = Attribute::<inlineencodings::GenId>::from(entity! {
+        metadata::iri:          "http://ex/child".to_blob().get_handle(),
+        metadata::value_encoding: <inlineencodings::GenId as MetaDescribe>::id(),
+    });
+    let name_attr = Attribute::<Handle<LongString>>::from(entity! {
+        metadata::iri:          "http://ex/name".to_blob().get_handle(),
+        metadata::value_encoding: <Handle<LongString> as MetaDescribe>::id(),
+    });
+    let leaf_handle: Inline<Handle<LongString>> = "leaf".to_blob().get_handle();
+    let expected_child = entity! { name_attr: leaf_handle }
+        .root()
+        .expect("child identity");
+    let expected_parent = entity! { child_attr: expected_child }
+        .root()
+        .expect("parent identity");
+
+    let (actual_child,) = find!(
+        (id: Id),
+        pattern!(&facts, [{ expected_parent @ child_attr: ?id }])
+    )
+    .next()
+    .expect("parent points at child");
+    assert_eq!(actual_child, expected_child);
+    assert_eq!(
+        find!(
+            (value: Inline<Handle<LongString>>),
+            pattern!(&facts, [{ expected_child @ name_attr: ?value }])
+        )
+        .count(),
+        1
     );
 }
 

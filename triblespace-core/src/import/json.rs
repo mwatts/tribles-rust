@@ -1,6 +1,7 @@
 //! Deterministic JSON *object* importer built on a winnow-based streaming parser.
 //!
-//! This importer hashes attribute/value pairs to derive entity identifiers.
+//! This importer uses the canonical `NIL || attribute || value` row protocol
+//! shared with `entity!` to derive entity identifiers.
 //! Identical JSON objects therefore converge to the same id, enabling structural
 //! deduplication.
 //!
@@ -18,18 +19,20 @@ use crate::attribute::Attribute;
 use crate::blob::encodings::longstring::LongString;
 use crate::blob::Blob;
 use crate::blob::IntoBlob;
-use crate::id::{ExclusiveId, Id, RawId, ID_LEN};
+use crate::id::{ExclusiveId, Id};
 use crate::inline::encodings::boolean::Boolean;
 use crate::inline::encodings::f64::F64;
 use crate::inline::encodings::genid::GenId;
-use crate::inline::encodings::hash::{Blake3, Handle};
-use crate::inline::encodings::UnknownInline;
+use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding, IntoInline, RawInline};
 use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::{Describe, MetaDescribe};
 use crate::repo::BlobStore;
-use crate::trible::{Fragment, Trible, TribleSet};
+use crate::trible::{
+    build_intrinsic_entity, build_namespaced_intrinsic_entity, Fragment, IntrinsicEntityRow,
+    TribleSet,
+};
 
 /// Error returned by [`JsonObjectImporter`] when importing a JSON document.
 #[derive(Debug)]
@@ -126,7 +129,7 @@ impl std::error::Error for EncodeError {
 
 type ParsedString = View<str>;
 
-/// Deterministic JSON importer that derives entity ids from attribute/value pairs.
+/// Deterministic JSON importer that derives entity ids from canonical fact rows.
 ///
 /// This importer expects either:
 /// - a top-level JSON object, or
@@ -242,7 +245,7 @@ where
             Some(b'{') => {
                 let (root, obj_staged) = self.parse_object(&mut bytes)?;
                 staged += obj_staged;
-                roots.push(root.forget());
+                roots.push(root);
             }
             Some(b'[') => {
                 self.consume_byte(&mut bytes, b'[')?;
@@ -257,7 +260,7 @@ where
                         }
                         let (root, obj_staged) = self.parse_object(&mut bytes)?;
                         staged += obj_staged;
-                        roots.push(root.forget());
+                        roots.push(root);
                         self.skip_ws(&mut bytes);
                         match bytes.peek_token() {
                             Some(b',') => {
@@ -280,13 +283,10 @@ where
         Ok(Fragment::new(roots, staged))
     }
 
-    fn parse_object(
-        &mut self,
-        bytes: &mut Bytes,
-    ) -> Result<(ExclusiveId, TribleSet), JsonImportError> {
+    fn parse_object(&mut self, bytes: &mut Bytes) -> Result<(Id, TribleSet), JsonImportError> {
         self.consume_byte(bytes, b'{')?;
         self.skip_ws(bytes);
-        let mut pairs: Vec<(RawId, RawInline)> = Vec::new();
+        let mut pairs: Vec<(Id, RawInline)> = Vec::new();
         let mut staged = TribleSet::new();
 
         if bytes.peek_token() == Some(b'}') {
@@ -313,12 +313,15 @@ where
             }
         }
 
-        let entity = self.derive_id(&pairs)?;
-        for (attr_raw, value_raw) in pairs {
-            let attr_id = Id::new(attr_raw).ok_or(JsonImportError::PrimitiveRoot)?;
-            let value = Inline::<UnknownInline>::new(value_raw);
-            staged.insert(&Trible::new(&entity, &attr_id, &value));
-        }
+        let rows = pairs
+            .into_iter()
+            .map(|(attribute, value)| IntrinsicEntityRow::new(attribute, value))
+            .collect();
+        let (entity, entity_facts) = match self.id_salt.as_ref() {
+            Some(namespace) => build_namespaced_intrinsic_entity(rows, namespace),
+            None => build_intrinsic_entity(rows),
+        };
+        staged += entity_facts;
 
         Ok((entity, staged))
     }
@@ -327,7 +330,7 @@ where
         &mut self,
         bytes: &mut Bytes,
         field: &ParsedString,
-        pairs: &mut Vec<(RawId, RawInline)>,
+        pairs: &mut Vec<(Id, RawInline)>,
         staged: &mut TribleSet,
     ) -> Result<(), JsonImportError> {
         self.consume_byte(bytes, b'[')?;
@@ -360,7 +363,7 @@ where
         &mut self,
         bytes: &mut Bytes,
         field: &ParsedString,
-        pairs: &mut Vec<(RawId, RawInline)>,
+        pairs: &mut Vec<(Id, RawInline)>,
         staged: &mut TribleSet,
     ) -> Result<(), JsonImportError> {
         match bytes.peek_token() {
@@ -371,13 +374,13 @@ where
             Some(b't') => {
                 self.consume_literal(bytes, b"true")?;
                 let attr = self.bool_attr(field)?;
-                pairs.push((attr.raw(), attr.inline_from(true).raw));
+                pairs.push((attr.id(), attr.inline_from(true).raw));
                 Ok(())
             }
             Some(b'f') => {
                 self.consume_literal(bytes, b"false")?;
                 let attr = self.bool_attr(field)?;
-                pairs.push((attr.raw(), attr.inline_from(false).raw));
+                pairs.push((attr.id(), attr.inline_from(false).raw));
                 Ok(())
             }
             Some(b'"') => {
@@ -391,7 +394,7 @@ where
                             field: field_name,
                             source: EncodeError::from_error(err),
                         })?;
-                pairs.push((attr.raw(), handle.raw));
+                pairs.push((attr.id(), handle.raw));
                 Ok(())
             }
             Some(b'{') => {
@@ -399,7 +402,7 @@ where
                 *staged += child_staged;
                 let attr = self.genid_attr(field)?;
                 let value = GenId::inline_from(&child);
-                pairs.push((attr.raw(), value.raw));
+                pairs.push((attr.id(), value.raw));
                 Ok(())
             }
             Some(b'[') => self.parse_array(bytes, field, pairs, staged),
@@ -422,30 +425,10 @@ where
                 }
                 let attr = self.num_attr(field)?;
                 let encoded: Inline<F64> = number.to_inline();
-                pairs.push((attr.raw(), encoded.raw));
+                pairs.push((attr.id(), encoded.raw));
                 Ok(())
             }
         }
-    }
-
-    fn derive_id(&self, pairs: &[(RawId, RawInline)]) -> Result<ExclusiveId, JsonImportError> {
-        let mut sorted = pairs.to_vec();
-        sorted
-            .sort_by(|(a_attr, a_val), (b_attr, b_val)| a_attr.cmp(b_attr).then(a_val.cmp(b_val)));
-
-        let mut hasher = Blake3::new();
-        if let Some(salt) = self.id_salt {
-            hasher.update(salt.as_ref());
-        }
-        for (attr, value) in &sorted {
-            hasher.update(attr);
-            hasher.update(value);
-        }
-        let digest: [u8; 32] = hasher.finalize();
-        let mut raw = [0u8; ID_LEN];
-        raw.copy_from_slice(&digest[digest.len() - ID_LEN..]);
-        let id = Id::new(raw).ok_or(JsonImportError::PrimitiveRoot)?;
-        Ok(ExclusiveId::force(id))
     }
 
     fn skip_ws(&self, bytes: &mut Bytes) {
@@ -671,6 +654,69 @@ mod tests {
         assert_eq!(roots.len(), 1);
         assert_eq!(fragment.facts().len(), 2);
         assert!(!importer.metadata().facts().is_empty());
+    }
+
+    #[test]
+    fn unsalted_json_root_matches_equivalent_entity_macro() {
+        let mut blobs = MemoryBlobStore::new();
+        let mut importer = JsonObjectImporter::<_>::new(&mut blobs, None);
+        let imported = importer
+            .import_str(r#"{"title":"Dune","pages":412}"#)
+            .unwrap();
+
+        let title = importer
+            .str_attrs
+            .iter()
+            .find(|(name, _)| name.as_ref() == "title")
+            .map(|(_, attribute)| attribute.clone())
+            .expect("title attribute was derived");
+        let pages = importer
+            .num_attrs
+            .iter()
+            .find(|(name, _)| name.as_ref() == "pages")
+            .map(|(_, attribute)| attribute.clone())
+            .expect("pages attribute was derived");
+        let title_value: Inline<Handle<LongString>> = "Dune".to_blob().get_handle();
+        let expected = entity! {
+            title: title_value,
+            pages: 412.0f64,
+        };
+
+        assert_eq!(imported.root(), expected.root());
+        assert_eq!(imported.facts(), expected.facts());
+    }
+
+    #[test]
+    fn duplicate_json_members_have_the_same_set_identity() {
+        let mut single_blobs = MemoryBlobStore::new();
+        let single = JsonObjectImporter::<_>::new(&mut single_blobs, None)
+            .import_str(r#"{"tag":["x"]}"#)
+            .unwrap();
+
+        let mut duplicate_blobs = MemoryBlobStore::new();
+        let duplicate = JsonObjectImporter::<_>::new(&mut duplicate_blobs, None)
+            .import_str(r#"{"tag":["x","x"]}"#)
+            .unwrap();
+
+        assert_eq!(single.root(), duplicate.root());
+        assert_eq!(single.facts(), duplicate.facts());
+    }
+
+    #[test]
+    fn namespaced_json_identity_is_order_and_duplicate_invariant() {
+        let namespace = [0x5au8; 32];
+        let mut first_blobs = MemoryBlobStore::new();
+        let first = JsonObjectImporter::<_>::new(&mut first_blobs, Some(namespace))
+            .import_str(r#"{"tag":["x","x"],"active":true}"#)
+            .unwrap();
+
+        let mut second_blobs = MemoryBlobStore::new();
+        let second = JsonObjectImporter::<_>::new(&mut second_blobs, Some(namespace))
+            .import_str(r#"{"active":true,"tag":["x"]}"#)
+            .unwrap();
+
+        assert_eq!(first.root(), second.root());
+        assert_eq!(first.facts(), second.facts());
     }
 
     fn extract_handle_raw(facts: &TribleSet, expected_attr: &str) -> RawInline {

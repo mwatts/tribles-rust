@@ -11,11 +11,12 @@ The `triblespace_core::import` module collects conversion helpers that translate
 structured documents into raw tribles. Today the namespace ships with two
 deterministic JSON importers and an N-Triples (RDF) importer:
 
-- `JsonObjectImporter` hashes attribute/value pairs to derive entity identifiers
-  so identical inputs reproduce the same entities. It accepts a top-level JSON
+- `JsonObjectImporter` hashes sorted and deduplicated
+  `NIL || attribute || value` rows using the same protocol as `entity!`, so
+  identical fact sets reproduce the same entities. It accepts a top-level JSON
   object (or a top-level array of objects). Construct it with a blob sink (e.g.,
-  a `Workspace`’s store or a `MemoryBlobStore`) and an optional 32-byte salt when
-  you want to mix in extra entropy to avoid collisions. Each `import_*` call
+  a `Workspace`’s store or a `MemoryBlobStore`) and an optional 32-byte namespace
+  when independently imported corpora must not share identities. Each `import_*` call
   returns a [`Fragment`](../src/trible/fragment.rs) that exports the root entity
   id(s) and contains the emitted facts.
 - `JsonTreeImporter` preserves the full JSON structure and ordering by emitting
@@ -212,15 +213,16 @@ prefixes, blank nodes, and quad/N-Quads are not yet supported.
 
 ## Managing Entity Identifiers
 
-The importer buffers the encoded attribute/value pairs for each object, sorts
-them, and feeds the resulting byte stream into a hash protocol. The first 16
-bytes of that digest become the entity identifier, ensuring identical JSON
-inputs produce identical IDs even across separate runs. You can supply an
-optional 32-byte salt via the constructor to keep deterministic imports from
-colliding with existing data. Once the identifier is established,
-the importer writes the derived pairs into a `TribleSet` via `Trible::new` and
-returns them as a `Fragment` whose exports are the root entity id(s) for the
-imported document.
+The importer buffers the encoded facts for each object as complete 64-byte
+`NIL || attribute || value` rows, sorts and deduplicates them, hashes their
+contiguous bytes with BLAKE3, and takes the final 16 digest bytes as the entity
+identifier. It passes those same defining rows through the shared intrinsic
+entity builder, ensuring identical fact sets produce identical IDs even across
+separate runs. You can supply an optional 32-byte namespace via the constructor;
+it prefixes the canonical row stream and deliberately prevents identities from
+unifying across namespaces. The returned `Fragment` exports the resulting plain
+`Id` root and contains exactly the object's defining rows plus any recursively
+imported child-object facts.
 
 This hashing step also changes how repeated structures behave. When a JSON
 document contains identical nested objects—common in fixtures such as

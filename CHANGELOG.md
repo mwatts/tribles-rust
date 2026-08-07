@@ -56,6 +56,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: Identity Epoch 2 redefines every implicit entity root from its
+  canonical trible rows.** `entity!`, the JSON object importer, and non-orphan
+  N-Triples blank nodes now share one protocol: encode each defining fact as
+  `NIL || attribute || value`, sort and deduplicate the complete 64-byte rows,
+  hash their contiguous bytes with BLAKE3, and take the final 16 digest bytes.
+  Every persisted non-empty implicit entity ID changes, including dynamic
+  attribute IDs and identities that transitively contain them. Treat all
+  Epoch-1 implicit-ID data as incompatible: migrate or re-ingest it as one
+  corpus, and never mix epochs even where the empty-row digest happens to
+  coincide. `RangeRecord` canonical validation and commit, branch, capability,
+  index-recipe, and dynamic-attribute identities all rotate transitively; the
+  corresponding faculties migration is a separate downstream release cut.
+  Implicit whole-set construction exports a reproducible plain `Id`
+  and emits exactly its hashed defining rows; incremental explicit subjects
+  still require an `ExclusiveId`. JSON namespace salts remain supported over
+  the new canonical row stream, while N-Triples' random orphan salt remains a
+  deliberately separate fresh-existential protocol.
+
 - **SuccinctArchive CPU range confirmation batches wavelet descents.** The
   frontier still forms and routes each complete candidate region before any
   fallback, while the canonical CPU path resolves adjacent distinct values in

@@ -404,9 +404,12 @@ pub fn pattern_changes(input: TokenStream) -> TokenStream {
 ///
 /// `entity! { [id_expr] @ attr: value, attr?: option, attr*: repeated }`
 ///
-/// If the id is omitted, the macro derives a deterministic entity id from the
-/// attribute/value pairs. `attr?:` inserts a fact only when the option is
-/// `Some`, and `attr*:` spreads repeated values into multiple facts.
+/// If the id is omitted, the macro derives a deterministic plain `Id` by
+/// sorting and deduplicating the complete `NIL || attribute || value` rows and
+/// hashing their contiguous bytes. Supplying an explicit subject instead
+/// requires an `ExclusiveId`, the write capability for incrementally extending
+/// that identity. `attr?:` inserts a fact only when the option is `Some`, and
+/// `attr*:` spreads repeated values into multiple facts.
 ///
 /// ```rust,ignore
 /// let alice = fucid();

@@ -84,9 +84,9 @@ fn now_updated_at() -> Inline<NsTAIInterval> {
 /// signed with `signing_key` allowing the repository to verify its
 /// authenticity.
 ///
-/// The metadata entity id is derived intrinsically from the
-/// `(attribute, value)` pairs via `entity!`'s content-hash form — no
-/// open-coded derivation. Because every publish stamps a fresh
+/// The metadata entity id is derived intrinsically from canonical
+/// `NIL || attribute || value` rows via `entity!` — no open-coded derivation.
+/// Because every publish stamps a fresh
 /// `metadata::updated_at`, each publish produces a distinct entity id
 /// and a distinct metadata blob hash (which is what lets receivers order
 /// concurrent HEAD gossips by timestamp alone).

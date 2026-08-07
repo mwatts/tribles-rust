@@ -36,12 +36,12 @@
 //! out of normal joins instead of needing a `lang()` builtin.
 //!
 //! Blank nodes are resolved via the same content-address path the
-//! `entity!` macro uses: a bnode's id is the Blake3 of its sorted
-//! `(attribute, value)` pairs. Two bnodes with the same outgoing facts
-//! collapse to a single entity automatically — the bnode IS the entity
-//! that has these facts. Orphan bnodes (referenced but never appear as
-//! subject) get a per-import salt so they're distinct existentials
-//! across separate ingest calls. Cyclic blank-node graphs return
+//! `entity!` macro uses: a bnode's id is the Blake3 of its sorted and
+//! deduplicated `NIL || attribute || value` rows. Two bnodes with the same
+//! outgoing facts collapse to a single entity automatically — the bnode IS
+//! the entity that has these facts. Orphan bnodes (referenced but never appear
+//! as subject) get a per-import salt so they're distinct existentials across
+//! separate ingest calls. Cyclic blank-node graphs return
 //! [`IngestError::BnodeCycle`] — there's no fixed-point id assignment
 //! without symmetry-breaking, and we'd rather refuse than guess.
 //!
@@ -94,7 +94,7 @@ use crate::inline::encodings::UnknownInline;
 use crate::inline::{Inline, IntoInline, RawInline, TryToInline};
 use crate::macros::entity;
 use crate::prelude::inlineencodings;
-use crate::trible::{Fragment, Trible, TribleSet};
+use crate::trible::{build_intrinsic_entity, Fragment, IntrinsicEntityRow, Trible, TribleSet};
 
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 
@@ -240,35 +240,25 @@ impl BnodeBuffer {
 
         // 3. Resolve each bnode's id in dependency order. By the time
         //    we visit a label, all labels its outgoing facts reference
-        //    are already in `resolved`.
+        //    are already in `resolved`. Non-orphans go through the exact
+        //    canonical builder used by `entity!`; its returned facts are the
+        //    complete defining rows for that intrinsic root.
         let mut resolved: HashMap<View<str>, Id> = HashMap::new();
         for label in order {
-            let id = resolve_bnode_id(&label, &self.outgoing, &resolved, &self.salt);
+            let rows = bnode_rows(&label, &self.outgoing, &resolved);
+            let (id, outgoing_facts) = if rows.is_empty() {
+                (
+                    resolve_orphan_bnode_id(&label, &self.salt),
+                    TribleSet::new(),
+                )
+            } else {
+                build_intrinsic_entity(rows)
+            };
+            *facts += outgoing_facts;
             resolved.insert(label, id);
         }
 
-        // 4. Emit outgoing tribles (bnode-as-subject).
-        for (label, edges) in self.outgoing {
-            let subject_id = resolved[&label];
-            let e = ExclusiveId::force_ref(&subject_id);
-            for edge in edges {
-                let (attr_id, value_raw) = match edge {
-                    OutgoingFact::Resolved { attr_id, value_raw } => (attr_id, value_raw),
-                    OutgoingFact::BnodeRef {
-                        attr_id,
-                        target_label,
-                    } => {
-                        let target_id = resolved[&target_label];
-                        let v: Inline<GenId> = target_id.to_inline();
-                        (attr_id, v.raw)
-                    }
-                };
-                let v: Inline<UnknownInline> = Inline::new(value_raw);
-                facts.insert(&Trible::new(e, &attr_id, &v));
-            }
-        }
-
-        // 5. Emit incoming tribles (bnode-as-object, subject already known).
+        // 4. Emit incoming tribles (bnode-as-object, subject already known).
         for inc in self.incoming {
             let target_id = resolved[&inc.target_label];
             let e = ExclusiveId::force_ref(&inc.subject_id);
@@ -281,20 +271,14 @@ impl BnodeBuffer {
     }
 }
 
-/// Compute the intrinsic id for a single bnode given its outgoing facts.
-/// Mirrors the `entity!` macro's derivation: sort `(attr_id, value_raw)`
-/// pairs, dedupe consecutive duplicates, hash with Blake3, and take the
-/// last 16 bytes as the id.
-///
-/// For orphans (no outgoing facts), falls back to skolemisation:
-/// `Blake3(salt || label)[16..]`.
-fn resolve_bnode_id(
+/// Project one bnode's outgoing facts into the canonical scratch rows consumed
+/// by [`build_intrinsic_entity`].
+fn bnode_rows(
     label: &View<str>,
     outgoing: &HashMap<View<str>, Vec<OutgoingFact>>,
     resolved: &HashMap<View<str>, Id>,
-    salt: &[u8; 16],
-) -> Id {
-    let pairs: Vec<(Id, RawInline)> = outgoing
+) -> Vec<IntrinsicEntityRow> {
+    outgoing
         .get(label)
         .map(|edges| {
             edges
@@ -312,39 +296,24 @@ fn resolve_bnode_id(
                         (*attr_id, v.raw)
                     }
                 })
+                .map(|(attribute, value)| IntrinsicEntityRow::new(attribute, value))
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
 
-    if pairs.is_empty() {
-        // Orphan: skolemise via salt.
-        let mut hasher = Hasher::new();
-        hasher.update(salt);
-        hasher.update(label.as_ref().as_bytes());
-        let digest = hasher.finalize();
-        let mut raw = [0u8; ID_LEN];
-        raw.copy_from_slice(&digest.as_bytes()[digest.as_bytes().len() - ID_LEN..]);
-        return Id::new(raw).expect("non-nil from random salt");
-    }
-
-    let mut pairs = pairs;
-    pairs.sort_unstable();
+/// Skolemise a blank node that is referenced but has no defining outgoing
+/// facts. This intentionally remains outside the intrinsic entity identity
+/// protocol: the random per-import salt gives a fresh RDF existential to each
+/// ingest call, while the label keeps repeated references stable within it.
+fn resolve_orphan_bnode_id(label: &View<str>, salt: &[u8; 16]) -> Id {
     let mut hasher = Hasher::new();
-    let mut last: Option<(Id, RawInline)> = None;
-    for (a, v) in &pairs {
-        if let Some((la, lv)) = last {
-            if *a == la && *v == lv {
-                continue;
-            }
-        }
-        hasher.update(&a[..]);
-        hasher.update(&v[..]);
-        last = Some((*a, *v));
-    }
+    hasher.update(salt);
+    hasher.update(label.as_ref().as_bytes());
     let digest = hasher.finalize();
     let mut raw = [0u8; ID_LEN];
     raw.copy_from_slice(&digest.as_bytes()[digest.as_bytes().len() - ID_LEN..]);
-    Id::new(raw).expect("intrinsic id from non-empty pairs")
+    Id::new(raw).expect("non-nil from random orphan salt")
 }
 
 /// Kahn's topological sort. Returns an ordering where every node comes
@@ -386,6 +355,10 @@ fn topo_sort(
             .collect();
         Err(cycle)
     } else {
+        // Edges point from a bnode to the bnodes its intrinsic rows depend on.
+        // Kahn's walk above therefore discovers dependants first; resolution
+        // needs the reverse order so every referenced id already exists.
+        order.reverse();
         Ok(order)
     }
 }

@@ -20,6 +20,7 @@ pub use fragment::Fragment;
 pub use spread::Spread;
 #[doc(hidden)]
 pub use tribleset::build_intrinsic_entity;
+pub(crate) use tribleset::build_namespaced_intrinsic_entity;
 /// Re-export of [`TribleSet`](tribleset::TribleSet).
 pub use tribleset::TribleSet;
 /// Re-export of [`TribleSetFingerprint`](tribleset::TribleSetFingerprint).
