@@ -41,6 +41,11 @@ pub enum PileCommand {
         #[command(subcommand)]
         cmd: blob::Command,
     },
+    /// Provision durable signing identities for pile-backed writers.
+    SigningKey {
+        #[command(subcommand)]
+        cmd: signing::Command,
+    },
     /// Merge source branch heads into a target branch.
     Merge {
         /// Path to the pile file to modify
@@ -177,6 +182,7 @@ pub fn run(cmd: PileCommand) -> Result<()> {
         PileCommand::Branch { cmd } => branch::run(cmd),
         PileCommand::Pin { cmd } => pin::run(cmd),
         PileCommand::Blob { cmd } => blob::run(cmd),
+        PileCommand::SigningKey { cmd } => signing::run(cmd),
         PileCommand::Merge {
             pile,
             target,

@@ -1,8 +1,38 @@
 use anyhow::Result;
+use clap::Parser;
 use ed25519_dalek::SigningKey;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use triblespace_core::signing_key_file;
+
+#[derive(Parser)]
+pub enum Command {
+    /// Explicitly initialize the durable signing identity used beside a pile.
+    Init {
+        /// Pile whose lexical parent supplies the default self.key path.
+        pile: PathBuf,
+        /// Explicit key path instead of TRIBLESPACE_KEY or self.key beside the pile.
+        #[arg(long)]
+        key: Option<PathBuf>,
+    },
+}
+
+pub fn run(command: Command) -> Result<()> {
+    match command {
+        Command::Init { pile, key } => {
+            let path = signing_key_file::resolve_path(key.as_deref(), &pile);
+            let signer = signing_key_file::init(&path)?;
+            println!("path: {}", path.display());
+            println!(
+                "public-key: {}",
+                hex::encode_upper(signer.verifying_key().to_bytes())
+            );
+            Ok(())
+        }
+    }
+}
 
 /// Load a signing key from an explicit path, the TRIBLES_SIGNING_KEY env var,
 /// or generate an ephemeral key.  Used by commands that don't have a pile
