@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Durable Ed25519 key files now have one strict core utility.** Callers can
+  resolve an explicit path, `TRIBLESPACE_KEY`, or the lexical `self.key` beside
+  a pile without following symlinks during resolution; load only regular,
+  exact 64-hex seed files with private Unix permissions; and explicitly
+  initialize a mode-0600 file through a synced same-directory temporary and an
+  atomic no-replace install. Concurrent initializers load the winning key,
+  while ordinary loads never create or silently substitute an identity.
 - **Canonical collection records can be published with explicit crash-order
   barriers.** The concrete `SimpleArchive` union kind now normalizes and
   validates supplied bytes, flushes definitions and element dependencies

@@ -35,6 +35,8 @@ pub mod prelude;
 pub mod query;
 /// Repository layer: blob stores, branch stores, commits, and workspaces.
 pub mod repo;
+/// Durable Ed25519 signing-key file resolution, loading, and initialization.
+pub mod signing_key_file;
 /// Trible representation, sets, fragments, and spread helpers.
 pub mod trible;
 
