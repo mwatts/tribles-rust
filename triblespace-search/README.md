@@ -5,23 +5,27 @@ Content-addressed BM25 + HNSW indexes on top of
 
 Two blob types, loaded zero-copy via [anybytes] and [jerky]:
 
-- **`SuccinctBM25Index`** (SB25 blob, schema id
-  `68C03764D04D05DF65E49589FBBA1441`) — lexical / associative
+- **`SuccinctBM25Index`** (SB25 blob) — lexical / associative
   retrieval. Terms are 32-byte triblespace `Inline`s, so the
   index handles text search, entity co-occurrence, and tag
-  weighting with the same schema. Postings bit-packed via jerky
-  `CompactVector`.
-- **`SuccinctHNSWIndex`** (SH25 blob, schema id
-  `A96890DE5F85A4F2285C365549B21BC2`) — approximate cosine
-  similarity over caller-supplied embedding handles. Graph
-  stored as per-(layer, node) CSR in two jerky `CompactVector`s.
-  Nodes are `Handle<Embedding>` values; the caller's
+  weighting with the same schema. Document indices and exact
+  `u32` term frequencies are bit-packed via jerky
+  `CompactVector`s; scores are derived at query time.
+- **`SuccinctHNSWIndex`** (SH25 blob) — approximate cosine
+  similarity over caller-supplied embedding handles. Its graph
+  is stored in a succinct jerky-backed representation. Nodes are
+  `Handle<Embedding>` values; the caller's
   doc-to-embedding mapping is a trible they own, not a shadow
   datamodel inside the index.
 
-Both indexes are rebuilt-and-replaced (no mutation). The resulting
-blob handle is persisted wherever the caller likes — branch
-metadata, commit metadata, a plain trible, or an in-memory cache.
+The authoritative schema identities live in each marker type's
+`MetaDescribe` implementation. A format rotation must also rotate any
+persisted attribute or manifest that routes handles to that reader; changing
+the metadata ID does not create a new Rust type or perform a runtime check.
+
+Index blobs are immutable. Direct builders return fresh content-addressed
+handles; range-native rollups append complete source-range artifacts and
+compact by publishing new blobs rather than mutating existing ones.
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) for the full design.
 
@@ -92,9 +96,9 @@ remaining open items are perf/encoding refinements, not architecture.
   index to answer phrase queries — `bigram_tokens("quick brown")`
   hashes only the ordered pair, so a doc matches iff the two words
   appear adjacently.
-* **`schemas::F32LE`**: `InlineEncoding` for packing `f32` scores
-  into 32-byte `Inline<F32LE>`s. Used by the scored BM25
-  constraint.
+* **`schemas::F32LE`**: general-purpose `InlineEncoding` for packing
+  an `f32` into a 32-byte `Inline<F32LE>`. BM25 scores are returned
+  directly and are not persisted through this schema.
 * Eight runnable examples:
   - `query_demo` — text search, multi-term ranking via
     filter+rescore, value-as-term citation search.

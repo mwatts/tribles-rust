@@ -1,16 +1,15 @@
-//! Measures peak heap allocation through `BM25Builder::build` and
-//! `SuccinctBM25Index::to_bytes` using a process-global tracking
+//! Measures peak heap allocation through the naive and succinct BM25 builds
+//! and the succinct index's `IntoBlob` handoff using a process-global tracking
 //! allocator.
 //!
 //! What the numbers reveal:
-//! - Build peaks (naive and succinct) are dominated by the
-//!   `term_to_tfs: HashMap<RawInline, HashMap<u32, u32>>`
-//!   accumulator — at 50 k docs / 20 k vocab that's ~150 MiB
-//!   alone. The streaming `SuccinctPostings::build_with` refactor
-//!   trims a smaller-but-real `Vec<Vec<(u32, f32)>>` intermediate
-//!   that is *masked* by `term_to_tfs` at modest scales; the win
-//!   becomes visible at 100 k+ docs where the intermediate hits
-//!   ~144 MiB and matters versus the HashMap's ~360 MiB.
+//! - Both build paths maintain an exact
+//!   `term_to_tfs: HashMap<RawInline, HashMap<u32, u32>>` accumulator. The
+//!   succinct path streams exact `(doc_code, tf)` rows into bit-packed
+//!   postings one term at a time, so its posting scratch is bounded by the
+//!   largest posting list rather than the whole corpus. Actual peaks depend on
+//!   the corpus and frequency distribution; this program reports them instead
+//!   of relying on a fixed estimate from the retired score layout.
 //! - `to_blob` peak should be near zero — under the
 //!   canonical-bytes pattern the index *is* its blob, so
 //!   `to_blob` is a refcounted `Bytes::clone`. The phase peak
@@ -163,10 +162,9 @@ fn run(n_docs: usize, vocab: usize, doc_len: usize) {
         fresh_builder().build_naive()
     });
 
-    // Direct-to-succinct build via streaming SuccinctPostings::
-    // build_with — the path the previous two commits restructured.
-    // Peak should be smaller than the naive intermediate plus the
-    // returned succinct index.
+    // Direct-to-succinct build streams exact raw-frequency postings through
+    // `SuccinctPostings::build_with_into`, materializing one term-sized scratch
+    // row at a time.
     let succinct = measure("BM25Builder::build (streaming succinct)", || {
         fresh_builder().build()
     });

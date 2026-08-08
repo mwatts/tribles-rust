@@ -10,18 +10,19 @@
 //!      [segments] [docs_per_segment] [terms_per_doc] [vocabulary] [overlap_percent]`
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use triblespace_core::blob::MemoryBlobStore;
+use triblespace_core::blob::{Blob, MemoryBlobStore, TryFromBlob};
 use triblespace_core::id::{Id, RawId};
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::repo::index_home::IndexKind;
 use triblespace_core::repo::BlobStore;
 use triblespace_search::bm25::BM25Builder;
-use triblespace_search::index_bm25::Bm25Rollup;
-use triblespace_search::succinct::SuccinctBM25Index;
+use triblespace_search::index_bm25::{query_across, Bm25Rollup};
+use triblespace_search::succinct::{SuccinctBM25Blob, SuccinctBM25Cover, SuccinctBM25Index};
 use triblespace_search::tokens::WordHash;
 
 struct TrackingAlloc;
@@ -123,6 +124,10 @@ fn fmt_bytes(bytes: usize) -> String {
     }
 }
 
+fn average(elapsed: Duration, iterations: u32) -> Duration {
+    elapsed / iterations
+}
+
 fn main() {
     let segment_count = parse_arg(1, 8);
     let docs_per_segment = parse_arg(2, 2_000);
@@ -169,5 +174,54 @@ fn main() {
         fmt_bytes(extra_heap),
         fmt_bytes(merged_blob.bytes.len()),
         digest.to_hex(),
+    );
+
+    let query = [term_from_u64(0), term_from_u64(1), term_from_u64(2)];
+    let cover_started = Instant::now();
+    let cover = SuccinctBM25Cover::new(&segments).expect("one BM25 recipe");
+    let cover_build = cover_started.elapsed();
+
+    let merged: SuccinctBM25Index<GenId, WordHash> =
+        SuccinctBM25Index::try_from_blob(Blob::<SuccinctBM25Blob>::new(merged_blob.bytes.clone()))
+            .expect("merge output is a valid succinct BM25 artifact");
+    let resident_expected = cover.query_multi(&query);
+    let compacted_expected = merged.query_multi(&query);
+    assert_eq!(
+        resident_expected
+            .iter()
+            .map(|(document, score)| (document.raw, score.to_bits()))
+            .collect::<Vec<_>>(),
+        compacted_expected
+            .iter()
+            .map(|(document, score)| (document.raw, score.to_bits()))
+            .collect::<Vec<_>>()
+    );
+
+    const QUERY_ITERATIONS: u32 = 2_000;
+    let resident_started = Instant::now();
+    for _ in 0..QUERY_ITERATIONS {
+        black_box(cover.query_multi(black_box(&query)));
+    }
+    let resident_query = average(resident_started.elapsed(), QUERY_ITERATIONS);
+
+    let compacted_started = Instant::now();
+    for _ in 0..QUERY_ITERATIONS {
+        black_box(merged.query_multi(black_box(&query)));
+    }
+    let compacted_query = average(compacted_started.elapsed(), QUERY_ITERATIONS);
+
+    const ONE_SHOT_ITERATIONS: u32 = 3;
+    let one_shot_started = Instant::now();
+    for _ in 0..ONE_SHOT_ITERATIONS {
+        black_box(query_across(black_box(&segments), black_box(&query)).unwrap());
+    }
+    let one_shot_query = average(one_shot_started.elapsed(), ONE_SHOT_ITERATIONS);
+
+    println!(
+        "cover build {:.3}ms; 3-term query resident {:.3}µs, compacted {:.3}µs, one-shot {:.3}ms",
+        cover_build.as_secs_f64() * 1_000.0,
+        resident_query.as_secs_f64() * 1_000_000.0,
+        compacted_query.as_secs_f64() * 1_000_000.0,
+        one_shot_query.as_secs_f64() * 1_000.0,
     );
 }

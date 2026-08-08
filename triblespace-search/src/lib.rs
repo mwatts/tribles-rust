@@ -25,10 +25,10 @@
 //! via `BM25Builder::build_naive()` / `HNSWBuilder::build_naive()`
 //! / `FlatBuilder::build()`.
 //!
-//! Both indexes are rebuilt-and-replaced (no mutation); the
-//! caller persists the resulting handle wherever appropriate
-//! (branch metadata, commit metadata, a plain trible, or an
-//! in-memory cache).
+//! Index blobs are immutable. Direct builders return fresh
+//! content-addressed handles; range-native rollups append complete
+//! source-range artifacts and compact by publishing new blobs rather
+//! than mutating existing ones.
 //!
 //! # Query surface
 //!
@@ -116,7 +116,7 @@ pub mod tokens;
 
 /// Reference implementations for tests and benchmarks.
 ///
-/// The types re-exported here are naive (insertion-order,
+/// The types re-exported here are naive (canonical-key-order,
 /// non-packed) forms that exist only to validate the succinct
 /// builds and to measure "how much does jerky packing actually
 /// save at this scale." They are not a production persistence
@@ -149,9 +149,10 @@ pub mod testing {
 
 // Versioning policy: breaking byte-layout changes mint a new
 // `BlobEncoding` id (see `SuccinctBM25Blob` / `SuccinctHNSWBlob`
-// in `succinct.rs`). The type system then rules out
-// mismatched-layout deserialization — there's no single
-// global version number. `git log docs/DESIGN.md` has the
-// progression of layout decisions; the blob encoding id in
-// `succinct.rs` is authoritative for what any given binary
-// can load.
+// in `succinct.rs`). That metadata identity feeds derived typed
+// schemas, but it is not an in-band runtime guard and does not
+// make the Rust marker a new type. Persisted attributes/manifests
+// that route handles to a reader must rotate with it. There is no
+// single global version number; `git log docs/DESIGN.md` records
+// the layout progression and the marker implementation is
+// authoritative for the current identity.

@@ -13,6 +13,7 @@
 //! cargo run --release --example query_latency
 //! ```
 
+use std::hint::black_box;
 use std::time::Instant;
 
 use triblespace_core::id::{Id, RawId};
@@ -20,7 +21,6 @@ use triblespace_core::inline::Inline;
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::hnsw::HNSWBuilder;
 use triblespace_search::succinct::SuccinctHNSWIndex;
-use triblespace_search::testing::BM25Index;
 use triblespace_search::tokens::hash_tokens;
 use triblespace_search::tokens::WordHash;
 
@@ -97,8 +97,8 @@ fn bench_bm25(n_docs: usize, vocab: usize, doc_len: usize) {
 
     // Warm-up — populate caches.
     for q in &queries {
-        let _: Vec<_> = naive.query_term(q).collect();
-        let _: Vec<_> = succinct.query_term(q).collect();
+        black_box(naive.query_term(black_box(q)).collect::<Vec<_>>());
+        black_box(succinct.query_term(black_box(q)).collect::<Vec<_>>());
     }
 
     let time_single = |tag: &str, f: &dyn Fn(&Inline<WordHash>)| {
@@ -124,16 +124,13 @@ fn bench_bm25(n_docs: usize, vocab: usize, doc_len: usize) {
 
     println!("BM25 single-term query  [n={n_docs}, vocab={vocab}, avg_len={doc_len}]:");
     time_single("naive", &|q| {
-        let _: Vec<_> = naive.query_term(q).collect();
+        black_box(naive.query_term(black_box(q)).collect::<Vec<_>>());
     });
     time_single("SB25", &|q| {
-        let _: Vec<_> = succinct.query_term(q).collect();
+        black_box(succinct.query_term(black_box(q)).collect::<Vec<_>>());
     });
 
-    // 3-term OR query via query_multi (naive only — succinct
-    // doesn't currently expose query_multi; sum-of-query_term is
-    // equivalent).
-    let multi_reps = 10;
+    // Three-term OR ranking through the shared `query_multi` API.
     let tri_queries: Vec<Vec<Inline<WordHash>>> = (0..100)
         .map(|i| {
             vec![
@@ -143,32 +140,39 @@ fn bench_bm25(n_docs: usize, vocab: usize, doc_len: usize) {
             ]
         })
         .collect();
-    // Warm
+    // Warm both implementations.
     for q in &tri_queries {
-        let _ = naive.query_multi(q);
+        black_box(naive.query_multi(black_box(q)));
+        black_box(succinct.query_multi(black_box(q)));
     }
-    let mut samples: Vec<u128> = Vec::new();
-    for _ in 0..multi_reps {
-        for q in &tri_queries {
-            let t0 = Instant::now();
-            let _ = naive.query_multi(q);
-            samples.push(t0.elapsed().as_nanos());
+
+    let time_multi = |tag: &str, f: &dyn Fn(&[Inline<WordHash>])| {
+        let reps = 10;
+        let mut samples: Vec<u128> = Vec::with_capacity(tri_queries.len() * reps);
+        for _ in 0..reps {
+            for q in &tri_queries {
+                let t0 = Instant::now();
+                f(q);
+                samples.push(t0.elapsed().as_nanos());
+            }
         }
-    }
-    samples.sort_unstable();
-    let avg = samples.iter().sum::<u128>() / samples.len() as u128;
-    println!(
-        "  {:<14} avg {:<9}  p50 {:<9}  p99 {:<9}  (n={})",
-        "naive 3-term",
-        fmt_ns(avg),
-        fmt_ns(percentile(&samples, 0.5)),
-        fmt_ns(percentile(&samples, 0.99)),
-        samples.len(),
-    );
-    // Keep the compiler honest about the built indexes.
-    let _ = naive.doc_count();
-    let _: &BM25Index = &naive;
-    let _ = succinct.doc_count();
+        samples.sort_unstable();
+        let avg = samples.iter().sum::<u128>() / samples.len() as u128;
+        println!(
+            "  {tag:<14} avg {:<9}  p50 {:<9}  p99 {:<9}  (n={})",
+            fmt_ns(avg),
+            fmt_ns(percentile(&samples, 0.5)),
+            fmt_ns(percentile(&samples, 0.99)),
+            samples.len(),
+        );
+    };
+
+    time_multi("naive 3-term", &|q| {
+        black_box(naive.query_multi(black_box(q)));
+    });
+    time_multi("SB25 3-term", &|q| {
+        black_box(succinct.query_multi(black_box(q)));
+    });
 }
 
 fn bench_hnsw(n_docs: usize, dim: usize) {

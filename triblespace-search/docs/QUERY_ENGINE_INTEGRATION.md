@@ -121,8 +121,8 @@ let s = idx.score(&doc.to_inline(), &tokens);
 Recompute helper for ranking. Returns the summed BM25 score for
 `doc` across `terms` — same number `matches` used internally,
 exposed as a plain function. Lossless f32 (no engine-side
-equality bookkeeping); on the succinct index the score reflects
-the stored u16 quantisation but at f32 precision.
+equality bookkeeping); the succinct index derives it from exact,
+bit-packed term frequencies.
 
 Typical use after `matches` filters through the engine:
 
@@ -133,14 +133,17 @@ let mut ranked: Vec<(Id, f32)> = find!(
 )
 .map(|(d,)| (d, idx.score(&d.to_inline(), &tokens)))
 .collect();
-ranked.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+ranked.sort_unstable_by(|left, right| {
+    right
+        .1
+        .total_cmp(&left.1)
+        .then_with(|| left.0.cmp(&right.0))
+});
 ```
 
-Same pattern as HNSW: filter on a fixed floor, recompute the
-precise score afterwards if you need it for ranking. Score is
-never a bound query variable — quantisation bookkeeping doesn't
-reach the engine path, and the join planner stays tight (one
-less variable per BM25 clause).
+Same pattern as HNSW: filter on a fixed floor, recompute the precise score
+afterwards if you need it for ranking. Score is never a bound query variable,
+so the join planner stays tight (one less variable per BM25 clause).
 
 See `examples/multi_term_bm25_search.rs` for the full runnable
 flow, and `BM25Filter` in the `constraint` module for the
@@ -280,9 +283,10 @@ let idx: SuccinctBM25Index =
 let c = idx.matches(doc, &terms, 0.0);
 ```
 
-`idx` owns the data; `c` borrows it for the duration of the
-query pass. A later rebuild produces a new handle; the next
-query picks it up by loading the updated handle.
+`idx` owns the data; `c` borrows it for the duration of the query pass. Direct
+callers can publish a freshly built handle, while range-native maintenance
+publishes immutable segments and compacted alternatives. A later query attaches
+the selected handle or cover.
 
 ## Open questions
 
@@ -304,5 +308,6 @@ query picks it up by loading the updated handle.
 - `top_k` / `sort_by_score` combinators. Callers slice.
 - Hybrid score as a first-class bound variable. Callers write
   the linear combination in Rust.
-- Live incremental updates. Rebuild-and-replace only.
+- In-place mutation of index blobs. Range updates and compaction publish fresh
+  immutable artifacts.
 - Cross-language bindings. Rust-native only.

@@ -28,24 +28,15 @@
 //! persisted succinct segments, and [`attach`](IndexKind::attach) is
 //! zero-copy (it decodes only the stored succinct blob).
 //!
-//! # Multi-segment query semantics (cross-segment IDF caveat)
+//! # Multi-segment query semantics
 //!
-//! An LSMT holds several segments (one per maintenance step, plus
-//! merged tiers). BM25 scores are **per-segment**: a term's IDF is
-//! computed against the documents *in that segment*, and document
-//! lengths are normalised against that segment's average. A query over
-//! the union ([`query_across`]) runs the bag-of-words query on each
-//! segment and unions the results, keeping each document's best score.
-//! Because IDF is local, scores from different segments are only
-//! approximately comparable — a term that is rare globally but common
-//! within one small segment is scored lower there than a single index
-//! over the whole corpus would score it. The size-tiered [`merge`]
-//! counters this by streaming the persisted segments through a
-//! bounded-memory union builder. IDF is recomputed over the merged
-//! corpus, so the bulk of the documents end up in a segment with
-//! corpus-wide statistics. Exact cross-segment IDF would require a global
-//! document-frequency roll-up across segments at query time; that is a
-//! deliberate follow-up, not done here.
+//! A selected LSM cover can hold several segments. Persisted postings carry
+//! exact raw term frequencies. [`SuccinctBM25Cover`] joins their document
+//! carrier and document lengths once, then derives global IDF and BM25 scores
+//! from only the queried postings. Consequently the same logical corpus has
+//! identical scores and ranking under every physical cover shape. Callers
+//! serving repeated queries should retain that resident cover; [`query_across`]
+//! is the one-shot convenience path.
 //!
 //! [`query_across`]: crate::index_bm25::query_across
 //! [`merge`]: IndexKind::merge
@@ -68,7 +59,8 @@ use triblespace_core::trible::{Fragment, TribleSet};
 
 use crate::bm25::BM25Builder;
 use crate::index_schema::{index_source_attribute, seg_bm25};
-use crate::succinct::{SuccinctBM25Blob, SuccinctBM25Index};
+pub use crate::succinct::Bm25TuningMismatch;
+use crate::succinct::{SuccinctBM25Blob, SuccinctBM25Cover, SuccinctBM25Index};
 use crate::tokens::WordHash;
 
 /// The document-key / term schemas of the BM25 segments this kind
@@ -80,11 +72,11 @@ type Seg = SuccinctBM25Index<GenId, WordHash>;
 /// `Handle<LongString>` content a branch's entities point at, keyed by
 /// entity id.
 ///
-/// Parameterised by the blob reader `R` used to resolve those content
-/// handles into text during [`build`](IndexKind::build) /
-/// [`merge`](IndexKind::merge). Attach and query need no reader — the
-/// stored succinct index is self-contained (terms are hashed at build
-/// time).
+/// Parameterised by the blob reader `R` used to resolve those content handles
+/// into text during [`build`](IndexKind::build). Merge operates directly on
+/// exact frequencies in the persisted segments. Attach and query need no
+/// content reader — the stored succinct index is self-contained (terms are
+/// hashed at build time).
 #[derive(Clone)]
 pub struct Bm25Rollup<R> {
     reader: R,
@@ -103,10 +95,10 @@ impl<R> Bm25Rollup<R> {
     }
 
     /// Stable kind id — minted via `trible genid`
-    /// (`11430BC8836BED33509173D454496A3C`). Distinct from
+    /// (`881C9D0DAC43814CB4E80897E420B67B`). Distinct from
     /// `SuccinctRollup`'s and `HnswRollup`'s so all three kinds'
     /// manifests coexist in one branch-head tribleset.
-    pub const KIND_ID_HEX: &'static str = "11430BC8836BED33509173D454496A3C";
+    pub const KIND_ID_HEX: &'static str = "881C9D0DAC43814CB4E80897E420B67B";
 }
 
 impl<R> Bm25Rollup<R>
@@ -250,12 +242,10 @@ where
         if segments.is_empty() {
             return Ok(Vec::new());
         }
-        // The kind always builds with BM25Builder's default tuning. Pass the
-        // same values to the direct per-term-max segment union, which retains
-        // all duplicate-key content without a corpus-sized token-bag
-        // intermediate.
-        let defaults: BM25Builder<GenId, WordHash> = BM25Builder::new();
-        let merged = SuccinctBM25Index::try_merge_segments(segments, defaults.k1, defaults.b)?;
+        // The exact join validates one shared scoring recipe at its own
+        // boundary and retains all duplicate-key content without a
+        // corpus-sized token-bag intermediate.
+        let merged = SuccinctBM25Index::try_merge_segments(segments)?;
         if merged.doc_count() == 0 {
             Ok(Vec::new())
         } else {
@@ -264,32 +254,17 @@ where
     }
 }
 
-/// Rank documents for a bag-of-words `terms` query across several attached
-/// BM25 artifacts, returning `(doc_key, score)` descending.
+/// One-shot rank of a logical corpus represented by several attached BM25
+/// artifacts.
 ///
-/// Each artifact scores against its own local corpus statistics. Results are
-/// unioned by document and duplicate documents keep their best score.
-pub fn query_across(segments: &[Seg], terms: &[Inline<WordHash>]) -> Vec<(Inline<GenId>, f32)> {
-    let mut acc: HashMap<RawInline, f32> = HashMap::new();
-    for segment in segments {
-        for (document, score) in segment.query_multi(terms) {
-            let slot = acc.entry(document.raw).or_insert(f32::NEG_INFINITY);
-            if score > *slot {
-                *slot = score;
-            }
-        }
-    }
-    let mut rows: Vec<_> = acc
-        .into_iter()
-        .map(|(raw, score)| (Inline::<GenId>::new(raw), score))
-        .collect();
-    rows.sort_unstable_by(|left, right| {
-        right
-            .1
-            .partial_cmp(&left.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    rows
+/// This constructs a [`SuccinctBM25Cover`] and is therefore ideal for a
+/// one-off query or correctness boundary. A server should construct and retain
+/// the cover itself so its all-postings document-length pass is amortised.
+pub fn query_across(
+    segments: &[Seg],
+    terms: &[Inline<WordHash>],
+) -> Result<Vec<(Inline<GenId>, f32)>, Bm25TuningMismatch> {
+    Ok(SuccinctBM25Cover::new(segments)?.query_multi(terms))
 }
 
 #[cfg(test)]
@@ -455,6 +430,73 @@ mod tests {
         builder.build()
     }
 
+    fn adversarial_cover_leaves() -> Vec<Seg> {
+        let alpha = merge_term(1);
+        let beta = merge_term(2);
+        let gamma = merge_term(3);
+        let common = merge_term(4);
+        let rare = merge_term(5);
+
+        let leaf = |rows: Vec<(u64, Vec<Inline<WordHash>>)>| {
+            let mut builder: BM25Builder<GenId, WordHash> = BM25Builder::new();
+            for (document, terms) in rows {
+                builder.insert(merge_doc(document), terms);
+            }
+            builder.build()
+        };
+
+        vec![
+            leaf(vec![
+                (1, Vec::new()),
+                (
+                    2,
+                    std::iter::repeat_n(alpha, 65_537).chain([beta]).collect(),
+                ),
+                (3, vec![common, common]),
+            ]),
+            leaf(vec![
+                (2, std::iter::repeat_n(alpha, 65_539).collect()),
+                (2, vec![beta, beta, beta, gamma]),
+                (4, vec![rare, common]),
+            ]),
+            leaf(vec![
+                (3, vec![common, beta, beta]),
+                (5, vec![alpha, gamma]),
+                (6, Vec::new()),
+            ]),
+            leaf(vec![
+                (1, vec![gamma]),
+                (4, vec![rare, rare, rare, rare]),
+                (7, vec![common]),
+            ]),
+            leaf(vec![
+                (5, vec![alpha, alpha, beta]),
+                (7, vec![common]),
+                (8, vec![gamma, rare]),
+            ]),
+        ]
+    }
+
+    fn ranked_bits(rows: Vec<(Inline<GenId>, f32)>) -> Vec<(RawInline, u32)> {
+        rows.into_iter()
+            .map(|(document, score)| (document.raw, score.to_bits()))
+            .collect()
+    }
+
+    type ExpectedRankings = Vec<(Vec<Inline<WordHash>>, Vec<(RawInline, u32)>)>;
+
+    fn assert_cover_matches(segments: &[Seg], expected: &ExpectedRankings, expected_docs: usize) {
+        let cover = SuccinctBM25Cover::new(segments).unwrap();
+        assert_eq!(cover.doc_count(), expected_docs);
+        for (query, ranking) in expected {
+            assert_eq!(ranked_bits(cover.query_multi(query)), *ranking);
+            assert_eq!(
+                ranked_bits(query_across(segments, query).unwrap()),
+                *ranking
+            );
+        }
+    }
+
     #[test]
     fn single_artifact_equals_monolithic_oracle() {
         let pairs = synthetic(120);
@@ -474,6 +516,7 @@ mod tests {
         ] {
             let got: HashMap<_, _> =
                 query_across(std::slice::from_ref(&segment), &hash_tokens(query))
+                    .unwrap()
                     .into_iter()
                     .map(|(document, score)| (document.raw, score))
                     .collect();
@@ -481,7 +524,7 @@ mod tests {
             assert_eq!(got.len(), expected.len(), "query `{query}` hit count");
             for (document, expected_score) in expected {
                 let score = got[&document];
-                assert!((score - expected_score).abs() <= 1e-4);
+                assert_eq!(score.to_bits(), expected_score.to_bits());
             }
         }
     }
@@ -531,6 +574,7 @@ mod tests {
         assert_eq!(merged.doc_count(), union.len());
         for query in ["memory pile", "alpha beta gamma", "index search rollup"] {
             let got: HashSet<_> = query_across(std::slice::from_ref(&merged), &hash_tokens(query))
+                .unwrap()
                 .into_iter()
                 .map(|(document, _)| document.raw)
                 .collect();
@@ -619,17 +663,86 @@ mod tests {
 
         let defaults: BM25Builder<GenId, WordHash> = BM25Builder::new();
         let expected = materialized_max_union(&segments, defaults.k1, defaults.b);
-        let merged =
-            SuccinctBM25Index::try_merge_segments(&segments, defaults.k1, defaults.b).unwrap();
+        let merged = SuccinctBM25Index::try_merge_segments(&segments).unwrap();
         assert_eq!(merged.bytes.as_ref(), expected.bytes.as_ref());
+        let left = SuccinctBM25Index::try_merge_segments(&segments[..2]).unwrap();
+        let right = SuccinctBM25Index::try_merge_segments(&segments[2..]).unwrap();
+        let grouped = SuccinctBM25Index::try_merge_segments(&[left, right]).unwrap();
+        assert_eq!(merged.bytes.as_ref(), grouped.bytes.as_ref());
         segments.reverse();
-        let reversed =
-            SuccinctBM25Index::try_merge_segments(&segments, defaults.k1, defaults.b).unwrap();
+        let reversed = SuccinctBM25Index::try_merge_segments(&segments).unwrap();
         assert_eq!(merged.bytes.as_ref(), reversed.bytes.as_ref());
         segments.push(reload(&segments[0]));
-        let duplicated =
-            SuccinctBM25Index::try_merge_segments(&segments, defaults.k1, defaults.b).unwrap();
+        let duplicated = SuccinctBM25Index::try_merge_segments(&segments).unwrap();
         assert_eq!(merged.bytes.as_ref(), duplicated.bytes.as_ref());
+    }
+
+    #[test]
+    fn resident_cover_is_invariant_under_arbitrary_lsm_shapes() {
+        let queries = vec![
+            vec![merge_term(1)],
+            vec![merge_term(2), merge_term(3)],
+            // Query multiplicity is part of the bag-of-words query, even
+            // though corpus duplicates join idempotently.
+            vec![merge_term(4), merge_term(4), merge_term(5)],
+            vec![merge_term(99)],
+        ];
+        let canonical = SuccinctBM25Index::try_merge_segments(&adversarial_cover_leaves()).unwrap();
+        let expected: ExpectedRankings = queries
+            .into_iter()
+            .map(|query| {
+                let ranking = ranked_bits(canonical.query_multi(&query));
+                (query, ranking)
+            })
+            .collect();
+        let expected_docs = canonical.doc_count();
+        assert_eq!(expected_docs, 8);
+
+        // Raw leaves, including an exact duplicate leaf: duplicate physical
+        // coverage must not inflate either frequencies or document lengths.
+        let mut raw = adversarial_cover_leaves();
+        raw.push(reload(&raw[0]));
+        assert_cover_matches(&raw, &expected, expected_docs);
+
+        // A deliberately uneven partial compaction.
+        let mut leaves = adversarial_cover_leaves();
+        let tail = leaves.split_off(3);
+        let right = SuccinctBM25Index::try_merge_segments(&tail).unwrap();
+        let left_pair = SuccinctBM25Index::try_merge_segments(&leaves[..2]).unwrap();
+        let partial = vec![left_pair, reload(&leaves[2]), right];
+        assert_cover_matches(&partial, &expected, expected_docs);
+
+        // Random merge trees exercise every intermediate cover, not only the
+        // final compacted singleton. Physical order is perturbed by
+        // swap-removal along the way.
+        for seed in 0..12 {
+            let mut rng = MergeRng(0xC07E_5A11 ^ seed);
+            let mut cover = adversarial_cover_leaves();
+            assert_cover_matches(&cover, &expected, expected_docs);
+            while cover.len() > 1 {
+                let left = (rng.next() as usize) % cover.len();
+                let a = cover.swap_remove(left);
+                let right = (rng.next() as usize) % cover.len();
+                let b = cover.swap_remove(right);
+                cover.push(SuccinctBM25Index::try_merge_segments(&[a, b]).unwrap());
+                assert_cover_matches(&cover, &expected, expected_docs);
+            }
+            assert_eq!(cover[0].bytes.as_ref(), canonical.bytes.as_ref());
+        }
+    }
+
+    #[test]
+    fn cover_rejects_mixed_scoring_recipes() {
+        let mut left: BM25Builder<GenId, WordHash> = BM25Builder::new().k1(1.2).b(0.75);
+        left.insert(merge_doc(1), [merge_term(1)]);
+        let mut right: BM25Builder<GenId, WordHash> = BM25Builder::new().k1(1.5).b(0.75);
+        right.insert(merge_doc(2), [merge_term(1)]);
+        let segments = [left.build(), right.build()];
+
+        assert!(SuccinctBM25Cover::new(&segments).is_err());
+        assert!(query_across(&segments, &[merge_term(1)]).is_err());
+        let error = SuccinctBM25Index::try_merge_segments(&segments).unwrap_err();
+        assert!(error.downcast_ref::<Bm25TuningMismatch>().is_some());
     }
 
     #[test]
@@ -651,6 +764,7 @@ mod tests {
         );
         let attached = kind.attach(&reader, &stored).unwrap();
         let hits: HashSet<_> = query_across(&[attached], &hash_tokens("alpha"))
+            .unwrap()
             .into_iter()
             .map(|(key, _)| key.raw)
             .collect();
@@ -781,6 +895,11 @@ mod tests {
         let right = decode(kind.build(&second).unwrap().pop().unwrap());
         let merged = decode(kind.merge(&[left, right]).unwrap().pop().unwrap());
         assert_eq!(merged.doc_count(), 2);
-        assert_eq!(query_across(&[merged], &hash_tokens("alpha beta")).len(), 2);
+        assert_eq!(
+            query_across(&[merged], &hash_tokens("alpha beta"))
+                .unwrap()
+                .len(),
+            2
+        );
     }
 }

@@ -6,15 +6,31 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## Unreleased
 
+### Succinct BM25 is exact and LSM-cover invariant
+
+- Succinct postings now persist exact, bit-packed `u32` term frequencies
+  instead of corpus-relative quantized scores. Duplicate document rows and
+  segments join as `(Docs union, pointwise max frequency)`, preserving empty
+  documents and making arbitrary merge trees associative, commutative,
+  idempotent, and byte-canonical. Mixed `k1`/`b` recipes are rejected.
+- Added `SuccinctBM25Cover`, a reusable logical view over attached LSM
+  segments. It derives global document lengths once and k-way merges only the
+  requested postings per query, so scores and deterministic ranking equal a
+  fully compacted index regardless of physical cover shape. `query_across` is
+  now a fallible one-shot convenience wrapper around that resident API.
+- Rotated `SuccinctBM25Blob` to
+  `DAFEEEC9350D072B83E32DBBBBB66039`, the typed artifact attribute to
+  `9B286B90C6F25B5FB6DE6A7176241940`, and the BM25 rollup recipe to
+  `881C9D0DAC43814CB4E80897E420B67B`; retired score blobs are intentionally
+  incompatible rather than heuristically migrated.
+
 ### Candidate distinctness is proven at its source
 
 - `aggregate_above` sums each query term's postings into a `HashMap` keyed by
   doc, so its output is distinct by construction and all four `matches` /
   `matches_text` entry points inherit that. A `debug_assert!` pins the property
-  where it is established. Nothing at the index layer supplies it:
-  `BM25Builder::insert` appends one row per call, so the naive index can hold
-  one doc key at two doc indices and a single term's posting list then yields it
-  twice.
+  where it is established. BM25's canonical `(Docs, F)` build also collapses
+  repeated document rows before either backend exposes a posting list.
 - `SimilarTo::from_candidates` keeps its collapse because the crate's own
   producers can repeat. Embedding handles are content-addressed, so two entities
   embedding to the same vector share one handle, and neither `FlatBuilder` nor

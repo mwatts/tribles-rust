@@ -82,9 +82,16 @@ fn find_matches_then_score_for_ranking() {
         .into_iter()
         .map(|d| (d, idx.score(&d.to_inline(), &fox)))
         .collect();
-    ranked.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    ranked.sort_unstable_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
 
     // Length-3 docs (1, 2) outrank the length-7 doc (3).
+    assert_eq!(ranked[0].0, id(1));
+    assert_eq!(ranked[1].0, id(2));
     assert_eq!(ranked[2].0, id(3));
     assert!((ranked[0].1 - ranked[1].1).abs() < 1e-5);
     assert!(ranked[0].1 > ranked[2].1);

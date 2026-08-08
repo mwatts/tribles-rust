@@ -121,7 +121,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .map(|(d, t)| (d, idx.score_text(&d.to_inline(), &text), t))
             .collect();
-            rows.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            rows.sort_unstable_by(|left, right| {
+                right
+                    .1
+                    .total_cmp(&left.1)
+                    .then_with(|| left.0.cmp(&right.0))
+            });
             for (id, score, title) in rows.into_iter().take(10) {
                 println!("{score:6.2}  {id}  {title}");
             }
@@ -220,13 +225,17 @@ let mut ranked: Vec<(Id, f32)> = find!(
 )
 .map(|(d,)| (d, idx.score_text(&d.to_inline(), "typst links")))
 .collect();
-ranked.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+ranked.sort_unstable_by(|left, right| {
+    right
+        .1
+        .total_cmp(&left.1)
+        .then_with(|| left.0.cmp(&right.0))
+});
 ```
 
-Two reasons. First: quantisation bookkeeping disappears — the
-lossy f32-on-disk score lives only in the index storage; the
-engine sees docs only. Second: one less variable per BM25
-clause in the planner, no Cartesian-blowup dedupe needed.
+Two reasons. First: exact term frequencies stay inside the index and BM25
+scores are derived there; the engine sees docs only. Second: one less variable
+per BM25 clause in the planner, with no Cartesian-blowup dedupe needed.
 
 If you want to filter by relevance (not just presence), pass a
 non-zero floor: `idx.matches_text(doc, "typst links", 1.5)`. The
@@ -246,10 +255,11 @@ on every call.
   commit attribute (version-tied)? All three work; pick based
   on how often the index refreshes vs. how often branches move.
 
-- **How big does the index get?** For the 100k-fragment target,
-  the SB25 blob is ~86 MiB (naive would be ~157 MiB). See
-  `cargo run --release --example blob_sizes_at_scale` for the
-  actual numbers on a corpus your size.
+- **How big does the index get?** The exact-TF layout is
+  corpus-dependent: posting frequency width follows the largest term
+  frequency. Run `cargo run --release --example blob_sizes_at_scale` on a
+  representative corpus instead of relying on the retired score-layout
+  estimate.
 
 - **When to embed?** BM25 is the default for text search. Layer
   in HNSW (`SuccinctHNSWIndex`) only once the caller has an
