@@ -59,9 +59,10 @@ that schema id.
 
 ```
 [keys                ] variable         ; CompressedUniverse view:
-                                        ; 4-byte fragment dictionary
-                                        ; (sorted, deduped) + DACs-byte
-                                        ; codes, one per unique key.
+                                        ; one 16-byte suffix per key,
+                                        ; plus only the nonzero 16-byte
+                                        ; prefixes after the leading
+                                        ; intrinsic-ID run.
                                         ; `keys.access(code)` decodes
                                         ; the 32-byte RawInline.
 [terms               ] n_terms × 32 B  ; sorted RawInline table
@@ -145,21 +146,14 @@ retain the cover alongside the attached segments.
   See `tests/scale_smoke.rs` and the phase 2a revert in git
   history for the actual numbers.
 
-### What keys-side compression bought us
+### What keys-side compression buys us
 
-- `keys` is now a `CompressedUniverse` (Phase 2b). Measured via
-  `cargo run --release --example blob_sizes_at_scale`:
-
-  | corpus           | keys section vs 32 B flat |
-  | :--------------- | :------------------------: |
-  | scattered GenIds |        0.74×–0.81×         |
-  | 11-byte-prefix   |        0.29×–0.32×         |
-
-  "Scattered" is the pseudo-random `id_from_u64` with 16 trailing
-  random bytes (worst-ish case — only the leading 16 zero bytes
-  are shared). "Correlated" shares an 11-byte prefix and varies
-  only the last 5 — simulates "one session of entity ids minted
-  from a shared namespace seed."
+`CompressedUniverse` stores a sorted key domain as every 16-byte suffix plus
+only the nonzero 16-byte prefixes. For `N` keys of which the first `Z` have a
+zero high half, the payload is exactly `32N - 16Z` bytes. A GenId-keyed corpus
+therefore uses exactly half the flat 32-byte key payload before constant
+metadata, independent of incidental byte-frequency patterns. Full-width hash
+keys remain exactly flat rather than risking dictionary overhead.
 - Whole-blob ratio moves too, but modestly: 0.48×→0.42× at 1 k
   docs with correlated keys; ~0.01×–0.02× improvement at 50 k
   because postings dominate the denominator.
@@ -401,12 +395,9 @@ doc_lens at max ≈ 1024 → 10 bits ≈ 1.25 B; offsets at 18M max →
 `ceil(log2(max_tf + 1))` bits: a maximum within-document frequency of 255
 uses one byte per posting, while larger values widen losslessly.
 
-The `keys` range covers the fragment-dictionary compression
-spread: near-worst-case (random 32-byte values, no shared 4-byte
-fragments) ≈ raw 3.2 MiB plus a small DACs overhead; typical
-GenId-keyed corpora with 16 bytes of zero padding and structured
-trible bytes compress toward ~1.5 MiB. Neither end moves the blob total much
-because postings dominate.
+For 100k keys, the key carrier ranges from raw 3.2 MiB for full-width values to
+about 1.5 MiB for GenIds with their implicit zero high half. Neither end moves
+the blob total much because postings dominate.
 
 The **postings dominate** either blob. SB25 bit-packs both `doc_idx` and exact
 term frequency; the remaining keys, terms, and document lengths are already

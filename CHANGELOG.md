@@ -18,7 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pass, hash tables, or DAC decoding. Strict attachment checks pin its boundary,
   section cardinalities, and ordering. Portable raw Succinct and detached
   Rank9 artifacts remain byte-for-byte independent of this native runtime
-  choice.
+  choice. The direct native `SuccinctBM25Blob`, whose bytes embed the runtime
+  metadata, rotates to schema ID `7ECEC029EEE4CA89582599E83B0E9508`
+  (minted with `trible genid` on 2026-08-08). The unused
+  `Universe::validate_metadata_prefix` compatibility seam was removed;
+  attachment validates the concrete runtime layout directly.
 - **Canonical `SimpleArchive` leaves can now derive raw Succinct artifacts
   without constructing a query runtime.**
   `SuccinctArchiveBlob::build_from_simple_archive` validates the source's

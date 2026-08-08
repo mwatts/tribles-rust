@@ -1324,10 +1324,9 @@ pub struct SuccinctBM25Index<
 
     /// Sorted, deduplicated, compressed doc-key table. For
     /// entity-keyed corpora (`Inline<GenId>`), 16 of the 32 bytes
-    /// per key are always zero; plus real-world ID patterns
-    /// share 4-byte fragments across docs. `CompressedUniverse`
-    /// frequency-sorts fragments and stores indices via
-    /// DACs-byte — typical 3-5× savings vs. a flat row table.
+    /// per key are always zero. `CompressedUniverse` stores that
+    /// shared zero prefix implicitly while retaining direct access
+    /// and binary search over the two 16-byte halves.
     ///
     /// The doc_idx in the postings table is the key's position
     /// in the sorted universe (not insertion order).
@@ -1874,13 +1873,13 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
         self.b
     }
 
-    /// Bytes attributable to the doc-key section in the canonical
-    /// blob — the `CompressedUniverse`'s fragment dictionary plus
-    /// its DacsByte payload. Useful for size-attribution
+    /// Bytes attributable to the doc-key section in the native
+    /// blob — every 16-byte suffix plus the stored nonzero 16-byte
+    /// prefixes. Useful for size-attribution
     /// instrumentation (see `examples/blob_sizes_at_scale.rs`).
     pub fn keys_size_bytes(&self) -> usize {
         let meta = self.meta();
-        meta.keys.fragments.len + meta.keys.data.levels.len
+        meta.keys.suffixes.len + meta.keys.nonzero_prefixes.len
     }
 
     /// Length of doc `i`, or `None` if out of range.
@@ -2161,7 +2160,7 @@ impl std::error::Error for SuccinctLoadError {}
 /// [`IntoBlob`](triblespace_core::blob::IntoBlob) is an `O(1)` refcounted clone.
 ///
 /// Schema id minted fresh via `trible genid`:
-/// `DAFEEEC9350D072B83E32DBBBBB66039`. Any breaking layout
+/// `7ECEC029EEE4CA89582599E83B0E9508`. Any breaking layout
 /// change mints a new id. The id participates in derived typed
 /// schemas, but it is not an in-band runtime guard and changing
 /// it does not create a new Rust marker type. Persisted
@@ -2169,6 +2168,9 @@ impl std::error::Error for SuccinctLoadError {}
 /// rotate with it; see `docs/FACULTY_INTEGRATION.md`.
 ///
 /// Retired ids:
+/// - `DAFEEEC9350D072B83E32DBBBBB66039` — exact-TF native layout
+///   with the former DACS-backed document-key universe; retired when the
+///   runtime universe became zero-prefix halves.
 /// - `DA527A8FF09A3709B2AC6425CD5AF7A8` — canonical-byte
 ///   score-posting layout; retired when persisted scores became exact raw
 ///   term frequencies.
@@ -2189,7 +2191,7 @@ impl BlobEncoding for SuccinctBM25Blob {}
 // that the schema can't describe itself.
 impl MetaDescribe for SuccinctBM25Blob {
     fn describe() -> Fragment {
-        let id = id_hex!("DAFEEEC9350D072B83E32DBBBBB66039");
+        let id = id_hex!("7ECEC029EEE4CA89582599E83B0E9508");
         entity! { ExclusiveId::force_ref(&id) @
             metadata::name:        "SuccinctBM25Blob",
             metadata::description: "Canonical-bytes blob format for the succinct BM25 index. The index *is* its blob: document-key and term tables, document lengths, exact bit-packed term-frequency postings, and a `SuccinctBM25Meta` suffix all share one `anybytes::ByteArea`.",

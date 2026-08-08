@@ -31,25 +31,6 @@ fn id_from_u64(n: u64) -> Id {
     Id::new(raw).unwrap()
 }
 
-/// A naturally correlated GenId: share 11 bytes of fixed prefix
-/// (simulating "all entities minted from the same namespace seed
-/// during one session") and vary only the last 5 bytes by the
-/// doc index. Exposes the best case for `CompressedUniverse`'s
-/// 4-byte fragment dictionary: many docs share the same leading
-/// fragments.
-fn correlated_id(prefix: &[u8; 11], n: u64) -> Id {
-    let mut raw: RawId = [0; 16];
-    raw[..11].copy_from_slice(prefix);
-    // Last 5 bytes carry the doc-unique payload. `.max(1)` keeps
-    // the low byte non-zero so the overall Id is never nil.
-    let bytes = n.to_le_bytes();
-    raw[11..16].copy_from_slice(&bytes[..5]);
-    if raw.iter().all(|&b| b == 0) {
-        raw[15] = 1;
-    }
-    Id::new(raw).unwrap()
-}
-
 fn fake_doc(rng: &mut Rng, vocab: usize, n_words: usize) -> String {
     let mut words = Vec::with_capacity(n_words);
     for _ in 0..n_words {
@@ -62,22 +43,13 @@ fn fake_doc(rng: &mut Rng, vocab: usize, n_words: usize) -> String {
     words.join(" ")
 }
 
-/// Read the keys-section length from a built index. Wraps
-/// [`SuccinctBM25Index::keys_size_bytes`] so the wire-format
-/// layout (where the fragment-dictionary and DacsByte payload
-/// sections live inside the canonical bytes) stays inside the
-/// crate.
+/// Read the keys-section length from a built index. The native layout details
+/// remain encapsulated by [`SuccinctBM25Index::keys_size_bytes`].
 fn keys_len_from_blob(idx: &triblespace_search::succinct::SuccinctBM25Index) -> usize {
     idx.keys_size_bytes()
 }
 
-#[derive(Clone, Copy)]
-enum KeyDist {
-    Scattered,
-    Correlated,
-}
-
-fn bench(n_docs: usize, vocab: usize, doc_len: usize, keys: KeyDist) {
+fn bench(n_docs: usize, vocab: usize, doc_len: usize) {
     let mut rng = Rng(0xC0FFEE + n_docs as u64);
     // Materialise the docs once and reuse across serial + parallel
     // build paths so the measured time is build-only, not doc-gen.
@@ -85,29 +57,10 @@ fn bench(n_docs: usize, vocab: usize, doc_len: usize, keys: KeyDist) {
         .map(|i| (i as u64 + 1, fake_doc(&mut rng, vocab, doc_len)))
         .collect();
 
-    // Shared 11-byte prefix drawn deterministically from the
-    // bench seed so the correlated-keys case is reproducible.
-    let mut prefix_rng = Rng(0xABCD_1234 + n_docs as u64);
-    let mut prefix = [0u8; 11];
-    for slot in prefix.iter_mut() {
-        *slot = (prefix_rng.next() & 0xFF) as u8;
-    }
-    // Ensure the prefix isn't all zeros — that would make the
-    // last-5 payload the *only* distinguishing bytes and we'd
-    // accidentally measure the raw 16-byte Id case, not the
-    // shared-prefix case.
-    if prefix.iter().all(|&b| b == 0) {
-        prefix[0] = 1;
-    }
-
     let fresh_builder = || {
         let mut b: BM25Builder = BM25Builder::new();
         for (id_u64, doc) in &docs {
-            let id = match keys {
-                KeyDist::Scattered => id_from_u64(*id_u64),
-                KeyDist::Correlated => correlated_id(&prefix, *id_u64),
-            };
-            b.insert(id, hash_tokens(doc));
+            b.insert(id_from_u64(*id_u64), hash_tokens(doc));
         }
         b
     };
@@ -128,7 +81,7 @@ fn bench(n_docs: usize, vocab: usize, doc_len: usize, keys: KeyDist) {
     // Bit-identical output is the load-bearing invariant.
     debug_assert_eq!(naive, parallel_naive);
 
-    // Direct-to-succinct build (the production path).
+    // Direct-to-succinct build (the native accelerator path).
     let t1 = Instant::now();
     let succinct = fresh_builder().build();
     let encode_ms = t1.elapsed().as_secs_f64() * 1000.0;
@@ -144,13 +97,8 @@ fn bench(n_docs: usize, vocab: usize, doc_len: usize, keys: KeyDist) {
     // actually saved on this key distribution.
     let keys_flat = n_docs * 32;
     let keys_ratio = keys_bytes as f64 / keys_flat as f64;
-    let dist_tag = match keys {
-        KeyDist::Scattered => "scattered",
-        KeyDist::Correlated => "correlated",
-    };
-
     println!(
-        "n={n_docs:>6}  keys={dist_tag:<10}  vocab={vocab:>5}  avg_doc_len={doc_len:>3} \
+        "n={n_docs:>6}  vocab={vocab:>5}  avg_doc_len={doc_len:>3} \
          | build-1 {build_ms_serial:>5.0}ms  build-{threads} {build_ms_par:>5.0}ms \
          ({speedup:>3.1}×)  succinct-encode {encode_ms:>5.0}ms \
          | naive {:>8}  SB25 {:>8}  ratio {:.2}×  keys {:>8}/{:>8} ({:.2}×)",
@@ -176,16 +124,8 @@ fn fmt_bytes(n: usize) -> String {
 fn main() {
     println!("BM25 blob size: naive vs SB25 (succinct)");
     println!(
-        "\"scattered\"  keys use `id_from_u64` — all 16 trailing \
-         bytes vary pseudo-randomly."
-    );
-    println!(
-        "\"correlated\" keys share an 11-byte prefix — simulates \
-         one-session-minted entity ids."
-    );
-    println!(
-        "keys column: actual / flat-32B baseline, with the \
-         CompressedUniverse compression ratio."
+        "keys column: zero-prefix-halves payload / flat-32B baseline. \
+         GenIds share the implicit zero high half."
     );
     println!(
         "-------------------------------------------------------------\
@@ -198,7 +138,6 @@ fn main() {
             10_000 => (2_000, 64),
             _ => (5_000, 96),
         };
-        bench(n, vocab, len, KeyDist::Scattered);
-        bench(n, vocab, len, KeyDist::Correlated);
+        bench(n, vocab, len);
     }
 }

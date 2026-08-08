@@ -17,42 +17,6 @@ pub trait Universe: Serializable {
     where
         I: Iterator<Item = RawInline>;
 
-    /// Validate that every metadata handle needed by this universe lies in a
-    /// retained byte prefix.
-    ///
-    /// Exact raw-archive validation uses this seam to prevent a generic
-    /// universe from retaining a handle outside the canonical raw section
-    /// prefix. Built-in universes override it with non-panicking handle
-    /// preflights; the default contains a third-party implementation's
-    /// deserializer and converts an unwind into metadata failure.
-    fn validate_metadata_prefix(
-        meta: &Self::Meta,
-        bytes: &Bytes,
-        limit: usize,
-    ) -> Result<(), jerky::error::Error>
-    where
-        Self::Meta: Copy,
-        Self::Error: std::fmt::Display,
-    {
-        if limit > bytes.len() {
-            return Err(super::invalid_rank9_metadata(format!(
-                "universe prefix limit {limit} exceeds {} bytes",
-                bytes.len()
-            )));
-        }
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Self::from_bytes(*meta, bytes.clone().slice(0..limit))
-        })) {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(err)) => Err(super::invalid_rank9_metadata(format!(
-                "universe metadata exceeds the retained prefix: {err}"
-            ))),
-            Err(_) => Err(super::invalid_rank9_metadata(
-                "universe metadata panicked while validating the retained prefix",
-            )),
-        }
-    }
-
     /// Builds a universe from an arbitrary iterator, sorting and deduplicating internally.
     fn with<I>(iter: I, sections: &mut SectionWriter<'_>) -> Self
     where
@@ -157,21 +121,6 @@ impl Universe for OrderedUniverse {
     {
         let collected: Vec<_> = iter.collect();
         OrderedUniverse::from_slice(&collected, sections)
-    }
-
-    fn validate_metadata_prefix(
-        meta: &Self::Meta,
-        bytes: &Bytes,
-        limit: usize,
-    ) -> Result<(), jerky::error::Error> {
-        if limit > bytes.len() {
-            return Err(super::invalid_rank9_metadata(format!(
-                "ordered-universe prefix limit {limit} exceeds {} bytes",
-                bytes.len()
-            )));
-        }
-        super::checked_section_range(*meta, limit, "ordered-universe values")?;
-        Ok(())
     }
 
     fn access(&self, pos: usize) -> RawInline {
@@ -310,7 +259,10 @@ impl CompressedUniverse {
             .view(&bytes)
             .map_err(jerky::error::Error::from)?;
 
-        if nonzero_prefixes.iter().any(|prefix| *prefix == [0; 16]) {
+        if nonzero_prefixes
+            .first()
+            .is_some_and(|prefix| *prefix == [0; 16])
+        {
             return Err(super::invalid_rank9_metadata(
                 "compressed-universe tail contains a zero prefix",
             ));
@@ -434,14 +386,6 @@ impl Universe for CompressedUniverse {
         }
     }
 
-    fn validate_metadata_prefix(
-        meta: &Self::Meta,
-        bytes: &Bytes,
-        limit: usize,
-    ) -> Result<(), jerky::error::Error> {
-        Self::validate_layout(meta, bytes, limit)
-    }
-
     fn access(&self, pos: usize) -> RawInline {
         let mut value: RawInline = [0; 32];
         value[16..].copy_from_slice(&self.suffixes[pos]);
@@ -453,11 +397,16 @@ impl Universe for CompressedUniverse {
 
     fn search(&self, value: &RawInline) -> Option<usize> {
         let position = self.search_lower(value);
-        if position < self.len() && self.access(position) == *value {
-            Some(position)
+        let matches = if value[..16] == [0; 16] {
+            position < self.zero_prefix_len && self.suffixes[position].as_slice() == &value[16..]
         } else {
-            None
-        }
+            position >= self.zero_prefix_len
+                && position < self.len()
+                && self
+                    .tail_cmp(position - self.zero_prefix_len, value)
+                    .is_eq()
+        };
+        matches.then_some(position)
     }
 
     fn search_lower(&self, value: &RawInline) -> usize {
@@ -536,18 +485,6 @@ where
             search_cache: Cache::new(SEARCH_CACHE),
             inner: U::with_sorted_dedup(values, sections),
         }
-    }
-
-    fn validate_metadata_prefix(
-        meta: &Self::Meta,
-        bytes: &Bytes,
-        limit: usize,
-    ) -> Result<(), jerky::error::Error>
-    where
-        Self::Meta: Copy,
-        Self::Error: std::fmt::Display,
-    {
-        U::validate_metadata_prefix(meta, bytes, limit)
     }
 
     fn access(&self, pos: usize) -> RawInline {
@@ -654,8 +591,6 @@ mod tests {
         let bytes = area.freeze().unwrap();
 
         assert_eq!(bytes.len(), 32 * values.len() - 16 * zero_prefix_len);
-        CompressedUniverse::validate_metadata_prefix(&metadata, &bytes, bytes.len()).unwrap();
-
         let rebuilt = CompressedUniverse::from_bytes(metadata, bytes).unwrap();
         for (position, value) in values.iter().enumerate() {
             assert_eq!(rebuilt.access(position), *value);
@@ -763,7 +698,7 @@ mod tests {
         assert!(CompressedUniverse::from_bytes(metadata, Bytes::from_source(unordered)).is_err());
 
         assert!(
-            CompressedUniverse::validate_metadata_prefix(&metadata, &bytes, bytes.len() - 1,)
+            CompressedUniverse::from_bytes(metadata, bytes.clone().slice(0..bytes.len() - 1),)
                 .is_err()
         );
     }
