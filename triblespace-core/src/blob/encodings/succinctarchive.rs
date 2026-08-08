@@ -2,11 +2,9 @@ mod succinctarchiveconstraint;
 mod succinctarchiverangeconstraint;
 mod universe;
 
-// Internal staging seam for the portable raw representation. This module has
-// deliberately no `BlobEncoding` identity and is not re-exported: the public
-// schema switch must happen atomically with removal of the native v1 codec and
-// adaptation of the runtime/Rank9 attachment path.
-#[allow(dead_code)]
+// Internal codec for the one public, architecture-independent raw layout. Its
+// schema identity lives on `SuccinctArchiveBlob`; native runtime arenas and
+// detached Rank9 indexes never pass through this module.
 mod portable;
 
 use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
@@ -86,11 +84,13 @@ impl BlobEncoding for SuccinctArchiveBlob {}
 
 impl MetaDescribe for SuccinctArchiveBlob {
     fn describe() -> Fragment {
-        let id: Id = id_hex!("8FAD1D4C7F884B51BAA5D6C56B873E41");
+        // Minted with `trible genid` on 2026-08-08 for the incompatible
+        // portable v2 format. Native v1 has no compatibility reader.
+        let id: Id = id_hex!("D187C3155DD368B784E1F53DBE8C7513");
         entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::name: "succinctarchive",
-                metadata::description: "Succinct archive index for fast offline trible queries. The bytes store a compressed, query-friendly layout derived from a canonical trible set.\n\nUse for large, read-heavy, mostly immutable datasets where fast scans or joins matter more than incremental updates. Build it from a TribleSet or SimpleArchive, and keep a canonical source if you need to regenerate or validate the index.",
+                metadata::description: "Portable canonical Ring archive for fast offline trible queries. The architecture-independent bytes contain the ordered raw domain and logical prefix, pair-change, and wavelet bit vectors. Query runtimes and detached Rank9 accelerators are reproducibly derived and excluded from its content identity.",
                 metadata::tag: metadata::KIND_BLOB_ENCODING,
         }
     }
@@ -164,13 +164,12 @@ impl SuccinctArchiveRank9IndexBlob {
 
 #[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
 #[repr(C)]
-/// Serialisation metadata trailer for a [`SuccinctArchive`].
+/// Process-local handles into the rebuilt query arena.
 ///
-/// Stored at the very end of the canonical raw [`SuccinctArchiveBlob`]; the
-/// `D` parameter captures the domain (universe) metadata layout. Accelerator
-/// bytes never occur before this trailer: its exact EOF position is part of
-/// the raw archive's content identity.
-pub struct SuccinctArchiveMeta<D: Metadata> {
+/// This native metadata is never serialized in [`SuccinctArchiveBlob`] and is
+/// not a compatibility format. The portable blob identity contains only the
+/// ordered raw domain and logical bit-vector words.
+struct SuccinctArchiveMeta<D: Metadata> {
     /// Number of distinct entities in the archive.
     pub entity_count: usize,
     /// Number of distinct attributes in the archive.
@@ -335,24 +334,6 @@ fn reserve_rank9_index_header<'area>(
     header
 }
 
-/// Appends the canonical EOF metadata trailer to the raw archive. Rank/select
-/// structures deliberately live in a different blob and cannot affect this
-/// blob's content identity.
-fn try_finalize_succinct_archive<D>(
-    writer: &mut SectionWriter<'_>,
-    meta: &SuccinctArchiveMeta<D>,
-) -> Result<(), jerky::error::Error>
-where
-    D: Metadata + Clone,
-{
-    let mut meta_section = writer
-        .reserve::<SuccinctArchiveMeta<D>>(1)
-        .map_err(jerky::error::Error::from)?;
-    meta_section.as_mut_slice()[0] = meta.clone();
-    meta_section.freeze().map_err(jerky::error::Error::from)?;
-    Ok(())
-}
-
 /// Appends the relative index table and exact native-ABI footer to a detached
 /// Rank9 blob. Its fixed header must already occupy offset zero.
 fn try_finalize_rank9_index(
@@ -389,14 +370,6 @@ fn try_finalize_rank9_index(
     };
     footer.freeze().map_err(jerky::error::Error::from)?;
     Ok(())
-}
-
-fn finalize_succinct_archive<D>(writer: &mut SectionWriter<'_>, meta: &SuccinctArchiveMeta<D>)
-where
-    D: Metadata + Clone,
-{
-    try_finalize_succinct_archive(writer, meta)
-        .expect("temporary archive arena must remain writable");
 }
 
 fn build_prefix_bv<I>(
@@ -441,7 +414,7 @@ where
 /// `pattern!` queries alongside regular [`TribleSet`]s.
 #[derive(Debug, Clone)]
 pub struct SuccinctArchive<U> {
-    /// The canonical raw archive blob bytes (shared, zero-copy).
+    /// The canonical, architecture-independent raw archive blob bytes.
     pub bytes: Bytes,
     /// Detached persisted Rank9/select accelerator bytes.
     rank9_index_bytes: Bytes,
@@ -519,6 +492,240 @@ fn wavelet_meta<D: Metadata>(meta: &SuccinctArchiveMeta<D>) -> [WaveletMatrixMet
     ]
 }
 
+fn portable_codec_error(error: impl std::fmt::Display) -> jerky::error::Error {
+    invalid_rank9_metadata(error.to_string())
+}
+
+fn copy_raw_words(
+    handle: SectionHandle<u64>,
+    runtime_bytes: &Bytes,
+) -> Result<Vec<u64>, jerky::error::Error> {
+    Ok(handle.view(runtime_bytes)?.iter().copied().collect())
+}
+
+/// Canonicalizes an internal query arena into the portable raw representation.
+/// Universe compression and native section offsets deliberately disappear at
+/// this boundary: only the ordered raw domain and logical bit-vector words
+/// participate in the public blob identity.
+fn encode_portable_runtime<U>(
+    meta: &SuccinctArchiveMeta<U::Meta>,
+    domain: &U,
+    runtime_bytes: &Bytes,
+) -> Result<Bytes, jerky::error::Error>
+where
+    U: Universe,
+{
+    let domain_values: Vec<_> = (0..domain.len()).map(|code| domain.access(code)).collect();
+    let top_level = top_level_bitvector_meta(meta)
+        .into_iter()
+        .map(|vector| copy_raw_words(vector.handle, runtime_bytes))
+        .collect::<Result<Vec<_>, _>>()?;
+    let [e_a, a_a, v_a, changed_e_a, changed_e_v, changed_a_e, changed_a_v, changed_v_e, changed_v_a]: [Vec<u64>; TOP_LEVEL_RANK9_INDEX_COUNT] =
+        top_level.try_into().expect("nine top-level raw vectors");
+
+    let mut wavelets = Vec::with_capacity(SuccinctRotation::ALL.len());
+    for (position, matrix) in wavelet_meta(meta).into_iter().enumerate() {
+        if matrix.alph_size != domain.len() {
+            return Err(invalid_rank9_metadata(format!(
+                "wavelet matrix {position} alphabet size {} does not match domain cardinality {}",
+                matrix.alph_size,
+                domain.len()
+            )));
+        }
+        if matrix.len != meta.eav_c.len {
+            return Err(invalid_rank9_metadata(format!(
+                "wavelet matrix {position} contains {} rows, expected {}",
+                matrix.len, meta.eav_c.len
+            )));
+        }
+        let handles = matrix.layers.view(runtime_bytes)?;
+        if handles.len() != matrix.alph_width {
+            return Err(invalid_rank9_metadata(format!(
+                "wavelet matrix {position} has {} raw planes, expected {}",
+                handles.len(),
+                matrix.alph_width
+            )));
+        }
+        let mut words = Vec::new();
+        for handle in handles.iter().copied() {
+            words.extend(copy_raw_words(handle, runtime_bytes)?);
+        }
+        wavelets.push(words);
+    }
+    let [eav_c, vea_c, ave_c, vae_c, eva_c, aev_c]: [Vec<u64>; 6] =
+        wavelets.try_into().expect("six Ring wavelet matrices");
+
+    portable::encode(portable::PortableParts {
+        triple_count: meta.eav_c.len,
+        domain: &domain_values,
+        prefixes: [&e_a, &a_a, &v_a],
+        changes: [
+            &changed_e_a,
+            &changed_e_v,
+            &changed_a_e,
+            &changed_a_v,
+            &changed_v_e,
+            &changed_v_a,
+        ],
+        wavelets: [&eav_c, &vea_c, &ave_c, &vae_c, &eva_c, &aev_c],
+    })
+    .map(Bytes::from)
+    .map_err(portable_codec_error)
+}
+
+fn write_runtime_bitvector(
+    words: &[u64],
+    len: usize,
+    writer: &mut SectionWriter<'_>,
+) -> Result<BitVectorDataMeta, jerky::error::Error> {
+    let mut section = writer.reserve::<u64>(words.len())?;
+    section.as_mut_slice().copy_from_slice(words);
+    let handle = section.handle();
+    section.freeze()?;
+    Ok(BitVectorDataMeta { handle, len })
+}
+
+fn write_runtime_wavelet(
+    words: &[u64],
+    alphabet_size: usize,
+    len: usize,
+    writer: &mut SectionWriter<'_>,
+) -> Result<WaveletMatrixMeta, jerky::error::Error> {
+    let width = jerky::utils::alphabet_width(alphabet_size);
+    let row_words = len.div_ceil(u64::BITS as usize);
+    let expected = width
+        .checked_mul(row_words)
+        .ok_or_else(|| invalid_rank9_metadata("runtime wavelet word count overflow"))?;
+    if words.len() != expected {
+        return Err(invalid_rank9_metadata(format!(
+            "portable wavelet contains {} words, expected {expected}",
+            words.len()
+        )));
+    }
+
+    let mut handles = writer.reserve::<SectionHandle<u64>>(width)?;
+    for depth in 0..width {
+        let start = depth * row_words;
+        let plane = &words[start..start + row_words];
+        let mut section = writer.reserve::<u64>(plane.len())?;
+        section.as_mut_slice().copy_from_slice(plane);
+        handles[depth] = section.handle();
+        section.freeze()?;
+    }
+    let layers = handles.handle();
+    handles.freeze()?;
+    Ok(WaveletMatrixMeta {
+        alph_size: alphabet_size,
+        alph_width: width,
+        len,
+        layers,
+    })
+}
+
+fn build_runtime_from_portable<U>(
+    parts: portable::RuntimeParts,
+) -> Result<(SuccinctArchiveMeta<U::Meta>, Bytes), jerky::error::Error>
+where
+    U: Universe + Serializable<Error = jerky::error::Error>,
+{
+    let mut area = ByteArea::new()?;
+    let mut sections = area.sections();
+    let expected_domain_len = parts.domain.len();
+    let domain = U::with_sorted_dedup(parts.domain.into_iter(), &mut sections);
+    let domain_len = domain.len();
+    if domain_len != expected_domain_len {
+        return Err(invalid_rank9_metadata(format!(
+            "runtime universe retained {domain_len} values, expected {expected_domain_len}"
+        )));
+    }
+
+    let [e_a_words, a_a_words, v_a_words] = parts.prefixes;
+    let prefix_len = parts
+        .triple_count
+        .checked_add(domain_len)
+        .and_then(|sum| sum.checked_add(1))
+        .ok_or_else(|| invalid_rank9_metadata("runtime prefix length overflow"))?;
+    let e_a = write_runtime_bitvector(&e_a_words, prefix_len, &mut sections)?;
+    let a_a = write_runtime_bitvector(&a_a_words, prefix_len, &mut sections)?;
+    let v_a = write_runtime_bitvector(&v_a_words, prefix_len, &mut sections)?;
+
+    let [eav_words, vea_words, ave_words, vae_words, eva_words, aev_words] = parts.wavelets;
+    let eav_c = write_runtime_wavelet(&eav_words, domain_len, parts.triple_count, &mut sections)?;
+    let vea_c = write_runtime_wavelet(&vea_words, domain_len, parts.triple_count, &mut sections)?;
+    let ave_c = write_runtime_wavelet(&ave_words, domain_len, parts.triple_count, &mut sections)?;
+    let vae_c = write_runtime_wavelet(&vae_words, domain_len, parts.triple_count, &mut sections)?;
+    let eva_c = write_runtime_wavelet(&eva_words, domain_len, parts.triple_count, &mut sections)?;
+    let aev_c = write_runtime_wavelet(&aev_words, domain_len, parts.triple_count, &mut sections)?;
+
+    // Keep changed_v_a physically last: its end is the compact runtime-arena
+    // boundary used by detached Rank9 validation.
+    let [changed_e_a_words, changed_e_v_words, changed_a_e_words, changed_a_v_words, changed_v_e_words, changed_v_a_words] =
+        parts.changes;
+    let changed_e_a =
+        write_runtime_bitvector(&changed_e_a_words, parts.triple_count, &mut sections)?;
+    let changed_e_v =
+        write_runtime_bitvector(&changed_e_v_words, parts.triple_count, &mut sections)?;
+    let changed_a_e =
+        write_runtime_bitvector(&changed_a_e_words, parts.triple_count, &mut sections)?;
+    let changed_a_v =
+        write_runtime_bitvector(&changed_a_v_words, parts.triple_count, &mut sections)?;
+    let changed_v_e =
+        write_runtime_bitvector(&changed_v_e_words, parts.triple_count, &mut sections)?;
+    let changed_v_a =
+        write_runtime_bitvector(&changed_v_a_words, parts.triple_count, &mut sections)?;
+
+    let meta = SuccinctArchiveMeta {
+        entity_count: parts.entity_count,
+        attribute_count: parts.attribute_count,
+        value_count: parts.value_count,
+        domain: domain.metadata(),
+        e_a,
+        a_a,
+        v_a,
+        changed_e_a,
+        changed_e_v,
+        changed_a_e,
+        changed_a_v,
+        changed_v_e,
+        changed_v_a,
+        eav_c,
+        vea_c,
+        ave_c,
+        vae_c,
+        eva_c,
+        aev_c,
+    };
+    let runtime_bytes = area.freeze()?;
+    Ok((meta, runtime_bytes))
+}
+
+fn build_runtime_rank9_index<D: Metadata>(
+    meta: &SuccinctArchiveMeta<D>,
+    runtime_bytes: &Bytes,
+    source: Inline<Handle<SuccinctArchiveBlob>>,
+) -> Result<Bytes, jerky::error::Error> {
+    let mut area = ByteArea::new()?;
+    let mut sections = area.sections();
+    let mut header = reserve_rank9_index_header(&mut sections);
+    header[0].source = source.raw;
+
+    let mut indexes = Vec::with_capacity(expected_rank9_index_count(meta)?);
+    for vector in top_level_bitvector_meta(meta) {
+        let vector = BitVector::<Rank9SelIndex>::from_bytes(vector, runtime_bytes.clone())?;
+        indexes.push(vector.index.persist(&mut sections)?);
+    }
+    for matrix in wavelet_meta(meta) {
+        let matrix = WaveletMatrix::<Rank9SelIndex>::from_bytes(matrix, runtime_bytes.clone())?;
+        indexes.extend(matrix.persist_layer_indexes(&mut sections)?);
+    }
+
+    try_finalize_rank9_index(&mut sections, &indexes)?;
+    header.freeze()?;
+    let bytes = area.freeze()?;
+    parse_rank9_index(meta, runtime_bytes, source, &bytes)?;
+    Ok(bytes)
+}
+
 fn bitvector_word_bytes(len: usize) -> Result<usize, jerky::error::Error> {
     len.checked_add(63)
         .map(|bits| bits / 64)
@@ -531,7 +738,7 @@ fn expected_rank9_index_count<D: Metadata>(
 ) -> Result<usize, jerky::error::Error> {
     let mut count = TOP_LEVEL_RANK9_INDEX_COUNT;
     for matrix in wavelet_meta(meta) {
-        if matrix.alph_width != jerky::utils::needed_bits(matrix.alph_size) {
+        if matrix.alph_width != jerky::utils::alphabet_width(matrix.alph_size) {
             return Err(invalid_rank9_metadata(format!(
                 "wavelet alphabet width {} does not match alphabet size {}",
                 matrix.alph_width, matrix.alph_size
@@ -544,9 +751,9 @@ fn expected_rank9_index_count<D: Metadata>(
     Ok(count)
 }
 
-/// Preflights every raw handle before any AnyBytes/Jerky view constructor can
-/// slice with it. The last legacy raw section is `changed_v_a`; its end is the
-/// canonical raw-prefix boundary for all writers.
+/// Preflights every runtime-arena handle before any AnyBytes/Jerky view
+/// constructor can slice with it. `changed_v_a` is the final internal raw
+/// section; public portable bytes have their own gapless layout validator.
 fn validate_raw_rank9_sources<D: Metadata>(
     meta: &SuccinctArchiveMeta<D>,
     bytes: &Bytes,
@@ -586,7 +793,7 @@ fn validate_raw_rank9_sources<D: Metadata>(
     }
 
     for (matrix_index, matrix) in wavelet_meta(meta).into_iter().enumerate() {
-        if matrix.alph_width != jerky::utils::needed_bits(matrix.alph_size) {
+        if matrix.alph_width != jerky::utils::alphabet_width(matrix.alph_size) {
             return Err(invalid_rank9_metadata(format!(
                 "wavelet matrix {matrix_index} has a non-canonical alphabet width"
             )));
@@ -623,23 +830,6 @@ fn validate_raw_rank9_sources<D: Metadata>(
         }
     }
 
-    Ok(raw_end)
-}
-
-fn validate_raw_archive<D: Metadata>(
-    meta: &SuccinctArchiveMeta<D>,
-    bytes: &Bytes,
-    meta_start: usize,
-) -> Result<usize, jerky::error::Error> {
-    let raw_end = validate_raw_rank9_sources(meta, bytes, meta_start)?;
-    let expected_meta_start =
-        checked_align_up(raw_end, std::mem::align_of::<SuccinctArchiveMeta<D>>())?;
-    if meta_start != expected_meta_start {
-        return Err(invalid_rank9_metadata(format!(
-            "raw archive metadata starts at {meta_start}, expected {expected_meta_start}"
-        )));
-    }
-    ensure_zero_bytes(bytes, raw_end..meta_start, "raw archive metadata padding")?;
     Ok(raw_end)
 }
 
@@ -1014,95 +1204,6 @@ where
             z = prefix.rank0(prefix.select1(id + 1).unwrap()).unwrap();
             Some(self.domain.access(id))
         })
-    }
-
-    /// Returns the serialization metadata header for this archive.
-    pub fn meta(&self) -> SuccinctArchiveMeta<U::Meta>
-    where
-        U: Serializable,
-    {
-        SuccinctArchiveMeta {
-            entity_count: self.entity_count,
-            attribute_count: self.attribute_count,
-            value_count: self.value_count,
-            domain: self.domain.metadata(),
-            e_a: self.e_a.metadata(),
-            a_a: self.a_a.metadata(),
-            v_a: self.v_a.metadata(),
-            changed_e_a: self.changed_e_a.metadata(),
-            changed_e_v: self.changed_e_v.metadata(),
-            changed_a_e: self.changed_a_e.metadata(),
-            changed_a_v: self.changed_a_v.metadata(),
-            changed_v_e: self.changed_v_e.metadata(),
-            changed_v_a: self.changed_v_a.metadata(),
-            eav_c: self.eav_c.metadata(),
-            vea_c: self.vea_c.metadata(),
-            ave_c: self.ave_c.metadata(),
-            vae_c: self.vae_c.metadata(),
-            eva_c: self.eva_c.metadata(),
-            aev_c: self.aev_c.metadata(),
-        }
-    }
-
-    /// Persists the attached Rank9/select structures as a detached accelerator
-    /// bound to `source`. The raw archive bytes are never copied or modified.
-    fn persist_rank9_index(
-        &self,
-        source: Inline<Handle<SuccinctArchiveBlob>>,
-    ) -> Result<Bytes, jerky::error::Error>
-    where
-        U: Serializable<Error = jerky::error::Error>,
-        U::Meta: Copy,
-    {
-        let meta = self.meta();
-        let mut area = ByteArea::new()?;
-        let mut sections = area.sections();
-        let mut header = sections.reserve::<Rank9IndexHeader>(1)?;
-        if header.handle().offset != 0 {
-            return Err(invalid_rank9_metadata(
-                "Rank9 source handle is not at offset zero",
-            ));
-        }
-        header[0] = Rank9IndexHeader {
-            source: source.raw,
-            marker: RANK9_INDEX_MARKER,
-            version: RANK9_INDEX_VERSION,
-            flags: RANK9_INDEX_FLAGS,
-            word_bytes: std::mem::size_of::<usize>() as u8,
-            endian: RANK9_INDEX_ENDIAN,
-            reserved: [0; 6],
-        };
-
-        let mut index_handles = [
-            &self.e_a,
-            &self.a_a,
-            &self.v_a,
-            &self.changed_e_a,
-            &self.changed_e_v,
-            &self.changed_a_e,
-            &self.changed_a_v,
-            &self.changed_v_e,
-            &self.changed_v_a,
-        ]
-        .into_iter()
-        .map(|vector| vector.index.persist(&mut sections))
-        .collect::<Result<Vec<_>, _>>()?;
-        for matrix in [
-            &self.eav_c,
-            &self.vea_c,
-            &self.ave_c,
-            &self.vae_c,
-            &self.eva_c,
-            &self.aev_c,
-        ] {
-            index_handles.extend(matrix.persist_layer_indexes(&mut sections)?);
-        }
-
-        try_finalize_rank9_index(&mut sections, &index_handles)?;
-        header.freeze()?;
-        let index = area.freeze()?;
-        parse_rank9_index(&meta, &self.bytes, source, &index)?;
-        Ok(index)
     }
 }
 
@@ -1653,7 +1754,7 @@ struct PackedWaveletBuilder<'area> {
 
 impl<'area> PackedWaveletBuilder<'area> {
     fn new(alphabet_size: usize, len: usize, writer: &mut SectionWriter<'area>) -> Self {
-        let width = jerky::utils::needed_bits(alphabet_size);
+        let width = jerky::utils::alphabet_width(alphabet_size);
         let mut handles = writer.reserve::<SectionHandle<u64>>(width).unwrap();
         let mut planes = Vec::with_capacity(width);
         for depth in 0..width {
@@ -2255,7 +2356,8 @@ fn stable_sort_materialized_rows(
 /// their six-PATCH [`TribleSet`] representation. Segment-local value domains
 /// are merged first. EAV is decoded, remapped, merged, and deduplicated once;
 /// the other five rotations are derived by stable linear counting sorts. The
-/// on-disk blob format is unchanged.
+/// result is then emitted through the same portable canonical codec as a full
+/// rebuild.
 fn merge_ordered_archives_with_factory<F>(
     segments: &[SuccinctArchive<OrderedUniverse>],
     factory: &F,
@@ -2302,8 +2404,8 @@ where
     let mut row_scratch = Vec::with_capacity(triple_count);
     let mut radix_counts = vec![0usize; domain_len];
 
-    // Reserve sections in exactly the historical serialization order so the
-    // structural merge produces the same canonical bytes as a full rebuild.
+    // Reserve one compact process-local arena for the runtime. Public bytes are
+    // emitted independently through `encode_portable_runtime` below.
     let mut e_a_builder =
         BitVectorBuilder::from_bit(false, triple_count + domain_len + 1, &mut sections).unwrap();
     let mut a_a_builder =
@@ -2437,7 +2539,6 @@ where
         aev_c,
     };
 
-    finalize_succinct_archive(&mut sections, &meta);
     try_finalize_rank9_index(&mut rank9_sections, &index_handles)
         .expect("temporary Rank9 arena must remain writable");
     drop((
@@ -2451,12 +2552,19 @@ where
         changed_v_e,
         changed_v_a,
     ));
-    let bytes = area.freeze().unwrap();
+    let runtime_bytes = area.freeze().unwrap();
+    let bytes = encode_portable_runtime(&meta, &domain, &runtime_bytes).unwrap();
     let raw_blob = Blob::<SuccinctArchiveBlob>::new(bytes.clone());
     rank9_header[0].source = raw_blob.get_handle().raw;
     rank9_header.freeze().unwrap();
     let rank9_bytes = rank9_area.freeze().unwrap();
-    Ok(SuccinctArchive::from_bytes_with_rank9_indexes(meta, bytes, rank9_bytes).unwrap())
+    Ok(SuccinctArchive::from_runtime_bytes_with_rank9_indexes(
+        meta,
+        runtime_bytes,
+        bytes,
+        rank9_bytes,
+    )
+    .unwrap())
 }
 
 /// Structurally merge sorted succinct-archive segments on the default CPU
@@ -2727,7 +2835,6 @@ where
         aev_c,
     };
 
-    finalize_succinct_archive(&mut sections, &meta);
     try_finalize_rank9_index(&mut rank9_sections, &index_handles)
         .expect("temporary Rank9 arena must remain writable");
     drop((
@@ -2742,13 +2849,20 @@ where
         changed_v_a,
     ));
 
-    let bytes = area.freeze().unwrap();
+    let runtime_bytes = area.freeze().unwrap();
+    let bytes = encode_portable_runtime(&meta, &domain, &runtime_bytes).unwrap();
     let raw_blob = Blob::<SuccinctArchiveBlob>::new(bytes.clone());
     rank9_header[0].source = raw_blob.get_handle().raw;
     rank9_header.freeze().unwrap();
     let rank9_bytes = rank9_area.freeze().unwrap();
 
-    Ok(SuccinctArchive::from_bytes_with_rank9_indexes(meta, bytes, rank9_bytes).unwrap())
+    Ok(SuccinctArchive::from_runtime_bytes_with_rank9_indexes(
+        meta,
+        runtime_bytes,
+        bytes,
+        rank9_bytes,
+    )
+    .unwrap())
 }
 
 impl<U> From<&TribleSet> for SuccinctArchive<U>
@@ -2822,20 +2936,27 @@ impl<U> SuccinctArchive<U>
 where
     U: Universe + Serializable<Error = jerky::error::Error>,
 {
-    /// Attaches exact-validated persisted Rank9/select indexes in canonical
-    /// order. Unlike [`Serializable::from_bytes`], this explicit constructor
-    /// never guesses where an enclosing arena ends.
-    fn from_bytes_with_rank9_indexes(
+    /// Attaches exact-validated persisted Rank9/select indexes to a runtime
+    /// arena that was freshly derived from canonical portable bytes.
+    fn from_runtime_bytes_with_rank9_indexes(
         meta: SuccinctArchiveMeta<U::Meta>,
+        runtime_bytes: Bytes,
         bytes: Bytes,
         rank9_index_bytes: Bytes,
     ) -> Result<Self, jerky::error::Error> {
         let source = Blob::<SuccinctArchiveBlob>::new(bytes.clone()).get_handle();
-        let index_handles = parse_rank9_index(&meta, &bytes, source, &rank9_index_bytes)?;
+        let raw_end = validate_raw_rank9_sources(&meta, &runtime_bytes, runtime_bytes.len())?;
+        if raw_end != runtime_bytes.len() {
+            return Err(invalid_rank9_metadata(format!(
+                "runtime arena has {} trailing bytes after its raw sections",
+                runtime_bytes.len() - raw_end
+            )));
+        }
+        let index_handles = parse_rank9_index(&meta, &runtime_bytes, source, &rank9_index_bytes)?;
 
         let top_level_meta = top_level_bitvector_meta(&meta);
         let wavelet_metadata = wavelet_meta(&meta);
-        let domain = U::from_bytes(meta.domain, bytes.clone())?;
+        let domain = U::from_bytes(meta.domain, runtime_bytes.clone())?;
         let mut top_level = Vec::with_capacity(TOP_LEVEL_RANK9_INDEX_COUNT);
         for (raw_meta, index_handle) in top_level_meta
             .into_iter()
@@ -2843,7 +2964,7 @@ where
         {
             // `validate_rank9_index_handles` preflights this raw handle before
             // BitVectorData/AnyBytes can slice with it.
-            let data = BitVectorData::from_bytes(raw_meta, bytes.clone())?;
+            let data = BitVectorData::from_bytes(raw_meta, runtime_bytes.clone())?;
             let index =
                 Rank9SelIndex::from_bytes_for_data(&data, index_handle.bytes(&rank9_index_bytes))?;
             top_level.push(BitVector::new(data, index));
@@ -2862,7 +2983,7 @@ where
             let matrix_handles = &index_handles[handle_cursor..handle_end];
             let matrix = WaveletMatrix::from_bytes_with_persisted_indexes(
                 matrix_meta,
-                bytes.clone(),
+                runtime_bytes.clone(),
                 matrix_handles
                     .iter()
                     .map(|handle| handle.bytes(&rank9_index_bytes)),
@@ -2897,73 +3018,6 @@ where
             eva_c,
             aev_c,
         })
-    }
-}
-
-impl<U> Serializable for SuccinctArchive<U>
-where
-    U: Universe + Serializable<Error = jerky::error::Error>,
-    U::Meta: Copy + 'static,
-{
-    type Meta = SuccinctArchiveMeta<U::Meta>;
-    type Error = jerky::error::Error;
-
-    fn metadata(&self) -> Self::Meta {
-        self.meta()
-    }
-
-    fn from_bytes(meta: Self::Meta, bytes: Bytes) -> Result<Self, Self::Error> {
-        let meta_start = bytes
-            .len()
-            .checked_sub(std::mem::size_of::<SuccinctArchiveMeta<U::Meta>>())
-            .ok_or_else(|| invalid_rank9_metadata("raw succinct archive is truncated"))?;
-        let raw_end = validate_raw_archive(&meta, &bytes, meta_start)?;
-        U::validate_metadata_prefix(&meta.domain, &bytes, raw_end)?;
-        let domain = U::from_bytes(meta.domain, bytes.clone())?;
-
-        let e_a = BitVector::from_bytes(meta.e_a, bytes.clone())?;
-        let a_a = BitVector::from_bytes(meta.a_a, bytes.clone())?;
-        let v_a = BitVector::from_bytes(meta.v_a, bytes.clone())?;
-        let changed_e_a = BitVector::from_bytes(meta.changed_e_a, bytes.clone())?;
-        let changed_e_v = BitVector::from_bytes(meta.changed_e_v, bytes.clone())?;
-        let changed_a_e = BitVector::from_bytes(meta.changed_a_e, bytes.clone())?;
-        let changed_a_v = BitVector::from_bytes(meta.changed_a_v, bytes.clone())?;
-        let changed_v_e = BitVector::from_bytes(meta.changed_v_e, bytes.clone())?;
-        let changed_v_a = BitVector::from_bytes(meta.changed_v_a, bytes.clone())?;
-
-        let eav_c = WaveletMatrix::from_bytes(meta.eav_c, bytes.clone())?;
-        let vea_c = WaveletMatrix::from_bytes(meta.vea_c, bytes.clone())?;
-        let ave_c = WaveletMatrix::from_bytes(meta.ave_c, bytes.clone())?;
-        let vae_c = WaveletMatrix::from_bytes(meta.vae_c, bytes.clone())?;
-        let eva_c = WaveletMatrix::from_bytes(meta.eva_c, bytes.clone())?;
-        let aev_c = WaveletMatrix::from_bytes(meta.aev_c, bytes.clone())?;
-
-        let mut archive = SuccinctArchive {
-            bytes,
-            rank9_index_bytes: Bytes::empty(),
-            domain,
-            entity_count: meta.entity_count,
-            attribute_count: meta.attribute_count,
-            value_count: meta.value_count,
-            e_a,
-            a_a,
-            v_a,
-            changed_e_a,
-            changed_e_v,
-            changed_a_e,
-            changed_a_v,
-            changed_v_e,
-            changed_v_a,
-            eav_c,
-            vea_c,
-            ave_c,
-            vae_c,
-            eva_c,
-            aev_c,
-        };
-        let source = Blob::<SuccinctArchiveBlob>::new(archive.bytes.clone()).get_handle();
-        archive.rank9_index_bytes = archive.persist_rank9_index(source)?;
-        Ok(archive)
     }
 }
 
@@ -3021,15 +3075,41 @@ impl std::fmt::Debug for SuccinctArchiveError {
 impl<U> SuccinctArchive<U>
 where
     U: Universe + Serializable<Error = jerky::error::Error>,
-    <U as Serializable>::Meta: Copy + 'static,
 {
+    fn validated_runtime(
+        bytes: &Bytes,
+    ) -> Result<(SuccinctArchiveMeta<U::Meta>, Bytes), SuccinctArchiveError> {
+        let parts = {
+            let view = portable::parse(bytes.as_ref())
+                .map_err(|error| SuccinctArchiveError(portable_codec_error(error)))?;
+            view.prove_canonical()
+                .map_err(|error| SuccinctArchiveError(portable_codec_error(error)))?
+        };
+        build_runtime_from_portable::<U>(parts).map_err(SuccinctArchiveError)
+    }
+
+    /// Proves the portable bytes by independently deriving all prefixes,
+    /// changed masks, and rotations from the decoded EAV source ring before
+    /// constructing a runtime. No merely structural parse reaches query APIs.
+    fn from_portable_bytes(bytes: Bytes) -> Result<Self, SuccinctArchiveError> {
+        let (meta, runtime_bytes) = Self::validated_runtime(&bytes)?;
+        let source = Blob::<SuccinctArchiveBlob>::new(bytes.clone()).get_handle();
+        let rank9_index_bytes = build_runtime_rank9_index(&meta, &runtime_bytes, source)
+            .map_err(SuccinctArchiveError)?;
+        Self::from_runtime_bytes_with_rank9_indexes(meta, runtime_bytes, bytes, rank9_index_bytes)
+            .map_err(SuccinctArchiveError)
+    }
+
     /// Builds a queryable archive and returns its raw and Rank9 artifacts.
     pub fn build_blob_pair(
         source: &TribleSet,
     ) -> (
         Blob<SuccinctArchiveBlob>,
         Blob<SuccinctArchiveRank9IndexBlob>,
-    ) {
+    )
+    where
+        U::Meta: Clone,
+    {
         let archive: Self = source.into();
         archive.to_blob_pair()
     }
@@ -3053,8 +3133,12 @@ where
     pub fn build_rank9_index(
         raw: Blob<SuccinctArchiveBlob>,
     ) -> Result<Blob<SuccinctArchiveRank9IndexBlob>, SuccinctArchiveError> {
-        let archive = <Self as TryFromBlob<SuccinctArchiveBlob>>::try_from_blob(raw)?;
-        Ok(Blob::new(archive.rank9_index_bytes))
+        let bytes = raw.bytes;
+        let (meta, runtime_bytes) = Self::validated_runtime(&bytes)?;
+        let source = Blob::<SuccinctArchiveBlob>::new(bytes).get_handle();
+        let index = build_runtime_rank9_index(&meta, &runtime_bytes, source)
+            .map_err(SuccinctArchiveError)?;
+        Ok(Blob::new(index))
     }
 
     /// Attaches an exact raw/index pair without rebuilding rank/select data.
@@ -3063,19 +3147,9 @@ where
         rank9: Blob<SuccinctArchiveRank9IndexBlob>,
     ) -> Result<Self, SuccinctArchiveError> {
         let bytes = raw.bytes;
-        let mut tail = bytes.clone();
-        let meta = *tail
-            .view_suffix::<SuccinctArchiveMeta<U::Meta>>()
-            .map_err(|err| {
-                SuccinctArchiveError(invalid_rank9_metadata(format!(
-                    "cannot read raw archive EOF metadata: {err}"
-                )))
-            })?;
-        let meta_start = tail.len();
-        let raw_end =
-            validate_raw_archive(&meta, &bytes, meta_start).map_err(SuccinctArchiveError)?;
-        U::validate_metadata_prefix(&meta.domain, &bytes, raw_end).map_err(SuccinctArchiveError)?;
-        Self::from_bytes_with_rank9_indexes(meta, bytes, rank9.bytes).map_err(SuccinctArchiveError)
+        let (meta, runtime_bytes) = Self::validated_runtime(&bytes)?;
+        Self::from_runtime_bytes_with_rank9_indexes(meta, runtime_bytes, bytes, rank9.bytes)
+            .map_err(SuccinctArchiveError)
     }
 
     /// Store-facing pair attachment that reports a missing Rank9 artifact as
@@ -3096,21 +3170,11 @@ where
 impl<U> TryFromBlob<SuccinctArchiveBlob> for SuccinctArchive<U>
 where
     U: Universe + Serializable<Error = jerky::error::Error>,
-    <U as Serializable>::Meta: Copy + 'static,
 {
     type Error = SuccinctArchiveError;
 
     fn try_from_blob(blob: Blob<SuccinctArchiveBlob>) -> Result<Self, Self::Error> {
-        let bytes = blob.bytes;
-        let mut tail = bytes.clone();
-        let meta = *tail
-            .view_suffix::<SuccinctArchiveMeta<U::Meta>>()
-            .map_err(|err| {
-                SuccinctArchiveError(invalid_rank9_metadata(format!(
-                    "cannot read EOF metadata: {err}"
-                )))
-            })?;
-        SuccinctArchive::from_bytes(meta, bytes).map_err(SuccinctArchiveError)
+        Self::from_portable_bytes(blob.bytes)
     }
 }
 
@@ -3208,8 +3272,13 @@ mod tests {
 
             let archive: SuccinctArchive<CompressedUniverse> = (&set).into();
             let set_: TribleSet = (&archive).into();
+            let blob: Blob<SuccinctArchiveBlob> = (&archive).to_blob();
+            let restored: SuccinctArchive<CompressedUniverse> =
+                blob.try_from_blob().unwrap();
+            let restored_set: TribleSet = (&restored).into();
 
             assert_eq!(set, set_);
+            assert_eq!(set, restored_set);
         }
 
         #[test]
@@ -3478,6 +3547,108 @@ mod tests {
         let rebuilt: SuccinctArchive<OrderedUniverse> = blob.try_from_blob().unwrap();
         let kb2: TribleSet = (&rebuilt).into();
         assert_eq!(kb, kb2);
+    }
+
+    #[test]
+    fn public_builder_matches_the_portable_singleton_golden() {
+        let entity = ordered_id(1);
+        let attribute = ordered_id(2);
+        let mut raw_value = [0u8; 32];
+        raw_value[0] = 1;
+        let value = Inline::<UnknownInline>::new(raw_value);
+        let set: TribleSet = [Trible::force(&entity, &attribute, &value)]
+            .into_iter()
+            .collect();
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+
+        assert_eq!(
+            blake3::hash(archive.bytes.as_ref()).to_hex().as_str(),
+            "c55fa61e822974f3cb0e5b2d156dbf35b0e5bbb7599595209e6672ec91d8b8c1"
+        );
+        let decoded: SuccinctArchive<OrderedUniverse> =
+            Blob::<SuccinctArchiveBlob>::new(archive.bytes.clone())
+                .try_from_blob()
+                .unwrap();
+        assert_eq!(TribleSet::from(&decoded), set);
+    }
+
+    #[test]
+    fn empty_portable_archive_and_detached_rank9_roundtrip() {
+        let set = TribleSet::new();
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+        let (raw, rank9) = archive.to_blob_pair();
+        let raw_only: SuccinctArchive<OrderedUniverse> = raw.clone().try_from_blob().unwrap();
+        let paired = SuccinctArchive::<OrderedUniverse>::from_blob_pair(raw, rank9).unwrap();
+        assert_eq!(TribleSet::from(&raw_only), set);
+        assert_eq!(TribleSet::from(&paired), set);
+    }
+
+    fn two_by_two_permutation(swapped: bool) -> TribleSet {
+        let e1 = ordered_id(1);
+        let e2 = ordered_id(2);
+        let a1 = ordered_id(3);
+        let a2 = ordered_id(4);
+        let v1 = ordered_value(0x10);
+        let v2 = ordered_value(0x20);
+        let pairs = if swapped {
+            [(e1, a1, v2), (e2, a2, v1)]
+        } else {
+            [(e1, a1, v1), (e2, a2, v2)]
+        };
+        pairs
+            .into_iter()
+            .map(|(entity, attribute, value)| Trible::force(&entity, &attribute, &value))
+            .collect()
+    }
+
+    #[test]
+    fn exact_derivation_rejects_structurally_valid_changed_mask_drift() {
+        let archive: SuccinctArchive<OrderedUniverse> = (&two_by_two_permutation(false)).into();
+        let mut bytes = archive.bytes.as_ref().to_vec();
+        let n = 2usize;
+        let d = 6usize;
+        let prefix_words = (n + d + 1).div_ceil(64);
+        let changed_start = d * 32 + 3 * prefix_words * 8;
+        bytes[changed_start] ^= 1 << 1;
+
+        let malformed = Blob::<SuccinctArchiveBlob>::new(Bytes::from(bytes));
+        let result: Result<SuccinctArchive<OrderedUniverse>, _> = malformed.try_from_blob();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn exact_derivation_rejects_a_valid_but_foreign_secondary_rotation() {
+        let left: SuccinctArchive<OrderedUniverse> = (&two_by_two_permutation(false)).into();
+        let right: SuccinctArchive<OrderedUniverse> = (&two_by_two_permutation(true)).into();
+        let mut bytes = left.bytes.as_ref().to_vec();
+
+        let n = 2usize;
+        let d = 6usize;
+        let prefix_words = (n + d + 1).div_ceil(64);
+        let row_words = n.div_ceil(64);
+        let width = portable::alphabet_width(d);
+        let wavelets_start = d * 32 + 3 * prefix_words * 8 + 6 * row_words * 8;
+        let wavelet_len = width * row_words * 8;
+        let vae = wavelets_start + SuccinctRotation::Vae.index() * wavelet_len;
+        bytes[vae..vae + wavelet_len]
+            .copy_from_slice(&right.bytes.as_ref()[vae..vae + wavelet_len]);
+
+        // Each source archive is canonical and both have identical domain and
+        // per-axis histograms, so the splice passes raw structural validation.
+        portable::parse(&bytes).unwrap();
+        let malformed = Blob::<SuccinctArchiveBlob>::new(Bytes::from(bytes));
+        let result: Result<SuccinctArchive<OrderedUniverse>, _> = malformed.try_from_blob();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn portable_identity_is_independent_of_runtime_universe_encoding() {
+        let set = varied_knights();
+        let ordered: SuccinctArchive<OrderedUniverse> = (&set).into();
+        let compressed: SuccinctArchive<CompressedUniverse> = (&set).into();
+        assert_eq!(ordered.bytes, compressed.bytes);
+        assert_eq!(TribleSet::from(&ordered), set);
+        assert_eq!(TribleSet::from(&compressed), set);
     }
 
     fn assert_detached_rank9_corruption_rejected(mutate: impl FnOnce(&mut Vec<u8>)) {
@@ -3811,7 +3982,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_backend_is_rejected_after_leading_zero_planes() {
+    fn zero_backend_is_rejected_after_a_leading_zero_plane() {
         let backend = ZeroFreeze;
         let factory = BackendWaveletFactory { backend: &backend };
         let mut area = ByteArea::new().unwrap();
@@ -3827,7 +3998,7 @@ mod tests {
             result,
             Err(SuccinctArchiveMergeError::PlanePrefixMismatch {
                 rotation: SuccinctRotation::Eav,
-                depth: 2,
+                depth: 1,
             })
         ));
     }

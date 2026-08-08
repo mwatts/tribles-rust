@@ -15,20 +15,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   boundaries. Rank treats out-of-domain values as absent and select returns no
   result on both scalar, batched, and device-resident paths, so removed leading
   zero planes cannot make code `D` alias code zero.
-- **A portable SuccinctArchive v2 raw codec is staged behind an internal-only
-  seam.** Its gapless little-endian layout derives every section boundary from
+- **SuccinctArchive now has one portable v2 raw format.** Its gapless
+  little-endian layout derives every section boundary from
   only trible and ordered-domain cardinalities. The domain begins at byte zero
   so its 32-byte values remain visible to generic conservative child scans;
   `N,D` occupy a fixed terminal footer. The codec uses the mathematically
   minimal wavelet width for codes in `0..D`, and exact-validates sizes,
   canonical bit tails, unary prefixes, ordered-domain role invariants,
   in-domain codes, and last-column histograms. Empty, singleton, and multi-row
-  byte/hash goldens pin the representation. The staged view remains explicitly
-  non-queryable until the collection recipe proves changed masks and
-  cross-rotation identity. It deliberately has no second public `BlobEncoding`:
-  replacing the native v1 serializer/parser, adapting construction and detached
-  Rank9 attachment, and minting the fresh external schema ID remain one atomic
-  follow-up rather than introducing format coexistence.
+  byte/hash goldens pin the representation. Attachment independently derives
+  all prefixes, changed masks, and six rotations from the decoded EAV source
+  ring and requires exact byte equality before rebuilding the native query
+  arena. Detached Rank9 data remains source-bound and can attach without
+  rebuilding rank/select structures. Native v1 serialization and parsing were
+  removed rather than retained as a compatibility path, and the incompatible
+  public format has a freshly minted schema ID.
 - **Signed collection commits can be prepared and staged before visibility.**
   The `SimpleArchive` union kind can now construct the exact canonical commit
   entirely in memory, durably stage its attachments, definition, data, and

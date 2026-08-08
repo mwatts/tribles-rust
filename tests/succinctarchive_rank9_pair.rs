@@ -125,15 +125,12 @@ fn raw_identity_is_deterministic_and_independent_of_rank9_bytes() {
 }
 
 #[test]
-fn old_embedded_suffix_is_not_a_raw_succinct_archive() {
+fn embedded_accelerator_is_not_a_portable_raw_succinct_archive() {
     let archive: SuccinctArchive<OrderedUniverse> = (&set(9)).into();
-    let meta_size = std::mem::size_of_val(&archive.meta());
     let (raw, rank9) = archive.to_blob_pair();
-    let meta_start = raw.bytes.len() - meta_size;
     let mut embedded = Vec::with_capacity(raw.bytes.len() + rank9.bytes.len());
-    embedded.extend_from_slice(&raw.bytes.as_ref()[..meta_start]);
+    embedded.extend_from_slice(raw.bytes.as_ref());
     embedded.extend_from_slice(rank9.bytes.as_ref());
-    embedded.extend_from_slice(&raw.bytes.as_ref()[meta_start..]);
 
     let embedded = Blob::<SuccinctArchiveBlob>::new(Bytes::from_source(embedded));
     let decoded: Result<SuccinctArchive<OrderedUniverse>, _> = embedded.try_from_blob();

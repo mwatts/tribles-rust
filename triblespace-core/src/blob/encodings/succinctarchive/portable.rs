@@ -1,12 +1,10 @@
 //! Canonical, portable raw bytes for an ordered-domain succinct archive.
 //!
-//! This is intentionally an internal staging module. It has no public
-//! [`BlobEncoding`](crate::blob::BlobEncoding), magic bytes, or version word.
-//! A future incompatible layout receives a fresh external blob-schema ID; the
-//! payload therefore contains only information needed to decode the archive.
-//! The current public `SuccinctArchiveBlob` still uses the native v1 layout on
-//! this branch. Do not expose both formats: the eventual schema-ID change,
-//! runtime bridge, v1 deletion, and Rank9 adaptation are one atomic milestone.
+//! This codec stays internal because its public identity is the external
+//! [`SuccinctArchiveBlob`](super::SuccinctArchiveBlob) schema ID. It has no
+//! magic bytes or version word: a future incompatible layout receives a fresh
+//! schema ID, so the payload contains only information needed to decode the
+//! archive. Native runtime arenas are reproducible caches, not a second format.
 //!
 //! The payload is a gapless sequence of little-endian sections:
 //!
@@ -34,10 +32,12 @@
 //! Parsing these bytes does **not** make them queryable. This layer rejects
 //! malformed raw structure and locally impossible code histograms, but it does
 //! not prove that changed-pair masks are derived from their rotations or that
-//! all six rotations encode the same trible set. The future public attachment
-//! path must pass the bytes through the collection recipe's exact canonical
+//! all six rotations encode the same trible set. The public attachment path
+//! passes the bytes through the collection recipe's exact canonical
 //! derivation gate before constructing a query engine. Keeping that proof out
-//! of this layout module is deliberate, not a compatibility escape hatch.
+//! of this layout module is deliberate. Public attachment decodes a candidate
+//! EAV source set, rebuilds the complete canonical payload, and requires exact
+//! byte equality before exposing the runtime.
 
 use std::fmt;
 use std::ops::Range;
@@ -194,19 +194,20 @@ pub(crate) struct PortableView<'a> {
     layout: Layout,
 }
 
+/// Owned logical sections used to rebuild a process-local query arena.
+/// Offsets and native metadata are intentionally absent.
+pub(crate) struct RuntimeParts {
+    pub(crate) triple_count: usize,
+    pub(crate) domain: Vec<RawInline>,
+    pub(crate) entity_count: usize,
+    pub(crate) attribute_count: usize,
+    pub(crate) value_count: usize,
+    pub(crate) prefixes: [Vec<u64>; PREFIX_COUNT],
+    pub(crate) changes: [Vec<u64>; CHANGE_COUNT],
+    pub(crate) wavelets: [Vec<u64>; WAVELET_COUNT],
+}
+
 impl PortableView<'_> {
-    pub(crate) fn triple_count(&self) -> usize {
-        self.layout.triple_count
-    }
-
-    pub(crate) fn domain_len(&self) -> usize {
-        self.layout.domain_len
-    }
-
-    pub(crate) fn alphabet_width(&self) -> usize {
-        self.layout.alphabet_width
-    }
-
     pub(crate) fn domain_value(&self, code: usize) -> RawInline {
         let start = self.layout.domain.start + code * RAW_INLINE_LEN;
         self.bytes[start..start + RAW_INLINE_LEN]
@@ -214,17 +215,348 @@ impl PortableView<'_> {
             .expect("validated domain range")
     }
 
-    pub(crate) fn prefix_word(&self, axis: PrefixAxis, word: usize) -> u64 {
-        read_word(self.bytes, &self.layout.prefixes[axis.index()], word)
-    }
-
-    pub(crate) fn change_word(&self, axis: ChangeAxis, word: usize) -> u64 {
-        read_word(self.bytes, &self.layout.changes[axis.index()], word)
-    }
-
     pub(crate) fn wavelet_word(&self, rotation: Rotation, depth: usize, word: usize) -> u64 {
         let word = depth * self.layout.row_words + word;
         read_word(self.bytes, &self.layout.wavelets[rotation.index()], word)
+    }
+
+    /// Prove that every byte is the exact canonical derivation of the EAV
+    /// source ring.
+    ///
+    /// The candidate rows are decoded without consulting a changed-pair mask.
+    /// A small, independent canonical writer then derives all three prefixes,
+    /// all six masks, and all six wavelet matrices from those rows. Only exact
+    /// byte equality succeeds. This makes the proof independent of Jerky's
+    /// native runtime and its detached Rank9 accelerator.
+    pub(crate) fn prove_canonical(&self) -> Result<RuntimeParts, PortableError> {
+        let rows = self.candidate_eav_codes()?;
+        if rows.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(PortableError::new(
+                "decoded EAV source rows are not strictly increasing",
+            ));
+        }
+
+        let (expected, parts) = canonical_bytes_from_eav(self, &rows)?;
+        if expected != self.bytes {
+            return Err(PortableError::new(
+                "payload is not the exact canonical derivation of its EAV source ring",
+            ));
+        }
+
+        Ok(parts)
+    }
+
+    fn candidate_eav_codes(&self) -> Result<Vec<[usize; 3]>, PortableError> {
+        let prefix_counts = validate_prefixes(self)?;
+        let starts = prefix_counts.map(|counts| {
+            let mut cursor = 0usize;
+            counts
+                .into_iter()
+                .map(|count| {
+                    let start = cursor;
+                    cursor += count;
+                    start
+                })
+                .collect::<Vec<_>>()
+        });
+
+        let eav = PortableWavelet::new(self, Rotation::Eav);
+        let vea = PortableWavelet::new(self, Rotation::Vea);
+        let ave = PortableWavelet::new(self, Rotation::Ave);
+        let value_starts = &starts[PrefixAxis::Value.index()];
+        let attribute_starts = &starts[PrefixAxis::Attribute.index()];
+
+        let mut candidate = Vec::with_capacity(self.layout.triple_count);
+        for eav_position in 0..self.layout.triple_count {
+            let value = eav.access(eav_position).ok_or_else(|| {
+                PortableError::new(format!("EAV wavelet cannot decode row {eav_position}"))
+            })?;
+            let vea_position = value_starts[value]
+                .checked_add(eav.rank(eav_position, value).ok_or_else(|| {
+                    PortableError::new(format!(
+                        "EAV rank cannot rotate row {eav_position} for value code {value}"
+                    ))
+                })?)
+                .filter(|position| *position < self.layout.triple_count)
+                .ok_or_else(|| {
+                    PortableError::new(format!(
+                        "EAV row {eav_position} rotates outside the VEA column"
+                    ))
+                })?;
+
+            let attribute = vea.access(vea_position).ok_or_else(|| {
+                PortableError::new(format!(
+                    "VEA wavelet cannot decode rotated row {vea_position}"
+                ))
+            })?;
+            let ave_position = attribute_starts[attribute]
+                .checked_add(vea.rank(vea_position, attribute).ok_or_else(|| {
+                    PortableError::new(format!(
+                        "VEA rank cannot rotate row {vea_position} for attribute code {attribute}"
+                    ))
+                })?)
+                .filter(|position| *position < self.layout.triple_count)
+                .ok_or_else(|| {
+                    PortableError::new(format!(
+                        "VEA row {vea_position} rotates outside the AVE column"
+                    ))
+                })?;
+
+            let entity = ave.access(ave_position).ok_or_else(|| {
+                PortableError::new(format!(
+                    "AVE wavelet cannot decode rotated row {ave_position}"
+                ))
+            })?;
+            candidate.push([entity, attribute, value]);
+        }
+        Ok(candidate)
+    }
+}
+
+fn canonical_bytes_from_eav(
+    view: &PortableView<'_>,
+    eav_rows: &[[usize; 3]],
+) -> Result<(Vec<u8>, RuntimeParts), PortableError> {
+    let domain_len = view.layout.domain_len;
+    let domain: Vec<_> = (0..domain_len)
+        .map(|code| view.domain_value(code))
+        .collect();
+
+    let mut axis_counts: [Vec<usize>; PREFIX_COUNT] =
+        std::array::from_fn(|_| vec![0usize; domain_len]);
+    for &[entity, attribute, value] in eav_rows {
+        axis_counts[PrefixAxis::Entity.index()][entity] += 1;
+        axis_counts[PrefixAxis::Attribute.index()][attribute] += 1;
+        axis_counts[PrefixAxis::Value.index()][value] += 1;
+    }
+    let distinct = |counts: &[usize]| counts.iter().filter(|count| **count != 0).count();
+    let entity_count = distinct(&axis_counts[PrefixAxis::Entity.index()]);
+    let attribute_count = distinct(&axis_counts[PrefixAxis::Attribute.index()]);
+    let value_count = distinct(&axis_counts[PrefixAxis::Value.index()]);
+    let prefixes = axis_counts.map(|counts| encode_prefix(&counts, eav_rows.len()));
+
+    let mut rotations: [Vec<[usize; 3]>; WAVELET_COUNT] =
+        std::array::from_fn(|_| Vec::with_capacity(eav_rows.len()));
+    for &[entity, attribute, value] in eav_rows {
+        rotations[Rotation::Eav.index()].push([entity, attribute, value]);
+        rotations[Rotation::Vea.index()].push([value, entity, attribute]);
+        rotations[Rotation::Ave.index()].push([attribute, value, entity]);
+        rotations[Rotation::Vae.index()].push([value, attribute, entity]);
+        rotations[Rotation::Eva.index()].push([entity, value, attribute]);
+        rotations[Rotation::Aev.index()].push([attribute, entity, value]);
+    }
+    for rows in &mut rotations {
+        rows.sort_unstable();
+    }
+
+    let rotation_changes: [Vec<u64>; WAVELET_COUNT] =
+        std::array::from_fn(|rotation| encode_changes(&rotations[rotation]));
+    let wavelets: [Vec<u64>; WAVELET_COUNT] = std::array::from_fn(|rotation| {
+        encode_wavelet(
+            rotations[rotation].iter().map(|row| row[2]),
+            eav_rows.len(),
+            domain_len,
+        )
+    });
+
+    let [eav_changes, vea_changes, ave_changes, vae_changes, eva_changes, aev_changes] =
+        rotation_changes;
+    let changes = [
+        eav_changes,
+        eva_changes,
+        aev_changes,
+        ave_changes,
+        vea_changes,
+        vae_changes,
+    ];
+    let bytes = encode(PortableParts {
+        triple_count: eav_rows.len(),
+        domain: &domain,
+        prefixes: [&prefixes[0], &prefixes[1], &prefixes[2]],
+        changes: [
+            &changes[0],
+            &changes[1],
+            &changes[2],
+            &changes[3],
+            &changes[4],
+            &changes[5],
+        ],
+        wavelets: [
+            &wavelets[Rotation::Eav.index()],
+            &wavelets[Rotation::Vea.index()],
+            &wavelets[Rotation::Ave.index()],
+            &wavelets[Rotation::Vae.index()],
+            &wavelets[Rotation::Eva.index()],
+            &wavelets[Rotation::Aev.index()],
+        ],
+    })?;
+    Ok((
+        bytes,
+        RuntimeParts {
+            triple_count: eav_rows.len(),
+            domain,
+            entity_count,
+            attribute_count,
+            value_count,
+            prefixes,
+            changes,
+            wavelets,
+        },
+    ))
+}
+
+fn encode_prefix(counts: &[usize], row_count: usize) -> Vec<u64> {
+    let mut words = vec![0u64; words_for_bits(row_count + counts.len() + 1)];
+    let mut rows_seen = 0usize;
+    for (code, count) in counts.iter().copied().enumerate() {
+        set_bit(&mut words, rows_seen + code);
+        rows_seen += count;
+    }
+    debug_assert_eq!(rows_seen, row_count);
+    set_bit(&mut words, row_count + counts.len());
+    words
+}
+
+fn encode_changes(rows: &[[usize; 3]]) -> Vec<u64> {
+    let mut words = vec![0u64; words_for_bits(rows.len())];
+    let mut previous = None;
+    for (position, row) in rows.iter().enumerate() {
+        let pair = [row[0], row[1]];
+        if previous != Some(pair) {
+            set_bit(&mut words, position);
+            previous = Some(pair);
+        }
+    }
+    words
+}
+
+fn encode_wavelet(
+    sequence: impl IntoIterator<Item = usize>,
+    row_count: usize,
+    domain_len: usize,
+) -> Vec<u64> {
+    let width = alphabet_width(domain_len);
+    let row_words = words_for_bits(row_count);
+    let mut current: Vec<_> = sequence.into_iter().collect();
+    let mut next = vec![0usize; row_count];
+    let mut result = Vec::with_capacity(width * row_words);
+    for depth in 0..width {
+        let shift = width - depth - 1;
+        let mut plane = vec![0u64; row_words];
+        let mut zeros = 0usize;
+        for (position, code) in current.iter().copied().enumerate() {
+            if code & (1usize << shift) == 0 {
+                zeros += 1;
+            } else {
+                set_bit(&mut plane, position);
+            }
+        }
+        let (mut zero, mut one) = (0usize, zeros);
+        for code in current.iter().copied() {
+            if code & (1usize << shift) == 0 {
+                next[zero] = code;
+                zero += 1;
+            } else {
+                next[one] = code;
+                one += 1;
+            }
+        }
+        result.extend(plane);
+        std::mem::swap(&mut current, &mut next);
+    }
+    result
+}
+
+fn set_bit(words: &mut [u64], position: usize) {
+    words[position / u64::BITS as usize] |= 1u64 << (position % u64::BITS as usize);
+}
+
+/// Small, validation-only rank directory over one portable wavelet matrix.
+/// It is intentionally not retained by the query runtime: exact derivation
+/// rebuilds the canonical native/CubeCL-facing representation and attaches the
+/// detached accelerator there.
+struct PortableWavelet<'a> {
+    view: &'a PortableView<'a>,
+    rotation: Rotation,
+    ranks: Vec<Vec<usize>>,
+    zero_counts: Vec<usize>,
+}
+
+impl<'a> PortableWavelet<'a> {
+    fn new(view: &'a PortableView<'a>, rotation: Rotation) -> Self {
+        let mut ranks = Vec::with_capacity(view.layout.alphabet_width);
+        let mut zero_counts = Vec::with_capacity(view.layout.alphabet_width);
+        for depth in 0..view.layout.alphabet_width {
+            let mut rank = Vec::with_capacity(view.layout.row_words + 1);
+            rank.push(0usize);
+            for word in 0..view.layout.row_words {
+                rank.push(
+                    rank[word] + view.wavelet_word(rotation, depth, word).count_ones() as usize,
+                );
+            }
+            zero_counts.push(view.layout.triple_count - rank[view.layout.row_words]);
+            ranks.push(rank);
+        }
+        Self {
+            view,
+            rotation,
+            ranks,
+            zero_counts,
+        }
+    }
+
+    fn rank1(&self, depth: usize, position: usize) -> usize {
+        let word = position / u64::BITS as usize;
+        let offset = position % u64::BITS as usize;
+        let complete = self.ranks[depth][word];
+        if offset == 0 {
+            complete
+        } else {
+            let mask = (1u64 << offset) - 1;
+            complete
+                + (self.view.wavelet_word(self.rotation, depth, word) & mask).count_ones() as usize
+        }
+    }
+
+    fn access(&self, mut position: usize) -> Option<usize> {
+        if position >= self.view.layout.triple_count {
+            return None;
+        }
+        let mut value = 0usize;
+        for depth in 0..self.view.layout.alphabet_width {
+            value <<= 1;
+            let word = self
+                .view
+                .wavelet_word(self.rotation, depth, position / u64::BITS as usize);
+            let one = word & (1u64 << (position % u64::BITS as usize)) != 0;
+            let ones_before = self.rank1(depth, position);
+            if one {
+                value |= 1;
+                position = self.zero_counts[depth] + ones_before;
+            } else {
+                position -= ones_before;
+            }
+        }
+        (value < self.view.layout.domain_len).then_some(value)
+    }
+
+    fn rank(&self, position: usize, value: usize) -> Option<usize> {
+        if position > self.view.layout.triple_count || value >= self.view.layout.domain_len {
+            return None;
+        }
+        let mut start = 0usize;
+        let mut end = position;
+        for depth in 0..self.view.layout.alphabet_width {
+            let shift = self.view.layout.alphabet_width - depth - 1;
+            if value & (1usize << shift) != 0 {
+                start = self.zero_counts[depth] + self.rank1(depth, start);
+                end = self.zero_counts[depth] + self.rank1(depth, end);
+            } else {
+                start -= self.rank1(depth, start);
+                end -= self.rank1(depth, end);
+            }
+        }
+        Some(end - start)
     }
 }
 
@@ -774,9 +1106,9 @@ mod tests {
             "2a5c88cdcc7a9df5e0815cadb233b5dcf192e7c21e8393afc681c940ab7aa0dd"
         );
         let decoded = parse(&EMPTY_GOLDEN).unwrap();
-        assert_eq!(decoded.triple_count(), 0);
-        assert_eq!(decoded.domain_len(), 0);
-        assert_eq!(decoded.alphabet_width(), 1);
+        assert_eq!(decoded.layout.triple_count, 0);
+        assert_eq!(decoded.layout.domain_len, 0);
+        assert_eq!(decoded.layout.alphabet_width, 1);
     }
 
     #[test]
@@ -795,9 +1127,9 @@ mod tests {
             "c55fa61e822974f3cb0e5b2d156dbf35b0e5bbb7599595209e6672ec91d8b8c1"
         );
         let decoded = parse(&SINGLETON_GOLDEN).unwrap();
-        assert_eq!(decoded.triple_count(), 1);
-        assert_eq!(decoded.domain_len(), 3);
-        assert_eq!(decoded.alphabet_width(), 2);
+        assert_eq!(decoded.layout.triple_count, 1);
+        assert_eq!(decoded.layout.domain_len, 3);
+        assert_eq!(decoded.layout.alphabet_width, 2);
         assert_eq!(decoded.domain_value(2), VALUE_ONE);
     }
 
@@ -817,9 +1149,9 @@ mod tests {
             "a2ea03cd06c60f36762dee4a65add3cfa84545f55ab0a717f924333183691aee"
         );
         let decoded = parse(&MULTI_GOLDEN).unwrap();
-        assert_eq!(decoded.triple_count(), 2);
-        assert_eq!(decoded.domain_len(), 4);
-        assert_eq!(decoded.alphabet_width(), 2);
+        assert_eq!(decoded.layout.triple_count, 2);
+        assert_eq!(decoded.layout.domain_len, 4);
+        assert_eq!(decoded.layout.alphabet_width, 2);
         assert_eq!(decoded.wavelet_word(Rotation::Eav, 1, 0), 1);
     }
 
@@ -929,8 +1261,8 @@ mod tests {
             })
             .unwrap();
             let view = parse(&bytes).unwrap();
-            assert_eq!(view.triple_count(), len);
-            assert_eq!(view.alphabet_width(), 3);
+            assert_eq!(view.layout.triple_count, len);
+            assert_eq!(view.layout.alphabet_width, 3);
         }
     }
 
