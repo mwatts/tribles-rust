@@ -185,6 +185,19 @@ pub fn attributes_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Re
             },
             // The anchor participates in identity instead of replacing it, which
             // is the only difference from `Pinned` and the whole point.
+            //
+            // BOOTSTRAP CONSTRAINT, and it is load-bearing: this arm dereferences
+            // `metadata::anchor` and `metadata::value_encoding`, which are
+            // THEMSELVES declared by `attributes!{}`. An attribute that this arm
+            // depends on cannot itself be anchored — its LazyLock init would
+            // require its own value. That fails as a hang or a reentrant-init
+            // panic at RUNTIME, not as a compile error, so it will not be caught
+            // by building.
+            //
+            // Every attribute in `metadata` must therefore stay `unsafe as`
+            // permanently. That is not a migration state to be cleaned up later;
+            // it is why the `Pinned` arm builds an EMPTY fragment via the
+            // low-level `Fragment::rooted` rather than `entity!{}`.
             AttributeId::Anchored(lit) => {
                 let entity_input = quote! {
                     #base_path::metadata::anchor: {

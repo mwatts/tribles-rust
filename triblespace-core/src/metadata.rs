@@ -100,6 +100,12 @@ attributes! {
     /// valid for domain entities.
     "AE94660A55D2EE3C428D2BB299E02EC3" unsafe as description: inlineencodings::Handle<LongString>;
     /// Links an attribute or handle to its inline encoding identifier.
+    // BOOTSTRAP: every attribute in this block must remain `unsafe as`.
+    // `attributes!{}`'s anchored form derives identity by referencing
+    // `metadata::anchor` and `metadata::value_encoding`, so anchoring one of
+    // these would make its own initialization require itself — a reentrant
+    // LazyLock, which hangs or panics at runtime rather than failing to compile.
+    // This is permanent, not a migration leftover.
     "213F89E3F49628A105B3830BD3A6612C" unsafe as value_encoding: inlineencodings::GenId;
     /// A stable, hand-chosen namespace id that PARTICIPATES in a derived
     /// attribute identity rather than replacing it.
