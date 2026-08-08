@@ -224,7 +224,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   artifact and recipe IDs are `570272A9F9C994D2152EFB10712F5275` and
   `468F6EBF93C14A7FBC1188592B2BF984`; the recipe rotation prevents stale native
   manifests from becoming false completed-empty ranges. Direct native BM25
-  callers and Succinct HNSW are unchanged.
+  remains available under the runtime-schema rotation above; Succinct HNSW is
+  unchanged.
 
 - **Breaking: Yard collection and compaction now require an explicit retention
   plan.** The parameterless `Yard::collect()` and `Yard::compact()` shortcuts
