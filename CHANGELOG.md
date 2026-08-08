@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Signed collection commits can be prepared and staged before visibility.**
+  The `SimpleArchive` union kind can now construct the exact canonical commit
+  entirely in memory, durably stage its attachments, definition, data, and
+  metadata while withholding the record, permit caller-owned unsigned cache
+  artifacts in between, and consume the staged value to append and flush the
+  signed `COMMIT` last. Abandonment is deliberately inert: unrooted staged
+  dependencies remain undiscoverable as membership and produce no retention
+  roots.
 - **Collection retention is now an explicit two-edge policy rather than a
   blind hash walk.** `RetentionRoots` distinguishes direct record roots from
   recursively owned blobs. The strong planner retains only locally authorized,

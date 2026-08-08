@@ -16,6 +16,7 @@
 //! equation until its three blobs are resident, then call
 //! [`validate_merge`](crate::collection::simplearchive_union::validate_merge).
 
+use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 
@@ -174,6 +175,128 @@ pub enum PublicationError<PutError, FlushError> {
     RecordFlush(FlushError),
 }
 
+/// Validation failure while preparing a canonical collection commit in memory.
+///
+/// The uninhabited storage error parameters make it impossible for this phase
+/// to report an I/O failure: preparation does not touch the destination store.
+pub type PreparationError = PublicationError<Infallible, Infallible>;
+
+/// A canonical signed collection commit whose bytes have not been published.
+///
+/// Preparation validates and normalizes the definition, data, metadata, and
+/// embedded fragment blobs entirely in memory. Call [`Self::stage`] to durably
+/// write every dependency while retaining the commit record itself. Dropping a
+/// prepared value has no storage effect.
+#[derive(Clone, Debug)]
+#[must_use = "a prepared collection commit has no effect until it is staged and finalized"]
+pub struct PreparedCollectionCommit {
+    embedded: Vec<Blob<UnknownBlob>>,
+    definition: Blob<SimpleArchive>,
+    data: Blob<SimpleArchive>,
+    metadata: Blob<SimpleArchive>,
+    commit: CollectionCommit,
+}
+
+impl PreparedCollectionCommit {
+    /// Inspect the exact canonical commit that finalization will publish.
+    pub fn commit(&self) -> &CollectionCommit {
+        &self.commit
+    }
+
+    /// Durably stage every dependency without publishing the commit record.
+    ///
+    /// The exact store-call order is embedded blobs (in handle order), the
+    /// collection definition, data, metadata, and then one durability flush.
+    /// On success the returned value retains the same mutable store borrow, so
+    /// a caller may append unsigned `MERGE` or `DERIVE` artifacts through
+    /// [`StagedCollectionCommit::store_mut`] before consuming the value with
+    /// [`StagedCollectionCommit::finalize`].
+    pub fn stage<'store, S>(
+        self,
+        store: &'store mut S,
+    ) -> Result<StagedCollectionCommit<'store, S>, PublicationError<S::PutError, S::Error>>
+    where
+        S: BlobStorePut + StorageFlush,
+    {
+        let Self {
+            embedded,
+            definition,
+            data,
+            metadata,
+            commit,
+        } = self;
+
+        for blob in embedded {
+            store
+                .put::<UnknownBlob, _>(blob)
+                .map_err(PublicationError::DependencyPut)?;
+        }
+        store
+            .put::<SimpleArchive, _>(definition)
+            .map_err(PublicationError::DependencyPut)?;
+        store
+            .put::<SimpleArchive, _>(data)
+            .map_err(PublicationError::DependencyPut)?;
+        store
+            .put::<SimpleArchive, _>(metadata)
+            .map_err(PublicationError::DependencyPut)?;
+        store.flush().map_err(PublicationError::DependencyFlush)?;
+
+        Ok(StagedCollectionCommit { store, commit })
+    }
+}
+
+/// A canonical commit whose complete dependency set is already durable.
+///
+/// This type holds the exact store borrow used for staging. Its
+/// [`store_mut`](Self::store_mut) escape hatch exists so reproducible unsigned
+/// equations and their artifacts can be appended before the source membership
+/// root becomes visible. Only consuming [`finalize`](Self::finalize) appends
+/// the signed `COMMIT` record and flushes it. Drop is deliberately inert and
+/// never auto-finalizes.
+#[must_use = "dropping a staged collection commit leaves its dependencies inert; call finalize to publish it"]
+pub struct StagedCollectionCommit<'store, S>
+where
+    S: BlobStorePut + StorageFlush,
+{
+    store: &'store mut S,
+    commit: CollectionCommit,
+}
+
+impl<'store, S> StagedCollectionCommit<'store, S>
+where
+    S: BlobStorePut + StorageFlush,
+{
+    /// Inspect the exact commit that remains withheld from the store.
+    pub fn commit(&self) -> &CollectionCommit {
+        &self.commit
+    }
+
+    /// Borrow the staged publication's destination for intervening artifacts.
+    ///
+    /// Writes performed here occur after the dependency durability barrier and
+    /// before the final commit append. The caller remains responsible for the
+    /// validity and dependency ordering of any unsigned records it writes.
+    pub fn store_mut(&mut self) -> &mut S {
+        self.store
+    }
+
+    /// Append the canonical signed commit last and make it crash-durable.
+    ///
+    /// This is the sole visibility boundary. The record put is followed by a
+    /// flush which also covers every caller artifact appended through
+    /// [`store_mut`](Self::store_mut). If the put or flush fails, backend-
+    /// specific recovery may be required before deterministic replay.
+    pub fn finalize(self) -> Result<CollectionCommit, PublicationError<S::PutError, S::Error>> {
+        let Self { store, commit } = self;
+        store
+            .put::<SimpleArchive, _>(commit.to_blob())
+            .map_err(PublicationError::RecordPut)?;
+        store.flush().map_err(PublicationError::RecordFlush)?;
+        Ok(commit)
+    }
+}
+
 impl<PutError, FlushError> fmt::Display for PublicationError<PutError, FlushError>
 where
     PutError: fmt::Display,
@@ -318,6 +441,122 @@ pub fn validate_merge(
     Ok(())
 }
 
+/// Prepare a canonical signed membership root entirely in memory.
+///
+/// Supplied data and metadata are normalized from their bytes before either is
+/// validated or included in the signed transcript, so a forged
+/// [`Blob::with_handle`] cache cannot enter storage or determine the commit
+/// identity. No store is touched. The returned value can be inspected, staged,
+/// abandoned inertly, or finalized later.
+pub fn prepare_commit(
+    definition: &CollectionDefinition,
+    data: &Blob<SimpleArchive>,
+    metadata: &Blob<SimpleArchive>,
+    signing_key: &SigningKey,
+) -> Result<PreparedCollectionCommit, PreparationError> {
+    prepare_commit_with_embedded(definition, data, metadata, signing_key, Vec::new())
+}
+
+/// Prepare a self-contained fact fragment as a canonical signed membership root.
+///
+/// `content` and `metadata` may each carry blobs referenced by handles in their
+/// facts. This boundary recomputes every embedded blob's identity and requires
+/// both its [`MemoryBlobStore`] key and cached [`Blob`] handle to match the
+/// bytes. A mismatch is rejected rather than normalized because the fragment
+/// facts may name the forged identity. Fragment exports are not serialized.
+/// No destination store is touched.
+pub fn prepare_fragment_commit(
+    definition: &CollectionDefinition,
+    content: impl Into<Fragment>,
+    metadata: impl Into<Fragment>,
+    signing_key: &SigningKey,
+) -> Result<PreparedCollectionCommit, PreparationError> {
+    let (content_facts, content_blobs) = content.into().into_facts_and_blobs();
+    let (metadata_facts, metadata_blobs) = metadata.into().into_facts_and_blobs();
+
+    let mut embedded =
+        checked_embedded_blobs(content_blobs).map_err(|(store_key, cached_handle, actual)| {
+            PublicationError::InvalidEmbeddedBlob {
+                store_key,
+                cached_handle,
+                actual,
+            }
+        })?;
+    embedded.extend(checked_embedded_blobs(metadata_blobs).map_err(
+        |(store_key, cached_handle, actual)| PublicationError::InvalidEmbeddedBlob {
+            store_key,
+            cached_handle,
+            actual,
+        },
+    )?);
+    embedded.sort_unstable_by_key(|blob| blob.get_handle().raw);
+    embedded.dedup_by_key(|blob| blob.get_handle().raw);
+
+    let content: Blob<SimpleArchive> = crate::blob::IntoBlob::to_blob(content_facts);
+    let metadata: Blob<SimpleArchive> = crate::blob::IntoBlob::to_blob(metadata_facts);
+    prepare_commit_with_embedded(definition, &content, &metadata, signing_key, embedded)
+}
+
+fn prepare_commit_with_embedded(
+    definition: &CollectionDefinition,
+    data: &Blob<SimpleArchive>,
+    metadata: &Blob<SimpleArchive>,
+    signing_key: &SigningKey,
+    embedded: Vec<Blob<UnknownBlob>>,
+) -> Result<PreparedCollectionCommit, PreparationError> {
+    validate_definition(definition).map_err(PublicationError::Validation)?;
+
+    let data = normalize_blob(data);
+    validate_element(&data).map_err(|source| {
+        PublicationError::Validation(SimpleArchiveUnionValidationError::InvalidElement {
+            role: ElementRole::CommitData,
+            source,
+        })
+    })?;
+
+    let metadata = normalize_blob(metadata);
+    validate_element(&metadata).map_err(PublicationError::InvalidMetadata)?;
+
+    let commit = CollectionCommit::sign(
+        signing_key,
+        definition.id(),
+        normalized_data_identity(&data),
+        metadata.get_handle(),
+    );
+
+    Ok(PreparedCollectionCommit {
+        embedded,
+        definition: definition.to_blob(),
+        data,
+        metadata,
+        commit,
+    })
+}
+
+fn widen_preparation_error<PutError, FlushError>(
+    error: PreparationError,
+) -> PublicationError<PutError, FlushError> {
+    match error {
+        PublicationError::Validation(error) => PublicationError::Validation(error),
+        PublicationError::InvalidMetadata(error) => PublicationError::InvalidMetadata(error),
+        PublicationError::InvalidEmbeddedBlob {
+            store_key,
+            cached_handle,
+            actual,
+        } => PublicationError::InvalidEmbeddedBlob {
+            store_key,
+            cached_handle,
+            actual,
+        },
+        PublicationError::DependencyPut(never) | PublicationError::RecordPut(never) => {
+            match never {}
+        }
+        PublicationError::DependencyFlush(never) | PublicationError::RecordFlush(never) => {
+            match never {}
+        }
+    }
+}
+
 /// Publish a signed membership root after its dependencies are crash-durable.
 ///
 /// Supplied data and metadata are normalized from their bytes before either is
@@ -345,42 +584,9 @@ pub fn publish_commit<S>(
 where
     S: BlobStorePut + StorageFlush,
 {
-    validate_definition(definition).map_err(PublicationError::Validation)?;
-
-    let data = normalize_blob(data);
-    validate_element(&data).map_err(|source| {
-        PublicationError::Validation(SimpleArchiveUnionValidationError::InvalidElement {
-            role: ElementRole::CommitData,
-            source,
-        })
-    })?;
-
-    let metadata = normalize_blob(metadata);
-    validate_element(&metadata).map_err(PublicationError::InvalidMetadata)?;
-
-    let commit = CollectionCommit::sign(
-        signing_key,
-        definition.id(),
-        normalized_data_identity(&data),
-        metadata.get_handle(),
-    );
-
-    store
-        .put::<SimpleArchive, _>(definition.to_blob())
-        .map_err(PublicationError::DependencyPut)?;
-    store
-        .put::<SimpleArchive, _>(data)
-        .map_err(PublicationError::DependencyPut)?;
-    store
-        .put::<SimpleArchive, _>(metadata)
-        .map_err(PublicationError::DependencyPut)?;
-    store.flush().map_err(PublicationError::DependencyFlush)?;
-    store
-        .put::<SimpleArchive, _>(commit.to_blob())
-        .map_err(PublicationError::RecordPut)?;
-    store.flush().map_err(PublicationError::RecordFlush)?;
-
-    Ok(commit)
+    let prepared =
+        prepare_commit(definition, data, metadata, signing_key).map_err(widen_preparation_error)?;
+    prepared.stage(store)?.finalize()
 }
 
 /// Publish a self-contained fact fragment as a signed membership root.
@@ -392,11 +598,10 @@ where
 /// normalized because the fragment facts may name the forged identity.
 ///
 /// Fragment exports are not serialized. Their fact sets become canonical
-/// `SimpleArchive` data and metadata elements. Valid embedded blobs are written
-/// first, then [`publish_commit`] writes the definition and archives; its
-/// dependency flush therefore covers all of them before the signed record is
-/// written. The same backend-recovery boundary documented by
-/// [`PublicationError`] applies.
+/// `SimpleArchive` data and metadata elements. The shared prepared-publication
+/// path writes embedded blobs, the definition, and both archives before its
+/// dependency flush, then appends the signed record last. The same backend-
+/// recovery boundary documented by [`PublicationError`] applies.
 pub fn publish_fragment_commit<S>(
     store: &mut S,
     definition: &CollectionDefinition,
@@ -407,40 +612,9 @@ pub fn publish_fragment_commit<S>(
 where
     S: BlobStorePut + StorageFlush,
 {
-    let (content_facts, content_blobs) = content.into().into_facts_and_blobs();
-    let (metadata_facts, metadata_blobs) = metadata.into().into_facts_and_blobs();
-
-    let mut embedded =
-        checked_embedded_blobs(content_blobs).map_err(|(store_key, cached_handle, actual)| {
-            PublicationError::InvalidEmbeddedBlob {
-                store_key,
-                cached_handle,
-                actual,
-            }
-        })?;
-    embedded.extend(checked_embedded_blobs(metadata_blobs).map_err(
-        |(store_key, cached_handle, actual)| PublicationError::InvalidEmbeddedBlob {
-            store_key,
-            cached_handle,
-            actual,
-        },
-    )?);
-    embedded.sort_unstable_by_key(|blob| blob.get_handle().raw);
-    embedded.dedup_by_key(|blob| blob.get_handle().raw);
-
-    // `publish_commit` performs this check again, but doing it before the
-    // embedded puts preserves its validation-before-write boundary here.
-    validate_definition(definition).map_err(PublicationError::Validation)?;
-
-    let content: Blob<SimpleArchive> = crate::blob::IntoBlob::to_blob(content_facts);
-    let metadata: Blob<SimpleArchive> = crate::blob::IntoBlob::to_blob(metadata_facts);
-    for blob in embedded {
-        store
-            .put::<UnknownBlob, _>(blob)
-            .map_err(PublicationError::DependencyPut)?;
-    }
-
-    publish_commit(store, definition, &content, &metadata, signing_key)
+    let prepared = prepare_fragment_commit(definition, content, metadata, signing_key)
+        .map_err(widen_preparation_error)?;
+    prepared.stage(store)?.finalize()
 }
 
 /// Publish an exact merge after its definition, inputs, and result are durable.
@@ -730,7 +904,10 @@ mod tests {
     use crate::blob::encodings::longstring::LongString;
     use crate::blob::encodings::rawbytes::RawBytes;
     use crate::blob::{BlobEncoding, IntoBlob};
-    use crate::collection::{discover_collection_records, empty_metadata_handle};
+    use crate::collection::{
+        discover_collection_records, empty_metadata_handle, plan_collection_retention,
+        resolve_collection_semantics, CollectionClaimValidation, CollectionDerive,
+    };
     use crate::inline::InlineEncoding;
     use crate::macros::entity;
     use crate::repo::pile::Pile;
@@ -907,6 +1084,149 @@ mod tests {
             metadata.get_handle(),
         );
         (definition, data_blob, metadata, signing_key, commit)
+    }
+
+    #[test]
+    fn prepared_fragment_is_canonical_idempotent_and_commits_after_caller_artifacts() {
+        let source_definition = definition(id(1));
+        let target = definition(id(2));
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let (content, metadata, text_handle, payload_handle) = fragment_fixture();
+        let content_archive: Blob<SimpleArchive> = content.facts().clone().to_blob();
+        let metadata_archive: Blob<SimpleArchive> = metadata.facts().clone().to_blob();
+        let expected = CollectionCommit::sign(
+            &signing_key,
+            source_definition.id(),
+            data(&content_archive),
+            metadata_archive.get_handle(),
+        );
+
+        let prepared = prepare_fragment_commit(
+            &source_definition,
+            content.clone(),
+            metadata.clone(),
+            &signing_key,
+        )
+        .unwrap();
+        let repeated =
+            prepare_fragment_commit(&source_definition, content, metadata, &signing_key).unwrap();
+        assert_eq!(prepared.commit(), &expected);
+        assert_eq!(repeated.commit(), &expected);
+        assert_eq!(
+            prepared.commit().to_blob().get_handle(),
+            repeated.commit().to_blob().get_handle()
+        );
+
+        let derive = CollectionDerive::new(
+            source_definition.id(),
+            target.id(),
+            expected.data(),
+            Inline::new([0x42; 32]),
+        );
+        let derive_blob = CollectionDerive::to_blob(&derive);
+        let definition_blob = CollectionDefinition::to_blob(&source_definition);
+        let commit_blob = CollectionCommit::to_blob(&expected);
+        let mut embedded = vec![text_handle.raw, payload_handle.raw];
+        embedded.sort_unstable();
+        let sequence = vec![
+            ProbeEvent::Put(embedded[0]),
+            ProbeEvent::Put(embedded[1]),
+            put_event(&definition_blob),
+            put_event(&content_archive),
+            put_event(&metadata_archive),
+            ProbeEvent::Flush,
+            put_event(&derive_blob),
+            put_event(&commit_blob),
+            ProbeEvent::Flush,
+        ];
+
+        let mut store = ProbeStore::default();
+        for prepared in [prepared, repeated] {
+            let mut staged = prepared.stage(&mut store).unwrap();
+            assert_eq!(staged.commit(), &expected);
+            staged
+                .store_mut()
+                .put::<SimpleArchive, _>(derive_blob.clone())
+                .unwrap();
+            assert_eq!(staged.finalize().unwrap(), expected);
+        }
+
+        let mut expected_events = sequence.clone();
+        expected_events.extend(sequence);
+        assert_eq!(store.events, expected_events);
+        // The last flush intentionally covers the unsigned cache artifact and
+        // COMMIT together. The signed source remains valid without that cache:
+        // its transcript names only the definition, data, and metadata.
+        assert!(store.durable.contains(&derive_blob.get_handle().raw));
+        assert!(store.durable.contains(&commit_blob.get_handle().raw));
+        assert!(store.pending.is_empty());
+        validate_commit(&source_definition, &expected, &content_archive).unwrap();
+    }
+
+    #[test]
+    fn staged_fragment_is_not_a_discoverable_commit_and_drop_is_inert() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("staged-only.pile");
+        std::fs::File::create(&path).unwrap();
+
+        let definition = definition(id(1));
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let (content, metadata, text_handle, payload_handle) = fragment_fixture();
+        let expected_content: Blob<SimpleArchive> = content.facts().clone().to_blob();
+        let expected_metadata: Blob<SimpleArchive> = metadata.facts().clone().to_blob();
+        let prepared =
+            prepare_fragment_commit(&definition, content, metadata, &signing_key).unwrap();
+        let withheld = prepared.commit().clone();
+
+        let mut pile = Pile::open(&path).unwrap();
+        let mut staged = prepared.stage(&mut pile).unwrap();
+        {
+            let reader = staged.store_mut().reader().unwrap();
+            let discovered = discover_collection_records(&reader).unwrap();
+            assert_eq!(discovered.definitions(), &[definition.clone()]);
+            assert!(discovered.commits().is_empty());
+            assert!(discovered.merges().is_empty());
+            assert!(discovered.derives().is_empty());
+
+            let resolution = resolve_collection_semantics(&discovered, &BTreeSet::new(), |_| {
+                Ok::<_, Infallible>(CollectionClaimValidation::<()>::Pending)
+            })
+            .unwrap();
+            assert!(resolution.admitted_claims().is_empty());
+            assert!(resolution.semantics().members(definition.id()).is_none());
+            let roots = plan_collection_retention(&discovered, &resolution, &reader).unwrap();
+            assert!(roots.is_empty());
+            assert!(roots.expanded(&reader).is_empty());
+
+            let content: Blob<SimpleArchive> = reader
+                .get::<Blob<SimpleArchive>, SimpleArchive>(withheld.data().transmute())
+                .unwrap();
+            let metadata: Blob<SimpleArchive> = reader.get(withheld.metadata()).unwrap();
+            let text: View<str> = reader.get::<View<str>, LongString>(text_handle).unwrap();
+            let payload: Bytes = reader.get::<Bytes, RawBytes>(payload_handle).unwrap();
+            assert_eq!(content, expected_content);
+            assert_eq!(metadata, expected_metadata);
+            assert_eq!(&*text, "a self-contained content blob");
+            assert_eq!(&*payload, &[0, 1, 2, 3, 0xFE, 0xFF]);
+        }
+
+        // Drop deliberately does not cross the visibility boundary. Explicit
+        // close still succeeds and preserves only the staged dependencies.
+        drop(staged);
+        pile.close().unwrap();
+
+        let mut reopened = Pile::open(&path).unwrap();
+        let reader = reopened.reader().unwrap();
+        let discovered = discover_collection_records(&reader).unwrap();
+        assert_eq!(discovered.definitions(), &[definition]);
+        assert!(discovered.commits().is_empty());
+        assert!(reader
+            .get::<Blob<SimpleArchive>, SimpleArchive>(
+                CollectionCommit::to_blob(&withheld).get_handle(),
+            )
+            .is_err());
+        drop(reader);
+        reopened.close().unwrap();
     }
 
     #[test]
