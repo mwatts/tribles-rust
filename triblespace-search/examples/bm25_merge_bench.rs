@@ -1,4 +1,4 @@
-//! Phase-level smoke benchmark for succinct BM25 segment merging.
+//! Phase-level smoke benchmark for portable BM25 segment merging.
 //!
 //! This intentionally uses only public APIs so it exercises the same
 //! `Bm25Rollup::merge` path as index-home compaction. It is not a statistical
@@ -10,6 +10,7 @@
 //!      [segments] [docs_per_segment] [terms_per_doc] [vocabulary] [overlap_percent]`
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::collections::HashMap;
 use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -20,9 +21,8 @@ use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::{Inline, RawInline};
 use triblespace_core::repo::index_home::IndexKind;
 use triblespace_core::repo::BlobStore;
-use triblespace_search::bm25::BM25Builder;
 use triblespace_search::index_bm25::{query_across, Bm25Rollup};
-use triblespace_search::succinct::{SuccinctBM25Blob, SuccinctBM25Cover, SuccinctBM25Index};
+use triblespace_search::portable_bm25::{PortableBM25Blob, PortableBM25Index};
 use triblespace_search::tokens::WordHash;
 
 struct TrackingAlloc;
@@ -81,7 +81,7 @@ fn build_segments(
     terms_per_doc: usize,
     vocabulary: usize,
     overlap_percent: usize,
-) -> Vec<SuccinctBM25Index<GenId, WordHash>> {
+) -> Vec<PortableBM25Index<GenId, WordHash>> {
     assert!(segment_count > 0);
     assert!(vocabulary > 0);
     assert!(overlap_percent <= 100);
@@ -89,8 +89,9 @@ fn build_segments(
 
     (0..segment_count)
         .map(|segment| {
-            let mut builder: BM25Builder<GenId, WordHash> = BM25Builder::new();
             let mut rng = Rng(0xB25_5EED ^ segment as u64);
+            let mut documents = Vec::with_capacity(docs_per_segment);
+            let mut counts = Vec::new();
             for local in 0..docs_per_segment {
                 let ordinal = if local < shared_docs {
                     local as u64
@@ -98,11 +99,23 @@ fn build_segments(
                     shared_docs as u64
                         + (segment * (docs_per_segment - shared_docs) + local - shared_docs) as u64
                 };
-                let terms =
-                    (0..terms_per_doc).map(|_| term_from_u64(rng.next() % vocabulary as u64));
-                builder.insert(id_from_u64(ordinal + 1), terms);
+                let id = id_from_u64(ordinal + 1);
+                let document: Inline<GenId> = triblespace_core::inline::IntoInline::to_inline(&id);
+                documents.push(document);
+                let mut frequencies = HashMap::new();
+                for _ in 0..terms_per_doc {
+                    *frequencies
+                        .entry(term_from_u64(rng.next() % vocabulary as u64))
+                        .or_insert(0u32) += 1;
+                }
+                counts.extend(
+                    frequencies
+                        .into_iter()
+                        .map(|(term, frequency)| (document, term, frequency)),
+                );
             }
-            builder.build()
+            PortableBM25Index::from_exact_counts(documents, counts)
+                .expect("benchmark corpus is valid")
         })
         .collect()
 }
@@ -143,7 +156,7 @@ fn main() {
         vocabulary,
         overlap_percent,
     );
-    let input_bytes: usize = segments.iter().map(|segment| segment.bytes.len()).sum();
+    let input_bytes: usize = segments.iter().map(|segment| segment.bytes().len()).sum();
     println!(
         "prepared {segment_count} segments x {docs_per_segment} docs x \
          {terms_per_doc} terms ({overlap_percent}% overlap, vocab {vocabulary}) in {:.3}s; input {}",
@@ -177,14 +190,14 @@ fn main() {
     );
 
     let query = [term_from_u64(0), term_from_u64(1), term_from_u64(2)];
-    let cover_started = Instant::now();
-    let cover = SuccinctBM25Cover::new(&segments).expect("one BM25 recipe");
-    let cover_build = cover_started.elapsed();
+    let resident_started = Instant::now();
+    let resident = PortableBM25Index::merge(segments.iter()).expect("portable resident merge");
+    let resident_build = resident_started.elapsed();
 
-    let merged: SuccinctBM25Index<GenId, WordHash> =
-        SuccinctBM25Index::try_from_blob(Blob::<SuccinctBM25Blob>::new(merged_blob.bytes.clone()))
-            .expect("merge output is a valid succinct BM25 artifact");
-    let resident_expected = cover.query_multi(&query);
+    let merged: PortableBM25Index<GenId, WordHash> =
+        PortableBM25Index::try_from_blob(Blob::<PortableBM25Blob>::new(merged_blob.bytes.clone()))
+            .expect("merge output is a valid portable BM25 artifact");
+    let resident_expected = resident.query_multi(&query);
     let compacted_expected = merged.query_multi(&query);
     assert_eq!(
         resident_expected
@@ -198,11 +211,11 @@ fn main() {
     );
 
     const QUERY_ITERATIONS: u32 = 2_000;
-    let resident_started = Instant::now();
+    let resident_query_started = Instant::now();
     for _ in 0..QUERY_ITERATIONS {
-        black_box(cover.query_multi(black_box(&query)));
+        black_box(resident.query_multi(black_box(&query)));
     }
-    let resident_query = average(resident_started.elapsed(), QUERY_ITERATIONS);
+    let resident_query = average(resident_query_started.elapsed(), QUERY_ITERATIONS);
 
     let compacted_started = Instant::now();
     for _ in 0..QUERY_ITERATIONS {
@@ -218,8 +231,8 @@ fn main() {
     let one_shot_query = average(one_shot_started.elapsed(), ONE_SHOT_ITERATIONS);
 
     println!(
-        "cover build {:.3}ms; 3-term query resident {:.3}µs, compacted {:.3}µs, one-shot {:.3}ms",
-        cover_build.as_secs_f64() * 1_000.0,
+        "resident merge {:.3}ms; 3-term query resident {:.3}µs, reattached {:.3}µs, one-shot {:.3}ms",
+        resident_build.as_secs_f64() * 1_000.0,
         resident_query.as_secs_f64() * 1_000_000.0,
         compacted_query.as_secs_f64() * 1_000_000.0,
         one_shot_query.as_secs_f64() * 1_000.0,

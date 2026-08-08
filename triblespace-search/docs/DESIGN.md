@@ -1,9 +1,9 @@
 # triblespace-search — design
 
-Two content-addressed index blobs that sit on top of a triblespace
-pile: one for BM25-style lexical / associative retrieval, one for
-approximate nearest-neighbour search over embeddings. Both follow
-the same invariants:
+Three typed content-addressed representations sit on top of a triblespace pile:
+a portable BM25 carrier, a direct native BM25 accelerator, and a native HNSW
+accelerator for approximate nearest-neighbour search. They follow the same
+logical invariants:
 
 1. **Content-addressed.** Same corpus → same blob hash. Rebuilds
    are free when nothing has changed; same content embedded with
@@ -12,10 +12,12 @@ the same invariants:
    fresh content-addressed segment. Range rollups publish complete standalone
    alternatives without replacing prior nodes; direct callers may also persist
    the handle in ordinary tribles.
-3. **Zero-copy views via jerky.** The blob is a self-contained
-   byte buffer; a `try_from_blob` produces a view that holds an
-   `anybytes::Bytes` backing and answers queries without copying.
-4. **Unordered-query shape.** Both indexes expose their query
+3. **Typed self-contained bytes.** `try_from_blob` validates the representation
+   selected by the handle type. Portable BM25 keeps a gapless fixed-width
+   grammar; the native succinct accelerators use jerky. Every attached view
+   retains one `anybytes::Bytes` backing and answers queries without copying
+   the canonical payload.
+4. **Unordered-query shape.** All attached views expose their query
    primitive as a triblespace constraint, and both follow the
    same rule: doc/handle is the only bound variable, score is
    a fixed parameter rather than another query variable.
@@ -50,12 +52,47 @@ The BM25 artifact is therefore a general lossless carrier `(Docs, F)`, where
 `F(doc, term) -> u32` is sparse term frequency. IDF, average document length,
 and BM25 scores are derived from that carrier at query time.
 
+## `PortableBM25Index` — durable range carrier
+
+`Bm25Rollup` persists only `PortableBM25Blob`. The representation is independent
+of a native accelerator and has one gapless little-endian grammar:
+
+```text
+[documents]  D x 32-byte keys, strictly increasing
+[terms]      T x 32-byte terms, strictly increasing
+[postings]   P x (u32 document ordinal, u32 exact frequency), term-major
+[ends]       T x u64 cumulative posting ends
+[footer]     u64 D, u64 T
+```
+
+Every term has at least one posting, every frequency is positive, and posting
+document ordinals are strictly increasing within a term. There is no magic,
+in-band version, native `usize`, padding, persisted float, score, document
+length, or query-accelerator metadata. An incompatible grammar gets a new blob
+encoding identity rather than a compatibility reader.
+
+The logical join is:
+
+```text
+(Docs₁, F₁) ⊔ (Docs₂, F₂)
+  = (Docs₁ ∪ Docs₂, pointwise_max(F₁, F₂))
+```
+
+This preserves empty documents and makes segment merge associative,
+commutative, idempotent, and byte-canonical. Attachment exact-validates the
+grammar, retains its bytes, and derives only document lengths and average
+length in memory. `query_across` materializes that canonical join as a one-shot
+correctness boundary; repeated-query servers should retain the merged portable
+view so the all-postings pass is amortized.
+
 ## `SuccinctBM25Index` — SB25 blob layout
 
-Self-contained canonical blob, zero-copy via `anybytes::Bytes`, bit-packed via
-jerky. The exact schema identity is `SuccinctBM25Blob::ID`; there are no magic
-bytes or in-band versions. Every breaking layout or semantic change rotates
-that schema id.
+The direct native accelerator remains available to callers that deliberately
+choose its machine-specific Jerky representation. It is a self-contained
+canonical blob, zero-copy via `anybytes::Bytes`, and bit-packed via jerky. It is
+not the durable range-rollup format. The exact schema identity is
+`SuccinctBM25Blob::ID`; there are no magic bytes or in-band versions. Every
+breaking layout or semantic change rotates that schema id.
 
 ```
 [keys                ] variable         ; CompressedUniverse view:
@@ -99,31 +136,22 @@ Lookup algorithm:
 4. Derive Robertson-smoothed IDF from `(n_docs, posting_count)`, then compute
    standard BM25 from `tf`, `doc_lens[doc_idx]`, `avg_doc_len`, `k1`, and `b`.
 
-### Canonical build and merge law
+### Native build semantics
 
-One inserted row counts repeated terms by addition. Rows or persisted segments
-that share a document key join their frequency maps pointwise with `max`;
+One inserted row counts repeated terms by addition. Repeated inserted rows
+that share a document key join their frequency maps pointwise with `max`, while
 document keys themselves join by set union. Document lengths are the sums of
-the joined frequencies, not independent input fields. This preserves empty
-documents and gives an associative, commutative, idempotent carrier:
+those frequencies, not independent input fields, so empty documents survive
+and input row order cannot affect the native bytes:
 
 ```text
 (Docs₁, F₁) ⊔ (Docs₂, F₂)
   = (Docs₁ ∪ Docs₂, pointwise_max(F₁, F₂))
 ```
 
-The canonical document/term ordering makes equivalent merge trees produce the
-same bytes. `k1` and `b` are recipe parameters rather than members of that
-join, so merging segments with bitwise-different tuning is an error.
-
-`SuccinctBM25Cover` is the resident read view over a physical LSM cover. For a
-fragmented cover it k-way joins document identity and all exact frequencies
-once to derive canonical document lengths; each later query k-way joins only
-the requested term postings before deriving global IDF and scores. Empty and
-singleton covers are direct fast paths. Thus cover shape cannot change scores
-or deterministic ranking, while repeated reads do not rebuild a merged index.
-`query_across` constructs that view as a one-shot convenience; servers should
-retain the cover alongside the attached segments.
+The direct native API builds one accelerator at a time; durable segment merge
+belongs to the portable range carrier above. Its `k1` and `b` remain explicit
+per-index query parameters rather than durable range identity.
 
 ### What's already compressed (as of the current impl)
 
@@ -299,7 +327,7 @@ them.
 
 ## Query engine integration
 
-Both indexes expose their query as a `triblespace::Constraint`.
+All attached search views expose their query as a `triblespace::Constraint`.
 Callers load the blob once (cheap — mmap-backed
 `anybytes::Bytes`) and produce a constraint by binding the
 variables they want:
@@ -363,7 +391,7 @@ pile of ≈ 100 k typst wiki fragments, average ≈ 180 words each
 (≈ 300 raw tokens with punctuation). Numbers are back-of-envelope
 for contrasting the naive flat representation with the succinct layout.
 
-### BM25 — size estimate
+### Direct native BM25 — size estimate
 
 Assume after `hash_tokens`:
 - `n_docs = 100 000`
@@ -409,7 +437,7 @@ here and it made the section **bigger** — maximum-entropy hashes
 have no shared 4-byte fragments for the dictionary to exploit.
 Left uncompressed.
 
-### BM25 — build time
+### Direct native BM25 — build time
 
 Build is O(total postings) with hashmap bookkeeping: `18 M`
 insertions into the `HashMap<RawInline, HashMap<u32, u32>>` tf
@@ -432,7 +460,7 @@ single-threaded. A term-partitioned variant would push further
 but needs a routing hash per insert; filed as future work when
 build-time actually bites.
 
-### BM25 — query latency
+### Direct native BM25 — query latency
 
 `cargo run --release --example query_latency` on current laptop
 hardware (10 k / 50 k docs with Zipf-ish vocab):
@@ -453,13 +481,12 @@ and comparing 32-byte keys until final decoding. Measured p50 is 35.6 / 67.9 µs
 (naive / SB25) at 10 k and 161 / 370 µs at 50 k. This is about 28–29% faster on
 SB25 than the retired baked-score implementation despite deriving exact scores.
 
-Multi-segment reads have two costs. Constructing a resident
-`SuccinctBM25Cover` is an all-postings pass that belongs at attachment/change
-time. Once resident, a query visits only its requested postings; the remaining
-overhead versus a compacted artifact is the small k-way merge across physical
-segments. The `bm25_merge_bench` example reports cover construction, resident
-query, compacted query, and deliberately non-amortized `query_across` timings
-for the same corpus and verifies bit-identical ranking first.
+Range-native multi-segment reads use the portable carrier. Constructing the
+resident canonical merge is an all-postings pass that belongs at
+attachment/change time. Once resident, queries operate directly on that merged
+view. The `bm25_merge_bench` example reports portable merge, resident query,
+reattached query, and deliberately non-amortized `query_across` timings for the
+same corpus and verifies bit-identical ranking first.
 
 ### HNSW — size estimate
 

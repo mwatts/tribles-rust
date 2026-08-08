@@ -10,12 +10,13 @@ use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::encodings::iu256::U256BE;
 use triblespace_core::prelude::attributes;
 
-use crate::succinct::{SuccinctBM25Blob, SuccinctHNSWBlob};
+use crate::portable_bm25::PortableBM25Blob;
+use crate::succinct::SuccinctHNSWBlob;
 
 attributes! {
-    /// One exact-TF succinct BM25 artifact. Rotated with the blob format on
-    /// 2026-08-03 so retired score blobs cannot match the new reader.
-    "9B286B90C6F25B5FB6DE6A7176241940" as pub seg_bm25: Handle<SuccinctBM25Blob>;
+    /// One portable canonical exact-TF BM25 artifact. Rotated on 2026-08-08
+    /// when range persistence moved off the native succinct accelerator.
+    "570272A9F9C994D2152EFB10712F5275" as pub seg_bm25: Handle<PortableBM25Blob>;
     /// One physical succinct HNSW artifact.
     "54B0D283B85698E875A8A270E2570CF7" as pub seg_hnsw: Handle<SuccinctHNSWBlob>;
     /// Source attribute projected by a search recipe.

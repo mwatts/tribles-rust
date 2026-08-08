@@ -114,6 +114,15 @@ archive, and no source is claimed twice. Attachment then uses
 `SuccinctArchive::from_blob_pair` and never rebuilds Rank9 data on the read
 path. A range with no pairs remains a complete empty/contentless certificate.
 
+The BM25 recipe instead emits `seg_bm25*` handles to
+`PortableBM25Blob`. Its durable logical value is the document set plus sparse
+positive exact `u32` term frequencies; compaction is document union and
+pointwise maximum frequency. Native `SuccinctBM25Blob` / `CompressedUniverse`
+layout is deliberately absent from range identity and persistence. The
+portable carrier derives document lengths, IDF, and scores only after the
+selected cover has been canonically joined, so physical LSM shape cannot alter
+ranking. HNSW remains a separately typed native succinct artifact.
+
 ## Exact compaction
 
 Compaction may merge ranges only when their logical commit sets are disjoint

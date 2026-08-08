@@ -21,23 +21,38 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   trees. The resident view implements the existing BM25 query constraint
   surface without adopting an ambient tokenizer.
 
-### Succinct BM25 is exact and LSM-cover invariant
+### Range-native BM25 now persists only the portable carrier
+
+- `Bm25Rollup` builds `PortableBM25Blob` directly from exact per-document
+  counts, attaches `PortableBM25Index`, and compacts with the canonical
+  document-union / pointwise-max join. The durable path no longer constructs a
+  token bag, native Succinct arena, `CompressedUniverse`, or native cover
+  machinery; direct callers may still choose a single native Succinct BM25
+  accelerator independently.
+- This is an intentionally incompatible unpublished-format cutover with no
+  dual reader. Existing range artifacts must be rebuilt. The typed artifact
+  attribute is now `570272A9F9C994D2152EFB10712F5275`, and the recipe kind is
+  now `468F6EBF93C14A7FBC1188592B2BF984`; both IDs were minted with
+  `trible genid` on 2026-08-08. Rotating the recipe prevents old native
+  manifests from being misread as certified-empty portable ranges.
+- `SuccinctHNSWBlob`, its typed attribute, and its rollup recipe are unchanged.
+- Removed the unpublished `SuccinctBM25Cover`, `Bm25TuningMismatch`, native
+  segment merge/spool implementation, and its runtime `tempfile` feature. The
+  single-index native accelerator remains available without a second hidden
+  range-compaction path.
+
+### Direct native Succinct BM25 persists exact frequencies
 
 - Succinct postings now persist exact, bit-packed `u32` term frequencies
-  instead of corpus-relative quantized scores. Duplicate document rows and
-  segments join as `(Docs union, pointwise max frequency)`, preserving empty
-  documents and making arbitrary merge trees associative, commutative,
-  idempotent, and byte-canonical. Mixed `k1`/`b` recipes are rejected.
-- Added `SuccinctBM25Cover`, a reusable logical view over attached LSM
-  segments. It derives global document lengths once and k-way merges only the
-  requested postings per query, so scores and deterministic ranking equal a
-  fully compacted index regardless of physical cover shape. `query_across` is
-  now a fallible one-shot convenience wrapper around that resident API.
-- Rotated `SuccinctBM25Blob` to
-  `DAFEEEC9350D072B83E32DBBBBB66039`, the typed artifact attribute to
-  `9B286B90C6F25B5FB6DE6A7176241940`, and the BM25 rollup recipe to
-  `881C9D0DAC43814CB4E80897E420B67B`; retired score blobs are intentionally
-  incompatible rather than heuristically migrated.
+  instead of corpus-relative quantized scores. Repeated rows for one document
+  join by pointwise maximum frequency while preserving empty documents.
+  Document lengths, IDF, and scores are derived exactly from that carrier.
+- The direct native document-key universe now stores zero-prefix halves rather
+  than a fragment dictionary and DAC sequence. `SuccinctBM25Blob` therefore
+  rotates to `7ECEC029EEE4CA89582599E83B0E9508`; the preceding exact-TF native
+  identity `DAFEEEC9350D072B83E32DBBBBB66039` and older score blobs are
+  intentionally incompatible rather than heuristically migrated. Range
+  persistence now uses the separate portable carrier described above.
 
 ### Candidate distinctness is proven at its source
 

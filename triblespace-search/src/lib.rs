@@ -31,9 +31,10 @@
 //! / `FlatBuilder::build()`.
 //!
 //! Index blobs are immutable. Direct builders return fresh
-//! content-addressed handles; range-native rollups append complete
-//! source-range artifacts and compact by publishing new blobs rather
-//! than mutating existing ones.
+//! content-addressed handles. Range-native BM25 rollups persist
+//! [`portable_bm25::PortableBM25Blob`], while HNSW rollups retain the native
+//! succinct graph. Both append complete source-range artifacts and compact by
+//! publishing new blobs rather than mutating existing ones.
 //!
 //! # Query surface
 //!
@@ -126,8 +127,8 @@ pub mod tokens;
 /// non-packed) forms that exist only to validate the succinct
 /// builds and to measure "how much does jerky packing actually
 /// save at this scale." They are not a production persistence
-/// path — persistence always goes through the succinct forms
-/// in [`succinct`].
+/// path: range BM25 persists through [`portable_bm25`], direct native BM25
+/// and HNSW through [`succinct`].
 ///
 /// - [`BM25Index`][testing::BM25Index] — reference BM25 scoring
 ///   and query implementation. Produced by

@@ -56,16 +56,12 @@ blake3 = "1"
 unicode-properties = "0.1.4"
 # 1.13 raised its MSRV to 1.85; this crate still promises Rust 1.80.
 unicode-segmentation = "=1.12.0"
-# Segment merge spools exact joined postings to an anonymous temporary file so
-# canonical serialization never retains a corpus-sized posting cache in memory.
-tempfile = { version = "3", optional = true }
-
 [features]
 default = ["succinct"]
 # Swap the naive flat-array implementations for the succinct
 # jerky-backed ones. On until we have both working; off lets us
 # test the naive path in isolation.
-succinct = ["dep:jerky", "dep:zerocopy", "dep:tempfile"]
+succinct = ["dep:jerky", "dep:zerocopy"]
 
 [package.metadata.docs.rs]
 all-features = true

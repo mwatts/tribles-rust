@@ -3,11 +3,17 @@
 Content-addressed BM25 + HNSW indexes on top of
 [triblespace](https://github.com/triblespace/triblespace-rs) piles.
 
-Two blob types, loaded zero-copy via [anybytes] and [jerky]:
+Three typed blob representations. The durable BM25 range carrier is portable;
+the native query accelerators are loaded zero-copy via [anybytes] and [jerky]:
 
+- **`PortableBM25Index`** — architecture-independent lexical /
+  associative retrieval persisted by `Bm25Rollup`. Its canonical bytes carry
+  sorted document and term domains plus positive exact `u32` frequencies;
+  document lengths, IDF, and scores are derived after attachment. Portable
+  merge is document union plus pointwise maximum frequency.
 - **`SuccinctBM25Index`** (SB25 blob) — lexical / associative
-  retrieval. Terms are 32-byte triblespace `Inline`s, so the
-  index handles text search, entity co-occurrence, and tag
+  retrieval for direct native callers. Terms are 32-byte triblespace
+  `Inline`s, so the index handles text search, entity co-occurrence, and tag
   weighting with the same schema. Document indices and exact
   `u32` term frequencies are bit-packed via jerky
   `CompactVector`s; scores are derived at query time.
@@ -24,8 +30,9 @@ persisted attribute or manifest that routes handles to that reader; changing
 the metadata ID does not create a new Rust type or perform a runtime check.
 
 Index blobs are immutable. Direct builders return fresh content-addressed
-handles; range-native rollups append complete source-range artifacts and
-compact by publishing new blobs rather than mutating existing ones.
+handles. Range-native BM25 rollups append portable exact-frequency artifacts;
+HNSW rollups retain native succinct artifacts. Both compact by publishing new
+blobs rather than mutating existing ones.
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) for the full design.
 
@@ -35,8 +42,8 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for the full design.
 ## Status
 
 **Pre-alpha.** Tracks the workspace version (`0.36.0`); the API
-shapes are settling but not yet stable for downstream pinning. Both
-the naive and succinct paths are shipped end-to-end (see
+shapes are settling but not yet stable for downstream pinning. The
+naive, portable, and native succinct paths are shipped end-to-end (see
 [`docs/DESIGN.md`](docs/DESIGN.md) for the full picture and
 [`CHANGELOG.md`](CHANGELOG.md) for the recent shape changes). The
 remaining open items are perf/encoding refinements, not architecture.
@@ -49,6 +56,10 @@ remaining open items are perf/encoding refinements, not architecture.
   — binds `doc` only; score is a fixed parameter. Pair with
   `idx.score(&doc, terms)` to recompute precise scores after
   the engine filters.
+* **`PortableBM25Index`**: strict, canonical exact-TF carrier used by
+  range-native BM25 persistence. Its bytes contain no native `usize`, padding,
+  Jerky arena, persisted float, score, or redundant document-length table;
+  attachment derives the query caches and speaks the same constraint surface.
 * **`SuccinctBM25Index`**: jerky-backed zero-copy view — doc
   keys via `CompressedUniverse`, terms as a typed
   `View<[[u8; 32]]>` row table, doc-lengths + postings via
@@ -74,7 +85,7 @@ remaining open items are perf/encoding refinements, not architecture.
   Every backend freezes native order and duplicate occurrences at constraint
   construction.
 * **Shared constraint traits** `CosineSimilarity` (HNSW, Flat,
-  SuccinctHNSW) + `BM25Queryable` (naive + succinct BM25).
+  SuccinctHNSW) + `BM25Queryable` (naive + portable + succinct BM25).
 * **`matches_text(doc, text, floor)`** + **`score_text(doc, text)`**:
   word-hash-keyed sugar over `matches` and `score` — tokenises the
   query string with `hash_tokens` internally, available on indexes
@@ -118,7 +129,7 @@ remaining open items are perf/encoding refinements, not architecture.
   - `phrase_search` — `hash_tokens` + `bigram_tokens` in two
     typed indexes; same corpus answers single-word and phrase
     queries.
-* 154 tests across unit, scale (1k-doc equivalence +
+* Tests across unit, scale (1k-doc equivalence +
   naive-vs-SB25 size guard), engine-integration
   (`IntersectionConstraint` joins + `find!` / `pattern!`
   composition + `find!` over both succinct paths), and
@@ -128,8 +139,6 @@ remaining open items are perf/encoding refinements, not architecture.
 
 * Wavelet-matrix BM25 term table (would shrink the term column
   at large vocabularies; correctness-first is winning today).
-* Direct `SuccinctBM25Index` builder that skips the naive
-  intermediate (memory win at large build-time scale).
 
 See
 [`docs/DESIGN.md`](docs/DESIGN.md),

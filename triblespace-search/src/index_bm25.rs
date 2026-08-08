@@ -1,5 +1,5 @@
-//! [`Bm25Rollup`]: an [`IndexKind`] whose segments are persisted
-//! succinct BM25 indexes over a branch's message-content tribles.
+//! [`Bm25Rollup`]: an [`IndexKind`] whose segments are persisted portable,
+//! canonical exact-TF BM25 corpora over a branch's message-content tribles.
 //!
 //! # The waste this removes
 //!
@@ -25,18 +25,18 @@
 //! `Bm25Rollup` holds a blob reader to resolve those handles into the
 //! strings [`crate::tokens::hash_tokens`] tokenises. The reader is used
 //! only by [`build`](IndexKind::build); merge operates directly on the
-//! persisted succinct segments, and [`attach`](IndexKind::attach) is
-//! zero-copy (it decodes only the stored succinct blob).
+//! persisted portable sufficient statistics, and [`attach`](IndexKind::attach)
+//! validates the canonical bytes and derives only document-length caches.
 //!
 //! # Multi-segment query semantics
 //!
 //! A selected LSM cover can hold several segments. Persisted postings carry
-//! exact raw term frequencies. [`SuccinctBM25Cover`] joins their document
-//! carrier and document lengths once, then derives global IDF and BM25 scores
-//! from only the queried postings. Consequently the same logical corpus has
-//! identical scores and ranking under every physical cover shape. Callers
-//! serving repeated queries should retain that resident cover; [`query_across`]
-//! is the one-shot convenience path.
+//! exact raw term frequencies. [`PortableBM25Index::merge`] joins those
+//! sufficient statistics into one canonical resident corpus; document lengths,
+//! global IDF, and BM25 scores are derived only after that join. Consequently
+//! the same logical corpus has identical scores and ranking under every
+//! physical cover shape. Callers serving repeated queries should retain that
+//! resident merge; [`query_across`] is the one-shot convenience path.
 //!
 //! [`query_across`]: crate::index_bm25::query_across
 //! [`merge`]: IndexKind::merge
@@ -57,25 +57,23 @@ use triblespace_core::repo::index_home::{ArtifactError, IndexKind};
 use triblespace_core::repo::{BlobStoreGet, BlobStorePut};
 use triblespace_core::trible::{Fragment, TribleSet};
 
-use crate::bm25::BM25Builder;
 use crate::index_schema::{index_source_attribute, seg_bm25};
-pub use crate::succinct::Bm25TuningMismatch;
-use crate::succinct::{SuccinctBM25Blob, SuccinctBM25Cover, SuccinctBM25Index};
+use crate::portable_bm25::{PortableBM25Blob, PortableBM25Error, PortableBM25Index};
 use crate::tokens::WordHash;
 
 /// The document-key / term schemas of the BM25 segments this kind
 /// builds: entity-keyed documents, word-hash terms — the classic
 /// text-search shape and the one `archive search` uses.
-type Seg = SuccinctBM25Index<GenId, WordHash>;
+type Seg = PortableBM25Index<GenId, WordHash>;
 
-/// An [`IndexKind`] whose segments are [`SuccinctBM25Index`]es over the
+/// An [`IndexKind`] whose segments are [`PortableBM25Index`]es over the
 /// `Handle<LongString>` content a branch's entities point at, keyed by
 /// entity id.
 ///
 /// Parameterised by the blob reader `R` used to resolve those content handles
 /// into text during [`build`](IndexKind::build). Merge operates directly on
 /// exact frequencies in the persisted segments. Attach and query need no
-/// content reader — the stored succinct index is self-contained (terms are
+/// content reader — the stored portable corpus is self-contained (terms are
 /// hashed at build time).
 #[derive(Clone)]
 pub struct Bm25Rollup<R> {
@@ -95,10 +93,12 @@ impl<R> Bm25Rollup<R> {
     }
 
     /// Stable kind id — minted via `trible genid`
-    /// (`881C9D0DAC43814CB4E80897E420B67B`). Distinct from
+    /// (`468F6EBF93C14A7FBC1188592B2BF984`). Rotated on 2026-08-08 so
+    /// manifests written for the retired native BM25 artifact cannot be
+    /// mistaken for portable completed-empty ranges. Distinct from
     /// `SuccinctRollup`'s and `HnswRollup`'s so all three kinds'
     /// manifests coexist in one branch-head tribleset.
-    pub const KIND_ID_HEX: &'static str = "881C9D0DAC43814CB4E80897E420B67B";
+    pub const KIND_ID_HEX: &'static str = "468F6EBF93C14A7FBC1188592B2BF984";
 }
 
 impl<R> Bm25Rollup<R>
@@ -116,19 +116,27 @@ where
         Ok(view.as_ref().to_owned())
     }
 
-    /// Build a succinct BM25 blob from an iterator of `(doc_key,
-    /// tokens)` rows. Used by `build` and by materialized-oracle tests for
-    /// the streaming merge.
-    fn build_blob<I>(&self, rows: I) -> Blob<SuccinctBM25Blob>
-    where
-        I: IntoIterator<Item = (Inline<GenId>, Vec<Inline<WordHash>>)>,
-    {
-        let mut builder: BM25Builder<GenId, WordHash> = BM25Builder::new();
-        for (key, tokens) in rows {
-            builder.insert(key, tokens);
+    /// Build one portable BM25 blob from the exact joined frequencies already
+    /// accumulated by [`build`](IndexKind::build). No token-bag expansion or
+    /// native succinct arena participates in persistence.
+    fn build_blob(
+        &self,
+        docs: HashMap<RawInline, HashMap<RawInline, u32>>,
+    ) -> Result<Blob<PortableBM25Blob>, ArtifactError> {
+        let mut documents = Vec::with_capacity(docs.len());
+        let mut counts = Vec::new();
+        for (document, frequencies) in docs {
+            let document = Inline::<GenId>::new(document);
+            documents.push(document);
+            counts.extend(
+                frequencies
+                    .into_iter()
+                    .map(|(term, frequency)| (document, Inline::<WordHash>::new(term), frequency)),
+            );
         }
-        let idx: Seg = builder.build();
-        (&idx).to_blob()
+        let index = PortableBM25Index::from_exact_counts(documents, counts)
+            .map_err(|error| Box::new(error) as ArtifactError)?;
+        Ok((&index).to_blob())
     }
 }
 
@@ -137,8 +145,8 @@ where
     R: BlobStoreGet,
 {
     type Segment = Seg;
-    type PreparedArtifact = Blob<SuccinctBM25Blob>;
-    type StoredArtifact = Inline<Handle<SuccinctBM25Blob>>;
+    type PreparedArtifact = Blob<PortableBM25Blob>;
+    type StoredArtifact = Inline<Handle<PortableBM25Blob>>;
 
     fn recipe_fragment(&self) -> Fragment {
         let algorithm = Id::from_hex(Self::KIND_ID_HEX).expect("valid algorithm id");
@@ -175,25 +183,10 @@ where
             }
         }
 
-        let mut rows: Vec<(Inline<GenId>, Vec<Inline<WordHash>>)> = docs
-            .into_iter()
-            .map(|(key, tfs)| {
-                let mut tfs: Vec<(RawInline, u32)> = tfs.into_iter().collect();
-                tfs.sort_unstable_by_key(|&(term, _)| term);
-                let tokens = tfs
-                    .into_iter()
-                    .flat_map(|(term, tf)| {
-                        std::iter::repeat(Inline::<WordHash>::new(term)).take(tf as usize)
-                    })
-                    .collect();
-                (Inline::<GenId>::new(key), tokens)
-            })
-            .collect();
-        rows.sort_unstable_by_key(|(key, _)| key.raw);
-        if rows.is_empty() {
+        if docs.is_empty() {
             Ok(Vec::new())
         } else {
-            Ok(vec![self.build_blob(rows)])
+            Ok(vec![self.build_blob(docs)?])
         }
     }
 
@@ -218,7 +211,7 @@ where
         entity: Id,
     ) -> Result<Vec<Self::StoredArtifact>, ArtifactError> {
         Ok(triblespace_core::find!(
-            handle: Inline<Handle<SuccinctBM25Blob>>,
+            handle: Inline<Handle<PortableBM25Blob>>,
             pattern!(facts, [{ entity @ seg_bm25: ?handle }])
         )
         .collect())
@@ -229,10 +222,10 @@ where
         reader: &B,
         artifact: &Self::StoredArtifact,
     ) -> Result<Self::Segment, ArtifactError> {
-        let blob: Blob<SuccinctBM25Blob> = reader
+        let blob: Blob<PortableBM25Blob> = reader
             .get(*artifact)
             .map_err(|error| Box::new(error) as ArtifactError)?;
-        SuccinctBM25Index::try_from_blob(blob).map_err(|error| Box::new(error) as ArtifactError)
+        PortableBM25Index::try_from_blob(blob).map_err(|error| Box::new(error) as ArtifactError)
     }
 
     fn merge(
@@ -242,10 +235,7 @@ where
         if segments.is_empty() {
             return Ok(Vec::new());
         }
-        // The exact join validates one shared scoring recipe at its own
-        // boundary and retains all duplicate-key content without a
-        // corpus-sized token-bag intermediate.
-        let merged = SuccinctBM25Index::try_merge_segments(segments)?;
+        let merged = PortableBM25Index::merge(segments.iter())?;
         if merged.doc_count() == 0 {
             Ok(Vec::new())
         } else {
@@ -257,14 +247,15 @@ where
 /// One-shot rank of a logical corpus represented by several attached BM25
 /// artifacts.
 ///
-/// This constructs a [`SuccinctBM25Cover`] and is therefore ideal for a
-/// one-off query or correctness boundary. A server should construct and retain
-/// the cover itself so its all-postings document-length pass is amortised.
+/// This constructs a canonical [`PortableBM25Index`] merge and is therefore
+/// ideal for a one-off query or correctness boundary. A server should construct
+/// and retain that merged resident corpus so its all-postings join and
+/// document-length pass are amortised.
 pub fn query_across(
     segments: &[Seg],
     terms: &[Inline<WordHash>],
-) -> Result<Vec<(Inline<GenId>, f32)>, Bm25TuningMismatch> {
-    Ok(SuccinctBM25Cover::new(segments)?.query_multi(terms))
+) -> Result<Vec<(Inline<GenId>, f32)>, PortableBM25Error> {
+    Ok(PortableBM25Index::merge(segments.iter())?.query_multi(terms))
 }
 
 #[cfg(test)]
@@ -285,6 +276,7 @@ mod tests {
     use triblespace_core::trible::TribleSet;
 
     use super::*;
+    use crate::bm25::BM25Builder;
     use crate::index_schema::seg_bm25;
     use crate::tokens::hash_tokens;
 
@@ -308,12 +300,31 @@ mod tests {
         source
     }
 
-    fn decode(blob: Blob<SuccinctBM25Blob>) -> Seg {
-        SuccinctBM25Index::try_from_blob(blob).unwrap()
+    fn decode(blob: Blob<PortableBM25Blob>) -> Seg {
+        PortableBM25Index::try_from_blob(blob).unwrap()
     }
 
     fn reload(segment: &Seg) -> Seg {
-        decode(Blob::new(segment.bytes.clone()))
+        decode(Blob::new(segment.bytes().clone()))
+    }
+
+    fn build_portable(builder: BM25Builder<GenId, WordHash>) -> Seg {
+        let mut documents = Vec::with_capacity(builder.docs.len());
+        let mut counts = Vec::new();
+        for (document, terms) in builder.docs {
+            let document = Inline::<GenId>::new(document);
+            documents.push(document);
+            let mut frequencies = HashMap::new();
+            for term in terms {
+                *frequencies.entry(term).or_insert(0u32) += 1;
+            }
+            counts.extend(
+                frequencies
+                    .into_iter()
+                    .map(|(term, frequency)| (document, Inline::<WordHash>::new(term), frequency)),
+            );
+        }
+        PortableBM25Index::from_exact_counts(documents, counts).unwrap()
     }
 
     fn build_segment(kind: &Bm25Rollup<impl BlobStoreGet>, source: &TribleSet) -> Seg {
@@ -362,7 +373,7 @@ mod tests {
             builder.insert(document, hash_tokens(text));
         }
         builder
-            .build()
+            .build_naive()
             .query_multi(&hash_tokens(query))
             .into_iter()
             .map(|(document, score)| (document.raw, score))
@@ -398,27 +409,24 @@ mod tests {
         Inline::new(raw)
     }
 
-    fn materialized_max_union(segments: &[Seg], k1: f32, b: f32) -> Seg {
+    fn materialized_max_union(segments: &[Seg]) -> Seg {
         let mut union: HashMap<RawInline, HashMap<RawInline, u32>> = HashMap::new();
         for segment in segments {
-            for (key, tokens) in segment.reconstruct_docs() {
-                let mut source_tfs: HashMap<RawInline, u32> = HashMap::new();
-                for term in tokens {
-                    *source_tfs.entry(term).or_default() += 1;
-                }
-                let merged_tfs = union.entry(key).or_default();
-                for (term, frequency) in source_tfs {
-                    merged_tfs
-                        .entry(term)
-                        .and_modify(|old| *old = (*old).max(frequency))
-                        .or_insert(frequency);
-                }
+            for key in segment.document_keys() {
+                union.entry(key.raw).or_default();
+            }
+            for (key, term, frequency) in segment.exact_frequencies() {
+                let merged_tfs = union.entry(key.raw).or_default();
+                merged_tfs
+                    .entry(term.raw)
+                    .and_modify(|old| *old = (*old).max(frequency))
+                    .or_insert(frequency);
             }
         }
 
         let mut rows: Vec<_> = union.into_iter().collect();
         rows.sort_unstable_by_key(|(key, _)| *key);
-        let mut builder: BM25Builder<GenId, WordHash> = BM25Builder::new().k1(k1).b(b);
+        let mut builder: BM25Builder<GenId, WordHash> = BM25Builder::new();
         for (key, frequencies) in rows {
             let mut frequencies: Vec<_> = frequencies.into_iter().collect();
             frequencies.sort_unstable_by_key(|(term, _)| *term);
@@ -427,7 +435,7 @@ mod tests {
             });
             builder.insert(Inline::<GenId>::new(key), terms);
         }
-        builder.build()
+        build_portable(builder)
     }
 
     fn adversarial_cover_leaves() -> Vec<Seg> {
@@ -442,7 +450,7 @@ mod tests {
             for (document, terms) in rows {
                 builder.insert(merge_doc(document), terms);
             }
-            builder.build()
+            build_portable(builder)
         };
 
         vec![
@@ -486,7 +494,7 @@ mod tests {
     type ExpectedRankings = Vec<(Vec<Inline<WordHash>>, Vec<(RawInline, u32)>)>;
 
     fn assert_cover_matches(segments: &[Seg], expected: &ExpectedRankings, expected_docs: usize) {
-        let cover = SuccinctBM25Cover::new(segments).unwrap();
+        let cover = PortableBM25Index::merge(segments.iter()).unwrap();
         assert_eq!(cover.doc_count(), expected_docs);
         for (query, ranking) in expected {
             assert_eq!(ranked_bits(cover.query_multi(query)), *ranking);
@@ -504,7 +512,7 @@ mod tests {
         let source = stage_many(&mut storage, &pairs);
         let kind = Bm25Rollup::new(storage.reader().unwrap(), content.id());
         let artifact = kind.build(&source).unwrap().pop().unwrap();
-        let reloaded = Blob::<SuccinctBM25Blob>::new(artifact.bytes.clone());
+        let reloaded = Blob::<PortableBM25Blob>::new(artifact.bytes.clone());
         let segment = decode(reloaded);
         assert_eq!(segment.doc_count(), pairs.len());
 
@@ -609,13 +617,11 @@ mod tests {
         let kind = Bm25Rollup::new(storage.reader().unwrap(), content.id());
         let left = build_segment(&kind, &source_a);
         let right = build_segment(&kind, &source_b);
-        let defaults: BM25Builder<GenId, WordHash> = BM25Builder::new();
-        let expected =
-            materialized_max_union(&[reload(&left), reload(&right)], defaults.k1, defaults.b);
+        let expected = materialized_max_union(&[reload(&left), reload(&right)]);
         let direct = merge_segment(&kind, &[reload(&left), reload(&right)]);
         let reversed = merge_segment(&kind, &[reload(&right), reload(&left)]);
-        assert_eq!(direct.bytes.as_ref(), expected.bytes.as_ref());
-        assert_eq!(direct.bytes.as_ref(), reversed.bytes.as_ref());
+        assert_eq!(direct.bytes().as_ref(), expected.bytes().as_ref());
+        assert_eq!(direct.bytes().as_ref(), reversed.bytes().as_ref());
 
         let duplicate = merge_segment(&kind, &[reload(&left), left]);
         assert_eq!(duplicate.doc_count(), 2);
@@ -658,23 +664,22 @@ mod tests {
                 }
                 builder.insert(merge_doc((ordinal + 1) as u64), terms);
             }
-            segments.push(builder.build());
+            segments.push(build_portable(builder));
         }
 
-        let defaults: BM25Builder<GenId, WordHash> = BM25Builder::new();
-        let expected = materialized_max_union(&segments, defaults.k1, defaults.b);
-        let merged = SuccinctBM25Index::try_merge_segments(&segments).unwrap();
-        assert_eq!(merged.bytes.as_ref(), expected.bytes.as_ref());
-        let left = SuccinctBM25Index::try_merge_segments(&segments[..2]).unwrap();
-        let right = SuccinctBM25Index::try_merge_segments(&segments[2..]).unwrap();
-        let grouped = SuccinctBM25Index::try_merge_segments(&[left, right]).unwrap();
-        assert_eq!(merged.bytes.as_ref(), grouped.bytes.as_ref());
+        let expected = materialized_max_union(&segments);
+        let merged = PortableBM25Index::merge(segments.iter()).unwrap();
+        assert_eq!(merged.bytes().as_ref(), expected.bytes().as_ref());
+        let left = PortableBM25Index::merge(segments[..2].iter()).unwrap();
+        let right = PortableBM25Index::merge(segments[2..].iter()).unwrap();
+        let grouped = PortableBM25Index::merge([&left, &right]).unwrap();
+        assert_eq!(merged.bytes().as_ref(), grouped.bytes().as_ref());
         segments.reverse();
-        let reversed = SuccinctBM25Index::try_merge_segments(&segments).unwrap();
-        assert_eq!(merged.bytes.as_ref(), reversed.bytes.as_ref());
+        let reversed = PortableBM25Index::merge(segments.iter()).unwrap();
+        assert_eq!(merged.bytes().as_ref(), reversed.bytes().as_ref());
         segments.push(reload(&segments[0]));
-        let duplicated = SuccinctBM25Index::try_merge_segments(&segments).unwrap();
-        assert_eq!(merged.bytes.as_ref(), duplicated.bytes.as_ref());
+        let duplicated = PortableBM25Index::merge(segments.iter()).unwrap();
+        assert_eq!(merged.bytes().as_ref(), duplicated.bytes().as_ref());
     }
 
     #[test]
@@ -687,7 +692,8 @@ mod tests {
             vec![merge_term(4), merge_term(4), merge_term(5)],
             vec![merge_term(99)],
         ];
-        let canonical = SuccinctBM25Index::try_merge_segments(&adversarial_cover_leaves()).unwrap();
+        let leaves = adversarial_cover_leaves();
+        let canonical = PortableBM25Index::merge(leaves.iter()).unwrap();
         let expected: ExpectedRankings = queries
             .into_iter()
             .map(|query| {
@@ -707,8 +713,8 @@ mod tests {
         // A deliberately uneven partial compaction.
         let mut leaves = adversarial_cover_leaves();
         let tail = leaves.split_off(3);
-        let right = SuccinctBM25Index::try_merge_segments(&tail).unwrap();
-        let left_pair = SuccinctBM25Index::try_merge_segments(&leaves[..2]).unwrap();
+        let right = PortableBM25Index::merge(tail.iter()).unwrap();
+        let left_pair = PortableBM25Index::merge(leaves[..2].iter()).unwrap();
         let partial = vec![left_pair, reload(&leaves[2]), right];
         assert_cover_matches(&partial, &expected, expected_docs);
 
@@ -724,25 +730,11 @@ mod tests {
                 let a = cover.swap_remove(left);
                 let right = (rng.next() as usize) % cover.len();
                 let b = cover.swap_remove(right);
-                cover.push(SuccinctBM25Index::try_merge_segments(&[a, b]).unwrap());
+                cover.push(PortableBM25Index::merge([&a, &b]).unwrap());
                 assert_cover_matches(&cover, &expected, expected_docs);
             }
-            assert_eq!(cover[0].bytes.as_ref(), canonical.bytes.as_ref());
+            assert_eq!(cover[0].bytes().as_ref(), canonical.bytes().as_ref());
         }
-    }
-
-    #[test]
-    fn cover_rejects_mixed_scoring_recipes() {
-        let mut left: BM25Builder<GenId, WordHash> = BM25Builder::new().k1(1.2).b(0.75);
-        left.insert(merge_doc(1), [merge_term(1)]);
-        let mut right: BM25Builder<GenId, WordHash> = BM25Builder::new().k1(1.5).b(0.75);
-        right.insert(merge_doc(2), [merge_term(1)]);
-        let segments = [left.build(), right.build()];
-
-        assert!(SuccinctBM25Cover::new(&segments).is_err());
-        assert!(query_across(&segments, &[merge_term(1)]).is_err());
-        let error = SuccinctBM25Index::try_merge_segments(&segments).unwrap_err();
-        assert!(error.downcast_ref::<Bm25TuningMismatch>().is_some());
     }
 
     #[test]
@@ -879,7 +871,7 @@ mod tests {
             .collect();
         assert_eq!(parsed, HashSet::from([stored_a, stored_b]));
 
-        let malformed = Blob::<SuccinctBM25Blob>::new(Bytes::from(vec![0u8; 8]));
+        let malformed = Blob::<PortableBM25Blob>::new(Bytes::from(vec![0u8; 8]));
         let malformed_handle = storage.put(malformed).unwrap();
         let reader = storage.reader().unwrap();
         assert!(kind.attach(&reader, &malformed_handle).is_err());

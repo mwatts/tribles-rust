@@ -48,9 +48,9 @@ From `triblespace::core::query::Constraint`:
 
 ## BM25 as a `Constraint`
 
-One constraint shape: `BM25Filter<S>`, generic over the doc
-schema. Same shape on both naive `BM25Index<D, T>` and succinct
-`SuccinctBM25Index<D, T>`.
+One constraint shape: `BM25Filter<S>`, generic over the doc schema. The naive
+`BM25Index<D, T>`, portable `PortableBM25Index<D, T>`, and native succinct
+`SuccinctBM25Index<D, T>` all expose it.
 
 ### `matches(doc, &terms, score_floor)`
 
@@ -158,10 +158,10 @@ table themselves and filter.
 
 ### Shared `BM25Queryable` trait
 
-Both the naive `BM25Index<D, T>` and the succinct
-`SuccinctBM25Index<D, T>` implement `BM25Queryable`. The
+The naive `BM25Index<D, T>`, portable `PortableBM25Index<D, T>`, and native
+succinct `SuccinctBM25Index<D, T>` implement `BM25Queryable`. The
 constraints are generic over it — same constraint types, same
-`find!` integration, either backend.
+`find!` integration, every backend.
 
 ## Embedding constraints
 
@@ -283,10 +283,10 @@ let idx: SuccinctBM25Index =
 let c = idx.matches(doc, &terms, 0.0);
 ```
 
-`idx` owns the data; `c` borrows it for the duration of the query pass. Direct
-callers can publish a freshly built handle, while range-native maintenance
-publishes immutable segments and compacted alternatives. A later query attaches
-the selected handle or cover.
+`idx` owns the data; `c` borrows it for the duration of the query pass. This is
+the direct native path. Range-native BM25 maintenance instead publishes
+`PortableBM25Blob` segments and compacted alternatives; a later query attaches
+and retains their canonical portable merge.
 
 ## Open questions
 

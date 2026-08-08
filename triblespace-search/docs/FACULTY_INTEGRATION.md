@@ -16,6 +16,11 @@ tempdir pile, seeds a handful of fragments, runs refresh, then
 issues a few queries. If the pseudo-code below drifts, that
 example is the source of truth.
 
+This chapter deliberately demonstrates the direct native,
+rebuild-and-replace API. Range-native maintenance uses `Bm25Rollup` and
+persists `PortableBM25Blob`; it does not publish the `SuccinctBM25Blob` shown
+below.
+
 ## Example: `wiki_search.rs`
 
 ```rust,ignore
