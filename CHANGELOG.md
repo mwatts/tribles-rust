@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **CPU and GPU wavelet backends now share the portable codec's minimal
+  alphabet width.** Jerky and the CubeCL freeze geometry use
+  `max(1, bit_length(D - 1))`, including `D=0/1` and exact power-of-two
+  boundaries. Rank treats out-of-domain values as absent and select returns no
+  result on both scalar, batched, and device-resident paths, so removed leading
+  zero planes cannot make code `D` alias code zero.
 - **A portable SuccinctArchive v2 raw codec is staged behind an internal-only
   seam.** Its gapless little-endian layout derives every section boundary from
   only trible and ordered-domain cardinalities. The domain begins at byte zero

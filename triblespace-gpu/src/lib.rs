@@ -133,7 +133,7 @@ impl FreezeGeometry {
         }
         let len = u32::try_from(sequence_len)
             .map_err(|_| GpuFreezeError::SequenceTooLong(sequence_len))?;
-        let width_usize = needed_bits(alphabet_size);
+        let width_usize = alphabet_width(alphabet_size);
         if plane_words.len() != width_usize {
             return Err(GpuFreezeError::OutputLayers {
                 expected: width_usize,
@@ -182,8 +182,9 @@ impl FreezeGeometry {
 }
 
 #[cfg(any(test, feature = "wgpu", feature = "cuda"))]
-fn needed_bits(value: usize) -> usize {
-    (usize::BITS - value.leading_zeros()).max(1) as usize
+fn alphabet_width(size: usize) -> usize {
+    let max_code = size.saturating_sub(1);
+    (usize::BITS - max_code.leading_zeros()).max(1) as usize
 }
 
 #[cfg(test)]
@@ -200,7 +201,7 @@ mod tests {
     }
 
     fn geometry(alphabet_size: usize, len: usize) -> Result<FreezeGeometry, GpuFreezeError> {
-        let planes = vec![len.div_ceil(64); needed_bits(alphabet_size)];
+        let planes = vec![len.div_ceil(64); alphabet_width(alphabet_size)];
         FreezeGeometry::checked(alphabet_size, len, &planes)
     }
 
@@ -217,7 +218,9 @@ mod tests {
 
     #[test]
     fn alphabet_width_boundaries_are_exact() {
-        for (alphabet_size, expected) in [(255, 8), (256, 9), (257, 9)] {
+        for (alphabet_size, expected) in
+            [(0, 1), (1, 1), (2, 1), (3, 2), (255, 8), (256, 8), (257, 9)]
+        {
             assert_eq!(geometry(alphabet_size, 65).unwrap().width, expected);
         }
     }
@@ -241,7 +244,7 @@ mod tests {
     #[test]
     fn rejects_packed_offsets_that_do_not_fit_u32() {
         let len = u32::MAX as usize;
-        let planes = vec![len.div_ceil(64); needed_bits(u32::MAX as usize)];
+        let planes = vec![len.div_ceil(64); alphabet_width(u32::MAX as usize)];
         assert_eq!(
             FreezeGeometry::checked(u32::MAX as usize, len, &planes),
             Err(GpuFreezeError::GeometryOverflow("packed u32 word count"))
@@ -251,13 +254,13 @@ mod tests {
     #[test]
     fn rejects_malformed_output_shape() {
         assert_eq!(
-            FreezeGeometry::checked(256, 65, &[2; 8]),
+            FreezeGeometry::checked(256, 65, &[2; 9]),
             Err(GpuFreezeError::OutputLayers {
-                expected: 9,
-                actual: 8,
+                expected: 8,
+                actual: 9,
             })
         );
-        let mut planes = [2; 9];
+        let mut planes = [2; 8];
         planes[4] = 1;
         assert_eq!(
             FreezeGeometry::checked(256, 65, &planes),
