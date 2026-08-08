@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The native compressed Succinct universe now uses one zero-prefix layout.**
+  Every ordered 32-byte value contributes its second 16-byte half, while the
+  leading run of intrinsic identifiers shares an implicit all-zero first half;
+  only later first halves are stored. The payload is therefore exactly
+  `32N - 16Z` bytes, never exceeds the ordered universe, and supports direct
+  access and binary search without the former fragment dictionary, frequency
+  pass, hash tables, or DAC decoding. Strict attachment checks pin its boundary,
+  section cardinalities, and ordering. Portable raw Succinct and detached
+  Rank9 artifacts remain byte-for-byte independent of this native runtime
+  choice.
 - **Canonical `SimpleArchive` leaves can now derive raw Succinct artifacts
   without constructing a query runtime.**
   `SuccinctArchiveBlob::build_from_simple_archive` validates the source's

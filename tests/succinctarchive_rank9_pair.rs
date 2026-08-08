@@ -80,11 +80,28 @@ fn rank9_root_discovers_and_retains_its_raw_archive() {
 }
 
 #[test]
-fn compressed_universe_pair_roundtrips() {
+fn runtime_universe_choice_preserves_pair_identity_and_cross_attachment() {
     let expected = set(4);
-    let (raw, rank9) = SuccinctArchive::<CompressedUniverse>::build_blob_pair(&expected);
-    let archive = SuccinctArchive::<CompressedUniverse>::from_blob_pair(raw, rank9).unwrap();
-    assert_eq!(archive.iter().collect::<TribleSet>(), expected);
+    let (ordered_raw, ordered_rank9) =
+        SuccinctArchive::<OrderedUniverse>::build_blob_pair(&expected);
+    let (compressed_raw, compressed_rank9) =
+        SuccinctArchive::<CompressedUniverse>::build_blob_pair(&expected);
+
+    assert_eq!(compressed_raw.bytes, ordered_raw.bytes);
+    assert_eq!(compressed_raw.get_handle(), ordered_raw.get_handle());
+    assert_eq!(compressed_rank9.bytes, ordered_rank9.bytes);
+    assert_eq!(compressed_rank9.get_handle(), ordered_rank9.get_handle());
+
+    let compressed = SuccinctArchive::<CompressedUniverse>::from_blob_pair(
+        ordered_raw.clone(),
+        ordered_rank9.clone(),
+    )
+    .unwrap();
+    let ordered =
+        SuccinctArchive::<OrderedUniverse>::from_blob_pair(compressed_raw, compressed_rank9)
+            .unwrap();
+    assert_eq!(compressed.iter().collect::<TribleSet>(), expected);
+    assert_eq!(ordered.iter().collect::<TribleSet>(), expected);
 }
 
 #[test]

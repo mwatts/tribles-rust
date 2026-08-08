@@ -1,16 +1,11 @@
 use crate::inline::RawInline;
 
-use std::cmp::Reverse;
-use std::collections::HashMap;
 use std::convert::Infallible;
-use std::convert::TryInto;
 
 use anybytes::area::{SectionHandle, SectionWriter};
 use anybytes::Bytes;
 use anybytes::View;
 use indxvec::Search;
-use jerky::int_vectors::dacs_byte::{DacsByteMeta, LevelMeta};
-use jerky::int_vectors::{Access, DacsByte, NumVals};
 use jerky::serialization::Serializable;
 use quick_cache::sync::Cache;
 
@@ -250,65 +245,27 @@ impl Serializable for OrderedUniverse {
     }
 }
 
-/// Universe that splits each 32-byte value into eight 4-byte fragments,
-/// frequency-sorts them, and stores indices via a DACs byte sequence.
+/// Universe that stores every 32-byte value as two 16-byte halves and elides
+/// the zero first half shared by intrinsic entity identifiers.
 ///
-/// This yields significantly better compression than [`OrderedUniverse`]
-/// when many values share common 4-byte fragments (e.g. sequential IDs).
+/// Values are byte-sorted, so all values beginning with sixteen zero bytes
+/// form one contiguous prefix. The representation stores every second half,
+/// only the nonzero first halves, and the length of that prefix. Its payload is
+/// exactly `32N - 16Z` bytes for `N` values and `Z` zero-first-half values: it
+/// is never larger than [`OrderedUniverse`] and retains direct access plus
+/// binary search without a dictionary or variable-length decoding.
 #[derive(Debug, Clone)]
 pub struct CompressedUniverse {
-    fragments: View<[[u8; 4]]>,
-    fragments_handle: SectionHandle<[u8; 4]>,
-    data: DacsByte,
+    zero_prefix_len: usize,
+    suffixes: View<[[u8; 16]]>,
+    suffixes_handle: SectionHandle<[u8; 16]>,
+    nonzero_prefixes: View<[[u8; 16]]>,
+    nonzero_prefixes_handle: SectionHandle<[u8; 16]>,
 }
 
-impl Universe for CompressedUniverse {
-    fn with_sorted_dedup<I>(iter: I, sections: &mut SectionWriter<'_>) -> Self
-    where
-        I: Iterator<Item = RawInline>,
-    {
-        let mut data_fragments: Vec<[u8; 4]> = Vec::new();
-        let mut frequency: HashMap<[u8; 4], u64> = HashMap::new();
-
-        for value in iter {
-            for i in 0..8 {
-                let fragment = value[i * 4..i * 4 + 4].try_into().unwrap();
-                *frequency.entry(fragment).or_insert(0) += 1;
-                data_fragments.push(fragment);
-            }
-        }
-
-        let mut fragments: Vec<_> = frequency.keys().copied().collect();
-        fragments.sort_unstable_by_key(|fragment| (Reverse(frequency.get(fragment)), *fragment));
-
-        let fragment_index: HashMap<[u8; 4], u32> = fragments
-            .iter()
-            .enumerate()
-            .map(|(pos, value)| (*value, pos as u32))
-            .collect();
-
-        let data: Vec<u32> = data_fragments
-            .into_iter()
-            .map(|fragment| fragment_index.get(&fragment).copied().unwrap())
-            .collect();
-
-        let data = DacsByte::from_slice(&data, sections).unwrap();
-
-        let mut section = sections.reserve::<[u8; 4]>(fragments.len()).unwrap();
-        section.as_mut_slice().copy_from_slice(&fragments);
-        let fragments_handle = section.handle();
-        let bytes = section.freeze().unwrap();
-        let fragments = bytes.view::<[[u8; 4]]>().expect("view");
-
-        Self {
-            fragments,
-            fragments_handle,
-            data,
-        }
-    }
-
-    fn validate_metadata_prefix(
-        meta: &Self::Meta,
+impl CompressedUniverse {
+    fn validate_layout(
+        meta: &CompressedUniverseMeta,
         bytes: &Bytes,
         limit: usize,
     ) -> Result<(), jerky::error::Error> {
@@ -318,87 +275,210 @@ impl Universe for CompressedUniverse {
                 bytes.len()
             )));
         }
-        super::checked_section_range(meta.fragments, limit, "compressed-universe fragments")?;
-
-        let levels = meta.data.num_levels;
-        let max_levels = usize::BITS.div_ceil(8) as usize;
-        if levels == 0 || levels > max_levels {
-            return Err(super::invalid_rank9_metadata(format!(
-                "compressed-universe DAC has invalid level count {levels}"
-            )));
-        }
-        let table = super::checked_section_range(
-            meta.data.levels,
+        super::checked_section_range(meta.suffixes, limit, "compressed-universe suffixes")?;
+        super::checked_section_range(
+            meta.nonzero_prefixes,
             limit,
-            "compressed-universe DAC level table",
+            "compressed-universe nonzero prefixes",
         )?;
-        let expected_table_len = levels
-            .checked_mul(std::mem::size_of::<LevelMeta>())
-            .ok_or_else(|| super::invalid_rank9_metadata("DAC level-table length overflow"))?;
-        if table.len() != expected_table_len {
+
+        let suffix_count = meta.suffixes.len / std::mem::size_of::<[u8; 16]>();
+        if meta.zero_prefix_len > suffix_count {
             return Err(super::invalid_rank9_metadata(format!(
-                "compressed-universe DAC level table has {} bytes, expected {expected_table_len}",
-                table.len()
+                "compressed-universe zero-prefix boundary {} exceeds {suffix_count} values",
+                meta.zero_prefix_len
             )));
         }
-        let infos = meta
-            .data
-            .levels
-            .view(bytes)
-            .map_err(jerky::error::Error::from)?;
-        for (index, info) in infos.iter().enumerate() {
-            super::checked_section_range(
-                info.level,
-                limit,
-                &format!("compressed-universe DAC payload level {index}"),
-            )?;
-            let flag_range = super::checked_section_range(
-                info.flag,
-                limit,
-                &format!("compressed-universe DAC flag level {index}"),
-            )?;
-            let expected_flag_len = if index + 1 < levels {
-                info.flag_bits
-                    .checked_add(63)
-                    .map(|bits| bits / 64)
-                    .and_then(|words| words.checked_mul(std::mem::size_of::<u64>()))
-                    .ok_or_else(|| super::invalid_rank9_metadata("DAC flag length overflow"))?
-            } else {
-                0
-            };
-            if flag_range.len() != expected_flag_len {
-                return Err(super::invalid_rank9_metadata(format!(
-                    "compressed-universe DAC flag level {index} has {} bytes, expected {expected_flag_len}",
-                    flag_range.len()
-                )));
-            }
+        let nonzero_count = meta.nonzero_prefixes.len / std::mem::size_of::<[u8; 16]>();
+        let expected_nonzero = suffix_count - meta.zero_prefix_len;
+        if nonzero_count != expected_nonzero {
+            return Err(super::invalid_rank9_metadata(format!(
+                "compressed-universe stores {nonzero_count} nonzero prefixes, expected {expected_nonzero}"
+            )));
         }
         Ok(())
     }
 
-    fn access(&self, pos: usize) -> RawInline {
-        let mut v: RawInline = [0; 32];
+    fn attach(meta: CompressedUniverseMeta, bytes: Bytes) -> Result<Self, jerky::error::Error> {
+        Self::validate_layout(&meta, &bytes, bytes.len())?;
+        let suffixes = meta
+            .suffixes
+            .view(&bytes)
+            .map_err(jerky::error::Error::from)?;
+        let nonzero_prefixes = meta
+            .nonzero_prefixes
+            .view(&bytes)
+            .map_err(jerky::error::Error::from)?;
 
-        for i in 0..8 {
-            v[i * 4..i * 4 + 4]
-                .copy_from_slice(&self.fragments[self.data.access((pos * 8) + i).unwrap()]);
+        if nonzero_prefixes.iter().any(|prefix| *prefix == [0; 16]) {
+            return Err(super::invalid_rank9_metadata(
+                "compressed-universe tail contains a zero prefix",
+            ));
+        }
+        if !suffixes[..meta.zero_prefix_len]
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+        {
+            return Err(super::invalid_rank9_metadata(
+                "compressed-universe zero-prefix values are not strictly increasing",
+            ));
+        }
+        if (1..nonzero_prefixes.len()).any(|position| {
+            let previous = (
+                &nonzero_prefixes[position - 1],
+                &suffixes[meta.zero_prefix_len + position - 1],
+            );
+            let current = (
+                &nonzero_prefixes[position],
+                &suffixes[meta.zero_prefix_len + position],
+            );
+            previous >= current
+        }) {
+            return Err(super::invalid_rank9_metadata(
+                "compressed-universe nonzero-prefix values are not strictly increasing",
+            ));
         }
 
-        v
+        Ok(Self {
+            zero_prefix_len: meta.zero_prefix_len,
+            suffixes,
+            suffixes_handle: meta.suffixes,
+            nonzero_prefixes,
+            nonzero_prefixes_handle: meta.nonzero_prefixes,
+        })
     }
 
-    fn search(&self, v: &RawInline) -> Option<usize> {
-        if self.len() == 0 {
-            return None;
+    #[inline]
+    fn tail_cmp(&self, tail_pos: usize, value: &RawInline) -> std::cmp::Ordering {
+        self.nonzero_prefixes[tail_pos]
+            .as_slice()
+            .cmp(&value[..16])
+            .then_with(|| {
+                self.suffixes[self.zero_prefix_len + tail_pos]
+                    .as_slice()
+                    .cmp(&value[16..])
+            })
+    }
+
+    fn tail_partition_point(
+        &self,
+        mut predicate: impl FnMut(std::cmp::Ordering) -> bool,
+        value: &RawInline,
+    ) -> usize {
+        let mut lo = 0usize;
+        let mut hi = self.nonzero_prefixes.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if predicate(self.tail_cmp(mid, value)) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
         }
-        (0..=self.len() - 1)
-            .binary_by(|p| self.access(p).cmp(v))
-            .ok()
+        lo
+    }
+}
+
+impl Universe for CompressedUniverse {
+    fn with_sorted_dedup<I>(iter: I, sections: &mut SectionWriter<'_>) -> Self
+    where
+        I: Iterator<Item = RawInline>,
+    {
+        let mut suffixes = Vec::<[u8; 16]>::new();
+        let mut nonzero_prefixes = Vec::<[u8; 16]>::new();
+        let mut previous = None;
+        let mut saw_nonzero_prefix = false;
+
+        for value in iter {
+            debug_assert!(previous.is_none_or(|prior| prior < value));
+            previous = Some(value);
+
+            let mut suffix = [0; 16];
+            suffix.copy_from_slice(&value[16..]);
+            suffixes.push(suffix);
+
+            if value[..16] == [0; 16] {
+                debug_assert!(!saw_nonzero_prefix);
+            } else {
+                saw_nonzero_prefix = true;
+                let mut prefix = [0; 16];
+                prefix.copy_from_slice(&value[..16]);
+                nonzero_prefixes.push(prefix);
+            }
+        }
+
+        let zero_prefix_len = suffixes.len() - nonzero_prefixes.len();
+
+        let mut suffixes_section = sections.reserve::<[u8; 16]>(suffixes.len()).unwrap();
+        suffixes_section.as_mut_slice().copy_from_slice(&suffixes);
+        let suffixes_handle = suffixes_section.handle();
+        let suffixes_bytes = suffixes_section.freeze().unwrap();
+        let suffixes = suffixes_bytes.view::<[[u8; 16]]>().expect("view");
+
+        let mut prefixes_section = sections
+            .reserve::<[u8; 16]>(nonzero_prefixes.len())
+            .unwrap();
+        prefixes_section
+            .as_mut_slice()
+            .copy_from_slice(&nonzero_prefixes);
+        let nonzero_prefixes_handle = prefixes_section.handle();
+        let prefixes_bytes = prefixes_section.freeze().unwrap();
+        let nonzero_prefixes = prefixes_bytes.view::<[[u8; 16]]>().expect("view");
+
+        Self {
+            zero_prefix_len,
+            suffixes,
+            suffixes_handle,
+            nonzero_prefixes,
+            nonzero_prefixes_handle,
+        }
+    }
+
+    fn validate_metadata_prefix(
+        meta: &Self::Meta,
+        bytes: &Bytes,
+        limit: usize,
+    ) -> Result<(), jerky::error::Error> {
+        Self::validate_layout(meta, bytes, limit)
+    }
+
+    fn access(&self, pos: usize) -> RawInline {
+        let mut value: RawInline = [0; 32];
+        value[16..].copy_from_slice(&self.suffixes[pos]);
+        if pos >= self.zero_prefix_len {
+            value[..16].copy_from_slice(&self.nonzero_prefixes[pos - self.zero_prefix_len]);
+        }
+        value
+    }
+
+    fn search(&self, value: &RawInline) -> Option<usize> {
+        let position = self.search_lower(value);
+        if position < self.len() && self.access(position) == *value {
+            Some(position)
+        } else {
+            None
+        }
+    }
+
+    fn search_lower(&self, value: &RawInline) -> usize {
+        if value[..16] == [0; 16] {
+            return self.suffixes[..self.zero_prefix_len]
+                .partition_point(|suffix| suffix.as_slice() < &value[16..]);
+        }
+        self.zero_prefix_len + self.tail_partition_point(|ordering| ordering.is_lt(), value)
+    }
+
+    fn search_upper(&self, value: &RawInline) -> usize {
+        if value[..16] == [0; 16] {
+            return self.suffixes[..self.zero_prefix_len]
+                .partition_point(|suffix| suffix.as_slice() <= &value[16..]);
+        }
+        self.zero_prefix_len + self.tail_partition_point(|ordering| !ordering.is_gt(), value)
     }
 
     #[inline]
     fn len(&self) -> usize {
-        self.data.num_vals() / 8
+        self.suffixes.len()
     }
 }
 
@@ -406,10 +486,12 @@ impl Universe for CompressedUniverse {
 #[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
 #[repr(C)]
 pub struct CompressedUniverseMeta {
-    /// Section handle pointing to the fragment dictionary.
-    pub fragments: SectionHandle<[u8; 4]>,
-    /// DACs byte metadata for the fragment-index sequence.
-    pub data: DacsByteMeta,
+    /// Number of leading values whose first sixteen bytes are all zero.
+    pub zero_prefix_len: usize,
+    /// Second sixteen bytes of every value, in value order.
+    pub suffixes: SectionHandle<[u8; 16]>,
+    /// First sixteen bytes of values after the zero-prefix range.
+    pub nonzero_prefixes: SectionHandle<[u8; 16]>,
 }
 
 impl Serializable for CompressedUniverse {
@@ -418,19 +500,14 @@ impl Serializable for CompressedUniverse {
 
     fn metadata(&self) -> Self::Meta {
         CompressedUniverseMeta {
-            fragments: self.fragments_handle,
-            data: self.data.metadata(),
+            zero_prefix_len: self.zero_prefix_len,
+            suffixes: self.suffixes_handle,
+            nonzero_prefixes: self.nonzero_prefixes_handle,
         }
     }
 
     fn from_bytes(meta: Self::Meta, bytes: Bytes) -> Result<Self, Self::Error> {
-        let fragments = meta.fragments.view(&bytes).map_err(Self::Error::from)?;
-        let data = DacsByte::from_bytes(meta.data, bytes)?;
-        Ok(Self {
-            fragments,
-            fragments_handle: meta.fragments,
-            data,
-        })
+        Self::attach(meta, bytes)
     }
 }
 
@@ -523,98 +600,16 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::iter::repeat_with;
-
     use anybytes::area::ByteArea;
+    use anybytes::Bytes;
     use jerky::Serializable;
 
-    use crate::id::fucid;
     use crate::id::id_into_value;
-    use crate::id::rngid;
-    use crate::id::ufoid;
 
     use super::CachedUniverse;
     use super::CompressedUniverse;
     use super::OrderedUniverse;
     use super::Universe;
-
-    #[test]
-    fn ids_compressed() {
-        let size = 100;
-
-        let count_data: Vec<_> = (0..size as u128)
-            .map(|id| id_into_value(&id.to_be_bytes()))
-            .collect();
-        let genid_data: Vec<_> = repeat_with(|| id_into_value(&rngid())).take(size).collect();
-        let ufoid_data: Vec<_> = repeat_with(|| id_into_value(&ufoid())).take(size).collect();
-        let fucid_data: Vec<_> = repeat_with(|| id_into_value(&fucid())).take(size).collect();
-
-        let mut area = ByteArea::new().unwrap();
-        let mut sections = area.sections();
-        let _count_universe = CompressedUniverse::with(count_data.iter().copied(), &mut sections);
-        let _fucid_universe = CompressedUniverse::with(fucid_data.iter().copied(), &mut sections);
-        let _ufoid_universe = CompressedUniverse::with(ufoid_data.iter().copied(), &mut sections);
-        let _genid_universe = CompressedUniverse::with(genid_data.iter().copied(), &mut sections);
-        drop(sections);
-        let _bytes = area.freeze().unwrap();
-
-        // Todo: replace with size estimates on serialized data
-        //println!(
-        //    "count universe bytes per entry: {}",
-        //    count_universe.size_in_bytes() as f64 / size as f64
-        //);
-        //println!(
-        //    "fucid universe bytes per entry: {}",
-        //    fucid_universe.size_in_bytes() as f64 / size as f64
-        //);
-        //println!(
-        //    "ufoid universe bytes per entry: {}",
-        //    ufoid_universe.size_in_bytes() as f64 / size as f64
-        //);
-        //println!(
-        //    "genid universe bytes per entry: {}",
-        //    genid_universe.size_in_bytes() as f64 / size as f64
-        //);
-    }
-
-    #[test]
-    fn ids_uncompressed() {
-        let size = 100;
-
-        let count_data: Vec<_> = (0..size as u128)
-            .map(|id| id_into_value(&id.to_be_bytes()))
-            .collect();
-        let genid_data: Vec<_> = repeat_with(|| id_into_value(&rngid())).take(size).collect();
-        let ufoid_data: Vec<_> = repeat_with(|| id_into_value(&ufoid())).take(size).collect();
-        let fucid_data: Vec<_> = repeat_with(|| id_into_value(&fucid())).take(size).collect();
-
-        let mut area = ByteArea::new().unwrap();
-        let mut sections = area.sections();
-        let _count_universe = OrderedUniverse::with(count_data.iter().copied(), &mut sections);
-        let _fucid_universe = OrderedUniverse::with(fucid_data.iter().copied(), &mut sections);
-        let _ufoid_universe = OrderedUniverse::with(ufoid_data.iter().copied(), &mut sections);
-        let _genid_universe = OrderedUniverse::with(genid_data.iter().copied(), &mut sections);
-        drop(sections);
-        let _bytes = area.freeze().unwrap();
-
-        // Todo: replace with size estimates on serialized data
-        //println!(
-        //    "count universe bytes per entry: {}",
-        //    count_universe.size_in_bytes() as f64 / size as f64
-        //);
-        //println!(
-        //    "fucid universe bytes per entry: {}",
-        //    fucid_universe.size_in_bytes() as f64 / size as f64
-        //);
-        //println!(
-        //    "ufoid universe bytes per entry: {}",
-        //    ufoid_universe.size_in_bytes() as f64 / size as f64
-        //);
-        //println!(
-        //    "genid universe bytes per entry: {}",
-        //    genid_universe.size_in_bytes() as f64 / size as f64
-        //);
-    }
 
     #[test]
     fn ordered_universe_zero_copy() {
@@ -639,6 +634,138 @@ mod tests {
         let mut sections = area.sections();
         let u = CompressedUniverse::with_sorted_dedup(std::iter::empty(), &mut sections);
         assert_eq!(u.search(&[0u8; 32]), None);
+    }
+
+    #[test]
+    fn compressed_universe_roundtrips_with_exact_zero_prefix_payload() {
+        let mut values = vec![[0; 32], [0; 32], [0; 32], [0x11; 32], [0x22; 32]];
+        values[1][31] = 7;
+        values[2][16] = 9;
+        values[3][16..].fill(0x44);
+        values.sort_unstable();
+        values.dedup();
+        let zero_prefix_len = values.partition_point(|value| value[..16] == [0; 16]);
+
+        let mut area = ByteArea::new().unwrap();
+        let mut sections = area.sections();
+        let universe = CompressedUniverse::with_sorted_dedup(values.iter().copied(), &mut sections);
+        let metadata = universe.metadata();
+        drop(sections);
+        let bytes = area.freeze().unwrap();
+
+        assert_eq!(bytes.len(), 32 * values.len() - 16 * zero_prefix_len);
+        CompressedUniverse::validate_metadata_prefix(&metadata, &bytes, bytes.len()).unwrap();
+
+        let rebuilt = CompressedUniverse::from_bytes(metadata, bytes).unwrap();
+        for (position, value) in values.iter().enumerate() {
+            assert_eq!(rebuilt.access(position), *value);
+            assert_eq!(rebuilt.search(value), Some(position));
+            assert_eq!(rebuilt.search_lower(value), position);
+            assert_eq!(rebuilt.search_upper(value), position + 1);
+        }
+        assert_eq!(rebuilt.search(&[0xff; 32]), None);
+        assert_eq!(rebuilt.search_lower(&[0xff; 32]), values.len());
+        assert_eq!(rebuilt.search_upper(&[0xff; 32]), values.len());
+    }
+
+    #[test]
+    fn compressed_universe_searches_match_ordered_universe() {
+        let mut values = Vec::new();
+        for suffix in 0..128u32 {
+            let mut value = [0; 32];
+            value[28..].copy_from_slice(&(suffix * 2).to_be_bytes());
+            values.push(value);
+        }
+        for prefix in 1..=8u8 {
+            for suffix in 0..17u32 {
+                let mut value = [0; 32];
+                value[15] = prefix;
+                value[28..].copy_from_slice(&(suffix * 3).to_be_bytes());
+                values.push(value);
+            }
+        }
+        values.sort_unstable();
+
+        let mut probes = values.clone();
+        for suffix in 0..128u32 {
+            let mut value = [0; 32];
+            value[28..].copy_from_slice(&(suffix * 2 + 1).to_be_bytes());
+            probes.push(value);
+        }
+        for prefix in 1..=9u8 {
+            for suffix in 0..17u32 {
+                let mut value = [0; 32];
+                value[15] = prefix;
+                value[28..].copy_from_slice(&(suffix * 3 + 1).to_be_bytes());
+                probes.push(value);
+            }
+        }
+        probes.push([0xff; 32]);
+
+        let mut area = ByteArea::new().unwrap();
+        let mut sections = area.sections();
+        let ordered = OrderedUniverse::with_sorted_dedup(values.iter().copied(), &mut sections);
+        let compressed =
+            CompressedUniverse::with_sorted_dedup(values.iter().copied(), &mut sections);
+
+        assert_eq!(compressed.len(), ordered.len());
+        for position in 0..values.len() {
+            assert_eq!(compressed.access(position), ordered.access(position));
+        }
+        for probe in probes {
+            assert_eq!(compressed.search(&probe), ordered.search(&probe));
+            assert_eq!(
+                compressed.search_lower(&probe),
+                ordered.search_lower(&probe)
+            );
+            assert_eq!(
+                compressed.search_upper(&probe),
+                ordered.search_upper(&probe)
+            );
+        }
+    }
+
+    #[test]
+    fn compressed_universe_rejects_malformed_metadata_and_content() {
+        let mut values = vec![[0; 32], [0x11; 32], [0x22; 32]];
+        values[0][31] = 1;
+        let mut area = ByteArea::new().unwrap();
+        let mut sections = area.sections();
+        let universe = CompressedUniverse::with_sorted_dedup(values.iter().copied(), &mut sections);
+        let metadata = universe.metadata();
+        drop(sections);
+        let bytes = area.freeze().unwrap();
+
+        let mut boundary = metadata;
+        boundary.zero_prefix_len = values.len() + 1;
+        assert!(CompressedUniverse::from_bytes(boundary, bytes.clone()).is_err());
+
+        let mut count = metadata;
+        count.nonzero_prefixes.len -= 16;
+        assert!(CompressedUniverse::from_bytes(count, bytes.clone()).is_err());
+
+        let mut misaligned = metadata;
+        misaligned.suffixes.len -= 1;
+        assert!(CompressedUniverse::from_bytes(misaligned, bytes.clone()).is_err());
+
+        let mut outside = metadata;
+        outside.nonzero_prefixes.offset = bytes.len() + 16;
+        assert!(CompressedUniverse::from_bytes(outside, bytes.clone()).is_err());
+
+        let mut zero_tail = bytes.as_ref().to_vec();
+        let start = metadata.nonzero_prefixes.offset;
+        zero_tail[start..start + 16].fill(0);
+        assert!(CompressedUniverse::from_bytes(metadata, Bytes::from_source(zero_tail)).is_err());
+
+        let mut unordered = bytes.as_ref().to_vec();
+        let prefixes = metadata.nonzero_prefixes.offset;
+        unordered.swap(prefixes, prefixes + 16);
+        assert!(CompressedUniverse::from_bytes(metadata, Bytes::from_source(unordered)).is_err());
+
+        assert!(
+            CompressedUniverse::validate_metadata_prefix(&metadata, &bytes, bytes.len() - 1,)
+                .is_err()
+        );
     }
 
     #[test]
