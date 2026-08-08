@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A portable SuccinctArchive v2 raw codec is staged behind an internal-only
+  seam.** Its gapless little-endian layout derives every section boundary from
+  only trible and ordered-domain cardinalities. The domain begins at byte zero
+  so its 32-byte values remain visible to generic conservative child scans;
+  `N,D` occupy a fixed terminal footer. The codec uses the mathematically
+  minimal wavelet width for codes in `0..D`, and exact-validates sizes,
+  canonical bit tails, unary prefixes, ordered-domain role invariants,
+  in-domain codes, and last-column histograms. Empty, singleton, and multi-row
+  byte/hash goldens pin the representation. The staged view remains explicitly
+  non-queryable until the collection recipe proves changed masks and
+  cross-rotation identity. It deliberately has no second public `BlobEncoding`:
+  replacing the native v1 serializer/parser, adapting construction and detached
+  Rank9 attachment, and minting the fresh external schema ID remain one atomic
+  follow-up rather than introducing format coexistence.
 - **Signed collection commits can be prepared and staged before visibility.**
   The `SimpleArchive` union kind can now construct the exact canonical commit
   entirely in memory, durably stage its attachments, definition, data, and

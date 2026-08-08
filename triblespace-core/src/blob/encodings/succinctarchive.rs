@@ -2,6 +2,13 @@ mod succinctarchiveconstraint;
 mod succinctarchiverangeconstraint;
 mod universe;
 
+// Internal staging seam for the portable raw representation. This module has
+// deliberately no `BlobEncoding` identity and is not re-exported: the public
+// schema switch must happen atomically with removal of the native v1 codec and
+// adaptation of the runtime/Rank9 attachment path.
+#[allow(dead_code)]
+mod portable;
+
 use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
 use crate::blob::Blob;
 use crate::blob::BlobEncoding;
