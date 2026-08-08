@@ -165,7 +165,7 @@ where
                     field: field.as_ref().to_owned(),
                     source: EncodeError::from_error(err),
                 })?;
-        Ok(Attribute::<S>::from(entity! {
+        Ok(Attribute::<S>::from_fragment_unchecked(entity! {
             metadata::name:         handle,
             metadata::value_encoding: <S as MetaDescribe>::id(),
         }))
@@ -723,7 +723,7 @@ mod tests {
         use crate::blob::IntoBlob;
         use crate::metadata::MetaDescribe;
         let h: Inline<Handle<LongString>> = String::from(expected_attr).to_blob().get_handle();
-        let attr = Attribute::<Handle<LongString>>::from(crate::macros::entity! {
+        let attr = Attribute::<Handle<LongString>>::from_fragment_unchecked(crate::macros::entity! {
             metadata::name:         h,
             metadata::value_encoding: <Handle<LongString> as MetaDescribe>::id(),
         })

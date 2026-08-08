@@ -175,7 +175,11 @@ pub fn attributes_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Re
                 ::std::sync::LazyLock::new(|| {
                     use #base_path::blob::IntoBlob as _;
                     use #base_path::metadata::MetaDescribe as _;
-                    #base_path::attribute::Attribute::<#ty>::from(#body_fragment)
+                    // The macro supplies the encoding fact itself in both branches, so this
+                    // conversion is checked by construction rather than by the callee.
+                    // Deliberately explicit: `From<Fragment>` gave the UNCHECKED path the
+                    // shortest name in Rust, which is why it was removed.
+                    #base_path::attribute::Attribute::<#ty>::from_fragment_unchecked(#body_fragment)
                 });
         });
         per_attr.push((name, name_lit, description));

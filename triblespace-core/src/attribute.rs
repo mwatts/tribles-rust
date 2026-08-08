@@ -10,23 +10,34 @@
 //! are emitted at the [`attributes!`](crate::macros::attributes) call site as usage facts —
 //! there is no `AttributeUsage` type, the macro inlines them.
 //!
-//! Construct via [`From<Fragment>`]:
+//! Construct via the derived constructors — the encoding fact is emitted
+//! from `S`, so it cannot disagree with the phantom type:
+//!
+//! ```ignore
+//! Attribute::<S>::anchored(id)   // pinned namespace: identity is (anchor, S)
+//! Attribute::<S>::named("title") // display-name origin: identity is (name, S)
+//! Attribute::<S>::iri(iri)       // RDF predicate: identity is (iri, S)
+//! ```
+//!
+//! [`Attribute::from_fragment_unchecked`] wraps a hand-built fragment for
+//! origins those do not cover. It validates only rootedness, so the caller
+//! carries the obligation that the facts agree with `S`. The shapes it expects:
 //!
 //! ```ignore
 //! // Display-name origin (JSON fields, config keys, column headers):
-//! Attribute::<S>::from(entity! {
+//! Attribute::<S>::from_fragment_unchecked(entity! {
 //!     metadata::name:         name.to_blob().get_handle(),
 //!     metadata::value_encoding: <S as MetaDescribe>::id(),
 //! })
 //!
 //! // RDF / JSON-LD predicate (IRI as canonical identifier):
-//! Attribute::<S>::from(entity! {
+//! Attribute::<S>::from_fragment_unchecked(entity! {
 //!     metadata::iri:          iri.to_blob().get_handle(),
 //!     metadata::value_encoding: <S as MetaDescribe>::id(),
 //! })
 //!
 //! // Explicit hex id (pinned attribute namespace):
-//! Attribute::<S>::from(entity! {
+//! Attribute::<S>::from_fragment_unchecked(entity! {
 //!     ExclusiveId::force_ref(&id) @
 //!         metadata::value_encoding: <S as MetaDescribe>::id(),
 //! })
@@ -88,7 +99,7 @@ impl<S: InlineEncoding + crate::metadata::MetaDescribe> Attribute<S> {
     /// ::anchored(ANCHOR)` is an ordinary generic call, so one anchor yields a
     /// distinct id per element type.
     pub fn anchored(anchor: Id) -> Self {
-        Self::from(crate::macros::entity! {
+        Self::from_fragment_unchecked(crate::macros::entity! {
             crate::metadata::anchor:
                 crate::inline::encodings::genid::GenId::inline_from(anchor),
             crate::metadata::value_encoding: <S as crate::metadata::MetaDescribe>::id(),
@@ -102,7 +113,7 @@ impl<S: InlineEncoding + crate::metadata::MetaDescribe> Attribute<S> {
     /// usage facts.
     pub fn named(name: &str) -> Self {
         use crate::blob::IntoBlob;
-        Self::from(crate::macros::entity! {
+        Self::from_fragment_unchecked(crate::macros::entity! {
             crate::metadata::name: name.to_string().to_blob().get_handle(),
             crate::metadata::value_encoding: <S as crate::metadata::MetaDescribe>::id(),
         })
@@ -113,7 +124,7 @@ impl<S: InlineEncoding + crate::metadata::MetaDescribe> Attribute<S> {
     /// Identity is `(iri, S)`.
     pub fn iri(iri: &str) -> Self {
         use crate::blob::IntoBlob;
-        Self::from(crate::macros::entity! {
+        Self::from_fragment_unchecked(crate::macros::entity! {
             crate::metadata::iri: iri.to_string().to_blob().get_handle(),
             crate::metadata::value_encoding: <S as crate::metadata::MetaDescribe>::id(),
         })
@@ -191,11 +202,30 @@ impl<S: InlineEncoding> Attribute<S> {
 /// Pinning a schema's attribute ids (so local renames don't churn the
 /// schema) is what the [`attributes!`](crate::macros::attributes) macro is for — declare them with
 /// explicit hex literals there.
-impl<S: InlineEncoding> From<Fragment> for Attribute<S> {
-    fn from(fragment: Fragment) -> Self {
+impl<S: InlineEncoding> Attribute<S> {
+    /// Wrap a hand-built identity fragment, **without checking that it agrees
+    /// with `S`**.
+    ///
+    /// Prefer [`Attribute::anchored`], [`Attribute::named`] or
+    /// [`Attribute::iri`], which emit the encoding fact from `S` and therefore
+    /// cannot disagree with it. This exists for origins those three do not
+    /// cover — an import deriving identity from foreign metadata, say.
+    ///
+    /// # Invariant the caller upholds
+    ///
+    /// The fragment's `metadata::value_encoding` must be
+    /// `<S as MetaDescribe>::id()`. Nothing here verifies that: only rootedness
+    /// is checked, so a fragment claiming a different encoding is accepted and
+    /// produces an attribute whose Rust type and stored identity contradict each
+    /// other. See `from_fragment_permits_a_lying_schema`.
+    ///
+    /// # Panics
+    ///
+    /// If the fragment is not rooted.
+    pub fn from_fragment_unchecked(fragment: Fragment) -> Self {
         let id = fragment
             .root()
-            .expect("Attribute::from(Fragment) requires a rooted fragment");
+            .expect("Attribute::from_fragment_unchecked requires a rooted fragment");
         Self {
             id,
             fragment,
@@ -237,6 +267,24 @@ mod tests {
     use crate::metadata::{self, Describe, MetaDescribe};
 
     /// `anchored` is a pure function of `(anchor, S)`.
+    /// This change must not move any existing attribute id.
+    ///
+    /// `attributes!` still expands the hex form to a pinned root, so every id in
+    /// every consumer is byte-identical to before. Flipping that to `anchored`
+    /// is the migration, and it is deliberately NOT part of this change — this
+    /// test is what says so in a way that fails if someone does it by accident.
+    #[test]
+    fn declared_hex_ids_are_unchanged() {
+        assert_eq!(
+            format!("{:X}", crate::metadata::value_encoding.id()),
+            "213F89E3F49628A105B3830BD3A6612C"
+        );
+        assert_eq!(
+            format!("{:X}", crate::metadata::anchor.id()),
+            "E16A3F51AF63084FFE1079E8A0BA57AB"
+        );
+    }
+
     #[test]
     fn anchored_is_deterministic() {
         let a = Id::from_hex("2ADC6462A7F70E230558C5D681E38768").unwrap();
@@ -279,11 +327,11 @@ mod tests {
     /// `S` itself.
     #[test]
     fn from_fragment_permits_a_lying_schema() {
-        let lying = Attribute::<ShortString>::from(entity! {
+        let lying = Attribute::<ShortString>::from_fragment_unchecked(entity! {
             metadata::value_encoding:
                 <Handle<crate::blob::encodings::longstring::LongString> as MetaDescribe>::id(),
         });
-        let honest = Attribute::<ShortString>::from(entity! {
+        let honest = Attribute::<ShortString>::from_fragment_unchecked(entity! {
             metadata::value_encoding: <ShortString as MetaDescribe>::id(),
         });
         // Same phantom type, different identity: one of them is lying about
@@ -297,11 +345,11 @@ mod tests {
     #[test]
     fn pinned_form_ignores_the_schema() {
         let a = Id::from_hex("2ADC6462A7F70E230558C5D681E38768").unwrap();
-        let short = Attribute::<ShortString>::from(entity! {
+        let short = Attribute::<ShortString>::from_fragment_unchecked(entity! {
             crate::id::ExclusiveId::force_ref(&a) @
                 metadata::value_encoding: <ShortString as MetaDescribe>::id(),
         });
-        let handle = Attribute::<Handle<crate::blob::encodings::longstring::LongString>>::from(
+        let handle = Attribute::<Handle<crate::blob::encodings::longstring::LongString>>::from_fragment_unchecked(
             entity! {
                 crate::id::ExclusiveId::force_ref(&a) @
                     metadata::value_encoding:
@@ -322,11 +370,11 @@ mod tests {
     fn dynamic_field_is_deterministic() {
         let h1 = "title".to_blob().get_handle();
         let h2 = "title".to_blob().get_handle();
-        let a1 = Attribute::<ShortString>::from(entity! {
+        let a1 = Attribute::<ShortString>::from_fragment_unchecked(entity! {
             metadata::name:         h1,
             metadata::value_encoding: <ShortString as MetaDescribe>::id(),
         });
-        let a2 = Attribute::<ShortString>::from(entity! {
+        let a2 = Attribute::<ShortString>::from_fragment_unchecked(entity! {
             metadata::name:         h2,
             metadata::value_encoding: <ShortString as MetaDescribe>::id(),
         });
@@ -339,11 +387,11 @@ mod tests {
     fn dynamic_field_changes_with_name() {
         let h_title = "title".to_blob().get_handle();
         let h_author = "author".to_blob().get_handle();
-        let title = Attribute::<ShortString>::from(entity! {
+        let title = Attribute::<ShortString>::from_fragment_unchecked(entity! {
             metadata::name:         h_title,
             metadata::value_encoding: <ShortString as MetaDescribe>::id(),
         });
-        let author = Attribute::<ShortString>::from(entity! {
+        let author = Attribute::<ShortString>::from_fragment_unchecked(entity! {
             metadata::name:         h_author,
             metadata::value_encoding: <ShortString as MetaDescribe>::id(),
         });
@@ -354,11 +402,11 @@ mod tests {
     #[test]
     fn dynamic_field_changes_with_schema() {
         let h = "title".to_blob().get_handle();
-        let short = Attribute::<ShortString>::from(entity! {
+        let short = Attribute::<ShortString>::from_fragment_unchecked(entity! {
             metadata::name:         h,
             metadata::value_encoding: <ShortString as MetaDescribe>::id(),
         });
-        let handle = Attribute::<Handle<LongString>>::from(entity! {
+        let handle = Attribute::<Handle<LongString>>::from_fragment_unchecked(entity! {
             metadata::name:         h,
             metadata::value_encoding: <Handle<LongString> as MetaDescribe>::id(),
         });
@@ -370,7 +418,7 @@ mod tests {
     fn describe_preserves_identity_iri() {
         let iri = "http://example.org/foo".to_string();
         let iri_handle: Inline<Handle<LongString>> = iri.to_blob().get_handle();
-        let attr = Attribute::<ShortString>::from(entity! {
+        let attr = Attribute::<ShortString>::from_fragment_unchecked(entity! {
             metadata::iri:          iri_handle,
             metadata::value_encoding: <ShortString as crate::metadata::MetaDescribe>::id(),
         });

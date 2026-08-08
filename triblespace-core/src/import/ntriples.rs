@@ -9,7 +9,7 @@
 //! [`entity!`] under [`metadata::iri`](crate::metadata::iri) and
 //! [`metadata::value_encoding`](crate::metadata::value_encoding),
 //! then taking the resulting fragment's root via
-//! [`Attribute::<S>::from`](crate::attribute::Attribute). The inline encoding is chosen from the
+//! [`Attribute::<S>::from_fragment_unchecked`](crate::attribute::Attribute). The inline encoding is chosen from the
 //! object's XSD datatype:
 //!
 //! - `xsd:integer` / `xsd:long` / `xsd:int` / `xsd:short` / `xsd:byte`
