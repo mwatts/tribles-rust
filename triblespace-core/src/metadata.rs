@@ -101,6 +101,16 @@ attributes! {
     "AE94660A55D2EE3C428D2BB299E02EC3" as description: inlineencodings::Handle<LongString>;
     /// Links an attribute or handle to its inline encoding identifier.
     "213F89E3F49628A105B3830BD3A6612C" as value_encoding: inlineencodings::GenId;
+    /// A stable, hand-chosen namespace id that PARTICIPATES in a derived
+    /// attribute identity rather than replacing it.
+    ///
+    /// Pinning an entity (`entity!{ id @ .. }`) makes the id the anchor and the
+    /// facts mere annotations, so the value encoding stays outside identity and a
+    /// re-typed attribute silently keeps addressing rows written under the old
+    /// type. Carrying the anchor as a FIELD instead means identity is derived from
+    /// `(anchor, value_encoding)`: stable under renaming, and changed by a change
+    /// of type.
+    "E16A3F51AF63084FFE1079E8A0BA57AB" as anchor: inlineencodings::GenId;
     /// Links a handle to its blob encoding identifier.
     "43C134652906547383054B1E31E23DF4" as blob_encoding: inlineencodings::GenId;
     /// Links an `Array<T>` schema entity to its element schema's id. Distinct

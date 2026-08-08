@@ -67,6 +67,59 @@ impl<S: InlineEncoding> Clone for Attribute<S> {
     }
 }
 
+impl<S: InlineEncoding + crate::metadata::MetaDescribe> Attribute<S> {
+    /// Pinned-anchor attribute: the id is derived from `(anchor, S)`.
+    ///
+    /// The encoding fact is emitted from `S` rather than passed in, so the
+    /// phantom type and the identity fragment cannot disagree. That is the
+    /// whole reason to prefer this over [`From<Fragment>`], which validates
+    /// only that the fragment is rooted.
+    ///
+    /// Two consequences worth stating, because they are the point:
+    ///
+    /// * the Rust identifier is NOT in the identity, so renaming is free;
+    /// * changing the schema changes the id, so a re-typed attribute cannot
+    ///   silently reinterpret rows written under the old type. It becomes a
+    ///   different attribute, which is the truthful outcome — an in-place
+    ///   re-encoding of a *shared* attribute could only ever produce rows of
+    ///   two meanings under one id, with nothing to tell them apart.
+    ///
+    /// Generic attributes need no macro support: `Attribute::<Handle<Array<T>>>
+    /// ::anchored(ANCHOR)` is an ordinary generic call, so one anchor yields a
+    /// distinct id per element type.
+    pub fn anchored(anchor: Id) -> Self {
+        Self::from(crate::macros::entity! {
+            crate::metadata::anchor:
+                crate::inline::encodings::genid::GenId::inline_from(anchor),
+            crate::metadata::value_encoding: <S as crate::metadata::MetaDescribe>::id(),
+        })
+    }
+
+    /// Display-name origin (JSON fields, config keys, column headers).
+    ///
+    /// Identity is `(name, S)`. Use when the name IS the shared identifier
+    /// parties agree on — not for a local Rust identifier, which belongs in
+    /// usage facts.
+    pub fn named(name: &str) -> Self {
+        use crate::blob::IntoBlob;
+        Self::from(crate::macros::entity! {
+            crate::metadata::name: name.to_string().to_blob().get_handle(),
+            crate::metadata::value_encoding: <S as crate::metadata::MetaDescribe>::id(),
+        })
+    }
+
+    /// RDF / JSON-LD predicate origin, with the IRI as canonical identifier.
+    ///
+    /// Identity is `(iri, S)`.
+    pub fn iri(iri: &str) -> Self {
+        use crate::blob::IntoBlob;
+        Self::from(crate::macros::entity! {
+            crate::metadata::iri: iri.to_string().to_blob().get_handle(),
+            crate::metadata::value_encoding: <S as crate::metadata::MetaDescribe>::id(),
+        })
+    }
+}
+
 impl<S: InlineEncoding> Attribute<S> {
     /// The attribute's id, equal to the wrapped fragment's root.
     pub fn id(&self) -> Id {
@@ -182,6 +235,88 @@ mod tests {
     use crate::inline::Inline;
     use crate::macros::{entity, find, pattern};
     use crate::metadata::{self, Describe, MetaDescribe};
+
+    /// `anchored` is a pure function of `(anchor, S)`.
+    #[test]
+    fn anchored_is_deterministic() {
+        let a = Id::from_hex("2ADC6462A7F70E230558C5D681E38768").unwrap();
+        assert_eq!(
+            Attribute::<ShortString>::anchored(a).raw(),
+            Attribute::<ShortString>::anchored(a).raw()
+        );
+    }
+
+    /// The property the whole design turns on: SAME anchor, DIFFERENT schema,
+    /// different attribute. A re-typed attribute cannot address rows written
+    /// under the old type.
+    #[test]
+    fn anchored_changes_with_schema() {
+        let a = Id::from_hex("2ADC6462A7F70E230558C5D681E38768").unwrap();
+        let short = Attribute::<ShortString>::anchored(a);
+        let handle = Attribute::<Handle<crate::blob::encodings::longstring::LongString>>::anchored(a);
+        assert_ne!(short.raw(), handle.raw());
+    }
+
+    /// Different anchors stay different under one schema — so `weight` and
+    /// `bias`, which share a value type and differ only in meaning, do not
+    /// collide.
+    #[test]
+    fn anchored_changes_with_anchor() {
+        let a = Id::from_hex("2ADC6462A7F70E230558C5D681E38768").unwrap();
+        let b = Id::from_hex("23178058559C762BB4B1FEAA36B3566D").unwrap();
+        assert_ne!(
+            Attribute::<ShortString>::anchored(a).raw(),
+            Attribute::<ShortString>::anchored(b).raw()
+        );
+    }
+
+    /// Why `anchored` exists rather than leaving callers to `From<Fragment>`.
+    ///
+    /// `From` validates only that the fragment is rooted, so a caller may hand
+    /// it facts that contradict the phantom type. Here the Rust type says
+    /// `ShortString` while the stored encoding says otherwise, and it is
+    /// accepted. `anchored` cannot express that, because it emits the fact from
+    /// `S` itself.
+    #[test]
+    fn from_fragment_permits_a_lying_schema() {
+        let lying = Attribute::<ShortString>::from(entity! {
+            metadata::value_encoding:
+                <Handle<crate::blob::encodings::longstring::LongString> as MetaDescribe>::id(),
+        });
+        let honest = Attribute::<ShortString>::from(entity! {
+            metadata::value_encoding: <ShortString as MetaDescribe>::id(),
+        });
+        // Same phantom type, different identity: one of them is lying about
+        // what it stores, and nothing at construction noticed.
+        assert_ne!(lying.raw(), honest.raw());
+    }
+
+    /// The pinned form does NOT carry the schema into identity — which is the
+    /// defect `anchored` exists to avoid, pinned here so it cannot regress
+    /// silently.
+    #[test]
+    fn pinned_form_ignores_the_schema() {
+        let a = Id::from_hex("2ADC6462A7F70E230558C5D681E38768").unwrap();
+        let short = Attribute::<ShortString>::from(entity! {
+            crate::id::ExclusiveId::force_ref(&a) @
+                metadata::value_encoding: <ShortString as MetaDescribe>::id(),
+        });
+        let handle = Attribute::<Handle<crate::blob::encodings::longstring::LongString>>::from(
+            entity! {
+                crate::id::ExclusiveId::force_ref(&a) @
+                    metadata::value_encoding:
+                        <Handle<crate::blob::encodings::longstring::LongString> as MetaDescribe>::id(),
+            },
+        );
+        // Both are just the anchor. A re-typed attribute keeps its id.
+        assert_eq!(short.raw(), handle.raw());
+        assert_eq!(short.id(), a);
+        // Whereas anchored separates them.
+        assert_ne!(
+            Attribute::<ShortString>::anchored(a).raw(),
+            Attribute::<Handle<crate::blob::encodings::longstring::LongString>>::anchored(a).raw()
+        );
+    }
 
     #[test]
     fn dynamic_field_is_deterministic() {
