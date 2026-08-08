@@ -27,14 +27,14 @@ pub mod schema {
     use super::*;
 
     attributes! {
-        "3E062AA7E3554C8F2DB94883CE639BFE" as pub session: GenId;
-        "146E5AA2F7CB3D8B654BC7742A13CAB3" as pub parent: GenId;
-        "CCB0147D20C4C6FCAC0E3D87FAFF71D1" as pub name: Handle<LongString>;
-        "8A4BE2C4D0E90D2B9EE0E1A07ECA2CFA" as pub category: ShortString;
-        "E11A84A30CC112650DC860B66B8BD8A9" as pub begin_ns: U256BE;
-        "2786FA563372FB6EF469EC7710719A49" as pub end_ns: U256BE;
-        "7593602383D0B0D21BBE382A67E5BD9F" as pub duration_ns: U256BE;
-        "7E96DD9A0B5002796B645ED25F5E99AC" as pub source: Handle<LongString>;
+        "3E062AA7E3554C8F2DB94883CE639BFE" unsafe as pub session: GenId;
+        "146E5AA2F7CB3D8B654BC7742A13CAB3" unsafe as pub parent: GenId;
+        "CCB0147D20C4C6FCAC0E3D87FAFF71D1" unsafe as pub name: Handle<LongString>;
+        "8A4BE2C4D0E90D2B9EE0E1A07ECA2CFA" unsafe as pub category: ShortString;
+        "E11A84A30CC112650DC860B66B8BD8A9" unsafe as pub begin_ns: U256BE;
+        "2786FA563372FB6EF469EC7710719A49" unsafe as pub end_ns: U256BE;
+        "7593602383D0B0D21BBE382A67E5BD9F" unsafe as pub duration_ns: U256BE;
+        "7E96DD9A0B5002796B645ED25F5E99AC" unsafe as pub source: Handle<LongString>;
     }
 
     #[allow(non_upper_case_globals)]

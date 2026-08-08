@@ -11,8 +11,8 @@ mod fields {
 
     // Golden-vector fixture IDs minted with `trible genid` on 2026-08-07.
     attributes! {
-        "2751005841B8C6B799E24D12B58B950B" as pub alpha: ShortString;
-        "0177C46AF9CA63B1AB039F73E3A65D2D" as pub beta: ShortString;
+        "2751005841B8C6B799E24D12B58B950B" unsafe as pub alpha: ShortString;
+        "0177C46AF9CA63B1AB039F73E3A65D2D" unsafe as pub beta: ShortString;
     }
 }
 

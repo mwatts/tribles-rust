@@ -33,15 +33,15 @@ use crate::trible::TribleSet;
 attributes! {
     /// Index recipe owning one independent range cover. Minted with
     /// `trible genid` on 2026-07-13.
-    "8DB05C6453156E9F3424A2B4BE924513" as pub index_recipe: crate::inline::encodings::genid::GenId;
+    "8DB05C6453156E9F3424A2B4BE924513" unsafe as pub index_recipe: crate::inline::encodings::genid::GenId;
     /// Inclusive minimal commit frontier of a derived-index range.
     /// Repeated values form an antichain. Minted with `trible genid` on
     /// 2026-07-13.
-    "FC67FFBAD460A96D07EBA341CD4127E7" as pub commit_start: Handle<SimpleArchive>;
+    "FC67FFBAD460A96D07EBA341CD4127E7" unsafe as pub commit_start: Handle<SimpleArchive>;
     /// Inclusive maximal commit frontier of a derived-index range.
     /// Repeated values form an antichain. Minted with `trible genid` on
     /// 2026-07-13.
-    "FAD9B5F3ABA90AC846D08C787A831C7D" as pub commit_end: Handle<SimpleArchive>;
+    "FAD9B5F3ABA90AC846D08C787A831C7D" unsafe as pub commit_end: Handle<SimpleArchive>;
 }
 
 /// Structural errors that do not require access to the commit DAG.

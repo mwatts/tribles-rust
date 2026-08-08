@@ -20,7 +20,7 @@ attributes! {
     /// from an external vocabulary where the entity's identity is a URI —
     /// the same URI always deterministically maps to the same triblespace
     /// Id by round-tripping through an `rdf_uri` fragment.
-    "AA68DE115445A63D62A63FF3284D030C" as pub rdf_uri: Handle<LongString>;
+    "AA68DE115445A63D62A63FF3284D030C" unsafe as pub rdf_uri: Handle<LongString>;
 
     /// BCP-47 language tag for a reified language-tagged literal entity.
     ///
@@ -29,9 +29,9 @@ attributes! {
     /// and `rdf_text` (the lexical form, hashed as a `LongString` blob).
     /// Two literals with the same `(lang, text)` pair derive the same
     /// intrinsic id, giving content-addressed deduplication for free.
-    "904DCA1F8C0BF087B02C0581F69EDF4D" as pub rdf_lang: ShortString;
+    "904DCA1F8C0BF087B02C0581F69EDF4D" unsafe as pub rdf_lang: ShortString;
 
     /// Lexical form of a reified language-tagged literal entity. See
     /// [`rdf_lang`] for the full encoding rationale.
-    "02923632852C6AF8CD0D2596ACC343D2" as pub rdf_text: Handle<LongString>;
+    "02923632852C6AF8CD0D2596ACC343D2" unsafe as pub rdf_text: Handle<LongString>;
 }

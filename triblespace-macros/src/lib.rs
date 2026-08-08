@@ -40,9 +40,9 @@ mod instrumentation_attributes {
 
         attributes! {
             // Instrumentation-specific: link back to the macro invocation entity.
-            "19D4972B2DF977FA64541FC967C4B133" as invocation: ShortString;
+            "19D4972B2DF977FA64541FC967C4B133" unsafe as invocation: ShortString;
             // Instrumentation-specific: the Rust type tokens for this attribute's inline encoding.
-            "D97A427FF782B0BF08B55AC84877B486" as attribute_type: Handle<LongString>;
+            "D97A427FF782B0BF08B55AC84877B486" unsafe as attribute_type: Handle<LongString>;
         }
     }
 
@@ -52,11 +52,11 @@ mod instrumentation_attributes {
         use triblespace_core_macros::attributes;
 
         attributes! {
-            "1CED5213A71C9DD60AD9B3698E5548F4" as macro_kind: ShortString;
-            "E413CB09A4352D7B46B65FC635C18CCC" as manifest_dir: Handle<LongString>;
-            "8ED33DA54C226ADEA0FFF7863563DF5F" as source_range: LineLocation;
-            "B981AEA9437561F8DB96E7EECBB94BFD" as source_tokens: Handle<LongString>;
-            "92EF719DA3DD2405E89B953837E076A5" as crate_name: ShortString;
+            "1CED5213A71C9DD60AD9B3698E5548F4" unsafe as macro_kind: ShortString;
+            "E413CB09A4352D7B46B65FC635C18CCC" unsafe as manifest_dir: Handle<LongString>;
+            "8ED33DA54C226ADEA0FFF7863563DF5F" unsafe as source_range: LineLocation;
+            "B981AEA9437561F8DB96E7EECBB94BFD" unsafe as source_tokens: Handle<LongString>;
+            "92EF719DA3DD2405E89B953837E076A5" unsafe as crate_name: ShortString;
         }
     }
 }
@@ -302,7 +302,7 @@ fn emit_attribute_definitions(context: &mut MetadataContext<'_>) {
 ///
 ///     attributes! {
 ///         /// A person's display name.
-///         "A74AA63539354CDA47F387A4C3A8D54C" as pub name: ShortString;
+///         "A74AA63539354CDA47F387A4C3A8D54C" unsafe as pub name: ShortString;
 ///         pub friend: GenId;
 ///     }
 /// }

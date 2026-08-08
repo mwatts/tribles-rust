@@ -14,7 +14,17 @@ use syn::Type;
 use syn::Visibility;
 
 enum AttributeId {
-    Hex(LitStr),
+    /// `"hex" unsafe as` — the id IS the literal. Asserted, not derived, so the
+    /// value encoding never reaches identity and a re-typed attribute keeps
+    /// addressing rows written under the old type.
+    ///
+    /// The caller carries the obligation that the type has not changed since the
+    /// id was minted, which is why the syntax says `unsafe`.
+    Pinned(LitStr),
+    /// `"hex" as` — identity is derived from `(anchor, value_encoding)`. Stable
+    /// under renaming; a change of type yields a different attribute.
+    Anchored(LitStr),
+    /// bare name — identity is derived from `(name, value_encoding)`.
     Derived,
 }
 
@@ -73,6 +83,14 @@ impl Parse for AttributesInput {
             let attrs = content.call(Attribute::parse_outer)?;
             if content.peek(LitStr) {
                 let id_lit: LitStr = content.parse()?;
+                // `unsafe` sits on `as` rather than leading the entry: it marks
+                // the operation that is actually unchecked — the literal becoming
+                // the id verbatim instead of feeding into one — and it keeps the
+                // block readable as a column of ids.
+                let pinned = content.peek(Token![unsafe]);
+                if pinned {
+                    content.parse::<Token![unsafe]>()?;
+                }
                 content.parse::<Token![as]>()?;
                 let vis: Option<Visibility> = if content.peek(Token![pub]) {
                     Some(content.parse()?)
@@ -86,7 +104,11 @@ impl Parse for AttributesInput {
                 attributes.push(AttributesDef {
                     attrs,
                     vis,
-                    id: AttributeId::Hex(id_lit),
+                    id: if pinned {
+                        AttributeId::Pinned(id_lit)
+                    } else {
+                        AttributeId::Anchored(id_lit)
+                    },
                     name,
                     ty,
                 });
@@ -147,7 +169,9 @@ pub fn attributes_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Re
         // crate as us) so the expansion uses our `base_path` instead
         // of routing through a sibling proc-macro shim.
         let body_fragment = match id {
-            AttributeId::Hex(lit) => quote! {
+            // Unchanged on purpose: this is what keeps every existing id
+            // byte-identical. The fragment is empty, so the id is the literal.
+            AttributeId::Pinned(lit) => quote! {
                 {
                     let __id: #base_path::id::Id = #base_path::id::Id::new(
                         #base_path::id::_hex_literal_hex!(#lit)
@@ -159,6 +183,22 @@ pub fn attributes_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Re
                     )
                 }
             },
+            // The anchor participates in identity instead of replacing it, which
+            // is the only difference from `Pinned` and the whole point.
+            AttributeId::Anchored(lit) => {
+                let entity_input = quote! {
+                    #base_path::metadata::anchor: {
+                        let __id: #base_path::id::Id = #base_path::id::Id::new(
+                            #base_path::id::_hex_literal_hex!(#lit)
+                        )
+                        .expect("attributes!{} hex id must be non-nil");
+                        <#base_path::inline::encodings::genid::GenId
+                            as #base_path::inline::InlineEncoding>::inline_from(__id)
+                    },
+                    #base_path::metadata::value_encoding: <#ty as #base_path::metadata::MetaDescribe>::id(),
+                };
+                crate::entity_impl(entity_input, base_path)?
+            }
             AttributeId::Derived => {
                 let entity_input = quote! {
                     #base_path::metadata::name:         #name_lit.to_blob().get_handle(),
@@ -284,6 +324,6 @@ pub fn attributes_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Re
 
 impl From<LitStr> for AttributeId {
     fn from(lit: LitStr) -> Self {
-        AttributeId::Hex(lit)
+        AttributeId::Pinned(lit)
     }
 }

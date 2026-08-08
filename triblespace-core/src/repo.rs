@@ -36,9 +36,9 @@
 //! let mut ws = repo.pull(*branch_id).expect("pull branch");
 //!
 //! attributes! {
-//!     "8F180883F9FD5F787E9E0AF0DF5866B9" as pub author: GenId;
-//!     "0DBB530B37B966D137C50B943700EDB2" as pub firstname: ShortString;
-//!     "6BAA463FD4EAF45F6A103DB9433E4545" as pub lastname: ShortString;
+//!     "8F180883F9FD5F787E9E0AF0DF5866B9" unsafe as pub author: GenId;
+//!     "0DBB530B37B966D137C50B943700EDB2" unsafe as pub firstname: ShortString;
+//!     "6BAA463FD4EAF45F6A103DB9433E4545" unsafe as pub lastname: ShortString;
 //! }
 //! let author = fucid();
 //! ws.commit(
@@ -222,25 +222,25 @@ use crate::prelude::*;
 
 attributes! {
     /// The actual data of the commit.
-    "4DD4DDD05CC31734B03ABB4E43188B1F" as pub content: Handle<SimpleArchive>;
+    "4DD4DDD05CC31734B03ABB4E43188B1F" unsafe as pub content: Handle<SimpleArchive>;
     /// Metadata describing the commit content.
-    "88B59BD497540AC5AECDB7518E737C87" as pub metadata: Handle<SimpleArchive>;
+    "88B59BD497540AC5AECDB7518E737C87" unsafe as pub metadata: Handle<SimpleArchive>;
     /// A commit that this commit is based on.
-    "317044B612C690000D798CA660ECFD2A" as pub parent: Handle<SimpleArchive>;
+    "317044B612C690000D798CA660ECFD2A" unsafe as pub parent: Handle<SimpleArchive>;
     /// A (potentially long) message describing the commit.
-    "B59D147839100B6ED4B165DF76EDF3BB" as pub message: Handle<LongString>;
+    "B59D147839100B6ED4B165DF76EDF3BB" unsafe as pub message: Handle<LongString>;
     /// A short message describing the commit.
-    "12290C0BE0E9207E324F24DDE0D89300" as pub short_message: ShortString;
+    "12290C0BE0E9207E324F24DDE0D89300" unsafe as pub short_message: ShortString;
     /// The hash of the first commit in the commit chain of the branch.
-    "272FBC56108F336C4D2E17289468C35F" as pub head: Handle<SimpleArchive>;
+    "272FBC56108F336C4D2E17289468C35F" unsafe as pub head: Handle<SimpleArchive>;
     /// An id used to track the branch.
-    "8694CC73AF96A5E1C7635C677D1B928A" as pub branch: GenId;
+    "8694CC73AF96A5E1C7635C677D1B928A" unsafe as pub branch: GenId;
     /// The author of the signature identified by their ed25519 public key.
-    "ADB4FFAD247C886848161297EFF5A05B" as pub signed_by: ed::ED25519PublicKey;
+    "ADB4FFAD247C886848161297EFF5A05B" unsafe as pub signed_by: ed::ED25519PublicKey;
     /// The `r` part of a ed25519 signature.
-    "9DF34F84959928F93A3C40AEB6E9E499" as pub signature_r: ed::ED25519RComponent;
+    "9DF34F84959928F93A3C40AEB6E9E499" unsafe as pub signature_r: ed::ED25519RComponent;
     /// The `s` part of a ed25519 signature.
-    "1ACE03BF70242B289FDF00E4327C3BC6" as pub signature_s: ed::ED25519SComponent;
+    "1ACE03BF70242B289FDF00E4327C3BC6" unsafe as pub signature_s: ed::ED25519SComponent;
 }
 
 /// Rebuild branch-head metadata against a new commit head, carrying every

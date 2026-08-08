@@ -549,18 +549,18 @@ mod r1_schema {
 
     attributes! {
         // metronome / ring edge
-        "277A42231FD9D42DD50D789D8F9E8661" as mp: inlineencodings::GenId;
+        "277A42231FD9D42DD50D789D8F9E8661" unsafe as mp: inlineencodings::GenId;
         // multi-source marker (K>1 eager-cohort control)
-        "0F64BC179033DB2703C65E7DBBAA9AD3" as msrc: inlineencodings::GenId;
+        "0F64BC179033DB2703C65E7DBBAA9AD3" unsafe as msrc: inlineencodings::GenId;
         // oasis: type marker, p edge, q edge
-        "A0C25A0F02E2D5232269F274761B2AB1" as otype: inlineencodings::GenId;
-        "831EA731FB6C91252CDDC4FC399DC975" as op: inlineencodings::GenId;
-        "2B3A5EF282FED1F652A2C182E116C28C" as oq: inlineencodings::GenId;
+        "A0C25A0F02E2D5232269F274761B2AB1" unsafe as otype: inlineencodings::GenId;
+        "831EA731FB6C91252CDDC4FC399DC975" unsafe as op: inlineencodings::GenId;
+        "2B3A5EF282FED1F652A2C182E116C28C" unsafe as oq: inlineencodings::GenId;
         // thin k-hop functional chain edge
-        "EE09E63B176F818960267C5041CA6C92" as khop: inlineencodings::GenId;
+        "EE09E63B176F818960267C5041CA6C92" unsafe as khop: inlineencodings::GenId;
         // diamond (reconvergence-capture) route attributes
-        "E73DC5D12C49394D3C6D883A152E57C9" as da: inlineencodings::GenId;
-        "C41A8C9EC883E09D34C86F87C15EA965" as db: inlineencodings::GenId;
+        "E73DC5D12C49394D3C6D883A152E57C9" unsafe as da: inlineencodings::GenId;
+        "C41A8C9EC883E09D34C86F87C15EA965" unsafe as db: inlineencodings::GenId;
     }
 }
 

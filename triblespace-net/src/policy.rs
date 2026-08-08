@@ -51,35 +51,35 @@ attributes! {
     /// Tags a pin as local-only (skip in gossip publish, skip in
     /// content-branch-name lookups). Value is one of the `KIND_*` tags
     /// below indicating the role.
-    "3361F2DE0BD68BA8712EC5B9CCC7EF2A" as pub local_only_pin: GenId;
+    "3361F2DE0BD68BA8712EC5B9CCC7EF2A" unsafe as pub local_only_pin: GenId;
 
     // ── Per-team-cap pin ──────────────────────────────────────────────
     /// Names the team this pin holds cap state for. Set on the pin
     /// head metadata entity alongside `local_only_pin =
     /// KIND_TEAM_CAP`.
-    "E1EE471B597A4142AD26CA1FED368D2F" as pub cap_for_team: ED25519PublicKey;
+    "E1EE471B597A4142AD26CA1FED368D2F" unsafe as pub cap_for_team: ED25519PublicKey;
 
     // ── Renewal policy entry ──────────────────────────────────────────
     /// The pubkey this entry is willing to auto-renew (the subject of
     /// caps we'll keep issuing).
-    "384D8A994AF026BBD1329CAD7041E3B8" as pub policy_subject: ED25519PublicKey;
+    "384D8A994AF026BBD1329CAD7041E3B8" unsafe as pub policy_subject: ED25519PublicKey;
     /// The scope-root id the renewal covers. Multiple entries with the
     /// same `policy_subject` but different `policy_scope` model
     /// per-scope approval/retraction independently (A can retract B's
     /// WRITE without touching B's READ).
-    "D67D3CB1562B27504892BF0ACB55EA8B" as pub policy_scope: GenId;
+    "D67D3CB1562B27504892BF0ACB55EA8B" unsafe as pub policy_scope: GenId;
     /// Interval covered by the most recently signed cap. The
     /// daemon's "near expiry?" check compares `now + renewal_window`
     /// against the upper bound of this interval.
-    "AEF94EAB060C3D78AE373715885897C0" as pub policy_issued_at: NsTAIInterval;
+    "AEF94EAB060C3D78AE373715885897C0" unsafe as pub policy_issued_at: NsTAIInterval;
     /// Handle of the most recent cap blob A signed for this entry.
-    "BF6B9C894E3CA2AB5FBCC12B925C9680" as pub policy_latest_cap: Handle<SimpleArchive>;
+    "BF6B9C894E3CA2AB5FBCC12B925C9680" unsafe as pub policy_latest_cap: Handle<SimpleArchive>;
     /// Handle of the most recent sig blob accompanying the cap above.
-    "5A72B59BF016C7024385B6976BD8AD0E" as pub policy_latest_sig: Handle<SimpleArchive>;
+    "5A72B59BF016C7024385B6976BD8AD0E" unsafe as pub policy_latest_sig: Handle<SimpleArchive>;
     /// Set when A has chosen to stop auto-renewing this entry. The
     /// daemon skips entries with this attribute; the corresponding
     /// peer's chain dies naturally at the current cap's expiry.
-    "57C45D022B79C4D3A021AC0114D973EE" as pub policy_retracted_at: NsTAIInterval;
+    "57C45D022B79C4D3A021AC0114D973EE" unsafe as pub policy_retracted_at: NsTAIInterval;
     /// Set when the most recently dispatched `OP_DELIVER_CAP` to the
     /// subject returned a STATUS_OK ack — i.e. the subject's daemon
     /// confirmed receipt of `policy_latest_cap` / `policy_latest_sig`.
@@ -91,26 +91,26 @@ attributes! {
     /// "still pending delivery" and re-dispatches them (rate-limited
     /// via an in-memory per-entry cooldown so a peer that's
     /// persistently unreachable doesn't get hammered).
-    "2E289E766CFD4F2554D430C31337BE2B" as pub policy_delivered_at: NsTAIInterval;
+    "2E289E766CFD4F2554D430C31337BE2B" unsafe as pub policy_delivered_at: NsTAIInterval;
 
     // ── Pending request entry ─────────────────────────────────────────
     /// The pubkey that sent the join request. Matches the iroh
     /// connection's `remote_id` at the time of receipt.
-    "3583BC29C2155717639FA7E9314CC8B9" as pub request_requester: ED25519PublicKey;
+    "3583BC29C2155717639FA7E9314CC8B9" unsafe as pub request_requester: ED25519PublicKey;
     /// Handle of the partial cap blob the requester sent.
-    "42903FA16A2913144A48072F575BB304" as pub request_partial_cap: Handle<SimpleArchive>;
+    "42903FA16A2913144A48072F575BB304" unsafe as pub request_partial_cap: Handle<SimpleArchive>;
     /// Wall-clock instant the request arrived (point interval).
-    "8CC3155E937E416C8CFDC11630E9789E" as pub request_received_at: NsTAIInterval;
+    "8CC3155E937E416C8CFDC11630E9789E" unsafe as pub request_received_at: NsTAIInterval;
     /// Current resolution status (one of the `STATUS_*` tags).
-    "4D72D56FF30DA693679F08D629DA7574" as pub request_status: GenId;
+    "4D72D56FF30DA693679F08D629DA7574" unsafe as pub request_status: GenId;
 
     // ── Per-team-cap pin ──────────────────────────────────────────────
     /// Handle of the currently-pinned cap blob for a team. Overwritten
     /// on each renewal so old caps become unreachable.
-    "A2BBD772754BBB8EAFD7479F5A1249FD" as pub team_cap_handle: Handle<SimpleArchive>;
+    "A2BBD772754BBB8EAFD7479F5A1249FD" unsafe as pub team_cap_handle: Handle<SimpleArchive>;
     /// Handle of the currently-pinned sig blob for a team. Updated in
     /// lockstep with `team_cap_handle`.
-    "FAC14D0CAB23B1C7AC20D8CF1C843EBF" as pub team_sig_handle: Handle<SimpleArchive>;
+    "FAC14D0CAB23B1C7AC20D8CF1C843EBF" unsafe as pub team_sig_handle: Handle<SimpleArchive>;
 }
 
 // ── Pin role kind tags ────────────────────────────────────────────────

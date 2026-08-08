@@ -9,7 +9,7 @@ pub mod testmod {
     attributes! {
         /// First doc line
         /// Second doc line
-        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" as follows: inlineencodings::GenId;
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" unsafe as follows: inlineencodings::GenId;
     }
 }
 

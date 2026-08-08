@@ -100,18 +100,18 @@ mod r1_schema {
 
     attributes! {
         // metronome / ring edge
-        "277A42231FD9D42DD50D789D8F9E8661" as mp: inlineencodings::GenId;
+        "277A42231FD9D42DD50D789D8F9E8661" unsafe as mp: inlineencodings::GenId;
         // multi-source marker (K>1 eager-cohort control)
-        "0F64BC179033DB2703C65E7DBBAA9AD3" as msrc: inlineencodings::GenId;
+        "0F64BC179033DB2703C65E7DBBAA9AD3" unsafe as msrc: inlineencodings::GenId;
         // oasis: type marker, p edge, q edge
-        "A0C25A0F02E2D5232269F274761B2AB1" as otype: inlineencodings::GenId;
-        "831EA731FB6C91252CDDC4FC399DC975" as op: inlineencodings::GenId;
-        "2B3A5EF282FED1F652A2C182E116C28C" as oq: inlineencodings::GenId;
+        "A0C25A0F02E2D5232269F274761B2AB1" unsafe as otype: inlineencodings::GenId;
+        "831EA731FB6C91252CDDC4FC399DC975" unsafe as op: inlineencodings::GenId;
+        "2B3A5EF282FED1F652A2C182E116C28C" unsafe as oq: inlineencodings::GenId;
         // thin k-hop functional chain edge
-        "EE09E63B176F818960267C5041CA6C92" as khop: inlineencodings::GenId;
+        "EE09E63B176F818960267C5041CA6C92" unsafe as khop: inlineencodings::GenId;
         // diamond (reconvergence-capture) route attributes
-        "E73DC5D12C49394D3C6D883A152E57C9" as da: inlineencodings::GenId;
-        "C41A8C9EC883E09D34C86F87C15EA965" as db: inlineencodings::GenId;
+        "E73DC5D12C49394D3C6D883A152E57C9" unsafe as da: inlineencodings::GenId;
+        "C41A8C9EC883E09D34C86F87C15EA965" unsafe as db: inlineencodings::GenId;
     }
 }
 
@@ -585,43 +585,43 @@ mod r2_schema {
 
     attributes! {
         // F6 — the eight `or!` arm attributes (k = F6_ARMS).
-        "84AAEA2CDB0F31C9926D5BA55DCB646B" as u0: inlineencodings::GenId;
-        "A784BFAFA148EFF689FA757C2A95EA2C" as u1: inlineencodings::GenId;
-        "2AAB1B3A425B16D9680BF525CB0A9496" as u2: inlineencodings::GenId;
-        "1A6306A5E7A469266D3F6BC3B4F0F830" as u3: inlineencodings::GenId;
-        "5478E2F71D3C8FA4FCFD72D653C2F050" as u4: inlineencodings::GenId;
-        "595533D46DA73D4D9EDAE23C69DA8B28" as u5: inlineencodings::GenId;
-        "BBB163B3E6F55B2040940AD229F012D7" as u6: inlineencodings::GenId;
-        "B358920E7B50BC2334BDBA2B9EE95D44" as u7: inlineencodings::GenId;
+        "84AAEA2CDB0F31C9926D5BA55DCB646B" unsafe as u0: inlineencodings::GenId;
+        "A784BFAFA148EFF689FA757C2A95EA2C" unsafe as u1: inlineencodings::GenId;
+        "2AAB1B3A425B16D9680BF525CB0A9496" unsafe as u2: inlineencodings::GenId;
+        "1A6306A5E7A469266D3F6BC3B4F0F830" unsafe as u3: inlineencodings::GenId;
+        "5478E2F71D3C8FA4FCFD72D653C2F050" unsafe as u4: inlineencodings::GenId;
+        "595533D46DA73D4D9EDAE23C69DA8B28" unsafe as u5: inlineencodings::GenId;
+        "BBB163B3E6F55B2040940AD229F012D7" unsafe as u6: inlineencodings::GenId;
+        "B358920E7B50BC2334BDBA2B9EE95D44" unsafe as u7: inlineencodings::GenId;
         // F7 — hub skew: in-edge (source -> node) and out-edge (node -> target).
-        "0E64D47BDE5A9CCE0F41C6384BC7935F" as hs: inlineencodings::GenId;
-        "D88DE6AC745F82E035551D9D2625F976" as ht: inlineencodings::GenId;
+        "0E64D47BDE5A9CCE0F41C6384BC7935F" unsafe as hs: inlineencodings::GenId;
+        "D88DE6AC745F82E035551D9D2625F976" unsafe as ht: inlineencodings::GenId;
         // F8 — witness multiplicity: the two hidden-variable fans.
-        "52A53A202DFC13F7074E0A697ABAB30C" as wa: inlineencodings::GenId;
-        "236FC28BA8AA72FDE8E5723B403A0BD2" as wb: inlineencodings::GenId;
+        "52A53A202DFC13F7074E0A697ABAB30C" unsafe as wa: inlineencodings::GenId;
+        "236FC28BA8AA72FDE8E5723B403A0BD2" unsafe as wb: inlineencodings::GenId;
         // F9 — mask density: proposer side and confirmer side.
-        "8DC793B45ADE8B81ADE789E8313BF974" as ma: inlineencodings::GenId;
-        "B0E12EFD7CF941497603F09DEDF89760" as mb: inlineencodings::GenId;
+        "8DC793B45ADE8B81ADE789E8313BF974" unsafe as ma: inlineencodings::GenId;
+        "B0E12EFD7CF941497603F09DEDF89760" unsafe as mb: inlineencodings::GenId;
         // F10 — GPU confirm-batch threshold: proposer side and confirmer side.
-        "3573F33EBA6E94CBAFFD27FFBAA4A0F8" as ga: inlineencodings::GenId;
-        "3E9767FEE8A1EE68C58F0419817D5140" as gb: inlineencodings::GenId;
+        "3573F33EBA6E94CBAFFD27FFBAA4A0F8" unsafe as ga: inlineencodings::GenId;
+        "3E9767FEE8A1EE68C58F0419817D5140" unsafe as gb: inlineencodings::GenId;
         // F11 — lying estimates: the small source and the large source.
-        "7503DE9B6CA70780D9096223E4DD1A08" as la: inlineencodings::GenId;
-        "EE3CC3EBE8F1E540DBC396C985E282F2" as lb: inlineencodings::GenId;
+        "7503DE9B6CA70780D9096223E4DD1A08" unsafe as la: inlineencodings::GenId;
+        "EE3CC3EBE8F1E540DBC396C985E282F2" unsafe as lb: inlineencodings::GenId;
         // F12 — deep chain: the single functional hop edge.
-        "7A7F3D3A4EBFB4FC617D063261FB592C" as hop: inlineencodings::GenId;
+        "7A7F3D3A4EBFB4FC617D063261FB592C" unsafe as hop: inlineencodings::GenId;
         // F13 — constant pressure: five string-valued slots per entity.
-        "FCE112E22C1592CC487EF5320D9E25D7" as c0: inlineencodings::ShortString;
-        "B57751A976F6908E53938CF80A615DCC" as c1: inlineencodings::ShortString;
-        "8C72F6255184F8FA9BDBD15574F540A8" as c2: inlineencodings::ShortString;
-        "ED5816955F19EFA0C6BBA2C2F7BA77ED" as c3: inlineencodings::ShortString;
-        "61C46CDF6E77A00A3B566C5157F57EFB" as c4: inlineencodings::ShortString;
+        "FCE112E22C1592CC487EF5320D9E25D7" unsafe as c0: inlineencodings::ShortString;
+        "B57751A976F6908E53938CF80A615DCC" unsafe as c1: inlineencodings::ShortString;
+        "8C72F6255184F8FA9BDBD15574F540A8" unsafe as c2: inlineencodings::ShortString;
+        "ED5816955F19EFA0C6BBA2C2F7BA77ED" unsafe as c3: inlineencodings::ShortString;
+        "61C46CDF6E77A00A3B566C5157F57EFB" unsafe as c4: inlineencodings::ShortString;
         // F14 — widening ramp: the wide root and the selective confirmer.
-        "6389E8FE7CA25BE81A2BAFEF79C8EDBC" as w1: inlineencodings::GenId;
-        "ED3F65982ED22D4008A510A19D4798A8" as w2: inlineencodings::GenId;
+        "6389E8FE7CA25BE81A2BAFEF79C8EDBC" unsafe as w1: inlineencodings::GenId;
+        "ED3F65982ED22D4008A510A19D4798A8" unsafe as w2: inlineencodings::GenId;
         // F15 — union dedup pressure: the two overlapping arms.
-        "32697C0766C902A3A6BEA17656631E5F" as ua: inlineencodings::GenId;
-        "CBF362B65F450B457B32C05C5198868F" as ub: inlineencodings::GenId;
+        "32697C0766C902A3A6BEA17656631E5F" unsafe as ua: inlineencodings::GenId;
+        "CBF362B65F450B457B32C05C5198868F" unsafe as ub: inlineencodings::GenId;
     }
 }
 

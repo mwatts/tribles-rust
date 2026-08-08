@@ -117,7 +117,7 @@ mod tests {
     use crate::prelude::*;
 
     attributes! {
-        "BB00000000000000BB00000000000000" as range_test_score: R256BE;
+        "BB00000000000000BB00000000000000" unsafe as range_test_score: R256BE;
     }
 
     #[test]

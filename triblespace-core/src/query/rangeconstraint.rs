@@ -97,7 +97,7 @@ mod tests {
     use crate::prelude::*;
 
     attributes! {
-        "AA00000000000000AA00000000000000" as test_score: R256;
+        "AA00000000000000AA00000000000000" unsafe as test_score: R256;
     }
 
     #[test]

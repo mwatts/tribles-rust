@@ -98,9 +98,9 @@ attributes! {
     /// This attribute is general-purpose: it can describe any entity. Schema
     /// metadata uses it for documenting value/blob encodings, but it is equally
     /// valid for domain entities.
-    "AE94660A55D2EE3C428D2BB299E02EC3" as description: inlineencodings::Handle<LongString>;
+    "AE94660A55D2EE3C428D2BB299E02EC3" unsafe as description: inlineencodings::Handle<LongString>;
     /// Links an attribute or handle to its inline encoding identifier.
-    "213F89E3F49628A105B3830BD3A6612C" as value_encoding: inlineencodings::GenId;
+    "213F89E3F49628A105B3830BD3A6612C" unsafe as value_encoding: inlineencodings::GenId;
     /// A stable, hand-chosen namespace id that PARTICIPATES in a derived
     /// attribute identity rather than replacing it.
     ///
@@ -110,20 +110,20 @@ attributes! {
     /// type. Carrying the anchor as a FIELD instead means identity is derived from
     /// `(anchor, value_encoding)`: stable under renaming, and changed by a change
     /// of type.
-    "E16A3F51AF63084FFE1079E8A0BA57AB" as anchor: inlineencodings::GenId;
+    "E16A3F51AF63084FFE1079E8A0BA57AB" unsafe as anchor: inlineencodings::GenId;
     /// Links a handle to its blob encoding identifier.
-    "43C134652906547383054B1E31E23DF4" as blob_encoding: inlineencodings::GenId;
+    "43C134652906547383054B1E31E23DF4" unsafe as blob_encoding: inlineencodings::GenId;
     /// Links an `Array<T>` schema entity to its element schema's id. Distinct
     /// from `blob_encoding` because element schemas are not themselves
     /// `BlobEncoding`s — they only carry an `ArrayElement::Native` byte-layout.
-    "56C43BEE48BE99521886D99BE9026A3B" as array_item_schema: inlineencodings::GenId;
+    "56C43BEE48BE99521886D99BE9026A3B" unsafe as array_item_schema: inlineencodings::GenId;
     /// Links a handle to the hash algorithm used for content addressing.
-    "51C08CFABB2C848CE0B4A799F0EFE5EA" as hash_schema: inlineencodings::GenId;
+    "51C08CFABB2C848CE0B4A799F0EFE5EA" unsafe as hash_schema: inlineencodings::GenId;
     /// Optional WebAssembly module for formatting values governed by this schema.
     ///
     /// The value is a `Handle<WasmCode>` that points to a sandboxed
     /// formatter module (see `triblespace_core::value_formatter`).
-    "1A3D520FEDA9E1A4051EBE96E43ABAC7" as value_formatter: inlineencodings::Handle<WasmCode>;
+    "1A3D520FEDA9E1A4051EBE96E43ABAC7" unsafe as value_formatter: inlineencodings::Handle<WasmCode>;
     /// Long-form display name stored as a LongString handle.
     ///
     /// Names are *display*-oriented and contextual: multiple usages of the
@@ -137,7 +137,7 @@ attributes! {
     /// [`iri`](`self::iri`) instead. The id-derivation paths for dynamic
     /// attributes hash from those identity-determining attributes, not
     /// from `name`.
-    "7FB28C0B48E1924687857310EE230414" as name: inlineencodings::Handle<LongString>;
+    "7FB28C0B48E1924687857310EE230414" unsafe as name: inlineencodings::Handle<LongString>;
     /// Internationalized Resource Identifier (IRI) for this entity.
     ///
     /// The canonical identity-determining string for RDF predicate URIs and
@@ -153,28 +153,28 @@ attributes! {
     /// it at the application boundary; the storage layer doesn't enforce
     /// it, so mistyped or placeholder IRIs ingest without rejection and
     /// queries can unify across "any string this entity has."
-    "325F05DB88184B4540AAEEFAE1E9667F" as iri: inlineencodings::Handle<LongString>;
+    "325F05DB88184B4540AAEEFAE1E9667F" unsafe as iri: inlineencodings::Handle<LongString>;
     /// Link a usage annotation entity to the attribute it describes.
-    "F10DE6D8E60E0E86013F1B867173A85C" as attribute: inlineencodings::GenId;
+    "F10DE6D8E60E0E86013F1B867173A85C" unsafe as attribute: inlineencodings::GenId;
     /// Optional provenance string for a usage annotation.
-    "A56350FD00EC220B4567FE15A5CD68B8" as source: inlineencodings::Handle<LongString>;
+    "A56350FD00EC220B4567FE15A5CD68B8" unsafe as source: inlineencodings::Handle<LongString>;
     /// Optional module path for the usage annotation (from `module_path!()`).
-    "BCB94C7439215641A3E9760CE3F4F432" as source_module: inlineencodings::Handle<LongString>;
+    "BCB94C7439215641A3E9760CE3F4F432" unsafe as source_module: inlineencodings::Handle<LongString>;
     /// Preferred JSON representation (e.g. string, number, bool, object, ref, blob).
     /// Preferred JSON representation hint (e.g. `"string"`, `"number"`, `"bool"`, `"object"`).
-    "A7AFC8C0FAD017CE7EC19587AF682CFF" as json_kind: inlineencodings::ShortString;
+    "A7AFC8C0FAD017CE7EC19587AF682CFF" unsafe as json_kind: inlineencodings::ShortString;
     /// Generic tag edge: link any entity to a tag entity (by Id). Reusable across domains.
-    "91C50E9FBB1F73E892EBD5FFDE46C251" as tag: inlineencodings::GenId;
+    "91C50E9FBB1F73E892EBD5FFDE46C251" unsafe as tag: inlineencodings::GenId;
     /// When an entity was created.
-    "9B1E79DFD065F643954141593CD8B9E0" as created_at: inlineencodings::NsTAIInterval;
+    "9B1E79DFD065F643954141593CD8B9E0" unsafe as created_at: inlineencodings::NsTAIInterval;
     /// When an entity was last updated.
-    "93B7372E3443063392CD801B03A8D390" as updated_at: inlineencodings::NsTAIInterval;
+    "93B7372E3443063392CD801B03A8D390" unsafe as updated_at: inlineencodings::NsTAIInterval;
     /// When a process or interval started.
-    "06973030ACA83A7B2B4FC8BEBB31F77A" as started_at: inlineencodings::NsTAIInterval;
+    "06973030ACA83A7B2B4FC8BEBB31F77A" unsafe as started_at: inlineencodings::NsTAIInterval;
     /// When a process or interval finished.
-    "9B06AA4060EF9928A923FC7E6A6B6438" as finished_at: inlineencodings::NsTAIInterval;
+    "9B06AA4060EF9928A923FC7E6A6B6438" unsafe as finished_at: inlineencodings::NsTAIInterval;
     /// When an entity expires or becomes invalid.
-    "89FEC3B560336BA88B10759DECD3155F" as expires_at: inlineencodings::NsTAIInterval;
+    "89FEC3B560336BA88B10759DECD3155F" unsafe as expires_at: inlineencodings::NsTAIInterval;
     /// A version that this entity supersedes (predecessor edge, repeated).
     ///
     /// Canonical versioning edge for snapshot histories: an entity's current
@@ -184,5 +184,5 @@ attributes! {
     /// supersedes DAG rather than a mutable pointer. General-purpose across
     /// domains (wiki fragments, compass reviews, relations groups, memory
     /// chunks); a merge that reconciles two heads may supersede both.
-    "EA5308C6296520A185DE4E5019F779FB" as supersedes: inlineencodings::GenId;
+    "EA5308C6296520A185DE4E5019F779FB" unsafe as supersedes: inlineencodings::GenId;
 }

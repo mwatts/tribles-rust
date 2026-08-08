@@ -19,7 +19,7 @@ use triblespace_core::repo::{BlobStore, BlobStoreGet};
 mod ns {
     use triblespace_core::prelude::*;
     attributes! {
-        "DD00000000000000DD00000000000020" as pub note: inlineencodings::Handle<blobencodings::LongString>;
+        "DD00000000000000DD00000000000020" unsafe as pub note: inlineencodings::Handle<blobencodings::LongString>;
     }
 }
 

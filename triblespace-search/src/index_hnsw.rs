@@ -396,8 +396,8 @@ mod tests {
     use crate::schemas::put_embedding;
 
     attributes! {
-        "BCDCA79081A84E7428A2D06A7F222313" as emb: EmbHandle;
-        "8F0323D08F73BC597E701C99BBE2CA20" as alternate_emb: EmbHandle;
+        "BCDCA79081A84E7428A2D06A7F222313" unsafe as emb: EmbHandle;
+        "8F0323D08F73BC597E701C99BBE2CA20" unsafe as alternate_emb: EmbHandle;
     }
 
     fn commit(byte: u8) -> triblespace_core::repo::CommitHandle {

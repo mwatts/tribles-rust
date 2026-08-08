@@ -40,7 +40,7 @@ mod search_attrs {
     use super::*;
 
     attributes! {
-        "03712511F65DCC9B1C45FE04184F1B44" as pub book_embedding: Handle<Embedding>;
+        "03712511F65DCC9B1C45FE04184F1B44" unsafe as pub book_embedding: Handle<Embedding>;
     }
 }
 

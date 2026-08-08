@@ -34,14 +34,14 @@ use crate::protocol::RawHash;
 
 // Minted attribute IDs for tracking pins.
 attributes! {
-    "FD45B98C108B3F9F2D18C0B5373BC9FB" as pub remote_name: Handle<LongString>;
-    "ACEBAE99F0B5B1E12DAE3FDC1E2BC575" as pub tracking_remote_pin: GenId;
-    "C52A223988BB237B0859319661DA23F5" as pub tracking_peer: ED25519PublicKey;
+    "FD45B98C108B3F9F2D18C0B5373BC9FB" unsafe as pub remote_name: Handle<LongString>;
+    "ACEBAE99F0B5B1E12DAE3FDC1E2BC575" unsafe as pub tracking_remote_pin: GenId;
+    "C52A223988BB237B0859319661DA23F5" unsafe as pub tracking_peer: ED25519PublicKey;
     // Presence marks a *weak* (lazy/evictable) tracking pin: its history
     // is synced but content blobs are fetched on demand and may be
     // evicted under budget, rather than eagerly replicated via
     // `fetch_reachable`. Valued by the pin's own id (a pure marker).
-    "CCD0C9D01CD09EFAC0BA04A804E6D7A0" as pub weak_tracking: GenId;
+    "CCD0C9D01CD09EFAC0BA04A804E6D7A0" unsafe as pub weak_tracking: GenId;
 }
 
 /// Returns true if the given pin is a tracking pin (has the

@@ -64,40 +64,40 @@ pub const COLLECTION_DERIVE_ARCHIVE_LEN: u64 = (5 * TRIBLE_LEN) as u64;
 attributes! {
     /// Stable extrinsic dataset scope shared by related representations.
     /// Minted with `trible genid` on 2026-08-07.
-    "D3418873C70392E3ADAA05C00E11A583" as pub collection_scope: GenId;
+    "D3418873C70392E3ADAA05C00E11A583" unsafe as pub collection_scope: GenId;
     /// Blob representation carried by the elements of this collection.
     /// Minted with `trible genid` on 2026-08-07.
-    "620FA4F2B456357DCD1882E583B85CC3" as pub collection_representation: GenId;
+    "620FA4F2B456357DCD1882E583B85CC3" unsafe as pub collection_representation: GenId;
     /// Canonical recipe governing construction and merge for this collection.
     /// Minted with `trible genid` on 2026-08-07.
-    "5D338C58D897B969BE1AE0956CCFE301" as pub collection_recipe: GenId;
+    "5D338C58D897B969BE1AE0956CCFE301" unsafe as pub collection_recipe: GenId;
     /// Concrete collection participating in a `COMMIT` or `MERGE` record.
     /// Minted with `trible genid` on 2026-08-07.
-    "F3FFD6EB309C2E4B5FFE9C0A9CEC974B" as pub collection: GenId;
+    "F3FFD6EB309C2E4B5FFE9C0A9CEC974B" unsafe as pub collection: GenId;
     /// Content hash asserted as a collection member by a signed `COMMIT`.
     /// Minted with `trible genid` on 2026-08-07.
-    "38DACE0F58C43D05CBCE06F7AB12C023" as pub data: Hash<Blake3>;
+    "38DACE0F58C43D05CBCE06F7AB12C023" unsafe as pub data: Hash<Blake3>;
     /// Canonically lower input of a commutative `MERGE`.
     /// Minted with `trible genid` on 2026-08-07.
-    "9FCB0E212B790CD13789ECE7319F7C59" as pub merge_low: Hash<Blake3>;
+    "9FCB0E212B790CD13789ECE7319F7C59" unsafe as pub merge_low: Hash<Blake3>;
     /// Canonically higher input of a commutative `MERGE`.
     /// Minted with `trible genid` on 2026-08-07.
-    "2DD133FBB7084D04920D488B34823295" as pub merge_high: Hash<Blake3>;
+    "2DD133FBB7084D04920D488B34823295" unsafe as pub merge_high: Hash<Blake3>;
     /// Exact result of a commutative `MERGE`.
     /// Minted with `trible genid` on 2026-08-07.
-    "7B05303C15B05973D2C8A85615C0E81F" as pub merge_result: Hash<Blake3>;
+    "7B05303C15B05973D2C8A85615C0E81F" unsafe as pub merge_result: Hash<Blake3>;
     /// Source collection of a `DERIVE` equation.
     /// Minted with `trible genid` on 2026-08-07.
-    "B2E4FA570D093A023F88A41FC7AC3AAA" as pub derive_source: GenId;
+    "B2E4FA570D093A023F88A41FC7AC3AAA" unsafe as pub derive_source: GenId;
     /// Target collection of a `DERIVE` equation.
     /// Minted with `trible genid` on 2026-08-07.
-    "3B388D3A074D9A7B9A85F87FE95028D6" as pub derive_target: GenId;
+    "3B388D3A074D9A7B9A85F87FE95028D6" unsafe as pub derive_target: GenId;
     /// Source element of a `DERIVE` equation.
     /// Minted with `trible genid` on 2026-08-07.
-    "19AD8BC87A6F3D3E6B8D1647AB1D6878" as pub derive_input: Hash<Blake3>;
+    "19AD8BC87A6F3D3E6B8D1647AB1D6878" unsafe as pub derive_input: Hash<Blake3>;
     /// Exact target element of a `DERIVE` equation.
     /// Minted with `trible genid` on 2026-08-07.
-    "9C54FEF362965976CF697669BCB1C2FD" as pub derive_output: Hash<Blake3>;
+    "9C54FEF362965976CF697669BCB1C2FD" unsafe as pub derive_output: Hash<Blake3>;
 }
 
 /// Type-erased content identity of one collection element.

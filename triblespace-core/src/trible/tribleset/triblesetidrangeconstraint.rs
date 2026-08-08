@@ -202,7 +202,7 @@ mod tests {
     use crate::prelude::*;
 
     attributes! {
-        "CC00000000000000CC00000000000000" as id_range_test_score: R256BE;
+        "CC00000000000000CC00000000000000" unsafe as id_range_test_score: R256BE;
     }
 
     #[test]

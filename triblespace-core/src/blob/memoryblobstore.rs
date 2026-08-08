@@ -376,7 +376,7 @@ mod tests {
     use inlineencodings::Handle;
 
     attributes! {
-        "5AD0FAFB1FECBC197A385EC20166899E" as description: Handle<LongString>;
+        "5AD0FAFB1FECBC197A385EC20166899E" unsafe as description: Handle<LongString>;
     }
 
     #[test]

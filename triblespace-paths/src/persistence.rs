@@ -31,10 +31,10 @@ const AUTOMATON_FINGERPRINT_DOMAIN: [u8; 16] = [
 attributes! {
     /// Canonical BLAKE3 fingerprint of the fixed path automaton. Minted with
     /// `trible genid` on 2026-07-28.
-    "77DF5A905CCE3B0643BB02999F73BE4C" as pub path_automaton_fingerprint: Hash<Blake3>;
+    "77DF5A905CCE3B0643BB02999F73BE4C" unsafe as pub path_automaton_fingerprint: Hash<Blake3>;
     /// Canonical v2 direct-product summary for one source range. Minted with
     /// `trible genid` on 2026-07-28 for the matched-support value schema.
-    "743B2E1BDF3E42B867242CE0F916E7E5" as pub seg_path_summary: Handle<PathSummaryBlob>;
+    "743B2E1BDF3E42B867242CE0F916E7E5" unsafe as pub seg_path_summary: Handle<PathSummaryBlob>;
 }
 
 /// Canonical direct-product summary bytes for one fixed automaton.

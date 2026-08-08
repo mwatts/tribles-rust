@@ -2401,8 +2401,8 @@ mod tests {
         use crate::prelude::*;
 
         attributes! {
-            "8143F46E812E88C4544E7094080EC523" as loves: inlineencodings::GenId;
-            "D6E0F2A6E5214E1330565B4D4138E55C" as name: inlineencodings::ShortString;
+            "8143F46E812E88C4544E7094080EC523" unsafe as loves: inlineencodings::GenId;
+            "D6E0F2A6E5214E1330565B4D4138E55C" unsafe as name: inlineencodings::ShortString;
         }
     }
 
@@ -2479,8 +2479,8 @@ mod tests {
         use crate::prelude::*;
 
         attributes! {
-            "A19EC1D9DD534BA9896223A457A6B9C9" as name: inlineencodings::ShortString;
-            "C21DE0AA5BA3446AB886C9640BA60244" as friend: inlineencodings::GenId;
+            "A19EC1D9DD534BA9896223A457A6B9C9" unsafe as name: inlineencodings::ShortString;
+            "C21DE0AA5BA3446AB886C9640BA60244" unsafe as friend: inlineencodings::GenId;
         }
     }
 

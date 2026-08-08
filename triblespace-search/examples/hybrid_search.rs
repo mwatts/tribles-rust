@@ -44,7 +44,7 @@ mod attrs {
     use super::*;
 
     attributes! {
-        "03712511F65DCC9B1C45FE04184F1B44" as pub paper_embedding: Handle<Embedding>;
+        "03712511F65DCC9B1C45FE04184F1B44" unsafe as pub paper_embedding: Handle<Embedding>;
     }
 }
 

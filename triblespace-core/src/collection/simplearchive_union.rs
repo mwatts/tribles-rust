@@ -919,8 +919,8 @@ mod tests {
 
         attributes! {
             // Test-only sentinel attributes; these are not protocol ids.
-            "DD00000000000000DD00000000000031" as pub text: inlineencodings::Handle<blobencodings::LongString>;
-            "DD00000000000000DD00000000000032" as pub payload: inlineencodings::Handle<blobencodings::RawBytes>;
+            "DD00000000000000DD00000000000031" unsafe as pub text: inlineencodings::Handle<blobencodings::LongString>;
+            "DD00000000000000DD00000000000032" unsafe as pub payload: inlineencodings::Handle<blobencodings::RawBytes>;
         }
     }
 

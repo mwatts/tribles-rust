@@ -34,16 +34,16 @@ use triblespace_core::query::{Constraint, VariableContext, VariableSet};
 mod profile {
     use triblespace_core::prelude::*;
     attributes! {
-        "CC00000000000000DD00000000000001" as pub nickname: inlineencodings::ShortString;
-        "CC00000000000000DD00000000000002" as pub display_name: inlineencodings::ShortString;
-        "CC00000000000000DD00000000000003" as pub city: inlineencodings::ShortString;
+        "CC00000000000000DD00000000000001" unsafe as pub nickname: inlineencodings::ShortString;
+        "CC00000000000000DD00000000000002" unsafe as pub display_name: inlineencodings::ShortString;
+        "CC00000000000000DD00000000000003" unsafe as pub city: inlineencodings::ShortString;
         // Budget-test attributes (see
         // many_literals_do_not_consume_the_variable_budget).
-        "CC00000000000000DD00000000000010" as pub m0: inlineencodings::ShortString;
-        "CC00000000000000DD00000000000011" as pub m1: inlineencodings::ShortString;
-        "CC00000000000000DD00000000000012" as pub m2: inlineencodings::ShortString;
-        "CC00000000000000DD00000000000013" as pub m3: inlineencodings::ShortString;
-        "CC00000000000000DD00000000000014" as pub m4: inlineencodings::ShortString;
+        "CC00000000000000DD00000000000010" unsafe as pub m0: inlineencodings::ShortString;
+        "CC00000000000000DD00000000000011" unsafe as pub m1: inlineencodings::ShortString;
+        "CC00000000000000DD00000000000012" unsafe as pub m2: inlineencodings::ShortString;
+        "CC00000000000000DD00000000000013" unsafe as pub m3: inlineencodings::ShortString;
+        "CC00000000000000DD00000000000014" unsafe as pub m4: inlineencodings::ShortString;
     }
 }
 

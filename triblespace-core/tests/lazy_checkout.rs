@@ -21,7 +21,7 @@ use triblespace_core::repo::WorkspaceCheckoutError;
 mod test_ns {
     use triblespace_core::prelude::*;
     attributes! {
-        "DD00000000000000DD00000000000002" as pub label: inlineencodings::ShortString;
+        "DD00000000000000DD00000000000002" unsafe as pub label: inlineencodings::ShortString;
     }
 }
 

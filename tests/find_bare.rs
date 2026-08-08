@@ -3,9 +3,9 @@ use triblespace::prelude::*;
 mod ns {
     use triblespace::prelude::*;
     attributes! {
-        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" as name: inlineencodings::ShortString;
-        "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" as score: inlineencodings::U256BE;
-        "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC" as friend: inlineencodings::GenId;
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" unsafe as name: inlineencodings::ShortString;
+        "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB" unsafe as score: inlineencodings::U256BE;
+        "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC" unsafe as friend: inlineencodings::GenId;
     }
 }
 

@@ -281,8 +281,8 @@ mod tests {
     use crate::tokens::hash_tokens;
 
     attributes! {
-        "155F694D45E9135AEBBE3FDAE750A69F" as content: Handle<LongString>;
-        "882E48C941C34CA9B27E708A808AEE1C" as alternate_content: Handle<LongString>;
+        "155F694D45E9135AEBBE3FDAE750A69F" unsafe as content: Handle<LongString>;
+        "882E48C941C34CA9B27E708A808AEE1C" unsafe as alternate_content: Handle<LongString>;
     }
 
     fn commit(byte: u8) -> triblespace_core::repo::CommitHandle {

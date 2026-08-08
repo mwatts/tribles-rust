@@ -4,7 +4,7 @@ mod ns {
     use triblespace::prelude::*;
 
     attributes! {
-        "67D58765E2104ACCA9F26B6E186BAABC" as label: inlineencodings::ShortString;
+        "67D58765E2104ACCA9F26B6E186BAABC" unsafe as label: inlineencodings::ShortString;
     }
 }
 

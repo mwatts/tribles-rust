@@ -7,7 +7,7 @@ use triblespace_core::prelude::{
 };
 
 attributes! {
-    "11111111111111111111111111111111" as pub fixed: ShortString;
+    "11111111111111111111111111111111" unsafe as pub fixed: ShortString;
     pub derived: ShortString;
     private: ShortString;
 }

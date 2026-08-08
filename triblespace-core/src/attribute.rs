@@ -266,13 +266,55 @@ mod tests {
     use crate::macros::{entity, find, pattern};
     use crate::metadata::{self, Describe, MetaDescribe};
 
-    /// `anchored` is a pure function of `(anchor, S)`.
+    // The only users of the `Anchored` arm in the tree. Everything else was
+    // swept to `unsafe as` to keep ids stable, so without these the new arm
+    // would compile and never be taken.
+    crate::macros::attributes! {
+        /// Anchored: same literal as `pinned_probe`, derived id.
+        "5F3C1A0E7B294D6685A0C1F2E3D40912" as anchored_probe: ShortString;
+        /// Same anchor, different schema — must be a different attribute.
+        "5F3C1A0E7B294D6685A0C1F2E3D40912" as anchored_probe_other: Handle<LongString>;
+        /// Pinned: the id is the literal verbatim.
+        "5F3C1A0E7B294D6685A0C1F2E3D40912" unsafe as pinned_probe: ShortString;
+    }
+
+    /// The anchored form derives; it does not pin.
+    #[test]
+    fn anchored_arm_does_not_yield_the_literal() {
+        let lit = "5F3C1A0E7B294D6685A0C1F2E3D40912";
+        assert_eq!(format!("{:X}", pinned_probe.id()), lit, "pinned must be verbatim");
+        assert_ne!(
+            format!("{:X}", anchored_probe.id()),
+            lit,
+            "anchored must derive, not pin — if this passes the arm is not deriving"
+        );
+    }
+
+    /// Same anchor, different schema, different attribute. This is the property
+    /// the whole change exists for.
+    #[test]
+    fn anchored_arm_separates_schemas() {
+        assert_ne!(anchored_probe.raw(), anchored_probe_other.raw());
+    }
+
+    /// And it agrees with the hand-written constructor, so the macro and the API
+    /// cannot drift apart.
+    #[test]
+    fn anchored_arm_matches_the_constructor() {
+        let a = Id::from_hex("5F3C1A0E7B294D6685A0C1F2E3D40912").unwrap();
+        assert_eq!(
+            anchored_probe.raw(),
+            Attribute::<ShortString>::anchored(a).raw()
+        );
+    }
+
     /// This change must not move any existing attribute id.
     ///
-    /// `attributes!` still expands the hex form to a pinned root, so every id in
-    /// every consumer is byte-identical to before. Flipping that to `anchored`
-    /// is the migration, and it is deliberately NOT part of this change — this
-    /// test is what says so in a way that fails if someone does it by accident.
+    /// The bare hex form now derives, but every declaration that existed was
+    /// swept to `unsafe as` in the same commit, so all 288 of them still expand
+    /// to a pinned root and every id in every consumer is byte-identical.
+    /// Migration is per-declaration from here: delete an `unsafe`, migrate that
+    /// attribute's rows. This test fails if a sweep is ever missed.
     #[test]
     fn declared_hex_ids_are_unchanged() {
         assert_eq!(
@@ -285,6 +327,7 @@ mod tests {
         );
     }
 
+    /// `anchored` is a pure function of `(anchor, S)`.
     #[test]
     fn anchored_is_deterministic() {
         let a = Id::from_hex("2ADC6462A7F70E230558C5D681E38768").unwrap();

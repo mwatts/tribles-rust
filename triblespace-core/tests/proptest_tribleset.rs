@@ -11,8 +11,8 @@ use triblespace_core::trible::Trible;
 mod test_ns {
     use triblespace_core::prelude::*;
     attributes! {
-        "AA00000000000000AA00000000000001" as pub link: inlineencodings::GenId;
-        "AA00000000000000AA00000000000002" as pub label: inlineencodings::ShortString;
+        "AA00000000000000AA00000000000001" unsafe as pub link: inlineencodings::GenId;
+        "AA00000000000000AA00000000000002" unsafe as pub label: inlineencodings::ShortString;
     }
 }
 

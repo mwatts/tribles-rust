@@ -6,9 +6,9 @@ use triblespace_core::prelude::*;
 mod test_ns {
     use triblespace_core::prelude::*;
     attributes! {
-        "CC00000000000000CC00000000000001" as pub name: inlineencodings::ShortString;
-        "CC00000000000000CC00000000000002" as pub link: inlineencodings::GenId;
-        "CC00000000000000CC00000000000003" as pub count: inlineencodings::U256BE;
+        "CC00000000000000CC00000000000001" unsafe as pub name: inlineencodings::ShortString;
+        "CC00000000000000CC00000000000002" unsafe as pub link: inlineencodings::GenId;
+        "CC00000000000000CC00000000000003" unsafe as pub count: inlineencodings::U256BE;
     }
 }
 

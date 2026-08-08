@@ -21,7 +21,7 @@ use triblespace_core::trible::Fragment;
 mod ns {
     use triblespace_core::prelude::*;
     attributes! {
-        "DD00000000000000DD00000000000010" as pub note: inlineencodings::Handle<blobencodings::LongString>;
+        "DD00000000000000DD00000000000010" unsafe as pub note: inlineencodings::Handle<blobencodings::LongString>;
     }
 }
 

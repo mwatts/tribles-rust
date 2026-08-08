@@ -45,17 +45,17 @@ attributes! {
     /// Maximal source-commit frontier certified by one recipe manifest.
     /// Repeated values are a canonical antichain; caught-up branch state is a
     /// singleton HEAD. Minted with `trible genid` on 2026-07-13.
-    "42813BC8BB5BBF16870403E8A573162E" as pub index_head: Handle<SimpleArchive>;
+    "42813BC8BB5BBF16870403E8A573162E" unsafe as pub index_head: Handle<SimpleArchive>;
     /// Raw SuccinctArchive artifact. Minted with `trible genid` on 2026-07-13.
-    "040E0073548E08298E732F7154C5703F" as pub seg_succinct: Handle<SuccinctArchiveBlob>;
+    "040E0073548E08298E732F7154C5703F" unsafe as pub seg_succinct: Handle<SuccinctArchiveBlob>;
     /// Source-bound detached Rank9 artifact. Minted with `trible genid` on
     /// 2026-07-13.
-    "0297BF2535F4FEDF7AFE6E5E7D125CF0" as pub seg_succinct_rank9: Handle<SuccinctArchiveRank9IndexBlob>;
+    "0297BF2535F4FEDF7AFE6E5E7D125CF0" unsafe as pub seg_succinct_rank9: Handle<SuccinctArchiveRank9IndexBlob>;
     /// LSM level of one logical range record. Retained from the original
     /// prototype because its meaning is unchanged.
-    "7188AAD5C5044798547E7F53FE1CA5D5" as pub seg_level: U256BE;
+    "7188AAD5C5044798547E7F53FE1CA5D5" unsafe as pub seg_level: U256BE;
     /// Monotonic recipe-local sequence number of one logical range record.
-    "DFE499897718CFB97497AA8504A5D48F" as pub seg_seq: U256BE;
+    "DFE499897718CFB97497AA8504A5D48F" unsafe as pub seg_seq: U256BE;
 }
 
 /// Number of logical range records that trigger one size-tiered carry.

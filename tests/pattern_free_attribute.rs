@@ -23,9 +23,9 @@ use triblespace::prelude::*;
 mod ns {
     use triblespace::prelude::*;
     attributes! {
-        "1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A" as name: inlineencodings::ShortString;
-        "2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B" as friend: inlineencodings::GenId;
-        "3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C" as nickname: inlineencodings::ShortString;
+        "1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A" unsafe as name: inlineencodings::ShortString;
+        "2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B" unsafe as friend: inlineencodings::GenId;
+        "3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C" unsafe as nickname: inlineencodings::ShortString;
     }
 }
 

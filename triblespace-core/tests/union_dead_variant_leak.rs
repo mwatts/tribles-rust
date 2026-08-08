@@ -37,10 +37,10 @@ use triblespace_core::prelude::*;
 mod profile {
     use triblespace_core::prelude::*;
     attributes! {
-        "F1A2B3C4D5E6F708192A3B4C5D6E7F01" as pub nickname: inlineencodings::ShortString;
-        "F1A2B3C4D5E6F708192A3B4C5D6E7F02" as pub display_name: inlineencodings::ShortString;
-        "F1A2B3C4D5E6F708192A3B4C5D6E7F03" as pub city: inlineencodings::ShortString;
-        "F1A2B3C4D5E6F708192A3B4C5D6E7F04" as pub alias: inlineencodings::ShortString;
+        "F1A2B3C4D5E6F708192A3B4C5D6E7F01" unsafe as pub nickname: inlineencodings::ShortString;
+        "F1A2B3C4D5E6F708192A3B4C5D6E7F02" unsafe as pub display_name: inlineencodings::ShortString;
+        "F1A2B3C4D5E6F708192A3B4C5D6E7F03" unsafe as pub city: inlineencodings::ShortString;
+        "F1A2B3C4D5E6F708192A3B4C5D6E7F04" unsafe as pub alias: inlineencodings::ShortString;
     }
 }
 

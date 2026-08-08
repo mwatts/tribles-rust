@@ -55,16 +55,16 @@ triblespace_core_macros::attributes! {
     /// The pubkey this capability authorizes. Must match the verified
     /// peer identity at connection time (i.e. the connecting peer's
     /// iroh `EndpointId`).
-    "1A8A6A9D8CA1DA67FACAB373DE21233B" as pub cap_subject: ed::ED25519PublicKey;
+    "1A8A6A9D8CA1DA67FACAB373DE21233B" unsafe as pub cap_subject: ed::ED25519PublicKey;
     /// The pubkey of the entity that signed this capability. Must match
     /// the `signed_by` field of the accompanying signature blob.
     /// Recorded in the cap so verification can detect a sig-blob/cap
     /// issuer mismatch without an extra fetch.
-    "2E9CD97ED0698FAF18EAEB74B5893685" as pub cap_issuer: ed::ED25519PublicKey;
+    "2E9CD97ED0698FAF18EAEB74B5893685" unsafe as pub cap_issuer: ed::ED25519PublicKey;
     /// Entity id within the cap blob anchoring the scope tribles. The
     /// scope sub-graph hanging off this id encodes which permissions
     /// (and optionally which resources) the capability grants.
-    "1A7DD2026BEFBE55A354CE10839CFDD6" as pub cap_scope_root: GenId;
+    "1A7DD2026BEFBE55A354CE10839CFDD6" unsafe as pub cap_scope_root: GenId;
     // Note: chain references (cap_parent, embedded parent sig) live in
     // the sig blob, not the cap blob. A cap blob is a pure declaration
     // of (subject, issuer, scope, expiry) — independent of which
@@ -75,7 +75,7 @@ triblespace_core_macros::attributes! {
     /// Repeated when a permission applies to multiple branches; absent
     /// when the permission is unrestricted (applies to every branch
     /// the holder is otherwise authorised on).
-    "46246789D627C1B0F81B21418E179DFD" as pub scope_branch: GenId;
+    "46246789D627C1B0F81B21418E179DFD" unsafe as pub scope_branch: GenId;
 
     // ── Sig blob ──────────────────────────────────────────────────────
     /// Handle of the cap blob this signature attests to. The signature
@@ -83,17 +83,17 @@ triblespace_core_macros::attributes! {
     /// `cap_blob.bytes`), not over the handle. SimpleArchive is already
     /// canonical, so the bytes the signer signs are exactly what the
     /// hasher hashes.
-    "230E175A083E29155C860B38BD44F2F3" as pub sig_signs: Handle<SimpleArchive>;
+    "230E175A083E29155C860B38BD44F2F3" unsafe as pub sig_signs: Handle<SimpleArchive>;
     /// Handle of the parent cap blob in the chain. Absent when this
     /// entry's issuer is the team root (chain terminator). Present on
     /// every other sig-blob outer entity and recursive sub-entity.
-    "ACF20EE95C6A4AE16B445590E88AB9BE" as pub sig_parent_cap: Handle<SimpleArchive>;
+    "ACF20EE95C6A4AE16B445590E88AB9BE" unsafe as pub sig_parent_cap: Handle<SimpleArchive>;
     /// Entity id within the same sig blob holding the parent's proof
     /// inline. The sub-entity carries `signed_by`, `signature_r`,
     /// `signature_s`, and (if the chain continues) its own
     /// `sig_parent_cap` + `sig_embedded_parent_proof`. Absent when
     /// the issuer is the team root.
-    "8ED30E412129FB0A791BD335EACF2E82" as pub sig_embedded_parent_proof: GenId;
+    "8ED30E412129FB0A791BD335EACF2E82" unsafe as pub sig_embedded_parent_proof: GenId;
     // Note: sig_signer + sig_value (r/s) reuse the existing
     // `repo::signed_by`, `repo::signature_r`, `repo::signature_s`
     // attributes — same convention as commit signatures, plus
