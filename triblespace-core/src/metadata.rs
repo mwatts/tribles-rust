@@ -86,6 +86,16 @@ pub const KIND_INLINE_ENCODING: Id = id_hex!("9A169BF2383E7B1A3E019808DFE3C2EB")
 /// Tag for entities that represent blob encodings.
 pub const KIND_BLOB_ENCODING: Id = id_hex!("CE488DB0C494C7FDBF3DF1731AED68A6");
 /// Tag for entities that describe an attribute usage in some source context.
+/// Marks an entity as an attribute itself, in its identity core.
+///
+/// Mirrors `KIND_BLOB_ENCODING` on `Array<T>`: without a kind in identity, an
+/// attribute is indistinguishable from any other entity carrying an anchor and a
+/// value encoding, and "which attributes exist here" is unanswerable — which the
+/// id migration needs to enumerate.
+///
+/// Distinct from [`KIND_ATTRIBUTE_USAGE`], which tags the codebase-local
+/// annotation (Rust identifier, source module) rather than the shared attribute.
+pub const KIND_ATTRIBUTE: Id = id_hex!("1611CA4D740B7077EE27EBDD5274074B");
 pub const KIND_ATTRIBUTE_USAGE: Id = id_hex!("45759727A79C28D657EC06D5C6013649");
 /// Tag for entities that describe a protocol.
 pub const KIND_PROTOCOL: Id = id_hex!("A04AD649FA28DC5904385532E9C8EF74");

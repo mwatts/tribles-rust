@@ -209,6 +209,7 @@ pub fn attributes_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Re
                             as #base_path::inline::InlineEncoding>::inline_from(__id)
                     },
                     #base_path::metadata::value_encoding: <#ty as #base_path::metadata::MetaDescribe>::id(),
+                    #base_path::metadata::tag: #base_path::metadata::KIND_ATTRIBUTE,
                 };
                 crate::entity_impl(entity_input, base_path)?
             }
@@ -216,6 +217,7 @@ pub fn attributes_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Re
                 let entity_input = quote! {
                     #base_path::metadata::name:         #name_lit.to_blob().get_handle(),
                     #base_path::metadata::value_encoding: <#ty as #base_path::metadata::MetaDescribe>::id(),
+                    #base_path::metadata::tag: #base_path::metadata::KIND_ATTRIBUTE,
                 };
                 crate::entity_impl(entity_input, base_path)?
             }

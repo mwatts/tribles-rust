@@ -103,6 +103,7 @@ impl<S: InlineEncoding + crate::metadata::MetaDescribe> Attribute<S> {
             crate::metadata::anchor:
                 crate::inline::encodings::genid::GenId::inline_from(anchor),
             crate::metadata::value_encoding: <S as crate::metadata::MetaDescribe>::id(),
+            crate::metadata::tag: crate::metadata::KIND_ATTRIBUTE,
         })
     }
 
@@ -116,6 +117,7 @@ impl<S: InlineEncoding + crate::metadata::MetaDescribe> Attribute<S> {
         Self::from_fragment_unchecked(crate::macros::entity! {
             crate::metadata::name: name.to_string().to_blob().get_handle(),
             crate::metadata::value_encoding: <S as crate::metadata::MetaDescribe>::id(),
+            crate::metadata::tag: crate::metadata::KIND_ATTRIBUTE,
         })
     }
 
@@ -127,6 +129,7 @@ impl<S: InlineEncoding + crate::metadata::MetaDescribe> Attribute<S> {
         Self::from_fragment_unchecked(crate::macros::entity! {
             crate::metadata::iri: iri.to_string().to_blob().get_handle(),
             crate::metadata::value_encoding: <S as crate::metadata::MetaDescribe>::id(),
+            crate::metadata::tag: crate::metadata::KIND_ATTRIBUTE,
         })
     }
 }
