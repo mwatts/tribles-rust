@@ -55,6 +55,33 @@ pub fn build_intrinsic_entity(rows: Vec<IntrinsicEntityRow>) -> (Id, TribleSet) 
     build_intrinsic_entity_inner(rows, None)
 }
 
+/// Reproduce the first intrinsic-entity identity epoch over canonical
+/// `(attribute, value)` pairs.
+///
+/// Before [`build_intrinsic_entity`] made complete NIL-prefixed rows the hash
+/// domain, `entity!` sorted and deduplicated 48-byte `A || V` pairs, hashed
+/// their concatenation with BLAKE3, and retained the final 16 digest bytes.
+/// Historical durable identities must be verified under that exact rule
+/// rather than reinterpreted under the current epoch.
+///
+/// New entities must use [`build_intrinsic_entity`]. This function exists only
+/// for explicit legacy admission and migration boundaries.
+#[doc(hidden)]
+pub fn intrinsic_entity_id_v1(mut pairs: Vec<(Id, crate::inline::RawInline)>) -> Id {
+    pairs.sort_unstable();
+    pairs.dedup();
+
+    let mut hasher = Blake3::new();
+    for (attribute, value) in pairs {
+        hasher.update(&attribute[..]);
+        hasher.update(&value);
+    }
+    let digest = hasher.finalize();
+    let mut raw_id: RawId = [0; crate::id::ID_LEN];
+    raw_id.copy_from_slice(&digest[digest.len() - crate::id::ID_LEN..]);
+    Id::new(raw_id).expect("BLAKE3-derived legacy entity ids must be non-nil")
+}
+
 /// Canonicalizes and stores a content-derived entity inside a caller-supplied
 /// namespace. The namespace prefixes the same canonical row byte stream used
 /// by [`build_intrinsic_entity`]. Because the namespace is configuration rather
@@ -752,6 +779,19 @@ mod tests {
         // SAFETY: the wrapper and both 64-byte rows are 16-byte aligned, the
         // keys are distinct, immutable, and retained by `owner` during build.
         unsafe { TribleSet::from_archive_partition(&storage.0, &hashes, &owner) }
+    }
+
+    #[test]
+    fn intrinsic_entity_v1_reproduces_the_historical_av_stream() {
+        let attribute = Id::new([0x11; 16]).unwrap();
+        let low = [0x22; 32];
+        let high = [0x33; 32];
+        let expected = Id::new(hex_literal::hex!("ECBA4194366B3AD966A7912E5B641750")).unwrap();
+
+        assert_eq!(
+            intrinsic_entity_id_v1(vec![(attribute, high), (attribute, low), (attribute, high),]),
+            expected,
+        );
     }
 
     fn assert_shared_owner_guard(set: &TribleSet, owner_count: usize) {

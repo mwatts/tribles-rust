@@ -21,6 +21,8 @@ pub use spread::Spread;
 #[doc(hidden)]
 pub use tribleset::build_intrinsic_entity;
 pub(crate) use tribleset::build_namespaced_intrinsic_entity;
+#[doc(hidden)]
+pub use tribleset::intrinsic_entity_id_v1;
 /// Re-export of [`TribleSet`](tribleset::TribleSet).
 pub use tribleset::TribleSet;
 /// Re-export of [`TribleSetFingerprint`](tribleset::TribleSetFingerprint).
