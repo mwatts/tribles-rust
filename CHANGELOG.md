@@ -884,6 +884,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Conservative TribleSet handle scans now read the value column.**
+  `potential_handles` previously traversed the VAE index but interpreted the
+  canonical leaf's leading entity-and-attribute bytes as a handle. It now
+  extracts bytes 32..64, so referenced blobs survive retention passes.
+
 - **Object-store reads now verify fetched bytes against their requested
   content address before decoding.** A mismatched object returns the expected
   and computed BLAKE3 digests through `GetBlobErr::HashMismatch` instead of

@@ -211,7 +211,7 @@ use crate::patch::IdentitySchema;
 use crate::patch::PATCH;
 use crate::prelude::inlineencodings::GenId;
 use crate::repo::branch::branch_metadata;
-use crate::trible::TribleSet;
+use crate::trible::{TribleSet, V_END, V_START};
 use ed25519_dalek::SigningKey;
 
 use crate::blob::encodings::longstring::LongString;
@@ -875,7 +875,7 @@ pub fn potential_handles<'a>(
 ) -> impl Iterator<Item = Inline<Handle<UnknownBlob>>> + 'a {
     set.vae.iter().map(|raw| {
         let mut value = [0u8; INLINE_LEN];
-        value.copy_from_slice(&raw[0..INLINE_LEN]);
+        value.copy_from_slice(&raw[V_START..=V_END]);
         Inline::<Handle<UnknownBlob>>::new(value)
     })
 }

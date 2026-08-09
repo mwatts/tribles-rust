@@ -368,9 +368,6 @@ mod tests {
 
     use super::*;
     use anybytes::Bytes;
-    use fake::faker::name::raw::Name;
-    use fake::locales::EN;
-    use fake::Fake;
 
     use blobencodings::LongString;
     use inlineencodings::Handle;
@@ -380,18 +377,27 @@ mod tests {
     }
 
     #[test]
-    fn keep() {
+    fn potential_handles_retain_value_handles() {
         use crate::repo::potential_handles;
         use crate::trible::TribleSet;
 
         let mut kb = TribleSet::new();
         let mut blobs = MemoryBlobStore::new();
-        for _i in 0..200 {
-            kb += entity! {
-               description: blobs.put(Bytes::from_source(Name(EN).fake::<String>()).view().unwrap()).unwrap()
-            };
-        }
-        blobs.keep(potential_handles(&kb));
+        let retained = blobs
+            .put::<LongString, _>(Bytes::from_source("retained".to_owned()).view().unwrap())
+            .unwrap();
+        let discarded = blobs
+            .put::<LongString, _>(Bytes::from_source("discarded".to_owned()).view().unwrap())
+            .unwrap();
+        kb += entity! { description: retained };
+
+        let candidates: Vec<_> = potential_handles(&kb).collect();
+        assert_eq!(candidates, vec![retained.transmute()]);
+
+        blobs.keep(candidates);
+        let reader = blobs.reader().unwrap();
+        assert!(reader.get::<View<str>, LongString>(retained).is_ok());
+        assert!(reader.get::<View<str>, LongString>(discarded).is_err());
     }
 
     /// `MemoryBlobStoreReader` must be `Send + Sync` so it composes
