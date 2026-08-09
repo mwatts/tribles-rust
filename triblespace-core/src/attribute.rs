@@ -285,7 +285,11 @@ mod tests {
     #[test]
     fn anchored_arm_does_not_yield_the_literal() {
         let lit = "5F3C1A0E7B294D6685A0C1F2E3D40912";
-        assert_eq!(format!("{:X}", pinned_probe.id()), lit, "pinned must be verbatim");
+        assert_eq!(
+            format!("{:X}", pinned_probe.id()),
+            lit,
+            "pinned must be verbatim"
+        );
         assert_ne!(
             format!("{:X}", anchored_probe.id()),
             lit,
@@ -347,7 +351,8 @@ mod tests {
     fn anchored_changes_with_schema() {
         let a = Id::from_hex("2ADC6462A7F70E230558C5D681E38768").unwrap();
         let short = Attribute::<ShortString>::anchored(a);
-        let handle = Attribute::<Handle<crate::blob::encodings::longstring::LongString>>::anchored(a);
+        let handle =
+            Attribute::<Handle<crate::blob::encodings::longstring::LongString>>::anchored(a);
         assert_ne!(short.raw(), handle.raw());
     }
 

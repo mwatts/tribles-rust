@@ -723,11 +723,12 @@ mod tests {
         use crate::blob::IntoBlob;
         use crate::metadata::MetaDescribe;
         let h: Inline<Handle<LongString>> = String::from(expected_attr).to_blob().get_handle();
-        let attr = Attribute::<Handle<LongString>>::from_fragment_unchecked(crate::macros::entity! {
-            metadata::name:         h,
-            metadata::value_encoding: <Handle<LongString> as MetaDescribe>::id(),
-        })
-        .id();
+        let attr =
+            Attribute::<Handle<LongString>>::from_fragment_unchecked(crate::macros::entity! {
+                metadata::name:         h,
+                metadata::value_encoding: <Handle<LongString> as MetaDescribe>::id(),
+            })
+            .id();
         let trible = facts
             .iter()
             .find(|t| *t.a() == attr)
