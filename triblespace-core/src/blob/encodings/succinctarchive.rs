@@ -1246,23 +1246,30 @@ where
     /// Iterates over all tribles by walking the EAV wavelet matrix and
     /// resolving each triple through the domain mapping.
     pub fn iter<'a>(&'a self) -> impl Iterator<Item = Trible> + 'a {
-        (0..self.eav_c.len()).map(move |v_i| {
-            let v = self.eav_c.access(v_i).unwrap();
-            let a_i = self.v_a.select1(v).unwrap() - v + self.eav_c.rank(v_i, v).unwrap();
-            let a = self.vea_c.access(a_i).unwrap();
-            let e_i = self.a_a.select1(a).unwrap() - a + self.vea_c.rank(a_i, a).unwrap();
-            let e = self.ave_c.access(e_i).unwrap();
+        (0..self.eav_c.len()).map(move |position| self.decode_eav_trible(position))
+    }
 
-            let e = self.domain.access(e);
-            let a = self.domain.access(a);
-            let v = self.domain.access(v);
+    /// Decode one position in canonical EAV order.
+    ///
+    /// Kept as a direct positional operation so sibling logical-cover views
+    /// can merge several physical archives without exposing archive-local
+    /// universe codes.
+    fn decode_eav_trible(&self, position: usize) -> Trible {
+        let v = self.eav_c.access(position).unwrap();
+        let a_i = self.v_a.select1(v).unwrap() - v + self.eav_c.rank(position, v).unwrap();
+        let a = self.vea_c.access(a_i).unwrap();
+        let e_i = self.a_a.select1(a).unwrap() - a + self.vea_c.rank(a_i, a).unwrap();
+        let e = self.ave_c.access(e_i).unwrap();
 
-            let e: Id = Id::new(id_from_value(&e).unwrap()).unwrap();
-            let a: Id = Id::new(id_from_value(&a).unwrap()).unwrap();
-            let v: Inline<UnknownInline> = Inline::new(v);
+        let e = self.domain.access(e);
+        let a = self.domain.access(a);
+        let v = self.domain.access(v);
 
-            Trible::force(&e, &a, &v)
-        })
+        let e: Id = Id::new(id_from_value(&e).unwrap()).unwrap();
+        let a: Id = Id::new(id_from_value(&a).unwrap()).unwrap();
+        let v: Inline<UnknownInline> = Inline::new(v);
+
+        Trible::force(&e, &a, &v)
     }
 
     /// Iterates over the facts for one fixed attribute in ascending AVE order.

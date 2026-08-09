@@ -11,6 +11,7 @@ use crate::query::{
     Binding, Candidates, Constraint, Frontier, ProposalBuffer, Term, TriblePattern, VariableId,
     VariableSet,
 };
+use crate::trible::Trible;
 
 use super::{SuccinctArchive, SuccinctArchiveConstraint, Universe};
 
@@ -49,12 +50,35 @@ impl<U> UnionArchive<U> {
     pub fn segment_count(&self) -> usize {
         self.segments.len()
     }
+
+    /// Return one logical cover containing this cover plus additional shards.
+    ///
+    /// Attached archives are cheap `Bytes`-backed clones. The original cover
+    /// remains immutable, which makes this useful for validating a staged
+    /// delta against one already-frozen snapshot.
+    pub fn with_segments(&self, additional: impl IntoIterator<Item = SuccinctArchive<U>>) -> Self
+    where
+        SuccinctArchive<U>: Clone,
+    {
+        let mut segments = self.segments.to_vec();
+        segments.extend(additional);
+        Self::new(segments)
+    }
 }
 
 impl<U> UnionArchive<U>
 where
     U: Universe,
 {
+    /// Iterate the logical set union in canonical EAV order.
+    ///
+    /// The k-way merge retains one position per physical shard and removes
+    /// facts repeated by overlapping shards. Physical compaction therefore
+    /// cannot affect the observed sequence.
+    pub fn iter<'a>(&'a self) -> impl Iterator<Item = Trible> + 'a {
+        UnionArchiveTribles::new(&self.segments)
+    }
+
     /// Iterate one fixed attribute in ascending decoded `(value, entity)`
     /// order across the logical set union.
     ///
@@ -75,6 +99,90 @@ where
         attribute: &Id,
     ) -> impl Iterator<Item = (RawInline, Id)> + 'a {
         UnionArchiveAttributeValueEntities::new(&self.segments, attribute, true)
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct TribleHeapItem {
+    trible: Trible,
+    segment: usize,
+}
+
+impl Ord for TribleHeapItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.trible
+            .cmp(&other.trible)
+            .then_with(|| self.segment.cmp(&other.segment))
+            .reverse()
+    }
+}
+
+impl PartialOrd for TribleHeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Ordered, deduplicating cursor over every fact in a physical cover.
+struct UnionArchiveTribles<'a, U> {
+    segments: &'a [SuccinctArchive<U>],
+    positions: Vec<usize>,
+    heap: BinaryHeap<TribleHeapItem>,
+    last: Option<Trible>,
+}
+
+impl<'a, U> UnionArchiveTribles<'a, U>
+where
+    U: Universe,
+{
+    fn new(segments: &'a [SuccinctArchive<U>]) -> Self {
+        let mut heap = BinaryHeap::new();
+        let positions = vec![0; segments.len()];
+        for (segment, archive) in segments.iter().enumerate() {
+            if !archive.eav_c.is_empty() {
+                heap.push(TribleHeapItem {
+                    trible: archive.decode_eav_trible(0),
+                    segment,
+                });
+            }
+        }
+        Self {
+            segments,
+            positions,
+            heap,
+            last: None,
+        }
+    }
+
+    fn advance(&mut self, segment: usize) {
+        self.positions[segment] += 1;
+        let position = self.positions[segment];
+        let archive = &self.segments[segment];
+        if position < archive.eav_c.len() {
+            self.heap.push(TribleHeapItem {
+                trible: archive.decode_eav_trible(position),
+                segment,
+            });
+        }
+    }
+}
+
+impl<U> Iterator for UnionArchiveTribles<'_, U>
+where
+    U: Universe,
+{
+    type Item = Trible;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(item) = self.heap.pop() {
+            self.advance(item.segment);
+            if self.last == Some(item.trible) {
+                continue;
+            }
+            self.last = Some(item.trible);
+            return Some(item.trible);
+        }
+        None
     }
 }
 
@@ -364,6 +472,49 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected.iter().copied().rev().collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn ordered_iteration_is_cover_independent_and_deduplicates_overlap() {
+        let ada = ufoid();
+        let grace = ufoid();
+
+        let mut left = TribleSet::new();
+        left += entity! { &ada @ literature::firstname: "Ada" };
+
+        let mut right = TribleSet::new();
+        right += entity! { &ada @ literature::firstname: "Ada" };
+        right += entity! { &grace @ literature::firstname: "Grace" };
+
+        let mut logical = left.clone();
+        logical += right.clone();
+        let expected = logical.iter_ordered().copied().collect::<Vec<_>>();
+        let union = UnionArchive::new(
+            [&right, &left]
+                .into_iter()
+                .map(SuccinctArchive::<OrderedUniverse>::from)
+                .collect::<Vec<_>>(),
+        );
+
+        assert_eq!(union.iter().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn immutable_cover_extension_keeps_the_original_snapshot() {
+        let ada = ufoid();
+        let grace = ufoid();
+        let mut first = TribleSet::new();
+        first += entity! { &ada @ literature::firstname: "Ada" };
+        let mut second = TribleSet::new();
+        second += entity! { &grace @ literature::firstname: "Grace" };
+
+        let original = UnionArchive::new(vec![SuccinctArchive::<OrderedUniverse>::from(&first)]);
+        let extended = original.with_segments([SuccinctArchive::from(&second)]);
+
+        assert_eq!(original.segment_count(), 1);
+        assert_eq!(extended.segment_count(), 2);
+        assert_eq!(original.iter().count(), first.len());
+        assert_eq!(extended.iter().count(), first.len() + second.len());
     }
 
     #[test]

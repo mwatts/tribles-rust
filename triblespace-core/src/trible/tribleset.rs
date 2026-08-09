@@ -620,7 +620,10 @@ impl TribleSet {
         triblesetidrangeconstraint::AttributeRangeConstraint::new(variable, min, max, self.clone())
     }
 
-    /// Iterates over all tribles in EAV order.
+    /// Iterates over all tribles in the index's native traversal order.
+    ///
+    /// Use [`Self::iter_ordered`] when physical representation must not affect
+    /// the sequence.
     pub fn iter(&self) -> TribleSetIterator<'_> {
         TribleSetIterator {
             inner: self
@@ -628,6 +631,13 @@ impl TribleSet {
                 .iter()
                 .map(|data| Trible::as_transmute_raw_unchecked(data)),
         }
+    }
+
+    /// Iterates over all tribles in canonical byte-lexicographic EAV order.
+    pub fn iter_ordered(&self) -> impl Iterator<Item = &Trible> {
+        self.eav
+            .iter_ordered()
+            .map(|data| Trible::as_transmute_raw_unchecked(data))
     }
 }
 
