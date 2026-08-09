@@ -1,7 +1,11 @@
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
+use std::ops::Range;
 use std::sync::Arc;
 
+use crate::id::Id;
 use crate::inline::encodings::genid::GenId;
-use crate::inline::InlineEncoding;
+use crate::inline::{InlineEncoding, RawInline};
 use crate::query::unionconstraint::UnionConstraint;
 use crate::query::{
     Binding, Candidates, Constraint, Frontier, ProposalBuffer, Term, TriblePattern, VariableId,
@@ -44,6 +48,156 @@ impl<U> UnionArchive<U> {
     /// change it without changing the relation exposed by [`TriblePattern`].
     pub fn segment_count(&self) -> usize {
         self.segments.len()
+    }
+}
+
+impl<U> UnionArchive<U>
+where
+    U: Universe,
+{
+    /// Iterate one fixed attribute in ascending decoded `(value, entity)`
+    /// order across the logical set union.
+    ///
+    /// The k-way merge keeps one cursor per physical shard and removes facts
+    /// repeated by overlapping shards. Local universe codes never cross the
+    /// abstraction boundary.
+    pub fn iter_attribute_value_entities<'a>(
+        &'a self,
+        attribute: &Id,
+    ) -> impl Iterator<Item = (RawInline, Id)> + 'a {
+        UnionArchiveAttributeValueEntities::new(&self.segments, attribute, false)
+    }
+
+    /// Iterate one fixed attribute in descending decoded `(value, entity)`
+    /// order across the logical set union.
+    pub fn iter_attribute_value_entities_rev<'a>(
+        &'a self,
+        attribute: &Id,
+    ) -> impl Iterator<Item = (RawInline, Id)> + 'a {
+        UnionArchiveAttributeValueEntities::new(&self.segments, attribute, true)
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct HeapItem {
+    pair: (RawInline, Id),
+    segment: usize,
+    descending: bool,
+}
+
+impl Ord for HeapItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        debug_assert_eq!(self.descending, other.descending);
+        let order = self
+            .pair
+            .cmp(&other.pair)
+            .then_with(|| self.segment.cmp(&other.segment));
+        if self.descending {
+            order
+        } else {
+            order.reverse()
+        }
+    }
+}
+
+impl PartialOrd for HeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Ordered, deduplicating cursor over one fixed attribute in a physical
+/// [`UnionArchive`] cover.
+struct UnionArchiveAttributeValueEntities<'a, U> {
+    segments: &'a [SuccinctArchive<U>],
+    ranges: Vec<Range<usize>>,
+    heap: BinaryHeap<HeapItem>,
+    descending: bool,
+    last: Option<(RawInline, Id)>,
+}
+
+impl<'a, U> UnionArchiveAttributeValueEntities<'a, U>
+where
+    U: Universe,
+{
+    fn new(segments: &'a [SuccinctArchive<U>], attribute: &Id, descending: bool) -> Self {
+        let mut ranges: Vec<_> = segments
+            .iter()
+            .map(|segment| {
+                super::base_range(
+                    &segment.domain,
+                    &segment.a_a,
+                    &super::id_into_value(attribute),
+                )
+            })
+            .collect();
+        let mut heap = BinaryHeap::new();
+        for (index, (segment, range)) in segments.iter().zip(&mut ranges).enumerate() {
+            let position = if descending {
+                if range.start == range.end {
+                    continue;
+                }
+                range.end -= 1;
+                range.end
+            } else {
+                let Some(position) = range.next() else {
+                    continue;
+                };
+                position
+            };
+            heap.push(HeapItem {
+                pair: segment.decode_ave_value_entity(position),
+                segment: index,
+                descending,
+            });
+        }
+        Self {
+            segments,
+            ranges,
+            heap,
+            descending,
+            last: None,
+        }
+    }
+
+    fn advance(&mut self, segment: usize) {
+        let range = &mut self.ranges[segment];
+        let position = if self.descending {
+            if range.start == range.end {
+                return;
+            }
+            range.end -= 1;
+            range.end
+        } else {
+            let Some(position) = range.next() else {
+                return;
+            };
+            position
+        };
+        self.heap.push(HeapItem {
+            pair: self.segments[segment].decode_ave_value_entity(position),
+            segment,
+            descending: self.descending,
+        });
+    }
+}
+
+impl<U> Iterator for UnionArchiveAttributeValueEntities<'_, U>
+where
+    U: Universe,
+{
+    type Item = (RawInline, Id);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(item) = self.heap.pop() {
+            self.advance(item.segment);
+            if self.last == Some(item.pair) {
+                continue;
+            }
+            self.last = Some(item.pair);
+            return Some(item.pair);
+        }
+        None
     }
 }
 
@@ -168,6 +322,48 @@ mod tests {
 
         assert_eq!(union.segment_count(), 2);
         assert_eq!(names, ["Ada", "Grace"]);
+    }
+
+    #[test]
+    fn ordered_attribute_iteration_merges_and_deduplicates_shards() {
+        let attribute = ufoid();
+        let other_attribute = ufoid();
+        let e1 = ufoid();
+        let e2 = ufoid();
+        let e3 = ufoid();
+        let low = Inline::<UnknownInline>::new([0x20; 32]);
+        let high = Inline::<UnknownInline>::new([0x40; 32]);
+
+        let mut left = TribleSet::new();
+        left.insert(&Trible::force(&e2, &attribute, &low));
+        left.insert(&Trible::force(&e3, &attribute, &high));
+
+        let mut right = TribleSet::new();
+        right.insert(&Trible::force(&e1, &attribute, &low));
+        right.insert(&Trible::force(&e2, &attribute, &low));
+        right.insert(&Trible::force(&e3, &other_attribute, &high));
+
+        let union = UnionArchive::new(
+            [&left, &right]
+                .into_iter()
+                .map(SuccinctArchive::<OrderedUniverse>::from)
+                .collect::<Vec<_>>(),
+        );
+        let mut expected = vec![(low.raw, *e1), (low.raw, *e2), (high.raw, *e3)];
+        expected.sort_unstable();
+
+        assert_eq!(
+            union
+                .iter_attribute_value_entities(&attribute)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            union
+                .iter_attribute_value_entities_rev(&attribute)
+                .collect::<Vec<_>>(),
+            expected.iter().copied().rev().collect::<Vec<_>>()
+        );
     }
 
     #[test]
