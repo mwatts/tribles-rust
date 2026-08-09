@@ -215,6 +215,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`UnionArchive` is now a storage-neutral Succinct data source.** Its owned
+  shard union and query constraint live beside `SuccinctArchive` under
+  `blob::encodings::succinctarchive` and are available through the blob
+  encodings prelude. `SuccinctRollup::union` remains a convenience constructor,
+  but collection consumers no longer need the legacy `repo::index_home` module
+  merely to query an already attached set of Succinct shards.
+
 - **Breaking: range-native BM25 now persists only the portable exact-TF
   carrier.** `Bm25Rollup` builds and merges `PortableBM25Blob` directly under
   document-union / pointwise-max semantics; native `SuccinctBM25Blob`,

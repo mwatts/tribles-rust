@@ -1,5 +1,6 @@
 mod succinctarchiveconstraint;
 mod succinctarchiverangeconstraint;
+mod unionarchive;
 mod universe;
 
 // Internal codec for the one public, architecture-independent raw layout. Its
@@ -37,6 +38,9 @@ pub use succinctarchiveconstraint::SuccinctArchiveConstraint;
 
 /// Inclusive value-range constraint returned by [`SuccinctArchive::value_in_range`].
 pub use succinctarchiverangeconstraint::SuccinctArchiveRangeConstraint;
+
+/// Storage-neutral logical union over attached Succinct archive shards.
+pub use unionarchive::{UnionArchive, UnionArchiveConstraint};
 
 /// Re-export all universe types and traits.
 pub use universe::*;
