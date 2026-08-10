@@ -74,6 +74,15 @@ Tracking branches are your sandbox for remote state. Merging them into
 your own same-named branch is how you "accept" the remote changes (see
 the *Merge Flow* section below).
 
+Local renewal decisions, pending capability requests, and the node's current
+team capabilities are not branches at all. They live behind `LocalCellStore`,
+which has no enumeration or gossip operation; a peer therefore cannot publish
+them as HEAD updates. During migration, the publisher still recognizes and
+suppresses the old `local_only_pin` marker so merely upgrading a node cannot
+leak policy heads written by an older binary. The guard checks snapshot
+membership without reading a missing blob, so classification cannot turn a
+private or damaged legacy head into a network want.
+
 ## Transports
 
 Three protocols ride on the same iroh endpoint:

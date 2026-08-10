@@ -30,6 +30,7 @@ use crate::inline::encodings::hash::{Blake3, Handle, Hash};
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
 use crate::inline::RawInline;
+use crate::local_cell::AsyncLocalCellStore;
 use crate::prelude::blobencodings::SimpleArchive;
 
 use super::async_store::{
@@ -42,6 +43,7 @@ use super::{BlobInfo, BlobMetadata};
 const BRANCH_INFIX: &str = "branches";
 const BLOB_INFIX: &str = "blobs";
 const COLLECTION_RECORD_INFIX: &str = "collection-records";
+const LOCAL_CELL_INFIX: &str = "local-cells";
 
 /// Repository backed by an [`object_store`] compatible storage backend.
 ///
@@ -243,6 +245,52 @@ impl AsyncCollectionStore for ObjectStoreRemote {
                 }
                 Err(error) => Err(InsertCollectionRecordErr::Store(error)),
             }
+        }
+    }
+}
+
+impl AsyncLocalCellStore for ObjectStoreRemote {
+    type CellError = ObjectCellError;
+
+    fn cell(
+        &mut self,
+        id: Id,
+    ) -> impl Future<Output = Result<Option<Inline<Handle<SimpleArchive>>>, Self::CellError>> + Send
+    {
+        async move {
+            let path = self.prefix.child(LOCAL_CELL_INFIX).child(hex::encode(id));
+            match self.store.get(&path).await {
+                Ok(object) => {
+                    let bytes = object.bytes().await.map_err(ObjectCellError::Store)?;
+                    if bytes.is_empty() {
+                        return Ok(None);
+                    }
+                    let raw: RawInline = (&bytes[..])
+                        .try_into()
+                        .map_err(|_| ObjectCellError::InvalidLength(bytes.len()))?;
+                    Ok(Some(Inline::new(raw)))
+                }
+                Err(object_store::Error::NotFound { .. }) => Ok(None),
+                Err(error) => Err(ObjectCellError::Store(error)),
+            }
+        }
+    }
+
+    fn set_cell(
+        &mut self,
+        id: Id,
+        value: Option<Inline<Handle<SimpleArchive>>>,
+    ) -> impl Future<Output = Result<(), Self::CellError>> + Send {
+        let bytes = value
+            .map(|value| bytes::Bytes::copy_from_slice(&value.raw))
+            .unwrap_or_default();
+        async move {
+            let path = self.prefix.child(LOCAL_CELL_INFIX).child(hex::encode(id));
+            self.store
+                .put_opts(&path, bytes.into(), PutMode::Overwrite.into())
+                .await
+                .map_err(ObjectCellError::Store)?;
+            Ok(())
         }
     }
 }
@@ -759,6 +807,35 @@ impl fmt::Display for ListBlobsErr {
 }
 impl Error for ListBlobsErr {}
 
+/// Error returned while reading or replacing a local policy cell.
+#[derive(Debug)]
+pub enum ObjectCellError {
+    /// The underlying object-store operation failed.
+    Store(object_store::Error),
+    /// A non-tombstone cell object was not exactly one handle wide.
+    InvalidLength(usize),
+}
+
+impl fmt::Display for ObjectCellError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Store(error) => write!(f, "local-cell operation failed: {error}"),
+            Self::InvalidLength(length) => {
+                write!(f, "local-cell value has invalid byte length {length}")
+            }
+        }
+    }
+}
+
+impl Error for ObjectCellError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Store(error) => Some(error),
+            Self::InvalidLength(_) => None,
+        }
+    }
+}
+
 /// Error returned when listing branches from the object store.
 #[derive(Debug)]
 pub enum ListBranchesErr {
@@ -944,5 +1021,39 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(actual, vec![record]);
+    }
+
+    #[test]
+    fn local_cells_are_lww_and_disjoint_from_remote_branches() {
+        block_on(async {
+            let mut store = remote();
+            let id = Id::new([31; 16]).unwrap();
+            let first = Inline::<Handle<SimpleArchive>>::new([41; 32]);
+            let second = Inline::<Handle<SimpleArchive>>::new([42; 32]);
+
+            AsyncLocalCellStore::set_cell(&mut store, id, Some(first))
+                .await
+                .unwrap();
+            assert_eq!(
+                AsyncLocalCellStore::cell(&mut store, id).await.unwrap(),
+                Some(first)
+            );
+            AsyncLocalCellStore::set_cell(&mut store, id, Some(second))
+                .await
+                .unwrap();
+            assert_eq!(
+                AsyncLocalCellStore::cell(&mut store, id).await.unwrap(),
+                Some(second)
+            );
+            assert!(AsyncPinStore::pins(&mut store).await.unwrap().is_empty());
+
+            AsyncLocalCellStore::set_cell(&mut store, id, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                AsyncLocalCellStore::cell(&mut store, id).await.unwrap(),
+                None
+            );
+        });
     }
 }

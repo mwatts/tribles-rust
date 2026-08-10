@@ -2,7 +2,7 @@
 //!
 //! Owns the inner store, spawns the iroh network thread on construction,
 //! and exposes the standard storage traits (`BlobStore + BlobStorePut +
-//! PinStore`) with two layers of network behavior built in:
+//! PinStore + LocalCellStore`) with two layers of network behavior built in:
 //!
 //! - **Reads** auto-call [`refresh`](Peer::refresh), which drains pending
 //!   incoming gossip events into the wrapped store and re-publishes any
@@ -17,7 +17,7 @@
 //! and any tiering (bounded want retention, generational eviction) lives
 //! in `S` — e.g. a [`Yard`](triblespace_core::repo::yard::Yard). Read-miss
 //! swarm fetches land in `S` under a **want** ([`WantStore`]),
-//! independently of any named [`PinStore`] cells. The want is recorded
+//! independently of named [`PinStore`] branches and local policy cells. The want is recorded
 //! durably *before* the fetch — asserted AND
 //! flushed ([`StorageFlush`]), so the marker survives an immediate
 //! process exit — the demand IS the want-signal (a sync daemon's work
@@ -52,6 +52,7 @@ use triblespace_core::id::Id;
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::InlineEncoding;
 use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::local_cell::LocalCellStore;
 use triblespace_core::repo::lazy::WantRecordError;
 use triblespace_core::repo::{
     BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, PinStore, PushResult,
@@ -107,7 +108,14 @@ pub use crate::host::{PeerConfig, SyncDirection};
 /// ```
 pub struct Peer<S>
 where
-    S: BlobStore + BlobStorePut + PinStore + WantStore + StorageFlush + Send + 'static,
+    S: BlobStore
+        + BlobStorePut
+        + LocalCellStore
+        + PinStore
+        + WantStore
+        + StorageFlush
+        + Send
+        + 'static,
 {
     /// The wrapped store, shared behind a mutex: a `&self` async read on
     /// a [`PeerReader`] must be able to record a want and land a
@@ -148,7 +156,7 @@ where
     /// scalar so cloning is cheap, but we keep it as an explicit
     /// `Clone` instead of `Copy` so the surface area for accidental
     /// duplication stays auditable. Used by `renewal_tick` to sign
-    /// fresh caps for entries on the renewal-policy pin.
+    /// fresh caps for entries in the renewal-policy cell.
     signing_key: SigningKey,
 
     /// Per-entry cooldown for undelivered-cap re-dispatch. The
@@ -162,7 +170,14 @@ where
 
 impl<S> Peer<S>
 where
-    S: BlobStore + BlobStorePut + PinStore + WantStore + StorageFlush + Send + 'static,
+    S: BlobStore
+        + BlobStorePut
+        + LocalCellStore
+        + PinStore
+        + WantStore
+        + StorageFlush
+        + Send
+        + 'static,
 {
     /// Wrap a store in a Peer. Spawns the iroh network thread
     /// internally; the thread lives for the Peer's lifetime and shuts
@@ -373,11 +388,9 @@ where
                     sig_bytes,
                 } => {
                     // Verify the delivered chain against our configured
-                    // team root, then store both blobs locally. Pinning
-                    // them into a per-team-cap pin (so compaction
-                    // retains them) comes with the CLI subcommands —
-                    // for now they're orphan blobs in the pile, same
-                    // as our own outgoing-cap blobs.
+                    // team root, then store both blobs locally and replace our
+                    // entry in the team-cap cell, which retains them through
+                    // compaction.
                     self.absorb_cap_delivery(issuer, cap_bytes, sig_bytes);
                 }
                 NetEvent::CapDeliveryConfirmed {
@@ -465,14 +478,10 @@ where
                 Err(_) => return,
             };
             for bid in bids {
-                if crate::tracking::is_tracking_pin(&mut *store, bid) {
+                if crate::policy::is_legacy_local_only_pin(&mut *store, bid) {
                     continue;
                 }
-                // Local-only policy pins (renewal policy, pending
-                // requests, per-team-cap pins) carry per-peer
-                // state that mustn't leak to the team mesh. See
-                // `crate::policy`.
-                if crate::policy::is_local_only_pin(&mut *store, bid) {
+                if crate::tracking::is_tracking_pin(&mut *store, bid) {
                     continue;
                 }
                 let head = match store.head(bid) {
@@ -490,7 +499,7 @@ where
 
     /// Persist an incoming join request: store the partial-cap blob,
     /// then add a pending-request entity to the local pending-requests
-    /// branch. The entity id becomes the value `team approve <id>`
+    /// cell. The entity id becomes the value `team approve <id>`
     /// consumes; the partial-cap blob is recoverable from the entity's
     /// `request_partial_cap` handle.
     fn absorb_cap_request(&mut self, requester: PublisherKey, partial_cap_bytes: anybytes::Bytes) {
@@ -544,7 +553,7 @@ where
             None => {
                 tracing::warn!(
                     requester = %hex::encode(&requester[..4]),
-                    "CapRequest: failed to record on pending-requests pin"
+                    "CapRequest: failed to record in pending-requests cell"
                 );
             }
         }
@@ -553,12 +562,8 @@ where
     /// Verify a peer-delivered cap chain against our configured team
     /// root and, on success, store both blobs locally.
     ///
-    /// Pinning into a per-team-cap pin (for retention across
-    /// compaction) is deferred — the CLI subcommands that surface
-    /// "my current cap" will manage that pin. For now the cap+sig
-    /// blobs live in the pile as orphan blobs, same as the cap blobs
-    /// we issue ourselves via `team invite`. They become reachable
-    /// from a branch once the CLI commits them.
+    /// The current pair is recorded in the team-cap cell, whose value is a
+    /// recursive local retention root independent of branch authority.
     fn absorb_cap_delivery(
         &mut self,
         issuer: PublisherKey,
@@ -575,7 +580,7 @@ where
         // every fetched parent have already arrived as earlier
         // `NetEvent::Blob` events on this channel, so by the time
         // we get here the store already holds them and we only
-        // need to pin the team-cap pin onto the leaf pair.
+        // need to replace our team-cap cell entry with the leaf pair.
         let cap_blob: Blob<SimpleArchive> = Blob::new(cap_bytes);
         let sig_blob: Blob<SimpleArchive> = Blob::new(sig_bytes);
         let cap_handle: Inline<Handle<SimpleArchive>> = (&cap_blob).get_handle();
@@ -608,18 +613,18 @@ where
             return;
         }
 
-        match crate::policy::pin_team_cap(&mut *store, self.team_root, cap_handle, sig_handle) {
-            Some(_bid) => {
+        match crate::policy::set_team_cap(&mut *store, self.team_root, cap_handle, sig_handle) {
+            Some(()) => {
                 tracing::info!(
                     issuer = %hex::encode(&issuer[..4]),
                     sig = %hex::encode(&sig_handle.raw[..4]),
-                    "CapDelivered: pinned on team-cap pin"
+                    "CapDelivered: stored in team-cap cell"
                 );
             }
             None => {
                 tracing::warn!(
                     issuer = %hex::encode(&issuer[..4]),
-                    "CapDelivered: team-cap pin failed"
+                    "CapDelivered: team-cap cell write failed"
                 );
             }
         }
@@ -741,7 +746,7 @@ where
         else {
             tracing::warn!(
                 renewable = entries.len(),
-                "renewal_tick: no team-cap pinned; cannot issue successors"
+                "renewal_tick: no team cap stored; cannot issue successors"
             );
             return 0;
         };
@@ -895,10 +900,10 @@ where
             Err(_) => return,
         };
         for bid in bids {
-            if crate::tracking::is_tracking_pin(&mut *store, bid) {
+            if crate::policy::is_legacy_local_only_pin(&mut *store, bid) {
                 continue;
             }
-            if crate::policy::is_local_only_pin(&mut *store, bid) {
+            if crate::tracking::is_tracking_pin(&mut *store, bid) {
                 continue;
             }
             if let Ok(Some(head)) = store.head(bid) {
@@ -1033,7 +1038,14 @@ where
 
 impl<S> BlobStorePut for Peer<S>
 where
-    S: BlobStore + BlobStorePut + PinStore + WantStore + StorageFlush + Send + 'static,
+    S: BlobStore
+        + BlobStorePut
+        + LocalCellStore
+        + PinStore
+        + WantStore
+        + StorageFlush
+        + Send
+        + 'static,
 {
     type PutError = S::PutError;
 
@@ -1063,7 +1075,14 @@ where
 
 impl<S> BlobStore for Peer<S>
 where
-    S: BlobStore + BlobStorePut + PinStore + WantStore + StorageFlush + Send + 'static,
+    S: BlobStore
+        + BlobStorePut
+        + LocalCellStore
+        + PinStore
+        + WantStore
+        + StorageFlush
+        + Send
+        + 'static,
 {
     type Reader = PeerReader<S::Reader>;
     type ReaderError = S::ReaderError;
@@ -1083,9 +1102,42 @@ where
     }
 }
 
+impl<S> LocalCellStore for Peer<S>
+where
+    S: BlobStore
+        + BlobStorePut
+        + LocalCellStore
+        + PinStore
+        + WantStore
+        + StorageFlush
+        + Send
+        + 'static,
+{
+    type CellError = S::CellError;
+
+    fn cell(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::CellError> {
+        self.store.lock().expect("store mutex").cell(id)
+    }
+
+    fn set_cell(
+        &mut self,
+        id: Id,
+        value: Option<Inline<Handle<SimpleArchive>>>,
+    ) -> Result<(), Self::CellError> {
+        self.store.lock().expect("store mutex").set_cell(id, value)
+    }
+}
+
 impl<S> PinStore for Peer<S>
 where
-    S: BlobStore + BlobStorePut + PinStore + WantStore + StorageFlush + Send + 'static,
+    S: BlobStore
+        + BlobStorePut
+        + LocalCellStore
+        + PinStore
+        + WantStore
+        + StorageFlush
+        + Send
+        + 'static,
 {
     type PinsError = S::PinsError;
     type HeadError = S::HeadError;
@@ -1128,11 +1180,11 @@ where
                 // Tracking branches are local mirror state and must NOT be
                 // re-gossiped — otherwise the publisher would receive its
                 // own tracking branch back and create a tracking-of-the-
-                // tracking, ad infinitum. Same logic for policy branches
-                // (renewal state, pending requests, per-team-cap pins) —
-                // they're per-peer local state.
-                if !crate::tracking::is_tracking_pin(&mut *store, id)
-                    && !crate::policy::is_local_only_pin(&mut *store, id)
+                // tracking, ad infinitum. Current local policy lives in
+                // LocalCellStore and cannot enter this PinStore path; the
+                // second predicate protects unmigrated pre-cell policy pins.
+                if !crate::policy::is_legacy_local_only_pin(&mut *store, id)
+                    && !crate::tracking::is_tracking_pin(&mut *store, id)
                     && self.direction != SyncDirection::ReadOnly
                 {
                     let bid_bytes: [u8; 16] = id.into();
@@ -1379,6 +1431,14 @@ where
 
     fn blobs<'a>(&'a self) -> Self::Iter<'a> {
         self.local.blobs()
+    }
+
+    fn contains_blob<S>(&self, handle: Inline<Handle<S>>) -> Result<bool, Self::Err>
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding,
+    {
+        self.local.contains_blob(handle)
     }
 }
 

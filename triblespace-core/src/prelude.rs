@@ -57,6 +57,7 @@ pub use crate::inline::IntoInline;
 pub use crate::inline::ToEncoded;
 pub use crate::inline::TryFromInline;
 pub use crate::inline::TryToInline;
+pub use crate::local_cell::LocalCellStore;
 pub use crate::metadata::{Describe, MetaDescribe};
 pub use crate::or;
 pub use crate::query::exists;

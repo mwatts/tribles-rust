@@ -1,7 +1,6 @@
 //! `trible pile pin …` — generic operations on the pin storage
 //! primitive. Pins are named, atomically-updatable handles to
-//! SimpleArchive blobs; they back content branches, tracking
-//! mirrors, and local-only policy state alike (decide#6de2dd95).
+//! SimpleArchive blobs; they back content branches and tracking mirrors.
 //!
 //! For branch-specific operations (commit walks, named lookups,
 //! reflogs that interpret head as a commit chain), see
@@ -24,7 +23,7 @@ use triblespace_core::trible::TribleSet;
 #[derive(Parser)]
 pub enum Command {
     /// List every pin in a pile, classified by role (BRANCH /
-    /// TRACKING / POLICY / UNNAMED). For named-branch-only output
+    /// TRACKING / UNNAMED). For named-branch-only output
     /// with commit-aware columns use `pile branch list`.
     List {
         /// Path to the pile file to inspect.
@@ -40,14 +39,14 @@ pub enum Command {
         pin: String,
     },
     /// Tombstone a pin by writing a None head via CAS. Any role
-    /// (branch / tracking / policy / unnamed) — the storage
+    /// (branch / tracking / unnamed) — the storage
     /// primitive doesn't discriminate. The pin's reachable blobs
     /// become unreachable and the next compaction reclaims them.
     ///
     /// Branches that need a commit-aware delete (e.g. with name
     /// resolution) should use `pile branch delete`; this is the
     /// raw "delete any pin" path operators reach for when cleaning
-    /// up stale tracking pins or wrong policy entries.
+    /// up stale tracking pins.
     Delete {
         /// Path to the pile file to modify.
         path: PathBuf,
@@ -71,9 +70,6 @@ enum Role {
     /// A pin carrying `tracking_remote_pin` — mirrors a remote
     /// peer's branch head.
     Tracking,
-    /// A pin carrying `local_only_pin` — renewal policy, pending
-    /// requests, per-team-cap holding, etc.
-    LocalOnly,
     /// Pin head exists but matches none of the known role markers.
     /// Either an exotic use or a stale anonymous pin from older
     /// schema versions.
@@ -89,7 +85,6 @@ impl Role {
         match self {
             Role::Branch(_) => "BRANCH",
             Role::Tracking => "TRACKING",
-            Role::LocalOnly => "POLICY",
             Role::Unnamed => "UNNAMED",
         }
     }
@@ -126,15 +121,6 @@ fn classify(meta: &TribleSet, pin_id: Id) -> Role {
         if tracking_iter.next().is_some() {
             return Role::Tracking;
         }
-    }
-
-    // Local-only pin: has local_only_pin marker.
-    let mut local_only_iter = find!(
-        v: Id,
-        pattern!(meta, [{ _?e @ triblespace_net::policy::local_only_pin: ?v }])
-    );
-    if local_only_iter.next().is_some() {
-        return Role::LocalOnly;
     }
 
     Role::Unnamed

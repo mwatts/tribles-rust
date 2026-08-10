@@ -8,6 +8,7 @@ use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::blob::MemoryBlobStore;
 use crate::collection::{CollectionRecord, CollectionStore};
+use crate::local_cell::LocalCellStore;
 use crate::prelude::blobencodings::SimpleArchive;
 use crate::prelude::*;
 use crate::repo::PinStore;
@@ -17,7 +18,7 @@ use crate::repo::WantStore;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::InlineEncoding;
 
-/// Simple in-memory implementation of [`BlobStore`] and [`PinStore`].
+/// Simple in-memory implementation of the repository storage traits.
 ///
 /// Useful for unit tests or ephemeral repositories where persistence is not
 /// required.
@@ -34,6 +35,8 @@ pub struct MemoryRepo {
     pub wants: HashSet<Inline<Handle<UnknownBlob>>>,
     /// Canonical collection records keyed by intrinsic record id.
     collection_records: BTreeMap<Id, CollectionRecord>,
+    /// Local LWW policy cells, disjoint from branch pins and collection truth.
+    cells: BTreeMap<Id, Inline<Handle<SimpleArchive>>>,
 }
 
 impl CollectionStore for MemoryRepo {
@@ -83,7 +86,18 @@ impl crate::repo::BlobStoreKeep for MemoryRepo {
     where
         I: IntoIterator<Item = Inline<Handle<UnknownBlob>>>,
     {
-        self.blobs.keep(handles);
+        // Cell values are local operational ownership roots. Expand their
+        // resident closure before invoking the exact low-level keep primitive
+        // so a retention pass cannot leave a cell pointing at collected data.
+        let roots: Vec<Inline<Handle<UnknownBlob>>> = self
+            .cells
+            .values()
+            .copied()
+            .map(|value| value.transmute())
+            .collect();
+        let reader = self.blobs.reader().expect("memory reader is infallible");
+        let cell_keep: Vec<_> = crate::repo::reachable(&reader, roots).collect();
+        self.blobs.keep(handles.into_iter().chain(cell_keep));
     }
 }
 
@@ -128,6 +142,30 @@ impl PinStore for MemoryRepo {
             }
         }
         Ok(PushResult::Success())
+    }
+}
+
+impl LocalCellStore for MemoryRepo {
+    type CellError = Infallible;
+
+    fn cell(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::CellError> {
+        Ok(self.cells.get(&id).copied())
+    }
+
+    fn set_cell(
+        &mut self,
+        id: Id,
+        value: Option<Inline<Handle<SimpleArchive>>>,
+    ) -> Result<(), Self::CellError> {
+        match value {
+            Some(value) => {
+                self.cells.insert(id, value);
+            }
+            None => {
+                self.cells.remove(&id);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -215,6 +253,51 @@ mod tests {
         // A later want wins over the earlier retraction.
         repo.want(handle(1)).unwrap();
         assert_eq!(repo.wants().unwrap().count(), 2);
+    }
+
+    #[test]
+    fn cells_are_lww_and_disjoint_from_pins() {
+        let mut repo = MemoryRepo::default();
+        let cell = Id::new([7; 16]).unwrap();
+        let first = Inline::<Handle<SimpleArchive>>::new([1; 32]);
+        let second = Inline::<Handle<SimpleArchive>>::new([2; 32]);
+
+        repo.set_cell(cell, Some(first)).unwrap();
+        assert_eq!(repo.cell(cell).unwrap(), Some(first));
+        assert_eq!(repo.pins().unwrap().count(), 0);
+
+        repo.set_cell(cell, Some(second)).unwrap();
+        assert_eq!(repo.cell(cell).unwrap(), Some(second));
+        repo.set_cell(cell, None).unwrap();
+        assert_eq!(repo.cell(cell).unwrap(), None);
+    }
+
+    #[test]
+    fn cell_values_and_descendants_survive_memory_keep() {
+        use crate::blob::encodings::longstring::LongString;
+        use crate::blob::Blob;
+        use crate::repo::{BlobStoreGet, BlobStoreKeep};
+
+        let mut repo = MemoryRepo::default();
+        let child = repo.put::<LongString, _>("cell child".to_owned()).unwrap();
+        let value: TribleSet = entity! { crate::metadata::name: child }.into();
+        let value = repo.put::<SimpleArchive, _>(value).unwrap();
+        let orphan = repo.put::<LongString, _>("orphan".to_owned()).unwrap();
+        repo.set_cell(Id::new([8; 16]).unwrap(), Some(value))
+            .unwrap();
+
+        repo.keep(std::iter::empty::<Inline<Handle<UnknownBlob>>>());
+
+        let reader = repo.reader().unwrap();
+        assert!(reader
+            .get::<Blob<UnknownBlob>, UnknownBlob>(value.transmute())
+            .is_ok());
+        assert!(reader
+            .get::<Blob<UnknownBlob>, UnknownBlob>(child.transmute())
+            .is_ok());
+        assert!(reader
+            .get::<Blob<UnknownBlob>, UnknownBlob>(orphan.transmute())
+            .is_err());
     }
 
     #[test]

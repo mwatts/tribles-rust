@@ -17,6 +17,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SimpleArchive -> SuccinctArchiveBlob` mapping or raw set union. The canonical
   empty artifact and byte-identical commuting derivation/merge paths are pinned
   by focused tests; none of these equations authorize membership or retention.
+- **Local operational policy now has a storage primitive independent of pins,
+  collections, and wants.** `LocalCellStore` exposes only named LWW read and
+  replace operations over queryable `SimpleArchive` values, with sync/async
+  adapters and Memory, Pile, Yard, hybrid, lazy, Peer, and object-store
+  implementations. Pile uses freshly minted fixed-width value/tombstone
+  markers (`24264FA9EE46A1ACC0E024AE69774B09` and
+  `4FE372AE868D22A44DED7A60D579B651`); current values are recursive local GC
+  roots but grant no collection authority and have no gossip surface. Network
+  renewal state, pending requests, and all per-team capability entries moved
+  from CAS pins into freshly minted cells (`2F6A91899E035E24348CFEE43BC2EA94`,
+  `3894E3CAF6600BE5CF73EDAE8CB1EFCC`, and
+  `CCA97EB4195A17659C9F9162A951CF85`). A read-only legacy marker
+  guard remains in branch publication until old policy pins are migrated, so
+  upgrading cannot disclose them. `BlobStoreList::contains_blob` supplies the
+  guard's non-demanding membership probe, so an unreadable legacy head is
+  suppressed without manufacturing a blob want.
 - **Signed records now use neutral metadata and attestation namespaces.** The
   generic metadata-archive link and Ed25519 signer/signature attributes moved
   out of the legacy repository module without changing their stable IDs or

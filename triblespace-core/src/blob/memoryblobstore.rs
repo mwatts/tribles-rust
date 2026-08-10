@@ -290,6 +290,14 @@ impl BlobStoreList for MemoryBlobStoreReader {
     fn blobs(&self) -> Self::Iter<'static> {
         MemoryBlobStoreListIter { inner: self.iter() }
     }
+
+    fn contains_blob<S>(&self, handle: Inline<Handle<S>>) -> Result<bool, Self::Err>
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: crate::inline::InlineEncoding,
+    {
+        Ok(self.blobs.get(&handle.raw).is_some())
+    }
 }
 
 impl crate::repo::BlobStoreMeta for MemoryBlobStoreReader {

@@ -35,6 +35,7 @@ use crate::collection::{CollectionRecord, CollectionStore};
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
+use crate::local_cell::{AsyncLocalCellStore, LocalCellStore};
 use crate::repo::{
     BlobInfo, BlobMetadata, BlobStore, BlobStoreForget, BlobStoreGet, BlobStoreList, BlobStoreMeta,
     BlobStorePut, PinStore, PushResult,
@@ -349,6 +350,29 @@ where
     }
 }
 
+impl<S> AsyncLocalCellStore for SyncAsAsync<S>
+where
+    S: LocalCellStore + Send,
+{
+    type CellError = S::CellError;
+
+    fn cell(
+        &mut self,
+        id: Id,
+    ) -> impl Future<Output = Result<Option<Inline<Handle<SimpleArchive>>>, Self::CellError>> + Send
+    {
+        async move { self.0.cell(id) }
+    }
+
+    fn set_cell(
+        &mut self,
+        id: Id,
+        value: Option<Inline<Handle<SimpleArchive>>>,
+    ) -> impl Future<Output = Result<(), Self::CellError>> + Send {
+        async move { self.0.set_cell(id, value) }
+    }
+}
+
 impl<S> AsyncPinStore for SyncAsAsync<S>
 where
     S: PinStore + Send,
@@ -575,6 +599,23 @@ impl<A: AsyncCollectionStore> CollectionStore for Blocking<A> {
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
         self.rt.block_on(self.inner.insert(record))
+    }
+}
+
+#[cfg(feature = "object-store")]
+impl<A: AsyncLocalCellStore> LocalCellStore for Blocking<A> {
+    type CellError = A::CellError;
+
+    fn cell(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::CellError> {
+        self.rt.block_on(self.inner.cell(id))
+    }
+
+    fn set_cell(
+        &mut self,
+        id: Id,
+        value: Option<Inline<Handle<SimpleArchive>>>,
+    ) -> Result<(), Self::CellError> {
+        self.rt.block_on(self.inner.set_cell(id, value))
     }
 }
 

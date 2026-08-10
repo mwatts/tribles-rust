@@ -30,16 +30,15 @@ type BranchNameHandle = Inline<Handle<LongString>>;
 #[derive(Parser)]
 pub enum Command {
     /// List named content branches in a pile file (id + head + name).
-    /// Filters to pins carrying `metadata::name` — tracking pins
-    /// and local-only policy pins are excluded (see `pile pin list`
-    /// for the generic all-pins view).
+    /// Filters to pins carrying `metadata::name`; tracking pins are excluded
+    /// (see `pile pin list` for the generic all-pins view).
     List {
         /// Path to the pile file to inspect
         path: PathBuf,
         /// Include all pin records ever seen (scans raw pile records,
         /// including tombstoned pins of every role). Useful for
-        /// forensics — surfaces tracking pins and policy pins
-        /// alongside content branches.
+        /// forensics — surfaces tracking pins and legacy policy pins alongside
+        /// content branches.
         #[arg(long)]
         all: bool,
         /// Only show deleted/tombstoned pins (implies --all)
@@ -307,8 +306,8 @@ pub fn run(cmd: Command) -> Result<()> {
                                 // a branch is, by the Pin/Branch
                                 // taxonomy, a pin that carries
                                 // metadata::name. Pins without a
-                                // name are tracking pins, local-
-                                // only policy pins, or anonymous —
+                                // name are tracking pins, unmigrated legacy
+                                // policy pins, or anonymous —
                                 // none of which belong in
                                 // `branch list`. See `pile pin list`
                                 // for the generic all-pins view.
@@ -1894,6 +1893,8 @@ fn scan_pile_records(path: &std::path::Path) -> Result<Vec<RawBranchRecord>> {
                 meta_handle: None,
             }),
             PileRecordContent::Blob { .. }
+            | PileRecordContent::LocalCell { .. }
+            | PileRecordContent::LocalCellTombstone { .. }
             | PileRecordContent::WeakPin { .. }
             | PileRecordContent::WeakUnpin { .. }
             | PileRecordContent::Collection { .. } => {}

@@ -31,6 +31,7 @@ use std::time::Duration;
 use anybytes::Bytes;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::inline::Inline;
+use triblespace_core::local_cell::LocalCellStore;
 use triblespace_core::repo::{
     BlobStore, BlobStoreGet, BlobStorePut, PinStore, StorageFlush, WantStore,
 };
@@ -146,7 +147,14 @@ impl Reconciler {
     /// reachable, never an error.
     pub async fn tick<S>(&mut self, peer: &mut Peer<S>) -> ReconcileStats
     where
-        S: BlobStore + BlobStorePut + PinStore + WantStore + StorageFlush + Send + 'static,
+        S: BlobStore
+            + BlobStorePut
+            + LocalCellStore
+            + PinStore
+            + WantStore
+            + StorageFlush
+            + Send
+            + 'static,
     {
         let mut stats = ReconcileStats::default();
 

@@ -28,10 +28,9 @@ pub enum PileCommand {
         #[command(subcommand)]
         cmd: branch::Command,
     },
-    /// Operations on the pin storage primitive (every named handle
-    /// in the pile, regardless of role). Branches, tracking mirrors,
-    /// and local-only policy pins all show up here. For the branch-
-    /// specific view, see `pile branch`.
+    /// Operations on the legacy pin storage primitive. Branches and tracking
+    /// mirrors show up here; local policy lives in separate local cells. For
+    /// the branch-specific view, see `pile branch`.
     Pin {
         #[command(subcommand)]
         cmd: pin::Command,

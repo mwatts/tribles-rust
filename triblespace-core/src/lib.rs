@@ -27,6 +27,8 @@ pub mod id;
 pub mod import;
 /// Inline types, schemas, and conversion traits.
 pub mod inline;
+/// Local named operational values, independent of collections and repository branches.
+pub mod local_cell;
 /// Bootstrap metadata namespace for describing schemas and attributes.
 pub mod metadata;
 /// Adaptive radix tree (PATCH) used as the backing store for trible indexes.

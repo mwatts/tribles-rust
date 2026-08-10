@@ -72,7 +72,7 @@ trible team request-join --admin HEX --scope (read|write|admin)
                          [--key PATH] [--pile PATH]
     Send an OP_REQUEST_CAP to an admin's running daemon asking to
     be issued a capability. The admin sees the request on their
-    pending-requests pin (`team list-pending`); after `team approve`
+    pending-requests cell (`team list-pending`); after `team approve`
     the freshly-signed cap arrives via the auth-handshake ALPN.
 
 trible team approve --pile PATH --entry HEX --team-root HEX
@@ -258,9 +258,31 @@ be tightened to hours.
 Renewal happens via the same `OP_DELIVER_CAP` path that `team
 approve` uses: the issuer's daemon signs a fresh cap with a
 later expiry, dispatches it to the subject's daemon over the
-auth-handshake ALPN, and the subject pins it on the team-cap pin.
+auth-handshake ALPN, and the subject records it in the team-cap cell.
 `team list-issued` shows the renewal-policy entries this node is
-keeping renewed; `team retract --entry HEX` removes one.
+keeping renewed; `team retract --entry HEX` marks one as non-renewing.
+
+These three pieces of mutable policy—pending requests, renewal entries, and
+current team capabilities—are stored as ordinary queryable `SimpleArchive`
+values behind three local cells. Cells are recursive local retention roots, but
+they are neither branch authority nor wants and have no gossip surface. All
+teams share one team-cap cell value; replacing one intrinsic team entry leaves
+the other teams unchanged.
+
+Cell replacement is atomic, but editing a whole archive is deliberately not a
+cross-process transaction. Two processes that read the same cell and then
+replace it can lose one another's otherwise-disjoint edits: the later
+replacement wins for the whole value. Until policy mutations are routed
+through the daemon as the single writer, stop `pile net sync` while running
+policy-mutating CLI commands such as `team invite`, `team approve`, and
+`team retract`, then restart it. Read-only commands may run concurrently.
+
+An upgraded binary does not yet import policy written in the former
+local-policy-pin representation. Those legacy heads remain conservatively
+suppressed from gossip, so the upgrade cannot disclose them, but renewal,
+pending-request, and team-cap state must be migrated or re-established before
+the new cell-backed policy sees it. Removing that guard depends on landing and
+running the explicit legacy migration.
 
 ## `PeerConfig` Surface
 

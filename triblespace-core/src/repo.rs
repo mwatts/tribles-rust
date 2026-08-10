@@ -302,6 +302,26 @@ pub trait BlobStoreList {
     /// Lists all blobs in the repository.
     fn blobs<'a>(&'a self) -> Self::Iter<'a>;
 
+    /// Test whether one blob is present in this reader snapshot without
+    /// turning absence into demand.
+    ///
+    /// The default derives membership from [`blobs`](Self::blobs). Indexed
+    /// local readers should override it with their native lookup; wrappers
+    /// should delegate to the wrapped snapshot. Unlike [`BlobStoreGet::get`],
+    /// this is always an observation and must not record a want or fetch.
+    fn contains_blob<S>(&self, handle: Inline<Handle<S>>) -> Result<bool, Self::Err>
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding,
+    {
+        for info in self.blobs() {
+            if info?.handle.raw == handle.raw {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Lists blobs in `self` that are not in `old`.
     ///
     /// Backends with true snapshot semantics (e.g. [`Pile`],
@@ -571,17 +591,13 @@ pub type PinSnapshot = PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>;
 /// pile's compaction sweep treats every pin head as a reachability
 /// root: blobs reachable from a pin survive; the rest are reclaimed.
 ///
-/// Pins back several specialized use patterns, distinguished at
+/// Pins back specialized branch use patterns, distinguished at
 /// higher layers via metadata markers:
 /// - A **branch** is a pin whose value resolves to a commit-chain
 ///   head (Repository's content abstraction). Branch metadata
 ///   carries `metadata::name` for human-readable lookup.
 /// - A **tracking pin** mirrors a remote peer's branch head and
 ///   carries `tracking_remote_pin` + `remote_name`.
-/// - A **local-only pin** (renewal policy, pending requests,
-///   per-team cap holdings) carries `local_only_pin: <kind>` and is
-///   excluded from gossip publication.
-///
 /// `PinStore` itself doesn't know about these distinctions — it just
 /// provides the primitive: enumerate ids, read the current head, CAS
 /// an update. The two-level taxonomy lives at higher layers
@@ -605,8 +621,10 @@ pub trait PinStore {
     where
         Self: 'a;
 
-    /// Lists every pin in the store. Returns a fallible iterator over
-    /// pin ids (any role — branches, tracking pins, local-only pins).
+    /// Lists every pin in the store. Returns a fallible iterator over pin ids
+    /// of any role. Current repository code uses content branches and tracking
+    /// mirrors; old stores or applications may also contain legacy or anonymous
+    /// pins.
     /// Callers that want only content branches filter by checking for
     /// the `metadata::name` attribute on each pin's head metadata.
     fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError>;
@@ -681,7 +699,8 @@ pub trait PinStore {
 /// handle is both the durable demand key consumed by synchronization
 /// daemons and the cache-retention key after the bytes arrive.
 ///
-/// Wants are independent of named mutable [`PinStore`] cells. A backend
+/// Wants are independent of named mutable [`PinStore`] branches and
+/// [`LocalCellStore`](crate::local_cell::LocalCellStore) policy cells. A backend
 /// may support either capability without supporting the other. Repeated
 /// [`want`](Self::want) and [`unwant`](Self::unwant) operations resolve
 /// last-writer-wins per handle; [`wants`](Self::wants) enumerates the

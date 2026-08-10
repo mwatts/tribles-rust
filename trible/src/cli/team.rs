@@ -114,10 +114,10 @@ pub enum Command {
     },
     /// Send an `OP_REQUEST_CAP` to a team admin asking to be issued
     /// a capability. The admin's running daemon records the request
-    /// on its pending-requests pin (visible via `team list-pending`);
+    /// in its pending-requests cell (visible via `team list-pending`);
     /// once they approve via `team approve`, the freshly-signed cap
-    /// arrives via the auth-handshake ALPN and the daemon pins it
-    /// on the team-cap pin.
+    /// arrives via the auth-handshake ALPN and the daemon stores it
+    /// in the team-cap cell.
     RequestJoin {
         /// Admin's pubkey (hex).
         #[arg(long)]
@@ -552,7 +552,7 @@ fn run_invite(
         store_blob(pile, cap_blob)?;
         store_blob(pile, sig_blob)?;
 
-        // Record on the renewal-policy pin so the running `pile net
+        // Record in the renewal-policy cell so the running `pile net
         // sync` daemon's renewal_tick takes over from here: once this
         // cap nears expiry, the daemon signs a successor and
         // dispatches via OP_DELIVER_CAP. The invitee experiences the
@@ -1154,7 +1154,7 @@ fn run_retract(pile_path: PathBuf, entry_hex: String) -> Result<()> {
             Ok(())
         }
         None => bail!(
-            "retract failed: entry {} not found, or the renewal-policy pin is missing/locked",
+            "retract failed: entry {} not found, or the renewal-policy cell is missing/unavailable",
             hex::encode(<[u8; 16]>::from(entry_id))
         ),
     }
@@ -1245,7 +1245,7 @@ fn run_request_join(
             println!("ACK — admin received your request and queued it.");
             println!("They'll see it under `team list-pending`.");
             println!("Once approved, your cap arrives via the auth-handshake ALPN;");
-            println!("a running `pile net sync` daemon will pin it on the team-cap pin.");
+            println!("a running `pile net sync` daemon will store it in the team-cap cell.");
             Ok(())
         }
         triblespace_net::handshake::STATUS_REJECTED => bail!("admin rejected the request"),
@@ -1394,7 +1394,7 @@ fn run_approve(
         let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
         let request_id = request.id;
 
-        // Persist cap+sig blobs, record on the renewal-policy pin,
+        // Persist cap+sig blobs, record in the renewal-policy cell,
         // mark the request approved — purely local writes, no
         // network. The running `pile net sync` daemon's
         // `redispatch_undelivered` loop picks the new policy entry up

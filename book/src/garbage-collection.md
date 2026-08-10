@@ -62,7 +62,10 @@ The resulting roots compose with both storage paths. Yard's `collect` and
 roots. `Pile::rewrite_retained_into` copies the selected state into
 another append-only pile and also recursively retains and recreates every active
 legacy strong-pin mapping, which allows pinned branches and collection scopes to
-coexist during migration. Weak wants are an explicit rewrite choice. Preserving
+coexist during migration. Current `LocalCellStore` values are also recursive
+local roots and are recreated by retained pile rewrites. That keeps operational
+policy alive without granting collection authority or exposing a branch to
+gossip. Weak wants are an explicit rewrite choice. Preserving
 them copies their demand markers but does not promote the requested blob to an
 ownership root; dropping them omits the markers entirely.
 

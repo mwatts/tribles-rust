@@ -1,7 +1,7 @@
 # Pile Format
 
-The on-disk pile keeps blobs, native collection records, and pins in one
-append-only file. The write-ahead log *is* the database: all indices are
+The on-disk pile keeps blobs, native collection records, pins, local cells,
+and wants in one append-only file. The write-ahead log *is* the database: all indices are
 reconstructed from the bytes already stored on disk. This design avoids
 background compaction, manifest management, or auxiliary metadata while still
 providing a durable content-addressed store for local repositories. The pile
@@ -19,7 +19,8 @@ memory map never exposes half-written records.
 
 Every record the pile writes today — blob, native collection definition,
 collection commit, collection merge, collection derive, branch (pin) head,
-branch tombstone, want assertion, or want retraction — uses the **V3** layout:
+branch tombstone, local-cell value, local-cell tombstone, want assertion, or
+want retraction — uses the **V3** layout:
 a fixed **256-byte header**, followed (for blobs) by the payload, padded so the
 whole record is a **256-byte multiple**. Want records retain their historical
 weak-pin/weak-unpin magic markers for byte compatibility; those are physical
@@ -71,7 +72,8 @@ refreshing state.
    in memory. It **fails
    loud** on a corrupt or torn tail (`ReadError::CorruptPile { valid_length }`)
    and never mutates the file. Callers rarely need to invoke it directly:
-   `reader`, `records`, `pins`, `head`, and `update` call `refresh` internally
+   `reader`, `records`, `pins`, `head`, `update`, `cell`, and `set_cell` call
+   `refresh` internally
    before they inspect or apply records, so external writers are visible
    without a standalone scan.
 3. **Amputate only when asked to.** `amputate` is the explicit, opt-in repair
@@ -82,7 +84,8 @@ refreshing state.
    every newer-format record past the first one it misreads as corruption).
    The `trible pile amputate <path>` command wraps it for operators.
 4. **Append new records.** `put` (through the `BlobStorePut` trait),
-   `CollectionStore::insert`, and pin update helpers extend the file. Each
+   `CollectionStore::insert`, local-cell replacement, and pin update helpers
+   extend the file. Each
    append immediately feeds the bytes back through the record scanner so
    in-memory indices stay synchronised without waiting for a manual `refresh`.
    Blob records use a single `write_vectored` call; fixed-width collection and
@@ -242,7 +245,7 @@ explains how to query these fields through the `PileReader` API.
 `CollectionStore` is a grow-only set of canonical collection-calculus records.
 The pile stores its four record kinds directly as fixed 256-byte V3 records;
 they are **not blob records**, have no following payload, and carry no
-insertion timestamp. They are also distinct from the legacy mutable pin cells
+insertion timestamp. They are also distinct from mutable branch pins and local cells
 described below: collection records have no head, tombstone, or
 last-writer-wins update. Their logical key is the record's intrinsic entity ID.
 
@@ -299,6 +302,34 @@ pile does not check whether the referenced blob exists locally, allowing
 deployments that store heads on disk while serving blob contents from a remote
 store.
 
+## Local Cell Records
+
+```text
+            ┌────16 byte───┐┌────16 byte───┐┌────────────32 byte───────────┐┌───192 byte───┐
+          ┌ ┌──────────────┐┌──────────────┐┌──────────────────────────────┐┌──────────────┐
+ value    │ │ cell marker  ││   cell id    ││      SimpleArchive handle    ││  reserved 0s │
+ (256 B)  └ └──────────────┘└──────────────┘└──────────────────────────────┘└──────────────┘
+
+            ┌────16 byte───┐┌────16 byte───┐┌──────────────224 byte────────────────────────┐
+          ┌ ┌──────────────┐┌──────────────┐┌──────────────────────────────────────────────┐
+ clear    │ │ clear marker ││   cell id    ││                 reserved 0s                  │
+ (256 B)  └ └──────────────┘└──────────────┘└──────────────────────────────────────────────┘
+```
+
+Local cells are named last-writer-wins operational values. Their V3 markers are
+`24264FA9EE46A1ACC0E024AE69774B09` (replace) and
+`4FE372AE868D22A44DED7A60D579B651` (clear), minted with `trible genid` on
+2026-08-10. A clear is material even in a pile that has not observed an older
+value, so concatenating that pile after an older one still suppresses the old
+cell.
+
+Cells are deliberately not branches: they have no compare-and-swap guard,
+history, enumeration API, collection authority, or gossip surface. They are
+also not wants. A current cell value is instead a recursive **local operational
+retention root**, allowing queryable policy stored in ordinary
+`SimpleArchive` blobs to survive collection without asserting that it belongs
+to any published collection.
+
 ## Want Records
 
 ```text
@@ -312,7 +343,7 @@ A want assertion (and its retraction counterpart, using the same layout with a
 different marker) is keyed by **blob handle** — per-blob and anonymous, with no
 pin ID. Assertions and retractions resolve last-writer-wins per handle. The
 resulting [`WantStore`](https://docs.rs/triblespace-core/latest/triblespace_core/repo/trait.WantStore.html)
-state is independent from named mutable pin cells: a pile may use wants for
+state is independent from mutable branches and local policy cells: a pile may use wants for
 fetch-on-demand and bounded cache retention without using branches at all.
 Because wants are durable records, reopening a pile reconstructs the current
 wanted set. The implementation keeps the original weak-pin/weak-unpin marker
