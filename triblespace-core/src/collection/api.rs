@@ -6,7 +6,7 @@
 //! repository abstraction: it has no head, branch, CAS, retry, read-admission,
 //! or planning policy.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
@@ -26,10 +26,10 @@ use super::simplearchive_union::{
     self, MaterializationError, PublicationError, SimpleArchiveUnionValidationError,
 };
 use super::{
-    discover_collection_records, resolve_collection_semantics, CollectionClaimValidation,
-    CollectionCommit, CollectionData, CollectionDefinition, CollectionDiscoveryError,
-    CollectionFunctionalConflict, CollectionResolutionError, CollectionStore,
-    CollectionValidationRequest,
+    collection_physical_cover, discover_collection_records, resolve_collection_semantics,
+    CollectionClaimValidation, CollectionCommit, CollectionData, CollectionDefinition,
+    CollectionDiscoveryError, CollectionFunctionalConflict, CollectionResolutionError,
+    CollectionStore, CollectionValidationRequest,
 };
 
 /// A scoped `SimpleArchive`-union collection and its signing authority.
@@ -274,10 +274,16 @@ where
     /// signed commit in that record view which names this exact collection and
     /// this facade's public key is mandatory membership; commits from foreign
     /// keys are ignored. All own commit dependencies are exact-validated and
-    /// fail loud. Exact resident merge equations may replace redundant leaves
-    /// in the physical cover, while missing or invalid unsigned equations are
-    /// treated as cache misses and the committed leaves remain authoritative.
+    /// fail loud. Merge validation is restricted to the subgraph between
+    /// authenticated leaves and resident result artifacts, while allowing
+    /// nonresident intermediate equations. Exact resident results may replace
+    /// redundant leaves in the physical cover; corrupt artifacts and missing,
+    /// invalid, or irrelevant unsigned equations are cache misses and the
+    /// committed leaves remain authoritative.
     /// Derivations are not admitted by this `SimpleArchive`-only facade.
+    /// This boundary assumes records have already passed deployment admission:
+    /// it prevents unsigned records from acquiring blob authority, but does
+    /// not bound CPU spent validating arbitrarily many admitted equations.
     ///
     /// This is a **known-prefix** read, not a global-latest transaction:
     /// [`CollectionStore`] does not promise a coherent snapshot under
@@ -323,11 +329,11 @@ where
             .reader()
             .map_err(CollectionMaterializationError::Reader)?;
 
-        // Authenticate and exact-validate every mandatory leaf first. Besides
-        // enforcing the signed boundary, this cache means an unsigned merge
-        // never causes the same large endpoint to be fetched and scanned over
-        // and over in one materialization.
+        // Authenticate and exact-validate every mandatory leaf first. Each
+        // signed endpoint is fetched once and remains available for fallback;
+        // derived scratch values below have a shorter, use-counted lifetime.
         let mut known = BTreeMap::<CollectionData, Blob<SimpleArchive>>::new();
+        let mut roots = BTreeSet::new();
         for claim in discovered
             .commits()
             .iter()
@@ -374,78 +380,183 @@ where
                     },
                 );
             }
+            roots.insert(data);
             known.entry(data).or_insert(data_blob);
         }
 
-        // Grow only through merge equations grounded in authenticated leaves.
-        // The exact join for one input pair is cached and compared before any
-        // speculative result fetch, so arbitrary result hashes neither mint
-        // Yard wants nor trigger repeated large-input scans. A result is
-        // admitted only when it is already resident and byte-for-byte equal to
-        // that canonical join; all other unsigned evidence remains inert.
-        let mut accepted_merges = BTreeSet::new();
-        let mut examined_merges = BTreeSet::new();
-        let mut joins = BTreeMap::<(CollectionData, CollectionData), Blob<SimpleArchive>>::new();
-        loop {
-            let mut changed = false;
-            for claim in discovered
-                .merges()
-                .iter()
-                .filter(|claim| claim.collection() == collection)
-            {
-                if examined_merges.contains(&claim.id()) {
-                    continue;
-                }
-                let (low, high) = claim.inputs();
-                let (Some(low_blob), Some(high_blob)) = (known.get(&low), known.get(&high)) else {
-                    continue;
-                };
+        // Unsigned merges are useful only when they can contribute to a
+        // resident physical cover. Walk backwards from resident result hashes
+        // first, then validate that finite subgraph forwards from authenticated
+        // leaves. This retains the resolver's nonresident-intermediate model:
+        // an intermediate need not be stored when its computed bytes feed a
+        // later resident result.
+        let merges: Vec<_> = discovered
+            .merges()
+            .iter()
+            .filter(|claim| claim.collection() == collection)
+            .copied()
+            .collect();
+        let mut producers = BTreeMap::<CollectionData, Vec<usize>>::new();
+        for (index, claim) in merges.iter().enumerate() {
+            producers.entry(claim.result()).or_default().push(index);
+        }
 
-                let expected = match joins.entry((low, high)) {
-                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        let Ok(joined) = simplearchive_union::join(low_blob, high_blob) else {
+        let mut resident_results = BTreeSet::new();
+        let mut reverse_seen = BTreeSet::new();
+        let mut reverse_queue = VecDeque::new();
+        for result in producers.keys().copied() {
+            let resident = known.contains_key(&result)
+                || matches!(
+                    reader.metadata(Handle::<SimpleArchive>::from_hash(result)),
+                    Ok(Some(_))
+                );
+            if resident {
+                resident_results.insert(result);
+                if reverse_seen.insert(result) {
+                    reverse_queue.push_back(result);
+                }
+            }
+        }
+
+        let mut candidates = BTreeSet::new();
+        while let Some(result) = reverse_queue.pop_front() {
+            let Some(indices) = producers.get(&result) else {
+                continue;
+            };
+            for &index in indices {
+                candidates.insert(index);
+                let (low, high) = merges[index].inputs();
+                for input in [low, high] {
+                    if reverse_seen.insert(input) {
+                        reverse_queue.push_back(input);
+                    }
+                }
+            }
+        }
+
+        // Index each candidate by its missing inputs. Newly admitted results
+        // wake only their direct dependants, avoiding repeated global scans as
+        // a deep LSM cover becomes grounded.
+        let mut missing = vec![u8::MAX; merges.len()];
+        let mut waiters = BTreeMap::<CollectionData, Vec<usize>>::new();
+        let mut remaining_uses = BTreeMap::<CollectionData, usize>::new();
+        let mut ready = BTreeSet::new();
+        for &index in &candidates {
+            let claim = &merges[index];
+            let (low, high) = claim.inputs();
+            *remaining_uses.entry(low).or_default() += 1;
+            if high != low {
+                *remaining_uses.entry(high).or_default() += 1;
+            }
+            let mut count = 0u8;
+            if !known.contains_key(&low) {
+                waiters.entry(low).or_default().push(index);
+                count += 1;
+            }
+            if high != low && !known.contains_key(&high) {
+                waiters.entry(high).or_default().push(index);
+                count += 1;
+            }
+            missing[index] = count;
+            if count == 0 {
+                ready.insert((claim.id(), index));
+            }
+        }
+
+        let mut accepted_merges = BTreeSet::new();
+        let mut expected_hashes =
+            BTreeMap::<(CollectionData, CollectionData), CollectionData>::new();
+        while let Some((_, index)) = ready.pop_first() {
+            let claim = &merges[index];
+            let (low, high) = claim.inputs();
+            let pair = (low, high);
+
+            let mut joined = None;
+            let expected_data = if let Some(expected) = expected_hashes.get(&pair).copied() {
+                Some(expected)
+            } else {
+                match (known.get(&low), known.get(&high)) {
+                    (Some(low_blob), Some(high_blob)) => {
+                        match simplearchive_union::join(low_blob, high_blob) {
+                            Ok(value) => {
+                                let expected = Handle::<SimpleArchive>::to_hash(value.get_handle());
+                                expected_hashes.insert(pair, expected);
+                                joined = Some(value);
+                                Some(expected)
+                            }
                             // `known` contains only exact-validated canonical
                             // elements, so this is a defensive invariant guard.
-                            examined_merges.insert(claim.id());
-                            continue;
+                            Err(_) => None,
+                        }
+                    }
+                    _ => None,
+                }
+            };
+
+            if let Some(expected_data) = expected_data.filter(|data| *data == claim.result()) {
+                let retain_result = remaining_uses
+                    .get(&expected_data)
+                    .copied()
+                    .unwrap_or_default()
+                    > 0;
+                let inserted = if known.contains_key(&expected_data) || !retain_result {
+                    false
+                } else {
+                    if joined.is_none() {
+                        joined = match (known.get(&low), known.get(&high)) {
+                            (Some(low_blob), Some(high_blob)) => {
+                                simplearchive_union::join(low_blob, high_blob).ok()
+                            }
+                            _ => None,
                         };
-                        entry.insert(joined)
+                    }
+                    if let Some(value) = joined {
+                        debug_assert_eq!(
+                            Handle::<SimpleArchive>::to_hash(value.get_handle()),
+                            expected_data
+                        );
+                        known.insert(expected_data, value);
+                        true
+                    } else {
+                        false
                     }
                 };
-                let expected_data = Handle::<SimpleArchive>::to_hash(expected.get_handle());
-                if claim.result() != expected_data {
-                    examined_merges.insert(claim.id());
-                    continue;
-                }
 
-                if !known.contains_key(&expected_data) {
-                    let result_handle = Handle::<SimpleArchive>::from_hash(expected_data);
-                    if !matches!(reader.metadata(result_handle), Ok(Some(_))) {
-                        examined_merges.insert(claim.id());
-                        continue;
-                    }
-                    let Ok(result): Result<Blob<SimpleArchive>, _> = reader.get(result_handle)
-                    else {
-                        examined_merges.insert(claim.id());
-                        continue;
+                // A terminal result needs no retained bytes: its canonical
+                // hash already validates the equation, and a selected
+                // physical artifact is exact-checked later. A nonterminal
+                // result is accepted only when its bytes remain available to
+                // validate its dependants.
+                if known.contains_key(&expected_data) || !retain_result {
+                    accepted_merges.insert(claim.id());
+                    if inserted {
+                        for dependent in waiters.remove(&expected_data).unwrap_or_default() {
+                            debug_assert!(missing[dependent] > 0 && missing[dependent] <= 2);
+                            missing[dependent] -= 1;
+                            if missing[dependent] == 0 {
+                                ready.insert((merges[dependent].id(), dependent));
+                            }
+                        }
                     };
-                    if result.bytes != expected.bytes {
-                        examined_merges.insert(claim.id());
-                        continue;
-                    }
-                    known.insert(
-                        expected_data,
-                        Blob::with_handle(expected.bytes.clone(), expected.get_handle()),
-                    );
                 }
-
-                accepted_merges.insert(claim.id());
-                examined_merges.insert(claim.id());
-                changed = true;
             }
-            if !changed {
-                break;
+
+            // Computed intermediate bytes live only until their final
+            // candidate consumer has run. This keeps a balanced LSM to one
+            // live derived frontier instead of retaining the dataset once per
+            // level. Authenticated leaves stay cached for mandatory fallback.
+            for input in [Some(low), (high != low).then_some(high)]
+                .into_iter()
+                .flatten()
+            {
+                let uses = remaining_uses
+                    .get_mut(&input)
+                    .expect("candidate inputs have reference counts");
+                debug_assert!(*uses > 0);
+                *uses -= 1;
+                if *uses == 0 && !roots.contains(&input) {
+                    known.remove(&input);
+                }
             }
         }
 
@@ -470,8 +581,85 @@ where
             }
         };
 
-        simplearchive_union::materialize(resolution.semantics(), &self.definition, &reader)
-            .map_err(CollectionMaterializationError::Materialize)
+        // Optional physical results are accelerators, not failure authority.
+        // Offer only metadata-resident, semantically accepted results to the
+        // cover algorithm, then exact-check just the members it selects. A bad
+        // candidate is removed and the cover is recomputed, so corrupt or
+        // stale artifacts fall back to another cover without forcing eager
+        // reads of the full historical LSM. Mandatory root bytes already
+        // failed loud above.
+        let semantics = resolution.semantics();
+        let mut resident = roots.clone();
+        for data in semantics.members(collection).into_iter().flatten().copied() {
+            if resident_results.contains(&data) {
+                resident.insert(data);
+            }
+        }
+
+        let mut selected = BTreeMap::<CollectionData, Blob<SimpleArchive>>::new();
+        let cover = loop {
+            let cover = collection_physical_cover(semantics, collection, &resident);
+            if !cover.missing.is_empty() {
+                return Err(CollectionMaterializationError::Materialize(
+                    MaterializationError::Missing {
+                        obligations: cover.missing,
+                    },
+                ));
+            }
+
+            selected.retain(|data, _| cover.cover.contains(data));
+            let mut rejected = Vec::new();
+            for data in cover.cover.iter().copied() {
+                if roots.contains(&data) || selected.contains_key(&data) {
+                    continue;
+                }
+                let handle = Handle::<SimpleArchive>::from_hash(data);
+                let actual: Result<Blob<SimpleArchive>, _> = reader.get(handle);
+                match actual {
+                    Ok(actual) => {
+                        let actual = Blob::<SimpleArchive>::new(actual.bytes.clone());
+                        let actual_data = Handle::<SimpleArchive>::to_hash(actual.get_handle());
+                        if actual_data == data
+                            && simplearchive_union::validate_element(&actual).is_ok()
+                        {
+                            selected.insert(data, actual);
+                        } else {
+                            rejected.push(data);
+                        }
+                    }
+                    Err(_) => rejected.push(data),
+                }
+            }
+
+            if rejected.is_empty() {
+                break cover.cover;
+            }
+            for data in rejected {
+                resident.remove(&data);
+            }
+        };
+
+        let mut facts = TribleSet::new();
+        for data in cover {
+            let blob = if roots.contains(&data) {
+                known
+                    .get(&data)
+                    .expect("authenticated root bytes stay cached")
+            } else {
+                selected
+                    .get(&data)
+                    .expect("optional cover members were exact-validated")
+            };
+            let blob = blob.clone();
+            let member: TribleSet = blob.try_from_blob().map_err(|source| {
+                CollectionMaterializationError::Materialize(MaterializationError::InvalidElement {
+                    data,
+                    source,
+                })
+            })?;
+            facts += member;
+        }
+        Ok(facts)
     }
 }
 
@@ -830,7 +1018,7 @@ mod tests {
     }
 
     #[test]
-    fn grounded_merge_chain_materializes_the_committed_union() {
+    fn resident_top_cover_can_use_a_nonresident_intermediate() {
         let mut collection = Collection::new(
             MemoryRepo::default(),
             id(1),
@@ -845,9 +1033,9 @@ mod tests {
         let mut expected = first.facts().clone();
         expected += second.facts().clone();
         expected += third.facts().clone();
-        collection.commit(first).unwrap();
-        collection.commit(second).unwrap();
-        collection.commit(third).unwrap();
+        let first_commit = collection.commit(first).unwrap();
+        let second_commit = collection.commit(second).unwrap();
+        let third_commit = collection.commit(third).unwrap();
         let definition = *collection.definition();
 
         let (_, first_two) = simplearchive_union::publish_merge(
@@ -857,13 +1045,126 @@ mod tests {
             &second_blob,
         )
         .unwrap();
-        simplearchive_union::publish_merge(
+        let (_, top) = simplearchive_union::publish_merge(
             collection.storage_mut(),
             &definition,
             &first_two,
             &third_blob,
         )
         .unwrap();
+        collection.storage_mut().blobs.keep([
+            Handle::<SimpleArchive>::from_hash(first_commit.data()).transmute(),
+            first_commit.metadata().transmute(),
+            Handle::<SimpleArchive>::from_hash(second_commit.data()).transmute(),
+            second_commit.metadata().transmute(),
+            Handle::<SimpleArchive>::from_hash(third_commit.data()).transmute(),
+            third_commit.metadata().transmute(),
+            top.get_handle().transmute(),
+        ]);
+
+        assert_eq!(collection.materialize().unwrap(), expected);
+    }
+
+    #[test]
+    fn shared_nonresident_intermediate_lives_through_all_consumers() {
+        let mut collection = Collection::new(
+            MemoryRepo::default(),
+            id(1),
+            SigningKey::from_bytes(&[7; 32]),
+        );
+        let fragments = [
+            fragment(1, false),
+            fragment(2, false),
+            fragment(3, false),
+            fragment(4, false),
+        ];
+        let blobs: Vec<_> = fragments
+            .iter()
+            .map(|fragment| fragment.facts().clone().to_blob())
+            .collect();
+        let mut expected = TribleSet::new();
+        let mut commits = Vec::new();
+        for fragment in fragments {
+            expected += fragment.facts().clone();
+            commits.push(collection.commit(fragment).unwrap());
+        }
+        let definition = *collection.definition();
+
+        // X is shared by two children. Reference-counted scratch must retain
+        // it until both Y and Z have consumed it, even though none of X/Y/Z is
+        // physically resident when the final top artifact is materialized.
+        let (_, x) = simplearchive_union::publish_merge(
+            collection.storage_mut(),
+            &definition,
+            &blobs[0],
+            &blobs[1],
+        )
+        .unwrap();
+        let (_, y) = simplearchive_union::publish_merge(
+            collection.storage_mut(),
+            &definition,
+            &x,
+            &blobs[2],
+        )
+        .unwrap();
+        let (_, z) = simplearchive_union::publish_merge(
+            collection.storage_mut(),
+            &definition,
+            &x,
+            &blobs[3],
+        )
+        .unwrap();
+        let (_, top) =
+            simplearchive_union::publish_merge(collection.storage_mut(), &definition, &y, &z)
+                .unwrap();
+
+        let mut keep = Vec::new();
+        for commit in commits {
+            keep.push(Handle::<SimpleArchive>::from_hash(commit.data()).transmute());
+            keep.push(commit.metadata().transmute());
+        }
+        keep.push(top.get_handle().transmute());
+        collection.storage_mut().blobs.keep(keep);
+
+        assert_eq!(collection.materialize().unwrap(), expected);
+    }
+
+    #[test]
+    fn corrupt_optional_merge_result_falls_back_to_committed_leaves() {
+        let mut collection = Collection::new(
+            MemoryRepo::default(),
+            id(1),
+            SigningKey::from_bytes(&[7; 32]),
+        );
+        let left_fragment = fragment(1, false);
+        let right_fragment = fragment(2, false);
+        let left_blob = left_fragment.facts().clone().to_blob();
+        let right_blob = right_fragment.facts().clone().to_blob();
+        let mut expected = left_fragment.facts().clone();
+        expected += right_fragment.facts().clone();
+        let left = collection.commit(left_fragment).unwrap();
+        let right = collection.commit(right_fragment).unwrap();
+        let definition = *collection.definition();
+        let (_, merged) = simplearchive_union::publish_merge(
+            collection.storage_mut(),
+            &definition,
+            &left_blob,
+            &right_blob,
+        )
+        .unwrap();
+        let merged_handle = merged.get_handle();
+
+        collection.storage_mut().blobs.keep([
+            Handle::<SimpleArchive>::from_hash(left.data()).transmute(),
+            left.metadata().transmute(),
+            Handle::<SimpleArchive>::from_hash(right.data()).transmute(),
+            right.metadata().transmute(),
+        ]);
+        let wrong = archive(9);
+        collection
+            .storage_mut()
+            .blobs
+            .insert(Blob::with_handle(wrong.bytes, merged_handle));
 
         assert_eq!(collection.materialize().unwrap(), expected);
     }

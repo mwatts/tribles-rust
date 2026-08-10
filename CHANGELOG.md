@@ -123,10 +123,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exact-collection commits strictly signed by that same key, treats invalid
   signatures as unauthenticated inert diagnostics, and fails loud on every
   authenticated dependency including the exact signed metadata identity.
-  Resident merge records are validated only as they become reachable from
-  those roots and may provide an optional physical cover without letting
-  missing, invalid, or ungrounded cache equations hide leaves or manufacture
-  speculative blob demand. Its documented concurrency contract is one
+  Merge validation is restricted to the subgraph backwards-reachable from
+  resident results and forwards-reachable from those roots; nonresident
+  intermediates remain usable, while optional result bytes are exact-checked
+  before a tentative cover is accepted. Missing, corrupt, invalid, ungrounded,
+  or irrelevant
+  cache equations cannot hide leaves or manufacture demand-born blob fetches.
+  Materialization explicitly remains downstream of record admission: durable
+  validation receipts or bounded network admission are still required to cap
+  CPU and temporary resource work from arbitrarily many distinct equations.
+  Its documented concurrency contract is one
   complete known prefix, not global latest. It has no parents, head, conflict
   retry, message field, planner, or tuning knobs. Optional procedural-macro
   instrumentation uses the same path and one explicit

@@ -52,10 +52,22 @@ record fields and is therefore an inert diagnostic, never an owner-attributed
 veto. Every strictly verified own commit is ground truth: its definition, data
 archive, and exact metadata archive must all validate or the read fails instead
 of silently returning a partial set. Valid resident `MERGE` records may provide
-a compact physical cover. They are considered only as their inputs become
-reachable from those authenticated leaves; missing, invalid, or ungrounded
+a compact physical cover. Validation is the intersection of two reachability
+walks: backwards from resident result identities (through nonresident
+intermediates when needed), then forwards from authenticated leaves. Optional
+result bytes are exact-checked against their computed canonical identity before
+a tentative physical cover is accepted. Missing, corrupt, invalid, ungrounded,
+or irrelevant
 unsigned merge evidence is merely a cache miss, so it cannot erase committed
-leaves or drive speculative blob demand.
+leaves or drive demand-born blob fetches.
+
+This read boundary assumes that collection records have already passed the
+deployment's admission policy. It bounds blob authority, not arbitrary CPU
+work: each distinct admitted equation may still require canonical union
+validation. A network service must therefore authenticate and bound record
+admission (or retain immutable validation receipts) before placing untrusted
+claims in its durable `CollectionStore`; otherwise both validation CPU and
+temporary resource use scale with the admitted equation graph.
 
 Materialization has the same observed-prefix concurrency contract as native
 record listing. It first discovers one deterministic record view and then opens
