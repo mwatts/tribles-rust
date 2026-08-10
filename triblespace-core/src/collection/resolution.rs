@@ -274,7 +274,7 @@ pub struct CollectionSemantics {
     frontier: BTreeMap<Id, BTreeSet<CollectionData>>,
     commit_ids_by_member: BTreeMap<MemberKey, BTreeSet<Id>>,
     merge_inputs_by_result: BTreeMap<MemberKey, BTreeSet<MergeProducer>>,
-    merge_results_by_input: BTreeMap<MemberKey, BTreeSet<CollectionData>>,
+    order_results_by_input: BTreeMap<MemberKey, BTreeSet<CollectionData>>,
     derive_inputs_by_output: BTreeMap<MemberKey, BTreeSet<DeriveProducer>>,
     derive_outputs_by_input: BTreeMap<(Id, Id), BTreeMap<CollectionData, BTreeSet<DeriveOutput>>>,
 }
@@ -336,69 +336,27 @@ impl CollectionSemantics {
     }
 
     fn subsumes(&self, collection: Id, lower: CollectionData, upper: CollectionData) -> bool {
-        self.subsumes_inner(collection, lower, upper, &mut BTreeSet::new())
-    }
-
-    /// Prove one order relation without materializing the transitive closure.
-    ///
-    /// Exact merges contribute ordinary graph edges. A derive contributes the
-    /// homomorphism rule: if two mapped source elements are ordered, their
-    /// target outputs are ordered too. The recursive proof search composes
-    /// both kinds of edge across collection boundaries while the `visiting`
-    /// set breaks cycles introduced by mutually derived representations.
-    fn subsumes_inner(
-        &self,
-        collection: Id,
-        lower: CollectionData,
-        upper: CollectionData,
-        visiting: &mut BTreeSet<(Id, CollectionData, CollectionData)>,
-    ) -> bool {
         if lower == upper {
             return true;
         }
-        let state = (collection, lower, upper);
-        if !visiting.insert(state) {
-            return false;
-        }
 
-        if let Some(results) = self.merge_results_by_input.get(&(collection, lower)) {
-            for result in results {
-                if self.subsumes_inner(collection, *result, upper, visiting) {
-                    visiting.remove(&state);
+        let mut visited = BTreeSet::from([lower]);
+        let mut pending = vec![lower];
+        while let Some(input) = pending.pop() {
+            for result in self
+                .order_results_by_input
+                .get(&(collection, input))
+                .into_iter()
+                .flatten()
+            {
+                if *result == upper {
                     return true;
                 }
-            }
-        }
-
-        // An output can have several construction paths. Each active derive
-        // preimage provides a way to lift source order through the same
-        // source-to-target homomorphism. Enumerating only mapped source points
-        // keeps the retained graph linear in active equations; no quadratic
-        // transitive-order matrix is stored.
-        for (source, source_lower, _) in self
-            .derive_inputs_by_output
-            .get(&(collection, lower))
-            .into_iter()
-            .flatten()
-        {
-            let Some(mappings) = self.derive_outputs_by_input.get(&(*source, collection)) else {
-                continue;
-            };
-            for (source_upper, outputs) in mappings {
-                if !self.subsumes_inner(*source, *source_lower, *source_upper, visiting) {
-                    continue;
-                }
-                for (target_upper, _) in outputs {
-                    if *target_upper != lower
-                        && self.subsumes_inner(collection, *target_upper, upper, visiting)
-                    {
-                        visiting.remove(&state);
-                        return true;
-                    }
+                if visited.insert(*result) {
+                    pending.push(*result);
                 }
             }
         }
-        visiting.remove(&state);
         false
     }
 
@@ -703,15 +661,10 @@ where
         for input in [low, high] {
             if input != result {
                 semantics
-                    .merge_results_by_input
+                    .order_results_by_input
                     .entry((collection, input))
                     .or_default()
                     .insert(result);
-                semantics
-                    .frontier
-                    .get_mut(&collection)
-                    .expect("active merge collection has members")
-                    .remove(&input);
             }
         }
     }
@@ -734,34 +687,22 @@ where
             .insert((output, claim.id()));
     }
 
-    // Explicit MERGEs above preserve the old linear frontier update. Only
-    // mapped target outputs need the additional homomorphism rule: A <= C
-    // implies f(A) <= f(C), even when no target MERGE was materialized. Keep
-    // the potentially quadratic proof work local to each observed map rather
-    // than comparing every member of every collection.
-    let mut homomorphically_dominated = BTreeSet::new();
-    for ((source, target), mappings) in &semantics.derive_outputs_by_input {
-        for (source_lower, lower_outputs) in mappings {
-            for (source_upper, upper_outputs) in mappings {
-                if source_lower == source_upper
-                    || !semantics.subsumes(*source, *source_lower, *source_upper)
-                {
-                    continue;
-                }
-                for (lower, _) in lower_outputs {
-                    if upper_outputs.iter().any(|(upper, _)| upper != lower) {
-                        homomorphically_dominated.insert((*target, *lower));
-                    }
-                }
-            }
+    close_homomorphic_order(
+        &semantics.derive_outputs_by_input,
+        &mut semantics.order_results_by_input,
+    );
+
+    // Every stored edge is strict. Its input therefore cannot be maximal;
+    // ordinary graph reachability supplies the transitive order on demand.
+    for ((collection, element), results) in &semantics.order_results_by_input {
+        if results.is_empty() {
+            continue;
         }
-    }
-    for (collection, element) in homomorphically_dominated {
         semantics
             .frontier
-            .get_mut(&collection)
-            .expect("active derive target has members")
-            .remove(&element);
+            .get_mut(collection)
+            .expect("known order collection has members")
+            .remove(element);
     }
 
     Ok(CollectionResolution {
@@ -771,6 +712,90 @@ where
         activation_pending,
         rejected,
     })
+}
+
+/// Lift the sparse known order through every observed join homomorphism.
+///
+/// A mapped source member starts one witness. Unmapped successors carry that
+/// witness upward. At the next mapped successor, the corresponding target
+/// edge is recorded and traversal for that witness stops: the successor's own
+/// seed represents the reset. Consequently an all-mapped chain costs one
+/// visit per source edge, while two mapped endpoints still discover the order
+/// relation across any number of unmapped intermediates.
+///
+/// Target edges can themselves be sources for another homomorphism, so all
+/// maps are revisited until no sparse edge is added. The graph remains a
+/// generating relation; its transitive closure is never materialized.
+fn close_homomorphic_order(
+    mappings_by_homomorphism: &BTreeMap<(Id, Id), BTreeMap<CollectionData, BTreeSet<DeriveOutput>>>,
+    order_results_by_input: &mut BTreeMap<MemberKey, BTreeSet<CollectionData>>,
+) {
+    loop {
+        let mut changed = false;
+        for ((source, target), mappings) in mappings_by_homomorphism {
+            let additions =
+                nearest_mapped_order_edges(*source, *target, mappings, order_results_by_input);
+            for (lower, upper) in additions {
+                changed |= order_results_by_input
+                    .entry((*target, lower))
+                    .or_default()
+                    .insert(upper);
+            }
+        }
+        if !changed {
+            return;
+        }
+    }
+}
+
+fn nearest_mapped_order_edges(
+    source: Id,
+    target: Id,
+    mappings: &BTreeMap<CollectionData, BTreeSet<DeriveOutput>>,
+    order_results_by_input: &BTreeMap<MemberKey, BTreeSet<CollectionData>>,
+) -> BTreeSet<(CollectionData, CollectionData)> {
+    let mut pending = Vec::new();
+    for (input, outputs) in mappings {
+        for (output, _) in outputs {
+            for successor in order_results_by_input
+                .get(&(source, *input))
+                .into_iter()
+                .flatten()
+            {
+                pending.push((*successor, *output));
+            }
+        }
+    }
+
+    let mut visited = BTreeSet::new();
+    let mut additions = BTreeSet::new();
+    while let Some((source_member, lower_output)) = pending.pop() {
+        if !visited.insert((source_member, lower_output)) {
+            continue;
+        }
+
+        if let Some(upper_outputs) = mappings.get(&source_member) {
+            for (upper_output, _) in upper_outputs {
+                if lower_output != *upper_output
+                    && !order_results_by_input
+                        .get(&(target, lower_output))
+                        .is_some_and(|results| results.contains(upper_output))
+                {
+                    additions.insert((lower_output, *upper_output));
+                }
+            }
+            continue;
+        }
+
+        for successor in order_results_by_input
+            .get(&(source, source_member))
+            .into_iter()
+            .flatten()
+        {
+            pending.push((*successor, lower_output));
+        }
+    }
+    additions
 }
 
 /// Close active equations under the commuting-square law.
@@ -1271,6 +1296,115 @@ mod tests {
                 cover: BTreeSet::from([data(13)]),
                 missing: BTreeSet::new(),
             }
+        );
+    }
+
+    #[test]
+    fn derive_lifts_order_across_unmapped_source_members() {
+        let source = CollectionDefinition::new(id(1), id(2), id(3));
+        let target = CollectionDefinition::new(id(4), id(5), id(6));
+        let commits = [
+            commit(&source, data(1), 1),
+            commit(&source, data(2), 2),
+            commit(&source, data(4), 3),
+        ];
+        let merges = [
+            CollectionMerge::new(source.id(), data(1), data(2), data(3)),
+            CollectionMerge::new(source.id(), data(3), data(4), data(7)),
+        ];
+        let derives = [
+            CollectionDerive::new(source.id(), target.id(), data(1), data(11)),
+            CollectionDerive::new(source.id(), target.id(), data(7), data(17)),
+        ];
+        let records = discover(
+            &[source.clone(), target.clone()],
+            &commits,
+            &merges,
+            &derives,
+            false,
+        );
+        let authorized = commits.iter().map(CollectionCommit::id).collect();
+        let resolution = resolve_collection_semantics(&records, &authorized, accepted).unwrap();
+        let semantics = resolution.semantics();
+
+        assert!(semantics.subsumes(target.id(), data(11), data(17)));
+        assert_eq!(
+            semantics.frontier(target.id()),
+            Some(&BTreeSet::from([data(17)]))
+        );
+    }
+
+    #[test]
+    fn derive_carries_incomparable_leaf_witnesses_through_unmapped_joins() {
+        let source = CollectionDefinition::new(id(1), id(2), id(3));
+        let target = CollectionDefinition::new(id(4), id(5), id(6));
+        let commits = [
+            commit(&source, data(1), 1),
+            commit(&source, data(2), 2),
+            commit(&source, data(4), 3),
+            commit(&source, data(8), 4),
+        ];
+        let merges = [
+            CollectionMerge::new(source.id(), data(1), data(2), data(3)),
+            CollectionMerge::new(source.id(), data(4), data(8), data(12)),
+            CollectionMerge::new(source.id(), data(3), data(12), data(15)),
+        ];
+        let derives = [
+            CollectionDerive::new(source.id(), target.id(), data(1), data(21)),
+            CollectionDerive::new(source.id(), target.id(), data(2), data(22)),
+            CollectionDerive::new(source.id(), target.id(), data(4), data(24)),
+            CollectionDerive::new(source.id(), target.id(), data(8), data(28)),
+            CollectionDerive::new(source.id(), target.id(), data(15), data(35)),
+        ];
+        let records = discover(
+            &[source.clone(), target.clone()],
+            &commits,
+            &merges,
+            &derives,
+            false,
+        );
+        let authorized = commits.iter().map(CollectionCommit::id).collect();
+        let resolution = resolve_collection_semantics(&records, &authorized, accepted).unwrap();
+        let semantics = resolution.semantics();
+
+        for lower in [data(21), data(22), data(24), data(28)] {
+            assert!(semantics.subsumes(target.id(), lower, data(35)));
+        }
+        assert_eq!(
+            semantics.frontier(target.id()),
+            Some(&BTreeSet::from([data(35)]))
+        );
+    }
+
+    #[test]
+    fn lifted_order_reaches_a_second_homomorphism() {
+        let source = CollectionDefinition::new(id(1), id(2), id(3));
+        let middle = CollectionDefinition::new(id(4), id(5), id(6));
+        let target = CollectionDefinition::new(id(7), id(8), id(9));
+        let commits = [commit(&source, data(1), 1), commit(&source, data(2), 2)];
+        let merges = [CollectionMerge::new(source.id(), data(1), data(2), data(3))];
+        let derives = [
+            CollectionDerive::new(source.id(), middle.id(), data(1), data(11)),
+            CollectionDerive::new(source.id(), middle.id(), data(3), data(13)),
+            CollectionDerive::new(middle.id(), target.id(), data(11), data(21)),
+            CollectionDerive::new(middle.id(), target.id(), data(13), data(23)),
+        ];
+        let records = discover(
+            &[source.clone(), middle.clone(), target.clone()],
+            &commits,
+            &merges,
+            &derives,
+            false,
+        );
+        let authorized = commits.iter().map(CollectionCommit::id).collect();
+        let resolution = resolve_collection_semantics(&records, &authorized, accepted).unwrap();
+        let semantics = resolution.semantics();
+
+        assert!(semantics.subsumes(middle.id(), data(11), data(13)));
+        assert!(semantics.subsumes(target.id(), data(21), data(23)));
+        assert_eq!(
+            semantics.frontier(target.id()),
+            Some(&BTreeSet::from([data(23)]))
         );
     }
 
