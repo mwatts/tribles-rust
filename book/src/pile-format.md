@@ -1,12 +1,13 @@
 # Pile Format
 
-The on-disk pile keeps every blob and pin in one append-only file. The
-write-ahead log *is* the database: all indices are reconstructed from the bytes
-already stored on disk. This design avoids background compaction, manifest
-management, or auxiliary metadata while still providing a durable
-content-addressed store for local repositories. The pile file is memory mapped
-for fast, zero-copy reads and can be safely shared between threads because
-existing bytes are never mutated—once data is validated it remains stable.
+The on-disk pile keeps blobs, native collection records, and pins in one
+append-only file. The write-ahead log *is* the database: all indices are
+reconstructed from the bytes already stored on disk. This design avoids
+background compaction, manifest management, or auxiliary metadata while still
+providing a durable content-addressed store for local repositories. The pile
+file is memory mapped for fast, zero-copy reads and can be safely shared
+between threads because existing bytes are never mutated—once data is
+validated it remains stable.
 
 While large databases often avoid `mmap` due to pitfalls with partial writes and
 page cache thrashing [[1](https://db.cs.cmu.edu/mmap-cidr2022/)], the pile's
@@ -16,10 +17,12 @@ memory map never exposes half-written records.
 
 ## Record model: uniform 256-byte records (V3)
 
-Every record the pile writes today — blob, branch (pin) head, branch
-tombstone, weak-pin marker, weak-unpin marker — uses the **V3** layout: a
-fixed **256-byte header**, followed (for blobs) by the payload, padded so the
-whole record is a **256-byte multiple**. This uniformity is load-bearing:
+Every record the pile writes today — blob, native collection definition,
+collection commit, collection merge, collection derive, branch (pin) head,
+branch tombstone, weak-pin marker, or weak-unpin marker — uses the **V3**
+layout: a fixed **256-byte header**, followed (for blobs) by the payload,
+padded so the whole record is a **256-byte multiple**. This uniformity is
+load-bearing:
 
 - **Position independence.** Blob data starts at the constant
   `record_start + 256`; there is no offset-derived padding. A record means
@@ -63,12 +66,13 @@ refreshing state.
    and `memmap2` mapping. It does not read any records yet (and it does not
    create missing files — create the file explicitly for a fresh pile).
 2. **Load and validate.** `refresh` acquires a shared lock, walks bytes beyond
-   `applied_length`, and rebuilds the blob/pin indices in memory. It **fails
+   `applied_length`, and rebuilds the blob, collection-record, and pin indices
+   in memory. It **fails
    loud** on a corrupt or torn tail (`ReadError::CorruptPile { valid_length }`)
    and never mutates the file. Callers rarely need to invoke it directly:
-   `reader`, `pins`, `head`, and `update` call `refresh` internally before they
-   inspect or apply records, so external writers are visible without a
-   standalone scan.
+   `reader`, `records`, `pins`, `head`, and `update` call `refresh` internally
+   before they inspect or apply records, so external writers are visible
+   without a standalone scan.
 3. **Amputate only when asked to.** `amputate` is the explicit, opt-in repair
    path: it re-runs validation under an exclusive lock and truncates the file
    back to the last valid record, discarding a torn tail left by a crash. It
@@ -76,10 +80,12 @@ refreshing state.
    under version skew is a silent data-loss hazard (an old binary would "eat"
    every newer-format record past the first one it misreads as corruption).
    The `trible pile amputate <path>` command wraps it for operators.
-4. **Append new records.** `put` (through the `BlobStorePut` trait) and pin
-   update helpers extend the file via a single `write_vectored` call. Each
+4. **Append new records.** `put` (through the `BlobStorePut` trait),
+   `CollectionStore::insert`, and pin update helpers extend the file. Each
    append immediately feeds the bytes back through the record scanner so
    in-memory indices stay synchronised without waiting for a manual `refresh`.
+   Blob records use a single `write_vectored` call; fixed-width collection and
+   pin records use one append of their 256-byte header.
    Records larger than ~1&nbsp;GiB can't be appended in a single atomic
    `writev` because kernel `write_vectored` calls cap at `INT_MAX` bytes on
    macOS and `MAX_RW_COUNT` (~2&nbsp;GiB) on Linux. In that case `put` takes
@@ -229,6 +235,48 @@ Each blob record carries:
 The payload follows at `record_start + 256` and is post-padded to the next
 256-byte boundary. The [Pile Blob Metadata](./pile-blob-metadata.md) chapter
 explains how to query these fields through the `PileReader` API.
+
+## Native Collection Records
+
+`CollectionStore` is a grow-only set of canonical collection-calculus records.
+The pile stores its four record kinds directly as fixed 256-byte V3 records;
+they are **not blob records**, have no following payload, and carry no
+insertion timestamp. They are also distinct from the legacy mutable pin cells
+described below: collection records have no head, tombstone, or
+last-writer-wins update. Their logical key is the record's intrinsic entity ID.
+
+The magic markers below identify the compact pile representation. They are
+wire-format markers, not the `metadata::tag` IDs found in the equivalent
+canonical `SimpleArchive` entities.
+
+| Kind | V3 magic marker | Exact byte layout |
+|---|---|---|
+| Definition | `3BE108504E4F5242FB24AA72D6D94CE1` | `0..16` marker, `16..32` scope ID, `32..48` representation ID, `48..64` recipe ID, `64..256` reserved zeros |
+| Commit | `BB758AA6F79FBFC4D1958592A8956777` | `0..16` marker, `16..32` collection ID, `32..64` data digest, `64..96` metadata handle, `96..128` Ed25519 public key, `128..160` signature R, `160..192` signature S, `192..256` reserved zeros |
+| Merge | `CC0108AC1DF4F335AFA856A529C42BE9` | `0..16` marker, `16..32` collection ID, `32..64` lower input digest, `64..96` higher input digest, `96..128` result digest, `128..256` reserved zeros |
+| Derive | `07ECF056F6F015D94389FFF21F851480` | `0..16` marker, `16..32` source collection ID, `32..48` target collection ID, `48..80` input digest, `80..112` output digest, `112..256` reserved zeros |
+
+Every reserved byte must be zero; a nonzero reserved byte makes replay fail as
+corrupt rather than silently assigning meaning to a format extension. Merge
+inputs are stored in lexicographic digest order (`low <= high`), so swapping
+the two operands cannot create a second representation of the same
+commutative equation.
+
+The intrinsic record ID is deliberately absent from these headers. On replay,
+the decoder reconstructs the exact canonical one-root entity from the stored
+fields and its collection-record kind tag, then derives the root ID from that
+fact set. For a commit this reconstruction includes the public key and both
+signature components. Consequently the compact pile header and the canonical
+`SimpleArchive` form identify the same semantic record without trusting a
+separately stored key.
+
+Pile replay keeps the records in intrinsic-ID order. Re-inserting an identical
+record is an idempotent success; a different record reconstructing to the same
+ID is reported as a collision. Concatenating piles therefore gives set-union
+semantics for collection records: append order and duplicate copies do not
+change the discovered collection calculus. This order-independent behavior is
+specific to collection records and does not turn the last-writer-wins pin log
+into a set.
 
 ## Pin Records (branch head / tombstone)
 

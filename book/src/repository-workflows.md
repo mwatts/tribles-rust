@@ -17,6 +17,47 @@ examples in `examples/repo.rs` and `examples/workspace.rs` showcase these APIs
 and are a great place to start if you are comfortable with Git but new to
 Tribles.
 
+## Publishing an append-only collection
+
+Applications that only need to publish independent facts do not need to mint a
+branch or select a mutable head. `Collection<S>` is the narrow publication
+facade for that case. It combines a storage backend, a stable dataset scope,
+and a signing key; every call to `Collection::commit(Fragment)` publishes one
+independent signed membership assertion:
+
+```rust,ignore
+use triblespace::prelude::{Collection, Fragment};
+
+// `storage` implements BlobStorePut + CollectionStore + StorageFlush.
+// `scope` is the stable Id of this dataset.
+let mut collection = Collection::new(storage, scope, signing_key);
+let commit = collection.commit(fragment)?;
+let storage = collection.into_storage();
+```
+
+The fragment remains self-contained across the publication boundary: its facts
+become the collection's canonical `SimpleArchive` data element, its metafacts
+become the commit's canonical metadata archive, and attachments from its shared
+blob store are copied alongside those two archives. Publication flushes all
+dependencies before inserting the signed commit record. Identical retries are
+idempotent, while distinct commits coexist; there is no branch head, CAS retry,
+or implied "latest" member.
+
+`Pile`, `MemoryRepo`, and the storage composition wrappers implement the native
+`CollectionStore` surface. `ObjectStoreRemote` exposes the corresponding async
+surface and can be used with `Collection` through `Blocking`. Under the
+configured object-store prefix, each record is a create-only object at
+`collection-records/<intrinsic-record-id>` whose bytes are the record's
+canonical `SimpleArchive`. Listing is an observed monotone view rather than a
+global snapshot: a concurrent immutable insert may appear on this list or the
+next, but any observed object is decoded and checked against the ID in its
+path.
+
+This collection path coexists with the branch-oriented `Repository` and
+`Workspace` APIs documented below. Native collection records are not pin
+updates; choosing the headless path does not change the semantics of existing
+branches.
+
 ## Opening a repository
 
 Repositories are constructed from any storage that implements the appropriate
@@ -550,5 +591,8 @@ use triblespace::telemetry::Telemetry;
 let _guard = Telemetry::install_global_from_env("archive import");
 ```
 
-Set `TELEMETRY_PILE` to enable the sink. You can tune batching via
-`TELEMETRY_FLUSH_MS`.
+Set `TELEMETRY_PILE` and a 32-character hexadecimal
+`TELEMETRY_COLLECTION_SCOPE` to enable the sink. Every flushed batch becomes
+an independent signed collection commit carrying its telemetry schema as
+metafacts; no mutable branch head or compare-and-set retry is involved. You can
+tune batching via `TELEMETRY_FLUSH_MS`.
