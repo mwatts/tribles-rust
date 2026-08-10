@@ -136,13 +136,19 @@ impl core::fmt::Display for TensorError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             TensorError::TooShort { len } => {
-                write!(f, "tensor blob is {len} bytes, shorter than its {TENSOR_HEADER_LEN}-byte header")
+                write!(
+                    f,
+                    "tensor blob is {len} bytes, shorter than its {TENSOR_HEADER_LEN}-byte header"
+                )
             }
             TensorError::LengthMismatch { expected, found } => {
                 write!(f, "tensor payload is {found} bytes, dims imply {expected}")
             }
             TensorError::RankTooLarge { rank } => {
-                write!(f, "rank {rank} exceeds the {MAX_RANK} a fixed header can hold")
+                write!(
+                    f,
+                    "rank {rank} exceeds the {MAX_RANK} a fixed header can hold"
+                )
             }
         }
     }
@@ -189,7 +195,10 @@ pub fn tensor_blob<T: TensorElement, const RANK: usize>(
     let elems: u64 = dims.iter().product();
     let expected = T::payload_len(elems as usize);
     if payload.len() != expected {
-        return Err(TensorError::LengthMismatch { expected, found: payload.len() });
+        return Err(TensorError::LengthMismatch {
+            expected,
+            found: payload.len(),
+        });
     }
 
     let mut bytes = Vec::with_capacity(TENSOR_HEADER_LEN + payload.len());
@@ -220,13 +229,18 @@ impl<T: TensorElement, const RANK: usize> TryFromBlob<Tensor<T, RANK>> for Tenso
         let mut dims = Vec::with_capacity(RANK);
         for i in 0..RANK {
             let at = i * 8;
-            dims.push(u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes")));
+            dims.push(u64::from_le_bytes(
+                bytes[at..at + 8].try_into().expect("8 bytes"),
+            ));
         }
         let elems: u64 = dims.iter().product();
         let expected = T::payload_len(elems as usize);
         let payload = bytes.slice(TENSOR_HEADER_LEN..);
         if payload.len() != expected {
-            return Err(TensorError::LengthMismatch { expected, found: payload.len() });
+            return Err(TensorError::LengthMismatch {
+                expected,
+                found: payload.len(),
+            });
         }
         Ok(TensorView { dims, payload })
     }
@@ -260,11 +274,36 @@ pub mod elements {
         };
     }
 
-    dense_element!(F32, 32, "92F4DB8D84519C8D6E212CB810FF40D4", "32-bit IEEE-754 float.");
-    dense_element!(F64, 64, "FA3AD8DEC844D5F409AB728269B7A3FE", "64-bit IEEE-754 float.");
-    dense_element!(F16, 16, "0E7E69818968BCD97A540DE30B9E605D", "16-bit IEEE-754 half float.");
-    dense_element!(BF16, 16, "8656DFBC50009089603533E4558D05C6", "16-bit bfloat.");
-    dense_element!(U8, 8, "D16AC7C02F25E4799F4D47EB1E51EF6E", "Unsigned 8-bit integer.");
+    dense_element!(
+        F32,
+        32,
+        "92F4DB8D84519C8D6E212CB810FF40D4",
+        "32-bit IEEE-754 float."
+    );
+    dense_element!(
+        F64,
+        64,
+        "FA3AD8DEC844D5F409AB728269B7A3FE",
+        "64-bit IEEE-754 float."
+    );
+    dense_element!(
+        F16,
+        16,
+        "0E7E69818968BCD97A540DE30B9E605D",
+        "16-bit IEEE-754 half float."
+    );
+    dense_element!(
+        BF16,
+        16,
+        "8656DFBC50009089603533E4558D05C6",
+        "16-bit bfloat."
+    );
+    dense_element!(
+        U8,
+        8,
+        "D16AC7C02F25E4799F4D47EB1E51EF6E",
+        "Unsigned 8-bit integer."
+    );
     dense_element!(
         E4M3,
         8,
@@ -325,7 +364,11 @@ mod tests {
         let f32_3 = <Tensor<F32, 3> as MetaDescribe>::id();
         assert_ne!(f32_2, bf16_2, "element type must discriminate");
         assert_ne!(f32_2, f32_3, "rank must discriminate");
-        assert_eq!(f32_2, <Tensor<F32, 2> as MetaDescribe>::id(), "and be stable");
+        assert_eq!(
+            f32_2,
+            <Tensor<F32, 2> as MetaDescribe>::id(),
+            "and be stable"
+        );
     }
 
     #[test]
@@ -346,7 +389,11 @@ mod tests {
         let expected = elems / 2 + elems / NVFP4_BLOCK + 4;
         let blob = tensor_blob::<NVFP4, 1>([elems as u64], payload(expected)).expect("well formed");
         let view: TensorView = blob.try_from_blob().expect("decodes");
-        assert_eq!(view.dims(), &[4096], "logical, not the 2048 bytes it packs into");
+        assert_eq!(
+            view.dims(),
+            &[4096],
+            "logical, not the 2048 bytes it packs into"
+        );
         assert_eq!(view.elems(), 4096);
         assert!(view.payload().len() < elems, "and it really is packed");
     }
@@ -354,9 +401,17 @@ mod tests {
     /// Scales are payload, not a separate blob bound by naming convention.
     #[test]
     fn nvfp4_payload_accounts_for_its_own_scales() {
-        assert_eq!(NVFP4::payload_len(16), 8 + 1 + 4, "8 packed + 1 block scale + global");
+        assert_eq!(
+            NVFP4::payload_len(16),
+            8 + 1 + 4,
+            "8 packed + 1 block scale + global"
+        );
         assert_eq!(NVFP4::payload_len(32), 16 + 2 + 4);
-        assert_eq!(F32::payload_len(32), 128, "a dense format is just its elements");
+        assert_eq!(
+            F32::payload_len(32),
+            128,
+            "a dense format is just its elements"
+        );
     }
 
     /// Measured against Inkling-Small, whose 78 quantised tensors are each
@@ -375,8 +430,16 @@ mod tests {
         let elems = rows * cols;
         let packed = elems / 2;
         let block_scales = elems / NVFP4_BLOCK;
-        assert_eq!(packed, 4096 * 2048, "matches the checkpoint's packed last dim");
-        assert_eq!(block_scales, 4096 * 256, "matches the scale tensor's last dim");
+        assert_eq!(
+            packed,
+            4096 * 2048,
+            "matches the checkpoint's packed last dim"
+        );
+        assert_eq!(
+            block_scales,
+            4096 * 256,
+            "matches the scale tensor's last dim"
+        );
         assert_eq!(
             NVFP4::payload_len(elems),
             packed + block_scales + 4,
@@ -397,7 +460,13 @@ mod tests {
     #[test]
     fn a_payload_that_contradicts_the_dims_is_refused() {
         let err = tensor_blob::<F32, 2>([3, 4], payload(40)).expect_err("must refuse");
-        assert_eq!(err, TensorError::LengthMismatch { expected: 48, found: 40 });
+        assert_eq!(
+            err,
+            TensorError::LengthMismatch {
+                expected: 48,
+                found: 40
+            }
+        );
     }
 
     /// Reading a rank-2 blob as rank-3 is still caught, just by a different
@@ -410,7 +479,13 @@ mod tests {
         let wrong: Blob<Tensor<F32, 3>> = blob.transmute();
         let err = <TensorView as TryFromBlob<Tensor<F32, 3>>>::try_from_blob(wrong)
             .expect_err("must refuse");
-        assert_eq!(err, TensorError::LengthMismatch { expected: 0, found: 48 });
+        assert_eq!(
+            err,
+            TensorError::LengthMismatch {
+                expected: 0,
+                found: 48
+            }
+        );
     }
 
     /// The payload begins at a constant offset regardless of rank, so it keeps

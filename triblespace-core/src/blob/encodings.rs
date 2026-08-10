@@ -2,7 +2,6 @@
 
 /// Flat typed array blob encoding.
 pub mod array;
-pub mod tensor;
 /// Arbitrary-length UTF-8 text blob encoding.
 pub mod longstring;
 /// Opaque raw bytes blob encoding (positive choice, distinct from UnknownBlob).
@@ -11,6 +10,7 @@ pub mod rawbytes;
 pub mod simplearchive;
 /// Succinct (Ring-based) compressed trible archive blob encoding.
 pub mod succinctarchive;
+pub mod tensor;
 /// WebAssembly bytecode blob encoding.
 pub mod wasmcode;
 
