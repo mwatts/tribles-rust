@@ -116,12 +116,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   canonical bytes and path identity. Memory, hybrid, lazy, blocking-async, and
   generational Yard adapters preserve the same idempotent algebra, including
   across cat/reopen/reclaim boundaries.
-- **`Collection<S>` is the narrow Fragment-native publication facade.** Pure
+- **`Collection<S>` is the narrow Fragment-native owned facade.** Pure
   construction binds one scope and signing key; `commit(fragment)` archives
   facts as data, metafacts as signed metadata, persists the shared attachment
-  store, and appends one independent signed COMMIT. It has no parents, head,
-  conflict retry, message field, planner, or tuning knobs. Optional procedural-
-  macro instrumentation uses the same path and one explicit
+  store, and appends one independent signed COMMIT. `materialize()` admits only
+  exact-collection commits signed by that same key, fails loud on every
+  observed own dependency, and uses validated resident merge records as an
+  optional physical cover without letting missing or invalid cache equations
+  hide committed leaves. Its documented concurrency contract is one complete
+  known prefix, not global latest. It has no parents, head, conflict retry,
+  message field, planner, or tuning knobs. Optional procedural-macro
+  instrumentation uses the same path and one explicit
   `TRIBLESPACE_METADATA_COLLECTION_SCOPE`, replacing its Repository/Workspace
   push protocol.
 - **Collection retention is now an explicit two-edge policy rather than a

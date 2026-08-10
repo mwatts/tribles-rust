@@ -32,6 +32,7 @@ use triblespace::prelude::{Collection, Fragment};
 // `scope` is the stable Id of this dataset.
 let mut collection = Collection::new(storage, scope, signing_key);
 let commit = collection.commit(fragment)?;
+let facts = collection.materialize()?;
 let storage = collection.into_storage();
 ```
 
@@ -42,6 +43,22 @@ blob store are copied alongside those two archives. Publication flushes all
 dependencies before inserting the signed commit record. Identical retries are
 idempotent, while distinct commits coexist; there is no branch head, CAS retry,
 or implied "latest" member.
+
+When the backend also provides a blob reader with metadata lookup,
+`Collection::materialize()` returns the complete known union of commits signed
+by the facade's own key for this exact scoped collection. Commits signed by
+other keys are not admitted. Every observed own commit is ground truth: its
+signature, definition, data archive, and metadata archive must all validate or
+the read fails instead of silently returning a partial set. Valid resident
+`MERGE` records may provide a compact physical cover; missing or invalid
+unsigned merge evidence is merely a cache miss, so it cannot erase committed
+leaves.
+
+Materialization has the same observed-prefix concurrency contract as native
+record listing. It first discovers one deterministic record view and then opens
+a blob-reader snapshot. A concurrent commit not observed during that discovery
+appears on a later call; all own commits that were observed are included or the
+call returns an error. This is deliberately not a global "latest" transaction.
 
 `Pile`, `MemoryRepo`, and the storage composition wrappers implement the native
 `CollectionStore` surface. `ObjectStoreRemote` exposes the corresponding async
