@@ -133,6 +133,13 @@ attributes! {
     /// from `blob_encoding` because element schemas are not themselves
     /// `BlobEncoding`s — they only carry an `ArrayElement::Native` byte-layout.
     "56C43BEE48BE99521886D99BE9026A3B" unsafe as array_item_schema: inlineencodings::GenId;
+    /// Rank of a `Tensor<T, RANK>` schema entity.
+    ///
+    /// Written as a FACT, not only carried in the Rust type, so an attribute
+    /// using this encoding is queryable by rank without a second mechanism
+    /// recording it. The same facts derive the encoding's id, so the annotation
+    /// and the identity cannot disagree.
+    "7B094441362DD9ADEBDC5EB5D224FC56" unsafe as tensor_rank: inlineencodings::I256BE;
     /// Links a handle to the hash algorithm used for content addressing.
     "51C08CFABB2C848CE0B4A799F0EFE5EA" unsafe as hash_schema: inlineencodings::GenId;
     /// Optional WebAssembly module for formatting values governed by this schema.

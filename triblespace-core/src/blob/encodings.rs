@@ -2,6 +2,7 @@
 
 /// Flat typed array blob encoding.
 pub mod array;
+pub mod tensor;
 /// Arbitrary-length UTF-8 text blob encoding.
 pub mod longstring;
 /// Opaque raw bytes blob encoding (positive choice, distinct from UnknownBlob).
