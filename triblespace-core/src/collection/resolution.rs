@@ -25,13 +25,16 @@ use super::{
 type MemberKey = (Id, CollectionData);
 type MergeProducer = (CollectionData, CollectionData, Id);
 type DeriveProducer = (Id, CollectionData, Id);
+type DeriveOutput = (CollectionData, Id);
 
 /// One definition-matched claim presented for concrete semantic validation.
 ///
 /// The callback owns all representation-specific work, including loading and
 /// validating the bytes named by each endpoint. For `Derive`, the exact source
 /// and target collection ids identify the mapping; this generic layer imposes
-/// no additional scope relationship.
+/// no additional scope relationship. Every accepted `Derive` belongs to the
+/// canonical source-to-target join homomorphism: mappings for the same exact
+/// collection pair preserve joins and therefore preserve the induced order.
 #[derive(Clone, Copy, Debug)]
 pub enum CollectionValidationRequest<'a> {
     /// An authorized, strictly self-signed commit whose element still needs
@@ -95,16 +98,22 @@ pub enum CollectionClaimValidation<D> {
 /// One deterministic output witness in a functional conflict.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConflictingCollectionOutput {
-    /// Intrinsic id of the accepted claim.
+    /// Intrinsic id of the accepted or homomorphically implied equation.
+    ///
+    /// Implied equations use the id of the canonical `MERGE` or `DERIVE`
+    /// record that would state the theorem explicitly; the record need not be
+    /// physically present.
     pub claim: Id,
     /// Output asserted by that claim.
     pub data: CollectionData,
 }
 
-/// Two accepted claims assign different outputs to one canonical operation.
+/// Two accepted or homomorphically implied equations assign different outputs
+/// to one canonical operation.
 ///
-/// Conflicts include accepted equations whose inputs are not currently
-/// members. Deferring them until activation would make future roots expose an
+/// Direct conflicts include accepted equations whose inputs are not currently
+/// members. Conflicts implied by a commuting square become visible once the
+/// square is active; deferring either kind would make future roots expose an
 /// order-dependent semantic contradiction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CollectionFunctionalConflict {
@@ -255,10 +264,10 @@ impl<D> CollectionResolution<D> {
 
 /// Least semantic closure of positively accepted collection claims.
 ///
-/// The retained indexes are linear in active records. The known order is not
-/// materialized transitively; reachability is computed only when a physical
-/// cover query needs it. Metadata and signatures remain on the supporting
-/// commit records rather than becoming inputs to the data lattice.
+/// The known order is not materialized transitively; reachability is computed
+/// from asserted and commuting-square-implied equations when needed. Metadata
+/// and signatures remain on the supporting commit records rather than becoming
+/// inputs to the data lattice.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CollectionSemantics {
     members: BTreeMap<Id, BTreeSet<CollectionData>>,
@@ -267,6 +276,7 @@ pub struct CollectionSemantics {
     merge_inputs_by_result: BTreeMap<MemberKey, BTreeSet<MergeProducer>>,
     merge_results_by_input: BTreeMap<MemberKey, BTreeSet<CollectionData>>,
     derive_inputs_by_output: BTreeMap<MemberKey, BTreeSet<DeriveProducer>>,
+    derive_outputs_by_input: BTreeMap<(Id, Id), BTreeMap<CollectionData, BTreeSet<DeriveOutput>>>,
 }
 
 impl CollectionSemantics {
@@ -280,7 +290,7 @@ impl CollectionSemantics {
         self.members.get(&collection)
     }
 
-    /// Maximal members under the order witnessed by active merge lineage.
+    /// Maximal members under active merge and homomorphism lineage.
     pub fn frontier(&self, collection: Id) -> Option<&BTreeSet<CollectionData>> {
         self.frontier.get(&collection)
     }
@@ -326,22 +336,69 @@ impl CollectionSemantics {
     }
 
     fn subsumes(&self, collection: Id, lower: CollectionData, upper: CollectionData) -> bool {
+        self.subsumes_inner(collection, lower, upper, &mut BTreeSet::new())
+    }
+
+    /// Prove one order relation without materializing the transitive closure.
+    ///
+    /// Exact merges contribute ordinary graph edges. A derive contributes the
+    /// homomorphism rule: if two mapped source elements are ordered, their
+    /// target outputs are ordered too. The recursive proof search composes
+    /// both kinds of edge across collection boundaries while the `visiting`
+    /// set breaks cycles introduced by mutually derived representations.
+    fn subsumes_inner(
+        &self,
+        collection: Id,
+        lower: CollectionData,
+        upper: CollectionData,
+        visiting: &mut BTreeSet<(Id, CollectionData, CollectionData)>,
+    ) -> bool {
         if lower == upper {
             return true;
         }
-        let mut visited = BTreeSet::new();
-        let mut pending = vec![lower];
-        while let Some(element) = pending.pop() {
-            if !visited.insert(element) {
-                continue;
-            }
-            if let Some(results) = self.merge_results_by_input.get(&(collection, element)) {
-                if results.contains(&upper) {
+        let state = (collection, lower, upper);
+        if !visiting.insert(state) {
+            return false;
+        }
+
+        if let Some(results) = self.merge_results_by_input.get(&(collection, lower)) {
+            for result in results {
+                if self.subsumes_inner(collection, *result, upper, visiting) {
+                    visiting.remove(&state);
                     return true;
                 }
-                pending.extend(results.iter().copied());
             }
         }
+
+        // An output can have several construction paths. Each active derive
+        // preimage provides a way to lift source order through the same
+        // source-to-target homomorphism. Enumerating only mapped source points
+        // keeps the retained graph linear in active equations; no quadratic
+        // transitive-order matrix is stored.
+        for (source, source_lower, _) in self
+            .derive_inputs_by_output
+            .get(&(collection, lower))
+            .into_iter()
+            .flatten()
+        {
+            let Some(mappings) = self.derive_outputs_by_input.get(&(*source, collection)) else {
+                continue;
+            };
+            for (source_upper, outputs) in mappings {
+                if !self.subsumes_inner(*source, *source_lower, *source_upper, visiting) {
+                    continue;
+                }
+                for (target_upper, _) in outputs {
+                    if *target_upper != lower
+                        && self.subsumes_inner(collection, *target_upper, upper, visiting)
+                    {
+                        visiting.remove(&state);
+                        return true;
+                    }
+                }
+            }
+        }
+        visiting.remove(&state);
         false
     }
 
@@ -590,23 +647,54 @@ where
         }
     }
 
+    // A source/target pair named by DERIVE denotes one canonical join
+    // homomorphism. Individual records are observations of that map, not
+    // unrelated point functions.
+    let homomorphisms: BTreeSet<_> = accepted_derives
+        .iter()
+        .map(|claim| (claim.source(), claim.target()))
+        .collect();
+
+    let mut activation_pending = BTreeSet::new();
+    let mut active_merges = BTreeMap::new();
+    let mut active_derives = BTreeMap::new();
+
+    for claim in &accepted_merges {
+        let collection = claim.collection();
+        let (low, high) = claim.inputs();
+        if !contains_member(&members, collection, low)
+            || !contains_member(&members, collection, high)
+        {
+            activation_pending.insert(claim.id());
+            continue;
+        }
+        active_merges.insert(claim.id(), (**claim).clone());
+    }
+
+    for claim in &accepted_derives {
+        let (input, output) = claim.mapping();
+        if !contains_member(&members, claim.source(), input) {
+            activation_pending.insert(claim.id());
+            continue;
+        }
+        debug_assert!(contains_member(&members, claim.target(), output));
+        active_derives.insert(claim.id(), (**claim).clone());
+    }
+
+    close_homomorphic_squares(&homomorphisms, &mut active_merges, &mut active_derives)
+        .map_err(CollectionResolutionError::Conflict)?;
+
     let mut semantics = CollectionSemantics {
         frontier: members.clone(),
         members,
         commit_ids_by_member,
         ..CollectionSemantics::default()
     };
-    let mut activation_pending = BTreeSet::new();
 
-    for claim in accepted_merges {
+    for claim in active_merges.values() {
         let collection = claim.collection();
         let (low, high) = claim.inputs();
         let result = claim.result();
-        if !semantics.contains(collection, low) || !semantics.contains(collection, high) {
-            activation_pending.insert(claim.id());
-            continue;
-        }
-
         semantics
             .merge_inputs_by_result
             .entry((collection, result))
@@ -628,17 +716,52 @@ where
         }
     }
 
-    for claim in accepted_derives {
+    for claim in active_derives.values() {
+        let source = claim.source();
+        let target = claim.target();
         let (input, output) = claim.mapping();
-        if !semantics.contains(claim.source(), input) {
-            activation_pending.insert(claim.id());
-            continue;
-        }
         semantics
             .derive_inputs_by_output
-            .entry((claim.target(), output))
+            .entry((target, output))
             .or_default()
-            .insert((claim.source(), input, claim.id()));
+            .insert((source, input, claim.id()));
+        semantics
+            .derive_outputs_by_input
+            .entry((source, target))
+            .or_default()
+            .entry(input)
+            .or_default()
+            .insert((output, claim.id()));
+    }
+
+    // Explicit MERGEs above preserve the old linear frontier update. Only
+    // mapped target outputs need the additional homomorphism rule: A <= C
+    // implies f(A) <= f(C), even when no target MERGE was materialized. Keep
+    // the potentially quadratic proof work local to each observed map rather
+    // than comparing every member of every collection.
+    let mut homomorphically_dominated = BTreeSet::new();
+    for ((source, target), mappings) in &semantics.derive_outputs_by_input {
+        for (source_lower, lower_outputs) in mappings {
+            for (source_upper, upper_outputs) in mappings {
+                if source_lower == source_upper
+                    || !semantics.subsumes(*source, *source_lower, *source_upper)
+                {
+                    continue;
+                }
+                for (lower, _) in lower_outputs {
+                    if upper_outputs.iter().any(|(upper, _)| upper != lower) {
+                        homomorphically_dominated.insert((*target, *lower));
+                    }
+                }
+            }
+        }
+    }
+    for (collection, element) in homomorphically_dominated {
+        semantics
+            .frontier
+            .get_mut(&collection)
+            .expect("active derive target has members")
+            .remove(&element);
     }
 
     Ok(CollectionResolution {
@@ -648,6 +771,147 @@ where
         activation_pending,
         rejected,
     })
+}
+
+/// Close active equations under the commuting-square law.
+///
+/// For a homomorphism `f : S -> T`, a source equation `a join b = c`
+/// completes either missing side of
+///
+/// ```text
+/// a join b = c
+/// |    |     |
+/// f    f     f
+/// v    v     v
+/// x join y = z
+/// ```
+///
+/// when the other three edges are known. The completed edge is represented by
+/// the ordinary canonical record value, but is not admitted as a stored claim.
+/// Its intrinsic id gives conflict diagnostics a stable name and lets the
+/// normal lineage indexes consume asserted and implied equations uniformly.
+fn close_homomorphic_squares(
+    homomorphisms: &BTreeSet<(Id, Id)>,
+    active_merges: &mut BTreeMap<Id, CollectionMerge>,
+    active_derives: &mut BTreeMap<Id, CollectionDerive>,
+) -> Result<(), Box<CollectionFunctionalConflict>> {
+    loop {
+        let joins = index_merge_outputs(active_merges.values());
+        let maps = index_derive_outputs(active_derives.values());
+        let mut merge_theorems = BTreeMap::new();
+        let mut derive_theorems = BTreeMap::new();
+
+        for (source, target) in homomorphisms {
+            for source_merge in active_merges
+                .values()
+                .filter(|claim| claim.collection() == *source)
+            {
+                let (left, right) = source_merge.inputs();
+                let result = source_merge.result();
+                let Some(left_outputs) = maps.get(&(*source, *target, left)) else {
+                    continue;
+                };
+                let Some(right_outputs) = maps.get(&(*source, *target, right)) else {
+                    continue;
+                };
+
+                for left_output in left_outputs.keys() {
+                    for right_output in right_outputs.keys() {
+                        let (target_low, target_high) = ordered(*left_output, *right_output);
+
+                        // Target join + source join + endpoint maps imply the
+                        // mapping of the source result.
+                        if let Some(outputs) = joins.get(&(*target, target_low, target_high)) {
+                            for output in outputs.keys() {
+                                let theorem =
+                                    CollectionDerive::new(*source, *target, result, *output);
+                                derive_theorems.insert(theorem.id(), theorem);
+                            }
+                        }
+
+                        // Source-result map + source join + endpoint maps
+                        // imply the exact target join.
+                        if let Some(outputs) = maps.get(&(*source, *target, result)) {
+                            for output in outputs.keys() {
+                                let theorem = CollectionMerge::new(
+                                    *target,
+                                    *left_output,
+                                    *right_output,
+                                    *output,
+                                );
+                                merge_theorems.insert(theorem.id(), theorem);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut changed = false;
+        for (id, theorem) in merge_theorems {
+            if let std::collections::btree_map::Entry::Vacant(entry) = active_merges.entry(id) {
+                entry.insert(theorem);
+                changed = true;
+            }
+        }
+        for (id, theorem) in derive_theorems {
+            if let std::collections::btree_map::Entry::Vacant(entry) = active_derives.entry(id) {
+                entry.insert(theorem);
+                changed = true;
+            }
+        }
+
+        let merges: Vec<_> = active_merges.values().collect();
+        let derives: Vec<_> = active_derives.values().collect();
+        check_functional(&merges, &derives)?;
+        if !changed {
+            return Ok(());
+        }
+    }
+}
+
+fn ordered(
+    mut left: CollectionData,
+    mut right: CollectionData,
+) -> (CollectionData, CollectionData) {
+    if right < left {
+        std::mem::swap(&mut left, &mut right);
+    }
+    (left, right)
+}
+
+fn index_merge_outputs<'a>(
+    merges: impl IntoIterator<Item = &'a CollectionMerge>,
+) -> BTreeMap<(Id, CollectionData, CollectionData), BTreeMap<CollectionData, Id>> {
+    let mut outputs: BTreeMap<(Id, CollectionData, CollectionData), BTreeMap<CollectionData, Id>> =
+        BTreeMap::new();
+    for claim in merges {
+        let (low, high) = claim.inputs();
+        outputs
+            .entry((claim.collection(), low, high))
+            .or_default()
+            .entry(claim.result())
+            .and_modify(|record| *record = (*record).min(claim.id()))
+            .or_insert_with(|| claim.id());
+    }
+    outputs
+}
+
+fn index_derive_outputs<'a>(
+    derives: impl IntoIterator<Item = &'a CollectionDerive>,
+) -> BTreeMap<(Id, Id, CollectionData), BTreeMap<CollectionData, Id>> {
+    let mut outputs: BTreeMap<(Id, Id, CollectionData), BTreeMap<CollectionData, Id>> =
+        BTreeMap::new();
+    for claim in derives {
+        let (input, output) = claim.mapping();
+        outputs
+            .entry((claim.source(), claim.target(), input))
+            .or_default()
+            .entry(output)
+            .and_modify(|record| *record = (*record).min(claim.id()))
+            .or_insert_with(|| claim.id());
+    }
+    outputs
 }
 
 fn validate_claim<D, E, V>(
@@ -970,6 +1234,153 @@ mod tests {
             semantics.supporting_commit_ids(rollup.id(), data(6)),
             BTreeSet::from([raw_one.id(), raw_two.id(), rollup_four.id()])
         );
+    }
+
+    #[test]
+    fn derive_lifts_source_subsumption_without_a_target_merge() {
+        let source = CollectionDefinition::new(id(1), id(2), id(3));
+        let target = CollectionDefinition::new(id(4), id(5), id(6));
+        let first = commit(&source, data(1), 1);
+        let second = commit(&source, data(2), 2);
+        let source_merge = CollectionMerge::new(source.id(), data(1), data(2), data(3));
+        let lower = CollectionDerive::new(source.id(), target.id(), data(1), data(11));
+        let upper = CollectionDerive::new(source.id(), target.id(), data(3), data(13));
+        let records = discover(
+            &[source.clone(), target.clone()],
+            &[first.clone(), second.clone()],
+            &[source_merge],
+            &[lower, upper],
+            false,
+        );
+        let resolution = resolve_collection_semantics(
+            &records,
+            &BTreeSet::from([first.id(), second.id()]),
+            accepted,
+        )
+        .unwrap();
+        let semantics = resolution.semantics();
+
+        assert!(semantics.subsumes(target.id(), data(11), data(13)));
+        assert_eq!(
+            semantics.frontier(target.id()),
+            Some(&BTreeSet::from([data(13)]))
+        );
+        assert_eq!(
+            collection_physical_cover(semantics, target.id(), &BTreeSet::from([data(13)])),
+            CollectionPhysicalCover {
+                cover: BTreeSet::from([data(13)]),
+                missing: BTreeSet::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn homomorphic_square_supplies_target_physical_fallback() {
+        let source = CollectionDefinition::new(id(1), id(2), id(3));
+        let target = CollectionDefinition::new(id(4), id(5), id(6));
+        let first = commit(&source, data(1), 1);
+        let second = commit(&source, data(2), 2);
+        let source_merge = CollectionMerge::new(source.id(), data(1), data(2), data(3));
+        let derives = [
+            CollectionDerive::new(source.id(), target.id(), data(1), data(11)),
+            CollectionDerive::new(source.id(), target.id(), data(2), data(12)),
+            CollectionDerive::new(source.id(), target.id(), data(3), data(13)),
+        ];
+        let records = discover(
+            &[source.clone(), target.clone()],
+            &[first.clone(), second.clone()],
+            &[source_merge],
+            &derives,
+            false,
+        );
+        let resolution = resolve_collection_semantics(
+            &records,
+            &BTreeSet::from([first.id(), second.id()]),
+            accepted,
+        )
+        .unwrap();
+        let semantics = resolution.semantics();
+
+        assert_eq!(
+            semantics.frontier(target.id()),
+            Some(&BTreeSet::from([data(13)]))
+        );
+        assert_eq!(
+            collection_physical_cover(
+                semantics,
+                target.id(),
+                &BTreeSet::from([data(11), data(12)])
+            ),
+            CollectionPhysicalCover {
+                cover: BTreeSet::from([data(11), data(12)]),
+                missing: BTreeSet::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn target_merge_completes_the_reverse_side_of_the_square() {
+        let source = CollectionDefinition::new(id(1), id(2), id(3));
+        let target = CollectionDefinition::new(id(4), id(5), id(6));
+        let first = commit(&source, data(1), 1);
+        let second = commit(&source, data(2), 2);
+        let source_merge = CollectionMerge::new(source.id(), data(1), data(2), data(3));
+        let lower = CollectionDerive::new(source.id(), target.id(), data(1), data(11));
+        let upper = CollectionDerive::new(source.id(), target.id(), data(2), data(12));
+        let target_merge = CollectionMerge::new(target.id(), data(11), data(12), data(13));
+        let implied = CollectionDerive::new(source.id(), target.id(), data(3), data(13));
+        let records = discover(
+            &[source.clone(), target.clone()],
+            &[first.clone(), second.clone()],
+            &[source_merge, target_merge],
+            &[lower, upper],
+            false,
+        );
+        let resolution = resolve_collection_semantics(
+            &records,
+            &BTreeSet::from([first.id(), second.id()]),
+            accepted,
+        )
+        .unwrap();
+
+        assert!(resolution
+            .semantics()
+            .derive_inputs_by_output
+            .get(&(target.id(), data(13)))
+            .is_some_and(|producers| {
+                producers.contains(&(source.id(), data(3), implied.id()))
+            }));
+    }
+
+    #[test]
+    fn commuting_square_conflicts_are_rejected() {
+        let source = CollectionDefinition::new(id(1), id(2), id(3));
+        let target = CollectionDefinition::new(id(4), id(5), id(6));
+        let first = commit(&source, data(1), 1);
+        let second = commit(&source, data(2), 2);
+        let source_merge = CollectionMerge::new(source.id(), data(1), data(2), data(3));
+        let target_merge = CollectionMerge::new(target.id(), data(11), data(12), data(13));
+        let derives = [
+            CollectionDerive::new(source.id(), target.id(), data(1), data(11)),
+            CollectionDerive::new(source.id(), target.id(), data(2), data(12)),
+            CollectionDerive::new(source.id(), target.id(), data(3), data(14)),
+        ];
+        let records = discover(
+            &[source.clone(), target],
+            &[first.clone(), second.clone()],
+            &[source_merge, target_merge],
+            &derives,
+            false,
+        );
+
+        assert!(matches!(
+            resolve_collection_semantics(
+                &records,
+                &BTreeSet::from([first.id(), second.id()]),
+                accepted,
+            ),
+            Err(CollectionResolutionError::Conflict(_))
+        ));
     }
 
     #[test]

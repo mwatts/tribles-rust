@@ -215,6 +215,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Collection resolution now honors every `DERIVE` pair as a canonical join
+  homomorphism.** Source subsumption is lifted into target collections without
+  requiring redundant target `MERGE` records, and active source/target
+  commuting squares complete either missing equation. Implied target merges
+  participate in physical-cover fallback, and incompatible explicit or implied
+  equations produce deterministic functional conflicts.
+
 - **`UnionArchive` is now a storage-neutral Succinct data source.** Its owned
   shard union and query constraint live beside `SuccinctArchive` under
   `blob::encodings::succinctarchive` and are available through the blob

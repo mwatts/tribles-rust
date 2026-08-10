@@ -545,7 +545,8 @@ impl CollectionMerge {
     }
 }
 
-/// Unsigned exact mapping equation between two collection lattices.
+/// One unsigned exact observation of the canonical join homomorphism between
+/// two collection lattices.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollectionDerive {
     root: Id,
