@@ -9,6 +9,8 @@
 use std::error::Error;
 use std::fmt;
 
+use crate::id::Id;
+
 use super::{
     CollectionCommit, CollectionDefinition, CollectionDerive, CollectionMerge, CollectionRecord,
     CollectionStore, CommitVerificationError,
@@ -17,12 +19,8 @@ use super::{
 /// One collection record with a discovery-time validation failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollectionRecordDiagnostic {
-    /// Structurally canonical commit that failed semantic verification.
-    ///
-    /// Retaining the record lets later authorization boundaries distinguish a
-    /// corrupt commit from an unrelated signer from one that claims their own
-    /// key. No field becomes trusted merely by appearing here.
-    pub commit: CollectionCommit,
+    /// Intrinsic id of the record carrying this diagnostic.
+    pub id: Id,
     /// Cryptographic validation failure.
     pub error: CollectionRecordDiagnosticError,
 }
@@ -103,9 +101,8 @@ impl DiscoveredCollectionRecords {
         self.merges.dedup_by_key(|record| record.id());
         self.derives.sort_unstable_by_key(CollectionDerive::id);
         self.derives.dedup_by_key(|record| record.id());
-        self.diagnostics
-            .sort_unstable_by_key(|entry| entry.commit.id());
-        self.diagnostics.dedup_by_key(|entry| entry.commit.id());
+        self.diagnostics.sort_unstable_by_key(|entry| entry.id);
+        self.diagnostics.dedup_by_key(|entry| entry.id);
     }
 }
 
@@ -164,7 +161,7 @@ where
             CollectionRecord::Commit(record) => match record.verify_strict() {
                 Ok(()) => discovered.commits.push(record),
                 Err(error) => discovered.diagnostics.push(CollectionRecordDiagnostic {
-                    commit: record,
+                    id: record.id(),
                     error: CollectionRecordDiagnosticError::InvalidCommit(error),
                 }),
             },
@@ -186,7 +183,6 @@ mod tests {
     use ed25519_dalek::SigningKey;
 
     use crate::collection::{empty_metadata_handle, CollectionData};
-    use crate::id::Id;
     use crate::inline::Inline;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -289,7 +285,7 @@ mod tests {
         assert_eq!(
             forward_records.diagnostics(),
             &[CollectionRecordDiagnostic {
-                commit: invalid_commit,
+                id: invalid_commit.id(),
                 error: CollectionRecordDiagnosticError::InvalidCommit(
                     CommitVerificationError::InvalidSignature,
                 ),

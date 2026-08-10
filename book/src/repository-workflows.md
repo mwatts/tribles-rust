@@ -47,12 +47,15 @@ or implied "latest" member.
 When the backend also provides a blob reader with metadata lookup,
 `Collection::materialize()` returns the complete known union of commits signed
 by the facade's own key for this exact scoped collection. Commits signed by
-other keys are not admitted. Every observed own commit is ground truth: its
-signature, definition, data archive, and metadata archive must all validate or
-the read fails instead of silently returning a partial set. Valid resident
-`MERGE` records may provide a compact physical cover; missing or invalid
+other keys are not admitted. A failed signature authenticates none of its
+record fields and is therefore an inert diagnostic, never an owner-attributed
+veto. Every strictly verified own commit is ground truth: its definition, data
+archive, and exact metadata archive must all validate or the read fails instead
+of silently returning a partial set. Valid resident `MERGE` records may provide
+a compact physical cover. They are considered only as their inputs become
+reachable from those authenticated leaves; missing, invalid, or ungrounded
 unsigned merge evidence is merely a cache miss, so it cannot erase committed
-leaves.
+leaves or drive speculative blob demand.
 
 Materialization has the same observed-prefix concurrency contract as native
 record listing. It first discovers one deterministic record view and then opens

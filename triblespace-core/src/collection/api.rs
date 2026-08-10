@@ -6,7 +6,7 @@
 //! repository abstraction: it has no head, branch, CAS, retry, read-admission,
 //! or planning policy.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
@@ -28,8 +28,8 @@ use super::simplearchive_union::{
 use super::{
     discover_collection_records, resolve_collection_semantics, CollectionClaimValidation,
     CollectionCommit, CollectionData, CollectionDefinition, CollectionDiscoveryError,
-    CollectionFunctionalConflict, CollectionRecordDiagnosticError, CollectionResolutionError,
-    CollectionStore, CollectionValidationRequest,
+    CollectionFunctionalConflict, CollectionResolutionError, CollectionStore,
+    CollectionValidationRequest,
 };
 
 /// A scoped `SimpleArchive`-union collection and its signing authority.
@@ -45,23 +45,16 @@ pub struct Collection<S> {
 
 /// Failure to materialize the complete known value of an owned collection.
 ///
-/// Signed commits claiming this collection under the facade's own public key
-/// are ground truth, so their definition, data, metadata, and signature fail
-/// loud. Unsigned equations are only replaceable cache evidence: missing or
-/// invalid equations are omitted from the resolved semantics and cannot hide
-/// a valid committed leaf.
+/// Strictly verified commits by this collection's own public key are ground
+/// truth, so their definition, data, and metadata fail loud. A record with an
+/// invalid signature authenticates none of its fields and is ignored as an
+/// inert discovery diagnostic. Unsigned equations are only replaceable cache
+/// evidence: missing or invalid equations are omitted from the resolved
+/// semantics and cannot hide a valid committed leaf.
 #[derive(Debug)]
 pub enum CollectionMaterializationError<RecordsError, ReaderError, MetaError, GetError> {
     /// Native collection-record discovery did not complete.
     Discovery(CollectionDiscoveryError<RecordsError>),
-    /// A structurally canonical commit claiming this collection and public key
-    /// failed strict signature verification.
-    InvalidOwnCommit {
-        /// Intrinsic id of the invalid commit record.
-        commit: Id,
-        /// Strict verification diagnostic.
-        source: CollectionRecordDiagnosticError,
-    },
     /// At least one own commit was observed, but its canonical collection
     /// definition was absent from the same record view.
     MissingDefinition {
@@ -106,6 +99,16 @@ pub enum CollectionMaterializationError<RecordsError, ReaderError, MetaError, Ge
         /// Canonical archive failure.
         source: UnarchiveError,
     },
+    /// An own commit's canonical metadata bytes did not have the exact
+    /// identity signed by the commit.
+    InvalidCommitMetadataIdentity {
+        /// Intrinsic commit record id.
+        commit: Id,
+        /// Signed metadata archive handle.
+        expected: crate::inline::Inline<Handle<SimpleArchive>>,
+        /// Blake3 handle recomputed from the returned bytes.
+        actual: crate::inline::Inline<Handle<SimpleArchive>>,
+    },
     /// Positively validated equations contradicted operation functionality.
     ResolutionConflict(Box<CollectionFunctionalConflict>),
     /// The resolved semantic frontier could not be physically materialized.
@@ -123,9 +126,6 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Discovery(source) => source.fmt(f),
-            Self::InvalidOwnCommit { commit, source } => {
-                write!(f, "owned collection commit {commit:X} is invalid: {source}")
-            }
             Self::MissingDefinition { collection } => write!(
                 f,
                 "owned collection {collection:X} has commits but no canonical definition"
@@ -161,6 +161,16 @@ where
                 "owned commit {commit:X} has invalid metadata {}: {source}",
                 hex::encode_upper(metadata.raw),
             ),
+            Self::InvalidCommitMetadataIdentity {
+                commit,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "owned commit {commit:X} metadata bytes hash to {} instead of signed {}",
+                hex::encode_upper(actual.raw),
+                hex::encode_upper(expected.raw),
+            ),
             Self::ResolutionConflict(source) => source.fmt(f),
             Self::Materialize(source) => source.fmt(f),
         }
@@ -178,13 +188,13 @@ where
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Discovery(source) => Some(source),
-            Self::InvalidOwnCommit { source, .. } => Some(source),
             Self::MissingDefinition { .. } => None,
             Self::Reader(source) => Some(source),
             Self::CommitDataGet { source, .. } => Some(source),
             Self::InvalidCommitData { source, .. } => Some(source),
             Self::CommitMetadataGet { source, .. } => Some(source),
             Self::InvalidCommitMetadata { source, .. } => Some(source),
+            Self::InvalidCommitMetadataIdentity { .. } => None,
             Self::ResolutionConflict(source) => Some(source),
             Self::Materialize(source) => Some(source),
         }
@@ -292,16 +302,6 @@ where
         let collection = self.definition.id();
         let public_key = self.signing_key.verifying_key().to_bytes();
 
-        for diagnostic in discovered.diagnostics() {
-            let commit = diagnostic.commit;
-            if commit.collection() == collection && commit.public_key().raw == public_key {
-                return Err(CollectionMaterializationError::InvalidOwnCommit {
-                    commit: commit.id(),
-                    source: diagnostic.error.clone(),
-                });
-            }
-        }
-
         let authorized: BTreeSet<_> = discovered
             .commits()
             .iter()
@@ -323,80 +323,148 @@ where
             .reader()
             .map_err(CollectionMaterializationError::Reader)?;
 
-        let resolution =
-            resolve_collection_semantics(&discovered, &authorized, |request| match request {
-                CollectionValidationRequest::Commit { definition, claim } => {
-                    let data = claim.data();
-                    let data_blob: Blob<SimpleArchive> = reader
-                        .get(Handle::<SimpleArchive>::from_hash(data))
-                        .map_err(|source| CollectionMaterializationError::CommitDataGet {
-                            commit: claim.id(),
-                            data,
-                            source,
-                        })?;
-                    simplearchive_union::validate_commit(definition, claim, &data_blob).map_err(
-                        |source| CollectionMaterializationError::InvalidCommitData {
-                            commit: claim.id(),
-                            source,
-                        },
-                    )?;
+        // Authenticate and exact-validate every mandatory leaf first. Besides
+        // enforcing the signed boundary, this cache means an unsigned merge
+        // never causes the same large endpoint to be fetched and scanned over
+        // and over in one materialization.
+        let mut known = BTreeMap::<CollectionData, Blob<SimpleArchive>>::new();
+        for claim in discovered
+            .commits()
+            .iter()
+            .filter(|claim| authorized.contains(&claim.id()))
+        {
+            let data = claim.data();
+            let data_blob: Blob<SimpleArchive> = reader
+                .get(Handle::<SimpleArchive>::from_hash(data))
+                .map_err(|source| CollectionMaterializationError::CommitDataGet {
+                    commit: claim.id(),
+                    data,
+                    source,
+                })?;
+            simplearchive_union::validate_commit(&self.definition, claim, &data_blob).map_err(
+                |source| CollectionMaterializationError::InvalidCommitData {
+                    commit: claim.id(),
+                    source,
+                },
+            )?;
 
-                    let metadata = claim.metadata();
-                    let metadata_blob: Blob<SimpleArchive> =
-                        reader.get(metadata).map_err(|source| {
-                            CollectionMaterializationError::CommitMetadataGet {
-                                commit: claim.id(),
-                                metadata,
-                                source,
-                            }
-                        })?;
-                    simplearchive_union::validate_element(&metadata_blob).map_err(|source| {
-                        CollectionMaterializationError::InvalidCommitMetadata {
-                            commit: claim.id(),
-                            metadata,
-                            source,
-                        }
-                    })?;
-                    Ok(CollectionClaimValidation::Accepted)
+            let metadata = claim.metadata();
+            let metadata_blob: Blob<SimpleArchive> = reader.get(metadata).map_err(|source| {
+                CollectionMaterializationError::CommitMetadataGet {
+                    commit: claim.id(),
+                    metadata,
+                    source,
                 }
-                CollectionValidationRequest::Merge { definition, claim }
-                    if definition.id() == collection =>
-                {
-                    let (low, high) = claim.inputs();
-                    let Ok(low): Result<Blob<SimpleArchive>, _> =
-                        reader.get(Handle::<SimpleArchive>::from_hash(low))
-                    else {
-                        return Ok(CollectionClaimValidation::Pending);
-                    };
-                    let Ok(high): Result<Blob<SimpleArchive>, _> =
-                        reader.get(Handle::<SimpleArchive>::from_hash(high))
-                    else {
-                        return Ok(CollectionClaimValidation::Pending);
-                    };
-                    let Ok(result): Result<Blob<SimpleArchive>, _> =
-                        reader.get(Handle::<SimpleArchive>::from_hash(claim.result()))
-                    else {
-                        return Ok(CollectionClaimValidation::Pending);
-                    };
+            })?;
+            simplearchive_union::validate_element(&metadata_blob).map_err(|source| {
+                CollectionMaterializationError::InvalidCommitMetadata {
+                    commit: claim.id(),
+                    metadata,
+                    source,
+                }
+            })?;
+            let actual_metadata =
+                Blob::<SimpleArchive>::new(metadata_blob.bytes.clone()).get_handle();
+            if actual_metadata != metadata {
+                return Err(
+                    CollectionMaterializationError::InvalidCommitMetadataIdentity {
+                        commit: claim.id(),
+                        expected: metadata,
+                        actual: actual_metadata,
+                    },
+                );
+            }
+            known.entry(data).or_insert(data_blob);
+        }
 
-                    Ok(
-                        match simplearchive_union::validate_merge(
-                            definition, claim, &low, &high, &result,
-                        ) {
-                            Ok(()) => CollectionClaimValidation::Accepted,
-                            Err(source) => CollectionClaimValidation::Rejected(source),
-                        },
-                    )
+        // Grow only through merge equations grounded in authenticated leaves.
+        // The exact join for one input pair is cached and compared before any
+        // speculative result fetch, so arbitrary result hashes neither mint
+        // Yard wants nor trigger repeated large-input scans. A result is
+        // admitted only when it is already resident and byte-for-byte equal to
+        // that canonical join; all other unsigned evidence remains inert.
+        let mut accepted_merges = BTreeSet::new();
+        let mut examined_merges = BTreeSet::new();
+        let mut joins = BTreeMap::<(CollectionData, CollectionData), Blob<SimpleArchive>>::new();
+        loop {
+            let mut changed = false;
+            for claim in discovered
+                .merges()
+                .iter()
+                .filter(|claim| claim.collection() == collection)
+            {
+                if examined_merges.contains(&claim.id()) {
+                    continue;
+                }
+                let (low, high) = claim.inputs();
+                let (Some(low_blob), Some(high_blob)) = (known.get(&low), known.get(&high)) else {
+                    continue;
+                };
+
+                let expected = match joins.entry((low, high)) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        let Ok(joined) = simplearchive_union::join(low_blob, high_blob) else {
+                            // `known` contains only exact-validated canonical
+                            // elements, so this is a defensive invariant guard.
+                            examined_merges.insert(claim.id());
+                            continue;
+                        };
+                        entry.insert(joined)
+                    }
+                };
+                let expected_data = Handle::<SimpleArchive>::to_hash(expected.get_handle());
+                if claim.result() != expected_data {
+                    examined_merges.insert(claim.id());
+                    continue;
+                }
+
+                if !known.contains_key(&expected_data) {
+                    let result_handle = Handle::<SimpleArchive>::from_hash(expected_data);
+                    if !matches!(reader.metadata(result_handle), Ok(Some(_))) {
+                        examined_merges.insert(claim.id());
+                        continue;
+                    }
+                    let Ok(result): Result<Blob<SimpleArchive>, _> = reader.get(result_handle)
+                    else {
+                        examined_merges.insert(claim.id());
+                        continue;
+                    };
+                    if result.bytes != expected.bytes {
+                        examined_merges.insert(claim.id());
+                        continue;
+                    }
+                    known.insert(
+                        expected_data,
+                        Blob::with_handle(expected.bytes.clone(), expected.get_handle()),
+                    );
+                }
+
+                accepted_merges.insert(claim.id());
+                examined_merges.insert(claim.id());
+                changed = true;
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let resolution = resolve_collection_semantics(&discovered, &authorized, |request| {
+            Ok::<CollectionClaimValidation<()>, Infallible>(match request {
+                CollectionValidationRequest::Commit { .. } => CollectionClaimValidation::Accepted,
+                CollectionValidationRequest::Merge { claim, .. }
+                    if accepted_merges.contains(&claim.id()) =>
+                {
+                    CollectionClaimValidation::Accepted
                 }
                 CollectionValidationRequest::Merge { .. }
-                | CollectionValidationRequest::Derive { .. } => {
-                    Ok(CollectionClaimValidation::Pending)
-                }
-            });
+                | CollectionValidationRequest::Derive { .. } => CollectionClaimValidation::Pending,
+            })
+        });
 
         let resolution = match resolution {
             Ok(resolution) => resolution,
-            Err(CollectionResolutionError::Validation { source, .. }) => return Err(source),
+            Err(CollectionResolutionError::Validation { source, .. }) => match source {},
             Err(CollectionResolutionError::Conflict(source)) => {
                 return Err(CollectionMaterializationError::ResolutionConflict(source));
             }
@@ -605,26 +673,19 @@ mod tests {
     }
 
     #[test]
-    fn invalid_signature_claiming_the_owned_key_fails_loud() {
+    fn invalid_signature_claiming_the_owned_key_is_inert() {
         let scope = id(1);
         let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let definition = simplearchive_union::definition(scope);
-        let valid = CollectionCommit::sign(
-            &signing_key,
-            definition.id(),
-            Inline::new([4; 32]),
-            Inline::new([5; 32]),
-        );
+        let expected = fragment(1, false);
+        let mut collection = Collection::new(MemoryRepo::default(), scope, signing_key);
+        let valid = collection.commit(expected.clone()).unwrap();
         let invalid = invalid_signature(valid);
-        let mut storage = MemoryRepo::default();
-        storage.insert(CollectionRecord::Commit(invalid)).unwrap();
-        let mut collection = Collection::new(storage, scope, signing_key);
+        collection
+            .storage_mut()
+            .insert(CollectionRecord::Commit(invalid))
+            .unwrap();
 
-        assert!(matches!(
-            collection.materialize(),
-            Err(CollectionMaterializationError::InvalidOwnCommit { commit, .. })
-                if commit == invalid.id()
-        ));
+        assert_eq!(collection.materialize().unwrap(), expected.into_facts());
     }
 
     #[test]
@@ -697,6 +758,35 @@ mod tests {
     }
 
     #[test]
+    fn canonical_owned_metadata_must_match_the_signed_handle() {
+        let mut collection = Collection::new(
+            MemoryRepo::default(),
+            id(1),
+            SigningKey::from_bytes(&[7; 32]),
+        );
+        let commit = collection.commit(fragment(1, false)).unwrap();
+        let wrong_metadata = archive(9);
+        collection
+            .storage_mut()
+            .blobs
+            .keep([Handle::<SimpleArchive>::from_hash(commit.data())
+                .transmute::<Handle<UnknownBlob>>()]);
+        collection
+            .storage_mut()
+            .blobs
+            .insert(Blob::with_handle(wrong_metadata.bytes, commit.metadata()));
+
+        assert!(matches!(
+            collection.materialize(),
+            Err(CollectionMaterializationError::InvalidCommitMetadataIdentity {
+                commit: observed,
+                expected,
+                ..
+            }) if observed == commit.id() && expected == commit.metadata()
+        ));
+    }
+
+    #[test]
     fn valid_merge_cover_materializes_the_committed_union() {
         let mut collection = Collection::new(
             MemoryRepo::default(),
@@ -715,6 +805,45 @@ mod tests {
 
         simplearchive_union::publish_merge(collection.storage_mut(), &definition, &left, &right)
             .unwrap();
+
+        assert_eq!(collection.materialize().unwrap(), expected);
+    }
+
+    #[test]
+    fn grounded_merge_chain_materializes_the_committed_union() {
+        let mut collection = Collection::new(
+            MemoryRepo::default(),
+            id(1),
+            SigningKey::from_bytes(&[7; 32]),
+        );
+        let first = fragment(1, false);
+        let second = fragment(2, false);
+        let third = fragment(3, false);
+        let first_blob = first.facts().clone().to_blob();
+        let second_blob = second.facts().clone().to_blob();
+        let third_blob = third.facts().clone().to_blob();
+        let mut expected = first.facts().clone();
+        expected += second.facts().clone();
+        expected += third.facts().clone();
+        collection.commit(first).unwrap();
+        collection.commit(second).unwrap();
+        collection.commit(third).unwrap();
+        let definition = *collection.definition();
+
+        let (_, first_two) = simplearchive_union::publish_merge(
+            collection.storage_mut(),
+            &definition,
+            &first_blob,
+            &second_blob,
+        )
+        .unwrap();
+        simplearchive_union::publish_merge(
+            collection.storage_mut(),
+            &definition,
+            &first_two,
+            &third_blob,
+        )
+        .unwrap();
 
         assert_eq!(collection.materialize().unwrap(), expected);
     }

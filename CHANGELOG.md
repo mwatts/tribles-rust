@@ -120,12 +120,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   construction binds one scope and signing key; `commit(fragment)` archives
   facts as data, metafacts as signed metadata, persists the shared attachment
   store, and appends one independent signed COMMIT. `materialize()` admits only
-  exact-collection commits signed by that same key, fails loud on every
-  observed own dependency, and uses validated resident merge records as an
-  optional physical cover without letting missing or invalid cache equations
-  hide committed leaves. Its documented concurrency contract is one complete
-  known prefix, not global latest. It has no parents, head, conflict retry,
-  message field, planner, or tuning knobs. Optional procedural-macro
+  exact-collection commits strictly signed by that same key, treats invalid
+  signatures as unauthenticated inert diagnostics, and fails loud on every
+  authenticated dependency including the exact signed metadata identity.
+  Resident merge records are validated only as they become reachable from
+  those roots and may provide an optional physical cover without letting
+  missing, invalid, or ungrounded cache equations hide leaves or manufacture
+  speculative blob demand. Its documented concurrency contract is one
+  complete known prefix, not global latest. It has no parents, head, conflict
+  retry, message field, planner, or tuning knobs. Optional procedural-macro
   instrumentation uses the same path and one explicit
   `TRIBLESPACE_METADATA_COLLECTION_SCOPE`, replacing its Repository/Workspace
   push protocol.
