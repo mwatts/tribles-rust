@@ -5,8 +5,8 @@
 //! A [`Lazy`] wraps a store the same way a `triblespace-net` `Peer`
 //! does (shared behind `Arc<Mutex<S>>` so a `&self` read can record
 //! state), but where the Peer answers a read miss with a swarm fetch,
-//! `Lazy` answers it with a **durable want**: it weak-pins the missing
-//! handle and flushes the store so the marker survives an immediate
+//! `Lazy` answers it with a **durable want**: it records the missing
+//! handle and flushes the store so the demand survives an immediate
 //! process exit. It never performs I/O it doesn't own, and it never
 //! networks — this module lives in `triblespace-core`, which has no
 //! network dependency at all, so the guarantee is enforced by the
@@ -39,11 +39,11 @@
 //!
 //! - A short-lived process (a faculty invocation) opens the shared pile
 //!   as a `Lazy<Pile>` and reads. Every miss leaves a crash-durable
-//!   weak-pin want on record (weak pins ARE the want-queue — see
-//!   [`WeakPinStore`]) and comes back `NotYet` (sync probe) or suspends
+//!   want on record (the [`WantStore`] is the queue) and comes back
+//!   `NotYet` (sync probe) or suspends
 //!   (async read).
 //! - A long-running daemon (`Peer` + `Reconciler` in `triblespace-net`,
-//!   or `trible pile net sync --lazy`) enumerates the weak pins, fetches
+//!   or `trible pile net sync --lazy`) enumerates the wants, fetches
 //!   the absent blobs from the swarm, and lands them in the same pile.
 //! - The next sync probe — or the still-suspended async read — finds
 //!   the bytes locally.
@@ -60,7 +60,7 @@
 //! existence is semidecidable, same as everywhere else in the lazy-sync
 //! substrate.
 //!
-//! Failure posture is loud: if the want cannot be recorded (pin or flush
+//! Failure posture is loud: if the want cannot be recorded (store or flush
 //! fails), the read returns a want-record error ([`WantGetError::WantRecord`]
 //! on the probe, [`WantWaitError::WantRecord`] on the async read) — it
 //! never silently proceeds, because a silently-dropped want is a blob
@@ -72,7 +72,7 @@
 //! [`BlobStoreGet`]: crate::repo::BlobStoreGet
 //! [`LazyReader`]: crate::repo::lazy::LazyReader
 //! [`Lazy`]: crate::repo::lazy::Lazy
-//! [`WeakPinStore`]: crate::repo::WeakPinStore
+//! [`WantStore`]: crate::repo::WantStore
 //! [`WantGetError::NotYet`]: crate::repo::lazy::WantGetError::NotYet
 //! [`WantGetError::WantRecord`]: crate::repo::lazy::WantGetError::WantRecord
 //! [`WantWaitError::Store`]: crate::repo::lazy::WantWaitError::Store
@@ -100,7 +100,7 @@ use super::async_store::{
 };
 use super::{
     BlobInfo, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, PinStore, PushResult,
-    StorageFlush, WeakPinStore,
+    StorageFlush, WantStore,
 };
 
 /// Fixed cadence at which a suspended async read re-checks the store
@@ -110,39 +110,39 @@ use super::{
 /// immediately, so this bounds only the *cross-process* wake latency.
 const WANT_RECHECK_CADENCE: Duration = Duration::from_millis(100);
 
-/// The want-record failure of a store `S`: either the weak pin itself or
+/// The want-record failure of a store `S`: either the want operation or
 /// the flush that makes it crash-durable failed.
 pub type WantRecordErrorOf<S> =
-    WantRecordError<<S as WeakPinStore>::WeakPinError, <S as StorageFlush>::Error>;
+    WantRecordError<<S as WantStore>::WantError, <S as StorageFlush>::Error>;
 
 /// Recording a durable want failed. Both halves matter: a want that is
-/// pinned but not flushed evaporates if the process exits before the
+/// asserted but not flushed evaporates if the process exits before the
 /// next sync — and a faculty exits right after its read.
 #[derive(Debug)]
-pub enum WantRecordError<P, F> {
-    /// The weak pin could not be recorded.
-    Pin(P),
-    /// The weak pin was recorded but flushing it durably failed.
+pub enum WantRecordError<W, F> {
+    /// The want could not be recorded.
+    Want(W),
+    /// The want was recorded but flushing it durably failed.
     Flush(F),
 }
 
-impl<P: std::error::Error, F: std::error::Error> std::fmt::Display for WantRecordError<P, F> {
+impl<W: std::error::Error, F: std::error::Error> std::fmt::Display for WantRecordError<W, F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Pin(e) => write!(f, "recording weak-pin want failed: {e}"),
-            Self::Flush(e) => write!(f, "flushing weak-pin want failed: {e}"),
+            Self::Want(e) => write!(f, "recording durable want failed: {e}"),
+            Self::Flush(e) => write!(f, "flushing durable want failed: {e}"),
         }
     }
 }
 
-impl<P, F> std::error::Error for WantRecordError<P, F>
+impl<W, F> std::error::Error for WantRecordError<W, F>
 where
-    P: std::error::Error + 'static,
+    W: std::error::Error + 'static,
     F: std::error::Error + 'static,
 {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Pin(e) => Some(e),
+            Self::Want(e) => Some(e),
             Self::Flush(e) => Some(e),
         }
     }
@@ -154,7 +154,7 @@ pub enum WantGetError<E, W> {
     /// The bytes were present locally but didn't convert to the
     /// requested type.
     Conversion(E),
-    /// Local miss. The want is **durably on record** (weak pin, flushed)
+    /// Local miss. The want is **durably on record** (asserted and flushed)
     /// — a sync daemon (`Peer` + `Reconciler`) services it. This is the
     /// probe's "recorded, not present" outcome, never "definitely
     /// absent"; to *wait* for the blob instead, use the async
@@ -326,10 +326,10 @@ impl WantSignal {
 ///
 /// Mirrors the shared-store shape of `triblespace-net`'s `Peer`
 /// (`Arc<Mutex<S>>`) so a `&self` read on a [`LazyReader`] can record
-/// the weak-pin want — the one piece of state a read must mutate.
+/// the durable want — the one piece of state a read must mutate.
 pub struct Lazy<S>
 where
-    S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
+    S: BlobStore + BlobStorePut + WantStore + StorageFlush + Send + 'static,
 {
     store: Arc<Mutex<S>>,
     signal: Arc<WantSignal>,
@@ -337,7 +337,7 @@ where
 
 impl<S> Lazy<S>
 where
-    S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
+    S: BlobStore + BlobStorePut + WantStore + StorageFlush + Send + 'static,
 {
     /// Wrap a store. No network is opened — `Lazy` is pure local
     /// mechanics. (A cadence re-check thread is spawned lazily only
@@ -380,7 +380,7 @@ where
 
 impl<S> BlobStorePut for Lazy<S>
 where
-    S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
+    S: BlobStore + BlobStorePut + WantStore + StorageFlush + Send + 'static,
 {
     type PutError = S::PutError;
 
@@ -402,7 +402,7 @@ where
 
 impl<S> BlobStore for Lazy<S>
 where
-    S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
+    S: BlobStore + BlobStorePut + WantStore + StorageFlush + Send + 'static,
 {
     type Reader = LazyReader<S>;
     type ReaderError = S::ReaderError;
@@ -419,7 +419,7 @@ where
 
 impl<S> PinStore for Lazy<S>
 where
-    S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
+    S: BlobStore + BlobStorePut + PinStore + WantStore + StorageFlush + Send + 'static,
 {
     type PinsError = S::PinsError;
     type HeadError = S::HeadError;
@@ -453,14 +453,7 @@ where
 
 impl<S> CollectionStore for Lazy<S>
 where
-    S: BlobStore
-        + BlobStorePut
-        + CollectionStore
-        + PinStore
-        + WeakPinStore
-        + StorageFlush
-        + Send
-        + 'static,
+    S: BlobStore + BlobStorePut + CollectionStore + WantStore + StorageFlush + Send + 'static,
 {
     type RecordsError = S::RecordsError;
     type InsertError = S::InsertError;
@@ -482,50 +475,49 @@ where
     }
 }
 
-impl<S> WeakPinStore for Lazy<S>
+impl<S> WantStore for Lazy<S>
 where
-    S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
+    S: BlobStore + BlobStorePut + WantStore + StorageFlush + Send + 'static,
 {
-    type WeakPinError = S::WeakPinError;
+    type WantError = S::WantError;
     // Collected eagerly, same rationale as `pins`.
-    type WeakListIter<'a>
-        = std::vec::IntoIter<Result<Inline<Handle<UnknownBlob>>, S::WeakPinError>>
+    type WantIter<'a>
+        = std::vec::IntoIter<Result<Inline<Handle<UnknownBlob>>, S::WantError>>
     where
         S: 'a;
 
     /// Passthrough to the inner store. Note the durability contract of
-    /// the *read* path (pin + flush) does not apply here — this is the
-    /// store's own `pin_weak` semantics; call
+    /// the *read* path (want + flush) does not apply here — this is the
+    /// store's own `want` semantics; call
     /// [`StorageFlush::flush`] yourself if you need the marker
     /// crash-durable immediately.
-    fn pin_weak<Sch>(&mut self, handle: Inline<Handle<Sch>>) -> Result<(), Self::WeakPinError>
+    fn want<Sch>(&mut self, handle: Inline<Handle<Sch>>) -> Result<(), Self::WantError>
     where
         Sch: BlobEncoding + 'static,
         Handle<Sch>: InlineEncoding,
     {
-        self.store.lock().expect("store mutex").pin_weak(handle)
+        self.store.lock().expect("store mutex").want(handle)
     }
 
     /// Passthrough: retract a want / retention marker.
-    fn unpin_weak<Sch>(&mut self, handle: Inline<Handle<Sch>>) -> Result<(), Self::WeakPinError>
+    fn unwant<Sch>(&mut self, handle: Inline<Handle<Sch>>) -> Result<(), Self::WantError>
     where
         Sch: BlobEncoding + 'static,
         Handle<Sch>: InlineEncoding,
     {
-        self.store.lock().expect("store mutex").unpin_weak(handle)
+        self.store.lock().expect("store mutex").unwant(handle)
     }
 
-    fn weak_pins<'a>(&'a mut self) -> Result<Self::WeakListIter<'a>, Self::WeakPinError> {
+    fn wants<'a>(&'a mut self) -> Result<Self::WantIter<'a>, Self::WantError> {
         let mut store = self.store.lock().expect("store mutex");
-        let pins: Vec<Result<Inline<Handle<UnknownBlob>>, S::WeakPinError>> =
-            store.weak_pins()?.collect();
+        let pins: Vec<Result<Inline<Handle<UnknownBlob>>, S::WantError>> = store.wants()?.collect();
         Ok(pins.into_iter())
     }
 }
 
 impl<S> StorageFlush for Lazy<S>
 where
-    S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
+    S: BlobStore + BlobStorePut + WantStore + StorageFlush + Send + 'static,
 {
     type Error = <S as StorageFlush>::Error;
 
@@ -542,7 +534,7 @@ where
 /// `Lazy` end to end. Landing a blob wakes suspended async reads.
 impl<S> AsyncBlobStorePut for Lazy<S>
 where
-    S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
+    S: BlobStore + BlobStorePut + WantStore + StorageFlush + Send + 'static,
 {
     type PutError = S::PutError;
 
@@ -584,7 +576,7 @@ where
 /// probe and the async waiting read.
 impl<S> AsyncBlobStore for Lazy<S>
 where
-    S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
+    S: BlobStore + BlobStorePut + WantStore + StorageFlush + Send + 'static,
     S::Reader: Sync,
 {
     type Reader = LazyReader<S>;
@@ -607,7 +599,7 @@ where
 /// The suspension behind the async waiting read. Every poll takes a
 /// fresh reader from the live store — which refreshes it, so records
 /// appended by other processes become visible — and does a local get.
-/// The first miss records the durable want (pin + flush, exactly like
+/// The first miss records the durable want (assert + flush, exactly like
 /// the sync probe), then the future parks until woken: by an in-process
 /// `put` through the owning [`Lazy`], or by the cadence ticker.
 ///
@@ -615,7 +607,7 @@ where
 /// durable want remains recorded.
 struct WaitForBlob<S>
 where
-    S: BlobStore + WeakPinStore + StorageFlush + Send + 'static,
+    S: BlobStore + WantStore + StorageFlush + Send + 'static,
 {
     store: Arc<Mutex<S>>,
     signal: Arc<WantSignal>,
@@ -625,7 +617,7 @@ where
 
 impl<S> Future for WaitForBlob<S>
 where
-    S: BlobStore + WeakPinStore + StorageFlush + Send + 'static,
+    S: BlobStore + WantStore + StorageFlush + Send + 'static,
 {
     type Output = Result<
         Bytes,
@@ -648,14 +640,14 @@ where
             return Poll::Ready(Ok(bytes));
         }
 
-        // The durable want, recorded once: weak-pin the demand, then
+        // Record the durable want once, then
         // flush — the marker must survive an immediate process exit. Any
         // failure is an ERROR: a silently dropped want is a blob nobody
         // will ever fetch, and a wait without a recorded want is a wait
         // nobody will ever satisfy.
         if !this.want_recorded {
-            if let Err(e) = store.pin_weak(handle) {
-                return Poll::Ready(Err(WantWaitError::WantRecord(WantRecordError::Pin(e))));
+            if let Err(e) = store.want(handle) {
+                return Poll::Ready(Err(WantWaitError::WantRecord(WantRecordError::Want(e))));
             }
             if let Err(e) = store.flush() {
                 return Poll::Ready(Err(WantWaitError::WantRecord(WantRecordError::Flush(e))));
@@ -681,7 +673,7 @@ where
 /// store. See the [module-level docs](self) for the probe/wait split.
 impl<S> AsyncBlobStoreGet for LazyReader<S>
 where
-    S: BlobStore + WeakPinStore + StorageFlush + Send + 'static,
+    S: BlobStore + WantStore + StorageFlush + Send + 'static,
 {
     type GetError<E: std::error::Error + Send + Sync + 'static> =
         WantWaitError<E, S::ReaderError, WantRecordErrorOf<S>>;
@@ -724,7 +716,7 @@ where
 /// first poll (enumeration is local; it never records wants).
 impl<S> AsyncBlobStoreList for LazyReader<S>
 where
-    S: BlobStore + WeakPinStore + StorageFlush + Send + 'static,
+    S: BlobStore + WantStore + StorageFlush + Send + 'static,
     S::Reader: Sync,
 {
     type Err = <S::Reader as BlobStoreList>::Err;
@@ -744,7 +736,7 @@ where
 /// [module-level docs](self)):
 /// - the sync [`BlobStoreGet`] is the *probe*: local-plus-want — a hit
 ///   is served from the snapshot; a miss durably records the demand
-///   (weak pin + flush) and returns [`WantGetError::NotYet`]
+///   (want + flush) and returns [`WantGetError::NotYet`]
 ///   immediately.
 /// - the async [`AsyncBlobStoreGet`]
 ///   is the *waiting read*: same durable want on miss, then suspension
@@ -757,11 +749,11 @@ where
 /// trait.
 pub struct LazyReader<S>
 where
-    S: BlobStore + WeakPinStore + StorageFlush + Send + 'static,
+    S: BlobStore + WantStore + StorageFlush + Send + 'static,
 {
     local: S::Reader,
     /// Want-recording handle into the shared store: a `&self` read must
-    /// be able to weak-pin the missed handle and flush the marker.
+    /// be able to record the missed handle and flush the want.
     store: Arc<Mutex<S>>,
     /// Wake channel shared with the owning [`Lazy`], so a suspended
     /// async read hears about in-process landings immediately.
@@ -773,7 +765,7 @@ where
 // snapshot's value. (Mirrors `PeerReader` in triblespace-net.)
 impl<S> Clone for LazyReader<S>
 where
-    S: BlobStore + WeakPinStore + StorageFlush + Send + 'static,
+    S: BlobStore + WantStore + StorageFlush + Send + 'static,
 {
     fn clone(&self) -> Self {
         Self {
@@ -785,17 +777,17 @@ where
 }
 impl<S> PartialEq for LazyReader<S>
 where
-    S: BlobStore + WeakPinStore + StorageFlush + Send + 'static,
+    S: BlobStore + WantStore + StorageFlush + Send + 'static,
 {
     fn eq(&self, other: &Self) -> bool {
         self.local == other.local
     }
 }
-impl<S> Eq for LazyReader<S> where S: BlobStore + WeakPinStore + StorageFlush + Send + 'static {}
+impl<S> Eq for LazyReader<S> where S: BlobStore + WantStore + StorageFlush + Send + 'static {}
 
 impl<S> BlobStoreGet for LazyReader<S>
 where
-    S: BlobStore + WeakPinStore + StorageFlush + Send + 'static,
+    S: BlobStore + WantStore + StorageFlush + Send + 'static,
 {
     type GetError<E: std::error::Error + Send + Sync + 'static> =
         WantGetError<E, WantRecordErrorOf<S>>;
@@ -820,15 +812,15 @@ where
                 .try_from_blob()
                 .map_err(WantGetError::Conversion),
             Err(_) => {
-                // The durable want: weak-pin the demand, then flush —
+                // Record the durable want, then flush —
                 // the marker must survive an immediate process exit
                 // (pile records are not durable until flushed). Any
                 // failure here is an ERROR to the caller: a silently
                 // dropped want is a blob nobody will ever fetch.
                 let mut store = self.store.lock().expect("store mutex");
                 store
-                    .pin_weak(handle)
-                    .map_err(|e| WantGetError::WantRecord(WantRecordError::Pin(e)))?;
+                    .want(handle)
+                    .map_err(|e| WantGetError::WantRecord(WantRecordError::Want(e)))?;
                 store
                     .flush()
                     .map_err(|e| WantGetError::WantRecord(WantRecordError::Flush(e)))?;
@@ -840,7 +832,7 @@ where
 
 impl<S> BlobStoreList for LazyReader<S>
 where
-    S: BlobStore + WeakPinStore + StorageFlush + Send + 'static,
+    S: BlobStore + WantStore + StorageFlush + Send + 'static,
 {
     type Iter<'a>
         = <S::Reader as BlobStoreList>::Iter<'a>
@@ -901,11 +893,7 @@ mod tests {
         let bytes: Bytes =
             BlobStoreGet::get(&reader, handle).expect("resident blob serves locally");
         assert_eq!(&bytes[..], b"resident");
-        assert_eq!(
-            lazy.weak_pins().unwrap().count(),
-            0,
-            "a hit records no want"
-        );
+        assert_eq!(lazy.wants().unwrap().count(), 0, "a hit records no want");
     }
 
     /// The core contract of the sync probe: a miss returns `NotYet` with
@@ -928,37 +916,37 @@ mod tests {
         );
         drop(reader);
 
-        let wants: Vec<_> = lazy.weak_pins().unwrap().map(Result::unwrap).collect();
-        assert_eq!(wants, vec![handle], "want visible in weak_pins()");
+        let wants: Vec<_> = lazy.wants().unwrap().map(Result::unwrap).collect();
+        assert_eq!(wants, vec![handle], "want visible in wants()");
 
         // A second handle opened fresh on the same file replays the
         // (flushed) marker — this is what a sync daemon's pile handle
         // sees after the faculty process exits.
         let mut reopened = Pile::open(&path).unwrap();
-        let wants: Vec<_> = reopened.weak_pins().unwrap().map(Result::unwrap).collect();
+        let wants: Vec<_> = reopened.wants().unwrap().map(Result::unwrap).collect();
         assert_eq!(wants, vec![handle], "want survives reopen");
         reopened.close().unwrap();
 
         lazy.into_store().close().unwrap();
     }
 
-    // ── WantRecord path: a store whose pin_weak fails ────────────────
+    // ── WantRecord path: a store whose want fails ────────────────
 
     #[derive(Debug, PartialEq)]
-    struct PinRefused;
-    impl std::fmt::Display for PinRefused {
+    struct WantRefused;
+    impl std::fmt::Display for WantRefused {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "weak pin refused")
+            write!(f, "want refused")
         }
     }
-    impl std::error::Error for PinRefused {}
+    impl std::error::Error for WantRefused {}
 
-    /// MemoryRepo wrapper whose weak-pin surface always fails —
+    /// MemoryRepo wrapper whose want surface always fails —
     /// simulates a store that cannot record the want.
     #[derive(Debug, Default)]
-    struct FailingPins(MemoryRepo);
+    struct FailingWants(MemoryRepo);
 
-    impl BlobStorePut for FailingPins {
+    impl BlobStorePut for FailingWants {
         type PutError = <MemoryRepo as BlobStorePut>::PutError;
         fn put<Sch, T>(&mut self, item: T) -> Result<Inline<Handle<Sch>>, Self::PutError>
         where
@@ -970,7 +958,7 @@ mod tests {
         }
     }
 
-    impl BlobStore for FailingPins {
+    impl BlobStore for FailingWants {
         type Reader = <MemoryRepo as BlobStore>::Reader;
         type ReaderError = <MemoryRepo as BlobStore>::ReaderError;
         fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
@@ -978,55 +966,30 @@ mod tests {
         }
     }
 
-    impl PinStore for FailingPins {
-        type PinsError = <MemoryRepo as PinStore>::PinsError;
-        type HeadError = <MemoryRepo as PinStore>::HeadError;
-        type UpdateError = <MemoryRepo as PinStore>::UpdateError;
-        type ListIter<'a> = <MemoryRepo as PinStore>::ListIter<'a>;
+    impl WantStore for FailingWants {
+        type WantError = WantRefused;
+        type WantIter<'a> = std::vec::IntoIter<Result<Inline<Handle<UnknownBlob>>, WantRefused>>;
 
-        fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError> {
-            self.0.pins()
-        }
-        fn head(
-            &mut self,
-            id: Id,
-        ) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
-            self.0.head(id)
-        }
-        fn update(
-            &mut self,
-            id: Id,
-            old: Option<Inline<Handle<SimpleArchive>>>,
-            new: Option<Inline<Handle<SimpleArchive>>>,
-        ) -> Result<PushResult, Self::UpdateError> {
-            self.0.update(id, old, new)
-        }
-    }
-
-    impl WeakPinStore for FailingPins {
-        type WeakPinError = PinRefused;
-        type WeakListIter<'a> = std::vec::IntoIter<Result<Inline<Handle<UnknownBlob>>, PinRefused>>;
-
-        fn pin_weak<Sch>(&mut self, _handle: Inline<Handle<Sch>>) -> Result<(), PinRefused>
+        fn want<Sch>(&mut self, _handle: Inline<Handle<Sch>>) -> Result<(), WantRefused>
         where
             Sch: BlobEncoding + 'static,
             Handle<Sch>: InlineEncoding,
         {
-            Err(PinRefused)
+            Err(WantRefused)
         }
-        fn unpin_weak<Sch>(&mut self, _handle: Inline<Handle<Sch>>) -> Result<(), PinRefused>
+        fn unwant<Sch>(&mut self, _handle: Inline<Handle<Sch>>) -> Result<(), WantRefused>
         where
             Sch: BlobEncoding + 'static,
             Handle<Sch>: InlineEncoding,
         {
-            Err(PinRefused)
+            Err(WantRefused)
         }
-        fn weak_pins<'a>(&'a mut self) -> Result<Self::WeakListIter<'a>, PinRefused> {
+        fn wants<'a>(&'a mut self) -> Result<Self::WantIter<'a>, WantRefused> {
             Ok(Vec::new().into_iter())
         }
     }
 
-    impl StorageFlush for FailingPins {
+    impl StorageFlush for FailingWants {
         type Error = std::convert::Infallible;
         fn flush(&mut self) -> Result<(), Self::Error> {
             Ok(())
@@ -1036,20 +999,20 @@ mod tests {
     /// A failed want-record is an ERROR to the caller — never a silent
     /// `NotYet` (a silently dropped want is a blob nobody will fetch).
     /// The flush half of the failure ([`WantRecordError::Flush`]) shares
-    /// this exact propagation path; only the pin half is simulated here
+    /// this exact propagation path; only the want half is simulated here
     /// because a failing-but-typed flush needs no separate mechanism.
     #[test]
     fn want_record_failure_is_an_error() {
-        let mut lazy = Lazy::new(FailingPins::default());
+        let mut lazy = Lazy::new(FailingWants::default());
         let (_, handle) = blob_of(b"unrecordable");
 
         let reader = BlobStore::reader(&mut lazy).unwrap();
         let err = BlobStoreGet::get::<Bytes, UnknownBlob>(&reader, handle)
-            .expect_err("miss on a pin-refusing store must error");
+            .expect_err("miss on a want-refusing store must error");
         assert!(
             matches!(
                 err,
-                WantGetError::WantRecord(WantRecordError::Pin(PinRefused))
+                WantGetError::WantRecord(WantRecordError::Want(WantRefused))
             ),
             "want-record failure must surface as WantRecord, got {err:?}"
         );
@@ -1060,18 +1023,18 @@ mod tests {
     /// is a wait nobody will ever satisfy.
     #[test]
     fn async_want_record_failure_is_an_error() {
-        let mut lazy = Lazy::new(FailingPins::default());
+        let mut lazy = Lazy::new(FailingWants::default());
         let (_, handle) = blob_of(b"unrecordable");
 
         let reader = BlobStore::reader(&mut lazy).unwrap();
         let err = block_on(AsyncBlobStoreGet::get::<Bytes, UnknownBlob>(
             &reader, handle,
         ))
-        .expect_err("miss on a pin-refusing store must error, not suspend");
+        .expect_err("miss on a want-refusing store must error, not suspend");
         assert!(
             matches!(
                 err,
-                WantWaitError::WantRecord(WantRecordError::Pin(PinRefused))
+                WantWaitError::WantRecord(WantRecordError::Want(WantRefused))
             ),
             "want-record failure must surface as WantRecord, got {err:?}"
         );
@@ -1100,11 +1063,7 @@ mod tests {
         let bytes: Bytes =
             block_on(AsyncBlobStoreGet::get(&reader, handle)).expect("present blob resolves");
         assert_eq!(&bytes[..], b"already here");
-        assert_eq!(
-            lazy.weak_pins().unwrap().count(),
-            0,
-            "a hit records no want"
-        );
+        assert_eq!(lazy.wants().unwrap().count(), 0, "a hit records no want");
     }
 
     /// The in-process wake path: the first poll records the durable want
@@ -1128,7 +1087,7 @@ mod tests {
             fut.as_mut().poll(&mut cx).is_pending(),
             "absent blob suspends"
         );
-        let wants: Vec<_> = lazy.weak_pins().unwrap().map(Result::unwrap).collect();
+        let wants: Vec<_> = lazy.wants().unwrap().map(Result::unwrap).collect();
         assert_eq!(wants, vec![handle], "first pending poll recorded the want");
         assert_eq!(
             counter.0.load(Ordering::SeqCst),
@@ -1167,7 +1126,7 @@ mod tests {
             // fut dropped here — the wait is abandoned.
         }
 
-        let wants: Vec<_> = lazy.weak_pins().unwrap().map(Result::unwrap).collect();
+        let wants: Vec<_> = lazy.wants().unwrap().map(Result::unwrap).collect();
         assert_eq!(wants, vec![handle], "the want outlives the dropped future");
     }
 

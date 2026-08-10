@@ -5,7 +5,7 @@
 //! closure that is only partially present fails with
 //! `WantGetError::NotYet` (bubbled through
 //! `WorkspaceCheckoutError::Storage`) while the miss has already
-//! enqueued a durable weak-pin want for the absent blob — exactly what
+//! enqueued a durable want for the absent blob — exactly what
 //! a sync daemon needs to service the demand before a retry. (An async
 //! consumer would instead suspend on the reader's `AsyncBlobStoreGet`
 //! until the blob lands.)
@@ -86,8 +86,8 @@ fn checkout_over_lazy_fails_notyet_and_enqueues_wants() {
     // The miss enqueued a durable want for exactly the withheld blob.
     let wants: Vec<_> = repo_b
         .storage_mut()
-        .weak_pins()
-        .expect("weak pins")
+        .wants()
+        .expect("wants")
         .map(Result::unwrap)
         .collect();
     assert!(

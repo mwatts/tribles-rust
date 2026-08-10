@@ -126,7 +126,7 @@ pub enum Command {
         #[arg(long, value_name = "SECS")]
         quiescent_for: Option<u64>,
         /// Disable the lazy want-reconcile tick. By default sync also
-        /// services durable weak-pin *wants*: weak-pin records appended
+        /// services durable *wants*: want records appended
         /// to the pile (by faculties or any other process) are noticed
         /// each tick and the missing blobs fetched from the swarm
         /// (fetch-on-want). Content-lazy is the doctrine; this flag is
@@ -287,14 +287,12 @@ fn run_sync(
     if let Some(q) = quiescent_for {
         eprintln!("quiescent stop: {q}s without events");
     }
-    // Lazy content sync: service durable weak-pin wants. Fetching is a
+    // Lazy content sync: service durable wants. Fetching is a
     // read, so WriteOnly ("no fetch") suppresses it; it stays on under
     // ReadOnly — a leecher that only services wants is a legit workflow.
     let lazy = !no_lazy && direction != SyncDirection::WriteOnly;
     if lazy {
-        eprintln!(
-            "lazy: servicing weak-pin wants every {reconcile_interval}s (--no-lazy to disable)"
-        );
+        eprintln!("lazy: servicing wants every {reconcile_interval}s (--no-lazy to disable)");
     } else if no_lazy {
         eprintln!("lazy: disabled (--no-lazy)");
     } else {
@@ -314,7 +312,7 @@ fn run_sync(
 
     // Want-reconcile state. The Reconciler (triblespace-net) owns the
     // per-want retry bookkeeping (exponential backoff, capped at 60s);
-    // the wants themselves live durably in the pile as weak pins. The
+    // the wants themselves live durably in the pile's WantStore. The
     // tick is async (the swarm fetch awaits the host), so we drive it
     // on a small current-thread runtime — the fetch's internal DHT
     // deadline uses tokio timers, which need a runtime context.
@@ -412,13 +410,14 @@ fn run_sync(
                 .renewal_tick(hifitime::Duration::from_seconds(3600.0));
         }
 
-        // Want-reconcile tick: a weak pin IS a durable want-marker —
+        // Want-reconcile tick: a want IS a durable want-marker —
         // "I would like this blob; fetch it if absent; evictable."
-        // Each pass re-reads the pile (weak-pin records appended by
+        // Each pass re-reads the pile (want records appended by
         // OTHER processes since the last pass become visible), diffs
         // the want set against the blobs present, and swarm-fetches
-        // the missing ones, landing them under their existing weak
-        // pin. Failed fetches retry with per-want exponential backoff
+        // the missing ones. Their existing wants become cache-retention
+        // interest after the bytes land. Failed fetches retry with
+        // per-want exponential backoff
         // inside the Reconciler; a want nobody serves stays pending —
         // normal, never an error, never dropped. Strong pins/branches
         // are untouched.
@@ -447,7 +446,7 @@ fn run_sync(
     if lazy {
         eprintln!(
             "wants: {wants_fetched_total} fetched this run; {wants_pending} still pending \
-             (pending is normal — the wants stay on record as weak pins in the pile \
+             (pending is normal — the wants stay in the pile's WantStore \
              and are serviced whenever a holder becomes reachable)"
         );
     }

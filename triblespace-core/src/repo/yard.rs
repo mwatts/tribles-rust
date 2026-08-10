@@ -34,69 +34,69 @@ use super::pile::{
 };
 use super::{
     transfer, BlobChildren, BlobInfo, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut,
-    PinStore, PushResult, RetentionRoots, StorageClose, TransferError, WeakPinStore,
+    PinStore, PushResult, RetentionRoots, StorageClose, TransferError, WantStore,
 };
 
 type HandleSet = PATCH<INLINE_LEN, IdentitySchema>;
 type StrongPins = PATCH<16, IdentitySchema, Inline<Handle<UnknownBlob>>>;
-type WeakPins = PATCH<INLINE_LEN, IdentitySchema, WeakPin>;
+type WantIndex = PATCH<INLINE_LEN, IdentitySchema, WantEntry>;
 
 #[derive(Debug, Clone, Copy)]
-struct WeakPin {
+struct WantEntry {
     last_used: u64,
 }
 
 #[derive(Debug, Default)]
-struct WeakState {
-    pins: WeakPins,
+struct WantState {
+    wants: WantIndex,
     clock: u64,
 }
 
-impl WeakState {
-    fn pin(&mut self, handle: Inline<Handle<UnknownBlob>>) {
+impl WantState {
+    fn want(&mut self, handle: Inline<Handle<UnknownBlob>>) {
         self.clock = self.clock.wrapping_add(1).max(1);
         let entry = Entry::with_value(
             &handle.raw,
-            WeakPin {
+            WantEntry {
                 last_used: self.clock,
             },
         );
-        self.pins.replace(&entry);
+        self.wants.replace(&entry);
     }
 
-    fn unpin(&mut self, raw: &[u8; INLINE_LEN]) {
-        self.pins.remove(raw);
+    fn unwant(&mut self, raw: &[u8; INLINE_LEN]) {
+        self.wants.remove(raw);
     }
 
     fn trim_to_present_budget(&mut self, present: &HandleSet, budget: usize) -> HandleSet {
         let mut candidates = Vec::new();
-        for raw in &self.pins {
+        for raw in &self.wants {
             if present.get(raw).is_some() {
-                let pin = *self
-                    .pins
+                let entry = *self
+                    .wants
                     .get(raw)
                     .expect("key from PATCH iterator must resolve in the same PATCH");
-                candidates.push((*raw, pin.last_used));
+                candidates.push((*raw, entry.last_used));
             }
         }
 
         candidates.sort_by_key(|(_, last_used)| Reverse(*last_used));
 
-        let mut retained = WeakPins::new();
+        let mut retained = WantIndex::new();
         let mut handles = HandleSet::new();
         for (raw, last_used) in candidates.into_iter().take(budget) {
-            retained.replace(&Entry::with_value(&raw, WeakPin { last_used }));
+            retained.replace(&Entry::with_value(&raw, WantEntry { last_used }));
             handles.insert(&Entry::new(&raw));
         }
-        self.pins = retained;
+        self.wants = retained;
         handles
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct YardConfig {
-    /// Maximum number of weak-pinned blobs retained in the young cache.
-    pub weak_budget: usize,
+    /// Maximum number of wanted blobs retained in the young cache.
+    pub want_budget: usize,
     /// Strong survivor budget for the youngest level.
     pub strong_level_budget: usize,
     /// Per-level strong budget multiplier.
@@ -106,7 +106,7 @@ pub struct YardConfig {
 impl Default for YardConfig {
     fn default() -> Self {
         Self {
-            weak_budget: 1024,
+            want_budget: 1024,
             strong_level_budget: 1024,
             fanout: 10,
         }
@@ -162,7 +162,7 @@ pub struct Yard {
     generations: Vec<Generation>,
     config: YardConfig,
     strong_pins: StrongPins,
-    weak_state: Arc<Mutex<WeakState>>,
+    want_state: Arc<Mutex<WantState>>,
 }
 
 impl Yard {
@@ -195,7 +195,7 @@ impl Yard {
             generations,
             config,
             strong_pins: StrongPins::new(),
-            weak_state: Arc::new(Mutex::new(WeakState::default())),
+            want_state: Arc::new(Mutex::new(WantState::default())),
         })
     }
 
@@ -206,10 +206,10 @@ impl Yard {
     /// truncated**. Repair is an explicit opt-in via [`Yard::amputate`]
     /// (mirroring [`Pile::refresh`] vs [`Pile::amputate`]).
     ///
-    /// The weak-pin state is rebuilt from the durable weak-pin markers found
+    /// The wanted set is rebuilt from the durable want markers found
     /// in the generation piles (old to young, so the young generation's
     /// markers override older ones), fixing the restart amnesia the previous
-    /// in-memory-only weak state had.
+    /// in-memory-only want state had.
     pub fn open<P>(
         paths: impl IntoIterator<Item = P>,
         config: YardConfig,
@@ -273,15 +273,15 @@ impl Yard {
         if generations.is_empty() {
             return Err(YardOpenError::NoGenerations);
         }
-        // Reload the durable weak pins. Iterate old -> young so a young
+        // Reload the durable wants. Iterate old -> young so a young
         // marker (re-)pins last and wins the LRU recency slot; each pile's
         // own set is already LWW-resolved by its log order. (In practice
         // markers are only ever written to the young generation's pile.)
-        let mut weak_state = WeakState::default();
+        let mut want_state = WantState::default();
         for generation in generations.iter_mut().rev() {
             for segment in &mut generation.segments {
-                for marker in segment.pile_mut().weak_pins().map_err(update_err_io)? {
-                    weak_state.pin(marker.map_err(update_err_io)?);
+                for marker in segment.pile_mut().wants().map_err(update_err_io)? {
+                    want_state.want(marker.map_err(update_err_io)?);
                 }
             }
         }
@@ -289,7 +289,7 @@ impl Yard {
             generations,
             config,
             strong_pins: StrongPins::new(),
-            weak_state: Arc::new(Mutex::new(weak_state)),
+            want_state: Arc::new(Mutex::new(want_state)),
         })
     }
 
@@ -332,33 +332,23 @@ impl Yard {
         self.strong_pins.remove(&raw);
     }
 
-    /// Returns whether `handle` is resident (live) in any generation.
-    fn is_resident(&self, handle: &Inline<Handle<UnknownBlob>>) -> bool {
-        self.generations.iter().any(|generation| {
-            generation
-                .segments
-                .iter()
-                .any(|s| s.live.get(&handle.raw).is_some())
-        })
-    }
-
-    /// Re-append the surviving weak-pin markers to the young generation's
+    /// Re-append the surviving want markers to the young generation's
     /// pile. A pile rewrite ([`reclaim_generation`]) transfers only live
-    /// blobs, so it drops the weak-pin marker records along with the dead
-    /// bytes; whenever the young pile is rewritten the current weak set must
-    /// be re-recorded (surviving pins re-recorded, evicted ones dropped —
+    /// blobs, so it drops the want marker records along with the dead
+    /// bytes; whenever the young pile is rewritten the current wanted set must
+    /// be re-recorded (surviving wants re-recorded, evicted ones dropped —
     /// eviction already removed them from the in-memory set).
-    fn rerecord_weak_markers(&mut self) -> Result<(), std::io::Error> {
-        let pins: Vec<Inline<Handle<UnknownBlob>>> = {
-            let weak_state = self.weak_state.lock().expect("weak pin mutex poisoned");
-            (&weak_state.pins)
+    fn rerecord_want_markers(&mut self) -> Result<(), std::io::Error> {
+        let wants: Vec<Inline<Handle<UnknownBlob>>> = {
+            let want_state = self.want_state.lock().expect("want mutex poisoned");
+            (&want_state.wants)
                 .into_iter()
                 .map(|raw| Inline::<Handle<UnknownBlob>>::new(*raw))
                 .collect()
         };
         let pile = self.generations[0].active_mut().pile_mut();
-        for handle in pins {
-            pile.pin_weak(handle).map_err(|err| match err {
+        for handle in wants {
+            pile.want(handle).map_err(|err| match err {
                 PileWriteError::IoError(io) => io,
             })?;
         }
@@ -369,7 +359,7 @@ impl Yard {
     }
 
     /// Recompute the keep set with explicit policy roots and logically collect
-    /// cold weak pins and orphans.
+    /// cold wants and orphans.
     ///
     /// The supplied roots are strong for this pass. Direct roots retain only
     /// themselves; recursive roots retain their resident descendants. Callers
@@ -385,14 +375,14 @@ impl Yard {
         let reader = self.reader().map_err(YardCollectError::Reader)?;
         let strong_keep = self.strong_keep_set(&reader, &retention);
         let present = reader.live_set();
-        let weak_keep = self
-            .weak_state
+        let want_keep = self
+            .want_state
             .lock()
-            .expect("weak pin mutex poisoned")
-            .trim_to_present_budget(&present, self.config.weak_budget);
+            .expect("want mutex poisoned")
+            .trim_to_present_budget(&present, self.config.want_budget);
 
         let mut keep = strong_keep;
-        keep.union(weak_keep);
+        keep.union(want_keep);
         for generation in &mut self.generations {
             for segment in &mut generation.segments {
                 segment.live = segment.live.intersect(&keep);
@@ -404,8 +394,8 @@ impl Yard {
     /// Run one compaction pass with explicit policy roots.
     ///
     /// Strong survivors descend when a level exceeds its strong budget. The
-    /// whole surviving tier moves together; weak survivors remain evictable
-    /// under the weak budget after they descend. Pass an empty
+    /// whole surviving tier moves together; wanted survivors remain evictable
+    /// under the want budget after they descend. Pass an empty
     /// [`RetentionRoots`] explicitly when legacy strong pins are the only
     /// desired strong roots.
     pub fn compact(&mut self, retention: &RetentionRoots) -> Result<(), YardCollectError> {
@@ -428,12 +418,12 @@ impl Yard {
                     continue;
                 }
 
-                // Overflow: dump the whole tier down — strong *and* weak
+                // Overflow: dump the whole tier down — strong *and* wanted
                 // survivors. `collect(retention)` above already dropped dead, so the
-                // segment's `live` is exactly the survivors. Weak descends to
+                // segment's `live` is exactly the survivors. Wanted content descends to
                 // use space in lower tiers rather than being pinned to the
                 // youngest generation; it stays evictable everywhere and is
-                // dropped by the weak budget under pressure.
+                // dropped by the want budget under pressure.
                 let movers = self.generations[level].segments[0].live.clone();
                 let handles: Vec<_> = movers
                     .clone()
@@ -479,11 +469,11 @@ impl Yard {
         for level in dumped {
             self.reclaim_segment(level, 0)
                 .map_err(YardCollectError::Reclaim)?;
-            // The rewrite dropped the young pile's weak-pin markers along
-            // with its dead bytes; re-record the surviving weak set.
+            // The rewrite dropped the young pile's want markers along
+            // with its dead bytes; re-record the surviving wanted set.
             if level == 0 {
-                self.rerecord_weak_markers()
-                    .map_err(YardCollectError::WeakMarkers)?;
+                self.rerecord_want_markers()
+                    .map_err(YardCollectError::WantMarkers)?;
             }
         }
 
@@ -505,12 +495,12 @@ impl Yard {
             for index in 0..self.generations[level].segments.len() {
                 self.reclaim_segment(level, index)?;
             }
-            // The rewrite dropped the young pile's weak-pin markers along
-            // with its dead bytes; re-record the surviving weak set so the
-            // pins stay durable (evicted ones are simply not re-recorded).
+            // The rewrite dropped the young pile's want markers along
+            // with its dead bytes; re-record the surviving wanted set so the
+            // wants stay durable (evicted ones are simply not re-recorded).
             if level == 0 {
-                self.rerecord_weak_markers()
-                    .map_err(YardReclaimError::WeakMarkers)?;
+                self.rerecord_want_markers()
+                    .map_err(YardReclaimError::WantMarkers)?;
             }
         }
         Ok(())
@@ -581,11 +571,11 @@ impl Yard {
     }
 
     fn strong_keep_set(&self, reader: &YardReader, retention: &RetentionRoots) -> HandleSet {
-        let weak_pins = self
-            .weak_state
+        let wants = self
+            .want_state
             .lock()
-            .expect("weak pin mutex poisoned")
-            .pins
+            .expect("want mutex poisoned")
+            .wants
             .clone();
         let roots: Vec<_> = (&self.strong_pins)
             .into_iter()
@@ -595,17 +585,17 @@ impl Yard {
         let mut keep = HandleSet::new();
         let mut queue = VecDeque::from(roots);
         while let Some(handle) = queue.pop_front() {
-            // Weak wants veto legacy strong-pin ownership and prune that whole
+            // Wants veto legacy strong-pin ownership and prune that whole
             // subtree. This policy belongs to the collector, not to the
             // structural BlobChildren view used by explicit retention.
-            if weak_pins.get(&handle.raw).is_some() || keep.get(&handle.raw).is_some() {
+            if wants.get(&handle.raw).is_some() || keep.get(&handle.raw).is_some() {
                 continue;
             }
             keep.insert(&Entry::new(&handle.raw));
             queue.extend(reader.children(handle));
         }
-        // Explicit policy roots are not weak cache wants. They remain strong
-        // even if the same handle or an owned descendant also has a stale weak
+        // Explicit policy roots are not cache wants. They remain strong
+        // even if the same handle or an owned descendant also has a stale want
         // marker.
         for handle in retention.expanded(reader) {
             keep.insert(&Entry::new(&handle.raw));
@@ -763,46 +753,19 @@ impl PinStore for Yard {
     }
 }
 
-impl WeakPinStore for Yard {
-    type WeakPinError = PileWriteError;
+impl WantStore for Yard {
+    type WantError = PileWriteError;
 
-    type WeakListIter<'a> = std::vec::IntoIter<Result<Inline<Handle<UnknownBlob>>, PileWriteError>>;
+    type WantIter<'a> = std::vec::IntoIter<Result<Inline<Handle<UnknownBlob>>, PileWriteError>>;
 
-    /// Weakly pin a blob: refresh its LRU recency in memory AND persist a
-    /// weak-pin marker to the young generation's pile, so the want survives
+    /// Assert a want for a blob: refresh its LRU recency in memory AND persist a
+    /// want marker to the young generation's pile, so the want survives
     /// a restart ([`Yard::open`] reloads it).
     ///
-    /// A weak pin is the demand-born want-signal for content you *lack*
-    /// (minted on a get-miss). Weak-pinning a blob you already hold
-    /// (resident in any generation) is a **no-op** — nothing is recorded:
-    /// weak entries originate only from demand, never from tagging resident
-    /// content. (Releasing resident content you no longer need durably is a
-    /// separate concern — the local→distributed handoff — not wired here
-    /// yet.)
-    fn pin_weak<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WeakPinError>
-    where
-        S: BlobEncoding + 'static,
-        Handle<S>: InlineEncoding,
-    {
-        let handle: Inline<Handle<UnknownBlob>> = handle.transmute();
-        if self.is_resident(&handle) {
-            return Ok(());
-        }
-        self.generations[0]
-            .active_mut()
-            .pile_mut()
-            .pin_weak::<UnknownBlob>(handle)?;
-        self.weak_state
-            .lock()
-            .expect("weak pin mutex poisoned")
-            .pin(handle);
-        Ok(())
-    }
-
-    /// Retract a weak pin: remove it from the in-memory weak state and
-    /// persist a weak-unpin marker to the young generation's pile
-    /// (last-writer-wins against any earlier weak-pin marker).
-    fn unpin_weak<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WeakPinError>
+    /// Automatic lazy reads call this only on a miss. Explicit callers may
+    /// also want an already-resident blob; that assertion is persisted and
+    /// makes the resident copy subject to the yard's bounded want policy.
+    fn want<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WantError>
     where
         S: BlobEncoding + 'static,
         Handle<S>: InlineEncoding,
@@ -811,18 +774,38 @@ impl WeakPinStore for Yard {
         self.generations[0]
             .active_mut()
             .pile_mut()
-            .unpin_weak::<UnknownBlob>(handle)?;
-        self.weak_state
+            .want::<UnknownBlob>(handle)?;
+        self.want_state
             .lock()
-            .expect("weak pin mutex poisoned")
-            .unpin(&handle.raw);
+            .expect("want mutex poisoned")
+            .want(handle);
         Ok(())
     }
 
-    fn weak_pins<'a>(&'a mut self) -> Result<Self::WeakListIter<'a>, Self::WeakPinError> {
+    /// Retract a want: remove it from the in-memory want state and
+    /// persist a want-retraction marker to the young generation's pile
+    /// (last-writer-wins against any earlier want marker).
+    fn unwant<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WantError>
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding,
+    {
+        let handle: Inline<Handle<UnknownBlob>> = handle.transmute();
+        self.generations[0]
+            .active_mut()
+            .pile_mut()
+            .unwant::<UnknownBlob>(handle)?;
+        self.want_state
+            .lock()
+            .expect("want mutex poisoned")
+            .unwant(&handle.raw);
+        Ok(())
+    }
+
+    fn wants<'a>(&'a mut self) -> Result<Self::WantIter<'a>, Self::WantError> {
         let items: Vec<Result<Inline<Handle<UnknownBlob>>, PileWriteError>> = {
-            let weak_state = self.weak_state.lock().expect("weak pin mutex poisoned");
-            (&weak_state.pins)
+            let want_state = self.want_state.lock().expect("want mutex poisoned");
+            (&want_state.wants)
                 .into_iter()
                 .map(|raw| Ok(Inline::<Handle<UnknownBlob>>::new(*raw)))
                 .collect()
@@ -881,7 +864,7 @@ impl BlobStore for Yard {
         }
         Ok(YardReader {
             generations,
-            weak_state: self.weak_state.clone(),
+            want_state: self.want_state.clone(),
         })
     }
 }
@@ -889,7 +872,7 @@ impl BlobStore for Yard {
 impl super::StorageFlush for Yard {
     type Error = super::pile::FlushError;
 
-    /// Flush every open generation pile. Weak-pin markers and fresh
+    /// Flush every open generation pile. Want markers and fresh
     /// writes land in the young generation, but older generations can
     /// hold unsynced rewrites from `reclaim`/`compact`, so sync them all.
     fn flush(&mut self) -> Result<(), Self::Error> {
@@ -937,7 +920,7 @@ impl Eq for YardGenerationReader {}
 #[derive(Debug, Clone)]
 pub struct YardReader {
     generations: Vec<YardGenerationReader>,
-    weak_state: Arc<Mutex<WeakState>>,
+    want_state: Arc<Mutex<WantState>>,
 }
 
 impl YardReader {
@@ -950,9 +933,9 @@ impl YardReader {
     }
 
     /// Union read across generations (young -> old) that does NOT mint a
-    /// demand-born weak pin on a miss; returns `None` on a clean miss.
+    /// demand-born want on a miss; returns `None` on a clean miss.
     /// Speculative / structural reads (reference discovery via
-    /// `children`) use this so they never pollute the weak set with
+    /// `children`) use this so they never pollute the wanted set with
     /// wants for non-existent hashes. The public `get` layers the
     /// demand-born want on top of it.
     fn get_local<T, S>(
@@ -1003,12 +986,12 @@ impl BlobStoreGet for YardReader {
             Some(result) => result,
             None => {
                 // An *intentional* read that missed is a demand-born
-                // "want" — mint the weak pin so the sync daemon can fetch
+                // "want" — mint the want so the sync daemon can fetch
                 // it. Speculative scans use `get_local` and never land here.
-                self.weak_state
+                self.want_state
                     .lock()
-                    .expect("weak pin mutex poisoned")
-                    .pin(handle.transmute());
+                    .expect("want mutex poisoned")
+                    .want(handle.transmute());
                 Err(YardGetError::NotFound)
             }
         }
@@ -1018,7 +1001,7 @@ impl BlobStoreGet for YardReader {
 impl BlobChildren for YardReader {
     fn children(&self, handle: Inline<Handle<UnknownBlob>>) -> Vec<Inline<Handle<UnknownBlob>>> {
         // Structural scan: use the non-minting read so reference
-        // discovery never floods the weak set with speculative wants. Weak
+        // discovery never floods the wanted set with speculative wants. Wanted
         // cache policy is intentionally absent here: callers such as explicit
         // retention need the complete resident ownership graph.
         let Some(Ok(blob)) = self.get_local::<Blob<UnknownBlob>, UnknownBlob>(handle) else {
@@ -1220,7 +1203,7 @@ pub enum YardCollectError {
     Transfer(TransferError<Infallible, YardGetError<Infallible>, InsertError>),
     Flush(super::pile::FlushError),
     Reclaim(YardReclaimError),
-    WeakMarkers(std::io::Error),
+    WantMarkers(std::io::Error),
 }
 
 impl fmt::Display for YardCollectError {
@@ -1235,8 +1218,8 @@ impl fmt::Display for YardCollectError {
             Self::Reclaim(err) => {
                 write!(f, "failed to recycle compacted yard generation: {err}")
             }
-            Self::WeakMarkers(err) => {
-                write!(f, "failed to re-record weak-pin markers: {err}")
+            Self::WantMarkers(err) => {
+                write!(f, "failed to re-record want markers: {err}")
             }
         }
     }
@@ -1266,7 +1249,7 @@ pub enum YardReclaimError {
     Transfer(TransferError<Infallible, GetBlobError<Infallible>, InsertError>),
     CollectionRecord(CollectionInsertError),
     Close(super::pile::FlushError),
-    WeakMarkers(std::io::Error),
+    WantMarkers(std::io::Error),
     /// A generation rewrite failed (`primary`) and the subsequent
     /// fail-loud reopen of the generation file also failed (`err`). The
     /// segment is left closed; nothing was truncated.
@@ -1290,8 +1273,8 @@ impl fmt::Display for YardReclaimError {
                 write!(f, "failed to copy a yard collection record: {err}")
             }
             Self::Close(err) => write!(f, "failed to close yard generation pile: {err}"),
-            Self::WeakMarkers(err) => {
-                write!(f, "failed to re-record weak-pin markers: {err}")
+            Self::WantMarkers(err) => {
+                write!(f, "failed to re-record want markers: {err}")
             }
             Self::Reopen { path, primary, err } => write!(
                 f,
@@ -1513,21 +1496,21 @@ mod tests {
     }
 
     #[test]
-    fn strong_keep_and_weak_evict_gc() {
+    fn strong_keep_and_want_evict_gc() {
         let (_dir, mut yard) = yard_with(
             1,
             YardConfig {
-                weak_budget: 0,
+                want_budget: 0,
                 ..YardConfig::default()
             },
         );
         let strong = yard.put::<RawBytes, _>(raw_blob(b"strong")).unwrap();
-        // demand-born weak: wanted while absent, then fetched, then LRU-
+        // demand-born wanted: wanted while absent, then fetched, then LRU-
         // evicted under a zero budget — a genuine cache eviction, not an
         // orphan sweep.
-        let weak = Blob::<RawBytes>::new(raw_blob(b"weak")).get_handle();
-        yard.pin_weak(weak).unwrap();
-        yard.put::<RawBytes, _>(raw_blob(b"weak")).unwrap();
+        let wanted = Blob::<RawBytes>::new(raw_blob(b"wanted")).get_handle();
+        yard.want(wanted).unwrap();
+        yard.put::<RawBytes, _>(raw_blob(b"wanted")).unwrap();
 
         yard.pin_strong(pin_id(1), strong);
         yard.collect(&RetentionRoots::new()).unwrap();
@@ -1535,25 +1518,25 @@ mod tests {
 
         assert_eq!(get_raw(&reader, strong).unwrap(), raw_blob(b"strong"));
         assert!(matches!(
-            get_raw(&reader, weak),
+            get_raw(&reader, wanted),
             Err(YardGetError::NotFound)
         ));
     }
 
     #[test]
-    fn weak_veto_overrides_strong_reachability() {
+    fn want_veto_overrides_strong_reachability() {
         let (_dir, mut yard) = yard_with(
             1,
             YardConfig {
-                weak_budget: 0,
+                want_budget: 0,
                 ..YardConfig::default()
             },
         );
-        // `child` enters the cache the demand-born way: weak-pinned while
+        // `child` enters the cache the demand-born way: wanted while
         // absent (the want), then fetched. It is reachable from a strong
-        // parent, yet the weak veto still makes it evictable.
+        // parent, yet the wanted veto still makes it evictable.
         let child = Blob::<UnknownBlob>::new(Bytes::from_source(b"child".to_vec())).get_handle();
-        yard.pin_weak(child).unwrap();
+        yard.want(child).unwrap();
         yard.put::<UnknownBlob, _>(Bytes::from_source(b"child".to_vec()))
             .unwrap();
         let parent = yard
@@ -1576,15 +1559,15 @@ mod tests {
         let (_dir, mut yard) = yard_with(
             1,
             YardConfig {
-                weak_budget: 0,
+                want_budget: 0,
                 ..YardConfig::default()
             },
         );
         let owned_child =
             Blob::<UnknownBlob>::new(Bytes::from_source(b"owned child".to_vec())).get_handle();
-        // Even an evictable weak-cache marker cannot veto an explicit policy
+        // Even an evictable cache want cannot veto an explicit policy
         // root: collection retention has already decided this edge is owned.
-        yard.pin_weak(owned_child).unwrap();
+        yard.want(owned_child).unwrap();
         yard.put::<UnknownBlob, _>(Bytes::from_source(b"owned child".to_vec()))
             .unwrap();
         let owned_parent = yard
@@ -1619,7 +1602,7 @@ mod tests {
     }
 
     #[test]
-    fn hole_safe_walk_prunes_weak_absent_child() {
+    fn hole_safe_walk_prunes_wanted_absent_child() {
         let (_dir, mut yard) = yard_with(1, YardConfig::default());
         let absent =
             Blob::<UnknownBlob>::new(Bytes::from_source(b"not stored".to_vec())).get_handle();
@@ -1628,7 +1611,7 @@ mod tests {
             .unwrap();
 
         yard.pin_strong(pin_id(3), parent);
-        yard.pin_weak(absent).unwrap();
+        yard.want(absent).unwrap();
 
         yard.collect(&RetentionRoots::new()).unwrap();
         let reader = yard.reader().unwrap();
@@ -1641,35 +1624,35 @@ mod tests {
     }
 
     #[test]
-    fn compaction_tenures_strong_and_lets_weak_descend() {
+    fn compaction_tenures_strong_and_lets_wants_descend() {
         let (_dir, mut yard) = yard_with(
             3,
             YardConfig {
-                weak_budget: 10,
+                want_budget: 10,
                 strong_level_budget: 0,
                 fanout: 1,
             },
         );
         let strong = yard.put::<RawBytes, _>(raw_blob(b"tenured")).unwrap();
-        // `weak` is demand-born: wanted while absent, then fetched, so it is
+        // `wanted` is demand-born: wanted while absent, then fetched, so it is
         // a genuine cache entry — not a resident downgrade, which no-ops.
-        let weak = Blob::<RawBytes>::new(raw_blob(b"cache")).get_handle();
-        yard.pin_weak(weak).unwrap();
+        let wanted = Blob::<RawBytes>::new(raw_blob(b"cache")).get_handle();
+        yard.want(wanted).unwrap();
         yard.put::<RawBytes, _>(raw_blob(b"cache")).unwrap();
         yard.pin_strong(pin_id(4), strong);
 
         yard.compact(&RetentionRoots::new()).unwrap();
 
-        // With a zero strong budget everything overflows downward; weak now
+        // With a zero strong budget everything overflows downward; wanted now
         // rides the flow to the bottom alongside strong (it is not pinned to
         // the youngest generation), and stays there because it is within the
-        // weak budget.
+        // want budget.
         assert!(!yard.contains_in_generation(0, strong));
         assert!(!yard.contains_in_generation(1, strong));
         assert!(yard.contains_in_generation(2, strong));
-        assert!(!yard.contains_in_generation(0, weak));
-        assert!(!yard.contains_in_generation(1, weak));
-        assert!(yard.contains_in_generation(2, weak));
+        assert!(!yard.contains_in_generation(0, wanted));
+        assert!(!yard.contains_in_generation(1, wanted));
+        assert!(yard.contains_in_generation(2, wanted));
     }
 
     #[test]
@@ -1677,7 +1660,7 @@ mod tests {
         let (_dir, paths, mut yard) = yard_with_paths(
             2,
             YardConfig {
-                weak_budget: 0,
+                want_budget: 0,
                 strong_level_budget: 0,
                 fanout: 1,
             },
@@ -1737,7 +1720,7 @@ mod tests {
         let (_dir, paths, mut yard) = yard_with_paths(
             1,
             YardConfig {
-                weak_budget: 0,
+                want_budget: 0,
                 ..YardConfig::default()
             },
         );
@@ -1794,62 +1777,58 @@ mod tests {
         assert_eq!(pile_blob_count(&paths[0]), after_count);
     }
 
-    /// The amnesia regression: weak pins are durable pile records, so
-    /// reopening a yard rebuilds the weak state instead of resetting it.
+    /// The amnesia regression: wants are durable pile records, so
+    /// reopening a yard rebuilds the want state instead of resetting it.
     #[test]
-    fn yard_open_reloads_weak_pins() {
+    fn yard_open_reloads_wants() {
         let (_dir, paths, mut yard) = yard_with_paths(2, YardConfig::default());
 
-        // A pure want: pinned while absent, never fetched.
+        // A pure want: asserted while absent, never fetched.
         let want = Blob::<RawBytes>::new(raw_blob(b"still wanted after restart")).get_handle();
-        yard.pin_weak(want).unwrap();
-        // A demand-fetched cache entry: pinned while absent, then put.
+        yard.want(want).unwrap();
+        // A demand-fetched cache entry: wanted while absent, then put.
         let cached = Blob::<RawBytes>::new(raw_blob(b"cached")).get_handle();
-        yard.pin_weak(cached).unwrap();
+        yard.want(cached).unwrap();
         yard.put::<RawBytes, _>(raw_blob(b"cached")).unwrap();
         // A retracted want must stay retracted across restart (LWW).
         let retracted = Blob::<RawBytes>::new(raw_blob(b"changed my mind")).get_handle();
-        yard.pin_weak(retracted).unwrap();
-        yard.unpin_weak(retracted).unwrap();
+        yard.want(retracted).unwrap();
+        yard.unwant(retracted).unwrap();
 
         drop(yard); // closes (and flushes) the generation piles
 
         let mut reopened = Yard::open(paths, YardConfig::default()).unwrap();
-        let pinned: BTreeSet<_> = reopened
-            .weak_pins()
-            .unwrap()
-            .map(|r| r.unwrap().raw)
-            .collect();
+        let wanted: BTreeSet<_> = reopened.wants().unwrap().map(|r| r.unwrap().raw).collect();
         assert!(
-            pinned.contains(&want.raw),
-            "weak want lost across restart — the amnesia bug"
+            wanted.contains(&want.raw),
+            "wanted want lost across restart — the amnesia bug"
         );
         assert!(
-            pinned.contains(&cached.raw),
-            "weak cache-retention marker lost across restart"
+            wanted.contains(&cached.raw),
+            "wanted cache-retention marker lost across restart"
         );
         assert!(
-            !pinned.contains(&retracted.raw),
-            "weak unpin did not stick across restart"
+            !wanted.contains(&retracted.raw),
+            "want retraction did not stick across restart"
         );
 
-        // The reloaded weak pin still works as a retention marker: the
+        // The reloaded want still works as a retention marker: the
         // cached blob survives collection under the default budget.
         reopened.collect(&RetentionRoots::new()).unwrap();
         let reader = reopened.reader().unwrap();
         assert_eq!(get_raw(&reader, cached).unwrap(), raw_blob(b"cached"));
     }
 
-    /// A young-pile rewrite (reclaim) must not drop the durable weak set:
+    /// A young-pile rewrite (reclaim) must not drop the durable wanted set:
     /// surviving pins are re-recorded into the rewritten pile.
     #[test]
-    fn weak_markers_survive_reclaim() {
+    fn want_markers_survive_reclaim() {
         let (_dir, paths, mut yard) = yard_with_paths(1, YardConfig::default());
 
         let want = Blob::<RawBytes>::new(raw_blob(b"wanted, absent")).get_handle();
-        yard.pin_weak(want).unwrap();
+        yard.want(want).unwrap();
         let cached = Blob::<RawBytes>::new(raw_blob(b"cached blob")).get_handle();
-        yard.pin_weak(cached).unwrap();
+        yard.want(cached).unwrap();
         yard.put::<RawBytes, _>(raw_blob(b"cached blob")).unwrap();
 
         // Rewrite the young pile: only live blobs are transferred, so the
@@ -1858,17 +1837,13 @@ mod tests {
 
         drop(yard);
         let mut reopened = Yard::open(paths, YardConfig::default()).unwrap();
-        let pinned: BTreeSet<_> = reopened
-            .weak_pins()
-            .unwrap()
-            .map(|r| r.unwrap().raw)
-            .collect();
+        let wanted: BTreeSet<_> = reopened.wants().unwrap().map(|r| r.unwrap().raw).collect();
         assert!(
-            pinned.contains(&want.raw),
+            wanted.contains(&want.raw),
             "want marker lost by reclaim rewrite"
         );
         assert!(
-            pinned.contains(&cached.raw),
+            wanted.contains(&cached.raw),
             "cache marker lost by reclaim rewrite"
         );
         let reader = reopened.reader().unwrap();
@@ -1983,7 +1958,7 @@ mod tests {
         }
 
         #[derive(Clone, Copy, Debug)]
-        enum WeakPinMode {
+        enum WantMode {
             YoungOnly,
             AnyKnownHandle,
         }
@@ -2047,19 +2022,19 @@ mod tests {
             live_sets(yard).into_iter().flatten().collect()
         }
 
-        fn weak_pins(yard: &Yard) -> BTreeMap<RawHandle, u64> {
-            let weak_state = yard.weak_state.lock().expect("weak pin mutex poisoned");
-            weak_state
-                .pins
+        fn wants(yard: &Yard) -> BTreeMap<RawHandle, u64> {
+            let want_state = yard.want_state.lock().expect("want mutex poisoned");
+            want_state
+                .wants
                 .clone()
                 .into_iter()
                 .map(|raw| {
-                    let pin = weak_state
-                        .pins
+                    let entry = want_state
+                        .wants
                         .get(&raw)
-                        .expect("weak pin key resolves")
+                        .expect("want key resolves")
                         .last_used;
-                    (raw, pin)
+                    (raw, entry)
                 })
                 .collect()
         }
@@ -2072,12 +2047,12 @@ mod tests {
                 .collect()
         }
 
-        fn budgeted_weak(
-            weak: &BTreeMap<RawHandle, u64>,
+        fn budgeted_wants(
+            wanted: &BTreeMap<RawHandle, u64>,
             present: &BTreeSet<RawHandle>,
             budget: usize,
         ) -> BTreeSet<RawHandle> {
-            let mut candidates = weak
+            let mut candidates = wanted
                 .iter()
                 .filter(|(raw, _)| present.contains(*raw))
                 .map(|(raw, last_used)| (*raw, *last_used))
@@ -2101,12 +2076,12 @@ mod tests {
         fn model_strong_keep(
             roots: &[RawHandle],
             present: &BTreeSet<RawHandle>,
-            weak: &BTreeSet<RawHandle>,
+            wanted: &BTreeSet<RawHandle>,
             model: &Model,
         ) -> BTreeSet<RawHandle> {
             let mut queue = VecDeque::new();
             for root in roots {
-                if !weak.contains(root) {
+                if !wanted.contains(root) {
                     queue.push_back(*root);
                 }
             }
@@ -2122,7 +2097,7 @@ mod tests {
                 };
 
                 for child in child_chunks(bytes) {
-                    if !weak.contains(&child)
+                    if !wanted.contains(&child)
                         && present.contains(&child)
                         && model.bytes.contains_key(&child)
                         && !keep.contains(&child)
@@ -2137,14 +2112,14 @@ mod tests {
 
         fn expected_live_after_collect(yard: &Yard, model: &Model) -> BTreeSet<RawHandle> {
             let present = live_union(yard);
-            let weak_with_lru = weak_pins(yard);
-            let weak = weak_with_lru.keys().copied().collect::<BTreeSet<_>>();
-            let strong_keep = model_strong_keep(&strong_roots(yard), &present, &weak, model);
-            let weak_keep = budgeted_weak(&weak_with_lru, &present, yard.config.weak_budget);
+            let wants_with_lru = wants(yard);
+            let wanted = wants_with_lru.keys().copied().collect::<BTreeSet<_>>();
+            let strong_keep = model_strong_keep(&strong_roots(yard), &present, &wanted, model);
+            let want_keep = budgeted_wants(&wants_with_lru, &present, yard.config.want_budget);
 
             present
                 .into_iter()
-                .filter(|raw| strong_keep.contains(raw) || weak_keep.contains(raw))
+                .filter(|raw| strong_keep.contains(raw) || want_keep.contains(raw))
                 .collect()
         }
 
@@ -2173,8 +2148,8 @@ mod tests {
         fn assert_general_invariants(yard: &mut Yard, model: &Model, seed: u64, step: usize) {
             let reader = yard.reader().unwrap();
             let live = live_union(yard);
-            let weak = weak_pins(yard).keys().copied().collect::<BTreeSet<_>>();
-            let strong_keep = model_strong_keep(&strong_roots(yard), &live, &weak, model);
+            let wanted = wants(yard).keys().copied().collect::<BTreeSet<_>>();
+            let strong_keep = model_strong_keep(&strong_roots(yard), &live, &wanted, model);
 
             for raw in strong_keep.intersection(&live) {
                 let expected = model
@@ -2184,8 +2159,8 @@ mod tests {
                 assert_readable_bytes(&reader, *raw, expected, seed, step);
             }
 
-            if let Some(raw) = weak.intersection(&strong_keep).next() {
-                panic!("seed {seed} step {step}: weak pin {raw:02X?} leaked into strong keep");
+            if let Some(raw) = wanted.intersection(&strong_keep).next() {
+                panic!("seed {seed} step {step}: want {raw:02X?} leaked into strong keep");
             }
 
             for raw in &live {
@@ -2288,15 +2263,15 @@ mod tests {
             }
         }
 
-        fn choose_weak_target(
+        fn choose_want_target(
             yard: &Yard,
             rng: &mut SplitMix64,
             model: &mut Model,
-            mode: WeakPinMode,
+            mode: WantMode,
         ) -> RawHandle {
             match mode {
-                WeakPinMode::AnyKnownHandle => choose_known_or_absent(rng, model),
-                WeakPinMode::YoungOnly => {
+                WantMode::AnyKnownHandle => choose_known_or_absent(rng, model),
+                WantMode::YoungOnly => {
                     let young = live_sets(yard)
                         .first()
                         .into_iter()
@@ -2359,11 +2334,11 @@ mod tests {
             }
         }
 
-        fn run_one(seed: u64, weak_pin_mode: WeakPinMode) -> FinalState {
+        fn run_one(seed: u64, want_mode: WantMode) -> FinalState {
             let (_dir, mut yard) = yard_with(
                 GENERATIONS,
                 YardConfig {
-                    weak_budget: 3,
+                    want_budget: 3,
                     strong_level_budget: 2,
                     fanout: 2,
                 },
@@ -2383,8 +2358,8 @@ mod tests {
                     }
                     3 => yard.unpin_strong(pin_id(rng.index(PIN_COUNT))),
                     4 => {
-                        let raw = choose_weak_target(&yard, &mut rng, &mut model, weak_pin_mode);
-                        yard.pin_weak(unknown(raw)).unwrap();
+                        let raw = choose_want_target(&yard, &mut rng, &mut model, want_mode);
+                        yard.want(unknown(raw)).unwrap();
                     }
                     5 => {
                         let raw = choose_known_or_absent(&mut rng, &mut model);
@@ -2445,7 +2420,7 @@ mod tests {
         #[test]
         fn seeded_yard_property_sequences() {
             for seed in 0..SEEDS {
-                run_one(0xC0DE_0000_0000_0000 ^ seed, WeakPinMode::YoungOnly);
+                run_one(0xC0DE_0000_0000_0000 ^ seed, WantMode::YoungOnly);
             }
         }
 
@@ -2454,55 +2429,57 @@ mod tests {
             for seed in [0, 13, 49] {
                 let seed = 0xD57D_0000_0000_0000 ^ seed;
                 assert_eq!(
-                    run_one(seed, WeakPinMode::YoungOnly),
-                    run_one(seed, WeakPinMode::YoungOnly),
+                    run_one(seed, WantMode::YoungOnly),
+                    run_one(seed, WantMode::YoungOnly),
                     "seed {seed} diverged"
                 );
             }
         }
 
         #[test]
-        fn seeded_yard_property_sequences_resident_weak_pins_are_noops() {
-            // Full operation space, including attempts to weak-pin resident
-            // (even already-tenured) blobs. With the resident-weak-pin
-            // no-op, those attempts are inert — the want only ever targets
-            // absent content — so "weak never tenures" and the live=keep
-            // invariants all hold. (Seed 0xC0DE^2, step 32, exposed the
-            // pre-no-op bug; it now passes alongside the rest of the sweep.)
+        fn seeded_yard_property_sequences_include_resident_wants() {
+            // Exercise explicit wants for absent, young, and already-tenured
+            // blobs. The model treats every assertion uniformly and verifies
+            // the same bounded cache policy after collection.
             for seed in [0, 2, 7, 13, 31, 49] {
-                run_one(0xC0DE_0000_0000_0000 ^ seed, WeakPinMode::AnyKnownHandle);
+                run_one(0xC0DE_0000_0000_0000 ^ seed, WantMode::AnyKnownHandle);
             }
         }
 
         #[test]
-        fn weak_pin_on_resident_tenured_blob_is_a_noop() {
+        fn explicit_want_on_resident_blob_is_recorded_and_budgeted() {
             let (_dir, mut yard) = yard_with(
                 3,
                 YardConfig {
-                    weak_budget: 1,
+                    want_budget: 0,
                     strong_level_budget: 0,
                     fanout: 1,
                 },
             );
             let tenured = yard
-                .put::<UnknownBlob, _>(Bytes::from_source(b"tenured then weak".to_vec()))
+                .put::<UnknownBlob, _>(Bytes::from_source(b"tenured then wanted".to_vec()))
                 .unwrap();
 
             yard.pin_strong(pin_id(0), tenured);
             yard.compact(&RetentionRoots::new()).unwrap();
             assert!(yard.contains_in_generation(2, tenured));
 
-            // Weak-pinning a blob you already hold is a no-op: the want
-            // signal only ever targets absent content. The resident blob
-            // stays strong in the bottom generation, never acquiring a weak
-            // tag — which is exactly why "weak never tenures" holds by
-            // construction rather than needing eviction machinery here.
-            yard.pin_weak(tenured).unwrap();
-            yard.compact(&RetentionRoots::new()).unwrap();
+            // Explicit interest is recorded even though the bytes are already
+            // present. With a zero want budget, that makes the previously
+            // strong resident eligible for eviction on the next collection.
+            yard.want(tenured).unwrap();
+            assert_eq!(
+                yard.wants()
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+                vec![tenured]
+            );
+            yard.collect(&RetentionRoots::new()).unwrap();
 
             assert!(
-                yard.contains_in_generation(2, tenured),
-                "resident weak-pin must be a no-op; the strong blob stays held"
+                !yard.contains_in_generation(2, tenured),
+                "zero want budget must evict explicitly wanted resident content"
             );
         }
     }

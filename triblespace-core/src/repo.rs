@@ -153,7 +153,7 @@ pub trait StorageClose {
 /// ([`pile::Pile`]'s appended records are not durable until
 /// [`pile::Pile::flush`]) expose it here so generic code can demand
 /// durability at a specific point — most importantly when recording a
-/// weak-pin **want** whose writer may exit immediately afterwards (a
+/// durable **want** whose writer may exit immediately afterwards (a
 /// faculty process recording a demand for a sync daemon to service).
 /// Backends with nothing to sync (in-memory stores) return `Ok(())` with
 /// `Infallible` as the error type.
@@ -683,49 +683,47 @@ pub trait PinStore {
     ) -> Result<PushResult, Self::UpdateError>;
 }
 
-/// Storage backend for *weak* pins: anonymous, per-blob retention markers.
+/// Storage backend for durable, anonymous per-blob wants.
 ///
-/// Retention is one strength axis, resolved last-writer-wins by log
-/// position: `pin ⊐ weak-pin ⊐ weak-unpin ⊐ unpin`. A [`PinStore`]
-/// record is `pin`, its tombstone is `unpin`; this trait adds the soft
-/// siblings. Unlike a strong pin, a weak pin has no name — it is keyed
-/// by the blob handle itself.
+/// A want says: "obtain this blob if it is absent; keep the local copy
+/// while cache policy permits; it may be evicted under pressure." The
+/// handle is both the durable demand key consumed by synchronization
+/// daemons and the cache-retention key after the bytes arrive.
 ///
-/// A weak pin is demand-born: "I want this blob; fetch it if absent;
-/// keep it while there's room; evictable under pressure." One marker is
-/// simultaneously the want-signal a sync daemon works from (fetch what
-/// is weak-pinned but absent), the cache-retention marker, and the
-/// eviction target. `unpin_weak` retracts it.
-///
-/// Strong pins remain authoritative for GC — the keep set is
-/// `reachable(strong pins)` plus budgeted weak — and weak state never
-/// blocks strong retention.
-pub trait WeakPinStore: PinStore {
-    /// Error type for weak-pin operations.
-    type WeakPinError: Error + Debug + Send + Sync + 'static;
+/// Wants are independent of named mutable [`PinStore`] cells. A backend
+/// may support either capability without supporting the other. Repeated
+/// [`want`](Self::want) and [`unwant`](Self::unwant) operations resolve
+/// last-writer-wins per handle; [`wants`](Self::wants) enumerates the
+/// currently asserted set.
+pub trait WantStore {
+    /// Error type for want operations.
+    type WantError: Error + Debug + Send + Sync + 'static;
 
-    /// Iterator over the LWW-resolved weak-pinned handles.
-    type WeakListIter<'a>: Iterator<Item = Result<Inline<Handle<UnknownBlob>>, Self::WeakPinError>>
+    /// Iterator over the LWW-resolved wanted handles.
+    type WantIter<'a>: Iterator<Item = Result<Inline<Handle<UnknownBlob>>, Self::WantError>>
     where
         Self: 'a;
 
-    /// Records a weak pin for `handle`. Later records win: a weak pin
-    /// after a weak unpin of the same handle re-pins it.
-    fn pin_weak<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WeakPinError>
+    /// Assert durable demand/cache interest in `handle`.
+    ///
+    /// A later `want` after an `unwant` asserts the want again.
+    fn want<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WantError>
     where
         S: BlobEncoding + 'static,
         Handle<S>: InlineEncoding;
 
-    /// Retracts a weak pin for `handle` (last-writer-wins).
-    fn unpin_weak<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WeakPinError>
+    /// Retract durable demand/cache interest in `handle`.
+    fn unwant<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WantError>
     where
         S: BlobEncoding + 'static,
         Handle<S>: InlineEncoding;
 
-    /// Lists every weakly pinned handle (the LWW-resolved set). This is
-    /// the enumeration surface for sync daemons (fetch the absent ones)
-    /// and GC (the budgeted-weak side of the keep set).
-    fn weak_pins<'a>(&'a mut self) -> Result<Self::WeakListIter<'a>, Self::WeakPinError>;
+    /// List the LWW-resolved wanted handles.
+    ///
+    /// Synchronization daemons fetch wanted handles that are absent;
+    /// cache collectors may retain a policy-selected subset that is
+    /// already present.
+    fn wants<'a>(&'a mut self) -> Result<Self::WantIter<'a>, Self::WantError>;
 }
 
 /// Error returned by [`transfer`] when copying blobs between stores.

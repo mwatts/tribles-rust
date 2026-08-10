@@ -14,17 +14,17 @@
 //!   network thread.
 //!
 //! There is no separate cache tier: `Peer<S>` takes a **single store**,
-//! and any tiering (bounded weak retention, generational eviction) lives
+//! and any tiering (bounded want retention, generational eviction) lives
 //! in `S` — e.g. a [`Yard`](triblespace_core::repo::yard::Yard). Read-miss
-//! swarm fetches land in `S` under a **weak pin** ([`WeakPinStore`]),
-//! following the retention lattice `pin ⊐ weak-pin ⊐ weak-unpin ⊐ unpin`:
-//! the weak pin is recorded durably *before* the fetch — pinned AND
+//! swarm fetches land in `S` under a **want** ([`WantStore`]),
+//! independently of any named [`PinStore`] cells. The want is recorded
+//! durably *before* the fetch — asserted AND
 //! flushed ([`StorageFlush`]), so the marker survives an immediate
 //! process exit — the demand IS the want-signal (a sync daemon's work
 //! queue), then the retention marker for the fetched blob, then the
-//! eviction target. A failed fetch leaves the weak pin in place: it
+//! eviction target. A failed fetch leaves the want in place: it
 //! remains an outstanding want. The want-on-record invariant holds
-//! unconditionally: if the pin or its flush FAILS, the read errors out
+//! unconditionally: if the want or its flush FAILS, the read errors out
 //! ([`PeerReaderGetError::WantRecord`] /
 //! [`Peer::get_or_fetch_async`]'s `Err`) instead of proceeding — the
 //! caller never observes a fetch whose demand isn't durably recorded.
@@ -55,7 +55,7 @@ use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::lazy::WantRecordError;
 use triblespace_core::repo::{
     BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, PinStore, PushResult,
-    StorageFlush, WeakPinStore,
+    StorageFlush, WantStore,
 };
 
 use crate::channel::{NetEvent, PublisherKey};
@@ -107,10 +107,10 @@ pub use crate::host::{PeerConfig, SyncDirection};
 /// ```
 pub struct Peer<S>
 where
-    S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
+    S: BlobStore + BlobStorePut + PinStore + WantStore + StorageFlush + Send + 'static,
 {
     /// The wrapped store, shared behind a mutex: a `&self` async read on
-    /// a [`PeerReader`] must be able to record a weak pin and land a
+    /// a [`PeerReader`] must be able to record a want and land a
     /// swarm-fetched blob back into it (the one piece of Peer state the
     /// read snapshot must be able to mutate). All of Peer's own methods
     /// take the same lock.
@@ -162,7 +162,7 @@ where
 
 impl<S> Peer<S>
 where
-    S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
+    S: BlobStore + BlobStorePut + PinStore + WantStore + StorageFlush + Send + 'static,
 {
     /// Wrap a store in a Peer. Spawns the iroh network thread
     /// internally; the thread lives for the Peer's lifetime and shuts
@@ -268,7 +268,7 @@ where
     /// pass a different budget. Does NOT persist the result and records
     /// no want — that is the caller's policy choice (see
     /// [`get_or_fetch_async`](Self::get_or_fetch_async) for the
-    /// weak-pin-then-fetch-then-put composition). Used in
+    /// want-then-fetch-then-put composition). Used in
     /// deterministic-sim drivers, polled while stepping the sim.
     pub async fn fetch_blob(&self, hash: RawHash) -> Option<Vec<u8>> {
         self.sender
@@ -342,7 +342,7 @@ where
                                     &name,
                                     &publisher,
                                     // Gossip-driven auto-tracking stays strong
-                                    // (eager) for now; the weak/lazy path is
+                                    // (eager) for now; the lazy-tracking path is
                                     // opt-in and wired separately.
                                     false,
                                 );
@@ -911,7 +911,7 @@ where
 
     /// Lock and borrow the underlying store. Use for store-specific
     /// methods that aren't part of the storage traits (e.g.
-    /// `Pile::flush`, `Yard::collect`, `WeakPinStore::weak_pins`).
+    /// `Pile::flush`, `Yard::collect`, `WantStore::wants`).
     ///
     /// Writes through this borrow bypass the Peer's auto-publish and
     /// become invisible to the network until the next
@@ -954,27 +954,27 @@ where
     }
 
     /// Honest **async** lazy read: return `hash`'s bytes, fetching from
-    /// the swarm and landing them weak-pinned into the store on a local
+    /// the swarm and landing them wanted into the store on a local
     /// miss.
     ///
     /// 1. **Local** — one lookup in the store
     ///    (via [`try_local`](Self::try_local)). Hit ⇒ return
-    ///    immediately, no network, no pin.
-    /// 2. **Miss** — the demand-born weak pin: `pin_weak(hash)` is
-    ///    recorded durably FIRST — pinned and **flushed**, so the want
-    ///    survives an immediate process exit. The weak pin IS the
+    ///    immediately, no network, no want.
+    /// 2. **Miss** — the demand-born want: `want(hash)` is
+    ///    recorded durably FIRST — asserted and **flushed**, so the want
+    ///    survives an immediate process exit. The want IS the
     ///    want-signal (a sync daemon's work queue), then — once the
     ///    fetch lands — the retention marker for the fetched blob, then
     ///    the eviction target. Only then is the swarm-addressed fetch
     ///    awaited (DHT-routed, hash-verified) and the verified bytes
-    ///    `put` into the store. If the fetch fails, the weak pin stays:
+    ///    `put` into the store. If the fetch fails, the want stays:
     ///    it remains an outstanding want.
     ///
     /// `Ok(None)` is *Unavailable*: nobody reachable served it before
     /// the budget expired. Existence is semidecidable — there is no
     /// "definitely absent" outcome — and the want stays on record.
     ///
-    /// `Err` means the want could NOT be durably recorded (pin or flush
+    /// `Err` means the want could NOT be durably recorded (want or flush
     /// failed). No fetch is attempted in that case: proceeding would
     /// hand the caller bytes whose demand isn't on record, silently
     /// breaking the want-on-record invariant every daemon relies on.
@@ -986,7 +986,7 @@ where
     pub async fn get_or_fetch_async(
         &mut self,
         hash: RawHash,
-    ) -> Result<Option<Bytes>, WantRecordError<S::WeakPinError, <S as StorageFlush>::Error>> {
+    ) -> Result<Option<Bytes>, WantRecordError<S::WantError, <S as StorageFlush>::Error>> {
         if let Some(bytes) = self.try_local(hash) {
             return Ok(Some(bytes));
         }
@@ -997,8 +997,8 @@ where
         {
             let mut store = self.store.lock().expect("store mutex");
             store
-                .pin_weak(Inline::<Handle<UnknownBlob>>::new(hash))
-                .map_err(WantRecordError::Pin)?;
+                .want(Inline::<Handle<UnknownBlob>>::new(hash))
+                .map_err(WantRecordError::Want)?;
             store.flush().map_err(WantRecordError::Flush)?;
         }
         let Some(raw) = self.fetch_blob(hash).await else {
@@ -1033,7 +1033,7 @@ where
 
 impl<S> BlobStorePut for Peer<S>
 where
-    S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
+    S: BlobStore + BlobStorePut + PinStore + WantStore + StorageFlush + Send + 'static,
 {
     type PutError = S::PutError;
 
@@ -1063,7 +1063,7 @@ where
 
 impl<S> BlobStore for Peer<S>
 where
-    S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
+    S: BlobStore + BlobStorePut + PinStore + WantStore + StorageFlush + Send + 'static,
 {
     type Reader = PeerReader<S::Reader>;
     type ReaderError = S::ReaderError;
@@ -1074,7 +1074,7 @@ where
         // The fetch capability: a clone of the command sender plus a
         // landing handle into the *shared* store, so a `&self` async
         // read can pull a missing blob from the swarm, record the
-        // demand-born weak pin, and land the bytes.
+        // demand-born want, and land the bytes.
         let fetch = Some(FetchCap {
             sender: self.sender.clone(),
             sink: Arc::new(SharedStore(self.store.clone())),
@@ -1085,7 +1085,7 @@ where
 
 impl<S> PinStore for Peer<S>
 where
-    S: BlobStore + BlobStorePut + PinStore + WeakPinStore + StorageFlush + Send + 'static,
+    S: BlobStore + BlobStorePut + PinStore + WantStore + StorageFlush + Send + 'static,
 {
     type PinsError = S::PinsError;
     type HeadError = S::HeadError;
@@ -1214,7 +1214,7 @@ fn extract_scope_subgraph(
 ///   "the layers above the blob substrate do whatever fancy dance they
 ///   like" hold.
 /// - the **async** [`AsyncBlobStoreGet`] is *transparent* — local
-///   lookup, else a demand-born weak pin followed by an awaited swarm
+///   lookup, else a demand-born want followed by an awaited swarm
 ///   fetch that lands the result in the shared store. This is what
 ///   gives a generic async consumer (a lazy `Repository::checkout`)
 ///   lazy replication for free, without ever knowing it holds a `Peer`.
@@ -1242,11 +1242,11 @@ struct FetchCap {
 }
 
 /// Interior-mutable access to the Peer's shared store for a `&self`
-/// async read: record the demand-born weak pin, land the fetched bytes.
+/// async read: record the demand-born want, land the fetched bytes.
 /// Erases the concrete store type `S` so `PeerReader` need not carry it
 /// — which is also why `record_want`'s error is boxed.
 trait StoreSink: Send + Sync {
-    /// Durably record the want: weak-pin `hash` AND flush it BEFORE the
+    /// Durably record the want: want `hash` AND flush it BEFORE the
     /// fetch, so a failed fetch — or an immediate process exit — leaves
     /// the outstanding demand on record. A failed record is an error the
     /// read must surface, never a warn-and-continue.
@@ -1260,18 +1260,18 @@ struct SharedStore<S>(Arc<Mutex<S>>);
 
 impl<S> StoreSink for SharedStore<S>
 where
-    S: BlobStorePut + WeakPinStore + StorageFlush + Send + 'static,
+    S: BlobStorePut + WantStore + StorageFlush + Send + 'static,
 {
     fn record_want(&self, hash: RawHash) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut store = self.0.lock().expect("store mutex");
         store
-            .pin_weak(Inline::<Handle<UnknownBlob>>::new(hash))
+            .want(Inline::<Handle<UnknownBlob>>::new(hash))
             .map_err(|e| {
-                Box::new(WantRecordError::<_, <S as StorageFlush>::Error>::Pin(e))
+                Box::new(WantRecordError::<_, <S as StorageFlush>::Error>::Want(e))
                     as Box<dyn std::error::Error + Send + Sync>
             })?;
         store.flush().map_err(|e| {
-            Box::new(WantRecordError::<S::WeakPinError, _>::Flush(e))
+            Box::new(WantRecordError::<S::WantError, _>::Flush(e))
                 as Box<dyn std::error::Error + Send + Sync>
         })?;
         Ok(())
@@ -1314,11 +1314,11 @@ pub enum PeerReaderGetError<E> {
     Conversion(E),
     /// Not held locally and the swarm didn't serve it before the host
     /// resolved the fetch. Existence is semidecidable — this is
-    /// "not obtained", never "definitely absent". The demand-born weak
-    /// pin recorded before the fetch stays: the want is on record.
+    /// "not obtained", never "definitely absent". The demand-born want
+    /// recorded before the fetch stays on record.
     Unavailable,
-    /// Local miss AND the demand-born weak pin could not be durably
-    /// recorded (pin or flush failed). No fetch was attempted — the
+    /// Local miss AND the demand-born want could not be durably
+    /// recorded (want or flush failed). No fetch was attempted — the
     /// want-on-record invariant must hold before any bytes move.
     /// Boxed because the reader's store type is erased behind the
     /// fetch capability; the concrete error is a
@@ -1384,10 +1384,10 @@ where
 
 // Conservative reference discovery works through the local `get`: the
 // default scan checks each 32-byte chunk against the store snapshot,
-// which — post-fetch — also holds any weak-pinned lazily-landed blobs.
+// which — post-fetch — also holds any wanted lazily-landed blobs.
 impl<L> BlobChildren for PeerReader<L> where L: BlobStoreGet {}
 
-/// Transparent async read: local lookup → a demand-born weak pin + an
+/// Transparent async read: local lookup → a demand-born want + an
 /// awaited swarm fetch that lands the result in the shared store. This
 /// is the surface a *generic* async consumer depends on to get lazy
 /// replication for free — it never needs to know it's holding a `Peer`.
@@ -1420,9 +1420,9 @@ where
             let bytes: Bytes = if let Ok(b) = local.get::<Bytes, UnknownBlob>(Inline::new(raw)) {
                 b
             } else if let Some(cap) = fetch {
-                // The demand-born weak pin: record the want durably
-                // FIRST (pin + flush), then fetch. A failed fetch
-                // leaves the pin — it remains an outstanding want. A
+                // The demand-born want: record the want durably
+                // FIRST (want + flush), then fetch. A failed fetch
+                // leaves the want — it remains an outstanding want. A
                 // failed RECORD is an error: never fetch bytes whose
                 // demand isn't on record.
                 cap.sink

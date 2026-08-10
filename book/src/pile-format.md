@@ -19,10 +19,11 @@ memory map never exposes half-written records.
 
 Every record the pile writes today — blob, native collection definition,
 collection commit, collection merge, collection derive, branch (pin) head,
-branch tombstone, weak-pin marker, or weak-unpin marker — uses the **V3**
-layout: a fixed **256-byte header**, followed (for blobs) by the payload,
-padded so the whole record is a **256-byte multiple**. This uniformity is
-load-bearing:
+branch tombstone, want assertion, or want retraction — uses the **V3** layout:
+a fixed **256-byte header**, followed (for blobs) by the payload, padded so the
+whole record is a **256-byte multiple**. Want records retain their historical
+weak-pin/weak-unpin magic markers for byte compatibility; those are physical
+format names, not the public storage model. This uniformity is load-bearing:
 
 - **Position independence.** Blob data starts at the constant
   `record_start + 256`; there is no offset-derived padding. A record means
@@ -298,24 +299,24 @@ pile does not check whether the referenced blob exists locally, allowing
 deployments that store heads on disk while serving blob contents from a remote
 store.
 
-## Weak-Pin Records (want / retention markers)
+## Want Records
 
 ```text
             ┌────16 byte───┐┌────────────32 byte───────────┐┌────────────208 byte──────────┐
           ┌ ┌──────────────┐┌──────────────────────────────┐┌──────────────────────────────┐
- weak-pin │ │  pin marker  ││         blob handle          ││          reserved 0s         │
+ want     │ │assert marker ││         blob handle          ││          reserved 0s         │
  (256 B)  └ └──────────────┘└──────────────────────────────┘└──────────────────────────────┘
 ```
 
-A weak-pin marker (and its weak-unpin counterpart, same layout with a
-different marker) is keyed by **blob handle** — per-blob and anonymous, no pin
-id. Together with the pin records they make retention one strength axis,
-resolved last-writer-wins by log position:
-`pin ⊐ weak-pin ⊐ weak-unpin ⊐ unpin` (the pin-head record *is* `pin`, the
-tombstone *is* `unpin`). A weak pin is simultaneously the demand-born
-want-signal ("I want this blob; fetch it if absent"), the cache-retention
-marker for a fetched blob, and the eviction target under pressure. Because the
-markers are durable records, reopening a pile reloads the weak set.
+A want assertion (and its retraction counterpart, using the same layout with a
+different marker) is keyed by **blob handle** — per-blob and anonymous, with no
+pin ID. Assertions and retractions resolve last-writer-wins per handle. The
+resulting [`WantStore`](https://docs.rs/triblespace-core/latest/triblespace_core/repo/trait.WantStore.html)
+state is independent from named mutable pin cells: a pile may use wants for
+fetch-on-demand and bounded cache retention without using branches at all.
+Because wants are durable records, reopening a pile reconstructs the current
+wanted set. The implementation keeps the original weak-pin/weak-unpin marker
+IDs solely so existing piles continue to decode byte-for-byte.
 
 ## Legacy V1 records
 
@@ -323,7 +324,7 @@ Piles written before V3 contain 64-byte-aligned records: a 64-byte blob header
 (marker, timestamp, length, hash) followed by a payload padded to a 64-byte
 boundary, and 64-byte branch / tombstone records. The reader recognises the V1
 markers and reads these records byte-identical; they are never rewritten. V1
-had no weak-pin records.
+had no want records.
 
 ## Recovery
 

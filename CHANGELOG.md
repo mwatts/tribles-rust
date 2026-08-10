@@ -101,7 +101,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unsigned `MERGE` and `DERIVE` endpoints remain descriptive, reproducible cache
   work rather than ownership edges. The policy-aware planner can still narrow
   this to locally authorized, admitted COMMIT ground truth for an explicit
-  destructive retention operation. Weak wants remain demand markers and never
+  destructive retention operation. Wants remain demand markers and never
   silently become ownership roots.
 - **Resolved `SimpleArchive` collections have one narrow read-side
   materializer.** It probes residency only for known semantic members, selects
@@ -232,6 +232,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its resolved documentation backlog entry are removed.
 
 ### Changed
+
+- **Durable demand/cache interest is now a standalone `WantStore`.** The
+  public `want`, `unwant`, and `wants` surface no longer inherits named
+  compare-and-swap pins, so lazy readers and cache policy can compose with
+  stores that have no mutable heads. Pile retains the historical weak-marker
+  bytes solely as its compatible physical encoding; MemoryRepo, HybridStore,
+  Lazy, Yard, Peer fetches, and reconciliation expose only want semantics.
+  Explicitly wanting resident Yard content now records the interest uniformly
+  and makes it participate in the configured want budget.
 
 - **The optional telemetry sink now publishes native collection commits.**
   Per-thread `Fragment` batches retain their attachments until a central

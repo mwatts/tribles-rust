@@ -27,7 +27,7 @@ use triblespace_core::prelude::BlobStore;
 use triblespace_core::repo::async_store::AsyncBlobStoreGet;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{
-    BlobStoreGet, BlobStoreKeep, BlobStoreList, BlobStorePut, PinStore, WeakPinStore,
+    BlobStoreGet, BlobStoreKeep, BlobStoreList, BlobStorePut, PinStore, WantStore,
 };
 use triblespace_core::trible::TribleSet;
 use triblespace_net::transport::sim::{DhtMode, SimConfig, SimNet};
@@ -80,10 +80,10 @@ fn holds_locally(peer: &mut triblespace_net::peer::Peer<MemoryRepo>, hash: [u8; 
     BlobStoreGet::get::<anybytes::Bytes, UnknownBlob>(&reader, Inline::new(hash)).is_ok()
 }
 
-/// Count of weak-pinned handles in the peer's store — the retention
+/// Count of wanted handles in the peer's store — the retention
 /// markers that lazy swarm fetches land under.
-fn weak_pin_count(peer: &triblespace_net::peer::Peer<MemoryRepo>) -> usize {
-    peer.store().weak_pins().unwrap().count()
+fn want_count(peer: &triblespace_net::peer::Peer<MemoryRepo>) -> usize {
+    peer.store().wants().unwrap().count()
 }
 
 /// A holds a content blob; B does not. B's swarm fetch must pull it
@@ -134,13 +134,13 @@ fn fetch_blob_pulls_from_the_holder() {
 
 /// The full lazy-read invariant: a node B that does not hold a content
 /// blob fetches it from the swarm and lands it in its store under a
-/// **weak pin** — the demand-born retention marker — after which the
+/// **want** — the demand-born retention marker — after which the
 /// `PeerReader` serves it locally. This is "lazy replication" in one
 /// test: B reads content it never eagerly replicated, retains it as an
-/// evictable weak-pinned resident, and a strong pin (the durability
+/// evictable wanted resident, and a strong pin (the durability
 /// promise) would be a separate decision.
 #[test]
-fn lazy_read_lands_weak_pinned_in_store() {
+fn lazy_read_lands_wanted_in_store() {
     let _g = sim_guard();
     run_paused(0xCAFE, async {
         let net = SimNet::new(0xCAFE, SimConfig::default());
@@ -166,20 +166,20 @@ fn lazy_read_lands_weak_pinned_in_store() {
             peer_a.refresh();
         }
 
-        // Precondition: B holds nothing locally and has no weak pins.
+        // Precondition: B holds nothing locally and has no wants.
         assert!(
             peer_b.try_local(hash).is_none(),
             "precondition: B lacks the blob"
         );
-        assert_eq!(weak_pin_count(&peer_b), 0, "precondition: no weak pins");
+        assert_eq!(want_count(&peer_b), 0, "precondition: no wants");
         let strong_before = peer_b.store().pins().unwrap().count();
 
-        // The lazy read: record the demand-born weak pin, fetch from
+        // The lazy read: record the demand-born want, fetch from
         // the swarm, land the verified bytes in the store.
         let got = drive_future(peer_b.get_or_fetch_async(hash), || peer_a.refresh(), 120)
             .await
             .expect("fetch future completes")
-            .expect("want recorded (MemoryRepo pins are infallible)")
+            .expect("want recorded (MemoryRepo wants are infallible)")
             .expect("B must obtain the blob from the swarm");
         assert_eq!(
             blake3::hash(&got).as_bytes(),
@@ -196,17 +196,17 @@ fn lazy_read_lands_weak_pinned_in_store() {
             &hash,
             "served bytes hash to the content id"
         );
-        // 2. It is retained under a weak pin (the demand-born marker)...
-        let weak: Vec<_> = peer_b
+        // 2. It is retained under a want (the demand-born marker)...
+        let wanted: Vec<_> = peer_b
             .store()
-            .weak_pins()
+            .wants()
             .unwrap()
             .map(Result::unwrap)
             .collect();
         assert_eq!(
-            weak,
+            wanted,
             vec![Inline::<Handle<UnknownBlob>>::new(hash)],
-            "fetched blob is weak-pinned"
+            "fetched blob is wanted"
         );
         // 3. ...and NOT strong-pinned (no eager durability promise).
         assert_eq!(
@@ -218,10 +218,10 @@ fn lazy_read_lands_weak_pinned_in_store() {
 }
 
 /// Eviction lives in the store now — and it is always safe: the evicted
-/// blob is re-fetchable. B lazily reads 3 blobs (each lands weak-pinned),
-/// then the store evicts the first (weak-unpin + drop the bytes); the
+/// blob is re-fetchable. B lazily reads 3 blobs (each lands wanted),
+/// then the store evicts the first (`unwant` + drop the bytes); the
 /// evicted blob becomes a local miss but the swarm still serves it on
-/// demand — "weak pins are wants, eviction is always safe".
+/// demand — wanted content remains re-fetchable after eviction.
 #[test]
 fn lazy_store_eviction_is_safe_and_refetches() {
     let _g = sim_guard();
@@ -251,7 +251,7 @@ fn lazy_store_eviction_is_safe_and_refetches() {
             peer_a.refresh();
         }
 
-        // Lazily read all three, in order — each lands weak-pinned.
+        // Lazily read all three, in order — each lands wanted.
         for (_, hash) in &blobs {
             let got = drive_future(peer_b.get_or_fetch_async(*hash), || peer_a.refresh(), 120)
                 .await
@@ -260,11 +260,7 @@ fn lazy_store_eviction_is_safe_and_refetches() {
                 .expect("swarm must serve each blob");
             assert_eq!(blake3::hash(&got).as_bytes(), hash);
         }
-        assert_eq!(
-            weak_pin_count(&peer_b),
-            3,
-            "each lazy read landed weak-pinned"
-        );
+        assert_eq!(want_count(&peer_b), 3, "each lazy read landed wanted");
         for (_, hash) in &blobs {
             assert!(
                 peer_b.try_local(*hash).is_some(),
@@ -272,14 +268,14 @@ fn lazy_store_eviction_is_safe_and_refetches() {
             );
         }
 
-        // The store evicts the first blob: retract the weak pin and
+        // The store evicts the first blob: retract the want and
         // drop the bytes. (MemoryRepo has no eviction policy of its
         // own — this is the store-side operation a budgeted store like
         // Yard performs under pressure.)
         {
             let mut store = peer_b.store();
             store
-                .unpin_weak(Inline::<Handle<UnknownBlob>>::new(blobs[0].1))
+                .unwant(Inline::<Handle<UnknownBlob>>::new(blobs[0].1))
                 .unwrap();
             let retained: Vec<Inline<Handle<UnknownBlob>>> = store
                 .reader()
@@ -293,11 +289,7 @@ fn lazy_store_eviction_is_safe_and_refetches() {
         }
 
         // The eviction retracted the pin and dropped the resident bytes.
-        assert_eq!(
-            weak_pin_count(&peer_b),
-            2,
-            "weak pin retracted by the eviction"
-        );
+        assert_eq!(want_count(&peer_b), 2, "want retracted by the eviction");
         assert!(
             peer_b.try_local(blobs[0].1).is_none(),
             "oldest evicted from the store"
@@ -322,11 +314,11 @@ fn lazy_store_eviction_is_safe_and_refetches() {
 
 /// The honest **async** lazy read: `get_or_fetch_async` awaits the
 /// swarm fetch (oneshot reply, no blocked thread) and lands the result
-/// weak-pinned in the store. Driven deterministically by polling the
+/// wanted in the store. Driven deterministically by polling the
 /// future and stepping the sim on `Pending` — the awaited oneshot
 /// resolves once the host (driven by the stepping) sends the reply.
 #[test]
-fn async_lazy_read_awaits_swarm_and_lands_weak_pinned() {
+fn async_lazy_read_awaits_swarm_and_lands_wanted() {
     let _g = sim_guard();
     run_paused(0xA5A5, async {
         let net = SimNet::new(0xA5A5, SimConfig::default());
@@ -378,19 +370,19 @@ fn async_lazy_read_awaits_swarm_and_lands_weak_pinned() {
             &hash,
             "awaited bytes hash to the content id"
         );
-        // Landed weak-pinned in the store, served locally on the next read.
+        // Landed wanted in the store, served locally on the next read.
         assert!(
             peer_b.try_local(hash).is_some(),
             "now resident in the local store"
         );
-        assert_eq!(weak_pin_count(&peer_b), 1, "landed under a weak pin");
+        assert_eq!(want_count(&peer_b), 1, "landed under a want");
     });
 }
 
 /// Transparent async read through the trait surface: a *generic*
 /// `AsyncBlobStoreGet` consumer calls `reader.get(handle).await` on a
 /// blob B doesn't hold, and the `PeerReader` fetches it from the swarm
-/// and lands it weak-pinned in the shared store — no knowledge that
+/// and lands it wanted in the shared store — no knowledge that
 /// it's a `Peer`. This is the "lazy replication for free" payoff of
 /// increment 5b.
 #[test]
@@ -449,9 +441,9 @@ fn transparent_async_get_fetches_through_reader() {
         // The fetch landed in the *shared* store (a &self read mutated
         // Peer state), so a fresh local read now hits.
         assert_eq!(
-            weak_pin_count(&peer_b),
+            want_count(&peer_b),
             1,
-            "fetch recorded the demand-born weak pin"
+            "fetch recorded the demand-born want"
         );
         assert!(
             peer_b.try_local(hash).is_some(),
@@ -661,9 +653,9 @@ fn lazy_read_unavailable_under_partition_then_heals() {
             "nothing landed from a failed fetch"
         );
         assert_eq!(
-            weak_pin_count(&peer_b),
+            want_count(&peer_b),
             0,
-            "fetch_blob records no want — pinning is the caller's policy"
+            "fetch_blob records no want — retention is the caller's policy"
         );
 
         // Heal the link; the same read now succeeds.
@@ -721,7 +713,7 @@ fn lazy_read_unavailable_under_crash_then_revives() {
 }
 
 /// A `Peer<S>` **retains** what it fetches: the lazy read lands the
-/// blob in the store under a weak pin, so a second read is a LOCAL
+/// blob in the store under a want, so a second read is a LOCAL
 /// hit — no re-fetch, no swarm dependency. Proven by crashing the only
 /// holder before the second read: it still succeeds, resolving on the
 /// first poll without a single sim step. Retention is the store's job;
@@ -758,8 +750,8 @@ fn fetched_blob_is_retained_second_read_hits_locally() {
             .expect("the lazy read fetches from the swarm");
         assert_eq!(blake3::hash(&got).as_bytes(), &hash);
 
-        // The fetch landed weak-pinned: resident, evictable, retained.
-        assert_eq!(weak_pin_count(&peer_b), 1, "fetch landed under a weak pin");
+        // The fetch landed wanted: resident, evictable, retained.
+        assert_eq!(want_count(&peer_b), 1, "fetch landed under a want");
         assert!(
             peer_b.try_local(hash).is_some(),
             "a local hit after the fetch"
@@ -978,7 +970,7 @@ fn run_lazy_fetch(seed: u64, config: SimConfig) -> (Option<Vec<u8>>, u32) {
 /// `Arc<Mutex>`): both `&self` reads fetch from the swarm and land into
 /// the one shared store. The conn-pool singleflight should share the
 /// dial to the holder, and the content-addressed store must end with
-/// exactly one copy under exactly one weak pin — no double-store from
+/// exactly one copy under exactly one want — no double-store from
 /// the racing lands.
 #[test]
 fn concurrent_transparent_reads_share_store_and_dedupe() {
@@ -1051,11 +1043,11 @@ fn concurrent_transparent_reads_share_store_and_dedupe() {
         assert_eq!(blake3::hash(&got1).as_bytes(), &hash);
         assert_eq!(blake3::hash(&got2).as_bytes(), &hash);
         // Both racing lands hit the same content-addressed store: one
-        // copy, and the two recorded wants collapse to one weak pin.
+        // copy, and the two recorded wants collapse to one want.
         assert_eq!(
-            weak_pin_count(&peer_b),
+            want_count(&peer_b),
             1,
-            "concurrent lands of the same blob dedupe to a single weak pin"
+            "concurrent lands of the same blob dedupe to a single want"
         );
         assert!(
             peer_b.try_local(hash).is_some(),
@@ -1173,11 +1165,11 @@ fn lazy_fetch_succeeds_across_many_seeds() {
     }
 }
 
-/// The want-reconcile loop — the daemon half of "a weak pin IS a
-/// durable want-marker". A faculty (another process) appends a weak-pin
+/// The want-reconcile loop — the daemon half of "a want IS a
+/// durable want-marker". A faculty (another process) appends a want
 /// record for a blob the node doesn't hold; the sync daemon's reconcile
 /// tick notices the want, fetches the blob from whoever holds it, and
-/// lands it under the existing weak pin. Strong pins are never touched,
+/// lands it under the existing want. Strong pins are never touched,
 /// on either side. B runs WITHOUT gossip so the only path the content
 /// can take is the reconcile-driven swarm fetch — no eager branch sync
 /// can satisfy the want behind the test's back.
@@ -1219,10 +1211,10 @@ fn reconcile_tick_services_out_of_band_want() {
 
         // Out-of-band want: written through the store guard, bypassing
         // the Peer's own read path — exactly what a faculty appending a
-        // weak-pin record to the shared pile looks like to the daemon.
+        // want record to the shared pile looks like to the daemon.
         peer_b
             .store()
-            .pin_weak(Inline::<Handle<UnknownBlob>>::new(hash))
+            .want(Inline::<Handle<UnknownBlob>>::new(hash))
             .unwrap();
         assert!(
             peer_b.try_local(hash).is_none(),
@@ -1230,7 +1222,7 @@ fn reconcile_tick_services_out_of_band_want() {
         );
 
         let a_pins_before: Vec<_> = peer_a.store().pins().unwrap().map(Result::unwrap).collect();
-        let a_weak_before = weak_pin_count(&peer_a);
+        let a_wants_before = want_count(&peer_a);
         let b_pins_before = peer_b.store().pins().unwrap().count();
 
         // The reconcile pass: notice the want, fetch, land.
@@ -1238,7 +1230,7 @@ fn reconcile_tick_services_out_of_band_want() {
         let stats = drive_future(rec.tick(&mut peer_b), || peer_a.refresh(), 300)
             .await
             .expect("reconcile tick completes");
-        assert_eq!(stats.wants, 1, "the out-of-band weak pin is the want set");
+        assert_eq!(stats.wants, 1, "the out-of-band want is the want set");
         assert_eq!(stats.missing, 1, "its blob was absent at pass start");
         assert_eq!(stats.fetched, 1, "the want was serviced from the swarm");
         assert_eq!(stats.pending, 0, "nothing left outstanding");
@@ -1248,18 +1240,18 @@ fn reconcile_tick_services_out_of_band_want() {
             peer_b.try_local(hash).is_some(),
             "want serviced: blob now resident at B"
         );
-        // ...still weak-pinned — the want-marker became the retention
+        // ...still wanted — the want-marker became the retention
         // marker (the reconciler records no pin state of its own)...
-        let weak: Vec<_> = peer_b
+        let wanted: Vec<_> = peer_b
             .store()
-            .weak_pins()
+            .wants()
             .unwrap()
             .map(Result::unwrap)
             .collect();
         assert_eq!(
-            weak,
+            wanted,
             vec![Inline::<Handle<UnknownBlob>>::new(hash)],
-            "the want stays on record as the weak pin"
+            "the want stays on record as the want"
         );
         // ...B grew no strong pin...
         assert_eq!(
@@ -1270,11 +1262,7 @@ fn reconcile_tick_services_out_of_band_want() {
         // ...and A's retention is untouched.
         let a_pins_after: Vec<_> = peer_a.store().pins().unwrap().map(Result::unwrap).collect();
         assert_eq!(a_pins_after, a_pins_before, "A's strong pins untouched");
-        assert_eq!(
-            weak_pin_count(&peer_a),
-            a_weak_before,
-            "A's weak pins untouched"
-        );
+        assert_eq!(want_count(&peer_a), a_wants_before, "A's wants untouched");
     });
 }
 
@@ -1310,7 +1298,7 @@ fn reconcile_unsatisfiable_want_stays_pending() {
         let hash = *blake3::hash(b"nobody holds this blob").as_bytes();
         peer_a
             .store()
-            .pin_weak(Inline::<Handle<UnknownBlob>>::new(hash))
+            .want(Inline::<Handle<UnknownBlob>>::new(hash))
             .unwrap();
 
         let mut rec = Reconciler::new();
@@ -1349,13 +1337,13 @@ fn reconcile_unsatisfiable_want_stays_pending() {
 
         // Throughout: the want is still durably on record and the blob
         // still absent — nothing was dropped, nothing errored.
-        let weak: Vec<_> = peer_a
+        let wanted: Vec<_> = peer_a
             .store()
-            .weak_pins()
+            .wants()
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        assert_eq!(weak, vec![Inline::<Handle<UnknownBlob>>::new(hash)]);
+        assert_eq!(wanted, vec![Inline::<Handle<UnknownBlob>>::new(hash)]);
         assert!(peer_a.try_local(hash).is_none());
     });
 }

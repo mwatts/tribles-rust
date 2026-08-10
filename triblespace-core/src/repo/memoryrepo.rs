@@ -12,7 +12,7 @@ use crate::prelude::blobencodings::SimpleArchive;
 use crate::prelude::*;
 use crate::repo::PinStore;
 use crate::repo::PushResult;
-use crate::repo::WeakPinStore;
+use crate::repo::WantStore;
 
 use crate::inline::encodings::hash::Handle;
 use crate::inline::InlineEncoding;
@@ -27,11 +27,11 @@ pub struct MemoryRepo {
     pub blobs: MemoryBlobStore,
     /// Map from pin id to the handle of its current head (a commit for content branches; arbitrary SimpleArchive blob for other pin roles).
     pub branches: HashMap<Id, Inline<Handle<SimpleArchive>>>,
-    /// LWW-resolved weak-pin set (see [`WeakPinStore`]). In memory the
-    /// last-writer-wins resolution is just insert/remove. Weak pins here
-    /// are exactly as ephemeral as the blobs themselves — the trait is a
+    /// LWW-resolved wanted handles (see [`WantStore`]). In memory the
+    /// last-writer-wins resolution is just insert/remove. Wants here are
+    /// exactly as ephemeral as the blobs themselves — the trait is a
     /// capability, durability is the store's own property.
-    pub weak: HashSet<Inline<Handle<UnknownBlob>>>,
+    pub wants: HashSet<Inline<Handle<UnknownBlob>>>,
     /// Canonical collection records keyed by intrinsic record id.
     collection_records: BTreeMap<Id, CollectionRecord>,
 }
@@ -131,35 +131,34 @@ impl PinStore for MemoryRepo {
     }
 }
 
-impl WeakPinStore for MemoryRepo {
-    type WeakPinError = Infallible;
+impl WantStore for MemoryRepo {
+    type WantError = Infallible;
 
-    type WeakListIter<'a> =
-        std::vec::IntoIter<Result<Inline<Handle<UnknownBlob>>, Self::WeakPinError>>;
+    type WantIter<'a> = std::vec::IntoIter<Result<Inline<Handle<UnknownBlob>>, Self::WantError>>;
 
-    fn pin_weak<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WeakPinError>
+    fn want<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WantError>
     where
         S: BlobEncoding + 'static,
         Handle<S>: InlineEncoding,
     {
-        self.weak.insert(handle.transmute());
+        self.wants.insert(handle.transmute());
         Ok(())
     }
 
-    fn unpin_weak<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WeakPinError>
+    fn unwant<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WantError>
     where
         S: BlobEncoding + 'static,
         Handle<S>: InlineEncoding,
     {
-        self.weak.remove(&handle.transmute());
+        self.wants.remove(&handle.transmute());
         Ok(())
     }
 
-    fn weak_pins<'a>(&'a mut self) -> Result<Self::WeakListIter<'a>, Self::WeakPinError> {
-        // Sorted for the same reason as `pins()`: weak-pin enumeration
+    fn wants<'a>(&'a mut self) -> Result<Self::WantIter<'a>, Self::WantError> {
+        // Sorted for the same reason as `pins()`: want enumeration
         // feeds sync-daemon fetch order, and HashSet's per-instance seed
         // would break deterministic simulation replay.
-        let mut handles: Vec<Inline<Handle<UnknownBlob>>> = self.weak.iter().copied().collect();
+        let mut handles: Vec<Inline<Handle<UnknownBlob>>> = self.wants.iter().copied().collect();
         handles.sort();
         Ok(handles.into_iter().map(Ok).collect::<Vec<_>>().into_iter())
     }
@@ -194,28 +193,28 @@ mod tests {
         Inline::new([byte; 32])
     }
 
-    /// Weak pins resolve last-writer-wins: pin → listed, unpin →
-    /// gone, re-pin → listed again. Enumeration is sorted (stable
+    /// Wants resolve last-writer-wins: want → listed, unwant →
+    /// gone, re-want → listed again. Enumeration is sorted (stable
     /// across runs despite HashSet backing).
     #[test]
-    fn weak_pins_lww_roundtrip() {
+    fn wants_lww_roundtrip() {
         let mut repo = MemoryRepo::default();
-        assert_eq!(repo.weak_pins().unwrap().count(), 0);
+        assert_eq!(repo.wants().unwrap().count(), 0);
 
-        repo.pin_weak(handle(2)).unwrap();
-        repo.pin_weak(handle(1)).unwrap();
-        // Re-pinning an already-pinned handle is idempotent.
-        repo.pin_weak(handle(1)).unwrap();
-        let pins: Vec<_> = repo.weak_pins().unwrap().map(Result::unwrap).collect();
-        assert_eq!(pins, vec![handle(1), handle(2)], "sorted enumeration");
+        repo.want(handle(2)).unwrap();
+        repo.want(handle(1)).unwrap();
+        // Reasserting an existing want is idempotent.
+        repo.want(handle(1)).unwrap();
+        let wants: Vec<_> = repo.wants().unwrap().map(Result::unwrap).collect();
+        assert_eq!(wants, vec![handle(1), handle(2)], "sorted enumeration");
 
-        repo.unpin_weak(handle(1)).unwrap();
-        let pins: Vec<_> = repo.weak_pins().unwrap().map(Result::unwrap).collect();
-        assert_eq!(pins, vec![handle(2)]);
+        repo.unwant(handle(1)).unwrap();
+        let wants: Vec<_> = repo.wants().unwrap().map(Result::unwrap).collect();
+        assert_eq!(wants, vec![handle(2)]);
 
-        // A later weak pin wins over the earlier unpin.
-        repo.pin_weak(handle(1)).unwrap();
-        assert_eq!(repo.weak_pins().unwrap().count(), 2);
+        // A later want wins over the earlier retraction.
+        repo.want(handle(1)).unwrap();
+        assert_eq!(repo.wants().unwrap().count(), 2);
     }
 
     #[test]

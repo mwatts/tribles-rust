@@ -10,14 +10,16 @@ use crate::repo::BlobStore;
 use crate::repo::BlobStorePut;
 use crate::repo::PinStore;
 use crate::repo::PushResult;
+use crate::repo::WantStore;
 
-/// Store that delegates blob and branch operations to two independent stores.
+/// Store that delegates blob/want and branch/collection-record operations to
+/// two independent stores.
 ///
 /// This allows mixing different storage implementations in one repository,
 /// e.g. an on-disk blob store with an in-memory branch store.
 #[derive(Debug)]
 pub struct HybridStore<B, R> {
-    /// Storage for commit, content and metadata blobs.
+    /// Storage for content-addressed blobs and per-blob wants.
     pub blobs: B,
     /// Storage for branch heads and native collection records.
     ///
@@ -115,6 +117,39 @@ where
     }
 }
 
+impl<B, R> WantStore for HybridStore<B, R>
+where
+    B: WantStore,
+{
+    type WantError = B::WantError;
+
+    type WantIter<'a>
+        = B::WantIter<'a>
+    where
+        B: 'a,
+        R: 'a;
+
+    fn want<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WantError>
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding,
+    {
+        self.blobs.want(handle)
+    }
+
+    fn unwant<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WantError>
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding,
+    {
+        self.blobs.unwant(handle)
+    }
+
+    fn wants<'a>(&'a mut self) -> Result<Self::WantIter<'a>, Self::WantError> {
+        self.blobs.wants()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +184,25 @@ mod tests {
             CollectionStore::records(&mut hybrid.blobs).unwrap().count(),
             0
         );
+    }
+
+    #[test]
+    fn wants_delegate_only_to_the_blob_side() {
+        use crate::blob::encodings::UnknownBlob;
+
+        let handle = Inline::<Handle<UnknownBlob>>::new([9; 32]);
+        let mut hybrid = HybridStore::new(MemoryRepo::default(), MemoryRepo::default());
+
+        hybrid.want(handle).unwrap();
+        assert_eq!(
+            hybrid
+                .wants()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![handle]
+        );
+        assert_eq!(hybrid.blobs.wants().unwrap().count(), 1);
+        assert_eq!(hybrid.branches.wants().unwrap().count(), 0);
     }
 }

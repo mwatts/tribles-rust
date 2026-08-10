@@ -18,13 +18,13 @@
 //!    OP_CHILDREN/OP_GET_BLOB, lands a tracking pin, and
 //!    `merge_tracking_into_local` advances B's local "main" to A's
 //!    head commit.
-//! 2. **Lazy weak-pin want** — a content blob lives ONLY in pile A
+//! 2. **Lazy want** — a content blob lives ONLY in pile A
 //!    (never committed to a branch, so eager sync never ships it). B
-//!    durably records a weak-pin want for its hash; a
+//!    durably records a want for its hash; a
 //!    `Reconciler::tick` services the want via the swarm fetch
 //!    (publisher-first: A is known to B from the stage-1 gossip) and
 //!    lands the verified bytes in pile B under the still-recorded
-//!    weak pin.
+//!    want.
 //!
 //! Piles are created under `std::env::temp_dir()` — set `TMPDIR` to
 //! redirect.
@@ -48,7 +48,7 @@ use triblespace_core::inline::{Inline, TryToInline};
 use triblespace_core::prelude::BlobStore;
 use triblespace_core::repo::capability::{self, PERM_ADMIN};
 use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::{BlobStoreGet, BlobStorePut, Repository, WeakPinStore};
+use triblespace_core::repo::{BlobStoreGet, BlobStorePut, Repository, WantStore};
 use triblespace_core::trible::TribleSet;
 use triblespace_net::clock;
 use triblespace_net::host;
@@ -293,10 +293,10 @@ async fn eager_gossip_sync_converges_over_iroh() {
 
 /// Stage 2: the lazy path. A content blob lives ONLY in pile A and is
 /// never committed to a branch — eager sync will never ship it. B
-/// records a durable weak-pin want; the Reconciler services it via the
+/// records a durable want; the Reconciler services it via the
 /// swarm fetch and lands the bytes in pile B.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn weak_pin_want_fetches_from_holder_over_iroh() {
+async fn want_fetches_from_holder_over_iroh() {
     init_tracing();
     let network = TestNetwork::new();
     let ka = key(0xA1);
@@ -349,15 +349,15 @@ async fn weak_pin_want_fetches_from_holder_over_iroh() {
         );
     }
 
-    // The durable want: weak-pin the hash in pile B and flush — the
+    // The durable want: want the hash in pile B and flush — the
     // marker survives a process exit; the Reconciler is the daemon
     // that services the queue.
     {
         let peer_b = repo_b.storage_mut();
         let mut store = peer_b.store();
         store
-            .pin_weak(Inline::<Handle<UnknownBlob>>::new(hash))
-            .expect("record weak-pin want");
+            .want(Inline::<Handle<UnknownBlob>>::new(hash))
+            .expect("record want");
         store.flush().expect("flush want");
     }
 
@@ -380,7 +380,7 @@ async fn weak_pin_want_fetches_from_holder_over_iroh() {
     }
     assert!(
         fetched,
-        "Reconciler must fetch the weak-pin want from A over the iroh transport"
+        "Reconciler must fetch the want from A over the iroh transport"
     );
 
     // The payload landed in pile B…
@@ -395,19 +395,19 @@ async fn weak_pin_want_fetches_from_holder_over_iroh() {
             "landed bytes verify against the requested hash"
         );
     }
-    // …and the weak pin that expressed the want is still on record —
+    // …and the demand marker is still on record —
     // it is now the retention marker for the fetched blob.
     {
         let peer_b = repo_b.storage_mut();
         let mut store = peer_b.store();
-        let still_pinned = store
-            .weak_pins()
-            .expect("weak pins")
+        let still_wanted = store
+            .wants()
+            .expect("wants")
             .filter_map(Result::ok)
             .any(|h| h.raw == hash);
         assert!(
-            still_pinned,
-            "the weak pin stays on record as the retention marker"
+            still_wanted,
+            "the want stays on record as the retention marker"
         );
     }
 }

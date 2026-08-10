@@ -20,8 +20,8 @@
 //!    host walks the closure (OP_CHILDREN / OP_GET_BLOB over QUIC)
 //!    and `merge_tracking_into_local` advances B's "main" to A's head
 //!    commit. B prints `EAGER-OK <head>`.
-//! 2. **LAZY**: B durably records a weak-pin *want* for the payload
-//!    hash (pin + flush — the demand survives a crash), and a
+//! 2. **LAZY**: B durably records a want for the payload
+//!    hash (want + flush — the demand survives a crash), and a
 //!    `Reconciler::tick` services it via the swarm fetch
 //!    (publisher-first: A is gossip-known from stage 1). B prints
 //!    `LAZY-OK <hash>` and writes the done-file; A sees it and exits.
@@ -55,7 +55,7 @@ use triblespace_core::inline::{Inline, TryToInline};
 use triblespace_core::prelude::BlobStore;
 use triblespace_core::repo::capability::{self, PERM_ADMIN};
 use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::{BlobStoreGet, BlobStorePut, Repository, WeakPinStore};
+use triblespace_core::repo::{BlobStoreGet, BlobStorePut, Repository, WantStore};
 use triblespace_core::trible::TribleSet;
 use triblespace_net::host;
 use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
@@ -407,7 +407,7 @@ fn run_b(dir: &Path) {
     }
     println!("EAGER-OK {}", hex::encode(a_head));
 
-    // ── Stage 2: lazy weak-pin want ──────────────────────────────────
+    // ── Stage 2: lazy want ──────────────────────────────────
     {
         let peer = repo.storage_mut();
         let reader = peer.reader().expect("reader");
@@ -417,10 +417,10 @@ fn run_b(dir: &Path) {
             held.is_err(),
             "precondition: B must NOT hold the never-committed payload after eager sync"
         );
-        // The durable want: weak-pin + flush BEFORE any fetch.
+        // The durable want: want + flush BEFORE any fetch.
         let mut store = peer.store();
         store
-            .pin_weak(Inline::<Handle<UnknownBlob>>::new(payload_hash))
+            .want(Inline::<Handle<UnknownBlob>>::new(payload_hash))
             .expect("record want");
         store.flush().expect("flush want");
     }
@@ -451,13 +451,13 @@ fn run_b(dir: &Path) {
             BlobStoreGet::get::<anybytes::Bytes, UnknownBlob>(&reader, Inline::new(payload_hash))
                 .expect("payload landed in pile B");
         assert_eq!(blake3::hash(&got).as_bytes(), &payload_hash);
-        let still_pinned = peer
+        let still_wanted = peer
             .store()
-            .weak_pins()
-            .expect("weak pins")
+            .wants()
+            .expect("wants")
             .filter_map(Result::ok)
             .any(|h| h.raw == payload_hash);
-        assert!(still_pinned, "weak pin stays on record as retention marker");
+        assert!(still_wanted, "want stays on record as retention marker");
     }
     println!("LAZY-OK {}", hex::encode(payload_hash));
 

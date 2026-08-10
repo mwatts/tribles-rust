@@ -94,7 +94,7 @@ pub use crate::repo::CommitSet;
 pub use crate::repo::PinStore;
 pub use crate::repo::Repository;
 pub use crate::repo::StorageFlush;
-pub use crate::repo::WeakPinStore;
+pub use crate::repo::WantStore;
 pub use crate::repo::{BlobInfo, BlobStoreList};
 pub use crate::trible::Fragment;
 pub use crate::trible::Spread;

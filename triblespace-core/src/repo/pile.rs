@@ -82,15 +82,11 @@ const MAGIC_MARKER_BRANCH_TOMBSTONE: RawId = hex!("E888CC787202D2AE4C654BFE9699C
 const MAGIC_MARKER_BLOB_V3: RawId = hex!("9C33EEB525065A62EAEC4BE43DCC355A");
 const MAGIC_MARKER_BRANCH_V3: RawId = hex!("AC363D04AFE1AF17B39581B1E23021D7");
 const MAGIC_MARKER_BRANCH_TOMBSTONE_V3: RawId = hex!("D0CBA0C8EAAB4C0C73121C3205671E4F");
-/// Weak-pin marker pair (minted 2026-07-01 via `trible genid`). Retention is
-/// one strength axis resolved last-writer-wins by log position:
-/// `pin ⊐ weak-pin ⊐ weak-unpin ⊐ unpin` — the branch record IS `pin`, the
-/// branch tombstone IS `unpin`; these two are the soft siblings. A weak pin is
-/// per-blob and anonymous (keyed by blob handle, no branch id): "I want this
-/// blob; fetch it if absent; evictable under pressure." It is simultaneously
-/// the demand/want-signal (a sync daemon's work queue), the cache-retention
-/// marker, and the eviction target. `weak-unpin` retracts it. Because the
-/// records are durable pile records, reopening a pile reloads the weak set.
+/// Legacy physical marker pair used to encode [`WantStore`] state (minted
+/// 2026-07-01 via `trible genid`). The historical names remain part of the
+/// on-disk format, but their semantic payload is simply a per-handle LWW want:
+/// the first marker asserts durable demand/cache interest and the second
+/// retracts it. Reopening a pile reconstructs the current wanted set.
 const MAGIC_MARKER_WEAK_PIN_V3: RawId = hex!("8F3EEFEDECD491F63F6EAAA5FD6F3D5E");
 const MAGIC_MARKER_WEAK_UNPIN_V3: RawId = hex!("2D76662DFF0187EC36A8C90B12BB8B0D");
 /// Native collection-record markers, minted on 2026-08-10 with `trible genid`.
@@ -354,8 +350,8 @@ impl BranchTombstoneHeaderV3 {
     }
 }
 
-/// V3 weak-pin marker — fixed 256 bytes. Keyed by blob handle (no branch id);
-/// see the docs on [`MAGIC_MARKER_WEAK_PIN_V3`] for the retention lattice.
+/// V3 want marker using the legacy weak-pin encoding — fixed 256 bytes and
+/// keyed by blob handle (no branch id).
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
 struct WeakPinHeaderV3 {
@@ -374,8 +370,7 @@ impl WeakPinHeaderV3 {
     }
 }
 
-/// V3 weak-unpin marker — fixed 256 bytes. Retracts a prior weak pin on the
-/// same handle (last-writer-wins by log position).
+/// V3 want-retraction marker using the legacy weak-unpin encoding.
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
 struct WeakUnpinHeaderV3 {
@@ -579,14 +574,14 @@ pub enum PileRecordContent {
         /// The branch being tombstoned.
         branch_id: Id,
     },
-    /// A weak-pin marker for a blob handle.
+    /// A want assertion in the legacy weak-pin physical encoding.
     WeakPin {
-        /// The pinned blob handle.
+        /// The wanted blob handle.
         handle: Inline<Handle<UnknownBlob>>,
     },
-    /// A weak-unpin marker retracting a prior weak pin.
+    /// A want retraction in the legacy weak-unpin physical encoding.
     WeakUnpin {
-        /// The unpinned blob handle.
+        /// The no-longer-wanted blob handle.
         handle: Inline<Handle<UnknownBlob>>,
     },
     /// One immutable native collection-algebra record. Four distinct V3 magic
@@ -906,9 +901,9 @@ fn indexed_blob_record(
 /// Iterator over the raw records of a pile file, in log order.
 ///
 /// This is the record-level view of the append-only log: every blob, branch
-/// update, branch tombstone, and weak-pin marker ever appended, including
-/// records that later ones supersede (superseded branch heads, tombstoned
-/// branches, retracted weak pins). It shares its decoder with the [`Pile`]
+/// update, branch tombstone, and legacy-encoded want marker ever appended,
+/// including records that later ones supersede (superseded branch heads,
+/// tombstoned branches, retracted wants). It shares its decoder with the [`Pile`]
 /// replay path, so both V1 and V3 records are understood; tools that need
 /// history or forensics (reflogs, consolidation, corruption reports) should
 /// consume this instead of hand-rolling a parser.
@@ -1006,10 +1001,10 @@ pub struct Pile {
     /// Immutable collection records keyed by their intrinsic entity id.
     /// `BTreeMap` makes enumeration independent of append/cat order.
     collection_records: BTreeMap<Id, CollectionRecord>,
-    /// LWW-resolved weak-pin set: weak-pin records insert the handle,
-    /// weak-unpin records remove it; log-order application makes the last
+    /// LWW-resolved wanted set. Legacy weak-pin records assert the handle and
+    /// weak-unpin records retract it; log-order application makes the last
     /// record for a handle win by construction.
-    weak_pins: PATCH<32, IdentitySchema>,
+    wants: PATCH<32, IdentitySchema>,
     /// Length of the file that has been validated and applied.
     ///
     /// Offsets below this value are guaranteed valid; corruption detection
@@ -1251,8 +1246,8 @@ impl From<ReadError> for InsertError {
     }
 }
 
-/// Error returned when appending a pin-head update or weak-pin marker
-/// record to a [`Pile`].
+/// Error returned when appending a pin-head update or want marker to a
+/// [`Pile`].
 pub enum PileWriteError {
     /// Underlying I/O failure.
     IoError(std::io::Error),
@@ -1425,7 +1420,7 @@ impl Pile {
             validations: ValidationCache::default(),
             branches: PATCH::<16, IdentitySchema, Inline<Handle<SimpleArchive>>>::new(),
             collection_records: BTreeMap::new(),
-            weak_pins: PATCH::<32, IdentitySchema>::new(),
+            wants: PATCH::<32, IdentitySchema>::new(),
             applied_length: 0,
         })
     }
@@ -1547,11 +1542,11 @@ impl Pile {
                 Applied::BranchTombstone { id: branch_id }
             }
             PileRecordContent::WeakPin { handle } => {
-                self.weak_pins.insert(&Entry::new(&handle.raw));
+                self.wants.insert(&Entry::new(&handle.raw));
                 Applied::WeakPin { handle }
             }
             PileRecordContent::WeakUnpin { handle } => {
-                self.weak_pins.remove(&handle.raw);
+                self.wants.remove(&handle.raw);
                 Applied::WeakUnpin { handle }
             }
             PileRecordContent::Collection { record } => {
@@ -1655,7 +1650,7 @@ impl Pile {
             std::ptr::drop_in_place(&mut this.validations);
             std::ptr::drop_in_place(&mut this.branches);
             std::ptr::drop_in_place(&mut this.collection_records);
-            std::ptr::drop_in_place(&mut this.weak_pins);
+            std::ptr::drop_in_place(&mut this.wants);
         }
 
         res
@@ -1679,7 +1674,7 @@ impl crate::repo::StorageClose for Pile {
 }
 
 // Generic durability hook: appended records (blobs, branch updates,
-// weak-pin markers) are not crash-durable until flushed — see the
+// want markers) are not crash-durable until flushed — see the
 // inherent [`Pile::flush`].
 impl crate::repo::StorageFlush for Pile {
     type Error = FlushError;
@@ -1696,7 +1691,7 @@ use super::BlobStoreList;
 use super::BlobStorePut;
 use super::PinStore;
 use super::PushResult;
-use super::WeakPinStore;
+use super::WantStore;
 
 /// Iterator returned by [`PileReader::iter`].
 ///
@@ -2111,13 +2106,13 @@ impl PinStore for Pile {
     }
 }
 
-/// Iterator over the LWW-resolved weak-pinned handles stored in the pile,
+/// Iterator over the LWW-resolved wanted handles stored in the pile,
 /// using the PATCH's ordered key iterator (byte order, deterministic).
-pub struct PileWeakPinIter {
+pub struct PileWantIter {
     inner: crate::patch::PATCHIntoOrderedIterator<32, IdentitySchema, ()>,
 }
 
-impl Iterator for PileWeakPinIter {
+impl Iterator for PileWantIter {
     type Item = Result<Inline<Handle<UnknownBlob>>, PileWriteError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -2127,7 +2122,8 @@ impl Iterator for PileWeakPinIter {
 }
 
 impl Pile {
-    /// Shared weak-marker append. Mirrors [`PinStore::update`]'s write path:
+    /// Append a want assertion or retraction using the legacy marker format.
+    /// Mirrors [`PinStore::update`]'s write path:
     /// exclusive lock, refresh, no-op short-circuit when the LWW state already
     /// matches, a single fixed 256-byte header write (keeping a pure-V3 pile
     /// 256-aligned), and an `apply_next` read-back while still holding the
@@ -2142,10 +2138,10 @@ impl Pile {
         let res = (|| {
             self.refresh_locked().map_err(PileWriteError::from)?;
 
-            // No-op short-circuit: the weak set is logically a per-handle
+            // No-op short-circuit: the wanted set is logically a per-handle
             // LWW cell; re-asserting the current state carries no
             // information and would just churn the append-only file.
-            let current = self.weak_pins.get(&handle.raw).is_some();
+            let current = self.wants.get(&handle.raw).is_some();
             if current == pin {
                 return Ok(());
             }
@@ -2183,14 +2179,13 @@ impl Pile {
     }
 }
 
-impl WeakPinStore for Pile {
-    type WeakPinError = PileWriteError;
-    type WeakListIter<'a> = PileWeakPinIter;
+impl WantStore for Pile {
+    type WantError = PileWriteError;
+    type WantIter<'a> = PileWantIter;
 
-    /// Appends a weak-pin record for `handle`. Durable across reopen (the
-    /// record is replayed by the scan), subject to the same flush rules as
-    /// branch updates: call [`Pile::flush`] to make it crash-durable.
-    fn pin_weak<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WeakPinError>
+    /// Asserts a want for `handle`. The legacy marker is replayed across
+    /// reopen; call [`Pile::flush`] to make it crash-durable.
+    fn want<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WantError>
     where
         S: BlobEncoding + 'static,
         Handle<S>: InlineEncoding,
@@ -2198,9 +2193,8 @@ impl WeakPinStore for Pile {
         self.write_weak_marker(handle.transmute(), true)
     }
 
-    /// Appends a weak-unpin record for `handle`, retracting any prior weak
-    /// pin (last-writer-wins by log position).
-    fn unpin_weak<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WeakPinError>
+    /// Retracts the want for `handle` (last-writer-wins by log position).
+    fn unwant<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WantError>
     where
         S: BlobEncoding + 'static,
         Handle<S>: InlineEncoding,
@@ -2208,12 +2202,12 @@ impl WeakPinStore for Pile {
         self.write_weak_marker(handle.transmute(), false)
     }
 
-    fn weak_pins<'a>(&'a mut self) -> Result<Self::WeakListIter<'a>, Self::WeakPinError> {
+    fn wants<'a>(&'a mut self) -> Result<Self::WantIter<'a>, Self::WantError> {
         // Ensure newly appended records are applied before enumerating so
         // external writers are visible to callers (mirrors `pins`).
         self.refresh()?;
-        let cloned = self.weak_pins.clone();
-        Ok(PileWeakPinIter {
+        let cloned = self.wants.clone();
+        Ok(PileWantIter {
             inner: cloned.into_iter_ordered(),
         })
     }
@@ -2252,16 +2246,16 @@ impl crate::repo::BlobStoreMeta for PileReader {
     }
 }
 
-/// How a source pile's active weak wants participate in a retained rewrite.
+/// How a source pile's active wants participate in a retained rewrite.
 ///
-/// Weak wants are demand markers, not ownership roots. Preserving them copies
+/// Wants are demand markers, not ownership roots. Preserving them copies
 /// the marker into the destination but does not retain or copy the requested
 /// blob unless an explicit or strong-pin root reaches it independently.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WeakWantRewritePolicy {
-    /// Recreate every active weak-want marker without promoting its target.
+pub enum WantRewritePolicy {
+    /// Recreate every active want marker without promoting its target.
     Preserve,
-    /// Omit weak-want markers from the destination.
+    /// Omit want markers from the destination.
     Drop,
 }
 
@@ -2272,8 +2266,8 @@ pub struct PileRewriteStats {
     pub retained_blobs: usize,
     /// Number of active legacy strong-pin mappings recreated.
     pub strong_pins: usize,
-    /// Number of weak-want markers recreated.
-    pub weak_wants: usize,
+    /// Number of want markers recreated.
+    pub wants: usize,
 }
 
 /// Failure while copying one policy-selected pile state into another pile.
@@ -2292,8 +2286,8 @@ pub enum PileRewriteError {
         /// Head already present in the destination.
         current: Option<Inline<Handle<SimpleArchive>>>,
     },
-    /// A preserved weak-want marker could not be appended.
-    WeakWant(PileWriteError),
+    /// A preserved want marker could not be appended.
+    Want(PileWriteError),
     /// An immutable collection-algebra record could not be appended.
     Collection(CollectionInsertError),
     /// The completed destination state could not be made durable.
@@ -2310,7 +2304,7 @@ impl std::fmt::Display for PileRewriteError {
                 f,
                 "destination has conflicting strong pin {id:X} at {current:?}"
             ),
-            Self::WeakWant(error) => write!(f, "failed to recreate a weak want: {error}"),
+            Self::Want(error) => write!(f, "failed to recreate a want: {error}"),
             Self::Collection(error) => {
                 write!(f, "failed to preserve a collection record: {error}")
             }
@@ -2324,7 +2318,7 @@ impl Error for PileRewriteError {
         match self {
             Self::Source(error) => Some(error),
             Self::Transfer(error) => Some(error),
-            Self::StrongPin(error) | Self::WeakWant(error) => Some(error),
+            Self::StrongPin(error) | Self::Want(error) => Some(error),
             Self::Collection(error) => Some(error),
             Self::Flush(error) => Some(error),
             Self::StrongPinConflict { .. } => None,
@@ -2344,7 +2338,7 @@ impl Pile {
     /// and branch models to coexist during migration.
     ///
     /// The source is refreshed once; blobs, strong pins, collection records,
-    /// and weak wants are then taken from that coherent applied-prefix
+    /// and wants are then taken from that coherent applied-prefix
     /// snapshot. Native commits retain their data and metadata recursively;
     /// merge and derive records are algebraic evidence rather than ownership
     /// edges. The destination may already contain identical blobs, records,
@@ -2357,12 +2351,12 @@ impl Pile {
         &mut self,
         destination: &mut Pile,
         explicit: &super::RetentionRoots,
-        weak_wants: WeakWantRewritePolicy,
+        wants: WantRewritePolicy,
     ) -> Result<PileRewriteStats, PileRewriteError> {
         let reader = self.reader().map_err(PileRewriteError::Source)?;
         let strong_pins = self.branches.clone();
         let collection_records = self.collection_records.clone();
-        let source_weak_wants = self.weak_pins.clone();
+        let source_wants = self.wants.clone();
 
         let mut roots = explicit.clone();
         for raw in &strong_pins {
@@ -2407,13 +2401,13 @@ impl Pile {
                 .map_err(PileRewriteError::Collection)?;
         }
 
-        let mut preserved_weak_wants = 0usize;
-        if weak_wants == WeakWantRewritePolicy::Preserve {
-            for raw in source_weak_wants.into_iter_ordered() {
+        let mut preserved_wants = 0usize;
+        if wants == WantRewritePolicy::Preserve {
+            for raw in source_wants.into_iter_ordered() {
                 destination
-                    .pin_weak(Inline::<Handle<UnknownBlob>>::new(raw))
-                    .map_err(PileRewriteError::WeakWant)?;
-                preserved_weak_wants += 1;
+                    .want(Inline::<Handle<UnknownBlob>>::new(raw))
+                    .map_err(PileRewriteError::Want)?;
+                preserved_wants += 1;
             }
         }
 
@@ -2421,7 +2415,7 @@ impl Pile {
         Ok(PileRewriteStats {
             retained_blobs,
             strong_pins: strong_pins.len() as usize,
-            weak_wants: preserved_weak_wants,
+            wants: preserved_wants,
         })
     }
 }
@@ -2636,7 +2630,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_rewrite_composes_explicit_roots_strong_pins_and_weak_wants() {
+    fn retained_rewrite_composes_explicit_roots_strong_pins_and_wants() {
         let dir = tempfile::tempdir().unwrap();
         let source_path = fresh_empty_pile_path(&dir, "source.pile");
         let destination_path = fresh_empty_pile_path(&dir, "destination.pile");
@@ -2670,10 +2664,10 @@ mod tests {
         let collection_record = source
             .put::<UnknownBlob, _>(Bytes::from_source(obsolete_input.raw.to_vec()))
             .unwrap();
-        let weak_target = source
-            .put::<UnknownBlob, _>(Bytes::from_source(b"weak target".to_vec()))
+        let want_target = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"want target".to_vec()))
             .unwrap();
-        source.pin_weak(weak_target).unwrap();
+        source.want(want_target).unwrap();
         let orphan = source
             .put::<UnknownBlob, _>(Bytes::from_source(b"orphan".to_vec()))
             .unwrap();
@@ -2686,14 +2680,14 @@ mod tests {
         explicit.retain_direct(collection_record);
 
         let stats = source
-            .rewrite_retained_into(&mut destination, &explicit, WeakWantRewritePolicy::Preserve)
+            .rewrite_retained_into(&mut destination, &explicit, WantRewritePolicy::Preserve)
             .unwrap();
         assert_eq!(
             stats,
             PileRewriteStats {
                 retained_blobs: 5,
                 strong_pins: 1,
-                weak_wants: 1,
+                wants: 1,
             }
         );
 
@@ -2707,17 +2701,17 @@ mod tests {
         ] {
             assert!(reader.get::<Blob<UnknownBlob>, _>(retained).is_ok());
         }
-        for collected in [obsolete_input, weak_target, orphan] {
+        for collected in [obsolete_input, want_target, orphan] {
             assert!(reader.get::<Blob<UnknownBlob>, _>(collected).is_err());
         }
         assert_eq!(destination.head(pin_id).unwrap(), Some(legacy_head));
         assert_eq!(
             destination
-                .weak_pins()
+                .wants()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
-            vec![weak_target]
+            vec![want_target]
         );
 
         drop(reader);
@@ -2783,7 +2777,7 @@ mod tests {
             .rewrite_retained_into(
                 &mut destination,
                 &RetentionRoots::new(),
-                WeakWantRewritePolicy::Drop,
+                WantRewritePolicy::Drop,
             )
             .unwrap();
         assert_eq!(stats.retained_blobs, 3);
@@ -3537,13 +3531,13 @@ mod tests {
             .unwrap();
         assert!(!writer.dirty);
 
-        writer.pin_weak(handle).unwrap();
+        writer.want(handle).unwrap();
         assert!(writer.dirty);
         writer.flush().unwrap();
         assert!(!writer.dirty);
-        writer.pin_weak(handle).unwrap();
+        writer.want(handle).unwrap();
         assert!(!writer.dirty);
-        writer.unpin_weak(handle).unwrap();
+        writer.unwant(handle).unwrap();
         assert!(writer.dirty);
         writer.flush().unwrap();
         assert!(!writer.dirty);
@@ -4143,30 +4137,30 @@ mod tests {
         pile.close().unwrap();
     }
 
-    /// Durable weak pins: a weak-pin record survives close + reopen — the
-    /// scan rebuilds the LWW-resolved weak set from the on-disk markers.
+    /// Durable wants survive close + reopen; the scan rebuilds the
+    /// LWW-resolved set from the legacy on-disk markers.
     #[test]
-    fn weak_pin_survives_reopen() {
+    fn want_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "pile.pile");
 
-        // A weak pin is a want — the blob need not exist in the pile.
+        // A want may name a blob that is not present in the pile.
         let wanted: Inline<Handle<UnknownBlob>> =
             Blob::<UnknownBlob>::new(Bytes::from_source(vec![7u8; 21])).get_handle();
 
         let mut pile: Pile = Pile::open(&path).unwrap();
-        pile.pin_weak(wanted).unwrap();
-        let pinned: HashSet<_> = pile.weak_pins().unwrap().map(|r| r.unwrap()).collect();
+        pile.want(wanted).unwrap();
+        let pinned: HashSet<_> = pile.wants().unwrap().map(|r| r.unwrap()).collect();
         assert!(pinned.contains(&wanted));
         pile.close().unwrap();
 
         let mut reopened: Pile = Pile::open(&path).unwrap();
         reopened.amputate().unwrap();
-        let pinned: HashSet<_> = reopened.weak_pins().unwrap().map(|r| r.unwrap()).collect();
+        let pinned: HashSet<_> = reopened.wants().unwrap().map(|r| r.unwrap()).collect();
         assert_eq!(pinned.len(), 1);
         assert!(
             pinned.contains(&wanted),
-            "weak pin lost across reopen — restart amnesia"
+            "want lost across reopen — restart amnesia"
         );
         reopened.close().unwrap();
     }
@@ -4174,7 +4168,7 @@ mod tests {
     /// LWW by log position: the last marker for a handle wins, both live and
     /// across a fresh scan of the on-disk record sequence.
     #[test]
-    fn weak_pin_lww_last_writer_wins() {
+    fn want_lww_last_writer_wins() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "pile.pile");
 
@@ -4185,14 +4179,14 @@ mod tests {
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         // a: pin, unpin, pin — three real records; last writer says pinned.
-        pile.pin_weak(a).unwrap();
-        pile.unpin_weak(a).unwrap();
-        pile.pin_weak(a).unwrap();
+        pile.want(a).unwrap();
+        pile.unwant(a).unwrap();
+        pile.want(a).unwrap();
         // b: pin then unpin — last writer says unpinned.
-        pile.pin_weak(b).unwrap();
-        pile.unpin_weak(b).unwrap();
+        pile.want(b).unwrap();
+        pile.unwant(b).unwrap();
 
-        let pinned: HashSet<_> = pile.weak_pins().unwrap().map(|r| r.unwrap()).collect();
+        let pinned: HashSet<_> = pile.wants().unwrap().map(|r| r.unwrap()).collect();
         assert!(pinned.contains(&a));
         assert!(!pinned.contains(&b));
         pile.close().unwrap();
@@ -4200,17 +4194,17 @@ mod tests {
         // The same resolution must fall out of a fresh log replay.
         let mut reopened: Pile = Pile::open(&path).unwrap();
         reopened.amputate().unwrap();
-        let pinned: HashSet<_> = reopened.weak_pins().unwrap().map(|r| r.unwrap()).collect();
+        let pinned: HashSet<_> = reopened.wants().unwrap().map(|r| r.unwrap()).collect();
         assert_eq!(pinned.len(), 1);
         assert!(pinned.contains(&a));
         assert!(!pinned.contains(&b));
         reopened.close().unwrap();
     }
 
-    /// Re-asserting the current weak state is a no-op append (mirrors the
+    /// Re-asserting the current want state is a no-op append (mirrors the
     /// branch-update no-op rule): the LWW cell carries no new information.
     #[test]
-    fn weak_pin_noop_does_not_grow_file() {
+    fn want_noop_does_not_grow_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "pile.pile");
 
@@ -4219,21 +4213,21 @@ mod tests {
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         // Unpinning a never-pinned handle records nothing.
-        pile.unpin_weak(h).unwrap();
+        pile.unwant(h).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
 
-        pile.pin_weak(h).unwrap();
+        pile.want(h).unwrap();
         let len_after_pin = std::fs::metadata(&path).unwrap().len();
         assert_eq!(len_after_pin, V3_HEADER_LEN as u64);
 
-        pile.pin_weak(h).unwrap();
+        pile.want(h).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), len_after_pin);
         pile.close().unwrap();
     }
 
-    /// Mixed pile: a legacy V1 blob, V3 blobs, branch records, and weak
+    /// Mixed pile: a legacy V1 blob, V3 blobs, branch records, and want
     /// markers interleaved — the scan walks every record kind cleanly and
-    /// each index (blobs, branches, weak pins) resolves correctly.
+    /// each index (blobs, branches, wants) resolves correctly.
     #[test]
     fn mixed_v1_v3_branch_and_weak_markers_interleave() {
         let dir = tempfile::tempdir().unwrap();
@@ -4268,13 +4262,13 @@ mod tests {
 
         // Interleave: weak-pin, V3 blob, branch head, weak-pin + weak-unpin,
         // another V3 blob.
-        pile.pin_weak(want).unwrap();
+        pile.want(want).unwrap();
         let d1 = vec![1u8; 300];
         let b1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(d1.clone()));
         let h1 = pile.put::<UnknownBlob, _>(b1).unwrap();
         pile.update(branch_id, None, Some(h1.transmute())).unwrap();
-        pile.pin_weak(retracted).unwrap();
-        pile.unpin_weak(retracted).unwrap();
+        pile.want(retracted).unwrap();
+        pile.unwant(retracted).unwrap();
         let d2 = vec![2u8; 77];
         let b2: Blob<UnknownBlob> = Blob::new(Bytes::from_source(d2.clone()));
         let h2 = pile.put::<UnknownBlob, _>(b2).unwrap();
@@ -4295,7 +4289,7 @@ mod tests {
 
         assert_eq!(pile.head(branch_id).unwrap(), Some(h1.transmute()));
 
-        let pinned: HashSet<_> = pile.weak_pins().unwrap().map(|r| r.unwrap()).collect();
+        let pinned: HashSet<_> = pile.wants().unwrap().map(|r| r.unwrap()).collect();
         assert_eq!(pinned.len(), 1);
         assert!(pinned.contains(&want));
         assert!(!pinned.contains(&retracted));
@@ -4339,8 +4333,8 @@ mod tests {
         let b1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(d1.clone()));
         let h1 = pile.put::<UnknownBlob, _>(b1).unwrap();
         pile.update(branch_id, None, Some(h1.transmute())).unwrap();
-        pile.pin_weak(want).unwrap();
-        pile.unpin_weak(want).unwrap();
+        pile.want(want).unwrap();
+        pile.unwant(want).unwrap();
         pile.update(branch_id, Some(h1.transmute()), None).unwrap();
         pile.close().unwrap();
 
