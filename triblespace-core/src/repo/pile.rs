@@ -2575,14 +2575,18 @@ impl Pile {
     ///
     /// The source is refreshed once; blobs, strong pins, local cells,
     /// collection records, and wants are then taken from that coherent applied-prefix
-    /// snapshot. Native commits retain their data and metadata recursively;
-    /// merge and derive records are algebraic evidence rather than ownership
-    /// edges. The destination may already contain identical blobs, records,
-    /// and strong-pin mappings, making retries idempotent, but a differently
-    /// mapped pin or intrinsic-record collision is an error. Missing or invalid
-    /// selected blobs fail the rewrite rather than silently producing a partial
-    /// destination. One final flush makes blobs and records durable in append
-    /// order.
+    /// snapshot. Strictly verified native commits retain their resident data
+    /// and metadata recursively; an invalid commit authenticates none of its
+    /// fields. A valid commit whose dependency is not resident is still copied
+    /// as durable ground truth, but the absent dependency is not manufactured
+    /// into a transfer root. Later synchronization may satisfy it. Merge and
+    /// derive records are algebraic evidence rather than ownership edges. The
+    /// destination may already contain identical blobs, records, and strong-pin
+    /// mappings, making retries idempotent, but a differently mapped pin or
+    /// intrinsic-record collision is an error. Missing or invalid explicitly
+    /// selected blobs still fail the rewrite rather than silently weakening the
+    /// caller's retention policy. One final flush makes blobs and records
+    /// durable in append order.
     pub fn rewrite_retained_into(
         &mut self,
         destination: &mut Pile,
@@ -2610,9 +2614,32 @@ impl Pile {
             roots.retain_recursive(value);
         }
         for record in collection_records.values() {
-            if let CollectionRecord::Commit(commit) = record {
-                roots.retain_recursive(Inline::<Handle<UnknownBlob>>::new(commit.data().raw));
-                roots.retain_recursive(commit.metadata());
+            let CollectionRecord::Commit(commit) = record else {
+                continue;
+            };
+            if commit.verify_strict().is_err() {
+                // Structural decoding is deliberately weaker than authority:
+                // preserve the immutable record below for diagnostics and
+                // future replication, but let none of its attacker-controlled
+                // fields affect local lifetime.
+                continue;
+            }
+
+            // Unlike explicit policy roots, native COMMIT dependencies may be
+            // absent on a partially synchronized node. Observe only this
+            // coherent reader snapshot; do not issue a demand read, and do not
+            // turn absence into a root which would make every later rewrite
+            // fail. `reachable` already applies the same resident-only rule to
+            // recursive descendants.
+            let data = Inline::<Handle<UnknownBlob>>::new(commit.data().raw);
+            let metadata = commit.metadata().transmute();
+            for handle in [data, metadata] {
+                if reader
+                    .contains_blob(handle)
+                    .expect("PileReader residency lookup is infallible")
+                {
+                    roots.retain_recursive(handle);
+                }
             }
         }
         let keep = roots.expanded(&reader);
@@ -2757,6 +2784,22 @@ mod tests {
     fn sorted_collection_records(mut records: Vec<CollectionRecord>) -> Vec<CollectionRecord> {
         records.sort_by_key(CollectionRecord::id);
         records
+    }
+
+    fn invalidate_collection_commit(commit: CollectionCommit) -> CollectionCommit {
+        let (signature_r, signature_s) = commit.signature();
+        let mut forged_r = signature_r.raw;
+        forged_r[0] ^= 1;
+        let forged = CollectionCommit::from_parts(
+            commit.collection(),
+            commit.data(),
+            commit.metadata(),
+            commit.public_key(),
+            Inline::new(forged_r),
+            signature_s,
+        );
+        assert!(forged.verify_strict().is_err());
+        forged
     }
 
     #[test]
@@ -3002,6 +3045,160 @@ mod tests {
     }
 
     #[test]
+    fn retained_rewrite_ignores_invalid_commit_owned_resident_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "invalid-commit-source.pile");
+        let destination_path = fresh_empty_pile_path(&dir, "invalid-commit-destination.pile");
+        let mut source = Pile::open(&source_path).unwrap();
+        let mut destination = Pile::open(&destination_path).unwrap();
+
+        let forged_data = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"forged ownership data".to_vec()))
+            .unwrap();
+        let metadata_facts: TribleSet = entity! {
+            crate::metadata::tag: collection_test_id(20)
+        }
+        .into();
+        let forged_metadata = source
+            .put::<SimpleArchive, _>(metadata_facts.to_blob())
+            .unwrap();
+        let definition = CollectionDefinition::new(
+            collection_test_id(21),
+            collection_test_id(22),
+            collection_test_id(23),
+        );
+        let invalid = invalidate_collection_commit(CollectionCommit::sign(
+            &SigningKey::from_bytes(&[24; 32]),
+            definition.id(),
+            Inline::<Hash<Blake3>>::new(forged_data.raw),
+            forged_metadata,
+        ));
+        let records = vec![
+            CollectionRecord::Definition(definition),
+            CollectionRecord::Commit(invalid),
+        ];
+        for record in records.iter().copied() {
+            source.insert(record).unwrap();
+        }
+        source.flush().unwrap();
+
+        let stats = source
+            .rewrite_retained_into(
+                &mut destination,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+            )
+            .unwrap();
+        assert_eq!(stats.retained_blobs, 0);
+        assert_eq!(
+            destination
+                .records()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            sorted_collection_records(records),
+        );
+
+        let reader = destination.reader().unwrap();
+        assert!(matches!(
+            reader.get::<Blob<UnknownBlob>, _>(forged_data),
+            Err(GetBlobError::BlobNotFound)
+        ));
+        assert!(matches!(
+            reader.get::<Blob<SimpleArchive>, _>(forged_metadata),
+            Err(GetBlobError::BlobNotFound)
+        ));
+
+        drop(reader);
+        destination.close().unwrap();
+        source.close().unwrap();
+    }
+
+    #[test]
+    fn retained_rewrite_preserves_valid_dangling_commit_without_demanding_dependencies() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "dangling-commit-source.pile");
+        let destination_path = fresh_empty_pile_path(&dir, "dangling-commit-destination.pile");
+        let mut source = Pile::open(&source_path).unwrap();
+        let mut destination = Pile::open(&destination_path).unwrap();
+
+        let definition = CollectionDefinition::new(
+            collection_test_id(25),
+            collection_test_id(26),
+            collection_test_id(27),
+        );
+        let missing_data = collection_test_hash(28);
+        let missing_metadata = Inline::<Handle<SimpleArchive>>::new([29; 32]);
+        let commit = CollectionCommit::sign(
+            &SigningKey::from_bytes(&[30; 32]),
+            definition.id(),
+            missing_data,
+            missing_metadata,
+        );
+        commit.verify_strict().unwrap();
+        let records = vec![
+            CollectionRecord::Definition(definition),
+            CollectionRecord::Commit(commit),
+        ];
+        for record in records.iter().copied() {
+            source.insert(record).unwrap();
+        }
+        source.flush().unwrap();
+
+        let stats = source
+            .rewrite_retained_into(
+                &mut destination,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+            )
+            .unwrap();
+        assert_eq!(stats.retained_blobs, 0);
+        assert_eq!(
+            destination
+                .records()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            sorted_collection_records(records),
+        );
+
+        let reader = destination.reader().unwrap();
+        assert!(!reader
+            .contains_blob(Handle::<UnknownBlob>::from_hash(missing_data))
+            .unwrap());
+        assert!(!reader.contains_blob(missing_metadata).unwrap());
+
+        drop(reader);
+        destination.close().unwrap();
+        source.close().unwrap();
+    }
+
+    #[test]
+    fn retained_rewrite_still_fails_loud_for_missing_explicit_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "missing-explicit-source.pile");
+        let destination_path = fresh_empty_pile_path(&dir, "missing-explicit-destination.pile");
+        let mut source = Pile::open(&source_path).unwrap();
+        let mut destination = Pile::open(&destination_path).unwrap();
+        let missing = Inline::<Handle<UnknownBlob>>::new([31; 32]);
+        let mut explicit = RetentionRoots::new();
+        explicit.retain_recursive(missing);
+
+        let error = source
+            .rewrite_retained_into(&mut destination, &explicit, WantRewritePolicy::Drop)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PileRewriteError::Transfer(crate::repo::TransferError::Load(
+                GetBlobError::BlobNotFound
+            ))
+        ));
+
+        destination.close().unwrap();
+        source.close().unwrap();
+    }
+
+    #[test]
     fn retained_rewrite_preserves_native_records_and_commit_owned_blobs() {
         let dir = tempfile::tempdir().unwrap();
         let source_path = fresh_empty_pile_path(&dir, "collection-source.pile");
@@ -3029,14 +3226,16 @@ mod tests {
             collection_test_id(12),
         );
         let key = SigningKey::from_bytes(&[13; 32]);
+        let commit = CollectionCommit::sign(
+            &key,
+            definition.id(),
+            Inline::<Hash<Blake3>>::new(data.raw),
+            metadata,
+        );
+        commit.verify_strict().unwrap();
         let records = vec![
             CollectionRecord::Definition(definition),
-            CollectionRecord::Commit(CollectionCommit::sign(
-                &key,
-                definition.id(),
-                Inline::<Hash<Blake3>>::new(data.raw),
-                metadata,
-            )),
+            CollectionRecord::Commit(commit),
             CollectionRecord::Merge(CollectionMerge::new(
                 definition.id(),
                 collection_test_hash(14),

@@ -112,9 +112,9 @@ where
 /// The returned roots are a pure result, not a persisted retained-scope
 /// registry. A collector must rediscover, authorize, resolve, and plan again on
 /// each later pass. Ordinary rewrites remain conservative and preserve every
-/// native record plus every COMMIT-owned blob; applying this narrower plan is
-/// an explicit local forgetting operation, never an implicit publication side
-/// effect.
+/// native record plus the resident closure owned by every strictly verified
+/// `COMMIT`; applying this narrower authorized plan is an explicit local
+/// forgetting operation, never an implicit publication side effect.
 pub fn plan_collection_retention<D, R>(
     records: &DiscoveredCollectionRecords,
     resolution: &CollectionResolution<D>,

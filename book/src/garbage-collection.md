@@ -59,9 +59,18 @@ collections that are retained.
 The resulting roots compose with both storage paths. Yard's `collect` and
 `compact` require them as explicit policy roots; callers pass an empty
 `RetentionRoots` deliberately when legacy strong pins are the only strong
-roots. `Pile::rewrite_retained_into` copies the selected state into
-another append-only pile and also recursively retains and recreates every active
-legacy strong-pin mapping, which allows pinned branches and collection scopes to
+roots. Both Yard collection and `Pile::rewrite_retained_into` strictly verify a
+native `COMMIT` signature before its fields can add implicit roots. They
+preserve every immutable record, including invalid and partially synchronized
+records, but recursively retain only dependencies named by valid commits which
+are resident in the relevant Pile snapshot or live in the Yard. An absent
+dependency therefore remains available for later synchronization instead of
+permanently poisoning local retention. Caller-supplied `RetentionRoots` keep
+their existing backend semantics; in particular, a retained Pile rewrite still
+fails loud when an explicitly selected blob is absent.
+
+The Pile rewrite also recursively retains and recreates every active legacy
+strong-pin mapping, which allows pinned branches and collection scopes to
 coexist during migration. Current `LocalCellStore` values are also recursive
 local roots and are recreated by retained pile rewrites. That keeps operational
 policy alive without granting collection authority or exposing a branch to

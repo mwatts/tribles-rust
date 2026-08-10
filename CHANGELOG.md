@@ -969,6 +969,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Pile and Yard retention now authenticate native commit ownership before
+  rooting blobs.** A structurally decodable but invalidly signed `COMMIT`
+  remains preserved as an immutable collection record, while none of its
+  attacker-controlled data or metadata fields affect retention. Valid commits
+  recursively retain only dependencies resident in the rewrite's coherent
+  source snapshot or live in the Yard, so partially synchronized dangling
+  commits remain available for later synchronization without poisoning local
+  retention. Caller-supplied `RetentionRoots`, strong pins, and local cells
+  retain their existing backend-specific missing-data behavior.
+
 - **Index recipes ignore blobs carried only by their schema metafacts.** Recipe
   validation still rejects blob-backed descriptor facts, but automatic
   `entity!` attribute descriptions no longer make an otherwise inline,

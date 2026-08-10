@@ -396,10 +396,12 @@ impl Yard {
     /// The supplied roots are strong for this pass. Direct roots retain only
     /// themselves; recursive roots retain their resident descendants. Callers
     /// must supply the same policy on every later collection pass for the
-    /// corresponding data to remain live. Native collection commits always
-    /// add their data and metadata as recursive roots; unsigned equations do
-    /// not. Pass an empty [`RetentionRoots`] explicitly when those commits and
-    /// legacy strong pins are the only desired strong roots.
+    /// corresponding data to remain live. Strictly verified native collection
+    /// commits add their resident data and metadata as recursive roots;
+    /// invalid commits authenticate nothing, dangling dependencies remain for
+    /// later synchronization, and unsigned equations add no roots. Pass an
+    /// empty [`RetentionRoots`] explicitly when those commits and legacy strong
+    /// pins are the only desired strong roots.
     pub fn collect(&mut self, retention: &RetentionRoots) -> Result<(), YardCollectError> {
         let retention = self
             .retention_with_native_commits(retention)
@@ -585,9 +587,12 @@ impl Yard {
         self.config.strong_level_budget.saturating_mul(multiplier)
     }
 
-    /// Add the ownership edges carried by every structurally valid native
-    /// commit. Commit data and metadata are strong recursive roots; unsigned
-    /// merge/derive equations are evidence only and never own their inputs.
+    /// Add the resident ownership edges carried by strictly verified native
+    /// commits. Invalid signatures authenticate no fields. A valid commit is
+    /// preserved as a native record even when one of its dependencies is not
+    /// live locally, but only live data and metadata become recursive roots;
+    /// unsigned merge/derive equations are evidence only and never own their
+    /// inputs.
     fn retention_with_native_commits(
         &mut self,
         retention: &RetentionRoots,
@@ -595,10 +600,27 @@ impl Yard {
         self.refresh_cells()
             .map_err(YardCollectionRecordsError::Pile)?;
         let mut combined = retention.clone();
-        for result in self.records()? {
-            if let CollectionRecord::Commit(commit) = result? {
-                combined.retain_recursive(Inline::<Handle<UnknownBlob>>::new(commit.data().raw));
-                combined.retain_recursive(commit.metadata());
+        let records = self.records()?.collect::<Result<Vec<_>, _>>()?;
+        for record in records {
+            let CollectionRecord::Commit(commit) = record else {
+                continue;
+            };
+            if commit.verify_strict().is_err() {
+                continue;
+            }
+
+            let data = Inline::<Handle<UnknownBlob>>::new(commit.data().raw);
+            let metadata = commit.metadata().transmute();
+            for handle in [data, metadata] {
+                let live = self.generations.iter().any(|generation| {
+                    generation
+                        .segments
+                        .iter()
+                        .any(|segment| segment.live.get(&handle.raw).is_some())
+                });
+                if live {
+                    combined.retain_recursive(handle);
+                }
             }
         }
         for raw in &self.cells {
@@ -1423,6 +1445,22 @@ mod tests {
         Id::new([byte; 16]).unwrap()
     }
 
+    fn invalidate_collection_commit(commit: CollectionCommit) -> CollectionCommit {
+        let (signature_r, signature_s) = commit.signature();
+        let mut forged_r = signature_r.raw;
+        forged_r[0] ^= 1;
+        let forged = CollectionCommit::from_parts(
+            commit.collection(),
+            commit.data(),
+            commit.metadata(),
+            commit.public_key(),
+            Inline::new(forged_r),
+            signature_s,
+        );
+        assert!(forged.verify_strict().is_err());
+        forged
+    }
+
     fn get_raw(
         reader: &YardReader,
         handle: Inline<Handle<RawBytes>>,
@@ -1547,14 +1585,11 @@ mod tests {
 
         let definition = CollectionDefinition::new(pin_id(31), pin_id(32), pin_id(33));
         let key = SigningKey::from_bytes(&[34; 32]);
+        let commit = CollectionCommit::sign(&key, definition.id(), Inline::new(data.raw), metadata);
+        commit.verify_strict().unwrap();
         let records = vec![
             CollectionRecord::Definition(definition),
-            CollectionRecord::Commit(CollectionCommit::sign(
-                &key,
-                definition.id(),
-                Inline::new(data.raw),
-                metadata,
-            )),
+            CollectionRecord::Commit(commit),
             CollectionRecord::Merge(CollectionMerge::new(
                 definition.id(),
                 Inline::new(equation_only.raw),
@@ -1589,6 +1624,84 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
+        let mut expected = records;
+        expected.sort_by_key(CollectionRecord::id);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn invalid_native_commit_cannot_keep_resident_yard_blobs_live() {
+        let (dir, mut yard) = yard_with(1, YardConfig::default());
+        let forged_data = yard
+            .put::<RawBytes, _>(raw_blob(b"invalid commit data"))
+            .unwrap();
+        let forged_metadata = yard
+            .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+            .unwrap();
+        let definition = CollectionDefinition::new(pin_id(38), pin_id(39), pin_id(40));
+        let invalid = invalidate_collection_commit(CollectionCommit::sign(
+            &SigningKey::from_bytes(&[41; 32]),
+            definition.id(),
+            Inline::new(forged_data.raw),
+            forged_metadata,
+        ));
+        let records = vec![
+            CollectionRecord::Definition(definition),
+            CollectionRecord::Commit(invalid),
+        ];
+        for record in records.iter().copied() {
+            yard.insert(record).unwrap();
+        }
+
+        yard.collect(&RetentionRoots::new()).unwrap();
+        let reader = yard.reader().unwrap();
+        assert!(!reader.contains_blob(forged_data).unwrap());
+        assert!(!reader.contains_blob(forged_metadata).unwrap());
+        drop(reader);
+
+        yard.reclaim().unwrap();
+        assert_eq!(pile_blob_count(&dir.path().join("gen-0.pile")), 0);
+        let mut actual = yard
+            .records()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        actual.sort_by_key(CollectionRecord::id);
+        let mut expected = records;
+        expected.sort_by_key(CollectionRecord::id);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn valid_dangling_native_commit_survives_yard_collection_and_reclaim() {
+        let (dir, mut yard) = yard_with(1, YardConfig::default());
+        let definition = CollectionDefinition::new(pin_id(42), pin_id(43), pin_id(44));
+        let missing_data = Inline::new([45; 32]);
+        let missing_metadata = Inline::<Handle<SimpleArchive>>::new([46; 32]);
+        let commit = CollectionCommit::sign(
+            &SigningKey::from_bytes(&[47; 32]),
+            definition.id(),
+            missing_data,
+            missing_metadata,
+        );
+        commit.verify_strict().unwrap();
+        let records = vec![
+            CollectionRecord::Definition(definition),
+            CollectionRecord::Commit(commit),
+        ];
+        for record in records.iter().copied() {
+            yard.insert(record).unwrap();
+        }
+
+        yard.collect(&RetentionRoots::new()).unwrap();
+        yard.reclaim().unwrap();
+        assert_eq!(pile_blob_count(&dir.path().join("gen-0.pile")), 0);
+        let mut actual = yard
+            .records()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        actual.sort_by_key(CollectionRecord::id);
         let mut expected = records;
         expected.sort_by_key(CollectionRecord::id);
         assert_eq!(actual, expected);
