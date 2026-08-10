@@ -87,10 +87,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("create branch");
     let mut ws = repo.pull(*branch_id).expect("pull workspace");
 
-    // The entity! macro returns a Fragment carrying both facts and any
-    // blob payloads it auto-put while building. Accumulate into another
-    // Fragment with `+=` so blobs flow through into the commit; commit
-    // accepts anything `Into<Fragment>`.
+    // The entity! macro returns a Fragment carrying facts, descriptions of
+    // the attributes actually used, and one blob store shared by both sets.
+    // Accumulate into another Fragment with `+=` so every channel composes.
     let herbert = ufoid();
     let dune = ufoid();
     let mut library = Fragment::empty();
@@ -106,6 +105,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         literature::quote: "I must not fear. Fear is the mind-killer.",
     };
 
+    // This introductory repository API is legacy: Workspace::commit archives
+    // the content facts and blobs but not Fragment::metafacts. New collection
+    // code passes the Fragment directly to publish_fragment_commit, which
+    // archives facts as data and metafacts as metadata.
     ws.commit(library, "import dune");
 
     // `checkout(..)` returns a Checkout — a TribleSet paired with the

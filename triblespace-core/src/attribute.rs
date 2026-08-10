@@ -26,20 +26,23 @@
 //! ```ignore
 //! // Display-name origin (JSON fields, config keys, column headers):
 //! Attribute::<S>::from_fragment_unchecked(entity! {
-//!     metadata::name:         name.to_blob().get_handle(),
+//!     metadata::name: name.to_owned(),
 //!     metadata::value_encoding: <S as MetaDescribe>::id(),
+//!     metadata::tag: metadata::KIND_ATTRIBUTE,
 //! })
 //!
 //! // RDF / JSON-LD predicate (IRI as canonical identifier):
 //! Attribute::<S>::from_fragment_unchecked(entity! {
-//!     metadata::iri:          iri.to_blob().get_handle(),
+//!     metadata::iri: iri.to_owned(),
 //!     metadata::value_encoding: <S as MetaDescribe>::id(),
+//!     metadata::tag: metadata::KIND_ATTRIBUTE,
 //! })
 //!
 //! // Explicit hex id (pinned attribute namespace):
 //! Attribute::<S>::from_fragment_unchecked(entity! {
 //!     ExclusiveId::force_ref(&id) @
 //!         metadata::value_encoding: <S as MetaDescribe>::id(),
+//!         metadata::tag: metadata::KIND_ATTRIBUTE,
 //! })
 //! ```
 
@@ -47,7 +50,78 @@ use crate::id::Id;
 use crate::id::RawId;
 use crate::inline::InlineEncoding;
 use crate::trible::Fragment;
+use core::cell::Cell;
 use core::marker::PhantomData;
+use std::sync::OnceLock;
+
+std::thread_local! {
+    /// Re-entrancy guard for lazily constructing attribute descriptions.
+    ///
+    /// Schema descriptions are themselves expressed with metadata attributes,
+    /// so asking every nested `entity!` to describe its attributes would form
+    /// a cycle. The outermost build owns the complete description; nested
+    /// builds fall back to the attribute's identity fragment.
+    static META_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+struct MetaDepthGuard;
+
+impl MetaDepthGuard {
+    fn enter() -> Option<Self> {
+        META_DEPTH.with(|depth| {
+            if depth.get() > 0 {
+                None
+            } else {
+                depth.set(1);
+                Some(Self)
+            }
+        })
+    }
+}
+
+impl Drop for MetaDepthGuard {
+    fn drop(&mut self) {
+        META_DEPTH.with(|depth| depth.set(0));
+    }
+}
+
+/// Lazily cached description for one attribute declared by `attributes!`.
+///
+/// The builder is deferred because its value encoding may itself be described
+/// with `entity!`. [`AttributeMeta::get`] cuts that recursion at the outermost
+/// description build while retaining a process-wide immutable cache.
+pub struct AttributeMeta {
+    cell: OnceLock<Fragment>,
+    build: fn() -> Fragment,
+}
+
+impl AttributeMeta {
+    pub const fn new(build: fn() -> Fragment) -> Self {
+        Self {
+            cell: OnceLock::new(),
+            build,
+        }
+    }
+
+    /// Returns the cached description, or `None` inside a recursive metadata
+    /// build where the caller should use the attribute's identity fragment.
+    pub fn get(&self) -> Option<&Fragment> {
+        if let Some(fragment) = self.cell.get() {
+            return Some(fragment);
+        }
+        let _guard = MetaDepthGuard::enter()?;
+        let fragment = (self.build)();
+        Some(self.cell.get_or_init(|| fragment))
+    }
+}
+
+impl core::fmt::Debug for AttributeMeta {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AttributeMeta")
+            .field("built", &self.cell.get().is_some())
+            .finish()
+    }
+}
 
 /// A typed reference to an attribute: a rooted [`Fragment`] carrying
 /// the identity-determining facts, tagged with a phantom value-schema
@@ -57,12 +131,29 @@ use core::marker::PhantomData;
 /// read — `entity!{}` codegen calls it once per attribute per fact,
 /// and walking the fragment's exports PATCH each time dominated the
 /// pre-0.40 entities/union benches.
-#[derive(Debug, PartialEq, Eq)]
 pub struct Attribute<S: InlineEncoding> {
     id: Id,
     fragment: Fragment,
+    meta: Option<&'static AttributeMeta>,
     _schema: PhantomData<S>,
 }
+
+impl<S: InlineEncoding> core::fmt::Debug for Attribute<S> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Attribute")
+            .field("id", &self.id)
+            .field("fragment", &self.fragment)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S: InlineEncoding> PartialEq for Attribute<S> {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.fragment == other.fragment
+    }
+}
+
+impl<S: InlineEncoding> Eq for Attribute<S> {}
 
 impl<S: InlineEncoding> Clone for Attribute<S> {
     // Manual impl: `PhantomData<S>` doesn't require `S: Clone`, but
@@ -73,6 +164,7 @@ impl<S: InlineEncoding> Clone for Attribute<S> {
         Self {
             id: self.id,
             fragment: self.fragment.clone(),
+            meta: self.meta,
             _schema: PhantomData,
         }
     }
@@ -113,9 +205,8 @@ impl<S: InlineEncoding + crate::metadata::MetaDescribe> Attribute<S> {
     /// parties agree on — not for a local Rust identifier, which belongs in
     /// usage facts.
     pub fn named(name: &str) -> Self {
-        use crate::blob::IntoBlob;
         Self::from_fragment_unchecked(crate::macros::entity! {
-            crate::metadata::name: name.to_string().to_blob().get_handle(),
+            crate::metadata::name: name.to_owned(),
             crate::metadata::value_encoding: <S as crate::metadata::MetaDescribe>::id(),
             crate::metadata::tag: crate::metadata::KIND_ATTRIBUTE,
         })
@@ -125,9 +216,8 @@ impl<S: InlineEncoding + crate::metadata::MetaDescribe> Attribute<S> {
     ///
     /// Identity is `(iri, S)`.
     pub fn iri(iri: &str) -> Self {
-        use crate::blob::IntoBlob;
         Self::from_fragment_unchecked(crate::macros::entity! {
-            crate::metadata::iri: iri.to_string().to_blob().get_handle(),
+            crate::metadata::iri: iri.to_owned(),
             crate::metadata::value_encoding: <S as crate::metadata::MetaDescribe>::id(),
             crate::metadata::tag: crate::metadata::KIND_ATTRIBUTE,
         })
@@ -148,6 +238,23 @@ impl<S: InlineEncoding> Attribute<S> {
     /// The identity-determining fragment.
     pub fn fragment(&self) -> &Fragment {
         &self.fragment
+    }
+
+    /// Attach the declaration-site description generated by `attributes!`.
+    pub fn with_meta(mut self, meta: &'static AttributeMeta) -> Self {
+        self.meta = Some(meta);
+        self
+    }
+
+    /// Description carried into fragments that use this attribute.
+    ///
+    /// Declared attributes use their cached declaration record. Runtime-minted
+    /// attributes fall back to their identity fragment, which contains the
+    /// IRI/name, value encoding, and any blobs used to derive that identity.
+    pub fn meta(&self) -> &Fragment {
+        self.meta
+            .and_then(AttributeMeta::get)
+            .unwrap_or(&self.fragment)
     }
 
     /// Convert a host value into a typed `Inline<S>` using the Field's schema.
@@ -232,6 +339,7 @@ impl<S: InlineEncoding> Attribute<S> {
         Self {
             id,
             fragment,
+            meta: None,
             _schema: PhantomData,
         }
     }

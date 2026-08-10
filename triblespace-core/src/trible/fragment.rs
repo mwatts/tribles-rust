@@ -21,14 +21,21 @@ use super::TribleSet;
 /// caller as the fragment's interface.
 ///
 /// The embedded blob store is what makes a Fragment *self-contained*:
-/// handles in the facts (e.g. `metadata::name: <Inline<Handle</// LongString>>>`) reference bytes that the fragment carries with
-/// itself. An empty `MemoryBlobStore` is structurally a single
-/// PATCH-root pointer — fragments without blobs pay essentially
-/// zero overhead.
+/// handles in either fact set can reference bytes that the fragment carries
+/// with itself. An empty `MemoryBlobStore` is structurally a single PATCH-root
+/// pointer — fragments without blobs pay essentially zero overhead.
+///
+/// Alongside its content facts, a fragment carries a separate set of
+/// **metafacts** describing the attributes used by that content. Keeping the
+/// two sets separate means ordinary content queries never see schema records,
+/// while publication can archive both halves atomically. One shared blob store
+/// backs handles from either set: content addressing deduplicates equal bytes,
+/// and a fragment remains one indivisible ownership unit.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Fragment {
     exports: PATCH<16>,
     facts: TribleSet,
+    metafacts: TribleSet,
     blobs: MemoryBlobStore,
 }
 
@@ -47,6 +54,7 @@ impl Fragment {
         Self {
             exports,
             facts,
+            metafacts: TribleSet::new(),
             blobs: MemoryBlobStore::new(),
         }
     }
@@ -67,6 +75,7 @@ impl Fragment {
         Self {
             exports: export_set,
             facts,
+            metafacts: TribleSet::new(),
             blobs: MemoryBlobStore::new(),
         }
     }
@@ -79,22 +88,46 @@ impl Fragment {
         Self {
             exports: PATCH::<16>::new(),
             facts,
+            metafacts: TribleSet::new(),
             blobs,
         }
     }
 
-    /// Creates a fragment that exports a single root id, with the given
-    /// facts and blob store. The macro-generated `entity!{}` expansion
-    /// uses this to wrap its accumulated state — facts come from per-
-    /// attribute inserts, blobs come from any `field*: spread_source`
-    /// extras the spread sources carried with them.
+    /// Creates an unrooted fragment from all three carried data channels.
+    ///
+    /// This is the inverse of [`Fragment::into_parts`] minus the exports and is
+    /// primarily useful when composition consumes a fragment's exported ids.
+    pub fn from_parts(facts: TribleSet, metafacts: TribleSet, blobs: MemoryBlobStore) -> Self {
+        Self {
+            exports: PATCH::<16>::new(),
+            facts,
+            metafacts,
+            blobs,
+        }
+    }
+
+    /// Creates a fragment that exports a single root id, with the given facts
+    /// and blob store but no metafacts. Producers that also have descriptions
+    /// should use [`Fragment::rooted_from_parts`].
     pub fn rooted_with_blobs(root: Id, facts: TribleSet, blobs: MemoryBlobStore) -> Self {
+        Self::rooted_from_parts(root, facts, TribleSet::new(), blobs)
+    }
+
+    /// Creates a rooted fragment from content, description, and their shared
+    /// blob store.
+    pub fn rooted_from_parts(
+        root: Id,
+        facts: TribleSet,
+        metafacts: TribleSet,
+        blobs: MemoryBlobStore,
+    ) -> Self {
         let mut exports = PATCH::<16>::new();
         let raw: RawId = root.into();
         exports.insert(&Entry::new(&raw));
         Self {
             exports,
             facts,
+            metafacts,
             blobs,
         }
     }
@@ -147,6 +180,31 @@ impl Fragment {
         &mut self.facts
     }
 
+    /// Returns the schema and other descriptive facts carried alongside the
+    /// content.
+    pub fn metafacts(&self) -> &TribleSet {
+        &self.metafacts
+    }
+
+    /// Mutable access for importers that discover attributes while ingesting
+    /// data.
+    pub fn metafacts_mut(&mut self) -> &mut TribleSet {
+        &mut self.metafacts
+    }
+
+    /// Promotes another fragment into this fragment's description channel.
+    ///
+    /// Both of the description fragment's fact sets become metafacts here;
+    /// its exports are intentionally ignored, and its blobs join the one
+    /// shared store. This is the runtime-schema counterpart to the metadata
+    /// emitted automatically by `entity!`.
+    pub fn describe_with(&mut self, description: Fragment) {
+        let (_, facts, metafacts, blobs) = description.into_parts();
+        self.metafacts += facts;
+        self.metafacts += metafacts;
+        self.blobs.union(blobs);
+    }
+
     /// Borrow the fragment's local blob store.
     pub fn blobs(&self) -> &MemoryBlobStore {
         &self.blobs
@@ -164,15 +222,24 @@ impl Fragment {
         self.facts
     }
 
-    /// Consume the fragment, yielding its facts and blob store. The
-    /// exports are dropped — most callers want facts/blobs together
-    /// without the rooted-id concern.
+    /// Consume the fragment, yielding only its metafacts.
+    pub fn into_metafacts(self) -> TribleSet {
+        self.metafacts
+    }
+
+    /// Consume the fragment, yielding its content facts and shared blob store.
+    ///
+    /// Exports and metafacts are dropped. Because the store is shared, it may
+    /// conservatively include bytes referenced only by the discarded
+    /// metafacts. Use [`Fragment::into_parts`] when publishing both channels.
     pub fn into_facts_and_blobs(self) -> (TribleSet, MemoryBlobStore) {
         (self.facts, self.blobs)
     }
 
-    pub fn into_parts(self) -> (PATCH<16>, TribleSet, MemoryBlobStore) {
-        (self.exports, self.facts, self.blobs)
+    /// Consume the complete fragment into exports, facts, metafacts, and the
+    /// blob store shared by both fact sets.
+    pub fn into_parts(self) -> (PATCH<16>, TribleSet, TribleSet, MemoryBlobStore) {
+        (self.exports, self.facts, self.metafacts, self.blobs)
     }
 }
 
@@ -196,6 +263,7 @@ impl<'a> IntoIterator for &'a Fragment {
 impl AddAssign for Fragment {
     fn add_assign(&mut self, rhs: Self) {
         self.facts += rhs.facts;
+        self.metafacts += rhs.metafacts;
         self.exports.union(rhs.exports);
         self.blobs.union(rhs.blobs);
     }
@@ -241,11 +309,12 @@ impl Add<Fragment> for TribleSet {
     }
 }
 
-/// Lossless promotion: a `TribleSet` becomes a Fragment with no
-/// exported root and an empty blob store. The reverse direction is
-/// intentionally not implemented — going from `Fragment` to
-/// `TribleSet` discards the embedded blob store and exports, so it
-/// has to be explicit (`Fragment::into_facts`).
+/// Promote a bare `TribleSet` into an undescribed fragment.
+///
+/// This remains available for the legacy repository surface while collection
+/// publication migrates to concrete, self-describing `Fragment` values. New
+/// producers should prefer `entity!` or an explicit fragment constructor so
+/// metadata is not omitted accidentally.
 impl From<TribleSet> for Fragment {
     fn from(facts: TribleSet) -> Self {
         Self::from_facts_and_blobs(facts, MemoryBlobStore::new())

@@ -109,13 +109,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   winning key, while ordinary loads never create or silently substitute an
   identity. `trible pile signing-key init` exposes that deliberate provisioning
   step without coupling key creation to an ordinary reader or writer.
-- **Self-contained fragments can be published directly into a collection.**
-  The `SimpleArchive` union kind absorbs every blob embedded by content and
-  metadata `Fragment`s, archives their facts, and places those dependencies
-  behind the existing pre-`COMMIT` durability barrier. Publication first
-  recomputes every embedded byte identity and rejects forged store keys or
-  cached blob handles before writing, so it never normalizes a handle that the
-  fragment's facts may still name.
+- **Fragments now carry their descriptions as first-class metafacts.** A
+  `Fragment` consists of exports, content facts, metafacts, and one
+  content-addressed blob store shared by both fact sets. `entity!` automatically
+  carries the cached description of every attribute that actually emits a fact;
+  optional and repeated fields that emit nothing add nothing. Composition and
+  spread preserve all four channels without making descriptions participate in
+  content-derived entity identity. The `SimpleArchive` collection helper now
+  accepts one fragment, archives its facts as data and its metafacts as metadata,
+  and stages every shared attachment behind the pre-`COMMIT` durability barrier.
+  Publication recomputes embedded byte identities and rejects forged store keys
+  or cached handles before writing.
 - **Canonical collection records can be published with explicit crash-order
   barriers.** The concrete `SimpleArchive` union kind now normalizes and
   validates supplied bytes, flushes definitions and element dependencies

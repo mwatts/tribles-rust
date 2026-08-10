@@ -16,13 +16,13 @@ use triblespace_core::import::ntriples::{ingest_ntriples, uri_to_id_pure, Ingest
 use triblespace_core::import::rdf_uri;
 use triblespace_core::inline::{Inline, TryToInline};
 use triblespace_core::macros::{entity, find, pattern};
-use triblespace_core::metadata::{self, MetaDescribe};
+use triblespace_core::metadata;
 use triblespace_core::prelude::inlineencodings::{self, Handle};
 use triblespace_core::prelude::BlobStore as _;
 use triblespace_core::prelude::BlobStoreGet as _;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::Repository;
-use triblespace_core::trible::TribleSet;
+use triblespace_core::trible::{Fragment, TribleSet};
 
 fn new_repo() -> Repository<MemoryRepo> {
     let signing_key = SigningKey::from_bytes(&[0x11; 32]);
@@ -37,6 +37,24 @@ const NT_SAMPLE: &[u8] = br#"
 <http://example.org/dune> <http://example.org/title> "Dune" .
 "#;
 
+fn undescribed_attributes(fragment: &Fragment) -> Vec<Id> {
+    let used: std::collections::HashSet<Id> =
+        fragment.facts().iter().map(|trible| *trible.a()).collect();
+    used.into_iter()
+        .filter(|attribute| {
+            let attribute = *attribute;
+            find!(
+                (schema: Id),
+                pattern!(fragment.metafacts(), [{
+                    attribute @ metadata::value_encoding: ?schema
+                }])
+            )
+            .next()
+            .is_none()
+        })
+        .collect()
+}
+
 #[test]
 fn ingests_facts_and_roundtrips_via_query() {
     let mut repo = new_repo();
@@ -45,7 +63,7 @@ fn ingests_facts_and_roundtrips_via_query() {
 
     let import = ingest_ntriples(Cursor::new(NT_SAMPLE)).expect("clean ntriples");
     assert_eq!(import.triples, 4, "four non-empty triples in the sample");
-    let facts = import.facts.into_facts();
+    let facts = import.facts.facts().clone();
 
     // `facts` is the faithful graph — no rdf_uri annotations mixed in.
     let uri_in_facts = find!(
@@ -55,21 +73,18 @@ fn ingests_facts_and_roundtrips_via_query() {
     .count();
     assert_eq!(uri_in_facts, 0, "rdf_uri annotations stay out of facts");
 
-    // The URI↔id inverse mapping rides in `meta` instead: the two
+    // The URI↔id inverse mapping rides in `uri_map` instead: the two
     // distinct subject URIs (frank, dune) each appear, and the
     // URI-valued object (dune) is also tagged.
-    let uri_in_meta = find!(
+    let uri_in_map = find!(
         (entity: Id, uri: Inline<Handle<LongString>>),
-        pattern!(import.meta.facts(), [{ ?entity @ rdf_uri: ?uri }])
+        pattern!(import.uri_map.facts(), [{ ?entity @ rdf_uri: ?uri }])
     )
     .count();
-    assert!(uri_in_meta >= 2, "at least frank and dune carry rdf_uri");
+    assert!(uri_in_map >= 2, "at least frank and dune carry rdf_uri");
 
     // The integer literal lands as I256BE under an IRI-rooted attribute.
-    let birthyear = Attribute::<inlineencodings::I256BE>::from(entity! {
-        metadata::iri:          "http://example.org/birthyear".to_blob().get_handle(),
-        metadata::value_encoding: <inlineencodings::I256BE as MetaDescribe>::id(),
-    });
+    let birthyear = Attribute::<inlineencodings::I256BE>::iri("http://example.org/birthyear");
     let (year,) = find!(
         (year: i128),
         pattern!(&facts, [{ _?e @ birthyear: ?year }])
@@ -80,10 +95,7 @@ fn ingests_facts_and_roundtrips_via_query() {
 
     // The string literal lands as Handle<LongString>; we don't pull the blob
     // (the test would need a reader), we just verify the trible exists.
-    let firstname_attr = Attribute::<Handle<LongString>>::from(entity! {
-        metadata::iri:          "http://example.org/firstname".to_blob().get_handle(),
-        metadata::value_encoding: <Handle<LongString> as MetaDescribe>::id(),
-    });
+    let firstname_attr = Attribute::<Handle<LongString>>::iri("http://example.org/firstname");
     let firstname_count = find!(
         (h: Inline<Handle<LongString>>),
         pattern!(&facts, [{ _?e @ firstname_attr: ?h }])
@@ -92,10 +104,7 @@ fn ingests_facts_and_roundtrips_via_query() {
     assert_eq!(firstname_count, 1, "one firstname triple");
 
     // The URI-valued triple lands as a GenId pointing frank → dune.
-    let wrote = Attribute::<inlineencodings::GenId>::from(entity! {
-        metadata::iri:          "http://example.org/wrote".to_blob().get_handle(),
-        metadata::value_encoding: <inlineencodings::GenId as MetaDescribe>::id(),
-    });
+    let wrote = Attribute::<inlineencodings::GenId>::iri("http://example.org/wrote");
     let link_count = find!(
         (src: Id, dst: Id),
         pattern!(&facts, [{ ?src @ wrote: ?dst }])
@@ -104,7 +113,7 @@ fn ingests_facts_and_roundtrips_via_query() {
     assert_eq!(link_count, 1, "one wrote edge");
 
     // Actually commit, to prove the facts are a valid commit payload.
-    ws.commit(facts, "ntriples import");
+    ws.commit(import.facts, "ntriples import");
     repo.push(&mut ws).expect("push succeeds");
 }
 
@@ -122,10 +131,7 @@ fn uri_to_id_is_deterministic_across_workspaces() {
         .facts
         .into_facts();
 
-    let frank_attr = Attribute::<Handle<LongString>>::from(entity! {
-        metadata::iri:          "http://example.org/firstname".to_blob().get_handle(),
-        metadata::value_encoding: <Handle<LongString> as MetaDescribe>::id(),
-    });
+    let frank_attr = Attribute::<Handle<LongString>>::iri("http://example.org/firstname");
     let (frank_a,) = find!(
         (e: Id),
         pattern!(&facts_a, [{ ?e @ frank_attr: _?v }])
@@ -156,10 +162,7 @@ fn xsd_datatypes_map_to_native_schemas() {
     assert_eq!(import.triples, 4);
     let facts = import.facts.into_facts();
 
-    let i_attr = Attribute::<inlineencodings::I256BE>::from(entity! {
-        metadata::iri:          "http://ex/i".to_blob().get_handle(),
-        metadata::value_encoding: <inlineencodings::I256BE as MetaDescribe>::id(),
-    });
+    let i_attr = Attribute::<inlineencodings::I256BE>::iri("http://ex/i");
     let (i_val,) = find!(
         (v: i128),
         pattern!(&facts, [{ _?e @ i_attr: ?v }])
@@ -168,10 +171,7 @@ fn xsd_datatypes_map_to_native_schemas() {
     .unwrap();
     assert_eq!(i_val, 42);
 
-    let u_attr = Attribute::<inlineencodings::U256BE>::from(entity! {
-        metadata::iri:          "http://ex/u".to_blob().get_handle(),
-        metadata::value_encoding: <inlineencodings::U256BE as MetaDescribe>::id(),
-    });
+    let u_attr = Attribute::<inlineencodings::U256BE>::iri("http://ex/u");
     let (u_val,) = find!(
         (v: u128),
         pattern!(&facts, [{ _?e @ u_attr: ?v }])
@@ -180,10 +180,7 @@ fn xsd_datatypes_map_to_native_schemas() {
     .unwrap();
     assert_eq!(u_val, 100);
 
-    let b_attr = Attribute::<inlineencodings::Boolean>::from(entity! {
-        metadata::iri:          "http://ex/b".to_blob().get_handle(),
-        metadata::value_encoding: <inlineencodings::Boolean as MetaDescribe>::id(),
-    });
+    let b_attr = Attribute::<inlineencodings::Boolean>::iri("http://ex/b");
     let (b_val,) = find!(
         (v: bool),
         pattern!(&facts, [{ _?e @ b_attr: ?v }])
@@ -192,10 +189,7 @@ fn xsd_datatypes_map_to_native_schemas() {
     .unwrap();
     assert!(b_val);
 
-    let f_attr = Attribute::<inlineencodings::F64>::from(entity! {
-        metadata::iri:          "http://ex/f".to_blob().get_handle(),
-        metadata::value_encoding: <inlineencodings::F64 as MetaDescribe>::id(),
-    });
+    let f_attr = Attribute::<inlineencodings::F64>::iri("http://ex/f");
     let (f_val,) = find!(
         (v: f64),
         pattern!(&facts, [{ _?e @ f_attr: ?v }])
@@ -225,10 +219,7 @@ fn xsd_temporal_and_binary_types() {
     let facts = import.facts.into_facts();
 
     // dateTime → NsTAIInterval [t, t]
-    let born = Attribute::<NsTAIInterval>::from(entity! {
-        metadata::iri:          "http://ex/born".to_blob().get_handle(),
-        metadata::value_encoding: <NsTAIInterval as MetaDescribe>::id(),
-    });
+    let born = Attribute::<NsTAIInterval>::iri("http://ex/born");
     let born_count = find!(
         (v: Inline<NsTAIInterval>),
         pattern!(&facts, [{ _?e @ born: ?v }])
@@ -237,10 +228,7 @@ fn xsd_temporal_and_binary_types() {
     assert_eq!(born_count, 1, "dateTime stored as NsTAIInterval");
 
     // date → NsTAIInterval (one day)
-    let lived = Attribute::<NsTAIInterval>::from(entity! {
-        metadata::iri:          "http://ex/lived".to_blob().get_handle(),
-        metadata::value_encoding: <NsTAIInterval as MetaDescribe>::id(),
-    });
+    let lived = Attribute::<NsTAIInterval>::iri("http://ex/lived");
     assert_eq!(
         find!(
             (v: Inline<NsTAIInterval>),
@@ -251,10 +239,7 @@ fn xsd_temporal_and_binary_types() {
     );
 
     // gYear / gYearMonth → NsTAIInterval
-    let century = Attribute::<NsTAIInterval>::from(entity! {
-        metadata::iri:          "http://ex/century".to_blob().get_handle(),
-        metadata::value_encoding: <NsTAIInterval as MetaDescribe>::id(),
-    });
+    let century = Attribute::<NsTAIInterval>::iri("http://ex/century");
     assert_eq!(
         find!(
             (v: Inline<NsTAIInterval>),
@@ -265,10 +250,7 @@ fn xsd_temporal_and_binary_types() {
     );
 
     // duration → NsDuration
-    let lifespan = Attribute::<NsDuration>::from(entity! {
-        metadata::iri:          "http://ex/lifespan".to_blob().get_handle(),
-        metadata::value_encoding: <NsDuration as MetaDescribe>::id(),
-    });
+    let lifespan = Attribute::<NsDuration>::iri("http://ex/lifespan");
     assert_eq!(
         find!(
             (v: Inline<NsDuration>),
@@ -279,10 +261,7 @@ fn xsd_temporal_and_binary_types() {
     );
 
     // hexBinary / base64Binary → Handle<RawBytes>
-    let checksum = Attribute::<Handle<RawBytes>>::from(entity! {
-        metadata::iri:          "http://ex/checksum".to_blob().get_handle(),
-        metadata::value_encoding: <Handle<RawBytes> as MetaDescribe>::id(),
-    });
+    let checksum = Attribute::<Handle<RawBytes>>::iri("http://ex/checksum");
     assert_eq!(
         find!(
             (h: Inline<Handle<RawBytes>>),
@@ -291,10 +270,7 @@ fn xsd_temporal_and_binary_types() {
         .count(),
         1
     );
-    let avatar = Attribute::<Handle<RawBytes>>::from(entity! {
-        metadata::iri:          "http://ex/avatar".to_blob().get_handle(),
-        metadata::value_encoding: <Handle<RawBytes> as MetaDescribe>::id(),
-    });
+    let avatar = Attribute::<Handle<RawBytes>>::iri("http://ex/avatar");
     assert_eq!(
         find!(
             (h: Inline<Handle<RawBytes>>),
@@ -305,10 +281,7 @@ fn xsd_temporal_and_binary_types() {
     );
 
     // anyURI → GenId via uri_to_id (same path as `<...>` objects).
-    let homepage = Attribute::<inlineencodings::GenId>::from(entity! {
-        metadata::iri:          "http://ex/homepage".to_blob().get_handle(),
-        metadata::value_encoding: <inlineencodings::GenId as MetaDescribe>::id(),
-    });
+    let homepage = Attribute::<inlineencodings::GenId>::iri("http://ex/homepage");
     assert_eq!(
         find!(
             (id: Id),
@@ -335,10 +308,7 @@ fn lang_tagged_literals_reify_into_entities() {
     let facts = import.facts.into_facts();
 
     // `?label` is a GenId pointing at the reified language-tagged entity.
-    let label_attr = Attribute::<inlineencodings::GenId>::from(entity! {
-        metadata::iri:          "http://ex/label".to_blob().get_handle(),
-        metadata::value_encoding: <inlineencodings::GenId as MetaDescribe>::id(),
-    });
+    let label_attr = Attribute::<inlineencodings::GenId>::iri("http://ex/label");
 
     // Two distinct subjects, two label entities for them, but the
     // `(en, "human")` pair is shared, so we have exactly 2 distinct
@@ -382,6 +352,32 @@ fn lang_tagged_literals_reify_into_entities() {
 }
 
 #[test]
+fn metafacts_survive_scratch_and_reified_literal_paths() {
+    // `age` is first resolved inside the temporary typed-literal fragment for
+    // a blank-node subject. The language literal creates rdf_lang/rdf_text
+    // facts in a nested fragment. Both paths must propagate their descriptions
+    // instead of leaving attributes in the graph that its metafacts cannot
+    // explain.
+    let data = br#"
+_:person <http://example.org/age> "42"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<http://example.org/person> <http://example.org/label> "human"@en .
+"#;
+    let import = ingest_ntriples(Cursor::new(&data[..])).expect("clean ntriples");
+
+    let missing = undescribed_attributes(&import.facts);
+    assert!(
+        missing.is_empty(),
+        "import uses attributes its metafacts do not describe: {missing:?}"
+    );
+
+    let uri_map_missing = undescribed_attributes(&import.uri_map);
+    assert!(
+        uri_map_missing.is_empty(),
+        "URI map uses attributes its metafacts do not describe: {uri_map_missing:?}"
+    );
+}
+
+#[test]
 fn bnode_subjects_emit_with_intrinsic_ids() {
     // Two structurally identical bnodes (same outgoing facts) should
     // collapse to the same intrinsic id — that's the content-addressed
@@ -399,10 +395,7 @@ _:c <http://ex/age> "43"^^<http://www.w3.org/2001/XMLSchema#integer> .
 
     // Three input lines but `_:a` and `_:b` collapse — only two distinct
     // subjects emit a trible.
-    let age = Attribute::<inlineencodings::I256BE>::from(entity! {
-        metadata::iri:          "http://ex/age".to_blob().get_handle(),
-        metadata::value_encoding: <inlineencodings::I256BE as MetaDescribe>::id(),
-    });
+    let age = Attribute::<inlineencodings::I256BE>::iri("http://ex/age");
     let subjects: std::collections::HashSet<_> = find!(
         (e: Id),
         pattern!(&facts, [{ ?e @ age: _?v }])
@@ -439,14 +432,8 @@ _:b1 <http://ex/q> "x" .
     assert_eq!(import.triples, 2);
     let facts = import.facts.into_facts();
 
-    let p = Attribute::<inlineencodings::GenId>::from(entity! {
-        metadata::iri:          "http://ex/p".to_blob().get_handle(),
-        metadata::value_encoding: <inlineencodings::GenId as MetaDescribe>::id(),
-    });
-    let q = Attribute::<Handle<LongString>>::from(entity! {
-        metadata::iri:          "http://ex/q".to_blob().get_handle(),
-        metadata::value_encoding: <Handle<LongString> as MetaDescribe>::id(),
-    });
+    let p = Attribute::<inlineencodings::GenId>::iri("http://ex/p");
+    let q = Attribute::<Handle<LongString>>::iri("http://ex/q");
 
     let (target,) = find!(
         (id: Id),
@@ -478,14 +465,8 @@ _:child <http://ex/name> "leaf" .
         .facts
         .into_facts();
 
-    let child_attr = Attribute::<inlineencodings::GenId>::from(entity! {
-        metadata::iri:          "http://ex/child".to_blob().get_handle(),
-        metadata::value_encoding: <inlineencodings::GenId as MetaDescribe>::id(),
-    });
-    let name_attr = Attribute::<Handle<LongString>>::from(entity! {
-        metadata::iri:          "http://ex/name".to_blob().get_handle(),
-        metadata::value_encoding: <Handle<LongString> as MetaDescribe>::id(),
-    });
+    let child_attr = Attribute::<inlineencodings::GenId>::iri("http://ex/child");
+    let name_attr = Attribute::<Handle<LongString>>::iri("http://ex/name");
     let leaf_handle: Inline<Handle<LongString>> = "leaf".to_blob().get_handle();
     let expected_child = entity! { name_attr: leaf_handle }
         .root()
@@ -528,10 +509,7 @@ _:b <http://ex/p> _:a .
 }
 
 fn ex_p_genid_objects(facts: &TribleSet) -> Vec<Id> {
-    let attr = Attribute::<inlineencodings::GenId>::from(entity! {
-        metadata::iri: "http://ex/p".to_blob().get_handle(),
-        metadata::value_encoding: <inlineencodings::GenId as MetaDescribe>::id(),
-    });
+    let attr = Attribute::<inlineencodings::GenId>::iri("http://ex/p");
     let mut ids: Vec<Id> = find!(
         (id: Id),
         pattern!(facts, [{ _?subject @ attr: ?id }])
@@ -752,34 +730,28 @@ fn w3c_negative_bad_esc_invalid_escape() {
 }
 
 #[test]
-fn predicate_uris_recoverable_from_meta() {
-    // The import's meta fragment is a full self-description: besides
-    // the rdf_uri annotations for entity URIs, it carries one
-    // describing entity per (predicate IRI, value schema) pair, plus
-    // the IRI-string blobs those facts reference. Round-trip: derive
-    // the attribute id the standard way, look up its IRI handle in
-    // meta, resolve the bytes from meta's embedded blob store.
+fn predicate_uris_recoverable_from_metafacts() {
+    // Predicate descriptions travel with the imported graph: derive the
+    // attribute id the standard way, look up its IRI handle in metafacts,
+    // then resolve the bytes from the fragment's one shared blob store.
     let import = ingest_ntriples(Cursor::new(NT_SAMPLE)).expect("clean ntriples");
 
-    let firstname_attr = Attribute::<Handle<LongString>>::from(entity! {
-        metadata::iri:          "http://example.org/firstname".to_blob().get_handle(),
-        metadata::value_encoding: <Handle<LongString> as MetaDescribe>::id(),
-    });
+    let firstname_attr = Attribute::<Handle<LongString>>::iri("http://example.org/firstname");
     let attr_entity = firstname_attr.id();
 
     let (h,) = find!(
         (h: Inline<Handle<LongString>>),
-        pattern!(import.meta.facts(), [{ attr_entity @ metadata::iri: ?h }])
+        pattern!(import.facts.metafacts(), [{ attr_entity @ metadata::iri: ?h }])
     )
     .next()
-    .expect("describing entity for the firstname attribute in meta");
+    .expect("describing entity for the firstname attribute in metafacts");
 
-    let mut blobs = import.meta.blobs().clone();
+    let mut blobs = import.facts.blobs().clone();
     let uri: View<str> = blobs
         .reader()
-        .expect("meta blob reader")
+        .expect("fragment blob reader")
         .get(h)
-        .expect("IRI blob resolvable from meta's embedded store");
+        .expect("IRI blob resolvable from the shared fragment store");
     assert_eq!(uri.as_ref(), "http://example.org/firstname");
 }
 
@@ -794,10 +766,7 @@ fn uri_to_id_pure_matches_import_emission() {
     let import = ingest_ntriples(Cursor::new(&data[..])).expect("clean ntriples");
     let facts = import.facts.into_facts();
 
-    let links = Attribute::<inlineencodings::GenId>::from(entity! {
-        metadata::iri:          "http://example.org/links".to_blob().get_handle(),
-        metadata::value_encoding: <inlineencodings::GenId as MetaDescribe>::id(),
-    });
+    let links = Attribute::<inlineencodings::GenId>::iri("http://example.org/links");
     let (subject, object) = find!(
         (s: Id, o: Id),
         pattern!(&facts, [{ ?s @ links: ?o }])

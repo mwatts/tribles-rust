@@ -92,11 +92,13 @@ Ownership policies and schemas determine who may mint new facts for a given
 identifier.
 
 ### Fragment
-A bundle of tribles and exported IDs returned by the `entity!` macro and import
-pipelines. Fragments compose via `+=` to build larger datasets. Use
-`Fragment::root()` to extract derived IDs, `Fragment::empty()` to start
-accumulation, and spread (`*`) to pass child fragments into parent entities,
-giving Merkle trees for free.
+A self-contained bundle of exported IDs, content facts, descriptive metafacts,
+and one content-addressed blob store shared by both fact sets. `entity!` and
+import pipelines return fragments; `entity!` carries descriptions for the
+attributes that actually emitted facts. Fragments compose via `+=` without
+mixing descriptions into ordinary queries. Use `Fragment::root()` to extract
+derived IDs, `Fragment::empty()` to start accumulation, and spread (`*`) to pass
+child fragments into parent entities, giving Merkle trees for free.
 
 ### PATCH
 The **Persistent Adaptive Trie with Cuckoo-compression and Hash-maintenance**.

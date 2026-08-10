@@ -119,18 +119,22 @@ subtrees converge automatically when you import overlapping backups. This makes
 lossless imports a good archival layer: you can keep full-fidelity raw JSON and
 still layer semantic projections on top.
 
-Each `import_*` call returns a rooted `Fragment` containing the JSON AST facts.
-Merge fragments when you ingest multiple documents. `metadata()` returns a
-fixed `Fragment` exporting the encoding ids for the `json_tree::*` attributes and
-kinds. You typically merge it once alongside your lossless archive.
+Each `import_*` call returns a rooted, self-contained `Fragment` containing the
+JSON AST facts, every referenced string/number/field-name blob, and the fixed
+`json_tree::*` schema in its metafacts. The importer also mirrors content blobs
+into the backing store supplied at construction. Merge returned fragments when
+you ingest multiple documents; their descriptions and attachments converge
+under the same set union. `metadata()` remains available when a caller wants to
+inspect the schema directly, but persisting an import does not require a
+separate metadata step.
 
 ## Importing N-Triples (RDF)
 
 The `import::ntriples` module reads the [N-Triples](https://www.w3.org/TR/n-triples/)
 serialization of an RDF graph and emits one trible per statement. The
-importer runs directly against a `Workspace<Blobs: BlobStore<Blake3>>` so
-literal blobs land in the workspace's local store alongside the emitted
-facts:
+importer is a pure function of its input: it returns self-contained fragments
+whose shared blob stores carry every byte referenced by their facts or
+metafacts.
 
 ```rust,ignore
 use std::io::Cursor;
@@ -140,9 +144,14 @@ let data = br#"
 <http://example.org/frank> <http://example.org/firstname> "Frank" .
 <http://example.org/frank> <http://example.org/birthyear> "1920"^^<http://www.w3.org/2001/XMLSchema#integer> .
 "#;
-let (facts, count) = ingest_ntriples(&mut workspace, Cursor::new(&data[..]));
-assert_eq!(count, 2);
-workspace.commit(facts, "import example");
+let import = ingest_ntriples(Cursor::new(&data[..]))?;
+assert_eq!(import.triples, 2);
+
+// `facts` is the RDF graph and already carries its predicate vocabulary.
+let mut facts = import.facts;
+// URI↔id annotations are optional queryable content.
+facts += import.uri_map;
+# Ok::<(), triblespace::core::import::ntriples::IngestError>(())
 ```
 
 **URI → entity id.** Every subject and URI-valued object gets a stable
@@ -151,9 +160,11 @@ the URI is stored as a `LongString` blob, wrapped in an `entity!` fragment
 exporting a single `rdf_uri` edge, and the fragment's content-derived root
 id becomes the entity id. The same URI always produces the same id across
 processes, so repeated imports over the same data reach the same
-TribleSet — even across machines. The `rdf_uri` edge itself is also
-emitted, so `pattern!([{ ?e @ rdf_uri: ?uri }])` recovers the original
-URI for any imported entity.
+TribleSet — even across machines. The `rdf_uri` inverse-mapping edges are
+returned separately in `NtImport::uri_map`: merge that fragment into the graph
+when `pattern!([{ ?e @ rdf_uri: ?uri }])` should recover source URIs, attach it
+as metadata when recovery should not affect content queries, or drop it when
+URI recovery is unnecessary.
 
 **Orphan blank nodes.** A blank node that is referenced as an object but has no
 outgoing facts cannot use the normal intrinsic-entity derivation: every such
@@ -167,9 +178,7 @@ addressing of the N-Triples document, not RDF graph canonicalization: changing
 comments or whitespace creates a new document scope.
 
 **Predicate → attribute id.** Predicate URIs become attribute ids through
-the entity-core derivation rooted at `metadata::iri` —
-`Attribute::<S>::from(entity!{ metadata::iri: <iri handle>,
-metadata::value_encoding: <S as MetaDescribe>::id() })`. Because
+the entity-core derivation exposed as `Attribute::<S>::iri(predicate)`. Because
 attribute ids are hashed together with the chosen `InlineEncoding`, the same
 predicate used for two different literal types produces two different
 attribute ids — which is what you want: `:birthyear "1920"^^xsd:integer`
@@ -200,16 +209,9 @@ schema:
 
 ```rust,ignore
 use triblespace::core::attribute::Attribute;
-use triblespace::core::blob::IntoBlob;
-use triblespace::core::macros::entity;
-use triblespace::core::metadata::{self, MetaDescribe};
-use triblespace::prelude::inlineencodings::{Blake3, Handle, I256BE};
-use triblespace::prelude::Inline;
+use triblespace::prelude::inlineencodings::I256BE;
 
-let birthyear = Attribute::<I256BE>::from(entity! {
-    metadata::iri:          "http://example.org/birthyear".to_blob().get_handle(),
-    metadata::value_encoding: <I256BE as MetaDescribe>::id(),
-});
+let birthyear = Attribute::<I256BE>::iri("http://example.org/birthyear");
 for (entity, year) in find!(
     (entity: Id, year: i128),
     pattern!(&facts, [{ ?entity @ birthyear: ?year }])
@@ -248,10 +250,10 @@ workload on datasets with significant repetition.
 ## Extending the Importers
 
 To support a new external format, implement a module in the `import` namespace
-that follows the same pattern: decode the source data, derive attributes via
-`Attribute::<S>::from(entity!{ metadata::<origin>: <handle>, metadata::value_encoding: <S as MetaDescribe>::id() })`
-(use `metadata::iri` for URI-identified predicates, `metadata::name` for
-display-name origins like JSON fields), encode values using the appropriate
-`InlineEncoding`, and hand the results to `Trible::new`. If the format supplies
-stable identifiers, mix them into the hashing step or salt so downstream
-systems can keep imports idempotent.
+that follows the same pattern: decode the source data, derive attributes with
+`Attribute::<S>::iri(...)` for URI-identified predicates or
+`Attribute::<S>::named(...)` for display-name origins such as JSON fields,
+encode values using the appropriate `InlineEncoding`, and carry the dynamic
+attribute fragments in the result's metafacts. If the format supplies stable
+identifiers, mix them into the hashing step or salt so downstream systems can
+keep imports idempotent.

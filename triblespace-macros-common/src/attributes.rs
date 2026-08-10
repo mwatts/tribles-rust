@@ -1,4 +1,5 @@
 use proc_macro2::TokenStream as TokenStream2;
+use quote::format_ident;
 use quote::quote;
 use syn::parse::Parse;
 use syn::parse::ParseStream;
@@ -141,7 +142,7 @@ pub fn attributes_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Re
     let mut out: TokenStream2 = TokenStream2::new();
     // Per-attribute records the top-level `describe()` needs in order
     // to emit identity + usage facts inline at the declaration site.
-    let mut per_attr: Vec<(Ident, LitStr, Option<LitStr>)> = Vec::new();
+    let mut per_attr: Vec<(Ident, Ident, LitStr, Option<LitStr>, Type)> = Vec::new();
     for AttributesDef {
         mut attrs,
         vis,
@@ -154,6 +155,7 @@ pub fn attributes_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Re
         attrs = parsed_attrs;
         let ident_name = name.to_string();
         let name_lit = LitStr::new(&ident_name, name.span());
+        let meta_ident = format_ident!("__attribute_meta_{}", name, span = name.span());
 
         let vis_ts = match vis {
             Some(v) => quote! { #v },
@@ -211,15 +213,15 @@ pub fn attributes_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Re
                     #base_path::metadata::value_encoding: <#ty as #base_path::metadata::MetaDescribe>::id(),
                     #base_path::metadata::tag: #base_path::metadata::KIND_ATTRIBUTE,
                 };
-                crate::entity_impl(entity_input, base_path)?
+                crate::entity_impl_no_meta(entity_input, base_path)?
             }
             AttributeId::Derived => {
                 let entity_input = quote! {
-                    #base_path::metadata::name:         #name_lit.to_blob().get_handle(),
+                    #base_path::metadata::name:         #name_lit,
                     #base_path::metadata::value_encoding: <#ty as #base_path::metadata::MetaDescribe>::id(),
                     #base_path::metadata::tag: #base_path::metadata::KIND_ATTRIBUTE,
                 };
-                crate::entity_impl(entity_input, base_path)?
+                crate::entity_impl_no_meta(entity_input, base_path)?
             }
         };
 
@@ -228,33 +230,38 @@ pub fn attributes_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Re
             #[allow(non_upper_case_globals)]
             #vis_ts static #name: ::std::sync::LazyLock<#base_path::attribute::Attribute<#ty>> =
                 ::std::sync::LazyLock::new(|| {
-                    use #base_path::blob::IntoBlob as _;
-                    use #base_path::metadata::MetaDescribe as _;
                     // The macro supplies the encoding fact itself in both branches, so this
                     // conversion is checked by construction rather than by the callee.
                     // Deliberately explicit: `From<Fragment>` gave the UNCHECKED path the
                     // shortest name in Rust, which is why it was removed.
                     #base_path::attribute::Attribute::<#ty>::from_fragment_unchecked(#body_fragment)
+                        .with_meta(&#meta_ident)
                 });
         });
-        per_attr.push((name, name_lit, description));
+        per_attr.push((name, meta_ident, name_lit, description, ty));
     }
 
-    // Build per-attribute blocks for the top-level `describe()`:
-    //   1. emit identity + schema spread via `Attribute::describe`
-    //   2. inline the usage facts (rust identifier as
-    //      `metadata::name`, module_path as `metadata::source_module`,
-    //      doc-comment as `metadata::description` if present) under a
-    //      usage entity whose id derives from
-    //      (metadata::attribute, metadata::source_module).
-    //
-    // `entity_impl` (same crate as us) expands the inner `entity!{}`
-    // calls directly with our `base_path` — no sibling proc-macro
-    // shim is invoked, so these inner expansions never trip the
-    // metadata-emission wrapper that the outer `attributes!{}`
-    // shim already applied.
-    let per_attr_blocks = per_attr.into_iter().map(|(name, name_lit, description)| -> syn::Result<TokenStream2> {
-        let usage_core_tokens = crate::entity_impl(
+    // Build one cached description per declaration. `entity!` and the module's
+    // explicit `describe()` use this same fragment, so the automatic and manual
+    // paths cannot drift. Every internal expansion suppresses automatic
+    // metafacts to cut the metadata attributes' bootstrap cycle.
+    let mut meta_statics = TokenStream2::new();
+    let mut describe_blocks = Vec::new();
+    for (name, meta_ident, name_lit, description, ty) in per_attr {
+        // Pinned attributes have an empty identity fragment, while anchored and
+        // derived attributes already carry these two facts. Re-emitting them is
+        // harmless set union and gives all three forms one complete record.
+        let attribute_core_tokens = crate::entity_impl_no_meta(
+            quote! {
+                __attr_ref @
+                #base_path::metadata::value_encoding:
+                    <#ty as #base_path::metadata::MetaDescribe>::id(),
+                #base_path::metadata::tag: #base_path::metadata::KIND_ATTRIBUTE,
+            },
+            base_path,
+        )?;
+
+        let usage_core_tokens = crate::entity_impl_no_meta(
             quote! {
                 #base_path::metadata::attribute:     __attr_id,
                 #base_path::metadata::source_module: module_path!(),
@@ -262,17 +269,8 @@ pub fn attributes_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Re
             base_path,
         )?;
 
-        // Annotation entity (rust-identifier name + KIND_ATTRIBUTE_USAGE
-        // tag + optional doc-comment description) rooted under the
-        // derived usage id. `entity_impl` (same crate as us) expands
-        // the inner `entity!{}` directly with our `base_path` so the
-        // expansion resolves the same way the outer `attributes!{}`
-        // does. Doc-comments and string literals auto-put through
-        // `entity!{}`'s blob-source machinery, so merging the
-        // annotation into the usage core folds its facts + blobs in
-        // and re-unions the same root id idempotently into exports.
         let annotation_tokens = if let Some(desc_lit) = description {
-            crate::entity_impl(
+            crate::entity_impl_no_meta(
                 quote! {
                     __usage_ref @
                     #base_path::metadata::name:        #name_lit,
@@ -282,7 +280,7 @@ pub fn attributes_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Re
                 base_path,
             )?
         } else {
-            crate::entity_impl(
+            crate::entity_impl_no_meta(
                 quote! {
                     __usage_ref @
                     #base_path::metadata::name: #name_lit,
@@ -292,44 +290,48 @@ pub fn attributes_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Re
             )?
         };
 
-        Ok(quote! {
-            {
-                // Core: the attribute's own identity-determining facts
-                // (`metadata::iri` / `metadata::name` and
-                // `metadata::value_encoding`) — `Attribute::describe`
-                // is a pure accessor that returns the stored
-                // fragment. Schema-level facts (what `S::id()` is,
-                // hash protocol, etc.) are NOT folded in here; the
-                // schema describes itself if a consumer wants those.
-                __fragment += <#base_path::attribute::Attribute<_> as #base_path::metadata::Describe>::describe(
-                    &*#name,
-                );
+        meta_statics.extend(quote! {
+            #[doc(hidden)]
+            #[allow(non_upper_case_globals)]
+            static #meta_ident: #base_path::attribute::AttributeMeta =
+                #base_path::attribute::AttributeMeta::new(|| {
+                    let mut __fragment = #base_path::trible::Fragment::default();
 
-                // Usage entity: a codebase-local annotation tagged
-                // with `KIND_ATTRIBUTE_USAGE`. Its id derives from
-                // `(metadata::attribute, metadata::source_module)` so
-                // multiple usages of the same attribute (different
-                // modules, different crates) coexist without
-                // clobbering each other. Rust-identifier name and the
-                // optional doc-comment description ride along under
-                // that derived id — the annotation entity!{} is
-                // rooted at the same id, so `+=` re-unions it
-                // idempotently into the usage core's exports and
-                // folds the annotation's facts + auto-put blobs in.
-                let __attr_id = #name.id();
-                let mut __usage = #usage_core_tokens;
-                let __usage_id = __usage.root().expect("usage core must be rooted");
-                let __usage_ref = #base_path::id::ExclusiveId::force_ref(&__usage_id);
-                __usage += #annotation_tokens;
-                __fragment += __usage;
+                    // Preserve identity-determining facts (anchor/name/IRI).
+                    __fragment += <#base_path::attribute::Attribute<_>
+                        as #base_path::metadata::Describe>::describe(&*#name);
+
+                    // Add the universal attribute schema/kind facts, including
+                    // for the deliberately factless pinned form.
+                    let __attr_id = #name.id();
+                    let __attr_ref = #base_path::id::ExclusiveId::force_ref(&__attr_id);
+                    __fragment += #attribute_core_tokens;
+
+                    // Usage identity is derived only from attribute + source
+                    // module. Human-facing name and docs are annotations on it.
+                    let mut __usage = #usage_core_tokens;
+                    let __usage_id = __usage.root().expect("usage core must be rooted");
+                    let __usage_ref = #base_path::id::ExclusiveId::force_ref(&__usage_id);
+                    __usage += #annotation_tokens;
+                    __fragment += __usage;
+                    __fragment
+                });
+        });
+
+        describe_blocks.push(quote! {
+            if let Some(__meta) = #meta_ident.get() {
+                __fragment += __meta.clone();
             }
-        })
-    }).collect::<syn::Result<Vec<_>>>()?;
+        });
+    }
 
+    out.extend(meta_statics);
     out.extend(quote! {
+        /// Returns the same descriptions that `entity!` carries automatically,
+        /// for callers that need a schema fragment without accompanying data.
         pub fn describe() -> #base_path::trible::Fragment {
             let mut __fragment = #base_path::trible::Fragment::default();
-            #( #per_attr_blocks )*
+            #( #describe_blocks )*
             __fragment
         }
     });

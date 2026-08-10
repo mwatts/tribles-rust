@@ -16,7 +16,7 @@ Each attribute introduced with `attributes!` defines an **atomic type** — a un
 
 Formally this is a function `title : Id → ValueTitle`, or, in relational terms, the set `{ (id, value) }`.
 In the codebase the macro emits a `static LazyLock<Attribute<S>>` for each declared attribute, so the generated binding already carries the `InlineEncoding` that governs the value column.
-The derived form (omit the hex id) hashes the attribute name together with the schema metadata via the entity-core mechanism — equivalent to `Attribute::<S>::from(entity!{ metadata::name: <name handle>, metadata::value_encoding: <S as MetaDescribe>::id() })` — which is convenient for quick experiments; shared protocols should still pin explicit ids so collaborators and other languages read the same column.
+The derived form (omit the hex id) hashes the attribute name together with the schema metadata via the entity-core mechanism — equivalent to `Attribute::<S>::named(name)` — which is convenient for quick experiments; shared protocols should still pin explicit ids so collaborators and other languages read the same column.
 These atomic pieces are the building blocks for everything else.
 
 ## Entities as Intersection Types
@@ -28,14 +28,14 @@ Semantically it is the meet (`∧`) of its constituent relations:
 Entity{A, B}  ≡  { A : ValueA } ∧ { B : ValueB }
 ```
 
-At runtime `entity!` expands to a small [`Fragment`](../src/trible/fragment.rs): a [`TribleSet`](../src/trible/tribleset.rs) containing those facts plus a set of exported entity ids. The procedural macro emits a fresh set, populates it with [`Trible::new`][Trible] calls, and returns the fragment by value. Use `+=` to merge fragments into a dataset (only the facts are unioned), and use `root()`/`exports()` when you want the produced entity id(s) back alongside the facts.
+At runtime `entity!` expands to a small [`Fragment`](../src/trible/fragment.rs): exported entity ids, a [`TribleSet`](../src/trible/tribleset.rs) containing the asserted facts, descriptive metafacts for the attributes that emitted those facts, and one blob store shared by both sets. The description channel does not participate in intrinsic entity identity or ordinary content queries. Use `+=` to union every channel, and use `root()`/`exports()` when you want the produced entity id(s) back alongside the facts.
 At the type level it represents their conjunction.
 Records are therefore intersection types: every additional field refines the shape without invalidating existing data.
 
 ## Merge Drives Dataset Composition
 
-The `+=` operator delegates to [`TribleSet::union`](../src/trible/tribleset.rs), exposed through the `AddAssign` implementation.
-`union` performs **set union** on the six internal indexes that back a `TribleSet`.
+For content facts, the `+=` operator delegates to [`TribleSet::union`](../src/trible/tribleset.rs), exposed through the `AddAssign` implementation. Fragment composition applies the same set union independently to facts and metafacts, unions exports, and structurally joins the shared blob stores.
+`TribleSet::union` performs **set union** on the six internal indexes that back a `TribleSet`.
 When the entity identifiers are disjoint the effect is classic dataset union; when they coincide we get field conjunction—record extension.
 This dual role is what keeps TribleSpace’s algebra compact.
 

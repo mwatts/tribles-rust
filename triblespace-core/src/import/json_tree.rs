@@ -11,6 +11,7 @@ use winnow::stream::Stream;
 use crate::blob::encodings::longstring::LongString;
 use crate::blob::Blob;
 use crate::blob::IntoBlob;
+use crate::blob::MemoryBlobStore;
 use crate::id::{ExclusiveId, Id, RawId, ID_LEN};
 use crate::inline::encodings::boolean::Boolean;
 use crate::inline::encodings::genid::GenId;
@@ -161,14 +162,21 @@ where
     /// [`Fragment`] rooted at the document's top-level node.
     pub fn import_blob(&mut self, blob: Blob<LongString>) -> Result<Fragment, JsonImportError> {
         let mut data = TribleSet::new();
+        let mut local_blobs = MemoryBlobStore::new();
         let mut bytes = blob.bytes.clone();
         self.skip_ws(&mut bytes);
-        let root = self.parse_value(&mut bytes, &mut data)?;
+        let root = self.parse_value(&mut bytes, &mut data, &mut local_blobs)?;
         self.skip_ws(&mut bytes);
         if bytes.peek_token().is_some() {
             return Err(JsonImportError::Syntax("trailing tokens".into()));
         }
-        Ok(Fragment::rooted(root, data))
+        let mut fragment = Fragment::rooted_with_blobs(root, data, local_blobs);
+        // The node kinds are minted here rather than declared by an
+        // `attributes!` block, so the importer has to attach their schema
+        // itself. Keep it in the returned fragment's metafacts so committing
+        // the import cannot silently lose the information needed to decode it.
+        fragment.describe_with(build_json_tree_metadata());
+        Ok(fragment)
     }
 
     /// Returns schema metadata for the lossless JSON tree format.
@@ -181,6 +189,7 @@ where
         &mut self,
         bytes: &mut Bytes,
         data: &mut TribleSet,
+        local_blobs: &mut MemoryBlobStore,
     ) -> Result<Id, JsonImportError> {
         match bytes.peek_token() {
             Some(b'n') => {
@@ -212,34 +221,36 @@ where
             Some(b'"') => {
                 let text = self.parse_string(bytes)?;
                 let id = self.hash_tagged(b"string", &[text.as_ref().as_bytes()]);
-                let handle = self
-                    .store
-                    .put(text)
-                    .map_err(|err| JsonImportError::EncodeString {
+                let text_blob: Blob<LongString> = text.to_blob();
+                let handle = self.store.put(text_blob.clone()).map_err(|err| {
+                    JsonImportError::EncodeString {
                         field: "string".to_string(),
                         source: EncodeError::from_error(err),
-                    })?;
+                    }
+                })?;
+                local_blobs.insert(text_blob);
                 *data += entity! { ExclusiveId::force_ref(&id) @
                     kind: kind_string,
                     string: handle,
                 };
                 Ok(id)
             }
-            Some(b'{') => self.parse_object(bytes, data),
-            Some(b'[') => self.parse_array(bytes, data),
+            Some(b'{') => self.parse_object(bytes, data, local_blobs),
+            Some(b'[') => self.parse_array(bytes, data, local_blobs),
             _ => {
                 let number = self.parse_number(bytes)?;
                 let number_view = number
                     .view::<str>()
                     .map_err(|_| JsonImportError::Syntax("invalid number".into()))?;
                 let id = self.hash_tagged(b"number", &[number_view.as_ref().as_bytes()]);
-                let handle =
-                    self.store
-                        .put(number_view)
-                        .map_err(|err| JsonImportError::EncodeNumber {
-                            field: "number".to_string(),
-                            source: EncodeError::from_error(err),
-                        })?;
+                let number_blob: Blob<LongString> = number_view.to_blob();
+                let handle = self.store.put(number_blob.clone()).map_err(|err| {
+                    JsonImportError::EncodeNumber {
+                        field: "number".to_string(),
+                        source: EncodeError::from_error(err),
+                    }
+                })?;
+                local_blobs.insert(number_blob);
                 *data += entity! { ExclusiveId::force_ref(&id) @
                     kind: kind_number,
                     number_raw: handle,
@@ -253,6 +264,7 @@ where
         &mut self,
         bytes: &mut Bytes,
         data: &mut TribleSet,
+        local_blobs: &mut MemoryBlobStore,
     ) -> Result<Id, JsonImportError> {
         self.consume_byte(bytes, b'{')?;
         self.skip_ws(bytes);
@@ -267,14 +279,15 @@ where
                 self.skip_ws(bytes);
                 self.consume_byte(bytes, b':')?;
                 self.skip_ws(bytes);
-                let value = self.parse_value(bytes, data)?;
-                let name_handle =
-                    self.store
-                        .put(name.clone())
-                        .map_err(|err| JsonImportError::EncodeString {
-                            field: "field".to_string(),
-                            source: EncodeError::from_error(err),
-                        })?;
+                let value = self.parse_value(bytes, data, local_blobs)?;
+                let name_blob: Blob<LongString> = name.clone().to_blob();
+                let name_handle = self.store.put(name_blob.clone()).map_err(|err| {
+                    JsonImportError::EncodeString {
+                        field: "field".to_string(),
+                        source: EncodeError::from_error(err),
+                    }
+                })?;
+                local_blobs.insert(name_blob);
                 fields.push(FieldEntry {
                     name,
                     name_handle,
@@ -321,6 +334,7 @@ where
         &mut self,
         bytes: &mut Bytes,
         data: &mut TribleSet,
+        local_blobs: &mut MemoryBlobStore,
     ) -> Result<Id, JsonImportError> {
         self.consume_byte(bytes, b'[')?;
         self.skip_ws(bytes);
@@ -331,7 +345,7 @@ where
         } else {
             let mut index: u64 = 0;
             loop {
-                let value = self.parse_value(bytes, data)?;
+                let value = self.parse_value(bytes, data, local_blobs)?;
                 entries.push(ArrayEntry { index, value });
                 index = index.saturating_add(1);
 
@@ -482,11 +496,17 @@ fn id_from_digest(digest: &[u8]) -> Id {
 
 #[cfg(test)]
 mod tests {
+    use anybytes::View;
+
     use super::{kind_array_entry, JsonTreeImporter};
+    use crate::blob::encodings::longstring::LongString;
     use crate::blob::IntoBlob;
     use crate::blob::MemoryBlobStore;
     use crate::id::Id;
+    use crate::inline::encodings::hash::Handle;
+    use crate::inline::Inline;
     use crate::macros::{find, pattern};
+    use crate::repo::{BlobStore, BlobStoreGet};
 
     #[test]
     fn lossless_ids_are_content_based() {
@@ -517,6 +537,10 @@ mod tests {
         let root = fragment
             .root()
             .expect("import_blob returns a rooted fragment");
+        assert!(
+            !fragment.metafacts().is_empty(),
+            "the imported tree carries its schema without a separate metadata call"
+        );
         let catalog = fragment.facts();
         let mut entries = find!(
             (index: ethnum::U256, value: Id),
@@ -533,5 +557,40 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].0, ethnum::U256::new(0));
         assert_eq!(entries[1].0, ethnum::U256::new(1));
+    }
+
+    #[test]
+    fn returned_fragment_carries_its_content_blobs() {
+        let input = r#"{"field": "value"}"#;
+        let mut external = MemoryBlobStore::new();
+        let mut importer = JsonTreeImporter::<_>::new(&mut external, None);
+        let fragment = importer.import_blob(input.to_blob()).unwrap();
+
+        let string_handle = find!(
+            (handle: Inline<Handle<LongString>>),
+            pattern!(fragment.facts(), [{ _?node @ super::string: ?handle }])
+        )
+        .map(|(handle,)| handle)
+        .next()
+        .expect("the string node has a content handle");
+
+        let field_handle = find!(
+            (handle: Inline<Handle<LongString>>),
+            pattern!(fragment.facts(), [{ _?entry @ super::field_name: ?handle }])
+        )
+        .map(|(handle,)| handle)
+        .next()
+        .expect("the field entry has a name handle");
+
+        let mut local = fragment.blobs().clone();
+        let reader = local.reader().expect("fragment blob-store reader");
+        let value: View<str> = reader
+            .get(string_handle)
+            .expect("string bytes resolve from the returned fragment");
+        let field: View<str> = reader
+            .get(field_handle)
+            .expect("field-name bytes resolve from the returned fragment");
+        assert_eq!(&*value, "value");
+        assert_eq!(&*field, "field");
     }
 }

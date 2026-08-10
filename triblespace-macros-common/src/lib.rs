@@ -494,11 +494,32 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
 }
 
 pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result<TokenStream2> {
+    entity_impl_with(input, base_path, true)
+}
+
+/// Internal expansion used while constructing attribute descriptions. It emits
+/// the requested facts but does not recursively describe the metadata
+/// attributes used to express them.
+pub(crate) fn entity_impl_no_meta(
+    input: TokenStream2,
+    base_path: &TokenStream2,
+) -> syn::Result<TokenStream2> {
+    entity_impl_with(input, base_path, false)
+}
+
+fn entity_impl_with(
+    input: TokenStream2,
+    base_path: &TokenStream2,
+    emit_meta: bool,
+) -> syn::Result<TokenStream2> {
     let wrapped = quote! { { #input } };
 
     let Entity { id, attributes } = syn::parse2(wrapped)?;
 
     let state_init = quote! {
+        #[allow(unused_mut)]
+        let mut __meta: #base_path::trible::TribleSet =
+            #base_path::trible::TribleSet::new();
         let mut __blobs: #base_path::blob::MemoryBlobStore =
             #base_path::blob::MemoryBlobStore::new();
     };
@@ -551,6 +572,23 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
         let extra_ident = format_ident!("__extra{}", i, span = Span::mixed_site());
 
         attr_eval_tokens.extend(quote! { let #af_ident = &#field_expr; });
+
+        // An attribute description is itself a Fragment. Its two fact sets are
+        // both descriptive relative to the entity being built, while its one
+        // blob store remains shared with the entity's content blobs.
+        let meta_tokens = if emit_meta {
+            quote! {
+                {
+                    let __attr_meta = #af_ident.meta();
+                    __meta.union(__attr_meta.facts().clone());
+                    __meta.union(__attr_meta.metafacts().clone());
+                    __blobs.union(__attr_meta.blobs().clone());
+                }
+            }
+        } else {
+            TokenStream2::new()
+        };
+
         match mode {
             AttributeMode::Required => {
                 attr_eval_tokens.extend(quote! {
@@ -559,6 +597,7 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
                     if let Some(__b) = __maybe_blob {
                         __blobs.insert(__b);
                     }
+                    #meta_tokens
                 });
             }
             AttributeMode::Optional => {
@@ -574,6 +613,9 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
                             __val
                         })
                     };
+                    if #val_ident.is_some() {
+                        #meta_tokens
+                    }
                 });
             }
             AttributeMode::Repeated => {
@@ -593,6 +635,9 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
                             .collect::<::std::vec::Vec<_>>();
                         (__vals, __spread_facts)
                     };
+                    if !#val_ident.is_empty() {
+                        #meta_tokens
+                    }
                 });
             }
         }
@@ -640,9 +685,10 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
                     }
                 });
                 extra_merge_tokens.extend(quote! {
-                    let (__extra_facts, __extra_blobs) =
-                        #extra_ident.into_facts_and_blobs();
+                    let (_, __extra_facts, __extra_metafacts, __extra_blobs) =
+                        #extra_ident.into_parts();
                     set += __extra_facts;
+                    __meta.union(__extra_metafacts);
                     __blobs.union(__extra_blobs);
                 });
             }
@@ -686,7 +732,7 @@ pub fn entity_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Result
             #attr_eval_tokens
             #entity_init
             #extra_merge_tokens
-            #base_path::trible::Fragment::rooted_with_blobs(root_id, set, __blobs)
+            #base_path::trible::Fragment::rooted_from_parts(root_id, set, __meta, __blobs)
         }
     };
 

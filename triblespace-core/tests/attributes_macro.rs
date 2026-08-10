@@ -1,6 +1,4 @@
-use triblespace_core::blob::IntoBlob;
 use triblespace_core::metadata;
-use triblespace_core::metadata::MetaDescribe;
 use triblespace_core::prelude::inlineencodings::ShortString;
 use triblespace_core::prelude::{
     attributes, entity, find, pattern, Attribute, Id, Inline, IntoInline,
@@ -17,16 +15,10 @@ fn attributes_macro_accepts_hex_and_derived_ids() {
     let expected_fixed = Id::from_hex("11111111111111111111111111111111").expect("valid hex id");
     assert_eq!(fixed.id(), expected_fixed);
 
-    let expected_derived = Attribute::<ShortString>::from(entity! {
-        metadata::name:         "derived".to_blob().get_handle(),
-        metadata::value_encoding: <ShortString as MetaDescribe>::id(),
-    });
+    let expected_derived = Attribute::<ShortString>::named("derived");
     assert_eq!(derived.id(), expected_derived.id());
 
-    let expected_private = Attribute::<ShortString>::from(entity! {
-        metadata::name:         "private".to_blob().get_handle(),
-        metadata::value_encoding: <ShortString as MetaDescribe>::id(),
-    });
+    let expected_private = Attribute::<ShortString>::named("private");
     assert_eq!(private.id(), expected_private.id());
 }
 

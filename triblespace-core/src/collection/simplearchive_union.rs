@@ -459,42 +459,33 @@ pub fn prepare_commit(
 
 /// Prepare a self-contained fact fragment as a canonical signed membership root.
 ///
-/// `content` and `metadata` may each carry blobs referenced by handles in their
-/// facts. This boundary recomputes every embedded blob's identity and requires
-/// both its [`MemoryBlobStore`] key and cached [`Blob`] handle to match the
-/// bytes. A mismatch is rejected rather than normalized because the fragment
-/// facts may name the forged identity. Fragment exports are not serialized.
-/// No destination store is touched.
+/// The fragment's facts become collection data and its metafacts become commit
+/// metadata. Its one shared blob store may back handles in either set. This
+/// boundary recomputes every embedded blob's identity and requires both its
+/// [`MemoryBlobStore`] key and cached [`Blob`] handle to match the bytes. A
+/// mismatch is rejected rather than normalized because either fact set may
+/// name the forged identity. Fragment exports are not serialized. No
+/// destination store is touched.
 pub fn prepare_fragment_commit(
     definition: &CollectionDefinition,
-    content: impl Into<Fragment>,
-    metadata: impl Into<Fragment>,
+    fragment: Fragment,
     signing_key: &SigningKey,
 ) -> Result<PreparedCollectionCommit, PreparationError> {
-    let (content_facts, content_blobs) = content.into().into_facts_and_blobs();
-    let (metadata_facts, metadata_blobs) = metadata.into().into_facts_and_blobs();
+    let (_, facts, metafacts, blobs) = fragment.into_parts();
 
     let mut embedded =
-        checked_embedded_blobs(content_blobs).map_err(|(store_key, cached_handle, actual)| {
+        checked_embedded_blobs(blobs).map_err(|(store_key, cached_handle, actual)| {
             PublicationError::InvalidEmbeddedBlob {
                 store_key,
                 cached_handle,
                 actual,
             }
         })?;
-    embedded.extend(checked_embedded_blobs(metadata_blobs).map_err(
-        |(store_key, cached_handle, actual)| PublicationError::InvalidEmbeddedBlob {
-            store_key,
-            cached_handle,
-            actual,
-        },
-    )?);
     embedded.sort_unstable_by_key(|blob| blob.get_handle().raw);
-    embedded.dedup_by_key(|blob| blob.get_handle().raw);
 
-    let content: Blob<SimpleArchive> = crate::blob::IntoBlob::to_blob(content_facts);
-    let metadata: Blob<SimpleArchive> = crate::blob::IntoBlob::to_blob(metadata_facts);
-    prepare_commit_with_embedded(definition, &content, &metadata, signing_key, embedded)
+    let data: Blob<SimpleArchive> = crate::blob::IntoBlob::to_blob(facts);
+    let metadata: Blob<SimpleArchive> = crate::blob::IntoBlob::to_blob(metafacts);
+    prepare_commit_with_embedded(definition, &data, &metadata, signing_key, embedded)
 }
 
 fn prepare_commit_with_embedded(
@@ -591,13 +582,14 @@ where
 
 /// Publish a self-contained fact fragment as a signed membership root.
 ///
-/// `content` and `metadata` may each carry blobs referenced by handles in their
-/// facts. Before touching `store`, this boundary recomputes every embedded
-/// blob's identity and requires both its [`MemoryBlobStore`] key and cached
-/// [`Blob`] handle to match the bytes. A mismatch is rejected rather than
-/// normalized because the fragment facts may name the forged identity.
+/// The fragment's facts and metafacts become the signed data and metadata
+/// elements, and its shared blob store backs handles in either set. Before
+/// touching `store`, this boundary recomputes every embedded blob's identity
+/// and requires both its [`MemoryBlobStore`] key and cached [`Blob`] handle to
+/// match the bytes. A mismatch is rejected rather than normalized because a
+/// fact may name the forged identity.
 ///
-/// Fragment exports are not serialized. Their fact sets become canonical
+/// Fragment exports are not serialized. The two fact sets become canonical
 /// `SimpleArchive` data and metadata elements. The shared prepared-publication
 /// path writes embedded blobs, the definition, and both archives before its
 /// dependency flush, then appends the signed record last. The same backend-
@@ -605,14 +597,13 @@ where
 pub fn publish_fragment_commit<S>(
     store: &mut S,
     definition: &CollectionDefinition,
-    content: impl Into<Fragment>,
-    metadata: impl Into<Fragment>,
+    fragment: Fragment,
     signing_key: &SigningKey,
 ) -> Result<CollectionCommit, PublicationError<S::PutError, <S as StorageFlush>::Error>>
 where
     S: BlobStorePut + StorageFlush,
 {
-    let prepared = prepare_fragment_commit(definition, content, metadata, signing_key)
+    let prepared = prepare_fragment_commit(definition, fragment, signing_key)
         .map_err(widen_preparation_error)?;
     prepared.stage(store)?.finalize()
 }
@@ -1051,19 +1042,31 @@ mod tests {
 
     fn fragment_fixture() -> (
         Fragment,
-        Fragment,
         Inline<Handle<LongString>>,
         Inline<Handle<RawBytes>>,
     ) {
         let text: Blob<LongString> = String::from("a self-contained content blob").to_blob();
         let text_handle = text.get_handle();
-        let content = entity! { fragment_ns::text: text };
+        let mut content = entity! { fragment_ns::text: text };
 
         let payload: Blob<RawBytes> = vec![0, 1, 2, 3, 0xFE, 0xFF].to_blob();
         let payload_handle = payload.get_handle();
         let metadata = entity! { fragment_ns::payload: payload };
+        content.describe_with(metadata);
 
-        (content, metadata, text_handle, payload_handle)
+        (content, text_handle, payload_handle)
+    }
+
+    fn embedded_put_events(fragment: &Fragment) -> Vec<ProbeEvent> {
+        let mut blobs = fragment.blobs().clone();
+        let mut handles: Vec<_> = blobs
+            .reader()
+            .expect("memory store reader is infallible")
+            .iter()
+            .map(|(handle, _)| handle.raw)
+            .collect();
+        handles.sort_unstable();
+        handles.into_iter().map(ProbeEvent::Put).collect()
     }
 
     fn commit_fixture() -> (
@@ -1091,9 +1094,10 @@ mod tests {
         let source_definition = definition(id(1));
         let target = definition(id(2));
         let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let (content, metadata, text_handle, payload_handle) = fragment_fixture();
-        let content_archive: Blob<SimpleArchive> = content.facts().clone().to_blob();
-        let metadata_archive: Blob<SimpleArchive> = metadata.facts().clone().to_blob();
+        let (fragment, _text_handle, _payload_handle) = fragment_fixture();
+        let embedded = embedded_put_events(&fragment);
+        let content_archive: Blob<SimpleArchive> = fragment.facts().clone().to_blob();
+        let metadata_archive: Blob<SimpleArchive> = fragment.metafacts().clone().to_blob();
         let expected = CollectionCommit::sign(
             &signing_key,
             source_definition.id(),
@@ -1101,15 +1105,9 @@ mod tests {
             metadata_archive.get_handle(),
         );
 
-        let prepared = prepare_fragment_commit(
-            &source_definition,
-            content.clone(),
-            metadata.clone(),
-            &signing_key,
-        )
-        .unwrap();
-        let repeated =
-            prepare_fragment_commit(&source_definition, content, metadata, &signing_key).unwrap();
+        let prepared =
+            prepare_fragment_commit(&source_definition, fragment.clone(), &signing_key).unwrap();
+        let repeated = prepare_fragment_commit(&source_definition, fragment, &signing_key).unwrap();
         assert_eq!(prepared.commit(), &expected);
         assert_eq!(repeated.commit(), &expected);
         assert_eq!(
@@ -1126,19 +1124,19 @@ mod tests {
         let derive_blob = CollectionDerive::to_blob(&derive);
         let definition_blob = CollectionDefinition::to_blob(&source_definition);
         let commit_blob = CollectionCommit::to_blob(&expected);
-        let mut embedded = vec![text_handle.raw, payload_handle.raw];
-        embedded.sort_unstable();
-        let sequence = vec![
-            ProbeEvent::Put(embedded[0]),
-            ProbeEvent::Put(embedded[1]),
-            put_event(&definition_blob),
-            put_event(&content_archive),
-            put_event(&metadata_archive),
-            ProbeEvent::Flush,
-            put_event(&derive_blob),
-            put_event(&commit_blob),
-            ProbeEvent::Flush,
-        ];
+        let sequence = [
+            embedded,
+            vec![
+                put_event(&definition_blob),
+                put_event(&content_archive),
+                put_event(&metadata_archive),
+                ProbeEvent::Flush,
+                put_event(&derive_blob),
+                put_event(&commit_blob),
+                ProbeEvent::Flush,
+            ],
+        ]
+        .concat();
 
         let mut store = ProbeStore::default();
         for prepared in [prepared, repeated] {
@@ -1171,11 +1169,10 @@ mod tests {
 
         let definition = definition(id(1));
         let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let (content, metadata, text_handle, payload_handle) = fragment_fixture();
-        let expected_content: Blob<SimpleArchive> = content.facts().clone().to_blob();
-        let expected_metadata: Blob<SimpleArchive> = metadata.facts().clone().to_blob();
-        let prepared =
-            prepare_fragment_commit(&definition, content, metadata, &signing_key).unwrap();
+        let (fragment, text_handle, payload_handle) = fragment_fixture();
+        let expected_content: Blob<SimpleArchive> = fragment.facts().clone().to_blob();
+        let expected_metadata: Blob<SimpleArchive> = fragment.metafacts().clone().to_blob();
+        let prepared = prepare_fragment_commit(&definition, fragment, &signing_key).unwrap();
         let withheld = prepared.commit().clone();
 
         let mut pile = Pile::open(&path).unwrap();
@@ -1227,6 +1224,33 @@ mod tests {
             .is_err());
         drop(reader);
         reopened.close().unwrap();
+    }
+
+    #[test]
+    fn fragment_without_metafacts_still_stages_the_canonical_empty_metadata_archive() {
+        let definition = definition(id(1));
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let empty_archive: Blob<SimpleArchive> = TribleSet::new().to_blob();
+
+        let prepared =
+            prepare_fragment_commit(&definition, Fragment::empty(), &signing_key).unwrap();
+
+        assert_eq!(prepared.commit().metadata(), empty_metadata_handle());
+        assert_eq!(prepared.metadata.get_handle(), empty_metadata_handle());
+        assert_eq!(prepared.metadata, empty_archive);
+
+        let mut store = ProbeStore::default();
+        let staged = prepared.stage(&mut store).unwrap();
+        drop(staged);
+        assert_eq!(
+            store
+                .events
+                .iter()
+                .filter(|event| **event == ProbeEvent::Put(empty_metadata_handle().raw))
+                .count(),
+            2,
+            "empty data and empty metadata are both staged explicitly"
+        );
     }
 
     #[test]
@@ -1290,9 +1314,10 @@ mod tests {
     fn fragment_commit_puts_embedded_dependencies_before_record_and_replays_idempotently() {
         let definition = definition(id(1));
         let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let (content, metadata, text_handle, payload_handle) = fragment_fixture();
-        let content_archive: Blob<SimpleArchive> = content.facts().clone().to_blob();
-        let metadata_archive: Blob<SimpleArchive> = metadata.facts().clone().to_blob();
+        let (fragment, _text_handle, _payload_handle) = fragment_fixture();
+        let embedded = embedded_put_events(&fragment);
+        let content_archive: Blob<SimpleArchive> = fragment.facts().clone().to_blob();
+        let metadata_archive: Blob<SimpleArchive> = fragment.metafacts().clone().to_blob();
         let expected = CollectionCommit::sign(
             &signing_key,
             definition.id(),
@@ -1302,31 +1327,25 @@ mod tests {
         let definition_blob = CollectionDefinition::to_blob(&definition);
         let record_blob = CollectionCommit::to_blob(&expected);
 
-        let mut embedded = vec![text_handle.raw, payload_handle.raw];
-        embedded.sort_unstable();
-        let sequence = vec![
-            ProbeEvent::Put(embedded[0]),
-            ProbeEvent::Put(embedded[1]),
-            put_event(&definition_blob),
-            put_event(&content_archive),
-            put_event(&metadata_archive),
-            ProbeEvent::Flush,
-            put_event(&record_blob),
-            ProbeEvent::Flush,
-        ];
+        let sequence = [
+            embedded.clone(),
+            vec![
+                put_event(&definition_blob),
+                put_event(&content_archive),
+                put_event(&metadata_archive),
+                ProbeEvent::Flush,
+                put_event(&record_blob),
+                ProbeEvent::Flush,
+            ],
+        ]
+        .concat();
 
         let mut store = ProbeStore::default();
-        let first = publish_fragment_commit(
-            &mut store,
-            &definition,
-            content.clone(),
-            metadata.clone(),
-            &signing_key,
-        )
-        .unwrap();
-        let second =
-            publish_fragment_commit(&mut store, &definition, content, metadata, &signing_key)
+        let first =
+            publish_fragment_commit(&mut store, &definition, fragment.clone(), &signing_key)
                 .unwrap();
+        let second =
+            publish_fragment_commit(&mut store, &definition, fragment, &signing_key).unwrap();
 
         assert_eq!(first, expected);
         assert_eq!(second, expected);
@@ -1334,9 +1353,14 @@ mod tests {
         expected_events.extend(sequence);
         assert_eq!(store.events, expected_events);
 
-        let expected_handles = BTreeSet::from([
-            text_handle.raw,
-            payload_handle.raw,
+        let mut expected_handles: BTreeSet<_> = embedded
+            .into_iter()
+            .map(|event| match event {
+                ProbeEvent::Put(handle) => handle,
+                ProbeEvent::Flush => unreachable!("embedded events are puts"),
+            })
+            .collect();
+        expected_handles.extend([
             definition_blob.get_handle().raw,
             content_archive.get_handle().raw,
             metadata_archive.get_handle().raw,
@@ -1363,14 +1387,8 @@ mod tests {
         let actual_text_handle = Blob::<LongString>::new(forged_text.bytes.clone()).get_handle();
         let forged_content = entity! { fragment_ns::text: forged_text };
         let mut store = ProbeStore::default();
-        let error = publish_fragment_commit(
-            &mut store,
-            &definition,
-            forged_content,
-            Fragment::empty(),
-            &signing_key,
-        )
-        .unwrap_err();
+        let error = publish_fragment_commit(&mut store, &definition, forged_content, &signing_key)
+            .unwrap_err();
         assert!(matches!(
             error,
             PublicationError::InvalidEmbeddedBlob {
@@ -1392,14 +1410,8 @@ mod tests {
             std::iter::once((bogus_store_key, payload.transmute())).collect();
         let forged_content = Fragment::from_facts_and_blobs(TribleSet::new(), embedded);
         let mut store = ProbeStore::default();
-        let error = publish_fragment_commit(
-            &mut store,
-            &definition,
-            forged_content,
-            Fragment::empty(),
-            &signing_key,
-        )
-        .unwrap_err();
+        let error = publish_fragment_commit(&mut store, &definition, forged_content, &signing_key)
+            .unwrap_err();
         assert!(matches!(
             error,
             PublicationError::InvalidEmbeddedBlob {
@@ -1672,15 +1684,14 @@ mod tests {
 
         let definition = definition(id(1));
         let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let (content, metadata, text_handle, payload_handle) = fragment_fixture();
-        let expected_content: Blob<SimpleArchive> = content.facts().clone().to_blob();
-        let expected_metadata: Blob<SimpleArchive> = metadata.facts().clone().to_blob();
+        let (fragment, text_handle, payload_handle) = fragment_fixture();
+        let expected_content: Blob<SimpleArchive> = fragment.facts().clone().to_blob();
+        let expected_metadata: Blob<SimpleArchive> = fragment.metafacts().clone().to_blob();
 
         let commit = {
             let mut pile = Pile::open(&path).unwrap();
             let commit =
-                publish_fragment_commit(&mut pile, &definition, content, metadata, &signing_key)
-                    .unwrap();
+                publish_fragment_commit(&mut pile, &definition, fragment, &signing_key).unwrap();
             pile.close().unwrap();
             commit
         };

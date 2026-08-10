@@ -79,8 +79,14 @@ fn entity_still_accepts_precomputed_value() {
     .expect("note handle is in the facts");
     assert_eq!(resolved, precomputed);
 
-    // No bytes absorbed.
-    assert_eq!(frag.blobs().len(), 0);
+    // The payload bytes were not absorbed. The store is no longer globally
+    // empty because `entity!` also carries the declaration blobs referenced by
+    // the attribute's metafacts.
+    let mut blobs = frag.blobs().clone();
+    let reader = blobs.reader().expect("blob reader");
+    assert!(reader
+        .get::<anybytes::View<str>, LongString>(precomputed)
+        .is_err());
 }
 
 /// Audit: the Blake3 hash is computed exactly once during a full
