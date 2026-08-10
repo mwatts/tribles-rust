@@ -95,7 +95,8 @@ triblespace_core_macros::attributes! {
     /// the issuer is the team root.
     "8ED30E412129FB0A791BD335EACF2E82" unsafe as pub sig_embedded_parent_proof: GenId;
     // Note: sig_signer + sig_value (r/s) reuse the existing
-    // `repo::signed_by`, `repo::signature_r`, `repo::signature_s`
+    // `attestation::signed_by`, `attestation::signature_r`,
+    // `attestation::signature_s`
     // attributes — same convention as commit signatures, plus
     // structural reuse (a sig blob has the same shape inside as the
     // signature portion of a commit's metadata blob).
@@ -253,9 +254,9 @@ pub fn build_capability(
     // longer a leaf.
     let mut sig_set: TribleSet = TribleSet::from(entity! {
         sig_signs: cap_handle,
-        crate::repo::signed_by: issuer_pubkey,
-        crate::repo::signature_r: signature,
-        crate::repo::signature_s: signature,
+        crate::attestation::signed_by: issuer_pubkey,
+        crate::attestation::signature_r: signature,
+        crate::attestation::signature_s: signature,
     });
     let leaf_outer_id: crate::id::Id = find!(
         (s: crate::id::Id, _h: Inline<Handle<SimpleArchive>>),
@@ -879,9 +880,9 @@ fn extract_and_verify_sig_at(
         (signer: VerifyingKey, r, s),
         pattern!(sig_set, [{
             entity @
-            crate::repo::signed_by: ?signer,
-            crate::repo::signature_r: ?r,
-            crate::repo::signature_s: ?s,
+            crate::attestation::signed_by: ?signer,
+            crate::attestation::signature_r: ?r,
+            crate::attestation::signature_s: ?s,
         }])
     );
     let (signer, r, s) = match (iter.next(), iter.next()) {
@@ -1201,7 +1202,7 @@ mod tests {
         // exactly one signed_by trible.
         let signed_by_entities: HashSet<Id> = find!(
             (e: Id, s: VerifyingKey),
-            pattern!(&sig_set, [{ ?e @ crate::repo::signed_by: ?s }])
+            pattern!(&sig_set, [{ ?e @ crate::attestation::signed_by: ?s }])
         )
         .map(|(e, _)| e)
         .collect();

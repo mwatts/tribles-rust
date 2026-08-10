@@ -10,6 +10,8 @@ extern crate proc_macro;
 #[cfg(not(all(target_pointer_width = "64", target_endian = "little")))]
 compile_error!("triblespace-rs requires a 64-bit little-endian target");
 
+/// Shared structural attributes for signed records and attestations.
+pub mod attestation;
 pub mod attribute;
 /// Blob storage, schemas, and conversion traits.
 pub mod blob;

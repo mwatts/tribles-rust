@@ -32,8 +32,9 @@ Each capability is two blobs stored in the pile:
   `cap_scope_root` (the entity id anchoring the scope facts inside
   the same blob), and `metadata::expires_at`.
 - A **sig blob** — a `TribleSet` with `sig_signs` (handle of the cap
-  blob) plus `repo::signed_by` + `signature_r` + `signature_s`,
-  reusing the existing commit-signature attribute conventions.
+  blob) plus `attestation::signed_by`, `attestation::signature_r`, and
+  `attestation::signature_s`,
+  reusing the shared structural attestation attributes.
 
 Signatures attest to the cap blob's canonical bytes (matching how
 `Workspace::commit` signs commit metadata), not to a hash of those

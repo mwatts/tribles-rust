@@ -803,7 +803,7 @@ fn run_show(
             pattern!(&sig_set, [{
                 ?sig @
                 capability::sig_signs: ?signed,
-                triblespace_core::repo::signed_by: ?signer,
+                triblespace_core::attestation::signed_by: ?signer,
             }])
         );
         let (mut current_outer_id, mut current_cap_handle, mut current_signer) =
@@ -932,7 +932,7 @@ fn run_show(
                         (next_signer: VerifyingKey),
                         pattern!(&sig_set, [{
                             parent_proof_id @
-                            triblespace_core::repo::signed_by: ?next_signer
+                            triblespace_core::attestation::signed_by: ?next_signer
                         }])
                     );
                     let next_signer = match iter.next() {

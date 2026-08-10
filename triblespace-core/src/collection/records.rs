@@ -21,6 +21,7 @@ use ed25519::signature::Signer;
 use ed25519::Signature;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
+use crate::attestation::{signature_r, signature_s, signed_by};
 use crate::attribute::Attribute;
 use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
 use crate::blob::{Blob, TryFromBlob};
@@ -30,9 +31,8 @@ use crate::inline::encodings::ed25519::{ED25519PublicKey, ED25519RComponent, ED2
 use crate::inline::encodings::genid::{GenId, IdParseError};
 use crate::inline::encodings::hash::{Blake3, Handle, Hash};
 use crate::inline::{Inline, InlineEncoding};
-use crate::metadata;
+use crate::metadata::{self, archive as commit_metadata};
 use crate::prelude::{attributes, entity};
-use crate::repo::{metadata as commit_metadata, signature_r, signature_s, signed_by};
 use crate::trible::{Fragment, TribleSet, TRIBLE_LEN};
 
 /// Tag identifying a canonical collection definition.

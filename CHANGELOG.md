@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Signed records now use neutral metadata and attestation namespaces.** The
+  generic metadata-archive link and Ed25519 signer/signature attributes moved
+  out of the legacy repository module without changing their stable IDs or
+  wire encodings. Collection records, capabilities, and legacy commits now
+  share those structural fields without making collection semantics depend on
+  branch/CAS code.
 - **The native compressed Succinct universe now uses one zero-prefix layout.**
   Every ordered 32-byte value contributes its second 16-byte half, while the
   leading run of intrinsic identifiers shares an implicit all-zero first half;

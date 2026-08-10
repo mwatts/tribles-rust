@@ -84,11 +84,11 @@ pub fn commit_metadata(
     let fragment = entity! {
         crate::metadata::created_at?: created_at,
         super::content?: content_handle,
-        super::signed_by?: signed_by,
-        super::signature_r?: signature,
-        super::signature_s?: signature,
+        crate::attestation::signed_by?: signed_by,
+        crate::attestation::signature_r?: signature,
+        crate::attestation::signature_s?: signature,
         super::message?: msg,
-        super::metadata?: metadata,
+        crate::metadata::archive?: metadata,
         super::parent*: parents,
     };
 
@@ -107,9 +107,9 @@ pub fn verify(content: Blob<SimpleArchive>, metadata: TribleSet) -> Result<(), V
     pattern!(&metadata, [
     {
         super::content: handle,
-        super::signed_by: ?pubkey,
-        super::signature_r: ?r,
-        super::signature_s: ?s
+        crate::attestation::signed_by: ?pubkey,
+        crate::attestation::signature_r: ?r,
+        crate::attestation::signature_s: ?s
     }]))
     .at_most_one()
     {

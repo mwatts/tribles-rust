@@ -40,7 +40,7 @@ signing its contents:
 ```rust
 use triblespace::prelude::*;
 use triblespace::examples::literature;
-use triblespace::repo;
+use triblespace::core::{attestation, repo};
 use inlineencodings::{Handle, Blake3};
 use blobencodings::{SimpleArchive, LongString};
 use rand::rngs::OsRng;
@@ -84,9 +84,9 @@ let signature: Signature = commit_author_key.sign(
 let _meta_set = entity!{
    repo::content: archived_set_handle,
    repo::short_message: "Initial commit",
-   repo::signed_by: commit_author_key.verifying_key(),
-   repo::signature_r: signature,
-   repo::signature_s: signature,
+   attestation::signed_by: commit_author_key.verifying_key(),
+   attestation::signature_r: signature,
+   attestation::signature_s: signature,
 };
 ```
 

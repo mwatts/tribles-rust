@@ -109,9 +109,9 @@ pub fn branch_metadata(
     let fragment = entity! {
         super::branch: branch_id,
         super::head?: head_handle,
-        super::signed_by?: signed_by,
-        super::signature_r?: signature,
-        super::signature_s?: signature,
+        crate::attestation::signed_by?: signed_by,
+        crate::attestation::signature_r?: signature,
+        crate::attestation::signature_s?: signature,
         metadata::name: name,
         metadata::updated_at: updated_at,
     };
@@ -178,9 +178,9 @@ pub fn verify(
     pattern!(&metadata, [
     {
         branch_entity @ super::head: handle,
-        super::signed_by: ?pubkey,
-        super::signature_r: ?r,
-        super::signature_s: ?s,
+        crate::attestation::signed_by: ?pubkey,
+        crate::attestation::signature_r: ?r,
+        crate::attestation::signature_s: ?s,
     }]))
     .at_most_one()
     {

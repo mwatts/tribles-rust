@@ -4,6 +4,7 @@
 //! It defines meta attributes that are used to describe other attributes.
 
 use crate::blob::encodings::longstring::LongString;
+use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::wasmcode::WasmCode;
 use crate::id::Id;
 use crate::id_hex;
@@ -103,6 +104,11 @@ pub const KIND_PROTOCOL: Id = id_hex!("A04AD649FA28DC5904385532E9C8EF74");
 pub const KIND_TAG: Id = id_hex!("452584B4C1CAE0B77F44408E6F194A31");
 
 attributes! {
+    /// Generic link to a canonical metadata archive.
+    ///
+    /// The surrounding record format decides whether this handle participates
+    /// in an attestation and, if so, which transcript covers it.
+    "88B59BD497540AC5AECDB7518E737C87" unsafe as pub archive: inlineencodings::Handle<SimpleArchive>;
     /// Optional long-form description stored as a LongString handle.
     ///
     /// This attribute is general-purpose: it can describe any entity. Schema
@@ -208,4 +214,17 @@ attributes! {
     /// domains (wiki fragments, compass reviews, relations groups, memory
     /// chunks); a merge that reconciles two heads may supersede both.
     "EA5308C6296520A185DE4E5019F779FB" unsafe as supersedes: inlineencodings::GenId;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_archive_attribute_id_is_preserved() {
+        assert_eq!(
+            archive.id(),
+            crate::id_hex!("88B59BD497540AC5AECDB7518E737C87")
+        );
+    }
 }

@@ -216,15 +216,12 @@ use ed25519_dalek::SigningKey;
 
 use crate::blob::encodings::longstring::LongString;
 use crate::blob::encodings::simplearchive::SimpleArchive;
-use crate::inline::encodings::ed25519 as ed;
 use crate::inline::encodings::shortstring::ShortString;
 use crate::prelude::*;
 
 attributes! {
     /// The actual data of the commit.
     "4DD4DDD05CC31734B03ABB4E43188B1F" unsafe as pub content: Handle<SimpleArchive>;
-    /// Metadata describing the commit content.
-    "88B59BD497540AC5AECDB7518E737C87" unsafe as pub metadata: Handle<SimpleArchive>;
     /// A commit that this commit is based on.
     "317044B612C690000D798CA660ECFD2A" unsafe as pub parent: Handle<SimpleArchive>;
     /// A (potentially long) message describing the commit.
@@ -235,12 +232,6 @@ attributes! {
     "272FBC56108F336C4D2E17289468C35F" unsafe as pub head: Handle<SimpleArchive>;
     /// An id used to track the branch.
     "8694CC73AF96A5E1C7635C677D1B928A" unsafe as pub branch: GenId;
-    /// The author of the signature identified by their ed25519 public key.
-    "ADB4FFAD247C886848161297EFF5A05B" unsafe as pub signed_by: ed::ED25519PublicKey;
-    /// The `r` part of a ed25519 signature.
-    "9DF34F84959928F93A3C40AEB6E9E499" unsafe as pub signature_r: ed::ED25519RComponent;
-    /// The `s` part of a ed25519 signature.
-    "1ACE03BF70242B289FDF00E4327C3BC6" unsafe as pub signature_s: ed::ED25519SComponent;
 }
 
 /// Rebuild branch-head metadata against a new commit head, carrying every
@@ -2965,7 +2956,7 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
                                 .map_err(WorkspaceCheckoutError::Storage)?;
                             let metadata_opt = match find!(
                                 (c: Inline<_>),
-                                pattern!(&meta, [{ metadata: ?c }])
+                                pattern!(&meta, [{ crate::metadata::archive: ?c }])
                             )
                             .at_most_one()
                             {
@@ -2996,7 +2987,9 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
                 .map_err(WorkspaceCheckoutError::Storage)?;
 
             let metadata_opt =
-                match find!((c: Inline<_>), pattern!(&meta, [{ metadata: ?c }])).at_most_one() {
+                match find!((c: Inline<_>), pattern!(&meta, [{ crate::metadata::archive: ?c }]))
+                    .at_most_one()
+                {
                     Ok(Some((c,))) => Some(c),
                     Ok(None) => None,
                     Err(_) => return Err(WorkspaceCheckoutError::BadCommitMetadata()),
@@ -3060,7 +3053,7 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
                             };
                             let metadata_opt = match find!(
                                 (c: Inline<_>),
-                                pattern!(&meta, [{ metadata: ?c }])
+                                pattern!(&meta, [{ crate::metadata::archive: ?c }])
                             )
                             .at_most_one()
                             {
@@ -3110,7 +3103,9 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
             }
 
             let metadata_opt =
-                match find!((c: Inline<_>), pattern!(&meta, [{ metadata: ?c }])).at_most_one() {
+                match find!((c: Inline<_>), pattern!(&meta, [{ crate::metadata::archive: ?c }]))
+                    .at_most_one()
+                {
                     Ok(Some((c,))) => Some(c),
                     Ok(None) => None,
                     Err(_) => return Err(WorkspaceCheckoutError::BadCommitMetadata()),

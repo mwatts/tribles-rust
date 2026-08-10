@@ -49,7 +49,7 @@ fn commit_harness() {
     // Ensure the content handle and signature info were stored
     let (handle, pubkey, _r, _s) = find!(
         (h: Inline<_>, k: Inline<_>, r, s),
-        pattern!(&commit_set, [{ repo::content: h, repo::signed_by: k, repo::signature_r: r, repo::signature_s: s }])
+        pattern!(&commit_set, [{ repo::content: h, crate::attestation::signed_by: k, crate::attestation::signature_r: r, crate::attestation::signature_s: s }])
     )
     .at_most_one()
     .unwrap()

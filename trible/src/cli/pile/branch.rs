@@ -1950,12 +1950,12 @@ fn read_commit_fields(commit: &TribleSet) -> CommitInfo {
     use triblespace_core::repo;
 
     let content_attr = repo::content.id();
-    let metadata_attr = repo::metadata.id();
+    let metadata_attr = triblespace_core::metadata::archive.id();
     let parent_attr = repo::parent.id();
     let message_attr = repo::message.id();
     let short_message_attr = repo::short_message.id();
     let created_at_attr = triblespace_core::metadata::created_at.id();
-    let signed_by_attr = repo::signed_by.id();
+    let signed_by_attr = triblespace_core::attestation::signed_by.id();
 
     let mut info = CommitInfo {
         parents: Vec::new(),
