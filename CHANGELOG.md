@@ -233,6 +233,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The optional telemetry sink now publishes native collection commits.**
+  Per-thread `Fragment` batches retain their attachments until a central
+  `Collection<Pile>` durably commits them, carry the telemetry protocol as
+  metafacts, and remain intact for an identical retry after publication
+  failure. `TELEMETRY_COLLECTION_SCOPE` replaces the former branch setting;
+  telemetry no longer creates Repository/Workspace histories or CAS heads.
+
 - **Collection resolution now honors every `DERIVE` pair as a canonical join
   homomorphism.** Source subsumption is lifted into target collections without
   requiring redundant target `MERGE` records, and active source/target

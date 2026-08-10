@@ -3,24 +3,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::core::collection::Collection;
 use crate::core::metadata;
 use crate::core::repo::pile::Pile;
-use crate::core::repo::{Repository, Workspace};
 use crate::prelude::blobencodings::LongString;
-use crate::prelude::inlineencodings::{Blake3, GenId, Handle, ShortString, U256BE};
+use crate::prelude::inlineencodings::{GenId, Handle, ShortString, U256BE};
 use crate::prelude::*;
 use ed25519_dalek::SigningKey;
 use rand_core06::OsRng;
 use thread_local::ThreadLocal;
 use tracing::Subscriber;
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::EnvFilter;
 
 const ENV_TELEMETRY_PILE: &str = "TELEMETRY_PILE";
 const ENV_PILE: &str = "PILE";
-const ENV_TELEMETRY_BRANCH: &str = "TELEMETRY_BRANCH";
+const ENV_TELEMETRY_COLLECTION_SCOPE: &str = "TELEMETRY_COLLECTION_SCOPE";
 const ENV_TELEMETRY_FLUSH_MS: &str = "TELEMETRY_FLUSH_MS";
 
 pub mod schema {
@@ -84,19 +84,39 @@ fn is_valid_short(value: &str) -> bool {
 }
 
 struct ThreadTelemetry {
-    workspace: Workspace<Pile>,
+    batch: Fragment,
     last_flush: Instant,
 }
 
 struct TelemetryInner {
-    repo: Mutex<Option<Repository<Pile>>>,
-    workspaces: ThreadLocal<Arc<Mutex<ThreadTelemetry>>>,
+    collection: Mutex<Option<Collection<Pile>>>,
+    batches: ThreadLocal<Arc<Mutex<ThreadTelemetry>>>,
     registry: Mutex<Vec<Arc<Mutex<ThreadTelemetry>>>>,
     session: Id,
     base: Instant,
-    branch_id: Id,
     flush_interval: Duration,
     shutdown: AtomicBool,
+}
+
+fn self_describing(mut batch: Fragment) -> Fragment {
+    batch.describe_with(schema::build_telemetry_metadata());
+    batch
+}
+
+/// Publish a clone of the pending batch and clear the durable in-memory copy
+/// only after the publication succeeds. A partial backend failure can
+/// therefore be retried with the exact same content-addressed commit.
+fn publish_pending<E>(
+    state: &mut ThreadTelemetry,
+    publish: impl FnOnce(Fragment) -> Result<(), E>,
+) -> Result<bool, E> {
+    if state.batch.facts().is_empty() {
+        return Ok(false);
+    }
+
+    publish(self_describing(state.batch.clone()))?;
+    state.batch = Fragment::empty();
+    Ok(true)
 }
 
 impl TelemetryInner {
@@ -105,12 +125,9 @@ impl TelemetryInner {
     }
 
     fn get_or_init_thread(&self) -> &Arc<Mutex<ThreadTelemetry>> {
-        self.workspaces.get_or(|| {
-            let mut repo_guard = self.repo.lock().expect("telemetry repo lock");
-            let repo = repo_guard.as_mut().expect("telemetry repo not closed");
-            let ws = repo.pull(self.branch_id).expect("telemetry pull workspace");
+        self.batches.get_or(|| {
             let arc = Arc::new(Mutex::new(ThreadTelemetry {
-                workspace: ws,
+                batch: Fragment::empty(),
                 last_flush: Instant::now(),
             }));
             self.registry
@@ -125,10 +142,17 @@ impl TelemetryInner {
         if state.last_flush.elapsed() < self.flush_interval {
             return;
         }
-        let mut repo_guard = self.repo.lock().expect("telemetry repo lock");
-        if let Some(repo) = repo_guard.as_mut() {
-            if let Err(e) = repo.push(&mut state.workspace) {
+
+        if state.batch.facts().is_empty() {
+            state.last_flush = Instant::now();
+            return;
+        }
+
+        let mut collection_guard = self.collection.lock().expect("telemetry collection lock");
+        if let Some(collection) = collection_guard.as_mut() {
+            if let Err(e) = publish_pending(state, |batch| collection.commit(batch).map(|_| ())) {
                 log::warn!("telemetry flush failed: {e:?}");
+                return;
             }
         }
         state.last_flush = Instant::now();
@@ -229,7 +253,7 @@ where
         attrs.record(&mut fields);
 
         let start_ns = self.inner.now_ns();
-        let span_id = *ufoid();
+        let span_id = *genid();
         let parent = self.parent_id(attrs, &ctx);
 
         span.extensions_mut().insert(TelemetrySpanData {
@@ -249,7 +273,7 @@ where
         };
 
         span_begin(
-            &mut state.workspace,
+            &mut state.batch,
             self.inner.session,
             span_id,
             parent,
@@ -278,7 +302,7 @@ where
         let mut state = thread_state.lock().expect("telemetry thread state lock");
 
         span_end(
-            &mut state.workspace,
+            &mut state.batch,
             data.span,
             end_ns,
             end_ns.saturating_sub(data.start_ns),
@@ -308,16 +332,16 @@ impl Telemetry {
         }
         let pile_path = PathBuf::from(pile_path);
 
-        let branch_hex = std::env::var(ENV_TELEMETRY_BRANCH).ok()?;
-        let branch_hex = branch_hex.trim();
-        if branch_hex.len() != 32 {
+        let scope_hex = std::env::var(ENV_TELEMETRY_COLLECTION_SCOPE).ok()?;
+        let scope_hex = scope_hex.trim();
+        if scope_hex.len() != 32 {
             log::warn!(
-                "TELEMETRY_BRANCH must be a 32-char hex ID, got {} chars",
-                branch_hex.len()
+                "TELEMETRY_COLLECTION_SCOPE must be a 32-char hex ID, got {} chars",
+                scope_hex.len()
             );
             return None;
         }
-        let branch_id = Id::from_hex(branch_hex)?;
+        let collection_scope = Id::from_hex(scope_hex)?;
 
         let flush_ms = std::env::var(ENV_TELEMETRY_FLUSH_MS)
             .ok()
@@ -326,7 +350,7 @@ impl Telemetry {
         let flush_interval = Duration::from_millis(flush_ms.max(10));
 
         let base = Instant::now();
-        let session_id = *ufoid();
+        let session_id = *genid();
 
         // Open the pile with the non-mutating refresh — never amputate on
         // open. A corrupt telemetry pile disables telemetry (fail loud in
@@ -347,33 +371,29 @@ impl Telemetry {
         }
 
         let signing_key = SigningKey::generate(&mut OsRng);
-        let metadata_fragment = schema::build_telemetry_metadata();
-        let metadata_set: TribleSet = metadata_fragment.into();
-        let mut repo = Repository::new(pile, signing_key, metadata_set).ok()?;
+        let mut collection = Collection::new(pile, collection_scope, signing_key);
 
         // Commit session start entity.
-        let mut ws = repo.pull(branch_id).ok()?;
         let session_entity = ExclusiveId::force_ref(&session_id);
-        let mut init = TribleSet::new();
+        let mut init = Fragment::empty();
+        let session_name = init.put(session_name.to_string());
         init += entity! { session_entity @
             metadata::tag: schema::kind_session,
             schema::category: "session",
-            schema::name: ws.put(session_name.to_string()),
+            schema::name: session_name,
             schema::begin_ns: 0u64,
         };
-        ws.commit(init, "telemetry session");
-        if repo.push(&mut ws).is_err() {
-            let _ = repo.close();
+        if collection.commit(self_describing(init)).is_err() {
+            let _ = collection.close();
             return None;
         }
 
         let inner = Arc::new(TelemetryInner {
-            repo: Mutex::new(Some(repo)),
-            workspaces: ThreadLocal::new(),
+            collection: Mutex::new(Some(collection)),
+            batches: ThreadLocal::new(),
             registry: Mutex::new(Vec::new()),
             session: session_id,
             base,
-            branch_id,
             flush_interval,
             shutdown: AtomicBool::new(false),
         });
@@ -407,40 +427,45 @@ impl Drop for Telemetry {
     fn drop(&mut self) {
         self.inner.shutdown.store(true, Ordering::Relaxed);
 
-        // Flush all thread-local workspaces.
+        // Flush all thread-local batches. Each flush takes the locks in the
+        // same state-then-collection order as the tracing callbacks.
         let registry = self.inner.registry.lock().expect("telemetry registry lock");
-        {
-            let mut repo_guard = self.inner.repo.lock().expect("telemetry repo lock");
-            if let Some(repo) = repo_guard.as_mut() {
-                for state_arc in registry.iter() {
-                    let mut state = state_arc.lock().expect("telemetry thread state lock");
-                    if let Err(e) = repo.push(&mut state.workspace) {
-                        log::warn!("telemetry shutdown flush failed: {e:?}");
-                    }
-                }
-
-                // Commit session end entity.
-                let end_ns = self.inner.now_ns();
-                if let Ok(mut ws) = repo.pull(self.inner.branch_id) {
-                    let session_entity = ExclusiveId::force_ref(&self.inner.session);
-                    let mut end = TribleSet::new();
-                    end += entity! { session_entity @
-                        schema::end_ns: end_ns,
-                        schema::duration_ns: end_ns,
-                    };
-                    ws.commit(end, "telemetry session end");
-                    if let Err(e) = repo.push(&mut ws) {
-                        log::warn!("telemetry session end push failed: {e:?}");
-                    }
+        for state_arc in registry.iter() {
+            let mut state = state_arc.lock().expect("telemetry thread state lock");
+            let mut collection_guard = self
+                .inner
+                .collection
+                .lock()
+                .expect("telemetry collection lock");
+            if let Some(collection) = collection_guard.as_mut() {
+                if let Err(e) =
+                    publish_pending(&mut state, |batch| collection.commit(batch).map(|_| ()))
+                {
+                    log::warn!("telemetry shutdown flush failed: {e:?}");
                 }
             }
         }
         drop(registry);
 
-        // Close the pile.
-        let mut repo_guard = self.inner.repo.lock().expect("telemetry repo lock");
-        if let Some(repo) = repo_guard.take() {
-            if let Err(e) = repo.close() {
+        // Commit the terminal session facts and close the pile.
+        let end_ns = self.inner.now_ns();
+        let session_entity = ExclusiveId::force_ref(&self.inner.session);
+        let mut end = Fragment::empty();
+        end += entity! { session_entity @
+            schema::end_ns: end_ns,
+            schema::duration_ns: end_ns,
+        };
+
+        let mut collection_guard = self
+            .inner
+            .collection
+            .lock()
+            .expect("telemetry collection lock");
+        if let Some(mut collection) = collection_guard.take() {
+            if let Err(e) = collection.commit(self_describing(end)) {
+                log::warn!("telemetry session end commit failed: {e:?}");
+            }
+            if let Err(e) = collection.close() {
                 log::warn!("telemetry pile close failed: {e:?}");
             }
         }
@@ -448,7 +473,7 @@ impl Drop for Telemetry {
 }
 
 fn span_begin(
-    ws: &mut Workspace<Pile>,
+    batch: &mut Fragment,
     session: Id,
     span_id: Id,
     parent: Option<Id>,
@@ -458,29 +483,92 @@ fn span_begin(
     source: Option<String>,
 ) {
     let span_entity = ExclusiveId::force_ref(&span_id);
-    let mut tribles = TribleSet::new();
-    tribles += entity! { span_entity @
+    let name = batch.put(name.to_string());
+    let source = source.map(|source| batch.put(source));
+    *batch += entity! { span_entity @
         metadata::tag: schema::kind_span,
         schema::session: session,
         schema::category: category,
-        schema::name: ws.put(name.to_string()),
+        schema::name: name,
         schema::begin_ns: at_ns,
     };
     if let Some(parent) = parent {
-        tribles += entity! { span_entity @ schema::parent: parent };
+        *batch += entity! { span_entity @ schema::parent: parent };
     }
     if let Some(source) = source {
-        tribles += entity! { span_entity @ schema::source: ws.put(source) };
+        *batch += entity! { span_entity @ schema::source: source };
     }
-    ws.commit(tribles, "telemetry span");
 }
 
-fn span_end(ws: &mut Workspace<Pile>, span_id: Id, at_ns: u64, duration_ns: u64) {
+fn span_end(batch: &mut Fragment, span_id: Id, at_ns: u64, duration_ns: u64) {
     let span_entity = ExclusiveId::force_ref(&span_id);
-    let mut tribles = TribleSet::new();
-    tribles += entity! { span_entity @
+    *batch += entity! { span_entity @
         schema::end_ns: at_ns,
         schema::duration_ns: duration_ns,
     };
-    ws.commit(tribles, "telemetry span end");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pending_span() -> Fragment {
+        let mut batch = Fragment::empty();
+        span_begin(
+            &mut batch,
+            *genid(),
+            *genid(),
+            None,
+            7,
+            "telemetry",
+            "pending_span",
+            Some("telemetry::tests".to_owned()),
+        );
+        batch
+    }
+
+    #[test]
+    fn failed_publish_keeps_the_exact_pending_batch_for_retry() {
+        let batch = pending_span();
+        let mut state = ThreadTelemetry {
+            batch: batch.clone(),
+            last_flush: Instant::now(),
+        };
+
+        let result = publish_pending(&mut state, |_| Err::<(), _>("backend unavailable"));
+
+        assert_eq!(result, Err("backend unavailable"));
+        assert_eq!(state.batch, batch);
+    }
+
+    #[test]
+    fn successful_publish_is_self_describing_and_clears_the_batch() {
+        let batch = pending_span();
+        assert!(!batch.facts().is_empty());
+        assert!(!batch.blobs().is_empty());
+
+        let mut state = ThreadTelemetry {
+            batch: batch.clone(),
+            last_flush: Instant::now(),
+        };
+        let mut published = None;
+
+        let result = publish_pending(&mut state, |candidate| {
+            published = Some(candidate);
+            Ok::<(), ()>(())
+        });
+
+        assert_eq!(result, Ok(true));
+        assert_eq!(state.batch, Fragment::empty());
+
+        let published = published.expect("publisher received the batch");
+        assert_eq!(published.facts(), batch.facts());
+        let description = schema::build_telemetry_metadata();
+        for fact in description.facts() {
+            assert!(published.metafacts().contains(fact));
+        }
+        for fact in description.metafacts() {
+            assert!(published.metafacts().contains(fact));
+        }
+    }
 }
