@@ -220,7 +220,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requiring redundant target `MERGE` records, and active source/target
   commuting squares complete either missing equation. Implied target merges
   participate in physical-cover fallback, and incompatible explicit or implied
-  equations produce deterministic functional conflicts.
+  equations completed by active squares produce deterministic functional
+  conflicts. Concrete validators remain the trust boundary for the ACI join
+  and canonical-homomorphism laws: the generic resolver does not materialize
+  every absorption equation or diagnose all order-only global inconsistencies.
 
 - **`UnionArchive` is now a storage-neutral Succinct data source.** Its owned
   shard union and query constraint live beside `SuccinctArchive` under

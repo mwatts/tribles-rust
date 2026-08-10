@@ -35,6 +35,10 @@ type DeriveOutput = (CollectionData, Id);
 /// no additional scope relationship. Every accepted `Derive` belongs to the
 /// canonical source-to-target join homomorphism: mappings for the same exact
 /// collection pair preserve joins and therefore preserve the induced order.
+/// The callback is the trust boundary for those algebraic laws: this resolver
+/// diagnoses direct functional conflicts and conflicts completed by active
+/// commuting squares, but does not materialize every absorption equation or
+/// globally re-prove order consistency among accepted claims.
 #[derive(Clone, Copy, Debug)]
 pub enum CollectionValidationRequest<'a> {
     /// An authorized, strictly self-signed commit whose element still needs
@@ -86,7 +90,9 @@ impl CollectionValidationRequest<'_> {
 /// registry of earlier verdicts.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CollectionClaimValidation<D> {
-    /// The exact claim is semantically valid under the supplied definition(s).
+    /// The exact claim is semantically valid under the supplied definition(s),
+    /// including the collection's ACI join law and, for a derivation, the
+    /// canonical homomorphism law.
     Accepted,
     /// Validation cannot yet conclude, commonly because an endpoint is absent.
     Pending,
@@ -114,7 +120,9 @@ pub struct ConflictingCollectionOutput {
 /// Direct conflicts include accepted equations whose inputs are not currently
 /// members. Conflicts implied by a commuting square become visible once the
 /// square is active; deferring either kind would make future roots expose an
-/// order-dependent semantic contradiction.
+/// order-dependent semantic contradiction. This is deliberately not a global
+/// algebra checker: order-only contradictions outside an active commuting
+/// square remain the validation callback's responsibility.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CollectionFunctionalConflict {
     /// One commutative merge key has two results.
