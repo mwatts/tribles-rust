@@ -440,3 +440,46 @@ mod tests {
         assert_eq!(r1.bytes.len(), r4.bytes.len(), "same payload, same total");
     }
 }
+
+#[cfg(test)]
+mod shape_check_reach {
+    use super::elements::{F32, F64};
+    use super::*;
+
+    fn payload(n: usize) -> Bytes {
+        Bytes::from_source(vec![0u8; n])
+    }
+
+    /// The dims-imply-length check is one comparison covering a family of
+    /// errors, because they all break the same invariant.
+    #[test]
+    fn one_check_catches_several_different_mistakes() {
+        // a truncated payload
+        assert!(tensor_blob::<F32, 2>([3, 4], payload(40)).is_err());
+        // a payload sized for a wider element
+        assert!(tensor_blob::<F32, 2>([3, 4], payload(96)).is_err());
+        assert!(tensor_blob::<F64, 2>([3, 4], payload(48)).is_err());
+        // reading with an extra dimension: it comes from the zero padding
+        let blob = tensor_blob::<F32, 2>([3, 4], payload(48)).expect("ok");
+        let wrong: Blob<Tensor<F32, 3>> = blob.transmute();
+        assert!(<TensorView as TryFromBlob<Tensor<F32, 3>>>::try_from_blob(wrong).is_err());
+        // and reading with a MISSING leading dimension
+        let blob = tensor_blob::<F32, 3>([2, 3, 4], payload(96)).expect("ok");
+        let wrong: Blob<Tensor<F32, 2>> = blob.transmute();
+        assert!(<TensorView as TryFromBlob<Tensor<F32, 2>>>::try_from_blob(wrong).is_err());
+    }
+
+    /// The one case that passes, and it is not a hole: a trailing dimension of
+    /// 1 read away leaves the identical elements in the identical order, so
+    /// [3,4,1] and [3,4] describe the same tensor. The check declines to
+    /// complain about a difference that is not one.
+    #[test]
+    fn a_trailing_unit_dimension_is_genuinely_the_same_tensor() {
+        let blob = tensor_blob::<F32, 3>([3, 4, 1], payload(48)).expect("ok");
+        let as_rank2: Blob<Tensor<F32, 2>> = blob.transmute();
+        let view: TensorView =
+            <TensorView as TryFromBlob<Tensor<F32, 2>>>::try_from_blob(as_rank2).expect("passes");
+        assert_eq!(view.dims(), &[3, 4]);
+        assert_eq!(view.elems(), 12, "same elements, same order");
+    }
+}
