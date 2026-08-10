@@ -2933,20 +2933,10 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 [[package]]
 name = "jerky"
 version = "0.9.0"
-source = "git+https://github.com/triblespace/jerky.git?rev=6cdd751efb03543669f2ab8cd5ae3bb162f32d07#6cdd751efb03543669f2ab8cd5ae3bb162f32d07"
+source = "git+https://github.com/triblespace/jerky.git?rev=fc0be54529f6bc0a6c5e7312cd649de21a7f3316#fc0be54529f6bc0a6c5e7312cd649de21a7f3316"
 dependencies = [
  "anybytes",
  "cubecl",
- "num-traits",
- "zerocopy",
-]
-
-[[package]]
-name = "jerky"
-version = "0.9.0"
-source = "git+https://github.com/triblespace/jerky.git?rev=8a066da4a70eb1188f5c6dca70c009e07aa6d048#8a066da4a70eb1188f5c6dca70c009e07aa6d048"
-dependencies = [
- "anybytes",
  "num-traits",
  "zerocopy",
 ]
@@ -5491,7 +5481,7 @@ dependencies = [
  "rand 0.8.7",
  "regex",
  "triblespace 0.47.0",
- "triblespace 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=6c346e045b33a2e1112fcf48a712ec1db6779c46)",
+ "triblespace 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=429d1204a87ee3bad3e9ed5f606575f17a1c5453)",
  "triblespace-core 0.47.0",
 ]
 
@@ -5500,17 +5490,18 @@ name = "triblespace"
 version = "0.47.0"
 dependencies = [
  "triblespace-core 0.47.0",
- "triblespace-gpu",
+ "triblespace-gpu 0.47.0",
  "triblespace-macros 0.47.0",
 ]
 
 [[package]]
 name = "triblespace"
 version = "0.47.0"
-source = "git+https://github.com/triblespace/triblespace-rs?rev=6c346e045b33a2e1112fcf48a712ec1db6779c46#6c346e045b33a2e1112fcf48a712ec1db6779c46"
+source = "git+https://github.com/triblespace/triblespace-rs?rev=429d1204a87ee3bad3e9ed5f606575f17a1c5453#429d1204a87ee3bad3e9ed5f606575f17a1c5453"
 dependencies = [
- "triblespace-core 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=6c346e045b33a2e1112fcf48a712ec1db6779c46)",
- "triblespace-macros 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=6c346e045b33a2e1112fcf48a712ec1db6779c46)",
+ "triblespace-core 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=429d1204a87ee3bad3e9ed5f606575f17a1c5453)",
+ "triblespace-gpu 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=429d1204a87ee3bad3e9ed5f606575f17a1c5453)",
+ "triblespace-macros 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=429d1204a87ee3bad3e9ed5f606575f17a1c5453)",
 ]
 
 [[package]]
@@ -5537,8 +5528,9 @@ dependencies = [
  "indexmap",
  "indxvec",
  "itertools",
- "jerky 0.9.0 (git+https://github.com/triblespace/jerky.git?rev=6cdd751efb03543669f2ab8cd5ae3bb162f32d07)",
+ "jerky",
  "json-event-parser",
+ "libc",
  "memmap2",
  "num-rational",
  "object_store",
@@ -5562,12 +5554,13 @@ dependencies = [
  "wasmi",
  "winnow 0.7.15",
  "zerocopy",
+ "zeroize",
 ]
 
 [[package]]
 name = "triblespace-core"
 version = "0.47.0"
-source = "git+https://github.com/triblespace/triblespace-rs?rev=6c346e045b33a2e1112fcf48a712ec1db6779c46#6c346e045b33a2e1112fcf48a712ec1db6779c46"
+source = "git+https://github.com/triblespace/triblespace-rs?rev=429d1204a87ee3bad3e9ed5f606575f17a1c5453#429d1204a87ee3bad3e9ed5f606575f17a1c5453"
 dependencies = [
  "ahash",
  "anybytes",
@@ -5589,8 +5582,9 @@ dependencies = [
  "indexmap",
  "indxvec",
  "itertools",
- "jerky 0.9.0 (git+https://github.com/triblespace/jerky.git?rev=8a066da4a70eb1188f5c6dca70c009e07aa6d048)",
+ "jerky",
  "json-event-parser",
+ "libc",
  "memmap2",
  "num-rational",
  "object_store",
@@ -5607,13 +5601,14 @@ dependencies = [
  "smallvec",
  "sptr",
  "tokio",
- "triblespace-core-macros 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=6c346e045b33a2e1112fcf48a712ec1db6779c46)",
+ "triblespace-core-macros 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=429d1204a87ee3bad3e9ed5f606575f17a1c5453)",
  "url",
  "uuid",
  "ux",
  "wasmi",
  "winnow 0.7.15",
  "zerocopy",
+ "zeroize",
 ]
 
 [[package]]
@@ -5629,12 +5624,12 @@ dependencies = [
 [[package]]
 name = "triblespace-core-macros"
 version = "0.47.0"
-source = "git+https://github.com/triblespace/triblespace-rs?rev=6c346e045b33a2e1112fcf48a712ec1db6779c46#6c346e045b33a2e1112fcf48a712ec1db6779c46"
+source = "git+https://github.com/triblespace/triblespace-rs?rev=429d1204a87ee3bad3e9ed5f606575f17a1c5453#429d1204a87ee3bad3e9ed5f606575f17a1c5453"
 dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
- "triblespace-macros-common 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=6c346e045b33a2e1112fcf48a712ec1db6779c46)",
+ "triblespace-macros-common 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=429d1204a87ee3bad3e9ed5f606575f17a1c5453)",
 ]
 
 [[package]]
@@ -5643,8 +5638,19 @@ version = "0.47.0"
 dependencies = [
  "cubecl",
  "itertools",
- "jerky 0.9.0 (git+https://github.com/triblespace/jerky.git?rev=6cdd751efb03543669f2ab8cd5ae3bb162f32d07)",
+ "jerky",
  "triblespace-core 0.47.0",
+]
+
+[[package]]
+name = "triblespace-gpu"
+version = "0.47.0"
+source = "git+https://github.com/triblespace/triblespace-rs?rev=429d1204a87ee3bad3e9ed5f606575f17a1c5453#429d1204a87ee3bad3e9ed5f606575f17a1c5453"
+dependencies = [
+ "cubecl",
+ "itertools",
+ "jerky",
+ "triblespace-core 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=429d1204a87ee3bad3e9ed5f606575f17a1c5453)",
 ]
 
 [[package]]
@@ -5664,16 +5670,16 @@ dependencies = [
 [[package]]
 name = "triblespace-macros"
 version = "0.47.0"
-source = "git+https://github.com/triblespace/triblespace-rs?rev=6c346e045b33a2e1112fcf48a712ec1db6779c46#6c346e045b33a2e1112fcf48a712ec1db6779c46"
+source = "git+https://github.com/triblespace/triblespace-rs?rev=429d1204a87ee3bad3e9ed5f606575f17a1c5453#429d1204a87ee3bad3e9ed5f606575f17a1c5453"
 dependencies = [
  "ed25519-dalek",
  "hex",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
- "triblespace-core 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=6c346e045b33a2e1112fcf48a712ec1db6779c46)",
- "triblespace-core-macros 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=6c346e045b33a2e1112fcf48a712ec1db6779c46)",
- "triblespace-macros-common 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=6c346e045b33a2e1112fcf48a712ec1db6779c46)",
+ "triblespace-core 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=429d1204a87ee3bad3e9ed5f606575f17a1c5453)",
+ "triblespace-core-macros 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=429d1204a87ee3bad3e9ed5f606575f17a1c5453)",
+ "triblespace-macros-common 0.47.0 (git+https://github.com/triblespace/triblespace-rs?rev=429d1204a87ee3bad3e9ed5f606575f17a1c5453)",
 ]
 
 [[package]]
@@ -5688,7 +5694,7 @@ dependencies = [
 [[package]]
 name = "triblespace-macros-common"
 version = "0.47.0"
-source = "git+https://github.com/triblespace/triblespace-rs?rev=6c346e045b33a2e1112fcf48a712ec1db6779c46#6c346e045b33a2e1112fcf48a712ec1db6779c46"
+source = "git+https://github.com/triblespace/triblespace-rs?rev=429d1204a87ee3bad3e9ed5f606575f17a1c5453#429d1204a87ee3bad3e9ed5f606575f17a1c5453"
 dependencies = [
  "proc-macro2",
  "quote",

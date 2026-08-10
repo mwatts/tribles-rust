@@ -23,9 +23,9 @@ use subject::core::blob::TryFromBlob;
 use subject::core::id::Id;
 #[cfg(feature = "rpq")]
 use subject::core::import::ntriples::uri_to_id_pure;
-use subject::core::inline::encodings::hash::Handle;
 use subject::core::inline::Inline;
 use subject::core::inline::InlineEncoding;
+use subject::core::inline::encodings::hash::Handle;
 use subject::core::macros::entity;
 use subject::core::metadata::{self, MetaDescribe};
 use subject::core::prelude::BlobStore;
@@ -104,7 +104,7 @@ pub type BlobReader = AnyBlobReader;
 /// attribute and a `GenId` attribute). Check `import --stats` output
 /// before trusting a schema choice in a translation.
 pub fn attr<S: InlineEncoding + MetaDescribe>(iri: &str) -> Attribute<S> {
-    Attribute::<S>::from(entity! {
+    Attribute::<S>::from_fragment_unchecked(entity! {
         metadata::iri:            iri.to_owned().to_blob().get_handle(),
         metadata::value_encoding: <S as MetaDescribe>::id(),
     })

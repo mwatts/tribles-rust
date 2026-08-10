@@ -3,8 +3,8 @@
 //! The SUBJECT engine (renamed dep `subject`, repointed per rev by
 //! bench.sh) runs the workload; results land as canonical telemetry
 //! sessions/spans plus per-measure outcome entities, written through
-//! the stable LEDGER dep (`triblespace` 0.47) on the minted results
-//! branch. Explicit stopwatch (`std::time::Instant`), one span per
+//! the pinned native-collection LEDGER dep under the minted results
+//! collection scope. Explicit stopwatch (`std::time::Instant`), one span per
 //! measured iteration (warmups unmeasured), NO aggregation in the
 //! runner — raw observations only; statistics are the viewer's job.
 //!

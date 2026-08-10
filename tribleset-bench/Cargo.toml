@@ -73,17 +73,15 @@ subject = { package = "triblespace", path = "subjects/current" }
 # same crate instance `subject::core` re-exports. Pointing at the same
 # path the subject's own core dep uses makes cargo unify the two.
 triblespace_core = { package = "triblespace-core", path = "subjects/current/triblespace-core" }
-# The results ledger: stable triblespace 0.47, used ONLY to write
-# sessions/spans/outcome entities. Measurement I/O never depends on the
-# era of the subject. 0.47.0 is not on crates.io (0.46.4 is the newest
-# published version), so the ledger pins the exact upstream rev whose
-# Cargo.toml carries 0.47.0 — an immutable commit, same stability
-# guarantee as a registry version. Ledger-side code (src/ledger.rs)
-# must use ONLY the umbrella macros (`triblespace::prelude`/
-# `triblespace::macros`) — they expand to `::triblespace::core` paths,
-# which resolve to this dep; the core-macro flavor would leak to the
-# subject's core.
-triblespace = { git = "https://github.com/triblespace/triblespace-rs", rev = "6c346e045b33a2e1112fcf48a712ec1db6779c46" }
+# The results ledger: a stable native-collection revision, used ONLY to
+# write/read sessions, spans, and outcome entities. Measurement I/O never
+# depends on the era of the subject. The exact git revision keeps the two
+# package instances separate even when bench.sh repoints the SUBJECT to an
+# older checkout. Ledger-side code (src/ledger.rs) must use ONLY the umbrella
+# macros (`triblespace::prelude`/`triblespace::macros`) — they expand to
+# `::triblespace::core` paths, which resolve to this dep; the core-macro flavor
+# would leak to the subject's core.
+triblespace = { git = "https://github.com/triblespace/triblespace-rs", rev = "429d1204a87ee3bad3e9ed5f606575f17a1c5453" }
 anyhow = "1"
 # Serve the vendored queries: blob views, SPARQL regex functions, and
 # the NsTAIInterval date folds. anybytes must unify with the subject
@@ -91,8 +89,8 @@ anyhow = "1"
 anybytes = "0.20.2"
 regex = "1"
 hifitime = "4.1.2"
-# Repository signing (both the subject's checkout phase and the ledger
-# writer create throwaway signing keys). 2.1 unifies with both graphs.
+# Collection/repository signing (the ledger writer and the subject's legacy
+# checkout phase create throwaway signing keys). 2.1 unifies with both graphs.
 ed25519-dalek = { version = "2.1.0", features = ["rand_core"] }
 rand = "0.8"
 # GORBIE 0.18.1's CardCtx calls its markdown helper unconditionally, so this

@@ -1,7 +1,7 @@
 //! Results ledger: canonical telemetry sessions/spans plus bench
-//! outcome entities, written DIRECTLY (no tracing) through the stable
-//! LEDGER dependency (`triblespace` 0.47) — measurement I/O never
-//! depends on the era of the subject.
+//! outcome entities, written DIRECTLY (no tracing) through the pinned
+//! native-collection LEDGER dependency — measurement I/O never depends
+//! on the era of the subject.
 //!
 //! DISCIPLINE: this module uses ONLY the ledger's umbrella surface
 //! (`triblespace::prelude`, `triblespace::core::…`). The umbrella
@@ -14,16 +14,20 @@
 //! `june-on-tip/src/telemetry.rs` — the minted ids are the contract;
 //! GORBIE's telemetry-viewer renders the axis.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::LazyLock;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::collection::{
+    Collection, CollectionClaimValidation, CollectionData, CollectionValidationRequest,
+    discover_collection_records, resolve_collection_semantics, simplearchive_union,
+};
 use triblespace::core::metadata;
-use triblespace::core::repo::{self, branch, PushResult, Workspace};
 use triblespace::core::repo::pile::Pile;
 use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::inlineencodings::{Handle, ShortString};
@@ -81,9 +85,14 @@ pub static KIND_SESSION: LazyLock<Id> =
 /// Tag id of a telemetry span entity.
 pub static KIND_SPAN: LazyLock<Id> =
     LazyLock::new(|| Id::from_hex("0AF9FEB9A2BFEB1BE8A8229829181085").expect("kind_span id"));
-/// The results branch every suite run commits to.
-pub static RESULTS_BRANCH: LazyLock<Id> =
-    LazyLock::new(|| Id::from_hex("F6D99F76BC15E78C0BBD44F9D28A0C0A").expect("results branch id"));
+/// Deterministic dataset scope for the benchmark-results collection.
+///
+/// This keeps the suite's existing minted results identity while changing its
+/// storage meaning from a mutable branch name to an extrinsic collection
+/// scope. Every signed run commit under this scope coexists; there is no head.
+pub static RESULTS_COLLECTION_SCOPE: LazyLock<Id> = LazyLock::new(|| {
+    Id::from_hex("F6D99F76BC15E78C0BBD44F9D28A0C0A").expect("results collection scope id")
+});
 
 /// Clip a string to a ShortString-safe payload: first line, NULs
 /// stripped, at most 32 bytes on a char boundary.
@@ -96,18 +105,42 @@ fn clip32(s: &str) -> String {
     line[..end].to_owned()
 }
 
-/// One open results pile + workspace on the results branch. All facts
-/// accumulate in a pending set; `finish` commits, pushes, and closes.
+/// Complete schema description stored beside every results element.
+///
+/// `entity!` already carries descriptions for the attributes it uses. Adding
+/// the two tag entities and the full attribute namespaces here also makes a
+/// partial run fragment intelligible without depending on Rust source or on a
+/// separate repository metadata commit.
+fn ledger_metadata() -> Fragment {
+    let mut description = tele::describe();
+    description += bench::describe();
+    description += entity! { ExclusiveId::force_ref(&*KIND_SESSION) @
+        metadata::name: "telemetry_session",
+        metadata::description:
+            "A benchmark session grouping raw timing spans and measure outcomes.",
+        metadata::tag: metadata::KIND_TAG,
+    };
+    description += entity! { ExclusiveId::force_ref(&*KIND_SPAN) @
+        metadata::name: "telemetry_span",
+        metadata::description:
+            "One raw measured iteration with begin, end, and duration in nanoseconds.",
+        metadata::tag: metadata::KIND_TAG,
+    };
+    description
+}
+
+/// One open results collection. All facts and their attachments accumulate in
+/// a self-contained fragment; `finish` publishes one independent signed commit
+/// and closes the pile.
 pub struct ResultsLedger {
-    repo: Repository<Pile>,
-    ws: Workspace<Pile>,
+    collection: Collection<Pile>,
     session: Id,
-    pending: TribleSet,
+    pending: Fragment,
 }
 
 impl ResultsLedger {
-    /// Open (creating file and results branch as needed) and start a
-    /// session entity decorated with the bench provenance attributes.
+    /// Open (creating the file as needed) and start a session entity decorated
+    /// with the bench provenance attributes.
     pub fn open(path: &Path, commit: &str, label: &str, config: &str) -> Result<Self> {
         if !path.exists() {
             std::fs::OpenOptions::new()
@@ -118,56 +151,22 @@ impl ResultsLedger {
         }
         let mut pile =
             Pile::open(path).map_err(|e| anyhow!("open results pile {}: {e:?}", path.display()))?;
-        pile.refresh().map_err(|e| anyhow!("load results pile: {e:?}"))?;
-        let branch_exists = pile
-            .head(*RESULTS_BRANCH)
-            .map_err(|e| anyhow!("read results branch head: {e:?}"))?
-            .is_some();
+        pile.refresh()
+            .map_err(|e| anyhow!("load results pile: {e:?}"))?;
+        let collection = Collection::new(
+            pile,
+            *RESULTS_COLLECTION_SCOPE,
+            SigningKey::generate(&mut OsRng),
+        );
 
-        // Commit metadata: the schema self-description — provenance as
-        // exhaust, not product.
-        let mut described = tele::describe();
-        described += bench::describe();
-        let meta: TribleSet = described.into();
-
-        let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), meta)
-            .map_err(|e| anyhow!("open repository on results pile: {e:?}"))?;
-
-        if !branch_exists {
-            // `Repository::create_branch` mints a fresh id; the suite
-            // needs the FIXED minted branch id, so replicate its steps
-            // (unsigned branch metadata, as speced).
-            let name_blob: Blob<LongString> = "tribleset-bench".to_owned().to_blob();
-            let name_handle = name_blob.get_handle();
-            repo.storage_mut()
-                .put::<LongString, _>(name_blob)
-                .map_err(|e| anyhow!("store branch name blob: {e:?}"))?;
-            let branch_set = branch::branch_unsigned(*RESULTS_BRANCH, name_handle, None);
-            let branch_handle = repo
-                .storage_mut()
-                .put(branch_set.to_blob())
-                .map_err(|e| anyhow!("store branch metadata blob: {e:?}"))?;
-            match repo
-                .storage_mut()
-                .update(*RESULTS_BRANCH, None, Some(branch_handle))
-                .map_err(|e| anyhow!("create results branch: {e:?}"))?
-            {
-                PushResult::Success() => {}
-                PushResult::Conflict(_) => bail!("results branch creation raced another writer"),
-            }
-        }
-
-        let mut ws = repo
-            .pull(*RESULTS_BRANCH)
-            .map_err(|e| anyhow!("pull results branch: {e:?}"))?;
-
-        let session_owner = ufoid();
+        let session_owner = genid();
         let session = *session_owner;
-        let name_handle = ws.put("tribleset-bench".to_string());
-        let config_handle = ws.put(config.to_string());
+        let mut pending = Fragment::empty();
+        let name_handle = pending.put("tribleset-bench".to_string());
+        let config_handle = pending.put(config.to_string());
         let commit_short = clip32(commit);
         let label_short = clip32(label);
-        let pending = entity! { &session_owner @
+        pending += entity! { &session_owner @
             metadata::tag: *KIND_SESSION,
             tele::category: "session",
             tele::name: name_handle,
@@ -175,12 +174,10 @@ impl ResultsLedger {
             bench::commit: commit_short.as_str(),
             bench::engine: label_short.as_str(),
             bench::config: config_handle,
-        }
-        .into();
+        };
 
         Ok(Self {
-            repo,
-            ws,
+            collection,
             session,
             pending,
         })
@@ -193,9 +190,9 @@ impl ResultsLedger {
 
     /// Record one measured iteration as a telemetry span.
     pub fn span(&mut self, name: &str, begin_ns: u64, duration_ns: u64) {
-        let span_owner = ufoid();
-        let name_handle = self.ws.put(name.to_string());
-        self.pending += TribleSet::from(entity! { &span_owner @
+        let span_owner = genid();
+        let name_handle = self.pending.put(name.to_string());
+        self.pending += entity! { &span_owner @
             metadata::tag: *KIND_SPAN,
             tele::session: self.session,
             tele::category: "bench",
@@ -203,97 +200,162 @@ impl ResultsLedger {
             tele::begin_ns: begin_ns,
             tele::end_ns: begin_ns + duration_ns,
             tele::duration_ns: duration_ns,
-        });
+        };
     }
 
     /// Record a per-measure outcome entity.
     pub fn outcome(&mut self, workload: &str, outcome: &str, rows: Option<u64>) {
-        let outcome_owner = ufoid();
-        let workload_handle = self.ws.put(workload.to_string());
+        let outcome_owner = genid();
+        let workload_handle = self.pending.put(workload.to_string());
         let outcome_short = clip32(outcome);
-        self.pending += TribleSet::from(entity! { &outcome_owner @
+        self.pending += entity! { &outcome_owner @
             bench::of_run: self.session,
             bench::workload: workload_handle,
             bench::outcome: outcome_short.as_str(),
-        });
+        };
         if let Some(r) = rows {
-            self.pending += TribleSet::from(entity! { &outcome_owner @ bench::rows: r });
+            self.pending += entity! { &outcome_owner @ bench::rows: r };
         }
     }
 
-    /// Close the session (end/duration), commit, push, close the pile.
+    /// Close the session, publish one independent collection commit, and close
+    /// the pile. The fragment carries every long-string attachment referenced
+    /// by its facts and its full schema description in commit metadata.
     pub fn finish(mut self, end_ns: u64) -> Result<()> {
         let session_ref = ExclusiveId::force_ref(&self.session);
-        self.pending += TribleSet::from(entity! { session_ref @
+        self.pending += entity! { session_ref @
             tele::end_ns: end_ns,
             tele::duration_ns: end_ns,
-        });
-        self.ws.commit(std::mem::take(&mut self.pending), "tribleset-bench run");
-        self.repo
-            .push(&mut self.ws)
-            .map_err(|e| anyhow!("push results: {e:?}"))?;
-        self.repo
+        };
+        self.pending.describe_with(ledger_metadata());
+        self.collection
+            .commit(std::mem::take(&mut self.pending))
+            .map_err(|e| anyhow!("publish results collection commit: {e:?}"))?;
+        self.collection
             .close()
             .map_err(|e| anyhow!("close results pile: {e:?}"))?;
         Ok(())
     }
 }
 
-/// The acceptance instrument: reopen a results pile READ-ONLY (no
-/// Repository, no appends), walk the results branch, and print session
-/// + span + outcome counts.
+fn load_collection_archive<R>(
+    reader: &R,
+    data: CollectionData,
+) -> std::result::Result<Blob<SimpleArchive>, String>
+where
+    R: BlobStoreGet,
+{
+    let handle: Inline<Handle<SimpleArchive>> = data.transmute();
+    reader
+        .get(handle)
+        .map_err(|e| format!("read collection element {data:?}: {e:?}"))
+}
+
+/// The acceptance instrument: reopen a results pile read-only, discover and
+/// resolve every valid signed commit in the deterministic results collection,
+/// unite its set-valued elements, and print session + span + outcome counts.
+///
+/// The pile itself is the trust scope, matching the old local results-branch
+/// reader: every strictly self-signed commit in this exact collection is
+/// authorized. No commit is selected as a mutable or latest head.
 pub fn verify(path: &Path) -> Result<()> {
     let mut pile =
         Pile::open(path).map_err(|e| anyhow!("open results pile {}: {e:?}", path.display()))?;
-    pile.refresh().map_err(|e| anyhow!("load results pile: {e:?}"))?;
-    let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
-    let Some(meta_handle) = pile
-        .head(*RESULTS_BRANCH)
-        .map_err(|e| anyhow!("read results branch head: {e:?}"))?
-    else {
-        bail!("no results branch {:X} in {}", &*RESULTS_BRANCH, path.display());
-    };
-    let branch_meta: TribleSet = reader
-        .get(meta_handle)
-        .map_err(|e| anyhow!("read branch metadata: {e:?}"))?;
-
-    // Walk the linear commit chain, uniting the content sets.
-    let heads: Vec<Inline<Handle<SimpleArchive>>> = find!(
-        (c: Inline<Handle<SimpleArchive>>),
-        pattern!(&branch_meta, [{ repo::head: ?c }])
-    )
-    .map(|(c,)| c)
-    .collect();
-    let [head] = heads[..] else { bail!("results branch has no unique head commit") };
-    let mut facts = TribleSet::new();
-    let mut commits = 0usize;
-    let mut cursor = Some(head);
-    while let Some(handle) = cursor {
-        let meta: TribleSet = reader
-            .get(handle)
-            .map_err(|e| anyhow!("read commit metadata: {e:?}"))?;
-        for (content,) in find!(
-            (c: Inline<Handle<SimpleArchive>>),
-            pattern!(&meta, [{ repo::content: ?c }])
-        ) {
-            let set: TribleSet = reader
-                .get(content)
-                .map_err(|e| anyhow!("read commit content: {e:?}"))?;
-            facts += set;
-        }
-        commits += 1;
-        let parents: Vec<Inline<Handle<SimpleArchive>>> = find!(
-            (p: Inline<Handle<SimpleArchive>>),
-            pattern!(&meta, [{ repo::parent: ?p }])
-        )
-        .map(|(p,)| p)
-        .collect();
-        cursor = match parents[..] {
-            [] => None,
-            [p] => Some(p),
-            _ => bail!("merge commit on the results branch (expected a linear chain)"),
-        };
+    pile.refresh()
+        .map_err(|e| anyhow!("load results pile: {e:?}"))?;
+    let discovered = discover_collection_records(&mut pile)
+        .map_err(|e| anyhow!("discover results collection records: {e:?}"))?;
+    if !discovered.diagnostics().is_empty() {
+        bail!(
+            "results pile contains invalid signed collection records: {:?}",
+            discovered.diagnostics()
+        );
     }
+
+    let definition = simplearchive_union::definition(*RESULTS_COLLECTION_SCOPE);
+    if !discovered.definitions().contains(&definition) {
+        bail!(
+            "no results collection for scope {:X} in {}",
+            &*RESULTS_COLLECTION_SCOPE,
+            path.display()
+        );
+    }
+
+    let authorized: BTreeSet<Id> = discovered
+        .commits()
+        .iter()
+        .filter(|commit| commit.collection() == definition.id())
+        .map(|commit| commit.id())
+        .collect();
+    if authorized.is_empty() {
+        bail!(
+            "results collection {:X} has no signed commits",
+            definition.id()
+        );
+    }
+
+    let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
+    let resolution = resolve_collection_semantics(&discovered, &authorized, |request| {
+        let verdict = match request {
+            CollectionValidationRequest::Commit {
+                definition: found,
+                claim,
+            } if found.id() == definition.id() => {
+                let blob = load_collection_archive(&reader, claim.data())?;
+                match simplearchive_union::validate_commit(found, claim, &blob) {
+                    Ok(()) => CollectionClaimValidation::Accepted,
+                    Err(error) => CollectionClaimValidation::Rejected(error),
+                }
+            }
+            CollectionValidationRequest::Merge {
+                definition: found,
+                claim,
+            } if found.id() == definition.id() => {
+                let (low, high) = claim.inputs();
+                let low = load_collection_archive(&reader, low)?;
+                let high = load_collection_archive(&reader, high)?;
+                let result = load_collection_archive(&reader, claim.result())?;
+                match simplearchive_union::validate_merge(found, claim, &low, &high, &result) {
+                    Ok(()) => CollectionClaimValidation::Accepted,
+                    Err(error) => CollectionClaimValidation::Rejected(error),
+                }
+            }
+            // This reader owns one concrete SimpleArchive-union collection.
+            // Unrelated records and mappings need another collection's
+            // authorization/recipe policy and therefore remain ineligible.
+            CollectionValidationRequest::Commit { .. }
+            | CollectionValidationRequest::Merge { .. }
+            | CollectionValidationRequest::Derive { .. } => CollectionClaimValidation::Pending,
+        };
+        Ok::<_, String>(verdict)
+    })
+    .map_err(|e| anyhow!("resolve results collection: {e}"))?;
+
+    let unresolved: Vec<Id> = authorized
+        .difference(resolution.admitted_claims())
+        .copied()
+        .collect();
+    if !unresolved.is_empty() {
+        bail!(
+            "results collection has unresolved commits {unresolved:?}; rejected={:?}",
+            resolution.rejected()
+        );
+    }
+
+    let mut facts = TribleSet::new();
+    for data in resolution
+        .semantics()
+        .members(definition.id())
+        .into_iter()
+        .flatten()
+    {
+        let handle: Inline<Handle<SimpleArchive>> = data.transmute();
+        let set: TribleSet = reader
+            .get(handle)
+            .map_err(|e| anyhow!("read admitted results element {data:?}: {e:?}"))?;
+        facts += set;
+    }
+    let commits = authorized.len();
 
     let kind_session: Id = *KIND_SESSION;
     let kind_span: Id = *KIND_SPAN;
@@ -312,7 +374,7 @@ pub fn verify(path: &Path) -> Result<()> {
     .count();
 
     println!(
-        "verify   : {} — {} commits, {} tribles on the results branch",
+        "verify   : {} — {} signed commits, {} tribles in the results collection",
         path.display(),
         commits,
         facts.len()
@@ -327,13 +389,14 @@ pub fn verify(path: &Path) -> Result<()> {
         ),
         pattern!(&facts, [{ ?s @ bench::commit: ?c, bench::engine: ?eng, bench::config: ?cfg }])
     ) {
-        let commit: String = c.try_from_inline().map_err(|e| anyhow!("commit decode: {e:?}"))?;
+        let commit: String = c
+            .try_from_inline()
+            .map_err(|e| anyhow!("commit decode: {e:?}"))?;
         let engine: String = eng
             .try_from_inline()
             .map_err(|e| anyhow!("engine decode: {e:?}"))?;
-        let config: anybytes::View<str> = reader
-            .get(cfg)
-            .map_err(|e| anyhow!("config blob: {e:?}"))?;
+        let config: anybytes::View<str> =
+            reader.get(cfg).map_err(|e| anyhow!("config blob: {e:?}"))?;
         println!("  {s:X}  commit={commit} engine={engine}");
         println!("    config: {}", config.as_ref());
     }
@@ -365,8 +428,9 @@ pub fn verify(path: &Path) -> Result<()> {
             tele::duration_ns: ?d
         }])
     ) {
-        let name: anybytes::View<str> =
-            reader.get(n).map_err(|e| anyhow!("span name blob: {e:?}"))?;
+        let name: anybytes::View<str> = reader
+            .get(n)
+            .map_err(|e| anyhow!("span name blob: {e:?}"))?;
         span_times
             .entry((run, name.as_ref().to_owned()))
             .or_default()
@@ -413,7 +477,11 @@ pub fn verify(path: &Path) -> Result<()> {
         let outcome: String = v
             .try_from_inline()
             .map_err(|e| anyhow!("outcome decode: {e:?}"))?;
-        outcome_rows.push((workload.as_ref().to_owned(), outcome, rows_of.get(&o).copied()));
+        outcome_rows.push((
+            workload.as_ref().to_owned(),
+            outcome,
+            rows_of.get(&o).copied(),
+        ));
     }
     println!("outcomes : {}", outcome_rows.len());
     let mut histogram: std::collections::BTreeMap<(String, String), usize> = Default::default();
@@ -436,6 +504,88 @@ pub fn verify(path: &Path) -> Result<()> {
         }
     }
 
-    pile.close().map_err(|e| anyhow!("close results pile: {e:?}"))?;
+    pile.close()
+        .map_err(|e| anyhow!("close results pile: {e:?}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_collection_roundtrip_accumulates_runs_with_metadata_and_attachments() {
+        let path = std::env::temp_dir().join(format!("tribleset-bench-ledger-{:X}.pile", *genid()));
+
+        let mut ledger = ResultsLedger::open(
+            &path,
+            "0123456789abcdef",
+            "native-collection-test",
+            "argv: test | suite: tribleset-bench test",
+        )
+        .unwrap();
+        ledger.span("fixture/total", 11, 13);
+        ledger.outcome("fixture/total", "signal", Some(7));
+        ledger.finish(29).unwrap();
+
+        let mut second = ResultsLedger::open(
+            &path,
+            "fedcba9876543210",
+            "native-collection-test-2",
+            "argv: test-2 | suite: tribleset-bench test",
+        )
+        .unwrap();
+        second.outcome("fixture/other", "skip:test", None);
+        second.finish(3).unwrap();
+
+        verify(&path).unwrap();
+
+        let mut pile = Pile::open(&path).unwrap();
+        let discovered = discover_collection_records(&mut pile).unwrap();
+        let definition = simplearchive_union::definition(*RESULTS_COLLECTION_SCOPE);
+        assert!(discovered.definitions().contains(&definition));
+        let commits: Vec<_> = discovered
+            .commits()
+            .iter()
+            .filter(|commit| commit.collection() == definition.id())
+            .collect();
+        assert_eq!(commits.len(), 2);
+
+        let reader = pile.reader().unwrap();
+        let mut facts = TribleSet::new();
+        for commit in commits {
+            let metadata: TribleSet = reader.get(commit.metadata()).unwrap();
+            assert!(!metadata.is_empty());
+            let data_handle: Inline<Handle<SimpleArchive>> = commit.data().transmute();
+            let run: TribleSet = reader.get(data_handle).unwrap();
+            facts += run;
+        }
+        assert_eq!(
+            find!(
+                session: Id,
+                pattern!(&facts, [{ ?session @ metadata::tag: *KIND_SESSION }])
+            )
+            .count(),
+            2
+        );
+        let configs: BTreeSet<String> = find!(
+            cfg: Inline<Handle<LongString>>,
+            pattern!(&facts, [{ bench::config: ?cfg }])
+        )
+        .map(|config| {
+            let config: anybytes::View<str> = reader.get(config).unwrap();
+            config.as_ref().to_owned()
+        })
+        .collect();
+        assert_eq!(configs.len(), 2);
+        assert!(
+            configs
+                .iter()
+                .all(|config| config.contains("suite: tribleset-bench test"))
+        );
+
+        drop(reader);
+        pile.close().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
 }
