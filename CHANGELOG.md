@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Network-learned native collection claims now have one explicit admission
+  boundary.** The current sync wire remains read-only and fetched bytes remain
+  inert blobs. Future reconciliation carriers can pass decoded claims through
+  `admit_collection_claim`, which requires exact intrinsic definitions,
+  strictly verifies a `COMMIT`'s embedded author signature, gates that author
+  (never the carrier) on current write authority for the definition's generic
+  collection scope, and inserts a claim only after its complete content-valid
+  dependency closure and exact recipe equation are accepted. `MERGE` and
+  `DERIVE` remain permissionless but equally validated. The new
+  `scope_resource` capability attribute
+  (`204AA3002758946773AC4E37918D6E72`, minted with `trible genid`) is a typed
+  namespace distinct from legacy branch restrictions; capability expiry gates
+  only new admission and cannot retract grow-only evidence already stored.
 - **Raw SuccinctArchive collections now validate the exact collection laws.**
   The raw representation reuses the canonical TribleSet union recipe while
   remaining a distinct collection through its representation identity.

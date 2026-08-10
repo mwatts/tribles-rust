@@ -184,9 +184,12 @@ Capabilities encode their scope as tribles hung off `cap_scope_root`:
 
 - One or more `metadata::tag: PERM_*` triples granting permissions
   (`PERM_READ`, `PERM_WRITE`, `PERM_ADMIN`).
-- Zero or more `scope_branch: <branch_id>` triples restricting the
-  permission to a specific branch. An empty branch-restriction set
-  means "all branches".
+- Zero or more typed resource restrictions. `scope_branch: <branch_id>`
+  names a legacy pin-based branch; `scope_resource: <resource_id>` names a
+  generic resource anchor such as `CollectionDefinition::scope()`. The two
+  namespaces are distinct even when their 16-byte ids happen to match. No
+  restriction of either kind means globally unrestricted; once any typed
+  restriction exists, an omitted namespace grants none of that kind.
 
 The relay enforces scope at two levels:
 
@@ -208,14 +211,33 @@ cap grants read on. Out-of-scope blobs surface as `None` (length =
 `u64::MAX`) on `OP_GET_BLOB`; `OP_CHILDREN` filters its returned list
 to in-scope hashes only.
 
-Unrestricted caps (`granted_branches() == None` — no `scope_branch`
-tribles) short-circuit to "every present blob is in scope".
+Globally unrestricted caps (`granted_branches() == None` — neither
+`scope_branch` nor `scope_resource` tribles) short-circuit to "every present
+blob is in scope". A collection-resource-only cap returns an empty branch set
+and therefore grants no legacy branch-rooted blob graph.
 
 Permission semantics mirror `scope_subsumes`: `PERM_WRITE` and
 `PERM_ADMIN` imply `PERM_READ`; `PERM_ADMIN` is required to delegate
 sub-capabilities. The reachability scan is recomputed per request
 today; per-stream caching is a future optimisation for
 chain-walk-heavy workloads.
+
+### Native collection admission
+
+The current v4 pile-sync protocol remains read-only and does not accept native
+collection records from a remote peer. The reusable admission boundary is
+defined independently of any future reconciliation transport: a signed
+`COMMIT` is authorized by its embedded author key against
+`scope_resource == CollectionDefinition::scope()`, never by the peer carrying
+the bytes. Its exact data and metadata closure and the collection recipe must
+validate before the definition or claim enters `CollectionStore`. Unsigned
+`MERGE` and `DERIVE` equations need no writer capability, but still require
+exact recipe validation.
+
+Capability validity is an admission-time predicate. Expiry prevents a new
+local admission; it does not retract a record already admitted into the
+grow-only store. A currently authorized writer can renew an old element by
+signing another commit for the same data identity.
 
 ## Eviction
 

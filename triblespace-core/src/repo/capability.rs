@@ -23,11 +23,13 @@
 //! Scope is encoded as tribles inside the cap blob, anchored at
 //! `cap_scope_root`. Permissions are tagged via `metadata::tag` linking
 //! to constants like `PERM_READ`, `PERM_WRITE`, `PERM_ADMIN`. Optional
-//! per-resource restrictions like `scope_branch` narrow a permission to a
-//! specific branch.
+//! typed resource restrictions narrow a permission: the legacy
+//! `scope_branch` relation names pin-based branches, while `scope_resource`
+//! names generic resource anchors such as a collection definition's
+//! `collection_scope`. The two namespaces are deliberately distinct.
 //!
-//! (Names like `cap_scope_root`, `metadata::tag`, `scope_branch`, and
-//! `PERM_*` are spelled in plain code formatting rather than as
+//! (Names like `cap_scope_root`, `metadata::tag`, `scope_branch`,
+//! `scope_resource`, and `PERM_*` are spelled in plain code formatting rather than as
 //! intra-doc links because the macro-generated attribute items and
 //! the `id_hex!`-defined constants don't reliably resolve as
 //! rustdoc link targets from a `//!` block.)
@@ -72,10 +74,19 @@ triblespace_core_macros::attributes! {
 
     // ── Scope ─────────────────────────────────────────────────────────
     /// Optional restriction of a permission to a specific branch.
-    /// Repeated when a permission applies to multiple branches; absent
-    /// when the permission is unrestricted (applies to every branch
-    /// the holder is otherwise authorised on).
+    /// Repeated when a permission applies to multiple branches. Absence means
+    /// every branch only when no generic resource restriction exists either;
+    /// otherwise it grants no branches.
     "46246789D627C1B0F81B21418E179DFD" unsafe as pub scope_branch: GenId;
+    /// Optional restriction of a permission to a generic resource anchor.
+    ///
+    /// Native collection admission compares this value to the exact
+    /// [`crate::collection::CollectionDefinition::scope`]. It is not an alias
+    /// for [`scope_branch`]: a branch id and a collection scope with identical
+    /// bytes remain different resource kinds.
+    ///
+    /// Minted with `trible genid` on 2026-08-10.
+    "204AA3002758946773AC4E37918D6E72" unsafe as pub scope_resource: GenId;
 
     // ── Sig blob ──────────────────────────────────────────────────────
     /// Handle of the cap blob this signature attests to. The signature
@@ -317,13 +328,27 @@ fn issuer_subject_value(key: VerifyingKey) -> Inline<ed::ED25519PublicKey> {
 
 // ── Scope subsumption ────────────────────────────────────────────────
 
-/// Collect the permission tag ids and branch restrictions from a scope
+/// Typed restrictions carried by one capability scope.
+///
+/// Keeping branch ids and generic resource anchors in separate sets prevents
+/// equal 16-byte values from silently crossing authorization namespaces.
+#[derive(Default)]
+struct ScopeFacts {
+    permissions: HashSet<crate::id::Id>,
+    branches: HashSet<crate::id::Id>,
+    resources: HashSet<crate::id::Id>,
+}
+
+impl ScopeFacts {
+    fn unrestricted(&self) -> bool {
+        self.branches.is_empty() && self.resources.is_empty()
+    }
+}
+
+/// Collect permission tags and typed resource restrictions from a scope
 /// sub-graph anchored at `scope_root`.
-fn collect_scope_facts(
-    set: &TribleSet,
-    scope_root: crate::id::Id,
-) -> (HashSet<crate::id::Id>, HashSet<crate::id::Id>) {
-    let perms: HashSet<crate::id::Id> = find!(
+fn collect_scope_facts(set: &TribleSet, scope_root: crate::id::Id) -> ScopeFacts {
+    let permissions: HashSet<crate::id::Id> = find!(
         (perm: crate::id::Id),
         pattern!(set, [{ scope_root @ crate::metadata::tag: ?perm }])
     )
@@ -337,21 +362,35 @@ fn collect_scope_facts(
     .map(|(b,)| b)
     .collect();
 
-    (perms, branches)
+    let resources: HashSet<crate::id::Id> = find!(
+        (resource: crate::id::Id),
+        pattern!(set, [{ scope_root @ scope_resource: ?resource }])
+    )
+    .map(|(resource,)| resource)
+    .collect();
+
+    ScopeFacts {
+        permissions,
+        branches,
+        resources,
+    }
 }
 
 /// Check whether a parent scope authorises a child scope.
 ///
 /// Rules:
-/// - If parent grants `PERM_ADMIN`, parent subsumes every child scope.
-/// - Otherwise: every permission tag in the child must be in the
-///   parent's set (with `PERM_WRITE` implying `PERM_READ` for upgrade
-///   compatibility, but an explicit `PERM_READ`-only parent does *not*
-///   imply `PERM_WRITE` for the child).
-/// - Branch restriction: an empty `scope_branch` set means "all
-///   branches"; a non-empty set restricts the scope to those branches.
-///   The child's restriction set must be a subset of the parent's
-///   (where empty parent = all branches allowed).
+/// - If parent grants `PERM_ADMIN`, it subsumes every child *permission*.
+///   Typed resource restrictions still apply: administrative authority over
+///   one resource cannot delegate authority over another.
+/// - Otherwise every permission tag in the child must be in the parent's set
+///   (with `PERM_WRITE` implying `PERM_READ` for upgrade compatibility, but an
+///   explicit `PERM_READ`-only parent does *not* imply `PERM_WRITE` for the
+///   child).
+/// - Resource restriction: branches and generic resources are distinct typed
+///   namespaces. No restrictions of either kind means "all resources". Once
+///   either kind occurs, the child may name only typed resources named by the
+///   parent. Omitting one namespace then grants none of that kind, rather than
+///   implicitly granting all of it.
 ///
 /// Unknown permission tags in the child cause subsumption to fail
 /// closed.
@@ -361,42 +400,43 @@ pub fn scope_subsumes(
     child_set: &TribleSet,
     child_scope_root: crate::id::Id,
 ) -> bool {
-    let (parent_perms, parent_branches) = collect_scope_facts(parent_set, parent_scope_root);
-    let (child_perms, child_branches) = collect_scope_facts(child_set, child_scope_root);
+    let parent = collect_scope_facts(parent_set, parent_scope_root);
+    let child = collect_scope_facts(child_set, child_scope_root);
 
-    if parent_perms.contains(&PERM_ADMIN) {
-        return true;
+    if child
+        .permissions
+        .iter()
+        .any(|perm| *perm != PERM_READ && *perm != PERM_WRITE && *perm != PERM_ADMIN)
+    {
+        return false;
     }
 
-    for perm in &child_perms {
-        if *perm == PERM_READ {
-            if !parent_perms.contains(&PERM_READ) && !parent_perms.contains(&PERM_WRITE) {
+    if !parent.permissions.contains(&PERM_ADMIN) {
+        for perm in &child.permissions {
+            if *perm == PERM_READ {
+                if !parent.permissions.contains(&PERM_READ)
+                    && !parent.permissions.contains(&PERM_WRITE)
+                {
+                    return false;
+                }
+            } else if *perm == PERM_WRITE {
+                if !parent.permissions.contains(&PERM_WRITE) {
+                    return false;
+                }
+            } else if *perm == PERM_ADMIN {
                 return false;
             }
-        } else if *perm == PERM_WRITE {
-            if !parent_perms.contains(&PERM_WRITE) {
-                return false;
-            }
-        } else if *perm == PERM_ADMIN {
-            // Parent isn't admin (already checked), so the child can't
-            // claim admin either.
-            return false;
-        } else {
-            // Unknown permission — fail closed.
-            return false;
         }
     }
 
-    // Branch restriction subsumption.
-    if !parent_branches.is_empty() {
-        if child_branches.is_empty() {
-            return false;
-        }
-        for b in &child_branches {
-            if !parent_branches.contains(b) {
-                return false;
-            }
-        }
+    // The empty restriction set means universal scope. Otherwise both
+    // namespaces participate independently in the subset relation.
+    if !parent.unrestricted()
+        && (child.unrestricted()
+            || !child.branches.is_subset(&parent.branches)
+            || !child.resources.is_subset(&parent.resources))
+    {
+        return false;
     }
 
     true
@@ -466,9 +506,11 @@ impl From<UnarchiveError> for VerifyError {
 ///
 /// - [`permissions`](Self::permissions) — which `PERM_*` tags are
 ///   hung on the scope root
-/// - [`granted_branches`](Self::granted_branches) — `Some(set)` if the
-///   cap restricts itself to specific branches, or `None` if it's
-///   unrestricted within its permission set
+/// - [`granted_branches`](Self::granted_branches) — `Some(set)` if the cap
+///   carries any typed restriction (possibly an empty branch set), or `None`
+///   if it is globally unrestricted within its permission set
+/// - [`granted_resources`](Self::granted_resources) — the corresponding
+///   generic-resource view
 /// - [`grants_read`](Self::grants_read) — convenience for "any read-
 ///   equivalent permission" (write/admin imply read)
 /// - [`grants_read_on`](Self::grants_read_on) — combines the two:
@@ -542,19 +584,36 @@ impl VerifiedCapability {
     /// Returns the set of permissions tagged on this cap's scope root
     /// (a subset of `{`[`PERM_READ`]`,`[`PERM_WRITE`]`,`[`PERM_ADMIN`]`}`).
     pub fn permissions(&self) -> HashSet<crate::id::Id> {
-        let (perms, _) = collect_scope_facts(&self.cap_set, self.scope_root);
-        perms
+        collect_scope_facts(&self.cap_set, self.scope_root).permissions
     }
 
-    /// Returns `Some(set)` if the cap restricts itself to a specific
-    /// non-empty set of branches, or `None` if the cap is unrestricted
-    /// (i.e. applies to every branch within the granted permission set).
+    /// Returns `Some(set)` when this capability carries any typed resource
+    /// restriction, or `None` when it is globally unrestricted.
+    ///
+    /// A generic-resource-only scope returns `Some(empty)`: it grants no
+    /// branches. This keeps generic collection authority distinct from legacy
+    /// branch authority.
     pub fn granted_branches(&self) -> Option<HashSet<crate::id::Id>> {
-        let (_, branches) = collect_scope_facts(&self.cap_set, self.scope_root);
-        if branches.is_empty() {
+        let scope = collect_scope_facts(&self.cap_set, self.scope_root);
+        if scope.unrestricted() {
             None
         } else {
-            Some(branches)
+            Some(scope.branches)
+        }
+    }
+
+    /// Returns `Some(set)` when this capability carries any typed resource
+    /// restriction, or `None` when it is globally unrestricted.
+    ///
+    /// A branch-only scope returns `Some(empty)`: it grants no generic
+    /// resources. This is distinct from the unrestricted `None` case and keeps
+    /// legacy branch ids from becoming collection authority by accident.
+    pub fn granted_resources(&self) -> Option<HashSet<crate::id::Id>> {
+        let scope = collect_scope_facts(&self.cap_set, self.scope_root);
+        if scope.unrestricted() {
+            None
+        } else {
+            Some(scope.resources)
         }
     }
 
@@ -577,6 +636,37 @@ impl VerifiedCapability {
         match self.granted_branches() {
             None => true,
             Some(set) => set.contains(branch),
+        }
+    }
+
+    /// Returns `true` if this capability grants read-equivalent permission on
+    /// an exact generic resource anchor.
+    pub fn grants_read_on_resource(&self, resource: &crate::id::Id) -> bool {
+        if !self.grants_read() {
+            return false;
+        }
+        match self.granted_resources() {
+            None => true,
+            Some(set) => set.contains(resource),
+        }
+    }
+
+    /// Returns `true` if this capability grants write authority on an exact
+    /// generic resource anchor.
+    ///
+    /// Native collection admission compares `resource` to
+    /// [`crate::collection::CollectionDefinition::scope`]. Capability
+    /// verification (including expiry) happens before this predicate is used;
+    /// the result gates only a new local admission and does not retroactively
+    /// remove already admitted grow-only records.
+    pub fn grants_write_on_resource(&self, resource: &crate::id::Id) -> bool {
+        let permissions = self.permissions();
+        if !permissions.contains(&PERM_WRITE) && !permissions.contains(&PERM_ADMIN) {
+            return false;
+        }
+        match self.granted_resources() {
+            None => true,
+            Some(set) => set.contains(resource),
         }
     }
 }
@@ -935,6 +1025,41 @@ mod tests {
         (*scope_root, facts)
     }
 
+    fn restricted_scope(permission: Id, branches: &[Id], resources: &[Id]) -> (Id, TribleSet) {
+        let scope_root = crate::id::ufoid();
+        let mut facts = TribleSet::from(entity! {
+            ExclusiveId::force_ref(&scope_root) @
+            crate::metadata::tag: permission,
+        });
+        for branch in branches {
+            facts += TribleSet::from(entity! {
+                ExclusiveId::force_ref(&scope_root) @
+                scope_branch: *branch,
+            });
+        }
+        for resource in resources {
+            facts += TribleSet::from(entity! {
+                ExclusiveId::force_ref(&scope_root) @
+                scope_resource: *resource,
+            });
+        }
+        (*scope_root, facts)
+    }
+
+    fn verified_scope(
+        subject: VerifyingKey,
+        permission: Id,
+        branches: &[Id],
+        resources: &[Id],
+    ) -> VerifiedCapability {
+        let (scope_root, cap_set) = restricted_scope(permission, branches, resources);
+        VerifiedCapability {
+            subject,
+            scope_root,
+            cap_set,
+        }
+    }
+
     /// Build a fetch_blob closure backed by an in-memory map.
     fn fetch_from(
         blobs: &[Blob<SimpleArchive>],
@@ -1228,5 +1353,86 @@ mod tests {
             1,
             "expected 1 sig_parent_cap entry for length-2 chain"
         );
+    }
+
+    #[test]
+    fn generic_resources_and_legacy_branches_are_distinct_namespaces() {
+        let subject = key().verifying_key();
+        let same_bytes = Id::new([42; 16]).unwrap();
+        let other = Id::new([43; 16]).unwrap();
+
+        let resource_only = verified_scope(subject, PERM_WRITE, &[], &[same_bytes]);
+        assert!(resource_only.grants_write_on_resource(&same_bytes));
+        assert!(!resource_only.grants_write_on_resource(&other));
+        assert!(!resource_only.grants_read_on(&same_bytes));
+        assert_eq!(resource_only.granted_branches(), Some(HashSet::new()));
+
+        let branch_only = verified_scope(subject, PERM_WRITE, &[same_bytes], &[]);
+        assert!(branch_only.grants_read_on(&same_bytes));
+        assert!(!branch_only.grants_write_on_resource(&same_bytes));
+        assert_eq!(branch_only.granted_resources(), Some(HashSet::new()));
+
+        let unrestricted = verified_scope(subject, PERM_WRITE, &[], &[]);
+        assert!(unrestricted.grants_read_on(&other));
+        assert!(unrestricted.grants_write_on_resource(&other));
+        assert_eq!(unrestricted.granted_branches(), None);
+        assert_eq!(unrestricted.granted_resources(), None);
+    }
+
+    #[test]
+    fn read_only_capability_never_grants_collection_write() {
+        let subject = key().verifying_key();
+        let resource = Id::new([44; 16]).unwrap();
+        let capability = verified_scope(subject, PERM_READ, &[], &[resource]);
+        assert!(capability.grants_read_on_resource(&resource));
+        assert!(!capability.grants_write_on_resource(&resource));
+    }
+
+    #[test]
+    fn resource_scope_delegation_is_typed_subset_even_for_admin() {
+        let allowed = Id::new([45; 16]).unwrap();
+        let denied = Id::new([46; 16]).unwrap();
+        let branch = Id::new([47; 16]).unwrap();
+
+        let (parent_root, parent) = restricted_scope(PERM_ADMIN, &[], &[allowed]);
+        let (allowed_root, allowed_child) = restricted_scope(PERM_WRITE, &[], &[allowed]);
+        assert!(scope_subsumes(
+            &parent,
+            parent_root,
+            &allowed_child,
+            allowed_root
+        ));
+
+        let (denied_root, denied_child) = restricted_scope(PERM_WRITE, &[], &[denied]);
+        assert!(!scope_subsumes(
+            &parent,
+            parent_root,
+            &denied_child,
+            denied_root
+        ));
+
+        let (branch_root, branch_child) = restricted_scope(PERM_WRITE, &[branch], &[]);
+        assert!(!scope_subsumes(
+            &parent,
+            parent_root,
+            &branch_child,
+            branch_root
+        ));
+
+        let (unrestricted_root, unrestricted_parent) = restricted_scope(PERM_ADMIN, &[], &[]);
+        assert!(scope_subsumes(
+            &unrestricted_parent,
+            unrestricted_root,
+            &denied_child,
+            denied_root
+        ));
+
+        let (unrestricted_child_root, unrestricted_child) = restricted_scope(PERM_WRITE, &[], &[]);
+        assert!(!scope_subsumes(
+            &parent,
+            parent_root,
+            &unrestricted_child,
+            unrestricted_child_root
+        ));
     }
 }

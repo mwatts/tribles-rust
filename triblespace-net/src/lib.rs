@@ -10,6 +10,10 @@
 
 mod channel;
 
+/// Trust boundary for admitting native collection records learned through a
+/// network carrier.
+pub mod admission;
+
 /// Base backoff shared by the crate's retry loops (failed head-walk
 /// retries in [`host`], failed want-fetch retries in
 /// [`reconcile::Reconciler`]); doubles per attempt up to
