@@ -549,6 +549,26 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_facade_reuses_one_open_storage() {
+        let scope = id(1);
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let expected = fragment(1, false);
+        let mut storage = MemoryRepo::default();
+
+        {
+            let mut collection = Collection::new(&mut storage, scope, signing_key.clone());
+            collection.commit(expected.clone()).unwrap();
+            assert_eq!(collection.materialize().unwrap(), expected.facts().clone());
+        }
+
+        let discovered = discover_collection_records(&mut storage).unwrap();
+        assert_eq!(discovered.commits().len(), 1);
+
+        let mut collection = Collection::new(&mut storage, scope, signing_key);
+        assert_eq!(collection.materialize().unwrap(), expected.into_facts());
+    }
+
+    #[test]
     fn distinct_commits_coexist_and_repeated_commits_are_idempotent() {
         let scope = id(1);
         let signing_key = SigningKey::from_bytes(&[7; 32]);

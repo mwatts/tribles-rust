@@ -165,6 +165,17 @@ pub trait StorageFlush {
     fn flush(&mut self) -> Result<(), Self::Error>;
 }
 
+impl<S> StorageFlush for &mut S
+where
+    S: StorageFlush + ?Sized,
+{
+    type Error = S::Error;
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        (**self).flush()
+    }
+}
+
 // Convenience impl for repositories whose storage supports explicit close.
 impl<Storage> Repository<Storage>
 where
@@ -416,6 +427,22 @@ pub trait BlobStorePut {
         Handle<S>: InlineEncoding;
 }
 
+impl<B> BlobStorePut for &mut B
+where
+    B: BlobStorePut + ?Sized,
+{
+    type PutError = B::PutError;
+
+    fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
+    where
+        S: BlobEncoding + 'static,
+        T: IntoBlob<S>,
+        Handle<S>: InlineEncoding,
+    {
+        (**self).put(item)
+    }
+}
+
 /// Combined read/write blob storage.
 ///
 /// Extends [`BlobStorePut`] with the ability to create a shareable
@@ -427,6 +454,18 @@ pub trait BlobStore: BlobStorePut {
     type ReaderError: Error + Debug + Send + Sync + 'static;
     /// Creates a shareable reader snapshot of the current store state.
     fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError>;
+}
+
+impl<B> BlobStore for &mut B
+where
+    B: BlobStore + ?Sized,
+{
+    type Reader = B::Reader;
+    type ReaderError = B::ReaderError;
+
+    fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
+        (**self).reader()
+    }
 }
 
 /// Trait for blob stores that can retain a supplied set of handles.

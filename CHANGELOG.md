@@ -131,7 +131,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retry, message field, planner, or tuning knobs. Optional procedural-macro
   instrumentation uses the same path and one explicit
   `TRIBLESPACE_METADATA_COLLECTION_SCOPE`, replacing its Repository/Workspace
-  push protocol.
+  push protocol. Storage traits delegate through `&mut S`, so several scoped
+  collection facades can safely borrow one already-open backend in sequence;
+  no second open, close/reopen refresh, or special multi-collection session is
+  required.
 - **Collection retention is now an explicit two-edge policy rather than a
   blind hash walk.** Native collection records live outside the blob root set.
   Conservative Pile/Yard rewrites preserve every native record and recursively

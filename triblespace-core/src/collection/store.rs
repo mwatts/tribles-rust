@@ -38,3 +38,23 @@ pub trait CollectionStore {
     /// add another logical set member.
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError>;
 }
+
+impl<S> CollectionStore for &mut S
+where
+    S: CollectionStore + ?Sized,
+{
+    type RecordsError = S::RecordsError;
+    type InsertError = S::InsertError;
+    type RecordIter<'a>
+        = S::RecordIter<'a>
+    where
+        Self: 'a;
+
+    fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+        (**self).records()
+    }
+
+    fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
+        (**self).insert(record)
+    }
+}
