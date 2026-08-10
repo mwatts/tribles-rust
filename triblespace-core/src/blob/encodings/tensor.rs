@@ -1,11 +1,16 @@
 //! Self-describing typed tensor blob encoding.
 //!
 //! [`Array<T>`](super::array::Array) says "a flat run of T" and leaves shape to
-//! triples that reference it. A `Tensor` carries its shape INSIDE the blob, and
-//! that difference is the whole point: a tensor blob is complete on its own, so
-//! it can be handed to another node by handle and remain interpretable without
-//! the facts that happened to accompany it. Sharing a model between machines is
-//! then a blob transfer, not a blob transfer plus a schema agreement.
+//! triples that reference it. A `Tensor` carries its shape INSIDE the blob, so
+//! moving one between machines moves its shape with it — a blob transfer rather
+//! than a blob transfer plus a side-channel for dimensions.
+//!
+//! It carries NOTHING ELSE. No magic marker, no rank field. Both were in an
+//! earlier version and both were redundant: the element type and rank come from
+//! the attribute that points at the blob, and content addressing means a handle
+//! names exact bytes, so a marker could only catch a corruption hashing already
+//! rules out. A redundant tag is worse than none — it looks like a check while
+//! verifying nothing the reference had not already settled.
 //!
 //! # What is in the type, and why the rest is not
 //!
@@ -47,11 +52,6 @@ use crate::macros::entity;
 use crate::metadata::{self, MetaDescribe};
 use crate::trible::Fragment;
 
-/// Magic marker opening every tensor blob. Minted 2026-08-10 via `trible genid`.
-pub const TENSOR_MAGIC: [u8; 16] = [
-    0x4A, 0x49, 0x83, 0xDC, 0x8C, 0xBD, 0x82, 0xD0, 0x87, 0xB7, 0x7B, 0x20, 0x56, 0x41, 0x0D, 0x0C,
-];
-
 /// Header width, chosen so the TENSOR that follows it is 256-byte aligned.
 ///
 /// The alignment is a chain, and every link has to hold:
@@ -68,16 +68,11 @@ pub const TENSOR_MAGIC: [u8; 16] = [
 /// these bytes are spare.
 pub const TENSOR_HEADER_LEN: usize = 256;
 
-/// Largest rank the fixed header can hold: `(256 - 24) / 8`.
-pub const MAX_RANK: usize = 29;
-
-/// Every header field is 64-bit, so each sits at a naturally aligned offset by
-/// construction rather than because the arithmetic happens to work out. There
-/// is no reason to economise: 232 of the 256 bytes are spare at rank 3, and a
-/// 32-bit field would buy four bytes in exchange for a layout whose alignment
-/// has to be reasoned about — in a header that exists to be read zero-copy off
-/// a 256-aligned pile record.
-const HEADER_PREAMBLE: usize = 24;
+/// Largest rank the header can hold: one `u64` dimension per 8 bytes.
+///
+/// The whole header is dimensions now that the magic and rank field are gone,
+/// which is what makes this exactly 32 rather than 29.
+pub const MAX_RANK: usize = TENSOR_HEADER_LEN / 8;
 
 /// An element format, including what it costs to store.
 ///
@@ -131,14 +126,6 @@ impl<T: TensorElement, const RANK: usize> MetaDescribe for Tensor<T, RANK> {
 pub enum TensorError {
     /// Shorter than the fixed header.
     TooShort { len: usize },
-    /// Did not open with [`TENSOR_MAGIC`].
-    NotATensor,
-    /// The header's rank disagrees with the type's.
-    ///
-    /// Reported rather than trusted: the type says what the caller BELIEVES,
-    /// the header says what was written, and a mismatch means one of them is
-    /// wrong about bytes that would otherwise be read as a different shape.
-    RankMismatch { expected: usize, found: usize },
     /// The payload is not the length the header's dims imply.
     LengthMismatch { expected: usize, found: usize },
     /// A rank the fixed header cannot hold.
@@ -150,10 +137,6 @@ impl core::fmt::Display for TensorError {
         match self {
             TensorError::TooShort { len } => {
                 write!(f, "tensor blob is {len} bytes, shorter than its {TENSOR_HEADER_LEN}-byte header")
-            }
-            TensorError::NotATensor => write!(f, "blob does not open with the tensor magic"),
-            TensorError::RankMismatch { expected, found } => {
-                write!(f, "tensor header says rank {found}, caller expects rank {expected}")
             }
             TensorError::LengthMismatch { expected, found } => {
                 write!(f, "tensor payload is {found} bytes, dims imply {expected}")
@@ -210,12 +193,10 @@ pub fn tensor_blob<T: TensorElement, const RANK: usize>(
     }
 
     let mut bytes = Vec::with_capacity(TENSOR_HEADER_LEN + payload.len());
-    bytes.extend_from_slice(&TENSOR_MAGIC);
-    bytes.extend_from_slice(&(RANK as u64).to_le_bytes());
     for d in dims {
         bytes.extend_from_slice(&d.to_le_bytes());
     }
-    debug_assert_eq!(bytes.len(), HEADER_PREAMBLE + RANK * 8);
+    debug_assert_eq!(bytes.len(), RANK * 8);
     bytes.resize(TENSOR_HEADER_LEN, 0);
     bytes.extend_from_slice(&payload);
     Ok(Blob::new(Bytes::from_source(bytes)))
@@ -229,24 +210,16 @@ impl<T: TensorElement, const RANK: usize> TryFromBlob<Tensor<T, RANK>> for Tenso
         if bytes.len() < TENSOR_HEADER_LEN {
             return Err(TensorError::TooShort { len: bytes.len() });
         }
-        if bytes[0..16] != TENSOR_MAGIC {
-            return Err(TensorError::NotATensor);
-        }
-        // Checked on the READ side too, not only where blobs are built. The
-        // write guard makes this look safe without making it safe: the dim
-        // loop indexes `HEADER_PREAMBLE + i * 8`, so an over-large RANK would
-        // run off the fixed header and read payload bytes as dimensions, or
-        // panic. A caller can name any RANK it likes.
+        // Checked on the READ side too, not only where blobs are built. RANK is
+        // a const generic a caller names freely, and the dim loop would
+        // otherwise run off the fixed header and read payload bytes as
+        // dimensions — a plausible-looking tensor rather than an error.
         if RANK > MAX_RANK {
             return Err(TensorError::RankTooLarge { rank: RANK });
         }
-        let rank = u64::from_le_bytes(bytes[16..24].try_into().expect("8 bytes")) as usize;
-        if rank != RANK {
-            return Err(TensorError::RankMismatch { expected: RANK, found: rank });
-        }
-        let mut dims = Vec::with_capacity(rank);
-        for i in 0..rank {
-            let at = HEADER_PREAMBLE + i * 8;
+        let mut dims = Vec::with_capacity(RANK);
+        for i in 0..RANK {
+            let at = i * 8;
             dims.push(u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes")));
         }
         let elems: u64 = dims.iter().product();
@@ -427,62 +400,35 @@ mod tests {
         assert_eq!(err, TensorError::LengthMismatch { expected: 48, found: 40 });
     }
 
-    /// The type says what the caller believes; the header says what was
-    /// written. A mismatch means one of them is wrong about these bytes.
+    /// Reading a rank-2 blob as rank-3 is still caught, just by a different
+    /// route now that no rank is stored: the third dimension reads out of the
+    /// header's zero padding, so the dims imply an empty payload and the actual
+    /// one contradicts it. The check that survives is the one over real data.
     #[test]
-    fn a_rank_disagreement_between_type_and_header_is_refused() {
+    fn reading_a_tensor_at_the_wrong_rank_is_refused() {
         let blob = tensor_blob::<F32, 2>([3, 4], payload(48)).expect("well formed");
         let wrong: Blob<Tensor<F32, 3>> = blob.transmute();
         let err = <TensorView as TryFromBlob<Tensor<F32, 3>>>::try_from_blob(wrong)
             .expect_err("must refuse");
-        assert_eq!(err, TensorError::RankMismatch { expected: 3, found: 2 });
-    }
-
-    /// The fixed header holds 29 dims: `(256 - 24) / 8`, the 24 being the
-    /// magic plus the rank field. Beyond that a tensor is refused on BOTH
-    /// sides — reading included, because the dim loop would otherwise walk off
-    /// the header into the payload and read it as dimensions.
-    #[test]
-    fn a_rank_the_header_cannot_hold_is_refused_both_ways() {
-        assert_eq!(MAX_RANK, 29);
-        // the largest rank that fits still works
-        assert!(tensor_blob::<F32, 29>([1; 29], payload(4)).is_ok());
-
-        let err = tensor_blob::<F32, 30>([1; 30], payload(4)).expect_err("write refuses");
-        assert_eq!(err, TensorError::RankTooLarge { rank: 30 });
-
-        // and a blob that claims rank 30 cannot be read into one either
-        let mut raw = vec![0u8; TENSOR_HEADER_LEN + 4];
-        raw[0..16].copy_from_slice(&TENSOR_MAGIC);
-        raw[16..24].copy_from_slice(&30u64.to_le_bytes());
-        let blob: Blob<Tensor<F32, 30>> = Blob::new(Bytes::from_source(raw));
-        let err = <TensorView as TryFromBlob<Tensor<F32, 30>>>::try_from_blob(blob)
-            .expect_err("read refuses");
-        assert_eq!(err, TensorError::RankTooLarge { rank: 30 });
-    }
-
-    #[test]
-    fn bytes_that_are_not_a_tensor_are_refused() {
-        let blob: Blob<Tensor<F32, 1>> = Blob::new(payload(TENSOR_HEADER_LEN + 4));
-        let err = <TensorView as TryFromBlob<Tensor<F32, 1>>>::try_from_blob(blob)
-            .expect_err("must refuse");
-        assert_eq!(err, TensorError::NotATensor);
+        assert_eq!(err, TensorError::LengthMismatch { expected: 0, found: 48 });
     }
 
     /// The payload begins at a constant offset regardless of rank, so it keeps
     /// the 256 alignment a pile record already gives its data.
-    /// Every header field is 8-aligned by construction, and the rank the
-    /// header can hold is exactly what the preamble leaves room for.
+    /// The header is dimensions and nothing else, so every field is a u64 at an
+    /// 8-aligned offset by construction and the capacity is exactly 256/8.
     #[test]
-    fn the_header_is_uniformly_64_bit() {
-        assert_eq!(HEADER_PREAMBLE % 8, 0, "dims start 8-aligned");
-        assert_eq!(TENSOR_MAGIC.len() % 8, 0, "so does the rank field after the magic");
-        assert_eq!(MAX_RANK, (TENSOR_HEADER_LEN - HEADER_PREAMBLE) / 8);
+    fn the_header_is_nothing_but_dimensions() {
+        assert_eq!(MAX_RANK, 32, "one u64 per 8 bytes of a 256-byte header");
         let blob = tensor_blob::<F32, 3>([2, 3, 4], payload(2 * 3 * 4 * 4)).expect("ok");
-        assert_eq!(
-            u64::from_le_bytes(blob.bytes[16..24].try_into().unwrap()),
-            3,
-            "rank is a full 64-bit field"
+        for (i, expect) in [2u64, 3, 4].iter().enumerate() {
+            let at = i * 8;
+            let got = u64::from_le_bytes(blob.bytes[at..at + 8].try_into().unwrap());
+            assert_eq!(got, *expect, "dim {i} sits at offset {at}");
+        }
+        assert!(
+            blob.bytes[24..TENSOR_HEADER_LEN].iter().all(|b| *b == 0),
+            "the rest is padding, not a marker"
         );
     }
 
