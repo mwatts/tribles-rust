@@ -287,8 +287,12 @@ fn emit_attribute_definitions(context: &mut MetadataContext) {
 ///
 /// Each entry has the form:
 ///
-/// - `"HEX_ID" as [vis] name: Schema;` for an explicit attribute id
-/// - `[vis] name: Schema;` for a derived id based on the attribute name
+/// - `"HEX_ANCHOR" as [vis] name: Schema;` for an id derived from the
+///   stable anchor and value encoding
+/// - `"HEX_ID" unsafe as [vis] name: Schema;` to use a pre-existing id
+///   literally, without letting the value encoding participate in identity
+/// - `[vis] name: Schema;` for an id derived from the attribute name and
+///   value encoding
 ///
 /// Doc comments attached to each entry become description metadata, and the
 /// macro also generates a `describe` helper for archiving those definitions.

@@ -36,6 +36,17 @@ mod social {
 assert_ne!(social::name.id(), social::friend.id());
 ```
 
+The three declaration forms differ in what determines identity:
+
+- `"HEX_ANCHOR" as name: Encoding` derives the id from the stable anchor and
+  encoding. This is the safe default for shared schemas: renaming the Rust
+  binding is free, while changing the encoding creates a different attribute.
+- `name: Encoding` derives the id from the name and encoding. It is convenient
+  when the source name itself is the shared identifier.
+- `"HEX_ID" unsafe as name: Encoding` uses the literal id without incorporating
+  the encoding. Reserve it for compatibility with an already-published id; the
+  caller must ensure the type still matches the stored rows.
+
 Reach for this macro when:
 
 - you are defining a namespace or encoding module

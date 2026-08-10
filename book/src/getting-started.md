@@ -34,13 +34,13 @@ mod literature {
     use triblespace::prelude::blobencodings::LongString;
     use triblespace::prelude::inlineencodings::{Blake3, GenId, Handle, R256, ShortString};
 
-    // Each attribute is declared with a 128-bit hex constant that
-    // names the *field itself*, not any value stored in it. The
-    // constant is the stable global id for the attribute — `title`
-    // is just the human-readable Rust binding inside this module.
+    // Each shared attribute is declared with a stable 128-bit anchor. Its
+    // identity is derived from (anchor, value encoding), so `title` is only
+    // the human-readable Rust binding inside this module and changing the
+    // encoding truthfully creates a different attribute.
     // Renaming the binding (or another codebase calling the same
-    // field `name`) doesn't break compatibility, because everyone
-    // writes and queries the same underlying id. See the
+    // field `name`) doesn't break compatibility, because everyone derives
+    // the same underlying id from the shared anchor and encoding. See the
     // [Identifiers chapter](./deep-dive/identifiers.md#abstract-vs-semantic-identifiers)
     // for why abstract ids + local semantic names is the
     // recommended split.
@@ -73,9 +73,12 @@ mod literature {
     }
 }
 
-// The examples pin explicit ids for shared encodings. For quick prototypes you
-// can omit the hex literal and `attributes!` will derive a deterministic id
-// from the attribute name and encoding via the entity-core mechanism.
+// The examples anchor shared attributes independently of their Rust names. For
+// quick prototypes you can omit the hex literal and `attributes!` will derive
+// a deterministic id from the attribute name and encoding. The rare
+// `"HEX_ID" unsafe as ...` form pins the literal bytes themselves; use it only
+// to preserve an already-published attribute whose encoding cannot participate
+// in identity.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Repositories manage shared history; MemoryRepo keeps everything in-memory

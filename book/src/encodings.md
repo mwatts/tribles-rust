@@ -97,10 +97,15 @@ ingest external formats. Wrap the source field name in an entity-core fragment �
 `Attribute::<S>::from(entity!{ metadata::name: <name handle>, metadata::value_encoding: <S as MetaDescribe>::id() })` —
 to combine the encoding ID with the source field name and produce a stable
 attribute so re-importing the same data always targets the same column.
-The `attributes!` macro applies the same derivation when you omit the 128-bit id
-literal, which is useful for quick experiments or internal attributes; for
-encodings that will be shared across binaries or languages prefer explicit ids so
-the column remains stable even if the attribute name later changes.
+The `attributes!` macro offers three identity origins. Omitting the literal
+derives identity from `(name, encoding)`, which is useful for quick experiments
+or source-shaped internal attributes. `"HEX_ANCHOR" as name: Encoding` derives
+identity from `(anchor, encoding)`, which is the preferred form for attributes
+shared across binaries or languages: the Rust name can change freely, while a
+type change truthfully creates a different column. The exceptional
+`"HEX_ID" unsafe as name: Encoding` form uses the literal bytes verbatim. It is
+for preserving an already-published identity and carries the unchecked
+obligation that the encoding still agrees with all rows under that id.
 
 ## Built‑in inline encodings
 
