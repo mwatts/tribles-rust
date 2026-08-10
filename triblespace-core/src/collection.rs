@@ -18,6 +18,8 @@ pub mod retention;
 pub mod simplearchive_union;
 /// Native grow-only storage for collection-calculus records.
 pub mod store;
+/// Canonical raw `SuccinctArchiveBlob` set-union collection kind.
+pub mod succinctarchive_union;
 
 pub use api::*;
 pub use discovery::*;

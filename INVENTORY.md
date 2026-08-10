@@ -49,6 +49,12 @@
   `book/src/query-language.md#recursive-traversal`.
 
 ## Desired Functionality
+- Extract a representation-neutral crash-ordered publisher for unsigned
+  collection equations: persist endpoint artifacts, flush dependencies, insert
+  the validated `DERIVE` or `MERGE`, then flush the record. The existing staged
+  publisher is intentionally concrete to `SimpleArchive` commits; a future
+  `ensure(ticket, target_collection)` producer should reuse the generic seam
+  without giving unsigned construction evidence root authority.
 - For pathological single commits or Succinct LSM levels that cannot keep the
   domain, EAV rows, and equal rotation scratch in memory, add a file-backed EAV
   spool plus stable radix/counting passes into the final portable sink; choose

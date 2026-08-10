@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Raw SuccinctArchive collections now validate the exact collection laws.**
+  The raw representation reuses the canonical TribleSet union recipe while
+  remaining a distinct collection through its representation identity.
+  Validators bind every unsigned `DERIVE` and `MERGE` endpoint to freshly
+  hashed bytes, require canonical portable artifacts, and admit only the exact
+  `SimpleArchive -> SuccinctArchiveBlob` mapping or raw set union. The canonical
+  empty artifact and byte-identical commuting derivation/merge paths are pinned
+  by focused tests; none of these equations authorize membership or retention.
 - **Signed records now use neutral metadata and attestation namespaces.** The
   generic metadata-archive link and Ed25519 signer/signature attributes moved
   out of the legacy repository module without changing their stable IDs or
