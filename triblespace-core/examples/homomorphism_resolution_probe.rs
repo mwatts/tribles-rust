@@ -4,15 +4,15 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
-use triblespace_core::blob::MemoryBlobStore;
 use triblespace_core::collection::{
     discover_collection_records, empty_metadata_handle, resolve_collection_semantics,
     CollectionClaimValidation, CollectionCommit, CollectionData, CollectionDefinition,
-    CollectionDerive, CollectionMerge, CollectionValidationRequest,
+    CollectionDerive, CollectionMerge, CollectionRecord, CollectionStore,
+    CollectionValidationRequest,
 };
 use triblespace_core::id::Id;
 use triblespace_core::inline::Inline;
-use triblespace_core::repo::BlobStore;
+use triblespace_core::repo::memoryrepo::MemoryRepo;
 
 #[derive(Clone, Copy, Debug)]
 enum Shape {
@@ -126,19 +126,19 @@ fn build(
         .map(|input| CollectionDerive::new(source.id(), target.id(), *input, mapped(*input)))
         .collect();
 
-    let mut store = MemoryBlobStore::new();
-    store.insert(source.to_blob());
-    store.insert(target.to_blob());
+    let mut store = MemoryRepo::default();
+    CollectionStore::insert(&mut store, CollectionRecord::Definition(source)).unwrap();
+    CollectionStore::insert(&mut store, CollectionRecord::Definition(target)).unwrap();
     for record in &commits {
-        store.insert(record.to_blob());
+        CollectionStore::insert(&mut store, CollectionRecord::Commit(*record)).unwrap();
     }
     for record in &merges {
-        store.insert(record.to_blob());
+        CollectionStore::insert(&mut store, CollectionRecord::Merge(*record)).unwrap();
     }
     for record in &derives {
-        store.insert(record.to_blob());
+        CollectionStore::insert(&mut store, CollectionRecord::Derive(*record)).unwrap();
     }
-    let records = discover_collection_records(&store.reader().unwrap()).unwrap();
+    let records = discover_collection_records(&mut store).unwrap();
     let authorized = commits.iter().map(CollectionCommit::id).collect();
     (
         records,

@@ -15,7 +15,7 @@ pub mod attribute;
 pub mod blob;
 /// Attribute definition and usage metadata.
 pub mod clock;
-/// Canonical records and discovery for the typed collection calculus.
+/// Typed collection records, storage, publication, discovery, and resolution.
 pub mod collection;
 /// Export utilities for serialising trible data.
 pub mod export;
@@ -33,7 +33,7 @@ pub mod patch;
 pub mod prelude;
 /// Query engine: constraints, variables, and the Atreides join algorithm.
 pub mod query;
-/// Repository layer: blob stores, branch stores, commits, and workspaces.
+/// Blob-storage backends and the legacy branch/repository compatibility layer.
 pub mod repo;
 /// Durable Ed25519 signing-key file resolution, loading, and initialization.
 pub mod signing_key_file;

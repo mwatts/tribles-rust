@@ -435,12 +435,13 @@ pub trait BlobStoreKeep {
 /// - **recursive** roots own their resident descendants, discovered through
 ///   [`reachable`].
 ///
-/// The distinction matters for self-describing ledgers. A collection record
-/// contains hashes that describe algebraic inputs, but those hashes are not
-/// ownership edges. Treating the record as a recursive root would pin every
-/// historical physical input and defeat collection compaction. The record
-/// itself is therefore a direct root while selected data and metadata are
-/// recursive roots.
+/// The distinction matters for self-describing ledgers and other descriptive
+/// blobs. A descriptive blob can contain hashes that name algebraic inputs
+/// without owning them. Treating it as a recursive root would pin historical
+/// physical inputs and defeat compaction; callers retain such a blob directly
+/// while retaining selected owned data and metadata recursively. Native
+/// collection records live in [`crate::collection::CollectionStore`] rather
+/// than in this blob-root set.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RetentionRoots {
     direct: BTreeSet<[u8; INLINE_LEN]>,

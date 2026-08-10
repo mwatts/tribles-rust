@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::convert::Infallible;
@@ -6,6 +7,7 @@ use crate::blob::encodings::UnknownBlob;
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::blob::MemoryBlobStore;
+use crate::collection::{CollectionRecord, CollectionStore};
 use crate::prelude::blobencodings::SimpleArchive;
 use crate::prelude::*;
 use crate::repo::PinStore;
@@ -30,6 +32,30 @@ pub struct MemoryRepo {
     /// are exactly as ephemeral as the blobs themselves — the trait is a
     /// capability, durability is the store's own property.
     pub weak: HashSet<Inline<Handle<UnknownBlob>>>,
+    /// Canonical collection records keyed by intrinsic record id.
+    collection_records: BTreeMap<Id, CollectionRecord>,
+}
+
+impl CollectionStore for MemoryRepo {
+    type RecordsError = Infallible;
+    type InsertError = Infallible;
+
+    type RecordIter<'a> = std::vec::IntoIter<Result<CollectionRecord, Self::RecordsError>>;
+
+    fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+        Ok(self
+            .collection_records
+            .values()
+            .copied()
+            .map(Ok)
+            .collect::<Vec<_>>()
+            .into_iter())
+    }
+
+    fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
+        self.collection_records.entry(record.id()).or_insert(record);
+        Ok(())
+    }
 }
 
 impl crate::repo::BlobStorePut for MemoryRepo {
@@ -162,6 +188,8 @@ impl crate::repo::StorageClose for MemoryRepo {
 mod tests {
     use super::*;
 
+    use crate::collection::{CollectionDefinition, CollectionMerge};
+
     fn handle(byte: u8) -> Inline<Handle<UnknownBlob>> {
         Inline::new([byte; 32])
     }
@@ -188,5 +216,34 @@ mod tests {
         // A later weak pin wins over the earlier unpin.
         repo.pin_weak(handle(1)).unwrap();
         assert_eq!(repo.weak_pins().unwrap().count(), 2);
+    }
+
+    #[test]
+    fn collection_records_are_idempotent_and_intrinsically_ordered() {
+        let definition = CollectionRecord::Definition(CollectionDefinition::new(
+            Id::new([1; 16]).unwrap(),
+            Id::new([2; 16]).unwrap(),
+            Id::new([3; 16]).unwrap(),
+        ));
+        let merge = CollectionRecord::Merge(CollectionMerge::new(
+            definition.id(),
+            Inline::new([4; 32]),
+            Inline::new([5; 32]),
+            Inline::new([6; 32]),
+        ));
+        let mut expected = vec![definition, merge];
+        expected.sort_unstable_by_key(CollectionRecord::id);
+
+        let mut repo = MemoryRepo::default();
+        CollectionStore::insert(&mut repo, merge).unwrap();
+        CollectionStore::insert(&mut repo, definition).unwrap();
+        CollectionStore::insert(&mut repo, merge).unwrap();
+
+        let actual = repo
+            .records()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(actual, expected);
     }
 }

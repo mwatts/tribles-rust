@@ -171,15 +171,17 @@ mod tests {
     use ed25519_dalek::SigningKey;
 
     use crate::blob::encodings::UnknownBlob;
-    use crate::blob::{BlobEncoding, IntoBlob, MemoryBlobStore, TryFromBlob};
+    use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
     use crate::collection::{
         discover_collection_records, resolve_collection_semantics, CollectionClaimValidation,
-        CollectionCommit, CollectionMerge, CollectionValidationRequest,
+        CollectionCommit, CollectionMerge, CollectionRecord, CollectionStore,
+        CollectionValidationRequest,
     };
     use crate::id::Id;
     use crate::inline::Inline;
     use crate::inline::InlineEncoding;
-    use crate::repo::{BlobMetadata, BlobStore, BlobStoreGet, BlobStoreMeta};
+    use crate::repo::memoryrepo::MemoryRepo;
+    use crate::repo::{BlobMetadata, BlobStoreGet, BlobStoreMeta};
     use crate::trible::{Trible, TRIBLE_LEN};
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -326,16 +328,15 @@ mod tests {
             })
             .collect();
 
-        let mut records = MemoryBlobStore::new();
-        records.insert(definition.to_blob());
+        let mut records = MemoryRepo::default();
+        CollectionStore::insert(&mut records, CollectionRecord::Definition(*definition)).unwrap();
         for commit in &commits {
-            records.insert(commit.to_blob());
+            CollectionStore::insert(&mut records, CollectionRecord::Commit(*commit)).unwrap();
         }
         for merge in merges {
-            records.insert(merge.to_blob());
+            CollectionStore::insert(&mut records, CollectionRecord::Merge(*merge)).unwrap();
         }
-        let reader = records.reader().unwrap();
-        let discovered = discover_collection_records(&reader).unwrap();
+        let discovered = discover_collection_records(&mut records).unwrap();
         let authorized = commits.iter().map(CollectionCommit::id).collect();
         resolve_collection_semantics(
             &discovered,

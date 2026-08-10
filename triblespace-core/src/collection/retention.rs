@@ -1,8 +1,9 @@
 //! Strong retention roots for authorized collection commits.
 //!
 //! A signed, locally authorized [`super::CollectionCommit`] is durable ground
-//! truth. Its collection definition and commit record are direct roots; its
-//! data and metadata are recursive roots which own their resident attachments.
+//! truth. Its native collection records are retained by the collection-store
+//! rewrite policy; its data and metadata are recursive blob roots which own
+//! their resident attachments.
 //!
 //! Unsigned `MERGE` and `DERIVE` records are reproducible cache work, not
 //! authority. They therefore add no strong roots, whether their equations are
@@ -28,7 +29,7 @@ use super::{CollectionData, CollectionResolution, DiscoveredCollectionRecords};
 /// available.
 #[derive(Debug)]
 pub enum CollectionRetentionError<MetadataError> {
-    /// An admitted commit's collection has no resident canonical definition.
+    /// An admitted commit's collection has no canonical definition record.
     MissingDefinition {
         /// Intrinsic collection id.
         collection: Id,
@@ -101,16 +102,19 @@ where
 /// cannot retain anything. Admitted unsigned equations are deliberately
 /// ignored: validation and activation do not turn cache work into authority.
 ///
-/// Every admitted commit retains its referenced collection definition and
-/// canonical commit record directly, plus its signed data and metadata
-/// recursively. Planning fails if any required definition, data, or metadata
-/// blob is absent instead of manufacturing a root for unavailable ground
-/// truth.
+/// Every admitted commit requires its referenced collection definition to be
+/// present in `records` and retains its signed data and metadata recursively.
+/// Native definition and commit records are not blobs and therefore do not
+/// appear in the returned roots. Planning fails if a required definition
+/// record, data blob, or metadata blob is absent instead of manufacturing a
+/// root for unavailable ground truth.
 ///
 /// The returned roots are a pure result, not a persisted retained-scope
 /// registry. A collector must rediscover, authorize, resolve, and plan again on
-/// each later pass. A legacy pin must not be removed until some higher layer
-/// durably owns that recurring policy.
+/// each later pass. Ordinary rewrites remain conservative and preserve every
+/// native record plus every COMMIT-owned blob; applying this narrower plan is
+/// an explicit local forgetting operation, never an implicit publication side
+/// effect.
 pub fn plan_collection_retention<D, R>(
     records: &DiscoveredCollectionRecords,
     resolution: &CollectionResolution<D>,
@@ -132,19 +136,11 @@ where
             continue;
         }
 
-        let definition = definitions.get(&claim.collection()).ok_or(
+        definitions.get(&claim.collection()).ok_or(
             CollectionRetentionError::MissingDefinition {
                 collection: claim.collection(),
             },
         )?;
-        let definition_handle = definition.to_blob().get_handle();
-        if !require_resident(reader, definition_handle)? {
-            return Err(CollectionRetentionError::MissingDefinition {
-                collection: claim.collection(),
-            });
-        }
-        roots.retain_direct(definition_handle);
-        roots.retain_direct(claim.to_blob().get_handle());
 
         let data_handle = Handle::<UnknownBlob>::from_hash(claim.data());
         if !require_resident(reader, data_handle)? {
@@ -199,12 +195,13 @@ mod tests {
     use crate::collection::simplearchive_union::{self, SimpleArchiveUnionValidationError};
     use crate::collection::{
         discover_collection_records, resolve_collection_semantics, CollectionClaimValidation,
-        CollectionCommit, CollectionDerive, CollectionMerge, CollectionValidationRequest,
+        CollectionCommit, CollectionDerive, CollectionMerge, CollectionRecord, CollectionStore,
+        CollectionValidationRequest,
     };
     use crate::inline::encodings::hash::{Blake3, Hash};
     use crate::macros::entity;
     use crate::metadata;
-    use crate::repo::{BlobStore, BlobStoreGet};
+    use crate::repo::{memoryrepo::MemoryRepo, BlobStore, BlobStoreGet, BlobStoreKeep};
     use crate::trible::{Trible, TribleSet, TRIBLE_LEN};
 
     fn id(byte: u8) -> Id {
@@ -286,7 +283,7 @@ mod tests {
     }
 
     fn insert_record_fixture(
-        store: &mut MemoryBlobStore,
+        store: &mut MemoryRepo,
         definition: &super::super::CollectionDefinition,
         data: Blob<SimpleArchive>,
         metadata: Blob<SimpleArchive>,
@@ -298,10 +295,10 @@ mod tests {
             self::data(&data),
             metadata.get_handle(),
         );
-        store.insert(super::super::CollectionDefinition::to_blob(definition));
-        store.insert(data);
-        store.insert(metadata);
-        store.insert(CollectionCommit::to_blob(&commit));
+        CollectionStore::insert(store, CollectionRecord::Definition(*definition)).unwrap();
+        store.blobs.insert(data);
+        store.blobs.insert(metadata);
+        CollectionStore::insert(store, CollectionRecord::Commit(commit)).unwrap();
         commit
     }
 
@@ -323,30 +320,23 @@ mod tests {
             .into_facts()
             .to_blob();
 
-        let mut store = MemoryBlobStore::new();
-        store.insert(content_text);
-        store.insert(metadata_text);
-        store.insert(orphan);
+        let mut store = MemoryRepo::default();
+        store.blobs.insert(content_text);
+        store.blobs.insert(metadata_text);
+        store.blobs.insert(orphan);
         let content_handle = content.get_handle();
         let metadata_handle = metadata.get_handle();
-        let definition_handle =
-            super::super::CollectionDefinition::to_blob(&definition).get_handle();
         let commit = insert_record_fixture(&mut store, &definition, content, metadata, &key);
-        let commit_handle = CollectionCommit::to_blob(&commit).get_handle();
 
+        let records = discover_collection_records(&mut store).unwrap();
         let reader = store.reader().unwrap();
-        let records = discover_collection_records(&reader).unwrap();
         let authorized = BTreeSet::from([commit.id()]);
         let resolution = resolve_collection_semantics(&records, &authorized, |request| {
             validate_union(&reader, &BTreeSet::new(), request)
         })
         .unwrap();
         let roots = plan_collection_retention(&records, &resolution, &reader).unwrap();
-        let direct: BTreeSet<_> = roots.direct().collect();
-        assert_eq!(
-            direct,
-            BTreeSet::from([definition_handle.transmute(), commit_handle.transmute()])
-        );
+        assert_eq!(roots.direct().len(), 0);
         let recursive: BTreeSet<_> = roots.recursive().collect();
         assert_eq!(
             recursive,
@@ -355,11 +345,10 @@ mod tests {
         let keep = roots.expanded(&reader);
 
         store.keep(keep);
+        let retained_records = discover_collection_records(&mut store).unwrap();
+        assert_eq!(retained_records.definitions(), &[definition]);
+        assert_eq!(retained_records.commits(), &[commit]);
         let reader = store.reader().unwrap();
-        assert!(reader
-            .get::<Blob<SimpleArchive>, _>(definition_handle)
-            .is_ok());
-        assert!(reader.get::<Blob<SimpleArchive>, _>(commit_handle).is_ok());
         assert!(reader
             .get::<Blob<SimpleArchive>, _>(Handle::from_hash(commit.data()))
             .is_ok());
@@ -379,14 +368,12 @@ mod tests {
     fn unsigned_equations_add_no_strong_roots_when_grounded_or_ungrounded() {
         let source = simplearchive_union::definition(id(1));
         let target = simplearchive_union::definition(id(2));
-        let source_definition = super::super::CollectionDefinition::to_blob(&source);
-        let target_definition = super::super::CollectionDefinition::to_blob(&target);
         let key = SigningKey::from_bytes(&[7; 32]);
         let left = archive([row(1, 1, 1)]);
         let right = archive([row(2, 1, 2)]);
         let empty_metadata = TribleSet::new().to_blob();
 
-        let mut store = MemoryBlobStore::new();
+        let mut store = MemoryRepo::default();
         let first = insert_record_fixture(
             &mut store,
             &source,
@@ -401,7 +388,7 @@ mod tests {
             empty_metadata.clone(),
             &key,
         );
-        store.insert(target_definition.clone());
+        CollectionStore::insert(&mut store, CollectionRecord::Definition(target)).unwrap();
 
         let active_merge_result = simplearchive_union::join(&left, &right).unwrap();
         let active_merge = CollectionMerge::new(
@@ -443,17 +430,17 @@ mod tests {
             orphan_merge_result.clone(),
             orphan_derive_output.clone(),
         ] {
-            store.insert(blob);
+            store.blobs.insert(blob);
         }
         for record in [&active_merge, &orphan_merge] {
-            store.insert(CollectionMerge::to_blob(record));
+            CollectionStore::insert(&mut store, CollectionRecord::Merge(*record)).unwrap();
         }
         for record in [&active_derive, &orphan_derive] {
-            store.insert(CollectionDerive::to_blob(record));
+            CollectionStore::insert(&mut store, CollectionRecord::Derive(*record)).unwrap();
         }
 
+        let records = discover_collection_records(&mut store).unwrap();
         let reader = store.reader().unwrap();
-        let records = discover_collection_records(&reader).unwrap();
 
         let unauthorized = resolve_collection_semantics(&records, &BTreeSet::new(), |request| {
             validate_union_and_derives(&reader, request)
@@ -480,15 +467,7 @@ mod tests {
         }
 
         let roots = plan_collection_retention(&records, &resolution, &reader).unwrap();
-        let direct: BTreeSet<_> = roots.direct().collect();
-        assert_eq!(
-            direct,
-            BTreeSet::from([
-                source_definition.get_handle().transmute(),
-                CollectionCommit::to_blob(&first).get_handle().transmute(),
-                CollectionCommit::to_blob(&second).get_handle().transmute(),
-            ])
-        );
+        assert_eq!(roots.direct().len(), 0);
         let recursive: BTreeSet<_> = roots.recursive().collect();
         assert_eq!(
             recursive,
@@ -500,13 +479,6 @@ mod tests {
         );
 
         let keep = roots.expanded(&reader);
-        assert!(!keep.contains(&target_definition.get_handle().transmute()));
-        for record in [&active_merge, &orphan_merge] {
-            assert!(!keep.contains(&CollectionMerge::to_blob(record).get_handle().transmute()));
-        }
-        for record in [&active_derive, &orphan_derive] {
-            assert!(!keep.contains(&CollectionDerive::to_blob(record).get_handle().transmute()));
-        }
         for cache_blob in [
             &active_merge_result,
             &active_derive_output,
@@ -525,22 +497,16 @@ mod tests {
         let key = SigningKey::from_bytes(&[7; 32]);
         let content = archive([row(1, 1, 1)]);
         let metadata = archive([row(2, 1, 2)]);
-        let definition_blob = super::super::CollectionDefinition::to_blob(&definition);
         let commit =
             CollectionCommit::sign(&key, definition.id(), data(&content), metadata.get_handle());
-        let commit_blob = CollectionCommit::to_blob(&commit);
 
-        let mut complete = MemoryBlobStore::new();
-        for blob in [
-            definition_blob.clone(),
-            content.clone(),
-            metadata.clone(),
-            commit_blob.clone(),
-        ] {
-            complete.insert(blob);
-        }
+        let mut complete = MemoryRepo::default();
+        CollectionStore::insert(&mut complete, CollectionRecord::Definition(definition)).unwrap();
+        CollectionStore::insert(&mut complete, CollectionRecord::Commit(commit)).unwrap();
+        complete.blobs.insert(content.clone());
+        complete.blobs.insert(metadata.clone());
+        let records = discover_collection_records(&mut complete).unwrap();
         let complete_reader = complete.reader().unwrap();
-        let records = discover_collection_records(&complete_reader).unwrap();
         let resolution =
             resolve_collection_semantics(&records, &BTreeSet::from([commit.id()]), |request| {
                 validate_union(&complete_reader, &BTreeSet::new(), request)
@@ -548,25 +514,17 @@ mod tests {
             .unwrap();
         plan_collection_retention(&records, &resolution, &complete_reader).unwrap();
 
-        let mut missing_definition = MemoryBlobStore::new();
-        for blob in [content.clone(), metadata.clone(), commit_blob.clone()] {
-            missing_definition.insert(blob);
-        }
-        let reader = missing_definition.reader().unwrap();
+        let mut missing_definition = MemoryRepo::default();
+        CollectionStore::insert(&mut missing_definition, CollectionRecord::Commit(commit)).unwrap();
+        let missing_records = discover_collection_records(&mut missing_definition).unwrap();
         assert!(matches!(
-            plan_collection_retention(&records, &resolution, &reader),
+            plan_collection_retention(&missing_records, &resolution, &complete_reader),
             Err(CollectionRetentionError::MissingDefinition { collection })
                 if collection == definition.id()
         ));
 
         let mut missing_data = MemoryBlobStore::new();
-        for blob in [
-            definition_blob.clone(),
-            metadata.clone(),
-            commit_blob.clone(),
-        ] {
-            missing_data.insert(blob);
-        }
+        missing_data.insert(metadata.clone());
         let reader = missing_data.reader().unwrap();
         assert!(matches!(
             plan_collection_retention(&records, &resolution, &reader),
@@ -575,9 +533,7 @@ mod tests {
         ));
 
         let mut missing_metadata = MemoryBlobStore::new();
-        for blob in [definition_blob, content, commit_blob] {
-            missing_metadata.insert(blob);
-        }
+        missing_metadata.insert(content);
         let reader = missing_metadata.reader().unwrap();
         assert!(matches!(
             plan_collection_retention(&records, &resolution, &reader),

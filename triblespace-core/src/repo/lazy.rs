@@ -90,6 +90,7 @@ use anybytes::Bytes;
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
+use crate::collection::{CollectionRecord, CollectionStore};
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding, RawInline};
@@ -447,6 +448,37 @@ where
         new: Option<Inline<Handle<SimpleArchive>>>,
     ) -> Result<PushResult, Self::UpdateError> {
         self.store.lock().expect("store mutex").update(id, old, new)
+    }
+}
+
+impl<S> CollectionStore for Lazy<S>
+where
+    S: BlobStore
+        + BlobStorePut
+        + CollectionStore
+        + PinStore
+        + WeakPinStore
+        + StorageFlush
+        + Send
+        + 'static,
+{
+    type RecordsError = S::RecordsError;
+    type InsertError = S::InsertError;
+    // Collected eagerly: the inner iterator borrows the mutex guard, which
+    // cannot escape this call.
+    type RecordIter<'a>
+        = std::vec::IntoIter<Result<CollectionRecord, S::RecordsError>>
+    where
+        S: 'a;
+
+    fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+        let mut store = self.store.lock().expect("store mutex");
+        let records: Vec<Result<CollectionRecord, S::RecordsError>> = store.records()?.collect();
+        Ok(records.into_iter())
+    }
+
+    fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
+        self.store.lock().expect("store mutex").insert(record)
     }
 }
 
@@ -824,6 +856,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collection::CollectionDefinition;
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::pile::Pile;
     use futures::executor::block_on;
@@ -839,6 +872,22 @@ mod tests {
     fn fresh_pile(path: &std::path::Path) -> Pile {
         std::fs::File::create(path).unwrap();
         Pile::open(path).unwrap()
+    }
+
+    #[test]
+    fn collection_records_forward_through_the_store_mutex() {
+        let id = |byte| Id::new([byte; 16]).unwrap();
+        let record = CollectionRecord::Definition(CollectionDefinition::new(id(1), id(2), id(3)));
+        let mut lazy = Lazy::new(MemoryRepo::default());
+
+        CollectionStore::insert(&mut lazy, record).unwrap();
+        assert_eq!(
+            CollectionStore::records(&mut lazy)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![record]
+        );
     }
 
     /// A local hit serves from the snapshot: no want is recorded.

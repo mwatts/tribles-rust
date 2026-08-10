@@ -327,6 +327,7 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
     let mut blob_header_matches = 0usize;
     let mut branch_header_matches = 0usize;
     let mut weak_marker_matches = 0usize;
+    let mut collection_record_matches = 0usize;
     let mut payload_matches = 0usize;
     let mut parse_error = None;
 
@@ -375,6 +376,16 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
                     println!("weak-pin marker match at byte {}", record.offset);
                 }
             }
+            PileRecordContent::Collection { .. } => {
+                let raw = &bytes[record.offset..record.offset + record.len];
+                for pos in finder.find_iter(raw) {
+                    collection_record_matches += 1;
+                    println!(
+                        "collection-record reference at byte {}",
+                        record.offset + pos
+                    );
+                }
+            }
         }
     }
 
@@ -382,6 +393,7 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
     println!("  blob headers:   {blob_header_matches}");
     println!("  branch headers: {branch_header_matches}");
     println!("  weak markers:   {weak_marker_matches}");
+    println!("  collection records: {collection_record_matches}");
     println!("  payload refs:   {payload_matches}");
     if let Some(err) = parse_error {
         println!("  parse stopped:  {err}");

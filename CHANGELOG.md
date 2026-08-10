@@ -77,18 +77,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signed `COMMIT` last. Abandonment is deliberately inert: unrooted staged
   dependencies remain undiscoverable as membership and produce no retention
   roots.
+- **Collection algebra records now have a native grow-only storage surface.**
+  `CollectionStore` admits intrinsically identified `Definition`, signed
+  `COMMIT`, `MERGE`, and `DERIVE` records without a mutable head, CAS,
+  tombstone, or branch cell. Pile stores each kind as one fixed 256-byte V3
+  record and replays their set union in intrinsic-id order; object-store
+  remotes use immutable `collection-records/<id>` objects and validate both
+  canonical bytes and path identity. Memory, hybrid, lazy, blocking-async, and
+  generational Yard adapters preserve the same idempotent algebra, including
+  across cat/reopen/reclaim boundaries.
+- **`Collection<S>` is the narrow Fragment-native publication facade.** Pure
+  construction binds one scope and signing key; `commit(fragment)` archives
+  facts as data, metafacts as signed metadata, persists the shared attachment
+  store, and appends one independent signed COMMIT. It has no parents, head,
+  conflict retry, message field, planner, or tuning knobs. Optional procedural-
+  macro instrumentation uses the same path and one explicit
+  `TRIBLESPACE_METADATA_COLLECTION_SCOPE`, replacing its Repository/Workspace
+  push protocol.
 - **Collection retention is now an explicit two-edge policy rather than a
-  blind hash walk.** `RetentionRoots` distinguishes direct record roots from
-  recursively owned blobs. The strong planner retains only locally authorized,
-  admitted `COMMIT` ground truth: each referenced collection definition and
-  commit record directly, and each signed data and metadata blob recursively
-  with its resident attachments. Unsigned `MERGE` and `DERIVE` equations add no
-  roots even when accepted and active; they remain collectable cache work for a
-  separate future policy. Yard `collect` and `compact` require those policy
-  roots explicitly, and Pile can rewrite them into another append-only store
-  while composing in active legacy strong pins. Weak wants are handled
-  explicitly: they may be preserved as demand markers without silently
-  becoming ownership roots.
+  blind hash walk.** Native collection records live outside the blob root set.
+  Conservative Pile/Yard rewrites preserve every native record and recursively
+  retain every signed COMMIT's data, metadata, and resident attachment closure;
+  unsigned `MERGE` and `DERIVE` endpoints remain descriptive, reproducible cache
+  work rather than ownership edges. The policy-aware planner can still narrow
+  this to locally authorized, admitted COMMIT ground truth for an explicit
+  destructive retention operation. Weak wants remain demand markers and never
+  silently become ownership roots.
 - **Resolved `SimpleArchive` collections have one narrow read-side
   materializer.** It probes residency only for known semantic members, selects
   the deterministic overlap-aware physical cover, reports uncovered frontier

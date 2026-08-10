@@ -1,4 +1,5 @@
-//! Generational collection of piles for lazy-retention blob storage.
+//! Generational collection of piles for lazy-retention blob storage and a
+//! generation-independent native collection-record union.
 //!
 //! A [`Yard`](crate::repo::yard::Yard) keeps an ordered young-to-old sequence of [`Pile`](crate::repo::pile::Pile)
 //! generations. Writes land in the youngest generation, reads search the union
@@ -8,7 +9,7 @@
 //! also be physically removed from disk.
 
 use std::cmp::Reverse;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
@@ -20,6 +21,7 @@ use anybytes::Bytes;
 
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
+use crate::collection::{CollectionRecord, CollectionStore};
 use crate::id::{Id, RawId};
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding, INLINE_LEN};
@@ -27,7 +29,9 @@ use crate::patch::{Entry, IdentitySchema, PATCH};
 
 use crate::prelude::blobencodings::SimpleArchive;
 
-use super::pile::{GetBlobError, InsertError, Pile, PileReader, PileWriteError, ReadError};
+use super::pile::{
+    CollectionInsertError, GetBlobError, InsertError, Pile, PileReader, PileWriteError, ReadError,
+};
 use super::{
     transfer, BlobChildren, BlobInfo, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut,
     PinStore, PushResult, RetentionRoots, StorageClose, TransferError, WeakPinStore,
@@ -370,11 +374,16 @@ impl Yard {
     /// The supplied roots are strong for this pass. Direct roots retain only
     /// themselves; recursive roots retain their resident descendants. Callers
     /// must supply the same policy on every later collection pass for the
-    /// corresponding data to remain live. Pass an empty [`RetentionRoots`]
-    /// explicitly when legacy strong pins are the only desired strong roots.
+    /// corresponding data to remain live. Native collection commits always
+    /// add their data and metadata as recursive roots; unsigned equations do
+    /// not. Pass an empty [`RetentionRoots`] explicitly when those commits and
+    /// legacy strong pins are the only desired strong roots.
     pub fn collect(&mut self, retention: &RetentionRoots) -> Result<(), YardCollectError> {
+        let retention = self
+            .retention_with_native_commits(retention)
+            .map_err(YardCollectError::CollectionRecords)?;
         let reader = self.reader().map_err(YardCollectError::Reader)?;
-        let strong_keep = self.strong_keep_set(&reader, retention);
+        let strong_keep = self.strong_keep_set(&reader, &retention);
         let present = reader.live_set();
         let weak_keep = self
             .weak_state
@@ -405,8 +414,11 @@ impl Yard {
         let mut dumped = Vec::new();
 
         {
+            let retention = self
+                .retention_with_native_commits(retention)
+                .map_err(YardCollectError::CollectionRecords)?;
             let reader = self.reader().map_err(YardCollectError::Reader)?;
-            let strong_keep = self.strong_keep_set(&reader, retention);
+            let strong_keep = self.strong_keep_set(&reader, &retention);
 
             for level in 0..last {
                 let strong_here = self.generations[level].segments[0]
@@ -484,9 +496,10 @@ impl Yard {
     /// generation's live PATCH set, so evicted blobs stop being readable through
     /// Yard readers, but they do not mutate the underlying append-only pile
     /// files. `reclaim` is the explicit physical step. For each generation it
-    /// writes the current live handles to a sibling temporary pile with
-    /// [`transfer`], closes both piles, atomically renames the temporary file
-    /// over the original on the same filesystem, and reopens the generation.
+    /// writes the current live handles and every native collection record to a
+    /// sibling temporary pile, closes both piles, atomically renames the
+    /// temporary file over the original on the same filesystem, and reopens
+    /// the generation.
     pub fn reclaim(&mut self) -> Result<(), YardReclaimError> {
         for level in 0..self.generations.len() {
             for index in 0..self.generations[level].segments.len() {
@@ -550,6 +563,23 @@ impl Yard {
         self.config.strong_level_budget.saturating_mul(multiplier)
     }
 
+    /// Add the ownership edges carried by every structurally valid native
+    /// commit. Commit data and metadata are strong recursive roots; unsigned
+    /// merge/derive equations are evidence only and never own their inputs.
+    fn retention_with_native_commits(
+        &mut self,
+        retention: &RetentionRoots,
+    ) -> Result<RetentionRoots, YardCollectionRecordsError> {
+        let mut combined = retention.clone();
+        for result in self.records()? {
+            if let CollectionRecord::Commit(commit) = result? {
+                combined.retain_recursive(Inline::<Handle<UnknownBlob>>::new(commit.data().raw));
+                combined.retain_recursive(commit.metadata());
+            }
+        }
+        Ok(combined)
+    }
+
     fn strong_keep_set(&self, reader: &YardReader, retention: &RetentionRoots) -> HandleSet {
         let weak_pins = self
             .weak_state
@@ -604,6 +634,88 @@ impl Yard {
             .live
             .insert(&Entry::new(&unknown.raw));
         Ok(handle)
+    }
+}
+
+/// Deterministic owned snapshot of the native collection records visible
+/// across all yard generations.
+pub struct YardCollectionRecordIter {
+    inner: std::collections::btree_map::IntoValues<Id, CollectionRecord>,
+}
+
+impl Iterator for YardCollectionRecordIter {
+    type Item = Result<CollectionRecord, YardCollectionRecordsError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(Ok)
+    }
+}
+
+/// Failure while replaying the native collection-record union of a yard.
+#[derive(Debug)]
+pub enum YardCollectionRecordsError {
+    /// One generation could not refresh or decode its pile.
+    Pile(ReadError),
+    /// Two generations presented different canonical records under one
+    /// intrinsic id.
+    IdCollision { id: Id },
+}
+
+impl fmt::Display for YardCollectionRecordsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pile(error) => write!(f, "failed to replay yard collection records: {error}"),
+            Self::IdCollision { id } => {
+                write!(f, "collection record id {id:X} names different fields")
+            }
+        }
+    }
+}
+
+impl Error for YardCollectionRecordsError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Pile(error) => Some(error),
+            Self::IdCollision { .. } => None,
+        }
+    }
+}
+
+impl CollectionStore for Yard {
+    type RecordsError = YardCollectionRecordsError;
+    type InsertError = CollectionInsertError;
+    type RecordIter<'a> = YardCollectionRecordIter;
+
+    fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+        let mut records = BTreeMap::new();
+        for generation in &mut self.generations {
+            for segment in &mut generation.segments {
+                let replay = segment
+                    .pile_mut()
+                    .records()
+                    .map_err(YardCollectionRecordsError::Pile)?;
+                for result in replay {
+                    let record = result.map_err(YardCollectionRecordsError::Pile)?;
+                    let id = record.id();
+                    match records.get(&id) {
+                        Some(existing) if existing != &record => {
+                            return Err(YardCollectionRecordsError::IdCollision { id });
+                        }
+                        Some(_) => {}
+                        None => {
+                            records.insert(id, record);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(YardCollectionRecordIter {
+            inner: records.into_values(),
+        })
+    }
+
+    fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
+        self.generations[0].active_mut().pile_mut().insert(record)
     }
 }
 
@@ -987,6 +1099,11 @@ fn reclaim_generation(
         Err(err) => return Err(YardReclaimError::Io(err)),
     }
 
+    let collection_records = old_pile
+        .records()
+        .map_err(YardReclaimError::Pile)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(YardReclaimError::Pile)?;
     let reader = old_pile.reader().map_err(YardReclaimError::Pile)?;
     File::create(temp_path).map_err(YardReclaimError::Io)?;
     let mut new_pile = Pile::open(temp_path).map_err(YardReclaimError::Pile)?;
@@ -998,6 +1115,11 @@ fn reclaim_generation(
 
     for result in transfer(&reader, &mut new_pile, handles) {
         result.map_err(YardReclaimError::Transfer)?;
+    }
+    for record in collection_records {
+        new_pile
+            .insert(record)
+            .map_err(YardReclaimError::CollectionRecord)?;
     }
 
     new_pile.close().map_err(YardReclaimError::Close)?;
@@ -1094,6 +1216,7 @@ impl<E: Error + 'static> Error for YardGetError<E> {}
 #[derive(Debug)]
 pub enum YardCollectError {
     Reader(YardReaderError),
+    CollectionRecords(YardCollectionRecordsError),
     Transfer(TransferError<Infallible, YardGetError<Infallible>, InsertError>),
     Flush(super::pile::FlushError),
     Reclaim(YardReclaimError),
@@ -1104,6 +1227,9 @@ impl fmt::Display for YardCollectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Reader(err) => write!(f, "failed to create yard reader: {err}"),
+            Self::CollectionRecords(err) => {
+                write!(f, "failed to replay yard collection records: {err}")
+            }
             Self::Transfer(err) => write!(f, "failed to compact yard generation: {err}"),
             Self::Flush(err) => write!(f, "failed to flush yard generation pile: {err}"),
             Self::Reclaim(err) => {
@@ -1138,6 +1264,7 @@ pub enum YardReclaimError {
     Io(std::io::Error),
     Pile(ReadError),
     Transfer(TransferError<Infallible, GetBlobError<Infallible>, InsertError>),
+    CollectionRecord(CollectionInsertError),
     Close(super::pile::FlushError),
     WeakMarkers(std::io::Error),
     /// A generation rewrite failed (`primary`) and the subsequent
@@ -1159,6 +1286,9 @@ impl fmt::Display for YardReclaimError {
             Self::Io(err) => write!(f, "failed to replace yard generation pile: {err}"),
             Self::Pile(err) => write!(f, "failed to read yard generation pile: {err}"),
             Self::Transfer(err) => write!(f, "failed to copy live yard blobs: {err}"),
+            Self::CollectionRecord(err) => {
+                write!(f, "failed to copy a yard collection record: {err}")
+            }
             Self::Close(err) => write!(f, "failed to close yard generation pile: {err}"),
             Self::WeakMarkers(err) => {
                 write!(f, "failed to re-record weak-pin markers: {err}")
@@ -1178,6 +1308,12 @@ impl Error for YardReclaimError {}
 mod tests {
     use super::*;
     use crate::blob::encodings::rawbytes::RawBytes;
+    use crate::collection::{
+        empty_metadata_handle, CollectionCommit, CollectionDefinition, CollectionDerive,
+        CollectionMerge,
+    };
+    use crate::trible::TribleSet;
+    use ed25519_dalek::SigningKey;
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
     fn yard_with_paths(
@@ -1240,6 +1376,140 @@ mod tests {
             })
             .expect("older generation is listed");
         assert_eq!(info.length, b"old generation".len() as u64);
+    }
+
+    #[test]
+    fn collection_records_form_a_deterministic_generation_union_and_write_young() {
+        let config = YardConfig::default();
+        let (_dir, paths, mut yard) = yard_with_paths(2, config);
+        let first = CollectionRecord::Definition(CollectionDefinition::new(
+            pin_id(21),
+            pin_id(22),
+            pin_id(23),
+        ));
+        let second = CollectionRecord::Definition(CollectionDefinition::new(
+            pin_id(24),
+            pin_id(25),
+            pin_id(26),
+        ));
+        let third = CollectionRecord::Definition(CollectionDefinition::new(
+            pin_id(27),
+            pin_id(28),
+            pin_id(29),
+        ));
+
+        yard.generations[1]
+            .active_mut()
+            .pile_mut()
+            .insert(first)
+            .unwrap();
+        yard.generations[1]
+            .active_mut()
+            .pile_mut()
+            .insert(second)
+            .unwrap();
+        yard.generations[0]
+            .active_mut()
+            .pile_mut()
+            .insert(first)
+            .unwrap();
+        yard.insert(third).unwrap();
+
+        let mut expected = vec![first, second, third];
+        expected.sort_by_key(CollectionRecord::id);
+        assert_eq!(
+            yard.records()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            expected
+        );
+        let young = yard.generations[0]
+            .active_mut()
+            .pile_mut()
+            .records()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(young.contains(&third));
+
+        yard.close().unwrap();
+        let mut reopened = Yard::open(&paths, config).unwrap();
+        assert_eq!(
+            reopened
+                .records()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            expected
+        );
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn native_commits_root_owned_blobs_and_reclaim_preserves_every_record_kind() {
+        let (dir, mut yard) = yard_with(1, YardConfig::default());
+        let attachment = yard
+            .put::<RawBytes, _>(raw_blob(b"commit-owned attachment"))
+            .unwrap();
+        let data = yard
+            .put::<RawBytes, _>(Bytes::from_source(attachment.raw.to_vec()))
+            .unwrap();
+        let metadata = yard
+            .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+            .unwrap();
+        assert_eq!(metadata, empty_metadata_handle());
+        let equation_only = yard
+            .put::<RawBytes, _>(raw_blob(b"mentioned only by unsigned equations"))
+            .unwrap();
+
+        let definition = CollectionDefinition::new(pin_id(31), pin_id(32), pin_id(33));
+        let key = SigningKey::from_bytes(&[34; 32]);
+        let records = vec![
+            CollectionRecord::Definition(definition),
+            CollectionRecord::Commit(CollectionCommit::sign(
+                &key,
+                definition.id(),
+                Inline::new(data.raw),
+                metadata,
+            )),
+            CollectionRecord::Merge(CollectionMerge::new(
+                definition.id(),
+                Inline::new(equation_only.raw),
+                Inline::new([35; 32]),
+                Inline::new([36; 32]),
+            )),
+            CollectionRecord::Derive(CollectionDerive::new(
+                definition.id(),
+                pin_id(37),
+                Inline::new([36; 32]),
+                Inline::new(equation_only.raw),
+            )),
+        ];
+        for record in records.iter().copied() {
+            yard.insert(record).unwrap();
+        }
+
+        yard.collect(&RetentionRoots::new()).unwrap();
+        let reader = yard.reader().unwrap();
+        assert!(reader.get::<Bytes, RawBytes>(attachment).is_ok());
+        assert!(reader.get::<Bytes, RawBytes>(data).is_ok());
+        assert!(reader
+            .get::<Blob<SimpleArchive>, SimpleArchive>(metadata)
+            .is_ok());
+        assert!(reader.get::<Bytes, RawBytes>(equation_only).is_err());
+        drop(reader);
+
+        yard.reclaim().unwrap();
+        assert_eq!(pile_blob_count(&dir.path().join("gen-0.pile")), 3);
+        let actual = yard
+            .records()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut expected = records;
+        expected.sort_by_key(CollectionRecord::id);
+        assert_eq!(actual, expected);
     }
 
     #[test]

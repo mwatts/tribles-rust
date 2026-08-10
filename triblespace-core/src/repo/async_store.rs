@@ -31,6 +31,7 @@ use std::future::Future;
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
+use crate::collection::{CollectionRecord, CollectionStore};
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
@@ -128,6 +129,34 @@ pub trait AsyncBlobStore: AsyncBlobStorePut {
 
     /// Create a shareable reader snapshot of the current store state.
     fn reader(&mut self) -> impl Future<Output = Result<Self::Reader, Self::ReaderError>> + Send;
+}
+
+/// Async counterpart of [`CollectionStore`].
+///
+/// A remote enumeration is an observed monotone view, not a coherent snapshot:
+/// records appended concurrently may appear on this call or a later one. Every
+/// returned vector is nevertheless ordered deterministically by intrinsic
+/// record id by the implementation.
+pub trait AsyncCollectionStore {
+    /// Failure while enumerating stored records.
+    type RecordsError: Error + Debug + Send + Sync + 'static;
+    /// Failure while admitting one canonical record.
+    type InsertError: Error + Debug + Send + Sync + 'static;
+
+    /// Enumerate the collection records currently observed by the backend.
+    fn records(
+        &mut self,
+    ) -> impl Future<
+        Output = Result<Vec<Result<CollectionRecord, Self::RecordsError>>, Self::RecordsError>,
+    > + Send;
+
+    /// Insert one immutable canonical record.
+    ///
+    /// Re-inserting the same intrinsic record is an idempotent success.
+    fn insert(
+        &mut self,
+        record: CollectionRecord,
+    ) -> impl Future<Output = Result<(), Self::InsertError>> + Send;
 }
 
 /// Async counterpart of [`PinStore`]: named,
@@ -294,6 +323,29 @@ where
 
     fn reader(&mut self) -> impl Future<Output = Result<Self::Reader, Self::ReaderError>> + Send {
         async move { self.0.reader().map(SyncAsAsync) }
+    }
+}
+
+impl<S> AsyncCollectionStore for SyncAsAsync<S>
+where
+    S: CollectionStore + Send,
+{
+    type RecordsError = S::RecordsError;
+    type InsertError = S::InsertError;
+
+    fn records(
+        &mut self,
+    ) -> impl Future<
+        Output = Result<Vec<Result<CollectionRecord, Self::RecordsError>>, Self::RecordsError>,
+    > + Send {
+        async move { self.0.records().map(Iterator::collect) }
+    }
+
+    fn insert(
+        &mut self,
+        record: CollectionRecord,
+    ) -> impl Future<Output = Result<(), Self::InsertError>> + Send {
+        async move { self.0.insert(record) }
     }
 }
 
@@ -509,6 +561,24 @@ impl<A: AsyncBlobStore> BlobStore for Blocking<A> {
 }
 
 #[cfg(feature = "object-store")]
+impl<A: AsyncCollectionStore> CollectionStore for Blocking<A> {
+    type RecordsError = A::RecordsError;
+    type InsertError = A::InsertError;
+    type RecordIter<'a>
+        = std::vec::IntoIter<Result<CollectionRecord, A::RecordsError>>
+    where
+        A: 'a;
+
+    fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+        self.rt.block_on(self.inner.records()).map(Vec::into_iter)
+    }
+
+    fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
+        self.rt.block_on(self.inner.insert(record))
+    }
+}
+
+#[cfg(feature = "object-store")]
 impl<A: AsyncPinStore> PinStore for Blocking<A> {
     type PinsError = A::PinsError;
     type HeadError = A::HeadError;
@@ -582,14 +652,29 @@ impl<A: StorageClose> StorageClose for Blocking<A> {
     }
 }
 
+// `ObjectStoreRemote` completes every write before its future resolves, and
+// the blocking adapter has no write buffer of its own. There is therefore no
+// pending state for the synchronous publication protocol to flush between its
+// dependency and record phases.
+#[cfg(feature = "object-store")]
+impl crate::repo::StorageFlush for Blocking<crate::repo::objectstore::ObjectStoreRemote> {
+    type Error = std::convert::Infallible;
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::blob::encodings::simplearchive::SimpleArchive;
     use crate::blob::Blob;
     use crate::blob::MemoryBlobStore;
+    use crate::collection::{CollectionDefinition, CollectionRecord, CollectionStore};
     use crate::id::{ExclusiveId, Id};
     use crate::macros::entity;
+    use crate::repo::memoryrepo::MemoryRepo;
     use crate::trible::TribleSet;
     use futures::executor::block_on;
 
@@ -601,6 +686,14 @@ mod tests {
         }
         .into();
         ts.to_blob()
+    }
+
+    fn collection_record(tag: u8) -> CollectionRecord {
+        CollectionRecord::Definition(CollectionDefinition::new(
+            Id::new([tag; 16]).unwrap(),
+            Id::new([tag.wrapping_add(1).max(1); 16]).unwrap(),
+            Id::new([tag.wrapping_add(2).max(1); 16]).unwrap(),
+        ))
     }
 
     #[test]
@@ -639,12 +732,45 @@ mod tests {
 
     #[test]
     fn async_pins_on_fresh_repo_are_empty() {
-        use crate::repo::memoryrepo::MemoryRepo;
         let mut repo = SyncAsAsync::new(MemoryRepo::default());
         let pins = block_on(repo.pins()).unwrap();
         assert!(pins.is_empty(), "fresh repo has no pins");
         let head = block_on(repo.head(Id::new([7u8; 16]).unwrap())).unwrap();
         assert!(head.is_none(), "unknown pin has no head");
+    }
+
+    #[test]
+    fn sync_collection_store_reads_and_writes_through_async_facade() {
+        let mut store = SyncAsAsync::new(MemoryRepo::default());
+        let first = collection_record(1);
+        let second = collection_record(7);
+
+        block_on(AsyncCollectionStore::insert(&mut store, second)).unwrap();
+        block_on(AsyncCollectionStore::insert(&mut store, first)).unwrap();
+        block_on(AsyncCollectionStore::insert(&mut store, second)).unwrap();
+
+        let actual = block_on(AsyncCollectionStore::records(&mut store))
+            .unwrap()
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut expected = vec![first, second];
+        expected.sort_unstable_by_key(CollectionRecord::id);
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(feature = "object-store")]
+    #[test]
+    fn blocking_lowers_async_collection_store_back_to_sync() {
+        let mut store = Blocking::new(SyncAsAsync::new(MemoryRepo::default())).unwrap();
+        let record = collection_record(13);
+
+        CollectionStore::insert(&mut store, record).unwrap();
+        let actual = CollectionStore::records(&mut store)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(actual, vec![record]);
     }
 
     // Blocking and SyncAsAsync are inverses: a sync store wrapped up

@@ -6,6 +6,8 @@
 //! test-only: it exercises algebraic laws rather than serving as another
 //! runtime implementation.
 
+/// Narrow write facade for a scoped fact collection.
+pub mod api;
 pub mod discovery;
 pub mod records;
 /// Stateless semantic admission, closure, provenance, and physical-cover view.
@@ -14,11 +16,15 @@ pub mod resolution;
 pub mod retention;
 /// Canonical `SimpleArchive` set-union collection kind.
 pub mod simplearchive_union;
+/// Native grow-only storage for collection-calculus records.
+pub mod store;
 
+pub use api::*;
 pub use discovery::*;
 pub use records::*;
 pub use resolution::*;
 pub use retention::*;
+pub use store::*;
 
 #[cfg(test)]
 mod oracle;

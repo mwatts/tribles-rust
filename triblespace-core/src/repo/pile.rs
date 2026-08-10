@@ -22,6 +22,7 @@ use anybytes::Bytes;
 use hex_literal::hex;
 use memmap2::MmapOptions;
 use memmap2::MmapRaw;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::error::Error;
@@ -45,8 +46,13 @@ use crate::blob::Blob;
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
+use crate::collection::{
+    CollectionCommit, CollectionDefinition, CollectionDerive, CollectionMerge, CollectionRecord,
+    CollectionStore,
+};
 use crate::id::Id;
 use crate::id::RawId;
+use crate::inline::encodings::ed25519::{ED25519PublicKey, ED25519RComponent, ED25519SComponent};
 use crate::inline::encodings::hash::Blake3;
 use crate::inline::encodings::hash::Hash;
 use crate::inline::Inline;
@@ -87,6 +93,14 @@ const MAGIC_MARKER_BRANCH_TOMBSTONE_V3: RawId = hex!("D0CBA0C8EAAB4C0C73121C3205
 /// records are durable pile records, reopening a pile reloads the weak set.
 const MAGIC_MARKER_WEAK_PIN_V3: RawId = hex!("8F3EEFEDECD491F63F6EAAA5FD6F3D5E");
 const MAGIC_MARKER_WEAK_UNPIN_V3: RawId = hex!("2D76662DFF0187EC36A8C90B12BB8B0D");
+/// Native collection-record markers, minted on 2026-08-10 with `trible genid`.
+/// Each record is a complete fixed-width V3 header with zeroed trailing bytes;
+/// unlike the legacy branch cell, these records are immutable, intrinsically
+/// identified, and compose by set union.
+const MAGIC_MARKER_COLLECTION_DEFINITION_V3: RawId = hex!("3BE108504E4F5242FB24AA72D6D94CE1");
+const MAGIC_MARKER_COLLECTION_COMMIT_V3: RawId = hex!("BB758AA6F79FBFC4D1958592A8956777");
+const MAGIC_MARKER_COLLECTION_MERGE_V3: RawId = hex!("CC0108AC1DF4F335AFA856A529C42BE9");
+const MAGIC_MARKER_COLLECTION_DERIVE_V3: RawId = hex!("07ECF056F6F015D94389FFF21F851480");
 
 const BLOB_HEADER_LEN: usize = std::mem::size_of::<BlobHeader>();
 const BLOB_ALIGNMENT: usize = BLOB_HEADER_LEN;
@@ -380,6 +394,131 @@ impl WeakUnpinHeaderV3 {
     }
 }
 
+/// Native V3 collection definition: `(scope, representation, recipe)`.
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct CollectionDefinitionHeaderV3 {
+    magic_marker: RawId,
+    scope: RawId,
+    representation: RawId,
+    recipe: RawId,
+    reserved: [u8; 192],
+}
+
+impl CollectionDefinitionHeaderV3 {
+    fn new(record: &CollectionDefinition) -> Self {
+        Self {
+            magic_marker: MAGIC_MARKER_COLLECTION_DEFINITION_V3,
+            scope: record.scope().into(),
+            representation: record.representation().into(),
+            recipe: record.recipe().into(),
+            reserved: [0u8; 192],
+        }
+    }
+}
+
+/// Native V3 signed collection commit. All signed transcript fields are
+/// present directly in the header; the intrinsic record id is reconstructed.
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct CollectionCommitHeaderV3 {
+    magic_marker: RawId,
+    collection: RawId,
+    data: RawInline,
+    metadata: RawInline,
+    public_key: RawInline,
+    signature_r: RawInline,
+    signature_s: RawInline,
+    reserved: [u8; 64],
+}
+
+impl CollectionCommitHeaderV3 {
+    fn new(record: &CollectionCommit) -> Self {
+        let (signature_r, signature_s) = record.signature();
+        Self {
+            magic_marker: MAGIC_MARKER_COLLECTION_COMMIT_V3,
+            collection: record.collection().into(),
+            data: record.data().raw,
+            metadata: record.metadata().raw,
+            public_key: record.public_key().raw,
+            signature_r: signature_r.raw,
+            signature_s: signature_s.raw,
+            reserved: [0u8; 64],
+        }
+    }
+}
+
+/// Native V3 exact join equation. Inputs are stored in canonical digest order.
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct CollectionMergeHeaderV3 {
+    magic_marker: RawId,
+    collection: RawId,
+    low: RawInline,
+    high: RawInline,
+    result: RawInline,
+    reserved: [u8; 128],
+}
+
+impl CollectionMergeHeaderV3 {
+    fn new(record: &CollectionMerge) -> Self {
+        let (low, high) = record.inputs();
+        Self {
+            magic_marker: MAGIC_MARKER_COLLECTION_MERGE_V3,
+            collection: record.collection().into(),
+            low: low.raw,
+            high: high.raw,
+            result: record.result().raw,
+            reserved: [0u8; 128],
+        }
+    }
+}
+
+/// Native V3 exact mapping equation between two typed collections.
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct CollectionDeriveHeaderV3 {
+    magic_marker: RawId,
+    source: RawId,
+    target: RawId,
+    input: RawInline,
+    output: RawInline,
+    reserved: [u8; 144],
+}
+
+impl CollectionDeriveHeaderV3 {
+    fn new(record: &CollectionDerive) -> Self {
+        let (input, output) = record.mapping();
+        Self {
+            magic_marker: MAGIC_MARKER_COLLECTION_DERIVE_V3,
+            source: record.source().into(),
+            target: record.target().into(),
+            input: input.raw,
+            output: output.raw,
+            reserved: [0u8; 144],
+        }
+    }
+}
+
+fn collection_record_header(record: &CollectionRecord) -> [u8; V3_HEADER_LEN] {
+    let mut bytes = [0u8; V3_HEADER_LEN];
+    match record {
+        CollectionRecord::Definition(record) => {
+            bytes.copy_from_slice(CollectionDefinitionHeaderV3::new(record).as_bytes())
+        }
+        CollectionRecord::Commit(record) => {
+            bytes.copy_from_slice(CollectionCommitHeaderV3::new(record).as_bytes())
+        }
+        CollectionRecord::Merge(record) => {
+            bytes.copy_from_slice(CollectionMergeHeaderV3::new(record).as_bytes())
+        }
+        CollectionRecord::Derive(record) => {
+            bytes.copy_from_slice(CollectionDeriveHeaderV3::new(record).as_bytes())
+        }
+    }
+    bytes
+}
+
 // Compile-time guarantee that every V3 header is exactly 256 bytes.
 const _: () = {
     assert!(std::mem::size_of::<BlobHeaderV3>() == V3_HEADER_LEN);
@@ -387,6 +526,10 @@ const _: () = {
     assert!(std::mem::size_of::<BranchTombstoneHeaderV3>() == V3_HEADER_LEN);
     assert!(std::mem::size_of::<WeakPinHeaderV3>() == V3_HEADER_LEN);
     assert!(std::mem::size_of::<WeakUnpinHeaderV3>() == V3_HEADER_LEN);
+    assert!(std::mem::size_of::<CollectionDefinitionHeaderV3>() == V3_HEADER_LEN);
+    assert!(std::mem::size_of::<CollectionCommitHeaderV3>() == V3_HEADER_LEN);
+    assert!(std::mem::size_of::<CollectionMergeHeaderV3>() == V3_HEADER_LEN);
+    assert!(std::mem::size_of::<CollectionDeriveHeaderV3>() == V3_HEADER_LEN);
 };
 
 /// A single record decoded from a pile file.
@@ -445,6 +588,12 @@ pub enum PileRecordContent {
     WeakUnpin {
         /// The unpinned blob handle.
         handle: Inline<Handle<UnknownBlob>>,
+    },
+    /// One immutable native collection-algebra record. Four distinct V3 magic
+    /// markers share this typed raw-inspection surface.
+    Collection {
+        /// Canonically reconstructed semantic record.
+        record: CollectionRecord,
     },
 }
 
@@ -573,6 +722,90 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
                 len: V3_HEADER_LEN,
                 content: PileRecordContent::WeakUnpin {
                     handle: Inline::new(header.handle),
+                },
+            })
+        }
+        MAGIC_MARKER_COLLECTION_DEFINITION_V3 => {
+            let (header, _) =
+                CollectionDefinitionHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            if header.reserved.iter().any(|byte| *byte != 0) {
+                return Err(corrupt());
+            }
+            let scope = Id::new(header.scope).ok_or_else(corrupt)?;
+            let representation = Id::new(header.representation).ok_or_else(corrupt)?;
+            let recipe = Id::new(header.recipe).ok_or_else(corrupt)?;
+            Ok(PileRecord {
+                offset,
+                len: V3_HEADER_LEN,
+                content: PileRecordContent::Collection {
+                    record: CollectionRecord::Definition(CollectionDefinition::new(
+                        scope,
+                        representation,
+                        recipe,
+                    )),
+                },
+            })
+        }
+        MAGIC_MARKER_COLLECTION_COMMIT_V3 => {
+            let (header, _) =
+                CollectionCommitHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            if header.reserved.iter().any(|byte| *byte != 0) {
+                return Err(corrupt());
+            }
+            let collection = Id::new(header.collection).ok_or_else(corrupt)?;
+            Ok(PileRecord {
+                offset,
+                len: V3_HEADER_LEN,
+                content: PileRecordContent::Collection {
+                    record: CollectionRecord::Commit(CollectionCommit::from_parts(
+                        collection,
+                        Inline::new(header.data),
+                        Inline::new(header.metadata),
+                        Inline::<ED25519PublicKey>::new(header.public_key),
+                        Inline::<ED25519RComponent>::new(header.signature_r),
+                        Inline::<ED25519SComponent>::new(header.signature_s),
+                    )),
+                },
+            })
+        }
+        MAGIC_MARKER_COLLECTION_MERGE_V3 => {
+            let (header, _) =
+                CollectionMergeHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            if header.reserved.iter().any(|byte| *byte != 0) || header.high < header.low {
+                return Err(corrupt());
+            }
+            let collection = Id::new(header.collection).ok_or_else(corrupt)?;
+            Ok(PileRecord {
+                offset,
+                len: V3_HEADER_LEN,
+                content: PileRecordContent::Collection {
+                    record: CollectionRecord::Merge(CollectionMerge::new(
+                        collection,
+                        Inline::new(header.low),
+                        Inline::new(header.high),
+                        Inline::new(header.result),
+                    )),
+                },
+            })
+        }
+        MAGIC_MARKER_COLLECTION_DERIVE_V3 => {
+            let (header, _) =
+                CollectionDeriveHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            if header.reserved.iter().any(|byte| *byte != 0) {
+                return Err(corrupt());
+            }
+            let source = Id::new(header.source).ok_or_else(corrupt)?;
+            let target = Id::new(header.target).ok_or_else(corrupt)?;
+            Ok(PileRecord {
+                offset,
+                len: V3_HEADER_LEN,
+                content: PileRecordContent::Collection {
+                    record: CollectionRecord::Derive(CollectionDerive::new(
+                        source,
+                        target,
+                        Inline::new(header.input),
+                        Inline::new(header.output),
+                    )),
                 },
             })
         }
@@ -748,6 +981,7 @@ enum Applied {
     BranchTombstone { id: Id },
     WeakPin { handle: Inline<Handle<UnknownBlob>> },
     WeakUnpin { handle: Inline<Handle<UnknownBlob>> },
+    Collection { id: Id },
 }
 
 #[derive(Debug)]
@@ -769,6 +1003,9 @@ pub struct Pile {
     blobs: PATCH<32, IdentitySchema, IndexEntry>,
     validations: ValidationCache,
     branches: PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>,
+    /// Immutable collection records keyed by their intrinsic entity id.
+    /// `BTreeMap` makes enumeration independent of append/cat order.
+    collection_records: BTreeMap<Id, CollectionRecord>,
     /// LWW-resolved weak-pin set: weak-pin records insert the handle,
     /// weak-unpin records remove it; log-order application makes the last
     /// record for a handle win by construction.
@@ -1057,6 +1294,56 @@ impl From<ReadError> for PileWriteError {
     }
 }
 
+/// Failure while appending an immutable native collection record.
+#[derive(Debug)]
+pub enum CollectionInsertError {
+    /// Existing pile state could not be refreshed or decoded.
+    Read(ReadError),
+    /// The fixed record could not be appended or the file lock released.
+    Io(std::io::Error),
+    /// The intrinsic id already names different canonical fields.
+    IdCollision { id: Id },
+    /// Readback observed a record other than the exclusively appended one.
+    UnexpectedReadback,
+}
+
+impl std::fmt::Display for CollectionInsertError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read(error) => write!(f, "failed to refresh collection records: {error}"),
+            Self::Io(error) => write!(f, "failed to append collection record: {error}"),
+            Self::IdCollision { id } => {
+                write!(f, "collection record id {id:X} names different fields")
+            }
+            Self::UnexpectedReadback => {
+                f.write_str("collection append read back an unexpected pile record")
+            }
+        }
+    }
+}
+
+impl Error for CollectionInsertError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Read(error) => Some(error),
+            Self::Io(error) => Some(error),
+            Self::IdCollision { .. } | Self::UnexpectedReadback => None,
+        }
+    }
+}
+
+impl From<ReadError> for CollectionInsertError {
+    fn from(error: ReadError) -> Self {
+        Self::Read(error)
+    }
+}
+
+impl From<std::io::Error> for CollectionInsertError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
 /// Error returned when retrieving a blob from a [`Pile`].
 #[derive(Debug)]
 pub enum GetBlobError<E: Error> {
@@ -1137,6 +1424,7 @@ impl Pile {
             blobs: PATCH::<32, IdentitySchema, IndexEntry>::new(),
             validations: ValidationCache::default(),
             branches: PATCH::<16, IdentitySchema, Inline<Handle<SimpleArchive>>>::new(),
+            collection_records: BTreeMap::new(),
             weak_pins: PATCH::<32, IdentitySchema>::new(),
             applied_length: 0,
         })
@@ -1266,6 +1554,19 @@ impl Pile {
                 self.weak_pins.remove(&handle.raw);
                 Applied::WeakUnpin { handle }
             }
+            PileRecordContent::Collection { record } => {
+                let id = record.id();
+                if let Some(existing) = self.collection_records.get(&id) {
+                    if existing != &record {
+                        return Err(ReadError::CorruptPile {
+                            valid_length: start_offset,
+                        });
+                    }
+                } else {
+                    self.collection_records.insert(id, record);
+                }
+                Applied::Collection { id }
+            }
         };
         self.applied_length = next_applied_length;
         Ok(Some(applied))
@@ -1353,6 +1654,7 @@ impl Pile {
             std::ptr::drop_in_place(&mut this.blobs);
             std::ptr::drop_in_place(&mut this.validations);
             std::ptr::drop_in_place(&mut this.branches);
+            std::ptr::drop_in_place(&mut this.collection_records);
             std::ptr::drop_in_place(&mut this.weak_pins);
         }
 
@@ -1497,6 +1799,68 @@ impl Iterator for PileBranchStoreIter {
     }
 }
 
+/// Deterministic owned snapshot of the pile's native collection records.
+pub struct PileCollectionRecordIter {
+    inner: std::collections::btree_map::IntoValues<Id, CollectionRecord>,
+}
+
+impl Iterator for PileCollectionRecordIter {
+    type Item = Result<CollectionRecord, ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(Ok)
+    }
+}
+
+impl CollectionStore for Pile {
+    type RecordsError = ReadError;
+    type InsertError = CollectionInsertError;
+    type RecordIter<'a> = PileCollectionRecordIter;
+
+    fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+        self.refresh()?;
+        Ok(PileCollectionRecordIter {
+            inner: self.collection_records.clone().into_values(),
+        })
+    }
+
+    fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
+        let id = record.id();
+        let header = collection_record_header(&record);
+
+        self.file.lock()?;
+        let result = (|| {
+            self.refresh_locked()?;
+
+            if let Some(existing) = self.collection_records.get(&id) {
+                return if existing == &record {
+                    Ok(())
+                } else {
+                    Err(CollectionInsertError::IdCollision { id })
+                };
+            }
+
+            self.dirty = true;
+            let written = self.file.write(&header)?;
+            if written != V3_HEADER_LEN {
+                return Err(CollectionInsertError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write complete collection record",
+                )));
+            }
+
+            match self.apply_next()? {
+                Some(Applied::Collection { id: applied }) if applied == id => Ok(()),
+                Some(_) | None => Err(CollectionInsertError::UnexpectedReadback),
+            }
+        })();
+        let unlock = self.file.unlock();
+        result?;
+        unlock?;
+        Ok(())
+    }
+}
+
 impl BlobStorePut for Pile {
     type PutError = InsertError;
 
@@ -1611,6 +1975,7 @@ impl Pile {
                     Some(Applied::BranchTombstone { .. }) => {}
                     Some(Applied::WeakPin { .. }) => {}
                     Some(Applied::WeakUnpin { .. }) => {}
+                    Some(Applied::Collection { .. }) => {}
                     None => {
                         return Err(InsertError::IoError(std::io::Error::other(
                             "blob missing after write",
@@ -1929,6 +2294,8 @@ pub enum PileRewriteError {
     },
     /// A preserved weak-want marker could not be appended.
     WeakWant(PileWriteError),
+    /// An immutable collection-algebra record could not be appended.
+    Collection(CollectionInsertError),
     /// The completed destination state could not be made durable.
     Flush(FlushError),
 }
@@ -1944,6 +2311,9 @@ impl std::fmt::Display for PileRewriteError {
                 "destination has conflicting strong pin {id:X} at {current:?}"
             ),
             Self::WeakWant(error) => write!(f, "failed to recreate a weak want: {error}"),
+            Self::Collection(error) => {
+                write!(f, "failed to preserve a collection record: {error}")
+            }
             Self::Flush(error) => write!(f, "failed to flush rewritten pile: {error}"),
         }
     }
@@ -1955,6 +2325,7 @@ impl Error for PileRewriteError {
             Self::Source(error) => Some(error),
             Self::Transfer(error) => Some(error),
             Self::StrongPin(error) | Self::WeakWant(error) => Some(error),
+            Self::Collection(error) => Some(error),
             Self::Flush(error) => Some(error),
             Self::StrongPinConflict { .. } => None,
         }
@@ -1972,13 +2343,16 @@ impl Pile {
     /// ownership root and recreates the exact pin mapping, allowing collection
     /// and branch models to coexist during migration.
     ///
-    /// The source is refreshed once; blobs, strong pins, and weak wants are
-    /// then taken from that coherent applied-prefix snapshot. The destination
-    /// may already contain identical blobs and identical strong-pin mappings,
-    /// making retries idempotent, but a differently mapped pin is an error.
-    /// Missing or invalid selected blobs fail the rewrite rather than silently
-    /// producing a partial destination. One final flush makes blobs and marker
-    /// records durable in append order.
+    /// The source is refreshed once; blobs, strong pins, collection records,
+    /// and weak wants are then taken from that coherent applied-prefix
+    /// snapshot. Native commits retain their data and metadata recursively;
+    /// merge and derive records are algebraic evidence rather than ownership
+    /// edges. The destination may already contain identical blobs, records,
+    /// and strong-pin mappings, making retries idempotent, but a differently
+    /// mapped pin or intrinsic-record collision is an error. Missing or invalid
+    /// selected blobs fail the rewrite rather than silently producing a partial
+    /// destination. One final flush makes blobs and records durable in append
+    /// order.
     pub fn rewrite_retained_into(
         &mut self,
         destination: &mut Pile,
@@ -1987,6 +2361,7 @@ impl Pile {
     ) -> Result<PileRewriteStats, PileRewriteError> {
         let reader = self.reader().map_err(PileRewriteError::Source)?;
         let strong_pins = self.branches.clone();
+        let collection_records = self.collection_records.clone();
         let source_weak_wants = self.weak_pins.clone();
 
         let mut roots = explicit.clone();
@@ -1995,6 +2370,12 @@ impl Pile {
                 .get(raw)
                 .expect("pin key from snapshot must retain its value");
             roots.retain_recursive(head);
+        }
+        for record in collection_records.values() {
+            if let CollectionRecord::Commit(commit) = record {
+                roots.retain_recursive(Inline::<Handle<UnknownBlob>>::new(commit.data().raw));
+                roots.retain_recursive(commit.metadata());
+            }
         }
         let keep = roots.expanded(&reader);
         let retained_blobs = keep.len();
@@ -2020,6 +2401,12 @@ impl Pile {
             }
         }
 
+        for record in collection_records.into_values() {
+            destination
+                .insert(record)
+                .map_err(PileRewriteError::Collection)?;
+        }
+
         let mut preserved_weak_wants = 0usize;
         if weak_wants == WeakWantRewritePolicy::Preserve {
             for raw in source_weak_wants.into_iter_ordered() {
@@ -2043,6 +2430,7 @@ impl Pile {
 mod tests {
     use super::*;
 
+    use ed25519_dalek::SigningKey;
     use rand::RngCore;
     use std::collections::{HashMap, HashSet};
     use std::io::Write;
@@ -2051,12 +2439,200 @@ mod tests {
     use std::time::UNIX_EPOCH;
     use tempfile;
 
+    use crate::collection::empty_metadata_handle;
     use crate::repo::{BlobStoreMeta, PushResult, RetentionRoots};
+    use crate::trible::TribleSet;
 
     fn fresh_empty_pile_path(dir: &tempfile::TempDir, name: &str) -> PathBuf {
         let path = dir.path().join(name);
         std::fs::File::create(&path).unwrap();
         path
+    }
+
+    fn collection_test_id(byte: u8) -> Id {
+        Id::new([byte; 16]).unwrap()
+    }
+
+    fn collection_test_hash(byte: u8) -> Inline<Hash<Blake3>> {
+        Inline::new([byte; 32])
+    }
+
+    fn collection_test_records() -> Vec<CollectionRecord> {
+        let source = CollectionDefinition::new(
+            collection_test_id(1),
+            collection_test_id(2),
+            collection_test_id(3),
+        );
+        let target = CollectionDefinition::new(
+            collection_test_id(1),
+            collection_test_id(4),
+            collection_test_id(5),
+        );
+        let key = SigningKey::from_bytes(&[7; 32]);
+        vec![
+            CollectionRecord::Definition(source),
+            CollectionRecord::Commit(CollectionCommit::sign(
+                &key,
+                source.id(),
+                collection_test_hash(6),
+                empty_metadata_handle(),
+            )),
+            CollectionRecord::Merge(CollectionMerge::new(
+                source.id(),
+                collection_test_hash(6),
+                collection_test_hash(7),
+                collection_test_hash(8),
+            )),
+            CollectionRecord::Derive(CollectionDerive::new(
+                source.id(),
+                target.id(),
+                collection_test_hash(8),
+                collection_test_hash(9),
+            )),
+        ]
+    }
+
+    fn sorted_collection_records(mut records: Vec<CollectionRecord>) -> Vec<CollectionRecord> {
+        records.sort_by_key(CollectionRecord::id);
+        records
+    }
+
+    #[test]
+    fn native_collection_record_headers_are_fixed_zero_padded_and_roundtrip() {
+        let records = collection_test_records();
+        let expected = [
+            (MAGIC_MARKER_COLLECTION_DEFINITION_V3, 64usize),
+            (MAGIC_MARKER_COLLECTION_COMMIT_V3, 192usize),
+            (MAGIC_MARKER_COLLECTION_MERGE_V3, 128usize),
+            (MAGIC_MARKER_COLLECTION_DERIVE_V3, 112usize),
+        ];
+
+        for (record, (magic, reserved_start)) in records.into_iter().zip(expected) {
+            let header = collection_record_header(&record);
+            assert_eq!(header.len(), V3_HEADER_LEN);
+            assert_eq!(&header[..16], magic.as_slice());
+            assert!(header[reserved_start..].iter().all(|byte| *byte == 0));
+
+            let decoded = decode_record(&header, 0).unwrap();
+            assert_eq!(decoded.len, V3_HEADER_LEN);
+            assert!(matches!(
+                decoded.content,
+                PileRecordContent::Collection { record: decoded } if decoded == record
+            ));
+
+            let mut nonzero_padding = header;
+            nonzero_padding[reserved_start] = 1;
+            assert!(matches!(
+                decode_record(&nonzero_padding, 0),
+                Err(ReadError::CorruptPile { valid_length: 0 })
+            ));
+        }
+    }
+
+    #[test]
+    fn native_collection_records_replay_in_intrinsic_id_order_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "collections.pile");
+        let records = collection_test_records();
+        let expected = sorted_collection_records(records.clone());
+
+        let mut pile = Pile::open(&path).unwrap();
+        for record in records {
+            pile.insert(record).unwrap();
+        }
+        pile.close().unwrap();
+
+        let mut reopened = Pile::open(&path).unwrap();
+        let actual = reopened
+            .records()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(actual, expected);
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn native_collection_record_insert_is_physically_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "idempotent.pile");
+        let record = collection_test_records()[0];
+        let mut pile = Pile::open(&path).unwrap();
+
+        pile.insert(record).unwrap();
+        let once = std::fs::metadata(&path).unwrap().len();
+        pile.insert(record).unwrap();
+        let twice = std::fs::metadata(&path).unwrap().len();
+
+        assert_eq!(once, V3_HEADER_LEN as u64);
+        assert_eq!(twice, once);
+        assert_eq!(pile.records().unwrap().count(), 1);
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn native_collection_records_cat_as_an_order_independent_set_union() {
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = fresh_empty_pile_path(&dir, "a.pile");
+        let path_b = fresh_empty_pile_path(&dir, "b.pile");
+        let path_ab = dir.path().join("ab.pile");
+        let path_ba = dir.path().join("ba.pile");
+        let records = collection_test_records();
+
+        let mut a = Pile::open(&path_a).unwrap();
+        a.insert(records[0]).unwrap();
+        a.insert(records[1]).unwrap();
+        a.close().unwrap();
+        let mut b = Pile::open(&path_b).unwrap();
+        b.insert(records[0]).unwrap();
+        b.insert(records[2]).unwrap();
+        b.insert(records[3]).unwrap();
+        b.close().unwrap();
+
+        let bytes_a = std::fs::read(&path_a).unwrap();
+        let bytes_b = std::fs::read(&path_b).unwrap();
+        let mut ab = bytes_a.clone();
+        ab.extend_from_slice(&bytes_b);
+        std::fs::write(&path_ab, ab).unwrap();
+        let mut ba = bytes_b;
+        ba.extend_from_slice(&bytes_a);
+        std::fs::write(&path_ba, ba).unwrap();
+
+        let expected = sorted_collection_records(records);
+        for path in [&path_ab, &path_ba] {
+            let mut pile = Pile::open(path).unwrap();
+            let actual = pile
+                .records()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(actual, expected);
+            pile.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn native_collection_record_torn_tail_is_detected_and_amputated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "torn.pile");
+        let mut pile = Pile::open(&path).unwrap();
+        pile.insert(collection_test_records()[0]).unwrap();
+        pile.close().unwrap();
+
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len((V3_HEADER_LEN - 1) as u64)
+            .unwrap();
+        let mut reopened = Pile::open(&path).unwrap();
+        assert!(matches!(
+            reopened.refresh(),
+            Err(ReadError::CorruptPile { valid_length: 0 })
+        ));
+        reopened.amputate().unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        reopened.close().unwrap();
     }
 
     #[test]
@@ -2143,6 +2719,86 @@ mod tests {
                 .unwrap(),
             vec![weak_target]
         );
+
+        drop(reader);
+        destination.close().unwrap();
+        source.close().unwrap();
+    }
+
+    #[test]
+    fn retained_rewrite_preserves_native_records_and_commit_owned_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "collection-source.pile");
+        let destination_path = fresh_empty_pile_path(&dir, "collection-destination.pile");
+        let mut source = Pile::open(&source_path).unwrap();
+        let mut destination = Pile::open(&destination_path).unwrap();
+
+        let attachment = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"owned attachment".to_vec()))
+            .unwrap();
+        let data = source
+            .put::<UnknownBlob, _>(Bytes::from_source(attachment.raw.to_vec()))
+            .unwrap();
+        let metadata = source
+            .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+            .unwrap();
+        assert_eq!(metadata, empty_metadata_handle());
+        let orphan = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"unowned".to_vec()))
+            .unwrap();
+
+        let definition = CollectionDefinition::new(
+            collection_test_id(10),
+            collection_test_id(11),
+            collection_test_id(12),
+        );
+        let key = SigningKey::from_bytes(&[13; 32]);
+        let records = vec![
+            CollectionRecord::Definition(definition),
+            CollectionRecord::Commit(CollectionCommit::sign(
+                &key,
+                definition.id(),
+                Inline::<Hash<Blake3>>::new(data.raw),
+                metadata,
+            )),
+            CollectionRecord::Merge(CollectionMerge::new(
+                definition.id(),
+                collection_test_hash(14),
+                collection_test_hash(15),
+                collection_test_hash(16),
+            )),
+            CollectionRecord::Derive(CollectionDerive::new(
+                definition.id(),
+                collection_test_id(17),
+                collection_test_hash(16),
+                collection_test_hash(18),
+            )),
+        ];
+        for record in records.iter().copied() {
+            source.insert(record).unwrap();
+        }
+        source.flush().unwrap();
+
+        let stats = source
+            .rewrite_retained_into(
+                &mut destination,
+                &RetentionRoots::new(),
+                WeakWantRewritePolicy::Drop,
+            )
+            .unwrap();
+        assert_eq!(stats.retained_blobs, 3);
+
+        let actual_records = destination
+            .records()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(actual_records, sorted_collection_records(records));
+        let reader = destination.reader().unwrap();
+        for retained in [attachment, data, metadata.transmute()] {
+            assert!(reader.get::<Blob<UnknownBlob>, _>(retained).is_ok());
+        }
+        assert!(reader.get::<Blob<UnknownBlob>, _>(orphan).is_err());
 
         drop(reader);
         destination.close().unwrap();

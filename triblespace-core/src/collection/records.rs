@@ -225,7 +225,7 @@ impl Error for CommitVerificationError {}
 /// representations. The collection root itself is intrinsic and is returned as
 /// a plain [`Id`]; constructing this descriptor never manufactures an
 /// [`crate::id::ExclusiveId`] for either identity.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CollectionDefinition {
     root: Id,
     scope: Id,
@@ -299,7 +299,7 @@ impl CollectionDefinition {
 }
 
 /// Signed exogenous membership assertion.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CollectionCommit {
     root: Id,
     collection: Id,
@@ -331,7 +331,7 @@ impl CollectionCommit {
         )
     }
 
-    fn from_parts(
+    pub(crate) fn from_parts(
         collection_id: Id,
         data_hash: CollectionData,
         metadata: Inline<Handle<SimpleArchive>>,
@@ -456,7 +456,7 @@ impl CollectionCommit {
 }
 
 /// Unsigned exact join equation inside one collection lattice.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CollectionMerge {
     root: Id,
     collection: Id,
@@ -547,7 +547,7 @@ impl CollectionMerge {
 
 /// One unsigned exact observation of the canonical join homomorphism between
 /// two collection lattices.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CollectionDerive {
     root: Id,
     source: Id,
@@ -621,7 +621,7 @@ impl CollectionDerive {
 
 /// A structurally canonical collection record classified by its
 /// [`metadata::tag`].
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CollectionRecord {
     /// Intrinsic definition of a typed collection.
     Definition(CollectionDefinition),
@@ -671,6 +671,16 @@ impl CollectionRecord {
             Self::Commit(record) => record.id(),
             Self::Merge(record) => record.id(),
             Self::Derive(record) => record.id(),
+        }
+    }
+
+    /// Encode this record as its canonical one-entity `SimpleArchive`.
+    pub fn to_blob(&self) -> Blob<SimpleArchive> {
+        match self {
+            Self::Definition(record) => record.to_blob(),
+            Self::Commit(record) => record.to_blob(),
+            Self::Merge(record) => record.to_blob(),
+            Self::Derive(record) => record.to_blob(),
         }
     }
 }
@@ -1119,6 +1129,17 @@ mod tests {
             derive.to_blob().bytes.len() as u64,
             COLLECTION_DERIVE_ARCHIVE_LEN
         );
+        for (record, expected) in [
+            (
+                CollectionRecord::Definition(definition),
+                definition.to_blob(),
+            ),
+            (CollectionRecord::Commit(commit), commit.to_blob()),
+            (CollectionRecord::Merge(merge), merge.to_blob()),
+            (CollectionRecord::Derive(derive), derive.to_blob()),
+        ] {
+            assert_eq!(record.to_blob(), expected);
+        }
 
         assert_eq!(commit.signing_transcript().len(), COMMIT_TRANSCRIPT_LEN);
         assert_eq!(commit.id(), id_hex!("1617B0DBF0B10E15C061790CC8DF0AB5"));

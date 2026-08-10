@@ -1049,11 +1049,12 @@ mod tests {
     use ed25519_dalek::SigningKey;
 
     use crate::blob::encodings::simplearchive::SimpleArchive;
-    use crate::blob::{Blob, IntoBlob, MemoryBlobStore};
+    use crate::blob::{Blob, IntoBlob};
     use crate::collection::simplearchive_union::{self, SimpleArchiveUnionValidationError};
+    use crate::collection::{CollectionRecord, CollectionStore};
     use crate::inline::encodings::hash::{Blake3, Handle, Hash};
     use crate::inline::Inline;
-    use crate::repo::{BlobStore, BlobStoreGet};
+    use crate::repo::{memoryrepo::MemoryRepo, BlobStore, BlobStoreGet};
     use crate::trible::{Trible, TribleSet, TRIBLE_LEN};
 
     fn id(byte: u8) -> Id {
@@ -1084,22 +1085,22 @@ mod tests {
         derives: &[CollectionDerive],
         reverse: bool,
     ) -> DiscoveredCollectionRecords {
-        let mut blobs: Vec<Blob<SimpleArchive>> = definitions
+        let mut records: Vec<CollectionRecord> = definitions
             .iter()
-            .map(CollectionDefinition::to_blob)
-            .chain(commits.iter().map(CollectionCommit::to_blob))
-            .chain(merges.iter().map(CollectionMerge::to_blob))
-            .chain(derives.iter().map(CollectionDerive::to_blob))
+            .copied()
+            .map(CollectionRecord::Definition)
+            .chain(commits.iter().copied().map(CollectionRecord::Commit))
+            .chain(merges.iter().copied().map(CollectionRecord::Merge))
+            .chain(derives.iter().copied().map(CollectionRecord::Derive))
             .collect();
         if reverse {
-            blobs.reverse();
+            records.reverse();
         }
-        let mut store = MemoryBlobStore::new();
-        for blob in blobs {
-            store.insert(blob);
+        let mut store = MemoryRepo::default();
+        for record in records {
+            CollectionStore::insert(&mut store, record).unwrap();
         }
-        let reader = store.reader().unwrap();
-        super::super::discover_collection_records(&reader).unwrap()
+        super::super::discover_collection_records(&mut store).unwrap()
     }
 
     fn accepted(
@@ -1900,20 +1901,20 @@ mod tests {
         );
         let authorized = BTreeSet::from([first.id(), second.id()]);
 
-        let mut store = MemoryBlobStore::new();
+        let mut store = MemoryRepo::default();
         for record in [
-            CollectionDefinition::to_blob(&definition),
-            CollectionCommit::to_blob(&first),
-            CollectionCommit::to_blob(&second),
-            CollectionMerge::to_blob(&merge),
+            CollectionRecord::Definition(definition),
+            CollectionRecord::Commit(first),
+            CollectionRecord::Commit(second),
+            CollectionRecord::Merge(merge),
         ] {
-            store.insert(record);
+            CollectionStore::insert(&mut store, record).unwrap();
         }
-        store.insert(left);
-        store.insert(right);
+        store.blobs.insert(left);
+        store.blobs.insert(right);
 
+        let records = super::super::discover_collection_records(&mut store).unwrap();
         let reader = store.reader().unwrap();
-        let records = super::super::discover_collection_records(&reader).unwrap();
         let pending = resolve_collection_semantics(&records, &authorized, |request| {
             validate_union(&reader, request)
         })
@@ -1923,9 +1924,9 @@ mod tests {
             .semantics()
             .contains(definition.id(), merge.result()));
 
-        store.insert(result);
+        store.blobs.insert(result);
+        let records = super::super::discover_collection_records(&mut store).unwrap();
         let reader = store.reader().unwrap();
-        let records = super::super::discover_collection_records(&reader).unwrap();
         let resolved = resolve_collection_semantics(&records, &authorized, |request| {
             validate_union(&reader, request)
         })

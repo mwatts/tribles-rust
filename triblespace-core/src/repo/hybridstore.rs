@@ -1,5 +1,6 @@
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
+use crate::collection::{CollectionRecord, CollectionStore};
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
@@ -18,7 +19,10 @@ use crate::repo::PushResult;
 pub struct HybridStore<B, R> {
     /// Storage for commit, content and metadata blobs.
     pub blobs: B,
-    /// Storage for branch heads.
+    /// Storage for branch heads and native collection records.
+    ///
+    /// The field retains its historical name while both record families
+    /// coexist; changing the public layout is a separate migration.
     pub branches: R,
 }
 
@@ -86,5 +90,64 @@ where
         new: Option<Inline<Handle<SimpleArchive>>>,
     ) -> Result<PushResult, Self::UpdateError> {
         self.branches.update(id, old, new)
+    }
+}
+
+impl<B, R> CollectionStore for HybridStore<B, R>
+where
+    R: CollectionStore,
+{
+    type RecordsError = R::RecordsError;
+    type InsertError = R::InsertError;
+
+    type RecordIter<'a>
+        = R::RecordIter<'a>
+    where
+        B: 'a,
+        R: 'a;
+
+    fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+        self.branches.records()
+    }
+
+    fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
+        self.branches.insert(record)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::collection::CollectionDefinition;
+    use crate::repo::memoryrepo::MemoryRepo;
+
+    fn id(byte: u8) -> Id {
+        Id::new([byte; 16]).unwrap()
+    }
+
+    #[test]
+    fn collection_records_delegate_only_to_the_record_side() {
+        let record = CollectionRecord::Definition(CollectionDefinition::new(id(1), id(2), id(3)));
+        let mut hybrid = HybridStore::new(MemoryRepo::default(), MemoryRepo::default());
+
+        CollectionStore::insert(&mut hybrid, record).unwrap();
+        assert_eq!(
+            CollectionStore::records(&mut hybrid)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![record]
+        );
+        assert_eq!(
+            CollectionStore::records(&mut hybrid.branches)
+                .unwrap()
+                .count(),
+            1
+        );
+        assert_eq!(
+            CollectionStore::records(&mut hybrid.blobs).unwrap().count(),
+            0
+        );
     }
 }

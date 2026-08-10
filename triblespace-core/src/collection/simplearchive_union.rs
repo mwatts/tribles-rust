@@ -34,7 +34,10 @@ use crate::metadata::MetaDescribe;
 use crate::repo::{BlobStore, BlobStorePut, StorageFlush};
 use crate::trible::{Fragment, Trible, TRIBLE_LEN};
 
-use super::{CollectionCommit, CollectionData, CollectionDefinition, CollectionMerge};
+use super::{
+    CollectionCommit, CollectionData, CollectionDefinition, CollectionMerge, CollectionRecord,
+    CollectionStore,
+};
 
 mod materialize;
 pub use materialize::*;
@@ -141,17 +144,19 @@ impl Error for SimpleArchiveUnionValidationError {
 /// Failure to publish a crash-ordered collection record.
 ///
 /// Dependency writes and their durability barrier are distinguished from the
-/// record write and its barrier so callers can report which publication phase
-/// failed. The ordering guarantee applies at successful operation boundaries:
-/// a record write is not attempted until the dependency flush succeeds, and a
-/// record is not returned until its own flush succeeds.
+/// native record insertions and final barrier so callers can report which
+/// publication phase failed. The ordering guarantee applies at successful
+/// operation boundaries: a membership/equation record is not inserted until
+/// the dependency flush succeeds, and a record is not returned until its own
+/// flush succeeds.
 ///
-/// [`BlobStorePut`] and [`StorageFlush`] do not require failed I/O operations to
-/// be atomic. A backend error may therefore require backend-specific recovery
-/// before retrying. Once the store is usable again, replaying the same logical
-/// publication is content-addressed and deterministic.
+/// [`BlobStorePut`], [`CollectionStore`], and [`StorageFlush`] do not require
+/// failed I/O operations to be atomic. A backend error may therefore require
+/// backend-specific recovery before retrying. Once the store is usable again,
+/// replaying the same logical publication is content-addressed and
+/// deterministic.
 #[derive(Debug)]
-pub enum PublicationError<PutError, FlushError> {
+pub enum PublicationError<PutError, InsertError, FlushError> {
     /// The definition or collection data is invalid for this concrete kind.
     Validation(SimpleArchiveUnionValidationError),
     /// Commit metadata is not a canonical `SimpleArchive`.
@@ -165,12 +170,14 @@ pub enum PublicationError<PutError, FlushError> {
         /// Fresh Blake3 identity recomputed from the blob bytes.
         actual: CollectionData,
     },
-    /// A definition, element, result, or metadata write failed.
+    /// An element, result, metadata, or embedded-attachment write failed.
     DependencyPut(PutError),
-    /// The dependency durability barrier failed; no record write was attempted.
+    /// The collection definition could not be admitted to the native record store.
+    DefinitionInsert(InsertError),
+    /// The dependency durability barrier failed; no final record insertion was attempted.
     DependencyFlush(FlushError),
-    /// The final commit or merge record write failed.
-    RecordPut(PutError),
+    /// The final commit or merge record could not be admitted to the native record store.
+    RecordInsert(InsertError),
     /// The final record durability barrier failed.
     RecordFlush(FlushError),
 }
@@ -179,7 +186,7 @@ pub enum PublicationError<PutError, FlushError> {
 ///
 /// The uninhabited storage error parameters make it impossible for this phase
 /// to report an I/O failure: preparation does not touch the destination store.
-pub type PreparationError = PublicationError<Infallible, Infallible>;
+pub type PreparationError = PublicationError<Infallible, Infallible, Infallible>;
 
 /// A canonical signed collection commit whose bytes have not been published.
 ///
@@ -191,7 +198,7 @@ pub type PreparationError = PublicationError<Infallible, Infallible>;
 #[must_use = "a prepared collection commit has no effect until it is staged and finalized"]
 pub struct PreparedCollectionCommit {
     embedded: Vec<Blob<UnknownBlob>>,
-    definition: Blob<SimpleArchive>,
+    definition: CollectionDefinition,
     data: Blob<SimpleArchive>,
     metadata: Blob<SimpleArchive>,
     commit: CollectionCommit,
@@ -205,8 +212,9 @@ impl PreparedCollectionCommit {
 
     /// Durably stage every dependency without publishing the commit record.
     ///
-    /// The exact store-call order is embedded blobs (in handle order), the
-    /// collection definition, data, metadata, and then one durability flush.
+    /// The exact store-call order is the collection-definition record,
+    /// embedded blobs (in handle order), data, metadata, and then one
+    /// durability flush.
     /// On success the returned value retains the same mutable store borrow, so
     /// a caller may append unsigned `MERGE` or `DERIVE` artifacts through
     /// [`StagedCollectionCommit::store_mut`] before consuming the value with
@@ -214,9 +222,12 @@ impl PreparedCollectionCommit {
     pub fn stage<'store, S>(
         self,
         store: &'store mut S,
-    ) -> Result<StagedCollectionCommit<'store, S>, PublicationError<S::PutError, S::Error>>
+    ) -> Result<
+        StagedCollectionCommit<'store, S>,
+        PublicationError<S::PutError, S::InsertError, S::Error>,
+    >
     where
-        S: BlobStorePut + StorageFlush,
+        S: BlobStorePut + CollectionStore + StorageFlush,
     {
         let Self {
             embedded,
@@ -226,14 +237,14 @@ impl PreparedCollectionCommit {
             commit,
         } = self;
 
+        store
+            .insert(CollectionRecord::Definition(definition))
+            .map_err(PublicationError::DefinitionInsert)?;
         for blob in embedded {
             store
                 .put::<UnknownBlob, _>(blob)
                 .map_err(PublicationError::DependencyPut)?;
         }
-        store
-            .put::<SimpleArchive, _>(definition)
-            .map_err(PublicationError::DependencyPut)?;
         store
             .put::<SimpleArchive, _>(data)
             .map_err(PublicationError::DependencyPut)?;
@@ -257,7 +268,7 @@ impl PreparedCollectionCommit {
 #[must_use = "dropping a staged collection commit leaves its dependencies inert; call finalize to publish it"]
 pub struct StagedCollectionCommit<'store, S>
 where
-    S: BlobStorePut + StorageFlush,
+    S: BlobStorePut + CollectionStore + StorageFlush,
 {
     store: &'store mut S,
     commit: CollectionCommit,
@@ -265,7 +276,7 @@ where
 
 impl<'store, S> StagedCollectionCommit<'store, S>
 where
-    S: BlobStorePut + StorageFlush,
+    S: BlobStorePut + CollectionStore + StorageFlush,
 {
     /// Inspect the exact commit that remains withheld from the store.
     pub fn commit(&self) -> &CollectionCommit {
@@ -284,22 +295,26 @@ where
     /// Append the canonical signed commit last and make it crash-durable.
     ///
     /// This is the sole visibility boundary. The record put is followed by a
-    /// flush which also covers every caller artifact appended through
+    /// flush which also covers every caller artifact inserted through
     /// [`store_mut`](Self::store_mut). If the put or flush fails, backend-
     /// specific recovery may be required before deterministic replay.
-    pub fn finalize(self) -> Result<CollectionCommit, PublicationError<S::PutError, S::Error>> {
+    pub fn finalize(
+        self,
+    ) -> Result<CollectionCommit, PublicationError<S::PutError, S::InsertError, S::Error>> {
         let Self { store, commit } = self;
         store
-            .put::<SimpleArchive, _>(commit.to_blob())
-            .map_err(PublicationError::RecordPut)?;
+            .insert(CollectionRecord::Commit(commit))
+            .map_err(PublicationError::RecordInsert)?;
         store.flush().map_err(PublicationError::RecordFlush)?;
         Ok(commit)
     }
 }
 
-impl<PutError, FlushError> fmt::Display for PublicationError<PutError, FlushError>
+impl<PutError, InsertError, FlushError> fmt::Display
+    for PublicationError<PutError, InsertError, FlushError>
 where
     PutError: fmt::Display,
+    InsertError: fmt::Display,
     FlushError: fmt::Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -325,18 +340,23 @@ where
             Self::DependencyPut(error) => {
                 write!(f, "failed to write a collection dependency: {error}")
             }
+            Self::DefinitionInsert(error) => {
+                write!(f, "failed to insert a collection definition: {error}")
+            }
             Self::DependencyFlush(error) => {
                 write!(f, "failed to flush collection dependencies: {error}")
             }
-            Self::RecordPut(error) => write!(f, "failed to write collection record: {error}"),
+            Self::RecordInsert(error) => write!(f, "failed to insert collection record: {error}"),
             Self::RecordFlush(error) => write!(f, "failed to flush collection record: {error}"),
         }
     }
 }
 
-impl<PutError, FlushError> Error for PublicationError<PutError, FlushError>
+impl<PutError, InsertError, FlushError> Error
+    for PublicationError<PutError, InsertError, FlushError>
 where
     PutError: Error + 'static,
+    InsertError: Error + 'static,
     FlushError: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
@@ -344,7 +364,8 @@ where
             Self::Validation(error) => Some(error),
             Self::InvalidMetadata(error) => Some(error),
             Self::InvalidEmbeddedBlob { .. } => None,
-            Self::DependencyPut(error) | Self::RecordPut(error) => Some(error),
+            Self::DependencyPut(error) => Some(error),
+            Self::DefinitionInsert(error) | Self::RecordInsert(error) => Some(error),
             Self::DependencyFlush(error) | Self::RecordFlush(error) => Some(error),
         }
     }
@@ -517,16 +538,16 @@ fn prepare_commit_with_embedded(
 
     Ok(PreparedCollectionCommit {
         embedded,
-        definition: definition.to_blob(),
+        definition: *definition,
         data,
         metadata,
         commit,
     })
 }
 
-fn widen_preparation_error<PutError, FlushError>(
+fn widen_preparation_error<PutError, InsertError, FlushError>(
     error: PreparationError,
-) -> PublicationError<PutError, FlushError> {
+) -> PublicationError<PutError, InsertError, FlushError> {
     match error {
         PublicationError::Validation(error) => PublicationError::Validation(error),
         PublicationError::InvalidMetadata(error) => PublicationError::InvalidMetadata(error),
@@ -539,7 +560,8 @@ fn widen_preparation_error<PutError, FlushError>(
             cached_handle,
             actual,
         },
-        PublicationError::DependencyPut(never) | PublicationError::RecordPut(never) => {
+        PublicationError::DependencyPut(never) => match never {},
+        PublicationError::DefinitionInsert(never) | PublicationError::RecordInsert(never) => {
             match never {}
         }
         PublicationError::DependencyFlush(never) | PublicationError::RecordFlush(never) => {
@@ -554,7 +576,7 @@ fn widen_preparation_error<PutError, FlushError>(
 /// validated or stored, so a forged [`Blob::with_handle`] cache cannot enter
 /// storage or the signed transcript. The exact write order is:
 ///
-/// 1. definition, data, metadata;
+/// 1. collection-definition record, data blob, metadata blob;
 /// 2. dependency flush;
 /// 3. signed commit record;
 /// 4. record flush.
@@ -571,9 +593,12 @@ pub fn publish_commit<S>(
     data: &Blob<SimpleArchive>,
     metadata: &Blob<SimpleArchive>,
     signing_key: &SigningKey,
-) -> Result<CollectionCommit, PublicationError<S::PutError, <S as StorageFlush>::Error>>
+) -> Result<
+    CollectionCommit,
+    PublicationError<S::PutError, S::InsertError, <S as StorageFlush>::Error>,
+>
 where
-    S: BlobStorePut + StorageFlush,
+    S: BlobStorePut + CollectionStore + StorageFlush,
 {
     let prepared =
         prepare_commit(definition, data, metadata, signing_key).map_err(widen_preparation_error)?;
@@ -591,17 +616,21 @@ where
 ///
 /// Fragment exports are not serialized. The two fact sets become canonical
 /// `SimpleArchive` data and metadata elements. The shared prepared-publication
-/// path writes embedded blobs, the definition, and both archives before its
-/// dependency flush, then appends the signed record last. The same backend-
-/// recovery boundary documented by [`PublicationError`] applies.
+/// path inserts the definition record and writes embedded blobs plus both
+/// archives before its dependency flush, then inserts the signed record last.
+/// The same backend-recovery boundary documented by [`PublicationError`]
+/// applies.
 pub fn publish_fragment_commit<S>(
     store: &mut S,
     definition: &CollectionDefinition,
     fragment: Fragment,
     signing_key: &SigningKey,
-) -> Result<CollectionCommit, PublicationError<S::PutError, <S as StorageFlush>::Error>>
+) -> Result<
+    CollectionCommit,
+    PublicationError<S::PutError, S::InsertError, <S as StorageFlush>::Error>,
+>
 where
-    S: BlobStorePut + StorageFlush,
+    S: BlobStorePut + CollectionStore + StorageFlush,
 {
     let prepared = prepare_fragment_commit(definition, fragment, signing_key)
         .map_err(widen_preparation_error)?;
@@ -614,7 +643,8 @@ where
 /// computed Blake3 identities, validated, and joined directly. The exact write
 /// order is:
 ///
-/// 1. definition, canonical low input, canonical high input, result;
+/// 1. collection-definition record, canonical low input, canonical high input,
+///    result;
 /// 2. dependency flush;
 /// 3. merge record;
 /// 4. record flush.
@@ -631,10 +661,10 @@ pub fn publish_merge<S>(
     high: &Blob<SimpleArchive>,
 ) -> Result<
     (CollectionMerge, Blob<SimpleArchive>),
-    PublicationError<S::PutError, <S as StorageFlush>::Error>,
+    PublicationError<S::PutError, S::InsertError, <S as StorageFlush>::Error>,
 >
 where
-    S: BlobStorePut + StorageFlush,
+    S: BlobStorePut + CollectionStore + StorageFlush,
 {
     validate_definition(definition).map_err(PublicationError::Validation)?;
 
@@ -668,8 +698,8 @@ where
     );
 
     store
-        .put::<SimpleArchive, _>(definition.to_blob())
-        .map_err(PublicationError::DependencyPut)?;
+        .insert(CollectionRecord::Definition(*definition))
+        .map_err(PublicationError::DefinitionInsert)?;
     store
         .put::<SimpleArchive, _>(low)
         .map_err(PublicationError::DependencyPut)?;
@@ -681,8 +711,8 @@ where
         .map_err(PublicationError::DependencyPut)?;
     store.flush().map_err(PublicationError::DependencyFlush)?;
     store
-        .put::<SimpleArchive, _>(merge.to_blob())
-        .map_err(PublicationError::RecordPut)?;
+        .insert(CollectionRecord::Merge(merge))
+        .map_err(PublicationError::RecordInsert)?;
     store.flush().map_err(PublicationError::RecordFlush)?;
 
     Ok((merge, result))
@@ -887,7 +917,7 @@ impl std::iter::FusedIterator for UnionRows<'_> {}
 mod tests {
     use super::*;
 
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use ed25519_dalek::SigningKey;
     use hex_literal::hex;
@@ -929,6 +959,7 @@ mod tests {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum ProbeEvent {
         Put([u8; 32]),
+        Insert(Id),
         Flush,
     }
 
@@ -938,6 +969,9 @@ mod tests {
         known: BTreeSet<[u8; 32]>,
         pending: BTreeSet<[u8; 32]>,
         durable: BTreeSet<[u8; 32]>,
+        records: BTreeMap<Id, CollectionRecord>,
+        pending_records: BTreeSet<Id>,
+        durable_records: BTreeSet<Id>,
         fail_at: Option<usize>,
     }
 
@@ -984,12 +1018,37 @@ mod tests {
         }
     }
 
+    impl CollectionStore for ProbeStore {
+        type RecordsError = Infallible;
+        type InsertError = ProbeFailure;
+        type RecordIter<'a> = std::vec::IntoIter<Result<CollectionRecord, Infallible>>;
+
+        fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+            Ok(self
+                .records
+                .values()
+                .copied()
+                .map(Ok)
+                .collect::<Vec<_>>()
+                .into_iter())
+        }
+
+        fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
+            self.attempt(ProbeEvent::Insert(record.id()))?;
+            self.records.entry(record.id()).or_insert(record);
+            self.pending_records.insert(record.id());
+            Ok(())
+        }
+    }
+
     impl StorageFlush for ProbeStore {
         type Error = ProbeFailure;
 
         fn flush(&mut self) -> Result<(), Self::Error> {
             self.attempt(ProbeEvent::Flush)?;
             self.durable.extend(std::mem::take(&mut self.pending));
+            self.durable_records
+                .extend(std::mem::take(&mut self.pending_records));
             Ok(())
         }
     }
@@ -1038,6 +1097,10 @@ mod tests {
         Handle<S>: InlineEncoding,
     {
         ProbeEvent::Put(blob.get_handle().raw)
+    }
+
+    fn insert_event(record: CollectionRecord) -> ProbeEvent {
+        ProbeEvent::Insert(record.id())
     }
 
     fn fragment_fixture() -> (
@@ -1121,18 +1184,18 @@ mod tests {
             expected.data(),
             Inline::new([0x42; 32]),
         );
-        let derive_blob = CollectionDerive::to_blob(&derive);
-        let definition_blob = CollectionDefinition::to_blob(&source_definition);
-        let commit_blob = CollectionCommit::to_blob(&expected);
+        let derive_record = CollectionRecord::Derive(derive);
+        let definition_record = CollectionRecord::Definition(source_definition);
+        let commit_record = CollectionRecord::Commit(expected);
         let sequence = [
+            vec![insert_event(definition_record)],
             embedded,
             vec![
-                put_event(&definition_blob),
                 put_event(&content_archive),
                 put_event(&metadata_archive),
                 ProbeEvent::Flush,
-                put_event(&derive_blob),
-                put_event(&commit_blob),
+                insert_event(derive_record),
+                insert_event(commit_record),
                 ProbeEvent::Flush,
             ],
         ]
@@ -1142,10 +1205,7 @@ mod tests {
         for prepared in [prepared, repeated] {
             let mut staged = prepared.stage(&mut store).unwrap();
             assert_eq!(staged.commit(), &expected);
-            staged
-                .store_mut()
-                .put::<SimpleArchive, _>(derive_blob.clone())
-                .unwrap();
+            staged.store_mut().insert(derive_record).unwrap();
             assert_eq!(staged.finalize().unwrap(), expected);
         }
 
@@ -1155,9 +1215,10 @@ mod tests {
         // The last flush intentionally covers the unsigned cache artifact and
         // COMMIT together. The signed source remains valid without that cache:
         // its transcript names only the definition, data, and metadata.
-        assert!(store.durable.contains(&derive_blob.get_handle().raw));
-        assert!(store.durable.contains(&commit_blob.get_handle().raw));
+        assert!(store.durable_records.contains(&derive.id()));
+        assert!(store.durable_records.contains(&expected.id()));
         assert!(store.pending.is_empty());
+        assert!(store.pending_records.is_empty());
         validate_commit(&source_definition, &expected, &content_archive).unwrap();
     }
 
@@ -1178,8 +1239,8 @@ mod tests {
         let mut pile = Pile::open(&path).unwrap();
         let mut staged = prepared.stage(&mut pile).unwrap();
         {
+            let discovered = discover_collection_records(staged.store_mut()).unwrap();
             let reader = staged.store_mut().reader().unwrap();
-            let discovered = discover_collection_records(&reader).unwrap();
             assert_eq!(discovered.definitions(), &[definition.clone()]);
             assert!(discovered.commits().is_empty());
             assert!(discovered.merges().is_empty());
@@ -1213,15 +1274,14 @@ mod tests {
         pile.close().unwrap();
 
         let mut reopened = Pile::open(&path).unwrap();
+        let discovered = discover_collection_records(&mut reopened).unwrap();
         let reader = reopened.reader().unwrap();
-        let discovered = discover_collection_records(&reader).unwrap();
         assert_eq!(discovered.definitions(), &[definition]);
         assert!(discovered.commits().is_empty());
-        assert!(reader
-            .get::<Blob<SimpleArchive>, SimpleArchive>(
-                CollectionCommit::to_blob(&withheld).get_handle(),
-            )
-            .is_err());
+        assert!(!discovered
+            .commits()
+            .iter()
+            .any(|commit| commit.id() == withheld.id()));
         drop(reader);
         reopened.close().unwrap();
     }
@@ -1259,14 +1319,12 @@ mod tests {
         let bogus = archive([row(14, 1, 14)]);
         let forged_data = Blob::with_handle(data_blob.bytes.clone(), bogus.get_handle());
         let forged_metadata = Blob::with_handle(metadata.bytes.clone(), bogus.get_handle());
-        let definition_blob = CollectionDefinition::to_blob(&definition);
-        let record_blob = CollectionCommit::to_blob(&expected);
         let sequence = vec![
-            put_event(&definition_blob),
+            insert_event(CollectionRecord::Definition(definition)),
             put_event(&data_blob),
             put_event(&metadata),
             ProbeEvent::Flush,
-            put_event(&record_blob),
+            insert_event(CollectionRecord::Commit(expected)),
             ProbeEvent::Flush,
         ];
 
@@ -1298,15 +1356,16 @@ mod tests {
         let mut expected_events = sequence.clone();
         expected_events.extend(sequence);
         assert_eq!(store.events, expected_events);
-        let expected_handles = BTreeSet::from([
-            definition_blob.get_handle().raw,
-            data_blob.get_handle().raw,
-            metadata.get_handle().raw,
-            record_blob.get_handle().raw,
-        ]);
+        let expected_handles =
+            BTreeSet::from([data_blob.get_handle().raw, metadata.get_handle().raw]);
         assert_eq!(store.known, expected_handles);
         assert_eq!(store.durable, expected_handles);
+        assert_eq!(
+            store.durable_records,
+            BTreeSet::from([definition.id(), expected.id()])
+        );
         assert!(store.pending.is_empty());
+        assert!(store.pending_records.is_empty());
         assert!(!store.known.contains(&bogus.get_handle().raw));
     }
 
@@ -1324,17 +1383,14 @@ mod tests {
             data(&content_archive),
             metadata_archive.get_handle(),
         );
-        let definition_blob = CollectionDefinition::to_blob(&definition);
-        let record_blob = CollectionCommit::to_blob(&expected);
-
         let sequence = [
+            vec![insert_event(CollectionRecord::Definition(definition))],
             embedded.clone(),
             vec![
-                put_event(&definition_blob),
                 put_event(&content_archive),
                 put_event(&metadata_archive),
                 ProbeEvent::Flush,
-                put_event(&record_blob),
+                insert_event(CollectionRecord::Commit(expected)),
                 ProbeEvent::Flush,
             ],
         ]
@@ -1357,18 +1413,23 @@ mod tests {
             .into_iter()
             .map(|event| match event {
                 ProbeEvent::Put(handle) => handle,
-                ProbeEvent::Flush => unreachable!("embedded events are puts"),
+                ProbeEvent::Insert(_) | ProbeEvent::Flush => {
+                    unreachable!("embedded events are puts")
+                }
             })
             .collect();
         expected_handles.extend([
-            definition_blob.get_handle().raw,
             content_archive.get_handle().raw,
             metadata_archive.get_handle().raw,
-            record_blob.get_handle().raw,
         ]);
         assert_eq!(store.known, expected_handles);
         assert_eq!(store.durable, expected_handles);
+        assert_eq!(
+            store.durable_records,
+            BTreeSet::from([definition.id(), expected.id()])
+        );
         assert!(store.pending.is_empty());
+        assert!(store.pending_records.is_empty());
     }
 
     #[test]
@@ -1441,15 +1502,13 @@ mod tests {
             data(high),
             data(&expected_result),
         );
-        let definition_blob = CollectionDefinition::to_blob(&definition);
-        let record_blob = CollectionMerge::to_blob(&expected_merge);
         let sequence = vec![
-            put_event(&definition_blob),
+            insert_event(CollectionRecord::Definition(definition)),
             put_event(low),
             put_event(high),
             put_event(&expected_result),
             ProbeEvent::Flush,
-            put_event(&record_blob),
+            insert_event(CollectionRecord::Merge(expected_merge)),
             ProbeEvent::Flush,
         ];
 
@@ -1465,28 +1524,25 @@ mod tests {
         expected_events.extend(sequence);
         assert_eq!(store.events, expected_events);
         let expected_handles = BTreeSet::from([
-            definition_blob.get_handle().raw,
             low.get_handle().raw,
             high.get_handle().raw,
             expected_result.get_handle().raw,
-            record_blob.get_handle().raw,
         ]);
         assert_eq!(store.known, expected_handles);
         assert_eq!(store.durable, expected_handles);
+        assert_eq!(
+            store.durable_records,
+            BTreeSet::from([definition.id(), expected_merge.id()])
+        );
         assert!(store.pending.is_empty());
+        assert!(store.pending_records.is_empty());
         assert!(!store.known.contains(&bogus.get_handle().raw));
     }
 
     #[test]
     fn commit_publication_orders_completed_prefixes_and_replays_after_recovery() {
         let (definition, data_blob, metadata, signing_key, expected) = commit_fixture();
-        let definition_blob = CollectionDefinition::to_blob(&definition);
-        let record_blob = CollectionCommit::to_blob(&expected);
-        let dependencies = BTreeSet::from([
-            definition_blob.get_handle().raw,
-            data_blob.get_handle().raw,
-            metadata.get_handle().raw,
-        ]);
+        let dependencies = BTreeSet::from([data_blob.get_handle().raw, metadata.get_handle().raw]);
 
         for fail_at in 1..=6 {
             let mut store = ProbeStore::failing_before_effect_at(fail_at);
@@ -1494,23 +1550,23 @@ mod tests {
                 publish_commit(&mut store, &definition, &data_blob, &metadata, &signing_key)
                     .unwrap_err();
             match (fail_at, error) {
-                (1..=3, PublicationError::DependencyPut(ProbeFailure(at)))
+                (1, PublicationError::DefinitionInsert(ProbeFailure(at)))
+                | (2..=3, PublicationError::DependencyPut(ProbeFailure(at)))
                 | (4, PublicationError::DependencyFlush(ProbeFailure(at)))
-                | (5, PublicationError::RecordPut(ProbeFailure(at)))
+                | (5, PublicationError::RecordInsert(ProbeFailure(at)))
                 | (6, PublicationError::RecordFlush(ProbeFailure(at))) => {
                     assert_eq!(at, fail_at)
                 }
                 (_, error) => panic!("unexpected publication error: {error}"),
             }
 
-            assert!(!store.durable.contains(&record_blob.get_handle().raw));
+            assert!(!store.durable_records.contains(&expected.id()));
             if fail_at <= 4 {
-                assert!(!store
-                    .events
-                    .contains(&ProbeEvent::Put(record_blob.get_handle().raw)));
+                assert!(!store.events.contains(&ProbeEvent::Insert(expected.id())));
             } else {
                 assert_eq!(store.events[3], ProbeEvent::Flush);
                 assert!(dependencies.is_subset(&store.durable));
+                assert!(store.durable_records.contains(&definition.id()));
             }
 
             store.recover();
@@ -1519,7 +1575,8 @@ mod tests {
                     .unwrap();
             assert_eq!(retried, expected);
             assert!(dependencies.is_subset(&store.durable));
-            assert!(store.durable.contains(&record_blob.get_handle().raw));
+            assert!(store.durable_records.contains(&definition.id()));
+            assert!(store.durable_records.contains(&expected.id()));
         }
     }
 
@@ -1531,10 +1588,7 @@ mod tests {
         let (low, high) = ordered_inputs(&left, &right);
         let result = join(low, high).unwrap();
         let expected = CollectionMerge::new(definition.id(), data(low), data(high), data(&result));
-        let definition_blob = CollectionDefinition::to_blob(&definition);
-        let record_blob = CollectionMerge::to_blob(&expected);
         let dependencies = BTreeSet::from([
-            definition_blob.get_handle().raw,
             low.get_handle().raw,
             high.get_handle().raw,
             result.get_handle().raw,
@@ -1544,30 +1598,31 @@ mod tests {
             let mut store = ProbeStore::failing_before_effect_at(fail_at);
             let error = publish_merge(&mut store, &definition, &left, &right).unwrap_err();
             match (fail_at, error) {
-                (1..=4, PublicationError::DependencyPut(ProbeFailure(at)))
+                (1, PublicationError::DefinitionInsert(ProbeFailure(at)))
+                | (2..=4, PublicationError::DependencyPut(ProbeFailure(at)))
                 | (5, PublicationError::DependencyFlush(ProbeFailure(at)))
-                | (6, PublicationError::RecordPut(ProbeFailure(at)))
+                | (6, PublicationError::RecordInsert(ProbeFailure(at)))
                 | (7, PublicationError::RecordFlush(ProbeFailure(at))) => {
                     assert_eq!(at, fail_at)
                 }
                 (_, error) => panic!("unexpected publication error: {error}"),
             }
 
-            assert!(!store.durable.contains(&record_blob.get_handle().raw));
+            assert!(!store.durable_records.contains(&expected.id()));
             if fail_at <= 5 {
-                assert!(!store
-                    .events
-                    .contains(&ProbeEvent::Put(record_blob.get_handle().raw)));
+                assert!(!store.events.contains(&ProbeEvent::Insert(expected.id())));
             } else {
                 assert_eq!(store.events[4], ProbeEvent::Flush);
                 assert!(dependencies.is_subset(&store.durable));
+                assert!(store.durable_records.contains(&definition.id()));
             }
 
             store.recover();
             let retried = publish_merge(&mut store, &definition, &left, &right).unwrap();
             assert_eq!(retried, (expected.clone(), result.clone()));
             assert!(dependencies.is_subset(&store.durable));
-            assert!(store.durable.contains(&record_blob.get_handle().raw));
+            assert!(store.durable_records.contains(&definition.id()));
+            assert!(store.durable_records.contains(&expected.id()));
         }
     }
 
@@ -1652,8 +1707,8 @@ mod tests {
         };
 
         let mut reopened = Pile::open(&path).unwrap();
+        let discovered = discover_collection_records(&mut reopened).unwrap();
         let reader = reopened.reader().unwrap();
-        let discovered = discover_collection_records(&reader).unwrap();
         assert_eq!(discovered.definitions(), &[definition.clone()]);
         assert_eq!(discovered.commits(), &[commit.clone()]);
         assert_eq!(discovered.merges(), &[merge.clone()]);
@@ -1697,8 +1752,8 @@ mod tests {
         };
 
         let mut reopened = Pile::open(&path).unwrap();
+        let discovered = discover_collection_records(&mut reopened).unwrap();
         let reader = reopened.reader().unwrap();
-        let discovered = discover_collection_records(&reader).unwrap();
         assert_eq!(discovered.definitions(), &[definition.clone()]);
         assert_eq!(discovered.commits(), &[commit.clone()]);
         assert!(discovered.merges().is_empty());

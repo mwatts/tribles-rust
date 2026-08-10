@@ -23,6 +23,7 @@ use crate::blob::Blob;
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
+use crate::collection::{CollectionRecord, RecordDecodeError};
 use crate::id::Id;
 use crate::id::RawId;
 use crate::inline::encodings::hash::{Blake3, Handle, Hash};
@@ -33,13 +34,14 @@ use crate::prelude::blobencodings::SimpleArchive;
 
 use super::async_store::{
     AsyncBlobStore, AsyncBlobStoreForget, AsyncBlobStoreGet, AsyncBlobStoreList,
-    AsyncBlobStoreMeta, AsyncBlobStorePut, AsyncPinStore,
+    AsyncBlobStoreMeta, AsyncBlobStorePut, AsyncCollectionStore, AsyncPinStore,
 };
 use super::PushResult;
 use super::{BlobInfo, BlobMetadata};
 
 const BRANCH_INFIX: &str = "branches";
 const BLOB_INFIX: &str = "blobs";
+const COLLECTION_RECORD_INFIX: &str = "collection-records";
 
 /// Repository backed by an [`object_store`] compatible storage backend.
 ///
@@ -155,6 +157,93 @@ impl AsyncBlobStore for ObjectStoreRemote {
             prefix: self.prefix.clone(),
         };
         async move { Ok(reader) }
+    }
+}
+
+impl AsyncCollectionStore for ObjectStoreRemote {
+    type RecordsError = ListCollectionRecordsErr;
+    type InsertError = InsertCollectionRecordErr;
+
+    fn records(
+        &mut self,
+    ) -> impl Future<
+        Output = Result<Vec<Result<CollectionRecord, Self::RecordsError>>, Self::RecordsError>,
+    > + Send {
+        async move {
+            let prefix = self.prefix.child(COLLECTION_RECORD_INFIX);
+            let mut observed = Vec::new();
+
+            // Object-store LIST is an observed monotone view, not a coherent
+            // snapshot. A concurrent immutable insertion may be visible on
+            // this call or the next one; every object this call does observe
+            // is nevertheless validated before it is returned.
+            let listed = self.store.list(Some(&prefix)).collect::<Vec<_>>().await;
+            for item in listed {
+                let (sort_id, sort_path, result) = match item {
+                    Err(error) => {
+                        let sort_path = error.to_string();
+                        (None, sort_path, Err(ListCollectionRecordsErr::List(error)))
+                    }
+                    Ok(meta) => {
+                        let sort_path = meta.location.to_string();
+                        let path_id = collection_record_id_from_path(&prefix, &meta.location).ok();
+                        let result =
+                            read_collection_record(&*self.store, &prefix, meta.location).await;
+                        let sort_id = result.as_ref().map(CollectionRecord::id).ok().or(path_id);
+                        (sort_id, sort_path, result)
+                    }
+                };
+                observed.push((sort_id, sort_path, result));
+            }
+
+            // Remote LIST order is backend-specific. Normalize successful
+            // records by intrinsic id, and malformed entries by path, so the
+            // observed view is deterministic independent of provider order.
+            observed.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+            Ok(observed.into_iter().map(|(_, _, result)| result).collect())
+        }
+    }
+
+    fn insert(
+        &mut self,
+        record: CollectionRecord,
+    ) -> impl Future<Output = Result<(), Self::InsertError>> + Send {
+        let id = record.id();
+        let path = self
+            .prefix
+            .child(COLLECTION_RECORD_INFIX)
+            .child(hex::encode(id));
+        let expected: bytes::Bytes = CollectionRecord::to_blob(&record).bytes.into();
+
+        async move {
+            match self
+                .store
+                .put_opts(&path, expected.clone().into(), PutMode::Create.into())
+                .await
+            {
+                Ok(_) => Ok(()),
+                Err(object_store::Error::AlreadyExists { .. }) => {
+                    // The namespace is immutable. A replay is success only
+                    // when the already-present canonical bytes are identical;
+                    // never turn insertion into a mutable CAS update.
+                    let object = self
+                        .store
+                        .get(&path)
+                        .await
+                        .map_err(InsertCollectionRecordErr::ReadExisting)?;
+                    let actual = object
+                        .bytes()
+                        .await
+                        .map_err(InsertCollectionRecordErr::ReadExisting)?;
+                    if actual == expected {
+                        Ok(())
+                    } else {
+                        Err(InsertCollectionRecordErr::ExistingMismatch { id })
+                    }
+                }
+                Err(error) => Err(InsertCollectionRecordErr::Store(error)),
+            }
+        }
     }
 }
 
@@ -461,6 +550,147 @@ impl AsyncBlobStoreMeta for ObjectStoreReader {
     }
 }
 
+fn collection_record_id_from_path(
+    prefix: &Path,
+    location: &Path,
+) -> Result<Id, ListCollectionRecordsErr> {
+    let name = location
+        .filename()
+        .ok_or(ListCollectionRecordsErr::NotAFile("no filename"))?;
+    if location != &prefix.child(name) {
+        return Err(ListCollectionRecordsErr::NotDirectChild(
+            location.to_string(),
+        ));
+    }
+    let raw = RawId::from_hex(name).map_err(ListCollectionRecordsErr::BadNameHex)?;
+    Id::new(raw).ok_or(ListCollectionRecordsErr::BadId)
+}
+
+async fn read_collection_record(
+    store: &dyn ObjectStore,
+    prefix: &Path,
+    location: Path,
+) -> Result<CollectionRecord, ListCollectionRecordsErr> {
+    let path_id = collection_record_id_from_path(prefix, &location)?;
+    let object = store
+        .get(&location)
+        .await
+        .map_err(ListCollectionRecordsErr::Get)?;
+    let bytes = object
+        .bytes()
+        .await
+        .map_err(ListCollectionRecordsErr::Get)?;
+    let bytes: Bytes = bytes.into();
+    let blob: Blob<SimpleArchive> = Blob::new(bytes);
+    let record = CollectionRecord::decode(&blob)
+        .map_err(ListCollectionRecordsErr::Decode)?
+        .ok_or(ListCollectionRecordsErr::UnknownKind)?;
+    let record_id = record.id();
+    if record_id != path_id {
+        return Err(ListCollectionRecordsErr::IdMismatch {
+            path: path_id,
+            record: record_id,
+        });
+    }
+    Ok(record)
+}
+
+/// Error returned while enumerating native collection records.
+#[derive(Debug)]
+pub enum ListCollectionRecordsErr {
+    /// The object-store LIST operation failed.
+    List(object_store::Error),
+    /// A listed object had no filename component.
+    NotAFile(&'static str),
+    /// A listed object was nested below the one-id-per-object namespace.
+    NotDirectChild(String),
+    /// A listed filename was not a hexadecimal intrinsic id.
+    BadNameHex(<RawId as FromHex>::Error),
+    /// The decoded filename represented the nil id.
+    BadId,
+    /// A listed record object could not be fetched.
+    Get(object_store::Error),
+    /// The stored bytes were not a canonical collection record.
+    Decode(RecordDecodeError),
+    /// The stored archive carried no recognized collection-record kind.
+    UnknownKind,
+    /// The record's intrinsic id did not match its object path.
+    IdMismatch { path: Id, record: Id },
+}
+
+impl fmt::Display for ListCollectionRecordsErr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::List(error) => write!(f, "collection-record list failed: {error}"),
+            Self::NotAFile(error) => write!(f, "collection-record list failed: {error}"),
+            Self::NotDirectChild(path) => {
+                write!(f, "collection-record object is not a direct child: {path}")
+            }
+            Self::BadNameHex(error) => {
+                write!(f, "collection-record filename is not hexadecimal: {error}")
+            }
+            Self::BadId => write!(f, "collection-record filename is the nil id"),
+            Self::Get(error) => write!(f, "collection-record fetch failed: {error}"),
+            Self::Decode(error) => write!(f, "collection-record decode failed: {error}"),
+            Self::UnknownKind => write!(f, "object is not a collection record"),
+            Self::IdMismatch { path, record } => write!(
+                f,
+                "collection-record path id {path:X} does not match decoded id {record:X}"
+            ),
+        }
+    }
+}
+
+impl Error for ListCollectionRecordsErr {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::List(error) | Self::Get(error) => Some(error),
+            Self::BadNameHex(error) => Some(error),
+            Self::Decode(error) => Some(error),
+            Self::NotAFile(_)
+            | Self::NotDirectChild(_)
+            | Self::BadId
+            | Self::UnknownKind
+            | Self::IdMismatch { .. } => None,
+        }
+    }
+}
+
+/// Error returned while inserting one immutable collection record.
+#[derive(Debug)]
+pub enum InsertCollectionRecordErr {
+    /// Creating the immutable record object failed.
+    Store(object_store::Error),
+    /// An existing object could not be fetched for idempotency validation.
+    ReadExisting(object_store::Error),
+    /// The intrinsic-id path already contained different bytes.
+    ExistingMismatch { id: Id },
+}
+
+impl fmt::Display for InsertCollectionRecordErr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Store(error) => write!(f, "collection-record insert failed: {error}"),
+            Self::ReadExisting(error) => {
+                write!(f, "failed to validate existing collection record: {error}")
+            }
+            Self::ExistingMismatch { id } => write!(
+                f,
+                "collection-record id {id:X} already contains different bytes"
+            ),
+        }
+    }
+}
+
+impl Error for InsertCollectionRecordErr {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Store(error) | Self::ReadExisting(error) => Some(error),
+            Self::ExistingMismatch { .. } => None,
+        }
+    }
+}
+
 /// Error returned when retrieving a blob from the object store.
 #[derive(Debug)]
 pub enum GetBlobErr<E: Error> {
@@ -616,5 +846,103 @@ impl From<object_store::Error> for PushBranchErr {
 impl From<TryFromSliceError> for PushBranchErr {
     fn from(err: TryFromSliceError) -> Self {
         Self::ValidationErr(err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use futures::executor::block_on;
+    use object_store::memory::InMemory;
+
+    use crate::collection::{CollectionDefinition, CollectionStore};
+    use crate::repo::async_store::Blocking;
+    use crate::repo::StorageFlush;
+
+    fn remote() -> ObjectStoreRemote {
+        ObjectStoreRemote {
+            store: Arc::new(InMemory::new()),
+            prefix: Path::from("test-repository"),
+        }
+    }
+
+    fn record(tag: u8) -> CollectionRecord {
+        CollectionRecord::Definition(CollectionDefinition::new(
+            Id::new([tag; 16]).unwrap(),
+            Id::new([tag.wrapping_add(1).max(1); 16]).unwrap(),
+            Id::new([tag.wrapping_add(2).max(1); 16]).unwrap(),
+        ))
+    }
+
+    #[test]
+    fn native_collection_records_are_sorted_and_idempotent() {
+        block_on(async {
+            let mut store = remote();
+            let first = record(1);
+            let second = record(9);
+
+            AsyncCollectionStore::insert(&mut store, second)
+                .await
+                .unwrap();
+            AsyncCollectionStore::insert(&mut store, first)
+                .await
+                .unwrap();
+            AsyncCollectionStore::insert(&mut store, second)
+                .await
+                .unwrap();
+
+            let actual = AsyncCollectionStore::records(&mut store)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let mut expected = vec![first, second];
+            expected.sort_unstable_by_key(CollectionRecord::id);
+            assert_eq!(actual, expected);
+        });
+    }
+
+    #[test]
+    fn collection_record_path_must_match_decoded_intrinsic_id() {
+        block_on(async {
+            let mut store = remote();
+            let path_record = record(1);
+            let stored_record = record(2);
+            let path = store
+                .prefix
+                .child(COLLECTION_RECORD_INFIX)
+                .child(hex::encode(path_record.id()));
+            let bytes: bytes::Bytes = CollectionRecord::to_blob(&stored_record).bytes.into();
+            store.store.put(&path, bytes.into()).await.unwrap();
+
+            assert!(matches!(
+                AsyncCollectionStore::insert(&mut store, path_record).await,
+                Err(InsertCollectionRecordErr::ExistingMismatch { id }) if id == path_record.id()
+            ));
+
+            let records = AsyncCollectionStore::records(&mut store).await.unwrap();
+            assert_eq!(records.len(), 1);
+            assert!(matches!(
+                &records[0],
+                Err(ListCollectionRecordsErr::IdMismatch { path, record })
+                    if *path == path_record.id() && *record == stored_record.id()
+            ));
+        });
+    }
+
+    #[test]
+    fn blocking_object_store_supports_collection_publication_flush() {
+        let mut store = Blocking::new(remote()).unwrap();
+        let record = record(17);
+
+        CollectionStore::insert(&mut store, record).unwrap();
+        StorageFlush::flush(&mut store).unwrap();
+        let actual = CollectionStore::records(&mut store)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(actual, vec![record]);
     }
 }

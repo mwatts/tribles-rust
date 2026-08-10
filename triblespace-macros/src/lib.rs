@@ -1,3 +1,11 @@
+//! Instrumented procedural-macro wrappers for TribleSpace.
+//!
+//! Compile-time metadata emission is optional. It is enabled when
+//! `TRIBLESPACE_METADATA_PILE`, `TRIBLESPACE_METADATA_COLLECTION_SCOPE`, and
+//! `TRIBLESPACE_METADATA_SIGNING_KEY` are all set to valid values. Each macro
+//! invocation is accumulated as one self-contained [`Fragment`] and published
+//! as one signed collection commit; partial configuration is inert.
+
 use proc_macro::Span;
 use proc_macro::TokenStream;
 
@@ -9,12 +17,11 @@ use std::path::Path;
 use ed25519_dalek::SigningKey;
 use hex::FromHex;
 
+use triblespace_core::collection::Collection;
 use triblespace_core::id::fucid;
 use triblespace_core::id::Id;
 use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::Repository;
-use triblespace_core::repo::Workspace;
-use triblespace_core::trible::TribleSet;
+use triblespace_core::trible::Fragment;
 
 use syn::parse::Parse;
 use syn::parse::ParseStream;
@@ -81,124 +88,116 @@ fn metadata_signing_key() -> Option<SigningKey> {
     Some(SigningKey::from_bytes(&bytes))
 }
 
-fn parse_branch_id(value: &str) -> Option<Id> {
+fn parse_collection_scope(value: &str) -> Option<Id> {
     Id::from_hex(value)
 }
 
-struct MetadataContext<'a> {
-    workspace: &'a mut Workspace<Pile>,
-    invocation_id: triblespace_core::id::Id,
-    input: &'a TokenStream,
+fn publish_metadata(
+    pile_path: &Path,
+    collection_scope: Id,
+    signing_key: SigningKey,
+    fragment: Fragment,
+) {
+    let pile = match Pile::open(pile_path) {
+        Ok(pile) => pile,
+        Err(_) => return,
+    };
+    let mut collection = Collection::new(pile, collection_scope, signing_key);
+    let _ = collection.commit(fragment);
+    let _ = collection.close();
 }
 
-impl<'a> MetadataContext<'a> {
-    fn workspace(&mut self) -> &mut Workspace<Pile> {
-        self.workspace
+struct MetadataContext {
+    fragment: Fragment,
+    invocation_id: triblespace_core::id::Id,
+    input: TokenStream2,
+}
+
+impl MetadataContext {
+    fn fragment(&mut self) -> &mut Fragment {
+        &mut self.fragment
     }
 
     fn invocation_id(&self) -> triblespace_core::id::Id {
         self.invocation_id
     }
 
-    fn tokens(&self) -> &'a TokenStream {
-        self.input
+    fn tokens(&self) -> &TokenStream2 {
+        &self.input
     }
 }
 
 fn emit_metadata<F>(kind: &str, input: &TokenStream, extra: F)
 where
-    F: FnOnce(&mut MetadataContext<'_>),
+    F: FnOnce(&mut MetadataContext),
 {
     let pile_path = match std::env::var("TRIBLESPACE_METADATA_PILE") {
         Ok(p) if !p.trim().is_empty() => p,
         _ => return,
     };
 
-    let branch_value = match std::env::var("TRIBLESPACE_METADATA_BRANCH") {
-        Ok(b) if !b.trim().is_empty() => b,
+    let scope_value = match std::env::var("TRIBLESPACE_METADATA_COLLECTION_SCOPE") {
+        Ok(scope) if !scope.trim().is_empty() => scope,
         _ => return,
     };
 
-    let branch_id = match parse_branch_id(&branch_value) {
-        Some(id) => id,
+    let collection_scope = match parse_collection_scope(&scope_value) {
+        Some(scope) => scope,
         None => return,
-    };
-
-    let pile = match Pile::open(Path::new(&pile_path)) {
-        Ok(pile) => pile,
-        Err(_) => return,
     };
 
     let signing_key = match metadata_signing_key() {
         Some(key) => key,
-        None => {
-            // Avoid Drop warnings if metadata emission is partially configured.
-            let _ = pile.close();
-            return;
-        }
-    };
-    let mut repo = match Repository::new(pile, signing_key, TribleSet::new()) {
-        Ok(r) => r,
-        Err(_) => return,
-    };
-
-    let mut workspace = match repo.pull(branch_id) {
-        Ok(ws) => ws,
-        Err(_) => {
-            let _ = repo.close();
-            return;
-        }
+        None => return,
     };
 
     let span = invocation_span(input);
-    let mut set = TribleSet::new();
+    let mut fragment = Fragment::empty();
     let entity = fucid();
     let invocation_id = entity.id;
 
-    set += ::triblespace_core::macros::entity! {
+    fragment += ::triblespace_core::macros::entity! {
         &entity @
         invocation::macro_kind: kind,
         invocation::source_range: span
     };
 
     if let Ok(crate_name) = std::env::var("CARGO_PKG_NAME") {
-        set += ::triblespace_core::macros::entity! { &entity @ invocation::crate_name: crate_name };
+        fragment +=
+            ::triblespace_core::macros::entity! { &entity @ invocation::crate_name: crate_name };
     }
 
     if let Ok(dir) = std::env::var("CARGO_MANIFEST_DIR") {
         if !dir.trim().is_empty() {
-            let handle = workspace.put(dir);
-            set +=
+            let handle = fragment.put(dir);
+            fragment +=
                 ::triblespace_core::macros::entity! { &entity @ invocation::manifest_dir: handle };
         }
     }
 
     let tokens = input.to_string();
     if !tokens.is_empty() {
-        let handle = workspace.put(tokens);
-        set += ::triblespace_core::macros::entity! { &entity @ invocation::source_tokens: handle };
+        let handle = fragment.put(tokens);
+        fragment +=
+            ::triblespace_core::macros::entity! { &entity @ invocation::source_tokens: handle };
     }
 
-    if set.is_empty() {
-        let _ = repo.close();
-        return;
-    }
+    let mut context = MetadataContext {
+        fragment,
+        invocation_id,
+        input: TokenStream2::from(input.clone()),
+    };
+    extra(&mut context);
 
-    workspace.commit(set, "macro invocation");
-
-    {
-        let mut context = MetadataContext {
-            workspace: &mut workspace,
-            invocation_id,
-            input,
-        };
-        extra(&mut context);
-    }
-
-    let _ = repo.push(&mut workspace);
-
-    drop(workspace);
-    let _ = repo.close();
+    // Build the complete self-contained fragment before opening storage. The
+    // collection facade then publishes exactly one immutable COMMIT; there is
+    // no mutable branch head, parent selection, push, or retry protocol here.
+    publish_metadata(
+        Path::new(&pile_path),
+        collection_scope,
+        signing_key,
+        context.fragment,
+    );
 }
 
 struct AttributeDefinition {
@@ -225,6 +224,7 @@ impl Parse for AttributeDefinitions {
             }
 
             let id: LitStr = input.parse()?;
+            input.parse::<Token![unsafe]>()?;
             input.parse::<Token![as]>()?;
             if input.peek(Token![pub]) {
                 let _: Visibility = input.parse()?;
@@ -240,14 +240,12 @@ impl Parse for AttributeDefinitions {
     }
 }
 
-fn emit_attribute_definitions(context: &mut MetadataContext<'_>) {
+fn emit_attribute_definitions(context: &mut MetadataContext) {
     use triblespace_core::inline::encodings::genid::GenId;
     use triblespace_core::metadata;
     use triblespace_core::prelude::InlineEncoding;
 
-    let Ok(parsed) =
-        syn::parse2::<AttributeDefinitions>(TokenStream2::from(context.tokens().clone()))
-    else {
+    let Ok(parsed) = syn::parse2::<AttributeDefinitions>(context.tokens().clone()) else {
         return;
     };
     if parsed.entries.is_empty() {
@@ -264,8 +262,8 @@ fn emit_attribute_definitions(context: &mut MetadataContext<'_>) {
             continue;
         };
 
-        let name_handle = context.workspace().put(definition.name.to_string());
-        let mut set = ::triblespace_core::macros::entity! {
+        let name_handle = context.fragment().put(definition.name.to_string());
+        let mut definition_fragment = ::triblespace_core::macros::entity! {
             &entity @
             metadata::attribute: GenId::inline_from(attr_id),
             metadata::name: name_handle,
@@ -275,12 +273,12 @@ fn emit_attribute_definitions(context: &mut MetadataContext<'_>) {
 
         let ty_tokens = definition.ty.to_token_stream().to_string();
         if !ty_tokens.is_empty() {
-            let handle = context.workspace().put(ty_tokens);
-            set +=
+            let handle = context.fragment().put(ty_tokens);
+            definition_fragment +=
                 ::triblespace_core::macros::entity! { &entity @ attribute::attribute_type: handle };
         }
 
-        context.workspace().commit(set, "macro invocation");
+        *context.fragment() += definition_fragment;
     }
 }
 
@@ -495,5 +493,140 @@ pub fn value_formatter(attr: TokenStream, item: TokenStream) -> TokenStream {
     match value_formatter_impl(TokenStream2::from(attr), TokenStream2::from(item)) {
         Ok(tokens) => TokenStream::from(tokens),
         Err(err) => err.to_compile_error().into(),
+    }
+}
+
+#[cfg(test)]
+mod instrumentation_tests {
+    use super::*;
+
+    use std::fs::File;
+
+    use triblespace_core::blob::encodings::longstring::LongString;
+    use triblespace_core::blob::Blob;
+    use triblespace_core::collection::{self, CollectionRecord, CollectionStore};
+    use triblespace_core::inline::encodings::hash::Handle;
+    use triblespace_core::repo::{BlobStore, BlobStoreGet, StorageClose};
+
+    fn id(byte: u8) -> Id {
+        Id::new([byte; 16]).unwrap()
+    }
+
+    #[test]
+    fn collection_scope_uses_exact_non_nil_hex_ids() {
+        let encoded = "01010101010101010101010101010101";
+        assert_eq!(parse_collection_scope(encoded), Some(id(1)));
+        assert_eq!(parse_collection_scope(&encoded.to_lowercase()), Some(id(1)));
+        assert_eq!(
+            parse_collection_scope("00000000000000000000000000000000"),
+            None
+        );
+        assert_eq!(
+            parse_collection_scope("0x01010101010101010101010101010101"),
+            None
+        );
+        assert_eq!(parse_collection_scope("01"), None);
+    }
+
+    #[test]
+    fn attribute_metadata_joins_the_invocation_fragment_with_its_attachments() {
+        let invocation_entity = fucid();
+        let mut fragment = Fragment::empty();
+        fragment += triblespace_core::macros::entity! {
+            &invocation_entity @ invocation::macro_kind: "attributes"
+        };
+        let mut context = MetadataContext {
+            fragment,
+            invocation_id: invocation_entity.id,
+            input: quote! {
+                "11111111111111111111111111111111" unsafe as pub first: FirstEncoding;
+                "22222222222222222222222222222222" unsafe as second: SecondEncoding;
+            },
+        };
+
+        emit_attribute_definitions(&mut context);
+
+        let facts = context.fragment.facts();
+        assert_eq!(
+            facts
+                .iter()
+                .filter(|fact| fact.a() == &triblespace_core::metadata::attribute.id())
+                .count(),
+            2
+        );
+        assert_eq!(
+            facts
+                .iter()
+                .filter(|fact| fact.a() == &attribute::invocation.id())
+                .count(),
+            2
+        );
+
+        let handles = facts
+            .iter()
+            .filter(|fact| {
+                fact.a() == &triblespace_core::metadata::name.id()
+                    || fact.a() == &attribute::attribute_type.id()
+            })
+            .map(|fact| *fact.v::<Handle<LongString>>())
+            .collect::<Vec<_>>();
+        assert_eq!(handles.len(), 4);
+
+        let mut blobs = context.fragment.blobs().clone();
+        let reader = blobs.reader().unwrap();
+        for handle in handles {
+            let _: Blob<LongString> = reader.get(handle).unwrap();
+        }
+    }
+
+    #[test]
+    fn publication_emits_one_signed_commit_with_self_contained_attachments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("instrumentation.pile");
+        File::create(&path).unwrap();
+
+        let entity = fucid();
+        let mut fragment = Fragment::empty();
+        let attachment = fragment.put("fn example() {}".to_owned());
+        fragment += triblespace_core::macros::entity! {
+            &entity @
+            invocation::macro_kind: "entity",
+            invocation::source_tokens: attachment
+        };
+
+        let scope = id(9);
+        publish_metadata(&path, scope, SigningKey::from_bytes(&[7; 32]), fragment);
+
+        let mut pile = Pile::open(&path).unwrap();
+        let records = CollectionStore::records(&mut pile)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(records.len(), 2, "one definition and one commit");
+
+        let definition = records
+            .iter()
+            .find_map(|record| match record {
+                CollectionRecord::Definition(definition) => Some(*definition),
+                _ => None,
+            })
+            .expect("collection definition");
+        let commit = records
+            .iter()
+            .find_map(|record| match record {
+                CollectionRecord::Commit(commit) => Some(*commit),
+                _ => None,
+            })
+            .expect("single collection commit");
+        assert_eq!(
+            definition,
+            collection::simplearchive_union::definition(scope)
+        );
+        assert_eq!(commit.collection(), definition.id());
+        commit.verify_strict().unwrap();
+
+        let reader = pile.reader().unwrap();
+        let _: Blob<LongString> = reader.get(attachment).unwrap();
+        StorageClose::close(pile).unwrap();
     }
 }
