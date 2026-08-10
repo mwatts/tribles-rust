@@ -898,6 +898,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Index recipes ignore blobs carried only by their schema metafacts.** Recipe
+  validation still rejects blob-backed descriptor facts, but automatic
+  `entity!` attribute descriptions no longer make an otherwise inline,
+  single-root recipe invalid.
+
 - **Conservative TribleSet handle scans now read the value column.**
   `potential_handles` previously traversed the VAE index but interpreted the
   canonical leaf's leading entity-and-attribute bytes as a handle. It now

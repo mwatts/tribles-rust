@@ -28,7 +28,9 @@ use crate::repo::index_range::{
     convex_union, is_ancestor, validate_exact_frontier_cover, RangeRecord, RangeRecordError,
     RangeValidationError, StoredCommitDag,
 };
-use crate::repo::{BlobStore, BlobStoreGet, BlobStorePut, CommitHandle, PinStore};
+use crate::repo::{
+    potential_handles, BlobStore, BlobStoreGet, BlobStorePut, CommitHandle, PinStore,
+};
 use crate::trible::{Fragment, TribleSet};
 
 pub use crate::repo::index_range::CommitRange;
@@ -529,13 +531,14 @@ impl<K: IndexKind> Manifest<K> {
 
 fn recipe_descriptor<K: IndexKind>(kind: &K) -> Result<(Id, TribleSet), ManifestError> {
     let fragment = kind.recipe_fragment();
-    if !fragment.blobs().is_empty() {
-        return Err(ManifestError::InvalidRecipeFragment);
-    }
     let recipe = fragment
         .root()
         .ok_or(ManifestError::InvalidRecipeFragment)?;
-    let facts = fragment.into_facts();
+    let (_, facts, _, mut blobs) = fragment.into_parts();
+    blobs.keep(potential_handles(&facts));
+    if !blobs.is_empty() {
+        return Err(ManifestError::InvalidRecipeFragment);
+    }
     if facts.iter().any(|fact| *fact.e() != recipe) {
         return Err(ManifestError::InvalidRecipeFragment);
     }
