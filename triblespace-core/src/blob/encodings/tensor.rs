@@ -232,6 +232,14 @@ impl<T: TensorElement, const RANK: usize> TryFromBlob<Tensor<T, RANK>> for Tenso
         if bytes[0..16] != TENSOR_MAGIC {
             return Err(TensorError::NotATensor);
         }
+        // Checked on the READ side too, not only where blobs are built. The
+        // write guard makes this look safe without making it safe: the dim
+        // loop indexes `HEADER_PREAMBLE + i * 8`, so an over-large RANK would
+        // run off the fixed header and read payload bytes as dimensions, or
+        // panic. A caller can name any RANK it likes.
+        if RANK > MAX_RANK {
+            return Err(TensorError::RankTooLarge { rank: RANK });
+        }
         let rank = u64::from_le_bytes(bytes[16..24].try_into().expect("8 bytes")) as usize;
         if rank != RANK {
             return Err(TensorError::RankMismatch { expected: RANK, found: rank });
@@ -428,6 +436,29 @@ mod tests {
         let err = <TensorView as TryFromBlob<Tensor<F32, 3>>>::try_from_blob(wrong)
             .expect_err("must refuse");
         assert_eq!(err, TensorError::RankMismatch { expected: 3, found: 2 });
+    }
+
+    /// The fixed header holds 29 dims: `(256 - 24) / 8`, the 24 being the
+    /// magic plus the rank field. Beyond that a tensor is refused on BOTH
+    /// sides — reading included, because the dim loop would otherwise walk off
+    /// the header into the payload and read it as dimensions.
+    #[test]
+    fn a_rank_the_header_cannot_hold_is_refused_both_ways() {
+        assert_eq!(MAX_RANK, 29);
+        // the largest rank that fits still works
+        assert!(tensor_blob::<F32, 29>([1; 29], payload(4)).is_ok());
+
+        let err = tensor_blob::<F32, 30>([1; 30], payload(4)).expect_err("write refuses");
+        assert_eq!(err, TensorError::RankTooLarge { rank: 30 });
+
+        // and a blob that claims rank 30 cannot be read into one either
+        let mut raw = vec![0u8; TENSOR_HEADER_LEN + 4];
+        raw[0..16].copy_from_slice(&TENSOR_MAGIC);
+        raw[16..24].copy_from_slice(&30u64.to_le_bytes());
+        let blob: Blob<Tensor<F32, 30>> = Blob::new(Bytes::from_source(raw));
+        let err = <TensorView as TryFromBlob<Tensor<F32, 30>>>::try_from_blob(blob)
+            .expect_err("read refuses");
+        assert_eq!(err, TensorError::RankTooLarge { rank: 30 });
     }
 
     #[test]
