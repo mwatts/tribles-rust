@@ -52,17 +52,32 @@ pub const TENSOR_MAGIC: [u8; 16] = [
     0x4A, 0x49, 0x83, 0xDC, 0x8C, 0xBD, 0x82, 0xD0, 0x87, 0xB7, 0x7B, 0x20, 0x56, 0x41, 0x0D, 0x0C,
 ];
 
-/// Fixed header length, and therefore the payload's offset.
+/// Header width, chosen so the TENSOR that follows it is 256-byte aligned.
 ///
-/// 256 rather than "as long as the dims need" so the payload lands at a
-/// constant offset AND stays 256-aligned within a pile record — whose data
-/// already begins at a 256 boundary. A rank-dependent header would put every
-/// tensor's payload at a different alignment and forfeit zero-copy GPU
-/// aliasing for the sake of a few dozen bytes.
+/// The alignment is a chain, and every link has to hold:
+///
+/// * a V3 pile record's data begins at `record_start + 256`, and every record
+///   is a 256-multiple, so a blob's first byte is 256-aligned;
+/// * this header is 256 wide, so the payload begins 256 bytes later;
+/// * therefore the payload is 256-aligned in the file, which is what CUDA and
+///   Metal want for a zero-copy storage-buffer binding.
+///
+/// A header sized to fit the dims would break the second link and put every
+/// tensor's payload at a different alignment — saving a few dozen bytes and
+/// costing the property the whole 256 story exists for. At rank 3, 232 of
+/// these bytes are spare.
 pub const TENSOR_HEADER_LEN: usize = 256;
 
 /// Largest rank the fixed header can hold: `(256 - 24) / 8`.
 pub const MAX_RANK: usize = 29;
+
+/// Every header field is 64-bit, so each sits at a naturally aligned offset by
+/// construction rather than because the arithmetic happens to work out. There
+/// is no reason to economise: 232 of the 256 bytes are spare at rank 3, and a
+/// 32-bit field would buy four bytes in exchange for a layout whose alignment
+/// has to be reasoned about — in a header that exists to be read zero-copy off
+/// a 256-aligned pile record.
+const HEADER_PREAMBLE: usize = 24;
 
 /// An element format, including what it costs to store.
 ///
@@ -196,11 +211,11 @@ pub fn tensor_blob<T: TensorElement, const RANK: usize>(
 
     let mut bytes = Vec::with_capacity(TENSOR_HEADER_LEN + payload.len());
     bytes.extend_from_slice(&TENSOR_MAGIC);
-    bytes.extend_from_slice(&(RANK as u32).to_le_bytes());
-    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&(RANK as u64).to_le_bytes());
     for d in dims {
         bytes.extend_from_slice(&d.to_le_bytes());
     }
+    debug_assert_eq!(bytes.len(), HEADER_PREAMBLE + RANK * 8);
     bytes.resize(TENSOR_HEADER_LEN, 0);
     bytes.extend_from_slice(&payload);
     Ok(Blob::new(Bytes::from_source(bytes)))
@@ -217,13 +232,13 @@ impl<T: TensorElement, const RANK: usize> TryFromBlob<Tensor<T, RANK>> for Tenso
         if bytes[0..16] != TENSOR_MAGIC {
             return Err(TensorError::NotATensor);
         }
-        let rank = u32::from_le_bytes(bytes[16..20].try_into().expect("4 bytes")) as usize;
+        let rank = u64::from_le_bytes(bytes[16..24].try_into().expect("8 bytes")) as usize;
         if rank != RANK {
             return Err(TensorError::RankMismatch { expected: RANK, found: rank });
         }
         let mut dims = Vec::with_capacity(rank);
         for i in 0..rank {
-            let at = 24 + i * 8;
+            let at = HEADER_PREAMBLE + i * 8;
             dims.push(u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes")));
         }
         let elems: u64 = dims.iter().product();
@@ -363,6 +378,38 @@ mod tests {
         assert_eq!(F32::payload_len(32), 128, "a dense format is just its elements");
     }
 
+    /// Measured against Inkling-Small, whose 78 quantised tensors are each
+    /// rank-3 `[256, 4096, 2048]` with `scale [256, 4096, 256]` and
+    /// `scale2 [256]`. That is 256 INDEPENDENT expert tensors stacked, not one
+    /// tensor with 256 global scales — data, scales and scale2 all slice
+    /// cleanly on the outermost dimension. So one expert is a rank-2 NVFP4
+    /// tensor with a single global scale, which is what this encoding models.
+    ///
+    /// Storing them per-expert is also what makes a checkpoint shareable: a
+    /// node fetches the experts it holds rather than a 12 GiB slab it either
+    /// has or does not.
+    #[test]
+    fn one_inkling_expert_is_a_rank_2_nvfp4_tensor() {
+        let (rows, cols) = (4096usize, 4096usize);
+        let elems = rows * cols;
+        let packed = elems / 2;
+        let block_scales = elems / NVFP4_BLOCK;
+        assert_eq!(packed, 4096 * 2048, "matches the checkpoint's packed last dim");
+        assert_eq!(block_scales, 4096 * 256, "matches the scale tensor's last dim");
+        assert_eq!(
+            NVFP4::payload_len(elems),
+            packed + block_scales + 4,
+            "one expert carries one global scale"
+        );
+        let blob = tensor_blob::<NVFP4, 2>(
+            [rows as u64, cols as u64],
+            payload(NVFP4::payload_len(elems)),
+        )
+        .expect("well formed");
+        let view: TensorView = blob.try_from_blob().expect("decodes");
+        assert_eq!(view.dims(), &[4096, 4096], "logical, not the packed 2048");
+    }
+
     /// A payload that does not match the dims is refused where it is cheap to
     /// refuse. Accepted, it would read later as a differently-shaped tensor and
     /// produce plausible numbers rather than an error.
@@ -393,6 +440,21 @@ mod tests {
 
     /// The payload begins at a constant offset regardless of rank, so it keeps
     /// the 256 alignment a pile record already gives its data.
+    /// Every header field is 8-aligned by construction, and the rank the
+    /// header can hold is exactly what the preamble leaves room for.
+    #[test]
+    fn the_header_is_uniformly_64_bit() {
+        assert_eq!(HEADER_PREAMBLE % 8, 0, "dims start 8-aligned");
+        assert_eq!(TENSOR_MAGIC.len() % 8, 0, "so does the rank field after the magic");
+        assert_eq!(MAX_RANK, (TENSOR_HEADER_LEN - HEADER_PREAMBLE) / 8);
+        let blob = tensor_blob::<F32, 3>([2, 3, 4], payload(2 * 3 * 4 * 4)).expect("ok");
+        assert_eq!(
+            u64::from_le_bytes(blob.bytes[16..24].try_into().unwrap()),
+            3,
+            "rank is a full 64-bit field"
+        );
+    }
+
     #[test]
     fn the_payload_offset_does_not_depend_on_rank() {
         assert_eq!(TENSOR_HEADER_LEN % 256, 0);
