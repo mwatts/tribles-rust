@@ -13,10 +13,10 @@ use ed25519_dalek::SigningKey;
 use rand_core06::OsRng;
 use thread_local::ThreadLocal;
 use tracing::Subscriber;
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::EnvFilter;
 
 const ENV_TELEMETRY_PILE: &str = "TELEMETRY_PILE";
 const ENV_PILE: &str = "PILE";
