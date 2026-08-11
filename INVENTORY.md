@@ -202,12 +202,6 @@ prioritized for efficient zero-copy access.
 - Add a FAQ chapter to the book summarising common questions.
 
 ## Discovered Issues
-- Wire strong collection retention into a higher-level compaction owner with a
-  durable local policy for authorized commit signers. The planner derives its
-  collections from admitted `COMMIT`s and `RetentionRoots` remains an ephemeral
-  pure result; until every future Pile/Yard collection pass recomputes and
-  supplies those roots, migration must keep its final legacy strong pin rather
-  than tombstoning the only independently recurring root.
 - Add a separate bounded cache planner for useful unsigned `MERGE`/`DERIVE`
   equations and materialized results. Strong retention intentionally ignores
   them—even when accepted and active—so append-only cache work cannot

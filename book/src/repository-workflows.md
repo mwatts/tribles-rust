@@ -21,9 +21,9 @@ Tribles.
 
 Applications that only need to publish independent facts do not need to mint a
 branch or select a mutable head. `Collection<S>` is the narrow publication
-facade for that case. It combines a storage backend, a stable dataset scope,
-and a signing key; every call to `Collection::commit(Fragment)` publishes one
-independent signed membership assertion:
+facade for that case. It combines a storage backend, one canonical collection
+descriptor, and a signing key; every call to `Collection::commit(Fragment)`
+publishes one independent signed membership assertion:
 
 ```rust,ignore
 use triblespace::prelude::{Collection, Fragment};
@@ -36,20 +36,29 @@ let facts = collection.materialize()?;
 let storage = collection.into_storage();
 ```
 
+A collection descriptor is a canonical `SimpleArchive` containing exactly the
+dataset **scope**, blob **representation**, and algebraic **recipe**. Its
+32-byte content handle is the `CollectionId`. `COMMIT`, `MERGE`, and `DERIVE`
+records carry descriptor handles directly, so any claim can resolve and verify
+its own collection semantics through the ordinary blob store. There is no
+separate definition record or registry whose synchronization could make an
+otherwise complete claim ambiguous. `Collection::new` constructs the canonical
+`SimpleArchive`-union descriptor for the supplied scope.
+
 The fragment remains self-contained across the publication boundary: its facts
 become the collection's canonical `SimpleArchive` data element, its metafacts
 become the commit's canonical metadata archive, and attachments from its shared
 blob store are copied alongside those two archives. Publication flushes all
-dependencies before inserting the signed commit record. Identical retries are
-idempotent, while distinct commits coexist; there is no branch head, CAS retry,
-or implied "latest" member.
+dependencies, including the descriptor blob, before inserting the signed
+commit record. Identical retries are idempotent, while distinct commits
+coexist; there is no branch head, CAS retry, or implied "latest" member.
 
 When the backend also provides a blob reader with metadata lookup,
 `Collection::materialize()` returns the complete known union of commits signed
 by the facade's own key for this exact scoped collection. Commits signed by
 other keys are not admitted. A failed signature authenticates none of its
 record fields and is therefore an inert diagnostic, never an owner-attributed
-veto. Every strictly verified own commit is ground truth: its definition, data
+veto. Every strictly verified own commit is ground truth: its descriptor, data
 archive, and exact metadata archive must all validate or the read fails instead
 of silently returning a partial set. Valid resident `MERGE` records may provide
 a compact physical cover. Validation is the intersection of two reachability
@@ -83,7 +92,8 @@ configured object-store prefix, each record is a create-only object at
 canonical `SimpleArchive`. Listing is an observed monotone view rather than a
 global snapshot: a concurrent immutable insert may appear on this list or the
 next, but any observed object is decoded and checked against the ID in its
-path.
+path. Descriptor blobs use the ordinary blob namespace; `CollectionStore`
+contains only `COMMIT`, `MERGE`, and `DERIVE`.
 
 This collection path coexists with the branch-oriented `Repository` and
 `Workspace` APIs documented below. Native collection records are not pin

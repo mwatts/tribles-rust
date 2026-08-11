@@ -41,20 +41,24 @@ has two sorts:
   conservative traversal.
 
 Strong collection retention follows only signed ground truth. For every
-locally authorized, admitted `COMMIT`, its collection definition and canonical
-commit record are direct roots. The commit's signed data and metadata are
-recursive roots, so their resident attachments remain owned. Planning fails if
-any required definition, data, or metadata blob is absent.
+locally authorized, admitted `COMMIT`, the descriptor, signed data, and metadata
+handles are recursive roots, so all of their resident attachments remain
+owned. The descriptor is the canonical `(scope, representation, recipe)`
+`SimpleArchive`; its 32-byte content handle is the `CollectionId` carried by
+the commit. The native commit record is preserved by `CollectionStore` rather
+than represented as a blob root. Planning fails if any required descriptor,
+data, or metadata blob is absent.
 
 Unsigned `MERGE` and `DERIVE` records are reproducible cache work. They add no
 strong roots even when validation accepts them and their equations are active;
-their records, intermediate inputs, results, and derived collection
-definitions may all be collected. A future cache planner can choose useful
-equations or materializations under a separate budget without letting
-append-only unsigned claims manufacture durable ownership. This boundary also
-means the strong planner needs neither a requested-view set nor persistent
-validation-verdict machinery: admitted commits themselves determine the
-collections that are retained.
+their named inputs, results, and otherwise-unowned descriptor blobs may all be
+collected. Conservative Pile and Yard rewrites preserve the equation records
+themselves as immutable ledger evidence, but that preservation creates no blob
+ownership edge. A future cache planner can choose useful materializations under
+a separate budget without letting append-only unsigned claims manufacture
+durable ownership. This boundary also means the strong planner needs neither a
+requested-view set nor persistent validation-verdict machinery: admitted
+commits themselves determine the collections that are retained.
 
 The resulting roots compose with both storage paths. Yard's `collect` and
 `compact` require them as explicit policy roots; callers pass an empty
@@ -69,22 +73,24 @@ permanently poisoning local retention. Caller-supplied `RetentionRoots` keep
 their existing backend semantics; in particular, a retained Pile rewrite still
 fails loud when an explicitly selected blob is absent.
 
-The Pile rewrite also recursively retains and recreates every active legacy
-strong-pin mapping, which allows pinned branches and collection scopes to
-coexist during migration. Current `LocalCellStore` values are also recursive
-local roots and are recreated by retained pile rewrites. That keeps operational
-policy alive without granting collection authority or exposing a branch to
-gossip. Weak wants are an explicit rewrite choice. Preserving
+The Pile rewrite also recursively retains and recreates every active branch
+pin. Legacy V3 collection records are different: their 16-byte definition
+identities predate descriptor handles, so they are preserved byte-for-byte as
+inert physical evidence but grant no current collection authority and own no
+blobs. Current `LocalCellStore` values are recursive local roots and are
+recreated by retained pile rewrites. That keeps operational policy alive
+without granting collection authority or exposing a branch to gossip. Weak
+wants are an explicit rewrite choice. Preserving
 them copies their demand markers but does not promote the requested blob to an
 ownership root; dropping them omits the markers entirely.
 
 `RetentionRoots` is deliberately a pure, ephemeral plan rather than a retained
-scope registry. Every later collection or rewrite must rediscover records,
-apply the local signer/authorization policy, resolve the claims, and supply a
-fresh plan for all admitted commits. Do not remove the last legacy strong pin
-for a dataset until a higher-level service durably owns that recurring policy.
-It is safe to publish and validate the collection while leaving the pin in
-place during this transition; both root sources compose idempotently.
+collection registry. Every later collection or rewrite must rediscover
+records, apply the local signer/authorization policy, resolve the claims, and
+supply a fresh plan for all admitted commits. Ordinary Pile and Yard rewrites
+independently apply the conservative rule above: preserve every native record,
+then recursively retain the resident descriptor, data, and metadata closure of
+every strictly verified current `COMMIT`.
 
 ## Conservative Reachability
 

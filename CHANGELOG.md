@@ -101,21 +101,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   public format has a freshly minted schema ID.
 - **Signed collection commits can be prepared and staged before visibility.**
   The `SimpleArchive` union kind can now construct the exact canonical commit
-  entirely in memory, durably stage its attachments, definition, data, and
+  entirely in memory, durably stage its attachments, descriptor, data, and
   metadata while withholding the record, permit caller-owned unsigned cache
   artifacts in between, and consume the staged value to append and flush the
   signed `COMMIT` last. Abandonment is deliberately inert: unrooted staged
   dependencies remain undiscoverable as membership and produce no retention
   roots.
 - **Collection algebra records now have a native grow-only storage surface.**
-  `CollectionStore` admits intrinsically identified `Definition`, signed
-  `COMMIT`, `MERGE`, and `DERIVE` records without a mutable head, CAS,
-  tombstone, or branch cell. Pile stores each kind as one fixed 256-byte V3
-  record and replays their set union in intrinsic-id order; object-store
-  remotes use immutable `collection-records/<id>` objects and validate both
-  canonical bytes and path identity. Memory, hybrid, lazy, blocking-async, and
-  generational Yard adapters preserve the same idempotent algebra, including
-  across cat/reopen/reclaim boundaries.
+  `CollectionStore` admits intrinsically identified signed `COMMIT` and
+  unsigned `MERGE` and `DERIVE` records without a mutable head, CAS, tombstone,
+  or branch cell. A canonical `SimpleArchive` descriptor carries
+  `(scope, representation, recipe)` and its 32-byte content handle is the sole
+  `CollectionId`; every record names descriptor handles directly, so there is
+  no definition record or registry. Pile stores each equation as one fixed
+  256-byte V4 record and replays their set union in intrinsic-id order;
+  object-store remotes use immutable `collection-records/<id>` objects and
+  validate both canonical bytes and path identity. Memory, hybrid, lazy,
+  blocking-async, and generational Yard adapters preserve the same idempotent
+  algebra, including across cat/reopen/reclaim boundaries. Legacy V3
+  definition/16-byte-ID records remain recognizable for safe replay and
+  conservative rewriting but are semantically inert.
 - **`Collection<S>` is the narrow Fragment-native owned facade.** Pure
   construction binds one scope and signing key; `commit(fragment)` archives
   facts as data, metafacts as signed metadata, persists the shared attachment
@@ -141,10 +146,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collection facades can safely borrow one already-open backend in sequence;
   no second open, close/reopen refresh, or special multi-collection session is
   required.
-- **Collection retention is now an explicit two-edge policy rather than a
-  blind hash walk.** Native collection records live outside the blob root set.
+- **Collection retention now follows signed ownership rather than a blind hash
+  walk.** Native collection records live outside the blob root set.
   Conservative Pile/Yard rewrites preserve every native record and recursively
-  retain every signed COMMIT's data, metadata, and resident attachment closure;
+  retain every signed COMMIT's descriptor, data, metadata, and resident
+  attachment closure;
   unsigned `MERGE` and `DERIVE` endpoints remain descriptive, reproducible cache
   work rather than ownership edges. The policy-aware planner can still narrow
   this to locally authorized, admitted COMMIT ground truth for an explicit
@@ -154,7 +160,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   materializer.** It probes residency only for known semantic members, selects
   the deterministic overlap-aware physical cover, reports uncovered frontier
   obligations before fetching, and decodes the selected archives into one
-  `TribleSet`. Definition, metadata, fetch, missing-cover, and archive failures
+  `TribleSet`. Descriptor, metadata, fetch, missing-cover, and archive failures
   remain distinct without reintroducing repositories, heads, catalogs, or
   authorization policy.
 - **Durable Ed25519 key files now have one strict core utility.** Callers can
@@ -183,7 +189,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or cached handles before writing.
 - **Canonical collection records can be published with explicit crash-order
   barriers.** The concrete `SimpleArchive` union kind now normalizes and
-  validates supplied bytes, flushes definitions and element dependencies
+  validates supplied bytes, flushes descriptor and element dependencies
   before writing a signed `COMMIT` or exact `MERGE`, and flushes the record
   before returning. Completed operation prefixes leave only inert dependencies
   or a record whose dependencies were already durable. Replay after any
@@ -191,7 +197,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   repository transaction layer.
 - **Discovered collection records now resolve through a stateless production
   semantic layer.** Callers select eligible self-signed commits and validate
-  definition-matched `COMMIT`, `MERGE`, and `DERIVE` claims through one narrow
+  descriptor-bound `COMMIT`, `MERGE`, and `DERIVE` claims through one narrow
   callback. Accepted equations are checked for deterministic functional
   conflicts before a least membership fixed point produces members, maximal
   frontiers, and on-demand supporting-commit provenance without a persistent
@@ -200,22 +206,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compactions, while never substituting source-representation bytes across a
   derivation.
 - **The first production collection kind is canonical `SimpleArchive`
-  TribleSet union.** `collection::simplearchive_union` constructs definitions,
+  TribleSet union.** `collection::simplearchive_union` constructs descriptors,
   validates commit and merge endpoints against freshly computed Blake3
   identities, and validates or computes exact set unions directly over sorted
   64-byte rows without constructing PATCH indexes. The version-1 recipe ID
   `6D64C5F4B9E9B73F57C5F8702AB7FE45` was minted with `trible genid` on
   2026-08-07 and names the union law independently of this implementation.
-- **Typed collection records can be discovered without a catalog or storage
-  extension.** The top-level `triblespace_core::collection` module publishes
-  the canonical archive lengths and scans ordinary `BlobStoreList` metadata,
-  fetching only candidate sizes before one `SimpleArchive` decode dispatches
-  by `metadata::tag`. Definitions and unsigned `MERGE`/`DERIVE` claims are
-  returned in intrinsic-id order; signed `COMMIT` records are included only
-  after strict Ed25519 self-signature verification, leaving key authorization
-  to caller policy. Unknown kinds and unrelated blob noise remain invisible,
-  while malformed candidate-sized known kinds and invalid signatures carry
-  handle-addressed diagnostics and list/get failures remain hard errors.
+- **Typed collection records can be discovered without a catalog.** The
+  top-level `triblespace_core::collection` module enumerates structurally
+  canonical `COMMIT`, `MERGE`, and `DERIVE` values from `CollectionStore` and
+  returns them in intrinsic-id order. Signed commits are included only after
+  strict Ed25519 self-signature verification, leaving key authorization to
+  caller policy; invalid signatures remain diagnostics and structural storage
+  failures remain hard errors. Descriptor bytes resolve through the ordinary
+  blob store by the exact handles carried in claims, not through discovery or a
+  definition registry.
 - **The collection calculus has a wire-format-neutral executable test oracle.**
   The bounded reference model folds accepted signed `COMMIT` leaves, exact
   unsigned `MERGE`, and canonical unsigned `DERIVE` relations to their least
@@ -986,12 +991,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Pile and Yard retention now authenticate native commit ownership before
   rooting blobs.** A structurally decodable but invalidly signed `COMMIT`
   remains preserved as an immutable collection record, while none of its
-  attacker-controlled data or metadata fields affect retention. Valid commits
-  recursively retain only dependencies resident in the rewrite's coherent
-  source snapshot or live in the Yard, so partially synchronized dangling
-  commits remain available for later synchronization without poisoning local
-  retention. Caller-supplied `RetentionRoots`, strong pins, and local cells
-  retain their existing backend-specific missing-data behavior.
+  attacker-controlled descriptor, data, or metadata fields affect retention.
+  Valid commits recursively retain only dependencies resident in the rewrite's
+  coherent source snapshot or live in the Yard, so partially synchronized
+  dangling commits remain available for later synchronization without
+  poisoning local retention. Caller-supplied `RetentionRoots`, strong pins,
+  and local cells retain their existing backend-specific missing-data behavior.
 
 - **Index recipes ignore blobs carried only by their schema metafacts.** Recipe
   validation still rejects blob-backed descriptor facts, but automatic

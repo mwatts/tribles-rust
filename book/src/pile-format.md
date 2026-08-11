@@ -15,26 +15,27 @@ narrow usage pattern keeps these failure modes manageable. Appends happen
 sequentially and validation walks new bytes before readers observe them, so the
 memory map never exposes half-written records.
 
-## Record model: uniform 256-byte records (V3)
+## Record model: uniform 256-byte framing
 
-Every record the pile writes today — blob, native collection definition,
-collection commit, collection merge, collection derive, branch (pin) head,
-branch tombstone, local-cell value, local-cell tombstone, want assertion, or
-want retraction — uses the **V3** layout:
-a fixed **256-byte header**, followed (for blobs) by the payload, padded so the
-whole record is a **256-byte multiple**. Want records retain their historical
-weak-pin/weak-unpin magic markers for byte compatibility; those are physical
-format names, not the public storage model. This uniformity is load-bearing:
+Every record the pile writes today uses a fixed **256-byte header**, followed
+(for blobs) by the payload, padded so the whole record is a **256-byte
+multiple**. Blob, branch, local-cell, and want records retain their V3 markers;
+current native collection equations use V4 markers because they carry 32-byte
+descriptor handles. A collection descriptor itself is an ordinary blob, not a
+fourth collection-record kind. Want records likewise retain their historical
+weak-pin/weak-unpin markers for byte compatibility; those are physical format
+names, not the public storage model. The common framing is load-bearing:
 
 - **Position independence.** Blob data starts at the constant
   `record_start + 256`; there is no offset-derived padding. A record means
   the same thing at any offset, so records survive relocation and
   `cat a.pile >> b.pile` is a valid merge of two piles.
-- **Alignment for free.** Because every record is a 256-byte multiple, a
-  pure-V3 pile stays 256-aligned throughout under the atomic lock-free
-  append — every blob's payload lands on a 256-byte boundary, satisfying GPU
-  storage-buffer binding requirements (CUDA / Metal
-  `min_storage_buffer_offset_alignment`) for zero-copy aliasing.
+- **Alignment for free.** Because every newly written record is a 256-byte
+  multiple, a pile composed entirely of current 256-byte-framed records stays
+  aligned under the atomic lock-free append. Every blob payload in such a pile
+  lands on a 256-byte boundary, satisfying GPU storage-buffer binding
+  requirements (CUDA / Metal `min_storage_buffer_offset_alignment`) for
+  zero-copy aliasing.
 - **Cache-friendly headers.** Each header begins on a cache-line boundary and
   admits safe typed views with the `zerocopy` crate.
 
@@ -43,10 +44,10 @@ per-record metadata belongs in tribles, not in the header, so identical bytes
 never fork into distinct blobs.
 
 The reader still accepts the original **V1** records (64-byte-aligned blob,
-branch, and tombstone layouts — see [Legacy V1 records](#legacy-v1-records)),
-so piles written before V3 read byte-identical with no migration step. New
-writes are always V3. The skew direction to watch is the other one. A current
-reader that encounters a complete unknown marker reports
+branch, and tombstone layouts — see [Legacy V1 records](#legacy-v1-records))
+and recognizes the obsolete V3 collection headers described below. New writes
+use the current marker for each record family. A current reader that encounters
+a complete unknown marker reports
 `ReadError::UnsupportedRecord { offset, marker }` and leaves the pile
 untouched; it cannot safely skip or truncate a record whose length it does not
 know. Older binaries predating this distinction may report `CorruptPile`
@@ -245,23 +246,29 @@ explains how to query these fields through the `PileReader` API.
 
 ## Native Collection Records
 
-`CollectionStore` is a grow-only set of canonical collection-calculus records.
-The pile stores its four record kinds directly as fixed 256-byte V3 records;
-they are **not blob records**, have no following payload, and carry no
-insertion timestamp. They are also distinct from mutable branch pins and local cells
+`CollectionStore` is a grow-only set of canonical collection-calculus records:
+signed `COMMIT` assertions and unsigned `MERGE` and `DERIVE` equations. The
+pile stores these three kinds directly as fixed 256-byte V4 records. They are
+**not blob records**, have no following payload, and carry no insertion
+timestamp. They are also distinct from mutable branch pins and local cells
 described below: collection records have no head, tombstone, or
 last-writer-wins update. Their logical key is the record's intrinsic entity ID.
+
+The collection itself is identified by a canonical `SimpleArchive` descriptor
+containing `(scope, representation, recipe)`. Its 32-byte blob handle is the
+sole `CollectionId`. Records carry this handle directly; there is no definition
+record or registry. Consequently a transferred claim names the exact descriptor
+bytes needed to interpret it, using the ordinary blob store.
 
 The magic markers below identify the compact pile representation. They are
 wire-format markers, not the `metadata::tag` IDs found in the equivalent
 canonical `SimpleArchive` entities.
 
-| Kind | V3 magic marker | Exact byte layout |
+| Kind | V4 magic marker | Exact byte layout |
 |---|---|---|
-| Definition | `3BE108504E4F5242FB24AA72D6D94CE1` | `0..16` marker, `16..32` scope ID, `32..48` representation ID, `48..64` recipe ID, `64..256` reserved zeros |
-| Commit | `BB758AA6F79FBFC4D1958592A8956777` | `0..16` marker, `16..32` collection ID, `32..64` data digest, `64..96` metadata handle, `96..128` Ed25519 public key, `128..160` signature R, `160..192` signature S, `192..256` reserved zeros |
-| Merge | `CC0108AC1DF4F335AFA856A529C42BE9` | `0..16` marker, `16..32` collection ID, `32..64` lower input digest, `64..96` higher input digest, `96..128` result digest, `128..256` reserved zeros |
-| Derive | `07ECF056F6F015D94389FFF21F851480` | `0..16` marker, `16..32` source collection ID, `32..48` target collection ID, `48..80` input digest, `80..112` output digest, `112..256` reserved zeros |
+| Commit | `CBF2CF97D52A3486E16C12D70D397C66` | `0..16` marker, `16..48` descriptor handle, `48..80` data digest, `80..112` metadata handle, `112..144` Ed25519 public key, `144..176` signature R, `176..208` signature S, `208..256` reserved zeros |
+| Merge | `9F5D028D4C423620D6957A5F726FA727` | `0..16` marker, `16..48` descriptor handle, `48..80` lower input digest, `80..112` higher input digest, `112..144` result digest, `144..256` reserved zeros |
+| Derive | `ECFB2EE90ED8042244F7BAC704454BB9` | `0..16` marker, `16..48` source descriptor handle, `48..80` target descriptor handle, `80..112` input digest, `112..144` output digest, `144..256` reserved zeros |
 
 Every reserved byte must be zero; a nonzero reserved byte makes replay fail as
 corrupt rather than silently assigning meaning to a format extension. Merge
@@ -284,6 +291,22 @@ semantics for collection records: append order and duplicate copies do not
 change the discovered collection calculus. This order-independent behavior is
 specific to collection records and does not turn the last-writer-wins pin log
 into a set.
+
+### Legacy V3 collection records
+
+V3 encoded a collection by a separate definition record with a 16-byte
+intrinsic entity ID. Its V1 commit signature transcript and equations therefore
+do not identify the current descriptor-handle semantics. The reader recognizes
+all four old markers so it can validate record boundaries and preserve their
+bytes during conservative rewrites, but treats them as inert physical evidence:
+they never enter `CollectionStore`, assert membership, or retain blobs.
+
+| Legacy kind | V3 magic marker | Exact byte layout |
+|---|---|---|
+| Definition | `3BE108504E4F5242FB24AA72D6D94CE1` | `0..16` marker, `16..32` scope ID, `32..48` representation ID, `48..64` recipe ID, `64..256` reserved zeros |
+| Commit | `BB758AA6F79FBFC4D1958592A8956777` | `0..16` marker, `16..32` definition ID, `32..64` data digest, `64..96` metadata handle, `96..128` Ed25519 public key, `128..160` signature R, `160..192` signature S, `192..256` reserved zeros |
+| Merge | `CC0108AC1DF4F335AFA856A529C42BE9` | `0..16` marker, `16..32` definition ID, `32..64` lower input digest, `64..96` higher input digest, `96..128` result digest, `128..256` reserved zeros |
+| Derive | `07ECF056F6F015D94389FFF21F851480` | `0..16` marker, `16..32` source definition ID, `32..48` target definition ID, `48..80` input digest, `80..112` output digest, `112..256` reserved zeros |
 
 ## Pin Records (branch head / tombstone)
 
