@@ -657,9 +657,12 @@ pub enum PileRecordContent {
 /// Decodes the record starting at the beginning of `bytes`, which is the pile
 /// file's content from `offset` onward. This is the single source of truth for
 /// record parsing: [`Pile::refresh`]/[`Pile::amputate`] replay records through
-/// it, and [`PileRecords`] exposes it for raw inspection. An unknown magic
-/// marker or a truncated record yields [`ReadError::CorruptPile`] pointing at
-/// `offset` — never a silent stop.
+/// it, and [`PileRecords`] exposes it for raw inspection. A complete but
+/// unknown magic marker yields
+/// [`ReadError::UnsupportedRecord`] because this reader cannot know the
+/// record's length; a truncated known record yields
+/// [`ReadError::CorruptPile`] pointing at `offset`. Neither case is silently
+/// skipped.
 fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
     let corrupt = || ReadError::CorruptPile {
         valid_length: offset,
@@ -895,7 +898,10 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
                 },
             })
         }
-        _ => Err(corrupt()),
+        _ => Err(ReadError::UnsupportedRecord {
+            offset,
+            marker: magic,
+        }),
     }
 }
 
@@ -999,9 +1005,10 @@ fn indexed_blob_record(
 /// history or forensics (reflogs, consolidation, corruption reports) should
 /// consume this instead of hand-rolling a parser.
 ///
-/// The iterator yields `Err(`[`ReadError::CorruptPile`]`)` and then ends when
-/// it encounters an unknown magic marker or a truncated record — a partial
-/// tail after a crash surfaces as an error, never as a silently shortened
+/// The iterator yields an error and then ends when it encounters an unknown
+/// magic marker or a truncated record. Unknown markers surface as
+/// [`ReadError::UnsupportedRecord`] while malformed or truncated known records
+/// surface as [`ReadError::CorruptPile`]; neither becomes a silently shortened
 /// record list.
 #[derive(Debug)]
 pub struct PileRecords {
@@ -1266,8 +1273,19 @@ pub enum ReadError {
     IoError(std::io::Error),
     /// The pile contains corrupted data starting at `valid_length`.
     CorruptPile {
-        /// Byte offset where the first invalid record was found.
+        /// Byte offset where the first malformed or truncated known record was
+        /// found.
         valid_length: usize,
+    },
+    /// The pile contains a complete magic marker this reader does not know.
+    ///
+    /// The marker may name a record introduced by a newer binary. Its length
+    /// is unknowable to this reader, so it is unsafe to skip or amputate it.
+    UnsupportedRecord {
+        /// Byte offset where the unsupported record begins.
+        offset: usize,
+        /// Unrecognized 16-byte record marker.
+        marker: RawId,
     },
     /// The pile file exceeds the addressable range.
     FileTooLarge {
@@ -1283,6 +1301,11 @@ impl std::fmt::Display for ReadError {
             ReadError::CorruptPile { valid_length } => {
                 write!(f, "Corrupt pile at byte {valid_length}")
             }
+            ReadError::UnsupportedRecord { offset, marker } => write!(
+                f,
+                "Unsupported pile record marker {} at byte {offset}; a newer reader may be required",
+                hex::encode_upper(marker)
+            ),
             ReadError::FileTooLarge { length } => {
                 write!(f, "Pile of length {length} exceeds supported size")
             }
@@ -1293,7 +1316,9 @@ impl std::error::Error for ReadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::IoError(err) => Some(err),
-            Self::CorruptPile { .. } | Self::FileTooLarge { .. } => None,
+            Self::CorruptPile { .. }
+            | Self::UnsupportedRecord { .. }
+            | Self::FileTooLarge { .. } => None,
         }
     }
 }
@@ -1311,6 +1336,10 @@ impl From<ReadError> for std::io::Error {
             ReadError::CorruptPile { valid_length } => {
                 std::io::Error::other(format!("corrupt pile at byte {valid_length}"))
             }
+            ReadError::UnsupportedRecord { offset, marker } => std::io::Error::other(format!(
+                "unsupported pile record marker {} at byte {offset}; a newer reader may be required",
+                hex::encode_upper(marker)
+            )),
             ReadError::FileTooLarge { length } => {
                 std::io::Error::other(format!("pile length {length} exceeds supported size"))
             }
@@ -1509,7 +1538,8 @@ impl Pile {
     /// The returned pile has no in-memory index; callers should invoke
     /// [`Self::refresh`] to load existing data. After a crash left a torn
     /// tail, [`Self::amputate`] loads and **truncates the file at the first
-    /// invalid record** — a destructive last resort, not an open path.
+    /// malformed known record** — a destructive last resort, not an open
+    /// path. Complete unknown markers are refused without truncation.
     pub fn open(path: &Path) -> Result<Self, ReadError> {
         let file = OpenOptions::new().read(true).append(true).open(path)?;
         let length_u64 = file.metadata()?.len();
@@ -1710,17 +1740,17 @@ impl Pile {
         Ok(())
     }
 
-    /// Amputates the pile's tail: **TRUNCATES the file at the first invalid
-    /// record, destroying everything after it.**
+    /// Amputates the pile's tail: **TRUNCATES the file at the first malformed
+    /// or truncated known record, destroying everything after it.**
     ///
     /// This is a last-resort surgical recovery for a torn tail left by a
     /// crashed or interrupted append — never a routine open path. Everything
-    /// past the first record this binary cannot parse is *gone from disk*,
-    /// including data that a newer binary would have read fine (a stale
-    /// binary sees newer record formats as corruption and would amputate
-    /// them). If you are not certain the tail is a torn write, take a copy
-    /// of the file first and prefer the non-mutating [`Self::refresh`],
-    /// which fails loud without touching the file.
+    /// past the malformed record is *gone from disk*. A complete unknown magic
+    /// marker is instead reported as [`ReadError::UnsupportedRecord`] and is
+    /// never truncated, because this reader cannot know the newer record's
+    /// length. If you are not certain the tail is a torn write, take a copy of
+    /// the file first and prefer the non-mutating [`Self::refresh`], which
+    /// fails loud without touching the file.
     ///
     /// The method first attempts a regular [`Self::refresh`]. If corruption is
     /// detected, it acquires an exclusive lock, re-attempts the refresh and,
@@ -3819,7 +3849,7 @@ mod tests {
     }
 
     #[test]
-    fn amputate_truncates_unknown_magic() {
+    fn unknown_magic_reports_unsupported_without_amputation() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "pile.pile");
 
@@ -3830,19 +3860,51 @@ mod tests {
             pile.close().unwrap();
         }
 
-        let valid_len = std::fs::metadata(&path).unwrap().len();
-        // Append 16 bytes of garbage that don't form a valid marker
+        let valid_len = std::fs::metadata(&path).unwrap().len() as usize;
+        let unknown_marker = [0xA5u8; 16];
+        let mut unknown_record = [0u8; V3_HEADER_LEN];
+        unknown_record[..16].copy_from_slice(&unknown_marker);
         std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
             .unwrap()
-            .write_all(&[0u8; 16])
+            .write_all(&unknown_record)
             .unwrap();
+        let length_with_unknown_record = std::fs::metadata(&path).unwrap().len();
 
         let mut pile: Pile = Pile::open(&path).unwrap();
-        pile.amputate().unwrap();
+        assert!(matches!(
+            pile.refresh(),
+            Err(ReadError::UnsupportedRecord { offset, marker })
+                if offset == valid_len && marker == unknown_marker
+        ));
+        assert!(matches!(
+            pile.amputate(),
+            Err(ReadError::UnsupportedRecord { offset, marker })
+                if offset == valid_len && marker == unknown_marker
+        ));
         pile.close().unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), valid_len);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            length_with_unknown_record,
+            "amputation must preserve a record whose marker this reader does not know"
+        );
+    }
+
+    #[test]
+    fn decoder_distinguishes_unknown_magic_from_truncated_known_record() {
+        let unknown_marker = [0xA5u8; 16];
+        assert!(matches!(
+            decode_record(&unknown_marker, V3_ALIGNMENT),
+            Err(ReadError::UnsupportedRecord { offset, marker })
+                if offset == V3_ALIGNMENT && marker == unknown_marker
+        ));
+
+        assert!(matches!(
+            decode_record(&MAGIC_MARKER_BLOB_V3, V3_ALIGNMENT),
+            Err(ReadError::CorruptPile { valid_length })
+                if valid_length == V3_ALIGNMENT
+        ));
     }
 
     #[test]
@@ -4834,8 +4896,9 @@ mod tests {
 
     /// [`PileRecords`] walks a mixed V1/V3 pile record-by-record: every
     /// record kind appears in log order, offsets tile the file exactly, blob
-    /// payloads are addressable through `data_offset`/`data_len`, and a
-    /// garbage tail surfaces as `Err(CorruptPile)` — never a silent stop.
+    /// payloads are addressable through `data_offset`/`data_len`, and an
+    /// unknown-marker tail surfaces as `Err(UnsupportedRecord)` — never a
+    /// silent stop.
     #[test]
     fn pile_records_walks_mixed_pile_and_fails_loud() {
         let dir = tempfile::tempdir().unwrap();
@@ -4943,14 +5006,16 @@ mod tests {
             other => panic!("expected branch tombstone record, got {other:?}"),
         }
 
-        // A garbage tail is an error at its offset, then the iterator ends.
-        let garbage_offset = std::fs::metadata(&path).unwrap().len() as usize;
+        // An unknown record marker is an error at its offset, then the iterator
+        // ends. Its length is unknowable, so it must not be called corruption.
+        let unknown_offset = std::fs::metadata(&path).unwrap().len() as usize;
+        let unknown_marker = [0xFFu8; 16];
         {
             let mut f = std::fs::OpenOptions::new()
                 .append(true)
                 .open(&path)
                 .unwrap();
-            f.write_all(&[0xFFu8; 32]).unwrap();
+            f.write_all(&unknown_marker).unwrap();
             f.sync_all().unwrap();
         }
         let mut records = PileRecords::open(&path).unwrap();
@@ -4964,8 +5029,11 @@ mod tests {
         };
         assert_eq!(ok, 6);
         match err {
-            ReadError::CorruptPile { valid_length } => assert_eq!(valid_length, garbage_offset),
-            other => panic!("expected CorruptPile, got {other:?}"),
+            ReadError::UnsupportedRecord { offset, marker } => {
+                assert_eq!(offset, unknown_offset);
+                assert_eq!(marker, unknown_marker);
+            }
+            other => panic!("expected UnsupportedRecord, got {other:?}"),
         }
         assert!(records.next().is_none(), "iterator must end after an error");
     }

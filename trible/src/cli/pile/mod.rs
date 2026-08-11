@@ -3,7 +3,7 @@ use clap::Parser;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use triblespace_core::repo::pile::Pile;
+use triblespace_core::repo::pile::{Pile, ReadError};
 
 pub mod blob;
 pub mod branch;
@@ -71,18 +71,17 @@ pub enum PileCommand {
         #[command(subcommand)]
         cmd: diagnose::Command,
     },
-    /// DESTRUCTIVE: truncate a pile at its first invalid record, deleting
-    /// everything after it.
+    /// DESTRUCTIVE: truncate a pile at its first malformed known record,
+    /// deleting everything after it.
     ///
     /// This is the ONLY explicit entry point that truncates a pile: it loads
-    /// every valid record and cuts the file back to the last offset THIS
-    /// binary can parse — everything past that point is permanently destroyed.
-    /// A stale binary sees newer-format records as "invalid" and will happily
-    /// amputate perfectly good data, which is why faculties and other tools
-    /// refuse to do this on open. This is last-resort surgery for a torn tail
-    /// left by a crashed write: back the file up first, confirm the tail is
-    /// genuinely a torn write (e.g. `trible pile diagnose`), and only then
-    /// run this by hand.
+    /// every valid record and cuts the file back to the last offset before a
+    /// malformed known record — everything past that point is permanently
+    /// destroyed. Unknown record markers are refused because their length is
+    /// unknowable and may indicate a newer pile format. This is last-resort
+    /// surgery for a torn known record left by a crashed write: back the file
+    /// up first, confirm the tail is genuinely torn (e.g. `trible pile
+    /// diagnose`), and only then run this by hand.
     Amputate {
         /// Path to the pile file to amputate (TRUNCATED in place)
         path: PathBuf,
@@ -157,21 +156,35 @@ pub enum PileCommand {
     },
 }
 
-/// Open a pile and load its records via `refresh`, failing loud on a
-/// corrupt or torn tail instead of silently truncating it (which
-/// `Pile::amputate` would do). Deliberate, destructive repair stays an
-/// explicit, separate step: `trible pile amputate <path>`.
+/// Turn a pile read failure into an operator-facing diagnostic without
+/// suggesting destructive repair for an unsupported record marker.
+pub(crate) fn pile_read_error(path: &Path, err: ReadError) -> anyhow::Error {
+    match err {
+        err @ ReadError::UnsupportedRecord { .. } => anyhow!(
+            "pile {} contains a record format unsupported by this binary ({err}); this is likely \
+             version skew. Upgrade trible to a reader that recognizes the marker. The pile was \
+             left unchanged",
+            path.display()
+        ),
+        err @ ReadError::CorruptPile { .. } => anyhow!(
+            "pile {} is corrupt ({err}): refusing to auto-repair. If, and only if, the tail is a \
+             genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile \
+             amputate {}",
+            path.display(),
+            path.display()
+        ),
+        err => anyhow!("read pile {}: {err}", path.display()),
+    }
+}
+
+/// Open a pile and load its records via `refresh`, failing loud on a corrupt,
+/// torn, or unsupported tail without modifying it. Deliberate repair of
+/// genuine corruption stays a separate `trible pile amputate <path>` step.
 pub(crate) fn open_refreshed(path: &Path) -> Result<Pile> {
     let mut pile = Pile::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.refresh() {
         let _ = pile.close();
-        return Err(anyhow!(
-            "pile {} is corrupt ({err:?}): refusing to auto-repair (a stale binary could \
-             truncate newer data). If, and only if, the tail is a genuinely torn write, \
-             truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
-            path.display(),
-            path.display()
-        ));
+        return Err(pile_read_error(path, err));
     }
     Ok(pile)
 }
@@ -214,8 +227,10 @@ pub fn run(cmd: PileCommand) -> Result<()> {
             // TRUNCATES the file back to the last known-good offset,
             // destroying everything after it. This is the single place in
             // the tree that performs that mutation.
-            pile.amputate()
-                .map_err(|e| anyhow::anyhow!("amputate pile {}: {e:?}", path.display()))?;
+            if let Err(err) = pile.amputate() {
+                let _ = pile.close();
+                return Err(pile_read_error(&path, err));
+            }
             let after = fs::metadata(&path)?.len();
             pile.close()
                 .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;

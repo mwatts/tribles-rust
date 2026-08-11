@@ -2112,10 +2112,10 @@ mod tests {
         let live = yard.put::<RawBytes, _>(raw_blob(b"survivor")).unwrap();
         drop(yard); // closes (and flushes) the generation pile
 
-        // Corrupt the tail: append garbage that is not a valid record.
+        // Tear the tail before a complete record marker lands.
         {
             let mut file = fs::OpenOptions::new().append(true).open(&paths[0]).unwrap();
-            file.write_all(&[0xFF; 64]).unwrap();
+            file.write_all(&[0xFF; 8]).unwrap();
             file.sync_all().unwrap();
         }
         let corrupt_len = fs::metadata(&paths[0]).unwrap().len();

@@ -623,13 +623,13 @@ fn corrupt_source_fails_loud_without_truncation() {
         repo.into_storage().close().unwrap();
     }
 
-    // Tear the tail: append garbage that decodes as no known record.
+    // Tear the tail before even a complete record marker has landed.
     {
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .open(&src_path)
             .unwrap();
-        file.write_all(&[0xFFu8; 33]).unwrap();
+        file.write_all(&[0xFFu8; 8]).unwrap();
         file.sync_all().unwrap();
     }
     let len_before = std::fs::metadata(&src_path).unwrap().len();
@@ -684,5 +684,50 @@ fn corrupt_source_fails_loud_without_truncation() {
     assert_eq!(
         len_before, len_after,
         "source pile must not be truncated by a failed open"
+    );
+}
+
+/// A complete unknown marker is format/version skew, not evidence that the
+/// tail is disposable. Normal commands and the explicit repair command both
+/// fail without suggesting or performing truncation.
+#[test]
+fn unsupported_record_marker_never_recommends_or_performs_amputation() {
+    use std::io::Write;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("unsupported.pile");
+    let unknown_marker = [0xA5u8; 16];
+    let mut unknown_record = [0u8; 256];
+    unknown_record[..16].copy_from_slice(&unknown_marker);
+    std::fs::File::create(&path)
+        .unwrap()
+        .write_all(&unknown_record)
+        .unwrap();
+    let len_before = std::fs::metadata(&path).unwrap().len();
+
+    let unsupported_without_repair_hint = || {
+        predicate::str::contains("unsupported")
+            .and(predicate::str::contains("version skew"))
+            .and(predicate::str::contains("trible pile amputate").not())
+    };
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "migrate", path.to_str().unwrap(), "list"])
+        .assert()
+        .failure()
+        .stderr(unsupported_without_repair_hint());
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "amputate", path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(unsupported_without_repair_hint());
+
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        len_before,
+        "an unknown marker must survive even an explicit amputation attempt"
     );
 }

@@ -257,12 +257,7 @@ fn open_pile(path: &PathBuf) -> Result<PileBlake3> {
         PileBlake3::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.refresh() {
         let _ = pile.close();
-        return Err(anyhow!(
-            "pile {} is corrupt ({err:?}): refusing to auto-repair (a stale binary could \
-             truncate newer data). If, and only if, the tail is a genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
-            path.display(),
-            path.display()
-        ));
+        return Err(crate::cli::pile::pile_read_error(path, err));
     }
     Ok(pile)
 }

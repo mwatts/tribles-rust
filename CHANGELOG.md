@@ -975,6 +975,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Unknown pile record markers can no longer arm destructive repair under
+  version skew.** A complete unknown marker at a record boundary now returns
+  `ReadError::UnsupportedRecord` with its offset and marker, while malformed or
+  truncated known records remain `CorruptPile`. `Pile::amputate` refuses the
+  unsupported case without truncating, and CLI diagnostics direct operators to
+  upgrade the reader without recommending tail removal. Unknown records are
+  not skipped because their lengths are unknowable.
+
 - **Pile and Yard retention now authenticate native commit ownership before
   rooting blobs.** A structurally decodable but invalidly signed `COMMIT`
   remains preserved as an immutable collection record, while none of its

@@ -1200,13 +1200,12 @@ mod tests {
         let (_, handle) = blob_of(b"unreachable");
         let reader = BlobStore::reader(&mut lazy).unwrap();
 
-        // Corrupt the tail out-of-band: garbage that matches no record
-        // magic.
+        // Tear the tail out-of-band before a complete record marker lands.
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
             .unwrap();
-        file.write_all(&[0xAB; 256]).unwrap();
+        file.write_all(&[0xAB; 8]).unwrap();
         file.sync_all().unwrap();
         drop(file);
 

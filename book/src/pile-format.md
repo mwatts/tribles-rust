@@ -45,11 +45,13 @@ never fork into distinct blobs.
 The reader still accepts the original **V1** records (64-byte-aligned blob,
 branch, and tombstone layouts — see [Legacy V1 records](#legacy-v1-records)),
 so piles written before V3 read byte-identical with no migration step. New
-writes are always V3. The skew direction to watch is the other one: **binaries
-from before V3 treat V3 records as unknown and fail loud with
-`ReadError::CorruptPile`** — they do not truncate anything. When an old binary
-reports corruption on a pile a newer binary wrote, the fix is to upgrade the
-binary, never to "repair" the pile.
+writes are always V3. The skew direction to watch is the other one. A current
+reader that encounters a complete unknown marker reports
+`ReadError::UnsupportedRecord { offset, marker }` and leaves the pile
+untouched; it cannot safely skip or truncate a record whose length it does not
+know. Older binaries predating this distinction may report `CorruptPile`
+instead. When an old binary rejects a pile a newer binary wrote, upgrade the
+binary rather than trying to repair the pile.
 
 ## Design Rationale
 
@@ -69,20 +71,21 @@ refreshing state.
    create missing files — create the file explicitly for a fresh pile).
 2. **Load and validate.** `refresh` acquires a shared lock, walks bytes beyond
    `applied_length`, and rebuilds the blob, collection-record, and pin indices
-   in memory. It **fails
-   loud** on a corrupt or torn tail (`ReadError::CorruptPile { valid_length }`)
-   and never mutates the file. Callers rarely need to invoke it directly:
+   in memory. It **fails loud** on a corrupt or torn known record
+   (`ReadError::CorruptPile { valid_length }`) and distinguishes a complete
+   unknown marker as `ReadError::UnsupportedRecord { offset, marker }`. It
+   never mutates the file. Callers rarely need to invoke it directly:
    `reader`, `records`, `pins`, `head`, `update`, `cell`, and `set_cell` call
    `refresh` internally
    before they inspect or apply records, so external writers are visible
    without a standalone scan.
 3. **Amputate only when asked to.** `amputate` is the explicit, opt-in repair
    path: it re-runs validation under an exclusive lock and truncates the file
-   back to the last valid record, discarding a torn tail left by a crash. It
-   is deliberately **not** part of the normal open sequence — implicit repair
-   under version skew is a silent data-loss hazard (an old binary would "eat"
-   every newer-format record past the first one it misreads as corruption).
-   The `trible pile amputate <path>` command wraps it for operators.
+   back to the last valid record, discarding a torn known record left by a
+   crash. It refuses `UnsupportedRecord` without modifying the file because an
+   unknown record's boundary is unknowable. It is deliberately **not** part of
+   the normal open sequence. The `trible pile amputate <path>` command wraps it
+   for operators.
 4. **Append new records.** `put` (through the `BlobStorePut` trait),
    `CollectionStore::insert`, local-cell replacement, and pin update helpers
    extend the file. Each
@@ -152,12 +155,11 @@ fn add_blob(bytes: &[u8]) -> Result<(), Box<dyn Error>> {
     let path = PathBuf::from("data.pile");
     let mut pile = Pile::open(&path)?;
     // Load and validate the existing records. This FAILS LOUD on a corrupt
-    // or torn tail and never mutates the file. Repair is a separate,
-    // explicit decision (`Pile::amputate` / `trible pile amputate`), typically
-    // made by an operator after checking that the binary isn't simply older
-    // than the pile's records.
+    // or torn known record and never mutates the file. An unknown complete
+    // marker is reported separately as unsupported version skew.
     match pile.refresh() {
         Ok(()) => {}
+        Err(err @ ReadError::UnsupportedRecord { .. }) => return Err(err.into()),
         Err(err @ ReadError::CorruptPile { .. }) => return Err(err.into()),
         Err(other) => return Err(other.into()),
     }
@@ -211,8 +213,9 @@ consolidation, forensics—should use
 [`PileRecords`](../../src/repo/pile.rs), an iterator over every record in a
 pile file in log order. It shares its decoder with the replay path described
 above, so it understands every record format ever written; do not hand-roll a
-parser against the layouts documented in this chapter. An unknown or
-truncated record is reported as an error, never skipped.
+parser against the layouts documented in this chapter. A complete unknown
+marker is reported as `UnsupportedRecord`; a malformed or truncated known
+record is reported as `CorruptPile`. Neither is skipped.
 
 ## Blob Records
 
@@ -359,10 +362,13 @@ had no want records.
 
 ## Recovery
 
-`refresh` scans an existing file to ensure every header uses a known marker
-and that the whole record fits. It does not verify any hashes. If a truncated
-or unknown block is found the function reports the number of bytes that were
-valid so far using `ReadError::CorruptPile` — and leaves the file untouched.
+`refresh` scans an existing file to ensure every known record fits. It does not
+verify any hashes. A malformed or truncated known record reports the number of
+bytes that were valid so far using `ReadError::CorruptPile`. A complete unknown
+marker reports its bytes and offset using `ReadError::UnsupportedRecord`, since
+the reader cannot infer that record's length. Both errors leave the file
+untouched, and the reader never guesses a length in order to skip an unknown
+record.
 
 If the file shrinks between scans into data that has already been applied, the
 process aborts immediately. Previously returned `Bytes` handles would dangle
@@ -372,14 +378,14 @@ data is treated as unrecoverable.
 `refresh` holds a shared file lock while scanning. This prevents a concurrent
 `amputate` call from truncating the file out from under the reader.
 
-The `amputate` helper is the explicit, destructive repair path: it re-runs the same
-validation under an exclusive lock and truncates the file to the valid length
-if corruption is encountered, discarding incomplete data left by an
-interrupted write. Run it deliberately (e.g. via `trible pile amputate <path>`)
-— never as a routine part of opening — and only once you know the "corruption"
-isn't just an older binary meeting newer record kinds. Hash verification
-happens lazily only when individual blobs are loaded so that opening a large
-pile remains fast.
+The `amputate` helper is the explicit, destructive repair path: it re-runs the
+same validation under an exclusive lock and truncates the file to the valid
+length if corruption is encountered, discarding incomplete data left by an
+interrupted write. It propagates `UnsupportedRecord` without truncating. Run it
+deliberately (e.g. via `trible pile amputate <path>`) — never as a routine part
+of opening — and only for a genuinely malformed or torn known record. Hash
+verification happens lazily only when individual blobs are loaded so that
+opening a large pile remains fast.
 
 For more details on interacting with a pile see the [`Pile` struct
 documentation](https://docs.rs/triblespace/latest/triblespace/repo/pile/struct.Pile.html).
