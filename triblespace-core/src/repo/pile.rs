@@ -23,6 +23,7 @@ use hex_literal::hex;
 use memmap2::MmapOptions;
 use memmap2::MmapRaw;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::error::Error;
@@ -47,8 +48,7 @@ use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
 use crate::collection::{
-    CollectionCommit, CollectionDefinition, CollectionDerive, CollectionMerge, CollectionRecord,
-    CollectionStore,
+    CollectionCommit, CollectionDerive, CollectionMerge, CollectionRecord, CollectionStore,
 };
 use crate::id::Id;
 use crate::id::RawId;
@@ -90,14 +90,26 @@ const MAGIC_MARKER_BRANCH_TOMBSTONE_V3: RawId = hex!("D0CBA0C8EAAB4C0C73121C3205
 /// retracts it. Reopening a pile reconstructs the current wanted set.
 const MAGIC_MARKER_WEAK_PIN_V3: RawId = hex!("8F3EEFEDECD491F63F6EAAA5FD6F3D5E");
 const MAGIC_MARKER_WEAK_UNPIN_V3: RawId = hex!("2D76662DFF0187EC36A8C90B12BB8B0D");
-/// Native collection-record markers, minted on 2026-08-10 with `trible genid`.
-/// Each record is a complete fixed-width V3 header with zeroed trailing bytes;
-/// unlike the legacy branch cell, these records are immutable, intrinsically
-/// identified, and compose by set union.
+/// Legacy V3 collection-record markers, minted on 2026-08-10 with
+/// `trible genid`.
+///
+/// These physical records predate descriptor-handle collection identities.
+/// They remain recognizable for safe replay and conservative rewriting, but
+/// are inert: they are never reconstructed as current [`CollectionRecord`]s
+/// and never enter [`CollectionStore`]. New writes use the V4 markers below.
 const MAGIC_MARKER_COLLECTION_DEFINITION_V3: RawId = hex!("3BE108504E4F5242FB24AA72D6D94CE1");
 const MAGIC_MARKER_COLLECTION_COMMIT_V3: RawId = hex!("BB758AA6F79FBFC4D1958592A8956777");
 const MAGIC_MARKER_COLLECTION_MERGE_V3: RawId = hex!("CC0108AC1DF4F335AFA856A529C42BE9");
 const MAGIC_MARKER_COLLECTION_DERIVE_V3: RawId = hex!("07ECF056F6F015D94389FFF21F851480");
+/// Current collection-record markers, minted on 2026-08-11 with
+/// `trible genid`.
+///
+/// V4 collection records carry 32-byte canonical descriptor handles directly.
+/// There is deliberately no V4 definition record: descriptors are ordinary
+/// `SimpleArchive` blobs named by those handles.
+const MAGIC_MARKER_COLLECTION_COMMIT_V4: RawId = hex!("CBF2CF97D52A3486E16C12D70D397C66");
+const MAGIC_MARKER_COLLECTION_MERGE_V4: RawId = hex!("9F5D028D4C423620D6957A5F726FA727");
+const MAGIC_MARKER_COLLECTION_DERIVE_V4: RawId = hex!("ECFB2EE90ED8042244F7BAC704454BB9");
 /// Local-cell records, minted on 2026-08-10 with `trible genid`.
 ///
 /// A set record replaces one local operational slot; a tombstone clears it.
@@ -437,7 +449,7 @@ impl WeakUnpinHeaderV3 {
     }
 }
 
-/// Native V3 collection definition: `(scope, representation, recipe)`.
+/// Legacy V3 collection definition: `(scope, representation, recipe)`.
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
 struct CollectionDefinitionHeaderV3 {
@@ -448,20 +460,7 @@ struct CollectionDefinitionHeaderV3 {
     reserved: [u8; 192],
 }
 
-impl CollectionDefinitionHeaderV3 {
-    fn new(record: &CollectionDefinition) -> Self {
-        Self {
-            magic_marker: MAGIC_MARKER_COLLECTION_DEFINITION_V3,
-            scope: record.scope().into(),
-            representation: record.representation().into(),
-            recipe: record.recipe().into(),
-            reserved: [0u8; 192],
-        }
-    }
-}
-
-/// Native V3 signed collection commit. All signed transcript fields are
-/// present directly in the header; the intrinsic record id is reconstructed.
+/// Legacy V3 signed collection commit using a 16-byte intrinsic definition id.
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
 struct CollectionCommitHeaderV3 {
@@ -475,23 +474,7 @@ struct CollectionCommitHeaderV3 {
     reserved: [u8; 64],
 }
 
-impl CollectionCommitHeaderV3 {
-    fn new(record: &CollectionCommit) -> Self {
-        let (signature_r, signature_s) = record.signature();
-        Self {
-            magic_marker: MAGIC_MARKER_COLLECTION_COMMIT_V3,
-            collection: record.collection().into(),
-            data: record.data().raw,
-            metadata: record.metadata().raw,
-            public_key: record.public_key().raw,
-            signature_r: signature_r.raw,
-            signature_s: signature_s.raw,
-            reserved: [0u8; 64],
-        }
-    }
-}
-
-/// Native V3 exact join equation. Inputs are stored in canonical digest order.
+/// Legacy V3 exact join equation using a 16-byte intrinsic definition id.
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
 struct CollectionMergeHeaderV3 {
@@ -503,21 +486,7 @@ struct CollectionMergeHeaderV3 {
     reserved: [u8; 128],
 }
 
-impl CollectionMergeHeaderV3 {
-    fn new(record: &CollectionMerge) -> Self {
-        let (low, high) = record.inputs();
-        Self {
-            magic_marker: MAGIC_MARKER_COLLECTION_MERGE_V3,
-            collection: record.collection().into(),
-            low: low.raw,
-            high: high.raw,
-            result: record.result().raw,
-            reserved: [0u8; 128],
-        }
-    }
-}
-
-/// Native V3 exact mapping equation between two typed collections.
+/// Legacy V3 mapping equation using 16-byte intrinsic definition ids.
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
 struct CollectionDeriveHeaderV3 {
@@ -529,16 +498,85 @@ struct CollectionDeriveHeaderV3 {
     reserved: [u8; 144],
 }
 
-impl CollectionDeriveHeaderV3 {
+/// V4 signed collection commit. The complete 32-byte descriptor handle bound
+/// by the V2 signature transcript is stored directly in the fixed header.
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct CollectionCommitHeaderV4 {
+    magic_marker: RawId,
+    collection: RawInline,
+    data: RawInline,
+    metadata: RawInline,
+    public_key: RawInline,
+    signature_r: RawInline,
+    signature_s: RawInline,
+    reserved: [u8; 48],
+}
+
+impl CollectionCommitHeaderV4 {
+    fn new(record: &CollectionCommit) -> Self {
+        let (signature_r, signature_s) = record.signature();
+        Self {
+            magic_marker: MAGIC_MARKER_COLLECTION_COMMIT_V4,
+            collection: record.collection().raw,
+            data: record.data().raw,
+            metadata: record.metadata().raw,
+            public_key: record.public_key().raw,
+            signature_r: signature_r.raw,
+            signature_s: signature_s.raw,
+            reserved: [0u8; 48],
+        }
+    }
+}
+
+/// V4 exact join equation. Inputs are stored in canonical digest order.
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct CollectionMergeHeaderV4 {
+    magic_marker: RawId,
+    collection: RawInline,
+    low: RawInline,
+    high: RawInline,
+    result: RawInline,
+    reserved: [u8; 112],
+}
+
+impl CollectionMergeHeaderV4 {
+    fn new(record: &CollectionMerge) -> Self {
+        let (low, high) = record.inputs();
+        Self {
+            magic_marker: MAGIC_MARKER_COLLECTION_MERGE_V4,
+            collection: record.collection().raw,
+            low: low.raw,
+            high: high.raw,
+            result: record.result().raw,
+            reserved: [0u8; 112],
+        }
+    }
+}
+
+/// V4 exact mapping equation between two descriptor-identified collections.
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct CollectionDeriveHeaderV4 {
+    magic_marker: RawId,
+    source: RawInline,
+    target: RawInline,
+    input: RawInline,
+    output: RawInline,
+    reserved: [u8; 112],
+}
+
+impl CollectionDeriveHeaderV4 {
     fn new(record: &CollectionDerive) -> Self {
         let (input, output) = record.mapping();
         Self {
-            magic_marker: MAGIC_MARKER_COLLECTION_DERIVE_V3,
-            source: record.source().into(),
-            target: record.target().into(),
+            magic_marker: MAGIC_MARKER_COLLECTION_DERIVE_V4,
+            source: record.source().raw,
+            target: record.target().raw,
             input: input.raw,
             output: output.raw,
-            reserved: [0u8; 144],
+            reserved: [0u8; 112],
         }
     }
 }
@@ -546,17 +584,14 @@ impl CollectionDeriveHeaderV3 {
 fn collection_record_header(record: &CollectionRecord) -> [u8; V3_HEADER_LEN] {
     let mut bytes = [0u8; V3_HEADER_LEN];
     match record {
-        CollectionRecord::Definition(record) => {
-            bytes.copy_from_slice(CollectionDefinitionHeaderV3::new(record).as_bytes())
-        }
         CollectionRecord::Commit(record) => {
-            bytes.copy_from_slice(CollectionCommitHeaderV3::new(record).as_bytes())
+            bytes.copy_from_slice(CollectionCommitHeaderV4::new(record).as_bytes())
         }
         CollectionRecord::Merge(record) => {
-            bytes.copy_from_slice(CollectionMergeHeaderV3::new(record).as_bytes())
+            bytes.copy_from_slice(CollectionMergeHeaderV4::new(record).as_bytes())
         }
         CollectionRecord::Derive(record) => {
-            bytes.copy_from_slice(CollectionDeriveHeaderV3::new(record).as_bytes())
+            bytes.copy_from_slice(CollectionDeriveHeaderV4::new(record).as_bytes())
         }
     }
     bytes
@@ -575,6 +610,9 @@ const _: () = {
     assert!(std::mem::size_of::<CollectionCommitHeaderV3>() == V3_HEADER_LEN);
     assert!(std::mem::size_of::<CollectionMergeHeaderV3>() == V3_HEADER_LEN);
     assert!(std::mem::size_of::<CollectionDeriveHeaderV3>() == V3_HEADER_LEN);
+    assert!(std::mem::size_of::<CollectionCommitHeaderV4>() == V3_HEADER_LEN);
+    assert!(std::mem::size_of::<CollectionMergeHeaderV4>() == V3_HEADER_LEN);
+    assert!(std::mem::size_of::<CollectionDeriveHeaderV4>() == V3_HEADER_LEN);
 };
 
 /// A single record decoded from a pile file.
@@ -593,6 +631,25 @@ pub struct PileRecord {
     pub len: usize,
     /// The decoded record content.
     pub content: PileRecordContent,
+}
+
+/// Kind of one recognized but semantically inert legacy V3 collection header.
+///
+/// The raw header bytes remain available through [`PileRecords::bytes`] using
+/// the enclosing [`PileRecord`]'s `offset` and `len`. This enum deliberately
+/// exposes only the physical kind: V3's 16-byte definition identities and V1
+/// commit transcripts must not be mistaken for current descriptor-handle
+/// collection authority.
+#[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+pub enum LegacyCollectionRecordKindV3 {
+    /// Legacy standalone collection definition.
+    Definition,
+    /// Legacy signed commit over a 16-byte definition id.
+    Commit,
+    /// Legacy merge equation over a 16-byte definition id.
+    Merge,
+    /// Legacy derive equation between 16-byte definition ids.
+    Derive,
 }
 
 /// Decoded content of a [`PileRecord`], independent of on-disk format version.
@@ -646,11 +703,19 @@ pub enum PileRecordContent {
         /// The no-longer-wanted blob handle.
         handle: Inline<Handle<UnknownBlob>>,
     },
-    /// One immutable native collection-algebra record. Four distinct V3 magic
-    /// markers share this typed raw-inspection surface.
+    /// One immutable current collection-algebra record. Three distinct V4
+    /// magic markers share this typed raw-inspection surface.
     Collection {
         /// Canonically reconstructed semantic record.
         record: CollectionRecord,
+    },
+    /// One recognized legacy V3 collection header.
+    ///
+    /// Replay treats this as inert physical evidence. It is excluded from
+    /// [`CollectionStore`] but retained byte-for-byte by ordinary pile rewrite.
+    LegacyCollectionV3 {
+        /// The historical physical record kind.
+        kind: LegacyCollectionRecordKindV3,
     },
 }
 
@@ -820,18 +885,14 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
             if header.reserved.iter().any(|byte| *byte != 0) {
                 return Err(corrupt());
             }
-            let scope = Id::new(header.scope).ok_or_else(corrupt)?;
-            let representation = Id::new(header.representation).ok_or_else(corrupt)?;
-            let recipe = Id::new(header.recipe).ok_or_else(corrupt)?;
+            Id::new(header.scope).ok_or_else(corrupt)?;
+            Id::new(header.representation).ok_or_else(corrupt)?;
+            Id::new(header.recipe).ok_or_else(corrupt)?;
             Ok(PileRecord {
                 offset,
                 len: V3_HEADER_LEN,
-                content: PileRecordContent::Collection {
-                    record: CollectionRecord::Definition(CollectionDefinition::new(
-                        scope,
-                        representation,
-                        recipe,
-                    )),
+                content: PileRecordContent::LegacyCollectionV3 {
+                    kind: LegacyCollectionRecordKindV3::Definition,
                 },
             })
         }
@@ -841,19 +902,12 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
             if header.reserved.iter().any(|byte| *byte != 0) {
                 return Err(corrupt());
             }
-            let collection = Id::new(header.collection).ok_or_else(corrupt)?;
+            Id::new(header.collection).ok_or_else(corrupt)?;
             Ok(PileRecord {
                 offset,
                 len: V3_HEADER_LEN,
-                content: PileRecordContent::Collection {
-                    record: CollectionRecord::Commit(CollectionCommit::from_parts(
-                        collection,
-                        Inline::new(header.data),
-                        Inline::new(header.metadata),
-                        Inline::<ED25519PublicKey>::new(header.public_key),
-                        Inline::<ED25519RComponent>::new(header.signature_r),
-                        Inline::<ED25519SComponent>::new(header.signature_s),
-                    )),
+                content: PileRecordContent::LegacyCollectionV3 {
+                    kind: LegacyCollectionRecordKindV3::Commit,
                 },
             })
         }
@@ -863,17 +917,12 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
             if header.reserved.iter().any(|byte| *byte != 0) || header.high < header.low {
                 return Err(corrupt());
             }
-            let collection = Id::new(header.collection).ok_or_else(corrupt)?;
+            Id::new(header.collection).ok_or_else(corrupt)?;
             Ok(PileRecord {
                 offset,
                 len: V3_HEADER_LEN,
-                content: PileRecordContent::Collection {
-                    record: CollectionRecord::Merge(CollectionMerge::new(
-                        collection,
-                        Inline::new(header.low),
-                        Inline::new(header.high),
-                        Inline::new(header.result),
-                    )),
+                content: PileRecordContent::LegacyCollectionV3 {
+                    kind: LegacyCollectionRecordKindV3::Merge,
                 },
             })
         }
@@ -883,15 +932,69 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
             if header.reserved.iter().any(|byte| *byte != 0) {
                 return Err(corrupt());
             }
-            let source = Id::new(header.source).ok_or_else(corrupt)?;
-            let target = Id::new(header.target).ok_or_else(corrupt)?;
+            Id::new(header.source).ok_or_else(corrupt)?;
+            Id::new(header.target).ok_or_else(corrupt)?;
+            Ok(PileRecord {
+                offset,
+                len: V3_HEADER_LEN,
+                content: PileRecordContent::LegacyCollectionV3 {
+                    kind: LegacyCollectionRecordKindV3::Derive,
+                },
+            })
+        }
+        MAGIC_MARKER_COLLECTION_COMMIT_V4 => {
+            let (header, _) =
+                CollectionCommitHeaderV4::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            if header.reserved.iter().any(|byte| *byte != 0) {
+                return Err(corrupt());
+            }
+            Ok(PileRecord {
+                offset,
+                len: V3_HEADER_LEN,
+                content: PileRecordContent::Collection {
+                    record: CollectionRecord::Commit(CollectionCommit::from_parts(
+                        Inline::new(header.collection),
+                        Inline::new(header.data),
+                        Inline::new(header.metadata),
+                        Inline::<ED25519PublicKey>::new(header.public_key),
+                        Inline::<ED25519RComponent>::new(header.signature_r),
+                        Inline::<ED25519SComponent>::new(header.signature_s),
+                    )),
+                },
+            })
+        }
+        MAGIC_MARKER_COLLECTION_MERGE_V4 => {
+            let (header, _) =
+                CollectionMergeHeaderV4::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            if header.reserved.iter().any(|byte| *byte != 0) || header.high < header.low {
+                return Err(corrupt());
+            }
+            Ok(PileRecord {
+                offset,
+                len: V3_HEADER_LEN,
+                content: PileRecordContent::Collection {
+                    record: CollectionRecord::Merge(CollectionMerge::new(
+                        Inline::new(header.collection),
+                        Inline::new(header.low),
+                        Inline::new(header.high),
+                        Inline::new(header.result),
+                    )),
+                },
+            })
+        }
+        MAGIC_MARKER_COLLECTION_DERIVE_V4 => {
+            let (header, _) =
+                CollectionDeriveHeaderV4::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            if header.reserved.iter().any(|byte| *byte != 0) {
+                return Err(corrupt());
+            }
             Ok(PileRecord {
                 offset,
                 len: V3_HEADER_LEN,
                 content: PileRecordContent::Collection {
                     record: CollectionRecord::Derive(CollectionDerive::new(
-                        source,
-                        target,
+                        Inline::new(header.source),
+                        Inline::new(header.target),
                         Inline::new(header.input),
                         Inline::new(header.output),
                     )),
@@ -1095,6 +1198,7 @@ enum Applied {
     Collection {
         id: Id,
     },
+    LegacyCollectionV3,
 }
 
 #[derive(Debug)]
@@ -1124,6 +1228,10 @@ pub struct Pile {
     /// Immutable collection records keyed by their intrinsic entity id.
     /// `BTreeMap` makes enumeration independent of append/cat order.
     collection_records: BTreeMap<Id, CollectionRecord>,
+    /// Exact byte-distinct legacy V3 collection headers accepted during replay.
+    /// They remain inert but are conservatively carried through retained
+    /// rewrites so an explicit future migration still has its source evidence.
+    legacy_collection_headers: BTreeSet<[u8; V3_HEADER_LEN]>,
     /// LWW-resolved wanted set. Legacy weak-pin records assert the handle and
     /// weak-unpin records retract it; log-order application makes the last
     /// record for a handle win by construction.
@@ -1568,6 +1676,7 @@ impl Pile {
             cells: PATCH::<16, IdentitySchema, Inline<Handle<SimpleArchive>>>::new(),
             cell_tombstones: PATCH::<16, IdentitySchema>::new(),
             collection_records: BTreeMap::new(),
+            legacy_collection_headers: BTreeSet::new(),
             wants: PATCH::<32, IdentitySchema>::new(),
             applied_length: 0,
         })
@@ -1650,6 +1759,12 @@ impl Pile {
         // record format ever written (V1 and V3 alike).
         let record = decode_record(slice, start_offset)?;
         let next_applied_length = start_offset + record.len;
+        let legacy_collection_header =
+            matches!(record.content, PileRecordContent::LegacyCollectionV3 { .. }).then(|| {
+                let mut header = [0u8; V3_HEADER_LEN];
+                header.copy_from_slice(&slice[..V3_HEADER_LEN]);
+                header
+            });
         let applied = match record.content {
             PileRecordContent::Blob { hash, .. } => {
                 let candidate = IndexEntry::new(start_offset);
@@ -1720,6 +1835,13 @@ impl Pile {
                     self.collection_records.insert(id, record);
                 }
                 Applied::Collection { id }
+            }
+            PileRecordContent::LegacyCollectionV3 { .. } => {
+                self.legacy_collection_headers.insert(
+                    legacy_collection_header
+                        .expect("legacy collection record must retain its physical header"),
+                );
+                Applied::LegacyCollectionV3
             }
         };
         self.applied_length = next_applied_length;
@@ -1976,6 +2098,50 @@ impl Iterator for PileCollectionRecordIter {
     }
 }
 
+impl Pile {
+    /// Append one already-validated legacy collection header if this pile does
+    /// not already contain the same physical evidence.
+    fn preserve_legacy_collection_header(
+        &mut self,
+        header: [u8; V3_HEADER_LEN],
+    ) -> Result<(), CollectionInsertError> {
+        debug_assert!(matches!(
+            decode_record(&header, 0),
+            Ok(PileRecord {
+                content: PileRecordContent::LegacyCollectionV3 { .. },
+                ..
+            })
+        ));
+
+        self.file.lock()?;
+        let result = (|| {
+            self.refresh_locked()?;
+
+            if self.legacy_collection_headers.contains(&header) {
+                return Ok(());
+            }
+
+            self.dirty = true;
+            let written = self.file.write(&header)?;
+            if written != V3_HEADER_LEN {
+                return Err(CollectionInsertError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write complete legacy collection record",
+                )));
+            }
+
+            match self.apply_next()? {
+                Some(Applied::LegacyCollectionV3) => Ok(()),
+                Some(_) | None => Err(CollectionInsertError::UnexpectedReadback),
+            }
+        })();
+        let unlock = self.file.unlock();
+        result?;
+        unlock?;
+        Ok(())
+    }
+}
+
 impl CollectionStore for Pile {
     type RecordsError = ReadError;
     type InsertError = CollectionInsertError;
@@ -2142,6 +2308,7 @@ impl Pile {
                     Some(Applied::WeakPin { .. }) => {}
                     Some(Applied::WeakUnpin { .. }) => {}
                     Some(Applied::Collection { .. }) => {}
+                    Some(Applied::LegacyCollectionV3) => {}
                     None => {
                         return Err(InsertError::IoError(std::io::Error::other(
                             "blob missing after write",
@@ -2604,19 +2771,21 @@ impl Pile {
     /// and branch models to coexist during migration.
     ///
     /// The source is refreshed once; blobs, strong pins, local cells,
-    /// collection records, and wants are then taken from that coherent applied-prefix
-    /// snapshot. Strictly verified native commits retain their resident data
-    /// and metadata recursively; an invalid commit authenticates none of its
-    /// fields. A valid commit whose dependency is not resident is still copied
-    /// as durable ground truth, but the absent dependency is not manufactured
-    /// into a transfer root. Later synchronization may satisfy it. Merge and
-    /// derive records are algebraic evidence rather than ownership edges. The
-    /// destination may already contain identical blobs, records, and strong-pin
+    /// collection records, inert legacy collection headers, and wants are then
+    /// taken from that coherent applied-prefix snapshot. Strictly verified V4
+    /// commits retain their resident descriptor, data, and metadata recursively;
+    /// an invalid commit authenticates none of its fields. A valid commit whose
+    /// dependency is not resident is still copied as durable ground truth, but
+    /// the absent dependency is not manufactured into a transfer root. Later
+    /// synchronization may satisfy it. Merge and derive records are algebraic
+    /// evidence rather than ownership edges. Byte-distinct legacy V3 collection
+    /// headers are copied exactly but remain semantically inert. The destination
+    /// may already contain identical blobs, records, headers, and strong-pin
     /// mappings, making retries idempotent, but a differently mapped pin or
     /// intrinsic-record collision is an error. Missing or invalid explicitly
     /// selected blobs still fail the rewrite rather than silently weakening the
-    /// caller's retention policy. One final flush makes blobs and records
-    /// durable in append order.
+    /// caller's retention policy. One final flush makes blobs and records durable
+    /// in append order.
     pub fn rewrite_retained_into(
         &mut self,
         destination: &mut Pile,
@@ -2628,6 +2797,7 @@ impl Pile {
         let local_cells = self.cells.clone();
         let local_cell_tombstones = self.cell_tombstones.clone();
         let collection_records = self.collection_records.clone();
+        let legacy_collection_headers = self.legacy_collection_headers.clone();
         let source_wants = self.wants.clone();
 
         let mut roots = explicit.clone();
@@ -2661,9 +2831,10 @@ impl Pile {
             // turn absence into a root which would make every later rewrite
             // fail. `reachable` already applies the same resident-only rule to
             // recursive descendants.
+            let descriptor = Inline::<Handle<UnknownBlob>>::new(commit.collection().raw);
             let data = Inline::<Handle<UnknownBlob>>::new(commit.data().raw);
             let metadata = commit.metadata().transmute();
-            for handle in [data, metadata] {
+            for handle in [descriptor, data, metadata] {
                 if reader
                     .contains_blob(handle)
                     .expect("PileReader residency lookup is infallible")
@@ -2694,6 +2865,12 @@ impl Pile {
                     return Err(PileRewriteError::StrongPinConflict { id, current });
                 }
             }
+        }
+
+        for header in legacy_collection_headers {
+            destination
+                .preserve_legacy_collection_header(header)
+                .map_err(PileRewriteError::Collection)?;
         }
 
         for record in collection_records.into_values() {
@@ -2750,14 +2927,14 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use rand::RngCore;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeSet, HashMap, HashSet};
     use std::io::Write;
     use std::path::PathBuf;
     use std::time::SystemTime;
     use std::time::UNIX_EPOCH;
     use tempfile;
 
-    use crate::collection::empty_metadata_handle;
+    use crate::collection::{empty_metadata_handle, CollectionDescriptor, CollectionId};
     use crate::macros::entity;
     use crate::repo::{BlobStoreMeta, PushResult, RetentionRoots};
     use crate::trible::TribleSet;
@@ -2776,39 +2953,121 @@ mod tests {
         Inline::new([byte; 32])
     }
 
+    fn collection_test_collection(byte: u8) -> CollectionId {
+        Inline::new([byte; 32])
+    }
+
     fn collection_test_records() -> Vec<CollectionRecord> {
-        let source = CollectionDefinition::new(
-            collection_test_id(1),
-            collection_test_id(2),
-            collection_test_id(3),
-        );
-        let target = CollectionDefinition::new(
-            collection_test_id(1),
-            collection_test_id(4),
-            collection_test_id(5),
-        );
+        let source = collection_test_collection(1);
+        let target = collection_test_collection(2);
         let key = SigningKey::from_bytes(&[7; 32]);
         vec![
-            CollectionRecord::Definition(source),
             CollectionRecord::Commit(CollectionCommit::sign(
                 &key,
-                source.id(),
+                source,
                 collection_test_hash(6),
                 empty_metadata_handle(),
             )),
             CollectionRecord::Merge(CollectionMerge::new(
-                source.id(),
+                source,
                 collection_test_hash(6),
                 collection_test_hash(7),
                 collection_test_hash(8),
             )),
             CollectionRecord::Derive(CollectionDerive::new(
-                source.id(),
-                target.id(),
+                source,
+                target,
                 collection_test_hash(8),
                 collection_test_hash(9),
             )),
         ]
+    }
+
+    fn fixed_collection_header(bytes: &[u8]) -> [u8; V3_HEADER_LEN] {
+        bytes
+            .try_into()
+            .expect("collection headers are exactly one fixed pile header")
+    }
+
+    fn legacy_collection_test_headers() -> Vec<(LegacyCollectionRecordKindV3, [u8; V3_HEADER_LEN])>
+    {
+        vec![
+            (
+                LegacyCollectionRecordKindV3::Definition,
+                fixed_collection_header(
+                    CollectionDefinitionHeaderV3 {
+                        magic_marker: MAGIC_MARKER_COLLECTION_DEFINITION_V3,
+                        scope: [1; 16],
+                        representation: [2; 16],
+                        recipe: [3; 16],
+                        reserved: [0; 192],
+                    }
+                    .as_bytes(),
+                ),
+            ),
+            (
+                LegacyCollectionRecordKindV3::Commit,
+                fixed_collection_header(
+                    CollectionCommitHeaderV3 {
+                        magic_marker: MAGIC_MARKER_COLLECTION_COMMIT_V3,
+                        collection: [4; 16],
+                        data: [5; 32],
+                        metadata: [6; 32],
+                        public_key: [7; 32],
+                        signature_r: [8; 32],
+                        signature_s: [9; 32],
+                        reserved: [0; 64],
+                    }
+                    .as_bytes(),
+                ),
+            ),
+            (
+                LegacyCollectionRecordKindV3::Merge,
+                fixed_collection_header(
+                    CollectionMergeHeaderV3 {
+                        magic_marker: MAGIC_MARKER_COLLECTION_MERGE_V3,
+                        collection: [10; 16],
+                        low: [11; 32],
+                        high: [12; 32],
+                        result: [13; 32],
+                        reserved: [0; 128],
+                    }
+                    .as_bytes(),
+                ),
+            ),
+            (
+                LegacyCollectionRecordKindV3::Derive,
+                fixed_collection_header(
+                    CollectionDeriveHeaderV3 {
+                        magic_marker: MAGIC_MARKER_COLLECTION_DERIVE_V3,
+                        source: [14; 16],
+                        target: [15; 16],
+                        input: [16; 32],
+                        output: [17; 32],
+                        reserved: [0; 144],
+                    }
+                    .as_bytes(),
+                ),
+            ),
+        ]
+    }
+
+    fn legacy_collection_headers_at(
+        path: &Path,
+    ) -> Vec<(LegacyCollectionRecordKindV3, [u8; V3_HEADER_LEN])> {
+        let mut records = PileRecords::open(path).unwrap();
+        let mut found = Vec::new();
+        while let Some(record) = records.next() {
+            let record = record.unwrap();
+            let PileRecordContent::LegacyCollectionV3 { kind } = record.content else {
+                continue;
+            };
+            let header = records.bytes()[record.offset..record.offset + record.len]
+                .try_into()
+                .unwrap();
+            found.push((kind, header));
+        }
+        found
     }
 
     fn sorted_collection_records(mut records: Vec<CollectionRecord>) -> Vec<CollectionRecord> {
@@ -2833,13 +3092,12 @@ mod tests {
     }
 
     #[test]
-    fn native_collection_record_headers_are_fixed_zero_padded_and_roundtrip() {
+    fn v4_collection_record_headers_are_fixed_zero_padded_and_roundtrip() {
         let records = collection_test_records();
         let expected = [
-            (MAGIC_MARKER_COLLECTION_DEFINITION_V3, 64usize),
-            (MAGIC_MARKER_COLLECTION_COMMIT_V3, 192usize),
-            (MAGIC_MARKER_COLLECTION_MERGE_V3, 128usize),
-            (MAGIC_MARKER_COLLECTION_DERIVE_V3, 112usize),
+            (MAGIC_MARKER_COLLECTION_COMMIT_V4, 208usize),
+            (MAGIC_MARKER_COLLECTION_MERGE_V4, 144usize),
+            (MAGIC_MARKER_COLLECTION_DERIVE_V4, 144usize),
         ];
 
         for (record, (magic, reserved_start)) in records.into_iter().zip(expected) {
@@ -2862,6 +3120,68 @@ mod tests {
                 Err(ReadError::CorruptPile { valid_length: 0 })
             ));
         }
+    }
+
+    #[test]
+    fn legacy_v3_collection_headers_are_inert_and_preserved_by_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "legacy-source.pile");
+        let destination_path = fresh_empty_pile_path(&dir, "legacy-destination.pile");
+        let expected = legacy_collection_test_headers();
+
+        {
+            let mut file = OpenOptions::new().append(true).open(&source_path).unwrap();
+            for (_, header) in &expected {
+                file.write_all(header).unwrap();
+            }
+        }
+
+        assert_eq!(
+            legacy_collection_headers_at(&source_path)
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            expected.iter().copied().collect::<BTreeSet<_>>()
+        );
+
+        let mut malformed = expected[0].1;
+        malformed[64] = 1;
+        assert!(matches!(
+            decode_record(&malformed, 0),
+            Err(ReadError::CorruptPile { valid_length: 0 })
+        ));
+
+        let mut source = Pile::open(&source_path).unwrap();
+        let mut destination = Pile::open(&destination_path).unwrap();
+        assert_eq!(source.records().unwrap().count(), 0);
+
+        let stats = source
+            .rewrite_retained_into(
+                &mut destination,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+            )
+            .unwrap();
+        assert_eq!(stats.retained_blobs, 0);
+        assert_eq!(destination.records().unwrap().count(), 0);
+
+        let rewritten = legacy_collection_headers_at(&destination_path);
+        assert_eq!(
+            rewritten.into_iter().collect::<BTreeSet<_>>(),
+            expected.iter().copied().collect::<BTreeSet<_>>()
+        );
+
+        let once = std::fs::metadata(&destination_path).unwrap().len();
+        source
+            .rewrite_retained_into(
+                &mut destination,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+            )
+            .unwrap();
+        assert_eq!(std::fs::metadata(&destination_path).unwrap().len(), once);
+
+        destination.close().unwrap();
+        source.close().unwrap();
     }
 
     #[test]
@@ -2921,7 +3241,6 @@ mod tests {
         let mut b = Pile::open(&path_b).unwrap();
         b.insert(records[0]).unwrap();
         b.insert(records[2]).unwrap();
-        b.insert(records[3]).unwrap();
         b.close().unwrap();
 
         let bytes_a = std::fs::read(&path_a).unwrap();
@@ -3092,21 +3411,22 @@ mod tests {
         let forged_metadata = source
             .put::<SimpleArchive, _>(metadata_facts.to_blob())
             .unwrap();
-        let definition = CollectionDefinition::new(
+        let descriptor = CollectionDescriptor::new(
             collection_test_id(21),
             collection_test_id(22),
             collection_test_id(23),
         );
+        let descriptor_handle = source
+            .put::<SimpleArchive, _>(descriptor.to_blob())
+            .unwrap();
+        assert_eq!(descriptor_handle, descriptor.handle());
         let invalid = invalidate_collection_commit(CollectionCommit::sign(
             &SigningKey::from_bytes(&[24; 32]),
-            definition.id(),
+            descriptor_handle,
             Inline::<Hash<Blake3>>::new(forged_data.raw),
             forged_metadata,
         ));
-        let records = vec![
-            CollectionRecord::Definition(definition),
-            CollectionRecord::Commit(invalid),
-        ];
+        let records = vec![CollectionRecord::Commit(invalid)];
         for record in records.iter().copied() {
             source.insert(record).unwrap();
         }
@@ -3138,6 +3458,10 @@ mod tests {
             reader.get::<Blob<SimpleArchive>, _>(forged_metadata),
             Err(GetBlobError::BlobNotFound)
         ));
+        assert!(matches!(
+            reader.get::<Blob<SimpleArchive>, _>(descriptor_handle),
+            Err(GetBlobError::BlobNotFound)
+        ));
 
         drop(reader);
         destination.close().unwrap();
@@ -3152,24 +3476,17 @@ mod tests {
         let mut source = Pile::open(&source_path).unwrap();
         let mut destination = Pile::open(&destination_path).unwrap();
 
-        let definition = CollectionDefinition::new(
-            collection_test_id(25),
-            collection_test_id(26),
-            collection_test_id(27),
-        );
+        let missing_descriptor = collection_test_collection(25);
         let missing_data = collection_test_hash(28);
         let missing_metadata = Inline::<Handle<SimpleArchive>>::new([29; 32]);
         let commit = CollectionCommit::sign(
             &SigningKey::from_bytes(&[30; 32]),
-            definition.id(),
+            missing_descriptor,
             missing_data,
             missing_metadata,
         );
         commit.verify_strict().unwrap();
-        let records = vec![
-            CollectionRecord::Definition(definition),
-            CollectionRecord::Commit(commit),
-        ];
+        let records = vec![CollectionRecord::Commit(commit)];
         for record in records.iter().copied() {
             source.insert(record).unwrap();
         }
@@ -3197,6 +3514,7 @@ mod tests {
             .contains_blob(Handle::<UnknownBlob>::from_hash(missing_data))
             .unwrap());
         assert!(!reader.contains_blob(missing_metadata).unwrap());
+        assert!(!reader.contains_blob(missing_descriptor).unwrap());
 
         drop(reader);
         destination.close().unwrap();
@@ -3250,31 +3568,34 @@ mod tests {
             .put::<UnknownBlob, _>(Bytes::from_source(b"unowned".to_vec()))
             .unwrap();
 
-        let definition = CollectionDefinition::new(
+        let descriptor = CollectionDescriptor::new(
             collection_test_id(10),
             collection_test_id(11),
             collection_test_id(12),
         );
+        let descriptor_handle = source
+            .put::<SimpleArchive, _>(descriptor.to_blob())
+            .unwrap();
+        assert_eq!(descriptor_handle, descriptor.handle());
         let key = SigningKey::from_bytes(&[13; 32]);
         let commit = CollectionCommit::sign(
             &key,
-            definition.id(),
+            descriptor_handle,
             Inline::<Hash<Blake3>>::new(data.raw),
             metadata,
         );
         commit.verify_strict().unwrap();
         let records = vec![
-            CollectionRecord::Definition(definition),
             CollectionRecord::Commit(commit),
             CollectionRecord::Merge(CollectionMerge::new(
-                definition.id(),
+                descriptor_handle,
                 collection_test_hash(14),
                 collection_test_hash(15),
                 collection_test_hash(16),
             )),
             CollectionRecord::Derive(CollectionDerive::new(
-                definition.id(),
-                collection_test_id(17),
+                descriptor_handle,
+                collection_test_collection(17),
                 collection_test_hash(16),
                 collection_test_hash(18),
             )),
@@ -3291,7 +3612,7 @@ mod tests {
                 WantRewritePolicy::Drop,
             )
             .unwrap();
-        assert_eq!(stats.retained_blobs, 3);
+        assert_eq!(stats.retained_blobs, 4);
 
         let actual_records = destination
             .records()
@@ -3300,7 +3621,12 @@ mod tests {
             .unwrap();
         assert_eq!(actual_records, sorted_collection_records(records));
         let reader = destination.reader().unwrap();
-        for retained in [attachment, data, metadata.transmute()] {
+        for retained in [
+            attachment,
+            data,
+            metadata.transmute(),
+            descriptor_handle.transmute(),
+        ] {
             assert!(reader.get::<Blob<UnknownBlob>, _>(retained).is_ok());
         }
         assert!(reader.get::<Blob<UnknownBlob>, _>(orphan).is_err());
