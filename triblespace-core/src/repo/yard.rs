@@ -1413,7 +1413,7 @@ mod tests {
     use super::*;
     use crate::blob::encodings::rawbytes::RawBytes;
     use crate::collection::{
-        empty_metadata_handle, CollectionCommit, CollectionDefinition, CollectionDerive,
+        empty_metadata_handle, CollectionCommit, CollectionDerive, CollectionDescriptor,
         CollectionMerge,
     };
     use crate::trible::TribleSet;
@@ -1443,6 +1443,20 @@ mod tests {
 
     fn pin_id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
+    }
+
+    fn merge_record(tag: u8) -> CollectionRecord {
+        let descriptor = CollectionDescriptor::new(
+            pin_id(tag),
+            pin_id(tag.wrapping_add(1)),
+            pin_id(tag.wrapping_add(2)),
+        );
+        CollectionRecord::Merge(CollectionMerge::new(
+            descriptor.handle(),
+            Inline::new([tag.wrapping_add(3); 32]),
+            Inline::new([tag.wrapping_add(4); 32]),
+            Inline::new([tag.wrapping_add(5); 32]),
+        ))
     }
 
     fn invalidate_collection_commit(commit: CollectionCommit) -> CollectionCommit {
@@ -1502,21 +1516,9 @@ mod tests {
     fn collection_records_form_a_deterministic_generation_union_and_write_young() {
         let config = YardConfig::default();
         let (_dir, paths, mut yard) = yard_with_paths(2, config);
-        let first = CollectionRecord::Definition(CollectionDefinition::new(
-            pin_id(21),
-            pin_id(22),
-            pin_id(23),
-        ));
-        let second = CollectionRecord::Definition(CollectionDefinition::new(
-            pin_id(24),
-            pin_id(25),
-            pin_id(26),
-        ));
-        let third = CollectionRecord::Definition(CollectionDefinition::new(
-            pin_id(27),
-            pin_id(28),
-            pin_id(29),
-        ));
+        let first = merge_record(21);
+        let second = merge_record(27);
+        let third = merge_record(33);
 
         yard.generations[1]
             .active_mut()
@@ -1583,22 +1585,26 @@ mod tests {
             .put::<RawBytes, _>(raw_blob(b"mentioned only by unsigned equations"))
             .unwrap();
 
-        let definition = CollectionDefinition::new(pin_id(31), pin_id(32), pin_id(33));
+        let descriptor = CollectionDescriptor::new(pin_id(31), pin_id(32), pin_id(33));
+        let descriptor_handle = yard
+            .put::<SimpleArchive, _>(CollectionDescriptor::to_blob(&descriptor))
+            .unwrap();
+        assert_eq!(descriptor_handle, descriptor.handle());
         let key = SigningKey::from_bytes(&[34; 32]);
-        let commit = CollectionCommit::sign(&key, definition.id(), Inline::new(data.raw), metadata);
+        let commit =
+            CollectionCommit::sign(&key, descriptor.handle(), Inline::new(data.raw), metadata);
         commit.verify_strict().unwrap();
         let records = vec![
-            CollectionRecord::Definition(definition),
             CollectionRecord::Commit(commit),
             CollectionRecord::Merge(CollectionMerge::new(
-                definition.id(),
+                descriptor.handle(),
                 Inline::new(equation_only.raw),
                 Inline::new([35; 32]),
                 Inline::new([36; 32]),
             )),
             CollectionRecord::Derive(CollectionDerive::new(
-                definition.id(),
-                pin_id(37),
+                descriptor.handle(),
+                CollectionDescriptor::new(pin_id(37), pin_id(38), pin_id(39)).handle(),
                 Inline::new([36; 32]),
                 Inline::new(equation_only.raw),
             )),
@@ -1614,11 +1620,14 @@ mod tests {
         assert!(reader
             .get::<Blob<SimpleArchive>, SimpleArchive>(metadata)
             .is_ok());
+        assert!(reader
+            .get::<Blob<SimpleArchive>, SimpleArchive>(descriptor.handle())
+            .is_ok());
         assert!(reader.get::<Bytes, RawBytes>(equation_only).is_err());
         drop(reader);
 
         yard.reclaim().unwrap();
-        assert_eq!(pile_blob_count(&dir.path().join("gen-0.pile")), 3);
+        assert_eq!(pile_blob_count(&dir.path().join("gen-0.pile")), 4);
         let actual = yard
             .records()
             .unwrap()
@@ -1638,17 +1647,16 @@ mod tests {
         let forged_metadata = yard
             .put::<SimpleArchive, _>(TribleSet::new().to_blob())
             .unwrap();
-        let definition = CollectionDefinition::new(pin_id(38), pin_id(39), pin_id(40));
+        let descriptor = CollectionDescriptor::new(pin_id(38), pin_id(39), pin_id(40));
+        yard.put::<SimpleArchive, _>(CollectionDescriptor::to_blob(&descriptor))
+            .unwrap();
         let invalid = invalidate_collection_commit(CollectionCommit::sign(
             &SigningKey::from_bytes(&[41; 32]),
-            definition.id(),
+            descriptor.handle(),
             Inline::new(forged_data.raw),
             forged_metadata,
         ));
-        let records = vec![
-            CollectionRecord::Definition(definition),
-            CollectionRecord::Commit(invalid),
-        ];
+        let records = vec![CollectionRecord::Commit(invalid)];
         for record in records.iter().copied() {
             yard.insert(record).unwrap();
         }
@@ -1675,27 +1683,26 @@ mod tests {
     #[test]
     fn valid_dangling_native_commit_survives_yard_collection_and_reclaim() {
         let (dir, mut yard) = yard_with(1, YardConfig::default());
-        let definition = CollectionDefinition::new(pin_id(42), pin_id(43), pin_id(44));
+        let descriptor = CollectionDescriptor::new(pin_id(42), pin_id(43), pin_id(44));
+        yard.put::<SimpleArchive, _>(CollectionDescriptor::to_blob(&descriptor))
+            .unwrap();
         let missing_data = Inline::new([45; 32]);
         let missing_metadata = Inline::<Handle<SimpleArchive>>::new([46; 32]);
         let commit = CollectionCommit::sign(
             &SigningKey::from_bytes(&[47; 32]),
-            definition.id(),
+            descriptor.handle(),
             missing_data,
             missing_metadata,
         );
         commit.verify_strict().unwrap();
-        let records = vec![
-            CollectionRecord::Definition(definition),
-            CollectionRecord::Commit(commit),
-        ];
+        let records = vec![CollectionRecord::Commit(commit)];
         for record in records.iter().copied() {
             yard.insert(record).unwrap();
         }
 
         yard.collect(&RetentionRoots::new()).unwrap();
         yard.reclaim().unwrap();
-        assert_eq!(pile_blob_count(&dir.path().join("gen-0.pile")), 0);
+        assert_eq!(pile_blob_count(&dir.path().join("gen-0.pile")), 1);
         let mut actual = yard
             .records()
             .unwrap()

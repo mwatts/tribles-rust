@@ -225,7 +225,7 @@ impl crate::repo::StorageClose for MemoryRepo {
 mod tests {
     use super::*;
 
-    use crate::collection::{CollectionDefinition, CollectionMerge};
+    use crate::collection::{CollectionDerive, CollectionDescriptor, CollectionMerge};
 
     fn handle(byte: u8) -> Inline<Handle<UnknownBlob>> {
         Inline::new([byte; 32])
@@ -302,23 +302,34 @@ mod tests {
 
     #[test]
     fn collection_records_are_idempotent_and_intrinsically_ordered() {
-        let definition = CollectionRecord::Definition(CollectionDefinition::new(
+        let descriptor = CollectionDescriptor::new(
             Id::new([1; 16]).unwrap(),
             Id::new([2; 16]).unwrap(),
             Id::new([3; 16]).unwrap(),
-        ));
+        );
+        let target = CollectionDescriptor::new(
+            Id::new([7; 16]).unwrap(),
+            Id::new([8; 16]).unwrap(),
+            Id::new([9; 16]).unwrap(),
+        );
         let merge = CollectionRecord::Merge(CollectionMerge::new(
-            definition.id(),
+            descriptor.handle(),
             Inline::new([4; 32]),
             Inline::new([5; 32]),
             Inline::new([6; 32]),
         ));
-        let mut expected = vec![definition, merge];
+        let derive = CollectionRecord::Derive(CollectionDerive::new(
+            descriptor.handle(),
+            target.handle(),
+            Inline::new([10; 32]),
+            Inline::new([11; 32]),
+        ));
+        let mut expected = vec![derive, merge];
         expected.sort_unstable_by_key(CollectionRecord::id);
 
         let mut repo = MemoryRepo::default();
         CollectionStore::insert(&mut repo, merge).unwrap();
-        CollectionStore::insert(&mut repo, definition).unwrap();
+        CollectionStore::insert(&mut repo, derive).unwrap();
         CollectionStore::insert(&mut repo, merge).unwrap();
 
         let actual = repo

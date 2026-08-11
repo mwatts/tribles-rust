@@ -933,7 +933,7 @@ mod tests {
     use futures::executor::block_on;
     use object_store::memory::InMemory;
 
-    use crate::collection::{CollectionDefinition, CollectionStore};
+    use crate::collection::{CollectionDescriptor, CollectionMerge, CollectionStore};
     use crate::repo::async_store::Blocking;
     use crate::repo::StorageFlush;
 
@@ -945,10 +945,16 @@ mod tests {
     }
 
     fn record(tag: u8) -> CollectionRecord {
-        CollectionRecord::Definition(CollectionDefinition::new(
+        let descriptor = CollectionDescriptor::new(
             Id::new([tag; 16]).unwrap(),
             Id::new([tag.wrapping_add(1).max(1); 16]).unwrap(),
             Id::new([tag.wrapping_add(2).max(1); 16]).unwrap(),
+        );
+        CollectionRecord::Merge(CollectionMerge::new(
+            descriptor.handle(),
+            Inline::new([tag.wrapping_add(3); 32]),
+            Inline::new([tag.wrapping_add(4); 32]),
+            Inline::new([tag.wrapping_add(5); 32]),
         ))
     }
 

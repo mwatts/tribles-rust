@@ -876,7 +876,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collection::CollectionDefinition;
+    use crate::collection::{CollectionDescriptor, CollectionMerge};
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::pile::Pile;
     use futures::executor::block_on;
@@ -897,7 +897,13 @@ mod tests {
     #[test]
     fn collection_records_forward_through_the_store_mutex() {
         let id = |byte| Id::new([byte; 16]).unwrap();
-        let record = CollectionRecord::Definition(CollectionDefinition::new(id(1), id(2), id(3)));
+        let descriptor = CollectionDescriptor::new(id(1), id(2), id(3));
+        let record = CollectionRecord::Merge(CollectionMerge::new(
+            descriptor.handle(),
+            Inline::new([4; 32]),
+            Inline::new([5; 32]),
+            Inline::new([6; 32]),
+        ));
         let mut lazy = Lazy::new(MemoryRepo::default());
 
         CollectionStore::insert(&mut lazy, record).unwrap();

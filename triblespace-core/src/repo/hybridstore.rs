@@ -174,7 +174,7 @@ where
 mod tests {
     use super::*;
 
-    use crate::collection::CollectionDefinition;
+    use crate::collection::{CollectionDescriptor, CollectionMerge};
     use crate::repo::memoryrepo::MemoryRepo;
 
     fn id(byte: u8) -> Id {
@@ -183,7 +183,13 @@ mod tests {
 
     #[test]
     fn collection_records_delegate_only_to_the_record_side() {
-        let record = CollectionRecord::Definition(CollectionDefinition::new(id(1), id(2), id(3)));
+        let descriptor = CollectionDescriptor::new(id(1), id(2), id(3));
+        let record = CollectionRecord::Merge(CollectionMerge::new(
+            descriptor.handle(),
+            Inline::new([4; 32]),
+            Inline::new([5; 32]),
+            Inline::new([6; 32]),
+        ));
         let mut hybrid = HybridStore::new(MemoryRepo::default(), MemoryRepo::default());
 
         CollectionStore::insert(&mut hybrid, record).unwrap();
