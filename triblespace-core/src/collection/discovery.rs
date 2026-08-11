@@ -172,7 +172,7 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
 
-    use crate::collection::{CollectionData, CollectionId, empty_metadata_handle};
+    use crate::collection::{empty_metadata_handle, CollectionData, CollectionId};
     use crate::inline::Inline;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]

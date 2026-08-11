@@ -1,7 +1,7 @@
 //! Narrow owned facade for one scoped collection.
 //!
 //! [`Collection`] owns the storage, canonical `SimpleArchive`-union
-//! definition, and signing key needed to publish [`Fragment`] values and read
+//! descriptor, and signing key needed to publish [`Fragment`] values and read
 //! the complete known union authorized by that same key. It is not a
 //! repository abstraction: it has no head, branch, CAS, retry, read-admission,
 //! or planning policy.
@@ -27,26 +27,26 @@ use super::simplearchive_union::{
 };
 use super::{
     collection_physical_cover, discover_collection_records, resolve_collection_semantics,
-    CollectionClaimValidation, CollectionCommit, CollectionData, CollectionDefinition,
-    CollectionDiscoveryError, CollectionFunctionalConflict, CollectionResolutionError,
-    CollectionStore, CollectionValidationRequest,
+    CollectionClaimValidation, CollectionCommit, CollectionData, CollectionDescriptor,
+    CollectionDiscoveryError, CollectionFunctionalConflict, CollectionId,
+    CollectionResolutionError, CollectionStore, CollectionValidationRequest, RecordDecodeError,
 };
 
 /// A scoped `SimpleArchive`-union collection and its signing authority.
 ///
-/// Construction is pure with respect to `storage`: the canonical definition
+/// Construction is pure with respect to `storage`: the canonical descriptor
 /// is derived in memory and is not inserted until a [`commit`](Self::commit)
 /// publication begins.
 pub struct Collection<S> {
     storage: S,
-    definition: CollectionDefinition,
+    descriptor: CollectionDescriptor,
     signing_key: SigningKey,
 }
 
 /// Failure to materialize the complete known value of an owned collection.
 ///
 /// Strictly verified commits by this collection's own public key are ground
-/// truth, so their definition, data, and metadata fail loud. A record with an
+/// truth, so their descriptor, data, and metadata fail loud. A record with an
 /// invalid signature authenticates none of its fields and is ignored as an
 /// inert discovery diagnostic. Unsigned equations are only replaceable cache
 /// evidence: missing or invalid equations are omitted from the resolved
@@ -55,11 +55,34 @@ pub struct Collection<S> {
 pub enum CollectionMaterializationError<RecordsError, ReaderError, MetaError, GetError> {
     /// Native collection-record discovery did not complete.
     Discovery(CollectionDiscoveryError<RecordsError>),
-    /// At least one own commit was observed, but its canonical collection
-    /// definition was absent from the same record view.
-    MissingDefinition {
-        /// Intrinsic collection definition id.
-        collection: Id,
+    /// An own commit's canonical descriptor blob could not be fetched.
+    DescriptorGet {
+        /// Canonical collection-descriptor handle.
+        collection: CollectionId,
+        /// Backend fetch failure.
+        source: GetError,
+    },
+    /// The fetched descriptor bytes were not the exact canonical descriptor
+    /// archive named by the collection handle.
+    InvalidDescriptor {
+        /// Canonical collection-descriptor handle.
+        collection: CollectionId,
+        /// Structural descriptor decoding failure.
+        source: RecordDecodeError,
+    },
+    /// The fetched descriptor bytes did not hash to the handle named by the
+    /// commits.
+    DescriptorIdentity {
+        /// Descriptor handle named by the commits.
+        expected: CollectionId,
+        /// Handle recomputed from the fetched bytes.
+        actual: CollectionId,
+    },
+    /// The fetched canonical descriptor did not equal the descriptor expected
+    /// by this owned facade.
+    DescriptorMismatch {
+        /// Descriptor handle named by this facade and its commits.
+        collection: CollectionId,
     },
     /// The blob reader could not be created after record discovery.
     Reader(ReaderError),
@@ -126,9 +149,26 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Discovery(source) => source.fmt(f),
-            Self::MissingDefinition { collection } => write!(
+            Self::DescriptorGet { collection, source } => write!(
                 f,
-                "owned collection {collection:X} has commits but no canonical definition"
+                "failed to fetch owned collection descriptor {}: {source}",
+                hex::encode_upper(collection.raw),
+            ),
+            Self::InvalidDescriptor { collection, source } => write!(
+                f,
+                "owned collection descriptor {} is invalid: {source}",
+                hex::encode_upper(collection.raw),
+            ),
+            Self::DescriptorIdentity { expected, actual } => write!(
+                f,
+                "owned collection descriptor bytes hash to {} instead of {}",
+                hex::encode_upper(actual.raw),
+                hex::encode_upper(expected.raw),
+            ),
+            Self::DescriptorMismatch { collection } => write!(
+                f,
+                "owned collection descriptor {} does not match the facade descriptor",
+                hex::encode_upper(collection.raw),
             ),
             Self::Reader(source) => write!(f, "failed to open collection blob view: {source}"),
             Self::CommitDataGet {
@@ -188,7 +228,9 @@ where
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Discovery(source) => Some(source),
-            Self::MissingDefinition { .. } => None,
+            Self::DescriptorGet { source, .. } => Some(source),
+            Self::InvalidDescriptor { source, .. } => Some(source),
+            Self::DescriptorIdentity { .. } | Self::DescriptorMismatch { .. } => None,
             Self::Reader(source) => Some(source),
             Self::CommitDataGet { source, .. } => Some(source),
             Self::InvalidCommitData { source, .. } => Some(source),
@@ -206,14 +248,14 @@ impl<S> Collection<S> {
     pub fn new(storage: S, scope: Id, signing_key: SigningKey) -> Self {
         Self {
             storage,
-            definition: simplearchive_union::definition(scope),
+            descriptor: simplearchive_union::descriptor(scope),
             signing_key,
         }
     }
 
-    /// Canonical collection definition derived from the constructor scope.
-    pub fn definition(&self) -> &CollectionDefinition {
-        &self.definition
+    /// Canonical collection descriptor derived from the constructor scope.
+    pub fn descriptor(&self) -> &CollectionDescriptor {
+        &self.descriptor
     }
 
     /// Borrow the underlying storage.
@@ -254,7 +296,7 @@ where
     > {
         simplearchive_union::publish_fragment_commit(
             &mut self.storage,
-            &self.definition,
+            &self.descriptor,
             fragment,
             &self.signing_key,
         )
@@ -291,7 +333,7 @@ where
     /// appears on a later call. The returned set is nevertheless complete for
     /// all own commits observed by this pass, or the call returns an error
     /// instead of a partial set. If no own commit is observed, the result is
-    /// empty even when the collection definition is absent.
+    /// empty without opening a blob view or fetching the collection descriptor.
     pub fn materialize(
         &mut self,
     ) -> Result<
@@ -305,7 +347,7 @@ where
     > {
         let discovered = discover_collection_records(&mut self.storage)
             .map_err(CollectionMaterializationError::Discovery)?;
-        let collection = self.definition.id();
+        let collection = self.descriptor.handle();
         let public_key = self.signing_key.verifying_key().to_bytes();
 
         let authorized: BTreeSet<_> = discovered
@@ -320,14 +362,35 @@ where
         if authorized.is_empty() {
             return Ok(TribleSet::new());
         }
-        if !discovered.definitions().contains(&self.definition) {
-            return Err(CollectionMaterializationError::MissingDefinition { collection });
-        }
-
         let reader = self
             .storage
             .reader()
             .map_err(CollectionMaterializationError::Reader)?;
+
+        // The descriptor handle is the collection identity. Once an own
+        // commit makes this collection nonempty, its descriptor is mandatory
+        // ground truth just like the signed data and metadata below. Fetch by
+        // the exact handle, recompute the identity rather than trusting a
+        // cached handle, decode the canonical archive, and bind it back to the
+        // facade's expected semantics before interpreting any element.
+        let descriptor_blob: Blob<SimpleArchive> = reader.get(collection).map_err(|source| {
+            CollectionMaterializationError::DescriptorGet { collection, source }
+        })?;
+        let descriptor_blob = Blob::<SimpleArchive>::new(descriptor_blob.bytes.clone());
+        let actual_descriptor = descriptor_blob.get_handle();
+        if actual_descriptor != collection {
+            return Err(CollectionMaterializationError::DescriptorIdentity {
+                expected: collection,
+                actual: actual_descriptor,
+            });
+        }
+        let decoded_descriptor =
+            CollectionDescriptor::decode(&descriptor_blob).map_err(|source| {
+                CollectionMaterializationError::InvalidDescriptor { collection, source }
+            })?;
+        if decoded_descriptor != self.descriptor {
+            return Err(CollectionMaterializationError::DescriptorMismatch { collection });
+        }
 
         // Authenticate and exact-validate every mandatory leaf first. Each
         // signed endpoint is fetched once and remains available for fallback;
@@ -347,7 +410,7 @@ where
                     data,
                     source,
                 })?;
-            simplearchive_union::validate_commit(&self.definition, claim, &data_blob).map_err(
+            simplearchive_union::validate_commit(&self.descriptor, claim, &data_blob).map_err(
                 |source| CollectionMaterializationError::InvalidCommitData {
                     commit: claim.id(),
                     source,
@@ -727,8 +790,8 @@ mod tests {
         let mut collection = Collection::new(MemoryRepo::default(), scope, signing_key);
 
         assert_eq!(
-            collection.definition(),
-            &simplearchive_union::definition(scope)
+            collection.descriptor(),
+            &simplearchive_union::descriptor(scope)
         );
         assert!(collection.storage().blobs.is_empty());
         assert!(collection.storage_mut().records().unwrap().next().is_none());
@@ -775,9 +838,9 @@ mod tests {
         assert!(after_second > after_first);
         assert_eq!(collection.storage().blobs.len(), after_second);
 
-        let definition = *collection.definition();
+        let descriptor = *collection.descriptor();
         let discovered = discover_collection_records(collection.storage_mut()).unwrap();
-        assert_eq!(discovered.definitions(), &[definition]);
+        assert_eq!(discovered.definitions(), &[descriptor]);
         assert_eq!(
             discovered
                 .commits()
@@ -834,13 +897,13 @@ mod tests {
         let own_key = SigningKey::from_bytes(&[7; 32]);
         let foreign_key = SigningKey::from_bytes(&[8; 32]);
         let mut collection = Collection::new(MemoryRepo::default(), id(1), own_key);
-        let definition = *collection.definition();
+        let descriptor = *collection.descriptor();
         let data = archive(1);
         let metadata: Blob<SimpleArchive> = TribleSet::new().to_blob();
 
         let foreign = simplearchive_union::publish_commit(
             collection.storage_mut(),
-            &definition,
+            &descriptor,
             &data,
             &metadata,
             &foreign_key,
@@ -858,12 +921,12 @@ mod tests {
     fn own_commit_without_its_definition_fails_loud() {
         let scope = id(1);
         let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let definition = simplearchive_union::definition(scope);
+        let descriptor = simplearchive_union::descriptor(scope);
         let data = archive(1);
         let metadata: Blob<SimpleArchive> = TribleSet::new().to_blob();
         let commit = CollectionCommit::sign(
             &signing_key,
-            definition.id(),
+            descriptor.handle(),
             Handle::<SimpleArchive>::to_hash(data.get_handle()),
             metadata.get_handle(),
         );
@@ -876,7 +939,7 @@ mod tests {
         assert!(matches!(
             collection.materialize(),
             Err(CollectionMaterializationError::MissingDefinition { collection })
-                if collection == definition.id()
+                if collection == descriptor.handle()
         ));
     }
 
@@ -1009,9 +1072,9 @@ mod tests {
         expected += right_fragment.facts().clone();
         collection.commit(left_fragment).unwrap();
         collection.commit(right_fragment).unwrap();
-        let definition = *collection.definition();
+        let descriptor = *collection.descriptor();
 
-        simplearchive_union::publish_merge(collection.storage_mut(), &definition, &left, &right)
+        simplearchive_union::publish_merge(collection.storage_mut(), &descriptor, &left, &right)
             .unwrap();
 
         assert_eq!(collection.materialize().unwrap(), expected);
@@ -1036,18 +1099,18 @@ mod tests {
         let first_commit = collection.commit(first).unwrap();
         let second_commit = collection.commit(second).unwrap();
         let third_commit = collection.commit(third).unwrap();
-        let definition = *collection.definition();
+        let descriptor = *collection.descriptor();
 
         let (_, first_two) = simplearchive_union::publish_merge(
             collection.storage_mut(),
-            &definition,
+            &descriptor,
             &first_blob,
             &second_blob,
         )
         .unwrap();
         let (_, top) = simplearchive_union::publish_merge(
             collection.storage_mut(),
-            &definition,
+            &descriptor,
             &first_two,
             &third_blob,
         )
@@ -1088,34 +1151,34 @@ mod tests {
             expected += fragment.facts().clone();
             commits.push(collection.commit(fragment).unwrap());
         }
-        let definition = *collection.definition();
+        let descriptor = *collection.descriptor();
 
         // X is shared by two children. Reference-counted scratch must retain
         // it until both Y and Z have consumed it, even though none of X/Y/Z is
         // physically resident when the final top artifact is materialized.
         let (_, x) = simplearchive_union::publish_merge(
             collection.storage_mut(),
-            &definition,
+            &descriptor,
             &blobs[0],
             &blobs[1],
         )
         .unwrap();
         let (_, y) = simplearchive_union::publish_merge(
             collection.storage_mut(),
-            &definition,
+            &descriptor,
             &x,
             &blobs[2],
         )
         .unwrap();
         let (_, z) = simplearchive_union::publish_merge(
             collection.storage_mut(),
-            &definition,
+            &descriptor,
             &x,
             &blobs[3],
         )
         .unwrap();
         let (_, top) =
-            simplearchive_union::publish_merge(collection.storage_mut(), &definition, &y, &z)
+            simplearchive_union::publish_merge(collection.storage_mut(), &descriptor, &y, &z)
                 .unwrap();
 
         let mut keep = Vec::new();
@@ -1144,10 +1207,10 @@ mod tests {
         expected += right_fragment.facts().clone();
         let left = collection.commit(left_fragment).unwrap();
         let right = collection.commit(right_fragment).unwrap();
-        let definition = *collection.definition();
+        let descriptor = *collection.descriptor();
         let (_, merged) = simplearchive_union::publish_merge(
             collection.storage_mut(),
-            &definition,
+            &descriptor,
             &left_blob,
             &right_blob,
         )
@@ -1183,7 +1246,7 @@ mod tests {
         let left = collection.commit(left_fragment).unwrap();
         let right = collection.commit(right_fragment).unwrap();
         let broken = CollectionMerge::new(
-            collection.definition().id(),
+            collection.descriptor().id(),
             left.data(),
             right.data(),
             left.data(),

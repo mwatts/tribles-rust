@@ -11,16 +11,16 @@ use crate::inline::encodings::hash::Handle;
 use crate::repo::{BlobStoreGet, BlobStoreMeta};
 use crate::trible::TribleSet;
 
-use super::{validate_definition, SimpleArchiveUnionValidationError};
+use super::{validate_descriptor, SimpleArchiveUnionValidationError};
 use crate::collection::{
-    collection_physical_cover, CollectionData, CollectionDefinition, CollectionSemantics,
+    collection_physical_cover, CollectionData, CollectionDescriptor, CollectionSemantics,
 };
 
 /// Failure to materialize one resolved `SimpleArchive` union collection.
 #[derive(Debug)]
 pub enum MaterializationError<MetadataError, GetError> {
-    /// The supplied definition does not name this representation and recipe.
-    Definition(SimpleArchiveUnionValidationError),
+    /// The supplied descriptor does not name this representation and recipe.
+    Descriptor(SimpleArchiveUnionValidationError),
     /// Residency lookup failed for one semantic member.
     Metadata {
         /// Member whose residency could not be determined.
@@ -56,7 +56,7 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Definition(source) => write!(f, "invalid collection definition: {source}"),
+            Self::Descriptor(source) => write!(f, "invalid collection descriptor: {source}"),
             Self::Metadata { data, source } => write!(
                 f,
                 "failed to inspect collection member {}: {source}",
@@ -88,7 +88,7 @@ where
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Definition(source) => Some(source),
+            Self::Descriptor(source) => Some(source),
             Self::Metadata { source, .. } => Some(source),
             Self::Missing { .. } => None,
             Self::Get { source, .. } => Some(source),
@@ -113,7 +113,7 @@ where
 /// this boundary.
 pub fn materialize<R>(
     semantics: &CollectionSemantics,
-    definition: &CollectionDefinition,
+    descriptor: &CollectionDescriptor,
     reader: &R,
 ) -> Result<
     TribleSet,
@@ -125,9 +125,9 @@ pub fn materialize<R>(
 where
     R: BlobStoreMeta + BlobStoreGet + ?Sized,
 {
-    validate_definition(definition).map_err(MaterializationError::Definition)?;
+    validate_descriptor(descriptor).map_err(MaterializationError::Descriptor)?;
 
-    let collection = definition.id();
+    let collection = descriptor.handle();
     let mut resident = BTreeSet::new();
     for data in semantics.members(collection).into_iter().flatten().copied() {
         let handle = Handle::<SimpleArchive>::from_hash(data);
@@ -311,7 +311,7 @@ mod tests {
     }
 
     fn semantics(
-        definition: &CollectionDefinition,
+        descriptor: &CollectionDescriptor,
         roots: &[Blob<SimpleArchive>],
         merges: &[CollectionMerge],
     ) -> CollectionSemantics {
@@ -321,7 +321,7 @@ mod tests {
             .map(|(index, blob)| {
                 CollectionCommit::sign(
                     &SigningKey::from_bytes(&[(index + 1) as u8; 32]),
-                    definition.id(),
+                    descriptor.handle(),
                     data(blob),
                     crate::collection::empty_metadata_handle(),
                 )
@@ -329,7 +329,7 @@ mod tests {
             .collect();
 
         let mut records = MemoryRepo::default();
-        CollectionStore::insert(&mut records, CollectionRecord::Definition(*definition)).unwrap();
+        CollectionStore::insert(&mut records, CollectionRecord::Descriptor(*descriptor)).unwrap();
         for commit in &commits {
             CollectionStore::insert(&mut records, CollectionRecord::Commit(*commit)).unwrap();
         }
@@ -355,11 +355,11 @@ mod tests {
 
     #[test]
     fn empty_collection_materializes_without_store_access() {
-        let definition = super::super::definition(id(1));
+        let descriptor = super::super::descriptor(id(1));
         let reader = ProbeReader::default();
 
         assert_eq!(
-            materialize(&CollectionSemantics::default(), &definition, &reader).unwrap(),
+            materialize(&CollectionSemantics::default(), &descriptor, &reader).unwrap(),
             TribleSet::new(),
         );
         assert!(reader.metadata_calls.borrow().is_empty());
@@ -368,15 +368,15 @@ mod tests {
 
     #[test]
     fn direct_resident_leaves_materialize_in_deterministic_handle_order() {
-        let definition = super::super::definition(id(1));
+        let descriptor = super::super::descriptor(id(1));
         let left = archive([row(1, 1, 1)]);
         let right = archive([row(2, 1, 2)]);
-        let semantics = semantics(&definition, &[left.clone(), right.clone()], &[]);
+        let semantics = semantics(&descriptor, &[left.clone(), right.clone()], &[]);
         let mut reader = ProbeReader::default();
         reader.insert(right.clone());
         reader.insert(left.clone());
 
-        let actual = materialize(&semantics, &definition, &reader).unwrap();
+        let actual = materialize(&semantics, &descriptor, &reader).unwrap();
         let expected = decode(super::super::join(&left, &right).unwrap());
         assert_eq!(actual, expected);
 
@@ -389,17 +389,22 @@ mod tests {
 
     #[test]
     fn resident_compacted_result_replaces_nonresident_inputs() {
-        let definition = super::super::definition(id(1));
+        let descriptor = super::super::descriptor(id(1));
         let left = archive([row(1, 1, 1)]);
         let right = archive([row(2, 1, 2)]);
         let result = super::super::join(&left, &right).unwrap();
-        let merge = CollectionMerge::new(definition.id(), data(&left), data(&right), data(&result));
-        let semantics = semantics(&definition, &[left, right], &[merge]);
+        let merge = CollectionMerge::new(
+            descriptor.handle(),
+            data(&left),
+            data(&right),
+            data(&result),
+        );
+        let semantics = semantics(&descriptor, &[left, right], &[merge]);
         let mut reader = ProbeReader::default();
         reader.insert(result.clone());
 
         assert_eq!(
-            materialize(&semantics, &definition, &reader).unwrap(),
+            materialize(&semantics, &descriptor, &reader).unwrap(),
             decode(result.clone())
         );
         assert_eq!(*reader.get_calls.borrow(), vec![result.get_handle().raw]);
@@ -407,7 +412,7 @@ mod tests {
 
     #[test]
     fn overlapping_upper_cover_is_fetched_only_once() {
-        let definition = super::super::definition(id(1));
+        let descriptor = super::super::descriptor(id(1));
         let a = archive([row(1, 1, 1)]);
         let b = archive([row(2, 1, 2)]);
         let c = archive([row(3, 1, 3)]);
@@ -416,16 +421,16 @@ mod tests {
         let bc = super::super::join(&b, &c).unwrap();
         let bcd = super::super::join(&bc, &d).unwrap();
         let merges = [
-            CollectionMerge::new(definition.id(), data(&a), data(&b), data(&ab)),
-            CollectionMerge::new(definition.id(), data(&b), data(&c), data(&bc)),
-            CollectionMerge::new(definition.id(), data(&bc), data(&d), data(&bcd)),
+            CollectionMerge::new(descriptor.handle(), data(&a), data(&b), data(&ab)),
+            CollectionMerge::new(descriptor.handle(), data(&b), data(&c), data(&bc)),
+            CollectionMerge::new(descriptor.handle(), data(&bc), data(&d), data(&bcd)),
         ];
-        let semantics = semantics(&definition, &[a.clone(), b, c, d], &merges);
+        let semantics = semantics(&descriptor, &[a.clone(), b, c, d], &merges);
         let mut reader = ProbeReader::default();
         reader.insert(a.clone());
         reader.insert(bcd.clone());
 
-        let actual = materialize(&semantics, &definition, &reader).unwrap();
+        let actual = materialize(&semantics, &descriptor, &reader).unwrap();
         let expected = decode(super::super::join(&a, &bcd).unwrap());
         assert_eq!(actual, expected);
         let mut calls = reader.get_calls.borrow().clone();
@@ -437,17 +442,22 @@ mod tests {
 
     #[test]
     fn missing_frontier_is_reported_before_fetching() {
-        let definition = super::super::definition(id(1));
+        let descriptor = super::super::descriptor(id(1));
         let left = archive([row(1, 1, 1)]);
         let right = archive([row(2, 1, 2)]);
         let result = super::super::join(&left, &right).unwrap();
-        let merge = CollectionMerge::new(definition.id(), data(&left), data(&right), data(&result));
-        let semantics = semantics(&definition, &[left.clone(), right], &[merge]);
+        let merge = CollectionMerge::new(
+            descriptor.handle(),
+            data(&left),
+            data(&right),
+            data(&result),
+        );
+        let semantics = semantics(&descriptor, &[left.clone(), right], &[merge]);
         let mut reader = ProbeReader::default();
         reader.insert(left);
 
         assert!(matches!(
-            materialize(&semantics, &definition, &reader),
+            materialize(&semantics, &descriptor, &reader),
             Err(MaterializationError::Missing { obligations })
                 if obligations == BTreeSet::from([data(&result)])
         ));
@@ -457,12 +467,12 @@ mod tests {
     #[test]
     fn wrong_definition_fails_before_store_access() {
         let wrong =
-            CollectionDefinition::new(id(1), id(2), super::super::TRIBLE_SET_UNION_RECIPE_V1);
+            CollectionDescriptor::new(id(1), id(2), super::super::TRIBLE_SET_UNION_RECIPE_V1);
         let reader = ProbeReader::default();
 
         assert!(matches!(
             materialize(&CollectionSemantics::default(), &wrong, &reader),
-            Err(MaterializationError::Definition(
+            Err(MaterializationError::Descriptor(
                 SimpleArchiveUnionValidationError::WrongRepresentation { .. }
             ))
         ));
@@ -472,9 +482,9 @@ mod tests {
 
     #[test]
     fn metadata_and_get_failures_remain_distinct() {
-        let definition = super::super::definition(id(1));
+        let descriptor = super::super::descriptor(id(1));
         let leaf = archive([row(1, 1, 1)]);
-        let semantics = semantics(&definition, std::slice::from_ref(&leaf), &[]);
+        let semantics = semantics(&descriptor, std::slice::from_ref(&leaf), &[]);
 
         let mut metadata_failure = ProbeReader::default();
         metadata_failure.insert(leaf.clone());
@@ -482,7 +492,7 @@ mod tests {
             .metadata_failures
             .insert(leaf.get_handle().raw);
         assert!(matches!(
-            materialize(&semantics, &definition, &metadata_failure),
+            materialize(&semantics, &descriptor, &metadata_failure),
             Err(MaterializationError::Metadata {
                 data: failed,
                 source: ProbeMetadataError::Injected,
@@ -493,7 +503,7 @@ mod tests {
         get_failure.insert(leaf.clone());
         get_failure.get_failures.insert(leaf.get_handle().raw);
         assert!(matches!(
-            materialize(&semantics, &definition, &get_failure),
+            materialize(&semantics, &descriptor, &get_failure),
             Err(MaterializationError::Get {
                 data: failed,
                 source: ProbeGetError::Injected,
@@ -503,14 +513,14 @@ mod tests {
 
     #[test]
     fn malformed_resident_element_is_a_decode_failure() {
-        let definition = super::super::definition(id(1));
+        let descriptor = super::super::descriptor(id(1));
         let malformed = Blob::new(vec![0_u8; TRIBLE_LEN - 1].into());
-        let semantics = semantics(&definition, std::slice::from_ref(&malformed), &[]);
+        let semantics = semantics(&descriptor, std::slice::from_ref(&malformed), &[]);
         let mut reader = ProbeReader::default();
         reader.insert(malformed.clone());
 
         assert!(matches!(
-            materialize(&semantics, &definition, &reader),
+            materialize(&semantics, &descriptor, &reader),
             Err(MaterializationError::InvalidElement {
                 data: failed,
                 source: UnarchiveError::BadArchive,

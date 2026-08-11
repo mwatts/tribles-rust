@@ -3,7 +3,7 @@
 //!
 //! The SimpleArchive and raw SuccinctArchive collections use the same
 //! [`TRIBLE_SET_UNION_RECIPE_V1`](super::simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1):
-//! the recipe names the set-union law, while the collection definition's
+//! the recipe names the set-union law, while the collection descriptor's
 //! representation field distinguishes their bytes. The canonical conversion
 //! is therefore a join homomorphism:
 //!
@@ -30,18 +30,20 @@ use crate::inline::Inline;
 use crate::metadata::MetaDescribe;
 
 use super::simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1;
-use super::{CollectionData, CollectionDefinition, CollectionDerive, CollectionMerge};
+use super::{
+    CollectionData, CollectionDerive, CollectionDescriptor, CollectionId, CollectionMerge,
+};
 
-/// A collection definition participating in a validation failure.
+/// A collection descriptor participating in a validation failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DefinitionRole {
+pub enum DescriptorRole {
     /// Canonical SimpleArchive source of a derivation.
     Source,
     /// Canonical raw SuccinctArchive target or merge collection.
     Target,
 }
 
-impl fmt::Display for DefinitionRole {
+impl fmt::Display for DescriptorRole {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Source => formatter.write_str("source"),
@@ -80,22 +82,22 @@ impl fmt::Display for ElementRole {
 /// Failure to validate the canonical raw SuccinctArchive collection law.
 #[derive(Debug)]
 pub enum SuccinctArchiveUnionValidationError {
-    /// A definition names another blob representation.
+    /// A descriptor names another blob representation.
     WrongRepresentation {
-        /// Definition being checked.
-        role: DefinitionRole,
+        /// Descriptor being checked.
+        role: DescriptorRole,
         /// Required representation descriptor.
         expected: Id,
-        /// Representation found in the definition.
+        /// Representation found in the descriptor.
         actual: Id,
     },
-    /// A definition names another semantic recipe.
+    /// A descriptor names another semantic recipe.
     WrongRecipe {
-        /// Definition being checked.
-        role: DefinitionRole,
+        /// Descriptor being checked.
+        role: DescriptorRole,
         /// Required union recipe.
         expected: Id,
-        /// Recipe found in the definition.
+        /// Recipe found in the descriptor.
         actual: Id,
     },
     /// A derivation crosses dataset scopes.
@@ -105,14 +107,14 @@ pub enum SuccinctArchiveUnionValidationError {
         /// Target dataset scope.
         target: Id,
     },
-    /// A record names another collection definition.
+    /// A record names another collection descriptor.
     WrongCollection {
         /// Record endpoint being checked.
-        role: DefinitionRole,
-        /// Definition required at this endpoint.
-        expected: Id,
-        /// Definition named by the record.
-        actual: Id,
+        role: DescriptorRole,
+        /// Descriptor required at this endpoint.
+        expected: CollectionId,
+        /// Descriptor named by the record.
+        actual: CollectionId,
     },
     /// Supplied bytes do not have the content identity named by the record.
     EndpointMismatch {
@@ -162,7 +164,9 @@ impl fmt::Display for SuccinctArchiveUnionValidationError {
                 actual,
             } => write!(
                 formatter,
-                "record {role} collection {actual:X} does not match definition {expected:X}"
+                "record {role} collection {} does not match descriptor {}",
+                hex::encode_upper(actual.raw),
+                hex::encode_upper(expected.raw),
             ),
             Self::EndpointMismatch {
                 role,
@@ -206,8 +210,8 @@ impl Error for SuccinctArchiveUnionValidationError {
 ///
 /// This intentionally reuses the SimpleArchive collection's set-union recipe.
 /// Representation, not recipe proliferation, distinguishes the two lattices.
-pub fn definition(scope: Id) -> CollectionDefinition {
-    CollectionDefinition::new(
+pub fn descriptor(scope: Id) -> CollectionDescriptor {
+    CollectionDescriptor::new(
         scope,
         <SuccinctArchiveBlob as MetaDescribe>::id(),
         TRIBLE_SET_UNION_RECIPE_V1,
@@ -237,33 +241,33 @@ pub fn join(
 
 /// Validate an exact canonical `SimpleArchive -> SuccinctArchiveBlob` mapping.
 ///
-/// This checks both definitions, requires their dataset scopes to agree, binds
+/// This checks both descriptors, requires their dataset scopes to agree, binds
 /// the record and supplied endpoint bytes in both directions, validates the
 /// target's portable format, and compares it byte-for-byte with a fresh direct
 /// construction from the source.
 pub fn validate_derive(
-    source_definition: &CollectionDefinition,
-    target_definition: &CollectionDefinition,
+    source_descriptor: &CollectionDescriptor,
+    target_descriptor: &CollectionDescriptor,
     claim: &CollectionDerive,
     input: &Blob<SimpleArchive>,
     output: &Blob<SuccinctArchiveBlob>,
 ) -> Result<(), SuccinctArchiveUnionValidationError> {
-    validate_source_definition(source_definition)?;
-    validate_definition(target_definition)?;
-    if source_definition.scope() != target_definition.scope() {
+    validate_source_descriptor(source_descriptor)?;
+    validate_descriptor(target_descriptor)?;
+    if source_descriptor.scope() != target_descriptor.scope() {
         return Err(SuccinctArchiveUnionValidationError::ScopeMismatch {
-            source: source_definition.scope(),
-            target: target_definition.scope(),
+            source: source_descriptor.scope(),
+            target: target_descriptor.scope(),
         });
     }
     validate_collection(
-        DefinitionRole::Source,
-        source_definition.id(),
+        DescriptorRole::Source,
+        source_descriptor.handle(),
         claim.source(),
     )?;
     validate_collection(
-        DefinitionRole::Target,
-        target_definition.id(),
+        DescriptorRole::Target,
+        target_descriptor.handle(),
         claim.target(),
     )?;
 
@@ -284,14 +288,18 @@ pub fn validate_derive(
 /// exact-validates both inputs while constructing their canonical union;
 /// byte-for-byte equality with that union proves the claimed result canonical.
 pub fn validate_merge(
-    definition: &CollectionDefinition,
+    descriptor: &CollectionDescriptor,
     claim: &CollectionMerge,
     low: &Blob<SuccinctArchiveBlob>,
     high: &Blob<SuccinctArchiveBlob>,
     result: &Blob<SuccinctArchiveBlob>,
 ) -> Result<(), SuccinctArchiveUnionValidationError> {
-    validate_definition(definition)?;
-    validate_collection(DefinitionRole::Target, definition.id(), claim.collection())?;
+    validate_descriptor(descriptor)?;
+    validate_collection(
+        DescriptorRole::Target,
+        descriptor.handle(),
+        claim.collection(),
+    )?;
 
     let (expected_low, expected_high) = claim.inputs();
     validate_endpoint(ElementRole::MergeLow, expected_low, low)?;
@@ -305,52 +313,52 @@ pub fn validate_merge(
     Ok(())
 }
 
-fn validate_source_definition(
-    definition: &CollectionDefinition,
+fn validate_source_descriptor(
+    descriptor: &CollectionDescriptor,
 ) -> Result<(), SuccinctArchiveUnionValidationError> {
-    validate_definition_parts(
-        DefinitionRole::Source,
-        definition,
+    validate_descriptor_parts(
+        DescriptorRole::Source,
+        descriptor,
         <SimpleArchive as MetaDescribe>::id(),
     )
 }
 
-fn validate_definition(
-    definition: &CollectionDefinition,
+fn validate_descriptor(
+    descriptor: &CollectionDescriptor,
 ) -> Result<(), SuccinctArchiveUnionValidationError> {
-    validate_definition_parts(
-        DefinitionRole::Target,
-        definition,
+    validate_descriptor_parts(
+        DescriptorRole::Target,
+        descriptor,
         <SuccinctArchiveBlob as MetaDescribe>::id(),
     )
 }
 
-fn validate_definition_parts(
-    role: DefinitionRole,
-    definition: &CollectionDefinition,
+fn validate_descriptor_parts(
+    role: DescriptorRole,
+    descriptor: &CollectionDescriptor,
     expected_representation: Id,
 ) -> Result<(), SuccinctArchiveUnionValidationError> {
-    if definition.representation() != expected_representation {
+    if descriptor.representation() != expected_representation {
         return Err(SuccinctArchiveUnionValidationError::WrongRepresentation {
             role,
             expected: expected_representation,
-            actual: definition.representation(),
+            actual: descriptor.representation(),
         });
     }
-    if definition.recipe() != TRIBLE_SET_UNION_RECIPE_V1 {
+    if descriptor.recipe() != TRIBLE_SET_UNION_RECIPE_V1 {
         return Err(SuccinctArchiveUnionValidationError::WrongRecipe {
             role,
             expected: TRIBLE_SET_UNION_RECIPE_V1,
-            actual: definition.recipe(),
+            actual: descriptor.recipe(),
         });
     }
     Ok(())
 }
 
 fn validate_collection(
-    role: DefinitionRole,
-    expected: Id,
-    actual: Id,
+    role: DescriptorRole,
+    expected: CollectionId,
+    actual: CollectionId,
 ) -> Result<(), SuccinctArchiveUnionValidationError> {
     if actual != expected {
         return Err(SuccinctArchiveUnionValidationError::WrongCollection {
@@ -424,8 +432,8 @@ mod tests {
 
     #[test]
     fn definitions_share_scope_and_union_law_but_not_representation() {
-        let source = simplearchive_union::definition(id(1));
-        let target = definition(id(1));
+        let source = simplearchive_union::descriptor(id(1));
+        let target = descriptor(id(1));
 
         assert_eq!(source.scope(), target.scope());
         assert_eq!(source.recipe(), target.recipe());
@@ -443,8 +451,8 @@ mod tests {
 
     #[test]
     fn canonical_empty_is_the_derived_bottom_and_merge_identity() {
-        let source_definition = simplearchive_union::definition(id(1));
-        let target_definition = definition(id(1));
+        let source_descriptor = simplearchive_union::descriptor(id(1));
+        let target_descriptor = descriptor(id(1));
         let source_empty: Blob<SimpleArchive> = TribleSet::new().to_blob();
         let derived_empty = derive_element(&source_empty).unwrap();
         let canonical_empty = empty();
@@ -453,14 +461,14 @@ mod tests {
         assert_eq!(derived_empty.get_handle(), canonical_empty.get_handle());
 
         let derive = CollectionDerive::new(
-            source_definition.id(),
-            target_definition.id(),
+            source_descriptor.handle(),
+            target_descriptor.handle(),
             data_identity(&source_empty),
             data_identity(&canonical_empty),
         );
         validate_derive(
-            &source_definition,
-            &target_definition,
+            &source_descriptor,
+            &target_descriptor,
             &derive,
             &source_empty,
             &canonical_empty,
@@ -475,18 +483,18 @@ mod tests {
 
         let (low, high) = ordered(&canonical_empty, &element);
         let merge = CollectionMerge::new(
-            target_definition.id(),
+            target_descriptor.handle(),
             data_identity(low),
             data_identity(high),
             data_identity(&joined),
         );
-        validate_merge(&target_definition, &merge, low, high, &joined).unwrap();
+        validate_merge(&target_descriptor, &merge, low, high, &joined).unwrap();
     }
 
     #[test]
     fn derive_and_merge_commute_to_identical_canonical_bytes() {
-        let source_definition = simplearchive_union::definition(id(1));
-        let target_definition = definition(id(1));
+        let source_descriptor = simplearchive_union::descriptor(id(1));
+        let target_descriptor = descriptor(id(1));
         let shared = row(3, 10, 40);
         let left = archive([row(2, 10, 60), shared]);
         let right = archive([row(1, 10, 20), shared]);
@@ -509,14 +517,14 @@ mod tests {
             (&source_union, &derive_after_merge),
         ] {
             let claim = CollectionDerive::new(
-                source_definition.id(),
-                target_definition.id(),
+                source_descriptor.handle(),
+                target_descriptor.handle(),
                 data_identity(input),
                 data_identity(output),
             );
             validate_derive(
-                &source_definition,
-                &target_definition,
+                &source_descriptor,
+                &target_descriptor,
                 &claim,
                 input,
                 output,
@@ -526,32 +534,32 @@ mod tests {
 
         let (low, high) = ordered(&derived_left, &derived_right);
         let merge = CollectionMerge::new(
-            target_definition.id(),
+            target_descriptor.handle(),
             data_identity(low),
             data_identity(high),
             data_identity(&merge_after_derive),
         );
-        validate_merge(&target_definition, &merge, low, high, &merge_after_derive).unwrap();
+        validate_merge(&target_descriptor, &merge, low, high, &merge_after_derive).unwrap();
     }
 
     #[test]
     fn validators_reject_valid_but_wrong_canonical_outputs() {
-        let source_definition = simplearchive_union::definition(id(1));
-        let target_definition = definition(id(1));
+        let source_descriptor = simplearchive_union::descriptor(id(1));
+        let target_descriptor = descriptor(id(1));
         let input = archive([row(1, 9, 3)]);
         let wrong_source = archive([row(2, 9, 4)]);
         let wrong_output = derive_element(&wrong_source).unwrap();
         let claim = CollectionDerive::new(
-            source_definition.id(),
-            target_definition.id(),
+            source_descriptor.handle(),
+            target_descriptor.handle(),
             data_identity(&input),
             data_identity(&wrong_output),
         );
 
         assert!(matches!(
             validate_derive(
-                &source_definition,
-                &target_definition,
+                &source_descriptor,
+                &target_descriptor,
                 &claim,
                 &input,
                 &wrong_output,
@@ -565,35 +573,35 @@ mod tests {
         let wrong = empty();
         let (low, high) = ordered(&left, &right);
         let merge = CollectionMerge::new(
-            target_definition.id(),
+            target_descriptor.handle(),
             data_identity(low),
             data_identity(high),
             data_identity(&wrong),
         );
         assert_ne!(correct.bytes, wrong.bytes);
         assert!(matches!(
-            validate_merge(&target_definition, &merge, low, high, &wrong),
+            validate_merge(&target_descriptor, &merge, low, high, &wrong),
             Err(SuccinctArchiveUnionValidationError::WrongMergeResult)
         ));
     }
 
     #[test]
     fn malformed_target_is_rejected_before_equation_admission() {
-        let source_definition = simplearchive_union::definition(id(1));
-        let target_definition = definition(id(1));
+        let source_descriptor = simplearchive_union::descriptor(id(1));
+        let target_descriptor = descriptor(id(1));
         let input = archive([row(1, 9, 3)]);
         let malformed = Blob::<SuccinctArchiveBlob>::new(Bytes::from(vec![0xAA; 17]));
         let claim = CollectionDerive::new(
-            source_definition.id(),
-            target_definition.id(),
+            source_descriptor.handle(),
+            target_descriptor.handle(),
             data_identity(&input),
             data_identity(&malformed),
         );
 
         assert!(matches!(
             validate_derive(
-                &source_definition,
-                &target_definition,
+                &source_descriptor,
+                &target_descriptor,
                 &claim,
                 &input,
                 &malformed,

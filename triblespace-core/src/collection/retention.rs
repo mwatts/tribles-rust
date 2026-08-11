@@ -11,7 +11,6 @@
 //! cache policy may retain selected equations and materializations without
 //! weakening this ground-truth boundary.
 
-use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
@@ -23,16 +22,16 @@ use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
 use crate::repo::{BlobStoreMeta, RetentionRoots};
 
-use super::{CollectionData, CollectionResolution, DiscoveredCollectionRecords};
+use super::{CollectionData, CollectionId, CollectionResolution, DiscoveredCollectionRecords};
 
 /// A collection retention plan could not prove that every required blob stays
 /// available.
 #[derive(Debug)]
 pub enum CollectionRetentionError<MetadataError> {
-    /// An admitted commit's collection has no canonical definition record.
-    MissingDefinition {
-        /// Intrinsic collection id.
-        collection: Id,
+    /// An admitted commit's canonical collection descriptor blob is absent.
+    MissingDescriptor {
+        /// Canonical collection-descriptor handle.
+        collection: CollectionId,
     },
     /// Storage metadata lookup failed while establishing residency.
     Metadata {
@@ -60,8 +59,12 @@ pub enum CollectionRetentionError<MetadataError> {
 impl<MetadataError: fmt::Display> fmt::Display for CollectionRetentionError<MetadataError> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingDefinition { collection } => {
-                write!(f, "collection {collection:X} has no canonical definition")
+            Self::MissingDescriptor { collection } => {
+                write!(
+                    f,
+                    "collection descriptor {} is not resident",
+                    hex::encode_upper(collection.raw),
+                )
             }
             Self::Metadata { handle, source } => write!(
                 f,
@@ -102,12 +105,11 @@ where
 /// cannot retain anything. Admitted unsigned equations are deliberately
 /// ignored: validation and activation do not turn cache work into authority.
 ///
-/// Every admitted commit requires its referenced collection definition to be
-/// present in `records` and retains its signed data and metadata recursively.
-/// Native definition and commit records are not blobs and therefore do not
-/// appear in the returned roots. Planning fails if a required definition
-/// record, data blob, or metadata blob is absent instead of manufacturing a
-/// root for unavailable ground truth.
+/// Every admitted commit requires its referenced collection descriptor blob
+/// to be resident and retains the descriptor, signed data, and metadata
+/// recursively. Native commit records are not blobs and therefore do not
+/// appear in the returned roots. Planning fails if any required blob is absent
+/// instead of manufacturing a root for unavailable ground truth.
 ///
 /// The returned roots are a pure result, not a persisted retained-scope
 /// registry. A collector must rediscover, authorize, resolve, and plan again on
@@ -124,11 +126,6 @@ where
     R: BlobStoreMeta + ?Sized,
 {
     let admitted = resolution.admitted_claims();
-    let definitions: BTreeMap<_, _> = records
-        .definitions()
-        .iter()
-        .map(|definition| (definition.id(), definition))
-        .collect();
     let mut roots = RetentionRoots::new();
 
     for claim in records.commits() {
@@ -136,11 +133,12 @@ where
             continue;
         }
 
-        definitions.get(&claim.collection()).ok_or(
-            CollectionRetentionError::MissingDefinition {
+        if !require_resident(reader, claim.collection())? {
+            return Err(CollectionRetentionError::MissingDescriptor {
                 collection: claim.collection(),
-            },
-        )?;
+            });
+        }
+        roots.retain_recursive(claim.collection());
 
         let data_handle = Handle::<UnknownBlob>::from_hash(claim.data());
         if !require_resident(reader, data_handle)? {
@@ -244,16 +242,16 @@ mod tests {
         }
 
         let verdict = match request {
-            CollectionValidationRequest::Commit { definition, claim } => {
+            CollectionValidationRequest::Commit { descriptor, claim } => {
                 let Some(blob) = load_archive(reader, claim.data()) else {
                     return Ok(CollectionClaimValidation::Pending);
                 };
-                match simplearchive_union::validate_commit(definition, claim, &blob) {
+                match simplearchive_union::validate_commit(descriptor, claim, &blob) {
                     Ok(()) => CollectionClaimValidation::Accepted,
                     Err(error) => CollectionClaimValidation::Rejected(error),
                 }
             }
-            CollectionValidationRequest::Merge { definition, claim } => {
+            CollectionValidationRequest::Merge { descriptor, claim } => {
                 let (low, high) = claim.inputs();
                 let (Some(low), Some(high), Some(result)) = (
                     load_archive(reader, low),
@@ -262,7 +260,7 @@ mod tests {
                 ) else {
                     return Ok(CollectionClaimValidation::Pending);
                 };
-                match simplearchive_union::validate_merge(definition, claim, &low, &high, &result) {
+                match simplearchive_union::validate_merge(descriptor, claim, &low, &high, &result) {
                     Ok(()) => CollectionClaimValidation::Accepted,
                     Err(error) => CollectionClaimValidation::Rejected(error),
                 }
@@ -284,18 +282,18 @@ mod tests {
 
     fn insert_record_fixture(
         store: &mut MemoryRepo,
-        definition: &super::super::CollectionDefinition,
+        descriptor: &super::super::CollectionDescriptor,
         data: Blob<SimpleArchive>,
         metadata: Blob<SimpleArchive>,
         key: &SigningKey,
     ) -> CollectionCommit {
         let commit = CollectionCommit::sign(
             key,
-            definition.id(),
+            descriptor.handle(),
             self::data(&data),
             metadata.get_handle(),
         );
-        CollectionStore::insert(store, CollectionRecord::Definition(*definition)).unwrap();
+        CollectionStore::insert(store, CollectionRecord::Descriptor(*descriptor)).unwrap();
         store.blobs.insert(data);
         store.blobs.insert(metadata);
         CollectionStore::insert(store, CollectionRecord::Commit(commit)).unwrap();
@@ -304,7 +302,7 @@ mod tests {
 
     #[test]
     fn authorized_commits_are_exact_strong_roots_and_keep_attachments() {
-        let definition = simplearchive_union::definition(id(1));
+        let descriptor = simplearchive_union::descriptor(id(1));
         let key = SigningKey::from_bytes(&[7; 32]);
         let content_text: Blob<LongString> = "retained content".to_owned().to_blob();
         let content_text_handle = content_text.get_handle();
@@ -326,7 +324,7 @@ mod tests {
         store.blobs.insert(orphan);
         let content_handle = content.get_handle();
         let metadata_handle = metadata.get_handle();
-        let commit = insert_record_fixture(&mut store, &definition, content, metadata, &key);
+        let commit = insert_record_fixture(&mut store, &descriptor, content, metadata, &key);
 
         let records = discover_collection_records(&mut store).unwrap();
         let reader = store.reader().unwrap();
@@ -346,7 +344,7 @@ mod tests {
 
         store.keep(keep);
         let retained_records = discover_collection_records(&mut store).unwrap();
-        assert_eq!(retained_records.definitions(), &[definition]);
+        assert_eq!(retained_records.definitions(), &[descriptor]);
         assert_eq!(retained_records.commits(), &[commit]);
         let reader = store.reader().unwrap();
         assert!(reader
@@ -366,8 +364,8 @@ mod tests {
 
     #[test]
     fn unsigned_equations_add_no_strong_roots_when_grounded_or_ungrounded() {
-        let source = simplearchive_union::definition(id(1));
-        let target = simplearchive_union::definition(id(2));
+        let source = simplearchive_union::descriptor(id(1));
+        let target = simplearchive_union::descriptor(id(2));
         let key = SigningKey::from_bytes(&[7; 32]);
         let left = archive([row(1, 1, 1)]);
         let right = archive([row(2, 1, 2)]);
@@ -388,7 +386,7 @@ mod tests {
             empty_metadata.clone(),
             &key,
         );
-        CollectionStore::insert(&mut store, CollectionRecord::Definition(target)).unwrap();
+        CollectionStore::insert(&mut store, CollectionRecord::Descriptor(target)).unwrap();
 
         let active_merge_result = simplearchive_union::join(&left, &right).unwrap();
         let active_merge = CollectionMerge::new(
@@ -493,15 +491,19 @@ mod tests {
 
     #[test]
     fn missing_required_commit_ground_truth_is_rejected() {
-        let definition = simplearchive_union::definition(id(1));
+        let descriptor = simplearchive_union::descriptor(id(1));
         let key = SigningKey::from_bytes(&[7; 32]);
         let content = archive([row(1, 1, 1)]);
         let metadata = archive([row(2, 1, 2)]);
-        let commit =
-            CollectionCommit::sign(&key, definition.id(), data(&content), metadata.get_handle());
+        let commit = CollectionCommit::sign(
+            &key,
+            descriptor.handle(),
+            data(&content),
+            metadata.get_handle(),
+        );
 
         let mut complete = MemoryRepo::default();
-        CollectionStore::insert(&mut complete, CollectionRecord::Definition(definition)).unwrap();
+        CollectionStore::insert(&mut complete, CollectionRecord::Descriptor(descriptor)).unwrap();
         CollectionStore::insert(&mut complete, CollectionRecord::Commit(commit)).unwrap();
         complete.blobs.insert(content.clone());
         complete.blobs.insert(metadata.clone());
@@ -520,7 +522,7 @@ mod tests {
         assert!(matches!(
             plan_collection_retention(&missing_records, &resolution, &complete_reader),
             Err(CollectionRetentionError::MissingDefinition { collection })
-                if collection == definition.id()
+                if collection == descriptor.handle()
         ));
 
         let mut missing_data = MemoryBlobStore::new();

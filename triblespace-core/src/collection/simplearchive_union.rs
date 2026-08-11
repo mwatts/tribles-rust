@@ -35,8 +35,8 @@ use crate::repo::{BlobStore, BlobStorePut, StorageFlush};
 use crate::trible::{Fragment, Trible, TRIBLE_LEN};
 
 use super::{
-    CollectionCommit, CollectionData, CollectionDefinition, CollectionMerge, CollectionRecord,
-    CollectionStore,
+    CollectionCommit, CollectionData, CollectionDescriptor, CollectionId, CollectionMerge,
+    CollectionRecord, CollectionStore,
 };
 
 mod materialize;
@@ -76,12 +76,15 @@ impl fmt::Display for ElementRole {
 /// Failure to validate a commit or merge against this concrete collection kind.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SimpleArchiveUnionValidationError {
-    /// The definition names another blob representation.
+    /// The descriptor names another blob representation.
     WrongRepresentation { expected: Id, actual: Id },
-    /// The definition names another semantic recipe.
+    /// The descriptor names another semantic recipe.
     WrongRecipe { expected: Id, actual: Id },
-    /// The record belongs to another collection definition.
-    WrongCollection { expected: Id, actual: Id },
+    /// The record belongs to another collection descriptor.
+    WrongCollection {
+        expected: CollectionId,
+        actual: CollectionId,
+    },
     /// Supplied bytes do not have the content identity named by the record.
     EndpointMismatch {
         role: ElementRole,
@@ -110,7 +113,9 @@ impl fmt::Display for SimpleArchiveUnionValidationError {
             ),
             Self::WrongCollection { expected, actual } => write!(
                 f,
-                "record collection {actual:X} does not match definition {expected:X}"
+                "record collection {} does not match descriptor {}",
+                hex::encode_upper(actual.raw),
+                hex::encode_upper(expected.raw),
             ),
             Self::EndpointMismatch {
                 role,
@@ -157,7 +162,7 @@ impl Error for SimpleArchiveUnionValidationError {
 /// deterministic.
 #[derive(Debug)]
 pub enum PublicationError<PutError, InsertError, FlushError> {
-    /// The definition or collection data is invalid for this concrete kind.
+    /// The descriptor or collection data is invalid for this concrete kind.
     Validation(SimpleArchiveUnionValidationError),
     /// Commit metadata is not a canonical `SimpleArchive`.
     InvalidMetadata(UnarchiveError),
@@ -172,8 +177,6 @@ pub enum PublicationError<PutError, InsertError, FlushError> {
     },
     /// An element, result, metadata, or embedded-attachment write failed.
     DependencyPut(PutError),
-    /// The collection definition could not be admitted to the native record store.
-    DefinitionInsert(InsertError),
     /// The dependency durability barrier failed; no final record insertion was attempted.
     DependencyFlush(FlushError),
     /// The final commit or merge record could not be admitted to the native record store.
@@ -190,7 +193,7 @@ pub type PreparationError = PublicationError<Infallible, Infallible, Infallible>
 
 /// A canonical signed collection commit whose bytes have not been published.
 ///
-/// Preparation validates and normalizes the definition, data, metadata, and
+/// Preparation validates and normalizes the descriptor, data, metadata, and
 /// embedded fragment blobs entirely in memory. Call [`Self::stage`] to durably
 /// write every dependency while retaining the commit record itself. Dropping a
 /// prepared value has no storage effect.
@@ -198,7 +201,7 @@ pub type PreparationError = PublicationError<Infallible, Infallible, Infallible>
 #[must_use = "a prepared collection commit has no effect until it is staged and finalized"]
 pub struct PreparedCollectionCommit {
     embedded: Vec<Blob<UnknownBlob>>,
-    definition: CollectionDefinition,
+    descriptor: CollectionDescriptor,
     data: Blob<SimpleArchive>,
     metadata: Blob<SimpleArchive>,
     commit: CollectionCommit,
@@ -212,7 +215,7 @@ impl PreparedCollectionCommit {
 
     /// Durably stage every dependency without publishing the commit record.
     ///
-    /// The exact store-call order is the collection-definition record,
+    /// The exact store-call order is the collection descriptor blob,
     /// embedded blobs (in handle order), data, metadata, and then one
     /// durability flush.
     /// On success the returned value retains the same mutable store borrow, so
@@ -231,15 +234,15 @@ impl PreparedCollectionCommit {
     {
         let Self {
             embedded,
-            definition,
+            descriptor,
             data,
             metadata,
             commit,
         } = self;
 
         store
-            .insert(CollectionRecord::Definition(definition))
-            .map_err(PublicationError::DefinitionInsert)?;
+            .put::<SimpleArchive, _>(descriptor.to_blob())
+            .map_err(PublicationError::DependencyPut)?;
         for blob in embedded {
             store
                 .put::<UnknownBlob, _>(blob)
@@ -340,9 +343,6 @@ where
             Self::DependencyPut(error) => {
                 write!(f, "failed to write a collection dependency: {error}")
             }
-            Self::DefinitionInsert(error) => {
-                write!(f, "failed to insert a collection definition: {error}")
-            }
             Self::DependencyFlush(error) => {
                 write!(f, "failed to flush collection dependencies: {error}")
             }
@@ -365,15 +365,15 @@ where
             Self::InvalidMetadata(error) => Some(error),
             Self::InvalidEmbeddedBlob { .. } => None,
             Self::DependencyPut(error) => Some(error),
-            Self::DefinitionInsert(error) | Self::RecordInsert(error) => Some(error),
+            Self::RecordInsert(error) => Some(error),
             Self::DependencyFlush(error) | Self::RecordFlush(error) => Some(error),
         }
     }
 }
 
 /// Construct this collection kind for an extrinsic dataset scope.
-pub fn definition(scope: Id) -> CollectionDefinition {
-    CollectionDefinition::new(
+pub fn descriptor(scope: Id) -> CollectionDescriptor {
+    CollectionDescriptor::new(
         scope,
         <SimpleArchive as MetaDescribe>::id(),
         TRIBLE_SET_UNION_RECIPE_V1,
@@ -403,16 +403,16 @@ pub fn join(
 
 /// Validate a discovered commit as one canonical root of this collection.
 ///
-/// This binds the concrete definition, record collection, endpoint identity,
+/// This binds the concrete descriptor, record collection, endpoint identity,
 /// and element bytes in one check. The record's strict self-signature and the
 /// caller's authorization policy remain separate admission prerequisites.
 pub fn validate_commit(
-    definition: &CollectionDefinition,
+    descriptor: &CollectionDescriptor,
     commit: &CollectionCommit,
     data_blob: &Blob<SimpleArchive>,
 ) -> Result<(), SimpleArchiveUnionValidationError> {
-    validate_definition(definition)?;
-    validate_collection(definition, commit.collection())?;
+    validate_descriptor(descriptor)?;
+    validate_collection(descriptor, commit.collection())?;
     validate_endpoint(ElementRole::CommitData, commit.data(), data_blob)?;
     Ok(())
 }
@@ -423,14 +423,14 @@ pub fn validate_commit(
 /// canonical archives. The expected two-way union is then compared row-for-row
 /// with `result`, using constant auxiliary space.
 pub fn validate_merge(
-    definition: &CollectionDefinition,
+    descriptor: &CollectionDescriptor,
     claim: &CollectionMerge,
     low: &Blob<SimpleArchive>,
     high: &Blob<SimpleArchive>,
     result: &Blob<SimpleArchive>,
 ) -> Result<(), SimpleArchiveUnionValidationError> {
-    validate_definition(definition)?;
-    validate_collection(definition, claim.collection())?;
+    validate_descriptor(descriptor)?;
+    validate_collection(descriptor, claim.collection())?;
 
     let (expected_low, expected_high) = claim.inputs();
     validate_handle(ElementRole::MergeLow, expected_low, low)?;
@@ -470,12 +470,12 @@ pub fn validate_merge(
 /// identity. No store is touched. The returned value can be inspected, staged,
 /// abandoned inertly, or finalized later.
 pub fn prepare_commit(
-    definition: &CollectionDefinition,
+    descriptor: &CollectionDescriptor,
     data: &Blob<SimpleArchive>,
     metadata: &Blob<SimpleArchive>,
     signing_key: &SigningKey,
 ) -> Result<PreparedCollectionCommit, PreparationError> {
-    prepare_commit_with_embedded(definition, data, metadata, signing_key, Vec::new())
+    prepare_commit_with_embedded(descriptor, data, metadata, signing_key, Vec::new())
 }
 
 /// Prepare a self-contained fact fragment as a canonical signed membership root.
@@ -488,7 +488,7 @@ pub fn prepare_commit(
 /// name the forged identity. Fragment exports are not serialized. No
 /// destination store is touched.
 pub fn prepare_fragment_commit(
-    definition: &CollectionDefinition,
+    descriptor: &CollectionDescriptor,
     fragment: Fragment,
     signing_key: &SigningKey,
 ) -> Result<PreparedCollectionCommit, PreparationError> {
@@ -506,17 +506,17 @@ pub fn prepare_fragment_commit(
 
     let data: Blob<SimpleArchive> = crate::blob::IntoBlob::to_blob(facts);
     let metadata: Blob<SimpleArchive> = crate::blob::IntoBlob::to_blob(metafacts);
-    prepare_commit_with_embedded(definition, &data, &metadata, signing_key, embedded)
+    prepare_commit_with_embedded(descriptor, &data, &metadata, signing_key, embedded)
 }
 
 fn prepare_commit_with_embedded(
-    definition: &CollectionDefinition,
+    descriptor: &CollectionDescriptor,
     data: &Blob<SimpleArchive>,
     metadata: &Blob<SimpleArchive>,
     signing_key: &SigningKey,
     embedded: Vec<Blob<UnknownBlob>>,
 ) -> Result<PreparedCollectionCommit, PreparationError> {
-    validate_definition(definition).map_err(PublicationError::Validation)?;
+    validate_descriptor(descriptor).map_err(PublicationError::Validation)?;
 
     let data = normalize_blob(data);
     validate_element(&data).map_err(|source| {
@@ -531,14 +531,14 @@ fn prepare_commit_with_embedded(
 
     let commit = CollectionCommit::sign(
         signing_key,
-        definition.id(),
+        descriptor.handle(),
         normalized_data_identity(&data),
         metadata.get_handle(),
     );
 
     Ok(PreparedCollectionCommit {
         embedded,
-        definition: *definition,
+        descriptor: *descriptor,
         data,
         metadata,
         commit,
@@ -561,9 +561,7 @@ fn widen_preparation_error<PutError, InsertError, FlushError>(
             actual,
         },
         PublicationError::DependencyPut(never) => match never {},
-        PublicationError::DefinitionInsert(never) | PublicationError::RecordInsert(never) => {
-            match never {}
-        }
+        PublicationError::RecordInsert(never) => match never {},
         PublicationError::DependencyFlush(never) | PublicationError::RecordFlush(never) => {
             match never {}
         }
@@ -576,7 +574,7 @@ fn widen_preparation_error<PutError, InsertError, FlushError>(
 /// validated or stored, so a forged [`Blob::with_handle`] cache cannot enter
 /// storage or the signed transcript. The exact write order is:
 ///
-/// 1. collection-definition record, data blob, metadata blob;
+/// 1. collection-descriptor blob, data blob, metadata blob;
 /// 2. dependency flush;
 /// 3. signed commit record;
 /// 4. record flush.
@@ -589,7 +587,7 @@ fn widen_preparation_error<PutError, InsertError, FlushError>(
 /// policy decision.
 pub fn publish_commit<S>(
     store: &mut S,
-    definition: &CollectionDefinition,
+    descriptor: &CollectionDescriptor,
     data: &Blob<SimpleArchive>,
     metadata: &Blob<SimpleArchive>,
     signing_key: &SigningKey,
@@ -601,7 +599,7 @@ where
     S: BlobStorePut + CollectionStore + StorageFlush,
 {
     let prepared =
-        prepare_commit(definition, data, metadata, signing_key).map_err(widen_preparation_error)?;
+        prepare_commit(descriptor, data, metadata, signing_key).map_err(widen_preparation_error)?;
     prepared.stage(store)?.finalize()
 }
 
@@ -616,13 +614,13 @@ where
 ///
 /// Fragment exports are not serialized. The two fact sets become canonical
 /// `SimpleArchive` data and metadata elements. The shared prepared-publication
-/// path inserts the definition record and writes embedded blobs plus both
+/// path writes the descriptor blob, embedded blobs, and both
 /// archives before its dependency flush, then inserts the signed record last.
 /// The same backend-recovery boundary documented by [`PublicationError`]
 /// applies.
 pub fn publish_fragment_commit<S>(
     store: &mut S,
-    definition: &CollectionDefinition,
+    descriptor: &CollectionDescriptor,
     fragment: Fragment,
     signing_key: &SigningKey,
 ) -> Result<
@@ -632,18 +630,18 @@ pub fn publish_fragment_commit<S>(
 where
     S: BlobStorePut + CollectionStore + StorageFlush,
 {
-    let prepared = prepare_fragment_commit(definition, fragment, signing_key)
+    let prepared = prepare_fragment_commit(descriptor, fragment, signing_key)
         .map_err(widen_preparation_error)?;
     prepared.stage(store)?.finalize()
 }
 
-/// Publish an exact merge after its definition, inputs, and result are durable.
+/// Publish an exact merge after its descriptor, inputs, and result are durable.
 ///
 /// Input blobs are normalized from their bytes, ordered by their freshly
 /// computed Blake3 identities, validated, and joined directly. The exact write
 /// order is:
 ///
-/// 1. collection-definition record, canonical low input, canonical high input,
+/// 1. collection-descriptor blob, canonical low input, canonical high input,
 ///    result;
 /// 2. dependency flush;
 /// 3. merge record;
@@ -656,7 +654,7 @@ where
 /// idempotent.
 pub fn publish_merge<S>(
     store: &mut S,
-    definition: &CollectionDefinition,
+    descriptor: &CollectionDescriptor,
     low: &Blob<SimpleArchive>,
     high: &Blob<SimpleArchive>,
 ) -> Result<
@@ -666,7 +664,7 @@ pub fn publish_merge<S>(
 where
     S: BlobStorePut + CollectionStore + StorageFlush,
 {
-    validate_definition(definition).map_err(PublicationError::Validation)?;
+    validate_descriptor(descriptor).map_err(PublicationError::Validation)?;
 
     let mut low = normalize_blob(low);
     let mut high = normalize_blob(high);
@@ -691,15 +689,15 @@ where
     })?;
     let result = join_canonical_rows(&low, &high, &low_rows, &high_rows);
     let merge = CollectionMerge::new(
-        definition.id(),
+        descriptor.handle(),
         low_data,
         high_data,
         normalized_data_identity(&result),
     );
 
     store
-        .insert(CollectionRecord::Definition(*definition))
-        .map_err(PublicationError::DefinitionInsert)?;
+        .put::<SimpleArchive, _>(descriptor.to_blob())
+        .map_err(PublicationError::DependencyPut)?;
     store
         .put::<SimpleArchive, _>(low)
         .map_err(PublicationError::DependencyPut)?;
@@ -718,32 +716,32 @@ where
     Ok((merge, result))
 }
 
-fn validate_definition(
-    definition: &CollectionDefinition,
+fn validate_descriptor(
+    descriptor: &CollectionDescriptor,
 ) -> Result<(), SimpleArchiveUnionValidationError> {
     let expected_representation = <SimpleArchive as MetaDescribe>::id();
-    if definition.representation() != expected_representation {
+    if descriptor.representation() != expected_representation {
         return Err(SimpleArchiveUnionValidationError::WrongRepresentation {
             expected: expected_representation,
-            actual: definition.representation(),
+            actual: descriptor.representation(),
         });
     }
-    if definition.recipe() != TRIBLE_SET_UNION_RECIPE_V1 {
+    if descriptor.recipe() != TRIBLE_SET_UNION_RECIPE_V1 {
         return Err(SimpleArchiveUnionValidationError::WrongRecipe {
             expected: TRIBLE_SET_UNION_RECIPE_V1,
-            actual: definition.recipe(),
+            actual: descriptor.recipe(),
         });
     }
     Ok(())
 }
 
 fn validate_collection(
-    definition: &CollectionDefinition,
-    actual: Id,
+    descriptor: &CollectionDescriptor,
+    actual: CollectionId,
 ) -> Result<(), SimpleArchiveUnionValidationError> {
-    if actual != definition.id() {
+    if actual != descriptor.handle() {
         return Err(SimpleArchiveUnionValidationError::WrongCollection {
-            expected: definition.id(),
+            expected: descriptor.handle(),
             actual,
         });
     }
@@ -1133,29 +1131,29 @@ mod tests {
     }
 
     fn commit_fixture() -> (
-        CollectionDefinition,
+        CollectionDescriptor,
         Blob<SimpleArchive>,
         Blob<SimpleArchive>,
         SigningKey,
         CollectionCommit,
     ) {
-        let definition = definition(id(1));
+        let descriptor = descriptor(id(1));
         let data_blob = archive([row(1, 1, 1), row(3, 1, 3)]);
         let metadata = archive([row(9, 1, 9)]);
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let commit = CollectionCommit::sign(
             &signing_key,
-            definition.id(),
+            descriptor.handle(),
             data(&data_blob),
             metadata.get_handle(),
         );
-        (definition, data_blob, metadata, signing_key, commit)
+        (descriptor, data_blob, metadata, signing_key, commit)
     }
 
     #[test]
     fn prepared_fragment_is_canonical_idempotent_and_commits_after_caller_artifacts() {
-        let source_definition = definition(id(1));
-        let target = definition(id(2));
+        let source_descriptor = descriptor(id(1));
+        let target = descriptor(id(2));
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let (fragment, _text_handle, _payload_handle) = fragment_fixture();
         let embedded = embedded_put_events(&fragment);
@@ -1163,14 +1161,14 @@ mod tests {
         let metadata_archive: Blob<SimpleArchive> = fragment.metafacts().clone().to_blob();
         let expected = CollectionCommit::sign(
             &signing_key,
-            source_definition.id(),
+            source_descriptor.handle(),
             data(&content_archive),
             metadata_archive.get_handle(),
         );
 
         let prepared =
-            prepare_fragment_commit(&source_definition, fragment.clone(), &signing_key).unwrap();
-        let repeated = prepare_fragment_commit(&source_definition, fragment, &signing_key).unwrap();
+            prepare_fragment_commit(&source_descriptor, fragment.clone(), &signing_key).unwrap();
+        let repeated = prepare_fragment_commit(&source_descriptor, fragment, &signing_key).unwrap();
         assert_eq!(prepared.commit(), &expected);
         assert_eq!(repeated.commit(), &expected);
         assert_eq!(
@@ -1179,16 +1177,16 @@ mod tests {
         );
 
         let derive = CollectionDerive::new(
-            source_definition.id(),
+            source_descriptor.handle(),
             target.id(),
             expected.data(),
             Inline::new([0x42; 32]),
         );
         let derive_record = CollectionRecord::Derive(derive);
-        let definition_record = CollectionRecord::Definition(source_definition);
+        let descriptor_blob = CollectionRecord::Descriptor(source_descriptor);
         let commit_record = CollectionRecord::Commit(expected);
         let sequence = [
-            vec![insert_event(definition_record)],
+            vec![insert_event(descriptor_blob)],
             embedded,
             vec![
                 put_event(&content_archive),
@@ -1214,12 +1212,12 @@ mod tests {
         assert_eq!(store.events, expected_events);
         // The last flush intentionally covers the unsigned cache artifact and
         // COMMIT together. The signed source remains valid without that cache:
-        // its transcript names only the definition, data, and metadata.
+        // its transcript names only the descriptor, data, and metadata.
         assert!(store.durable_records.contains(&derive.id()));
         assert!(store.durable_records.contains(&expected.id()));
         assert!(store.pending.is_empty());
         assert!(store.pending_records.is_empty());
-        validate_commit(&source_definition, &expected, &content_archive).unwrap();
+        validate_commit(&source_descriptor, &expected, &content_archive).unwrap();
     }
 
     #[test]
@@ -1228,12 +1226,12 @@ mod tests {
         let path = dir.path().join("staged-only.pile");
         std::fs::File::create(&path).unwrap();
 
-        let definition = definition(id(1));
+        let descriptor = descriptor(id(1));
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let (fragment, text_handle, payload_handle) = fragment_fixture();
         let expected_content: Blob<SimpleArchive> = fragment.facts().clone().to_blob();
         let expected_metadata: Blob<SimpleArchive> = fragment.metafacts().clone().to_blob();
-        let prepared = prepare_fragment_commit(&definition, fragment, &signing_key).unwrap();
+        let prepared = prepare_fragment_commit(&descriptor, fragment, &signing_key).unwrap();
         let withheld = prepared.commit().clone();
 
         let mut pile = Pile::open(&path).unwrap();
@@ -1241,7 +1239,7 @@ mod tests {
         {
             let discovered = discover_collection_records(staged.store_mut()).unwrap();
             let reader = staged.store_mut().reader().unwrap();
-            assert_eq!(discovered.definitions(), &[definition.clone()]);
+            assert_eq!(discovered.definitions(), &[descriptor.clone()]);
             assert!(discovered.commits().is_empty());
             assert!(discovered.merges().is_empty());
             assert!(discovered.derives().is_empty());
@@ -1251,7 +1249,10 @@ mod tests {
             })
             .unwrap();
             assert!(resolution.admitted_claims().is_empty());
-            assert!(resolution.semantics().members(definition.id()).is_none());
+            assert!(resolution
+                .semantics()
+                .members(descriptor.handle())
+                .is_none());
             let roots = plan_collection_retention(&discovered, &resolution, &reader).unwrap();
             assert!(roots.is_empty());
             assert!(roots.expanded(&reader).is_empty());
@@ -1276,7 +1277,7 @@ mod tests {
         let mut reopened = Pile::open(&path).unwrap();
         let discovered = discover_collection_records(&mut reopened).unwrap();
         let reader = reopened.reader().unwrap();
-        assert_eq!(discovered.definitions(), &[definition]);
+        assert_eq!(discovered.definitions(), &[descriptor]);
         assert!(discovered.commits().is_empty());
         assert!(!discovered
             .commits()
@@ -1288,12 +1289,12 @@ mod tests {
 
     #[test]
     fn fragment_without_metafacts_still_stages_the_canonical_empty_metadata_archive() {
-        let definition = definition(id(1));
+        let descriptor = descriptor(id(1));
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let empty_archive: Blob<SimpleArchive> = TribleSet::new().to_blob();
 
         let prepared =
-            prepare_fragment_commit(&definition, Fragment::empty(), &signing_key).unwrap();
+            prepare_fragment_commit(&descriptor, Fragment::empty(), &signing_key).unwrap();
 
         assert_eq!(prepared.commit().metadata(), empty_metadata_handle());
         assert_eq!(prepared.metadata.get_handle(), empty_metadata_handle());
@@ -1315,12 +1316,12 @@ mod tests {
 
     #[test]
     fn commit_publication_normalizes_orders_flushes_and_replays_idempotently() {
-        let (definition, data_blob, metadata, signing_key, expected) = commit_fixture();
+        let (descriptor, data_blob, metadata, signing_key, expected) = commit_fixture();
         let bogus = archive([row(14, 1, 14)]);
         let forged_data = Blob::with_handle(data_blob.bytes.clone(), bogus.get_handle());
         let forged_metadata = Blob::with_handle(metadata.bytes.clone(), bogus.get_handle());
         let sequence = vec![
-            insert_event(CollectionRecord::Definition(definition)),
+            insert_event(CollectionRecord::Descriptor(descriptor)),
             put_event(&data_blob),
             put_event(&metadata),
             ProbeEvent::Flush,
@@ -1331,7 +1332,7 @@ mod tests {
         let mut store = ProbeStore::default();
         let first = publish_commit(
             &mut store,
-            &definition,
+            &descriptor,
             &forged_data,
             &forged_metadata,
             &signing_key,
@@ -1339,7 +1340,7 @@ mod tests {
         .unwrap();
         let second = publish_commit(
             &mut store,
-            &definition,
+            &descriptor,
             &forged_data,
             &forged_metadata,
             &signing_key,
@@ -1351,7 +1352,7 @@ mod tests {
         assert_eq!(first.data(), data(&data_blob));
         assert_eq!(first.metadata(), metadata.get_handle());
         first.verify_strict().unwrap();
-        validate_commit(&definition, &first, &data_blob).unwrap();
+        validate_commit(&descriptor, &first, &data_blob).unwrap();
 
         let mut expected_events = sequence.clone();
         expected_events.extend(sequence);
@@ -1362,7 +1363,7 @@ mod tests {
         assert_eq!(store.durable, expected_handles);
         assert_eq!(
             store.durable_records,
-            BTreeSet::from([definition.id(), expected.id()])
+            BTreeSet::from([descriptor.handle(), expected.id()])
         );
         assert!(store.pending.is_empty());
         assert!(store.pending_records.is_empty());
@@ -1371,7 +1372,7 @@ mod tests {
 
     #[test]
     fn fragment_commit_puts_embedded_dependencies_before_record_and_replays_idempotently() {
-        let definition = definition(id(1));
+        let descriptor = descriptor(id(1));
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let (fragment, _text_handle, _payload_handle) = fragment_fixture();
         let embedded = embedded_put_events(&fragment);
@@ -1379,12 +1380,12 @@ mod tests {
         let metadata_archive: Blob<SimpleArchive> = fragment.metafacts().clone().to_blob();
         let expected = CollectionCommit::sign(
             &signing_key,
-            definition.id(),
+            descriptor.handle(),
             data(&content_archive),
             metadata_archive.get_handle(),
         );
         let sequence = [
-            vec![insert_event(CollectionRecord::Definition(definition))],
+            vec![insert_event(CollectionRecord::Descriptor(descriptor))],
             embedded.clone(),
             vec![
                 put_event(&content_archive),
@@ -1398,10 +1399,10 @@ mod tests {
 
         let mut store = ProbeStore::default();
         let first =
-            publish_fragment_commit(&mut store, &definition, fragment.clone(), &signing_key)
+            publish_fragment_commit(&mut store, &descriptor, fragment.clone(), &signing_key)
                 .unwrap();
         let second =
-            publish_fragment_commit(&mut store, &definition, fragment, &signing_key).unwrap();
+            publish_fragment_commit(&mut store, &descriptor, fragment, &signing_key).unwrap();
 
         assert_eq!(first, expected);
         assert_eq!(second, expected);
@@ -1426,7 +1427,7 @@ mod tests {
         assert_eq!(store.durable, expected_handles);
         assert_eq!(
             store.durable_records,
-            BTreeSet::from([definition.id(), expected.id()])
+            BTreeSet::from([descriptor.handle(), expected.id()])
         );
         assert!(store.pending.is_empty());
         assert!(store.pending_records.is_empty());
@@ -1434,7 +1435,7 @@ mod tests {
 
     #[test]
     fn fragment_commit_rejects_forged_embedded_identities_before_writing() {
-        let definition = definition(id(1));
+        let descriptor = descriptor(id(1));
         let signing_key = SigningKey::from_bytes(&[7; 32]);
 
         // This is the exact forged-cache shape that `entity!` deliberately
@@ -1448,7 +1449,7 @@ mod tests {
         let actual_text_handle = Blob::<LongString>::new(forged_text.bytes.clone()).get_handle();
         let forged_content = entity! { fragment_ns::text: forged_text };
         let mut store = ProbeStore::default();
-        let error = publish_fragment_commit(&mut store, &definition, forged_content, &signing_key)
+        let error = publish_fragment_commit(&mut store, &descriptor, forged_content, &signing_key)
             .unwrap_err();
         assert!(matches!(
             error,
@@ -1471,7 +1472,7 @@ mod tests {
             std::iter::once((bogus_store_key, payload.transmute())).collect();
         let forged_content = Fragment::from_facts_and_blobs(TribleSet::new(), embedded);
         let mut store = ProbeStore::default();
-        let error = publish_fragment_commit(&mut store, &definition, forged_content, &signing_key)
+        let error = publish_fragment_commit(&mut store, &descriptor, forged_content, &signing_key)
             .unwrap_err();
         assert!(matches!(
             error,
@@ -1488,7 +1489,7 @@ mod tests {
 
     #[test]
     fn merge_publication_normalizes_canonicalizes_and_replays_idempotently() {
-        let definition = definition(id(1));
+        let descriptor = descriptor(id(1));
         let left = archive([row(1, 1, 1), row(3, 1, 3)]);
         let right = archive([row(2, 1, 2), row(3, 1, 3)]);
         let bogus = archive([row(14, 1, 14)]);
@@ -1497,13 +1498,13 @@ mod tests {
         let (low, high) = ordered_inputs(&left, &right);
         let expected_result = join(low, high).unwrap();
         let expected_merge = CollectionMerge::new(
-            definition.id(),
+            descriptor.handle(),
             data(low),
             data(high),
             data(&expected_result),
         );
         let sequence = vec![
-            insert_event(CollectionRecord::Definition(definition)),
+            insert_event(CollectionRecord::Descriptor(descriptor)),
             put_event(low),
             put_event(high),
             put_event(&expected_result),
@@ -1513,12 +1514,12 @@ mod tests {
         ];
 
         let mut store = ProbeStore::default();
-        let first = publish_merge(&mut store, &definition, &forged_right, &forged_left).unwrap();
-        let second = publish_merge(&mut store, &definition, &forged_left, &forged_right).unwrap();
+        let first = publish_merge(&mut store, &descriptor, &forged_right, &forged_left).unwrap();
+        let second = publish_merge(&mut store, &descriptor, &forged_left, &forged_right).unwrap();
 
         assert_eq!(first, (expected_merge.clone(), expected_result.clone()));
         assert_eq!(second, (expected_merge.clone(), expected_result.clone()));
-        validate_merge(&definition, &first.0, low, high, &first.1).unwrap();
+        validate_merge(&descriptor, &first.0, low, high, &first.1).unwrap();
 
         let mut expected_events = sequence.clone();
         expected_events.extend(sequence);
@@ -1532,7 +1533,7 @@ mod tests {
         assert_eq!(store.durable, expected_handles);
         assert_eq!(
             store.durable_records,
-            BTreeSet::from([definition.id(), expected_merge.id()])
+            BTreeSet::from([descriptor.handle(), expected_merge.id()])
         );
         assert!(store.pending.is_empty());
         assert!(store.pending_records.is_empty());
@@ -1541,13 +1542,13 @@ mod tests {
 
     #[test]
     fn commit_publication_orders_completed_prefixes_and_replays_after_recovery() {
-        let (definition, data_blob, metadata, signing_key, expected) = commit_fixture();
+        let (descriptor, data_blob, metadata, signing_key, expected) = commit_fixture();
         let dependencies = BTreeSet::from([data_blob.get_handle().raw, metadata.get_handle().raw]);
 
         for fail_at in 1..=6 {
             let mut store = ProbeStore::failing_before_effect_at(fail_at);
             let error =
-                publish_commit(&mut store, &definition, &data_blob, &metadata, &signing_key)
+                publish_commit(&mut store, &descriptor, &data_blob, &metadata, &signing_key)
                     .unwrap_err();
             match (fail_at, error) {
                 (1, PublicationError::DefinitionInsert(ProbeFailure(at)))
@@ -1566,28 +1567,29 @@ mod tests {
             } else {
                 assert_eq!(store.events[3], ProbeEvent::Flush);
                 assert!(dependencies.is_subset(&store.durable));
-                assert!(store.durable_records.contains(&definition.id()));
+                assert!(store.durable_records.contains(&descriptor.handle()));
             }
 
             store.recover();
             let retried =
-                publish_commit(&mut store, &definition, &data_blob, &metadata, &signing_key)
+                publish_commit(&mut store, &descriptor, &data_blob, &metadata, &signing_key)
                     .unwrap();
             assert_eq!(retried, expected);
             assert!(dependencies.is_subset(&store.durable));
-            assert!(store.durable_records.contains(&definition.id()));
+            assert!(store.durable_records.contains(&descriptor.handle()));
             assert!(store.durable_records.contains(&expected.id()));
         }
     }
 
     #[test]
     fn merge_publication_orders_completed_prefixes_and_replays_after_recovery() {
-        let definition = definition(id(1));
+        let descriptor = descriptor(id(1));
         let left = archive([row(1, 1, 1), row(3, 1, 3)]);
         let right = archive([row(2, 1, 2), row(3, 1, 3)]);
         let (low, high) = ordered_inputs(&left, &right);
         let result = join(low, high).unwrap();
-        let expected = CollectionMerge::new(definition.id(), data(low), data(high), data(&result));
+        let expected =
+            CollectionMerge::new(descriptor.handle(), data(low), data(high), data(&result));
         let dependencies = BTreeSet::from([
             low.get_handle().raw,
             high.get_handle().raw,
@@ -1596,7 +1598,7 @@ mod tests {
 
         for fail_at in 1..=7 {
             let mut store = ProbeStore::failing_before_effect_at(fail_at);
-            let error = publish_merge(&mut store, &definition, &left, &right).unwrap_err();
+            let error = publish_merge(&mut store, &descriptor, &left, &right).unwrap_err();
             match (fail_at, error) {
                 (1, PublicationError::DefinitionInsert(ProbeFailure(at)))
                 | (2..=4, PublicationError::DependencyPut(ProbeFailure(at)))
@@ -1614,28 +1616,28 @@ mod tests {
             } else {
                 assert_eq!(store.events[4], ProbeEvent::Flush);
                 assert!(dependencies.is_subset(&store.durable));
-                assert!(store.durable_records.contains(&definition.id()));
+                assert!(store.durable_records.contains(&descriptor.handle()));
             }
 
             store.recover();
-            let retried = publish_merge(&mut store, &definition, &left, &right).unwrap();
+            let retried = publish_merge(&mut store, &descriptor, &left, &right).unwrap();
             assert_eq!(retried, (expected.clone(), result.clone()));
             assert!(dependencies.is_subset(&store.durable));
-            assert!(store.durable_records.contains(&definition.id()));
+            assert!(store.durable_records.contains(&descriptor.handle()));
             assert!(store.durable_records.contains(&expected.id()));
         }
     }
 
     #[test]
     fn publication_rejects_every_invalid_input_before_writing() {
-        let (definition, data_blob, metadata, signing_key, _) = commit_fixture();
+        let (descriptor, data_blob, metadata, signing_key, _) = commit_fixture();
         let mut store = ProbeStore::default();
-        let wrong_definition =
-            CollectionDefinition::new(definition.scope(), id(8), TRIBLE_SET_UNION_RECIPE_V1);
+        let wrong_descriptor =
+            CollectionDescriptor::new(descriptor.scope(), id(8), TRIBLE_SET_UNION_RECIPE_V1);
         assert!(matches!(
             publish_commit(
                 &mut store,
-                &wrong_definition,
+                &wrong_descriptor,
                 &data_blob,
                 &metadata,
                 &signing_key,
@@ -1650,7 +1652,7 @@ mod tests {
         assert!(matches!(
             publish_commit(
                 &mut store,
-                &definition,
+                &descriptor,
                 &invalid_data,
                 &metadata,
                 &signing_key,
@@ -1665,7 +1667,7 @@ mod tests {
         assert!(matches!(
             publish_commit(
                 &mut store,
-                &definition,
+                &descriptor,
                 &data_blob,
                 &invalid_metadata,
                 &signing_key,
@@ -1677,7 +1679,7 @@ mod tests {
         assert!(store.events.is_empty());
 
         assert!(matches!(
-            publish_merge(&mut store, &definition, &invalid_data, &data_blob,),
+            publish_merge(&mut store, &descriptor, &invalid_data, &data_blob,),
             Err(PublicationError::Validation(
                 SimpleArchiveUnionValidationError::InvalidElement { .. }
             ))
@@ -1691,7 +1693,7 @@ mod tests {
         let path = dir.path().join("collections.pile");
         std::fs::File::create(&path).unwrap();
 
-        let definition = definition(id(1));
+        let descriptor = descriptor(id(1));
         let left = archive([row(1, 1, 1), row(3, 1, 3)]);
         let right = archive([row(2, 1, 2), row(3, 1, 3)]);
         let metadata = archive([row(9, 1, 9)]);
@@ -1700,8 +1702,8 @@ mod tests {
         let (commit, merge, result) = {
             let mut pile = Pile::open(&path).unwrap();
             let commit =
-                publish_commit(&mut pile, &definition, &left, &metadata, &signing_key).unwrap();
-            let (merge, result) = publish_merge(&mut pile, &definition, &right, &left).unwrap();
+                publish_commit(&mut pile, &descriptor, &left, &metadata, &signing_key).unwrap();
+            let (merge, result) = publish_merge(&mut pile, &descriptor, &right, &left).unwrap();
             pile.close().unwrap();
             (commit, merge, result)
         };
@@ -1709,7 +1711,7 @@ mod tests {
         let mut reopened = Pile::open(&path).unwrap();
         let discovered = discover_collection_records(&mut reopened).unwrap();
         let reader = reopened.reader().unwrap();
-        assert_eq!(discovered.definitions(), &[definition.clone()]);
+        assert_eq!(discovered.definitions(), &[descriptor.clone()]);
         assert_eq!(discovered.commits(), &[commit.clone()]);
         assert_eq!(discovered.merges(), &[merge.clone()]);
         assert!(discovered.derives().is_empty());
@@ -1723,9 +1725,9 @@ mod tests {
         assert_eq!(fetched_right, right);
         assert_eq!(fetched_metadata, metadata);
         assert_eq!(fetched_result, result);
-        validate_commit(&definition, &commit, &fetched_left).unwrap();
+        validate_commit(&descriptor, &commit, &fetched_left).unwrap();
         let (low, high) = ordered_inputs(&fetched_left, &fetched_right);
-        validate_merge(&definition, &merge, low, high, &fetched_result).unwrap();
+        validate_merge(&descriptor, &merge, low, high, &fetched_result).unwrap();
 
         drop(reader);
         reopened.close().unwrap();
@@ -1737,7 +1739,7 @@ mod tests {
         let path = dir.path().join("fragment-commit.pile");
         std::fs::File::create(&path).unwrap();
 
-        let definition = definition(id(1));
+        let descriptor = descriptor(id(1));
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let (fragment, text_handle, payload_handle) = fragment_fixture();
         let expected_content: Blob<SimpleArchive> = fragment.facts().clone().to_blob();
@@ -1746,7 +1748,7 @@ mod tests {
         let commit = {
             let mut pile = Pile::open(&path).unwrap();
             let commit =
-                publish_fragment_commit(&mut pile, &definition, fragment, &signing_key).unwrap();
+                publish_fragment_commit(&mut pile, &descriptor, fragment, &signing_key).unwrap();
             pile.close().unwrap();
             commit
         };
@@ -1754,7 +1756,7 @@ mod tests {
         let mut reopened = Pile::open(&path).unwrap();
         let discovered = discover_collection_records(&mut reopened).unwrap();
         let reader = reopened.reader().unwrap();
-        assert_eq!(discovered.definitions(), &[definition.clone()]);
+        assert_eq!(discovered.definitions(), &[descriptor.clone()]);
         assert_eq!(discovered.commits(), &[commit.clone()]);
         assert!(discovered.merges().is_empty());
         assert!(discovered.derives().is_empty());
@@ -1765,7 +1767,7 @@ mod tests {
         let fetched_metadata: Blob<SimpleArchive> = reader.get(commit.metadata()).unwrap();
         assert_eq!(fetched_content, expected_content);
         assert_eq!(fetched_metadata, expected_metadata);
-        validate_commit(&definition, &commit, &fetched_content).unwrap();
+        validate_commit(&descriptor, &commit, &fetched_content).unwrap();
 
         let fetched_text: View<str> = reader.get::<View<str>, LongString>(text_handle).unwrap();
         let fetched_payload: Bytes = reader.get::<Bytes, RawBytes>(payload_handle).unwrap();
@@ -1778,7 +1780,7 @@ mod tests {
 
     #[test]
     fn definition_and_empty_element_are_golden() {
-        let definition = definition(id(1));
+        let descriptor = descriptor(id(1));
         assert_eq!(
             <SimpleArchive as MetaDescribe>::id(),
             id_hex!("8F4A27C8581DADCBA1ADA8BA228069B6")
@@ -1787,10 +1789,13 @@ mod tests {
             TRIBLE_SET_UNION_RECIPE_V1,
             id_hex!("6D64C5F4B9E9B73F57C5F8702AB7FE45")
         );
-        assert_eq!(definition.scope(), id(1));
-        assert_eq!(definition.id(), id_hex!("4B6F24A289B950F2CF20896EAB7A1658"));
+        assert_eq!(descriptor.scope(), id(1));
         assert_eq!(
-            CollectionDefinition::to_blob(&definition).get_handle().raw,
+            descriptor.handle(),
+            id_hex!("4B6F24A289B950F2CF20896EAB7A1658")
+        );
+        assert_eq!(
+            CollectionDescriptor::to_blob(&descriptor).get_handle().raw,
             hex!("A639BFB1D8F4DD5E9AF4667512A23673812866F2CBF01D3F11DEF89850FA65B9")
         );
 
@@ -1855,25 +1860,25 @@ mod tests {
 
     #[test]
     fn commit_validation_binds_definition_collection_handle_and_bytes() {
-        let definition = definition(id(1));
+        let descriptor = descriptor(id(1));
         let blob = archive([row(1, 1, 1)]);
         let commit = CollectionCommit::sign(
             &SigningKey::from_bytes(&[7; 32]),
-            definition.id(),
+            descriptor.handle(),
             data(&blob),
             empty_metadata_handle(),
         );
-        validate_commit(&definition, &commit, &blob).unwrap();
+        validate_commit(&descriptor, &commit, &blob).unwrap();
 
         let wrong_representation =
-            CollectionDefinition::new(definition.scope(), id(9), TRIBLE_SET_UNION_RECIPE_V1);
+            CollectionDescriptor::new(descriptor.scope(), id(9), TRIBLE_SET_UNION_RECIPE_V1);
         assert!(matches!(
             validate_commit(&wrong_representation, &commit, &blob),
             Err(SimpleArchiveUnionValidationError::WrongRepresentation { .. })
         ));
 
-        let wrong_recipe = CollectionDefinition::new(
-            definition.scope(),
+        let wrong_recipe = CollectionDescriptor::new(
+            descriptor.scope(),
             <SimpleArchive as MetaDescribe>::id(),
             id(9),
         );
@@ -1882,18 +1887,18 @@ mod tests {
             Err(SimpleArchiveUnionValidationError::WrongRecipe { .. })
         ));
 
-        let other_definition = super::definition(id(2));
+        let other_descriptor = super::descriptor(id(2));
         assert_eq!(
-            validate_commit(&other_definition, &commit, &blob),
+            validate_commit(&other_descriptor, &commit, &blob),
             Err(SimpleArchiveUnionValidationError::WrongCollection {
-                expected: other_definition.id(),
-                actual: definition.id(),
+                expected: other_descriptor.handle(),
+                actual: descriptor.handle(),
             })
         );
 
         let other_blob = archive([row(2, 1, 2)]);
         assert!(matches!(
-            validate_commit(&definition, &commit, &other_blob),
+            validate_commit(&descriptor, &commit, &other_blob),
             Err(SimpleArchiveUnionValidationError::EndpointMismatch {
                 role: ElementRole::CommitData,
                 ..
@@ -1902,7 +1907,7 @@ mod tests {
 
         let forged = Blob::with_handle(other_blob.bytes.clone(), blob.get_handle());
         assert_eq!(
-            validate_commit(&definition, &commit, &forged),
+            validate_commit(&descriptor, &commit, &forged),
             Err(SimpleArchiveUnionValidationError::EndpointMismatch {
                 role: ElementRole::CommitData,
                 expected: data(&blob),
@@ -1913,12 +1918,12 @@ mod tests {
         let invalid = raw_archive(vec![row(2, 1, 2), row(1, 1, 1)]);
         let invalid_commit = CollectionCommit::sign(
             &SigningKey::from_bytes(&[7; 32]),
-            definition.id(),
+            descriptor.handle(),
             data(&invalid),
             empty_metadata_handle(),
         );
         assert_eq!(
-            validate_commit(&definition, &invalid_commit, &invalid),
+            validate_commit(&descriptor, &invalid_commit, &invalid),
             Err(SimpleArchiveUnionValidationError::InvalidElement {
                 role: ElementRole::CommitData,
                 source: UnarchiveError::BadCanonicalizationOrdering,
@@ -1928,22 +1933,27 @@ mod tests {
 
     #[test]
     fn merge_validation_is_exact_and_binds_every_endpoint() {
-        let definition = definition(id(1));
+        let descriptor = descriptor(id(1));
         let left = archive([row(1, 1, 1), row(3, 1, 3)]);
         let right = archive([row(2, 1, 2), row(3, 1, 3)]);
         let result = join(&left, &right).unwrap();
-        let claim = CollectionMerge::new(definition.id(), data(&left), data(&right), data(&result));
+        let claim = CollectionMerge::new(
+            descriptor.handle(),
+            data(&left),
+            data(&right),
+            data(&result),
+        );
         let (low, high) = ordered_inputs(&left, &right);
-        validate_merge(&definition, &claim, low, high, &result).unwrap();
+        validate_merge(&descriptor, &claim, low, high, &result).unwrap();
 
         let wrong_collection = CollectionMerge::new(id(9), data(low), data(high), data(&result));
         assert!(matches!(
-            validate_merge(&definition, &wrong_collection, low, high, &result),
+            validate_merge(&descriptor, &wrong_collection, low, high, &result),
             Err(SimpleArchiveUnionValidationError::WrongCollection { .. })
         ));
 
         assert!(matches!(
-            validate_merge(&definition, &claim, high, low, &result),
+            validate_merge(&descriptor, &claim, high, low, &result),
             Err(SimpleArchiveUnionValidationError::EndpointMismatch {
                 role: ElementRole::MergeLow,
                 ..
@@ -1952,7 +1962,7 @@ mod tests {
 
         let forged_high = Blob::with_handle(low.bytes.clone(), high.get_handle());
         assert_eq!(
-            validate_merge(&definition, &claim, low, &forged_high, &result),
+            validate_merge(&descriptor, &claim, low, &forged_high, &result),
             Err(SimpleArchiveUnionValidationError::EndpointMismatch {
                 role: ElementRole::MergeHigh,
                 expected: data(high),
@@ -1962,7 +1972,7 @@ mod tests {
 
         let other_result = archive([row(4, 1, 4)]);
         assert!(matches!(
-            validate_merge(&definition, &claim, low, high, &other_result),
+            validate_merge(&descriptor, &claim, low, high, &other_result),
             Err(SimpleArchiveUnionValidationError::EndpointMismatch {
                 role: ElementRole::MergeResult,
                 ..
@@ -1970,22 +1980,26 @@ mod tests {
         ));
 
         let wrong_result = archive([row(1, 1, 1), row(2, 1, 2)]);
-        let wrong_claim =
-            CollectionMerge::new(definition.id(), data(low), data(high), data(&wrong_result));
+        let wrong_claim = CollectionMerge::new(
+            descriptor.handle(),
+            data(low),
+            data(high),
+            data(&wrong_result),
+        );
         assert_eq!(
-            validate_merge(&definition, &wrong_claim, low, high, &wrong_result),
+            validate_merge(&descriptor, &wrong_claim, low, high, &wrong_result),
             Err(SimpleArchiveUnionValidationError::WrongMergeResult)
         );
 
         let invalid_result = raw_archive(vec![row(2, 1, 2), row(1, 1, 1)]);
         let invalid_claim = CollectionMerge::new(
-            definition.id(),
+            descriptor.handle(),
             data(low),
             data(high),
             data(&invalid_result),
         );
         assert_eq!(
-            validate_merge(&definition, &invalid_claim, low, high, &invalid_result),
+            validate_merge(&descriptor, &invalid_claim, low, high, &invalid_result),
             Err(SimpleArchiveUnionValidationError::InvalidElement {
                 role: ElementRole::MergeResult,
                 source: UnarchiveError::BadCanonicalizationOrdering,
@@ -2037,7 +2051,7 @@ mod tests {
                 let actual = join(&left, &right).unwrap();
 
                 prop_assert_eq!(&actual, &expected);
-                let collection = definition(id(1));
+                let collection = descriptor(id(1));
                 let claim = CollectionMerge::new(
                     collection.id(),
                     data(&left),

@@ -17,8 +17,8 @@
 use std::error::Error;
 use std::fmt;
 
-use ed25519::Signature;
 use ed25519::signature::Signer;
+use ed25519::Signature;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
 use crate::attestation::{signature_r, signature_s, signed_by};
@@ -33,7 +33,7 @@ use crate::inline::encodings::hash::{Blake3, Handle, Hash};
 use crate::inline::{Inline, InlineEncoding};
 use crate::metadata::{self, archive as commit_metadata};
 use crate::prelude::{attributes, entity};
-use crate::trible::{Fragment, TRIBLE_LEN, TribleSet};
+use crate::trible::{Fragment, TribleSet, TRIBLE_LEN};
 
 /// Tag identifying a canonical collection descriptor.
 ///
@@ -879,8 +879,8 @@ mod tests {
     use hex_literal::hex;
 
     use crate::id::Id;
-    use crate::inline::IntoInline;
     use crate::inline::encodings::shortstring::ShortString;
+    use crate::inline::IntoInline;
     use crate::trible::Trible;
 
     fn id(byte: u8) -> Id {
@@ -1029,11 +1029,9 @@ mod tests {
             valid.signature_s,
         ));
 
-        assert!(
-            alterations
-                .iter()
-                .all(|altered| altered.verify_strict().is_err())
-        );
+        assert!(alterations
+            .iter()
+            .all(|altered| altered.verify_strict().is_err()));
     }
 
     #[test]
