@@ -32,7 +32,9 @@ use triblespace::prelude::{Collection, Fragment};
 // `scope` is the stable Id of this dataset.
 let mut collection = Collection::new(storage, scope, signing_key);
 let commit = collection.commit(fragment)?;
-let facts = collection.materialize()?;
+let snapshot = collection.snapshot()?;
+let facts = snapshot.facts();
+let exact_commits = snapshot.commits();
 let storage = collection.into_storage();
 ```
 
@@ -83,6 +85,13 @@ record listing. It first discovers one deterministic record view and then opens
 a blob-reader snapshot. A concurrent commit not observed during that discovery
 appears on a later call; all own commits that were observed are included or the
 call returns an error. This is deliberately not a global "latest" transaction.
+`Collection::snapshot()` carries the materialized facts, that exact authorized
+commit set, and the reader used for validation together. Physically visible
+blobs from a later commit remain inert unless its signed record belongs to the
+returned commit set, so derived-index builders cannot accidentally pair an old
+fact view with a newer source ticket. `Collection::materialize()` is the facts-
+only projection and retains its empty-collection fast path without opening a
+reader.
 
 `Pile`, `MemoryRepo`, and the storage composition wrappers implement the native
 `CollectionStore` surface. `ObjectStoreRemote` exposes the corresponding async

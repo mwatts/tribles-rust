@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Owned collections now expose coherent known-prefix snapshots.**
+  `Collection::snapshot()` performs one native-record discovery and returns
+  the materialized facts, exact signer-authorized commits, and the blob reader
+  used to validate them as one value. Later physically visible blobs cannot
+  alter that authority frontier, preventing derived indexes from mixing an old
+  fact view with a newer source ticket. `Collection::materialize()` shares the
+  same implementation while preserving its no-reader empty fast path.
 - **New pile writes use a generic, length-delimited record envelope.** The
   envelope marker `E5A95E5D8A0BBA8782E46B9C9E73B313` was minted with
   `trible genid` on 2026-08-11; the next 16 bytes reuse each current V3/V4

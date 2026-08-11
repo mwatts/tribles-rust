@@ -29,7 +29,8 @@ use super::{
     collection_physical_cover, discover_collection_records, resolve_collection_semantics,
     CollectionClaimValidation, CollectionCommit, CollectionData, CollectionDescriptor,
     CollectionDiscoveryError, CollectionFunctionalConflict, CollectionId,
-    CollectionResolutionError, CollectionStore, CollectionValidationRequest, RecordDecodeError,
+    CollectionResolutionError, CollectionStore, CollectionValidationRequest,
+    DiscoveredCollectionRecords, RecordDecodeError,
 };
 
 /// A scoped `SimpleArchive`-union collection and its signing authority.
@@ -41,6 +42,47 @@ pub struct Collection<S> {
     storage: S,
     descriptor: CollectionDescriptor,
     signing_key: SigningKey,
+}
+
+/// One coherent known-prefix view of an owned collection.
+///
+/// [`commits`](Self::commits) is the exact set of commits from the single
+/// collection-record discovery pass that authorized [`facts`](Self::facts).
+/// [`reader`](Self::reader) is the blob-reader snapshot used to validate and
+/// materialize those facts. The reader may contain physically available blobs
+/// published after record discovery, but those blobs acquire no authority
+/// unless their commits are present in this snapshot.
+pub struct CollectionSnapshot<R> {
+    facts: TribleSet,
+    commits: Vec<CollectionCommit>,
+    reader: R,
+}
+
+impl<R> CollectionSnapshot<R> {
+    /// Materialized union authorized by this snapshot's exact commit set.
+    pub fn facts(&self) -> &TribleSet {
+        &self.facts
+    }
+
+    /// Exact authorized commits, ordered by intrinsic record id.
+    pub fn commits(&self) -> &[CollectionCommit] {
+        &self.commits
+    }
+
+    /// Blob-reader snapshot used to validate and materialize the facts.
+    pub fn reader(&self) -> &R {
+        &self.reader
+    }
+
+    /// Consume the snapshot and return its materialized facts.
+    pub fn into_facts(self) -> TribleSet {
+        self.facts
+    }
+
+    /// Consume the snapshot into materialized facts, exact commits, and reader.
+    pub fn into_parts(self) -> (TribleSet, Vec<CollectionCommit>, R) {
+        (self.facts, self.commits, self.reader)
+    }
 }
 
 /// Failure to materialize the complete known value of an owned collection.
@@ -308,6 +350,33 @@ where
     S: BlobStore + CollectionStore,
     S::Reader: BlobStoreMeta,
 {
+    /// Capture one coherent known-prefix snapshot of this owned collection.
+    ///
+    /// The call enumerates collection records exactly once, selects the exact
+    /// commits signed by this facade's key for this descriptor, and then opens
+    /// one blob-reader snapshot. The returned facts are materialized solely
+    /// from that commit set. A concurrently published commit first observed
+    /// after record discovery therefore cannot influence the facts even when
+    /// its content-addressed blobs are already visible to the reader.
+    ///
+    /// This is not a global-latest transaction: a later call may observe more
+    /// commits. It is a coherent authority boundary for consumers that need
+    /// to carry facts, source commits, and the validating blob view together.
+    pub fn snapshot(
+        &mut self,
+    ) -> Result<
+        CollectionSnapshot<S::Reader>,
+        CollectionMaterializationError<
+            S::RecordsError,
+            S::ReaderError,
+            <S::Reader as BlobStoreMeta>::MetaError,
+            <S::Reader as BlobStoreGet>::GetError<Infallible>,
+        >,
+    > {
+        let (discovered, commits) = self.observe_owned_commits()?;
+        self.snapshot_from_observation(discovered, commits)
+    }
+
     /// Materialize the complete known `TribleSet` authorized by this facade's
     /// signing identity.
     ///
@@ -345,27 +414,70 @@ where
             <S::Reader as BlobStoreGet>::GetError<Infallible>,
         >,
     > {
+        let (discovered, commits) = self.observe_owned_commits()?;
+        if commits.is_empty() {
+            return Ok(TribleSet::new());
+        }
+        self.snapshot_from_observation(discovered, commits)
+            .map(CollectionSnapshot::into_facts)
+    }
+
+    fn observe_owned_commits(
+        &mut self,
+    ) -> Result<
+        (DiscoveredCollectionRecords, Vec<CollectionCommit>),
+        CollectionMaterializationError<
+            S::RecordsError,
+            S::ReaderError,
+            <S::Reader as BlobStoreMeta>::MetaError,
+            <S::Reader as BlobStoreGet>::GetError<Infallible>,
+        >,
+    > {
         let discovered = discover_collection_records(&mut self.storage)
             .map_err(CollectionMaterializationError::Discovery)?;
         let collection = self.descriptor.handle();
         let public_key = self.signing_key.verifying_key().to_bytes();
 
-        let authorized: BTreeSet<_> = discovered
+        let commits = discovered
             .commits()
             .iter()
             .filter(|commit| {
                 commit.collection() == collection && commit.public_key().raw == public_key
             })
-            .map(CollectionCommit::id)
+            .copied()
             .collect();
 
-        if authorized.is_empty() {
-            return Ok(TribleSet::new());
-        }
+        Ok((discovered, commits))
+    }
+
+    fn snapshot_from_observation(
+        &mut self,
+        discovered: DiscoveredCollectionRecords,
+        commits: Vec<CollectionCommit>,
+    ) -> Result<
+        CollectionSnapshot<S::Reader>,
+        CollectionMaterializationError<
+            S::RecordsError,
+            S::ReaderError,
+            <S::Reader as BlobStoreMeta>::MetaError,
+            <S::Reader as BlobStoreGet>::GetError<Infallible>,
+        >,
+    > {
+        let collection = self.descriptor.handle();
+        let authorized: BTreeSet<_> = commits.iter().map(CollectionCommit::id).collect();
+
         let reader = self
             .storage
             .reader()
             .map_err(CollectionMaterializationError::Reader)?;
+
+        if commits.is_empty() {
+            return Ok(CollectionSnapshot {
+                facts: TribleSet::new(),
+                commits,
+                reader,
+            });
+        }
 
         // The descriptor handle is the collection identity. Once an own
         // commit makes this collection nonempty, its descriptor is mandatory
@@ -397,11 +509,7 @@ where
         // derived scratch values below have a shorter, use-counted lifetime.
         let mut known = BTreeMap::<CollectionData, Blob<SimpleArchive>>::new();
         let mut roots = BTreeSet::new();
-        for claim in discovered
-            .commits()
-            .iter()
-            .filter(|claim| authorized.contains(&claim.id()))
-        {
+        for claim in &commits {
             let data = claim.data();
             let data_blob: Blob<SimpleArchive> = reader
                 .get(Handle::<SimpleArchive>::from_hash(data))
@@ -722,7 +830,11 @@ where
             })?;
             facts += member;
         }
-        Ok(facts)
+        Ok(CollectionSnapshot {
+            facts,
+            commits,
+            reader,
+        })
     }
 }
 
@@ -786,6 +898,56 @@ mod tests {
 
         fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
             panic!("empty collection must not open a blob reader")
+        }
+    }
+
+    struct AppendAfterFirstDiscovery {
+        inner: MemoryRepo,
+        initially_visible: BTreeSet<Id>,
+        records_calls: usize,
+    }
+
+    impl CollectionStore for AppendAfterFirstDiscovery {
+        type RecordsError = Infallible;
+        type InsertError = Infallible;
+        type RecordIter<'a> = std::vec::IntoIter<Result<CollectionRecord, Infallible>>;
+
+        fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+            let mut records = self
+                .inner
+                .records()?
+                .collect::<Result<Vec<_>, Infallible>>()?;
+            self.records_calls += 1;
+            if self.records_calls == 1 {
+                records.retain(|record| self.initially_visible.contains(&record.id()));
+            }
+            Ok(records.into_iter().map(Ok).collect::<Vec<_>>().into_iter())
+        }
+
+        fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
+            self.inner.insert(record)
+        }
+    }
+
+    impl BlobStorePut for AppendAfterFirstDiscovery {
+        type PutError = <MemoryRepo as BlobStorePut>::PutError;
+
+        fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
+        where
+            S: BlobEncoding + 'static,
+            T: IntoBlob<S>,
+            Handle<S>: InlineEncoding,
+        {
+            self.inner.put(item)
+        }
+    }
+
+    impl BlobStore for AppendAfterFirstDiscovery {
+        type Reader = <MemoryRepo as BlobStore>::Reader;
+        type ReaderError = <MemoryRepo as BlobStore>::ReaderError;
+
+        fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
+            self.inner.reader()
         }
     }
 
@@ -917,6 +1079,64 @@ mod tests {
             Collection::new(EmptyWithoutReader, id(1), SigningKey::from_bytes(&[7; 32]));
 
         assert_eq!(collection.materialize().unwrap(), TribleSet::new());
+    }
+
+    #[test]
+    fn empty_snapshot_still_carries_a_reader() {
+        let mut collection = Collection::new(
+            MemoryRepo::default(),
+            id(1),
+            SigningKey::from_bytes(&[7; 32]),
+        );
+
+        let snapshot = collection.snapshot().unwrap();
+        assert_eq!(snapshot.facts(), &TribleSet::new());
+        assert!(snapshot.commits().is_empty());
+        assert!(snapshot.reader().is_empty());
+    }
+
+    #[test]
+    fn snapshot_keeps_one_authority_frontier_when_a_commit_appears_before_reader_open() {
+        let scope = id(1);
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let first = fragment(1, false);
+        let second = fragment(2, false);
+        let mut expected_all = first.facts().clone();
+        expected_all += second.facts().clone();
+
+        let mut seeded = Collection::new(MemoryRepo::default(), scope, signing_key.clone());
+        let first_commit = seeded.commit(first.clone()).unwrap();
+        let second_commit = seeded.commit(second).unwrap();
+        let storage = AppendAfterFirstDiscovery {
+            inner: seeded.into_storage(),
+            initially_visible: BTreeSet::from([first_commit.id()]),
+            records_calls: 0,
+        };
+        let mut collection = Collection::new(storage, scope, signing_key);
+
+        let snapshot = collection.snapshot().unwrap();
+        assert_eq!(snapshot.facts(), first.facts());
+        assert_eq!(snapshot.commits(), &[first_commit]);
+        assert_eq!(collection.storage().records_calls, 1);
+
+        // The later commit's bytes are already in the captured blob reader.
+        // They remain semantically inert because its signed record was not in
+        // the exact authority frontier returned with this snapshot.
+        let _: Blob<SimpleArchive> = snapshot
+            .reader()
+            .get(Handle::<SimpleArchive>::from_hash(second_commit.data()))
+            .unwrap();
+
+        let next = collection.snapshot().unwrap();
+        assert_eq!(next.facts(), &expected_all);
+        assert_eq!(
+            next.commits()
+                .iter()
+                .map(CollectionCommit::id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([first_commit.id(), second_commit.id()])
+        );
+        assert_eq!(collection.storage().records_calls, 2);
     }
 
     #[test]

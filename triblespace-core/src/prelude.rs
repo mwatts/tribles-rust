@@ -39,7 +39,7 @@ pub use crate::blob::BlobEncoding;
 pub use crate::blob::IntoBlob;
 pub use crate::blob::MemoryBlobStore;
 pub use crate::blob::TryFromBlob;
-pub use crate::collection::{Collection, CollectionStore};
+pub use crate::collection::{Collection, CollectionSnapshot, CollectionStore};
 pub use crate::id::fucid;
 pub use crate::id::genid;
 pub use crate::id::local_ids;
