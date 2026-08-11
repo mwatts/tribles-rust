@@ -119,7 +119,7 @@ impl ObjectStoreRemote {
 }
 
 impl AsyncBlobStorePut for ObjectStoreRemote {
-    type PutError = object_store::Error;
+    type PutError = PutBlobErr;
 
     fn put<S, T>(
         &mut self,
@@ -139,11 +139,30 @@ impl AsyncBlobStorePut for ObjectStoreRemote {
             let path = self.prefix.child(BLOB_INFIX).child(hex::encode(raw));
             let result = self
                 .store
-                .put_opts(&path, bytes.into(), PutMode::Create.into())
+                .put_opts(&path, bytes.clone().into(), PutMode::Create.into())
                 .await;
             match result {
-                Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => Ok(Inline::new(raw)),
-                Err(e) => Err(e),
+                Ok(_) => Ok(Inline::new(raw)),
+                Err(object_store::Error::AlreadyExists { .. }) => {
+                    // A content-addressed retry is idempotent only when the
+                    // occupied key contains the exact staged bytes. Merely
+                    // trusting the filename could publish an authoritative
+                    // collection record over a corrupt dependency.
+                    let object = self
+                        .store
+                        .get(&path)
+                        .await
+                        .map_err(PutBlobErr::ReadExisting)?;
+                    let actual = object.bytes().await.map_err(PutBlobErr::ReadExisting)?;
+                    if actual == bytes {
+                        Ok(Inline::new(raw))
+                    } else {
+                        Err(PutBlobErr::ExistingMismatch {
+                            handle: Inline::new(raw),
+                        })
+                    }
+                }
+                Err(error) => Err(PutBlobErr::Store(error)),
             }
         }
     }
@@ -739,6 +758,45 @@ impl Error for InsertCollectionRecordErr {
     }
 }
 
+/// Error returned while inserting one immutable content-addressed blob.
+#[derive(Debug)]
+pub enum PutBlobErr {
+    /// Creating the immutable blob object failed.
+    Store(object_store::Error),
+    /// An existing object could not be fetched for idempotency validation.
+    ReadExisting(object_store::Error),
+    /// The content-addressed path already contained different bytes.
+    ExistingMismatch {
+        /// Handle encoded by the occupied object path.
+        handle: Inline<Hash<Blake3>>,
+    },
+}
+
+impl fmt::Display for PutBlobErr {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Store(error) => write!(formatter, "blob insert failed: {error}"),
+            Self::ReadExisting(error) => {
+                write!(formatter, "failed to validate existing blob: {error}")
+            }
+            Self::ExistingMismatch { handle } => write!(
+                formatter,
+                "blob handle {} already contains different bytes",
+                Hash::<Blake3>::to_hex(handle)
+            ),
+        }
+    }
+}
+
+impl Error for PutBlobErr {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Store(error) | Self::ReadExisting(error) => Some(error),
+            Self::ExistingMismatch { .. } => None,
+        }
+    }
+}
+
 /// Error returned when retrieving a blob from the object store.
 #[derive(Debug)]
 pub enum GetBlobErr<E: Error> {
@@ -933,8 +991,9 @@ mod tests {
     use futures::executor::block_on;
     use object_store::memory::InMemory;
 
+    use crate::blob::encodings::rawbytes::RawBytes;
     use crate::collection::{CollectionDescriptor, CollectionMerge, CollectionStore};
-    use crate::repo::async_store::Blocking;
+    use crate::repo::async_store::{AsyncBlobStorePut, Blocking};
     use crate::repo::StorageFlush;
 
     fn remote() -> ObjectStoreRemote {
@@ -1012,6 +1071,47 @@ mod tests {
                 Err(ListCollectionRecordsErr::IdMismatch { path, record })
                     if *path == path_record.id() && *record == stored_record.id()
             ));
+        });
+    }
+
+    #[test]
+    fn blob_retry_requires_exact_existing_bytes() {
+        block_on(async {
+            let mut store = remote();
+            let expected = Bytes::from_source(b"canonical blob".to_vec());
+            let handle = Blob::<RawBytes>::new(expected.clone()).get_handle();
+            let path = store
+                .prefix
+                .child(BLOB_INFIX)
+                .child(hex::encode(handle.raw));
+            store
+                .store
+                .put(&path, bytes::Bytes::from_static(b"wrong bytes").into())
+                .await
+                .unwrap();
+
+            assert!(matches!(
+                AsyncBlobStorePut::put::<RawBytes, _>(&mut store, expected).await,
+                Err(PutBlobErr::ExistingMismatch { handle: actual })
+                    if actual.raw == handle.raw
+            ));
+        });
+    }
+
+    #[test]
+    fn blob_retry_accepts_exact_existing_bytes() {
+        block_on(async {
+            let mut store = remote();
+            let bytes = Bytes::from_source(b"canonical blob".to_vec());
+
+            let first = AsyncBlobStorePut::put::<RawBytes, _>(&mut store, bytes.clone())
+                .await
+                .unwrap();
+            let repeated = AsyncBlobStorePut::put::<RawBytes, _>(&mut store, bytes)
+                .await
+                .unwrap();
+
+            assert_eq!(repeated, first);
         });
     }
 
