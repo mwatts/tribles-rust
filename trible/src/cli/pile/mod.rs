@@ -71,16 +71,17 @@ pub enum PileCommand {
         #[command(subcommand)]
         cmd: diagnose::Command,
     },
-    /// DESTRUCTIVE: truncate a pile at its first malformed known record,
+    /// DESTRUCTIVE: truncate a pile at its first malformed or torn record,
     /// deleting everything after it.
     ///
-    /// This is the ONLY explicit entry point that truncates a pile: it loads
-    /// every valid record and cuts the file back to the last offset before a
-    /// malformed known record — everything past that point is permanently
-    /// destroyed. Unknown record markers are refused because their length is
+    /// This explicit repair entry point loads every structurally complete
+    /// record and cuts the file back to the last valid boundary—everything
+    /// past that point is permanently destroyed. Complete opaque envelopes
+    /// are crossed, and a torn opaque envelope can be cut at its known start;
+    /// unknown unenveloped markers are refused because their length is
     /// unknowable and may indicate a newer pile format. This is last-resort
-    /// surgery for a torn known record left by a crashed write: back the file
-    /// up first, confirm the tail is genuinely torn (e.g. `trible pile
+    /// surgery for a torn append left by a crashed write: back the file up
+    /// first, confirm the tail is genuinely torn (e.g. `trible pile
     /// diagnose`), and only then run this by hand.
     Amputate {
         /// Path to the pile file to amputate (TRUNCATED in place)

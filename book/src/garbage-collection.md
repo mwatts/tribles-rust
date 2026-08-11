@@ -92,6 +92,14 @@ independently apply the conservative rule above: preserve every native record,
 then recursively retain the resident descriptor, data, and metadata closure of
 every strictly verified current `COMMIT`.
 
+Generic-envelope records whose kind is unknown to the running binary form a
+harder boundary: their bytes have a known span and ordinary replay can safely
+project them away, but the reader cannot know whether their semantics own known
+blobs. `Pile::rewrite_retained_into` and Yard collection, compaction, and
+reclaim therefore refuse before changing destination bytes or live sets when
+any opaque record is present. Upgrade to tooling that understands the kind
+before performing destructive retention.
+
 ## Conservative Reachability
 
 Every commit and branch metadata record is stored as a `SimpleArchive`. The

@@ -8,14 +8,20 @@ blob arrive?" without walking the raw bytes on disk.
 
 ## Header fields at a glance
 
-The header written ahead of every blob contains four fields (64 bytes total):
+The current 256-byte generic envelope written ahead of every blob contains:
 
-| Field         | Size (bytes) | Purpose                                                                 |
-| ------------- | ------------ | ------------------------------------------------------------------------ |
-| Magic marker  | 16           | Distinguishes blob records from branch updates.                         |
-| Timestamp     | 8            | Milliseconds since the Unix epoch when the payload was appended.        |
-| Length        | 8            | Size of the payload in bytes (padding is stored separately).            |
-| Hash          | 32           | The 256-bit digest of the payload used to validate the stored bytes.    |
+| Field | Offset | Size | Purpose |
+|---|---:|---:|---|
+| Envelope marker | `0..16` | 16 | Identifies the generic forward-compatible framing. |
+| Blob kind ID | `16..32` | 16 | Selects blob semantics. |
+| Span | `32..36` | 4 | Total record size in 256-byte blocks, little-endian. |
+| Timestamp | `36..44` | 8 | Unix milliseconds when the payload was appended, little-endian. |
+| Length | `44..52` | 8 | Exact payload bytes excluding padding, little-endian. |
+| Hash | `52..84` | 32 | Digest used to validate and address the payload. |
+| Reserved | `84..256` | 172 | Required zeros. |
+
+The reader also accepts legacy V1/V3 blob headers and projects their timestamp,
+length, and hash through the same API.
 
 [`BlobMetadata`][blobmetadata] re-exposes the timestamp and length fields so
 callers can read when a blob was appended and how large the payload is.
@@ -30,8 +36,8 @@ validation to the reader:
   way to turn this into a `SystemTime` is shown below. `Pile::put` records this
   value using `SystemTime::now()`, so it reflects wall-clock time and can move
   forward or backward if the system clock is adjusted.
-- `length`: the size of the blob payload in bytes. Padding that aligns entries
-  to 64-byte boundaries is excluded from this value, so it matches the slice
+- `length`: the size of the blob payload in bytes. Padding that aligns current
+  entries to 256-byte boundaries is excluded from this value, so it matches the slice
   returned by [`PileReader::get`][get].
 
 [blobmetadata]: ../../src/repo.rs

@@ -170,6 +170,18 @@ pub struct Yard {
 }
 
 impl Yard {
+    fn opaque_record_count(&mut self) -> Result<usize, ReadError> {
+        let mut count = 0usize;
+        for generation in &mut self.generations {
+            for segment in &mut generation.segments {
+                count = count
+                    .checked_add(segment.pile_mut().opaque_record_count()?)
+                    .expect("yard opaque-record count overflow");
+            }
+        }
+        Ok(count)
+    }
+
     /// Create a fresh yard, truncating/creating one pile file per generation.
     pub fn create<P>(
         paths: impl IntoIterator<Item = P>,
@@ -403,6 +415,14 @@ impl Yard {
     /// empty [`RetentionRoots`] explicitly when those commits and legacy strong
     /// pins are the only desired strong roots.
     pub fn collect(&mut self, retention: &RetentionRoots) -> Result<(), YardCollectError> {
+        let opaque_records = self
+            .opaque_record_count()
+            .map_err(|err| YardCollectError::Reader(YardReaderError::Pile(err)))?;
+        if opaque_records != 0 {
+            return Err(YardCollectError::OpaqueRecords {
+                count: opaque_records,
+            });
+        }
         let retention = self
             .retention_with_native_commits(retention)
             .map_err(YardCollectError::CollectionRecords)?;
@@ -525,6 +545,12 @@ impl Yard {
     /// temporary file over the original on the same filesystem, and reopens
     /// the generation.
     pub fn reclaim(&mut self) -> Result<(), YardReclaimError> {
+        let opaque_records = self.opaque_record_count().map_err(YardReclaimError::Pile)?;
+        if opaque_records != 0 {
+            return Err(YardReclaimError::OpaqueRecords {
+                count: opaque_records,
+            });
+        }
         for level in 0..self.generations.len() {
             for index in 0..self.generations[level].segments.len() {
                 self.reclaim_segment(level, index)?;
@@ -1178,6 +1204,15 @@ fn reclaim_generation(
     live: &HandleSet,
     mut old_pile: Pile,
 ) -> Result<Pile, YardReclaimError> {
+    let opaque_records = old_pile
+        .opaque_record_count()
+        .map_err(YardReclaimError::Pile)?;
+    if opaque_records != 0 {
+        return Err(YardReclaimError::OpaqueRecords {
+            count: opaque_records,
+        });
+    }
+
     match fs::remove_file(temp_path) {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -1320,8 +1355,16 @@ impl<E: Error> fmt::Display for YardGetError<E> {
 impl<E: Error + 'static> Error for YardGetError<E> {}
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum YardCollectError {
     Reader(YardReaderError),
+    /// At least one generation contains unknown enveloped records. Collection
+    /// cannot know whether they own otherwise-unrooted blobs, so it refuses
+    /// before changing any generation's live set.
+    OpaqueRecords {
+        /// Total opaque records found across all generations.
+        count: usize,
+    },
     CollectionRecords(YardCollectionRecordsError),
     Transfer(TransferError<Infallible, YardGetError<Infallible>, InsertError>),
     Flush(super::pile::FlushError),
@@ -1333,6 +1376,10 @@ impl fmt::Display for YardCollectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Reader(err) => write!(f, "failed to create yard reader: {err}"),
+            Self::OpaqueRecords { count } => write!(
+                f,
+                "refusing to collect a yard containing {count} unknown enveloped record(s)"
+            ),
             Self::CollectionRecords(err) => {
                 write!(f, "failed to replay yard collection records: {err}")
             }
@@ -1366,9 +1413,17 @@ impl fmt::Display for YardCloseError {
 impl Error for YardCloseError {}
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum YardReclaimError {
     Io(std::io::Error),
     Pile(ReadError),
+    /// One or more generations contain unknown enveloped records. Reclaim
+    /// cannot infer their retention semantics and refuses before replacing
+    /// any file.
+    OpaqueRecords {
+        /// Number of opaque records found by the refusing scan.
+        count: usize,
+    },
     Transfer(TransferError<Infallible, GetBlobError<Infallible>, InsertError>),
     CollectionRecord(CollectionInsertError),
     LocalCell(PileWriteError),
@@ -1392,6 +1447,10 @@ impl fmt::Display for YardReclaimError {
         match self {
             Self::Io(err) => write!(f, "failed to replace yard generation pile: {err}"),
             Self::Pile(err) => write!(f, "failed to read yard generation pile: {err}"),
+            Self::OpaqueRecords { count } => write!(
+                f,
+                "refusing to reclaim a yard containing {count} unknown enveloped record(s)"
+            ),
             Self::Transfer(err) => write!(f, "failed to copy live yard blobs: {err}"),
             Self::CollectionRecord(err) => {
                 write!(f, "failed to copy a yard collection record: {err}")

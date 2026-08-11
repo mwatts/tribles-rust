@@ -15,16 +15,34 @@ narrow usage pattern keeps these failure modes manageable. Appends happen
 sequentially and validation walks new bytes before readers observe them, so the
 memory map never exposes half-written records.
 
-## Record model: uniform 256-byte framing
+## Record model: generic envelope and uniform 256-byte framing
 
-Every record the pile writes today uses a fixed **256-byte header**, followed
-(for blobs) by the payload, padded so the whole record is a **256-byte
-multiple**. Blob, branch, local-cell, and want records retain their V3 markers;
-current native collection equations use V4 markers because they carry 32-byte
-descriptor handles. A collection descriptor itself is an ordinary blob, not a
-fourth collection-record kind. Want records likewise retain their historical
-weak-pin/weak-unpin markers for byte compatibility; those are physical format
-names, not the public storage model. The common framing is load-bearing:
+Every record the pile writes today begins with the same fixed **256-byte
+envelope header**, followed (for blobs) by the payload, padded so the whole
+record is a **256-byte multiple**:
+
+| Offset | Width | Field |
+|---:|---:|---|
+| `0..16` | 16 | Generic envelope marker `E5A95E5D8A0BBA8782E46B9C9E73B313` |
+| `16..32` | 16 | Semantic record-kind ID |
+| `32..36` | 4 | Total record span in 256-byte blocks, unsigned little-endian |
+| `36..256` | 220 | Kind-specific body and zeroed reserved bytes |
+
+The envelope marker was minted with `trible genid` on 2026-08-11. Record kinds
+reuse the existing current V3 blob/branch/cell/want markers and V4 collection
+markers; no semantic IDs were reminted. A collection descriptor itself remains
+an ordinary blob, not a fourth collection-record kind. Want records likewise
+retain their historical weak-pin/weak-unpin kind IDs; those are physical format
+names, not the public storage model.
+
+The span includes the header. Zero is invalid; decoders perform checked
+`span * 256` arithmetic and require that the complete record fit in the
+observed pile prefix. A header-only record therefore has span 1. A blob has
+span `1 + ceil(payload_length / 256)`, and the decoder requires the generic
+span and blob-specific byte length to agree exactly. A `u32` block count keeps
+the prefix compact while permitting a single record of almost 1&nbsp;TiB.
+
+The common framing is load-bearing:
 
 - **Position independence.** Blob data starts at the constant
   `record_start + 256`; there is no offset-derived padding. A record means
@@ -39,20 +57,40 @@ names, not the public storage model. The common framing is load-bearing:
 - **Cache-friendly headers.** Each header begins on a cache-line boundary and
   admits safe typed views with the `zerocopy` crate.
 
-Reserved header bytes are zeroed and are **not** part of the content hash;
+Reserved kind-body bytes are zeroed and are **not** part of the content hash;
 per-record metadata belongs in tribles, not in the header, so identical bytes
 never fork into distinct blobs.
 
-The reader still accepts the original **V1** records (64-byte-aligned blob,
-branch, and tombstone layouts — see [Legacy V1 records](#legacy-v1-records))
-and recognizes the obsolete V3 collection headers described below. New writes
-use the current marker for each record family. A current reader that encounters
-a complete unknown marker reports
-`ReadError::UnsupportedRecord { offset, marker }` and leaves the pile
-untouched; it cannot safely skip or truncate a record whose length it does not
-know. Older binaries predating this distinction may report `CorruptPile`
-instead. When an old binary rejects a pile a newer binary wrote, upgrade the
-binary rather than trying to repair the pile.
+Unknown kinds inside this envelope decode as opaque records. Normal pile replay
+semantically skips them and continues with subsequent known records;
+`PileRecords` still exposes their exact offset, length, kind, and raw bytes.
+This is a forgetful projection: any future kind introduced under this envelope
+must remain independent of the meaning of known records. In particular, it may
+not change the validity or effect of a known record, constrain an old writer's
+otherwise-valid append, or make an existing record depend on a companion
+record of the new kind. Such an extension—or any other extension whose absence
+cannot conservatively mean “no effect”—requires a new generic envelope marker
+instead.
+
+Concatenation is associative ordered composition, not universally commutative:
+branches, cells, and wants are right-biased last-writer-wins logs. Opaque
+filtering is sound because it leaves the relative order of every known record
+unchanged; only collection records additionally collapse to order-independent
+set union.
+
+The reader still accepts original **V1** records (64-byte-aligned blob, branch,
+and tombstone layouts), unenveloped **V3** records, and unenveloped **V4**
+collection records byte-for-byte. An unknown *unenveloped* marker still reports
+`ReadError::UnsupportedRecord { offset, marker }`, because its boundary is
+unknowable. Older binaries predating the generic envelope reject its marker;
+upgrade them rather than trying to repair the pile.
+
+The envelope deliberately has no checksum or complemented length. It detects
+torn/truncated appends through its bounds and kind-specific checks, and it
+solves version-skew framing; it is not intended to diagnose arbitrary header
+bit rot. For example, a corrupted kind can look like an opaque kind, while a
+corrupted but still in-bounds span can cover later bytes. Blob payload integrity
+remains protected by its content hash.
 
 ## Design Rationale
 
@@ -72,28 +110,30 @@ refreshing state.
    create missing files — create the file explicitly for a fresh pile).
 2. **Load and validate.** `refresh` acquires a shared lock, walks bytes beyond
    `applied_length`, and rebuilds the blob, collection-record, and pin indices
-   in memory. It **fails loud** on a corrupt or torn known record
-   (`ReadError::CorruptPile { valid_length }`) and distinguishes a complete
-   unknown marker as `ReadError::UnsupportedRecord { offset, marker }`. It
-   never mutates the file. Callers rarely need to invoke it directly:
+   in memory. It **fails loud** on a corrupt or torn record
+   (`ReadError::CorruptPile { valid_length }`). It skips bounded unknown
+   envelope kinds as opaque records and distinguishes an unknown legacy marker
+   as `ReadError::UnsupportedRecord { offset, marker }`. It never mutates the
+   file. Callers rarely need to invoke it directly:
    `reader`, `records`, `pins`, `head`, `update`, `cell`, and `set_cell` call
    `refresh` internally
    before they inspect or apply records, so external writers are visible
    without a standalone scan.
 3. **Amputate only when asked to.** `amputate` is the explicit, opt-in repair
    path: it re-runs validation under an exclusive lock and truncates the file
-   back to the last valid record, discarding a torn known record left by a
-   crash. It refuses `UnsupportedRecord` without modifying the file because an
-   unknown record's boundary is unknowable. It is deliberately **not** part of
-   the normal open sequence. The `trible pile amputate <path>` command wraps it
-   for operators.
+   back to the last valid record, discarding a torn record left by a
+   crash. It crosses complete opaque envelopes and may truncate a torn opaque
+   tail at its known start. It refuses `UnsupportedRecord` without modifying
+   the file because an unknown unenveloped record's boundary is unknowable. It
+   is deliberately **not** part of the normal open sequence. The
+   `trible pile amputate <path>` command wraps it for operators.
 4. **Append new records.** `put` (through the `BlobStorePut` trait),
    `CollectionStore::insert`, local-cell replacement, and pin update helpers
    extend the file. Each
    append immediately feeds the bytes back through the record scanner so
    in-memory indices stay synchronised without waiting for a manual `refresh`.
    Blob records use a single `write_vectored` call; fixed-width collection and
-   pin records use one append of their 256-byte header.
+   pin records use one append of their 256-byte envelope header.
    Records larger than ~1&nbsp;GiB can't be appended in a single atomic
    `writev` because kernel `write_vectored` calls cap at `INT_MAX` bytes on
    macOS and `MAX_RW_COUNT` (~2&nbsp;GiB) on Linux. In that case `put` takes
@@ -125,8 +165,8 @@ assumption, avoiding repeated hash verification for frequently accessed blobs.
 Hash verification only happens when blobs are read. Opening even a very large
 pile is therefore fast while still catching corruption before data is used.
 
-Every record begins with a 16&nbsp;byte magic marker that identifies its kind.
-The sections below illustrate the layout of each type.
+Every newly written record begins with the generic marker, kind ID, and span
+described above. The sections below illustrate each kind-specific body.
 
 ## Usage
 
@@ -156,8 +196,8 @@ fn add_blob(bytes: &[u8]) -> Result<(), Box<dyn Error>> {
     let path = PathBuf::from("data.pile");
     let mut pile = Pile::open(&path)?;
     // Load and validate the existing records. This FAILS LOUD on a corrupt
-    // or torn known record and never mutates the file. An unknown complete
-    // marker is reported separately as unsupported version skew.
+    // or torn record and never mutates the file. Unknown envelope kinds are
+    // skipped as opaque; unknown legacy markers remain unsupported.
     match pile.refresh() {
         Ok(()) => {}
         Err(err @ ReadError::UnsupportedRecord { .. }) => return Err(err.into()),
@@ -214,25 +254,34 @@ consolidation, forensics—should use
 [`PileRecords`](../../src/repo/pile.rs), an iterator over every record in a
 pile file in log order. It shares its decoder with the replay path described
 above, so it understands every record format ever written; do not hand-roll a
-parser against the layouts documented in this chapter. A complete unknown
-marker is reported as `UnsupportedRecord`; a malformed or truncated known
-record is reported as `CorruptPile`. Neither is skipped.
+parser against the layouts documented in this chapter. An unknown envelope kind
+is yielded as `PileRecordContent::Opaque` with its declared boundary; callers
+can preserve its exact bytes through the iterator's raw file view. An unknown
+unenveloped marker is reported as `UnsupportedRecord`, while a malformed or
+truncated record is reported as `CorruptPile`.
+
+Semantic Pile and Yard reads may continue across opaque records, but destructive
+retention is different: `Pile::rewrite_retained_into`, Yard collection,
+compaction, and reclaim refuse before mutation when any opaque record is
+present. An older reader cannot know whether the unknown kind owns a known
+blob, so silently omitting it—or collecting its dependencies—would be unsafe.
 
 ## Blob Records
 
-```text
-            ┌────16 byte───┐┌8 byte┐┌8 byte┐┌────────────32 byte───────────┐┌───192 byte───┐
-          ┌ ┌──────────────┐┌──────┐┌──────┐┌──────────────────────────────┐┌──────────────┐
- header   │ │ blob marker  ││ time ││length││             hash             ││  reserved 0s │
- (256 B)  └ └──────────────┘└──────┘└──────┘└──────────────────────────────┘└──────────────┘
-            ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
- payload    │        bytes, post-padded so the record is a 256-byte multiple             │
-            └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
-```
+| Offset | Width | Field |
+|---:|---:|---|
+| `0..16` | 16 | Generic envelope marker |
+| `16..32` | 16 | Blob kind `9C33EEB525065A62EAEC4BE43DCC355A` |
+| `32..36` | 4 | Total 256-byte-block span, little-endian |
+| `36..44` | 8 | Timestamp in Unix milliseconds, little-endian |
+| `44..52` | 8 | Exact unpadded payload byte length, little-endian |
+| `52..84` | 32 | BLAKE3 payload hash |
+| `84..256` | 172 | Reserved zeros |
+| `256..` | variable | Payload and post-padding to the declared span |
 
 Each blob record carries:
 
-- **Magic marker** – identifies the record kind.
+- **Record kind** – identifies blob semantics inside the generic envelope.
 - **Timestamp** – milliseconds since the Unix epoch when the append occurred.
 - **Payload length** – the unpadded byte length of the blob.
 - **Hash** – the digest produced by the pile's hash protocol (BLAKE3 by
@@ -248,7 +297,8 @@ explains how to query these fields through the `PileReader` API.
 
 `CollectionStore` is a grow-only set of canonical collection-calculus records:
 signed `COMMIT` assertions and unsigned `MERGE` and `DERIVE` equations. The
-pile stores these three kinds directly as fixed 256-byte V4 records. They are
+pile stores these three kinds directly as fixed one-block enveloped records.
+Their semantic kind IDs retain the V4 markers. They are
 **not blob records**, have no following payload, and carry no insertion
 timestamp. They are also distinct from mutable branch pins and local cells
 described below: collection records have no head, tombstone, or
@@ -264,11 +314,11 @@ The magic markers below identify the compact pile representation. They are
 wire-format markers, not the `metadata::tag` IDs found in the equivalent
 canonical `SimpleArchive` entities.
 
-| Kind | V4 magic marker | Exact byte layout |
+| Kind | V4 kind ID | Kind-specific byte layout after the common prefix |
 |---|---|---|
-| Commit | `CBF2CF97D52A3486E16C12D70D397C66` | `0..16` marker, `16..48` descriptor handle, `48..80` data digest, `80..112` metadata handle, `112..144` Ed25519 public key, `144..176` signature R, `176..208` signature S, `208..256` reserved zeros |
-| Merge | `9F5D028D4C423620D6957A5F726FA727` | `0..16` marker, `16..48` descriptor handle, `48..80` lower input digest, `80..112` higher input digest, `112..144` result digest, `144..256` reserved zeros |
-| Derive | `ECFB2EE90ED8042244F7BAC704454BB9` | `0..16` marker, `16..48` source descriptor handle, `48..80` target descriptor handle, `80..112` input digest, `112..144` output digest, `144..256` reserved zeros |
+| Commit | `CBF2CF97D52A3486E16C12D70D397C66` | `36..68` descriptor handle, `68..100` data digest, `100..132` metadata handle, `132..164` Ed25519 public key, `164..196` signature R, `196..228` signature S, `228..256` reserved zeros |
+| Merge | `9F5D028D4C423620D6957A5F726FA727` | `36..68` descriptor handle, `68..100` lower input digest, `100..132` higher input digest, `132..164` result digest, `164..256` reserved zeros |
+| Derive | `ECFB2EE90ED8042244F7BAC704454BB9` | `36..68` source descriptor handle, `68..100` target descriptor handle, `100..132` input digest, `132..164` output digest, `164..256` reserved zeros |
 
 Every reserved byte must be zero; a nonzero reserved byte makes replay fail as
 corrupt rather than silently assigning meaning to a format extension. Merge
@@ -292,6 +342,19 @@ change the discovered collection calculus. This order-independent behavior is
 specific to collection records and does not turn the last-writer-wins pin log
 into a set.
 
+### Legacy unenveloped V4 collection records
+
+Before the generic envelope, the same three V4 kind IDs occupied bytes
+`0..16`, followed immediately by the semantic fields. Those exact 256-byte
+records remain readable and reconstruct the same current collection records.
+They are never rewritten in place; newly inserted records use the envelope.
+
+| Kind | Legacy unenveloped byte layout |
+|---|---|
+| Commit | `0..16` kind, `16..48` descriptor, `48..80` data, `80..112` metadata, `112..144` public key, `144..176` signature R, `176..208` signature S, `208..256` zeros |
+| Merge | `0..16` kind, `16..48` descriptor, `48..80` low, `80..112` high, `112..144` result, `144..256` zeros |
+| Derive | `0..16` kind, `16..48` source descriptor, `48..80` target descriptor, `80..112` input, `112..144` output, `144..256` zeros |
+
 ### Legacy V3 collection records
 
 V3 encoded a collection by a separate definition record with a 16-byte
@@ -310,17 +373,10 @@ they never enter `CollectionStore`, assert membership, or retain blobs.
 
 ## Pin Records (branch head / tombstone)
 
-```text
-            ┌────16 byte───┐┌────16 byte───┐┌────────────32 byte───────────┐┌───192 byte───┐
-          ┌ ┌──────────────┐┌──────────────┐┌──────────────────────────────┐┌──────────────┐
- head     │ │ branch marker││   branch id  ││             hash             ││  reserved 0s │
- (256 B)  └ └──────────────┘└──────────────┘└──────────────────────────────┘└──────────────┘
-
-            ┌────16 byte───┐┌────16 byte───┐┌──────────────224 byte────────────────────────┐
-          ┌ ┌──────────────┐┌──────────────┐┌──────────────────────────────────────────────┐
- tombstone│ │ tomb marker  ││   branch id  ││                 reserved 0s                  │
- (256 B)  └ └──────────────┘└──────────────┘└──────────────────────────────────────────────┘
-```
+| Kind | Kind ID | Kind-specific body after the common prefix |
+|---|---|---|
+| Head | `AC363D04AFE1AF17B39581B1E23021D7` | `36..52` branch ID, `52..84` hash, `84..256` reserved zeros |
+| Tombstone | `D0CBA0C8EAAB4C0C73121C3205671E4F` | `36..52` branch ID, `52..256` reserved zeros |
 
 Pin-head records map a pin (branch) identifier to the hash of a blob; a
 tombstone retracts the mapping. Appends are intentionally lightweight: the
@@ -330,17 +386,10 @@ store.
 
 ## Local Cell Records
 
-```text
-            ┌────16 byte───┐┌────16 byte───┐┌────────────32 byte───────────┐┌───192 byte───┐
-          ┌ ┌──────────────┐┌──────────────┐┌──────────────────────────────┐┌──────────────┐
- value    │ │ cell marker  ││   cell id    ││      SimpleArchive handle    ││  reserved 0s │
- (256 B)  └ └──────────────┘└──────────────┘└──────────────────────────────┘└──────────────┘
-
-            ┌────16 byte───┐┌────16 byte───┐┌──────────────224 byte────────────────────────┐
-          ┌ ┌──────────────┐┌──────────────┐┌──────────────────────────────────────────────┐
- clear    │ │ clear marker ││   cell id    ││                 reserved 0s                  │
- (256 B)  └ └──────────────┘└──────────────┘└──────────────────────────────────────────────┘
-```
+| Kind | Kind ID | Kind-specific body after the common prefix |
+|---|---|---|
+| Replace | `24264FA9EE46A1ACC0E024AE69774B09` | `36..52` cell ID, `52..84` `SimpleArchive` handle, `84..256` reserved zeros |
+| Clear | `4FE372AE868D22A44DED7A60D579B651` | `36..52` cell ID, `52..256` reserved zeros |
 
 Local cells are named last-writer-wins operational values. Their V3 markers are
 `24264FA9EE46A1ACC0E024AE69774B09` (replace) and
@@ -358,12 +407,10 @@ to any published collection.
 
 ## Want Records
 
-```text
-            ┌────16 byte───┐┌────────────32 byte───────────┐┌────────────208 byte──────────┐
-          ┌ ┌──────────────┐┌──────────────────────────────┐┌──────────────────────────────┐
- want     │ │assert marker ││         blob handle          ││          reserved 0s         │
- (256 B)  └ └──────────────┘└──────────────────────────────┘└──────────────────────────────┘
-```
+| Kind | Kind ID | Kind-specific body after the common prefix |
+|---|---|---|
+| Assert | `8F3EEFEDECD491F63F6EAAA5FD6F3D5E` | `36..68` blob handle, `68..256` reserved zeros |
+| Retract | `2D76662DFF0187EC36A8C90B12BB8B0D` | `36..68` blob handle, `68..256` reserved zeros |
 
 A want assertion (and its retraction counterpart, using the same layout with a
 different marker) is keyed by **blob handle** — per-blob and anonymous, with no
@@ -375,23 +422,32 @@ Because wants are durable records, reopening a pile reconstructs the current
 wanted set. The implementation keeps the original weak-pin/weak-unpin marker
 IDs solely so existing piles continue to decode byte-for-byte.
 
-## Legacy V1 records
+## Legacy unenveloped records
 
-Piles written before V3 contain 64-byte-aligned records: a 64-byte blob header
-(marker, timestamp, length, hash) followed by a payload padded to a 64-byte
-boundary, and 64-byte branch / tombstone records. The reader recognises the V1
-markers and reads these records byte-identical; they are never rewritten. V1
-had no want records.
+Unenveloped V3 blob, branch, local-cell, and want records place their kind ID
+directly in `0..16`. Their semantic bodies begin at byte 16 rather than byte
+36: a V3 blob stores timestamp at `16..24`, byte length at `24..32`, and hash at
+`32..64`; branch and cell IDs occupy `16..32`; branch/cell values occupy
+`32..64`; and want handles occupy `16..48`. All have a 256-byte header and
+remain readable byte-for-byte. The legacy V3 and V4 collection layouts are
+listed above.
+
+Piles written before V3 contain 64-byte-aligned V1 records: a 64-byte blob
+header (marker, timestamp, length, hash) followed by a payload padded to a
+64-byte boundary, and 64-byte branch / tombstone records. The reader recognises
+the V1 markers and reads these records byte-identical; they are never rewritten.
+V1 had no want records.
 
 ## Recovery
 
-`refresh` scans an existing file to ensure every known record fits. It does not
-verify any hashes. A malformed or truncated known record reports the number of
-bytes that were valid so far using `ReadError::CorruptPile`. A complete unknown
-marker reports its bytes and offset using `ReadError::UnsupportedRecord`, since
-the reader cannot infer that record's length. Both errors leave the file
-untouched, and the reader never guesses a length in order to skip an unknown
-record.
+`refresh` scans an existing file to ensure every record fits. It does not verify
+blob hashes. A malformed or truncated known or enveloped record reports the
+number of bytes that were valid so far using `ReadError::CorruptPile`. A
+complete unknown envelope kind is structurally accepted and semantically
+skipped; an unknown unenveloped marker reports its bytes and offset using
+`ReadError::UnsupportedRecord`, since the reader cannot infer that record's
+length. Both errors leave the file untouched, and the reader never guesses a
+legacy record length.
 
 If the file shrinks between scans into data that has already been applied, the
 process aborts immediately. Previously returned `Bytes` handles would dangle
@@ -404,9 +460,10 @@ data is treated as unrecoverable.
 The `amputate` helper is the explicit, destructive repair path: it re-runs the
 same validation under an exclusive lock and truncates the file to the valid
 length if corruption is encountered, discarding incomplete data left by an
-interrupted write. It propagates `UnsupportedRecord` without truncating. Run it
-deliberately (e.g. via `trible pile amputate <path>`) — never as a routine part
-of opening — and only for a genuinely malformed or torn known record. Hash
+interrupted write. It crosses complete opaque envelopes, truncates a torn one
+at its start, and propagates `UnsupportedRecord` for unknown unenveloped
+markers without truncating. Run it deliberately (e.g. via
+`trible pile amputate <path>`)—never as a routine part of opening. Hash
 verification happens lazily only when individual blobs are loaded so that
 opening a large pile remains fast.
 

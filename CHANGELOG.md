@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **New pile writes use a generic, length-delimited record envelope.** The
+  envelope marker `E5A95E5D8A0BBA8782E46B9C9E73B313` was minted with
+  `trible genid` on 2026-08-11; the next 16 bytes reuse each current V3/V4
+  marker as its semantic kind, followed by a little-endian `u32` span measured
+  in 256-byte blocks. Unknown enveloped kinds remain raw-visible through
+  `PileRecords` and are semantically skipped so later known records still
+  replay, while unknown unenveloped markers remain unsupported. Pile/Yard
+  collection and physical rewrites refuse before mutation in the presence of
+  opaque records because older tooling cannot infer their retention closure.
+  Existing V1/V3/V4 records remain readable byte-for-byte, and focused tests
+  cover every writer, legacy/enveloped concatenation, opaque multi-block
+  crossing, malformed spans, amputation, Lazy reopen/append, and conservative
+  reclamation.
 - **Raw SuccinctArchive collections now validate the exact collection laws.**
   The raw representation reuses the canonical TribleSet union recipe while
   remaining a distinct collection through its representation identity.

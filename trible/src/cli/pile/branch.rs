@@ -1869,7 +1869,8 @@ struct BranchState {
 ///
 /// Uses [`PileRecords`], the record-level iterator exported by
 /// `triblespace-core` — the same decoder the pile replay path uses, so every
-/// record format (V1 and V3) is understood. A corrupt or unknown record is a
+/// record format (legacy and generic envelope) is understood. A corrupt or
+/// unsupported unenveloped record is a
 /// hard error: decisions like consolidation must never be made off a
 /// truncated view of the log.
 fn scan_pile_records(path: &std::path::Path) -> Result<Vec<RawBranchRecord>> {
@@ -1898,7 +1899,9 @@ fn scan_pile_records(path: &std::path::Path) -> Result<Vec<RawBranchRecord>> {
             | PileRecordContent::WeakPin { .. }
             | PileRecordContent::WeakUnpin { .. }
             | PileRecordContent::LegacyCollectionV3 { .. }
-            | PileRecordContent::Collection { .. } => {}
+            | PileRecordContent::Collection { .. }
+            | PileRecordContent::Opaque { .. } => {}
+            _ => {}
         }
     }
 

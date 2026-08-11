@@ -52,6 +52,9 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                 let reader = pile
                     .reader()
                     .map_err(|e| anyhow::anyhow!("pile reader error: {e:?}"))?;
+                let opaque_records = pile
+                    .opaque_record_count()
+                    .map_err(|e| anyhow::anyhow!("pile envelope scan error: {e:?}"))?;
 
                 // Blob hash validation.
                 let mut invalid = 0usize;
@@ -76,7 +79,13 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                 }
 
                 if invalid == 0 {
-                    println!("Pile appears healthy");
+                    if opaque_records == 0 {
+                        println!("Pile appears healthy");
+                    } else {
+                        println!(
+                            "Known record projection appears healthy; skipped {opaque_records} structurally framed opaque record(s) whose bodies were not semantically validated"
+                        );
+                    }
                 } else {
                     println!("Pile corrupt: {invalid} of {total} blobs have incorrect hashes");
                     if fail_fast {
@@ -319,7 +328,8 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
     let needle_str: String = target.from_inline();
 
     // Record-level walk shared with the pile replay path — understands every
-    // record format (V1 and V3), so no format constant is duplicated here.
+    // record format (legacy and generic envelope), so no format constant is
+    // duplicated here.
     let mut records = PileRecords::open(pile_path)?;
     let bytes = records.bytes().clone();
 
@@ -329,6 +339,7 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
     let mut local_cell_matches = 0usize;
     let mut want_marker_matches = 0usize;
     let mut collection_record_matches = 0usize;
+    let mut opaque_record_matches = 0usize;
     let mut payload_matches = 0usize;
     let mut parse_error = None;
 
@@ -400,6 +411,18 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
                     );
                 }
             }
+            PileRecordContent::Opaque { kind } => {
+                let raw = &bytes[record.offset..record.offset + record.len];
+                for pos in finder.find_iter(raw) {
+                    opaque_record_matches += 1;
+                    println!(
+                        "opaque-record byte match at byte {} (kind {})",
+                        record.offset + pos,
+                        hex::encode_upper(kind)
+                    );
+                }
+            }
+            _ => {}
         }
     }
 
@@ -409,6 +432,7 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
     println!("  local cells:    {local_cell_matches}");
     println!("  want markers:   {want_marker_matches}");
     println!("  collection records: {collection_record_matches}");
+    println!("  opaque records: {opaque_record_matches}");
     println!("  payload refs:   {payload_matches}");
     if let Some(err) = parse_error {
         println!("  parse stopped:  {err}");

@@ -68,18 +68,28 @@ use crate::prelude::inlineencodings::Handle;
 const MAGIC_MARKER_BLOB: RawId = hex!("1E08B022FF2F47B6EBACF1D68EB35D96");
 const MAGIC_MARKER_BRANCH: RawId = hex!("2BC991A7F5D5D2A3A468C53B0AA03504");
 const MAGIC_MARKER_BRANCH_TOMBSTONE: RawId = hex!("E888CC787202D2AE4C654BFE9699C430");
-/// V3 record markers — the uniform 256-byte-header format (minted 2026-06-29 via
-/// `trible genid`). Every V3 record (blob/branch/tombstone) has a FIXED 256-byte
-/// header and is padded to a 256-byte multiple. Consequences:
-///   * blob data starts at a constant `record_start + V3_HEADER_LEN` — reads are
+/// Generic forward-compatible pile-record envelope marker.
+///
+/// Minted on 2026-08-11 with `trible genid`:
+/// `E5A95E5D8A0BBA8782E46B9C9E73B313`.
+///
+/// New records place this marker first, their existing V3/V4 marker in the
+/// next 16 bytes as a semantic record-kind id, and their total span as a
+/// count of 256-byte blocks in bytes 32..36. Readers can therefore cross an
+/// unknown record kind without assigning semantics to it.
+const MAGIC_MARKER_ENVELOPE: RawId = hex!("E5A95E5D8A0BBA8782E46B9C9E73B313");
+/// V3 record markers, minted 2026-06-29 via `trible genid`. Legacy V3 records
+/// place these first; current records reuse them as envelope kind IDs. Both
+/// layouts have a fixed 256-byte header and 256-byte record granularity. Consequences:
+///   * blob data starts at a constant `record_start + 256` — reads are
 ///     position-INDEPENDENT (no offset-derived pad), so a record survives
 ///     relocation/`cat` and is found correctly regardless of its offset;
-///   * because every record is a 256-multiple, a pure-V3 pile stays 256-aligned
+///   * because every record is a 256-multiple, a current pile stays 256-aligned
 ///     throughout under ATOMIC lock-free append (no exclusive lock needed), so
-///     `cat a >> b` of two pure-V3 piles is a valid merge AND the data stays
+///     `cat a >> b` of two current piles is a valid merge AND the data stays
 ///     256-aligned for zero-copy GPU aliasing (CUDA/Metal `min_storage_buffer_offset_alignment`).
-/// New writes are V3; the reader still accepts the original V1
-/// [`MAGIC_MARKER_BLOB`] record so existing piles read byte-identical.
+/// The reader still accepts the original V1 and unenveloped V3 records so
+/// existing piles read byte-identical.
 const MAGIC_MARKER_BLOB_V3: RawId = hex!("9C33EEB525065A62EAEC4BE43DCC355A");
 const MAGIC_MARKER_BRANCH_V3: RawId = hex!("AC363D04AFE1AF17B39581B1E23021D7");
 const MAGIC_MARKER_BRANCH_TOMBSTONE_V3: RawId = hex!("D0CBA0C8EAAB4C0C73121C3205671E4F");
@@ -121,17 +131,18 @@ const MAGIC_MARKER_LOCAL_CELL_TOMBSTONE_V3: RawId = hex!("4FE372AE868D22A44DED7A
 const BLOB_HEADER_LEN: usize = std::mem::size_of::<BlobHeader>();
 const BLOB_ALIGNMENT: usize = BLOB_HEADER_LEN;
 /// GPU storage-buffer binding-offset requirement (CUDA / Metal
-/// `min_storage_buffer_offset_alignment`); a V3 record's data start lands on this.
+/// `min_storage_buffer_offset_alignment`); a current blob record's data start lands here.
 const GPU_DATA_ALIGNMENT: usize = 256;
-/// V3 fixed header length and record alignment (== GPU_DATA_ALIGNMENT). A V3
-/// header is always this many bytes; data follows at `record_start + V3_HEADER_LEN`,
-/// and the whole record is padded to a multiple of this.
+/// Fixed header length and record alignment inherited from V3
+/// (== GPU_DATA_ALIGNMENT). Current envelope headers retain this width; blob
+/// data follows at `record_start + ENVELOPE_HEADER_LEN`.
 const V3_HEADER_LEN: usize = 256;
-const V3_ALIGNMENT: usize = GPU_DATA_ALIGNMENT;
-/// Post-data padding that rounds a V3 record up to a 256-byte multiple. The
-/// header is already 256, so this only rounds the data length.
-fn v3_post_pad(data_len: usize) -> usize {
-    (V3_ALIGNMENT - (data_len % V3_ALIGNMENT)) % V3_ALIGNMENT
+const ENVELOPE_HEADER_LEN: usize = 256;
+const ENVELOPE_BLOCK_LEN: usize = GPU_DATA_ALIGNMENT;
+const ENVELOPE_HEADER_BLOCKS: u32 = 1;
+/// Post-data padding that rounds a fixed-header record up to a 256-byte block.
+fn block_post_pad(data_len: usize) -> usize {
+    (ENVELOPE_BLOCK_LEN - (data_len % ENVELOPE_BLOCK_LEN)) % ENVELOPE_BLOCK_LEN
 }
 
 /// Largest single blob record we'll write with the concurrent `write_vectored`
@@ -265,8 +276,8 @@ struct BranchHeader {
     hash: RawInline,
 }
 
-// `BranchHeader` / `BranchTombstoneHeader` have no constructors — new writes are
-// V3; these structs exist only so the reader can decode legacy V1 records.
+// `BranchHeader` / `BranchTombstoneHeader` have no constructors; these structs
+// exist only so the reader can decode legacy V1 records.
 
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
@@ -288,7 +299,7 @@ struct BlobHeader {
 
 impl BlobHeader {
     /// V1 blob constructor — retained only for the legacy-format backward-compat
-    /// test (new writes are V3; V1 blob records are otherwise read, never written).
+    /// test (V1 blob records are otherwise read, never written).
     #[cfg(test)]
     fn new(timestamp: u64, length: u64, hash: Inline<Hash<Blake3>>) -> Self {
         Self {
@@ -319,6 +330,7 @@ struct BlobHeaderV3 {
 }
 
 impl BlobHeaderV3 {
+    #[cfg(test)]
     fn new(timestamp: u64, length: u64, hash: Inline<Hash<Blake3>>) -> Self {
         Self {
             magic_marker: MAGIC_MARKER_BLOB_V3,
@@ -340,17 +352,6 @@ struct BranchHeaderV3 {
     reserved: [u8; 192],
 }
 
-impl BranchHeaderV3 {
-    fn new(branch_id: Id, hash: Inline<Handle<SimpleArchive>>) -> Self {
-        Self {
-            magic_marker: MAGIC_MARKER_BRANCH_V3,
-            branch_id: *branch_id,
-            hash: hash.raw,
-            reserved: [0u8; 192],
-        }
-    }
-}
-
 /// V3 branch tombstone — fixed 256 bytes.
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
@@ -358,16 +359,6 @@ struct BranchTombstoneHeaderV3 {
     magic_marker: RawId,
     branch_id: RawId,
     reserved: [u8; 224],
-}
-
-impl BranchTombstoneHeaderV3 {
-    fn new(branch_id: Id) -> Self {
-        Self {
-            magic_marker: MAGIC_MARKER_BRANCH_TOMBSTONE_V3,
-            branch_id: *branch_id,
-            reserved: [0u8; 224],
-        }
-    }
 }
 
 /// V3 local-cell replacement — fixed 256 bytes.
@@ -380,17 +371,6 @@ struct LocalCellHeaderV3 {
     reserved: [u8; 192],
 }
 
-impl LocalCellHeaderV3 {
-    fn new(cell_id: Id, value: Inline<Handle<SimpleArchive>>) -> Self {
-        Self {
-            magic_marker: MAGIC_MARKER_LOCAL_CELL_V3,
-            cell_id: cell_id.into(),
-            value: value.raw,
-            reserved: [0u8; 192],
-        }
-    }
-}
-
 /// V3 local-cell deletion — fixed 256 bytes.
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
@@ -398,16 +378,6 @@ struct LocalCellTombstoneHeaderV3 {
     magic_marker: RawId,
     cell_id: RawId,
     reserved: [u8; 224],
-}
-
-impl LocalCellTombstoneHeaderV3 {
-    fn new(cell_id: Id) -> Self {
-        Self {
-            magic_marker: MAGIC_MARKER_LOCAL_CELL_TOMBSTONE_V3,
-            cell_id: cell_id.into(),
-            reserved: [0u8; 224],
-        }
-    }
 }
 
 /// V3 want marker using the legacy weak-pin encoding — fixed 256 bytes and
@@ -420,16 +390,6 @@ struct WeakPinHeaderV3 {
     reserved: [u8; 208],
 }
 
-impl WeakPinHeaderV3 {
-    fn new(handle: Inline<Handle<UnknownBlob>>) -> Self {
-        Self {
-            magic_marker: MAGIC_MARKER_WEAK_PIN_V3,
-            handle: handle.raw,
-            reserved: [0u8; 208],
-        }
-    }
-}
-
 /// V3 want-retraction marker using the legacy weak-unpin encoding.
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
@@ -437,16 +397,6 @@ struct WeakUnpinHeaderV3 {
     magic_marker: RawId,
     handle: RawInline,
     reserved: [u8; 208],
-}
-
-impl WeakUnpinHeaderV3 {
-    fn new(handle: Inline<Handle<UnknownBlob>>) -> Self {
-        Self {
-            magic_marker: MAGIC_MARKER_WEAK_UNPIN_V3,
-            handle: handle.raw,
-            reserved: [0u8; 208],
-        }
-    }
 }
 
 /// Legacy V3 collection definition: `(scope, representation, recipe)`.
@@ -513,22 +463,6 @@ struct CollectionCommitHeaderV4 {
     reserved: [u8; 48],
 }
 
-impl CollectionCommitHeaderV4 {
-    fn new(record: &CollectionCommit) -> Self {
-        let (signature_r, signature_s) = record.signature();
-        Self {
-            magic_marker: MAGIC_MARKER_COLLECTION_COMMIT_V4,
-            collection: record.collection().raw,
-            data: record.data().raw,
-            metadata: record.metadata().raw,
-            public_key: record.public_key().raw,
-            signature_r: signature_r.raw,
-            signature_s: signature_s.raw,
-            reserved: [0u8; 48],
-        }
-    }
-}
-
 /// V4 exact join equation. Inputs are stored in canonical digest order.
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
@@ -539,20 +473,6 @@ struct CollectionMergeHeaderV4 {
     high: RawInline,
     result: RawInline,
     reserved: [u8; 112],
-}
-
-impl CollectionMergeHeaderV4 {
-    fn new(record: &CollectionMerge) -> Self {
-        let (low, high) = record.inputs();
-        Self {
-            magic_marker: MAGIC_MARKER_COLLECTION_MERGE_V4,
-            collection: record.collection().raw,
-            low: low.raw,
-            high: high.raw,
-            result: record.result().raw,
-            reserved: [0u8; 112],
-        }
-    }
 }
 
 /// V4 exact mapping equation between two descriptor-identified collections.
@@ -567,37 +487,277 @@ struct CollectionDeriveHeaderV4 {
     reserved: [u8; 112],
 }
 
-impl CollectionDeriveHeaderV4 {
-    fn new(record: &CollectionDerive) -> Self {
-        let (input, output) = record.mapping();
+/// Common prefix of every newly written pile record. `span_blocks` is a
+/// canonical little-endian `u32` at bytes 32..36, includes the 256-byte header
+/// itself, and is never zero.
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct EnvelopePrefix {
+    magic_marker: RawId,
+    record_kind: RawId,
+    span_blocks: [u8; 4],
+}
+
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct BlobHeaderEnvelope {
+    envelope_marker: RawId,
+    record_kind: RawId,
+    span_blocks: [u8; 4],
+    timestamp: [u8; 8],
+    length: [u8; 8],
+    hash: RawInline,
+    reserved: [u8; 172],
+}
+
+impl BlobHeaderEnvelope {
+    fn new(span_blocks: u32, timestamp: u64, length: u64, hash: Inline<Hash<Blake3>>) -> Self {
         Self {
-            magic_marker: MAGIC_MARKER_COLLECTION_DERIVE_V4,
-            source: record.source().raw,
-            target: record.target().raw,
-            input: input.raw,
-            output: output.raw,
-            reserved: [0u8; 112],
+            envelope_marker: MAGIC_MARKER_ENVELOPE,
+            record_kind: MAGIC_MARKER_BLOB_V3,
+            span_blocks: span_blocks.to_le_bytes(),
+            timestamp: timestamp.to_le_bytes(),
+            length: length.to_le_bytes(),
+            hash: hash.raw,
+            reserved: [0u8; 172],
         }
     }
 }
 
-fn collection_record_header(record: &CollectionRecord) -> [u8; V3_HEADER_LEN] {
-    let mut bytes = [0u8; V3_HEADER_LEN];
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct BranchHeaderEnvelope {
+    envelope_marker: RawId,
+    record_kind: RawId,
+    span_blocks: [u8; 4],
+    branch_id: RawId,
+    hash: RawInline,
+    reserved: [u8; 172],
+}
+
+impl BranchHeaderEnvelope {
+    fn new(branch_id: Id, hash: Inline<Handle<SimpleArchive>>) -> Self {
+        Self {
+            envelope_marker: MAGIC_MARKER_ENVELOPE,
+            record_kind: MAGIC_MARKER_BRANCH_V3,
+            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
+            branch_id: *branch_id,
+            hash: hash.raw,
+            reserved: [0u8; 172],
+        }
+    }
+}
+
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct BranchTombstoneHeaderEnvelope {
+    envelope_marker: RawId,
+    record_kind: RawId,
+    span_blocks: [u8; 4],
+    branch_id: RawId,
+    reserved: [u8; 204],
+}
+
+impl BranchTombstoneHeaderEnvelope {
+    fn new(branch_id: Id) -> Self {
+        Self {
+            envelope_marker: MAGIC_MARKER_ENVELOPE,
+            record_kind: MAGIC_MARKER_BRANCH_TOMBSTONE_V3,
+            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
+            branch_id: *branch_id,
+            reserved: [0u8; 204],
+        }
+    }
+}
+
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct LocalCellHeaderEnvelope {
+    envelope_marker: RawId,
+    record_kind: RawId,
+    span_blocks: [u8; 4],
+    cell_id: RawId,
+    value: RawInline,
+    reserved: [u8; 172],
+}
+
+impl LocalCellHeaderEnvelope {
+    fn new(cell_id: Id, value: Inline<Handle<SimpleArchive>>) -> Self {
+        Self {
+            envelope_marker: MAGIC_MARKER_ENVELOPE,
+            record_kind: MAGIC_MARKER_LOCAL_CELL_V3,
+            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
+            cell_id: cell_id.into(),
+            value: value.raw,
+            reserved: [0u8; 172],
+        }
+    }
+}
+
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct LocalCellTombstoneHeaderEnvelope {
+    envelope_marker: RawId,
+    record_kind: RawId,
+    span_blocks: [u8; 4],
+    cell_id: RawId,
+    reserved: [u8; 204],
+}
+
+impl LocalCellTombstoneHeaderEnvelope {
+    fn new(cell_id: Id) -> Self {
+        Self {
+            envelope_marker: MAGIC_MARKER_ENVELOPE,
+            record_kind: MAGIC_MARKER_LOCAL_CELL_TOMBSTONE_V3,
+            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
+            cell_id: cell_id.into(),
+            reserved: [0u8; 204],
+        }
+    }
+}
+
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct WantHeaderEnvelope {
+    envelope_marker: RawId,
+    record_kind: RawId,
+    span_blocks: [u8; 4],
+    handle: RawInline,
+    reserved: [u8; 188],
+}
+
+impl WantHeaderEnvelope {
+    fn new(handle: Inline<Handle<UnknownBlob>>, asserted: bool) -> Self {
+        Self {
+            envelope_marker: MAGIC_MARKER_ENVELOPE,
+            record_kind: if asserted {
+                MAGIC_MARKER_WEAK_PIN_V3
+            } else {
+                MAGIC_MARKER_WEAK_UNPIN_V3
+            },
+            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
+            handle: handle.raw,
+            reserved: [0u8; 188],
+        }
+    }
+}
+
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct CollectionCommitHeaderEnvelope {
+    envelope_marker: RawId,
+    record_kind: RawId,
+    span_blocks: [u8; 4],
+    collection: RawInline,
+    data: RawInline,
+    metadata: RawInline,
+    public_key: RawInline,
+    signature_r: RawInline,
+    signature_s: RawInline,
+    reserved: [u8; 28],
+}
+
+impl CollectionCommitHeaderEnvelope {
+    fn new(record: &CollectionCommit) -> Self {
+        let (signature_r, signature_s) = record.signature();
+        Self {
+            envelope_marker: MAGIC_MARKER_ENVELOPE,
+            record_kind: MAGIC_MARKER_COLLECTION_COMMIT_V4,
+            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
+            collection: record.collection().raw,
+            data: record.data().raw,
+            metadata: record.metadata().raw,
+            public_key: record.public_key().raw,
+            signature_r: signature_r.raw,
+            signature_s: signature_s.raw,
+            reserved: [0u8; 28],
+        }
+    }
+}
+
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct CollectionMergeHeaderEnvelope {
+    envelope_marker: RawId,
+    record_kind: RawId,
+    span_blocks: [u8; 4],
+    collection: RawInline,
+    low: RawInline,
+    high: RawInline,
+    result: RawInline,
+    reserved: [u8; 92],
+}
+
+impl CollectionMergeHeaderEnvelope {
+    fn new(record: &CollectionMerge) -> Self {
+        let (low, high) = record.inputs();
+        Self {
+            envelope_marker: MAGIC_MARKER_ENVELOPE,
+            record_kind: MAGIC_MARKER_COLLECTION_MERGE_V4,
+            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
+            collection: record.collection().raw,
+            low: low.raw,
+            high: high.raw,
+            result: record.result().raw,
+            reserved: [0u8; 92],
+        }
+    }
+}
+
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct CollectionDeriveHeaderEnvelope {
+    envelope_marker: RawId,
+    record_kind: RawId,
+    span_blocks: [u8; 4],
+    source: RawInline,
+    target: RawInline,
+    input: RawInline,
+    output: RawInline,
+    reserved: [u8; 92],
+}
+
+impl CollectionDeriveHeaderEnvelope {
+    fn new(record: &CollectionDerive) -> Self {
+        let (input, output) = record.mapping();
+        Self {
+            envelope_marker: MAGIC_MARKER_ENVELOPE,
+            record_kind: MAGIC_MARKER_COLLECTION_DERIVE_V4,
+            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
+            source: record.source().raw,
+            target: record.target().raw,
+            input: input.raw,
+            output: output.raw,
+            reserved: [0u8; 92],
+        }
+    }
+}
+
+fn envelope_blocks_for_payload(data_len: usize) -> Option<u32> {
+    let payload_blocks = data_len.checked_add(ENVELOPE_BLOCK_LEN - 1)? / ENVELOPE_BLOCK_LEN;
+    u32::try_from(payload_blocks)
+        .ok()?
+        .checked_add(ENVELOPE_HEADER_BLOCKS)
+}
+
+fn collection_record_header(record: &CollectionRecord) -> [u8; ENVELOPE_HEADER_LEN] {
+    let mut bytes = [0u8; ENVELOPE_HEADER_LEN];
     match record {
         CollectionRecord::Commit(record) => {
-            bytes.copy_from_slice(CollectionCommitHeaderV4::new(record).as_bytes())
+            bytes.copy_from_slice(CollectionCommitHeaderEnvelope::new(record).as_bytes())
         }
         CollectionRecord::Merge(record) => {
-            bytes.copy_from_slice(CollectionMergeHeaderV4::new(record).as_bytes())
+            bytes.copy_from_slice(CollectionMergeHeaderEnvelope::new(record).as_bytes())
         }
         CollectionRecord::Derive(record) => {
-            bytes.copy_from_slice(CollectionDeriveHeaderV4::new(record).as_bytes())
+            bytes.copy_from_slice(CollectionDeriveHeaderEnvelope::new(record).as_bytes())
         }
     }
     bytes
 }
 
-// Compile-time guarantee that every V3 header is exactly 256 bytes.
+// Compile-time guarantee that every legacy and current fixed header is exactly
+// 256 bytes.
 const _: () = {
     assert!(std::mem::size_of::<BlobHeaderV3>() == V3_HEADER_LEN);
     assert!(std::mem::size_of::<BranchHeaderV3>() == V3_HEADER_LEN);
@@ -613,6 +773,16 @@ const _: () = {
     assert!(std::mem::size_of::<CollectionCommitHeaderV4>() == V3_HEADER_LEN);
     assert!(std::mem::size_of::<CollectionMergeHeaderV4>() == V3_HEADER_LEN);
     assert!(std::mem::size_of::<CollectionDeriveHeaderV4>() == V3_HEADER_LEN);
+    assert!(std::mem::size_of::<EnvelopePrefix>() == 36);
+    assert!(std::mem::size_of::<BlobHeaderEnvelope>() == ENVELOPE_HEADER_LEN);
+    assert!(std::mem::size_of::<BranchHeaderEnvelope>() == ENVELOPE_HEADER_LEN);
+    assert!(std::mem::size_of::<BranchTombstoneHeaderEnvelope>() == ENVELOPE_HEADER_LEN);
+    assert!(std::mem::size_of::<LocalCellHeaderEnvelope>() == ENVELOPE_HEADER_LEN);
+    assert!(std::mem::size_of::<LocalCellTombstoneHeaderEnvelope>() == ENVELOPE_HEADER_LEN);
+    assert!(std::mem::size_of::<WantHeaderEnvelope>() == ENVELOPE_HEADER_LEN);
+    assert!(std::mem::size_of::<CollectionCommitHeaderEnvelope>() == ENVELOPE_HEADER_LEN);
+    assert!(std::mem::size_of::<CollectionMergeHeaderEnvelope>() == ENVELOPE_HEADER_LEN);
+    assert!(std::mem::size_of::<CollectionDeriveHeaderEnvelope>() == ENVELOPE_HEADER_LEN);
 };
 
 /// A single record decoded from a pile file.
@@ -621,8 +791,8 @@ const _: () = {
 /// record's header starts at `offset` and the whole record (header + payload +
 /// padding) spans `len` bytes, so `offset + len` is the offset of the next
 /// record. This is the same decoder the [`Pile`] itself replays on open, so it
-/// understands every record format ever written (V1 64-byte records and V3
-/// uniform 256-aligned records alike).
+/// understands every record format ever written (V1, unenveloped V3/V4, and
+/// the generic envelope alike).
 #[derive(Debug, Clone, Copy)]
 pub struct PileRecord {
     /// Byte offset of the record header within the pile file.
@@ -654,6 +824,7 @@ pub enum LegacyCollectionRecordKindV3 {
 
 /// Decoded content of a [`PileRecord`], independent of on-disk format version.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum PileRecordContent {
     /// A blob record. The payload bytes live at
     /// `data_offset..data_offset + data_len` in the pile file; trailing
@@ -717,17 +888,226 @@ pub enum PileRecordContent {
         /// The historical physical record kind.
         kind: LegacyCollectionRecordKindV3,
     },
+    /// A structurally valid generic envelope whose semantic record kind is
+    /// unknown to this reader. Replay deliberately projects it away, while
+    /// [`PileRecords`] exposes its exact offset and length so raw tooling can
+    /// preserve the bytes.
+    Opaque {
+        /// Unknown semantic record-kind id carried by the envelope.
+        kind: RawId,
+    },
+}
+
+fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
+    let corrupt = || ReadError::CorruptPile {
+        valid_length: offset,
+    };
+    let (prefix, _) = EnvelopePrefix::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+    let declared_blocks = u32::from_le_bytes(prefix.span_blocks);
+    if prefix.magic_marker != MAGIC_MARKER_ENVELOPE || declared_blocks == 0 {
+        return Err(corrupt());
+    }
+    let span_blocks = usize::try_from(declared_blocks).map_err(|_| corrupt())?;
+    let len = span_blocks
+        .checked_mul(ENVELOPE_BLOCK_LEN)
+        .ok_or_else(corrupt)?;
+    if len < ENVELOPE_HEADER_LEN || bytes.len() < len {
+        return Err(corrupt());
+    }
+
+    let fixed_header = || {
+        if declared_blocks == ENVELOPE_HEADER_BLOCKS {
+            Ok(())
+        } else {
+            Err(corrupt())
+        }
+    };
+    match prefix.record_kind {
+        MAGIC_MARKER_BLOB_V3 => {
+            let (header, _) =
+                BlobHeaderEnvelope::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            if header.reserved.iter().any(|byte| *byte != 0) {
+                return Err(corrupt());
+            }
+            let data_len =
+                usize::try_from(u64::from_le_bytes(header.length)).map_err(|_| corrupt())?;
+            let expected_blocks = envelope_blocks_for_payload(data_len).ok_or_else(corrupt)?;
+            if declared_blocks != expected_blocks {
+                return Err(corrupt());
+            }
+            let data_offset = offset
+                .checked_add(ENVELOPE_HEADER_LEN)
+                .ok_or_else(corrupt)?;
+            Ok(PileRecord {
+                offset,
+                len,
+                content: PileRecordContent::Blob {
+                    timestamp: u64::from_le_bytes(header.timestamp),
+                    hash: Inline::new(header.hash),
+                    data_offset,
+                    data_len,
+                },
+            })
+        }
+        MAGIC_MARKER_BRANCH_V3 => {
+            fixed_header()?;
+            let (header, _) =
+                BranchHeaderEnvelope::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            if header.reserved.iter().any(|byte| *byte != 0) {
+                return Err(corrupt());
+            }
+            let branch_id = Id::new(header.branch_id).ok_or_else(corrupt)?;
+            Ok(PileRecord {
+                offset,
+                len,
+                content: PileRecordContent::Branch {
+                    branch_id,
+                    head: Inline::<Hash<Blake3>>::new(header.hash).into(),
+                },
+            })
+        }
+        MAGIC_MARKER_BRANCH_TOMBSTONE_V3 => {
+            fixed_header()?;
+            let (header, _) = BranchTombstoneHeaderEnvelope::try_read_from_prefix(bytes)
+                .map_err(|_| corrupt())?;
+            if header.reserved.iter().any(|byte| *byte != 0) {
+                return Err(corrupt());
+            }
+            let branch_id = Id::new(header.branch_id).ok_or_else(corrupt)?;
+            Ok(PileRecord {
+                offset,
+                len,
+                content: PileRecordContent::BranchTombstone { branch_id },
+            })
+        }
+        MAGIC_MARKER_LOCAL_CELL_V3 => {
+            fixed_header()?;
+            let (header, _) =
+                LocalCellHeaderEnvelope::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            if header.reserved.iter().any(|byte| *byte != 0) {
+                return Err(corrupt());
+            }
+            let cell_id = Id::new(header.cell_id).ok_or_else(corrupt)?;
+            Ok(PileRecord {
+                offset,
+                len,
+                content: PileRecordContent::LocalCell {
+                    cell_id,
+                    value: Inline::new(header.value),
+                },
+            })
+        }
+        MAGIC_MARKER_LOCAL_CELL_TOMBSTONE_V3 => {
+            fixed_header()?;
+            let (header, _) = LocalCellTombstoneHeaderEnvelope::try_read_from_prefix(bytes)
+                .map_err(|_| corrupt())?;
+            if header.reserved.iter().any(|byte| *byte != 0) {
+                return Err(corrupt());
+            }
+            let cell_id = Id::new(header.cell_id).ok_or_else(corrupt)?;
+            Ok(PileRecord {
+                offset,
+                len,
+                content: PileRecordContent::LocalCellTombstone { cell_id },
+            })
+        }
+        MAGIC_MARKER_WEAK_PIN_V3 | MAGIC_MARKER_WEAK_UNPIN_V3 => {
+            fixed_header()?;
+            let (header, _) =
+                WantHeaderEnvelope::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            if header.reserved.iter().any(|byte| *byte != 0) {
+                return Err(corrupt());
+            }
+            let handle = Inline::new(header.handle);
+            let content = if prefix.record_kind == MAGIC_MARKER_WEAK_PIN_V3 {
+                PileRecordContent::WeakPin { handle }
+            } else {
+                PileRecordContent::WeakUnpin { handle }
+            };
+            Ok(PileRecord {
+                offset,
+                len,
+                content,
+            })
+        }
+        MAGIC_MARKER_COLLECTION_COMMIT_V4 => {
+            fixed_header()?;
+            let (header, _) = CollectionCommitHeaderEnvelope::try_read_from_prefix(bytes)
+                .map_err(|_| corrupt())?;
+            if header.reserved.iter().any(|byte| *byte != 0) {
+                return Err(corrupt());
+            }
+            Ok(PileRecord {
+                offset,
+                len,
+                content: PileRecordContent::Collection {
+                    record: CollectionRecord::Commit(CollectionCommit::from_parts(
+                        Inline::new(header.collection),
+                        Inline::new(header.data),
+                        Inline::new(header.metadata),
+                        Inline::<ED25519PublicKey>::new(header.public_key),
+                        Inline::<ED25519RComponent>::new(header.signature_r),
+                        Inline::<ED25519SComponent>::new(header.signature_s),
+                    )),
+                },
+            })
+        }
+        MAGIC_MARKER_COLLECTION_MERGE_V4 => {
+            fixed_header()?;
+            let (header, _) = CollectionMergeHeaderEnvelope::try_read_from_prefix(bytes)
+                .map_err(|_| corrupt())?;
+            if header.reserved.iter().any(|byte| *byte != 0) || header.high < header.low {
+                return Err(corrupt());
+            }
+            Ok(PileRecord {
+                offset,
+                len,
+                content: PileRecordContent::Collection {
+                    record: CollectionRecord::Merge(CollectionMerge::new(
+                        Inline::new(header.collection),
+                        Inline::new(header.low),
+                        Inline::new(header.high),
+                        Inline::new(header.result),
+                    )),
+                },
+            })
+        }
+        MAGIC_MARKER_COLLECTION_DERIVE_V4 => {
+            fixed_header()?;
+            let (header, _) = CollectionDeriveHeaderEnvelope::try_read_from_prefix(bytes)
+                .map_err(|_| corrupt())?;
+            if header.reserved.iter().any(|byte| *byte != 0) {
+                return Err(corrupt());
+            }
+            Ok(PileRecord {
+                offset,
+                len,
+                content: PileRecordContent::Collection {
+                    record: CollectionRecord::Derive(CollectionDerive::new(
+                        Inline::new(header.source),
+                        Inline::new(header.target),
+                        Inline::new(header.input),
+                        Inline::new(header.output),
+                    )),
+                },
+            })
+        }
+        kind => Ok(PileRecord {
+            offset,
+            len,
+            content: PileRecordContent::Opaque { kind },
+        }),
+    }
 }
 
 /// Decodes the record starting at the beginning of `bytes`, which is the pile
 /// file's content from `offset` onward. This is the single source of truth for
 /// record parsing: [`Pile::refresh`]/[`Pile::amputate`] replay records through
-/// it, and [`PileRecords`] exposes it for raw inspection. A complete but
-/// unknown magic marker yields
-/// [`ReadError::UnsupportedRecord`] because this reader cannot know the
-/// record's length; a truncated known record yields
-/// [`ReadError::CorruptPile`] pointing at `offset`. Neither case is silently
-/// skipped.
+/// it, and [`PileRecords`] exposes it for raw inspection. An unknown legacy
+/// marker yields [`ReadError::UnsupportedRecord`] because this reader cannot
+/// know its length. An unknown kind inside the generic envelope has an exact
+/// span and yields [`PileRecordContent::Opaque`]. A truncated record yields
+/// [`ReadError::CorruptPile`] pointing at `offset`.
 fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
     let corrupt = || ReadError::CorruptPile {
         valid_length: offset,
@@ -736,6 +1116,9 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
         return Err(corrupt());
     }
     let magic: RawId = bytes[0..16].try_into().unwrap();
+    if magic == MAGIC_MARKER_ENVELOPE {
+        return decode_enveloped_record(bytes, offset);
+    }
     match magic {
         MAGIC_MARKER_BLOB => {
             let (header, _) = BlobHeader::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
@@ -787,7 +1170,7 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
             // record padded to a 256-byte multiple.
             let (header, _) = BlobHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
             let data_len = header.length as usize;
-            let post_pad = v3_post_pad(data_len);
+            let post_pad = block_post_pad(data_len);
             let len = V3_HEADER_LEN
                 .checked_add(data_len)
                 .and_then(|l| l.checked_add(post_pad))
@@ -1104,15 +1487,16 @@ fn indexed_blob_record(
 /// update, branch tombstone, and legacy-encoded want marker ever appended,
 /// including records that later ones supersede (superseded branch heads,
 /// tombstoned branches, retracted wants). It shares its decoder with the [`Pile`]
-/// replay path, so both V1 and V3 records are understood; tools that need
+/// replay path, so V1, unenveloped V3/V4, and generic-envelope records are
+/// understood; tools that need
 /// history or forensics (reflogs, consolidation, corruption reports) should
 /// consume this instead of hand-rolling a parser.
 ///
-/// The iterator yields an error and then ends when it encounters an unknown
-/// magic marker or a truncated record. Unknown markers surface as
-/// [`ReadError::UnsupportedRecord`] while malformed or truncated known records
-/// surface as [`ReadError::CorruptPile`]; neither becomes a silently shortened
-/// record list.
+/// Unknown envelope kinds are yielded as [`PileRecordContent::Opaque`] with a
+/// known boundary. The iterator yields an error and ends for an unknown
+/// unenveloped marker or a truncated record: the former surfaces as
+/// [`ReadError::UnsupportedRecord`] and the latter as
+/// [`ReadError::CorruptPile`].
 #[derive(Debug)]
 pub struct PileRecords {
     bytes: Bytes,
@@ -1199,6 +1583,7 @@ enum Applied {
         id: Id,
     },
     LegacyCollectionV3,
+    Opaque,
 }
 
 #[derive(Debug)]
@@ -1232,6 +1617,10 @@ pub struct Pile {
     /// They remain inert but are conservatively carried through retained
     /// rewrites so an explicit future migration still has its source evidence.
     legacy_collection_headers: BTreeSet<[u8; V3_HEADER_LEN]>,
+    /// Number of structurally valid generic-envelope records whose semantic
+    /// kind this binary does not know. Ordinary replay projects them away;
+    /// destructive physical rewrites refuse while this is nonzero.
+    opaque_records: usize,
     /// LWW-resolved wanted set. Legacy weak-pin records assert the handle and
     /// weak-unpin records retract it; log-order application makes the last
     /// record for a handle win by construction.
@@ -1385,7 +1774,8 @@ pub enum ReadError {
         /// found.
         valid_length: usize,
     },
-    /// The pile contains a complete magic marker this reader does not know.
+    /// The pile contains a complete unenveloped magic marker this reader does
+    /// not know.
     ///
     /// The marker may name a record introduced by a newer binary. Its length
     /// is unknowable to this reader, so it is unsafe to skip or amputate it.
@@ -1646,8 +2036,9 @@ impl Pile {
     /// The returned pile has no in-memory index; callers should invoke
     /// [`Self::refresh`] to load existing data. After a crash left a torn
     /// tail, [`Self::amputate`] loads and **truncates the file at the first
-    /// malformed known record** — a destructive last resort, not an open
-    /// path. Complete unknown markers are refused without truncation.
+    /// malformed record** — a destructive last resort, not an open path.
+    /// Complete opaque envelopes are crossed; unknown unenveloped markers are
+    /// refused without truncation.
     pub fn open(path: &Path) -> Result<Self, ReadError> {
         let file = OpenOptions::new().read(true).append(true).open(path)?;
         let length_u64 = file.metadata()?.len();
@@ -1677,6 +2068,7 @@ impl Pile {
             cell_tombstones: PATCH::<16, IdentitySchema>::new(),
             collection_records: BTreeMap::new(),
             legacy_collection_headers: BTreeSet::new(),
+            opaque_records: 0,
             wants: PATCH::<32, IdentitySchema>::new(),
             applied_length: 0,
         })
@@ -1756,7 +2148,7 @@ impl Pile {
             .unwrap()
         };
         // Single decoder shared with [`PileRecords`] — understands every
-        // record format ever written (V1 and V3 alike).
+        // record format ever written (V1, unenveloped V3/V4, and envelope).
         let record = decode_record(slice, start_offset)?;
         let next_applied_length = start_offset + record.len;
         let legacy_collection_header =
@@ -1843,6 +2235,13 @@ impl Pile {
                 );
                 Applied::LegacyCollectionV3
             }
+            PileRecordContent::Opaque { .. } => {
+                self.opaque_records = self
+                    .opaque_records
+                    .checked_add(1)
+                    .expect("opaque pile-record count overflow");
+                Applied::Opaque
+            }
         };
         self.applied_length = next_applied_length;
         Ok(Some(applied))
@@ -1863,14 +2262,15 @@ impl Pile {
     }
 
     /// Amputates the pile's tail: **TRUNCATES the file at the first malformed
-    /// or truncated known record, destroying everything after it.**
+    /// or truncated record, destroying everything after it.**
     ///
     /// This is a last-resort surgical recovery for a torn tail left by a
     /// crashed or interrupted append — never a routine open path. Everything
-    /// past the malformed record is *gone from disk*. A complete unknown magic
-    /// marker is instead reported as [`ReadError::UnsupportedRecord`] and is
-    /// never truncated, because this reader cannot know the newer record's
-    /// length. If you are not certain the tail is a torn write, take a copy of
+    /// past the malformed record is *gone from disk*. Complete opaque envelopes
+    /// are crossed, and a torn one has a known starting boundary. An unknown
+    /// unenveloped marker is instead reported as
+    /// [`ReadError::UnsupportedRecord`] and is never truncated because its
+    /// length is unknowable. If you are not certain the tail is a torn write, take a copy of
     /// the file first and prefer the non-mutating [`Self::refresh`], which
     /// fails loud without touching the file.
     ///
@@ -2100,6 +2500,15 @@ impl Iterator for PileCollectionRecordIter {
 }
 
 impl Pile {
+    /// Return the number of unknown generic-envelope records in the coherent
+    /// applied prefix. Physical rewriting must refuse while this is nonzero,
+    /// because an older binary cannot compute an unknown kind's preservation
+    /// or retention semantics.
+    pub fn opaque_record_count(&mut self) -> Result<usize, ReadError> {
+        self.refresh()?;
+        Ok(self.opaque_records)
+    }
+
     /// Copy every byte-distinct inert legacy V3 collection header into
     /// `destination`.
     ///
@@ -2193,7 +2602,7 @@ impl CollectionStore for Pile {
 
             self.dirty = true;
             let written = self.file.write(&header)?;
-            if written != V3_HEADER_LEN {
+            if written != ENVELOPE_HEADER_LEN {
                 return Err(CollectionInsertError::Io(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
                     "failed to write complete collection record",
@@ -2237,13 +2646,13 @@ impl BlobStorePut for Pile {
 }
 
 impl Pile {
-    /// Shared blob-append. Writes a V3 record: a fixed 256-byte header, the blob
-    /// data at `record_start + V3_HEADER_LEN`, and post-padding to a 256-byte
-    /// multiple. Because V3 has no offset-derived pad, the append uses the atomic
+    /// Shared blob-append. Writes an enveloped record: a fixed 256-byte header, the blob
+    /// data at `record_start + ENVELOPE_HEADER_LEN`, and post-padding to a 256-byte
+    /// multiple. Because the envelope has no offset-derived pad, the append uses the atomic
     /// shared-lock fast path for records up to `ATOMIC_WRITE_LIMIT` (no exclusive lock needed —
     /// a fixed header has no start offset to stabilize). The data is
-    /// absolutely 256-aligned (zero-copy GPU-aliasable) in a pure-V3 pile, which
-    /// stays 256-aligned because every V3 record is a 256-byte multiple.
+    /// absolutely 256-aligned (zero-copy GPU-aliasable) in a current pile, which
+    /// stays 256-aligned because every record span is a count of 256-byte blocks.
     fn put_impl<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, InsertError>
     where
         S: BlobEncoding + 'static,
@@ -2252,8 +2661,22 @@ impl Pile {
     {
         let blob = IntoBlob::to_blob(item);
         let blob_size = blob.bytes.len();
-        let padding = v3_post_pad(blob_size);
-        let record_size = V3_HEADER_LEN + blob_size + padding;
+        let padding = block_post_pad(blob_size);
+        let span_blocks = envelope_blocks_for_payload(blob_size).ok_or_else(|| {
+            InsertError::IoError(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "blob is too large for the u32 pile-record span",
+            ))
+        })?;
+        let record_size = ENVELOPE_HEADER_LEN
+            .checked_add(blob_size)
+            .and_then(|size| size.checked_add(padding))
+            .ok_or_else(|| {
+                InsertError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "blob pile-record size overflows usize",
+                ))
+            })?;
         let use_atomic = record_size <= ATOMIC_WRITE_LIMIT;
 
         if use_atomic {
@@ -2283,10 +2706,11 @@ impl Pile {
                 }
             }
             let now_in_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
-            let header = BlobHeaderV3::new(now_in_ms as u64, blob_size as u64, hash);
-            let actual_record_size = V3_HEADER_LEN + blob_size + padding;
+            let header =
+                BlobHeaderEnvelope::new(span_blocks, now_in_ms as u64, blob_size as u64, hash);
+            let actual_record_size = record_size;
             // post-pad is < 256.
-            let zero_buf = [0u8; V3_ALIGNMENT];
+            let zero_buf = [0u8; ENVELOPE_BLOCK_LEN];
             // Mark before entering the syscall: partial writes and later
             // read-back failures must still leave close responsible for the
             // bytes this handle may have appended.
@@ -2330,6 +2754,7 @@ impl Pile {
                     Some(Applied::WeakUnpin { .. }) => {}
                     Some(Applied::Collection { .. }) => {}
                     Some(Applied::LegacyCollectionV3) => {}
+                    Some(Applied::Opaque) => {}
                     None => {
                         return Err(InsertError::IoError(std::io::Error::other(
                             "blob missing after write",
@@ -2419,18 +2844,18 @@ impl PinStore for Pile {
                 return Ok(PushResult::Success());
             }
 
-            // V3 branch/tombstone records: fixed 256-byte header, no data, so the
-            // record is exactly one 256-byte unit — keeping a pure-V3 pile
+            // Enveloped branch/tombstone records: fixed 256-byte header, no data, so the
+            // record is exactly one 256-byte unit — keeping a current pile
             // 256-aligned throughout (branches write under the exclusive lock).
             self.dirty = true;
             let (expected, write_res) = match new {
                 Some(new) => {
-                    let header = BranchHeaderV3::new(id, new);
-                    (V3_HEADER_LEN, self.file.write(header.as_bytes()))
+                    let header = BranchHeaderEnvelope::new(id, new);
+                    (ENVELOPE_HEADER_LEN, self.file.write(header.as_bytes()))
                 }
                 None => {
-                    let header = BranchTombstoneHeaderV3::new(id);
-                    (V3_HEADER_LEN, self.file.write(header.as_bytes()))
+                    let header = BranchTombstoneHeaderEnvelope::new(id);
+                    (ENVELOPE_HEADER_LEN, self.file.write(header.as_bytes()))
                 }
             };
             let written = match write_res {
@@ -2516,13 +2941,13 @@ impl LocalCellStore for Pile {
             let written = match value {
                 Some(value) => self
                     .file
-                    .write(LocalCellHeaderV3::new(id, value).as_bytes()),
+                    .write(LocalCellHeaderEnvelope::new(id, value).as_bytes()),
                 None => self
                     .file
-                    .write(LocalCellTombstoneHeaderV3::new(id).as_bytes()),
+                    .write(LocalCellTombstoneHeaderEnvelope::new(id).as_bytes()),
             }
             .map_err(PileWriteError::IoError)?;
-            if written != V3_HEADER_LEN {
+            if written != ENVELOPE_HEADER_LEN {
                 return Err(PileWriteError::IoError(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
                     "failed to write complete local-cell record",
@@ -2570,10 +2995,11 @@ impl Iterator for PileWantIter {
 }
 
 impl Pile {
-    /// Append a want assertion or retraction using the legacy marker format.
+    /// Append an enveloped want assertion or retraction, reusing the legacy
+    /// weak-pin marker as its semantic kind ID.
     /// Mirrors [`PinStore::update`]'s write path:
     /// exclusive lock, refresh, no-op short-circuit when the LWW state already
-    /// matches, a single fixed 256-byte header write (keeping a pure-V3 pile
+    /// matches, a single fixed 256-byte header write (keeping a current pile
     /// 256-aligned), and an `apply_next` read-back while still holding the
     /// lock. Like branch updates, the record is **not durable** until
     /// [`Pile::flush`] is called.
@@ -2595,15 +3021,10 @@ impl Pile {
             }
 
             self.dirty = true;
-            let write_res = if pin {
-                let header = WeakPinHeaderV3::new(handle);
-                self.file.write(header.as_bytes())
-            } else {
-                let header = WeakUnpinHeaderV3::new(handle);
-                self.file.write(header.as_bytes())
-            };
+            let header = WantHeaderEnvelope::new(handle, pin);
+            let write_res = self.file.write(header.as_bytes());
             let written = write_res.map_err(PileWriteError::IoError)?;
-            if written != V3_HEADER_LEN {
+            if written != ENVELOPE_HEADER_LEN {
                 return Err(PileWriteError::IoError(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
                     "failed to write weak-pin header",
@@ -2723,9 +3144,16 @@ pub struct PileRewriteStats {
 
 /// Failure while copying one policy-selected pile state into another pile.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum PileRewriteError {
     /// The source could not produce a coherent reader snapshot.
     Source(ReadError),
+    /// The source contains unknown enveloped records, so a semantic rewrite
+    /// could not prove that it would preserve their bytes and retention laws.
+    OpaqueRecords {
+        /// Number of opaque records observed in the source snapshot.
+        count: usize,
+    },
     /// A selected blob was absent, invalid, or could not be stored.
     Transfer(super::TransferError<Infallible, GetBlobError<Infallible>, InsertError>),
     /// A strong-pin mapping could not be appended to the destination.
@@ -2751,6 +3179,10 @@ impl std::fmt::Display for PileRewriteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Source(error) => write!(f, "failed to snapshot source pile: {error}"),
+            Self::OpaqueRecords { count } => write!(
+                f,
+                "refusing to rewrite a pile containing {count} unknown enveloped record(s)"
+            ),
             Self::Transfer(error) => write!(f, "failed to copy a retained blob: {error}"),
             Self::StrongPin(error) => write!(f, "failed to recreate a strong pin: {error}"),
             Self::StrongPinConflict { id, current } => write!(
@@ -2775,7 +3207,7 @@ impl Error for PileRewriteError {
             Self::StrongPin(error) | Self::Want(error) | Self::LocalCell(error) => Some(error),
             Self::Collection(error) => Some(error),
             Self::Flush(error) => Some(error),
-            Self::StrongPinConflict { .. } => None,
+            Self::StrongPinConflict { .. } | Self::OpaqueRecords { .. } => None,
         }
     }
 }
@@ -2814,6 +3246,11 @@ impl Pile {
         wants: WantRewritePolicy,
     ) -> Result<PileRewriteStats, PileRewriteError> {
         let reader = self.reader().map_err(PileRewriteError::Source)?;
+        if self.opaque_records != 0 {
+            return Err(PileRewriteError::OpaqueRecords {
+                count: self.opaque_records,
+            });
+        }
         let strong_pins = self.branches.clone();
         let local_cells = self.cells.clone();
         let local_cell_tombstones = self.cell_tombstones.clone();
@@ -2957,7 +3394,8 @@ mod tests {
 
     use crate::collection::{empty_metadata_handle, CollectionDescriptor, CollectionId};
     use crate::macros::entity;
-    use crate::repo::yard::{Yard, YardConfig};
+    use crate::repo::lazy::Lazy;
+    use crate::repo::yard::{Yard, YardCollectError, YardConfig, YardReclaimError};
     use crate::repo::{BlobStoreMeta, PushResult, RetentionRoots, StorageClose};
     use crate::trible::TribleSet;
 
@@ -2965,6 +3403,24 @@ mod tests {
         let path = dir.path().join(name);
         std::fs::File::create(&path).unwrap();
         path
+    }
+
+    const TEST_UNKNOWN_KIND_A: RawId = [0xA5; 16];
+    const TEST_UNKNOWN_KIND_B: RawId = [0x5A; 16];
+
+    fn test_envelope_bytes(kind: RawId, span_blocks: u32, physical_len: usize) -> Vec<u8> {
+        assert!(physical_len >= 36);
+        let mut bytes = vec![0xC3; physical_len];
+        bytes[..16].copy_from_slice(&MAGIC_MARKER_ENVELOPE);
+        bytes[16..32].copy_from_slice(&kind);
+        bytes[32..36].copy_from_slice(&span_blocks.to_le_bytes());
+        bytes
+    }
+
+    fn append_test_bytes(path: &Path, bytes: &[u8]) {
+        let mut file = OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
     }
 
     fn collection_test_id(byte: u8) -> Id {
@@ -3114,22 +3570,27 @@ mod tests {
     }
 
     #[test]
-    fn v4_collection_record_headers_are_fixed_zero_padded_and_roundtrip() {
+    fn enveloped_collection_record_headers_are_fixed_zero_padded_and_roundtrip() {
         let records = collection_test_records();
         let expected = [
-            (MAGIC_MARKER_COLLECTION_COMMIT_V4, 208usize),
-            (MAGIC_MARKER_COLLECTION_MERGE_V4, 144usize),
-            (MAGIC_MARKER_COLLECTION_DERIVE_V4, 144usize),
+            (MAGIC_MARKER_COLLECTION_COMMIT_V4, 228usize),
+            (MAGIC_MARKER_COLLECTION_MERGE_V4, 164usize),
+            (MAGIC_MARKER_COLLECTION_DERIVE_V4, 164usize),
         ];
 
         for (record, (magic, reserved_start)) in records.into_iter().zip(expected) {
             let header = collection_record_header(&record);
-            assert_eq!(header.len(), V3_HEADER_LEN);
-            assert_eq!(&header[..16], magic.as_slice());
+            assert_eq!(header.len(), ENVELOPE_HEADER_LEN);
+            assert_eq!(&header[..16], MAGIC_MARKER_ENVELOPE.as_slice());
+            assert_eq!(&header[16..32], magic.as_slice());
+            assert_eq!(
+                u32::from_le_bytes(header[32..36].try_into().unwrap()),
+                ENVELOPE_HEADER_BLOCKS
+            );
             assert!(header[reserved_start..].iter().all(|byte| *byte == 0));
 
             let decoded = decode_record(&header, 0).unwrap();
-            assert_eq!(decoded.len, V3_HEADER_LEN);
+            assert_eq!(decoded.len, ENVELOPE_HEADER_LEN);
             assert!(matches!(
                 decoded.content,
                 PileRecordContent::Collection { record: decoded } if decoded == record
@@ -3142,6 +3603,552 @@ mod tests {
                 Err(ReadError::CorruptPile { valid_length: 0 })
             ));
         }
+    }
+
+    #[test]
+    fn every_current_write_path_uses_the_generic_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "all-enveloped.pile");
+        let mut pile = Pile::open(&path).unwrap();
+
+        let blob_data = vec![0x42; ENVELOPE_BLOCK_LEN + 1];
+        let blob = pile
+            .put::<UnknownBlob, _>(Bytes::from_source(blob_data.clone()))
+            .unwrap();
+
+        let branch_id = Id::new([1; 16]).unwrap();
+        let branch_head = Inline::<Handle<SimpleArchive>>::new([2; 32]);
+        assert!(matches!(
+            pile.update(branch_id, None, Some(branch_head)).unwrap(),
+            PushResult::Success()
+        ));
+        assert!(matches!(
+            pile.update(branch_id, Some(branch_head), None).unwrap(),
+            PushResult::Success()
+        ));
+
+        let cell_id = Id::new([3; 16]).unwrap();
+        let cell_value = Inline::<Handle<SimpleArchive>>::new([4; 32]);
+        pile.set_cell(cell_id, Some(cell_value)).unwrap();
+        pile.set_cell(cell_id, None).unwrap();
+
+        let wanted = Inline::<Handle<UnknownBlob>>::new([5; 32]);
+        pile.want(wanted).unwrap();
+        pile.unwant(wanted).unwrap();
+
+        let collection_records = collection_test_records();
+        for record in &collection_records {
+            pile.insert(*record).unwrap();
+        }
+        pile.close().unwrap();
+
+        let expected = [
+            (MAGIC_MARKER_BLOB_V3, 3u32),
+            (MAGIC_MARKER_BRANCH_V3, 1),
+            (MAGIC_MARKER_BRANCH_TOMBSTONE_V3, 1),
+            (MAGIC_MARKER_LOCAL_CELL_V3, 1),
+            (MAGIC_MARKER_LOCAL_CELL_TOMBSTONE_V3, 1),
+            (MAGIC_MARKER_WEAK_PIN_V3, 1),
+            (MAGIC_MARKER_WEAK_UNPIN_V3, 1),
+            (MAGIC_MARKER_COLLECTION_COMMIT_V4, 1),
+            (MAGIC_MARKER_COLLECTION_MERGE_V4, 1),
+            (MAGIC_MARKER_COLLECTION_DERIVE_V4, 1),
+        ];
+        let mut records = PileRecords::open(&path).unwrap();
+        let decoded = (&mut records).collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(decoded.len(), expected.len());
+        for (record, (kind, blocks)) in decoded.iter().zip(expected) {
+            let raw = &records.bytes()[record.offset..record.offset + record.len];
+            assert_eq!(&raw[..16], MAGIC_MARKER_ENVELOPE.as_slice());
+            assert_eq!(&raw[16..32], kind.as_slice());
+            assert_eq!(u32::from_le_bytes(raw[32..36].try_into().unwrap()), blocks);
+            assert_eq!(record.len, blocks as usize * ENVELOPE_BLOCK_LEN);
+        }
+        let blob_raw = &records.bytes()[decoded[0].offset..decoded[0].offset + decoded[0].len];
+        assert_eq!(&blob_raw[32..36], &3u32.to_le_bytes());
+        assert_eq!(&blob_raw[44..52], &(blob_data.len() as u64).to_le_bytes());
+
+        let mut reopened = Pile::open(&path).unwrap();
+        let fetched: Blob<UnknownBlob> = reopened.reader().unwrap().get(blob).unwrap();
+        assert_eq!(fetched.bytes.as_ref(), blob_data);
+        assert_eq!(reopened.head(branch_id).unwrap(), None);
+        assert_eq!(reopened.cell(cell_id).unwrap(), None);
+        assert!(reopened.wants().unwrap().next().is_none());
+        assert_eq!(
+            reopened
+                .records()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            sorted_collection_records(collection_records)
+        );
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn envelope_numeric_fields_are_canonical_little_endian() {
+        let header = BlobHeaderEnvelope::new(
+            0x0102_0304,
+            0x1112_1314_1516_1718,
+            0x2122_2324_2526_2728,
+            collection_test_hash(9),
+        );
+        let bytes = header.as_bytes();
+        assert_eq!(&bytes[32..36], &0x0102_0304u32.to_le_bytes());
+        assert_eq!(&bytes[36..44], &0x1112_1314_1516_1718u64.to_le_bytes());
+        assert_eq!(&bytes[44..52], &0x2122_2324_2526_2728u64.to_le_bytes());
+
+        assert_eq!(envelope_blocks_for_payload(0), Some(1));
+        assert_eq!(envelope_blocks_for_payload(255), Some(2));
+        assert_eq!(envelope_blocks_for_payload(256), Some(2));
+        assert_eq!(envelope_blocks_for_payload(257), Some(3));
+        #[cfg(target_pointer_width = "64")]
+        {
+            let largest_payload = (u32::MAX as usize - 1) * ENVELOPE_BLOCK_LEN;
+            assert_eq!(envelope_blocks_for_payload(largest_payload), Some(u32::MAX));
+            assert_eq!(envelope_blocks_for_payload(largest_payload + 1), None);
+        }
+        assert_eq!(envelope_blocks_for_payload(usize::MAX), None);
+    }
+
+    #[test]
+    fn legacy_v4_collection_headers_remain_readable_byte_exact() {
+        for record in collection_test_records() {
+            let mut header = [0u8; V3_HEADER_LEN];
+            match record {
+                CollectionRecord::Commit(commit) => {
+                    let (signature_r, signature_s) = commit.signature();
+                    header.copy_from_slice(
+                        CollectionCommitHeaderV4 {
+                            magic_marker: MAGIC_MARKER_COLLECTION_COMMIT_V4,
+                            collection: commit.collection().raw,
+                            data: commit.data().raw,
+                            metadata: commit.metadata().raw,
+                            public_key: commit.public_key().raw,
+                            signature_r: signature_r.raw,
+                            signature_s: signature_s.raw,
+                            reserved: [0; 48],
+                        }
+                        .as_bytes(),
+                    );
+                }
+                CollectionRecord::Merge(merge) => {
+                    let (low, high) = merge.inputs();
+                    header.copy_from_slice(
+                        CollectionMergeHeaderV4 {
+                            magic_marker: MAGIC_MARKER_COLLECTION_MERGE_V4,
+                            collection: merge.collection().raw,
+                            low: low.raw,
+                            high: high.raw,
+                            result: merge.result().raw,
+                            reserved: [0; 112],
+                        }
+                        .as_bytes(),
+                    );
+                }
+                CollectionRecord::Derive(derive) => {
+                    let (input, output) = derive.mapping();
+                    header.copy_from_slice(
+                        CollectionDeriveHeaderV4 {
+                            magic_marker: MAGIC_MARKER_COLLECTION_DERIVE_V4,
+                            source: derive.source().raw,
+                            target: derive.target().raw,
+                            input: input.raw,
+                            output: output.raw,
+                            reserved: [0; 112],
+                        }
+                        .as_bytes(),
+                    );
+                }
+            }
+
+            let original = header;
+            let decoded = decode_record(&header, 0).unwrap();
+            assert_eq!(decoded.len, V3_HEADER_LEN);
+            assert!(matches!(
+                decoded.content,
+                PileRecordContent::Collection { record: decoded } if decoded == record
+            ));
+            assert_eq!(header, original);
+        }
+    }
+
+    #[test]
+    fn opaque_envelopes_are_raw_visible_and_writers_cross_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "opaque-crossing.pile");
+        let header_only = test_envelope_bytes(TEST_UNKNOWN_KIND_A, 1, ENVELOPE_BLOCK_LEN);
+        let multi_block = test_envelope_bytes(TEST_UNKNOWN_KIND_B, 2, 2 * ENVELOPE_BLOCK_LEN);
+
+        // Hold an already-refreshed writer while another descriptor appends
+        // both future record kinds. Its next write must refresh across both.
+        let mut pile = Pile::open(&path).unwrap();
+        pile.refresh().unwrap();
+        {
+            let mut external = OpenOptions::new().append(true).open(&path).unwrap();
+            external.write_all(&header_only).unwrap();
+            external.write_all(&multi_block).unwrap();
+            external.sync_all().unwrap();
+        }
+        let known_payload = b"known after opaque".to_vec();
+        let known = pile
+            .put::<UnknownBlob, _>(Bytes::from_source(known_payload.clone()))
+            .unwrap();
+        let branch_id = Id::new([9; 16]).unwrap();
+        pile.update(branch_id, None, Some(known.transmute()))
+            .unwrap();
+        pile.close().unwrap();
+
+        let mut records = PileRecords::open(&path).unwrap();
+        let decoded = (&mut records).collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(decoded.len(), 4);
+        assert!(matches!(
+            decoded[0],
+            PileRecord {
+                len: ENVELOPE_BLOCK_LEN,
+                content: PileRecordContent::Opaque {
+                    kind: TEST_UNKNOWN_KIND_A
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            decoded[1],
+            PileRecord {
+                len,
+                content: PileRecordContent::Opaque { kind: TEST_UNKNOWN_KIND_B },
+                ..
+            } if len == 2 * ENVELOPE_BLOCK_LEN
+        ));
+        assert!(matches!(decoded[2].content, PileRecordContent::Blob { .. }));
+        assert!(matches!(
+            decoded[3].content,
+            PileRecordContent::Branch { .. }
+        ));
+        assert_eq!(&records.bytes()[..ENVELOPE_BLOCK_LEN], &header_only);
+        assert_eq!(
+            &records.bytes()[ENVELOPE_BLOCK_LEN..3 * ENVELOPE_BLOCK_LEN],
+            &multi_block
+        );
+
+        let mut reopened = Pile::open(&path).unwrap();
+        reopened.refresh().unwrap();
+        assert_eq!(reopened.opaque_records, 2);
+        let fetched: Blob<UnknownBlob> = reopened.reader().unwrap().get(known).unwrap();
+        assert_eq!(fetched.bytes.as_ref(), known_payload);
+        assert_eq!(reopened.head(branch_id).unwrap(), Some(known.transmute()));
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn opaque_projection_preserves_lww_order_for_branches_cells_and_wants() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "opaque-lww.pile");
+        let opaque = test_envelope_bytes(TEST_UNKNOWN_KIND_A, 1, ENVELOPE_BLOCK_LEN);
+        let mut pile = Pile::open(&path).unwrap();
+
+        let branch_cleared = Id::new([11; 16]).unwrap();
+        let branch_restored = Id::new([12; 16]).unwrap();
+        let branch_head = Inline::<Handle<SimpleArchive>>::new([13; 32]);
+        pile.update(branch_cleared, None, Some(branch_head))
+            .unwrap();
+        append_test_bytes(&path, &opaque);
+        pile.update(branch_cleared, Some(branch_head), None)
+            .unwrap();
+        append_test_bytes(
+            &path,
+            BranchTombstoneHeaderEnvelope::new(branch_restored).as_bytes(),
+        );
+        append_test_bytes(&path, &opaque);
+        pile.update(branch_restored, None, Some(branch_head))
+            .unwrap();
+
+        let cell_cleared = Id::new([14; 16]).unwrap();
+        let cell_restored = Id::new([15; 16]).unwrap();
+        let cell_value = Inline::<Handle<SimpleArchive>>::new([16; 32]);
+        pile.set_cell(cell_cleared, Some(cell_value)).unwrap();
+        append_test_bytes(&path, &opaque);
+        pile.set_cell(cell_cleared, None).unwrap();
+        pile.set_cell(cell_restored, None).unwrap();
+        append_test_bytes(&path, &opaque);
+        pile.set_cell(cell_restored, Some(cell_value)).unwrap();
+
+        let want_retracted = Inline::<Handle<UnknownBlob>>::new([17; 32]);
+        let want_restored = Inline::<Handle<UnknownBlob>>::new([18; 32]);
+        pile.want(want_retracted).unwrap();
+        append_test_bytes(&path, &opaque);
+        pile.unwant(want_retracted).unwrap();
+        append_test_bytes(
+            &path,
+            WantHeaderEnvelope::new(want_restored, false).as_bytes(),
+        );
+        append_test_bytes(&path, &opaque);
+        pile.want(want_restored).unwrap();
+        pile.close().unwrap();
+
+        let mut reopened = Pile::open(&path).unwrap();
+        reopened.refresh().unwrap();
+        assert_eq!(reopened.opaque_record_count().unwrap(), 6);
+        assert_eq!(reopened.head(branch_cleared).unwrap(), None);
+        assert_eq!(reopened.head(branch_restored).unwrap(), Some(branch_head));
+        assert_eq!(reopened.cell(cell_cleared).unwrap(), None);
+        assert_eq!(reopened.cell(cell_restored).unwrap(), Some(cell_value));
+        let wants = reopened
+            .wants()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(wants, vec![want_restored]);
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn legacy_v3_and_enveloped_piles_concatenate_without_reframing() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = fresh_empty_pile_path(&dir, "legacy-v3.pile");
+        let current_path = fresh_empty_pile_path(&dir, "enveloped.pile");
+        let merged_path = dir.path().join("mixed-cat.pile");
+
+        let legacy_payload = b"legacy V3".to_vec();
+        let legacy_handle =
+            Blob::<UnknownBlob>::new(Bytes::from_source(legacy_payload.clone())).get_handle();
+        append_v3_blob_candidate(&legacy_path, legacy_handle.into(), &legacy_payload, 17);
+
+        let current_payload = b"current envelope".to_vec();
+        let mut current = Pile::open(&current_path).unwrap();
+        let current_handle = current
+            .put::<UnknownBlob, _>(Bytes::from_source(current_payload.clone()))
+            .unwrap();
+        current.close().unwrap();
+
+        let mut merged = std::fs::read(&legacy_path).unwrap();
+        merged.extend_from_slice(&std::fs::read(&current_path).unwrap());
+        std::fs::write(&merged_path, merged).unwrap();
+
+        let mut pile = Pile::open(&merged_path).unwrap();
+        pile.refresh().unwrap();
+        let reader = pile.reader().unwrap();
+        let legacy: Blob<UnknownBlob> = reader.get(legacy_handle).unwrap();
+        let current: Blob<UnknownBlob> = reader.get(current_handle).unwrap();
+        assert_eq!(legacy.bytes.as_ref(), legacy_payload);
+        assert_eq!(current.bytes.as_ref(), current_payload);
+        drop(reader);
+        pile.close().unwrap();
+
+        let mut records = PileRecords::open(&merged_path).unwrap();
+        let decoded = (&mut records).collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(
+            &records.bytes()[decoded[0].offset..decoded[0].offset + 16],
+            MAGIC_MARKER_BLOB_V3.as_slice()
+        );
+        assert_eq!(
+            &records.bytes()[decoded[1].offset..decoded[1].offset + 16],
+            MAGIC_MARKER_ENVELOPE.as_slice()
+        );
+    }
+
+    #[test]
+    fn lazy_pile_reads_reopens_and_appends_across_opaque_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "lazy-opaque.pile");
+        std::fs::write(
+            &path,
+            test_envelope_bytes(TEST_UNKNOWN_KIND_A, 1, ENVELOPE_BLOCK_LEN),
+        )
+        .unwrap();
+
+        let first_payload = b"first lazy blob".to_vec();
+        let mut seed = Pile::open(&path).unwrap();
+        let first = seed
+            .put::<UnknownBlob, _>(Bytes::from_source(first_payload.clone()))
+            .unwrap();
+        seed.close().unwrap();
+
+        let mut lazy: Lazy<Pile> = Lazy::new(Pile::open(&path).unwrap());
+        let reader = BlobStore::reader(&mut lazy).unwrap();
+        let first_read: Blob<UnknownBlob> = reader.get(first).unwrap();
+        assert_eq!(first_read.bytes.as_ref(), first_payload);
+        drop(reader);
+
+        {
+            let mut external = OpenOptions::new().append(true).open(&path).unwrap();
+            external
+                .write_all(&test_envelope_bytes(
+                    TEST_UNKNOWN_KIND_B,
+                    2,
+                    2 * ENVELOPE_BLOCK_LEN,
+                ))
+                .unwrap();
+        }
+        let second_payload = b"second lazy blob".to_vec();
+        let second = BlobStorePut::put::<UnknownBlob, _>(
+            &mut lazy,
+            Bytes::from_source(second_payload.clone()),
+        )
+        .unwrap();
+        lazy.into_store().close().unwrap();
+
+        let mut reopened: Lazy<Pile> = Lazy::new(Pile::open(&path).unwrap());
+        let reader = BlobStore::reader(&mut reopened).unwrap();
+        let first_read: Blob<UnknownBlob> = reader.get(first).unwrap();
+        let second_read: Blob<UnknownBlob> = reader.get(second).unwrap();
+        assert_eq!(first_read.bytes.as_ref(), first_payload);
+        assert_eq!(second_read.bytes.as_ref(), second_payload);
+        drop(reader);
+        assert_eq!(reopened.store().opaque_record_count().unwrap(), 2);
+        reopened.into_store().close().unwrap();
+    }
+
+    #[test]
+    fn envelope_span_rejects_zero_maximum_truncation_and_kind_mismatch() {
+        let complete_header = test_envelope_bytes(TEST_UNKNOWN_KIND_A, 1, ENVELOPE_HEADER_LEN);
+        for truncated_at in [0usize, 1, 15, 16, 31, 32, 35, 36, 255] {
+            assert!(matches!(
+                decode_record(&complete_header[..truncated_at], 11),
+                Err(ReadError::CorruptPile { valid_length: 11 })
+            ));
+        }
+
+        for malformed in [
+            test_envelope_bytes(TEST_UNKNOWN_KIND_A, 0, ENVELOPE_BLOCK_LEN),
+            test_envelope_bytes(TEST_UNKNOWN_KIND_A, u32::MAX, ENVELOPE_BLOCK_LEN),
+            test_envelope_bytes(TEST_UNKNOWN_KIND_A, 2, 2 * ENVELOPE_BLOCK_LEN - 1),
+            test_envelope_bytes(MAGIC_MARKER_BRANCH_V3, 2, 2 * ENVELOPE_BLOCK_LEN),
+        ] {
+            assert!(matches!(
+                decode_record(&malformed, 17),
+                Err(ReadError::CorruptPile { valid_length: 17 })
+            ));
+        }
+
+        let prefix_only = test_envelope_bytes(TEST_UNKNOWN_KIND_A, 1, 36);
+        assert!(matches!(
+            decode_record(&prefix_only, 23),
+            Err(ReadError::CorruptPile { valid_length: 23 })
+        ));
+
+        let hash = collection_test_hash(7);
+        let mut wrong_blob_span = vec![0u8; 2 * ENVELOPE_BLOCK_LEN];
+        wrong_blob_span[..ENVELOPE_HEADER_LEN].copy_from_slice(
+            BlobHeaderEnvelope::new(1, 42, (ENVELOPE_BLOCK_LEN + 1) as u64, hash).as_bytes(),
+        );
+        assert!(matches!(
+            decode_record(&wrong_blob_span, 29),
+            Err(ReadError::CorruptPile { valid_length: 29 })
+        ));
+    }
+
+    #[test]
+    fn amputation_crosses_complete_opaque_and_truncates_torn_opaque_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "opaque-amputation.pile");
+        let complete = test_envelope_bytes(TEST_UNKNOWN_KIND_A, 2, 2 * ENVELOPE_BLOCK_LEN);
+        let torn = test_envelope_bytes(TEST_UNKNOWN_KIND_B, 2, ENVELOPE_BLOCK_LEN);
+        {
+            let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(&complete).unwrap();
+            file.write_all(&torn).unwrap();
+        }
+
+        let mut pile = Pile::open(&path).unwrap();
+        assert!(matches!(
+            pile.refresh(),
+            Err(ReadError::CorruptPile { valid_length })
+                if valid_length == complete.len()
+        ));
+        pile.amputate().unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            complete.len() as u64
+        );
+        pile.refresh().unwrap();
+        assert_eq!(pile.opaque_records, 1);
+        pile.close().unwrap();
+
+        let mut records = PileRecords::open(&path).unwrap();
+        let only = records.next().unwrap().unwrap();
+        assert_eq!(only.len, complete.len());
+        assert!(matches!(
+            only.content,
+            PileRecordContent::Opaque {
+                kind: TEST_UNKNOWN_KIND_A
+            }
+        ));
+        assert!(records.next().is_none());
+    }
+
+    #[test]
+    fn opaque_records_refuse_pile_and_yard_retention_before_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "opaque-source.pile");
+        let destination_path = fresh_empty_pile_path(&dir, "opaque-destination.pile");
+        std::fs::write(
+            &source_path,
+            test_envelope_bytes(TEST_UNKNOWN_KIND_A, 1, ENVELOPE_BLOCK_LEN),
+        )
+        .unwrap();
+
+        let mut source = Pile::open(&source_path).unwrap();
+        let retained = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"possibly owned".to_vec()))
+            .unwrap();
+        let mut destination = Pile::open(&destination_path).unwrap();
+        destination
+            .put::<UnknownBlob, _>(Bytes::from_source(b"sentinel".to_vec()))
+            .unwrap();
+        destination.flush().unwrap();
+        let destination_before = std::fs::read(&destination_path).unwrap();
+
+        assert!(matches!(
+            source.rewrite_retained_into(
+                &mut destination,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+            ),
+            Err(PileRewriteError::OpaqueRecords { count: 1 })
+        ));
+        assert_eq!(
+            std::fs::read(&destination_path).unwrap(),
+            destination_before
+        );
+        let fetched: Blob<UnknownBlob> = source.reader().unwrap().get(retained).unwrap();
+        assert_eq!(fetched.bytes.as_ref(), b"possibly owned");
+        destination.close().unwrap();
+        source.close().unwrap();
+
+        // The fence is Yard-wide: an opaque record in the young generation
+        // may own a known blob physically resident only in an older one.
+        let old_path = fresh_empty_pile_path(&dir, "opaque-owned-old.pile");
+        let mut old = Pile::open(&old_path).unwrap();
+        let cross_generation = old
+            .put::<UnknownBlob, _>(Bytes::from_source(
+                b"possibly owned across generations".to_vec(),
+            ))
+            .unwrap();
+        old.close().unwrap();
+        let young_before = std::fs::read(&source_path).unwrap();
+        let old_before = std::fs::read(&old_path).unwrap();
+        let mut yard = Yard::open([&source_path, &old_path], YardConfig::default()).unwrap();
+        assert!(matches!(
+            yard.collect(&RetentionRoots::new()),
+            Err(YardCollectError::OpaqueRecords { count: 1 })
+        ));
+        assert!(matches!(
+            yard.compact(&RetentionRoots::new()),
+            Err(YardCollectError::OpaqueRecords { count: 1 })
+        ));
+        assert!(matches!(
+            yard.reclaim(),
+            Err(YardReclaimError::OpaqueRecords { count: 1 })
+        ));
+        assert_eq!(std::fs::read(&source_path).unwrap(), young_before);
+        assert_eq!(std::fs::read(&old_path).unwrap(), old_before);
+        let fetched: Blob<UnknownBlob> = yard.reader().unwrap().get(retained).unwrap();
+        assert_eq!(fetched.bytes.as_ref(), b"possibly owned");
+        let fetched: Blob<UnknownBlob> = yard.reader().unwrap().get(cross_generation).unwrap();
+        assert_eq!(fetched.bytes.as_ref(), b"possibly owned across generations");
+        yard.close().unwrap();
     }
 
     #[test]
@@ -3266,7 +4273,7 @@ mod tests {
         pile.insert(record).unwrap();
         let twice = std::fs::metadata(&path).unwrap().len();
 
-        assert_eq!(once, V3_HEADER_LEN as u64);
+        assert_eq!(once, ENVELOPE_HEADER_LEN as u64);
         assert_eq!(twice, once);
         assert_eq!(pile.records().unwrap().count(), 1);
         pile.close().unwrap();
@@ -3324,7 +4331,7 @@ mod tests {
             .write(true)
             .open(&path)
             .unwrap()
-            .set_len((V3_HEADER_LEN - 1) as u64)
+            .set_len((ENVELOPE_HEADER_LEN - 1) as u64)
             .unwrap();
         let mut reopened = Pile::open(&path).unwrap();
         assert!(matches!(
@@ -3694,7 +4701,7 @@ mod tests {
         let header = BlobHeaderV3::new(timestamp, payload.len() as u64, hash);
         file.write_all(header.as_bytes()).unwrap();
         file.write_all(payload).unwrap();
-        file.write_all(&vec![0; v3_post_pad(payload.len())])
+        file.write_all(&vec![0; block_post_pad(payload.len())])
             .unwrap();
         file.sync_all().unwrap();
         record_offset
@@ -3964,10 +4971,10 @@ mod tests {
     }
 
     #[test]
-    fn put_v3_256_aligned_roundtrip() {
-        // Every V3 record is a 256-byte multiple with the data at a fixed
+    fn put_enveloped_256_aligned_roundtrip() {
+        // Every current record is a 256-byte multiple with the data at a fixed
         // header offset, so plain `put` yields absolutely 256-aligned
-        // (GPU-aliasable) data in a pure-V3 pile.
+        // (GPU-aliasable) data in a current pile.
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "v3.pile");
         // Sizes around the 64/256 boundaries to exercise the post-pad.
@@ -3986,38 +4993,38 @@ mod tests {
             }
             pile.close().unwrap();
         }
-        // Reopen fresh — the scan rebuilds the index from the on-disk V3 records.
+        // Reopen fresh — the scan rebuilds the index from enveloped records.
         let mut pile: Pile = Pile::open(&path).unwrap();
         pile.amputate().unwrap();
         for (hash, expected) in hashes.iter().zip(&datas) {
             let entry = *pile
                 .blobs
                 .get(&hash.raw)
-                .expect("V3 blob missing after reopen");
+                .expect("enveloped blob missing after reopen");
             let record = indexed_blob_record(&pile.mmap, pile.applied_length, entry, hash);
             assert_eq!(
                 record.payload_offset % GPU_DATA_ALIGNMENT,
                 0,
-                "V3 data offset {} not {GPU_DATA_ALIGNMENT}-aligned (size {})",
+                "enveloped data offset {} not {GPU_DATA_ALIGNMENT}-aligned (size {})",
                 record.payload_offset,
                 expected.len()
             );
             assert_eq!(
                 record.bytes.as_ref(),
                 &expected[..],
-                "V3 roundtrip mismatch (size {})",
+                "enveloped roundtrip mismatch (size {})",
                 expected.len()
             );
         }
         pile.close().unwrap();
     }
 
-    /// The whole point of uniform-V3: `cat a.pile >> b.pile` is a valid merge —
+    /// The whole point of uniform current framing: `cat a.pile >> b.pile` is a valid merge —
     /// every record from both piles is found and byte-correct, the data stays
     /// 256-aligned, and `amputate()` does not truncate the concatenation as
     /// corrupt. This is what an offset-derived pad could never survive.
     #[test]
-    fn v3_cat_merge_preserves_all_blobs_and_alignment() {
+    fn enveloped_cat_merge_preserves_all_blobs_and_alignment() {
         let dir = tempfile::tempdir().unwrap();
         let path_a = fresh_empty_pile_path(&dir, "a.pile");
         let path_b = fresh_empty_pile_path(&dir, "b.pile");
@@ -4046,14 +5053,14 @@ mod tests {
             b.close().unwrap();
         }
 
-        // Each pure-V3 pile is a whole number of 256-byte units — the precondition
+        // Each current pile is a whole number of 256-byte units — the precondition
         // that makes the appended pile land on a 256-aligned offset.
         assert_eq!(
-            std::fs::metadata(&path_a).unwrap().len() % V3_ALIGNMENT as u64,
+            std::fs::metadata(&path_a).unwrap().len() % ENVELOPE_BLOCK_LEN as u64,
             0
         );
         assert_eq!(
-            std::fs::metadata(&path_b).unwrap().len() % V3_ALIGNMENT as u64,
+            std::fs::metadata(&path_b).unwrap().len() % ENVELOPE_BLOCK_LEN as u64,
             0
         );
 
@@ -4074,7 +5081,7 @@ mod tests {
         assert_eq!(
             std::fs::metadata(&path_b).unwrap().len(),
             merged_len,
-            "cat-merged pile was truncated — cat is not a valid V3 merge"
+            "cat-merged pile was truncated — cat is not a valid framed merge"
         );
         for (hash, expected) in &handles {
             let entry = *merged
@@ -4083,7 +5090,7 @@ mod tests {
                 .expect("blob lost after cat-merge");
             let record = indexed_blob_record(&merged.mmap, merged.applied_length, entry, hash);
             assert_eq!(
-                record.payload_offset % V3_ALIGNMENT,
+                record.payload_offset % ENVELOPE_BLOCK_LEN,
                 0,
                 "post-cat data offset not 256-aligned"
             );
@@ -4095,13 +5102,13 @@ mod tests {
         }
         // Still 256-aligned, so it can be cat'd again.
         assert_eq!(
-            std::fs::metadata(&path_b).unwrap().len() % V3_ALIGNMENT as u64,
+            std::fs::metadata(&path_b).unwrap().len() % ENVELOPE_BLOCK_LEN as u64,
             0
         );
         merged.close().unwrap();
     }
 
-    /// Existing piles are V1; the V3-capable reader must read them unchanged.
+    /// Existing V1 piles remain readable unchanged by the current reader.
     #[test]
     fn v3_reader_still_reads_legacy_v1_records() {
         let dir = tempfile::tempdir().unwrap();
@@ -4127,7 +5134,7 @@ mod tests {
         assert_eq!(
             fetched.bytes.as_ref(),
             data.as_slice(),
-            "legacy V1 blob not read by the V3-capable reader"
+            "legacy V1 blob not read by the current reader"
         );
         pile.close().unwrap();
     }
@@ -4268,15 +5275,15 @@ mod tests {
     fn decoder_distinguishes_unknown_magic_from_truncated_known_record() {
         let unknown_marker = [0xA5u8; 16];
         assert!(matches!(
-            decode_record(&unknown_marker, V3_ALIGNMENT),
+            decode_record(&unknown_marker, ENVELOPE_BLOCK_LEN),
             Err(ReadError::UnsupportedRecord { offset, marker })
-                if offset == V3_ALIGNMENT && marker == unknown_marker
+                if offset == ENVELOPE_BLOCK_LEN && marker == unknown_marker
         ));
 
         assert!(matches!(
-            decode_record(&MAGIC_MARKER_BLOB_V3, V3_ALIGNMENT),
+            decode_record(&MAGIC_MARKER_BLOB_V3, ENVELOPE_BLOCK_LEN),
             Err(ReadError::CorruptPile { valid_length })
-                if valid_length == V3_ALIGNMENT
+                if valid_length == ENVELOPE_BLOCK_LEN
         ));
     }
 
@@ -4330,7 +5337,7 @@ mod tests {
             .write(true)
             .open(&path)
             .unwrap();
-        file.seek(SeekFrom::Start(16 + 8)).unwrap();
+        file.seek(SeekFrom::Start(48)).unwrap();
         file.write_all(&(1_000_000u64).to_le_bytes()).unwrap();
         file.flush().unwrap();
         drop(file);
@@ -4363,7 +5370,7 @@ mod tests {
             .write(true)
             .open(&path)
             .unwrap();
-        file.seek(SeekFrom::Start(16 + 8)).unwrap();
+        file.seek(SeekFrom::Start(48)).unwrap();
         file.write_all(&(1_000_000u64).to_le_bytes()).unwrap();
         file.flush().unwrap();
         drop(file);
@@ -4743,7 +5750,7 @@ mod tests {
         young.set_cell(id, None).unwrap();
         assert_eq!(
             std::fs::metadata(&young_path).unwrap().len(),
-            V3_HEADER_LEN as u64
+            ENVELOPE_HEADER_LEN as u64
         );
         young.close().unwrap();
 
@@ -4936,10 +5943,10 @@ mod tests {
 
         pile.amputate().unwrap();
 
-        // Blobs are now written as V3 records (fixed 256-byte header, padded to a
+        // Blobs are written as enveloped records (fixed 256-byte header, padded to a
         // 256-byte multiple).
         let expected_len =
-            (super::V3_HEADER_LEN + data.len() + super::v3_post_pad(data.len())) as u64;
+            (super::ENVELOPE_HEADER_LEN + data.len() + super::block_post_pad(data.len())) as u64;
         assert_eq!(std::fs::metadata(&path).unwrap().len(), expected_len);
 
         let reader = pile.reader().unwrap();
@@ -4962,12 +5969,13 @@ mod tests {
         pile1.flush().unwrap();
         pile1.refresh().unwrap();
 
-        // Corrupt the first V3 blob's payload (the fixed header is 256 bytes).
+        // Corrupt the first enveloped blob's payload (the fixed header is 256 bytes).
         use std::io::Seek;
         use std::io::SeekFrom;
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        file.seek(SeekFrom::Start(V3_HEADER_LEN as u64)).unwrap();
+        file.seek(SeekFrom::Start(ENVELOPE_HEADER_LEN as u64))
+            .unwrap();
         file.write_all(&[9u8; 4]).unwrap();
         file.sync_all().unwrap();
 
@@ -5189,18 +6197,18 @@ mod tests {
 
         pile.want(h).unwrap();
         let len_after_pin = std::fs::metadata(&path).unwrap().len();
-        assert_eq!(len_after_pin, V3_HEADER_LEN as u64);
+        assert_eq!(len_after_pin, ENVELOPE_HEADER_LEN as u64);
 
         pile.want(h).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), len_after_pin);
         pile.close().unwrap();
     }
 
-    /// Mixed pile: a legacy V1 blob, V3 blobs, branch records, and want
+    /// Mixed pile: a legacy V1 blob, enveloped blobs, branch records, and want
     /// markers interleaved — the scan walks every record kind cleanly and
     /// each index (blobs, branches, wants) resolves correctly.
     #[test]
-    fn mixed_v1_v3_branch_and_weak_markers_interleave() {
+    fn mixed_v1_enveloped_branch_and_weak_markers_interleave() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "mixed.pile");
 
@@ -5231,8 +6239,8 @@ mod tests {
         let mut pile: Pile = Pile::open(&path).unwrap();
         pile.amputate().unwrap();
 
-        // Interleave: weak-pin, V3 blob, branch head, weak-pin + weak-unpin,
-        // another V3 blob.
+        // Interleave: want, enveloped blob, branch head, want + unwant, then
+        // another enveloped blob.
         pile.want(want).unwrap();
         let d1 = vec![1u8; 300];
         let b1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(d1.clone()));
@@ -5267,7 +6275,7 @@ mod tests {
         pile.close().unwrap();
     }
 
-    /// [`PileRecords`] walks a mixed V1/V3 pile record-by-record: every
+    /// [`PileRecords`] walks a mixed legacy/current pile record-by-record: every
     /// record kind appears in log order, offsets tile the file exactly, blob
     /// payloads are addressable through `data_offset`/`data_len`, and an
     /// unknown-marker tail surfaces as `Err(UnsupportedRecord)` — never a
@@ -5324,7 +6332,7 @@ mod tests {
         }
         assert_eq!(expected_offset, bytes.len());
 
-        // Exact sequence: V1 blob, V3 blob, branch set, weak-pin,
+        // Exact sequence: V1 blob, enveloped blob, branch set, want,
         // weak-unpin, branch tombstone.
         assert_eq!(decoded.len(), 6);
         match decoded[0].content {
@@ -5349,10 +6357,10 @@ mod tests {
                 ..
             } => {
                 assert_eq!(hash, h1.into());
-                assert_eq!(data_offset, decoded[1].offset + V3_HEADER_LEN);
+                assert_eq!(data_offset, decoded[1].offset + ENVELOPE_HEADER_LEN);
                 assert_eq!(&bytes[data_offset..data_offset + data_len], &d1[..]);
             }
-            other => panic!("expected V3 blob record, got {other:?}"),
+            other => panic!("expected enveloped blob record, got {other:?}"),
         }
         match decoded[2].content {
             PileRecordContent::Branch {
@@ -5379,8 +6387,9 @@ mod tests {
             other => panic!("expected branch tombstone record, got {other:?}"),
         }
 
-        // An unknown record marker is an error at its offset, then the iterator
-        // ends. Its length is unknowable, so it must not be called corruption.
+        // An unknown unenveloped record marker is an error at its offset, then
+        // the iterator ends. Its length is unknowable, so it must not be called
+        // corruption.
         let unknown_offset = std::fs::metadata(&path).unwrap().len() as usize;
         let unknown_marker = [0xFFu8; 16];
         {

@@ -16,6 +16,19 @@ fn random_signing_key() -> SigningKey {
     SigningKey::from_bytes(&seed)
 }
 
+fn opaque_envelope(needle: Option<[u8; 32]>) -> Vec<u8> {
+    let mut record = vec![0u8; 256];
+    record[..16].copy_from_slice(
+        &hex::decode("E5A95E5D8A0BBA8782E46B9C9E73B313").expect("envelope marker"),
+    );
+    record[16..32].fill(0xA5);
+    record[32..36].copy_from_slice(&1u32.to_le_bytes());
+    if let Some(needle) = needle {
+        record[80..112].copy_from_slice(&needle);
+    }
+    record
+}
+
 #[test]
 fn list_branches_outputs_branch_id() {
     let dir = tempdir().unwrap();
@@ -35,6 +48,28 @@ fn list_branches_outputs_branch_id() {
         .assert()
         .success()
         .stdout(predicate::str::is_match("^[A-F0-9]{32}\\t-\\tmain\\n$").unwrap());
+}
+
+#[test]
+fn list_branches_crosses_opaque_envelopes() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("opaque-before-branch.pile");
+    std::fs::write(&path, opaque_envelope(None)).unwrap();
+
+    {
+        let pile = Pile::open(&path).unwrap();
+        let mut repo = Repository::new(pile, random_signing_key(), TribleSet::new()).unwrap();
+        repo.create_branch("after-opaque", None)
+            .expect("create branch after opaque record");
+        repo.into_storage().close().unwrap();
+    }
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "branch", "list", path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_match("^[A-F0-9]{32}\\t-\\tafter-opaque\\n$").unwrap());
 }
 
 #[test]
@@ -348,6 +383,48 @@ fn diagnose_reports_healthy() {
 }
 
 #[test]
+fn diagnose_qualifies_health_when_opaque_bodies_are_skipped() {
+    let dir = tempdir().unwrap();
+    let pile_path = dir.path().join("opaque-diag.pile");
+    std::fs::write(&pile_path, opaque_envelope(None)).unwrap();
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "diagnose", "check", pile_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Known record projection appears healthy",
+        ))
+        .stdout(predicate::str::contains(
+            "bodies were not semantically validated",
+        ));
+}
+
+#[test]
+fn diagnose_locate_hash_scans_the_complete_opaque_record() {
+    let dir = tempdir().unwrap();
+    let pile_path = dir.path().join("opaque-locate.pile");
+    let needle = [0x4D; 32];
+    std::fs::write(&pile_path, opaque_envelope(Some(needle))).unwrap();
+    let handle = format!("blake3:{}", hex::encode_upper(needle));
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "pile",
+            "diagnose",
+            "locate-hash",
+            pile_path.to_str().unwrap(),
+            &handle,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("opaque-record byte match"))
+        .stdout(predicate::str::contains("opaque records: 1"));
+}
+
+#[test]
 fn diagnose_reports_invalid_hash() {
     use std::io::Seek;
     use std::io::Write;
@@ -376,7 +453,7 @@ fn diagnose_reports_invalid_hash() {
         .write(true)
         .open(&pile_path)
         .unwrap();
-    // first blob payload starts after the fixed 256-byte V3 header
+    // first blob payload starts after the fixed 256-byte envelope header
     file.seek(std::io::SeekFrom::Start(256)).unwrap();
     file.write_all(b"X").unwrap();
 

@@ -56,8 +56,9 @@ use crate::trible::Fragment;
 ///
 /// The alignment is a chain, and every link has to hold:
 ///
-/// * a V3 pile record's data begins at `record_start + 256`, and every record
-///   is a 256-multiple, so a blob's first byte is 256-aligned;
+/// * a current generic-envelope pile record's data begins at
+///   `record_start + 256`, and its span is measured in 256-byte blocks, so a
+///   blob's first byte is 256-aligned in a current-format pile;
 /// * this header is 256 wide, so the payload begins 256 bytes later;
 /// * therefore the payload is 256-aligned in the file, which is what CUDA and
 ///   Metal want for a zero-copy storage-buffer binding.
