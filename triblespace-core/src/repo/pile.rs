@@ -1933,6 +1933,7 @@ impl Pile {
             std::ptr::drop_in_place(&mut this.cells);
             std::ptr::drop_in_place(&mut this.cell_tombstones);
             std::ptr::drop_in_place(&mut this.collection_records);
+            std::ptr::drop_in_place(&mut this.legacy_collection_headers);
             std::ptr::drop_in_place(&mut this.wants);
         }
 
@@ -2099,6 +2100,26 @@ impl Iterator for PileCollectionRecordIter {
 }
 
 impl Pile {
+    /// Copy every byte-distinct inert legacy V3 collection header into
+    /// `destination`.
+    ///
+    /// This is an internal physical-rewrite primitive. Legacy headers do not
+    /// participate in the current collection algebra, but reclaim must retain
+    /// their exact source evidence for a later explicit migration. The source
+    /// is refreshed before the snapshot and destination insertion is
+    /// idempotent by exact header bytes.
+    pub(crate) fn preserve_legacy_collection_headers_into(
+        &mut self,
+        destination: &mut Pile,
+    ) -> Result<(), CollectionInsertError> {
+        self.refresh()?;
+        let headers = self.legacy_collection_headers.clone();
+        for header in headers {
+            destination.preserve_legacy_collection_header(header)?;
+        }
+        Ok(())
+    }
+
     /// Append one already-validated legacy collection header if this pile does
     /// not already contain the same physical evidence.
     fn preserve_legacy_collection_header(
@@ -2936,7 +2957,8 @@ mod tests {
 
     use crate::collection::{empty_metadata_handle, CollectionDescriptor, CollectionId};
     use crate::macros::entity;
-    use crate::repo::{BlobStoreMeta, PushResult, RetentionRoots};
+    use crate::repo::yard::{Yard, YardConfig};
+    use crate::repo::{BlobStoreMeta, PushResult, RetentionRoots, StorageClose};
     use crate::trible::TribleSet;
 
     fn fresh_empty_pile_path(dir: &tempfile::TempDir, name: &str) -> PathBuf {
@@ -3182,6 +3204,31 @@ mod tests {
 
         destination.close().unwrap();
         source.close().unwrap();
+    }
+
+    #[test]
+    fn yard_reclaim_preserves_inert_legacy_v3_collection_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "legacy-yard.pile");
+        let expected = legacy_collection_test_headers();
+
+        {
+            let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+            for (_, header) in &expected {
+                file.write_all(header).unwrap();
+            }
+        }
+
+        let mut yard = Yard::open([&path], YardConfig::default()).unwrap();
+        yard.reclaim().unwrap();
+        yard.close().unwrap();
+
+        assert_eq!(
+            legacy_collection_headers_at(&path)
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            expected.into_iter().collect::<BTreeSet<_>>()
+        );
     }
 
     #[test]

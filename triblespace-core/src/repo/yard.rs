@@ -1204,6 +1204,9 @@ fn reclaim_generation(
     for result in transfer(&reader, &mut new_pile, handles) {
         result.map_err(YardReclaimError::Transfer)?;
     }
+    old_pile
+        .preserve_legacy_collection_headers_into(&mut new_pile)
+        .map_err(YardReclaimError::CollectionRecord)?;
     for record in collection_records {
         new_pile
             .insert(record)
