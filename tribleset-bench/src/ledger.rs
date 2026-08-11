@@ -18,14 +18,15 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::LazyLock;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::collection::{
-    Collection, CollectionClaimValidation, CollectionData, CollectionValidationRequest,
-    discover_collection_records, resolve_collection_semantics, simplearchive_union,
+    discover_collection_records, resolve_collection_semantics, simplearchive_union, Collection,
+    CollectionClaimValidation, CollectionData, CollectionDescriptor, CollectionId,
+    CollectionValidationRequest,
 };
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
@@ -251,6 +252,26 @@ where
         .map_err(|e| format!("read collection element {data:?}: {e:?}"))
 }
 
+fn load_collection_descriptor<R>(
+    reader: &R,
+    collection: CollectionId,
+) -> std::result::Result<CollectionDescriptor, String>
+where
+    R: BlobStoreGet,
+{
+    let blob: Blob<SimpleArchive> = reader
+        .get(collection)
+        .map_err(|e| format!("read collection descriptor {collection:?}: {e:?}"))?;
+    let canonical = Blob::<SimpleArchive>::new(blob.bytes.clone());
+    if canonical.get_handle() != collection {
+        return Err(format!(
+            "collection descriptor bytes do not match handle {collection:?}"
+        ));
+    }
+    CollectionDescriptor::decode(&canonical)
+        .map_err(|e| format!("decode collection descriptor {collection:?}: {e}"))
+}
+
 /// The acceptance instrument: reopen a results pile read-only, discover and
 /// resolve every valid signed commit in the deterministic results collection,
 /// unite its set-valued elements, and print session + span + outcome counts.
@@ -272,10 +293,14 @@ pub fn verify(path: &Path) -> Result<()> {
         );
     }
 
-    let definition = simplearchive_union::definition(*RESULTS_COLLECTION_SCOPE);
-    if !discovered.definitions().contains(&definition) {
+    let descriptor = simplearchive_union::descriptor(*RESULTS_COLLECTION_SCOPE);
+    let collection = descriptor.handle();
+    let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
+    let resident_descriptor = load_collection_descriptor(&reader, collection)
+        .map_err(|e| anyhow!("load results collection descriptor: {e}"))?;
+    if resident_descriptor != descriptor {
         bail!(
-            "no results collection for scope {:X} in {}",
+            "results collection descriptor for scope {:X} does not match the canonical recipe in {}",
             &*RESULTS_COLLECTION_SCOPE,
             path.display()
         );
@@ -284,38 +309,32 @@ pub fn verify(path: &Path) -> Result<()> {
     let authorized: BTreeSet<Id> = discovered
         .commits()
         .iter()
-        .filter(|commit| commit.collection() == definition.id())
+        .filter(|commit| commit.collection() == collection)
         .map(|commit| commit.id())
         .collect();
     if authorized.is_empty() {
         bail!(
-            "results collection {:X} has no signed commits",
-            definition.id()
+            "results collection for scope {:X} has no signed commits",
+            &*RESULTS_COLLECTION_SCOPE
         );
     }
 
-    let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
     let resolution = resolve_collection_semantics(&discovered, &authorized, |request| {
         let verdict = match request {
-            CollectionValidationRequest::Commit {
-                definition: found,
-                claim,
-            } if found.id() == definition.id() => {
+            CollectionValidationRequest::Commit { claim } if claim.collection() == collection => {
                 let blob = load_collection_archive(&reader, claim.data())?;
-                match simplearchive_union::validate_commit(found, claim, &blob) {
+                match simplearchive_union::validate_commit(&descriptor, claim, &blob) {
                     Ok(()) => CollectionClaimValidation::Accepted,
                     Err(error) => CollectionClaimValidation::Rejected(error),
                 }
             }
-            CollectionValidationRequest::Merge {
-                definition: found,
-                claim,
-            } if found.id() == definition.id() => {
+            CollectionValidationRequest::Merge { claim } if claim.collection() == collection => {
                 let (low, high) = claim.inputs();
                 let low = load_collection_archive(&reader, low)?;
                 let high = load_collection_archive(&reader, high)?;
                 let result = load_collection_archive(&reader, claim.result())?;
-                match simplearchive_union::validate_merge(found, claim, &low, &high, &result) {
+                match simplearchive_union::validate_merge(&descriptor, claim, &low, &high, &result)
+                {
                     Ok(()) => CollectionClaimValidation::Accepted,
                     Err(error) => CollectionClaimValidation::Rejected(error),
                 }
@@ -345,7 +364,7 @@ pub fn verify(path: &Path) -> Result<()> {
     let mut facts = TribleSet::new();
     for data in resolution
         .semantics()
-        .members(definition.id())
+        .members(collection)
         .into_iter()
         .flatten()
     {
@@ -542,16 +561,20 @@ mod tests {
 
         let mut pile = Pile::open(&path).unwrap();
         let discovered = discover_collection_records(&mut pile).unwrap();
-        let definition = simplearchive_union::definition(*RESULTS_COLLECTION_SCOPE);
-        assert!(discovered.definitions().contains(&definition));
+        let descriptor = simplearchive_union::descriptor(*RESULTS_COLLECTION_SCOPE);
+        let collection = descriptor.handle();
+        let reader = pile.reader().unwrap();
+        assert_eq!(
+            load_collection_descriptor(&reader, collection).unwrap(),
+            descriptor
+        );
         let commits: Vec<_> = discovered
             .commits()
             .iter()
-            .filter(|commit| commit.collection() == definition.id())
+            .filter(|commit| commit.collection() == collection)
             .collect();
         assert_eq!(commits.len(), 2);
 
-        let reader = pile.reader().unwrap();
         let mut facts = TribleSet::new();
         for commit in commits {
             let metadata: TribleSet = reader.get(commit.metadata()).unwrap();
@@ -578,11 +601,9 @@ mod tests {
         })
         .collect();
         assert_eq!(configs.len(), 2);
-        assert!(
-            configs
-                .iter()
-                .all(|config| config.contains("suite: tribleset-bench test"))
-        );
+        assert!(configs
+            .iter()
+            .all(|config| config.contains("suite: tribleset-bench test")));
 
         drop(reader);
         pile.close().unwrap();

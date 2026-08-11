@@ -6,13 +6,14 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::SigningKey;
 use triblespace_core::collection::{
     discover_collection_records, empty_metadata_handle, resolve_collection_semantics,
-    CollectionClaimValidation, CollectionCommit, CollectionData, CollectionDefinition,
-    CollectionDerive, CollectionMerge, CollectionRecord, CollectionStore,
+    CollectionClaimValidation, CollectionCommit, CollectionData, CollectionDerive,
+    CollectionDescriptor, CollectionId, CollectionMerge, CollectionRecord, CollectionStore,
     CollectionValidationRequest,
 };
 use triblespace_core::id::Id;
 use triblespace_core::inline::Inline;
-use triblespace_core::repo::memoryrepo::MemoryRepo;
+use triblespace_core::prelude::blobencodings::SimpleArchive;
+use triblespace_core::repo::{memoryrepo::MemoryRepo, BlobStorePut};
 
 #[derive(Clone, Copy, Debug)]
 enum Shape {
@@ -54,7 +55,7 @@ fn build(
 ) -> (
     triblespace_core::collection::DiscoveredCollectionRecords,
     BTreeSet<Id>,
-    Id,
+    CollectionId,
     usize,
     usize,
 ) {
@@ -63,8 +64,10 @@ fn build(
         assert!(leaves.is_power_of_two());
     }
 
-    let source = CollectionDefinition::new(id(1), id(2), id(3));
-    let target = CollectionDefinition::new(id(4), id(5), id(6));
+    let source = CollectionDescriptor::new(id(1), id(2), id(3));
+    let target = CollectionDescriptor::new(id(4), id(5), id(6));
+    let source_collection = source.handle();
+    let target_collection = target.handle();
     let signing_key = SigningKey::from_bytes(&[7; 32]);
     let leaf_data: Vec<_> = (0..leaves)
         .map(|i| data(b"source-leaf-v1", i as u64, &[]))
@@ -72,7 +75,12 @@ fn build(
     let commits: Vec<_> = leaf_data
         .iter()
         .map(|element| {
-            CollectionCommit::sign(&signing_key, source.id(), *element, empty_metadata_handle())
+            CollectionCommit::sign(
+                &signing_key,
+                source_collection,
+                *element,
+                empty_metadata_handle(),
+            )
         })
         .collect();
 
@@ -87,7 +95,12 @@ fn build(
                     step as u64,
                     &[leaves.trailing_zeros() as u8],
                 );
-                merges.push(CollectionMerge::new(source.id(), current, next, result));
+                merges.push(CollectionMerge::new(
+                    source_collection,
+                    current,
+                    next,
+                    result,
+                ));
                 all_elements.push(result);
                 current = result;
             }
@@ -105,7 +118,12 @@ fn build(
                         &[leaves.trailing_zeros() as u8],
                     );
                     node += 1;
-                    merges.push(CollectionMerge::new(source.id(), pair[0], pair[1], result));
+                    merges.push(CollectionMerge::new(
+                        source_collection,
+                        pair[0],
+                        pair[1],
+                        result,
+                    ));
                     all_elements.push(result);
                     next_level.push(result);
                 }
@@ -123,12 +141,24 @@ fn build(
     };
     let derives: Vec<_> = mapped_inputs
         .iter()
-        .map(|input| CollectionDerive::new(source.id(), target.id(), *input, mapped(*input)))
+        .map(|input| {
+            CollectionDerive::new(source_collection, target_collection, *input, mapped(*input))
+        })
         .collect();
 
     let mut store = MemoryRepo::default();
-    CollectionStore::insert(&mut store, CollectionRecord::Definition(source)).unwrap();
-    CollectionStore::insert(&mut store, CollectionRecord::Definition(target)).unwrap();
+    assert_eq!(
+        store
+            .put::<SimpleArchive, _>(CollectionDescriptor::to_blob(&source))
+            .unwrap(),
+        source_collection
+    );
+    assert_eq!(
+        store
+            .put::<SimpleArchive, _>(CollectionDescriptor::to_blob(&target))
+            .unwrap(),
+        target_collection
+    );
     for record in &commits {
         CollectionStore::insert(&mut store, CollectionRecord::Commit(*record)).unwrap();
     }
@@ -143,7 +173,7 @@ fn build(
     (
         records,
         authorized,
-        target.id(),
+        target_collection,
         all_elements.len(),
         derives.len(),
     )

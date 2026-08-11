@@ -507,8 +507,11 @@ mod instrumentation_tests {
     use std::fs::File;
 
     use triblespace_core::blob::encodings::longstring::LongString;
+    use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace_core::blob::Blob;
-    use triblespace_core::collection::{self, CollectionRecord, CollectionStore};
+    use triblespace_core::collection::{
+        self, CollectionDescriptor, CollectionRecord, CollectionStore,
+    };
     use triblespace_core::inline::encodings::hash::Handle;
     use triblespace_core::repo::{BlobStore, BlobStoreGet, StorageClose};
 
@@ -606,15 +609,7 @@ mod instrumentation_tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(records.len(), 2, "one definition and one commit");
-
-        let definition = records
-            .iter()
-            .find_map(|record| match record {
-                CollectionRecord::Definition(definition) => Some(*definition),
-                _ => None,
-            })
-            .expect("collection definition");
+        assert_eq!(records.len(), 1, "the descriptor is a blob, not a record");
         let commit = records
             .iter()
             .find_map(|record| match record {
@@ -622,14 +617,17 @@ mod instrumentation_tests {
                 _ => None,
             })
             .expect("single collection commit");
-        assert_eq!(
-            definition,
-            collection::simplearchive_union::definition(scope)
-        );
-        assert_eq!(commit.collection(), definition.id());
         commit.verify_strict().unwrap();
 
         let reader = pile.reader().unwrap();
+        let descriptor_blob: Blob<SimpleArchive> = reader.get(commit.collection()).unwrap();
+        let descriptor = CollectionDescriptor::decode(&descriptor_blob).unwrap();
+        assert_eq!(
+            descriptor,
+            collection::simplearchive_union::descriptor(scope)
+        );
+        assert_eq!(commit.collection(), descriptor.handle());
+
         let _: Blob<LongString> = reader.get(attachment).unwrap();
         StorageClose::close(pile).unwrap();
     }
