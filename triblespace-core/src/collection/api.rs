@@ -739,16 +739,55 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::convert::Infallible;
 
     use super::*;
 
     use crate::blob::encodings::{longstring::LongString, UnknownBlob};
-    use crate::blob::{Bytes, IntoBlob};
+    use crate::blob::{BlobEncoding, Bytes, IntoBlob};
     use crate::collection::{discover_collection_records, CollectionMerge, CollectionRecord};
     use crate::inline::encodings::hash::Handle;
-    use crate::inline::Inline;
+    use crate::inline::{Inline, InlineEncoding};
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::trible::{Trible, TribleSet, TRIBLE_LEN};
+
+    struct EmptyWithoutReader;
+
+    impl CollectionStore for EmptyWithoutReader {
+        type RecordsError = Infallible;
+        type InsertError = Infallible;
+        type RecordIter<'a> = std::iter::Empty<Result<CollectionRecord, Infallible>>;
+
+        fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+            Ok(std::iter::empty())
+        }
+
+        fn insert(&mut self, _record: CollectionRecord) -> Result<(), Self::InsertError> {
+            Ok(())
+        }
+    }
+
+    impl BlobStorePut for EmptyWithoutReader {
+        type PutError = Infallible;
+
+        fn put<S, T>(&mut self, _item: T) -> Result<Inline<Handle<S>>, Self::PutError>
+        where
+            S: BlobEncoding + 'static,
+            T: IntoBlob<S>,
+            Handle<S>: InlineEncoding,
+        {
+            panic!("empty collection must not put a blob")
+        }
+    }
+
+    impl BlobStore for EmptyWithoutReader {
+        type Reader = <MemoryRepo as BlobStore>::Reader;
+        type ReaderError = Infallible;
+
+        fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
+            panic!("empty collection must not open a blob reader")
+        }
+    }
 
     fn id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
@@ -784,7 +823,7 @@ mod tests {
     }
 
     #[test]
-    fn construction_is_pure_and_derives_the_scoped_definition() {
+    fn construction_is_pure_and_derives_the_scoped_descriptor() {
         let scope = id(1);
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let mut collection = Collection::new(MemoryRepo::default(), scope, signing_key);
@@ -839,8 +878,19 @@ mod tests {
         assert_eq!(collection.storage().blobs.len(), after_second);
 
         let descriptor = *collection.descriptor();
+        let descriptor_handle = descriptor.handle();
+        let reader = collection.storage_mut().reader().unwrap();
+        let descriptor_blob: Blob<SimpleArchive> = reader.get(descriptor_handle).unwrap();
+        assert_eq!(
+            Blob::<SimpleArchive>::new(descriptor_blob.bytes.clone()).get_handle(),
+            descriptor_handle
+        );
+        assert_eq!(
+            CollectionDescriptor::decode(&descriptor_blob).unwrap(),
+            descriptor
+        );
+
         let discovered = discover_collection_records(collection.storage_mut()).unwrap();
-        assert_eq!(discovered.definitions(), &[descriptor]);
         assert_eq!(
             discovered
                 .commits()
@@ -857,17 +907,14 @@ mod tests {
                 .collect::<Result<Vec<CollectionRecord>, _>>()
                 .unwrap()
                 .len(),
-            3
+            2
         );
     }
 
     #[test]
-    fn empty_owned_collection_materializes_without_a_definition() {
-        let mut collection = Collection::new(
-            MemoryRepo::default(),
-            id(1),
-            SigningKey::from_bytes(&[7; 32]),
-        );
+    fn empty_owned_collection_materializes_without_opening_a_blob_reader() {
+        let mut collection =
+            Collection::new(EmptyWithoutReader, id(1), SigningKey::from_bytes(&[7; 32]));
 
         assert_eq!(collection.materialize().unwrap(), TribleSet::new());
     }
@@ -918,7 +965,7 @@ mod tests {
     }
 
     #[test]
-    fn own_commit_without_its_definition_fails_loud() {
+    fn own_commit_without_its_descriptor_blob_fails_loud() {
         let scope = id(1);
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let descriptor = simplearchive_union::descriptor(scope);
@@ -938,8 +985,43 @@ mod tests {
 
         assert!(matches!(
             collection.materialize(),
-            Err(CollectionMaterializationError::MissingDefinition { collection })
+            Err(CollectionMaterializationError::DescriptorGet { collection, .. })
                 if collection == descriptor.handle()
+        ));
+    }
+
+    #[test]
+    fn own_descriptor_bytes_must_match_the_collection_handle() {
+        let scope = id(1);
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let descriptor = simplearchive_union::descriptor(scope);
+        let descriptor_handle = descriptor.handle();
+        let data = archive(1);
+        let metadata: Blob<SimpleArchive> = TribleSet::new().to_blob();
+        let commit = CollectionCommit::sign(
+            &signing_key,
+            descriptor_handle,
+            Handle::<SimpleArchive>::to_hash(data.get_handle()),
+            metadata.get_handle(),
+        );
+        let wrong_descriptor =
+            CollectionDescriptor::to_blob(&simplearchive_union::descriptor(id(2)));
+        let actual = wrong_descriptor.get_handle();
+        let mut storage = MemoryRepo::default();
+        storage.blobs.insert(data);
+        storage.blobs.insert(metadata);
+        storage
+            .blobs
+            .insert(Blob::with_handle(wrong_descriptor.bytes, descriptor_handle));
+        storage.insert(CollectionRecord::Commit(commit)).unwrap();
+        let mut collection = Collection::new(storage, scope, signing_key);
+
+        assert!(matches!(
+            collection.materialize(),
+            Err(CollectionMaterializationError::DescriptorIdentity {
+                expected,
+                actual: observed,
+            }) if expected == descriptor_handle && observed == actual
         ));
     }
 
@@ -965,10 +1047,11 @@ mod tests {
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let mut missing = Collection::new(MemoryRepo::default(), scope, signing_key.clone());
         let missing_commit = missing.commit(fragment(1, false)).unwrap();
-        missing
-            .storage_mut()
-            .blobs
-            .keep([missing_commit.metadata().transmute::<Handle<UnknownBlob>>()]);
+        let missing_descriptor = missing.descriptor().handle();
+        missing.storage_mut().blobs.keep([
+            missing_descriptor.transmute::<Handle<UnknownBlob>>(),
+            missing_commit.metadata().transmute::<Handle<UnknownBlob>>(),
+        ]);
         assert!(matches!(
             missing.materialize(),
             Err(CollectionMaterializationError::CommitDataGet { commit, .. })
@@ -977,10 +1060,11 @@ mod tests {
 
         let mut corrupt = Collection::new(MemoryRepo::default(), scope, signing_key);
         let corrupt_commit = corrupt.commit(fragment(1, false)).unwrap();
-        corrupt
-            .storage_mut()
-            .blobs
-            .keep([corrupt_commit.metadata().transmute::<Handle<UnknownBlob>>()]);
+        let corrupt_descriptor = corrupt.descriptor().handle();
+        corrupt.storage_mut().blobs.keep([
+            corrupt_descriptor.transmute::<Handle<UnknownBlob>>(),
+            corrupt_commit.metadata().transmute::<Handle<UnknownBlob>>(),
+        ]);
         let claimed = Handle::<SimpleArchive>::from_hash(corrupt_commit.data());
         corrupt
             .storage_mut()
@@ -999,11 +1083,12 @@ mod tests {
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let mut missing = Collection::new(MemoryRepo::default(), scope, signing_key.clone());
         let missing_commit = missing.commit(fragment(1, false)).unwrap();
-        missing
-            .storage_mut()
-            .blobs
-            .keep([Handle::<SimpleArchive>::from_hash(missing_commit.data())
-                .transmute::<Handle<UnknownBlob>>()]);
+        let missing_descriptor = missing.descriptor().handle();
+        missing.storage_mut().blobs.keep([
+            missing_descriptor.transmute::<Handle<UnknownBlob>>(),
+            Handle::<SimpleArchive>::from_hash(missing_commit.data())
+                .transmute::<Handle<UnknownBlob>>(),
+        ]);
         assert!(matches!(
             missing.materialize(),
             Err(CollectionMaterializationError::CommitMetadataGet { commit, .. })
@@ -1012,11 +1097,12 @@ mod tests {
 
         let mut corrupt = Collection::new(MemoryRepo::default(), scope, signing_key);
         let corrupt_commit = corrupt.commit(fragment(1, false)).unwrap();
-        corrupt
-            .storage_mut()
-            .blobs
-            .keep([Handle::<SimpleArchive>::from_hash(corrupt_commit.data())
-                .transmute::<Handle<UnknownBlob>>()]);
+        let corrupt_descriptor = corrupt.descriptor().handle();
+        corrupt.storage_mut().blobs.keep([
+            corrupt_descriptor.transmute::<Handle<UnknownBlob>>(),
+            Handle::<SimpleArchive>::from_hash(corrupt_commit.data())
+                .transmute::<Handle<UnknownBlob>>(),
+        ]);
         corrupt.storage_mut().blobs.insert(Blob::with_handle(
             Bytes::from(vec![0; 63]),
             corrupt_commit.metadata(),
@@ -1037,11 +1123,11 @@ mod tests {
         );
         let commit = collection.commit(fragment(1, false)).unwrap();
         let wrong_metadata = archive(9);
-        collection
-            .storage_mut()
-            .blobs
-            .keep([Handle::<SimpleArchive>::from_hash(commit.data())
-                .transmute::<Handle<UnknownBlob>>()]);
+        let descriptor = collection.descriptor().handle();
+        collection.storage_mut().blobs.keep([
+            descriptor.transmute::<Handle<UnknownBlob>>(),
+            Handle::<SimpleArchive>::from_hash(commit.data()).transmute::<Handle<UnknownBlob>>(),
+        ]);
         collection
             .storage_mut()
             .blobs
@@ -1116,6 +1202,7 @@ mod tests {
         )
         .unwrap();
         collection.storage_mut().blobs.keep([
+            descriptor.handle().transmute(),
             Handle::<SimpleArchive>::from_hash(first_commit.data()).transmute(),
             first_commit.metadata().transmute(),
             Handle::<SimpleArchive>::from_hash(second_commit.data()).transmute(),
@@ -1182,6 +1269,7 @@ mod tests {
                 .unwrap();
 
         let mut keep = Vec::new();
+        keep.push(descriptor.handle().transmute());
         for commit in commits {
             keep.push(Handle::<SimpleArchive>::from_hash(commit.data()).transmute());
             keep.push(commit.metadata().transmute());
@@ -1218,6 +1306,7 @@ mod tests {
         let merged_handle = merged.get_handle();
 
         collection.storage_mut().blobs.keep([
+            descriptor.handle().transmute(),
             Handle::<SimpleArchive>::from_hash(left.data()).transmute(),
             left.metadata().transmute(),
             Handle::<SimpleArchive>::from_hash(right.data()).transmute(),
@@ -1246,7 +1335,7 @@ mod tests {
         let left = collection.commit(left_fragment).unwrap();
         let right = collection.commit(right_fragment).unwrap();
         let broken = CollectionMerge::new(
-            collection.descriptor().id(),
+            collection.descriptor().handle(),
             left.data(),
             right.data(),
             left.data(),
