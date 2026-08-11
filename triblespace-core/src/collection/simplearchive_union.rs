@@ -1178,15 +1178,16 @@ mod tests {
 
         let derive = CollectionDerive::new(
             source_descriptor.handle(),
-            target.id(),
+            target.handle(),
             expected.data(),
             Inline::new([0x42; 32]),
         );
         let derive_record = CollectionRecord::Derive(derive);
-        let descriptor_blob = CollectionRecord::Descriptor(source_descriptor);
         let commit_record = CollectionRecord::Commit(expected);
         let sequence = [
-            vec![insert_event(descriptor_blob)],
+            vec![put_event(&CollectionDescriptor::to_blob(
+                &source_descriptor,
+            ))],
             embedded,
             vec![
                 put_event(&content_archive),
@@ -1239,10 +1240,14 @@ mod tests {
         {
             let discovered = discover_collection_records(staged.store_mut()).unwrap();
             let reader = staged.store_mut().reader().unwrap();
-            assert_eq!(discovered.definitions(), &[descriptor.clone()]);
             assert!(discovered.commits().is_empty());
             assert!(discovered.merges().is_empty());
             assert!(discovered.derives().is_empty());
+            let descriptor_blob: Blob<SimpleArchive> = reader.get(descriptor.handle()).unwrap();
+            assert_eq!(
+                CollectionDescriptor::decode(&descriptor_blob).unwrap(),
+                descriptor
+            );
 
             let resolution = resolve_collection_semantics(&discovered, &BTreeSet::new(), |_| {
                 Ok::<_, Infallible>(CollectionClaimValidation::<()>::Pending)
@@ -1277,12 +1282,16 @@ mod tests {
         let mut reopened = Pile::open(&path).unwrap();
         let discovered = discover_collection_records(&mut reopened).unwrap();
         let reader = reopened.reader().unwrap();
-        assert_eq!(discovered.definitions(), &[descriptor]);
         assert!(discovered.commits().is_empty());
         assert!(!discovered
             .commits()
             .iter()
             .any(|commit| commit.id() == withheld.id()));
+        let descriptor_blob: Blob<SimpleArchive> = reader.get(descriptor.handle()).unwrap();
+        assert_eq!(
+            CollectionDescriptor::decode(&descriptor_blob).unwrap(),
+            descriptor
+        );
         drop(reader);
         reopened.close().unwrap();
     }
@@ -1321,7 +1330,7 @@ mod tests {
         let forged_data = Blob::with_handle(data_blob.bytes.clone(), bogus.get_handle());
         let forged_metadata = Blob::with_handle(metadata.bytes.clone(), bogus.get_handle());
         let sequence = vec![
-            insert_event(CollectionRecord::Descriptor(descriptor)),
+            put_event(&CollectionDescriptor::to_blob(&descriptor)),
             put_event(&data_blob),
             put_event(&metadata),
             ProbeEvent::Flush,
@@ -1357,14 +1366,14 @@ mod tests {
         let mut expected_events = sequence.clone();
         expected_events.extend(sequence);
         assert_eq!(store.events, expected_events);
-        let expected_handles =
-            BTreeSet::from([data_blob.get_handle().raw, metadata.get_handle().raw]);
+        let expected_handles = BTreeSet::from([
+            descriptor.handle().raw,
+            data_blob.get_handle().raw,
+            metadata.get_handle().raw,
+        ]);
         assert_eq!(store.known, expected_handles);
         assert_eq!(store.durable, expected_handles);
-        assert_eq!(
-            store.durable_records,
-            BTreeSet::from([descriptor.handle(), expected.id()])
-        );
+        assert_eq!(store.durable_records, BTreeSet::from([expected.id()]));
         assert!(store.pending.is_empty());
         assert!(store.pending_records.is_empty());
         assert!(!store.known.contains(&bogus.get_handle().raw));
@@ -1385,7 +1394,7 @@ mod tests {
             metadata_archive.get_handle(),
         );
         let sequence = [
-            vec![insert_event(CollectionRecord::Descriptor(descriptor))],
+            vec![put_event(&CollectionDescriptor::to_blob(&descriptor))],
             embedded.clone(),
             vec![
                 put_event(&content_archive),
@@ -1420,15 +1429,13 @@ mod tests {
             })
             .collect();
         expected_handles.extend([
+            descriptor.handle().raw,
             content_archive.get_handle().raw,
             metadata_archive.get_handle().raw,
         ]);
         assert_eq!(store.known, expected_handles);
         assert_eq!(store.durable, expected_handles);
-        assert_eq!(
-            store.durable_records,
-            BTreeSet::from([descriptor.handle(), expected.id()])
-        );
+        assert_eq!(store.durable_records, BTreeSet::from([expected.id()]));
         assert!(store.pending.is_empty());
         assert!(store.pending_records.is_empty());
     }
@@ -1504,7 +1511,7 @@ mod tests {
             data(&expected_result),
         );
         let sequence = vec![
-            insert_event(CollectionRecord::Descriptor(descriptor)),
+            put_event(&CollectionDescriptor::to_blob(&descriptor)),
             put_event(low),
             put_event(high),
             put_event(&expected_result),
@@ -1525,16 +1532,14 @@ mod tests {
         expected_events.extend(sequence);
         assert_eq!(store.events, expected_events);
         let expected_handles = BTreeSet::from([
+            descriptor.handle().raw,
             low.get_handle().raw,
             high.get_handle().raw,
             expected_result.get_handle().raw,
         ]);
         assert_eq!(store.known, expected_handles);
         assert_eq!(store.durable, expected_handles);
-        assert_eq!(
-            store.durable_records,
-            BTreeSet::from([descriptor.handle(), expected_merge.id()])
-        );
+        assert_eq!(store.durable_records, BTreeSet::from([expected_merge.id()]));
         assert!(store.pending.is_empty());
         assert!(store.pending_records.is_empty());
         assert!(!store.known.contains(&bogus.get_handle().raw));
@@ -1543,7 +1548,11 @@ mod tests {
     #[test]
     fn commit_publication_orders_completed_prefixes_and_replays_after_recovery() {
         let (descriptor, data_blob, metadata, signing_key, expected) = commit_fixture();
-        let dependencies = BTreeSet::from([data_blob.get_handle().raw, metadata.get_handle().raw]);
+        let dependencies = BTreeSet::from([
+            descriptor.handle().raw,
+            data_blob.get_handle().raw,
+            metadata.get_handle().raw,
+        ]);
 
         for fail_at in 1..=6 {
             let mut store = ProbeStore::failing_before_effect_at(fail_at);
@@ -1551,8 +1560,7 @@ mod tests {
                 publish_commit(&mut store, &descriptor, &data_blob, &metadata, &signing_key)
                     .unwrap_err();
             match (fail_at, error) {
-                (1, PublicationError::DefinitionInsert(ProbeFailure(at)))
-                | (2..=3, PublicationError::DependencyPut(ProbeFailure(at)))
+                (1..=3, PublicationError::DependencyPut(ProbeFailure(at)))
                 | (4, PublicationError::DependencyFlush(ProbeFailure(at)))
                 | (5, PublicationError::RecordInsert(ProbeFailure(at)))
                 | (6, PublicationError::RecordFlush(ProbeFailure(at))) => {
@@ -1567,7 +1575,6 @@ mod tests {
             } else {
                 assert_eq!(store.events[3], ProbeEvent::Flush);
                 assert!(dependencies.is_subset(&store.durable));
-                assert!(store.durable_records.contains(&descriptor.handle()));
             }
 
             store.recover();
@@ -1576,7 +1583,6 @@ mod tests {
                     .unwrap();
             assert_eq!(retried, expected);
             assert!(dependencies.is_subset(&store.durable));
-            assert!(store.durable_records.contains(&descriptor.handle()));
             assert!(store.durable_records.contains(&expected.id()));
         }
     }
@@ -1591,6 +1597,7 @@ mod tests {
         let expected =
             CollectionMerge::new(descriptor.handle(), data(low), data(high), data(&result));
         let dependencies = BTreeSet::from([
+            descriptor.handle().raw,
             low.get_handle().raw,
             high.get_handle().raw,
             result.get_handle().raw,
@@ -1600,8 +1607,7 @@ mod tests {
             let mut store = ProbeStore::failing_before_effect_at(fail_at);
             let error = publish_merge(&mut store, &descriptor, &left, &right).unwrap_err();
             match (fail_at, error) {
-                (1, PublicationError::DefinitionInsert(ProbeFailure(at)))
-                | (2..=4, PublicationError::DependencyPut(ProbeFailure(at)))
+                (1..=4, PublicationError::DependencyPut(ProbeFailure(at)))
                 | (5, PublicationError::DependencyFlush(ProbeFailure(at)))
                 | (6, PublicationError::RecordInsert(ProbeFailure(at)))
                 | (7, PublicationError::RecordFlush(ProbeFailure(at))) => {
@@ -1616,14 +1622,12 @@ mod tests {
             } else {
                 assert_eq!(store.events[4], ProbeEvent::Flush);
                 assert!(dependencies.is_subset(&store.durable));
-                assert!(store.durable_records.contains(&descriptor.handle()));
             }
 
             store.recover();
             let retried = publish_merge(&mut store, &descriptor, &left, &right).unwrap();
             assert_eq!(retried, (expected.clone(), result.clone()));
             assert!(dependencies.is_subset(&store.durable));
-            assert!(store.durable_records.contains(&descriptor.handle()));
             assert!(store.durable_records.contains(&expected.id()));
         }
     }
@@ -1711,16 +1715,20 @@ mod tests {
         let mut reopened = Pile::open(&path).unwrap();
         let discovered = discover_collection_records(&mut reopened).unwrap();
         let reader = reopened.reader().unwrap();
-        assert_eq!(discovered.definitions(), &[descriptor.clone()]);
         assert_eq!(discovered.commits(), &[commit.clone()]);
         assert_eq!(discovered.merges(), &[merge.clone()]);
         assert!(discovered.derives().is_empty());
         assert!(discovered.diagnostics().is_empty());
 
+        let fetched_descriptor: Blob<SimpleArchive> = reader.get(descriptor.handle()).unwrap();
         let fetched_left: Blob<SimpleArchive> = reader.get(left.get_handle()).unwrap();
         let fetched_right: Blob<SimpleArchive> = reader.get(right.get_handle()).unwrap();
         let fetched_metadata: Blob<SimpleArchive> = reader.get(metadata.get_handle()).unwrap();
         let fetched_result: Blob<SimpleArchive> = reader.get(result.get_handle()).unwrap();
+        assert_eq!(
+            CollectionDescriptor::decode(&fetched_descriptor).unwrap(),
+            descriptor
+        );
         assert_eq!(fetched_left, left);
         assert_eq!(fetched_right, right);
         assert_eq!(fetched_metadata, metadata);
@@ -1756,15 +1764,19 @@ mod tests {
         let mut reopened = Pile::open(&path).unwrap();
         let discovered = discover_collection_records(&mut reopened).unwrap();
         let reader = reopened.reader().unwrap();
-        assert_eq!(discovered.definitions(), &[descriptor.clone()]);
         assert_eq!(discovered.commits(), &[commit.clone()]);
         assert!(discovered.merges().is_empty());
         assert!(discovered.derives().is_empty());
         assert!(discovered.diagnostics().is_empty());
 
+        let fetched_descriptor: Blob<SimpleArchive> = reader.get(descriptor.handle()).unwrap();
         let content_handle: Inline<Handle<SimpleArchive>> = commit.data().transmute();
         let fetched_content: Blob<SimpleArchive> = reader.get(content_handle).unwrap();
         let fetched_metadata: Blob<SimpleArchive> = reader.get(commit.metadata()).unwrap();
+        assert_eq!(
+            CollectionDescriptor::decode(&fetched_descriptor).unwrap(),
+            descriptor
+        );
         assert_eq!(fetched_content, expected_content);
         assert_eq!(fetched_metadata, expected_metadata);
         validate_commit(&descriptor, &commit, &fetched_content).unwrap();
@@ -1779,7 +1791,7 @@ mod tests {
     }
 
     #[test]
-    fn definition_and_empty_element_are_golden() {
+    fn descriptor_and_empty_element_are_golden() {
         let descriptor = descriptor(id(1));
         assert_eq!(
             <SimpleArchive as MetaDescribe>::id(),
@@ -1791,12 +1803,16 @@ mod tests {
         );
         assert_eq!(descriptor.scope(), id(1));
         assert_eq!(
-            descriptor.handle(),
+            descriptor.entity_id(),
             id_hex!("4B6F24A289B950F2CF20896EAB7A1658")
         );
         assert_eq!(
-            CollectionDescriptor::to_blob(&descriptor).get_handle().raw,
+            descriptor.handle().raw,
             hex!("A639BFB1D8F4DD5E9AF4667512A23673812866F2CBF01D3F11DEF89850FA65B9")
+        );
+        assert_eq!(
+            CollectionDescriptor::to_blob(&descriptor).get_handle(),
+            descriptor.handle()
         );
 
         let empty: Blob<SimpleArchive> = TribleSet::new().to_blob();
@@ -1859,7 +1875,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_validation_binds_definition_collection_handle_and_bytes() {
+    fn commit_validation_binds_descriptor_collection_handle_and_bytes() {
         let descriptor = descriptor(id(1));
         let blob = archive([row(1, 1, 1)]);
         let commit = CollectionCommit::sign(
@@ -1946,7 +1962,12 @@ mod tests {
         let (low, high) = ordered_inputs(&left, &right);
         validate_merge(&descriptor, &claim, low, high, &result).unwrap();
 
-        let wrong_collection = CollectionMerge::new(id(9), data(low), data(high), data(&result));
+        let wrong_collection = CollectionMerge::new(
+            super::descriptor(id(9)).handle(),
+            data(low),
+            data(high),
+            data(&result),
+        );
         assert!(matches!(
             validate_merge(&descriptor, &wrong_collection, low, high, &result),
             Err(SimpleArchiveUnionValidationError::WrongCollection { .. })
@@ -2053,7 +2074,7 @@ mod tests {
                 prop_assert_eq!(&actual, &expected);
                 let collection = descriptor(id(1));
                 let claim = CollectionMerge::new(
-                    collection.id(),
+                    collection.handle(),
                     data(&left),
                     data(&right),
                     data(&actual),
