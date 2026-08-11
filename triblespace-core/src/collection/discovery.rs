@@ -12,8 +12,8 @@ use std::fmt;
 use crate::id::Id;
 
 use super::{
-    CollectionCommit, CollectionDefinition, CollectionDerive, CollectionMerge, CollectionRecord,
-    CollectionStore, CommitVerificationError,
+    CollectionCommit, CollectionDerive, CollectionMerge, CollectionRecord, CollectionStore,
+    CommitVerificationError,
 };
 
 /// One collection record with a discovery-time validation failure.
@@ -54,7 +54,6 @@ impl Error for CollectionRecordDiagnosticError {
 /// result therefore does not expose backend enumeration or append order.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DiscoveredCollectionRecords {
-    definitions: Vec<CollectionDefinition>,
     commits: Vec<CollectionCommit>,
     merges: Vec<CollectionMerge>,
     derives: Vec<CollectionDerive>,
@@ -62,11 +61,6 @@ pub struct DiscoveredCollectionRecords {
 }
 
 impl DiscoveredCollectionRecords {
-    /// Canonical collection definitions, ordered by intrinsic id.
-    pub fn definitions(&self) -> &[CollectionDefinition] {
-        &self.definitions
-    }
-
     /// Commits with valid strict self-signatures, ordered by intrinsic id.
     ///
     /// Signature validity does not authorize the signing key. Callers apply
@@ -92,9 +86,6 @@ impl DiscoveredCollectionRecords {
     }
 
     fn canonicalize(&mut self) {
-        self.definitions
-            .sort_unstable_by_key(CollectionDefinition::id);
-        self.definitions.dedup_by_key(|record| record.id());
         self.commits.sort_unstable_by_key(CollectionCommit::id);
         self.commits.dedup_by_key(|record| record.id());
         self.merges.sort_unstable_by_key(CollectionMerge::id);
@@ -157,7 +148,6 @@ where
     for record in records {
         let record = record.map_err(CollectionDiscoveryError::Records)?;
         match record {
-            CollectionRecord::Definition(record) => discovered.definitions.push(record),
             CollectionRecord::Commit(record) => match record.verify_strict() {
                 Ok(()) => discovered.commits.push(record),
                 Err(error) => discovered.diagnostics.push(CollectionRecordDiagnostic {
@@ -182,7 +172,7 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
 
-    use crate::collection::{empty_metadata_handle, CollectionData};
+    use crate::collection::{CollectionData, CollectionId, empty_metadata_handle};
     use crate::inline::Inline;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -220,24 +210,23 @@ mod tests {
         }
     }
 
-    fn id(byte: u8) -> Id {
-        Id::new([byte; 16]).unwrap()
-    }
-
     fn hash(byte: u8) -> CollectionData {
         Inline::new([byte; 32])
     }
 
+    fn collection(byte: u8) -> CollectionId {
+        Inline::new([byte; 32])
+    }
+
     fn fixture_records() -> (Vec<CollectionRecord>, CollectionCommit) {
-        let definition = CollectionDefinition::new(id(1), id(2), id(3));
         let commit = CollectionCommit::sign(
             &SigningKey::from_bytes(&[7; 32]),
-            definition.id(),
+            collection(1),
             hash(4),
             empty_metadata_handle(),
         );
-        let merge = CollectionMerge::new(definition.id(), hash(4), hash(5), hash(6));
-        let derive = CollectionDerive::new(definition.id(), id(7), hash(4), hash(8));
+        let merge = CollectionMerge::new(collection(1), hash(4), hash(5), hash(6));
+        let derive = CollectionDerive::new(collection(1), collection(7), hash(4), hash(8));
 
         let (r, mut s) = commit.signature();
         s.raw[0] ^= 1;
@@ -252,7 +241,6 @@ mod tests {
 
         (
             vec![
-                CollectionRecord::Definition(definition),
                 CollectionRecord::Commit(commit),
                 CollectionRecord::Merge(merge),
                 CollectionRecord::Derive(derive),
@@ -278,7 +266,6 @@ mod tests {
         let reverse_records = discover_collection_records(&mut reverse).unwrap();
 
         assert_eq!(forward_records, reverse_records);
-        assert_eq!(forward_records.definitions().len(), 1);
         assert_eq!(forward_records.commits().len(), 1);
         assert_eq!(forward_records.merges().len(), 1);
         assert_eq!(forward_records.derives().len(), 1);
