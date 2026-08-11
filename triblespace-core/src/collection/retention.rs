@@ -193,8 +193,8 @@ mod tests {
     use crate::collection::simplearchive_union::{self, SimpleArchiveUnionValidationError};
     use crate::collection::{
         discover_collection_records, resolve_collection_semantics, CollectionClaimValidation,
-        CollectionCommit, CollectionDerive, CollectionMerge, CollectionRecord, CollectionStore,
-        CollectionValidationRequest,
+        CollectionCommit, CollectionDerive, CollectionDescriptor, CollectionId, CollectionMerge,
+        CollectionRecord, CollectionStore, CollectionValidationRequest,
     };
     use crate::inline::encodings::hash::{Blake3, Hash};
     use crate::macros::entity;
@@ -232,6 +232,17 @@ mod tests {
         reader.get(Handle::<SimpleArchive>::from_hash(data)).ok()
     }
 
+    fn load_descriptor<R: BlobStoreGet>(
+        reader: &R,
+        collection: CollectionId,
+    ) -> Option<CollectionDescriptor> {
+        let blob: Blob<SimpleArchive> = reader.get(collection).ok()?;
+        let blob = Blob::<SimpleArchive>::new(blob.bytes.clone());
+        (blob.get_handle() == collection)
+            .then(|| CollectionDescriptor::decode(&blob).ok())
+            .flatten()
+    }
+
     fn validate_union<R: BlobStoreGet>(
         reader: &R,
         durable: &BTreeSet<Id>,
@@ -242,16 +253,22 @@ mod tests {
         }
 
         let verdict = match request {
-            CollectionValidationRequest::Commit { descriptor, claim } => {
+            CollectionValidationRequest::Commit { claim } => {
+                let Some(descriptor) = load_descriptor(reader, claim.collection()) else {
+                    return Ok(CollectionClaimValidation::Pending);
+                };
                 let Some(blob) = load_archive(reader, claim.data()) else {
                     return Ok(CollectionClaimValidation::Pending);
                 };
-                match simplearchive_union::validate_commit(descriptor, claim, &blob) {
+                match simplearchive_union::validate_commit(&descriptor, claim, &blob) {
                     Ok(()) => CollectionClaimValidation::Accepted,
                     Err(error) => CollectionClaimValidation::Rejected(error),
                 }
             }
-            CollectionValidationRequest::Merge { descriptor, claim } => {
+            CollectionValidationRequest::Merge { claim } => {
+                let Some(descriptor) = load_descriptor(reader, claim.collection()) else {
+                    return Ok(CollectionClaimValidation::Pending);
+                };
                 let (low, high) = claim.inputs();
                 let (Some(low), Some(high), Some(result)) = (
                     load_archive(reader, low),
@@ -260,7 +277,8 @@ mod tests {
                 ) else {
                     return Ok(CollectionClaimValidation::Pending);
                 };
-                match simplearchive_union::validate_merge(descriptor, claim, &low, &high, &result) {
+                match simplearchive_union::validate_merge(&descriptor, claim, &low, &high, &result)
+                {
                     Ok(()) => CollectionClaimValidation::Accepted,
                     Err(error) => CollectionClaimValidation::Rejected(error),
                 }
@@ -282,7 +300,7 @@ mod tests {
 
     fn insert_record_fixture(
         store: &mut MemoryRepo,
-        descriptor: &super::super::CollectionDescriptor,
+        descriptor: &CollectionDescriptor,
         data: Blob<SimpleArchive>,
         metadata: Blob<SimpleArchive>,
         key: &SigningKey,
@@ -293,7 +311,7 @@ mod tests {
             self::data(&data),
             metadata.get_handle(),
         );
-        CollectionStore::insert(store, CollectionRecord::Descriptor(*descriptor)).unwrap();
+        store.blobs.insert(descriptor.to_blob());
         store.blobs.insert(data);
         store.blobs.insert(metadata);
         CollectionStore::insert(store, CollectionRecord::Commit(commit)).unwrap();
@@ -338,15 +356,23 @@ mod tests {
         let recursive: BTreeSet<_> = roots.recursive().collect();
         assert_eq!(
             recursive,
-            BTreeSet::from([content_handle.transmute(), metadata_handle.transmute()])
+            BTreeSet::from([
+                descriptor.handle().transmute(),
+                content_handle.transmute(),
+                metadata_handle.transmute(),
+            ])
         );
         let keep = roots.expanded(&reader);
 
         store.keep(keep);
         let retained_records = discover_collection_records(&mut store).unwrap();
-        assert_eq!(retained_records.definitions(), &[descriptor]);
         assert_eq!(retained_records.commits(), &[commit]);
         let reader = store.reader().unwrap();
+        let retained_descriptor: Blob<SimpleArchive> = reader.get(descriptor.handle()).unwrap();
+        assert_eq!(
+            CollectionDescriptor::decode(&retained_descriptor).unwrap(),
+            descriptor
+        );
         assert!(reader
             .get::<Blob<SimpleArchive>, _>(Handle::from_hash(commit.data()))
             .is_ok());
@@ -386,19 +412,19 @@ mod tests {
             empty_metadata.clone(),
             &key,
         );
-        CollectionStore::insert(&mut store, CollectionRecord::Descriptor(target)).unwrap();
+        store.blobs.insert(target.to_blob());
 
         let active_merge_result = simplearchive_union::join(&left, &right).unwrap();
         let active_merge = CollectionMerge::new(
-            source.id(),
+            source.handle(),
             data(&left),
             data(&right),
             data(&active_merge_result),
         );
         let active_derive_output = archive([row(3, 1, 3)]);
         let active_derive = CollectionDerive::new(
-            source.id(),
-            target.id(),
+            source.handle(),
+            target.handle(),
             data(&active_merge_result),
             data(&active_derive_output),
         );
@@ -407,15 +433,15 @@ mod tests {
         let orphan_right = archive([row(5, 1, 5)]);
         let orphan_merge_result = simplearchive_union::join(&orphan_left, &orphan_right).unwrap();
         let orphan_merge = CollectionMerge::new(
-            source.id(),
+            source.handle(),
             data(&orphan_left),
             data(&orphan_right),
             data(&orphan_merge_result),
         );
         let orphan_derive_output = archive([row(6, 1, 6)]);
         let orphan_derive = CollectionDerive::new(
-            source.id(),
-            target.id(),
+            source.handle(),
+            target.handle(),
             data(&orphan_merge_result),
             data(&orphan_derive_output),
         );
@@ -470,6 +496,7 @@ mod tests {
         assert_eq!(
             recursive,
             BTreeSet::from([
+                source.handle().transmute(),
                 left.get_handle().transmute(),
                 right.get_handle().transmute(),
                 empty_metadata.get_handle().transmute(),
@@ -503,8 +530,8 @@ mod tests {
         );
 
         let mut complete = MemoryRepo::default();
-        CollectionStore::insert(&mut complete, CollectionRecord::Descriptor(descriptor)).unwrap();
         CollectionStore::insert(&mut complete, CollectionRecord::Commit(commit)).unwrap();
+        complete.blobs.insert(descriptor.to_blob());
         complete.blobs.insert(content.clone());
         complete.blobs.insert(metadata.clone());
         let records = discover_collection_records(&mut complete).unwrap();
@@ -516,16 +543,18 @@ mod tests {
             .unwrap();
         plan_collection_retention(&records, &resolution, &complete_reader).unwrap();
 
-        let mut missing_definition = MemoryRepo::default();
-        CollectionStore::insert(&mut missing_definition, CollectionRecord::Commit(commit)).unwrap();
-        let missing_records = discover_collection_records(&mut missing_definition).unwrap();
+        let mut missing_descriptor = MemoryBlobStore::new();
+        missing_descriptor.insert(content.clone());
+        missing_descriptor.insert(metadata.clone());
+        let reader = missing_descriptor.reader().unwrap();
         assert!(matches!(
-            plan_collection_retention(&missing_records, &resolution, &complete_reader),
-            Err(CollectionRetentionError::MissingDefinition { collection })
+            plan_collection_retention(&records, &resolution, &reader),
+            Err(CollectionRetentionError::MissingDescriptor { collection })
                 if collection == descriptor.handle()
         ));
 
         let mut missing_data = MemoryBlobStore::new();
+        missing_data.insert(descriptor.to_blob());
         missing_data.insert(metadata.clone());
         let reader = missing_data.reader().unwrap();
         assert!(matches!(
@@ -535,6 +564,7 @@ mod tests {
         ));
 
         let mut missing_metadata = MemoryBlobStore::new();
+        missing_metadata.insert(descriptor.to_blob());
         missing_metadata.insert(content);
         let reader = missing_metadata.reader().unwrap();
         assert!(matches!(

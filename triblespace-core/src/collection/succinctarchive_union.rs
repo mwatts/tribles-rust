@@ -431,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn definitions_share_scope_and_union_law_but_not_representation() {
+    fn descriptors_share_scope_and_union_law_but_not_representation() {
         let source = simplearchive_union::descriptor(id(1));
         let target = descriptor(id(1));
 
@@ -446,7 +446,7 @@ mod tests {
             target.representation(),
             <SuccinctArchiveBlob as MetaDescribe>::id()
         );
-        assert_ne!(source.id(), target.id());
+        assert_ne!(source.handle(), target.handle());
     }
 
     #[test]

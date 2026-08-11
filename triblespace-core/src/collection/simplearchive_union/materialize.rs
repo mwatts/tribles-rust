@@ -329,7 +329,6 @@ mod tests {
             .collect();
 
         let mut records = MemoryRepo::default();
-        CollectionStore::insert(&mut records, CollectionRecord::Descriptor(*descriptor)).unwrap();
         for commit in &commits {
             CollectionStore::insert(&mut records, CollectionRecord::Commit(*commit)).unwrap();
         }
@@ -465,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn wrong_definition_fails_before_store_access() {
+    fn wrong_descriptor_fails_before_store_access() {
         let wrong =
             CollectionDescriptor::new(id(1), id(2), super::super::TRIBLE_SET_UNION_RECIPE_V1);
         let reader = ProbeReader::default();
