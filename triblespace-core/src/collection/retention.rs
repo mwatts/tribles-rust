@@ -412,7 +412,7 @@ mod tests {
             empty_metadata.clone(),
             &key,
         );
-        store.blobs.insert(target.to_blob());
+        store.blobs.insert(CollectionDescriptor::to_blob(&target));
 
         let active_merge_result = simplearchive_union::join(&left, &right).unwrap();
         let active_merge = CollectionMerge::new(
@@ -531,7 +531,9 @@ mod tests {
 
         let mut complete = MemoryRepo::default();
         CollectionStore::insert(&mut complete, CollectionRecord::Commit(commit)).unwrap();
-        complete.blobs.insert(descriptor.to_blob());
+        complete
+            .blobs
+            .insert(CollectionDescriptor::to_blob(&descriptor));
         complete.blobs.insert(content.clone());
         complete.blobs.insert(metadata.clone());
         let records = discover_collection_records(&mut complete).unwrap();
@@ -554,7 +556,7 @@ mod tests {
         ));
 
         let mut missing_data = MemoryBlobStore::new();
-        missing_data.insert(descriptor.to_blob());
+        missing_data.insert(CollectionDescriptor::to_blob(&descriptor));
         missing_data.insert(metadata.clone());
         let reader = missing_data.reader().unwrap();
         assert!(matches!(
@@ -564,7 +566,7 @@ mod tests {
         ));
 
         let mut missing_metadata = MemoryBlobStore::new();
-        missing_metadata.insert(descriptor.to_blob());
+        missing_metadata.insert(CollectionDescriptor::to_blob(&descriptor));
         missing_metadata.insert(content);
         let reader = missing_metadata.reader().unwrap();
         assert!(matches!(

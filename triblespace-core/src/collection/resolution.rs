@@ -1035,7 +1035,7 @@ mod tests {
     use crate::blob::encodings::simplearchive::SimpleArchive;
     use crate::blob::{Blob, IntoBlob};
     use crate::collection::simplearchive_union::{self, SimpleArchiveUnionValidationError};
-    use crate::collection::{CollectionRecord, CollectionStore};
+    use crate::collection::{CollectionDescriptor, CollectionRecord, CollectionStore};
     use crate::inline::encodings::hash::{Blake3, Handle, Hash};
     use crate::inline::Inline;
     use crate::repo::{memoryrepo::MemoryRepo, BlobStore, BlobStoreGet};
@@ -1930,7 +1930,7 @@ mod tests {
 
     #[test]
     fn simplearchive_union_validation_integrates_with_discovery_and_resolution() {
-        let definition = simplearchive_union::definition(id(1));
+        let definition = simplearchive_union::descriptor(id(1));
         let left = archive([row(1, 1, 1)]);
         let right = archive([row(2, 1, 2)]);
         let result = simplearchive_union::join(&left, &right).unwrap();
@@ -1945,7 +1945,9 @@ mod tests {
         let authorized = BTreeSet::from([first.id(), second.id()]);
 
         let mut store = MemoryRepo::default();
-        store.blobs.insert(definition.to_blob());
+        store
+            .blobs
+            .insert(CollectionDescriptor::to_blob(&definition));
         for record in [
             CollectionRecord::Commit(first),
             CollectionRecord::Commit(second),
