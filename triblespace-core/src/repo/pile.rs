@@ -3417,7 +3417,7 @@ mod tests {
             collection_test_id(23),
         );
         let descriptor_handle = source
-            .put::<SimpleArchive, _>(descriptor.to_blob())
+            .put::<SimpleArchive, _>(CollectionDescriptor::to_blob(&descriptor))
             .unwrap();
         assert_eq!(descriptor_handle, descriptor.handle());
         let invalid = invalidate_collection_commit(CollectionCommit::sign(
@@ -3574,7 +3574,7 @@ mod tests {
             collection_test_id(12),
         );
         let descriptor_handle = source
-            .put::<SimpleArchive, _>(descriptor.to_blob())
+            .put::<SimpleArchive, _>(CollectionDescriptor::to_blob(&descriptor))
             .unwrap();
         assert_eq!(descriptor_handle, descriptor.handle());
         let key = SigningKey::from_bytes(&[13; 32]);
