@@ -590,9 +590,9 @@ impl Yard {
     /// Add the resident ownership edges carried by strictly verified native
     /// commits. Invalid signatures authenticate no fields. A valid commit is
     /// preserved as a native record even when one of its dependencies is not
-    /// live locally, but only live data and metadata become recursive roots;
-    /// unsigned merge/derive equations are evidence only and never own their
-    /// inputs.
+    /// live locally, but only its live descriptor, data, and metadata become
+    /// recursive roots; unsigned merge/derive equations are evidence only and
+    /// never own their inputs.
     fn retention_with_native_commits(
         &mut self,
         retention: &RetentionRoots,
@@ -609,9 +609,10 @@ impl Yard {
                 continue;
             }
 
+            let descriptor = Inline::<Handle<UnknownBlob>>::new(commit.collection().raw);
             let data = Inline::<Handle<UnknownBlob>>::new(commit.data().raw);
             let metadata = commit.metadata().transmute();
-            for handle in [data, metadata] {
+            for handle in [descriptor, data, metadata] {
                 let live = self.generations.iter().any(|generation| {
                     generation
                         .segments
