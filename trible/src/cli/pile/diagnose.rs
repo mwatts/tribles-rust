@@ -390,7 +390,7 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
                     );
                 }
             }
-            PileRecordContent::Collection { .. } => {
+            PileRecordContent::Collection { .. } | PileRecordContent::LegacyCollectionV3 { .. } => {
                 let raw = &bytes[record.offset..record.offset + record.len];
                 for pos in finder.find_iter(raw) {
                     collection_record_matches += 1;
