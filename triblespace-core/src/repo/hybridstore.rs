@@ -11,7 +11,10 @@ use crate::repo::BlobStore;
 use crate::repo::BlobStorePut;
 use crate::repo::PinStore;
 use crate::repo::PushResult;
+use crate::repo::StorageFlush;
 use crate::repo::WantStore;
+use std::error::Error;
+use std::fmt;
 
 /// Store that delegates blob/want and branch/collection-record operations to
 /// two independent stores.
@@ -33,6 +36,59 @@ impl<B, R> HybridStore<B, R> {
     /// Creates a new [`HybridStore`] from the given blob and branch stores.
     pub fn new(blobs: B, branches: R) -> Self {
         Self { blobs, branches }
+    }
+}
+
+/// Failure while crash-ordering writes across a [`HybridStore`].
+#[derive(Debug)]
+pub enum HybridFlushError<BlobError, RecordError> {
+    /// The content-addressed blob store could not make staged data durable.
+    Blobs(BlobError),
+    /// The record store could not make collection evidence durable.
+    Records(RecordError),
+}
+
+impl<BlobError, RecordError> fmt::Display for HybridFlushError<BlobError, RecordError>
+where
+    BlobError: fmt::Display,
+    RecordError: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Blobs(error) => write!(formatter, "failed to flush hybrid blob store: {error}"),
+            Self::Records(error) => {
+                write!(formatter, "failed to flush hybrid record store: {error}")
+            }
+        }
+    }
+}
+
+impl<BlobError, RecordError> Error for HybridFlushError<BlobError, RecordError>
+where
+    BlobError: Error + 'static,
+    RecordError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Blobs(error) => Some(error),
+            Self::Records(error) => Some(error),
+        }
+    }
+}
+
+impl<B, R> StorageFlush for HybridStore<B, R>
+where
+    B: StorageFlush,
+    R: StorageFlush,
+{
+    type Error = HybridFlushError<B::Error, R::Error>;
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        // Never let authoritative records become durable ahead of the blobs
+        // they name. If the first barrier fails, leave record durability
+        // untouched; if the second fails, only harmless orphan blobs remain.
+        self.blobs.flush().map_err(HybridFlushError::Blobs)?;
+        self.branches.flush().map_err(HybridFlushError::Records)
     }
 }
 
@@ -174,8 +230,10 @@ where
 mod tests {
     use super::*;
 
-    use crate::collection::{CollectionDescriptor, CollectionMerge};
+    use crate::collection::{Collection, CollectionDescriptor, CollectionMerge};
     use crate::repo::memoryrepo::MemoryRepo;
+    use crate::trible::Fragment;
+    use ed25519_dalek::SigningKey;
 
     fn id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
@@ -210,6 +268,20 @@ mod tests {
             CollectionStore::records(&mut hybrid.blobs).unwrap().count(),
             0
         );
+    }
+
+    #[test]
+    fn collection_publication_and_read_work_across_both_sides() {
+        let hybrid = HybridStore::new(MemoryRepo::default(), MemoryRepo::default());
+        let mut collection = Collection::new(hybrid, id(7), SigningKey::from_bytes(&[8; 32]));
+
+        let commit = collection.commit(Fragment::empty()).unwrap();
+        assert_eq!(collection.materialize().unwrap().len(), 0);
+        assert_eq!(commit.collection(), collection.descriptor().handle());
+        assert!(collection.storage().blobs.blobs.len() >= 2);
+        let storage = collection.storage_mut();
+        assert_eq!(storage.branches.records().unwrap().count(), 1);
+        assert_eq!(storage.blobs.records().unwrap().count(), 0);
     }
 
     #[test]
