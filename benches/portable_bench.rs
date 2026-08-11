@@ -228,7 +228,7 @@ const STREAM_CONF_DAMP: &str = "https://dblp.org/streams/conf/damp";
 
 /// The importer's (IRI, value schema) -> attribute derivation.
 fn attr<S: InlineEncoding + MetaDescribe>(iri: &str) -> Attribute<S> {
-    Attribute::<S>::from(entity! {
+    Attribute::<S>::from_fragment_unchecked(entity! {
         metadata::iri:            iri.to_owned().to_blob().get_handle(),
         metadata::value_encoding: <S as MetaDescribe>::id(),
     })

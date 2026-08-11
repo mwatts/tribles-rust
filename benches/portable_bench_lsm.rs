@@ -86,7 +86,7 @@ const DBLP_CREATED_BY: &str = "https://dblp.org/rdf/schema#createdBy";
 const DBLP_NUMBER_OF_CREATORS: &str = "https://dblp.org/rdf/schema#numberOfCreators";
 
 fn attr<S: InlineEncoding + MetaDescribe>(iri: &str) -> Attribute<S> {
-    Attribute::<S>::from(entity! {
+    Attribute::<S>::from_fragment_unchecked(entity! {
         metadata::iri:            iri.to_owned().to_blob().get_handle(),
         metadata::value_encoding: <S as MetaDescribe>::id(),
     })
