@@ -17,7 +17,7 @@ use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::time::NsTAIInterval;
 use triblespace_core::inline::{Inline, TryToInline};
 use triblespace_core::repo::capability::{self, PERM_READ, scope_branch};
-use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut};
+use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut, PinStore, WantStore};
 use triblespace_core::trible::{Fragment, TRIBLE_LEN, Trible, TribleSet};
 use triblespace_net::transport::sim::{SimConfig, SimNet};
 
@@ -256,6 +256,85 @@ fn branch_restricted_capability_cannot_enumerate_collections() {
             fetch_result_while_stepping(client, pk(&server_key), collection).await;
         let error = result.unwrap_err();
         assert!(error.to_string().contains("unrestricted read"));
+    });
+}
+
+#[test]
+fn direct_collection_reconcile_admits_without_branches_or_wants() {
+    let _guard = common::sim_guard();
+    run_paused(0xC011ECA, async {
+        let root = key(0xF3);
+        let server_key = key(0xA3);
+        let client_key = key(0xB3);
+        let (server_cap, server_sig) = admin_cap(&root, &server_key);
+        let (client_cap, client_sig) = admin_cap(&root, &client_key);
+        let mut server_store = store_with_caps(&[
+            (server_cap.clone(), server_sig.clone()),
+            (client_cap.clone(), client_sig.clone()),
+        ]);
+        let client_store = store_with_caps(&[
+            (server_cap, server_sig.clone()),
+            (client_cap, client_sig.clone()),
+        ]);
+
+        let descriptor = simplearchive_union::descriptor(id(6));
+        let data = archive(7);
+        let facts = TribleSet::try_from_blob(data.clone()).unwrap();
+        let mut collection = Collection::new(&mut server_store, id(6), server_key.clone());
+        let commit = collection.commit(Fragment::from(facts.clone())).unwrap();
+        server_store
+            .gossip(CollectionGossip::sign(&server_key, descriptor.handle()))
+            .unwrap();
+
+        let net = SimNet::new(0xC011ECA, SimConfig::default());
+        let _server = bring_up(
+            &net,
+            &server_key,
+            server_store,
+            root.verifying_key(),
+            self_cap_of(&server_sig),
+            false,
+        );
+        let client = bring_up(
+            &net,
+            &client_key,
+            client_store,
+            root.verifying_key(),
+            self_cap_of(&client_sig),
+            false,
+        );
+        SimNet::step(&vclock(), Duration::from_millis(1)).await;
+
+        let worker = std::thread::spawn(move || {
+            let mut client = client;
+            let outcome = client
+                .reconcile_collection_from(pk(&server_key), descriptor.handle(), |_, _, _| {
+                    Ok::<_, std::convert::Infallible>(true)
+                })
+                .unwrap();
+            (client, outcome)
+        });
+        while !worker.is_finished() {
+            SimNet::step(&vclock(), Duration::from_millis(1)).await;
+        }
+        let (client, outcome) = worker.join().unwrap();
+        assert_eq!(outcome.observed, 1);
+        assert_eq!(outcome.admitted, 1);
+        assert_eq!(outcome.denied, 0);
+
+        let mut store = client.store();
+        assert!(store.records().unwrap().any(|record| {
+            matches!(record, Ok(triblespace_core::collection::CollectionRecord::Commit(found)) if found == commit)
+        }));
+        let reader = store.reader().unwrap();
+        assert_eq!(
+            reader
+                .get::<TribleSet, SimpleArchive>(data.get_handle())
+                .unwrap(),
+            facts,
+        );
+        assert!(store.pins().unwrap().next().is_none());
+        assert!(store.wants().unwrap().next().is_none());
     });
 }
 

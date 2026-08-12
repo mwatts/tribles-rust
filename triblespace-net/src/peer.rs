@@ -61,10 +61,39 @@ use triblespace_core::repo::{
 };
 
 use crate::channel::{NetEvent, PublisherKey};
+use crate::collection_sync::{
+    IncomingAdmissionOutcome, IncomingValidationError, prepare_incoming_simplearchive_union_commit,
+};
 use crate::host::{self, NetReceiver, NetSender, StoreSnapshot};
 use crate::protocol::RawHash;
 
 pub use crate::host::{PeerConfig, SyncDirection};
+
+/// Summary of one exact direct collection reconciliation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CollectionReconcileOutcome {
+    /// Grant-backed commits observed on the source peer.
+    pub observed: usize,
+    /// Commits accepted by policy and durably admitted.
+    pub admitted: usize,
+    /// Valid commits declined by caller policy.
+    pub denied: usize,
+}
+
+/// Failure while fetching, verifying, authorizing, or durably admitting one
+/// direct collection reconciliation.
+#[derive(Debug, thiserror::Error)]
+pub enum CollectionReconcileError {
+    /// Authenticated evidence/closure transfer failed.
+    #[error("collection fetch failed: {0}")]
+    Fetch(#[source] anyhow::Error),
+    /// Cryptographic or collection-semantic validation failed before mutation.
+    #[error("incoming collection validation failed: {0}")]
+    Validation(#[source] IncomingValidationError),
+    /// Caller policy or destination storage rejected admission.
+    #[error("incoming collection admission failed: {0}")]
+    Admission(#[source] anyhow::Error),
+}
 
 /// A store wrapped in distributed network sync.
 ///
@@ -321,6 +350,68 @@ where
         collection: triblespace_core::collection::CollectionId,
     ) -> anyhow::Result<crate::collection_wire::CollectionFetch> {
         self.sender.fetch_collection(peer, collection)
+    }
+
+    /// Reconcile one exact collection from a specific peer.
+    ///
+    /// Transport work completes before the store lock is taken. Each grant /
+    /// commit pair and every fetched blob are independently verified, then
+    /// caller policy decides before the first mutation. Accepted commits use
+    /// the admission layer's dependency-flush → commit-flush ordering. The
+    /// resulting serving snapshot is refreshed without invoking legacy branch
+    /// or DHT publication machinery.
+    pub fn reconcile_collection_from<AuthorizationError, Authorize>(
+        &mut self,
+        peer: [u8; 32],
+        collection: triblespace_core::collection::CollectionId,
+        mut authorize: Authorize,
+    ) -> Result<CollectionReconcileOutcome, CollectionReconcileError>
+    where
+        AuthorizationError: std::error::Error + Send + Sync + 'static,
+        Authorize: FnMut(
+            &triblespace_core::collection::CollectionDescriptor,
+            &triblespace_core::collection::CollectionCommit,
+            &triblespace_core::collection::CollectionGossip,
+        ) -> Result<bool, AuthorizationError>,
+    {
+        let fetched = self
+            .fetch_collection_from(peer, collection)
+            .map_err(CollectionReconcileError::Fetch)?;
+        let blobs: crate::collection_sync::IncomingBlobBundle = fetched
+            .blobs()
+            .iter()
+            .map(|(hash, bytes)| (Inline::new(*hash), Bytes::from_source(bytes.clone())))
+            .collect();
+
+        let mut outcome = CollectionReconcileOutcome {
+            observed: fetched.evidence().len(),
+            ..CollectionReconcileOutcome::default()
+        };
+        for evidence in fetched.evidence() {
+            let prepared = prepare_incoming_simplearchive_union_commit(
+                evidence.commit(),
+                evidence.grant(),
+                blobs.clone(),
+            )
+            .map_err(CollectionReconcileError::Validation)?;
+            let mut store = self.store.lock().expect("store mutex");
+            match prepared
+                .admit(&mut *store, |descriptor, commit, grant| {
+                    authorize(descriptor, commit, grant)
+                })
+                .map_err(|error| CollectionReconcileError::Admission(anyhow::Error::new(error)))?
+            {
+                IncomingAdmissionOutcome::Admitted { .. } => outcome.admitted += 1,
+                IncomingAdmissionOutcome::Unauthorized { .. } => outcome.denied += 1,
+            }
+        }
+
+        let mut store = self.store.lock().expect("store mutex");
+        if let Some(snapshot) = StoreSnapshot::from_store(&mut *store) {
+            self.sender.update_snapshot(snapshot);
+        }
+        self.last_blob_reader = store.reader().ok();
+        Ok(outcome)
     }
 
     /// Reconcile this peer with the latest external state.
