@@ -15,7 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exact descriptor handle and requires an unrestricted read capability.
   Clients can fetch the descriptor/data/metadata roots and their verified blob
   closure as an inert bundle; destination admission remains a separate policy
-  boundary. Existing blob and branch operations are unchanged.
+  boundary. Batch admission hashes shared blobs once, completes every policy
+  decision before mutation, writes only the accepted closure union, and uses
+  exactly two durability barriers regardless of commit count. Existing blob
+  and branch operations are unchanged.
 - **Pile diagnostics can decode one exact physical record boundary.**
   `trible pile diagnose record-at <pile> <offset>` walks the canonical replay
   decoder without modifying the pile, reports the marker, classification,

@@ -259,6 +259,15 @@ impl CollectionFetch {
     pub fn blobs(&self) -> &BTreeMap<RawHash, Vec<u8>> {
         &self.blobs
     }
+
+    /// Consume the transfer into its verified evidence and content-addressed
+    /// blob bundle.
+    ///
+    /// This is the admission path: ownership moves into the store-facing
+    /// validator without cloning every fetched blob.
+    pub fn into_parts(self) -> (Vec<CollectionCommitEvidence>, BTreeMap<RawHash, Vec<u8>>) {
+        (self.evidence, self.blobs)
+    }
 }
 
 /// Enumerate strictly framed evidence for one exact collection over an

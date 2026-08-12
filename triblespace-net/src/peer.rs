@@ -62,7 +62,7 @@ use triblespace_core::repo::{
 
 use crate::channel::{NetEvent, PublisherKey};
 use crate::collection_sync::{
-    IncomingAdmissionOutcome, IncomingValidationError, prepare_incoming_simplearchive_union_commit,
+    IncomingBatchCounts, IncomingBatchValidationError, prepare_incoming_simplearchive_union_batch,
 };
 use crate::host::{self, NetReceiver, NetSender, StoreSnapshot};
 use crate::protocol::RawHash;
@@ -70,15 +70,7 @@ use crate::protocol::RawHash;
 pub use crate::host::{PeerConfig, SyncDirection};
 
 /// Summary of one exact direct collection reconciliation.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct CollectionReconcileOutcome {
-    /// Grant-backed commits observed on the source peer.
-    pub observed: usize,
-    /// Commits accepted by policy and durably admitted.
-    pub admitted: usize,
-    /// Valid commits declined by caller policy.
-    pub denied: usize,
-}
+pub type CollectionReconcileOutcome = IncomingBatchCounts;
 
 /// Failure while fetching, verifying, authorizing, or durably admitting one
 /// direct collection reconciliation.
@@ -89,7 +81,7 @@ pub enum CollectionReconcileError {
     Fetch(#[source] anyhow::Error),
     /// Cryptographic or collection-semantic validation failed before mutation.
     #[error("incoming collection validation failed: {0}")]
-    Validation(#[source] IncomingValidationError),
+    Validation(#[source] IncomingBatchValidationError),
     /// Caller policy or destination storage rejected admission.
     #[error("incoming collection admission failed: {0}")]
     Admission(#[source] anyhow::Error),
@@ -364,7 +356,7 @@ where
         &mut self,
         peer: [u8; 32],
         collection: triblespace_core::collection::CollectionId,
-        mut authorize: Authorize,
+        authorize: Authorize,
     ) -> Result<CollectionReconcileOutcome, CollectionReconcileError>
     where
         AuthorizationError: std::error::Error + Send + Sync + 'static,
@@ -377,36 +369,24 @@ where
         let fetched = self
             .fetch_collection_from(peer, collection)
             .map_err(CollectionReconcileError::Fetch)?;
-        let blobs: crate::collection_sync::IncomingBlobBundle = fetched
-            .blobs()
-            .iter()
-            .map(|(hash, bytes)| (Inline::new(*hash), Bytes::from_source(bytes.clone())))
+        let (evidence, blobs) = fetched.into_parts();
+        let blobs: crate::collection_sync::IncomingBlobBundle = blobs
+            .into_iter()
+            .map(|(hash, bytes)| (Inline::new(hash), Bytes::from_source(bytes)))
             .collect();
-
-        let mut outcome = CollectionReconcileOutcome {
-            observed: fetched.evidence().len(),
-            ..CollectionReconcileOutcome::default()
-        };
-        for evidence in fetched.evidence() {
-            let prepared = prepare_incoming_simplearchive_union_commit(
-                evidence.commit(),
-                evidence.grant(),
-                blobs.clone(),
-            )
+        let evidence = evidence
+            .into_iter()
+            .map(|item| (item.commit(), item.grant()))
+            .collect();
+        let prepared = prepare_incoming_simplearchive_union_batch(evidence, blobs)
             .map_err(CollectionReconcileError::Validation)?;
-            let mut store = self.store.lock().expect("store mutex");
-            match prepared
-                .admit(&mut *store, |descriptor, commit, grant| {
-                    authorize(descriptor, commit, grant)
-                })
-                .map_err(|error| CollectionReconcileError::Admission(anyhow::Error::new(error)))?
-            {
-                IncomingAdmissionOutcome::Admitted { .. } => outcome.admitted += 1,
-                IncomingAdmissionOutcome::Unauthorized { .. } => outcome.denied += 1,
-            }
-        }
-
+        let authorized = prepared
+            .authorize(authorize)
+            .map_err(|error| CollectionReconcileError::Admission(anyhow::Error::new(error)))?;
         let mut store = self.store.lock().expect("store mutex");
+        let outcome = authorized
+            .admit(&mut *store)
+            .map_err(|error| CollectionReconcileError::Admission(anyhow::Error::new(error)))?;
         if let Some(snapshot) = StoreSnapshot::from_store(&mut *store) {
             self.sender.update_snapshot(snapshot);
         }
