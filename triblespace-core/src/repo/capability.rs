@@ -646,7 +646,7 @@ struct CapFields {
 /// `leaf_sig_handle`.
 ///
 /// Eviction in the descriptive-caps model is per-issuer non-renewal
-/// (the issuer's local retraction-policy cell), not a broadcast
+/// (the issuer's private renewal-policy collection), not a broadcast
 /// revocation blob. Verification therefore checks signatures and
 /// expiry only; a "revoked" peer's chain dies at its next natural
 /// expiry once the issuer stops renewing.

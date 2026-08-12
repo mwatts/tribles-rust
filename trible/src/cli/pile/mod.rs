@@ -29,8 +29,8 @@ pub enum PileCommand {
         cmd: branch::Command,
     },
     /// Operations on the legacy pin storage primitive. Branches and tracking
-    /// mirrors show up here; local policy lives in separate local cells. For
-    /// the branch-specific view, see `pile branch`.
+    /// mirrors show up here; private node policy lives in a signer-owned
+    /// collection. For the branch-specific view, see `pile branch`.
     Pin {
         #[command(subcommand)]
         cmd: pin::Command,

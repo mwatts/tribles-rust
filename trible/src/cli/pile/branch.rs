@@ -1894,8 +1894,6 @@ fn scan_pile_records(path: &std::path::Path) -> Result<Vec<RawBranchRecord>> {
                 meta_handle: None,
             }),
             PileRecordContent::Blob { .. }
-            | PileRecordContent::LocalCell { .. }
-            | PileRecordContent::LocalCellTombstone { .. }
             | PileRecordContent::WeakPin { .. }
             | PileRecordContent::WeakUnpin { .. }
             | PileRecordContent::LegacyCollectionV3 { .. }

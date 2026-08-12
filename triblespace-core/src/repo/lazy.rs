@@ -96,7 +96,6 @@ use crate::collection::{
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding, RawInline};
-use crate::local_cell::LocalCellStore;
 
 use super::async_store::{
     AsyncBlobStore, AsyncBlobStoreGet, AsyncBlobStoreList, AsyncBlobStorePut,
@@ -500,26 +499,6 @@ where
         self.store.lock().expect("store mutex").gossip(grant)
     }
 }
-
-impl<S> LocalCellStore for Lazy<S>
-where
-    S: BlobStore + BlobStorePut + LocalCellStore + WantStore + StorageFlush + Send + 'static,
-{
-    type CellError = S::CellError;
-
-    fn cell(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::CellError> {
-        self.store.lock().expect("store mutex").cell(id)
-    }
-
-    fn set_cell(
-        &mut self,
-        id: Id,
-        value: Option<Inline<Handle<SimpleArchive>>>,
-    ) -> Result<(), Self::CellError> {
-        self.store.lock().expect("store mutex").set_cell(id, value)
-    }
-}
-
 impl<S> WantStore for Lazy<S>
 where
     S: BlobStore + BlobStorePut + WantStore + StorageFlush + Send + 'static,

@@ -77,10 +77,10 @@ The Pile rewrite also recursively retains and recreates every active branch
 pin. Legacy V3 collection records are different: their 16-byte definition
 identities predate descriptor handles, so they are preserved byte-for-byte as
 inert physical evidence but grant no current collection authority and own no
-blobs. Current `LocalCellStore` values are recursive local roots and are
-recreated by retained pile rewrites. That keeps operational policy alive
-without granting collection authority or exposing a branch to gossip. Weak
-wants are an explicit rewrite choice. Preserving
+blobs. Node policy needs no separate root primitive: its valid signer-owned
+collection commits retain the resident descriptor, fact archive, metadata, and
+referenced capability/signature closure under the ordinary collection rule.
+Weak wants are an explicit rewrite choice. Preserving
 them copies their demand markers but does not promote the requested blob to an
 ownership root; dropping them omits the markers entirely.
 
@@ -92,13 +92,15 @@ independently apply the conservative rule above: preserve every native record,
 then recursively retain the resident descriptor, data, and metadata closure of
 every strictly verified current `COMMIT`.
 
-Generic-envelope records whose kind is unknown to the running binary form a
-harder boundary: their bytes have a known span and ordinary replay can safely
-project them away, but the reader cannot know whether their semantics own known
-blobs. `Pile::rewrite_retained_into` and Yard collection, compaction, and
+Opaque records form a harder boundary: their bytes have a known span and
+ordinary replay can safely project them away, but the reader cannot know
+whether their former or future semantics own known blobs. This includes unknown
+generic-envelope kinds and both recognized encodings of the retired local-cell
+experiment. `Pile::rewrite_retained_into` and Yard collection, compaction, and
 reclaim therefore refuse before changing destination bytes or live sets when
-any opaque record is present. Upgrade to tooling that understands the kind
-before performing destructive retention.
+any opaque record is present. Upgrade to tooling that understands an unknown
+kind, or explicitly migrate retired records, before performing destructive
+retention.
 
 ## Conservative Reachability
 

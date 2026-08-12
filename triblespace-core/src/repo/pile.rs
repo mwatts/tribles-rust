@@ -59,7 +59,6 @@ use crate::inline::encodings::hash::Hash;
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
 use crate::inline::RawInline;
-use crate::local_cell::LocalCellStore;
 use crate::patch::Entry;
 use crate::patch::IdentitySchema;
 use crate::patch::PATCH;
@@ -127,11 +126,11 @@ const MAGIC_MARKER_COLLECTION_DERIVE_V4: RawId = hex!("ECFB2EE90ED8042244F7BAC70
 /// metadata and does not retain the named descriptor or any collection data.
 /// The semantic kind was minted with `trible genid` on 2026-08-12.
 const MAGIC_MARKER_COLLECTION_GOSSIP_V1: RawId = KIND_COLLECTION_GOSSIP.raw();
-/// Local-cell records, minted on 2026-08-10 with `trible genid`.
+/// Retired local-cell record markers, minted on 2026-08-10 with `trible genid`.
 ///
-/// A set record replaces one local operational slot; a tombstone clears it.
-/// These records never enter branch gossip or collection authority. Their
-/// current values are nevertheless recursive local retention roots.
+/// These values remain private solely so old piles can be crossed at their
+/// known 256-byte boundaries. They decode as opaque migration evidence and
+/// never reconstruct operational state.
 const MAGIC_MARKER_LOCAL_CELL_V3: RawId = hex!("24264FA9EE46A1ACC0E024AE69774B09");
 const MAGIC_MARKER_LOCAL_CELL_TOMBSTONE_V3: RawId = hex!("4FE372AE868D22A44DED7A60D579B651");
 
@@ -368,25 +367,6 @@ struct BranchTombstoneHeaderV3 {
     reserved: [u8; 224],
 }
 
-/// V3 local-cell replacement — fixed 256 bytes.
-#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
-#[repr(C)]
-struct LocalCellHeaderV3 {
-    magic_marker: RawId,
-    cell_id: RawId,
-    value: RawInline,
-    reserved: [u8; 192],
-}
-
-/// V3 local-cell deletion — fixed 256 bytes.
-#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
-#[repr(C)]
-struct LocalCellTombstoneHeaderV3 {
-    magic_marker: RawId,
-    cell_id: RawId,
-    reserved: [u8; 224],
-}
-
 /// V3 want marker using the legacy weak-pin encoding — fixed 256 bytes and
 /// keyed by blob handle (no branch id).
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
@@ -579,52 +559,6 @@ impl BranchTombstoneHeaderEnvelope {
 
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
-struct LocalCellHeaderEnvelope {
-    envelope_marker: RawId,
-    record_kind: RawId,
-    span_blocks: [u8; 4],
-    cell_id: RawId,
-    value: RawInline,
-    reserved: [u8; 172],
-}
-
-impl LocalCellHeaderEnvelope {
-    fn new(cell_id: Id, value: Inline<Handle<SimpleArchive>>) -> Self {
-        Self {
-            envelope_marker: MAGIC_MARKER_ENVELOPE,
-            record_kind: MAGIC_MARKER_LOCAL_CELL_V3,
-            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
-            cell_id: cell_id.into(),
-            value: value.raw,
-            reserved: [0u8; 172],
-        }
-    }
-}
-
-#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
-#[repr(C)]
-struct LocalCellTombstoneHeaderEnvelope {
-    envelope_marker: RawId,
-    record_kind: RawId,
-    span_blocks: [u8; 4],
-    cell_id: RawId,
-    reserved: [u8; 204],
-}
-
-impl LocalCellTombstoneHeaderEnvelope {
-    fn new(cell_id: Id) -> Self {
-        Self {
-            envelope_marker: MAGIC_MARKER_ENVELOPE,
-            record_kind: MAGIC_MARKER_LOCAL_CELL_TOMBSTONE_V3,
-            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
-            cell_id: cell_id.into(),
-            reserved: [0u8; 204],
-        }
-    }
-}
-
-#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
-#[repr(C)]
 struct WantHeaderEnvelope {
     envelope_marker: RawId,
     record_kind: RawId,
@@ -800,8 +734,6 @@ const _: () = {
     assert!(std::mem::size_of::<BlobHeaderV3>() == V3_HEADER_LEN);
     assert!(std::mem::size_of::<BranchHeaderV3>() == V3_HEADER_LEN);
     assert!(std::mem::size_of::<BranchTombstoneHeaderV3>() == V3_HEADER_LEN);
-    assert!(std::mem::size_of::<LocalCellHeaderV3>() == V3_HEADER_LEN);
-    assert!(std::mem::size_of::<LocalCellTombstoneHeaderV3>() == V3_HEADER_LEN);
     assert!(std::mem::size_of::<WeakPinHeaderV3>() == V3_HEADER_LEN);
     assert!(std::mem::size_of::<WeakUnpinHeaderV3>() == V3_HEADER_LEN);
     assert!(std::mem::size_of::<CollectionDefinitionHeaderV3>() == V3_HEADER_LEN);
@@ -815,8 +747,6 @@ const _: () = {
     assert!(std::mem::size_of::<BlobHeaderEnvelope>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<BranchHeaderEnvelope>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<BranchTombstoneHeaderEnvelope>() == ENVELOPE_HEADER_LEN);
-    assert!(std::mem::size_of::<LocalCellHeaderEnvelope>() == ENVELOPE_HEADER_LEN);
-    assert!(std::mem::size_of::<LocalCellTombstoneHeaderEnvelope>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<WantHeaderEnvelope>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<CollectionCommitHeaderEnvelope>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<CollectionMergeHeaderEnvelope>() == ENVELOPE_HEADER_LEN);
@@ -891,18 +821,6 @@ pub enum PileRecordContent {
         /// The branch being tombstoned.
         branch_id: Id,
     },
-    /// A local operational cell replacement.
-    LocalCell {
-        /// Stable local slot id.
-        cell_id: Id,
-        /// New current value.
-        value: Inline<Handle<SimpleArchive>>,
-    },
-    /// A local operational cell tombstone.
-    LocalCellTombstone {
-        /// Stable local slot id.
-        cell_id: Id,
-    },
     /// A want assertion in the legacy weak-pin physical encoding.
     WeakPin {
         /// The wanted blob handle.
@@ -932,12 +850,13 @@ pub enum PileRecordContent {
         /// The historical physical record kind.
         kind: LegacyCollectionRecordKindV3,
     },
-    /// A structurally valid generic envelope whose semantic record kind is
-    /// unknown to this reader. Replay deliberately projects it away, while
-    /// [`PileRecords`] exposes its exact offset and length so raw tooling can
-    /// preserve the bytes.
+    /// A record whose semantic kind is not active in this reader. This covers
+    /// structurally valid unknown generic envelopes and the two retired,
+    /// fixed-width unenveloped local-cell markers. Replay deliberately
+    /// projects it away, while [`PileRecords`] exposes its exact offset and
+    /// length so raw migration tooling can preserve the bytes.
     Opaque {
-        /// Unknown semantic record-kind id carried by the envelope.
+        /// Inert semantic record-kind id.
         kind: RawId,
     },
 }
@@ -1022,37 +941,6 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
                 offset,
                 len,
                 content: PileRecordContent::BranchTombstone { branch_id },
-            })
-        }
-        MAGIC_MARKER_LOCAL_CELL_V3 => {
-            fixed_header()?;
-            let (header, _) =
-                LocalCellHeaderEnvelope::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
-            if header.reserved.iter().any(|byte| *byte != 0) {
-                return Err(corrupt());
-            }
-            let cell_id = Id::new(header.cell_id).ok_or_else(corrupt)?;
-            Ok(PileRecord {
-                offset,
-                len,
-                content: PileRecordContent::LocalCell {
-                    cell_id,
-                    value: Inline::new(header.value),
-                },
-            })
-        }
-        MAGIC_MARKER_LOCAL_CELL_TOMBSTONE_V3 => {
-            fixed_header()?;
-            let (header, _) = LocalCellTombstoneHeaderEnvelope::try_read_from_prefix(bytes)
-                .map_err(|_| corrupt())?;
-            if header.reserved.iter().any(|byte| *byte != 0) {
-                return Err(corrupt());
-            }
-            let cell_id = Id::new(header.cell_id).ok_or_else(corrupt)?;
-            Ok(PileRecord {
-                offset,
-                len,
-                content: PileRecordContent::LocalCellTombstone { cell_id },
             })
         }
         MAGIC_MARKER_WEAK_PIN_V3 | MAGIC_MARKER_WEAK_UNPIN_V3 => {
@@ -1169,8 +1057,10 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
 /// record parsing: [`Pile::refresh`]/[`Pile::amputate`] replay records through
 /// it, and [`PileRecords`] exposes it for raw inspection. An unknown legacy
 /// marker yields [`ReadError::UnsupportedRecord`] because this reader cannot
-/// know its length. An unknown kind inside the generic envelope has an exact
-/// span and yields [`PileRecordContent::Opaque`]. A truncated record yields
+/// know its length. The two retired fixed-width local-cell markers are
+/// recognized as opaque migration evidence. An unknown kind inside the generic
+/// envelope has an exact span and yields [`PileRecordContent::Opaque`]. A
+/// truncated record yields
 /// [`ReadError::CorruptPile`] pointing at `offset`.
 fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
     let corrupt = || ReadError::CorruptPile {
@@ -1275,35 +1165,11 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
                 content: PileRecordContent::BranchTombstone { branch_id },
             })
         }
-        MAGIC_MARKER_LOCAL_CELL_V3 => {
-            let (header, _) =
-                LocalCellHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
-            if header.reserved.iter().any(|byte| *byte != 0) {
-                return Err(corrupt());
-            }
-            let cell_id = Id::new(header.cell_id).ok_or_else(corrupt)?;
-            Ok(PileRecord {
-                offset,
-                len: V3_HEADER_LEN,
-                content: PileRecordContent::LocalCell {
-                    cell_id,
-                    value: Inline::new(header.value),
-                },
-            })
-        }
-        MAGIC_MARKER_LOCAL_CELL_TOMBSTONE_V3 => {
-            let (header, _) =
-                LocalCellTombstoneHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
-            if header.reserved.iter().any(|byte| *byte != 0) {
-                return Err(corrupt());
-            }
-            let cell_id = Id::new(header.cell_id).ok_or_else(corrupt)?;
-            Ok(PileRecord {
-                offset,
-                len: V3_HEADER_LEN,
-                content: PileRecordContent::LocalCellTombstone { cell_id },
-            })
-        }
+        MAGIC_MARKER_LOCAL_CELL_V3 | MAGIC_MARKER_LOCAL_CELL_TOMBSTONE_V3 => Ok(PileRecord {
+            offset,
+            len: V3_HEADER_LEN,
+            content: PileRecordContent::Opaque { kind: magic },
+        }),
         MAGIC_MARKER_WEAK_PIN_V3 => {
             let (header, _) =
                 WeakPinHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
@@ -1620,35 +1486,13 @@ impl Iterator for PileRecords {
 
 #[derive(Debug)]
 enum Applied {
-    Blob {
-        hash: Inline<Hash<Blake3>>,
-    },
-    Branch {
-        id: Id,
-        hash: Inline<Hash<Blake3>>,
-    },
-    BranchTombstone {
-        id: Id,
-    },
-    LocalCell {
-        id: Id,
-        value: Inline<Handle<SimpleArchive>>,
-    },
-    LocalCellTombstone {
-        id: Id,
-    },
-    WeakPin {
-        handle: Inline<Handle<UnknownBlob>>,
-    },
-    WeakUnpin {
-        handle: Inline<Handle<UnknownBlob>>,
-    },
-    Collection {
-        id: Id,
-    },
-    CollectionGossip {
-        grant: CollectionGossip,
-    },
+    Blob { hash: Inline<Hash<Blake3>> },
+    Branch { id: Id, hash: Inline<Hash<Blake3>> },
+    BranchTombstone { id: Id },
+    WeakPin { handle: Inline<Handle<UnknownBlob>> },
+    WeakUnpin { handle: Inline<Handle<UnknownBlob>> },
+    Collection { id: Id },
+    CollectionGossip { grant: CollectionGossip },
     LegacyCollectionV3,
     Opaque,
 }
@@ -1672,11 +1516,6 @@ pub struct Pile {
     blobs: PATCH<32, IdentitySchema, IndexEntry>,
     validations: ValidationCache,
     branches: PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>,
-    /// LWW-resolved local operational cell values.
-    cells: PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>,
-    /// Cell tombstones retained separately so a younger Yard generation can
-    /// suppress an older generation's value while reconstructing its view.
-    cell_tombstones: PATCH<16, IdentitySchema>,
     /// Immutable collection records keyed by their intrinsic entity id.
     /// `BTreeMap` makes enumeration independent of append/cat order.
     collection_records: BTreeMap<Id, CollectionRecord>,
@@ -1687,9 +1526,9 @@ pub struct Pile {
     /// They remain inert but are conservatively carried through retained
     /// rewrites so an explicit future migration still has its source evidence.
     legacy_collection_headers: BTreeSet<[u8; V3_HEADER_LEN]>,
-    /// Number of structurally valid generic-envelope records whose semantic
-    /// kind this binary does not know. Ordinary replay projects them away;
-    /// destructive physical rewrites refuse while this is nonzero.
+    /// Number of structurally valid records projected as opaque. This includes
+    /// unknown generic-envelope kinds and retired local-cell encodings.
+    /// Destructive physical rewrites refuse while this is nonzero.
     opaque_records: usize,
     /// LWW-resolved wanted set. Legacy weak-pin records assert the handle and
     /// weak-unpin records retract it; log-order application makes the last
@@ -2134,8 +1973,6 @@ impl Pile {
             blobs: PATCH::<32, IdentitySchema, IndexEntry>::new(),
             validations: ValidationCache::default(),
             branches: PATCH::<16, IdentitySchema, Inline<Handle<SimpleArchive>>>::new(),
-            cells: PATCH::<16, IdentitySchema, Inline<Handle<SimpleArchive>>>::new(),
-            cell_tombstones: PATCH::<16, IdentitySchema>::new(),
             collection_records: BTreeMap::new(),
             collection_gossips: BTreeSet::new(),
             legacy_collection_headers: BTreeSet::new(),
@@ -2267,17 +2104,6 @@ impl Pile {
                 self.branches.remove(&branch_id.into());
                 Applied::BranchTombstone { id: branch_id }
             }
-            PileRecordContent::LocalCell { cell_id, value } => {
-                self.cells
-                    .replace(&Entry::with_value(&cell_id.into(), value));
-                self.cell_tombstones.remove(&cell_id.into());
-                Applied::LocalCell { id: cell_id, value }
-            }
-            PileRecordContent::LocalCellTombstone { cell_id } => {
-                self.cells.remove(&cell_id.into());
-                self.cell_tombstones.insert(&Entry::new(&cell_id.into()));
-                Applied::LocalCellTombstone { id: cell_id }
-            }
             PileRecordContent::WeakPin { handle } => {
                 self.wants.insert(&Entry::new(&handle.raw));
                 Applied::WeakPin { handle }
@@ -2405,8 +2231,6 @@ impl Pile {
             std::ptr::drop_in_place(&mut this.blobs);
             std::ptr::drop_in_place(&mut this.validations);
             std::ptr::drop_in_place(&mut this.branches);
-            std::ptr::drop_in_place(&mut this.cells);
-            std::ptr::drop_in_place(&mut this.cell_tombstones);
             std::ptr::drop_in_place(&mut this.collection_records);
             std::ptr::drop_in_place(&mut this.collection_gossips);
             std::ptr::drop_in_place(&mut this.legacy_collection_headers);
@@ -2433,8 +2257,8 @@ impl crate::repo::StorageClose for Pile {
     }
 }
 
-// Generic durability hook: appended records (blobs, branch updates, local
-// cells, want markers) are not crash-durable until flushed — see the
+// Generic durability hook: appended records (blobs, branch updates,
+// collection records, want markers) are not crash-durable until flushed — see the
 // inherent [`Pile::flush`].
 impl crate::repo::StorageFlush for Pile {
     type Error = FlushError;
@@ -2881,8 +2705,6 @@ impl Pile {
                     }
                     Some(Applied::Branch { .. }) => {}
                     Some(Applied::BranchTombstone { .. }) => {}
-                    Some(Applied::LocalCell { .. }) => {}
-                    Some(Applied::LocalCellTombstone { .. }) => {}
                     Some(Applied::WeakPin { .. }) => {}
                     Some(Applied::WeakUnpin { .. }) => {}
                     Some(Applied::Collection { .. }) => {}
@@ -3024,95 +2846,6 @@ impl PinStore for Pile {
     }
 }
 
-impl Pile {
-    /// Snapshot the LWW-resolved cell state and its explicit tombstones.
-    ///
-    /// This is backend plumbing for [`super::yard::Yard`], not a public cell
-    /// enumeration surface: reconstructing a multi-generation local view needs
-    /// tombstones so younger clears suppress older values.
-    pub(crate) fn local_cell_snapshot(
-        &mut self,
-    ) -> Result<
-        (
-            PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>,
-            PATCH<16, IdentitySchema>,
-        ),
-        ReadError,
-    > {
-        self.refresh()?;
-        Ok((self.cells.clone(), self.cell_tombstones.clone()))
-    }
-}
-
-impl LocalCellStore for Pile {
-    type CellError = PileWriteError;
-
-    fn cell(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::CellError> {
-        self.refresh().map_err(PileWriteError::from)?;
-        Ok(self.cells.get(&id.into()).copied())
-    }
-
-    fn set_cell(
-        &mut self,
-        id: Id,
-        value: Option<Inline<Handle<SimpleArchive>>>,
-    ) -> Result<(), Self::CellError> {
-        self.file.lock()?;
-        let result = (|| {
-            self.refresh_locked().map_err(PileWriteError::from)?;
-            let current = self.cells.get(&id.into()).copied();
-            let has_tombstone = self.cell_tombstones.get(&id.into()).is_some();
-
-            // A first clear is material even when this pile has no value: the
-            // tombstone must suppress older values after `cat` or in a Yard.
-            // Once that intent is represented, identical replacements are
-            // true no-ops.
-            if current == value && (value.is_some() || has_tombstone) {
-                return Ok(());
-            }
-
-            self.dirty = true;
-            let written = match value {
-                Some(value) => self
-                    .file
-                    .write(LocalCellHeaderEnvelope::new(id, value).as_bytes()),
-                None => self
-                    .file
-                    .write(LocalCellTombstoneHeaderEnvelope::new(id).as_bytes()),
-            }
-            .map_err(PileWriteError::IoError)?;
-            if written != ENVELOPE_HEADER_LEN {
-                return Err(PileWriteError::IoError(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "failed to write complete local-cell record",
-                )));
-            }
-
-            match self.apply_next().map_err(PileWriteError::from)? {
-                Some(Applied::LocalCell {
-                    id: applied,
-                    value: applied_value,
-                }) if applied == id && value == Some(applied_value) => Ok(()),
-                Some(Applied::LocalCellTombstone { id: applied })
-                    if applied == id && value.is_none() =>
-                {
-                    Ok(())
-                }
-                Some(_) => Err(PileWriteError::IoError(std::io::Error::other(
-                    "unexpected record after local-cell write",
-                ))),
-                None => Err(PileWriteError::IoError(std::io::Error::other(
-                    "local-cell record missing after write",
-                ))),
-            }
-        })();
-        let unlock = self.file.unlock();
-        result?;
-        unlock?;
-        Ok(())
-    }
-}
-
 /// Iterator over the LWW-resolved wanted handles stored in the pile,
 /// using the PATCH's ordered key iterator (byte order, deterministic).
 pub struct PileWantIter {
@@ -3147,7 +2880,7 @@ impl Pile {
             self.refresh_locked().map_err(PileWriteError::from)?;
 
             // No-op short-circuit: the wanted set is logically a per-handle
-            // LWW cell; re-asserting the current state carries no
+            // LWW register; re-asserting the current state carries no
             // information and would just churn the append-only file.
             let current = self.wants.get(&handle.raw).is_some();
             if current == pin {
@@ -3269,9 +3002,6 @@ pub struct PileRewriteStats {
     pub retained_blobs: usize,
     /// Number of active legacy strong-pin mappings recreated.
     pub strong_pins: usize,
-    /// Number of current local operational cell states (values or tombstones)
-    /// recreated.
-    pub local_cells: usize,
     /// Number of want markers recreated.
     pub wants: usize,
     /// Number of grow-only collection-publication grants preserved.
@@ -3284,8 +3014,8 @@ pub struct PileRewriteStats {
 pub enum PileRewriteError {
     /// The source could not produce a coherent reader snapshot.
     Source(ReadError),
-    /// The source contains unknown enveloped records, so a semantic rewrite
-    /// could not prove that it would preserve their bytes and retention laws.
+    /// The source contains opaque records, so a semantic rewrite could not
+    /// prove that it would preserve their bytes and retention laws.
     OpaqueRecords {
         /// Number of opaque records observed in the source snapshot.
         count: usize,
@@ -3303,8 +3033,6 @@ pub enum PileRewriteError {
     },
     /// A preserved want marker could not be appended.
     Want(PileWriteError),
-    /// A local operational cell could not be recreated.
-    LocalCell(PileWriteError),
     /// An immutable collection-algebra record could not be appended.
     Collection(CollectionInsertError),
     /// The completed destination state could not be made durable.
@@ -3317,7 +3045,7 @@ impl std::fmt::Display for PileRewriteError {
             Self::Source(error) => write!(f, "failed to snapshot source pile: {error}"),
             Self::OpaqueRecords { count } => write!(
                 f,
-                "refusing to rewrite a pile containing {count} unknown enveloped record(s)"
+                "refusing to rewrite a pile containing {count} opaque record(s)"
             ),
             Self::Transfer(error) => write!(f, "failed to copy a retained blob: {error}"),
             Self::StrongPin(error) => write!(f, "failed to recreate a strong pin: {error}"),
@@ -3326,7 +3054,6 @@ impl std::fmt::Display for PileRewriteError {
                 "destination has conflicting strong pin {id:X} at {current:?}"
             ),
             Self::Want(error) => write!(f, "failed to recreate a want: {error}"),
-            Self::LocalCell(error) => write!(f, "failed to recreate a local cell: {error}"),
             Self::Collection(error) => {
                 write!(f, "failed to preserve a collection record: {error}")
             }
@@ -3340,7 +3067,7 @@ impl Error for PileRewriteError {
         match self {
             Self::Source(error) => Some(error),
             Self::Transfer(error) => Some(error),
-            Self::StrongPin(error) | Self::Want(error) | Self::LocalCell(error) => Some(error),
+            Self::StrongPin(error) | Self::Want(error) => Some(error),
             Self::Collection(error) => Some(error),
             Self::Flush(error) => Some(error),
             Self::StrongPinConflict { .. } | Self::OpaqueRecords { .. } => None,
@@ -3359,8 +3086,8 @@ impl Pile {
     /// ownership root and recreates the exact pin mapping, allowing collection
     /// and branch models to coexist during migration.
     ///
-    /// The source is refreshed once; blobs, strong pins, local cells,
-    /// collection records, inert legacy collection headers, and wants are then
+    /// The source is refreshed once; blobs, strong pins, collection records,
+    /// inert legacy collection headers, and wants are then
     /// taken from that coherent applied-prefix snapshot. Strictly verified V4
     /// commits retain their resident descriptor, data, and metadata recursively;
     /// an invalid commit authenticates none of its fields. A valid commit whose
@@ -3388,8 +3115,6 @@ impl Pile {
             });
         }
         let strong_pins = self.branches.clone();
-        let local_cells = self.cells.clone();
-        let local_cell_tombstones = self.cell_tombstones.clone();
         let collection_records = self.collection_records.clone();
         let collection_gossips = self.collection_gossips.clone();
         let legacy_collection_headers = self.legacy_collection_headers.clone();
@@ -3401,12 +3126,6 @@ impl Pile {
                 .get(raw)
                 .expect("pin key from snapshot must retain its value");
             roots.retain_recursive(head);
-        }
-        for raw in &local_cells {
-            let value = *local_cells
-                .get(raw)
-                .expect("cell key from snapshot must retain its value");
-            roots.retain_recursive(value);
         }
         for record in collection_records.values() {
             let CollectionRecord::Commit(commit) = record else {
@@ -3479,28 +3198,6 @@ impl Pile {
                 .map_err(PileRewriteError::Collection)?;
         }
 
-        // Recreate explicit clears as well as present values. This matters
-        // when the destination already carries an older value or is later
-        // composed after an older pile: absence alone cannot suppress it.
-        // Apply them only after every selected source blob has transferred
-        // successfully, so a validation failure cannot mutate cell state.
-        for raw in &local_cell_tombstones {
-            let id = Id::new(*raw).expect("Pile never stores a nil local-cell id");
-            destination
-                .set_cell(id, None)
-                .map_err(PileRewriteError::LocalCell)?;
-        }
-
-        for raw in &local_cells {
-            let id = Id::new(*raw).expect("Pile never stores a nil local-cell id");
-            let value = *local_cells
-                .get(raw)
-                .expect("cell key from snapshot must retain its value");
-            destination
-                .set_cell(id, Some(value))
-                .map_err(PileRewriteError::LocalCell)?;
-        }
-
         let mut preserved_wants = 0usize;
         if wants == WantRewritePolicy::Preserve {
             for raw in source_wants.into_iter_ordered() {
@@ -3515,7 +3212,6 @@ impl Pile {
         Ok(PileRewriteStats {
             retained_blobs,
             strong_pins: strong_pins.len() as usize,
-            local_cells: (local_cells.len() + local_cell_tombstones.len()) as usize,
             wants: preserved_wants,
             collection_gossips: collection_gossips.len(),
         })
@@ -3783,11 +3479,6 @@ mod tests {
             PushResult::Success()
         ));
 
-        let cell_id = Id::new([3; 16]).unwrap();
-        let cell_value = Inline::<Handle<SimpleArchive>>::new([4; 32]);
-        pile.set_cell(cell_id, Some(cell_value)).unwrap();
-        pile.set_cell(cell_id, None).unwrap();
-
         let wanted = Inline::<Handle<UnknownBlob>>::new([5; 32]);
         pile.want(wanted).unwrap();
         pile.unwant(wanted).unwrap();
@@ -3804,8 +3495,6 @@ mod tests {
             (MAGIC_MARKER_BLOB_V3, 3u32),
             (MAGIC_MARKER_BRANCH_V3, 1),
             (MAGIC_MARKER_BRANCH_TOMBSTONE_V3, 1),
-            (MAGIC_MARKER_LOCAL_CELL_V3, 1),
-            (MAGIC_MARKER_LOCAL_CELL_TOMBSTONE_V3, 1),
             (MAGIC_MARKER_WEAK_PIN_V3, 1),
             (MAGIC_MARKER_WEAK_UNPIN_V3, 1),
             (MAGIC_MARKER_COLLECTION_COMMIT_V4, 1),
@@ -3831,7 +3520,6 @@ mod tests {
         let fetched: Blob<UnknownBlob> = reopened.reader().unwrap().get(blob).unwrap();
         assert_eq!(fetched.bytes.as_ref(), blob_data);
         assert_eq!(reopened.head(branch_id).unwrap(), None);
-        assert_eq!(reopened.cell(cell_id).unwrap(), None);
         assert!(reopened.wants().unwrap().next().is_none());
         assert_eq!(
             reopened
@@ -4008,7 +3696,45 @@ mod tests {
     }
 
     #[test]
-    fn opaque_projection_preserves_lww_order_for_branches_cells_and_wants() {
+    fn retired_local_cell_records_are_opaque_migration_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "retired-local-cells.pile");
+        let mut unenveloped = [0u8; V3_HEADER_LEN];
+        unenveloped[..16].copy_from_slice(&MAGIC_MARKER_LOCAL_CELL_V3);
+        let enveloped = test_envelope_bytes(
+            MAGIC_MARKER_LOCAL_CELL_TOMBSTONE_V3,
+            ENVELOPE_HEADER_BLOCKS,
+            ENVELOPE_HEADER_LEN,
+        );
+        append_test_bytes(&path, &unenveloped);
+        append_test_bytes(&path, &enveloped);
+
+        let mut records = PileRecords::open(&path).unwrap();
+        let decoded = (&mut records).collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert!(matches!(
+            decoded[0].content,
+            PileRecordContent::Opaque {
+                kind: MAGIC_MARKER_LOCAL_CELL_V3
+            }
+        ));
+        assert!(matches!(
+            decoded[1].content,
+            PileRecordContent::Opaque {
+                kind: MAGIC_MARKER_LOCAL_CELL_TOMBSTONE_V3
+            }
+        ));
+        assert_eq!(decoded[0].len, V3_HEADER_LEN);
+        assert_eq!(decoded[1].len, ENVELOPE_HEADER_LEN);
+
+        let mut pile = Pile::open(&path).unwrap();
+        pile.refresh().unwrap();
+        assert_eq!(pile.opaque_record_count().unwrap(), 2);
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn opaque_projection_preserves_lww_order_for_branches_and_wants() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "opaque-lww.pile");
         let opaque = test_envelope_bytes(TEST_UNKNOWN_KIND_A, 1, ENVELOPE_BLOCK_LEN);
@@ -4030,16 +3756,6 @@ mod tests {
         pile.update(branch_restored, None, Some(branch_head))
             .unwrap();
 
-        let cell_cleared = Id::new([14; 16]).unwrap();
-        let cell_restored = Id::new([15; 16]).unwrap();
-        let cell_value = Inline::<Handle<SimpleArchive>>::new([16; 32]);
-        pile.set_cell(cell_cleared, Some(cell_value)).unwrap();
-        append_test_bytes(&path, &opaque);
-        pile.set_cell(cell_cleared, None).unwrap();
-        pile.set_cell(cell_restored, None).unwrap();
-        append_test_bytes(&path, &opaque);
-        pile.set_cell(cell_restored, Some(cell_value)).unwrap();
-
         let want_retracted = Inline::<Handle<UnknownBlob>>::new([17; 32]);
         let want_restored = Inline::<Handle<UnknownBlob>>::new([18; 32]);
         pile.want(want_retracted).unwrap();
@@ -4055,11 +3771,9 @@ mod tests {
 
         let mut reopened = Pile::open(&path).unwrap();
         reopened.refresh().unwrap();
-        assert_eq!(reopened.opaque_record_count().unwrap(), 6);
+        assert_eq!(reopened.opaque_record_count().unwrap(), 4);
         assert_eq!(reopened.head(branch_cleared).unwrap(), None);
         assert_eq!(reopened.head(branch_restored).unwrap(), Some(branch_head));
-        assert_eq!(reopened.cell(cell_cleared).unwrap(), None);
-        assert_eq!(reopened.cell(cell_restored).unwrap(), Some(cell_value));
         let wants = reopened
             .wants()
             .unwrap()
@@ -4595,16 +4309,6 @@ mod tests {
         let orphan = source
             .put::<UnknownBlob, _>(Bytes::from_source(b"orphan".to_vec()))
             .unwrap();
-        let cell_id = Id::new([10; 16]).unwrap();
-        let cell_value_set: TribleSet = entity! { crate::metadata::tag: cell_id }.into();
-        let cell_value = source.put(cell_value_set).unwrap();
-        source.set_cell(cell_id, Some(cell_value)).unwrap();
-        let cleared_cell_id = Id::new([11; 16]).unwrap();
-        source.set_cell(cleared_cell_id, None).unwrap();
-        let stale_destination_value = destination.put(TribleSet::new()).unwrap();
-        destination
-            .set_cell(cleared_cell_id, Some(stale_destination_value))
-            .unwrap();
         source.flush().unwrap();
 
         let mut explicit = RetentionRoots::new();
@@ -4619,9 +4323,8 @@ mod tests {
         assert_eq!(
             stats,
             PileRewriteStats {
-                retained_blobs: 6,
+                retained_blobs: 5,
                 strong_pins: 1,
-                local_cells: 2,
                 wants: 1,
                 collection_gossips: 0,
             }
@@ -4634,7 +4337,6 @@ mod tests {
             collection_attachment,
             collection_data,
             collection_record,
-            cell_value.transmute(),
         ] {
             assert!(reader.get::<Blob<UnknownBlob>, _>(retained).is_ok());
         }
@@ -4642,8 +4344,6 @@ mod tests {
             assert!(reader.get::<Blob<UnknownBlob>, _>(collected).is_err());
         }
         assert_eq!(destination.head(pin_id).unwrap(), Some(legacy_head));
-        assert_eq!(destination.cell(cell_id).unwrap(), Some(cell_value));
-        assert_eq!(destination.cell(cleared_cell_id).unwrap(), None);
         assert_eq!(
             destination
                 .wants()
@@ -5919,61 +5619,6 @@ mod tests {
     }
 
     #[test]
-    fn local_cell_is_lww_persistent_and_not_a_pin() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = fresh_empty_pile_path(&dir, "local-cell.pile");
-        let id = Id::new([71; 16]).unwrap();
-
-        let mut pile = Pile::open(&path).unwrap();
-        let first = pile.put(TribleSet::new()).unwrap();
-        let second_set: TribleSet = entity! { crate::metadata::tag: id }.into();
-        let second = pile.put(second_set).unwrap();
-        pile.set_cell(id, Some(first)).unwrap();
-        pile.set_cell(id, Some(second)).unwrap();
-        assert_eq!(pile.cell(id).unwrap(), Some(second));
-        assert_eq!(pile.pins().unwrap().count(), 0);
-        pile.close().unwrap();
-
-        let mut reopened = Pile::open(&path).unwrap();
-        assert_eq!(reopened.cell(id).unwrap(), Some(second));
-        reopened.set_cell(id, None).unwrap();
-        reopened.close().unwrap();
-
-        let mut cleared = Pile::open(&path).unwrap();
-        assert_eq!(cleared.cell(id).unwrap(), None);
-        cleared.close().unwrap();
-    }
-
-    #[test]
-    fn standalone_cell_tombstone_suppresses_an_older_cat_value() {
-        let dir = tempfile::tempdir().unwrap();
-        let old_path = fresh_empty_pile_path(&dir, "cell-old.pile");
-        let young_path = fresh_empty_pile_path(&dir, "cell-young.pile");
-        let merged_path = dir.path().join("cell-merged.pile");
-        let id = Id::new([72; 16]).unwrap();
-
-        let mut old = Pile::open(&old_path).unwrap();
-        let value = old.put(TribleSet::new()).unwrap();
-        old.set_cell(id, Some(value)).unwrap();
-        old.close().unwrap();
-
-        let mut young = Pile::open(&young_path).unwrap();
-        young.set_cell(id, None).unwrap();
-        assert_eq!(
-            std::fs::metadata(&young_path).unwrap().len(),
-            ENVELOPE_HEADER_LEN as u64
-        );
-        young.close().unwrap();
-
-        let mut merged = std::fs::read(&old_path).unwrap();
-        merged.extend_from_slice(&std::fs::read(&young_path).unwrap());
-        std::fs::write(&merged_path, merged).unwrap();
-        let mut pile = Pile::open(&merged_path).unwrap();
-        assert_eq!(pile.cell(id).unwrap(), None);
-        pile.close().unwrap();
-    }
-
-    #[test]
     fn branch_update_detects_conflict() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "pile.pile");
@@ -6392,7 +6037,7 @@ mod tests {
     }
 
     /// Re-asserting the current want state is a no-op append (mirrors the
-    /// branch-update no-op rule): the LWW cell carries no new information.
+    /// branch-update no-op rule): the LWW state carries no new information.
     #[test]
     fn want_noop_does_not_grow_file() {
         let dir = tempfile::tempdir().unwrap();

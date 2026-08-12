@@ -738,9 +738,9 @@ pub trait PinStore {
 /// handle is both the durable demand key consumed by synchronization
 /// daemons and the cache-retention key after the bytes arrive.
 ///
-/// Wants are independent of named mutable [`PinStore`] branches and
-/// [`LocalCellStore`](crate::local_cell::LocalCellStore) policy cells. A backend
-/// may support either capability without supporting the other. Repeated
+/// Wants are independent of named mutable [`PinStore`] branches and native
+/// collection records. A backend may support either capability without
+/// supporting the other. Repeated
 /// [`want`](Self::want) and [`unwant`](Self::unwant) operations resolve
 /// last-writer-wins per handle; [`wants`](Self::wants) enumerates the
 /// currently asserted set.

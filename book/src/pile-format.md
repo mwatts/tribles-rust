@@ -1,7 +1,8 @@
 # Pile Format
 
-The on-disk pile keeps blobs, native collection records, pins, local cells,
-wants, and collection-publication grants in one append-only file. The write-ahead log *is* the database: all indices are
+The on-disk pile keeps blobs, native collection records, pins, wants, and
+collection-publication grants in one append-only file. The write-ahead log *is*
+the database: all indices are
 reconstructed from the bytes already stored on disk. This design avoids
 background compaction, manifest management, or auxiliary metadata while still
 providing a durable content-addressed store for local repositories. The pile
@@ -29,7 +30,7 @@ record is a **256-byte multiple**:
 | `36..256` | 220 | Kind-specific body and zeroed reserved bytes |
 
 The envelope marker was minted with `trible genid` on 2026-08-11. Record kinds
-reuse the existing current V3 blob/branch/cell/want markers and V4 collection
+reuse the existing current V3 blob/branch/want markers and V4 collection
 markers; no semantic IDs were reminted. A collection descriptor itself remains
 an ordinary blob, not a fourth collection-record kind. Want records likewise
 retain their historical weak-pin/weak-unpin kind IDs; those are physical format
@@ -73,10 +74,9 @@ cannot conservatively mean “no effect”—requires a new generic envelope mar
 instead.
 
 Concatenation is associative ordered composition, not universally commutative:
-branches, cells, and wants are right-biased last-writer-wins logs. Opaque
-filtering is sound because it leaves the relative order of every known record
-unchanged; only collection records additionally collapse to order-independent
-set union.
+branches and wants are right-biased last-writer-wins logs. Opaque filtering is
+sound because it leaves the relative order of every known record unchanged;
+only collection records additionally collapse to order-independent set union.
 
 The reader still accepts original **V1** records (64-byte-aligned blob, branch,
 and tombstone layouts), unenveloped **V3** records, and unenveloped **V4**
@@ -115,8 +115,7 @@ refreshing state.
    envelope kinds as opaque records and distinguishes an unknown legacy marker
    as `ReadError::UnsupportedRecord { offset, marker }`. It never mutates the
    file. Callers rarely need to invoke it directly:
-   `reader`, `records`, `pins`, `head`, `update`, `cell`, and `set_cell` call
-   `refresh` internally
+   `reader`, `records`, `pins`, `head`, and `update` call `refresh` internally
    before they inspect or apply records, so external writers are visible
    without a standalone scan.
 3. **Amputate only when asked to.** `amputate` is the explicit, opt-in repair
@@ -128,8 +127,7 @@ refreshing state.
    is deliberately **not** part of the normal open sequence. The
    `trible pile amputate <path>` command wraps it for operators.
 4. **Append new records.** `put` (through the `BlobStorePut` trait),
-   `CollectionStore::insert`, local-cell replacement, and pin update helpers
-   extend the file. Each
+   `CollectionStore::insert`, and pin update helpers extend the file. Each
    append immediately feeds the bytes back through the record scanner so
    in-memory indices stay synchronised without waiting for a manual `refresh`.
    Blob records use a single `write_vectored` call; fixed-width collection and
@@ -300,8 +298,8 @@ signed `COMMIT` assertions and unsigned `MERGE` and `DERIVE` equations. The
 pile stores these three kinds directly as fixed one-block enveloped records.
 Their semantic kind IDs retain the V4 markers. They are
 **not blob records**, have no following payload, and carry no insertion
-timestamp. They are also distinct from mutable branch pins and local cells
-described below: collection records have no head, tombstone, or
+timestamp. They are also distinct from mutable branch pins and wants:
+collection records have no head, tombstone, or
 last-writer-wins update. Their logical key is the record's intrinsic entity ID.
 
 The collection itself is identified by a canonical `SimpleArchive` descriptor
@@ -415,26 +413,27 @@ pile does not check whether the referenced blob exists locally, allowing
 deployments that store heads on disk while serving blob contents from a remote
 store.
 
-## Local Cell Records
+## Retired Local Cell Records
 
 | Kind | Kind ID | Kind-specific body after the common prefix |
 |---|---|---|
 | Replace | `24264FA9EE46A1ACC0E024AE69774B09` | `36..52` cell ID, `52..84` `SimpleArchive` handle, `84..256` reserved zeros |
 | Clear | `4FE372AE868D22A44DED7A60D579B651` | `36..52` cell ID, `52..256` reserved zeros |
 
-Local cells are named last-writer-wins operational values. Their V3 markers are
-`24264FA9EE46A1ACC0E024AE69774B09` (replace) and
-`4FE372AE868D22A44DED7A60D579B651` (clear), minted with `trible genid` on
-2026-08-10. A clear is material even in a pile that has not observed an older
-value, so concatenating that pile after an older one still suppresses the old
-cell.
+These markers belonged to an experimental named last-writer-wins value API.
+That API and its writers were removed before release: a whole-value replacement
+was not invariant under pile concatenation and made independently edited policy
+silently order-dependent. The markers are retired permanently and must never be
+assigned new meaning.
 
-Cells are deliberately not branches: they have no compare-and-swap guard,
-history, enumeration API, collection authority, or gossip surface. They are
-also not wants. A current cell value is instead a recursive **local operational
-retention root**, allowing queryable policy stored in ordinary
-`SimpleArchive` blobs to survive collection without asserting that it belongs
-to any published collection.
+Current readers recognize both the enveloped form above and the fixed-width
+unenveloped V3 form solely to preserve migration evidence. They expose either
+form as `PileRecordContent::Opaque`, do not project a value into repository
+state, and do not treat its referenced archive as a retention root. Raw tooling
+through `PileRecords` can still copy or explicitly migrate the exact bytes.
+Because their former ownership semantics are no longer interpreted,
+`Pile::rewrite_retained_into` and Yard collection/reclaim refuse a destructive
+rewrite while any such record remains.
 
 ## Want Records
 
@@ -447,7 +446,7 @@ A want assertion (and its retraction counterpart, using the same layout with a
 different marker) is keyed by **blob handle** — per-blob and anonymous, with no
 pin ID. Assertions and retractions resolve last-writer-wins per handle. The
 resulting [`WantStore`](https://docs.rs/triblespace-core/latest/triblespace_core/repo/trait.WantStore.html)
-state is independent from mutable branches and local policy cells: a pile may use wants for
+state is independent from mutable branches and native collections: a pile may use wants for
 fetch-on-demand and bounded cache retention without using branches at all.
 Because wants are durable records, reopening a pile reconstructs the current
 wanted set. The implementation keeps the original weak-pin/weak-unpin marker
@@ -455,13 +454,16 @@ IDs solely so existing piles continue to decode byte-for-byte.
 
 ## Legacy unenveloped records
 
-Unenveloped V3 blob, branch, local-cell, and want records place their kind ID
-directly in `0..16`. Their semantic bodies begin at byte 16 rather than byte
-36: a V3 blob stores timestamp at `16..24`, byte length at `24..32`, and hash at
-`32..64`; branch and cell IDs occupy `16..32`; branch/cell values occupy
-`32..64`; and want handles occupy `16..48`. All have a 256-byte header and
-remain readable byte-for-byte. The legacy V3 and V4 collection layouts are
-listed above.
+Unenveloped V3 blob, branch, and want records place their kind ID directly in
+`0..16`. Their semantic bodies begin at byte 16 rather than byte 36: a V3 blob
+stores timestamp at `16..24`, byte length at `24..32`, and hash at `32..64`;
+branch IDs occupy `16..32`; branch values occupy `32..64`; and want handles
+occupy `16..48`. All have a 256-byte header and remain readable byte-for-byte.
+The two retired local-cell markers are the one deliberate exception to the
+unknown-unenveloped rule: their historical 256-byte boundary is known, so the
+reader crosses them and exposes them as opaque migration evidence. Their former
+cell ID occupied `16..32`, and a replacement's archive handle occupied
+`32..64`. The legacy V3 and V4 collection layouts are listed above.
 
 Piles written before V3 contain 64-byte-aligned V1 records: a 64-byte blob
 header (marker, timestamp, length, hash) followed by a payload padded to a
@@ -477,8 +479,9 @@ number of bytes that were valid so far using `ReadError::CorruptPile`. A
 complete unknown envelope kind is structurally accepted and semantically
 skipped; an unknown unenveloped marker reports its bytes and offset using
 `ReadError::UnsupportedRecord`, since the reader cannot infer that record's
-length. Both errors leave the file untouched, and the reader never guesses a
-legacy record length.
+length. The retired cell markers are recognized as fixed 256-byte opaque
+records rather than guessed. Both errors leave the file untouched, and the
+reader never guesses any other legacy record length.
 
 If the file shrinks between scans into data that has already been applied, the
 process aborts immediately. Previously returned `Bytes` handles would dangle

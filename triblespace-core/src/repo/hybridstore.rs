@@ -7,7 +7,6 @@ use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
-use crate::local_cell::LocalCellStore;
 use crate::prelude::blobencodings::SimpleArchive;
 use crate::repo::BlobStore;
 use crate::repo::BlobStorePut;
@@ -197,26 +196,6 @@ where
         self.branches.gossip(grant)
     }
 }
-
-impl<B, R> LocalCellStore for HybridStore<B, R>
-where
-    R: LocalCellStore,
-{
-    type CellError = R::CellError;
-
-    fn cell(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::CellError> {
-        self.branches.cell(id)
-    }
-
-    fn set_cell(
-        &mut self,
-        id: Id,
-        value: Option<Inline<Handle<SimpleArchive>>>,
-    ) -> Result<(), Self::CellError> {
-        self.branches.set_cell(id, value)
-    }
-}
-
 impl<B, R> WantStore for HybridStore<B, R>
 where
     B: WantStore,
@@ -306,19 +285,6 @@ mod tests {
         let storage = collection.storage_mut();
         assert_eq!(storage.branches.records().unwrap().count(), 1);
         assert_eq!(storage.blobs.records().unwrap().count(), 0);
-    }
-
-    #[test]
-    fn local_cells_delegate_only_to_the_record_side() {
-        let cell = id(4);
-        let value = Inline::<Handle<SimpleArchive>>::new([8; 32]);
-        let mut hybrid = HybridStore::new(MemoryRepo::default(), MemoryRepo::default());
-
-        hybrid.set_cell(cell, Some(value)).unwrap();
-        assert_eq!(hybrid.cell(cell).unwrap(), Some(value));
-        assert_eq!(hybrid.branches.cell(cell).unwrap(), Some(value));
-        assert_eq!(hybrid.blobs.cell(cell).unwrap(), None);
-        assert_eq!(hybrid.pins().unwrap().count(), 0);
     }
 
     #[test]

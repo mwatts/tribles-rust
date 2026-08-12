@@ -48,22 +48,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SimpleArchive -> SuccinctArchiveBlob` mapping or raw set union. The canonical
   empty artifact and byte-identical commuting derivation/merge paths are pinned
   by focused tests; none of these equations authorize membership or retention.
-- **Local operational policy now has a storage primitive independent of pins,
-  collections, and wants.** `LocalCellStore` exposes only named LWW read and
-  replace operations over queryable `SimpleArchive` values, with sync/async
-  adapters and Memory, Pile, Yard, hybrid, lazy, Peer, and object-store
-  implementations. Pile uses freshly minted fixed-width value/tombstone
-  markers (`24264FA9EE46A1ACC0E024AE69774B09` and
-  `4FE372AE868D22A44DED7A60D579B651`); current values are recursive local GC
-  roots but grant no collection authority and have no gossip surface. Network
-  renewal state, pending requests, and all per-team capability entries moved
-  from CAS pins into freshly minted cells (`2F6A91899E035E24348CFEE43BC2EA94`,
-  `3894E3CAF6600BE5CF73EDAE8CB1EFCC`, and
-  `CCA97EB4195A17659C9F9162A951CF85`). A read-only legacy marker
-  guard remains in branch publication until old policy pins are migrated, so
-  upgrading cannot disclose them. `BlobStoreList::contains_blob` supplies the
-  guard's non-demanding membership probe, so an unreadable legacy head is
-  suppressed without manufacturing a blob want.
+- **Node operational policy now lives in one private signer-owned collection.**
+  Capability requests and decisions are immutable facts; renewal and team-cap
+  versions form explicit `metadata::supersedes` DAGs; delivery acknowledgements
+  name exact versions. Approval and initial issuance publish in one collection
+  commit, retries are intrinsic-idempotent, and a union of independently
+  modified piles exposes concurrent heads as a fail-closed conflict instead of
+  selecting an order-dependent winner. Policy collection membership is not
+  gossiped by default and `Peer` deliberately exposes no `CollectionStore`
+  adapter. The public `LocalCellStore`/`AsyncLocalCellStore` footgun and every
+  backend writer were removed. Existing enveloped and unenveloped cell records
+  remain raw-visible as opaque migration evidence; semantic rewrite and Yard
+  reclaim refuse them rather than silently discarding private state. A
+  read-only legacy pin marker guard likewise remains until old policy pins are
+  explicitly migrated, and its non-demanding residency probe cannot
+  manufacture a blob want.
 - **Signed records now use neutral metadata and attestation namespaces.** The
   generic metadata-archive link and Ed25519 signer/signature attributes moved
   out of the legacy repository module without changing their stable IDs or
@@ -1026,8 +1025,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Valid commits recursively retain only dependencies resident in the rewrite's
   coherent source snapshot or live in the Yard, so partially synchronized
   dangling commits remain available for later synchronization without
-  poisoning local retention. Caller-supplied `RetentionRoots`, strong pins,
-  and local cells retain their existing backend-specific missing-data behavior.
+  poisoning local retention. Caller-supplied `RetentionRoots` and strong pins
+  retain their existing backend-specific missing-data behavior.
 
 - **Index recipes ignore blobs carried only by their schema metafacts.** Recipe
   validation still rejects blob-backed descriptor facts, but automatic

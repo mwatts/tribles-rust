@@ -13,7 +13,7 @@
 //! (exponential backoff) for the ones nobody served yet.
 //!
 //! Wants are independent from named [`PinStore`](triblespace_core::repo::PinStore)
-//! cells. The reconciler reads wants and lands blobs; it never changes
+//! branches and native collections. The reconciler reads wants and lands blobs; it never changes
 //! named pin state. The demand that triggered the fetch is already on
 //! record and becomes cache-retention interest after the blob lands.
 //! - **"Absent" is always "not obtained yet", never definitely-absent**

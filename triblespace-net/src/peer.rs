@@ -18,7 +18,7 @@
 //! and any tiering (bounded want retention, generational eviction) lives
 //! in `S` — e.g. a [`Yard`](triblespace_core::repo::yard::Yard). Read-miss
 //! swarm fetches land in `S` under a **want** ([`WantStore`]),
-//! independently of named [`PinStore`] branches and local policy cells. The want is recorded
+//! independently of named [`PinStore`] branches and private policy collections. The want is recorded
 //! durably *before* the fetch — asserted AND
 //! flushed ([`StorageFlush`]), so the marker survives an immediate
 //! process exit — the demand IS the want-signal (a sync daemon's work
@@ -158,7 +158,7 @@ where
     /// scalar so cloning is cheap, but we keep it as an explicit
     /// `Clone` instead of `Copy` so the surface area for accidental
     /// duplication stays auditable. Used by `renewal_tick` to sign
-    /// fresh caps for entries in the renewal-policy cell.
+    /// fresh caps for heads in the renewal-policy version DAG.
     signing_key: SigningKey,
 
     /// Per-entry cooldown for undelivered-cap re-dispatch. The
@@ -391,9 +391,9 @@ where
                     sig_bytes,
                 } => {
                     // Verify the delivered chain against our configured
-                    // team root, then store both blobs locally and replace our
-                    // entry in the team-cap cell, which retains them through
-                    // compaction.
+                    // team root, then store both blobs locally and append our
+                    // team-cap version, whose collection commit retains them
+                    // through compaction.
                     self.absorb_cap_delivery(issuer, cap_bytes, sig_bytes);
                 }
                 NetEvent::CapDeliveryConfirmed {
@@ -520,8 +520,8 @@ where
     }
 
     /// Persist an incoming join request: store the partial-cap blob,
-    /// then add a pending-request entity to the local pending-requests
-    /// cell. The entity id becomes the value `team approve <id>`
+    /// then commit a request and observation to the private node-policy
+    /// collection. The request id becomes the value `team approve <id>`
     /// consumes; the partial-cap blob is recoverable from the entity's
     /// `request_partial_cap` handle.
     fn absorb_cap_request(&mut self, requester: PublisherKey, partial_cap_bytes: anybytes::Bytes) {
@@ -586,8 +586,8 @@ where
     /// Verify a peer-delivered cap chain against our configured team
     /// root and, on success, store both blobs locally.
     ///
-    /// The current pair is recorded in the team-cap cell, whose value is a
-    /// recursive local retention root independent of branch authority.
+    /// The current pair is recorded as a version in the signer-owned policy
+    /// collection, independently of branch authority or gossip permission.
     fn absorb_cap_delivery(
         &mut self,
         issuer: PublisherKey,
@@ -604,7 +604,7 @@ where
         // every fetched parent have already arrived as earlier
         // `NetEvent::Blob` events on this channel, so by the time
         // we get here the store already holds them and we only
-        // need to replace our team-cap cell entry with the leaf pair.
+        // need to append our team-cap version naming the leaf pair.
         let cap_blob: Blob<SimpleArchive> = Blob::new(cap_bytes);
         let sig_blob: Blob<SimpleArchive> = Blob::new(sig_bytes);
         let cap_handle: Inline<Handle<SimpleArchive>> = (&cap_blob).get_handle();

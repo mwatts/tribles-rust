@@ -27,7 +27,6 @@ use crate::collection::{
 use crate::id::{Id, RawId};
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding, INLINE_LEN};
-use crate::local_cell::LocalCellStore;
 use crate::patch::{Entry, IdentitySchema, PATCH};
 
 use crate::prelude::blobencodings::SimpleArchive;
@@ -42,7 +41,6 @@ use super::{
 
 type HandleSet = PATCH<INLINE_LEN, IdentitySchema>;
 type StrongPins = PATCH<16, IdentitySchema, Inline<Handle<UnknownBlob>>>;
-type LocalCells = PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>;
 type WantIndex = PATCH<INLINE_LEN, IdentitySchema, WantEntry>;
 
 #[derive(Debug, Clone, Copy)]
@@ -166,8 +164,6 @@ pub struct Yard {
     generations: Vec<Generation>,
     config: YardConfig,
     strong_pins: StrongPins,
-    /// LWW local-cell view reconstructed old-to-young across every pile.
-    cells: LocalCells,
     want_state: Arc<Mutex<WantState>>,
 }
 
@@ -213,7 +209,6 @@ impl Yard {
             generations,
             config,
             strong_pins: StrongPins::new(),
-            cells: LocalCells::new(),
             want_state: Arc::new(Mutex::new(WantState::default())),
         })
     }
@@ -304,16 +299,12 @@ impl Yard {
                 }
             }
         }
-        let mut yard = Self {
+        Ok(Self {
             generations,
             config,
             strong_pins: StrongPins::new(),
-            cells: LocalCells::new(),
             want_state: Arc::new(Mutex::new(want_state)),
-        };
-        yard.refresh_cells()
-            .map_err(|error| YardOpenError::Io(error.into()))?;
-        Ok(yard)
+        })
     }
 
     /// Number of generations in young-to-old order.
@@ -353,29 +344,6 @@ impl Yard {
     pub fn unpin_strong(&mut self, pin: Id) {
         let raw: RawId = pin.into();
         self.strong_pins.remove(&raw);
-    }
-
-    /// Rebuild the local-cell view from every generation. Generations are
-    /// stored young-to-old, so replay proceeds in reverse; a younger value or
-    /// tombstone then wins exactly as concatenated pile records would.
-    fn refresh_cells(&mut self) -> Result<(), ReadError> {
-        let mut cells = LocalCells::new();
-        for generation in self.generations.iter_mut().rev() {
-            for segment in &mut generation.segments {
-                let (values, tombstones) = segment.pile_mut().local_cell_snapshot()?;
-                for raw in &tombstones {
-                    cells.remove(raw);
-                }
-                for raw in &values {
-                    let value = *values
-                        .get(raw)
-                        .expect("cell key from pile snapshot must retain its value");
-                    cells.replace(&Entry::with_value(raw, value));
-                }
-            }
-        }
-        self.cells = cells;
-        Ok(())
     }
 
     /// Re-append the surviving want markers to the young generation's
@@ -625,8 +593,6 @@ impl Yard {
         &mut self,
         retention: &RetentionRoots,
     ) -> Result<RetentionRoots, YardCollectionRecordsError> {
-        self.refresh_cells()
-            .map_err(YardCollectionRecordsError::Pile)?;
         let mut combined = retention.clone();
         let records = self.records()?.collect::<Result<Vec<_>, _>>()?;
         for record in records {
@@ -651,13 +617,6 @@ impl Yard {
                     combined.retain_recursive(handle);
                 }
             }
-        }
-        for raw in &self.cells {
-            let value = *self
-                .cells
-                .get(raw)
-                .expect("cell key from yard snapshot must retain its value");
-            combined.retain_recursive(value);
         }
         Ok(combined)
     }
@@ -838,33 +797,6 @@ impl CollectionGossipStore for Yard {
         self.generations[0].active_mut().pile_mut().gossip(grant)
     }
 }
-
-impl LocalCellStore for Yard {
-    type CellError = PileWriteError;
-
-    fn cell(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::CellError> {
-        self.refresh_cells().map_err(PileWriteError::from)?;
-        Ok(self.cells.get(&id.into()).copied())
-    }
-
-    fn set_cell(
-        &mut self,
-        id: Id,
-        value: Option<Inline<Handle<SimpleArchive>>>,
-    ) -> Result<(), Self::CellError> {
-        self.refresh_cells().map_err(PileWriteError::from)?;
-        self.generations[0]
-            .active_mut()
-            .pile_mut()
-            .set_cell(id, value)?;
-        match value {
-            Some(value) => self.cells.replace(&Entry::with_value(&id.into(), value)),
-            None => self.cells.remove(&id.into()),
-        }
-        Ok(())
-    }
-}
-
 impl PinStore for Yard {
     type PinsError = Infallible;
     type HeadError = Infallible;
@@ -1269,9 +1201,6 @@ fn reclaim_generation(
         .map_err(YardReclaimError::Pile)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(YardReclaimError::Pile)?;
-    let (local_cells, local_cell_tombstones) = old_pile
-        .local_cell_snapshot()
-        .map_err(YardReclaimError::Pile)?;
     let reader = old_pile.reader().map_err(YardReclaimError::Pile)?;
     File::create(temp_path).map_err(YardReclaimError::Io)?;
     let mut new_pile = Pile::open(temp_path).map_err(YardReclaimError::Pile)?;
@@ -1297,22 +1226,6 @@ fn reclaim_generation(
             .gossip(grant)
             .map_err(YardReclaimError::CollectionRecord)?;
     }
-    for raw in &local_cell_tombstones {
-        let id = Id::new(*raw).expect("Pile never stores a nil local-cell id");
-        new_pile
-            .set_cell(id, None)
-            .map_err(YardReclaimError::LocalCell)?;
-    }
-    for raw in &local_cells {
-        let id = Id::new(*raw).expect("Pile never stores a nil local-cell id");
-        let value = *local_cells
-            .get(raw)
-            .expect("cell key from pile snapshot must retain its value");
-        new_pile
-            .set_cell(id, Some(value))
-            .map_err(YardReclaimError::LocalCell)?;
-    }
-
     new_pile.close().map_err(YardReclaimError::Close)?;
     drop(reader);
     old_pile.close().map_err(YardReclaimError::Close)?;
@@ -1408,9 +1321,9 @@ impl<E: Error + 'static> Error for YardGetError<E> {}
 #[non_exhaustive]
 pub enum YardCollectError {
     Reader(YardReaderError),
-    /// At least one generation contains unknown enveloped records. Collection
-    /// cannot know whether they own otherwise-unrooted blobs, so it refuses
-    /// before changing any generation's live set.
+    /// At least one generation contains opaque records. Collection cannot know
+    /// whether they own otherwise-unrooted blobs, so it refuses before
+    /// changing any generation's live set.
     OpaqueRecords {
         /// Total opaque records found across all generations.
         count: usize,
@@ -1428,7 +1341,7 @@ impl fmt::Display for YardCollectError {
             Self::Reader(err) => write!(f, "failed to create yard reader: {err}"),
             Self::OpaqueRecords { count } => write!(
                 f,
-                "refusing to collect a yard containing {count} unknown enveloped record(s)"
+                "refusing to collect a yard containing {count} opaque record(s)"
             ),
             Self::CollectionRecords(err) => {
                 write!(f, "failed to replay yard collection records: {err}")
@@ -1467,16 +1380,14 @@ impl Error for YardCloseError {}
 pub enum YardReclaimError {
     Io(std::io::Error),
     Pile(ReadError),
-    /// One or more generations contain unknown enveloped records. Reclaim
-    /// cannot infer their retention semantics and refuses before replacing
-    /// any file.
+    /// One or more generations contain opaque records. Reclaim cannot infer
+    /// their retention semantics and refuses before replacing any file.
     OpaqueRecords {
         /// Number of opaque records found by the refusing scan.
         count: usize,
     },
     Transfer(TransferError<Infallible, GetBlobError<Infallible>, InsertError>),
     CollectionRecord(CollectionInsertError),
-    LocalCell(PileWriteError),
     Close(super::pile::FlushError),
     WantMarkers(std::io::Error),
     /// A generation rewrite failed (`primary`) and the subsequent
@@ -1499,13 +1410,12 @@ impl fmt::Display for YardReclaimError {
             Self::Pile(err) => write!(f, "failed to read yard generation pile: {err}"),
             Self::OpaqueRecords { count } => write!(
                 f,
-                "refusing to reclaim a yard containing {count} unknown enveloped record(s)"
+                "refusing to reclaim a yard containing {count} opaque record(s)"
             ),
             Self::Transfer(err) => write!(f, "failed to copy live yard blobs: {err}"),
             Self::CollectionRecord(err) => {
                 write!(f, "failed to copy a yard collection record: {err}")
             }
-            Self::LocalCell(err) => write!(f, "failed to copy a yard local cell: {err}"),
             Self::Close(err) => write!(f, "failed to close yard generation pile: {err}"),
             Self::WantMarkers(err) => {
                 write!(f, "failed to re-record want markers: {err}")
@@ -2231,45 +2141,6 @@ mod tests {
         );
         let reader = reopened.reader().unwrap();
         assert_eq!(get_raw(&reader, cached).unwrap(), raw_blob(b"cached blob"));
-    }
-
-    #[test]
-    fn local_cell_value_is_a_recursive_root_and_survives_reclaim() {
-        let (_dir, paths, mut yard) = yard_with_paths(
-            2,
-            YardConfig {
-                want_budget: 0,
-                strong_level_budget: 0,
-                fanout: 2,
-            },
-        );
-        let cell_id = pin_id(87);
-        let value = yard
-            .put::<SimpleArchive, _>(TribleSet::new())
-            .expect("put cell value");
-        let orphan = yard
-            .put::<RawBytes, _>(raw_blob(b"unowned"))
-            .expect("put orphan");
-        yard.set_cell(cell_id, Some(value)).unwrap();
-
-        yard.collect(&RetentionRoots::new()).unwrap();
-        let reader = yard.reader().unwrap();
-        assert!(reader.get::<TribleSet, SimpleArchive>(value).is_ok());
-        assert!(reader.get::<Bytes, RawBytes>(orphan).is_err());
-        drop(reader);
-
-        yard.reclaim().unwrap();
-        yard.close().unwrap();
-
-        let mut reopened = Yard::open(paths, YardConfig::default()).unwrap();
-        assert_eq!(reopened.cell(cell_id).unwrap(), Some(value));
-        assert!(reopened
-            .reader()
-            .unwrap()
-            .get::<TribleSet, SimpleArchive>(value)
-            .is_ok());
-        assert_eq!(reopened.pins().unwrap().count(), 0);
-        reopened.close().unwrap();
     }
 
     /// The fail-loud posture: opening a yard whose generation pile has a

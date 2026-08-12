@@ -71,8 +71,8 @@ trible team invite --pile PATH --team-root HEX --cap HEX --key ISSUER
 trible team request-join --admin HEX --scope (read|write|admin)
                          [--key PATH] [--pile PATH]
     Send an OP_REQUEST_CAP to an admin's running daemon asking to
-    be issued a capability. The admin sees the request on their
-    pending-requests cell (`team list-pending`); after `team approve`
+    be issued a capability. The admin sees the request in their private
+    node-policy collection (`team list-pending`); after `team approve`
     the freshly-signed cap arrives via the auth-handshake ALPN.
 
 trible team approve --pile PATH --entry HEX --team-root HEX
@@ -223,8 +223,8 @@ There is no team-root-signed revocation blob. The descriptive-caps
 model evicts peers via **per-issuer non-renewal**: every cap carries
 a short natural expiry (default 30 days), the issuer's running
 daemon refreshes the cap before that expiry as long as a
-**renewal-policy entry** says it should, and `team retract` deletes
-the entry. The peer's chain dies at the next natural expiry. The
+**renewal-policy entry** says it should, and `team retract` appends a
+terminal successor version. The peer's chain dies at the next natural expiry. The
 decision is local to the issuer — nothing propagates, nothing
 cascades, nothing has to be signed by the team root.
 
@@ -258,31 +258,40 @@ be tightened to hours.
 Renewal happens via the same `OP_DELIVER_CAP` path that `team
 approve` uses: the issuer's daemon signs a fresh cap with a
 later expiry, dispatches it to the subject's daemon over the
-auth-handshake ALPN, and the subject records it in the team-cap cell.
+auth-handshake ALPN, and the subject records it in its private node-policy
+collection.
 `team list-issued` shows the renewal-policy entries this node is
 keeping renewed; `team retract --entry HEX` marks one as non-renewing.
 
-These three pieces of mutable policy—pending requests, renewal entries, and
-current team capabilities—are stored as ordinary queryable `SimpleArchive`
-values behind three local cells. Cells are recursive local retention roots, but
-they are neither branch authority nor wants and have no gossip surface. All
-teams share one team-cap cell value; replacing one intrinsic team entry leaves
-the other teams unchanged.
+Pending requests, decisions, renewal entries, and current team capabilities are
+facts in one private, signer-owned node-policy collection. “Private” is an
+authority decision, not a second storage primitive: policy code commits to the
+inner collection store, while `Peer` deliberately does not expose those records
+as repository branches or write any collection-gossip grant. Merely belonging
+to a collection therefore does not authorize proactive gossip.
 
-Cell replacement is atomic, but editing a whole archive is deliberately not a
-cross-process transaction. Two processes that read the same cell and then
-replace it can lose one another's otherwise-disjoint edits: the later
-replacement wins for the whole value. Until policy mutations are routed
-through the daemon as the single writer, stop `pile net sync` while running
-policy-mutating CLI commands such as `team invite`, `team approve`, and
-`team retract`, then restart it. Read-only commands may run concurrently.
+Policy history is immutable. A request has a stable intrinsic core, receipt is
+an observation event, and approval or rejection is an immutable decision.
+Approving a request commits the decision and the first issued-cap policy version
+together. Renewal-policy and team-cap changes form explicit version DAGs with
+`metadata::supersedes`; delivery acknowledgements name the exact version they
+confirm. The current value is derived only when a track has one unambiguous
+terminal version. Concurrent descendants survive pile concatenation as a
+visible fork and fail closed instead of letting append order silently choose a
+winner. Exact retries are idempotent, while stale updates are rejected.
 
-An upgraded binary does not yet import policy written in the former
-local-policy-pin representation. Those legacy heads remain conservatively
-suppressed from gossip, so the upgrade cannot disclose them, but renewal,
-pending-request, and team-cap state must be migrated or re-established before
-the new cell-backed policy sees it. Removing that guard depends on landing and
-running the explicit legacy migration.
+The collection is owned by the node signing key. CLI readers and writers must
+load that existing key; silently initializing a replacement key would select a
+different policy collection. Its admitted commits recursively retain their
+descriptor, fact archive, metadata, and referenced capability/signature blobs.
+
+An upgraded binary does not automatically import policy written through the
+former local-policy-pin or experimental local-cell representations. Legacy
+policy pins remain conservatively suppressed from gossip. Retired cell records
+are readable only as opaque raw migration evidence and block destructive pile
+rewrites; operators must explicitly migrate or re-establish their renewal,
+request, and team-cap facts. Removing the pin guard still depends on completing
+that explicit legacy migration.
 
 ## `PeerConfig` Surface
 

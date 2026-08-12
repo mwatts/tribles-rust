@@ -1217,6 +1217,7 @@ mod tests {
     use triblespace_core::id::ExclusiveId;
     use triblespace_core::inline::TryToInline;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
+    use triblespace_core::repo::pile::Pile;
     use triblespace_core::repo::{BlobStorePut, PinStore, PushResult};
 
     fn point_now() -> Inline<NsTAIInterval> {
@@ -1227,6 +1228,11 @@ mod tests {
     fn handle(store: &mut MemoryRepo) -> Inline<Handle<SimpleArchive>> {
         let blob: Blob<SimpleArchive> = TribleSet::new().to_blob();
         store.put(blob).expect("put")
+    }
+
+    fn tagged_handle(store: &mut Pile, tag: Id) -> Inline<Handle<SimpleArchive>> {
+        let value: TribleSet = entity! { metadata::tag: tag }.into();
+        store.put(value).expect("put tagged archive")
     }
 
     #[test]
@@ -1335,6 +1341,60 @@ mod tests {
             update_policy_entry(&mut store, &key, first, point_now(), stale_cap, stale_sig,),
             Err(PolicyError::Stale { .. })
         ));
+    }
+
+    #[test]
+    fn concatenating_independent_policy_forks_fails_closed_in_either_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_path = dir.path().join("base.pile");
+        let left_path = dir.path().join("left.pile");
+        let right_path = dir.path().join("right.pile");
+        std::fs::File::create(&base_path).unwrap();
+
+        let key = SigningKey::generate(&mut OsRng);
+        let team = SigningKey::generate(&mut OsRng).verifying_key();
+        let subject = SigningKey::generate(&mut OsRng).verifying_key();
+        let scope = *triblespace_core::id::ufoid();
+        let first = {
+            let mut base = Pile::open(&base_path).unwrap();
+            let cap = tagged_handle(&mut base, *triblespace_core::id::ufoid());
+            let sig = tagged_handle(&mut base, *triblespace_core::id::ufoid());
+            let first =
+                record_policy_entry(&mut base, &key, team, subject, scope, point_now(), cap, sig)
+                    .unwrap();
+            base.close().unwrap();
+            first
+        };
+        std::fs::copy(&base_path, &left_path).unwrap();
+        std::fs::copy(&base_path, &right_path).unwrap();
+
+        for path in [&left_path, &right_path] {
+            let mut pile = Pile::open(path).unwrap();
+            let cap = tagged_handle(&mut pile, *triblespace_core::id::ufoid());
+            let sig = tagged_handle(&mut pile, *triblespace_core::id::ufoid());
+            update_policy_entry(&mut pile, &key, first, point_now(), cap, sig).unwrap();
+            pile.close().unwrap();
+        }
+
+        let left = std::fs::read(&left_path).unwrap();
+        let right = std::fs::read(&right_path).unwrap();
+        for (name, first_bytes, second_bytes) in
+            [("left-right", &left, &right), ("right-left", &right, &left)]
+        {
+            let merged_path = dir.path().join(format!("{name}.pile"));
+            let mut merged_bytes = first_bytes.to_vec();
+            merged_bytes.extend_from_slice(second_bytes);
+            std::fs::write(&merged_path, merged_bytes).unwrap();
+            let mut merged = Pile::open(&merged_path).unwrap();
+            assert!(matches!(
+                list_renewal_policy(&mut merged, &key),
+                Err(PolicyError::Conflict {
+                    domain: "renewal-policy version DAG",
+                    ..
+                })
+            ));
+            merged.close().unwrap();
+        }
     }
 
     #[test]

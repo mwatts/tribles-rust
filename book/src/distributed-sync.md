@@ -87,13 +87,23 @@ your own same-named branch is how you "accept" the remote changes (see
 the *Merge Flow* section below).
 
 Local renewal decisions, pending capability requests, and the node's current
-team capabilities are not branches at all. They live behind `LocalCellStore`,
-which has no enumeration or gossip operation; a peer therefore cannot publish
-them as HEAD updates. During migration, the publisher still recognizes and
-suppresses the old `local_only_pin` marker so merely upgrading a node cannot
-leak policy heads written by an older binary. The guard checks snapshot
-membership without reading a missing blob, so classification cannot turn a
-private or damaged legacy head into a network want.
+team capabilities are not branches at all. They are immutable facts in one
+private, signer-owned node-policy collection. `Peer` commits policy directly to
+its inner collection store but deliberately does not expose `CollectionStore`
+through the repository adapter, publish the records as HEAD updates, or write a
+collection-gossip grant. Collection membership alone is therefore not gossip
+authority: proactive redistribution requires a separate explicit grant, and
+node policy creates none. A content blob may still be discoverable through the
+generic content-addressed transport, but possessing its hash neither reveals
+nor asserts membership in this collection.
+
+During migration, the publisher still recognizes and suppresses the old
+`local_only_pin` marker so merely upgrading a node cannot leak policy heads
+written by an older binary. The guard checks snapshot membership without
+reading a missing blob, so classification cannot turn a private or damaged
+legacy head into a network want. Records from the retired local-cell experiment
+are projected only as opaque raw migration evidence and never become gossip
+state.
 
 ## Transports
 
