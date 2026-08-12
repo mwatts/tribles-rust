@@ -479,7 +479,7 @@ fn run_invite(
     scope: ScopeArg,
     branches_hex: Vec<String>,
 ) -> Result<()> {
-    let issuer_key = load_or_generate_signing_key(key, &pile_path)?;
+    let issuer_key = load_existing_signing_key(key, &pile_path)?;
     let team_root = parse_pubkey_hex(&team_root_hex)?;
     let issuer_cap_sig_handle = parse_handle_hex(&cap_hex)?;
     let invitee = parse_pubkey_hex(&invitee_hex)?;
@@ -1288,7 +1288,7 @@ fn run_approve(
     let team_root = parse_pubkey_hex(&team_root_hex)?;
     let issuer_cap_sig_handle = parse_handle_hex(&cap_hex)?;
 
-    let issuer_key = load_or_generate_signing_key(key, &pile_path)?;
+    let issuer_key = load_existing_signing_key(key, &pile_path)?;
 
     let (sig_handle, expiry, policy_entry) = with_pile(&pile_path, |pile| {
         // Look up the pending request entry. Read the partial cap

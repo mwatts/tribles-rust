@@ -882,8 +882,22 @@ where
             // bumps, no byte-copy).
             let cap_bytes = new_cap.bytes.clone();
             let sig_bytes = new_sig.bytes.clone();
-            let _ = store.put::<SimpleArchive, Blob<SimpleArchive>>(new_cap);
-            let _ = store.put::<SimpleArchive, Blob<SimpleArchive>>(new_sig);
+            if let Err(error) = store.put::<SimpleArchive, Blob<SimpleArchive>>(new_cap) {
+                tracing::warn!(
+                    entry = ?entry.id,
+                    ?error,
+                    "renewal_tick: failed to persist successor cap; not recording or dispatching"
+                );
+                continue;
+            }
+            if let Err(error) = store.put::<SimpleArchive, Blob<SimpleArchive>>(new_sig) {
+                tracing::warn!(
+                    entry = ?entry.id,
+                    ?error,
+                    "renewal_tick: failed to persist successor signature; not recording or dispatching"
+                );
+                continue;
+            }
 
             // Publish the successor before dispatch. A crash can leave an
             // undelivered durable version (which the retry loop repairs), but

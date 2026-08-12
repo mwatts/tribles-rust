@@ -641,6 +641,8 @@ impl<A: AsyncCollectionGossipStore> CollectionGossipStore for Blocking<A> {
         self.rt.block_on(self.inner.gossip(grant))
     }
 }
+
+#[cfg(feature = "object-store")]
 impl<A: AsyncPinStore> PinStore for Blocking<A> {
     type PinsError = A::PinsError;
     type HeadError = A::HeadError;

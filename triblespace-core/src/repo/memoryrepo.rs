@@ -24,7 +24,7 @@ use crate::inline::InlineEncoding;
 ///
 /// Useful for unit tests or ephemeral repositories where persistence is not
 /// required.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct MemoryRepo {
     /// In-memory blob store for all repository blobs.
     pub blobs: MemoryBlobStore,
@@ -109,7 +109,27 @@ impl crate::repo::BlobStoreKeep for MemoryRepo {
     where
         I: IntoIterator<Item = Inline<Handle<UnknownBlob>>>,
     {
-        self.blobs.keep(handles);
+        let reader = self.blobs.reader().expect("memory reader is infallible");
+        let mut roots = crate::repo::RetentionRoots::new();
+        for record in self.collection_records.values() {
+            let CollectionRecord::Commit(commit) = record else {
+                continue;
+            };
+            if commit.verify_strict().is_err() {
+                continue;
+            }
+            for root in [
+                Inline::<Handle<UnknownBlob>>::new(commit.collection().raw),
+                Inline::<Handle<UnknownBlob>>::new(commit.data().raw),
+                commit.metadata().transmute(),
+            ] {
+                if crate::repo::BlobStoreList::contains_blob(&reader, root).unwrap_or(false) {
+                    roots.retain_recursive(root);
+                }
+            }
+        }
+        self.blobs
+            .keep(handles.into_iter().chain(roots.expanded(&reader)));
     }
 }
 
@@ -281,5 +301,40 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn valid_collection_commits_and_owned_closure_survive_memory_keep() {
+        use ed25519_dalek::SigningKey;
+
+        use crate::blob::encodings::longstring::LongString;
+        use crate::collection::Collection;
+        use crate::repo::{BlobStoreGet, BlobStoreKeep};
+
+        let mut repo = MemoryRepo::default();
+        let child = repo.put::<LongString, _>("owned child".to_owned()).unwrap();
+        let fragment = entity! { crate::metadata::name: child };
+        let scope = *crate::id::ufoid();
+        let key = SigningKey::from_bytes(&[23; 32]);
+        let descriptor = *Collection::new(&mut repo, scope, key.clone()).descriptor();
+        let commit = Collection::new(&mut repo, scope, key)
+            .commit(fragment)
+            .unwrap();
+        let orphan = repo.put::<LongString, _>("orphan".to_owned()).unwrap();
+
+        repo.keep(std::iter::empty::<Inline<Handle<UnknownBlob>>>());
+
+        let reader = repo.reader().unwrap();
+        for retained in [
+            descriptor.handle().transmute(),
+            Inline::<Handle<UnknownBlob>>::new(commit.data().raw),
+            commit.metadata().transmute(),
+            child.transmute(),
+        ] {
+            assert!(reader.get::<Blob<UnknownBlob>, _>(retained).is_ok());
+        }
+        assert!(reader
+            .get::<Blob<UnknownBlob>, _>(orphan.transmute())
+            .is_err());
     }
 }

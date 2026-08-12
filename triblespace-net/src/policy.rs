@@ -53,7 +53,7 @@ attributes! {
     "BF6B9C894E3CA2AB5FBCC12B925C9680" unsafe as pub policy_latest_cap: Handle<SimpleArchive>;
     /// Handle of the signature blob in this exact policy version.
     "5A72B59BF016C7024385B6976BD8AD0E" unsafe as pub policy_latest_sig: Handle<SimpleArchive>;
-    /// Present only on a terminal policy version.
+    /// Retraction time carried by a terminal version or its observation event.
     "57C45D022B79C4D3A021AC0114D973EE" unsafe as pub policy_retracted_at: NsTAIInterval;
     /// Timestamp on an acknowledgement event for one exact policy version.
     "2E289E766CFD4F2554D430C31337BE2B" unsafe as pub policy_delivered_at: NsTAIInterval;
@@ -84,6 +84,8 @@ attributes! {
     "ECA4E42E6FA84DF3B87FECA69F26303E" as pub policy_acknowledges: GenId;
     /// Request whose approval caused an issued policy version.
     "BE1DD8EC542E0DEC4DD64DB189C85CF8" as pub policy_request: GenId;
+    /// Stable terminal version named by an immutable retraction observation.
+    "72244D02BFC88B514C64E37763AEB310" as pub policy_retraction_observes: GenId;
 }
 
 /// Scope for the node's one private policy collection.
@@ -100,6 +102,8 @@ const KIND_REQUEST_DECISION: Id = triblespace_core::id::id_hex!("4B2C21CC2A145CA
 const KIND_POLICY_VERSION: Id = triblespace_core::id::id_hex!("25EC6D8585681E74DAA91A3F2D5ADC5F");
 const KIND_DELIVERY_ACK: Id = triblespace_core::id::id_hex!("2FA2CED1789C8A29FC2B2FF6E6DE48FD");
 const KIND_TEAM_CAP_VERSION: Id = triblespace_core::id::id_hex!("53490AE586FDA93510D4BAFC4B487D2F");
+const KIND_POLICY_RETRACTION_OBSERVATION: Id =
+    triblespace_core::id::id_hex!("5405154A77D3765D121FCCCA573090AA");
 
 /// Derived status for a request that has no decision event.
 pub const STATUS_PENDING: Id = triblespace_core::id::id_hex!("08A49DEBF036B127CF60D8B33A7B9B31");
@@ -230,7 +234,19 @@ fn request_observation_fragment(request: Id, received_at: Inline<NsTAIInterval>)
     }
 }
 
-fn request_decision_fragment(request: Id, status: Id) -> Result<Fragment, PolicyError> {
+#[derive(Clone)]
+struct RequestDecision {
+    id: Id,
+    request: Id,
+    status: Id,
+    predecessors: Vec<Id>,
+}
+
+fn request_decision_fragment(
+    request: Id,
+    status: Id,
+    predecessors: &[Id],
+) -> Result<Fragment, PolicyError> {
     if status != STATUS_APPROVED && status != STATUS_REJECTED {
         return Err(PolicyError::UnknownStatus(status));
     }
@@ -238,10 +254,11 @@ fn request_decision_fragment(request: Id, status: Id) -> Result<Fragment, Policy
         metadata::tag: KIND_REQUEST_DECISION,
         request_decides: request,
         request_status: status,
+        metadata::supersedes*: predecessors.iter().copied(),
     })
 }
 
-fn requests_from(meta: &TribleSet) -> Result<Vec<PendingRequest>, PolicyError> {
+fn request_records_from(meta: &TribleSet) -> Result<BTreeMap<Id, PendingRequest>, PolicyError> {
     let mut requests = BTreeMap::new();
     for (id, requester, partial_cap) in find!(
         (
@@ -305,7 +322,32 @@ fn requests_from(meta: &TribleSet) -> Result<Vec<PendingRequest>, PolicyError> {
             .or_insert(received_at);
     }
 
-    let mut decisions: BTreeMap<Id, Id> = BTreeMap::new();
+    requests
+        .into_iter()
+        .map(|(id, (requester, partial_cap))| {
+            let received_at = observations
+                .get(&id)
+                .copied()
+                .ok_or(PolicyError::Malformed("request has no observation"))?;
+            Ok((
+                id,
+                PendingRequest {
+                    id,
+                    requester,
+                    partial_cap,
+                    received_at,
+                    status: STATUS_PENDING,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn request_decisions(
+    meta: &TribleSet,
+    requests: &BTreeMap<Id, PendingRequest>,
+) -> Result<BTreeMap<Id, RequestDecision>, PolicyError> {
+    let mut decisions = BTreeMap::new();
     for (decision, request, status) in find!(
         (decision: Id, request: Id, status: Id),
         pattern!(meta, [{
@@ -315,7 +357,14 @@ fn requests_from(meta: &TribleSet) -> Result<Vec<PendingRequest>, PolicyError> {
             request_status: ?status,
         }])
     ) {
-        let canonical = request_decision_fragment(request, status)?
+        let mut predecessors: Vec<Id> = find!(
+            value: Id,
+            pattern!(meta, [{ decision @ metadata::supersedes: ?value }])
+        )
+        .collect();
+        predecessors.sort();
+        predecessors.dedup();
+        let canonical = request_decision_fragment(request, status, &predecessors)?
             .root()
             .expect("decision fragment has one root");
         if canonical != decision {
@@ -326,33 +375,77 @@ fn requests_from(meta: &TribleSet) -> Result<Vec<PendingRequest>, PolicyError> {
         if !requests.contains_key(&request) {
             return Err(PolicyError::Malformed("decision names an unknown request"));
         }
-        match decisions.insert(request, status) {
-            Some(previous) if previous != status => {
-                return Err(PolicyError::Conflict {
-                    domain: "request decision",
-                    identity: format!("{request:?}"),
-                });
-            }
-            _ => {}
+        if decisions
+            .insert(
+                decision,
+                RequestDecision {
+                    id: decision,
+                    request,
+                    status,
+                    predecessors,
+                },
+            )
+            .is_some()
+        {
+            return Err(PolicyError::Malformed(
+                "request decision has repeated core fields",
+            ));
         }
     }
+    for decision in decisions.values() {
+        for predecessor in &decision.predecessors {
+            let prior = decisions.get(predecessor).ok_or(PolicyError::Malformed(
+                "request decision has a dangling predecessor",
+            ))?;
+            if prior.request != decision.request {
+                return Err(PolicyError::Malformed(
+                    "request decision supersedes a different request",
+                ));
+            }
+        }
+    }
+    Ok(decisions)
+}
 
-    requests
-        .into_iter()
-        .map(|(id, (requester, partial_cap))| {
-            let received_at = observations
-                .get(&id)
-                .copied()
-                .ok_or(PolicyError::Malformed("request has no observation"))?;
-            Ok(PendingRequest {
-                id,
-                requester,
-                partial_cap,
-                received_at,
-                status: decisions.get(&id).copied().unwrap_or(STATUS_PENDING),
-            })
-        })
-        .collect()
+fn request_decision_frontiers(
+    decisions: &BTreeMap<Id, RequestDecision>,
+) -> BTreeMap<Id, Vec<RequestDecision>> {
+    let superseded: BTreeSet<Id> = decisions
+        .values()
+        .flat_map(|decision| decision.predecessors.iter().copied())
+        .collect();
+    let mut frontiers: BTreeMap<Id, Vec<RequestDecision>> = BTreeMap::new();
+    for decision in decisions
+        .values()
+        .filter(|decision| !superseded.contains(&decision.id))
+    {
+        frontiers
+            .entry(decision.request)
+            .or_default()
+            .push(decision.clone());
+    }
+    for candidates in frontiers.values_mut() {
+        candidates.sort_by_key(|decision| decision.id);
+    }
+    frontiers
+}
+
+fn requests_from(meta: &TribleSet) -> Result<Vec<PendingRequest>, PolicyError> {
+    let mut requests = request_records_from(meta)?;
+    let decisions = request_decisions(meta, &requests)?;
+    for (request, candidates) in request_decision_frontiers(&decisions) {
+        if candidates.len() != 1 {
+            return Err(PolicyError::Conflict {
+                domain: "request decision DAG",
+                identity: format!("{request:?}"),
+            });
+        }
+        requests
+            .get_mut(&request)
+            .expect("decision validation checked request")
+            .status = candidates[0].status;
+    }
+    Ok(requests.into_values().collect())
 }
 
 /// Materialize all stable requests and their derived states.
@@ -390,14 +483,6 @@ where
     Ok(request_id)
 }
 
-fn decision_for(meta: &TribleSet, request_id: Id) -> Result<Id, PolicyError> {
-    requests_from(meta)?
-        .into_iter()
-        .find(|request| request.id == request_id)
-        .map(|request| request.status)
-        .ok_or(PolicyError::NotFound(request_id))
-}
-
 /// Reject a pending request with one immutable decision event.
 ///
 /// Approval intentionally has no symmetric status-only operation; use
@@ -412,19 +497,59 @@ where
     S: BlobStore + CollectionStore + StorageFlush,
     S::Reader: BlobStoreMeta,
 {
+    use triblespace_core::inline::TryToInline;
+
     let meta = materialize(store, signing_key)?;
-    match decision_for(&meta, request_id)? {
-        STATUS_PENDING => commit(
-            store,
-            signing_key,
-            request_decision_fragment(request_id, STATUS_REJECTED)?,
-        ),
-        STATUS_REJECTED => Ok(()),
-        _ => Err(PolicyError::Conflict {
+    let requests = request_records_from(&meta)?;
+    if !requests.contains_key(&request_id) {
+        return Err(PolicyError::NotFound(request_id));
+    }
+    let decisions = request_decisions(&meta, &requests)?;
+    let frontier = request_decision_frontiers(&decisions)
+        .remove(&request_id)
+        .unwrap_or_default();
+    if frontier.len() == 1 && frontier[0].status == STATUS_REJECTED {
+        return Ok(());
+    }
+    if frontier.len() == 1 && frontier[0].status == STATUS_APPROVED {
+        return Err(PolicyError::Conflict {
             domain: "request decision",
             identity: format!("{request_id:?}"),
-        }),
+        });
     }
+    let mut fragment = request_decision_fragment(
+        request_id,
+        STATUS_REJECTED,
+        &frontier
+            .iter()
+            .map(|decision| decision.id)
+            .collect::<Vec<_>>(),
+    )?;
+
+    // Resolving an approval/rejection fork toward rejection must also stop any
+    // issuance authorized by the losing approval. Terminalize each affected
+    // active policy track in the same collection commit, so no intermediate
+    // state can renew or redispatch it.
+    if !frontier.is_empty() {
+        let now = crate::clock::epoch_now();
+        let retracted_at = (now, now)
+            .try_to_inline()
+            .map_err(|error| storage_error("encoding rejection time", error))?;
+        let versions = policy_versions_raw(&meta)?;
+        for candidates in policy_frontiers(&versions).into_values() {
+            if candidates
+                .iter()
+                .any(|version| version.request == Some(request_id))
+                && candidates
+                    .iter()
+                    .any(|version| version.retracted_at.is_none())
+            {
+                let (_, terminal) = terminal_policy_fragment(&candidates, retracted_at);
+                fragment += terminal;
+            }
+        }
+    }
+    commit(store, signing_key, fragment)
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -488,7 +613,84 @@ fn policy_version_fragment(version: &PolicyVersion) -> Fragment {
     }
 }
 
-fn policy_versions(meta: &TribleSet) -> Result<BTreeMap<Id, PolicyVersion>, PolicyError> {
+fn retraction_observation_fragment(version: Id, retracted_at: Inline<NsTAIInterval>) -> Fragment {
+    entity! {
+        metadata::tag: KIND_POLICY_RETRACTION_OBSERVATION,
+        policy_retraction_observes: version,
+        policy_retracted_at: retracted_at,
+    }
+}
+
+fn retraction_observations(
+    meta: &TribleSet,
+) -> Result<BTreeMap<Id, Inline<NsTAIInterval>>, PolicyError> {
+    let mut observations = BTreeMap::new();
+    for (observation, version, retracted_at) in find!(
+        (
+            observation: Id,
+            version: Id,
+            retracted_at: Inline<NsTAIInterval>,
+        ),
+        pattern!(meta, [{
+            ?observation @
+            metadata::tag: KIND_POLICY_RETRACTION_OBSERVATION,
+            policy_retraction_observes: ?version,
+            policy_retracted_at: ?retracted_at,
+        }])
+    ) {
+        if retraction_observation_fragment(version, retracted_at)
+            .root()
+            .expect("retraction observation has one root")
+            != observation
+        {
+            return Err(PolicyError::Malformed(
+                "policy retraction observation id is not intrinsic",
+            ));
+        }
+        observations
+            .entry(version)
+            .and_modify(|current: &mut Inline<NsTAIInterval>| {
+                if retracted_at.raw < current.raw {
+                    *current = retracted_at;
+                }
+            })
+            .or_insert(retracted_at);
+    }
+    Ok(observations)
+}
+
+fn terminal_policy_fragment(
+    frontier: &[PolicyVersion],
+    retracted_at: Inline<NsTAIInterval>,
+) -> (Id, Fragment) {
+    let template = frontier.first().expect("terminal frontier is nonempty");
+    debug_assert!(
+        frontier
+            .iter()
+            .all(|version| version.key() == template.key())
+    );
+    let terminal = PolicyVersion {
+        id: team_root_placeholder(),
+        team_root: template.team_root,
+        subject: template.subject,
+        scope: template.scope,
+        issued_at: template.issued_at,
+        cap: template.cap,
+        sig: template.sig,
+        // The terminal entity is stable across independent retractions. Wall
+        // clock is recorded separately as a commutative observation.
+        retracted_at: None,
+        request: template.request,
+        predecessors: frontier.iter().map(|version| version.id).collect(),
+    };
+    let mut fragment = policy_version_fragment(&terminal);
+    let id = fragment.root().expect("policy version has one root");
+    fragment += retraction_observation_fragment(id, retracted_at);
+    (id, fragment)
+}
+
+fn policy_versions_raw(meta: &TribleSet) -> Result<BTreeMap<Id, PolicyVersion>, PolicyError> {
+    let retractions = retraction_observations(meta)?;
     let mut versions = BTreeMap::new();
     for (id, team_root, subject, scope, issued_at, cap, sig) in find!(
         (
@@ -511,7 +713,7 @@ fn policy_versions(meta: &TribleSet) -> Result<BTreeMap<Id, PolicyVersion>, Poli
             policy_latest_sig: ?sig,
         }])
     ) {
-        let retracted_at = optional_one(find!(
+        let embedded_retracted_at = optional_one(find!(
             value: Inline<NsTAIInterval>,
             pattern!(meta, [{ id @ policy_retracted_at: ?value }])
         ))?;
@@ -534,7 +736,7 @@ fn policy_versions(meta: &TribleSet) -> Result<BTreeMap<Id, PolicyVersion>, Poli
             issued_at,
             cap,
             sig,
-            retracted_at,
+            retracted_at: embedded_retracted_at,
             request,
             predecessors,
         };
@@ -550,8 +752,68 @@ fn policy_versions(meta: &TribleSet) -> Result<BTreeMap<Id, PolicyVersion>, Poli
             ));
         }
     }
+    for (version, retracted_at) in retractions {
+        let current = versions.get_mut(&version).ok_or(PolicyError::Malformed(
+            "retraction observation names an unknown policy version",
+        ))?;
+        current.retracted_at = Some(match current.retracted_at {
+            Some(embedded) if embedded.raw <= retracted_at.raw => embedded,
+            _ => retracted_at,
+        });
+    }
     validate_policy_dag(&versions)?;
     Ok(versions)
+}
+
+fn policy_versions(meta: &TribleSet) -> Result<BTreeMap<Id, PolicyVersion>, PolicyError> {
+    let versions = policy_versions_raw(meta)?;
+    validate_request_backed_versions(meta, &versions)?;
+    Ok(versions)
+}
+
+fn validate_request_backed_versions(
+    meta: &TribleSet,
+    versions: &BTreeMap<Id, PolicyVersion>,
+) -> Result<(), PolicyError> {
+    let requests = request_records_from(meta)?;
+    let decisions = request_decisions(meta, &requests)?;
+    let decision_frontiers = request_decision_frontiers(&decisions);
+    let active: BTreeSet<Id> = policy_frontiers(versions)
+        .into_values()
+        .flatten()
+        .map(|version| version.id)
+        .collect();
+    for version in versions.values() {
+        let Some(request_id) = version.request else {
+            continue;
+        };
+        let request = requests.get(&request_id).ok_or(PolicyError::Malformed(
+            "policy version names an unknown request",
+        ))?;
+        if request.requester != version.subject {
+            return Err(PolicyError::Malformed(
+                "policy version request belongs to a different subject",
+            ));
+        }
+        if active.contains(&version.id) && version.retracted_at.is_none() {
+            match decision_frontiers.get(&request_id).map(Vec::as_slice) {
+                Some([decision]) if decision.status == STATUS_APPROVED => {}
+                Some(decisions) if decisions.len() > 1 => {
+                    return Err(PolicyError::Conflict {
+                        domain: "request decision DAG",
+                        identity: format!("{request_id:?}"),
+                    });
+                }
+                _ => {
+                    return Err(PolicyError::Conflict {
+                        domain: "request-backed policy authorization",
+                        identity: format!("{request_id:?}"),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_policy_dag(versions: &BTreeMap<Id, PolicyVersion>) -> Result<(), PolicyError> {
@@ -600,6 +862,22 @@ fn validate_policy_dag(versions: &BTreeMap<Id, PolicyVersion>) -> Result<(), Pol
 fn policy_heads(
     versions: &BTreeMap<Id, PolicyVersion>,
 ) -> Result<BTreeMap<GrantKey, PolicyVersion>, PolicyError> {
+    let mut heads = BTreeMap::new();
+    for (key, candidates) in policy_frontiers(versions) {
+        if candidates.len() != 1 {
+            return Err(PolicyError::Conflict {
+                domain: "renewal-policy version DAG",
+                identity: key.label(),
+            });
+        }
+        heads.insert(key, candidates.into_iter().next().expect("len checked"));
+    }
+    Ok(heads)
+}
+
+fn policy_frontiers(
+    versions: &BTreeMap<Id, PolicyVersion>,
+) -> BTreeMap<GrantKey, Vec<PolicyVersion>> {
     let superseded: BTreeSet<Id> = versions
         .values()
         .flat_map(|version| version.predecessors.iter().copied())
@@ -611,19 +889,10 @@ fn policy_heads(
             .or_default()
             .push(version.clone());
     }
-    let all_keys: BTreeSet<GrantKey> = versions.values().map(PolicyVersion::key).collect();
-    let mut heads = BTreeMap::new();
-    for key in all_keys {
-        let candidates = grouped.remove(&key).unwrap_or_default();
-        if candidates.len() != 1 {
-            return Err(PolicyError::Conflict {
-                domain: "renewal-policy version DAG",
-                identity: key.label(),
-            });
-        }
-        heads.insert(key, candidates.into_iter().next().expect("len checked"));
+    for candidates in grouped.values_mut() {
+        candidates.sort_by_key(|version| version.id);
     }
-    Ok(heads)
+    grouped
 }
 
 fn delivery_acks(
@@ -757,8 +1026,8 @@ where
         .collect())
 }
 
-fn policy_candidate(
-    meta: &TribleSet,
+fn policy_candidate_from_versions(
+    versions: &BTreeMap<Id, PolicyVersion>,
     team_root: VerifyingKey,
     subject: VerifyingKey,
     scope: Id,
@@ -767,21 +1036,30 @@ fn policy_candidate(
     sig: Inline<Handle<SimpleArchive>>,
     request: Option<Id>,
 ) -> Result<(Id, Option<Fragment>), PolicyError> {
-    let versions = policy_versions(meta)?;
-    let heads = policy_heads(&versions)?;
     let key = GrantKey::new(team_root, subject, scope);
-    let predecessors = match heads.get(&key) {
-        None => Vec::new(),
-        Some(current) if current.retracted_at.is_some() => {
-            return Err(PolicyError::Retracted(current.id));
+    let frontier = policy_frontiers(versions).remove(&key).unwrap_or_default();
+    let existing = versions.values().find(|version| {
+        version.key() == key
+            && version.issued_at == issued_at
+            && version.cap == cap
+            && version.sig == sig
+            && version.request == request
+            && version.retracted_at.is_none()
+    });
+    if let Some(existing) = existing {
+        let selected_fork_head =
+            frontier.len() > 1 && frontier.iter().any(|candidate| candidate.id == existing.id);
+        if !selected_fork_head {
+            return Ok((existing.id, None));
         }
-        Some(current)
-            if current.issued_at == issued_at && current.cap == cap && current.sig == sig =>
-        {
-            return Ok((current.id, None));
-        }
-        Some(current) => vec![current.id],
-    };
+    }
+    if let Some(terminal) = frontier
+        .iter()
+        .find(|version| version.retracted_at.is_some())
+    {
+        return Err(PolicyError::Retracted(terminal.id));
+    }
+    let predecessors = frontier.into_iter().map(|version| version.id).collect();
     let mut version = PolicyVersion {
         id: team_root_placeholder(),
         team_root,
@@ -806,7 +1084,8 @@ fn team_root_placeholder() -> Id {
 }
 
 /// Append an issued credential to its `(team, subject, scope)` version DAG.
-/// Exact replay is idempotent; a new credential supersedes the unique head.
+/// Exact replay is idempotent. A new credential supersedes every current head;
+/// replaying one selected head of a fork explicitly converges on that value.
 pub fn record_policy_entry<S>(
     store: &mut S,
     signing_key: &SigningKey,
@@ -822,8 +1101,10 @@ where
     S::Reader: BlobStoreMeta,
 {
     let meta = materialize(store, signing_key)?;
-    let (id, fragment) =
-        policy_candidate(&meta, team_root, subject, scope, issued_at, cap, sig, None)?;
+    let versions = policy_versions(&meta)?;
+    let (id, fragment) = policy_candidate_from_versions(
+        &versions, team_root, subject, scope, issued_at, cap, sig, None,
+    )?;
     if let Some(fragment) = fragment {
         commit(store, signing_key, fragment)?;
     }
@@ -848,9 +1129,10 @@ where
     S::Reader: BlobStoreMeta,
 {
     let meta = materialize(store, signing_key)?;
-    let request = requests_from(&meta)?
-        .into_iter()
-        .find(|request| request.id == request_id)
+    let requests = request_records_from(&meta)?;
+    let request = requests
+        .get(&request_id)
+        .cloned()
         .ok_or(PolicyError::NotFound(request_id))?;
     if request.requester != subject {
         return Err(PolicyError::RequestSubjectMismatch {
@@ -858,18 +1140,49 @@ where
         });
     }
 
-    let decision = match request.status {
-        STATUS_PENDING => Some(request_decision_fragment(request_id, STATUS_APPROVED)?),
-        STATUS_APPROVED => None,
-        _ => {
+    let decisions = request_decisions(&meta, &requests)?;
+    let frontier = request_decision_frontiers(&decisions)
+        .remove(&request_id)
+        .unwrap_or_default();
+    let exact_approval = || -> Result<Id, PolicyError> {
+        // Approval is a one-shot transition, not an alternate renewal API.
+        // An exact replay returns the already-recorded version even if the
+        // track has since advanced; different issuance bytes must not
+        // silently supersede the current credential.
+        let versions = policy_versions_raw(&meta)?;
+        let mut exact = versions.values().filter(|version| {
+            version.request == Some(request_id)
+                && version.team_root == team_root
+                && version.subject == subject
+                && version.scope == scope
+                && version.issued_at == issued_at
+                && version.cap == cap
+                && version.sig == sig
+                && version.retracted_at.is_none()
+        });
+        match (exact.next(), exact.next()) {
+            (Some(version), None) => Ok(version.id),
+            _ => Err(PolicyError::Conflict {
+                domain: "request approval replay",
+                identity: format!("{request_id:?}"),
+            }),
+        }
+    };
+    let decision_predecessors = match frontier.as_slice() {
+        [] => Vec::new(),
+        [only] if only.status == STATUS_APPROVED => return exact_approval(),
+        [only] if only.status == STATUS_REJECTED => {
             return Err(PolicyError::Conflict {
                 domain: "request decision",
                 identity: format!("{request_id:?}"),
             });
         }
+        _ => frontier.iter().map(|decision| decision.id).collect(),
     };
-    let (version_id, version) = policy_candidate(
-        &meta,
+    let decision = request_decision_fragment(request_id, STATUS_APPROVED, &decision_predecessors)?;
+    let versions = policy_versions_raw(&meta)?;
+    let (version_id, version) = policy_candidate_from_versions(
+        &versions,
         team_root,
         subject,
         scope,
@@ -880,9 +1193,7 @@ where
     )?;
 
     let mut fragment = Fragment::empty();
-    if let Some(decision) = decision {
-        fragment += decision;
-    }
+    fragment += decision;
     if let Some(version) = version {
         fragment += version;
     }
@@ -911,16 +1222,32 @@ where
         .get(&entry_id)
         .cloned()
         .ok_or(PolicyError::NotFound(entry_id))?;
-    let current = policy_heads(&versions)?
-        .get(&previous.key())
-        .cloned()
-        .ok_or(PolicyError::NotFound(entry_id))?;
+    if let Some(existing) = versions.values().find(|version| {
+        version.key() == previous.key()
+            && version.predecessors.contains(&entry_id)
+            && version.retracted_at.is_none()
+            && version.issued_at == new_issued_at
+            && version.cap == new_cap
+            && version.sig == new_sig
+    }) {
+        return Ok(existing.id);
+    }
+    let frontier = policy_frontiers(&versions)
+        .remove(&previous.key())
+        .unwrap_or_default();
+    let [current] = frontier.as_slice() else {
+        return Err(PolicyError::Conflict {
+            domain: "renewal-policy version DAG",
+            identity: previous.key().label(),
+        });
+    };
     if current.id != entry_id {
         return Err(PolicyError::Stale {
             expected: entry_id,
             current: current.id,
         });
     }
+    let current = current.clone();
     if current.retracted_at.is_some() {
         return Err(PolicyError::Retracted(current.id));
     }
@@ -958,42 +1285,25 @@ where
     use triblespace_core::inline::TryToInline;
 
     let meta = materialize(store, signing_key)?;
-    let versions = policy_versions(&meta)?;
+    let versions = policy_versions_raw(&meta)?;
     let previous = versions
         .get(&entry_id)
         .cloned()
         .ok_or(PolicyError::NotFound(entry_id))?;
-    let current = policy_heads(&versions)?
-        .get(&previous.key())
-        .cloned()
-        .ok_or(PolicyError::NotFound(entry_id))?;
-    if current.id != entry_id {
-        return Err(PolicyError::Stale {
-            expected: entry_id,
-            current: current.id,
-        });
+    let frontier = policy_frontiers(&versions)
+        .remove(&previous.key())
+        .unwrap_or_default();
+    if frontier.len() == 1 && frontier[0].retracted_at.is_some() {
+        return Ok(frontier[0].id);
     }
-    if current.retracted_at.is_some() {
-        return Ok(current.id);
+    if frontier.is_empty() {
+        return Err(PolicyError::NotFound(entry_id));
     }
     let now = crate::clock::epoch_now();
     let retracted_at = (now, now)
         .try_to_inline()
         .map_err(|error| storage_error("encoding retraction time", error))?;
-    let terminal = PolicyVersion {
-        id: team_root_placeholder(),
-        team_root: current.team_root,
-        subject: current.subject,
-        scope: current.scope,
-        issued_at: current.issued_at,
-        cap: current.cap,
-        sig: current.sig,
-        retracted_at: Some(retracted_at),
-        request: current.request,
-        predecessors: vec![current.id],
-    };
-    let fragment = policy_version_fragment(&terminal);
-    let id = fragment.root().expect("policy version has one root");
+    let (id, fragment) = terminal_policy_fragment(&frontier, retracted_at);
     commit(store, signing_key, fragment)?;
     Ok(id)
 }
@@ -1045,17 +1355,32 @@ where
     S::Reader: BlobStoreMeta,
 {
     let meta = materialize(store, signing_key)?;
-    let mut matches = policy_versions(&meta)?
-        .into_values()
+    let versions = policy_versions(&meta)?;
+    let mut matches = versions
+        .values()
         .filter(|version| version.subject == subject && version.sig == latest_sig)
         .map(|version| version.id);
     match (matches.next(), matches.next()) {
         (None, None) => Ok(None),
         (Some(id), None) => Ok(Some(id)),
-        _ => Err(PolicyError::Conflict {
-            domain: "authenticated policy version",
-            identity: hex::encode(latest_sig.raw),
-        }),
+        _ => {
+            // Fork convergence can deliberately carry a selected credential
+            // into a new multi-predecessor head, so the same signature may
+            // occur in both historical and current versions. Prefer the one
+            // unique current head; otherwise the acknowledgement is
+            // genuinely ambiguous and must fail closed.
+            let mut current = policy_heads(&versions)?
+                .into_values()
+                .filter(|version| version.subject == subject && version.sig == latest_sig)
+                .map(|version| version.id);
+            match (current.next(), current.next()) {
+                (Some(id), None) => Ok(Some(id)),
+                _ => Err(PolicyError::Conflict {
+                    domain: "authenticated policy version",
+                    identity: hex::encode(latest_sig.raw),
+                }),
+            }
+        }
     }
 }
 
@@ -1078,7 +1403,7 @@ fn team_cap_fragment(version: &TeamCapVersion) -> Fragment {
     }
 }
 
-fn team_cap_heads(meta: &TribleSet) -> Result<BTreeMap<[u8; 32], TeamCapVersion>, PolicyError> {
+fn team_cap_versions(meta: &TribleSet) -> Result<BTreeMap<Id, TeamCapVersion>, PolicyError> {
     let mut versions = BTreeMap::new();
     for (id, team_root, cap, sig) in find!(
         (
@@ -1136,23 +1461,15 @@ fn team_cap_heads(meta: &TribleSet) -> Result<BTreeMap<[u8; 32], TeamCapVersion>
             }
         }
     }
-    let superseded: BTreeSet<Id> = versions
-        .values()
-        .flat_map(|version| version.predecessors.iter().copied())
-        .collect();
-    let teams: BTreeSet<[u8; 32]> = versions
-        .values()
-        .map(|version| version.team_root.to_bytes())
-        .collect();
+    Ok(versions)
+}
+
+fn team_cap_heads_from_versions(
+    versions: &BTreeMap<Id, TeamCapVersion>,
+) -> Result<BTreeMap<[u8; 32], TeamCapVersion>, PolicyError> {
+    let frontiers = team_cap_frontiers(versions);
     let mut heads = BTreeMap::new();
-    for team in teams {
-        let candidates: Vec<_> = versions
-            .values()
-            .filter(|version| {
-                version.team_root.to_bytes() == team && !superseded.contains(&version.id)
-            })
-            .cloned()
-            .collect();
+    for (team, candidates) in frontiers {
         if candidates.len() != 1 {
             return Err(PolicyError::Conflict {
                 domain: "team-cap version DAG",
@@ -1162,6 +1479,33 @@ fn team_cap_heads(meta: &TribleSet) -> Result<BTreeMap<[u8; 32], TeamCapVersion>
         heads.insert(team, candidates.into_iter().next().expect("len checked"));
     }
     Ok(heads)
+}
+
+fn team_cap_frontiers(
+    versions: &BTreeMap<Id, TeamCapVersion>,
+) -> BTreeMap<[u8; 32], Vec<TeamCapVersion>> {
+    let superseded: BTreeSet<Id> = versions
+        .values()
+        .flat_map(|version| version.predecessors.iter().copied())
+        .collect();
+    let mut frontiers: BTreeMap<[u8; 32], Vec<TeamCapVersion>> = BTreeMap::new();
+    for version in versions
+        .values()
+        .filter(|version| !superseded.contains(&version.id))
+    {
+        frontiers
+            .entry(version.team_root.to_bytes())
+            .or_default()
+            .push(version.clone());
+    }
+    for candidates in frontiers.values_mut() {
+        candidates.sort_by_key(|version| version.id);
+    }
+    frontiers
+}
+
+fn team_cap_heads(meta: &TribleSet) -> Result<BTreeMap<[u8; 32], TeamCapVersion>, PolicyError> {
+    team_cap_heads_from_versions(&team_cap_versions(meta)?)
 }
 
 /// Append the current credential for one team. Exact replay is idempotent.
@@ -1177,12 +1521,21 @@ where
     S::Reader: BlobStoreMeta,
 {
     let meta = materialize(store, signing_key)?;
-    let heads = team_cap_heads(&meta)?;
-    let predecessor = match heads.get(&team_root.to_bytes()) {
-        Some(current) if current.cap == cap && current.sig == sig => return Ok(()),
-        Some(current) => vec![current.id],
-        None => Vec::new(),
-    };
+    let versions = team_cap_versions(&meta)?;
+    let frontier = team_cap_frontiers(&versions)
+        .remove(&team_root.to_bytes())
+        .unwrap_or_default();
+    let existing = versions
+        .values()
+        .find(|version| version.team_root == team_root && version.cap == cap && version.sig == sig);
+    if let Some(existing) = existing {
+        let selected_fork_head =
+            frontier.len() > 1 && frontier.iter().any(|candidate| candidate.id == existing.id);
+        if !selected_fork_head {
+            return Ok(());
+        }
+    }
+    let predecessor = frontier.into_iter().map(|version| version.id).collect();
     let version = TeamCapVersion {
         id: team_root_placeholder(),
         team_root,
@@ -1233,6 +1586,18 @@ mod tests {
     fn tagged_handle(store: &mut Pile, tag: Id) -> Inline<Handle<SimpleArchive>> {
         let value: TribleSet = entity! { metadata::tag: tag }.into();
         store.put(value).expect("put tagged archive")
+    }
+
+    fn merge_memory_repo(target: &mut MemoryRepo, mut source: MemoryRepo) {
+        let records = source
+            .records()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        target.blobs.union(source.blobs);
+        for record in records {
+            target.insert(record).unwrap();
+        }
     }
 
     #[test]
@@ -1286,6 +1651,7 @@ mod tests {
         let before = store.records().unwrap().count();
         let cap = handle(&mut store);
         let sig = handle(&mut store);
+        let issued_at = point_now();
         let version = approve_request_and_record_policy(
             &mut store,
             &key,
@@ -1293,7 +1659,7 @@ mod tests {
             team,
             requester,
             *triblespace_core::id::ufoid(),
-            point_now(),
+            issued_at,
             cap,
             sig,
         )
@@ -1307,6 +1673,37 @@ mod tests {
             list_renewal_policy(&mut store, &key).unwrap()[0].id,
             version
         );
+
+        let scope = list_renewal_policy(&mut store, &key).unwrap()[0].scope;
+        let replay = approve_request_and_record_policy(
+            &mut store, &key, request, team, requester, scope, issued_at, cap, sig,
+        )
+        .unwrap();
+        assert_eq!(replay, version);
+        assert_eq!(store.records().unwrap().count(), before + 1);
+
+        let different_cap = {
+            let value: TribleSet = entity! { metadata::tag: *triblespace_core::id::ufoid() }.into();
+            store.put(value).unwrap()
+        };
+        assert!(matches!(
+            approve_request_and_record_policy(
+                &mut store,
+                &key,
+                request,
+                team,
+                requester,
+                scope,
+                issued_at,
+                different_cap,
+                sig,
+            ),
+            Err(PolicyError::Conflict {
+                domain: "request approval replay",
+                ..
+            })
+        ));
+        assert_eq!(store.records().unwrap().count(), before + 1);
     }
 
     #[test]
@@ -1331,20 +1728,44 @@ mod tests {
         .unwrap();
         let second_cap = handle(&mut store);
         let second_sig = handle(&mut store);
-        let second =
-            update_policy_entry(&mut store, &key, first, point_now(), second_cap, second_sig)
-                .unwrap();
+        let second_issued_at = point_now();
+        let second = update_policy_entry(
+            &mut store,
+            &key,
+            first,
+            second_issued_at,
+            second_cap,
+            second_sig,
+        )
+        .unwrap();
         assert_ne!(first, second);
+        assert_eq!(
+            update_policy_entry(
+                &mut store,
+                &key,
+                first,
+                second_issued_at,
+                second_cap,
+                second_sig,
+            )
+            .unwrap(),
+            second
+        );
         let stale_cap = handle(&mut store);
         let stale_sig = handle(&mut store);
         assert!(matches!(
             update_policy_entry(&mut store, &key, first, point_now(), stale_cap, stale_sig,),
             Err(PolicyError::Stale { .. })
         ));
+        let terminal = retract_policy_entry(&mut store, &key, second).unwrap();
+        assert_eq!(
+            retract_policy_entry(&mut store, &key, second).unwrap(),
+            terminal
+        );
     }
 
     #[test]
-    fn concatenating_independent_policy_forks_fails_closed_in_either_order() {
+    fn concatenating_policy_forks_fails_closed_then_converges_explicitly() {
         let dir = tempfile::tempdir().unwrap();
         let base_path = dir.path().join("base.pile");
         let left_path = dir.path().join("left.pile");
@@ -1393,8 +1814,109 @@ mod tests {
                     ..
                 })
             ));
+            let resolved_cap = tagged_handle(&mut merged, *triblespace_core::id::ufoid());
+            let resolved_sig = tagged_handle(&mut merged, *triblespace_core::id::ufoid());
+            let resolved = record_policy_entry(
+                &mut merged,
+                &key,
+                team,
+                subject,
+                scope,
+                point_now(),
+                resolved_cap,
+                resolved_sig,
+            )
+            .unwrap();
+            let listed = list_renewal_policy(&mut merged, &key).unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].id, resolved);
             merged.close().unwrap();
         }
+    }
+
+    #[test]
+    fn concurrent_approve_and_reject_fails_closed_until_explicit_rejection() {
+        let key = SigningKey::generate(&mut OsRng);
+        let team = SigningKey::generate(&mut OsRng).verifying_key();
+        let requester = SigningKey::generate(&mut OsRng).verifying_key();
+        let mut base = MemoryRepo::default();
+        let partial = handle(&mut base);
+        let request =
+            record_pending_request(&mut base, &key, requester, partial, point_now()).unwrap();
+
+        let mut approved = base.clone();
+        let cap = handle(&mut approved);
+        let sig = handle(&mut approved);
+        approve_request_and_record_policy(
+            &mut approved,
+            &key,
+            request,
+            team,
+            requester,
+            *triblespace_core::id::ufoid(),
+            point_now(),
+            cap,
+            sig,
+        )
+        .unwrap();
+        let mut rejected = base;
+        reject_pending_request(&mut rejected, &key, request).unwrap();
+
+        merge_memory_repo(&mut approved, rejected);
+        assert!(matches!(
+            list_pending_requests(&mut approved, &key),
+            Err(PolicyError::Conflict {
+                domain: "request decision DAG",
+                ..
+            })
+        ));
+        assert!(matches!(
+            list_renewal_policy(&mut approved, &key),
+            Err(PolicyError::Conflict {
+                domain: "request decision DAG",
+                ..
+            })
+        ));
+        reject_pending_request(&mut approved, &key, request).unwrap();
+        assert_eq!(
+            list_pending_requests(&mut approved, &key).unwrap()[0].status,
+            STATUS_REJECTED
+        );
+        let policy = list_renewal_policy(&mut approved, &key).unwrap();
+        assert_eq!(policy.len(), 1);
+        assert!(policy[0].retracted_at.is_some());
+        assert!(undelivered_entries(&mut approved, &key).unwrap().is_empty());
+    }
+
+    #[test]
+    fn concurrent_retractions_converge_to_one_stable_terminal() {
+        let key = SigningKey::generate(&mut OsRng);
+        let team = SigningKey::generate(&mut OsRng).verifying_key();
+        let subject = SigningKey::generate(&mut OsRng).verifying_key();
+        let mut base = MemoryRepo::default();
+        let cap = handle(&mut base);
+        let sig = handle(&mut base);
+        let first = record_policy_entry(
+            &mut base,
+            &key,
+            team,
+            subject,
+            *triblespace_core::id::ufoid(),
+            point_now(),
+            cap,
+            sig,
+        )
+        .unwrap();
+        let mut left = base.clone();
+        let mut right = base;
+        let left_terminal = retract_policy_entry(&mut left, &key, first).unwrap();
+        let right_terminal = retract_policy_entry(&mut right, &key, first).unwrap();
+        assert_eq!(left_terminal, right_terminal);
+        merge_memory_repo(&mut left, right);
+        let listed = list_renewal_policy(&mut left, &key).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, left_terminal);
+        assert!(listed[0].retracted_at.is_some());
     }
 
     #[test]
@@ -1416,6 +1938,45 @@ mod tests {
         assert_eq!(
             current_team_cap(&mut store, &key, team_b).unwrap(),
             Some((cap_b, sig_b))
+        );
+    }
+
+    #[test]
+    fn team_cap_fork_can_converge_on_a_selected_existing_head() {
+        let key = SigningKey::generate(&mut OsRng);
+        let team = SigningKey::generate(&mut OsRng).verifying_key();
+        let mut base = MemoryRepo::default();
+        let first_cap = handle(&mut base);
+        let first_sig = handle(&mut base);
+        set_team_cap(&mut base, &key, team, first_cap, first_sig).unwrap();
+
+        let mut left = base.clone();
+        let mut right = base;
+        let left_cap = {
+            let value: TribleSet = entity! { metadata::tag: *triblespace_core::id::ufoid() }.into();
+            left.put(value).unwrap()
+        };
+        let left_sig = handle(&mut left);
+        let right_cap = {
+            let value: TribleSet = entity! { metadata::tag: *triblespace_core::id::ufoid() }.into();
+            right.put(value).unwrap()
+        };
+        let right_sig = handle(&mut right);
+        set_team_cap(&mut left, &key, team, left_cap, left_sig).unwrap();
+        set_team_cap(&mut right, &key, team, right_cap, right_sig).unwrap();
+        merge_memory_repo(&mut left, right);
+        assert!(matches!(
+            current_team_cap(&mut left, &key, team),
+            Err(PolicyError::Conflict {
+                domain: "team-cap version DAG",
+                ..
+            })
+        ));
+
+        set_team_cap(&mut left, &key, team, left_cap, left_sig).unwrap();
+        assert_eq!(
+            current_team_cap(&mut left, &key, team).unwrap(),
+            Some((left_cap, left_sig))
         );
     }
 

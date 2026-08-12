@@ -49,12 +49,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   empty artifact and byte-identical commuting derivation/merge paths are pinned
   by focused tests; none of these equations authorize membership or retention.
 - **Node operational policy now lives in one private signer-owned collection.**
-  Capability requests and decisions are immutable facts; renewal and team-cap
-  versions form explicit `metadata::supersedes` DAGs; delivery acknowledgements
-  name exact versions. Approval and initial issuance publish in one collection
+  Capability requests have stable cores and immutable receipt observations;
+  request decisions, renewal policy, and team-cap versions form explicit
+  `metadata::supersedes` DAGs. Stable terminal renewal versions keep local
+  retraction times in separate observations, and delivery acknowledgements name
+  exact versions. Approval and initial issuance publish in one collection
   commit, retries are intrinsic-idempotent, and a union of independently
   modified piles exposes concurrent heads as a fail-closed conflict instead of
-  selecting an order-dependent winner. Policy collection membership is not
+  selecting an order-dependent winner. Explicit successors can converge those
+  forks. Policy collection membership is not
   gossiped by default and `Peer` deliberately exposes no `CollectionStore`
   adapter. The public `LocalCellStore`/`AsyncLocalCellStore` footgun and every
   backend writer were removed. Existing enveloped and unenveloped cell records

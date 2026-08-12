@@ -271,14 +271,17 @@ as repository branches or write any collection-gossip grant. Merely belonging
 to a collection therefore does not authorize proactive gossip.
 
 Policy history is immutable. A request has a stable intrinsic core, receipt is
-an observation event, and approval or rejection is an immutable decision.
+an observation event, and approval or rejection is an immutable decision DAG.
 Approving a request commits the decision and the first issued-cap policy version
 together. Renewal-policy and team-cap changes form explicit version DAGs with
-`metadata::supersedes`; delivery acknowledgements name the exact version they
-confirm. The current value is derived only when a track has one unambiguous
-terminal version. Concurrent descendants survive pile concatenation as a
-visible fork and fail closed instead of letting append order silently choose a
-winner. Exact retries are idempotent, while stale updates are rejected.
+`metadata::supersedes`; a stable terminal renewal version is paired with a
+separate immutable observation carrying the local retraction time, and delivery
+acknowledgements name the exact version they confirm. The current value is
+derived only when a track has one unambiguous terminal version. Concurrent
+descendants survive pile concatenation as a visible fork and fail closed
+instead of letting append order silently choose a winner. An explicit successor
+can supersede every current head to resolve a fork. Exact retries are
+idempotent, while stale updates are rejected.
 
 The collection is owned by the node signing key. CLI readers and writers must
 load that existing key; silently initializing a replacement key would select a

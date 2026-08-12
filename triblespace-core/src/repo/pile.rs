@@ -1044,6 +1044,14 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
                 },
             })
         }
+        kind @ (MAGIC_MARKER_LOCAL_CELL_V3 | MAGIC_MARKER_LOCAL_CELL_TOMBSTONE_V3) => {
+            fixed_header()?;
+            Ok(PileRecord {
+                offset,
+                len,
+                content: PileRecordContent::Opaque { kind },
+            })
+        }
         kind => Ok(PileRecord {
             offset,
             len,
@@ -1165,11 +1173,16 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
                 content: PileRecordContent::BranchTombstone { branch_id },
             })
         }
-        MAGIC_MARKER_LOCAL_CELL_V3 | MAGIC_MARKER_LOCAL_CELL_TOMBSTONE_V3 => Ok(PileRecord {
-            offset,
-            len: V3_HEADER_LEN,
-            content: PileRecordContent::Opaque { kind: magic },
-        }),
+        MAGIC_MARKER_LOCAL_CELL_V3 | MAGIC_MARKER_LOCAL_CELL_TOMBSTONE_V3 => {
+            if bytes.len() < V3_HEADER_LEN {
+                return Err(corrupt());
+            }
+            Ok(PileRecord {
+                offset,
+                len: V3_HEADER_LEN,
+                content: PileRecordContent::Opaque { kind: magic },
+            })
+        }
         MAGIC_MARKER_WEAK_PIN_V3 => {
             let (header, _) =
                 WeakPinHeaderV3::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
@@ -3731,6 +3744,37 @@ mod tests {
         pile.refresh().unwrap();
         assert_eq!(pile.opaque_record_count().unwrap(), 2);
         pile.close().unwrap();
+    }
+
+    #[test]
+    fn truncated_retired_unenveloped_cell_is_corrupt_not_an_applied_record() {
+        for kind in [
+            MAGIC_MARKER_LOCAL_CELL_V3,
+            MAGIC_MARKER_LOCAL_CELL_TOMBSTONE_V3,
+        ] {
+            for len in [16usize, 17, V3_HEADER_LEN - 1] {
+                let mut bytes = vec![0u8; len];
+                bytes[..16].copy_from_slice(&kind);
+                assert!(matches!(
+                    decode_record(&bytes, 37),
+                    Err(ReadError::CorruptPile { valid_length: 37 })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn retired_enveloped_cell_requires_its_historical_fixed_span() {
+        for kind in [
+            MAGIC_MARKER_LOCAL_CELL_V3,
+            MAGIC_MARKER_LOCAL_CELL_TOMBSTONE_V3,
+        ] {
+            let bytes = test_envelope_bytes(kind, 2, 2 * ENVELOPE_BLOCK_LEN);
+            assert!(matches!(
+                decode_record(&bytes, 41),
+                Err(ReadError::CorruptPile { valid_length: 41 })
+            ));
+        }
     }
 
     #[test]
