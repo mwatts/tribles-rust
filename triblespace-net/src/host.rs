@@ -14,8 +14,12 @@ use std::thread;
 use ed25519_dalek::SigningKey;
 use iroh_base::{EndpointAddr, EndpointId};
 use tracing::{Instrument, debug, debug_span, error, info, info_span, instrument, trace, warn};
+use triblespace_core::collection::{
+    CollectionGossip, CollectionGossipStore, CollectionId, CollectionRecord, CollectionStore,
+};
 
 use crate::channel::{NetCommand, NetEvent, PublisherKey};
+use crate::collection_wire::{CollectionCommitEvidence, CollectionFetch, grant_backed_commits};
 use crate::identity::iroh_secret;
 use crate::protocol::*;
 use crate::transport::{Conn, GossipEvent, GossipSink, Harness, PeerId, Transport};
@@ -26,6 +30,7 @@ fn op_name(op: u8) -> &'static str {
         OP_AUTH => "AUTH",
         OP_GET_BLOB => "GET_BLOB",
         OP_CHILDREN => "CHILDREN",
+        OP_COLLECTION_EVIDENCE => "COLLECTION_EVIDENCE",
         _ => "UNKNOWN",
     }
 }
@@ -149,16 +154,39 @@ pub enum SyncDirection {
 pub struct StoreSnapshot<R> {
     pub reader: R,
     pub branches: triblespace_core::repo::PinSnapshot,
+    collection_records: Vec<CollectionRecord>,
+    collection_gossips: Vec<CollectionGossip>,
 }
 
 impl StoreSnapshot<()> {
     pub fn from_store<S>(store: &mut S) -> Option<StoreSnapshot<S::Reader>>
     where
-        S: triblespace_core::repo::BlobStore + triblespace_core::repo::PinStore,
+        S: triblespace_core::repo::BlobStore
+            + triblespace_core::repo::PinStore
+            + CollectionStore
+            + CollectionGossipStore,
     {
+        // Collection evidence is an additive serving capability. Failure to
+        // enumerate it must never suppress the pre-existing blob/branch
+        // snapshot (notably, legacy model piles remain directly readable).
+        // Invalid structural evidence is inert and simply absent from this
+        // serving view.
+        let collection_records = store
+            .records()
+            .map(|records| records.filter_map(Result::ok).collect())
+            .unwrap_or_default();
+        let collection_gossips = store
+            .gossips()
+            .map(|gossips| gossips.filter_map(Result::ok).collect())
+            .unwrap_or_default();
         let branches = store.pin_snapshot().ok()?;
         let reader = store.reader().ok()?;
-        Some(StoreSnapshot { reader, branches })
+        Some(StoreSnapshot {
+            reader,
+            branches,
+            collection_records,
+            collection_gossips,
+        })
     }
 }
 
@@ -171,6 +199,9 @@ pub trait AnySnapshot: Send + 'static {
     fn get_blob(&self, hash: &RawHash) -> Option<Vec<u8>>;
     fn has_blob(&self, hash: &RawHash) -> bool;
     fn branches(&self) -> &triblespace_core::repo::PinSnapshot;
+    /// Strict grant-backed commits for one exact descriptor handle, in
+    /// deterministic intrinsic-record order.
+    fn collection_evidence(&self, collection: CollectionId) -> Vec<CollectionCommitEvidence>;
 }
 
 impl<R> AnySnapshot for StoreSnapshot<R>
@@ -198,6 +229,14 @@ where
     fn branches(&self) -> &triblespace_core::repo::PinSnapshot {
         &self.branches
     }
+
+    fn collection_evidence(&self, collection: CollectionId) -> Vec<CollectionCommitEvidence> {
+        grant_backed_commits(
+            &self.collection_records,
+            &self.collection_gossips,
+            collection,
+        )
+    }
 }
 
 /// The network capability a `Peer` invokes **inline** for
@@ -214,6 +253,15 @@ pub trait NetCapability: Send + Sync {
     /// Swarm-addressed fetch of `hash` (DHT-routed, content-verified).
     /// `None` is Unavailable.
     fn fetch_blob(&self, hash: RawHash) -> futures::future::BoxFuture<'static, Option<Vec<u8>>>;
+
+    /// Fetch one exact collection's grant-backed commits and named blob
+    /// closure from a specific authenticated peer. Returned evidence remains
+    /// inert; this capability performs no destination admission.
+    fn fetch_collection(
+        &self,
+        peer: PeerId,
+        collection: CollectionId,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<CollectionFetch>>;
 }
 
 /// Gossip-known publishers, most-recent-first. Every HEAD frame names
@@ -286,6 +334,40 @@ impl<T: Transport> NetCapability for NetCap<T> {
                 data = fetch_one(&t, &hash, &pool, my_id, &self_cap).await;
             }
             data.filter(|data| blake3::hash(data).as_bytes() == &hash)
+        })
+    }
+
+    fn fetch_collection(
+        &self,
+        peer: PeerId,
+        collection: CollectionId,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<CollectionFetch>> {
+        let transport = self.transport.clone();
+        let pool = self.pool.clone();
+        let self_cap = self.self_cap;
+        let my_id = self.my_id;
+        Box::pin(async move {
+            if peer == my_id {
+                return Err(anyhow::anyhow!(
+                    "collection reconciliation peer is the local node"
+                ));
+            }
+            let Some(connection) = pool_get(&transport, &pool, peer, &self_cap).await else {
+                return Err(anyhow::anyhow!(
+                    "could not establish an authenticated collection connection to {}",
+                    hex::encode(peer),
+                ));
+            };
+            match crate::collection_wire::fetch_collection(&connection, collection).await {
+                Ok(fetch) => Ok(fetch),
+                Err(error) => {
+                    // A protocol error may indicate a stale pooled connection.
+                    // Semantic rejection also takes this harmless path; the next
+                    // request simply authenticates a fresh connection.
+                    pool_evict(&pool, peer).await;
+                    Err(error)
+                }
+            }
         })
     }
 }
@@ -376,6 +458,38 @@ impl NetSender {
                 None
             }
         }
+    }
+
+    /// Directly fetch one collection's verified publication evidence and
+    /// complete named blob closure from `peer`.
+    ///
+    /// The whole operation, including host readiness, authentication,
+    /// enumeration, and closure transfer, is bounded by `budget`. It does not
+    /// insert records or blobs into any local store.
+    pub async fn fetch_collection(
+        &self,
+        peer: PeerId,
+        collection: CollectionId,
+        budget: std::time::Duration,
+    ) -> anyhow::Result<CollectionFetch> {
+        tokio::time::timeout(budget, self.fetch_collection_unbounded(peer, collection))
+            .await
+            .map_err(|_| anyhow::anyhow!("collection fetch deadline ({budget:?}) exceeded"))?
+    }
+
+    async fn fetch_collection_unbounded(
+        &self,
+        peer: PeerId,
+        collection: CollectionId,
+    ) -> anyhow::Result<CollectionFetch> {
+        let mut receiver = self.cap.clone();
+        let capability = receiver
+            .wait_for(|capability| capability.is_some())
+            .await
+            .map_err(|_| anyhow::anyhow!("network host stopped before becoming ready"))?
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("network capability was not published"))?;
+        capability.fetch_collection(peer, collection).await
     }
 
     /// The unbounded fetch [`fetch_blob`](Self::fetch_blob) wraps in its
@@ -2081,6 +2195,46 @@ async fn serve_stream<T: Transport>(
                 send_hash(send, hash).await?;
             }
             send_hash(send, &NIL_HASH).await?;
+        }
+
+        OP_COLLECTION_EVIDENCE => {
+            let collection = CollectionId::new(recv_hash(recv).await?);
+            // Branch restrictions have no principled interpretation for
+            // descriptor-addressed collections. Until capabilities gain a
+            // collection scope, expose this operation only to read-equivalent
+            // caps with no resource restriction.
+            if !verified.grants_read() || verified.granted_branches().is_some() {
+                warn!(
+                    collection = %hex::encode(&collection.raw[..4]),
+                    "OP_COLLECTION_EVIDENCE denied: unrestricted read required"
+                );
+                send_u32_be(send, COLLECTION_EVIDENCE_REJECTED).await?;
+            } else {
+                let evidence = {
+                    let guard = snap_arc.lock().unwrap();
+                    guard
+                        .as_ref()
+                        .map(|snapshot| snapshot.collection_evidence(collection))
+                        .unwrap_or_default()
+                };
+                let count = u32::try_from(evidence.len())
+                    .map_err(|_| anyhow::anyhow!("too many collection evidence records"))?;
+                // `u32::MAX` is reserved for the authorization sentinel.
+                if count == COLLECTION_EVIDENCE_REJECTED {
+                    return Err(anyhow::anyhow!("too many collection evidence records"));
+                }
+                send_u32_be(send, count).await?;
+                for item in evidence {
+                    send.write_all(&item.encode())
+                        .await
+                        .map_err(|error| anyhow::anyhow!("send collection evidence: {error}"))?;
+                }
+                debug!(
+                    collection = %hex::encode(&collection.raw[..4]),
+                    count,
+                    "OP_COLLECTION_EVIDENCE served"
+                );
+            }
         }
 
         _ => {}

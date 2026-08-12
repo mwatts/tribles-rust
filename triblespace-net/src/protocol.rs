@@ -19,6 +19,8 @@
 //!   AUTH       cap_handle:32 → resp:u8                (0x00 = OK, 0x01 = REJECTED)
 //!   GET_BLOB   hash:32 → len:u64 data                (u64::MAX = missing)
 //!   CHILDREN   parent:32 → hash* nil                  (nil = end)
+//!   COLLECTION_EVIDENCE collection:32 → count:u32 evidence[count]
+//!                  (`u32::MAX` = unrestricted-read capability required)
 //!   (protocol is read-only — no remote writes)
 //!
 //! Branch-state discovery is gossip-driven, not ALPN-driven. HEAD
@@ -42,6 +44,10 @@ pub const OP_CHILDREN: u8 = 0x03;
 /// status (`AUTH_OK` or `AUTH_REJECTED`). Connection state caches the
 /// verified scope; subsequent ops on the same connection inherit it.
 pub const OP_AUTH: u8 = 0x05;
+/// Enumerate grant-backed signed commits for one exact 32-byte collection
+/// descriptor handle. The response framing and strict evidence codec live in
+/// [`crate::collection_wire`].
+pub const OP_COLLECTION_EVIDENCE: u8 = 0x06;
 // CAS_PUSH removed: the data model is monotonic (set union), merge
 // always succeeds, and each node manages its own branches locally.
 // No remote writes needed — the protocol is read-only.
@@ -53,6 +59,12 @@ pub const AUTH_OK: u8 = 0x00;
 /// failed, expired, scope-not-subset, fetch failed for any link, etc.).
 /// The connection should be closed by the client.
 pub const AUTH_REJECTED: u8 = 0x01;
+
+/// `OP_COLLECTION_EVIDENCE` response sentinel: the authenticated capability
+/// either lacks read permission or is branch-restricted. Collection-native
+/// enumeration deliberately requires unrestricted read scope until
+/// collection-scoped capabilities exist.
+pub const COLLECTION_EVIDENCE_REJECTED: u32 = u32::MAX;
 
 pub const NIL_HASH: RawHash = [0u8; 32];
 pub const NIL_BRANCH_ID: RawPinId = [0u8; 16];

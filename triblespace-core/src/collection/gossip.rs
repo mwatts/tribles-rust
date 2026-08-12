@@ -44,6 +44,14 @@ pub const GOSSIP_TRANSCRIPT_VERSION: u32 = 1;
 /// Domain prefix of the signed gossip-grant transcript.
 pub const GOSSIP_TRANSCRIPT_DOMAIN: &[u8] = b"triblespace.collection.gossip.transcript";
 
+/// Canonical byte length of one collection-gossip witness.
+///
+/// The fixed layout is `collection || author || signature_r || signature_s`,
+/// with four 32-byte fields and no padding. Decoding these bytes is
+/// structural only; call [`CollectionGossip::verify_strict`] before treating
+/// the result as a publication grant.
+pub const COLLECTION_GOSSIP_BYTES_LEN: usize = 128;
+
 /// Number of bytes in a version-1 gossip-grant transcript.
 pub const GOSSIP_TRANSCRIPT_LEN: usize = GOSSIP_TRANSCRIPT_DOMAIN.len()
     + 16 // kind id
@@ -94,6 +102,30 @@ impl CollectionGossip {
             signature_r,
             signature_s,
         }
+    }
+
+    /// Decode one exact canonical 128-byte witness without trusting it.
+    ///
+    /// Every byte string of this fixed size has a structural representation;
+    /// invalid public keys and signatures remain available as evidence and
+    /// are rejected by [`verify_strict`](Self::verify_strict).
+    pub fn from_bytes(bytes: [u8; COLLECTION_GOSSIP_BYTES_LEN]) -> Self {
+        Self::from_parts(
+            Inline::new(bytes[0..32].try_into().expect("fixed collection field")),
+            Inline::new(bytes[32..64].try_into().expect("fixed author field")),
+            Inline::new(bytes[64..96].try_into().expect("fixed signature field")),
+            Inline::new(bytes[96..128].try_into().expect("fixed signature field")),
+        )
+    }
+
+    /// Encode this witness into its exact canonical 128-byte layout.
+    pub fn to_bytes(&self) -> [u8; COLLECTION_GOSSIP_BYTES_LEN] {
+        let mut bytes = [0u8; COLLECTION_GOSSIP_BYTES_LEN];
+        bytes[0..32].copy_from_slice(&self.collection.raw);
+        bytes[32..64].copy_from_slice(&self.public_key.raw);
+        bytes[64..96].copy_from_slice(&self.signature_r.raw);
+        bytes[96..128].copy_from_slice(&self.signature_s.raw);
+        bytes
     }
 
     /// Strictly verify the Ed25519 signature over the canonical transcript.
@@ -244,6 +276,27 @@ mod tests {
             hex_literal::hex!("E6D1675C7608CF2F6480218716E99899E9649171809E094B60FCA3B8669CFD00")
         );
         first.verify_strict().unwrap();
+        assert_eq!(CollectionGossip::from_bytes(first.to_bytes()), first);
+        assert_eq!(
+            &first.to_bytes()[0..64],
+            &[collection(3).raw, first.public_key().raw].concat()
+        );
+    }
+
+    #[test]
+    fn byte_decode_is_structural_and_strict_verification_stays_explicit() {
+        let key = SigningKey::from_bytes(&[19; 32]);
+        let valid = CollectionGossip::sign(&key, collection(8));
+        let mut bytes = valid.to_bytes();
+        bytes[127] ^= 1;
+
+        let structural = CollectionGossip::from_bytes(bytes);
+        assert_eq!(structural.collection(), valid.collection());
+        assert_eq!(structural.public_key(), valid.public_key());
+        assert_eq!(
+            structural.verify_strict(),
+            Err(GossipVerificationError::InvalidSignature)
+        );
     }
 
     #[test]
