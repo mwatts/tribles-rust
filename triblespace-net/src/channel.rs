@@ -14,8 +14,12 @@
 //! without re-materialising the buffer.
 
 use anybytes::Bytes;
+use std::sync::mpsc;
+use triblespace_core::collection::CollectionId;
 
+use crate::collection_wire::CollectionFetch;
 use crate::protocol::{RawHash, RawPinId};
+use crate::transport::PeerId;
 
 /// A 32-byte public key identifying a publisher.
 pub type PublisherKey = [u8; 32];
@@ -52,6 +56,15 @@ pub enum NetCommand {
         subject: PublisherKey,
         cap_bytes: Bytes,
         sig_bytes: Bytes,
+    },
+    /// Fetch one exact collection's grant-backed evidence and blob closure
+    /// from a specific authenticated peer.  The host runtime executes the
+    /// async transport work; the synchronous `Peer` side receives inert
+    /// evidence and owns admission policy.
+    FetchCollection {
+        peer: PeerId,
+        collection: CollectionId,
+        reply: mpsc::Sender<anyhow::Result<CollectionFetch>>,
     },
     // The swarm-addressed read-miss fetch is no longer a command: it
     // runs inline via `NetSender::fetch_blob` / `host::NetCapability`,

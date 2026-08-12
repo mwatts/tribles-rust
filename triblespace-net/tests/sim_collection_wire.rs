@@ -126,10 +126,8 @@ fn direct_collection_fetch_returns_verified_evidence_and_blob_closure_without_ad
 
         // Let both host tasks publish their capabilities before the direct op.
         SimNet::step(&vclock(), Duration::from_millis(1)).await;
-        let fetched = client
-            .fetch_collection_from(pk(&server_key), descriptor.handle(), Duration::from_secs(5))
-            .await
-            .unwrap();
+        let (client, fetched) =
+            fetch_while_stepping(client, pk(&server_key), descriptor.handle()).await;
 
         assert_eq!(fetched.collection(), descriptor.handle());
         assert_eq!(fetched.evidence().len(), 1);
@@ -208,10 +206,8 @@ fn direct_collection_fetch_omits_commits_without_author_grants() {
         );
         SimNet::step(&vclock(), Duration::from_millis(1)).await;
 
-        let fetched = client
-            .fetch_collection_from(pk(&server_key), descriptor.handle(), Duration::from_secs(5))
-            .await
-            .unwrap();
+        let (_client, fetched) =
+            fetch_while_stepping(client, pk(&server_key), descriptor.handle()).await;
         assert!(fetched.evidence().is_empty());
         assert!(fetched.roots().is_empty());
         assert!(fetched.blobs().is_empty());
@@ -256,10 +252,39 @@ fn branch_restricted_capability_cannot_enumerate_collections() {
         SimNet::step(&vclock(), Duration::from_millis(1)).await;
 
         let collection = simplearchive_union::descriptor(id(5)).handle();
-        let error = client
-            .fetch_collection_from(pk(&server_key), collection, Duration::from_secs(5))
-            .await
-            .unwrap_err();
+        let (_client, result) =
+            fetch_result_while_stepping(client, pk(&server_key), collection).await;
+        let error = result.unwrap_err();
         assert!(error.to_string().contains("unrestricted read"));
     });
+}
+
+async fn fetch_result_while_stepping(
+    client: triblespace_net::peer::Peer<triblespace_core::repo::memoryrepo::MemoryRepo>,
+    peer: [u8; 32],
+    collection: triblespace_core::collection::CollectionId,
+) -> (
+    triblespace_net::peer::Peer<triblespace_core::repo::memoryrepo::MemoryRepo>,
+    anyhow::Result<triblespace_net::collection_wire::CollectionFetch>,
+) {
+    let worker = std::thread::spawn(move || {
+        let result = client.fetch_collection_from(peer, collection);
+        (client, result)
+    });
+    while !worker.is_finished() {
+        SimNet::step(&vclock(), Duration::from_millis(1)).await;
+    }
+    worker.join().expect("collection fetch worker panicked")
+}
+
+async fn fetch_while_stepping(
+    client: triblespace_net::peer::Peer<triblespace_core::repo::memoryrepo::MemoryRepo>,
+    peer: [u8; 32],
+    collection: triblespace_core::collection::CollectionId,
+) -> (
+    triblespace_net::peer::Peer<triblespace_core::repo::memoryrepo::MemoryRepo>,
+    triblespace_net::collection_wire::CollectionFetch,
+) {
+    let (client, result) = fetch_result_while_stepping(client, peer, collection).await;
+    (client, result.unwrap())
 }

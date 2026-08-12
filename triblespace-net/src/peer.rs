@@ -312,16 +312,15 @@ where
     /// Fetch one exact collection's grant-backed commit evidence and named
     /// blob closure directly from `peer`.
     ///
-    /// The returned bundle is strictly verified but inert: this method does
-    /// not insert blobs, collection records, or gossip grants into the local
-    /// store. Admission is a separate caller-owned capability.
-    pub async fn fetch_collection_from(
+    /// The transport runs on the jailed host runtime. The returned bundle is
+    /// strictly verified but inert: this method does not insert blobs,
+    /// collection records, or gossip grants into the local store.
+    pub fn fetch_collection_from(
         &self,
         peer: [u8; 32],
         collection: triblespace_core::collection::CollectionId,
-        budget: std::time::Duration,
     ) -> anyhow::Result<crate::collection_wire::CollectionFetch> {
-        self.sender.fetch_collection(peer, collection, budget).await
+        self.sender.fetch_collection(peer, collection)
     }
 
     /// Reconcile this peer with the latest external state.

@@ -253,15 +253,6 @@ pub trait NetCapability: Send + Sync {
     /// Swarm-addressed fetch of `hash` (DHT-routed, content-verified).
     /// `None` is Unavailable.
     fn fetch_blob(&self, hash: RawHash) -> futures::future::BoxFuture<'static, Option<Vec<u8>>>;
-
-    /// Fetch one exact collection's grant-backed commits and named blob
-    /// closure from a specific authenticated peer. Returned evidence remains
-    /// inert; this capability performs no destination admission.
-    fn fetch_collection(
-        &self,
-        peer: PeerId,
-        collection: CollectionId,
-    ) -> futures::future::BoxFuture<'static, anyhow::Result<CollectionFetch>>;
 }
 
 /// Gossip-known publishers, most-recent-first. Every HEAD frame names
@@ -334,40 +325,6 @@ impl<T: Transport> NetCapability for NetCap<T> {
                 data = fetch_one(&t, &hash, &pool, my_id, &self_cap).await;
             }
             data.filter(|data| blake3::hash(data).as_bytes() == &hash)
-        })
-    }
-
-    fn fetch_collection(
-        &self,
-        peer: PeerId,
-        collection: CollectionId,
-    ) -> futures::future::BoxFuture<'static, anyhow::Result<CollectionFetch>> {
-        let transport = self.transport.clone();
-        let pool = self.pool.clone();
-        let self_cap = self.self_cap;
-        let my_id = self.my_id;
-        Box::pin(async move {
-            if peer == my_id {
-                return Err(anyhow::anyhow!(
-                    "collection reconciliation peer is the local node"
-                ));
-            }
-            let Some(connection) = pool_get(&transport, &pool, peer, &self_cap).await else {
-                return Err(anyhow::anyhow!(
-                    "could not establish an authenticated collection connection to {}",
-                    hex::encode(peer),
-                ));
-            };
-            match crate::collection_wire::fetch_collection(&connection, collection).await {
-                Ok(fetch) => Ok(fetch),
-                Err(error) => {
-                    // A protocol error may indicate a stale pooled connection.
-                    // Semantic rejection also takes this harmless path; the next
-                    // request simply authenticates a fresh connection.
-                    pool_evict(&pool, peer).await;
-                    Err(error)
-                }
-            }
         })
     }
 }
@@ -460,36 +417,27 @@ impl NetSender {
         }
     }
 
-    /// Directly fetch one collection's verified publication evidence and
-    /// complete named blob closure from `peer`.
+    /// Ask the jailed host runtime to fetch inert collection evidence.
     ///
-    /// The whole operation, including host readiness, authentication,
-    /// enumeration, and closure transfer, is bounded by `budget`. It does not
-    /// insert records or blobs into any local store.
-    pub async fn fetch_collection(
-        &self,
-        peer: PeerId,
-        collection: CollectionId,
-        budget: std::time::Duration,
-    ) -> anyhow::Result<CollectionFetch> {
-        tokio::time::timeout(budget, self.fetch_collection_unbounded(peer, collection))
-            .await
-            .map_err(|_| anyhow::anyhow!("collection fetch deadline ({budget:?}) exceeded"))?
-    }
-
-    async fn fetch_collection_unbounded(
+    /// There is deliberately no public deadline knob. Existing transport
+    /// stage deadlines bound the operation; channel failure reports that the
+    /// host stopped. This method never mutates a store.
+    pub fn fetch_collection(
         &self,
         peer: PeerId,
         collection: CollectionId,
     ) -> anyhow::Result<CollectionFetch> {
-        let mut receiver = self.cap.clone();
-        let capability = receiver
-            .wait_for(|capability| capability.is_some())
-            .await
-            .map_err(|_| anyhow::anyhow!("network host stopped before becoming ready"))?
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("network capability was not published"))?;
-        capability.fetch_collection(peer, collection).await
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.cmd_tx
+            .send(NetCommand::FetchCollection {
+                peer,
+                collection,
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("network host stopped before collection fetch"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("network host stopped during collection fetch"))?
     }
 
     /// The unbounded fetch [`fetch_blob`](Self::fetch_blob) wraps in its
@@ -944,6 +892,40 @@ async fn host_loop<T: Transport>(
                             }
                         }
                         conn.close(0, b"ok");
+                    });
+                }
+                NetCommand::FetchCollection {
+                    peer,
+                    collection,
+                    reply,
+                } => {
+                    let transport = transport.clone();
+                    let pool = conn_pool.clone();
+                    tokio::spawn(async move {
+                        let result = async {
+                            if peer == my_id {
+                                anyhow::bail!("collection reconciliation peer is the local node");
+                            }
+                            let Some(connection) =
+                                pool_get(&transport, &pool, peer, &self_cap).await
+                            else {
+                                anyhow::bail!(
+                                    "could not establish an authenticated collection connection to {}",
+                                    hex::encode(peer),
+                                );
+                            };
+                            match crate::collection_wire::fetch_collection(&connection, collection)
+                                .await
+                            {
+                                Ok(fetch) => Ok(fetch),
+                                Err(error) => {
+                                    pool_evict(&pool, peer).await;
+                                    Err(error)
+                                }
+                            }
+                        }
+                        .await;
+                        let _ = reply.send(result);
                     });
                 }
             }
