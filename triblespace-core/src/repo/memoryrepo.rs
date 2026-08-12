@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::convert::Infallible;
@@ -7,7 +8,9 @@ use crate::blob::encodings::UnknownBlob;
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::blob::MemoryBlobStore;
-use crate::collection::{CollectionRecord, CollectionStore};
+use crate::collection::{
+    CollectionGossip, CollectionGossipStore, CollectionRecord, CollectionStore,
+};
 use crate::local_cell::LocalCellStore;
 use crate::prelude::blobencodings::SimpleArchive;
 use crate::prelude::*;
@@ -35,8 +38,31 @@ pub struct MemoryRepo {
     pub wants: HashSet<Inline<Handle<UnknownBlob>>>,
     /// Canonical collection records keyed by intrinsic record id.
     collection_records: BTreeMap<Id, CollectionRecord>,
+    /// Grow-only signed publication grants in deterministic value order.
+    collection_gossips: BTreeSet<CollectionGossip>,
     /// Local LWW policy cells, disjoint from branch pins and collection truth.
     cells: BTreeMap<Id, Inline<Handle<SimpleArchive>>>,
+}
+
+impl CollectionGossipStore for MemoryRepo {
+    type GossipsError = Infallible;
+    type GossipError = Infallible;
+    type GossipIter<'a> = std::vec::IntoIter<Result<CollectionGossip, Self::GossipsError>>;
+
+    fn gossips<'a>(&'a mut self) -> Result<Self::GossipIter<'a>, Self::GossipsError> {
+        Ok(self
+            .collection_gossips
+            .iter()
+            .copied()
+            .map(Ok)
+            .collect::<Vec<_>>()
+            .into_iter())
+    }
+
+    fn gossip(&mut self, grant: CollectionGossip) -> Result<(), Self::GossipError> {
+        self.collection_gossips.insert(grant);
+        Ok(())
+    }
 }
 
 impl CollectionStore for MemoryRepo {

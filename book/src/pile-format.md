@@ -1,7 +1,7 @@
 # Pile Format
 
 The on-disk pile keeps blobs, native collection records, pins, local cells,
-and wants in one append-only file. The write-ahead log *is* the database: all indices are
+wants, and collection-publication grants in one append-only file. The write-ahead log *is* the database: all indices are
 reconstructed from the bytes already stored on disk. This design avoids
 background compaction, manifest management, or auxiliary metadata while still
 providing a durable content-addressed store for local repositories. The pile
@@ -339,8 +339,39 @@ record is an idempotent success; a different record reconstructing to the same
 ID is reported as a collision. Concatenating piles therefore gives set-union
 semantics for collection records: append order and duplicate copies do not
 change the discovered collection calculus. This order-independent behavior is
-specific to collection records and does not turn the last-writer-wins pin log
-into a set.
+specific to collection records and grow-only publication grants; it does not
+turn the last-writer-wins pin log into a set.
+
+## Collection Publication Grants
+
+`CollectionGossipStore` is separate from `CollectionStore`. A grant is an
+author-signed, irrevocable protocol permission to redistribute that author's
+strictly verified and locally admitted `COMMIT`s in one exact `CollectionId`.
+It is not a fourth collection-calculus record, does not retain any blob, and
+does not require the descriptor or commits to be present when inserted. Thus a
+grant arriving before or after its data has the same meaning under pile
+concatenation.
+
+The kind ID `9BB5B1F4D6FD8FB850B494C2CF51B5CA` was minted with `trible genid` on
+2026-08-12. Its one-block envelope body is:
+
+| Offset | Field |
+|---:|---|
+| `36..68` | collection descriptor handle |
+| `68..100` | author Ed25519 public key |
+| `100..132` | signature R component |
+| `132..164` | signature S component |
+| `164..256` | reserved zeros |
+
+The signed transcript is domain-separated and binds the kind, version, author,
+and descriptor handle. Physical storage preserves even structurally decoded
+invalid witnesses so imported hostile evidence cannot corrupt a whole pile;
+consumers grant publication permission only after strict signature
+verification. Logical authorization is existential over `(author,
+CollectionId)` while storage retains byte-distinct witnesses in deterministic
+order. There is deliberately no tombstone or `ungossip`: once another holder
+has observed permission, local mutation cannot take it back. Runtime policy may
+still choose not to operate a relay.
 
 ### Legacy unenveloped V4 collection records
 

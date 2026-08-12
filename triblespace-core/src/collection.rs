@@ -9,6 +9,8 @@
 /// Narrow write facade for a scoped fact collection.
 pub mod api;
 pub mod discovery;
+/// Orthogonal grow-only publication grants for collection commits.
+pub mod gossip;
 pub mod records;
 /// Stateless semantic admission, closure, provenance, and physical-cover view.
 pub mod resolution;
@@ -23,6 +25,7 @@ pub mod succinctarchive_union;
 
 pub use api::*;
 pub use discovery::*;
+pub use gossip::*;
 pub use records::*;
 pub use resolution::*;
 pub use retention::*;

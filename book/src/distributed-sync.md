@@ -40,6 +40,18 @@ The network thread is a private implementation detail: `Peer::new`
 spawns it; `Peer::drop` winds it down. Async stays jailed inside that
 thread — the storage traits stay sync.
 
+Collection publication uses a separate grow-only authorization surface.
+`CollectionGossipStore` records an author's permanent permission to
+redistribute that author's commits in an exact collection. It is neither a
+command forcing every holder to spend bandwidth nor an access-control grant.
+A participating peer sends the signed grant proof with an eligible commit;
+the receiver strictly verifies both signatures, checks that author and
+collection match, and independently admits the commit under its collection
+authorization and recipe rules before storing it. Unsigned `MERGE` and
+`DERIVE` records are never publication authority. A grant may arrive before
+the descriptor or commit without changing the eventual result, and there is no
+`ungossip` because observed publication cannot be revoked.
+
 ```rust,ignore
 use std::collections::HashSet;
 

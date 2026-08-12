@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Collection publication is an orthogonal grow-only store capability.**
+  `CollectionGossipStore` holds fixed 128-byte Ed25519 grants authorizing
+  redistribution of one author's strictly verified commits in an exact
+  descriptor-identified collection. There is intentionally no `ungossip`:
+  observed publication cannot be revoked by later local state. Grants are not
+  collection-calculus records, admission proofs, access control, delivery
+  requests, or GC roots. Memory, hybrid, lazy, Pile, Yard, sync/async adapters,
+  and object-store backends preserve deterministic set union. Pile kind
+  `9BB5B1F4D6FD8FB850B494C2CF51B5CA` was minted with `trible genid` on
+  2026-08-12; its envelope stores collection, author, R, and S directly and
+  remains valid before the named descriptor or commits arrive.
 - **Owned collections now expose coherent known-prefix snapshots.**
   `Collection::snapshot()` performs one native-record discovery and returns
   the materialized facts, exact signer-authorized commits, and the blob reader

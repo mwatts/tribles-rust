@@ -48,7 +48,8 @@ use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
 use crate::collection::{
-    CollectionCommit, CollectionDerive, CollectionMerge, CollectionRecord, CollectionStore,
+    CollectionCommit, CollectionDerive, CollectionGossip, CollectionGossipStore, CollectionMerge,
+    CollectionRecord, CollectionStore, KIND_COLLECTION_GOSSIP,
 };
 use crate::id::Id;
 use crate::id::RawId;
@@ -120,6 +121,12 @@ const MAGIC_MARKER_COLLECTION_DERIVE_V3: RawId = hex!("07ECF056F6F015D94389FFF21
 const MAGIC_MARKER_COLLECTION_COMMIT_V4: RawId = hex!("CBF2CF97D52A3486E16C12D70D397C66");
 const MAGIC_MARKER_COLLECTION_MERGE_V4: RawId = hex!("9F5D028D4C423620D6957A5F726FA727");
 const MAGIC_MARKER_COLLECTION_DERIVE_V4: RawId = hex!("ECFB2EE90ED8042244F7BAC704454BB9");
+/// Grow-only signed collection-publication grant.
+///
+/// Unlike a collection-calculus record this is orthogonal low-level store
+/// metadata and does not retain the named descriptor or any collection data.
+/// The semantic kind was minted with `trible genid` on 2026-08-12.
+const MAGIC_MARKER_COLLECTION_GOSSIP_V1: RawId = KIND_COLLECTION_GOSSIP.raw();
 /// Local-cell records, minted on 2026-08-10 with `trible genid`.
 ///
 /// A set record replaces one local operational slot; a tombstone clears it.
@@ -717,6 +724,37 @@ struct CollectionDeriveHeaderEnvelope {
     reserved: [u8; 92],
 }
 
+/// Signed grow-only publication grant for one author's commits in a
+/// descriptor-identified collection.
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct CollectionGossipHeaderEnvelope {
+    envelope_marker: RawId,
+    record_kind: RawId,
+    span_blocks: [u8; 4],
+    collection: RawInline,
+    public_key: RawInline,
+    signature_r: RawInline,
+    signature_s: RawInline,
+    reserved: [u8; 92],
+}
+
+impl CollectionGossipHeaderEnvelope {
+    fn new(grant: &CollectionGossip) -> Self {
+        let (signature_r, signature_s) = grant.signature();
+        Self {
+            envelope_marker: MAGIC_MARKER_ENVELOPE,
+            record_kind: MAGIC_MARKER_COLLECTION_GOSSIP_V1,
+            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
+            collection: grant.collection().raw,
+            public_key: grant.public_key().raw,
+            signature_r: signature_r.raw,
+            signature_s: signature_s.raw,
+            reserved: [0u8; 92],
+        }
+    }
+}
+
 impl CollectionDeriveHeaderEnvelope {
     fn new(record: &CollectionDerive) -> Self {
         let (input, output) = record.mapping();
@@ -783,6 +821,7 @@ const _: () = {
     assert!(std::mem::size_of::<CollectionCommitHeaderEnvelope>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<CollectionMergeHeaderEnvelope>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<CollectionDeriveHeaderEnvelope>() == ENVELOPE_HEADER_LEN);
+    assert!(std::mem::size_of::<CollectionGossipHeaderEnvelope>() == ENVELOPE_HEADER_LEN);
 };
 
 /// A single record decoded from a pile file.
@@ -879,6 +918,11 @@ pub enum PileRecordContent {
     Collection {
         /// Canonically reconstructed semantic record.
         record: CollectionRecord,
+    },
+    /// One signed grow-only collection-publication grant.
+    CollectionGossip {
+        /// Structural evidence; consumers verify its signature before use.
+        grant: CollectionGossip,
     },
     /// One recognized legacy V3 collection header.
     ///
@@ -1089,6 +1133,26 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
                         Inline::new(header.input),
                         Inline::new(header.output),
                     )),
+                },
+            })
+        }
+        MAGIC_MARKER_COLLECTION_GOSSIP_V1 => {
+            fixed_header()?;
+            let (header, _) = CollectionGossipHeaderEnvelope::try_read_from_prefix(bytes)
+                .map_err(|_| corrupt())?;
+            if header.reserved.iter().any(|byte| *byte != 0) {
+                return Err(corrupt());
+            }
+            Ok(PileRecord {
+                offset,
+                len,
+                content: PileRecordContent::CollectionGossip {
+                    grant: CollectionGossip::from_parts(
+                        Inline::new(header.collection),
+                        Inline::<ED25519PublicKey>::new(header.public_key),
+                        Inline::<ED25519RComponent>::new(header.signature_r),
+                        Inline::<ED25519SComponent>::new(header.signature_s),
+                    ),
                 },
             })
         }
@@ -1582,6 +1646,9 @@ enum Applied {
     Collection {
         id: Id,
     },
+    CollectionGossip {
+        grant: CollectionGossip,
+    },
     LegacyCollectionV3,
     Opaque,
 }
@@ -1613,6 +1680,9 @@ pub struct Pile {
     /// Immutable collection records keyed by their intrinsic entity id.
     /// `BTreeMap` makes enumeration independent of append/cat order.
     collection_records: BTreeMap<Id, CollectionRecord>,
+    /// Immutable signed collection-publication grants. This is a grow-only
+    /// set and contributes no blob-retention roots.
+    collection_gossips: BTreeSet<CollectionGossip>,
     /// Exact byte-distinct legacy V3 collection headers accepted during replay.
     /// They remain inert but are conservatively carried through retained
     /// rewrites so an explicit future migration still has its source evidence.
@@ -2067,6 +2137,7 @@ impl Pile {
             cells: PATCH::<16, IdentitySchema, Inline<Handle<SimpleArchive>>>::new(),
             cell_tombstones: PATCH::<16, IdentitySchema>::new(),
             collection_records: BTreeMap::new(),
+            collection_gossips: BTreeSet::new(),
             legacy_collection_headers: BTreeSet::new(),
             opaque_records: 0,
             wants: PATCH::<32, IdentitySchema>::new(),
@@ -2228,6 +2299,10 @@ impl Pile {
                 }
                 Applied::Collection { id }
             }
+            PileRecordContent::CollectionGossip { grant } => {
+                self.collection_gossips.insert(grant);
+                Applied::CollectionGossip { grant }
+            }
             PileRecordContent::LegacyCollectionV3 { .. } => {
                 self.legacy_collection_headers.insert(
                     legacy_collection_header
@@ -2333,6 +2408,7 @@ impl Pile {
             std::ptr::drop_in_place(&mut this.cells);
             std::ptr::drop_in_place(&mut this.cell_tombstones);
             std::ptr::drop_in_place(&mut this.collection_records);
+            std::ptr::drop_in_place(&mut this.collection_gossips);
             std::ptr::drop_in_place(&mut this.legacy_collection_headers);
             std::ptr::drop_in_place(&mut this.wants);
         }
@@ -2491,6 +2567,19 @@ pub struct PileCollectionRecordIter {
     inner: std::collections::btree_map::IntoValues<Id, CollectionRecord>,
 }
 
+/// Deterministic owned snapshot of the pile's grow-only publication grants.
+pub struct PileCollectionGossipIter {
+    inner: std::collections::btree_set::IntoIter<CollectionGossip>,
+}
+
+impl Iterator for PileCollectionGossipIter {
+    type Item = Result<CollectionGossip, ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(Ok)
+    }
+}
+
 impl Iterator for PileCollectionRecordIter {
     type Item = Result<CollectionRecord, ReadError>;
 
@@ -2611,6 +2700,50 @@ impl CollectionStore for Pile {
 
             match self.apply_next()? {
                 Some(Applied::Collection { id: applied }) if applied == id => Ok(()),
+                Some(_) | None => Err(CollectionInsertError::UnexpectedReadback),
+            }
+        })();
+        let unlock = self.file.unlock();
+        result?;
+        unlock?;
+        Ok(())
+    }
+}
+
+impl CollectionGossipStore for Pile {
+    type GossipsError = ReadError;
+    type GossipError = CollectionInsertError;
+    type GossipIter<'a> = PileCollectionGossipIter;
+
+    fn gossips<'a>(&'a mut self) -> Result<Self::GossipIter<'a>, Self::GossipsError> {
+        self.refresh()?;
+        Ok(PileCollectionGossipIter {
+            inner: self.collection_gossips.clone().into_iter(),
+        })
+    }
+
+    fn gossip(&mut self, grant: CollectionGossip) -> Result<(), Self::GossipError> {
+        let header = CollectionGossipHeaderEnvelope::new(&grant);
+
+        self.file.lock()?;
+        let result = (|| {
+            self.refresh_locked()?;
+
+            if self.collection_gossips.contains(&grant) {
+                return Ok(());
+            }
+
+            self.dirty = true;
+            let written = self.file.write(header.as_bytes())?;
+            if written != ENVELOPE_HEADER_LEN {
+                return Err(CollectionInsertError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write complete collection-gossip grant",
+                )));
+            }
+
+            match self.apply_next()? {
+                Some(Applied::CollectionGossip { grant: applied }) if applied == grant => Ok(()),
                 Some(_) | None => Err(CollectionInsertError::UnexpectedReadback),
             }
         })();
@@ -2753,6 +2886,7 @@ impl Pile {
                     Some(Applied::WeakPin { .. }) => {}
                     Some(Applied::WeakUnpin { .. }) => {}
                     Some(Applied::Collection { .. }) => {}
+                    Some(Applied::CollectionGossip { .. }) => {}
                     Some(Applied::LegacyCollectionV3) => {}
                     Some(Applied::Opaque) => {}
                     None => {
@@ -3140,6 +3274,8 @@ pub struct PileRewriteStats {
     pub local_cells: usize,
     /// Number of want markers recreated.
     pub wants: usize,
+    /// Number of grow-only collection-publication grants preserved.
+    pub collection_gossips: usize,
 }
 
 /// Failure while copying one policy-selected pile state into another pile.
@@ -3255,6 +3391,7 @@ impl Pile {
         let local_cells = self.cells.clone();
         let local_cell_tombstones = self.cell_tombstones.clone();
         let collection_records = self.collection_records.clone();
+        let collection_gossips = self.collection_gossips.clone();
         let legacy_collection_headers = self.legacy_collection_headers.clone();
         let source_wants = self.wants.clone();
 
@@ -3336,6 +3473,11 @@ impl Pile {
                 .insert(record)
                 .map_err(PileRewriteError::Collection)?;
         }
+        for grant in &collection_gossips {
+            destination
+                .gossip(*grant)
+                .map_err(PileRewriteError::Collection)?;
+        }
 
         // Recreate explicit clears as well as present values. This matters
         // when the destination already carries an older value or is later
@@ -3375,6 +3517,7 @@ impl Pile {
             strong_pins: strong_pins.len() as usize,
             local_cells: (local_cells.len() + local_cell_tombstones.len()) as usize,
             wants: preserved_wants,
+            collection_gossips: collection_gossips.len(),
         })
     }
 }
@@ -3458,6 +3601,19 @@ mod tests {
                 collection_test_hash(8),
                 collection_test_hash(9),
             )),
+        ]
+    }
+
+    fn collection_test_gossips() -> Vec<CollectionGossip> {
+        vec![
+            CollectionGossip::sign(
+                &SigningKey::from_bytes(&[21; 32]),
+                collection_test_collection(1),
+            ),
+            CollectionGossip::sign(
+                &SigningKey::from_bytes(&[22; 32]),
+                collection_test_collection(2),
+            ),
         ]
     }
 
@@ -3640,6 +3796,8 @@ mod tests {
         for record in &collection_records {
             pile.insert(*record).unwrap();
         }
+        let collection_gossip = collection_test_gossips()[0];
+        pile.gossip(collection_gossip).unwrap();
         pile.close().unwrap();
 
         let expected = [
@@ -3653,6 +3811,7 @@ mod tests {
             (MAGIC_MARKER_COLLECTION_COMMIT_V4, 1),
             (MAGIC_MARKER_COLLECTION_MERGE_V4, 1),
             (MAGIC_MARKER_COLLECTION_DERIVE_V4, 1),
+            (MAGIC_MARKER_COLLECTION_GOSSIP_V1, 1),
         ];
         let mut records = PileRecords::open(&path).unwrap();
         let decoded = (&mut records).collect::<Result<Vec<_>, _>>().unwrap();
@@ -3681,6 +3840,14 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
             sorted_collection_records(collection_records)
+        );
+        assert_eq!(
+            reopened
+                .gossips()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![collection_gossip]
         );
         reopened.close().unwrap();
     }
@@ -4320,6 +4487,49 @@ mod tests {
     }
 
     #[test]
+    fn collection_gossips_replay_idempotently_and_cat_as_set_union() {
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = fresh_empty_pile_path(&dir, "gossip-a.pile");
+        let path_b = fresh_empty_pile_path(&dir, "gossip-b.pile");
+        let path_ab = dir.path().join("gossip-ab.pile");
+        let path_ba = dir.path().join("gossip-ba.pile");
+        let grants = collection_test_gossips();
+
+        let mut a = Pile::open(&path_a).unwrap();
+        a.gossip(grants[0]).unwrap();
+        let once = std::fs::metadata(&path_a).unwrap().len();
+        a.gossip(grants[0]).unwrap();
+        assert_eq!(std::fs::metadata(&path_a).unwrap().len(), once);
+        a.close().unwrap();
+
+        let mut b = Pile::open(&path_b).unwrap();
+        b.gossip(grants[1]).unwrap();
+        b.close().unwrap();
+
+        let bytes_a = std::fs::read(&path_a).unwrap();
+        let bytes_b = std::fs::read(&path_b).unwrap();
+        let mut ab = bytes_a.clone();
+        ab.extend_from_slice(&bytes_b);
+        std::fs::write(&path_ab, ab).unwrap();
+        let mut ba = bytes_b;
+        ba.extend_from_slice(&bytes_a);
+        std::fs::write(&path_ba, ba).unwrap();
+
+        let expected = grants.into_iter().collect::<BTreeSet<_>>();
+        for path in [&path_ab, &path_ba] {
+            let mut pile = Pile::open(path).unwrap();
+            let actual = pile
+                .gossips()
+                .unwrap()
+                .collect::<Result<BTreeSet<_>, _>>()
+                .unwrap();
+            assert_eq!(actual, expected);
+            assert!(actual.iter().all(|grant| grant.verify_strict().is_ok()));
+            pile.close().unwrap();
+        }
+    }
+
+    #[test]
     fn native_collection_record_torn_tail_is_detected_and_amputated() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "torn.pile");
@@ -4413,6 +4623,7 @@ mod tests {
                 strong_pins: 1,
                 local_cells: 2,
                 wants: 1,
+                collection_gossips: 0,
             }
         );
 

@@ -1,6 +1,8 @@
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
-use crate::collection::{CollectionRecord, CollectionStore};
+use crate::collection::{
+    CollectionGossip, CollectionGossipStore, CollectionRecord, CollectionStore,
+};
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
@@ -171,6 +173,28 @@ where
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
         self.branches.insert(record)
+    }
+}
+
+impl<B, R> CollectionGossipStore for HybridStore<B, R>
+where
+    R: CollectionGossipStore,
+{
+    type GossipsError = R::GossipsError;
+    type GossipError = R::GossipError;
+
+    type GossipIter<'a>
+        = R::GossipIter<'a>
+    where
+        B: 'a,
+        R: 'a;
+
+    fn gossips<'a>(&'a mut self) -> Result<Self::GossipIter<'a>, Self::GossipsError> {
+        self.branches.gossips()
+    }
+
+    fn gossip(&mut self, grant: CollectionGossip) -> Result<(), Self::GossipError> {
+        self.branches.gossip(grant)
     }
 }
 

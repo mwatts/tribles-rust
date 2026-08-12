@@ -23,7 +23,7 @@ use crate::blob::Blob;
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
-use crate::collection::{CollectionRecord, RecordDecodeError};
+use crate::collection::{CollectionGossip, CollectionRecord, RecordDecodeError};
 use crate::id::Id;
 use crate::id::RawId;
 use crate::inline::encodings::hash::{Blake3, Handle, Hash};
@@ -35,7 +35,8 @@ use crate::prelude::blobencodings::SimpleArchive;
 
 use super::async_store::{
     AsyncBlobStore, AsyncBlobStoreForget, AsyncBlobStoreGet, AsyncBlobStoreList,
-    AsyncBlobStoreMeta, AsyncBlobStorePut, AsyncCollectionStore, AsyncPinStore,
+    AsyncBlobStoreMeta, AsyncBlobStorePut, AsyncCollectionGossipStore, AsyncCollectionStore,
+    AsyncPinStore,
 };
 use super::PushResult;
 use super::{BlobInfo, BlobMetadata};
@@ -43,6 +44,7 @@ use super::{BlobInfo, BlobMetadata};
 const BRANCH_INFIX: &str = "branches";
 const BLOB_INFIX: &str = "blobs";
 const COLLECTION_RECORD_INFIX: &str = "collection-records";
+const COLLECTION_GOSSIP_INFIX: &str = "collection-gossips";
 const LOCAL_CELL_INFIX: &str = "local-cells";
 
 /// Repository backed by an [`object_store`] compatible storage backend.
@@ -263,6 +265,89 @@ impl AsyncCollectionStore for ObjectStoreRemote {
                     }
                 }
                 Err(error) => Err(InsertCollectionRecordErr::Store(error)),
+            }
+        }
+    }
+}
+
+impl AsyncCollectionGossipStore for ObjectStoreRemote {
+    type GossipsError = ListCollectionGossipsErr;
+    type GossipError = InsertCollectionGossipErr;
+
+    fn gossips(
+        &mut self,
+    ) -> impl Future<
+        Output = Result<Vec<Result<CollectionGossip, Self::GossipsError>>, Self::GossipsError>,
+    > + Send {
+        async move {
+            let prefix = self.prefix.child(COLLECTION_GOSSIP_INFIX);
+            let listed = self.store.list(Some(&prefix)).collect::<Vec<_>>().await;
+            let mut observed = Vec::with_capacity(listed.len());
+            for item in listed {
+                let (path, result) = match item {
+                    Err(error) => {
+                        let path = error.to_string();
+                        (path, Err(ListCollectionGossipsErr::List(error)))
+                    }
+                    Ok(meta) => {
+                        let path = meta.location.to_string();
+                        let result =
+                            read_collection_gossip(&*self.store, &prefix, meta.location).await;
+                        (path, result)
+                    }
+                };
+                observed.push((path, result));
+            }
+            // Normalize provider-specific LIST order. Successful grants sort by
+            // their complete signed value; malformed entries sort by path.
+            observed.sort_by(|left, right| match (&left.1, &right.1) {
+                (Ok(left), Ok(right)) => left.cmp(right),
+                (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+                (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+                (Err(_), Err(_)) => left.0.cmp(&right.0),
+            });
+            Ok(observed.into_iter().map(|(_, result)| result).collect())
+        }
+    }
+
+    fn gossip(
+        &mut self,
+        grant: CollectionGossip,
+    ) -> impl Future<Output = Result<(), Self::GossipError>> + Send {
+        let bytes = encode_collection_gossip(grant);
+        let digest = blake3::hash(&bytes);
+        let path = self
+            .prefix
+            .child(COLLECTION_GOSSIP_INFIX)
+            .child(hex::encode(digest.as_bytes()));
+        let expected = bytes::Bytes::copy_from_slice(&bytes);
+
+        async move {
+            match self
+                .store
+                .put_opts(&path, expected.clone().into(), PutMode::Create.into())
+                .await
+            {
+                Ok(_) => Ok(()),
+                Err(object_store::Error::AlreadyExists { .. }) => {
+                    let object = self
+                        .store
+                        .get(&path)
+                        .await
+                        .map_err(InsertCollectionGossipErr::ReadExisting)?;
+                    let actual = object
+                        .bytes()
+                        .await
+                        .map_err(InsertCollectionGossipErr::ReadExisting)?;
+                    if actual == expected {
+                        Ok(())
+                    } else {
+                        Err(InsertCollectionGossipErr::ExistingMismatch {
+                            digest: *digest.as_bytes(),
+                        })
+                    }
+                }
+                Err(error) => Err(InsertCollectionGossipErr::Store(error)),
             }
         }
     }
@@ -633,6 +718,67 @@ fn collection_record_id_from_path(
     Id::new(raw).ok_or(ListCollectionRecordsErr::BadId)
 }
 
+const COLLECTION_GOSSIP_BYTES_LEN: usize = 128;
+
+fn encode_collection_gossip(grant: CollectionGossip) -> [u8; COLLECTION_GOSSIP_BYTES_LEN] {
+    let mut bytes = [0u8; COLLECTION_GOSSIP_BYTES_LEN];
+    let (signature_r, signature_s) = grant.signature();
+    bytes[0..32].copy_from_slice(&grant.collection().raw);
+    bytes[32..64].copy_from_slice(&grant.public_key().raw);
+    bytes[64..96].copy_from_slice(&signature_r.raw);
+    bytes[96..128].copy_from_slice(&signature_s.raw);
+    bytes
+}
+
+fn collection_gossip_digest_from_path(
+    prefix: &Path,
+    location: &Path,
+) -> Result<RawInline, ListCollectionGossipsErr> {
+    let name = location
+        .filename()
+        .ok_or(ListCollectionGossipsErr::NotAFile("no filename"))?;
+    if location != &prefix.child(name) {
+        return Err(ListCollectionGossipsErr::NotDirectChild(
+            location.to_string(),
+        ));
+    }
+    RawInline::from_hex(name).map_err(ListCollectionGossipsErr::BadNameHex)
+}
+
+async fn read_collection_gossip(
+    store: &dyn ObjectStore,
+    prefix: &Path,
+    location: Path,
+) -> Result<CollectionGossip, ListCollectionGossipsErr> {
+    let path_digest = collection_gossip_digest_from_path(prefix, &location)?;
+    let object = store
+        .get(&location)
+        .await
+        .map_err(ListCollectionGossipsErr::Get)?;
+    let bytes = object
+        .bytes()
+        .await
+        .map_err(ListCollectionGossipsErr::Get)?;
+    if bytes.len() != COLLECTION_GOSSIP_BYTES_LEN {
+        return Err(ListCollectionGossipsErr::BadLength {
+            actual: bytes.len(),
+        });
+    }
+    let actual_digest = *blake3::hash(&bytes).as_bytes();
+    if actual_digest != path_digest {
+        return Err(ListCollectionGossipsErr::DigestMismatch {
+            path: path_digest,
+            actual: actual_digest,
+        });
+    }
+    Ok(CollectionGossip::from_parts(
+        Inline::new(bytes[0..32].try_into().expect("checked gossip length")),
+        Inline::new(bytes[32..64].try_into().expect("checked gossip length")),
+        Inline::new(bytes[64..96].try_into().expect("checked gossip length")),
+        Inline::new(bytes[96..128].try_into().expect("checked gossip length")),
+    ))
+}
+
 async fn read_collection_record(
     store: &dyn ObjectStore,
     prefix: &Path,
@@ -723,6 +869,72 @@ impl Error for ListCollectionRecordsErr {
     }
 }
 
+/// Error returned while enumerating immutable collection-publication grants.
+#[derive(Debug)]
+pub enum ListCollectionGossipsErr {
+    /// The object-store LIST operation failed.
+    List(object_store::Error),
+    /// A listed object had no filename component.
+    NotAFile(&'static str),
+    /// A listed object was nested below the one-object-per-grant namespace.
+    NotDirectChild(String),
+    /// A listed filename was not a 32-byte hexadecimal digest.
+    BadNameHex(<RawInline as FromHex>::Error),
+    /// A listed grant object could not be fetched.
+    Get(object_store::Error),
+    /// A grant object did not contain the canonical four 32-byte fields.
+    BadLength { actual: usize },
+    /// The content digest did not match the immutable object path.
+    DigestMismatch { path: RawInline, actual: RawInline },
+}
+
+impl fmt::Display for ListCollectionGossipsErr {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::List(error) => write!(formatter, "collection-gossip list failed: {error}"),
+            Self::NotAFile(error) => {
+                write!(formatter, "collection-gossip list failed: {error}")
+            }
+            Self::NotDirectChild(path) => {
+                write!(
+                    formatter,
+                    "collection-gossip object is not a direct child: {path}"
+                )
+            }
+            Self::BadNameHex(error) => {
+                write!(
+                    formatter,
+                    "collection-gossip filename is not hexadecimal: {error}"
+                )
+            }
+            Self::Get(error) => write!(formatter, "collection-gossip fetch failed: {error}"),
+            Self::BadLength { actual } => write!(
+                formatter,
+                "collection-gossip object is {actual} bytes, expected {COLLECTION_GOSSIP_BYTES_LEN}"
+            ),
+            Self::DigestMismatch { path, actual } => write!(
+                formatter,
+                "collection-gossip path digest {} does not match content digest {}",
+                hex::encode_upper(path),
+                hex::encode_upper(actual)
+            ),
+        }
+    }
+}
+
+impl Error for ListCollectionGossipsErr {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::List(error) | Self::Get(error) => Some(error),
+            Self::BadNameHex(error) => Some(error),
+            Self::NotAFile(_)
+            | Self::NotDirectChild(_)
+            | Self::BadLength { .. }
+            | Self::DigestMismatch { .. } => None,
+        }
+    }
+}
+
 /// Error returned while inserting one immutable collection record.
 #[derive(Debug)]
 pub enum InsertCollectionRecordErr {
@@ -750,6 +962,45 @@ impl fmt::Display for InsertCollectionRecordErr {
 }
 
 impl Error for InsertCollectionRecordErr {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Store(error) | Self::ReadExisting(error) => Some(error),
+            Self::ExistingMismatch { .. } => None,
+        }
+    }
+}
+
+/// Error returned while inserting one immutable collection-publication grant.
+#[derive(Debug)]
+pub enum InsertCollectionGossipErr {
+    /// Creating the immutable grant object failed.
+    Store(object_store::Error),
+    /// An existing object could not be fetched for idempotency validation.
+    ReadExisting(object_store::Error),
+    /// The content-addressed path already contained different bytes.
+    ExistingMismatch { digest: RawInline },
+}
+
+impl fmt::Display for InsertCollectionGossipErr {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Store(error) => write!(formatter, "collection-gossip insert failed: {error}"),
+            Self::ReadExisting(error) => {
+                write!(
+                    formatter,
+                    "failed to validate existing collection gossip: {error}"
+                )
+            }
+            Self::ExistingMismatch { digest } => write!(
+                formatter,
+                "collection-gossip digest {} already contains different bytes",
+                hex::encode_upper(digest)
+            ),
+        }
+    }
+}
+
+impl Error for InsertCollectionGossipErr {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Store(error) | Self::ReadExisting(error) => Some(error),
@@ -992,7 +1243,11 @@ mod tests {
     use object_store::memory::InMemory;
 
     use crate::blob::encodings::rawbytes::RawBytes;
-    use crate::collection::{CollectionDescriptor, CollectionMerge, CollectionStore};
+    use ed25519_dalek::SigningKey;
+
+    use crate::collection::{
+        CollectionDescriptor, CollectionGossipStore, CollectionMerge, CollectionStore,
+    };
     use crate::repo::async_store::{AsyncBlobStorePut, Blocking};
     use crate::repo::StorageFlush;
 
@@ -1044,6 +1299,69 @@ mod tests {
             expected.sort_unstable_by_key(CollectionRecord::id);
             assert_eq!(actual, expected);
         });
+    }
+
+    #[test]
+    fn collection_gossips_are_sorted_idempotent_and_blocking_compatible() {
+        block_on(async {
+            let mut store = remote();
+            let first = CollectionGossip::sign(
+                &SigningKey::from_bytes(&[7; 32]),
+                CollectionDescriptor::new(
+                    Id::new([1; 16]).unwrap(),
+                    Id::new([2; 16]).unwrap(),
+                    Id::new([3; 16]).unwrap(),
+                )
+                .handle(),
+            );
+            let second = CollectionGossip::sign(
+                &SigningKey::from_bytes(&[8; 32]),
+                CollectionDescriptor::new(
+                    Id::new([4; 16]).unwrap(),
+                    Id::new([5; 16]).unwrap(),
+                    Id::new([6; 16]).unwrap(),
+                )
+                .handle(),
+            );
+
+            AsyncCollectionGossipStore::gossip(&mut store, second)
+                .await
+                .unwrap();
+            AsyncCollectionGossipStore::gossip(&mut store, first)
+                .await
+                .unwrap();
+            AsyncCollectionGossipStore::gossip(&mut store, second)
+                .await
+                .unwrap();
+            let actual = AsyncCollectionGossipStore::gossips(&mut store)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let mut expected = vec![first, second];
+            expected.sort();
+            assert_eq!(actual, expected);
+        });
+
+        let mut store = Blocking::new(remote()).unwrap();
+        let grant = CollectionGossip::sign(
+            &SigningKey::from_bytes(&[9; 32]),
+            CollectionDescriptor::new(
+                Id::new([7; 16]).unwrap(),
+                Id::new([8; 16]).unwrap(),
+                Id::new([9; 16]).unwrap(),
+            )
+            .handle(),
+        );
+        CollectionGossipStore::gossip(&mut store, grant).unwrap();
+        assert_eq!(
+            CollectionGossipStore::gossips(&mut store)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![grant]
+        );
     }
 
     #[test]
