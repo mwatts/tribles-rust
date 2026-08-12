@@ -7,9 +7,9 @@
 //! topic join, DHT node spawn — happens in [`bind`], which returns the
 //! transport-agnostic [`Harness`] the host loop runs against.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
-use iroh_base::EndpointId;
+use iroh_base::{EndpointAddr, EndpointId};
 use tokio::sync::mpsc;
 use tracing::warn;
 
@@ -33,6 +33,15 @@ const FORWARDED_ALPNS: [Alpn; 2] = [
 pub struct IrohTransport {
     ep: iroh::Endpoint,
     dht: Option<crate::dht::api::ApiClient>,
+    /// Explicitly configured routes, keyed by endpoint identity.
+    ///
+    /// `Endpoint::connect(EndpointId, ..)` delegates route selection to
+    /// discovery.  That is useful for ordinary internet peers, but it silently
+    /// discards a caller-supplied direct address (notably the Spark cluster's
+    /// 200 Gbit fabric).  Retaining the full address here makes an explicit
+    /// route authoritative for outbound protocol connections while preserving
+    /// discovery as the fallback for address-less peers.
+    peers: Arc<BTreeMap<EndpointId, EndpointAddr>>,
     /// Keeps the router (and through it the registered protocol
     /// handlers + gossip + DHT rpc node) alive for the transport's
     /// lifetime. The host loop never touches these; they exist below
@@ -95,9 +104,14 @@ impl Transport for IrohTransport {
 
     async fn dial(&self, peer: PeerId, alpn: Alpn) -> anyhow::Result<Self::Conn> {
         let id = EndpointId::from_bytes(&peer).map_err(|e| anyhow::anyhow!("peer id: {e}"))?;
+        let addr = self
+            .peers
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| EndpointAddr::from(id));
         let conn = self
             .ep
-            .connect(id, alpn)
+            .connect(addr, alpn)
             .await
             .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
         Ok(IrohConn(conn))
@@ -229,10 +243,32 @@ pub async fn bind(
 /// tests that wire two real `Peer`s over a virtual transport (no relays,
 /// no DNS), the way `auth_handshake_e2e` does for raw endpoints.
 pub async fn bind_with_endpoint(ep: iroh::Endpoint, config: &PeerConfig) -> Harness<IrohTransport> {
+    use iroh::address_lookup::{EndpointInfo, MemoryLookup};
     use iroh::protocol::Router;
     use iroh_gossip::Gossip;
 
     let my_id = ep.id();
+    let peers = Arc::new(
+        config
+            .peers
+            .iter()
+            .cloned()
+            .map(|addr| (addr.id, addr))
+            .collect(),
+    );
+
+    // Make configured routes available to every iroh sub-protocol, not only
+    // `IrohTransport::dial`: gossip and the embedded DHT initiate their own
+    // connections using endpoint ids.  A memory lookup bridges those ids back
+    // to the exact direct/fabric addresses supplied by the caller.
+    if !config.peers.is_empty() {
+        let lookup =
+            MemoryLookup::from_endpoint_info(config.peers.iter().cloned().map(EndpointInfo::from));
+        match ep.address_lookup() {
+            Ok(services) => services.add(lookup),
+            Err(error) => warn!(%error, "configured peer routes unavailable to iroh sub-protocols"),
+        }
+    }
     let mut router_builder = Router::builder(ep.clone());
 
     // DHT — always on. Peers bootstrap the routing table.
@@ -325,6 +361,7 @@ pub async fn bind_with_endpoint(ep: iroh::Endpoint, config: &PeerConfig) -> Harn
     let transport = IrohTransport {
         ep,
         dht: Some(dht_api),
+        peers,
         _alive: Arc::new(Anchors {
             _router: router,
             _dht_rpc: Some(rpc),

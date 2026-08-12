@@ -28,10 +28,11 @@
 //!
 //! Transport realism: every byte moves as iroh QUIC over real UDP
 //! sockets (loopback). Discovery is pinned rather than global — the
-//! endpoints run relay-free with a `MemoryLookup` seeded from the
-//! handoff (`PeerConfig::peers` carries ids only by design; iroh's
-//! address-lookup layer owns resolution, and `MemoryLookup` is that
-//! layer's direct-addressing form). Everything above the endpoint —
+//! endpoints run relay-free with both a `MemoryLookup` seeded from the
+//! handoff and full direct addresses in `PeerConfig::peers`. Explicit
+//! addresses are authoritative for protocol dials; the lookup also makes
+//! those routes available to iroh-gossip and the embedded DHT. Everything
+//! above the endpoint —
 //! DHT node, protocol router + OP_AUTH cap verification, gossip topic,
 //! host loop, Peer, Reconciler — is the unmodified production stack
 //! via `transport::iroh::bind_with_endpoint`.

@@ -86,9 +86,12 @@ pub(crate) fn dot_stripped_default_relay_map() -> iroh::RelayMap {
 /// see the `Peer` struct's doctest for the full pattern.
 pub struct PeerConfig {
     /// Bootstrap peers — for both the gossip mesh and the DHT.
-    /// `EndpointAddr` here carries only an `EndpointId`; iroh's
-    /// standard discovery (pkarr / DNS via `presets::N0`) resolves
-    /// the actual relay URL and direct addresses at dial time.
+    ///
+    /// An address-less entry delegates route selection to iroh's standard
+    /// discovery.  When direct addresses are present, outbound protocol dials
+    /// use the full address verbatim.  This is how a deployment selects a
+    /// dedicated fabric instead of accidentally falling back to a management
+    /// interface or relay.
     pub peers: Vec<EndpointAddr>,
     /// Whether to subscribe to live HEAD-update gossip. The topic id
     /// is the team root pubkey's 32 bytes — every team has exactly

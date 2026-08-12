@@ -6,6 +6,7 @@ use anyhow::{anyhow, Result};
 use clap::Parser;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use iroh_base::{EndpointAddr, EndpointId};
+use iroh_tickets::endpoint::EndpointTicket;
 
 use triblespace_net::identity::load_or_create_key;
 use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
@@ -16,17 +17,24 @@ fn open_pile(path: &PathBuf) -> Result<Pile> {
     Pile::open(path).map_err(|e| anyhow!("open pile: {e:?}"))
 }
 
-/// Parse a `--peers` argument. Each entry is a bare 64-char hex pubkey;
-/// iroh's discovery layer (pkarr + relay) handles the address lookup.
+/// Parse `--peers` as canonical iroh endpoint tickets or bare endpoint ids.
 ///
-/// Skips entries that don't parse, intentionally permissive so the CLI
-/// doesn't bail on a mistyped arg — missing-peers surfaces in the
-/// resulting trace output instead.
-fn parse_peers(strs: &[String]) -> Vec<EndpointAddr> {
+/// Tickets preserve explicit direct/fabric addresses. Bare ids deliberately
+/// delegate address selection to iroh discovery. A malformed peer is an error:
+/// silently dropping a mistyped fabric route can otherwise make a deployment
+/// fall back to a relay or management network while appearing configured.
+fn parse_peers(strs: &[String]) -> Result<Vec<EndpointAddr>> {
     strs.iter()
-        .filter_map(|s| {
-            let pk = s.parse::<iroh_base::PublicKey>().ok()?;
-            Some(EndpointAddr::from(EndpointId::from(pk)))
+        .map(|s| {
+            if let Ok(ticket) = s.parse::<EndpointTicket>() {
+                return Ok(ticket.into());
+            }
+            let pk = s.parse::<iroh_base::PublicKey>().map_err(|_| {
+                anyhow!(
+                    "invalid peer {s:?}: expected an iroh endpoint ticket or 64-char endpoint id"
+                )
+            })?;
+            Ok(EndpointAddr::from(EndpointId::from(pk)))
         })
         .collect()
 }
@@ -239,11 +247,9 @@ fn run_sync(
     use triblespace_core::repo::Repository;
 
     let key = load_or_create_key(&key_path, key_dir(&pile_path))?;
-    // parse_peers takes a list of bare 64-char hex pubkeys and yields
-    // address-less `EndpointAddr`s. iroh's standard discovery layer
-    // (pkarr + DNS via the N0 preset) resolves the actual relay URL
-    // and direct addrs at dial time.
-    let peers = parse_peers(&peer_strs);
+    // Endpoint tickets retain caller-selected direct/fabric routes; bare
+    // endpoint ids intentionally use iroh's discovery layer.
+    let peers = parse_peers(&peer_strs)?;
 
     // Single pile handle, wrapped in a Peer (which spawns the iroh thread)
     // and then a Repository for the workspace/commit API. Reads on the Peer
@@ -451,4 +457,23 @@ fn run_sync(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iroh_base::{SecretKey, TransportAddr};
+
+    #[test]
+    fn peers_accept_bare_ids_and_endpoint_tickets() {
+        let secret = SecretKey::from_bytes(&[7; 32]);
+        let id = EndpointId::from(secret.public());
+        let direct =
+            EndpointAddr::from_parts(id, [TransportAddr::Ip("10.55.0.2:49152".parse().unwrap())]);
+        let ticket = EndpointTicket::new(direct.clone()).to_string();
+
+        assert_eq!(parse_peers(&[id.to_string()]).unwrap(), vec![id.into()]);
+        assert_eq!(parse_peers(&[ticket]).unwrap(), vec![direct]);
+        assert!(parse_peers(&["not-a-peer".to_owned()]).is_err());
+    }
 }
