@@ -1,8 +1,9 @@
 //! `Peer<S>`: a store wrapped in distributed network sync.
 //!
 //! Owns the inner store, spawns the iroh network thread on construction,
-//! and exposes the standard storage traits (`BlobStore + BlobStorePut +
-//! PinStore + LocalCellStore`) with two layers of network behavior built in:
+//! and exposes the standard blob and pin storage traits with two layers of
+//! network behavior built in. Its signer-owned policy collection stays on the
+//! inner store and is deliberately not exposed for gossip through `Peer`:
 //!
 //! - **Reads** auto-call [`refresh`](Peer::refresh), which drains pending
 //!   incoming gossip events into the wrapped store and re-publishes any
@@ -48,15 +49,15 @@ use iroh_base::EndpointId;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{BlobEncoding, IntoBlob, TryFromBlob};
+use triblespace_core::collection::CollectionStore;
 use triblespace_core::id::Id;
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::InlineEncoding;
 use triblespace_core::inline::encodings::hash::Handle;
-use triblespace_core::local_cell::LocalCellStore;
 use triblespace_core::repo::lazy::WantRecordError;
 use triblespace_core::repo::{
-    BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, PinStore, PushResult,
-    StorageFlush, WantStore,
+    BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut, PinStore,
+    PushResult, StorageFlush, WantStore,
 };
 
 use crate::channel::{NetEvent, PublisherKey};
@@ -110,12 +111,13 @@ pub struct Peer<S>
 where
     S: BlobStore
         + BlobStorePut
-        + LocalCellStore
+        + CollectionStore
         + PinStore
         + WantStore
         + StorageFlush
         + Send
         + 'static,
+    S::Reader: BlobStoreMeta,
 {
     /// The wrapped store, shared behind a mutex: a `&self` async read on
     /// a [`PeerReader`] must be able to record a want and land a
@@ -172,12 +174,13 @@ impl<S> Peer<S>
 where
     S: BlobStore
         + BlobStorePut
-        + LocalCellStore
+        + CollectionStore
         + PinStore
         + WantStore
         + StorageFlush
         + Send
         + 'static,
+    S::Reader: BlobStoreMeta,
 {
     /// Wrap a store in a Peer. Spawns the iroh network thread
     /// internally; the thread lives for the Peer's lifetime and shuts
@@ -411,18 +414,37 @@ where
                     };
                     let sig_inline: Inline<Handle<SimpleArchive>> = Inline::new(sig_handle);
                     let mut store = self.store.lock().expect("store mutex");
-                    if let Some(entry_id) = crate::policy::find_policy_entry_by_subject_and_sig(
+                    match crate::policy::find_policy_entry_by_subject_and_sig(
                         &mut *store,
+                        &self.signing_key,
                         subject_key,
                         sig_inline,
                     ) {
-                        let _ = crate::policy::mark_policy_delivered(&mut *store, entry_id);
-                        tracing::debug!(
+                        Ok(Some(entry_id)) => {
+                            match crate::policy::mark_policy_delivered(
+                                &mut *store,
+                                &self.signing_key,
+                                entry_id,
+                            ) {
+                                Ok(()) => tracing::debug!(
+                                    subject = %hex::encode(&subject[..4]),
+                                    sig = %hex::encode(&sig_handle[..4]),
+                                    entry = ?entry_id,
+                                    "delivery confirmed; policy acknowledgement recorded"
+                                ),
+                                Err(error) => tracing::warn!(
+                                    entry = ?entry_id,
+                                    %error,
+                                    "delivery confirmation policy write failed"
+                                ),
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => tracing::warn!(
                             subject = %hex::encode(&subject[..4]),
-                            sig = %hex::encode(&sig_handle[..4]),
-                            entry = ?entry_id,
-                            "delivery confirmed; policy entry marked delivered"
-                        );
+                            %error,
+                            "delivery confirmation policy lookup failed"
+                        ),
                     }
                 }
             }
@@ -538,11 +560,12 @@ where
 
         match crate::policy::record_pending_request(
             &mut *store,
+            &self.signing_key,
             requester_pubkey,
             partial_cap_handle,
             received_at,
         ) {
-            Some(req_id) => {
+            Ok(req_id) => {
                 let req_id_bytes: [u8; 16] = req_id.into();
                 tracing::info!(
                     requester = %hex::encode(&requester[..4]),
@@ -550,10 +573,11 @@ where
                     "CapRequest recorded as pending"
                 );
             }
-            None => {
+            Err(error) => {
                 tracing::warn!(
                     requester = %hex::encode(&requester[..4]),
-                    "CapRequest: failed to record in pending-requests cell"
+                    %error,
+                    "CapRequest: failed to record in policy collection"
                 );
             }
         }
@@ -613,18 +637,25 @@ where
             return;
         }
 
-        match crate::policy::set_team_cap(&mut *store, self.team_root, cap_handle, sig_handle) {
-            Some(()) => {
+        match crate::policy::set_team_cap(
+            &mut *store,
+            &self.signing_key,
+            self.team_root,
+            cap_handle,
+            sig_handle,
+        ) {
+            Ok(()) => {
                 tracing::info!(
                     issuer = %hex::encode(&issuer[..4]),
                     sig = %hex::encode(&sig_handle.raw[..4]),
-                    "CapDelivered: stored in team-cap cell"
+                    "CapDelivered: stored in private policy collection"
                 );
             }
-            None => {
+            Err(error) => {
                 tracing::warn!(
                     issuer = %hex::encode(&issuer[..4]),
-                    "CapDelivered: team-cap cell write failed"
+                    %error,
+                    "CapDelivered: team-cap policy write failed"
                 );
             }
         }
@@ -651,7 +682,13 @@ where
 
         let mut store = self.store.lock().expect("store mutex");
 
-        let entries = crate::policy::undelivered_entries(&mut *store);
+        let entries = match crate::policy::undelivered_entries(&mut *store, &self.signing_key) {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::warn!(%error, "redispatch_undelivered: policy read failed");
+                return 0;
+            }
+        };
         if entries.is_empty() {
             return 0;
         }
@@ -734,22 +771,35 @@ where
 
         let mut store = self.store.lock().expect("store mutex");
 
-        let entries = crate::policy::renewable_within(&mut *store, renewal_window);
+        let entries =
+            match crate::policy::renewable_within(&mut *store, &self.signing_key, renewal_window) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    tracing::warn!(%error, "renewal_tick: policy read failed");
+                    return redispatched;
+                }
+            };
         if entries.is_empty() {
             return redispatched;
         }
 
         // Our own current cap is the parent for every renewal. If
         // we don't have one, we can't sign — log and bail.
-        let Some((parent_cap_handle, parent_sig_handle)) =
-            crate::policy::current_team_cap(&mut *store, self.team_root)
-        else {
-            tracing::warn!(
-                renewable = entries.len(),
-                "renewal_tick: no team cap stored; cannot issue successors"
-            );
-            return 0;
-        };
+        let (parent_cap_handle, parent_sig_handle) =
+            match crate::policy::current_team_cap(&mut *store, &self.signing_key, self.team_root) {
+                Ok(Some(pair)) => pair,
+                Ok(None) => {
+                    tracing::warn!(
+                        renewable = entries.len(),
+                        "renewal_tick: no team cap stored; cannot issue successors"
+                    );
+                    return redispatched;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "renewal_tick: team-cap policy read failed");
+                    return redispatched;
+                }
+            };
 
         let Ok(reader) = store.reader() else {
             tracing::warn!("renewal_tick: pile reader unavailable");
@@ -835,37 +885,35 @@ where
             let _ = store.put::<SimpleArchive, Blob<SimpleArchive>>(new_cap);
             let _ = store.put::<SimpleArchive, Blob<SimpleArchive>>(new_sig);
 
-            // Dispatch over the wire.
-            self.sender
-                .deliver_cap(entry.subject.to_bytes(), cap_bytes, sig_bytes);
-            // Record the attempt so the undelivered-redispatch path
-            // doesn't immediately re-fire on the same entry within
-            // its cooldown window.
-            self.last_dispatch_attempt
-                .insert(entry.id, crate::clock::mono_now());
-
-            // Update the policy entry so we don't re-renew on the
-            // next tick.
-            if crate::policy::update_policy_entry(
+            // Publish the successor before dispatch. A crash can leave an
+            // undelivered durable version (which the retry loop repairs), but
+            // can never deliver a credential that policy forgot to record.
+            match crate::policy::update_policy_entry(
                 &mut *store,
+                &self.signing_key,
                 entry.id,
                 new_expiry,
                 new_cap_handle,
                 new_sig_handle,
-            )
-            .is_some()
-            {
-                dispatched += 1;
-                tracing::info!(
-                    subject = %hex::encode(entry.subject.to_bytes()),
+            ) {
+                Ok(new_entry) => {
+                    self.sender
+                        .deliver_cap(entry.subject.to_bytes(), cap_bytes, sig_bytes);
+                    self.last_dispatch_attempt
+                        .insert(new_entry, crate::clock::mono_now());
+                    dispatched += 1;
+                    tracing::info!(
+                        subject = %hex::encode(entry.subject.to_bytes()),
+                        entry = ?new_entry,
+                        predecessor = ?entry.id,
+                        "renewal_tick: successor recorded and dispatched"
+                    );
+                }
+                Err(error) => tracing::warn!(
                     entry = ?entry.id,
-                    "renewal_tick: re-issued and dispatched"
-                );
-            } else {
-                tracing::warn!(
-                    entry = ?entry.id,
-                    "renewal_tick: re-issued but policy update failed; will retry"
-                );
+                    %error,
+                    "renewal_tick: successor policy write failed; not dispatching"
+                ),
             }
         }
         dispatched + redispatched
@@ -1040,12 +1088,13 @@ impl<S> BlobStorePut for Peer<S>
 where
     S: BlobStore
         + BlobStorePut
-        + LocalCellStore
+        + CollectionStore
         + PinStore
         + WantStore
         + StorageFlush
         + Send
         + 'static,
+    S::Reader: BlobStoreMeta,
 {
     type PutError = S::PutError;
 
@@ -1077,12 +1126,13 @@ impl<S> BlobStore for Peer<S>
 where
     S: BlobStore
         + BlobStorePut
-        + LocalCellStore
+        + CollectionStore
         + PinStore
         + WantStore
         + StorageFlush
         + Send
         + 'static,
+    S::Reader: BlobStoreMeta,
 {
     type Reader = PeerReader<S::Reader>;
     type ReaderError = S::ReaderError;
@@ -1102,42 +1152,17 @@ where
     }
 }
 
-impl<S> LocalCellStore for Peer<S>
-where
-    S: BlobStore
-        + BlobStorePut
-        + LocalCellStore
-        + PinStore
-        + WantStore
-        + StorageFlush
-        + Send
-        + 'static,
-{
-    type CellError = S::CellError;
-
-    fn cell(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::CellError> {
-        self.store.lock().expect("store mutex").cell(id)
-    }
-
-    fn set_cell(
-        &mut self,
-        id: Id,
-        value: Option<Inline<Handle<SimpleArchive>>>,
-    ) -> Result<(), Self::CellError> {
-        self.store.lock().expect("store mutex").set_cell(id, value)
-    }
-}
-
 impl<S> PinStore for Peer<S>
 where
     S: BlobStore
         + BlobStorePut
-        + LocalCellStore
+        + CollectionStore
         + PinStore
         + WantStore
         + StorageFlush
         + Send
         + 'static,
+    S::Reader: BlobStoreMeta,
 {
     type PinsError = S::PinsError;
     type HeadError = S::HeadError;
@@ -1180,9 +1205,9 @@ where
                 // Tracking branches are local mirror state and must NOT be
                 // re-gossiped — otherwise the publisher would receive its
                 // own tracking branch back and create a tracking-of-the-
-                // tracking, ad infinitum. Current local policy lives in
-                // LocalCellStore and cannot enter this PinStore path; the
-                // second predicate protects unmigrated pre-cell policy pins.
+                // tracking, ad infinitum. Current local policy lives in a
+                // private collection and cannot enter this PinStore path; the
+                // second predicate protects unmigrated pre-collection pins.
                 if !crate::policy::is_legacy_local_only_pin(&mut *store, id)
                     && !crate::tracking::is_tracking_pin(&mut *store, id)
                     && self.direction != SyncDirection::ReadOnly

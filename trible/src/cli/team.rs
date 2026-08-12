@@ -89,6 +89,9 @@ pub enum Command {
         /// Path to the local pile file.
         #[arg(long)]
         pile: PathBuf,
+        /// Node signing key that owns the private policy collection.
+        #[arg(long)]
+        key: Option<PathBuf>,
     },
     /// List the renewal-policy entries on the local pile: caps this
     /// node has issued (or auto-approved) that the daemon is
@@ -98,6 +101,9 @@ pub enum Command {
         /// Path to the local pile file.
         #[arg(long)]
         pile: PathBuf,
+        /// Node signing key that owns the private policy collection.
+        #[arg(long)]
+        key: Option<PathBuf>,
     },
     /// Stop auto-renewing a specific (subject, scope) entry. The
     /// corresponding peer's cap chain dies at its next natural
@@ -107,6 +113,9 @@ pub enum Command {
         /// Path to the local pile file.
         #[arg(long)]
         pile: PathBuf,
+        /// Node signing key that owns the private policy collection.
+        #[arg(long)]
+        key: Option<PathBuf>,
         /// The renewal-policy entry id to retract (hex, from
         /// `team list-issued`).
         #[arg(long)]
@@ -114,10 +123,10 @@ pub enum Command {
     },
     /// Send an `OP_REQUEST_CAP` to a team admin asking to be issued
     /// a capability. The admin's running daemon records the request
-    /// in its pending-requests cell (visible via `team list-pending`);
+    /// in its private policy collection (visible via `team list-pending`);
     /// once they approve via `team approve`, the freshly-signed cap
     /// arrives via the auth-handshake ALPN and the daemon stores it
-    /// in the team-cap cell.
+    /// in its private policy collection.
     RequestJoin {
         /// Admin's pubkey (hex).
         #[arg(long)]
@@ -225,9 +234,9 @@ pub fn run(cmd: Command) -> Result<()> {
             branches,
         } => run_invite(pile, team_root, cap, key, invitee, scope, branches),
         Command::List { pile } => run_list(pile),
-        Command::ListPending { pile } => run_list_pending(pile),
-        Command::ListIssued { pile } => run_list_issued(pile),
-        Command::Retract { pile, entry } => run_retract(pile, entry),
+        Command::ListPending { pile, key } => run_list_pending(pile, key),
+        Command::ListIssued { pile, key } => run_list_issued(pile, key),
+        Command::Retract { pile, key, entry } => run_retract(pile, key, entry),
         Command::RequestJoin {
             admin,
             scope,
@@ -291,11 +300,13 @@ fn with_pile<T>(path: &PathBuf, f: impl FnOnce(&mut PileBlake3) -> Result<T>) ->
 }
 
 fn load_or_generate_signing_key(path: Option<PathBuf>, pile_path: &PathBuf) -> Result<SigningKey> {
-    let parent = pile_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    triblespace_net::identity::load_or_create_key(&path, &parent)
+    let path = triblespace_core::signing_key_file::resolve_path(path.as_deref(), pile_path);
+    triblespace_core::signing_key_file::init(&path).map_err(Into::into)
+}
+
+fn load_existing_signing_key(path: Option<PathBuf>, pile_path: &PathBuf) -> Result<SigningKey> {
+    let path = triblespace_core::signing_key_file::resolve_path(path.as_deref(), pile_path);
+    triblespace_core::signing_key_file::load_existing(&path).map_err(Into::into)
 }
 
 fn fresh_signing_key() -> Result<SigningKey> {
@@ -547,34 +558,36 @@ fn run_invite(
         store_blob(pile, cap_blob)?;
         store_blob(pile, sig_blob)?;
 
-        // Record in the renewal-policy cell so the running `pile net
-        // sync` daemon's renewal_tick takes over from here: once this
-        // cap nears expiry, the daemon signs a successor and
+        // Record in the signer-owned policy collection so the running
+        // `pile net sync` daemon's renewal_tick takes over from here: once
+        // this cap nears expiry, the daemon signs a successor and
         // dispatches via OP_DELIVER_CAP. The invitee experiences the
         // issuance and every subsequent renewal as the same
         // OP_DELIVER_CAP event — the first delivery and the daemon's
         // later renewals are indistinguishable on B's side.
         let policy_entry = triblespace_net::policy::record_policy_entry(
-            pile, invitee, scope_root, expiry, cap_handle, sig_handle,
-        );
+            pile,
+            &issuer_key,
+            team_root,
+            invitee,
+            scope_root,
+            expiry,
+            cap_handle,
+            sig_handle,
+        )
+        .map_err(|error| anyhow!("record renewal policy: {error}"))?;
 
         Ok((sig_handle, expiry, policy_entry))
     })?;
 
     println!("issued cap (sig):  {}", hex::encode(sig_handle.raw));
     println!("expires:           {}", format_expiry(&expiry));
-    if let Some(entry_id) = policy_entry {
-        let entry_bytes: [u8; 16] = entry_id.into();
-        println!("renewal entry:     {}", hex::encode(entry_bytes));
-        println!(
-            "  the running sync daemon will auto-renew this cap until you `team retract {}`",
-            hex::encode(entry_bytes)
-        );
-    } else {
-        println!(
-            "(warning: failed to record renewal-policy entry; auto-renewal won't happen for this cap)"
-        );
-    }
+    let entry_bytes: [u8; 16] = policy_entry.into();
+    println!("renewal entry:     {}", hex::encode(entry_bytes));
+    println!(
+        "  the running sync daemon will auto-renew this cap until you `team retract --entry {}`",
+        hex::encode(entry_bytes)
+    );
     println!();
     println!("Share with the invitee:");
     println!("  TRIBLE_TEAM_ROOT={}", hex::encode(team_root.to_bytes()));
@@ -1052,9 +1065,11 @@ fn run_show(
 /// requests branch. Each line shows the entry id (for `team approve`),
 /// requester pubkey, partial-cap handle, received-at instant, and
 /// status tag.
-fn run_list_pending(pile_path: PathBuf) -> Result<()> {
+fn run_list_pending(pile_path: PathBuf, key: Option<PathBuf>) -> Result<()> {
+    let signing_key = load_existing_signing_key(key, &pile_path)?;
     let pending = with_pile(&pile_path, |pile| {
-        Ok(triblespace_net::policy::list_pending_requests(pile))
+        triblespace_net::policy::list_pending_requests(pile, &signing_key)
+            .map_err(|error| anyhow!("read policy collection: {error}"))
     })?;
 
     if pending.is_empty() {
@@ -1085,9 +1100,11 @@ fn run_list_pending(pile_path: PathBuf) -> Result<()> {
 
 /// Print the renewal-policy entries on the local pile: caps this node
 /// is currently auto-renewing, plus any that have been retracted.
-fn run_list_issued(pile_path: PathBuf) -> Result<()> {
+fn run_list_issued(pile_path: PathBuf, key: Option<PathBuf>) -> Result<()> {
+    let signing_key = load_existing_signing_key(key, &pile_path)?;
     let entries = with_pile(&pile_path, |pile| {
-        Ok(triblespace_net::policy::list_renewal_policy(pile))
+        triblespace_net::policy::list_renewal_policy(pile, &signing_key)
+            .map_err(|error| anyhow!("read policy collection: {error}"))
     })?;
 
     if entries.is_empty() {
@@ -1124,7 +1141,7 @@ fn run_list_issued(pile_path: PathBuf) -> Result<()> {
 /// Mark a renewal-policy entry as retracted. The next daemon tick
 /// will skip it; the corresponding subject's chain dies at its
 /// current cap's natural expiry.
-fn run_retract(pile_path: PathBuf, entry_hex: String) -> Result<()> {
+fn run_retract(pile_path: PathBuf, key: Option<PathBuf>, entry_hex: String) -> Result<()> {
     let entry_bytes: [u8; 16] = hex::decode(entry_hex.trim())
         .map_err(|e| anyhow!("decode entry hex: {e}"))?
         .as_slice()
@@ -1133,26 +1150,21 @@ fn run_retract(pile_path: PathBuf, entry_hex: String) -> Result<()> {
     let entry_id =
         Id::new(entry_bytes).ok_or_else(|| anyhow!("entry id is the all-zeros nil id"))?;
 
-    let outcome = with_pile(&pile_path, |pile| {
-        Ok(triblespace_net::policy::retract_policy_entry(
-            pile, entry_id,
-        ))
+    let signing_key = load_existing_signing_key(key, &pile_path)?;
+    let terminal = with_pile(&pile_path, |pile| {
+        triblespace_net::policy::retract_policy_entry(pile, &signing_key, entry_id)
+            .map_err(|error| anyhow!("retract policy entry: {error}"))
     })?;
 
-    match outcome {
-        Some(()) => {
-            println!(
-                "retracted entry {}",
-                hex::encode(<[u8; 16]>::from(entry_id))
-            );
-            println!("(the subject's cap chain will die at its current cap's expiry; no revocation propagates)");
-            Ok(())
-        }
-        None => bail!(
-            "retract failed: entry {} not found, or the renewal-policy cell is missing/unavailable",
-            hex::encode(<[u8; 16]>::from(entry_id))
-        ),
-    }
+    println!(
+        "retracted entry {} with terminal version {}",
+        hex::encode(<[u8; 16]>::from(entry_id)),
+        hex::encode(<[u8; 16]>::from(terminal)),
+    );
+    println!(
+        "(the subject's cap chain will die at its current cap's expiry; no revocation propagates)"
+    );
+    Ok(())
 }
 
 // ── Approve / Request-Join (one-shot iroh-endpoint subcommands) ───────
@@ -1240,7 +1252,9 @@ fn run_request_join(
             println!("ACK — admin received your request and queued it.");
             println!("They'll see it under `team list-pending`.");
             println!("Once approved, your cap arrives via the auth-handshake ALPN;");
-            println!("a running `pile net sync` daemon will store it in the team-cap cell.");
+            println!(
+                "a running `pile net sync` daemon will store it in its private policy collection."
+            );
             Ok(())
         }
         triblespace_net::handshake::STATUS_REJECTED => bail!("admin rejected the request"),
@@ -1282,7 +1296,8 @@ fn run_approve(
         // are what the requester proposed. We pass them through to
         // build_capability (along with our parent cap+sig and
         // signing key).
-        let pending = triblespace_net::policy::list_pending_requests(pile);
+        let pending = triblespace_net::policy::list_pending_requests(pile, &issuer_key)
+            .map_err(|error| anyhow!("read policy collection: {error}"))?;
         let request = pending
             .iter()
             .find(|p| p.id == entry_id)
@@ -1389,9 +1404,9 @@ fn run_approve(
         let sig_handle: Inline<Handle<SimpleArchive>> = (&sig_blob).get_handle();
         let request_id = request.id;
 
-        // Persist cap+sig blobs, record in the renewal-policy cell,
-        // mark the request approved — purely local writes, no
-        // network. The running `pile net sync` daemon's
+        // Persist cap+sig blobs, then atomically record the approval and
+        // issued renewal version in one private collection commit. These are
+        // purely local writes, with no policy gossip. The running `pile net sync` daemon's
         // `redispatch_undelivered` loop picks the new policy entry up
         // on its next tick (every 100ms) and dispatches
         // OP_DELIVER_CAP over its already-up iroh endpoint. We don't
@@ -1417,25 +1432,26 @@ fn run_approve(
         store_blob(pile, cap_blob)?;
         store_blob(pile, sig_blob)?;
 
-        let policy_entry = triblespace_net::policy::record_policy_entry(
-            pile, subject, scope_root, expiry, cap_handle, sig_handle,
-        );
-
-        let _ = triblespace_net::policy::set_request_status(
+        let policy_entry = triblespace_net::policy::approve_request_and_record_policy(
             pile,
+            &issuer_key,
             request_id,
-            triblespace_net::policy::STATUS_APPROVED,
-        );
+            team_root,
+            subject,
+            scope_root,
+            expiry,
+            cap_handle,
+            sig_handle,
+        )
+        .map_err(|error| anyhow!("record approval and renewal policy: {error}"))?;
 
         Ok((sig_handle, expiry, policy_entry))
     })?;
 
     println!("issued cap (sig):  {}", hex::encode(sig_handle.raw));
     println!("expires:           {}", format_expiry(&expiry));
-    if let Some(eid) = policy_entry {
-        let eid_bytes: [u8; 16] = eid.into();
-        println!("renewal entry:     {}", hex::encode(eid_bytes));
-    }
+    let eid_bytes: [u8; 16] = policy_entry.into();
+    println!("renewal entry:     {}", hex::encode(eid_bytes));
     println!(
         "  request marked APPROVED; the running sync daemon will deliver via \
          OP_DELIVER_CAP on its next tick (visible in `team list-issued` when \
