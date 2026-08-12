@@ -24,13 +24,74 @@ pub enum Command {
         /// Handle to locate (e.g. "blake3:HEX..." or bare 64 hex)
         handle: String,
     },
+    /// Decode the record beginning at one exact byte offset without modifying the pile.
+    ///
+    /// The command walks canonical record boundaries from the start of the
+    /// pile. An offset inside a record is rejected and reports the enclosing
+    /// span; an unsupported unenveloped marker is distinguished from a
+    /// malformed or torn known record.
+    RecordAt {
+        /// Path to the pile file to inspect
+        pile: PathBuf,
+        /// Exact byte offset where a record header is expected
+        offset: usize,
+    },
 }
 
 pub fn run(cmd: Command) -> Result<()> {
     match cmd {
         Command::Check { pile, fail_fast } => check(&pile, fail_fast),
         Command::LocateHash { pile, handle } => locate_hash_in_pile(&pile, &handle),
+        Command::RecordAt { pile, offset } => record_at(&pile, offset),
     }
+}
+
+#[derive(Default)]
+struct RecordEvidence {
+    opaque_count: usize,
+    opaque_first: Option<usize>,
+    opaque_last: Option<usize>,
+    legacy_collection_count: usize,
+    legacy_collection_first: Option<usize>,
+    legacy_collection_last: Option<usize>,
+}
+
+fn observe_offset(
+    count: &mut usize,
+    first: &mut Option<usize>,
+    last: &mut Option<usize>,
+    offset: usize,
+) {
+    *count += 1;
+    first.get_or_insert(offset);
+    *last = Some(offset);
+}
+
+fn scan_record_evidence(pile_path: &Path) -> Result<RecordEvidence> {
+    use triblespace_core::repo::pile::{PileRecordContent, PileRecords};
+
+    let mut evidence = RecordEvidence::default();
+    let mut records =
+        PileRecords::open(pile_path).map_err(|error| super::pile_read_error(pile_path, error))?;
+    for record in &mut records {
+        let record = record.map_err(|error| super::pile_read_error(pile_path, error))?;
+        match record.content {
+            PileRecordContent::Opaque { .. } => observe_offset(
+                &mut evidence.opaque_count,
+                &mut evidence.opaque_first,
+                &mut evidence.opaque_last,
+                record.offset,
+            ),
+            PileRecordContent::LegacyCollectionV3 { .. } => observe_offset(
+                &mut evidence.legacy_collection_count,
+                &mut evidence.legacy_collection_first,
+                &mut evidence.legacy_collection_last,
+                record.offset,
+            ),
+            _ => {}
+        }
+    }
+    Ok(evidence)
 }
 
 fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
@@ -51,10 +112,8 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                 let mut any_error = false;
                 let reader = pile
                     .reader()
-                    .map_err(|e| anyhow::anyhow!("pile reader error: {e:?}"))?;
-                let opaque_records = pile
-                    .opaque_record_count()
-                    .map_err(|e| anyhow::anyhow!("pile envelope scan error: {e:?}"))?;
+                    .map_err(|error| super::pile_read_error(pile_path, error))?;
+                let evidence = scan_record_evidence(pile_path)?;
 
                 // Blob hash validation.
                 let mut invalid = 0usize;
@@ -79,11 +138,12 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                 }
 
                 if invalid == 0 {
-                    if opaque_records == 0 {
+                    if evidence.opaque_count == 0 {
                         println!("Pile appears healthy");
                     } else {
                         println!(
-                            "Known record projection appears healthy; skipped {opaque_records} structurally framed opaque record(s) whose bodies were not semantically validated"
+                            "Known record projection appears healthy; skipped {} structurally framed opaque record(s) whose bodies were not semantically validated",
+                            evidence.opaque_count
                         );
                     }
                 } else {
@@ -92,6 +152,30 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
                         anyhow::bail!("invalid blob hashes detected");
                     }
                     any_error = true;
+                }
+
+                if evidence.legacy_collection_count != 0 {
+                    println!(
+                        "Recognized {} inert legacy V3 collection record(s) (first byte {}, last byte {}); preserved as migration evidence",
+                        evidence.legacy_collection_count,
+                        evidence
+                            .legacy_collection_first
+                            .expect("nonzero evidence has a first offset"),
+                        evidence
+                            .legacy_collection_last
+                            .expect("nonzero evidence has a last offset"),
+                    );
+                }
+                if evidence.opaque_count != 0 {
+                    println!(
+                        "Opaque record offsets: first byte {}, last byte {}",
+                        evidence
+                            .opaque_first
+                            .expect("nonzero evidence has a first offset"),
+                        evidence
+                            .opaque_last
+                            .expect("nonzero evidence has a last offset"),
+                    );
                 }
 
                 // Branch integrity diagnostics.
@@ -308,6 +392,163 @@ fn check(pile_path: &Path, fail_fast: bool) -> Result<()> {
         Err(e) => return Err(e.into()),
     }
     Ok(())
+}
+
+fn record_at(pile_path: &Path, offset: usize) -> Result<()> {
+    use triblespace_core::repo::pile::PileRecords;
+
+    let mut records =
+        PileRecords::open(pile_path).map_err(|error| super::pile_read_error(pile_path, error))?;
+    let bytes = records.bytes().clone();
+    let file_len = bytes.len();
+    if offset > file_len {
+        anyhow::bail!(
+            "byte offset {offset} lies past the {file_len}-byte end of pile {}",
+            pile_path.display()
+        );
+    }
+    if offset == file_len {
+        anyhow::bail!(
+            "byte offset {offset} is the end of pile {}; no record begins there",
+            pile_path.display()
+        );
+    }
+
+    for decoded in &mut records {
+        let record = decoded.map_err(|error| super::pile_read_error(pile_path, error))?;
+        let next_offset = record
+            .offset
+            .checked_add(record.len)
+            .expect("accepted pile record span fits usize");
+        if offset == record.offset {
+            print_record(&bytes, file_len, record);
+            return Ok(());
+        }
+        if offset < next_offset {
+            anyhow::bail!(
+                "byte offset {offset} is inside the record spanning bytes {}..{}; exact record starts are {} and {}",
+                record.offset,
+                next_offset,
+                record.offset,
+                next_offset,
+            );
+        }
+    }
+
+    anyhow::bail!(
+        "no record begins at byte offset {offset} in pile {}",
+        pile_path.display()
+    )
+}
+
+fn print_record(bytes: &[u8], file_len: usize, record: triblespace_core::repo::pile::PileRecord) {
+    use triblespace_core::collection::CollectionRecord;
+    use triblespace_core::repo::pile::{LegacyCollectionRecordKindV3, PileRecordContent};
+
+    let next_offset = record
+        .offset
+        .checked_add(record.len)
+        .expect("accepted pile record span fits usize");
+    let raw = &bytes[record.offset..next_offset];
+    let marker = &raw[..16];
+
+    println!("Record at byte {}", record.offset);
+    println!("  file_length: {file_len}");
+    println!("  marker: {}", hex::encode_upper(marker));
+    println!("  known_span_bytes: {}", record.len);
+    println!("  next_offset: {next_offset}");
+
+    match record.content {
+        PileRecordContent::Blob {
+            timestamp,
+            hash,
+            data_offset,
+            data_len,
+        } => {
+            println!("  classification: blob");
+            println!("  timestamp_ms: {timestamp}");
+            println!("  payload_hash: {}", hex::encode_upper(hash.raw));
+            println!("  payload_offset: {data_offset}");
+            println!("  payload_length: {data_len}");
+        }
+        PileRecordContent::Branch { branch_id, head } => {
+            println!("  classification: branch-head");
+            println!("  branch_id: {branch_id:X}");
+            println!("  head: {}", hex::encode_upper(head.raw));
+        }
+        PileRecordContent::BranchTombstone { branch_id } => {
+            println!("  classification: branch-tombstone");
+            println!("  branch_id: {branch_id:X}");
+        }
+        PileRecordContent::WeakPin { handle } => {
+            println!("  classification: want-assertion (legacy weak-pin encoding)");
+            println!("  handle: {}", hex::encode_upper(handle.raw));
+        }
+        PileRecordContent::WeakUnpin { handle } => {
+            println!("  classification: want-retraction (legacy weak-unpin encoding)");
+            println!("  handle: {}", hex::encode_upper(handle.raw));
+        }
+        PileRecordContent::Collection { record } => match record {
+            CollectionRecord::Commit(commit) => {
+                println!("  classification: collection-commit");
+                println!(
+                    "  collection: {}",
+                    hex::encode_upper(commit.collection().raw)
+                );
+                println!("  data: {}", hex::encode_upper(commit.data().raw));
+                println!("  metadata: {}", hex::encode_upper(commit.metadata().raw));
+                println!("  author: {}", hex::encode_upper(commit.public_key().raw));
+            }
+            CollectionRecord::Merge(merge) => {
+                let (low, high) = merge.inputs();
+                println!("  classification: collection-merge");
+                println!(
+                    "  collection: {}",
+                    hex::encode_upper(merge.collection().raw)
+                );
+                println!("  low: {}", hex::encode_upper(low.raw));
+                println!("  high: {}", hex::encode_upper(high.raw));
+                println!("  result: {}", hex::encode_upper(merge.result().raw));
+            }
+            CollectionRecord::Derive(derive) => {
+                let (input, output) = derive.mapping();
+                println!("  classification: collection-derive");
+                println!("  source: {}", hex::encode_upper(derive.source().raw));
+                println!("  target: {}", hex::encode_upper(derive.target().raw));
+                println!("  input: {}", hex::encode_upper(input.raw));
+                println!("  output: {}", hex::encode_upper(output.raw));
+            }
+        },
+        PileRecordContent::CollectionGossip { grant } => {
+            println!("  classification: collection-gossip-grant");
+            println!(
+                "  collection: {}",
+                hex::encode_upper(grant.collection().raw)
+            );
+            println!("  author: {}", hex::encode_upper(grant.public_key().raw));
+        }
+        PileRecordContent::LegacyCollectionV3 { kind } => {
+            let classification = match kind {
+                LegacyCollectionRecordKindV3::Definition => {
+                    "legacy-v3-collection-definition (inert)"
+                }
+                LegacyCollectionRecordKindV3::Commit => "legacy-v3-collection-commit (inert)",
+                LegacyCollectionRecordKindV3::Merge => "legacy-v3-collection-merge (inert)",
+                LegacyCollectionRecordKindV3::Derive => "legacy-v3-collection-derive (inert)",
+            };
+            println!("  classification: {classification}");
+            if kind == LegacyCollectionRecordKindV3::Definition {
+                println!("  scope: {}", hex::encode_upper(&raw[16..32]));
+                println!("  representation: {}", hex::encode_upper(&raw[32..48]));
+                println!("  recipe: {}", hex::encode_upper(&raw[48..64]));
+            }
+        }
+        PileRecordContent::Opaque { kind } => {
+            println!("  classification: opaque (semantically skipped)");
+            println!("  record_kind: {}", hex::encode_upper(kind));
+        }
+        _ => println!("  classification: recognized record"),
+    }
 }
 
 fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Pile diagnostics can decode one exact physical record boundary.**
+  `trible pile diagnose record-at <pile> <offset>` walks the canonical replay
+  decoder without modifying the pile, reports the marker, classification,
+  known span, next offset, and safely decoded fields, and rejects offsets that
+  land inside a record. Unsupported unenveloped markers now remain an explicit
+  upgrade/version-skew diagnosis with no amputation suggestion; only malformed
+  or torn known records mention the opt-in destructive repair. `diagnose check`
+  also reports the count and boundary offsets of inert legacy V3 collection
+  evidence and opaque records.
 - **Collection publication is an orthogonal grow-only store capability.**
   `CollectionGossipStore` holds fixed 128-byte Ed25519 grants authorizing
   redistribution of one author's strictly verified commits in an exact

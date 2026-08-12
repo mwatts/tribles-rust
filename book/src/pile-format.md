@@ -258,6 +258,15 @@ can preserve its exact bytes through the iterator's raw file view. An unknown
 unenveloped marker is reported as `UnsupportedRecord`, while a malformed or
 truncated record is reported as `CorruptPile`.
 
+For an operator-facing view of one exact boundary, use
+`trible pile diagnose record-at <pile> <offset>`. The command is read-only: it
+walks the same canonical decoder from byte zero, rejects offsets that land
+inside a record, and prints the physical marker, classification, known span,
+next offset, and the fields the current reader can safely decode. In
+particular, an unsupported unenveloped marker asks for a newer reader and never
+suggests amputation; only a malformed or torn known record presents the
+explicit destructive-repair command.
+
 Semantic Pile and Yard reads may continue across opaque records, but destructive
 retention is different: `Pile::rewrite_retained_into`, Yard collection,
 compaction, and reclaim refuse before mutation when any opaque record is

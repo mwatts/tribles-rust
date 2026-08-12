@@ -29,6 +29,31 @@ fn opaque_envelope(needle: Option<[u8; 32]>) -> Vec<u8> {
     record
 }
 
+fn legacy_v3_definition_followed_by_blob() -> Vec<u8> {
+    const HEADER_LEN: usize = 256;
+    let payload = b"prioritize";
+    let mut bytes = vec![0u8; 3 * HEADER_LEN];
+
+    bytes[..16].copy_from_slice(
+        &hex::decode("3BE108504E4F5242FB24AA72D6D94CE1").expect("definition marker"),
+    );
+    bytes[16..32].copy_from_slice(&hex::decode("B9566CF892C55CCB0E58411E1B18CD7F").expect("scope"));
+    bytes[32..48]
+        .copy_from_slice(&hex::decode("8F4A27C8581DADCBA1ADA8BA228069B6").expect("representation"));
+    bytes[48..64]
+        .copy_from_slice(&hex::decode("6D64C5F4B9E9B73F57C5F8702AB7FE45").expect("recipe"));
+
+    let blob = &mut bytes[HEADER_LEN..];
+    blob[..16]
+        .copy_from_slice(&hex::decode("9C33EEB525065A62EAEC4BE43DCC355A").expect("V3 blob marker"));
+    blob[16..24].copy_from_slice(&1_786_400_694_176u64.to_ne_bytes());
+    blob[24..32].copy_from_slice(&(payload.len() as u64).to_ne_bytes());
+    blob[32..64].copy_from_slice(blake3::hash(payload).as_bytes());
+    blob[HEADER_LEN..HEADER_LEN + payload.len()].copy_from_slice(payload);
+
+    bytes
+}
+
 #[test]
 fn list_branches_outputs_branch_id() {
     let dir = tempdir().unwrap();
@@ -380,6 +405,120 @@ fn diagnose_reports_healthy() {
         .assert()
         .success()
         .stdout(predicate::str::contains("healthy"));
+}
+
+#[test]
+fn diagnose_decodes_legacy_v3_definition_and_continues_into_blob() {
+    let dir = tempdir().unwrap();
+    let pile_path = dir.path().join("legacy-definition-then-blob.pile");
+    std::fs::write(&pile_path, legacy_v3_definition_followed_by_blob()).unwrap();
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "pile",
+            "diagnose",
+            "record-at",
+            pile_path.to_str().unwrap(),
+            "0",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "marker: 3BE108504E4F5242FB24AA72D6D94CE1",
+        ))
+        .stdout(predicate::str::contains(
+            "classification: legacy-v3-collection-definition (inert)",
+        ))
+        .stdout(predicate::str::contains(
+            "scope: B9566CF892C55CCB0E58411E1B18CD7F",
+        ))
+        .stdout(predicate::str::contains(
+            "representation: 8F4A27C8581DADCBA1ADA8BA228069B6",
+        ))
+        .stdout(predicate::str::contains(
+            "recipe: 6D64C5F4B9E9B73F57C5F8702AB7FE45",
+        ))
+        .stdout(predicate::str::contains("known_span_bytes: 256"))
+        .stdout(predicate::str::contains("next_offset: 256"));
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "pile",
+            "diagnose",
+            "record-at",
+            pile_path.to_str().unwrap(),
+            "256",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("classification: blob"))
+        .stdout(predicate::str::contains("known_span_bytes: 512"))
+        .stdout(predicate::str::contains("next_offset: 768"))
+        .stdout(predicate::str::contains("payload_offset: 512"))
+        .stdout(predicate::str::contains("payload_length: 10"))
+        .stdout(predicate::str::contains(
+            "payload_hash: 15FC745FC8162C584C12017295E065808B04FA51D72EAE20283A2415A4D5B1B0",
+        ));
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "diagnose", "check", pile_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Pile appears healthy"))
+        .stdout(predicate::str::contains(
+            "Recognized 1 inert legacy V3 collection record(s) (first byte 0, last byte 0)",
+        ));
+}
+
+#[test]
+fn diagnose_record_at_distinguishes_version_skew_from_a_torn_record() {
+    let dir = tempdir().unwrap();
+    let unsupported_path = dir.path().join("unsupported.pile");
+    let torn_path = dir.path().join("torn.pile");
+
+    let mut unsupported = vec![0u8; 256];
+    unsupported[..16].fill(0xA5);
+    std::fs::write(&unsupported_path, unsupported).unwrap();
+    std::fs::write(
+        &torn_path,
+        hex::decode("9C33EEB525065A62EAEC4BE43DCC355A").expect("V3 blob marker"),
+    )
+    .unwrap();
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "pile",
+            "diagnose",
+            "record-at",
+            unsupported_path.to_str().unwrap(),
+            "0",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "record format unsupported by this binary",
+        ))
+        .stderr(predicate::str::contains("Upgrade trible"))
+        .stderr(predicate::str::contains("amputate").not());
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "pile",
+            "diagnose",
+            "record-at",
+            torn_path.to_str().unwrap(),
+            "0",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("is corrupt"))
+        .stderr(predicate::str::contains("genuinely torn write"))
+        .stderr(predicate::str::contains("trible pile amputate"));
 }
 
 #[test]
