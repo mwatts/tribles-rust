@@ -105,3 +105,7 @@ harness = false
 [[bench]]
 name = "succinct_raw_build"
 harness = false
+
+[[bench]]
+name = "faculty_collection_storage"
+harness = false
