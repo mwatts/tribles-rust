@@ -341,6 +341,7 @@ mod tests {
         use crate::inline::encodings::iu256::U256BE;
         use crate::inline::encodings::iu256::U256LE;
         use crate::inline::encodings::linelocation::LineLocation;
+        use crate::inline::encodings::money::{Amount, Currency, Euro};
         use crate::inline::encodings::r256::R256BE;
         use crate::inline::encodings::r256::R256LE;
         use crate::inline::encodings::range::RangeInclusiveU128;
@@ -349,6 +350,7 @@ mod tests {
         use crate::inline::encodings::UnknownInline;
         use crate::inline::Inline;
         use crate::inline::InlineEncoding;
+        use crate::inline::TryToInline;
 
         let mut bundle = crate::trible::Fragment::empty();
         bundle += Boolean::describe();
@@ -366,6 +368,7 @@ mod tests {
         bundle += RangeU128::describe();
         bundle += RangeInclusiveU128::describe();
         bundle += LineLocation::describe();
+        bundle += Currency::<Euro>::describe();
 
         bundle += ED25519RComponent::describe();
         bundle += ED25519SComponent::describe();
@@ -495,6 +498,19 @@ mod tests {
                 )
                 .unwrap(),
             "1:2..3:4"
+        );
+
+        // Money borrows ROrd256's payload and its formatter, so a viewer
+        // shows the exact rational; decimal presentation is `Display`'s job,
+        // because only the Rust type knows the currency's minor unit.
+        let money = formatter_for(Currency::<Euro>::id());
+        let price: Inline<Currency<Euro>> = Amount::<Euro>::from_minor(150)
+            .expect("valid scale")
+            .try_to_inline()
+            .expect("in domain");
+        assert_eq!(
+            money.format_value_with_limits(&price.raw, limits).unwrap(),
+            "3/2"
         );
 
         let f256le = formatter_for(F256LE::id());

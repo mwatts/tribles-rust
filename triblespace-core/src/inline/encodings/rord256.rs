@@ -453,7 +453,7 @@ impl InlineEncoding for ROrd256 {
 }
 
 #[cfg(feature = "wasm")]
-mod wasm_formatter {
+pub(crate) mod wasm_formatter {
     use core::fmt::Write;
 
     use triblespace_core_macros::value_formatter;
@@ -1045,3 +1045,4 @@ mod tests {
         }
     }
 }
+

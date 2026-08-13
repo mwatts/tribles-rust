@@ -21,6 +21,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Money is a first-class inline encoding, parameterised by currency, and its
+  value is an exact rational.** `Currency<C>` stores a monetary amount as an
+  exact `Ratio<i128>` in `ROrd256`'s encoding — the canonical continued
+  fraction, whose bytes sort in numeric order. **There is no decimal scale
+  anywhere**: €1.50 is `3/2`. That is the point rather than a detail. A
+  fixed-point money encoding has to pick a scale, and that constant then has to
+  be right for every currency and every future use, and cannot be revised
+  without rewriting every amount ever written, because the same figure at a
+  different scale is a different byte string and so a different intrinsic id.
+  A rational has no such constant, holds values a fixed-point form cannot
+  (`1/3`), and makes rates exact: 19% VAT on €19.99 is `37981/10000`, so the
+  intermediate keeps its full value and rounding happens once, where the
+  document is produced. Canonical form still holds — rationals are stored
+  reduced, so one amount has exactly one byte string — and byte order is still
+  numeric order, so ordered indexes answer range queries directly.
+  The currency lives in the *encoding*, not the value: a trible always carries
+  its attribute, so repeating the currency in every amount buys nothing, while
+  making it a type parameter makes currency confusion structurally impossible.
+  `Currency<Euro>` and `Currency<UsDollar>` are different encodings with
+  different ids, so one anchored attribute name yields one attribute id per
+  currency (`Attribute::<Currency<Euro>>::anchored`) with nothing minted per
+  currency, and `Amount<Euro> + Amount<UsDollar>` does not compile. Per-currency
+  identity is derived from `CurrencyUnit::CODE`, so two codebases that
+  independently declare a currency land on the same ids and their data merges
+  without coordination; `MINOR_UNITS` is an annotation rather than part of
+  identity, so a disagreement about presentation cannot fork a currency, and it
+  is what `Display` pads *to* and never truncates to.
+  Costs, measured rather than assumed: encode ~480 ns, decode ~82 ns, validate
+  ~86 ns per two-decimal value (release, Apple M-series), so a 133k-record
+  ingest spends ~64 ms encoding money. The representable subset is `ROrd256`'s
+  and is data-dependent — every `p/q` with `max(|p|, q) ≤ 2^104` is guaranteed,
+  wider values are rejected with a typed `OrderedRatioError::OutOfDomain` rather
+  than rounded. Verified against the source rather than today's data: every
+  Revolver monetary column is a PostgreSQL `bigint` at three decimal places, so
+  the widest value such a column can hold reduces to a numerator below `2^60`
+  over a denominator dividing 100 — 44 bits of margin that new data cannot
+  erode. A zeroed buffer cannot pass for money either: the all-zero byte string
+  is not a canonical continued fraction and is rejected, with no niche reserved
+  for it.
+  Ships `Euro`, `UsDollar`, `PoundSterling`, `SwissFranc`, `Yen`, `Bitcoin` and
+  `Ether`; any other currency is a four-line marker type. `Amount<C>` carries
+  exact `from_units`/`to_units` and `from_minor`/`to_minor` conversion, checked
+  arithmetic with no currency-mismatch error (the types prevent it), exact
+  `checked_mul_ratio` for applying a rate, and `Display`/`FromStr` that render a
+  finite decimal where one exists and the fraction where it does not (`1/3 EUR`).
+  No binary float touches an amount anywhere.
+  **This depends on `ROrd256` and must land after it.** It also makes
+  `rord256`'s wasm formatter module `pub(crate)` so money reuses it rather than
+  growing a second copy, and names `num-traits` (already in the graph under
+  `num-rational`) for checked rational arithmetic.
+  New ids, minted with `trible genid` on 2026-08-13: encoding-family anchor
+  `51D01773A3AF0A26A936C56B3A95A9F0`, `money::code`
+  `CE4138C8D49DE483673E21822D63E6C4`, `money::minor_units`
+  `3B3C14395D9BCD5DFB0E63485E073FAB`.
 - **Durable wants now name blobs and reproducible collection work through one
   canonical request key.** `WantRequest` has a fixed 97-byte codec: a one-byte
   versioned kind followed by three 32-byte fields. `Blob` uses one handle and

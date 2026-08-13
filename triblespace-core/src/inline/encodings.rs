@@ -16,6 +16,8 @@ pub mod hash;
 pub mod iu256;
 /// Line/column source location encoding.
 pub mod linelocation;
+/// Exact monetary amounts, with the currency carried by the encoding's type.
+pub mod money;
 /// 256-bit rational number encodings (little-endian and big-endian).
 pub mod r256;
 /// Range encodings for pairs of `u128` values.

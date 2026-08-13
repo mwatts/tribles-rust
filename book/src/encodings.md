@@ -118,6 +118,8 @@ The crate provides the following inline encodings out of the box:
 - `ROrd256` &ndash; exact rationals whose bytes sort in numeric order.
 - `F64` &ndash; IEEE-754 double-precision floating point number (little-endian).
 - `F256BE` / `F256LE` &ndash; 256-bit floating point numbers.
+- `Currency<C>` &ndash; an exact monetary amount in the currency `C`, stored as an
+  exact rational (see [Monetary amounts](#monetary-amounts)).
 - `Hash` and `Handle` &ndash; cryptographic digests and blob handles (see [`hash.rs`](../src/inline/encodings/hash.rs)).
 - `ED25519RComponent`, `ED25519SComponent` and `ED25519PublicKey` &ndash; signature fields and keys.
 - `NsTAIInterval` to encode time intervals.
@@ -198,6 +200,17 @@ What are you storing?
 │  │  └─ ShortString
 │  └─ Longer text?
 │     └─ Handle<LongString>  (blob)
+│
+├─ Money?
+│  └─ Currency<C> — an exact rational, one encoding per
+│     currency, in ROrd256's order-preserving layout.
+│     No decimal scale anywhere: 1.50 is 3/2, so there is
+│     no constant to pick now and regret later, and a VAT
+│     rate applies without rounding. Bytes sort numerically,
+│     so index ranges work. See "Monetary amounts".
+│     ⚠ Never F64/F256: binary floats cannot represent 0.1.
+│     ⚠ Not a bare rational: the currency belongs in the
+│     encoding, so EUR and USD cannot meet in a query.
 │
 ├─ A number?
 │  ├─ Integer
@@ -321,6 +334,192 @@ covers the full `i128 × i128` box rather than a subset of it.
 **Choose neither for money.** Amounts have a fixed scale, are not divided at
 storage, and already sort numerically as scaled integers. Use `Currency<C>`,
 which is exactly that.
+## Monetary amounts
+
+Money gets its own encoding family — `Currency<C>`, one encoding per currency —
+but the *value* it stores is not a money-specific layout at all. It is an exact
+rational in [`ROrd256`](#exact-rationals-r256-vs-rord256)'s encoding.
+
+```rust
+use triblespace::core::attribute::Attribute;
+use triblespace::core::id::Id;
+use triblespace::core::id_hex;
+use triblespace::core::inline::TryToInline;
+use triblespace::core::inline::encodings::money::{Amount, Currency, Euro, UsDollar};
+
+let price = Amount::<Euro>::from_minor(150).expect("valid scale"); // €1.50, from cents
+assert_eq!(price.to_string(), "1.50 EUR");
+let value = price.try_to_inline().expect("in domain");
+
+// One anchor, one attribute name, one id per currency.
+const TOTAL: Id = id_hex!("251C2B673AE7F49F7374866925D4F7D7");
+let eur_total = Attribute::<Currency<Euro>>::anchored(TOTAL);
+let usd_total = Attribute::<Currency<UsDollar>>::anchored(TOTAL);
+assert_ne!(eur_total.id(), usd_total.id());
+```
+
+### A rational, because then there is no scale to get wrong
+
+The obvious encoding for money is a fixed-point integer: pick a scale, count
+units of `10⁻ˢᶜᵃˡᵉ`. It works, and it hides a decision. Whatever scale you pick
+becomes a constant that every stored value depends on. It has to be right for
+every currency and every future use — sub-cent unit prices, an eighteen-decimal
+crypto denomination — and it cannot be revised without rewriting every amount
+ever written, because the same figure at a different scale is a different byte
+string and therefore a different intrinsic ID.
+
+A rational has no such constant. €1.50 is `3/2`. €1.505 is `301/200`. A third of
+a euro is `1/3`, which no fixed-point encoding can hold at all. The question "is
+18 places enough, or 4, or 36?" simply does not arise, and there is no migration
+hiding behind a later answer to it.
+
+Canonical form — the property a content-addressed store actually needs — comes
+along for free. Every rational is stored reduced, so one amount has exactly one
+byte string, and merge, equality and intrinsic IDs all agree. That is the same
+guarantee a fixed global scale was buying, obtained from the number itself
+rather than from a convention about it.
+
+It also makes rates exact. Applying 19% VAT to €19.99 gives `37981/10000`
+exactly — not `3.79`, not `3.80`, not a float. The intermediate keeps its full
+value, so rounding happens once, where the invoice is produced, which is the
+only place it belongs.
+
+### …and it still sorts
+
+Using `ROrd256` rather than `R256` is what makes the choice free. `R256` stores
+numerator and denominator side by side, so its bytes sort by numerator first and
+`1/1` lands below `2/3`; an index range over such a column is not a value range.
+`ROrd256` stores the canonical continued fraction in an order-preserving code,
+so plain bytewise comparison — which is what the indexes do — *is* numeric
+comparison. "Invoices over €10,000" is an index range, and the answer is exact
+rather than float-keyed.
+
+Worth being honest about: ordering is not why this design won. At the scale of a
+working accounting database a linear filter over a hundred thousand rows is
+milliseconds, and index acceleration only begins to matter in the millions. If
+`R256` were the only exact rational available, exactness would still be the right
+trade and the scan would be fine. `ROrd256` simply means there is no trade.
+
+### What it costs
+
+**Encode time.** A continued-fraction expansion, not a byte copy. Measured on
+two-decimal amounts across a ±500,000 EUR range (release build, Apple M-series):
+
+| operation | per value |
+|---|---|
+| encode | ~480 ns |
+| decode | ~82 ns |
+| validate | ~86 ns |
+
+A 133,000-record ingest therefore spends about **64 ms** encoding money — far
+below the cost of reading those rows out of the database. Comparison, which is
+what queries do, is a plain byte compare and costs nothing extra.
+
+**A bounded, data-dependent domain.** Encoding costs roughly
+`2·log2(max(|p|, q))` bits, so every `p/q` with `max(|p|, q) ≤ 2^104` is
+guaranteed to fit, and wider values are **rejected with a typed
+`OrderedRatioError::OutOfDomain`, never rounded silently**. Unlike a fixed-scale
+integer, whose limit is a fixed magnitude, this limit depends on the *shape* of
+the number — so it deserves a real check rather than a shrug.
+
+The check that matters is on the source column, not on today's values. Revolver,
+the accounting database this was built for, stores every monetary field as a
+PostgreSQL `bigint` at three decimal places (verified against the schema in the
+dump; measured earlier: 316,375 non-zero values across 31 currency columns, none
+with a digit below the second decimal). The widest value such a column can hold
+is `±(2⁶³−1)` at scale 3, which reduces to a numerator below `2⁶⁰` over a
+denominator dividing 100 — against a guarantee that runs to `2¹⁰⁴`. That is
+**44 bits of margin**, and it cannot be eroded by new data, only by a schema
+change. Decimal money is friendly to this encoding in general: a two-decimal
+amount is `p/100` at worst, and the numerator would have to reach 10³¹ before
+the guarantee stopped applying.
+
+Ingest code should still surface the error rather than unwrap it.
+
+### The currency is in the encoding, not in the value
+
+`Currency<Euro>` and `Currency<UsDollar>` are different encodings with different
+IDs. Since an attribute's identity is derived from `(anchor, value_encoding)`,
+one anchored attribute name yields a *different attribute* per currency, with
+nothing minted per currency.
+
+The objection — that a value should be self-describing — does not survive
+contact with the data model. A trible is (entity, attribute, value); the
+attribute is always present when the value is. Putting the currency in the
+attribute is exactly as self-describing as putting it in the value, and it buys
+three things:
+
+1. **Currency confusion becomes structurally impossible.** You cannot sum EUR
+   and USD by accident, because they are not the same attribute and do not meet
+   in a query — and in Rust, `Amount<Euro> + Amount<UsDollar>` does not compile.
+2. **The value stays a plain number**, which is what lets it be an `ROrd256`
+   payload unchanged rather than a money-specific layout with a prefix.
+3. **No combinatorial minting.** Adding a currency is a four-line marker type,
+   not a new attribute ID per (field × currency).
+
+The cost is real: **a query that spans currencies has to name each one**, with
+an `or!` across the per-currency attributes. Summing across currencies without a
+conversion rate is meaningless anyway, so making it explicit is a feature — but
+it is still something you have to write out.
+
+Declaring a currency is the whole extension mechanism:
+
+```rust
+use triblespace::core::inline::encodings::money::{Currency, CurrencyUnit};
+
+pub struct NorwegianKrone;
+impl CurrencyUnit for NorwegianKrone {
+    const CODE: &'static str = "NOK";
+    const MINOR_UNITS: u32 = 2;
+}
+type Nok = Currency<NorwegianKrone>;
+```
+
+The encoding's ID is *derived* from `CODE`, so two codebases that independently
+declare NOK land on the same encoding ID and the same attribute IDs, and their
+data merges — no registry, no coordination. `MINOR_UNITS` is deliberately an
+annotation rather than part of that identity: it is a presentation convention,
+and a disagreement about one should leave two claims about one currency rather
+than fork it into two currencies whose amounts no longer meet. It is what
+`Display` pads *to* and never truncates to: `1.50 EUR`, `5 JPY`, but `1.505 EUR`
+when the value has more digits, and `1/3 EUR` when it has no finite decimal at
+all.
+
+An **unknown currency** is a compile-time absence, not a runtime error: there is
+no `Currency<C>` for a currency nobody declared, so no attribute ID exists to
+write it under. Reading a pile written by someone else, the code is recoverable
+from the encoding entity's `code` fact rather than from the 32 bytes.
+
+**Ingesting a runtime currency column** means dispatching on the code to pick the
+monomorphisation:
+
+```rust,ignore
+match currency_code {
+    "EUR" => set += entity!{ &doc @ total: Amount::<Euro>::from_minor(cents)?.try_to_inline()? },
+    "USD" => set += entity!{ &doc @ total_usd: Amount::<UsDollar>::from_minor(cents)?.try_to_inline()? },
+    other => return Err(UnknownCurrency(other.to_owned())),
+}
+```
+
+### Other things this encoding deliberately is not
+
+- **Not a float, at any width.** Binary floats cannot represent `0.1`; extra
+  width only moves the discrepancy.
+- **Not an interval.** Money that has been through a currency conversion is
+  genuinely bounded rather than exact and deserves `[low, high]`. But an ingested
+  figure is exact, and a VAT split or an allocation is now exact too — a rational
+  times a rate is still a rational. What is left for an interval is narrow, and
+  it belongs in an additive sibling encoding under its own anchor.
+- **Not a rounding policy.** A rational can carry `19/300` of a euro exactly, but
+  the figure legally owed is the rounded one on the invoice. Which way at the
+  half, at which scale, on the line or on the total, is a business decision a
+  byte layout has no standing to make. The encoding's job is to keep the
+  intermediate exact so that decision happens once, deliberately.
+- **No ISO-4217 table.** `CODE` is not checked against the registry. That
+  registry is mutable (SSP in 2011, VES in 2018, ZWG in 2024), and a table baked
+  into the crate would make the validity of already-stored data depend on which
+  version of the library reads it — and would make adding a currency a release
+  of this crate rather than four lines in yours.
 
 ## Defining new encodings
 
