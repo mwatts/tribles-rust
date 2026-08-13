@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Durable wants now name blobs and reproducible collection work through one
+  canonical request key.** `WantRequest` has a fixed 97-byte codec: a one-byte
+  versioned kind followed by three 32-byte fields. `Blob` uses one handle and
+  zero padding, `Merge` uses a collection plus canonically ordered inputs, and
+  `Derive` uses source collection, target collection, and input. Pile assertions
+  and retractions use new one-block envelope kinds
+  `9A06797600FA90B8A8259B0ED029EC21` and
+  `2D957A780A52E474F58A06D44D6FE46C`, minted with `trible genid` on
+  2026-08-13. Legacy weak-pin records still replay into the same set as `Blob`
+  requests. Blob writes retain the historical weak-pin envelope kinds so an
+  older reader's forgetful projection remains sound; the new kinds are used
+  only for operation wants. Only blob wants participate in fetch and bounded
+  cache retention; merge and derive wants are durable questions whose answers
+  are existing collection receipts. Reconciliation recognizes locally present
+  exact receipts and keeps unanswered operation wants visibly pending; remote
+  receipt discovery follows as a separate protocol slice.
 - **Native collection records now use one dense typed representation.**
   `COMMIT`, `MERGE`, and `DERIVE` no longer masquerade as queryable
   `SimpleArchive` entities: their exact payloads are fixed at 192, 128, and

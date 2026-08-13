@@ -444,6 +444,36 @@ fn record_at(pile_path: &Path, offset: usize) -> Result<()> {
 fn print_record(bytes: &[u8], file_len: usize, record: triblespace_core::repo::pile::PileRecord) {
     use triblespace_core::collection::CollectionRecord;
     use triblespace_core::repo::pile::{LegacyCollectionRecordKindV3, PileRecordContent};
+    use triblespace_core::repo::WantRequest;
+
+    fn print_want_request(request: WantRequest) {
+        match request {
+            WantRequest::Blob { handle } => {
+                println!("  request_kind: blob");
+                println!("  handle: {}", hex::encode_upper(handle.raw));
+            }
+            WantRequest::Merge {
+                collection,
+                low,
+                high,
+            } => {
+                println!("  request_kind: merge");
+                println!("  collection: {}", hex::encode_upper(collection.raw));
+                println!("  low: {}", hex::encode_upper(low.raw));
+                println!("  high: {}", hex::encode_upper(high.raw));
+            }
+            WantRequest::Derive {
+                source,
+                target,
+                input,
+            } => {
+                println!("  request_kind: derive");
+                println!("  source: {}", hex::encode_upper(source.raw));
+                println!("  target: {}", hex::encode_upper(target.raw));
+                println!("  input: {}", hex::encode_upper(input.raw));
+            }
+        }
+    }
 
     let next_offset = record
         .offset
@@ -487,6 +517,14 @@ fn print_record(bytes: &[u8], file_len: usize, record: triblespace_core::repo::p
         PileRecordContent::WeakUnpin { handle } => {
             println!("  classification: want-retraction (legacy weak-unpin encoding)");
             println!("  handle: {}", hex::encode_upper(handle.raw));
+        }
+        PileRecordContent::WantAssert { request } => {
+            println!("  classification: want-assertion");
+            print_want_request(request);
+        }
+        PileRecordContent::WantRetract { request } => {
+            println!("  classification: want-retraction");
+            print_want_request(request);
         }
         PileRecordContent::Collection { record } => match record {
             CollectionRecord::Commit(commit) => {
@@ -557,6 +595,40 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
     use triblespace_core::inline::encodings::hash::Hash;
     use triblespace_core::inline::Inline;
     use triblespace_core::repo::pile::{PileRecordContent, PileRecords};
+    use triblespace_core::repo::WantRequest;
+
+    fn matching_want_fields(request: WantRequest, needle: &[u8; 32]) -> Vec<&'static str> {
+        match request {
+            WantRequest::Blob { handle } => (handle.raw == *needle)
+                .then_some("handle")
+                .into_iter()
+                .collect(),
+            WantRequest::Merge {
+                collection,
+                low,
+                high,
+            } => [
+                ("collection", collection.raw),
+                ("low", low.raw),
+                ("high", high.raw),
+            ]
+            .into_iter()
+            .filter_map(|(field, value)| (value == *needle).then_some(field))
+            .collect(),
+            WantRequest::Derive {
+                source,
+                target,
+                input,
+            } => [
+                ("source", source.raw),
+                ("target", target.raw),
+                ("input", input.raw),
+            ]
+            .into_iter()
+            .filter_map(|(field, value)| (value == *needle).then_some(field))
+            .collect(),
+        }
+    }
 
     let handle = handle.trim();
     let normalized = if !handle.contains(':') && handle.len() == 64 {
@@ -627,6 +699,16 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
                     want_marker_matches += 1;
                     println!(
                         "want marker match at byte {} (legacy weak-pin encoding)",
+                        record.offset
+                    );
+                }
+            }
+            PileRecordContent::WantAssert { request }
+            | PileRecordContent::WantRetract { request } => {
+                for field in matching_want_fields(request, &needle) {
+                    want_marker_matches += 1;
+                    println!(
+                        "typed want reference at byte {} (request field {field})",
                         record.offset
                     );
                 }

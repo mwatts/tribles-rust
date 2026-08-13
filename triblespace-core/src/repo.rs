@@ -210,6 +210,7 @@ use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::blob::MemoryBlobStore;
 use crate::blob::TryFromBlob;
+use crate::collection::{CollectionData, CollectionId};
 use crate::find;
 use crate::id::genid;
 use crate::id::Id;
@@ -731,48 +732,305 @@ pub trait PinStore {
     ) -> Result<PushResult, Self::UpdateError>;
 }
 
-/// Storage backend for durable, anonymous per-blob wants.
+/// Exact byte length of a canonical [`WantRequest`].
+pub const WANT_REQUEST_BYTES_LEN: usize = 1 + 3 * INLINE_LEN;
+
+/// Versioned tag of a blob request in the canonical [`WantRequest`] codec.
+pub const WANT_REQUEST_KIND_BLOB_V1: u8 = 1;
+/// Versioned tag of a merge request in the canonical [`WantRequest`] codec.
+pub const WANT_REQUEST_KIND_MERGE_V1: u8 = 2;
+/// Versioned tag of a derive request in the canonical [`WantRequest`] codec.
+pub const WANT_REQUEST_KIND_DERIVE_V1: u8 = 3;
+
+/// A durable request for absent content or reproducible collection work.
 ///
-/// A want says: "obtain this blob if it is absent; keep the local copy
-/// while cache policy permits; it may be evicted under pressure." The
-/// handle is both the durable demand key consumed by synchronization
-/// daemons and the cache-retention key after the bytes arrive.
+/// Requests deliberately name only inputs. A fulfiller may satisfy a blob
+/// request by fetching its content, a merge request by publishing an exact
+/// [`crate::collection::CollectionMerge`], or a derive request by publishing
+/// an exact [`crate::collection::CollectionDerive`].
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum WantRequest {
+    /// Obtain and retain one content-addressed blob according to local policy.
+    Blob {
+        /// Type-erased content handle requested from the store or network.
+        handle: Inline<Handle<UnknownBlob>>,
+    },
+    /// Discover or compute the exact merge of two collection elements.
+    Merge {
+        /// Collection whose merge operation is requested.
+        collection: CollectionId,
+        /// Canonically lower input digest.
+        low: CollectionData,
+        /// Canonically higher input digest.
+        high: CollectionData,
+    },
+    /// Discover or compute one collection derivation.
+    Derive {
+        /// Source collection containing `input`.
+        source: CollectionId,
+        /// Target collection requested for the derived output.
+        target: CollectionId,
+        /// Source element to derive.
+        input: CollectionData,
+    },
+}
+
+impl WantRequest {
+    /// Construct a blob request from any typed content handle.
+    pub fn blob<S>(handle: Inline<Handle<S>>) -> Self
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding,
+    {
+        Self::Blob {
+            handle: handle.transmute(),
+        }
+    }
+
+    /// Construct a merge request with its two inputs in canonical order.
+    pub fn merge(collection: CollectionId, first: CollectionData, second: CollectionData) -> Self {
+        let (low, high) = if first <= second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        Self::Merge {
+            collection,
+            low,
+            high,
+        }
+    }
+
+    /// Construct a derivation request from one exact source element.
+    pub const fn derive(source: CollectionId, target: CollectionId, input: CollectionData) -> Self {
+        Self::Derive {
+            source,
+            target,
+            input,
+        }
+    }
+
+    /// Encode this request into its exact tagged 97-byte representation.
+    pub fn to_bytes(self) -> [u8; WANT_REQUEST_BYTES_LEN] {
+        let mut bytes = [0; WANT_REQUEST_BYTES_LEN];
+        match self {
+            Self::Blob { handle } => {
+                bytes[0] = WANT_REQUEST_KIND_BLOB_V1;
+                write_want_field(&mut bytes, 0, handle.raw);
+            }
+            Self::Merge {
+                collection,
+                low,
+                high,
+            } => {
+                bytes[0] = WANT_REQUEST_KIND_MERGE_V1;
+                write_want_field(&mut bytes, 0, collection.raw);
+                write_want_field(&mut bytes, 1, low.raw);
+                write_want_field(&mut bytes, 2, high.raw);
+            }
+            Self::Derive {
+                source,
+                target,
+                input,
+            } => {
+                bytes[0] = WANT_REQUEST_KIND_DERIVE_V1;
+                write_want_field(&mut bytes, 0, source.raw);
+                write_want_field(&mut bytes, 1, target.raw);
+                write_want_field(&mut bytes, 2, input.raw);
+            }
+        }
+        bytes
+    }
+
+    /// Decode one exact canonical 97-byte request.
+    pub fn from_bytes(bytes: [u8; WANT_REQUEST_BYTES_LEN]) -> Result<Self, WantRequestDecodeError> {
+        match bytes[0] {
+            WANT_REQUEST_KIND_BLOB_V1 => {
+                if bytes[1 + INLINE_LEN..].iter().any(|byte| *byte != 0) {
+                    return Err(WantRequestDecodeError::NonZeroUnusedFields {
+                        kind: WANT_REQUEST_KIND_BLOB_V1,
+                    });
+                }
+                Ok(Self::Blob {
+                    handle: Inline::new(read_want_field(&bytes, 0)),
+                })
+            }
+            WANT_REQUEST_KIND_MERGE_V1 => {
+                let collection = Inline::new(read_want_field(&bytes, 0));
+                let low = Inline::new(read_want_field(&bytes, 1));
+                let high = Inline::new(read_want_field(&bytes, 2));
+                if high < low {
+                    return Err(WantRequestDecodeError::NonCanonicalMergeInputs);
+                }
+                Ok(Self::Merge {
+                    collection,
+                    low,
+                    high,
+                })
+            }
+            WANT_REQUEST_KIND_DERIVE_V1 => Ok(Self::Derive {
+                source: Inline::new(read_want_field(&bytes, 0)),
+                target: Inline::new(read_want_field(&bytes, 1)),
+                input: Inline::new(read_want_field(&bytes, 2)),
+            }),
+            unknown => Err(WantRequestDecodeError::UnknownKind(unknown)),
+        }
+    }
+}
+
+/// Structural failure while decoding a canonical [`WantRequest`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WantRequestDecodeError {
+    /// The versioned variant tag is unknown.
+    UnknownKind(u8),
+    /// A short variant used non-zero bytes in a reserved field.
+    NonZeroUnusedFields { kind: u8 },
+    /// A merge encoded its inputs in descending order.
+    NonCanonicalMergeInputs,
+}
+
+impl fmt::Display for WantRequestDecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownKind(kind) => {
+                write!(formatter, "want request has unknown dense kind {kind}")
+            }
+            Self::NonZeroUnusedFields { kind } => write!(
+                formatter,
+                "want request kind {kind} has non-zero unused fields"
+            ),
+            Self::NonCanonicalMergeInputs => {
+                formatter.write_str("want request merge inputs are not canonically ordered")
+            }
+        }
+    }
+}
+
+impl Error for WantRequestDecodeError {}
+
+fn write_want_field(
+    bytes: &mut [u8; WANT_REQUEST_BYTES_LEN],
+    index: usize,
+    field: [u8; INLINE_LEN],
+) {
+    let start = 1 + index * INLINE_LEN;
+    bytes[start..start + INLINE_LEN].copy_from_slice(&field);
+}
+
+fn read_want_field(bytes: &[u8; WANT_REQUEST_BYTES_LEN], index: usize) -> [u8; INLINE_LEN] {
+    let start = 1 + index * INLINE_LEN;
+    bytes[start..start + INLINE_LEN]
+        .try_into()
+        .expect("validated fixed-width want request field")
+}
+
+/// Storage backend for durable typed wants.
 ///
 /// Wants are independent of named mutable [`PinStore`] branches and native
 /// collection records. A backend may support either capability without
-/// supporting the other. Repeated
-/// [`want`](Self::want) and [`unwant`](Self::unwant) operations resolve
-/// last-writer-wins per handle; [`wants`](Self::wants) enumerates the
-/// currently asserted set.
+/// supporting the other. Repeated [`want`](Self::want) and
+/// [`unwant`](Self::unwant) operations resolve last-writer-wins per exact
+/// request; [`wants`](Self::wants) enumerates the currently asserted set.
 pub trait WantStore {
     /// Error type for want operations.
     type WantError: Error + Debug + Send + Sync + 'static;
 
-    /// Iterator over the LWW-resolved wanted handles.
-    type WantIter<'a>: Iterator<Item = Result<Inline<Handle<UnknownBlob>>, Self::WantError>>
+    /// Iterator over the LWW-resolved requests.
+    type WantIter<'a>: Iterator<Item = Result<WantRequest, Self::WantError>>
     where
         Self: 'a;
 
-    /// Assert durable demand/cache interest in `handle`.
+    /// Assert durable interest in `request`.
     ///
     /// A later `want` after an `unwant` asserts the want again.
-    fn want<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WantError>
-    where
-        S: BlobEncoding + 'static,
-        Handle<S>: InlineEncoding;
+    fn want(&mut self, request: WantRequest) -> Result<(), Self::WantError>;
 
-    /// Retract durable demand/cache interest in `handle`.
-    fn unwant<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WantError>
-    where
-        S: BlobEncoding + 'static,
-        Handle<S>: InlineEncoding;
+    /// Retract durable interest in `request`.
+    fn unwant(&mut self, request: WantRequest) -> Result<(), Self::WantError>;
 
-    /// List the LWW-resolved wanted handles.
-    ///
-    /// Synchronization daemons fetch wanted handles that are absent;
-    /// cache collectors may retain a policy-selected subset that is
-    /// already present.
+    /// List the LWW-resolved requests.
     fn wants<'a>(&'a mut self) -> Result<Self::WantIter<'a>, Self::WantError>;
+}
+
+#[cfg(test)]
+mod want_request_tests {
+    use super::*;
+
+    fn collection(byte: u8) -> CollectionId {
+        Inline::new([byte; INLINE_LEN])
+    }
+
+    fn data(byte: u8) -> CollectionData {
+        Inline::new([byte; INLINE_LEN])
+    }
+
+    #[test]
+    fn typed_blob_request_roundtrips_with_zero_unused_fields() {
+        let typed = Inline::<Handle<SimpleArchive>>::new([0x41; INLINE_LEN]);
+        let request = WantRequest::blob(typed);
+        let bytes = request.to_bytes();
+
+        assert_eq!(bytes.len(), WANT_REQUEST_BYTES_LEN);
+        assert_eq!(bytes[0], WANT_REQUEST_KIND_BLOB_V1);
+        assert!(bytes[1 + INLINE_LEN..].iter().all(|byte| *byte == 0));
+        assert_eq!(WantRequest::from_bytes(bytes), Ok(request));
+        assert_eq!(
+            request,
+            WantRequest::Blob {
+                handle: typed.transmute()
+            }
+        );
+    }
+
+    #[test]
+    fn merge_constructor_sorts_and_dense_decoder_rejects_reverse_order() {
+        let request = WantRequest::merge(collection(1), data(9), data(2));
+        assert_eq!(
+            request,
+            WantRequest::Merge {
+                collection: collection(1),
+                low: data(2),
+                high: data(9),
+            }
+        );
+        assert_eq!(WantRequest::from_bytes(request.to_bytes()), Ok(request));
+
+        let mut reversed = request.to_bytes();
+        reversed[1 + INLINE_LEN..1 + 2 * INLINE_LEN].fill(9);
+        reversed[1 + 2 * INLINE_LEN..].fill(2);
+        assert_eq!(
+            WantRequest::from_bytes(reversed),
+            Err(WantRequestDecodeError::NonCanonicalMergeInputs)
+        );
+    }
+
+    #[test]
+    fn derive_request_roundtrips() {
+        let request = WantRequest::derive(collection(1), collection(2), data(3));
+        let bytes = request.to_bytes();
+        assert_eq!(bytes[0], WANT_REQUEST_KIND_DERIVE_V1);
+        assert_eq!(WantRequest::from_bytes(bytes), Ok(request));
+    }
+
+    #[test]
+    fn dense_decoder_rejects_noncanonical_shapes() {
+        let mut unknown = [0; WANT_REQUEST_BYTES_LEN];
+        unknown[0] = 99;
+        assert_eq!(
+            WantRequest::from_bytes(unknown),
+            Err(WantRequestDecodeError::UnknownKind(99))
+        );
+
+        let mut padded =
+            WantRequest::blob(Inline::<Handle<UnknownBlob>>::new([0x51; INLINE_LEN])).to_bytes();
+        padded[1 + INLINE_LEN] = 1;
+        assert_eq!(
+            WantRequest::from_bytes(padded),
+            Err(WantRequestDecodeError::NonZeroUnusedFields {
+                kind: WANT_REQUEST_KIND_BLOB_V1,
+            })
+        );
+    }
 }
 
 /// Error returned by [`transfer`] when copying blobs between stores.

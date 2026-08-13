@@ -1896,6 +1896,8 @@ fn scan_pile_records(path: &std::path::Path) -> Result<Vec<RawBranchRecord>> {
             PileRecordContent::Blob { .. }
             | PileRecordContent::WeakPin { .. }
             | PileRecordContent::WeakUnpin { .. }
+            | PileRecordContent::WantAssert { .. }
+            | PileRecordContent::WantRetract { .. }
             | PileRecordContent::LegacyCollectionV3 { .. }
             | PileRecordContent::Collection { .. }
             | PileRecordContent::Opaque { .. } => {}

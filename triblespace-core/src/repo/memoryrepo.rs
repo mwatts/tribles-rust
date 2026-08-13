@@ -15,7 +15,7 @@ use crate::prelude::blobencodings::SimpleArchive;
 use crate::prelude::*;
 use crate::repo::PinStore;
 use crate::repo::PushResult;
-use crate::repo::WantStore;
+use crate::repo::{WantRequest, WantStore};
 
 use crate::inline::encodings::hash::Handle;
 use crate::inline::InlineEncoding;
@@ -30,11 +30,11 @@ pub struct MemoryRepo {
     pub blobs: MemoryBlobStore,
     /// Map from pin id to the handle of its current head (a commit for content branches; arbitrary SimpleArchive blob for other pin roles).
     pub branches: HashMap<Id, Inline<Handle<SimpleArchive>>>,
-    /// LWW-resolved wanted handles (see [`WantStore`]). In memory the
+    /// LWW-resolved typed requests (see [`WantStore`]). In memory the
     /// last-writer-wins resolution is just insert/remove. Wants here are
     /// exactly as ephemeral as the blobs themselves — the trait is a
     /// capability, durability is the store's own property.
-    pub wants: HashSet<Inline<Handle<UnknownBlob>>>,
+    pub wants: HashSet<WantRequest>,
     /// Canonical collection records keyed by intrinsic record id.
     collection_records: BTreeMap<Id, CollectionRecord>,
     /// Grow-only signed publication grants in deterministic value order.
@@ -180,23 +180,15 @@ impl PinStore for MemoryRepo {
 impl WantStore for MemoryRepo {
     type WantError = Infallible;
 
-    type WantIter<'a> = std::vec::IntoIter<Result<Inline<Handle<UnknownBlob>>, Self::WantError>>;
+    type WantIter<'a> = std::vec::IntoIter<Result<WantRequest, Self::WantError>>;
 
-    fn want<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WantError>
-    where
-        S: BlobEncoding + 'static,
-        Handle<S>: InlineEncoding,
-    {
-        self.wants.insert(handle.transmute());
+    fn want(&mut self, request: WantRequest) -> Result<(), Self::WantError> {
+        self.wants.insert(request);
         Ok(())
     }
 
-    fn unwant<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WantError>
-    where
-        S: BlobEncoding + 'static,
-        Handle<S>: InlineEncoding,
-    {
-        self.wants.remove(&handle.transmute());
+    fn unwant(&mut self, request: WantRequest) -> Result<(), Self::WantError> {
+        self.wants.remove(&request);
         Ok(())
     }
 
@@ -204,9 +196,9 @@ impl WantStore for MemoryRepo {
         // Sorted for the same reason as `pins()`: want enumeration
         // feeds sync-daemon fetch order, and HashSet's per-instance seed
         // would break deterministic simulation replay.
-        let mut handles: Vec<Inline<Handle<UnknownBlob>>> = self.wants.iter().copied().collect();
-        handles.sort();
-        Ok(handles.into_iter().map(Ok).collect::<Vec<_>>().into_iter())
+        let mut requests: Vec<WantRequest> = self.wants.iter().copied().collect();
+        requests.sort();
+        Ok(requests.into_iter().map(Ok).collect::<Vec<_>>().into_iter())
     }
 }
 
@@ -247,19 +239,21 @@ mod tests {
         let mut repo = MemoryRepo::default();
         assert_eq!(repo.wants().unwrap().count(), 0);
 
-        repo.want(handle(2)).unwrap();
-        repo.want(handle(1)).unwrap();
+        let first = WantRequest::blob(handle(1));
+        let second = WantRequest::blob(handle(2));
+        repo.want(second).unwrap();
+        repo.want(first).unwrap();
         // Reasserting an existing want is idempotent.
-        repo.want(handle(1)).unwrap();
+        repo.want(first).unwrap();
         let wants: Vec<_> = repo.wants().unwrap().map(Result::unwrap).collect();
-        assert_eq!(wants, vec![handle(1), handle(2)], "sorted enumeration");
+        assert_eq!(wants, vec![first, second], "sorted enumeration");
 
-        repo.unwant(handle(1)).unwrap();
+        repo.unwant(first).unwrap();
         let wants: Vec<_> = repo.wants().unwrap().map(Result::unwrap).collect();
-        assert_eq!(wants, vec![handle(2)]);
+        assert_eq!(wants, vec![second]);
 
         // A later want wins over the earlier retraction.
-        repo.want(handle(1)).unwrap();
+        repo.want(first).unwrap();
         assert_eq!(repo.wants().unwrap().count(), 2);
     }
 

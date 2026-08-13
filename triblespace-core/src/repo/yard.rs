@@ -9,7 +9,7 @@
 //! also be physically removed from disk.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
@@ -36,7 +36,7 @@ use super::pile::{
 };
 use super::{
     transfer, BlobChildren, BlobInfo, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut,
-    PinStore, PushResult, RetentionRoots, StorageClose, TransferError, WantStore,
+    PinStore, PushResult, RetentionRoots, StorageClose, TransferError, WantRequest, WantStore,
 };
 
 type HandleSet = PATCH<INLINE_LEN, IdentitySchema>;
@@ -50,24 +50,50 @@ struct WantEntry {
 
 #[derive(Debug, Default)]
 struct WantState {
+    /// Blob requests alone carry LRU cache semantics.
     wants: WantIndex,
+    /// Operation requests are durable questions, never blob-retention roots
+    /// and never subject to the resident-blob cache budget.
+    operations: BTreeSet<WantRequest>,
     clock: u64,
 }
 
 impl WantState {
-    fn want(&mut self, handle: Inline<Handle<UnknownBlob>>) {
-        self.clock = self.clock.wrapping_add(1).max(1);
-        let entry = Entry::with_value(
-            &handle.raw,
-            WantEntry {
-                last_used: self.clock,
-            },
-        );
-        self.wants.replace(&entry);
+    fn want(&mut self, request: WantRequest) {
+        match request {
+            WantRequest::Blob { handle } => {
+                self.clock = self.clock.wrapping_add(1).max(1);
+                let entry = Entry::with_value(
+                    &handle.raw,
+                    WantEntry {
+                        last_used: self.clock,
+                    },
+                );
+                self.wants.replace(&entry);
+            }
+            WantRequest::Merge { .. } | WantRequest::Derive { .. } => {
+                self.operations.insert(request);
+            }
+        }
     }
 
-    fn unwant(&mut self, raw: &[u8; INLINE_LEN]) {
-        self.wants.remove(raw);
+    fn unwant(&mut self, request: WantRequest) {
+        match request {
+            WantRequest::Blob { handle } => self.wants.remove(&handle.raw),
+            WantRequest::Merge { .. } | WantRequest::Derive { .. } => {
+                self.operations.remove(&request);
+            }
+        }
+    }
+
+    fn requests(&self) -> Vec<WantRequest> {
+        let mut requests: Vec<_> = (&self.wants)
+            .into_iter()
+            .map(|raw| WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(*raw)))
+            .chain(self.operations.iter().copied())
+            .collect();
+        requests.sort();
+        requests
     }
 
     fn trim_to_present_budget(&mut self, present: &HandleSet, budget: usize) -> HandleSet {
@@ -220,10 +246,10 @@ impl Yard {
     /// truncated**. Repair is an explicit opt-in via [`Yard::amputate`]
     /// (mirroring [`Pile::refresh`] vs [`Pile::amputate`]).
     ///
-    /// The wanted set is rebuilt from the durable want markers found
-    /// in the generation piles (old to young, so the young generation's
-    /// markers override older ones), fixing the restart amnesia the previous
-    /// in-memory-only want state had.
+    /// The wanted set is rebuilt from the durable markers in the single young
+    /// operational log. Wants found in an older generation are rejected: each
+    /// pile exposes only its locally collapsed LWW set, so cross-file ordering
+    /// cannot be reconstructed soundly.
     pub fn open<P>(
         paths: impl IntoIterator<Item = P>,
         config: YardConfig,
@@ -287,15 +313,28 @@ impl Yard {
         if generations.is_empty() {
             return Err(YardOpenError::NoGenerations);
         }
-        // Reload the durable wants. Iterate old -> young so a young
-        // marker (re-)pins last and wins the LRU recency slot; each pile's
-        // own set is already LWW-resolved by its log order. (In practice
-        // markers are only ever written to the young generation's pile.)
+        // Wants are a single young-generation operational log. Combining the
+        // already-collapsed sets of several generations would falsely revive
+        // an old assertion after a young retraction, so reject that ambiguous
+        // state instead of inventing cross-pile append order.
         let mut want_state = WantState::default();
-        for generation in generations.iter_mut().rev() {
+        for (level, generation) in generations.iter_mut().enumerate() {
+            // Generation::one is the only constructor today. If multi-segment
+            // tiers land, wants must remain in one ordered active-segment log
+            // rather than unioning several locally collapsed LWW sets.
+            debug_assert_eq!(generation.segments.len(), 1);
             for segment in &mut generation.segments {
-                for marker in segment.pile_mut().wants().map_err(update_err_io)? {
-                    want_state.want(marker.map_err(update_err_io)?);
+                let requests = segment
+                    .pile_mut()
+                    .wants()
+                    .map_err(update_err_io)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(update_err_io)?;
+                if level != 0 && !requests.is_empty() {
+                    return Err(YardOpenError::WantsOutsideYoungGeneration { level });
+                }
+                for request in requests {
+                    want_state.want(request);
                 }
             }
         }
@@ -353,16 +392,13 @@ impl Yard {
     /// be re-recorded (surviving wants re-recorded, evicted ones dropped —
     /// eviction already removed them from the in-memory set).
     fn rerecord_want_markers(&mut self) -> Result<(), std::io::Error> {
-        let wants: Vec<Inline<Handle<UnknownBlob>>> = {
+        let wants: Vec<WantRequest> = {
             let want_state = self.want_state.lock().expect("want mutex poisoned");
-            (&want_state.wants)
-                .into_iter()
-                .map(|raw| Inline::<Handle<UnknownBlob>>::new(*raw))
-                .collect()
+            want_state.requests()
         };
         let pile = self.generations[0].active_mut().pile_mut();
-        for handle in wants {
-            pile.want(handle).map_err(|err| match err {
+        for request in wants {
+            pile.want(request).map_err(|err| match err {
                 PileWriteError::IoError(io) => io,
             })?;
         }
@@ -844,7 +880,7 @@ impl PinStore for Yard {
 impl WantStore for Yard {
     type WantError = PileWriteError;
 
-    type WantIter<'a> = std::vec::IntoIter<Result<Inline<Handle<UnknownBlob>>, PileWriteError>>;
+    type WantIter<'a> = std::vec::IntoIter<Result<WantRequest, PileWriteError>>;
 
     /// Assert a want for a blob: refresh its LRU recency in memory AND persist a
     /// want marker to the young generation's pile, so the want survives
@@ -853,50 +889,34 @@ impl WantStore for Yard {
     /// Automatic lazy reads call this only on a miss. Explicit callers may
     /// also want an already-resident blob; that assertion is persisted and
     /// makes the resident copy subject to the yard's bounded want policy.
-    fn want<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WantError>
-    where
-        S: BlobEncoding + 'static,
-        Handle<S>: InlineEncoding,
-    {
-        let handle: Inline<Handle<UnknownBlob>> = handle.transmute();
-        self.generations[0]
-            .active_mut()
-            .pile_mut()
-            .want::<UnknownBlob>(handle)?;
+    fn want(&mut self, request: WantRequest) -> Result<(), Self::WantError> {
+        self.generations[0].active_mut().pile_mut().want(request)?;
         self.want_state
             .lock()
             .expect("want mutex poisoned")
-            .want(handle);
+            .want(request);
         Ok(())
     }
 
     /// Retract a want: remove it from the in-memory want state and
     /// persist a want-retraction marker to the young generation's pile
     /// (last-writer-wins against any earlier want marker).
-    fn unwant<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WantError>
-    where
-        S: BlobEncoding + 'static,
-        Handle<S>: InlineEncoding,
-    {
-        let handle: Inline<Handle<UnknownBlob>> = handle.transmute();
+    fn unwant(&mut self, request: WantRequest) -> Result<(), Self::WantError> {
         self.generations[0]
             .active_mut()
             .pile_mut()
-            .unwant::<UnknownBlob>(handle)?;
+            .unwant(request)?;
         self.want_state
             .lock()
             .expect("want mutex poisoned")
-            .unwant(&handle.raw);
+            .unwant(request);
         Ok(())
     }
 
     fn wants<'a>(&'a mut self) -> Result<Self::WantIter<'a>, Self::WantError> {
-        let items: Vec<Result<Inline<Handle<UnknownBlob>>, PileWriteError>> = {
+        let items: Vec<Result<WantRequest, PileWriteError>> = {
             let want_state = self.want_state.lock().expect("want mutex poisoned");
-            (&want_state.wants)
-                .into_iter()
-                .map(|raw| Ok(Inline::<Handle<UnknownBlob>>::new(*raw)))
-                .collect()
+            want_state.requests().into_iter().map(Ok).collect()
         };
         Ok(items.into_iter())
     }
@@ -1079,7 +1099,7 @@ impl BlobStoreGet for YardReader {
                 self.want_state
                     .lock()
                     .expect("want mutex poisoned")
-                    .want(handle.transmute());
+                    .want(WantRequest::blob(handle));
                 Err(YardGetError::NotFound)
             }
         }
@@ -1252,6 +1272,11 @@ fn reclaim_temp_path(path: &Path, level: usize) -> PathBuf {
 #[derive(Debug)]
 pub enum YardOpenError {
     NoGenerations,
+    /// Durable wants must live only in the young operational generation;
+    /// collapsed per-generation sets cannot reconstruct cross-file LWW order.
+    WantsOutsideYoungGeneration {
+        level: usize,
+    },
     Io(std::io::Error),
     /// A generation pile failed to open or validate. A
     /// [`ReadError::CorruptPile`] here means the named generation file has
@@ -1270,6 +1295,10 @@ impl fmt::Display for YardOpenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoGenerations => write!(f, "yard requires at least one generation"),
+            Self::WantsOutsideYoungGeneration { level } => write!(
+                f,
+                "yard generation {level} contains wants; wants must live only in generation 0"
+            ),
             Self::Io(err) => write!(f, "failed to create yard pile file: {err}"),
             Self::Pile { path, err } => {
                 write!(
@@ -1802,7 +1831,7 @@ mod tests {
         // evicted under a zero budget — a genuine cache eviction, not an
         // orphan sweep.
         let wanted = Blob::<RawBytes>::new(raw_blob(b"wanted")).get_handle();
-        yard.want(wanted).unwrap();
+        yard.want(WantRequest::blob(wanted)).unwrap();
         yard.put::<RawBytes, _>(raw_blob(b"wanted")).unwrap();
 
         yard.pin_strong(pin_id(1), strong);
@@ -1829,7 +1858,7 @@ mod tests {
         // absent (the want), then fetched. It is reachable from a strong
         // parent, yet the wanted veto still makes it evictable.
         let child = Blob::<UnknownBlob>::new(Bytes::from_source(b"child".to_vec())).get_handle();
-        yard.want(child).unwrap();
+        yard.want(WantRequest::blob(child)).unwrap();
         yard.put::<UnknownBlob, _>(Bytes::from_source(b"child".to_vec()))
             .unwrap();
         let parent = yard
@@ -1860,7 +1889,7 @@ mod tests {
             Blob::<UnknownBlob>::new(Bytes::from_source(b"owned child".to_vec())).get_handle();
         // Even an evictable cache want cannot veto an explicit policy
         // root: collection retention has already decided this edge is owned.
-        yard.want(owned_child).unwrap();
+        yard.want(WantRequest::blob(owned_child)).unwrap();
         yard.put::<UnknownBlob, _>(Bytes::from_source(b"owned child".to_vec()))
             .unwrap();
         let owned_parent = yard
@@ -1904,7 +1933,7 @@ mod tests {
             .unwrap();
 
         yard.pin_strong(pin_id(3), parent);
-        yard.want(absent).unwrap();
+        yard.want(WantRequest::blob(absent)).unwrap();
 
         yard.collect(&RetentionRoots::new()).unwrap();
         let reader = yard.reader().unwrap();
@@ -1930,7 +1959,7 @@ mod tests {
         // `wanted` is demand-born: wanted while absent, then fetched, so it is
         // a genuine cache entry — not a resident downgrade, which no-ops.
         let wanted = Blob::<RawBytes>::new(raw_blob(b"cache")).get_handle();
-        yard.want(wanted).unwrap();
+        yard.want(WantRequest::blob(wanted)).unwrap();
         yard.put::<RawBytes, _>(raw_blob(b"cache")).unwrap();
         yard.pin_strong(pin_id(4), strong);
 
@@ -2078,20 +2107,27 @@ mod tests {
 
         // A pure want: asserted while absent, never fetched.
         let want = Blob::<RawBytes>::new(raw_blob(b"still wanted after restart")).get_handle();
-        yard.want(want).unwrap();
+        yard.want(WantRequest::blob(want)).unwrap();
         // A demand-fetched cache entry: wanted while absent, then put.
         let cached = Blob::<RawBytes>::new(raw_blob(b"cached")).get_handle();
-        yard.want(cached).unwrap();
+        yard.want(WantRequest::blob(cached)).unwrap();
         yard.put::<RawBytes, _>(raw_blob(b"cached")).unwrap();
         // A retracted want must stay retracted across restart (LWW).
         let retracted = Blob::<RawBytes>::new(raw_blob(b"changed my mind")).get_handle();
-        yard.want(retracted).unwrap();
-        yard.unwant(retracted).unwrap();
+        yard.want(WantRequest::blob(retracted)).unwrap();
+        yard.unwant(WantRequest::blob(retracted)).unwrap();
 
         drop(yard); // closes (and flushes) the generation piles
 
         let mut reopened = Yard::open(paths, YardConfig::default()).unwrap();
-        let wanted: BTreeSet<_> = reopened.wants().unwrap().map(|r| r.unwrap().raw).collect();
+        let wanted: BTreeSet<_> = reopened
+            .wants()
+            .unwrap()
+            .map(|result| match result.unwrap() {
+                WantRequest::Blob { handle } => handle.raw,
+                _ => panic!("test only inserted blob requests"),
+            })
+            .collect();
         assert!(
             wanted.contains(&want.raw),
             "wanted want lost across restart — the amnesia bug"
@@ -2119,9 +2155,9 @@ mod tests {
         let (_dir, paths, mut yard) = yard_with_paths(1, YardConfig::default());
 
         let want = Blob::<RawBytes>::new(raw_blob(b"wanted, absent")).get_handle();
-        yard.want(want).unwrap();
+        yard.want(WantRequest::blob(want)).unwrap();
         let cached = Blob::<RawBytes>::new(raw_blob(b"cached blob")).get_handle();
-        yard.want(cached).unwrap();
+        yard.want(WantRequest::blob(cached)).unwrap();
         yard.put::<RawBytes, _>(raw_blob(b"cached blob")).unwrap();
 
         // Rewrite the young pile: only live blobs are transferred, so the
@@ -2130,7 +2166,14 @@ mod tests {
 
         drop(yard);
         let mut reopened = Yard::open(paths, YardConfig::default()).unwrap();
-        let wanted: BTreeSet<_> = reopened.wants().unwrap().map(|r| r.unwrap().raw).collect();
+        let wanted: BTreeSet<_> = reopened
+            .wants()
+            .unwrap()
+            .map(|result| match result.unwrap() {
+                WantRequest::Blob { handle } => handle.raw,
+                _ => panic!("test only inserted blob requests"),
+            })
+            .collect();
         assert!(
             wanted.contains(&want.raw),
             "want marker lost by reclaim rewrite"
@@ -2141,6 +2184,61 @@ mod tests {
         );
         let reader = reopened.reader().unwrap();
         assert_eq!(get_raw(&reader, cached).unwrap(), raw_blob(b"cached blob"));
+    }
+
+    #[test]
+    fn operation_wants_survive_reclaim_without_retaining_their_digest_fields() {
+        let config = YardConfig {
+            want_budget: 0,
+            ..YardConfig::default()
+        };
+        let (_dir, paths, mut yard) = yard_with_paths(1, config);
+        let input_blob = yard
+            .put::<RawBytes, _>(raw_blob(b"an operation input digest is not a blob root"))
+            .unwrap();
+        let source = Inline::new([51; INLINE_LEN]);
+        let target = Inline::new([52; INLINE_LEN]);
+        let input = Inline::new(input_blob.raw);
+        let merge = WantRequest::merge(source, input, Inline::new([53; INLINE_LEN]));
+        let derive = WantRequest::derive(source, target, input);
+        yard.want(merge).unwrap();
+        yard.want(derive).unwrap();
+
+        yard.collect(&RetentionRoots::new()).unwrap();
+        assert!(!yard.contains_in_generation(0, input_blob));
+        yard.reclaim().unwrap();
+        drop(yard);
+
+        let mut reopened = Yard::open(paths, config).unwrap();
+        assert_eq!(
+            reopened
+                .wants()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![merge, derive]
+        );
+        assert!(!reopened.contains_in_generation(0, input_blob));
+    }
+
+    #[test]
+    fn yard_rejects_wants_stranded_in_an_old_generation() {
+        let (_dir, paths, yard) = yard_with_paths(2, YardConfig::default());
+        drop(yard);
+
+        let request = WantRequest::derive(
+            Inline::new([61; INLINE_LEN]),
+            Inline::new([62; INLINE_LEN]),
+            Inline::new([63; INLINE_LEN]),
+        );
+        let mut old = Pile::open(&paths[1]).unwrap();
+        old.want(request).unwrap();
+        old.close().unwrap();
+
+        assert!(matches!(
+            Yard::open(paths, YardConfig::default()),
+            Err(YardOpenError::WantsOutsideYoungGeneration { level: 1 })
+        ));
     }
 
     /// The fail-loud posture: opening a yard whose generation pile has a
@@ -2652,7 +2750,7 @@ mod tests {
                     3 => yard.unpin_strong(pin_id(rng.index(PIN_COUNT))),
                     4 => {
                         let raw = choose_want_target(&yard, &mut rng, &mut model, want_mode);
-                        yard.want(unknown(raw)).unwrap();
+                        yard.want(WantRequest::blob(unknown(raw))).unwrap();
                     }
                     5 => {
                         let raw = choose_known_or_absent(&mut rng, &mut model);
@@ -2760,13 +2858,13 @@ mod tests {
             // Explicit interest is recorded even though the bytes are already
             // present. With a zero want budget, that makes the previously
             // strong resident eligible for eviction on the next collection.
-            yard.want(tenured).unwrap();
+            yard.want(WantRequest::blob(tenured)).unwrap();
             assert_eq!(
                 yard.wants()
                     .unwrap()
                     .collect::<Result<Vec<_>, _>>()
                     .unwrap(),
-                vec![tenured]
+                vec![WantRequest::blob(tenured)]
             );
             yard.collect(&RetentionRoots::new()).unwrap();
 

@@ -102,7 +102,7 @@ use super::async_store::{
 };
 use super::{
     BlobInfo, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, PinStore, PushResult,
-    StorageFlush, WantStore,
+    StorageFlush, WantRequest, WantStore,
 };
 
 /// Fixed cadence at which a suspended async read re-checks the store
@@ -506,7 +506,7 @@ where
     type WantError = S::WantError;
     // Collected eagerly, same rationale as `pins`.
     type WantIter<'a>
-        = std::vec::IntoIter<Result<Inline<Handle<UnknownBlob>>, S::WantError>>
+        = std::vec::IntoIter<Result<WantRequest, S::WantError>>
     where
         S: 'a;
 
@@ -515,27 +515,19 @@ where
     /// store's own `want` semantics; call
     /// [`StorageFlush::flush`] yourself if you need the marker
     /// crash-durable immediately.
-    fn want<Sch>(&mut self, handle: Inline<Handle<Sch>>) -> Result<(), Self::WantError>
-    where
-        Sch: BlobEncoding + 'static,
-        Handle<Sch>: InlineEncoding,
-    {
-        self.store.lock().expect("store mutex").want(handle)
+    fn want(&mut self, request: WantRequest) -> Result<(), Self::WantError> {
+        self.store.lock().expect("store mutex").want(request)
     }
 
     /// Passthrough: retract a want / retention marker.
-    fn unwant<Sch>(&mut self, handle: Inline<Handle<Sch>>) -> Result<(), Self::WantError>
-    where
-        Sch: BlobEncoding + 'static,
-        Handle<Sch>: InlineEncoding,
-    {
-        self.store.lock().expect("store mutex").unwant(handle)
+    fn unwant(&mut self, request: WantRequest) -> Result<(), Self::WantError> {
+        self.store.lock().expect("store mutex").unwant(request)
     }
 
     fn wants<'a>(&'a mut self) -> Result<Self::WantIter<'a>, Self::WantError> {
         let mut store = self.store.lock().expect("store mutex");
-        let pins: Vec<Result<Inline<Handle<UnknownBlob>>, S::WantError>> = store.wants()?.collect();
-        Ok(pins.into_iter())
+        let requests: Vec<Result<WantRequest, S::WantError>> = store.wants()?.collect();
+        Ok(requests.into_iter())
     }
 }
 
@@ -670,7 +662,7 @@ where
         // will ever fetch, and a wait without a recorded want is a wait
         // nobody will ever satisfy.
         if !this.want_recorded {
-            if let Err(e) = store.want(handle) {
+            if let Err(e) = store.want(WantRequest::blob(handle)) {
                 return Poll::Ready(Err(WantWaitError::WantRecord(WantRecordError::Want(e))));
             }
             if let Err(e) = store.flush() {
@@ -843,7 +835,7 @@ where
                 // dropped want is a blob nobody will ever fetch.
                 let mut store = self.store.lock().expect("store mutex");
                 store
-                    .want(handle)
+                    .want(WantRequest::blob(handle))
                     .map_err(|e| WantGetError::WantRecord(WantRecordError::Want(e)))?;
                 store
                     .flush()
@@ -955,14 +947,22 @@ mod tests {
         drop(reader);
 
         let wants: Vec<_> = lazy.wants().unwrap().map(Result::unwrap).collect();
-        assert_eq!(wants, vec![handle], "want visible in wants()");
+        assert_eq!(
+            wants,
+            vec![WantRequest::blob(handle)],
+            "want visible in wants()"
+        );
 
         // A second handle opened fresh on the same file replays the
         // (flushed) marker — this is what a sync daemon's pile handle
         // sees after the faculty process exits.
         let mut reopened = Pile::open(&path).unwrap();
         let wants: Vec<_> = reopened.wants().unwrap().map(Result::unwrap).collect();
-        assert_eq!(wants, vec![handle], "want survives reopen");
+        assert_eq!(
+            wants,
+            vec![WantRequest::blob(handle)],
+            "want survives reopen"
+        );
         reopened.close().unwrap();
 
         lazy.into_store().close().unwrap();
@@ -1006,20 +1006,12 @@ mod tests {
 
     impl WantStore for FailingWants {
         type WantError = WantRefused;
-        type WantIter<'a> = std::vec::IntoIter<Result<Inline<Handle<UnknownBlob>>, WantRefused>>;
+        type WantIter<'a> = std::vec::IntoIter<Result<WantRequest, WantRefused>>;
 
-        fn want<Sch>(&mut self, _handle: Inline<Handle<Sch>>) -> Result<(), WantRefused>
-        where
-            Sch: BlobEncoding + 'static,
-            Handle<Sch>: InlineEncoding,
-        {
+        fn want(&mut self, _request: WantRequest) -> Result<(), WantRefused> {
             Err(WantRefused)
         }
-        fn unwant<Sch>(&mut self, _handle: Inline<Handle<Sch>>) -> Result<(), WantRefused>
-        where
-            Sch: BlobEncoding + 'static,
-            Handle<Sch>: InlineEncoding,
-        {
+        fn unwant(&mut self, _request: WantRequest) -> Result<(), WantRefused> {
             Err(WantRefused)
         }
         fn wants<'a>(&'a mut self) -> Result<Self::WantIter<'a>, WantRefused> {
@@ -1126,7 +1118,11 @@ mod tests {
             "absent blob suspends"
         );
         let wants: Vec<_> = lazy.wants().unwrap().map(Result::unwrap).collect();
-        assert_eq!(wants, vec![handle], "first pending poll recorded the want");
+        assert_eq!(
+            wants,
+            vec![WantRequest::blob(handle)],
+            "first pending poll recorded the want"
+        );
         assert_eq!(
             counter.0.load(Ordering::SeqCst),
             0,
@@ -1165,7 +1161,11 @@ mod tests {
         }
 
         let wants: Vec<_> = lazy.wants().unwrap().map(Result::unwrap).collect();
-        assert_eq!(wants, vec![handle], "the want outlives the dropped future");
+        assert_eq!(
+            wants,
+            vec![WantRequest::blob(handle)],
+            "the want outlives the dropped future"
+        );
     }
 
     /// The cross-process path: a blob landed by a *second pile handle*

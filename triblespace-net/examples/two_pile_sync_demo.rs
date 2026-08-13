@@ -56,7 +56,7 @@ use triblespace_core::inline::{Inline, TryToInline};
 use triblespace_core::prelude::BlobStore;
 use triblespace_core::repo::capability::{self, PERM_ADMIN};
 use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::{BlobStoreGet, BlobStorePut, Repository, WantStore};
+use triblespace_core::repo::{BlobStoreGet, BlobStorePut, Repository, WantRequest, WantStore};
 use triblespace_core::trible::TribleSet;
 use triblespace_net::host;
 use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
@@ -421,7 +421,9 @@ fn run_b(dir: &Path) {
         // The durable want: want + flush BEFORE any fetch.
         let mut store = peer.store();
         store
-            .want(Inline::<Handle<UnknownBlob>>::new(payload_hash))
+            .want(WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(
+                payload_hash,
+            )))
             .expect("record want");
         store.flush().expect("flush want");
     }
@@ -457,7 +459,9 @@ fn run_b(dir: &Path) {
             .wants()
             .expect("wants")
             .filter_map(Result::ok)
-            .any(|h| h.raw == payload_hash);
+            .any(|request| {
+                request == WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(payload_hash))
+            });
         assert!(still_wanted, "want stays on record as retention marker");
     }
     println!("LAZY-OK {}", hex::encode(payload_hash));

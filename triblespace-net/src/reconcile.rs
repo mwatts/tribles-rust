@@ -1,21 +1,15 @@
-//! Want-reconcile: service durable **wants** by fetching the
-//! absent blobs from the swarm.
+//! Want-reconcile: service durable **wants**.
 //!
-//! A want is durable demand/cache interest — "I would like this blob;
-//! fetch it if absent; keep it while policy permits." Faculties and
-//! other processes append
-//! want records to the shared pile out-of-band; a long-running sync
-//! daemon (`trible pile net sync`) services that queue. This module is
-//! the mechanism, the CLI is just the wiring: each
-//! [`tick`](Reconciler::tick) diffs the LWW-resolved want set
-//! against the blobs actually present, drives the [`Peer`]'s existing
-//! swarm fetch for each missing want, and keeps per-want retry state
-//! (exponential backoff) for the ones nobody served yet.
+//! Blob wants are durable demand/cache interest — "obtain this blob and keep it
+//! while policy permits." Merge and derive wants are exact questions about
+//! immutable collection receipts. Faculties and other processes append wants
+//! to the shared pile out-of-band; a long-running sync daemon
+//! (`trible pile net sync`) services that queue.
 //!
 //! Wants are independent from named [`PinStore`](triblespace_core::repo::PinStore)
-//! branches and native collections. The reconciler reads wants and lands blobs; it never changes
-//! named pin state. The demand that triggered the fetch is already on
-//! record and becomes cache-retention interest after the blob lands.
+//! branches. The reconciler never changes named pin state. Blob demand becomes
+//! cache-retention interest after bytes land; operation wants are fulfilled by
+//! native collection records and never become blob roots.
 //! - **"Absent" is always "not obtained yet", never definitely-absent**
 //!   — existence is semidecidable. A want that can't be satisfied stays
 //!   pending and is retried with backoff; it is NOT an error and NOT
@@ -30,10 +24,11 @@ use std::time::Duration;
 
 use anybytes::Bytes;
 use triblespace_core::blob::encodings::UnknownBlob;
-use triblespace_core::collection::{CollectionGossipStore, CollectionStore};
+use triblespace_core::collection::{CollectionGossipStore, CollectionRecord, CollectionStore};
 use triblespace_core::inline::Inline;
 use triblespace_core::repo::{
-    BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut, PinStore, StorageFlush, WantStore,
+    BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut, PinStore, StorageFlush, WantRequest,
+    WantStore,
 };
 
 use crate::peer::Peer;
@@ -44,10 +39,10 @@ use crate::protocol::RawHash;
 /// is legible from the outside.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ReconcileStats {
-    /// Wanted handles seen this pass — the full LWW-resolved want
-    /// set, whether the blob is present or not.
+    /// Exact requests seen this pass — the full LWW-resolved want set.
     pub wants: usize,
-    /// Wants whose blob was absent locally at the start of the pass.
+    /// Requests whose blob or exact operation receipt was absent locally at
+    /// the start of the pass.
     pub missing: usize,
     /// Fetches actually issued this pass (`missing` minus the
     /// backoff-gated).
@@ -161,17 +156,52 @@ impl Reconciler {
         let mut stats = ReconcileStats::default();
 
         // ── Wants: the LWW-resolved want set ──────────────────────
-        let wants: Vec<RawHash> = {
+        let requests: Vec<WantRequest> = {
             let mut store = peer.store();
             match store.wants() {
-                Ok(iter) => iter.filter_map(Result::ok).map(|h| h.raw).collect(),
+                Ok(iter) => iter.filter_map(Result::ok).collect(),
                 Err(e) => {
                     tracing::warn!(error = ?e, "reconcile: wants enumeration failed; skipping pass");
                     return stats;
                 }
             }
         };
-        stats.wants = wants.len();
+        stats.wants = requests.len();
+        let mut blob_wants = Vec::new();
+        let mut operation_wants = HashSet::new();
+        for request in requests {
+            match request {
+                WantRequest::Blob { handle } => blob_wants.push(handle.raw),
+                WantRequest::Merge { .. } | WantRequest::Derive { .. } => {
+                    operation_wants.insert(request);
+                }
+            }
+        }
+
+        // A locally present exact receipt already answers an operation want.
+        // Remote receipt discovery lands in the next protocol slice; until
+        // then unanswered operation wants remain visibly pending rather than
+        // allowing the daemon to report false quiescence.
+        if !operation_wants.is_empty() {
+            let local_answers = {
+                let mut store = peer.store();
+                match store.records() {
+                    Ok(records) => records
+                        .filter_map(Result::ok)
+                        .filter_map(want_request_for_record)
+                        .collect::<HashSet<_>>(),
+                    Err(error) => {
+                        tracing::warn!(
+                            error = ?error,
+                            "reconcile: collection receipt enumeration failed; operation wants stay pending"
+                        );
+                        HashSet::new()
+                    }
+                }
+            };
+            operation_wants.retain(|request| !local_answers.contains(request));
+        }
+        stats.pending = operation_wants.len();
 
         // ── Presence: which wants the local snapshot already serves ───
         // Peer::reader() runs refresh() (drains gossip, announces
@@ -184,13 +214,13 @@ impl Reconciler {
                 return stats;
             }
         };
-        let missing: Vec<RawHash> = wants
+        let missing: Vec<RawHash> = blob_wants
             .into_iter()
             .filter(|hash| {
                 BlobStoreGet::get::<Bytes, UnknownBlob>(&reader, Inline::new(*hash)).is_err()
             })
             .collect();
-        stats.missing = missing.len();
+        stats.missing = missing.len() + operation_wants.len();
 
         // Drop bookkeeping for wants no longer outstanding — satisfied
         // out-of-band (gossip landed the blob) or retracted.
@@ -277,5 +307,48 @@ impl Reconciler {
         }
 
         stats
+    }
+}
+
+fn want_request_for_record(record: CollectionRecord) -> Option<WantRequest> {
+    match record {
+        CollectionRecord::Commit(_) => None,
+        CollectionRecord::Merge(merge) => {
+            let (low, high) = merge.inputs();
+            Some(WantRequest::merge(merge.collection(), low, high))
+        }
+        CollectionRecord::Derive(derive) => {
+            let (input, _) = derive.mapping();
+            Some(WantRequest::derive(derive.source(), derive.target(), input))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use triblespace_core::collection::{CollectionDerive, CollectionMerge};
+
+    #[test]
+    fn exact_receipts_project_to_their_input_only_want_keys() {
+        let collection = Inline::new([1; 32]);
+        let target = Inline::new([2; 32]);
+        let a = Inline::new([3; 32]);
+        let b = Inline::new([4; 32]);
+        let result = Inline::new([5; 32]);
+
+        assert_eq!(
+            want_request_for_record(CollectionRecord::Merge(CollectionMerge::new(
+                collection, b, a, result,
+            ))),
+            Some(WantRequest::merge(collection, a, b))
+        );
+        assert_eq!(
+            want_request_for_record(CollectionRecord::Derive(CollectionDerive::new(
+                collection, target, a, result,
+            ))),
+            Some(WantRequest::derive(collection, target, a))
+        );
     }
 }

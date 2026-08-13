@@ -13,7 +13,7 @@ use crate::repo::BlobStorePut;
 use crate::repo::PinStore;
 use crate::repo::PushResult;
 use crate::repo::StorageFlush;
-use crate::repo::WantStore;
+use crate::repo::{WantRequest, WantStore};
 use std::error::Error;
 use std::fmt;
 
@@ -24,7 +24,7 @@ use std::fmt;
 /// e.g. an on-disk blob store with an in-memory branch store.
 #[derive(Debug)]
 pub struct HybridStore<B, R> {
-    /// Storage for content-addressed blobs and per-blob wants.
+    /// Storage for content-addressed blobs and durable typed wants.
     pub blobs: B,
     /// Storage for branch heads and native collection records.
     ///
@@ -208,20 +208,12 @@ where
         B: 'a,
         R: 'a;
 
-    fn want<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WantError>
-    where
-        S: BlobEncoding + 'static,
-        Handle<S>: InlineEncoding,
-    {
-        self.blobs.want(handle)
+    fn want(&mut self, request: WantRequest) -> Result<(), Self::WantError> {
+        self.blobs.want(request)
     }
 
-    fn unwant<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WantError>
-    where
-        S: BlobEncoding + 'static,
-        Handle<S>: InlineEncoding,
-    {
-        self.blobs.unwant(handle)
+    fn unwant(&mut self, request: WantRequest) -> Result<(), Self::WantError> {
+        self.blobs.unwant(request)
     }
 
     fn wants<'a>(&'a mut self) -> Result<Self::WantIter<'a>, Self::WantError> {
@@ -292,16 +284,17 @@ mod tests {
         use crate::blob::encodings::UnknownBlob;
 
         let handle = Inline::<Handle<UnknownBlob>>::new([9; 32]);
+        let request = WantRequest::blob(handle);
         let mut hybrid = HybridStore::new(MemoryRepo::default(), MemoryRepo::default());
 
-        hybrid.want(handle).unwrap();
+        hybrid.want(request).unwrap();
         assert_eq!(
             hybrid
                 .wants()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
-            vec![handle]
+            vec![request]
         );
         assert_eq!(hybrid.blobs.wants().unwrap().count(), 1);
         assert_eq!(hybrid.branches.wants().unwrap().count(), 0);

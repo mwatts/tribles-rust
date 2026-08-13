@@ -57,7 +57,7 @@ use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::lazy::WantRecordError;
 use triblespace_core::repo::{
     BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut, PinStore,
-    PushResult, StorageFlush, WantStore,
+    PushResult, StorageFlush, WantRequest, WantStore,
 };
 
 use crate::channel::{NetEvent, PublisherKey};
@@ -1142,7 +1142,7 @@ where
         {
             let mut store = self.store.lock().expect("store mutex");
             store
-                .want(Inline::<Handle<UnknownBlob>>::new(hash))
+                .want(WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(hash)))
                 .map_err(WantRecordError::Want)?;
             store.flush().map_err(WantRecordError::Flush)?;
         }
@@ -1437,7 +1437,7 @@ where
     fn record_want(&self, hash: RawHash) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut store = self.0.lock().expect("store mutex");
         store
-            .want(Inline::<Handle<UnknownBlob>>::new(hash))
+            .want(WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(hash)))
             .map_err(|e| {
                 Box::new(WantRecordError::<_, <S as StorageFlush>::Error>::Want(e))
                     as Box<dyn std::error::Error + Send + Sync>

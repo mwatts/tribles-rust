@@ -27,7 +27,7 @@ use triblespace_core::prelude::BlobStore;
 use triblespace_core::repo::async_store::AsyncBlobStoreGet;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{
-    BlobStoreGet, BlobStoreKeep, BlobStoreList, BlobStorePut, PinStore, WantStore,
+    BlobStoreGet, BlobStoreKeep, BlobStoreList, BlobStorePut, PinStore, WantRequest, WantStore,
 };
 use triblespace_core::trible::TribleSet;
 use triblespace_net::transport::sim::{DhtMode, SimConfig, SimNet};
@@ -205,7 +205,7 @@ fn lazy_read_lands_wanted_in_store() {
             .collect();
         assert_eq!(
             wanted,
-            vec![Inline::<Handle<UnknownBlob>>::new(hash)],
+            vec![WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(hash))],
             "fetched blob is wanted"
         );
         // 3. ...and NOT strong-pinned (no eager durability promise).
@@ -275,7 +275,9 @@ fn lazy_store_eviction_is_safe_and_refetches() {
         {
             let mut store = peer_b.store();
             store
-                .unwant(Inline::<Handle<UnknownBlob>>::new(blobs[0].1))
+                .unwant(WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(
+                    blobs[0].1,
+                )))
                 .unwrap();
             let retained: Vec<Inline<Handle<UnknownBlob>>> = store
                 .reader()
@@ -1214,7 +1216,7 @@ fn reconcile_tick_services_out_of_band_want() {
         // want record to the shared pile looks like to the daemon.
         peer_b
             .store()
-            .want(Inline::<Handle<UnknownBlob>>::new(hash))
+            .want(WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(hash)))
             .unwrap();
         assert!(
             peer_b.try_local(hash).is_none(),
@@ -1250,7 +1252,7 @@ fn reconcile_tick_services_out_of_band_want() {
             .collect();
         assert_eq!(
             wanted,
-            vec![Inline::<Handle<UnknownBlob>>::new(hash)],
+            vec![WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(hash))],
             "the want stays on record as the want"
         );
         // ...B grew no strong pin...
@@ -1298,7 +1300,7 @@ fn reconcile_unsatisfiable_want_stays_pending() {
         let hash = *blake3::hash(b"nobody holds this blob").as_bytes();
         peer_a
             .store()
-            .want(Inline::<Handle<UnknownBlob>>::new(hash))
+            .want(WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(hash)))
             .unwrap();
 
         let mut rec = Reconciler::new();
@@ -1343,7 +1345,10 @@ fn reconcile_unsatisfiable_want_stays_pending() {
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        assert_eq!(wanted, vec![Inline::<Handle<UnknownBlob>>::new(hash)]);
+        assert_eq!(
+            wanted,
+            vec![WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(hash))]
+        );
         assert!(peer_a.try_local(hash).is_none());
     });
 }

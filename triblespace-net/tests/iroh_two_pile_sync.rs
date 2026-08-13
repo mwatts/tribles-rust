@@ -48,7 +48,7 @@ use triblespace_core::inline::{Inline, TryToInline};
 use triblespace_core::prelude::BlobStore;
 use triblespace_core::repo::capability::{self, PERM_ADMIN};
 use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::{BlobStoreGet, BlobStorePut, Repository, WantStore};
+use triblespace_core::repo::{BlobStoreGet, BlobStorePut, Repository, WantRequest, WantStore};
 use triblespace_core::trible::TribleSet;
 use triblespace_net::clock;
 use triblespace_net::host;
@@ -356,7 +356,7 @@ async fn want_fetches_from_holder_over_iroh() {
         let peer_b = repo_b.storage_mut();
         let mut store = peer_b.store();
         store
-            .want(Inline::<Handle<UnknownBlob>>::new(hash))
+            .want(WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(hash)))
             .expect("record want");
         store.flush().expect("flush want");
     }
@@ -404,7 +404,7 @@ async fn want_fetches_from_holder_over_iroh() {
             .wants()
             .expect("wants")
             .filter_map(Result::ok)
-            .any(|h| h.raw == hash);
+            .any(|request| request == WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(hash)));
         assert!(
             still_wanted,
             "the want stays on record as the retention marker"

@@ -29,12 +29,12 @@ record is a **256-byte multiple**:
 | `32..36` | 4 | Total record span in 256-byte blocks, unsigned little-endian |
 | `36..256` | 220 | Kind-specific body and zeroed reserved bytes |
 
-The envelope marker was minted with `trible genid` on 2026-08-11. Record kinds
-reuse the existing current V3 blob/branch/want markers and V4 collection
-markers; no semantic IDs were reminted. A collection descriptor itself remains
-an ordinary blob, not a fourth collection-record kind. Want records likewise
-retain their historical weak-pin/weak-unpin kind IDs; those are physical format
-names, not the public storage model.
+The envelope marker was minted with `trible genid` on 2026-08-11. Blob and
+branch record kinds reuse their current V3 markers, while collection records
+reuse their V4 markers. A collection descriptor itself remains an ordinary
+blob, not a fourth collection-record kind. Typed want assertions and
+retractions have their own markers; historical weak-pin records remain
+readable as the blob-only predecessor of that model.
 
 The span includes the header. Zero is invalid; decoders perform checked
 `span * 256` arithmetic and require that the complete record fit in the
@@ -452,22 +452,44 @@ rewrite while any such record remains.
 
 | Kind | Kind ID | Kind-specific body after the common prefix |
 |---|---|---|
-| Assert | `8F3EEFEDECD491F63F6EAAA5FD6F3D5E` | `36..68` blob handle, `68..256` reserved zeros |
-| Retract | `2D76662DFF0187EC36A8C90B12BB8B0D` | `36..68` blob handle, `68..256` reserved zeros |
+| Assert | `9A06797600FA90B8A8259B0ED029EC21` | `36` request kind, `37..69` field A, `69..101` field B, `101..133` field C, `133..256` reserved zeros |
+| Retract | `2D957A780A52E474F58A06D44D6FE46C` | same request layout |
 
-A want assertion (and its retraction counterpart, using the same layout with a
-different marker) is keyed by **blob handle** — per-blob and anonymous, with no
-pin ID. Assertions and retractions resolve last-writer-wins per handle. The
-resulting [`WantStore`](https://docs.rs/triblespace-core/latest/triblespace_core/repo/trait.WantStore.html)
-state is independent from mutable branches and native collections: a pile may use wants for
-fetch-on-demand and bounded cache retention without using branches at all.
-Because wants are durable records, reopening a pile reconstructs the current
-wanted set. The implementation keeps the original weak-pin/weak-unpin marker
-IDs solely so existing piles continue to decode byte-for-byte.
+Both kind IDs were minted with `trible genid` on 2026-08-13 and encode `Merge`
+and `Derive` requests. An assertion and its retraction are keyed by the exact
+canonical 97-byte `WantRequest` below. They resolve last-writer-wins per exact
+request; reopening a pile reconstructs the asserted set.
+
+| Request | Tag | Field A | Field B | Field C |
+|---|---:|---|---|---|
+| Blob | 1 | blob handle | zero | zero |
+| Merge | 2 | collection descriptor handle | lower input digest | higher input digest |
+| Derive | 3 | source descriptor handle | target descriptor handle | input digest |
+
+The canonical key is `tag || A || B || C`: byte `0` is the versioned tag,
+`1..33` is A, `33..65` is B, and `65..97` is C. Blob decoding rejects nonzero
+unused fields. Merge inputs must be in lexicographic order (`low <= high`), so
+operand order cannot create a second request key.
+
+The three request kinds deliberately share durability but not policy. `Blob`
+asks for content and participates in fetch-on-demand and bounded cache
+retention. `Merge` and `Derive` are durable questions about reproducible
+collection work; an answer is the corresponding native `MERGE` or `DERIVE`
+receipt already defined by `CollectionStore`, not mutable state inside the
+want. The storage format persists those questions independently of whether a
+local or remote worker eventually supplies the receipt.
+
+Blob assertions continue to be written with the historical weak-pin kind
+`8F3EEFEDECD491F63F6EAAA5FD6F3D5E`, and Blob retractions with the historical
+weak-unpin kind `2D76662DFF0187EC36A8C90B12BB8B0D`. Their single handle decodes
+as the equivalent canonical `Blob` request. Keeping Blob writes on these kinds
+is essential to the envelope's forgetful-projection rule: an older reader sees
+the complete Blob LWW history and may safely ignore the new independent
+operation-want kinds.
 
 ## Legacy unenveloped records
 
-Unenveloped V3 blob, branch, and want records place their kind ID directly in
+Unenveloped V3 blob, branch, and legacy blob-want records place their kind ID directly in
 `0..16`. Their semantic bodies begin at byte 16 rather than byte 36: a V3 blob
 stores timestamp at `16..24`, byte length at `24..32`, and hash at `32..64`;
 branch IDs occupy `16..32`; branch values occupy `32..64`; and want handles

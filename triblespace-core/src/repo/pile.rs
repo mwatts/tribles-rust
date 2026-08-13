@@ -64,6 +64,7 @@ use crate::patch::IdentitySchema;
 use crate::patch::PATCH;
 use crate::prelude::blobencodings::SimpleArchive;
 use crate::prelude::inlineencodings::Handle;
+use crate::repo::{WantRequest, WANT_REQUEST_BYTES_LEN};
 
 const MAGIC_MARKER_BLOB: RawId = hex!("1E08B022FF2F47B6EBACF1D68EB35D96");
 const MAGIC_MARKER_BRANCH: RawId = hex!("2BC991A7F5D5D2A3A468C53B0AA03504");
@@ -100,6 +101,14 @@ const MAGIC_MARKER_BRANCH_TOMBSTONE_V3: RawId = hex!("D0CBA0C8EAAB4C0C73121C3205
 /// retracts it. Reopening a pile reconstructs the current wanted set.
 const MAGIC_MARKER_WEAK_PIN_V3: RawId = hex!("8F3EEFEDECD491F63F6EAAA5FD6F3D5E");
 const MAGIC_MARKER_WEAK_UNPIN_V3: RawId = hex!("2D76662DFF0187EC36A8C90B12BB8B0D");
+/// Typed want assertion and retraction markers, minted on 2026-08-13 with
+/// `trible genid`.
+///
+/// Unlike the legacy weak-pin pair, these carry the complete canonical
+/// [`WantRequest`] key and can therefore name blob fetches as well as exact
+/// merge and derive receipt lookups.
+const MAGIC_MARKER_WANT_ASSERT_V2: RawId = hex!("9A06797600FA90B8A8259B0ED029EC21");
+const MAGIC_MARKER_WANT_RETRACT_V2: RawId = hex!("2D957A780A52E474F58A06D44D6FE46C");
 /// Legacy V3 collection-record markers, minted on 2026-08-10 with
 /// `trible genid`.
 ///
@@ -585,6 +594,60 @@ impl WantHeaderEnvelope {
 
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
+struct TypedWantHeaderEnvelope {
+    envelope_marker: RawId,
+    record_kind: RawId,
+    span_blocks: [u8; 4],
+    request_kind: u8,
+    field_a: RawInline,
+    field_b: RawInline,
+    field_c: RawInline,
+    reserved: [u8; 123],
+}
+
+impl TypedWantHeaderEnvelope {
+    /// Construct the physical envelope used only by collection-operation
+    /// wants. Blob wants deliberately retain the legacy weak-pin envelope so
+    /// an older reader sees the same forgetful projection as a current one.
+    fn new_operation(request: WantRequest, asserted: bool) -> Option<Self> {
+        if matches!(request, WantRequest::Blob { .. }) {
+            return None;
+        }
+        let bytes = request.to_bytes();
+        let mut field_a = [0u8; 32];
+        let mut field_b = [0u8; 32];
+        let mut field_c = [0u8; 32];
+        field_a.copy_from_slice(&bytes[1..33]);
+        field_b.copy_from_slice(&bytes[33..65]);
+        field_c.copy_from_slice(&bytes[65..97]);
+        Some(Self {
+            envelope_marker: MAGIC_MARKER_ENVELOPE,
+            record_kind: if asserted {
+                MAGIC_MARKER_WANT_ASSERT_V2
+            } else {
+                MAGIC_MARKER_WANT_RETRACT_V2
+            },
+            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
+            request_kind: bytes[0],
+            field_a,
+            field_b,
+            field_c,
+            reserved: [0u8; 123],
+        })
+    }
+
+    fn request(&self) -> Result<WantRequest, crate::repo::WantRequestDecodeError> {
+        let mut bytes = [0u8; WANT_REQUEST_BYTES_LEN];
+        bytes[0] = self.request_kind;
+        bytes[1..33].copy_from_slice(&self.field_a);
+        bytes[33..65].copy_from_slice(&self.field_b);
+        bytes[65..97].copy_from_slice(&self.field_c);
+        WantRequest::from_bytes(bytes)
+    }
+}
+
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
 struct CollectionCommitHeaderEnvelope {
     envelope_marker: RawId,
     record_kind: RawId,
@@ -748,6 +811,7 @@ const _: () = {
     assert!(std::mem::size_of::<BranchHeaderEnvelope>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<BranchTombstoneHeaderEnvelope>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<WantHeaderEnvelope>() == ENVELOPE_HEADER_LEN);
+    assert!(std::mem::size_of::<TypedWantHeaderEnvelope>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<CollectionCommitHeaderEnvelope>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<CollectionMergeHeaderEnvelope>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<CollectionDeriveHeaderEnvelope>() == ENVELOPE_HEADER_LEN);
@@ -830,6 +894,16 @@ pub enum PileRecordContent {
     WeakUnpin {
         /// The no-longer-wanted blob handle.
         handle: Inline<Handle<UnknownBlob>>,
+    },
+    /// A typed local request assertion.
+    WantAssert {
+        /// The exact request key being asserted.
+        request: WantRequest,
+    },
+    /// A typed local request retraction.
+    WantRetract {
+        /// The exact request key being retracted.
+        request: WantRequest,
     },
     /// One immutable current collection-algebra record. Three distinct V4
     /// magic markers share this typed raw-inspection surface.
@@ -955,6 +1029,33 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
                 PileRecordContent::WeakPin { handle }
             } else {
                 PileRecordContent::WeakUnpin { handle }
+            };
+            Ok(PileRecord {
+                offset,
+                len,
+                content,
+            })
+        }
+        MAGIC_MARKER_WANT_ASSERT_V2 | MAGIC_MARKER_WANT_RETRACT_V2 => {
+            fixed_header()?;
+            let (header, _) =
+                TypedWantHeaderEnvelope::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+            if header.reserved.iter().any(|byte| *byte != 0) {
+                return Err(corrupt());
+            }
+            let request = header.request().map_err(|_| corrupt())?;
+            // Blob wants must use the legacy weak-pin physical marker pair.
+            // Accepting the typed representation here would let a newer
+            // writer construct a history whose Blob LWW projection differs
+            // between current readers and older readers that skip this
+            // unknown record kind.
+            if matches!(request, WantRequest::Blob { .. }) {
+                return Err(corrupt());
+            }
+            let content = if prefix.record_kind == MAGIC_MARKER_WANT_ASSERT_V2 {
+                PileRecordContent::WantAssert { request }
+            } else {
+                PileRecordContent::WantRetract { request }
             };
             Ok(PileRecord {
                 offset,
@@ -1502,8 +1603,8 @@ enum Applied {
     Blob { hash: Inline<Hash<Blake3>> },
     Branch { id: Id, hash: Inline<Hash<Blake3>> },
     BranchTombstone { id: Id },
-    WeakPin { handle: Inline<Handle<UnknownBlob>> },
-    WeakUnpin { handle: Inline<Handle<UnknownBlob>> },
+    WantAssert { request: WantRequest },
+    WantRetract { request: WantRequest },
     Collection { id: Id },
     CollectionGossip { grant: CollectionGossip },
     LegacyCollectionV3,
@@ -1543,10 +1644,10 @@ pub struct Pile {
     /// unknown generic-envelope kinds and retired local-cell encodings.
     /// Destructive physical rewrites refuse while this is nonzero.
     opaque_records: usize,
-    /// LWW-resolved wanted set. Legacy weak-pin records assert the handle and
-    /// weak-unpin records retract it; log-order application makes the last
-    /// record for a handle win by construction.
-    wants: PATCH<32, IdentitySchema>,
+    /// LWW-resolved typed request set. Legacy weak-pin records project to blob
+    /// requests; current records carry the complete 97-byte canonical key.
+    /// Log-order application makes the last record for one exact key win.
+    wants: PATCH<WANT_REQUEST_BYTES_LEN, IdentitySchema>,
     /// Length of the file that has been validated and applied.
     ///
     /// Offsets below this value are guaranteed valid; corruption detection
@@ -1990,7 +2091,7 @@ impl Pile {
             collection_gossips: BTreeSet::new(),
             legacy_collection_headers: BTreeSet::new(),
             opaque_records: 0,
-            wants: PATCH::<32, IdentitySchema>::new(),
+            wants: PATCH::<WANT_REQUEST_BYTES_LEN, IdentitySchema>::new(),
             applied_length: 0,
         })
     }
@@ -2118,12 +2219,22 @@ impl Pile {
                 Applied::BranchTombstone { id: branch_id }
             }
             PileRecordContent::WeakPin { handle } => {
-                self.wants.insert(&Entry::new(&handle.raw));
-                Applied::WeakPin { handle }
+                let request = WantRequest::blob(handle);
+                self.wants.insert(&Entry::new(&request.to_bytes()));
+                Applied::WantAssert { request }
             }
             PileRecordContent::WeakUnpin { handle } => {
-                self.wants.remove(&handle.raw);
-                Applied::WeakUnpin { handle }
+                let request = WantRequest::blob(handle);
+                self.wants.remove(&request.to_bytes());
+                Applied::WantRetract { request }
+            }
+            PileRecordContent::WantAssert { request } => {
+                self.wants.insert(&Entry::new(&request.to_bytes()));
+                Applied::WantAssert { request }
+            }
+            PileRecordContent::WantRetract { request } => {
+                self.wants.remove(&request.to_bytes());
+                Applied::WantRetract { request }
             }
             PileRecordContent::Collection { record } => {
                 let id = record.id();
@@ -2718,8 +2829,8 @@ impl Pile {
                     }
                     Some(Applied::Branch { .. }) => {}
                     Some(Applied::BranchTombstone { .. }) => {}
-                    Some(Applied::WeakPin { .. }) => {}
-                    Some(Applied::WeakUnpin { .. }) => {}
+                    Some(Applied::WantAssert { .. }) => {}
+                    Some(Applied::WantRetract { .. }) => {}
                     Some(Applied::Collection { .. }) => {}
                     Some(Applied::CollectionGossip { .. }) => {}
                     Some(Applied::LegacyCollectionV3) => {}
@@ -2859,65 +2970,85 @@ impl PinStore for Pile {
     }
 }
 
-/// Iterator over the LWW-resolved wanted handles stored in the pile,
+/// Iterator over the LWW-resolved typed requests stored in the pile,
 /// using the PATCH's ordered key iterator (byte order, deterministic).
 pub struct PileWantIter {
-    inner: crate::patch::PATCHIntoOrderedIterator<32, IdentitySchema, ()>,
+    inner: crate::patch::PATCHIntoOrderedIterator<WANT_REQUEST_BYTES_LEN, IdentitySchema, ()>,
 }
 
 impl Iterator for PileWantIter {
-    type Item = Result<Inline<Handle<UnknownBlob>>, PileWriteError>;
+    type Item = Result<WantRequest, PileWriteError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let raw = self.inner.next()?;
-        Some(Ok(Inline::<Handle<UnknownBlob>>::new(raw)))
+        let bytes = self.inner.next()?;
+        Some(Ok(WantRequest::from_bytes(bytes).expect(
+            "Pile only indexes structurally decoded canonical want requests",
+        )))
     }
 }
 
 impl Pile {
-    /// Append an enveloped want assertion or retraction, reusing the legacy
-    /// weak-pin marker as its semantic kind ID.
+    /// Append an enveloped typed want assertion or retraction.
     /// Mirrors [`PinStore::update`]'s write path:
     /// exclusive lock, refresh, no-op short-circuit when the LWW state already
     /// matches, a single fixed 256-byte header write (keeping a current pile
     /// 256-aligned), and an `apply_next` read-back while still holding the
     /// lock. Like branch updates, the record is **not durable** until
     /// [`Pile::flush`] is called.
-    fn write_weak_marker(
+    fn write_want_marker(
         &mut self,
-        handle: Inline<Handle<UnknownBlob>>,
-        pin: bool,
+        request: WantRequest,
+        asserted: bool,
     ) -> Result<(), PileWriteError> {
         self.file.lock()?;
         let res = (|| {
             self.refresh_locked().map_err(PileWriteError::from)?;
 
-            // No-op short-circuit: the wanted set is logically a per-handle
+            // No-op short-circuit: the wanted set is logically a per-request
             // LWW register; re-asserting the current state carries no
             // information and would just churn the append-only file.
-            let current = self.wants.get(&handle.raw).is_some();
-            if current == pin {
+            let key = request.to_bytes();
+            let current = self.wants.get(&key).is_some();
+            if current == asserted {
                 return Ok(());
             }
 
             self.dirty = true;
-            let header = WantHeaderEnvelope::new(handle, pin);
-            let write_res = self.file.write(header.as_bytes());
+            // Blob wants retain the historical physical marker. Otherwise an
+            // older reader would see `legacy assert; typed retract` as
+            // `assert; opaque` and resurrect the request. Operation wants are
+            // independent of every legacy meaning and use the typed marker.
+            let write_res = match request {
+                WantRequest::Blob { handle } => self
+                    .file
+                    .write(WantHeaderEnvelope::new(handle, asserted).as_bytes()),
+                WantRequest::Merge { .. } | WantRequest::Derive { .. } => self.file.write(
+                    TypedWantHeaderEnvelope::new_operation(request, asserted)
+                        .expect("collection-operation want must have a typed envelope")
+                        .as_bytes(),
+                ),
+            };
             let written = write_res.map_err(PileWriteError::IoError)?;
             if written != ENVELOPE_HEADER_LEN {
                 return Err(PileWriteError::IoError(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
-                    "failed to write weak-pin header",
+                    "failed to write typed want header",
                 )));
             }
             match self.apply_next().map_err(PileWriteError::from)? {
-                Some(Applied::WeakPin { handle: h }) if pin && h == handle => Ok(()),
-                Some(Applied::WeakUnpin { handle: h }) if !pin && h == handle => Ok(()),
+                Some(Applied::WantAssert { request: actual }) if asserted && actual == request => {
+                    Ok(())
+                }
+                Some(Applied::WantRetract { request: actual })
+                    if !asserted && actual == request =>
+                {
+                    Ok(())
+                }
                 Some(_) => Err(PileWriteError::IoError(std::io::Error::other(
-                    "unexpected record after weak-pin write",
+                    "unexpected record after typed want write",
                 ))),
                 None => Err(PileWriteError::IoError(std::io::Error::other(
-                    "weak-pin marker missing after write",
+                    "typed want marker missing after write",
                 ))),
             }
         })();
@@ -2932,23 +3063,14 @@ impl WantStore for Pile {
     type WantError = PileWriteError;
     type WantIter<'a> = PileWantIter;
 
-    /// Asserts a want for `handle`. The legacy marker is replayed across
-    /// reopen; call [`Pile::flush`] to make it crash-durable.
-    fn want<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WantError>
-    where
-        S: BlobEncoding + 'static,
-        Handle<S>: InlineEncoding,
-    {
-        self.write_weak_marker(handle.transmute(), true)
+    /// Assert `request`; call [`Pile::flush`] to make it crash-durable.
+    fn want(&mut self, request: WantRequest) -> Result<(), Self::WantError> {
+        self.write_want_marker(request, true)
     }
 
-    /// Retracts the want for `handle` (last-writer-wins by log position).
-    fn unwant<S>(&mut self, handle: Inline<Handle<S>>) -> Result<(), Self::WantError>
-    where
-        S: BlobEncoding + 'static,
-        Handle<S>: InlineEncoding,
-    {
-        self.write_weak_marker(handle.transmute(), false)
+    /// Retract `request` (last-writer-wins by log position).
+    fn unwant(&mut self, request: WantRequest) -> Result<(), Self::WantError> {
+        self.write_want_marker(request, false)
     }
 
     fn wants<'a>(&'a mut self) -> Result<Self::WantIter<'a>, Self::WantError> {
@@ -3213,9 +3335,13 @@ impl Pile {
 
         let mut preserved_wants = 0usize;
         if wants == WantRewritePolicy::Preserve {
-            for raw in source_wants.into_iter_ordered() {
+            for bytes in source_wants.into_iter_ordered() {
                 destination
-                    .want(Inline::<Handle<UnknownBlob>>::new(raw))
+                    .want(
+                        WantRequest::from_bytes(bytes).expect(
+                            "Pile only indexes structurally decoded canonical want requests",
+                        ),
+                    )
                     .map_err(PileRewriteError::Want)?;
                 preserved_wants += 1;
             }
@@ -3493,8 +3619,8 @@ mod tests {
         ));
 
         let wanted = Inline::<Handle<UnknownBlob>>::new([5; 32]);
-        pile.want(wanted).unwrap();
-        pile.unwant(wanted).unwrap();
+        pile.want(WantRequest::blob(wanted)).unwrap();
+        pile.unwant(WantRequest::blob(wanted)).unwrap();
 
         let collection_records = collection_test_records();
         for record in &collection_records {
@@ -3802,15 +3928,15 @@ mod tests {
 
         let want_retracted = Inline::<Handle<UnknownBlob>>::new([17; 32]);
         let want_restored = Inline::<Handle<UnknownBlob>>::new([18; 32]);
-        pile.want(want_retracted).unwrap();
+        pile.want(WantRequest::blob(want_retracted)).unwrap();
         append_test_bytes(&path, &opaque);
-        pile.unwant(want_retracted).unwrap();
+        pile.unwant(WantRequest::blob(want_retracted)).unwrap();
         append_test_bytes(
             &path,
             WantHeaderEnvelope::new(want_restored, false).as_bytes(),
         );
         append_test_bytes(&path, &opaque);
-        pile.want(want_restored).unwrap();
+        pile.want(WantRequest::blob(want_restored)).unwrap();
         pile.close().unwrap();
 
         let mut reopened = Pile::open(&path).unwrap();
@@ -3823,7 +3949,7 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(wants, vec![want_restored]);
+        assert_eq!(wants, vec![WantRequest::blob(want_restored)]);
         reopened.close().unwrap();
     }
 
@@ -4349,7 +4475,7 @@ mod tests {
         let want_target = source
             .put::<UnknownBlob, _>(Bytes::from_source(b"want target".to_vec()))
             .unwrap();
-        source.want(want_target).unwrap();
+        source.want(WantRequest::blob(want_target)).unwrap();
         let orphan = source
             .put::<UnknownBlob, _>(Bytes::from_source(b"orphan".to_vec()))
             .unwrap();
@@ -4394,7 +4520,7 @@ mod tests {
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
-            vec![want_target]
+            vec![WantRequest::blob(want_target)]
         );
 
         drop(reader);
@@ -5409,13 +5535,13 @@ mod tests {
             .unwrap();
         assert!(!writer.dirty);
 
-        writer.want(handle).unwrap();
+        writer.want(WantRequest::blob(handle)).unwrap();
         assert!(writer.dirty);
         writer.flush().unwrap();
         assert!(!writer.dirty);
-        writer.want(handle).unwrap();
+        writer.want(WantRequest::blob(handle)).unwrap();
         assert!(!writer.dirty);
-        writer.unwant(handle).unwrap();
+        writer.unwant(WantRequest::blob(handle)).unwrap();
         assert!(writer.dirty);
         writer.flush().unwrap();
         assert!(!writer.dirty);
@@ -6017,7 +6143,7 @@ mod tests {
     }
 
     /// Durable wants survive close + reopen; the scan rebuilds the
-    /// LWW-resolved set from the legacy on-disk markers.
+    /// LWW-resolved set from the on-disk markers.
     #[test]
     fn want_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
@@ -6028,9 +6154,9 @@ mod tests {
             Blob::<UnknownBlob>::new(Bytes::from_source(vec![7u8; 21])).get_handle();
 
         let mut pile: Pile = Pile::open(&path).unwrap();
-        pile.want(wanted).unwrap();
+        pile.want(WantRequest::blob(wanted)).unwrap();
         let pinned: HashSet<_> = pile.wants().unwrap().map(|r| r.unwrap()).collect();
-        assert!(pinned.contains(&wanted));
+        assert!(pinned.contains(&WantRequest::blob(wanted)));
         pile.close().unwrap();
 
         let mut reopened: Pile = Pile::open(&path).unwrap();
@@ -6038,10 +6164,147 @@ mod tests {
         let pinned: HashSet<_> = reopened.wants().unwrap().map(|r| r.unwrap()).collect();
         assert_eq!(pinned.len(), 1);
         assert!(
-            pinned.contains(&wanted),
+            pinned.contains(&WantRequest::blob(wanted)),
             "want lost across reopen — restart amnesia"
         );
         reopened.close().unwrap();
+    }
+
+    #[test]
+    fn typed_operation_wants_roundtrip_as_exact_enveloped_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "typed-wants.pile");
+        let source = collection_test_collection(31);
+        let target = collection_test_collection(32);
+        let merge = WantRequest::merge(source, collection_test_hash(34), collection_test_hash(33));
+        let derive = WantRequest::derive(source, target, collection_test_hash(35));
+
+        let mut pile = Pile::open(&path).unwrap();
+        pile.want(merge).unwrap();
+        pile.want(derive).unwrap();
+        pile.flush().unwrap();
+        assert_eq!(
+            pile.wants()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![merge, derive]
+        );
+        pile.close().unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            (2 * ENVELOPE_HEADER_LEN) as u64
+        );
+        let records = PileRecords::open(&path)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(matches!(
+            records[0].content,
+            PileRecordContent::WantAssert { request } if request == merge
+        ));
+        assert!(matches!(
+            records[1].content,
+            PileRecordContent::WantAssert { request } if request == derive
+        ));
+
+        let mut reopened = Pile::open(&path).unwrap();
+        reopened.refresh().unwrap();
+        assert_eq!(
+            reopened
+                .wants()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![merge, derive]
+        );
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn typed_want_retraction_is_scoped_to_the_exact_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "typed-want-lww.pile");
+        let source = collection_test_collection(41);
+        let target = collection_test_collection(42);
+        let input = collection_test_hash(43);
+        let merge = WantRequest::merge(source, input, collection_test_hash(44));
+        let derive = WantRequest::derive(source, target, input);
+
+        let mut pile = Pile::open(&path).unwrap();
+        pile.want(merge).unwrap();
+        pile.want(derive).unwrap();
+        pile.unwant(merge).unwrap();
+        assert_eq!(
+            pile.wants()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![derive]
+        );
+        pile.close().unwrap();
+
+        let mut reopened = Pile::open(&path).unwrap();
+        reopened.refresh().unwrap();
+        assert_eq!(
+            reopened
+                .wants()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![derive]
+        );
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn blob_wants_keep_the_legacy_physical_kinds_for_old_reader_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "blob-want-projection.pile");
+        let handle = Inline::<Handle<UnknownBlob>>::new([47; 32]);
+
+        let mut pile = Pile::open(&path).unwrap();
+        pile.want(WantRequest::blob(handle)).unwrap();
+        pile.unwant(WantRequest::blob(handle)).unwrap();
+        pile.close().unwrap();
+
+        let records = PileRecords::open(&path)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(matches!(
+            records[0].content,
+            PileRecordContent::WeakPin { handle: actual } if actual == handle
+        ));
+        assert!(matches!(
+            records[1].content,
+            PileRecordContent::WeakUnpin { handle: actual } if actual == handle
+        ));
+    }
+
+    #[test]
+    fn typed_physical_want_markers_reject_blob_requests() {
+        let request = WantRequest::blob(Inline::<Handle<UnknownBlob>>::new([48; 32]));
+        assert!(TypedWantHeaderEnvelope::new_operation(request, true).is_none());
+
+        // Also reject the representation at the trust boundary rather than
+        // merely relying on our writer not to produce it.
+        let encoded = request.to_bytes();
+        let header = TypedWantHeaderEnvelope {
+            envelope_marker: MAGIC_MARKER_ENVELOPE,
+            record_kind: MAGIC_MARKER_WANT_ASSERT_V2,
+            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
+            request_kind: encoded[0],
+            field_a: encoded[1..33].try_into().unwrap(),
+            field_b: encoded[33..65].try_into().unwrap(),
+            field_c: encoded[65..97].try_into().unwrap(),
+            reserved: [0; 123],
+        };
+        assert!(matches!(
+            decode_record(header.as_bytes(), 0),
+            Err(ReadError::CorruptPile { valid_length: 0 })
+        ));
     }
 
     /// LWW by log position: the last marker for a handle wins, both live and
@@ -6058,16 +6321,16 @@ mod tests {
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         // a: pin, unpin, pin — three real records; last writer says pinned.
-        pile.want(a).unwrap();
-        pile.unwant(a).unwrap();
-        pile.want(a).unwrap();
+        pile.want(WantRequest::blob(a)).unwrap();
+        pile.unwant(WantRequest::blob(a)).unwrap();
+        pile.want(WantRequest::blob(a)).unwrap();
         // b: pin then unpin — last writer says unpinned.
-        pile.want(b).unwrap();
-        pile.unwant(b).unwrap();
+        pile.want(WantRequest::blob(b)).unwrap();
+        pile.unwant(WantRequest::blob(b)).unwrap();
 
         let pinned: HashSet<_> = pile.wants().unwrap().map(|r| r.unwrap()).collect();
-        assert!(pinned.contains(&a));
-        assert!(!pinned.contains(&b));
+        assert!(pinned.contains(&WantRequest::blob(a)));
+        assert!(!pinned.contains(&WantRequest::blob(b)));
         pile.close().unwrap();
 
         // The same resolution must fall out of a fresh log replay.
@@ -6075,8 +6338,8 @@ mod tests {
         reopened.amputate().unwrap();
         let pinned: HashSet<_> = reopened.wants().unwrap().map(|r| r.unwrap()).collect();
         assert_eq!(pinned.len(), 1);
-        assert!(pinned.contains(&a));
-        assert!(!pinned.contains(&b));
+        assert!(pinned.contains(&WantRequest::blob(a)));
+        assert!(!pinned.contains(&WantRequest::blob(b)));
         reopened.close().unwrap();
     }
 
@@ -6092,14 +6355,14 @@ mod tests {
 
         let mut pile: Pile = Pile::open(&path).unwrap();
         // Unpinning a never-pinned handle records nothing.
-        pile.unwant(h).unwrap();
+        pile.unwant(WantRequest::blob(h)).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
 
-        pile.want(h).unwrap();
+        pile.want(WantRequest::blob(h)).unwrap();
         let len_after_pin = std::fs::metadata(&path).unwrap().len();
         assert_eq!(len_after_pin, ENVELOPE_HEADER_LEN as u64);
 
-        pile.want(h).unwrap();
+        pile.want(WantRequest::blob(h)).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), len_after_pin);
         pile.close().unwrap();
     }
@@ -6141,13 +6404,13 @@ mod tests {
 
         // Interleave: want, enveloped blob, branch head, want + unwant, then
         // another enveloped blob.
-        pile.want(want).unwrap();
+        pile.want(WantRequest::blob(want)).unwrap();
         let d1 = vec![1u8; 300];
         let b1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(d1.clone()));
         let h1 = pile.put::<UnknownBlob, _>(b1).unwrap();
         pile.update(branch_id, None, Some(h1.transmute())).unwrap();
-        pile.want(retracted).unwrap();
-        pile.unwant(retracted).unwrap();
+        pile.want(WantRequest::blob(retracted)).unwrap();
+        pile.unwant(WantRequest::blob(retracted)).unwrap();
         let d2 = vec![2u8; 77];
         let b2: Blob<UnknownBlob> = Blob::new(Bytes::from_source(d2.clone()));
         let h2 = pile.put::<UnknownBlob, _>(b2).unwrap();
@@ -6170,8 +6433,8 @@ mod tests {
 
         let pinned: HashSet<_> = pile.wants().unwrap().map(|r| r.unwrap()).collect();
         assert_eq!(pinned.len(), 1);
-        assert!(pinned.contains(&want));
-        assert!(!pinned.contains(&retracted));
+        assert!(pinned.contains(&WantRequest::blob(want)));
+        assert!(!pinned.contains(&WantRequest::blob(retracted)));
         pile.close().unwrap();
     }
 
@@ -6213,8 +6476,8 @@ mod tests {
         let b1: Blob<UnknownBlob> = Blob::new(Bytes::from_source(d1.clone()));
         let h1 = pile.put::<UnknownBlob, _>(b1).unwrap();
         pile.update(branch_id, None, Some(h1.transmute())).unwrap();
-        pile.want(want).unwrap();
-        pile.unwant(want).unwrap();
+        pile.want(WantRequest::blob(want)).unwrap();
+        pile.unwant(WantRequest::blob(want)).unwrap();
         pile.update(branch_id, Some(h1.transmute()), None).unwrap();
         pile.close().unwrap();
 
@@ -6232,8 +6495,8 @@ mod tests {
         }
         assert_eq!(expected_offset, bytes.len());
 
-        // Exact sequence: V1 blob, enveloped blob, branch set, want,
-        // weak-unpin, branch tombstone.
+        // Exact sequence: V1 blob, enveloped blob, branch set, legacy-compatible
+        // blob want, blob retraction, branch tombstone.
         assert_eq!(decoded.len(), 6);
         match decoded[0].content {
             PileRecordContent::Blob {

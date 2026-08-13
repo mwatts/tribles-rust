@@ -91,7 +91,9 @@ fn checkout_over_lazy_fails_notyet_and_enqueues_wants() {
         .map(Result::unwrap)
         .collect();
     assert!(
-        wants.iter().any(|h| h.raw == content_handle.raw),
+        wants
+            .iter()
+            .any(|request| *request == WantRequest::blob(content_handle)),
         "the absent content blob must be enqueued as a want: {wants:?}"
     );
 }
