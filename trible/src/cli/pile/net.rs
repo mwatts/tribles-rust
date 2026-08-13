@@ -110,13 +110,13 @@ pub enum Command {
         peers: Vec<String>,
         #[arg(long)]
         key: Option<PathBuf>,
-        /// Don't publish our own HEADs — fetch only. Useful for
-        /// follower / leecher workflows where we're catching up.
+        /// Don't publish our own collection evidence — receive only. Useful
+        /// for follower / leecher workflows where we're catching up.
         #[arg(long, conflicts_with = "write_only")]
         read_only: bool,
-        /// Don't react to incoming HEADs — publish only. Useful for
-        /// pure-publisher workflows (importers, archives) where the
-        /// local pile has nothing to learn from the swarm.
+        /// Don't admit incoming collection evidence — publish only. Useful
+        /// for pure-publisher workflows (importers, archives) where the local
+        /// pile has nothing to learn from the swarm.
         #[arg(long, conflicts_with = "read_only")]
         write_only: bool,
         /// Stop after at most N seconds. Without this flag (and without
@@ -125,7 +125,7 @@ pub enum Command {
         #[arg(long, value_name = "SECS")]
         duration: Option<u64>,
         /// Stop after N seconds without any network event (no incoming
-        /// HEAD, no incoming blob) and without any want being serviced
+        /// collection evidence or blob) and without any want being serviced
         /// by the lazy reconcile. Best-effort "we appear to have
         /// caught up" signal — useful for bounded sync in scripts where
         /// you accept the two-generals caveat. Wants that stay pending
@@ -244,21 +244,18 @@ fn run_sync(
     no_lazy: bool,
     reconcile_interval: u64,
 ) -> Result<()> {
-    use triblespace_core::repo::Repository;
-
     let key = load_or_create_key(&key_path, key_dir(&pile_path))?;
     // Endpoint tickets retain caller-selected direct/fabric routes; bare
     // endpoint ids intentionally use iroh's discovery layer.
     let peers = parse_peers(&peer_strs)?;
 
-    // Single pile handle, wrapped in a Peer (which spawns the iroh thread)
-    // and then a Repository for the workspace/commit API. Reads on the Peer
-    // auto-drain incoming gossip + auto-publish external writes; writes
-    // auto-publish via the network thread.
+    // One pile handle wrapped directly in a Peer. Collection synchronization
+    // is a union of immutable signed evidence, so the daemon needs neither a
+    // Repository workspace nor named tracking branches.
     let pile = open_pile(&pile_path)?;
     let team_root = team_root_from_env(&key)?;
     let self_cap = self_cap_from_env()?;
-    let peer = Peer::new(
+    let mut peer = Peer::new(
         pile,
         key.clone(),
         PeerConfig {
@@ -269,14 +266,7 @@ fn run_sync(
             direction,
         },
     );
-    let mut repo = Repository::new(
-        peer,
-        key.clone(),
-        triblespace_core::trible::TribleSet::new(),
-    )
-    .map_err(|e| anyhow!("repo: {e:?}"))?;
-
-    eprintln!("node: {}", repo.storage().id());
+    eprintln!("node: {}", peer.id());
     eprintln!(
         "team_root: {}  (gossip topic)",
         hex::encode(team_root.to_bytes())
@@ -308,10 +298,6 @@ fn run_sync(
     }
     eprintln!("live sync active. (Ctrl-C to stop)\n");
 
-    // Initial broadcast so peers connecting later can learn our state.
-    // republish_branches itself is direction-aware (no-op in ReadOnly).
-    repo.storage_mut().republish_branches();
-
     let started = std::time::Instant::now();
     let duration_limit = duration.map(std::time::Duration::from_secs);
     let quiescent_limit = quiescent_for.map(std::time::Duration::from_secs);
@@ -339,8 +325,8 @@ fn run_sync(
 
     loop {
         // Bounded run-time. The host_loop also does periodic re-broadcasts
-        // (30s) of its own cache, so the CLI no longer needs to drive a
-        // republish_branches tick.
+        // (30s) from the current snapshot, so the CLI does not need to drive
+        // another publication tick.
         if let Some(limit) = duration_limit {
             if started.elapsed() >= limit {
                 eprintln!(
@@ -358,46 +344,15 @@ fn run_sync(
         // reachable holds may stay pending forever, and that's its
         // normal state (it survives in the pile for the next run).
         if let Some(limit) = quiescent_limit {
-            if repo.storage().last_event_at().elapsed() >= limit
-                && last_want_progress.elapsed() >= limit
-            {
+            if peer.last_event_at().elapsed() >= limit && last_want_progress.elapsed() >= limit {
                 eprintln!("\nquiescent for {}s; stopping", limit.as_secs());
                 break;
             }
         }
 
-        // Auto-merge: walk the tracking branches in the pile and merge each
-        // into its same-named local branch. The Peer auto-refreshes on every
-        // read (drains gossip + diffs external writes), so list_tracking_pins
-        // always sees the latest state. Skipped under WriteOnly — we don't
-        // pull tracking state down in that mode.
-        if direction != SyncDirection::WriteOnly {
-            let tracks = triblespace_net::tracking::list_tracking_pins(repo.storage_mut());
-            for info in tracks {
-                let triblespace_net::tracking::TrackingPinInfo {
-                    local_id: tracking_id,
-                    remote_name: name,
-                    ..
-                } = info;
-
-                match triblespace_net::tracking::merge_tracking_into_local(
-                    &mut repo,
-                    tracking_id,
-                    &name,
-                ) {
-                    Ok(triblespace_net::tracking::MergeOutcome::Merged { .. }) => {
-                        eprintln!("  merged '{name}'");
-                    }
-                    Ok(_) => { /* up-to-date or empty, no-op */ }
-                    Err(e) => eprintln!("  merge error '{name}': {e}"),
-                }
-            }
-        } else {
-            // Still need to drive refresh() so the network thread's event
-            // channel doesn't back up (and so last_event_at() updates for
-            // quiescence). refresh() is no-op-cheap and direction-aware.
-            repo.storage_mut().refresh();
-        }
+        // Drain immutable collection evidence and publish any records appended
+        // by another process. Direction policy lives inside Peer::refresh.
+        peer.refresh();
 
         // Renewal-daemon tick: scan the renewal-policy branch for
         // entries whose current cap is within the renewal window of
@@ -411,9 +366,7 @@ fn run_sync(
         // expires, giving the daemon multiple chances to land the
         // successor.
         if direction != SyncDirection::ReadOnly {
-            let _renewed = repo
-                .storage_mut()
-                .renewal_tick(hifitime::Duration::from_seconds(3600.0));
+            let _renewed = peer.renewal_tick(hifitime::Duration::from_seconds(3600.0));
         }
 
         // Want-reconcile tick: a want IS a durable want-marker —
@@ -428,7 +381,7 @@ fn run_sync(
         // normal, never an error, never dropped. Strong pins/branches
         // are untouched.
         if lazy && next_reconcile <= std::time::Instant::now() {
-            let stats = reconcile_rt.block_on(reconciler.tick(repo.storage_mut()));
+            let stats = reconcile_rt.block_on(reconciler.tick(&mut peer));
             next_reconcile = std::time::Instant::now() + reconcile_every;
             wants_fulfilled_total += stats.fulfilled as u64;
             wants_pending = stats.pending;
@@ -456,6 +409,9 @@ fn run_sync(
              and are serviced whenever a holder becomes reachable)"
         );
     }
+    peer.into_store()
+        .close()
+        .map_err(|error| anyhow!("close pile: {error}"))?;
     Ok(())
 }
 

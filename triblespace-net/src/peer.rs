@@ -1143,11 +1143,9 @@ where
     /// on the wire.
     ///
     /// Distinct from [`refresh`](Self::refresh): refresh publishes only the
-    /// deltas it detects against its diff baselines. New code should publish
-    /// collection evidence and use
-    /// [`republish_collection_evidence`](Self::republish_collection_evidence)
-    /// for periodic full-state announcements; this API remains during the
-    /// pin-to-collection cutover.
+    /// deltas it detects against its diff baselines. This API remains only for
+    /// the transitional legacy branch protocol; immutable collection evidence
+    /// is replayed directly from the host's live store snapshot.
     pub fn republish_branches(&mut self) {
         // ReadOnly suppresses publishing entirely — even republish.
         if self.direction == SyncDirection::ReadOnly {
@@ -1176,32 +1174,6 @@ where
                 self.last_branches.insert(bid, head.raw);
             }
         }
-    }
-
-    /// Force-republish every locally known grant-backed collection commit.
-    ///
-    /// This is the immutable-evidence counterpart of
-    /// [`republish_branches`](Self::republish_branches): newly joined gossip
-    /// neighbors learn the full publishable set even when no local collection
-    /// record changed since the last refresh.
-    pub fn republish_collection_evidence(&mut self) {
-        if self.direction == SyncDirection::ReadOnly {
-            return;
-        }
-        let mut store = self.store.lock().expect("store mutex");
-        if let Some(snapshot) = StoreSnapshot::from_store(&mut *store) {
-            self.sender.update_snapshot(snapshot);
-        }
-        let Some(evidence) = grant_backed_collection_evidence(&mut *store) else {
-            return;
-        };
-        for item in &evidence {
-            self.sender.gossip_collection_evidence(*item);
-        }
-        self.last_collection_commits = evidence
-            .into_iter()
-            .map(|item| item.commit().id())
-            .collect();
     }
 
     /// Lock and borrow the underlying store. Use for store-specific
