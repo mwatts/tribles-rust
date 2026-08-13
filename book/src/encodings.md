@@ -206,13 +206,12 @@ What are you storing?
 │  ├─ Floating point
 │  │  ├─ Standard double? → F64
 │  │  └─ Extended precision? → F256BE
-│  ├─ Money or any fixed-scale amount?
-│  │  └─ A scaled integer (I256BE of minor units) — never a rational.
-│  │     Amounts are not divided at storage, and a scaled integer
-│  │     already sorts numerically.
-│  └─ Rational (exact, arises from division)?
-│     ├─ Need numeric range queries on it? → ROrd256
-│     └─ Otherwise → R256  (simpler, faster, wider domain)
+│  └─ Rational? → R256
+│     ⚠ Canonical (reduced) but NOT numerically ordered:
+│     comparison hits the numerator first, so 1/1 sorts
+│     before 2/3. Use a fixed-scale integer if the index
+│     has to answer "greater than x" — or ROrd256 if you
+│     need exact division AND numeric range queries.
 │
 ├─ A timestamp or time range?
 │  └─ NsTAIInterval
@@ -320,8 +319,8 @@ inexact at the boundary, because the bound itself (`1/3`, say) is not a float.
 covers the full `i128 × i128` box rather than a subset of it.
 
 **Choose neither for money.** Amounts have a fixed scale, are not divided at
-storage, and already sort numerically as scaled integers. Use an integer of
-minor units.
+storage, and already sort numerically as scaled integers. Use `Currency<C>`,
+which is exactly that.
 
 ## Defining new encodings
 
