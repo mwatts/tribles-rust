@@ -230,8 +230,8 @@ impl StoreSnapshot<()> {
 /// Type-erased snapshot for the host thread.
 ///
 /// Carries just enough of the pile for the network thread to serve
-/// peer requests: per-hash blob fetch, branch head listing, and a
-/// quick presence check.
+/// peer requests: per-hash blob access, the pin-head authorization roots, and
+/// canonical collection evidence.
 pub trait AnySnapshot: Send + 'static {
     fn get_blob(&self, hash: &RawHash) -> Option<Vec<u8>>;
     fn has_blob(&self, hash: &RawHash) -> bool;

@@ -285,17 +285,15 @@ different policy collection. Its admitted commits recursively retain their
 descriptor, fact archive, metadata, and referenced capability/signature blobs.
 
 An upgraded binary does not automatically import policy written through the
-former local-policy-pin or experimental local-cell representations. Legacy
-policy pins remain conservatively suppressed from gossip. Retired cell records
-are readable only as opaque raw migration evidence and block destructive pile
-rewrites; operators must explicitly migrate or re-establish their renewal,
-request, and team-cap facts. Removing the pin guard still depends on completing
-that explicit legacy migration.
+former local-policy-pin or experimental local-cell representations. Retired
+records remain opaque migration evidence; operators must explicitly migrate or
+re-establish their renewal, request, and team-cap facts.
 
 ## `PeerConfig` Surface
 
 ```rust,ignore
 use triblespace::net::peer::{Peer, PeerConfig};
+use triblespace::net::peer::SyncDirection;
 
 let pile = triblespace::core::repo::pile::Pile::open(path)?;
 let peer = Peer::new(pile, signing_key.clone(), PeerConfig {
@@ -304,6 +302,7 @@ let peer = Peer::new(pile, signing_key.clone(), PeerConfig {
     team_root: team_root_pubkey,            // 32 bytes — the team's CA AND
                                             // the gossip mesh id when gossip=true
     self_cap: my_own_cap_sig_handle,        // what we present on OP_AUTH
+    direction: SyncDirection::Bidirectional,
 });
 ```
 
@@ -320,6 +319,7 @@ For a hosted relay running for a team, the operator only needs:
   read-or-better cap and the operator pastes that handle into the
   config)
 
-That's it. No per-user accounts, no shared secrets, no team
-configuration database. Caps live in the pile alongside everything
-else and gossip propagates them naturally.
+That's it. No per-user accounts, no shared secrets, no team configuration
+database. Capabilities remain private collection data and move through the
+authenticated delivery protocol; collection membership alone never grants
+permission to gossip them.

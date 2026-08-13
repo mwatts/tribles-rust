@@ -115,10 +115,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   adapter. The public `LocalCellStore`/`AsyncLocalCellStore` footgun and every
   backend writer were removed. Existing enveloped and unenveloped cell records
   remain raw-visible as opaque migration evidence; semantic rewrite and Yard
-  reclaim refuse them rather than silently discarding private state. A
-  read-only legacy pin marker guard likewise remains until old policy pins are
-  explicitly migrated, and its non-demanding residency probe cannot
-  manufacture a blob want.
+  reclaim refuse them rather than silently discarding private state. The
+  former legacy-policy pin gossip guard disappeared with mutable HEAD gossip
+  itself; old pins remain raw-visible migration evidence but are never
+  replicated as semantic state.
 - **Signed records now use neutral metadata and attestation namespaces.** The
   generic metadata-archive link and Ed25519 signer/signature attributes moved
   out of the legacy repository module without changing their stable IDs or

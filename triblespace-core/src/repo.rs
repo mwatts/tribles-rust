@@ -1256,8 +1256,8 @@ pub enum MergeError {
     /// forever.
     ///
     /// Callers should ensure both heads' full closures are locally present
-    /// (e.g. via `fetch_reachable`) before retrying. The contained string
-    /// is a human-readable description of the underlying read failure.
+    /// before retrying. The contained string is a human-readable description
+    /// of the underlying read failure.
     AncestryWalkFailed(String),
 }
 
@@ -3131,9 +3131,8 @@ impl<Blobs: BlobStore> Workspace<Blobs> {
         // blob is missing locally, refuse to merge — falling through to a
         // divergent-merge here would write a new commit referencing an
         // unknown parent, which `pile diagnose check` would later report as
-        // a chain break and which `fetch_reachable`'s Phase-1
-        // `have_local` short-circuit would never re-fetch. Better to fail
-        // loudly so the caller can re-sync the missing closure and retry.
+        // a chain break. Better to fail loudly so the caller can obtain the
+        // missing closure and retry.
         let remote_in_local = ancestors(local_head)
             .select(self)
             .map_err(|e| MergeError::AncestryWalkFailed(format!("walking local ancestry: {e:?}")))?

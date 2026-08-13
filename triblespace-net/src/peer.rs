@@ -1,8 +1,8 @@
 //! `Peer<S>`: a store wrapped in distributed network sync.
 //!
 //! Owns the inner store, spawns the iroh network thread on construction,
-//! and exposes the standard blob and pin storage traits with two layers of
-//! network behavior built in. Its signer-owned policy collection stays on the
+//! and exposes the standard blob storage traits with network behavior built
+//! in. Its signer-owned policy collection stays on the
 //! inner store and is deliberately not exposed for gossip through `Peer`:
 //!
 //! - **Reads** auto-call [`refresh`](Peer::refresh), which drains pending
@@ -478,18 +478,19 @@ where
     /// "do it now" semantics or tight loops with no read activity.
     pub fn refresh(&mut self) {
         // ── Phase 1: drain incoming events ────────────────────────────
-        // WriteOnly suppresses incoming-event handling: we always
-        // drain the channel to keep it from filling, but skip the
-        // store mutation. The local node has nothing to learn from
-        // the swarm.
+        // WriteOnly suppresses incoming *data* convergence while preserving
+        // capability-control traffic. Join requests, delivered capabilities,
+        // and delivery confirmations are operational messages required to
+        // administer even a pure publisher; silently discarding them would
+        // make directionality alter the authorization protocol itself.
         let mut incoming_collection_evidence = Vec::new();
         while let Some(event) = self.receiver.try_recv() {
             self.last_event_at = crate::clock::mono_now();
-            if self.direction == SyncDirection::WriteOnly {
-                continue;
-            }
             match event {
                 NetEvent::Blob(data) => {
+                    if self.direction == SyncDirection::WriteOnly {
+                        continue;
+                    }
                     // `data` is already an anybytes::Bytes (refcounted) —
                     // pass it into the store without re-wrapping.
                     let _ = self
@@ -499,7 +500,9 @@ where
                         .put::<UnknownBlob, Bytes>(data);
                 }
                 NetEvent::CollectionEvidence(evidence) => {
-                    incoming_collection_evidence.push(evidence);
+                    if self.direction != SyncDirection::WriteOnly {
+                        incoming_collection_evidence.push(evidence);
+                    }
                 }
                 NetEvent::CapRequest {
                     requester,

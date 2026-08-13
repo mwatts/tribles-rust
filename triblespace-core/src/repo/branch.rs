@@ -62,14 +62,9 @@ pub fn carried_facts(meta: &TribleSet, branch_id: Id) -> Result<TribleSet, Branc
     Ok(carried)
 }
 
-/// Current TAI time as a collapsed `NsTAIInterval`. Used as
-/// `metadata::updated_at` on every branch metadata blob so that peers can
-/// order concurrent HEAD gossips without walking ancestor chains.
-///
-/// TAI is strictly monotone (no leap-second jumps). Wall-clock regressions
-/// still mean subsequent publishes land "in the past" from the publisher's
-/// view; receivers simply hold out until the publisher's clock catches up
-/// and a fresher timestamp arrives.
+/// Current TAI time as a collapsed `NsTAIInterval`. Stored as
+/// `metadata::updated_at` on every branch metadata blob so publication time is
+/// explicit, queryable data rather than an ambient filesystem observation.
 fn now_updated_at() -> Inline<NsTAIInterval> {
     let now = crate::clock::epoch_now();
     (now, now)
@@ -86,10 +81,8 @@ fn now_updated_at() -> Inline<NsTAIInterval> {
 ///
 /// The metadata entity id is derived intrinsically from canonical
 /// `NIL || attribute || value` rows via `entity!` — no open-coded derivation.
-/// Because every publish stamps a fresh
-/// `metadata::updated_at`, each publish produces a distinct entity id
-/// and a distinct metadata blob hash (which is what lets receivers order
-/// concurrent HEAD gossips by timestamp alone).
+/// Because every publish stamps a fresh `metadata::updated_at`, each publish
+/// produces a distinct entity id and metadata blob hash.
 pub fn branch_metadata(
     signing_key: &SigningKey,
     branch_id: Id,
