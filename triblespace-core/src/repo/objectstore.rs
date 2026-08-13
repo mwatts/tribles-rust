@@ -234,7 +234,7 @@ impl AsyncCollectionStore for ObjectStoreRemote {
             .prefix
             .child(COLLECTION_RECORD_INFIX)
             .child(hex::encode(id));
-        let expected: bytes::Bytes = CollectionRecord::to_blob(&record).bytes.into();
+        let expected: bytes::Bytes = record.to_bytes().into();
 
         async move {
             match self
@@ -471,7 +471,7 @@ impl AsyncPinStore for ObjectStoreRemote {
                             }
                         }
                         Err(object_store::Error::NotFound { .. }) => {
-                            return Ok(PushResult::Conflict(None))
+                            return Ok(PushResult::Conflict(None));
                         }
                         Err(e) => return Err(PushBranchErr::StoreErr(e)),
                     }
@@ -744,11 +744,7 @@ async fn read_collection_record(
         .bytes()
         .await
         .map_err(ListCollectionRecordsErr::Get)?;
-    let bytes: Bytes = bytes.into();
-    let blob: Blob<SimpleArchive> = Blob::new(bytes);
-    let record = CollectionRecord::decode(&blob)
-        .map_err(ListCollectionRecordsErr::Decode)?
-        .ok_or(ListCollectionRecordsErr::UnknownKind)?;
+    let record = CollectionRecord::from_bytes(&bytes).map_err(ListCollectionRecordsErr::Decode)?;
     let record_id = record.id();
     if record_id != path_id {
         return Err(ListCollectionRecordsErr::IdMismatch {
@@ -774,10 +770,8 @@ pub enum ListCollectionRecordsErr {
     BadId,
     /// A listed record object could not be fetched.
     Get(object_store::Error),
-    /// The stored bytes were not a canonical collection record.
+    /// The stored bytes were not a canonical dense collection record.
     Decode(RecordDecodeError),
-    /// The stored archive carried no recognized collection-record kind.
-    UnknownKind,
     /// The record's intrinsic id did not match its object path.
     IdMismatch { path: Id, record: Id },
 }
@@ -796,7 +790,6 @@ impl fmt::Display for ListCollectionRecordsErr {
             Self::BadId => write!(f, "collection-record filename is the nil id"),
             Self::Get(error) => write!(f, "collection-record fetch failed: {error}"),
             Self::Decode(error) => write!(f, "collection-record decode failed: {error}"),
-            Self::UnknownKind => write!(f, "object is not a collection record"),
             Self::IdMismatch { path, record } => write!(
                 f,
                 "collection-record path id {path:X} does not match decoded id {record:X}"
@@ -811,11 +804,9 @@ impl Error for ListCollectionRecordsErr {
             Self::List(error) | Self::Get(error) => Some(error),
             Self::BadNameHex(error) => Some(error),
             Self::Decode(error) => Some(error),
-            Self::NotAFile(_)
-            | Self::NotDirectChild(_)
-            | Self::BadId
-            | Self::UnknownKind
-            | Self::IdMismatch { .. } => None,
+            Self::NotAFile(_) | Self::NotDirectChild(_) | Self::BadId | Self::IdMismatch { .. } => {
+                None
+            }
         }
     }
 }
@@ -1169,6 +1160,7 @@ mod tests {
 
     use crate::collection::{
         CollectionDescriptor, CollectionGossipStore, CollectionMerge, CollectionStore,
+        COLLECTION_MERGE_BYTES_LEN, COLLECTION_RECORD_KIND_MERGE_V1,
     };
     use crate::repo::async_store::{AsyncBlobStorePut, Blocking};
     use crate::repo::StorageFlush;
@@ -1210,6 +1202,21 @@ mod tests {
             AsyncCollectionStore::insert(&mut store, second)
                 .await
                 .unwrap();
+
+            let first_path = store
+                .prefix
+                .child(COLLECTION_RECORD_INFIX)
+                .child(hex::encode(first.id()));
+            let stored = store
+                .store
+                .get(&first_path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            assert_eq!(stored.len(), 1 + COLLECTION_MERGE_BYTES_LEN);
+            assert_eq!(stored[0], COLLECTION_RECORD_KIND_MERGE_V1);
 
             let actual = AsyncCollectionStore::records(&mut store)
                 .await
@@ -1296,7 +1303,7 @@ mod tests {
                 .prefix
                 .child(COLLECTION_RECORD_INFIX)
                 .child(hex::encode(path_record.id()));
-            let bytes: bytes::Bytes = CollectionRecord::to_blob(&stored_record).bytes.into();
+            let bytes: bytes::Bytes = stored_record.to_bytes().into();
             store.store.put(&path, bytes.into()).await.unwrap();
 
             assert!(matches!(

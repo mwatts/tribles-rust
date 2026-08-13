@@ -11,14 +11,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-use anybytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use triblespace_core::blob::Blob;
-use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::collection::{
-    COLLECTION_COMMIT_ARCHIVE_LEN, COLLECTION_GOSSIP_BYTES_LEN, CollectionCommit, CollectionGossip,
+    COLLECTION_COMMIT_BYTES_LEN, COLLECTION_GOSSIP_BYTES_LEN, CollectionCommit, CollectionGossip,
     CollectionId, CollectionRecord, CommitVerificationError, GossipVerificationError,
-    RecordDecodeError,
 };
 
 use crate::protocol::{
@@ -30,9 +26,9 @@ use crate::transport::Conn;
 /// Exact byte length of one grant-backed commit evidence item.
 ///
 /// The layout is the canonical 128-byte gossip witness followed by the
-/// canonical 448-byte [`CollectionCommit`] `SimpleArchive`.
+/// canonical 192-byte dense [`CollectionCommit`].
 pub const COLLECTION_COMMIT_EVIDENCE_LEN: usize =
-    COLLECTION_GOSSIP_BYTES_LEN + COLLECTION_COMMIT_ARCHIVE_LEN as usize;
+    COLLECTION_GOSSIP_BYTES_LEN + COLLECTION_COMMIT_BYTES_LEN;
 
 /// Defensive upper bound on the number of evidence items accepted from one
 /// response. The wire count remains a `u32`; this bound prevents a malicious
@@ -79,10 +75,11 @@ impl CollectionCommitEvidence {
                 .try_into()
                 .expect("checked evidence length"),
         );
-        let commit = CollectionCommit::decode(&Blob::<SimpleArchive>::new(Bytes::from_source(
-            bytes[COLLECTION_GOSSIP_BYTES_LEN..].to_vec(),
-        )))
-        .map_err(CollectionCommitEvidenceError::InvalidCommitRecord)?;
+        let commit = CollectionCommit::from_bytes(
+            bytes[COLLECTION_GOSSIP_BYTES_LEN..]
+                .try_into()
+                .expect("checked evidence length"),
+        );
         Self::new(grant, commit)
     }
 
@@ -90,9 +87,7 @@ impl CollectionCommitEvidence {
     pub fn encode(&self) -> [u8; COLLECTION_COMMIT_EVIDENCE_LEN] {
         let mut bytes = [0u8; COLLECTION_COMMIT_EVIDENCE_LEN];
         bytes[..COLLECTION_GOSSIP_BYTES_LEN].copy_from_slice(&self.grant.to_bytes());
-        let commit = self.commit.to_blob();
-        debug_assert_eq!(commit.bytes.len(), COLLECTION_COMMIT_ARCHIVE_LEN as usize);
-        bytes[COLLECTION_GOSSIP_BYTES_LEN..].copy_from_slice(&commit.bytes);
+        bytes[COLLECTION_GOSSIP_BYTES_LEN..].copy_from_slice(&self.commit.to_bytes());
         bytes
     }
 
@@ -142,8 +137,6 @@ pub enum CollectionCommitEvidenceError {
     WrongLength { expected: usize, actual: usize },
     /// The grant failed strict Ed25519 verification.
     InvalidGrantSignature(GossipVerificationError),
-    /// The commit archive was not structurally canonical.
-    InvalidCommitRecord(RecordDecodeError),
     /// The commit failed strict Ed25519 verification.
     InvalidCommitSignature(CommitVerificationError),
     /// Grant and commit name different authors.
@@ -167,9 +160,6 @@ impl fmt::Display for CollectionCommitEvidenceError {
                     "collection gossip grant failed verification: {error}"
                 )
             }
-            Self::InvalidCommitRecord(error) => {
-                write!(formatter, "collection commit is not canonical: {error}")
-            }
             Self::InvalidCommitSignature(error) => {
                 write!(formatter, "collection commit failed verification: {error}")
             }
@@ -187,7 +177,6 @@ impl Error for CollectionCommitEvidenceError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::InvalidGrantSignature(error) => Some(error),
-            Self::InvalidCommitRecord(error) => Some(error),
             Self::InvalidCommitSignature(error) => Some(error),
             Self::WrongLength { .. }
             | Self::AuthorMismatch { .. }
@@ -391,7 +380,8 @@ pub async fn fetch_collection<C: Conn>(
 #[cfg(test)]
 mod tests {
     use ed25519_dalek::SigningKey;
-    use triblespace_core::blob::IntoBlob;
+    use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+    use triblespace_core::blob::{Blob, IntoBlob};
     use triblespace_core::collection::{
         CollectionDescriptor, empty_metadata_handle, simplearchive_union,
     };
@@ -422,6 +412,8 @@ mod tests {
         let commit = commit(&author, &descriptor);
         let grant = CollectionGossip::sign(&author, descriptor.handle());
         let evidence = CollectionCommitEvidence::new(grant, commit).unwrap();
+
+        assert_eq!(COLLECTION_COMMIT_EVIDENCE_LEN, 320);
 
         assert_eq!(
             CollectionCommitEvidence::decode(&evidence.encode()).unwrap(),
