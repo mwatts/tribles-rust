@@ -137,10 +137,10 @@ pub struct PeerConfig {
     /// dedicated fabric instead of accidentally falling back to a management
     /// interface or relay.
     pub peers: Vec<EndpointAddr>,
-    /// Whether to subscribe to live HEAD-update gossip. The topic id
-    /// is the team root pubkey's 32 bytes — every team has exactly
-    /// one gossip mesh, derived from its identity. `false` = serve-
-    /// /pull-only (no subscription, no broadcasts).
+    /// Whether to subscribe to live collection-evidence gossip. The topic id
+    /// is the team root pubkey's 32 bytes — every team has exactly one gossip
+    /// mesh, derived from its identity. `false` = serve-/pull-only (no
+    /// subscription, no broadcasts).
     pub gossip: bool,
     /// The team root public key — verifies all incoming capability
     /// chains. Every connection's first stream must present a cap that
@@ -152,13 +152,12 @@ pub struct PeerConfig {
     /// authorise us. Required — protocol v4 has mandatory auth on both
     /// directions of a connection.
     pub self_cap: RawHash,
-    /// Direction of participation in the team swarm. Controls whether
-    /// this node publishes its own HEADs (write side) and/or reacts to
-    /// incoming HEADs from peers (read side). Default is
-    /// `Bidirectional`. Use [`SyncDirection::ReadOnly`] for follower /
-    /// catch-up workflows; use [`SyncDirection::WriteOnly`] for
-    /// pure-publisher workflows where the local node has nothing to
-    /// learn from the swarm.
+    /// Direction of participation in the team swarm. Controls whether this
+    /// node publishes collection evidence (write side) and/or admits incoming
+    /// collection evidence (read side). Default is `Bidirectional`. Use
+    /// [`SyncDirection::ReadOnly`] for follower/catch-up workflows; use
+    /// [`SyncDirection::WriteOnly`] for pure-publisher workflows where the
+    /// local node has nothing to learn from the swarm.
     pub direction: SyncDirection,
 }
 
@@ -168,19 +167,18 @@ pub struct PeerConfig {
 /// — but locally we can choose to suppress one side of the data flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SyncDirection {
-    /// Subscribe to gossip + fetch closures AND publish our own
-    /// HEADs. Default behaviour.
+    /// Subscribe to gossip and publish our own collection evidence. Default
+    /// behaviour.
     #[default]
     Bidirectional,
-    /// Subscribe to gossip + fetch closures, but suppress local
-    /// HEAD publishes. Useful for follower / leecher workflows
-    /// where the local node is catching up to the swarm and has
-    /// no canonical state to contribute.
+    /// Subscribe to gossip, but suppress local collection-evidence publishes.
+    /// Useful for follower/leecher workflows where the local node is catching
+    /// up to the swarm and has no canonical state to contribute.
     ReadOnly,
-    /// Publish local HEADs to gossip, but ignore incoming HEAD
-    /// events from peers. Useful for pure-publisher workflows
-    /// (e.g. an importer feeding the swarm) where the local node
-    /// has nothing to learn from the swarm.
+    /// Publish local collection evidence to gossip, but ignore incoming
+    /// evidence from peers. Useful for pure-publisher workflows (for example,
+    /// an importer feeding the swarm) where the local node has nothing to
+    /// learn from the swarm.
     WriteOnly,
 }
 
@@ -354,29 +352,60 @@ pub struct CollectionOperationProbe {
     pub complete: bool,
 }
 
-/// Gossip-known publishers, most-recent-first. Every HEAD frame names
-/// its publisher, and the bottom-up insertion invariant says an
-/// announcer holds the full closure of what it announces — so recent
-/// publishers are the best first guess for ANY on-demand fetch, before
-/// paying (or depending on) a DHT lookup. Vec, not a hash set:
-/// insertion order is event order, which keeps deterministic simulation
-/// replay intact.
-type KnownPublishers = Arc<Mutex<Vec<PeerId>>>;
+/// Dialable team peers, most-recent live gossip neighbor first. Explicitly
+/// configured peers seed the list; neighbor events keep it current. These are
+/// routing candidates, not claims that a peer holds any particular blob.
+/// `Vec` preserves deterministic simulation replay order.
+type RoutingCandidates = Arc<Mutex<Vec<PeerId>>>;
 
-/// Cap on the remembered publisher list. Team meshes are small; eight
-/// most-recent publishers covers them while bounding the worst-case
-/// dial fan-out of a publisher-first miss (each attempt is further
-/// bounded by the caller's overall fetch budget).
-const KNOWN_PUBLISHER_CAP: usize = 8;
+/// Cap on the remembered routing list. Team meshes are small; eight recent
+/// peers bounds the worst-case dial fan-out of a DHT-independent miss (each
+/// attempt is also bounded by the caller's overall fetch budget).
+const ROUTING_CANDIDATE_CAP: usize = 8;
 
-/// Move `peer` to the front of the known-publisher list (dedup + cap).
-fn note_publisher(known: &KnownPublishers, peer: PeerId) {
-    let mut list = known.lock().unwrap();
+/// Move `peer` to the front of the routing-candidate list (dedup + cap).
+fn note_routing_candidate(candidates: &RoutingCandidates, peer: PeerId) {
+    let mut list = candidates.lock().unwrap();
     if let Some(pos) = list.iter().position(|p| *p == peer) {
         list.remove(pos);
     }
     list.insert(0, peer);
-    list.truncate(KNOWN_PUBLISHER_CAP);
+    list.truncate(ROUTING_CANDIDATE_CAP);
+}
+
+/// Remove a peer that the gossip mesh reports as no longer adjacent. A
+/// configured peer may re-enter on a later `NeighborUp`; DHT discovery remains
+/// available independently.
+fn remove_routing_candidate(candidates: &RoutingCandidates, peer: PeerId) {
+    candidates
+        .lock()
+        .unwrap()
+        .retain(|candidate| *candidate != peer);
+}
+
+fn remove_transient_routing_candidate(
+    candidates: &RoutingCandidates,
+    configured: &HashSet<PeerId>,
+    peer: PeerId,
+) {
+    if !configured.contains(&peer) {
+        remove_routing_candidate(candidates, peer);
+    }
+}
+
+fn collection_evidence_for_rebroadcast(
+    snapshot: &Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
+    publishes: bool,
+) -> Vec<CollectionCommitEvidence> {
+    if !publishes {
+        return Vec::new();
+    }
+    snapshot
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|snapshot| snapshot.all_collection_evidence())
+        .unwrap_or_default()
 }
 
 /// Transport-bound implementation of [`NetCapability`]. Holds exactly
@@ -386,13 +415,10 @@ struct NetCap<T: Transport> {
     pool: SharedPool<T::Conn>,
     self_cap: RawHash,
     my_id: PeerId,
-    /// Gossip-known publishers — consulted BEFORE the DHT on every
-    /// on-demand fetch. Previously this path passed `my_id` as the
-    /// publisher, so `providers_for`'s publisher-first shortcut never
-    /// fired and every read-miss paid the DHT lookup (and, on a dark
-    /// DHT, failed outright even with a reachable publisher in gossip
-    /// range).
-    publishers: KnownPublishers,
+    /// Configured peers and live gossip neighbors — consulted before the DHT
+    /// on every on-demand fetch. Membership is only a routing hint; callers
+    /// still verify content hashes and fall back to DHT providers.
+    candidates: RoutingCandidates,
     /// Explicit peers are the discovery boundary for input-only operation
     /// questions: their unknown result hashes cannot be looked up in the DHT.
     configured_peers: Vec<PeerId>,
@@ -404,10 +430,10 @@ impl<T: Transport> NetCapability for NetCap<T> {
         let pool = self.pool.clone();
         let self_cap = self.self_cap;
         let my_id = self.my_id;
-        // Snapshot the publisher list now (sync lock, most-recent-first,
-        // self excluded) so the future is self-contained.
+        // Snapshot the routing list now (sync lock, most-recent-first, self
+        // excluded) so the future is self-contained.
         let known: Vec<PeerId> = self
-            .publishers
+            .candidates
             .lock()
             .unwrap()
             .iter()
@@ -415,8 +441,8 @@ impl<T: Transport> NetCapability for NetCap<T> {
             .filter(|p| *p != my_id)
             .collect();
         Box::pin(async move {
-            // Publisher-first: whoever gossiped a HEAD at us is a live,
-            // dialable holder candidate — ask them before the DHT.
+            // Route-first: try known dialable team peers before the DHT. They
+            // are not presumed holders; an ordinary miss simply falls through.
             let mut data = if known.is_empty() {
                 None
             } else {
@@ -521,10 +547,6 @@ impl NetSender {
 
     pub fn announce(&self, hash: RawHash) {
         let _ = self.cmd_tx.send(NetCommand::Announce(hash));
-    }
-
-    pub fn gossip(&self, branch: RawPinId, head: RawHash) {
-        let _ = self.cmd_tx.send(NetCommand::Gossip { branch, head });
     }
 
     /// Publish one exact, already-verified collection evidence pair.
@@ -837,6 +859,7 @@ async fn host_loop<T: Transport>(
 
     let my_id: PeerId = transport.local_id();
     let self_cap: RawHash = config.self_cap;
+    let publishes_collection_evidence = config.direction != SyncDirection::ReadOnly;
     let mut configured_peers: Vec<PeerId> = config
         .peers
         .iter()
@@ -846,16 +869,17 @@ async fn host_loop<T: Transport>(
     configured_peers.sort_unstable();
     configured_peers.dedup();
 
-    // Host-wide singleflight connection pool — one authed
-    // connection per remote peer, reused across all concurrent
-    // fetch_reachable / swarm_fetch_chain calls. See `SharedPool`
-    // docs for the OnceCell-based dial deduplication.
+    // Host-wide singleflight connection pool — one authed connection per
+    // remote peer, reused across direct blob and capability-chain fetches. See
+    // `SharedPool` docs for the OnceCell-based dial deduplication.
     let conn_pool: SharedPool<T::Conn> = new_shared_pool();
 
-    // Gossip-known publishers: updated by the gossip task on every HEAD
-    // frame, consulted by the on-demand fetch capability below so
-    // read-miss fetches try the live publisher before the DHT.
-    let known_publishers: KnownPublishers = Arc::new(Mutex::new(Vec::new()));
+    // Configured peers seed routing even before gossip neighbor discovery.
+    // Live NeighborUp events move active routes to the front; collection
+    // evidence carriers do not imply possession of referenced blobs.
+    let routing_candidates: RoutingCandidates = Arc::new(Mutex::new(configured_peers.clone()));
+    let configured_peer_set: Arc<HashSet<PeerId>> =
+        Arc::new(configured_peers.iter().copied().collect());
 
     // Publish the inline-fetch capability now that the transport exists.
     // `Peer::fetch_blob` parks on this slot until it's filled, which is
@@ -866,15 +890,9 @@ async fn host_loop<T: Transport>(
         pool: conn_pool.clone(),
         self_cap,
         my_id,
-        publishers: known_publishers.clone(),
+        candidates: routing_candidates.clone(),
         configured_peers,
     }) as Arc<dyn NetCapability>));
-
-    // Failed-walk retry queue (bug C): walks that fail transiently
-    // are re-attempted with backoff from the command loop below,
-    // because the gossip layer dedupes rebroadcast frames and will
-    // NOT redeliver an unchanged head.
-    let retries: RetryQueue = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
 
     // Our own pubkey — the expected `cap_subject` of any cap
     // delivered to us via OP_DELIVER_CAP.
@@ -915,21 +933,14 @@ async fn host_loop<T: Transport>(
         }
     });
 
-    // ── Gossip: consume the team-topic event stream. HEAD frames
-    // trigger reachable-closure fetches; neighbor events are logged.
+    // ── Gossip: consume immutable collection evidence and maintain
+    // transport-level routing hints from neighbor liveness events.
     let mut gossip_sender: Option<T::Gossip> = None;
     if let Some((sender, mut gossip_events)) = gossip {
         gossip_sender = Some(sender);
         let events_tx = events.clone();
-        let t2 = transport.clone();
-        // Local snapshot handle — used by fetch_reachable's
-        // discovery phase to skip subtrees we already have.
-        // Same Arc the protocol server uses to answer
-        // OP_CHILDREN / OP_GET_BLOB to remote peers.
-        let snapshot_for_fetch = snapshot.clone();
-        let pool_for_fetch = conn_pool.clone();
-        let retries_for_gossip = retries.clone();
-        let publishers_for_gossip = known_publishers.clone();
+        let candidates_for_gossip = routing_candidates.clone();
+        let configured_for_gossip = configured_peer_set.clone();
         tokio::spawn(async move {
             while let Some(event) = gossip_events.recv().await {
                 match event {
@@ -937,68 +948,7 @@ async fn host_loop<T: Transport>(
                         bytes,
                         delivered_from,
                     } => {
-                        // Gossip HEAD message, v1 (81B, 0x01) or
-                        // v2 (89B, 0x02 + 8-byte nonce; the nonce is
-                        // anti-dedupe padding — parsed fields are
-                        // identical).
-                        if (bytes.len() == 81 && bytes[0] == 0x01)
-                            || (bytes.len() == 89 && bytes[0] == 0x02)
-                        {
-                            let mut branch = [0u8; 16];
-                            branch.copy_from_slice(&bytes[1..17]);
-                            let mut head = [0u8; 32];
-                            head.copy_from_slice(&bytes[17..49]);
-                            let mut publisher = [0u8; 32];
-                            publisher.copy_from_slice(&bytes[49..81]);
-
-                            let t3 = t2.clone();
-                            let events_tx2 = events_tx.clone();
-                            let self_cap2 = self_cap;
-                            let snap2 = snapshot_for_fetch.clone();
-                            let pool2 = pool_for_fetch.clone();
-                            // Use publisher key to connect for fetch
-                            // (they're the source); fall back to the
-                            // relaying neighbor if the frame carries
-                            // an invalid pubkey.
-                            let fetch_peer: PeerId =
-                                if ed25519_dalek::VerifyingKey::from_bytes(&publisher).is_ok() {
-                                    publisher
-                                } else {
-                                    delivered_from
-                                };
-                            // Remember the publisher for the on-demand
-                            // fetch path: read-miss fetches consult the
-                            // gossip-known publishers before the DHT.
-                            note_publisher(&publishers_for_gossip, fetch_peer);
-                            // A fresh frame supersedes any pending
-                            // retry for this branch — the new walk
-                            // owns the branch's recovery from here.
-                            retries_for_gossip.lock().unwrap().remove(&branch);
-                            let retries2 = retries_for_gossip.clone();
-                            tokio::spawn(async move {
-                                debug!(
-                                    head = %hex::encode(&head[..4]),
-                                    publisher = %hex::encode(&publisher[..4]),
-                                    "gossip head update; fetching"
-                                );
-                                track_known_head(
-                                    &t3,
-                                    fetch_peer,
-                                    branch,
-                                    head,
-                                    publisher,
-                                    &events_tx2,
-                                    &self_cap2,
-                                    &snap2,
-                                    &pool2,
-                                    &retries2,
-                                    0,
-                                )
-                                .await;
-                            });
-                        } else if let Some(evidence) =
-                            decode_collection_evidence_gossip_frame(&bytes)
-                        {
+                        if let Some(evidence) = decode_collection_evidence_gossip_frame(&bytes) {
                             // The carrier is only a mesh hop. Do not attach it
                             // to the evidence or use it as author authority;
                             // both author identities are signed inside the
@@ -1013,9 +963,15 @@ async fn host_loop<T: Transport>(
                         }
                     }
                     GossipEvent::NeighborUp(peer) => {
+                        note_routing_candidate(&candidates_for_gossip, peer);
                         info!(peer = %hex::encode(&peer[..4]), "gossip neighbor up");
                     }
                     GossipEvent::NeighborDown(peer) => {
+                        remove_transient_routing_candidate(
+                            &candidates_for_gossip,
+                            &configured_for_gossip,
+                            peer,
+                        );
                         info!(peer = %hex::encode(&peer[..4]), "gossip neighbor down");
                     }
                 }
@@ -1023,42 +979,6 @@ async fn host_loop<T: Transport>(
         });
     }
 
-    /// Build the gossip wire frame for a (branch, head) pair.
-    /// v2: 0x02 | branch(16) | head(32) | publisher(32) | nonce(8) = 89 bytes.
-    ///
-    /// The nonce (sender's monotonic nanoseconds) makes every frame
-    /// instance bytewise unique. This is load-bearing, not
-    /// decoration: the gossip mesh dedupes by message id (content
-    /// hash), so the periodic rebroadcast of an UNCHANGED head would
-    /// otherwise be mesh-wide deduped into a no-op — and a peer that
-    /// missed the original flood (crashed, partitioned, not yet
-    /// joined) would never learn the head at all (bug C, 2026-06-11,
-    /// reproduced by sim_swarm under SimNet's dedupe model). With
-    /// the nonce, dedupe still kills real duplicates — the same
-    /// frame instance arriving via multiple mesh paths — but each
-    /// rebroadcast period generates a deliverable new instance.
-    fn gossip_frame(branch: &RawPinId, head: &RawHash, publisher: &PeerId) -> Vec<u8> {
-        let mut msg = Vec::with_capacity(89);
-        msg.push(0x02);
-        msg.extend_from_slice(branch);
-        msg.extend_from_slice(head);
-        msg.extend_from_slice(publisher);
-        msg.extend_from_slice(&crate::clock::mono_now().as_nanos().to_be_bytes());
-        msg
-    }
-
-    // Last published HEAD per branch. Lets the periodic
-    // re-broadcast tick replay our state without callers
-    // having to drive it. iroh-gossip dedupes identical
-    // frames, so replaying the same set every 30s is cheap
-    // for neighbors who've already seen it, while giving
-    // newly-joined neighbors a chance to discover our HEADs
-    // without a JOIN message (which would add a DOS surface).
-    // BTreeMap (not HashMap): iterated on every rebroadcast tick, and
-    // deterministic iteration order is required for simulation replay
-    // (same seed => same frame order on the wire).
-    let mut last_published: std::collections::BTreeMap<RawPinId, RawHash> =
-        std::collections::BTreeMap::new();
     let rebroadcast_period = std::time::Duration::from_secs(30);
     // Read through crate::clock (not std Instant) so the rebroadcast
     // tick advances under simulated virtual time.
@@ -1073,16 +993,6 @@ async fn host_loop<T: Transport>(
                     tokio::spawn(async move {
                         t.dht_announce(hash).await;
                     });
-                }
-                NetCommand::Gossip { branch, head } => {
-                    last_published.insert(branch, head);
-                    if let Some(sender) = &gossip_sender {
-                        let msg = gossip_frame(&branch, &head, &my_id);
-                        let sender = sender.clone();
-                        tokio::spawn(async move {
-                            let _ = sender.broadcast(msg).await;
-                        });
-                    }
                 }
                 NetCommand::GossipCollectionEvidence { evidence } => {
                     if let Some(sender) = &gossip_sender {
@@ -1195,71 +1105,14 @@ async fn host_loop<T: Transport>(
             }
         }
 
-        // ── Failed-walk retries: respawn walks whose backoff expired.
-        {
-            let now = crate::clock::mono_now();
-            let due: Vec<(RawPinId, RetryEntry)> = {
-                let mut q = retries.lock().unwrap();
-                let keys: Vec<RawPinId> = q
-                    .iter()
-                    .filter(|(_, e)| e.next_attempt <= now)
-                    .map(|(k, _)| *k)
-                    .collect();
-                keys.into_iter()
-                    .filter_map(|k| q.remove(&k).map(|e| (k, e)))
-                    .collect()
-            };
-            for (branch, entry) in due {
-                debug!(
-                    head = %hex::encode(&entry.head[..4]),
-                    attempt = entry.attempt,
-                    "retrying failed walk"
-                );
-                let t3 = transport.clone();
-                let events_tx2 = events.clone();
-                let self_cap2 = self_cap;
-                let snap2 = snapshot.clone();
-                let pool2 = conn_pool.clone();
-                let retries2 = retries.clone();
-                tokio::spawn(async move {
-                    track_known_head(
-                        &t3,
-                        entry.fetch_peer,
-                        branch,
-                        entry.head,
-                        entry.publisher,
-                        &events_tx2,
-                        &self_cap2,
-                        &snap2,
-                        &pool2,
-                        &retries2,
-                        entry.attempt,
-                    )
-                    .await;
-                });
-            }
-        }
-
         if crate::clock::mono_now().duration_since(last_rebroadcast) >= rebroadcast_period {
-            let collection_evidence = snapshot
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|snapshot| snapshot.all_collection_evidence())
-                .unwrap_or_default();
+            let collection_evidence =
+                collection_evidence_for_rebroadcast(&snapshot, publishes_collection_evidence);
             trace!(
-                heads = last_published.len(),
                 collection_evidence = collection_evidence.len(),
                 "rebroadcast tick: replaying published evidence"
             );
             if let Some(sender) = &gossip_sender {
-                for (branch, head) in &last_published {
-                    let msg = gossip_frame(branch, head, &my_id);
-                    let sender = sender.clone();
-                    tokio::spawn(async move {
-                        let _ = sender.broadcast(msg).await;
-                    });
-                }
                 for evidence in collection_evidence {
                     let msg = collection_evidence_gossip_frame(
                         evidence,
@@ -1278,210 +1131,18 @@ async fn host_loop<T: Transport>(
     }
 }
 
-/// Fetch all blobs reachable from a HEAD, swarm-distributed.
-///
-/// For each blob along the BFS, asks the DHT for providers and
-/// fans the fetch across whoever's reachable; falls back to the
-/// gossip publisher if DHT lookup is empty. A per-pull connection
-/// pool keyed on `EndpointId` ensures we only auth once per
-/// provider — subsequent ops to the same provider reuse the
-/// connection through iroh's QUIC stream multiplexing (our
-/// `SnapshotHandler` already accepts unbounded sequential
-/// bi-streams per connection; auth state is per-connection, set
-/// on the first OP_AUTH stream).
-///
-/// Earlier versions opened one fresh `connect_authed` per blob,
-/// paying ~600ms of auth handshake each. A BFS over even a small
-/// graph would exhaust an outer deadline before the walk
-/// completed. With the pool, one auth per provider covers any
-/// number of ops; with DHT-driven provider selection, the walk
-/// fans out across multiple caching peers in parallel hops
-/// rather than funnelling everything through the publisher.
-async fn fetch_reachable<T: Transport>(
-    t: &T,
-    publisher: PeerId,
-    head: &RawHash,
-    events: &mpsc::Sender<NetEvent>,
-    self_cap: &RawHash,
-    local: &Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
-    pool: &SharedPool<T::Conn>,
-) -> anyhow::Result<()> {
-    // Local-presence check against the same snapshot the server
-    // uses to answer remote OP_CHILDREN / OP_GET_BLOB. Closure
-    // (rather than inline lookups) so the lock-and-snap-deref
-    // dance lives in one place.
-    let have_local = |hash: &RawHash| -> bool {
-        local
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|s| s.has_blob(hash))
-            .unwrap_or(false)
-    };
-
-    // Short-circuit: if the HEAD is already local, the bottom-up
-    // insertion invariant guarantees its whole closure is local
-    // too (Phase 2 writes children before parents; a stored blob
-    // implies stored children). Caught-up gossip rebroadcasts hit
-    // this case and incur zero wire bytes.
-    if have_local(head) {
-        return Ok(());
-    }
-
-    let publisher_id = publisher;
-
-    // Seed the pool with the publisher's connection on first encounter.
-    // pool_get is singleflight-on-dial via OnceCell, so concurrent
-    // fetch_reachable calls targeting the same publisher share one
-    // dial and one OP_AUTH; the resulting connection serves every
-    // op_children/op_get_blob on this and all other walks.
-    trace!(head = %hex::encode(&head[..4]), publisher = %hex::encode(&publisher_id[..4]), "fetch_reachable: seeding pool");
-    let _ = pool_get(t, pool, publisher_id, self_cap).await;
-    trace!(head = %hex::encode(&head[..4]), "fetch_reachable: pool seeded; entering Phase 1");
-
-    // ── Phase 1: discovery (OP_CHILDREN only) ──
-    //
-    // Walk the closure top-down via OP_CHILDREN. For each child,
-    // skip if already local (the subtree is guaranteed present by
-    // the bottom-up insertion invariant; descending would be
-    // wasted wire bytes). Build `to_fetch` in BFS order so reverse
-    // iteration in Phase 2 gives bottom-up arrival to the store.
-    let mut seen: HashSet<RawHash> = HashSet::new();
-    let mut to_fetch: Vec<RawHash> = Vec::new();
-    let mut frontier: Vec<RawHash> = vec![*head];
-    seen.insert(*head);
-    to_fetch.push(*head);
-
-    while !frontier.is_empty() {
-        let mut next: Vec<RawHash> = Vec::new();
-        for parent in &frontier {
-            trace!(parent = %hex::encode(&parent[..4]), "fetch_reachable: calling children_one");
-            let children = match children_one(t, parent, pool, publisher_id, self_cap).await {
-                Some(c) => c,
-                None => {
-                    // Discovery FAILED for this blob — every provider
-                    // was unreachable or errored (a crash reset the
-                    // conn mid-OP_CHILDREN, say). This is NOT "the
-                    // blob is a leaf": a genuine leaf returns
-                    // `Some(vec![])`. Treating a failed discovery as a
-                    // leaf would skip the parent's entire subtree,
-                    // complete the walk with a hole, and advance the
-                    // tracking pin to a head whose ancestry is missing
-                    // — after which every `merge_commit` dies on
-                    // Storage(NotFound). Abort instead so the caller's
-                    // retry queue re-attempts the whole walk; the
-                    // have_local short-circuits make the retry cheap
-                    // (already-fetched subtrees are skipped).
-                    warn!(
-                        parent = %hex::encode(&parent[..4]),
-                        "op_children: no provider could serve; aborting walk (closure would be incomplete)"
-                    );
-                    return Err(anyhow::anyhow!(
-                        "op_children discovery failed for {}: closure incomplete",
-                        hex::encode(parent)
-                    ));
-                }
-            };
-            trace!(parent = %hex::encode(&parent[..4]), n = children.len(), "fetch_reachable: children_one returned");
-            for hash in children {
-                if !seen.insert(hash) {
-                    continue;
-                }
-                // The first time we see a hash determines whether
-                // it ends up in to_fetch. If we already have it
-                // locally, the closure below it is also local
-                // (invariant), so don't enqueue or descend.
-                if have_local(&hash) {
-                    continue;
-                }
-                to_fetch.push(hash);
-                next.push(hash);
-            }
-        }
-        frontier = next;
-    }
-
-    // ── Phase 2: transfer (OP_GET_BLOB, deepest-first) ──
-    //
-    // Reverse BFS order = bottom-up: emit children before parents.
-    // Peer's mpsc receiver preserves order, so by the time it puts
-    // any parent into the store, its discovered-and-fetched children
-    // are already in; blobs that *weren't* discovered (have_local
-    // short-circuited them in Phase 1) were already locally present
-    // before Phase 1 started — and the same invariant said their
-    // closures were too.
-    //
-    // **Abort on first fetch failure.** If we can't fetch a child,
-    // we must NOT proceed to fetch its parents — writing a parent
-    // whose closure is incomplete would break the "stored blob ⇒
-    // closure stored" invariant that the have_local short-circuit
-    // relies on. Worse, append-only storage means any incomplete
-    // parent we wrote stays in the pile forever; Phase 1 would then
-    // short-circuit on that broken parent on every future sync, so
-    // the gap becomes permanent.
-    //
-    // Aborting drops the current walk's tracking-pin update too
-    // (the caller only emits NetEvent::Head on Ok), so on the next
-    // gossip rebroadcast Phase 1 re-walks from the head. Whatever
-    // descendants we *did* successfully write before the failure
-    // remain valid (they're deeper in the BFS, so by reverse-order
-    // they were completed before we hit the failure); Phase 1 will
-    // short-circuit on them and only re-fetch the still-missing
-    // ancestors.
-    for hash in to_fetch.iter().rev() {
-        let Some(data) = fetch_one(t, hash, pool, publisher_id, self_cap).await else {
-            warn!(
-                hash = %hex::encode(&hash[..4]),
-                "fetch aborted: blob unavailable; head not advanced (will retry on next gossip)"
-            );
-            return Err(anyhow::anyhow!(
-                "blob unavailable from all known providers: {}",
-                hex::encode(hash)
-            ));
-        };
-        if blake3::hash(&data).as_bytes() != hash {
-            warn!(
-                hash = %hex::encode(&hash[..4]),
-                "fetch aborted: hash mismatch; head not advanced"
-            );
-            return Err(anyhow::anyhow!(
-                "hash mismatch on fetched blob: expected {}",
-                hex::encode(hash)
-            ));
-        }
-        let _ = events.send(NetEvent::Blob(anybytes::Bytes::from_source(data)));
-    }
-
-    // No close: connections live in the shared pool for the
-    // host_loop's lifetime, reused by subsequent walks.
-    Ok(())
-}
-
-/// Resolve providers for a hash via DHT, append the publisher as a
-/// fallback if it's not already in the set. Returns the ordered
-/// candidate list — DHT providers first (likely caching peers,
-/// closer in the swarm), publisher last (always-available fallback).
+/// Resolve providers for a hash. When `preferred_peer` is not self, use it as
+/// the exact first candidate (cap-chain transfer knows the requesting peer is
+/// the source). Otherwise query the DHT.
 ///
 /// Self is filtered out — `find_providers` will list us as a
 /// provider for any blob we've announced, and trying to dial
 /// ourselves trips iroh's "Connecting to ourself is not supported"
-/// error. If we have the blob, we'd have hit the `have_local`
-/// short-circuit upstream; if we're being asked to fetch, by
-/// definition we don't have it (yet) — so self is never useful here.
-async fn providers_for<T: Transport>(t: &T, hash: &RawHash, publisher_id: PeerId) -> Vec<PeerId> {
+/// error. Self is never useful for a missing local hash.
+async fn providers_for<T: Transport>(t: &T, hash: &RawHash, preferred_peer: PeerId) -> Vec<PeerId> {
     let my_id = t.local_id();
-    // Publisher-first: the gossip frame's publisher announced the
-    // head, and the bottom-up insertion invariant says an announcer
-    // holds the full closure — so when we know a publisher, ask THEM
-    // and skip the DHT round-trip entirely. The DHT path only runs
-    // when no publisher is known (e.g. cold-start tracking pulls),
-    // and is timeout-bounded so a dark DHT degrades to "no
-    // alternates" instead of hanging the walk (the 2026-06-10 sync
-    // hang: dht_providers never resolved on a 2-node mesh with no
-    // DHT reachability, and the publisher fallback sat unreachable
-    // *behind* that await).
-    if publisher_id != my_id {
-        return vec![publisher_id];
+    if preferred_peer != my_id {
+        return vec![preferred_peer];
     }
     trace!(hash = %hex::encode(&hash[..4]), "providers_for: DHT find_providers awaiting");
     let mut providers: Vec<PeerId> =
@@ -1502,14 +1163,12 @@ async fn providers_for<T: Transport>(t: &T, hash: &RawHash, publisher_id: PeerId
 }
 
 /// Host-wide connection pool: one authed `iroh::endpoint::Connection`
-/// per remote peer, shared across all concurrent `fetch_reachable` /
-/// `swarm_fetch_chain` invocations.
+/// per remote peer, shared across all direct blob and capability-chain fetches.
 ///
 /// `OnceCell` per peer provides automatic singleflight: the first
 /// task to encounter a missing entry runs the dial; concurrent tasks
 /// await the same `OnceCell` and reuse the resulting connection. No
-/// dial-storm when a gossip rebroadcast fans 5+ heads into 5+ parallel
-/// fetch tasks targeting the same peer.
+/// dial-storm when several reads target the same peer concurrently.
 ///
 /// iroh QUIC multiplexes streams cheaply on a single connection; our
 /// `serve_stream` accepts unbounded sequential bi-streams per
@@ -1600,8 +1259,8 @@ async fn fetch_one<T: Transport>(
 /// OP_GET_BLOB with the per-op deadline, evict-and-try-next on
 /// connection errors. First success wins; the caller verifies the hash.
 /// The provider-iteration tail of [`fetch_one`], split out so the
-/// publisher-first on-demand path ([`NetCap::fetch_blob`]) can drive it
-/// with gossip-known candidates without a DHT round-trip.
+/// route-first on-demand path ([`NetCap::fetch_blob`]) can drive it with known
+/// dialable candidates without a DHT round-trip.
 async fn fetch_from_providers<T: Transport>(
     t: &T,
     hash: &RawHash,
@@ -1642,11 +1301,9 @@ async fn fetch_from_providers<T: Transport>(
 /// OP_AUTH context) and return it as a `BTreeMap<RawHash, Vec<u8>>`
 /// (ordered, so draining it into NetEvent::Blob emissions is
 /// deterministic for simulation replay).
-/// Mirrors `fetch_reachable`'s two-phase walk (Phase 1 OP_CHILDREN
-/// discovery, Phase 2 OP_GET_BLOB in reverse-BFS order) but writes
-/// the results to a map instead of emitting `NetEvent::Blob`. The
-/// caller decides whether to cache the bytes into the local store
-/// after using them.
+/// Uses a two-phase walk (OP_CHILDREN discovery, then OP_GET_BLOB in
+/// reverse-BFS order) and writes results to a map. The caller decides whether
+/// to cache the bytes into the local store after using them.
 async fn swarm_fetch_chain<T: Transport>(
     t: &T,
     publisher: PeerId,
@@ -1749,91 +1406,6 @@ async fn children_one<T: Transport>(
         }
     }
     None
-}
-
-/// Fetch the reachable closure from `head` on `fetch_peer` and, on
-/// success, emit a [`NetEvent::Head`] so the Peer materializes a
-/// tracking pin.
-///
-/// Shared tail of the gossip-arrival handler and the `Track` command:
-/// both know (fetch_peer, branch, head, publisher) by the time they
-/// get here. Gossip gets the head directly from the broadcast message;
-/// `Track` asks the peer via `op_head` first.
-///
-/// Failed-walk retry state, keyed by branch. One entry per branch —
-/// a newer head for the same branch replaces (and thereby cancels
-/// retries for) an older failed one.
-///
-/// Exists because gossip CANNOT be relied on to redeliver: the 30s
-/// rebroadcast replays byte-identical frames, and the gossip mesh
-/// dedupes message-ids — so a head whose first fetch failed
-/// transiently would otherwise never be retried (bug C, 2026-06-11:
-/// reproduced deterministically by sim_swarm the moment SimNet
-/// modeled iroh-gossip's dedupe; diagnosed from first principles by
-/// the organisation zooid).
-pub(crate) struct RetryEntry {
-    pub head: RawHash,
-    pub publisher: PublisherKey,
-    pub fetch_peer: PeerId,
-    pub next_attempt: crate::clock::Mono,
-    pub attempt: u32,
-}
-
-pub(crate) type RetryQueue = Arc<Mutex<std::collections::BTreeMap<RawPinId, RetryEntry>>>;
-
-fn retry_backoff(attempt: u32) -> std::time::Duration {
-    crate::RETRY_BACKOFF_BASE
-        .saturating_mul(1u32 << attempt.min(6))
-        .min(crate::RETRY_BACKOFF_CAP)
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn track_known_head<T: Transport>(
-    t: &T,
-    fetch_peer: PeerId,
-    branch: RawPinId,
-    head: RawHash,
-    publisher: PublisherKey,
-    events: &mpsc::Sender<NetEvent>,
-    self_cap: &RawHash,
-    local: &Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
-    pool: &SharedPool<T::Conn>,
-    retries: &RetryQueue,
-    attempt: u32,
-) {
-    if let Err(e) = fetch_reachable(t, fetch_peer, &head, events, self_cap, local, pool).await {
-        warn!(
-            error = %e,
-            peer = %hex::encode(&fetch_peer[..4]),
-            attempt,
-            "fetch_reachable failed; queueing retry"
-        );
-        // Unconditional insert: the gossip arm removes a branch's
-        // pending entry whenever a FRESH frame for that branch
-        // arrives, so whatever walk fails here is the newest known
-        // head for the branch at this moment.
-        retries.lock().unwrap().insert(
-            branch,
-            RetryEntry {
-                head,
-                publisher,
-                fetch_peer,
-                next_attempt: crate::clock::mono_now() + retry_backoff(attempt),
-                attempt: attempt.saturating_add(1),
-            },
-        );
-    } else {
-        let _ = events.send(NetEvent::Head {
-            branch,
-            head,
-            publisher,
-        });
-        // Success cancels any pending retry for this branch+head.
-        let mut q = retries.lock().unwrap();
-        if q.get(&branch).map(|e| e.head == head).unwrap_or(false) {
-            q.remove(&branch);
-        }
-    }
 }
 
 // ── Protocol handler ─────────────────────────────────────────────────
@@ -2277,14 +1849,12 @@ async fn serve_stream<T: Transport>(
             std::collections::BTreeMap::new();
         let mut result = verify_once(&fetched);
 
-        // Swarm fetch + retry on missing-blob. Caps are orphan blobs
-        // (not reachable from any branch HEAD), so they don't ride
-        // along with normal sync. On first auth from a peer whose
-        // chain we haven't cached, this walks the chain via OP_CHILDREN
-        // and pulls the cap blobs into a local HashMap. Sending peers
-        // verify our chain when we dial them (mutual recursion that
-        // terminates because the union of all members' piles holds
-        // every cap that's been issued).
+        // Swarm fetch + retry on missing-blob. Capability blobs are not
+        // collection evidence, so on first auth from a peer whose chain we
+        // have not cached, walk it via OP_CHILDREN and pull the blobs into a
+        // local map. Sending peers verify our chain when we dial them (mutual
+        // recursion that terminates because issued capabilities are held by
+        // members of the team).
         if matches!(
             result,
             Err(triblespace_core::repo::capability::VerifyError::Fetch),
@@ -2345,11 +1915,7 @@ async fn serve_stream<T: Transport>(
             return Ok(());
         }
     };
-    // Two-tier scope gate:
-    //
-    //  - branch level: `OP_LIST` and `OP_HEAD` are filtered by
-    //    `verified.grants_read_on(branch)`.
-    //  - blob level: `OP_GET_BLOB` and `OP_CHILDREN` are filtered by
+    // Blob-level scope gate: `OP_GET_BLOB` and `OP_CHILDREN` are filtered by
     //    blob-graph reachability from the allowed heads. A peer with a
     //    cap restricted to branch X cannot fetch blobs that only branch
     //    Y reaches, even if they probe by raw hash. Unrestricted caps
@@ -2640,16 +2206,23 @@ fn blob_in_scope(
 
 #[cfg(test)]
 mod collection_evidence_gossip_tests {
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+
     use ed25519_dalek::SigningKey;
     use triblespace_core::collection::{
-        CollectionCommit, CollectionGossip, empty_metadata_handle, simplearchive_union,
+        CollectionCommit, CollectionGossip, CollectionId, CollectionRecord, empty_metadata_handle,
+        simplearchive_union,
     };
     use triblespace_core::id::Id;
     use triblespace_core::inline::Inline;
+    use triblespace_core::repo::{PinSnapshot, WantRequest};
 
     use super::{
-        COLLECTION_EVIDENCE_GOSSIP_FRAME_LEN, GOSSIP_COLLECTION_EVIDENCE,
-        collection_evidence_gossip_frame, decode_collection_evidence_gossip_frame,
+        AnySnapshot, COLLECTION_EVIDENCE_GOSSIP_FRAME_LEN, GOSSIP_COLLECTION_EVIDENCE,
+        RoutingCandidates, collection_evidence_for_rebroadcast, collection_evidence_gossip_frame,
+        decode_collection_evidence_gossip_frame, note_routing_candidate,
+        remove_transient_routing_candidate,
     };
     use crate::collection_wire::{COLLECTION_COMMIT_EVIDENCE_LEN, CollectionCommitEvidence};
 
@@ -2664,6 +2237,40 @@ mod collection_evidence_gossip_tests {
         );
         CollectionCommitEvidence::new(CollectionGossip::sign(&author, descriptor.handle()), commit)
             .unwrap()
+    }
+
+    struct EvidenceSnapshot {
+        branches: PinSnapshot,
+        evidence: CollectionCommitEvidence,
+    }
+
+    impl AnySnapshot for EvidenceSnapshot {
+        fn get_blob(&self, _: &[u8; 32]) -> Option<Vec<u8>> {
+            None
+        }
+
+        fn has_blob(&self, _: &[u8; 32]) -> bool {
+            false
+        }
+
+        fn branches(&self) -> &PinSnapshot {
+            &self.branches
+        }
+
+        fn collection_evidence(&self, collection: CollectionId) -> Vec<CollectionCommitEvidence> {
+            (self.evidence.commit().collection() == collection)
+                .then_some(self.evidence)
+                .into_iter()
+                .collect()
+        }
+
+        fn all_collection_evidence(&self) -> Vec<CollectionCommitEvidence> {
+            vec![self.evidence]
+        }
+
+        fn collection_operation_receipts(&self, _: WantRequest) -> Vec<CollectionRecord> {
+            Vec::new()
+        }
     }
 
     #[test]
@@ -2709,5 +2316,39 @@ mod collection_evidence_gossip_tests {
         wrong_tag[0] ^= 0x80;
         assert_eq!(decode_collection_evidence_gossip_frame(&wrong_tag), None);
         assert_eq!(decode_collection_evidence_gossip_frame(&first[..328]), None);
+    }
+
+    #[test]
+    fn read_only_host_never_selects_periodic_evidence_for_publication() {
+        let evidence = evidence();
+        let snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>> =
+            Arc::new(Mutex::new(Some(Box::new(EvidenceSnapshot {
+                branches: PinSnapshot::default(),
+                evidence,
+            }))));
+
+        assert!(collection_evidence_for_rebroadcast(&snapshot, false).is_empty());
+        assert_eq!(
+            collection_evidence_for_rebroadcast(&snapshot, true),
+            vec![evidence]
+        );
+    }
+
+    #[test]
+    fn routing_candidates_follow_neighbor_liveness_without_dropping_configuration() {
+        let configured_peer = [1; 32];
+        let transient_peer = [2; 32];
+        let candidates: RoutingCandidates = Arc::new(Mutex::new(vec![configured_peer]));
+        let configured = HashSet::from([configured_peer]);
+
+        note_routing_candidate(&candidates, transient_peer);
+        assert_eq!(
+            *candidates.lock().unwrap(),
+            vec![transient_peer, configured_peer]
+        );
+
+        remove_transient_routing_candidate(&candidates, &configured, transient_peer);
+        remove_transient_routing_candidate(&candidates, &configured, configured_peer);
+        assert_eq!(*candidates.lock().unwrap(), vec![configured_peer]);
     }
 }
