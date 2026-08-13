@@ -216,7 +216,7 @@ impl StoreSnapshot<()> {
             .gossips()
             .map(|gossips| gossips.filter_map(Result::ok).collect())
             .unwrap_or_default();
-        let pin_heads = store.pin_snapshot().ok()?;
+        let pin_heads = store.snapshot_pin_heads().ok()?;
         let reader = store.reader().ok()?;
         Some(StoreSnapshot {
             reader,

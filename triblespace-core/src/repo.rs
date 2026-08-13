@@ -626,9 +626,9 @@ pub type PinSnapshot = PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>;
 /// Observational access to one point-in-time snapshot of pin heads.
 ///
 /// This is deliberately narrower than [`PinStore`]. Consumers that only need
-/// a stable authorization or serving view must not thereby gain the ability to
-/// enumerate individual cells, inspect them piecemeal, or perform compare-and-
-/// swap mutation. The mutable receiver permits stores such as
+/// a stable authorization or serving view must not thereby require piecemeal
+/// store access or compare-and-swap mutation. The returned snapshot remains
+/// fully inspectable. The mutable receiver permits stores such as
 /// [`crate::repo::pile::Pile`] to refresh externally appended records before
 /// producing the snapshot; the capability itself is read-only.
 ///
@@ -640,7 +640,7 @@ pub trait PinSnapshotSource {
     type PinSnapshotError: Error + Debug + Send + Sync + 'static;
 
     /// Return a point-in-time snapshot of every `(pin id, head)` mapping.
-    fn pin_snapshot(&mut self) -> Result<PinSnapshot, Self::PinSnapshotError>;
+    fn snapshot_pin_heads(&mut self) -> Result<PinSnapshot, Self::PinSnapshotError>;
 }
 
 /// Storage backend for pins: named, atomically-updatable handles to
@@ -754,7 +754,7 @@ where
 {
     type PinSnapshotError = T::PinsError;
 
-    fn pin_snapshot(&mut self) -> Result<PinSnapshot, Self::PinSnapshotError> {
+    fn snapshot_pin_heads(&mut self) -> Result<PinSnapshot, Self::PinSnapshotError> {
         PinStore::pin_snapshot(self)
     }
 }
