@@ -16,8 +16,8 @@
 //!   fetching its referenced blobs; semantic trust belongs to later
 //!   collection resolution.
 //! - **Blob writes** delegate to the inner store and announce content to the
-//!   DHT. Legacy [`PinStore`] HEAD gossip remains temporarily available for
-//!   compatibility, but is not the primary replication ledger.
+//!   DHT. [`PinStore`] remains a local storage delegation used by capability
+//!   scope checks; pins are not replicated state.
 //!
 //! There is no separate cache tier: `Peer<S>` takes a **single store**,
 //! and any tiering (bounded want retention, generational eviction) lives
@@ -40,8 +40,6 @@
 //! Collection discovery is gossip-driven: immutable grant+commit evidence
 //! floods the team topic and arrives through `NetEvent`. Referenced content
 //! remains independently retrievable by hash, normally through durable wants.
-//! The older HEAD path still exists as a migration bridge for pin-based
-//! callers and should not be used to model new replicated state.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -188,9 +186,8 @@ where
 ///     self_cap: [0u8; 32],
 ///     direction: SyncDirection::Bidirectional,
 /// });
-/// // From here `peer` is just a `BlobStore + BlobStorePut +
-/// // PinStore` — wrap it in `Repository::new` and use it like
-/// // any other triblespace storage.
+/// // From here `peer` provides network-aware blob storage while retaining
+/// // the wrapped store's local PinStore surface for capability scope checks.
 /// drop(peer);
 /// ```
 pub struct Peer<S>
@@ -222,17 +219,13 @@ where
     /// the last refresh.
     last_blob_reader: Option<S::Reader>,
 
-    /// Baseline branch heads for diff-and-publish on `refresh`. Updated on
-    /// every Peer-driven write so we don't double-gossip our own changes.
-    last_branches: HashMap<Id, RawHash>,
-
     /// Intrinsic commit ids whose matching grant-backed evidence has already
     /// been handed to the host gossip loop. This is only a publication-diff
     /// baseline: durable truth remains in the two grow-only stores.
     last_collection_commits: BTreeSet<Id>,
 
     /// Direction of swarm participation — controls collection-evidence and
-    /// blob publication/reception, plus the transitional legacy HEAD path.
+    /// blob publication/reception.
     direction: SyncDirection,
 
     /// Monotonic time of the most recent NetEvent absorbed in
@@ -329,7 +322,6 @@ where
             sender,
             receiver,
             last_blob_reader: None,
-            last_branches: HashMap::new(),
             last_collection_commits: BTreeSet::new(),
             direction,
             last_event_at: crate::clock::mono_now(),
@@ -476,8 +468,7 @@ where
     /// Two phases:
     ///
     /// 1. **Drain incoming events** — pulls any pending gossip
-    ///    `NetEvent`s from the network thread into the wrapped store
-    ///    (creating tracking pins as needed).
+    ///    `NetEvent`s from the network thread into the wrapped store.
     /// 2. **Publish external writes** — diffs the wrapped store against
     ///    the last published baseline and gossips/announces any deltas
     ///    that didn't go through the Peer's own write path. Use this to
@@ -508,41 +499,6 @@ where
                         .lock()
                         .expect("store mutex")
                         .put::<UnknownBlob, Bytes>(data);
-                }
-                NetEvent::Head {
-                    branch,
-                    head,
-                    publisher,
-                } => {
-                    if let Some(remote_id) = Id::new(branch) {
-                        let mut store = self.store.lock().expect("store mutex");
-                        match read_remote_name(&mut *store, &head, remote_id) {
-                            Some(name) => {
-                                let r = crate::tracking::ensure_tracking_pin(
-                                    &mut *store,
-                                    remote_id,
-                                    &head,
-                                    &name,
-                                    &publisher,
-                                    // Gossip-driven auto-tracking stays strong
-                                    // (eager) for now; the lazy-tracking path is
-                                    // opt-in and wired separately.
-                                    false,
-                                );
-                                tracing::trace!(
-                                    head = %hex::encode(&head[..4]),
-                                    ok = r.is_some(),
-                                    "head event -> ensure_tracking_pin"
-                                );
-                            }
-                            None => {
-                                tracing::warn!(
-                                    head = %hex::encode(&head[..4]),
-                                    "peer: head event but branch meta unreadable; dropped"
-                                );
-                            }
-                        }
-                    }
                 }
                 NetEvent::CollectionEvidence(evidence) => {
                     incoming_collection_evidence.push(evidence);
@@ -691,31 +647,8 @@ where
                 .collect();
         }
 
-        // ── Phase 5: diff-and-publish branch deltas ───────────────────
-        // ReadOnly skips this entire phase — followers don't gossip.
-        if self.direction != SyncDirection::ReadOnly {
-            let bids: Vec<Id> = match store.pins() {
-                Ok(it) => it.filter_map(|r| r.ok()).collect(),
-                Err(_) => return,
-            };
-            for bid in bids {
-                if crate::policy::is_legacy_local_only_pin(&mut *store, bid) {
-                    continue;
-                }
-                if crate::tracking::is_tracking_pin(&mut *store, bid) {
-                    continue;
-                }
-                let head = match store.head(bid) {
-                    Ok(Some(h)) => h,
-                    _ => continue,
-                };
-                if self.last_branches.get(&bid) != Some(&head.raw) {
-                    let bid_bytes: [u8; 16] = bid.into();
-                    self.sender.gossip(bid_bytes, head.raw);
-                    self.last_branches.insert(bid, head.raw);
-                }
-            }
-        }
+        // Pin heads remain local storage state. Collection evidence above is
+        // the only semantic state published through gossip.
     }
 
     /// Persist an incoming join request: store the partial-cap blob,
@@ -1132,50 +1065,6 @@ where
         dispatched + redispatched
     }
 
-    /// Force-republish all current non-tracking legacy branches to the gossip
-    /// topic, regardless of whether they appear changed since the last
-    /// publish.
-    ///
-    /// Use this for periodic "I'm still here, here's my state"
-    /// announcements that help newly-joined gossip neighbors learn about
-    /// us. Long-running sync daemons typically call this every few seconds.
-    /// Cheap to call repeatedly — iroh-gossip dedupes identical messages
-    /// on the wire.
-    ///
-    /// Distinct from [`refresh`](Self::refresh): refresh publishes only the
-    /// deltas it detects against its diff baselines. This API remains only for
-    /// the transitional legacy branch protocol; immutable collection evidence
-    /// is replayed directly from the host's live store snapshot.
-    pub fn republish_branches(&mut self) {
-        // ReadOnly suppresses publishing entirely — even republish.
-        if self.direction == SyncDirection::ReadOnly {
-            return;
-        }
-        let mut store = self.store.lock().expect("store mutex");
-        // Refresh the snapshot served by the network thread BEFORE
-        // gossiping — see `refresh` Phase 2 for the ordering rationale.
-        if let Some(snap) = StoreSnapshot::from_store(&mut *store) {
-            self.sender.update_snapshot(snap);
-        }
-        let bids: Vec<Id> = match store.pins() {
-            Ok(it) => it.filter_map(|r| r.ok()).collect(),
-            Err(_) => return,
-        };
-        for bid in bids {
-            if crate::policy::is_legacy_local_only_pin(&mut *store, bid) {
-                continue;
-            }
-            if crate::tracking::is_tracking_pin(&mut *store, bid) {
-                continue;
-            }
-            if let Ok(Some(head)) = store.head(bid) {
-                let bid_bytes: [u8; 16] = bid.into();
-                self.sender.gossip(bid_bytes, head.raw);
-                self.last_branches.insert(bid, head.raw);
-            }
-        }
-    }
-
     /// Lock and borrow the underlying store. Use for store-specific
     /// methods that aren't part of the storage traits (e.g.
     /// `Pile::flush`, `Yard::collect`, `WantStore::wants`).
@@ -1291,12 +1180,11 @@ where
 
 // ── Trait delegations ───────────────────────────────────────────────
 //
-// Reads (`reader`, `head`, `branches`) call `refresh()` first so they
-// always see the latest gossiped state AND any external writes that
-// landed since the last refresh get announced. Writes (`put`, `update`)
-// delegate to the inner store and then push the new state out via the
-// network thread, updating the diff baselines so refresh doesn't
-// double-announce.
+// Reads call `refresh()` first so they always see the latest collection
+// evidence and any external blob writes get announced. Blob writes delegate
+// to the inner store and then publish the new state. PinStore remains a local
+// delegation; pin updates only refresh the snapshot used for capability scope
+// checks and are never gossiped.
 
 impl<S> BlobStorePut for Peer<S>
 where
@@ -1410,29 +1298,13 @@ where
         new: Option<Inline<Handle<SimpleArchive>>>,
     ) -> Result<PushResult, Self::UpdateError> {
         let mut store = self.store.lock().expect("store mutex");
-        let result = store.update(id, old, new.clone())?;
+        let result = store.update(id, old, new)?;
         if let PushResult::Success() = &result {
-            if let Some(head) = new {
-                // Refresh the snapshot served by the network thread
-                // BEFORE gossiping — see `refresh` Phase 2 for the
-                // ordering rationale.
-                if let Some(snap) = StoreSnapshot::from_store(&mut *store) {
-                    self.sender.update_snapshot(snap);
-                }
-                // Tracking branches are local mirror state and must NOT be
-                // re-gossiped — otherwise the publisher would receive its
-                // own tracking branch back and create a tracking-of-the-
-                // tracking, ad infinitum. Current local policy lives in a
-                // private collection and cannot enter this PinStore path; the
-                // second predicate protects unmigrated pre-collection pins.
-                if !crate::policy::is_legacy_local_only_pin(&mut *store, id)
-                    && !crate::tracking::is_tracking_pin(&mut *store, id)
-                    && self.direction != SyncDirection::ReadOnly
-                {
-                    let bid_bytes: [u8; 16] = id.into();
-                    self.sender.gossip(bid_bytes, head.raw);
-                    self.last_branches.insert(id, head.raw);
-                }
+            // Pin reachability still participates in blob-scope capability
+            // checks, so keep the host's read snapshot current without
+            // turning the pin mutation into replicated state.
+            if let Some(snap) = StoreSnapshot::from_store(&mut *store) {
+                self.sender.update_snapshot(snap);
             }
         }
         Ok(result)
@@ -1585,46 +1457,6 @@ mod collection_gossip_tests {
     }
 }
 
-/// Read the branch name from a branch metadata blob. Tries `metadata::name`
-/// first (normal branches) and falls back to `remote_name` (tracking
-/// branches mirrored from a remote peer).
-fn read_remote_name<S: BlobStore>(
-    store: &mut S,
-    head_hash: &RawHash,
-    remote_id: Id,
-) -> Option<String> {
-    use triblespace_core::blob::encodings::longstring::LongString;
-    use triblespace_core::macros::{find, pattern};
-    use triblespace_core::repo::BlobStoreGet;
-
-    let reader = store.reader().ok()?;
-    let meta_handle = Inline::<Handle<SimpleArchive>>::new(*head_hash);
-    let meta: triblespace_core::trible::TribleSet = reader.get(meta_handle).ok()?;
-    let branch_entity = triblespace_core::repo::branch::branch_entity(&meta, remote_id).ok()?;
-
-    let mut names = find!(
-        h: Inline<Handle<LongString>>,
-        pattern!(&meta, [{ branch_entity @ triblespace_core::metadata::name: ?h }])
-    );
-    let name_handle = match (names.next(), names.next()) {
-        (Some(name), None) => Some(name),
-        (None, None) => {
-            let mut remote_names = find!(
-            h: Inline<Handle<LongString>>,
-                pattern!(&meta, [{ branch_entity @ crate::tracking::remote_name: ?h }])
-            );
-            match (remote_names.next(), remote_names.next()) {
-                (Some(name), None) => Some(name),
-                _ => None,
-            }
-        }
-        _ => None,
-    }?;
-
-    let name_view: anybytes::View<str> = reader.get(name_handle).ok()?;
-    Some(name_view.as_ref().to_string())
-}
-
 /// Extract every trible whose entity is `scope_root` from `set`,
 /// returning them as a fresh TribleSet. Used by `renewal_tick` to
 /// reconstruct the scope-facts argument to `build_capability` from
@@ -1656,8 +1488,8 @@ fn extract_scope_subgraph(
 /// - the **async** [`AsyncBlobStoreGet`] is *transparent* — local
 ///   lookup, else a demand-born want followed by an awaited swarm
 ///   fetch that lands the result in the shared store. This is what
-///   gives a generic async consumer (a lazy `Repository::checkout`)
-///   lazy replication for free, without ever knowing it holds a `Peer`.
+///   gives a generic async consumer lazy replication for free, without ever
+///   knowing it holds a `Peer`.
 ///
 /// So existence-vs-retrieval is split by *which trait you call*, not by
 /// a bespoke method: probe with the sync `get`, retrieve with the async
