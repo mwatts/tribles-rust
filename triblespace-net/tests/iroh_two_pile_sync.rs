@@ -1,8 +1,9 @@
 //! Two-pile sync over the REAL iroh transport stack — the v0.47.0
 //! release-gate integration test.
 //!
-//! The deterministic-simulation suite (`sim_two_node`, `sim_lazy`)
-//! proves the protocol *logic*; this test proves the *transport*: two
+//! The deterministic-simulation suite (`sim_lazy`,
+//! `sim_collection_gossip`) proves the protocol *logic*; this test proves the
+//! *transport*: two
 //! `Peer<Pile>`s — real pile files on disk — run the full production
 //! stack (`transport::iroh::bind_with_endpoint`: embedded DHT node,
 //! protocol router, iroh-gossip topic mesh, OP_AUTH with cap-chain
@@ -11,20 +12,12 @@
 //! no relays, no DNS, no OS sockets — everything above the packet
 //! layer is the production code path).
 //!
-//! Two stages:
-//!
-//! 1. **Eager gossip sync** — a commit on pile A floods the team topic
-//!    as a HEAD frame; B's host walks the reachable closure over
-//!    OP_CHILDREN/OP_GET_BLOB, lands a tracking pin, and
-//!    `merge_tracking_into_local` advances B's local "main" to A's
-//!    head commit.
-//! 2. **Lazy want** — a content blob lives ONLY in pile A
-//!    (never committed to a branch, so eager sync never ships it). B
-//!    durably records a want for its hash; a
-//!    `Reconciler::tick` services the want via the swarm fetch
-//!    (publisher-first: A is known to B from the stage-1 gossip) and
-//!    lands the verified bytes in pile B under the still-recorded
-//!    want.
+//! A content blob lives only in pile A. B durably records a want for its hash;
+//! a `Reconciler::tick` services the want over B's explicitly configured route
+//! to A and lands the verified bytes in pile B under the still-recorded want.
+//! This preserves real-transport, pile persistence, capability authentication,
+//! content verification, and durable-want coverage without depending on the
+//! retired mutable-HEAD/tracking protocol.
 //!
 //! Piles are created under `std::env::temp_dir()` — set `TMPDIR` to
 //! redirect.
@@ -48,13 +41,12 @@ use triblespace_core::inline::{Inline, TryToInline};
 use triblespace_core::prelude::BlobStore;
 use triblespace_core::repo::capability::{self, PERM_ADMIN};
 use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::{BlobStoreGet, BlobStorePut, Repository, WantRequest, WantStore};
+use triblespace_core::repo::{BlobStoreGet, BlobStorePut, WantRequest, WantStore};
 use triblespace_core::trible::TribleSet;
 use triblespace_net::clock;
 use triblespace_net::host;
 use triblespace_net::peer::{Peer, PeerConfig, SyncDirection};
 use triblespace_net::reconcile::Reconciler;
-use triblespace_net::tracking;
 
 fn key(n: u8) -> SigningKey {
     SigningKey::from_bytes(&[n; 32])
@@ -175,10 +167,10 @@ fn init_tracing() {
 
 /// The shared two-node bring-up: team root + two admin caps, two piles
 /// (both seeded with both chains), A up first with no bootstrap, B up
-/// second bootstrapping its gossip mesh + DHT off A.
+/// second with an explicit route to A.
 struct TwoNodes {
-    repo_a: Repository<Peer<Pile>>,
-    repo_b: Repository<Peer<Pile>>,
+    peer_a: Peer<Pile>,
+    peer_b: Peer<Pile>,
     _dir: tempfile::TempDir,
 }
 
@@ -205,96 +197,16 @@ async fn two_nodes(
     let a_id: EndpointAddr = peer_a.id().into();
     let peer_b = bring_up(network, kb, pile_b, team_root, self_cap_b, vec![a_id]).await;
 
-    let repo_a = Repository::new(peer_a, ka.clone(), TribleSet::new()).expect("repo a");
-    let repo_b = Repository::new(peer_b, kb.clone(), TribleSet::new()).expect("repo b");
     TwoNodes {
-        repo_a,
-        repo_b,
+        peer_a,
+        peer_b,
         _dir: dir,
     }
 }
 
-/// Commit on A's "main" and drive both peers until B's local "main"
-/// reaches A's head commit. Returns A's head commit hash. Panics if B
-/// doesn't converge within the tick budget.
-async fn commit_on_a_and_converge(
-    repo_a: &mut Repository<Peer<Pile>>,
-    repo_b: &mut Repository<Peer<Pile>>,
-    msg: &str,
-) -> [u8; 32] {
-    let branch_id = repo_a.ensure_branch("main", None).ok().expect("branch");
-    {
-        let mut ws = repo_a.pull(branch_id).expect("pull");
-        ws.commit(TribleSet::new(), msg);
-        repo_a.push(&mut ws).ok().expect("push");
-    }
-    // A's head COMMIT handle — content-addressed, so seeing it on B is
-    // the exact convergence criterion.
-    let a_head = {
-        let ws = repo_a.pull(branch_id).expect("pull");
-        ws.head().expect("branch has head").raw
-    };
-
-    // Driver loop — mirrors the CLI's `pile net sync`: refresh both
-    // peers (drains gossip → blobs + tracking pins), auto-merge
-    // tracking pins into the same-named local branch. A republishes
-    // periodically so a commit that raced the gossip-mesh join still
-    // floods once B's neighbor link is up (the host's own rebroadcast
-    // tick is 30s — too slow for a test).
-    for tick in 0..600u32 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        repo_a.storage_mut().refresh();
-        if tick % 10 == 5 {
-            repo_a.storage_mut().republish_branches();
-        }
-        repo_b.storage_mut().refresh();
-        for info in tracking::list_tracking_pins(repo_b.storage_mut()) {
-            let _ = tracking::merge_tracking_into_local(repo_b, info.local_id, &info.remote_name);
-        }
-        let b_head = repo_b
-            .lookup_branch("main")
-            .ok()
-            .flatten()
-            .and_then(|id| repo_b.pull(id).ok())
-            .and_then(|ws| ws.head());
-        if b_head.map(|h| h.raw == a_head).unwrap_or(false) {
-            return a_head;
-        }
-    }
-    panic!("B's local main did not reach A's head commit within 30s over the iroh transport");
-}
-
-/// Stage 1: eager gossip sync. Commit on pile A; HEAD gossips over the
-/// real iroh stack; B walks the closure and fast-forwards its "main".
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn eager_gossip_sync_converges_over_iroh() {
-    init_tracing();
-    let network = TestNetwork::new();
-    let ka = key(0xA0);
-    let kb = key(0xB0);
-    let TwoNodes {
-        mut repo_a,
-        mut repo_b,
-        _dir,
-    } = two_nodes(&network, &ka, &kb, |_| {}).await;
-
-    let a_head = commit_on_a_and_converge(&mut repo_a, &mut repo_b, "first fact from A").await;
-
-    // B holds the head commit blob itself (the closure fetch landed
-    // it — not just the branch pointer).
-    let reader = repo_b.storage_mut().reader().expect("b reader");
-    let held: Result<anybytes::Bytes, _> =
-        BlobStoreGet::get::<anybytes::Bytes, UnknownBlob>(&reader, Inline::new(a_head));
-    assert!(
-        held.is_ok(),
-        "B must hold A's head commit blob after eager sync"
-    );
-}
-
-/// Stage 2: the lazy path. A content blob lives ONLY in pile A and is
-/// never committed to a branch — eager sync will never ship it. B
-/// records a durable want; the Reconciler services it via the
-/// swarm fetch and lands the bytes in pile B.
+/// A content blob lives only in pile A. B records a durable want; the
+/// Reconciler services it through the explicitly configured route and lands
+/// the bytes in pile B.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn want_fetches_from_holder_over_iroh() {
     init_tracing();
@@ -302,7 +214,7 @@ async fn want_fetches_from_holder_over_iroh() {
     let ka = key(0xA1);
     let kb = key(0xB1);
 
-    // The lazy payload: a blob in pile A outside any branch history.
+    // The lazy payload: an otherwise unreferenced blob in pile A.
     let payload: TribleSet = {
         use triblespace_core::id::{ExclusiveId, ufoid};
         use triblespace_core::macros::entity;
@@ -317,8 +229,8 @@ async fn want_fetches_from_holder_over_iroh() {
     let hash = blob.get_handle().raw;
 
     let TwoNodes {
-        mut repo_a,
-        mut repo_b,
+        mut peer_a,
+        mut peer_b,
         _dir,
     } = two_nodes(&network, &ka, &kb, |pile| {
         pile.put::<SimpleArchive, _>(blob.clone())
@@ -327,20 +239,9 @@ async fn want_fetches_from_holder_over_iroh() {
     })
     .await;
 
-    // Stage-1 convergence first: proves the mesh is live AND registers
-    // A as a gossip-known publisher on B, so the lazy fetch's
-    // publisher-first path has a live holder to dial (the DHT-provider
-    // route additionally works, but A's initial announce may predate
-    // B's DHT join — publisher-first is the load-bearing route here,
-    // matching the sim suite's `lazy_fetch_uses_gossip_known_publisher_
-    // without_dht`).
-    let _a_head =
-        commit_on_a_and_converge(&mut repo_a, &mut repo_b, "anchor commit for publisher").await;
-
-    // Precondition: B does not hold the payload (it was never
-    // committed, so eager sync had nothing to say about it).
+    // Precondition: B does not hold the payload.
     {
-        let reader = repo_b.storage_mut().reader().expect("b reader");
+        let reader = peer_b.reader().expect("b reader");
         let held: Result<anybytes::Bytes, _> =
             BlobStoreGet::get::<anybytes::Bytes, UnknownBlob>(&reader, Inline::new(hash));
         assert!(
@@ -353,7 +254,6 @@ async fn want_fetches_from_holder_over_iroh() {
     // marker survives a process exit; the Reconciler is the daemon
     // that services the queue.
     {
-        let peer_b = repo_b.storage_mut();
         let mut store = peer_b.store();
         store
             .want(WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(hash)))
@@ -368,8 +268,8 @@ async fn want_fetches_from_holder_over_iroh() {
             .with_fetch_budget(Duration::from_secs(10));
     let mut fetched = false;
     for _ in 0..60u32 {
-        repo_a.storage_mut().refresh(); // keep A serving a fresh snapshot
-        let stats = reconciler.tick(repo_b.storage_mut()).await;
+        peer_a.refresh(); // keep A serving a fresh snapshot
+        let stats = reconciler.tick(&mut peer_b).await;
         if stats.fulfilled >= 1 {
             fetched = true;
             break;
@@ -385,7 +285,7 @@ async fn want_fetches_from_holder_over_iroh() {
 
     // The payload landed in pile B…
     {
-        let reader = repo_b.storage_mut().reader().expect("b reader");
+        let reader = peer_b.reader().expect("b reader");
         let got: anybytes::Bytes =
             BlobStoreGet::get::<anybytes::Bytes, UnknownBlob>(&reader, Inline::new(hash))
                 .expect("B holds the payload after reconcile");
@@ -398,7 +298,6 @@ async fn want_fetches_from_holder_over_iroh() {
     // …and the demand marker is still on record —
     // it is now the retention marker for the fetched blob.
     {
-        let peer_b = repo_b.storage_mut();
         let mut store = peer_b.store();
         let still_wanted = store
             .wants()

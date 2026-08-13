@@ -601,17 +601,13 @@ fn fetch_blob_unavailable_is_clean() {
     });
 }
 
-/// Publisher-first shortcut for read-miss fetches. Gossip already told
-/// B who publishes, so the on-demand fetch must consult that knowledge
-/// instead of always paying the DHT lookup. Proven under a BLACK-HOLE
-/// DHT: previously the on-demand path passed our own id as publisher,
-/// so `providers_for`'s publisher-first branch never fired — this fetch
-/// resolved Unavailable despite a reachable publisher one gossip hop
-/// away. Now the gossip-known publisher serves it directly, no DHT.
+/// Live-neighbor shortcut for read-miss fetches. Gossip topology already told
+/// B that A is dialable, so the on-demand fetch must try that routing hint
+/// before paying the DHT lookup. A neighbor is not presumed to hold the blob:
+/// the ordinary content request and hash verification still decide that.
+/// Proven under a BLACK-HOLE DHT so the neighbor route is load-bearing.
 #[test]
-fn lazy_fetch_uses_gossip_known_publisher_without_dht() {
-    use triblespace_core::id::Id;
-
+fn lazy_fetch_uses_live_gossip_neighbor_without_dht() {
     let _g = sim_guard();
     run_paused(0x60B1_0001, async {
         let net = SimNet::new(
@@ -628,33 +624,20 @@ fn lazy_fetch_uses_gossip_known_publisher_without_dht() {
         let cap_a = admin_cap(&root, &ka);
         let cap_b = admin_cap(&root, &kb);
 
-        // A holds a branch (so it gossips a HEAD — that's how B learns
-        // A is a publisher) plus an ORPHAN content blob outside the
-        // branch closure, so the eager tracking walk cannot land the
-        // fetch target at B behind the test's back.
-        let (branch_blob, _) = content_blob(0x31);
+        // A holds an otherwise unadvertised content blob. With a black-hole
+        // DHT, B can discover a route only from live gossip topology.
         let (orphan_blob, orphan_hash) = content_blob(0x32);
         let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
         store_a
-            .put::<SimpleArchive, _>(branch_blob.clone())
-            .unwrap();
-        store_a
             .put::<SimpleArchive, _>(orphan_blob.clone())
-            .unwrap();
-        store_a
-            .update(
-                Id::new([0x77; 16]).unwrap(),
-                None,
-                Some(branch_blob.get_handle()),
-            )
             .unwrap();
         let store_b = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
 
         let mut peer_a = bring_up(&net, &ka, store_a, team_root, self_cap_of(&cap_a.1), true);
         let mut peer_b = bring_up(&net, &kb, store_b, team_root, self_cap_of(&cap_b.1), true);
 
-        // Settle: A's refresh gossips the branch HEAD; B's host notes A
-        // as a known publisher when the frame arrives.
+        // Settle the gossip mesh so NeighborUp makes A a live routing
+        // candidate at B. No application payload is gossiped.
         for _ in 0..60u32 {
             SimNet::step(&vclock(), Duration::from_millis(20)).await;
             peer_a.refresh();
@@ -664,12 +647,12 @@ fn lazy_fetch_uses_gossip_known_publisher_without_dht() {
             "precondition: the orphan blob never rode the eager walk to B"
         );
 
-        // The DHT is dark, so the ONLY way this fetch can succeed is
-        // the gossip-known-publisher shortcut.
+        // The DHT is dark, so the ONLY way this fetch can succeed is the
+        // live-neighbor route learned independently of payload gossip.
         let got = drive_future(peer_b.fetch_blob(orphan_hash), || peer_a.refresh(), 200)
             .await
             .flatten()
-            .expect("gossip-known publisher must serve the read-miss fetch without the DHT");
+            .expect("live gossip neighbor must serve the read-miss fetch without the DHT");
         assert_eq!(blake3::hash(&got).as_bytes(), &orphan_hash);
     });
 }
@@ -1281,9 +1264,8 @@ fn lazy_fetch_succeeds_across_many_seeds() {
 /// record for a blob the node doesn't hold; the sync daemon's reconcile
 /// tick notices the want, fetches the blob from whoever holds it, and
 /// lands it under the existing want. Strong pins are never touched,
-/// on either side. B runs WITHOUT gossip so the only path the content
-/// can take is the reconcile-driven swarm fetch — no eager branch sync
-/// can satisfy the want behind the test's back.
+/// on either side. B runs WITHOUT gossip, keeping the test focused on the
+/// reconcile-driven content fetch rather than collection-evidence exchange.
 #[test]
 fn reconcile_tick_services_out_of_band_want() {
     use triblespace_core::id::Id;
@@ -1299,8 +1281,8 @@ fn reconcile_tick_services_out_of_band_want() {
         let cap_a = admin_cap(&root, &ka);
         let cap_b = admin_cap(&root, &kb);
 
-        // A holds the blob strong-pinned (a branch head points at it) —
-        // the eager holder whose retention the reconcile must not touch.
+        // A holds the blob under a local strong pin — independent retention
+        // state which B's reconciliation must not touch.
         let (blob, hash) = content_blob(0x21);
         let mut store_a = store_with_caps(&[cap_a.clone(), cap_b.clone()]);
         store_a.put::<SimpleArchive, _>(blob.clone()).unwrap();
@@ -1463,7 +1445,7 @@ fn reconcile_unsatisfiable_want_stays_pending() {
 }
 
 /// The content layer is decoupled from the gossip layer. Under **total
-/// gossip loss** the branch-sync/announce mesh is dark — but the lazy
+/// gossip loss** the collection-evidence mesh is dark — but the lazy
 /// read uses the DHT (a global provider record) plus a direct authed
 /// dial, neither of which is gossip, so it must still succeed. A
 /// regression that accidentally routed content discovery through gossip
