@@ -42,7 +42,7 @@
 //! floods the team topic and arrives through `NetEvent`. Referenced content
 //! remains independently retrievable by hash, normally through durable wants.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use anybytes::Bytes;
@@ -52,7 +52,7 @@ use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{BlobEncoding, IntoBlob, TryFromBlob};
 use triblespace_core::collection::{
-    CollectionCommit, CollectionGossip, CollectionGossipStore, CollectionRecord, CollectionStore,
+    CollectionGossip, CollectionGossipStore, CollectionRecord, CollectionStore,
 };
 use triblespace_core::id::Id;
 use triblespace_core::inline::Inline;
@@ -68,7 +68,7 @@ use crate::channel::{NetEvent, PublisherKey};
 use crate::collection_sync::{
     IncomingBatchCounts, IncomingBatchValidationError, prepare_incoming_collection_batch,
 };
-use crate::collection_wire::CollectionCommitEvidence;
+use crate::collection_wire::{CollectionCommitEvidence, all_grant_backed_commits};
 use crate::host::{self, NetReceiver, NetSender};
 use crate::protocol::RawHash;
 
@@ -100,31 +100,8 @@ where
     S: CollectionGossipStore + CollectionStore,
 {
     let grants: Vec<CollectionGossip> = store.gossips().ok()?.filter_map(Result::ok).collect();
-    let commits: Vec<CollectionCommit> = store
-        .records()
-        .ok()?
-        .filter_map(|record| match record.ok()? {
-            CollectionRecord::Commit(commit) => Some(commit),
-            CollectionRecord::Merge(_) | CollectionRecord::Derive(_) => None,
-        })
-        .collect();
-
-    let valid_grants: BTreeMap<([u8; 32], [u8; 32]), CollectionGossip> = grants
-        .into_iter()
-        .filter(|grant| grant.verify_strict().is_ok())
-        .map(|grant| ((grant.collection().raw, grant.public_key().raw), grant))
-        .collect();
-
-    let mut evidence: Vec<_> = commits
-        .into_iter()
-        .filter_map(|commit| {
-            let grant = valid_grants.get(&(commit.collection().raw, commit.public_key().raw))?;
-            CollectionCommitEvidence::new(*grant, commit).ok()
-        })
-        .collect();
-    evidence.sort_by_key(|item| item.commit().id());
-    evidence.dedup_by_key(|item| item.commit().id());
-    Some(evidence)
+    let records: Vec<CollectionRecord> = store.records().ok()?.filter_map(Result::ok).collect();
+    Some(all_grant_backed_commits(&records, &grants))
 }
 
 /// Canonicalize, strictly verify, and durably admit one gossip drain.
@@ -149,6 +126,22 @@ where
         .authorize(|_, _| Ok::<bool, std::convert::Infallible>(true))
         .expect("infallible evidence-storage policy");
     authorized.admit(store).map_err(anyhow::Error::new)
+}
+
+/// Whether local direction policy admits this incoming event.
+///
+/// Directionality governs replicated data, not the capability control plane:
+/// a pure publisher still has to receive join requests, issued capabilities,
+/// and delivery acknowledgements in order to administer its access policy.
+fn accepts_incoming_event(direction: SyncDirection, event: &NetEvent) -> bool {
+    match event {
+        NetEvent::Blob(_) | NetEvent::CollectionEvidence(_) => {
+            direction != SyncDirection::WriteOnly
+        }
+        NetEvent::CapRequest { .. }
+        | NetEvent::CapDelivered { .. }
+        | NetEvent::CapDeliveryConfirmed { .. } => true,
+    }
 }
 
 /// A store wrapped in distributed network sync.
@@ -486,11 +479,11 @@ where
         let mut incoming_collection_evidence = Vec::new();
         while let Some(event) = self.receiver.try_recv() {
             self.last_event_at = crate::clock::mono_now();
+            if !accepts_incoming_event(self.direction, &event) {
+                continue;
+            }
             match event {
                 NetEvent::Blob(data) => {
-                    if self.direction == SyncDirection::WriteOnly {
-                        continue;
-                    }
                     // `data` is already an anybytes::Bytes (refcounted) —
                     // pass it into the store without re-wrapping.
                     let _ = self
@@ -500,9 +493,7 @@ where
                         .put::<UnknownBlob, Bytes>(data);
                 }
                 NetEvent::CollectionEvidence(evidence) => {
-                    if self.direction != SyncDirection::WriteOnly {
-                        incoming_collection_evidence.push(evidence);
-                    }
+                    incoming_collection_evidence.push(evidence);
                 }
                 NetEvent::CapRequest {
                     requester,
@@ -1258,7 +1249,9 @@ where
 mod collection_gossip_tests {
     use std::convert::Infallible;
 
-    use triblespace_core::collection::{CollectionData, CollectionId, empty_metadata_handle};
+    use triblespace_core::collection::{
+        CollectionCommit, CollectionData, CollectionId, empty_metadata_handle,
+    };
 
     use super::*;
 
@@ -1397,6 +1390,51 @@ mod collection_gossip_tests {
         assert_eq!(store.records.len(), 2);
         assert_eq!(store.grants, vec![grant]);
         assert_eq!(store.flushes, 1);
+    }
+
+    #[test]
+    fn write_only_rejects_replication_data_but_keeps_capability_control() {
+        let author = SigningKey::from_bytes(&[10; 32]);
+        let collection = collection(4);
+        let grant = CollectionGossip::sign(&author, collection);
+        let evidence =
+            CollectionCommitEvidence::new(grant, commit(&author, collection, 1)).unwrap();
+        let bytes = Bytes::from(vec![1, 2, 3]);
+
+        let cases = [
+            (NetEvent::Blob(bytes.clone()), false),
+            (NetEvent::CollectionEvidence(evidence), false),
+            (
+                NetEvent::CapRequest {
+                    requester: [1; 32],
+                    partial_cap_bytes: bytes.clone(),
+                },
+                true,
+            ),
+            (
+                NetEvent::CapDelivered {
+                    issuer: [2; 32],
+                    cap_bytes: bytes.clone(),
+                    sig_bytes: bytes,
+                },
+                true,
+            ),
+            (
+                NetEvent::CapDeliveryConfirmed {
+                    subject: [3; 32],
+                    sig_handle: [4; 32],
+                },
+                true,
+            ),
+        ];
+
+        for (event, expected) in cases {
+            assert_eq!(
+                accepts_incoming_event(SyncDirection::WriteOnly, &event),
+                expected,
+                "unexpected WriteOnly policy for {event:?}"
+            );
+        }
     }
 }
 

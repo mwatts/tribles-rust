@@ -23,7 +23,7 @@ use triblespace_core::repo::{WANT_REQUEST_BYTES_LEN, WantRequest};
 use crate::channel::{NetCommand, NetEvent, PublisherKey};
 use crate::collection_wire::{
     COLLECTION_COMMIT_EVIDENCE_LEN, CollectionCommitEvidence, CollectionOperationReceiptResponse,
-    collection_operation_receipts, decode_collection_operation_request,
+    all_grant_backed_commits, collection_operation_receipts, decode_collection_operation_request,
     encode_collection_operation_receipts, grant_backed_commits, op_collection_operation_receipts,
 };
 use crate::identity::iroh_secret;
@@ -281,26 +281,7 @@ where
     }
 
     fn all_collection_evidence(&self) -> Vec<CollectionCommitEvidence> {
-        let grants: std::collections::BTreeMap<([u8; 32], [u8; 32]), CollectionGossip> = self
-            .collection_gossips
-            .iter()
-            .copied()
-            .filter(|grant| grant.verify_strict().is_ok())
-            .map(|grant| ((grant.collection().raw, grant.public_key().raw), grant))
-            .collect();
-
-        self.collection_records
-            .iter()
-            .filter_map(|record| match record {
-                CollectionRecord::Commit(commit) => grants
-                    .get(&(commit.collection().raw, commit.public_key().raw))
-                    .and_then(|grant| CollectionCommitEvidence::new(*grant, *commit).ok()),
-                CollectionRecord::Merge(_) | CollectionRecord::Derive(_) => None,
-            })
-            .map(|evidence| (evidence.commit().id(), evidence))
-            .collect::<std::collections::BTreeMap<_, _>>()
-            .into_values()
-            .collect()
+        all_grant_backed_commits(&self.collection_records, &self.collection_gossips)
     }
 
     fn collection_operation_receipts(&self, request: WantRequest) -> Vec<CollectionRecord> {

@@ -534,36 +534,47 @@ impl Error for CollectionCommitEvidenceError {
     }
 }
 
-/// Deterministically pair valid commits with valid same-author grants for one
-/// exact collection. Malformed or unrelated structural evidence is inert and
-/// omitted; clients independently verify every returned item.
-pub(crate) fn grant_backed_commits(
+/// Deterministically pair every valid commit with a valid same-author grant.
+/// Malformed structural evidence is inert and omitted; clients independently
+/// verify every returned item.
+pub(crate) fn all_grant_backed_commits(
     records: &[CollectionRecord],
     grants: &[CollectionGossip],
-    collection: CollectionId,
 ) -> Vec<CollectionCommitEvidence> {
-    let valid_grants: BTreeMap<[u8; 32], CollectionGossip> = grants
+    let valid_grants: BTreeMap<([u8; 32], [u8; 32]), CollectionGossip> = grants
         .iter()
         .copied()
-        .filter(|grant| grant.collection() == collection && grant.verify_strict().is_ok())
-        .map(|grant| (grant.public_key().raw, grant))
+        .filter(|grant| grant.verify_strict().is_ok())
+        .map(|grant| ((grant.collection().raw, grant.public_key().raw), grant))
         .collect();
 
     let mut evidence: Vec<_> = records
         .iter()
         .filter_map(|record| match record {
-            CollectionRecord::Commit(commit) if commit.collection() == collection => {
-                let grant = valid_grants.get(&commit.public_key().raw)?;
+            CollectionRecord::Commit(commit) => {
+                let grant =
+                    valid_grants.get(&(commit.collection().raw, commit.public_key().raw))?;
                 CollectionCommitEvidence::new(*grant, *commit).ok()
             }
-            CollectionRecord::Commit(_)
-            | CollectionRecord::Merge(_)
-            | CollectionRecord::Derive(_) => None,
+            CollectionRecord::Merge(_) | CollectionRecord::Derive(_) => None,
         })
         .collect();
     evidence.sort_by_key(|item| item.commit.id());
     evidence.dedup_by_key(|item| item.commit.id());
     evidence
+}
+
+/// Deterministically pair valid commits with valid same-author grants for one
+/// exact collection.
+pub(crate) fn grant_backed_commits(
+    records: &[CollectionRecord],
+    grants: &[CollectionGossip],
+    collection: CollectionId,
+) -> Vec<CollectionCommitEvidence> {
+    all_grant_backed_commits(records, grants)
+        .into_iter()
+        .filter(|evidence| evidence.commit().collection() == collection)
+        .collect()
 }
 
 /// Enumerate strictly framed evidence for one exact collection over an
