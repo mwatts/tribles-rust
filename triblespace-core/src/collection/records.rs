@@ -1,17 +1,15 @@
-//! Canonical `SimpleArchive` records for the top-level collection calculus.
+//! Dense typed records for the top-level collection calculus.
 //!
-//! A record is exactly one intrinsically identified entity. The entity's
-//! complete fact set is its wire representation; there are no packed side
-//! descriptors and no mutable head hidden inside the codec. [`CollectionCommit`]
-//! is the sole signed, exogenous membership assertion. [`CollectionMerge`] and
-//! [`CollectionDerive`] are unsigned construction equations whose semantic
-//! validity is checked by the representation/recipe implementation above this
-//! module.
+//! [`CollectionCommit`], [`CollectionMerge`], and [`CollectionDerive`] are
+//! native algebra records, not graph data. Their canonical representations are
+//! the fixed-width byte layouts exposed by their `to_bytes`/`from_bytes`
+//! methods. Only [`CollectionDescriptor`] remains a self-describing
+//! [`SimpleArchive`]: its blob handle is the collection identity.
 //!
-//! Decoding and semantic verification are deliberately separate. Decoding
-//! checks the canonical `SimpleArchive`, one-root shape, exact field arity,
-//! record-kind tag, and intrinsic reconstruction. A decoded commit can still
-//! carry an invalid public key or signature; [`CollectionCommit::verify_strict`]
+//! Structural decoding and semantic verification are deliberately separate.
+//! Every fixed-width commit or derive payload has a structural representation;
+//! a merge additionally rejects noncanonical input order. A decoded commit can
+//! still carry an invalid public key or signature; [`CollectionCommit::verify_strict`]
 //! performs that cryptographic check over a fixed, domain-separated transcript.
 
 use std::error::Error;
@@ -21,7 +19,6 @@ use ed25519::signature::Signer;
 use ed25519::Signature;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
-use crate::attestation::{signature_r, signature_s, signed_by};
 use crate::attribute::Attribute;
 use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
 use crate::blob::{Blob, TryFromBlob};
@@ -31,7 +28,7 @@ use crate::inline::encodings::ed25519::{ED25519PublicKey, ED25519RComponent, ED2
 use crate::inline::encodings::genid::{GenId, IdParseError};
 use crate::inline::encodings::hash::{Blake3, Handle, Hash};
 use crate::inline::{Inline, InlineEncoding};
-use crate::metadata::{self, archive as commit_metadata};
+use crate::metadata;
 use crate::prelude::{attributes, entity};
 use crate::trible::{Fragment, TribleSet, TRIBLE_LEN};
 
@@ -39,27 +36,33 @@ use crate::trible::{Fragment, TribleSet, TRIBLE_LEN};
 ///
 /// Minted with `trible genid` on 2026-08-07.
 pub const KIND_COLLECTION_DESCRIPTOR: Id = id_hex!("C5E238729BB95FA4A55E3939B11B3C29");
-/// Tag identifying a signed `COMMIT(descriptor, data, metadata)` assertion.
+/// Stable semantic kind of a signed `COMMIT(descriptor, data, metadata)` assertion.
 ///
 /// Minted with `trible genid` on 2026-08-11.
 pub const KIND_COLLECTION_COMMIT: Id = id_hex!("B34817308188C4515A3C51967A91A603");
-/// Tag identifying an unsigned commutative `MERGE` equation.
+/// Stable semantic kind of an unsigned commutative `MERGE` equation.
 ///
 /// Minted with `trible genid` on 2026-08-11.
 pub const KIND_COLLECTION_MERGE: Id = id_hex!("5F20FFC64313969B7E046A7677874D39");
-/// Tag identifying an unsigned `DERIVE` equation.
+/// Stable semantic kind of an unsigned `DERIVE` equation.
 ///
 /// Minted with `trible genid` on 2026-08-11.
 pub const KIND_COLLECTION_DERIVE: Id = id_hex!("6DB0214CB4F3BD8259F0117CDC127331");
 
 /// Byte length of a canonical collection-descriptor `SimpleArchive`.
 pub const COLLECTION_DESCRIPTOR_ARCHIVE_LEN: u64 = (4 * TRIBLE_LEN) as u64;
-/// Byte length of a canonical signed-commit `SimpleArchive`.
-pub const COLLECTION_COMMIT_ARCHIVE_LEN: u64 = (7 * TRIBLE_LEN) as u64;
-/// Byte length of a canonical merge-claim `SimpleArchive`.
-pub const COLLECTION_MERGE_ARCHIVE_LEN: u64 = (5 * TRIBLE_LEN) as u64;
-/// Byte length of a canonical derive-claim `SimpleArchive`.
-pub const COLLECTION_DERIVE_ARCHIVE_LEN: u64 = (5 * TRIBLE_LEN) as u64;
+/// Byte length of a dense signed commit.
+pub const COLLECTION_COMMIT_BYTES_LEN: usize = 6 * 32;
+/// Byte length of a dense merge equation.
+pub const COLLECTION_MERGE_BYTES_LEN: usize = 4 * 32;
+/// Byte length of a dense derive equation.
+pub const COLLECTION_DERIVE_BYTES_LEN: usize = 4 * 32;
+
+/// Version of collection-record identity derivation.
+pub const COLLECTION_RECORD_ID_VERSION: u32 = 1;
+
+/// Domain prefix of collection-record identity derivation.
+pub const COLLECTION_RECORD_ID_DOMAIN: &[u8] = b"triblespace.collection.record.id";
 
 attributes! {
     /// Stable extrinsic dataset scope shared by related representations.
@@ -71,33 +74,6 @@ attributes! {
     /// Canonical recipe governing construction and merge for this collection.
     /// Minted with `trible genid` on 2026-08-07.
     "5D338C58D897B969BE1AE0956CCFE301" unsafe as pub collection_recipe: GenId;
-    /// Canonical descriptor of the collection participating in a `COMMIT` or `MERGE`.
-    /// Minted with `trible genid` on 2026-08-11.
-    "23F6AF53CBFFECC96E960AB191C0D134" as pub collection_descriptor: Handle<SimpleArchive>;
-    /// Content hash asserted as a collection member by a signed `COMMIT`.
-    /// Minted with `trible genid` on 2026-08-07.
-    "38DACE0F58C43D05CBCE06F7AB12C023" unsafe as pub data: Hash<Blake3>;
-    /// Canonically lower input of a commutative `MERGE`.
-    /// Minted with `trible genid` on 2026-08-07.
-    "9FCB0E212B790CD13789ECE7319F7C59" unsafe as pub merge_low: Hash<Blake3>;
-    /// Canonically higher input of a commutative `MERGE`.
-    /// Minted with `trible genid` on 2026-08-07.
-    "2DD133FBB7084D04920D488B34823295" unsafe as pub merge_high: Hash<Blake3>;
-    /// Exact result of a commutative `MERGE`.
-    /// Minted with `trible genid` on 2026-08-07.
-    "7B05303C15B05973D2C8A85615C0E81F" unsafe as pub merge_result: Hash<Blake3>;
-    /// Canonical source descriptor of a `DERIVE` equation.
-    /// Minted with `trible genid` on 2026-08-11.
-    "46EA9036B272695FDF97DBBAFFEBA6F1" as pub derive_source_descriptor: Handle<SimpleArchive>;
-    /// Canonical target descriptor of a `DERIVE` equation.
-    /// Minted with `trible genid` on 2026-08-11.
-    "5735BB53156B5CAA35F30E574378C499" as pub derive_target_descriptor: Handle<SimpleArchive>;
-    /// Source element of a `DERIVE` equation.
-    /// Minted with `trible genid` on 2026-08-07.
-    "19AD8BC87A6F3D3E6B8D1647AB1D6878" unsafe as pub derive_input: Hash<Blake3>;
-    /// Exact target element of a `DERIVE` equation.
-    /// Minted with `trible genid` on 2026-08-07.
-    "9C54FEF362965976CF697669BCB1C2FD" unsafe as pub derive_output: Hash<Blake3>;
 }
 
 /// Type-erased content identity of one collection element.
@@ -161,6 +137,12 @@ pub enum RecordDecodeError {
     NonCanonicalRoot { stored: Id, expected: Id },
     /// The archive contained a fact outside the exact canonical record shape.
     NonCanonicalFacts,
+    /// A dense record had no kind byte or the wrong payload length.
+    InvalidLength { expected: usize, actual: usize },
+    /// A tagged dense record used an unknown variant byte.
+    UnknownKind(u8),
+    /// A merge payload did not carry its inputs in ascending digest order.
+    NonCanonicalMergeInputs,
 }
 
 impl fmt::Display for RecordDecodeError {
@@ -186,6 +168,16 @@ impl fmt::Display for RecordDecodeError {
             ),
             Self::NonCanonicalFacts => {
                 write!(f, "collection record contains noncanonical or extra facts")
+            }
+            Self::InvalidLength { expected, actual } => write!(
+                f,
+                "collection record has {actual} bytes; expected exactly {expected}"
+            ),
+            Self::UnknownKind(kind) => {
+                write!(f, "collection record has unknown dense kind {kind}")
+            }
+            Self::NonCanonicalMergeInputs => {
+                write!(f, "collection merge inputs are not canonically ordered")
             }
         }
     }
@@ -317,7 +309,7 @@ impl CollectionDescriptor {
 /// Signed exogenous membership assertion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CollectionCommit {
-    root: Id,
+    id: Id,
     collection: CollectionId,
     data: CollectionData,
     metadata: Inline<Handle<SimpleArchive>>,
@@ -355,7 +347,7 @@ impl CollectionCommit {
         r_component: Inline<ED25519RComponent>,
         s_component: Inline<ED25519SComponent>,
     ) -> Self {
-        let fragment = commit_fragment(
+        let bytes = commit_bytes(
             collection,
             data_hash,
             metadata,
@@ -363,9 +355,9 @@ impl CollectionCommit {
             r_component,
             s_component,
         );
-        let root = fragment.root().expect("collection commit is rooted");
+        let id = collection_record_id(KIND_COLLECTION_COMMIT, &bytes);
         Self {
-            root,
+            id,
             collection,
             data: data_hash,
             metadata,
@@ -375,33 +367,19 @@ impl CollectionCommit {
         }
     }
 
-    /// Decode exact record structure without trusting its signature.
-    pub fn decode(blob: &Blob<SimpleArchive>) -> Result<Self, RecordDecodeError> {
-        let facts = decode_archive(blob)?;
-        Self::from_tribles(&facts)
-    }
-
-    /// Decode exact record structure from an already parsed set.
+    /// Decode one exact dense payload without trusting its signature.
     ///
-    /// This deliberately does not call [`verify_strict`](Self::verify_strict).
-    pub fn from_tribles(facts: &TribleSet) -> Result<Self, RecordDecodeError> {
-        let root = record_root_and_kind(facts, KIND_COLLECTION_COMMIT)?;
-        let collection = one_inline(facts, &collection_descriptor, "collection_descriptor")?;
-        let data_hash = one_inline(facts, &data, "data")?;
-        let metadata = one_inline(facts, &commit_metadata, "metadata")?;
-        let public_key = one_inline(facts, &signed_by, "signed_by")?;
-        let r_component = one_inline(facts, &signature_r, "signature_r")?;
-        let s_component = one_inline(facts, &signature_s, "signature_s")?;
-        let record = Self::from_parts(
-            collection,
-            data_hash,
-            metadata,
-            public_key,
-            r_component,
-            s_component,
-        );
-        ensure_canonical(facts, root, record.root, record.to_tribles())?;
-        Ok(record)
+    /// Every byte string of this fixed size has a structural representation;
+    /// invalid public keys and signatures are rejected by [`verify_strict`](Self::verify_strict).
+    pub fn from_bytes(bytes: [u8; COLLECTION_COMMIT_BYTES_LEN]) -> Self {
+        Self::from_parts(
+            Inline::new(field(&bytes, 0)),
+            Inline::new(field(&bytes, 1)),
+            Inline::new(field(&bytes, 2)),
+            Inline::new(field(&bytes, 3)),
+            Inline::new(field(&bytes, 4)),
+            Inline::new(field(&bytes, 5)),
+        )
     }
 
     /// Strictly verify the Ed25519 signature over the canonical transcript.
@@ -424,7 +402,7 @@ impl CollectionCommit {
 
     /// Intrinsic record id.
     pub fn id(&self) -> Id {
-        self.root
+        self.id
     }
 
     /// Collection receiving the asserted member.
@@ -452,9 +430,9 @@ impl CollectionCommit {
         (self.signature_r, self.signature_s)
     }
 
-    /// Reconstruct the exact one-root trible record.
-    pub fn to_tribles(&self) -> TribleSet {
-        commit_fragment(
+    /// Encode this record into its exact dense 192-byte layout.
+    pub fn to_bytes(&self) -> [u8; COLLECTION_COMMIT_BYTES_LEN] {
+        commit_bytes(
             self.collection,
             self.data,
             self.metadata,
@@ -462,19 +440,13 @@ impl CollectionCommit {
             self.signature_r,
             self.signature_s,
         )
-        .into_facts()
-    }
-
-    /// Encode the record as a canonical `SimpleArchive`.
-    pub fn to_blob(&self) -> Blob<SimpleArchive> {
-        encode_archive(self.to_tribles())
     }
 }
 
 /// Unsigned exact join equation inside one collection lattice.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CollectionMerge {
-    root: Id,
+    id: Id,
     collection: CollectionId,
     low: CollectionData,
     high: CollectionData,
@@ -501,10 +473,10 @@ impl CollectionMerge {
         high: CollectionData,
         result: CollectionData,
     ) -> Self {
-        let fragment = merge_fragment(collection, low, high, result);
-        let root = fragment.root().expect("collection merge is rooted");
+        let bytes = merge_bytes(collection, low, high, result);
+        let id = collection_record_id(KIND_COLLECTION_MERGE, &bytes);
         Self {
-            root,
+            id,
             collection,
             low,
             high,
@@ -512,27 +484,25 @@ impl CollectionMerge {
         }
     }
 
-    /// Decode an exact, canonically ordered merge record.
-    pub fn decode(blob: &Blob<SimpleArchive>) -> Result<Self, RecordDecodeError> {
-        let facts = decode_archive(blob)?;
-        Self::from_tribles(&facts)
-    }
-
-    /// Decode an exact, canonically ordered merge from an already parsed set.
-    pub fn from_tribles(facts: &TribleSet) -> Result<Self, RecordDecodeError> {
-        let root = record_root_and_kind(facts, KIND_COLLECTION_MERGE)?;
-        let collection = one_inline(facts, &collection_descriptor, "collection_descriptor")?;
-        let low = one_inline(facts, &merge_low, "merge_low")?;
-        let high = one_inline(facts, &merge_high, "merge_high")?;
-        let result = one_inline(facts, &merge_result, "merge_result")?;
-        let record = Self::new(collection, low, high, result);
-        ensure_canonical(facts, root, record.root, record.to_tribles())?;
-        Ok(record)
+    /// Decode one exact, canonically ordered dense merge payload.
+    pub fn from_bytes(bytes: [u8; COLLECTION_MERGE_BYTES_LEN]) -> Result<Self, RecordDecodeError> {
+        let collection = Inline::new(field(&bytes, 0));
+        let low = Inline::new(field(&bytes, 1));
+        let high = Inline::new(field(&bytes, 2));
+        if high < low {
+            return Err(RecordDecodeError::NonCanonicalMergeInputs);
+        }
+        Ok(Self::from_ordered(
+            collection,
+            low,
+            high,
+            Inline::new(field(&bytes, 3)),
+        ))
     }
 
     /// Intrinsic record id.
     pub fn id(&self) -> Id {
-        self.root
+        self.id
     }
 
     /// Collection whose join law is asserted.
@@ -550,14 +520,9 @@ impl CollectionMerge {
         self.result
     }
 
-    /// Reconstruct the exact one-root trible record.
-    pub fn to_tribles(&self) -> TribleSet {
-        merge_fragment(self.collection, self.low, self.high, self.result).into_facts()
-    }
-
-    /// Encode the record as a canonical `SimpleArchive`.
-    pub fn to_blob(&self) -> Blob<SimpleArchive> {
-        encode_archive(self.to_tribles())
+    /// Encode this equation into its exact dense 128-byte layout.
+    pub fn to_bytes(&self) -> [u8; COLLECTION_MERGE_BYTES_LEN] {
+        merge_bytes(self.collection, self.low, self.high, self.result)
     }
 }
 
@@ -565,7 +530,7 @@ impl CollectionMerge {
 /// two collection lattices.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CollectionDerive {
-    root: Id,
+    id: Id,
     source: CollectionId,
     target: CollectionId,
     input: CollectionData,
@@ -580,10 +545,10 @@ impl CollectionDerive {
         input: CollectionData,
         output: CollectionData,
     ) -> Self {
-        let fragment = derive_fragment(source, target, input, output);
-        let root = fragment.root().expect("collection derivation is rooted");
+        let bytes = derive_bytes(source, target, input, output);
+        let id = collection_record_id(KIND_COLLECTION_DERIVE, &bytes);
         Self {
-            root,
+            id,
             source,
             target,
             input,
@@ -591,27 +556,19 @@ impl CollectionDerive {
         }
     }
 
-    /// Decode an exact derivation record.
-    pub fn decode(blob: &Blob<SimpleArchive>) -> Result<Self, RecordDecodeError> {
-        let facts = decode_archive(blob)?;
-        Self::from_tribles(&facts)
-    }
-
-    /// Decode an exact derivation from an already parsed set.
-    pub fn from_tribles(facts: &TribleSet) -> Result<Self, RecordDecodeError> {
-        let root = record_root_and_kind(facts, KIND_COLLECTION_DERIVE)?;
-        let source = one_inline(facts, &derive_source_descriptor, "derive_source_descriptor")?;
-        let target = one_inline(facts, &derive_target_descriptor, "derive_target_descriptor")?;
-        let input = one_inline(facts, &derive_input, "derive_input")?;
-        let output = one_inline(facts, &derive_output, "derive_output")?;
-        let record = Self::new(source, target, input, output);
-        ensure_canonical(facts, root, record.root, record.to_tribles())?;
-        Ok(record)
+    /// Decode one exact dense derive payload.
+    pub fn from_bytes(bytes: [u8; COLLECTION_DERIVE_BYTES_LEN]) -> Self {
+        Self::new(
+            Inline::new(field(&bytes, 0)),
+            Inline::new(field(&bytes, 1)),
+            Inline::new(field(&bytes, 2)),
+            Inline::new(field(&bytes, 3)),
+        )
     }
 
     /// Intrinsic record id.
     pub fn id(&self) -> Id {
-        self.root
+        self.id
     }
 
     /// Source collection.
@@ -629,19 +586,13 @@ impl CollectionDerive {
         (self.input, self.output)
     }
 
-    /// Reconstruct the exact one-root trible record.
-    pub fn to_tribles(&self) -> TribleSet {
-        derive_fragment(self.source, self.target, self.input, self.output).into_facts()
-    }
-
-    /// Encode the record as a canonical `SimpleArchive`.
-    pub fn to_blob(&self) -> Blob<SimpleArchive> {
-        encode_archive(self.to_tribles())
+    /// Encode this equation into its exact dense 128-byte layout.
+    pub fn to_bytes(&self) -> [u8; COLLECTION_DERIVE_BYTES_LEN] {
+        derive_bytes(self.source, self.target, self.input, self.output)
     }
 }
 
-/// A structurally canonical collection record classified by its
-/// [`metadata::tag`].
+/// A structurally canonical native collection record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CollectionRecord {
     /// Signed membership assertion whose embedded signature can be verified.
@@ -653,32 +604,33 @@ pub enum CollectionRecord {
 }
 
 impl CollectionRecord {
-    /// Decode a candidate archive once, then dispatch by its record-kind tag.
+    /// Decode the self-tagged dense form used by generic record stores.
     ///
-    /// Archives without a recognized collection tag return `Ok(None)` so a
-    /// heterogeneous blob store can be scanned without treating unrelated
-    /// records as errors. A recognized tag selects the exact structural
-    /// decoder for that kind.
-    pub fn decode(blob: &Blob<SimpleArchive>) -> Result<Option<Self>, RecordDecodeError> {
-        let facts = decode_archive(blob)?;
-        Self::from_tribles(&facts)
-    }
-
-    /// Classify and decode an already parsed fact set by its record-kind tag.
-    pub fn from_tribles(facts: &TribleSet) -> Result<Option<Self>, RecordDecodeError> {
-        let Some(kind) = known_record_kind(facts) else {
-            return Ok(None);
+    /// The first byte identifies the variant; the remainder is that variant's
+    /// exact untagged payload. Typed protocols should use the concrete record
+    /// codecs directly and avoid this extra byte.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, RecordDecodeError> {
+        let Some((&kind, payload)) = bytes.split_first() else {
+            return Err(RecordDecodeError::InvalidLength {
+                expected: 1,
+                actual: 0,
+            });
         };
-
-        let record = if kind == KIND_COLLECTION_COMMIT {
-            Self::Commit(CollectionCommit::from_tribles(facts)?)
-        } else if kind == KIND_COLLECTION_MERGE {
-            Self::Merge(CollectionMerge::from_tribles(facts)?)
-        } else {
-            debug_assert_eq!(kind, KIND_COLLECTION_DERIVE);
-            Self::Derive(CollectionDerive::from_tribles(facts)?)
-        };
-        Ok(Some(record))
+        match kind {
+            COLLECTION_RECORD_KIND_COMMIT_V1 => {
+                let bytes = exact_array::<COLLECTION_COMMIT_BYTES_LEN>(payload)?;
+                Ok(Self::Commit(CollectionCommit::from_bytes(bytes)))
+            }
+            COLLECTION_RECORD_KIND_MERGE_V1 => {
+                let bytes = exact_array::<COLLECTION_MERGE_BYTES_LEN>(payload)?;
+                Ok(Self::Merge(CollectionMerge::from_bytes(bytes)?))
+            }
+            COLLECTION_RECORD_KIND_DERIVE_V1 => {
+                let bytes = exact_array::<COLLECTION_DERIVE_BYTES_LEN>(payload)?;
+                Ok(Self::Derive(CollectionDerive::from_bytes(bytes)))
+            }
+            unknown => Err(RecordDecodeError::UnknownKind(unknown)),
+        }
     }
 
     /// Intrinsic id of the decoded record entity.
@@ -690,15 +642,31 @@ impl CollectionRecord {
         }
     }
 
-    /// Encode this record as its canonical one-entity `SimpleArchive`.
-    pub fn to_blob(&self) -> Blob<SimpleArchive> {
+    /// Encode the self-tagged dense form used by generic record stores.
+    pub fn to_bytes(&self) -> Vec<u8> {
         match self {
-            Self::Commit(record) => record.to_blob(),
-            Self::Merge(record) => record.to_blob(),
-            Self::Derive(record) => record.to_blob(),
+            Self::Commit(record) => {
+                tagged_bytes(COLLECTION_RECORD_KIND_COMMIT_V1, &record.to_bytes())
+            }
+            Self::Merge(record) => {
+                tagged_bytes(COLLECTION_RECORD_KIND_MERGE_V1, &record.to_bytes())
+            }
+            Self::Derive(record) => {
+                tagged_bytes(COLLECTION_RECORD_KIND_DERIVE_V1, &record.to_bytes())
+            }
         }
     }
 }
+
+/// Dense generic-store tag for the version-1 [`CollectionRecord::Commit`] layout.
+///
+/// A future payload layout allocates a new tag rather than reinterpreting this
+/// one, so stored bytes remain self-versioning without a second prefix byte.
+pub const COLLECTION_RECORD_KIND_COMMIT_V1: u8 = 1;
+/// Dense generic-store tag for the version-1 [`CollectionRecord::Merge`] layout.
+pub const COLLECTION_RECORD_KIND_MERGE_V1: u8 = 2;
+/// Dense generic-store tag for the version-1 [`CollectionRecord::Derive`] layout.
+pub const COLLECTION_RECORD_KIND_DERIVE_V1: u8 = 3;
 
 fn collection_fragment(scope: Id, representation: Id, recipe: Id) -> Fragment {
     entity! {
@@ -709,53 +677,83 @@ fn collection_fragment(scope: Id, representation: Id, recipe: Id) -> Fragment {
     }
 }
 
-fn commit_fragment(
+fn commit_bytes(
     collection: CollectionId,
     data_hash: CollectionData,
     metadata_handle: Inline<Handle<SimpleArchive>>,
     public_key: Inline<ED25519PublicKey>,
     r: Inline<ED25519RComponent>,
     s: Inline<ED25519SComponent>,
-) -> Fragment {
-    entity! {
-        metadata::tag: KIND_COLLECTION_COMMIT,
-        collection_descriptor: collection,
-        data: data_hash,
-        commit_metadata: metadata_handle,
-        signed_by: public_key,
-        signature_r: r,
-        signature_s: s,
-    }
+) -> [u8; COLLECTION_COMMIT_BYTES_LEN] {
+    concat_fields([
+        collection.raw,
+        data_hash.raw,
+        metadata_handle.raw,
+        public_key.raw,
+        r.raw,
+        s.raw,
+    ])
 }
 
-fn merge_fragment(
+fn merge_bytes(
     collection: CollectionId,
     low: CollectionData,
     high: CollectionData,
     result: CollectionData,
-) -> Fragment {
-    entity! {
-        metadata::tag: KIND_COLLECTION_MERGE,
-        collection_descriptor: collection,
-        merge_low: low,
-        merge_high: high,
-        merge_result: result,
-    }
+) -> [u8; COLLECTION_MERGE_BYTES_LEN] {
+    concat_fields([collection.raw, low.raw, high.raw, result.raw])
 }
 
-fn derive_fragment(
+fn derive_bytes(
     source: CollectionId,
     target: CollectionId,
     input: CollectionData,
     output: CollectionData,
-) -> Fragment {
-    entity! {
-        metadata::tag: KIND_COLLECTION_DERIVE,
-        derive_source_descriptor: source,
-        derive_target_descriptor: target,
-        derive_input: input,
-        derive_output: output,
+) -> [u8; COLLECTION_DERIVE_BYTES_LEN] {
+    concat_fields([source.raw, target.raw, input.raw, output.raw])
+}
+
+fn collection_record_id(kind: Id, payload: &[u8]) -> Id {
+    let mut hasher = Blake3::new();
+    hasher.update(COLLECTION_RECORD_ID_DOMAIN);
+    hasher.update(&COLLECTION_RECORD_ID_VERSION.to_be_bytes());
+    hasher.update(&kind.raw());
+    hasher.update(payload);
+    let digest = hasher.finalize();
+    let mut raw = [0u8; 16];
+    raw.copy_from_slice(&digest[digest.len() - 16..]);
+    Id::new(raw).expect("BLAKE3-derived collection record ids must be non-nil")
+}
+
+fn concat_fields<const N: usize, const OUT: usize>(fields: [[u8; 32]; N]) -> [u8; OUT] {
+    debug_assert_eq!(OUT, N * 32);
+    let mut bytes = [0u8; OUT];
+    for (index, value) in fields.into_iter().enumerate() {
+        bytes[index * 32..(index + 1) * 32].copy_from_slice(&value);
     }
+    bytes
+}
+
+fn field<const N: usize>(bytes: &[u8; N], index: usize) -> [u8; 32] {
+    bytes[index * 32..(index + 1) * 32]
+        .try_into()
+        .expect("fixed dense record field")
+}
+
+fn exact_array<const N: usize>(bytes: &[u8]) -> Result<[u8; N], RecordDecodeError> {
+    bytes
+        .try_into()
+        .map_err(|_| RecordDecodeError::InvalidLength {
+            expected: N,
+            actual: bytes.len(),
+        })
+}
+
+fn tagged_bytes(kind: u8, payload: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(1 + payload.len());
+    bytes.push(kind);
+    bytes.extend_from_slice(payload);
+    bytes
 }
 
 fn commit_transcript(
@@ -800,24 +798,6 @@ fn record_root_and_kind(facts: &TribleSet, expected: Id) -> Result<Id, RecordDec
         return Err(RecordDecodeError::WrongKind { expected, actual });
     }
     Ok(root)
-}
-
-fn known_record_kind(facts: &TribleSet) -> Option<Id> {
-    facts
-        .iter()
-        .filter(|fact| fact.a() == &metadata::tag.id())
-        .filter_map(|fact| {
-            (*fact.v::<GenId>())
-                .try_from_inline::<Id>()
-                .map_err(|_: IdParseError| ())
-                .ok()
-        })
-        .find(|kind| {
-            matches!(
-                *kind,
-                KIND_COLLECTION_COMMIT | KIND_COLLECTION_MERGE | KIND_COLLECTION_DERIVE
-            )
-        })
 }
 
 fn one_id(
@@ -879,9 +859,6 @@ mod tests {
     use hex_literal::hex;
 
     use crate::id::Id;
-    use crate::inline::encodings::shortstring::ShortString;
-    use crate::inline::IntoInline;
-    use crate::trible::Trible;
 
     fn id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
@@ -910,7 +887,6 @@ mod tests {
         assert_ne!(a.handle(), d.handle());
         assert_eq!(CollectionDescriptor::decode(&a.to_blob()).unwrap(), a);
         assert!(a.to_tribles().iter().all(|fact| fact.e() == &a.entity_id()));
-        assert_eq!(CollectionRecord::decode(&a.to_blob()).unwrap(), None);
     }
 
     #[test]
@@ -935,8 +911,8 @@ mod tests {
         let first = CollectionCommit::sign(&key, collection(1), hash(2), empty_metadata_handle());
         let retry = CollectionCommit::sign(&key, collection(1), hash(2), empty_metadata_handle());
         assert_eq!(first, retry);
-        assert_eq!(first.to_blob().bytes, retry.to_blob().bytes);
-        assert_eq!(CollectionCommit::decode(&first.to_blob()).unwrap(), first);
+        assert_eq!(first.to_bytes(), retry.to_bytes());
+        assert_eq!(CollectionCommit::from_bytes(first.to_bytes()), first);
         first.verify_strict().unwrap();
 
         let mut bad_s = first.signature_s;
@@ -949,7 +925,7 @@ mod tests {
             first.signature_r,
             bad_s,
         );
-        let decoded = CollectionCommit::decode(&bad.to_blob()).unwrap();
+        let decoded = CollectionCommit::from_bytes(bad.to_bytes());
         assert_eq!(
             decoded.verify_strict(),
             Err(CommitVerificationError::InvalidSignature)
@@ -980,7 +956,7 @@ mod tests {
             first.signature_r,
             first.signature_s,
         );
-        let decoded = CollectionCommit::decode(&invalid_key.to_blob()).unwrap();
+        let decoded = CollectionCommit::from_bytes(invalid_key.to_bytes());
         assert_eq!(
             decoded.verify_strict(),
             Err(CommitVerificationError::InvalidPublicKey)
@@ -1035,13 +1011,13 @@ mod tests {
     }
 
     #[test]
-    fn merge_is_commutative_on_the_wire() {
+    fn merge_is_commutative_in_dense_encoding() {
         let forward = CollectionMerge::new(collection(1), hash(2), hash(3), hash(4));
         let reverse = CollectionMerge::new(collection(1), hash(3), hash(2), hash(4));
         assert_eq!(forward, reverse);
-        assert_eq!(forward.to_blob().bytes, reverse.to_blob().bytes);
+        assert_eq!(forward.to_bytes(), reverse.to_bytes());
         assert_eq!(
-            CollectionMerge::decode(&forward.to_blob()).unwrap(),
+            CollectionMerge::from_bytes(forward.to_bytes()).unwrap(),
             forward
         );
     }
@@ -1049,78 +1025,56 @@ mod tests {
     #[test]
     fn derive_roundtrips() {
         let record = CollectionDerive::new(collection(1), collection(2), hash(3), hash(4));
-        assert_eq!(CollectionDerive::decode(&record.to_blob()).unwrap(), record);
+        assert_eq!(CollectionDerive::from_bytes(record.to_bytes()), record);
     }
 
     #[test]
-    fn cross_kind_substitution_is_rejected_before_field_parsing() {
+    fn generic_codec_tags_each_variant() {
         let commit = CollectionCommit::sign(
             &fixture_key(),
             collection(1),
             hash(2),
             empty_metadata_handle(),
         );
+        let merge = CollectionMerge::new(collection(1), hash(2), hash(3), hash(4));
+        let derive = CollectionDerive::new(collection(1), collection(2), hash(3), hash(4));
+        for record in [
+            CollectionRecord::Commit(commit),
+            CollectionRecord::Merge(merge),
+            CollectionRecord::Derive(derive),
+        ] {
+            assert_eq!(
+                CollectionRecord::from_bytes(&record.to_bytes()).unwrap(),
+                record
+            );
+        }
         assert_eq!(
-            CollectionMerge::decode(&commit.to_blob()),
-            Err(RecordDecodeError::WrongKind {
-                expected: KIND_COLLECTION_MERGE,
-                actual: KIND_COLLECTION_COMMIT,
+            CollectionRecord::from_bytes(&[99]),
+            Err(RecordDecodeError::UnknownKind(99))
+        );
+    }
+
+    #[test]
+    fn generic_codec_rejects_wrong_lengths() {
+        assert_eq!(
+            CollectionRecord::from_bytes(&[COLLECTION_RECORD_KIND_COMMIT_V1]),
+            Err(RecordDecodeError::InvalidLength {
+                expected: COLLECTION_COMMIT_BYTES_LEN,
+                actual: 0,
             })
         );
     }
 
     #[test]
-    fn exact_shape_rejects_unknown_fields() {
+    fn merge_decoder_rejects_noncanonical_input_order() {
         let record = CollectionMerge::new(collection(1), hash(2), hash(3), hash(4));
-        let mut facts = record.to_tribles();
-        let extra: Inline<ShortString> = "extra".to_inline();
-        facts.insert(&Trible::force(
-            &record.id(),
-            &crate::metadata::json_kind.id(),
-            &extra,
-        ));
+        let mut bytes = record.to_bytes();
+        bytes[32..64].fill(9);
+        bytes[64..96].fill(1);
         assert_eq!(
-            CollectionMerge::from_tribles(&facts),
-            Err(RecordDecodeError::NonCanonicalFacts)
+            CollectionMerge::from_bytes(bytes),
+            Err(RecordDecodeError::NonCanonicalMergeInputs)
         );
-    }
-
-    #[test]
-    fn exact_shape_reports_missing_and_repeated_fields() {
-        let record = CollectionMerge::new(collection(1), hash(2), hash(3), hash(4));
-        let mut missing = TribleSet::new();
-        for fact in record.to_tribles().iter() {
-            if fact.a() != &merge_result.id() {
-                missing.insert(fact);
-            }
-        }
-        assert_eq!(
-            CollectionMerge::from_tribles(&missing),
-            Err(RecordDecodeError::MissingField("merge_result"))
-        );
-
-        let mut repeated = record.to_tribles();
-        repeated.insert(&Trible::force(&record.id(), &merge_result.id(), &hash(9)));
-        assert_eq!(
-            CollectionMerge::from_tribles(&repeated),
-            Err(RecordDecodeError::RepeatedField("merge_result"))
-        );
-    }
-
-    #[test]
-    fn noncanonical_root_is_rejected() {
-        let record = CollectionDerive::new(collection(1), collection(2), hash(3), hash(4));
-        let wrong_root = id(9);
-        let mut facts = TribleSet::new();
-        for fact in record.to_tribles().iter() {
-            let mut raw = fact.data;
-            raw[..16].copy_from_slice(&wrong_root.raw());
-            facts.insert(&Trible::force_raw(raw).unwrap());
-        }
-        assert!(matches!(
-            CollectionDerive::from_tribles(&facts),
-            Err(RecordDecodeError::NonCanonicalRoot { stored, .. }) if stored == wrong_root
-        ));
     }
 
     #[test]
@@ -1144,32 +1098,12 @@ mod tests {
             descriptor.to_blob().bytes.len() as u64,
             COLLECTION_DESCRIPTOR_ARCHIVE_LEN
         );
-        assert_eq!(
-            commit.to_blob().bytes.len() as u64,
-            COLLECTION_COMMIT_ARCHIVE_LEN
-        );
-        assert_eq!(
-            merge.to_blob().bytes.len() as u64,
-            COLLECTION_MERGE_ARCHIVE_LEN
-        );
-        assert_eq!(
-            derive.to_blob().bytes.len() as u64,
-            COLLECTION_DERIVE_ARCHIVE_LEN
-        );
-        for (record, expected) in [
-            (CollectionRecord::Commit(commit), commit.to_blob()),
-            (CollectionRecord::Merge(merge), merge.to_blob()),
-            (CollectionRecord::Derive(derive), derive.to_blob()),
-        ] {
-            assert_eq!(record.to_blob(), expected);
-        }
+        assert_eq!(commit.to_bytes().len(), COLLECTION_COMMIT_BYTES_LEN);
+        assert_eq!(merge.to_bytes().len(), COLLECTION_MERGE_BYTES_LEN);
+        assert_eq!(derive.to_bytes().len(), COLLECTION_DERIVE_BYTES_LEN);
 
         assert_eq!(commit.signing_transcript().len(), COMMIT_TRANSCRIPT_LEN);
-        assert_eq!(commit.id(), id_hex!("68A89AE0FBB8C2A85ED70615450603CB"));
-        assert_eq!(
-            commit.to_blob().get_handle().raw,
-            hex!("FA8056A071E5B5CE443204BE3BB7F7A1B6B488850DF846C7D6078AE36202685D")
-        );
+        assert_eq!(commit.id(), id_hex!("21FE95F313A7AADD236286EE83B5AA39"));
         assert_eq!(
             commit.signature_r.raw,
             hex!("F89FCF5C72BC7EC3E376C6AB6BDEFC6ECEA3ADBBCA7A36DBF1729413A7820564")
@@ -1178,16 +1112,8 @@ mod tests {
             commit.signature_s.raw,
             hex!("F684108AF3E8E3898904D20EA458DCAE68F0F97F4E5C06DAFA0FAE0691F68D0B")
         );
-        assert_eq!(merge.id(), id_hex!("4F9CA34A284AB1098967CAA889C86EC1"));
-        assert_eq!(
-            merge.to_blob().get_handle().raw,
-            hex!("4EF629DC8FF64D75729F17B0F1B99F9A3664915E6111B024C513C3DF6CFE3440")
-        );
-        assert_eq!(derive.id(), id_hex!("D80EDEAB2CE810B2C6358F6ED8718B3A"));
-        assert_eq!(
-            derive.to_blob().get_handle().raw,
-            hex!("B4F485AD0190BBB9ACFF9E2E0724BA80E823B8BF9C9CDEC6C6E1CB786D90906C")
-        );
+        assert_eq!(merge.id(), id_hex!("032390A36A86A2F5A44604B78EF6FA8C"));
+        assert_eq!(derive.id(), id_hex!("7439DBBBCC791D653B9295EB1AD02400"));
         assert_eq!(
             commit.signing_transcript(),
             hex!(

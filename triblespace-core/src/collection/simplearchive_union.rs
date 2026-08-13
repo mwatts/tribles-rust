@@ -1171,10 +1171,8 @@ mod tests {
         let repeated = prepare_fragment_commit(&source_descriptor, fragment, &signing_key).unwrap();
         assert_eq!(prepared.commit(), &expected);
         assert_eq!(repeated.commit(), &expected);
-        assert_eq!(
-            prepared.commit().to_blob().get_handle(),
-            repeated.commit().to_blob().get_handle()
-        );
+        assert_eq!(prepared.commit().id(), repeated.commit().id());
+        assert_eq!(prepared.commit().to_bytes(), repeated.commit().to_bytes());
 
         let derive = CollectionDerive::new(
             source_descriptor.handle(),

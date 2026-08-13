@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Native collection records now use one dense typed representation.**
+  `COMMIT`, `MERGE`, and `DERIVE` no longer masquerade as queryable
+  `SimpleArchive` entities: their exact payloads are fixed at 192, 128, and
+  128 bytes, respectively, with structural `to_bytes`/`from_bytes` codecs.
+  Generic record stores use one stable versioned variant tag around those
+  payloads. Record IDs are derived directly from a domain, semantic kind,
+  codec version, and every dense payload byte; merge decoding rejects
+  noncanonical input order. Collection descriptors remain self-describing
+  `SimpleArchive` blobs whose handles are the collection identity.
 - **Authenticated peers can reconcile one exact native collection without
   reviving branch or tracking-pin semantics.** A new read-only operation
   enumerates deterministic, strictly verified grant/commit evidence for an
