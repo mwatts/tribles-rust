@@ -32,6 +32,15 @@ pub struct R256LE;
 /// Both the numerator and the denominator are stored in big-endian byte order,
 /// with the numerator in the first 16 bytes and the denominator in the last 16 bytes.
 ///
+/// # Byte order is not numeric order
+///
+/// Big-endian here buys a *stable, portable* byte layout, not a numerically
+/// meaningful one. Bytewise comparison sees the numerator first, so `1/1` sorts
+/// below `2/3` even though `1 > 2/3`, and an index range over an `R256BE`
+/// column is not a range of values. If you need range queries on exact
+/// rationals, use
+/// [`ROrd256`](super::rord256::ROrd256), whose bytes do sort numerically.
+///
 /// For a little-endian version, see [R256LE].
 pub struct R256BE;
 
@@ -69,7 +78,7 @@ impl MetaDescribe for R256BE {
         let mut tribles = entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::name: "r256be",
-                metadata::description: "Exact ratio stored as two i128 values (numerator/denominator) in big-endian, normalized with a positive denominator. This is useful when bytewise ordering or protocol encoding matters.\n\nUse for exact fractions in ordered or interoperable formats. Prefer F64 or F256 when approximate floats are acceptable.\n\nAs with the little-endian variant, values are expected to be canonical and denominator must be non-zero.",
+                metadata::description: "Exact ratio stored as two i128 values (numerator/denominator) in big-endian, normalized with a positive denominator. This is useful when a stable, portable byte layout matters.\n\nNote that big-endian here does NOT make bytewise order numeric order: comparison sees the numerator first, so 1/1 sorts below 2/3. Use ROrd256 if you need range queries over exact rationals. Prefer F64 or F256 when approximate floats are acceptable.\n\nAs with the little-endian variant, values are expected to be canonical and denominator must be non-zero.",
                 metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
 

@@ -115,6 +115,7 @@ The crate provides the following inline encodings out of the box:
 - `U256BE` / `U256LE` &ndash; 256-bit unsigned integers.
 - `I256BE` / `I256LE` &ndash; 256-bit signed integers.
 - `R256BE` / `R256LE` &ndash; 256-bit rational numbers.
+- `ROrd256` &ndash; exact rationals whose bytes sort in numeric order.
 - `F64` &ndash; IEEE-754 double-precision floating point number (little-endian).
 - `F256BE` / `F256LE` &ndash; 256-bit floating point numbers.
 - `Hash` and `Handle` &ndash; cryptographic digests and blob handles (see [`hash.rs`](../src/inline/encodings/hash.rs)).
@@ -205,7 +206,13 @@ What are you storing?
 │  ├─ Floating point
 │  │  ├─ Standard double? → F64
 │  │  └─ Extended precision? → F256BE
-│  └─ Rational? → R256
+│  ├─ Money or any fixed-scale amount?
+│  │  └─ A scaled integer (I256BE of minor units) — never a rational.
+│  │     Amounts are not divided at storage, and a scaled integer
+│  │     already sorts numerically.
+│  └─ Rational (exact, arises from division)?
+│     ├─ Need numeric range queries on it? → ROrd256
+│     └─ Otherwise → R256  (simpler, faster, wider domain)
 │
 ├─ A timestamp or time range?
 │  └─ NsTAIInterval
@@ -236,6 +243,85 @@ What are you storing?
 - When in doubt between an inline encoding and a blob, ask: "will I ever want to
   query or join on this directly?" If yes, it should be inline. If it's opaque
   content you just retrieve, use a blob handle.
+
+## Exact rationals: `R256` vs `ROrd256`
+
+Indexes compare the 32 stored bytes, so an index range is only a *value* range
+when the encoding's byte order matches its numeric order. `R256` does not have
+that property. It stores the numerator in the first 16 bytes and the denominator
+in the last 16, so bytewise comparison reads the numerator first and `1/1` sorts
+below `2/3` even though `1 > 2/3`. Its big-endian variant gives a stable portable
+layout, not a numerically meaningful one.
+
+`ROrd256` is the sibling encoding that does sort numerically, while staying
+exact and canonical.
+
+**How.** The Stern–Brocot tree is a binary search tree over the rationals, so
+its in-order traversal is numerically sorted and a root path (`L`/`R`) with a
+terminator sorting between `L` and `R` compares lexicographically in numeric
+order. A raw path is not width-bounded — `1/1000000` is 999999 left branches
+deep — but the continued fraction `[a0; a1, a2, …]` is exactly the run-length
+encoding of that path, so it carries the identical order in O(log min(p,q))
+terms. Comparison of continued fractions alternates (`a0` ascending, `a1`
+descending, …), so each term is written in a prefix-free order-preserving code
+and bit-complemented at odd positions, which turns the alternation back into
+plain lexicographic comparison. A terminated fraction behaves like a `+∞` term
+at the next position, so the terminator is a run of the pad value that sorts
+above every code — and complementing it at odd positions correctly turns that
+`+∞` into `−∞`.
+
+**Canonical.** The Euclidean algorithm never emits the alternative `[…, n-1, 1]`
+spelling, so exactly one byte string exists per value and intrinsic ids stay
+stable. Bytes that claim a trailing `1` are rejected by `validate`.
+
+**Representable subset.** Encoding costs roughly `2·log2(max(|p|, q))` bits and
+fails with a typed `OrderedRatioError::OutOfDomain` rather than rounding:
+
+| input | fits |
+|---|---|
+| any `p/q` with `max(\|p\|, q) ≤ 2^104` | always (guaranteed) |
+| any `i128` integer, any `1/n` | always |
+| random 96-bit `p` and `q` | always in practice |
+| random 120-bit `p` and `q` | ~99% |
+| random 127-bit `p` and `q` | ~26% |
+
+The guaranteed bound is set by long continued fractions of small-but-not-one
+terms; the smallest value that does *not* fit needs `max(|p|, q) > 2^104.7`.
+Counter-intuitively, Fibonacci ratios — the *longest* continued fractions — are
+the cheapest, because a term of `1` costs a single bit, so every Fibonacci ratio
+representable in `i128` encodes comfortably.
+
+**Cost.** Ordering is free at query time (it is `memcmp` on bytes the index
+already compares); you pay for it on write. Encoding runs a Euclidean expansion
+and decoding a continuant recurrence, both O(number of terms):
+
+| | `ROrd256` | `R256BE` | `R256LE` |
+|---|---|---|---|
+| encode, 64-bit `p/q` | 290 ns | 157 ns | 1.6 ns |
+| encode, worst case | 850 ns | 270 ns | 1.6 ns |
+| decode, 64-bit `p/q` | 176 ns | 157 ns | 157 ns |
+
+`R256LE`'s encode is two `to_le_bytes` and nothing else, so relative to a raw
+two-limb store `ROrd256` is two orders of magnitude slower to encode. Against
+`R256BE` — which canonicalizes with a gcd — it is under 2× for typical values,
+and decoding is comparable either way because `R256`'s own canonicality check
+also runs a gcd. Run `cargo bench -p triblespace-core --bench ordered_rational`
+to reproduce.
+
+**Choose `ROrd256`** when you need exactness *and* numeric range queries on the
+same column: exact empirical rates `k/n` where the denominator varies, exact
+probabilities or thresholds, ratios that arise from division and are then
+filtered by magnitude. The alternative — an `R256` column plus a parallel `F64`
+sort key — needs two attributes that can drift apart, and its range answers are
+inexact at the boundary, because the bound itself (`1/3`, say) is not a float.
+`ROrd256` makes the index answer the exact answer.
+
+**Choose `R256`** for everything else. It is simpler, encodes in nanoseconds, and
+covers the full `i128 × i128` box rather than a subset of it.
+
+**Choose neither for money.** Amounts have a fixed scale, are not divided at
+storage, and already sort numerically as scaled integers. Use an integer of
+minor units.
 
 ## Defining new encodings
 

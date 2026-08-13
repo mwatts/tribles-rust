@@ -109,3 +109,7 @@ harness = false
 [[bench]]
 name = "faculty_collection_storage"
 harness = false
+
+[[bench]]
+name = "ordered_rational"
+harness = false

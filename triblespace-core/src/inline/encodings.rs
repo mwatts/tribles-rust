@@ -20,6 +20,8 @@ pub mod linelocation;
 pub mod r256;
 /// Range encodings for pairs of `u128` values.
 pub mod range;
+/// Order-preserving exact rational encoding (bytes sort numerically).
+pub mod rord256;
 /// Inline UTF-8 short string encoding (up to 32 bytes).
 pub mod shortstring;
 /// TAI nanosecond interval encoding.
