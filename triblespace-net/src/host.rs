@@ -190,7 +190,7 @@ pub enum SyncDirection {
 /// Snapshot of store state for serving protocol requests.
 pub struct StoreSnapshot<R> {
     pub reader: R,
-    pub branches: triblespace_core::repo::PinSnapshot,
+    pub pin_heads: triblespace_core::repo::PinSnapshot,
     collection_records: Vec<CollectionRecord>,
     collection_gossips: Vec<CollectionGossip>,
 }
@@ -199,7 +199,7 @@ impl StoreSnapshot<()> {
     pub fn from_store<S>(store: &mut S) -> Option<StoreSnapshot<S::Reader>>
     where
         S: triblespace_core::repo::BlobStore
-            + triblespace_core::repo::PinStore
+            + triblespace_core::repo::PinSnapshotSource
             + CollectionStore
             + CollectionGossipStore,
     {
@@ -216,11 +216,11 @@ impl StoreSnapshot<()> {
             .gossips()
             .map(|gossips| gossips.filter_map(Result::ok).collect())
             .unwrap_or_default();
-        let branches = store.pin_snapshot().ok()?;
+        let pin_heads = store.pin_snapshot().ok()?;
         let reader = store.reader().ok()?;
         Some(StoreSnapshot {
             reader,
-            branches,
+            pin_heads,
             collection_records,
             collection_gossips,
         })
@@ -235,7 +235,7 @@ impl StoreSnapshot<()> {
 pub trait AnySnapshot: Send + 'static {
     fn get_blob(&self, hash: &RawHash) -> Option<Vec<u8>>;
     fn has_blob(&self, hash: &RawHash) -> bool;
-    fn branches(&self) -> &triblespace_core::repo::PinSnapshot;
+    fn pin_heads(&self) -> &triblespace_core::repo::PinSnapshot;
     /// Strict grant-backed commits for one exact descriptor handle, in
     /// deterministic intrinsic-record order.
     fn collection_evidence(&self, collection: CollectionId) -> Vec<CollectionCommitEvidence>;
@@ -251,10 +251,7 @@ pub trait AnySnapshot: Send + 'static {
 
 impl<R> AnySnapshot for StoreSnapshot<R>
 where
-    R: triblespace_core::repo::BlobStoreGet
-        + triblespace_core::repo::BlobStoreList
-        + Send
-        + 'static,
+    R: triblespace_core::repo::BlobStoreGet + Send + 'static,
 {
     fn get_blob(&self, hash: &RawHash) -> Option<Vec<u8>> {
         use triblespace_core::blob::encodings::UnknownBlob;
@@ -271,8 +268,8 @@ where
         self.get_blob(hash).is_some()
     }
 
-    fn branches(&self) -> &triblespace_core::repo::PinSnapshot {
-        &self.branches
+    fn pin_heads(&self) -> &triblespace_core::repo::PinSnapshot {
+        &self.pin_heads
     }
 
     fn collection_evidence(&self, collection: CollectionId) -> Vec<CollectionCommitEvidence> {
@@ -2152,13 +2149,13 @@ fn reachable_set_for(
         return None;
     }
 
-    let branches = snap.branches();
-    let mut frontier: Vec<RawHash> = branches
+    let pin_heads = snap.pin_heads();
+    let mut frontier: Vec<RawHash> = pin_heads
         .iter()
         .filter_map(|bid| {
             triblespace_core::id::Id::new(*bid)
                 .filter(|id| verified.grants_read_on(id))
-                .and_then(|_| branches.get(bid).map(|h| h.raw))
+                .and_then(|_| pin_heads.get(bid).map(|h| h.raw))
         })
         .collect();
     let mut reachable: HashSet<RawHash> = HashSet::new();
@@ -2240,7 +2237,7 @@ mod collection_evidence_gossip_tests {
     }
 
     struct EvidenceSnapshot {
-        branches: PinSnapshot,
+        pin_heads: PinSnapshot,
         evidence: CollectionCommitEvidence,
     }
 
@@ -2253,8 +2250,8 @@ mod collection_evidence_gossip_tests {
             false
         }
 
-        fn branches(&self) -> &PinSnapshot {
-            &self.branches
+        fn pin_heads(&self) -> &PinSnapshot {
+            &self.pin_heads
         }
 
         fn collection_evidence(&self, collection: CollectionId) -> Vec<CollectionCommitEvidence> {
@@ -2323,7 +2320,7 @@ mod collection_evidence_gossip_tests {
         let evidence = evidence();
         let snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>> =
             Arc::new(Mutex::new(Some(Box::new(EvidenceSnapshot {
-                branches: PinSnapshot::default(),
+                pin_heads: PinSnapshot::default(),
                 evidence,
             }))));
 

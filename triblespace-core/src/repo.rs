@@ -623,6 +623,26 @@ pub enum PushResult {
 /// Returned by [`PinStore::pin_snapshot`].
 pub type PinSnapshot = PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>;
 
+/// Observational access to one point-in-time snapshot of pin heads.
+///
+/// This is deliberately narrower than [`PinStore`]. Consumers that only need
+/// a stable authorization or serving view must not thereby gain the ability to
+/// enumerate individual cells, inspect them piecemeal, or perform compare-and-
+/// swap mutation. The mutable receiver permits stores such as
+/// [`crate::repo::pile::Pile`] to refresh externally appended records before
+/// producing the snapshot; the capability itself is read-only.
+///
+/// Existing [`PinStore`] implementations receive this capability through the
+/// blanket implementation below. Its explicit forwarding preserves optimized
+/// overrides such as `Pile`'s O(1) persistent-PATCH clone.
+pub trait PinSnapshotSource {
+    /// Error returned when a stable pin-head snapshot cannot be produced.
+    type PinSnapshotError: Error + Debug + Send + Sync + 'static;
+
+    /// Return a point-in-time snapshot of every `(pin id, head)` mapping.
+    fn pin_snapshot(&mut self) -> Result<PinSnapshot, Self::PinSnapshotError>;
+}
+
 /// Storage backend for pins: named, atomically-updatable handles to
 /// SimpleArchive blobs.
 ///
@@ -726,6 +746,17 @@ pub trait PinStore {
         old: Option<Inline<Handle<SimpleArchive>>>,
         new: Option<Inline<Handle<SimpleArchive>>>,
     ) -> Result<PushResult, Self::UpdateError>;
+}
+
+impl<T> PinSnapshotSource for T
+where
+    T: PinStore + ?Sized,
+{
+    type PinSnapshotError = T::PinsError;
+
+    fn pin_snapshot(&mut self) -> Result<PinSnapshot, Self::PinSnapshotError> {
+        PinStore::pin_snapshot(self)
+    }
 }
 
 /// Exact byte length of a canonical [`WantRequest`].

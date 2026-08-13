@@ -16,15 +16,16 @@
 //!   fetching its referenced blobs; semantic trust belongs to later
 //!   collection resolution.
 //! - **Blob writes** delegate to the inner store and announce content to the
-//!   DHT. [`PinStore`] remains a local storage delegation used by capability
-//!   scope checks; pins are not replicated state.
+//!   DHT. A read-only [`PinSnapshotSource`] supplies the pin-head view still
+//!   used by branch-restricted capability checks; pins are not replicated
+//!   state and `Peer` exposes no pin mutation API.
 //!
 //! There is no separate cache tier: `Peer<S>` takes a **single store**,
 //! and any tiering (bounded want retention, generational eviction) lives
 //! in `S` — e.g. a [`Yard`](triblespace_core::repo::yard::Yard). Read-miss
 //! swarm fetches land in `S` under a **want** ([`WantStore`]),
-//! independently of named [`PinStore`] branches and private policy collections. The want is recorded
-//! durably *before* the fetch — asserted AND
+//! independently of named pins and private policy collections. The want is
+//! recorded durably *before* the fetch — asserted AND
 //! flushed ([`StorageFlush`]), so the marker survives an immediate
 //! process exit — the demand IS the want-signal (a sync daemon's work
 //! queue), then the retention marker for the fetched blob, then the
@@ -59,8 +60,8 @@ use triblespace_core::inline::InlineEncoding;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::lazy::WantRecordError;
 use triblespace_core::repo::{
-    BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut, PinStore,
-    PushResult, StorageFlush, WantRequest, WantStore,
+    BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut,
+    PinSnapshotSource, StorageFlush, WantRequest, WantStore,
 };
 
 use crate::channel::{NetEvent, PublisherKey};
@@ -186,8 +187,8 @@ where
 ///     self_cap: [0u8; 32],
 ///     direction: SyncDirection::Bidirectional,
 /// });
-/// // From here `peer` provides network-aware blob storage while retaining
-/// // the wrapped store's local PinStore surface for capability scope checks.
+/// // From here `peer` provides network-aware blob storage. Store-specific
+/// // local state remains explicitly available through `peer.store()`.
 /// drop(peer);
 /// ```
 pub struct Peer<S>
@@ -196,7 +197,7 @@ where
         + BlobStorePut
         + CollectionGossipStore
         + CollectionStore
-        + PinStore
+        + PinSnapshotSource
         + WantStore
         + StorageFlush
         + Send
@@ -261,7 +262,7 @@ where
         + BlobStorePut
         + CollectionGossipStore
         + CollectionStore
-        + PinStore
+        + PinSnapshotSource
         + WantStore
         + StorageFlush
         + Send
@@ -474,7 +475,7 @@ where
     ///    that didn't go through the Peer's own write path. Use this to
     ///    catch writes from another process that touched the pile file.
     ///
-    /// Auto-called inside the BlobStore/PinStore read methods, so
+    /// Auto-called inside the BlobStore read methods, so
     /// callers using the storage normally don't need to invoke it.
     /// Mirrors `Pile::refresh` — the explicit method is available for
     /// "do it now" semantics or tight loops with no read activity.
@@ -1182,9 +1183,9 @@ where
 //
 // Reads call `refresh()` first so they always see the latest collection
 // evidence and any external blob writes get announced. Blob writes delegate
-// to the inner store and then publish the new state. PinStore remains a local
-// delegation; pin updates only refresh the snapshot used for capability scope
-// checks and are never gossiped.
+// to the inner store and then publish the new state. Local pin changes made
+// explicitly through `Peer::store()` enter the branch-restricted capability
+// view on the next `Peer::refresh()` and are never gossiped.
 
 impl<S> BlobStorePut for Peer<S>
 where
@@ -1192,7 +1193,7 @@ where
         + BlobStorePut
         + CollectionGossipStore
         + CollectionStore
-        + PinStore
+        + PinSnapshotSource
         + WantStore
         + StorageFlush
         + Send
@@ -1231,7 +1232,7 @@ where
         + BlobStorePut
         + CollectionGossipStore
         + CollectionStore
-        + PinStore
+        + PinSnapshotSource
         + WantStore
         + StorageFlush
         + Send
@@ -1253,61 +1254,6 @@ where
             sink: Arc::new(SharedStore(self.store.clone())),
         });
         Ok(PeerReader { local, fetch })
-    }
-}
-
-impl<S> PinStore for Peer<S>
-where
-    S: BlobStore
-        + BlobStorePut
-        + CollectionGossipStore
-        + CollectionStore
-        + PinStore
-        + WantStore
-        + StorageFlush
-        + Send
-        + 'static,
-    S::Reader: BlobStoreMeta,
-{
-    type PinsError = S::PinsError;
-    type HeadError = S::HeadError;
-    type UpdateError = S::UpdateError;
-    // Collected eagerly: the inner store's iterator would borrow the
-    // mutex guard, which cannot leave this call.
-    type ListIter<'a>
-        = std::vec::IntoIter<Result<Id, S::PinsError>>
-    where
-        S: 'a;
-
-    fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError> {
-        self.refresh();
-        let mut store = self.store.lock().expect("store mutex");
-        let ids: Vec<Result<Id, S::PinsError>> = store.pins()?.collect();
-        Ok(ids.into_iter())
-    }
-
-    fn head(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
-        self.refresh();
-        self.store.lock().expect("store mutex").head(id)
-    }
-
-    fn update(
-        &mut self,
-        id: Id,
-        old: Option<Inline<Handle<SimpleArchive>>>,
-        new: Option<Inline<Handle<SimpleArchive>>>,
-    ) -> Result<PushResult, Self::UpdateError> {
-        let mut store = self.store.lock().expect("store mutex");
-        let result = store.update(id, old, new)?;
-        if let PushResult::Success() = &result {
-            // Pin reachability still participates in blob-scope capability
-            // checks, so keep the host's read snapshot current without
-            // turning the pin mutation into replicated state.
-            if let Some(snap) = StoreSnapshot::from_store(&mut *store) {
-                self.sender.update_snapshot(snap);
-            }
-        }
-        Ok(result)
     }
 }
 
