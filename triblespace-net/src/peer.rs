@@ -10,9 +10,14 @@
 //!   deltas from external writers (e.g. another process appended to the
 //!   same pile file). Mirrors `Pile::refresh` — the explicit method is
 //!   available for tight loops, but normal storage use Just Works.
-//! - **Writes** delegate to the inner store and then announce blobs to
-//!   the DHT and gossip branch updates over the topic mesh, all via the
-//!   network thread.
+//! - **Publication** diffs [`CollectionStore`] and [`CollectionGossipStore`]
+//!   state, then gossips each strictly verified grant-backed commit as inert
+//!   signed evidence. Receivers may store and relay that evidence without
+//!   fetching its referenced blobs; semantic trust belongs to later
+//!   collection resolution.
+//! - **Blob writes** delegate to the inner store and announce content to the
+//!   DHT. Legacy [`PinStore`] HEAD gossip remains temporarily available for
+//!   compatibility, but is not the primary replication ledger.
 //!
 //! There is no separate cache tier: `Peer<S>` takes a **single store**,
 //! and any tiering (bounded want retention, generational eviction) lives
@@ -32,15 +37,13 @@
 //! "Promote to durable" is not an operation — durability is
 //! reachability from strong pins; the Peer performs no promotion.
 //!
-//! Branch-state discovery is gossip-driven: HEAD updates for the
-//! team's branches flood the team topic and arrive via the
-//! `NetEvent` channel; the network thread autonomously walks
-//! reachable closures via DHT-routed blob fetches. There are no
-//! peer-targeted RPCs on the public surface — peers serve content
-//! but don't get asked "what branches do you have." That question
-//! is asked of the team, via the topic, not of any individual peer.
+//! Collection discovery is gossip-driven: immutable grant+commit evidence
+//! floods the team topic and arrives through `NetEvent`. Referenced content
+//! remains independently retrievable by hash, normally through durable wants.
+//! The older HEAD path still exists as a migration bridge for pin-based
+//! callers and should not be used to model new replicated state.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use anybytes::Bytes;
@@ -49,7 +52,9 @@ use iroh_base::EndpointId;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{BlobEncoding, IntoBlob, TryFromBlob};
-use triblespace_core::collection::{CollectionGossipStore, CollectionStore};
+use triblespace_core::collection::{
+    CollectionCommit, CollectionGossip, CollectionGossipStore, CollectionRecord, CollectionStore,
+};
 use triblespace_core::id::Id;
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::InlineEncoding;
@@ -64,6 +69,7 @@ use crate::channel::{NetEvent, PublisherKey};
 use crate::collection_sync::{
     IncomingBatchCounts, IncomingBatchValidationError, prepare_incoming_collection_batch,
 };
+use crate::collection_wire::CollectionCommitEvidence;
 use crate::host::{self, NetReceiver, NetSender, StoreSnapshot};
 use crate::protocol::RawHash;
 
@@ -85,6 +91,65 @@ pub enum CollectionReconcileError {
     /// Caller policy or destination storage rejected admission.
     #[error("incoming collection admission failed: {0}")]
     Admission(#[source] anyhow::Error),
+}
+
+/// Materialize the strictly verified intersection of the collection record
+/// and publication-grant stores. A top-level enumeration failure preserves
+/// the caller's prior diff baseline; malformed individual rows are inert.
+fn grant_backed_collection_evidence<S>(store: &mut S) -> Option<Vec<CollectionCommitEvidence>>
+where
+    S: CollectionGossipStore + CollectionStore,
+{
+    let grants: Vec<CollectionGossip> = store.gossips().ok()?.filter_map(Result::ok).collect();
+    let commits: Vec<CollectionCommit> = store
+        .records()
+        .ok()?
+        .filter_map(|record| match record.ok()? {
+            CollectionRecord::Commit(commit) => Some(commit),
+            CollectionRecord::Merge(_) | CollectionRecord::Derive(_) => None,
+        })
+        .collect();
+
+    let valid_grants: BTreeMap<([u8; 32], [u8; 32]), CollectionGossip> = grants
+        .into_iter()
+        .filter(|grant| grant.verify_strict().is_ok())
+        .map(|grant| ((grant.collection().raw, grant.public_key().raw), grant))
+        .collect();
+
+    let mut evidence: Vec<_> = commits
+        .into_iter()
+        .filter_map(|commit| {
+            let grant = valid_grants.get(&(commit.collection().raw, commit.public_key().raw))?;
+            CollectionCommitEvidence::new(*grant, commit).ok()
+        })
+        .collect();
+    evidence.sort_by_key(|item| item.commit().id());
+    evidence.dedup_by_key(|item| item.commit().id());
+    Some(evidence)
+}
+
+/// Canonicalize, strictly verify, and durably admit one gossip drain.
+///
+/// Duplicate delivery is normal for gossip, so commit ids are reduced before
+/// the strict batch boundary. The resulting batch performs exactly one flush.
+fn admit_incoming_collection_evidence<S>(
+    store: &mut S,
+    mut evidence: Vec<CollectionCommitEvidence>,
+) -> anyhow::Result<IncomingBatchCounts>
+where
+    S: CollectionGossipStore + CollectionStore + StorageFlush,
+{
+    evidence.sort_by_key(|item| item.commit().id());
+    evidence.dedup_by_key(|item| item.commit().id());
+    let batch = evidence
+        .into_iter()
+        .map(|item| (item.commit(), item.grant()))
+        .collect();
+    let prepared = prepare_incoming_collection_batch(batch)?;
+    let authorized = prepared
+        .authorize(|_, _| Ok::<bool, std::convert::Infallible>(true))
+        .expect("infallible evidence-storage policy");
+    authorized.admit(store).map_err(anyhow::Error::new)
 }
 
 /// A store wrapped in distributed network sync.
@@ -161,8 +226,13 @@ where
     /// every Peer-driven write so we don't double-gossip our own changes.
     last_branches: HashMap<Id, RawHash>,
 
-    /// Direction of swarm participation — controls whether we publish
-    /// local HEADs and/or react to remote HEADs.
+    /// Intrinsic commit ids whose matching grant-backed evidence has already
+    /// been handed to the host gossip loop. This is only a publication-diff
+    /// baseline: durable truth remains in the two grow-only stores.
+    last_collection_commits: BTreeSet<Id>,
+
+    /// Direction of swarm participation — controls collection-evidence and
+    /// blob publication/reception, plus the transitional legacy HEAD path.
     direction: SyncDirection,
 
     /// Monotonic time of the most recent NetEvent absorbed in
@@ -260,6 +330,7 @@ where
             receiver,
             last_blob_reader: None,
             last_branches: HashMap::new(),
+            last_collection_commits: BTreeSet::new(),
             direction,
             last_event_at: crate::clock::mono_now(),
             team_root,
@@ -422,6 +493,7 @@ where
         // drain the channel to keep it from filling, but skip the
         // store mutation. The local node has nothing to learn from
         // the swarm.
+        let mut incoming_collection_evidence = Vec::new();
         while let Some(event) = self.receiver.try_recv() {
             self.last_event_at = crate::clock::mono_now();
             if self.direction == SyncDirection::WriteOnly {
@@ -471,6 +543,9 @@ where
                             }
                         }
                     }
+                }
+                NetEvent::CollectionEvidence(evidence) => {
+                    incoming_collection_evidence.push(evidence);
                 }
                 NetEvent::CapRequest {
                     requester,
@@ -543,6 +618,18 @@ where
             }
         }
 
+        // Gossip is a duplicate-delivery medium, while the pure preparation
+        // boundary accepts only a canonical, strictly ordered batch. Reduce
+        // the entire drain first, then mutate and flush the store once.
+        if !incoming_collection_evidence.is_empty() {
+            let mut store = self.store.lock().expect("store mutex");
+            if let Err(error) =
+                admit_incoming_collection_evidence(&mut *store, incoming_collection_evidence)
+            {
+                tracing::warn!(%error, "peer: invalid collection gossip batch dropped");
+            }
+        }
+
         let mut store = self.store.lock().expect("store mutex");
 
         // ── Phase 2: refresh the snapshot served by the network thread ─
@@ -585,7 +672,26 @@ where
             self.last_blob_reader = Some(current);
         }
 
-        // ── Phase 4: diff-and-publish branch deltas ───────────────────
+        // ── Phase 4: diff-and-publish collection evidence ────────────
+        // Commits and publication grants are orthogonal grow-only stores.
+        // Only their strictly verified, same-author intersection is eligible
+        // for publication. Received evidence may be relayed after admission:
+        // its transport carrier is deliberately not treated as its author.
+        if let Some(evidence) = grant_backed_collection_evidence(&mut *store) {
+            if self.direction != SyncDirection::ReadOnly {
+                for item in &evidence {
+                    if !self.last_collection_commits.contains(&item.commit().id()) {
+                        self.sender.gossip_collection_evidence(*item);
+                    }
+                }
+            }
+            self.last_collection_commits = evidence
+                .into_iter()
+                .map(|item| item.commit().id())
+                .collect();
+        }
+
+        // ── Phase 5: diff-and-publish branch deltas ───────────────────
         // ReadOnly skips this entire phase — followers don't gossip.
         if self.direction != SyncDirection::ReadOnly {
             let bids: Vec<Id> = match store.pins() {
@@ -1026,7 +1132,7 @@ where
         dispatched + redispatched
     }
 
-    /// Force-republish all current non-tracking branches to the gossip
+    /// Force-republish all current non-tracking legacy branches to the gossip
     /// topic, regardless of whether they appear changed since the last
     /// publish.
     ///
@@ -1036,9 +1142,12 @@ where
     /// Cheap to call repeatedly — iroh-gossip dedupes identical messages
     /// on the wire.
     ///
-    /// Distinct from [`refresh`](Self::refresh): refresh publishes only
-    /// the deltas it detects against its diff baselines. This method
-    /// republishes everything unconditionally.
+    /// Distinct from [`refresh`](Self::refresh): refresh publishes only the
+    /// deltas it detects against its diff baselines. New code should publish
+    /// collection evidence and use
+    /// [`republish_collection_evidence`](Self::republish_collection_evidence)
+    /// for periodic full-state announcements; this API remains during the
+    /// pin-to-collection cutover.
     pub fn republish_branches(&mut self) {
         // ReadOnly suppresses publishing entirely — even republish.
         if self.direction == SyncDirection::ReadOnly {
@@ -1067,6 +1176,32 @@ where
                 self.last_branches.insert(bid, head.raw);
             }
         }
+    }
+
+    /// Force-republish every locally known grant-backed collection commit.
+    ///
+    /// This is the immutable-evidence counterpart of
+    /// [`republish_branches`](Self::republish_branches): newly joined gossip
+    /// neighbors learn the full publishable set even when no local collection
+    /// record changed since the last refresh.
+    pub fn republish_collection_evidence(&mut self) {
+        if self.direction == SyncDirection::ReadOnly {
+            return;
+        }
+        let mut store = self.store.lock().expect("store mutex");
+        if let Some(snapshot) = StoreSnapshot::from_store(&mut *store) {
+            self.sender.update_snapshot(snapshot);
+        }
+        let Some(evidence) = grant_backed_collection_evidence(&mut *store) else {
+            return;
+        };
+        for item in &evidence {
+            self.sender.gossip_collection_evidence(*item);
+        }
+        self.last_collection_commits = evidence
+            .into_iter()
+            .map(|item| item.commit().id())
+            .collect();
     }
 
     /// Lock and borrow the underlying store. Use for store-specific
@@ -1329,6 +1464,152 @@ where
             }
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod collection_gossip_tests {
+    use std::convert::Infallible;
+
+    use triblespace_core::collection::{CollectionData, CollectionId, empty_metadata_handle};
+
+    use super::*;
+
+    #[derive(Default)]
+    struct TestStore {
+        records: Vec<CollectionRecord>,
+        grants: Vec<CollectionGossip>,
+        flushes: usize,
+    }
+
+    impl CollectionStore for TestStore {
+        type RecordsError = Infallible;
+        type InsertError = Infallible;
+        type RecordIter<'a> = std::vec::IntoIter<Result<CollectionRecord, Infallible>>;
+
+        fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+            Ok(self
+                .records
+                .iter()
+                .copied()
+                .map(Ok)
+                .collect::<Vec<_>>()
+                .into_iter())
+        }
+
+        fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
+            if !self.records.iter().any(|known| known.id() == record.id()) {
+                self.records.push(record);
+            }
+            Ok(())
+        }
+    }
+
+    impl CollectionGossipStore for TestStore {
+        type GossipsError = Infallible;
+        type GossipError = Infallible;
+        type GossipIter<'a> = std::vec::IntoIter<Result<CollectionGossip, Infallible>>;
+
+        fn gossips<'a>(&'a mut self) -> Result<Self::GossipIter<'a>, Self::GossipsError> {
+            Ok(self
+                .grants
+                .iter()
+                .copied()
+                .map(Ok)
+                .collect::<Vec<_>>()
+                .into_iter())
+        }
+
+        fn gossip(&mut self, grant: CollectionGossip) -> Result<(), Self::GossipError> {
+            if !self.grants.contains(&grant) {
+                self.grants.push(grant);
+            }
+            Ok(())
+        }
+    }
+
+    impl StorageFlush for TestStore {
+        type Error = Infallible;
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
+    fn collection(byte: u8) -> CollectionId {
+        Inline::new([byte; 32])
+    }
+
+    fn commit(author: &SigningKey, collection: CollectionId, byte: u8) -> CollectionCommit {
+        CollectionCommit::sign(
+            author,
+            collection,
+            CollectionData::new([byte; 32]),
+            empty_metadata_handle(),
+        )
+    }
+
+    #[test]
+    fn grant_backed_snapshot_filters_then_sorts_and_deduplicates() {
+        let author = SigningKey::from_bytes(&[7; 32]);
+        let ungranted_author = SigningKey::from_bytes(&[8; 32]);
+        let first_collection = collection(1);
+        let second_collection = collection(2);
+        let first = commit(&author, first_collection, 1);
+        let second = commit(&author, first_collection, 2);
+        let across_collection = commit(&author, second_collection, 3);
+        let ungranted = commit(&ungranted_author, first_collection, 4);
+
+        let mut invalid_grant =
+            CollectionGossip::sign(&ungranted_author, first_collection).to_bytes();
+        invalid_grant[127] ^= 1;
+        let mut store = TestStore {
+            records: vec![
+                CollectionRecord::Commit(second),
+                CollectionRecord::Commit(ungranted),
+                CollectionRecord::Commit(first),
+                CollectionRecord::Commit(second),
+                CollectionRecord::Commit(across_collection),
+            ],
+            grants: vec![
+                CollectionGossip::from_bytes(invalid_grant),
+                CollectionGossip::sign(&author, second_collection),
+                CollectionGossip::sign(&author, first_collection),
+            ],
+            flushes: 0,
+        };
+
+        let evidence = grant_backed_collection_evidence(&mut store).unwrap();
+        let ids: Vec<_> = evidence.iter().map(|item| item.commit().id()).collect();
+        let mut expected = vec![first.id(), second.id(), across_collection.id()];
+        expected.sort();
+
+        assert_eq!(ids, expected);
+        assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(evidence.iter().all(|item| {
+            item.commit().verify_strict().is_ok() && item.grant().verify_strict().is_ok()
+        }));
+    }
+
+    #[test]
+    fn one_gossip_drain_deduplicates_and_flushes_once() {
+        let author = SigningKey::from_bytes(&[9; 32]);
+        let collection = collection(3);
+        let grant = CollectionGossip::sign(&author, collection);
+        let first = CollectionCommitEvidence::new(grant, commit(&author, collection, 1)).unwrap();
+        let second = CollectionCommitEvidence::new(grant, commit(&author, collection, 2)).unwrap();
+        let mut store = TestStore::default();
+
+        let counts =
+            admit_incoming_collection_evidence(&mut store, vec![second, first, second]).unwrap();
+
+        assert_eq!(counts.observed, 2);
+        assert_eq!(counts.admitted, 2);
+        assert_eq!(counts.denied, 0);
+        assert_eq!(store.records.len(), 2);
+        assert_eq!(store.grants, vec![grant]);
+        assert_eq!(store.flushes, 1);
     }
 }
 
