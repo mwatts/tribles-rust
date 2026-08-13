@@ -103,9 +103,10 @@ fn self_describing(mut batch: Fragment) -> Fragment {
     batch
 }
 
-/// Publish a clone of the pending batch and clear the durable in-memory copy
-/// only after the publication succeeds. A partial backend failure can
-/// therefore be retried with the exact same content-addressed commit.
+/// Publish a clone of the pending batch and clear the retained in-memory copy
+/// only after the caller's complete publication policy succeeds. A partial
+/// backend failure can therefore be retried with the exact same
+/// content-addressed commit.
 fn publish_pending<E>(
     state: &mut ThreadTelemetry,
     publish: impl FnOnce(Fragment) -> Result<(), E>,
@@ -150,7 +151,12 @@ impl TelemetryInner {
 
         let mut collection_guard = self.collection.lock().expect("telemetry collection lock");
         if let Some(collection) = collection_guard.as_mut() {
-            if let Err(e) = publish_pending(state, |batch| collection.commit(batch).map(|_| ())) {
+            if let Err(e) = publish_pending(state, |batch| {
+                collection
+                    .commit(batch)
+                    .map_err(|error| format!("{error:?}"))?;
+                collection.flush().map_err(|error| format!("{error:?}"))
+            }) {
                 log::warn!("telemetry flush failed: {e:?}");
                 return;
             }
@@ -383,7 +389,7 @@ impl Telemetry {
             schema::name: session_name,
             schema::begin_ns: 0u64,
         };
-        if collection.commit(self_describing(init)).is_err() {
+        if collection.commit(self_describing(init)).is_err() || collection.flush().is_err() {
             let _ = collection.close();
             return None;
         }
@@ -438,9 +444,12 @@ impl Drop for Telemetry {
                 .lock()
                 .expect("telemetry collection lock");
             if let Some(collection) = collection_guard.as_mut() {
-                if let Err(e) =
-                    publish_pending(&mut state, |batch| collection.commit(batch).map(|_| ()))
-                {
+                if let Err(e) = publish_pending(&mut state, |batch| {
+                    collection
+                        .commit(batch)
+                        .map_err(|error| format!("{error:?}"))?;
+                    collection.flush().map_err(|error| format!("{error:?}"))
+                }) {
                     log::warn!("telemetry shutdown flush failed: {e:?}");
                 }
             }

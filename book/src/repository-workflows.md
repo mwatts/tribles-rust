@@ -28,10 +28,12 @@ publishes one independent signed membership assertion:
 ```rust,ignore
 use triblespace::prelude::{Collection, Fragment};
 
-// `storage` implements BlobStorePut + CollectionStore + StorageFlush.
+// `storage` implements BlobStorePut + CollectionStore.
 // `scope` is the stable Id of this dataset.
 let mut collection = Collection::new(storage, scope, signing_key);
 let commit = collection.commit(fragment)?;
+// Optional: choose an explicit durability boundary for one or many commits.
+collection.flush()?;
 let snapshot = collection.snapshot()?;
 let facts = snapshot.facts();
 let exact_commits = snapshot.commits();
@@ -53,10 +55,13 @@ only collection-control structure represented as a `SimpleArchive`.
 The fragment remains self-contained across the publication boundary: its facts
 become the collection's canonical `SimpleArchive` data element, its metafacts
 become the commit's canonical metadata archive, and attachments from its shared
-blob store are copied alongside those two archives. Publication flushes all
+blob store are copied alongside those two archives. Publication writes all
 dependencies, including the descriptor blob, before inserting the signed
-commit record. Identical retries are idempotent, while distinct commits
-coexist; there is no branch head, CAS retry, or implied "latest" member.
+commit record, but deliberately performs no implicit durability flush. Call
+`Collection::flush` at the cadence the application requires, or rely on the
+storage's explicit close operation. Identical retries are idempotent, while
+distinct commits coexist; there is no branch head, CAS retry, or implied
+"latest" member.
 
 When the backend also provides a blob reader with metadata lookup,
 `Collection::materialize()` returns the complete known union of commits signed

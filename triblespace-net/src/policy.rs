@@ -150,10 +150,13 @@ fn commit<S>(store: &mut S, signing_key: &SigningKey, fragment: Fragment) -> Res
 where
     S: BlobStorePut + CollectionStore + StorageFlush,
 {
-    Collection::new(&mut *store, POLICY_COLLECTION_SCOPE, signing_key.clone())
+    let mut collection = Collection::new(&mut *store, POLICY_COLLECTION_SCOPE, signing_key.clone());
+    collection
         .commit(fragment)
-        .map(|_| ())
-        .map_err(|error| storage_error("committing policy collection", error))
+        .map_err(|error| storage_error("committing policy collection", error))?;
+    collection
+        .flush()
+        .map_err(|error| storage_error("flushing policy collection", error))
 }
 
 fn optional_one<T>(mut values: impl Iterator<Item = T>) -> Result<Option<T>, PolicyError> {

@@ -12,11 +12,9 @@
 //! subprocess-shaped command. "Cold" here means a fresh process or `Pile`
 //! handle; the OS page cache is not flushed.
 //!
-//! Write rows are not durability-equivalent by accident: native collection
-//! publication intentionally flushes dependencies before the signed record and
-//! flushes again afterward. The legacy repository batches appended records and
-//! this harness makes them durable when the pile closes. Keep that distinction
-//! in the interpretation rather than treating every ratio as CPU overhead.
+//! Write rows use the same durability cadence: both models preserve ordered
+//! publication in memory and make the entire measured batch durable when the
+//! pile closes. Neither ordinary path hides per-commit durability barriers.
 //!
 //! Run a representative quick matrix:
 //!

@@ -187,12 +187,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   public format has a freshly minted schema ID.
 - **Signed collection commits can be prepared and staged before visibility.**
   The `SimpleArchive` union kind can now construct the exact canonical commit
-  entirely in memory, durably stage its attachments, descriptor, data, and
-  metadata while withholding the record, permit caller-owned unsigned cache
-  artifacts in between, and consume the staged value to append and flush the
-  signed `COMMIT` last. Abandonment is deliberately inert: unrooted staged
-  dependencies remain undiscoverable as membership and produce no retention
-  roots.
+  entirely in memory, stage its attachments, descriptor, data, and metadata
+  while withholding the record, permit caller-owned unsigned cache artifacts
+  in between, and consume the staged value to append the signed `COMMIT` last.
+  Durability is an explicit caller policy. Abandonment is deliberately inert:
+  unrooted staged dependencies remain undiscoverable as membership and produce
+  no retention roots.
 - **Collection algebra records now have a native grow-only storage surface.**
   `CollectionStore` admits intrinsically identified signed `COMMIT` and
   unsigned `MERGE` and `DERIVE` records without a mutable head, CAS, tombstone,
@@ -270,17 +270,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spread preserve all four channels without making descriptions participate in
   content-derived entity identity. The `SimpleArchive` collection helper now
   accepts one fragment, archives its facts as data and its metafacts as metadata,
-  and stages every shared attachment behind the pre-`COMMIT` durability barrier.
+  and writes every shared attachment before the native `COMMIT` record.
   Publication recomputes embedded byte identities and rejects forged store keys
   or cached handles before writing.
-- **Canonical collection records can be published with explicit crash-order
-  barriers.** The concrete `SimpleArchive` union kind now normalizes and
-  validates supplied bytes, flushes descriptor and element dependencies
-  before writing a signed `COMMIT` or exact `MERGE`, and flushes the record
-  before returning. Completed operation prefixes leave only inert dependencies
-  or a record whose dependencies were already durable. Replay after any
-  backend-required I/O recovery is content-addressed and idempotent, without a
-  repository transaction layer.
+- **Canonical collection records preserve dependency-before-record order.**
+  The concrete `SimpleArchive` union kind normalizes and validates supplied
+  bytes, writes descriptor and element dependencies before a signed `COMMIT`
+  or exact `MERGE`, and leaves durability barriers to explicit caller policy.
+  Completed operation prefixes leave only inert dependencies or a record whose
+  dependencies were already admitted. Replay after any backend-required I/O
+  recovery is content-addressed and idempotent, without a repository
+  transaction layer.
 - **Discovered collection records now resolve through a stateless production
   semantic layer.** Callers select eligible self-signed commits and validate
   descriptor-bound `COMMIT`, `MERGE`, and `DERIVE` claims through one narrow
@@ -371,6 +371,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Ordinary collection publication no longer implies a durability barrier.**
+  Commit and merge publication still writes every content-addressed dependency
+  before its native collection record, but performs no implicit storage flush.
+  Callers may batch publications behind an explicit `StorageFlush::flush()` or
+  rely on storage close, matching Pile's append-only visibility model and
+  removing two `sync_all` calls from every collection commit.
+
 - **The collection-native pile-sync protocol now fails fast against legacy
   peers through ALPN `/triblespace/pile-sync/5`.** Protocol v4 still exposed
   branch operations and used a different collection-evidence frame width;
@@ -391,7 +398,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The optional telemetry sink now publishes native collection commits.**
   Per-thread `Fragment` batches retain their attachments until a central
-  `Collection<Pile>` durably commits them, carry the telemetry protocol as
+  `Collection<Pile>` commits them, carry the telemetry protocol as
   metafacts, and remain intact for an identical retry after publication
   failure. `TELEMETRY_COLLECTION_SCOPE` replaces the former branch setting;
   telemetry no longer creates Repository/Workspace histories or CAS heads.

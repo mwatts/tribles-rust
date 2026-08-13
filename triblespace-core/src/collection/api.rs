@@ -318,12 +318,12 @@ impl<S> Collection<S> {
 
 impl<S> Collection<S>
 where
-    S: BlobStorePut + CollectionStore + StorageFlush,
+    S: BlobStorePut + CollectionStore,
 {
     /// Publish one self-contained fragment as an independent signed commit.
     ///
     /// Facts are the collection element, metafacts are commit metadata, and
-    /// fragment attachments are staged through the same crash-ordered,
+    /// fragment attachments are staged through the same ordered,
     /// content-addressed path as
     /// [`simplearchive_union::publish_fragment_commit`]. Repeating identical
     /// input is idempotent; distinct commits coexist without selecting a head.
@@ -332,10 +332,7 @@ where
     pub fn commit(
         &mut self,
         fragment: Fragment,
-    ) -> Result<
-        CollectionCommit,
-        PublicationError<S::PutError, S::InsertError, <S as StorageFlush>::Error>,
-    > {
+    ) -> Result<CollectionCommit, PublicationError<S::PutError, S::InsertError>> {
         simplearchive_union::publish_fragment_commit(
             &mut self.storage,
             &self.descriptor,
@@ -845,6 +842,20 @@ where
     /// Consume the facade and close its underlying storage.
     pub fn close(self) -> Result<(), S::Error> {
         self.storage.close()
+    }
+}
+
+impl<S> Collection<S>
+where
+    S: StorageFlush,
+{
+    /// Explicitly make pending storage writes crash-durable.
+    ///
+    /// Ordinary collection publication deliberately does not call this. The
+    /// caller chooses the durability cadence and may batch any number of
+    /// commits or equations behind one barrier.
+    pub fn flush(&mut self) -> Result<(), S::Error> {
+        self.storage.flush()
     }
 }
 
