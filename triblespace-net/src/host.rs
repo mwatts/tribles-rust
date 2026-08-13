@@ -578,6 +578,39 @@ impl NetSender {
         *self.snapshot.lock().unwrap() = Some(boxed);
     }
 
+    /// Remove the serving view immediately. Every authenticated data operation
+    /// treats an absent snapshot as unavailable/out of scope, so this is the
+    /// fail-closed transition when a current store view cannot be produced.
+    fn clear_snapshot(&self) {
+        *self.snapshot.lock().unwrap() = None;
+    }
+
+    /// Replace the host's serving view with the store's current snapshot.
+    ///
+    /// Snapshot construction is replacement semantics, not best-effort cache
+    /// refresh: after a prior success, retaining that old view on failure could
+    /// keep a revoked pin head authorized indefinitely. Failure therefore
+    /// clears the slot, and a later successful refresh restores service.
+    pub(crate) fn refresh_store_snapshot<S>(&self, store: &mut S) -> bool
+    where
+        S: triblespace_core::repo::BlobStore
+            + triblespace_core::repo::PinSnapshotSource
+            + CollectionStore
+            + CollectionGossipStore,
+    {
+        match StoreSnapshot::from_store(store) {
+            Some(snapshot) => {
+                self.update_snapshot(snapshot);
+                true
+            }
+            None => {
+                warn!("store snapshot unavailable; clearing serving view");
+                self.clear_snapshot();
+                false
+            }
+        }
+    }
+
     /// Swarm-addressed on-demand blob fetch (lazy read-miss) — run
     /// **inline**, not via the command loop. Awaits the network
     /// capability becoming ready (published once the host's transport
@@ -2347,5 +2380,153 @@ mod collection_evidence_gossip_tests {
         remove_transient_routing_candidate(&candidates, &configured, transient_peer);
         remove_transient_routing_candidate(&candidates, &configured, configured_peer);
         assert_eq!(*candidates.lock().unwrap(), vec![configured_peer]);
+    }
+}
+
+#[cfg(test)]
+mod serving_snapshot_tests {
+    use std::convert::Infallible;
+    use std::fmt;
+
+    use ed25519_dalek::SigningKey;
+    use iroh_base::EndpointId;
+    use triblespace_core::blob::{BlobEncoding, IntoBlob};
+    use triblespace_core::collection::{
+        CollectionGossip, CollectionGossipStore, CollectionRecord, CollectionStore,
+    };
+    use triblespace_core::id::Id;
+    use triblespace_core::inline::encodings::hash::Handle;
+    use triblespace_core::inline::{Inline, InlineEncoding};
+    use triblespace_core::repo::memoryrepo::MemoryRepo;
+    use triblespace_core::repo::{
+        BlobStore, BlobStorePut, PinSnapshot, PinSnapshotSource, PinStore,
+    };
+
+    use super::wire;
+
+    #[derive(Debug)]
+    struct SnapshotUnavailable;
+
+    impl fmt::Display for SnapshotUnavailable {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("snapshot unavailable")
+        }
+    }
+
+    impl std::error::Error for SnapshotUnavailable {}
+
+    /// A normal in-memory store behind a deliberately fallible observational
+    /// pin-snapshot boundary. It does not implement PinStore itself, proving
+    /// the host needs only the narrow source capability.
+    struct FallibleSnapshotStore {
+        inner: MemoryRepo,
+        fail_snapshot: bool,
+    }
+
+    impl BlobStorePut for FallibleSnapshotStore {
+        type PutError = <MemoryRepo as BlobStorePut>::PutError;
+
+        fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
+        where
+            S: BlobEncoding + 'static,
+            T: IntoBlob<S>,
+            Handle<S>: InlineEncoding,
+        {
+            self.inner.put(item)
+        }
+    }
+
+    impl BlobStore for FallibleSnapshotStore {
+        type Reader = <MemoryRepo as BlobStore>::Reader;
+        type ReaderError = <MemoryRepo as BlobStore>::ReaderError;
+
+        fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
+            self.inner.reader()
+        }
+    }
+
+    impl CollectionStore for FallibleSnapshotStore {
+        type RecordsError = Infallible;
+        type InsertError = Infallible;
+        type RecordIter<'a> = <MemoryRepo as CollectionStore>::RecordIter<'a>;
+
+        fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+            self.inner.records()
+        }
+
+        fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
+            self.inner.insert(record)
+        }
+    }
+
+    impl CollectionGossipStore for FallibleSnapshotStore {
+        type GossipsError = Infallible;
+        type GossipError = Infallible;
+        type GossipIter<'a> = <MemoryRepo as CollectionGossipStore>::GossipIter<'a>;
+
+        fn gossips<'a>(&'a mut self) -> Result<Self::GossipIter<'a>, Self::GossipsError> {
+            self.inner.gossips()
+        }
+
+        fn gossip(&mut self, grant: CollectionGossip) -> Result<(), Self::GossipError> {
+            self.inner.gossip(grant)
+        }
+    }
+
+    impl PinSnapshotSource for FallibleSnapshotStore {
+        type PinSnapshotError = SnapshotUnavailable;
+
+        fn snapshot_pin_heads(&mut self) -> Result<PinSnapshot, Self::PinSnapshotError> {
+            if self.fail_snapshot {
+                Err(SnapshotUnavailable)
+            } else {
+                Ok(PinStore::pin_snapshot(&mut self.inner)
+                    .expect("MemoryRepo pin snapshots are infallible"))
+            }
+        }
+    }
+
+    #[test]
+    fn failed_refresh_clears_a_previously_authorizing_snapshot() {
+        let branch = Id::new([0x31; 16]).unwrap();
+        let head = Inline::new([0x42; 32]);
+        let mut inner = MemoryRepo::default();
+        assert!(matches!(
+            inner.update(branch, None, Some(head)).unwrap(),
+            triblespace_core::repo::PushResult::Success()
+        ));
+        let mut store = FallibleSnapshotStore {
+            inner,
+            fail_snapshot: false,
+        };
+
+        let key = SigningKey::from_bytes(&[0x71; 32]);
+        let endpoint = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
+        let (sender, _receiver, wiring) = wire(endpoint);
+
+        assert!(sender.refresh_store_snapshot(&mut store));
+        {
+            let guard = wiring.snapshot.lock().unwrap();
+            let snapshot = guard.as_ref().expect("first snapshot succeeds");
+            assert_eq!(
+                snapshot.pin_heads().get(&branch.into()),
+                Some(&head),
+                "the good snapshot authorizes reachability from this pin head"
+            );
+        }
+
+        store.fail_snapshot = true;
+        assert!(!sender.refresh_store_snapshot(&mut store));
+        assert!(
+            wiring.snapshot.lock().unwrap().is_none(),
+            "construction failure must clear the prior roots; request handlers deny when no snapshot is installed"
+        );
+
+        store.fail_snapshot = false;
+        assert!(sender.refresh_store_snapshot(&mut store));
+        assert!(
+            wiring.snapshot.lock().unwrap().is_some(),
+            "a later successful refresh restores service"
+        );
     }
 }

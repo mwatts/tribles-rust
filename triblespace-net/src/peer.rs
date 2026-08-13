@@ -69,7 +69,7 @@ use crate::collection_sync::{
     IncomingBatchCounts, IncomingBatchValidationError, prepare_incoming_collection_batch,
 };
 use crate::collection_wire::CollectionCommitEvidence;
-use crate::host::{self, NetReceiver, NetSender, StoreSnapshot};
+use crate::host::{self, NetReceiver, NetSender};
 use crate::protocol::RawHash;
 
 pub use crate::host::{PeerConfig, SyncDirection};
@@ -307,9 +307,7 @@ where
     ) -> Self {
         // Seed the snapshot served by the network thread so peers
         // requesting via the protocol see our current state immediately.
-        if let Some(snap) = StoreSnapshot::from_store(&mut store) {
-            sender.update_snapshot(snap);
-        }
+        sender.refresh_store_snapshot(&mut store);
 
         // Baseline starts as None. The first `refresh` will diff the
         // store against this and announce every existing blob to the
@@ -457,10 +455,9 @@ where
         let outcome = authorized
             .admit(&mut *store)
             .map_err(|error| CollectionReconcileError::Admission(anyhow::Error::new(error)))?;
-        if let Some(snapshot) = StoreSnapshot::from_store(&mut *store) {
-            self.sender.update_snapshot(snapshot);
+        if self.sender.refresh_store_snapshot(&mut *store) {
+            self.last_blob_reader = store.reader().ok();
         }
-        self.last_blob_reader = store.reader().ok();
         Ok(outcome)
     }
 
@@ -598,9 +595,7 @@ where
         // false` on the still-stale snapshot and the server would deny
         // OP_CHILDREN/OP_GET_BLOB as "out of scope" — even though we
         // just told them we have it.
-        if let Some(snap) = StoreSnapshot::from_store(&mut *store) {
-            self.sender.update_snapshot(snap);
-        }
+        let serving_snapshot_ready = self.sender.refresh_store_snapshot(&mut *store);
 
         // ── Phase 3: diff-and-publish blob deltas ─────────────────────
         // ReadOnly skips the publish: we still update the baseline
@@ -610,7 +605,7 @@ where
         // covers the initial pile contents without a separate startup
         // sweep (and without the race that two separate `reader()`
         // calls introduced).
-        if let Ok(current) = store.reader() {
+        if serving_snapshot_ready && let Ok(current) = store.reader() {
             if self.direction != SyncDirection::ReadOnly {
                 match self.last_blob_reader.as_ref() {
                     Some(baseline) => {
@@ -1070,11 +1065,11 @@ where
     /// methods that aren't part of the storage traits (e.g.
     /// `Pile::flush`, `Yard::collect`, `WantStore::wants`).
     ///
-    /// Writes through this borrow bypass the Peer's auto-publish and
-    /// become invisible to the network until the next
-    /// [`refresh`](Self::refresh) (which is auto-called on the next
-    /// read). Don't hold the guard across calls back into the Peer —
-    /// its own methods take the same lock.
+    /// Writes through this borrow bypass the Peer's auto-publish and serving
+    /// snapshot. In particular, after changing a pin used by branch-restricted
+    /// authorization, drop the guard and call [`refresh`](Self::refresh) before
+    /// treating a pin revocation as effective. Don't hold the guard across
+    /// calls back into the Peer — its own methods take the same lock.
     pub fn store(&self) -> MutexGuard<'_, S> {
         self.store.lock().expect("store mutex")
     }
@@ -1214,14 +1209,13 @@ where
         // ordering rationale. Without this, DHT-receivers of the announce
         // dial us, OP_GET_BLOB hits the stale snapshot, returns missing,
         // and the receiver waits for backoff to retry.
-        if let Some(snap) = StoreSnapshot::from_store(&mut *store) {
-            self.sender.update_snapshot(snap);
+        if self.sender.refresh_store_snapshot(&mut *store) {
+            if self.direction != SyncDirection::ReadOnly {
+                self.sender.announce(handle.raw);
+            }
+            // Update the blob baseline so refresh doesn't double-announce.
+            self.last_blob_reader = store.reader().ok();
         }
-        if self.direction != SyncDirection::ReadOnly {
-            self.sender.announce(handle.raw);
-        }
-        // Update the blob baseline so refresh doesn't double-announce.
-        self.last_blob_reader = store.reader().ok();
         Ok(handle)
     }
 }
