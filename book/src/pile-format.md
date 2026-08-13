@@ -302,14 +302,15 @@ explains how to query these fields through the `PileReader` API.
 
 ## Native Collection Records
 
-`CollectionStore` is a grow-only set of canonical collection-calculus records:
+`CollectionStore` is a grow-only set of typed collection-calculus records:
 signed `COMMIT` assertions and unsigned `MERGE` and `DERIVE` equations. The
 pile stores these three kinds directly as fixed one-block enveloped records.
-Their semantic kind IDs retain the V4 markers. They are
+Their pile record-kind markers retain the V4 values. They are
 **not blob records**, have no following payload, and carry no insertion
 timestamp. They are also distinct from mutable branch pins and wants:
 collection records have no head, tombstone, or
-last-writer-wins update. Their logical key is the record's intrinsic entity ID.
+last-writer-wins update. Their logical key is a content-derived 16-byte record
+ID; a collection record is not a trible entity.
 
 The collection itself is identified by a canonical `SimpleArchive` descriptor
 containing `(scope, representation, recipe)`. Its 32-byte blob handle is the
@@ -318,8 +319,10 @@ record or registry. Consequently a transferred claim names the exact descriptor
 bytes needed to interpret it, using the ordinary blob store.
 
 The magic markers below identify the compact pile representation. They are
-wire-format markers, not the `metadata::tag` IDs found in the equivalent
-canonical `SimpleArchive` entities.
+storage-envelope markers, distinct both from the stable semantic kind IDs used
+in record-ID/signature domains and from the one-byte versioned tags used by
+generic dense record stores. There is no equivalent `SimpleArchive` form for
+these algebra records.
 
 | Kind | V4 kind ID | Kind-specific byte layout after the common prefix |
 |---|---|---|
@@ -333,15 +336,16 @@ inputs are stored in lexicographic digest order (`low <= high`), so swapping
 the two operands cannot create a second representation of the same
 commutative equation.
 
-The intrinsic record ID is deliberately absent from these headers. On replay,
-the decoder reconstructs the exact canonical one-root entity from the stored
-fields and its collection-record kind tag, then derives the root ID from that
-fact set. For a commit this reconstruction includes the public key and both
-signature components. Consequently the compact pile header and the canonical
-`SimpleArchive` form identify the same semantic record without trusting a
-separately stored key.
+The record ID is deliberately absent from these headers. On replay, the
+decoder reconstructs the record's exact dense typed payload: 192 bytes for a
+commit and 128 bytes for a merge or derive. It hashes a domain separator,
+record-ID version, stable semantic kind ID, and every payload byte with BLAKE3,
+then uses the digest's final 16 bytes as the record ID. For a commit the payload
+includes the public key and both signature components. Consequently the pile
+header and the typed dense codec identify the same semantic record without
+trusting a separately stored key.
 
-Pile replay keeps the records in intrinsic-ID order. Re-inserting an identical
+Pile replay keeps the records in record-ID order. Re-inserting an identical
 record is an idempotent success; a different record reconstructing to the same
 ID is reported as a collision. Concatenating piles therefore gives set-union
 semantics for collection records: append order and duplicate copies do not

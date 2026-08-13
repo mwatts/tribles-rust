@@ -41,11 +41,14 @@ let storage = collection.into_storage();
 A collection descriptor is a canonical `SimpleArchive` containing exactly the
 dataset **scope**, blob **representation**, and algebraic **recipe**. Its
 32-byte content handle is the `CollectionId`. `COMMIT`, `MERGE`, and `DERIVE`
-records carry descriptor handles directly, so any claim can resolve and verify
-its own collection semantics through the ordinary blob store. There is no
-separate definition record or registry whose synchronization could make an
-otherwise complete claim ambiguous. `Collection::new` constructs the canonical
-`SimpleArchive`-union descriptor for the supplied scope.
+are native typed algebra records rather than trible sets or blobs. Their exact
+dense payloads are 192, 128, and 128 bytes respectively, and carry descriptor
+handles directly, so any claim can resolve and verify its own collection
+semantics through the ordinary blob store. There is no separate definition
+record or registry whose synchronization could make an otherwise complete
+claim ambiguous. `Collection::new` constructs the canonical
+`SimpleArchive`-union descriptor for the supplied scope. The descriptor is the
+only collection-control structure represented as a `SimpleArchive`.
 
 The fragment remains self-contained across the publication boundary: its facts
 become the collection's canonical `SimpleArchive` data element, its metafacts
@@ -97,12 +100,15 @@ reader.
 `CollectionStore` surface. `ObjectStoreRemote` exposes the corresponding async
 surface and can be used with `Collection` through `Blocking`. Under the
 configured object-store prefix, each record is a create-only object at
-`collection-records/<intrinsic-record-id>` whose bytes are the record's
-canonical `SimpleArchive`. Listing is an observed monotone view rather than a
-global snapshot: a concurrent immutable insert may appear on this list or the
-next, but any observed object is decoded and checked against the ID in its
-path. Descriptor blobs use the ordinary blob namespace; `CollectionStore`
-contains only `COMMIT`, `MERGE`, and `DERIVE`.
+`collection-records/<record-id>`. Its bytes are a one-byte, layout-versioned
+variant tag followed by the exact dense typed payload. A future payload layout
+receives a new tag rather than reinterpreting an existing one. Listing is an
+observed monotone view rather than a global snapshot: a concurrent immutable
+insert may appear on this list or the next, but every observed object is
+decoded, has its record ID recomputed from its semantic kind and dense payload,
+and is checked against the ID in its path. Descriptor blobs use the ordinary
+blob namespace; `CollectionStore` contains only `COMMIT`, `MERGE`, and
+`DERIVE`.
 
 This collection path coexists with the branch-oriented `Repository` and
 `Workspace` APIs documented below. Native collection records are not pin
