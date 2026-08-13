@@ -29,7 +29,7 @@
 //! commits are discovered through the team gossip mesh; content and exact
 //! receipts remain explicitly fetched through this read-only protocol.
 
-pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/4";
+pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/5";
 
 // Operation types — first byte on each stream.
 // 0x01 was the retired branch-list operation.

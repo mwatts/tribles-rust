@@ -371,6 +371,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The collection-native pile-sync protocol now fails fast against legacy
+  peers through ALPN `/triblespace/pile-sync/5`.** Protocol v4 still exposed
+  branch operations and used a different collection-evidence frame width;
+  advertising that same ALPN after removing those operations made mixed peers
+  negotiate successfully and then disagree on the wire. There is deliberately
+  no compatibility shim. Direction policy applies only to replication data;
+  capability requests, deliveries, and acknowledgements remain live for every
+  direction.
+
 - **Durable demand/cache interest is now a standalone `WantStore`.** The
   public `want`, `unwant`, and `wants` surface no longer inherits named
   compare-and-swap pins, so lazy readers and cache policy can compose with

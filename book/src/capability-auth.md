@@ -3,7 +3,7 @@
 The [`triblespace-net`](https://github.com/triblespace/triblespace-rs/tree/main/triblespace-net)
 crate ships a chain-of-trust capability system on top of iroh's
 TLS-verified peer identities. Every connection on the
-`/triblespace/pile-sync/4` ALPN must present a capability before any
+`/triblespace/pile-sync/5` ALPN must present a capability before any
 other op is served. This chapter explains the team model, the CLI
 lifecycle, and the two-tier scope gate the relay enforces.
 
@@ -156,7 +156,7 @@ every other peer's cap.
 
 ## Wire Protocol
 
-Protocol v4 (`/triblespace/pile-sync/4`) makes auth mandatory:
+Protocol v5 (`/triblespace/pile-sync/5`) makes auth mandatory:
 
 | Op | Byte | Meaning |
 |---|---:|---|

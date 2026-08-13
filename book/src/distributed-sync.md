@@ -132,7 +132,7 @@ separate `Blob(result)` WANT.
 ## Authenticated read protocol
 
 All point-to-point operations use `PILE_SYNC_ALPN =
-"/triblespace/pile-sync/4"`. The first stream on a connection must be
+"/triblespace/pile-sync/5"`. The first stream on a connection must be
 `OP_AUTH`, which proves a capability chain back to the configured team root.
 The remaining protocol is read-only:
 
@@ -172,7 +172,9 @@ semantics:
 - `WriteOnly` publishes but discards incoming evidence and does not fetch.
 
 These are runtime bandwidth policies, not durable retractions or alternate
-collection modes.
+collection modes. They apply to replication data only: capability requests,
+deliveries, and delivery acknowledgements remain accepted so authorization can
+still be established and renewed.
 
 ## CLI
 

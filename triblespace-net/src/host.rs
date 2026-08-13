@@ -123,7 +123,7 @@ pub(crate) fn dot_stripped_default_relay_map() -> iroh::RelayMap {
 }
 
 /// Configuration for [`Peer::new`](crate::peer::Peer::new). No
-/// `Default` impl — auth is mandatory in protocol v4 so every peer
+/// `Default` impl — auth is mandatory in protocol v5 so every peer
 /// construction site must explicitly choose a team root. For solo
 /// workflows the convention is `team_root = signing_key.verifying_key()`
 /// (the user is the team root and the founder of a team-of-one);
@@ -149,7 +149,7 @@ pub struct PeerConfig {
     pub team_root: ed25519_dalek::VerifyingKey,
     /// This node's own capability sig handle. Presented to remote peers
     /// as the first stream on every outgoing connection so they can
-    /// authorise us. Required — protocol v4 has mandatory auth on both
+    /// authorise us. Required — protocol v5 has mandatory auth on both
     /// directions of a connection.
     pub self_cap: RawHash,
     /// Direction of participation in the team swarm. Controls whether this
@@ -183,7 +183,7 @@ pub enum SyncDirection {
 }
 
 // No `Default` impl: every PeerConfig must specify a team root because
-// auth is mandatory in protocol v4. For a single-user OSS deployment
+// auth is mandatory in protocol v5. For a single-user OSS deployment
 // the convention is `team_root = signing_key.verifying_key()` (the user
 // is the team root and the founder of a team-of-one).
 
@@ -832,7 +832,7 @@ const DIAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 const OP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Connect to a peer over the pile-sync ALPN and immediately present
-/// our capability so subsequent ops are authorised. Protocol v4 makes
+/// our capability so subsequent ops are authorised. Protocol v5 makes
 /// this mandatory — the server rejects any op until the connection
 /// completes auth.
 #[instrument(level = "info", skip(t, self_cap), fields(peer = %hex::encode(&peer[..4])))]
@@ -1424,7 +1424,7 @@ async fn children_one<T: Transport>(
 #[derive(Clone)]
 struct SnapshotHandler<T: Transport> {
     snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
-    /// Verifies all incoming capability chains. Required — protocol v4
+    /// Verifies all incoming capability chains. Required — protocol v5
     /// has mandatory auth.
     team_root: ed25519_dalek::VerifyingKey,
     /// Transport for outbound connections + DHT provider lookup
@@ -1464,7 +1464,7 @@ struct HandshakeHandler<T: Transport> {
     /// Snapshot for local-pile blob lookup during verify.
     snapshot: Arc<Mutex<Option<Box<dyn AnySnapshot>>>>,
     /// Transport + pool are the swarm-fetch substrate. When the
-    /// local-pile verify fails with `Fetch`, we open `pile-sync/4`
+    /// local-pile verify fails with `Fetch`, we open `pile-sync/5`
     /// to providers of the missing blobs (DHT providers first,
     /// dialer as fallback) and walk the chain via `OP_CHILDREN` +
     /// `OP_GET_BLOB` until we have everything verify needs. The
