@@ -62,7 +62,7 @@ use triblespace_core::repo::{
 
 use crate::channel::{NetEvent, PublisherKey};
 use crate::collection_sync::{
-    IncomingBatchCounts, IncomingBatchValidationError, prepare_incoming_simplearchive_union_batch,
+    IncomingBatchCounts, IncomingBatchValidationError, prepare_incoming_collection_batch,
 };
 use crate::host::{self, NetReceiver, NetSender, StoreSnapshot};
 use crate::protocol::RawHash;
@@ -76,7 +76,7 @@ pub type CollectionReconcileOutcome = IncomingBatchCounts;
 /// direct collection reconciliation.
 #[derive(Debug, thiserror::Error)]
 pub enum CollectionReconcileError {
-    /// Authenticated evidence/closure transfer failed.
+    /// Authenticated evidence transfer failed.
     #[error("collection fetch failed: {0}")]
     Fetch(#[source] anyhow::Error),
     /// Cryptographic or collection-semantic validation failed before mutation.
@@ -330,28 +330,25 @@ where
         self.sender.fetch_blob(hash, budget).await
     }
 
-    /// Fetch one exact collection's grant-backed commit evidence and named
-    /// blob closure directly from `peer`.
+    /// Fetch one exact collection's grant-backed commit evidence from `peer`.
     ///
-    /// The transport runs on the jailed host runtime. The returned bundle is
-    /// strictly verified but inert: this method does not insert blobs,
-    /// collection records, or gossip grants into the local store.
-    pub fn fetch_collection_from(
+    /// The transport runs on the jailed host runtime. The returned evidence
+    /// is strictly verified but inert: this method does not mutate the local
+    /// store or fetch any blob referenced by a commit.
+    pub fn fetch_collection_evidence_from(
         &self,
         peer: [u8; 32],
         collection: triblespace_core::collection::CollectionId,
-    ) -> anyhow::Result<crate::collection_wire::CollectionFetch> {
-        self.sender.fetch_collection(peer, collection)
+    ) -> anyhow::Result<Vec<crate::collection_wire::CollectionCommitEvidence>> {
+        self.sender.fetch_collection_evidence(peer, collection)
     }
 
     /// Reconcile one exact collection from a specific peer.
     ///
     /// Transport work completes before the store lock is taken. Each grant /
-    /// commit pair and every fetched blob are independently verified, then
-    /// caller policy decides before the first mutation. Accepted commits use
-    /// the admission layer's dependency-flush → commit-flush ordering. The
-    /// resulting serving snapshot is refreshed without invoking legacy branch
-    /// or DHT publication machinery.
+    /// commit pair is independently verified, then caller policy decides the
+    /// complete batch before the first mutation. Accepted evidence is inserted
+    /// and flushed once; referenced blobs remain independent, lazy resources.
     pub fn reconcile_collection_from<AuthorizationError, Authorize>(
         &mut self,
         peer: [u8; 32],
@@ -361,24 +358,18 @@ where
     where
         AuthorizationError: std::error::Error + Send + Sync + 'static,
         Authorize: FnMut(
-            &triblespace_core::collection::CollectionDescriptor,
             &triblespace_core::collection::CollectionCommit,
             &triblespace_core::collection::CollectionGossip,
         ) -> Result<bool, AuthorizationError>,
     {
-        let fetched = self
-            .fetch_collection_from(peer, collection)
+        let evidence = self
+            .fetch_collection_evidence_from(peer, collection)
             .map_err(CollectionReconcileError::Fetch)?;
-        let (evidence, blobs) = fetched.into_parts();
-        let blobs: crate::collection_sync::IncomingBlobBundle = blobs
-            .into_iter()
-            .map(|(hash, bytes)| (Inline::new(hash), Bytes::from_source(bytes)))
-            .collect();
         let evidence = evidence
             .into_iter()
             .map(|item| (item.commit(), item.grant()))
             .collect();
-        let prepared = prepare_incoming_simplearchive_union_batch(evidence, blobs)
+        let prepared = prepare_incoming_collection_batch(evidence)
             .map_err(CollectionReconcileError::Validation)?;
         let authorized = prepared
             .authorize(authorize)

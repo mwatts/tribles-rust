@@ -3,11 +3,11 @@
 //! The wire surface deliberately carries evidence rather than admission
 //! decisions. A server enumerates only strictly verified
 //! [`CollectionGossip`] / [`CollectionCommit`] pairs for one exact
-//! descriptor handle. A client verifies the pair again, then may fetch the
-//! complete content-addressed closure rooted at the descriptor, data, and
-//! metadata handles. Nothing in this module mutates a destination store.
+//! descriptor handle. A client verifies the pair again and may admit that
+//! sparse evidence without fetching any referenced blob. Nothing in this
+//! module mutates a destination store.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
@@ -18,8 +18,7 @@ use triblespace_core::collection::{
 };
 
 use crate::protocol::{
-    COLLECTION_EVIDENCE_REJECTED, OP_COLLECTION_EVIDENCE, RawHash, op_children, op_get_blob,
-    recv_u32_be, send_hash, send_u8,
+    COLLECTION_EVIDENCE_REJECTED, OP_COLLECTION_EVIDENCE, recv_u32_be, send_hash, send_u8,
 };
 use crate::transport::Conn;
 
@@ -99,15 +98,6 @@ impl CollectionCommitEvidence {
     /// Exact canonical signed membership assertion.
     pub fn commit(&self) -> CollectionCommit {
         self.commit
-    }
-
-    /// Exact blob roots named by this commit: descriptor, data, and metadata.
-    pub fn roots(&self) -> [RawHash; 3] {
-        [
-            self.commit.collection().raw,
-            self.commit.data().raw,
-            self.commit.metadata().raw,
-        ]
     }
 }
 
@@ -217,48 +207,6 @@ pub(crate) fn grant_backed_commits(
     evidence
 }
 
-/// Complete read-only result of fetching one peer's grant-backed commits and
-/// the content-addressed closure rooted by those commits.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CollectionFetch {
-    collection: CollectionId,
-    evidence: Vec<CollectionCommitEvidence>,
-    roots: BTreeSet<RawHash>,
-    blobs: BTreeMap<RawHash, Vec<u8>>,
-}
-
-impl CollectionFetch {
-    /// Exact collection requested from the peer.
-    pub fn collection(&self) -> CollectionId {
-        self.collection
-    }
-
-    /// Strictly verified evidence, sorted by intrinsic commit id.
-    pub fn evidence(&self) -> &[CollectionCommitEvidence] {
-        &self.evidence
-    }
-
-    /// Descriptor/data/metadata roots named by the evidence.
-    pub fn roots(&self) -> &BTreeSet<RawHash> {
-        &self.roots
-    }
-
-    /// Verified bytes for every root and conservatively discovered descendant,
-    /// keyed by exact Blake3 identity.
-    pub fn blobs(&self) -> &BTreeMap<RawHash, Vec<u8>> {
-        &self.blobs
-    }
-
-    /// Consume the transfer into its verified evidence and content-addressed
-    /// blob bundle.
-    ///
-    /// This is the admission path: ownership moves into the store-facing
-    /// validator without cloning every fetched blob.
-    pub fn into_parts(self) -> (Vec<CollectionCommitEvidence>, BTreeMap<RawHash, Vec<u8>>) {
-        (self.evidence, self.blobs)
-    }
-}
-
 /// Enumerate strictly framed evidence for one exact collection over an
 /// already-authenticated connection.
 pub async fn op_collection_evidence<C: Conn>(
@@ -326,57 +274,6 @@ pub async fn op_collection_evidence<C: Conn>(
     Ok(evidence)
 }
 
-/// Fetch a peer's grant-backed evidence and every blob in the closure rooted
-/// at the exact descriptor/data/metadata handles. The returned bytes are
-/// hash-verified and remain inert; callers choose whether and how to admit
-/// them.
-pub async fn fetch_collection<C: Conn>(
-    conn: &C,
-    collection: CollectionId,
-) -> anyhow::Result<CollectionFetch> {
-    let evidence = op_collection_evidence(conn, collection).await?;
-    let roots: BTreeSet<RawHash> = evidence
-        .iter()
-        .flat_map(CollectionCommitEvidence::roots)
-        .collect();
-
-    let mut closure = BTreeSet::new();
-    let mut pending = roots.clone();
-    while let Some(parent) = pending.pop_first() {
-        if !closure.insert(parent) {
-            continue;
-        }
-        for child in op_children(conn, &parent).await? {
-            if !closure.contains(&child) {
-                pending.insert(child);
-            }
-        }
-    }
-
-    let mut blobs = BTreeMap::new();
-    for hash in closure {
-        let bytes = op_get_blob(conn, &hash)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("peer omitted collection blob {}", hex::encode(hash)))?;
-        let actual = *blake3::hash(&bytes).as_bytes();
-        if actual != hash {
-            return Err(anyhow::anyhow!(
-                "collection blob hash mismatch: expected {}, received {}",
-                hex::encode(hash),
-                hex::encode(actual),
-            ));
-        }
-        blobs.insert(hash, bytes);
-    }
-
-    Ok(CollectionFetch {
-        collection,
-        evidence,
-        roots,
-        blobs,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use ed25519_dalek::SigningKey;
@@ -418,14 +315,6 @@ mod tests {
         assert_eq!(
             CollectionCommitEvidence::decode(&evidence.encode()).unwrap(),
             evidence
-        );
-        assert_eq!(
-            evidence.roots(),
-            [
-                descriptor.handle().raw,
-                commit.data().raw,
-                commit.metadata().raw,
-            ]
         );
 
         let other = SigningKey::from_bytes(&[8; 32]);

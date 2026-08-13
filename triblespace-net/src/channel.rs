@@ -17,7 +17,7 @@ use anybytes::Bytes;
 use std::sync::mpsc;
 use triblespace_core::collection::CollectionId;
 
-use crate::collection_wire::CollectionFetch;
+use crate::collection_wire::CollectionCommitEvidence;
 use crate::protocol::{RawHash, RawPinId};
 use crate::transport::PeerId;
 
@@ -57,14 +57,13 @@ pub enum NetCommand {
         cap_bytes: Bytes,
         sig_bytes: Bytes,
     },
-    /// Fetch one exact collection's grant-backed evidence and blob closure
-    /// from a specific authenticated peer.  The host runtime executes the
-    /// async transport work; the synchronous `Peer` side receives inert
-    /// evidence and owns admission policy.
-    FetchCollection {
+    /// Fetch one exact collection's grant-backed sparse evidence from a
+    /// specific authenticated peer. The host runtime executes the async
+    /// transport work; the synchronous `Peer` side owns admission policy.
+    FetchCollectionEvidence {
         peer: PeerId,
         collection: CollectionId,
-        reply: mpsc::Sender<anyhow::Result<CollectionFetch>>,
+        reply: mpsc::Sender<anyhow::Result<Vec<CollectionCommitEvidence>>>,
     },
     // The swarm-addressed read-miss fetch is no longer a command: it
     // runs inline via `NetSender::fetch_blob` / `host::NetCapability`,

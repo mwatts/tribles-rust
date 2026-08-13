@@ -19,7 +19,7 @@ use triblespace_core::collection::{
 };
 
 use crate::channel::{NetCommand, NetEvent, PublisherKey};
-use crate::collection_wire::{CollectionCommitEvidence, CollectionFetch, grant_backed_commits};
+use crate::collection_wire::{CollectionCommitEvidence, grant_backed_commits};
 use crate::identity::iroh_secret;
 use crate::protocol::*;
 use crate::transport::{Conn, GossipEvent, GossipSink, Harness, PeerId, Transport};
@@ -417,19 +417,19 @@ impl NetSender {
         }
     }
 
-    /// Ask the jailed host runtime to fetch inert collection evidence.
+    /// Ask the jailed host runtime to fetch inert sparse collection evidence.
     ///
     /// There is deliberately no public deadline knob. Existing transport
     /// stage deadlines bound the operation; channel failure reports that the
     /// host stopped. This method never mutates a store.
-    pub fn fetch_collection(
+    pub fn fetch_collection_evidence(
         &self,
         peer: PeerId,
         collection: CollectionId,
-    ) -> anyhow::Result<CollectionFetch> {
+    ) -> anyhow::Result<Vec<CollectionCommitEvidence>> {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         self.cmd_tx
-            .send(NetCommand::FetchCollection {
+            .send(NetCommand::FetchCollectionEvidence {
                 peer,
                 collection,
                 reply: reply_tx,
@@ -894,7 +894,7 @@ async fn host_loop<T: Transport>(
                         conn.close(0, b"ok");
                     });
                 }
-                NetCommand::FetchCollection {
+                NetCommand::FetchCollectionEvidence {
                     peer,
                     collection,
                     reply,
@@ -914,10 +914,13 @@ async fn host_loop<T: Transport>(
                                     hex::encode(peer),
                                 );
                             };
-                            match crate::collection_wire::fetch_collection(&connection, collection)
-                                .await
+                            match crate::collection_wire::op_collection_evidence(
+                                &connection,
+                                collection,
+                            )
+                            .await
                             {
-                                Ok(fetch) => Ok(fetch),
+                                Ok(evidence) => Ok(evidence),
                                 Err(error) => {
                                     pool_evict(&pool, peer).await;
                                     Err(error)

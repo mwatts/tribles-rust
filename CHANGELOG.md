@@ -22,12 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reviving branch or tracking-pin semantics.** A new read-only operation
   enumerates deterministic, strictly verified grant/commit evidence for an
   exact descriptor handle and requires an unrestricted read capability.
-  Clients can fetch the descriptor/data/metadata roots and their verified blob
-  closure as an inert bundle; destination admission remains a separate policy
-  boundary. Batch admission hashes shared blobs once, completes every policy
-  decision before mutation, writes only the accepted closure union, and uses
-  exactly two durability barriers regardless of commit count. Existing blob
-  and branch operations are unchanged.
+  The wire carries only a 128-byte redistribution grant followed by the exact
+  192-byte dense commit. Destination admission remains a separate policy
+  boundary: it completes every decision before mutation, inserts the accepted
+  grow-only evidence, and flushes once. Descriptor, data, metadata, and
+  attachments remain independent lazy blobs resolved through ordinary wants;
+  missing residency neither invalidates nor delays the signed evidence.
+  Existing blob and branch operations are unchanged.
 - **Pile diagnostics can decode one exact physical record boundary.**
   `trible pile diagnose record-at <pile> <offset>` walks the canonical replay
   decoder without modifying the pile, reports the marker, classification,

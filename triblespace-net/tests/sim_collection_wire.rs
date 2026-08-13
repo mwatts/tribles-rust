@@ -1,4 +1,4 @@
-//! End-to-end collection-native evidence + closure fetch over the complete
+//! End-to-end sparse collection evidence transfer over the complete
 //! authenticated host/protocol/simulator stack.
 #![cfg(feature = "sim")]
 
@@ -68,7 +68,7 @@ fn branch_restricted_read_cap(
 }
 
 #[test]
-fn direct_collection_fetch_returns_verified_evidence_and_blob_closure_without_admission() {
+fn direct_collection_evidence_fetch_is_verified_and_does_not_fetch_or_admit_blobs() {
     let _guard = common::sim_guard();
     run_paused(0xC011EC7, async {
         let root = key(0xF0);
@@ -127,26 +127,34 @@ fn direct_collection_fetch_returns_verified_evidence_and_blob_closure_without_ad
         // Let both host tasks publish their capabilities before the direct op.
         SimNet::step(&vclock(), Duration::from_millis(1)).await;
         let (client, fetched) =
-            fetch_while_stepping(client, pk(&server_key), descriptor.handle()).await;
+            fetch_evidence_while_stepping(client, pk(&server_key), descriptor.handle()).await;
 
-        assert_eq!(fetched.collection(), descriptor.handle());
-        assert_eq!(fetched.evidence().len(), 1);
-        assert_eq!(fetched.evidence()[0].commit(), commit);
-        assert!(fetched.blobs().contains_key(&descriptor.handle().raw));
-        assert!(fetched.blobs().contains_key(&data.get_handle().raw));
-        assert!(fetched.blobs().contains_key(&metadata.get_handle().raw));
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].commit(), commit);
+        assert_eq!(fetched[0].grant().collection(), descriptor.handle());
 
-        // Fetch is a capability, not admission: client storage stays free of
-        // both the native commit and its data blob.
+        // Fetch is inert sparse evidence: neither the commit/grant nor any
+        // blob it names is admitted into the client store.
         assert!(client.store().records().unwrap().next().is_none());
+        assert!(client.store().gossips().unwrap().next().is_none());
         let reader = client.store().reader().unwrap();
+        assert!(
+            reader
+                .get::<TribleSet, SimpleArchive>(descriptor.handle())
+                .is_err()
+        );
         assert!(
             reader
                 .get::<TribleSet, SimpleArchive>(data.get_handle())
                 .is_err()
         );
+        assert!(
+            reader
+                .get::<TribleSet, SimpleArchive>(metadata.get_handle())
+                .is_err()
+        );
 
-        // Existing legacy blob reads remain unchanged on the serving peer.
+        // Evidence enumeration does not disturb the serving peer's blob store.
         let server_reader = server.store().reader().unwrap();
         assert_eq!(
             server_reader
@@ -158,7 +166,7 @@ fn direct_collection_fetch_returns_verified_evidence_and_blob_closure_without_ad
 }
 
 #[test]
-fn direct_collection_fetch_omits_commits_without_author_grants() {
+fn direct_collection_evidence_fetch_omits_commits_without_author_grants() {
     let _guard = common::sim_guard();
     run_paused(0xC011EC8, async {
         let root = key(0xF1);
@@ -207,10 +215,8 @@ fn direct_collection_fetch_omits_commits_without_author_grants() {
         SimNet::step(&vclock(), Duration::from_millis(1)).await;
 
         let (_client, fetched) =
-            fetch_while_stepping(client, pk(&server_key), descriptor.handle()).await;
-        assert!(fetched.evidence().is_empty());
-        assert!(fetched.roots().is_empty());
-        assert!(fetched.blobs().is_empty());
+            fetch_evidence_while_stepping(client, pk(&server_key), descriptor.handle()).await;
+        assert!(fetched.is_empty());
     });
 }
 
@@ -253,14 +259,14 @@ fn branch_restricted_capability_cannot_enumerate_collections() {
 
         let collection = simplearchive_union::descriptor(id(5)).handle();
         let (_client, result) =
-            fetch_result_while_stepping(client, pk(&server_key), collection).await;
+            fetch_evidence_result_while_stepping(client, pk(&server_key), collection).await;
         let error = result.unwrap_err();
         assert!(error.to_string().contains("unrestricted read"));
     });
 }
 
 #[test]
-fn direct_collection_reconcile_admits_without_branches_or_wants() {
+fn direct_collection_reconcile_admits_sparse_evidence_without_blobs_pins_or_wants() {
     let _guard = common::sim_guard();
     run_paused(0xC011ECA, async {
         let root = key(0xF3);
@@ -281,10 +287,9 @@ fn direct_collection_reconcile_admits_without_branches_or_wants() {
         let data = archive(7);
         let facts = TribleSet::try_from_blob(data.clone()).unwrap();
         let mut collection = Collection::new(&mut server_store, id(6), server_key.clone());
-        let commit = collection.commit(Fragment::from(facts.clone())).unwrap();
-        server_store
-            .gossip(CollectionGossip::sign(&server_key, descriptor.handle()))
-            .unwrap();
+        let commit = collection.commit(Fragment::from(facts)).unwrap();
+        let grant = CollectionGossip::sign(&server_key, descriptor.handle());
+        server_store.gossip(grant).unwrap();
 
         let net = SimNet::new(0xC011ECA, SimConfig::default());
         let _server = bring_up(
@@ -308,7 +313,7 @@ fn direct_collection_reconcile_admits_without_branches_or_wants() {
         let worker = std::thread::spawn(move || {
             let mut client = client;
             let outcome = client
-                .reconcile_collection_from(pk(&server_key), descriptor.handle(), |_, _, _| {
+                .reconcile_collection_from(pk(&server_key), descriptor.handle(), |_, _| {
                     Ok::<_, std::convert::Infallible>(true)
                 })
                 .unwrap();
@@ -326,28 +331,28 @@ fn direct_collection_reconcile_admits_without_branches_or_wants() {
         assert!(store.records().unwrap().any(|record| {
             matches!(record, Ok(triblespace_core::collection::CollectionRecord::Commit(found)) if found == commit)
         }));
+        assert!(store.gossips().unwrap().any(|found| found == Ok(grant)));
         let reader = store.reader().unwrap();
-        assert_eq!(
+        assert!(
             reader
                 .get::<TribleSet, SimpleArchive>(data.get_handle())
-                .unwrap(),
-            facts,
+                .is_err()
         );
         assert!(store.pins().unwrap().next().is_none());
         assert!(store.wants().unwrap().next().is_none());
     });
 }
 
-async fn fetch_result_while_stepping(
+async fn fetch_evidence_result_while_stepping(
     client: triblespace_net::peer::Peer<triblespace_core::repo::memoryrepo::MemoryRepo>,
     peer: [u8; 32],
     collection: triblespace_core::collection::CollectionId,
 ) -> (
     triblespace_net::peer::Peer<triblespace_core::repo::memoryrepo::MemoryRepo>,
-    anyhow::Result<triblespace_net::collection_wire::CollectionFetch>,
+    anyhow::Result<Vec<triblespace_net::collection_wire::CollectionCommitEvidence>>,
 ) {
     let worker = std::thread::spawn(move || {
-        let result = client.fetch_collection_from(peer, collection);
+        let result = client.fetch_collection_evidence_from(peer, collection);
         (client, result)
     });
     while !worker.is_finished() {
@@ -356,14 +361,14 @@ async fn fetch_result_while_stepping(
     worker.join().expect("collection fetch worker panicked")
 }
 
-async fn fetch_while_stepping(
+async fn fetch_evidence_while_stepping(
     client: triblespace_net::peer::Peer<triblespace_core::repo::memoryrepo::MemoryRepo>,
     peer: [u8; 32],
     collection: triblespace_core::collection::CollectionId,
 ) -> (
     triblespace_net::peer::Peer<triblespace_core::repo::memoryrepo::MemoryRepo>,
-    triblespace_net::collection_wire::CollectionFetch,
+    Vec<triblespace_net::collection_wire::CollectionCommitEvidence>,
 ) {
-    let (client, result) = fetch_result_while_stepping(client, peer, collection).await;
+    let (client, result) = fetch_evidence_result_while_stepping(client, peer, collection).await;
     (client, result.unwrap())
 }
