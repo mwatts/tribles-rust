@@ -22,14 +22,46 @@ use triblespace_core::repo::{WANT_REQUEST_BYTES_LEN, WantRequest};
 
 use crate::channel::{NetCommand, NetEvent, PublisherKey};
 use crate::collection_wire::{
-    CollectionCommitEvidence, CollectionOperationReceiptResponse, collection_operation_receipts,
-    decode_collection_operation_request, encode_collection_operation_receipts,
-    grant_backed_commits, op_collection_operation_receipts,
+    COLLECTION_COMMIT_EVIDENCE_LEN, CollectionCommitEvidence, CollectionOperationReceiptResponse,
+    collection_operation_receipts, decode_collection_operation_request,
+    encode_collection_operation_receipts, grant_backed_commits, op_collection_operation_receipts,
 };
 use crate::identity::iroh_secret;
 use crate::protocol::*;
 use crate::transport::{Conn, GossipEvent, GossipSink, Harness, PeerId, Transport};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// Team-topic domain tag for immutable collection commit evidence.
+const GOSSIP_COLLECTION_EVIDENCE: u8 = 0x03;
+/// tag(1) + grant-backed evidence(320) + anti-dedupe nonce(8).
+const COLLECTION_EVIDENCE_GOSSIP_FRAME_LEN: usize = 1 + COLLECTION_COMMIT_EVIDENCE_LEN + 8;
+
+/// Encode one immutable collection-evidence gossip frame.
+///
+/// The nonce is intentionally outside the signed evidence. It only gives
+/// periodic republishes distinct mesh message ids, so a late joiner can learn
+/// unchanged evidence without changing its canonical 320-byte identity.
+fn collection_evidence_gossip_frame(evidence: CollectionCommitEvidence, nonce: u64) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(COLLECTION_EVIDENCE_GOSSIP_FRAME_LEN);
+    frame.push(GOSSIP_COLLECTION_EVIDENCE);
+    frame.extend_from_slice(&evidence.encode());
+    frame.extend_from_slice(&nonce.to_be_bytes());
+    debug_assert_eq!(frame.len(), COLLECTION_EVIDENCE_GOSSIP_FRAME_LEN);
+    frame
+}
+
+/// Decode and strictly verify one complete collection-evidence gossip frame.
+///
+/// The transport carrier and anti-dedupe nonce are deliberately discarded:
+/// neither participates in author identity or local admission policy.
+fn decode_collection_evidence_gossip_frame(bytes: &[u8]) -> Option<CollectionCommitEvidence> {
+    if bytes.len() != COLLECTION_EVIDENCE_GOSSIP_FRAME_LEN
+        || bytes.first().copied() != Some(GOSSIP_COLLECTION_EVIDENCE)
+    {
+        return None;
+    }
+    CollectionCommitEvidence::decode(&bytes[1..1 + COLLECTION_COMMIT_EVIDENCE_LEN]).ok()
+}
 
 fn op_name(op: u8) -> &'static str {
     match op {
@@ -209,6 +241,10 @@ pub trait AnySnapshot: Send + 'static {
     /// Strict grant-backed commits for one exact descriptor handle, in
     /// deterministic intrinsic-record order.
     fn collection_evidence(&self, collection: CollectionId) -> Vec<CollectionCommitEvidence>;
+    /// Every strict grant-backed commit in deterministic commit-id order.
+    /// Used only to periodically republish the current store truth for late
+    /// gossip joiners; the host does not maintain a second ledger mirror.
+    fn all_collection_evidence(&self) -> Vec<CollectionCommitEvidence>;
     /// Exact unsigned merge/derive receipts answering one durable question,
     /// in deterministic intrinsic-record order. Conflicting answers remain
     /// distinct records.
@@ -247,6 +283,29 @@ where
             &self.collection_gossips,
             collection,
         )
+    }
+
+    fn all_collection_evidence(&self) -> Vec<CollectionCommitEvidence> {
+        let grants: std::collections::BTreeMap<([u8; 32], [u8; 32]), CollectionGossip> = self
+            .collection_gossips
+            .iter()
+            .copied()
+            .filter(|grant| grant.verify_strict().is_ok())
+            .map(|grant| ((grant.collection().raw, grant.public_key().raw), grant))
+            .collect();
+
+        self.collection_records
+            .iter()
+            .filter_map(|record| match record {
+                CollectionRecord::Commit(commit) => grants
+                    .get(&(commit.collection().raw, commit.public_key().raw))
+                    .and_then(|grant| CollectionCommitEvidence::new(*grant, *commit).ok()),
+                CollectionRecord::Merge(_) | CollectionRecord::Derive(_) => None,
+            })
+            .map(|evidence| (evidence.commit().id(), evidence))
+            .collect::<std::collections::BTreeMap<_, _>>()
+            .into_values()
+            .collect()
     }
 
     fn collection_operation_receipts(&self, request: WantRequest) -> Vec<CollectionRecord> {
@@ -466,6 +525,16 @@ impl NetSender {
 
     pub fn gossip(&self, branch: RawPinId, head: RawHash) {
         let _ = self.cmd_tx.send(NetCommand::Gossip { branch, head });
+    }
+
+    /// Publish one exact, already-verified collection evidence pair.
+    ///
+    /// This announces immutable evidence only. Receiving it says nothing
+    /// about whether the local view authorizes the signed author.
+    pub fn gossip_collection_evidence(&self, evidence: CollectionCommitEvidence) {
+        let _ = self
+            .cmd_tx
+            .send(NetCommand::GossipCollectionEvidence { evidence });
     }
 
     /// Dispatch a freshly-signed (cap, sig) blob pair to `subject`.
@@ -927,6 +996,20 @@ async fn host_loop<T: Transport>(
                                 )
                                 .await;
                             });
+                        } else if let Some(evidence) =
+                            decode_collection_evidence_gossip_frame(&bytes)
+                        {
+                            // The carrier is only a mesh hop. Do not attach it
+                            // to the evidence or use it as author authority;
+                            // both author identities are signed inside the
+                            // strictly decoded pair.
+                            let _ = events_tx.send(NetEvent::CollectionEvidence(evidence));
+                        } else if bytes.first().copied() == Some(GOSSIP_COLLECTION_EVIDENCE) {
+                            debug!(
+                                delivered_from = %hex::encode(&delivered_from[..4]),
+                                length = bytes.len(),
+                                "discarding malformed collection evidence gossip frame"
+                            );
                         }
                     }
                     GossipEvent::NeighborUp(peer) => {
@@ -995,6 +1078,18 @@ async fn host_loop<T: Transport>(
                     last_published.insert(branch, head);
                     if let Some(sender) = &gossip_sender {
                         let msg = gossip_frame(&branch, &head, &my_id);
+                        let sender = sender.clone();
+                        tokio::spawn(async move {
+                            let _ = sender.broadcast(msg).await;
+                        });
+                    }
+                }
+                NetCommand::GossipCollectionEvidence { evidence } => {
+                    if let Some(sender) = &gossip_sender {
+                        let msg = collection_evidence_gossip_frame(
+                            evidence,
+                            crate::clock::mono_now().as_nanos(),
+                        );
                         let sender = sender.clone();
                         tokio::spawn(async move {
                             let _ = sender.broadcast(msg).await;
@@ -1146,13 +1241,30 @@ async fn host_loop<T: Transport>(
         }
 
         if crate::clock::mono_now().duration_since(last_rebroadcast) >= rebroadcast_period {
+            let collection_evidence = snapshot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|snapshot| snapshot.all_collection_evidence())
+                .unwrap_or_default();
             trace!(
-                n = last_published.len(),
-                "rebroadcast tick: replaying published heads"
+                heads = last_published.len(),
+                collection_evidence = collection_evidence.len(),
+                "rebroadcast tick: replaying published evidence"
             );
             if let Some(sender) = &gossip_sender {
                 for (branch, head) in &last_published {
                     let msg = gossip_frame(branch, head, &my_id);
+                    let sender = sender.clone();
+                    tokio::spawn(async move {
+                        let _ = sender.broadcast(msg).await;
+                    });
+                }
+                for evidence in collection_evidence {
+                    let msg = collection_evidence_gossip_frame(
+                        evidence,
+                        crate::clock::mono_now().as_nanos(),
+                    );
                     let sender = sender.clone();
                     tokio::spawn(async move {
                         let _ = sender.broadcast(msg).await;
@@ -2523,5 +2635,79 @@ fn blob_in_scope(
     match reachable_set_for(snap, verified) {
         None => verified.grants_read(),
         Some(set) => set.contains(hash),
+    }
+}
+
+#[cfg(test)]
+mod collection_evidence_gossip_tests {
+    use ed25519_dalek::SigningKey;
+    use triblespace_core::collection::{
+        CollectionCommit, CollectionGossip, empty_metadata_handle, simplearchive_union,
+    };
+    use triblespace_core::id::Id;
+    use triblespace_core::inline::Inline;
+
+    use super::{
+        COLLECTION_EVIDENCE_GOSSIP_FRAME_LEN, GOSSIP_COLLECTION_EVIDENCE,
+        collection_evidence_gossip_frame, decode_collection_evidence_gossip_frame,
+    };
+    use crate::collection_wire::{COLLECTION_COMMIT_EVIDENCE_LEN, CollectionCommitEvidence};
+
+    fn evidence() -> CollectionCommitEvidence {
+        let author = SigningKey::from_bytes(&[0xA7; 32]);
+        let descriptor = simplearchive_union::descriptor(Id::new([0x3C; 16]).unwrap());
+        let commit = CollectionCommit::sign(
+            &author,
+            descriptor.handle(),
+            Inline::new([0xD4; 32]),
+            empty_metadata_handle(),
+        );
+        CollectionCommitEvidence::new(CollectionGossip::sign(&author, descriptor.handle()), commit)
+            .unwrap()
+    }
+
+    #[test]
+    fn collection_evidence_gossip_frame_is_exact_and_roundtrips_strictly() {
+        let evidence = evidence();
+        let nonce = 0x0102_0304_0506_0708;
+        let frame = collection_evidence_gossip_frame(evidence, nonce);
+
+        assert_eq!(COLLECTION_COMMIT_EVIDENCE_LEN, 320);
+        assert_eq!(COLLECTION_EVIDENCE_GOSSIP_FRAME_LEN, 329);
+        assert_eq!(frame.len(), COLLECTION_EVIDENCE_GOSSIP_FRAME_LEN);
+        assert_eq!(frame[0], GOSSIP_COLLECTION_EVIDENCE);
+        assert_eq!(
+            &frame[1..1 + COLLECTION_COMMIT_EVIDENCE_LEN],
+            &evidence.encode()
+        );
+        assert_eq!(
+            &frame[1 + COLLECTION_COMMIT_EVIDENCE_LEN..],
+            &nonce.to_be_bytes()
+        );
+        assert_eq!(
+            decode_collection_evidence_gossip_frame(&frame),
+            Some(evidence)
+        );
+    }
+
+    #[test]
+    fn collection_evidence_gossip_nonce_is_nonsemantic_but_signed_bytes_are_strict() {
+        let evidence = evidence();
+        let first = collection_evidence_gossip_frame(evidence, 1);
+        let second = collection_evidence_gossip_frame(evidence, 2);
+        assert_ne!(first, second);
+        assert_eq!(
+            decode_collection_evidence_gossip_frame(&second),
+            Some(evidence)
+        );
+
+        let mut tampered = first.clone();
+        tampered[1] ^= 0x80;
+        assert_eq!(decode_collection_evidence_gossip_frame(&tampered), None);
+
+        let mut wrong_tag = first.clone();
+        wrong_tag[0] ^= 0x80;
+        assert_eq!(decode_collection_evidence_gossip_frame(&wrong_tag), None);
+        assert_eq!(decode_collection_evidence_gossip_frame(&first[..328]), None);
     }
 }

@@ -39,6 +39,12 @@ pub enum NetCommand {
     /// branch updates trigger this; subscribers on the team topic
     /// receive the flood message and walk the closure to catch up.
     Gossip { branch: RawPinId, head: RawHash },
+    /// Gossip one strictly verified author grant + collection commit pair.
+    ///
+    /// This is immutable ledger evidence, not an admission decision. The
+    /// receiving side must not treat the mesh carrier as the commit author or
+    /// infer local author trust from transport delivery.
+    GossipCollectionEvidence { evidence: CollectionCommitEvidence },
     /// Dispatch a freshly-signed cap+sig pair to `subject` via the
     /// auth-handshake ALPN. Used by the renewal daemon (push-based
     /// renewal) and by the `team approve` subcommand (response to a
@@ -82,6 +88,12 @@ pub enum NetEvent {
         head: RawHash,
         publisher: PublisherKey,
     },
+    /// Strictly verified immutable collection evidence learned via gossip.
+    ///
+    /// Deliberately carries no transport publisher: the relaying neighbor is
+    /// not necessarily the author, and author identity is already signed into
+    /// both records. Admission remains a synchronous store-side policy.
+    CollectionEvidence(CollectionCommitEvidence),
     /// A peer asked us to issue them a capability. The partial cap
     /// blob carries the subject they're requesting for (must match
     /// `requester` — verified at connection time via iroh's TLS),
