@@ -141,3 +141,109 @@ fn live_gossip_admits_only_sparse_collection_evidence_idempotently() {
         assert!(store.wants().unwrap().next().is_none());
     });
 }
+
+#[test]
+fn periodic_replay_reaches_a_late_joiner_without_fetching_content() {
+    let _guard = common::sim_guard();
+    run_paused(0xC011EC_1A7E, async {
+        let root = key(0xE0);
+        let author = key(0xA1);
+        let receiver = key(0xB1);
+        let author_cap = admin_cap(&root, &author);
+        let receiver_cap = admin_cap(&root, &receiver);
+        let caps = [author_cap.clone(), receiver_cap.clone()];
+        let mut author_store = store_with_caps(&caps);
+        let receiver_store = store_with_caps(&caps);
+
+        let descriptor = simplearchive_union::descriptor(id(0x32));
+        let data = archive(0x42);
+        let metadata = archive(0x52);
+        let mut fragment = Fragment::from(TribleSet::try_from_blob(data.clone()).unwrap());
+        *fragment.metafacts_mut() = TribleSet::try_from_blob(metadata.clone()).unwrap();
+        let commit = Collection::new(&mut author_store, id(0x32), author.clone())
+            .commit(fragment)
+            .unwrap();
+        let grant = CollectionGossip::sign(&author, descriptor.handle());
+        author_store.gossip(grant).unwrap();
+
+        let net = SimNet::new(0xC011EC_1A7E, SimConfig::default());
+        let mut author_peer = bring_up(
+            &net,
+            &author,
+            author_store,
+            root.verifying_key(),
+            self_cap_of(&author_cap.1),
+            true,
+        );
+
+        // Let the construction-time publication run while there is nobody on
+        // the mesh to receive it. The later receiver can therefore learn this
+        // evidence only from the host's periodic replay.
+        SimNet::step(&vclock(), Duration::from_millis(100)).await;
+        author_peer.refresh();
+
+        let mut receiver_peer = bring_up(
+            &net,
+            &receiver,
+            receiver_store,
+            root.verifying_key(),
+            self_cap_of(&receiver_cap.1),
+            true,
+        );
+        SimNet::step(&vclock(), Duration::from_millis(100)).await;
+        author_peer.refresh();
+        receiver_peer.refresh();
+        {
+            let mut store = receiver_peer.store();
+            assert!(store.records().unwrap().next().is_none());
+            assert!(store.gossips().unwrap().next().is_none());
+        }
+
+        // The simulation clock becomes visible to protocol code after a
+        // discrete step. A follow-up host tick observes the elapsed replay
+        // interval and broadcasts a freshly nonced frame to the late joiner.
+        SimNet::step(&vclock(), Duration::from_secs(31)).await;
+        SimNet::step(&vclock(), Duration::from_millis(100)).await;
+        for _ in 0..100 {
+            author_peer.refresh();
+            receiver_peer.refresh();
+            let observed = {
+                let mut store = receiver_peer.store();
+                store
+                    .records()
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .any(|record| record == CollectionRecord::Commit(commit))
+            };
+            if observed {
+                break;
+            }
+            SimNet::step(&vclock(), Duration::from_millis(1)).await;
+        }
+
+        let mut store = receiver_peer.store();
+        let records: Vec<_> = store.records().unwrap().collect::<Result<_, _>>().unwrap();
+        let grants: Vec<_> = store.gossips().unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(records, vec![CollectionRecord::Commit(commit)]);
+        assert_eq!(grants, vec![grant]);
+
+        let reader = store.reader().unwrap();
+        assert!(
+            reader
+                .get::<TribleSet, SimpleArchive>(descriptor.handle())
+                .is_err()
+        );
+        assert!(
+            reader
+                .get::<TribleSet, SimpleArchive>(data.get_handle())
+                .is_err()
+        );
+        assert!(
+            reader
+                .get::<TribleSet, SimpleArchive>(metadata.get_handle())
+                .is_err()
+        );
+        assert!(store.wants().unwrap().next().is_none());
+        assert!(store.pins().unwrap().next().is_none());
+    });
+}
