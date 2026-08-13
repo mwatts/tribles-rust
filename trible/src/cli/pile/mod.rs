@@ -28,9 +28,9 @@ pub enum PileCommand {
         #[command(subcommand)]
         cmd: branch::Command,
     },
-    /// Operations on the legacy pin storage primitive. Branches and tracking
-    /// mirrors show up here; private node policy lives in a signer-owned
-    /// collection. For the branch-specific view, see `pile branch`.
+    /// Operations on the legacy pin storage primitive. Branches and unnamed
+    /// legacy/application pins show up here; private node policy lives in a
+    /// signer-owned collection. For the branch-specific view, see `pile branch`.
     Pin {
         #[command(subcommand)]
         cmd: pin::Command,

@@ -30,14 +30,14 @@ type BranchNameHandle = Inline<Handle<LongString>>;
 #[derive(Parser)]
 pub enum Command {
     /// List named content branches in a pile file (id + head + name).
-    /// Filters to pins carrying `metadata::name`; tracking pins are excluded
+    /// Filters to pins carrying `metadata::name`; unnamed pins are excluded
     /// (see `pile pin list` for the generic all-pins view).
     List {
         /// Path to the pile file to inspect
         path: PathBuf,
         /// Include all pin records ever seen (scans raw pile records,
         /// including tombstoned pins of every role). Useful for
-        /// forensics — surfaces tracking pins and legacy policy pins alongside
+        /// forensics — surfaces unnamed legacy/application pins alongside
         /// content branches.
         #[arg(long)]
         all: bool,
@@ -306,9 +306,8 @@ pub fn run(cmd: Command) -> Result<()> {
                                 // a branch is, by the Pin/Branch
                                 // taxonomy, a pin that carries
                                 // metadata::name. Pins without a
-                                // name are tracking pins, unmigrated legacy
-                                // policy pins, or anonymous —
-                                // none of which belong in
+                                // name are legacy/application pins, or
+                                // anonymous — none of which belong in
                                 // `branch list`. See `pile pin list`
                                 // for the generic all-pins view.
                                 let resolved = load_branch_name(&reader, &meta, id);

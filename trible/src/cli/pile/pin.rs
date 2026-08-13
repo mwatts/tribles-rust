@@ -1,6 +1,7 @@
 //! `trible pile pin …` — generic operations on the pin storage
 //! primitive. Pins are named, atomically-updatable handles to
-//! SimpleArchive blobs; they back content branches and tracking mirrors.
+//! SimpleArchive blobs; they back content branches and may also contain
+//! unnamed legacy or application-local state.
 //!
 //! For branch-specific operations (commit walks, named lookups,
 //! reflogs that interpret head as a commit chain), see
@@ -22,8 +23,8 @@ use triblespace_core::trible::TribleSet;
 
 #[derive(Parser)]
 pub enum Command {
-    /// List every pin in a pile, classified by role (BRANCH /
-    /// TRACKING / UNNAMED). For named-branch-only output
+    /// List every pin in a pile, classified by role (BRANCH / UNNAMED).
+    /// For named-branch-only output
     /// with commit-aware columns use `pile branch list`.
     List {
         /// Path to the pile file to inspect.
@@ -39,14 +40,14 @@ pub enum Command {
         pin: String,
     },
     /// Tombstone a pin by writing a None head via CAS. Any role
-    /// (branch / tracking / unnamed) — the storage
+    /// (branch / unnamed) — the storage
     /// primitive doesn't discriminate. The pin's reachable blobs
     /// become unreachable and the next compaction reclaims them.
     ///
     /// Branches that need a commit-aware delete (e.g. with name
     /// resolution) should use `pile branch delete`; this is the
     /// raw "delete any pin" path operators reach for when cleaning
-    /// up stale tracking pins.
+    /// up stale or anonymous pins.
     Delete {
         /// Path to the pile file to modify.
         path: PathBuf,
@@ -67,9 +68,6 @@ pub fn run(cmd: Command) -> Result<()> {
 enum Role {
     /// A pin carrying `metadata::name` — a content branch.
     Branch(String),
-    /// A pin carrying `tracking_remote_pin` — mirrors a remote
-    /// peer's branch head.
-    Tracking,
     /// Pin head exists but matches none of the known role markers.
     /// Either an exotic use or a stale anonymous pin from older
     /// schema versions.
@@ -84,7 +82,6 @@ impl Role {
     fn label(&self) -> &'static str {
         match self {
             Role::Branch(_) => "BRANCH",
-            Role::Tracking => "TRACKING",
             Role::Unnamed => "UNNAMED",
         }
     }
@@ -98,9 +95,9 @@ impl Role {
 }
 
 fn classify(meta: &TribleSet, pin_id: Id) -> Role {
-    // Branch and tracking markers belong to the unique metadata entity for
-    // this pin. Carried annotations may use the same attributes and must not
-    // change the pin's role.
+    // Branch markers belong to the unique metadata entity for this pin.
+    // Carried annotations may use the same attribute and must not change the
+    // pin's role.
     if let Ok(branch_entity) = triblespace_core::repo::branch::branch_entity(meta, pin_id) {
         let mut name_iter = find!(
             h: Inline<Handle<triblespace_core::blob::encodings::longstring::LongString>>,
@@ -112,14 +109,6 @@ fn classify(meta: &TribleSet, pin_id: Id) -> Role {
             // hint that it's named — `pile branch list` is the place to
             // get the resolved name.
             return Role::Branch(String::from("(named — see `pile branch list`)"));
-        }
-
-        let mut tracking_iter = find!(
-            v: Id,
-            pattern!(meta, [{ branch_entity @ triblespace_net::tracking::tracking_remote_pin: ?v }])
-        );
-        if tracking_iter.next().is_some() {
-            return Role::Tracking;
         }
     }
 

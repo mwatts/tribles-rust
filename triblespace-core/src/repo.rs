@@ -631,17 +631,14 @@ pub type PinSnapshot = PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>;
 /// pile's compaction sweep treats every pin head as a reachability
 /// root: blobs reachable from a pin survive; the rest are reclaimed.
 ///
-/// Pins back specialized branch use patterns, distinguished at
-/// higher layers via metadata markers:
+/// Pins back specialized branch use patterns, distinguished at higher layers
+/// via metadata markers:
 /// - A **branch** is a pin whose value resolves to a commit-chain
 ///   head (Repository's content abstraction). Branch metadata
 ///   carries `metadata::name` for human-readable lookup.
-/// - A **tracking pin** mirrors a remote peer's branch head and
-///   carries `tracking_remote_pin` + `remote_name`.
-/// `PinStore` itself doesn't know about these distinctions — it just
-/// provides the primitive: enumerate ids, read the current head, CAS
-/// an update. The two-level taxonomy lives at higher layers
-/// (decide#6de2dd95).
+/// `PinStore` itself does not know whether a value is a branch, legacy state,
+/// or application-local state. It only enumerates ids, reads current heads,
+/// and atomically updates them.
 ///
 /// This trait is the stateful counterpart to [`BlobStore`]: blob
 /// stores are content-addressed and orderless; pin stores track a
@@ -662,9 +659,8 @@ pub trait PinStore {
         Self: 'a;
 
     /// Lists every pin in the store. Returns a fallible iterator over pin ids
-    /// of any role. Current repository code uses content branches and tracking
-    /// mirrors; old stores or applications may also contain legacy or anonymous
-    /// pins.
+    /// of any role. Current repository code uses content branches; old stores
+    /// or applications may also contain legacy or anonymous pins.
     /// Callers that want only content branches filter by checking for
     /// the `metadata::name` attribute on each pin's head metadata.
     fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError>;
@@ -1743,9 +1739,8 @@ where
                 pattern!(&meta_set, [{ branch_entity @ crate::metadata::name: ?n }])
             )
             .exactly_one() else {
-                // Pins without names are tracking/policy/anonymous pins, and
-                // a malformed branch entity with multiple names must not
-                // answer to either one.
+                // Unnamed legacy/application pins and malformed branch
+                // entities with multiple names must not answer to either one.
                 continue;
             };
 

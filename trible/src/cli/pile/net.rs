@@ -251,7 +251,7 @@ fn run_sync(
 
     // One pile handle wrapped directly in a Peer. Collection synchronization
     // is a union of immutable signed evidence, so the daemon needs neither a
-    // Repository workspace nor named tracking branches.
+    // Repository workspace nor mutable branch mirrors.
     let pile = open_pile(&pile_path)?;
     let team_root = team_root_from_env(&key)?;
     let self_cap = self_cap_from_env()?;
