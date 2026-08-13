@@ -23,6 +23,12 @@ fn value_in_range_proposes_correctly() {
     let e3 = ufoid();
     let e4 = ufoid();
 
+    // NOTE: every value here is an integer, so all denominators are 1 and
+    // `R256BE`'s bytewise order coincides with numeric order. That coincidence
+    // is what makes the range assertions below meaningful — `R256BE` compares
+    // the numerator first, so adding a genuine fraction (say 1/2) would make
+    // these ranges nonsense. If this test ever needs fractions, switch it to
+    // `I256BE` (ordered integers) or `ROrd256` (ordered exact rationals).
     let v10: Inline<R256BE> = 10i128.to_inline();
     let v50: Inline<R256BE> = 50i128.to_inline();
     let v90: Inline<R256BE> = 90i128.to_inline();
