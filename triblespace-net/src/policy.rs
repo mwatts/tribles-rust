@@ -30,17 +30,10 @@ use triblespace_core::macros::{entity, find, pattern};
 use triblespace_core::metadata;
 use triblespace_core::prelude::attributes;
 use triblespace_core::prelude::inlineencodings::{ED25519PublicKey, GenId};
-use triblespace_core::repo::{
-    BlobStore, BlobStoreList, BlobStoreMeta, BlobStorePut, PinStore, StorageFlush,
-};
+use triblespace_core::repo::{BlobStore, BlobStoreMeta, BlobStorePut, StorageFlush};
 use triblespace_core::trible::{Fragment, TribleSet};
 
 attributes! {
-    /// Legacy marker used by pre-collection policy pins. New policy code never
-    /// writes it; branch gossip keeps recognizing it until old pins have been
-    /// explicitly migrated or tombstoned.
-    "3361F2DE0BD68BA8712EC5B9CCC7EF2A" unsafe as legacy_local_only_pin: GenId;
-
     /// Names the team whose current credential a version describes.
     "E1EE471B597A4142AD26CA1FED368D2F" unsafe as pub cap_for_team: ED25519PublicKey;
     /// Subject whose issued credential a policy version maintains.
@@ -169,40 +162,6 @@ fn optional_one<T>(mut values: impl Iterator<Item = T>) -> Result<Option<T>, Pol
         (Some(value), None) => Ok(Some(value)),
         _ => Err(PolicyError::Malformed("optional field is repeated")),
     }
-}
-
-/// Whether `pin_id` is a policy pin written by the pre-collection
-/// implementation.
-///
-/// This is a staged-migration privacy guard, not a policy storage path. It
-/// fails closed when the pin or its value cannot be read and never turns a
-/// missing value into a durable want.
-pub(crate) fn is_legacy_local_only_pin<S>(store: &mut S, pin_id: Id) -> bool
-where
-    S: BlobStore + PinStore,
-{
-    let head = match store.head(pin_id) {
-        Ok(Some(head)) => head,
-        Ok(None) => return false,
-        Err(_) => return true,
-    };
-    let Ok(reader) = store.reader() else {
-        return true;
-    };
-    if !reader.contains_blob(head).unwrap_or(false) {
-        return true;
-    }
-    let Ok(value) =
-        triblespace_core::repo::BlobStoreGet::get::<TribleSet, SimpleArchive>(&reader, head)
-    else {
-        return true;
-    };
-    find!(
-        kind: Id,
-        pattern!(&value, [{ _?entity @ legacy_local_only_pin: ?kind }])
-    )
-    .next()
-    .is_some()
 }
 
 /// One stable capability request and its derived decision state.
@@ -1567,11 +1526,10 @@ mod tests {
     use rand::rngs::OsRng;
     use triblespace_core::blob::{Blob, IntoBlob};
     use triblespace_core::collection::CollectionStore;
-    use triblespace_core::id::ExclusiveId;
     use triblespace_core::inline::TryToInline;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
     use triblespace_core::repo::pile::Pile;
-    use triblespace_core::repo::{BlobStorePut, PinStore, PushResult};
+    use triblespace_core::repo::{BlobStorePut, PinStore};
 
     fn point_now() -> Inline<NsTAIInterval> {
         let now = hifitime::Epoch::now().expect("system time");
@@ -1978,23 +1936,5 @@ mod tests {
             current_team_cap(&mut left, &key, team).unwrap(),
             Some((left_cap, left_sig))
         );
-    }
-
-    #[test]
-    fn legacy_policy_pin_is_still_private() {
-        let mut store = MemoryRepo::default();
-        let marker = *triblespace_core::id::ufoid();
-        let value: TribleSet = entity! {
-            ExclusiveId::force_ref(&marker) @
-            legacy_local_only_pin: POLICY_COLLECTION_SCOPE,
-        }
-        .into();
-        let head = store.put(value).unwrap();
-        let pin = *triblespace_core::id::ufoid();
-        assert!(matches!(
-            store.update(pin, None, Some(head)).unwrap(),
-            PushResult::Success()
-        ));
-        assert!(is_legacy_local_only_pin(&mut store, pin));
     }
 }

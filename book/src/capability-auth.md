@@ -36,10 +36,9 @@ Each capability is two blobs stored in the pile:
   `attestation::signature_s`,
   reusing the shared structural attestation attributes.
 
-Signatures attest to the cap blob's canonical bytes (matching how
-`Workspace::commit` signs commit metadata), not to a hash of those
-bytes — keeping signatures hash-agnostic across any future change to
-the handle scheme.
+Signatures attest to the cap blob's canonical bytes, not to a hash of those
+bytes, keeping them hash-agnostic across any future change to the handle
+scheme.
 
 Non-root caps embed their parent's signature inline as a sub-entity
 within the cap blob (`cap_embedded_parent_sig`). This halves cold-cache
@@ -159,13 +158,15 @@ every other peer's cap.
 
 Protocol v4 (`/triblespace/pile-sync/4`) makes auth mandatory:
 
-| Op            | Byte | Meaning                                 |
-|---------------|------|-----------------------------------------|
-| `OP_LIST`     | 0x01 | List all branches and heads             |
-| `OP_GET_BLOB` | 0x02 | Fetch one blob by hash                  |
-| `OP_CHILDREN` | 0x03 | List blob hashes referenced by a parent |
-| `OP_HEAD`     | 0x04 | Head hash of one branch                 |
-| `OP_AUTH`     | 0x05 | Present a capability sig handle         |
+| Op | Byte | Meaning |
+|---|---:|---|
+| retired | 0x01 | former branch-list operation |
+| `OP_GET_BLOB` | 0x02 | Fetch one blob by hash |
+| `OP_CHILDREN` | 0x03 | List present child handles |
+| retired | 0x04 | former branch-head operation |
+| `OP_AUTH` | 0x05 | Present a capability sig handle |
+| `OP_COLLECTION_EVIDENCE` | 0x06 | Fetch grant-backed commits for one collection |
+| `OP_COLLECTION_OPERATION_RECEIPTS` | 0x07 | Fetch exact merge/derive receipts |
 
 The **first stream** on every connection must be `OP_AUTH`. The server
 fetches the referenced sig blob, walks back to the team root through
@@ -178,7 +179,7 @@ Streams sent before OP_AUTH or after AUTH_REJECTED are silently
 closed. The server doesn't leak a "you sent the wrong thing" error
 back to the client.
 
-## Two-Tier Scope Gate
+## Scope Gate
 
 Capabilities encode their scope as tribles hung off `cap_scope_root`:
 
@@ -188,15 +189,8 @@ Capabilities encode their scope as tribles hung off `cap_scope_root`:
   permission to a specific branch. An empty branch-restriction set
   means "all branches".
 
-The relay enforces scope at two levels:
-
-### Branch level (`OP_LIST`, `OP_HEAD`)
-
-`VerifiedCapability::grants_read_on(branch)` filters which branches
-the peer can see. Out-of-scope branches are silently dropped from
-`OP_LIST` responses; `OP_HEAD` for an out-of-scope branch returns
-`NIL_HASH` (indistinguishable from "branch doesn't exist", as far as
-the wire is concerned).
+The relay applies branch restrictions only to blob reachability. There is no
+wire operation that lists or mutates branch state.
 
 ### Blob level (`OP_GET_BLOB`, `OP_CHILDREN`)
 
@@ -208,8 +202,10 @@ cap grants read on. Out-of-scope blobs surface as `None` (length =
 `u64::MAX`) on `OP_GET_BLOB`; `OP_CHILDREN` filters its returned list
 to in-scope hashes only.
 
-Unrestricted caps (`granted_branches() == None` — no `scope_branch`
-tribles) short-circuit to "every present blob is in scope".
+Unrestricted caps (`granted_branches() == None` — no `scope_branch` tribles)
+short-circuit to "every present blob is in scope." Collection-evidence and
+operation-receipt enumeration currently require unrestricted read authority;
+collection-scoped capabilities remain future work.
 
 Permission semantics mirror `scope_subsumes`: `PERM_WRITE` and
 `PERM_ADMIN` imply `PERM_READ`; `PERM_ADMIN` is required to delegate

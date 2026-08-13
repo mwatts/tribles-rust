@@ -25,23 +25,17 @@
 //!                  (`u32::MAX` = rejected; each receipt is 128 bytes)
 //!   (protocol is read-only — no remote writes)
 //!
-//! Branch-state discovery is gossip-driven, not ALPN-driven. HEAD
-//! updates flood the team topic (= team_root pubkey); subscribers
-//! receive them as gossip messages and walk the reachable closure
-//! via `GET_BLOB` + `CHILDREN`. Earlier protocol versions had an
-//! `OP_LIST` ("enumerate this peer's branches") and `OP_HEAD`
-//! ("what head does this peer have for branch X"), but those bake
-//! the wrong primitive into the wire: peers don't have authoritative
-//! views, the *team* does. The right discovery mechanism is "join
-//! the gossip topic and let heads arrive."
+//! Branch-state operations are retired. Immutable grant-backed collection
+//! commits are discovered through the team gossip mesh; content and exact
+//! receipts remain explicitly fetched through this read-only protocol.
 
 pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/4";
 
 // Operation types — first byte on each stream.
-// 0x01 was OP_LIST, retired in favour of gossip-driven head discovery.
+// 0x01 was the retired branch-list operation.
 pub const OP_GET_BLOB: u8 = 0x02;
 pub const OP_CHILDREN: u8 = 0x03;
-// 0x04 was OP_HEAD, retired alongside OP_LIST.
+// 0x04 was the retired branch-head operation.
 /// First stream on every connection. Body: cap_handle:32. Response: u8
 /// status (`AUTH_OK` or `AUTH_REJECTED`). Connection state caches the
 /// verified scope; subsequent ops on the same connection inherit it.
@@ -77,10 +71,8 @@ pub const COLLECTION_EVIDENCE_REJECTED: u32 = u32::MAX;
 pub const COLLECTION_OPERATION_RECEIPTS_REJECTED: u32 = u32::MAX;
 
 pub const NIL_HASH: RawHash = [0u8; 32];
-pub const NIL_BRANCH_ID: RawPinId = [0u8; 16];
 
 pub type RawHash = [u8; 32];
-pub type RawPinId = [u8; 16];
 
 // ── Send/Recv helpers ────────────────────────────────────────────────
 //
@@ -101,10 +93,6 @@ pub async fn send_u8<W: AsyncWrite + Unpin>(send: &mut W, v: u8) -> Result<()> {
 
 pub async fn send_hash<W: AsyncWrite + Unpin>(send: &mut W, hash: &RawHash) -> Result<()> {
     send.write_all(hash).await.map_err(|e| anyhow!("send: {e}"))
-}
-
-pub async fn send_branch_id<W: AsyncWrite + Unpin>(send: &mut W, id: &RawPinId) -> Result<()> {
-    send.write_all(id).await.map_err(|e| anyhow!("send: {e}"))
 }
 
 pub async fn send_u32_be<W: AsyncWrite + Unpin>(send: &mut W, v: u32) -> Result<()> {
@@ -129,14 +117,6 @@ pub async fn recv_u8<R: AsyncRead + Unpin>(recv: &mut R) -> Result<u8> {
 
 pub async fn recv_hash<R: AsyncRead + Unpin>(recv: &mut R) -> Result<RawHash> {
     let mut buf = [0u8; 32];
-    recv.read_exact(&mut buf)
-        .await
-        .map_err(|e| anyhow!("recv: {e}"))?;
-    Ok(buf)
-}
-
-pub async fn recv_branch_id<R: AsyncRead + Unpin>(recv: &mut R) -> Result<RawPinId> {
-    let mut buf = [0u8; 16];
     recv.read_exact(&mut buf)
         .await
         .map_err(|e| anyhow!("recv: {e}"))?;

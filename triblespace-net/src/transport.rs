@@ -2,10 +2,9 @@
 //! network, as traits.
 //!
 //! This module exists so the *entire* protocol stack above it — the
-//! host loop, OP_AUTH / OP_CHILDREN / OP_GET_BLOB / OP_DELIVER_CAP
-//! handlers, `fetch_reachable`'s two-phase walk, cap verification,
-//! gossip-driven head tracking, the renewal daemon's redispatch — can
-//! run unmodified against either:
+//! host loop, authenticated blob/collection reads, cap verification,
+//! collection-evidence gossip, and the renewal daemon's redispatch — can run
+//! unmodified against either:
 //!
 //! - [`crate::transport::iroh`]: the production adapter (iroh QUIC,
 //!   iroh-gossip PlumTree, the embedded Kademlia DHT node), or

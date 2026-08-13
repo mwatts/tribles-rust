@@ -1,18 +1,17 @@
 //! Distributed sync for triblespace.
 //!
 //! The main type is [`Peer<S>`](peer::Peer): a store wrapper that owns an
-//! iroh network thread internally and exposes the standard storage traits
-//! (`BlobStore + BlobStorePut + PinStore`). Reads auto-drain incoming
-//! gossip; writes auto-publish to the gossip topic and DHT. The user thinks
-//! of it as "my store, but networked."
+//! iroh network thread internally and exposes the standard storage traits.
+//! Reads auto-drain immutable collection evidence; writes announce blobs to
+//! the DHT and publish grant-backed commits to the team gossip topic. Local
+//! pins remain only as one input to capability-scoped blob serving.
 //!
 //! All store traits stay sync. Async is jailed inside the network thread.
 
 mod channel;
 
-/// Base backoff shared by the crate's retry loops (failed head-walk
-/// retries in [`host`], failed want-fetch retries in
-/// [`reconcile::Reconciler`]); doubles per attempt up to
+/// Base backoff for failed WANT fulfillment in [`reconcile::Reconciler`];
+/// doubles per attempt up to
 /// [`RETRY_BACKOFF_CAP`]. Values chosen so a transient fault (peer
 /// restarting, partition healing) is retried promptly while a
 /// persistently-dead source costs at most one attempt per cap period.

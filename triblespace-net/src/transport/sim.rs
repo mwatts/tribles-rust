@@ -2,9 +2,9 @@
 //!
 //! [`SimNet`] is a process-local network: nodes join it, get a
 //! [`Harness<SimTransport>`] back, and from there the *entire*
-//! production protocol stack — host loop, OP_AUTH, fetch_reachable,
-//! cap delivery, gossip head tracking — runs unmodified over
-//! in-memory pipes instead of iroh QUIC.
+//! production protocol stack — host loop, authenticated reads, cap delivery,
+//! collection-evidence gossip — runs unmodified over in-memory pipes instead
+//! of iroh QUIC.
 //!
 //! # Determinism contract
 //!
