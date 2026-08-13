@@ -19,20 +19,18 @@
 //!   not an outstanding want — the presence diff filters it out.
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use anybytes::Bytes;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::collection::{CollectionGossipStore, CollectionRecord, CollectionStore};
-use triblespace_core::inline::Inline;
 use triblespace_core::repo::{
     BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut, PinStore, StorageFlush, WantRequest,
     WantStore,
 };
 
 use crate::peer::Peer;
-use crate::protocol::RawHash;
 
 /// Counters from one reconcile pass — the observable a sync daemon
 /// surfaces (trace lines, `--quiescent-for` scripts) so lazy progress
@@ -44,12 +42,12 @@ pub struct ReconcileStats {
     /// Requests whose blob or exact operation receipt was absent locally at
     /// the start of the pass.
     pub missing: usize,
-    /// Fetches actually issued this pass (`missing` minus the
-    /// backoff-gated).
+    /// Network attempts actually issued this pass (`missing` minus those
+    /// backoff-gated), counted per wanted question rather than per peer.
     pub attempted: usize,
-    /// Wants satisfied this pass: fetched from the swarm and landed in
-    /// the store.
-    pub fetched: usize,
+    /// Wants satisfied this pass: blob bytes or exact operation receipts
+    /// fetched from peers and durably landed in the store.
+    pub fulfilled: usize,
     /// Wants still outstanding after the pass. **Normal, not an error**
     /// — they stay on record (the want) and are retried with
     /// backoff on later passes.
@@ -74,7 +72,20 @@ struct WantState {
 /// dropping/recreating a `Reconciler` loses nothing but the
 /// backoff timers.
 pub struct Reconciler {
-    states: HashMap<RawHash, WantState>,
+    states: HashMap<WantRequest, WantState>,
+    /// Operation questions for which this process has both a durable local
+    /// answer and one complete sweep of the configured peers. This is
+    /// deliberately in-memory: after restart we sweep again rather than
+    /// mistake a partially persisted conflict response for complete evidence.
+    completed_operation_sweeps: HashSet<WantRequest>,
+    /// Operation questions whose currently visible local receipts crossed the
+    /// durability barrier in this process. Kept separate from sweep
+    /// completeness so an offline peer causes retries, not repeated fsyncs.
+    durable_operation_answers: HashSet<WantRequest>,
+    /// Blob wants observed behind this process's durability barrier. A fetched
+    /// blob whose flush fails stays outside this set, so later ticks retry the
+    /// barrier rather than mistaking process-local visibility for persistence.
+    durable_blob_answers: HashSet<WantRequest>,
     initial_backoff: Duration,
     max_backoff: Duration,
     /// End-to-end budget per fetch attempt. Background work, so more
@@ -109,6 +120,9 @@ impl Reconciler {
     pub fn with_backoff(initial: Duration, max: Duration) -> Self {
         Self {
             states: HashMap::new(),
+            completed_operation_sweeps: HashSet::new(),
+            durable_operation_answers: HashSet::new(),
+            durable_blob_answers: HashSet::new(),
             initial_backoff: initial,
             max_backoff: max,
             fetch_budget: RECONCILE_FETCH_DEADLINE,
@@ -167,28 +181,40 @@ impl Reconciler {
             }
         };
         stats.wants = requests.len();
-        let mut blob_wants = Vec::new();
-        let mut operation_wants = HashSet::new();
+        let mut blob_wants = BTreeSet::new();
+        let mut operation_wants = BTreeSet::new();
         for request in requests {
             match request {
-                WantRequest::Blob { handle } => blob_wants.push(handle.raw),
+                WantRequest::Blob { .. } => {
+                    blob_wants.insert(request);
+                }
                 WantRequest::Merge { .. } | WantRequest::Derive { .. } => {
                     operation_wants.insert(request);
                 }
             }
         }
 
-        // A locally present exact receipt already answers an operation want.
-        // Remote receipt discovery lands in the next protocol slice; until
-        // then unanswered operation wants remain visibly pending rather than
-        // allowing the daemon to report false quiescence.
+        // A visible exact receipt is useful evidence, but does not prove that
+        // the configured-peer sweep which found it completed. Flush local
+        // answers before use, then require one complete sweep per Reconciler
+        // lifetime. After a crash we intentionally probe again: this prevents
+        // one surviving record from a partially written conflict response
+        // from masquerading as complete evidence.
+        self.completed_operation_sweeps
+            .retain(|request| operation_wants.contains(request));
+        self.durable_operation_answers
+            .retain(|request| operation_wants.contains(request));
+        operation_wants.retain(|request| !self.completed_operation_sweeps.contains(request));
+        let mut durable_local_answers = self.durable_operation_answers.clone();
         if !operation_wants.is_empty() {
-            let local_answers = {
+            let locally_visible_answers = {
                 let mut store = peer.store();
                 match store.records() {
                     Ok(records) => records
                         .filter_map(Result::ok)
                         .filter_map(want_request_for_record)
+                        .filter(|request| operation_wants.contains(request))
+                        .filter(|request| !self.durable_operation_answers.contains(request))
                         .collect::<HashSet<_>>(),
                     Err(error) => {
                         tracing::warn!(
@@ -199,9 +225,30 @@ impl Reconciler {
                     }
                 }
             };
-            operation_wants.retain(|request| !local_answers.contains(request));
+            if !locally_visible_answers.is_empty() {
+                let durable = {
+                    let mut store = peer.store();
+                    match store.flush() {
+                        Ok(()) => true,
+                        Err(error) => {
+                            tracing::warn!(
+                                error = ?error,
+                                count = locally_visible_answers.len(),
+                                "reconcile: local collection receipts are visible but not durable; operation wants stay pending"
+                            );
+                            false
+                        }
+                    }
+                };
+                if durable {
+                    self.durable_operation_answers
+                        .extend(locally_visible_answers.iter().copied());
+                    durable_local_answers.extend(locally_visible_answers);
+                }
+            }
         }
-        stats.pending = operation_wants.len();
+        self.durable_blob_answers
+            .retain(|request| blob_wants.contains(request));
 
         // ── Presence: which wants the local snapshot already serves ───
         // Peer::reader() runs refresh() (drains gossip, announces
@@ -211,37 +258,165 @@ impl Reconciler {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(error = ?e, "reconcile: store reader unavailable; skipping pass");
+                stats.missing = operation_wants.len() + blob_wants.len();
+                stats.pending = stats.missing;
                 return stats;
             }
         };
-        let missing: Vec<RawHash> = blob_wants
-            .into_iter()
-            .filter(|hash| {
-                BlobStoreGet::get::<Bytes, UnknownBlob>(&reader, Inline::new(*hash)).is_err()
+        let locally_visible_blobs: HashSet<WantRequest> = blob_wants
+            .iter()
+            .copied()
+            .filter(|request| {
+                let WantRequest::Blob { handle } = request else {
+                    unreachable!("blob_wants contains only Blob requests")
+                };
+                BlobStoreGet::get::<Bytes, UnknownBlob>(&reader, *handle).is_ok()
             })
             .collect();
-        stats.missing = missing.len() + operation_wants.len();
+        drop(reader);
+        self.durable_blob_answers
+            .retain(|request| locally_visible_blobs.contains(request));
+        let new_local_blobs: HashSet<WantRequest> = locally_visible_blobs
+            .difference(&self.durable_blob_answers)
+            .copied()
+            .collect();
+        if !new_local_blobs.is_empty() {
+            let durable = {
+                let mut store = peer.store();
+                match store.flush() {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!(
+                            error = ?error,
+                            count = new_local_blobs.len(),
+                            "reconcile: local blobs are visible but not durable; blob wants stay pending"
+                        );
+                        false
+                    }
+                }
+            };
+            if durable {
+                self.durable_blob_answers.extend(new_local_blobs);
+            }
+        }
+        let missing_blobs: Vec<WantRequest> = blob_wants
+            .iter()
+            .filter(|request| !self.durable_blob_answers.contains(request))
+            .copied()
+            .collect();
+        stats.missing = missing_blobs.len()
+            + operation_wants
+                .iter()
+                .filter(|request| !durable_local_answers.contains(request))
+                .count();
 
         // Drop bookkeeping for wants no longer outstanding — satisfied
         // out-of-band (gossip landed the blob) or retracted.
-        let missing_set: HashSet<RawHash> = missing.iter().copied().collect();
-        self.states.retain(|hash, _| {
-            let keep = missing_set.contains(hash);
+        let outstanding: HashSet<WantRequest> = missing_blobs
+            .iter()
+            .copied()
+            .chain(operation_wants.iter().copied())
+            .collect();
+        self.states.retain(|request, _| {
+            let keep = outstanding.contains(request);
             if !keep {
-                tracing::info!(
-                    hash = %hex::encode(&hash[..4]),
-                    "reconcile: pending want resolved out-of-band"
-                );
+                tracing::info!(?request, "reconcile: pending want resolved out-of-band");
             }
             keep
         });
 
-        // ── Fetch the missing wants (backoff-gated) ───────────────────
-        for hash in missing {
-            if let Some(st) = self.states.get(&hash) {
+        // ── Discover exact operation receipts (backoff-gated) ────────
+        // Probe all configured peers before admitting anything. Distinct
+        // outputs are retained as conflicts; all discovered receipts from
+        // this pass share one durability flush.
+        let mut discovered = Vec::new();
+        for request in operation_wants {
+            if let Some(st) = self.states.get(&request) {
                 if crate::clock::mono_now().duration_since(st.last_attempt) < st.backoff {
-                    // Recently failed; wait out the backoff. Still a
-                    // pending want — just not this pass's problem.
+                    stats.pending += 1;
+                    continue;
+                }
+            }
+
+            stats.attempted += 1;
+            let probe = peer
+                .fetch_collection_operation_receipts_with_deadline(request, self.fetch_budget)
+                .await;
+            if probe.receipts.is_empty()
+                && probe.complete
+                && durable_local_answers.contains(&request)
+            {
+                self.states.remove(&request);
+                self.completed_operation_sweeps.insert(request);
+            } else if probe.receipts.is_empty() {
+                stats.pending += 1;
+                self.record_unavailable(request);
+            } else {
+                discovered.push((request, probe.receipts, probe.complete));
+            }
+        }
+
+        if !discovered.is_empty() {
+            let landing = {
+                let mut store = peer.store();
+                let mut failed = None;
+                'requests: for (_, receipts, _) in &discovered {
+                    for receipt in receipts {
+                        if let Err(error) = store.insert(*receipt) {
+                            failed = Some(format!("insert failed: {error:?}"));
+                            break 'requests;
+                        }
+                    }
+                }
+                if failed.is_none()
+                    && let Err(error) = store.flush()
+                {
+                    failed = Some(format!("flush failed: {error:?}"));
+                }
+                failed
+            };
+            match landing {
+                None => {
+                    // Make the freshly durable records visible to remote
+                    // receipt requests before reporting local fulfillment.
+                    peer.refresh();
+                    for (request, _, complete) in discovered {
+                        self.durable_operation_answers.insert(request);
+                        if complete {
+                            self.states.remove(&request);
+                            self.completed_operation_sweeps.insert(request);
+                            stats.fulfilled += 1;
+                        } else {
+                            // Partial evidence is useful and durable, but an
+                            // incomplete configured-peer sweep cannot
+                            // discharge the question: a recovering peer may
+                            // still hold a conflicting result.
+                            self.completed_operation_sweeps.remove(&request);
+                            stats.pending += 1;
+                            self.record_unavailable(request);
+                        }
+                    }
+                }
+                Some(error) => {
+                    tracing::warn!(%error, "reconcile: landing collection receipts failed");
+                    for (request, _, _) in discovered {
+                        self.durable_operation_answers.remove(&request);
+                        self.completed_operation_sweeps.remove(&request);
+                        stats.pending += 1;
+                        self.record_unavailable(request);
+                    }
+                }
+            }
+        }
+
+        // ── Fetch missing blobs (backoff-gated) ──────────────────────
+        for request in missing_blobs {
+            let WantRequest::Blob { handle } = request else {
+                unreachable!("missing_blobs contains only Blob requests")
+            };
+            let hash = handle.raw;
+            if let Some(st) = self.states.get(&request) {
+                if crate::clock::mono_now().duration_since(st.last_attempt) < st.backoff {
                     stats.pending += 1;
                     continue;
                 }
@@ -251,19 +426,31 @@ impl Reconciler {
             match peer.fetch_blob_with_deadline(hash, self.fetch_budget).await {
                 Some(bytes) => {
                     // Land the verified bytes (fetch_blob hash-checked
-                    // them). The demand marker is
-                    // already on record and now retains the blob — no
-                    // pin state changes here.
-                    if let Err(e) = peer.store().put::<UnknownBlob, Bytes>(Bytes::from(bytes)) {
+                    // them) and cross the same durability barrier as
+                    // collection receipts before reporting fulfillment. The
+                    // demand marker remains on record and retains the blob;
+                    // no pin state changes here.
+                    let landing = {
+                        let mut store = peer.store();
+                        match store.put::<UnknownBlob, Bytes>(Bytes::from(bytes)) {
+                            Ok(_) => store
+                                .flush()
+                                .map_err(|error| format!("flush failed: {error:?}")),
+                            Err(error) => Err(format!("put failed: {error:?}")),
+                        }
+                    };
+                    if let Err(error) = landing {
                         tracing::warn!(
                             hash = %hex::encode(&hash[..4]),
-                            error = ?e,
+                            %error,
                             "reconcile: landing fetched blob failed; want stays pending"
                         );
                         stats.pending += 1;
+                        self.record_unavailable(request);
                         continue;
                     }
-                    if self.states.remove(&hash).is_some() {
+                    self.durable_blob_answers.insert(request);
+                    if self.states.remove(&request).is_some() {
                         // State change: a want previously logged as
                         // pending has been satisfied.
                         tracing::info!(
@@ -276,7 +463,7 @@ impl Reconciler {
                             "reconcile: want fetched"
                         );
                     }
-                    stats.fetched += 1;
+                    stats.fulfilled += 1;
                 }
                 None => {
                     // Unavailable: nobody reachable served it. Normal —
@@ -284,29 +471,33 @@ impl Reconciler {
                     // with backoff. Log once on the state change
                     // (became pending), not per retry.
                     stats.pending += 1;
-                    let now = crate::clock::mono_now();
-                    match self.states.entry(hash) {
-                        Entry::Occupied(mut e) => {
-                            let st = e.get_mut();
-                            st.last_attempt = now;
-                            st.backoff = (st.backoff * 2).min(self.max_backoff);
-                        }
-                        Entry::Vacant(e) => {
-                            tracing::info!(
-                                hash = %hex::encode(&hash[..4]),
-                                "reconcile: want unavailable; pending (retried with backoff — not an error)"
-                            );
-                            e.insert(WantState {
-                                last_attempt: now,
-                                backoff: self.initial_backoff,
-                            });
-                        }
-                    }
+                    self.record_unavailable(request);
                 }
             }
         }
 
         stats
+    }
+
+    fn record_unavailable(&mut self, request: WantRequest) {
+        let now = crate::clock::mono_now();
+        match self.states.entry(request) {
+            Entry::Occupied(mut entry) => {
+                let state = entry.get_mut();
+                state.last_attempt = now;
+                state.backoff = (state.backoff * 2).min(self.max_backoff);
+            }
+            Entry::Vacant(entry) => {
+                tracing::info!(
+                    ?request,
+                    "reconcile: want unavailable; pending (retried with backoff — not an error)"
+                );
+                entry.insert(WantState {
+                    last_attempt: now,
+                    backoff: self.initial_backoff,
+                });
+            }
+        }
     }
 }
 
@@ -329,6 +520,7 @@ mod tests {
     use super::*;
 
     use triblespace_core::collection::{CollectionDerive, CollectionMerge};
+    use triblespace_core::inline::Inline;
 
     #[test]
     fn exact_receipts_project_to_their_input_only_want_keys() {

@@ -23,8 +23,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only for operation wants. Only blob wants participate in fetch and bounded
   cache retention; merge and derive wants are durable questions whose answers
   are existing collection receipts. Reconciliation recognizes locally present
-  exact receipts and keeps unanswered operation wants visibly pending; remote
-  receipt discovery follows as a separate protocol slice.
+  exact receipts, probes every configured authenticated peer for unanswered
+  operation questions, unions full 128-byte answers by intrinsic record ID,
+  preserves conflicting outputs, and admits each completed batch before one
+  durability flush. Partial answers from healthy peers are retained when
+  another configured peer stalls, while the question remains pending and is
+  retried until a complete sweep succeeds; restart deliberately performs a
+  fresh sweep so a partially persisted conflict set cannot masquerade as
+  complete. Inputs—not unknown result hashes—are the discovery key, so this
+  path deliberately does not use the blob DHT. Blob fulfillment now crosses
+  the same explicit durability barrier before quiescing.
 - **Native collection records now use one dense typed representation.**
   `COMMIT`, `MERGE`, and `DERIVE` no longer masquerade as queryable
   `SimpleArchive` entities: their exact payloads are fixed at 192, 128, and

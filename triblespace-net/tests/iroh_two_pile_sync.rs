@@ -370,7 +370,7 @@ async fn want_fetches_from_holder_over_iroh() {
     for _ in 0..60u32 {
         repo_a.storage_mut().refresh(); // keep A serving a fresh snapshot
         let stats = reconciler.tick(repo_b.storage_mut()).await;
-        if stats.fetched >= 1 {
+        if stats.fulfilled >= 1 {
             fetched = true;
             break;
         }

@@ -136,9 +136,9 @@ pub enum Command {
         /// Disable the lazy want-reconcile tick. By default sync also
         /// services durable *wants*: want records appended
         /// to the pile (by faculties or any other process) are noticed
-        /// each tick and the missing blobs fetched from the swarm
-        /// (fetch-on-want). Content-lazy is the doctrine; this flag is
-        /// the escape hatch.
+        /// each tick and missing blobs or collection receipts are obtained
+        /// from peers (fetch-on-want). Content-lazy is the doctrine; this flag
+        /// is the escape hatch.
         #[arg(long)]
         no_lazy: bool,
         /// Seconds between want-reconcile passes.
@@ -325,7 +325,7 @@ fn run_sync(
     let mut reconciler = triblespace_net::reconcile::Reconciler::new();
     let reconcile_every = std::time::Duration::from_secs(reconcile_interval);
     let mut next_reconcile = std::time::Instant::now();
-    let mut wants_fetched_total: u64 = 0;
+    let mut wants_fulfilled_total: u64 = 0;
     let mut wants_pending: usize = 0;
     let mut last_pending_logged: Option<usize> = None;
     // Most recent time a want was actually serviced — lazy progress
@@ -430,17 +430,17 @@ fn run_sync(
         if lazy && next_reconcile <= std::time::Instant::now() {
             let stats = reconcile_rt.block_on(reconciler.tick(repo.storage_mut()));
             next_reconcile = std::time::Instant::now() + reconcile_every;
-            wants_fetched_total += stats.fetched as u64;
+            wants_fulfilled_total += stats.fulfilled as u64;
             wants_pending = stats.pending;
-            if stats.fetched > 0 {
+            if stats.fulfilled > 0 {
                 last_want_progress = std::time::Instant::now();
             }
             // Trace on change (a want serviced, or the pending count
             // moved), not per tick — pending wants are steady state.
-            if stats.fetched > 0 || last_pending_logged != Some(stats.pending) {
+            if stats.fulfilled > 0 || last_pending_logged != Some(stats.pending) {
                 eprintln!(
-                    "  wants: {} seen, {} fetched this pass ({} total), {} pending",
-                    stats.wants, stats.fetched, wants_fetched_total, stats.pending,
+                    "  wants: {} seen, {} fulfilled this pass ({} total), {} pending",
+                    stats.wants, stats.fulfilled, wants_fulfilled_total, stats.pending,
                 );
                 last_pending_logged = Some(stats.pending);
             }
@@ -451,7 +451,7 @@ fn run_sync(
 
     if lazy {
         eprintln!(
-            "wants: {wants_fetched_total} fetched this run; {wants_pending} still pending \
+            "wants: {wants_fulfilled_total} fulfilled this run; {wants_pending} still pending \
              (pending is normal — the wants stay in the pile's WantStore \
              and are serviced whenever a holder becomes reachable)"
         );

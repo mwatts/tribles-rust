@@ -21,6 +21,10 @@ use triblespace_core::blob::Blob;
 use triblespace_core::blob::IntoBlob;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace_core::collection::{
+    CollectionMerge, CollectionRecord, CollectionStore, simplearchive_union,
+};
+use triblespace_core::id::Id;
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::prelude::BlobStore;
@@ -84,6 +88,111 @@ fn holds_locally(peer: &mut triblespace_net::peer::Peer<MemoryRepo>, hash: [u8; 
 /// markers that lazy swarm fetches land under.
 fn want_count(peer: &triblespace_net::peer::Peer<MemoryRepo>) -> usize {
     peer.store().wants().unwrap().count()
+}
+
+#[test]
+fn reconcile_tick_services_operation_want_from_configured_peer_without_dht() {
+    use triblespace_net::reconcile::Reconciler;
+
+    let _guard = sim_guard();
+    run_paused(0x0A11_CE01, async {
+        let root = key(0xE1);
+        let server_key = key(0xA1);
+        let client_key = key(0xB1);
+        let server_cap = admin_cap(&root, &server_key);
+        let client_cap = admin_cap(&root, &client_key);
+        let caps = [server_cap.clone(), client_cap.clone()];
+        let mut server_store = store_with_caps(&caps);
+        let mut client_store = store_with_caps(&caps);
+
+        let descriptor = simplearchive_union::descriptor(Id::new([0x31; 16]).unwrap());
+        let a = Inline::new([1; 32]);
+        let b = Inline::new([2; 32]);
+        let result = Inline::new([3; 32]);
+        let request = WantRequest::merge(descriptor.handle(), a, b);
+        let receipt =
+            CollectionRecord::Merge(CollectionMerge::new(descriptor.handle(), a, b, result));
+        server_store.insert(receipt).unwrap();
+        client_store.want(request).unwrap();
+
+        let net = SimNet::new(
+            0x0A11_CE01,
+            SimConfig {
+                dht: DhtMode::Blackhole,
+                ..SimConfig::default()
+            },
+        );
+        let mut server = bring_up(
+            &net,
+            &server_key,
+            server_store,
+            root.verifying_key(),
+            self_cap_of(&server_cap.1),
+            false,
+        );
+        let mut client = bring_up_with_peers(
+            &net,
+            &client_key,
+            client_store,
+            root.verifying_key(),
+            self_cap_of(&client_cap.1),
+            false,
+            vec![pk(&server_key)],
+        );
+        SimNet::step(&vclock(), Duration::from_millis(1)).await;
+
+        let mut reconciler = Reconciler::new();
+        let stats = drive_future(reconciler.tick(&mut client), || server.refresh(), 200)
+            .await
+            .expect("operation reconciliation completes");
+        assert_eq!(stats.wants, 1);
+        assert_eq!(stats.missing, 1);
+        assert_eq!(stats.attempted, 1);
+        assert_eq!(stats.fulfilled, 1);
+        assert_eq!(stats.pending, 0);
+        assert_eq!(
+            client
+                .store()
+                .records()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![receipt]
+        );
+        assert_eq!(
+            client
+                .store()
+                .wants()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec![request],
+            "the durable question remains as local policy after fulfillment"
+        );
+
+        // The same still-asserted question is now answered locally and causes
+        // neither a network attempt nor false pending work.
+        let again = reconciler.tick(&mut client).await;
+        assert_eq!(again.wants, 1);
+        assert_eq!(again.missing, 0);
+        assert_eq!(again.attempted, 0);
+        assert_eq!(again.fulfilled, 0);
+        assert_eq!(again.pending, 0);
+
+        // The process-local completion cache is deliberately not durable. A
+        // restarted reconciler sees the local receipt but performs one fresh
+        // configured-peer sweep before quiescing, so a partially persisted
+        // conflict batch can never masquerade as complete after a crash.
+        let mut restarted = Reconciler::new();
+        let after_restart = drive_future(restarted.tick(&mut client), || server.refresh(), 200)
+            .await
+            .expect("post-restart operation sweep completes");
+        assert_eq!(after_restart.wants, 1);
+        assert_eq!(after_restart.missing, 0);
+        assert_eq!(after_restart.attempted, 1);
+        assert_eq!(after_restart.fulfilled, 1);
+        assert_eq!(after_restart.pending, 0);
+    });
 }
 
 /// A holds a content blob; B does not. B's swarm fetch must pull it
@@ -1234,7 +1343,7 @@ fn reconcile_tick_services_out_of_band_want() {
             .expect("reconcile tick completes");
         assert_eq!(stats.wants, 1, "the out-of-band want is the want set");
         assert_eq!(stats.missing, 1, "its blob was absent at pass start");
-        assert_eq!(stats.fetched, 1, "the want was serviced from the swarm");
+        assert_eq!(stats.fulfilled, 1, "the want was serviced from the swarm");
         assert_eq!(stats.pending, 0, "nothing left outstanding");
 
         // The blob landed at B...
@@ -1313,7 +1422,7 @@ fn reconcile_unsatisfiable_want_stays_pending() {
             .expect("tick 1 completes despite the unsatisfiable want");
         assert_eq!(s1.missing, 1);
         assert_eq!(s1.attempted, 1, "first sighting is attempted immediately");
-        assert_eq!(s1.fetched, 0);
+        assert_eq!(s1.fulfilled, 0);
         assert_eq!(s1.pending, 1, "the want stays pending");
 
         // Tick 2, immediately: the backoff gate holds — still pending,
@@ -1334,7 +1443,7 @@ fn reconcile_unsatisfiable_want_stays_pending() {
             .await
             .expect("tick 3 completes");
         assert_eq!(s3.attempted, 1, "retried after the backoff elapsed");
-        assert_eq!(s3.fetched, 0);
+        assert_eq!(s3.fulfilled, 0);
         assert_eq!(s3.pending, 1);
 
         // Throughout: the want is still durably on record and the blob

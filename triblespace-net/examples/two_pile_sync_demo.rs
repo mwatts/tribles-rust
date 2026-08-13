@@ -441,7 +441,7 @@ fn run_b(dir: &Path) {
             std::process::exit(1);
         }
         let stats = rt.block_on(reconciler.tick(repo.storage_mut()));
-        if stats.fetched >= 1 {
+        if stats.fulfilled >= 1 {
             break;
         }
         std::thread::sleep(Duration::from_millis(300));
