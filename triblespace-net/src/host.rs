@@ -12,18 +12,24 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use ed25519_dalek::SigningKey;
+use futures::stream::{FuturesUnordered, StreamExt};
 use iroh_base::{EndpointAddr, EndpointId};
 use tracing::{Instrument, debug, debug_span, error, info, info_span, instrument, trace, warn};
 use triblespace_core::collection::{
     CollectionGossip, CollectionGossipStore, CollectionId, CollectionRecord, CollectionStore,
 };
+use triblespace_core::repo::{WANT_REQUEST_BYTES_LEN, WantRequest};
 
 use crate::channel::{NetCommand, NetEvent, PublisherKey};
-use crate::collection_wire::{CollectionCommitEvidence, grant_backed_commits};
+use crate::collection_wire::{
+    CollectionCommitEvidence, CollectionOperationReceiptResponse, collection_operation_receipts,
+    decode_collection_operation_request, encode_collection_operation_receipts,
+    grant_backed_commits, op_collection_operation_receipts,
+};
 use crate::identity::iroh_secret;
 use crate::protocol::*;
 use crate::transport::{Conn, GossipEvent, GossipSink, Harness, PeerId, Transport};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn op_name(op: u8) -> &'static str {
     match op {
@@ -31,6 +37,7 @@ fn op_name(op: u8) -> &'static str {
         OP_GET_BLOB => "GET_BLOB",
         OP_CHILDREN => "CHILDREN",
         OP_COLLECTION_EVIDENCE => "COLLECTION_EVIDENCE",
+        OP_COLLECTION_OPERATION_RECEIPTS => "COLLECTION_OPERATION_RECEIPTS",
         _ => "UNKNOWN",
     }
 }
@@ -202,6 +209,10 @@ pub trait AnySnapshot: Send + 'static {
     /// Strict grant-backed commits for one exact descriptor handle, in
     /// deterministic intrinsic-record order.
     fn collection_evidence(&self, collection: CollectionId) -> Vec<CollectionCommitEvidence>;
+    /// Exact unsigned merge/derive receipts answering one durable question,
+    /// in deterministic intrinsic-record order. Conflicting answers remain
+    /// distinct records.
+    fn collection_operation_receipts(&self, request: WantRequest) -> Vec<CollectionRecord>;
 }
 
 impl<R> AnySnapshot for StoreSnapshot<R>
@@ -237,6 +248,11 @@ where
             collection,
         )
     }
+
+    fn collection_operation_receipts(&self, request: WantRequest) -> Vec<CollectionRecord> {
+        collection_operation_receipts(request, self.collection_records.iter().copied())
+            .unwrap_or_default()
+    }
 }
 
 /// The network capability a `Peer` invokes **inline** for
@@ -249,10 +265,34 @@ where
 /// published through a readiness slot ([`NetSender::fetch_blob`]) once
 /// the transport binds, which is how the inline path handles the
 /// construction-ordering the command channel used to paper over.
-pub trait NetCapability: Send + Sync {
+pub(crate) trait NetCapability: Send + Sync {
     /// Swarm-addressed fetch of `hash` (DHT-routed, content-verified).
     /// `None` is Unavailable.
     fn fetch_blob(&self, hash: RawHash) -> futures::future::BoxFuture<'static, Option<Vec<u8>>>;
+    /// Start one independent probe per configured peer. The caller consumes
+    /// completed probes until its own end-to-end deadline, preserving healthy
+    /// answers even when another peer stalls.
+    fn collection_operation_receipt_probes(
+        &self,
+        request: WantRequest,
+    ) -> FuturesUnordered<futures::future::BoxFuture<'static, CollectionOperationPeerProbe>>;
+}
+
+pub enum CollectionOperationPeerProbe {
+    /// The peer answered the exact request, possibly with no records.
+    Complete(Vec<CollectionRecord>),
+    /// Dial, authentication, framing, or the per-peer deadline failed.
+    Incomplete,
+}
+
+/// Outcome of one bounded sweep over every configured peer.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CollectionOperationProbe {
+    /// Deterministic union of every exact receipt returned before the budget.
+    pub receipts: Vec<CollectionRecord>,
+    /// `true` only when every configured peer completed its probe. Partial
+    /// receipts remain useful evidence, but must not quiesce a durable want.
+    pub complete: bool,
 }
 
 /// Gossip-known publishers, most-recent-first. Every HEAD frame names
@@ -294,6 +334,9 @@ struct NetCap<T: Transport> {
     /// DHT, failed outright even with a reachable publisher in gossip
     /// range).
     publishers: KnownPublishers,
+    /// Explicit peers are the discovery boundary for input-only operation
+    /// questions: their unknown result hashes cannot be looked up in the DHT.
+    configured_peers: Vec<PeerId>,
 }
 
 impl<T: Transport> NetCapability for NetCap<T> {
@@ -326,6 +369,63 @@ impl<T: Transport> NetCapability for NetCap<T> {
             }
             data.filter(|data| blake3::hash(data).as_bytes() == &hash)
         })
+    }
+
+    fn collection_operation_receipt_probes(
+        &self,
+        request: WantRequest,
+    ) -> FuturesUnordered<futures::future::BoxFuture<'static, CollectionOperationPeerProbe>> {
+        let transport = self.transport.clone();
+        let pool = self.pool.clone();
+        let self_cap = self.self_cap;
+        let peers = self.configured_peers.clone();
+        peers
+            .into_iter()
+            .map(|peer| {
+                let transport = transport.clone();
+                let pool = pool.clone();
+                Box::pin(async move {
+                    let Some(connection) = pool_get(&transport, &pool, peer, &self_cap).await
+                    else {
+                        return CollectionOperationPeerProbe::Incomplete;
+                    };
+                    match tokio::time::timeout(
+                        OP_DEADLINE,
+                        op_collection_operation_receipts(&connection, request),
+                    )
+                    .await
+                    {
+                        Ok(Ok(CollectionOperationReceiptResponse::Receipts(receipts))) => {
+                            CollectionOperationPeerProbe::Complete(receipts)
+                        }
+                        // Authorization refusal is not a broken pooled
+                        // connection, but it also cannot establish that this
+                        // peer has no receipt. The sweep remains incomplete.
+                        Ok(Ok(CollectionOperationReceiptResponse::Rejected)) => {
+                            CollectionOperationPeerProbe::Incomplete
+                        }
+                        Ok(Err(error)) => {
+                            debug!(
+                                peer = %hex::encode(&peer[..4]),
+                                %error,
+                                "collection receipt probe failed"
+                            );
+                            pool_evict(&pool, peer).await;
+                            CollectionOperationPeerProbe::Incomplete
+                        }
+                        Err(_) => {
+                            debug!(
+                                peer = %hex::encode(&peer[..4]),
+                                "collection receipt probe deadline exceeded"
+                            );
+                            pool_evict(&pool, peer).await;
+                            CollectionOperationPeerProbe::Incomplete
+                        }
+                    }
+                })
+                    as futures::future::BoxFuture<'static, CollectionOperationPeerProbe>
+            })
+            .collect()
     }
 }
 
@@ -414,6 +514,63 @@ impl NetSender {
                 );
                 None
             }
+        }
+    }
+
+    /// Probe configured authenticated peers for exact collection-operation
+    /// receipts. Empty means unavailable: no configured peer answered with a
+    /// matching receipt. No DHT lookup is possible because the result hash is
+    /// precisely what the question asks us to discover.
+    pub(crate) async fn fetch_collection_operation_receipts(
+        &self,
+        request: WantRequest,
+        budget: std::time::Duration,
+    ) -> CollectionOperationProbe {
+        let mut rx = self.cap.clone();
+        let deadline = tokio::time::Instant::now() + budget;
+        let cap = match tokio::time::timeout_at(deadline, rx.wait_for(|cap| cap.is_some())).await {
+            Ok(Ok(guard)) => guard.clone(),
+            Ok(Err(_)) => return CollectionOperationProbe::default(),
+            Err(_) => {
+                debug!(
+                    ?request,
+                    ?budget,
+                    "collection receipt probe budget exceeded before network readiness"
+                );
+                return CollectionOperationProbe::default();
+            }
+        };
+        let Some(cap) = cap else {
+            return CollectionOperationProbe::default();
+        };
+        let mut probes = cap.collection_operation_receipt_probes(request);
+        let mut union = std::collections::BTreeMap::new();
+        let mut complete = true;
+        loop {
+            match tokio::time::timeout_at(deadline, probes.next()).await {
+                Ok(Some(CollectionOperationPeerProbe::Complete(receipts))) => {
+                    for receipt in receipts {
+                        union.entry(receipt.id()).or_insert(receipt);
+                    }
+                }
+                Ok(Some(CollectionOperationPeerProbe::Incomplete)) => complete = false,
+                Ok(None) => break,
+                Err(_) => {
+                    complete = false;
+                    debug!(
+                        ?request,
+                        ?budget,
+                        completed = union.len(),
+                        pending_peers = probes.len(),
+                        "collection receipt probe budget exceeded; preserving completed answers"
+                    );
+                    break;
+                }
+            }
+        }
+        CollectionOperationProbe {
+            receipts: union.into_values().collect(),
+            complete,
         }
     }
 
@@ -611,6 +768,14 @@ async fn host_loop<T: Transport>(
 
     let my_id: PeerId = transport.local_id();
     let self_cap: RawHash = config.self_cap;
+    let mut configured_peers: Vec<PeerId> = config
+        .peers
+        .iter()
+        .map(|address| *address.id.as_bytes())
+        .filter(|peer| *peer != my_id)
+        .collect();
+    configured_peers.sort_unstable();
+    configured_peers.dedup();
 
     // Host-wide singleflight connection pool — one authed
     // connection per remote peer, reused across all concurrent
@@ -633,6 +798,7 @@ async fn host_loop<T: Transport>(
         self_cap,
         my_id,
         publishers: known_publishers.clone(),
+        configured_peers,
     }) as Arc<dyn NetCapability>));
 
     // Failed-walk retry queue (bug C): walks that fail transiently
@@ -2218,6 +2384,61 @@ async fn serve_stream<T: Transport>(
                     collection = %hex::encode(&collection.raw[..4]),
                     count,
                     "OP_COLLECTION_EVIDENCE served"
+                );
+            }
+        }
+
+        OP_COLLECTION_OPERATION_RECEIPTS => {
+            let mut request_bytes = [0u8; WANT_REQUEST_BYTES_LEN];
+            let request = match recv.read_exact(&mut request_bytes).await {
+                Ok(_) => {
+                    let mut trailing = [0u8; 1];
+                    match recv.read(&mut trailing).await {
+                        Ok(0) => decode_collection_operation_request(request_bytes).ok(),
+                        Ok(_) => {
+                            debug!("collection operation request contains trailing bytes");
+                            None
+                        }
+                        Err(error) => {
+                            debug!(%error, "failed to finish collection operation request");
+                            None
+                        }
+                    }
+                }
+                Err(error) => {
+                    debug!(%error, "truncated collection operation request");
+                    None
+                }
+            };
+            // Like collection evidence, operation receipts are addressed by
+            // collection descriptors rather than legacy branch ids. Until
+            // capabilities carry collection scope, only an unrestricted read
+            // grant has a principled meaning here.
+            if !verified.grants_read() || verified.granted_branches().is_some() || request.is_none()
+            {
+                warn!(
+                    valid_request = request.is_some(),
+                    "OP_COLLECTION_OPERATION_RECEIPTS denied or malformed"
+                );
+                send_u32_be(send, COLLECTION_OPERATION_RECEIPTS_REJECTED).await?;
+            } else {
+                let request = request.expect("checked operation request");
+                let receipts = {
+                    let guard = snap_arc.lock().unwrap();
+                    guard
+                        .as_ref()
+                        .map(|snapshot| snapshot.collection_operation_receipts(request))
+                        .unwrap_or_default()
+                };
+                let response = encode_collection_operation_receipts(request, receipts)?;
+                send.write_all(&response).await.map_err(|error| {
+                    anyhow::anyhow!("send collection operation receipts: {error}")
+                })?;
+                debug!(
+                    ?request,
+                    count = (response.len() - 4)
+                        / crate::collection_wire::COLLECTION_OPERATION_RECEIPT_BYTES_LEN,
+                    "OP_COLLECTION_OPERATION_RECEIPTS served"
                 );
             }
         }

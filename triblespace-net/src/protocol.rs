@@ -21,6 +21,8 @@
 //!   CHILDREN   parent:32 → hash* nil                  (nil = end)
 //!   COLLECTION_EVIDENCE collection:32 → count:u32 evidence[count]
 //!                  (`u32::MAX` = unrestricted-read capability required)
+//!   COLLECTION_OPERATION_RECEIPTS request:97 → count:u32 receipt[count]
+//!                  (`u32::MAX` = rejected; each receipt is 128 bytes)
 //!   (protocol is read-only — no remote writes)
 //!
 //! Branch-state discovery is gossip-driven, not ALPN-driven. HEAD
@@ -48,6 +50,10 @@ pub const OP_AUTH: u8 = 0x05;
 /// descriptor handle. The response framing and strict evidence codec live in
 /// [`crate::collection_wire`].
 pub const OP_COLLECTION_EVIDENCE: u8 = 0x06;
+/// Ask for every locally known exact `MERGE` or `DERIVE` receipt answering one
+/// canonical 97-byte [`triblespace_core::repo::WantRequest`]. Responses carry
+/// full untagged 128-byte records; the request kind supplies their type.
+pub const OP_COLLECTION_OPERATION_RECEIPTS: u8 = 0x07;
 // CAS_PUSH removed: the data model is monotonic (set union), merge
 // always succeeds, and each node manages its own branches locally.
 // No remote writes needed — the protocol is read-only.
@@ -65,6 +71,10 @@ pub const AUTH_REJECTED: u8 = 0x01;
 /// enumeration deliberately requires unrestricted read scope until
 /// collection-scoped capabilities exist.
 pub const COLLECTION_EVIDENCE_REJECTED: u32 = u32::MAX;
+/// `OP_COLLECTION_OPERATION_RECEIPTS` response sentinel. This covers both
+/// authorization rejection and structurally invalid requests; callers learn
+/// no collection evidence from either case.
+pub const COLLECTION_OPERATION_RECEIPTS_REJECTED: u32 = u32::MAX;
 
 pub const NIL_HASH: RawHash = [0u8; 32];
 pub const NIL_BRANCH_ID: RawPinId = [0u8; 16];

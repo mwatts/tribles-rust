@@ -11,17 +11,24 @@ use triblespace_core::blob::Blob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{IntoBlob, TryFromBlob};
 use triblespace_core::collection::{
-    Collection, CollectionGossip, CollectionGossipStore, CollectionStore, simplearchive_union,
+    Collection, CollectionData, CollectionDerive, CollectionGossip, CollectionGossipStore,
+    CollectionMerge, CollectionRecord, CollectionStore, simplearchive_union,
 };
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::time::NsTAIInterval;
 use triblespace_core::inline::{Inline, TryToInline};
+use triblespace_core::repo::WantRequest;
 use triblespace_core::repo::capability::{self, PERM_READ, scope_branch};
+use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{BlobStore, BlobStoreGet, BlobStorePut, PinStore, WantStore};
 use triblespace_core::trible::{Fragment, TRIBLE_LEN, Trible, TribleSet};
-use triblespace_net::transport::sim::{SimConfig, SimNet};
+use triblespace_net::peer::Peer;
+use triblespace_net::transport::sim::{DhtMode, SimConfig, SimNet};
 
-use common::{admin_cap, bring_up, key, pk, run_paused, self_cap_of, store_with_caps, vclock};
+use common::{
+    admin_cap, bring_up, bring_up_with_peers, key, pk, run_paused, self_cap_of, store_with_caps,
+    vclock,
+};
 
 fn id(byte: u8) -> Id {
     Id::new([byte; 16]).unwrap()
@@ -33,6 +40,10 @@ fn archive(byte: u8) -> Blob<SimpleArchive> {
     let mut facts = TribleSet::new();
     facts.insert(&Trible::force_raw(row).unwrap());
     facts.to_blob()
+}
+
+fn data(byte: u8) -> CollectionData {
+    Inline::new([byte; 32])
 }
 
 fn branch_restricted_read_cap(
@@ -341,6 +352,401 @@ fn direct_collection_reconcile_admits_sparse_evidence_without_blobs_pins_or_want
         assert!(store.pins().unwrap().next().is_none());
         assert!(store.wants().unwrap().next().is_none());
     });
+}
+
+#[test]
+fn configured_peer_probe_roundtrips_exact_operation_receipts_without_dht_or_gossip_grants() {
+    let _guard = common::sim_guard();
+    run_paused(0xC011ECB, async {
+        let root = key(0xF4);
+        let server_key = key(0xA4);
+        let configured_key = key(0xB4);
+        let unconfigured_key = key(0xC4);
+        let server_cap = admin_cap(&root, &server_key);
+        let configured_cap = admin_cap(&root, &configured_key);
+        let unconfigured_cap = admin_cap(&root, &unconfigured_key);
+
+        let all_caps = [
+            server_cap.clone(),
+            configured_cap.clone(),
+            unconfigured_cap.clone(),
+        ];
+        let mut server_store = store_with_caps(&all_caps);
+        let configured_store = store_with_caps(&all_caps);
+        let unconfigured_store = store_with_caps(&all_caps);
+
+        let source = simplearchive_union::descriptor(id(20));
+        let target = simplearchive_union::descriptor(id(21));
+        let other = simplearchive_union::descriptor(id(22));
+        let merge_request = WantRequest::merge(source.handle(), data(1), data(2));
+        let merge_first = CollectionMerge::new(source.handle(), data(1), data(2), data(3));
+        let merge_conflict = CollectionMerge::new(source.handle(), data(1), data(2), data(4));
+        let merge_unrelated = CollectionMerge::new(source.handle(), data(1), data(9), data(5));
+        let merge_wrong_collection =
+            CollectionMerge::new(other.handle(), data(1), data(2), data(6));
+
+        let derive_request = WantRequest::derive(source.handle(), target.handle(), data(7));
+        let derive_first =
+            CollectionDerive::new(source.handle(), target.handle(), data(7), data(8));
+        let derive_conflict =
+            CollectionDerive::new(source.handle(), target.handle(), data(7), data(9));
+        let derive_unrelated =
+            CollectionDerive::new(source.handle(), target.handle(), data(10), data(11));
+
+        for record in [
+            CollectionRecord::Derive(derive_unrelated),
+            CollectionRecord::Merge(merge_conflict),
+            CollectionRecord::Merge(merge_unrelated),
+            CollectionRecord::Derive(derive_first),
+            CollectionRecord::Merge(merge_first),
+            CollectionRecord::Derive(derive_conflict),
+            CollectionRecord::Merge(merge_wrong_collection),
+        ] {
+            server_store.insert(record).unwrap();
+        }
+        assert!(
+            server_store.gossips().unwrap().next().is_none(),
+            "unsigned operation receipts need no collection gossip grant"
+        );
+
+        // A black-hole DHT makes the discovery choice observable: configured
+        // operation probes still dial their named peers directly, while an
+        // unconfigured client has no discovery fallback to wait on.
+        let net = SimNet::new(
+            0xC011ECB,
+            SimConfig {
+                dht: DhtMode::Blackhole,
+                ..SimConfig::default()
+            },
+        );
+        let _server = bring_up(
+            &net,
+            &server_key,
+            server_store,
+            root.verifying_key(),
+            self_cap_of(&server_cap.1),
+            false,
+        );
+        let configured = bring_up_with_peers(
+            &net,
+            &configured_key,
+            configured_store,
+            root.verifying_key(),
+            self_cap_of(&configured_cap.1),
+            false,
+            vec![pk(&server_key)],
+        );
+        let unconfigured = bring_up(
+            &net,
+            &unconfigured_key,
+            unconfigured_store,
+            root.verifying_key(),
+            self_cap_of(&unconfigured_cap.1),
+            false,
+        );
+        SimNet::step(&vclock(), Duration::from_millis(1)).await;
+
+        let merge_receipts = probe_operation_while_stepping(&configured, merge_request)
+            .await
+            .receipts;
+        let mut expected_merges = vec![
+            CollectionRecord::Merge(merge_first),
+            CollectionRecord::Merge(merge_conflict),
+        ];
+        expected_merges.sort_by_key(CollectionRecord::id);
+        assert_eq!(merge_receipts, expected_merges);
+
+        let derive_receipts = probe_operation_while_stepping(&configured, derive_request)
+            .await
+            .receipts;
+        let mut expected_derives = vec![
+            CollectionRecord::Derive(derive_first),
+            CollectionRecord::Derive(derive_conflict),
+        ];
+        expected_derives.sort_by_key(CollectionRecord::id);
+        assert_eq!(derive_receipts, expected_derives);
+
+        assert!(
+            probe_operation_while_stepping(&unconfigured, merge_request)
+                .await
+                .receipts
+                .is_empty(),
+            "operation discovery is configured-peer probing, not a DHT lookup"
+        );
+    });
+}
+
+#[test]
+fn configured_peer_probe_unions_conflicting_receipts_split_across_peers() {
+    let _guard = common::sim_guard();
+    run_paused(0xC011ECD, async {
+        let root = key(0xF6);
+        let first_server_key = key(0xA6);
+        let second_server_key = key(0xA7);
+        let client_key = key(0xB6);
+        let first_server_cap = admin_cap(&root, &first_server_key);
+        let second_server_cap = admin_cap(&root, &second_server_key);
+        let client_cap = admin_cap(&root, &client_key);
+        let all_caps = [
+            first_server_cap.clone(),
+            second_server_cap.clone(),
+            client_cap.clone(),
+        ];
+        let mut first_store = store_with_caps(&all_caps);
+        let mut second_store = store_with_caps(&all_caps);
+        let client_store = store_with_caps(&all_caps);
+
+        let descriptor = simplearchive_union::descriptor(id(24));
+        let request = WantRequest::merge(descriptor.handle(), data(1), data(2));
+        let first = CollectionRecord::Merge(CollectionMerge::new(
+            descriptor.handle(),
+            data(1),
+            data(2),
+            data(3),
+        ));
+        let conflicting = CollectionRecord::Merge(CollectionMerge::new(
+            descriptor.handle(),
+            data(1),
+            data(2),
+            data(4),
+        ));
+        first_store.insert(first).unwrap();
+        second_store.insert(conflicting).unwrap();
+
+        let net = SimNet::new(
+            0xC011ECD,
+            SimConfig {
+                dht: DhtMode::Blackhole,
+                ..SimConfig::default()
+            },
+        );
+        let _first_server = bring_up(
+            &net,
+            &first_server_key,
+            first_store,
+            root.verifying_key(),
+            self_cap_of(&first_server_cap.1),
+            false,
+        );
+        let _second_server = bring_up(
+            &net,
+            &second_server_key,
+            second_store,
+            root.verifying_key(),
+            self_cap_of(&second_server_cap.1),
+            false,
+        );
+        let client = bring_up_with_peers(
+            &net,
+            &client_key,
+            client_store,
+            root.verifying_key(),
+            self_cap_of(&client_cap.1),
+            false,
+            vec![pk(&second_server_key), pk(&first_server_key)],
+        );
+        SimNet::step(&vclock(), Duration::from_millis(1)).await;
+
+        let mut expected = vec![first, conflicting];
+        expected.sort_by_key(CollectionRecord::id);
+        assert_eq!(
+            probe_operation_while_stepping(&client, request)
+                .await
+                .receipts,
+            expected,
+            "configured-peer probing must union conflicting exact evidence from every peer"
+        );
+    });
+}
+
+#[test]
+fn configured_peer_probe_keeps_partial_evidence_and_recovers_conflict_after_stall() {
+    let _guard = common::sim_guard();
+    run_paused(0xC011ECE, async {
+        let root = key(0xF7);
+        let healthy_key = key(0xA8);
+        let stalled_key = key(0xA9);
+        let client_key = key(0xB7);
+        let healthy_cap = admin_cap(&root, &healthy_key);
+        let stalled_cap = admin_cap(&root, &stalled_key);
+        let client_cap = admin_cap(&root, &client_key);
+        let all_caps = [healthy_cap.clone(), stalled_cap.clone(), client_cap.clone()];
+        let mut healthy_store = store_with_caps(&all_caps);
+        let mut stalled_store = store_with_caps(&all_caps);
+        let client_store = store_with_caps(&all_caps);
+
+        let descriptor = simplearchive_union::descriptor(id(25));
+        let request = WantRequest::merge(descriptor.handle(), data(1), data(2));
+        let receipt = CollectionRecord::Merge(CollectionMerge::new(
+            descriptor.handle(),
+            data(1),
+            data(2),
+            data(3),
+        ));
+        let conflict = CollectionRecord::Merge(CollectionMerge::new(
+            descriptor.handle(),
+            data(1),
+            data(2),
+            data(4),
+        ));
+        healthy_store.insert(receipt).unwrap();
+        stalled_store.insert(conflict).unwrap();
+
+        let net = SimNet::new(
+            0xC011ECE,
+            SimConfig {
+                dht: DhtMode::Blackhole,
+                ..SimConfig::default()
+            },
+        );
+        let _healthy = bring_up(
+            &net,
+            &healthy_key,
+            healthy_store,
+            root.verifying_key(),
+            self_cap_of(&healthy_cap.1),
+            false,
+        );
+        let _stalled = bring_up(
+            &net,
+            &stalled_key,
+            stalled_store,
+            root.verifying_key(),
+            self_cap_of(&stalled_cap.1),
+            false,
+        );
+        let client = bring_up_with_peers(
+            &net,
+            &client_key,
+            client_store,
+            root.verifying_key(),
+            self_cap_of(&client_cap.1),
+            false,
+            vec![pk(&stalled_key), pk(&healthy_key)],
+        );
+        net.stall_dials(pk(&stalled_key));
+        SimNet::step(&vclock(), Duration::from_millis(1)).await;
+
+        let future = client
+            .fetch_collection_operation_receipts_with_deadline(request, Duration::from_secs(1));
+        tokio::pin!(future);
+        let mut answer = None;
+        for _ in 0..100 {
+            if let std::task::Poll::Ready(receipts) = futures::poll!(future.as_mut()) {
+                answer = Some(receipts);
+                break;
+            }
+            SimNet::step(&vclock(), Duration::from_millis(20)).await;
+        }
+        let answer = answer.expect("outer receipt budget completes despite stalled dial");
+        assert_eq!(
+            answer.receipts,
+            vec![receipt],
+            "the deadline must preserve answers completed by healthy configured peers"
+        );
+        assert!(
+            !answer.complete,
+            "the caller must retain that one configured peer did not answer"
+        );
+
+        net.unstall_dials(pk(&stalled_key));
+        let recovered = probe_operation_while_stepping(&client, request).await;
+        let mut expected = vec![receipt, conflict];
+        expected.sort_by_key(CollectionRecord::id);
+        assert_eq!(recovered.receipts, expected);
+        assert!(
+            recovered.complete,
+            "after recovery every configured peer completed and the conflict is visible"
+        );
+    });
+}
+
+#[test]
+fn branch_restricted_capability_receives_no_operation_receipts() {
+    let _guard = common::sim_guard();
+    run_paused(0xC011ECC, async {
+        let root = key(0xF5);
+        let server_key = key(0xA5);
+        let client_key = key(0xB5);
+        let control_key = key(0xC5);
+        let server_cap = admin_cap(&root, &server_key);
+        let client_cap = branch_restricted_read_cap(&root, &client_key);
+        let control_cap = admin_cap(&root, &control_key);
+        let all_caps = [server_cap.clone(), client_cap.clone(), control_cap.clone()];
+        let mut server_store = store_with_caps(&all_caps);
+        let client_store = store_with_caps(&all_caps);
+        let control_store = store_with_caps(&all_caps);
+
+        let descriptor = simplearchive_union::descriptor(id(23));
+        let request = WantRequest::merge(descriptor.handle(), data(1), data(2));
+        let receipt = CollectionRecord::Merge(CollectionMerge::new(
+            descriptor.handle(),
+            data(1),
+            data(2),
+            data(3),
+        ));
+        server_store.insert(receipt).unwrap();
+
+        let net = SimNet::new(0xC011ECC, SimConfig::default());
+        let _server = bring_up(
+            &net,
+            &server_key,
+            server_store,
+            root.verifying_key(),
+            self_cap_of(&server_cap.1),
+            false,
+        );
+        let client = bring_up_with_peers(
+            &net,
+            &client_key,
+            client_store,
+            root.verifying_key(),
+            self_cap_of(&client_cap.1),
+            false,
+            vec![pk(&server_key)],
+        );
+        let control = bring_up_with_peers(
+            &net,
+            &control_key,
+            control_store,
+            root.verifying_key(),
+            self_cap_of(&control_cap.1),
+            false,
+            vec![pk(&server_key)],
+        );
+        SimNet::step(&vclock(), Duration::from_millis(1)).await;
+
+        assert_eq!(
+            probe_operation_while_stepping(&control, request)
+                .await
+                .receipts,
+            vec![receipt],
+            "the same route serves an unrestricted reader"
+        );
+        assert!(
+            probe_operation_while_stepping(&client, request)
+                .await
+                .receipts
+                .is_empty(),
+            "the server's rejection is intentionally exposed as no receipts by the Peer probe"
+        );
+    });
+}
+
+async fn probe_operation_while_stepping(
+    peer: &Peer<MemoryRepo>,
+    request: WantRequest,
+) -> triblespace_net::host::CollectionOperationProbe {
+    let future =
+        peer.fetch_collection_operation_receipts_with_deadline(request, Duration::from_secs(1));
+    tokio::pin!(future);
+    for _ in 0..100 {
+        if let std::task::Poll::Ready(receipts) = futures::poll!(future.as_mut()) {
+            return receipts;
+        }
+        SimNet::step(&vclock(), Duration::from_millis(20)).await;
+    }
+    panic!("collection operation probe exceeded deterministic step budget")
 }
 
 async fn fetch_evidence_result_while_stepping(

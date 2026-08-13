@@ -121,13 +121,45 @@ pub fn bring_up(
     self_cap: [u8; 32],
     gossip: bool,
 ) -> Peer<MemoryRepo> {
+    bring_up_with_peers(
+        net,
+        signing_key,
+        store,
+        team_root,
+        self_cap,
+        gossip,
+        Vec::new(),
+    )
+}
+
+/// [`bring_up`] with an explicit configured-peer discovery boundary.
+///
+/// The simulator routes by peer identity, so address-less `EndpointAddr`
+/// values are sufficient. Keeping the conversion here lets scenarios state
+/// the topology as the same `[u8; 32]` identities used by `SimNet`.
+pub fn bring_up_with_peers(
+    net: &SimNet,
+    signing_key: &SigningKey,
+    store: MemoryRepo,
+    team_root: ed25519_dalek::VerifyingKey,
+    self_cap: [u8; 32],
+    gossip: bool,
+    peers: Vec<[u8; 32]>,
+) -> Peer<MemoryRepo> {
     let id = pk(signing_key);
     let harness = net.join(id, gossip);
     let (sender, receiver, wiring) = host::wire(EndpointId::from_bytes(&id).expect("endpoint id"));
     tokio::task::spawn_local(host::run_host(
         harness,
         PeerConfig {
-            peers: Vec::new(),
+            peers: peers
+                .into_iter()
+                .map(|peer| {
+                    iroh_base::EndpointAddr::from(
+                        EndpointId::from_bytes(&peer).expect("configured peer endpoint id"),
+                    )
+                })
+                .collect(),
             gossip,
             team_root,
             self_cap,

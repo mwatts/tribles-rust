@@ -330,6 +330,21 @@ where
         self.sender.fetch_blob(hash, budget).await
     }
 
+    /// Probe every configured peer for exact merge/derive receipts answering
+    /// `request`. The result separates inert deterministic evidence from sweep
+    /// completeness, so callers may retain healthy partial answers without
+    /// treating a stalled peer as a definitive absence. This method neither
+    /// inserts nor flushes records.
+    pub async fn fetch_collection_operation_receipts_with_deadline(
+        &self,
+        request: WantRequest,
+        budget: std::time::Duration,
+    ) -> crate::host::CollectionOperationProbe {
+        self.sender
+            .fetch_collection_operation_receipts(request, budget)
+            .await
+    }
+
     /// Fetch one exact collection's grant-backed commit evidence from `peer`.
     ///
     /// The transport runs on the jailed host runtime. The returned evidence
