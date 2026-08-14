@@ -285,6 +285,29 @@ where
     }
 }
 
+fn validate_unique_commit_dependencies<E, ValidateData, ValidateMetadata>(
+    commits: &[CollectionCommit],
+    mut validate_data: ValidateData,
+    mut validate_metadata: ValidateMetadata,
+) -> Result<BTreeMap<CollectionData, Blob<SimpleArchive>>, E>
+where
+    ValidateData: FnMut(&CollectionCommit) -> Result<Blob<SimpleArchive>, E>,
+    ValidateMetadata: FnMut(&CollectionCommit) -> Result<(), E>,
+{
+    let mut known = BTreeMap::new();
+    let mut validated_metadata = BTreeSet::new();
+    for commit in commits {
+        let data = commit.data();
+        if let std::collections::btree_map::Entry::Vacant(entry) = known.entry(data) {
+            entry.insert(validate_data(commit)?);
+        }
+        if validated_metadata.insert(commit.metadata()) {
+            validate_metadata(commit)?;
+        }
+    }
+    Ok(known)
+}
+
 impl<S> Collection<S> {
     /// Construct a write facade without reading from or writing to `storage`.
     pub fn new(storage: S, scope: Id, signing_key: SigningKey) -> Self {
@@ -494,56 +517,66 @@ where
             return Err(CollectionMaterializationError::DescriptorMismatch { collection });
         }
 
-        // Authenticate and exact-validate every mandatory leaf first. Each
-        // signed endpoint is fetched once and remains available for fallback;
-        // derived scratch values below have a shorter, use-counted lifetime.
-        let mut known = BTreeMap::<CollectionData, Blob<SimpleArchive>>::new();
-        let mut roots = BTreeSet::new();
-        for claim in &commits {
-            let data = claim.data();
-            let data_blob: Blob<SimpleArchive> = reader
-                .get(Handle::<SimpleArchive>::from_hash(data))
-                .map_err(|source| CollectionMaterializationError::CommitDataGet {
-                    commit: claim.id(),
-                    data,
-                    source,
-                })?;
-            simplearchive_union::validate_commit(&self.descriptor, claim, &data_blob).map_err(
-                |source| CollectionMaterializationError::InvalidCommitData {
-                    commit: claim.id(),
-                    source,
-                },
-            )?;
-
-            let metadata = claim.metadata();
-            let metadata_blob: Blob<SimpleArchive> = reader.get(metadata).map_err(|source| {
-                CollectionMaterializationError::CommitMetadataGet {
-                    commit: claim.id(),
-                    metadata,
-                    source,
-                }
-            })?;
-            simplearchive_union::validate_element(&metadata_blob).map_err(|source| {
-                CollectionMaterializationError::InvalidCommitMetadata {
-                    commit: claim.id(),
-                    metadata,
-                    source,
-                }
-            })?;
-            let actual_metadata =
-                Blob::<SimpleArchive>::new(metadata_blob.bytes.clone()).get_handle();
-            if actual_metadata != metadata {
-                return Err(
-                    CollectionMaterializationError::InvalidCommitMetadataIdentity {
+        // Authenticate and exact-validate every mandatory leaf first. Commit
+        // signatures were verified individually during discovery. Blob
+        // validation is instead keyed by content identity: several distinct
+        // signed commits may name the same data or metadata, and one reader
+        // snapshot cannot give that handle different bytes. Fetch and
+        // canonical-check each distinct handle once while retaining every
+        // commit as provenance and every data handle as a semantic root.
+        // Authenticated data remains available for fallback; derived scratch
+        // values below have a shorter, use-counted lifetime.
+        let mut known = validate_unique_commit_dependencies(
+            &commits,
+            |claim| {
+                let data = claim.data();
+                let data_blob: Blob<SimpleArchive> = reader
+                    .get(Handle::<SimpleArchive>::from_hash(data))
+                    .map_err(|source| CollectionMaterializationError::CommitDataGet {
                         commit: claim.id(),
-                        expected: metadata,
-                        actual: actual_metadata,
+                        data,
+                        source,
+                    })?;
+                simplearchive_union::validate_commit(&self.descriptor, claim, &data_blob).map_err(
+                    |source| CollectionMaterializationError::InvalidCommitData {
+                        commit: claim.id(),
+                        source,
                     },
-                );
-            }
-            roots.insert(data);
-            known.entry(data).or_insert(data_blob);
-        }
+                )?;
+                Ok(data_blob)
+            },
+            |claim| {
+                let metadata = claim.metadata();
+                let metadata_blob: Blob<SimpleArchive> =
+                    reader.get(metadata).map_err(|source| {
+                        CollectionMaterializationError::CommitMetadataGet {
+                            commit: claim.id(),
+                            metadata,
+                            source,
+                        }
+                    })?;
+                simplearchive_union::validate_element(&metadata_blob).map_err(|source| {
+                    CollectionMaterializationError::InvalidCommitMetadata {
+                        commit: claim.id(),
+                        metadata,
+                        source,
+                    }
+                })?;
+                let actual_metadata =
+                    Blob::<SimpleArchive>::new(metadata_blob.bytes.clone()).get_handle();
+                if actual_metadata != metadata {
+                    return Err(
+                        CollectionMaterializationError::InvalidCommitMetadataIdentity {
+                            commit: claim.id(),
+                            expected: metadata,
+                            actual: actual_metadata,
+                        },
+                    );
+                }
+                Ok(())
+            },
+        )?;
+        let roots: BTreeSet<_> = known.keys().copied().collect();
 
         // Unsigned merges are useful only when they can contribute to a
         // resident physical cover. Walk backwards from resident result hashes
@@ -869,7 +902,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::convert::Infallible;
 
     use super::*;
@@ -1176,6 +1209,91 @@ mod tests {
         let observed = collection.materialize().unwrap();
         assert_eq!(observed, expected);
         assert_eq!(collection.materialize().unwrap(), observed);
+    }
+
+    #[test]
+    fn shared_commit_handles_are_validated_once_without_losing_provenance() {
+        let scope = id(1);
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let descriptor = simplearchive_union::descriptor(scope);
+        let first_data = archive(1);
+        let second_data = archive(2);
+        let first_metadata = archive(8);
+        let second_metadata = archive(9);
+        let mut storage = MemoryRepo::default();
+        let first_commit = simplearchive_union::publish_commit(
+            &mut storage,
+            &descriptor,
+            &first_data,
+            &first_metadata,
+            &signing_key,
+        )
+        .unwrap();
+        let second_commit = simplearchive_union::publish_commit(
+            &mut storage,
+            &descriptor,
+            &first_data,
+            &second_metadata,
+            &signing_key,
+        )
+        .unwrap();
+        let third_commit = simplearchive_union::publish_commit(
+            &mut storage,
+            &descriptor,
+            &second_data,
+            &first_metadata,
+            &signing_key,
+        )
+        .unwrap();
+        let commits = [first_commit, second_commit, third_commit];
+
+        let data_by_handle = BTreeMap::from([
+            (
+                Handle::<SimpleArchive>::to_hash(first_data.get_handle()),
+                first_data.clone(),
+            ),
+            (
+                Handle::<SimpleArchive>::to_hash(second_data.get_handle()),
+                second_data.clone(),
+            ),
+        ]);
+        let mut data_validations = BTreeMap::new();
+        let mut metadata_validations = BTreeMap::new();
+        let known = validate_unique_commit_dependencies(
+            &commits,
+            |commit| {
+                *data_validations.entry(commit.data()).or_insert(0) += 1;
+                Ok::<_, Infallible>(data_by_handle[&commit.data()].clone())
+            },
+            |commit| {
+                *metadata_validations.entry(commit.metadata()).or_insert(0) += 1;
+                Ok::<_, Infallible>(())
+            },
+        )
+        .unwrap();
+        assert_eq!(known.len(), 2);
+        assert_eq!(
+            known.keys().copied().collect::<BTreeSet<_>>(),
+            data_by_handle.keys().copied().collect(),
+        );
+        assert!(data_validations.values().all(|count| *count == 1));
+        assert_eq!(metadata_validations.len(), 2);
+        assert!(metadata_validations.values().all(|count| *count == 1));
+
+        let mut expected = first_data.clone().try_from_blob::<TribleSet>().unwrap();
+        expected += second_data.clone().try_from_blob::<TribleSet>().unwrap();
+
+        let mut collection = Collection::new(storage, scope, signing_key);
+        let snapshot = collection.snapshot().unwrap();
+        assert_eq!(snapshot.facts(), &expected);
+        assert_eq!(
+            snapshot
+                .commits()
+                .iter()
+                .map(CollectionCommit::id)
+                .collect::<BTreeSet<_>>(),
+            commits.iter().map(CollectionCommit::id).collect(),
+        );
     }
 
     #[test]

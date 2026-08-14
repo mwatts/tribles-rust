@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Owned collection reads validate each distinct data handle and each
+  distinct metadata handle once per snapshot.** Every observed commit still
+  undergoes strict Ed25519 verification and remains in the snapshot's
+  provenance, but commits that name identical content share one fetch,
+  identity check, and canonical `SimpleArchive` validation. This preserves
+  fail-loud mandatory roots while avoiding work proportional to repeated
+  content.
 - **Physical collection covers follow the sparse order once per candidate.**
   Resident-frontier selection now walks reachable successors and tests the
   resident set during that walk, instead of comparing every resident pair
