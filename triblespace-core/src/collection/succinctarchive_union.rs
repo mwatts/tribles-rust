@@ -34,6 +34,9 @@ use super::{
     CollectionData, CollectionDerive, CollectionDescriptor, CollectionId, CollectionMerge,
 };
 
+mod collection;
+pub use collection::*;
+
 /// A collection descriptor participating in a validation failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DescriptorRole {

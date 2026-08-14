@@ -9,6 +9,8 @@
 /// Narrow write facade for a scoped fact collection.
 pub mod api;
 pub mod discovery;
+/// Shared exact-ticket lifecycle for canonical derived collections.
+pub mod exact_derived;
 /// Orthogonal grow-only publication grants for collection commits.
 pub mod gossip;
 pub mod records;

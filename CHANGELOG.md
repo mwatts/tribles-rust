@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Derived collections now share one qualified exact-ticket lifecycle.**
+  `collection::exact_derived::ExactDerivedCollection` supplies strict ticket
+  discovery, signed-root admission, deterministic resident covers, residual
+  lowering, descriptors-before-outputs-before-`DERIVE` publication, and fresh
+  read-side re-admission without `PinStore` or an implicit flush. Regular paths
+  use this kernel, and the new `SuccinctArchiveCollection` facade returns the
+  exact raw target cover as an owned sharded `UnionArchive`. It preserves
+  physical shards and rebuilds their Rank9 query accelerators only in process;
+  it does not persist or consume Rank9 sidecars. An empty ticket performs no
+  storage I/O and receives one authority-free local empty query shard, whereas
+  a signed commit over empty source data still publishes an ordinary
+  provenance-bearing `DERIVE`.
+
+  This resident-evidence path is deliberately not yet a replacement for
+  `SuccinctRollup`: validating an unsigned equation still requires all of its
+  endpoint blobs to be resident, while current retention roots do not preserve
+  the complete unsigned proof graph across garbage collection. Missing
+  endpoints safely leave claims pending and completion can fall back to signed
+  leaves, so correctness is preserved but compacted cache reuse is incomplete;
+  the intended follow-up is recursive deterministic reconstruction without new
+  authority roots or validation records. There is also no native target
+  compactor or persisted-accelerator policy, and each raw derived shard retains
+  the format's explicit `u32::MAX` row/domain boundary. The legacy rollup
+  remains available unchanged while those lifecycle boundaries are designed.
 - **Regular paths now use one exact native collection path.**
   `PathSummaryCollection::{attach_exact, ensure_exact}` validates a frozen set
   of signed `SimpleArchive` commits, reuses canonical source merges, target

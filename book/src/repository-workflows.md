@@ -120,6 +120,49 @@ This collection path coexists with the branch-oriented `Repository` and
 updates; choosing the headless path does not change the semantics of existing
 branches.
 
+## Attach an exact derived query view
+
+Derived query artifacts can use the signed source commits themselves as a
+frozen authority ticket. The native raw-Succinct facade has no repository or
+pin dependency:
+
+```rust,ignore
+use triblespace::core::collection::succinctarchive_union::SuccinctArchiveCollection;
+
+let succinct = SuccinctArchiveCollection::new(scope);
+
+// `ticket` is the byte-identical set of signed SimpleArchive commits selected
+// by the caller. Completion publishes only reproducible unsigned evidence.
+let archive = succinct.ensure_exact(&mut storage, &ticket)?;
+
+// A read-only consumer can instead require a complete resident cover.
+let same_archive = succinct.attach_exact(&mut storage, &ticket)?;
+```
+
+Both methods discover only the commits named by the ticket, verify their
+signatures and exact stored bytes, and admit unsigned source merges, target
+merges, and derivations only when their canonical equations validate. The
+returned `UnionArchive` preserves the deterministic physical shard cover.
+`ensure_exact` first probes for a complete cover, derives only the necessary
+resident source members, publishes descriptors before all output blobs and all
+outputs before `DERIVE` records, drops the old reader before writing, and then
+re-admits through a fresh reader. It neither signs a new root nor flushes the
+store. An empty ticket performs no storage I/O and receives one process-local
+empty query shard; a signed commit whose source data happens to be empty still
+has ordinary persisted derivation provenance.
+
+This API currently treats unsigned equations as resident cache evidence rather
+than durable receipts. Every endpoint needed to validate a `MERGE` or `DERIVE`
+must still be resident on the next attachment, and collection retention does
+not yet preserve that complete proof graph through garbage collection. Missing
+cache endpoints make the claim pending rather than granting incomplete
+authority, and `ensure_exact` can still fall back to signed resident leaves;
+the limitation is cache completeness, not correctness. It also does not
+schedule target compaction, persists no Rank9 sidecars (attachment rebuilds
+them in memory), and inherits the raw format's per-shard `u32::MAX` row and
+domain limits. Keep using `SuccinctRollup` where those durable lifecycle
+guarantees are required; the exact-ticket facade is not yet its replacement.
+
 ## Opening a repository
 
 Repositories are constructed from any storage that implements the appropriate

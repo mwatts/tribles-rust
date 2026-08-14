@@ -6,6 +6,7 @@
 //! recovery path: a structural storage failure is fatal. It verifies signed
 //! commits, classifies records, and canonicalizes the resulting semantic view.
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 
@@ -163,6 +164,62 @@ where
             CollectionRecord::Derive(record) => discovered.derives.push(record),
         }
     }
+
+    discovered.canonicalize();
+    Ok(discovered)
+}
+
+/// Discover every unsigned equation but verify only commits named by an exact ticket.
+///
+/// Exact-ticket consumers authorize concrete commit records rather than every
+/// signer or every commit in the store. Their ticket IDs are structurally
+/// available before Ed25519 verification, so unrelated commits can be skipped
+/// without changing the equation view or paying their signature cost. Matching
+/// commits retain the ordinary strict-verification and diagnostic behavior.
+/// The caller must still byte-match each supplied ticket record against the
+/// returned commit with the same intrinsic ID.
+pub(crate) fn discover_collection_records_for_ticket<S>(
+    store: &mut S,
+    ticket_ids: &BTreeSet<Id>,
+) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
+where
+    S: CollectionStore,
+{
+    let mut discovered = DiscoveredCollectionRecords::default();
+    let mut matching_commits = Vec::new();
+    let records = store.records().map_err(CollectionDiscoveryError::Records)?;
+
+    for record in records {
+        let record = record.map_err(CollectionDiscoveryError::Records)?;
+        match record {
+            CollectionRecord::Commit(record) if ticket_ids.contains(&record.id()) => {
+                matching_commits.push(record)
+            }
+            CollectionRecord::Commit(_) => {}
+            CollectionRecord::Merge(record) => discovered.merges.push(record),
+            CollectionRecord::Derive(record) => discovered.derives.push(record),
+        }
+    }
+
+    let mut verifications =
+        verify_matching_commits(&matching_commits, &CollectionCommit::verify_strict).into_iter();
+    matching_commits.retain(|record| {
+        match verifications
+            .next()
+            .expect("one verification result per ticket commit")
+        {
+            Ok(()) => true,
+            Err(error) => {
+                discovered.diagnostics.push(CollectionRecordDiagnostic {
+                    id: record.id(),
+                    error: CollectionRecordDiagnosticError::InvalidCommit(error),
+                });
+                false
+            }
+        }
+    });
+    debug_assert!(verifications.next().is_none());
+    discovered.commits = matching_commits;
 
     discovered.canonicalize();
     Ok(discovered)
