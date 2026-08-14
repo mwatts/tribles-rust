@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from 3.22 ms to 0.41 ms, and eight commits from 199 us to 111 us, while a
   singleton remained 24 us. Initializing a fresh Rayon pool cost the first
   plural scope roughly 0.23--0.26 ms; a first singleton does not initialize it.
+- **Plural owned collection reads validate commit data in parallel.** Data
+  fetches and metadata validation remain sequential; no reader handle or
+  backend error crosses into Rayon. Only successfully fetched bytes enter the
+  parallel identity and canonical `SimpleArchive` checks. Results replay in
+  intrinsic commit order, preserving data-before-metadata and deterministic
+  fail-loud attribution. Single-commit snapshots and builds without the
+  `parallel` feature retain the direct serial path.
 - **Owned collection reads validate each distinct data handle and each
   distinct metadata handle once per snapshot.** Every observed commit still
   undergoes strict Ed25519 verification and remains in the snapshot's

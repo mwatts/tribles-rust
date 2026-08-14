@@ -285,6 +285,7 @@ where
     }
 }
 
+#[cfg(any(test, not(feature = "parallel")))]
 fn validate_unique_commit_dependencies<E, ValidateData, ValidateMetadata>(
     commits: &[CollectionCommit],
     mut validate_data: ValidateData,
@@ -303,6 +304,115 @@ where
         }
         if validated_metadata.insert(commit.metadata()) {
             validate_metadata(commit)?;
+        }
+    }
+    Ok(known)
+}
+
+#[cfg(feature = "parallel")]
+struct FetchedCommitData {
+    commit: CollectionCommit,
+    data: CollectionData,
+    blob: Blob<SimpleArchive>,
+}
+
+/// Fetch dependencies through the possibly non-`Sync` reader on the caller
+/// thread in serial data-then-metadata order, then parallelize concrete data
+/// checks. Error replay by intrinsic commit keeps data before metadata and
+/// prevents a later prefetched failure from outranking an earlier failure.
+#[cfg(feature = "parallel")]
+fn validate_unique_commit_dependencies_parallel<
+    E,
+    FetchData,
+    FetchMetadata,
+    ValidateMetadata,
+    MapDataError,
+>(
+    commits: &[CollectionCommit],
+    descriptor: &CollectionDescriptor,
+    mut fetch_data: FetchData,
+    mut fetch_metadata: FetchMetadata,
+    mut validate_metadata: ValidateMetadata,
+    mut map_data_error: MapDataError,
+) -> Result<BTreeMap<CollectionData, Blob<SimpleArchive>>, E>
+where
+    FetchData: FnMut(&CollectionCommit) -> Result<Blob<SimpleArchive>, E>,
+    FetchMetadata: FnMut(&CollectionCommit) -> Result<Blob<SimpleArchive>, E>,
+    ValidateMetadata: FnMut(&CollectionCommit, &Blob<SimpleArchive>) -> Result<(), E>,
+    MapDataError: FnMut(&CollectionCommit, SimpleArchiveUnionValidationError) -> E,
+{
+    use rayon::prelude::*;
+
+    if let [commit] = commits {
+        let data = commit.data();
+        let data_blob = fetch_data(commit)?;
+        simplearchive_union::validate_commit(descriptor, commit, &data_blob)
+            .map_err(|error| map_data_error(commit, error))?;
+        let metadata_blob = fetch_metadata(commit)?;
+        validate_metadata(commit, &metadata_blob)?;
+        return Ok(BTreeMap::from([(data, data_blob)]));
+    }
+
+    let mut seen_data = BTreeSet::new();
+    let mut seen_metadata = BTreeSet::new();
+    let mut fetched = Vec::with_capacity(commits.len());
+    let mut dependency_error = None;
+    for commit in commits {
+        if seen_data.insert(commit.data()) {
+            match fetch_data(commit) {
+                Ok(blob) => fetched.push(FetchedCommitData {
+                    commit: *commit,
+                    data: commit.data(),
+                    blob,
+                }),
+                Err(error) => {
+                    dependency_error = Some((commit.id(), error));
+                    break;
+                }
+            }
+        }
+        if seen_metadata.insert(commit.metadata()) {
+            match fetch_metadata(commit) {
+                Ok(blob) => {
+                    if let Err(error) = validate_metadata(commit, &blob) {
+                        dependency_error = Some((commit.id(), error));
+                        break;
+                    }
+                }
+                Err(error) => {
+                    dependency_error = Some((commit.id(), error));
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut fetched = fetched
+        .into_par_iter()
+        .map(|fetched| {
+            let validation =
+                simplearchive_union::validate_commit(descriptor, &fetched.commit, &fetched.blob);
+            (fetched, validation)
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .peekable();
+
+    let mut known = BTreeMap::new();
+    for commit in commits {
+        if fetched
+            .peek()
+            .is_some_and(|(fetched, _)| fetched.commit.id() == commit.id())
+        {
+            let (fetched, validation) = fetched.next().expect("peeked commit data");
+            validation.map_err(|error| map_data_error(commit, error))?;
+            known.insert(fetched.data, fetched.blob);
+        }
+        if dependency_error
+            .as_ref()
+            .is_some_and(|(failed_commit, _)| *failed_commit == commit.id())
+        {
+            return Err(dependency_error.take().expect("matched dependency error").1);
         }
     }
     Ok(known)
@@ -526,17 +636,65 @@ where
         // commit as provenance and every data handle as a semantic root.
         // Authenticated data remains available for fallback; derived scratch
         // values below have a shorter, use-counted lifetime.
+        let fetch_data = |claim: &CollectionCommit| {
+            let data = claim.data();
+            reader
+                .get(Handle::<SimpleArchive>::from_hash(data))
+                .map_err(|source| CollectionMaterializationError::CommitDataGet {
+                    commit: claim.id(),
+                    data,
+                    source,
+                })
+        };
+        let fetch_metadata = |claim: &CollectionCommit| {
+            let metadata = claim.metadata();
+            reader.get(metadata).map_err(|source| {
+                CollectionMaterializationError::CommitMetadataGet {
+                    commit: claim.id(),
+                    metadata,
+                    source,
+                }
+            })
+        };
+        let validate_metadata = |claim: &CollectionCommit, metadata_blob: &Blob<SimpleArchive>| {
+            let metadata = claim.metadata();
+            simplearchive_union::validate_element(metadata_blob).map_err(|source| {
+                CollectionMaterializationError::InvalidCommitMetadata {
+                    commit: claim.id(),
+                    metadata,
+                    source,
+                }
+            })?;
+            let actual_metadata =
+                Blob::<SimpleArchive>::new(metadata_blob.bytes.clone()).get_handle();
+            if actual_metadata != metadata {
+                return Err(
+                    CollectionMaterializationError::InvalidCommitMetadataIdentity {
+                        commit: claim.id(),
+                        expected: metadata,
+                        actual: actual_metadata,
+                    },
+                );
+            }
+            Ok(())
+        };
+        #[cfg(feature = "parallel")]
+        let mut known = validate_unique_commit_dependencies_parallel(
+            &commits,
+            &self.descriptor,
+            fetch_data,
+            fetch_metadata,
+            validate_metadata,
+            |claim, source| CollectionMaterializationError::InvalidCommitData {
+                commit: claim.id(),
+                source,
+            },
+        )?;
+        #[cfg(not(feature = "parallel"))]
         let mut known = validate_unique_commit_dependencies(
             &commits,
             |claim| {
-                let data = claim.data();
-                let data_blob: Blob<SimpleArchive> = reader
-                    .get(Handle::<SimpleArchive>::from_hash(data))
-                    .map_err(|source| CollectionMaterializationError::CommitDataGet {
-                        commit: claim.id(),
-                        data,
-                        source,
-                    })?;
+                let data_blob = fetch_data(claim)?;
                 simplearchive_union::validate_commit(&self.descriptor, claim, &data_blob).map_err(
                     |source| CollectionMaterializationError::InvalidCommitData {
                         commit: claim.id(),
@@ -546,34 +704,8 @@ where
                 Ok(data_blob)
             },
             |claim| {
-                let metadata = claim.metadata();
-                let metadata_blob: Blob<SimpleArchive> =
-                    reader.get(metadata).map_err(|source| {
-                        CollectionMaterializationError::CommitMetadataGet {
-                            commit: claim.id(),
-                            metadata,
-                            source,
-                        }
-                    })?;
-                simplearchive_union::validate_element(&metadata_blob).map_err(|source| {
-                    CollectionMaterializationError::InvalidCommitMetadata {
-                        commit: claim.id(),
-                        metadata,
-                        source,
-                    }
-                })?;
-                let actual_metadata =
-                    Blob::<SimpleArchive>::new(metadata_blob.bytes.clone()).get_handle();
-                if actual_metadata != metadata {
-                    return Err(
-                        CollectionMaterializationError::InvalidCommitMetadataIdentity {
-                            commit: claim.id(),
-                            expected: metadata,
-                            actual: actual_metadata,
-                        },
-                    );
-                }
-                Ok(())
+                let metadata_blob = fetch_metadata(claim)?;
+                validate_metadata(claim, &metadata_blob)
             },
         )?;
         let roots: BTreeSet<_> = known.keys().copied().collect();
@@ -902,6 +1034,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "parallel")]
+    use std::cell::Cell;
     use std::collections::{BTreeMap, BTreeSet};
     use std::convert::Infallible;
 
@@ -1294,6 +1428,71 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             commits.iter().map(CollectionCommit::id).collect(),
         );
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_dependency_fetches_keep_serial_stage_order() {
+        let mut collection = Collection::new(
+            MemoryRepo::default(),
+            id(1),
+            SigningKey::from_bytes(&[7; 32]),
+        );
+        let mut commits = [
+            collection.commit(fragment(1, false)).unwrap(),
+            collection.commit(fragment(2, false)).unwrap(),
+        ];
+        commits.sort_unstable_by_key(CollectionCommit::id);
+        let lower = commits[0];
+        let descriptor = *collection.descriptor();
+        let reader = collection.storage_mut().reader().unwrap();
+
+        let calls = Cell::new(1usize);
+        for corrupt_data in [false, true] {
+            // The descriptor consumed get #1. The one-shot failure on get #3
+            // must stay on lower metadata; when lower data is also corrupt,
+            // its validation failure must still take precedence. Cell keeps
+            // both reader callbacks deliberately non-Sync.
+            calls.set(1);
+            let observed = validate_unique_commit_dependencies_parallel(
+                &commits,
+                &descriptor,
+                |commit| {
+                    calls.set(calls.get() + 1);
+                    if corrupt_data && commit.id() == lower.id() {
+                        Ok(Blob::with_handle(
+                            Bytes::from(vec![0; 63]),
+                            Handle::<SimpleArchive>::from_hash(commit.data()),
+                        ))
+                    } else if calls.get() == 3 {
+                        Err(("data", commit.id()))
+                    } else {
+                        Ok(reader
+                            .get(Handle::<SimpleArchive>::from_hash(commit.data()))
+                            .unwrap())
+                    }
+                },
+                |commit| {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == 3 {
+                        Err(("metadata", commit.id()))
+                    } else {
+                        Ok(reader.get(commit.metadata()).unwrap())
+                    }
+                },
+                |_commit, _blob| Ok(()),
+                |commit, _source| ("invalid-data", commit.id()),
+            )
+            .expect_err("the lower dependency must fail");
+
+            let stage = if corrupt_data {
+                "invalid-data"
+            } else {
+                "metadata"
+            };
+            assert_eq!(observed, (stage, lower.id()));
+            assert_eq!(calls.get(), 3);
+        }
     }
 
     #[test]
