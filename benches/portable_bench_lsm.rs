@@ -1,25 +1,31 @@
-//! Portable engine benchmark v2 — LSM (index-home) arm.
+//! Portable engine benchmark v2 — native exact-Succinct collection arm.
 //!
-//! A SEPARATE bench target on purpose: the index-home API
-//! (`append_range` / `SuccinctRollup` / `Manifest` / `UnionArchive`) is
-//! tip-era surface that does not exist at older sweep commits. Keeping it in
-//! its own `[[bench]]` gives it an INDEPENDENT compilation fate — at commits
-//! where the API differs this target BUILD-FAILs honestly while
-//! `portable_bench` keeps running. Never fold this file into the main bench.
+//! A SEPARATE bench target on purpose: the native collection algebra does not
+//! exist at older sweep commits. Keeping it in its own `[[bench]]` gives it an
+//! INDEPENDENT compilation fate — at commits where the API differs this target
+//! BUILD-FAILs honestly while `portable_bench` keeps running. Never fold this
+//! file into the main bench.
 //!
 //! WHAT IT MEASURES:
-//!   build_lsm  — streaming commit ranges into physical succinct leaves via
-//!                `repo::index_home::append_range` (leaf build + blob puts +
-//!                ordered size-tiered carry merges, FANOUT=4), against a
-//!                scratch in-memory blob store seeded with the commit-DAG
-//!                metadata (merges validate convex range unions against the
-//!                DAG). The SOURCE pile is never written — reads only.
+//!   build_exact — one end-to-end query-ready exact-Succinct build. Every
+//!                 iteration first publishes the input chunks as independent
+//!                 native `SimpleArchive` collection commits and freezes that
+//!                 collection's exact ticket OUTSIDE the timer. The timer then
+//!                 covers `SuccinctArchiveCollection::compact_exact`: exact
+//!                 source validation/derivation, canonical raw blob puts,
+//!                 deterministic dyadic target compaction, persisted Rank9
+//!                 fibers, equation publication, and final attachment. Source
+//!                 serialization, signing, and publication are deliberately
+//!                 excluded. There is one fixed maintenance policy and no
+//!                 fanout, level, or planner tuning knob. An input pile is
+//!                 opened read-only; each iteration writes only its fresh
+//!                 scratch `MemoryRepo`.
 //!   q<N>_union — the same wired query matrix as the main bench (q3 = q3b
 //!                union-under-join, q5 = q5b witness semijoin — keep
 //!                `measure_queries` + the q3b/q5b fns byte-identical with
 //!                portable_bench.rs or `q<N>_union` stops being comparable
 //!                with `q<N>_set`/`q<N>_arch`), executed over the
-//!                `UnionArchive` of the built leaves (per-shard confirm +
+//!                query-ready `UnionArchive` exact cover (per-shard confirm +
 //!                cross-shard dedup). q2 is `path!`-based and
 //!                TribleSet-only, so it has no union arm.
 //!
@@ -30,16 +36,16 @@
 //! DATASET MODES (mirrors the main bench):
 //!   --pile <path>  first k commits of the data branch for the rung target.
 //!                  ALWAYS chunk-aligned: the rung SNAPS to the nearest
-//!                  cumulative-commit boundary (leaves are per-commit
-//!                  physical artifacts, a carved prefix has no commit
-//!                  identity to hang a `CommitRange` on) via the SAME
+//!                  cumulative-commit boundary (the source authority is one
+//!                  native collection commit per input commit, so a carved
+//!                  prefix would change the benchmark workload) via the SAME
 //!                  `snap_to_chunk` the main bench applies under
 //!                  `--chunk-aligned`, and the snapped rung + actual trible
 //!                  count are printed so sweeps record actual-vs-nominal.
 //!                  Opens the pile READ-ONLY (no Repository, no puts).
 //!   (no --pile)    the synthetic DBLP-shaped set, split into --chunks
-//!                  synthetic commits with real parent-linked metadata in
-//!                  the scratch store.
+//!                  independent native collection commits in the scratch
+//!                  store.
 //!
 //! USAGE:
 //!   cargo bench --bench portable_bench_lsm -- [--pile P] [--branch B]
@@ -47,8 +53,8 @@
 //!     [--build-warmup 2] [--chunks 16] [--range-min 2]
 //!
 //! Crash isolation mirrors the main bench: every query measure and every
-//! panic-prone phase (build_lsm, manifest attach) runs under `catch_unwind`
-//! with the panic hook silenced; a panicking measure reports
+//! panic-prone build runs under `catch_unwind` with the panic hook silenced; a
+//! panicking measure reports
 //! `  <key>  PANIC (<msg>)`, joins a `PANIC    :` summary line, contributes
 //! a `usize::MAX` sentinel to the identity tuple, and is EXCLUDED from the
 //! SIGNAL/NO-SIGNAL verdict counts.
@@ -60,15 +66,16 @@
 
 use std::time::Instant;
 
+use ed25519_dalek::SigningKey;
 use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
+use triblespace_core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
+use triblespace_core::collection::exact_derived::ExactDerivedCollection;
+use triblespace_core::collection::succinctarchive_union::SuccinctArchiveCollection;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::metadata;
 use triblespace_core::prelude::inlineencodings::{GenId, I256BE};
 use triblespace_core::prelude::*;
-use triblespace_core::repo::index_home::{append_range, IndexKind, Manifest, SuccinctRollup};
-use triblespace_core::repo::index_range::CommitRange;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::{self, PinStore};
 
@@ -437,11 +444,10 @@ fn build_dblp_shaped(target: usize, qa: &DblpAttrs) -> TribleSet {
 
 type CommitHandle = Inline<Handle<SimpleArchive>>;
 
-/// One logical range's worth of input: the commit handle, its metadata facts
-/// (for the scratch store's DAG), and its content set (the leaf source).
+/// One chunk of source facts. Pile commit boundaries and synthetic chunk
+/// boundaries both become independent native collection commits during the
+/// untimed source-seeding phase.
 struct Chunk {
-    handle: CommitHandle,
-    meta: TribleSet,
     content: TribleSet,
 }
 
@@ -531,10 +537,10 @@ fn pile_chunks(path: &std::path::Path, branch: Option<&str>, rung: usize) -> Vec
     // main bench uses, no deserialization on the walk), then SNAP to the
     // nearest chunk boundary. Always chunk-aligned: leaves are per-commit
     // physical artifacts, so sub-chunk rungs cannot be carved here.
-    let mut entries: Vec<(CommitHandle, TribleSet, CommitHandle)> = Vec::new();
+    let mut entries: Vec<CommitHandle> = Vec::new();
     let mut cum: Vec<usize> = Vec::new();
     let mut total = 0usize;
-    for (handle, meta) in chain {
+    for (_, meta) in chain {
         let contents: Vec<CommitHandle> = find!(
             (c: Inline<Handle<SimpleArchive>>),
             pattern!(&meta, [{ repo::content: ?c }])
@@ -545,7 +551,7 @@ fn pile_chunks(path: &std::path::Path, branch: Option<&str>, rung: usize) -> Vec
         let blob: Blob<SimpleArchive> = reader.get(content).expect("read content blob");
         total += blob.bytes.len() / 64;
         cum.push(total);
-        entries.push((handle, meta, content));
+        entries.push(content);
     }
     assert!(
         !entries.is_empty(),
@@ -560,13 +566,9 @@ fn pile_chunks(path: &std::path::Path, branch: Option<&str>, rung: usize) -> Vec
     let chunks: Vec<Chunk> = entries
         .into_iter()
         .take(k)
-        .map(|(handle, meta, content)| {
+        .map(|content| {
             let set: TribleSet = reader.get(content).expect("read commit content");
-            Chunk {
-                handle,
-                meta,
-                content: set,
-            }
+            Chunk { content: set }
         })
         .collect();
     // The reader is a snapshot; closing the pile here is safe and keeps the
@@ -575,43 +577,23 @@ fn pile_chunks(path: &std::path::Path, branch: Option<&str>, rung: usize) -> Vec
     chunks
 }
 
-/// Synthetic commit chain: split the DBLP-shaped set into `n` chunks and
-/// mint parent-linked commit metadata for each (content-addressed handles,
-/// no store required to NAME them — the scratch store is seeded per
-/// iteration).
+/// Split the synthetic DBLP-shaped set into `n` source chunks. Each chunk is
+/// published as one independent native collection commit per build iteration.
 fn synthetic_chunks(target: usize, n: usize, qa: &DblpAttrs) -> Vec<Chunk> {
     let set = build_dblp_shaped(target, qa);
     let per = set.len().div_ceil(n.max(1));
-    let mut ids = Ids::new();
     let mut chunks: Vec<Chunk> = Vec::new();
     let mut current = TribleSet::new();
-    let mut parent: Option<CommitHandle> = None;
-    let mut flush = |content: TribleSet, parent: &mut Option<CommitHandle>| {
-        let content_handle = content.clone().to_blob().get_handle();
-        let cid = ids.mint();
-        let mut meta: TribleSet = entity! { &cid @ repo::content: content_handle }.into();
-        if let Some(p) = *parent {
-            meta += entity! { &cid @ repo::parent: p };
-        }
-        let handle = meta.clone().to_blob().get_handle();
-        *parent = Some(handle);
-        Chunk {
-            handle,
-            meta,
-            content,
-        }
-    };
     for t in set.iter() {
         current.insert(t);
         if current.len() >= per {
-            chunks.push(flush(
-                std::mem::replace(&mut current, TribleSet::new()),
-                &mut parent,
-            ));
+            chunks.push(Chunk {
+                content: std::mem::replace(&mut current, TribleSet::new()),
+            });
         }
     }
     if current.len() > 0 {
-        chunks.push(flush(current, &mut parent));
+        chunks.push(Chunk { content: current });
     }
     println!(
         "dataset  : synthetic DBLP-shaped, {} tribles in {} synthetic commits",
@@ -680,6 +662,24 @@ fn parse_size(s: &str) -> Option<usize> {
     num.parse::<usize>().ok().map(|n| n * mul)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BuildShape {
+    ticket_commits: usize,
+    raw_cover_members: usize,
+    query_shards: usize,
+    raw_bytes: usize,
+}
+
+fn benchmark_scope() -> Id {
+    // An intrinsic benchmark scope: fixed by this description so every
+    // iteration exercises byte-identical collection descriptors and records.
+    entity! {
+        metadata::name: "portable native exact-Succinct benchmark",
+    }
+    .root()
+    .expect("intrinsic benchmark description exports one root")
+}
+
 fn main() {
     let mut pile: Option<std::path::PathBuf> = None;
     let mut branch: Option<String> = None;
@@ -727,7 +727,7 @@ fn main() {
         i += 1;
     }
 
-    println!("engine   : current (query), LSM index-home arm");
+    println!("engine   : current (query), native exact-Succinct collection arm");
     println!(
         "config   : rung={rung} iters={iters} warmup={warmup} build_iters={build_iters} build_warmup={build_warmup} chunks={n_chunks} range_min={range_min}"
     );
@@ -738,128 +738,137 @@ fn main() {
         None => synthetic_chunks(rung, n_chunks, &qa),
     };
 
-    // -- BUILD-LSM ---------------------------------------------------------
-    // Per iteration: a fresh scratch store seeded with the commit metadata
-    // (untimed), then the timed streaming loop — leaf build, artifact puts,
-    // and carry merges all inside `append_range`. Guarded: at commits where
-    // the index-home surface panics (rather than failing to compile) this
-    // records a PANIC outcome instead of a dead bench.
-    let kind = SuccinctRollup::new();
+    // -- BUILD-EXACT -------------------------------------------------------
+    // Per iteration: publish the source chunks and freeze their exact ticket
+    // in a fresh scratch store (untimed), then time one fixed end-to-end call
+    // that returns a query-ready exact cover. Source signing/publication is an
+    // authority setup cost, not part of Succinct construction.
+    let scope = benchmark_scope();
+    let succinct = SuccinctArchiveCollection::new(scope);
+    let signing_key = SigningKey::from_bytes(&[0x5A; 32]);
     let mut all: Vec<(String, Outcome)> = Vec::new();
     let built = quiet_catch(|| {
         let mut samples = Vec::new();
-        let mut kept: Option<(MemoryBlobStore, TribleSet)> = None;
-        let mut ident: Option<usize> = None;
+        let mut kept = None;
+        let mut ident: Option<BuildShape> = None;
         for i in 0..(build_warmup + build_iters) {
             let recording = i >= build_warmup;
-            let mut store = MemoryBlobStore::default();
+            let mut source = Collection::new(MemoryRepo::default(), scope, signing_key.clone());
             for chunk in &chunks {
-                let stored: CommitHandle =
-                    store.put(chunk.meta.clone()).expect("seed commit metadata");
-                assert_eq!(
-                    stored, chunk.handle,
-                    "commit metadata handle drifted between pile and scratch store"
-                );
+                source
+                    .commit(Fragment::from(chunk.content.clone()))
+                    .expect("publish source chunk");
             }
+            let ticket = source.ticket().expect("freeze exact source ticket");
+            let mut store = source.into_storage();
+
             let t = Instant::now();
-            let mut head_set = TribleSet::new();
-            for chunk in &chunks {
-                append_range(
-                    &mut store,
-                    &kind,
-                    &chunk.content,
-                    CommitRange::leaf(chunk.handle),
-                    &mut head_set,
-                )
-                .expect("append range");
-            }
+            let union = succinct
+                .compact_exact(&mut store, &ticket)
+                .expect("build compact exact Succinct cover");
             if recording {
                 samples.push(t.elapsed().as_secs_f64() * 1000.0);
             }
+
+            // Inspect the raw physical cover outside the timer. This reports
+            // construction shape without charging validation a second time to
+            // the build metric.
+            let exact = ExactDerivedCollection::<SimpleArchive, SuccinctArchiveBlob>::new(
+                succinct.source_descriptor(),
+                succinct.descriptor(),
+            );
+            let raw_cover = exact
+                .attach_exact(&mut store, &ticket, &succinct)
+                .expect("reattach exact raw cover for metrics");
+            let shape = BuildShape {
+                ticket_commits: ticket.len(),
+                raw_cover_members: raw_cover.len(),
+                query_shards: union.segment_count(),
+                raw_bytes: raw_cover
+                    .members()
+                    .iter()
+                    .map(|(_, blob)| blob.bytes.len())
+                    .sum(),
+            };
+            drop(raw_cover);
+
             match ident {
-                None => ident = Some(head_set.len()),
-                Some(expected) if expected != head_set.len() => {
+                None => ident = Some(shape),
+                Some(expected) if expected != shape => {
                     println!(
-                        "WORKLOAD IDENTITY VIOLATION (build_lsm): iter {i} manifest has {} tribles, expected {expected}",
-                        head_set.len()
+                        "WORKLOAD IDENTITY VIOLATION (build_exact): iter {i} produced {shape:?}, expected {expected:?}"
                     );
                     std::process::exit(3);
                 }
                 _ => {}
             }
-            kept = Some((store, head_set));
+            kept = Some((store, union));
         }
-        let (store, head_set) = kept.expect("at least one build iteration");
-        (samples, store, head_set, ident.unwrap_or(0))
+        let (store, union) = kept.expect("at least one build iteration");
+        (
+            samples,
+            store,
+            union,
+            ident.expect("at least one build identity"),
+        )
     });
 
     // Identity-tuple state (PANIC sentinels when a phase never produced it).
     let mut union_counts = [PANIC_COUNT; 4];
     let mut full_len = PANIC_COUNT;
-    let mut manifest_ident = PANIC_COUNT;
+    let mut build_shape = BuildShape {
+        ticket_commits: PANIC_COUNT,
+        raw_cover_members: PANIC_COUNT,
+        query_shards: PANIC_COUNT,
+        raw_bytes: PANIC_COUNT,
+    };
 
     match built {
-        Ok((samples, mut store, head_set, ident)) => {
-            all.push(("build_lsm".to_owned(), Outcome::Samples(samples)));
-            manifest_ident = ident;
+        Ok((samples, _store, union, shape)) => {
+            all.push(("build_exact".to_owned(), Outcome::Samples(samples)));
+            build_shape = shape;
+            println!(
+                "exact    : {} source commits, {} raw physical members ({} bytes), {} query shards",
+                shape.ticket_commits, shape.raw_cover_members, shape.raw_bytes, shape.query_shards
+            );
 
-            // -- attach + q<N>_union ---------------------------------------
-            match quiet_catch(|| {
-                let reader = store.reader().expect("scratch store reader");
-                let manifest: Manifest<SuccinctRollup> =
-                    Manifest::from_tribles(&head_set, &reader, &kind).expect("parse manifest");
-                let mut segments: Vec<SuccinctArchive<OrderedUniverse>> = Vec::new();
-                for entry in manifest.ranges() {
-                    for artifact in entry.artifacts() {
-                        segments.push(kind.attach(&reader, artifact).expect("attach segment"));
-                    }
-                }
-                (manifest.ranges().len(), segments)
-            }) {
-                Ok((n_ranges, segments)) => {
-                    println!(
-                        "lsm      : {} logical ranges, {} physical segments",
-                        n_ranges,
-                        segments.len()
-                    );
-                    let union = SuccinctRollup::union(&segments);
-                    let (union_outcomes, counts) =
-                        measure_queries(&union, "union", &qa, range_min, iters, warmup);
-                    union_counts = counts;
-                    all.extend(union_outcomes);
+            let (union_outcomes, counts) =
+                measure_queries(&union, "union", &qa, range_min, iters, warmup);
+            union_counts = counts;
+            all.extend(union_outcomes);
 
-                    // Identity gate: union-of-leaves must equal the plain set
-                    // at the interface (untimed reference run; PANIC
-                    // sentinels are skipped — a query that panicked on
-                    // either side has no count to disagree with).
-                    let mut full = TribleSet::new();
-                    for chunk in &chunks {
-                        full.union(chunk.content.clone());
-                    }
-                    full_len = full.len();
-                    let (_, set_counts) = measure_queries(&full, "set-ref", &qa, range_min, 1, 0);
-                    if !counts_match(union_counts, set_counts) {
-                        println!(
-                            "WORKLOAD IDENTITY VIOLATION (union vs set): union returned {union_counts:?}, set returned {set_counts:?}"
-                        );
-                        std::process::exit(3);
-                    }
-                }
-                Err(msg) => {
-                    all.push(("attach".to_owned(), Outcome::Panic(msg)));
-                    println!("note     : manifest attach panicked — no union arm");
-                }
+            // Identity gate: the exact physical cover must equal the plain
+            // source union at the query interface (untimed reference run;
+            // PANIC sentinels are skipped because a panicked arm has no count
+            // to disagree with).
+            let mut full = TribleSet::new();
+            for chunk in &chunks {
+                full.union(chunk.content.clone());
+            }
+            full_len = full.len();
+            let (_, set_counts) = measure_queries(&full, "set-ref", &qa, range_min, 1, 0);
+            if !counts_match(union_counts, set_counts) {
+                println!(
+                    "WORKLOAD IDENTITY VIOLATION (union vs set): union returned {union_counts:?}, set returned {set_counts:?}"
+                );
+                std::process::exit(3);
             }
         }
         Err(msg) => {
-            all.push(("build_lsm".to_owned(), Outcome::Panic(msg)));
-            println!("note     : build_lsm panicked — no leaves to query");
+            all.push(("build_exact".to_owned(), Outcome::Panic(msg)));
+            println!("note     : build_exact panicked — no exact cover to query");
         }
     }
 
     println!(
-        "identity : tribles={} q[1,3,4,5]={:?} manifest={}  (runs comparable ONLY if ALL match; {} = PANIC sentinel)",
-        full_len, union_counts, manifest_ident, PANIC_COUNT
+        "identity : tribles={} q[1,3,4,5]={:?} ticket={} raw-cover={} query-shards={} raw-bytes={}  (runs comparable ONLY if ALL match; {} = PANIC sentinel)",
+        full_len,
+        union_counts,
+        build_shape.ticket_commits,
+        build_shape.raw_cover_members,
+        build_shape.query_shards,
+        build_shape.raw_bytes,
+        PANIC_COUNT
     );
 
     let mut signal: Vec<String> = Vec::new();

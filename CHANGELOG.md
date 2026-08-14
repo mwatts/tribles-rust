@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or a checkout. The pile re-id/rename integration test now exercises its real
   generic contract by carrying unrelated canonical branch annotations instead
   of depending on a Succinct-specific manifest fixture.
+- **The portable Succinct LSM benchmark now measures the native exact
+  collection lifecycle.** Source chunks are published and ticketed outside the
+  timer; `build_exact` measures canonical raw construction, deterministic
+  target compaction, Rank9 fiber persistence, and query-ready attachment as one
+  fixed operation. The report replaces legacy fanout/range/manifest counters
+  with exact-ticket, raw-cover, serialized-byte, and physical-shard metrics
+  while retaining the union-versus-`TribleSet` query identity gates.
 - **The speculative adaptive Succinct rollup wrapper is gone.** Core retains
   the stateless `WaveletMatrixFreezeBackend` and
   `merge_ordered_archives_with_backend` experiment seams, but no longer mixes
