@@ -20,10 +20,12 @@ use crate::{Automaton, PathError, PathIndex, PathSummary, Step};
 
 const HEADER_LEN: usize = 48;
 const FINGERPRINT_VERSION: u32 = 1;
+// Stable path-summary-v2 algorithm anchor, minted with `trible genid` on
+// 2026-07-28 when canonical summaries were restricted to matched support plus
+// nullable identity.
+const PATH_SUMMARY_ALGORITHM_ID_HEX: &str = "341216BFE738E2D82BFFF96F52E7FE06";
 
-// The PathRollup v2 algorithm id doubles as the automaton wire domain
-// separator. Minted with `trible genid` on 2026-07-28 when canonical summaries
-// were restricted to matched support plus nullable identity.
+// The algorithm id's bytes also serve as the automaton wire domain separator.
 const AUTOMATON_FINGERPRINT_DOMAIN: [u8; 16] = [
     0x34, 0x12, 0x16, 0xbf, 0xe7, 0x38, 0xe2, 0xd8, 0x2b, 0xff, 0xf9, 0x6f, 0x52, 0xe7, 0xfe, 0x06,
 ];
@@ -343,8 +345,8 @@ pub fn automaton_fingerprint(automaton: &Automaton) -> Inline<Hash<Blake3>> {
 }
 
 pub(crate) fn path_summary_recipe_fragment(automaton: &Automaton) -> Fragment {
-    let algorithm =
-        Id::from_hex(PathRollup::KIND_ID_HEX).expect("valid minted path-summary algorithm id");
+    let algorithm = Id::from_hex(PATH_SUMMARY_ALGORITHM_ID_HEX)
+        .expect("valid minted path-summary algorithm id");
     let fingerprint = automaton_fingerprint(automaton);
     entity! { _ @
         metadata::tag: algorithm,
@@ -367,7 +369,7 @@ pub struct PathRollup {
 impl PathRollup {
     /// Stable v2 algorithm id minted with `trible genid` on 2026-07-28 for
     /// matched-support summaries plus nullable full-domain identity.
-    pub const KIND_ID_HEX: &'static str = "341216BFE738E2D82BFFF96F52E7FE06";
+    pub const KIND_ID_HEX: &'static str = PATH_SUMMARY_ALGORITHM_ID_HEX;
 
     /// Construct one recipe. The canonical automaton fingerprint participates
     /// in recipe identity, so different path expressions never share ranges.
