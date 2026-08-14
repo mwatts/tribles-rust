@@ -25,7 +25,9 @@ use crate::inline::encodings::hash::{Blake3, Handle, Hash};
 use crate::inline::{Inline, InlineEncoding};
 use crate::repo::{BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut};
 
-use super::discovery::discover_collection_records_for_ticket;
+use super::discovery::{
+    canonicalize_exact_ticket, discover_collection_records_for_ticket, validate_exact_ticket,
+};
 use super::{
     collection_physical_cover, resolve_collection_semantics, CollectionClaimValidation,
     CollectionCommit, CollectionData, CollectionDerive, CollectionDescriptor, CollectionId,
@@ -556,6 +558,8 @@ where
         S::Reader: BlobStoreMeta,
         A: ExactDerivedAlgebra<Source, Target> + ?Sized,
     {
+        let ticket = canonicalize_exact_ticket(ticket, self.source.handle())
+            .map_err(|error| ExactDerivedCollectionError::InvalidTicket(error.to_string()))?;
         let requested: BTreeSet<_> = ticket.iter().map(CollectionCommit::id).collect();
         let discovered = discover_collection_records_for_ticket(
             store,
@@ -564,7 +568,8 @@ where
             self.target.handle(),
         )
         .map_err(|error| ExactDerivedCollectionError::storage("discover exact ticket", error))?;
-        let authorized = exact_ticket_ids(&discovered, ticket, &self.source)?;
+        let authorized = validate_exact_ticket(&discovered, &ticket)
+            .map_err(|error| ExactDerivedCollectionError::InvalidTicket(error.to_string()))?;
         let reader = store.reader().map_err(|error| {
             ExactDerivedCollectionError::storage("open exact-ticket reader", error)
         })?;
@@ -684,7 +689,7 @@ where
             }
         };
 
-        for commit in ticket {
+        for commit in &ticket {
             if resolution.validation_pending().contains(&commit.id()) {
                 return Err(ExactDerivedCollectionError::IncompleteCommit(commit.id()));
             }
@@ -1189,42 +1194,6 @@ where
             algebra.join_target(low, high).map(ScratchValue::Target)
         }
     }
-}
-
-fn exact_ticket_ids(
-    discovered: &DiscoveredCollectionRecords,
-    ticket: &[CollectionCommit],
-    source: &CollectionDescriptor,
-) -> Result<BTreeSet<Id>, ExactDerivedCollectionError> {
-    let mut ids = BTreeSet::new();
-    for commit in ticket {
-        if commit.collection() != source.handle() {
-            return Err(ExactDerivedCollectionError::InvalidTicket(format!(
-                "commit {:X} names another source collection",
-                commit.id(),
-            )));
-        }
-        match discovered
-            .commits()
-            .binary_search_by_key(&commit.id(), CollectionCommit::id)
-        {
-            Ok(index) if discovered.commits()[index] == *commit => {}
-            Ok(_) => {
-                return Err(ExactDerivedCollectionError::InvalidTicket(format!(
-                    "commit {:X} does not byte-match the stored record",
-                    commit.id(),
-                )));
-            }
-            Err(_) => {
-                return Err(ExactDerivedCollectionError::InvalidTicket(format!(
-                    "commit {:X} is absent or fails strict signature verification",
-                    commit.id(),
-                )));
-            }
-        }
-        ids.insert(commit.id());
-    }
-    Ok(ids)
 }
 
 fn contains<R, E>(

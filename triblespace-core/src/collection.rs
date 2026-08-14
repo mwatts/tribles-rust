@@ -33,6 +33,7 @@ pub use gossip::*;
 pub use records::*;
 pub use resolution::*;
 pub use retention::*;
+pub use simplearchive_union::SimpleArchiveCollection;
 pub use store::*;
 
 #[cfg(test)]

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Direct `SimpleArchive` collections now have a keyless exact-ticket read
+  facade.** `SimpleArchiveCollection::{attach_exact,snapshot_exact}` accepts a
+  set of complete `CollectionCommit` records, admits mixed authors only after
+  exact stored-byte and strict-signature checks, and keeps unselected commits
+  inert. It shares `Collection`'s descriptor, mandatory data/metadata, merge
+  cover, and coherent-reader validation path, exposes no write operation, and
+  canonicalizes byte-identical ticket repeats into one sorted commit set.
 - **The unpublished branch-index persistence stack is gone.** Core no longer
   exposes commit-range manifests, `IndexKind`, repository on-commit hooks, or
   their branch-head maintenance path. Search no longer exposes the

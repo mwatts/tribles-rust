@@ -127,6 +127,31 @@ This collection path coexists with the branch-oriented `Repository` and
 updates; choosing the headless path does not change the semantics of existing
 branches.
 
+## Attach an exact direct fact view
+
+Read-only consumers that already hold an immutable commit ticket do not need
+the publishing key. `SimpleArchiveCollection` fixes the same canonical
+descriptor from the dataset scope and accepts the complete signed records as a
+set:
+
+```rust,ignore
+use triblespace::prelude::SimpleArchiveCollection;
+
+let models = SimpleArchiveCollection::new(model_scope);
+let facts = models.attach_exact(&mut storage, &ticket)?;
+let snapshot = models.snapshot_exact(&mut storage, &ticket)?;
+```
+
+Ticket members may have different authors. Byte-identical repeats collapse,
+and the snapshot returns the canonical intrinsic-id-sorted unique commit set.
+Each member must name this descriptor, byte-match a strictly verified stored
+record, and have resident valid descriptor, data, and mandatory metadata
+blobs. Commits present in storage but omitted from the ticket remain inert.
+Same-descriptor `MERGE` evidence may supply a smaller exact physical cover but
+cannot widen the authorized union. `attach_exact` and `snapshot_exact` never
+write; the latter carries the one reader used to validate and materialize the
+selected record observation.
+
 ## Attach an exact derived query view
 
 Derived query artifacts can use the signed source commits themselves as a

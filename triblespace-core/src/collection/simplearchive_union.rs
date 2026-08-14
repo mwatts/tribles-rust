@@ -41,7 +41,9 @@ use super::{
     CollectionRecord, CollectionStore,
 };
 
+mod collection;
 mod materialize;
+pub use collection::*;
 pub use materialize::*;
 
 /// Canonical TribleSet set-union recipe, version 1.

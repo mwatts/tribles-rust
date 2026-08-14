@@ -6,7 +6,7 @@
 //! recovery path: a structural storage failure is fatal. It verifies signed
 //! commits, classifies records, and canonicalizes the resulting semantic view.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
@@ -35,6 +35,135 @@ pub struct CollectionRecordDiagnostic {
 pub enum CollectionRecordDiagnosticError {
     /// A structurally canonical commit failed strict Ed25519 verification.
     InvalidCommit(CommitVerificationError),
+}
+
+/// Failure to canonicalize or admit an exact commit ticket.
+///
+/// Exact tickets are mathematical sets of complete [`CollectionCommit`]
+/// records. Byte-identical repeats collapse, while every distinct member must
+/// name the expected collection and byte-match one strictly verified record
+/// selected from storage.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExactTicketError {
+    /// A supplied commit names another collection descriptor.
+    WrongCollection {
+        /// Intrinsic commit record id.
+        commit: Id,
+        /// Descriptor required by the fixed facade.
+        expected: CollectionId,
+        /// Descriptor named by the supplied commit.
+        actual: CollectionId,
+    },
+    /// Two supplied records have the same intrinsic id but different bytes.
+    ConflictingCommit {
+        /// Colliding intrinsic commit record id.
+        commit: Id,
+    },
+    /// Storage returned the requested intrinsic id with different commit bytes.
+    StoredCommitMismatch {
+        /// Intrinsic commit record id.
+        commit: Id,
+    },
+    /// The exact record is absent or did not pass strict signature verification.
+    MissingOrInvalidCommit {
+        /// Intrinsic commit record id.
+        commit: Id,
+    },
+}
+
+impl fmt::Display for ExactTicketError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WrongCollection {
+                commit,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "ticket commit {commit:X} names collection {} instead of {}",
+                hex::encode_upper(actual.raw),
+                hex::encode_upper(expected.raw),
+            ),
+            Self::ConflictingCommit { commit } => write!(
+                f,
+                "ticket contains byte-distinct commits with intrinsic id {commit:X}",
+            ),
+            Self::StoredCommitMismatch { commit } => write!(
+                f,
+                "ticket commit {commit:X} does not byte-match the stored record",
+            ),
+            Self::MissingOrInvalidCommit { commit } => write!(
+                f,
+                "ticket commit {commit:X} is absent or fails strict signature verification",
+            ),
+        }
+    }
+}
+
+impl Error for ExactTicketError {}
+
+/// Canonical intrinsic-id order for one exact ticket.
+pub(crate) fn canonicalize_exact_ticket(
+    ticket: &[CollectionCommit],
+    expected: CollectionId,
+) -> Result<Vec<CollectionCommit>, ExactTicketError> {
+    let mut ticket = ticket.to_vec();
+    ticket.sort_unstable_by(|left, right| {
+        left.id()
+            .cmp(&right.id())
+            .then_with(|| left.to_bytes().cmp(&right.to_bytes()))
+    });
+    let mut commits = BTreeMap::<Id, CollectionCommit>::new();
+    for commit in &ticket {
+        if commit.collection() != expected {
+            return Err(ExactTicketError::WrongCollection {
+                commit: commit.id(),
+                expected,
+                actual: commit.collection(),
+            });
+        }
+        match commits.entry(commit.id()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(*commit);
+            }
+            std::collections::btree_map::Entry::Occupied(entry)
+                if entry.get().to_bytes() == commit.to_bytes() => {}
+            std::collections::btree_map::Entry::Occupied(_) => {
+                return Err(ExactTicketError::ConflictingCommit {
+                    commit: commit.id(),
+                });
+            }
+        }
+    }
+    Ok(commits.into_values().collect())
+}
+
+/// Require every canonical ticket member to byte-match strict discovered data.
+pub(crate) fn validate_exact_ticket(
+    discovered: &DiscoveredCollectionRecords,
+    ticket: &[CollectionCommit],
+) -> Result<BTreeSet<Id>, ExactTicketError> {
+    let mut ids = BTreeSet::new();
+    for commit in ticket {
+        match discovered
+            .commits()
+            .binary_search_by_key(&commit.id(), CollectionCommit::id)
+        {
+            Ok(index) if discovered.commits()[index].to_bytes() == commit.to_bytes() => {}
+            Ok(_) => {
+                return Err(ExactTicketError::StoredCommitMismatch {
+                    commit: commit.id(),
+                });
+            }
+            Err(_) => {
+                return Err(ExactTicketError::MissingOrInvalidCommit {
+                    commit: commit.id(),
+                });
+            }
+        }
+        ids.insert(commit.id());
+    }
+    Ok(ids)
 }
 
 impl fmt::Display for CollectionRecordDiagnosticError {
@@ -189,8 +318,6 @@ pub(crate) fn discover_collection_records_for_ticket<S>(
 where
     S: CollectionStore,
 {
-    let mut discovered = DiscoveredCollectionRecords::default();
-    let mut matching_commits = Vec::new();
     let mut selectors: BTreeSet<_> = ticket_ids
         .iter()
         .copied()
@@ -199,8 +326,44 @@ where
     selectors.insert(CollectionRecordSelector::MergeCollection(source));
     selectors.insert(CollectionRecordSelector::MergeCollection(target));
     selectors.insert(CollectionRecordSelector::DerivePair { source, target });
+    discover_collection_records_for_selectors(store, ticket_ids, &selectors)
+}
+
+/// Discover one direct collection's exact ticket and same-descriptor merges.
+///
+/// Commits outside `ticket_ids`, derives, and merges for other descriptors are
+/// excluded at the storage selector boundary. Matching ticket commits retain
+/// strict signature verification; callers must still byte-match the supplied
+/// full records with [`validate_exact_ticket`].
+pub(crate) fn discover_collection_records_for_collection_ticket<S>(
+    store: &mut S,
+    ticket_ids: &BTreeSet<Id>,
+    collection: CollectionId,
+) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
+where
+    S: CollectionStore,
+{
+    let mut selectors: BTreeSet<_> = ticket_ids
+        .iter()
+        .copied()
+        .map(CollectionRecordSelector::Id)
+        .collect();
+    selectors.insert(CollectionRecordSelector::MergeCollection(collection));
+    discover_collection_records_for_selectors(store, ticket_ids, &selectors)
+}
+
+fn discover_collection_records_for_selectors<S>(
+    store: &mut S,
+    ticket_ids: &BTreeSet<Id>,
+    selectors: &BTreeSet<CollectionRecordSelector>,
+) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
+where
+    S: CollectionStore,
+{
+    let mut discovered = DiscoveredCollectionRecords::default();
+    let mut matching_commits = Vec::new();
     let records = store
-        .select_records(&selectors)
+        .select_records(selectors)
         .map_err(CollectionDiscoveryError::Records)?;
 
     for record in records {

@@ -30,7 +30,7 @@ use super::{
     CollectionClaimValidation, CollectionCommit, CollectionData, CollectionDescriptor,
     CollectionDiscoveryError, CollectionFunctionalConflict, CollectionId,
     CollectionResolutionError, CollectionStore, CollectionValidationRequest,
-    DiscoveredCollectionRecords, RecordDecodeError,
+    DiscoveredCollectionRecords, ExactTicketError, RecordDecodeError,
 };
 
 /// A scoped `SimpleArchive`-union collection and its signing authority.
@@ -85,19 +85,19 @@ impl<R> CollectionSnapshot<R> {
     }
 }
 
-/// Failure to materialize the complete known value of an owned collection.
+/// Failure to materialize the complete authorized value of a collection.
 ///
-/// Strictly verified commits by this collection's own public key are ground
-/// truth, so their descriptor, data, and metadata fail loud. A record with an
-/// invalid signature authenticates none of its fields and is ignored as an
-/// inert discovery diagnostic. Unsigned equations are only replaceable cache
-/// evidence: missing or invalid equations are omitted from the resolved
-/// semantics and cannot hide a valid committed leaf.
+/// Every authorized strictly verified commit is ground truth, so its
+/// descriptor, data, and metadata fail loud. Unsigned equations are only
+/// replaceable cache evidence: missing or invalid equations are omitted from
+/// the resolved semantics and cannot hide a valid committed leaf.
 #[derive(Debug)]
 pub enum CollectionMaterializationError<RecordsError, ReaderError, MetaError, GetError> {
     /// Native collection-record discovery did not complete.
     Discovery(CollectionDiscoveryError<RecordsError>),
-    /// An own commit's canonical descriptor blob could not be fetched.
+    /// A supplied exact ticket was not an exact resident authority set.
+    ExactTicket(ExactTicketError),
+    /// An authorized commit's canonical descriptor blob could not be fetched.
     DescriptorGet {
         /// Canonical collection-descriptor handle.
         collection: CollectionId,
@@ -128,7 +128,7 @@ pub enum CollectionMaterializationError<RecordsError, ReaderError, MetaError, Ge
     },
     /// The blob reader could not be created after record discovery.
     Reader(ReaderError),
-    /// An own commit's data blob could not be fetched.
+    /// An authorized commit's data blob could not be fetched.
     CommitDataGet {
         /// Intrinsic commit record id.
         commit: Id,
@@ -137,7 +137,7 @@ pub enum CollectionMaterializationError<RecordsError, ReaderError, MetaError, Ge
         /// Backend fetch failure.
         source: GetError,
     },
-    /// An own commit's data failed exact `SimpleArchive` collection
+    /// An authorized commit's data failed exact `SimpleArchive` collection
     /// validation.
     InvalidCommitData {
         /// Intrinsic commit record id.
@@ -145,7 +145,7 @@ pub enum CollectionMaterializationError<RecordsError, ReaderError, MetaError, Ge
         /// Exact representation or identity diagnostic.
         source: SimpleArchiveUnionValidationError,
     },
-    /// An own commit's mandatory metadata archive could not be fetched.
+    /// An authorized commit's mandatory metadata archive could not be fetched.
     CommitMetadataGet {
         /// Intrinsic commit record id.
         commit: Id,
@@ -154,7 +154,7 @@ pub enum CollectionMaterializationError<RecordsError, ReaderError, MetaError, Ge
         /// Backend fetch failure.
         source: GetError,
     },
-    /// An own commit's mandatory metadata was not a canonical
+    /// An authorized commit's mandatory metadata was not a canonical
     /// `SimpleArchive`.
     InvalidCommitMetadata {
         /// Intrinsic commit record id.
@@ -164,7 +164,7 @@ pub enum CollectionMaterializationError<RecordsError, ReaderError, MetaError, Ge
         /// Canonical archive failure.
         source: UnarchiveError,
     },
-    /// An own commit's canonical metadata bytes did not have the exact
+    /// An authorized commit's canonical metadata bytes did not have the exact
     /// identity signed by the commit.
     InvalidCommitMetadataIdentity {
         /// Intrinsic commit record id.
@@ -191,25 +191,26 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Discovery(source) => source.fmt(f),
+            Self::ExactTicket(source) => write!(f, "invalid exact ticket: {source}"),
             Self::DescriptorGet { collection, source } => write!(
                 f,
-                "failed to fetch owned collection descriptor {}: {source}",
+                "failed to fetch authorized collection descriptor {}: {source}",
                 hex::encode_upper(collection.raw),
             ),
             Self::InvalidDescriptor { collection, source } => write!(
                 f,
-                "owned collection descriptor {} is invalid: {source}",
+                "authorized collection descriptor {} is invalid: {source}",
                 hex::encode_upper(collection.raw),
             ),
             Self::DescriptorIdentity { expected, actual } => write!(
                 f,
-                "owned collection descriptor bytes hash to {} instead of {}",
+                "authorized collection descriptor bytes hash to {} instead of {}",
                 hex::encode_upper(actual.raw),
                 hex::encode_upper(expected.raw),
             ),
             Self::DescriptorMismatch { collection } => write!(
                 f,
-                "owned collection descriptor {} does not match the facade descriptor",
+                "authorized collection descriptor {} does not match the facade descriptor",
                 hex::encode_upper(collection.raw),
             ),
             Self::Reader(source) => write!(f, "failed to open collection blob view: {source}"),
@@ -219,11 +220,11 @@ where
                 source,
             } => write!(
                 f,
-                "failed to fetch data {} for owned commit {commit:X}: {source}",
+                "failed to fetch data {} for authorized commit {commit:X}: {source}",
                 hex::encode_upper(data.raw),
             ),
             Self::InvalidCommitData { commit, source } => {
-                write!(f, "owned commit {commit:X} has invalid data: {source}")
+                write!(f, "authorized commit {commit:X} has invalid data: {source}")
             }
             Self::CommitMetadataGet {
                 commit,
@@ -231,7 +232,7 @@ where
                 source,
             } => write!(
                 f,
-                "failed to fetch metadata {} for owned commit {commit:X}: {source}",
+                "failed to fetch metadata {} for authorized commit {commit:X}: {source}",
                 hex::encode_upper(metadata.raw),
             ),
             Self::InvalidCommitMetadata {
@@ -240,7 +241,7 @@ where
                 source,
             } => write!(
                 f,
-                "owned commit {commit:X} has invalid metadata {}: {source}",
+                "authorized commit {commit:X} has invalid metadata {}: {source}",
                 hex::encode_upper(metadata.raw),
             ),
             Self::InvalidCommitMetadataIdentity {
@@ -249,7 +250,7 @@ where
                 actual,
             } => write!(
                 f,
-                "owned commit {commit:X} metadata bytes hash to {} instead of signed {}",
+                "authorized commit {commit:X} metadata bytes hash to {} instead of signed {}",
                 hex::encode_upper(actual.raw),
                 hex::encode_upper(expected.raw),
             ),
@@ -270,6 +271,7 @@ where
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Discovery(source) => Some(source),
+            Self::ExactTicket(source) => Some(source),
             Self::DescriptorGet { source, .. } => Some(source),
             Self::InvalidDescriptor { source, .. } => Some(source),
             Self::DescriptorIdentity { .. } | Self::DescriptorMismatch { .. } => None,
@@ -545,7 +547,7 @@ where
         let (discovered, commits) = self
             .discover_owned_commits()
             .map_err(CollectionMaterializationError::Discovery)?;
-        self.snapshot_from_observation(discovered, commits)
+        Self::snapshot_from_observation(&mut self.storage, &self.descriptor, discovered, commits)
     }
 
     /// Materialize the complete known `TribleSet` authorized by this facade's
@@ -591,12 +593,18 @@ where
         if commits.is_empty() {
             return Ok(TribleSet::new());
         }
-        self.snapshot_from_observation(discovered, commits)
+        Self::snapshot_from_observation(&mut self.storage, &self.descriptor, discovered, commits)
             .map(CollectionSnapshot::into_facts)
     }
 
-    fn snapshot_from_observation(
-        &mut self,
+    /// Materialize one already-discovered exact authority frontier.
+    ///
+    /// Both signer-owned and caller-ticketed facades use this single validator
+    /// so descriptor, mandatory dependency, merge-cover, and reader-snapshot
+    /// semantics cannot drift apart.
+    pub(crate) fn snapshot_from_observation(
+        storage: &mut S,
+        descriptor: &CollectionDescriptor,
         discovered: DiscoveredCollectionRecords,
         commits: Vec<CollectionCommit>,
     ) -> Result<
@@ -608,11 +616,10 @@ where
             <S::Reader as BlobStoreGet>::GetError<Infallible>,
         >,
     > {
-        let collection = self.descriptor.handle();
+        let collection = descriptor.handle();
         let authorized: BTreeSet<_> = commits.iter().map(CollectionCommit::id).collect();
 
-        let reader = self
-            .storage
+        let reader = storage
             .reader()
             .map_err(CollectionMaterializationError::Reader)?;
 
@@ -624,7 +631,7 @@ where
             });
         }
 
-        // The descriptor handle is the collection identity. Once an own
+        // The descriptor handle is the collection identity. Once an authorized
         // commit makes this collection nonempty, its descriptor is mandatory
         // ground truth just like the signed data and metadata below. Fetch by
         // the exact handle, recompute the identity rather than trusting a
@@ -645,7 +652,7 @@ where
             CollectionDescriptor::decode(&descriptor_blob).map_err(|source| {
                 CollectionMaterializationError::InvalidDescriptor { collection, source }
             })?;
-        if decoded_descriptor != self.descriptor {
+        if decoded_descriptor != *descriptor {
             return Err(CollectionMaterializationError::DescriptorMismatch { collection });
         }
 
@@ -703,7 +710,7 @@ where
         #[cfg(feature = "parallel")]
         let mut known = validate_unique_commit_dependencies_parallel(
             &commits,
-            &self.descriptor,
+            descriptor,
             fetch_data,
             fetch_metadata,
             validate_metadata,
@@ -717,7 +724,7 @@ where
             &commits,
             |claim| {
                 let data_blob = fetch_data(claim)?;
-                simplearchive_union::validate_commit(&self.descriptor, claim, &data_blob).map_err(
+                simplearchive_union::validate_commit(descriptor, claim, &data_blob).map_err(
                     |source| CollectionMaterializationError::InvalidCommitData {
                         commit: claim.id(),
                         source,
@@ -1609,11 +1616,13 @@ mod tests {
     }
 
     #[test]
-    fn commits_from_a_foreign_signer_are_ignored() {
+    fn owned_snapshot_remains_signer_scoped_after_shared_materializer_refactor() {
         let own_key = SigningKey::from_bytes(&[7; 32]);
         let foreign_key = SigningKey::from_bytes(&[8; 32]);
         let mut collection = Collection::new(MemoryRepo::default(), id(1), own_key);
         let descriptor = *collection.descriptor();
+        let expected = fragment(2, false);
+        let own_commit = collection.commit(expected.clone()).unwrap();
         let data = archive(1);
         let metadata: Blob<SimpleArchive> = TribleSet::new().to_blob();
 
@@ -1630,7 +1639,9 @@ mod tests {
             .insert(CollectionRecord::Commit(invalid_signature(foreign)))
             .unwrap();
 
-        assert_eq!(collection.materialize().unwrap(), TribleSet::new());
+        let snapshot = collection.snapshot().unwrap();
+        assert_eq!(snapshot.facts(), expected.facts());
+        assert_eq!(snapshot.commits(), &[own_commit]);
     }
 
     #[test]
