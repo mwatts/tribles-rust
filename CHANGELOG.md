@@ -61,11 +61,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under the same read/resolution snapshot, caching successful images but
   publishing only the final feasible plan. An indispensable signed source leaf
   reports an explicit unrepresentable cover with zero writes. Succinct raw
-  construction and merge preserve typed input-versus-union-growth phases, and
-  path-summary unions distinguish persisted decode failures from fresh encode
-  capacity. Portable vertex/arc/product limits are representation capacity;
-  host `usize` byte/allocation arithmetic remains fatal rather than triggering
-  a physical-cover fallback.
+  construction and merge preserve typed input-versus-union-growth phases.
+  Paths remains fatal on all algebra failures, including fixed summary limits:
+  its public operation currently rejoins every shard before closure, so a
+  finer cover cannot make an oversized result representable. `Capacity` is
+  reserved there until fragmented closure/materialization exists.
 
   Explicit native target compaction is now available through the generic
   `collection::exact_target_compaction::compact_exact_target` producer and the

@@ -188,7 +188,7 @@ impl ExactDerivedAlgebra<SimpleArchive, PathSummaryBlob> for PathSummaryCollecti
         &self,
         source: &triblespace_core::blob::Blob<SimpleArchive>,
     ) -> Result<triblespace_core::blob::Blob<PathSummaryBlob>, ExactAlgebraError> {
-        path_summary_union::derive_element(source, &self.automaton).map_err(classify_derive_error)
+        path_summary_union::derive_element(source, &self.automaton).map_err(fatal_algebra_error)
     }
 
     fn join_target(
@@ -196,39 +196,15 @@ impl ExactDerivedAlgebra<SimpleArchive, PathSummaryBlob> for PathSummaryCollecti
         low: &triblespace_core::blob::Blob<PathSummaryBlob>,
         high: &triblespace_core::blob::Blob<PathSummaryBlob>,
     ) -> Result<triblespace_core::blob::Blob<PathSummaryBlob>, ExactAlgebraError> {
-        path_summary_union::join(low, high, &self.automaton).map_err(classify_target_join_error)
+        path_summary_union::join(low, high, &self.automaton).map_err(fatal_algebra_error)
     }
 }
 
-fn classify_derive_error(error: PathSummaryUnionError) -> ExactAlgebraError {
-    let reason = error.to_string();
-    if matches!(
-        &error,
-        PathSummaryUnionError::Encode(PathSummaryBlobError::RepresentationCapacity)
-    ) {
-        ExactAlgebraError::Capacity(reason)
-    } else {
-        // Source bytes are persisted, and no decode or merge phase belongs to
-        // derivation. Treat every such failure as invalid algebra input.
-        ExactAlgebraError::Fatal(reason)
-    }
-}
-
-fn classify_target_join_error(error: PathSummaryUnionError) -> ExactAlgebraError {
-    let capacity = matches!(
-        &error,
-        PathSummaryUnionError::Merge(
-            PathError::TooManyVertices { .. } | PathError::ProductCarrierTooLarge { .. }
-        ) | PathSummaryUnionError::Encode(PathSummaryBlobError::RepresentationCapacity)
-    );
-    let reason = error.to_string();
-    if capacity {
-        ExactAlgebraError::Capacity(reason)
-    } else {
-        // Persisted decode failures and host-size arithmetic are fatal; only
-        // fixed portable result geometry can trigger a finer-cover fallback.
-        ExactAlgebraError::Fatal(reason)
-    }
+fn fatal_algebra_error(error: PathSummaryUnionError) -> ExactAlgebraError {
+    // Paths currently rejoins every selected shard before closure, so a finer
+    // cover cannot evade fixed summary capacity. Reserve `Capacity` until the
+    // public operation supports fragmented closure/materialization.
+    ExactAlgebraError::Fatal(error.to_string())
 }
 
 #[cfg(test)]
@@ -352,49 +328,17 @@ mod tests {
     }
 
     #[test]
-    fn exact_algebra_distinguishes_fresh_capacity_from_persisted_bytes() {
+    fn exact_algebra_treats_fixed_representation_capacity_as_fatal() {
         for error in [
             PathSummaryUnionError::Merge(PathError::TooManyVertices { count: usize::MAX }),
             PathSummaryUnionError::Merge(PathError::ProductCarrierTooLarge {
                 vertices: usize::MAX,
                 states: u32::MAX,
             }),
-            PathSummaryUnionError::Encode(PathSummaryBlobError::RepresentationCapacity),
+            PathSummaryUnionError::Summary(PathSummaryBlobError::CapacityOverflow),
         ] {
             assert!(matches!(
-                classify_target_join_error(error),
-                ExactAlgebraError::Capacity(_)
-            ));
-        }
-
-        assert!(matches!(
-            classify_derive_error(PathSummaryUnionError::Encode(
-                PathSummaryBlobError::RepresentationCapacity
-            )),
-            ExactAlgebraError::Capacity(_)
-        ));
-
-        for error in [
-            PathSummaryUnionError::Decode(PathSummaryBlobError::RepresentationCapacity),
-            PathSummaryUnionError::Decode(PathSummaryBlobError::HostSizeOverflow),
-            PathSummaryUnionError::Merge(PathError::EmptyInput),
-            PathSummaryUnionError::Merge(PathError::DifferentAutomata),
-            PathSummaryUnionError::Merge(PathError::CapacityOverflow),
-            PathSummaryUnionError::Encode(PathSummaryBlobError::HostSizeOverflow),
-            PathSummaryUnionError::Encode(PathSummaryBlobError::BadLength),
-        ] {
-            assert!(matches!(
-                classify_target_join_error(error),
-                ExactAlgebraError::Fatal(_)
-            ));
-        }
-
-        for error in [
-            PathSummaryUnionError::Decode(PathSummaryBlobError::RepresentationCapacity),
-            PathSummaryUnionError::Encode(PathSummaryBlobError::HostSizeOverflow),
-        ] {
-            assert!(matches!(
-                classify_derive_error(error),
+                fatal_algebra_error(error),
                 ExactAlgebraError::Fatal(_)
             ));
         }

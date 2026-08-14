@@ -82,31 +82,18 @@ impl fmt::Display for ElementRole {
 pub enum PathSummaryUnionError {
     /// The source is not a canonical `SimpleArchive`.
     Source(UnarchiveError),
-    /// A persisted path-summary input could not be decoded.
-    Decode(PathSummaryBlobError),
+    /// Path-summary encoding or decoding failed.
+    Summary(PathSummaryBlobError),
     /// Two decoded summaries could not be joined.
     Merge(PathError),
-    /// A freshly constructed path summary could not be encoded.
-    Encode(PathSummaryBlobError),
 }
 
 impl fmt::Display for PathSummaryUnionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Source(source) => write!(formatter, "invalid SimpleArchive source: {source}"),
-            Self::Decode(source) => {
-                write!(
-                    formatter,
-                    "invalid persisted path-summary element: {source}"
-                )
-            }
+            Self::Summary(source) => write!(formatter, "invalid path-summary element: {source}"),
             Self::Merge(source) => write!(formatter, "cannot join path summaries: {source}"),
-            Self::Encode(source) => {
-                write!(
-                    formatter,
-                    "cannot encode constructed path summary: {source}"
-                )
-            }
         }
     }
 }
@@ -115,9 +102,8 @@ impl Error for PathSummaryUnionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Source(source) => Some(source),
-            Self::Decode(source) => Some(source),
+            Self::Summary(source) => Some(source),
             Self::Merge(source) => Some(source),
-            Self::Encode(source) => Some(source),
         }
     }
 }
@@ -273,7 +259,7 @@ pub fn derive_element(
         GraphEdge::from(trible)
     });
     let summary = PathSummary::from_edges(automaton.clone(), edges);
-    PathSummaryBlob::encode(&summary).map_err(PathSummaryUnionError::Encode)
+    PathSummaryBlob::encode(&summary).map_err(PathSummaryUnionError::Summary)
 }
 
 /// Compute the canonical union of two path-summary elements.
@@ -283,11 +269,11 @@ pub fn join(
     automaton: &Automaton,
 ) -> Result<Blob<PathSummaryBlob>, PathSummaryUnionError> {
     let left =
-        PathSummaryBlob::decode(left.clone(), automaton).map_err(PathSummaryUnionError::Decode)?;
-    let right =
-        PathSummaryBlob::decode(right.clone(), automaton).map_err(PathSummaryUnionError::Decode)?;
+        PathSummaryBlob::decode(left.clone(), automaton).map_err(PathSummaryUnionError::Summary)?;
+    let right = PathSummaryBlob::decode(right.clone(), automaton)
+        .map_err(PathSummaryUnionError::Summary)?;
     let joined = left.merge(&right).map_err(PathSummaryUnionError::Merge)?;
-    PathSummaryBlob::encode(&joined).map_err(PathSummaryUnionError::Encode)
+    PathSummaryBlob::encode(&joined).map_err(PathSummaryUnionError::Summary)
 }
 
 /// Validate an exact canonical `SimpleArchive -> PathSummaryBlob` mapping.
@@ -582,24 +568,6 @@ mod tests {
             assert_eq!(joined.bytes, matching.bytes);
             assert_eq!(joined.get_handle(), matching.get_handle());
         }
-    }
-
-    #[test]
-    fn join_identifies_persisted_decode_failures() {
-        let automaton = Automaton::new(u32::MAX, [0], [0], []).unwrap();
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&crate::automaton_fingerprint(&automaton).raw);
-        bytes.extend_from_slice(&automaton.state_count().to_le_bytes());
-        bytes.extend_from_slice(&2u32.to_le_bytes());
-        bytes.extend_from_slice(&0u64.to_le_bytes());
-        bytes.extend_from_slice(&[1; 32]);
-        bytes.extend_from_slice(&[2; 32]);
-        let malformed = Blob::<PathSummaryBlob>::new(bytes.into());
-        let error = join(&malformed, &empty(&automaton), &automaton).unwrap_err();
-        assert_eq!(
-            error,
-            PathSummaryUnionError::Decode(PathSummaryBlobError::RepresentationCapacity)
-        );
     }
 
     #[test]
