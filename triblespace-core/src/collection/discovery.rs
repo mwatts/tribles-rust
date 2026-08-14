@@ -10,10 +10,12 @@ use std::error::Error;
 use std::fmt;
 
 use crate::id::Id;
+use crate::inline::encodings::ed25519::ED25519PublicKey;
+use crate::inline::Inline;
 
 use super::{
-    CollectionCommit, CollectionDerive, CollectionMerge, CollectionRecord, CollectionStore,
-    CommitVerificationError,
+    CollectionCommit, CollectionDerive, CollectionId, CollectionMerge, CollectionRecord,
+    CollectionStore, CommitVerificationError,
 };
 
 /// One collection record with a discovery-time validation failure.
@@ -142,19 +144,60 @@ pub fn discover_collection_records<S>(
 where
     S: CollectionStore,
 {
+    discover_collection_records_matching(store, |_| true)
+}
+
+/// Discover records for one exact collection and authorized signer.
+///
+/// A commit's descriptor and public-key fields are structurally available
+/// before its signature is verified. Commits outside this exact scope are
+/// therefore discarded without paying for Ed25519 verification. Matching
+/// commits still undergo the same strict verification and produce the same
+/// diagnostics as [`discover_collection_records`].
+///
+/// `MERGE` and `DERIVE` records are retained in full. They are unsigned
+/// equations whose relevance can span collection boundaries, so narrowing
+/// them here would change the semantic graph seen by downstream resolution.
+/// Physical decoding remains the store's responsibility: a malformed record
+/// or iteration failure is fatal even when it appears outside the requested
+/// commit scope.
+pub fn discover_collection_records_scoped<S>(
+    store: &mut S,
+    collection: CollectionId,
+    signer: Inline<ED25519PublicKey>,
+) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
+where
+    S: CollectionStore,
+{
+    discover_collection_records_matching(store, |commit| {
+        commit.collection() == collection && commit.public_key() == signer
+    })
+}
+
+fn discover_collection_records_matching<S, F>(
+    store: &mut S,
+    mut include_commit: F,
+) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
+where
+    S: CollectionStore,
+    F: FnMut(&CollectionCommit) -> bool,
+{
     let mut discovered = DiscoveredCollectionRecords::default();
     let records = store.records().map_err(CollectionDiscoveryError::Records)?;
 
     for record in records {
         let record = record.map_err(CollectionDiscoveryError::Records)?;
         match record {
-            CollectionRecord::Commit(record) => match record.verify_strict() {
-                Ok(()) => discovered.commits.push(record),
-                Err(error) => discovered.diagnostics.push(CollectionRecordDiagnostic {
-                    id: record.id(),
-                    error: CollectionRecordDiagnosticError::InvalidCommit(error),
-                }),
-            },
+            CollectionRecord::Commit(record) if include_commit(&record) => {
+                match record.verify_strict() {
+                    Ok(()) => discovered.commits.push(record),
+                    Err(error) => discovered.diagnostics.push(CollectionRecordDiagnostic {
+                        id: record.id(),
+                        error: CollectionRecordDiagnosticError::InvalidCommit(error),
+                    }),
+                }
+            }
+            CollectionRecord::Commit(_) => {}
             CollectionRecord::Merge(record) => discovered.merges.push(record),
             CollectionRecord::Derive(record) => discovered.derives.push(record),
         }
@@ -218,6 +261,23 @@ mod tests {
         Inline::new([byte; 32])
     }
 
+    fn signer(key: &SigningKey) -> Inline<ED25519PublicKey> {
+        Inline::new(key.verifying_key().to_bytes())
+    }
+
+    fn invalid_signature(commit: CollectionCommit) -> CollectionCommit {
+        let (r, mut s) = commit.signature();
+        s.raw[0] ^= 1;
+        CollectionCommit::from_parts(
+            commit.collection(),
+            commit.data(),
+            commit.metadata(),
+            commit.public_key(),
+            r,
+            s,
+        )
+    }
+
     fn fixture_records() -> (Vec<CollectionRecord>, CollectionCommit) {
         let commit = CollectionCommit::sign(
             &SigningKey::from_bytes(&[7; 32]),
@@ -228,16 +288,7 @@ mod tests {
         let merge = CollectionMerge::new(collection(1), hash(4), hash(5), hash(6));
         let derive = CollectionDerive::new(collection(1), collection(7), hash(4), hash(8));
 
-        let (r, mut s) = commit.signature();
-        s.raw[0] ^= 1;
-        let invalid_commit = CollectionCommit::from_parts(
-            commit.collection(),
-            commit.data(),
-            commit.metadata(),
-            commit.public_key(),
-            r,
-            s,
-        );
+        let invalid_commit = invalid_signature(commit);
 
         (
             vec![
@@ -281,6 +332,130 @@ mod tests {
     }
 
     #[test]
+    fn scoped_discovery_ignores_unrelated_invalid_signatures_and_rejects_relevant_ones() {
+        let target = collection(1);
+        let other = collection(2);
+        let authorized_key = SigningKey::from_bytes(&[7; 32]);
+        let foreign_key = SigningKey::from_bytes(&[8; 32]);
+        let valid =
+            CollectionCommit::sign(&authorized_key, target, hash(1), empty_metadata_handle());
+        let relevant_invalid = invalid_signature(CollectionCommit::sign(
+            &authorized_key,
+            target,
+            hash(2),
+            empty_metadata_handle(),
+        ));
+        let wrong_collection = invalid_signature(CollectionCommit::sign(
+            &authorized_key,
+            other,
+            hash(3),
+            empty_metadata_handle(),
+        ));
+        let wrong_signer = invalid_signature(CollectionCommit::sign(
+            &foreign_key,
+            target,
+            hash(4),
+            empty_metadata_handle(),
+        ));
+        let target_merge = CollectionMerge::new(target, hash(1), hash(2), hash(5));
+        let other_merge = CollectionMerge::new(other, hash(3), hash(4), hash(6));
+        let crossing_derive = CollectionDerive::new(target, other, hash(5), hash(6));
+
+        let mut store = ProbeStore {
+            records: [
+                CollectionRecord::Commit(wrong_signer),
+                CollectionRecord::Merge(other_merge),
+                CollectionRecord::Commit(relevant_invalid),
+                CollectionRecord::Derive(crossing_derive),
+                CollectionRecord::Commit(valid),
+                CollectionRecord::Commit(wrong_collection),
+                CollectionRecord::Merge(target_merge),
+            ]
+            .into_iter()
+            .map(Ok)
+            .collect(),
+            ..ProbeStore::default()
+        };
+
+        let discovered =
+            discover_collection_records_scoped(&mut store, target, signer(&authorized_key))
+                .unwrap();
+
+        assert_eq!(discovered.commits(), &[valid]);
+        assert_eq!(
+            discovered.diagnostics(),
+            &[CollectionRecordDiagnostic {
+                id: relevant_invalid.id(),
+                error: CollectionRecordDiagnosticError::InvalidCommit(
+                    CommitVerificationError::InvalidSignature,
+                ),
+            }]
+        );
+        assert_eq!(discovered.merges().len(), 2);
+        assert!(discovered.merges().contains(&target_merge));
+        assert!(discovered.merges().contains(&other_merge));
+        assert_eq!(discovered.derives(), &[crossing_derive]);
+    }
+
+    #[test]
+    fn scoped_discovery_equals_full_discovery_projected_to_valid_matching_commits() {
+        let target = collection(1);
+        let other = collection(2);
+        let authorized_key = SigningKey::from_bytes(&[7; 32]);
+        let foreign_key = SigningKey::from_bytes(&[8; 32]);
+        let matching = [
+            CollectionCommit::sign(&authorized_key, target, hash(1), empty_metadata_handle()),
+            CollectionCommit::sign(&authorized_key, target, hash(2), empty_metadata_handle()),
+        ];
+        let records = vec![
+            CollectionRecord::Commit(CollectionCommit::sign(
+                &foreign_key,
+                target,
+                hash(3),
+                empty_metadata_handle(),
+            )),
+            CollectionRecord::Merge(CollectionMerge::new(other, hash(3), hash(4), hash(5))),
+            CollectionRecord::Commit(matching[1]),
+            CollectionRecord::Derive(CollectionDerive::new(other, target, hash(5), hash(2))),
+            CollectionRecord::Commit(CollectionCommit::sign(
+                &authorized_key,
+                other,
+                hash(4),
+                empty_metadata_handle(),
+            )),
+            CollectionRecord::Commit(matching[0]),
+            CollectionRecord::Merge(CollectionMerge::new(target, hash(1), hash(2), hash(6))),
+        ];
+        let mut full_store = ProbeStore {
+            records: records.iter().copied().map(Ok).collect(),
+            ..ProbeStore::default()
+        };
+        let mut scoped_store = ProbeStore {
+            records: records.into_iter().map(Ok).collect(),
+            ..ProbeStore::default()
+        };
+
+        let full = discover_collection_records(&mut full_store).unwrap();
+        let scoped =
+            discover_collection_records_scoped(&mut scoped_store, target, signer(&authorized_key))
+                .unwrap();
+        let expected_commits: Vec<_> = full
+            .commits()
+            .iter()
+            .copied()
+            .filter(|commit| {
+                commit.collection() == target && commit.public_key() == signer(&authorized_key)
+            })
+            .collect();
+
+        assert_eq!(scoped.commits(), expected_commits);
+        assert_eq!(scoped.merges(), full.merges());
+        assert_eq!(scoped.derives(), full.derives());
+        assert_eq!(scoped.diagnostics(), full.diagnostics());
+        assert_eq!(expected_commits.len(), matching.len());
+    }
+
+    #[test]
     fn start_and_iteration_failures_are_fatal() {
         let mut start_failure = ProbeStore {
             start_error: Some(ProbeRecordsError("start")),
@@ -302,6 +477,21 @@ mod tests {
             discover_collection_records(&mut iteration_failure),
             Err(CollectionDiscoveryError::Records(ProbeRecordsError(
                 "iteration"
+            )))
+        ));
+
+        let mut scoped_failure = ProbeStore {
+            records: vec![Ok(records[0]), Err(ProbeRecordsError("scoped iteration"))],
+            ..ProbeStore::default()
+        };
+        assert!(matches!(
+            discover_collection_records_scoped(
+                &mut scoped_failure,
+                collection(99),
+                signer(&SigningKey::from_bytes(&[9; 32])),
+            ),
+            Err(CollectionDiscoveryError::Records(ProbeRecordsError(
+                "scoped iteration"
             )))
         ));
     }

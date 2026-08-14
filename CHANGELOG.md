@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   final six-index `TribleSet` once. This removes one transient `TribleSet` and
   PATCH union per collection leaf without changing collection semantics,
   persisted records, physical-cover selection, or the one-member path.
+- **Owned collection reads scope signed-commit verification before Ed25519.**
+  `Collection` now discards commits whose descriptor or signer field does not
+  exactly match the facade before verifying their signatures, while retaining
+  all native `MERGE` and `DERIVE` equations for downstream semantic closure.
+  Matching invalid signatures remain rejected diagnostics, unrelated invalid
+  signatures are inert, and structural storage failures still abort discovery.
 - **The destructive pile CLI requires the current reader's exact boundary.**
   `trible pile amputate <path> --truncate-to <byte-offset>` refuses a guessed
   or stale offset before mutation. Read failures now say explicitly that a

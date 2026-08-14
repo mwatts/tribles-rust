@@ -26,7 +26,7 @@ use super::simplearchive_union::{
     self, MaterializationError, PublicationError, SimpleArchiveUnionValidationError,
 };
 use super::{
-    collection_physical_cover, discover_collection_records, resolve_collection_semantics,
+    collection_physical_cover, discover_collection_records_scoped, resolve_collection_semantics,
     CollectionClaimValidation, CollectionCommit, CollectionData, CollectionDescriptor,
     CollectionDiscoveryError, CollectionFunctionalConflict, CollectionId,
     CollectionResolutionError, CollectionStore, CollectionValidationRequest,
@@ -430,19 +430,12 @@ where
             <S::Reader as BlobStoreGet>::GetError<Infallible>,
         >,
     > {
-        let discovered = discover_collection_records(&mut self.storage)
-            .map_err(CollectionMaterializationError::Discovery)?;
         let collection = self.descriptor.handle();
-        let public_key = self.signing_key.verifying_key().to_bytes();
-
-        let commits = discovered
-            .commits()
-            .iter()
-            .filter(|commit| {
-                commit.collection() == collection && commit.public_key().raw == public_key
-            })
-            .copied()
-            .collect();
+        let public_key = crate::inline::Inline::new(self.signing_key.verifying_key().to_bytes());
+        let discovered =
+            discover_collection_records_scoped(&mut self.storage, collection, public_key)
+                .map_err(CollectionMaterializationError::Discovery)?;
+        let commits = discovered.commits().to_vec();
 
         Ok((discovered, commits))
     }
