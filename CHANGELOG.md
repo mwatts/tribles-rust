@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Telemetry no longer turns an unknown pile read failure into destructive
+  repair advice.** Unsupported record markers are identified as likely
+  format/version skew with an upgrade-first diagnostic, while every refresh
+  failure leaves the pile unchanged and disables only the optional sink.
 - **Scoped collection discovery verifies independent commits concurrently.**
   The exact collection-and-signer filter still runs during the store's serial,
   fail-loud enumeration, then matching Ed25519 signatures use Rayon's indexed

@@ -1,11 +1,11 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::core::collection::Collection;
 use crate::core::metadata;
-use crate::core::repo::pile::Pile;
+use crate::core::repo::pile::{Pile, ReadError};
 use crate::prelude::blobencodings::LongString;
 use crate::prelude::inlineencodings::{GenId, Handle, ShortString, U256BE};
 use crate::prelude::*;
@@ -101,6 +101,26 @@ struct TelemetryInner {
 fn self_describing(mut batch: Fragment) -> Fragment {
     batch.describe_with(schema::build_telemetry_metadata());
     batch
+}
+
+fn pile_refresh_diagnostic(path: &Path, error: &ReadError) -> String {
+    let failure = format!(
+        "telemetry pile {} failed to load ({error}); telemetry disabled.",
+        path.display()
+    );
+
+    match error {
+        ReadError::UnsupportedRecord { .. } => format!(
+            "{failure} This is likely format/version skew; upgrade to a reader that recognizes \
+             the record marker. The pile was left unchanged."
+        ),
+        ReadError::CorruptPile { .. } => format!(
+            "{failure} A malformed or incomplete known record does not prove that the remaining \
+             suffix is a disposable torn write. The pile was left unchanged; inspect it with \
+             current pile diagnostics before choosing recovery."
+        ),
+        _ => format!("{failure} The pile was left unchanged."),
+    }
 }
 
 /// Publish a clone of the pending batch and clear the retained in-memory copy
@@ -358,20 +378,15 @@ impl Telemetry {
         let base = Instant::now();
         let session_id = *genid();
 
-        // Open the pile with the non-mutating refresh — never amputate on
-        // open. A corrupt telemetry pile disables telemetry (fail loud in
-        // the log) instead of truncating data; repair is an explicit
-        // operator decision (`trible pile amputate`).
+        // Open the pile with the non-mutating refresh. Any read failure
+        // disables telemetry without changing the pile; the error alone does
+        // not establish that any suffix is safe to discard.
         if let Some(parent) = pile_path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).ok()?;
         }
         let mut pile = Pile::open(&pile_path).ok()?;
         if let Err(err) = pile.refresh() {
-            log::warn!(
-                "telemetry pile {} failed to load ({err:?}); telemetry disabled. \
-                 Repair explicitly with `trible pile amputate` if the tail is torn.",
-                pile_path.display()
-            );
+            log::warn!("{}", pile_refresh_diagnostic(&pile_path, &err));
             let _ = pile.close();
             return None;
         }
@@ -520,6 +535,38 @@ fn span_end(batch: &mut Fragment, span_id: Id, at_ns: u64, duration_ns: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_record_diagnostic_prioritizes_version_skew_without_destructive_advice() {
+        let diagnostic = pile_refresh_diagnostic(
+            Path::new("telemetry.pile"),
+            &ReadError::UnsupportedRecord {
+                offset: 256,
+                marker: [0xA5; 16],
+            },
+        );
+
+        assert!(diagnostic.contains("likely format/version skew"));
+        assert!(diagnostic.contains("upgrade to a reader"));
+        assert!(diagnostic.contains("pile was left unchanged"));
+        assert!(!diagnostic.contains("amputate"));
+    }
+
+    #[test]
+    fn no_refresh_failure_diagnostic_recommends_amputation() {
+        let failures = [
+            ReadError::CorruptPile { valid_length: 7 },
+            ReadError::IoError(std::io::Error::other("unavailable")),
+            ReadError::FileTooLarge { length: usize::MAX },
+        ];
+
+        for failure in &failures {
+            let diagnostic = pile_refresh_diagnostic(Path::new("telemetry.pile"), failure);
+            assert!(diagnostic.contains("telemetry disabled"));
+            assert!(diagnostic.contains("pile was left unchanged"));
+            assert!(!diagnostic.contains("amputate"));
+        }
+    }
 
     fn pending_span() -> Fragment {
         let mut batch = Fragment::empty();
