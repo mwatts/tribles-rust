@@ -27,13 +27,13 @@ via [anybytes] and [jerky]:
 
 The authoritative schema identities live in each marker type's
 `MetaDescribe` implementation. A format rotation must also rotate any
-persisted attribute or manifest that routes handles to that reader; changing
-the metadata ID does not create a new Rust type or perform a runtime check.
+persisted typed attribute or collection recipe that routes handles to that
+reader; changing the metadata ID does not create a new Rust type or perform a
+runtime check.
 
 Index blobs are immutable. Direct builders and collection derivations return
 fresh content-addressed handles. Portable BM25 elements join canonically;
-range-native HNSW rollups retain native succinct artifacts and compact by
-publishing new blobs rather than mutating existing ones.
+native HNSW and succinct-HNSW builders return standalone immutable artifacts.
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) for the full design.
 

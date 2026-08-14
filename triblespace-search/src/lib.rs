@@ -32,8 +32,8 @@
 //!
 //! Index blobs are immutable. Direct builders and collection derivations
 //! return fresh content-addressed handles. Portable BM25 carriers join by
-//! document union plus pointwise-maximum term frequency; HNSW range rollups
-//! retain the native succinct graph.
+//! document union plus pointwise-maximum term frequency; HNSW builders return
+//! standalone native or succinct graphs.
 //!
 //! # Query surface
 //!
@@ -106,10 +106,6 @@
 pub mod bm25;
 pub mod constraint;
 pub mod hnsw;
-#[cfg(feature = "succinct")]
-pub mod index_hnsw;
-#[cfg(feature = "succinct")]
-pub mod index_schema;
 pub mod portable_bm25;
 #[cfg(feature = "succinct")]
 pub mod ring;
@@ -156,8 +152,8 @@ pub mod testing {
 // `SuccinctBM25Blob` / `SuccinctHNSWBlob` in `succinct.rs`). That metadata
 // identity feeds derived typed
 // schemas, but it is not an in-band runtime guard and does not
-// make the Rust marker a new type. Persisted attributes/manifests
-// that route handles to a reader must rotate with it. There is no
+// make the Rust marker a new type. Persisted typed attributes or collection
+// recipes that route handles to a reader must rotate with it. There is no
 // single global version number; `git log docs/DESIGN.md` records
 // the layout progression and the marker implementation is
 // authoritative for the current identity.

@@ -95,9 +95,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // naive intermediate.
             let idx = builder.build();
             let handle = pile.put::<SuccinctBM25Blob, _>(&idx)?;
-            // Persist the handle as a single-attribute trible
-            // under a well-known anchor id (see below), or in
-            // branch metadata.
+            // Persist the handle as a typed ordinary trible under a
+            // well-known anchor id (see below), or derive it through an
+            // explicit collection recipe.
             persist_index_handle(&mut pile, handle)?;
         }
         Cmd::Query { text } => {
@@ -165,7 +165,7 @@ multiple tokenizer flavours become multiple indexes joined
 via the query engine (`and!` / `or!`); see
 `examples/phrase_search.rs` for the two-index pattern.
 
-## Pattern: rebuild-and-replace, no mutation
+## Pattern: rebuild and publish, no mutation
 
 triblespace-search indexes are content-addressed and immutable
 by design. The `Refresh` command:
@@ -175,8 +175,8 @@ by design. The `Refresh` command:
    in CLAUDE.md).
 2. Builds a fresh `SuccinctBM25Index`.
 3. `put`s the blob — the returned handle is the index's hash.
-4. Replaces the reference in branch metadata (or a trible
-   attribute under a stable id).
+4. Publishes the typed handle as an ordinary trible, or records the derivation
+   through an explicit collection recipe.
 
 If nothing changed between refreshes, step 3 returns the same
 handle because content-addressing: the pile's blob-dedup layer
@@ -256,10 +256,10 @@ on every call.
 
 ## Open questions for faculty authors
 
-- **Where does the handle live?** Branch metadata (one reference
-  per branch), a trible under a stable id (pile-scoped), or a
-  commit attribute (version-tied)? All three work; pick based
-  on how often the index refreshes vs. how often branches move.
+- **Where does the handle live?** Direct callers may publish a typed handle as
+  an ordinary trible. Maintained projections should use a collection recipe so
+  source authority, exact-cover evidence, and artifact lifetime remain explicit
+  rather than ambient branch-head state.
 
 - **How big does the index get?** The exact-TF layout is
   corpus-dependent: posting frequency width follows the largest term

@@ -166,10 +166,10 @@ not the right lever.
 
 **Keep `RingGraph` alongside as a documented primitive.**
 Callers whose pile lives on disk / network (cold fetches
-dominate query time) or whose *branch-metadata* size is a
-hard constraint can compose it themselves. We've tested it
-across scales and round-trip, so the building block is
-stable. If a real deployment pattern surfaces, we'd add a
+dominate query time), whose transfer size is constrained, or
+who retain many immutable graph versions can compose it
+themselves. We've tested it across scales and round-trip, so
+the building block is stable. If a real deployment pattern surfaces, we'd add a
 `SuccinctRingHNSWIndex` variant that uses `RingGraph` in
 place of `SuccinctGraph` — mechanical change, mostly new
 blob-schema id.
@@ -189,10 +189,9 @@ dwarfs any graph-encoding choice.
 - **Range-filtered similarity** — "nearest neighbours of X
   whose doc-id falls in [a, b]" — wavelet-tree 2D range
   query. No plans for this yet.
-- **Branch metadata persistence** — if the index blob
-  itself is what we're optimizing for (e.g., many versions
-  stored per branch, each paying full graph size), the 2×
-  saving amortizes across versions.
+- **Versioned artifact retention** — if many immutable graph
+  versions remain reachable at once, each pays the full graph
+  size and the 2× saving amortizes across versions.
 
 ## See also
 

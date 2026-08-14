@@ -743,12 +743,9 @@ impl SimilarTo {
     /// neither `HNSWBuilder::insert` nor `FlatBuilder::insert` collapses a
     /// repeated handle — the index's handle table stores it once per
     /// insert. `candidates_above` then maps node → handle on all three
-    /// backends and hands the repeat straight through. (The index-home
-    /// rollups already know this: `HnswRollup::build` dedups by handle
-    /// before inserting, "two entities can share one content-addressed
-    /// vector", and `nearest_across` dedups across segments.) Nothing
-    /// downstream would collapse it — the engine has no head-claiming
-    /// layer, so a repeated proposal is a repeated row.
+    /// backends and hands the repeat straight through. Nothing downstream
+    /// would collapse it — the engine has no head-claiming layer, so a repeated
+    /// proposal is a repeated row.
     pub fn from_candidates(var: Variable<Handle<Embedding>>, candidates: Vec<RawInline>) -> Self {
         let mut membership = HashSet::with_capacity(candidates.len());
         let mut unique = Vec::with_capacity(candidates.len());

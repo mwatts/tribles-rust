@@ -903,8 +903,8 @@ impl SuccinctHNSWIndex {
 
     /// The content-addressed embedding handle of node `i`, or `None`
     /// if out of range. Lets callers enumerate a stored graph's nodes
-    /// (e.g. to union + rebuild several segments in an index-home
-    /// merge) without attaching a blob store.
+    /// (e.g. to union and rebuild several direct artifacts) without attaching
+    /// a blob store.
     pub fn handle(&self, i: usize) -> Option<Inline<EmbHandle>> {
         self.handles.get(i).map(|raw| Inline::new(*raw))
     }
@@ -1660,8 +1660,9 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
     }
 
     /// Exactly reconstruct the joined per-document token multisets represented
-    /// by this index. Production rollup merges stream the same raw frequencies
-    /// directly and never materialize all token bags.
+    /// by this index. This is an explicit inspection/rebuild surface; callers
+    /// that already hold exact counts should build directly rather than
+    /// materializing all token bags.
     ///
     /// Returns one `(doc_key, tokens)` row per document, `doc_key`
     /// being the raw `Inline<D>` bytes and `tokens` the exact `Inline<T>` term
@@ -1729,7 +1730,7 @@ impl std::error::Error for SuccinctLoadError {}
 /// change mints a new id. The id participates in derived typed
 /// schemas, but it is not an in-band runtime guard and changing
 /// it does not create a new Rust marker type. Persisted
-/// attributes/manifests that route handles to this reader must
+/// typed attributes or collection recipes that route handles to this reader must
 /// rotate with it; see `docs/FACULTY_INTEGRATION.md`.
 ///
 /// Retired ids:
@@ -1817,7 +1818,7 @@ impl<D: InlineEncoding, T: InlineEncoding> TryFromBlob<SuccinctBM25Blob>
 /// change mints a new id. The id participates in derived typed
 /// schemas, but it is not an in-band runtime guard and changing
 /// it does not create a new Rust marker type. Persisted
-/// attributes/manifests that route handles to this reader must
+/// typed attributes or collection recipes that route handles to this reader must
 /// rotate with it; see `docs/FACULTY_INTEGRATION.md`.
 ///
 /// Retired ids (bytes routed under these identities must not be
@@ -2236,7 +2237,7 @@ mod tests {
     // Magic/version rejection tests retired along with the
     // fields themselves. Routing is now external: a breaking
     // layout rotates the marker id and every persisted typed
-    // attribute/manifest that can hand bytes to this reader.
+    // typed attribute or collection recipe that can hand bytes to this reader.
 
     #[test]
     fn succinct_bm25_rejects_truncation() {
@@ -2476,7 +2477,7 @@ mod tests {
 
     // Magic/version rejection tests retired. Routing is now
     // external: a breaking layout rotates the marker id and every
-    // persisted typed attribute/manifest that can hand bytes to
+    // persisted typed attribute or collection recipe that can hand bytes to
     // this reader.
 
     #[test]

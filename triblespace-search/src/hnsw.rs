@@ -645,11 +645,8 @@ where
     /// entry per [`HNSWBuilder::insert`] call with no collapse. Handles
     /// are content-addressed, so two entities embedding to the same vector
     /// share one handle and both nodes surface it. Callers that need a set
-    /// must collapse — `SimilarTo::from_candidates` does,
-    /// [`nearest_across`][n] does, and `HnswRollup::build` dedups by
-    /// handle before it ever reaches a builder.
-    ///
-    /// [n]: crate::index_hnsw::nearest_across
+    /// must collapse — [`SimilarTo::from_candidates`]
+    /// does so before the candidates enter the query engine.
     #[doc(hidden)]
     pub fn candidates_above(
         &self,

@@ -118,12 +118,12 @@ or stale output.
 
 There is deliberately no high-level adaptive rollup wrapper. The removed
 `AcceleratedSuccinctRollup` mixed CPU and device execution behind a row
-threshold and a process-local circuit breaker in the legacy `IndexKind`
+threshold and a process-local circuit breaker in the former branch-index
 lifecycle. Current Apple M4 end-to-end measurement showed no useful benefit
 from retaining that policy surface.
 
 The exact `SuccinctArchiveCollection` lifecycle is instead blob-native and
-does not call an `IndexKind` merge. Accelerating it would require a separate
+does not call a branch-index merge. Accelerating it would require a separate
 direct-raw adapter that consumes and produces its canonical raw collection
 blobs; the low-level freeze backend remains available for that experiment.
 

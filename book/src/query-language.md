@@ -537,7 +537,7 @@ crate combines that automaton with graph edges to materialize an accepted
 endpoint relation, exposed through an ordinary two-variable constraint. That
 constraint composes directly with `find!`, `and!`, and `pattern!`; see
 [Regular Path Indexes](regular-path-indexes.md) for expression construction,
-the low-level automaton escape hatch, and range-native repository maintenance.
+the low-level automaton escape hatch, and exact collection maintenance.
 
 For a fixed small number of hops, explicit pattern clauses joined on `temp!`
 variables remain simpler. For unbounded traversal, use the path index or drive

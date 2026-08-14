@@ -377,12 +377,10 @@ proptest! {
 // mints a fresh, content-derived branch entity, so anything else stored
 // beside it is dropped unless deliberately carried forward.
 //
-// That carry used to name exactly one kind (`index_home::manifest_tribles`),
-// which made head metadata durable only for annotations core knew about by
-// name — a closed-world assumption in a store built on open extension. The
-// loss was invisible: an annotation could be written, read back, and then
-// vanish at the next unrelated push, with no error at the write and no trace
-// afterwards.
+// A closed-world carry list makes head metadata durable only for annotations
+// core knows about by name. The loss is invisible: an annotation can be
+// written, read back, and then vanish at the next unrelated push, with no error
+// at the write and no trace afterwards.
 //
 // This asserts the property that makes head metadata usable by anything
 // outside core — a migration record, a downstream faculty's annotation.

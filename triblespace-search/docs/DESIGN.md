@@ -314,8 +314,8 @@ them.
   costs ~3× end-to-end query latency on in-memory / warm-
   cache workloads, and at 1B corpus scale the graph is only
   ~4 % of total storage (embeddings dominate). `RingGraph`
-  stays as an opt-in primitive for disk-backed or
-  branch-metadata-heavy workloads. See
+  stays as an opt-in primitive for storage- or transfer-constrained workloads,
+  including deployments retaining many immutable graph versions. See
   [`docs/HNSW_GRAPH_ENCODING.md`](HNSW_GRAPH_ENCODING.md)
   for the full measurements and when-to-use-which.
 - **Vector quantization** — the biggest lever at scale.

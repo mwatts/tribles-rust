@@ -30,7 +30,14 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 - Collection consumers remain responsible for their domain projection and
   exact-cover evidence. They attach the selected portable elements, join once
   when the resident view changes, and query that resident view directly.
-- Direct native Succinct BM25 and range-native Succinct HNSW remain unchanged.
+- Direct native Succinct BM25, HNSW, and Succinct HNSW remain unchanged.
+
+### Unpublished branch-index persistence is removed
+
+- Removed the `HnswRollup` / `IndexKind` facade and its typed manifest
+  attributes together with Core's branch-index persistence stack. Direct
+  `HNSWBuilder`, `HNSWIndex`, `SuccinctHNSWIndex`, blob round-trips, and query
+  constraints remain the supported HNSW surfaces.
 
 ### Direct native Succinct BM25 persists exact frequencies
 
@@ -89,23 +96,6 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 - Pairwise cosine now divides by both vector norms, so exact filtering remains
   truthful even for embedding blobs that bypass the crate's normalized-ingest
   helper. Zero vectors retain similarity zero.
-
-### Range-native typed HNSW artifacts
-
-- Ported `HnswRollup` to the fallible, range-native `IndexKind` contract.
-  Prepared and stored artifacts retain their exact `SuccinctHNSWBlob` type
-  throughout put, manifest, parse, and attach paths rather than erasing blobs
-  through `UnknownBlob`.
-- Added a stable typed artifact attribute plus an intrinsic recipe descriptor.
-  HNSW identity includes its source-embedding attribute, dimension, and
-  deterministic seed, so parameter-distinct recipes coexist safely in one
-  branch manifest.
-- Empty projections now produce zero physical artifacts while retaining their
-  logical range record. Repeated typed handle facts represent repeated physical
-  artifacts on one logical range.
-- Builds now fail closed on unreadable embeddings and dimension mismatches.
-  HNSW compaction also fails when a source embedding can no longer be resolved
-  instead of certifying an incomplete merged range.
 
 ## [0.41.4] - 2026-05-17
 

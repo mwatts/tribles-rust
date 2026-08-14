@@ -119,9 +119,6 @@ pub mod capability;
 pub mod commit;
 /// Storage adapter that delegates blobs and branches to separate backends.
 pub mod hybridstore;
-/// Range-native derived-index manifests and typed artifacts.
-pub mod index_home;
-pub mod index_range;
 /// No-network lazy reader: local get, durable want on miss ([`lazy::Lazy`]).
 pub mod lazy;
 /// Fully in-memory repository implementation for tests and ephemeral use.
@@ -255,13 +252,12 @@ attributes! {
 ///
 /// # Why the carry is total
 ///
-/// This used to preserve exactly one thing: `index_home::manifest_tribles`.
-/// That made branch-head metadata durable only for the annotation kinds core
-/// knows by name — a closed-world assumption inside a store built on open
+/// Preserving only selected annotation kinds would make branch-head metadata
+/// durable under a closed-world assumption inside a store built on open
 /// extension. Anything else attached to a head (a migration record, a
-/// downstream faculty's annotation) survived until the next push and then
-/// vanished, with no error and no trace, because the loss happens in the
-/// rebuild rather than at the write.
+/// downstream faculty's annotation) would survive until the next push and then
+/// vanish, with no error and no trace, because the loss happens in the rebuild
+/// rather than at the write.
 ///
 /// So the rule is inverted: everything is carried EXCEPT the branch-head
 /// entities being replaced. Those are identified by carrying the `branch`
@@ -281,9 +277,8 @@ fn rebuild_branch_meta(
 
 /// Every fact on a branch head except the branch-head entities themselves.
 ///
-/// The complement of [`index_home::manifest_tribles`]: rather than naming
-/// the kinds worth keeping, this names the one kind being replaced and keeps
-/// the rest.
+/// Rather than naming the kinds worth keeping, this names the one kind being
+/// replaced and keeps the rest.
 fn carried_head_facts(base_meta: &TribleSet, branch_id: Id) -> TribleSet {
     branch::carried_facts(base_meta, branch_id)
         .expect("branch metadata was validated before rebuild")
@@ -1345,9 +1340,6 @@ pub enum PushError<Storage: PinStore + BlobStore> {
     BranchUpdate(Storage::UpdateError),
     /// Malformed branch metadata.
     BadBranchMetadata(),
-    /// Malformed commit metadata encountered while computing the push's
-    /// content delta for on-commit hooks.
-    BadCommitMetadata(),
     /// Merge failed while retrying a push.
     MergeError(MergeError),
 }
@@ -1425,70 +1417,6 @@ where
     Create(BranchError<Storage>),
 }
 
-/// A topologically ordered batch of source commits introduced by one push
-/// attempt. The batch carries handles only; hooks that need payloads load one
-/// commit at a time from the storage passed alongside it.
-#[derive(Debug, Clone)]
-pub struct CommitBatch {
-    /// Source branch HEAD covered by the branch metadata this push replaces.
-    pub base_head: Option<CommitHandle>,
-    /// Source branch HEAD the push is about to publish.
-    pub new_head: CommitHandle,
-    /// Newly reachable commits, parents before children and deduplicated.
-    pub commits: Vec<CommitHandle>,
-}
-
-/// An on-commit hook, run by [`Repository::try_push`] once per push
-/// attempt, after the new branch-head tribleset has been assembled and
-/// before it is CAS'd in.
-///
-/// Arguments, in order:
-///
-/// 1. `&mut Storage` — the repository's storage, for uploading derived
-///    blobs (index segments). Blobs uploaded by a losing attempt are
-///    unreferenced and content-addressed: a retry dedupes against them
-///    and GC reclaims them otherwise.
-/// 2. [`Id`] — the branch being pushed.
-/// 3. [`CommitBatch`] — every commit newly reachable from this attempt,
-///    ordered parents-first. Payloads are deliberately not unioned: hooks can
-///    build one logical leaf per source commit with bounded peak memory.
-/// 4. `&mut TribleSet` — the branch-head tribleset about to be CAS'd
-///    in. A hook folds its derived state (e.g. an index-home manifest)
-///    into this set, so commit and maintenance land in **one** atomic
-///    repoint; there is no second CAS to race.
-///
-/// Hooks run once per push *attempt*: after a CAS conflict the push
-/// merges and retries, and hooks re-run against the fresh base metadata
-/// and that attempt's delta (the mutated head tribleset of a losing
-/// attempt is discarded wholesale, so nothing a hook did leaks across
-/// attempts). Hooks must therefore be idempotent at the storage level —
-/// content-addressed blob uploads, as in
-/// [`Repository::register_index`], satisfy this for free.
-///
-/// A hook error never blocks or corrupts the commit: the hook's changes
-/// to the head tribleset are discarded, the error is recorded for
-/// [`Repository::take_hook_errors`], and the push proceeds.
-pub type CommitHook<Storage> = Box<
-    dyn FnMut(
-            &mut Storage,
-            Id,
-            &CommitBatch,
-            &mut TribleSet,
-        ) -> Result<(), Box<dyn Error + Send + Sync>>
-        + Send
-        + Sync,
->;
-
-/// A hook failure recorded (and skipped) during a push. Drained via
-/// [`Repository::take_hook_errors`].
-#[derive(Debug)]
-pub struct HookError {
-    /// The branch that was being pushed when the hook failed.
-    pub branch: Id,
-    /// The hook's error.
-    pub error: Box<dyn Error + Send + Sync>,
-}
-
 /// High-level wrapper combining a blob store and branch store into a usable
 /// repository API.
 ///
@@ -1499,12 +1427,6 @@ pub struct Repository<Storage: BlobStore + PinStore> {
     storage: Storage,
     signing_key: SigningKey,
     commit_metadata: MetadataHandle,
-    /// On-commit hooks (see [`CommitHook`]); empty by default, in which
-    /// case pushes take the plain path with zero added work.
-    hooks: Vec<CommitHook<Storage>>,
-    /// Hook failures skipped by pushes since the last
-    /// [`take_hook_errors`](Self::take_hook_errors).
-    hook_errors: Vec<HookError>,
 }
 
 /// Error returned by [`Repository::pull`].
@@ -1582,107 +1504,7 @@ where
             storage,
             signing_key,
             commit_metadata,
-            hooks: Vec::new(),
-            hook_errors: Vec::new(),
         })
-    }
-
-    /// Register an on-commit hook (see [`CommitHook`] for the contract:
-    /// arguments, per-attempt re-runs, and the skip-on-error policy).
-    ///
-    /// Hooks run in registration order inside every subsequent
-    /// [`push`](Self::push)/[`try_push`](Self::try_push) that lands a new
-    /// commit. For the common "maintain a derived index" case, prefer the
-    /// [`register_index`](Self::register_index) convenience.
-    pub fn on_commit<F>(&mut self, hook: F)
-    where
-        F: FnMut(
-                &mut Storage,
-                Id,
-                &CommitBatch,
-                &mut TribleSet,
-            ) -> Result<(), Box<dyn Error + Send + Sync>>
-            + Send
-            + Sync
-            + 'static,
-    {
-        self.hooks.push(Box::new(hook));
-    }
-
-    /// Register an [`IndexKind`](index_home::IndexKind) for automatic,
-    /// range-native on-commit maintenance. Every newly reachable commit gets
-    /// one inclusive `[commit, commit]` logical record, including contentless
-    /// merge commits and canonical empty recipe projections. A large commit
-    /// may still produce several repeated physical artifacts on that record.
-    pub fn register_index<K>(&mut self, kind: K)
-    where
-        K: index_home::IndexKind + Send + Sync + 'static,
-    {
-        self.on_commit(move |storage, _branch, batch, head_meta| {
-            let reader = storage
-                .reader()
-                .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)?;
-            index_home::validate_monotone_batch(&reader, batch.base_head, batch.new_head)?;
-            let manifest = index_home::Manifest::from_tribles(head_meta, &reader, &kind)
-                .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)?;
-            if !manifest.claims_head(batch.base_head) {
-                return Err(Box::new(index_home::CoverageMismatch {
-                    recipe: manifest.recipe(),
-                    expected: batch.base_head,
-                    actual: manifest.frontier().to_vec(),
-                }));
-            }
-
-            // All workspace blobs were uploaded before hooks run. Take one
-            // fresh snapshot and materialise exactly one commit payload at a
-            // time: strict commit-as-leaf semantics without a push-sized
-            // union in memory.
-            let reader = storage
-                .reader()
-                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-            for commit in &batch.commits {
-                let meta: TribleSet = reader
-                    .get(*commit)
-                    .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-                let content_handle = find!(
-                    (content_handle: Inline<Handle<SimpleArchive>>),
-                    pattern!(&meta, [{ content: ?content_handle }])
-                )
-                .at_most_one()
-                .map_err(|_| {
-                    Box::new(std::io::Error::other("ambiguous commit content"))
-                        as Box<dyn Error + Send + Sync>
-                })?
-                .map(|(handle,)| handle);
-                let source = if let Some(content_handle) = content_handle {
-                    reader
-                        .get(content_handle)
-                        .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)?
-                } else {
-                    TribleSet::new()
-                };
-                index_home::append_range(
-                    storage,
-                    &kind,
-                    &source,
-                    index_home::CommitRange::leaf(*commit),
-                    head_meta,
-                )
-                .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)?;
-            }
-            index_home::set_index_head(storage, &kind, head_meta, Some(batch.new_head))
-                .map_err(|error| Box::new(error) as Box<dyn Error + Send + Sync>)?;
-            Ok(())
-        });
-    }
-
-    /// Drain the hook failures recorded (and skipped) by pushes since the
-    /// last call. An entry here means a commit landed *without* that
-    /// hook's contribution — for index hooks the index is soft state and
-    /// simply missing that delta; it can be repaired by an explicit range
-    /// rebuild, never by re-writing history.
-    pub fn take_hook_errors(&mut self) -> Vec<HookError> {
-        std::mem::take(&mut self.hook_errors)
     }
 
     /// Consume the repository and return the underlying storage backend.
@@ -2023,70 +1845,13 @@ where
             .get(head_handle)
             .map_err(PushError::StorageGet)?;
 
-        let mut branch_meta = rebuild_branch_meta(
+        let branch_meta = rebuild_branch_meta(
             &workspace.signing_key,
             workspace.base_branch_id,
             branch_name,
             Some(head_.to_blob()),
             &base_branch_meta,
         );
-
-        // On-commit hooks: fold derived state (index-home segments) into
-        // the SAME branch-head tribleset this push is about to CAS in —
-        // one atomic repoint carries the commit and its index maintenance
-        // together, so hooks never race the branch pin with a second CAS.
-        // Runs once per push ATTEMPT (see [`CommitHook`] for the retry and
-        // failure contract); with no hooks registered this is a single
-        // `is_empty` check.
-        if !self.hooks.is_empty() {
-            let convert = |e: WorkspaceCheckoutError<
-                <<Storage as BlobStore>::Reader as BlobStoreGet>::GetError<UnarchiveError>,
-            >| match e {
-                WorkspaceCheckoutError::Storage(e) => PushError::StorageGet(e),
-                WorkspaceCheckoutError::BadCommitMetadata() => PushError::BadCommitMetadata(),
-            };
-
-            // Select every commit reachable from the new head but not from
-            // the base head, then order that bounded set parents-first.
-            // Hooks receive handles rather than one materialised union, so
-            // they can process one source commit at a time. Stopping on the
-            // base head's full ancestor closure matters for merge commits: a
-            // conflict-retry merge reaches old history through the caller's
-            // side, and those commits are already covered by the winner.
-            let new_commits = match workspace.base_head {
-                None => collect_reachable(workspace, head_handle).map_err(convert)?,
-                Some(base) => {
-                    let stop = collect_reachable(workspace, base).map_err(convert)?;
-                    let mut seeds = CommitSet::new();
-                    seeds.insert(&Entry::new(&head_handle.raw));
-                    collect_reachable_from_patch_until(workspace, seeds, &stop).map_err(convert)?
-                }
-            };
-            let commits = topological_commits(workspace, &new_commits).map_err(convert)?;
-            let batch = CommitBatch {
-                base_head: workspace.base_head,
-                new_head: head_handle,
-                commits,
-            };
-
-            let branch_id = workspace.base_branch_id;
-            for hook in self.hooks.iter_mut() {
-                // Per-hook atomicity: run against a scratch copy (cheap —
-                // TribleSet is persistent) so a failing hook contributes
-                // nothing instead of leaving the head half-mutated. The
-                // commit is the user's data; the hook's output is derived,
-                // re-buildable soft state — so on error we skip the hook,
-                // record it for `take_hook_errors`, and push anyway.
-                let mut scratch = branch_meta.clone();
-                match hook(&mut self.storage, branch_id, &batch, &mut scratch) {
-                    Ok(()) => branch_meta = scratch,
-                    Err(error) => self.hook_errors.push(HookError {
-                        branch: branch_id,
-                        error,
-                    }),
-                }
-            }
-        }
 
         let branch_meta_handle = self
             .storage
@@ -2730,78 +2495,6 @@ where
 // start selector. This keeps the mechanics explicit—`start..end` literally
 // walks from `end` until it hits `start`—while continuing to support selectors
 // such as `Ancestors(...)` at either boundary.
-
-/// Select commits and return them in deterministic ancestor-before-child
-/// order without loading their content blobs.
-///
-/// This is the commit-leaf traversal used by derived-index bootstrap and
-/// on-push maintenance. A commit reachable through several merge parents is
-/// returned once. Ordering between unrelated commits is deterministic but has
-/// no semantic significance.
-pub fn commits_topological<S, Blobs>(
-    ws: &mut Workspace<Blobs>,
-    selector: S,
-) -> Result<
-    Vec<CommitHandle>,
-    WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
->
-where
-    S: CommitSelector<Blobs>,
-    Blobs: BlobStore,
-{
-    let commits = selector.select(ws)?;
-    topological_commits(ws, &commits)
-}
-
-fn topological_commits<Blobs: BlobStore>(
-    ws: &mut Workspace<Blobs>,
-    commits: &CommitSet,
-) -> Result<
-    Vec<CommitHandle>,
-    WorkspaceCheckoutError<<Blobs::Reader as BlobStoreGet>::GetError<UnarchiveError>>,
-> {
-    let mut ordered = Vec::with_capacity(commits.len() as usize);
-    let mut emitted: HashSet<CommitHandle> = HashSet::new();
-
-    // Iterative post-order DFS avoids recursion depth depending on history
-    // length. Starting points and parent lists are sorted so the result is
-    // reproducible even though PATCH's ordinary iterator is intentionally
-    // unordered.
-    for raw in commits.iter_ordered() {
-        let root = Inline::new(*raw);
-        if emitted.contains(&root) {
-            continue;
-        }
-        let mut stack = vec![(root, false)];
-        while let Some((commit, expanded)) = stack.pop() {
-            if emitted.contains(&commit) {
-                continue;
-            }
-            if expanded {
-                emitted.insert(commit);
-                ordered.push(commit);
-                continue;
-            }
-
-            stack.push((commit, true));
-            let meta: TribleSet = ws.get(commit).map_err(WorkspaceCheckoutError::Storage)?;
-            let mut parents: Vec<CommitHandle> = find!(
-                (parent_: Inline<Handle<SimpleArchive>>),
-                pattern!(&meta, [{ parent: ?parent_ }])
-            )
-            .map(|(parent_,)| parent_)
-            .filter(|parent_| commits.get(&parent_.raw).is_some())
-            .filter(|parent_| !emitted.contains(parent_))
-            .collect();
-            parents.sort_unstable_by_key(|parent_| parent_.raw);
-            parents.dedup_by_key(|parent_| parent_.raw);
-            for parent_ in parents.into_iter().rev() {
-                stack.push((parent_, false));
-            }
-        }
-    }
-    Ok(ordered)
-}
 
 fn collect_reachable_from_patch<Blobs: BlobStore>(
     ws: &mut Workspace<Blobs>,

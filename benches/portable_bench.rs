@@ -9,9 +9,9 @@
 //!   `or!`, `and!`, `temp!`, `value_range`, `Pile`, `Repository`,
 //!   `Workspace::checkout`, `SuccinctArchive` — every item verified present
 //!   at both 739fd05c (2026-07-03) and 6a6a94f1 (2026-07-24). Everything
-//!   that drifted this month lives outside this surface. The LSM index-home
-//!   path is deliberately NOT here — it lives in `portable_bench_lsm.rs`
-//!   with an independent compilation fate.
+//!   that drifted this month lives outside this surface. The native exact-
+//!   Succinct collection arm is deliberately NOT here — it lives in
+//!   `portable_bench_lsm.rs` with an independent compilation fate.
 //! * *Raw samples, never a bare mean.* Minima reproduce to 0.2–1.7%; means
 //!   drift 6–15%; maxima swing 3x. We print min/p50/p95/max so the floor and
 //!   the tail are both first-class.
