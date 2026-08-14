@@ -1,0 +1,786 @@
+//! Canonical path-summary union and its derivation from `SimpleArchive`.
+//!
+//! One collection is fixed by an extrinsic dataset scope and one canonical
+//! path automaton. Its elements retain only the graph domain and direct
+//! product arcs required by that automaton; their join is exact set union.
+//! Lowering graph facts into those direct arcs is therefore a join
+//! homomorphism:
+//!
+//! ```text
+//! paths(a ∪ b) = paths(a) ⊔ paths(b)
+//! ```
+//!
+//! Transitive closure is deliberately absent from the collection law. It is
+//! performed once when a [`PathIndex`](crate::PathIndex) is materialized, so
+//! paths whose edges live in different source fragments remain discoverable.
+
+use std::error::Error;
+use std::fmt;
+
+use triblespace_core::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
+use triblespace_core::blob::{Blob, BlobEncoding};
+use triblespace_core::collection::simplearchive_union::{self, TRIBLE_SET_UNION_RECIPE_V1};
+use triblespace_core::collection::{
+    CollectionData, CollectionDerive, CollectionDescriptor, CollectionId, CollectionMerge,
+};
+use triblespace_core::id::Id;
+use triblespace_core::inline::encodings::hash::{Blake3, Hash};
+use triblespace_core::inline::Inline;
+use triblespace_core::metadata::MetaDescribe;
+use triblespace_core::trible::{Trible, TRIBLE_LEN};
+
+use crate::persistence::path_summary_recipe_id;
+use crate::{Automaton, GraphEdge, PathError, PathSummary, PathSummaryBlob, PathSummaryBlobError};
+
+/// A collection descriptor participating in a validation failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DescriptorRole {
+    /// Canonical `SimpleArchive` source of a derivation.
+    Source,
+    /// Canonical path-summary target or merge collection.
+    Target,
+}
+
+impl fmt::Display for DescriptorRole {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source => formatter.write_str("source"),
+            Self::Target => formatter.write_str("target"),
+        }
+    }
+}
+
+/// A collection element participating in a validation failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ElementRole {
+    /// `SimpleArchive` input of a derivation.
+    DeriveInput,
+    /// Path-summary output of a derivation.
+    DeriveOutput,
+    /// Canonically lower path-summary merge input.
+    MergeLow,
+    /// Canonically higher path-summary merge input.
+    MergeHigh,
+    /// Claimed path-summary merge output.
+    MergeResult,
+}
+
+impl fmt::Display for ElementRole {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DeriveInput => formatter.write_str("derive input"),
+            Self::DeriveOutput => formatter.write_str("derive output"),
+            Self::MergeLow => formatter.write_str("merge low input"),
+            Self::MergeHigh => formatter.write_str("merge high input"),
+            Self::MergeResult => formatter.write_str("merge result"),
+        }
+    }
+}
+
+/// Failure to construct one canonical path-summary collection element.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PathSummaryUnionError {
+    /// The source is not a canonical `SimpleArchive`.
+    Source(UnarchiveError),
+    /// Path-summary encoding or decoding failed.
+    Summary(PathSummaryBlobError),
+    /// Two decoded summaries could not be joined.
+    Merge(PathError),
+}
+
+impl fmt::Display for PathSummaryUnionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source(source) => write!(formatter, "invalid SimpleArchive source: {source}"),
+            Self::Summary(source) => write!(formatter, "invalid path-summary element: {source}"),
+            Self::Merge(source) => write!(formatter, "cannot join path summaries: {source}"),
+        }
+    }
+}
+
+impl Error for PathSummaryUnionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(source) => Some(source),
+            Self::Summary(source) => Some(source),
+            Self::Merge(source) => Some(source),
+        }
+    }
+}
+
+/// Failure to validate the canonical path-summary collection law.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PathSummaryUnionValidationError {
+    /// A descriptor names another blob representation.
+    WrongRepresentation {
+        /// Descriptor being checked.
+        role: DescriptorRole,
+        /// Required representation descriptor.
+        expected: Id,
+        /// Representation found in the descriptor.
+        actual: Id,
+    },
+    /// A descriptor names another semantic recipe.
+    WrongRecipe {
+        /// Descriptor being checked.
+        role: DescriptorRole,
+        /// Required recipe.
+        expected: Id,
+        /// Recipe found in the descriptor.
+        actual: Id,
+    },
+    /// A derivation crosses dataset scopes.
+    ScopeMismatch {
+        /// Source dataset scope.
+        source: Id,
+        /// Target dataset scope.
+        target: Id,
+    },
+    /// A record names another collection descriptor.
+    WrongCollection {
+        /// Record endpoint being checked.
+        role: DescriptorRole,
+        /// Descriptor required at this endpoint.
+        expected: CollectionId,
+        /// Descriptor named by the record.
+        actual: CollectionId,
+    },
+    /// Supplied bytes do not have the content identity named by the record.
+    EndpointMismatch {
+        /// Endpoint being checked.
+        role: ElementRole,
+        /// Identity named by the record.
+        expected: CollectionData,
+        /// Fresh identity computed from the supplied bytes.
+        actual: CollectionData,
+    },
+    /// Fresh canonical derivation failed.
+    Derive(PathSummaryUnionError),
+    /// Fresh canonical merge failed.
+    Merge(PathSummaryUnionError),
+    /// The claimed derivation is not the canonical lowering of its source.
+    WrongDeriveOutput,
+    /// The claimed merge result is not the canonical union of its inputs.
+    WrongMergeResult,
+}
+
+impl fmt::Display for PathSummaryUnionValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WrongRepresentation {
+                role,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "{role} collection representation {actual:X} does not match {expected:X}"
+            ),
+            Self::WrongRecipe {
+                role,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "{role} collection recipe {actual:X} does not match {expected:X}"
+            ),
+            Self::ScopeMismatch { source, target } => write!(
+                formatter,
+                "derive source scope {source:X} does not match target scope {target:X}"
+            ),
+            Self::WrongCollection {
+                role,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "record {role} collection {actual:?} does not match descriptor {expected:?}"
+            ),
+            Self::EndpointMismatch {
+                role,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "{role} identity {actual:?} does not match claimed {expected:?}"
+            ),
+            Self::Derive(source) => write!(formatter, "cannot derive path summary: {source}"),
+            Self::Merge(source) => write!(formatter, "cannot merge path summaries: {source}"),
+            Self::WrongDeriveOutput => {
+                formatter.write_str("derive output is not the canonical path summary of its input")
+            }
+            Self::WrongMergeResult => {
+                formatter.write_str("merge result is not the exact canonical union of its inputs")
+            }
+        }
+    }
+}
+
+impl Error for PathSummaryUnionValidationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Derive(source) | Self::Merge(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+
+/// Construct the path-summary collection for one dataset scope and automaton.
+///
+/// The automaton's canonical fingerprint participates in the recipe identity,
+/// so two path expressions over the same source scope form distinct target
+/// collections.
+pub fn descriptor(scope: Id, automaton: &Automaton) -> CollectionDescriptor {
+    CollectionDescriptor::new(
+        scope,
+        <PathSummaryBlob as MetaDescribe>::id(),
+        path_summary_recipe_id(automaton),
+    )
+}
+
+/// Return the canonical empty path summary for one fixed automaton.
+pub fn empty(automaton: &Automaton) -> Blob<PathSummaryBlob> {
+    let summary = PathSummary::from_edges(automaton.clone(), std::iter::empty::<GraphEdge>());
+    PathSummaryBlob::encode(&summary)
+        .expect("the fixed empty path-summary construction cannot fail")
+}
+
+/// Canonically derive one path-summary element from a `SimpleArchive`.
+pub fn derive_element(
+    source: &Blob<SimpleArchive>,
+    automaton: &Automaton,
+) -> Result<Blob<PathSummaryBlob>, PathSummaryUnionError> {
+    simplearchive_union::validate_element(source).map_err(PathSummaryUnionError::Source)?;
+    let edges = source.bytes.as_ref().chunks_exact(TRIBLE_LEN).map(|chunk| {
+        let raw: &[u8; TRIBLE_LEN] = chunk
+            .try_into()
+            .expect("validated SimpleArchive chunks have fixed trible length");
+        let trible = Trible::as_transmute_force_raw(raw)
+            .expect("validated SimpleArchive contains valid tribles");
+        GraphEdge::from(trible)
+    });
+    let summary = PathSummary::from_edges(automaton.clone(), edges);
+    PathSummaryBlob::encode(&summary).map_err(PathSummaryUnionError::Summary)
+}
+
+/// Compute the canonical union of two path-summary elements.
+pub fn join(
+    left: &Blob<PathSummaryBlob>,
+    right: &Blob<PathSummaryBlob>,
+    automaton: &Automaton,
+) -> Result<Blob<PathSummaryBlob>, PathSummaryUnionError> {
+    let left =
+        PathSummaryBlob::decode(left.clone(), automaton).map_err(PathSummaryUnionError::Summary)?;
+    let right = PathSummaryBlob::decode(right.clone(), automaton)
+        .map_err(PathSummaryUnionError::Summary)?;
+    let joined = left.merge(&right).map_err(PathSummaryUnionError::Merge)?;
+    PathSummaryBlob::encode(&joined).map_err(PathSummaryUnionError::Summary)
+}
+
+/// Validate an exact canonical `SimpleArchive -> PathSummaryBlob` mapping.
+///
+/// Both descriptor handles, both endpoint identities, dataset scope, source
+/// canonicality, and byte-exact output are checked. Authorization of source
+/// commits remains an independent collection-resolution concern.
+pub fn validate_derive(
+    source_descriptor: &CollectionDescriptor,
+    target_descriptor: &CollectionDescriptor,
+    claim: &CollectionDerive,
+    input: &Blob<SimpleArchive>,
+    output: &Blob<PathSummaryBlob>,
+    automaton: &Automaton,
+) -> Result<(), PathSummaryUnionValidationError> {
+    validate_source_descriptor(source_descriptor)?;
+    validate_target_descriptor(target_descriptor, automaton)?;
+    if source_descriptor.scope() != target_descriptor.scope() {
+        return Err(PathSummaryUnionValidationError::ScopeMismatch {
+            source: source_descriptor.scope(),
+            target: target_descriptor.scope(),
+        });
+    }
+    validate_collection(
+        DescriptorRole::Source,
+        source_descriptor.handle(),
+        claim.source(),
+    )?;
+    validate_collection(
+        DescriptorRole::Target,
+        target_descriptor.handle(),
+        claim.target(),
+    )?;
+
+    let (expected_input, expected_output) = claim.mapping();
+    validate_endpoint(ElementRole::DeriveInput, expected_input, input)?;
+    validate_endpoint(ElementRole::DeriveOutput, expected_output, output)?;
+    let expected =
+        derive_element(input, automaton).map_err(PathSummaryUnionValidationError::Derive)?;
+    if output.bytes != expected.bytes {
+        return Err(PathSummaryUnionValidationError::WrongDeriveOutput);
+    }
+    Ok(())
+}
+
+/// Validate an exact canonical path-summary union equation.
+///
+/// All endpoint identities are recomputed from supplied bytes. Both inputs
+/// are exact-decoded against the collection automaton before their freshly
+/// constructed union is compared byte-for-byte with the claimed result.
+pub fn validate_merge(
+    collection_descriptor: &CollectionDescriptor,
+    claim: &CollectionMerge,
+    low: &Blob<PathSummaryBlob>,
+    high: &Blob<PathSummaryBlob>,
+    result: &Blob<PathSummaryBlob>,
+    automaton: &Automaton,
+) -> Result<(), PathSummaryUnionValidationError> {
+    validate_target_descriptor(collection_descriptor, automaton)?;
+    validate_collection(
+        DescriptorRole::Target,
+        collection_descriptor.handle(),
+        claim.collection(),
+    )?;
+
+    let (expected_low, expected_high) = claim.inputs();
+    validate_endpoint(ElementRole::MergeLow, expected_low, low)?;
+    validate_endpoint(ElementRole::MergeHigh, expected_high, high)?;
+    validate_endpoint(ElementRole::MergeResult, claim.result(), result)?;
+
+    let expected = join(low, high, automaton).map_err(PathSummaryUnionValidationError::Merge)?;
+    if result.bytes != expected.bytes {
+        return Err(PathSummaryUnionValidationError::WrongMergeResult);
+    }
+    Ok(())
+}
+
+fn validate_source_descriptor(
+    collection_descriptor: &CollectionDescriptor,
+) -> Result<(), PathSummaryUnionValidationError> {
+    validate_descriptor_parts(
+        DescriptorRole::Source,
+        collection_descriptor,
+        <SimpleArchive as MetaDescribe>::id(),
+        TRIBLE_SET_UNION_RECIPE_V1,
+    )
+}
+
+fn validate_target_descriptor(
+    collection_descriptor: &CollectionDescriptor,
+    automaton: &Automaton,
+) -> Result<(), PathSummaryUnionValidationError> {
+    validate_descriptor_parts(
+        DescriptorRole::Target,
+        collection_descriptor,
+        <PathSummaryBlob as MetaDescribe>::id(),
+        path_summary_recipe_id(automaton),
+    )
+}
+
+fn validate_descriptor_parts(
+    role: DescriptorRole,
+    collection_descriptor: &CollectionDescriptor,
+    expected_representation: Id,
+    expected_recipe: Id,
+) -> Result<(), PathSummaryUnionValidationError> {
+    if collection_descriptor.representation() != expected_representation {
+        return Err(PathSummaryUnionValidationError::WrongRepresentation {
+            role,
+            expected: expected_representation,
+            actual: collection_descriptor.representation(),
+        });
+    }
+    if collection_descriptor.recipe() != expected_recipe {
+        return Err(PathSummaryUnionValidationError::WrongRecipe {
+            role,
+            expected: expected_recipe,
+            actual: collection_descriptor.recipe(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_collection(
+    role: DescriptorRole,
+    expected: CollectionId,
+    actual: CollectionId,
+) -> Result<(), PathSummaryUnionValidationError> {
+    if actual != expected {
+        return Err(PathSummaryUnionValidationError::WrongCollection {
+            role,
+            expected,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn validate_endpoint<S: BlobEncoding>(
+    role: ElementRole,
+    expected: CollectionData,
+    blob: &Blob<S>,
+) -> Result<(), PathSummaryUnionValidationError> {
+    let actual = data_identity(blob);
+    if actual != expected {
+        return Err(PathSummaryUnionValidationError::EndpointMismatch {
+            role,
+            expected,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn data_identity<S: BlobEncoding>(blob: &Blob<S>) -> CollectionData {
+    Inline::<Hash<Blake3>>::new(Blake3::digest(&blob.bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use triblespace_core::blob::IntoBlob;
+    use triblespace_core::id::ExclusiveId;
+    use triblespace_core::inline::RawInline;
+    use triblespace_core::metadata;
+    use triblespace_core::prelude::entity;
+    use triblespace_core::trible::TribleSet;
+
+    use crate::{PathIndex, Step, Transition};
+
+    fn id(byte: u8) -> Id {
+        Id::new([byte; 16]).unwrap()
+    }
+
+    fn label(byte: u8) -> [u8; 16] {
+        [byte; 16]
+    }
+
+    fn plus(attribute: [u8; 16]) -> Automaton {
+        Automaton::new(
+            2,
+            [0],
+            [1],
+            [
+                Transition::new(0, 1, Step::Forward(attribute)),
+                Transition::new(1, 1, Step::Forward(attribute)),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn edge_facts(source_byte: u8, target_byte: u8) -> TribleSet {
+        let source = id(source_byte);
+        let target = id(target_byte);
+        entity! { ExclusiveId::force_ref(&source) @ metadata::tag: target }.into_facts()
+    }
+
+    fn archive(facts: &TribleSet) -> Blob<SimpleArchive> {
+        facts.to_blob()
+    }
+
+    fn ordered<'a, S: BlobEncoding>(
+        left: &'a Blob<S>,
+        right: &'a Blob<S>,
+    ) -> (&'a Blob<S>, &'a Blob<S>) {
+        if data_identity(left) <= data_identity(right) {
+            (left, right)
+        } else {
+            (right, left)
+        }
+    }
+
+    #[test]
+    fn descriptor_identity_includes_scope_representation_and_automaton() {
+        let scope = id(1);
+        let first_automaton = plus(label(7));
+        let second_automaton = plus(label(8));
+        let source = simplearchive_union::descriptor(scope);
+        let first = descriptor(scope, &first_automaton);
+        let repeated = descriptor(scope, &first_automaton);
+        let second = descriptor(scope, &second_automaton);
+
+        assert_eq!(first, repeated);
+        assert_eq!(first.scope(), source.scope());
+        assert_eq!(
+            first.representation(),
+            <PathSummaryBlob as MetaDescribe>::id()
+        );
+        assert_ne!(first.representation(), source.representation());
+        assert_ne!(first.recipe(), source.recipe());
+        assert_ne!(first.recipe(), second.recipe());
+        assert_ne!(first.handle(), second.handle());
+    }
+
+    #[test]
+    fn canonical_empty_is_total_derived_bottom_and_join_identity() {
+        let automaton = plus(label(7));
+        let source_descriptor = simplearchive_union::descriptor(id(1));
+        let target_descriptor = descriptor(id(1), &automaton);
+        let source_empty = archive(&TribleSet::new());
+        let canonical_empty = empty(&automaton);
+
+        assert_eq!(canonical_empty.bytes.len(), 48);
+        let mut expected_empty = Vec::with_capacity(48);
+        expected_empty.extend_from_slice(&crate::automaton_fingerprint(&automaton).raw);
+        expected_empty.extend_from_slice(&automaton.state_count().to_le_bytes());
+        expected_empty.extend_from_slice(&0u32.to_le_bytes());
+        expected_empty.extend_from_slice(&0u64.to_le_bytes());
+        assert_eq!(canonical_empty.bytes.as_ref(), expected_empty);
+        assert_eq!(canonical_empty.get_handle(), empty(&automaton).get_handle());
+        let decoded = PathSummaryBlob::decode(canonical_empty.clone(), &automaton).unwrap();
+        assert!(decoded.vertices().is_empty());
+        assert_eq!(decoded.direct_arc_count(), 0);
+
+        let derived_empty = derive_element(&source_empty, &automaton).unwrap();
+        assert_eq!(derived_empty.bytes, canonical_empty.bytes);
+
+        // `metadata::tag` does not match the fixed label(7) transition.
+        let unmatched_source = archive(&edge_facts(2, 3));
+        let derived_unmatched = derive_element(&unmatched_source, &automaton).unwrap();
+        assert_eq!(derived_unmatched.bytes, canonical_empty.bytes);
+
+        for (input, output) in [
+            (&source_empty, &derived_empty),
+            (&unmatched_source, &derived_unmatched),
+        ] {
+            let claim = CollectionDerive::new(
+                source_descriptor.handle(),
+                target_descriptor.handle(),
+                data_identity(input),
+                data_identity(output),
+            );
+            validate_derive(
+                &source_descriptor,
+                &target_descriptor,
+                &claim,
+                input,
+                output,
+                &automaton,
+            )
+            .unwrap();
+        }
+
+        let matching_automaton = plus(metadata::tag.id().into());
+        let matching = derive_element(&archive(&edge_facts(4, 5)), &matching_automaton).unwrap();
+        let matching_empty = empty(&matching_automaton);
+        let left_identity = join(&matching_empty, &matching, &matching_automaton).unwrap();
+        let right_identity = join(&matching, &matching_empty, &matching_automaton).unwrap();
+        let idempotent = join(&matching, &matching, &matching_automaton).unwrap();
+        for joined in [left_identity, right_identity, idempotent] {
+            assert_eq!(joined.bytes, matching.bytes);
+            assert_eq!(joined.get_handle(), matching.get_handle());
+        }
+    }
+
+    #[test]
+    fn derive_and_merge_commute_and_close_cross_fragment_paths() {
+        let automaton = plus(metadata::tag.id().into());
+        let source_descriptor = simplearchive_union::descriptor(id(1));
+        let target_descriptor = descriptor(id(1), &automaton);
+        let left = archive(&edge_facts(1, 2));
+        let right = archive(&edge_facts(2, 3));
+
+        let source_union = simplearchive_union::join(&left, &right).unwrap();
+        let derive_after_source_join = derive_element(&source_union, &automaton).unwrap();
+        let derived_left = derive_element(&left, &automaton).unwrap();
+        let derived_right = derive_element(&right, &automaton).unwrap();
+        let join_after_derive = join(&derived_left, &derived_right, &automaton).unwrap();
+
+        assert_eq!(derive_after_source_join.bytes, join_after_derive.bytes);
+        assert_eq!(
+            derive_after_source_join.get_handle(),
+            join_after_derive.get_handle()
+        );
+
+        for (input, output) in [
+            (&left, &derived_left),
+            (&right, &derived_right),
+            (&source_union, &derive_after_source_join),
+        ] {
+            let claim = CollectionDerive::new(
+                source_descriptor.handle(),
+                target_descriptor.handle(),
+                data_identity(input),
+                data_identity(output),
+            );
+            validate_derive(
+                &source_descriptor,
+                &target_descriptor,
+                &claim,
+                input,
+                output,
+                &automaton,
+            )
+            .unwrap();
+        }
+
+        let (low, high) = ordered(&derived_left, &derived_right);
+        let merge = CollectionMerge::new(
+            target_descriptor.handle(),
+            data_identity(low),
+            data_identity(high),
+            data_identity(&join_after_derive),
+        );
+        validate_merge(
+            &target_descriptor,
+            &merge,
+            low,
+            high,
+            &join_after_derive,
+            &automaton,
+        )
+        .unwrap();
+
+        let summary = PathSummaryBlob::decode(join_after_derive, &automaton).unwrap();
+        let index = PathIndex::from_summary(summary).unwrap();
+        assert!(index.contains(&RawInline::from(id(1)), &RawInline::from(id(3)),));
+    }
+
+    #[test]
+    fn nullable_unmatched_domain_obeys_the_same_homomorphism() {
+        let automaton = Automaton::new(1, [0], [0], []).unwrap();
+        let source_descriptor = simplearchive_union::descriptor(id(1));
+        let target_descriptor = descriptor(id(1), &automaton);
+        let left = archive(&edge_facts(1, 2));
+        let right = archive(&edge_facts(2, 3));
+        let source_union = simplearchive_union::join(&left, &right).unwrap();
+
+        let derive_after_source_join = derive_element(&source_union, &automaton).unwrap();
+        let derived_left = derive_element(&left, &automaton).unwrap();
+        let derived_right = derive_element(&right, &automaton).unwrap();
+        let join_after_derive = join(&derived_left, &derived_right, &automaton).unwrap();
+
+        assert_eq!(derive_after_source_join.bytes, join_after_derive.bytes);
+        let derive = CollectionDerive::new(
+            source_descriptor.handle(),
+            target_descriptor.handle(),
+            data_identity(&source_union),
+            data_identity(&derive_after_source_join),
+        );
+        validate_derive(
+            &source_descriptor,
+            &target_descriptor,
+            &derive,
+            &source_union,
+            &derive_after_source_join,
+            &automaton,
+        )
+        .unwrap();
+        let (low, high) = ordered(&derived_left, &derived_right);
+        let merge = CollectionMerge::new(
+            target_descriptor.handle(),
+            data_identity(low),
+            data_identity(high),
+            data_identity(&join_after_derive),
+        );
+        validate_merge(
+            &target_descriptor,
+            &merge,
+            low,
+            high,
+            &join_after_derive,
+            &automaton,
+        )
+        .unwrap();
+
+        let summary = PathSummaryBlob::decode(join_after_derive, &automaton).unwrap();
+        assert_eq!(summary.vertices().len(), 3);
+        assert_eq!(summary.direct_arc_count(), 0);
+        let index = PathIndex::from_summary(summary).unwrap();
+        assert_eq!(index.accepted_pair_count(), 3);
+
+        let joined_with_empty = join(&empty(&automaton), &derived_left, &automaton).unwrap();
+        assert_eq!(joined_with_empty.bytes, derived_left.bytes);
+    }
+
+    #[test]
+    fn validators_reject_wrong_descriptors_endpoints_and_equations() {
+        let automaton = plus(metadata::tag.id().into());
+        let source_descriptor = simplearchive_union::descriptor(id(1));
+        let target_descriptor = descriptor(id(1), &automaton);
+        let input = archive(&edge_facts(1, 2));
+        let other_input = archive(&edge_facts(3, 4));
+        let output = derive_element(&input, &automaton).unwrap();
+        let other_output = derive_element(&other_input, &automaton).unwrap();
+
+        let wrong_equation = CollectionDerive::new(
+            source_descriptor.handle(),
+            target_descriptor.handle(),
+            data_identity(&input),
+            data_identity(&other_output),
+        );
+        assert!(matches!(
+            validate_derive(
+                &source_descriptor,
+                &target_descriptor,
+                &wrong_equation,
+                &input,
+                &other_output,
+                &automaton,
+            ),
+            Err(PathSummaryUnionValidationError::WrongDeriveOutput)
+        ));
+
+        let wrong_endpoint = CollectionDerive::new(
+            source_descriptor.handle(),
+            target_descriptor.handle(),
+            data_identity(&other_input),
+            data_identity(&output),
+        );
+        assert!(matches!(
+            validate_derive(
+                &source_descriptor,
+                &target_descriptor,
+                &wrong_endpoint,
+                &input,
+                &output,
+                &automaton,
+            ),
+            Err(PathSummaryUnionValidationError::EndpointMismatch {
+                role: ElementRole::DeriveInput,
+                ..
+            })
+        ));
+
+        let foreign_automaton = plus(label(9));
+        let foreign_target = descriptor(id(1), &foreign_automaton);
+        let foreign_claim = CollectionDerive::new(
+            source_descriptor.handle(),
+            foreign_target.handle(),
+            data_identity(&input),
+            data_identity(&output),
+        );
+        assert!(matches!(
+            validate_derive(
+                &source_descriptor,
+                &foreign_target,
+                &foreign_claim,
+                &input,
+                &output,
+                &automaton,
+            ),
+            Err(PathSummaryUnionValidationError::WrongRecipe {
+                role: DescriptorRole::Target,
+                ..
+            })
+        ));
+
+        let (low, high) = ordered(&output, &other_output);
+        let wrong_result = empty(&automaton);
+        let merge = CollectionMerge::new(
+            target_descriptor.handle(),
+            data_identity(low),
+            data_identity(high),
+            data_identity(&wrong_result),
+        );
+        assert!(matches!(
+            validate_merge(
+                &target_descriptor,
+                &merge,
+                low,
+                high,
+                &wrong_result,
+                &automaton,
+            ),
+            Err(PathSummaryUnionValidationError::WrongMergeResult)
+        ));
+    }
+}

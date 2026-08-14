@@ -49,7 +49,7 @@ impl MetaDescribe for PathSummaryBlob {
         let id: Id = id_hex!("F15A8487F9372278E10F220DC37C2888");
         entity! { ExclusiveId::force_ref(&id) @
             metadata::name: "path-summary-v2",
-            metadata::description: "Canonical fixed-header path summary: the sorted graph-term domain required by one fixed automaton followed by sorted direct product arcs. Nullable automata retain the complete supplied endpoint universe; zero-vertex summaries are represented by an absent artifact.",
+            metadata::description: "Canonical fixed-header path summary: the sorted graph-term domain required by one fixed automaton followed by sorted direct product arcs. Nullable automata retain the complete supplied endpoint universe; the 48-byte zero-vertex form is the canonical empty summary.",
             metadata::tag: metadata::KIND_BLOB_ENCODING,
         }
     }
@@ -62,8 +62,6 @@ pub enum PathSummaryBlobError {
     BadLength,
     /// The blob belongs to a different fixed automaton.
     DifferentAutomaton,
-    /// A zero-vertex summary must be represented by no artifact.
-    NoncanonicalEmpty,
     /// A non-nullable summary retained vertices outside matched-edge support.
     NoncanonicalDomain,
     /// Vertex values are not strictly increasing.
@@ -83,7 +81,6 @@ impl fmt::Display for PathSummaryBlobError {
         let message = match self {
             Self::BadLength => "path-summary blob has an invalid length",
             Self::DifferentAutomaton => "path-summary blob belongs to a different automaton",
-            Self::NoncanonicalEmpty => "a zero-vertex path summary must be absent",
             Self::NoncanonicalDomain => {
                 "a non-nullable path summary contains vertices outside matched-edge support"
             }
@@ -100,15 +97,14 @@ impl fmt::Display for PathSummaryBlobError {
 impl Error for PathSummaryBlobError {}
 
 impl PathSummaryBlob {
-    /// Encode one nonempty canonical constructional summary.
+    /// Encode one canonical constructional summary.
     ///
     /// Product arcs use full-domain `u32` ordinals on disk. A persisted
     /// nullable summary therefore still requires `|U| * |Q| <= u32::MAX`,
     /// even though materialization closes only the smaller matched support.
+    /// The empty summary is the fixed 48-byte header with zero vertices and
+    /// arcs; retaining it makes derivation a total join homomorphism.
     pub fn encode(summary: &PathSummary) -> Result<Blob<Self>, PathSummaryBlobError> {
-        if summary.vertices().is_empty() {
-            return Err(PathSummaryBlobError::NoncanonicalEmpty);
-        }
         if !summary.has_canonical_domain() {
             return Err(PathSummaryBlobError::NoncanonicalDomain);
         }
@@ -225,9 +221,6 @@ fn validate_header(
         return Err(PathSummaryBlobError::DifferentAutomaton);
     }
     let vertex_count = read_u32(bytes, 36) as usize;
-    if vertex_count == 0 {
-        return Err(PathSummaryBlobError::NoncanonicalEmpty);
-    }
     let arc_count =
         usize::try_from(read_u64(bytes, 40)).map_err(|_| PathSummaryBlobError::CapacityOverflow)?;
     let vertex_bytes = vertex_count
@@ -349,6 +342,22 @@ pub fn automaton_fingerprint(automaton: &Automaton) -> Inline<Hash<Blake3>> {
     Inline::new(Blake3::digest(&wire))
 }
 
+pub(crate) fn path_summary_recipe_fragment(automaton: &Automaton) -> Fragment {
+    let algorithm =
+        Id::from_hex(PathRollup::KIND_ID_HEX).expect("valid minted path-summary algorithm id");
+    let fingerprint = automaton_fingerprint(automaton);
+    entity! { _ @
+        metadata::tag: algorithm,
+        path_automaton_fingerprint: fingerprint,
+    }
+}
+
+pub(crate) fn path_summary_recipe_id(automaton: &Automaton) -> Id {
+    path_summary_recipe_fragment(automaton)
+        .root()
+        .expect("path-summary recipe fragment is intrinsically rooted")
+}
+
 /// Range-native direct-product summary recipe for one fixed automaton.
 #[derive(Clone, Debug)]
 pub struct PathRollup {
@@ -416,12 +425,7 @@ impl IndexKind for PathRollup {
     type StoredArtifact = Inline<Handle<PathSummaryBlob>>;
 
     fn recipe_fragment(&self) -> Fragment {
-        let algorithm = Id::from_hex(Self::KIND_ID_HEX).expect("valid minted algorithm id");
-        let fingerprint = automaton_fingerprint(&self.automaton);
-        entity! { _ @
-            metadata::tag: algorithm,
-            path_automaton_fingerprint: fingerprint,
-        }
+        path_summary_recipe_fragment(&self.automaton)
     }
 
     fn build(&self, source: &TribleSet) -> Result<Vec<Self::PreparedArtifact>, ArtifactError> {

@@ -220,6 +220,32 @@ This design also makes merge order irrelevant. `PathSummary::merge` is
 associative, commutative, and idempotent for one fixed automaton; closure is
 derived only after the summaries have been combined.
 
+### Native collection algebra
+
+`triblespace_paths::path_summary_union` exposes that law directly through the
+native collection records. `descriptor(scope, automaton)` identifies one
+target lattice by dataset scope, `PathSummaryBlob` representation, and the
+canonical automaton fingerprint. `derive_element` lowers a canonical
+`SimpleArchive` source element into direct product arcs, while `join` computes
+the canonical union of two summaries. The corresponding `validate_derive` and
+`validate_merge` functions bind every supplied blob to the record's exact
+content identity and recompute the claimed equation byte for byte.
+
+The bottom element is explicit: `empty(automaton)` is the automaton fingerprint
+and state count followed by zero vertex and arc counts, exactly 48 bytes. Thus
+lowering is total even for an empty source or a non-nullable source with no
+matching labels, and the homomorphism holds without an out-of-band “no
+artifact” case:
+
+```text
+paths(∅) = ⊥
+paths(a ∪ b) = paths(a) ⊔ paths(b)
+```
+
+This native algebra does not depend on branch heads, commit ranges, manifests,
+or `IndexHome`. It records reproducible `DERIVE` and `MERGE` evidence; closure
+still happens only when the joined summary is materialized as a `PathIndex`.
+
 ## Nullable paths and the vertex universe
 
 A nullable expression uses an accepting initial state. Its zero-hop answers are
@@ -235,8 +261,10 @@ then maps that relation back into the full universe and adds the diagonal.
 Unrelated attributes therefore do not widen the quadratic closure workspace.
 
 An entirely empty source has no graph terms and therefore no identity pairs. Its
-range still exists as a certified contentless record, but it has no
-`PathSummaryBlob` handle. “Covered and empty” is distinct from “not indexed.”
+legacy registered range still exists as a certified contentless record, but it
+has no `PathSummaryBlob` handle. The native collection form instead derives the
+explicit 48-byte bottom described above. In either representation, “covered
+and empty” is distinct from “not indexed.”
 
 ## Freshness and the trust boundary
 

@@ -79,6 +79,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Path summaries now form a native typed collection algebra.** A source
+  `SimpleArchive` collection can be lowered through an automaton-specific
+  `DERIVE` into canonical `PathSummaryBlob` elements, and exact `MERGE`
+  validation proves their byte-level set union. The 48-byte zero-vertex
+  summary is the explicit bottom for each automaton, making lowering total and
+  preserving joins across empty, nullable, and cross-fragment inputs. Closure
+  remains a separate `PathIndex` materialization step, so paths may span any
+  number of independently derived source fragments.
+
 - **Money is a first-class inline encoding, parameterised by currency, and its
   value is an exact rational.** `Currency<C>` stores a monetary amount as an
   exact `Ratio<i128>` in `ROrd256`'s encoding — the canonical continued

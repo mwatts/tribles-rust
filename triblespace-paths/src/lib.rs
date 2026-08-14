@@ -13,6 +13,7 @@ mod automaton;
 mod constraint;
 mod expr;
 mod index;
+pub mod path_summary_union;
 mod persistence;
 mod summary;
 
