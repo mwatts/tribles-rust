@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The speculative adaptive Succinct rollup wrapper is gone.** Core retains
+  the stateless `WaveletMatrixFreezeBackend` and
+  `merge_ordered_archives_with_backend` experiment seams, but no longer mixes
+  CPU and device execution behind the public `AcceleratedSuccinctRollup`, a
+  row threshold, and a process-local circuit breaker. The current Apple M4
+  end-to-end measurement showed no useful win from that legacy adapter. Native
+  GPU execution for the exact raw-Succinct collection would require a separate
+  direct-raw adapter rather than routing through the legacy `IndexKind`
+  lifecycle. Ordinary `SuccinctRollup` remains available for now.
 - **Derived collections now share one qualified exact-ticket lifecycle.**
   `collection::exact_derived::ExactDerivedCollection` supplies strict ticket
   discovery, signed-root admission, deterministic resident covers, residual
@@ -2235,9 +2244,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is scratch-atomic and failures remain drainable through `take_hook_errors`
   without blocking the source commit. Reads attach the bounded artifact set
   through `IndexHome::attach_all`. Succinct compaction structurally merges the
-  six Ring rotations with bounded working memory; its packed CPU freeze has a
-  `WaveletMatrixFreezeBackend` seam used by `AcceleratedSuccinctRollup`, whose
-  returned device failures open a circuit breaker before canonical CPU retry.
+  six Ring rotations with bounded working memory; its packed CPU freeze exposes
+  the stateless `WaveletMatrixFreezeBackend` and
+  `merge_ordered_archives_with_backend` experimental seams.
   `SuccinctRollup::union` provides cross-artifact joins through
   `UnionConstraint`. BM25 and HNSW recipes in `triblespace-search` use the same
   typed range surface.

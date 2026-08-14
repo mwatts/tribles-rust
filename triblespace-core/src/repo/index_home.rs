@@ -9,12 +9,11 @@
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
 use crate::blob::encodings::succinctarchive::{
-    merge_ordered_archives, merge_ordered_archives_with_backend, OrderedUniverse, SuccinctArchive,
-    SuccinctArchiveBlob, SuccinctArchiveRank9IndexBlob, UnionArchive, WaveletMatrixFreezeBackend,
+    merge_ordered_archives, OrderedUniverse, SuccinctArchive, SuccinctArchiveBlob,
+    SuccinctArchiveRank9IndexBlob, UnionArchive,
 };
 use crate::blob::Blob;
 use crate::find;
@@ -1219,114 +1218,6 @@ impl IndexKind for SuccinctRollup {
             return Ok(Vec::new());
         }
         let archive = merge_ordered_archives(segments);
-        Ok(vec![build_succinct_artifact(&archive)])
-    }
-}
-
-/// Succinct recipe with an optional accelerated wavelet-freeze backend.
-pub struct AcceleratedSuccinctRollup<B> {
-    backend: B,
-    min_input_rows: usize,
-    accelerator_enabled: AtomicBool,
-}
-
-impl<B> AcceleratedSuccinctRollup<B> {
-    /// Construct an accelerated recipe.
-    pub fn new(backend: B, min_input_rows: usize) -> Self {
-        Self {
-            backend,
-            min_input_rows,
-            accelerator_enabled: AtomicBool::new(true),
-        }
-    }
-
-    /// Borrow the configured backend.
-    pub fn backend(&self) -> &B {
-        &self.backend
-    }
-
-    /// Configured CPU/device input-row crossover.
-    pub fn min_input_rows(&self) -> usize {
-        self.min_input_rows
-    }
-
-    /// Whether returned accelerator failures have opened the circuit breaker.
-    pub fn accelerator_enabled(&self) -> bool {
-        self.accelerator_enabled.load(Ordering::Relaxed)
-    }
-
-    /// Re-enable accelerator attempts.
-    pub fn reset_accelerator(&self) {
-        self.accelerator_enabled.store(true, Ordering::Relaxed);
-    }
-}
-
-impl<B> IndexKind for AcceleratedSuccinctRollup<B>
-where
-    B: WaveletMatrixFreezeBackend,
-{
-    type Segment = SuccinctArchive<OrderedUniverse>;
-    type PreparedArtifact = PreparedSuccinctArtifact;
-    type StoredArtifact = StoredSuccinctArtifact;
-
-    fn recipe_fragment(&self) -> Fragment {
-        succinct_recipe_fragment()
-    }
-
-    fn build(&self, source: &TribleSet) -> Result<Vec<Self::PreparedArtifact>, ArtifactError> {
-        SuccinctRollup.build(source)
-    }
-
-    fn put<S: BlobStorePut>(
-        &self,
-        storage: &mut S,
-        artifact: Self::PreparedArtifact,
-    ) -> Result<Self::StoredArtifact, ArtifactError> {
-        SuccinctRollup.put(storage, artifact)
-    }
-
-    fn emit(&self, entity: Id, artifact: &Self::StoredArtifact) -> TribleSet {
-        SuccinctRollup.emit(entity, artifact)
-    }
-
-    fn parse<R: BlobStoreGet>(
-        &self,
-        reader: &R,
-        facts: &TribleSet,
-        entity: Id,
-    ) -> Result<Vec<Self::StoredArtifact>, ArtifactError> {
-        SuccinctRollup.parse(reader, facts, entity)
-    }
-
-    fn attach<R: BlobStoreGet>(
-        &self,
-        reader: &R,
-        artifact: &Self::StoredArtifact,
-    ) -> Result<Self::Segment, ArtifactError> {
-        SuccinctRollup.attach(reader, artifact)
-    }
-
-    fn merge(
-        &self,
-        segments: &[Self::Segment],
-    ) -> Result<Vec<Self::PreparedArtifact>, ArtifactError> {
-        if segments.is_empty() {
-            return Ok(Vec::new());
-        }
-        let input_rows = segments.iter().fold(0usize, |sum, segment| {
-            sum.saturating_add(segment.eav_c.len())
-        });
-        let archive = if input_rows >= self.min_input_rows && self.accelerator_enabled() {
-            match merge_ordered_archives_with_backend(segments, &self.backend) {
-                Ok(archive) => archive,
-                Err(_) => {
-                    self.accelerator_enabled.store(false, Ordering::Relaxed);
-                    merge_ordered_archives(segments)
-                }
-            }
-        } else {
-            merge_ordered_archives(segments)
-        };
         Ok(vec![build_succinct_artifact(&archive)])
     }
 }

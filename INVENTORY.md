@@ -65,6 +65,10 @@
   domain, EAV rows, and equal rotation scratch in memory, add a file-backed EAV
   spool plus stable radix/counting passes into the final portable sink; choose
   it structurally from representability, not a tuning threshold.
+- If exact Succinct collection maintenance is accelerated again, build and
+  measure a direct adapter over canonical raw collection blobs. Do not route it
+  through the legacy `IndexKind` lifecycle or restore an adaptive threshold and
+  process-local circuit breaker around the low-level freeze backend.
 - Reconcile the residual branch's workspace-wide rustfmt baseline (or pin the
   intended formatter toolchain): `cargo fmt --all` currently rewrites many
   unrelated files, obscuring focused query-engine diffs.

@@ -193,11 +193,15 @@ mod tests {
 
     #[cfg(feature = "wgpu")]
     #[test]
-    fn wgpu_rollup_is_send_and_sync_for_repository_hooks() {
-        use triblespace_core::repo::index_home::AcceleratedSuccinctRollup;
+    fn wgpu_freeze_is_a_send_sync_core_backend() {
+        use triblespace_core::blob::encodings::succinctarchive::WaveletMatrixFreezeBackend;
 
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<AcceleratedSuccinctRollup<WgpuWaveletFreeze>>();
+        fn assert_backend<T>()
+        where
+            T: WaveletMatrixFreezeBackend<Error = GpuFreezeError> + Send + Sync,
+        {
+        }
+        assert_backend::<WgpuWaveletFreeze>();
     }
 
     fn geometry(alphabet_size: usize, len: usize) -> Result<FreezeGeometry, GpuFreezeError> {
