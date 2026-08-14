@@ -174,6 +174,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Owned collections expose record-only authority tickets.**
+  `Collection::ticket()` returns the exact strictly verified commits signed by
+  the facade's key for its canonical descriptor, ordered by intrinsic record
+  id after one deterministic collection-record pass. It requires only
+  `CollectionStore`, opens no blob reader, and shares snapshot/materialization's
+  scoped discovery path without changing their one-pass known-prefix contract.
+
 - **Path summaries now form a native typed collection algebra.** A source
   `SimpleArchive` collection can be lowered through an automaton-specific
   `DERIVE` into canonical `PathSummaryBlob` elements, and exact `MERGE`

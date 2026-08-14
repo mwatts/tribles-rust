@@ -451,6 +451,45 @@ impl<S> Collection<S> {
 
 impl<S> Collection<S>
 where
+    S: CollectionStore,
+{
+    /// Discover the exact strictly verified commits owned by this facade.
+    ///
+    /// The returned ticket comes from one deterministic native-record view and
+    /// is ordered by intrinsic record id. Only commits naming this facade's
+    /// exact descriptor and signing key are included; foreign and invalid
+    /// commits are excluded. This operation reads no blobs and does not open a
+    /// blob-reader snapshot, so callers can freeze source authority before
+    /// deciding which representation to materialize.
+    ///
+    /// Like every [`CollectionStore`] enumeration, this is a known-prefix
+    /// observation rather than a global-latest transaction. A concurrent
+    /// commit first observed after this call appears in a later ticket.
+    pub fn ticket(
+        &mut self,
+    ) -> Result<Vec<CollectionCommit>, CollectionDiscoveryError<S::RecordsError>> {
+        let (_, commits) = self.discover_owned_commits()?;
+        Ok(commits)
+    }
+
+    fn discover_owned_commits(
+        &mut self,
+    ) -> Result<
+        (DiscoveredCollectionRecords, Vec<CollectionCommit>),
+        CollectionDiscoveryError<S::RecordsError>,
+    > {
+        let collection = self.descriptor.handle();
+        let public_key = crate::inline::Inline::new(self.signing_key.verifying_key().to_bytes());
+        let discovered =
+            discover_collection_records_scoped(&mut self.storage, collection, public_key)?;
+        let commits = discovered.commits().to_vec();
+
+        Ok((discovered, commits))
+    }
+}
+
+impl<S> Collection<S>
+where
     S: BlobStorePut + CollectionStore,
 {
     /// Publish one self-contained fragment as an independent signed commit.
@@ -503,7 +542,9 @@ where
             <S::Reader as BlobStoreGet>::GetError<Infallible>,
         >,
     > {
-        let (discovered, commits) = self.observe_owned_commits()?;
+        let (discovered, commits) = self
+            .discover_owned_commits()
+            .map_err(CollectionMaterializationError::Discovery)?;
         self.snapshot_from_observation(discovered, commits)
     }
 
@@ -544,33 +585,14 @@ where
             <S::Reader as BlobStoreGet>::GetError<Infallible>,
         >,
     > {
-        let (discovered, commits) = self.observe_owned_commits()?;
+        let (discovered, commits) = self
+            .discover_owned_commits()
+            .map_err(CollectionMaterializationError::Discovery)?;
         if commits.is_empty() {
             return Ok(TribleSet::new());
         }
         self.snapshot_from_observation(discovered, commits)
             .map(CollectionSnapshot::into_facts)
-    }
-
-    fn observe_owned_commits(
-        &mut self,
-    ) -> Result<
-        (DiscoveredCollectionRecords, Vec<CollectionCommit>),
-        CollectionMaterializationError<
-            S::RecordsError,
-            S::ReaderError,
-            <S::Reader as BlobStoreMeta>::MetaError,
-            <S::Reader as BlobStoreGet>::GetError<Infallible>,
-        >,
-    > {
-        let collection = self.descriptor.handle();
-        let public_key = crate::inline::Inline::new(self.signing_key.verifying_key().to_bytes());
-        let discovered =
-            discover_collection_records_scoped(&mut self.storage, collection, public_key)
-                .map_err(CollectionMaterializationError::Discovery)?;
-        let commits = discovered.commits().to_vec();
-
-        Ok((discovered, commits))
     }
 
     fn snapshot_from_observation(
@@ -1087,6 +1109,36 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct TicketStore {
+        records: Vec<CollectionRecord>,
+        records_calls: usize,
+    }
+
+    impl CollectionStore for TicketStore {
+        type RecordsError = Infallible;
+        type InsertError = Infallible;
+        type RecordIter<'a> = std::vec::IntoIter<Result<CollectionRecord, Infallible>>;
+
+        fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+            self.records_calls += 1;
+            Ok(self
+                .records
+                .iter()
+                .copied()
+                .map(Ok)
+                .collect::<Vec<_>>()
+                .into_iter())
+        }
+
+        fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
+            self.records.push(record);
+            self.records.sort_unstable_by_key(CollectionRecord::id);
+            self.records.dedup_by_key(|record| record.id());
+            Ok(())
+        }
+    }
+
     struct AppendAfterFirstDiscovery {
         inner: MemoryRepo,
         initially_visible: BTreeSet<Id>,
@@ -1168,6 +1220,67 @@ mod tests {
             r,
             s,
         )
+    }
+
+    #[test]
+    fn ticket_discovers_only_exact_strictly_verified_owned_commits_without_blob_access() {
+        let scope = id(1);
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let foreign_key = SigningKey::from_bytes(&[8; 32]);
+        let collection_id = simplearchive_union::descriptor(scope).handle();
+        let other_collection = simplearchive_union::descriptor(id(2)).handle();
+        let metadata = super::super::empty_metadata_handle();
+        let first =
+            CollectionCommit::sign(&signing_key, collection_id, Inline::new([10; 32]), metadata);
+        let second =
+            CollectionCommit::sign(&signing_key, collection_id, Inline::new([11; 32]), metadata);
+        let foreign_signer =
+            CollectionCommit::sign(&foreign_key, collection_id, Inline::new([12; 32]), metadata);
+        let foreign_collection = CollectionCommit::sign(
+            &signing_key,
+            other_collection,
+            Inline::new([13; 32]),
+            metadata,
+        );
+        let invalid = invalid_signature(CollectionCommit::sign(
+            &signing_key,
+            collection_id,
+            Inline::new([14; 32]),
+            metadata,
+        ));
+
+        // TicketStore deliberately implements only CollectionStore. This test
+        // cannot compile if ticket discovery acquires a BlobStore dependency.
+        let mut store = TicketStore::default();
+        for record in [
+            CollectionRecord::Commit(second),
+            CollectionRecord::Commit(foreign_signer),
+            CollectionRecord::Commit(invalid),
+            CollectionRecord::Commit(first),
+            CollectionRecord::Commit(foreign_collection),
+        ] {
+            store.insert(record).unwrap();
+        }
+        let mut collection = Collection::new(store, scope, signing_key);
+
+        let ticket = collection.ticket().unwrap();
+        let mut expected = vec![first, second];
+        expected.sort_unstable_by_key(CollectionCommit::id);
+
+        assert_eq!(ticket, expected);
+        assert_eq!(collection.storage().records_calls, 1);
+    }
+
+    #[test]
+    fn ticket_for_an_empty_collection_is_empty_without_blob_access() {
+        let mut collection = Collection::new(
+            TicketStore::default(),
+            id(1),
+            SigningKey::from_bytes(&[7; 32]),
+        );
+
+        assert!(collection.ticket().unwrap().is_empty());
+        assert_eq!(collection.storage().records_calls, 1);
     }
 
     #[test]

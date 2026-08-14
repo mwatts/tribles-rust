@@ -40,6 +40,13 @@ let exact_commits = snapshot.commits();
 let storage = collection.into_storage();
 ```
 
+When only the source authority is needed, `Collection::ticket()` performs one
+deterministic native-record discovery pass and returns the facade's exact,
+strictly verified own commits without opening a blob reader or materializing
+facts. Use `snapshot()` instead when facts, commits, and their validating reader
+must come from one coherent observed prefix; separate `ticket()` and
+`materialize()` calls are independent known-prefix observations.
+
 A collection descriptor is a canonical `SimpleArchive` containing exactly the
 dataset **scope**, blob **representation**, and algebraic **recipe**. Its
 32-byte content handle is the `CollectionId`. `COMMIT`, `MERGE`, and `DERIVE`
