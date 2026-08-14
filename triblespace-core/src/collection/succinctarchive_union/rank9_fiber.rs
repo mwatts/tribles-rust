@@ -21,7 +21,8 @@ use crate::blob::encodings::succinctarchive::{
 use crate::blob::{Blob, BlobEncoding};
 use crate::collection::exact_derived::ExactCover;
 use crate::collection::{
-    CollectionData, CollectionDerive, CollectionDescriptor, CollectionRecord, CollectionStore,
+    CollectionData, CollectionDerive, CollectionDescriptor, CollectionRecord,
+    CollectionRecordSelector, CollectionStore,
 };
 use crate::inline::encodings::hash::{Blake3, Handle, Hash};
 use crate::inline::{Inline, InlineEncoding};
@@ -416,12 +417,16 @@ impl Rank9Fiber {
         ensure: bool,
     ) -> Result<BTreeMap<CollectionData, CandidateOutputs>, Rank9FiberError> {
         let mut candidates = BTreeMap::<CollectionData, CandidateOutputs>::new();
+        let selectors = [CollectionRecordSelector::DerivePair {
+            source: self.source.handle(),
+            target: self.target.handle(),
+        }]
+        .into_iter()
+        .collect();
         let records = store
-            .records()
-            .map_err(|error| Rank9FiberError::storage("scan Rank9 DERIVEs", error))?;
+            .select_records(&selectors)
+            .map_err(|error| Rank9FiberError::storage("select Rank9 DERIVEs", error))?;
         for record in records {
-            let record =
-                record.map_err(|error| Rank9FiberError::storage("decode Rank9 DERIVE", error))?;
             let CollectionRecord::Derive(claim) = record else {
                 continue;
             };
@@ -555,14 +560,16 @@ impl Rank9Fiber {
                 (claim.id(), claim)
             })
             .collect();
+        let selectors = expected_claims
+            .keys()
+            .copied()
+            .map(CollectionRecordSelector::Id)
+            .collect();
         let mut found = BTreeSet::new();
-        let records = store
-            .records()
-            .map_err(|error| Rank9FiberError::storage("re-scan published Rank9 DERIVEs", error))?;
+        let records = store.select_records(&selectors).map_err(|error| {
+            Rank9FiberError::storage("re-select published Rank9 DERIVEs", error)
+        })?;
         for record in records {
-            let record = record.map_err(|error| {
-                Rank9FiberError::storage("decode published Rank9 DERIVE", error)
-            })?;
             if let CollectionRecord::Derive(claim) = record {
                 if expected_claims.get(&claim.id()) == Some(&claim) {
                     found.insert(claim.id());

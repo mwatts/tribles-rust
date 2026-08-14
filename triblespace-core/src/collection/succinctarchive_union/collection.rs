@@ -350,6 +350,13 @@ mod tests {
             self.repo.records()
         }
 
+        fn select_records(
+            &mut self,
+            selectors: &BTreeSet<crate::collection::CollectionRecordSelector>,
+        ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
+            self.repo.select_records(selectors)
+        }
+
         fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
             self.inserts += 1;
             self.repo.insert(record)
