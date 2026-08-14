@@ -820,17 +820,28 @@ where
             };
             members.push((data, blob));
         }
-        let union = simplearchive_union::join_many(members.iter().map(|(_, blob)| *blob)).map_err(
-            |(index, source)| {
+        let facts = match members.as_slice() {
+            [(data, blob)] => (*blob).clone().try_from_blob().map_err(|source| {
                 CollectionMaterializationError::Materialize(MaterializationError::InvalidElement {
-                    data: members[index].0,
+                    data: *data,
                     source,
                 })
-            },
-        )?;
-        let facts: TribleSet = union
-            .try_from_blob()
-            .expect("join_many emits one canonical SimpleArchive");
+            })?,
+            _ => {
+                let union = simplearchive_union::join_many(members.iter().map(|(_, blob)| *blob))
+                    .map_err(|(index, source)| {
+                    CollectionMaterializationError::Materialize(
+                        MaterializationError::InvalidElement {
+                            data: members[index].0,
+                            source,
+                        },
+                    )
+                })?;
+                union
+                    .try_from_blob()
+                    .expect("join_many emits one canonical SimpleArchive")
+            }
+        };
         Ok(CollectionSnapshot {
             facts,
             commits,

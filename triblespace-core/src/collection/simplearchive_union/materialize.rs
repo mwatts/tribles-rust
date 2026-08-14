@@ -155,15 +155,28 @@ where
             .map_err(|source| MaterializationError::Get { data, source })?;
         members.push((data, blob));
     }
-    let union = join_many(members.iter().map(|(_, blob)| blob)).map_err(|(index, source)| {
-        MaterializationError::InvalidElement {
-            data: members[index].0,
-            source,
+    match members.as_slice() {
+        [(data, blob)] => {
+            blob.clone()
+                .try_from_blob()
+                .map_err(|source| MaterializationError::InvalidElement {
+                    data: *data,
+                    source,
+                })
         }
-    })?;
-    Ok(union
-        .try_from_blob()
-        .expect("join_many emits one canonical SimpleArchive"))
+        _ => {
+            let union =
+                join_many(members.iter().map(|(_, blob)| blob)).map_err(|(index, source)| {
+                    MaterializationError::InvalidElement {
+                        data: members[index].0,
+                        source,
+                    }
+                })?;
+            Ok(union
+                .try_from_blob()
+                .expect("join_many emits one canonical SimpleArchive"))
+        }
+    }
 }
 
 #[cfg(test)]
