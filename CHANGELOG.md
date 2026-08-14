@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The SuccinctArchive example now follows the native collection lifecycle.**
+  `native_succinct_collection` publishes intrinsic fragments as independent
+  signed commits, freezes authority with a record-only ticket, and queries an
+  exact `SuccinctArchiveCollection` projection without branch hooks, manifests,
+  or a checkout. The pile re-id/rename integration test now exercises its real
+  generic contract by carrying unrelated canonical branch annotations instead
+  of depending on a Succinct-specific manifest fixture.
 - **The speculative adaptive Succinct rollup wrapper is gone.** Core retains
   the stateless `WaveletMatrixFreezeBackend` and
   `merge_ordered_archives_with_backend` experiment seams, but no longer mixes

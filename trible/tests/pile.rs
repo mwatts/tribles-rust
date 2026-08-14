@@ -741,25 +741,29 @@ fn pile_branch_create_outputs_id() {
 }
 
 #[test]
-fn reid_and_rename_preserve_typed_manifest_facts() {
+fn reid_and_rename_preserve_unrelated_branch_annotations() {
     use triblespace::prelude::blobencodings::LongString;
+    use triblespace::prelude::entity;
     use triblespace::prelude::BlobStorePut;
+    use triblespace_core::metadata;
     use triblespace_core::repo;
-    use triblespace_core::repo::index_home::{Manifest, SuccinctRollup};
 
     let dir = tempdir().unwrap();
-    let source_path = dir.path().join("manifest-source.pile");
-    let reid_path = dir.path().join("manifest-reid.pile");
+    let source_path = dir.path().join("annotation-source.pile");
+    let reid_path = dir.path().join("annotation-reid.pile");
     std::fs::File::create(&source_path).unwrap();
 
-    let manifest_facts = Manifest::new(&SuccinctRollup).unwrap().to_tribles();
+    let annotations: TribleSet = entity! {
+        metadata::tag*: [metadata::KIND_TAG, metadata::KIND_MULTI],
+    }
+    .into();
     {
         let mut pile = Pile::open(&source_path).unwrap();
         let branch_id = triblespace_core::id::genid();
         let name = pile.put::<LongString, _>("original".to_string()).unwrap();
         let mut metadata =
             repo::branch::branch_metadata(&random_signing_key(), *branch_id, name, None);
-        metadata += manifest_facts.clone();
+        metadata += annotations.clone();
         let metadata_handle = pile.put(metadata).unwrap();
         pile.update(*branch_id, None, Some(metadata_handle))
             .unwrap();
@@ -784,10 +788,7 @@ fn reid_and_rename_preserve_typed_manifest_facts() {
         let metadata_handle = pile.head(branch).unwrap().unwrap();
         let reader = pile.reader().unwrap();
         let metadata: TribleSet = reader.get(metadata_handle).unwrap();
-        assert_eq!(
-            repo::index_home::manifest_tribles(&metadata),
-            manifest_facts
-        );
+        assert!(annotations.iter().all(|fact| metadata.contains(fact)));
         drop(reader);
         pile.close().unwrap();
         branch
@@ -811,10 +812,7 @@ fn reid_and_rename_preserve_typed_manifest_facts() {
     let metadata_handle = pile.head(reid_branch).unwrap().unwrap();
     let reader = pile.reader().unwrap();
     let metadata: TribleSet = reader.get(metadata_handle).unwrap();
-    assert_eq!(
-        repo::index_home::manifest_tribles(&metadata),
-        manifest_facts
-    );
+    assert!(annotations.iter().all(|fact| metadata.contains(fact)));
     drop(reader);
     pile.close().unwrap();
 }
