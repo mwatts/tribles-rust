@@ -16,10 +16,14 @@ pub mod hash;
 pub mod iu256;
 /// Line/column source location encoding.
 pub mod linelocation;
+/// Exact monetary amounts, with the currency carried by the encoding's type.
+pub mod money;
 /// 256-bit rational number encodings (little-endian and big-endian).
 pub mod r256;
 /// Range encodings for pairs of `u128` values.
 pub mod range;
+/// Order-preserving exact rational encoding (bytes sort numerically).
+pub mod rord256;
 /// Inline UTF-8 short string encoding (up to 32 bytes).
 pub mod shortstring;
 /// TAI nanosecond interval encoding.

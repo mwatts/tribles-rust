@@ -32,6 +32,24 @@ pub struct R256LE;
 /// Both the numerator and the denominator are stored in big-endian byte order,
 /// with the numerator in the first 16 bytes and the denominator in the last 16 bytes.
 ///
+/// # Bytewise order is not numeric order
+///
+/// Big-endian here buys a *deterministic* order for indexes and protocols, not
+/// a numeric one. Comparison reaches the numerator first, so `1/1` sorts before
+/// `2/3` even though 1 > ⅔, and because the schema stores fractions reduced,
+/// the denominators of neighbouring values genuinely differ. Range queries over
+/// an `R256BE` column therefore do not return numeric ranges.
+///
+/// If you need the index to answer "greater than x", prefer a fixed-scale
+/// integer — `Currency<C>` for monetary amounts (see the `feat/money-encoding`
+/// work), [`I256BE`](crate::inline::encodings::iu256::I256BE) otherwise.
+/// `R256` is for the quantities that get *multiplied* — rates,
+/// proportions, conversion factors — where exactness under division is the
+/// point and ordering is not. For the narrow case where you need *both*, exact
+/// division and numeric range queries on the same column, see
+/// [`ROrd256`](super::rord256::ROrd256), which pays a slower encode to make the
+/// bytes sort numerically.
+///
 /// For a little-endian version, see [R256LE].
 pub struct R256BE;
 
@@ -69,7 +87,7 @@ impl MetaDescribe for R256BE {
         let mut tribles = entity! {
             ExclusiveId::force_ref(&id) @
                 metadata::name: "r256be",
-                metadata::description: "Exact ratio stored as two i128 values (numerator/denominator) in big-endian, normalized with a positive denominator. This is useful when bytewise ordering or protocol encoding matters.\n\nUse for exact fractions in ordered or interoperable formats. Prefer F64 or F256 when approximate floats are acceptable.\n\nAs with the little-endian variant, values are expected to be canonical and denominator must be non-zero.",
+                metadata::description: "Exact ratio stored as two i128 values (numerator/denominator) in big-endian, normalized with a positive denominator. This is useful when a deterministic bytewise order or protocol encoding matters.\n\nUse for exact rates, proportions, and conversion factors in interoperable formats. Prefer F64 or F256 when approximate floats are acceptable, and a fixed-scale integer (Currency for money, I256BE otherwise) when the index must answer numeric range queries. ROrd256 covers the narrow case needing both exact division and numeric range queries.\n\nBytewise order is NOT numeric order: comparison reaches the numerator first, so 1/1 sorts before 2/3. As with the little-endian variant, values are expected to be canonical and denominator must be non-zero.",
                 metadata::tag: metadata::KIND_INLINE_ENCODING,
         };
 

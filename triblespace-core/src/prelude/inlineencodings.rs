@@ -38,6 +38,8 @@ pub use crate::inline::encodings::iu256::U256BE;
 pub use crate::inline::encodings::iu256::U256LE;
 /// Re-export of [`LineLocation`].
 pub use crate::inline::encodings::linelocation::LineLocation;
+/// Re-export of [`Currency`], the per-currency monetary encoding.
+pub use crate::inline::encodings::money::Currency;
 /// Re-export of [`R256`].
 pub use crate::inline::encodings::r256::R256;
 /// Re-export of [`R256BE`].

@@ -52,6 +52,9 @@ sptr = "0.3.2"
 indxvec = "1.9.0"
 ethnum = "1.5.0"
 num-rational = "0.4.2"
+# Checked rational arithmetic for the money encoding; already in the graph
+# under num-rational, named here because `CheckedAdd`/`CheckedMul` live in it.
+num-traits = "0.2.19"
 arrayvec = "0.7.6"
 smallvec = "1.13"
 quick_cache = "0.6.9"
@@ -108,4 +111,8 @@ harness = false
 
 [[bench]]
 name = "faculty_collection_storage"
+harness = false
+
+[[bench]]
+name = "ordered_rational"
 harness = false
