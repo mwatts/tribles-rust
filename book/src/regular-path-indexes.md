@@ -30,14 +30,29 @@ For example, `friend+` means one or more forward `friend` edges:
 
 ```rust,ignore
 use triblespace::prelude::*;
+use triblespace::prelude::inlineencodings::GenId;
 use triblespace_paths::{PathExpr, PathIndex, Step};
+
+mod social {
+    use triblespace::prelude::*;
+    use triblespace::prelude::inlineencodings::{GenId, ShortString};
+
+    attributes! {
+        "A19EC1D9DD534BA9896223A457A6B9C9" as pub name: ShortString;
+        "C21DE0AA5BA3446AB886C9640BA60244" as pub friend: GenId;
+    }
+}
 
 let friend = social::friend.id().into();
 let friend_automaton = PathExpr::from(Step::Forward(friend)).plus().compile();
 
+let alice = fucid();
+let bob = fucid();
+let carol = fucid();
 let mut graph = TribleSet::new();
 graph += entity! { &alice @ social::friend: &bob };
-graph += entity! { &bob @ social::friend: &carol };
+graph += entity! { &bob @ social::friend: &carol, social::name: "Bob" };
+graph += entity! { &carol @ social::name: "Carol" };
 let paths = PathIndex::from_tribles(friend_automaton.clone(), graph.iter())?;
 ```
 
@@ -123,6 +138,8 @@ twice asks for the accepted diagonal. The relation composes directly with
 `pattern!` and every other constraint:
 
 ```rust,ignore
+let alice_value: Inline<GenId> = (&alice).to_inline();
+
 let reachable_people: Vec<(Id, String)> = find!(
     (person: Id, name: String),
     and!(
