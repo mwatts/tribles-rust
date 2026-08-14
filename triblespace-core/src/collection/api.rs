@@ -807,7 +807,7 @@ where
             }
         };
 
-        let mut facts = TribleSet::new();
+        let mut members = Vec::with_capacity(cover.len());
         for data in cover {
             let blob = if roots.contains(&data) {
                 known
@@ -818,15 +818,19 @@ where
                     .get(&data)
                     .expect("optional cover members were exact-validated")
             };
-            let blob = blob.clone();
-            let member: TribleSet = blob.try_from_blob().map_err(|source| {
+            members.push((data, blob));
+        }
+        let union = simplearchive_union::join_many(members.iter().map(|(_, blob)| *blob)).map_err(
+            |(index, source)| {
                 CollectionMaterializationError::Materialize(MaterializationError::InvalidElement {
-                    data,
+                    data: members[index].0,
                     source,
                 })
-            })?;
-            facts += member;
-        }
+            },
+        )?;
+        let facts: TribleSet = union
+            .try_from_blob()
+            .expect("join_many emits one canonical SimpleArchive");
         Ok(CollectionSnapshot {
             facts,
             commits,

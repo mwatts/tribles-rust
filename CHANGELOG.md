@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **SimpleArchive collection covers now become one query index build.**
+  Materialization validates every selected canonical member, merges their
+  sorted rows with one overlap-deduplicating k-way pass, and constructs the
+  final six-index `TribleSet` once. This removes one transient `TribleSet` and
+  PATCH union per collection leaf without changing collection semantics,
+  persisted records, physical-cover selection, or the one-member path.
 - **The destructive pile CLI requires the current reader's exact boundary.**
   `trible pile amputate <path> --truncate-to <byte-offset>` refuses a guessed
   or stale offset before mutation. Read failures now say explicitly that a

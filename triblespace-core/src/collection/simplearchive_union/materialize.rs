@@ -11,7 +11,7 @@ use crate::inline::encodings::hash::Handle;
 use crate::repo::{BlobStoreGet, BlobStoreMeta};
 use crate::trible::TribleSet;
 
-use super::{validate_descriptor, SimpleArchiveUnionValidationError};
+use super::{join_many, validate_descriptor, SimpleArchiveUnionValidationError};
 use crate::collection::{
     collection_physical_cover, CollectionData, CollectionDescriptor, CollectionSemantics,
 };
@@ -147,18 +147,23 @@ where
         });
     }
 
-    let mut facts = TribleSet::new();
+    let mut members = Vec::with_capacity(cover.cover.len());
     for data in cover.cover {
         let handle = Handle::<SimpleArchive>::from_hash(data);
         let blob: Blob<SimpleArchive> = reader
             .get(handle)
             .map_err(|source| MaterializationError::Get { data, source })?;
-        let member: TribleSet = blob
-            .try_from_blob()
-            .map_err(|source| MaterializationError::InvalidElement { data, source })?;
-        facts += member;
+        members.push((data, blob));
     }
-    Ok(facts)
+    let union = join_many(members.iter().map(|(_, blob)| blob)).map_err(|(index, source)| {
+        MaterializationError::InvalidElement {
+            data: members[index].0,
+            source,
+        }
+    })?;
+    Ok(union
+        .try_from_blob()
+        .expect("join_many emits one canonical SimpleArchive"))
 }
 
 #[cfg(test)]

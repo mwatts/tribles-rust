@@ -16,6 +16,8 @@
 //! equation until its three blobs are resident, then call
 //! [`validate_merge`](crate::collection::simplearchive_union::validate_merge).
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
@@ -372,6 +374,55 @@ pub fn join(
     let left_rows = canonical_rows(left)?;
     let right_rows = canonical_rows(right)?;
     Ok(join_canonical_rows(left, right, &left_rows, &right_rows))
+}
+
+/// Compute one canonical union over many `SimpleArchive` elements.
+///
+/// Each input is validated before output construction. The error carries the
+/// zero-based input position so callers can retain the identity of a malformed
+/// member. A heap merge keeps one current row per input and writes the result
+/// once, avoiding the intermediate archives produced by repeated two-way
+/// joins.
+pub(crate) fn join_many<'a>(
+    elements: impl IntoIterator<Item = &'a Blob<SimpleArchive>>,
+) -> Result<Blob<SimpleArchive>, (usize, UnarchiveError)> {
+    let elements: Vec<_> = elements.into_iter().collect();
+    let mut element_rows = Vec::with_capacity(elements.len());
+    for (index, element) in elements.iter().enumerate() {
+        element_rows.push(canonical_rows(element).map_err(|source| (index, source))?);
+    }
+
+    match elements.as_slice() {
+        [] => return Ok(Blob::new(Bytes::from(Vec::<[u8; TRIBLE_LEN]>::new()))),
+        [element] => return Ok(normalize_blob(element)),
+        _ => {}
+    }
+
+    let capacity = element_rows
+        .iter()
+        .try_fold(0usize, |total, rows| total.checked_add(rows.len()))
+        .unwrap_or(0);
+    let mut union = Vec::with_capacity(capacity);
+    let mut heap = BinaryHeap::new();
+    for (element, rows) in element_rows.iter().enumerate() {
+        if let Some(first) = rows.first() {
+            heap.push(Reverse((*first, element, 0usize)));
+        }
+    }
+
+    let mut previous = None;
+    while let Some(Reverse((row, element, index))) = heap.pop() {
+        if previous != Some(row) {
+            union.push(row);
+            previous = Some(row);
+        }
+        let next = index + 1;
+        if let Some(row) = element_rows[element].get(next) {
+            heap.push(Reverse((*row, element, next)));
+        }
+    }
+
+    Ok(Blob::new(Bytes::from(union)))
 }
 
 /// Validate a discovered commit as one canonical root of this collection.
@@ -1769,6 +1820,31 @@ mod tests {
         let right_associated = join(&a, &join(&b, &c).unwrap()).unwrap();
         assert_eq!(left_associated, right_associated);
         assert_eq!(left_associated.bytes.len(), 5 * TRIBLE_LEN);
+    }
+
+    #[test]
+    fn join_many_unions_overlaps_in_one_canonical_stream() {
+        let empty = archive([]);
+        let a = archive([row(1, 1, 1), row(3, 1, 3)]);
+        let b = archive([row(2, 1, 2), row(3, 1, 3)]);
+        let c = archive([row(1, 2, 4), row(4, 1, 5)]);
+
+        assert_eq!(join_many(std::iter::empty()).unwrap(), empty);
+        assert_eq!(join_many([&a]).unwrap(), a);
+
+        let expected = join(&join(&a, &b).unwrap(), &c).unwrap();
+        assert_eq!(join_many([&c, &empty, &a, &b, &a]).unwrap(), expected);
+    }
+
+    #[test]
+    fn join_many_reports_the_malformed_input_position() {
+        let valid = archive([row(1, 1, 1)]);
+        let invalid = raw_archive(vec![row(3, 1, 3), row(2, 1, 2)]);
+
+        assert_eq!(
+            join_many([&valid, &invalid, &valid]),
+            Err((1, UnarchiveError::BadCanonicalizationOrdering)),
+        );
     }
 
     #[test]
