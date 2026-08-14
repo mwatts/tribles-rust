@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Regular paths now use one exact native collection path.**
+  `PathSummaryCollection::{attach_exact, ensure_exact}` validates a frozen set
+  of signed `SimpleArchive` commits, reuses canonical source merges, target
+  merges, and derives, and closes the exact resident summary cover once into a
+  `PathIndex`. Ensuring lowers only unsupported distinct source elements,
+  publishes blobs before unsigned records without an implicit flush, and
+  re-admits through a fresh reader. The empty ticket is a no-write local
+  bottom. `PathRollup`, its range attribute, `IndexHome` attachment, repository
+  hooks, commit ranges, and manifest-specific path tests are removed; the new
+  API requires only `BlobStore + CollectionStore` and works without
+  `PinStore`.
 - **Read-only pin snapshots are now an explicit storage capability.**
   Implementing mutable `PinStore` no longer automatically satisfies
   `PinSnapshotSource`. `Pile`, `MemoryRepo`, and `Yard` opt in directly, while

@@ -7,8 +7,9 @@ materializes the accepted endpoint relation, then exposes it as an ordinary
 two-variable [`Constraint`](triblespace::core::query::Constraint).
 
 This separation keeps query-time constraints stateless. The expensive fixpoint
-is built once per graph snapshot; `find!`, `and!`, constants, and the normal
-dynamic variable ordering then treat the result like any other relation.
+is built once for one exact collection ticket; `find!`, `and!`, constants,
+and normal dynamic variable ordering then treat the result like any other
+relation.
 
 Add the companion crate alongside the facade crate:
 
@@ -23,37 +24,20 @@ triblespace-paths = "0.47"
 Most callers describe a regular path with `PathExpr`. Each leaf is a graph
 property `Step`; the expression builders add concatenation, alternatives, and
 repetition. `compile` freezes that description into the fixed, epsilon-free
-automaton consumed by `PathIndex` and `PathRollup`.
+automaton consumed by `PathIndex` and `PathSummaryCollection`.
 
 For example, `friend+` means one or more forward `friend` edges:
 
 ```rust,ignore
 use triblespace::prelude::*;
-use triblespace::prelude::inlineencodings::GenId;
 use triblespace_paths::{PathExpr, PathIndex, Step};
 
-mod social {
-    use triblespace::prelude::*;
-    use triblespace::prelude::inlineencodings::{GenId, ShortString};
-
-    attributes! {
-        "A19EC1D9DD534BA9896223A457A6B9C9" as pub name: ShortString;
-        "C21DE0AA5BA3446AB886C9640BA60244" as pub friend: GenId;
-    }
-}
-
 let friend = social::friend.id().into();
-let friend_plus = PathExpr::from(Step::Forward(friend)).plus();
-let friend_automaton = friend_plus.compile();
+let friend_automaton = PathExpr::from(Step::Forward(friend)).plus().compile();
 
-let alice = fucid();
-let bob = fucid();
-let carol = fucid();
 let mut graph = TribleSet::new();
 graph += entity! { &alice @ social::friend: &bob };
-graph += entity! { &bob @ social::friend: &carol, social::name: "Bob" };
-graph += entity! { &carol @ social::name: "Carol" };
-
+graph += entity! { &bob @ social::friend: &carol };
 let paths = PathIndex::from_tribles(friend_automaton.clone(), graph.iter())?;
 ```
 
@@ -106,7 +90,7 @@ automaton. State ids are `u32`; `compile` panics if the expression contains
 
 ## Manual automata are the low-level escape hatch
 
-Construct `Automaton` directly when importing the output of another compiler,
+Construct `Automaton` directly when importing another compiler's output or
 when a deliberately shared state topology matters, or when the language has no
 atomic step. The `friend+` expression above is equivalent to this explicit
 two-state NFA:
@@ -139,8 +123,6 @@ twice asks for the accepted diagonal. The relation composes directly with
 `pattern!` and every other constraint:
 
 ```rust,ignore
-let alice_value: Inline<GenId> = (&alice).to_inline();
-
 let reachable_people: Vec<(Id, String)> = find!(
     (person: Id, name: String),
     and!(
@@ -151,146 +133,131 @@ let reachable_people: Vec<(Id, String)> = find!(
 .collect();
 ```
 
-The index also has direct read methods when no join is needed:
-`contains`, `reachable_from`, `reaching`, `accepted_pairs`, `starts`, `ends`,
-and `diagonal`. All endpoint fibers are sorted and duplicate-free. The path
+The index also has direct read methods when no join is needed: `contains`,
+`reachable_from`, `reaching`, `accepted_pairs`, `starts`, `ends`, and
+`diagonal`. All endpoint fibers are sorted and duplicate-free. The path
 relation therefore contains one pair per accepted `(start, end)`, not one row
 per distinct route between them; ordinary query joins can still introduce bag
 multiplicity through their other witnesses.
 
-## Keep the index current with a repository
+## Persist through the native collection algebra
 
-For a durable branch, wrap the same automaton in a `PathRollup` and register it
-before the branch's first data push:
+A durable path index is identified only by a source dataset scope and one
+automaton:
 
 ```rust,ignore
-use triblespace_paths::PathRollup;
+use triblespace_paths::PathSummaryCollection;
 
-let rollup = PathRollup::new(friend_automaton);
-repo.register_index(rollup.clone());
+let path_collection =
+    PathSummaryCollection::new(source_scope, friend_automaton.clone());
 
-let branch_id = *repo.create_branch("main", None)?;
-let mut ws = repo.pull(branch_id)?;
-ws.commit(graph, "add social graph");
-repo.push(&mut ws)?;
+// `ticket` is the exact byte-identical set of signed source
+// CollectionCommit records selected by the caller.
+let paths = path_collection.ensure_exact(&mut store, &ticket)?;
 
-// Hook errors do not roll back the source commit. Surface or repair them
-// before treating the derived index as current.
-if let Some(failure) = repo.take_hook_errors().into_iter().next() {
-    return Err(failure.error);
-}
-
-// Attachment reads the branch metadata directly; no checkout is required.
-let paths = rollup.attach_exact(repo.storage_mut(), branch_id)?;
+// Read-only consumers can require an already resident exact cover.
+let same_paths = path_collection.attach_exact(&mut store, &ticket)?;
 ```
 
-`Repository::register_index` installs an on-commit hook. Each newly reachable
-commit becomes one inclusive `[commit, commit]` logical range, even when the
-commit is contentless or produces no path artifact. The range record and the
-source branch head are published together in the same branch-metadata CAS.
-`IndexHome` applies base-FANOUT LSM compaction while appending those logical
-leaves.
+Both methods require only `BlobStore + CollectionStore`; there is no
+`Repository`, `PinStore`, branch head, commit chain, manifest, registered
+hook, or range planner.
 
-Registration is not retrospective. Register before the first relevant push, or
-explicitly build and audit a covering manifest for existing history. If a hook
-fails, the source commit still lands and `Repository::take_hook_errors` records
-the failure; a later `attach_exact` then rejects the stale frontier rather than
-silently serving an old relation.
+The ticket is the authority boundary. Every commit must:
+
+- name the canonical `SimpleArchive` union collection for the supplied scope;
+- byte-match one strictly self-signed record discovered in the store; and
+- name resident canonical source data.
+
+Duplicate copies of the same commit id collapse as set input. Distinct commits
+that name identical data remain distinct provenance roots and share one
+canonical derivation. Commit metadata is intentionally outside this
+path-semantic check: callers that require metadata closure validate it while
+constructing the ticket.
+
+`attach_exact` never writes. It admits existing canonical source `MERGE`,
+path-summary `MERGE`, and source-to-target `DERIVE` equations, then requires
+both:
+
+1. the union of support on the logical target frontier is exactly the supplied
+   commit-id set; and
+2. the target frontier has a complete resident physical cover.
+
+Only then are selected summaries joined and closed once into `PathIndex`.
+
+`ensure_exact` performs the same probe, selects a deterministic resident
+physical cover of the source lattice, and lowers only cover members supporting
+at least one still-unsupported signed root. A resident source merge can
+therefore replace several leaf derivations, even when it overlaps a root that
+already has a target image. It publishes descriptor and output blobs before the
+unsigned `DERIVE` records and performs no implicit durability flush. It drops
+the old reader before those writes and calls `attach_exact` afterwards, so
+local construction never substitutes for fresh admission. Concurrent and
+repeated ensures are content-addressed and record-idempotent.
+
+An empty ticket returns the automaton-indexed bottom relation locally and
+appends nothing.
 
 ## What a persisted summary means
 
-The automaton is part of the recipe identity. Two `PathRollup`s with different
-automata have different fingerprints, manifests, and range artifacts even when
-they cover the same commits.
+The automaton fingerprint participates in the target collection descriptor.
+Two automata over the same source scope therefore inhabit different
+collections.
 
-Each nonempty range stores a canonical `PathSummaryBlob` containing only:
+Each `PathSummaryBlob` contains only:
 
-- the sorted endpoint domain required by the fixed automaton, and
+- the sorted endpoint domain required by the fixed automaton; and
 - the sorted direct arcs of the graph × automaton product.
 
-Those summaries are sparse constructional data, not independently closed path
-relations. Compaction is canonical set union. At attachment,
-`PathRollup::attach_exact` unions every live range summary and computes the
-accepted endpoint relation once over the whole union. That order is essential:
-one path may take its first edge from range A, its next edge from range B, and
-later re-enter A. Unioning closures built independently per range would miss
-such paths.
+These summaries are sparse constructional data, not independently closed path
+relations. Their join is associative, commutative, and idempotent. Closure runs
+only after the selected summaries have been joined. This order is essential: a
+path may take its first edge from source fragment A, its next edge from fragment
+B, and later re-enter A. Unioning closures built independently per fragment
+would miss such paths. Merge order remains irrelevant because closure is
+derived only after the canonical semilattice join.
 
-This design also makes merge order irrelevant. `PathSummary::merge` is
-associative, commutative, and idempotent for one fixed automaton; closure is
-derived only after the summaries have been combined.
-
-### Native collection algebra
-
-`triblespace_paths::path_summary_union` exposes that law directly through the
-native collection records. `descriptor(scope, automaton)` identifies one
-target lattice by dataset scope, `PathSummaryBlob` representation, and the
-canonical automaton fingerprint. `derive_element` lowers a canonical
-`SimpleArchive` source element into direct product arcs, while `join` computes
-the canonical union of two summaries. The corresponding `validate_derive` and
-`validate_merge` functions bind every supplied blob to the record's exact
-content identity and recompute the claimed equation byte for byte.
-
-The bottom element is explicit: `empty(automaton)` is the automaton fingerprint
-and state count followed by zero vertex and arc counts, exactly 48 bytes. Thus
-lowering is total even for an empty source or a non-nullable source with no
-matching labels, and the homomorphism holds without an out-of-band “no
-artifact” case:
+The low-level `path_summary_union` module exposes the concrete law directly.
+`descriptor(scope, automaton)` identifies one target lattice by dataset scope,
+`PathSummaryBlob` representation, and canonical automaton fingerprint.
+`derive_element` lowers one canonical `SimpleArchive` into direct product arcs,
+`join` unions two summaries, and `validate_derive` / `validate_merge` bind all
+supplied blobs to the record's exact identities and recompute the claimed
+equations byte for byte:
 
 ```text
 paths(∅) = ⊥
 paths(a ∪ b) = paths(a) ⊔ paths(b)
 ```
 
-This native algebra does not depend on branch heads, commit ranges, manifests,
-or `IndexHome`. It records reproducible `DERIVE` and `MERGE` evidence; closure
-still happens only when the joined summary is materialized as a `PathIndex`.
+The bottom is an explicit 48-byte summary: automaton fingerprint, state count,
+and zero vertex and arc counts. Derivation is therefore total even for an empty
+source or a non-nullable source with no matching labels.
 
 ## Nullable paths and the vertex universe
 
 A nullable expression uses an accepting initial state. Its zero-hop answers are
-the identity pairs `(v, v)` for the summary's complete vertex universe. The
-universe includes both endpoints of every supplied trible, even when that
-trible's attribute matches no automaton transition. Without those unmatched
-terms, a nullable index would incorrectly lose valid zero-hop answers.
+identity pairs `(v, v)` for the summary's complete vertex universe. The
+universe includes both endpoints of every supplied trible, even when its
+attribute matches no transition.
 
-Non-nullable summaries omit those unmatched endpoints entirely. Nullable
-summaries retain them as the identity universe, but the SCC and bitset closure
-still runs only over endpoints incident to matching product arcs; the index
-then maps that relation back into the full universe and adds the diagonal.
+Non-nullable summaries omit unmatched endpoints. Nullable summaries retain
+them as the identity universe, but closure runs only over endpoints incident to
+matching product arcs before mapping the relation back and adding the diagonal.
 Unrelated attributes therefore do not widen the quadratic closure workspace.
 
-An entirely empty source has no graph terms and therefore no identity pairs. Its
-legacy registered range still exists as a certified contentless record, but it
-has no `PathSummaryBlob` handle. The native collection form instead derives the
-explicit 48-byte bottom described above. In either representation, “covered
-and empty” is distinct from “not indexed.”
-
-## Freshness and the trust boundary
-
-`attach_exact` reads the branch metadata pin, source commit head, and typed
-manifest from one snapshot. It checks that the manifest claims exactly that
-head and validates every summary's canonical bytes and automaton fingerprint.
-A mismatch fails with `IndexError::StaleCoverage` or an artifact error.
-
-The hot attachment path intentionally does **not** walk the full commit DAG to
-prove that all manifest ranges form an exact cover. Metadata produced by
-`Repository::register_index` earns that trust through its monotone, same-CAS
-maintenance path. For imported, manually assembled, or otherwise untrusted
-metadata, read the `IndexHome` snapshot and call
-`Manifest::audit_exact_cover` against a blob reader before trusting it, or
-rebuild the manifest. See [Range-Native Derived Indexes](index-ranges.md) for
-the inclusive frontier and exact-cover rules.
+An entirely empty source has no graph terms and therefore no identity pairs.
+Its native collection derivation is nevertheless the explicit 48-byte bottom,
+so “covered and empty” remains distinct from “not materialized.”
 
 ## Cost model: sparse input, potentially dense answer
 
-Range summaries retain an endpoint domain and direct product arcs, so they can
-remain close to the sparse input and merge cheaply. Attachment is a different
-operation: it materializes the complete accepted endpoint relation as CSR plus
-reverse and domain views. Some regular paths accept every pair of vertices,
-making that relation Θ(|V|²). No exact materialized representation can avoid
-paying for that output, and the closure construction also uses bitset scratch
-space.
+Summaries retain an endpoint domain and direct product arcs, so they can remain
+close to sparse input and merge cheaply. Attachment is a different operation:
+it materializes the complete accepted endpoint relation as CSR plus reverse and
+domain views. Some regular paths accept every pair of vertices, making that
+relation Θ(|V|²). No exact materialized representation can avoid paying for
+that output, and the closure construction also uses bitset scratch space.
 
 The current canonical blob stores product endpoints as full-domain `u32`
 ordinals. Persisted nullable summaries consequently require
@@ -298,9 +265,8 @@ ordinals. Persisted nullable summaries consequently require
 only the smaller matched support. Crossing that format ceiling is an explicit
 error rather than ordinal truncation.
 
-Use a `PathRollup` when the automaton is stable and many queries will amortize
-attachment, or when fast membership and joins matter. For a
-one-off traversal on a large sparse graph, an application-side graph search may
-use less memory; for a fixed small number of hops, explicit `pattern!` clauses
-remain the simplest answer. The path index is a deliberate materialized-view
-trade, not a hidden lazy traversal.
+Use a native path collection when a stable automaton and repeated queries
+amortize materialization. For a one-off traversal over a large sparse graph, an
+application-side search may use less memory; for a fixed small hop count,
+explicit joined `pattern!` clauses remain simpler. The path index is a
+deliberate materialized-view trade, not a hidden lazy traversal.

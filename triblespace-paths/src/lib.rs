@@ -13,6 +13,7 @@ mod automaton;
 mod constraint;
 mod expr;
 mod index;
+mod path_collection;
 pub mod path_summary_union;
 mod persistence;
 mod summary;
@@ -21,9 +22,9 @@ pub use automaton::{Automaton, AutomatonError, StateId, Step, Transition};
 pub use constraint::PathConstraint;
 pub use expr::PathExpr;
 pub use index::PathIndex;
+pub use path_collection::{PathSummaryCollection, PathSummaryCollectionError};
 pub use persistence::{
-    automaton_fingerprint, path_automaton_fingerprint, seg_path_summary, PathRollup,
-    PathSummaryBlob, PathSummaryBlobError,
+    automaton_fingerprint, path_automaton_fingerprint, PathSummaryBlob, PathSummaryBlobError,
 };
 pub use summary::{GraphEdge, PathError, PathSummary};
 
