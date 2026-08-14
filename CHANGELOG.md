@@ -53,19 +53,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only the missing canonical cache endpoints and is write-free again once the
   exact fibers are resident.
 
+  The five-operation algebra now returns one typed
+  `ExactAlgebraError::{Fatal, Capacity}`. `Capacity` is reserved for
+  deterministic fixed-representation geometry, never transient allocation,
+  I/O, or malformed persisted bytes. When a selected source upper exceeds that
+  geometry, completion excludes it and globally replans the physical cover
+  under the same read/resolution snapshot, caching successful images but
+  publishing only the final feasible plan. An indispensable signed source leaf
+  reports an explicit unrepresentable cover with zero writes. Succinct raw
+  construction and merge preserve typed input-versus-union-growth phases, and
+  path-summary unions distinguish persisted decode failures from fresh encode
+  capacity.
+
   Explicit native target compaction is now available through the generic
   `collection::exact_target_compaction::compact_exact_target` producer and the
   thin `SuccinctArchiveCollection::compact_exact` facade. Its fixed policy
   repeatedly joins the two lowest content handles in the lowest colliding
   dyadic serialized-byte tier, puts and verifies the target descriptor and all
   canonical result blobs before topologically ordered unsigned `MERGE` records,
-  and freshly re-admits every round under the same exact ticket. Stable covers
-  add no writes; repeated and concurrent work is content-addressed and
-  idempotent; no flush, planner, manifest, receipt, retention root, background
-  task, or authority record is introduced. Rank9 fibers are built only for the
-  final selected raw cover, never for compacted-away leaves; each raw shard
-  retains the explicit `u32::MAX` row/domain boundary, and the legacy
-  `SuccinctRollup` remains available unchanged.
+  and freshly re-admits every published round under the same exact ticket. A
+  capacity failure retires only the lower input for that planning round, so the
+  higher input remains eligible for another deterministic pair and every
+  attempt shrinks the active set. A no-claim round returns a capacity-stable
+  cover (which may retain a tier collision) with zero writes. Repeated and
+  concurrent work is content-addressed and idempotent; no flush, planner,
+  manifest, receipt, retention root, background task, or authority record is
+  introduced. Rank9 fibers are built only for the final selected raw cover,
+  never for compacted-away leaves; each raw shard retains the explicit
+  `u32::MAX` row/domain boundary, and the legacy `SuccinctRollup` remains
+  available unchanged.
 - **Regular paths now use one exact native collection path.**
   `PathSummaryCollection::{attach_exact, ensure_exact}` validates a frozen set
   of signed `SimpleArchive` commits, reuses canonical source merges, target

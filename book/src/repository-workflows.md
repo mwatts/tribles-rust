@@ -153,7 +153,13 @@ outputs before `DERIVE` records, drops the old reader before writing, and then
 re-admits through a fresh reader. It neither signs a new root nor flushes the
 store. An empty ticket performs no storage I/O and receives one process-local
 empty query shard; a signed commit whose source data happens to be empty still
-has ordinary persisted derivation provenance.
+has ordinary persisted derivation provenance. If one selected source upper is
+too large for the fixed target representation, ensuring excludes that physical
+member and globally recomputes the source cover under the same reader and
+resolved semantics. Successful images are reused across replans, while only
+the final feasible cover is published. A signed source leaf that has no finer
+representable cover returns an explicit unrepresentable-cover error and writes
+nothing.
 
 Once that raw cover is fixed, the facade attaches one source-bound Rank9
 sidecar per selected member. These fibers live in a separate collection
@@ -183,13 +189,17 @@ index bytes.
 `compact_exact` first performs ordinary exact completion, then groups the
 admitted canonical raw target members into fixed dyadic serialized-byte tiers.
 It repeatedly joins the two lowest content handles in the lowest colliding
-tier until at most one member remains per tier. The target descriptor and every
-canonical result blob are put before any topologically ordered unsigned
-`MERGE` record; no flush, manifest, receipt, level record, retention root, or
-new authority is implied. A fresh exact attachment checks each round under the
-same ticket. For any observed cover, repeated or concurrent calls choose the
-same content-addressed results and intrinsic record IDs, making retries
-idempotent.
+tier. If that fixed representation cannot encode a pair, the lower member is
+retired for the round while the higher member remains eligible for the next
+deterministic pair. Every attempt therefore shrinks the active set, and a
+capacity-stable result may deliberately retain members in the same tier. A
+round is staged completely before publication: if no join succeeds, it writes
+nothing; otherwise the target descriptor and every canonical result blob are
+put before any topologically ordered unsigned `MERGE` record. No flush,
+manifest, receipt, level record, retention root, or new authority is implied.
+A fresh exact attachment checks each published round under the same ticket.
+For any observed cover, repeated or concurrent calls choose the same
+content-addressed results and intrinsic record IDs, making retries idempotent.
 
 Unsigned equations remain reproducible cache evidence rather than durable
 receipts or authority. Their intermediate blobs need not remain resident:
@@ -205,8 +215,11 @@ The facade never schedules compaction in the background. Rank9 fibers add no
 signed root, receipt, manifest, retention root, durability flush, policy knob,
 or target-side compactor; explicit compaction first selects the raw cover and
 then builds fibers only for those selected members. The raw format's per-shard
-`u32::MAX` row and domain limits still apply, so an unrepresentable canonical
-join fails rather than silently weakening the tier guarantee.
+`u32::MAX` row and domain limits still apply. Capacity is a typed construction
+outcome: source completion falls back to finer exact members, while target
+maintenance returns a deterministic capacity-stable colliding cover when no
+further representable join exists. Persisted malformed or noncanonical bytes
+remain fatal and never acquire this fallback meaning.
 `SuccinctRollup` remains available unchanged for code that still uses its
 legacy lifecycle.
 

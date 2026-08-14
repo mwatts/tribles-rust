@@ -17,10 +17,10 @@ use std::fmt;
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::succinctarchive::{
     OrderedUniverse, SuccinctArchive, SuccinctArchiveBlob, SuccinctArchiveRank9IndexBlob,
-    UnionArchive,
+    SuccinctArchiveRawBuildError, SuccinctArchiveRawMergeError, UnionArchive,
 };
 use crate::collection::exact_derived::{
-    ExactDerivedAlgebra, ExactDerivedCollection, ExactDerivedCollectionError,
+    ExactAlgebraError, ExactDerivedAlgebra, ExactDerivedCollection, ExactDerivedCollectionError,
 };
 use crate::collection::exact_target_compaction::{
     compact_exact_target, ExactTargetCompactionError,
@@ -221,52 +221,85 @@ impl SuccinctArchiveCollection {
     }
 }
 
+fn fatal_algebra_error(error: impl fmt::Display) -> ExactAlgebraError {
+    ExactAlgebraError::Fatal(error.to_string())
+}
+
+fn classify_raw_build_error(error: SuccinctArchiveRawBuildError) -> ExactAlgebraError {
+    match error {
+        SuccinctArchiveRawBuildError::TooManyRows(_)
+        | SuccinctArchiveRawBuildError::DomainTooWide(_) => {
+            ExactAlgebraError::Capacity(error.to_string())
+        }
+        SuccinctArchiveRawBuildError::Source(_) | SuccinctArchiveRawBuildError::Construction(_) => {
+            fatal_algebra_error(error)
+        }
+    }
+}
+
+fn classify_raw_merge_error(error: SuccinctArchiveRawMergeError) -> ExactAlgebraError {
+    match error {
+        SuccinctArchiveRawMergeError::DomainTooWide | SuccinctArchiveRawMergeError::TooManyRows => {
+            ExactAlgebraError::Capacity(error.to_string())
+        }
+        SuccinctArchiveRawMergeError::InvalidInput { .. }
+        | SuccinctArchiveRawMergeError::Construction(_) => fatal_algebra_error(error),
+    }
+}
+
 impl ExactDerivedAlgebra<SimpleArchive, SuccinctArchiveBlob> for SuccinctArchiveCollection {
     fn validate_source(
         &self,
         descriptor: &CollectionDescriptor,
         source: &crate::blob::Blob<SimpleArchive>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ExactAlgebraError> {
         if *descriptor != self.source_descriptor() {
-            return Err("source descriptor does not match this Succinct collection".to_owned());
+            return Err(ExactAlgebraError::Fatal(
+                "source descriptor does not match this Succinct collection".to_owned(),
+            ));
         }
-        simplearchive_union::validate_element(source).map_err(|error| error.to_string())
+        simplearchive_union::validate_element(source).map_err(fatal_algebra_error)
     }
 
     fn validate_target(
         &self,
         descriptor: &CollectionDescriptor,
         target: &crate::blob::Blob<SuccinctArchiveBlob>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ExactAlgebraError> {
         if *descriptor != self.descriptor() {
-            return Err("target descriptor does not match this Succinct collection".to_owned());
+            return Err(ExactAlgebraError::Fatal(
+                "target descriptor does not match this Succinct collection".to_owned(),
+            ));
         }
+        // This is proof of one already-persisted artifact, not construction of
+        // a larger union. Any failure is malformed/noncanonical input and must
+        // remain fatal even if its decoder reports capacity-shaped metadata.
         SuccinctArchiveBlob::merge(std::slice::from_ref(target))
             .map(|_| ())
-            .map_err(|error| error.to_string())
+            .map_err(fatal_algebra_error)
     }
 
     fn join_source(
         &self,
         low: &crate::blob::Blob<SimpleArchive>,
         high: &crate::blob::Blob<SimpleArchive>,
-    ) -> Result<crate::blob::Blob<SimpleArchive>, String> {
-        simplearchive_union::join(low, high).map_err(|error| error.to_string())
+    ) -> Result<crate::blob::Blob<SimpleArchive>, ExactAlgebraError> {
+        simplearchive_union::join(low, high).map_err(fatal_algebra_error)
     }
 
     fn derive(
         &self,
         source: &crate::blob::Blob<SimpleArchive>,
-    ) -> Result<crate::blob::Blob<SuccinctArchiveBlob>, String> {
-        super::derive_element(source).map_err(|error| error.to_string())
+    ) -> Result<crate::blob::Blob<SuccinctArchiveBlob>, ExactAlgebraError> {
+        super::derive_element(source).map_err(classify_raw_build_error)
     }
 
     fn join_target(
         &self,
         low: &crate::blob::Blob<SuccinctArchiveBlob>,
         high: &crate::blob::Blob<SuccinctArchiveBlob>,
-    ) -> Result<crate::blob::Blob<SuccinctArchiveBlob>, String> {
-        super::join(low, high).map_err(|error| error.to_string())
+    ) -> Result<crate::blob::Blob<SuccinctArchiveBlob>, ExactAlgebraError> {
+        super::join(low, high).map_err(classify_raw_merge_error)
     }
 }
 
@@ -295,6 +328,33 @@ mod tests {
     use crate::repo::pile::{Pile, WantRewritePolicy};
     use crate::repo::{BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut, RetentionRoots};
     use crate::trible::{Trible, TribleSet, TRIBLE_LEN};
+
+    #[test]
+    fn exact_succinct_capacity_classification_is_typed_and_contextual() {
+        assert!(matches!(
+            classify_raw_build_error(SuccinctArchiveRawBuildError::TooManyRows(usize::MAX)),
+            ExactAlgebraError::Capacity(_)
+        ));
+        assert!(matches!(
+            classify_raw_build_error(SuccinctArchiveRawBuildError::DomainTooWide(usize::MAX)),
+            ExactAlgebraError::Capacity(_)
+        ));
+        assert!(matches!(
+            classify_raw_merge_error(SuccinctArchiveRawMergeError::DomainTooWide),
+            ExactAlgebraError::Capacity(_)
+        ));
+        assert!(matches!(
+            classify_raw_merge_error(SuccinctArchiveRawMergeError::TooManyRows),
+            ExactAlgebraError::Capacity(_)
+        ));
+
+        let collection = SuccinctArchiveCollection::new(Id::new([1; 16]).unwrap());
+        let malformed = Blob::<SuccinctArchiveBlob>::new(Bytes::from(vec![0u8; 1]));
+        assert!(matches!(
+            collection.validate_target(&collection.descriptor(), &malformed),
+            Err(ExactAlgebraError::Fatal(_))
+        ));
+    }
 
     /// Compile-time proof that the native API has no PinStore requirement.
     #[derive(Default)]

@@ -21,7 +21,7 @@ use std::fmt;
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::succinctarchive::{
-    SuccinctArchiveBlob, SuccinctArchiveError, SuccinctArchiveRawBuildError,
+    SuccinctArchiveBlob, SuccinctArchiveRawBuildError, SuccinctArchiveRawMergeError,
 };
 use crate::blob::{Blob, BlobEncoding};
 use crate::id::Id;
@@ -175,7 +175,7 @@ pub enum SuccinctArchiveUnionValidationError {
     /// The SimpleArchive source could not be canonically converted.
     SourceBuild(SuccinctArchiveRawBuildError),
     /// Raw merge-input validation or canonical union construction failed.
-    RawMerge(SuccinctArchiveError),
+    RawMerge(SuccinctArchiveRawMergeError),
     /// The claimed derivation is not the canonical conversion of its source.
     WrongDeriveOutput,
     /// The claimed merge result is not the canonical union of its inputs.
@@ -282,7 +282,7 @@ pub fn derive_element(
 pub fn join(
     left: &Blob<SuccinctArchiveBlob>,
     right: &Blob<SuccinctArchiveBlob>,
-) -> Result<Blob<SuccinctArchiveBlob>, SuccinctArchiveError> {
+) -> Result<Blob<SuccinctArchiveBlob>, SuccinctArchiveRawMergeError> {
     SuccinctArchiveBlob::merge(&[left.clone(), right.clone()])
 }
 

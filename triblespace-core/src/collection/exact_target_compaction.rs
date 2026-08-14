@@ -17,8 +17,8 @@ use crate::inline::InlineEncoding;
 use crate::repo::{BlobStore, BlobStoreMeta, BlobStorePut};
 
 use super::exact_derived::{
-    fresh_data_identity, ExactCover, ExactDerivedAlgebra, ExactDerivedCollection,
-    ExactDerivedCollectionError,
+    fresh_data_identity, ExactAlgebraError, ExactCover, ExactDerivedAlgebra,
+    ExactDerivedCollection, ExactDerivedCollectionError,
 };
 use super::{
     CollectionCommit, CollectionData, CollectionDescriptor, CollectionId, CollectionMerge,
@@ -154,17 +154,22 @@ impl From<ExactDerivedCollectionError> for ExactTargetCompactionError {
 /// The fixed policy assigns each canonical target blob to
 /// `floor(log2(max(1, serialized_len)))`, then repeatedly joins the two lowest
 /// content handles in the lowest colliding tier. A stable cover therefore has
-/// at most one physical member per dyadic byte-size tier. No policy knobs,
-/// manifest, receipt, signed record, retention record, or implicit flush are
-/// involved.
+/// at most one physical member per dyadic byte-size tier, except when a fixed
+/// representation cannot encode the join. Such a capacity-stable cover may
+/// retain colliding members: the lower member is retired for that planning
+/// round while the higher member remains eligible for the next pair. Every
+/// attempt shrinks the active set, so a round attempts at most `n - 1` pairs.
+/// No policy knobs, manifest, receipt, signed record, retention record, or
+/// implicit flush are involved.
 ///
-/// Each maintenance round drops the admission reader, stores the target
-/// descriptor, and computes its deterministic carry while storing each result.
-/// Only after the full carry succeeds are its topologically ordered `MERGE`
-/// records inserted, so every result blob precedes the first equation. A fresh
-/// read pass then admits the result. Freshly selected covers are compacted again
-/// when concurrent or older evidence exposes another collision. Repetition of
-/// any unstable canonical cover returns [`ExactTargetCompactionError::Stalled`].
+/// Each maintenance round first stages its complete deterministic carry in
+/// memory. Fatal construction errors and rounds with no successful claim write
+/// nothing. Otherwise, after the admission reader has been dropped, the target
+/// descriptor and every staged result are stored before the topologically
+/// ordered `MERGE` records. A fresh read pass then admits the result. Freshly
+/// selected covers are compacted again when concurrent or older evidence
+/// exposes another collision. Repetition of any non-capacity-stable canonical
+/// cover returns [`ExactTargetCompactionError::Stalled`].
 pub fn compact_exact_target<S, Source, Target, A>(
     exact: &ExactDerivedCollection<Source, Target>,
     store: &mut S,
@@ -189,7 +194,10 @@ where
             return Ok(cover);
         }
 
-        publish_round(exact.target_descriptor(), store, cover, algebra)?;
+        match publish_round(exact.target_descriptor(), store, cover, algebra)? {
+            RoundOutcome::Published => {}
+            RoundOutcome::CapacityStable(cover) => return Ok(cover),
+        }
         cover = exact.attach_exact(store, ticket, algebra)?;
         let identity = cover_identity(&cover);
         if !seen.insert(identity.clone()) {
@@ -214,12 +222,17 @@ fn has_tier_collision<Target: BlobEncoding>(cover: &ExactCover<Target>) -> bool 
         .any(|(_, blob)| !tiers.insert(target_tier(blob)))
 }
 
+enum RoundOutcome<Target: BlobEncoding> {
+    Published,
+    CapacityStable(ExactCover<Target>),
+}
+
 fn publish_round<S, Source, Target, A>(
     descriptor: CollectionDescriptor,
     store: &mut S,
     cover: ExactCover<Target>,
     algebra: &A,
-) -> Result<(), ExactTargetCompactionError>
+) -> Result<RoundOutcome<Target>, ExactTargetCompactionError>
 where
     S: BlobStorePut + CollectionStore,
     Source: BlobEncoding,
@@ -227,25 +240,15 @@ where
     Handle<Target>: InlineEncoding,
     A: ExactDerivedAlgebra<Source, Target> + ?Sized,
 {
-    let expected_descriptor = descriptor.handle();
-    let actual_descriptor = store
-        .put::<SimpleArchive, _>(CollectionDescriptor::to_blob(&descriptor))
-        .map_err(|error| ExactTargetCompactionError::storage("store target descriptor", error))?;
-    if actual_descriptor != expected_descriptor {
-        return Err(ExactTargetCompactionError::NonCanonicalDescriptorPut {
-            expected: expected_descriptor,
-            actual: actual_descriptor,
-        });
-    }
-
     let mut tiers = BTreeMap::<u32, BTreeMap<CollectionData, Blob<Target>>>::new();
     let mut locations = BTreeMap::<CollectionData, u32>::new();
-    for (data, blob) in cover.into_members() {
+    for (data, blob) in cover.members().iter().cloned() {
         let tier = target_tier(&blob);
         locations.insert(data, tier);
         tiers.entry(tier).or_default().insert(data, blob);
     }
 
+    let mut outputs = BTreeMap::<CollectionData, Blob<Target>>::new();
     let mut claims = Vec::<CollectionMerge>::new();
     loop {
         let Some(tier) = tiers
@@ -263,35 +266,40 @@ where
         locations.remove(&low_data);
         locations.remove(&high_data);
 
-        let constructed = algebra.join_target(&low, &high).map_err(|reason| {
-            ExactTargetCompactionError::Merge {
-                low: low_data,
-                high: high_data,
-                reason,
+        let constructed = match algebra.join_target(&low, &high) {
+            Ok(constructed) => constructed,
+            Err(ExactAlgebraError::Fatal(reason)) => {
+                return Err(ExactTargetCompactionError::Merge {
+                    low: low_data,
+                    high: high_data,
+                    reason,
+                });
             }
-        })?;
+            Err(ExactAlgebraError::Capacity(_)) => {
+                locations.insert(high_data, tier);
+                tiers.entry(tier).or_default().insert(high_data, high);
+                continue;
+            }
+        };
         let result_data = fresh_data_identity(&constructed);
         let result = Blob::with_handle(constructed.bytes, Handle::<Target>::from_hash(result_data));
-        algebra
-            .validate_target(&descriptor, &result)
-            .map_err(|reason| ExactTargetCompactionError::InvalidResult {
-                low: low_data,
-                high: high_data,
-                result: result_data,
-                reason,
-            })?;
-        let claim = CollectionMerge::new(descriptor.handle(), low_data, high_data, result_data);
-
-        let actual = store.put::<Target, _>(result.clone()).map_err(|error| {
-            ExactTargetCompactionError::storage("store compacted target", error)
-        })?;
-        let actual = Handle::<Target>::to_hash(actual);
-        if actual != result_data {
-            return Err(ExactTargetCompactionError::NonCanonicalTargetPut {
-                expected: result_data,
-                actual,
-            });
+        match algebra.validate_target(&descriptor, &result) {
+            Ok(()) => {}
+            Err(ExactAlgebraError::Fatal(reason)) => {
+                return Err(ExactTargetCompactionError::InvalidResult {
+                    low: low_data,
+                    high: high_data,
+                    result: result_data,
+                    reason,
+                });
+            }
+            Err(ExactAlgebraError::Capacity(_)) => {
+                locations.insert(high_data, tier);
+                tiers.entry(tier).or_default().insert(high_data, high);
+                continue;
+            }
         }
+        let claim = CollectionMerge::new(descriptor.handle(), low_data, high_data, result_data);
 
         if let Some(existing_tier) = locations.remove(&result_data) {
             let existing_bin = tiers
@@ -307,14 +315,38 @@ where
         tiers
             .entry(result_tier)
             .or_default()
-            .insert(result_data, result);
+            .insert(result_data, result.clone());
+        outputs.insert(result_data, result);
         claims.push(claim);
     }
 
+    if claims.is_empty() {
+        return Ok(RoundOutcome::CapacityStable(cover));
+    }
+
+    let expected_descriptor = descriptor.handle();
+    let actual_descriptor = store
+        .put::<SimpleArchive, _>(CollectionDescriptor::to_blob(&descriptor))
+        .map_err(|error| ExactTargetCompactionError::storage("store target descriptor", error))?;
+    if actual_descriptor != expected_descriptor {
+        return Err(ExactTargetCompactionError::NonCanonicalDescriptorPut {
+            expected: expected_descriptor,
+            actual: actual_descriptor,
+        });
+    }
+    for (expected, result) in outputs {
+        let actual = store.put::<Target, _>(result).map_err(|error| {
+            ExactTargetCompactionError::storage("store compacted target", error)
+        })?;
+        let actual = Handle::<Target>::to_hash(actual);
+        if actual != expected {
+            return Err(ExactTargetCompactionError::NonCanonicalTargetPut { expected, actual });
+        }
+    }
     for claim in claims {
         store
             .insert(CollectionRecord::Merge(claim))
             .map_err(|error| ExactTargetCompactionError::storage("publish target MERGE", error))?;
     }
-    Ok(())
+    Ok(RoundOutcome::Published)
 }

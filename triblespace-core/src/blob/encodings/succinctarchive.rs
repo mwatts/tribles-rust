@@ -150,6 +150,61 @@ impl std::error::Error for SuccinctArchiveRawBuildError {
     }
 }
 
+/// Failure while computing the canonical union of raw
+/// [`SuccinctArchiveBlob`] artifacts.
+///
+/// Input validation is deliberately distinct from output geometry. A
+/// capacity-looking failure while proving one persisted input is still an
+/// [`InvalidInput`](Self::InvalidInput); only growth of the already-validated
+/// union can produce [`DomainTooWide`](Self::DomainTooWide) or
+/// [`TooManyRows`](Self::TooManyRows).
+#[derive(Debug)]
+pub enum SuccinctArchiveRawMergeError {
+    /// One persisted input failed structural or canonical validation.
+    InvalidInput {
+        /// Zero-based input position in the supplied segment slice.
+        index: usize,
+        /// Exact validation failure for that input.
+        source: SuccinctArchiveError,
+    },
+    /// The validated union needs more than the raw format's `u32` domain.
+    DomainTooWide,
+    /// The validated union needs more than the raw format's `u32` row space.
+    TooManyRows,
+    /// Encoding the representable merged result violated an internal format
+    /// invariant.
+    Construction(SuccinctArchiveError),
+}
+
+impl std::fmt::Display for SuccinctArchiveRawMergeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidInput { index, source } => {
+                write!(
+                    formatter,
+                    "raw merge input segment {index} is invalid: {source}"
+                )
+            }
+            Self::DomainTooWide => formatter
+                .write_str("merged succinct domain exceeds the raw format's u32 code space"),
+            Self::TooManyRows => formatter
+                .write_str("merged succinct archive exceeds the raw format's u32 row-offset space"),
+            Self::Construction(source) => {
+                write!(formatter, "cannot encode merged succinct archive: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SuccinctArchiveRawMergeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidInput { source, .. } | Self::Construction(source) => Some(source),
+            Self::DomainTooWide | Self::TooManyRows => None,
+        }
+    }
+}
+
 impl SuccinctArchiveBlob {
     /// Derives the canonical portable Ring artifact directly from one
     /// canonical `SimpleArchive` blob.
@@ -262,22 +317,27 @@ impl SuccinctArchiveBlob {
     /// slice produces the canonical empty archive. The in-memory path uses
     /// `u32` codes and row offsets; an external-memory spool remains necessary
     /// for a single merged artifact exceeding those limits.
-    pub fn merge(segments: &[Blob<Self>]) -> Result<Blob<Self>, SuccinctArchiveError> {
+    pub fn merge(segments: &[Blob<Self>]) -> Result<Blob<Self>, SuccinctArchiveRawMergeError> {
         let mut decoded = Vec::with_capacity(segments.len());
         for (index, segment) in segments.iter().enumerate() {
             let view = portable::parse(segment.bytes.as_ref()).map_err(|error| {
-                raw_merge_error(format!(
-                    "input segment {index} failed structural validation: {error}"
-                ))
+                SuccinctArchiveRawMergeError::InvalidInput {
+                    index,
+                    source: raw_merge_error(format!("structural validation failed: {error}")),
+                }
             })?;
             decoded.push(view.prove_canonical_eav_u32().map_err(|error| {
-                raw_merge_error(format!("input segment {index} is not canonical: {error}"))
+                SuccinctArchiveRawMergeError::InvalidInput {
+                    index,
+                    source: raw_merge_error(format!("canonical proof failed: {error}")),
+                }
             })?);
         }
 
         let (domain, rows) = merge_raw_eav_parts(decoded)?;
-        let bytes = portable::encode_canonical_eav_u32(&domain, rows)
-            .map_err(|error| raw_merge_error(format!("cannot encode merged archive: {error}")))?;
+        let bytes = portable::encode_canonical_eav_u32(&domain, rows).map_err(|error| {
+            SuccinctArchiveRawMergeError::Construction(raw_merge_error(error.to_string()))
+        })?;
         Ok(Blob::new(Bytes::from(bytes)))
     }
 }
@@ -1612,7 +1672,7 @@ fn raw_merge_error(message: impl Into<String>) -> SuccinctArchiveError {
 /// Merge exact-decoded raw inputs without constructing a query runtime.
 fn merge_raw_eav_parts(
     parts: Vec<portable::CanonicalEavU32>,
-) -> Result<(Vec<RawInline>, Vec<[u32; 3]>), SuccinctArchiveError> {
+) -> Result<(Vec<RawInline>, Vec<[u32; 3]>), SuccinctArchiveRawMergeError> {
     let mut remaps: Vec<Vec<u32>> = parts
         .iter()
         .map(|part| vec![0; part.domain.len()])
@@ -1637,9 +1697,7 @@ fn merge_raw_eav_parts(
             domain.len() - 1
         } else {
             if domain.len() == u32::MAX as usize {
-                return Err(raw_merge_error(
-                    "merged domain exceeds raw MERGE's u32 code space",
-                ));
+                return Err(SuccinctArchiveRawMergeError::DomainTooWide);
             }
             domain.push(value);
             domain.len() - 1
@@ -1684,9 +1742,7 @@ fn merge_raw_eav_parts(
     while let Some(Reverse((row, source, position))) = row_heap.pop() {
         if rows.last() != Some(&row) {
             if rows.len() == u32::MAX as usize {
-                return Err(raw_merge_error(
-                    "merged archive exceeds raw MERGE's u32 row-offset space",
-                ));
+                return Err(SuccinctArchiveRawMergeError::TooManyRows);
             }
             rows.push(row);
         }
@@ -4664,6 +4720,19 @@ mod tests {
         let empty = TribleSet::new();
         let rebuilt: SuccinctArchive<OrderedUniverse> = (&empty).into();
         assert_eq!(merged.bytes.as_ref(), rebuilt.bytes.as_ref());
+    }
+
+    #[test]
+    fn raw_merge_identifies_the_invalid_persisted_input() {
+        let empty = TribleSet::new();
+        let source: Blob<SimpleArchive> = (&empty).to_blob();
+        let valid = SuccinctArchiveBlob::build_from_simple_archive(&source).unwrap();
+        let malformed = Blob::<SuccinctArchiveBlob>::new(Bytes::from(vec![0u8; 1]));
+
+        assert!(matches!(
+            SuccinctArchiveBlob::merge(&[valid, malformed]),
+            Err(SuccinctArchiveRawMergeError::InvalidInput { index: 1, .. })
+        ));
     }
 
     #[test]

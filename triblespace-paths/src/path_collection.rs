@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::collection::exact_derived::{
-    ExactCover, ExactDerivedAlgebra, ExactDerivedCollection, ExactDerivedCollectionError,
+    ExactAlgebraError, ExactCover, ExactDerivedAlgebra, ExactDerivedCollection,
+    ExactDerivedCollectionError,
 };
 use triblespace_core::collection::simplearchive_union;
 use triblespace_core::collection::{CollectionCommit, CollectionDescriptor, CollectionStore};
@@ -147,48 +148,88 @@ impl ExactDerivedAlgebra<SimpleArchive, PathSummaryBlob> for PathSummaryCollecti
         &self,
         descriptor: &CollectionDescriptor,
         source: &triblespace_core::blob::Blob<SimpleArchive>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ExactAlgebraError> {
         if *descriptor != self.source_descriptor() {
-            return Err("source descriptor does not match this path collection".to_owned());
+            return Err(ExactAlgebraError::Fatal(
+                "source descriptor does not match this path collection".to_owned(),
+            ));
         }
-        simplearchive_union::validate_element(source).map_err(|error| error.to_string())
+        simplearchive_union::validate_element(source)
+            .map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
     }
 
     fn validate_target(
         &self,
         descriptor: &CollectionDescriptor,
         target: &triblespace_core::blob::Blob<PathSummaryBlob>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ExactAlgebraError> {
         if *descriptor != self.descriptor() {
-            return Err("target descriptor does not match this path collection".to_owned());
+            return Err(ExactAlgebraError::Fatal(
+                "target descriptor does not match this path collection".to_owned(),
+            ));
         }
         PathSummaryBlob::decode(target.clone(), &self.automaton)
             .map(|_| ())
-            .map_err(|error| error.to_string())
+            // These bytes are persisted evidence. Even a capacity-looking
+            // header is malformed input, not a reason to refine the cover.
+            .map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
     }
 
     fn join_source(
         &self,
         low: &triblespace_core::blob::Blob<SimpleArchive>,
         high: &triblespace_core::blob::Blob<SimpleArchive>,
-    ) -> Result<triblespace_core::blob::Blob<SimpleArchive>, String> {
-        simplearchive_union::join(low, high).map_err(|error| error.to_string())
+    ) -> Result<triblespace_core::blob::Blob<SimpleArchive>, ExactAlgebraError> {
+        simplearchive_union::join(low, high)
+            .map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
     }
 
     fn derive(
         &self,
         source: &triblespace_core::blob::Blob<SimpleArchive>,
-    ) -> Result<triblespace_core::blob::Blob<PathSummaryBlob>, String> {
-        path_summary_union::derive_element(source, &self.automaton)
-            .map_err(|error| error.to_string())
+    ) -> Result<triblespace_core::blob::Blob<PathSummaryBlob>, ExactAlgebraError> {
+        path_summary_union::derive_element(source, &self.automaton).map_err(classify_derive_error)
     }
 
     fn join_target(
         &self,
         low: &triblespace_core::blob::Blob<PathSummaryBlob>,
         high: &triblespace_core::blob::Blob<PathSummaryBlob>,
-    ) -> Result<triblespace_core::blob::Blob<PathSummaryBlob>, String> {
-        path_summary_union::join(low, high, &self.automaton).map_err(|error| error.to_string())
+    ) -> Result<triblespace_core::blob::Blob<PathSummaryBlob>, ExactAlgebraError> {
+        path_summary_union::join(low, high, &self.automaton).map_err(classify_target_join_error)
+    }
+}
+
+fn classify_derive_error(error: PathSummaryUnionError) -> ExactAlgebraError {
+    let reason = error.to_string();
+    if matches!(
+        &error,
+        PathSummaryUnionError::Encode(PathSummaryBlobError::CapacityOverflow)
+    ) {
+        ExactAlgebraError::Capacity(reason)
+    } else {
+        // Source bytes are persisted, and no decode or merge phase belongs to
+        // derivation. Treat every such failure as invalid algebra input.
+        ExactAlgebraError::Fatal(reason)
+    }
+}
+
+fn classify_target_join_error(error: PathSummaryUnionError) -> ExactAlgebraError {
+    let capacity = matches!(
+        &error,
+        PathSummaryUnionError::Merge(
+            PathError::TooManyVertices { .. }
+                | PathError::ProductCarrierTooLarge { .. }
+                | PathError::CapacityOverflow
+        ) | PathSummaryUnionError::Encode(PathSummaryBlobError::CapacityOverflow)
+    );
+    let reason = error.to_string();
+    if capacity {
+        ExactAlgebraError::Capacity(reason)
+    } else {
+        // In particular, Decode(CapacityOverflow) describes malformed
+        // persisted evidence and must never trigger a finer-cover fallback.
+        ExactAlgebraError::Fatal(reason)
     }
 }
 
@@ -310,6 +351,65 @@ mod tests {
 
     fn assert_cross_fragment_path(index: &PathIndex) {
         assert!(index.contains(&RawInline::from(id(1)), &RawInline::from(id(3))));
+    }
+
+    #[test]
+    fn exact_algebra_distinguishes_fresh_capacity_from_persisted_bytes() {
+        for error in [
+            PathSummaryUnionError::Merge(PathError::TooManyVertices { count: usize::MAX }),
+            PathSummaryUnionError::Merge(PathError::ProductCarrierTooLarge {
+                vertices: usize::MAX,
+                states: u32::MAX,
+            }),
+            PathSummaryUnionError::Merge(PathError::CapacityOverflow),
+            PathSummaryUnionError::Encode(PathSummaryBlobError::CapacityOverflow),
+        ] {
+            assert!(matches!(
+                classify_target_join_error(error),
+                ExactAlgebraError::Capacity(_)
+            ));
+        }
+
+        assert!(matches!(
+            classify_derive_error(PathSummaryUnionError::Encode(
+                PathSummaryBlobError::CapacityOverflow
+            )),
+            ExactAlgebraError::Capacity(_)
+        ));
+
+        for error in [
+            PathSummaryUnionError::Decode(PathSummaryBlobError::CapacityOverflow),
+            PathSummaryUnionError::Merge(PathError::EmptyInput),
+            PathSummaryUnionError::Merge(PathError::DifferentAutomata),
+            PathSummaryUnionError::Encode(PathSummaryBlobError::BadLength),
+        ] {
+            assert!(matches!(
+                classify_target_join_error(error),
+                ExactAlgebraError::Fatal(_)
+            ));
+        }
+
+        assert!(matches!(
+            classify_derive_error(PathSummaryUnionError::Decode(
+                PathSummaryBlobError::CapacityOverflow
+            )),
+            ExactAlgebraError::Fatal(_)
+        ));
+
+        let automaton = Automaton::new(u32::MAX, [0], [0], []).unwrap();
+        let paths = PathSummaryCollection::new(id(9), automaton.clone());
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&crate::automaton_fingerprint(&automaton).raw);
+        bytes.extend_from_slice(&automaton.state_count().to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&[1; 32]);
+        bytes.extend_from_slice(&[2; 32]);
+        let persisted = Blob::<PathSummaryBlob>::new(bytes.into());
+        assert!(matches!(
+            paths.validate_target(&paths.descriptor(), &persisted),
+            Err(ExactAlgebraError::Fatal(_))
+        ));
     }
 
     #[test]
