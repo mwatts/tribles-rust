@@ -52,44 +52,61 @@ where
     Handle::<E>::to_hash(blob.get_handle())
 }
 
-fn validate(claim: DerivedClaim<'_, SimpleArchive, UnknownBlob>) -> Result<(), String> {
-    let source = simplearchive_union::descriptor(id(1));
-    let target = kernel().target_descriptor();
-    match claim {
-        DerivedClaim::Commit { claim, data } => {
-            simplearchive_union::validate_commit(&source, claim, data)
-                .map_err(|error| error.to_string())
+struct TestAlgebra;
+
+impl ExactDerivedAlgebra<SimpleArchive, UnknownBlob> for TestAlgebra {
+    fn validate_source(
+        &self,
+        descriptor: &CollectionDescriptor,
+        source: &Blob<SimpleArchive>,
+    ) -> Result<(), String> {
+        if *descriptor != kernel().source_descriptor() {
+            return Err("wrong test source descriptor".to_owned());
         }
-        DerivedClaim::SourceMerge {
-            claim,
-            low,
-            high,
-            result,
-        } => simplearchive_union::validate_merge(&source, claim, low, high, result)
-            .map_err(|error| error.to_string()),
-        DerivedClaim::TargetMerge {
-            claim: _,
-            low: _,
-            high: _,
-            result: _,
-        } => Err("test target has no merge equations".to_owned()),
-        DerivedClaim::Derive {
-            claim,
-            input,
-            output,
-        } => {
-            if claim.source() != source.handle() || claim.target() != target.handle() {
-                return Err("wrong derived collection endpoints".to_owned());
-            }
-            if claim.mapping() != (fresh_data_identity(input), fresh_data_identity(output)) {
-                return Err("derive endpoint identity mismatch".to_owned());
-            }
-            simplearchive_union::validate_element(input).map_err(|error| error.to_string())?;
-            if derive(input).unwrap().bytes != output.bytes {
-                return Err("test derivation output is not canonical".to_owned());
-            }
-            Ok(())
+        simplearchive_union::validate_element(source).map_err(|error| error.to_string())
+    }
+
+    fn validate_target(
+        &self,
+        descriptor: &CollectionDescriptor,
+        target: &Blob<UnknownBlob>,
+    ) -> Result<(), String> {
+        if *descriptor != kernel().target_descriptor() {
+            return Err("wrong test target descriptor".to_owned());
         }
+        let Some(source) = target.bytes.as_ref().strip_suffix(&[0xA5]) else {
+            return Err("test target lacks its canonical suffix".to_owned());
+        };
+        simplearchive_union::validate_element(&Blob::new(source.to_vec().into()))
+            .map_err(|error| error.to_string())
+    }
+
+    fn join_source(
+        &self,
+        low: &Blob<SimpleArchive>,
+        high: &Blob<SimpleArchive>,
+    ) -> Result<Blob<SimpleArchive>, String> {
+        simplearchive_union::join(low, high).map_err(|error| error.to_string())
+    }
+
+    fn derive(&self, source: &Blob<SimpleArchive>) -> Result<Blob<UnknownBlob>, String> {
+        Ok(derive(source).unwrap())
+    }
+
+    fn join_target(
+        &self,
+        low: &Blob<UnknownBlob>,
+        high: &Blob<UnknownBlob>,
+    ) -> Result<Blob<UnknownBlob>, String> {
+        let descriptor = kernel().target_descriptor();
+        self.validate_target(&descriptor, low)?;
+        self.validate_target(&descriptor, high)?;
+        let low =
+            Blob::<SimpleArchive>::new(low.bytes.as_ref()[..low.bytes.len() - 1].to_vec().into());
+        let high =
+            Blob::<SimpleArchive>::new(high.bytes.as_ref()[..high.bytes.len() - 1].to_vec().into());
+        let joined = simplearchive_union::join(&low, &high).map_err(|error| error.to_string())?;
+        Ok(derive(&joined).unwrap())
     }
 }
 
@@ -170,11 +187,11 @@ impl CollectionStore for PanicStore {
 fn zero_ticket_performs_no_store_operation() {
     let mut store = PanicStore;
     assert!(kernel()
-        .attach_exact(&mut store, &[], validate)
+        .attach_exact(&mut store, &[], &TestAlgebra)
         .unwrap()
         .is_empty());
     assert!(kernel()
-        .ensure_exact(&mut store, &[], validate, derive)
+        .ensure_exact(&mut store, &[], &TestAlgebra)
         .unwrap()
         .is_empty());
 }
@@ -239,7 +256,7 @@ fn complete_probe_ensure_performs_zero_writes() {
     };
 
     let cover = kernel()
-        .ensure_exact(&mut store, &[commit], validate, derive)
+        .ensure_exact(&mut store, &[commit], &TestAlgebra)
         .unwrap();
     assert_eq!(cover.len(), 1);
     assert_eq!(store.puts, 0);
@@ -400,7 +417,7 @@ fn reader_is_dropped_before_first_write() {
         live: Arc::clone(&live),
     };
     kernel()
-        .ensure_exact(&mut store, &[commit], validate, derive)
+        .ensure_exact(&mut store, &[commit], &TestAlgebra)
         .unwrap();
     assert_eq!(live.load(Ordering::SeqCst), 0);
 }
@@ -467,7 +484,7 @@ fn fresh_reprobe_rejects_a_lossy_output_put() {
         puts: 0,
         discard_put: 3,
     };
-    match kernel().ensure_exact(&mut store, &[commit], validate, derive) {
+    match kernel().ensure_exact(&mut store, &[commit], &TestAlgebra) {
         Err(ExactDerivedCollectionError::IncompleteCover { .. }) => {}
         Err(error) => panic!("unexpected fresh-reprobe error: {error:?}"),
         Ok(_) => panic!("lossy output was incorrectly admitted"),
@@ -488,14 +505,14 @@ fn missing_derive_output_is_pending_and_ensure_rebuilds() {
             data(&missing),
         )))
         .unwrap();
-    match kernel().attach_exact(&mut store, &[commit], validate) {
+    match kernel().attach_exact(&mut store, &[commit], &TestAlgebra) {
         Err(ExactDerivedCollectionError::IncompleteCover { .. }) => {}
         Err(error) => panic!("unexpected missing-output error: {error:?}"),
         Ok(_) => panic!("missing output was incorrectly admitted"),
     }
     assert_eq!(
         kernel()
-            .ensure_exact(&mut store, &[commit], validate, derive)
+            .ensure_exact(&mut store, &[commit], &TestAlgebra)
             .unwrap()
             .len(),
         1,
@@ -520,11 +537,12 @@ fn corrupt_unsigned_endpoint_is_rejected_as_optional_evidence() {
         )))
         .unwrap();
 
-    // Candidate reads deliberately do not enforce the cached handle. The
-    // concrete validator rejects this unsigned evidence, leaving the target
-    // incomplete instead of turning optional cache corruption into a global
-    // resolution failure.
-    match kernel().attach_exact(&mut store, &[commit], validate) {
+    // Scratch reconstruction proves the canonical DERIVE equation without
+    // trusting these bytes. Physical-cover admission then freshly hashes the
+    // forged resident artifact, removes it from the optional candidate set,
+    // and reports the target incomplete rather than granting cache corruption
+    // authority or failing unrelated evidence globally.
+    match kernel().attach_exact(&mut store, &[commit], &TestAlgebra) {
         Err(ExactDerivedCollectionError::IncompleteCover { .. }) => {}
         Err(error) => panic!("unexpected corrupt-cache error: {error:?}"),
         Ok(_) => panic!("corrupt unsigned output was incorrectly admitted"),
@@ -550,7 +568,7 @@ fn ungrounded_source_superset_cannot_escape_the_ticket() {
         .unwrap();
 
     let cover = kernel()
-        .ensure_exact(&mut store, &[commit], validate, derive)
+        .ensure_exact(&mut store, &[commit], &TestAlgebra)
         .unwrap();
     assert_eq!(cover.members()[0].1.bytes, derive(&a).unwrap().bytes);
     let derives: Vec<_> = store
@@ -563,6 +581,35 @@ fn ungrounded_source_superset_cannot_escape_the_ticket() {
         })
         .collect();
     assert_eq!(derives, vec![data(&a)]);
+}
+
+#[test]
+fn algebra_rejects_a_lying_source_descriptor() {
+    let source = archive([(1, 3)]);
+    let lying_source =
+        CollectionDescriptor::new(id(1), <UnknownBlob as MetaDescribe>::id(), id(99));
+    let lifecycle = ExactDerivedCollection::<SimpleArchive, UnknownBlob>::new(
+        lying_source,
+        kernel().target_descriptor(),
+    );
+    let mut store = MemoryRepo::default();
+    store.put::<SimpleArchive, _>(source.clone()).unwrap();
+    let metadata = store
+        .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+        .unwrap();
+    let commit = CollectionCommit::sign(
+        &SigningKey::from_bytes(&[7; 32]),
+        lying_source.handle(),
+        data(&source),
+        metadata,
+    );
+    store.insert(CollectionRecord::Commit(commit)).unwrap();
+
+    assert!(matches!(
+        lifecycle.attach_exact(&mut store, &[commit], &TestAlgebra),
+        Err(ExactDerivedCollectionError::RejectedCommit { commit: found, .. })
+            if found == commit.id()
+    ));
 }
 
 #[test]

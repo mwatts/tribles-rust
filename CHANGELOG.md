@@ -22,17 +22,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a signed commit over empty source data still publishes an ordinary
   provenance-bearing `DERIVE`.
 
-  This resident-evidence path is deliberately not yet a replacement for
-  `SuccinctRollup`: validating an unsigned equation still requires all of its
-  endpoint blobs to be resident, while current retention roots do not preserve
-  the complete unsigned proof graph across garbage collection. Missing
-  endpoints safely leave claims pending and completion can fall back to signed
-  leaves, so correctness is preserved but compacted cache reuse is incomplete;
-  the intended follow-up is recursive deterministic reconstruction without new
-  authority roots or validation records. There is also no native target
-  compactor or persisted-accelerator policy, and each raw derived shard retains
-  the format's explicit `u32::MAX` row/domain boundary. The legacy rollup
-  remains available unchanged while those lifecycle boundaries are designed.
+  Exact attachment no longer requires unsigned intermediate blobs to survive
+  garbage collection. A five-operation representation algebra validates the
+  fixed descriptors and terminal artifacts while a descriptor-typed evaluator
+  walks backwards from resident source and target results, then reconstructs
+  every candidate path forwards from authenticated source leaves. Computed
+  intermediates have use-counted scratch lifetimes and are never persisted.
+  Selected optional artifacts are freshly hashed and representation-validated;
+  invalid cache bytes are removed and the deterministic physical cover is
+  recomputed. This adds neither receipts nor authority/retention records, and a
+  complete `attach_exact` or `ensure_exact` remains write-free even after a
+  retained Pile rewrite collected the intermediate proof blobs. There is still
+  no native target compactor or persisted-accelerator policy, and each raw
+  derived shard retains the format's explicit `u32::MAX` row/domain boundary.
+  The legacy `SuccinctRollup` remains available unchanged.
 - **Regular paths now use one exact native collection path.**
   `PathSummaryCollection::{attach_exact, ensure_exact}` validates a frozen set
   of signed `SimpleArchive` commits, reuses canonical source merges, target

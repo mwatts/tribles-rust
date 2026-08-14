@@ -1,14 +1,13 @@
 //! Exact-ticket facade for canonical raw SuccinctArchive collections.
 //!
-//! This is a resident-evidence foundation, not a replacement for the legacy
-//! `SuccinctRollup` lifecycle. Existing unsigned equations are reusable only
-//! while all blobs needed to validate them remain resident; current collection
-//! retention does not preserve the whole unsigned proof graph through garbage
-//! collection. Missing evidence becomes pending rather than authoritative, and
-//! completion can fall back to signed leaves, so this is cache-incomplete but
-//! correctness-safe. The facade also has no background target compactor,
-//! rebuilds Rank9 indexes in process memory on every attachment, and inherits
-//! the raw format's explicit `u32::MAX` row/domain limit for each derived shard.
+//! This remains separate from the legacy `SuccinctRollup` lifecycle. Unsigned
+//! equations are reproducible cache evidence rather than authority or durable
+//! receipts: attachment reconstructs collected intermediates in use-counted
+//! scratch from authenticated source leaves, then freshly validates only the
+//! resident artifacts selected by the physical cover. The facade has no
+//! background target compactor, rebuilds Rank9 indexes in process memory on
+//! every attachment, and inherits the raw format's explicit `u32::MAX`
+//! row/domain limit for each derived shard.
 
 use std::error::Error;
 use std::fmt;
@@ -18,7 +17,7 @@ use crate::blob::encodings::succinctarchive::{
     OrderedUniverse, SuccinctArchive, SuccinctArchiveBlob, SuccinctArchiveError, UnionArchive,
 };
 use crate::collection::exact_derived::{
-    DerivedClaim, ExactCover, ExactDerivedCollection, ExactDerivedCollectionError,
+    ExactCover, ExactDerivedAlgebra, ExactDerivedCollection, ExactDerivedCollectionError,
 };
 use crate::collection::simplearchive_union;
 use crate::collection::{CollectionCommit, CollectionDescriptor, CollectionStore};
@@ -103,9 +102,7 @@ impl SuccinctArchiveCollection {
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
     {
-        let cover = self
-            .kernel()
-            .attach_exact(store, ticket, |claim| self.validate_claim(claim))?;
+        let cover = self.kernel().attach_exact(store, ticket, self)?;
         self.attach_cover(cover)
     }
 
@@ -124,51 +121,12 @@ impl SuccinctArchiveCollection {
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
     {
-        let cover = self.kernel().ensure_exact(
-            store,
-            ticket,
-            |claim| self.validate_claim(claim),
-            super::derive_element,
-        )?;
+        let cover = self.kernel().ensure_exact(store, ticket, self)?;
         self.attach_cover(cover)
     }
 
     fn kernel(&self) -> ExactDerivedCollection<SimpleArchive, SuccinctArchiveBlob> {
         ExactDerivedCollection::new(self.source_descriptor(), self.descriptor())
-    }
-
-    fn validate_claim(
-        &self,
-        claim: DerivedClaim<'_, SimpleArchive, SuccinctArchiveBlob>,
-    ) -> Result<(), String> {
-        let source = self.source_descriptor();
-        let target = self.descriptor();
-        match claim {
-            DerivedClaim::Commit { claim, data } => {
-                simplearchive_union::validate_commit(&source, claim, data)
-                    .map_err(|error| error.to_string())
-            }
-            DerivedClaim::SourceMerge {
-                claim,
-                low,
-                high,
-                result,
-            } => simplearchive_union::validate_merge(&source, claim, low, high, result)
-                .map_err(|error| error.to_string()),
-            DerivedClaim::TargetMerge {
-                claim,
-                low,
-                high,
-                result,
-            } => super::validate_merge(&target, claim, low, high, result)
-                .map_err(|error| error.to_string()),
-            DerivedClaim::Derive {
-                claim,
-                input,
-                output,
-            } => super::validate_derive(&source, &target, claim, input, output)
-                .map_err(|error| error.to_string()),
-        }
     }
 
     fn attach_cover(
@@ -193,6 +151,55 @@ impl SuccinctArchiveCollection {
     }
 }
 
+impl ExactDerivedAlgebra<SimpleArchive, SuccinctArchiveBlob> for SuccinctArchiveCollection {
+    fn validate_source(
+        &self,
+        descriptor: &CollectionDescriptor,
+        source: &crate::blob::Blob<SimpleArchive>,
+    ) -> Result<(), String> {
+        if *descriptor != self.source_descriptor() {
+            return Err("source descriptor does not match this Succinct collection".to_owned());
+        }
+        simplearchive_union::validate_element(source).map_err(|error| error.to_string())
+    }
+
+    fn validate_target(
+        &self,
+        descriptor: &CollectionDescriptor,
+        target: &crate::blob::Blob<SuccinctArchiveBlob>,
+    ) -> Result<(), String> {
+        if *descriptor != self.descriptor() {
+            return Err("target descriptor does not match this Succinct collection".to_owned());
+        }
+        SuccinctArchiveBlob::merge(std::slice::from_ref(target))
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn join_source(
+        &self,
+        low: &crate::blob::Blob<SimpleArchive>,
+        high: &crate::blob::Blob<SimpleArchive>,
+    ) -> Result<crate::blob::Blob<SimpleArchive>, String> {
+        simplearchive_union::join(low, high).map_err(|error| error.to_string())
+    }
+
+    fn derive(
+        &self,
+        source: &crate::blob::Blob<SimpleArchive>,
+    ) -> Result<crate::blob::Blob<SuccinctArchiveBlob>, String> {
+        super::derive_element(source).map_err(|error| error.to_string())
+    }
+
+    fn join_target(
+        &self,
+        low: &crate::blob::Blob<SuccinctArchiveBlob>,
+        high: &crate::blob::Blob<SuccinctArchiveBlob>,
+    ) -> Result<crate::blob::Blob<SuccinctArchiveBlob>, String> {
+        super::join(low, high).map_err(|error| error.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,7 +213,8 @@ mod tests {
     use crate::inline::encodings::hash::Handle;
     use crate::inline::InlineEncoding;
     use crate::repo::memoryrepo::MemoryRepo;
-    use crate::repo::BlobStorePut;
+    use crate::repo::pile::{Pile, WantRewritePolicy};
+    use crate::repo::{BlobStoreList, BlobStorePut, RetentionRoots};
     use crate::trible::{Trible, TribleSet, TRIBLE_LEN};
 
     /// Compile-time proof that the native API has no PinStore requirement.
@@ -349,6 +357,23 @@ mod tests {
 
     fn attached_facts(archive: &UnionArchive<OrderedUniverse>) -> TribleSet {
         archive.iter().collect()
+    }
+
+    fn pile_commit(
+        store: &mut Pile,
+        collection: &SuccinctArchiveCollection,
+        key: u8,
+        source: &Blob<SimpleArchive>,
+        metadata: crate::inline::Inline<Handle<SimpleArchive>>,
+    ) -> CollectionCommit {
+        let commit = CollectionCommit::sign(
+            &SigningKey::from_bytes(&[key; 32]),
+            collection.source_descriptor().handle(),
+            data(source),
+            metadata,
+        );
+        store.insert(CollectionRecord::Commit(commit)).unwrap();
+        commit
     }
 
     #[test]
@@ -536,6 +561,53 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_upper_target_artifact_falls_back_to_valid_lower_cover() {
+        let scope = id(7);
+        let collection = SuccinctArchiveCollection::new(scope);
+        let mut store = CollectionOnly::default();
+        let left_facts = facts([(1, 3)]);
+        let right_facts = facts([(2, 4)]);
+        let left = put_data(&mut store, &left_facts);
+        let right = put_data(&mut store, &right_facts);
+        let first = signed_commit(&mut store, scope, 1, &left);
+        let second = signed_commit(&mut store, scope, 2, &right);
+        publish(&mut store, first);
+        publish(&mut store, second);
+
+        let left_raw = super::super::derive_element(&left).unwrap();
+        let right_raw = super::super::derive_element(&right).unwrap();
+        for (input, output) in [(&left, &left_raw), (&right, &right_raw)] {
+            store.put::<SuccinctArchiveBlob, _>(output.clone()).unwrap();
+            store
+                .insert(CollectionRecord::Derive(CollectionDerive::new(
+                    collection.source_descriptor().handle(),
+                    collection.descriptor().handle(),
+                    data(input),
+                    data(output),
+                )))
+                .unwrap();
+        }
+        let joined = super::super::join(&left_raw, &right_raw).unwrap();
+        let forged =
+            Blob::<SuccinctArchiveBlob>::with_handle(left_raw.bytes.clone(), joined.get_handle());
+        store.put::<SuccinctArchiveBlob, _>(forged).unwrap();
+        store
+            .insert(CollectionRecord::Merge(CollectionMerge::new(
+                collection.descriptor().handle(),
+                data(&left_raw),
+                data(&right_raw),
+                data(&joined),
+            )))
+            .unwrap();
+
+        let attached = collection
+            .attach_exact(&mut store, &[first, second])
+            .unwrap();
+        assert_eq!(attached.segment_count(), 2);
+        assert_eq!(attached_facts(&attached), left_facts + right_facts);
+    }
+
+    #[test]
     fn old_ticket_stays_stable_after_later_commit_and_cache() {
         let scope = id(7);
         let collection = SuccinctArchiveCollection::new(scope);
@@ -633,5 +705,220 @@ mod tests {
             })
             .collect();
         assert_eq!(derive_inputs, vec![commit.data()]);
+    }
+
+    #[test]
+    fn retained_rewrite_reconstructs_collected_exact_proof_without_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("source.pile");
+        let retained_path = directory.path().join("retained.pile");
+        std::fs::File::create(&source_path).unwrap();
+        std::fs::File::create(&retained_path).unwrap();
+        let mut source_store = Pile::open(&source_path).unwrap();
+        let mut retained_store = Pile::open(&retained_path).unwrap();
+
+        let collection = SuccinctArchiveCollection::new(id(7));
+        let source_descriptor = CollectionDescriptor::to_blob(&collection.source_descriptor());
+        let target_descriptor = CollectionDescriptor::to_blob(&collection.descriptor());
+        source_store
+            .put::<SimpleArchive, _>(source_descriptor.clone())
+            .unwrap();
+        source_store
+            .put::<SimpleArchive, _>(target_descriptor.clone())
+            .unwrap();
+        let metadata = source_store
+            .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+            .unwrap();
+
+        let a_facts = facts([(1, 3)]);
+        let b_facts = facts([(2, 4)]);
+        let c_facts = facts([(3, 5)]);
+        let a = (&a_facts).to_blob();
+        let b = (&b_facts).to_blob();
+        let c = (&c_facts).to_blob();
+        for blob in [&a, &b, &c] {
+            source_store.put::<SimpleArchive, _>(blob.clone()).unwrap();
+        }
+        let commits = [
+            pile_commit(&mut source_store, &collection, 1, &a, metadata),
+            pile_commit(&mut source_store, &collection, 2, &b, metadata),
+            pile_commit(&mut source_store, &collection, 3, &c, metadata),
+        ];
+
+        let ab = simplearchive_union::join(&a, &b).unwrap();
+        let succinct_ab = super::super::derive_element(&ab).unwrap();
+        let succinct_c = super::super::derive_element(&c).unwrap();
+        let succinct_abc = super::super::join(&succinct_ab, &succinct_c).unwrap();
+        source_store.put::<SimpleArchive, _>(ab.clone()).unwrap();
+        for blob in [&succinct_ab, &succinct_c, &succinct_abc] {
+            source_store
+                .put::<SuccinctArchiveBlob, _>(blob.clone())
+                .unwrap();
+        }
+        for record in [
+            CollectionRecord::Merge(CollectionMerge::new(
+                collection.source_descriptor().handle(),
+                data(&a),
+                data(&b),
+                data(&ab),
+            )),
+            CollectionRecord::Derive(CollectionDerive::new(
+                collection.source_descriptor().handle(),
+                collection.descriptor().handle(),
+                data(&ab),
+                data(&succinct_ab),
+            )),
+            CollectionRecord::Derive(CollectionDerive::new(
+                collection.source_descriptor().handle(),
+                collection.descriptor().handle(),
+                data(&c),
+                data(&succinct_c),
+            )),
+            CollectionRecord::Merge(CollectionMerge::new(
+                collection.descriptor().handle(),
+                data(&succinct_ab),
+                data(&succinct_c),
+                data(&succinct_abc),
+            )),
+        ] {
+            source_store.insert(record).unwrap();
+        }
+        source_store.flush().unwrap();
+
+        let mut roots = RetentionRoots::new();
+        roots.retain_direct(succinct_abc.get_handle());
+        source_store
+            .rewrite_retained_into(&mut retained_store, &roots, WantRewritePolicy::Drop)
+            .unwrap();
+        source_store.close().unwrap();
+        retained_store.close().unwrap();
+
+        let mut retained_store = Pile::open(&retained_path).unwrap();
+        let reader = retained_store.reader().unwrap();
+        for handle in [a.get_handle(), b.get_handle(), c.get_handle()] {
+            assert!(reader.contains_blob(handle).unwrap());
+        }
+        assert!(reader
+            .contains_blob(source_descriptor.get_handle())
+            .unwrap());
+        assert!(reader.contains_blob(metadata).unwrap());
+        assert!(reader.contains_blob(succinct_abc.get_handle()).unwrap());
+        assert!(!reader.contains_blob(ab.get_handle()).unwrap());
+        assert!(!reader.contains_blob(succinct_ab.get_handle()).unwrap());
+        assert!(!reader.contains_blob(succinct_c.get_handle()).unwrap());
+        assert!(!reader
+            .contains_blob(target_descriptor.get_handle())
+            .unwrap());
+        drop(reader);
+
+        let before = std::fs::metadata(&retained_path).unwrap().len();
+        let attached = collection
+            .attach_exact(&mut retained_store, &commits)
+            .unwrap();
+        assert_eq!(attached.segment_count(), 1);
+        assert_eq!(attached_facts(&attached), a_facts + b_facts + c_facts);
+        assert_eq!(std::fs::metadata(&retained_path).unwrap().len(), before);
+        let ensured = collection
+            .ensure_exact(&mut retained_store, &commits)
+            .unwrap();
+        assert_eq!(ensured.segment_count(), 1);
+        assert_eq!(std::fs::metadata(&retained_path).unwrap().len(), before);
+
+        let reader = retained_store.reader().unwrap();
+        assert!(!reader.contains_blob(ab.get_handle()).unwrap());
+        assert!(!reader.contains_blob(succinct_ab.get_handle()).unwrap());
+        assert!(!reader.contains_blob(succinct_c.get_handle()).unwrap());
+        assert!(!reader
+            .contains_blob(target_descriptor.get_handle())
+            .unwrap());
+        drop(reader);
+        retained_store.close().unwrap();
+    }
+
+    #[test]
+    fn ensure_reconstructs_collected_source_ancestry_from_resident_source_seed() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("source-seed.pile");
+        let retained_path = directory.path().join("source-seed-retained.pile");
+        std::fs::File::create(&source_path).unwrap();
+        std::fs::File::create(&retained_path).unwrap();
+        let mut source_store = Pile::open(&source_path).unwrap();
+        let mut retained_store = Pile::open(&retained_path).unwrap();
+
+        let collection = SuccinctArchiveCollection::new(id(8));
+        source_store
+            .put::<SimpleArchive, _>(CollectionDescriptor::to_blob(
+                &collection.source_descriptor(),
+            ))
+            .unwrap();
+        let metadata = source_store
+            .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+            .unwrap();
+        let a = facts([(1, 3)]).to_blob();
+        let b = facts([(2, 4)]).to_blob();
+        let c = facts([(3, 5)]).to_blob();
+        for blob in [&a, &b, &c] {
+            source_store.put::<SimpleArchive, _>(blob.clone()).unwrap();
+        }
+        let commits = [
+            pile_commit(&mut source_store, &collection, 4, &a, metadata),
+            pile_commit(&mut source_store, &collection, 5, &b, metadata),
+            pile_commit(&mut source_store, &collection, 6, &c, metadata),
+        ];
+        let ab = simplearchive_union::join(&a, &b).unwrap();
+        let abc = simplearchive_union::join(&ab, &c).unwrap();
+        source_store.put::<SimpleArchive, _>(ab.clone()).unwrap();
+        source_store.put::<SimpleArchive, _>(abc.clone()).unwrap();
+        for record in [
+            CollectionRecord::Merge(CollectionMerge::new(
+                collection.source_descriptor().handle(),
+                data(&a),
+                data(&b),
+                data(&ab),
+            )),
+            CollectionRecord::Merge(CollectionMerge::new(
+                collection.source_descriptor().handle(),
+                data(&ab),
+                data(&c),
+                data(&abc),
+            )),
+        ] {
+            source_store.insert(record).unwrap();
+        }
+        source_store.flush().unwrap();
+
+        let mut roots = RetentionRoots::new();
+        roots.retain_direct(abc.get_handle());
+        source_store
+            .rewrite_retained_into(&mut retained_store, &roots, WantRewritePolicy::Drop)
+            .unwrap();
+        source_store.close().unwrap();
+        retained_store.close().unwrap();
+
+        let mut retained_store = Pile::open(&retained_path).unwrap();
+        let reader = retained_store.reader().unwrap();
+        assert!(!reader.contains_blob(ab.get_handle()).unwrap());
+        assert!(reader.contains_blob(abc.get_handle()).unwrap());
+        drop(reader);
+        let attached = collection
+            .ensure_exact(&mut retained_store, &commits)
+            .unwrap();
+        assert_eq!(attached.segment_count(), 1);
+        let derive_inputs: Vec<_> = retained_store
+            .records()
+            .unwrap()
+            .map(Result::unwrap)
+            .filter_map(|record| match record {
+                CollectionRecord::Derive(claim)
+                    if claim.source() == collection.source_descriptor().handle()
+                        && claim.target() == collection.descriptor().handle() =>
+                {
+                    Some(claim.mapping().0)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(derive_inputs, vec![data(&abc)]);
+        retained_store.close().unwrap();
     }
 }

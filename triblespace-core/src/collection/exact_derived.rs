@@ -1,18 +1,19 @@
 //! Exact-ticket attachment shared by canonical derived collections.
 //!
-//! Concrete facades supply descriptors, algebra validation, derivation, and
-//! final query materialization. This kernel owns the common authority and I/O
-//! lifecycle around signed source roots and reproducible unsigned evidence.
+//! Concrete facades supply descriptors, one canonical five-operation algebra,
+//! and final query materialization. This kernel owns the common authority and
+//! I/O lifecycle around signed source roots and reproducible unsigned evidence.
 //!
-//! Unsigned equations are resident cache evidence, not durable validation
-//! receipts: every endpoint needed to validate a `MERGE` or `DERIVE` must be
-//! present on each admission pass. This kernel neither retains that proof
-//! graph across garbage collection nor supplies a compaction policy. A facade
-//! that promises durable compacted attachment must add deterministic recursive
-//! reconstruction (or a heavier proof-retention scheme). Missing evidence is
-//! safely pending, so signed leaves remain available for fallback completion.
+//! Unsigned equations are cache evidence, not durable validation receipts.
+//! Admission walks backwards from resident source and target results, then
+//! recomputes that finite proof graph forwards from authenticated source leaves.
+//! Canonical intermediates live only in use-counted scratch, so garbage
+//! collection may discard them without invalidating a resident upper result.
+//! Selected optional artifacts are still freshly hashed and representation-
+//! validated; bad cache bytes are removed from consideration and the physical
+//! cover falls back without acquiring authority.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::marker::PhantomData;
@@ -27,58 +28,115 @@ use crate::repo::{BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut};
 use super::discovery::discover_collection_records_for_ticket;
 use super::{
     collection_physical_cover, resolve_collection_semantics, CollectionClaimValidation,
-    CollectionCommit, CollectionData, CollectionDerive, CollectionDescriptor, CollectionMerge,
-    CollectionRecord, CollectionStore, CollectionValidationRequest, DiscoveredCollectionRecords,
+    CollectionCommit, CollectionData, CollectionDerive, CollectionDescriptor, CollectionId,
+    CollectionMerge, CollectionRecord, CollectionSemantics, CollectionStore,
+    CollectionValidationRequest, DiscoveredCollectionRecords,
 };
 
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
 
-/// A resident typed claim handed to a concrete algebra validator.
+/// Canonical operations needed to reconstruct one exact derived collection.
 ///
-/// The validator is the representation-specific security boundary: it must
-/// bind the record descriptors and endpoint handles to freshly computed byte
-/// identities, then prove the concrete algebra equation. Returning `Err`
-/// rejects only this unsigned cache claim (or rejects a ticket root when the
-/// variant is [`Commit`](Self::Commit)); it does not abort unrelated evidence.
-pub enum DerivedClaim<'a, Source: BlobEncoding, Target: BlobEncoding> {
-    /// An authorized source root.
-    Commit {
-        /// Signed claim.
-        claim: &'a CollectionCommit,
-        /// Claimed source bytes.
-        data: &'a Blob<Source>,
-    },
-    /// A source-lattice merge.
-    SourceMerge {
-        /// Unsigned equation.
-        claim: &'a CollectionMerge,
-        /// Lower input.
-        low: &'a Blob<Source>,
-        /// Higher input.
-        high: &'a Blob<Source>,
-        /// Claimed result.
-        result: &'a Blob<Source>,
-    },
-    /// A target-lattice merge.
-    TargetMerge {
-        /// Unsigned equation.
-        claim: &'a CollectionMerge,
-        /// Lower input.
-        low: &'a Blob<Target>,
-        /// Higher input.
-        high: &'a Blob<Target>,
-        /// Claimed result.
-        result: &'a Blob<Target>,
-    },
-    /// A source-to-target derivation.
-    Derive {
-        /// Unsigned equation.
-        claim: &'a CollectionDerive,
-        /// Source input.
-        input: &'a Blob<Source>,
-        /// Target output.
-        output: &'a Blob<Target>,
-    },
+/// The kernel binds descriptors, records, and freshly computed content
+/// identities. This trait is the representation boundary: validators prove
+/// that resident terminal bytes belong to their lattice, while constructors
+/// compute the unique canonical result of each algebraic operation. Errors on
+/// unsigned equations reject only that optional cache evidence; errors on an
+/// authenticated source root reject the ticket.
+pub trait ExactDerivedAlgebra<Source: BlobEncoding, Target: BlobEncoding> {
+    /// Validate the exact source descriptor and one canonical source element.
+    fn validate_source(
+        &self,
+        descriptor: &CollectionDescriptor,
+        source: &Blob<Source>,
+    ) -> Result<(), String>;
+
+    /// Validate the exact target descriptor and one canonical target element.
+    fn validate_target(
+        &self,
+        descriptor: &CollectionDescriptor,
+        target: &Blob<Target>,
+    ) -> Result<(), String>;
+
+    /// Compute the canonical source join.
+    fn join_source(&self, low: &Blob<Source>, high: &Blob<Source>) -> Result<Blob<Source>, String>;
+
+    /// Compute the canonical source-to-target homomorphism.
+    fn derive(&self, source: &Blob<Source>) -> Result<Blob<Target>, String>;
+
+    /// Compute the canonical target join.
+    fn join_target(&self, low: &Blob<Target>, high: &Blob<Target>) -> Result<Blob<Target>, String>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum TypedData {
+    Source(CollectionData),
+    Target(CollectionData),
+}
+
+impl TypedData {
+    fn data(self) -> CollectionData {
+        match self {
+            Self::Source(data) | Self::Target(data) => data,
+        }
+    }
+}
+
+enum ScratchValue<Source: BlobEncoding, Target: BlobEncoding> {
+    Source(Blob<Source>),
+    Target(Blob<Target>),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Candidate {
+    SourceMerge(CollectionMerge),
+    Derive(CollectionDerive),
+    TargetMerge(CollectionMerge),
+}
+
+impl Candidate {
+    fn id(self) -> Id {
+        match self {
+            Self::SourceMerge(claim) | Self::TargetMerge(claim) => claim.id(),
+            Self::Derive(claim) => claim.id(),
+        }
+    }
+
+    fn inputs(self) -> (TypedData, Option<TypedData>) {
+        match self {
+            Self::SourceMerge(claim) => {
+                let (low, high) = claim.inputs();
+                (
+                    TypedData::Source(low),
+                    (high != low).then_some(TypedData::Source(high)),
+                )
+            }
+            Self::Derive(claim) => (TypedData::Source(claim.mapping().0), None),
+            Self::TargetMerge(claim) => {
+                let (low, high) = claim.inputs();
+                (
+                    TypedData::Target(low),
+                    (high != low).then_some(TypedData::Target(high)),
+                )
+            }
+        }
+    }
+
+    fn result(self) -> TypedData {
+        match self {
+            Self::SourceMerge(claim) => TypedData::Source(claim.result()),
+            Self::Derive(claim) => TypedData::Target(claim.mapping().1),
+            Self::TargetMerge(claim) => TypedData::Target(claim.result()),
+        }
+    }
+
+    fn kind_order(self) -> u8 {
+        match self {
+            Self::SourceMerge(_) => 0,
+            Self::Derive(_) => 1,
+            Self::TargetMerge(_) => 2,
+        }
+    }
 }
 
 /// A resident target cover in ascending content-handle order.
@@ -154,7 +212,7 @@ pub enum ExactDerivedCollectionError {
         /// Source member being lowered.
         input: CollectionData,
         /// Concrete construction failure.
-        source: BoxError,
+        reason: String,
     },
 }
 
@@ -186,9 +244,9 @@ impl fmt::Display for ExactDerivedCollectionError {
                 missing.len(),
                 unsupported_commits.len(),
             ),
-            Self::Derive { input, source } => write!(
+            Self::Derive { input, reason } => write!(
                 f,
-                "derive source element {}: {source}",
+                "derive source element {}: {reason}",
                 hex::encode_upper(input.raw),
             ),
         }
@@ -198,7 +256,7 @@ impl fmt::Display for ExactDerivedCollectionError {
 impl Error for ExactDerivedCollectionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Storage { source, .. } | Self::Derive { source, .. } => Some(source.as_ref()),
+            Self::Storage { source, .. } => Some(source.as_ref()),
             _ => None,
         }
     }
@@ -250,18 +308,22 @@ where
     }
 
     /// Attach an already complete exact cover without writing.
-    pub fn attach_exact<S, V>(
+    ///
+    /// Missing unsigned intermediates are reconstructed in use-counted scratch
+    /// from authenticated source roots. Scratch validation never publishes a
+    /// blob or equation.
+    pub fn attach_exact<S, A>(
         &self,
         store: &mut S,
         ticket: &[CollectionCommit],
-        validate: V,
+        algebra: &A,
     ) -> Result<ExactCover<Target>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
-        V: for<'a> Fn(DerivedClaim<'a, Source, Target>) -> Result<(), String>,
+        A: ExactDerivedAlgebra<Source, Target> + ?Sized,
     {
-        self.attach_with(store, ticket, &validate)
+        self.attach_with(store, ticket, algebra)
     }
 
     /// Complete missing derivations, then attach through a fresh read pass.
@@ -270,43 +332,46 @@ where
     /// writes. Otherwise the reader is dropped before descriptors and all
     /// output blobs are written ahead of unsigned `DERIVE` records. No flush
     /// or signed record is emitted.
-    pub fn ensure_exact<S, V, F, E>(
+    pub fn ensure_exact<S, A>(
         &self,
         store: &mut S,
         ticket: &[CollectionCommit],
-        validate: V,
-        derive: F,
+        algebra: &A,
     ) -> Result<ExactCover<Target>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
-        V: for<'a> Fn(DerivedClaim<'a, Source, Target>) -> Result<(), String>,
-        F: Fn(&Blob<Source>) -> Result<Blob<Target>, E>,
-        E: Error + Send + Sync + 'static,
+        A: ExactDerivedAlgebra<Source, Target> + ?Sized,
     {
         if ticket.is_empty() {
             return Ok(ExactCover::empty());
         }
 
-        let probe = self.probe(store, ticket, &validate, true)?;
+        let probe = self.probe(store, ticket, algebra, true)?;
         if probe.is_complete() {
-            return probe.load_target_cover();
+            return Ok(probe.into_target_cover());
         }
         if probe.source_residual_cover.is_empty() {
             return Err(probe.incomplete_error());
         }
 
         let mut prepared = Vec::with_capacity(probe.source_residual_cover.len());
-        for input_data in &probe.source_residual_cover {
-            let input = require_exact::<_, Source>(
-                &probe.reader,
-                *input_data,
-                "read selected source residual",
-            )?;
-            let output = derive(&input).map_err(|source| ExactDerivedCollectionError::Derive {
-                input: *input_data,
-                source: Box::new(source),
-            })?;
+        for (input_data, input) in &probe.source_residual_cover {
+            let output =
+                algebra
+                    .derive(input)
+                    .map_err(|reason| ExactDerivedCollectionError::Derive {
+                        input: *input_data,
+                        reason,
+                    })?;
+            algebra
+                .validate_target(&self.target, &output)
+                .map_err(|reason| {
+                    ExactDerivedCollectionError::Resolution(format!(
+                        "fresh DERIVE for {} constructed an invalid target: {reason}",
+                        hex::encode_upper(input_data.raw),
+                    ))
+                })?;
             let output_data = fresh_data_identity(&output);
             let claim = CollectionDerive::new(
                 self.source.handle(),
@@ -314,17 +379,6 @@ where
                 *input_data,
                 output_data,
             );
-            validate(DerivedClaim::Derive {
-                claim: &claim,
-                input: &input,
-                output: &output,
-            })
-            .map_err(|error| {
-                ExactDerivedCollectionError::Resolution(format!(
-                    "fresh DERIVE for {} failed validation: {error}",
-                    hex::encode_upper(input_data.raw),
-                ))
-            })?;
             prepared.push((output_data, output, claim));
         }
 
@@ -348,28 +402,28 @@ where
         }
 
         // Construction is not admission.
-        self.attach_with(store, ticket, &validate)
+        self.attach_with(store, ticket, algebra)
     }
 
-    fn attach_with<S, V>(
+    fn attach_with<S, A>(
         &self,
         store: &mut S,
         ticket: &[CollectionCommit],
-        validate: &V,
+        algebra: &A,
     ) -> Result<ExactCover<Target>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
-        V: for<'a> Fn(DerivedClaim<'a, Source, Target>) -> Result<(), String>,
+        A: ExactDerivedAlgebra<Source, Target> + ?Sized,
     {
         if ticket.is_empty() {
             return Ok(ExactCover::empty());
         }
-        let probe = self.probe(store, ticket, validate, false)?;
+        let probe = self.probe(store, ticket, algebra, false)?;
         if !probe.is_complete() {
             return Err(probe.incomplete_error());
         }
-        probe.load_target_cover()
+        Ok(probe.into_target_cover())
     }
 
     fn publish_descriptors<S: BlobStorePut>(
@@ -390,17 +444,17 @@ where
         Ok(())
     }
 
-    fn probe<S, V>(
+    fn probe<S, A>(
         &self,
         store: &mut S,
         ticket: &[CollectionCommit],
-        validate: &V,
+        algebra: &A,
         plan_source_residual: bool,
-    ) -> Result<ExactProbe<S::Reader>, ExactDerivedCollectionError>
+    ) -> Result<ExactProbe<S::Reader, Source, Target>, ExactDerivedCollectionError>
     where
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
-        V: for<'a> Fn(DerivedClaim<'a, Source, Target>) -> Result<(), String>,
+        A: ExactDerivedAlgebra<Source, Target> + ?Sized,
     {
         let requested: BTreeSet<_> = ticket.iter().map(CollectionCommit::id).collect();
         let discovered =
@@ -411,15 +465,116 @@ where
         let reader = store.reader().map_err(|error| {
             ExactDerivedCollectionError::storage("open exact-ticket reader", error)
         })?;
-        let resolution = resolve_collection_semantics(&discovered, &authorized, |request| {
-            self.validate_request(&reader, validate, request)
-        })
-        .map_err(|error| match error {
-            super::CollectionResolutionError::Validation { source, .. } => source,
-            super::CollectionResolutionError::Conflict(conflict) => {
-                ExactDerivedCollectionError::Resolution(conflict.to_string())
+
+        let mut known = BTreeMap::<TypedData, ScratchValue<Source, Target>>::new();
+        let mut roots = BTreeSet::new();
+        for commit in discovered
+            .commits()
+            .iter()
+            .filter(|commit| authorized.contains(&commit.id()))
+        {
+            let node = TypedData::Source(commit.data());
+            if !known.contains_key(&node) {
+                let Some(blob) =
+                    load_candidate::<_, Source>(&reader, commit.data(), "read source COMMIT")?
+                else {
+                    return Err(ExactDerivedCollectionError::IncompleteCommit(commit.id()));
+                };
+                let actual = fresh_data_identity(&blob);
+                if actual != commit.data() {
+                    return Err(ExactDerivedCollectionError::RejectedCommit {
+                        commit: commit.id(),
+                        reason: format!(
+                            "source bytes hash to {} instead of {}",
+                            hex::encode_upper(actual.raw),
+                            hex::encode_upper(commit.data().raw),
+                        ),
+                    });
+                }
+                algebra
+                    .validate_source(&self.source, &blob)
+                    .map_err(|reason| ExactDerivedCollectionError::RejectedCommit {
+                        commit: commit.id(),
+                        reason,
+                    })?;
+                known.insert(node, ScratchValue::Source(blob));
             }
-        })?;
+            roots.insert(node);
+        }
+
+        let candidates = self.candidates(&discovered);
+        let mut producers = BTreeMap::<TypedData, Vec<usize>>::new();
+        for (index, candidate) in candidates.iter().copied().enumerate() {
+            producers.entry(candidate.result()).or_default().push(index);
+        }
+
+        // Source compaction results are seeds too: ensure may reuse a resident
+        // source upper bound even when no target artifact exists yet.
+        let mut resident_results = BTreeSet::new();
+        let mut reverse_seen = BTreeSet::new();
+        let mut reverse_queue = VecDeque::new();
+        for result in producers.keys().copied() {
+            if known.contains_key(&result)
+                || self.contains_typed(&reader, result, "inspect reconstructed result")?
+            {
+                resident_results.insert(result);
+                if reverse_seen.insert(result) {
+                    reverse_queue.push_back(result);
+                }
+            }
+        }
+
+        // Include every producer path, including producers of authenticated
+        // roots: another ticket commit may be reachable only through that
+        // merge history, so first-proof traversal would lose provenance.
+        let mut candidate_indices = BTreeSet::new();
+        while let Some(result) = reverse_queue.pop_front() {
+            let Some(indices) = producers.get(&result) else {
+                continue;
+            };
+            for &index in indices {
+                candidate_indices.insert(index);
+                let (first, second) = candidates[index].inputs();
+                for input in [Some(first), second].into_iter().flatten() {
+                    if reverse_seen.insert(input) {
+                        reverse_queue.push_back(input);
+                    }
+                }
+            }
+        }
+
+        let (accepted, rejected) = evaluate_candidates(
+            &candidates,
+            &candidate_indices,
+            &roots,
+            &mut known,
+            &self.source,
+            &self.target,
+            algebra,
+        );
+        let resolution = resolve_collection_semantics(&discovered, &authorized, |request| {
+            let claim = request.claim_id();
+            Ok::<CollectionClaimValidation<String>, std::convert::Infallible>(
+                if matches!(request, CollectionValidationRequest::Commit { .. }) {
+                    CollectionClaimValidation::Accepted
+                } else if accepted.contains(&claim) {
+                    CollectionClaimValidation::Accepted
+                } else if let Some(reason) = rejected.get(&claim) {
+                    CollectionClaimValidation::Rejected(reason.clone())
+                } else {
+                    CollectionClaimValidation::Pending
+                },
+            )
+        });
+        let resolution = match resolution {
+            Ok(resolution) => resolution,
+            Err(super::CollectionResolutionError::Validation { source, .. }) => match source {},
+            Err(super::CollectionResolutionError::Conflict(conflict)) => {
+                return Err(ExactDerivedCollectionError::Resolution(
+                    conflict.to_string(),
+                ));
+            }
+        };
 
         for commit in ticket {
             if resolution.validation_pending().contains(&commit.id()) {
@@ -457,26 +612,56 @@ where
             .copied()
             .collect();
 
-        let target_resident = resident_members::<_, Target>(
+        let target_resident = resolution
+            .semantics()
+            .members(target)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|data| resident_results.contains(&TypedData::Target(*data)))
+            .collect();
+        let target_physical = validated_physical_cover(
             &reader,
-            resolution.semantics().members(target),
-            "inspect target residency",
-        )?;
-        let target_physical =
-            collection_physical_cover(resolution.semantics(), target, &target_resident);
+            resolution.semantics(),
+            target,
+            target_resident,
+            &BTreeMap::new(),
+            |blob| algebra.validate_target(&self.target, blob),
+        );
 
         let complete = target_physical.missing.is_empty() && unsupported_commits.is_empty();
         let source_residual_cover = if !plan_source_residual || complete {
-            BTreeSet::new()
+            Vec::new()
         } else {
             let source = self.source.handle();
-            let source_resident = resident_members::<_, Source>(
+            let source_roots: BTreeMap<_, _> = roots
+                .iter()
+                .filter_map(|node| match (node, known.get(node)) {
+                    (TypedData::Source(data), Some(ScratchValue::Source(blob))) => {
+                        Some((*data, blob.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let source_resident = resolution
+                .semantics()
+                .members(source)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|data| {
+                    source_roots.contains_key(data)
+                        || resident_results.contains(&TypedData::Source(*data))
+                })
+                .collect();
+            let source_physical = validated_physical_cover(
                 &reader,
-                resolution.semantics().members(source),
-                "inspect source residency",
-            )?;
-            let source_physical =
-                collection_physical_cover(resolution.semantics(), source, &source_resident);
+                resolution.semantics(),
+                source,
+                source_resident,
+                &source_roots,
+                |blob| algebra.validate_source(&self.source, blob),
+            );
             if !source_physical.missing.is_empty() {
                 return Err(ExactDerivedCollectionError::Resolution(format!(
                     "validated source lacks a resident cover for {} frontier element(s)",
@@ -499,108 +684,95 @@ where
                         .supporting_commit_ids(source, *data)
                         .is_disjoint(&required)
                 })
+                .map(|data| {
+                    let blob = source_physical
+                        .blobs
+                        .get(&data)
+                        .expect("validated source cover retains selected bytes")
+                        .clone();
+                    (data, blob)
+                })
                 .collect()
         };
 
         Ok(ExactProbe {
-            reader,
-            cover: target_physical.cover,
+            _reader: reader,
+            target_cover: ExactCover {
+                members: target_physical
+                    .cover
+                    .iter()
+                    .map(|data| {
+                        (
+                            *data,
+                            target_physical
+                                .blobs
+                                .get(data)
+                                .expect("validated target cover retains selected bytes")
+                                .clone(),
+                        )
+                    })
+                    .collect(),
+            },
             missing: target_physical.missing,
             unsupported_commits,
             source_residual_cover,
         })
     }
 
-    fn validate_request<R, V>(
+    fn candidates(&self, discovered: &DiscoveredCollectionRecords) -> Vec<Candidate> {
+        let mut candidates = Vec::new();
+        candidates.extend(
+            discovered
+                .merges()
+                .iter()
+                .filter(|claim| claim.collection() == self.source.handle())
+                .copied()
+                .map(Candidate::SourceMerge),
+        );
+        candidates.extend(
+            discovered
+                .derives()
+                .iter()
+                .filter(|claim| {
+                    claim.source() == self.source.handle() && claim.target() == self.target.handle()
+                })
+                .copied()
+                .map(Candidate::Derive),
+        );
+        candidates.extend(
+            discovered
+                .merges()
+                .iter()
+                .filter(|claim| claim.collection() == self.target.handle())
+                .copied()
+                .map(Candidate::TargetMerge),
+        );
+        candidates.sort_unstable_by_key(|candidate| (candidate.id(), candidate.kind_order()));
+        candidates
+    }
+
+    fn contains_typed<R: BlobStoreMeta>(
         &self,
         reader: &R,
-        validate: &V,
-        request: CollectionValidationRequest<'_>,
-    ) -> Result<CollectionClaimValidation<String>, ExactDerivedCollectionError>
-    where
-        R: BlobStoreGet + BlobStoreMeta,
-        V: for<'a> Fn(DerivedClaim<'a, Source, Target>) -> Result<(), String>,
-    {
-        let verdict = match request {
-            CollectionValidationRequest::Commit { claim } => {
-                let Some(data) = load_candidate::<_, Source>(reader, claim.data(), "read COMMIT")?
-                else {
-                    return Ok(CollectionClaimValidation::Pending);
-                };
-                validate(DerivedClaim::Commit { claim, data: &data })
-            }
-            CollectionValidationRequest::Merge { claim }
-                if claim.collection() == self.source.handle() =>
-            {
-                let Some((low, high, result)) =
-                    load_merge::<_, Source>(reader, claim, "read source MERGE")?
-                else {
-                    return Ok(CollectionClaimValidation::Pending);
-                };
-                validate(DerivedClaim::SourceMerge {
-                    claim,
-                    low: &low,
-                    high: &high,
-                    result: &result,
-                })
-            }
-            CollectionValidationRequest::Merge { claim }
-                if claim.collection() == self.target.handle() =>
-            {
-                let Some((low, high, result)) =
-                    load_merge::<_, Target>(reader, claim, "read target MERGE")?
-                else {
-                    return Ok(CollectionClaimValidation::Pending);
-                };
-                validate(DerivedClaim::TargetMerge {
-                    claim,
-                    low: &low,
-                    high: &high,
-                    result: &result,
-                })
-            }
-            CollectionValidationRequest::Derive { claim }
-                if claim.source() == self.source.handle()
-                    && claim.target() == self.target.handle() =>
-            {
-                let (input_data, output_data) = claim.mapping();
-                let Some(input) =
-                    load_candidate::<_, Source>(reader, input_data, "read DERIVE input")?
-                else {
-                    return Ok(CollectionClaimValidation::Pending);
-                };
-                let Some(output) =
-                    load_candidate::<_, Target>(reader, output_data, "read DERIVE output")?
-                else {
-                    return Ok(CollectionClaimValidation::Pending);
-                };
-                validate(DerivedClaim::Derive {
-                    claim,
-                    input: &input,
-                    output: &output,
-                })
-            }
-            CollectionValidationRequest::Merge { .. }
-            | CollectionValidationRequest::Derive { .. } => {
-                return Ok(CollectionClaimValidation::Pending);
-            }
-        };
-        Ok(match verdict {
-            Ok(()) => CollectionClaimValidation::Accepted,
-            Err(error) => CollectionClaimValidation::Rejected(error.to_string()),
-        })
+        data: TypedData,
+        operation: &'static str,
+    ) -> Result<bool, ExactDerivedCollectionError> {
+        match data {
+            TypedData::Source(data) => contains::<_, Source>(reader, data, operation),
+            TypedData::Target(data) => contains::<_, Target>(reader, data, operation),
+        }
     }
 }
 
-struct ExactProbe<R> {
-    reader: R,
-    cover: BTreeSet<CollectionData>,
+struct ExactProbe<R, Source: BlobEncoding, Target: BlobEncoding> {
+    _reader: R,
+    target_cover: ExactCover<Target>,
     missing: BTreeSet<CollectionData>,
     unsupported_commits: BTreeSet<Id>,
-    source_residual_cover: BTreeSet<CollectionData>,
+    source_residual_cover: Vec<(CollectionData, Blob<Source>)>,
 }
 
-impl<R: BlobStoreGet + BlobStoreMeta> ExactProbe<R> {
+impl<R, Source: BlobEncoding, Target: BlobEncoding> ExactProbe<R, Source, Target> {
     fn is_complete(&self) -> bool {
         self.missing.is_empty() && self.unsupported_commits.is_empty()
     }
@@ -612,19 +784,215 @@ impl<R: BlobStoreGet + BlobStoreMeta> ExactProbe<R> {
         }
     }
 
-    fn load_target_cover<Target>(self) -> Result<ExactCover<Target>, ExactDerivedCollectionError>
-    where
-        Target: BlobEncoding + 'static,
-        Handle<Target>: InlineEncoding,
-    {
-        let mut members = Vec::with_capacity(self.cover.len());
-        for data in self.cover {
-            members.push((
-                data,
-                require_exact::<_, Target>(&self.reader, data, "read selected target cover")?,
-            ));
+    fn into_target_cover(self) -> ExactCover<Target> {
+        self.target_cover
+    }
+}
+
+struct ValidatedPhysicalCover<E: BlobEncoding> {
+    cover: BTreeSet<CollectionData>,
+    missing: BTreeSet<CollectionData>,
+    blobs: BTreeMap<CollectionData, Blob<E>>,
+}
+
+fn validated_physical_cover<R, E, V>(
+    reader: &R,
+    semantics: &CollectionSemantics,
+    collection: CollectionId,
+    mut resident: BTreeSet<CollectionData>,
+    mandatory: &BTreeMap<CollectionData, Blob<E>>,
+    validate: V,
+) -> ValidatedPhysicalCover<E>
+where
+    R: BlobStoreGet + BlobStoreMeta,
+    E: BlobEncoding + 'static,
+    Handle<E>: InlineEncoding,
+    V: Fn(&Blob<E>) -> Result<(), String>,
+{
+    let mut selected = BTreeMap::new();
+    loop {
+        let physical = collection_physical_cover(semantics, collection, &resident);
+        selected.retain(|data, _| physical.cover.contains(data));
+        let mut rejected = Vec::new();
+        for data in physical.cover.iter().copied() {
+            if mandatory.contains_key(&data) || selected.contains_key(&data) {
+                continue;
+            }
+            let handle = Handle::<E>::from_hash(data);
+            let actual: Result<Blob<E>, _> = reader.get(handle);
+            match actual {
+                Ok(actual) if fresh_data_identity(&actual) == data && validate(&actual).is_ok() => {
+                    selected.insert(data, actual);
+                }
+                Ok(_) | Err(_) => rejected.push(data),
+            }
         }
-        Ok(ExactCover { members })
+        if rejected.is_empty() {
+            let mut blobs = selected;
+            for data in &physical.cover {
+                if let Some(blob) = mandatory.get(data) {
+                    blobs.insert(*data, blob.clone());
+                }
+            }
+            return ValidatedPhysicalCover {
+                cover: physical.cover,
+                missing: physical.missing,
+                blobs,
+            };
+        }
+        for data in rejected {
+            resident.remove(&data);
+        }
+    }
+}
+
+fn evaluate_candidates<Source, Target, A>(
+    candidates: &[Candidate],
+    candidate_indices: &BTreeSet<usize>,
+    roots: &BTreeSet<TypedData>,
+    known: &mut BTreeMap<TypedData, ScratchValue<Source, Target>>,
+    source_descriptor: &CollectionDescriptor,
+    target_descriptor: &CollectionDescriptor,
+    algebra: &A,
+) -> (BTreeSet<Id>, BTreeMap<Id, String>)
+where
+    Source: BlobEncoding,
+    Target: BlobEncoding,
+    A: ExactDerivedAlgebra<Source, Target> + ?Sized,
+{
+    let mut missing = vec![u8::MAX; candidates.len()];
+    let mut waiters = BTreeMap::<TypedData, Vec<usize>>::new();
+    let mut remaining_uses = BTreeMap::<TypedData, usize>::new();
+    let mut ready = BTreeSet::new();
+
+    for &index in candidate_indices {
+        let candidate = candidates[index];
+        let (first, second) = candidate.inputs();
+        let mut count = 0u8;
+        for input in [Some(first), second].into_iter().flatten() {
+            *remaining_uses.entry(input).or_default() += 1;
+            if !known.contains_key(&input) {
+                waiters.entry(input).or_default().push(index);
+                count += 1;
+            }
+        }
+        missing[index] = count;
+        if count == 0 {
+            ready.insert((candidate.id(), candidate.kind_order(), index));
+        }
+    }
+
+    let mut accepted = BTreeSet::new();
+    let mut rejected = BTreeMap::new();
+    while let Some((_, _, index)) = ready.pop_first() {
+        let candidate = candidates[index];
+        let result = candidate.result();
+        match evaluate_candidate(candidate, known, algebra) {
+            Ok(value) => {
+                let actual = match &value {
+                    ScratchValue::Source(blob) => fresh_data_identity(blob),
+                    ScratchValue::Target(blob) => fresh_data_identity(blob),
+                };
+                let representation = match &value {
+                    ScratchValue::Source(blob) => algebra.validate_source(source_descriptor, blob),
+                    ScratchValue::Target(blob) => algebra.validate_target(target_descriptor, blob),
+                };
+                if actual != result.data() {
+                    rejected.insert(
+                        candidate.id(),
+                        format!(
+                            "canonical result hashes to {} instead of {}",
+                            hex::encode_upper(actual.raw),
+                            hex::encode_upper(result.data().raw),
+                        ),
+                    );
+                } else if let Err(reason) = representation {
+                    rejected.insert(candidate.id(), reason);
+                } else {
+                    let retain_result =
+                        remaining_uses.get(&result).copied().unwrap_or_default() > 0;
+                    let inserted = !known.contains_key(&result) && retain_result;
+                    if inserted {
+                        known.insert(result, value);
+                    }
+                    accepted.insert(candidate.id());
+                    if inserted {
+                        for dependent_index in waiters.remove(&result).unwrap_or_default() {
+                            debug_assert!(
+                                missing[dependent_index] > 0 && missing[dependent_index] <= 2
+                            );
+                            missing[dependent_index] -= 1;
+                            if missing[dependent_index] == 0 {
+                                let dependent = candidates[dependent_index];
+                                ready.insert((
+                                    dependent.id(),
+                                    dependent.kind_order(),
+                                    dependent_index,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            Err(reason) => {
+                rejected.insert(candidate.id(), reason);
+            }
+        }
+
+        let (first, second) = candidate.inputs();
+        for input in [Some(first), second].into_iter().flatten() {
+            let uses = remaining_uses
+                .get_mut(&input)
+                .expect("candidate inputs have reference counts");
+            debug_assert!(*uses > 0);
+            *uses -= 1;
+            if *uses == 0 && !roots.contains(&input) {
+                known.remove(&input);
+            }
+        }
+    }
+
+    (accepted, rejected)
+}
+
+fn evaluate_candidate<Source, Target, A>(
+    candidate: Candidate,
+    known: &BTreeMap<TypedData, ScratchValue<Source, Target>>,
+    algebra: &A,
+) -> Result<ScratchValue<Source, Target>, String>
+where
+    Source: BlobEncoding,
+    Target: BlobEncoding,
+    A: ExactDerivedAlgebra<Source, Target> + ?Sized,
+{
+    match candidate {
+        Candidate::SourceMerge(claim) => {
+            let (low, high) = claim.inputs();
+            let Some(ScratchValue::Source(low)) = known.get(&TypedData::Source(low)) else {
+                return Err("source merge became ready without its low input".to_owned());
+            };
+            let Some(ScratchValue::Source(high)) = known.get(&TypedData::Source(high)) else {
+                return Err("source merge became ready without its high input".to_owned());
+            };
+            algebra.join_source(low, high).map(ScratchValue::Source)
+        }
+        Candidate::Derive(claim) => {
+            let input = claim.mapping().0;
+            let Some(ScratchValue::Source(input)) = known.get(&TypedData::Source(input)) else {
+                return Err("derive became ready without its source input".to_owned());
+            };
+            algebra.derive(input).map(ScratchValue::Target)
+        }
+        Candidate::TargetMerge(claim) => {
+            let (low, high) = claim.inputs();
+            let Some(ScratchValue::Target(low)) = known.get(&TypedData::Target(low)) else {
+                return Err("target merge became ready without its low input".to_owned());
+            };
+            let Some(ScratchValue::Target(high)) = known.get(&TypedData::Target(high)) else {
+                return Err("target merge became ready without its high input".to_owned());
+            };
+            algebra.join_target(low, high).map(ScratchValue::Target)
+        }
     }
 }
 
@@ -664,25 +1032,6 @@ fn exact_ticket_ids(
     Ok(ids)
 }
 
-fn resident_members<R, E>(
-    reader: &R,
-    members: Option<&BTreeSet<CollectionData>>,
-    operation: &'static str,
-) -> Result<BTreeSet<CollectionData>, ExactDerivedCollectionError>
-where
-    R: BlobStoreMeta,
-    E: BlobEncoding + 'static,
-    Handle<E>: InlineEncoding,
-{
-    let mut resident = BTreeSet::new();
-    for data in members.into_iter().flatten() {
-        if contains::<_, E>(reader, *data, operation)? {
-            resident.insert(*data);
-        }
-    }
-    Ok(resident)
-}
-
 fn contains<R, E>(
     reader: &R,
     data: CollectionData,
@@ -716,56 +1065,6 @@ where
         .get(Handle::<E>::from_hash(data))
         .map(Some)
         .map_err(|error| ExactDerivedCollectionError::storage(operation, error))
-}
-
-fn require_exact<R, E>(
-    reader: &R,
-    data: CollectionData,
-    operation: &'static str,
-) -> Result<Blob<E>, ExactDerivedCollectionError>
-where
-    R: BlobStoreGet + BlobStoreMeta,
-    E: BlobEncoding + 'static,
-    Handle<E>: InlineEncoding,
-{
-    let blob = load_candidate(reader, data, operation)?.ok_or_else(|| {
-        ExactDerivedCollectionError::IncompleteCover {
-            missing: vec![data],
-            unsupported_commits: Vec::new(),
-        }
-    })?;
-    let actual = fresh_data_identity(&blob);
-    if actual != data {
-        return Err(ExactDerivedCollectionError::Resolution(format!(
-            "selected resident bytes hash to {} instead of {}",
-            hex::encode_upper(actual.raw),
-            hex::encode_upper(data.raw),
-        )));
-    }
-    Ok(blob)
-}
-
-fn load_merge<R, E>(
-    reader: &R,
-    claim: &CollectionMerge,
-    operation: &'static str,
-) -> Result<Option<(Blob<E>, Blob<E>, Blob<E>)>, ExactDerivedCollectionError>
-where
-    R: BlobStoreGet + BlobStoreMeta,
-    E: BlobEncoding + 'static,
-    Handle<E>: InlineEncoding,
-{
-    let (low_data, high_data) = claim.inputs();
-    let Some(low) = load_candidate(reader, low_data, operation)? else {
-        return Ok(None);
-    };
-    let Some(high) = load_candidate(reader, high_data, operation)? else {
-        return Ok(None);
-    };
-    let Some(result) = load_candidate(reader, claim.result(), operation)? else {
-        return Ok(None);
-    };
-    Ok(Some((low, high, result)))
 }
 
 fn fresh_data_identity<E: BlobEncoding>(blob: &Blob<E>) -> CollectionData {

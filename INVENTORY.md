@@ -49,17 +49,6 @@
   `book/src/query-language.md#recursive-traversal`.
 
 ## Desired Functionality
-- Complete the native exact-ticket Succinct lifecycle before considering any
-  `SuccinctRollup` migration. Current `MERGE`/`DERIVE` validation requires every
-  equation endpoint to remain resident, but retention roots only signed commit
-  authority rather than the complete unsigned proof graph. Prefer recursive,
-  deterministic reconstruction: generalize `Collection::snapshot`'s
-  backward-from-resident-results and forward use-counted evaluation across
-  source `MERGE` -> `DERIVE` -> target `MERGE`, keeping signed leaves as the
-  only roots and adding no receipts, records, or retention policy. Test attach
-  after garbage collection of subsumed intermediates. Retaining the whole
-  proof closure or publishing durable validation receipts are heavier
-  alternatives, not the intended first design.
 - Add a native target-compaction producer and policy above
   `ExactDerivedCollection`. It should publish canonical raw Succinct `MERGE`
   outputs with the same dependency ordering, remain separate from admission,

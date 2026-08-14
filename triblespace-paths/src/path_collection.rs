@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::collection::exact_derived::{
-    DerivedClaim, ExactCover, ExactDerivedCollection, ExactDerivedCollectionError,
+    ExactCover, ExactDerivedAlgebra, ExactDerivedCollection, ExactDerivedCollectionError,
 };
 use triblespace_core::collection::simplearchive_union;
 use triblespace_core::collection::{CollectionCommit, CollectionDescriptor, CollectionStore};
@@ -101,9 +101,7 @@ impl PathSummaryCollection {
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
     {
-        let cover = self
-            .kernel()
-            .attach_exact(store, ticket, |claim| self.validate_claim(claim))?;
+        let cover = self.kernel().attach_exact(store, ticket, self)?;
         self.index_from_cover(cover).map(Arc::new)
     }
 
@@ -121,65 +119,12 @@ impl PathSummaryCollection {
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
     {
-        let cover = self.kernel().ensure_exact(
-            store,
-            ticket,
-            |claim| self.validate_claim(claim),
-            |source| path_summary_union::derive_element(source, &self.automaton),
-        )?;
+        let cover = self.kernel().ensure_exact(store, ticket, self)?;
         self.index_from_cover(cover).map(Arc::new)
     }
 
     fn kernel(&self) -> ExactDerivedCollection<SimpleArchive, PathSummaryBlob> {
         ExactDerivedCollection::new(self.source_descriptor(), self.descriptor())
-    }
-
-    fn validate_claim(
-        &self,
-        claim: DerivedClaim<'_, SimpleArchive, PathSummaryBlob>,
-    ) -> Result<(), String> {
-        let source = self.source_descriptor();
-        let target = self.descriptor();
-        match claim {
-            DerivedClaim::Commit { claim, data } => {
-                simplearchive_union::validate_commit(&source, claim, data)
-                    .map_err(|error| error.to_string())
-            }
-            DerivedClaim::SourceMerge {
-                claim,
-                low,
-                high,
-                result,
-            } => simplearchive_union::validate_merge(&source, claim, low, high, result)
-                .map_err(|error| error.to_string()),
-            DerivedClaim::TargetMerge {
-                claim,
-                low,
-                high,
-                result,
-            } => path_summary_union::validate_merge(
-                &target,
-                claim,
-                low,
-                high,
-                result,
-                &self.automaton,
-            )
-            .map_err(|error| error.to_string()),
-            DerivedClaim::Derive {
-                claim,
-                input,
-                output,
-            } => path_summary_union::validate_derive(
-                &source,
-                &target,
-                claim,
-                input,
-                output,
-                &self.automaton,
-            )
-            .map_err(|error| error.to_string()),
-        }
     }
 
     fn index_from_cover(
@@ -194,6 +139,56 @@ impl PathSummaryCollection {
         let summary = PathSummaryBlob::decode(joined, &self.automaton)
             .map_err(PathSummaryCollectionError::Summary)?;
         PathIndex::from_summary(summary).map_err(PathSummaryCollectionError::Index)
+    }
+}
+
+impl ExactDerivedAlgebra<SimpleArchive, PathSummaryBlob> for PathSummaryCollection {
+    fn validate_source(
+        &self,
+        descriptor: &CollectionDescriptor,
+        source: &triblespace_core::blob::Blob<SimpleArchive>,
+    ) -> Result<(), String> {
+        if *descriptor != self.source_descriptor() {
+            return Err("source descriptor does not match this path collection".to_owned());
+        }
+        simplearchive_union::validate_element(source).map_err(|error| error.to_string())
+    }
+
+    fn validate_target(
+        &self,
+        descriptor: &CollectionDescriptor,
+        target: &triblespace_core::blob::Blob<PathSummaryBlob>,
+    ) -> Result<(), String> {
+        if *descriptor != self.descriptor() {
+            return Err("target descriptor does not match this path collection".to_owned());
+        }
+        PathSummaryBlob::decode(target.clone(), &self.automaton)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn join_source(
+        &self,
+        low: &triblespace_core::blob::Blob<SimpleArchive>,
+        high: &triblespace_core::blob::Blob<SimpleArchive>,
+    ) -> Result<triblespace_core::blob::Blob<SimpleArchive>, String> {
+        simplearchive_union::join(low, high).map_err(|error| error.to_string())
+    }
+
+    fn derive(
+        &self,
+        source: &triblespace_core::blob::Blob<SimpleArchive>,
+    ) -> Result<triblespace_core::blob::Blob<PathSummaryBlob>, String> {
+        path_summary_union::derive_element(source, &self.automaton)
+            .map_err(|error| error.to_string())
+    }
+
+    fn join_target(
+        &self,
+        low: &triblespace_core::blob::Blob<PathSummaryBlob>,
+        high: &triblespace_core::blob::Blob<PathSummaryBlob>,
+    ) -> Result<triblespace_core::blob::Blob<PathSummaryBlob>, String> {
+        path_summary_union::join(low, high, &self.automaton).map_err(|error| error.to_string())
     }
 }
 
@@ -570,9 +565,7 @@ mod tests {
             .unwrap();
         let cover = paths
             .kernel()
-            .attach_exact(&mut store, &[first, second], |claim| {
-                paths.validate_claim(claim)
-            })
+            .attach_exact(&mut store, &[first, second], &paths)
             .unwrap();
         assert_eq!(cover.len(), 1);
         assert_eq!(cover.members()[0].0, joined_data);

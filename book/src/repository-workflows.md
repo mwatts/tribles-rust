@@ -151,17 +151,20 @@ store. An empty ticket performs no storage I/O and receives one process-local
 empty query shard; a signed commit whose source data happens to be empty still
 has ordinary persisted derivation provenance.
 
-This API currently treats unsigned equations as resident cache evidence rather
-than durable receipts. Every endpoint needed to validate a `MERGE` or `DERIVE`
-must still be resident on the next attachment, and collection retention does
-not yet preserve that complete proof graph through garbage collection. Missing
-cache endpoints make the claim pending rather than granting incomplete
-authority, and `ensure_exact` can still fall back to signed resident leaves;
-the limitation is cache completeness, not correctness. It also does not
-schedule target compaction, persists no Rank9 sidecars (attachment rebuilds
-them in memory), and inherits the raw format's per-shard `u32::MAX` row and
-domain limits. Keep using `SuccinctRollup` where those durable lifecycle
-guarantees are required; the exact-ticket facade is not yet its replacement.
+Unsigned equations remain reproducible cache evidence rather than durable
+receipts or authority. Their intermediate blobs need not remain resident:
+attachment walks backwards from resident source and target results, then
+reconstructs the finite candidate graph forwards from authenticated source
+leaves. Canonical intermediates live only in use-counted scratch. The selected
+physical artifacts are freshly hashed and representation-validated; an invalid
+optional upper artifact is removed and the cover is recomputed from valid lower
+members. This reconstruction writes no blobs or records and requires no new
+retention roots.
+
+The facade still does not schedule target compaction, persists no Rank9
+sidecars (attachment rebuilds them in memory), and inherits the raw format's
+per-shard `u32::MAX` row and domain limits. `SuccinctRollup` remains available
+unchanged for code that still uses its legacy lifecycle.
 
 ## Opening a repository
 
