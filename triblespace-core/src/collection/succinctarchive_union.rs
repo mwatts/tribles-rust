@@ -25,6 +25,7 @@ use crate::blob::encodings::succinctarchive::{
 };
 use crate::blob::{Blob, BlobEncoding};
 use crate::id::Id;
+use crate::id_hex;
 use crate::inline::encodings::hash::{Blake3, Hash};
 use crate::inline::Inline;
 use crate::metadata::MetaDescribe;
@@ -35,7 +36,50 @@ use super::{
 };
 
 mod collection;
+mod rank9_fiber;
 pub use collection::*;
+pub use rank9_fiber::Rank9FiberError;
+
+/// Lifted Rank9-union recipe for 32-bit little-endian targets.
+///
+/// Minted with `trible genid` on 2026-08-14. The profile pins the current portable
+/// SuccinctArchive source schema, detached Rank9 format
+/// marker/version/flags, the canonical Rank9 builder and Jerky serialization
+/// epoch, pointer width, and byte order. Any change that can alter canonical
+/// sidecar bytes requires a newly minted recipe id.
+pub const RANK9_LIFTED_UNION_RECIPE_V1_32_LE: Id = id_hex!("0685616E15F332468977EB59BDA4EB9D");
+
+/// Lifted Rank9-union recipe for 32-bit big-endian targets.
+///
+/// Minted with `trible genid` on 2026-08-14; see
+/// [`RANK9_LIFTED_UNION_RECIPE_V1_32_LE`] for the versioning contract.
+pub const RANK9_LIFTED_UNION_RECIPE_V1_32_BE: Id = id_hex!("154A792188583355B1CDAA9910E60748");
+
+/// Lifted Rank9-union recipe for 64-bit little-endian targets.
+///
+/// Minted with `trible genid` on 2026-08-14; see
+/// [`RANK9_LIFTED_UNION_RECIPE_V1_32_LE`] for the versioning contract.
+pub const RANK9_LIFTED_UNION_RECIPE_V1_64_LE: Id = id_hex!("E4A77808BBF9E373244789F007E81261");
+
+/// Lifted Rank9-union recipe for 64-bit big-endian targets.
+///
+/// Minted with `trible genid` on 2026-08-14; see
+/// [`RANK9_LIFTED_UNION_RECIPE_V1_32_LE`] for the versioning contract.
+pub const RANK9_LIFTED_UNION_RECIPE_V1_64_BE: Id = id_hex!("A470EAEB76777091CE795D9B108C79D0");
+
+#[cfg(all(target_pointer_width = "32", target_endian = "little"))]
+const CURRENT_RANK9_LIFTED_UNION_RECIPE: Id = RANK9_LIFTED_UNION_RECIPE_V1_32_LE;
+#[cfg(all(target_pointer_width = "32", target_endian = "big"))]
+const CURRENT_RANK9_LIFTED_UNION_RECIPE: Id = RANK9_LIFTED_UNION_RECIPE_V1_32_BE;
+#[cfg(all(target_pointer_width = "64", target_endian = "little"))]
+const CURRENT_RANK9_LIFTED_UNION_RECIPE: Id = RANK9_LIFTED_UNION_RECIPE_V1_64_LE;
+#[cfg(all(target_pointer_width = "64", target_endian = "big"))]
+const CURRENT_RANK9_LIFTED_UNION_RECIPE: Id = RANK9_LIFTED_UNION_RECIPE_V1_64_BE;
+
+/// Recipe id for the exact Rank9 ABI supported by this build.
+pub const fn current_rank9_lifted_union_recipe() -> Id {
+    CURRENT_RANK9_LIFTED_UNION_RECIPE
+}
 
 /// A collection descriptor participating in a validation failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

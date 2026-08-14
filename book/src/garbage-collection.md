@@ -60,6 +60,15 @@ durable ownership. This boundary also means the strong planner needs neither a
 requested-view set nor persistent validation-verdict machinery: admitted
 commits themselves determine the collections that are retained.
 
+Exact Succinct Rank9 fibers follow the same rule. Their raw-to-Rank9 `DERIVE`
+records may survive a conservative ledger rewrite, but neither the
+ABI-qualified Rank9 descriptor nor the source-bound sidecar becomes owned by
+that unsigned equation. A later `attach_exact` treats the missing fiber as a
+cache miss and rebuilds the query accelerator transiently without writes. A
+later `ensure_exact` republishes the canonical descriptor and sidecar, reuses
+the surviving claim instead of duplicating it, and freshly verifies the exact
+raw/sidecar pair. No Rank9-specific retention record or hidden root is needed.
+
 The resulting roots compose with both storage paths. Yard's `collect` and
 `compact` require them as explicit policy roots; callers pass an empty
 `RetentionRoots` deliberately when legacy strong pins are the only strong

@@ -49,12 +49,12 @@
   `book/src/query-language.md#recursive-traversal`.
 
 ## Desired Functionality
-- Choose the native Succinct accelerator and oversized-shard policies. The
-  exact-ticket facade currently rebuilds Rank9 indexes in memory and ignores
-  persisted sidecars; a single derived raw shard also rejects more than
-  `u32::MAX` rows or domain values. Decide when to retain source-bound Rank9
-  artifacts and how to split/spool oversized source covers without changing
-  collection identity.
+- Choose the oversized native Succinct shard policy. Exact-ticket Rank9
+  acceleration now has an ABI-qualified, source-bound persisted fiber with
+  transient fallback and cache-only retention semantics, but a single derived
+  raw shard still rejects more than `u32::MAX` rows or domain values. Decide
+  how to split or spool oversized source covers without changing collection
+  identity.
 - Extract a representation-neutral crash-ordered publisher for unsigned
   collection equations: persist endpoint artifacts, flush dependencies, insert
   the validated `DERIVE` or `MERGE`, then flush the record. The existing staged

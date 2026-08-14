@@ -15,12 +15,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lowering, descriptors-before-outputs-before-`DERIVE` publication, and fresh
   read-side re-admission without `PinStore` or an implicit flush. Regular paths
   use this kernel, and the new `SuccinctArchiveCollection` facade returns the
-  exact raw target cover as an owned sharded `UnionArchive`. It preserves
-  physical shards and rebuilds their Rank9 query accelerators only in process;
-  it does not persist or consume Rank9 sidecars. An empty ticket performs no
-  storage I/O and receives one authority-free local empty query shard, whereas
-  a signed commit over empty source data still publishes an ordinary
-  provenance-bearing `DERIVE`.
+  exact raw target cover as an owned sharded `UnionArchive`, preserving that
+  cover's physical shape while attaching an exact Rank9 accelerator fiber to
+  each selected raw member. The fiber uses an ABI-, format-, and
+  builder-version-qualified lifted collection whose join is defined by
+  `i(a) join i(b) = i(a join b)`, so ordinary raw-to-Rank9 `DERIVE` records are
+  truthful without introducing Rank9 `MERGE` records. Four explicitly minted
+  recipe ids distinguish 32/64-bit and little/big-endian profiles; the current
+  target selects exactly one. An empty ticket performs no storage I/O and
+  receives one authority-free local empty query shard, whereas a signed commit
+  over empty source data still publishes ordinary provenance-bearing raw and
+  Rank9 `DERIVE` evidence.
+
+  Rank9 evidence is optional cache state, not a second authoritative derived
+  collection. Attachment scans the record ledger once, accepts at most one
+  distinct claimed output after fresh source/sidecar hashes, source-header,
+  and exact pair validation, and otherwise rebuilds that member's runtime
+  transiently without writes. Ensuring publishes both descriptors and every
+  missing canonical sidecar before any new equation, then strictly re-reads
+  the exact expected raw/sidecar pairs and claims through a fresh reader. It
+  adds no signed root, receipt, manifest, scheduler, retention root, flush, or
+  Rank9 compactor. A complete probe performs no writes, and retries repair a
+  collected or corrupt canonical endpoint without duplicating its existing
+  `DERIVE`.
 
   Exact attachment no longer requires unsigned intermediate blobs to survive
   garbage collection. A five-operation representation algebra validates the
@@ -31,8 +48,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Selected optional artifacts are freshly hashed and representation-validated;
   invalid cache bytes are removed and the deterministic physical cover is
   recomputed. This adds neither receipts nor authority/retention records, and a
-  complete `attach_exact` or `ensure_exact` remains write-free even after a
-  retained Pile rewrite collected the intermediate proof blobs.
+  `attach_exact` remains write-free even after a retained Pile rewrite collects
+  intermediate proof blobs or optional Rank9 sidecars; `ensure_exact` repairs
+  only the missing canonical cache endpoints and is write-free again once the
+  exact fibers are resident.
 
   Explicit native target compaction is now available through the generic
   `collection::exact_target_compaction::compact_exact_target` producer and the
@@ -43,9 +62,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and freshly re-admits every round under the same exact ticket. Stable covers
   add no writes; repeated and concurrent work is content-addressed and
   idempotent; no flush, planner, manifest, receipt, retention root, background
-  task, or authority record is introduced. Persisted accelerators remain out of
-  scope, each raw shard retains the explicit `u32::MAX` row/domain boundary,
-  and the legacy `SuccinctRollup` remains available unchanged.
+  task, or authority record is introduced. Rank9 fibers are built only for the
+  final selected raw cover, never for compacted-away leaves; each raw shard
+  retains the explicit `u32::MAX` row/domain boundary, and the legacy
+  `SuccinctRollup` remains available unchanged.
 - **Regular paths now use one exact native collection path.**
   `PathSummaryCollection::{attach_exact, ensure_exact}` validates a frozen set
   of signed `SimpleArchive` commits, reuses canonical source merges, target

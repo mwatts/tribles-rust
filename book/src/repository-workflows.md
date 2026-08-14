@@ -155,6 +155,31 @@ store. An empty ticket performs no storage I/O and receives one process-local
 empty query shard; a signed commit whose source data happens to be empty still
 has ordinary persisted derivation provenance.
 
+Once that raw cover is fixed, the facade attaches one source-bound Rank9
+sidecar per selected member. These fibers live in a separate collection
+descriptor whose recipe pins the raw/sidecar format, builder version, native
+pointer width, and byte order. The four version-1 recipe ids distinguish
+32/64-bit and little/big-endian builds; the active compilation target selects
+one. This target collection is the lifted image `i(a)` of the raw lattice, with
+`i(a) join i(b) = i(a join b)`. An ordinary raw-to-Rank9 `DERIVE` therefore
+states the true homomorphism, even though this lifecycle never materializes a
+Rank9 `MERGE`.
+
+`attach_exact` treats those records and blobs as optional cache evidence. It
+scans the ledger once, accepts a unique claimed output only after fresh hashes,
+the embedded raw-source handle, and `SuccinctArchive::from_blob_pair` all
+agree, and falls back to a transient Rank9 rebuild for missing, corrupt,
+mismatched, or ambiguous evidence without writing. `ensure_exact` computes the
+one canonical sidecar for each incomplete raw member, puts both descriptors and
+all missing sidecars before new claims, then opens a fresh reader and strictly
+checks the exact expected raw endpoints, sidecars, source headers, and
+`DERIVE`s. A complete probe writes nothing. If a canonical claim survives but
+its endpoint does not, repair stores the endpoint without appending a duplicate
+claim. Persisted Rank9 validation is linear and does not build another Rank9
+index; reconstructing a query runtime still allocates its runtime arena and
+views, while transient fallback additionally allocates and builds the missing
+index bytes.
+
 `compact_exact` first performs ordinary exact completion, then groups the
 admitted canonical raw target members into fixed dyadic serialized-byte tiers.
 It repeatedly joins the two lowest content handles in the lowest colliding
@@ -176,10 +201,12 @@ optional upper artifact is removed and the cover is recomputed from valid lower
 members. This reconstruction writes no blobs or records and requires no new
 retention roots.
 
-The facade never schedules compaction in the background and persists no Rank9
-sidecars (attachment rebuilds them in memory). Explicit compaction inherits the
-raw format's per-shard `u32::MAX` row and domain limits; an unrepresentable
-canonical join fails rather than silently weakening the tier guarantee.
+The facade never schedules compaction in the background. Rank9 fibers add no
+signed root, receipt, manifest, retention root, durability flush, policy knob,
+or target-side compactor; explicit compaction first selects the raw cover and
+then builds fibers only for those selected members. The raw format's per-shard
+`u32::MAX` row and domain limits still apply, so an unrepresentable canonical
+join fails rather than silently weakening the tier guarantee.
 `SuccinctRollup` remains available unchanged for code that still uses its
 legacy lifecycle.
 
