@@ -164,36 +164,36 @@ fn main() {
     let baseline = CURRENT.load(Ordering::Relaxed);
     PEAK.store(baseline, Ordering::Relaxed);
     let merge_started = Instant::now();
-    let merged = PortableBM25Index::merge(segments.iter()).expect("canonical segments merge");
-    let elapsed = merge_started.elapsed();
+    let resident = PortableBM25Index::merge(segments.iter()).expect("canonical segments merge");
+    let resident_build = merge_started.elapsed();
     let extra_heap = PEAK.load(Ordering::Relaxed).saturating_sub(baseline);
-    let digest = blake3::hash(merged.bytes().as_ref());
+    let digest = blake3::hash(resident.bytes().as_ref());
 
     println!(
-        "merge {:.3}s; heap peak +{}; output {}; blake3 {}",
-        elapsed.as_secs_f64(),
+        "resident merge {:.3}s; heap peak +{}; output {}; blake3 {}",
+        resident_build.as_secs_f64(),
         fmt_bytes(extra_heap),
-        fmt_bytes(merged.bytes().len()),
+        fmt_bytes(resident.bytes().len()),
         digest.to_hex(),
     );
 
     let query = [term_from_u64(0), term_from_u64(1), term_from_u64(2)];
-    let resident_started = Instant::now();
-    let resident = PortableBM25Index::merge(segments.iter()).expect("portable resident merge");
-    let resident_build = resident_started.elapsed();
-
-    let merged_blob: Blob<PortableBM25Blob> = (&merged).to_blob();
+    let encode_started = Instant::now();
+    let merged_blob: Blob<PortableBM25Blob> = (&resident).to_blob();
+    let encode = encode_started.elapsed();
+    let reattach_started = Instant::now();
     let reattached: PortableBM25Index<GenId, WordHash> =
         PortableBM25Index::try_from_blob(merged_blob)
             .expect("merge output is a valid portable BM25 artifact");
+    let reattach = reattach_started.elapsed();
     let resident_expected = resident.query_multi(&query);
-    let compacted_expected = reattached.query_multi(&query);
+    let reattached_expected = reattached.query_multi(&query);
     assert_eq!(
         resident_expected
             .iter()
             .map(|(document, score)| (document.raw, score.to_bits()))
             .collect::<Vec<_>>(),
-        compacted_expected
+        reattached_expected
             .iter()
             .map(|(document, score)| (document.raw, score.to_bits()))
             .collect::<Vec<_>>()
@@ -206,11 +206,11 @@ fn main() {
     }
     let resident_query = average(resident_query_started.elapsed(), QUERY_ITERATIONS);
 
-    let compacted_started = Instant::now();
+    let reattached_started = Instant::now();
     for _ in 0..QUERY_ITERATIONS {
         black_box(reattached.query_multi(black_box(&query)));
     }
-    let compacted_query = average(compacted_started.elapsed(), QUERY_ITERATIONS);
+    let reattached_query = average(reattached_started.elapsed(), QUERY_ITERATIONS);
 
     const ONE_SHOT_ITERATIONS: u32 = 3;
     let one_shot_started = Instant::now();
@@ -222,10 +222,11 @@ fn main() {
     let one_shot_query = average(one_shot_started.elapsed(), ONE_SHOT_ITERATIONS);
 
     println!(
-        "resident merge {:.3}ms; 3-term query resident {:.3}µs, reattached {:.3}µs, one-shot {:.3}ms",
-        resident_build.as_secs_f64() * 1_000.0,
+        "encode {:.3}µs; reattach {:.3}µs; 3-term query resident {:.3}µs, reattached {:.3}µs, one-shot {:.3}ms",
+        encode.as_secs_f64() * 1_000_000.0,
+        reattach.as_secs_f64() * 1_000_000.0,
         resident_query.as_secs_f64() * 1_000_000.0,
-        compacted_query.as_secs_f64() * 1_000_000.0,
+        reattached_query.as_secs_f64() * 1_000_000.0,
         one_shot_query.as_secs_f64() * 1_000.0,
     );
 }

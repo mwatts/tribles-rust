@@ -337,7 +337,7 @@ impl<D: InlineEncoding, T: InlineEncoding> BM25Builder<D, T> {
 }
 
 /// Canonicalize builder rows under the same `(Docs, F)` join used by the
-/// succinct representation and range rollups. Repetitions within one row sum;
+/// succinct and portable representations. Repetitions within one row sum;
 /// rows sharing a document key join by pointwise max. Document keys are kept
 /// even when their joined token bag is empty and sorted for deterministic
 /// internal codes.

@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   helpers are removed. `SuccinctArchiveCollection` owns exact completion,
   deterministic target compaction, sharded `UnionArchive` queries, and optional
   Rank9 fibers. The unused branch-bound read wrapper and snapshot type are also
-  gone; the generic range-manifest primitives remain for BM25 and HNSW.
+  gone; the generic range-manifest primitives remain for HNSW.
 - **The SuccinctArchive example now follows the native collection lifecycle.**
   `native_succinct_collection` publishes intrinsic fragments as independent
   signed commits, freezes authority with a record-only ticket, and queries an
@@ -2251,9 +2251,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Repository::register_index` receives parents-first `CommitBatch` values and
   appends one inclusive logical leaf per newly reachable commit; hook mutation
   is scratch-atomic and failures remain drainable through `take_hook_errors`
-  without blocking the source commit. BM25 and HNSW recipes in
-  `triblespace-search` use the typed range surface; callers parse `Manifest`
-  snapshots and attach the bounded artifact set through their `IndexKind`.
+  without blocking the source commit. The HNSW recipe in
+  `triblespace-search` uses the typed range surface; callers parse `Manifest`
+  snapshots and attach the bounded artifact set through its `IndexKind`.
 - **Async blob-store trait family.** New
   `triblespace_core::repo::async_store` module: `AsyncBlobStoreGet` /
   `AsyncBlobStorePut` / `AsyncBlobStoreList` / `AsyncBlobStore` /

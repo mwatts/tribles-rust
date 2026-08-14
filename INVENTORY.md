@@ -66,9 +66,9 @@
   spool plus stable radix/counting passes into the final portable sink; choose
   it structurally from representability, not a tuning threshold.
 - If exact Succinct collection maintenance is accelerated again, build and
-  measure a direct adapter over canonical raw collection blobs. Do not route it
-  through the legacy `IndexKind` lifecycle or restore an adaptive threshold and
-  process-local circuit breaker around the low-level freeze backend.
+  measure a direct adapter over canonical raw collection blobs. Do not restore
+  an adaptive threshold and process-local circuit breaker around the low-level
+  freeze backend.
 - Reconcile the residual branch's workspace-wide rustfmt baseline (or pin the
   intended formatter toolchain): `cargo fmt --all` currently rewrites many
   unrelated files, obscuring focused query-engine diffs.
@@ -228,30 +228,10 @@ prioritized for efficient zero-copy access.
   replace the exact git-revision pins in `triblespace-core` and
   `triblespace-search` before the next crates.io release. The git pin is an
   intentional integration bridge, not the final publishable dependency.
-- Index-home kind IDs currently identify the implementation but not the full
-  index recipe. Derive or persist recipe identity for configuration such as a
-  BM25 content attribute/tokenizer version and HNSW dimensions/metric so
-  incompatible segment families cannot share one manifest or coverage
-  certificate.
-- Wire the portable exact-TF BM25 carrier into collection derivation only once
-  the source attribute and tokenizer recipe have an explicit identity. The
-  carrier deliberately accepts exact typed counts and does not silently choose
-  an Archive field or tokenization policy.
 - Define archive-message semantics when one entity carries multiple content
   handles. BM25 preserves the union of their term presence, while result
   materialisation currently selects one matching body; either make the schema
   cardinality explicit or make resolution deterministic and test it.
-- Make `IndexKind::build` fallible (or split out a fallible resolver-backed
-  build surface). BM25/HNSW kinds cannot currently report an unreadable source
-  handle through the trait; archive indexing prevalidates LongString content,
-  but generic callers can otherwise build a segment that silently omits it.
-- Extend commit-native index-home testing with an interrupted bootstrap over a
-  true merge DAG (multi-tip frontier plus CAS conflict), an actual commit above
-  the physical shard threshold proving all shards share one atomic coverage
-  advance, and explicit backward/divergent branch-head rejection.
-- Property-test BM25 max-union compaction across randomized segment
-  permutations, repeated multi-level FANOUT merges, and high term frequencies
-  near score-quantization saturation.
 - The optional CubeCL succinct-merge backend's per-level block-prefix scan is
   still one serial device thread. Packed CPU reduced the measured WGPU gain to
   5–8% on large Apple Metal tiers; investigate a hierarchical device scan and

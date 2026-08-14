@@ -8,10 +8,10 @@ logical invariants:
 1. **Content-addressed.** Same corpus → same blob hash. Rebuilds
    are free when nothing has changed; same content embedded with
    the same model yields the same blob everywhere in the pile.
-2. **Immutable range artifacts, no mutation.** A build or merge returns a
-   fresh content-addressed segment. Range rollups publish complete standalone
-   alternatives without replacing prior nodes; direct callers may also persist
-   the handle in ordinary tribles.
+2. **Immutable artifacts, no mutation.** A build or merge returns a fresh
+   content-addressed artifact without replacing prior nodes. Collection-owned
+   callers publish exact joins through their own evidence model; direct callers
+   may also persist the handle in ordinary tribles.
 3. **Typed self-contained bytes.** `try_from_blob` validates the representation
    selected by the handle type. Portable BM25 keeps a gapless fixed-width
    grammar; the native succinct accelerators use jerky. Every attached view

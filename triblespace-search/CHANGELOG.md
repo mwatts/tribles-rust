@@ -42,8 +42,9 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   than a fragment dictionary and DAC sequence. `SuccinctBM25Blob` therefore
   rotates to `7ECEC029EEE4CA89582599E83B0E9508`; the preceding exact-TF native
   identity `DAFEEEC9350D072B83E32DBBBBB66039` and older score blobs are
-  intentionally incompatible rather than heuristically migrated. Range
-  persistence now uses the separate portable carrier described above.
+  intentionally incompatible rather than heuristically migrated. The portable
+  exact-TF carrier described above remains a separate, architecture-independent
+  representation with its own canonical join.
 
 ### Candidate distinctness is proven at its source
 

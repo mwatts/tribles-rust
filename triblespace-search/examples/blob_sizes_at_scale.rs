@@ -1,7 +1,8 @@
 //! Prints the naive vs. direct native SB25 blob size for a few fake-corpus
 //! sizes, plus build time. Meant for eyeballing compression at a
 //! glance — `cargo run --release --example blob_sizes_at_scale`.
-//! This does not measure the portable carrier used by range rollups.
+//! This does not measure the portable exact-TF carrier used by collection
+//! derivations.
 //!
 //! Not an assertion test; that's what the regression guards in
 //! `tests/scale_smoke.rs` are for.
