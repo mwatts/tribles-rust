@@ -598,7 +598,7 @@ mod tests {
         let error = join(&malformed, &empty(&automaton), &automaton).unwrap_err();
         assert_eq!(
             error,
-            PathSummaryUnionError::Decode(PathSummaryBlobError::CapacityOverflow)
+            PathSummaryUnionError::Decode(PathSummaryBlobError::RepresentationCapacity)
         );
     }
 

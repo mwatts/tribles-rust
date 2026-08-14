@@ -66,8 +66,12 @@ pub enum PathSummaryBlobError {
     ArcOutOfBounds,
     /// An arc's source/destination state pair is absent from the automaton.
     InvalidStatePair,
-    /// A length or carrier calculation overflowed its representation.
-    CapacityOverflow,
+    /// A canonical vertex, arc, or product ordinal count does not fit the
+    /// portable wire format.
+    RepresentationCapacity,
+    /// Checked byte-length or allocation arithmetic overflowed this host's
+    /// `usize` address space.
+    HostSizeOverflow,
 }
 
 impl fmt::Display for PathSummaryBlobError {
@@ -82,7 +86,12 @@ impl fmt::Display for PathSummaryBlobError {
             Self::ArcOrder => "path-summary arcs are not strictly ordered",
             Self::ArcOutOfBounds => "path-summary arc is outside the product carrier",
             Self::InvalidStatePair => "path-summary arc uses an impossible automaton state pair",
-            Self::CapacityOverflow => "path-summary dimensions overflow their representation",
+            Self::RepresentationCapacity => {
+                "path-summary dimensions exceed the portable wire representation"
+            }
+            Self::HostSizeOverflow => {
+                "path-summary byte dimensions overflow this host's address space"
+            }
         };
         f.write_str(message)
     }
@@ -103,24 +112,24 @@ impl PathSummaryBlob {
             return Err(PathSummaryBlobError::NoncanonicalDomain);
         }
         let vertex_count = u32::try_from(summary.vertices().len())
-            .map_err(|_| PathSummaryBlobError::CapacityOverflow)?;
+            .map_err(|_| PathSummaryBlobError::RepresentationCapacity)?;
         checked_product_count(summary.vertices().len(), summary.automaton().state_count())?;
         let arcs = summary.ordinal_arcs().collect::<Vec<_>>();
         let arc_count =
-            u64::try_from(arcs.len()).map_err(|_| PathSummaryBlobError::CapacityOverflow)?;
+            u64::try_from(arcs.len()).map_err(|_| PathSummaryBlobError::RepresentationCapacity)?;
         let vertex_bytes = summary
             .vertices()
             .len()
             .checked_mul(32)
-            .ok_or(PathSummaryBlobError::CapacityOverflow)?;
+            .ok_or(PathSummaryBlobError::HostSizeOverflow)?;
         let arc_bytes = arcs
             .len()
             .checked_mul(8)
-            .ok_or(PathSummaryBlobError::CapacityOverflow)?;
+            .ok_or(PathSummaryBlobError::HostSizeOverflow)?;
         let capacity = HEADER_LEN
             .checked_add(vertex_bytes)
             .and_then(|length| length.checked_add(arc_bytes))
-            .ok_or(PathSummaryBlobError::CapacityOverflow)?;
+            .ok_or(PathSummaryBlobError::HostSizeOverflow)?;
         let fingerprint = automaton_fingerprint(summary.automaton());
 
         let mut bytes = Vec::with_capacity(capacity);
@@ -183,7 +192,16 @@ impl PathSummaryBlob {
             arcs.push(arc);
         }
         let summary = PathSummary::from_canonical_ordinals(automaton.clone(), vertices, arcs)
-            .map_err(|_| PathSummaryBlobError::CapacityOverflow)?;
+            .map_err(|error| match error {
+                crate::PathError::TooManyVertices { .. }
+                | crate::PathError::ProductCarrierTooLarge { .. } => {
+                    PathSummaryBlobError::RepresentationCapacity
+                }
+                crate::PathError::CapacityOverflow => PathSummaryBlobError::HostSizeOverflow,
+                crate::PathError::EmptyInput | crate::PathError::DifferentAutomata => {
+                    PathSummaryBlobError::NoncanonicalDomain
+                }
+            })?;
         if !summary.has_canonical_domain() {
             return Err(PathSummaryBlobError::NoncanonicalDomain);
         }
@@ -216,17 +234,17 @@ fn validate_header(
     }
     let vertex_count = read_u32(bytes, 36) as usize;
     let arc_count =
-        usize::try_from(read_u64(bytes, 40)).map_err(|_| PathSummaryBlobError::CapacityOverflow)?;
+        usize::try_from(read_u64(bytes, 40)).map_err(|_| PathSummaryBlobError::HostSizeOverflow)?;
     let vertex_bytes = vertex_count
         .checked_mul(32)
-        .ok_or(PathSummaryBlobError::CapacityOverflow)?;
+        .ok_or(PathSummaryBlobError::HostSizeOverflow)?;
     let arc_bytes = arc_count
         .checked_mul(8)
-        .ok_or(PathSummaryBlobError::CapacityOverflow)?;
+        .ok_or(PathSummaryBlobError::HostSizeOverflow)?;
     let expected_length = HEADER_LEN
         .checked_add(vertex_bytes)
         .and_then(|length| length.checked_add(arc_bytes))
-        .ok_or(PathSummaryBlobError::CapacityOverflow)?;
+        .ok_or(PathSummaryBlobError::HostSizeOverflow)?;
     if bytes.len() != expected_length {
         return Err(PathSummaryBlobError::BadLength);
     }
@@ -243,13 +261,13 @@ fn checked_product_count(
     vertex_count: usize,
     state_count: u32,
 ) -> Result<usize, PathSummaryBlobError> {
-    let product_count = vertex_count
-        .checked_mul(state_count as usize)
-        .ok_or(PathSummaryBlobError::CapacityOverflow)?;
-    if product_count > u32::MAX as usize {
-        return Err(PathSummaryBlobError::CapacityOverflow);
+    let state_count = state_count as usize;
+    if state_count != 0 && vertex_count > u32::MAX as usize / state_count {
+        return Err(PathSummaryBlobError::RepresentationCapacity);
     }
-    Ok(product_count)
+    vertex_count
+        .checked_mul(state_count)
+        .ok_or(PathSummaryBlobError::HostSizeOverflow)
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> u32 {
@@ -487,11 +505,25 @@ mod tests {
         assert_eq!(checked_product_count(2, 3).unwrap(), 6);
         assert_eq!(
             checked_product_count(u32::MAX as usize, 2).unwrap_err(),
-            PathSummaryBlobError::CapacityOverflow
+            PathSummaryBlobError::RepresentationCapacity,
         );
         assert_eq!(
             checked_product_count(usize::MAX, 2).unwrap_err(),
-            PathSummaryBlobError::CapacityOverflow
+            PathSummaryBlobError::RepresentationCapacity
+        );
+    }
+
+    #[test]
+    fn header_size_arithmetic_is_host_overflow_not_wire_capacity() {
+        let automaton = plus(9);
+        let mut bytes = vec![0u8; HEADER_LEN];
+        bytes[..32].copy_from_slice(&automaton_fingerprint(&automaton).raw);
+        bytes[32..36].copy_from_slice(&automaton.state_count().to_le_bytes());
+        bytes[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
+
+        assert_eq!(
+            validate_header(&bytes, &automaton).unwrap_err(),
+            PathSummaryBlobError::HostSizeOverflow,
         );
     }
 

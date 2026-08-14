@@ -63,7 +63,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports an explicit unrepresentable cover with zero writes. Succinct raw
   construction and merge preserve typed input-versus-union-growth phases, and
   path-summary unions distinguish persisted decode failures from fresh encode
-  capacity.
+  capacity. Portable vertex/arc/product limits are representation capacity;
+  host `usize` byte/allocation arithmetic remains fatal rather than triggering
+  a physical-cover fallback.
 
   Explicit native target compaction is now available through the generic
   `collection::exact_target_compaction::compact_exact_target` producer and the

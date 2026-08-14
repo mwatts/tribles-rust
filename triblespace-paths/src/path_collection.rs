@@ -204,7 +204,7 @@ fn classify_derive_error(error: PathSummaryUnionError) -> ExactAlgebraError {
     let reason = error.to_string();
     if matches!(
         &error,
-        PathSummaryUnionError::Encode(PathSummaryBlobError::CapacityOverflow)
+        PathSummaryUnionError::Encode(PathSummaryBlobError::RepresentationCapacity)
     ) {
         ExactAlgebraError::Capacity(reason)
     } else {
@@ -218,17 +218,15 @@ fn classify_target_join_error(error: PathSummaryUnionError) -> ExactAlgebraError
     let capacity = matches!(
         &error,
         PathSummaryUnionError::Merge(
-            PathError::TooManyVertices { .. }
-                | PathError::ProductCarrierTooLarge { .. }
-                | PathError::CapacityOverflow
-        ) | PathSummaryUnionError::Encode(PathSummaryBlobError::CapacityOverflow)
+            PathError::TooManyVertices { .. } | PathError::ProductCarrierTooLarge { .. }
+        ) | PathSummaryUnionError::Encode(PathSummaryBlobError::RepresentationCapacity)
     );
     let reason = error.to_string();
     if capacity {
         ExactAlgebraError::Capacity(reason)
     } else {
-        // In particular, Decode(CapacityOverflow) describes malformed
-        // persisted evidence and must never trigger a finer-cover fallback.
+        // Persisted decode failures and host-size arithmetic are fatal; only
+        // fixed portable result geometry can trigger a finer-cover fallback.
         ExactAlgebraError::Fatal(reason)
     }
 }
@@ -361,8 +359,7 @@ mod tests {
                 vertices: usize::MAX,
                 states: u32::MAX,
             }),
-            PathSummaryUnionError::Merge(PathError::CapacityOverflow),
-            PathSummaryUnionError::Encode(PathSummaryBlobError::CapacityOverflow),
+            PathSummaryUnionError::Encode(PathSummaryBlobError::RepresentationCapacity),
         ] {
             assert!(matches!(
                 classify_target_join_error(error),
@@ -372,15 +369,18 @@ mod tests {
 
         assert!(matches!(
             classify_derive_error(PathSummaryUnionError::Encode(
-                PathSummaryBlobError::CapacityOverflow
+                PathSummaryBlobError::RepresentationCapacity
             )),
             ExactAlgebraError::Capacity(_)
         ));
 
         for error in [
-            PathSummaryUnionError::Decode(PathSummaryBlobError::CapacityOverflow),
+            PathSummaryUnionError::Decode(PathSummaryBlobError::RepresentationCapacity),
+            PathSummaryUnionError::Decode(PathSummaryBlobError::HostSizeOverflow),
             PathSummaryUnionError::Merge(PathError::EmptyInput),
             PathSummaryUnionError::Merge(PathError::DifferentAutomata),
+            PathSummaryUnionError::Merge(PathError::CapacityOverflow),
+            PathSummaryUnionError::Encode(PathSummaryBlobError::HostSizeOverflow),
             PathSummaryUnionError::Encode(PathSummaryBlobError::BadLength),
         ] {
             assert!(matches!(
@@ -389,12 +389,15 @@ mod tests {
             ));
         }
 
-        assert!(matches!(
-            classify_derive_error(PathSummaryUnionError::Decode(
-                PathSummaryBlobError::CapacityOverflow
-            )),
-            ExactAlgebraError::Fatal(_)
-        ));
+        for error in [
+            PathSummaryUnionError::Decode(PathSummaryBlobError::RepresentationCapacity),
+            PathSummaryUnionError::Encode(PathSummaryBlobError::HostSizeOverflow),
+        ] {
+            assert!(matches!(
+                classify_derive_error(error),
+                ExactAlgebraError::Fatal(_)
+            ));
+        }
 
         let automaton = Automaton::new(u32::MAX, [0], [0], []).unwrap();
         let paths = PathSummaryCollection::new(id(9), automaton.clone());
