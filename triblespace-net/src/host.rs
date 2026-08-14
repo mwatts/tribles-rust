@@ -2461,7 +2461,9 @@ mod serving_snapshot_tests {
             if self.fail_snapshot {
                 Err(SnapshotUnavailable)
             } else {
-                Ok(PinStore::pin_snapshot(&mut self.inner)
+                Ok(self
+                    .inner
+                    .snapshot_pin_heads()
                     .expect("MemoryRepo pin snapshots are infallible"))
             }
         }

@@ -19,7 +19,7 @@ use triblespace_core::inline::encodings::hash::{Blake3, Handle, Hash};
 use triblespace_core::inline::Inline;
 use triblespace_core::macros::{find, pattern};
 use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::Repository;
+use triblespace_core::repo::{PinSnapshotSource, Repository};
 use triblespace_core::trible::TribleSet;
 
 use super::signing::load_signing_key;
@@ -1105,7 +1105,7 @@ pub fn run(cmd: Command) -> Result<()> {
                     // opening the reader. Refreshing individual heads after
                     // this point could mix generations under concurrent
                     // writers and produce handles the reader cannot see.
-                    let pin_snapshot = repo.storage_mut().pin_snapshot()?;
+                    let pin_snapshot = repo.storage_mut().snapshot_pin_heads()?;
                     let reader = repo
                         .storage_mut()
                         .reader()
@@ -1221,7 +1221,7 @@ pub fn run(cmd: Command) -> Result<()> {
                     // snapshot before opening the blob reader. The reader can
                     // then see every analyzed handle, and those exact handles
                     // also become the delete CAS expectations below.
-                    let pin_snapshot = repo.storage_mut().pin_snapshot()?;
+                    let pin_snapshot = repo.storage_mut().snapshot_pin_heads()?;
                     let branch_metadata: Vec<_> = branch_ids
                         .into_iter()
                         .map(|bid| {

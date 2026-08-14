@@ -2927,10 +2927,6 @@ impl PinStore for Pile {
         Ok(self.branches.get(&id.into()).copied())
     }
 
-    fn pin_snapshot(&mut self) -> Result<super::PinSnapshot, Self::PinsError> {
-        super::PinSnapshotSource::snapshot_pin_heads(self)
-    }
-
     /// Updates the head of `id` to `new` if it matches `old`.
     ///
     /// This method does not verify that `new` refers to a blob stored in the pile,

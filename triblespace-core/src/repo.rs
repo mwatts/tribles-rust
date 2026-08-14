@@ -615,7 +615,7 @@ pub enum PushResult {
 /// Cloning is O(1) (refcount bump), so this is the right primitive for
 /// handing pin state across threads or into long-lived serving views.
 ///
-/// Returned by [`PinStore::pin_snapshot`] and [`PinSnapshotSource`].
+/// Returned by [`PinSnapshotSource::snapshot_pin_heads`].
 pub type PinSnapshot = PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>;
 
 /// Observational access to one point-in-time snapshot of pin heads.
@@ -632,9 +632,8 @@ pub type PinSnapshot = PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>;
 /// to authorization or serving code. Concrete stores and composition wrappers
 /// may forward their narrowest available snapshot operation.
 ///
-/// Implementations must return a complete snapshot or an error. They must not
-/// inherit [`PinStore::pin_snapshot`]'s default partial-on-head-error behavior
-/// unless every per-head operation is infallible.
+/// Implementations must return a complete snapshot or an error. Listing or
+/// per-head failures must never be hidden by returning a partial view.
 pub trait PinSnapshotSource {
     /// Error returned when a stable pin-head snapshot cannot be produced.
     type PinSnapshotError: Error + Debug + Send + Sync + 'static;
@@ -759,34 +758,6 @@ pub trait PinStore {
     /// Callers that want only content branches filter by checking for
     /// the `metadata::name` attribute on each pin's head metadata.
     fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError>;
-
-    /// Cheap point-in-time snapshot of the (pin id → head) map.
-    ///
-    /// Returns a [`PinSnapshot`] — a PATCH keyed by pin id, valued by
-    /// the pinned head's handle. Cloning the returned PATCH is O(1)
-    /// (refcount bump), so this is also the right primitive for handing
-    /// the pin state to background threads / async tasks without
-    /// re-querying the store.
-    ///
-    /// The default impl walks `pins()` + `head()`. Stores with a
-    /// PATCH-backed pin index ([`crate::repo::pile::Pile`]) override to
-    /// clone the index directly. Head errors during the default walk
-    /// are skipped silently — partial snapshots are acceptable for the
-    /// "serving view" use case; callers that need strict atomicity
-    /// should drive [`pins`](Self::pins) + [`head`](Self::head)
-    /// themselves and handle errors.
-    fn pin_snapshot(&mut self) -> Result<PinSnapshot, Self::PinsError> {
-        let mut out = PinSnapshot::new();
-        let ids: Vec<Id> = self.pins()?.filter_map(|r| r.ok()).collect();
-        for id in ids {
-            if let Ok(Some(h)) = self.head(id) {
-                let bid: [u8; 16] = id.into();
-                let entry = Entry::with_value(&bid, h);
-                out.insert(&entry);
-            }
-        }
-        Ok(out)
-    }
 
     /// Retrieves the current head of a pin by its id.
     ///

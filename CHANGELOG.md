@@ -132,12 +132,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removed; the new API requires only `BlobStore + CollectionStore` and works
   without `PinStore`.
 - **Read-only pin snapshots are now an explicit storage capability.**
-  Implementing mutable `PinStore` no longer automatically satisfies
-  `PinSnapshotSource`. `Pile`, `MemoryRepo`, and `Yard` opt in directly, while
+  `PinStore::pin_snapshot` and its partial-on-error default are removed;
+  callers request the strict `PinSnapshotSource::snapshot_pin_heads`
+  capability instead. `Pile`, `MemoryRepo`, and `Yard` opt in directly, while
   `HybridStore` and `Lazy` forward only when their underlying pin side exposes
-  the narrow snapshot trait. Authorization and serving code therefore retains
-  fail-closed snapshot refresh without acquiring CAS mutation through a blanket
-  bound.
+  the narrow snapshot trait. Authorization, serving, and CLI snapshot users
+  therefore retain fail-closed complete-snapshot refresh without acquiring CAS
+  mutation through a blanket bound.
 - **Telemetry no longer turns an unknown pile read failure into destructive
   repair advice.** Unsupported record markers are identified as likely
   format/version skew with an upgrade-first diagnostic, while every refresh

@@ -914,9 +914,17 @@ impl PinSnapshotSource for Yard {
     type PinSnapshotError = Infallible;
 
     fn snapshot_pin_heads(&mut self) -> Result<super::PinSnapshot, Self::PinSnapshotError> {
-        // Both listing and head lookup are infallible, so PinStore's default
-        // cannot silently produce a partial snapshot here.
-        PinStore::pin_snapshot(self)
+        let mut snapshot = super::PinSnapshot::new();
+        for raw in self.strong_pins.iter_ordered() {
+            let head: Inline<Handle<SimpleArchive>> = self
+                .strong_pins
+                .get(raw)
+                .copied()
+                .expect("yard strong-pin snapshot key has no value")
+                .transmute();
+            snapshot.insert(&Entry::with_value(raw, head));
+        }
+        Ok(snapshot)
     }
 }
 

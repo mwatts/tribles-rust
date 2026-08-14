@@ -199,9 +199,18 @@ impl PinSnapshotSource for MemoryRepo {
     type PinSnapshotError = Infallible;
 
     fn snapshot_pin_heads(&mut self) -> Result<crate::repo::PinSnapshot, Self::PinSnapshotError> {
-        // Both listing and head lookup are infallible, so PinStore's default
-        // cannot silently produce a partial snapshot here.
-        PinStore::pin_snapshot(self)
+        let mut snapshot = crate::repo::PinSnapshot::new();
+        let mut ids: Vec<Id> = self.branches.keys().copied().collect();
+        ids.sort();
+        for id in ids {
+            let raw: [u8; 16] = id.into();
+            let head = *self
+                .branches
+                .get(&id)
+                .expect("pin disappeared while MemoryRepo was exclusively borrowed");
+            snapshot.insert(&crate::patch::Entry::with_value(&raw, head));
+        }
+        Ok(snapshot)
     }
 }
 
