@@ -52,10 +52,10 @@ The BM25 artifact is therefore a general lossless carrier `(Docs, F)`, where
 `F(doc, term) -> u32` is sparse term frequency. IDF, average document length,
 and BM25 scores are derived from that carrier at query time.
 
-## `PortableBM25Index` — durable range carrier
+## `PortableBM25Index` — portable exact-TF carrier
 
-`Bm25Rollup` persists only `PortableBM25Blob`. The representation is independent
-of a native accelerator and has one gapless little-endian grammar:
+`PortableBM25Blob` is independent of a native accelerator and has one gapless
+little-endian grammar:
 
 ```text
 [documents]  D x 32-byte keys, strictly increasing
@@ -81,16 +81,17 @@ The logical join is:
 This preserves empty documents and makes segment merge associative,
 commutative, idempotent, and byte-canonical. Attachment exact-validates the
 grammar, retains its bytes, and derives only document lengths and average
-length in memory. `query_across` materializes that canonical join as a one-shot
-correctness boundary; repeated-query servers should retain the merged portable
-view so the all-postings pass is amortized.
+length in memory. `PortableBM25Index::merge` materializes the canonical join;
+collection consumers supply their own domain projection and exact-cover
+evidence. Repeated-query servers should retain the merged portable view so the
+all-postings pass is amortized.
 
 ## `SuccinctBM25Index` — SB25 blob layout
 
 The direct native accelerator remains available to callers that deliberately
 choose its machine-specific Jerky representation. It is a self-contained
 canonical blob, zero-copy via `anybytes::Bytes`, and bit-packed via jerky. It is
-not the durable range-rollup format. The exact schema identity is
+distinct from the portable exact-TF carrier. The exact schema identity is
 `SuccinctBM25Blob::ID`; there are no magic bytes or in-band versions. Every
 breaking layout or semantic change rotates that schema id.
 
@@ -149,9 +150,9 @@ and input row order cannot affect the native bytes:
   = (Docs₁ ∪ Docs₂, pointwise_max(F₁, F₂))
 ```
 
-The direct native API builds one accelerator at a time; durable segment merge
-belongs to the portable range carrier above. Its `k1` and `b` remain explicit
-per-index query parameters rather than durable range identity.
+The direct native API builds one accelerator at a time. Exact portable
+collection elements can instead be joined through the carrier above. `k1` and
+`b` remain derived query parameters rather than persisted carrier identity.
 
 ### What's already compressed (as of the current impl)
 
@@ -481,12 +482,12 @@ and comparing 32-byte keys until final decoding. Measured p50 is 35.6 / 67.9 µs
 (naive / SB25) at 10 k and 161 / 370 µs at 50 k. This is about 28–29% faster on
 SB25 than the retired baked-score implementation despite deriving exact scores.
 
-Range-native multi-segment reads use the portable carrier. Constructing the
+Multi-element collection reads can use the portable carrier. Constructing the
 resident canonical merge is an all-postings pass that belongs at
 attachment/change time. Once resident, queries operate directly on that merged
 view. The `bm25_merge_bench` example reports portable merge, resident query,
-reattached query, and deliberately non-amortized `query_across` timings for the
-same corpus and verifies bit-identical ranking first.
+reattached query, and deliberately non-amortized direct merge-plus-query
+timings for the same corpus, verifying bit-identical ranking first.
 
 ### HNSW — size estimate
 

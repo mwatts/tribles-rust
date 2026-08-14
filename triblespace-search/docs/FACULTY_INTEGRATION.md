@@ -17,9 +17,10 @@ issues a few queries. If the pseudo-code below drifts, that
 example is the source of truth.
 
 This chapter deliberately demonstrates the direct native,
-rebuild-and-replace API. Range-native maintenance uses `Bm25Rollup` and
-persists `PortableBM25Blob`; it does not publish the `SuccinctBM25Blob` shown
-below.
+rebuild-and-replace API. Collection-native maintenance may instead define a
+domain projection into `PortableBM25Blob`, retain exact derivation evidence,
+and join its selected cover with `PortableBM25Index::merge`; that is separate
+from the `SuccinctBM25Blob` shown below.
 
 ## Example: `wiki_search.rs`
 

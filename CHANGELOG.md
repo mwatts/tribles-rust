@@ -667,17 +667,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   encodings prelude. Collection consumers can query an attached exact physical
   cover without depending on repository range-manifest machinery.
 
-- **Breaking: range-native BM25 now persists only the portable exact-TF
-  carrier.** `Bm25Rollup` builds and merges `PortableBM25Blob` directly under
-  document-union / pointwise-max semantics; native `SuccinctBM25Blob`,
-  `CompressedUniverse`, token-bag re-expansion, and the native cover are absent
-  from the durable path. There is no compatibility reader for the unpublished
-  range format, so existing artifacts must be rebuilt. The newly minted typed
-  artifact and recipe IDs are `570272A9F9C994D2152EFB10712F5275` and
-  `468F6EBF93C14A7FBC1188592B2BF984`; the recipe rotation prevents stale native
-  manifests from becoming false completed-empty ranges. Direct native BM25
-  remains available under the runtime-schema rotation above; Succinct HNSW is
-  unchanged.
+- **Portable BM25 is now a recipe-neutral canonical join carrier.** The
+  unpublished `Bm25Rollup`, `seg_bm25`, and `query_across` repository-range
+  facade is removed. Collection consumers derive exact `PortableBM25Blob`
+  elements with their own domain projection and join the selected cover once
+  with `PortableBM25Index::merge`; direct callers use the same operation.
+  Direct native BM25 and range-native Succinct HNSW remain independent.
 
 - **Breaking: Yard collection and compaction now require an explicit retention
   plan.** The parameterless `Yard::collect()` and `Yard::compact()` shortcuts

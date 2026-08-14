@@ -21,25 +21,16 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   trees. The resident view implements the existing BM25 query constraint
   surface without adopting an ambient tokenizer.
 
-### Range-native BM25 now persists only the portable carrier
+### Portable BM25 has one canonical join surface
 
-- `Bm25Rollup` builds `PortableBM25Blob` directly from exact per-document
-  counts, attaches `PortableBM25Index`, and compacts with the canonical
-  document-union / pointwise-max join. The durable path no longer constructs a
-  token bag, native Succinct arena, `CompressedUniverse`, or native cover
-  machinery; direct callers may still choose a single native Succinct BM25
-  accelerator independently.
-- This is an intentionally incompatible unpublished-format cutover with no
-  dual reader. Existing range artifacts must be rebuilt. The typed artifact
-  attribute is now `570272A9F9C994D2152EFB10712F5275`, and the recipe kind is
-  now `468F6EBF93C14A7FBC1188592B2BF984`; both IDs were minted with
-  `trible genid` on 2026-08-08. Rotating the recipe prevents old native
-  manifests from being misread as certified-empty portable ranges.
-- `SuccinctHNSWBlob`, its typed attribute, and its rollup recipe are unchanged.
-- Removed the unpublished `SuccinctBM25Cover`, `Bm25TuningMismatch`, native
-  segment merge/spool implementation, and its runtime `tempfile` feature. The
-  single-index native accelerator remains available without a second hidden
-  range-compaction path.
+- Removed the unpublished `Bm25Rollup`, `seg_bm25`, and `query_across`
+  repository-range facade. `PortableBM25Index::merge` is the single canonical
+  document-union / pointwise-max join for direct callers and collection-owned
+  derivation recipes alike.
+- Collection consumers remain responsible for their domain projection and
+  exact-cover evidence. They attach the selected portable elements, join once
+  when the resident view changes, and query that resident view directly.
+- Direct native Succinct BM25 and range-native Succinct HNSW remain unchanged.
 
 ### Direct native Succinct BM25 persists exact frequencies
 
@@ -98,24 +89,22 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   truthful even for embedding blobs that bypass the crate's normalized-ingest
   helper. Zero vectors retain similarity zero.
 
-### Range-native typed search artifacts
+### Range-native typed HNSW artifacts
 
-- Ported `Bm25Rollup` and `HnswRollup` to the fallible, range-native
-  `IndexKind` contract. Prepared and stored artifacts now retain their exact
-  `SuccinctBM25Blob` / `SuccinctHNSWBlob` types throughout put, manifest,
-  parse, and attach paths; the search recipes no longer erase blobs through
-  `UnknownBlob`.
-- Added stable typed artifact attributes plus intrinsic recipe descriptors.
-  BM25 identity includes its source-content attribute. HNSW identity includes
-  its source-embedding attribute, dimension, and deterministic seed, so
-  parameter-distinct recipes coexist safely in one branch manifest.
+- Ported `HnswRollup` to the fallible, range-native `IndexKind` contract.
+  Prepared and stored artifacts retain their exact `SuccinctHNSWBlob` type
+  throughout put, manifest, parse, and attach paths rather than erasing blobs
+  through `UnknownBlob`.
+- Added a stable typed artifact attribute plus an intrinsic recipe descriptor.
+  HNSW identity includes its source-embedding attribute, dimension, and
+  deterministic seed, so parameter-distinct recipes coexist safely in one
+  branch manifest.
 - Empty projections now produce zero physical artifacts while retaining their
   logical range record. Repeated typed handle facts represent repeated physical
   artifacts on one logical range.
-- Builds now fail closed on unreadable source content, unreadable embeddings,
-  and embedding dimension mismatches. HNSW compaction also fails when a source
-  embedding can no longer be resolved instead of certifying an incomplete
-  merged range.
+- Builds now fail closed on unreadable embeddings and dimension mismatches.
+  HNSW compaction also fails when a source embedding can no longer be resolved
+  instead of certifying an incomplete merged range.
 
 ## [0.41.4] - 2026-05-17
 

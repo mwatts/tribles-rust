@@ -6,8 +6,8 @@ index representation remains an open attribute on that source range.
 
 The `repo::index_range` module supplies this artifact-neutral foundation. It
 does not assign a generic `kind` tag or erase every artifact into one `blob`
-field. A consumer instead defines typed attributes such as a BM25 segment or
-HNSW graph and attaches those facts to a stable range entity. Canonical raw
+field. A consumer instead defines typed attributes such as an HNSW graph and
+attaches those facts to a stable range entity. Canonical raw
 Succinct archives use the native exact collection lifecycle instead; they are
 not repository-history manifests.
 
@@ -52,8 +52,8 @@ A diamond illustrates why the values are repeated:
 ## Stable range identity and open facts
 
 The `RangeRecord` identity is the intrinsic core
-`(index_recipe, commit_start*, commit_end*)`. BM25, HNSW, or another
-configuration over the same commits receives a different recipe and therefore
+`(index_recipe, commit_start*, commit_end*)`. Different HNSW configurations or
+other recipes over the same commits receive different identities and therefore
 cannot collapse into the same range entity. Artifact handles themselves never
 participate in the id.
 
@@ -100,14 +100,10 @@ independently prepared shards as they finish, while `append_stored_range`
 publishes all of their typed handles on one shared source range. The prepared
 convenience stores the vector first and then performs the same logical append.
 
-The BM25 recipe instead emits `seg_bm25*` handles to
-`PortableBM25Blob`. Its durable logical value is the document set plus sparse
-positive exact `u32` term frequencies; compaction is document union and
-pointwise maximum frequency. Native `SuccinctBM25Blob` / `CompressedUniverse`
-layout is deliberately absent from range identity and persistence. The
-portable carrier derives document lengths, IDF, and scores only after the
-selected cover has been canonically joined, so physical LSM shape cannot alter
-ranking. HNSW remains a separately typed native succinct artifact.
+HNSW is a typed native succinct range artifact. Portable exact-TF BM25 is not a
+range-native recipe: domain consumers derive it through the collection
+homomorphism machinery and join their exact selected cover independently of
+repository history ranges.
 
 Raw `SuccinctArchiveBlob` projections are maintained by
 `SuccinctArchiveCollection` over signed source collection commits. Its exact

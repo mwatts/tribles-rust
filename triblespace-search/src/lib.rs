@@ -30,11 +30,10 @@
 //! via `BM25Builder::build_naive()` / `HNSWBuilder::build_naive()`
 //! / `FlatBuilder::build()`.
 //!
-//! Index blobs are immutable. Direct builders return fresh
-//! content-addressed handles. Range-native BM25 rollups persist
-//! [`portable_bm25::PortableBM25Blob`], while HNSW rollups retain the native
-//! succinct graph. Both append complete source-range artifacts and compact by
-//! publishing new blobs rather than mutating existing ones.
+//! Index blobs are immutable. Direct builders and collection derivations
+//! return fresh content-addressed handles. Portable BM25 carriers join by
+//! document union plus pointwise-maximum term frequency; HNSW range rollups
+//! retain the native succinct graph.
 //!
 //! # Query surface
 //!
@@ -108,8 +107,6 @@ pub mod bm25;
 pub mod constraint;
 pub mod hnsw;
 #[cfg(feature = "succinct")]
-pub mod index_bm25;
-#[cfg(feature = "succinct")]
 pub mod index_hnsw;
 #[cfg(feature = "succinct")]
 pub mod index_schema;
@@ -127,8 +124,8 @@ pub mod tokens;
 /// non-packed) forms that exist only to validate the succinct
 /// builds and to measure "how much does jerky packing actually
 /// save at this scale." They are not a production persistence
-/// path: range BM25 persists through [`portable_bm25`], direct native BM25
-/// and HNSW through [`succinct`].
+/// path: portable exact-TF BM25 uses [`portable_bm25`], while direct native
+/// BM25 and HNSW use [`succinct`].
 ///
 /// - [`BM25Index`][testing::BM25Index] — reference BM25 scoring
 ///   and query implementation. Produced by

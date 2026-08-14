@@ -3,14 +3,15 @@
 Content-addressed BM25 + HNSW indexes on top of
 [triblespace](https://github.com/triblespace/triblespace-rs) piles.
 
-Three typed blob representations. The durable BM25 range carrier is portable;
-the native query accelerators are loaded zero-copy via [anybytes] and [jerky]:
+Three typed blob representations. The portable BM25 carrier is
+architecture-independent; the native query accelerators are loaded zero-copy
+via [anybytes] and [jerky]:
 
-- **`PortableBM25Index`** — architecture-independent lexical /
-  associative retrieval persisted by `Bm25Rollup`. Its canonical bytes carry
-  sorted document and term domains plus positive exact `u32` frequencies;
-  document lengths, IDF, and scores are derived after attachment. Portable
-  merge is document union plus pointwise maximum frequency.
+- **`PortableBM25Index`** — architecture-independent lexical / associative
+  retrieval carrier. Its canonical bytes carry sorted document and term
+  domains plus positive exact `u32` frequencies; document lengths, IDF, and
+  scores are derived after attachment. Portable merge is document union plus
+  pointwise maximum frequency.
 - **`SuccinctBM25Index`** (SB25 blob) — lexical / associative
   retrieval for direct native callers. Terms are 32-byte triblespace
   `Inline`s, so the index handles text search, entity co-occurrence, and tag
@@ -29,10 +30,10 @@ The authoritative schema identities live in each marker type's
 persisted attribute or manifest that routes handles to that reader; changing
 the metadata ID does not create a new Rust type or perform a runtime check.
 
-Index blobs are immutable. Direct builders return fresh content-addressed
-handles. Range-native BM25 rollups append portable exact-frequency artifacts;
-HNSW rollups retain native succinct artifacts. Both compact by publishing new
-blobs rather than mutating existing ones.
+Index blobs are immutable. Direct builders and collection derivations return
+fresh content-addressed handles. Portable BM25 elements join canonically;
+range-native HNSW rollups retain native succinct artifacts and compact by
+publishing new blobs rather than mutating existing ones.
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) for the full design.
 
@@ -56,10 +57,10 @@ remaining open items are perf/encoding refinements, not architecture.
   — binds `doc` only; score is a fixed parameter. Pair with
   `idx.score(&doc, terms)` to recompute precise scores after
   the engine filters.
-* **`PortableBM25Index`**: strict, canonical exact-TF carrier used by
-  range-native BM25 persistence. Its bytes contain no native `usize`, padding,
-  Jerky arena, persisted float, score, or redundant document-length table;
-  attachment derives the query caches and speaks the same constraint surface.
+* **`PortableBM25Index`**: strict, canonical exact-TF carrier. Its bytes
+  contain no native `usize`, padding, Jerky arena, persisted float, score, or
+  redundant document-length table; attachment derives the query caches and
+  speaks the same constraint surface.
 * **`SuccinctBM25Index`**: jerky-backed zero-copy view — doc
   keys via `CompressedUniverse`, terms as a typed
   `View<[[u8; 32]]>` row table, doc-lengths + postings via

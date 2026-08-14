@@ -1379,7 +1379,7 @@ impl<D: InlineEncoding, T: InlineEncoding> SuccinctBM25Index<D, T> {
         // ── 2. Exact `(document, term) -> frequency` join keyed by
         // universe code. Repetitions within one inserted row add; rows with
         // the same document key join by pointwise max. The latter makes
-        // duplicate keys idempotent and agrees with range-rollup union.
+        // duplicate keys idempotent and agrees with the portable exact-TF join.
         // Empty-token documents remain in `build_universe`, so the carrier is
         // `(Docs, F)`, not just the sparse frequency map. ───────────────────
         let mut term_to_tfs: HashMap<RawInline, HashMap<u32, u32>> = HashMap::new();

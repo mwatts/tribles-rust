@@ -1,9 +1,9 @@
 //! Phase-level smoke benchmark for portable BM25 segment merging.
 //!
-//! This intentionally uses only public APIs so it exercises the same
-//! `Bm25Rollup::merge` path as index-home compaction. It is not a statistical
-//! benchmark; run the release binary repeatedly (and under `/usr/bin/time -l`
-//! on macOS) when comparing merge implementations.
+//! This intentionally uses only [`PortableBM25Index::merge`] so it measures
+//! the canonical join directly, without a repository-range facade. It is not
+//! a statistical benchmark; run the release binary repeatedly (and under
+//! `/usr/bin/time -l` on macOS) when comparing merge implementations.
 //!
 //! Usage:
 //! `cargo run --release -p triblespace-search --example bm25_merge_bench -- \
@@ -15,13 +15,10 @@ use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use triblespace_core::blob::{Blob, MemoryBlobStore, TryFromBlob};
+use triblespace_core::blob::{Blob, IntoBlob, TryFromBlob};
 use triblespace_core::id::{Id, RawId};
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::{Inline, RawInline};
-use triblespace_core::repo::index_home::IndexKind;
-use triblespace_core::repo::BlobStore;
-use triblespace_search::index_bm25::{query_across, Bm25Rollup};
 use triblespace_search::portable_bm25::{PortableBM25Blob, PortableBM25Index};
 use triblespace_search::tokens::WordHash;
 
@@ -164,28 +161,19 @@ fn main() {
         fmt_bytes(input_bytes),
     );
 
-    let mut store = MemoryBlobStore::new();
-    let reader = store.reader().expect("memory reader");
-    let kind = Bm25Rollup::new(reader, id_from_u64(u64::MAX));
-
     let baseline = CURRENT.load(Ordering::Relaxed);
     PEAK.store(baseline, Ordering::Relaxed);
     let merge_started = Instant::now();
-    let merged_blob = kind
-        .merge(&segments)
-        .expect("canonical segments merge")
-        .into_iter()
-        .next()
-        .expect("non-empty benchmark input produces one artifact");
+    let merged = PortableBM25Index::merge(segments.iter()).expect("canonical segments merge");
     let elapsed = merge_started.elapsed();
     let extra_heap = PEAK.load(Ordering::Relaxed).saturating_sub(baseline);
-    let digest = blake3::hash(merged_blob.bytes.as_ref());
+    let digest = blake3::hash(merged.bytes().as_ref());
 
     println!(
         "merge {:.3}s; heap peak +{}; output {}; blake3 {}",
         elapsed.as_secs_f64(),
         fmt_bytes(extra_heap),
-        fmt_bytes(merged_blob.bytes.len()),
+        fmt_bytes(merged.bytes().len()),
         digest.to_hex(),
     );
 
@@ -194,11 +182,12 @@ fn main() {
     let resident = PortableBM25Index::merge(segments.iter()).expect("portable resident merge");
     let resident_build = resident_started.elapsed();
 
-    let merged: PortableBM25Index<GenId, WordHash> =
-        PortableBM25Index::try_from_blob(Blob::<PortableBM25Blob>::new(merged_blob.bytes.clone()))
+    let merged_blob: Blob<PortableBM25Blob> = (&merged).to_blob();
+    let reattached: PortableBM25Index<GenId, WordHash> =
+        PortableBM25Index::try_from_blob(merged_blob)
             .expect("merge output is a valid portable BM25 artifact");
     let resident_expected = resident.query_multi(&query);
-    let compacted_expected = merged.query_multi(&query);
+    let compacted_expected = reattached.query_multi(&query);
     assert_eq!(
         resident_expected
             .iter()
@@ -219,14 +208,16 @@ fn main() {
 
     let compacted_started = Instant::now();
     for _ in 0..QUERY_ITERATIONS {
-        black_box(merged.query_multi(black_box(&query)));
+        black_box(reattached.query_multi(black_box(&query)));
     }
     let compacted_query = average(compacted_started.elapsed(), QUERY_ITERATIONS);
 
     const ONE_SHOT_ITERATIONS: u32 = 3;
     let one_shot_started = Instant::now();
     for _ in 0..ONE_SHOT_ITERATIONS {
-        black_box(query_across(black_box(&segments), black_box(&query)).unwrap());
+        let one_shot =
+            PortableBM25Index::merge(black_box(&segments).iter()).expect("one-shot portable merge");
+        black_box(one_shot.query_multi(black_box(&query)));
     }
     let one_shot_query = average(one_shot_started.elapsed(), ONE_SHOT_ITERATIONS);
 

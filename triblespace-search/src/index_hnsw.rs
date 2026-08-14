@@ -12,10 +12,9 @@
 //! inclusive commit ranges, so a query attaches already-built graphs without
 //! a checkout, read-all-blobs pass, or rebuild.
 //!
-//! It shares the generic range-native LSMT maintenance surface with the BM25
-//! recipe: same exact commit cover, size-tiered carry, and GC reachability,
-//! but a different artifact *format* ([`SuccinctHNSWBlob`]) and query
-//! semantics (approximate cosine k-NN rather than lexical ranking).
+//! It uses the generic range-native LSMT maintenance surface: exact commit
+//! covers, size-tiered carry, and GC reachability around one native artifact
+//! format ([`SuccinctHNSWBlob`]) and approximate cosine k-NN semantics.
 //!
 //! # Where the vectors live
 //!
