@@ -49,10 +49,6 @@
   `book/src/query-language.md#recursive-traversal`.
 
 ## Desired Functionality
-- Add a native target-compaction producer and policy above
-  `ExactDerivedCollection`. It should publish canonical raw Succinct `MERGE`
-  outputs with the same dependency ordering, remain separate from admission,
-  and preserve exact-ticket support under concurrent/repeated work.
 - Choose the native Succinct accelerator and oversized-shard policies. The
   exact-ticket facade currently rebuilds Rank9 indexes in memory and ignores
   persisted sidecars; a single derived raw shard also rejects more than

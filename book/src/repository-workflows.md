@@ -137,9 +137,13 @@ let archive = succinct.ensure_exact(&mut storage, &ticket)?;
 
 // A read-only consumer can instead require a complete resident cover.
 let same_archive = succinct.attach_exact(&mut storage, &ticket)?;
+
+// Explicit maintenance compacts colliding canonical byte-size tiers. It is
+// never scheduled by attachment and still uses the same frozen ticket.
+let compact_archive = succinct.compact_exact(&mut storage, &ticket)?;
 ```
 
-Both methods discover only the commits named by the ticket, verify their
+All three methods discover only the commits named by the ticket, verify their
 signatures and exact stored bytes, and admit unsigned source merges, target
 merges, and derivations only when their canonical equations validate. The
 returned `UnionArchive` preserves the deterministic physical shard cover.
@@ -151,6 +155,17 @@ store. An empty ticket performs no storage I/O and receives one process-local
 empty query shard; a signed commit whose source data happens to be empty still
 has ordinary persisted derivation provenance.
 
+`compact_exact` first performs ordinary exact completion, then groups the
+admitted canonical raw target members into fixed dyadic serialized-byte tiers.
+It repeatedly joins the two lowest content handles in the lowest colliding
+tier until at most one member remains per tier. The target descriptor and every
+canonical result blob are put before any topologically ordered unsigned
+`MERGE` record; no flush, manifest, receipt, level record, retention root, or
+new authority is implied. A fresh exact attachment checks each round under the
+same ticket. For any observed cover, repeated or concurrent calls choose the
+same content-addressed results and intrinsic record IDs, making retries
+idempotent.
+
 Unsigned equations remain reproducible cache evidence rather than durable
 receipts or authority. Their intermediate blobs need not remain resident:
 attachment walks backwards from resident source and target results, then
@@ -161,10 +176,12 @@ optional upper artifact is removed and the cover is recomputed from valid lower
 members. This reconstruction writes no blobs or records and requires no new
 retention roots.
 
-The facade still does not schedule target compaction, persists no Rank9
-sidecars (attachment rebuilds them in memory), and inherits the raw format's
-per-shard `u32::MAX` row and domain limits. `SuccinctRollup` remains available
-unchanged for code that still uses its legacy lifecycle.
+The facade never schedules compaction in the background and persists no Rank9
+sidecars (attachment rebuilds them in memory). Explicit compaction inherits the
+raw format's per-shard `u32::MAX` row and domain limits; an unrepresentable
+canonical join fails rather than silently weakening the tier guarantee.
+`SuccinctRollup` remains available unchanged for code that still uses its
+legacy lifecycle.
 
 ## Opening a repository
 

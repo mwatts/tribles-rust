@@ -4,10 +4,10 @@
 //! equations are reproducible cache evidence rather than authority or durable
 //! receipts: attachment reconstructs collected intermediates in use-counted
 //! scratch from authenticated source leaves, then freshly validates only the
-//! resident artifacts selected by the physical cover. The facade has no
-//! background target compactor, rebuilds Rank9 indexes in process memory on
-//! every attachment, and inherits the raw format's explicit `u32::MAX`
-//! row/domain limit for each derived shard.
+//! resident artifacts selected by the physical cover. Target compaction is an
+//! explicit maintenance call rather than background policy. Attachment rebuilds
+//! Rank9 indexes in process memory and inherits the raw format's explicit
+//! `u32::MAX` row/domain limit for each derived shard.
 
 use std::error::Error;
 use std::fmt;
@@ -19,6 +19,9 @@ use crate::blob::encodings::succinctarchive::{
 use crate::collection::exact_derived::{
     ExactCover, ExactDerivedAlgebra, ExactDerivedCollection, ExactDerivedCollectionError,
 };
+use crate::collection::exact_target_compaction::{
+    compact_exact_target, ExactTargetCompactionError,
+};
 use crate::collection::simplearchive_union;
 use crate::collection::{CollectionCommit, CollectionDescriptor, CollectionStore};
 use crate::id::Id;
@@ -29,6 +32,8 @@ use crate::repo::{BlobStore, BlobStoreMeta};
 pub enum SuccinctArchiveCollectionError {
     /// Exact-ticket authority, resolution, construction, or storage failed.
     Exact(ExactDerivedCollectionError),
+    /// Explicit target compaction failed.
+    Compaction(ExactTargetCompactionError),
     /// A selected canonical raw shard could not become a query runtime.
     Attach(SuccinctArchiveError),
 }
@@ -37,6 +42,7 @@ impl fmt::Display for SuccinctArchiveCollectionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Exact(source) => source.fmt(f),
+            Self::Compaction(source) => source.fmt(f),
             Self::Attach(source) => write!(f, "attach raw SuccinctArchive cover: {source}"),
         }
     }
@@ -46,6 +52,7 @@ impl Error for SuccinctArchiveCollectionError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Exact(source) => Some(source),
+            Self::Compaction(source) => Some(source),
             Self::Attach(source) => Some(source),
         }
     }
@@ -54,6 +61,12 @@ impl Error for SuccinctArchiveCollectionError {
 impl From<ExactDerivedCollectionError> for SuccinctArchiveCollectionError {
     fn from(source: ExactDerivedCollectionError) -> Self {
         Self::Exact(source)
+    }
+}
+
+impl From<ExactTargetCompactionError> for SuccinctArchiveCollectionError {
+    fn from(source: ExactTargetCompactionError) -> Self {
+        Self::Compaction(source)
     }
 }
 
@@ -122,6 +135,25 @@ impl SuccinctArchiveCollection {
         S::Reader: BlobStoreMeta,
     {
         let cover = self.kernel().ensure_exact(store, ticket, self)?;
+        self.attach_cover(cover)
+    }
+
+    /// Explicitly compact and attach the exact raw target cover for `ticket`.
+    ///
+    /// This first performs ordinary exact completion, then applies the fixed
+    /// dyadic byte-size policy to canonical target members. All compacted blobs
+    /// precede unsigned `MERGE` records, no flush or signed record is implied,
+    /// and the returned cover is freshly re-admitted under the same ticket.
+    pub fn compact_exact<S>(
+        &self,
+        store: &mut S,
+        ticket: &[CollectionCommit],
+    ) -> Result<UnionArchive<OrderedUniverse>, SuccinctArchiveCollectionError>
+    where
+        S: BlobStore + CollectionStore,
+        S::Reader: BlobStoreMeta,
+    {
+        let cover = compact_exact_target(&self.kernel(), store, ticket, self)?;
         self.attach_cover(cover)
     }
 
@@ -383,6 +415,7 @@ mod tests {
         for attached in [
             collection.attach_exact(&mut store, &[]).unwrap(),
             collection.ensure_exact(&mut store, &[]).unwrap(),
+            collection.compact_exact(&mut store, &[]).unwrap(),
         ] {
             assert_eq!(attached.segment_count(), 1);
             assert_eq!(attached.iter().count(), 0);
@@ -442,6 +475,32 @@ mod tests {
             .unwrap();
         assert_eq!(attached_facts(&attached), left_facts + right_facts);
         assert_eq!(attached.segment_count(), 2);
+    }
+
+    #[test]
+    fn explicit_compaction_returns_one_exact_real_succinct_shard() {
+        let scope = id(7);
+        let collection = SuccinctArchiveCollection::new(scope);
+        let mut store = CollectionOnly::default();
+        let left_facts = facts([(1, 3)]);
+        let right_facts = facts([(2, 4)]);
+        let left = put_data(&mut store, &left_facts);
+        let right = put_data(&mut store, &right_facts);
+        let first = signed_commit(&mut store, scope, 1, &left);
+        let second = signed_commit(&mut store, scope, 2, &right);
+        publish(&mut store, first);
+        publish(&mut store, second);
+
+        let attached = collection
+            .compact_exact(&mut store, &[second, first])
+            .unwrap();
+        assert_eq!(attached.segment_count(), 1);
+        assert_eq!(attached_facts(&attached), left_facts + right_facts);
+        assert!(records(&mut store).into_iter().any(|record| matches!(
+            record,
+            CollectionRecord::Merge(claim)
+                if claim.collection() == collection.descriptor().handle()
+        )));
     }
 
     #[test]

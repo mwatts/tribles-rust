@@ -8,6 +8,9 @@ use ed25519_dalek::SigningKey;
 
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{IntoBlob, TryFromBlob};
+use crate::collection::exact_target_compaction::{
+    compact_exact_target, ExactTargetCompactionError,
+};
 use crate::collection::simplearchive_union;
 use crate::inline::encodings::hash::Handle;
 use crate::metadata::MetaDescribe;
@@ -194,6 +197,11 @@ fn zero_ticket_performs_no_store_operation() {
         .ensure_exact(&mut store, &[], &TestAlgebra)
         .unwrap()
         .is_empty());
+    assert!(
+        compact_exact_target(&kernel(), &mut store, &[], &TestAlgebra)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[derive(Default)]
@@ -258,6 +266,23 @@ fn complete_probe_ensure_performs_zero_writes() {
     let cover = kernel()
         .ensure_exact(&mut store, &[commit], &TestAlgebra)
         .unwrap();
+    assert_eq!(cover.len(), 1);
+    assert_eq!(store.puts, 0);
+    assert_eq!(store.inserts, 0);
+}
+
+#[test]
+fn stable_exact_cover_compaction_performs_zero_additional_writes() {
+    let source = archive([(1, 3)]);
+    let mut inner = MemoryRepo::default();
+    let commit = source_commit(&mut inner, 1, &source);
+    publish_derive(&mut inner, &source);
+    let mut store = CountingStore {
+        inner,
+        ..CountingStore::default()
+    };
+
+    let cover = compact_exact_target(&kernel(), &mut store, &[commit], &TestAlgebra).unwrap();
     assert_eq!(cover.len(), 1);
     assert_eq!(store.puts, 0);
     assert_eq!(store.inserts, 0);
@@ -345,9 +370,16 @@ impl BlobStoreList for GuardReader {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum WriteEvent {
+    Put(CollectionData),
+    Insert(CollectionRecord),
+}
+
 struct GuardStore {
     inner: MemoryRepo,
     live: Arc<AtomicUsize>,
+    events: Vec<WriteEvent>,
 }
 
 impl GuardStore {
@@ -370,7 +402,10 @@ impl BlobStorePut for GuardStore {
         Handle<S>: InlineEncoding,
     {
         self.assert_no_reader();
-        self.inner.put(item)
+        let blob = item.to_blob();
+        self.events
+            .push(WriteEvent::Put(Handle::<S>::to_hash(blob.get_handle())));
+        self.inner.put(blob)
     }
 }
 
@@ -402,6 +437,7 @@ impl CollectionStore for GuardStore {
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
         self.assert_no_reader();
+        self.events.push(WriteEvent::Insert(record));
         self.inner.insert(record)
     }
 }
@@ -415,11 +451,451 @@ fn reader_is_dropped_before_first_write() {
     let mut store = GuardStore {
         inner,
         live: Arc::clone(&live),
+        events: Vec::new(),
     };
     kernel()
         .ensure_exact(&mut store, &[commit], &TestAlgebra)
         .unwrap();
     assert_eq!(live.load(Ordering::SeqCst), 0);
+}
+
+fn target_merge_records(store: &mut MemoryRepo) -> Vec<CollectionMerge> {
+    store
+        .records()
+        .unwrap()
+        .map(Result::unwrap)
+        .filter_map(|record| match record {
+            CollectionRecord::Merge(claim)
+                if claim.collection() == kernel().target_descriptor().handle() =>
+            {
+                Some(claim)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn joined_cover(cover: &ExactCover<UnknownBlob>) -> Blob<UnknownBlob> {
+    let mut members = cover.members().iter();
+    let mut joined = members
+        .next()
+        .expect("nonempty ticket has a target member")
+        .1
+        .clone();
+    for (_, member) in members {
+        joined = TestAlgebra.join_target(&joined, member).unwrap();
+    }
+    joined
+}
+
+fn cover_ids(cover: &ExactCover<UnknownBlob>) -> Vec<CollectionData> {
+    cover.members().iter().map(|(data, _)| *data).collect()
+}
+
+#[test]
+fn compaction_collapses_same_tier_and_returns_an_exact_tier_stable_cover() {
+    let sources = [
+        archive([(1, 3)]),
+        archive([(2, 4)]),
+        archive((10..18).map(|entity| (entity, entity + 20))),
+    ];
+    let mut store = MemoryRepo::default();
+    let ticket: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| source_commit(&mut store, index as u8 + 1, source))
+        .collect();
+
+    let cover = compact_exact_target(&kernel(), &mut store, &ticket, &TestAlgebra).unwrap();
+    let mut tiers = BTreeSet::new();
+    for (_, blob) in cover.members() {
+        assert!(tiers.insert(blob.bytes.len().max(1).ilog2()));
+    }
+    assert_eq!(cover.len(), 2);
+    assert!(!target_merge_records(&mut store).is_empty());
+
+    let expected_source = sources
+        .iter()
+        .skip(1)
+        .try_fold(sources[0].clone(), |joined, source| {
+            simplearchive_union::join(&joined, source)
+        })
+        .unwrap();
+    assert_eq!(
+        joined_cover(&cover).bytes,
+        derive(&expected_source).unwrap().bytes
+    );
+}
+
+#[test]
+fn compaction_substitutes_new_resident_uppers_through_an_old_nonresident_proof() {
+    let sources = [archive([(1, 3)]), archive([(2, 4)]), archive([(3, 5)])];
+    let mut store = MemoryRepo::default();
+    let ticket: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| {
+            let commit = source_commit(&mut store, index as u8 + 1, source);
+            publish_derive(&mut store, source);
+            commit
+        })
+        .collect();
+    let mut targets: Vec<_> = sources
+        .iter()
+        .map(|source| {
+            let target = derive(source).unwrap();
+            (data(&target), target)
+        })
+        .collect();
+    targets.sort_unstable_by_key(|(data, _)| *data);
+    let old_intermediate = TestAlgebra
+        .join_target(&targets[1].1, &targets[2].1)
+        .unwrap();
+    let old_upper = TestAlgebra
+        .join_target(&targets[0].1, &old_intermediate)
+        .unwrap();
+    for claim in [
+        CollectionMerge::new(
+            kernel().target_descriptor().handle(),
+            targets[1].0,
+            targets[2].0,
+            data(&old_intermediate),
+        ),
+        CollectionMerge::new(
+            kernel().target_descriptor().handle(),
+            targets[0].0,
+            data(&old_intermediate),
+            data(&old_upper),
+        ),
+    ] {
+        store.insert(CollectionRecord::Merge(claim)).unwrap();
+    }
+    let wrong = derive(&archive([(9, 9)])).unwrap();
+    store
+        .put::<UnknownBlob, _>(Blob::<UnknownBlob>::with_handle(
+            wrong.bytes,
+            old_upper.get_handle(),
+        ))
+        .unwrap();
+
+    let before = kernel()
+        .attach_exact(&mut store, &ticket, &TestAlgebra)
+        .unwrap();
+    assert_eq!(before.len(), 3);
+    let after = compact_exact_target(&kernel(), &mut store, &ticket, &TestAlgebra).unwrap();
+    let mut tiers = BTreeSet::new();
+    assert!(after
+        .members()
+        .iter()
+        .all(|(_, blob)| tiers.insert(blob.bytes.len().max(1).ilog2())));
+    assert_eq!(after.len(), 2);
+    assert_eq!(joined_cover(&after).bytes, old_upper.bytes);
+    assert!(target_merge_records(&mut store)
+        .iter()
+        .any(|claim| claim.inputs() == (targets[0].0, targets[1].0)));
+}
+
+#[test]
+fn compaction_is_ticket_order_deterministic_and_repeatedly_idempotent() {
+    let sources = [
+        archive([(1, 3)]),
+        archive([(2, 4)]),
+        archive([(3, 5)]),
+        archive([(4, 6)]),
+    ];
+    let mut first_store = MemoryRepo::default();
+    let first_ticket: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| source_commit(&mut first_store, index as u8 + 1, source))
+        .collect();
+    let mut second_store = MemoryRepo::default();
+    let mut second_ticket: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| source_commit(&mut second_store, index as u8 + 1, source))
+        .collect();
+    second_ticket.reverse();
+
+    let first =
+        compact_exact_target(&kernel(), &mut first_store, &first_ticket, &TestAlgebra).unwrap();
+    let second =
+        compact_exact_target(&kernel(), &mut second_store, &second_ticket, &TestAlgebra).unwrap();
+    assert_eq!(cover_ids(&first), cover_ids(&second));
+    assert_eq!(
+        target_merge_records(&mut first_store),
+        target_merge_records(&mut second_store)
+    );
+
+    let records_before: Vec<_> = first_store.records().unwrap().map(Result::unwrap).collect();
+    let repeated =
+        compact_exact_target(&kernel(), &mut first_store, &first_ticket, &TestAlgebra).unwrap();
+    let records_after: Vec<_> = first_store.records().unwrap().map(Result::unwrap).collect();
+    assert_eq!(cover_ids(&first), cover_ids(&repeated));
+    assert_eq!(records_before, records_after);
+}
+
+#[test]
+fn compaction_drops_readers_and_puts_all_results_before_the_first_merge() {
+    let sources = [
+        archive([(1, 3)]),
+        archive([(2, 4)]),
+        archive([(3, 5)]),
+        archive([(4, 6)]),
+    ];
+    let mut inner = MemoryRepo::default();
+    let ticket: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| {
+            let commit = source_commit(&mut inner, index as u8 + 1, source);
+            publish_derive(&mut inner, source);
+            commit
+        })
+        .collect();
+    let live = Arc::new(AtomicUsize::new(0));
+    let mut store = GuardStore {
+        inner,
+        live: Arc::clone(&live),
+        events: Vec::new(),
+    };
+
+    compact_exact_target(&kernel(), &mut store, &ticket, &TestAlgebra).unwrap();
+    assert_eq!(live.load(Ordering::SeqCst), 0);
+    let first_merge = store
+        .events
+        .iter()
+        .position(|event| matches!(event, WriteEvent::Insert(CollectionRecord::Merge(_))))
+        .expect("colliding cover publishes a MERGE");
+    let descriptor_data = Handle::<SimpleArchive>::to_hash(kernel().target_descriptor().handle());
+    assert!(store.events[..first_merge]
+        .iter()
+        .any(|event| matches!(event, WriteEvent::Put(data) if *data == descriptor_data)));
+    let results: Vec<_> = store
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            WriteEvent::Insert(CollectionRecord::Merge(claim)) => Some(claim.result()),
+            _ => None,
+        })
+        .collect();
+    assert!(!results.is_empty());
+    for result in results {
+        assert!(store.events[..first_merge]
+            .iter()
+            .any(|event| matches!(event, WriteEvent::Put(data) if *data == result)));
+    }
+}
+
+struct FailingJoinAlgebra;
+
+impl ExactDerivedAlgebra<SimpleArchive, UnknownBlob> for FailingJoinAlgebra {
+    fn validate_source(
+        &self,
+        descriptor: &CollectionDescriptor,
+        source: &Blob<SimpleArchive>,
+    ) -> Result<(), String> {
+        TestAlgebra.validate_source(descriptor, source)
+    }
+
+    fn validate_target(
+        &self,
+        descriptor: &CollectionDescriptor,
+        target: &Blob<UnknownBlob>,
+    ) -> Result<(), String> {
+        TestAlgebra.validate_target(descriptor, target)
+    }
+
+    fn join_source(
+        &self,
+        low: &Blob<SimpleArchive>,
+        high: &Blob<SimpleArchive>,
+    ) -> Result<Blob<SimpleArchive>, String> {
+        TestAlgebra.join_source(low, high)
+    }
+
+    fn derive(&self, source: &Blob<SimpleArchive>) -> Result<Blob<UnknownBlob>, String> {
+        TestAlgebra.derive(source)
+    }
+
+    fn join_target(
+        &self,
+        _: &Blob<UnknownBlob>,
+        _: &Blob<UnknownBlob>,
+    ) -> Result<Blob<UnknownBlob>, String> {
+        Err("injected target join failure".to_owned())
+    }
+}
+
+#[derive(Debug)]
+struct RejectedPut;
+
+impl fmt::Display for RejectedPut {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("injected put failure")
+    }
+}
+
+impl Error for RejectedPut {}
+
+struct RejectPutStore {
+    inner: MemoryRepo,
+    puts: usize,
+}
+
+impl BlobStorePut for RejectPutStore {
+    type PutError = RejectedPut;
+
+    fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
+    where
+        S: BlobEncoding + 'static,
+        T: IntoBlob<S>,
+        Handle<S>: InlineEncoding,
+    {
+        self.puts += 1;
+        if self.puts == 2 {
+            Err(RejectedPut)
+        } else {
+            Ok(self
+                .inner
+                .put(item)
+                .expect("MemoryRepo puts are infallible"))
+        }
+    }
+}
+
+struct DropMergeStore {
+    inner: MemoryRepo,
+}
+
+impl BlobStorePut for DropMergeStore {
+    type PutError = <MemoryRepo as BlobStorePut>::PutError;
+
+    fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
+    where
+        S: BlobEncoding + 'static,
+        T: IntoBlob<S>,
+        Handle<S>: InlineEncoding,
+    {
+        self.inner.put(item)
+    }
+}
+
+impl BlobStore for DropMergeStore {
+    type Reader = <MemoryRepo as BlobStore>::Reader;
+    type ReaderError = <MemoryRepo as BlobStore>::ReaderError;
+
+    fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
+        self.inner.reader()
+    }
+}
+
+impl CollectionStore for DropMergeStore {
+    type RecordsError = <MemoryRepo as CollectionStore>::RecordsError;
+    type InsertError = <MemoryRepo as CollectionStore>::InsertError;
+    type RecordIter<'a>
+        = <MemoryRepo as CollectionStore>::RecordIter<'a>
+    where
+        Self: 'a;
+
+    fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+        self.inner.records()
+    }
+
+    fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
+        if matches!(record, CollectionRecord::Merge(_)) {
+            Ok(())
+        } else {
+            self.inner.insert(record)
+        }
+    }
+}
+
+impl BlobStore for RejectPutStore {
+    type Reader = <MemoryRepo as BlobStore>::Reader;
+    type ReaderError = <MemoryRepo as BlobStore>::ReaderError;
+
+    fn reader(&mut self) -> Result<Self::Reader, Self::ReaderError> {
+        self.inner.reader()
+    }
+}
+
+impl CollectionStore for RejectPutStore {
+    type RecordsError = <MemoryRepo as CollectionStore>::RecordsError;
+    type InsertError = <MemoryRepo as CollectionStore>::InsertError;
+    type RecordIter<'a>
+        = <MemoryRepo as CollectionStore>::RecordIter<'a>
+    where
+        Self: 'a;
+
+    fn records<'a>(&'a mut self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+        self.inner.records()
+    }
+
+    fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
+        self.inner.insert(record)
+    }
+}
+
+#[test]
+fn join_and_put_failures_publish_no_target_merge() {
+    let sources = [archive([(1, 3)]), archive([(2, 4)])];
+
+    let mut join_store = MemoryRepo::default();
+    let join_ticket: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| source_commit(&mut join_store, index as u8 + 1, source))
+        .collect();
+    assert!(matches!(
+        compact_exact_target(
+            &kernel(),
+            &mut join_store,
+            &join_ticket,
+            &FailingJoinAlgebra,
+        ),
+        Err(ExactTargetCompactionError::Merge { .. })
+    ));
+    assert!(target_merge_records(&mut join_store).is_empty());
+
+    let mut inner = MemoryRepo::default();
+    let put_ticket: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| {
+            let commit = source_commit(&mut inner, index as u8 + 1, source);
+            publish_derive(&mut inner, source);
+            commit
+        })
+        .collect();
+    let mut put_store = RejectPutStore { inner, puts: 0 };
+    assert!(matches!(
+        compact_exact_target(&kernel(), &mut put_store, &put_ticket, &TestAlgebra),
+        Err(ExactTargetCompactionError::Storage { .. })
+    ));
+    assert!(target_merge_records(&mut put_store.inner).is_empty());
+}
+
+#[test]
+fn discarded_merge_insert_stalls_instead_of_looping() {
+    let sources = [archive([(1, 3)]), archive([(2, 4)])];
+    let mut inner = MemoryRepo::default();
+    let ticket: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| {
+            let commit = source_commit(&mut inner, index as u8 + 1, source);
+            publish_derive(&mut inner, source);
+            commit
+        })
+        .collect();
+    let mut store = DropMergeStore { inner };
+
+    assert!(matches!(
+        compact_exact_target(&kernel(), &mut store, &ticket, &TestAlgebra),
+        Err(ExactTargetCompactionError::Stalled { cover }) if cover.len() == 2
+    ));
+    assert!(target_merge_records(&mut store.inner).is_empty());
 }
 
 struct LossyStore {

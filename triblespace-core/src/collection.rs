@@ -11,6 +11,8 @@ pub mod api;
 pub mod discovery;
 /// Shared exact-ticket lifecycle for canonical derived collections.
 pub mod exact_derived;
+/// Explicit size-tiered maintenance for exact canonical target covers.
+pub mod exact_target_compaction;
 /// Orthogonal grow-only publication grants for collection commits.
 pub mod gossip;
 pub mod records;

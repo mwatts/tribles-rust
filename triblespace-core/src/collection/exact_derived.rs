@@ -1067,7 +1067,7 @@ where
         .map_err(|error| ExactDerivedCollectionError::storage(operation, error))
 }
 
-fn fresh_data_identity<E: BlobEncoding>(blob: &Blob<E>) -> CollectionData {
+pub(super) fn fresh_data_identity<E: BlobEncoding>(blob: &Blob<E>) -> CollectionData {
     Inline::<Hash<Blake3>>::new(Blake3::digest(&blob.bytes))
 }
 

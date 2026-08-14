@@ -32,10 +32,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   invalid cache bytes are removed and the deterministic physical cover is
   recomputed. This adds neither receipts nor authority/retention records, and a
   complete `attach_exact` or `ensure_exact` remains write-free even after a
-  retained Pile rewrite collected the intermediate proof blobs. There is still
-  no native target compactor or persisted-accelerator policy, and each raw
-  derived shard retains the format's explicit `u32::MAX` row/domain boundary.
-  The legacy `SuccinctRollup` remains available unchanged.
+  retained Pile rewrite collected the intermediate proof blobs.
+
+  Explicit native target compaction is now available through the generic
+  `collection::exact_target_compaction::compact_exact_target` producer and the
+  thin `SuccinctArchiveCollection::compact_exact` facade. Its fixed policy
+  repeatedly joins the two lowest content handles in the lowest colliding
+  dyadic serialized-byte tier, puts and verifies the target descriptor and all
+  canonical result blobs before topologically ordered unsigned `MERGE` records,
+  and freshly re-admits every round under the same exact ticket. Stable covers
+  add no writes; repeated and concurrent work is content-addressed and
+  idempotent; no flush, planner, manifest, receipt, retention root, background
+  task, or authority record is introduced. Persisted accelerators remain out of
+  scope, each raw shard retains the explicit `u32::MAX` row/domain boundary,
+  and the legacy `SuccinctRollup` remains available unchanged.
 - **Regular paths now use one exact native collection path.**
   `PathSummaryCollection::{attach_exact, ensure_exact}` validates a frozen set
   of signed `SimpleArchive` commits, reuses canonical source merges, target
