@@ -347,6 +347,7 @@ impl CollectionSemantics {
         supporting
     }
 
+    #[cfg(test)]
     fn subsumes(
         &self,
         collection: CollectionId,
@@ -377,6 +378,38 @@ impl CollectionSemantics {
         false
     }
 
+    /// Return the first canonical candidate strictly above `lower` in the
+    /// sparse generating order.
+    ///
+    /// One reachability walk tests membership as it goes, instead of walking
+    /// the same order graph once for every candidate. The explicit exclusion
+    /// of `lower` preserves the resident-frontier meaning even if malformed
+    /// accepted evidence introduced a cycle.
+    fn first_strict_subsumer_in(
+        &self,
+        collection: CollectionId,
+        lower: CollectionData,
+        candidates: &BTreeSet<CollectionData>,
+    ) -> Option<CollectionData> {
+        let mut visited = BTreeSet::from([lower]);
+        let mut pending = vec![lower];
+        while let Some(input) = pending.pop() {
+            for result in self
+                .order_results_by_input
+                .get(&(collection, input))
+                .into_iter()
+                .flatten()
+            {
+                if visited.insert(*result) {
+                    pending.push(*result);
+                }
+            }
+        }
+        visited
+            .into_iter()
+            .find(|candidate| *candidate != lower && candidates.contains(candidate))
+    }
+
     fn cover_element(
         &self,
         collection: CollectionId,
@@ -384,11 +417,11 @@ impl CollectionSemantics {
         resident_frontier: &BTreeSet<CollectionData>,
         mut path: BTreeSet<CollectionData>,
     ) -> Option<BTreeSet<CollectionData>> {
-        if let Some(upper) = resident_frontier
-            .iter()
-            .find(|upper| self.subsumes(collection, element, **upper))
-        {
-            return Some(BTreeSet::from([*upper]));
+        if resident_frontier.contains(&element) {
+            return Some(BTreeSet::from([element]));
+        }
+        if let Some(upper) = self.first_strict_subsumer_in(collection, element, resident_frontier) {
+            return Some(BTreeSet::from([upper]));
         }
         if !path.insert(element) {
             return None;
@@ -448,10 +481,10 @@ pub fn collection_physical_cover(
     let resident_members: BTreeSet<_> = resident.intersection(members).copied().collect();
     let mut resident_frontier = BTreeSet::new();
     for candidate in &resident_members {
-        let dominated = resident_members
-            .iter()
-            .any(|other| candidate != other && semantics.subsumes(collection, *candidate, *other));
-        if !dominated {
+        if semantics
+            .first_strict_subsumer_in(collection, *candidate, &resident_members)
+            .is_none()
+        {
             resident_frontier.insert(*candidate);
         }
     }
@@ -1110,6 +1143,100 @@ mod tests {
         _: CollectionValidationRequest<'_>,
     ) -> Result<CollectionClaimValidation<()>, Infallible> {
         Ok(CollectionClaimValidation::Accepted)
+    }
+
+    fn reference_cover_element(
+        semantics: &CollectionSemantics,
+        collection: CollectionId,
+        element: CollectionData,
+        resident_frontier: &BTreeSet<CollectionData>,
+        mut path: BTreeSet<CollectionData>,
+    ) -> Option<BTreeSet<CollectionData>> {
+        if let Some(upper) = resident_frontier
+            .iter()
+            .find(|upper| semantics.subsumes(collection, element, **upper))
+        {
+            return Some(BTreeSet::from([*upper]));
+        }
+        if !path.insert(element) {
+            return None;
+        }
+        for (low, high, _) in semantics
+            .merge_inputs_by_result
+            .get(&(collection, element))
+            .into_iter()
+            .flatten()
+        {
+            let Some(mut proof) = reference_cover_element(
+                semantics,
+                collection,
+                *low,
+                resident_frontier,
+                path.clone(),
+            ) else {
+                continue;
+            };
+            let Some(right) = reference_cover_element(
+                semantics,
+                collection,
+                *high,
+                resident_frontier,
+                path.clone(),
+            ) else {
+                continue;
+            };
+            proof.extend(right);
+            return Some(proof);
+        }
+        None
+    }
+
+    fn reference_physical_cover(
+        semantics: &CollectionSemantics,
+        collection: CollectionId,
+        resident: &BTreeSet<CollectionData>,
+    ) -> CollectionPhysicalCover {
+        let Some(members) = semantics.members(collection) else {
+            return CollectionPhysicalCover::default();
+        };
+        let resident_members: BTreeSet<_> = resident.intersection(members).copied().collect();
+        let mut resident_frontier = BTreeSet::new();
+        for candidate in &resident_members {
+            let dominated = resident_members.iter().any(|other| {
+                candidate != other && semantics.subsumes(collection, *candidate, *other)
+            });
+            if !dominated {
+                resident_frontier.insert(*candidate);
+            }
+        }
+
+        let mut result = CollectionPhysicalCover::default();
+        for obligation in semantics
+            .frontier(collection)
+            .into_iter()
+            .flatten()
+            .copied()
+        {
+            match reference_cover_element(
+                semantics,
+                collection,
+                obligation,
+                &resident_frontier,
+                BTreeSet::new(),
+            ) {
+                Some(proof) => result.cover.extend(proof),
+                None => {
+                    result.missing.insert(obligation);
+                }
+            }
+        }
+        result
+    }
+
+    fn numbered_data(number: u32) -> CollectionData {
+        let mut raw = [0u8; 32];
+        raw[28..].copy_from_slice(&number.to_be_bytes());
+        Inline::new(raw)
     }
 
     #[test]
@@ -1785,6 +1912,76 @@ mod tests {
         assert_eq!(
             collection_physical_cover(semantics, definition.handle(), &BTreeSet::new()).missing,
             BTreeSet::from([data(3), data(14)])
+        );
+    }
+
+    #[test]
+    fn sparse_physical_cover_matches_pairwise_reference_including_cycles() {
+        let collection = CollectionDescriptor::new(id(1), id(2), id(3)).handle();
+        let elements = [data(1), data(2), data(3)];
+        let members = BTreeSet::from(elements);
+        let directed_edges: Vec<_> = elements
+            .iter()
+            .copied()
+            .flat_map(|lower| {
+                elements
+                    .iter()
+                    .copied()
+                    .filter(move |upper| *upper != lower)
+                    .map(move |upper| (lower, upper))
+            })
+            .collect();
+
+        for graph in 0u16..(1u16 << directed_edges.len()) {
+            let mut semantics = CollectionSemantics {
+                members: BTreeMap::from([(collection, members.clone())]),
+                frontier: BTreeMap::from([(collection, members.clone())]),
+                ..CollectionSemantics::default()
+            };
+            for (index, (lower, upper)) in directed_edges.iter().copied().enumerate() {
+                if graph & (1 << index) != 0 {
+                    semantics
+                        .order_results_by_input
+                        .entry((collection, lower))
+                        .or_default()
+                        .insert(upper);
+                }
+            }
+
+            for resident_bits in 0u8..(1u8 << elements.len()) {
+                let resident = elements
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter_map(|(index, element)| {
+                        (resident_bits & (1 << index) != 0).then_some(element)
+                    })
+                    .collect();
+                assert_eq!(
+                    collection_physical_cover(&semantics, collection, &resident),
+                    reference_physical_cover(&semantics, collection, &resident),
+                    "graph={graph:03x}, resident={resident_bits:01x}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn many_independent_resident_members_cover_themselves() {
+        let collection = CollectionDescriptor::new(id(1), id(2), id(3)).handle();
+        let members: BTreeSet<_> = (1..=4_096).map(numbered_data).collect();
+        let semantics = CollectionSemantics {
+            members: BTreeMap::from([(collection, members.clone())]),
+            frontier: BTreeMap::from([(collection, members.clone())]),
+            ..CollectionSemantics::default()
+        };
+
+        assert_eq!(
+            collection_physical_cover(&semantics, collection, &members),
+            CollectionPhysicalCover {
+                cover: members,
+                missing: BTreeSet::new(),
+            }
         );
     }
 

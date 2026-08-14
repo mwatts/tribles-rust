@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Physical collection covers follow the sparse order once per candidate.**
+  Resident-frontier selection now walks reachable successors and tests the
+  resident set during that walk, instead of comparing every resident pair
+  through an independent reachability query. Exact resident obligations are
+  discharged before any traversal. This preserves the canonical proof choice,
+  overlap reuse, cycle behavior, and nonresident-intermediate fallback while
+  making an equation-free collection linearithmic rather than quadratic in
+  its resident leaves.
 - **SimpleArchive collection covers now become one query index build.**
   Materialization validates every selected canonical member, merges their
   sorted rows with one overlap-deduplicating k-way pass, and constructs the
