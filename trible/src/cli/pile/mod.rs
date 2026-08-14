@@ -81,11 +81,19 @@ pub enum PileCommand {
     /// unknown unenveloped markers are refused because their length is
     /// unknowable and may indicate a newer pile format. This is last-resort
     /// surgery for a torn append left by a crashed write: back the file up
-    /// first, confirm the tail is genuinely torn (e.g. `trible pile
-    /// diagnose`), and only then run this by hand.
+    /// first, inspect the reported boundary with `trible pile diagnose
+    /// record-at`, confirm the tail is genuinely torn, and only then run this
+    /// by hand with that exact boundary.
     Amputate {
         /// Path to the pile file to amputate (TRUNCATED in place)
         path: PathBuf,
+        /// Exact byte offset to truncate to.
+        ///
+        /// This must equal the boundary reported by the current reader. The
+        /// explicit value prevents an old tool's generic repair suggestion
+        /// from becoming an unexamined destructive command.
+        #[arg(long, value_name = "BYTE_OFFSET")]
+        truncate_to: usize,
     },
     /// Migrate legacy pile metadata to the current schemas.
     Migrate {
@@ -168,9 +176,13 @@ pub(crate) fn pile_read_error(path: &Path, err: ReadError) -> anyhow::Error {
             path.display()
         ),
         err @ ReadError::CorruptPile { .. } => anyhow!(
-            "pile {} is corrupt ({err}): refusing to auto-repair. If, and only if, the tail is a \
-             genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile \
-             amputate {}",
+            "pile {} has a malformed or incomplete known record ({err}); this reader cannot \
+             prove that the remaining bytes are a disposable torn write. The pile was left \
+             unchanged. Inspect the reported boundary with `trible pile diagnose record-at {} \
+             <BYTE_OFFSET>`. Only after making a backup and independently confirming that every \
+             byte from that boundary onward may be destroyed, run `trible pile amputate {} \
+             --truncate-to <BYTE_OFFSET>`",
+            path.display(),
             path.display(),
             path.display()
         ),
@@ -180,7 +192,8 @@ pub(crate) fn pile_read_error(path: &Path, err: ReadError) -> anyhow::Error {
 
 /// Open a pile and load its records via `refresh`, failing loud on a corrupt,
 /// torn, or unsupported tail without modifying it. Deliberate repair of
-/// genuine corruption stays a separate `trible pile amputate <path>` step.
+/// genuine corruption stays a separate, boundary-confirmed
+/// `trible pile amputate <path> --truncate-to <byte-offset>` step.
 pub(crate) fn open_refreshed(path: &Path) -> Result<Pile> {
     let mut pile = Pile::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.refresh() {
@@ -221,28 +234,34 @@ pub fn run(cmd: PileCommand) -> Result<()> {
         }
         PileCommand::Net { cmd } => net::run(cmd),
         PileCommand::Diagnose { cmd } => diagnose::run(cmd),
-        PileCommand::Amputate { path } => {
-            let before = fs::metadata(&path)?.len();
+        PileCommand::Amputate { path, truncate_to } => {
             let mut pile = Pile::open(&path)?;
-            // `amputate` loads every valid record and, on a torn tail,
-            // TRUNCATES the file back to the last known-good offset,
-            // destroying everything after it. This is the single place in
-            // the tree that performs that mutation.
-            if let Err(err) = pile.amputate() {
-                let _ = pile.close();
-                return Err(pile_read_error(&path, err));
-            }
-            let after = fs::metadata(&path)?.len();
+            // Boundary comparison and truncation happen under the same
+            // exclusive file lock. A preflight `refresh` here would leave a
+            // check-then-act race with another repair process.
+            let amputated = match pile.amputate_at(truncate_to) {
+                Ok(amputated) => amputated,
+                Err(ReadError::CorruptPile { valid_length }) => {
+                    let _ = pile.close();
+                    return Err(anyhow!(
+                        "refusing destructive repair: --truncate-to {truncate_to} does not match \
+                         the current reader's boundary {valid_length}; the pile was left unchanged"
+                    ));
+                }
+                Err(err) => {
+                    let _ = pile.close();
+                    return Err(pile_read_error(&path, err));
+                }
+            };
             pile.close()
                 .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
-            if after == before {
-                println!("{}: already valid ({before} bytes)", path.display());
-            } else {
+            if amputated {
                 println!(
-                    "{}: amputated torn tail, {before} -> {after} bytes ({} bytes DESTROYED)",
-                    path.display(),
-                    before - after
+                    "{}: amputated tail at confirmed boundary {truncate_to}",
+                    path.display()
                 );
+            } else {
+                println!("{}: already valid", path.display());
             }
             Ok(())
         }

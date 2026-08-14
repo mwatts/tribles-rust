@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The destructive pile CLI requires the current reader's exact boundary.**
+  `trible pile amputate <path> --truncate-to <byte-offset>` refuses a guessed
+  or stale offset before mutation. Read failures now say explicitly that a
+  malformed known record and an interrupted append share one conservative
+  error class, direct operators through the non-mutating `record-at`
+  diagnostic, and require a backup plus independent confirmation instead of
+  presenting truncation as routine repair. Boundary comparison and truncation
+  occur under the same exclusive file lock. The old copy-pasteable
+  `trible pile amputate <path>` form is intentionally incomplete.
+
 ### Added
 
 - **Durable wants now name blobs and reproducible collection work through one

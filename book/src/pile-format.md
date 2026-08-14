@@ -124,8 +124,13 @@ refreshing state.
    crash. It crosses complete opaque envelopes and may truncate a torn opaque
    tail at its known start. It refuses `UnsupportedRecord` without modifying
    the file because an unknown unenveloped record's boundary is unknowable. It
-   is deliberately **not** part of the normal open sequence. The
-   `trible pile amputate <path>` command wraps it for operators.
+   is deliberately **not** part of the normal open sequence. The operator CLI
+   additionally requires the exact boundary reported by the current reader:
+   `trible pile amputate <path> --truncate-to <byte-offset>`. A stale generic
+   repair suggestion or a guessed offset therefore cannot trigger truncation.
+   The reader compares that offset and calls `set_len` while holding the same
+   exclusive file lock, so an intervening repair cannot move the boundary
+   between validation and mutation.
 4. **Append new records.** `put` (through the `BlobStorePut` trait),
    `CollectionStore::insert`, and pin update helpers extend the file. Each
    append immediately feeds the bytes back through the record scanner so
@@ -532,7 +537,9 @@ length if corruption is encountered, discarding incomplete data left by an
 interrupted write. It crosses complete opaque envelopes, truncates a torn one
 at its start, and propagates `UnsupportedRecord` for unknown unenveloped
 markers without truncating. Run it deliberately (e.g. via
-`trible pile amputate <path>`)—never as a routine part of opening. Hash
+`trible pile amputate <path> --truncate-to <byte-offset>`)—never as a routine
+part of opening. The CLI refuses a boundary that differs from the current
+reader's result. Hash
 verification happens lazily only when individual blobs are loaded so that
 opening a large pile remains fast.
 

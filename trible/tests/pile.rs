@@ -516,9 +516,9 @@ fn diagnose_record_at_distinguishes_version_skew_from_a_torn_record() {
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("is corrupt"))
-        .stderr(predicate::str::contains("genuinely torn write"))
-        .stderr(predicate::str::contains("trible pile amputate"));
+        .stderr(predicate::str::contains("malformed or incomplete"))
+        .stderr(predicate::str::contains("cannot prove"))
+        .stderr(predicate::str::contains("--truncate-to <BYTE_OFFSET>"));
 }
 
 #[test]
@@ -819,10 +819,9 @@ fn reid_and_rename_preserve_typed_manifest_facts() {
     pile.close().unwrap();
 }
 
-/// A corrupt (torn-tail) source pile must make `reid`, `squash`, and
-/// `migrate` fail loud — pointing at `trible pile amputate` — without
-/// truncating the source file. Silent auto-repair on open is reserved
-/// for the explicit `trible pile amputate` command.
+/// A malformed or incomplete source pile must make `reid`, `squash`, and
+/// `migrate` fail loud with a boundary-confirmed repair path, without
+/// truncating the source file.
 #[test]
 fn corrupt_source_fails_loud_without_truncation() {
     use std::io::Write;
@@ -850,7 +849,10 @@ fn corrupt_source_fails_loud_without_truncation() {
     }
     let len_before = std::fs::metadata(&src_path).unwrap().len();
 
-    let fail_loud = predicate::str::contains("trible pile amputate");
+    let fail_loud = || {
+        predicate::str::contains("cannot prove")
+            .and(predicate::str::contains("--truncate-to <BYTE_OFFSET>"))
+    };
 
     // reid: fails loud, source untouched, destination never created.
     let dest = dir.path().join("reid_dst.pile");
@@ -864,7 +866,7 @@ fn corrupt_source_fails_loud_without_truncation() {
         ])
         .assert()
         .failure()
-        .stderr(fail_loud.clone());
+        .stderr(fail_loud());
     assert!(
         !dest.exists(),
         "reid must not create dest on corrupt source"
@@ -882,7 +884,7 @@ fn corrupt_source_fails_loud_without_truncation() {
         ])
         .assert()
         .failure()
-        .stderr(fail_loud.clone());
+        .stderr(fail_loud());
     assert!(
         !dest.exists(),
         "squash must not create dest on corrupt source"
@@ -894,7 +896,7 @@ fn corrupt_source_fails_loud_without_truncation() {
         .args(["pile", "migrate", src_path.to_str().unwrap(), "list"])
         .assert()
         .failure()
-        .stderr(fail_loud);
+        .stderr(fail_loud());
 
     let len_after = std::fs::metadata(&src_path).unwrap().len();
     assert_eq!(
@@ -936,7 +938,13 @@ fn unsupported_record_marker_never_recommends_or_performs_amputation() {
 
     Command::cargo_bin("trible")
         .unwrap()
-        .args(["pile", "amputate", path.to_str().unwrap()])
+        .args([
+            "pile",
+            "amputate",
+            path.to_str().unwrap(),
+            "--truncate-to",
+            "0",
+        ])
         .assert()
         .failure()
         .stderr(unsupported_without_repair_hint());
@@ -946,4 +954,51 @@ fn unsupported_record_marker_never_recommends_or_performs_amputation() {
         len_before,
         "an unknown marker must survive even an explicit amputation attempt"
     );
+}
+
+#[test]
+fn amputate_requires_and_matches_the_current_reader_boundary() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("torn.pile");
+    std::fs::write(&path, [0xFFu8; 8]).unwrap();
+
+    // The old copy-pasteable command is deliberately incomplete now.
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "amputate", path.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--truncate-to"));
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 8);
+
+    // A guessed boundary cannot destroy anything.
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "pile",
+            "amputate",
+            path.to_str().unwrap(),
+            "--truncate-to",
+            "1",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "does not match the current reader's boundary 0",
+        ));
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 8);
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args([
+            "pile",
+            "amputate",
+            path.to_str().unwrap(),
+            "--truncate-to",
+            "0",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("at confirmed boundary"));
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
 }

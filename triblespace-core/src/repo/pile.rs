@@ -2308,24 +2308,53 @@ impl Pile {
         match self.refresh() {
             Ok(()) => Ok(()),
             Err(ReadError::CorruptPile { .. }) => {
-                self.file.lock()?;
-                let res = match self.refresh_locked() {
-                    Ok(()) => Ok(()),
-                    Err(ReadError::CorruptPile { valid_length }) => {
-                        self.file.set_len(valid_length as u64)?;
-                        self.dirty = true;
-                        self.flush().map_err(|err| match err {
-                            FlushError::IoError(err) => ReadError::IoError(err),
-                        })?;
-                        self.applied_length = valid_length;
-                        Ok(())
-                    }
-                    Err(e) => Err(e),
-                };
-                self.file.unlock()?;
-                res
+                self.amputate_exclusive(None).map(|_truncated| ())
             }
             Err(e) => Err(e),
+        }
+    }
+
+    /// Amputates only when the malformed record begins at
+    /// `expected_valid_length`.
+    ///
+    /// Unlike checking [`Self::refresh`] before calling [`Self::amputate`],
+    /// this compares the observed boundary and truncates under one exclusive
+    /// file lock. If the boundary differs, it returns
+    /// [`ReadError::CorruptPile`] with the current boundary and leaves the file
+    /// unchanged. The returned boolean says whether a tail was truncated; it
+    /// is false when the pile was already valid.
+    pub fn amputate_at(&mut self, expected_valid_length: usize) -> Result<bool, ReadError> {
+        self.amputate_exclusive(Some(expected_valid_length))
+    }
+
+    fn amputate_exclusive(
+        &mut self,
+        expected_valid_length: Option<usize>,
+    ) -> Result<bool, ReadError> {
+        self.file.lock()?;
+        let result = (|| match self.refresh_locked() {
+            Ok(()) => Ok(false),
+            Err(ReadError::CorruptPile { valid_length })
+                if expected_valid_length.is_some_and(|expected| expected != valid_length) =>
+            {
+                Err(ReadError::CorruptPile { valid_length })
+            }
+            Err(ReadError::CorruptPile { valid_length }) => {
+                self.file.set_len(valid_length as u64)?;
+                self.dirty = true;
+                self.flush().map_err(|err| match err {
+                    FlushError::IoError(err) => ReadError::IoError(err),
+                })?;
+                self.applied_length = valid_length;
+                Ok(true)
+            }
+            Err(error) => Err(error),
+        })();
+        let unlock = self.file.unlock().map_err(ReadError::from);
+        match (result, unlock) {
+            (Ok(truncated), Ok(())) => Ok(truncated),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
         }
     }
 
@@ -4127,6 +4156,29 @@ mod tests {
             }
         ));
         assert!(records.next().is_none());
+    }
+
+    #[test]
+    fn amputation_at_refuses_a_stale_boundary_before_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "boundary-guarded-amputation.pile");
+        let complete = test_envelope_bytes(TEST_UNKNOWN_KIND_A, 2, 2 * ENVELOPE_BLOCK_LEN);
+        let torn = test_envelope_bytes(TEST_UNKNOWN_KIND_B, 2, ENVELOPE_BLOCK_LEN);
+        let mut bytes = complete.clone();
+        bytes.extend_from_slice(&torn);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut pile = Pile::open(&path).unwrap();
+        assert!(matches!(
+            pile.amputate_at(0),
+            Err(ReadError::CorruptPile { valid_length })
+                if valid_length == complete.len()
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+        assert!(pile.amputate_at(complete.len()).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), complete);
+        pile.close().unwrap();
     }
 
     #[test]
