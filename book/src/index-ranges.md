@@ -6,9 +6,10 @@ index representation remains an open attribute on that source range.
 
 The `repo::index_range` module supplies this artifact-neutral foundation. It
 does not assign a generic `kind` tag or erase every artifact into one `blob`
-field. A consumer instead defines typed attributes such as a Succinct archive,
-Rank9 accelerator, BM25 segment, or HNSW graph and attaches those facts to a
-stable range entity.
+field. A consumer instead defines typed attributes such as a BM25 segment or
+HNSW graph and attaches those facts to a stable range entity. Canonical raw
+Succinct archives use the native exact collection lifecycle instead; they are
+not repository-history manifests.
 
 ## Inclusive DAG frontiers
 
@@ -51,11 +52,10 @@ A diamond illustrates why the values are repeated:
 ## Stable range identity and open facts
 
 The `RangeRecord` identity is the intrinsic core
-`(index_recipe, commit_start*, commit_end*)`. A raw Succinct archive and the
-Rank9 accelerator built specifically for it can therefore share one recipe
-slot and lifecycle, while BM25, HNSW, or even another configuration over the
-same commits receives a different recipe and cannot collapse into that entity.
-Artifact handles themselves never participate in the id.
+`(index_recipe, commit_start*, commit_end*)`. BM25, HNSW, or another
+configuration over the same commits receives a different recipe and therefore
+cannot collapse into the same range entity. Artifact handles themselves never
+participate in the id.
 
 `RangeRecord` retains every fact whose subject is its real entity id, including
 attributes unknown to the current binary, and refreshes only the intrinsic
@@ -70,7 +70,7 @@ that is the canonical completed-empty projection. `replace_range_records`
 removes every fact under a retired entity and is used when compacting the
 complete recipe/range slot and all artifacts owned by it.
 
-## Typed index-home manifests
+## Typed range manifests
 
 `repo::index_home` gives the artifact-neutral range model a typed maintenance
 surface. An `IndexKind` supplies one deterministic, inline-only
@@ -100,20 +100,6 @@ independently prepared shards as they finish, while `append_stored_range`
 publishes all of their typed handles on one shared source range. The prepared
 convenience stores the vector first and then performs the same logical append.
 
-The Succinct recipe emits both repeated attributes for every shard:
-
-```text
-range @ seg_succinct*: raw_archives,
-        seg_succinct_rank9*: rank9_accelerators
-```
-
-The facts are intentionally unordered. Parsing loads each Rank9 header, reads
-its embedded raw-source handle, and requires a bijection: every declared raw
-archive has exactly one accelerator, every accelerator names a declared raw
-archive, and no source is claimed twice. Attachment then uses
-`SuccinctArchive::from_blob_pair` and never rebuilds Rank9 data on the read
-path. A range with no pairs remains a complete empty/contentless certificate.
-
 The BM25 recipe instead emits `seg_bm25*` handles to
 `PortableBM25Blob`. Its durable logical value is the document set plus sparse
 positive exact `u32` term frequencies; compaction is document union and
@@ -122,6 +108,12 @@ layout is deliberately absent from range identity and persistence. The
 portable carrier derives document lengths, IDF, and scores only after the
 selected cover has been canonically joined, so physical LSM shape cannot alter
 ranking. HNSW remains a separately typed native succinct artifact.
+
+Raw `SuccinctArchiveBlob` projections are maintained by
+`SuccinctArchiveCollection` over signed source collection commits. Its exact
+`DERIVE`/`MERGE` evidence, deterministic physical cover, and optional Rank9
+fibers replace the former history-range recipe without coupling the projection
+to a branch head or `PinStore`.
 
 ## Exact compaction
 

@@ -12,7 +12,6 @@
 //! including certified-empty projections, and size-tiered compaction bounds
 //! the read fan-out while preserving the exact DAG cover.
 //!
-//! [`SuccinctRollup`]: triblespace_core::repo::index_home::SuccinctRollup
 //! [`HnswRollup`]: crate::index_hnsw::HnswRollup
 //! [`append_range`]: triblespace_core::repo::index_home::append_range
 //!
@@ -96,8 +95,8 @@ impl<R> Bm25Rollup<R> {
     /// (`468F6EBF93C14A7FBC1188592B2BF984`). Rotated on 2026-08-08 so
     /// manifests written for the retired native BM25 artifact cannot be
     /// mistaken for portable completed-empty ranges. Distinct from
-    /// `SuccinctRollup`'s and `HnswRollup`'s so all three kinds'
-    /// manifests coexist in one branch-head tribleset.
+    /// `HnswRollup` and every other recipe so their manifests coexist in one
+    /// branch-head tribleset.
     pub const KIND_ID_HEX: &'static str = "468F6EBF93C14A7FBC1188592B2BF984";
 }
 

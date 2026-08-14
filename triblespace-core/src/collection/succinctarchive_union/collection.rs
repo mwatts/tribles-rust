@@ -1,15 +1,14 @@
 //! Exact-ticket facade for canonical raw SuccinctArchive collections.
 //!
-//! This remains separate from the legacy `SuccinctRollup` lifecycle. Unsigned
-//! equations are reproducible cache evidence rather than authority or durable
-//! receipts: attachment reconstructs collected intermediates in use-counted
-//! scratch from authenticated source leaves, then freshly validates only the
-//! resident artifacts selected by the physical cover. Target compaction is an
-//! explicit maintenance call rather than background policy. The raw exact cover
-//! remains authoritative and fixes the returned shard shape; a private second
-//! stage attaches an exact persisted Rank9 fiber for each selected raw member or
-//! rebuilds that accelerator transiently when optional evidence is absent,
-//! invalid, or ambiguous.
+//! Unsigned equations are reproducible cache evidence rather than authority or
+//! durable receipts: attachment reconstructs collected intermediates in
+//! use-counted scratch from authenticated source leaves, then freshly validates
+//! only the resident artifacts selected by the physical cover. Target
+//! compaction is an explicit maintenance call rather than background policy.
+//! The raw exact cover remains authoritative and fixes the returned shard shape;
+//! a private second stage attaches an exact persisted Rank9 fiber for each
+//! selected raw member or rebuilds that accelerator transiently when optional
+//! evidence is absent, invalid, or ambiguous.
 
 use std::error::Error;
 use std::fmt;

@@ -1,4 +1,4 @@
-//! Range-native homes for immutable, typed derived-index artifacts.
+//! Range-native manifests for immutable, typed derived-index artifacts.
 //!
 //! An index recipe owns a lossless manifest embedded in the branch head.  Its
 //! logical LSM records cover inclusive regions of the source commit DAG; each
@@ -6,30 +6,22 @@
 //! coverage certificates, while unusually large commits can put several
 //! repeated typed artifact handles on one logical `[commit, commit]` leaf.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 
 use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
-use crate::blob::encodings::succinctarchive::{
-    merge_ordered_archives, OrderedUniverse, SuccinctArchive, SuccinctArchiveBlob,
-    SuccinctArchiveRank9IndexBlob, UnionArchive,
-};
-use crate::blob::Blob;
 use crate::find;
 use crate::id::{ExclusiveId, Id};
 use crate::inline::encodings::hash::Handle;
 use crate::inline::encodings::iu256::U256BE;
 use crate::inline::Inline;
-use crate::metadata;
 use crate::prelude::{attributes, entity, pattern};
 use crate::repo::index_range::{
     convex_union, is_ancestor, validate_exact_frontier_cover, RangeRecord, RangeRecordError,
     RangeValidationError, StoredCommitDag,
 };
-use crate::repo::{
-    potential_handles, BlobStore, BlobStoreGet, BlobStorePut, CommitHandle, PinStore,
-};
+use crate::repo::{potential_handles, BlobStore, BlobStoreGet, BlobStorePut, CommitHandle};
 use crate::trible::{Fragment, TribleSet};
 
 pub use crate::repo::index_range::CommitRange;
@@ -39,11 +31,6 @@ attributes! {
     /// Repeated values are a canonical antichain; caught-up branch state is a
     /// singleton HEAD. Minted with `trible genid` on 2026-07-13.
     "42813BC8BB5BBF16870403E8A573162E" unsafe as pub index_head: Handle<SimpleArchive>;
-    /// Raw SuccinctArchive artifact. Minted with `trible genid` on 2026-07-13.
-    "040E0073548E08298E732F7154C5703F" unsafe as pub seg_succinct: Handle<SuccinctArchiveBlob>;
-    /// Source-bound detached Rank9 artifact. Minted with `trible genid` on
-    /// 2026-07-13.
-    "0297BF2535F4FEDF7AFE6E5E7D125CF0" unsafe as pub seg_succinct_rank9: Handle<SuccinctArchiveRank9IndexBlob>;
     /// LSM level of one logical range record. Retained from the original
     /// prototype because its meaning is unchanged.
     "7188AAD5C5044798547E7F53FE1CA5D5" unsafe as pub seg_level: U256BE;
@@ -123,10 +110,8 @@ pub type ArtifactError = Box<dyn Error + Send + Sync>;
 
 /// A typed derived-index recipe.
 ///
-/// Artifact parsing is reader-aware because some typed relations live inside
-/// blobs.  In particular, Succinct Rank9 handles are intentionally unordered
-/// repeated facts and are paired by the raw source handle embedded in each
-/// Rank9 header.
+/// Artifact parsing is reader-aware because typed relations may live inside
+/// blobs or require representation-specific validation.
 pub trait IndexKind {
     /// Queryable attachment of one physical artifact.
     type Segment;
@@ -613,29 +598,16 @@ pub enum IndexError {
     Merge(ArtifactError),
     /// Victim ranges could not be compacted without filling a DAG hole.
     Range(ArtifactError),
-    /// The mutable branch pin advanced concurrently.
-    Conflict,
-    /// A present branch-metadata blob did not describe exactly one matching
-    /// branch entity with at most one source head.
-    InvalidSourceBranchMetadata,
-    /// The manifest does not certify the source head read with it.
-    StaleCoverage(CoverageMismatch),
 }
 
 impl fmt::Display for IndexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Storage(error) => write!(f, "index-home storage error: {error}"),
+            Self::Storage(error) => write!(f, "index-manifest storage error: {error}"),
             Self::Manifest(error) => error.fmt(f),
             Self::Artifact(error) => write!(f, "index artifact error: {error}"),
             Self::Merge(error) => write!(f, "index merge error: {error}"),
             Self::Range(error) => write!(f, "index range error: {error}"),
-            Self::Conflict => write!(f, "index-home manifest pin advanced concurrently"),
-            Self::InvalidSourceBranchMetadata => write!(
-                f,
-                "index-home pin does not contain one valid source branch entity"
-            ),
-            Self::StaleCoverage(error) => error.fmt(f),
         }
     }
 }
@@ -648,42 +620,7 @@ impl Error for IndexError {
             | Self::Merge(error)
             | Self::Range(error) => Some(error.as_ref()),
             Self::Manifest(error) => Some(error),
-            Self::StaleCoverage(error) => Some(error),
-            Self::Conflict | Self::InvalidSourceBranchMetadata => None,
         }
-    }
-}
-
-/// One branch-metadata read and the typed manifest parsed from those exact
-/// bytes.
-///
-/// Keeping the metadata pin, source commit head, and manifest together lets a
-/// consumer freshness-check an attached index without a second branch lookup.
-pub struct IndexSnapshot<K: IndexKind> {
-    metadata_head: Option<Inline<Handle<SimpleArchive>>>,
-    source_head: Option<CommitHandle>,
-    manifest: Manifest<K>,
-}
-
-impl<K: IndexKind> IndexSnapshot<K> {
-    /// Pin value naming the branch-metadata blob read for this snapshot.
-    pub fn metadata_head(&self) -> Option<Inline<Handle<SimpleArchive>>> {
-        self.metadata_head
-    }
-
-    /// Source commit head named by the same branch-metadata blob.
-    pub fn source_head(&self) -> Option<CommitHandle> {
-        self.source_head
-    }
-
-    /// Typed manifest parsed from the same branch-metadata blob.
-    pub fn manifest(&self) -> &Manifest<K> {
-        &self.manifest
-    }
-
-    /// Consume the snapshot and return its typed manifest.
-    pub fn into_manifest(self) -> Manifest<K> {
-        self.manifest
     }
 }
 
@@ -937,287 +874,4 @@ pub fn set_index_head_audited<S: BlobStore, K: IndexKind>(
     head: Option<CommitHandle>,
 ) -> Result<(), IndexError> {
     set_index_frontier_audited(storage, kind, head_set, head.into_iter().collect())
-}
-
-/// Read-only index-home surface for one `(source branch, recipe)`.
-pub struct IndexHome<'s, S, K> {
-    storage: &'s mut S,
-    kind: K,
-    branch: Id,
-}
-
-impl<'s, S, K> IndexHome<'s, S, K>
-where
-    S: BlobStore + PinStore,
-    K: IndexKind,
-{
-    /// Open the typed index manifest carried by `source_branch`.
-    pub fn new(storage: &'s mut S, source_branch: Id, kind: K) -> Self {
-        Self {
-            storage,
-            kind,
-            branch: source_branch,
-        }
-    }
-
-    /// Read one branch-metadata pin and parse its source head and typed
-    /// manifest from those exact bytes.
-    pub fn read_snapshot(&mut self) -> Result<IndexSnapshot<K>, IndexError> {
-        let metadata_head = self.storage.head(self.branch).map_err(storage_error)?;
-        let reader = self.storage.reader().map_err(storage_error)?;
-        let set = match metadata_head {
-            Some(head) => reader.get(head).map_err(storage_error)?,
-            None => TribleSet::new(),
-        };
-        let branch_entities: Vec<Id> = find!(
-            branch_meta: Id,
-            pattern!(&set, [{ ?branch_meta @ crate::repo::branch: self.branch }])
-        )
-        .collect();
-        let branch_meta = match (metadata_head, branch_entities.as_slice()) {
-            (None, []) => None,
-            (Some(_), [branch_meta]) => Some(*branch_meta),
-            _ => return Err(IndexError::InvalidSourceBranchMetadata),
-        };
-        let source_heads: Vec<CommitHandle> = if let Some(branch_meta) = branch_meta {
-            find!(
-                source_head: CommitHandle,
-                pattern!(&set, [{ branch_meta @ crate::repo::head: ?source_head }])
-            )
-            .collect()
-        } else {
-            Vec::new()
-        };
-        let source_head = match source_heads.as_slice() {
-            [] => None,
-            [head] => Some(*head),
-            _ => return Err(IndexError::InvalidSourceBranchMetadata),
-        };
-        let manifest =
-            Manifest::from_tribles(&set, &reader, &self.kind).map_err(IndexError::Manifest)?;
-        Ok(IndexSnapshot {
-            metadata_head,
-            source_head,
-            manifest,
-        })
-    }
-
-    /// Parse the current typed manifest.
-    pub fn read_manifest(&mut self) -> Result<Manifest<K>, IndexError> {
-        Ok(self.read_snapshot()?.into_manifest())
-    }
-
-    /// Attach every physical artifact in one already-read manifest snapshot.
-    pub fn attach_manifest(
-        &mut self,
-        manifest: &Manifest<K>,
-    ) -> Result<Vec<K::Segment>, IndexError> {
-        let reader = self.storage.reader().map_err(storage_error)?;
-        let mut segments = Vec::new();
-        for range in &manifest.ranges {
-            for artifact in &range.artifacts {
-                segments.push(
-                    self.kind
-                        .attach(&reader, artifact)
-                        .map_err(IndexError::Artifact)?,
-                );
-            }
-        }
-        Ok(segments)
-    }
-
-    /// Parse and attach the current manifest without a source checkout.
-    pub fn attach_all(&mut self) -> Result<Vec<K::Segment>, IndexError> {
-        let manifest = self.read_manifest()?;
-        self.attach_manifest(&manifest)
-    }
-}
-
-/// Prepared raw Succinct archive and detached source-bound Rank9 accelerator.
-#[derive(Debug, Clone)]
-pub struct PreparedSuccinctArtifact {
-    /// Canonical raw archive.
-    raw: Blob<SuccinctArchiveBlob>,
-    /// Replaceable native-ABI accelerator.
-    rank9: Blob<SuccinctArchiveRank9IndexBlob>,
-}
-
-/// Stored typed handles for one Succinct physical shard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StoredSuccinctArtifact {
-    /// Canonical raw archive handle.
-    raw: Inline<Handle<SuccinctArchiveBlob>>,
-    /// Accelerator handle whose embedded source is `raw`.
-    rank9: Inline<Handle<SuccinctArchiveRank9IndexBlob>>,
-}
-
-impl StoredSuccinctArtifact {
-    /// Canonical raw archive handle.
-    pub fn raw(&self) -> Inline<Handle<SuccinctArchiveBlob>> {
-        self.raw
-    }
-
-    /// Detached Rank9 accelerator handle.
-    pub fn rank9(&self) -> Inline<Handle<SuccinctArchiveRank9IndexBlob>> {
-        self.rank9
-    }
-}
-
-/// SuccinctArchive range recipe.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SuccinctRollup;
-
-impl SuccinctRollup {
-    /// Stable algorithm id minted for the original Succinct rollup recipe.
-    pub const KIND_ID_HEX: &'static str = "9540D50DEDECA9CA948FD14474F86566";
-
-    /// Construct the recipe.
-    pub fn new() -> Self {
-        Self
-    }
-
-    /// Union-query several attached physical shards (shards are Arc-cheap
-    /// view clones — no data copies).
-    pub fn union(segments: &[SuccinctArchive<OrderedUniverse>]) -> UnionArchive<OrderedUniverse> {
-        UnionArchive::new(segments.to_vec())
-    }
-}
-
-fn succinct_recipe_fragment() -> Fragment {
-    let algorithm = Id::from_hex(SuccinctRollup::KIND_ID_HEX).expect("valid algorithm id");
-    entity! { _ @ metadata::tag: algorithm }
-}
-
-fn build_succinct_artifact(archive: &SuccinctArchive<OrderedUniverse>) -> PreparedSuccinctArtifact {
-    let (raw, rank9) = archive.to_blob_pair();
-    PreparedSuccinctArtifact { raw, rank9 }
-}
-
-fn parse_succinct_artifacts<R: BlobStoreGet>(
-    reader: &R,
-    facts: &TribleSet,
-    entity: Id,
-) -> Result<Vec<StoredSuccinctArtifact>, ArtifactError> {
-    let mut raw: Vec<Inline<Handle<SuccinctArchiveBlob>>> = find!(
-        handle: Inline<Handle<SuccinctArchiveBlob>>,
-        pattern!(facts, [{ entity @ seg_succinct: ?handle }])
-    )
-    .collect();
-    let rank9: Vec<Inline<Handle<SuccinctArchiveRank9IndexBlob>>> = find!(
-        handle: Inline<Handle<SuccinctArchiveRank9IndexBlob>>,
-        pattern!(facts, [{ entity @ seg_succinct_rank9: ?handle }])
-    )
-    .collect();
-    raw.sort_unstable_by_key(|handle| handle.raw);
-
-    let raw_set: HashSet<_> = raw.iter().copied().collect();
-    let mut by_source = HashMap::new();
-    for handle in rank9 {
-        let blob: Blob<SuccinctArchiveRank9IndexBlob> = reader
-            .get(handle)
-            .map_err(|error| Box::new(error) as ArtifactError)?;
-        let source = SuccinctArchiveRank9IndexBlob::source_handle(&blob)
-            .map_err(|error| Box::new(error) as ArtifactError)?;
-        if !raw_set.contains(&source) {
-            return Err(format!(
-                "Rank9 artifact {:?} refers to foreign raw archive {:?}",
-                handle, source
-            )
-            .into());
-        }
-        if by_source.insert(source, handle).is_some() {
-            return Err(format!("raw archive {:?} has duplicate Rank9 artifacts", source).into());
-        }
-    }
-    if by_source.len() != raw.len() {
-        return Err("Succinct raw/Rank9 artifact cardinality mismatch".into());
-    }
-    Ok(raw
-        .into_iter()
-        .map(|raw| StoredSuccinctArtifact {
-            raw,
-            rank9: by_source[&raw],
-        })
-        .collect())
-}
-
-impl IndexKind for SuccinctRollup {
-    type Segment = SuccinctArchive<OrderedUniverse>;
-    type PreparedArtifact = PreparedSuccinctArtifact;
-    type StoredArtifact = StoredSuccinctArtifact;
-
-    fn recipe_fragment(&self) -> Fragment {
-        succinct_recipe_fragment()
-    }
-
-    fn build(&self, source: &TribleSet) -> Result<Vec<Self::PreparedArtifact>, ArtifactError> {
-        if source.is_empty() {
-            return Ok(Vec::new());
-        }
-        let archive: SuccinctArchive<OrderedUniverse> = source.into();
-        Ok(vec![build_succinct_artifact(&archive)])
-    }
-
-    fn put<S: BlobStorePut>(
-        &self,
-        storage: &mut S,
-        artifact: Self::PreparedArtifact,
-    ) -> Result<Self::StoredArtifact, ArtifactError> {
-        let raw_handle = artifact.raw.get_handle();
-        let source = SuccinctArchiveRank9IndexBlob::source_handle(&artifact.rank9)
-            .map_err(|error| Box::new(error) as ArtifactError)?;
-        if source != raw_handle {
-            return Err("Succinct Rank9 artifact refers to a different raw archive".into());
-        }
-        let raw = storage
-            .put(artifact.raw)
-            .map_err(|error| Box::new(error) as ArtifactError)?;
-        let rank9 = storage
-            .put(artifact.rank9)
-            .map_err(|error| Box::new(error) as ArtifactError)?;
-        Ok(StoredSuccinctArtifact { raw, rank9 })
-    }
-
-    fn emit(&self, entity: Id, artifact: &Self::StoredArtifact) -> TribleSet {
-        entity! { ExclusiveId::force_ref(&entity) @
-            seg_succinct: artifact.raw,
-            seg_succinct_rank9: artifact.rank9,
-        }
-        .into_facts()
-    }
-
-    fn parse<R: BlobStoreGet>(
-        &self,
-        reader: &R,
-        facts: &TribleSet,
-        entity: Id,
-    ) -> Result<Vec<Self::StoredArtifact>, ArtifactError> {
-        parse_succinct_artifacts(reader, facts, entity)
-    }
-
-    fn attach<R: BlobStoreGet>(
-        &self,
-        reader: &R,
-        artifact: &Self::StoredArtifact,
-    ) -> Result<Self::Segment, ArtifactError> {
-        let raw: Blob<SuccinctArchiveBlob> = reader
-            .get(artifact.raw)
-            .map_err(|error| Box::new(error) as ArtifactError)?;
-        let rank9: Blob<SuccinctArchiveRank9IndexBlob> = reader
-            .get(artifact.rank9)
-            .map_err(|error| Box::new(error) as ArtifactError)?;
-        SuccinctArchive::from_blob_pair(raw, rank9)
-            .map_err(|error| Box::new(error) as ArtifactError)
-    }
-
-    fn merge(
-        &self,
-        segments: &[Self::Segment],
-    ) -> Result<Vec<Self::PreparedArtifact>, ArtifactError> {
-        if segments.is_empty() {
-            return Ok(Vec::new());
-        }
-        let archive = merge_ordered_archives(segments);
-        Ok(vec![build_succinct_artifact(&archive)])
-    }
 }

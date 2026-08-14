@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Canonical raw Succinct archives now have one native exact-collection
+  lifecycle.** The unpublished ordinary `IndexKind` recipe, its branch-manifest
+  attributes and raw/Rank9 artifact pair types, and its build/parse/attach
+  helpers are removed. `SuccinctArchiveCollection` owns exact completion,
+  deterministic target compaction, sharded `UnionArchive` queries, and optional
+  Rank9 fibers. The unused branch-bound read wrapper and snapshot type are also
+  gone; the generic range-manifest primitives remain for BM25 and HNSW.
 - **The SuccinctArchive example now follows the native collection lifecycle.**
   `native_succinct_collection` publishes intrinsic fragments as independent
   signed commits, freezes authority with a record-only ticket, and queries an
@@ -30,8 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   row threshold, and a process-local circuit breaker. The current Apple M4
   end-to-end measurement showed no useful win from that legacy adapter. Native
   GPU execution for the exact raw-Succinct collection would require a separate
-  direct-raw adapter rather than routing through the legacy `IndexKind`
-  lifecycle. Ordinary `SuccinctRollup` remains available for now.
+  direct-raw adapter rather than routing through a range-manifest lifecycle.
 - **Derived collections now share one qualified exact-ticket lifecycle.**
   `collection::exact_derived::ExactDerivedCollection` supplies strict ticket
   discovery, signed-root admission, deterministic resident covers, residual
@@ -105,8 +111,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   manifest, receipt, retention root, background task, or authority record is
   introduced. Rank9 fibers are built only for the final selected raw cover,
   never for compacted-away leaves; each raw shard retains the explicit
-  `u32::MAX` row/domain boundary, and the legacy `SuccinctRollup` remains
-  available unchanged.
+  `u32::MAX` row/domain boundary.
 - **Regular paths now use one exact native collection path.**
   `PathSummaryCollection::{attach_exact, ensure_exact}` validates a frozen set
   of signed `SimpleArchive` commits, reuses canonical source merges, target
@@ -114,10 +119,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PathIndex`. Ensuring lowers only unsupported distinct source elements,
   publishes blobs before unsigned records without an implicit flush, and
   re-admits through a fresh reader. The empty ticket is a no-write local
-  bottom. `PathRollup`, its range attribute, `IndexHome` attachment, repository
-  hooks, commit ranges, and manifest-specific path tests are removed; the new
-  API requires only `BlobStore + CollectionStore` and works without
-  `PinStore`.
+  bottom. `PathRollup`, its range attribute, range-manifest attachment,
+  repository hooks, commit ranges, and manifest-specific path tests are
+  removed; the new API requires only `BlobStore + CollectionStore` and works
+  without `PinStore`.
 - **Read-only pin snapshots are now an explicit storage capability.**
   Implementing mutable `PinStore` no longer automatically satisfies
   `PinSnapshotSource`. `Pile`, `MemoryRepo`, and `Yard` opt in directly, while
@@ -604,19 +609,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   direct-product summaries. A single SCC/bitset kernel materializes canonical
   forward and reverse endpoint relations, including exact cross-segment paths,
   and exposes them through the ordinary two-variable constraint protocol.
-- **Regular-path summaries persist as typed range-native artifacts.**
-  `PathRollup` stores canonical automaton-fingerprinted direct-product summaries
-  in `IndexHome`, compacts them by set union, and globally closes the certified
-  live cover on attachment. A same-metadata `IndexSnapshot` pins the branch
-  metadata, source commit head, and manifest together so stale coverage fails
-  closed; full cover audits remain explicit repair/verification operations.
 - **The book now teaches the stable standalone regular-path index.** A dedicated
   chapter leads with canonical `PathExpr` construction and Glushkov lowering,
   retains explicit epsilon-free automata as the low-level escape hatch, and
-  covers direct `PathIndex` joins, `PathRollup` repository maintenance,
-  cross-range closure, nullable universes, freshness versus full cover audits,
-  and the potentially quadratic endpoint relation. Interim status guidance and
-  its resolved documentation backlog entry are removed.
+  covers direct `PathIndex` joins, exact collection maintenance, cross-range
+  closure, nullable universes, and the potentially quadratic endpoint
+  relation. Interim status guidance and its resolved documentation backlog
+  entry are removed.
 
 ### Changed
 
@@ -665,9 +664,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`UnionArchive` is now a storage-neutral Succinct data source.** Its owned
   shard union and query constraint live beside `SuccinctArchive` under
   `blob::encodings::succinctarchive` and are available through the blob
-  encodings prelude. `SuccinctRollup::union` remains a convenience constructor,
-  but collection consumers no longer need the legacy `repo::index_home` module
-  merely to query an already attached set of Succinct shards.
+  encodings prelude. Collection consumers can query an attached exact physical
+  cover without depending on repository range-manifest machinery.
 
 - **Breaking: range-native BM25 now persists only the portable exact-TF
   carrier.** `Bm25Rollup` builds and merges `PortableBM25Blob` directly under
@@ -1825,25 +1823,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   affine frontier after the first useful result. Ready planning retains each row's
   exact adaptive variable and proposing leaf, then cohorts only rows with the
   same action.
-- **Index homes use typed artifacts over exact commit-DAG ranges.** Recipe
+- **Range manifests use typed artifacts over exact commit-DAG ranges.** Recipe
   descriptors are self-marked, losslessly retained manifest headers with a
   repeated maximal certified frontier. Inclusive range records carry one LSM
   level/sequence and zero or more typed physical artifacts, so contentless
   commits remain covered and large commits can be sharded without overlapping
-  logical ranges. Succinct records emit both the raw archive and detached
-  Rank9 handle and reconstruct a strict source-handle bijection before attach;
-  compaction counts logical records and rejects non-convex DAG unions. The
-  `index_head` (`42813BC8BB5BBF16870403E8A573162E`), `seg_succinct`
-  (`040E0073548E08298E732F7154C5703F`), and `seg_succinct_rank9`
-  (`0297BF2535F4FEDF7AFE6E5E7D125CF0`) attributes were minted with
-  `trible genid` on 2026-07-13. The unpublished schema-erased
+  logical ranges. Compaction counts logical records and rejects non-convex DAG
+  unions. The `index_head` id `42813BC8BB5BBF16870403E8A573162E`
+  was minted with `trible genid` on 2026-07-13. The unpublished schema-erased
   `seg_kind`/`seg_blob`/`covered_tip` manifest and filtered registration API
   were removed rather than carried as compatibility surface. The obsolete
   monolithic branch `rollup` attribute, `Repository::compute_rollup`, and
-  `Workspace::rollup` were likewise removed; typed IndexHome artifacts are now
-  the only production derived-index path. CLI re-id and rename operations carry
-  complete recipe-owned entities losslessly, while squash drops them together
-  with the history it replaces.
+  `Workspace::rollup` were likewise removed. CLI re-id and rename operations
+  carry complete recipe-owned entities losslessly, while squash drops them
+  together with the history it replaces.
 - **Derived-index manifests gain artifact-neutral commit-DAG ranges.**
   `repo::index_range` models inclusive repeated start/end antichains, stable
   explicit range-record identities, lossless opaque-fact carry-forward,
@@ -2257,20 +2250,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Index-home provides bounded query-without-checkout maintenance.** Typed
+- **Range-manifest primitives provide bounded derived-index maintenance.** Typed
   recipe manifests live in the branch-head tribleset, so their artifact
   handles participate in the existing reachability GC without a separate pin.
   `Repository::register_index` receives parents-first `CommitBatch` values and
   appends one inclusive logical leaf per newly reachable commit; hook mutation
   is scratch-atomic and failures remain drainable through `take_hook_errors`
-  without blocking the source commit. Reads attach the bounded artifact set
-  through `IndexHome::attach_all`. Succinct compaction structurally merges the
-  six Ring rotations with bounded working memory; its packed CPU freeze exposes
-  the stateless `WaveletMatrixFreezeBackend` and
-  `merge_ordered_archives_with_backend` experimental seams.
-  `SuccinctRollup::union` provides cross-artifact joins through
-  `UnionConstraint`. BM25 and HNSW recipes in `triblespace-search` use the same
-  typed range surface.
+  without blocking the source commit. BM25 and HNSW recipes in
+  `triblespace-search` use the typed range surface; callers parse `Manifest`
+  snapshots and attach the bounded artifact set through their `IndexKind`.
 - **Async blob-store trait family.** New
   `triblespace_core::repo::async_store` module: `AsyncBlobStoreGet` /
   `AsyncBlobStorePut` / `AsyncBlobStoreList` / `AsyncBlobStore` /
@@ -2419,10 +2407,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alias of `put`.
 - **Index-home per-segment stats slot.** The `seg_stats` attribute,
   `SegmentEntry.stats`, and `IndexKind::stats` are gone — nothing populated
-  them (SuccinctRollup, BM25, and HNSW all left the default `None`). Also
+  them (BM25 and HNSW both left the default `None`). Also
   trimmed: `Manifest::empty()` (use `Default`), `Manifest::len()`/
-  `is_empty()` (read `manifest.segments` directly), and the unused
-  `IndexHome::branch()` accessor; `manifest_tribles` is `pub(crate)`.
+  `is_empty()` (read `manifest.segments` directly); `manifest_tribles` is
+  `pub(crate)`.
 
 ### Fixed
 

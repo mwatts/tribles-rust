@@ -227,8 +227,6 @@ outcome: source completion falls back to finer exact members, while target
 maintenance returns a deterministic capacity-stable colliding cover when no
 further representable join exists. Persisted malformed or noncanonical bytes
 remain fatal and never acquire this fallback meaning.
-`SuccinctRollup` remains available unchanged for code that still uses its
-legacy lifecycle.
 
 ## Opening a repository
 

@@ -12,29 +12,24 @@
 //! inclusive commit ranges, so a query attaches already-built graphs without
 //! a checkout, read-all-blobs pass, or rebuild.
 //!
-//! It is the vector analogue of [`SuccinctRollup`]: same range-native LSMT
-//! manifest, same size-tiered merge, same GC — a different artifact
-//! *format* ([`SuccinctHNSWBlob`]) and a different query semantics
-//! (approximate cosine k-NN instead of exact triple pattern).
-//!
-//! [`SuccinctRollup`]: triblespace_core::repo::index_home::SuccinctRollup
+//! It shares the generic range-native LSMT maintenance surface with the BM25
+//! recipe: same exact commit cover, size-tiered carry, and GC reachability,
+//! but a different artifact *format* ([`SuccinctHNSWBlob`]) and query
+//! semantics (approximate cosine k-NN rather than lexical ranking).
 //!
 //! # Where the vectors live
 //!
 //! The source view passed to [`IndexKind::build`] carries only
 //! `entity -> Handle<Embedding>` tribles; the vectors themselves are
-//! separate content-addressed blobs in the pile. So — unlike
-//! `SuccinctRollup`, whose source *is* the data — `HnswRollup` needs a
-//! blob reader to resolve those handles into the `[f32]` vectors the
-//! graph build compares. The reader is held on the kind (a cheap
-//! [`Clone`] snapshot of the same store the [`IndexHome`] writes
-//! segments into), so [`build`](IndexKind::build) and
+//! separate content-addressed blobs in the pile. `HnswRollup` therefore needs
+//! a blob reader to resolve those handles into the `[f32]` vectors the graph
+//! build compares. The reader is held on the kind (a cheap [`Clone`] snapshot
+//! of the same store the range-maintenance functions write segments into), so
+//! [`build`](IndexKind::build) and
 //! [`merge`](IndexKind::merge) can fetch vectors while
 //! [`attach`](IndexKind::attach) stays zero-copy (it decodes only the
 //! stored graph blob; embeddings are resolved lazily at query time by
 //! the attached view).
-//!
-//! [`IndexHome`]: triblespace_core::repo::index_home::IndexHome
 //!
 //! # Multi-segment query semantics
 //!
@@ -112,8 +107,8 @@ impl<R> HnswRollup<R> {
 
     /// Stable kind id — minted via `trible genid`
     /// (`78A4D957BB6EF35D4D56D76AD6013268`). Distinct from
-    /// `SuccinctRollup`'s so both kinds' manifests coexist in one
-    /// branch-head tribleset.
+    /// every other recipe id so independently maintained manifests coexist in
+    /// one branch-head tribleset.
     pub const KIND_ID_HEX: &'static str = "78A4D957BB6EF35D4D56D76AD6013268";
 }
 
@@ -256,10 +251,9 @@ where
         if segments.is_empty() {
             return Ok(Vec::new());
         }
-        // CPU union-then-rebuild (mirrors `SuccinctRollup::merge`):
-        // gather every segment's node handles, dedup, resolve to
-        // vectors, and rebuild one graph. The GPU-merge seam drops in
-        // behind this method exactly as it does for the rollup.
+        // CPU union-then-rebuild: gather every segment's node handles, dedup,
+        // resolve to vectors, and rebuild one graph. A future GPU-merge seam
+        // can remain hidden behind this method.
         let mut seen = HashSet::new();
         let mut pairs: Vec<(Inline<EmbHandle>, Vec<f32>)> = Vec::new();
         for seg in segments {
