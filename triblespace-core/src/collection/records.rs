@@ -389,15 +389,39 @@ impl CollectionCommit {
     pub fn verify_strict(&self) -> Result<(), CommitVerificationError> {
         let public_key = VerifyingKey::from_bytes(&self.public_key.raw)
             .map_err(|_| CommitVerificationError::InvalidPublicKey)?;
+        self.verify_signature_strict(&public_key)
+    }
+
+    /// Verify with an already parsed key when it matches this record's key.
+    ///
+    /// Scoped collection discovery compares the raw key field before calling
+    /// this helper. The equality check here keeps that optimization local and
+    /// fail-safe if another caller ever violates the precondition.
+    pub(crate) fn verify_strict_with_key(
+        &self,
+        public_key: &VerifyingKey,
+    ) -> Result<(), CommitVerificationError> {
+        if public_key.to_bytes() != self.public_key.raw {
+            return self.verify_strict();
+        }
+        self.verify_signature_strict(public_key)
+    }
+
+    fn verify_signature_strict(
+        &self,
+        public_key: &VerifyingKey,
+    ) -> Result<(), CommitVerificationError> {
         let signature = Signature::from_components(self.signature_r.raw, self.signature_s.raw);
+        let transcript =
+            commit_transcript(self.public_key, self.collection, self.data, self.metadata);
         public_key
-            .verify_strict(&self.signing_transcript(), &signature)
+            .verify_strict(&transcript, &signature)
             .map_err(|_| CommitVerificationError::InvalidSignature)
     }
 
     /// Exact bytes attested by this commit's signature.
     pub fn signing_transcript(&self) -> Vec<u8> {
-        commit_transcript(self.public_key, self.collection, self.data, self.metadata)
+        commit_transcript(self.public_key, self.collection, self.data, self.metadata).to_vec()
     }
 
     /// Intrinsic record id.
@@ -761,16 +785,22 @@ fn commit_transcript(
     collection: CollectionId,
     data_hash: CollectionData,
     metadata: Inline<Handle<SimpleArchive>>,
-) -> Vec<u8> {
-    let mut transcript = Vec::with_capacity(COMMIT_TRANSCRIPT_LEN);
-    transcript.extend_from_slice(COMMIT_TRANSCRIPT_DOMAIN);
-    transcript.extend_from_slice(&KIND_COLLECTION_COMMIT.raw());
-    transcript.extend_from_slice(&COMMIT_TRANSCRIPT_VERSION.to_be_bytes());
-    transcript.extend_from_slice(&public_key.raw);
-    transcript.extend_from_slice(&collection.raw);
-    transcript.extend_from_slice(&data_hash.raw);
-    transcript.extend_from_slice(&metadata.raw);
-    debug_assert_eq!(transcript.len(), COMMIT_TRANSCRIPT_LEN);
+) -> [u8; COMMIT_TRANSCRIPT_LEN] {
+    let mut transcript = [0; COMMIT_TRANSCRIPT_LEN];
+    let mut offset = 0;
+    let mut append = |bytes: &[u8]| {
+        let end = offset + bytes.len();
+        transcript[offset..end].copy_from_slice(bytes);
+        offset = end;
+    };
+    append(COMMIT_TRANSCRIPT_DOMAIN);
+    append(&KIND_COLLECTION_COMMIT.raw());
+    append(&COMMIT_TRANSCRIPT_VERSION.to_be_bytes());
+    append(&public_key.raw);
+    append(&collection.raw);
+    append(&data_hash.raw);
+    append(&metadata.raw);
+    debug_assert_eq!(offset, COMMIT_TRANSCRIPT_LEN);
     transcript
 }
 

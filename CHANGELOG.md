@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Scoped collection discovery verifies independent commits concurrently.**
+  The exact collection-and-signer filter still runs during the store's serial,
+  fail-loud enumeration, then matching Ed25519 signatures use Rayon's indexed
+  parallel iterator so worker completion order cannot affect canonical commit
+  or diagnostic order. A structural singleton path remains serial. The scoped
+  signer is parsed once, and internal fixed-size signing transcripts are built
+  on the stack while the public `signing_transcript()` API remains a `Vec`;
+  unscoped discovery continues to verify each embedded key serially. On a
+  16-logical-core Apple M-series release build, a synthetic Compass-shaped
+  5,500-commit scope fell from 141.6 ms to 12.9 ms steady-state, 128 commits
+  from 3.22 ms to 0.41 ms, and eight commits from 199 us to 111 us, while a
+  singleton remained 24 us. Initializing a fresh Rayon pool cost the first
+  plural scope roughly 0.23--0.26 ms; a first singleton does not initialize it.
 - **Owned collection reads validate each distinct data handle and each
   distinct metadata handle once per snapshot.** Every observed commit still
   undergoes strict Ed25519 verification and remains in the snapshot's
