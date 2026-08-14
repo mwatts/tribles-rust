@@ -2911,9 +2911,7 @@ impl PinStore for Pile {
     }
 
     fn pin_snapshot(&mut self) -> Result<super::PinSnapshot, Self::PinsError> {
-        // PATCH is persistent, so this is one cheap immutable snapshot.
-        self.refresh()?;
-        Ok(self.branches.clone())
+        super::PinSnapshotSource::snapshot_pin_heads(self)
     }
 
     /// Updates the head of `id` to `new` if it matches `old`.
@@ -3085,6 +3083,18 @@ impl Pile {
         res?;
         unlock_res?;
         Ok(())
+    }
+}
+
+impl super::PinSnapshotSource for Pile {
+    type PinSnapshotError = ReadError;
+
+    fn snapshot_pin_heads(&mut self) -> Result<super::PinSnapshot, Self::PinSnapshotError> {
+        // PATCH is persistent, so this is one cheap immutable snapshot. Keep
+        // refresh here as the single strict path: failure is returned rather
+        // than becoming a partial authorization view.
+        self.refresh()?;
+        Ok(self.branches.clone())
     }
 }
 

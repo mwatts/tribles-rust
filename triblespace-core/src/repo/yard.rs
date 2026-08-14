@@ -36,7 +36,8 @@ use super::pile::{
 };
 use super::{
     transfer, BlobChildren, BlobInfo, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut,
-    PinStore, PushResult, RetentionRoots, StorageClose, TransferError, WantRequest, WantStore,
+    PinSnapshotSource, PinStore, PushResult, RetentionRoots, StorageClose, TransferError,
+    WantRequest, WantStore,
 };
 
 type HandleSet = PATCH<INLINE_LEN, IdentitySchema>;
@@ -874,6 +875,16 @@ impl PinStore for Yard {
             None => self.unpin_strong(id),
         }
         Ok(PushResult::Success())
+    }
+}
+
+impl PinSnapshotSource for Yard {
+    type PinSnapshotError = Infallible;
+
+    fn snapshot_pin_heads(&mut self) -> Result<super::PinSnapshot, Self::PinSnapshotError> {
+        // Both listing and head lookup are infallible, so PinStore's default
+        // cannot silently produce a partial snapshot here.
+        PinStore::pin_snapshot(self)
     }
 }
 

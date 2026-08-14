@@ -620,7 +620,7 @@ pub enum PushResult {
 /// Cloning is O(1) (refcount bump), so this is the right primitive for
 /// handing pin state across threads or into long-lived serving views.
 ///
-/// Returned by [`PinStore::pin_snapshot`].
+/// Returned by [`PinStore::pin_snapshot`] and [`PinSnapshotSource`].
 pub type PinSnapshot = PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>;
 
 /// Observational access to one point-in-time snapshot of pin heads.
@@ -632,15 +632,95 @@ pub type PinSnapshot = PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>;
 /// [`crate::repo::pile::Pile`] to refresh externally appended records before
 /// producing the snapshot; the capability itself is read-only.
 ///
-/// Existing [`PinStore`] implementations receive this capability through the
-/// blanket implementation below. Its explicit forwarding preserves optimized
-/// overrides such as `Pile`'s O(1) persistent-PATCH clone.
+/// Implementations opt in explicitly. In particular, implementing the mutable
+/// [`PinStore`] API does not automatically grant this observational capability
+/// to authorization or serving code. Concrete stores and composition wrappers
+/// may forward their narrowest available snapshot operation.
+///
+/// Implementations must return a complete snapshot or an error. They must not
+/// inherit [`PinStore::pin_snapshot`]'s default partial-on-head-error behavior
+/// unless every per-head operation is infallible.
 pub trait PinSnapshotSource {
     /// Error returned when a stable pin-head snapshot cannot be produced.
     type PinSnapshotError: Error + Debug + Send + Sync + 'static;
 
     /// Return a point-in-time snapshot of every `(pin id, head)` mapping.
     fn snapshot_pin_heads(&mut self) -> Result<PinSnapshot, Self::PinSnapshotError>;
+}
+
+#[cfg(test)]
+mod pin_snapshot_source_tests {
+    use std::convert::Infallible;
+
+    use super::{PinSnapshot, PinSnapshotSource, PinStore, PushResult};
+    use crate::id::Id;
+    use crate::inline::encodings::hash::Handle;
+    use crate::inline::Inline;
+    use crate::prelude::blobencodings::SimpleArchive;
+    use crate::repo::hybridstore::HybridStore;
+    use crate::repo::lazy::Lazy;
+    use crate::repo::memoryrepo::MemoryRepo;
+    use crate::repo::pile::Pile;
+    use crate::repo::yard::Yard;
+
+    fn assert_source<T: PinSnapshotSource>() {}
+
+    #[test]
+    fn concrete_stores_and_composition_wrappers_opt_in_explicitly() {
+        assert_source::<Pile>();
+        assert_source::<MemoryRepo>();
+        assert_source::<Yard>();
+        assert_source::<HybridStore<(), MemoryRepo>>();
+        assert_source::<Lazy<MemoryRepo>>();
+    }
+
+    #[test]
+    fn memory_snapshot_is_a_stable_point_in_time_view() {
+        let id = Id::new([0x31; 16]).unwrap();
+        let first = Inline::<Handle<SimpleArchive>>::new([0x41; 32]);
+        let second = Inline::<Handle<SimpleArchive>>::new([0x51; 32]);
+        let mut store = MemoryRepo::default();
+
+        assert!(matches!(
+            store.update(id, None, Some(first)).unwrap(),
+            PushResult::Success()
+        ));
+        let snapshot = store.snapshot_pin_heads().unwrap();
+        assert!(matches!(
+            store.update(id, Some(first), Some(second)).unwrap(),
+            PushResult::Success()
+        ));
+
+        assert_eq!(snapshot.get(&id.into()), Some(&first));
+        assert_eq!(
+            store.snapshot_pin_heads().unwrap().get(&id.into()),
+            Some(&second)
+        );
+    }
+
+    struct SnapshotOnly(PinSnapshot);
+
+    impl PinSnapshotSource for SnapshotOnly {
+        type PinSnapshotError = Infallible;
+
+        fn snapshot_pin_heads(&mut self) -> Result<PinSnapshot, Self::PinSnapshotError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn hybrid_snapshot_forwarding_does_not_require_mutable_pin_access() {
+        let expected = PinSnapshot::new();
+        let mut store = HybridStore::new((), SnapshotOnly(expected.clone()));
+        assert_eq!(store.snapshot_pin_heads().unwrap(), expected);
+    }
+
+    #[test]
+    fn lazy_snapshot_forwarding_does_not_require_other_store_capabilities() {
+        let expected = PinSnapshot::new();
+        let mut store = Lazy::new(SnapshotOnly(expected.clone()));
+        assert_eq!(store.snapshot_pin_heads().unwrap(), expected);
+    }
 }
 
 /// Storage backend for pins: named, atomically-updatable handles to
@@ -746,17 +826,6 @@ pub trait PinStore {
         old: Option<Inline<Handle<SimpleArchive>>>,
         new: Option<Inline<Handle<SimpleArchive>>>,
     ) -> Result<PushResult, Self::UpdateError>;
-}
-
-impl<T> PinSnapshotSource for T
-where
-    T: PinStore + ?Sized,
-{
-    type PinSnapshotError = T::PinsError;
-
-    fn snapshot_pin_heads(&mut self) -> Result<PinSnapshot, Self::PinSnapshotError> {
-        PinStore::pin_snapshot(self)
-    }
 }
 
 /// Exact byte length of a canonical [`WantRequest`].

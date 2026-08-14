@@ -152,7 +152,7 @@ content.
 Collection-native enumeration currently requires unrestricted read authority;
 collection-scoped capabilities are future work. Blob reads may still be
 restricted to the graph reachable from named local pins. For that reason the
-legacy `PinStore` snapshot remains part of capability evaluation even though
+read-only `PinSnapshotSource` remains part of capability evaluation even though
 pins are no longer a synchronization protocol or a remote source of truth.
 
 Capability request, issuance, renewal, and delivery state lives in private

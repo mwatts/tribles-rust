@@ -10,6 +10,7 @@ use crate::inline::InlineEncoding;
 use crate::prelude::blobencodings::SimpleArchive;
 use crate::repo::BlobStore;
 use crate::repo::BlobStorePut;
+use crate::repo::PinSnapshotSource;
 use crate::repo::PinStore;
 use crate::repo::PushResult;
 use crate::repo::StorageFlush;
@@ -150,6 +151,17 @@ where
         new: Option<Inline<Handle<SimpleArchive>>>,
     ) -> Result<PushResult, Self::UpdateError> {
         self.branches.update(id, old, new)
+    }
+}
+
+impl<B, R> PinSnapshotSource for HybridStore<B, R>
+where
+    R: PinSnapshotSource,
+{
+    type PinSnapshotError = R::PinSnapshotError;
+
+    fn snapshot_pin_heads(&mut self) -> Result<crate::repo::PinSnapshot, Self::PinSnapshotError> {
+        self.branches.snapshot_pin_heads()
     }
 }
 

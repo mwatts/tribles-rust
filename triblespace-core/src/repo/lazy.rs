@@ -101,8 +101,8 @@ use super::async_store::{
     AsyncBlobStore, AsyncBlobStoreGet, AsyncBlobStoreList, AsyncBlobStorePut,
 };
 use super::{
-    BlobInfo, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, PinStore, PushResult,
-    StorageFlush, WantRequest, WantStore,
+    BlobInfo, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, PinSnapshotSource, PinStore,
+    PushResult, StorageFlush, WantRequest, WantStore,
 };
 
 /// Fixed cadence at which a suspended async read re-checks the store
@@ -329,18 +329,12 @@ impl WantSignal {
 /// Mirrors the shared-store shape of `triblespace-net`'s `Peer`
 /// (`Arc<Mutex<S>>`) so a `&self` read on a [`LazyReader`] can record
 /// the durable want — the one piece of state a read must mutate.
-pub struct Lazy<S>
-where
-    S: BlobStore + BlobStorePut + WantStore + StorageFlush + Send + 'static,
-{
+pub struct Lazy<S> {
     store: Arc<Mutex<S>>,
     signal: Arc<WantSignal>,
 }
 
-impl<S> Lazy<S>
-where
-    S: BlobStore + BlobStorePut + WantStore + StorageFlush + Send + 'static,
-{
+impl<S> Lazy<S> {
     /// Wrap a store. No network is opened — `Lazy` is pure local
     /// mechanics. (A cadence re-check thread is spawned lazily only
     /// while an async read is suspended, and retires itself when none
@@ -450,6 +444,17 @@ where
         new: Option<Inline<Handle<SimpleArchive>>>,
     ) -> Result<PushResult, Self::UpdateError> {
         self.store.lock().expect("store mutex").update(id, old, new)
+    }
+}
+
+impl<S> PinSnapshotSource for Lazy<S>
+where
+    S: PinSnapshotSource,
+{
+    type PinSnapshotError = S::PinSnapshotError;
+
+    fn snapshot_pin_heads(&mut self) -> Result<super::PinSnapshot, Self::PinSnapshotError> {
+        self.store.lock().expect("store mutex").snapshot_pin_heads()
     }
 }
 

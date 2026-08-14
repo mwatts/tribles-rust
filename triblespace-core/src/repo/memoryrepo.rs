@@ -13,6 +13,7 @@ use crate::collection::{
 };
 use crate::prelude::blobencodings::SimpleArchive;
 use crate::prelude::*;
+use crate::repo::PinSnapshotSource;
 use crate::repo::PinStore;
 use crate::repo::PushResult;
 use crate::repo::{WantRequest, WantStore};
@@ -174,6 +175,16 @@ impl PinStore for MemoryRepo {
             }
         }
         Ok(PushResult::Success())
+    }
+}
+
+impl PinSnapshotSource for MemoryRepo {
+    type PinSnapshotError = Infallible;
+
+    fn snapshot_pin_heads(&mut self) -> Result<crate::repo::PinSnapshot, Self::PinSnapshotError> {
+        // Both listing and head lookup are infallible, so PinStore's default
+        // cannot silently produce a partial snapshot here.
+        PinStore::pin_snapshot(self)
     }
 }
 
