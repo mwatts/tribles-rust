@@ -351,3 +351,157 @@ pub(crate) fn path_summary_recipe_id(automaton: &Automaton) -> Id {
         .root()
         .expect("path-summary recipe fragment is intrinsically rooted")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use triblespace_core::inline::RawInline;
+
+    use crate::{GraphEdge, Transition};
+
+    fn vertex(byte: u8) -> RawInline {
+        [byte; 32]
+    }
+
+    fn label(byte: u8) -> [u8; 16] {
+        [byte; 16]
+    }
+
+    fn edge(source: u8, attribute: u8, target: u8) -> GraphEdge {
+        GraphEdge {
+            source: vertex(source),
+            attribute: label(attribute),
+            target: vertex(target),
+        }
+    }
+
+    fn plus(attribute: u8) -> Automaton {
+        let attribute = label(attribute);
+        Automaton::new(
+            2,
+            [0],
+            [1],
+            [
+                Transition::new(0, 1, Step::Forward(attribute)),
+                Transition::new(1, 1, Step::Forward(attribute)),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn canonical_bytes_are_input_order_invariant_and_golden() {
+        let automaton = Automaton::new(
+            1,
+            [0, 0],
+            [0],
+            [
+                Transition::new(0, 0, Step::Forward(label(9))),
+                Transition::new(0, 0, Step::Forward(label(9))),
+            ],
+        )
+        .unwrap();
+        let first = PathSummary::from_edges(automaton.clone(), [edge(1, 9, 2), edge(1, 9, 2)]);
+        let second = PathSummary::from_edges(automaton, [edge(1, 9, 2)]);
+        let first_blob = PathSummaryBlob::encode(&first).unwrap();
+        let second_blob = PathSummaryBlob::encode(&second).unwrap();
+
+        assert_eq!(first_blob.bytes, second_blob.bytes);
+        assert_eq!(first_blob.get_handle(), second_blob.get_handle());
+        assert_eq!(
+            hex(first_blob.bytes.as_ref()),
+            "5f73d0cf0230edf0512144e14a5e96132e661e1925556060b8036f217dc9b7f801000000020000000100000000000000010101010101010101010101010101010101010101010101010101010101010102020202020202020202020202020202020202020202020202020202020202020000000001000000"
+        );
+
+        let ordered = plus(7);
+        let reversed = Automaton::new(
+            2,
+            [0],
+            [1],
+            [
+                Transition::new(1, 1, Step::Forward(label(7))),
+                Transition::new(0, 1, Step::Forward(label(7))),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            automaton_fingerprint(&ordered),
+            automaton_fingerprint(&reversed)
+        );
+    }
+
+    #[test]
+    fn malformed_length_fingerprint_order_bounds_and_state_pair_are_rejected() {
+        let automaton = plus(9);
+        let summary = PathSummary::from_edges(automaton.clone(), [edge(1, 9, 2)]);
+        let blob = PathSummaryBlob::encode(&summary).unwrap();
+
+        let mut bad = blob.bytes.as_ref().to_vec();
+        bad.pop();
+        assert_eq!(
+            PathSummaryBlob::decode(Blob::new(bad.into()), &automaton).unwrap_err(),
+            PathSummaryBlobError::BadLength
+        );
+
+        let mut bad = blob.bytes.as_ref().to_vec();
+        bad[0] ^= 1;
+        assert_eq!(
+            PathSummaryBlob::decode(Blob::new(bad.into()), &automaton).unwrap_err(),
+            PathSummaryBlobError::DifferentAutomaton
+        );
+
+        let mut bad = blob.bytes.as_ref().to_vec();
+        bad[48..80].copy_from_slice(&vertex(2));
+        assert_eq!(
+            PathSummaryBlob::decode(Blob::new(bad.into()), &automaton).unwrap_err(),
+            PathSummaryBlobError::VertexOrder
+        );
+
+        let arc_offset = HEADER_LEN + 2 * 32;
+        let mut bad = blob.bytes.as_ref().to_vec();
+        bad[arc_offset + 4..arc_offset + 8].copy_from_slice(&4u32.to_le_bytes());
+        assert_eq!(
+            PathSummaryBlob::decode(Blob::new(bad.into()), &automaton).unwrap_err(),
+            PathSummaryBlobError::ArcOutOfBounds
+        );
+
+        let mut bad = blob.bytes.as_ref().to_vec();
+        bad[arc_offset + 4..arc_offset + 8].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(
+            PathSummaryBlob::decode(Blob::new(bad.into()), &automaton).unwrap_err(),
+            PathSummaryBlobError::InvalidStatePair
+        );
+
+        let mut bad = blob.bytes.as_ref().to_vec();
+        let first_arc = bad[arc_offset..arc_offset + 8].to_vec();
+        bad[arc_offset + 8..arc_offset + 16].copy_from_slice(&first_arc);
+        assert_eq!(
+            PathSummaryBlob::decode(Blob::new(bad.into()), &automaton).unwrap_err(),
+            PathSummaryBlobError::ArcOrder
+        );
+    }
+
+    #[test]
+    fn product_carrier_dimensions_are_checked_before_ordinal_lowering() {
+        assert_eq!(checked_product_count(2, 3).unwrap(), 6);
+        assert_eq!(
+            checked_product_count(u32::MAX as usize, 2).unwrap_err(),
+            PathSummaryBlobError::CapacityOverflow
+        );
+        assert_eq!(
+            checked_product_count(usize::MAX, 2).unwrap_err(),
+            PathSummaryBlobError::CapacityOverflow
+        );
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        const TABLE: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            out.push(TABLE[(byte >> 4) as usize] as char);
+            out.push(TABLE[(byte & 0xf) as usize] as char);
+        }
+        out
+    }
+}
