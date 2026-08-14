@@ -8,8 +8,10 @@ use crate::blob::encodings::UnknownBlob;
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::blob::MemoryBlobStore;
+use crate::collection::store::selectors_match_record;
 use crate::collection::{
-    CollectionGossip, CollectionGossipStore, CollectionRecord, CollectionStore,
+    CollectionGossip, CollectionGossipStore, CollectionRecord, CollectionRecordSelector,
+    CollectionStore,
 };
 use crate::prelude::blobencodings::SimpleArchive;
 use crate::prelude::*;
@@ -77,6 +79,21 @@ impl CollectionStore for MemoryRepo {
             .map(Ok)
             .collect::<Vec<_>>()
             .into_iter())
+    }
+
+    fn select_records(
+        &mut self,
+        selectors: &BTreeSet<CollectionRecordSelector>,
+    ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
+        if selectors.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .collection_records
+            .values()
+            .copied()
+            .filter(|record| selectors_match_record(selectors, *record))
+            .collect())
     }
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
@@ -306,6 +323,83 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn collection_primary_selection_answers_group_and_exact_conflicting_operations() {
+        let source = CollectionDescriptor::new(
+            Id::new([21; 16]).unwrap(),
+            Id::new([22; 16]).unwrap(),
+            Id::new([23; 16]).unwrap(),
+        )
+        .handle();
+        let target = CollectionDescriptor::new(
+            Id::new([24; 16]).unwrap(),
+            Id::new([25; 16]).unwrap(),
+            Id::new([26; 16]).unwrap(),
+        )
+        .handle();
+        let other = CollectionDescriptor::new(
+            Id::new([27; 16]).unwrap(),
+            Id::new([28; 16]).unwrap(),
+            Id::new([29; 16]).unwrap(),
+        )
+        .handle();
+        let input = Inline::new([30; 32]);
+        let merge = CollectionRecord::Merge(CollectionMerge::new(
+            source,
+            Inline::new([31; 32]),
+            Inline::new([32; 32]),
+            Inline::new([33; 32]),
+        ));
+        let first = CollectionRecord::Derive(CollectionDerive::new(
+            source,
+            target,
+            input,
+            Inline::new([34; 32]),
+        ));
+        let conflicting = CollectionRecord::Derive(CollectionDerive::new(
+            source,
+            target,
+            input,
+            Inline::new([35; 32]),
+        ));
+        let sibling = CollectionRecord::Derive(CollectionDerive::new(
+            source,
+            target,
+            Inline::new([36; 32]),
+            Inline::new([37; 32]),
+        ));
+        let unrelated = CollectionRecord::Derive(CollectionDerive::new(
+            source,
+            other,
+            input,
+            Inline::new([38; 32]),
+        ));
+        let mut repo = MemoryRepo::default();
+        for record in [unrelated, conflicting, merge, first, sibling, first] {
+            repo.insert(record).unwrap();
+        }
+
+        let exact = [CollectionRecordSelector::Operation(WantRequest::derive(
+            source, target, input,
+        ))]
+        .into_iter()
+        .collect();
+        let mut expected = vec![first, conflicting];
+        expected.sort_unstable_by_key(CollectionRecord::id);
+        assert_eq!(repo.select_records(&exact).unwrap(), expected);
+
+        let grouped = [
+            CollectionRecordSelector::MergeCollection(source),
+            CollectionRecordSelector::DerivePair { source, target },
+        ]
+        .into_iter()
+        .collect();
+        let mut expected = vec![merge, first, conflicting, sibling];
+        expected.sort_unstable_by_key(CollectionRecord::id);
+        assert_eq!(repo.select_records(&grouped).unwrap(), expected);
+        assert!(!repo.select_records(&grouped).unwrap().contains(&unrelated));
     }
 
     #[test]

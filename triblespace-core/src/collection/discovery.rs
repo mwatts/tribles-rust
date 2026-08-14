@@ -18,7 +18,7 @@ use crate::inline::Inline;
 
 use super::{
     CollectionCommit, CollectionDerive, CollectionId, CollectionMerge, CollectionRecord,
-    CollectionStore, CommitVerificationError,
+    CollectionRecordSelector, CollectionStore, CommitVerificationError,
 };
 
 /// One collection record with a discovery-time validation failure.
@@ -169,28 +169,41 @@ where
     Ok(discovered)
 }
 
-/// Discover every unsigned equation but verify only commits named by an exact ticket.
+/// Discover the exact proof domain and verify only commits named by a ticket.
 ///
 /// Exact-ticket consumers authorize concrete commit records rather than every
 /// signer or every commit in the store. Their ticket IDs are structurally
 /// available before Ed25519 verification, so unrelated commits can be skipped
-/// without changing the equation view or paying their signature cost. Matching
-/// commits retain the ordinary strict-verification and diagnostic behavior.
-/// The caller must still byte-match each supplied ticket record against the
-/// returned commit with the same intrinsic ID.
+/// without paying their signature cost. Their fixed derived kernel can only
+/// activate source/target merges and source-to-target derives, so unrelated
+/// unsigned equations are omitted at the same boundary. Matching commits
+/// retain the ordinary strict-verification and diagnostic behavior. The caller
+/// must still byte-match each supplied ticket record against the returned
+/// commit with the same intrinsic ID.
 pub(crate) fn discover_collection_records_for_ticket<S>(
     store: &mut S,
     ticket_ids: &BTreeSet<Id>,
+    source: CollectionId,
+    target: CollectionId,
 ) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
 where
     S: CollectionStore,
 {
     let mut discovered = DiscoveredCollectionRecords::default();
     let mut matching_commits = Vec::new();
-    let records = store.records().map_err(CollectionDiscoveryError::Records)?;
+    let mut selectors: BTreeSet<_> = ticket_ids
+        .iter()
+        .copied()
+        .map(CollectionRecordSelector::Id)
+        .collect();
+    selectors.insert(CollectionRecordSelector::MergeCollection(source));
+    selectors.insert(CollectionRecordSelector::MergeCollection(target));
+    selectors.insert(CollectionRecordSelector::DerivePair { source, target });
+    let records = store
+        .select_records(&selectors)
+        .map_err(CollectionDiscoveryError::Records)?;
 
     for record in records {
-        let record = record.map_err(CollectionDiscoveryError::Records)?;
         match record {
             CollectionRecord::Commit(record) if ticket_ids.contains(&record.id()) => {
                 matching_commits.push(record)
@@ -423,6 +436,59 @@ mod tests {
             ],
             invalid_commit,
         )
+    }
+
+    #[test]
+    fn exact_ticket_discovery_selects_only_the_fixed_source_target_proof_domain() {
+        let source = collection(1);
+        let target = collection(2);
+        let other = collection(3);
+        let commit = CollectionCommit::sign(
+            &SigningKey::from_bytes(&[7; 32]),
+            source,
+            hash(4),
+            empty_metadata_handle(),
+        );
+        let source_merge = CollectionMerge::new(source, hash(4), hash(5), hash(6));
+        let target_merge = CollectionMerge::new(target, hash(7), hash(8), hash(9));
+        let derive = CollectionDerive::new(source, target, hash(6), hash(7));
+        let unrelated_merge = CollectionMerge::new(other, hash(10), hash(11), hash(12));
+        let unrelated_derive = CollectionDerive::new(source, other, hash(6), hash(13));
+        let unrelated_commit = invalid_signature(CollectionCommit::sign(
+            &SigningKey::from_bytes(&[8; 32]),
+            other,
+            hash(14),
+            empty_metadata_handle(),
+        ));
+        let mut physical = vec![
+            CollectionRecord::Merge(unrelated_merge),
+            CollectionRecord::Derive(unrelated_derive),
+            CollectionRecord::Commit(unrelated_commit),
+            CollectionRecord::Merge(target_merge),
+            CollectionRecord::Commit(commit),
+            CollectionRecord::Derive(derive),
+            CollectionRecord::Merge(source_merge),
+        ];
+        physical.sort_unstable_by_key(CollectionRecord::id);
+        let mut store = ProbeStore {
+            records: physical.into_iter().map(Ok).collect(),
+            ..ProbeStore::default()
+        };
+
+        let discovered = discover_collection_records_for_ticket(
+            &mut store,
+            &[commit.id()].into_iter().collect(),
+            source,
+            target,
+        )
+        .unwrap();
+
+        let mut expected_merges = vec![source_merge, target_merge];
+        expected_merges.sort_unstable_by_key(CollectionMerge::id);
+        assert_eq!(discovered.commits(), &[commit]);
+        assert_eq!(discovered.merges(), expected_merges);
+        assert_eq!(discovered.derives(), &[derive]);
+        assert!(discovered.diagnostics().is_empty());
     }
 
     #[test]

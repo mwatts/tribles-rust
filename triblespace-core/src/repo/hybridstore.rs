@@ -1,7 +1,8 @@
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::collection::{
-    CollectionGossip, CollectionGossipStore, CollectionRecord, CollectionStore,
+    CollectionGossip, CollectionGossipStore, CollectionRecord, CollectionRecordSelector,
+    CollectionStore,
 };
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
@@ -15,6 +16,7 @@ use crate::repo::PinStore;
 use crate::repo::PushResult;
 use crate::repo::StorageFlush;
 use crate::repo::{WantRequest, WantStore};
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 
@@ -182,6 +184,13 @@ where
         self.branches.records()
     }
 
+    fn select_records(
+        &mut self,
+        selectors: &BTreeSet<CollectionRecordSelector>,
+    ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
+        self.branches.select_records(selectors)
+    }
+
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
         self.branches.insert(record)
     }
@@ -263,6 +272,15 @@ mod tests {
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
+            vec![record]
+        );
+        let selectors = [CollectionRecordSelector::MergeCollection(
+            descriptor.handle(),
+        )]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            CollectionStore::select_records(&mut hybrid, &selectors).unwrap(),
             vec![record]
         );
         assert_eq!(

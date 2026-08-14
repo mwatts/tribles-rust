@@ -22,7 +22,8 @@ use anybytes::Bytes;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
 use crate::collection::{
-    CollectionGossip, CollectionGossipStore, CollectionRecord, CollectionStore,
+    CollectionGossip, CollectionGossipStore, CollectionRecord, CollectionRecordSelector,
+    CollectionStore,
 };
 use crate::id::{Id, RawId};
 use crate::inline::encodings::hash::Handle;
@@ -790,6 +791,37 @@ impl CollectionStore for Yard {
         Ok(YardCollectionRecordIter {
             inner: records.into_values(),
         })
+    }
+
+    fn select_records(
+        &mut self,
+        selectors: &BTreeSet<CollectionRecordSelector>,
+    ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
+        if selectors.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut records = BTreeMap::new();
+        for generation in &mut self.generations {
+            for segment in &mut generation.segments {
+                let selected = segment
+                    .pile_mut()
+                    .select_records(selectors)
+                    .map_err(YardCollectionRecordsError::Pile)?;
+                for record in selected {
+                    let id = record.id();
+                    match records.get(&id) {
+                        Some(existing) if existing != &record => {
+                            return Err(YardCollectionRecordsError::IdCollision { id });
+                        }
+                        Some(_) => {}
+                        None => {
+                            records.insert(id, record);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(records.into_values().collect())
     }
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
@@ -1628,6 +1660,71 @@ mod tests {
                 .unwrap(),
             expected
         );
+        reopened.close().unwrap();
+    }
+
+    #[test]
+    fn collection_selection_unions_generations_without_choosing_an_output() {
+        let config = YardConfig::default();
+        let (_dir, paths, mut yard) = yard_with_paths(2, config);
+        let source = Inline::new([41; 32]);
+        let target = Inline::new([42; 32]);
+        let input = Inline::new([43; 32]);
+        let first = CollectionRecord::Derive(CollectionDerive::new(
+            source,
+            target,
+            input,
+            Inline::new([44; 32]),
+        ));
+        let conflicting = CollectionRecord::Derive(CollectionDerive::new(
+            source,
+            target,
+            input,
+            Inline::new([45; 32]),
+        ));
+        let unrelated = CollectionRecord::Derive(CollectionDerive::new(
+            source,
+            Inline::new([46; 32]),
+            input,
+            Inline::new([47; 32]),
+        ));
+        yard.generations[1]
+            .active_mut()
+            .pile_mut()
+            .insert(first)
+            .unwrap();
+        yard.generations[0]
+            .active_mut()
+            .pile_mut()
+            .insert(first)
+            .unwrap();
+        yard.generations[0]
+            .active_mut()
+            .pile_mut()
+            .insert(conflicting)
+            .unwrap();
+        yard.generations[0]
+            .active_mut()
+            .pile_mut()
+            .insert(unrelated)
+            .unwrap();
+        let selectors = [CollectionRecordSelector::Operation(WantRequest::derive(
+            source, target, input,
+        ))]
+        .into_iter()
+        .collect();
+        let mut expected = vec![first, conflicting];
+        expected.sort_unstable_by_key(CollectionRecord::id);
+
+        assert_eq!(yard.select_records(&selectors).unwrap(), expected);
+        yard.close().unwrap();
+
+        let mut reopened = Yard::open(&paths, config).unwrap();
+        assert_eq!(reopened.select_records(&selectors).unwrap(), expected);
+        assert!(!reopened
+            .select_records(&selectors)
+            .unwrap()
+            .contains(&unrelated));
         reopened.close().unwrap();
     }
 

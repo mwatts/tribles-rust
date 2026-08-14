@@ -47,9 +47,10 @@ use crate::blob::Blob;
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
+use crate::collection::store::selectors_match_record;
 use crate::collection::{
     CollectionCommit, CollectionDerive, CollectionGossip, CollectionGossipStore, CollectionMerge,
-    CollectionRecord, CollectionStore, KIND_COLLECTION_GOSSIP,
+    CollectionRecord, CollectionRecordSelector, CollectionStore, KIND_COLLECTION_GOSSIP,
 };
 use crate::id::Id;
 use crate::id::RawId;
@@ -2650,6 +2651,22 @@ impl CollectionStore for Pile {
         })
     }
 
+    fn select_records(
+        &mut self,
+        selectors: &BTreeSet<CollectionRecordSelector>,
+    ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
+        if selectors.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.refresh()?;
+        Ok(self
+            .collection_records
+            .values()
+            .copied()
+            .filter(|record| selectors_match_record(selectors, *record))
+            .collect())
+    }
+
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
         let id = record.id();
         let header = collection_record_header(&record);
@@ -4428,6 +4445,72 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
             assert_eq!(actual, expected);
+            pile.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn collection_selection_survives_insert_reopen_and_concatenation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path_a = fresh_empty_pile_path(&dir, "selection-a.pile");
+        let path_b = fresh_empty_pile_path(&dir, "selection-b.pile");
+        let path_ab = dir.path().join("selection-ab.pile");
+        let path_ba = dir.path().join("selection-ba.pile");
+        let source = collection_test_collection(1);
+        let target = collection_test_collection(2);
+        let input = collection_test_hash(8);
+        let records = collection_test_records();
+        let first = records[2];
+        let conflicting = CollectionRecord::Derive(CollectionDerive::new(
+            source,
+            target,
+            input,
+            collection_test_hash(10),
+        ));
+        let unrelated = CollectionRecord::Derive(CollectionDerive::new(
+            source,
+            collection_test_collection(3),
+            input,
+            collection_test_hash(11),
+        ));
+        let exact = [CollectionRecordSelector::Operation(WantRequest::derive(
+            source, target, input,
+        ))]
+        .into_iter()
+        .collect();
+
+        let mut a = Pile::open(&path_a).unwrap();
+        for record in [records[0], records[1], first, unrelated] {
+            a.insert(record).unwrap();
+        }
+        assert_eq!(a.select_records(&exact).unwrap(), vec![first]);
+        a.close().unwrap();
+
+        let mut reopened = Pile::open(&path_a).unwrap();
+        assert_eq!(reopened.select_records(&exact).unwrap(), vec![first]);
+        reopened.close().unwrap();
+
+        let mut b = Pile::open(&path_b).unwrap();
+        for record in [first, conflicting] {
+            b.insert(record).unwrap();
+        }
+        b.close().unwrap();
+
+        let bytes_a = std::fs::read(&path_a).unwrap();
+        let bytes_b = std::fs::read(&path_b).unwrap();
+        let mut ab = bytes_a.clone();
+        ab.extend_from_slice(&bytes_b);
+        std::fs::write(&path_ab, ab).unwrap();
+        let mut ba = bytes_b;
+        ba.extend_from_slice(&bytes_a);
+        std::fs::write(&path_ba, ba).unwrap();
+
+        let mut expected = vec![first, conflicting];
+        expected.sort_unstable_by_key(CollectionRecord::id);
+        for path in [&path_ab, &path_ba] {
+            let mut pile = Pile::open(path).unwrap();
+            assert_eq!(pile.select_records(&exact).unwrap(), expected);
+            assert!(!pile.select_records(&exact).unwrap().contains(&unrelated));
             pile.close().unwrap();
         }
     }

@@ -457,10 +457,13 @@ where
         A: ExactDerivedAlgebra<Source, Target> + ?Sized,
     {
         let requested: BTreeSet<_> = ticket.iter().map(CollectionCommit::id).collect();
-        let discovered =
-            discover_collection_records_for_ticket(store, &requested).map_err(|error| {
-                ExactDerivedCollectionError::storage("discover exact ticket", error)
-            })?;
+        let discovered = discover_collection_records_for_ticket(
+            store,
+            &requested,
+            self.source.handle(),
+            self.target.handle(),
+        )
+        .map_err(|error| ExactDerivedCollectionError::storage("discover exact ticket", error))?;
         let authorized = exact_ticket_ids(&discovered, ticket, &self.source)?;
         let reader = store.reader().map_err(|error| {
             ExactDerivedCollectionError::storage("open exact-ticket reader", error)

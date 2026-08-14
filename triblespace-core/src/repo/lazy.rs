@@ -78,6 +78,7 @@
 //! [`WantWaitError::Store`]: crate::repo::lazy::WantWaitError::Store
 //! [`WantWaitError::WantRecord`]: crate::repo::lazy::WantWaitError::WantRecord
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -91,7 +92,8 @@ use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
 use crate::collection::{
-    CollectionGossip, CollectionGossipStore, CollectionRecord, CollectionStore,
+    CollectionGossip, CollectionGossipStore, CollectionRecord, CollectionRecordSelector,
+    CollectionStore,
 };
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
@@ -475,6 +477,16 @@ where
         let mut store = self.store.lock().expect("store mutex");
         let records: Vec<Result<CollectionRecord, S::RecordsError>> = store.records()?.collect();
         Ok(records.into_iter())
+    }
+
+    fn select_records(
+        &mut self,
+        selectors: &BTreeSet<CollectionRecordSelector>,
+    ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
+        self.store
+            .lock()
+            .expect("store mutex")
+            .select_records(selectors)
     }
 
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
@@ -913,6 +925,15 @@ mod tests {
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap(),
+            vec![record]
+        );
+        let selectors = [CollectionRecordSelector::MergeCollection(
+            descriptor.handle(),
+        )]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            CollectionStore::select_records(&mut lazy, &selectors).unwrap(),
             vec![record]
         );
     }
