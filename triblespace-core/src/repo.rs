@@ -794,6 +794,68 @@ pub trait PinStore {
     ) -> Result<PushResult, Self::UpdateError>;
 }
 
+impl<S> PinStore for &mut S
+where
+    S: PinStore + ?Sized,
+{
+    type PinsError = S::PinsError;
+    type HeadError = S::HeadError;
+    type UpdateError = S::UpdateError;
+    type ListIter<'a>
+        = S::ListIter<'a>
+    where
+        Self: 'a;
+
+    fn pins<'a>(&'a mut self) -> Result<Self::ListIter<'a>, Self::PinsError> {
+        (**self).pins()
+    }
+
+    fn head(&mut self, id: Id) -> Result<Option<Inline<Handle<SimpleArchive>>>, Self::HeadError> {
+        (**self).head(id)
+    }
+
+    fn update(
+        &mut self,
+        id: Id,
+        old: Option<Inline<Handle<SimpleArchive>>>,
+        new: Option<Inline<Handle<SimpleArchive>>>,
+    ) -> Result<PushResult, Self::UpdateError> {
+        (**self).update(id, old, new)
+    }
+}
+
+#[cfg(test)]
+mod pin_store_borrow_tests {
+    use super::{PinStore, PushResult};
+    use crate::id::Id;
+    use crate::inline::encodings::hash::Handle;
+    use crate::inline::Inline;
+    use crate::prelude::blobencodings::SimpleArchive;
+    use crate::repo::memoryrepo::MemoryRepo;
+
+    #[test]
+    fn mutable_borrow_forwards_the_complete_pin_store_surface() {
+        let id = Id::new([0x42; 16]).unwrap();
+        let head = Inline::<Handle<SimpleArchive>>::new([0x43; 32]);
+        let mut store = MemoryRepo::default();
+        let borrowed = &mut store;
+
+        assert!(matches!(
+            borrowed.update(id, None, Some(head)).unwrap(),
+            PushResult::Success()
+        ));
+        assert_eq!(borrowed.head(id).unwrap(), Some(head));
+        assert_eq!(
+            borrowed
+                .pins()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            [id]
+        );
+    }
+}
+
 /// Exact byte length of a canonical [`WantRequest`].
 pub const WANT_REQUEST_BYTES_LEN: usize = 1 + 3 * INLINE_LEN;
 

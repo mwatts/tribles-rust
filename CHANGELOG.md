@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Mutable pin stores now forward through ordinary mutable borrows.**
+  `&mut S` implements `PinStore` whenever `S` does, matching the existing
+  `BlobStore`, `CollectionStore`, and `StorageFlush` forwarding surfaces and
+  allowing a temporary `Repository` view without transferring backend
+  ownership or reimplementing the pin trait in downstream crates.
 - **Direct `SimpleArchive` collections now have a keyless exact-ticket read
   facade.** `SimpleArchiveCollection::{attach_exact,snapshot_exact}` accepts a
   set of complete `CollectionCommit` records, admits mixed authors only after
