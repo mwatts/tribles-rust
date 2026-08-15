@@ -65,7 +65,11 @@ fn used_bits(r: Ratio<i128>) -> usize {
         let a = n.div_euclid(d);
         let rem = n.rem_euclid(d);
         bits += if first {
-            code(if a >= 0 { a as u128 + 1 } else { a.unsigned_abs() })
+            code(if a >= 0 {
+                a as u128 + 1
+            } else {
+                a.unsigned_abs()
+            })
         } else {
             code(a as u128)
         };
@@ -230,10 +234,7 @@ fn main() {
         }
         widths.sort_unstable();
         let med = widths.get(widths.len() / 2).copied().unwrap_or(0);
-        let p99 = widths
-            .get(widths.len() * 99 / 100)
-            .copied()
-            .unwrap_or(0);
+        let p99 = widths.get(widths.len() * 99 / 100).copied().unwrap_or(0);
         println!(
             "  p,q < 2^{bits:<4} fits {:>6.2}%   used bits: median {med:>3}  p99 {p99:>3}",
             fit as f64 / 100.0

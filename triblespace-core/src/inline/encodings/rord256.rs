@@ -511,8 +511,14 @@ pub(crate) mod wasm_formatter {
         let (mut q1, mut q2) = (0i128, 1i128);
         macro_rules! step {
             ($a:expr) => {{
-                let np = $a.checked_mul(p1).and_then(|v| v.checked_add(p2)).ok_or(2u32)?;
-                let nq = $a.checked_mul(q1).and_then(|v| v.checked_add(q2)).ok_or(2u32)?;
+                let np = $a
+                    .checked_mul(p1)
+                    .and_then(|v| v.checked_add(p2))
+                    .ok_or(2u32)?;
+                let nq = $a
+                    .checked_mul(q1)
+                    .and_then(|v| v.checked_add(q2))
+                    .ok_or(2u32)?;
                 p2 = p1;
                 p1 = np;
                 q2 = q1;
@@ -665,8 +671,10 @@ mod tests {
         vals.sort();
         vals.dedup();
 
-        let mut by_bytes: Vec<(Inline<ROrd256>, Ratio<i128>)> =
-            vals.iter().map(|r| (enc(*r.numer(), *r.denom()), *r)).collect();
+        let mut by_bytes: Vec<(Inline<ROrd256>, Ratio<i128>)> = vals
+            .iter()
+            .map(|r| (enc(*r.numer(), *r.denom()), *r))
+            .collect();
         by_bytes.sort_by(|a, b| a.0.raw.cmp(&b.0.raw));
 
         let sorted: Vec<Ratio<i128>> = by_bytes.iter().map(|(_, r)| *r).collect();
@@ -828,7 +836,11 @@ mod tests {
             let a = n.div_euclid(d);
             let rem = n.rem_euclid(d);
             bits += if first {
-                code(if a >= 0 { a as u128 + 1 } else { a.unsigned_abs() })
+                code(if a >= 0 {
+                    a as u128 + 1
+                } else {
+                    a.unsigned_abs()
+                })
             } else {
                 code(a as u128)
             };
@@ -871,7 +883,10 @@ mod tests {
                 );
                 checked += 1;
             }
-            assert!(checked > 10, "period {period:?} barely exercised the domain");
+            assert!(
+                checked > 10,
+                "period {period:?} barely exercised the domain"
+            );
         }
 
         // Out-of-domain is a typed error, never a silent approximation.
@@ -903,7 +918,7 @@ mod tests {
         w.push(true).unwrap();
         w.push_term(2, false).unwrap(); // a0 = 1
         w.push_term(1, true).unwrap(); // a1 = 1  (odd position -> inverted)
-        // The terminator sits at position 2, which is even, so the pad is ones.
+                                       // The terminator sits at position 2, which is even, so the pad is ones.
         let raw = w.finish(true);
 
         let v = Inline::<ROrd256>::new(raw);
@@ -947,7 +962,10 @@ mod tests {
                 }
             }
         }
-        assert!(accepted > 200, "mutation test accepted too few mutants to be meaningful (got {accepted})");
+        assert!(
+            accepted > 200,
+            "mutation test accepted too few mutants to be meaningful (got {accepted})"
+        );
     }
 
     /// The wasm formatter is a hand-rolled second decoder compiled to a
@@ -979,7 +997,11 @@ mod tests {
         // get exercised.
         (1u32..=104u32, any::<u128>(), any::<u128>(), any::<bool>()).prop_map(
             |(bits, n, d, neg)| {
-                let mask = if bits >= 127 { u128::MAX >> 1 } else { (1u128 << bits) - 1 };
+                let mask = if bits >= 127 {
+                    u128::MAX >> 1
+                } else {
+                    (1u128 << bits) - 1
+                };
                 let num = ((n & mask) as i128).max(0);
                 let den = ((d & mask) as i128).max(1);
                 Ratio::new(if neg { -num } else { num }, den)
@@ -1045,4 +1067,3 @@ mod tests {
         }
     }
 }
-

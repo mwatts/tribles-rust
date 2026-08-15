@@ -301,25 +301,27 @@ impl WantSignal {
             return; // already running
         }
         let weak = Arc::downgrade(this);
-        std::thread::spawn(move || loop {
-            std::thread::sleep(WANT_RECHECK_CADENCE);
-            let Some(signal) = weak.upgrade() else { break };
-            let drained: Vec<Waker> =
-                std::mem::take(&mut *signal.wakers.lock().expect("wakers mutex"));
-            if drained.is_empty() {
-                // Nobody is parked: retire. Re-check for a registration
-                // that raced the retirement and take the ticker back if
-                // one slipped in (unless a fresh ticker already spawned).
-                signal.ticker_alive.store(false, Ordering::Release);
-                if signal.wakers.lock().expect("wakers mutex").is_empty()
-                    || signal.ticker_alive.swap(true, Ordering::AcqRel)
-                {
-                    break;
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(WANT_RECHECK_CADENCE);
+                let Some(signal) = weak.upgrade() else { break };
+                let drained: Vec<Waker> =
+                    std::mem::take(&mut *signal.wakers.lock().expect("wakers mutex"));
+                if drained.is_empty() {
+                    // Nobody is parked: retire. Re-check for a registration
+                    // that raced the retirement and take the ticker back if
+                    // one slipped in (unless a fresh ticker already spawned).
+                    signal.ticker_alive.store(false, Ordering::Release);
+                    if signal.wakers.lock().expect("wakers mutex").is_empty()
+                        || signal.ticker_alive.swap(true, Ordering::AcqRel)
+                    {
+                        break;
+                    }
+                    continue;
                 }
-                continue;
-            }
-            for waker in drained {
-                waker.wake();
+                for waker in drained {
+                    waker.wake();
+                }
             }
         });
     }
