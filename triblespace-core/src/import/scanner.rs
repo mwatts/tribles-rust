@@ -25,6 +25,9 @@
 //!   object, a huge base64 blob, an array — *without materializing it*. This is
 //!   what makes projection cheap: read `uuid` and `role`, skip the 2 GB of
 //!   content you are not projecting on this pass.
+//! * [`take_value`] advances the same scanner while returning the value's exact
+//!   source slice. It is the lossless counterpart to `skip_value`: still O(1),
+//!   still backed by the original mmap, but suitable for source receipts.
 //!
 //! # Example: project two fields from a JSONL record
 //!
@@ -72,11 +75,15 @@ fn syntax(msg: &str) -> ScanError {
     ScanError::Syntax(msg.to_owned())
 }
 
-/// Advance the cursor past ASCII whitespace.
+/// Advance the cursor past RFC 8259 JSON whitespace.
 pub fn skip_ws(bytes: &mut Bytes) {
-    while matches!(bytes.peek_token(), Some(b) if b.is_ascii_whitespace()) {
+    while matches!(bytes.peek_token(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
         bytes.pop_front();
     }
+}
+
+fn is_value_boundary(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b',' | b']' | b'}')
 }
 
 /// Consume exactly `expected`, or error.
@@ -95,9 +102,9 @@ pub fn expect_literal(bytes: &mut Bytes, literal: &[u8]) -> Result<(), ScanError
     Ok(())
 }
 
-/// Decode a `\uXXXX` escape's four hex digits into UTF-8 bytes. The cursor must
-/// be positioned just after the `u`.
-pub fn parse_unicode_escape(bytes: &mut Bytes) -> Result<Vec<u8>, ScanError> {
+/// Parse the four hexadecimal digits in one JSON UTF-16 code unit. The cursor
+/// must be positioned just after the `u`.
+fn parse_utf16_code_unit(bytes: &mut Bytes) -> Result<u16, ScanError> {
     use winnow::error::InputError;
     use winnow::token::take;
     use winnow::Parser;
@@ -107,16 +114,42 @@ pub fn parse_unicode_escape(bytes: &mut Bytes) -> Result<Vec<u8>, ScanError> {
         .parse_next(bytes)
         .map_err(|_| syntax("unterminated unicode escape"))?;
 
-    let mut code: u32 = 0;
+    let mut code: u16 = 0;
     for h in hex.as_ref() {
         code = (code << 4)
             | match h {
-                b'0'..=b'9' => (h - b'0') as u32,
-                b'a'..=b'f' => (h - b'a' + 10) as u32,
-                b'A'..=b'F' => (h - b'A' + 10) as u32,
+                b'0'..=b'9' => (h - b'0') as u16,
+                b'a'..=b'f' => (h - b'a' + 10) as u16,
+                b'A'..=b'F' => (h - b'A' + 10) as u16,
                 _ => return Err(syntax("invalid unicode escape")),
             };
     }
+
+    Ok(code)
+}
+
+/// Decode a JSON `\uXXXX` escape into UTF-8 bytes. The cursor must be
+/// positioned just after the first `u`.
+///
+/// JSON spells non-BMP scalar values as a UTF-16 surrogate pair. A leading
+/// surrogate therefore consumes the immediately following `\uXXXX` escape;
+/// lone low surrogates and malformed pairs are rejected.
+pub fn parse_unicode_escape(bytes: &mut Bytes) -> Result<Vec<u8>, ScanError> {
+    let first = parse_utf16_code_unit(bytes)?;
+    let code = match first {
+        high @ 0xD800..=0xDBFF => {
+            if bytes.pop_front() != Some(b'\\') || bytes.pop_front() != Some(b'u') {
+                return Err(syntax("high surrogate must be followed by a low surrogate"));
+            }
+            let low = parse_utf16_code_unit(bytes)?;
+            if !(0xDC00..=0xDFFF).contains(&low) {
+                return Err(syntax("high surrogate must be followed by a low surrogate"));
+            }
+            0x1_0000 + (((high as u32) - 0xD800) << 10) + ((low as u32) - 0xDC00)
+        }
+        0xDC00..=0xDFFF => return Err(syntax("lone low surrogate")),
+        scalar => scalar as u32,
+    };
 
     if let Some(ch) = char::from_u32(code) {
         let mut buf = [0u8; 4];
@@ -140,7 +173,7 @@ pub fn parse_string(bytes: &mut Bytes) -> Result<Bytes, ScanError> {
 
         let mut tentative = bytes.clone();
         let mut segment = take_while::<_, _, InputError<Bytes>>(0.., |b: u8| {
-            b != b'"' && b != b'\\' && b != b'\n' && b != b'\r'
+            b >= 0x20 && b != b'"' && b != b'\\'
         });
 
         if let Ok(prefix) = segment.parse_next(&mut tentative) {
@@ -159,7 +192,7 @@ pub fn parse_string(bytes: &mut Bytes) -> Result<Bytes, ScanError> {
         use winnow::Parser;
 
         let mut segment = take_while::<_, _, InputError<Bytes>>(0.., |b: u8| {
-            b != b'\\' && b != b'"' && b != b'\n' && b != b'\r'
+            b >= 0x20 && b != b'\\' && b != b'"'
         });
         let chunk = segment
             .parse_next(bytes)
@@ -189,7 +222,8 @@ pub fn parse_string(bytes: &mut Bytes) -> Result<Bytes, ScanError> {
                     _ => return Err(syntax("invalid escape sequence")),
                 }
             }
-            Some(b'\n') | Some(b'\r') | None => return Err(syntax("unterminated string")),
+            Some(0x00..=0x1F) => return Err(syntax("unescaped control character in string")),
+            None => return Err(syntax("unterminated string")),
             _ => unreachable!("peek_token only yields bytes"),
         }
     }
@@ -198,17 +232,64 @@ pub fn parse_string(bytes: &mut Bytes) -> Result<Bytes, ScanError> {
 /// Parse a JSON number, returning the raw token bytes (the caller decodes to
 /// `f64` / `i64` as it needs — see [`parse_f64`]).
 pub fn parse_number(bytes: &mut Bytes) -> Result<Bytes, ScanError> {
-    use winnow::error::InputError;
-    use winnow::token::take_while;
-    use winnow::Parser;
+    fn consume_digits(bytes: &mut Bytes) -> usize {
+        let mut count = 0;
+        while matches!(bytes.peek_token(), Some(b'0'..=b'9')) {
+            bytes.pop_front();
+            count += 1;
+        }
+        count
+    }
 
-    let mut number = take_while::<_, _, InputError<Bytes>>(1.., |b: u8| {
-        b.is_ascii_digit() || b == b'-' || b == b'+' || b == b'.' || b == b'e' || b == b'E'
-    });
+    // Parse through a clone so malformed tokens leave the caller's cursor
+    // untouched. Both the clone and the returned prefix retain the same
+    // anybytes owner, so success is still O(1) and zero-copy.
+    let start = bytes.clone();
+    let mut rest = start.clone();
 
-    number
-        .parse_next(bytes)
-        .map_err(|_: InputError<Bytes>| syntax("expected number"))
+    if rest.peek_token() == Some(b'-') {
+        rest.pop_front();
+    }
+
+    match rest.peek_token() {
+        Some(b'0') => {
+            rest.pop_front();
+            if matches!(rest.peek_token(), Some(b'0'..=b'9')) {
+                return Err(syntax("leading zero in number"));
+            }
+        }
+        Some(b'1'..=b'9') => {
+            rest.pop_front();
+            consume_digits(&mut rest);
+        }
+        _ => return Err(syntax("expected number")),
+    }
+
+    if rest.peek_token() == Some(b'.') {
+        rest.pop_front();
+        if consume_digits(&mut rest) == 0 {
+            return Err(syntax("fraction requires at least one digit"));
+        }
+    }
+
+    if matches!(rest.peek_token(), Some(b'e' | b'E')) {
+        rest.pop_front();
+        if matches!(rest.peek_token(), Some(b'+' | b'-')) {
+            rest.pop_front();
+        }
+        if consume_digits(&mut rest) == 0 {
+            return Err(syntax("exponent requires at least one digit"));
+        }
+    }
+
+    if matches!(rest.peek_token(), Some(byte) if !is_value_boundary(byte)) {
+        return Err(syntax("invalid character after number"));
+    }
+
+    let consumed = start.len() - rest.len();
+    let raw = start.slice(..consumed);
+    *bytes = rest;
+    Ok(raw)
 }
 
 /// Parse a JSON number and decode it to `f64`.
@@ -228,14 +309,22 @@ pub fn parse_f64(bytes: &mut Bytes) -> Result<f64, ScanError> {
 /// The cursor must be positioned at the first byte of the value (after any
 /// leading whitespace).
 pub fn skip_value(bytes: &mut Bytes) -> Result<(), ScanError> {
+    fn literal(bytes: &mut Bytes, expected: &[u8]) -> Result<(), ScanError> {
+        expect_literal(bytes, expected)?;
+        if matches!(bytes.peek_token(), Some(byte) if !is_value_boundary(byte)) {
+            return Err(syntax("invalid character after literal"));
+        }
+        Ok(())
+    }
+
     match bytes.peek_token() {
         Some(b'"') => {
             let _ = parse_string(bytes)?;
             Ok(())
         }
-        Some(b't') => expect_literal(bytes, b"true"),
-        Some(b'f') => expect_literal(bytes, b"false"),
-        Some(b'n') => expect_literal(bytes, b"null"),
+        Some(b't') => literal(bytes, b"true"),
+        Some(b'f') => literal(bytes, b"false"),
+        Some(b'n') => literal(bytes, b"null"),
         // Reuse the fold combinators so the recursive skipper and the public
         // `object` / `array` share one implementation of the brace-matching
         // structure — dropping each member/element on the floor via `skip_value`.
@@ -247,6 +336,24 @@ pub fn skip_value(bytes: &mut Bytes) -> Result<(), ScanError> {
         }
         None => Err(syntax("expected a value")),
     }
+}
+
+/// Return the exact source bytes of one complete JSON value and advance past
+/// it without decoding or copying the value.
+///
+/// The cursor must already be positioned at the value's first byte. Leading
+/// and trailing whitespace are therefore not part of the returned slice, but
+/// whitespace inside an object or array is retained byte-for-byte. On error,
+/// the caller's cursor is left unchanged.
+pub fn take_value(bytes: &mut Bytes) -> Result<Bytes, ScanError> {
+    let start = bytes.clone();
+    let mut rest = start.clone();
+    skip_value(&mut rest)?;
+
+    let consumed = start.len() - rest.len();
+    let value = start.slice(..consumed);
+    *bytes = rest;
+    Ok(value)
 }
 
 /// Parse a JSON object, folding `member` over each `"key": value` pair.
@@ -333,12 +440,65 @@ mod tests {
     #[test]
     fn string_zero_copy_and_escaped() {
         let mut b = bytes(r#""plain" rest"#);
+        let original_ptr = b.as_ptr();
         let s = parse_string(&mut b).unwrap();
+        assert_eq!(s.as_ptr(), unsafe { original_ptr.add(1) });
         assert_eq!(s.view::<str>().unwrap().as_ref(), "plain");
 
         let mut e = bytes(r#""a\nb☺""#);
         let s = parse_string(&mut e).unwrap();
         assert_eq!(s.view::<str>().unwrap().as_ref(), "a\nb\u{263A}");
+    }
+
+    #[test]
+    fn string_decodes_utf16_surrogate_pairs() {
+        let mut emoji = bytes(r#""\uD83D\uDE00""#);
+        let decoded = parse_string(&mut emoji).unwrap();
+        assert_eq!(decoded.view::<str>().unwrap().as_ref(), "😀");
+        assert_eq!(emoji.peek_token(), None);
+
+        let mut maximum = bytes(r#""\uDBFF\uDFFF""#);
+        let decoded = parse_string(&mut maximum).unwrap();
+        assert_eq!(decoded.view::<str>().unwrap().as_ref(), "\u{10FFFF}");
+    }
+
+    #[test]
+    fn string_rejects_lone_and_malformed_surrogates() {
+        for invalid in [
+            r#""\uD800""#,
+            r#""\uDC00""#,
+            r#""\uD800\u0041""#,
+            r#""\uD800\uD800""#,
+            r#""\uD800x""#,
+            r#""\uD800\xDC00""#,
+            r#""\uD800\uDFF""#,
+        ] {
+            let mut input = bytes(invalid);
+            assert!(parse_string(&mut input).is_err(), "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn string_rejects_every_unescaped_control_byte() {
+        for control in 0x00..=0x1F {
+            let mut fast_path = Bytes::from_source(vec![b'"', b'a', control, b'"']);
+            assert!(
+                parse_string(&mut fast_path).is_err(),
+                "fast path accepted control byte 0x{control:02X}"
+            );
+
+            let mut escaped_path = Bytes::from_source(vec![b'"', b'\\', b'n', control, b'"']);
+            assert!(
+                parse_string(&mut escaped_path).is_err(),
+                "escaped path accepted control byte 0x{control:02X}"
+            );
+        }
+
+        let mut escaped_controls = bytes(r#""\b\f\n\r\t\u0000""#);
+        assert_eq!(
+            parse_string(&mut escaped_controls).unwrap().as_ref(),
+            b"\x08\x0c\n\r\t\0"
+        );
     }
 
     #[test]
@@ -413,6 +573,55 @@ mod tests {
     fn f64_rejects_non_finite_shaped_and_parses_plain() {
         let mut b = bytes("3.5e2,");
         assert_eq!(parse_f64(&mut b).unwrap(), 350.0);
+
+        let mut overflow = bytes("1e999");
+        assert!(parse_f64(&mut overflow).is_err());
+    }
+
+    #[test]
+    fn number_accepts_exact_rfc_8259_grammar() {
+        for valid in [
+            "0", "-0", "1", "-1", "10", "0.25", "-0.25", "1e10", "1E+10", "1e-10", "0.0e0",
+        ] {
+            let source = format!("{valid},tail");
+            let mut input = bytes(&source);
+            let raw = parse_number(&mut input).unwrap();
+            assert_eq!(raw.as_ref(), valid.as_bytes(), "failed {valid:?}");
+            assert_eq!(input.as_ref(), b",tail");
+        }
+    }
+
+    #[test]
+    fn number_rejects_non_json_forms_without_advancing() {
+        for invalid in [
+            "+1", ".1", "-", "01", "-01", "1.", "1e", "1E+", "1e-", "--1", "1+2", "1e2e3", "NaN",
+            "Infinity",
+        ] {
+            let mut input = bytes(invalid);
+            let before = input.clone();
+            assert!(parse_number(&mut input).is_err(), "accepted {invalid:?}");
+            assert_eq!(input, before, "advanced on {invalid:?}");
+        }
+
+        for invalid in ["[01]", "[-01]", "[1.]", "[1e]", "[+1]"] {
+            let mut input = bytes(invalid);
+            assert!(skip_value(&mut input).is_err(), "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn take_value_returns_an_exact_zero_copy_slice() {
+        let mut input = bytes(r#"{"a": [1, 2], "s":"x\\ny"},tail"#);
+        let source_ptr = input.as_ptr();
+        let value = take_value(&mut input).unwrap();
+        assert_eq!(value.as_ref(), br#"{"a": [1, 2], "s":"x\\ny"}"#);
+        assert_eq!(value.as_ptr(), source_ptr);
+        assert_eq!(input.as_ref(), b",tail");
+
+        let mut invalid = bytes("[01],tail");
+        let before = invalid.clone();
+        assert!(take_value(&mut invalid).is_err());
+        assert_eq!(invalid, before);
     }
 
     #[test]
@@ -472,6 +681,11 @@ mod tests {
         assert_eq!(keys, vec!["a", "b"]);
         skip_ws(&mut b);
         assert_eq!(b.peek_token(), None);
+
+        for non_json_whitespace in [b'\x0b', b'\x0c'] {
+            let mut invalid = Bytes::from_source(vec![b'{', non_json_whitespace, b'}']);
+            assert!(object(&mut invalid, (), |(), _key, value| { skip_value(value) }).is_err());
+        }
     }
 
     #[test]
@@ -524,5 +738,10 @@ mod tests {
             object(&mut missing_colon, (), |(), _k, v| skip_value(v)),
             Err(ScanError::Syntax(_))
         ));
+
+        for invalid in ["truex", "false0", "nullnull"] {
+            let mut value = bytes(invalid);
+            assert!(skip_value(&mut value).is_err(), "accepted {invalid:?}");
+        }
     }
 }

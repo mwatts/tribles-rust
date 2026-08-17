@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The reusable JSON scanner now enforces RFC 8259 scalar syntax.** Its
+  mmap-friendly `anybytes::Bytes` string parser decodes UTF-16 surrogate pairs,
+  rejects lone surrogates and all unescaped control bytes, and its zero-copy
+  number parser rejects leading zeroes and incomplete fractions or exponents.
+  The new `take_value` primitive returns an exact borrowed slice for one nested
+  value, allowing source adapters to retain raw evidence without materializing
+  a `serde_json::Value` tree.
 - **Mutable pin stores now forward through ordinary mutable borrows.**
   `&mut S` implements `PinStore` whenever `S` does, matching the existing
   `BlobStore`, `CollectionStore`, and `StorageFlush` forwarding surfaces and
