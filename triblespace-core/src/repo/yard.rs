@@ -1205,6 +1205,20 @@ impl BlobStoreList for YardReader {
             .iter()
             .any(|generation| generation.live.get(&handle.raw).is_some()))
     }
+
+    fn blob_info<S>(&self, handle: Inline<Handle<S>>) -> Result<Option<BlobInfo>, Self::Err>
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding,
+    {
+        let handle: Inline<Handle<UnknownBlob>> = handle.transmute();
+        Ok(self.generations.iter().find_map(|generation| {
+            generation
+                .live
+                .get(&handle.raw)
+                .and_then(|_| generation.reader.unvalidated_blob_info(handle))
+        }))
+    }
 }
 
 pub struct YardListIter {
@@ -1220,7 +1234,7 @@ impl Iterator for YardListIter {
         let info = self
             .generations
             .iter()
-            .find_map(|generation| generation.reader.blob_info(handle))
+            .find_map(|generation| generation.reader.unvalidated_blob_info(handle))
             .expect("live Yard handle must resolve in one generation snapshot");
         Some(Ok(info))
     }

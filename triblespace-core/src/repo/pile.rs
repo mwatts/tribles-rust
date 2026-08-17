@@ -1718,7 +1718,10 @@ impl PileReader {
     ///
     /// This reads only the already-accepted pile record header. Callers that
     /// consume the payload must still use [`BlobStoreGet::get`].
-    pub(crate) fn blob_info(&self, handle: Inline<Handle<UnknownBlob>>) -> Option<super::BlobInfo> {
+    pub(crate) fn unvalidated_blob_info(
+        &self,
+        handle: Inline<Handle<UnknownBlob>>,
+    ) -> Option<super::BlobInfo> {
         let hash: &Inline<Hash<Blake3>> = handle.as_transmute();
         let entry = *self.blobs.get(&hash.raw)?;
         let header = indexed_blob_header(&self.mmap, self.covered_len, entry, hash);
@@ -2485,7 +2488,7 @@ impl Iterator for PileBlobStoreListIter {
         let key = self.inner.next()?;
         let hash = Inline::<Hash<Blake3>>::new(key);
         let handle = hash.into();
-        Some(Ok(self.reader.blob_info(handle).expect(
+        Some(Ok(self.reader.unvalidated_blob_info(handle).expect(
             "key from PATCH iterator must resolve in the same snapshot",
         )))
     }
@@ -2508,6 +2511,14 @@ impl BlobStoreList for PileReader {
         Handle<S>: InlineEncoding,
     {
         Ok(self.blobs.get(&handle.raw).is_some())
+    }
+
+    fn blob_info<S>(&self, handle: Inline<Handle<S>>) -> Result<Option<super::BlobInfo>, Self::Err>
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding,
+    {
+        Ok(self.unvalidated_blob_info(*handle.as_transmute()))
     }
 
     /// Cheap PATCH-level set difference between two immutable reader snapshots.
@@ -5762,6 +5773,29 @@ mod tests {
             .collect();
         assert!(empty.is_empty());
 
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn keyed_blob_info_reports_index_length_without_payload_access() {
+        use crate::repo::BlobStoreList;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "pile.pile");
+        let mut pile = Pile::open(&path).unwrap();
+        let handle = pile
+            .put::<UnknownBlob, _>(Blob::<UnknownBlob>::new(Bytes::from_source(vec![7u8; 13])))
+            .unwrap();
+        let reader = pile.reader().unwrap();
+
+        let info = BlobStoreList::blob_info(&reader, handle)
+            .unwrap()
+            .expect("stored blob has keyed information");
+        assert_eq!(info.handle, handle);
+        assert_eq!(info.length, 13);
+
+        let absent = Inline::<Handle<UnknownBlob>>::new([0xA5; 32]);
+        assert!(BlobStoreList::blob_info(&reader, absent).unwrap().is_none());
         pile.close().unwrap();
     }
 

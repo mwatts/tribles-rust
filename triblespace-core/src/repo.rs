@@ -329,6 +329,28 @@ pub trait BlobStoreList {
         Ok(false)
     }
 
+    /// Return lightweight, unvalidated storage information for one resident
+    /// blob without reading or hashing its payload.
+    ///
+    /// This is an observation of the store index, just like
+    /// [`contains_blob`](Self::contains_blob). Consumers that use the payload
+    /// must still call [`BlobStoreGet::get`], which validates the recorded
+    /// content address. Indexed stores should override this method with their
+    /// native lookup; the default remains correct for list-only backends.
+    fn blob_info<S>(&self, handle: Inline<Handle<S>>) -> Result<Option<BlobInfo>, Self::Err>
+    where
+        S: BlobEncoding + 'static,
+        Handle<S>: InlineEncoding,
+    {
+        for info in self.blobs() {
+            let info = info?;
+            if info.handle.raw == handle.raw {
+                return Ok(Some(info));
+            }
+        }
+        Ok(None)
+    }
+
     /// Lists blobs in `self` that are not in `old`.
     ///
     /// Backends with true snapshot semantics (e.g. [`Pile`],
