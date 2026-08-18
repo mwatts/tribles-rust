@@ -94,7 +94,12 @@ pub use crate::repo::BlobStorePut;
 pub use crate::repo::Checkout;
 pub use crate::repo::CommitHandle;
 pub use crate::repo::CommitSet;
+// Legacy, and still in the prelude so existing consumers keep compiling. Both
+// should leave the prelude once the remaining migration paths are gone --
+// re-exporting a deprecated surface by default is why nobody notices it.
+#[allow(deprecated)]
 pub use crate::repo::PinStore;
+#[allow(deprecated)]
 pub use crate::repo::Repository;
 pub use crate::repo::StorageFlush;
 pub use crate::repo::WantRequest;

@@ -8,3 +8,8 @@ proptest-regressions
 flamegraph*
 triblespace-net/img/
 self.key
+
+# Generated WASM value-formatter cache (built, never authored).
+target-relations/
+# Agent worktrees; these are separate git checkouts, not content.
+.claude/worktrees/

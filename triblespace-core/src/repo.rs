@@ -78,6 +78,8 @@
 //! }
 //! ```
 //!
+
+#![allow(deprecated)] // this module IS the legacy surface; the warning is for consumers
 //! For convenience `Repository::push` is provided as a retrying wrapper that
 //! performs the merge-and-retry loop for you. Call `push` when you prefer the
 //! repository to handle conflicts automatically; call `try_push` when you need
@@ -761,6 +763,18 @@ mod pin_snapshot_source_tests {
 /// single mutable pointer per pin. The update operation uses
 /// compare-and-swap semantics so multiple writers can coordinate
 /// without locks.
+/// # LEGACY
+///
+/// `PinStore` is the pre-`Collection` storage model and is retained for reading
+/// and migrating existing piles, not for new work. It carries the system's one
+/// piece of mutable, non-monotonic state — a named pointer updated by
+/// compare-and-swap — which is precisely what `Collection` removes: a collection
+/// discovers its commits by scope and folds them by set union, so there is no
+/// pointer to contend over and no CAS to lose.
+///
+/// New code should use [`crate::collection::Collection`]. Anything still using
+/// this trait is either legacy-pile migration or has not been cut over yet.
+#[deprecated(note = "legacy pre-Collection storage; use crate::collection::Collection. Retained for reading and migrating existing piles.")]
 pub trait PinStore {
     /// Error type for listing pins.
     type PinsError: Error + Debug + Send + Sync + 'static;
@@ -1478,6 +1492,14 @@ where
 /// The [`Repository`] type exposes convenience methods for creating branches,
 /// committing data and pushing changes while delegating actual storage to the
 /// given [`BlobStore`] and [`PinStore`] implementations.
+/// # LEGACY
+///
+/// `Repository` is the pre-`Collection` model: branches over a [`PinStore`],
+/// with a mutable head per branch. It is retained so existing piles remain
+/// readable and migratable. New work belongs in
+/// [`crate::collection::Collection`], which needs no mutable head — see the
+/// LEGACY note on [`PinStore`] for why that difference matters.
+#[deprecated(note = "legacy pre-Collection branch model; use crate::collection::Collection. Retained for reading and migrating existing piles.")]
 pub struct Repository<Storage: BlobStore + PinStore> {
     storage: Storage,
     signing_key: SigningKey,
