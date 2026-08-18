@@ -255,12 +255,30 @@ These two forms intentionally have different ownership types. An explicit
 subject must be supplied as an [`ExclusiveId`](triblespace::core::id::ExclusiveId),
 which is the capability to add facts to that extrinsic identity. An intrinsic
 entity instead exports its reproducible root as a plain
-[`Id`](triblespace::core::id::Id). Its defining rows are exactly the rows that
-participated in the hash; constructing it does not mint, acquire, or register
-an `ExclusiveId`. Turning that root into an `ExclusiveId` merely to append
-unhashed facts would break the content-addressed meaning of the root. Choose an
-explicit subject from the beginning when an entity needs to grow independently
-of its current facts.
+[`Id`](triblespace::core::id::Id).
+
+The rows that participated in the hash are the entity's **core**: the minimal
+subset of facts that determines its identity. Everything else attached to it is
+**annotation** — facts that describe without defining. Annotating a core-derived
+entity is the ordinary case, not a violation: core fields determine the id, but
+the id does not determine the entity's facts. An entity that acquires facts over
+time is normal and needs no special treatment.
+
+What the core must not become is a channel. **Derivation exists to make
+idempotence easy, and for nothing else. It must never encode meaning.** The test
+is mechanical:
+
+> Replace a derived id with a fresh `genid`. Everything must still work, except
+> idempotence.
+
+If anything else breaks, meaning has leaked into the id and the code is reading
+it back out — recomputing an id to look a thing up, or comparing a stored id
+against a re-derivation to check it. Both are hash joins wearing an `Id`, and
+both mean the entity they name was never written down. Write the entity, query
+it by its facts, and let the id go back to being a convenience.
+
+Re-deriving an id in order to *validate* it is a migration tool. In steady-state
+code it is a sign that the id has become load-bearing.
 
 This canonical-row protocol deliberately defines a new intrinsic-identity
 epoch relative to the historical hash of concatenated `attribute || value`
