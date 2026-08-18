@@ -64,6 +64,7 @@ pub use crate::metadata::{Describe, MetaDescribe};
 pub use crate::or;
 pub use crate::query::exists;
 pub use crate::query::find;
+pub use crate::query::frontier::latest;
 pub use crate::query::intersectionconstraint::and;
 pub use crate::query::intersectionconstraint::IntersectionConstraint;
 pub use crate::query::rangeconstraint::{value_range, InlineRange};

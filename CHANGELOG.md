@@ -221,6 +221,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`latest` resolves the frontier of any observation DAG.**
+  `triblespace::core::query::frontier::latest(facts, observes, candidates)`
+  (re-exported from the prelude) returns the candidates no entity in `facts`
+  observes over the given attribute — the maximal states of a
+  successor-to-predecessor DAG such as `metadata::supersedes`. The attribute is
+  a parameter, not a constant, and the source is any `TriblePattern`, so a
+  commit-set view answers for its own frame: there is no global "current", only
+  `latest(C)`. The map is a join homomorphism from the commit-set lattice
+  (union) to the antichain lattice ordered by domination, which is why head
+  resolution reads as non-monotone only when it is evaluated in the inclusion
+  lattice. The predicate `s is maximal in C ⟺ no state in C observes s` is
+  local: immediate edges suffice, no transitive closure and no vector clock are
+  needed, and it compiles to one short-circuited reverse-index probe per
+  candidate.
+
 - **Owned collections expose record-only authority tickets.**
   `Collection::ticket()` returns the exact strictly verified commits signed by
   the facade's key for its canonical descriptor, ordered by intrinsic record

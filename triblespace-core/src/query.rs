@@ -19,6 +19,8 @@
 pub mod constantconstraint;
 /// [`EqualityConstraint`](equalityconstraint::EqualityConstraint) — constrains two variables to have the same value.
 pub mod equalityconstraint;
+/// [`latest`](frontier::latest) — the maximal states of an observation DAG.
+pub mod frontier;
 /// Shared finite continuation for immutable, ordered single-variable sources.
 #[doc(hidden)]
 /// [`KeysConstraint`](hashmapconstraint::KeysConstraint) — constrains a variable to HashMap keys.

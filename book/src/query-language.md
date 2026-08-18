@@ -517,6 +517,52 @@ The [Query Engine](query-engine.md#the-constraint-protocol) chapter explains the
 protocol, the search that drives it, and the reasoning behind these rules in
 detail.
 
+## Frontiers (`latest`)
+
+A recurring modelling shape is *the same thing, changing over time*: a set of
+immutable states, each naming the states it observed, with reads wanting the
+ones nothing has moved past yet. Because the observer owns the identifier it
+writes under (see [Direction and consistency](deep-dive/trible-structure.md)),
+the edge always runs successor-to-predecessor — "I observed that" is a claim
+about your own new entity, whereas "I replace that" would be a claim about
+someone else's. `metadata::supersedes` is the published attribute for it.
+
+The question "which states are current" is answered by *absence*, which the
+monotone engine cannot state as a constraint. It is nevertheless a lawful
+lattice operation, and it lives in the query layer as
+[`latest`](triblespace::core::query::frontier::latest):
+
+```rust,ignore
+use triblespace::prelude::*;
+use triblespace::core::metadata;
+
+let heads = latest(&facts, metadata::supersedes.id(), candidates);
+```
+
+Three things are worth stating explicitly, because each one is a place where
+designs usually go wrong:
+
+- **There is no global "current".** There is a current state *for a given set
+  of commits*, which is exactly what a collection view is. Two readers holding
+  different commit sets legitimately disagree, and that is frame-relativity,
+  not a consistency bug. The `facts` argument is that frame.
+- **It is monotone, in the right lattice.** `latest` maps the commit-set
+  lattice (joined by union) into the antichain lattice ordered by domination
+  (joined by taking the maximal elements of the union), and
+  `latest(C₁ ∪ C₂) = latest(C₁) ⊔ latest(C₂)`. Head resolution looks
+  non-monotone only when it is evaluated in the *inclusion* lattice, where a
+  new successor shrinks the answer; under domination a taller element absorbing
+  a shorter one **is** the join.
+- **The predicate is local.** `s` is maximal in `C` exactly when no state in
+  `C` observes `s` — note "in `C`", not "in the frontier". Anything that
+  observes `s` already dominates it, so immediate edges suffice: no transitive
+  closure, no reachability query, and no vector clock. Each candidate costs one
+  short-circuited reverse-index probe, and the answer cannot depend on the order
+  states arrived in.
+
+The answer is a set. Concurrent states are a genuine fork, and collapsing them
+to one would invent an order the data does not have.
+
 ## Recursive traversal
 
 Queries in this chapter all have a fixed number of clauses, which means a fixed
