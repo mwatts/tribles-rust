@@ -15,6 +15,9 @@ pub mod exact_derived;
 pub mod exact_target_compaction;
 /// Orthogonal grow-only publication grants for collection commits.
 pub mod gossip;
+/// Maintained observed-set projection — the monotone half of register
+/// resolution, derived and joined by the store.
+pub mod observed_union;
 pub mod records;
 /// Stateless semantic admission, closure, provenance, and physical-cover view.
 pub mod resolution;

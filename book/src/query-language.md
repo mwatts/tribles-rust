@@ -563,6 +563,95 @@ designs usually go wrong:
 The answer is a set. Concurrent states are a genuine fork, and collapsing them
 to one would invent an order the data does not have.
 
+### Registers: the general form
+
+`latest` hard-codes two choices — order by the observation edge, report the
+whole antichain — and both are parameters in
+[`query::register`](triblespace::core::query::register). `latest` is now just
+the unscoped multi-value reading of that substrate.
+
+The useful thing to see first is that a *resolution policy* is not a second
+knob beside the order. It **is** a choice of order:
+
+| policy | is |
+|---|---|
+| multi-value | the maximal set under a **partial** order |
+| last-write-wins | the maximal set under a **total** order |
+| first-write-wins | the maximal set under that order **reversed** |
+| named by the reader | the maximal set under the **empty** order |
+
+There is one operation — take the maximal elements — and `sole` is a *check*
+that the order left exactly one, never a tie-break that invents one.
+
+Three axes are parameterised:
+
+- **Order.** `ObservationOrder` reads the DAG, as `latest` does. `StatedOrder`
+  compares a stated key by value among states sharing a group — a wall-clock
+  timestamp, a counter, a version number. Keys are compared as raw inline
+  bytes, which is value order exactly when the encoding is order-preserving
+  (`NsTAIInterval`, `I256BE`, `ROrd256` — deliberately *not* `R256`); this is
+  the same contract [`value_range`] carries, and the wide half of every
+  comparison is pushed into the engine through it.
+- **End.** `.first()` resolves to the minimum. `min` is the join of the
+  opposite order, so first-write-wins is as lawful a derivation as
+  last-write-wins.
+- **Observer scope.** By default *anything* in the frame may dominate. That is
+  the widest reading and often not the wanted one: `.within(attr)` admits only
+  states sharing the candidate's value for `attr`, and `.among(attr, value)`
+  only states asserting a given fact. Scoping the *candidates* cannot substitute
+  for this, because an observer need not be a candidate — which is precisely
+  what makes the unscoped form correct for a supersedes DAG and wrong for a
+  timestamped event log, where notes and status events hang off the same
+  subject and all carry a clock.
+
+An order composes into a query directly. `maximal` is a filter-only constraint:
+it estimates `usize::MAX` so the planner always sorts it last and a `pattern!`
+proposes the scope, which is what relieves the caller of materialising
+candidates.
+
+```rust,ignore
+use triblespace::prelude::*;
+
+let order = StatedOrder::<_, inlineencodings::NsTAIInterval>::new(
+    &facts, board::task.id(), metadata::created_at.id(),
+)
+.tiebreak_by_id()
+.among(metadata::tag.id(), KIND_STATUS.to_inline());
+
+let current: Vec<Id> = find!(
+    event: Id,
+    and!(
+        pattern!(&facts, [{ ?event @ board::task: &goal }]),
+        maximal(event, &order),
+    )
+).collect();
+```
+
+When an exact cardinality is wanted instead — so the planner can order *around*
+resolution rather than after it — materialise with `resolve` and propose from a
+`SortedSlice`, whose estimate is the resolved count itself.
+
+### The maintained form
+
+[`collection::observed_union`](triblespace::core::collection::observed_union) is
+the same resolution as an exact derived collection, for readers that would
+otherwise pay a probe per candidate on every read.
+
+It maintains the set of *observed* states rather than the frontier, and the
+asymmetry is the whole point. The frontier is antitone in the inclusion lattice
+the store runs on — a new commit can remove a member — so a derive producing it
+would not be lawful. Its complement only ever grows:
+
+```text
+observed(C₁ ∪ C₂) = observed(C₁) ∪ observed(C₂)
+```
+
+which is a join homomorphism into a plain union lattice. **The store maintains
+what accumulates; the reader performs what negates**, by subtracting, in its own
+frame — where the light-cone argument says currency belongs anyway. The
+resulting `ObservedIndex` implements the same `RegisterOrder` trait, so moving a
+call from live probes to the maintained index changes its cost and nothing else.
+
 ## Recursive traversal
 
 Queries in this chapter all have a fixed number of clauses, which means a fixed

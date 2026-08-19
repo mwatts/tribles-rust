@@ -1,5 +1,14 @@
 //! `latest` — the maximal states of an observation DAG.
 //!
+//! This is the unscoped, multi-value reading of a register:
+//! [`resolve`](crate::query::register::resolve) over an
+//! [`ObservationOrder`](crate::query::register::ObservationOrder). It is
+//! kept as a named function because it is the reading nearly every caller
+//! wants and the one the live pile is gated on; see
+//! [`register`](crate::query::register) for the orders that are not this
+//! one — a stated key (last- or first-write-wins), a narrowed observer
+//! set, or no order at all.
+//!
 //! Many designs model *the same thing, changing over time* as a set of
 //! immutable states, each naming the states it **observed**. Those edges are
 //! the causal order, and reads want the states nothing has moved past yet:
@@ -77,10 +86,8 @@
 use std::collections::BTreeSet;
 
 use crate::id::Id;
-use crate::inline::encodings::genid::GenId;
-use crate::inline::Inline;
-use crate::inline::IntoInline;
-use crate::query::{exists, temp, TriblePattern};
+use crate::query::register::{resolve, ObservationOrder};
+use crate::query::TriblePattern;
 
 /// The maximal elements of `candidates` under the observation DAG named by
 /// `observes`.
@@ -105,24 +112,7 @@ pub fn latest<P>(facts: &P, observes: Id, candidates: impl IntoIterator<Item = I
 where
     P: TriblePattern,
 {
-    let observes = observes.to_inline();
-    candidates
-        .into_iter()
-        .filter(|candidate| !is_observed(facts, observes, *candidate))
-        .collect()
-}
-
-/// Whether anything in `facts` observes `candidate` over the `observes`
-/// attribute — one reverse-index probe, short-circuited at the first witness.
-fn is_observed<P>(facts: &P, observes: Inline<GenId>, candidate: Id) -> bool
-where
-    P: TriblePattern,
-{
-    let candidate: Inline<GenId> = candidate.to_inline();
-    exists!(temp!(
-        (observer),
-        facts.pattern(observer, observes, candidate)
-    ))
+    resolve(&ObservationOrder::new(facts, observes), candidates)
 }
 
 #[cfg(test)]
