@@ -921,11 +921,11 @@ mod tests {
             super::super::RANK9_LIFTED_UNION_RECIPE_V1_64_BE,
         ];
         assert_eq!(
-            current.representation(),
+            current.representation().unwrap(),
             <SuccinctArchiveRank9IndexBlob as MetaDescribe>::id(),
         );
         assert_eq!(
-            current.recipe(),
+            current.recipe().unwrap(),
             super::super::current_rank9_lifted_union_recipe(),
         );
         #[cfg(all(target_pointer_width = "32", target_endian = "little"))]
@@ -933,7 +933,7 @@ mod tests {
         #[cfg(all(target_pointer_width = "32", target_endian = "big"))]
         assert_eq!(current.recipe(), recipes[1]);
         #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
-        assert_eq!(current.recipe(), recipes[2]);
+        assert_eq!(current.recipe().unwrap(), recipes[2]);
         #[cfg(all(target_pointer_width = "64", target_endian = "big"))]
         assert_eq!(current.recipe(), recipes[3]);
         assert_ne!(current.recipe(), collection.descriptor().recipe());
@@ -958,7 +958,7 @@ mod tests {
             .unwrap();
         let wrong_recipe = recipes
             .into_iter()
-            .find(|recipe| *recipe != current.recipe())
+            .find(|recipe| *recipe != current.recipe().unwrap())
             .unwrap();
         let wrong_target = CollectionDescriptor::new(
             collection.scope(),

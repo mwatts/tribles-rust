@@ -16,6 +16,7 @@
 //! authority to construction records. `DERIVE` and `MERGE` remain unsigned,
 //! reproducible evidence.
 
+use super::records::RecordDecodeError;
 use std::error::Error;
 use std::fmt;
 
@@ -129,6 +130,8 @@ impl fmt::Display for ElementRole {
 /// Failure to validate the canonical raw SuccinctArchive collection law.
 #[derive(Debug)]
 pub enum SuccinctArchiveUnionValidationError {
+    /// The descriptor does not carry a field this check needs.
+    Malformed(RecordDecodeError),
     /// A descriptor names another blob representation.
     WrongRepresentation {
         /// Descriptor being checked.
@@ -185,6 +188,9 @@ pub enum SuccinctArchiveUnionValidationError {
 impl fmt::Display for SuccinctArchiveUnionValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Malformed(error) => {
+                write!(formatter, "malformed collection descriptor: {error}")
+            }
             Self::WrongRepresentation {
                 role,
                 expected,
@@ -301,10 +307,12 @@ pub fn validate_derive(
 ) -> Result<(), SuccinctArchiveUnionValidationError> {
     validate_source_descriptor(source_descriptor)?;
     validate_descriptor(target_descriptor)?;
-    if source_descriptor.scope() != target_descriptor.scope() {
+    let source_scope = source_descriptor.scope()?;
+    let target_scope = target_descriptor.scope()?;
+    if source_scope != target_scope {
         return Err(SuccinctArchiveUnionValidationError::ScopeMismatch {
-            source: source_descriptor.scope(),
-            target: target_descriptor.scope(),
+            source: source_scope,
+            target: target_scope,
         });
     }
     validate_collection(
@@ -385,18 +393,20 @@ fn validate_descriptor_parts(
     descriptor: &CollectionDescriptor,
     expected_representation: Id,
 ) -> Result<(), SuccinctArchiveUnionValidationError> {
-    if descriptor.representation() != expected_representation {
+    let representation = descriptor.representation()?;
+    if representation != expected_representation {
         return Err(SuccinctArchiveUnionValidationError::WrongRepresentation {
             role,
             expected: expected_representation,
-            actual: descriptor.representation(),
+            actual: representation,
         });
     }
-    if descriptor.recipe() != TRIBLE_SET_UNION_RECIPE_V1 {
+    let recipe = descriptor.recipe()?;
+    if recipe != TRIBLE_SET_UNION_RECIPE_V1 {
         return Err(SuccinctArchiveUnionValidationError::WrongRecipe {
             role,
             expected: TRIBLE_SET_UNION_RECIPE_V1,
-            actual: descriptor.recipe(),
+            actual: recipe,
         });
     }
     Ok(())
@@ -484,13 +494,13 @@ mod tests {
 
         assert_eq!(source.scope(), target.scope());
         assert_eq!(source.recipe(), target.recipe());
-        assert_eq!(target.recipe(), TRIBLE_SET_UNION_RECIPE_V1);
+        assert_eq!(target.recipe().unwrap(), TRIBLE_SET_UNION_RECIPE_V1);
         assert_eq!(
-            source.representation(),
+            source.representation().unwrap(),
             <SimpleArchive as MetaDescribe>::id()
         );
         assert_eq!(
-            target.representation(),
+            target.representation().unwrap(),
             <SuccinctArchiveBlob as MetaDescribe>::id()
         );
         assert_ne!(source.handle(), target.handle());
@@ -655,5 +665,11 @@ mod tests {
             ),
             Err(SuccinctArchiveUnionValidationError::WrongDeriveOutput)
         ));
+    }
+}
+
+impl From<RecordDecodeError> for SuccinctArchiveUnionValidationError {
+    fn from(error: RecordDecodeError) -> Self {
+        Self::Malformed(error)
     }
 }

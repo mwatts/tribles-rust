@@ -236,7 +236,7 @@ impl CollectionDescriptor {
     /// Construct a canonical `(scope, representation, recipe, tag)` descriptor.
     pub fn new(scope: Id, representation: Id, recipe: Id) -> Self {
         let fragment = collection_fragment(scope, representation, recipe);
-        Self::from_fragment(&fragment).expect("collection descriptor is canonical by construction")
+        Self::from_fragment(&fragment)
     }
 
     /// Adopt a descriptor authored by [`entity!`](crate::macros::entity).
@@ -247,14 +247,13 @@ impl CollectionDescriptor {
     /// fragment here. Those arguments are covered by the descriptor blob's
     /// hash and readable by anyone holding the pile, so two collections differ
     /// exactly when their scope, representation, recipe, or arguments differ.
-    pub fn from_fragment(fragment: &Fragment) -> Result<Self, RecordDecodeError> {
+    pub fn from_fragment(fragment: &Fragment) -> Self {
         Self::from_tribles(fragment.facts())
     }
 
     /// Decode an exact collection-descriptor archive without external lookups.
     pub fn decode(blob: &Blob<SimpleArchive>) -> Result<Self, RecordDecodeError> {
-        let facts = decode_archive(blob)?;
-        Self::from_tribles(&facts)
+        Ok(Self::from_tribles(&decode_archive(blob)?))
     }
 
     /// Decode an exact collection-descriptor entity from an already parsed set.
@@ -263,32 +262,18 @@ impl CollectionDescriptor {
     /// kept verbatim rather than remodelled, so a descriptor for a recipe this
     /// binary has never heard of still decodes, still answers questions about
     /// its scope and law, and still re-emits byte-for-byte on the way out.
-    pub fn from_tribles(facts: &TribleSet) -> Result<Self, RecordDecodeError> {
-        record_root_and_kind(facts, KIND_COLLECTION_DESCRIPTOR)?;
-        // Presence and uniqueness of the structural attributes.
-        one_id(facts, &collection_scope, "collection_scope")?;
-        one_id(
-            facts,
-            &collection_representation,
-            "collection_representation",
-        )?;
-        one_id(facts, &collection_recipe, "collection_recipe")?;
-        Ok(Self {
+    pub fn from_tribles(facts: &TribleSet) -> Self {
+        Self {
             facts: facts.clone(),
-        })
+        }
     }
 
     /// Intrinsic entity root inside the descriptor archive.
     ///
     /// This is not the collection identity carried by claims; use
     /// [`handle`](Self::handle) for that.
-    pub fn entity_id(&self) -> Id {
-        *self
-            .facts
-            .iter()
-            .next()
-            .expect("a decoded descriptor has facts")
-            .e()
+    pub fn entity_id(&self) -> Result<Id, RecordDecodeError> {
+        record_root_and_kind(&self.facts, KIND_COLLECTION_DESCRIPTOR)
     }
 
     /// Canonical content identity of this collection descriptor.
@@ -297,21 +282,25 @@ impl CollectionDescriptor {
     }
 
     /// Extrinsic dataset scope shared by related collections.
-    pub fn scope(&self) -> Id {
-        self.structural(&collection_scope)
+    pub fn scope(&self) -> Result<Id, RecordDecodeError> {
+        one_id(&self.facts, &collection_scope, "collection_scope")
     }
 
     /// Blob-representation descriptor id.
-    pub fn representation(&self) -> Id {
-        self.structural(&collection_representation)
+    pub fn representation(&self) -> Result<Id, RecordDecodeError> {
+        one_id(
+            &self.facts,
+            &collection_representation,
+            "collection_representation",
+        )
     }
 
     /// Canonical construction/merge recipe id.
     ///
     /// This names the *law*. Its arguments, if any, are the remaining
     /// attributes on the descriptor entity; see [`argument`](Self::argument).
-    pub fn recipe(&self) -> Id {
-        self.structural(&collection_recipe)
+    pub fn recipe(&self) -> Result<Id, RecordDecodeError> {
+        one_id(&self.facts, &collection_recipe, "collection_recipe")
     }
 
     /// Look up one recipe argument by attribute.
@@ -330,10 +319,6 @@ impl CollectionDescriptor {
         })
     }
 
-    fn structural(&self, attribute: &Attribute<GenId>) -> Id {
-        one_id(&self.facts, attribute, "collection descriptor attribute")
-            .expect("a decoded descriptor has its structural attributes")
-    }
 
     /// Reconstruct the exact one-root trible record.
     ///
@@ -977,7 +962,8 @@ mod tests {
         assert_ne!(a.handle(), c.handle());
         assert_ne!(a.handle(), d.handle());
         assert_eq!(CollectionDescriptor::decode(&a.to_blob()).unwrap(), a);
-        assert!(a.to_tribles().iter().all(|fact| fact.e() == &a.entity_id()));
+        let root = a.entity_id().unwrap();
+        assert!(a.to_tribles().iter().all(|fact| fact.e() == &root));
     }
 
     #[test]
@@ -1178,7 +1164,7 @@ mod tests {
 
         // Descriptor wire bytes are unchanged by the identity cutover.
         assert_eq!(
-            descriptor.entity_id(),
+            descriptor.entity_id().unwrap(),
             id_hex!("D28DF8A2FAAABEDCD2943FD73920EECD")
         );
         assert_eq!(

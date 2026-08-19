@@ -242,7 +242,6 @@ pub fn descriptor(scope: Id, observes: Id) -> CollectionDescriptor {
         register_observes: observes,
     };
     CollectionDescriptor::from_fragment(&fragment)
-        .expect("observed-union descriptor is canonical by construction")
 }
 
 /// The observed-union law.

@@ -221,12 +221,12 @@ fn run_list(path: PathBuf, metadata: bool) -> Result<()> {
                 Fields::Decoded(descriptor) => {
                     print!(
                         "  scope={:X}  representation={}  recipe={}",
-                        descriptor.scope(),
+                        descriptor.scope()?,
                         named_id(
-                            descriptor.representation(),
-                            representation_name(descriptor.representation())
+                            descriptor.representation()?,
+                            representation_name(descriptor.representation()?)
                         ),
-                        named_id(descriptor.recipe(), recipe_name(descriptor.recipe())),
+                        named_id(descriptor.recipe()?, recipe_name(descriptor.recipe()?)),
                     );
                 }
                 Fields::Missing => print!("  <descriptor blob not in pile>"),
@@ -292,18 +292,18 @@ fn run_show(path: PathBuf, handle: String) -> Result<()> {
 
         let descriptor = CollectionDescriptor::decode(&blob)
             .map_err(|e| anyhow!("decode collection descriptor: {e:?}"))?;
-        println!("entity id:      {:X}", descriptor.entity_id());
-        println!("scope:          {:X}", descriptor.scope());
+        println!("entity id:      {:X}", descriptor.entity_id()?);
+        println!("scope:          {:X}", descriptor.scope()?);
         println!(
             "representation: {}",
             named_id(
-                descriptor.representation(),
-                representation_name(descriptor.representation())
+                descriptor.representation()?,
+                representation_name(descriptor.representation()?)
             )
         );
         println!(
             "recipe:         {}",
-            named_id(descriptor.recipe(), recipe_name(descriptor.recipe()))
+            named_id(descriptor.recipe()?, recipe_name(descriptor.recipe()?))
         );
 
         let facts: TribleSet = reader
@@ -389,7 +389,7 @@ mod tests {
         );
         assert_ne!(
             handle.raw[..16],
-            <[u8; 16]>::from(descriptor.entity_id())[..],
+            <[u8; 16]>::from(descriptor.entity_id().unwrap())[..],
             "identity is the blob hash, not the intrinsic entity id"
         );
 
@@ -398,10 +398,10 @@ mod tests {
         assert_eq!(blob.bytes.len(), 256, "four tribles at 64 bytes each");
 
         let decoded = CollectionDescriptor::decode(&blob).expect("decode descriptor");
-        assert_eq!(decoded.scope(), scope);
-        assert_eq!(decoded.representation(), representation);
-        assert_eq!(decoded.recipe(), TRIBLE_SET_UNION_RECIPE_V1);
-        assert_eq!(decoded.entity_id(), descriptor.entity_id());
+        assert_eq!(decoded.scope().unwrap(), scope);
+        assert_eq!(decoded.representation().unwrap(), representation);
+        assert_eq!(decoded.recipe().unwrap(), TRIBLE_SET_UNION_RECIPE_V1);
+        assert_eq!(decoded.entity_id().unwrap(), descriptor.entity_id().unwrap());
 
         // The trible dump `show` prints comes from the same bytes.
         let facts: TribleSet = reader
@@ -411,7 +411,7 @@ mod tests {
         let entities: BTreeSet<Id> = facts.iter().map(|t| *t.e()).collect();
         assert_eq!(
             entities,
-            BTreeSet::from([descriptor.entity_id()]),
+            BTreeSet::from([descriptor.entity_id().unwrap()]),
             "all four tribles hang off one intrinsic entity"
         );
     }

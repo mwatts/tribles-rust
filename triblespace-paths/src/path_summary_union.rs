@@ -111,6 +111,8 @@ impl Error for PathSummaryUnionError {
 /// Failure to validate the canonical path-summary collection law.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PathSummaryUnionValidationError {
+    /// The descriptor does not carry a field this check needs.
+    Malformed(triblespace_core::collection::records::RecordDecodeError),
     /// A descriptor names another blob representation.
     WrongRepresentation {
         /// Descriptor being checked.
@@ -167,6 +169,9 @@ pub enum PathSummaryUnionValidationError {
 impl fmt::Display for PathSummaryUnionValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Malformed(error) => {
+                write!(formatter, "malformed collection descriptor: {error}")
+            }
             Self::WrongRepresentation {
                 role,
                 expected,
@@ -291,10 +296,12 @@ pub fn validate_derive(
 ) -> Result<(), PathSummaryUnionValidationError> {
     validate_source_descriptor(source_descriptor)?;
     validate_target_descriptor(target_descriptor, automaton)?;
-    if source_descriptor.scope() != target_descriptor.scope() {
+    let source_scope = source_descriptor.scope()?;
+    let target_scope = target_descriptor.scope()?;
+    if source_scope != target_scope {
         return Err(PathSummaryUnionValidationError::ScopeMismatch {
-            source: source_descriptor.scope(),
-            target: target_descriptor.scope(),
+            source: source_scope,
+            target: target_scope,
         });
     }
     validate_collection(
@@ -380,18 +387,20 @@ fn validate_descriptor_parts(
     expected_representation: Id,
     expected_recipe: Id,
 ) -> Result<(), PathSummaryUnionValidationError> {
-    if collection_descriptor.representation() != expected_representation {
+    let representation = collection_descriptor.representation()?;
+    if representation != expected_representation {
         return Err(PathSummaryUnionValidationError::WrongRepresentation {
             role,
             expected: expected_representation,
-            actual: collection_descriptor.representation(),
+            actual: representation,
         });
     }
-    if collection_descriptor.recipe() != expected_recipe {
+    let recipe = collection_descriptor.recipe()?;
+    if recipe != expected_recipe {
         return Err(PathSummaryUnionValidationError::WrongRecipe {
             role,
             expected: expected_recipe,
-            actual: collection_descriptor.recipe(),
+            actual: recipe,
         });
     }
     Ok(())
@@ -500,7 +509,7 @@ mod tests {
         assert_eq!(first, repeated);
         assert_eq!(first.scope(), source.scope());
         assert_eq!(
-            first.representation(),
+            first.representation().unwrap(),
             <PathSummaryBlob as MetaDescribe>::id()
         );
         assert_ne!(first.representation(), source.representation());
@@ -782,5 +791,13 @@ mod tests {
             ),
             Err(PathSummaryUnionValidationError::WrongMergeResult)
         ));
+    }
+}
+
+impl From<triblespace_core::collection::records::RecordDecodeError>
+    for PathSummaryUnionValidationError
+{
+    fn from(error: triblespace_core::collection::records::RecordDecodeError) -> Self {
+        Self::Malformed(error)
     }
 }

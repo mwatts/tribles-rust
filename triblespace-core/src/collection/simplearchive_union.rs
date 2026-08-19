@@ -16,6 +16,7 @@
 //! equation until its three blobs are resident, then call
 //! [`validate_merge`](crate::collection::simplearchive_union::validate_merge).
 
+use super::records::RecordDecodeError;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::convert::Infallible;
@@ -80,6 +81,8 @@ impl fmt::Display for ElementRole {
 /// Failure to validate a commit or merge against this concrete collection kind.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SimpleArchiveUnionValidationError {
+    /// The descriptor does not carry a field this check needs.
+    Malformed(RecordDecodeError),
     /// The descriptor names another blob representation.
     WrongRepresentation { expected: Id, actual: Id },
     /// The descriptor names another semantic recipe.
@@ -107,6 +110,7 @@ pub enum SimpleArchiveUnionValidationError {
 impl fmt::Display for SimpleArchiveUnionValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Malformed(error) => write!(f, "malformed collection descriptor: {error}"),
             Self::WrongRepresentation { expected, actual } => write!(
                 f,
                 "collection representation {actual:X} does not match SimpleArchive {expected:X}"
@@ -729,16 +733,18 @@ fn validate_descriptor(
     descriptor: &CollectionDescriptor,
 ) -> Result<(), SimpleArchiveUnionValidationError> {
     let expected_representation = <SimpleArchive as MetaDescribe>::id();
-    if descriptor.representation() != expected_representation {
+    let representation = descriptor.representation()?;
+    if representation != expected_representation {
         return Err(SimpleArchiveUnionValidationError::WrongRepresentation {
             expected: expected_representation,
-            actual: descriptor.representation(),
+            actual: representation,
         });
     }
-    if descriptor.recipe() != TRIBLE_SET_UNION_RECIPE_V1 {
+    let recipe = descriptor.recipe()?;
+    if recipe != TRIBLE_SET_UNION_RECIPE_V1 {
         return Err(SimpleArchiveUnionValidationError::WrongRecipe {
             expected: TRIBLE_SET_UNION_RECIPE_V1,
-            actual: descriptor.recipe(),
+            actual: recipe,
         });
     }
     Ok(())
@@ -1587,7 +1593,7 @@ mod tests {
         let (descriptor, data_blob, metadata, signing_key, _) = commit_fixture();
         let mut store = ProbeStore::default();
         let wrong_descriptor =
-            CollectionDescriptor::new(descriptor.scope(), id(8), TRIBLE_SET_UNION_RECIPE_V1);
+            CollectionDescriptor::new(descriptor.scope().unwrap(), id(8), TRIBLE_SET_UNION_RECIPE_V1);
         assert!(matches!(
             publish_commit(
                 &mut store,
@@ -1751,9 +1757,9 @@ mod tests {
             TRIBLE_SET_UNION_RECIPE_V1,
             id_hex!("6D64C5F4B9E9B73F57C5F8702AB7FE45")
         );
-        assert_eq!(descriptor.scope(), id(1));
+        assert_eq!(descriptor.scope().unwrap(), id(1));
         assert_eq!(
-            descriptor.entity_id(),
+            descriptor.entity_id().unwrap(),
             id_hex!("4B6F24A289B950F2CF20896EAB7A1658")
         );
         assert_eq!(
@@ -1862,14 +1868,14 @@ mod tests {
         validate_commit(&descriptor, &commit, &blob).unwrap();
 
         let wrong_representation =
-            CollectionDescriptor::new(descriptor.scope(), id(9), TRIBLE_SET_UNION_RECIPE_V1);
+            CollectionDescriptor::new(descriptor.scope().unwrap(), id(9), TRIBLE_SET_UNION_RECIPE_V1);
         assert!(matches!(
             validate_commit(&wrong_representation, &commit, &blob),
             Err(SimpleArchiveUnionValidationError::WrongRepresentation { .. })
         ));
 
         let wrong_recipe = CollectionDescriptor::new(
-            descriptor.scope(),
+            descriptor.scope().unwrap(),
             <SimpleArchive as MetaDescribe>::id(),
             id(9),
         );
@@ -2080,5 +2086,11 @@ mod tests {
                 prop_assert_eq!(left_associated, right_associated);
             }
         }
+    }
+}
+
+impl From<RecordDecodeError> for SimpleArchiveUnionValidationError {
+    fn from(error: RecordDecodeError) -> Self {
+        Self::Malformed(error)
     }
 }

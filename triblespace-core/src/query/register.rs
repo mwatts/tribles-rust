@@ -999,7 +999,7 @@ mod tests {
                 register_identity: identity,
                 register_orders: order,
             };
-            CollectionDescriptor::from_fragment(&fragment).expect("canonical by construction")
+            CollectionDescriptor::from_fragment(&fragment)
         }
 
         let notes = describe(scope, representation, note_of.id(), note_at.id());
