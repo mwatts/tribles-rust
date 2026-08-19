@@ -3433,7 +3433,7 @@ mod tests {
     use std::time::UNIX_EPOCH;
     use tempfile;
 
-    use crate::collection::{empty_metadata_handle, CollectionDescriptor, CollectionId};
+    use crate::collection::{empty_metadata_handle, CollectionDescriptor, CollectionHandle};
     use crate::macros::entity;
     use crate::repo::lazy::Lazy;
     use crate::repo::yard::{Yard, YardCollectError, YardConfig, YardReclaimError};
@@ -3472,7 +3472,7 @@ mod tests {
         Inline::new([byte; 32])
     }
 
-    fn collection_test_collection(byte: u8) -> CollectionId {
+    fn collection_test_collection(byte: u8) -> CollectionHandle {
         Inline::new([byte; 32])
     }
 

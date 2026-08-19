@@ -15,7 +15,7 @@
 
 use anybytes::Bytes;
 use std::sync::mpsc;
-use triblespace_core::collection::CollectionId;
+use triblespace_core::collection::CollectionHandle;
 
 use crate::collection_wire::CollectionCommitEvidence;
 use crate::protocol::RawHash;
@@ -63,7 +63,7 @@ pub enum NetCommand {
     /// transport work; the synchronous `Peer` side owns admission policy.
     FetchCollectionEvidence {
         peer: PeerId,
-        collection: CollectionId,
+        collection: CollectionHandle,
         reply: mpsc::Sender<anyhow::Result<Vec<CollectionCommitEvidence>>>,
     },
     // The swarm-addressed read-miss fetch is no longer a command: it

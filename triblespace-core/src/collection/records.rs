@@ -92,7 +92,7 @@ pub type CollectionData = Inline<Hash<Blake3>>;
 /// The descriptor is an ordinary [`SimpleArchive`] blob. Claims carry this
 /// handle directly so their collection semantics can be recovered through
 /// ordinary blob resolution without a separate definition-record namespace.
-pub type CollectionId = Inline<Handle<SimpleArchive>>;
+pub type CollectionHandle = Inline<Handle<SimpleArchive>>;
 
 /// Version of the signed collection-commit transcript.
 pub const COMMIT_TRANSCRIPT_VERSION: u32 = 2;
@@ -225,7 +225,7 @@ impl Error for CommitVerificationError {}
 /// `scope` is an extrinsic dataset anchor shared by related
 /// representations. The descriptor entity has an intrinsic root, but the
 /// collection identity carried by claims is the descriptor blob's 32-byte
-/// [`CollectionId`]. Constructing a descriptor never manufactures an
+/// [`CollectionHandle`]. Constructing a descriptor never manufactures an
 /// [`crate::id::ExclusiveId`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollectionDescriptor {
@@ -277,7 +277,7 @@ impl CollectionDescriptor {
     }
 
     /// Canonical content identity of this collection descriptor.
-    pub fn handle(&self) -> CollectionId {
+    pub fn handle(&self) -> CollectionHandle {
         self.to_blob().get_handle()
     }
 
@@ -338,7 +338,7 @@ impl CollectionDescriptor {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CollectionCommit {
     id: Id,
-    collection: CollectionId,
+    collection: CollectionHandle,
     data: CollectionData,
     metadata: Inline<Handle<SimpleArchive>>,
     public_key: Inline<ED25519PublicKey>,
@@ -350,7 +350,7 @@ impl CollectionCommit {
     /// Sign a canonical `COMMIT(descriptor, data, metadata)` statement.
     pub fn sign(
         signing_key: &SigningKey,
-        collection: CollectionId,
+        collection: CollectionHandle,
         data_hash: CollectionData,
         metadata: Inline<Handle<SimpleArchive>>,
     ) -> Self {
@@ -368,7 +368,7 @@ impl CollectionCommit {
     }
 
     pub(crate) fn from_parts(
-        collection: CollectionId,
+        collection: CollectionHandle,
         data_hash: CollectionData,
         metadata: Inline<Handle<SimpleArchive>>,
         public_key: Inline<ED25519PublicKey>,
@@ -464,7 +464,7 @@ impl CollectionCommit {
     }
 
     /// Collection receiving the asserted member.
-    pub fn collection(&self) -> CollectionId {
+    pub fn collection(&self) -> CollectionHandle {
         self.collection
     }
 
@@ -505,7 +505,7 @@ impl CollectionCommit {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CollectionMerge {
     id: Id,
-    collection: CollectionId,
+    collection: CollectionHandle,
     low: CollectionData,
     high: CollectionData,
     result: CollectionData,
@@ -514,7 +514,7 @@ pub struct CollectionMerge {
 impl CollectionMerge {
     /// Construct a commutative merge record, sorting its two inputs by digest.
     pub fn new(
-        collection: CollectionId,
+        collection: CollectionHandle,
         mut left: CollectionData,
         mut right: CollectionData,
         result: CollectionData,
@@ -526,7 +526,7 @@ impl CollectionMerge {
     }
 
     fn from_ordered(
-        collection: CollectionId,
+        collection: CollectionHandle,
         low: CollectionData,
         high: CollectionData,
         result: CollectionData,
@@ -564,7 +564,7 @@ impl CollectionMerge {
     }
 
     /// Collection whose join law is asserted.
-    pub fn collection(&self) -> CollectionId {
+    pub fn collection(&self) -> CollectionHandle {
         self.collection
     }
 
@@ -589,8 +589,8 @@ impl CollectionMerge {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CollectionDerive {
     id: Id,
-    source: CollectionId,
-    target: CollectionId,
+    source: CollectionHandle,
+    target: CollectionHandle,
     input: CollectionData,
     output: CollectionData,
 }
@@ -598,8 +598,8 @@ pub struct CollectionDerive {
 impl CollectionDerive {
     /// Construct a canonical `DERIVE(source, target, input, output)` record.
     pub fn new(
-        source: CollectionId,
-        target: CollectionId,
+        source: CollectionHandle,
+        target: CollectionHandle,
         input: CollectionData,
         output: CollectionData,
     ) -> Self {
@@ -630,12 +630,12 @@ impl CollectionDerive {
     }
 
     /// Source collection.
-    pub fn source(&self) -> CollectionId {
+    pub fn source(&self) -> CollectionHandle {
         self.source
     }
 
     /// Target collection.
-    pub fn target(&self) -> CollectionId {
+    pub fn target(&self) -> CollectionHandle {
         self.target
     }
 
@@ -748,7 +748,7 @@ fn structural_attributes() -> [Id; 4] {
 
 
 fn commit_bytes(
-    collection: CollectionId,
+    collection: CollectionHandle,
     data_hash: CollectionData,
     metadata_handle: Inline<Handle<SimpleArchive>>,
     public_key: Inline<ED25519PublicKey>,
@@ -766,7 +766,7 @@ fn commit_bytes(
 }
 
 fn merge_bytes(
-    collection: CollectionId,
+    collection: CollectionHandle,
     low: CollectionData,
     high: CollectionData,
     result: CollectionData,
@@ -775,8 +775,8 @@ fn merge_bytes(
 }
 
 fn derive_bytes(
-    source: CollectionId,
-    target: CollectionId,
+    source: CollectionHandle,
+    target: CollectionHandle,
     input: CollectionData,
     output: CollectionData,
 ) -> [u8; COLLECTION_DERIVE_BYTES_LEN] {
@@ -828,7 +828,7 @@ fn tagged_bytes(kind: u8, payload: &[u8]) -> Vec<u8> {
 
 fn commit_transcript(
     public_key: Inline<ED25519PublicKey>,
-    collection: CollectionId,
+    collection: CollectionHandle,
     data_hash: CollectionData,
     metadata: Inline<Handle<SimpleArchive>>,
 ) -> [u8; COMMIT_TRANSCRIPT_LEN] {
@@ -874,6 +874,11 @@ fn record_root_and_kind(facts: &TribleSet, expected: Id) -> Result<Id, RecordDec
         return Err(RecordDecodeError::WrongKind { expected, actual });
     }
     Ok(root)
+}
+
+#[cfg(test)]
+pub(crate) fn one_id_for_test(facts: &TribleSet, attribute: &Attribute<GenId>) -> Id {
+    one_id(facts, attribute, "test").expect("present")
 }
 
 fn one_id(
@@ -944,7 +949,7 @@ mod tests {
         Inline::new([byte; 32])
     }
 
-    fn collection(byte: u8) -> CollectionId {
+    fn collection(byte: u8) -> CollectionHandle {
         Inline::new([byte; 32])
     }
 
@@ -1205,5 +1210,64 @@ mod tests {
             .to_vec()
         );
         commit.verify_strict().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod recipe_description_tests {
+    use crate::collection::observed_union::ObservedUnionV1;
+    use crate::collection::simplearchive_union::TribleSetUnionV1;
+    use crate::collection::succinctarchive_union::{
+        Rank9LiftedUnionV1_32Be, Rank9LiftedUnionV1_32Le, Rank9LiftedUnionV1_64Be,
+        Rank9LiftedUnionV1_64Le,
+    };
+    use crate::metadata::{self, MetaDescribe};
+    use crate::query::register::StatedOrderV1;
+
+    /// Every law describes itself, and the description is rooted at the id the
+    /// law was already minted under. A descriptor can therefore embed the
+    /// description without changing which law it names.
+    #[test]
+    fn every_recipe_describes_itself_under_its_own_id() {
+        fn check<L: MetaDescribe>(expected: crate::id::Id, name: &str) {
+            let fragment = <L as MetaDescribe>::describe();
+            assert_eq!(
+                <L as MetaDescribe>::id(),
+                expected,
+                "{name} describes itself under a different id than it was minted with"
+            );
+            let facts = fragment.facts();
+            let kind = crate::collection::records::one_id_for_test(&facts, &metadata::tag);
+            assert_eq!(
+                kind,
+                metadata::KIND_COLLECTION_RECIPE,
+                "{name} is not tagged as a collection recipe"
+            );
+        }
+        check::<TribleSetUnionV1>(
+            crate::collection::simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1,
+            "trible-set-union-v1",
+        );
+        check::<ObservedUnionV1>(
+            crate::collection::observed_union::OBSERVED_UNION_RECIPE_V1,
+            "observed-union-v1",
+        );
+        check::<StatedOrderV1>(crate::query::register::STATED_ORDER_RECIPE_V1, "stated-order-v1");
+        check::<Rank9LiftedUnionV1_32Le>(
+            crate::collection::succinctarchive_union::RANK9_LIFTED_UNION_RECIPE_V1_32_LE,
+            "rank9-32-le",
+        );
+        check::<Rank9LiftedUnionV1_32Be>(
+            crate::collection::succinctarchive_union::RANK9_LIFTED_UNION_RECIPE_V1_32_BE,
+            "rank9-32-be",
+        );
+        check::<Rank9LiftedUnionV1_64Le>(
+            crate::collection::succinctarchive_union::RANK9_LIFTED_UNION_RECIPE_V1_64_LE,
+            "rank9-64-le",
+        );
+        check::<Rank9LiftedUnionV1_64Be>(
+            crate::collection::succinctarchive_union::RANK9_LIFTED_UNION_RECIPE_V1_64_BE,
+            "rank9-64-be",
+        );
     }
 }

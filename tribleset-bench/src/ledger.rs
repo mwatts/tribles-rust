@@ -25,7 +25,7 @@ use rand::rngs::OsRng;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::collection::{
     discover_collection_records, resolve_collection_semantics, simplearchive_union, Collection,
-    CollectionClaimValidation, CollectionData, CollectionDescriptor, CollectionId,
+    CollectionClaimValidation, CollectionData, CollectionDescriptor, CollectionHandle,
     CollectionValidationRequest,
 };
 use triblespace::core::metadata;
@@ -254,7 +254,7 @@ where
 
 fn load_collection_descriptor<R>(
     reader: &R,
-    collection: CollectionId,
+    collection: CollectionHandle,
 ) -> std::result::Result<CollectionDescriptor, String>
 where
     R: BlobStoreGet,

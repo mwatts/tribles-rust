@@ -17,7 +17,7 @@ use crate::inline::encodings::ed25519::ED25519PublicKey;
 use crate::inline::Inline;
 
 use super::{
-    CollectionCommit, CollectionDerive, CollectionId, CollectionMerge, CollectionRecord,
+    CollectionCommit, CollectionDerive, CollectionHandle, CollectionMerge, CollectionRecord,
     CollectionRecordSelector, CollectionStore, CommitVerificationError,
 };
 
@@ -50,9 +50,9 @@ pub enum ExactTicketError {
         /// Intrinsic commit record id.
         commit: Id,
         /// Descriptor required by the fixed facade.
-        expected: CollectionId,
+        expected: CollectionHandle,
         /// Descriptor named by the supplied commit.
-        actual: CollectionId,
+        actual: CollectionHandle,
     },
     /// Two supplied records have the same intrinsic id but different bytes.
     ConflictingCommit {
@@ -105,7 +105,7 @@ impl Error for ExactTicketError {}
 /// Canonical intrinsic-id order for one exact ticket.
 pub(crate) fn canonicalize_exact_ticket(
     ticket: &[CollectionCommit],
-    expected: CollectionId,
+    expected: CollectionHandle,
 ) -> Result<Vec<CollectionCommit>, ExactTicketError> {
     let mut ticket = ticket.to_vec();
     ticket.sort_unstable_by(|left, right| {
@@ -312,8 +312,8 @@ where
 pub(crate) fn discover_collection_records_for_ticket<S>(
     store: &mut S,
     ticket_ids: &BTreeSet<Id>,
-    source: CollectionId,
-    target: CollectionId,
+    source: CollectionHandle,
+    target: CollectionHandle,
 ) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
 where
     S: CollectionStore,
@@ -338,7 +338,7 @@ where
 pub(crate) fn discover_collection_records_for_collection_ticket<S>(
     store: &mut S,
     ticket_ids: &BTreeSet<Id>,
-    collection: CollectionId,
+    collection: CollectionHandle,
 ) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
 where
     S: CollectionStore,
@@ -420,7 +420,7 @@ where
 /// commit scope.
 pub fn discover_collection_records_scoped<S>(
     store: &mut S,
-    collection: CollectionId,
+    collection: CollectionHandle,
     signer: Inline<ED25519PublicKey>,
 ) -> Result<DiscoveredCollectionRecords, CollectionDiscoveryError<S::RecordsError>>
 where
@@ -515,7 +515,7 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
 
-    use crate::collection::{empty_metadata_handle, CollectionData, CollectionId};
+    use crate::collection::{empty_metadata_handle, CollectionData, CollectionHandle};
     use crate::inline::Inline;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -557,7 +557,7 @@ mod tests {
         Inline::new([byte; 32])
     }
 
-    fn collection(byte: u8) -> CollectionId {
+    fn collection(byte: u8) -> CollectionHandle {
         Inline::new([byte; 32])
     }
 

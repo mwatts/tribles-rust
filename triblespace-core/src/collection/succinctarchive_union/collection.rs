@@ -435,7 +435,7 @@ mod tests {
 
     struct FaultStore {
         repo: MemoryRepo,
-        rank9_target: crate::collection::CollectionId,
+        rank9_target: crate::collection::CollectionHandle,
         fail_rank9_put: bool,
         drop_rank9_put: bool,
         replace_rank9_on_put: Option<CollectionData>,
@@ -447,7 +447,7 @@ mod tests {
     }
 
     impl FaultStore {
-        fn new(repo: MemoryRepo, rank9_target: crate::collection::CollectionId) -> Self {
+        fn new(repo: MemoryRepo, rank9_target: crate::collection::CollectionHandle) -> Self {
             Self {
                 repo,
                 rank9_target,

@@ -22,7 +22,7 @@ use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
 use crate::repo::{BlobStoreMeta, RetentionRoots};
 
-use super::{CollectionData, CollectionId, CollectionResolution, DiscoveredCollectionRecords};
+use super::{CollectionData, CollectionHandle, CollectionResolution, DiscoveredCollectionRecords};
 
 /// A collection retention plan could not prove that every required blob stays
 /// available.
@@ -31,7 +31,7 @@ pub enum CollectionRetentionError<MetadataError> {
     /// An admitted commit's canonical collection descriptor blob is absent.
     MissingDescriptor {
         /// Canonical collection-descriptor handle.
-        collection: CollectionId,
+        collection: CollectionHandle,
     },
     /// Storage metadata lookup failed while establishing residency.
     Metadata {
@@ -193,7 +193,7 @@ mod tests {
     use crate::collection::simplearchive_union::{self, SimpleArchiveUnionValidationError};
     use crate::collection::{
         discover_collection_records, resolve_collection_semantics, CollectionClaimValidation,
-        CollectionCommit, CollectionDerive, CollectionDescriptor, CollectionId, CollectionMerge,
+        CollectionCommit, CollectionDerive, CollectionDescriptor, CollectionHandle, CollectionMerge,
         CollectionRecord, CollectionStore, CollectionValidationRequest,
     };
     use crate::inline::encodings::hash::{Blake3, Hash};
@@ -234,7 +234,7 @@ mod tests {
 
     fn load_descriptor<R: BlobStoreGet>(
         reader: &R,
-        collection: CollectionId,
+        collection: CollectionHandle,
     ) -> Option<CollectionDescriptor> {
         let blob: Blob<SimpleArchive> = reader.get(collection).ok()?;
         let blob = Blob::<SimpleArchive>::new(blob.bytes.clone());

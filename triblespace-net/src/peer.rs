@@ -408,7 +408,7 @@ where
     pub fn fetch_collection_evidence_from(
         &self,
         peer: [u8; 32],
-        collection: triblespace_core::collection::CollectionId,
+        collection: triblespace_core::collection::CollectionHandle,
     ) -> anyhow::Result<Vec<crate::collection_wire::CollectionCommitEvidence>> {
         self.sender.fetch_collection_evidence(peer, collection)
     }
@@ -422,7 +422,7 @@ where
     pub fn reconcile_collection_from<AuthorizationError, Authorize>(
         &mut self,
         peer: [u8; 32],
-        collection: triblespace_core::collection::CollectionId,
+        collection: triblespace_core::collection::CollectionHandle,
         authorize: Authorize,
     ) -> Result<CollectionReconcileOutcome, CollectionReconcileError>
     where
@@ -1250,7 +1250,7 @@ mod collection_gossip_tests {
     use std::convert::Infallible;
 
     use triblespace_core::collection::{
-        CollectionCommit, CollectionData, CollectionId, empty_metadata_handle,
+        CollectionCommit, CollectionData, CollectionHandle, empty_metadata_handle,
     };
 
     use super::*;
@@ -1317,11 +1317,11 @@ mod collection_gossip_tests {
         }
     }
 
-    fn collection(byte: u8) -> CollectionId {
+    fn collection(byte: u8) -> CollectionHandle {
         Inline::new([byte; 32])
     }
 
-    fn commit(author: &SigningKey, collection: CollectionId, byte: u8) -> CollectionCommit {
+    fn commit(author: &SigningKey, collection: CollectionHandle, byte: u8) -> CollectionCommit {
         CollectionCommit::sign(
             author,
             collection,

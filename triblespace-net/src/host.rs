@@ -16,7 +16,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use iroh_base::{EndpointAddr, EndpointId};
 use tracing::{Instrument, debug, debug_span, error, info, info_span, instrument, trace, warn};
 use triblespace_core::collection::{
-    CollectionGossip, CollectionGossipStore, CollectionId, CollectionRecord, CollectionStore,
+    CollectionGossip, CollectionGossipStore, CollectionHandle, CollectionRecord, CollectionStore,
 };
 use triblespace_core::repo::{WANT_REQUEST_BYTES_LEN, WantRequest};
 
@@ -238,7 +238,7 @@ pub trait AnySnapshot: Send + 'static {
     fn pin_heads(&self) -> &triblespace_core::repo::PinSnapshot;
     /// Strict grant-backed commits for one exact descriptor handle, in
     /// deterministic intrinsic-record order.
-    fn collection_evidence(&self, collection: CollectionId) -> Vec<CollectionCommitEvidence>;
+    fn collection_evidence(&self, collection: CollectionHandle) -> Vec<CollectionCommitEvidence>;
     /// Every strict grant-backed commit in deterministic commit-id order.
     /// Used only to periodically republish the current store truth for late
     /// gossip joiners; the host does not maintain a second ledger mirror.
@@ -272,7 +272,7 @@ where
         &self.pin_heads
     }
 
-    fn collection_evidence(&self, collection: CollectionId) -> Vec<CollectionCommitEvidence> {
+    fn collection_evidence(&self, collection: CollectionHandle) -> Vec<CollectionCommitEvidence> {
         grant_backed_commits(
             &self.collection_records,
             &self.collection_gossips,
@@ -684,7 +684,7 @@ impl NetSender {
     pub fn fetch_collection_evidence(
         &self,
         peer: PeerId,
-        collection: CollectionId,
+        collection: CollectionHandle,
     ) -> anyhow::Result<Vec<CollectionCommitEvidence>> {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         self.cmd_tx
@@ -2038,7 +2038,7 @@ async fn serve_stream<T: Transport>(
         }
 
         OP_COLLECTION_EVIDENCE => {
-            let collection = CollectionId::new(recv_hash(recv).await?);
+            let collection = CollectionHandle::new(recv_hash(recv).await?);
             // Branch restrictions have no principled interpretation for
             // descriptor-addressed collections. Until capabilities gain a
             // collection scope, expose this operation only to read-equivalent
@@ -2222,7 +2222,7 @@ mod collection_evidence_gossip_tests {
 
     use ed25519_dalek::SigningKey;
     use triblespace_core::collection::{
-        CollectionCommit, CollectionGossip, CollectionId, CollectionRecord, empty_metadata_handle,
+        CollectionCommit, CollectionGossip, CollectionHandle, CollectionRecord, empty_metadata_handle,
         simplearchive_union,
     };
     use triblespace_core::id::Id;
@@ -2268,7 +2268,7 @@ mod collection_evidence_gossip_tests {
             &self.pin_heads
         }
 
-        fn collection_evidence(&self, collection: CollectionId) -> Vec<CollectionCommitEvidence> {
+        fn collection_evidence(&self, collection: CollectionHandle) -> Vec<CollectionCommitEvidence> {
             (self.evidence.commit().collection() == collection)
                 .then_some(self.evidence)
                 .into_iter()

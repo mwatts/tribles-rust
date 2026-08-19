@@ -21,7 +21,7 @@ use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
 use triblespace_core::blob::Blob;
 use triblespace_core::collection::records::{
-    CollectionDescriptor, CollectionId, CollectionRecord,
+    CollectionDescriptor, CollectionHandle, CollectionRecord,
 };
 use triblespace_core::collection::store::CollectionStore;
 use triblespace_core::id::Id;
@@ -76,7 +76,7 @@ pub fn run(cmd: Command) -> Result<()> {
 /// `pile blob inspect` rejects the bare form with `BadProtocol`. Collection
 /// handles get copied out of record dumps and log lines in both shapes, so
 /// this entry point normalizes rather than nitpicks.
-fn parse_collection_handle(handle: &str) -> Result<CollectionId> {
+fn parse_collection_handle(handle: &str) -> Result<CollectionHandle> {
     use triblespace::prelude::TryToInline;
 
     let trimmed = handle.trim();
@@ -93,7 +93,7 @@ fn parse_collection_handle(handle: &str) -> Result<CollectionId> {
     Ok(hash.into())
 }
 
-fn handle_hex(handle: CollectionId) -> String {
+fn handle_hex(handle: CollectionHandle) -> String {
     hex::encode(handle.raw)
 }
 
@@ -161,8 +161,8 @@ impl Refs {
 /// Walk every collection record in the pile and tally which collections they
 /// name. Merges and derives are included: a collection that only ever appears
 /// as a derive target is still a collection this pile references.
-fn referenced_collections(pile: &mut Pile) -> Result<BTreeMap<CollectionId, Refs>> {
-    let mut refs: BTreeMap<CollectionId, Refs> = BTreeMap::new();
+fn referenced_collections(pile: &mut Pile) -> Result<BTreeMap<CollectionHandle, Refs>> {
+    let mut refs: BTreeMap<CollectionHandle, Refs> = BTreeMap::new();
     let records = pile
         .records()
         .map_err(|e| anyhow!("enumerate collection records: {e:?}"))?;
@@ -192,7 +192,7 @@ enum Fields {
 }
 
 impl Fields {
-    fn load<R: BlobStoreGet>(reader: &R, handle: CollectionId) -> Self {
+    fn load<R: BlobStoreGet>(reader: &R, handle: CollectionHandle) -> Self {
         let blob: Blob<SimpleArchive> = match reader.get(handle) {
             Ok(blob) => blob,
             Err(_) => return Fields::Missing,
@@ -340,7 +340,7 @@ fn run_show(path: PathBuf, handle: String) -> Result<()> {
 /// Every collection a set of records names, without the descriptor lookups.
 /// Exposed for tests that want the enumeration independent of blob presence.
 #[cfg(test)]
-fn referenced_ids(records: &[CollectionRecord]) -> std::collections::BTreeSet<CollectionId> {
+fn referenced_ids(records: &[CollectionRecord]) -> std::collections::BTreeSet<CollectionHandle> {
     let mut out = std::collections::BTreeSet::new();
     for record in records {
         match record {
@@ -380,7 +380,7 @@ mod tests {
         let descriptor = CollectionDescriptor::new(scope, representation, TRIBLE_SET_UNION_RECIPE_V1);
 
         let mut store = MemoryBlobStore::new();
-        let handle: CollectionId = store
+        let handle: CollectionHandle = store
             .put::<SimpleArchive, _>(descriptor.to_blob())
             .expect("store descriptor");
         assert_eq!(
@@ -438,7 +438,7 @@ mod tests {
     fn enumeration_covers_merges_and_both_derive_sides() {
         use triblespace_core::collection::records::{CollectionDerive, CollectionMerge};
 
-        fn collection(byte: u8) -> CollectionId {
+        fn collection(byte: u8) -> CollectionHandle {
             Inline::new([byte; 32])
         }
         fn data(byte: u8) -> Inline<Hash<Blake3>> {

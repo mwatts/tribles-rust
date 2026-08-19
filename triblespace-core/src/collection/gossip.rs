@@ -30,7 +30,7 @@ use crate::id::{id_hex, Id};
 use crate::inline::encodings::ed25519::{ED25519PublicKey, ED25519RComponent, ED25519SComponent};
 use crate::inline::Inline;
 
-use super::CollectionId;
+use super::CollectionHandle;
 
 /// Stable semantic kind of a signed collection-gossip grant.
 ///
@@ -69,7 +69,7 @@ pub const GOSSIP_TRANSCRIPT_LEN: usize = GOSSIP_TRANSCRIPT_DOMAIN.len()
 /// policy.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CollectionGossip {
-    collection: CollectionId,
+    collection: CollectionHandle,
     public_key: Inline<ED25519PublicKey>,
     signature_r: Inline<ED25519RComponent>,
     signature_s: Inline<ED25519SComponent>,
@@ -77,7 +77,7 @@ pub struct CollectionGossip {
 
 impl CollectionGossip {
     /// Sign a permanent redistribution grant for `collection`.
-    pub fn sign(signing_key: &SigningKey, collection: CollectionId) -> Self {
+    pub fn sign(signing_key: &SigningKey, collection: CollectionHandle) -> Self {
         let public_key = Inline::new(signing_key.verifying_key().to_bytes());
         let transcript = gossip_transcript(public_key, collection);
         let signature: Signature = signing_key.sign(&transcript);
@@ -91,7 +91,7 @@ impl CollectionGossip {
 
     /// Reconstruct stored structural evidence without trusting its signature.
     pub(crate) fn from_parts(
-        collection: CollectionId,
+        collection: CollectionHandle,
         public_key: Inline<ED25519PublicKey>,
         signature_r: Inline<ED25519RComponent>,
         signature_s: Inline<ED25519SComponent>,
@@ -144,7 +144,7 @@ impl CollectionGossip {
     }
 
     /// Collection whose commits may be redistributed.
-    pub fn collection(&self) -> CollectionId {
+    pub fn collection(&self) -> CollectionHandle {
         self.collection
     }
 
@@ -228,7 +228,7 @@ where
     }
 }
 
-fn gossip_transcript(public_key: Inline<ED25519PublicKey>, collection: CollectionId) -> Vec<u8> {
+fn gossip_transcript(public_key: Inline<ED25519PublicKey>, collection: CollectionHandle) -> Vec<u8> {
     let mut transcript = Vec::with_capacity(GOSSIP_TRANSCRIPT_LEN);
     transcript.extend_from_slice(GOSSIP_TRANSCRIPT_DOMAIN);
     transcript.extend_from_slice(&KIND_COLLECTION_GOSSIP.raw());
@@ -243,7 +243,7 @@ fn gossip_transcript(public_key: Inline<ED25519PublicKey>, collection: Collectio
 mod tests {
     use super::*;
 
-    fn collection(byte: u8) -> CollectionId {
+    fn collection(byte: u8) -> CollectionHandle {
         Inline::new([byte; 32])
     }
 

@@ -13,7 +13,7 @@ use std::fmt::Debug;
 use crate::id::Id;
 use crate::repo::WantRequest;
 
-use super::{CollectionId, CollectionRecord};
+use super::{CollectionHandle, CollectionRecord};
 
 /// One semantic route into the grow-only collection-record set.
 ///
@@ -25,13 +25,13 @@ pub enum CollectionRecordSelector {
     /// Select one record by its intrinsic content-derived id.
     Id(Id),
     /// Select every `MERGE` asserted for one collection descriptor.
-    MergeCollection(CollectionId),
+    MergeCollection(CollectionHandle),
     /// Select every `DERIVE` from one exact source descriptor to one target.
     DerivePair {
         /// Source collection descriptor.
-        source: CollectionId,
+        source: CollectionHandle,
         /// Target collection descriptor.
-        target: CollectionId,
+        target: CollectionHandle,
     },
     /// Select every receipt answering one exact merge or derive request.
     ///
@@ -173,7 +173,7 @@ mod tests {
     };
     use crate::inline::Inline;
 
-    fn collection(byte: u8) -> CollectionId {
+    fn collection(byte: u8) -> CollectionHandle {
         Inline::new([byte; 32])
     }
 

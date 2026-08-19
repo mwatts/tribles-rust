@@ -7,7 +7,7 @@ use ed25519_dalek::SigningKey;
 use triblespace_core::collection::{
     discover_collection_records, empty_metadata_handle, resolve_collection_semantics,
     CollectionClaimValidation, CollectionCommit, CollectionData, CollectionDerive,
-    CollectionDescriptor, CollectionId, CollectionMerge, CollectionRecord, CollectionStore,
+    CollectionDescriptor, CollectionHandle, CollectionMerge, CollectionRecord, CollectionStore,
     CollectionValidationRequest,
 };
 use triblespace_core::id::Id;
@@ -55,7 +55,7 @@ fn build(
 ) -> (
     triblespace_core::collection::DiscoveredCollectionRecords,
     BTreeSet<Id>,
-    CollectionId,
+    CollectionHandle,
     usize,
     usize,
 ) {

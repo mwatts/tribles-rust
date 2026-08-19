@@ -21,7 +21,7 @@ use triblespace_core::blob::encodings::simplearchive::{SimpleArchive, UnarchiveE
 use triblespace_core::blob::{Blob, BlobEncoding};
 use triblespace_core::collection::simplearchive_union::{self, TRIBLE_SET_UNION_RECIPE_V1};
 use triblespace_core::collection::{
-    CollectionData, CollectionDerive, CollectionDescriptor, CollectionId, CollectionMerge,
+    CollectionData, CollectionDerive, CollectionDescriptor, CollectionHandle, CollectionMerge,
 };
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::{Blake3, Hash};
@@ -143,9 +143,9 @@ pub enum PathSummaryUnionValidationError {
         /// Record endpoint being checked.
         role: DescriptorRole,
         /// Descriptor required at this endpoint.
-        expected: CollectionId,
+        expected: CollectionHandle,
         /// Descriptor named by the record.
-        actual: CollectionId,
+        actual: CollectionHandle,
     },
     /// Supplied bytes do not have the content identity named by the record.
     EndpointMismatch {
@@ -408,8 +408,8 @@ fn validate_descriptor_parts(
 
 fn validate_collection(
     role: DescriptorRole,
-    expected: CollectionId,
-    actual: CollectionId,
+    expected: CollectionHandle,
+    actual: CollectionHandle,
 ) -> Result<(), PathSummaryUnionValidationError> {
     if actual != expected {
         return Err(PathSummaryUnionValidationError::WrongCollection {

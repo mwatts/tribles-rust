@@ -16,6 +16,9 @@
 //! equation until its three blobs are resident, then call
 //! [`validate_merge`](crate::collection::simplearchive_union::validate_merge).
 
+use crate::id::ExclusiveId;
+use crate::metadata;
+use crate::prelude::entity;
 use super::records::RecordDecodeError;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -38,7 +41,7 @@ use crate::repo::{BlobStore, BlobStorePut};
 use crate::trible::{Fragment, Trible, TRIBLE_LEN};
 
 use super::{
-    CollectionCommit, CollectionData, CollectionDescriptor, CollectionId, CollectionMerge,
+    CollectionCommit, CollectionData, CollectionDescriptor, CollectionHandle, CollectionMerge,
     CollectionRecord, CollectionStore,
 };
 
@@ -53,6 +56,25 @@ pub use materialize::*;
 /// implementation and of the collection's blob representation. Minted with
 /// `trible genid` on 2026-08-07.
 pub const TRIBLE_SET_UNION_RECIPE_V1: Id = id_hex!("6D64C5F4B9E9B73F57C5F8702AB7FE45");
+
+/// The TribleSet set-union law, as a describable type.
+///
+/// A descriptor embeds this description rather than only the id above, so a
+/// reader holding the pile can learn what the law is without the code that
+/// minted it.
+pub struct TribleSetUnionV1;
+
+impl MetaDescribe for TribleSetUnionV1 {
+    fn describe() -> Fragment {
+        let id: Id = TRIBLE_SET_UNION_RECIPE_V1;
+        entity! {
+            ExclusiveId::force_ref(&id) @
+                metadata::name: "trible-set-union-v1",
+                metadata::description: "Set union of the tribles carried by a collection's elements. Associative, commutative and idempotent, so any two states have a least upper bound and merging is order-independent: a collection's value is the union over every element committed to it, and two replicas that have seen the same elements agree regardless of the order they arrived in. Takes no arguments.",
+                metadata::tag: metadata::KIND_COLLECTION_RECIPE,
+        }
+    }
+}
 
 /// The collection endpoint involved in a validation failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,8 +111,8 @@ pub enum SimpleArchiveUnionValidationError {
     WrongRecipe { expected: Id, actual: Id },
     /// The record belongs to another collection descriptor.
     WrongCollection {
-        expected: CollectionId,
-        actual: CollectionId,
+        expected: CollectionHandle,
+        actual: CollectionHandle,
     },
     /// Supplied bytes do not have the content identity named by the record.
     EndpointMismatch {
@@ -752,7 +774,7 @@ fn validate_descriptor(
 
 fn validate_collection(
     descriptor: &CollectionDescriptor,
-    actual: CollectionId,
+    actual: CollectionHandle,
 ) -> Result<(), SimpleArchiveUnionValidationError> {
     if actual != descriptor.handle() {
         return Err(SimpleArchiveUnionValidationError::WrongCollection {

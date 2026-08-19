@@ -251,6 +251,21 @@ pub fn descriptor(scope: Id, observes: Id) -> CollectionDescriptor {
 /// argument would make the collection's meaning unrecoverable from the pile.
 pub const OBSERVED_UNION_RECIPE_V1: Id = id_hex!("A808ECA30730EF0F1C7FD96F3FC7CB03");
 
+/// The observed-union law, as a describable type.
+pub struct ObservedUnionV1;
+
+impl MetaDescribe for ObservedUnionV1 {
+    fn describe() -> Fragment {
+        let id: Id = OBSERVED_UNION_RECIPE_V1;
+        entity! {
+            ExclusiveId::force_ref(&id) @
+                metadata::name: "observed-union-v1",
+                metadata::description: "Union of the state ids observed over one attribute: the monotone half of register resolution. Readers subtract this set from their candidates to obtain the frontier, which is why the set itself only ever grows and merges by union. Takes one argument, carried as a trible on the collection descriptor: `register_observes`, the attribute whose observations are accumulated.",
+                metadata::tag: metadata::KIND_COLLECTION_RECIPE,
+        }
+    }
+}
+
 /// A resolved observed set, ready to answer domination.
 ///
 /// Implements [`RegisterOrder`], so it substitutes for a live

@@ -14,7 +14,7 @@ use std::fmt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use triblespace_core::collection::{
     COLLECTION_COMMIT_BYTES_LEN, COLLECTION_GOSSIP_BYTES_LEN, COLLECTION_MERGE_BYTES_LEN,
-    CollectionCommit, CollectionDerive, CollectionGossip, CollectionId, CollectionMerge,
+    CollectionCommit, CollectionDerive, CollectionGossip, CollectionHandle, CollectionMerge,
     CollectionRecord, CommitVerificationError, GossipVerificationError, RecordDecodeError,
 };
 use triblespace_core::id::Id;
@@ -569,7 +569,7 @@ pub(crate) fn all_grant_backed_commits(
 pub(crate) fn grant_backed_commits(
     records: &[CollectionRecord],
     grants: &[CollectionGossip],
-    collection: CollectionId,
+    collection: CollectionHandle,
 ) -> Vec<CollectionCommitEvidence> {
     all_grant_backed_commits(records, grants)
         .into_iter()
@@ -581,7 +581,7 @@ pub(crate) fn grant_backed_commits(
 /// already-authenticated connection.
 pub async fn op_collection_evidence<C: Conn>(
     conn: &C,
-    collection: CollectionId,
+    collection: CollectionHandle,
 ) -> anyhow::Result<Vec<CollectionCommitEvidence>> {
     let (mut send, mut recv) = conn
         .open_bi()

@@ -16,6 +16,10 @@
 //! authority to construction records. `DERIVE` and `MERGE` remain unsigned,
 //! reproducible evidence.
 
+use crate::id::ExclusiveId;
+use crate::metadata;
+use crate::prelude::entity;
+use crate::trible::Fragment;
 use super::records::RecordDecodeError;
 use std::error::Error;
 use std::fmt;
@@ -33,7 +37,7 @@ use crate::metadata::MetaDescribe;
 
 use super::simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1;
 use super::{
-    CollectionData, CollectionDerive, CollectionDescriptor, CollectionId, CollectionMerge,
+    CollectionData, CollectionDerive, CollectionDescriptor, CollectionHandle, CollectionMerge,
 };
 
 mod collection;
@@ -67,6 +71,66 @@ pub const RANK9_LIFTED_UNION_RECIPE_V1_64_LE: Id = id_hex!("E4A77808BBF9E3732447
 /// Minted with `trible genid` on 2026-08-14; see
 /// [`RANK9_LIFTED_UNION_RECIPE_V1_32_LE`] for the versioning contract.
 pub const RANK9_LIFTED_UNION_RECIPE_V1_64_BE: Id = id_hex!("A470EAEB76777091CE795D9B108C79D0");
+
+/// The lifted Rank9-union law for this ABI, as a describable type.
+pub struct Rank9LiftedUnionV1_32Le;
+
+impl MetaDescribe for Rank9LiftedUnionV1_32Le {
+    fn describe() -> Fragment {
+        let id: Id = RANK9_LIFTED_UNION_RECIPE_V1_32_LE;
+        entity! {
+            ExclusiveId::force_ref(&id) @
+                metadata::name: "rank9-lifted-union-v1-32-le",
+                metadata::description: "Set union of a SuccinctArchive collection lifted through its detached Rank9 sidecar. Same associative, commutative, idempotent law as trible-set-union, applied to the archive's canonical bytes rather than to loose tribles, so merging two indexed states yields the index of their union. The recipe pins everything that can change canonical sidecar bytes: the portable SuccinctArchive source schema, the Rank9 format marker, version and flags, the Rank9 builder and Jerky serialization epoch, and the target's 32-bit pointer width and little-endian byte order. A different width or byte order is a different law, because it yields different canonical bytes.",
+                metadata::tag: metadata::KIND_COLLECTION_RECIPE,
+        }
+    }
+}
+
+/// The lifted Rank9-union law for this ABI, as a describable type.
+pub struct Rank9LiftedUnionV1_32Be;
+
+impl MetaDescribe for Rank9LiftedUnionV1_32Be {
+    fn describe() -> Fragment {
+        let id: Id = RANK9_LIFTED_UNION_RECIPE_V1_32_BE;
+        entity! {
+            ExclusiveId::force_ref(&id) @
+                metadata::name: "rank9-lifted-union-v1-32-be",
+                metadata::description: "Set union of a SuccinctArchive collection lifted through its detached Rank9 sidecar. Same associative, commutative, idempotent law as trible-set-union, applied to the archive's canonical bytes rather than to loose tribles, so merging two indexed states yields the index of their union. The recipe pins everything that can change canonical sidecar bytes: the portable SuccinctArchive source schema, the Rank9 format marker, version and flags, the Rank9 builder and Jerky serialization epoch, and the target's 32-bit pointer width and big-endian byte order. A different width or byte order is a different law, because it yields different canonical bytes.",
+                metadata::tag: metadata::KIND_COLLECTION_RECIPE,
+        }
+    }
+}
+
+/// The lifted Rank9-union law for this ABI, as a describable type.
+pub struct Rank9LiftedUnionV1_64Le;
+
+impl MetaDescribe for Rank9LiftedUnionV1_64Le {
+    fn describe() -> Fragment {
+        let id: Id = RANK9_LIFTED_UNION_RECIPE_V1_64_LE;
+        entity! {
+            ExclusiveId::force_ref(&id) @
+                metadata::name: "rank9-lifted-union-v1-64-le",
+                metadata::description: "Set union of a SuccinctArchive collection lifted through its detached Rank9 sidecar. Same associative, commutative, idempotent law as trible-set-union, applied to the archive's canonical bytes rather than to loose tribles, so merging two indexed states yields the index of their union. The recipe pins everything that can change canonical sidecar bytes: the portable SuccinctArchive source schema, the Rank9 format marker, version and flags, the Rank9 builder and Jerky serialization epoch, and the target's 64-bit pointer width and little-endian byte order. A different width or byte order is a different law, because it yields different canonical bytes.",
+                metadata::tag: metadata::KIND_COLLECTION_RECIPE,
+        }
+    }
+}
+
+/// The lifted Rank9-union law for this ABI, as a describable type.
+pub struct Rank9LiftedUnionV1_64Be;
+
+impl MetaDescribe for Rank9LiftedUnionV1_64Be {
+    fn describe() -> Fragment {
+        let id: Id = RANK9_LIFTED_UNION_RECIPE_V1_64_BE;
+        entity! {
+            ExclusiveId::force_ref(&id) @
+                metadata::name: "rank9-lifted-union-v1-64-be",
+                metadata::description: "Set union of a SuccinctArchive collection lifted through its detached Rank9 sidecar. Same associative, commutative, idempotent law as trible-set-union, applied to the archive's canonical bytes rather than to loose tribles, so merging two indexed states yields the index of their union. The recipe pins everything that can change canonical sidecar bytes: the portable SuccinctArchive source schema, the Rank9 format marker, version and flags, the Rank9 builder and Jerky serialization epoch, and the target's 64-bit pointer width and big-endian byte order. A different width or byte order is a different law, because it yields different canonical bytes.",
+                metadata::tag: metadata::KIND_COLLECTION_RECIPE,
+        }
+    }
+}
 
 #[cfg(all(target_pointer_width = "32", target_endian = "little"))]
 const CURRENT_RANK9_LIFTED_UNION_RECIPE: Id = RANK9_LIFTED_UNION_RECIPE_V1_32_LE;
@@ -162,9 +226,9 @@ pub enum SuccinctArchiveUnionValidationError {
         /// Record endpoint being checked.
         role: DescriptorRole,
         /// Descriptor required at this endpoint.
-        expected: CollectionId,
+        expected: CollectionHandle,
         /// Descriptor named by the record.
-        actual: CollectionId,
+        actual: CollectionHandle,
     },
     /// Supplied bytes do not have the content identity named by the record.
     EndpointMismatch {
@@ -414,8 +478,8 @@ fn validate_descriptor_parts(
 
 fn validate_collection(
     role: DescriptorRole,
-    expected: CollectionId,
-    actual: CollectionId,
+    expected: CollectionHandle,
+    actual: CollectionHandle,
 ) -> Result<(), SuccinctArchiveUnionValidationError> {
     if actual != expected {
         return Err(SuccinctArchiveUnionValidationError::WrongCollection {

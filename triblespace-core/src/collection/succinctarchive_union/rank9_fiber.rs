@@ -59,9 +59,9 @@ pub enum Rank9FiberError {
         /// Which descriptor was being published.
         role: &'static str,
         /// Canonical descriptor identity.
-        expected: crate::collection::CollectionId,
+        expected: crate::collection::CollectionHandle,
         /// Identity returned by the backend.
-        actual: crate::collection::CollectionId,
+        actual: crate::collection::CollectionHandle,
     },
     /// A Rank9 put acknowledged a different content identity.
     NonCanonicalRank9Put {

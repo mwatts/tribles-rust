@@ -504,6 +504,21 @@ crate::macros::attributes! {
 /// Minted with `trible genid` on 2026-08-19.
 pub const STATED_ORDER_RECIPE_V1: Id = crate::id_hex!("6DD9E3F484DDDFF83BAC505ED33C8394");
 
+/// The stated-order law, as a describable type.
+pub struct StatedOrderV1;
+
+impl crate::metadata::MetaDescribe for StatedOrderV1 {
+    fn describe() -> crate::trible::Fragment {
+        let id: Id = STATED_ORDER_RECIPE_V1;
+        crate::macros::entity! {
+            crate::id::ExclusiveId::force_ref(&id) @
+                crate::metadata::name: "stated-order-v1",
+                crate::metadata::description: "A register whose states are ordered by a stated value rather than by observation. One state dominates another when they share an identity and its order value is greater, so the resolution is the set of states nothing beats: a single winner when the order is total, a tie when it is not. Takes two arguments, carried as tribles on the collection descriptor: `register_identity`, the attribute saying two states are about the same thing, and `register_orders`, the attribute carrying the order. Identity and order are separate because an order value alone carries no identity.",
+                crate::metadata::tag: crate::metadata::KIND_COLLECTION_RECIPE,
+        }
+    }
+}
+
 impl<P, K> StatedOrder<'_, P, K>
 where
     P: TriblePattern,

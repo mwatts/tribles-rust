@@ -30,7 +30,7 @@ use super::discovery::{
 };
 use super::{
     collection_physical_cover, resolve_collection_semantics, CollectionClaimValidation,
-    CollectionCommit, CollectionData, CollectionDerive, CollectionDescriptor, CollectionId,
+    CollectionCommit, CollectionData, CollectionDerive, CollectionDescriptor, CollectionHandle,
     CollectionMerge, CollectionRecord, CollectionSemantics, CollectionStore,
     CollectionValidationRequest, DiscoveredCollectionRecords,
 };
@@ -866,7 +866,7 @@ struct PreparedDerive<Target: BlobEncoding> {
 struct SourcePlan<Source: BlobEncoding> {
     descriptor: CollectionDescriptor,
     semantics: CollectionSemantics,
-    collection: CollectionId,
+    collection: CollectionHandle,
     resident: BTreeSet<CollectionData>,
     mandatory: BTreeMap<CollectionData, Blob<Source>>,
     required_commits: BTreeSet<Id>,
@@ -970,7 +970,7 @@ struct ValidatedPhysicalCover<E: BlobEncoding> {
 fn validated_physical_cover<R, E, V>(
     reader: &R,
     semantics: &CollectionSemantics,
-    collection: CollectionId,
+    collection: CollectionHandle,
     mut resident: BTreeSet<CollectionData>,
     mandatory: &BTreeMap<CollectionData, Blob<E>>,
     validate: V,

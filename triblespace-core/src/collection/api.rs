@@ -28,7 +28,7 @@ use super::simplearchive_union::{
 use super::{
     collection_physical_cover, discover_collection_records_scoped, resolve_collection_semantics,
     CollectionClaimValidation, CollectionCommit, CollectionData, CollectionDescriptor,
-    CollectionDiscoveryError, CollectionFunctionalConflict, CollectionId,
+    CollectionDiscoveryError, CollectionFunctionalConflict, CollectionHandle,
     CollectionResolutionError, CollectionStore, CollectionValidationRequest,
     DiscoveredCollectionRecords, ExactTicketError, RecordDecodeError,
 };
@@ -100,7 +100,7 @@ pub enum CollectionMaterializationError<RecordsError, ReaderError, MetaError, Ge
     /// An authorized commit's canonical descriptor blob could not be fetched.
     DescriptorGet {
         /// Canonical collection-descriptor handle.
-        collection: CollectionId,
+        collection: CollectionHandle,
         /// Backend fetch failure.
         source: GetError,
     },
@@ -108,7 +108,7 @@ pub enum CollectionMaterializationError<RecordsError, ReaderError, MetaError, Ge
     /// archive named by the collection handle.
     InvalidDescriptor {
         /// Canonical collection-descriptor handle.
-        collection: CollectionId,
+        collection: CollectionHandle,
         /// Structural descriptor decoding failure.
         source: RecordDecodeError,
     },
@@ -116,15 +116,15 @@ pub enum CollectionMaterializationError<RecordsError, ReaderError, MetaError, Ge
     /// commits.
     DescriptorIdentity {
         /// Descriptor handle named by the commits.
-        expected: CollectionId,
+        expected: CollectionHandle,
         /// Handle recomputed from the fetched bytes.
-        actual: CollectionId,
+        actual: CollectionHandle,
     },
     /// The fetched canonical descriptor did not equal the descriptor expected
     /// by this owned facade.
     DescriptorMismatch {
         /// Descriptor handle named by this facade and its commits.
-        collection: CollectionId,
+        collection: CollectionHandle,
     },
     /// The blob reader could not be created after record discovery.
     Reader(ReaderError),

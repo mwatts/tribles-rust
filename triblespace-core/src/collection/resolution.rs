@@ -18,13 +18,13 @@ use std::fmt;
 use crate::id::Id;
 
 use super::{
-    CollectionCommit, CollectionData, CollectionDerive, CollectionId, CollectionMerge,
+    CollectionCommit, CollectionData, CollectionDerive, CollectionHandle, CollectionMerge,
     DiscoveredCollectionRecords,
 };
 
-type MemberKey = (CollectionId, CollectionData);
+type MemberKey = (CollectionHandle, CollectionData);
 type MergeProducer = (CollectionData, CollectionData, Id);
-type DeriveProducer = (CollectionId, CollectionData, Id);
+type DeriveProducer = (CollectionHandle, CollectionData, Id);
 type DeriveOutput = (CollectionData, Id);
 
 /// One claim presented for concrete semantic validation.
@@ -123,7 +123,7 @@ pub enum CollectionFunctionalConflict {
     /// One commutative merge key has two results.
     Merge {
         /// Collection containing the merge.
-        collection: CollectionId,
+        collection: CollectionHandle,
         /// Canonically lower input.
         low: CollectionData,
         /// Canonically higher input.
@@ -136,9 +136,9 @@ pub enum CollectionFunctionalConflict {
     /// One source/target mapping assigns two outputs to the same input.
     Derive {
         /// Source collection.
-        source: CollectionId,
+        source: CollectionHandle,
         /// Target collection.
-        target: CollectionId,
+        target: CollectionHandle,
         /// Source element.
         input: CollectionData,
         /// Lowest deterministic output witness.
@@ -277,29 +277,29 @@ impl<D> CollectionResolution<D> {
 /// inputs to the data lattice.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CollectionSemantics {
-    members: BTreeMap<CollectionId, BTreeSet<CollectionData>>,
-    frontier: BTreeMap<CollectionId, BTreeSet<CollectionData>>,
+    members: BTreeMap<CollectionHandle, BTreeSet<CollectionData>>,
+    frontier: BTreeMap<CollectionHandle, BTreeSet<CollectionData>>,
     commit_ids_by_member: BTreeMap<MemberKey, BTreeSet<Id>>,
     merge_inputs_by_result: BTreeMap<MemberKey, BTreeSet<MergeProducer>>,
     order_results_by_input: BTreeMap<MemberKey, BTreeSet<CollectionData>>,
     derive_inputs_by_output: BTreeMap<MemberKey, BTreeSet<DeriveProducer>>,
     derive_outputs_by_input:
-        BTreeMap<(CollectionId, CollectionId), BTreeMap<CollectionData, BTreeSet<DeriveOutput>>>,
+        BTreeMap<(CollectionHandle, CollectionHandle), BTreeMap<CollectionData, BTreeSet<DeriveOutput>>>,
 }
 
 impl CollectionSemantics {
     /// Whether `data` belongs to the collection's least known closure.
-    pub fn contains(&self, collection: CollectionId, data: CollectionData) -> bool {
+    pub fn contains(&self, collection: CollectionHandle, data: CollectionData) -> bool {
         contains_member(&self.members, collection, data)
     }
 
     /// All known semantic members of `collection`.
-    pub fn members(&self, collection: CollectionId) -> Option<&BTreeSet<CollectionData>> {
+    pub fn members(&self, collection: CollectionHandle) -> Option<&BTreeSet<CollectionData>> {
         self.members.get(&collection)
     }
 
     /// Maximal members under active merge and homomorphism lineage.
-    pub fn frontier(&self, collection: CollectionId) -> Option<&BTreeSet<CollectionData>> {
+    pub fn frontier(&self, collection: CollectionHandle) -> Option<&BTreeSet<CollectionData>> {
         self.frontier.get(&collection)
     }
 
@@ -310,7 +310,7 @@ impl CollectionSemantics {
     /// Multiple commits of the same data remain distinct leaves.
     pub fn supporting_commit_ids(
         &self,
-        collection: CollectionId,
+        collection: CollectionHandle,
         data: CollectionData,
     ) -> BTreeSet<Id> {
         if !self.contains(collection, data) {
@@ -350,7 +350,7 @@ impl CollectionSemantics {
     #[cfg(test)]
     fn subsumes(
         &self,
-        collection: CollectionId,
+        collection: CollectionHandle,
         lower: CollectionData,
         upper: CollectionData,
     ) -> bool {
@@ -387,7 +387,7 @@ impl CollectionSemantics {
     /// accepted evidence introduced a cycle.
     fn first_strict_subsumer_in(
         &self,
-        collection: CollectionId,
+        collection: CollectionHandle,
         lower: CollectionData,
         candidates: &BTreeSet<CollectionData>,
     ) -> Option<CollectionData> {
@@ -412,7 +412,7 @@ impl CollectionSemantics {
 
     fn cover_element(
         &self,
-        collection: CollectionId,
+        collection: CollectionHandle,
         element: CollectionData,
         resident_frontier: &BTreeSet<CollectionData>,
         mut path: BTreeSet<CollectionData>,
@@ -472,7 +472,7 @@ pub struct CollectionPhysicalCover {
 /// is not promised to be globally minimum or hardware-optimal.
 pub fn collection_physical_cover(
     semantics: &CollectionSemantics,
-    collection: CollectionId,
+    collection: CollectionHandle,
     resident: &BTreeSet<CollectionData>,
 ) -> CollectionPhysicalCover {
     let Some(members) = semantics.members(collection) else {
@@ -584,7 +584,7 @@ where
         .chain(accepted_derives.iter().map(|claim| claim.id()))
         .collect();
 
-    let mut members: BTreeMap<CollectionId, BTreeSet<CollectionData>> = BTreeMap::new();
+    let mut members: BTreeMap<CollectionHandle, BTreeSet<CollectionData>> = BTreeMap::new();
     let mut commit_ids_by_member: BTreeMap<MemberKey, BTreeSet<Id>> = BTreeMap::new();
     for commit in accepted_commits {
         members
@@ -744,7 +744,7 @@ where
 /// generating relation; its transitive closure is never materialized.
 fn close_homomorphic_order(
     mappings_by_homomorphism: &BTreeMap<
-        (CollectionId, CollectionId),
+        (CollectionHandle, CollectionHandle),
         BTreeMap<CollectionData, BTreeSet<DeriveOutput>>,
     >,
     order_results_by_input: &mut BTreeMap<MemberKey, BTreeSet<CollectionData>>,
@@ -768,8 +768,8 @@ fn close_homomorphic_order(
 }
 
 fn nearest_mapped_order_edges(
-    source: CollectionId,
-    target: CollectionId,
+    source: CollectionHandle,
+    target: CollectionHandle,
     mappings: &BTreeMap<CollectionData, BTreeSet<DeriveOutput>>,
     order_results_by_input: &BTreeMap<MemberKey, BTreeSet<CollectionData>>,
 ) -> BTreeSet<(CollectionData, CollectionData)> {
@@ -835,7 +835,7 @@ fn nearest_mapped_order_edges(
 /// Its intrinsic id gives conflict diagnostics a stable name and lets the
 /// normal lineage indexes consume asserted and implied equations uniformly.
 fn close_homomorphic_squares(
-    homomorphisms: &BTreeSet<(CollectionId, CollectionId)>,
+    homomorphisms: &BTreeSet<(CollectionHandle, CollectionHandle)>,
     active_merges: &mut BTreeMap<Id, CollectionMerge>,
     active_derives: &mut BTreeMap<Id, CollectionDerive>,
 ) -> Result<(), Box<CollectionFunctionalConflict>> {
@@ -926,9 +926,9 @@ fn ordered(
 
 fn index_merge_outputs<'a>(
     merges: impl IntoIterator<Item = &'a CollectionMerge>,
-) -> BTreeMap<(CollectionId, CollectionData, CollectionData), BTreeMap<CollectionData, Id>> {
+) -> BTreeMap<(CollectionHandle, CollectionData, CollectionData), BTreeMap<CollectionData, Id>> {
     let mut outputs: BTreeMap<
-        (CollectionId, CollectionData, CollectionData),
+        (CollectionHandle, CollectionData, CollectionData),
         BTreeMap<CollectionData, Id>,
     > = BTreeMap::new();
     for claim in merges {
@@ -945,9 +945,9 @@ fn index_merge_outputs<'a>(
 
 fn index_derive_outputs<'a>(
     derives: impl IntoIterator<Item = &'a CollectionDerive>,
-) -> BTreeMap<(CollectionId, CollectionId, CollectionData), BTreeMap<CollectionData, Id>> {
+) -> BTreeMap<(CollectionHandle, CollectionHandle, CollectionData), BTreeMap<CollectionData, Id>> {
     let mut outputs: BTreeMap<
-        (CollectionId, CollectionId, CollectionData),
+        (CollectionHandle, CollectionHandle, CollectionData),
         BTreeMap<CollectionData, Id>,
     > = BTreeMap::new();
     for claim in derives {
@@ -974,8 +974,8 @@ where
 }
 
 fn contains_member(
-    members: &BTreeMap<CollectionId, BTreeSet<CollectionData>>,
-    collection: CollectionId,
+    members: &BTreeMap<CollectionHandle, BTreeSet<CollectionData>>,
+    collection: CollectionHandle,
     data: CollectionData,
 ) -> bool {
     members
@@ -988,7 +988,7 @@ fn check_functional(
     derives: &[&CollectionDerive],
 ) -> Result<(), Box<CollectionFunctionalConflict>> {
     let mut merge_outputs: BTreeMap<
-        (CollectionId, CollectionData, CollectionData),
+        (CollectionHandle, CollectionData, CollectionData),
         BTreeMap<CollectionData, Id>,
     > = BTreeMap::new();
     for claim in merges {
@@ -1022,7 +1022,7 @@ fn check_functional(
     }
 
     let mut derive_outputs: BTreeMap<
-        (CollectionId, CollectionId, CollectionData),
+        (CollectionHandle, CollectionHandle, CollectionData),
         BTreeMap<CollectionData, Id>,
     > = BTreeMap::new();
     for claim in derives {
@@ -1147,7 +1147,7 @@ mod tests {
 
     fn reference_cover_element(
         semantics: &CollectionSemantics,
-        collection: CollectionId,
+        collection: CollectionHandle,
         element: CollectionData,
         resident_frontier: &BTreeSet<CollectionData>,
         mut path: BTreeSet<CollectionData>,
@@ -1193,7 +1193,7 @@ mod tests {
 
     fn reference_physical_cover(
         semantics: &CollectionSemantics,
-        collection: CollectionId,
+        collection: CollectionHandle,
         resident: &BTreeSet<CollectionData>,
     ) -> CollectionPhysicalCover {
         let Some(members) = semantics.members(collection) else {
@@ -2081,7 +2081,7 @@ mod tests {
 
     fn load_descriptor<R: BlobStoreGet>(
         reader: &R,
-        handle: CollectionId,
+        handle: CollectionHandle,
     ) -> Option<CollectionDescriptor> {
         let blob = reader.get(handle).ok()?;
         CollectionDescriptor::decode(&blob).ok()

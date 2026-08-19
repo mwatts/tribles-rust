@@ -752,7 +752,7 @@ async fn probe_operation_while_stepping(
 async fn fetch_evidence_result_while_stepping(
     client: triblespace_net::peer::Peer<triblespace_core::repo::memoryrepo::MemoryRepo>,
     peer: [u8; 32],
-    collection: triblespace_core::collection::CollectionId,
+    collection: triblespace_core::collection::CollectionHandle,
 ) -> (
     triblespace_net::peer::Peer<triblespace_core::repo::memoryrepo::MemoryRepo>,
     anyhow::Result<Vec<triblespace_net::collection_wire::CollectionCommitEvidence>>,
@@ -770,7 +770,7 @@ async fn fetch_evidence_result_while_stepping(
 async fn fetch_evidence_while_stepping(
     client: triblespace_net::peer::Peer<triblespace_core::repo::memoryrepo::MemoryRepo>,
     peer: [u8; 32],
-    collection: triblespace_core::collection::CollectionId,
+    collection: triblespace_core::collection::CollectionHandle,
 ) -> (
     triblespace_net::peer::Peer<triblespace_core::repo::memoryrepo::MemoryRepo>,
     Vec<triblespace_net::collection_wire::CollectionCommitEvidence>,

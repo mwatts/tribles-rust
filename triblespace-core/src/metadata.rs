@@ -100,6 +100,19 @@ pub const KIND_ATTRIBUTE: Id = id_hex!("1611CA4D740B7077EE27EBDD5274074B");
 pub const KIND_ATTRIBUTE_USAGE: Id = id_hex!("45759727A79C28D657EC06D5C6013649");
 /// Tag for entities that describe a protocol.
 pub const KIND_PROTOCOL: Id = id_hex!("A04AD649FA28DC5904385532E9C8EF74");
+
+/// Kind of a collection recipe: the law governing how a collection is
+/// constructed and merged.
+///
+/// A recipe names a law, never its arguments. Which attribute an observed set
+/// observes, or which pair of attributes a register is ordered by, are tribles
+/// on the collection descriptor, so a reader holding only the pile can recover
+/// what a collection means. Recipes carry a `describe` fragment for the same
+/// reason: an id alone would leave the law unreadable to anyone without the
+/// code that minted it.
+///
+/// Minted with `trible genid` on 2026-08-19.
+pub const KIND_COLLECTION_RECIPE: Id = id_hex!("89E53D7FF204516307F0421C05E75000");
 /// Tag for entities that are themselves tag/marker constants (e.g. kind discriminants).
 pub const KIND_TAG: Id = id_hex!("452584B4C1CAE0B77F44408E6F194A31");
 

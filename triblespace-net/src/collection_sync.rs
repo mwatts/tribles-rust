@@ -251,7 +251,7 @@ mod tests {
     use std::fmt;
 
     use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-    use triblespace_core::collection::{CollectionData, CollectionId};
+    use triblespace_core::collection::{CollectionData, CollectionHandle};
     use triblespace_core::inline::Inline;
     use triblespace_core::inline::encodings::hash::Handle;
 
@@ -328,7 +328,7 @@ mod tests {
         }
     }
 
-    fn collection(byte: u8) -> CollectionId {
+    fn collection(byte: u8) -> CollectionHandle {
         Inline::new([byte; 32])
     }
 
@@ -342,7 +342,7 @@ mod tests {
 
     fn pair(
         author: &ed25519_dalek::SigningKey,
-        collection: CollectionId,
+        collection: CollectionHandle,
         byte: u8,
     ) -> (CollectionCommit, CollectionGossip) {
         (

@@ -21,7 +21,7 @@ use super::exact_derived::{
     ExactDerivedCollection, ExactDerivedCollectionError,
 };
 use super::{
-    CollectionCommit, CollectionData, CollectionDescriptor, CollectionId, CollectionMerge,
+    CollectionCommit, CollectionData, CollectionDescriptor, CollectionHandle, CollectionMerge,
     CollectionRecord, CollectionStore,
 };
 
@@ -62,9 +62,9 @@ pub enum ExactTargetCompactionError {
     /// The blob store returned another handle for the canonical target descriptor.
     NonCanonicalDescriptorPut {
         /// Descriptor handle computed from canonical bytes.
-        expected: CollectionId,
+        expected: CollectionHandle,
         /// Handle returned by the blob store.
-        actual: CollectionId,
+        actual: CollectionHandle,
     },
     /// The blob store returned another handle for a freshly hashed target result.
     NonCanonicalTargetPut {

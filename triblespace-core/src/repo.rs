@@ -209,7 +209,7 @@ use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::blob::MemoryBlobStore;
 use crate::blob::TryFromBlob;
-use crate::collection::{CollectionData, CollectionId};
+use crate::collection::{CollectionData, CollectionHandle};
 use crate::find;
 use crate::id::genid;
 use crate::id::Id;
@@ -918,7 +918,7 @@ pub enum WantRequest {
     /// Discover or compute the exact merge of two collection elements.
     Merge {
         /// Collection whose merge operation is requested.
-        collection: CollectionId,
+        collection: CollectionHandle,
         /// Canonically lower input digest.
         low: CollectionData,
         /// Canonically higher input digest.
@@ -927,9 +927,9 @@ pub enum WantRequest {
     /// Discover or compute one collection derivation.
     Derive {
         /// Source collection containing `input`.
-        source: CollectionId,
+        source: CollectionHandle,
         /// Target collection requested for the derived output.
-        target: CollectionId,
+        target: CollectionHandle,
         /// Source element to derive.
         input: CollectionData,
     },
@@ -948,7 +948,7 @@ impl WantRequest {
     }
 
     /// Construct a merge request with its two inputs in canonical order.
-    pub fn merge(collection: CollectionId, first: CollectionData, second: CollectionData) -> Self {
+    pub fn merge(collection: CollectionHandle, first: CollectionData, second: CollectionData) -> Self {
         let (low, high) = if first <= second {
             (first, second)
         } else {
@@ -962,7 +962,7 @@ impl WantRequest {
     }
 
     /// Construct a derivation request from one exact source element.
-    pub const fn derive(source: CollectionId, target: CollectionId, input: CollectionData) -> Self {
+    pub const fn derive(source: CollectionHandle, target: CollectionHandle, input: CollectionData) -> Self {
         Self::Derive {
             source,
             target,
@@ -1116,7 +1116,7 @@ pub trait WantStore {
 mod want_request_tests {
     use super::*;
 
-    fn collection(byte: u8) -> CollectionId {
+    fn collection(byte: u8) -> CollectionHandle {
         Inline::new([byte; INLINE_LEN])
     }
 
