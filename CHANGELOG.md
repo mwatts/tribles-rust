@@ -9,6 +9,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A recipe names a law; its arguments live on the descriptor.** Four
+  collections derived a recipe id by hashing a minted algorithm id together
+  with its arguments into a phantom entity and using the digest —
+  `observed_union` with its observed attribute, the stated-order register with
+  its identity and order pair, path summaries with an automaton fingerprint,
+  and Archive BM25 downstream. Nothing ever resolved such an id; it was only
+  re-derived in-process and compared against another re-derivation of itself.
+  Deriving an id is fine as a convergence device — substitute a random one and
+  you get two collections where you wanted one, which is wasteful, not broken.
+  What is not fine is deriving it *instead of storing the fields*: the digest
+  becomes their only carrier, and a reader holding the pile cannot recover
+  what the collection means. Recipes are now minted names for laws only, and
+  the arguments are ordinary tribles on the descriptor entity. Two collections
+  differ exactly when their scope or source, representation, recipe, or
+  arguments differ — which is what the derived id was simulating, one layer
+  down and unreadably. `path_summary_recipe_id` and `register::recipe_id` are
+  removed; `PATH_SUMMARY_RECIPE_V1` and `STATED_ORDER_RECIPE_V1` name the laws.
+
+- **Descriptors carry their representation's and recipe's own descriptions.**
+  Naming a schema and a law by bare id leaves both opaque to anyone without the
+  code that minted them — which is exactly the reader who most needs the
+  answer, a peer receiving a collection it has never seen. Every law is now a
+  describable type under the new `metadata::KIND_COLLECTION_RECIPE`, and a
+  descriptor embeds those fragments. The descriptor *entity* is unchanged: it
+  names the same schema and law by the same ids and keeps its intrinsic root.
+  The archive around it grew, 256 bytes to 640 for a SimpleArchive union, and
+  with it the collection handle. Existing collections keep their old handles
+  and remain readable; new ones are written under the new shape.
+
+- **A derived collection is anchored by its source.** New `collection_source`
+  names, by handle, the collection a derivation is computed from. Scope
+  narrows to what it can honestly be — the extrinsic anchor of a *root*, still
+  needed there because without it every root collection sharing a
+  representation and recipe would have one descriptor and one handle. The
+  validators changed with it: they compared two descriptors' *scopes*, a label
+  either side could claim independently, and now ask whether the target names
+  this exact source descriptor. `ScopeMismatch` became unconstructible and is
+  removed in favour of `WrongSource`.
+
+- **`CollectionId` is now `CollectionHandle`.** It is a 32-byte blob handle,
+  and calling it an id was the one place in the codebase where the two were
+  confused — enough to mislead a reader into asking why descriptors take ids
+  when the pile stores handles. Handle means 32 bytes, Id means 16.
+
+- **`CollectionDescriptor` holds its facts and queries them.** It parsed into a
+  parallel struct and reconstructed on the way out; it now keeps the archive
+  contents unchanged, so an argument for a recipe this binary has never heard
+  of decodes, answers questions, and re-emits byte-for-byte. `scope`,
+  `representation`, `recipe` and `entity_id` are fallible queries rather than
+  infallible accessors behind a validating constructor — the failure surfaces
+  where the value is needed and names the missing field, instead of rejecting a
+  whole archive over one a caller may never read. The type is no longer `Copy`.
+
+- **Decoding no longer re-derives a descriptor's intrinsic root.** A
+  non-canonical root does not break anything; it names a second collection with
+  the same meaning, which is wasteful rather than corrupt, and rejecting it
+  turned that into a hard error.
+
 - **A stated register is an identity and an order, and the scope axis is
   gone.** `StatedOrder` shipped taking a *grouping* attribute plus optional
   `.among(attr, value)` / `.within(attr)` knobs narrowing who may dominate.
@@ -22,9 +80,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   filter — Compass's `(goal, status-kind)` — over-includes by construction:
   notes and status events both hang off `board::task` and both carry a clock,
   so a later note retired a status on 778 of 2939 live goals. Both attributes
-  fold into `StatedOrder::recipe_id`, the way `observed_union` folds its
-  observation edge, so which measure of domination a reader is using is the
-  collection's identity and never an argument. `.among` and `.within` are
+  are carried on the collection descriptor, so which measure of domination a
+  reader is using is the collection's identity and never an argument. `.among` and `.within` are
   removed with no replacement; the live relations track heads that motivated
   `.within` agree with the unscoped order on every subject in the pile, and a
   supersedes edge crossing a track is a referential-integrity finding for a
