@@ -229,7 +229,6 @@ impl Error for CommitVerificationError {}
 /// [`crate::id::ExclusiveId`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollectionDescriptor {
-    root: Id,
     facts: TribleSet,
 }
 
@@ -265,7 +264,7 @@ impl CollectionDescriptor {
     /// binary has never heard of still decodes, still answers questions about
     /// its scope and law, and still re-emits byte-for-byte on the way out.
     pub fn from_tribles(facts: &TribleSet) -> Result<Self, RecordDecodeError> {
-        let root = record_root_and_kind(facts, KIND_COLLECTION_DESCRIPTOR)?;
+        record_root_and_kind(facts, KIND_COLLECTION_DESCRIPTOR)?;
         // Presence and uniqueness of the structural attributes.
         one_id(facts, &collection_scope, "collection_scope")?;
         one_id(
@@ -275,7 +274,6 @@ impl CollectionDescriptor {
         )?;
         one_id(facts, &collection_recipe, "collection_recipe")?;
         Ok(Self {
-            root,
             facts: facts.clone(),
         })
     }
@@ -285,7 +283,12 @@ impl CollectionDescriptor {
     /// This is not the collection identity carried by claims; use
     /// [`handle`](Self::handle) for that.
     pub fn entity_id(&self) -> Id {
-        self.root
+        *self
+            .facts
+            .iter()
+            .next()
+            .expect("a decoded descriptor has facts")
+            .e()
     }
 
     /// Canonical content identity of this collection descriptor.
