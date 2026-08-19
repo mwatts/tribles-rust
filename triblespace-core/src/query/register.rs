@@ -181,21 +181,59 @@ where
         .collect()
 }
 
-/// The single maximal state, or `None` when the order left a fork.
+/// What an order left standing: nothing, exactly one state, or a fork.
 ///
-/// This is the last-write-wins read, and its `None` is load-bearing: under a
-/// total order (a timestamp with an id tie-break, say) a fork is impossible,
-/// so `None` means the order was not as total as the reader believed. The
-/// alternative — picking one — would invent an order the data does not have
-/// and hide exactly the divergence a register exists to expose.
-pub fn sole<O>(order: &O, candidates: impl IntoIterator<Item = Id>) -> Option<Id>
+/// The three cases are kept apart deliberately. An earlier shape returned
+/// `Option<Id>` and collapsed "no states at all" and "several tied states"
+/// into the same `None`, so a reader could not tell an empty register from an
+/// undecided one — and had to call [`resolve`] again to learn WHICH states
+/// forked, without even knowing whether that was worth doing. `resolve` had
+/// already computed the fork; the old shape simply discarded it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolution {
+    /// No candidate survived, because there were none to begin with.
+    Empty,
+    /// Exactly one state is maximal. This is the last-write-wins read.
+    Sole(Id),
+    /// Several states are mutually incomparable, and here they are.
+    ///
+    /// Under a total order (a timestamp with an id tie-break, say) a fork is
+    /// impossible, so this variant means the order was not as total as the
+    /// reader believed. Picking one would invent an order the data does not
+    /// have and hide exactly the divergence a register exists to expose, so
+    /// the fork is handed back instead of resolved.
+    Fork(BTreeSet<Id>),
+}
+
+impl Resolution {
+    /// The single maximal state, if the order left exactly one.
+    pub fn sole(&self) -> Option<Id> {
+        match self {
+            Resolution::Sole(id) => Some(*id),
+            _ => None,
+        }
+    }
+
+    /// Every maximal state, whatever the shape.
+    pub fn states(&self) -> BTreeSet<Id> {
+        match self {
+            Resolution::Empty => BTreeSet::new(),
+            Resolution::Sole(id) => BTreeSet::from([*id]),
+            Resolution::Fork(set) => set.clone(),
+        }
+    }
+}
+
+/// Resolve to exactly one state, an empty register, or the fork itself.
+pub fn sole<O>(order: &O, candidates: impl IntoIterator<Item = Id>) -> Resolution
 where
     O: RegisterOrder + ?Sized,
 {
-    let mut resolved = resolve(order, candidates).into_iter();
-    match (resolved.next(), resolved.next()) {
-        (Some(only), None) => Some(only),
-        _ => None,
+    let resolved = resolve(order, candidates);
+    match resolved.len() {
+        0 => Resolution::Empty,
+        1 => Resolution::Sole(*resolved.iter().next().expect("length checked")),
+        _ => Resolution::Fork(resolved),
     }
 }
 
@@ -792,7 +830,7 @@ mod tests {
         );
         // A fork is exactly where last-write-wins has no answer, and
         // reporting one would be inventing the order.
-        assert_eq!(sole(&observation(&facts), [*base, *left, *right]), None);
+        assert_eq!(sole(&observation(&facts), [*base, *left, *right]).sole(), None);
     }
 
     #[test]
@@ -810,7 +848,7 @@ mod tests {
             resolve(&observation(&facts).first(), candidates),
             [*base].into_iter().collect::<BTreeSet<_>>()
         );
-        assert_eq!(sole(&observation(&facts).first(), candidates), Some(*base));
+        assert_eq!(sole(&observation(&facts).first(), candidates), Resolution::Sole(*base));
     }
 
     // ---------------------------------------------------------------
@@ -919,17 +957,49 @@ mod tests {
             resolve(&stated(&facts), candidates),
             [*one, *two].into_iter().collect::<BTreeSet<_>>()
         );
-        assert_eq!(sole(&stated(&facts), candidates), None);
+        assert_eq!(sole(&stated(&facts), candidates).sole(), None);
 
         // Total: the id breaks the tie, so LWW always answers.
         assert_eq!(
             sole(&stated(&facts).tiebreak_by_id(), candidates),
-            Some((*one).max(*two))
+            Resolution::Sole((*one).max(*two))
         );
         assert_eq!(
             sole(&stated(&facts).tiebreak_by_id().first(), candidates),
-            Some((*one).min(*two))
+            Resolution::Sole((*one).min(*two))
         );
+    }
+
+    /// An empty register and a forked one are different answers, and the
+    /// old `Option<Id>` shape could not tell them apart. A reader that sees
+    /// "no single answer" must be able to ask whether that is because there
+    /// is nothing here or because the order failed to decide — and if it
+    /// failed, WHICH states it failed between.
+    #[test]
+    fn empty_and_forked_are_distinguishable_and_the_fork_is_returned() {
+        let goal = ufoid();
+        let one = ufoid();
+        let two = ufoid();
+
+        let mut facts = TribleSet::new();
+        facts += note(&goal, &one, 10);
+        facts += note(&goal, &two, 10); // equal keys: a genuine fork
+
+        // Nothing to resolve at all.
+        assert_eq!(sole(&stated(&facts), []), Resolution::Empty);
+
+        // A fork, and it hands back the states that forked.
+        let forked = sole(&stated(&facts), [*one, *two]);
+        assert_eq!(
+            forked,
+            Resolution::Fork([*one, *two].into_iter().collect::<BTreeSet<_>>())
+        );
+        assert_eq!(forked.states().len(), 2, "the fork must not be empty");
+
+        // Both report "no single answer", but they are not the same answer.
+        assert_eq!(forked.sole(), None);
+        assert_eq!(Resolution::Empty.sole(), None);
+        assert_ne!(forked, Resolution::Empty);
     }
 
     /// The grouping attribute is shared by more kinds of state than the
@@ -952,13 +1022,13 @@ mod tests {
         // Unscoped, the note dominates the status event and the goal has
         // no current status at all.
         assert_eq!(resolve(&stated(&facts), [*status]), BTreeSet::new());
-        assert_eq!(sole(&stated(&facts).tiebreak_by_id(), [*status]), None);
+        assert_eq!(sole(&stated(&facts).tiebreak_by_id(), [*status]).sole(), None);
 
         // Scoped to the register's own kind, the status event stands.
         let order = stated(&facts)
             .tiebreak_by_id()
             .among(metadata::tag.id(), (*status_kind).to_inline());
-        assert_eq!(sole(&order, [*status]), Some(*status));
+        assert_eq!(sole(&order, [*status]), Resolution::Sole(*status));
     }
 
     #[test]
