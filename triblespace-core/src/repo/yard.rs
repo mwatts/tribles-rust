@@ -1563,7 +1563,7 @@ mod tests {
     }
 
     fn merge_record(tag: u8) -> CollectionRecord {
-        let descriptor = CollectionDescriptor::new(
+        let descriptor = CollectionDescriptor::naming(
             pin_id(tag),
             pin_id(tag.wrapping_add(1)),
             pin_id(tag.wrapping_add(2)),
@@ -1754,7 +1754,7 @@ mod tests {
     fn collection_gossips_union_across_generations_and_survive_reclaim() {
         let config = YardConfig::default();
         let (_dir, paths, mut yard) = yard_with_paths(2, config);
-        let descriptor = CollectionDescriptor::new(pin_id(61), pin_id(62), pin_id(63));
+        let descriptor = CollectionDescriptor::naming(pin_id(61), pin_id(62), pin_id(63));
         let first = CollectionGossip::sign(&SigningKey::from_bytes(&[64; 32]), descriptor.handle());
         let second =
             CollectionGossip::sign(&SigningKey::from_bytes(&[65; 32]), descriptor.handle());
@@ -1818,7 +1818,7 @@ mod tests {
             .put::<RawBytes, _>(raw_blob(b"mentioned only by unsigned equations"))
             .unwrap();
 
-        let descriptor = CollectionDescriptor::new(pin_id(31), pin_id(32), pin_id(33));
+        let descriptor = CollectionDescriptor::naming(pin_id(31), pin_id(32), pin_id(33));
         let descriptor_handle = yard
             .put::<SimpleArchive, _>(CollectionDescriptor::to_blob(&descriptor))
             .unwrap();
@@ -1837,7 +1837,7 @@ mod tests {
             )),
             CollectionRecord::Derive(CollectionDerive::new(
                 descriptor.handle(),
-                CollectionDescriptor::new(pin_id(37), pin_id(38), pin_id(39)).handle(),
+                CollectionDescriptor::naming(pin_id(37), pin_id(38), pin_id(39)).handle(),
                 Inline::new([36; 32]),
                 Inline::new(equation_only.raw),
             )),
@@ -1880,7 +1880,7 @@ mod tests {
         let forged_metadata = yard
             .put::<SimpleArchive, _>(TribleSet::new().to_blob())
             .unwrap();
-        let descriptor = CollectionDescriptor::new(pin_id(38), pin_id(39), pin_id(40));
+        let descriptor = CollectionDescriptor::naming(pin_id(38), pin_id(39), pin_id(40));
         yard.put::<SimpleArchive, _>(CollectionDescriptor::to_blob(&descriptor))
             .unwrap();
         let invalid = invalidate_collection_commit(CollectionCommit::sign(
@@ -1916,7 +1916,7 @@ mod tests {
     #[test]
     fn valid_dangling_native_commit_survives_yard_collection_and_reclaim() {
         let (dir, mut yard) = yard_with(1, YardConfig::default());
-        let descriptor = CollectionDescriptor::new(pin_id(42), pin_id(43), pin_id(44));
+        let descriptor = CollectionDescriptor::naming(pin_id(42), pin_id(43), pin_id(44));
         yard.put::<SimpleArchive, _>(CollectionDescriptor::to_blob(&descriptor))
             .unwrap();
         let missing_data = Inline::new([45; 32]);

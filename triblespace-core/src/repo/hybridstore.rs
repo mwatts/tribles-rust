@@ -257,7 +257,7 @@ mod tests {
 
     #[test]
     fn collection_records_delegate_only_to_the_record_side() {
-        let descriptor = CollectionDescriptor::new(id(1), id(2), id(3));
+        let descriptor = CollectionDescriptor::naming(id(1), id(2), id(3));
         let record = CollectionRecord::Merge(CollectionMerge::new(
             descriptor.handle(),
             Inline::new([4; 32]),

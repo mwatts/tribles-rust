@@ -233,10 +233,38 @@ pub struct CollectionDescriptor {
 }
 
 impl CollectionDescriptor {
-    /// Construct a canonical `(scope, representation, recipe, tag)` descriptor.
-    pub fn new(scope: Id, representation: Id, recipe: Id) -> Self {
-        let fragment = collection_fragment(scope, representation, recipe);
+    /// Construct a descriptor that carries its representation's and recipe's
+    /// own descriptions.
+    ///
+    /// The descriptor entity still names them by id, so this does not change
+    /// which schema or which law a collection uses. What changes is that their
+    /// descriptions travel inside the descriptor blob, so a reader holding
+    /// that one blob can say what the collection is without resolving anything
+    /// else. That matters for a peer receiving a collection it has never seen:
+    /// a bare id is only recognisable to someone who already holds the code
+    /// that minted it.
+    pub fn new(scope: Id, representation: Fragment, recipe: Fragment) -> Self {
+        let fragment = entity! {
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_scope: scope,
+            collection_representation*: representation,
+            collection_recipe*: recipe,
+        };
         Self::from_fragment(&fragment)
+    }
+
+    /// Construct a descriptor that names its representation and recipe without
+    /// describing them.
+    ///
+    /// Prefer [`new`](Self::new), which embeds their descriptions. This exists
+    /// for callers holding only ids: the resulting collection is perfectly
+    /// usable, it just cannot tell a stranger what it means.
+    pub fn naming(scope: Id, representation: Id, recipe: Id) -> Self {
+        Self::new(
+            scope,
+            Fragment::rooted(representation, TribleSet::new()),
+            Fragment::rooted(recipe, TribleSet::new()),
+        )
     }
 
     /// Adopt a descriptor authored by [`entity!`](crate::macros::entity).
@@ -272,8 +300,31 @@ impl CollectionDescriptor {
     ///
     /// This is not the collection identity carried by claims; use
     /// [`handle`](Self::handle) for that.
+    /// Entity the descriptor's own attributes hang off.
+    ///
+    /// The archive holds more than one entity: the descriptor, plus the
+    /// embedded descriptions of its representation and its recipe. The
+    /// descriptor is the one tagged [`KIND_COLLECTION_DESCRIPTOR`].
+    ///
+    /// This is not the collection identity carried by claims; use
+    /// [`handle`](Self::handle) for that.
     pub fn entity_id(&self) -> Result<Id, RecordDecodeError> {
-        record_root_and_kind(&self.facts, KIND_COLLECTION_DESCRIPTOR)
+        let tag = metadata::tag.id();
+        let expected: Inline<GenId> =
+            crate::inline::IntoInline::to_inline(KIND_COLLECTION_DESCRIPTOR);
+        let mut found = None;
+        for fact in self.facts.iter() {
+            if *fact.a() == tag && fact.v::<GenId>().raw == expected.raw {
+                if found.is_some() {
+                    return Err(RecordDecodeError::MultipleEntities);
+                }
+                found = Some(*fact.e());
+            }
+        }
+        found.ok_or(RecordDecodeError::WrongKind {
+            expected: KIND_COLLECTION_DESCRIPTOR,
+            actual: KIND_COLLECTION_DESCRIPTOR,
+        })
     }
 
     /// Canonical content identity of this collection descriptor.
@@ -726,14 +777,6 @@ pub const COLLECTION_RECORD_KIND_MERGE_V1: u8 = 2;
 /// Dense generic-store tag for the version-1 [`CollectionRecord::Derive`] layout.
 pub const COLLECTION_RECORD_KIND_DERIVE_V1: u8 = 3;
 
-fn collection_fragment(scope: Id, representation: Id, recipe: Id) -> Fragment {
-    entity! {
-        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-        collection_scope: scope,
-        collection_representation: representation,
-        collection_recipe: recipe,
-    }
-}
 
 /// The four attributes every descriptor carries. Anything else on the entity
 /// is an argument to the recipe.
@@ -959,10 +1002,10 @@ mod tests {
 
     #[test]
     fn collection_descriptor_is_scope_specific_and_roundtrips() {
-        let a = CollectionDescriptor::new(id(1), id(2), id(3));
-        let b = CollectionDescriptor::new(id(4), id(2), id(3));
-        let c = CollectionDescriptor::new(id(1), id(4), id(3));
-        let d = CollectionDescriptor::new(id(1), id(2), id(4));
+        let a = CollectionDescriptor::naming(id(1), id(2), id(3));
+        let b = CollectionDescriptor::naming(id(4), id(2), id(3));
+        let c = CollectionDescriptor::naming(id(1), id(4), id(3));
+        let d = CollectionDescriptor::naming(id(1), id(2), id(4));
         assert_ne!(a.handle(), b.handle());
         assert_ne!(a.handle(), c.handle());
         assert_ne!(a.handle(), d.handle());
@@ -1161,7 +1204,7 @@ mod tests {
 
     #[test]
     fn transcript_and_record_roots_are_golden() {
-        let descriptor = CollectionDescriptor::new(id(1), id(2), id(3));
+        let descriptor = CollectionDescriptor::naming(id(1), id(2), id(3));
         let commit =
             CollectionCommit::sign(&fixture_key(), collection(1), hash(2), Inline::new([3; 32]));
         let merge = CollectionMerge::new(collection(1), hash(2), hash(3), hash(4));

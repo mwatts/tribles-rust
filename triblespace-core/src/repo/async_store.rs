@@ -755,7 +755,7 @@ mod tests {
     }
 
     fn collection_record(tag: u8) -> CollectionRecord {
-        let descriptor = CollectionDescriptor::new(
+        let descriptor = CollectionDescriptor::naming(
             Id::new([tag; 16]).unwrap(),
             Id::new([tag.wrapping_add(1).max(1); 16]).unwrap(),
             Id::new([tag.wrapping_add(2).max(1); 16]).unwrap(),

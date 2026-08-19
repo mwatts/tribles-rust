@@ -378,8 +378,8 @@ where
 pub fn descriptor(scope: Id) -> CollectionDescriptor {
     CollectionDescriptor::new(
         scope,
-        <SimpleArchive as MetaDescribe>::id(),
-        TRIBLE_SET_UNION_RECIPE_V1,
+        <SimpleArchive as MetaDescribe>::describe(),
+        <TribleSetUnionV1 as MetaDescribe>::describe(),
     )
 }
 
@@ -1615,7 +1615,7 @@ mod tests {
         let (descriptor, data_blob, metadata, signing_key, _) = commit_fixture();
         let mut store = ProbeStore::default();
         let wrong_descriptor =
-            CollectionDescriptor::new(descriptor.scope().unwrap(), id(8), TRIBLE_SET_UNION_RECIPE_V1);
+            CollectionDescriptor::naming(descriptor.scope().unwrap(), id(8), TRIBLE_SET_UNION_RECIPE_V1);
         assert!(matches!(
             publish_commit(
                 &mut store,
@@ -1780,13 +1780,20 @@ mod tests {
             id_hex!("6D64C5F4B9E9B73F57C5F8702AB7FE45")
         );
         assert_eq!(descriptor.scope().unwrap(), id(1));
+        // The descriptor entity is unchanged by description embedding: its own
+        // attributes still name the same scope, schema and law, so the
+        // intrinsic root is what it always was.
         assert_eq!(
             descriptor.entity_id().unwrap(),
             id_hex!("4B6F24A289B950F2CF20896EAB7A1658")
         );
+        // The handle did move, once, when the schema's and the law's own
+        // descriptions began travelling inside the descriptor archive. That is
+        // the whole cost of making a collection legible to a reader who does
+        // not already hold the code that minted its ids.
         assert_eq!(
             descriptor.handle().raw,
-            hex!("A639BFB1D8F4DD5E9AF4667512A23673812866F2CBF01D3F11DEF89850FA65B9")
+            hex!("6FB1F933F52256268E995470A108F065479F77DB781689D7480E3F5AF707B7C0")
         );
         assert_eq!(
             CollectionDescriptor::to_blob(&descriptor).get_handle(),
@@ -1890,13 +1897,13 @@ mod tests {
         validate_commit(&descriptor, &commit, &blob).unwrap();
 
         let wrong_representation =
-            CollectionDescriptor::new(descriptor.scope().unwrap(), id(9), TRIBLE_SET_UNION_RECIPE_V1);
+            CollectionDescriptor::naming(descriptor.scope().unwrap(), id(9), TRIBLE_SET_UNION_RECIPE_V1);
         assert!(matches!(
             validate_commit(&wrong_representation, &commit, &blob),
             Err(SimpleArchiveUnionValidationError::WrongRepresentation { .. })
         ));
 
-        let wrong_recipe = CollectionDescriptor::new(
+        let wrong_recipe = CollectionDescriptor::naming(
             descriptor.scope().unwrap(),
             <SimpleArchive as MetaDescribe>::id(),
             id(9),

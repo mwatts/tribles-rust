@@ -484,7 +484,7 @@ mod tests {
     #[test]
     fn wrong_descriptor_fails_before_store_access() {
         let wrong =
-            CollectionDescriptor::new(id(1), id(2), super::super::TRIBLE_SET_UNION_RECIPE_V1);
+            CollectionDescriptor::naming(id(1), id(2), super::super::TRIBLE_SET_UNION_RECIPE_V1);
         let reader = ProbeReader::default();
 
         assert!(matches!(

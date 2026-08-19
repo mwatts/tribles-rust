@@ -231,14 +231,12 @@ pub fn join(
 /// Construct the observed-set collection for one dataset scope and edge.
 pub fn descriptor(scope: Id, observes: Id) -> CollectionDescriptor {
     let observes: Inline<GenId> = crate::inline::IntoInline::to_inline(observes);
-    let representation: Inline<GenId> =
-        crate::inline::IntoInline::to_inline(<ObservedSetBlob as MetaDescribe>::id());
     let scope_value: Inline<GenId> = crate::inline::IntoInline::to_inline(scope);
     let fragment = entity! { _ @
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,
         collection_scope: scope_value,
-        collection_representation: representation,
-        collection_recipe: OBSERVED_UNION_RECIPE_V1,
+        collection_representation*: <ObservedSetBlob as MetaDescribe>::describe(),
+        collection_recipe*: <ObservedUnionV1 as MetaDescribe>::describe(),
         register_observes: observes,
     };
     CollectionDescriptor::from_fragment(&fragment)

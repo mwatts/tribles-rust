@@ -122,7 +122,7 @@ impl SuccinctArchiveCollection {
     /// target `MERGE` records because constructing that join needs the raw
     /// dependencies named by the sidecars.
     pub fn rank9_descriptor(&self) -> CollectionDescriptor {
-        CollectionDescriptor::new(
+        CollectionDescriptor::naming(
             self.scope,
             <SuccinctArchiveRank9IndexBlob as MetaDescribe>::id(),
             super::current_rank9_lifted_union_recipe(),
@@ -941,7 +941,7 @@ mod tests {
         let descriptors: BTreeSet<_> = recipes
             .into_iter()
             .map(|recipe| {
-                CollectionDescriptor::new(
+                CollectionDescriptor::naming(
                     collection.scope(),
                     <SuccinctArchiveRank9IndexBlob as MetaDescribe>::id(),
                     recipe,
@@ -960,7 +960,7 @@ mod tests {
             .into_iter()
             .find(|recipe| *recipe != current.recipe().unwrap())
             .unwrap();
-        let wrong_target = CollectionDescriptor::new(
+        let wrong_target = CollectionDescriptor::naming(
             collection.scope(),
             <SuccinctArchiveRank9IndexBlob as MetaDescribe>::id(),
             wrong_recipe,

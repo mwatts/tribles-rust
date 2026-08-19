@@ -25,7 +25,7 @@ fn id(byte: u8) -> Id {
 fn kernel() -> ExactDerivedCollection<SimpleArchive, UnknownBlob> {
     ExactDerivedCollection::new(
         simplearchive_union::descriptor(id(1)),
-        CollectionDescriptor::new(
+        CollectionDescriptor::naming(
             id(2),
             <UnknownBlob as MetaDescribe>::id(),
             simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1,
@@ -1478,7 +1478,7 @@ fn ungrounded_source_superset_cannot_escape_the_ticket() {
 fn algebra_rejects_a_lying_source_descriptor() {
     let source = archive([(1, 3)]);
     let lying_source =
-        CollectionDescriptor::new(id(1), <UnknownBlob as MetaDescribe>::id(), id(99));
+        CollectionDescriptor::naming(id(1), <UnknownBlob as MetaDescribe>::id(), id(99));
     let lifecycle = ExactDerivedCollection::<SimpleArchive, UnknownBlob>::new(
         lying_source.clone(),
         kernel().target_descriptor().clone(),

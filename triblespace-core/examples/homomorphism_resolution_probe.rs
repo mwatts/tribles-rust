@@ -64,8 +64,8 @@ fn build(
         assert!(leaves.is_power_of_two());
     }
 
-    let source = CollectionDescriptor::new(id(1), id(2), id(3));
-    let target = CollectionDescriptor::new(id(4), id(5), id(6));
+    let source = CollectionDescriptor::naming(id(1), id(2), id(3));
+    let target = CollectionDescriptor::naming(id(4), id(5), id(6));
     let source_collection = source.handle();
     let target_collection = target.handle();
     let signing_key = SigningKey::from_bytes(&[7; 32]);

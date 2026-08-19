@@ -16,6 +16,7 @@
 //! authority to construction records. `DERIVE` and `MERGE` remain unsigned,
 //! reproducible evidence.
 
+use super::simplearchive_union::TribleSetUnionV1;
 use crate::id::ExclusiveId;
 use crate::metadata;
 use crate::prelude::entity;
@@ -330,8 +331,8 @@ impl Error for SuccinctArchiveUnionValidationError {
 pub fn descriptor(scope: Id) -> CollectionDescriptor {
     CollectionDescriptor::new(
         scope,
-        <SuccinctArchiveBlob as MetaDescribe>::id(),
-        TRIBLE_SET_UNION_RECIPE_V1,
+        <SuccinctArchiveBlob as MetaDescribe>::describe(),
+        <TribleSetUnionV1 as MetaDescribe>::describe(),
     )
 }
 

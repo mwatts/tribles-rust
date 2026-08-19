@@ -296,12 +296,12 @@ mod tests {
 
     #[test]
     fn collection_records_are_idempotent_and_intrinsically_ordered() {
-        let descriptor = CollectionDescriptor::new(
+        let descriptor = CollectionDescriptor::naming(
             Id::new([1; 16]).unwrap(),
             Id::new([2; 16]).unwrap(),
             Id::new([3; 16]).unwrap(),
         );
-        let target = CollectionDescriptor::new(
+        let target = CollectionDescriptor::naming(
             Id::new([7; 16]).unwrap(),
             Id::new([8; 16]).unwrap(),
             Id::new([9; 16]).unwrap(),
@@ -336,19 +336,19 @@ mod tests {
 
     #[test]
     fn collection_primary_selection_answers_group_and_exact_conflicting_operations() {
-        let source = CollectionDescriptor::new(
+        let source = CollectionDescriptor::naming(
             Id::new([21; 16]).unwrap(),
             Id::new([22; 16]).unwrap(),
             Id::new([23; 16]).unwrap(),
         )
         .handle();
-        let target = CollectionDescriptor::new(
+        let target = CollectionDescriptor::naming(
             Id::new([24; 16]).unwrap(),
             Id::new([25; 16]).unwrap(),
             Id::new([26; 16]).unwrap(),
         )
         .handle();
-        let other = CollectionDescriptor::new(
+        let other = CollectionDescriptor::naming(
             Id::new([27; 16]).unwrap(),
             Id::new([28; 16]).unwrap(),
             Id::new([29; 16]).unwrap(),

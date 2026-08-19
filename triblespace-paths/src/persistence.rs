@@ -336,20 +336,27 @@ pub fn automaton_fingerprint(automaton: &Automaton) -> Inline<Hash<Blake3>> {
     Inline::new(Blake3::digest(&wire))
 }
 
-pub(crate) fn path_summary_recipe_fragment(automaton: &Automaton) -> Fragment {
-    let algorithm = Id::from_hex(PATH_SUMMARY_ALGORITHM_ID_HEX)
-        .expect("valid minted path-summary algorithm id");
-    let fingerprint = automaton_fingerprint(automaton);
-    entity! { _ @
-        metadata::tag: algorithm,
-        path_automaton_fingerprint: fingerprint,
-    }
-}
+/// The path-summary law.
+///
+/// This names the law only. *Which* automaton a summary is over is an argument
+/// carried on the collection descriptor as `path_automaton_fingerprint`, not
+/// folded into this id: a digest of an automaton that is stored nowhere would
+/// leave the collection's meaning unrecoverable from the pile.
+pub const PATH_SUMMARY_RECIPE_V1: Id = triblespace_core::id_hex!("341216BFE738E2D82BFFF96F52E7FE06");
 
-pub(crate) fn path_summary_recipe_id(automaton: &Automaton) -> Id {
-    path_summary_recipe_fragment(automaton)
-        .root()
-        .expect("path-summary recipe fragment is intrinsically rooted")
+/// The path-summary law, as a describable type.
+pub struct PathSummaryV1;
+
+impl MetaDescribe for PathSummaryV1 {
+    fn describe() -> Fragment {
+        let id: Id = PATH_SUMMARY_RECIPE_V1;
+        entity! {
+            ExclusiveId::force_ref(&id) @
+                metadata::name: "path-summary-v1",
+                metadata::description: "Summary of the vertex pairs connected by a fixed regular path automaton, unioned across a collection's elements. Union is associative, commutative and idempotent, so summaries merge without regard to order. Takes one argument, carried as a trible on the collection descriptor: `path_automaton_fingerprint`, the digest of the epsilon-free automaton the summary is over. A different automaton is a different collection, because it answers a different question.",
+                metadata::tag: metadata::KIND_COLLECTION_RECIPE,
+        }
+    }
 }
 
 #[cfg(test)]

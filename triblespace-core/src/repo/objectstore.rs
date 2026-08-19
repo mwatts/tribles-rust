@@ -1173,7 +1173,7 @@ mod tests {
     }
 
     fn record(tag: u8) -> CollectionRecord {
-        let descriptor = CollectionDescriptor::new(
+        let descriptor = CollectionDescriptor::naming(
             Id::new([tag; 16]).unwrap(),
             Id::new([tag.wrapping_add(1).max(1); 16]).unwrap(),
             Id::new([tag.wrapping_add(2).max(1); 16]).unwrap(),
@@ -1236,7 +1236,7 @@ mod tests {
             let mut store = remote();
             let first = CollectionGossip::sign(
                 &SigningKey::from_bytes(&[7; 32]),
-                CollectionDescriptor::new(
+                CollectionDescriptor::naming(
                     Id::new([1; 16]).unwrap(),
                     Id::new([2; 16]).unwrap(),
                     Id::new([3; 16]).unwrap(),
@@ -1245,7 +1245,7 @@ mod tests {
             );
             let second = CollectionGossip::sign(
                 &SigningKey::from_bytes(&[8; 32]),
-                CollectionDescriptor::new(
+                CollectionDescriptor::naming(
                     Id::new([4; 16]).unwrap(),
                     Id::new([5; 16]).unwrap(),
                     Id::new([6; 16]).unwrap(),
@@ -1276,7 +1276,7 @@ mod tests {
         let mut store = Blocking::new(remote()).unwrap();
         let grant = CollectionGossip::sign(
             &SigningKey::from_bytes(&[9; 32]),
-            CollectionDescriptor::new(
+            CollectionDescriptor::naming(
                 Id::new([7; 16]).unwrap(),
                 Id::new([8; 16]).unwrap(),
                 Id::new([9; 16]).unwrap(),

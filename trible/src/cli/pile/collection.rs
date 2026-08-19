@@ -377,7 +377,7 @@ mod tests {
     fn show_decodes_a_descriptor_addressed_by_its_blob_handle() {
         let scope = *fucid();
         let representation = <SimpleArchive as MetaDescribe>::id();
-        let descriptor = CollectionDescriptor::new(scope, representation, TRIBLE_SET_UNION_RECIPE_V1);
+        let descriptor = CollectionDescriptor::naming(scope, representation, TRIBLE_SET_UNION_RECIPE_V1);
 
         let mut store = MemoryBlobStore::new();
         let handle: CollectionHandle = store

@@ -1241,8 +1241,8 @@ mod tests {
 
     #[test]
     fn authorization_and_validator_status_are_distinct() {
-        let definition = CollectionDescriptor::new(id(1), id(2), id(3));
-        let missing_collection = CollectionDescriptor::new(id(9), id(2), id(3));
+        let definition = CollectionDescriptor::naming(id(1), id(2), id(3));
+        let missing_collection = CollectionDescriptor::naming(id(9), id(2), id(3));
         let authorized = commit(&definition, data(1), 1);
         let unauthorized = commit(&definition, data(2), 2);
         let missing_descriptor_commit = commit(&missing_collection, data(3), 3);
@@ -1351,7 +1351,7 @@ mod tests {
 
     #[test]
     fn callback_failure_names_the_claim_and_returns_no_snapshot() {
-        let definition = CollectionDescriptor::new(id(1), id(2), id(3));
+        let definition = CollectionDescriptor::naming(id(1), id(2), id(3));
         let root = commit(&definition, data(1), 1);
         let records = discover(&[definition], &[root.clone()], &[], &[], false);
         let error = resolve_collection_semantics::<(), _, _>(
@@ -1371,10 +1371,10 @@ mod tests {
 
     #[test]
     fn alternating_merge_derive_merge_reaches_the_least_fixed_point() {
-        let raw = CollectionDescriptor::new(id(1), id(2), id(3));
+        let raw = CollectionDescriptor::naming(id(1), id(2), id(3));
         // A deliberately different scope proves that the generic resolver does
         // not preempt the derivation validator's compatibility policy.
-        let rollup = CollectionDescriptor::new(id(9), id(4), id(5));
+        let rollup = CollectionDescriptor::naming(id(9), id(4), id(5));
         let raw_one = commit(&raw, data(1), 1);
         let raw_two = commit(&raw, data(2), 2);
         let rollup_four = commit(&rollup, data(4), 3);
@@ -1420,8 +1420,8 @@ mod tests {
 
     #[test]
     fn derive_lifts_source_subsumption_without_a_target_merge() {
-        let source = CollectionDescriptor::new(id(1), id(2), id(3));
-        let target = CollectionDescriptor::new(id(4), id(5), id(6));
+        let source = CollectionDescriptor::naming(id(1), id(2), id(3));
+        let target = CollectionDescriptor::naming(id(4), id(5), id(6));
         let first = commit(&source, data(1), 1);
         let second = commit(&source, data(2), 2);
         let source_merge = CollectionMerge::new(source.handle(), data(1), data(2), data(3));
@@ -1458,8 +1458,8 @@ mod tests {
 
     #[test]
     fn derive_lifts_order_across_unmapped_source_members() {
-        let source = CollectionDescriptor::new(id(1), id(2), id(3));
-        let target = CollectionDescriptor::new(id(4), id(5), id(6));
+        let source = CollectionDescriptor::naming(id(1), id(2), id(3));
+        let target = CollectionDescriptor::naming(id(4), id(5), id(6));
         let commits = [
             commit(&source, data(1), 1),
             commit(&source, data(2), 2),
@@ -1493,8 +1493,8 @@ mod tests {
 
     #[test]
     fn derive_carries_incomparable_leaf_witnesses_through_unmapped_joins() {
-        let source = CollectionDescriptor::new(id(1), id(2), id(3));
-        let target = CollectionDescriptor::new(id(4), id(5), id(6));
+        let source = CollectionDescriptor::naming(id(1), id(2), id(3));
+        let target = CollectionDescriptor::naming(id(4), id(5), id(6));
         let commits = [
             commit(&source, data(1), 1),
             commit(&source, data(2), 2),
@@ -1535,9 +1535,9 @@ mod tests {
 
     #[test]
     fn lifted_order_reaches_a_second_homomorphism() {
-        let source = CollectionDescriptor::new(id(1), id(2), id(3));
-        let middle = CollectionDescriptor::new(id(4), id(5), id(6));
-        let target = CollectionDescriptor::new(id(7), id(8), id(9));
+        let source = CollectionDescriptor::naming(id(1), id(2), id(3));
+        let middle = CollectionDescriptor::naming(id(4), id(5), id(6));
+        let target = CollectionDescriptor::naming(id(7), id(8), id(9));
         let commits = [commit(&source, data(1), 1), commit(&source, data(2), 2)];
         let merges = [CollectionMerge::new(
             source.handle(),
@@ -1572,8 +1572,8 @@ mod tests {
 
     #[test]
     fn homomorphic_square_supplies_target_physical_fallback() {
-        let source = CollectionDescriptor::new(id(1), id(2), id(3));
-        let target = CollectionDescriptor::new(id(4), id(5), id(6));
+        let source = CollectionDescriptor::naming(id(1), id(2), id(3));
+        let target = CollectionDescriptor::naming(id(4), id(5), id(6));
         let first = commit(&source, data(1), 1);
         let second = commit(&source, data(2), 2);
         let source_merge = CollectionMerge::new(source.handle(), data(1), data(2), data(3));
@@ -1616,8 +1616,8 @@ mod tests {
 
     #[test]
     fn target_merge_completes_the_reverse_side_of_the_square() {
-        let source = CollectionDescriptor::new(id(1), id(2), id(3));
-        let target = CollectionDescriptor::new(id(4), id(5), id(6));
+        let source = CollectionDescriptor::naming(id(1), id(2), id(3));
+        let target = CollectionDescriptor::naming(id(4), id(5), id(6));
         let first = commit(&source, data(1), 1);
         let second = commit(&source, data(2), 2);
         let source_merge = CollectionMerge::new(source.handle(), data(1), data(2), data(3));
@@ -1650,8 +1650,8 @@ mod tests {
 
     #[test]
     fn commuting_square_conflicts_are_rejected() {
-        let source = CollectionDescriptor::new(id(1), id(2), id(3));
-        let target = CollectionDescriptor::new(id(4), id(5), id(6));
+        let source = CollectionDescriptor::naming(id(1), id(2), id(3));
+        let target = CollectionDescriptor::naming(id(4), id(5), id(6));
         let first = commit(&source, data(1), 1);
         let second = commit(&source, data(2), 2);
         let source_merge = CollectionMerge::new(source.handle(), data(1), data(2), data(3));
@@ -1681,7 +1681,7 @@ mod tests {
 
     #[test]
     fn accepted_pending_merge_conflict_is_hard_and_permutation_independent() {
-        let definition = CollectionDescriptor::new(id(1), id(2), id(3));
+        let definition = CollectionDescriptor::naming(id(1), id(2), id(3));
         let first = CollectionMerge::new(definition.handle(), data(1), data(2), data(3));
         let second = CollectionMerge::new(definition.handle(), data(1), data(2), data(4));
         let definitions = [definition.clone()];
@@ -1714,8 +1714,8 @@ mod tests {
 
     #[test]
     fn derive_conflicts_are_functional_by_exact_collection_pair_and_input() {
-        let source = CollectionDescriptor::new(id(1), id(2), id(3));
-        let target = CollectionDescriptor::new(id(4), id(5), id(6));
+        let source = CollectionDescriptor::naming(id(1), id(2), id(3));
+        let target = CollectionDescriptor::naming(id(4), id(5), id(6));
         let first = CollectionDerive::new(source.handle(), target.handle(), data(1), data(2));
         let second = CollectionDerive::new(source.handle(), target.handle(), data(1), data(3));
         let records = discover(
@@ -1746,7 +1746,7 @@ mod tests {
 
     #[test]
     fn rejected_equations_do_not_conflict_or_activate() {
-        let definition = CollectionDescriptor::new(id(1), id(2), id(3));
+        let definition = CollectionDescriptor::naming(id(1), id(2), id(3));
         let first = CollectionMerge::new(definition.handle(), data(1), data(2), data(3));
         let second = CollectionMerge::new(definition.handle(), data(1), data(2), data(4));
         let records = discover(
@@ -1777,7 +1777,7 @@ mod tests {
 
     #[test]
     fn pending_validation_and_authorization_growth_are_retried_monotonically() {
-        let definition = CollectionDescriptor::new(id(1), id(2), id(3));
+        let definition = CollectionDescriptor::naming(id(1), id(2), id(3));
         let first = commit(&definition, data(1), 1);
         let second = commit(&definition, data(2), 2);
         let merge = CollectionMerge::new(definition.handle(), data(1), data(2), data(3));
@@ -1831,7 +1831,7 @@ mod tests {
 
     #[test]
     fn idempotent_and_subsuming_merges_preserve_frontier_and_provenance() {
-        let definition = CollectionDescriptor::new(id(1), id(2), id(3));
+        let definition = CollectionDescriptor::naming(id(1), id(2), id(3));
         let first = commit(&definition, data(1), 1);
         let same_data_other_commit = commit(&definition, data(1), 3);
         let second = commit(&definition, data(2), 2);
@@ -1877,7 +1877,7 @@ mod tests {
 
     #[test]
     fn physical_cover_reuses_overlaps_and_follows_nonresident_intermediates() {
-        let definition = CollectionDescriptor::new(id(1), id(2), id(3));
+        let definition = CollectionDescriptor::naming(id(1), id(2), id(3));
         let commits: Vec<_> = [(1, 1), (2, 2), (4, 3), (8, 4)]
             .into_iter()
             .map(|(element, key)| commit(&definition, data(element), key))
@@ -1917,7 +1917,7 @@ mod tests {
 
     #[test]
     fn sparse_physical_cover_matches_pairwise_reference_including_cycles() {
-        let collection = CollectionDescriptor::new(id(1), id(2), id(3)).handle();
+        let collection = CollectionDescriptor::naming(id(1), id(2), id(3)).handle();
         let elements = [data(1), data(2), data(3)];
         let members = BTreeSet::from(elements);
         let directed_edges: Vec<_> = elements
@@ -1968,7 +1968,7 @@ mod tests {
 
     #[test]
     fn many_independent_resident_members_cover_themselves() {
-        let collection = CollectionDescriptor::new(id(1), id(2), id(3)).handle();
+        let collection = CollectionDescriptor::naming(id(1), id(2), id(3)).handle();
         let members: BTreeSet<_> = (1..=4_096).map(numbered_data).collect();
         let semantics = CollectionSemantics {
             members: BTreeMap::from([(collection, members.clone())]),
@@ -1987,8 +1987,8 @@ mod tests {
 
     #[test]
     fn derives_propagate_commit_provenance_but_never_substitute_physical_bytes() {
-        let source = CollectionDescriptor::new(id(1), id(2), id(3));
-        let target = CollectionDescriptor::new(id(9), id(4), id(5));
+        let source = CollectionDescriptor::naming(id(1), id(2), id(3));
+        let target = CollectionDescriptor::naming(id(9), id(4), id(5));
         let root = commit(&source, data(1), 1);
         let derive = CollectionDerive::new(source.handle(), target.handle(), data(1), data(2));
         let records = discover(
@@ -2023,8 +2023,8 @@ mod tests {
 
     #[test]
     fn supporting_commit_walk_handles_an_active_merge_derive_cycle() {
-        let source = CollectionDescriptor::new(id(1), id(2), id(3));
-        let target = CollectionDescriptor::new(id(4), id(5), id(6));
+        let source = CollectionDescriptor::naming(id(1), id(2), id(3));
+        let target = CollectionDescriptor::naming(id(4), id(5), id(6));
         let first = commit(&source, data(1), 1);
         let second = commit(&source, data(2), 2);
         let merge = CollectionMerge::new(source.handle(), data(1), data(2), data(3));

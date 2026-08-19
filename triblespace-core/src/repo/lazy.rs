@@ -912,7 +912,7 @@ mod tests {
     #[test]
     fn collection_records_forward_through_the_store_mutex() {
         let id = |byte| Id::new([byte; 16]).unwrap();
-        let descriptor = CollectionDescriptor::new(id(1), id(2), id(3));
+        let descriptor = CollectionDescriptor::naming(id(1), id(2), id(3));
         let record = CollectionRecord::Merge(CollectionMerge::new(
             descriptor.handle(),
             Inline::new([4; 32]),

@@ -58,16 +58,23 @@
 //! identity it lacks, an attribute meaning *the status of goal G*, after
 //! which no scope is wanted: a note is simply not in that register.
 //!
-//! # Identity lives in the recipe, not at the call site
+//! # Identity lives on the collection, not at the call site
 //!
 //! Which attribute carries identity and which carries order is a property
-//! of the *register*, never of the question a reader asks. Both fold into
-//! [`StatedOrder::recipe_id`], the way an observation edge folds into
-//! [`observed_union`](crate::collection::observed_union)'s recipe and an
-//! automaton fingerprint folds into a path collection's: two registers
-//! over the same dataset but different attributes are distinct collections
-//! and cannot be confused for one another's cache. The recipe id *is*
-//! which measure of domination.
+//! of the *register*, never of the question a reader asks. Both are carried
+//! as tribles on the collection descriptor, alongside a recipe id that names
+//! the law -- [`STATED_ORDER_RECIPE_V1`] -- and nothing else. Two registers
+//! over the same dataset but different attributes are therefore distinct
+//! collections, because the descriptor's content differs and so does its
+//! handle; they cannot be confused for one another's cache.
+//!
+//! An earlier design hashed the two attributes *into* the recipe id. That
+//! made the digest the only carrier of the pair: nothing stored them, so no
+//! reader could recover which attributes a register was over. The same
+//! correction applies to
+//! [`observed_union`](crate::collection::observed_union)'s observed edge and
+//! to a path collection's automaton fingerprint, both of which are now
+//! descriptor arguments too.
 //!
 //! What is left at the call site is the frame — which commits the reader
 //! holds — and nothing else.
@@ -1010,7 +1017,7 @@ mod tests {
                 crate::metadata::tag: KIND_COLLECTION_DESCRIPTOR,
                 collection_scope: scope_value,
                 collection_representation: representation,
-                collection_recipe: STATED_ORDER_RECIPE_V1,
+                collection_recipe*: <StatedOrderV1 as crate::metadata::MetaDescribe>::describe(),
                 register_identity: identity,
                 register_orders: order,
             };

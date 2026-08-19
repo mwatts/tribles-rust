@@ -14,6 +14,7 @@
 //! performed once when a [`PathIndex`](crate::PathIndex) is materialized, so
 //! paths whose edges live in different source fragments remain discoverable.
 
+use triblespace_core::prelude::entity;
 use std::error::Error;
 use std::fmt;
 
@@ -29,7 +30,7 @@ use triblespace_core::inline::Inline;
 use triblespace_core::metadata::MetaDescribe;
 use triblespace_core::trible::{Trible, TRIBLE_LEN};
 
-use crate::persistence::path_summary_recipe_id;
+use crate::persistence::{automaton_fingerprint, path_automaton_fingerprint, PathSummaryV1, PATH_SUMMARY_RECIPE_V1};
 use crate::{Automaton, GraphEdge, PathError, PathSummary, PathSummaryBlob, PathSummaryBlobError};
 
 /// A collection descriptor participating in a validation failure.
@@ -111,6 +112,8 @@ impl Error for PathSummaryUnionError {
 /// Failure to validate the canonical path-summary collection law.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PathSummaryUnionValidationError {
+    /// The descriptor summarises a different automaton than the one supplied.
+    WrongAutomaton,
     /// The descriptor does not carry a field this check needs.
     Malformed(triblespace_core::collection::records::RecordDecodeError),
     /// A descriptor names another blob representation.
@@ -169,6 +172,9 @@ pub enum PathSummaryUnionValidationError {
 impl fmt::Display for PathSummaryUnionValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::WrongAutomaton => {
+                write!(formatter, "collection summarises a different automaton")
+            }
             Self::Malformed(error) => {
                 write!(formatter, "malformed collection descriptor: {error}")
             }
@@ -235,11 +241,20 @@ impl Error for PathSummaryUnionValidationError {
 /// so two path expressions over the same source scope form distinct target
 /// collections.
 pub fn descriptor(scope: Id, automaton: &Automaton) -> CollectionDescriptor {
-    CollectionDescriptor::new(
-        scope,
-        <PathSummaryBlob as MetaDescribe>::id(),
-        path_summary_recipe_id(automaton),
-    )
+    let scope_value: triblespace_core::inline::Inline<
+        triblespace_core::inline::encodings::genid::GenId,
+    > = triblespace_core::inline::IntoInline::to_inline(scope);
+    let fingerprint = automaton_fingerprint(automaton);
+    let fragment = entity! { _ @
+        triblespace_core::metadata::tag: triblespace_core::collection::records::KIND_COLLECTION_DESCRIPTOR,
+        triblespace_core::collection::records::collection_scope: scope_value,
+        triblespace_core::collection::records::collection_representation*:
+            <PathSummaryBlob as MetaDescribe>::describe(),
+        triblespace_core::collection::records::collection_recipe*:
+            <PathSummaryV1 as MetaDescribe>::describe(),
+        path_automaton_fingerprint: fingerprint,
+    };
+    CollectionDescriptor::from_fragment(&fragment)
 }
 
 /// Return the canonical empty path summary for one fixed automaton.
@@ -377,8 +392,13 @@ fn validate_target_descriptor(
         DescriptorRole::Target,
         collection_descriptor,
         <PathSummaryBlob as MetaDescribe>::id(),
-        path_summary_recipe_id(automaton),
-    )
+        PATH_SUMMARY_RECIPE_V1,
+    )?;
+    let expected = automaton_fingerprint(automaton);
+    match collection_descriptor.argument(path_automaton_fingerprint.id()) {
+        Some(actual) if actual == expected.raw => Ok(()),
+        _ => Err(PathSummaryUnionValidationError::WrongAutomaton),
+    }
 }
 
 fn validate_descriptor_parts(
@@ -514,7 +534,15 @@ mod tests {
         );
         assert_ne!(first.representation(), source.representation());
         assert_ne!(first.recipe(), source.recipe());
-        assert_ne!(first.recipe(), second.recipe());
+        // Two summaries over different automata share the law and are told
+        // apart by its argument, so the recipe matches while the collections
+        // differ. The automaton is readable from the descriptor rather than
+        // hidden inside a derived recipe id.
+        assert_eq!(first.recipe(), second.recipe());
+        assert_ne!(
+            first.argument(path_automaton_fingerprint.id()),
+            second.argument(path_automaton_fingerprint.id())
+        );
         assert_ne!(first.handle(), second.handle());
     }
 
@@ -766,10 +794,7 @@ mod tests {
                 &output,
                 &automaton,
             ),
-            Err(PathSummaryUnionValidationError::WrongRecipe {
-                role: DescriptorRole::Target,
-                ..
-            })
+            Err(PathSummaryUnionValidationError::WrongAutomaton)
         ));
 
         let (low, high) = ordered(&output, &other_output);

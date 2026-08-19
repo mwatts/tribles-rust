@@ -4698,7 +4698,7 @@ mod tests {
         let forged_metadata = source
             .put::<SimpleArchive, _>(metadata_facts.to_blob())
             .unwrap();
-        let descriptor = CollectionDescriptor::new(
+        let descriptor = CollectionDescriptor::naming(
             collection_test_id(21),
             collection_test_id(22),
             collection_test_id(23),
@@ -4855,7 +4855,7 @@ mod tests {
             .put::<UnknownBlob, _>(Bytes::from_source(b"unowned".to_vec()))
             .unwrap();
 
-        let descriptor = CollectionDescriptor::new(
+        let descriptor = CollectionDescriptor::naming(
             collection_test_id(10),
             collection_test_id(11),
             collection_test_id(12),
