@@ -568,7 +568,7 @@ to one would invent an order the data does not have.
 `latest` hard-codes two choices — order by the observation edge, report the
 whole antichain — and both are parameters in
 [`query::register`](triblespace::core::query::register). `latest` is now just
-the unscoped multi-value reading of that substrate.
+the multi-value reading of that substrate over an observation DAG.
 
 The useful thing to see first is that a *resolution policy* is not a second
 knob beside the order. It **is** a choice of order:
@@ -583,26 +583,50 @@ knob beside the order. It **is** a choice of order:
 There is one operation — take the maximal elements — and `sole` is a *check*
 that the order left exactly one, never a tie-break that invents one.
 
-Three axes are parameterised:
+Two axes are parameterised, and the second is smaller than it looks:
 
 - **Order.** `ObservationOrder` reads the DAG, as `latest` does. `StatedOrder`
-  compares a stated key by value among states sharing a group — a wall-clock
-  timestamp, a counter, a version number. Keys are compared as raw inline
-  bytes, which is value order exactly when the encoding is order-preserving
-  (`NsTAIInterval`, `I256BE`, `ROrd256` — deliberately *not* `R256`); this is
-  the same contract [`value_range`] carries, and the wide half of every
-  comparison is pushed into the engine through it.
+  reads an **identity** attribute and an **order** attribute — a wall-clock
+  timestamp, a counter, a version number, plus the thing it is a measurement
+  *of*. Order values are compared as raw inline bytes, which is value order
+  exactly when the encoding is order-preserving (`NsTAIInterval`, `I256BE`,
+  `ROrd256` — deliberately *not* `R256`); this is the same contract
+  [`value_range`] carries, and the wide half of every comparison is pushed into
+  the engine through it.
 - **End.** `.first()` resolves to the minimum. `min` is the join of the
   opposite order, so first-write-wins is as lawful a derivation as
   last-write-wins.
-- **Observer scope.** By default *anything* in the frame may dominate. That is
-  the widest reading and often not the wanted one: `.within(attr)` admits only
-  states sharing the candidate's value for `attr`, and `.among(attr, value)`
-  only states asserting a given fact. Scoping the *candidates* cannot substitute
-  for this, because an observer need not be a candidate — which is precisely
-  what makes the unscoped form correct for a supersedes DAG and wrong for a
-  timestamped event log, where notes and status events hang off the same
-  subject and all carry a clock.
+
+There is no scope axis, and there was briefly one, which is worth saying
+plainly because it is an easy mistake to make twice.
+
+A register is a set of states that are *versions of the same thing*, ordered.
+That is two facts. An observation edge asserts both at once — "I observed
+that" says same-thing and later in one breath — which is why the DAG order
+takes a single attribute and needs no scope. A timestamp asserts only one of
+them: it says *when*, never *of what*. So a stated order must be told the
+identity, and if it is not, the missing half comes back as a filter.
+
+Compass hangs status events, notes, and priority events off a goal through the
+same `board::task` edge, all timestamped. `board::task` means *belongs to this
+goal* — not an identity: a note is not a later version of a status event. Read
+as one, a note at t=20 dominated a status event at t=10 and the goal reported
+no status at all, on 778 of 2939 live goals. The patch was an
+`.among(tag, STATUS)` knob narrowing who may dominate — which is
+`(goal, status-kind)`, a composite identity reconstructed at the call site out
+of a grouping plus a type filter, because the real one was not in the data.
+
+The cure is to put it in the data: an attribute meaning *the status of goal G*.
+Then nothing needs narrowing, because a note is not in that register to begin
+with.
+
+**Which attribute carries identity and which carries order is a property of the
+register, not of the reader's question.** Both fold into
+`StatedOrder::recipe_id`, the way `observed_union` folds its observation edge
+and a path collection folds its automaton fingerprint: two registers over one
+dataset are distinct collections and cannot share a cache. The recipe id *is*
+which measure of domination. What is left at the call site is the frame, and
+nothing else.
 
 An order composes into a query directly. `maximal` is a filter-only constraint:
 it estimates `usize::MAX` so the planner always sorts it last and a `pattern!`
@@ -612,16 +636,16 @@ candidates.
 ```rust,ignore
 use triblespace::prelude::*;
 
+// The register: identified by `status_of`, ordered by `created_at`.
 let order = StatedOrder::<_, inlineencodings::NsTAIInterval>::new(
-    &facts, board::task.id(), metadata::created_at.id(),
+    &facts, board::status_of.id(), metadata::created_at.id(),
 )
-.tiebreak_by_id()
-.among(metadata::tag.id(), KIND_STATUS.to_inline());
+.tiebreak_by_id();
 
 let current: Vec<Id> = find!(
     event: Id,
     and!(
-        pattern!(&facts, [{ ?event @ board::task: &goal }]),
+        pattern!(&facts, [{ ?event @ board::status_of: &goal }]),
         maximal(event, &order),
     )
 ).collect();

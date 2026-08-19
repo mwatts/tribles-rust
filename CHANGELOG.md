@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A stated register is an identity and an order, and the scope axis is
+  gone.** `StatedOrder` shipped taking a *grouping* attribute plus optional
+  `.among(attr, value)` / `.within(attr)` knobs narrowing who may dominate.
+  The knobs were the missing half of the grouping, spelled at the call site:
+  a register is a set of states that are versions of the same thing, ordered,
+  and a timestamp carries only the order. An observation edge asserts both at
+  once — "I observed that" is same-thing *and* later — which is why
+  `ObservationOrder` needs no second attribute and now carries no scope
+  either. A stated key asserts neither, so `StatedOrder::new` takes the
+  identity attribute explicitly. Reconstructing it from a grouping plus a kind
+  filter — Compass's `(goal, status-kind)` — over-includes by construction:
+  notes and status events both hang off `board::task` and both carry a clock,
+  so a later note retired a status on 778 of 2939 live goals. Both attributes
+  fold into `StatedOrder::recipe_id`, the way `observed_union` folds its
+  observation edge, so which measure of domination a reader is using is the
+  collection's identity and never an argument. `.among` and `.within` are
+  removed with no replacement; the live relations track heads that motivated
+  `.within` agree with the unscoped order on every subject in the pile, and a
+  supersedes edge crossing a track is a referential-integrity finding for a
+  validation pass, not something resolution should quietly disbelieve.
+
 - **The reusable JSON scanner now enforces RFC 8259 scalar syntax.** Its
   mmap-friendly `anybytes::Bytes` string parser decodes UTF-16 surrogate pairs,
   rejects lone surrogates and all unescaped control bytes, and its zero-copy
