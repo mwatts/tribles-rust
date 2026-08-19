@@ -219,9 +219,18 @@ fn run_list(path: PathBuf, metadata: bool) -> Result<()> {
             print!("  {}", handle_hex(*handle));
             match Fields::load(&reader, *handle) {
                 Fields::Decoded(descriptor) => {
+                    // A root carries a dataset anchor; a derivation carries
+                    // the collection it derives from instead. Show whichever
+                    // the descriptor actually has rather than demanding one.
+                    match (descriptor.source(), descriptor.scope()) {
+                        (Some(source), _) => {
+                            print!("  source={}", handle_hex(source))
+                        }
+                        (None, Ok(scope)) => print!("  scope={scope:X}"),
+                        (None, Err(e)) => print!("  <no anchor: {e}>"),
+                    }
                     print!(
-                        "  scope={:X}  representation={}  recipe={}",
-                        descriptor.scope()?,
+                        "  representation={}  recipe={}",
                         named_id(
                             descriptor.representation()?,
                             representation_name(descriptor.representation()?)
@@ -293,7 +302,11 @@ fn run_show(path: PathBuf, handle: String) -> Result<()> {
         let descriptor = CollectionDescriptor::decode(&blob)
             .map_err(|e| anyhow!("decode collection descriptor: {e:?}"))?;
         println!("entity id:      {:X}", descriptor.entity_id()?);
-        println!("scope:          {:X}", descriptor.scope()?);
+        match (descriptor.source(), descriptor.scope()) {
+            (Some(source), _) => println!("source:         {}", handle_hex(source)),
+            (None, Ok(scope)) => println!("scope:          {scope:X}"),
+            (None, Err(e)) => println!("anchor:         <none: {e}>"),
+        }
         println!(
             "representation: {}",
             named_id(
