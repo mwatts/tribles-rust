@@ -27,29 +27,50 @@
 //! concurrent states is the one thing this substrate refuses to do on the
 //! reader's behalf.
 //!
-//! # The third axis: who is allowed to dominate
+//! # A register needs two fields, and a timestamp is only one of them
 //!
-//! Order and end are the two obvious knobs. The third is the one that
-//! decides whether real code can use this at all: **which states count as
-//! dominators**.
+//! A register is a set of states that are *versions of the same thing*,
+//! ordered. That is two facts, and an order carrying only one of them
+//! cannot be resolved at all. [`ObservationOrder`] gets both from a single
+//! edge: "I observed that" says *these are versions of the same thing* and
+//! *this one is later* in the same breath, which is why an observation DAG
+//! takes no second attribute and needs no scope.
 //!
-//! [`latest`](crate::query::frontier::latest) admits the whole frame — if
-//! anything at all observes a state, that state has been moved past. It is
-//! the widest reading, and for a supersedes DAG it is right. It is also, in
-//! practice, the reading almost nobody hand-rolls. Head resolution in the
-//! wild narrows the *observer* set far more often than the candidate set: a
-//! snapshot track admits only same-track snapshots, an event log only events
-//! of the same kind. Narrowing the candidates cannot express that, because
-//! domination is asked of the frame, not of the candidate set — a state
-//! outside the candidates can still dominate one inside it, which is exactly
-//! the property that makes the unscoped form correct in the first place.
+//! A stated key carries no identity whatever. A timestamp says *when*;
+//! nothing in it says *of what*. [`StatedOrder`] therefore names the
+//! identity as its own attribute, and the two together — an identity and
+//! an order — are the whole register.
 //!
-//! So [`within`](ObservationOrder::within) admits only states sharing the
-//! candidate's group, and [`among`](StatedOrder::among) only states
-//! asserting a given fact. A stated key needs this more urgently than an
-//! edge does: a grouping attribute is rarely as selective as it looks, and
-//! comparing a status event against a note that happens to hang off the same
-//! subject silently answers the wrong question.
+//! Inferring the identity from a weaker relation over-includes, and must.
+//! Compass hangs status events, notes, and priority events off a goal
+//! through the *same* `board::task` edge, and every one of them carries a
+//! timestamp. `board::task` means *belongs to this goal*, which is not an
+//! identity: a note and a status event both belong to the goal and are not
+//! versions of one another. Read as identity it lets a note written at
+//! t=20 dominate a status event written at t=10, so the goal reports no
+//! current status — on 778 of 2939 goals in the live pile.
+//!
+//! An earlier shape patched that with a scoping knob — admit as dominators
+//! only states that also assert a kind tag — reconstructing the composite
+//! identity `(goal, status-kind)` out of a grouping plus a type filter.
+//! That was never a third axis; it was the missing half of the first,
+//! spelled out at every call site. The cure is to give the data the
+//! identity it lacks, an attribute meaning *the status of goal G*, after
+//! which no scope is wanted: a note is simply not in that register.
+//!
+//! # Identity lives in the recipe, not at the call site
+//!
+//! Which attribute carries identity and which carries order is a property
+//! of the *register*, never of the question a reader asks. Both fold into
+//! [`StatedOrder::recipe_id`], the way an observation edge folds into
+//! [`observed_union`](crate::collection::observed_union)'s recipe and an
+//! automaton fingerprint folds into a path collection's: two registers
+//! over the same dataset but different attributes are distinct collections
+//! and cannot be confused for one another's cache. The recipe id *is*
+//! which measure of domination.
+//!
+//! What is left at the call site is the frame — which commits the reader
+//! holds — and nothing else.
 //!
 //! # There is no global "current"
 //!
@@ -277,13 +298,22 @@ impl RegisterOrder for Unordered {
 /// regardless. **Immediate edges suffice; no transitive closure is needed**,
 /// which is why this is one reverse-index probe per candidate and not a path
 /// query.
+///
+/// # It needs no identity attribute, because the edge is one
+///
+/// A supersedes edge asserts, in one fact, both halves a register wants:
+/// that the two states are versions of the same thing, and which of them
+/// is later. So there is nothing here for a scope to narrow. An edge
+/// arriving from what a reader considers a different track is not a state
+/// outside the register — it is a claim to be *in* the register, and if
+/// that claim is wrong the edge set is wrong. Referential integrity is a
+/// validation pass over the edges; resolution must not quietly disagree
+/// with the data it is reading.
 #[derive(Clone, Copy, Debug)]
 pub struct ObservationOrder<'a, P> {
     facts: &'a P,
     observes: Inline<GenId>,
     end: End,
-    within: Option<Inline<GenId>>,
-    observer_states: Option<(Inline<GenId>, Inline<GenId>)>,
 }
 
 impl<'a, P> ObservationOrder<'a, P>
@@ -301,42 +331,7 @@ where
             facts,
             observes: observes.to_inline(),
             end: End::Last,
-            within: None,
-            observer_states: None,
         }
-    }
-
-    /// Only states sharing this candidate's value for `group` may dominate
-    /// it.
-    ///
-    /// The default observer set is the **whole frame**: if anything at all
-    /// observes a state, that state has been moved past, whatever kind of
-    /// thing did the observing. That is the widest reading, and it is the
-    /// one `latest` has always taken.
-    ///
-    /// It is not the only defensible one, and in practice it is not even
-    /// the common one. Hand-rolled head resolution in the wild narrows the
-    /// observer set far more often than it narrows the candidate set: a
-    /// snapshot track admits only same-track snapshots as observers, so a
-    /// stray edge from outside the track cannot silently retire a head.
-    /// Scoping candidates cannot express that — an observer need not be a
-    /// candidate — which is why it is a separate knob.
-    ///
-    /// A state that states no value for `group` belongs to no register
-    /// under this scope, so nothing can dominate it.
-    pub fn within(mut self, group: Id) -> Self {
-        self.within = Some(group.to_inline());
-        self
-    }
-
-    /// Only states asserting `attribute: value` may dominate.
-    ///
-    /// The fixed-fact form of [`within`](Self::within), for the common case
-    /// where observers are identified by a kind tag rather than by sharing
-    /// the candidate's subject.
-    pub fn among(mut self, attribute: Id, value: Inline<GenId>) -> Self {
-        self.observer_states = Some((attribute.to_inline(), value));
-        self
     }
 
     /// Resolve to the DAG's **roots** instead of its frontier.
@@ -360,127 +355,69 @@ where
 {
     fn dominated(&self, state: Id) -> bool {
         let inline_state: Inline<GenId> = state.to_inline();
-
-        // The unscoped hot path stays exactly what it was: one
-        // short-circuited reverse-index probe, no observer materialised.
-        if self.within.is_none() && self.observer_states.is_none() {
-            return match self.end {
-                // Something observed me, so it is above me.
-                End::Last => exists!(temp!(
-                    (observer),
-                    self.facts.pattern(observer, self.observes, inline_state)
-                )),
-                // I observed something, so it is below me.
-                End::First => exists!(temp!(
-                    (observed),
-                    self.facts.pattern::<GenId>(inline_state, self.observes, observed)
-                )),
-            };
-        }
-
-        // Under `within`, a state with no group value is in no register,
-        // so no other state shares one with it.
-        let group = match self.within {
-            Some(group) => match self.group_of(inline_state) {
-                Some(value) => Some((group, value)),
-                None => return false,
-            },
-            None => None,
-        };
-
-        // Scoped: enumerate the neighbours across the edge and check each
-        // against the scope. Both checks are point probes and `any`
-        // short-circuits on the first witness.
-        let neighbours: Box<dyn Iterator<Item = Id>> = match self.end {
-            End::Last => Box::new(find!(
-                observer: Id,
+        match self.end {
+            // Something observed me, so it is above me.
+            End::Last => exists!(temp!(
+                (observer),
                 self.facts.pattern(observer, self.observes, inline_state)
             )),
-            End::First => Box::new(find!(
-                observed: Id,
+            // I observed something, so it is below me.
+            End::First => exists!(temp!(
+                (observed),
                 self.facts
                     .pattern::<GenId>(inline_state, self.observes, observed)
             )),
-        };
-        neighbours.into_iter().any(|neighbour| {
-            let neighbour: Inline<GenId> = neighbour.to_inline();
-            let shares_group = match group {
-                Some((attribute, value)) => {
-                    exists!(self.facts.pattern(neighbour, attribute, value))
-                }
-                None => true,
-            };
-            let states_fact = match self.observer_states {
-                Some((attribute, value)) => {
-                    exists!(self.facts.pattern(neighbour, attribute, value))
-                }
-                None => true,
-            };
-            shares_group && states_fact
-        })
+        }
     }
 }
 
-impl<P> ObservationOrder<'_, P>
-where
-    P: TriblePattern,
-{
-    /// This state's value for the `within` group attribute, if it has one.
-    fn group_of(&self, state: Inline<GenId>) -> Option<Inline<GenId>> {
-        let group = self.within?;
-        find!(
-            value: Id,
-            self.facts.pattern(state, group, value)
-        )
-        .next()
-        .map(|value| value.to_inline())
-    }
-}
-
-/// Order by a **stated** key, compared by value within a group.
+/// Order by a stated **identity** and a stated **order**.
 ///
-/// Where [`ObservationOrder`] reads an edge the writer asserted, this reads
-/// a value the writer stated — a wall-clock timestamp, a counter, a version
-/// number — and compares states that name the same subject.
+/// Where [`ObservationOrder`] reads an edge whose single assertion carries
+/// both halves of a register, this reads two values the writer stated
+/// separately:
 ///
-/// Two attributes parameterise it:
+/// * `identity` points from a state to the register it is a state *of*.
+///   Not to a subject it merely hangs off: `board::task` says a status
+///   event *belongs to* a goal, and so do the goal's notes, which is why
+///   that edge is not an identity and reading it as one lets a note retire
+///   a status. The attribute wanted is the one that means *the status of
+///   goal G* and nothing else.
+/// * `order` carries the comparable value — a wall-clock timestamp, a
+///   counter, a version number.
 ///
-/// * `group` points from a state to the subject it is a state *of*. Unlike
-///   the observation DAG, where the edge itself joins the states of one
-///   register, a stated key is meaningless across registers: comparing one
-///   goal's timestamp with another's answers nothing. The grouping the
-///   observation order leaves implicit must therefore be named here.
-/// * `key` carries the comparable value.
+/// Neither is a scope, and there is no third knob. A state whose identity
+/// is some other register is not filtered out; it was never in this one.
 ///
 /// # Byte order is value order
 ///
-/// Keys are compared as raw inline bytes, which equals the value order
-/// exactly when the encoding is order-preserving (big-endian numerics,
-/// interval timestamps). This is the same contract
+/// Order values are compared as raw inline bytes, which equals the value
+/// order exactly when the encoding is order-preserving (big-endian
+/// numerics, interval timestamps). This is the same contract
 /// [`value_range`](crate::query::rangeconstraint::value_range) already
-/// carries, and the `>=` half of every comparison is pushed into the engine
-/// through it.
+/// carries, and the `>=` half of every comparison is pushed into the
+/// engine through it.
 ///
 /// # Ties, and what a tie-break buys
 ///
 /// Without [`tiebreak_by_id`](Self::tiebreak_by_id) the order is partial:
-/// equal keys are incomparable, so two states written in the same clock tick
-/// both survive and the reader sees the tie. With it the order is total —
-/// `(key, id)` compared lexicographically — so [`sole`] always answers, and
-/// that is precisely a last-write-wins register over a stated clock.
+/// equal values are incomparable, so two states written in the same clock
+/// tick both survive and the reader sees the tie. With it the order is
+/// total — `(order, id)` compared lexicographically — so [`sole`] always
+/// answers, and that is precisely a last-write-wins register over a stated
+/// clock.
 ///
-/// The tie-break is opt-in because it is not free: a total order reports one
-/// winner where there were two writers, and whether that is a resolution or
-/// a concealment is the reader's call, not the substrate's.
+/// The tie-break is opt-in because it is not free: a total order reports
+/// one winner where there were two writers, and whether that is a
+/// resolution or a concealment is the reader's call, not the substrate's.
 #[derive(Clone, Copy, Debug)]
 pub struct StatedOrder<'a, P, K: InlineEncoding> {
     facts: &'a P,
-    group: Inline<GenId>,
-    key: Inline<GenId>,
+    identity: Inline<GenId>,
+    order: Inline<GenId>,
     end: End,
     tiebreak: bool,
-    among: Option<(Inline<GenId>, Inline<GenId>)>,
-    _key: PhantomData<K>,
+    _order: PhantomData<K>,
 }
 
 impl<'a, P, K> StatedOrder<'a, P, K>
@@ -488,51 +425,28 @@ where
     P: TriblePattern,
     K: InlineEncoding,
 {
-    /// Order states of `facts` by `key`, among states sharing a `group`.
-    pub fn new(facts: &'a P, group: Id, key: Id) -> Self {
+    /// The register whose states share an `identity`, ordered by `order`.
+    pub fn new(facts: &'a P, identity: Id, order: Id) -> Self {
         Self {
             facts,
-            group: group.to_inline(),
-            key: key.to_inline(),
+            identity: identity.to_inline(),
+            order: order.to_inline(),
             end: End::Last,
             tiebreak: false,
-            among: None,
-            _key: PhantomData,
+            _order: PhantomData,
         }
     }
 
-    /// Only states asserting `attribute: value` participate in this
-    /// register.
+    /// Resolve to the **least** value instead of the greatest.
     ///
-    /// A grouping attribute is rarely as selective as it looks. Compass
-    /// hangs status events, notes, and priority events off a goal through
-    /// the *same* `board::task` edge, and every one of them carries a
-    /// timestamp — so "the greatest key among states naming this goal"
-    /// silently compares a status event against a note, and a goal whose
-    /// last activity was a note has no current status at all. That is not a
-    /// hypothetical: it is what the live pile does, on 778 of 2939 goals.
-    ///
-    /// The register is the *status events* of a goal, not everything
-    /// attached to it, and a kind tag is how that is said. Restricting the
-    /// candidate set is not enough, because domination asks about the whole
-    /// frame — a state outside the candidate set can still dominate one
-    /// inside it, which is exactly the property that makes the unscoped
-    /// form correct for the observation DAG and wrong here.
-    pub fn among(mut self, attribute: Id, value: Inline<GenId>) -> Self {
-        self.among = Some((attribute.to_inline(), value));
-        self
-    }
-
-    /// Resolve to the **least** key instead of the greatest.
-    ///
-    /// First-write-wins. The order is the dual of the original, and `min` is
-    /// its join, so this is as lawful a derivation as `max`.
+    /// First-write-wins. The order is the dual of the original, and `min`
+    /// is its join, so this is as lawful a derivation as `max`.
     pub fn first(mut self) -> Self {
         self.end = End::First;
         self
     }
 
-    /// Break key ties by state id, making the order total.
+    /// Break ties on the order value by state id, making the order total.
     ///
     /// This is the composite order — timestamp first, id second — that a
     /// last-write-wins register wants, and it is what lets [`sole`] be
@@ -547,21 +461,80 @@ where
         self.end
     }
 
-    /// This state's group and key, if it states both.
+    /// The identity of this measure of domination.
     ///
-    /// A state asserting several groups or several keys has no single
-    /// coordinate, and this takes the first pair the index yields. That is
-    /// deterministic but arbitrary, and it is the one place this order
-    /// assumes something about the data rather than reading it: a stated
-    /// key is only a coordinate if there is exactly one of it. Designs that
-    /// permit multiplicity want the observation order, where a state with
-    /// two predecessors is a merge rather than an ambiguity.
+    /// Both attributes fold in, because both are the register: swap either
+    /// one and the answer to "which states are current" is a different
+    /// answer about a different thing. This is the same construction
+    /// [`observed_union`](crate::collection::observed_union) uses for its
+    /// observation edge and a path collection uses for its automaton
+    /// fingerprint, and it is what lets several `current` lattices over
+    /// one dataset coexist without sharing a cache.
+    ///
+    /// [`End`] and the tie-break are deliberately *not* folded in. They
+    /// choose which end of this coordinate system a reader wants and how
+    /// finely it is cut; the coordinate system is the same one either way.
+    /// A maintained artifact that is specific to one end — as
+    /// [`observed_union`](crate::collection::observed_union)'s dominated
+    /// set is to [`End::Last`] — has to say so in its own descriptor.
+    pub fn recipe_id(identity: Id, order: Id) -> Id {
+        recipe_id(identity, order)
+    }
+}
+
+crate::macros::attributes! {
+    /// The identity attribute a stated-order register reads.
+    ///
+    /// Minted with `trible genid` on 2026-08-19.
+    "AAC4B8AD847759A6910662DB2F0321BA" as pub register_identity: GenId;
+    /// The order attribute a stated-order register reads.
+    ///
+    /// Minted with `trible genid` on 2026-08-19.
+    "435F580DA18908BAEB4EB675557E0BFD" as pub register_orders: GenId;
+}
+
+/// Minted with `trible genid` on 2026-08-19.
+const STATED_ORDER_ALGORITHM_ID_HEX: &str = "6DD9E3F484DDDFF83BAC505ED33C8394";
+
+/// The recipe id of the stated order over `identity` and `order`.
+///
+/// Free-standing as well as a method, so a collection descriptor can be
+/// built without borrowing a fact source.
+pub fn recipe_id(identity: Id, order: Id) -> Id {
+    let algorithm = Id::from_hex(STATED_ORDER_ALGORITHM_ID_HEX)
+        .expect("valid minted stated-order algorithm id");
+    let identity: Inline<GenId> = identity.to_inline();
+    let order: Inline<GenId> = order.to_inline();
+    crate::macros::entity! { _ @
+        crate::metadata::tag: algorithm,
+        register_identity: identity,
+        register_orders: order,
+    }
+    .root()
+    .expect("stated-order recipe fragment is intrinsically rooted")
+}
+
+impl<P, K> StatedOrder<'_, P, K>
+where
+    P: TriblePattern,
+    K: InlineEncoding,
+{
+    /// This state's register and order value, if it states both.
+    ///
+    /// A state asserting several identities or several order values has no
+    /// single coordinate, and this takes the first pair the index yields.
+    /// That is deterministic but arbitrary, and it is the one place this
+    /// order assumes something about the data rather than reading it: a
+    /// stated coordinate is only a coordinate if there is exactly one of
+    /// it. Designs that permit multiplicity want the observation order,
+    /// where a state with two predecessors is a merge rather than an
+    /// ambiguity.
     fn coordinate(&self, state: Inline<GenId>) -> Option<(Id, Inline<K>)> {
         find!(
-            (group: Id, key: Inline<K>),
+            (register: Id, order: Inline<K>),
             and!(
-                self.facts.pattern(state, self.group, group),
-                self.facts.pattern(state, self.key, key),
+                self.facts.pattern(state, self.identity, register),
+                self.facts.pattern(state, self.order, order),
             )
         )
         .next()
@@ -575,12 +548,13 @@ where
 {
     fn dominated(&self, state: Id) -> bool {
         let inline_state: Inline<GenId> = state.to_inline();
-        // A state that states no coordinate is incomparable to everything,
-        // so nothing dominates it and it survives as a concurrent value.
-        let Some((group, key)) = self.coordinate(inline_state) else {
+        // A state that states no coordinate is in no register under this
+        // order, so nothing dominates it and it survives as a concurrent
+        // value.
+        let Some((register, key)) = self.coordinate(inline_state) else {
             return false;
         };
-        let group: Inline<GenId> = group.to_inline();
+        let register: Inline<GenId> = register.to_inline();
 
         // Push the wide half of the comparison into the engine: only states
         // on the dominating side of `key` can possibly dominate. The strict
@@ -593,23 +567,12 @@ where
         find!(
             (other: Id, candidate: Inline<K>),
             and!(
-                self.facts.pattern(other, self.group, group),
-                self.facts.pattern(other, self.key, candidate),
+                self.facts.pattern(other, self.identity, register),
+                self.facts.pattern(other, self.order, candidate),
                 value_range(candidate, low, high),
             )
         )
-        .any(|(other, candidate)| {
-            if !self.beats(candidate.raw, other, key.raw, state) {
-                return false;
-            }
-            match self.among {
-                Some((attribute, value)) => {
-                    let other: Inline<GenId> = other.to_inline();
-                    exists!(self.facts.pattern(other, attribute, value))
-                }
-                None => true,
-            }
-        })
+        .any(|(other, candidate)| self.beats(candidate.raw, other, key.raw, state))
     }
 }
 
@@ -627,7 +590,7 @@ where
         key: [u8; 32],
         state: Id,
     ) -> bool {
-        // Equal keys are incomparable unless the reader asked for a total
+        // Equal values are incomparable unless the reader asked for a total
         // order, and a state never dominates itself under either.
         if challenger_key == key {
             return self.tiebreak
@@ -766,10 +729,16 @@ mod tests {
     use crate::prelude::*;
 
     attributes! {
-        /// The subject a note is a note *of* — the register's grouping.
+        /// The register a state is a state *of* — the stated identity.
         "46D95EBAB8D5D0E9103148B35731065C" as note_of: crate::inline::encodings::genid::GenId;
-        /// When the note was written — the stated key, order-preserving.
+        /// When the state was written — the stated order, order-preserving.
         "3B7AD155842AE30B164A311858D4D9A6" as note_at: NsTAIInterval;
+        /// The register that is *the status of* a subject — an identity, and
+        /// a different one from `note_of` even on the same subject.
+        "3DE10799440A0C3D4B40261E7089DCAD" as status_of: crate::inline::encodings::genid::GenId;
+        /// A second order attribute, so the recipe can be shown to depend
+        /// on both halves and not just the identity.
+        "641C46439161BDA3F7EE8ED412AD5DEF" as other_clock: NsTAIInterval;
     }
 
     /// A point interval, which is the shape compass writes and validates.
@@ -851,12 +820,14 @@ mod tests {
         assert_eq!(sole(&observation(&facts).first(), candidates), Resolution::Sole(*base));
     }
 
-    // ---------------------------------------------------------------
-    // Observer scope — the axis every hand-rolled holdout differs on.
-    // ---------------------------------------------------------------
-
+    /// The edge is the identity claim, so an observer a reader thinks
+    /// belongs to a different track still dominates. There is deliberately
+    /// no knob to suppress that: a supersedes edge across tracks is a
+    /// wrong edge, and resolution reading the edge set faithfully is what
+    /// lets a validation pass find it. Pinned so the axis cannot creep
+    /// back in as a "fix".
     #[test]
-    fn an_observer_outside_the_track_demotes_only_when_unscoped() {
+    fn an_edge_dominates_whatever_the_reader_thinks_of_its_source() {
         let track = ufoid();
         let other_track = ufoid();
         let head = ufoid();
@@ -864,52 +835,15 @@ mod tests {
 
         let mut facts = TribleSet::new();
         facts += entity! { &head @ note_of: &track };
-        // Something on a *different* track observes our head.
         facts += entity! { &interloper @ note_of: &other_track };
         facts += edge(&interloper, &head);
 
-        // Unscoped — any observer at all demotes. This is what `latest`
-        // does today, and what the ERP corporate-group port widened to.
         assert_eq!(
             resolve(&observation(&facts), [*head]),
             BTreeSet::new(),
-            "an unscoped frontier lets any entity in the frame demote a head"
+            "an observation edge is a claim of same-register membership, \
+             and resolution must not silently disbelieve it"
         );
-
-        // Scoped to the register — only states sharing my subject may
-        // dominate me. This is the rule `track_head` hand-rolls.
-        assert_eq!(
-            resolve(&observation(&facts).within(note_of.id()), [*head]),
-            [*head].into_iter().collect::<BTreeSet<_>>()
-        );
-    }
-
-    #[test]
-    fn observers_can_be_restricted_by_a_stated_fact() {
-        let head = ufoid();
-        let snapshot = ufoid();
-        let bystander = ufoid();
-        let kind = ufoid();
-
-        let mut facts = TribleSet::new();
-        facts += entity! { &bystander @ metadata::name: "not a snapshot" };
-        facts += edge(&bystander, &head);
-
-        // Only snapshots count as observers — the rule revolver's
-        // `Heads::build` hand-rolls. The bystander cannot demote.
-        let scoped = observation(&facts).among(metadata::tag.id(), (*kind).to_inline());
-        assert_eq!(
-            resolve(&scoped, [*head]),
-            [*head].into_iter().collect::<BTreeSet<_>>()
-        );
-
-        // Tag a real snapshot as an observer and the head falls.
-        let mut with_snapshot = facts.clone();
-        with_snapshot += entity! { &snapshot @ metadata::tag: &kind };
-        with_snapshot += edge(&snapshot, &head);
-        let scoped =
-            observation(&with_snapshot).among(metadata::tag.id(), (*kind).to_inline());
-        assert_eq!(resolve(&scoped, [*head]), BTreeSet::new());
     }
 
     // ---------------------------------------------------------------
@@ -917,7 +851,7 @@ mod tests {
     // ---------------------------------------------------------------
 
     #[test]
-    fn stated_keys_resolve_within_their_own_group() {
+    fn states_resolve_only_within_their_own_register() {
         let goal = ufoid();
         let other_goal = ufoid();
         let early = ufoid();
@@ -1002,33 +936,64 @@ mod tests {
         assert_ne!(forked, Resolution::Empty);
     }
 
-    /// The grouping attribute is shared by more kinds of state than the
-    /// register contains, so the dominator side needs its own scope. This
-    /// is compass's shape exactly: a note and a status event both hang off
-    /// the goal and both carry a timestamp.
+    /// The failure that produced the removed scoping axis, and its actual
+    /// cure. `note_of` is *belongs to this subject*, shared by more kinds
+    /// of state than any one register holds; read as an identity it lets a
+    /// later note retire a status event, which is what the live pile did
+    /// on 778 of 2939 goals. The register wanted is *the status of this
+    /// subject*, and the fix is to say so in the data — after which the
+    /// order needs nothing added to it, because the note was never in the
+    /// register to be filtered out.
     #[test]
-    fn a_foreign_kind_on_the_same_group_dominates_unless_scoped() {
+    fn a_weak_grouping_read_as_identity_lets_a_foreign_kind_dominate() {
         let goal = ufoid();
         let status = ufoid();
         let commentary = ufoid();
-        let status_kind = ufoid();
 
         let mut facts = TribleSet::new();
         facts += note(&goal, &status, 10);
-        facts += entity! { &status @ metadata::tag: &status_kind };
-        // A later note on the same goal, which is not a status event.
+        // A later note on the same subject, which is not a status event.
         facts += note(&goal, &commentary, 20);
+        // The identity the register actually wants: the status *of* the
+        // goal, which the note does not claim to be a version of.
+        facts += entity! { &status @ status_of: &goal };
 
-        // Unscoped, the note dominates the status event and the goal has
-        // no current status at all.
+        // Grouping-as-identity: the note dominates, and the goal has no
+        // current status at all.
         assert_eq!(resolve(&stated(&facts), [*status]), BTreeSet::new());
-        assert_eq!(sole(&stated(&facts).tiebreak_by_id(), [*status]).sole(), None);
+        assert_eq!(
+            sole(&stated(&facts).tiebreak_by_id(), [*status]).sole(),
+            None
+        );
 
-        // Scoped to the register's own kind, the status event stands.
-        let order = stated(&facts)
-            .tiebreak_by_id()
-            .among(metadata::tag.id(), (*status_kind).to_inline());
+        // The identity attribute, with nothing else changed about the
+        // order: the status event stands, and the note is simply not here.
+        let order = StatedOrder::<_, NsTAIInterval>::new(&facts, status_of.id(), note_at.id())
+            .tiebreak_by_id();
         assert_eq!(sole(&order, [*status]), Resolution::Sole(*status));
+    }
+
+    /// Two registers over one dataset are two recipes, and the pair of
+    /// attributes is what tells them apart. Neither ever reaches a call
+    /// site: the reader asks for the maximal states of a frame, and the
+    /// recipe already says which measure of domination that is.
+    #[test]
+    fn the_recipe_id_is_the_pair_of_attributes() {
+        let notes = recipe_id(note_of.id(), note_at.id());
+        let statuses = recipe_id(status_of.id(), note_at.id());
+        assert_ne!(
+            notes, statuses,
+            "two registers over the same order attribute must not share a recipe"
+        );
+        // Swapping the order attribute is as much a different register as
+        // swapping the identity.
+        assert_ne!(notes, recipe_id(note_of.id(), other_clock.id()));
+        // And it is a function of the pair, not of the call.
+        assert_eq!(notes, recipe_id(note_of.id(), note_at.id()));
+        assert_eq!(
+            notes,
+            StatedOrder::<TribleSet, NsTAIInterval>::recipe_id(note_of.id(), note_at.id())
+        );
     }
 
     #[test]
@@ -1278,36 +1243,6 @@ mod tests {
 
         let joined = assert_join_homomorphism!(|facts| stated(facts), c1, c2, [*a, *b, *c, *d]);
         assert_eq!(joined, [*a, *b, *c].into_iter().collect::<BTreeSet<_>>());
-    }
-
-    /// The scoped observation order is a join homomorphism as well —
-    /// narrowing the observer set does not disturb the lattice argument,
-    /// because it only changes which edges count as domination.
-    #[test]
-    fn scoped_observation_order_is_a_join_homomorphism() {
-        let track = ufoid();
-        let base = ufoid();
-        let left = ufoid();
-        let right = ufoid();
-
-        let mut c1 = TribleSet::new();
-        for state in [&base, &left, &right] {
-            c1 += entity! { state @ note_of: &track };
-        }
-        c1 += edge(&left, &base);
-        let mut c2 = TribleSet::new();
-        c2 += edge(&right, &base);
-
-        let joined = assert_join_homomorphism!(
-            |facts| observation(facts).within(note_of.id()),
-            c1,
-            c2,
-            [*base, *left, *right, *track],
-        );
-        assert_eq!(
-            joined,
-            [*left, *right, *track].into_iter().collect::<BTreeSet<_>>()
-        );
     }
 
     // ---------------------------------------------------------------
