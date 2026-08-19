@@ -317,11 +317,37 @@ collection records have no head, tombstone, or
 last-writer-wins update. Their logical key is a content-derived 16-byte record
 ID; a collection record is not a trible entity.
 
-The collection itself is identified by a canonical `SimpleArchive` descriptor
-containing `(scope, representation, recipe)`. Its 32-byte blob handle is the
-sole `CollectionId`. Records carry this handle directly; there is no definition
-record or registry. Consequently a transferred claim names the exact descriptor
-bytes needed to interpret it, using the ordinary blob store.
+The collection itself is identified by a canonical `SimpleArchive` descriptor.
+Its 32-byte blob handle is the sole `CollectionHandle`. Records carry this
+handle directly; there is no definition record or registry. Consequently a
+transferred claim names the exact descriptor bytes needed to interpret it,
+using the ordinary blob store.
+
+The descriptor archive holds a descriptor entity carrying:
+
+- `metadata::tag`, the descriptor kind;
+- exactly one anchor — `collection_scope` on a root, or `collection_source` on
+  a derivation, naming by handle the collection it derives from. A derivation
+  needs no anchor of its own, because its source already anchors it, and naming
+  that source by handle rather than by a shared label means a descriptor cannot
+  claim a lineage it does not have;
+- `collection_representation` and `collection_recipe`, naming the blob schema
+  and the construction/merge law;
+- any arguments the recipe takes, as ordinary tribles — which attribute an
+  observed set observes, which pair a register is ordered by, which automaton a
+  path summary is over.
+
+A recipe id names a *law* and never its arguments. Folding arguments into a
+derived recipe id would make that digest their only carrier, so a reader
+holding the pile could not recover what a collection means.
+
+For the same reason the archive also carries the `describe` fragments of the
+representation and the recipe, so the descriptor states what its schema and its
+law *are* rather than only naming them. A bare id is legible only to someone
+who already holds the code that minted it, which is exactly the reader — a peer
+receiving a collection it has never seen — that most needs the answer. The
+descriptor entity's own attributes are unchanged by this: it names the same
+schema and the same law by the same ids, and keeps its intrinsic root.
 
 The magic markers below identify the compact pile representation. They are
 storage-envelope markers, distinct both from the stable semantic kind IDs used
@@ -362,7 +388,7 @@ turn the last-writer-wins pin log into a set.
 
 `CollectionGossipStore` is separate from `CollectionStore`. A grant is an
 author-signed, irrevocable protocol permission to redistribute that author's
-strictly verified and locally admitted `COMMIT`s in one exact `CollectionId`.
+strictly verified and locally admitted `COMMIT`s in one exact `CollectionHandle`.
 It is not a fourth collection-calculus record, does not retain any blob, and
 does not require the descriptor or commits to be present when inserted. Thus a
 grant arriving before or after its data has the same meaning under pile
@@ -384,7 +410,7 @@ and descriptor handle. Physical storage preserves even structurally decoded
 invalid witnesses so imported hostile evidence cannot corrupt a whole pile;
 consumers grant publication permission only after strict signature
 verification. Logical authorization is existential over `(author,
-CollectionId)` while storage retains byte-distinct witnesses in deterministic
+CollectionHandle)` while storage retains byte-distinct witnesses in deterministic
 order. There is deliberately no tombstone or `ungossip`: once another holder
 has observed permission, local mutation cannot take it back. Runtime policy may
 still choose not to operate a relay.

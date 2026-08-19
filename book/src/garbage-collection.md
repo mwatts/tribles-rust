@@ -44,7 +44,7 @@ Strong collection retention follows only signed ground truth. For every
 locally authorized, admitted `COMMIT`, the descriptor, signed data, and metadata
 handles are recursive roots, so all of their resident attachments remain
 owned. The descriptor is the canonical `(scope, representation, recipe)`
-`SimpleArchive`; its 32-byte content handle is the `CollectionId` carried by
+`SimpleArchive`; its 32-byte content handle is the `CollectionHandle` carried by
 the commit. The native commit record is preserved by `CollectionStore` rather
 than represented as a blob root. Planning fails if any required descriptor,
 data, or metadata blob is absent.

@@ -47,9 +47,13 @@ facts. Use `snapshot()` instead when facts, commits, and their validating reader
 must come from one coherent observed prefix; separate `ticket()` and
 `materialize()` calls are independent known-prefix observations.
 
-A collection descriptor is a canonical `SimpleArchive` containing exactly the
-dataset **scope**, blob **representation**, and algebraic **recipe**. Its
-32-byte content handle is the `CollectionId`. `COMMIT`, `MERGE`, and `DERIVE`
+A collection descriptor is a canonical `SimpleArchive` naming one **anchor** --
+a dataset **scope** on a root, or the **source** collection a derivation is
+computed from -- together with its blob **representation**, its algebraic
+**recipe**, and any arguments that recipe takes. It also embeds the
+representation's and the recipe's own descriptions, so the descriptor states
+what they are rather than only naming them. Its 32-byte content handle is the
+`CollectionHandle`. `COMMIT`, `MERGE`, and `DERIVE`
 are native typed algebra records rather than trible sets or blobs. Their exact
 dense payloads are 192, 128, and 128 bytes respectively, and carry descriptor
 handles directly, so any claim can resolve and verify its own collection

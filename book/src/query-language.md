@@ -621,12 +621,17 @@ Then nothing needs narrowing, because a note is not in that register to begin
 with.
 
 **Which attribute carries identity and which carries order is a property of the
-register, not of the reader's question.** Both fold into
-`StatedOrder::recipe_id`, the way `observed_union` folds its observation edge
-and a path collection folds its automaton fingerprint: two registers over one
-dataset are distinct collections and cannot share a cache. The recipe id *is*
-which measure of domination. What is left at the call site is the frame, and
-nothing else.
+register, not of the reader's question.** Both are carried as tribles on the
+collection descriptor, beside a recipe id that names the law and nothing else.
+Two registers over one dataset are therefore distinct collections -- their
+descriptors differ in content, so they differ in handle -- and cannot share a
+cache. What is left at the call site is the frame, and nothing else.
+
+An earlier design hashed the two attributes *into* the recipe id, as
+`observed_union` did with its observation edge and a path collection with its
+automaton fingerprint. That made the digest their only carrier: nothing stored
+the pair, so no reader could recover which attributes a register was over. All
+three now carry their arguments on the descriptor instead.
 
 An order composes into a query directly. `maximal` is a filter-only constraint:
 it estimates `usize::MAX` so the planner always sorts it last and a `pattern!`
