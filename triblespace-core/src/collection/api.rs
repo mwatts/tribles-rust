@@ -915,7 +915,10 @@ where
             }
         }
 
-        let resolution = resolve_collection_semantics(&discovered, &authorized, |request| {
+        // A plain collection facade owns one root collection and derives
+        // nothing, so it declares no lineage.
+        let resolution =
+            resolve_collection_semantics(&discovered, &BTreeMap::new(), &authorized, |request| {
             Ok::<CollectionClaimValidation<()>, Infallible>(match request {
                 CollectionValidationRequest::Commit { .. } => CollectionClaimValidation::Accepted,
                 CollectionValidationRequest::Merge { claim, .. }

@@ -211,7 +211,7 @@ fn main() {
     let min_millis: u64 = args.get(4).map(|s| s.parse().unwrap()).unwrap_or(500);
     let (records, authorized, target, members, maps) = build(leaves, shape, mapping);
 
-    let warm = resolve_collection_semantics(&records, &authorized, accepted).unwrap();
+    let warm = resolve_collection_semantics(&records, &std::collections::BTreeMap::new(), &authorized, accepted).unwrap();
     let target_frontier = warm.semantics().frontier(target).map_or(0, BTreeSet::len);
     black_box(warm);
 
@@ -219,7 +219,7 @@ fn main() {
     let started = Instant::now();
     let mut iterations = 0_u64;
     while iterations == 0 || started.elapsed() < deadline {
-        let result = resolve_collection_semantics(&records, &authorized, accepted).unwrap();
+        let result = resolve_collection_semantics(&records, &std::collections::BTreeMap::new(), &authorized, accepted).unwrap();
         black_box(result);
         iterations += 1;
     }

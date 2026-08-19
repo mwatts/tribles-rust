@@ -523,6 +523,7 @@ pub fn collection_physical_cover(
 /// elements, and physical cover can change freely with residency.
 pub fn resolve_collection_semantics<D, E, V>(
     records: &DiscoveredCollectionRecords,
+    lineage: &BTreeMap<CollectionHandle, CollectionHandle>,
     authorized_commit_ids: &BTreeSet<Id>,
     mut validate: V,
 ) -> Result<CollectionResolution<D>, CollectionResolutionError<E>>
@@ -621,12 +622,16 @@ where
         }
     }
 
-    // A source/target pair named by DERIVE denotes one canonical join
-    // homomorphism. Individual records are observations of that map, not
-    // unrelated point functions.
-    let homomorphisms: BTreeSet<_> = accepted_derives
+    // Which collection derives from which is a property of the target's
+    // DESCRIPTOR, not of any record: a derivation is one canonical join
+    // homomorphism, and individual records are observations of that map. The
+    // caller supplies the lineage because it is the party holding descriptors;
+    // resolution reads records only. A caller that cannot name a target's
+    // source could not check the derivation either, since the recipe lives in
+    // the same descriptor.
+    let homomorphisms: BTreeSet<_> = lineage
         .iter()
-        .map(|claim| (claim.source(), claim.target()))
+        .map(|(target, source)| (*source, *target))
         .collect();
 
     let mut activation_pending = BTreeSet::new();
@@ -1059,6 +1064,29 @@ fn check_functional(
 
 #[cfg(test)]
 mod tests {
+
+    /// Resolve using the lineage the derive records themselves imply.
+    ///
+    /// `CollectionDerive` still carries a `source` field that restates what
+    /// the target's descriptor says. Building the lineage from it here keeps
+    /// these tests measuring resolution rather than plumbing, and makes the
+    /// redundancy explicit: this helper is exactly what disappears when the
+    /// field does, replaced by reading the target descriptor.
+    fn resolve_with_derive_lineage<D, E, V>(
+        records: &DiscoveredCollectionRecords,
+        authorized_commit_ids: &BTreeSet<Id>,
+        validate: V,
+    ) -> Result<CollectionResolution<D>, CollectionResolutionError<E>>
+    where
+        V: for<'a> FnMut(CollectionValidationRequest<'a>) -> Result<CollectionClaimValidation<D>, E>,
+    {
+        let lineage: BTreeMap<CollectionHandle, CollectionHandle> = records
+            .derives()
+            .iter()
+            .map(|claim| (claim.target(), claim.source()))
+            .collect();
+        resolve_collection_semantics(records, &lineage, authorized_commit_ids, validate)
+    }
     use super::*;
 
     use std::convert::Infallible;
@@ -1274,7 +1302,7 @@ mod tests {
         );
         let authorized_ids = BTreeSet::from([authorized.id(), missing_descriptor_commit.id()]);
         let mut called = Vec::new();
-        let resolution = resolve_collection_semantics(&records, &authorized_ids, |request| {
+        let resolution = resolve_with_derive_lineage(&records, &authorized_ids, |request| {
             let claim = request.claim_id();
             called.push(claim);
             let descriptor_available = match request {
@@ -1354,7 +1382,7 @@ mod tests {
         let definition = CollectionDescriptor::naming(id(1), id(2), id(3));
         let root = commit(&definition, data(1), 1);
         let records = discover(&[definition], &[root.clone()], &[], &[], false);
-        let error = resolve_collection_semantics::<(), _, _>(
+        let error = resolve_with_derive_lineage::<(), _, _>(
             &records,
             &BTreeSet::from([root.id()]),
             |_| Err(InjectedFailure),
@@ -1389,8 +1417,8 @@ mod tests {
 
         let forward = discover(&definitions, &commits, &merges, &derives, false);
         let reverse = discover(&definitions, &commits, &merges, &derives, true);
-        let forward = resolve_collection_semantics(&forward, &authorized, accepted).unwrap();
-        let reverse = resolve_collection_semantics(&reverse, &authorized, accepted).unwrap();
+        let forward = resolve_with_derive_lineage(&forward, &authorized, accepted).unwrap();
+        let reverse = resolve_with_derive_lineage(&reverse, &authorized, accepted).unwrap();
         assert_eq!(forward, reverse);
         assert!(forward.validation_pending().is_empty());
         assert!(forward.activation_pending().is_empty());
@@ -1434,7 +1462,7 @@ mod tests {
             &[lower, upper],
             false,
         );
-        let resolution = resolve_collection_semantics(
+        let resolution = resolve_with_derive_lineage(
             &records,
             &BTreeSet::from([first.id(), second.id()]),
             accepted,
@@ -1481,7 +1509,7 @@ mod tests {
             false,
         );
         let authorized = commits.iter().map(CollectionCommit::id).collect();
-        let resolution = resolve_collection_semantics(&records, &authorized, accepted).unwrap();
+        let resolution = resolve_with_derive_lineage(&records, &authorized, accepted).unwrap();
         let semantics = resolution.semantics();
 
         assert!(semantics.subsumes(target.handle(), data(11), data(17)));
@@ -1521,7 +1549,7 @@ mod tests {
             false,
         );
         let authorized = commits.iter().map(CollectionCommit::id).collect();
-        let resolution = resolve_collection_semantics(&records, &authorized, accepted).unwrap();
+        let resolution = resolve_with_derive_lineage(&records, &authorized, accepted).unwrap();
         let semantics = resolution.semantics();
 
         for lower in [data(21), data(22), data(24), data(28)] {
@@ -1559,7 +1587,7 @@ mod tests {
             false,
         );
         let authorized = commits.iter().map(CollectionCommit::id).collect();
-        let resolution = resolve_collection_semantics(&records, &authorized, accepted).unwrap();
+        let resolution = resolve_with_derive_lineage(&records, &authorized, accepted).unwrap();
         let semantics = resolution.semantics();
 
         assert!(semantics.subsumes(middle.handle(), data(11), data(13)));
@@ -1589,7 +1617,7 @@ mod tests {
             &derives,
             false,
         );
-        let resolution = resolve_collection_semantics(
+        let resolution = resolve_with_derive_lineage(
             &records,
             &BTreeSet::from([first.id(), second.id()]),
             accepted,
@@ -1632,7 +1660,7 @@ mod tests {
             &[lower, upper],
             false,
         );
-        let resolution = resolve_collection_semantics(
+        let resolution = resolve_with_derive_lineage(
             &records,
             &BTreeSet::from([first.id(), second.id()]),
             accepted,
@@ -1670,7 +1698,7 @@ mod tests {
         );
 
         assert!(matches!(
-            resolve_collection_semantics(
+            resolve_with_derive_lineage(
                 &records,
                 &BTreeSet::from([first.id(), second.id()]),
                 accepted,
@@ -1690,9 +1718,9 @@ mod tests {
         let reverse = discover(&definitions, &[], &merges, &[], true);
 
         let forward =
-            resolve_collection_semantics(&forward, &BTreeSet::new(), accepted).unwrap_err();
+            resolve_with_derive_lineage(&forward, &BTreeSet::new(), accepted).unwrap_err();
         let reverse =
-            resolve_collection_semantics(&reverse, &BTreeSet::new(), accepted).unwrap_err();
+            resolve_with_derive_lineage(&reverse, &BTreeSet::new(), accepted).unwrap_err();
         assert_eq!(forward, reverse);
         assert_eq!(
             forward,
@@ -1727,7 +1755,7 @@ mod tests {
         );
 
         assert_eq!(
-            resolve_collection_semantics(&records, &BTreeSet::new(), accepted).unwrap_err(),
+            resolve_with_derive_lineage(&records, &BTreeSet::new(), accepted).unwrap_err(),
             CollectionResolutionError::Conflict(Box::new(CollectionFunctionalConflict::Derive {
                 source: source.handle(),
                 target: target.handle(),
@@ -1756,7 +1784,7 @@ mod tests {
             &[],
             false,
         );
-        let resolution = resolve_collection_semantics(&records, &BTreeSet::new(), |request| {
+        let resolution = resolve_with_derive_lineage(&records, &BTreeSet::new(), |request| {
             if request.claim_id() == second.id() {
                 Ok::<_, Infallible>(CollectionClaimValidation::Rejected("wrong output"))
             } else {
@@ -1790,7 +1818,7 @@ mod tests {
         );
 
         let first_pass =
-            resolve_collection_semantics(&records, &BTreeSet::from([first.id()]), accepted)
+            resolve_with_derive_lineage(&records, &BTreeSet::from([first.id()]), accepted)
                 .unwrap();
         assert!(first_pass.validation_pending().is_empty());
         assert_eq!(
@@ -1802,7 +1830,7 @@ mod tests {
             .contains(definition.handle(), data(3)));
 
         let authorized = BTreeSet::from([first.id(), second.id()]);
-        let callback_pending = resolve_collection_semantics(&records, &authorized, |request| {
+        let callback_pending = resolve_with_derive_lineage(&records, &authorized, |request| {
             if request.claim_id() == merge.id() {
                 Ok::<_, Infallible>(CollectionClaimValidation::<()>::Pending)
             } else {
@@ -1818,7 +1846,7 @@ mod tests {
             .semantics()
             .contains(definition.handle(), data(3)));
 
-        let final_pass = resolve_collection_semantics(&records, &authorized, accepted).unwrap();
+        let final_pass = resolve_with_derive_lineage(&records, &authorized, accepted).unwrap();
         assert!(final_pass
             .semantics()
             .contains(definition.handle(), data(3)));
@@ -1848,7 +1876,7 @@ mod tests {
             &[],
             false,
         );
-        let resolution = resolve_collection_semantics(
+        let resolution = resolve_with_derive_lineage(
             &records,
             &BTreeSet::from([first.id(), same_data_other_commit.id(), second.id()]),
             accepted,
@@ -1889,7 +1917,7 @@ mod tests {
         ];
         let records = discover(&[definition.clone()], &commits, &merges, &[], false);
         let authorized = commits.iter().map(CollectionCommit::id).collect();
-        let resolution = resolve_collection_semantics(&records, &authorized, accepted).unwrap();
+        let resolution = resolve_with_derive_lineage(&records, &authorized, accepted).unwrap();
         let semantics = resolution.semantics();
         assert_eq!(
             semantics.frontier(definition.handle()),
@@ -1999,7 +2027,7 @@ mod tests {
             false,
         );
         let resolution =
-            resolve_collection_semantics(&records, &BTreeSet::from([root.id()]), accepted).unwrap();
+            resolve_with_derive_lineage(&records, &BTreeSet::from([root.id()]), accepted).unwrap();
         let semantics = resolution.semantics();
         assert_eq!(
             semantics.supporting_commit_ids(target.handle(), data(2)),
@@ -2037,7 +2065,7 @@ mod tests {
             &[forward, backward],
             false,
         );
-        let resolution = resolve_collection_semantics(
+        let resolution = resolve_with_derive_lineage(
             &records,
             &BTreeSet::from([first.id(), second.id()]),
             accepted,
@@ -2157,7 +2185,7 @@ mod tests {
 
         let records = super::super::discover_collection_records(&mut store).unwrap();
         let reader = store.reader().unwrap();
-        let pending = resolve_collection_semantics(&records, &authorized, |request| {
+        let pending = resolve_with_derive_lineage(&records, &authorized, |request| {
             validate_union(&reader, request)
         })
         .unwrap();
@@ -2169,7 +2197,7 @@ mod tests {
         store.blobs.insert(result);
         let records = super::super::discover_collection_records(&mut store).unwrap();
         let reader = store.reader().unwrap();
-        let resolved = resolve_collection_semantics(&records, &authorized, |request| {
+        let resolved = resolve_with_derive_lineage(&records, &authorized, |request| {
             validate_union(&reader, request)
         })
         .unwrap();

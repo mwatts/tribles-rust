@@ -357,6 +357,8 @@ mod tests {
         let authorized = commits.iter().map(CollectionCommit::id).collect();
         resolve_collection_semantics(
             &discovered,
+            // This materializer only reads one root collection's commits.
+            &std::collections::BTreeMap::new(),
             &authorized,
             |_: CollectionValidationRequest<'_>| {
                 Ok::<_, Infallible>(CollectionClaimValidation::<()>::Accepted)

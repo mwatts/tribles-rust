@@ -181,6 +181,16 @@ where
 
 #[cfg(test)]
 mod tests {
+
+    fn lineage_from_derives(
+        records: &DiscoveredCollectionRecords,
+    ) -> std::collections::BTreeMap<CollectionHandle, CollectionHandle> {
+        records
+            .derives()
+            .iter()
+            .map(|claim| (claim.target(), claim.source()))
+            .collect()
+    }
     use super::*;
 
     use std::collections::BTreeSet;
@@ -347,7 +357,7 @@ mod tests {
         let records = discover_collection_records(&mut store).unwrap();
         let reader = store.reader().unwrap();
         let authorized = BTreeSet::from([commit.id()]);
-        let resolution = resolve_collection_semantics(&records, &authorized, |request| {
+        let resolution = resolve_collection_semantics(&records, &lineage_from_derives(&records), &authorized, |request| {
             validate_union(&reader, &BTreeSet::new(), request)
         })
         .unwrap();
@@ -466,7 +476,7 @@ mod tests {
         let records = discover_collection_records(&mut store).unwrap();
         let reader = store.reader().unwrap();
 
-        let unauthorized = resolve_collection_semantics(&records, &BTreeSet::new(), |request| {
+        let unauthorized = resolve_collection_semantics(&records, &lineage_from_derives(&records), &BTreeSet::new(), |request| {
             validate_union_and_derives(&reader, request)
         })
         .unwrap();
@@ -477,7 +487,7 @@ mod tests {
         assert_eq!(empty.recursive().len(), 0);
 
         let authorized = BTreeSet::from([first.id(), second.id()]);
-        let resolution = resolve_collection_semantics(&records, &authorized, |request| {
+        let resolution = resolve_collection_semantics(&records, &lineage_from_derives(&records), &authorized, |request| {
             validate_union_and_derives(&reader, request)
         })
         .unwrap();
@@ -539,7 +549,7 @@ mod tests {
         let records = discover_collection_records(&mut complete).unwrap();
         let complete_reader = complete.reader().unwrap();
         let resolution =
-            resolve_collection_semantics(&records, &BTreeSet::from([commit.id()]), |request| {
+            resolve_collection_semantics(&records, &lineage_from_derives(&records), &BTreeSet::from([commit.id()]), |request| {
                 validate_union(&complete_reader, &BTreeSet::new(), request)
             })
             .unwrap();

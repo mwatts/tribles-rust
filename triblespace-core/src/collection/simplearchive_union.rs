@@ -1258,7 +1258,7 @@ mod tests {
                 descriptor
             );
 
-            let resolution = resolve_collection_semantics(&discovered, &BTreeSet::new(), |_| {
+            let resolution = resolve_collection_semantics(&discovered, &std::collections::BTreeMap::new(), &BTreeSet::new(), |_| {
                 Ok::<_, Infallible>(CollectionClaimValidation::<()>::Pending)
             })
             .unwrap();

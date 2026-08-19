@@ -1065,7 +1065,7 @@ mod tests {
         let discovered = discover_collection_records(&mut store).unwrap();
         let authorized = BTreeSet::from([first.id(), second.id()]);
         let resolution =
-            resolve_collection_semantics::<(), Infallible, _>(&discovered, &authorized, |_| {
+            resolve_collection_semantics::<(), Infallible, _>(&discovered, &std::collections::BTreeMap::new(), &authorized, |_| {
                 Ok(CollectionClaimValidation::Accepted)
             })
             .unwrap();

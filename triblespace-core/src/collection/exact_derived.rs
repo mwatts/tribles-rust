@@ -665,7 +665,11 @@ where
             &self.target,
             algebra,
         );
-        let resolution = resolve_collection_semantics(&discovered, &authorized, |request| {
+        // This kernel holds both descriptors, so it can state the lineage the
+        // derive records observe.
+        let lineage = BTreeMap::from([(self.target.handle(), self.source.handle())]);
+        let resolution =
+            resolve_collection_semantics(&discovered, &lineage, &authorized, |request| {
             let claim = request.claim_id();
             Ok::<CollectionClaimValidation<String>, std::convert::Infallible>(
                 if matches!(request, CollectionValidationRequest::Commit { .. }) {
