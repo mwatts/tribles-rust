@@ -221,6 +221,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Registers: `latest` generalised to a parameterisable resolution
+  substrate.** `triblespace::core::query::register` makes "which states are
+  current" a question with knobs instead of one hard-coded rule, and `latest`
+  is now the thin unscoped-multi-value reading of it.
+
+  The design finding is that *policy is not a second knob*. Multi-value is the
+  maximal set under a partial order, last-write-wins is the maximal set under a
+  total order, first-write-wins is that order reversed, and named-by-the-reader
+  is the empty order. There is one operation — take the maximal elements — and
+  the policies are orders to take it under. `sole` is therefore a *check* that
+  the order left a singleton, never a tie-break that invents one.
+
+  Three axes are parameterised. **Order**: `ObservationOrder` reads an
+  observation DAG (partial, so concurrency stays visible); `StatedOrder`
+  compares a stated key by value within a group, with an opt-in id tie-break
+  that makes it total. **End**: `.first()` resolves to the minimum instead of
+  the maximum; `min` is the join of the opposite order, so first-write-wins is
+  as lawful a derivation as last-write-wins. **Observer scope**: `.within(attr)`
+  admits only states sharing the candidate's group, and `.among(attr, value)`
+  only states asserting a fact — the axis every hand-rolled holdout in practice
+  differs on, and the one candidate scoping cannot express, because an observer
+  need not be a candidate.
+
+  Two exposures. `maximal(var, &order)` is an ordinary `Constraint` in the
+  `InlineRange` shape: filter-only, estimating `usize::MAX` so the planner
+  sorts it last and a `pattern!` proposes the scope — which removes the
+  caller's obligation to materialise candidates. For an exact cardinality the
+  planner can order around, `resolve` materialises and `SortedSlice` proposes.
+  `collection::observed_union` is the maintained form: an exact derived
+  collection over `SimpleArchive` whose target is the sorted set of observed
+  ids. It materialises the *dominated* half deliberately, because that half is
+  the monotone one — a commit can only add to it — while the frontier is
+  antitone in the store's inclusion lattice. The reader subtracts, so the
+  negation stays in the reader's frame. `ObservedIndex` implements the same
+  `RegisterOrder` trait, so switching from live probes to the maintained index
+  changes a call's cost and nothing else.
+
+  Gated read-only against the live pile, with every count asserted non-zero so
+  nothing passes vacuously: wiki frontiers (13006 revisions, 3098 entries),
+  memory heads (~3850 nodes, ~3550 heads — the pile is written concurrently, so
+  these drift between runs), ERP `group_heads`, and the derived index (9908
+  observed states, the same 3098-member frontier as live probes) all identical.
+  `relations`' four snapshot tracks, which narrow *both* scope axes at once,
+  agree with `track_head` on 776 of 776 subjects; what does not carry over is
+  its integrity checking — a wrong-track predecessor and `GroupHead::Invalid`'s
+  intrinsic-id re-derivation are schema validation sitting next to head
+  resolution, not part of it. Compass's `(created_at, event id)` rule — which
+  the observation frontier cannot express, and converting it would drop 160
+  notes — agrees with `sole(StatedOrder…)` on 2939 of 2939 goals.
+
+  New stable ids, minted with `trible genid` on 2026-08-19:
+  `3C98E1A6F691E8EE888F3F49D10B8CF2` (`observed-set-v1` blob encoding),
+  `A808ECA30730EF0F1C7FD96F3FC7CB03` (observed-set algorithm/recipe),
+  `E61092974C734142217EC718CC184673` (`register_observes` attribute).
+
+
 - **`latest` resolves the frontier of any observation DAG.**
   `triblespace::core::query::frontier::latest(facts, observes, candidates)`
   (re-exported from the prelude) returns the candidates no entity in `facts`

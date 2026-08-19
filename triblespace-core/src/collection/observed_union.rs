@@ -1,0 +1,607 @@
+//! A maintained index of the states something has observed.
+//!
+//! [`resolve`](crate::query::register::resolve) answers domination with one
+//! reverse-index probe per candidate. That is cheap, but it is paid on every
+//! read, and at ERP row counts the per-candidate form is the difference
+//! between seconds and hours — which is why the holdouts in the wild scan
+//! the whole collection once and subtract instead.
+//!
+//! This is that scan, as a derived collection the store maintains.
+//!
+//! # What is maintained, and why it is the *dominated* half
+//!
+//! The obvious thing to materialise is the frontier itself. It is the wrong
+//! thing, for the reason the taxonomy gives: the head set is **antitone** in
+//! the inclusion lattice the store runs on, so a newly arriving commit can
+//! *remove* a member, and a derive whose output can shrink is not lawful.
+//!
+//! The dominated set is the monotone half of the same computation. A commit
+//! can only ever add to it, so:
+//!
+//! ```text
+//! observed(C1 union C2) = observed(C1) union observed(C2)
+//! ```
+//!
+//! is a join homomorphism into a plain union lattice — the simplest lattice
+//! there is — and the derive is exact, incremental, and order-independent.
+//! The reader recovers the frontier by subtraction, which is where the
+//! antitone step lives: outside the store, in the reader's frame, exactly
+//! where the light-cone argument says currency belongs.
+//!
+//! So the split is: **the store maintains what accumulates, the reader
+//! performs what negates.** Materialising the frontier would have pushed a
+//! non-monotone operation into a monotone engine; materialising its
+//! complement does not.
+//!
+//! # What it costs the reader
+//!
+//! [`ObservedIndex`] implements [`RegisterOrder`], so it is a drop-in for
+//! [`ObservationOrder`](crate::query::register::ObservationOrder) in
+//! [`resolve`](crate::query::register::resolve),
+//! [`sole`](crate::query::register::sole) and
+//! [`maximal`](crate::query::register::maximal). Domination becomes a binary
+//! search over a sorted `Vec` rather than a query into the fact source, and
+//! nothing else about the call changes.
+//!
+//! # Identity
+//!
+//! The observed attribute participates in the collection's recipe id, the
+//! way a path collection's automaton fingerprint does: two registers over
+//! the same dataset but different edges are distinct collections, and cannot
+//! be confused for one another's cache.
+
+use anybytes::Bytes;
+use std::error::Error;
+use std::fmt;
+
+use crate::blob::encodings::simplearchive::SimpleArchive;
+use crate::blob::{Blob, BlobEncoding};
+use crate::id::{ExclusiveId, Id};
+use crate::id_hex;
+use crate::inline::encodings::genid::GenId;
+use crate::inline::Inline;
+use crate::macros::entity;
+use crate::metadata;
+use crate::metadata::MetaDescribe;
+use crate::query::register::RegisterOrder;
+use crate::trible::{Fragment, A_START, TRIBLE_LEN, V_START};
+
+use super::exact_derived::{
+    ExactAlgebraError, ExactCover, ExactDerivedAlgebra, ExactDerivedCollection,
+    ExactDerivedCollectionError,
+};
+use super::{simplearchive_union, CollectionCommit, CollectionDescriptor, CollectionStore};
+use crate::repo::{BlobStore, BlobStoreMeta};
+
+/// Width of one stored id.
+const ID_LEN: usize = 16;
+
+crate::macros::attributes! {
+    /// The observation attribute a derived observed-set collection reads.
+    ///
+    /// Minted with `trible genid` on 2026-08-19.
+    "E61092974C734142217EC718CC184673" as pub register_observes: GenId;
+}
+
+/// Minted with `trible genid` on 2026-08-19.
+const OBSERVED_SET_ALGORITHM_ID_HEX: &str = "A808ECA30730EF0F1C7FD96F3FC7CB03";
+
+/// Canonical sorted set of observed state ids.
+///
+/// The bytes are a strictly increasing sequence of 16-byte ids and nothing
+/// else, so the canonical form of a set is unique and the empty set is zero
+/// bytes. Strictly increasing rather than merely sorted: a duplicate would
+/// give one set two encodings, and the exact-derive kernel compares target
+/// bytes for equality.
+pub struct ObservedSetBlob;
+
+impl BlobEncoding for ObservedSetBlob {}
+
+impl MetaDescribe for ObservedSetBlob {
+    fn describe() -> Fragment {
+        // Minted with `trible genid` on 2026-08-19.
+        let id: Id = id_hex!("3C98E1A6F691E8EE888F3F49D10B8CF2");
+        entity! { ExclusiveId::force_ref(&id) @
+            metadata::name: "observed-set-v1",
+            metadata::description: "Strictly increasing sequence of 16-byte state ids that some entity observes over one fixed attribute. The monotone half of register resolution: readers subtract this set from their candidates to obtain the frontier. Empty is zero bytes.",
+            metadata::tag: metadata::KIND_BLOB_ENCODING,
+        }
+    }
+}
+
+/// Canonical observed-set validation failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ObservedSetError {
+    /// The payload is not a whole number of ids.
+    BadLength(usize),
+    /// The ids are not strictly increasing.
+    NotStrictlyIncreasing,
+}
+
+impl fmt::Display for ObservedSetError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BadLength(len) => {
+                write!(formatter, "observed set of {len} bytes is not a whole number of {ID_LEN}-byte ids")
+            }
+            Self::NotStrictlyIncreasing => {
+                formatter.write_str("observed set ids are not strictly increasing")
+            }
+        }
+    }
+}
+
+impl Error for ObservedSetError {}
+
+/// Validate one canonical observed-set element.
+pub fn validate_element(blob: &Blob<ObservedSetBlob>) -> Result<(), ObservedSetError> {
+    let bytes = blob.bytes.as_ref();
+    if bytes.len() % ID_LEN != 0 {
+        return Err(ObservedSetError::BadLength(bytes.len()));
+    }
+    if bytes
+        .chunks_exact(ID_LEN)
+        .zip(bytes.chunks_exact(ID_LEN).skip(1))
+        .any(|(low, high)| low >= high)
+    {
+        return Err(ObservedSetError::NotStrictlyIncreasing);
+    }
+    Ok(())
+}
+
+/// The canonical empty observed set.
+pub fn empty() -> Blob<ObservedSetBlob> {
+    Blob::new(Bytes::from_source(Vec::<u8>::new()))
+}
+
+/// Canonically derive one observed set from a `SimpleArchive`.
+///
+/// Every trible written under `observes` contributes its **value** — the
+/// state that was observed, and therefore the state that has been moved
+/// past. Values that are not well-formed ids are skipped rather than
+/// rejected: an unrelated encoding stored under the same attribute is not
+/// evidence about any register, and this derivation must never fail on
+/// facts it simply has no opinion about.
+pub fn derive_element(
+    source: &Blob<SimpleArchive>,
+    observes: Id,
+) -> Result<Blob<ObservedSetBlob>, ObservedSetError> {
+    let bytes = source.bytes.as_ref();
+    if bytes.len() % TRIBLE_LEN != 0 {
+        return Err(ObservedSetError::BadLength(bytes.len()));
+    }
+    let mut observed: Vec<[u8; ID_LEN]> = Vec::new();
+    for trible in bytes.chunks_exact(TRIBLE_LEN) {
+        if trible[A_START..A_START + ID_LEN] != observes[..] {
+            continue;
+        }
+        let value = &trible[V_START..V_START + 32];
+        // A GenId keeps the id in the low 16 bytes and zeroes the high 16.
+        if value[0..16].iter().any(|&byte| byte != 0) {
+            continue;
+        }
+        let low: [u8; ID_LEN] = value[16..32].try_into().expect("16-byte tail");
+        if low.iter().all(|&byte| byte == 0) {
+            continue;
+        }
+        observed.push(low);
+    }
+    observed.sort_unstable();
+    observed.dedup();
+    Ok(Blob::new(Bytes::from_source(observed.concat())))
+}
+
+/// The canonical union of two observed sets.
+pub fn join(
+    low: &Blob<ObservedSetBlob>,
+    high: &Blob<ObservedSetBlob>,
+) -> Result<Blob<ObservedSetBlob>, ObservedSetError> {
+    validate_element(low)?;
+    validate_element(high)?;
+    let left = low.bytes.as_ref();
+    let right = high.bytes.as_ref();
+    let mut merged: Vec<u8> = Vec::with_capacity(left.len() + right.len());
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < left.len() && j < right.len() {
+        let a = &left[i..i + ID_LEN];
+        let b = &right[j..j + ID_LEN];
+        match a.cmp(b) {
+            std::cmp::Ordering::Less => {
+                merged.extend_from_slice(a);
+                i += ID_LEN;
+            }
+            std::cmp::Ordering::Greater => {
+                merged.extend_from_slice(b);
+                j += ID_LEN;
+            }
+            std::cmp::Ordering::Equal => {
+                merged.extend_from_slice(a);
+                i += ID_LEN;
+                j += ID_LEN;
+            }
+        }
+    }
+    merged.extend_from_slice(&left[i..]);
+    merged.extend_from_slice(&right[j..]);
+    Ok(Blob::new(Bytes::from_source(merged)))
+}
+
+/// Construct the observed-set collection for one dataset scope and edge.
+pub fn descriptor(scope: Id, observes: Id) -> CollectionDescriptor {
+    CollectionDescriptor::new(
+        scope,
+        <ObservedSetBlob as MetaDescribe>::id(),
+        recipe_id(observes),
+    )
+}
+
+fn recipe_id(observes: Id) -> Id {
+    let algorithm =
+        Id::from_hex(OBSERVED_SET_ALGORITHM_ID_HEX).expect("valid minted observed-set algorithm id");
+    let observes: Inline<GenId> = crate::inline::IntoInline::to_inline(&observes);
+    entity! { _ @
+        metadata::tag: algorithm,
+        register_observes: observes,
+    }
+    .root()
+    .expect("observed-set recipe fragment is intrinsically rooted")
+}
+
+/// A resolved observed set, ready to answer domination.
+///
+/// Implements [`RegisterOrder`], so it substitutes for a live
+/// [`ObservationOrder`](crate::query::register::ObservationOrder) anywhere
+/// the substrate takes an order — the difference is a binary search instead
+/// of an index probe, and nothing else.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ObservedIndex {
+    observed: Vec<[u8; ID_LEN]>,
+}
+
+impl ObservedIndex {
+    /// Decode a validated observed set.
+    pub fn decode(blob: &Blob<ObservedSetBlob>) -> Result<Self, ObservedSetError> {
+        validate_element(blob)?;
+        Ok(Self {
+            observed: blob
+                .bytes
+                .as_ref()
+                .chunks_exact(ID_LEN)
+                .map(|chunk| chunk.try_into().expect("16-byte chunk"))
+                .collect(),
+        })
+    }
+
+    /// How many distinct states have been observed.
+    ///
+    /// An exact count, so a caller that wants the planner to order around
+    /// resolution has a real cardinality to hand it.
+    pub fn len(&self) -> usize {
+        self.observed.len()
+    }
+
+    /// Whether nothing has been observed yet.
+    pub fn is_empty(&self) -> bool {
+        self.observed.is_empty()
+    }
+}
+
+impl RegisterOrder for ObservedIndex {
+    fn dominated(&self, state: Id) -> bool {
+        let raw: [u8; ID_LEN] = state[..].try_into().expect("id is 16 bytes");
+        self.observed.binary_search(&raw).is_ok()
+    }
+}
+
+/// Canonical observed-set projection of one source `SimpleArchive`
+/// collection.
+#[derive(Clone, Debug)]
+pub struct ObservedSetCollection {
+    scope: Id,
+    observes: Id,
+}
+
+impl ObservedSetCollection {
+    /// Construct the observed-set projection for `scope` and `observes`.
+    pub fn new(scope: Id, observes: Id) -> Self {
+        Self { scope, observes }
+    }
+
+    /// Dataset scope shared with the source collection.
+    pub fn scope(&self) -> Id {
+        self.scope
+    }
+
+    /// The observation attribute this collection reads.
+    pub fn observes(&self) -> Id {
+        self.observes
+    }
+
+    /// Canonical source `SimpleArchive` collection descriptor.
+    pub fn source_descriptor(&self) -> CollectionDescriptor {
+        simplearchive_union::descriptor(self.scope)
+    }
+
+    /// Canonical target observed-set collection descriptor.
+    pub fn descriptor(&self) -> CollectionDescriptor {
+        descriptor(self.scope, self.observes)
+    }
+
+    /// Attach the observed set already resident for `ticket`.
+    pub fn attach_exact<S>(
+        &self,
+        store: &mut S,
+        ticket: &[CollectionCommit],
+    ) -> Result<ObservedIndex, ObservedSetCollectionError>
+    where
+        S: BlobStore + CollectionStore,
+        S::Reader: BlobStoreMeta,
+    {
+        let cover = self.kernel().attach_exact(store, ticket, self)?;
+        self.index_from_cover(cover)
+    }
+
+    /// Ensure and attach the observed set for `ticket`.
+    pub fn ensure_exact<S>(
+        &self,
+        store: &mut S,
+        ticket: &[CollectionCommit],
+    ) -> Result<ObservedIndex, ObservedSetCollectionError>
+    where
+        S: BlobStore + CollectionStore,
+        S::Reader: BlobStoreMeta,
+    {
+        let cover = self.kernel().ensure_exact(store, ticket, self)?;
+        self.index_from_cover(cover)
+    }
+
+    fn kernel(&self) -> ExactDerivedCollection<SimpleArchive, ObservedSetBlob> {
+        ExactDerivedCollection::new(self.source_descriptor(), self.descriptor())
+    }
+
+    fn index_from_cover(
+        &self,
+        cover: ExactCover<ObservedSetBlob>,
+    ) -> Result<ObservedIndex, ObservedSetCollectionError> {
+        let mut joined = empty();
+        for segment in cover.into_blobs() {
+            joined = join(&joined, &segment).map_err(ObservedSetCollectionError::Algebra)?;
+        }
+        ObservedIndex::decode(&joined).map_err(ObservedSetCollectionError::Algebra)
+    }
+}
+
+/// Failure to validate, complete, or materialize one observed-set ticket.
+#[derive(Debug)]
+pub enum ObservedSetCollectionError {
+    /// Exact-ticket authority, resolution, construction, or storage failed.
+    Collection(ExactDerivedCollectionError),
+    /// Canonical observed-set construction failed.
+    Algebra(ObservedSetError),
+}
+
+impl fmt::Display for ObservedSetCollectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Collection(source) => source.fmt(formatter),
+            Self::Algebra(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for ObservedSetCollectionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Collection(source) => Some(source),
+            Self::Algebra(source) => Some(source),
+        }
+    }
+}
+
+impl From<ExactDerivedCollectionError> for ObservedSetCollectionError {
+    fn from(source: ExactDerivedCollectionError) -> Self {
+        Self::Collection(source)
+    }
+}
+
+impl ExactDerivedAlgebra<SimpleArchive, ObservedSetBlob> for ObservedSetCollection {
+    fn validate_source(
+        &self,
+        descriptor: &CollectionDescriptor,
+        source: &Blob<SimpleArchive>,
+    ) -> Result<(), ExactAlgebraError> {
+        if *descriptor != self.source_descriptor() {
+            return Err(ExactAlgebraError::Fatal(
+                "source descriptor does not match this observed-set collection".to_owned(),
+            ));
+        }
+        simplearchive_union::validate_element(source)
+            .map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
+    }
+
+    fn validate_target(
+        &self,
+        descriptor: &CollectionDescriptor,
+        target: &Blob<ObservedSetBlob>,
+    ) -> Result<(), ExactAlgebraError> {
+        if *descriptor != self.descriptor() {
+            return Err(ExactAlgebraError::Fatal(
+                "target descriptor does not match this observed-set collection".to_owned(),
+            ));
+        }
+        // Persisted bytes: malformed is malformed, never a reason to refine
+        // the physical cover.
+        validate_element(target).map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
+    }
+
+    fn join_source(
+        &self,
+        low: &Blob<SimpleArchive>,
+        high: &Blob<SimpleArchive>,
+    ) -> Result<Blob<SimpleArchive>, ExactAlgebraError> {
+        simplearchive_union::join(low, high)
+            .map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
+    }
+
+    fn derive(
+        &self,
+        source: &Blob<SimpleArchive>,
+    ) -> Result<Blob<ObservedSetBlob>, ExactAlgebraError> {
+        derive_element(source, self.observes)
+            .map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
+    }
+
+    fn join_target(
+        &self,
+        low: &Blob<ObservedSetBlob>,
+        high: &Blob<ObservedSetBlob>,
+    ) -> Result<Blob<ObservedSetBlob>, ExactAlgebraError> {
+        join(low, high).map_err(|error| ExactAlgebraError::Fatal(error.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::prelude::*;
+    use std::collections::BTreeSet;
+    use crate::query::register::{resolve, ObservationOrder};
+    use crate::trible::TribleSet;
+
+    fn archive(facts: &TribleSet) -> Blob<SimpleArchive> {
+        facts.clone().to_blob()
+    }
+
+    fn edge(successor: &crate::id::ExclusiveId, predecessor: &crate::id::ExclusiveId) -> TribleSet {
+        entity! { successor @ metadata::supersedes: predecessor }.into()
+    }
+
+    fn observed_of(facts: &TribleSet) -> Blob<ObservedSetBlob> {
+        derive_element(&archive(facts), metadata::supersedes.id()).expect("derives")
+    }
+
+    #[test]
+    fn the_derived_index_agrees_with_the_live_order() {
+        let base = ufoid();
+        let left = ufoid();
+        let right = ufoid();
+        let mut facts = TribleSet::new();
+        facts += edge(&left, &base);
+        facts += edge(&right, &base);
+        let candidates = [*base, *left, *right];
+
+        let index = ObservedIndex::decode(&observed_of(&facts)).expect("decodes");
+        assert_eq!(index.len(), 1);
+        assert_eq!(
+            resolve(&index, candidates),
+            resolve(&ObservationOrder::new(&facts, metadata::supersedes.id()), candidates)
+        );
+        assert_eq!(
+            resolve(&index, candidates),
+            [*left, *right].into_iter().collect::<BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn derive_is_a_join_homomorphism_into_the_union_lattice() {
+        let base = ufoid();
+        let left = ufoid();
+        let right = ufoid();
+        let merge = ufoid();
+
+        let mut c1 = TribleSet::new();
+        c1 += edge(&left, &base);
+        let mut c2 = TribleSet::new();
+        c2 += edge(&right, &base);
+        c2 += edge(&merge, &right);
+        let mut union = c1.clone();
+        union += c2.clone();
+
+        // derive(C1 union C2) == join(derive(C1), derive(C2)), byte-exact.
+        // This is the equation the exact-derive kernel checks when it
+        // reuses a cached shard, so byte equality is the operative form.
+        let direct = observed_of(&union);
+        let incremental = join(&observed_of(&c1), &observed_of(&c2)).expect("joins");
+        assert_eq!(direct.bytes.as_ref(), incremental.bytes.as_ref());
+
+        // ... and the frontier read off it matches the live order.
+        let candidates = [*base, *left, *right, *merge];
+        let index = ObservedIndex::decode(&incremental).expect("decodes");
+        assert_eq!(index.len(), 2);
+        assert_eq!(
+            resolve(&index, candidates),
+            resolve(
+                &ObservationOrder::new(&union, metadata::supersedes.id()),
+                candidates
+            )
+        );
+        assert_eq!(
+            resolve(&index, candidates),
+            [*left, *merge].into_iter().collect::<BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn the_join_is_idempotent_commutative_and_has_empty_as_its_unit() {
+        let a = ufoid();
+        let b = ufoid();
+        let c = ufoid();
+        let mut left = TribleSet::new();
+        left += edge(&b, &a);
+        let mut right = TribleSet::new();
+        right += edge(&c, &b);
+
+        let l = observed_of(&left);
+        let r = observed_of(&right);
+
+        let lr = join(&l, &r).expect("joins");
+        let rl = join(&r, &l).expect("joins");
+        assert_eq!(lr.bytes.as_ref(), rl.bytes.as_ref(), "commutative");
+        assert_eq!(
+            join(&lr, &lr).expect("joins").bytes.as_ref(),
+            lr.bytes.as_ref(),
+            "idempotent"
+        );
+        assert_eq!(
+            join(&lr, &empty()).expect("joins").bytes.as_ref(),
+            lr.bytes.as_ref(),
+            "empty is the unit"
+        );
+        validate_element(&lr).expect("the join is canonical");
+    }
+
+    #[test]
+    fn the_observed_attribute_participates_in_collection_identity() {
+        let scope = ufoid();
+        assert_ne!(
+            descriptor(*scope, metadata::supersedes.id()),
+            descriptor(*scope, metadata::tag.id()),
+            "two registers over different edges are different collections"
+        );
+        // ... and the derivation genuinely reads the attribute it is told to.
+        let a = ufoid();
+        let b = ufoid();
+        let mut facts = TribleSet::new();
+        facts += edge(&b, &a);
+        let other = derive_element(&archive(&facts), metadata::tag.id()).expect("derives");
+        assert!(other.bytes.as_ref().is_empty());
+    }
+
+    #[test]
+    fn a_non_canonical_element_is_rejected() {
+        let mut bytes = vec![0u8; ID_LEN * 2];
+        bytes[ID_LEN - 1] = 9;
+        // Second id sorts below the first, so the sequence is not
+        // strictly increasing.
+        let blob: Blob<ObservedSetBlob> = Blob::new(Bytes::from_source(bytes));
+        assert_eq!(
+            validate_element(&blob),
+            Err(ObservedSetError::NotStrictlyIncreasing)
+        );
+        let ragged: Blob<ObservedSetBlob> = Blob::new(Bytes::from_source(vec![0u8; ID_LEN + 1]));
+        assert_eq!(
+            validate_element(&ragged),
+            Err(ObservedSetError::BadLength(ID_LEN + 1))
+        );
+    }
+}

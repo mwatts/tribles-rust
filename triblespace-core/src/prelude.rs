@@ -65,6 +65,9 @@ pub use crate::or;
 pub use crate::query::exists;
 pub use crate::query::find;
 pub use crate::query::frontier::latest;
+pub use crate::query::register::{
+    maximal, resolve, sole, End, Maximal, ObservationOrder, RegisterOrder, StatedOrder, Unordered,
+};
 pub use crate::query::intersectionconstraint::and;
 pub use crate::query::intersectionconstraint::IntersectionConstraint;
 pub use crate::query::rangeconstraint::{value_range, InlineRange};
