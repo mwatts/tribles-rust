@@ -7,6 +7,7 @@ use triblespace_core::repo::pile::{Pile, ReadError};
 
 pub mod blob;
 pub mod branch;
+pub mod collection;
 mod diagnose;
 mod extract;
 mod merge;
@@ -39,6 +40,14 @@ pub enum PileCommand {
     Blob {
         #[command(subcommand)]
         cmd: blob::Command,
+    },
+    /// Collection-aware views of a pile. A collection is identified by the
+    /// blake3 handle of its descriptor blob; these subcommands decode that
+    /// descriptor instead of showing it as 256 opaque bytes the way
+    /// `pile blob inspect` does.
+    Collection {
+        #[command(subcommand)]
+        cmd: collection::Command,
     },
     /// Provision durable signing identities for pile-backed writers.
     SigningKey {
@@ -208,6 +217,7 @@ pub fn run(cmd: PileCommand) -> Result<()> {
         PileCommand::Branch { cmd } => branch::run(cmd),
         PileCommand::Pin { cmd } => pin::run(cmd),
         PileCommand::Blob { cmd } => blob::run(cmd),
+        PileCommand::Collection { cmd } => collection::run(cmd),
         PileCommand::SigningKey { cmd } => signing::run(cmd),
         PileCommand::Merge {
             pile,

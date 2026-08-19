@@ -93,6 +93,16 @@ Signing key format
 - `pile blob get <PILE> <HANDLE> <OUTPUT>` — extract a blob by handle.
 - `pile blob inspect <PILE> <HANDLE>` — display metadata for a stored blob.
 
+#### Collections
+
+A collection is identified by the blake3 handle of its *descriptor blob* — a
+256-byte `SimpleArchive` naming the collection's scope, blob representation,
+and join recipe. `pile blob inspect` sees only "256 bytes, Binary"; these
+subcommands decode it.
+
+- `pile collection list [--metadata] <PILE>` — one row per distinct collection the pile's commit / merge / derive records reference, with the decoded scope, representation, and recipe (known representation and recipe ids are named). Pass `--metadata` for per-collection record counts and the descriptor blob's size and storage timestamp.
+- `pile collection show <PILE> <HANDLE>` — full decode of one descriptor: the intrinsic entity id inside the archive, all four tribles, the decoded fields, and how many records in this pile reference it. The handle is accepted with or without the `blake3:` prefix.
+
 ### Distributed pile sync
 
 Built on `triblespace-net` (iroh QUIC + DHT + gossip). All commands
