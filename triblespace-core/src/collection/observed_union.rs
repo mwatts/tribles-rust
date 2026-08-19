@@ -71,7 +71,8 @@ use super::exact_derived::{
     ExactDerivedCollectionError,
 };
 use super::records::{
-    collection_recipe, collection_representation, collection_scope, KIND_COLLECTION_DESCRIPTOR,
+    collection_recipe, collection_representation, collection_source, CollectionHandle,
+    KIND_COLLECTION_DESCRIPTOR,
 };
 use super::{simplearchive_union, CollectionCommit, CollectionDescriptor, CollectionStore};
 use crate::repo::{BlobStore, BlobStoreMeta};
@@ -229,12 +230,11 @@ pub fn join(
 }
 
 /// Construct the observed-set collection for one dataset scope and edge.
-pub fn descriptor(scope: Id, observes: Id) -> CollectionDescriptor {
+pub fn descriptor(source: CollectionHandle, observes: Id) -> CollectionDescriptor {
     let observes: Inline<GenId> = crate::inline::IntoInline::to_inline(observes);
-    let scope_value: Inline<GenId> = crate::inline::IntoInline::to_inline(scope);
     let fragment = entity! { _ @
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-        collection_scope: scope_value,
+        collection_source: source,
         collection_representation*: <ObservedSetBlob as MetaDescribe>::describe(),
         collection_recipe*: <ObservedUnionV1 as MetaDescribe>::describe(),
         register_observes: observes,
@@ -341,7 +341,7 @@ impl ObservedSetCollection {
 
     /// Canonical target observed-set collection descriptor.
     pub fn descriptor(&self) -> CollectionDescriptor {
-        descriptor(self.scope, self.observes)
+        descriptor(self.source_descriptor().handle(), self.observes)
     }
 
     /// Attach the observed set already resident for `ticket`.
@@ -589,11 +589,19 @@ mod tests {
 
     #[test]
     fn the_observed_attribute_participates_in_collection_identity() {
-        let scope = ufoid();
+        let source = simplearchive_union::descriptor(*ufoid()).handle();
         assert_ne!(
-            descriptor(*scope, metadata::supersedes.id()),
-            descriptor(*scope, metadata::tag.id()),
+            descriptor(source, metadata::supersedes.id()),
+            descriptor(source, metadata::tag.id()),
             "two registers over different edges are different collections"
+        );
+        // A derived collection carries no anchor of its own; two derivations
+        // of the same shape differ exactly when their sources differ.
+        let other = simplearchive_union::descriptor(*ufoid()).handle();
+        assert_ne!(
+            descriptor(source, metadata::tag.id()),
+            descriptor(other, metadata::tag.id()),
+            "the same derivation over different sources is a different collection"
         );
         // ... and the derivation genuinely reads the attribute it is told to.
         let a = ufoid();

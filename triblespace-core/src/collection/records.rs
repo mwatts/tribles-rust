@@ -67,9 +67,25 @@ pub const COLLECTION_RECORD_ID_VERSION: u32 = 1;
 pub const COLLECTION_RECORD_ID_DOMAIN: &[u8] = b"triblespace.collection.record.id";
 
 attributes! {
-    /// Stable extrinsic dataset scope shared by related representations.
+    /// Stable extrinsic anchor of a *root* dataset.
+    ///
+    /// Only a collection that is not derived from another carries one. A
+    /// derived collection needs no anchor of its own: its source already
+    /// anchors it, and its identity follows from that source together with its
+    /// representation, recipe and arguments. Minting an anchor for a derived
+    /// collection would assert a second, weaker claim about the same lineage.
+    ///
     /// Minted with `trible genid` on 2026-08-07.
     "D3418873C70392E3ADAA05C00E11A583" unsafe as pub collection_scope: GenId;
+    /// The collection this one derives from, by descriptor handle.
+    ///
+    /// This says *what* a derived collection is computed from; which state of
+    /// that source a given commit reflects belongs on the commit, not here.
+    /// A handle rather than a shared label means a descriptor cannot claim a
+    /// lineage it does not have: it names one exact source descriptor.
+    ///
+    /// Minted with `trible genid` on 2026-08-19.
+    "8D93B2A626CD32182C0A026BC8D5A014" unsafe as pub collection_source: Handle<SimpleArchive>;
     /// Blob representation carried by the elements of this collection.
     /// Minted with `trible genid` on 2026-08-07.
     "620FA4F2B456357DCD1882E583B85CC3" unsafe as pub collection_representation: GenId;
@@ -251,6 +267,39 @@ impl CollectionDescriptor {
             collection_recipe*: recipe,
         };
         Self::from_fragment(&fragment)
+    }
+
+    /// Construct a descriptor for a collection derived from another.
+    ///
+    /// A derived collection carries no dataset anchor of its own. Its source
+    /// is what anchors it, so two derivations of the same shape over different
+    /// data are different collections because their sources differ. Naming the
+    /// source by handle rather than by a shared label means the lineage is
+    /// exact and cannot be joined by assertion.
+    pub fn derived(
+        source: CollectionHandle,
+        representation: Fragment,
+        recipe: Fragment,
+    ) -> Self {
+        let fragment = entity! {
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_source: source,
+            collection_representation*: representation,
+            collection_recipe*: recipe,
+        };
+        Self::from_fragment(&fragment)
+    }
+
+    /// The collection this one derives from, if it derives from one.
+    ///
+    /// A root collection has no source and answers `None`; that is not a
+    /// failure, it is what being a root means.
+    pub fn source(&self) -> Option<CollectionHandle> {
+        let attribute = collection_source.id();
+        self.facts
+            .iter()
+            .find(|fact| *fact.a() == attribute)
+            .map(|fact| *fact.v::<Handle<SimpleArchive>>())
     }
 
     /// Construct a descriptor that names its representation and recipe without
