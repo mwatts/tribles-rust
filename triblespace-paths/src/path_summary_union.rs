@@ -310,11 +310,6 @@ pub fn validate_derive(
         _ => return Err(PathSummaryUnionValidationError::WrongSource),
     }
     validate_collection(
-        DescriptorRole::Source,
-        source_descriptor.handle(),
-        claim.source(),
-    )?;
-    validate_collection(
         DescriptorRole::Target,
         target_descriptor.handle(),
         claim.target(),
@@ -580,7 +575,6 @@ mod tests {
             (&unmatched_source, &derived_unmatched),
         ] {
             let claim = CollectionDerive::new(
-                source_descriptor.handle(),
                 target_descriptor.handle(),
                 data_identity(input),
                 data_identity(output),
@@ -634,7 +628,6 @@ mod tests {
             (&source_union, &derive_after_source_join),
         ] {
             let claim = CollectionDerive::new(
-                source_descriptor.handle(),
                 target_descriptor.handle(),
                 data_identity(input),
                 data_identity(output),
@@ -688,7 +681,6 @@ mod tests {
 
         assert_eq!(derive_after_source_join.bytes, join_after_derive.bytes);
         let derive = CollectionDerive::new(
-            source_descriptor.handle(),
             target_descriptor.handle(),
             data_identity(&source_union),
             data_identity(&derive_after_source_join),
@@ -740,7 +732,6 @@ mod tests {
         let other_output = derive_element(&other_input, &automaton).unwrap();
 
         let wrong_equation = CollectionDerive::new(
-            source_descriptor.handle(),
             target_descriptor.handle(),
             data_identity(&input),
             data_identity(&other_output),
@@ -758,7 +749,6 @@ mod tests {
         ));
 
         let wrong_endpoint = CollectionDerive::new(
-            source_descriptor.handle(),
             target_descriptor.handle(),
             data_identity(&other_input),
             data_identity(&output),
@@ -781,7 +771,6 @@ mod tests {
         let foreign_automaton = plus(label(9));
         let foreign_target = descriptor(simplearchive_union::descriptor(id(1)).handle(), &foreign_automaton);
         let foreign_claim = CollectionDerive::new(
-            source_descriptor.handle(),
             foreign_target.handle(),
             data_identity(&input),
             data_identity(&output),

@@ -183,13 +183,15 @@ where
 mod tests {
 
     fn lineage_from_derives(
-        records: &DiscoveredCollectionRecords,
+        _records: &DiscoveredCollectionRecords,
     ) -> std::collections::BTreeMap<CollectionHandle, CollectionHandle> {
-        records
-            .derives()
-            .iter()
-            .map(|claim| (claim.target(), claim.source()))
-            .collect()
+        // These retention tests build a single source -> target derivation
+        // over scopes 1 and 2; a derive no longer names its source, so the
+        // lineage is stated here the way a descriptor would state it.
+        std::collections::BTreeMap::from([(
+            simplearchive_union::descriptor(id(2)).handle(),
+            simplearchive_union::descriptor(id(1)).handle(),
+        )])
     }
     use super::*;
 
@@ -433,7 +435,6 @@ mod tests {
         );
         let active_derive_output = archive([row(3, 1, 3)]);
         let active_derive = CollectionDerive::new(
-            source.handle(),
             target.handle(),
             data(&active_merge_result),
             data(&active_derive_output),
@@ -450,7 +451,6 @@ mod tests {
         );
         let orphan_derive_output = archive([row(6, 1, 6)]);
         let orphan_derive = CollectionDerive::new(
-            source.handle(),
             target.handle(),
             data(&orphan_merge_result),
             data(&orphan_derive_output),

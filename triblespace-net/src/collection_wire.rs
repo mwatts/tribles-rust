@@ -13,7 +13,8 @@ use std::fmt;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use triblespace_core::collection::{
-    COLLECTION_COMMIT_BYTES_LEN, COLLECTION_GOSSIP_BYTES_LEN, COLLECTION_MERGE_BYTES_LEN,
+    COLLECTION_COMMIT_BYTES_LEN, COLLECTION_DERIVE_BYTES_LEN, COLLECTION_GOSSIP_BYTES_LEN,
+    COLLECTION_MERGE_BYTES_LEN,
     CollectionCommit, CollectionDerive, CollectionGossip, CollectionHandle, CollectionMerge,
     CollectionRecord, CommitVerificationError, GossipVerificationError, RecordDecodeError,
 };
@@ -124,7 +125,13 @@ pub fn encode_collection_operation_receipts(
     for receipt in receipts {
         match receipt {
             CollectionRecord::Merge(record) => bytes.extend_from_slice(&record.to_bytes()),
-            CollectionRecord::Derive(record) => bytes.extend_from_slice(&record.to_bytes()),
+            CollectionRecord::Derive(record) => {
+                // A derive is shorter than a merge; the slot is sized to the
+                // larger and the tail is zero, which the decoder requires.
+                let mut slot = [0u8; COLLECTION_OPERATION_RECEIPT_BYTES_LEN];
+                slot[..COLLECTION_DERIVE_BYTES_LEN].copy_from_slice(&record.to_bytes());
+                bytes.extend_from_slice(&slot);
+            }
             CollectionRecord::Commit(_) => {
                 unreachable!("receipt selection excludes collection commits")
             }
@@ -292,16 +299,9 @@ fn record_answers_request(record: CollectionRecord, request: WantRequest) -> boo
                 high,
             },
         ) => record.collection() == collection && record.inputs() == (low, high),
-        (
-            CollectionRecord::Derive(record),
-            WantRequest::Derive {
-                source,
-                target,
-                input,
-            },
-        ) => {
+        (CollectionRecord::Derive(record), WantRequest::Derive { target, input }) => {
             let (record_input, _) = record.mapping();
-            record.source() == source && record.target() == target && record_input == input
+            record.target() == target && record_input == input
         }
         (CollectionRecord::Commit(_), _)
         | (CollectionRecord::Merge(_), _)
@@ -317,9 +317,17 @@ fn decode_operation_receipt(
         WantRequest::Merge { .. } => CollectionMerge::from_bytes(bytes)
             .map(CollectionRecord::Merge)
             .map_err(CollectionOperationWireError::InvalidReceipt),
-        WantRequest::Derive { .. } => Ok(CollectionRecord::Derive(CollectionDerive::from_bytes(
-            bytes,
-        ))),
+        WantRequest::Derive { .. } => {
+            // A derive receipt is shorter than a merge one, and the slot is
+            // sized to the larger. The tail must be zero so a receipt has one
+            // canonical encoding.
+            if bytes[COLLECTION_DERIVE_BYTES_LEN..].iter().any(|b| *b != 0) {
+                return Err(CollectionOperationWireError::BlobRequest);
+            }
+            let mut exact = [0u8; COLLECTION_DERIVE_BYTES_LEN];
+            exact.copy_from_slice(&bytes[..COLLECTION_DERIVE_BYTES_LEN]);
+            Ok(CollectionRecord::Derive(CollectionDerive::from_bytes(exact)))
+        }
         WantRequest::Blob { .. } => Err(CollectionOperationWireError::BlobRequest),
     }
 }
@@ -683,7 +691,7 @@ mod tests {
         let source = simplearchive_union::descriptor(id(41));
         let target = simplearchive_union::descriptor(id(42));
         let merge = WantRequest::merge(source.handle(), data(9), data(2));
-        let derive = WantRequest::derive(source.handle(), target.handle(), data(3));
+        let derive = WantRequest::derive(target.handle(), data(3));
 
         for request in [merge, derive] {
             let bytes = encode_collection_operation_request(request).unwrap();
@@ -742,12 +750,7 @@ mod tests {
         let unrelated = CollectionMerge::new(descriptor.handle(), data(1), data(9), data(5));
         let wrong_collection =
             CollectionMerge::new(other_descriptor.handle(), data(1), data(2), data(6));
-        let derive = CollectionDerive::new(
-            descriptor.handle(),
-            other_descriptor.handle(),
-            data(1),
-            data(7),
-        );
+        let derive = CollectionDerive::new(other_descriptor.handle(), data(1), data(7));
         let signed = commit(&SigningKey::from_bytes(&[45; 32]), &descriptor);
 
         let encoded = encode_collection_operation_receipts(
@@ -790,10 +793,10 @@ mod tests {
     fn derive_receipts_preserve_conflicts_and_require_exact_inputs() {
         let source = simplearchive_union::descriptor(id(46));
         let target = simplearchive_union::descriptor(id(47));
-        let request = WantRequest::derive(source.handle(), target.handle(), data(1));
-        let first = CollectionDerive::new(source.handle(), target.handle(), data(1), data(2));
-        let conflicting = CollectionDerive::new(source.handle(), target.handle(), data(1), data(3));
-        let unrelated = CollectionDerive::new(source.handle(), target.handle(), data(9), data(2));
+        let request = WantRequest::derive(target.handle(), data(1));
+        let first = CollectionDerive::new(target.handle(), data(1), data(2));
+        let conflicting = CollectionDerive::new(target.handle(), data(1), data(3));
+        let unrelated = CollectionDerive::new(target.handle(), data(9), data(2));
 
         let encoded = encode_collection_operation_receipts(
             request,
@@ -814,7 +817,10 @@ mod tests {
         assert!(receipts.contains(&CollectionRecord::Derive(conflicting)));
 
         let mut mismatched = Vec::from(1u32.to_be_bytes());
-        mismatched.extend_from_slice(&unrelated.to_bytes());
+        // Derive receipts occupy a merge-sized slot, zero-padded.
+        let mut slot = [0u8; COLLECTION_OPERATION_RECEIPT_BYTES_LEN];
+        slot[..COLLECTION_DERIVE_BYTES_LEN].copy_from_slice(&unrelated.to_bytes());
+        mismatched.extend_from_slice(&slot);
         assert!(matches!(
             decode_collection_operation_receipts(request, &mismatched),
             Err(CollectionOperationWireError::ReceiptDoesNotAnswerRequest { .. })

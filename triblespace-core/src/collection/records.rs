@@ -49,7 +49,18 @@ pub const KIND_COLLECTION_MERGE: Id = id_hex!("5F20FFC64313969B7E046A7677874D39"
 /// Stable semantic kind of an unsigned `DERIVE` equation.
 ///
 /// Minted with `trible genid` on 2026-08-11.
-pub const KIND_COLLECTION_DERIVE: Id = id_hex!("6DB0214CB4F3BD8259F0117CDC127331");
+pub const KIND_COLLECTION_DERIVE: Id = id_hex!("46C621338B6DD5B71C8E1E6DD74B087C");
+
+/// The three-field derive's predecessor, which also named its source.
+///
+/// A derive's source is what the target's descriptor says it is, so naming it
+/// again in the record only created a way for the two to disagree. Records
+/// under this kind are not read: a derivation is a computation with a
+/// checkable artifact, so the cheapest correct thing to do with a stale one is
+/// recompute it. Kept here so the id is not minted twice.
+///
+/// Minted with `trible genid` on 2026-08-07, retired 2026-08-20.
+pub const KIND_COLLECTION_DERIVE_V1: Id = id_hex!("6DB0214CB4F3BD8259F0117CDC127331");
 
 /// Byte length of a canonical collection-descriptor `SimpleArchive`.
 pub const COLLECTION_DESCRIPTOR_ARCHIVE_LEN: u64 = (4 * TRIBLE_LEN) as u64;
@@ -58,7 +69,7 @@ pub const COLLECTION_COMMIT_BYTES_LEN: usize = 6 * 32;
 /// Byte length of a dense merge equation.
 pub const COLLECTION_MERGE_BYTES_LEN: usize = 4 * 32;
 /// Byte length of a dense derive equation.
-pub const COLLECTION_DERIVE_BYTES_LEN: usize = 4 * 32;
+pub const COLLECTION_DERIVE_BYTES_LEN: usize = 3 * 32;
 
 /// Version of collection-record identity derivation.
 pub const COLLECTION_RECORD_ID_VERSION: u32 = 1;
@@ -689,25 +700,27 @@ impl CollectionMerge {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CollectionDerive {
     id: Id,
-    source: CollectionHandle,
     target: CollectionHandle,
     input: CollectionData,
     output: CollectionData,
 }
 
 impl CollectionDerive {
-    /// Construct a canonical `DERIVE(source, target, input, output)` record.
+    /// Construct a canonical `DERIVE(target, input, output)` record.
+    ///
+    /// The target is named by descriptor handle, exactly as a commit names its
+    /// collection, and that descriptor already says which collection is the
+    /// source and by what recipe. A derive therefore says *which instance* of
+    /// a mapping was computed, never *which mapping*.
     pub fn new(
-        source: CollectionHandle,
         target: CollectionHandle,
         input: CollectionData,
         output: CollectionData,
     ) -> Self {
-        let bytes = derive_bytes(source, target, input, output);
+        let bytes = derive_bytes(target, input, output);
         let id = collection_record_id(KIND_COLLECTION_DERIVE, &bytes);
         Self {
             id,
-            source,
             target,
             input,
             output,
@@ -720,18 +733,12 @@ impl CollectionDerive {
             Inline::new(field(&bytes, 0)),
             Inline::new(field(&bytes, 1)),
             Inline::new(field(&bytes, 2)),
-            Inline::new(field(&bytes, 3)),
         )
     }
 
     /// Intrinsic record id.
     pub fn id(&self) -> Id {
         self.id
-    }
-
-    /// Source collection.
-    pub fn source(&self) -> CollectionHandle {
-        self.source
     }
 
     /// Target collection.
@@ -744,9 +751,9 @@ impl CollectionDerive {
         (self.input, self.output)
     }
 
-    /// Encode this equation into its exact dense 128-byte layout.
+    /// Encode this equation into its exact dense 96-byte layout.
     pub fn to_bytes(&self) -> [u8; COLLECTION_DERIVE_BYTES_LEN] {
-        derive_bytes(self.source, self.target, self.input, self.output)
+        derive_bytes(self.target, self.input, self.output)
     }
 }
 
@@ -867,12 +874,11 @@ fn merge_bytes(
 }
 
 fn derive_bytes(
-    source: CollectionHandle,
     target: CollectionHandle,
     input: CollectionData,
     output: CollectionData,
 ) -> [u8; COLLECTION_DERIVE_BYTES_LEN] {
-    concat_fields([source.raw, target.raw, input.raw, output.raw])
+    concat_fields([target.raw, input.raw, output.raw])
 }
 
 fn collection_record_id(kind: Id, payload: &[u8]) -> Id {
@@ -1198,7 +1204,7 @@ mod tests {
 
     #[test]
     fn derive_roundtrips() {
-        let record = CollectionDerive::new(collection(1), collection(2), hash(3), hash(4));
+        let record = CollectionDerive::new(collection(2), hash(3), hash(4));
         assert_eq!(CollectionDerive::from_bytes(record.to_bytes()), record);
     }
 
@@ -1211,7 +1217,7 @@ mod tests {
             empty_metadata_handle(),
         );
         let merge = CollectionMerge::new(collection(1), hash(2), hash(3), hash(4));
-        let derive = CollectionDerive::new(collection(1), collection(2), hash(3), hash(4));
+        let derive = CollectionDerive::new(collection(2), hash(3), hash(4));
         for record in [
             CollectionRecord::Commit(commit),
             CollectionRecord::Merge(merge),
@@ -1257,7 +1263,7 @@ mod tests {
         let commit =
             CollectionCommit::sign(&fixture_key(), collection(1), hash(2), Inline::new([3; 32]));
         let merge = CollectionMerge::new(collection(1), hash(2), hash(3), hash(4));
-        let derive = CollectionDerive::new(collection(1), collection(2), hash(3), hash(4));
+        let derive = CollectionDerive::new(collection(2), hash(3), hash(4));
 
         // Descriptor wire bytes are unchanged by the identity cutover.
         assert_eq!(
@@ -1287,7 +1293,10 @@ mod tests {
             hex!("F684108AF3E8E3898904D20EA458DCAE68F0F97F4E5C06DAFA0FAE0691F68D0B")
         );
         assert_eq!(merge.id(), id_hex!("032390A36A86A2F5A44604B78EF6FA8C"));
-        assert_eq!(derive.id(), id_hex!("7439DBBBCC791D653B9295EB1AD02400"));
+        // The derive id moved once, when the record stopped naming its source
+        // and gained a new kind: the id is a digest over the kind and payload,
+        // and both changed. Commit and merge ids are untouched.
+        assert_eq!(derive.id(), id_hex!("5F7EF9C1C56832B2F098486612592ACD"));
         assert_eq!(
             commit.signing_transcript(),
             hex!(

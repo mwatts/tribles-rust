@@ -387,11 +387,6 @@ pub fn validate_derive(
         }
     }
     validate_collection(
-        DescriptorRole::Source,
-        source_descriptor.handle(),
-        claim.source(),
-    )?;
-    validate_collection(
         DescriptorRole::Target,
         target_descriptor.handle(),
         claim.target(),
@@ -603,7 +598,6 @@ mod tests {
         assert_eq!(derived_empty.get_handle(), canonical_empty.get_handle());
 
         let derive = CollectionDerive::new(
-            source_descriptor.handle(),
             target_descriptor.handle(),
             data_identity(&source_empty),
             data_identity(&canonical_empty),
@@ -659,7 +653,6 @@ mod tests {
             (&source_union, &derive_after_merge),
         ] {
             let claim = CollectionDerive::new(
-                source_descriptor.handle(),
                 target_descriptor.handle(),
                 data_identity(input),
                 data_identity(output),
@@ -692,7 +685,6 @@ mod tests {
         let wrong_source = archive([row(2, 9, 4)]);
         let wrong_output = derive_element(&wrong_source).unwrap();
         let claim = CollectionDerive::new(
-            source_descriptor.handle(),
             target_descriptor.handle(),
             data_identity(&input),
             data_identity(&wrong_output),
@@ -734,7 +726,6 @@ mod tests {
         let input = archive([row(1, 9, 3)]);
         let malformed = Blob::<SuccinctArchiveBlob>::new(Bytes::from(vec![0xAA; 17]));
         let claim = CollectionDerive::new(
-            source_descriptor.handle(),
             target_descriptor.handle(),
             data_identity(&input),
             data_identity(&malformed),

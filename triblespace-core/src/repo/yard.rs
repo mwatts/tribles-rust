@@ -1689,23 +1689,19 @@ mod tests {
     fn collection_selection_unions_generations_without_choosing_an_output() {
         let config = YardConfig::default();
         let (_dir, paths, mut yard) = yard_with_paths(2, config);
-        let source = Inline::new([41; 32]);
         let target = Inline::new([42; 32]);
         let input = Inline::new([43; 32]);
         let first = CollectionRecord::Derive(CollectionDerive::new(
-            source,
             target,
             input,
             Inline::new([44; 32]),
         ));
         let conflicting = CollectionRecord::Derive(CollectionDerive::new(
-            source,
             target,
             input,
             Inline::new([45; 32]),
         ));
         let unrelated = CollectionRecord::Derive(CollectionDerive::new(
-            source,
             Inline::new([46; 32]),
             input,
             Inline::new([47; 32]),
@@ -1730,9 +1726,7 @@ mod tests {
             .pile_mut()
             .insert(unrelated)
             .unwrap();
-        let selectors = [CollectionRecordSelector::Operation(WantRequest::derive(
-            source, target, input,
-        ))]
+        let selectors = [CollectionRecordSelector::Operation(WantRequest::derive(target, input))]
         .into_iter()
         .collect();
         let mut expected = vec![first, conflicting];
@@ -1836,7 +1830,6 @@ mod tests {
                 Inline::new([36; 32]),
             )),
             CollectionRecord::Derive(CollectionDerive::new(
-                descriptor.handle(),
                 CollectionDescriptor::naming(pin_id(37), pin_id(38), pin_id(39)).handle(),
                 Inline::new([36; 32]),
                 Inline::new(equation_only.raw),
@@ -2330,7 +2323,7 @@ mod tests {
         let target = Inline::new([52; INLINE_LEN]);
         let input = Inline::new(input_blob.raw);
         let merge = WantRequest::merge(source, input, Inline::new([53; INLINE_LEN]));
-        let derive = WantRequest::derive(source, target, input);
+        let derive = WantRequest::derive(target, input);
         yard.want(merge).unwrap();
         yard.want(derive).unwrap();
 
@@ -2357,7 +2350,6 @@ mod tests {
         drop(yard);
 
         let request = WantRequest::derive(
-            Inline::new([61; INLINE_LEN]),
             Inline::new([62; INLINE_LEN]),
             Inline::new([63; INLINE_LEN]),
         );

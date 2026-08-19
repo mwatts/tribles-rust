@@ -901,6 +901,11 @@ pub const WANT_REQUEST_KIND_BLOB_V1: u8 = 1;
 pub const WANT_REQUEST_KIND_MERGE_V1: u8 = 2;
 /// Versioned tag of a derive request in the canonical [`WantRequest`] codec.
 pub const WANT_REQUEST_KIND_DERIVE_V1: u8 = 3;
+/// Derive request naming only its target and input.
+///
+/// The source is what the target's descriptor says it is, so a want that
+/// restated it only offered a way to disagree with the descriptor.
+pub const WANT_REQUEST_KIND_DERIVE_V2: u8 = 4;
 
 /// A durable request for absent content or reproducible collection work.
 ///
@@ -925,9 +930,11 @@ pub enum WantRequest {
         high: CollectionData,
     },
     /// Discover or compute one collection derivation.
+    ///
+    /// The source is not named: the target's descriptor says which collection
+    /// it derives from, so a want asks for one instance of a mapping the
+    /// responder can already identify.
     Derive {
-        /// Source collection containing `input`.
-        source: CollectionHandle,
         /// Target collection requested for the derived output.
         target: CollectionHandle,
         /// Source element to derive.
@@ -962,12 +969,8 @@ impl WantRequest {
     }
 
     /// Construct a derivation request from one exact source element.
-    pub const fn derive(source: CollectionHandle, target: CollectionHandle, input: CollectionData) -> Self {
-        Self::Derive {
-            source,
-            target,
-            input,
-        }
+    pub const fn derive(target: CollectionHandle, input: CollectionData) -> Self {
+        Self::Derive { target, input }
     }
 
     /// Encode this request into its exact tagged 97-byte representation.
@@ -988,15 +991,10 @@ impl WantRequest {
                 write_want_field(&mut bytes, 1, low.raw);
                 write_want_field(&mut bytes, 2, high.raw);
             }
-            Self::Derive {
-                source,
-                target,
-                input,
-            } => {
-                bytes[0] = WANT_REQUEST_KIND_DERIVE_V1;
-                write_want_field(&mut bytes, 0, source.raw);
-                write_want_field(&mut bytes, 1, target.raw);
-                write_want_field(&mut bytes, 2, input.raw);
+            Self::Derive { target, input } => {
+                bytes[0] = WANT_REQUEST_KIND_DERIVE_V2;
+                write_want_field(&mut bytes, 0, target.raw);
+                write_want_field(&mut bytes, 1, input.raw);
             }
         }
         bytes
@@ -1028,11 +1026,17 @@ impl WantRequest {
                     high,
                 })
             }
-            WANT_REQUEST_KIND_DERIVE_V1 => Ok(Self::Derive {
-                source: Inline::new(read_want_field(&bytes, 0)),
-                target: Inline::new(read_want_field(&bytes, 1)),
-                input: Inline::new(read_want_field(&bytes, 2)),
-            }),
+            WANT_REQUEST_KIND_DERIVE_V2 => {
+                if read_want_field(&bytes, 2).iter().any(|byte| *byte != 0) {
+                    return Err(WantRequestDecodeError::NonZeroUnusedFields {
+                        kind: WANT_REQUEST_KIND_DERIVE_V2,
+                    });
+                }
+                Ok(Self::Derive {
+                    target: Inline::new(read_want_field(&bytes, 0)),
+                    input: Inline::new(read_want_field(&bytes, 1)),
+                })
+            }
             unknown => Err(WantRequestDecodeError::UnknownKind(unknown)),
         }
     }
@@ -1166,9 +1170,9 @@ mod want_request_tests {
 
     #[test]
     fn derive_request_roundtrips() {
-        let request = WantRequest::derive(collection(1), collection(2), data(3));
+        let request = WantRequest::derive(collection(2), data(3));
         let bytes = request.to_bytes();
-        assert_eq!(bytes[0], WANT_REQUEST_KIND_DERIVE_V1);
+        assert_eq!(bytes[0], WANT_REQUEST_KIND_DERIVE_V2);
         assert_eq!(WantRequest::from_bytes(bytes), Ok(request));
     }
 

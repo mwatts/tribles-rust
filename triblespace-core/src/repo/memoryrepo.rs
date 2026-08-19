@@ -313,7 +313,6 @@ mod tests {
             Inline::new([6; 32]),
         ));
         let derive = CollectionRecord::Derive(CollectionDerive::new(
-            descriptor.handle(),
             target.handle(),
             Inline::new([10; 32]),
             Inline::new([11; 32]),
@@ -362,25 +361,21 @@ mod tests {
             Inline::new([33; 32]),
         ));
         let first = CollectionRecord::Derive(CollectionDerive::new(
-            source,
             target,
             input,
             Inline::new([34; 32]),
         ));
         let conflicting = CollectionRecord::Derive(CollectionDerive::new(
-            source,
             target,
             input,
             Inline::new([35; 32]),
         ));
         let sibling = CollectionRecord::Derive(CollectionDerive::new(
-            source,
             target,
             Inline::new([36; 32]),
             Inline::new([37; 32]),
         ));
         let unrelated = CollectionRecord::Derive(CollectionDerive::new(
-            source,
             other,
             input,
             Inline::new([38; 32]),
@@ -390,9 +385,7 @@ mod tests {
             repo.insert(record).unwrap();
         }
 
-        let exact = [CollectionRecordSelector::Operation(WantRequest::derive(
-            source, target, input,
-        ))]
+        let exact = [CollectionRecordSelector::Operation(WantRequest::derive(target, input))]
         .into_iter()
         .collect();
         let mut expected = vec![first, conflicting];
@@ -401,7 +394,7 @@ mod tests {
 
         let grouped = [
             CollectionRecordSelector::MergeCollection(source),
-            CollectionRecordSelector::DerivePair { source, target },
+            CollectionRecordSelector::DeriveTarget(target),
         ]
         .into_iter()
         .collect();

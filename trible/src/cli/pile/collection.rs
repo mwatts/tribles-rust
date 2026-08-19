@@ -176,7 +176,6 @@ fn referenced_collections(pile: &mut Pile) -> Result<BTreeMap<CollectionHandle, 
                 refs.entry(merge.collection()).or_default().merges += 1;
             }
             CollectionRecord::Derive(derive) => {
-                refs.entry(derive.source()).or_default().derives_from += 1;
                 refs.entry(derive.target()).or_default().derives_into += 1;
             }
         }
@@ -364,7 +363,6 @@ fn referenced_ids(records: &[CollectionRecord]) -> std::collections::BTreeSet<Co
                 out.insert(merge.collection());
             }
             CollectionRecord::Derive(derive) => {
-                out.insert(derive.source());
                 out.insert(derive.target());
             }
         }
@@ -448,7 +446,7 @@ mod tests {
     /// Enumeration must see collections named by merges and by *both* sides
     /// of a derive, not just commit targets.
     #[test]
-    fn enumeration_covers_merges_and_both_derive_sides() {
+    fn enumeration_covers_merges_and_derive_targets() {
         use triblespace_core::collection::records::{CollectionDerive, CollectionMerge};
 
         fn collection(byte: u8) -> CollectionHandle {
@@ -466,7 +464,6 @@ mod tests {
                 data(12),
             )),
             CollectionRecord::Derive(CollectionDerive::new(
-                collection(2),
                 collection(3),
                 data(20),
                 data(21),
@@ -475,7 +472,10 @@ mod tests {
 
         assert_eq!(
             referenced_ids(&records),
-            BTreeSet::from([collection(1), collection(2), collection(3)])
+            // A derive names only its target now: the source is what the
+            // target's descriptor says, so enumeration no longer learns a
+            // collection from the derive that points into it.
+            BTreeSet::from([collection(1), collection(3)])
         );
     }
 

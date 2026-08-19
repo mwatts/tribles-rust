@@ -133,10 +133,11 @@ pub enum CollectionFunctionalConflict {
         /// Next distinct deterministic output witness.
         second: ConflictingCollectionOutput,
     },
-    /// One source/target mapping assigns two outputs to the same input.
+    /// One mapping assigns two outputs to the same input.
+    ///
+    /// The target names the mapping: its descriptor says which collection it
+    /// derives from and by what recipe, so a conflict is about one target.
     Derive {
-        /// Source collection.
-        source: CollectionHandle,
         /// Target collection.
         target: CollectionHandle,
         /// Source element.
@@ -164,15 +165,13 @@ impl fmt::Display for CollectionFunctionalConflict {
                 second_claim = second.claim,
             ),
             Self::Derive {
-                source,
                 target,
                 first,
                 second,
                 ..
             } => write!(
                 f,
-                "collection mapping {source}->{target} has conflicting derive claims {first_claim:X} and {second_claim:X}",
-                source = hex::encode_upper(source.raw),
+                "derivation into {target} has conflicting derive claims {first_claim:X} and {second_claim:X}",
                 target = hex::encode_upper(target.raw),
                 first_claim = first.claim,
                 second_claim = second.claim,
@@ -613,7 +612,10 @@ where
         }
         for claim in &accepted_derives {
             let (input, output) = claim.mapping();
-            if contains_member(&members, claim.source(), input) {
+            let Some(source) = lineage.get(&claim.target()).copied() else {
+                continue;
+            };
+            if contains_member(&members, source, input) {
                 changed |= members.entry(claim.target()).or_default().insert(output);
             }
         }
@@ -652,7 +654,13 @@ where
 
     for claim in &accepted_derives {
         let (input, output) = claim.mapping();
-        if !contains_member(&members, claim.source(), input) {
+        // A derive whose target declares no source has no mapping to be an
+        // instance of, so it activates nothing.
+        let Some(source) = lineage.get(&claim.target()).copied() else {
+            activation_pending.insert(claim.id());
+            continue;
+        };
+        if !contains_member(&members, source, input) {
             activation_pending.insert(claim.id());
             continue;
         }
@@ -691,8 +699,10 @@ where
     }
 
     for claim in active_derives.values() {
-        let source = claim.source();
         let target = claim.target();
+        let Some(source) = lineage.get(&target).copied() else {
+            continue;
+        };
         let (input, output) = claim.mapping();
         semantics
             .derive_inputs_by_output
@@ -857,10 +867,10 @@ fn close_homomorphic_squares(
             {
                 let (left, right) = source_merge.inputs();
                 let result = source_merge.result();
-                let Some(left_outputs) = maps.get(&(*source, *target, left)) else {
+                let Some(left_outputs) = maps.get(&(*target, left)) else {
                     continue;
                 };
-                let Some(right_outputs) = maps.get(&(*source, *target, right)) else {
+                let Some(right_outputs) = maps.get(&(*target, right)) else {
                     continue;
                 };
 
@@ -873,14 +883,14 @@ fn close_homomorphic_squares(
                         if let Some(outputs) = joins.get(&(*target, target_low, target_high)) {
                             for output in outputs.keys() {
                                 let theorem =
-                                    CollectionDerive::new(*source, *target, result, *output);
+                                    CollectionDerive::new(*target, result, *output);
                                 derive_theorems.insert(theorem.id(), theorem);
                             }
                         }
 
                         // Source-result map + source join + endpoint maps
                         // imply the exact target join.
-                        if let Some(outputs) = maps.get(&(*source, *target, result)) {
+                        if let Some(outputs) = maps.get(&(*target, result)) {
                             for output in outputs.keys() {
                                 let theorem = CollectionMerge::new(
                                     *target,
@@ -950,15 +960,15 @@ fn index_merge_outputs<'a>(
 
 fn index_derive_outputs<'a>(
     derives: impl IntoIterator<Item = &'a CollectionDerive>,
-) -> BTreeMap<(CollectionHandle, CollectionHandle, CollectionData), BTreeMap<CollectionData, Id>> {
-    let mut outputs: BTreeMap<
-        (CollectionHandle, CollectionHandle, CollectionData),
-        BTreeMap<CollectionData, Id>,
-    > = BTreeMap::new();
+) -> BTreeMap<(CollectionHandle, CollectionData), BTreeMap<CollectionData, Id>> {
+    // Keyed on the target alone: a target has one source, stated by its
+    // descriptor, so naming the source here would only repeat it.
+    let mut outputs: BTreeMap<(CollectionHandle, CollectionData), BTreeMap<CollectionData, Id>> =
+        BTreeMap::new();
     for claim in derives {
         let (input, output) = claim.mapping();
         outputs
-            .entry((claim.source(), claim.target(), input))
+            .entry((claim.target(), input))
             .or_default()
             .entry(output)
             .and_modify(|record| *record = (*record).min(claim.id()))
@@ -1027,25 +1037,24 @@ fn check_functional(
     }
 
     let mut derive_outputs: BTreeMap<
-        (CollectionHandle, CollectionHandle, CollectionData),
+        (CollectionHandle, CollectionData),
         BTreeMap<CollectionData, Id>,
     > = BTreeMap::new();
     for claim in derives {
         let (input, output) = claim.mapping();
         derive_outputs
-            .entry((claim.source(), claim.target(), input))
+            .entry((claim.target(), input))
             .or_default()
             .entry(output)
             .and_modify(|record| *record = (*record).min(claim.id()))
             .or_insert_with(|| claim.id());
     }
-    for ((source, target, input), outputs) in derive_outputs {
+    for ((target, input), outputs) in derive_outputs {
         if outputs.len() > 1 {
             let mut outputs = outputs.into_iter();
             let (first_data, first_claim) = outputs.next().expect("conflict has first output");
             let (second_data, second_claim) = outputs.next().expect("conflict has second output");
             return Err(Box::new(CollectionFunctionalConflict::Derive {
-                source,
                 target,
                 input,
                 first: ConflictingCollectionOutput {
@@ -1065,26 +1074,24 @@ fn check_functional(
 #[cfg(test)]
 mod tests {
 
-    /// Resolve using the lineage the derive records themselves imply.
+    /// Resolve with a stated lineage.
     ///
-    /// `CollectionDerive` still carries a `source` field that restates what
-    /// the target's descriptor says. Building the lineage from it here keeps
-    /// these tests measuring resolution rather than plumbing, and makes the
-    /// redundancy explicit: this helper is exactly what disappears when the
-    /// field does, replaced by reading the target descriptor.
+    /// A derive record no longer names its source -- the target's descriptor
+    /// does -- so a test that exercises a derivation says which mapping its
+    /// records are instances of. Passing an empty lineage is meaningful: it
+    /// declares that nothing derives from anything, and derives resolve
+    /// against nothing.
     fn resolve_with_derive_lineage<D, E, V>(
         records: &DiscoveredCollectionRecords,
+        lineage: &[(CollectionHandle, CollectionHandle)],
         authorized_commit_ids: &BTreeSet<Id>,
         validate: V,
     ) -> Result<CollectionResolution<D>, CollectionResolutionError<E>>
     where
         V: for<'a> FnMut(CollectionValidationRequest<'a>) -> Result<CollectionClaimValidation<D>, E>,
     {
-        let lineage: BTreeMap<CollectionHandle, CollectionHandle> = records
-            .derives()
-            .iter()
-            .map(|claim| (claim.target(), claim.source()))
-            .collect();
+        let lineage: BTreeMap<CollectionHandle, CollectionHandle> =
+            lineage.iter().copied().collect();
         resolve_collection_semantics(records, &lineage, authorized_commit_ids, validate)
     }
     use super::*;
@@ -1280,7 +1287,6 @@ mod tests {
         let missing_descriptor_merge =
             CollectionMerge::new(missing_collection.handle(), data(10), data(11), data(12));
         let missing_descriptor_derive = CollectionDerive::new(
-            definition.handle(),
             missing_collection.handle(),
             data(1),
             data(13),
@@ -1302,7 +1308,7 @@ mod tests {
         );
         let authorized_ids = BTreeSet::from([authorized.id(), missing_descriptor_commit.id()]);
         let mut called = Vec::new();
-        let resolution = resolve_with_derive_lineage(&records, &authorized_ids, |request| {
+        let resolution = resolve_with_derive_lineage(&records, &[], &authorized_ids, |request| {
             let claim = request.claim_id();
             called.push(claim);
             let descriptor_available = match request {
@@ -1313,7 +1319,7 @@ mod tests {
                     claim.collection() == definition.handle()
                 }
                 CollectionValidationRequest::Derive { claim } => {
-                    claim.source() == definition.handle() && claim.target() == definition.handle()
+                    claim.target() == definition.handle()
                 }
             };
             if claim == rejected_merge.id() {
@@ -1384,6 +1390,7 @@ mod tests {
         let records = discover(&[definition], &[root.clone()], &[], &[], false);
         let error = resolve_with_derive_lineage::<(), _, _>(
             &records,
+            &[],
             &BTreeSet::from([root.id()]),
             |_| Err(InjectedFailure),
         )
@@ -1407,7 +1414,7 @@ mod tests {
         let raw_two = commit(&raw, data(2), 2);
         let rollup_four = commit(&rollup, data(4), 3);
         let raw_merge = CollectionMerge::new(raw.handle(), data(1), data(2), data(3));
-        let derive = CollectionDerive::new(raw.handle(), rollup.handle(), data(3), data(5));
+        let derive = CollectionDerive::new(rollup.handle(), data(3), data(5));
         let rollup_merge = CollectionMerge::new(rollup.handle(), data(4), data(5), data(6));
         let definitions = [raw.clone(), rollup.clone()];
         let commits = [raw_one.clone(), raw_two.clone(), rollup_four.clone()];
@@ -1417,8 +1424,8 @@ mod tests {
 
         let forward = discover(&definitions, &commits, &merges, &derives, false);
         let reverse = discover(&definitions, &commits, &merges, &derives, true);
-        let forward = resolve_with_derive_lineage(&forward, &authorized, accepted).unwrap();
-        let reverse = resolve_with_derive_lineage(&reverse, &authorized, accepted).unwrap();
+        let forward = resolve_with_derive_lineage(&forward, &[(rollup.handle(), raw.handle())], &authorized, accepted).unwrap();
+        let reverse = resolve_with_derive_lineage(&reverse, &[(rollup.handle(), raw.handle())], &authorized, accepted).unwrap();
         assert_eq!(forward, reverse);
         assert!(forward.validation_pending().is_empty());
         assert!(forward.activation_pending().is_empty());
@@ -1453,8 +1460,8 @@ mod tests {
         let first = commit(&source, data(1), 1);
         let second = commit(&source, data(2), 2);
         let source_merge = CollectionMerge::new(source.handle(), data(1), data(2), data(3));
-        let lower = CollectionDerive::new(source.handle(), target.handle(), data(1), data(11));
-        let upper = CollectionDerive::new(source.handle(), target.handle(), data(3), data(13));
+        let lower = CollectionDerive::new(target.handle(), data(1), data(11));
+        let upper = CollectionDerive::new(target.handle(), data(3), data(13));
         let records = discover(
             &[source.clone(), target.clone()],
             &[first.clone(), second.clone()],
@@ -1464,6 +1471,7 @@ mod tests {
         );
         let resolution = resolve_with_derive_lineage(
             &records,
+            &[(target.handle(), source.handle())],
             &BTreeSet::from([first.id(), second.id()]),
             accepted,
         )
@@ -1498,8 +1506,8 @@ mod tests {
             CollectionMerge::new(source.handle(), data(3), data(4), data(7)),
         ];
         let derives = [
-            CollectionDerive::new(source.handle(), target.handle(), data(1), data(11)),
-            CollectionDerive::new(source.handle(), target.handle(), data(7), data(17)),
+            CollectionDerive::new(target.handle(), data(1), data(11)),
+            CollectionDerive::new(target.handle(), data(7), data(17)),
         ];
         let records = discover(
             &[source.clone(), target.clone()],
@@ -1509,7 +1517,7 @@ mod tests {
             false,
         );
         let authorized = commits.iter().map(CollectionCommit::id).collect();
-        let resolution = resolve_with_derive_lineage(&records, &authorized, accepted).unwrap();
+        let resolution = resolve_with_derive_lineage(&records, &[(target.handle(), source.handle())], &authorized, accepted).unwrap();
         let semantics = resolution.semantics();
 
         assert!(semantics.subsumes(target.handle(), data(11), data(17)));
@@ -1535,11 +1543,11 @@ mod tests {
             CollectionMerge::new(source.handle(), data(3), data(12), data(15)),
         ];
         let derives = [
-            CollectionDerive::new(source.handle(), target.handle(), data(1), data(21)),
-            CollectionDerive::new(source.handle(), target.handle(), data(2), data(22)),
-            CollectionDerive::new(source.handle(), target.handle(), data(4), data(24)),
-            CollectionDerive::new(source.handle(), target.handle(), data(8), data(28)),
-            CollectionDerive::new(source.handle(), target.handle(), data(15), data(35)),
+            CollectionDerive::new(target.handle(), data(1), data(21)),
+            CollectionDerive::new(target.handle(), data(2), data(22)),
+            CollectionDerive::new(target.handle(), data(4), data(24)),
+            CollectionDerive::new(target.handle(), data(8), data(28)),
+            CollectionDerive::new(target.handle(), data(15), data(35)),
         ];
         let records = discover(
             &[source.clone(), target.clone()],
@@ -1549,7 +1557,7 @@ mod tests {
             false,
         );
         let authorized = commits.iter().map(CollectionCommit::id).collect();
-        let resolution = resolve_with_derive_lineage(&records, &authorized, accepted).unwrap();
+        let resolution = resolve_with_derive_lineage(&records, &[(target.handle(), source.handle())], &authorized, accepted).unwrap();
         let semantics = resolution.semantics();
 
         for lower in [data(21), data(22), data(24), data(28)] {
@@ -1574,10 +1582,10 @@ mod tests {
             data(3),
         )];
         let derives = [
-            CollectionDerive::new(source.handle(), middle.handle(), data(1), data(11)),
-            CollectionDerive::new(source.handle(), middle.handle(), data(3), data(13)),
-            CollectionDerive::new(middle.handle(), target.handle(), data(11), data(21)),
-            CollectionDerive::new(middle.handle(), target.handle(), data(13), data(23)),
+            CollectionDerive::new(middle.handle(), data(1), data(11)),
+            CollectionDerive::new(middle.handle(), data(3), data(13)),
+            CollectionDerive::new(target.handle(), data(11), data(21)),
+            CollectionDerive::new(target.handle(), data(13), data(23)),
         ];
         let records = discover(
             &[source.clone(), middle.clone(), target.clone()],
@@ -1587,7 +1595,7 @@ mod tests {
             false,
         );
         let authorized = commits.iter().map(CollectionCommit::id).collect();
-        let resolution = resolve_with_derive_lineage(&records, &authorized, accepted).unwrap();
+        let resolution = resolve_with_derive_lineage(&records, &[(middle.handle(), source.handle()), (target.handle(), middle.handle())], &authorized, accepted).unwrap();
         let semantics = resolution.semantics();
 
         assert!(semantics.subsumes(middle.handle(), data(11), data(13)));
@@ -1606,9 +1614,9 @@ mod tests {
         let second = commit(&source, data(2), 2);
         let source_merge = CollectionMerge::new(source.handle(), data(1), data(2), data(3));
         let derives = [
-            CollectionDerive::new(source.handle(), target.handle(), data(1), data(11)),
-            CollectionDerive::new(source.handle(), target.handle(), data(2), data(12)),
-            CollectionDerive::new(source.handle(), target.handle(), data(3), data(13)),
+            CollectionDerive::new(target.handle(), data(1), data(11)),
+            CollectionDerive::new(target.handle(), data(2), data(12)),
+            CollectionDerive::new(target.handle(), data(3), data(13)),
         ];
         let records = discover(
             &[source.clone(), target.clone()],
@@ -1619,6 +1627,7 @@ mod tests {
         );
         let resolution = resolve_with_derive_lineage(
             &records,
+            &[(target.handle(), source.handle())],
             &BTreeSet::from([first.id(), second.id()]),
             accepted,
         )
@@ -1649,10 +1658,10 @@ mod tests {
         let first = commit(&source, data(1), 1);
         let second = commit(&source, data(2), 2);
         let source_merge = CollectionMerge::new(source.handle(), data(1), data(2), data(3));
-        let lower = CollectionDerive::new(source.handle(), target.handle(), data(1), data(11));
-        let upper = CollectionDerive::new(source.handle(), target.handle(), data(2), data(12));
+        let lower = CollectionDerive::new(target.handle(), data(1), data(11));
+        let upper = CollectionDerive::new(target.handle(), data(2), data(12));
         let target_merge = CollectionMerge::new(target.handle(), data(11), data(12), data(13));
-        let implied = CollectionDerive::new(source.handle(), target.handle(), data(3), data(13));
+        let implied = CollectionDerive::new(target.handle(), data(3), data(13));
         let records = discover(
             &[source.clone(), target.clone()],
             &[first.clone(), second.clone()],
@@ -1662,6 +1671,7 @@ mod tests {
         );
         let resolution = resolve_with_derive_lineage(
             &records,
+            &[(target.handle(), source.handle())],
             &BTreeSet::from([first.id(), second.id()]),
             accepted,
         )
@@ -1685,12 +1695,12 @@ mod tests {
         let source_merge = CollectionMerge::new(source.handle(), data(1), data(2), data(3));
         let target_merge = CollectionMerge::new(target.handle(), data(11), data(12), data(13));
         let derives = [
-            CollectionDerive::new(source.handle(), target.handle(), data(1), data(11)),
-            CollectionDerive::new(source.handle(), target.handle(), data(2), data(12)),
-            CollectionDerive::new(source.handle(), target.handle(), data(3), data(14)),
+            CollectionDerive::new(target.handle(), data(1), data(11)),
+            CollectionDerive::new(target.handle(), data(2), data(12)),
+            CollectionDerive::new(target.handle(), data(3), data(14)),
         ];
         let records = discover(
-            &[source.clone(), target],
+            &[source.clone(), target.clone()],
             &[first.clone(), second.clone()],
             &[source_merge, target_merge],
             &derives,
@@ -1700,6 +1710,7 @@ mod tests {
         assert!(matches!(
             resolve_with_derive_lineage(
                 &records,
+                &[(target.handle(), source.handle())],
                 &BTreeSet::from([first.id(), second.id()]),
                 accepted,
             ),
@@ -1718,9 +1729,9 @@ mod tests {
         let reverse = discover(&definitions, &[], &merges, &[], true);
 
         let forward =
-            resolve_with_derive_lineage(&forward, &BTreeSet::new(), accepted).unwrap_err();
+            resolve_with_derive_lineage(&forward, &[], &BTreeSet::new(), accepted).unwrap_err();
         let reverse =
-            resolve_with_derive_lineage(&reverse, &BTreeSet::new(), accepted).unwrap_err();
+            resolve_with_derive_lineage(&reverse, &[], &BTreeSet::new(), accepted).unwrap_err();
         assert_eq!(forward, reverse);
         assert_eq!(
             forward,
@@ -1744,8 +1755,8 @@ mod tests {
     fn derive_conflicts_are_functional_by_exact_collection_pair_and_input() {
         let source = CollectionDescriptor::naming(id(1), id(2), id(3));
         let target = CollectionDescriptor::naming(id(4), id(5), id(6));
-        let first = CollectionDerive::new(source.handle(), target.handle(), data(1), data(2));
-        let second = CollectionDerive::new(source.handle(), target.handle(), data(1), data(3));
+        let first = CollectionDerive::new(target.handle(), data(1), data(2));
+        let second = CollectionDerive::new(target.handle(), data(1), data(3));
         let records = discover(
             &[source.clone(), target.clone()],
             &[],
@@ -1755,9 +1766,8 @@ mod tests {
         );
 
         assert_eq!(
-            resolve_with_derive_lineage(&records, &BTreeSet::new(), accepted).unwrap_err(),
+            resolve_with_derive_lineage(&records, &[(target.handle(), source.handle())], &BTreeSet::new(), accepted).unwrap_err(),
             CollectionResolutionError::Conflict(Box::new(CollectionFunctionalConflict::Derive {
-                source: source.handle(),
                 target: target.handle(),
                 input: data(1),
                 first: ConflictingCollectionOutput {
@@ -1784,7 +1794,7 @@ mod tests {
             &[],
             false,
         );
-        let resolution = resolve_with_derive_lineage(&records, &BTreeSet::new(), |request| {
+        let resolution = resolve_with_derive_lineage(&records, &[], &BTreeSet::new(), |request| {
             if request.claim_id() == second.id() {
                 Ok::<_, Infallible>(CollectionClaimValidation::Rejected("wrong output"))
             } else {
@@ -1818,7 +1828,7 @@ mod tests {
         );
 
         let first_pass =
-            resolve_with_derive_lineage(&records, &BTreeSet::from([first.id()]), accepted)
+            resolve_with_derive_lineage(&records, &[], &BTreeSet::from([first.id()]), accepted)
                 .unwrap();
         assert!(first_pass.validation_pending().is_empty());
         assert_eq!(
@@ -1830,7 +1840,7 @@ mod tests {
             .contains(definition.handle(), data(3)));
 
         let authorized = BTreeSet::from([first.id(), second.id()]);
-        let callback_pending = resolve_with_derive_lineage(&records, &authorized, |request| {
+        let callback_pending = resolve_with_derive_lineage(&records, &[], &authorized, |request| {
             if request.claim_id() == merge.id() {
                 Ok::<_, Infallible>(CollectionClaimValidation::<()>::Pending)
             } else {
@@ -1846,7 +1856,7 @@ mod tests {
             .semantics()
             .contains(definition.handle(), data(3)));
 
-        let final_pass = resolve_with_derive_lineage(&records, &authorized, accepted).unwrap();
+        let final_pass = resolve_with_derive_lineage(&records, &[], &authorized, accepted).unwrap();
         assert!(final_pass
             .semantics()
             .contains(definition.handle(), data(3)));
@@ -1878,6 +1888,7 @@ mod tests {
         );
         let resolution = resolve_with_derive_lineage(
             &records,
+            &[],
             &BTreeSet::from([first.id(), same_data_other_commit.id(), second.id()]),
             accepted,
         )
@@ -1917,7 +1928,7 @@ mod tests {
         ];
         let records = discover(&[definition.clone()], &commits, &merges, &[], false);
         let authorized = commits.iter().map(CollectionCommit::id).collect();
-        let resolution = resolve_with_derive_lineage(&records, &authorized, accepted).unwrap();
+        let resolution = resolve_with_derive_lineage(&records, &[], &authorized, accepted).unwrap();
         let semantics = resolution.semantics();
         assert_eq!(
             semantics.frontier(definition.handle()),
@@ -2018,7 +2029,7 @@ mod tests {
         let source = CollectionDescriptor::naming(id(1), id(2), id(3));
         let target = CollectionDescriptor::naming(id(9), id(4), id(5));
         let root = commit(&source, data(1), 1);
-        let derive = CollectionDerive::new(source.handle(), target.handle(), data(1), data(2));
+        let derive = CollectionDerive::new(target.handle(), data(1), data(2));
         let records = discover(
             &[source.clone(), target.clone()],
             &[root.clone()],
@@ -2027,7 +2038,7 @@ mod tests {
             false,
         );
         let resolution =
-            resolve_with_derive_lineage(&records, &BTreeSet::from([root.id()]), accepted).unwrap();
+            resolve_with_derive_lineage(&records, &[(target.handle(), source.handle())], &BTreeSet::from([root.id()]), accepted).unwrap();
         let semantics = resolution.semantics();
         assert_eq!(
             semantics.supporting_commit_ids(target.handle(), data(2)),
@@ -2056,8 +2067,8 @@ mod tests {
         let first = commit(&source, data(1), 1);
         let second = commit(&source, data(2), 2);
         let merge = CollectionMerge::new(source.handle(), data(1), data(2), data(3));
-        let forward = CollectionDerive::new(source.handle(), target.handle(), data(3), data(4));
-        let backward = CollectionDerive::new(target.handle(), source.handle(), data(4), data(3));
+        let forward = CollectionDerive::new(target.handle(), data(3), data(4));
+        let backward = CollectionDerive::new(source.handle(), data(4), data(3));
         let records = discover(
             &[source.clone(), target.clone()],
             &[first.clone(), second.clone()],
@@ -2067,6 +2078,7 @@ mod tests {
         );
         let resolution = resolve_with_derive_lineage(
             &records,
+            &[(target.handle(), source.handle()), (source.handle(), target.handle())],
             &BTreeSet::from([first.id(), second.id()]),
             accepted,
         )
@@ -2185,7 +2197,7 @@ mod tests {
 
         let records = super::super::discover_collection_records(&mut store).unwrap();
         let reader = store.reader().unwrap();
-        let pending = resolve_with_derive_lineage(&records, &authorized, |request| {
+        let pending = resolve_with_derive_lineage(&records, &[], &authorized, |request| {
             validate_union(&reader, request)
         })
         .unwrap();
@@ -2197,7 +2209,7 @@ mod tests {
         store.blobs.insert(result);
         let records = super::super::discover_collection_records(&mut store).unwrap();
         let reader = store.reader().unwrap();
-        let resolved = resolve_with_derive_lineage(&records, &authorized, |request| {
+        let resolved = resolve_with_derive_lineage(&records, &[], &authorized, |request| {
             validate_union(&reader, request)
         })
         .unwrap();

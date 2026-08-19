@@ -142,7 +142,7 @@ fn build(
     let derives: Vec<_> = mapped_inputs
         .iter()
         .map(|input| {
-            CollectionDerive::new(source_collection, target_collection, *input, mapped(*input))
+            CollectionDerive::new(target_collection, *input, mapped(*input))
         })
         .collect();
 

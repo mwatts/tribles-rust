@@ -229,7 +229,6 @@ fn publish_derive(store: &mut MemoryRepo, input: &Blob<SimpleArchive>) -> Blob<U
     store.put::<UnknownBlob, _>(output.clone()).unwrap();
     store
         .insert(CollectionRecord::Derive(CollectionDerive::new(
-            kernel().source_descriptor().handle(),
             kernel().target_descriptor().handle(),
             data(input),
             data(&output),
@@ -263,8 +262,7 @@ fn derived_inputs(store: &mut MemoryRepo) -> Vec<CollectionData> {
         .map(Result::unwrap)
         .filter_map(|record| match record {
             CollectionRecord::Derive(claim)
-                if claim.source() == kernel().source_descriptor().handle()
-                    && claim.target() == kernel().target_descriptor().handle() =>
+                if claim.target() == kernel().target_descriptor().handle() =>
             {
                 Some(claim.mapping().0)
             }
@@ -1390,7 +1388,6 @@ fn missing_derive_output_is_pending_and_ensure_rebuilds() {
     let missing = derive(&source).unwrap();
     store
         .insert(CollectionRecord::Derive(CollectionDerive::new(
-            kernel().source_descriptor().handle(),
             kernel().target_descriptor().handle(),
             data(&source),
             data(&missing),
@@ -1421,7 +1418,6 @@ fn corrupt_unsigned_endpoint_is_rejected_as_optional_evidence() {
     store.put::<UnknownBlob, _>(forged).unwrap();
     store
         .insert(CollectionRecord::Derive(CollectionDerive::new(
-            kernel().source_descriptor().handle(),
             kernel().target_descriptor().handle(),
             data(&source),
             data(&expected),

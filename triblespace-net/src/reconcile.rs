@@ -510,7 +510,7 @@ fn want_request_for_record(record: CollectionRecord) -> Option<WantRequest> {
         }
         CollectionRecord::Derive(derive) => {
             let (input, _) = derive.mapping();
-            Some(WantRequest::derive(derive.source(), derive.target(), input))
+            Some(WantRequest::derive(derive.target(), input))
         }
     }
 }
@@ -538,9 +538,9 @@ mod tests {
         );
         assert_eq!(
             want_request_for_record(CollectionRecord::Derive(CollectionDerive::new(
-                collection, target, a, result,
+                target, a, result,
             ))),
-            Some(WantRequest::derive(collection, target, a))
+            Some(WantRequest::derive(target, a))
         );
     }
 }

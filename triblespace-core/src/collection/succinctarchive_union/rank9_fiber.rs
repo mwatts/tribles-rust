@@ -275,7 +275,6 @@ impl Rank9Fiber {
             member.output = Some(output);
             if !member.claim_present {
                 claims.push(CollectionDerive::new(
-                    self.source.handle(),
                     self.target.handle(),
                     member.raw_data,
                     output,
@@ -335,7 +334,6 @@ impl Rank9Fiber {
             if let Some(candidate) = unique {
                 full_validation_attempted = true;
                 let claim = CollectionDerive::new(
-                    self.source.handle(),
                     self.target.handle(),
                     raw_data,
                     candidate,
@@ -381,7 +379,6 @@ impl Rank9Fiber {
                 output = Some(canonical);
                 if claim_present && !full_validation_attempted {
                     let claim = CollectionDerive::new(
-                        self.source.handle(),
                         self.target.handle(),
                         raw_data,
                         canonical,
@@ -417,10 +414,7 @@ impl Rank9Fiber {
         ensure: bool,
     ) -> Result<BTreeMap<CollectionData, CandidateOutputs>, Rank9FiberError> {
         let mut candidates = BTreeMap::<CollectionData, CandidateOutputs>::new();
-        let selectors = [CollectionRecordSelector::DerivePair {
-            source: self.source.handle(),
-            target: self.target.handle(),
-        }]
+        let selectors = [CollectionRecordSelector::DeriveTarget(self.target.handle())]
         .into_iter()
         .collect();
         let records = store
@@ -434,7 +428,7 @@ impl Rank9Fiber {
             let Some(raw) = raw_by_input.get(&input) else {
                 continue;
             };
-            if claim.source() != self.source.handle() || claim.target() != self.target.handle() {
+            if claim.target() != self.target.handle() {
                 continue;
             }
             let Some(outputs) = candidates.get_mut(&input) else {
@@ -483,7 +477,7 @@ impl Rank9Fiber {
     where
         R: BlobStoreGet + BlobStoreMeta,
     {
-        if claim.source() != self.source.handle() || claim.target() != self.target.handle() {
+        if claim.target() != self.target.handle() {
             return Ok(None);
         }
         let (input, output) = claim.mapping();
@@ -552,7 +546,6 @@ impl Rank9Fiber {
                     .output
                     .expect("every incomplete probe member is assigned before publication");
                 let claim = CollectionDerive::new(
-                    self.source.handle(),
                     self.target.handle(),
                     member.raw_data,
                     output,

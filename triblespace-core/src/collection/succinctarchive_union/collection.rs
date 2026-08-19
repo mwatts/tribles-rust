@@ -813,8 +813,7 @@ mod tests {
             .map(Result::unwrap)
             .filter_map(|record| match record {
                 CollectionRecord::Derive(claim)
-                    if claim.source() == collection.source_descriptor().handle()
-                        && claim.target() == collection.descriptor().handle() =>
+                    if claim.target() == collection.descriptor().handle() =>
                 {
                     Some(claim)
                 }
@@ -835,8 +834,7 @@ mod tests {
             .map(Result::unwrap)
             .filter_map(|record| match record {
                 CollectionRecord::Derive(claim)
-                    if claim.source() == collection.descriptor().handle()
-                        && claim.target() == collection.rank9_descriptor().handle() =>
+                    if claim.target() == collection.rank9_descriptor().handle() =>
                 {
                     Some(claim)
                 }
@@ -967,7 +965,6 @@ mod tests {
         );
         store
             .insert(CollectionRecord::Derive(CollectionDerive::new(
-                collection.descriptor().handle(),
                 wrong_target.handle(),
                 data(&raw),
                 data(&sidecar),
@@ -1020,13 +1017,11 @@ mod tests {
             CollectionRecord::Commit(first),
             CollectionRecord::Commit(second),
             CollectionRecord::Derive(CollectionDerive::new(
-                collection.source_descriptor().handle(),
                 collection.descriptor().handle(),
                 data(&a),
                 data(&raw_a),
             )),
             CollectionRecord::Derive(CollectionDerive::new(
-                collection.source_descriptor().handle(),
                 collection.descriptor().handle(),
                 data(&b),
                 data(&raw_b),
@@ -1038,19 +1033,16 @@ mod tests {
                 data(&raw_ab),
             )),
             CollectionRecord::Derive(CollectionDerive::new(
-                collection.descriptor().handle(),
                 collection.rank9_descriptor().handle(),
                 data(&raw_a),
                 data(&rank_a),
             )),
             CollectionRecord::Derive(CollectionDerive::new(
-                collection.descriptor().handle(),
                 collection.rank9_descriptor().handle(),
                 data(&raw_b),
                 data(&rank_b),
             )),
             CollectionRecord::Derive(CollectionDerive::new(
-                collection.descriptor().handle(),
                 collection.rank9_descriptor().handle(),
                 data(&raw_ab),
                 data(&rank_ab),
@@ -1065,9 +1057,23 @@ mod tests {
         let discovered = discover_collection_records(&mut store).unwrap();
         let authorized = BTreeSet::from([first.id(), second.id()]);
         let resolution =
-            resolve_collection_semantics::<(), Infallible, _>(&discovered, &std::collections::BTreeMap::new(), &authorized, |_| {
-                Ok(CollectionClaimValidation::Accepted)
-            })
+            resolve_collection_semantics::<(), Infallible, _>(
+                &discovered,
+                // Two hops: the raw SuccinctArchive collection derives from
+                // the SimpleArchive one, and the Rank9 sidecar from the raw.
+                &std::collections::BTreeMap::from([
+                    (
+                        collection.descriptor().handle(),
+                        collection.source_descriptor().handle(),
+                    ),
+                    (
+                        collection.rank9_descriptor().handle(),
+                        collection.descriptor().handle(),
+                    ),
+                ]),
+                &authorized,
+                |_| Ok(CollectionClaimValidation::Accepted),
+            )
             .unwrap();
         let semantics = resolution.semantics();
         let rank9_collection = collection.rank9_descriptor().handle();
@@ -1159,7 +1165,6 @@ mod tests {
             .unwrap();
         store
             .insert(CollectionRecord::Derive(CollectionDerive::new(
-                collection.descriptor().handle(),
                 collection.rank9_descriptor().handle(),
                 data(&raw),
                 data(&malformed),
@@ -1181,7 +1186,6 @@ mod tests {
             .unwrap();
         other_store
             .insert(CollectionRecord::Derive(CollectionDerive::new(
-                other_collection.descriptor().handle(),
                 other_collection.rank9_descriptor().handle(),
                 data(&other_raw),
                 data(&foreign),
@@ -1206,7 +1210,6 @@ mod tests {
                 .unwrap();
             store
                 .insert(CollectionRecord::Derive(CollectionDerive::new(
-                    collection.descriptor().handle(),
                     collection.rank9_descriptor().handle(),
                     data(&raw),
                     data(sidecar),
@@ -1234,7 +1237,6 @@ mod tests {
             .unwrap();
         store
             .insert(CollectionRecord::Derive(CollectionDerive::new(
-                collection.descriptor().handle(),
                 collection.rank9_descriptor().handle(),
                 data(&raw),
                 data(&canonical),
@@ -1261,7 +1263,6 @@ mod tests {
         base.put::<SuccinctArchiveRank9IndexBlob, _>(canonical.clone())
             .unwrap();
         base.insert(CollectionRecord::Derive(CollectionDerive::new(
-            collection.descriptor().handle(),
             collection.rank9_descriptor().handle(),
             data(&raw),
             data(&canonical),
@@ -1525,8 +1526,7 @@ mod tests {
             .into_iter()
             .filter_map(|record| match record {
                 CollectionRecord::Derive(claim)
-                    if claim.source() == collection.source_descriptor().handle()
-                        && claim.target() == collection.descriptor().handle() =>
+                    if claim.target() == collection.descriptor().handle() =>
                 {
                     Some(claim.mapping())
                 }
@@ -1609,8 +1609,7 @@ mod tests {
             .into_iter()
             .filter(|record| {
                 matches!(record, CollectionRecord::Derive(claim)
-                if claim.source() == collection.source_descriptor().handle()
-                    && claim.target() == collection.descriptor().handle())
+                if claim.target() == collection.descriptor().handle())
             })
             .count();
         assert_eq!(derives, 1);
@@ -1652,8 +1651,7 @@ mod tests {
             .into_iter()
             .filter_map(|record| match record {
                 CollectionRecord::Derive(claim)
-                    if claim.source() == collection.source_descriptor().handle()
-                        && claim.target() == collection.descriptor().handle() =>
+                    if claim.target() == collection.descriptor().handle() =>
                 {
                     Some(claim.mapping().0)
                 }
@@ -1682,7 +1680,6 @@ mod tests {
             store.put::<SuccinctArchiveBlob, _>(output.clone()).unwrap();
             store
                 .insert(CollectionRecord::Derive(CollectionDerive::new(
-                    collection.source_descriptor().handle(),
                     collection.descriptor().handle(),
                     data(input),
                     data(output),
@@ -1726,7 +1723,6 @@ mod tests {
             store.put::<SuccinctArchiveBlob, _>(output.clone()).unwrap();
             store
                 .insert(CollectionRecord::Derive(CollectionDerive::new(
-                    collection.source_descriptor().handle(),
                     collection.descriptor().handle(),
                     data(input),
                     data(output),
@@ -1774,7 +1770,6 @@ mod tests {
             .unwrap();
         store
             .insert(CollectionRecord::Derive(CollectionDerive::new(
-                collection.source_descriptor().handle(),
                 collection.descriptor().handle(),
                 second.data(),
                 data(&later_raw),
@@ -1798,7 +1793,6 @@ mod tests {
         let missing = super::super::derive_element(&source).unwrap();
         store
             .insert(CollectionRecord::Derive(CollectionDerive::new(
-                collection.source_descriptor().handle(),
                 collection.descriptor().handle(),
                 commit.data(),
                 data(&missing),
@@ -1842,8 +1836,7 @@ mod tests {
             .into_iter()
             .filter_map(|record| match record {
                 CollectionRecord::Derive(claim)
-                    if claim.source() == collection.source_descriptor().handle()
-                        && claim.target() == collection.descriptor().handle() =>
+                    if claim.target() == collection.descriptor().handle() =>
                 {
                     Some(claim.mapping().0)
                 }
@@ -1909,13 +1902,11 @@ mod tests {
                 data(&ab),
             )),
             CollectionRecord::Derive(CollectionDerive::new(
-                collection.source_descriptor().handle(),
                 collection.descriptor().handle(),
                 data(&ab),
                 data(&succinct_ab),
             )),
             CollectionRecord::Derive(CollectionDerive::new(
-                collection.source_descriptor().handle(),
                 collection.descriptor().handle(),
                 data(&c),
                 data(&succinct_c),
@@ -2084,8 +2075,7 @@ mod tests {
             .map(Result::unwrap)
             .filter_map(|record| match record {
                 CollectionRecord::Derive(claim)
-                    if claim.source() == collection.source_descriptor().handle()
-                        && claim.target() == collection.descriptor().handle() =>
+                    if claim.target() == collection.descriptor().handle() =>
                 {
                     Some(claim.mapping().0)
                 }

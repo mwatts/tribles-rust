@@ -462,13 +462,8 @@ fn print_record(bytes: &[u8], file_len: usize, record: triblespace_core::repo::p
                 println!("  low: {}", hex::encode_upper(low.raw));
                 println!("  high: {}", hex::encode_upper(high.raw));
             }
-            WantRequest::Derive {
-                source,
-                target,
-                input,
-            } => {
+            WantRequest::Derive { target, input } => {
                 println!("  request_kind: derive");
-                println!("  source: {}", hex::encode_upper(source.raw));
                 println!("  target: {}", hex::encode_upper(target.raw));
                 println!("  input: {}", hex::encode_upper(input.raw));
             }
@@ -551,7 +546,6 @@ fn print_record(bytes: &[u8], file_len: usize, record: triblespace_core::repo::p
             CollectionRecord::Derive(derive) => {
                 let (input, output) = derive.mapping();
                 println!("  classification: collection-derive");
-                println!("  source: {}", hex::encode_upper(derive.source().raw));
                 println!("  target: {}", hex::encode_upper(derive.target().raw));
                 println!("  input: {}", hex::encode_upper(input.raw));
                 println!("  output: {}", hex::encode_upper(output.raw));
@@ -615,15 +609,9 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
             .into_iter()
             .filter_map(|(field, value)| (value == *needle).then_some(field))
             .collect(),
-            WantRequest::Derive {
-                source,
-                target,
-                input,
-            } => [
-                ("source", source.raw),
-                ("target", target.raw),
-                ("input", input.raw),
-            ]
+            WantRequest::Derive { target, input } => {
+                [("target", target.raw), ("input", input.raw)]
+            }
             .into_iter()
             .filter_map(|(field, value)| (value == *needle).then_some(field))
             .collect(),

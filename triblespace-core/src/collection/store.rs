@@ -26,13 +26,11 @@ pub enum CollectionRecordSelector {
     Id(Id),
     /// Select every `MERGE` asserted for one collection descriptor.
     MergeCollection(CollectionHandle),
-    /// Select every `DERIVE` from one exact source descriptor to one target.
-    DerivePair {
-        /// Source collection descriptor.
-        source: CollectionHandle,
-        /// Target collection descriptor.
-        target: CollectionHandle,
-    },
+    /// Select every `DERIVE` into one exact target descriptor.
+    ///
+    /// The source is not part of the selector: a target has one source, named
+    /// by its descriptor, so selecting the target selects the mapping.
+    DeriveTarget(CollectionHandle),
     /// Select every receipt answering one exact merge or derive request.
     ///
     /// `WantRequest::Blob` has no collection-record answer and selects
@@ -49,7 +47,7 @@ fn collection_record_operation(record: CollectionRecord) -> Option<WantRequest> 
         }
         CollectionRecord::Derive(record) => {
             let (input, _) = record.mapping();
-            Some(WantRequest::derive(record.source(), record.target(), input))
+            Some(WantRequest::derive(record.target(), input))
         }
     }
 }
@@ -71,10 +69,7 @@ pub(crate) fn selectors_match_record(
             ))
         }
         CollectionRecord::Derive(derive) => {
-            selectors.contains(&CollectionRecordSelector::DerivePair {
-                source: derive.source(),
-                target: derive.target(),
-            }) || selectors.contains(&CollectionRecordSelector::Operation(
+            selectors.contains(&CollectionRecordSelector::DeriveTarget(derive.target())) || selectors.contains(&CollectionRecordSelector::Operation(
                 collection_record_operation(record).expect("DERIVE has an operation key"),
             ))
         }
@@ -195,10 +190,10 @@ mod tests {
             )),
             CollectionRecord::Merge(CollectionMerge::new(source, data(4), data(5), data(6))),
             CollectionRecord::Merge(CollectionMerge::new(other, data(4), data(5), data(7))),
-            CollectionRecord::Derive(CollectionDerive::new(source, target, input, data(11))),
-            CollectionRecord::Derive(CollectionDerive::new(source, target, input, data(12))),
-            CollectionRecord::Derive(CollectionDerive::new(source, target, data(13), data(14))),
-            CollectionRecord::Derive(CollectionDerive::new(source, other, input, data(15))),
+            CollectionRecord::Derive(CollectionDerive::new(target, input, data(11))),
+            CollectionRecord::Derive(CollectionDerive::new(target, input, data(12))),
+            CollectionRecord::Derive(CollectionDerive::new(target, data(13), data(14))),
+            CollectionRecord::Derive(CollectionDerive::new(other, input, data(15))),
         ];
         records.sort_unstable_by_key(CollectionRecord::id);
         records
@@ -244,14 +239,12 @@ mod tests {
             .unwrap();
         let source = collection(1);
         let target = collection(2);
-        let exact_derive = WantRequest::derive(source, target, data(10));
+        let exact_derive = WantRequest::derive(target, data(10));
         let overlapping_id = records
             .iter()
             .find(|record| match record {
                 CollectionRecord::Derive(derive) => {
-                    derive.source() == source
-                        && derive.target() == target
-                        && derive.mapping().0 == data(10)
+                    derive.target() == target && derive.mapping().0 == data(10)
                 }
                 _ => false,
             })
@@ -278,9 +271,7 @@ mod tests {
                 CollectionRecord::Commit(_) => record.id() == commit.id(),
                 CollectionRecord::Merge(merge) => merge.collection() == source,
                 CollectionRecord::Derive(derive) => {
-                    derive.source() == source
-                        && derive.target() == target
-                        && derive.mapping().0 == data(10)
+                    derive.target() == target && derive.mapping().0 == data(10)
                 }
             })
             .collect();
@@ -302,7 +293,7 @@ mod tests {
         let records = fixture();
         let source = collection(1);
         let target = collection(2);
-        let pair = [CollectionRecordSelector::DerivePair { source, target }]
+        let pair = [CollectionRecordSelector::DeriveTarget(target)]
             .into_iter()
             .collect();
         let mut store = FallbackStore {
@@ -314,9 +305,7 @@ mod tests {
 
         assert_eq!(selected.len(), 3);
         assert!(selected.iter().all(|record| match record {
-            CollectionRecord::Derive(derive) => {
-                derive.source() == source && derive.target() == target
-            }
+            CollectionRecord::Derive(derive) => derive.target() == target,
             _ => false,
         }));
     }

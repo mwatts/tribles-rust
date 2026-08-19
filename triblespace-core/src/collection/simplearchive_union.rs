@@ -1193,7 +1193,6 @@ mod tests {
         assert_eq!(prepared.commit().to_bytes(), repeated.commit().to_bytes());
 
         let derive = CollectionDerive::new(
-            source_descriptor.handle(),
             target.handle(),
             expected.data(),
             Inline::new([0x42; 32]),

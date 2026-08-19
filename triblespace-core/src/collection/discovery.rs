@@ -325,7 +325,7 @@ where
         .collect();
     selectors.insert(CollectionRecordSelector::MergeCollection(source));
     selectors.insert(CollectionRecordSelector::MergeCollection(target));
-    selectors.insert(CollectionRecordSelector::DerivePair { source, target });
+    selectors.insert(CollectionRecordSelector::DeriveTarget(target));
     discover_collection_records_for_selectors(store, ticket_ids, &selectors)
 }
 
@@ -586,7 +586,7 @@ mod tests {
             empty_metadata_handle(),
         );
         let merge = CollectionMerge::new(collection(1), hash(4), hash(5), hash(6));
-        let derive = CollectionDerive::new(collection(1), collection(7), hash(4), hash(8));
+        let derive = CollectionDerive::new(collection(7), hash(4), hash(8));
 
         let invalid_commit = invalid_signature(commit);
 
@@ -614,9 +614,9 @@ mod tests {
         );
         let source_merge = CollectionMerge::new(source, hash(4), hash(5), hash(6));
         let target_merge = CollectionMerge::new(target, hash(7), hash(8), hash(9));
-        let derive = CollectionDerive::new(source, target, hash(6), hash(7));
+        let derive = CollectionDerive::new(target, hash(6), hash(7));
         let unrelated_merge = CollectionMerge::new(other, hash(10), hash(11), hash(12));
-        let unrelated_derive = CollectionDerive::new(source, other, hash(6), hash(13));
+        let unrelated_derive = CollectionDerive::new(other, hash(6), hash(13));
         let unrelated_commit = invalid_signature(CollectionCommit::sign(
             &SigningKey::from_bytes(&[8; 32]),
             other,
@@ -712,7 +712,7 @@ mod tests {
         ));
         let target_merge = CollectionMerge::new(target, hash(1), hash(2), hash(5));
         let other_merge = CollectionMerge::new(other, hash(3), hash(4), hash(6));
-        let crossing_derive = CollectionDerive::new(target, other, hash(5), hash(6));
+        let crossing_derive = CollectionDerive::new(other, hash(5), hash(6));
 
         let mut store = ProbeStore {
             records: [
@@ -811,7 +811,7 @@ mod tests {
             )),
             CollectionRecord::Merge(CollectionMerge::new(other, hash(3), hash(4), hash(5))),
             CollectionRecord::Commit(matching[1]),
-            CollectionRecord::Derive(CollectionDerive::new(other, target, hash(5), hash(2))),
+            CollectionRecord::Derive(CollectionDerive::new(target, hash(5), hash(2))),
             CollectionRecord::Commit(CollectionCommit::sign(
                 &authorized_key,
                 other,

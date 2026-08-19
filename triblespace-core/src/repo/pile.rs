@@ -130,6 +130,13 @@ const MAGIC_MARKER_COLLECTION_DERIVE_V3: RawId = hex!("07ECF056F6F015D94389FFF21
 const MAGIC_MARKER_COLLECTION_COMMIT_V4: RawId = hex!("CBF2CF97D52A3486E16C12D70D397C66");
 const MAGIC_MARKER_COLLECTION_MERGE_V4: RawId = hex!("9F5D028D4C423620D6957A5F726FA727");
 const MAGIC_MARKER_COLLECTION_DERIVE_V4: RawId = hex!("ECFB2EE90ED8042244F7BAC704454BB9");
+/// V5 derive: the source field is gone, because the target's descriptor names
+/// it. Records under the V4 marker are no longer decoded — a derivation is a
+/// computation with a checkable artifact, so a stale one is recomputed rather
+/// than migrated, and the envelope skips it as opaque in the meantime.
+///
+/// Minted with `trible genid` on 2026-08-20.
+const MAGIC_MARKER_COLLECTION_DERIVE_V5: RawId = hex!("ED6B46F7286D4556B076C17B79FD8315");
 /// Grow-only signed collection-publication grant.
 ///
 /// Unlike a collection-calculus record this is orthogonal low-level store
@@ -715,11 +722,10 @@ struct CollectionDeriveHeaderEnvelope {
     envelope_marker: RawId,
     record_kind: RawId,
     span_blocks: [u8; 4],
-    source: RawInline,
     target: RawInline,
     input: RawInline,
     output: RawInline,
-    reserved: [u8; 92],
+    reserved: [u8; 124],
 }
 
 /// Signed grow-only publication grant for one author's commits in a
@@ -758,13 +764,12 @@ impl CollectionDeriveHeaderEnvelope {
         let (input, output) = record.mapping();
         Self {
             envelope_marker: MAGIC_MARKER_ENVELOPE,
-            record_kind: MAGIC_MARKER_COLLECTION_DERIVE_V4,
+            record_kind: MAGIC_MARKER_COLLECTION_DERIVE_V5,
             span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
-            source: record.source().raw,
             target: record.target().raw,
             input: input.raw,
             output: output.raw,
-            reserved: [0u8; 92],
+            reserved: [0u8; 124],
         }
     }
 }
@@ -1106,7 +1111,7 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
                 },
             })
         }
-        MAGIC_MARKER_COLLECTION_DERIVE_V4 => {
+        MAGIC_MARKER_COLLECTION_DERIVE_V5 => {
             fixed_header()?;
             let (header, _) = CollectionDeriveHeaderEnvelope::try_read_from_prefix(bytes)
                 .map_err(|_| corrupt())?;
@@ -1118,7 +1123,6 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
                 len,
                 content: PileRecordContent::Collection {
                     record: CollectionRecord::Derive(CollectionDerive::new(
-                        Inline::new(header.source),
                         Inline::new(header.target),
                         Inline::new(header.input),
                         Inline::new(header.output),
@@ -1421,7 +1425,6 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
                 len: V3_HEADER_LEN,
                 content: PileRecordContent::Collection {
                     record: CollectionRecord::Derive(CollectionDerive::new(
-                        Inline::new(header.source),
                         Inline::new(header.target),
                         Inline::new(header.input),
                         Inline::new(header.output),
@@ -3494,7 +3497,6 @@ mod tests {
                 collection_test_hash(8),
             )),
             CollectionRecord::Derive(CollectionDerive::new(
-                source,
                 target,
                 collection_test_hash(8),
                 collection_test_hash(9),
@@ -3629,7 +3631,9 @@ mod tests {
         let expected = [
             (MAGIC_MARKER_COLLECTION_COMMIT_V4, 228usize),
             (MAGIC_MARKER_COLLECTION_MERGE_V4, 164usize),
-            (MAGIC_MARKER_COLLECTION_DERIVE_V4, 164usize),
+            // V5 dropped the source field: 36 bytes of framing plus three
+            // 32-byte fields instead of four.
+            (MAGIC_MARKER_COLLECTION_DERIVE_V5, 132usize),
         ];
 
         for (record, (magic, reserved_start)) in records.into_iter().zip(expected) {
@@ -3701,7 +3705,7 @@ mod tests {
             (MAGIC_MARKER_WEAK_UNPIN_V3, 1),
             (MAGIC_MARKER_COLLECTION_COMMIT_V4, 1),
             (MAGIC_MARKER_COLLECTION_MERGE_V4, 1),
-            (MAGIC_MARKER_COLLECTION_DERIVE_V4, 1),
+            (MAGIC_MARKER_COLLECTION_DERIVE_V5, 1),
             (MAGIC_MARKER_COLLECTION_GOSSIP_V1, 1),
         ];
         let mut records = PileRecords::open(&path).unwrap();
@@ -3808,7 +3812,8 @@ mod tests {
                     header.copy_from_slice(
                         CollectionDeriveHeaderV4 {
                             magic_marker: MAGIC_MARKER_COLLECTION_DERIVE_V4,
-                            source: derive.source().raw,
+                            // legacy fixture: V4 named a source, V5 does not
+                            source: [0; 32],
                             target: derive.target().raw,
                             input: input.raw,
                             output: output.raw,
@@ -4469,20 +4474,16 @@ mod tests {
         let records = collection_test_records();
         let first = records[2];
         let conflicting = CollectionRecord::Derive(CollectionDerive::new(
-            source,
             target,
             input,
             collection_test_hash(10),
         ));
         let unrelated = CollectionRecord::Derive(CollectionDerive::new(
-            source,
             collection_test_collection(3),
             input,
             collection_test_hash(11),
         ));
-        let exact = [CollectionRecordSelector::Operation(WantRequest::derive(
-            source, target, input,
-        ))]
+        let exact = [CollectionRecordSelector::Operation(WantRequest::derive(target, input))]
         .into_iter()
         .collect();
 
@@ -4881,7 +4882,6 @@ mod tests {
                 collection_test_hash(16),
             )),
             CollectionRecord::Derive(CollectionDerive::new(
-                descriptor_handle,
                 collection_test_collection(17),
                 collection_test_hash(16),
                 collection_test_hash(18),
@@ -6352,7 +6352,7 @@ mod tests {
         let source = collection_test_collection(31);
         let target = collection_test_collection(32);
         let merge = WantRequest::merge(source, collection_test_hash(34), collection_test_hash(33));
-        let derive = WantRequest::derive(source, target, collection_test_hash(35));
+        let derive = WantRequest::derive(target, collection_test_hash(35));
 
         let mut pile = Pile::open(&path).unwrap();
         pile.want(merge).unwrap();
@@ -6405,7 +6405,7 @@ mod tests {
         let target = collection_test_collection(42);
         let input = collection_test_hash(43);
         let merge = WantRequest::merge(source, input, collection_test_hash(44));
-        let derive = WantRequest::derive(source, target, input);
+        let derive = WantRequest::derive(target, input);
 
         let mut pile = Pile::open(&path).unwrap();
         pile.want(merge).unwrap();

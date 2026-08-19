@@ -415,7 +415,6 @@ mod tests {
             .unwrap();
         store
             .insert(CollectionRecord::Derive(CollectionDerive::new(
-                paths.source_descriptor().handle(),
                 paths.descriptor().handle(),
                 third.data(),
                 Handle::<PathSummaryBlob>::to_hash(later_summary.get_handle()),
@@ -443,8 +442,7 @@ mod tests {
             .into_iter()
             .filter(|record| {
                 matches!(record, CollectionRecord::Derive(claim)
-                if claim.source() == paths.source_descriptor().handle()
-                    && claim.target() == paths.descriptor().handle())
+                if claim.target() == paths.descriptor().handle())
             })
             .count();
         assert_eq!(derives, 1);
@@ -462,7 +460,6 @@ mod tests {
         store.put::<PathSummaryBlob, _>(output.clone()).unwrap();
         store
             .insert(CollectionRecord::Derive(CollectionDerive::new(
-                paths.source_descriptor().handle(),
                 paths.descriptor().handle(),
                 commit.data(),
                 Handle::<PathSummaryBlob>::to_hash(output.get_handle()),
@@ -506,8 +503,7 @@ mod tests {
             .into_iter()
             .filter_map(|record| match record {
                 CollectionRecord::Derive(claim)
-                    if claim.source() == paths.source_descriptor().handle()
-                        && claim.target() == paths.descriptor().handle() =>
+                    if claim.target() == paths.descriptor().handle() =>
                 {
                     Some(claim.mapping().0)
                 }
@@ -546,7 +542,6 @@ mod tests {
             .unwrap();
         store
             .insert(CollectionRecord::Derive(CollectionDerive::new(
-                paths.source_descriptor().handle(),
                 paths.descriptor().handle(),
                 first.data(),
                 Handle::<PathSummaryBlob>::to_hash(left_summary.get_handle()),
@@ -558,8 +553,7 @@ mod tests {
             .into_iter()
             .filter_map(|record| match record {
                 CollectionRecord::Derive(claim)
-                    if claim.source() == paths.source_descriptor().handle()
-                        && claim.target() == paths.descriptor().handle() =>
+                    if claim.target() == paths.descriptor().handle() =>
                 {
                     Some(claim.mapping().0)
                 }
@@ -591,7 +585,6 @@ mod tests {
             store.put::<PathSummaryBlob, _>(output.clone()).unwrap();
             store
                 .insert(CollectionRecord::Derive(CollectionDerive::new(
-                    paths.source_descriptor().handle(),
                     paths.descriptor().handle(),
                     Handle::<SimpleArchive>::to_hash(input.get_handle()),
                     Handle::<PathSummaryBlob>::to_hash(output.get_handle()),

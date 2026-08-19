@@ -450,12 +450,8 @@ where
                         }
                     }
                     let output_data = fresh_data_identity(&output);
-                    let claim = CollectionDerive::new(
-                        self.source.handle(),
-                        self.target.handle(),
-                        input_data,
-                        output_data,
-                    );
+                    let claim =
+                        CollectionDerive::new(self.target.handle(), input_data, output_data);
                     cached.insert(
                         input_data,
                         PreparedDerive {
@@ -831,7 +827,7 @@ where
                 .derives()
                 .iter()
                 .filter(|claim| {
-                    claim.source() == self.source.handle() && claim.target() == self.target.handle()
+                    claim.target() == self.target.handle()
                 })
                 .copied()
                 .map(Candidate::Derive),
