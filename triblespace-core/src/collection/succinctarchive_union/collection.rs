@@ -110,7 +110,7 @@ impl SuccinctArchiveCollection {
 
     /// Canonical target raw-SuccinctArchive-union descriptor.
     pub fn descriptor(&self) -> CollectionDescriptor {
-        super::descriptor(self.scope)
+        super::descriptor(self.source_descriptor().handle())
     }
 
     /// ABI-, format-, and builder-version-qualified lifted Rank9 collection.

@@ -112,6 +112,8 @@ impl Error for PathSummaryUnionError {
 /// Failure to validate the canonical path-summary collection law.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PathSummaryUnionValidationError {
+    /// The summary does not derive from the source it was checked against.
+    WrongSource,
     /// The descriptor summarises a different automaton than the one supplied.
     WrongAutomaton,
     /// The descriptor does not carry a field this check needs.
@@ -133,13 +135,6 @@ pub enum PathSummaryUnionValidationError {
         expected: Id,
         /// Recipe found in the descriptor.
         actual: Id,
-    },
-    /// A derivation crosses dataset scopes.
-    ScopeMismatch {
-        /// Source dataset scope.
-        source: Id,
-        /// Target dataset scope.
-        target: Id,
     },
     /// A record names another collection descriptor.
     WrongCollection {
@@ -172,6 +167,9 @@ pub enum PathSummaryUnionValidationError {
 impl fmt::Display for PathSummaryUnionValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::WrongSource => {
+                write!(formatter, "summary derives from a different collection")
+            }
             Self::WrongAutomaton => {
                 write!(formatter, "collection summarises a different automaton")
             }
@@ -193,10 +191,6 @@ impl fmt::Display for PathSummaryUnionValidationError {
             } => write!(
                 formatter,
                 "{role} collection recipe {actual:X} does not match {expected:X}"
-            ),
-            Self::ScopeMismatch { source, target } => write!(
-                formatter,
-                "derive source scope {source:X} does not match target scope {target:X}"
             ),
             Self::WrongCollection {
                 role,
@@ -240,14 +234,14 @@ impl Error for PathSummaryUnionValidationError {
 /// The automaton's canonical fingerprint participates in the recipe identity,
 /// so two path expressions over the same source scope form distinct target
 /// collections.
-pub fn descriptor(scope: Id, automaton: &Automaton) -> CollectionDescriptor {
-    let scope_value: triblespace_core::inline::Inline<
-        triblespace_core::inline::encodings::genid::GenId,
-    > = triblespace_core::inline::IntoInline::to_inline(scope);
+pub fn descriptor(
+    source: triblespace_core::collection::records::CollectionHandle,
+    automaton: &Automaton,
+) -> CollectionDescriptor {
     let fingerprint = automaton_fingerprint(automaton);
     let fragment = entity! { _ @
         triblespace_core::metadata::tag: triblespace_core::collection::records::KIND_COLLECTION_DESCRIPTOR,
-        triblespace_core::collection::records::collection_scope: scope_value,
+        triblespace_core::collection::records::collection_source: source,
         triblespace_core::collection::records::collection_representation*:
             <PathSummaryBlob as MetaDescribe>::describe(),
         triblespace_core::collection::records::collection_recipe*:
@@ -311,13 +305,9 @@ pub fn validate_derive(
 ) -> Result<(), PathSummaryUnionValidationError> {
     validate_source_descriptor(source_descriptor)?;
     validate_target_descriptor(target_descriptor, automaton)?;
-    let source_scope = source_descriptor.scope()?;
-    let target_scope = target_descriptor.scope()?;
-    if source_scope != target_scope {
-        return Err(PathSummaryUnionValidationError::ScopeMismatch {
-            source: source_scope,
-            target: target_scope,
-        });
+    match target_descriptor.source() {
+        Some(source) if source == source_descriptor.handle() => {}
+        _ => return Err(PathSummaryUnionValidationError::WrongSource),
     }
     validate_collection(
         DescriptorRole::Source,
@@ -517,17 +507,28 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_identity_includes_scope_representation_and_automaton() {
-        let scope = id(1);
+    fn descriptor_identity_includes_source_representation_and_automaton() {
         let first_automaton = plus(label(7));
         let second_automaton = plus(label(8));
-        let source = simplearchive_union::descriptor(scope);
-        let first = descriptor(scope, &first_automaton);
-        let repeated = descriptor(scope, &first_automaton);
-        let second = descriptor(scope, &second_automaton);
+        let source = simplearchive_union::descriptor(id(1));
+        let first = descriptor(source.handle(), &first_automaton);
+        let repeated = descriptor(source.handle(), &first_automaton);
+        let second = descriptor(source.handle(), &second_automaton);
 
         assert_eq!(first, repeated);
-        assert_eq!(first.scope(), source.scope());
+        // A summary names the collection it summarises, and carries no anchor
+        // of its own.
+        assert_eq!(first.source(), Some(source.handle()));
+        assert!(first.scope().is_err(), "a derivation needs no anchor");
+        // The same automaton over a different source is a different summary.
+        assert_ne!(
+            first.handle(),
+            descriptor(
+                simplearchive_union::descriptor(id(2)).handle(),
+                &first_automaton
+            )
+            .handle()
+        );
         assert_eq!(
             first.representation().unwrap(),
             <PathSummaryBlob as MetaDescribe>::id()
@@ -550,7 +551,7 @@ mod tests {
     fn canonical_empty_is_total_derived_bottom_and_join_identity() {
         let automaton = plus(label(7));
         let source_descriptor = simplearchive_union::descriptor(id(1));
-        let target_descriptor = descriptor(id(1), &automaton);
+        let target_descriptor = descriptor(simplearchive_union::descriptor(id(1)).handle(), &automaton);
         let source_empty = archive(&TribleSet::new());
         let canonical_empty = empty(&automaton);
 
@@ -611,7 +612,7 @@ mod tests {
     fn derive_and_merge_commute_and_close_cross_fragment_paths() {
         let automaton = plus(metadata::tag.id().into());
         let source_descriptor = simplearchive_union::descriptor(id(1));
-        let target_descriptor = descriptor(id(1), &automaton);
+        let target_descriptor = descriptor(simplearchive_union::descriptor(id(1)).handle(), &automaton);
         let left = archive(&edge_facts(1, 2));
         let right = archive(&edge_facts(2, 3));
 
@@ -675,7 +676,7 @@ mod tests {
     fn nullable_unmatched_domain_obeys_the_same_homomorphism() {
         let automaton = Automaton::new(1, [0], [0], []).unwrap();
         let source_descriptor = simplearchive_union::descriptor(id(1));
-        let target_descriptor = descriptor(id(1), &automaton);
+        let target_descriptor = descriptor(simplearchive_union::descriptor(id(1)).handle(), &automaton);
         let left = archive(&edge_facts(1, 2));
         let right = archive(&edge_facts(2, 3));
         let source_union = simplearchive_union::join(&left, &right).unwrap();
@@ -732,7 +733,7 @@ mod tests {
     fn validators_reject_wrong_descriptors_endpoints_and_equations() {
         let automaton = plus(metadata::tag.id().into());
         let source_descriptor = simplearchive_union::descriptor(id(1));
-        let target_descriptor = descriptor(id(1), &automaton);
+        let target_descriptor = descriptor(simplearchive_union::descriptor(id(1)).handle(), &automaton);
         let input = archive(&edge_facts(1, 2));
         let other_input = archive(&edge_facts(3, 4));
         let output = derive_element(&input, &automaton).unwrap();
@@ -778,7 +779,7 @@ mod tests {
         ));
 
         let foreign_automaton = plus(label(9));
-        let foreign_target = descriptor(id(1), &foreign_automaton);
+        let foreign_target = descriptor(simplearchive_union::descriptor(id(1)).handle(), &foreign_automaton);
         let foreign_claim = CollectionDerive::new(
             source_descriptor.handle(),
             foreign_target.handle(),

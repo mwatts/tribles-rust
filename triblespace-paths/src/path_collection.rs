@@ -89,7 +89,7 @@ impl PathSummaryCollection {
 
     /// Canonical target path-summary collection descriptor.
     pub fn descriptor(&self) -> CollectionDescriptor {
-        path_summary_union::descriptor(self.scope, &self.automaton)
+        path_summary_union::descriptor(self.source_descriptor().handle(), &self.automaton)
     }
 
     /// Attach the exact endpoint relation already resident for `ticket`.

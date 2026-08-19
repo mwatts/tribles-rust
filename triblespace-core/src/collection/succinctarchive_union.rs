@@ -195,6 +195,13 @@ impl fmt::Display for ElementRole {
 /// Failure to validate the canonical raw SuccinctArchive collection law.
 #[derive(Debug)]
 pub enum SuccinctArchiveUnionValidationError {
+    /// The target does not derive from the source it was checked against.
+    WrongSource {
+        /// The source descriptor's handle.
+        expected: CollectionHandle,
+        /// What the target actually names, if anything.
+        actual: Option<CollectionHandle>,
+    },
     /// The descriptor does not carry a field this check needs.
     Malformed(RecordDecodeError),
     /// A descriptor names another blob representation.
@@ -214,13 +221,6 @@ pub enum SuccinctArchiveUnionValidationError {
         expected: Id,
         /// Recipe found in the descriptor.
         actual: Id,
-    },
-    /// A derivation crosses dataset scopes.
-    ScopeMismatch {
-        /// Source dataset scope.
-        source: Id,
-        /// Target dataset scope.
-        target: Id,
     },
     /// A record names another collection descriptor.
     WrongCollection {
@@ -253,6 +253,13 @@ pub enum SuccinctArchiveUnionValidationError {
 impl fmt::Display for SuccinctArchiveUnionValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::WrongSource { expected, actual } => match actual {
+                Some(actual) => write!(
+                    formatter,
+                    "collection derives from {actual:?}, not {expected:?}"
+                ),
+                None => write!(formatter, "collection is a root, expected a derivation of {expected:?}"),
+            },
             Self::Malformed(error) => {
                 write!(formatter, "malformed collection descriptor: {error}")
             }
@@ -271,10 +278,6 @@ impl fmt::Display for SuccinctArchiveUnionValidationError {
             } => write!(
                 formatter,
                 "{role} collection recipe {actual:X} does not match TribleSet union {expected:X}"
-            ),
-            Self::ScopeMismatch { source, target } => write!(
-                formatter,
-                "derive source scope {source:X} does not match target scope {target:X}"
             ),
             Self::WrongCollection {
                 role,
@@ -328,9 +331,9 @@ impl Error for SuccinctArchiveUnionValidationError {
 ///
 /// This intentionally reuses the SimpleArchive collection's set-union recipe.
 /// Representation, not recipe proliferation, distinguishes the two lattices.
-pub fn descriptor(scope: Id) -> CollectionDescriptor {
-    CollectionDescriptor::new(
-        scope,
+pub fn descriptor(source: CollectionHandle) -> CollectionDescriptor {
+    CollectionDescriptor::derived(
+        source,
         <SuccinctArchiveBlob as MetaDescribe>::describe(),
         <TribleSetUnionV1 as MetaDescribe>::describe(),
     )
@@ -372,13 +375,16 @@ pub fn validate_derive(
 ) -> Result<(), SuccinctArchiveUnionValidationError> {
     validate_source_descriptor(source_descriptor)?;
     validate_descriptor(target_descriptor)?;
-    let source_scope = source_descriptor.scope()?;
-    let target_scope = target_descriptor.scope()?;
-    if source_scope != target_scope {
-        return Err(SuccinctArchiveUnionValidationError::ScopeMismatch {
-            source: source_scope,
-            target: target_scope,
-        });
+    // The target names its source by handle, so this checks the lineage
+    // itself rather than a label both sides could independently claim.
+    match target_descriptor.source() {
+        Some(source) if source == source_descriptor.handle() => {}
+        _ => {
+            return Err(SuccinctArchiveUnionValidationError::WrongSource {
+                expected: source_descriptor.handle(),
+                actual: target_descriptor.source(),
+            })
+        }
     }
     validate_collection(
         DescriptorRole::Source,
@@ -552,12 +558,26 @@ mod tests {
         }
     }
 
+    /// The indexed collection is the raw one's derivation: same law, different
+    /// representation, and it says so by naming its source rather than by
+    /// sharing a label with it.
     #[test]
-    fn descriptors_share_scope_and_union_law_but_not_representation() {
+    fn the_index_derives_from_the_raw_collection_under_the_same_law() {
         let source = simplearchive_union::descriptor(id(1));
-        let target = descriptor(id(1));
+        let target = descriptor(source.handle());
 
-        assert_eq!(source.scope(), target.scope());
+        // The target points at exactly this source, and carries no anchor of
+        // its own: what it derives from is what anchors it.
+        assert_eq!(target.source(), Some(source.handle()));
+        assert!(target.scope().is_err(), "a derivation needs no anchor");
+        assert!(source.source().is_none(), "the raw collection is a root");
+        // A derivation of the same shape over different data is a different
+        // collection, because its source is.
+        assert_ne!(
+            target.handle(),
+            descriptor(simplearchive_union::descriptor(id(2)).handle()).handle()
+        );
+
         assert_eq!(source.recipe(), target.recipe());
         assert_eq!(target.recipe().unwrap(), TRIBLE_SET_UNION_RECIPE_V1);
         assert_eq!(
@@ -574,7 +594,7 @@ mod tests {
     #[test]
     fn canonical_empty_is_the_derived_bottom_and_merge_identity() {
         let source_descriptor = simplearchive_union::descriptor(id(1));
-        let target_descriptor = descriptor(id(1));
+        let target_descriptor = descriptor(simplearchive_union::descriptor(id(1)).handle());
         let source_empty: Blob<SimpleArchive> = TribleSet::new().to_blob();
         let derived_empty = derive_element(&source_empty).unwrap();
         let canonical_empty = empty();
@@ -616,7 +636,7 @@ mod tests {
     #[test]
     fn derive_and_merge_commute_to_identical_canonical_bytes() {
         let source_descriptor = simplearchive_union::descriptor(id(1));
-        let target_descriptor = descriptor(id(1));
+        let target_descriptor = descriptor(simplearchive_union::descriptor(id(1)).handle());
         let shared = row(3, 10, 40);
         let left = archive([row(2, 10, 60), shared]);
         let right = archive([row(1, 10, 20), shared]);
@@ -667,7 +687,7 @@ mod tests {
     #[test]
     fn validators_reject_valid_but_wrong_canonical_outputs() {
         let source_descriptor = simplearchive_union::descriptor(id(1));
-        let target_descriptor = descriptor(id(1));
+        let target_descriptor = descriptor(simplearchive_union::descriptor(id(1)).handle());
         let input = archive([row(1, 9, 3)]);
         let wrong_source = archive([row(2, 9, 4)]);
         let wrong_output = derive_element(&wrong_source).unwrap();
@@ -710,7 +730,7 @@ mod tests {
     #[test]
     fn malformed_target_is_rejected_before_equation_admission() {
         let source_descriptor = simplearchive_union::descriptor(id(1));
-        let target_descriptor = descriptor(id(1));
+        let target_descriptor = descriptor(simplearchive_union::descriptor(id(1)).handle());
         let input = archive([row(1, 9, 3)]);
         let malformed = Blob::<SuccinctArchiveBlob>::new(Bytes::from(vec![0xAA; 17]));
         let claim = CollectionDerive::new(
