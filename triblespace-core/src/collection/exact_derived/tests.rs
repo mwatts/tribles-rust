@@ -63,7 +63,7 @@ impl ExactDerivedAlgebra<SimpleArchive, UnknownBlob> for TestAlgebra {
         descriptor: &CollectionDescriptor,
         source: &Blob<SimpleArchive>,
     ) -> Result<(), ExactAlgebraError> {
-        if *descriptor != kernel().source_descriptor() {
+        if descriptor != kernel().source_descriptor() {
             return Err(ExactAlgebraError::Fatal(
                 "wrong test source descriptor".to_owned(),
             ));
@@ -77,7 +77,7 @@ impl ExactDerivedAlgebra<SimpleArchive, UnknownBlob> for TestAlgebra {
         descriptor: &CollectionDescriptor,
         target: &Blob<UnknownBlob>,
     ) -> Result<(), ExactAlgebraError> {
-        if *descriptor != kernel().target_descriptor() {
+        if descriptor != kernel().target_descriptor() {
             return Err(ExactAlgebraError::Fatal(
                 "wrong test target descriptor".to_owned(),
             ));
@@ -109,7 +109,7 @@ impl ExactDerivedAlgebra<SimpleArchive, UnknownBlob> for TestAlgebra {
         low: &Blob<UnknownBlob>,
         high: &Blob<UnknownBlob>,
     ) -> Result<Blob<UnknownBlob>, ExactAlgebraError> {
-        let descriptor = kernel().target_descriptor();
+        let descriptor = kernel().target_descriptor().clone();
         self.validate_target(&descriptor, low)?;
         self.validate_target(&descriptor, high)?;
         let low =
@@ -1480,8 +1480,8 @@ fn algebra_rejects_a_lying_source_descriptor() {
     let lying_source =
         CollectionDescriptor::new(id(1), <UnknownBlob as MetaDescribe>::id(), id(99));
     let lifecycle = ExactDerivedCollection::<SimpleArchive, UnknownBlob>::new(
-        lying_source,
-        kernel().target_descriptor(),
+        lying_source.clone(),
+        kernel().target_descriptor().clone(),
     );
     let mut store = MemoryRepo::default();
     store.put::<SimpleArchive, _>(source.clone()).unwrap();
@@ -1507,5 +1507,5 @@ fn algebra_rejects_a_lying_source_descriptor() {
 #[should_panic(expected = "distinct source and target descriptors")]
 fn identity_descriptor_pair_is_rejected() {
     let descriptor = simplearchive_union::descriptor(id(1));
-    let _ = ExactDerivedCollection::<SimpleArchive, SimpleArchive>::new(descriptor, descriptor);
+    let _ = ExactDerivedCollection::<SimpleArchive, SimpleArchive>::new(descriptor.clone(), descriptor);
 }

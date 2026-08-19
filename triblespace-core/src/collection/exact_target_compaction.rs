@@ -194,7 +194,7 @@ where
             return Ok(cover);
         }
 
-        match publish_round(exact.target_descriptor(), store, cover, algebra)? {
+        match publish_round(exact.target_descriptor().clone(), store, cover, algebra)? {
             RoundOutcome::Published => {}
             RoundOutcome::CapacityStable(cover) => return Ok(cover),
         }

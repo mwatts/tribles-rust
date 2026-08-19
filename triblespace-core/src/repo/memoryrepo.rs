@@ -424,7 +424,7 @@ mod tests {
         let fragment = entity! { crate::metadata::name: child };
         let scope = *crate::id::ufoid();
         let key = SigningKey::from_bytes(&[23; 32]);
-        let descriptor = *Collection::new(&mut repo, scope, key.clone()).descriptor();
+        let descriptor = Collection::new(&mut repo, scope, key.clone()).descriptor().clone();
         let commit = Collection::new(&mut repo, scope, key)
             .commit(fragment)
             .unwrap();

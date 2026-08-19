@@ -70,6 +70,9 @@ use super::exact_derived::{
     ExactAlgebraError, ExactCover, ExactDerivedAlgebra, ExactDerivedCollection,
     ExactDerivedCollectionError,
 };
+use super::records::{
+    collection_recipe, collection_representation, collection_scope, KIND_COLLECTION_DESCRIPTOR,
+};
 use super::{simplearchive_union, CollectionCommit, CollectionDescriptor, CollectionStore};
 use crate::repo::{BlobStore, BlobStoreMeta};
 
@@ -84,7 +87,6 @@ crate::macros::attributes! {
 }
 
 /// Minted with `trible genid` on 2026-08-19.
-const OBSERVED_SET_ALGORITHM_ID_HEX: &str = "A808ECA30730EF0F1C7FD96F3FC7CB03";
 
 /// Canonical sorted set of observed state ids.
 ///
@@ -228,24 +230,27 @@ pub fn join(
 
 /// Construct the observed-set collection for one dataset scope and edge.
 pub fn descriptor(scope: Id, observes: Id) -> CollectionDescriptor {
-    CollectionDescriptor::new(
-        scope,
-        <ObservedSetBlob as MetaDescribe>::id(),
-        recipe_id(observes),
-    )
+    let observes: Inline<GenId> = crate::inline::IntoInline::to_inline(observes);
+    let representation: Inline<GenId> =
+        crate::inline::IntoInline::to_inline(<ObservedSetBlob as MetaDescribe>::id());
+    let scope_value: Inline<GenId> = crate::inline::IntoInline::to_inline(scope);
+    let fragment = entity! { _ @
+        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+        collection_scope: scope_value,
+        collection_representation: representation,
+        collection_recipe: OBSERVED_UNION_RECIPE_V1,
+        register_observes: observes,
+    };
+    CollectionDescriptor::from_fragment(&fragment)
+        .expect("observed-union descriptor is canonical by construction")
 }
 
-fn recipe_id(observes: Id) -> Id {
-    let algorithm =
-        Id::from_hex(OBSERVED_SET_ALGORITHM_ID_HEX).expect("valid minted observed-set algorithm id");
-    let observes: Inline<GenId> = crate::inline::IntoInline::to_inline(&observes);
-    entity! { _ @
-        metadata::tag: algorithm,
-        register_observes: observes,
-    }
-    .root()
-    .expect("observed-set recipe fragment is intrinsically rooted")
-}
+/// The observed-union law.
+///
+/// This names the law only. Which attribute is observed is a parameter on the
+/// descriptor entity, not folded into this id: a digest of an unstored
+/// argument would make the collection's meaning unrecoverable from the pile.
+pub const OBSERVED_UNION_RECIPE_V1: Id = id_hex!("A808ECA30730EF0F1C7FD96F3FC7CB03");
 
 /// A resolved observed set, ready to answer domination.
 ///

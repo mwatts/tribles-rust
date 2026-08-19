@@ -1345,7 +1345,7 @@ mod tests {
         assert!(after_second > after_first);
         assert_eq!(collection.storage().blobs.len(), after_second);
 
-        let descriptor = *collection.descriptor();
+        let descriptor = collection.descriptor().clone();
         let descriptor_handle = descriptor.handle();
         let reader = collection.storage_mut().reader().unwrap();
         let descriptor_blob: Blob<SimpleArchive> = reader.get(descriptor_handle).unwrap();
@@ -1564,7 +1564,7 @@ mod tests {
         ];
         commits.sort_unstable_by_key(CollectionCommit::id);
         let lower = commits[0];
-        let descriptor = *collection.descriptor();
+        let descriptor = collection.descriptor().clone();
         let reader = collection.storage_mut().reader().unwrap();
 
         let calls = Cell::new(1usize);
@@ -1620,7 +1620,7 @@ mod tests {
         let own_key = SigningKey::from_bytes(&[7; 32]);
         let foreign_key = SigningKey::from_bytes(&[8; 32]);
         let mut collection = Collection::new(MemoryRepo::default(), id(1), own_key);
-        let descriptor = *collection.descriptor();
+        let descriptor = collection.descriptor().clone();
         let expected = fragment(2, false);
         let own_commit = collection.commit(expected.clone()).unwrap();
         let data = archive(1);
@@ -1838,7 +1838,7 @@ mod tests {
         expected += right_fragment.facts().clone();
         collection.commit(left_fragment).unwrap();
         collection.commit(right_fragment).unwrap();
-        let descriptor = *collection.descriptor();
+        let descriptor = collection.descriptor().clone();
 
         simplearchive_union::publish_merge(collection.storage_mut(), &descriptor, &left, &right)
             .unwrap();
@@ -1865,7 +1865,7 @@ mod tests {
         let first_commit = collection.commit(first).unwrap();
         let second_commit = collection.commit(second).unwrap();
         let third_commit = collection.commit(third).unwrap();
-        let descriptor = *collection.descriptor();
+        let descriptor = collection.descriptor().clone();
 
         let (_, first_two) = simplearchive_union::publish_merge(
             collection.storage_mut(),
@@ -1918,7 +1918,7 @@ mod tests {
             expected += fragment.facts().clone();
             commits.push(collection.commit(fragment).unwrap());
         }
-        let descriptor = *collection.descriptor();
+        let descriptor = collection.descriptor().clone();
 
         // X is shared by two children. Reference-counted scratch must retain
         // it until both Y and Z have consumed it, even though none of X/Y/Z is
@@ -1975,7 +1975,7 @@ mod tests {
         expected += right_fragment.facts().clone();
         let left = collection.commit(left_fragment).unwrap();
         let right = collection.commit(right_fragment).unwrap();
-        let descriptor = *collection.descriptor();
+        let descriptor = collection.descriptor().clone();
         let (_, merged) = simplearchive_union::publish_merge(
             collection.storage_mut(),
             &descriptor,

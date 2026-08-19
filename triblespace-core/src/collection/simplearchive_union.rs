@@ -564,7 +564,7 @@ fn prepare_commit_with_embedded(
 
     Ok(PreparedCollectionCommit {
         embedded,
-        descriptor: *descriptor,
+        descriptor: descriptor.clone(),
         data,
         metadata,
         commit,

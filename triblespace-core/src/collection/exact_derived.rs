@@ -315,7 +315,7 @@ impl Error for ExactDerivedCollectionError {
 }
 
 /// Exact-ticket lifecycle for one fixed source-to-target homomorphism.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExactDerivedCollection<Source: BlobEncoding, Target: BlobEncoding> {
     source: CollectionDescriptor,
     target: CollectionDescriptor,
@@ -350,13 +350,13 @@ where
     }
 
     /// Source descriptor.
-    pub fn source_descriptor(&self) -> CollectionDescriptor {
-        self.source
+    pub fn source_descriptor(&self) -> &CollectionDescriptor {
+        &self.source
     }
 
     /// Target descriptor.
-    pub fn target_descriptor(&self) -> CollectionDescriptor {
-        self.target
+    pub fn target_descriptor(&self) -> &CollectionDescriptor {
+        &self.target
     }
 
     /// Attach an already complete exact cover without writing.
@@ -532,7 +532,7 @@ where
         &self,
         store: &mut S,
     ) -> Result<(), ExactDerivedCollectionError> {
-        for descriptor in [self.source, self.target] {
+        for descriptor in [&self.source, &self.target] {
             let blob = descriptor.to_blob();
             let actual = store
                 .put::<SimpleArchive, _>(blob)
@@ -779,7 +779,7 @@ where
         let source_plan =
             source_plan_parts.map(|(collection, resident, mandatory, required_commits)| {
                 SourcePlan {
-                    descriptor: self.source,
+                    descriptor: self.source.clone(),
                     semantics: resolution.into_semantics(),
                     collection,
                     resident,

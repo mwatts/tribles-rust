@@ -30,6 +30,8 @@ use crate::inline::encodings::hash::{Blake3, Handle, Hash};
 use crate::inline::{Inline, InlineEncoding};
 use crate::metadata;
 use crate::prelude::{attributes, entity};
+use crate::id::RawId;
+use crate::inline::RawInline;
 use crate::trible::{Fragment, TribleSet, TRIBLE_LEN};
 
 /// Tag identifying a canonical collection descriptor.
@@ -225,25 +227,29 @@ impl Error for CommitVerificationError {}
 /// collection identity carried by claims is the descriptor blob's 32-byte
 /// [`CollectionId`]. Constructing a descriptor never manufactures an
 /// [`crate::id::ExclusiveId`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CollectionDescriptor {
     root: Id,
-    scope: Id,
-    representation: Id,
-    recipe: Id,
+    facts: TribleSet,
 }
 
 impl CollectionDescriptor {
     /// Construct a canonical `(scope, representation, recipe, tag)` descriptor.
     pub fn new(scope: Id, representation: Id, recipe: Id) -> Self {
         let fragment = collection_fragment(scope, representation, recipe);
-        let root = fragment.root().expect("collection descriptor is rooted");
-        Self {
-            root,
-            scope,
-            representation,
-            recipe,
-        }
+        Self::from_fragment(&fragment).expect("collection descriptor is canonical by construction")
+    }
+
+    /// Adopt a descriptor authored by [`entity!`](crate::macros::entity).
+    ///
+    /// This is how a parameterised recipe builds its collection: write the
+    /// descriptor as an ordinary intrinsic entity, with the recipe's own
+    /// arguments as further attributes on the same entity, and hand the
+    /// fragment here. Those arguments are covered by the descriptor blob's
+    /// hash and readable by anyone holding the pile, so two collections differ
+    /// exactly when their scope, representation, recipe, or arguments differ.
+    pub fn from_fragment(fragment: &Fragment) -> Result<Self, RecordDecodeError> {
+        Self::from_tribles(fragment.facts())
     }
 
     /// Decode an exact collection-descriptor archive without external lookups.
@@ -253,18 +259,25 @@ impl CollectionDescriptor {
     }
 
     /// Decode an exact collection-descriptor entity from an already parsed set.
+    ///
+    /// Attributes beyond the structural four are recipe arguments. They are
+    /// kept verbatim rather than remodelled, so a descriptor for a recipe this
+    /// binary has never heard of still decodes, still answers questions about
+    /// its scope and law, and still re-emits byte-for-byte on the way out.
     pub fn from_tribles(facts: &TribleSet) -> Result<Self, RecordDecodeError> {
         let root = record_root_and_kind(facts, KIND_COLLECTION_DESCRIPTOR)?;
-        let scope = one_id(facts, &collection_scope, "collection_scope")?;
-        let representation = one_id(
+        // Presence and uniqueness of the structural attributes.
+        one_id(facts, &collection_scope, "collection_scope")?;
+        one_id(
             facts,
             &collection_representation,
             "collection_representation",
         )?;
-        let recipe = one_id(facts, &collection_recipe, "collection_recipe")?;
-        let record = Self::new(scope, representation, recipe);
-        ensure_canonical(facts, root, record.root, record.to_tribles())?;
-        Ok(record)
+        one_id(facts, &collection_recipe, "collection_recipe")?;
+        Ok(Self {
+            root,
+            facts: facts.clone(),
+        })
     }
 
     /// Intrinsic entity root inside the descriptor archive.
@@ -282,25 +295,52 @@ impl CollectionDescriptor {
 
     /// Extrinsic dataset scope shared by related collections.
     pub fn scope(&self) -> Id {
-        self.scope
+        self.structural(&collection_scope)
     }
 
     /// Blob-representation descriptor id.
     pub fn representation(&self) -> Id {
-        self.representation
+        self.structural(&collection_representation)
     }
 
     /// Canonical construction/merge recipe id.
+    ///
+    /// This names the *law*. Its arguments, if any, are the remaining
+    /// attributes on the descriptor entity; see [`argument`](Self::argument).
     pub fn recipe(&self) -> Id {
-        self.recipe
+        self.structural(&collection_recipe)
+    }
+
+    /// Look up one recipe argument by attribute.
+    pub fn argument(&self, attribute: Id) -> Option<RawInline> {
+        self.arguments()
+            .find(|(a, _)| *a == attribute)
+            .map(|(_, v)| v)
+    }
+
+    /// Every recipe argument carried by this descriptor.
+    pub fn arguments(&self) -> impl Iterator<Item = (Id, RawInline)> + '_ {
+        self.facts.iter().filter_map(|fact| {
+            let attribute = *fact.a();
+            (!structural_attributes().contains(&attribute))
+                .then(|| (attribute, fact.v::<GenId>().raw))
+        })
+    }
+
+    fn structural(&self, attribute: &Attribute<GenId>) -> Id {
+        one_id(&self.facts, attribute, "collection descriptor attribute")
+            .expect("a decoded descriptor has its structural attributes")
     }
 
     /// Reconstruct the exact one-root trible record.
+    ///
+    /// This is the archive the descriptor was decoded from, unchanged. There
+    /// is no second model of it to drift.
     pub fn to_tribles(&self) -> TribleSet {
-        collection_fragment(self.scope, self.representation, self.recipe).into_facts()
+        self.facts.clone()
     }
 
-    /// Encode the descriptor as a canonical `SimpleArchive`.
+    /// Canonical `SimpleArchive` payload of this descriptor.
     pub fn to_blob(&self) -> Blob<SimpleArchive> {
         encode_archive(self.to_tribles())
     }
@@ -706,6 +746,18 @@ fn collection_fragment(scope: Id, representation: Id, recipe: Id) -> Fragment {
         collection_recipe: recipe,
     }
 }
+
+/// The four attributes every descriptor carries. Anything else on the entity
+/// is an argument to the recipe.
+fn structural_attributes() -> [Id; 4] {
+    [
+        metadata::tag.id(),
+        collection_scope.id(),
+        collection_representation.id(),
+        collection_recipe.id(),
+    ]
+}
+
 
 fn commit_bytes(
     collection: CollectionId,

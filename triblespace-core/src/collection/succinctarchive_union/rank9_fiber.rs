@@ -190,7 +190,7 @@ impl FiberProbe {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct Rank9Fiber {
     source: CollectionDescriptor,
     target: CollectionDescriptor,
@@ -249,8 +249,8 @@ impl Rank9Fiber {
             member.runtime = None;
         }
 
-        self.publish_descriptor(store, "raw", self.source)?;
-        self.publish_descriptor(store, "Rank9", self.target)?;
+        self.publish_descriptor(store, "raw", self.source.clone())?;
+        self.publish_descriptor(store, "Rank9", self.target.clone())?;
 
         let mut claims = Vec::new();
         for member in &mut members {
@@ -594,8 +594,8 @@ impl Rank9Fiber {
             .first()
             .expect("nonempty fixed cover reaches publication")
             .raw_data;
-        self.verify_descriptor(&reader, "raw", self.source, raw_context)?;
-        self.verify_descriptor(&reader, "Rank9", self.target, raw_context)?;
+        self.verify_descriptor(&reader, "raw", self.source.clone(), raw_context)?;
+        self.verify_descriptor(&reader, "Rank9", self.target.clone(), raw_context)?;
 
         let mut segments = Vec::with_capacity(members.len());
         for member in members {

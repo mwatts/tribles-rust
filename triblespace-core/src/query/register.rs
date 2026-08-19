@@ -477,8 +477,8 @@ where
     /// A maintained artifact that is specific to one end — as
     /// [`observed_union`](crate::collection::observed_union)'s dominated
     /// set is to [`End::Last`] — has to say so in its own descriptor.
-    pub fn recipe_id(identity: Id, order: Id) -> Id {
-        recipe_id(identity, order)
+    pub fn recipe() -> Id {
+        STATED_ORDER_RECIPE_V1
     }
 }
 
@@ -493,26 +493,16 @@ crate::macros::attributes! {
     "435F580DA18908BAEB4EB675557E0BFD" as pub register_orders: GenId;
 }
 
-/// Minted with `trible genid` on 2026-08-19.
-const STATED_ORDER_ALGORITHM_ID_HEX: &str = "6DD9E3F484DDDFF83BAC505ED33C8394";
-
-/// The recipe id of the stated order over `identity` and `order`.
+/// The stated-order law: an identity attribute plus a total order attribute.
 ///
-/// Free-standing as well as a method, so a collection descriptor can be
-/// built without borrowing a fact source.
-pub fn recipe_id(identity: Id, order: Id) -> Id {
-    let algorithm = Id::from_hex(STATED_ORDER_ALGORITHM_ID_HEX)
-        .expect("valid minted stated-order algorithm id");
-    let identity: Inline<GenId> = identity.to_inline();
-    let order: Inline<GenId> = order.to_inline();
-    crate::macros::entity! { _ @
-        crate::metadata::tag: algorithm,
-        register_identity: identity,
-        register_orders: order,
-    }
-    .root()
-    .expect("stated-order recipe fragment is intrinsically rooted")
-}
+/// This names the law only. *Which* attributes carry identity and order are
+/// parameters on the collection descriptor, not folded into this id. Hashing
+/// them in would leave the digest as the sole carrier of arguments that are
+/// stored nowhere, so a reader could never recover what the register means
+/// from the pile alone.
+///
+/// Minted with `trible genid` on 2026-08-19.
+pub const STATED_ORDER_RECIPE_V1: Id = crate::id_hex!("6DD9E3F484DDDFF83BAC505ED33C8394");
 
 impl<P, K> StatedOrder<'_, P, K>
 where
@@ -973,26 +963,73 @@ mod tests {
         assert_eq!(sole(&order, [*status]), Resolution::Sole(*status));
     }
 
-    /// Two registers over one dataset are two recipes, and the pair of
-    /// attributes is what tells them apart. Neither ever reaches a call
-    /// site: the reader asks for the maximal states of a frame, and the
-    /// recipe already says which measure of domination that is.
+    /// Two registers over one dataset share the *law* and are told apart by
+    /// its arguments. The arguments live on the collection descriptor as
+    /// ordinary tribles, so the descriptor's handle separates them while the
+    /// recipe id stays a readable name for what kind of register this is.
+    ///
+    /// This replaces an earlier design in which the pair of attributes was
+    /// hashed into the recipe id itself. That made the digest the only carrier
+    /// of the pair: nothing stored them, so no reader could recover which
+    /// attributes a register was over.
     #[test]
-    fn the_recipe_id_is_the_pair_of_attributes() {
-        let notes = recipe_id(note_of.id(), note_at.id());
-        let statuses = recipe_id(status_of.id(), note_at.id());
+    fn registers_share_a_law_and_differ_by_their_parameters() {
+        use crate::collection::records::{
+            collection_recipe, collection_representation, collection_scope, CollectionDescriptor,
+            KIND_COLLECTION_DESCRIPTOR,
+        };
+        // The law is one minted name, identical for every stated-order register.
+        assert_eq!(
+            StatedOrder::<TribleSet, NsTAIInterval>::recipe(),
+            STATED_ORDER_RECIPE_V1
+        );
+
+        let scope = *ufoid();
+        let representation = *ufoid();
+        fn describe(scope: Id, representation: Id, identity: Id, order: Id) -> CollectionDescriptor {
+            let scope_value: Inline<GenId> = scope.to_inline();
+            let representation: Inline<GenId> = representation.to_inline();
+            let identity: Inline<GenId> = identity.to_inline();
+            let order: Inline<GenId> = order.to_inline();
+            let fragment = crate::macros::entity! { _ @
+                crate::metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+                collection_scope: scope_value,
+                collection_representation: representation,
+                collection_recipe: STATED_ORDER_RECIPE_V1,
+                register_identity: identity,
+                register_orders: order,
+            };
+            CollectionDescriptor::from_fragment(&fragment).expect("canonical by construction")
+        }
+
+        let notes = describe(scope, representation, note_of.id(), note_at.id());
+        let statuses = describe(scope, representation, status_of.id(), note_at.id());
         assert_ne!(
-            notes, statuses,
-            "two registers over the same order attribute must not share a recipe"
+            notes.handle(),
+            statuses.handle(),
+            "two registers over the same order attribute must be two collections"
         );
         // Swapping the order attribute is as much a different register as
         // swapping the identity.
-        assert_ne!(notes, recipe_id(note_of.id(), other_clock.id()));
+        assert_ne!(
+            notes.handle(),
+            describe(scope, representation, note_of.id(), other_clock.id()).handle()
+        );
         // And it is a function of the pair, not of the call.
-        assert_eq!(notes, recipe_id(note_of.id(), note_at.id()));
+        assert_eq!(notes.handle(), describe(scope, representation, note_of.id(), note_at.id()).handle());
+        // The law itself is shared, not per-register.
+        assert_eq!(notes.recipe(), statuses.recipe());
+
+        // The point of the change: the arguments are recoverable from the
+        // descriptor. A reader holding only the pile can say what this
+        // register is over.
         assert_eq!(
-            notes,
-            StatedOrder::<TribleSet, NsTAIInterval>::recipe_id(note_of.id(), note_at.id())
+            notes.argument(register_identity.id()),
+            Some(<Id as crate::inline::IntoInline<GenId>>::to_inline(note_of.id()).raw),
+        );
+        assert_eq!(
+            notes.argument(register_orders.id()),
+            Some(<Id as crate::inline::IntoInline<GenId>>::to_inline(note_at.id()).raw),
         );
     }
 
