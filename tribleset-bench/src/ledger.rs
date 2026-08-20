@@ -14,7 +14,7 @@
 //! `june-on-tip/src/telemetry.rs` — the minted ids are the contract;
 //! GORBIE's telemetry-viewer renders the axis.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -25,8 +25,8 @@ use rand::rngs::OsRng;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::collection::{
     discover_collection_records, resolve_collection_semantics, simplearchive_union, Collection,
-    CollectionClaimValidation, CollectionData, CollectionDescriptor, CollectionHandle,
-    CollectionValidationRequest,
+    CollectionClaimValidation, CollectionData, CollectionHandle, CollectionName,
+    CollectionValidationRequest, SimpleArchiveCollection,
 };
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
@@ -86,14 +86,37 @@ pub static KIND_SESSION: LazyLock<Id> =
 /// Tag id of a telemetry span entity.
 pub static KIND_SPAN: LazyLock<Id> =
     LazyLock::new(|| Id::from_hex("0AF9FEB9A2BFEB1BE8A8229829181085").expect("kind_span id"));
-/// Deterministic dataset scope for the benchmark-results collection.
-///
-/// This keeps the suite's existing minted results identity while changing its
-/// storage meaning from a mutable branch name to an extrinsic collection
-/// scope. Every signed run commit under this scope coexists; there is no head.
-pub static RESULTS_COLLECTION_SCOPE: LazyLock<Id> = LazyLock::new(|| {
-    Id::from_hex("F6D99F76BC15E78C0BBD44F9D28A0C0A").expect("results collection scope id")
+/// Name the benchmark-results collection is known by within its team.
+pub static RESULTS_COLLECTION_NAME: LazyLock<CollectionName> = LazyLock::new(|| {
+    CollectionName::new("tribleset-bench-results").expect("results collection name")
 });
+
+/// Published root key of the team the benchmark-results collection belongs to.
+///
+/// A root collection is anchored by a name *and* a team, so the suite needs a
+/// team key that is the same on every machine and in every run — each run signs
+/// its commit with a throwaway key, and `verify` authorizes every strictly
+/// self-signed commit in the collection, so this key gates nothing and there is
+/// no secret to protect. It only has to pick out one collection.
+///
+/// It is derived from the id this suite already minted for its results
+/// (`F6D99F76BC15E78C0BBD44F9D28A0C0A`, the extrinsic *scope* back when that was
+/// how a root was anchored) rather than minting a second constant, so the
+/// results collection carries its own provenance forward under the new anchor.
+/// Result piles written under the scope anchor are not reachable through it;
+/// they predate the naming migration.
+pub static RESULTS_COLLECTION_TEAM: LazyLock<VerifyingKey> = LazyLock::new(|| {
+    let minted = Id::from_hex("F6D99F76BC15E78C0BBD44F9D28A0C0A").expect("results collection id");
+    let mut seed = [0u8; 32];
+    seed[..16].copy_from_slice(&minted.raw());
+    seed[16..].copy_from_slice(&minted.raw());
+    SigningKey::from_bytes(&seed).verifying_key()
+});
+
+/// The read-side facade naming the results collection.
+fn results_collection() -> SimpleArchiveCollection {
+    SimpleArchiveCollection::new(RESULTS_COLLECTION_NAME.clone(), *RESULTS_COLLECTION_TEAM)
+}
 
 /// Clip a string to a ShortString-safe payload: first line, NULs
 /// stripped, at most 32 bytes on a char boundary.
@@ -156,7 +179,8 @@ impl ResultsLedger {
             .map_err(|e| anyhow!("load results pile: {e:?}"))?;
         let collection = Collection::new(
             pile,
-            *RESULTS_COLLECTION_SCOPE,
+            &RESULTS_COLLECTION_NAME,
+            *RESULTS_COLLECTION_TEAM,
             SigningKey::generate(&mut OsRng),
         );
 
@@ -252,10 +276,16 @@ where
         .map_err(|e| format!("read collection element {data:?}: {e:?}"))
 }
 
+/// Read the descriptor a collection handle names, as ordinary facts.
+///
+/// A descriptor is a `TribleSet` and the handle is the hash of its archive, so
+/// rehashing the bytes is the whole check: bytes that hash to the handle we
+/// computed from our own recipe *are* our descriptor, and there is nothing
+/// further to compare.
 fn load_collection_descriptor<R>(
     reader: &R,
     collection: CollectionHandle,
-) -> std::result::Result<CollectionDescriptor, String>
+) -> std::result::Result<TribleSet, String>
 where
     R: BlobStoreGet,
 {
@@ -268,8 +298,8 @@ where
             "collection descriptor bytes do not match handle {collection:?}"
         ));
     }
-    CollectionDescriptor::decode(&canonical)
-        .map_err(|e| format!("decode collection descriptor {collection:?}: {e}"))
+    TribleSet::try_from_blob(canonical)
+        .map_err(|e| format!("decode collection descriptor {collection:?}: {e:?}"))
 }
 
 /// The acceptance instrument: reopen a results pile read-only, discover and
@@ -293,18 +323,19 @@ pub fn verify(path: &Path) -> Result<()> {
         );
     }
 
-    let descriptor = simplearchive_union::descriptor(*RESULTS_COLLECTION_SCOPE);
-    let collection = descriptor.handle();
+    let facade = results_collection();
+    let descriptor = facade.descriptor();
+    let collection = facade.collection();
     let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
-    let resident_descriptor = load_collection_descriptor(&reader, collection)
-        .map_err(|e| anyhow!("load results collection descriptor: {e}"))?;
-    if resident_descriptor != descriptor {
-        bail!(
-            "results collection descriptor for scope {:X} does not match the canonical recipe in {}",
-            &*RESULTS_COLLECTION_SCOPE,
+    // Presence is the match: the handle was computed from the canonical recipe
+    // here, and the loader rehashes what the pile returned against it.
+    load_collection_descriptor(&reader, collection).map_err(|e| {
+        anyhow!(
+            "results collection {} is not described in {}: {e}",
+            RESULTS_COLLECTION_NAME.as_str(),
             path.display()
-        );
-    }
+        )
+    })?;
 
     let authorized: BTreeSet<Id> = discovered
         .commits()
@@ -314,12 +345,16 @@ pub fn verify(path: &Path) -> Result<()> {
         .collect();
     if authorized.is_empty() {
         bail!(
-            "results collection for scope {:X} has no signed commits",
-            &*RESULTS_COLLECTION_SCOPE
+            "results collection {} has no signed commits",
+            RESULTS_COLLECTION_NAME.as_str()
         );
     }
 
-    let resolution = resolve_collection_semantics(&discovered, &authorized, |request| {
+    // The results collection is a set of independent signed commits; nothing
+    // derives from it and nothing is derived into it, so the lineage the
+    // resolver consults is empty.
+    let lineage = BTreeMap::new();
+    let resolution = resolve_collection_semantics(&discovered, &lineage, &authorized, |request| {
         let verdict = match request {
             CollectionValidationRequest::Commit { claim } if claim.collection() == collection => {
                 let blob = load_collection_archive(&reader, claim.data())?;
@@ -561,12 +596,12 @@ mod tests {
 
         let mut pile = Pile::open(&path).unwrap();
         let discovered = discover_collection_records(&mut pile).unwrap();
-        let descriptor = simplearchive_union::descriptor(*RESULTS_COLLECTION_SCOPE);
-        let collection = descriptor.handle();
+        let facade = results_collection();
+        let collection = facade.collection();
         let reader = pile.reader().unwrap();
         assert_eq!(
             load_collection_descriptor(&reader, collection).unwrap(),
-            descriptor
+            facade.descriptor().into_facts()
         );
         let commits: Vec<_> = discovered
             .commits()

@@ -81,7 +81,7 @@ triblespace_core = { package = "triblespace-core", path = "subjects/current/trib
 # macros (`triblespace::prelude`/`triblespace::macros`) — they expand to
 # `::triblespace::core` paths, which resolve to this dep; the core-macro flavor
 # would leak to the subject's core.
-triblespace = { git = "https://github.com/triblespace/triblespace-rs", rev = "429d1204a87ee3bad3e9ed5f606575f17a1c5453" }
+triblespace = { git = "https://github.com/triblespace/triblespace-rs", rev = "c4c5944334f513daac66bb665640d1a9bcb3d845" }
 anyhow = "1"
 # Serve the vendored queries: blob views, SPARQL regex functions, and
 # the NsTAIInterval date folds. anybytes must unify with the subject
