@@ -16,25 +16,58 @@ narrow usage pattern keeps these failure modes manageable. Appends happen
 sequentially and validation walks new bytes before readers observe them, so the
 memory map never exposes half-written records.
 
-## Record model: generic envelope and uniform 256-byte framing
+## Record model: one frame, uniform 256-byte records
 
-Every record the pile writes today begins with the same fixed **256-byte
-envelope header**, followed (for blobs) by the payload, padded so the whole
+Every record the pile writes begins with the same fixed **256-byte header**, followed (for blobs) by the payload, padded so the whole
 record is a **256-byte multiple**:
 
 | Offset | Width | Field |
 |---:|---:|---|
-| `0..16` | 16 | Generic envelope marker `E5A95E5D8A0BBA8782E46B9C9E73B313` |
-| `16..32` | 16 | Semantic record-kind ID |
-| `32..36` | 4 | Total record span in 256-byte blocks, unsigned little-endian |
-| `36..256` | 220 | Kind-specific body and zeroed reserved bytes |
+| `0..28` | 28 | Framing magic `0371B249F0626B2ABDDB80E23EA969059D9656A5EA5A497320351F3B` |
+| `28..32` | 4 | Total record span in 256-byte blocks, unsigned little-endian |
+| `32..64` | 32 | Record kind: the handle of a description of this record's layout |
+| `64..256` | 192 | Kind-specific body and zeroed reserved bytes |
 
-The envelope marker was minted with `trible genid` on 2026-08-11. Blob and
-branch record kinds reuse their current V3 markers, while collection records
-reuse their V4 markers. A collection descriptor itself remains an ordinary
-blob, not a fourth collection-record kind. Typed want assertions and
-retractions have their own markers; historical weak-pin records remain
-readable as the blob-only predecessor of that model.
+The magic was minted on 2026-08-20 as two `trible genid` calls,
+`0371B249F0626B2ABDDB80E23EA96905` and `9D9656A5EA5A497320351F3BE712CF82`,
+concatenated and truncated to 28 bytes. Those widths are chosen so the body
+starts at byte 64, and two things follow from that.
+
+**Every field lands on a 32-byte boundary.** A 32-byte digest, handle, or
+signature component in the body begins at a multiple of 32 — and because
+records themselves begin on 256-byte boundaries, the alignment holds at
+absolute file offsets, not merely within the record. The predecessor framing
+put a 36-byte prefix in front of the body, which left every 32-byte field four
+bytes short of a boundary and made each one straddle two.
+
+**The record kind resolves.** 32 bytes is a blob handle, and the handle names a
+`SimpleArchive` describing the record kind: its name, the exact byte layout of
+its body, and the `KIND_PILE_RECORD` tag. A reader meeting an unfamiliar record
+can therefore *resolve* what it is rather than merely failing to recognise it —
+the same move the collection layer made when descriptors replaced bare
+definition ids. Each description is rooted at the 16-byte id the kind was
+already minted under, so widening the field renamed nothing. The handles are
+pinned in `triblespace-core/src/repo/pile/record_kind.rs` and a test recomputes
+every one of them from its description, so editing a description is a format
+change that fails loudly with the new value rather than silently reframing the
+pile.
+
+`Pile::publish_record_kind_descriptions` (exposed as
+`trible pile migrate run record-kind-descriptions`) stores those description
+archives into a pile, which makes the kinds resolvable *there* — a pile so
+migrated can answer "what is this record?" about every record in it from its
+own bytes. Content addressing makes the call idempotent, and the migration's
+census distinguishes "already resident" from "left to store" so a re-run
+reports honestly instead of repeating its worklist.
+
+The arithmetic works out exactly. A signed commit is the tightest record —
+six 32-byte fields — and `64 + 6 × 32 = 256`: one block, nothing wasted and
+nothing reserved. Every other kind has slack.
+
+A collection descriptor itself remains an ordinary blob, not a fourth
+collection-record kind. Typed want assertions and retractions have their own
+kinds; historical weak-pin records remain readable as the blob-only predecessor
+of that model.
 
 The span includes the header. Zero is invalid; decoders perform checked
 `span * 256` arithmetic and require that the complete record fit in the
@@ -62,35 +95,82 @@ Reserved kind-body bytes are zeroed and are **not** part of the content hash;
 per-record metadata belongs in tribles, not in the header, so identical bytes
 never fork into distinct blobs.
 
-Unknown kinds inside this envelope decode as opaque records. Normal pile replay
+Unknown kinds inside a valid frame decode as opaque records. Normal pile replay
 semantically skips them and continues with subsequent known records;
 `PileRecords` still exposes their exact offset, length, kind, and raw bytes.
-This is a forgetful projection: any future kind introduced under this envelope
+This is a forgetful projection: any future kind introduced under this frame
 must remain independent of the meaning of known records. In particular, it may
 not change the validity or effect of a known record, constrain an old writer's
 otherwise-valid append, or make an existing record depend on a companion
 record of the new kind. Such an extension—or any other extension whose absence
-cannot conservatively mean “no effect”—requires a new generic envelope marker
-instead.
+cannot conservatively mean “no effect”—requires a new frame magic instead.
 
 Concatenation is associative ordered composition, not universally commutative:
 branches and wants are right-biased last-writer-wins logs. Opaque filtering is
 sound because it leaves the relative order of every known record unchanged;
 only collection records additionally collapse to order-independent set union.
 
-The reader still accepts original **V1** records (64-byte-aligned blob, branch,
-and tombstone layouts), unenveloped **V3** records, and unenveloped **V4**
-collection records byte-for-byte. An unknown *unenveloped* marker still reports
-`ReadError::UnsupportedRecord { offset, marker }`, because its boundary is
-unknowable. Older binaries predating the generic envelope reject its marker;
-upgrade them rather than trying to repair the pile.
+### Compatibility surface: v0.46.4, and a reframe for everything else
 
-The envelope deliberately has no checksum or complemented length. It detects
-torn/truncated appends through its bounds and kind-specific checks, and it
-solves version-skew framing; it is not intended to diagnose arbitrary header
-bit rot. For example, a corrupted kind can look like an opaque kind, while a
-corrupted but still in-bounds span can cover later bytes. Blob payload integrity
-remains protected by its content hash.
+The last released version is **v0.46.4** (tagged 2026-06-10). Its entire record
+vocabulary is three markers — the 64-byte-aligned V1 blob, branch, and
+tombstone records — and those are the only records anyone outside this
+workspace can be holding. They are read forever.
+
+Everything introduced between that release and the current framing never
+shipped: the V3 record family, the three generations of collection records, the
+typed wants, the retired local cells, and the 36-byte legacy envelope. None of
+it is a compatibility commitment. It is read **once**, by
+`trible pile migrate <pile> reframe --into <dest>`, which re-encodes the whole
+pile into the current framing; a reframed pile never needs those decoders
+again, and they will be deleted once the workspace piles have been reframed.
+
+The re-encode is semantic and in source order, which is what makes it faithful:
+
+- Blob payloads are content-addressed, so copying changes no identity, and
+  their original insertion timestamps are carried across — the wall clock at
+  the moment of a rewrite is not a fact about when a blob arrived.
+- Pins and wants are last-writer-wins logs, replayed in order, so the result's
+  projection equals the source's.
+- Collection records and grants are grow-only sets, so order is irrelevant and
+  re-insertion is idempotent.
+- Records that never carried live state are dropped and counted: inert legacy
+  V3 collection headers, retired local cells, and kinds no longer interpreted.
+  Derived collections fall in the same category by design — a derivation is a
+  computation with a checkable artifact, so a stale one is recomputed rather
+  than migrated. Only committed state, the signed assertions nobody can
+  recompute, has to survive, and it does.
+
+A commit's signature covers a domain-separated transcript over its fields, not
+the bytes of its frame, so re-encoding cannot invalidate one. That is a claim
+spanning two layers, so the reframe verifies every commit in the result instead
+of reasoning about it, and fails rather than reporting success if any does not.
+
+### An unknown frame is corruption, not a record from the future
+
+Unknown *kind* and unknown *frame* are different questions and get different
+answers. Conflating them would cost one of the two.
+
+An unknown kind inside a valid frame is **forward compatibility**: the frame
+states the span, so the record has an exact boundary, and replay crosses it as
+an opaque record. Because the kind is a handle, a reader can go and resolve
+what it was.
+
+An unknown frame is **corruption**. Nothing about the bytes is trustworthy —
+not even where the next record starts — so the decoder fails at exactly that
+offset rather than guessing. This is not a limitation to design around; it is
+the detection the wide magic buys. 28 bytes is a sentinel, not just an
+identifier: a mismatch is 224 bits of evidence that these bytes are not a
+record, so a torn write, a truncated file, or a mis-seek is caught where it
+happens instead of being read as plausible garbage. The error path must stay
+sharp; it is never softened into a skip or a warning.
+
+The two failures are still distinguished. A torn or truncated tail — including
+one that is a proper prefix of the magic — reports
+`ReadError::CorruptPile { valid_length }`, which is what `amputate` repairs. A
+legacy marker this reader no longer decodes reports
+`ReadError::UnsupportedRecord { offset, marker }`, which `amputate`
+deliberately refuses to truncate: the remedy there is `reframe`, not deletion.
 
 ## Design Rationale
 
@@ -282,13 +362,14 @@ blob, so silently omitting it—or collecting its dependencies—would be unsafe
 
 | Offset | Width | Field |
 |---:|---:|---|
-| `0..16` | 16 | Generic envelope marker |
-| `16..32` | 16 | Blob kind `9C33EEB525065A62EAEC4BE43DCC355A` |
-| `32..36` | 4 | Total 256-byte-block span, little-endian |
-| `36..44` | 8 | Timestamp in Unix milliseconds, little-endian |
-| `44..52` | 8 | Exact unpadded payload byte length, little-endian |
-| `52..84` | 32 | BLAKE3 payload hash |
-| `84..256` | 172 | Reserved zeros |
+| `0..28` | 28 | Framing magic |
+| `28..32` | 4 | Total 256-byte-block span, little-endian |
+| `32..64` | 32 | Blob kind `01148F301FE56E346D16596A8480532E8B4420C4EFD00C8DFF437D0DF9810ED0`, rooted at `9C33EEB525065A62EAEC4BE43DCC355A` |
+| `64..72` | 8 | Timestamp in Unix milliseconds, little-endian |
+| `72..80` | 8 | Exact unpadded payload byte length, little-endian |
+| `80..96` | 16 | Reserved zeros, rounding the scalars up to a 32-byte boundary |
+| `96..128` | 32 | BLAKE3 payload hash |
+| `128..256` | 128 | Reserved zeros |
 | `256..` | variable | Payload and post-padding to the declared span |
 
 Each blob record carries:
@@ -355,11 +436,11 @@ in record-ID/signature domains and from the one-byte versioned tags used by
 generic dense record stores. There is no equivalent `SimpleArchive` form for
 these algebra records.
 
-| Kind | V4 kind ID | Kind-specific byte layout after the common prefix |
+| Kind | Record kind (rooted at) | Kind-specific byte layout after the common prefix |
 |---|---|---|
-| Commit | `CBF2CF97D52A3486E16C12D70D397C66` | `36..68` descriptor handle, `68..100` data digest, `100..132` metadata handle, `132..164` Ed25519 public key, `164..196` signature R, `196..228` signature S, `228..256` reserved zeros |
-| Merge | `9F5D028D4C423620D6957A5F726FA727` | `36..68` descriptor handle, `68..100` lower input digest, `100..132` higher input digest, `132..164` result digest, `164..256` reserved zeros |
-| Derive | `ECFB2EE90ED8042244F7BAC704454BB9` | `36..68` source descriptor handle, `68..100` target descriptor handle, `100..132` input digest, `132..164` output digest, `164..256` reserved zeros |
+| Commit | `A1322BB3F5214287C314D42AFCC1A97CB264FACD9A22B4938838BE78DB31AA59` (`CBF2CF97D52A3486E16C12D70D397C66`) | `64..96` descriptor handle, `96..128` data digest, `128..160` metadata handle, `160..192` Ed25519 public key, `192..224` signature R, `224..256` signature S — no reserved bytes |
+| Merge | `0CEE320DE0BDA40A6A6F52221C5E4E4D2CE3B165B69C858673FD13D98F655379` (`9F5D028D4C423620D6957A5F726FA727`) | `64..96` descriptor handle, `96..128` lower input digest, `128..160` higher input digest, `160..192` result digest, `192..256` reserved zeros |
+| Derive | `7ACE1ED10F3EBC632627058CC461DC1CC171CD2E56C52E5DCE60EA4C8DC23C36` (`ED6B46F7286D4556B076C17B79FD8315`) | `64..96` target descriptor handle, `96..128` input digest, `128..160` output digest, `160..256` reserved zeros |
 
 Every reserved byte must be zero; a nonzero reserved byte makes replay fail as
 corrupt rather than silently assigning meaning to a format extension. Merge
@@ -394,16 +475,18 @@ does not require the descriptor or commits to be present when inserted. Thus a
 grant arriving before or after its data has the same meaning under pile
 concatenation.
 
-The kind ID `9BB5B1F4D6FD8FB850B494C2CF51B5CA` was minted with `trible genid` on
-2026-08-12. Its one-block envelope body is:
+The semantic kind ID `9BB5B1F4D6FD8FB850B494C2CF51B5CA` was minted with
+`trible genid` on 2026-08-12; the record kind on disk is
+`5E18D982337466E65CB8278658CF53027FC109385456B49D35C4E66D6E9CE599`, the handle
+of the description rooted at it. Its one-block envelope body is:
 
 | Offset | Field |
 |---:|---|
-| `36..68` | collection descriptor handle |
-| `68..100` | author Ed25519 public key |
-| `100..132` | signature R component |
-| `132..164` | signature S component |
-| `164..256` | reserved zeros |
+| `64..96` | collection descriptor handle |
+| `96..128` | author Ed25519 public key |
+| `128..160` | signature R component |
+| `160..192` | signature S component |
+| `192..256` | reserved zeros |
 
 The signed transcript is domain-separated and binds the kind, version, author,
 and descriptor handle. Physical storage preserves even structurally decoded
@@ -417,10 +500,9 @@ still choose not to operate a relay.
 
 ### Legacy unenveloped V4 collection records
 
-Before the generic envelope, the same three V4 kind IDs occupied bytes
-`0..16`, followed immediately by the semantic fields. Those exact 256-byte
-records remain readable and reconstruct the same current collection records.
-They are never rewritten in place; newly inserted records use the envelope.
+Before the legacy envelope, the same three V4 kind IDs occupied bytes `0..16`,
+followed immediately by the semantic fields. These postdate v0.46.4, so they
+are read only for `reframe`.
 
 | Kind | Legacy unenveloped byte layout |
 |---|---|
@@ -446,10 +528,10 @@ they never enter `CollectionStore`, assert membership, or retain blobs.
 
 ## Pin Records (branch head / tombstone)
 
-| Kind | Kind ID | Kind-specific body after the common prefix |
+| Kind | Record kind (rooted at) | Kind-specific body after the common prefix |
 |---|---|---|
-| Head | `AC363D04AFE1AF17B39581B1E23021D7` | `36..52` branch ID, `52..84` hash, `84..256` reserved zeros |
-| Tombstone | `D0CBA0C8EAAB4C0C73121C3205671E4F` | `36..52` branch ID, `52..256` reserved zeros |
+| Head | `2BC0B9FE0EFDB0BC53654E17BB9D06E01259F36AF93EEE54AD5D557B12DF706D` (`AC363D04AFE1AF17B39581B1E23021D7`) | `64..80` branch ID, `80..96` reserved zeros, `96..128` hash, `128..256` reserved zeros |
+| Tombstone | `8D9F27E76D3620EEC29B781F841E9EF77F2607B40DC702FE3DAED007E9228CA5` (`D0CBA0C8EAAB4C0C73121C3205671E4F`) | `64..80` branch ID, `80..256` reserved zeros |
 
 Pin-head records map a pin (branch) identifier to the hash of a blob; a
 tombstone retracts the mapping. Appends are intentionally lightweight: the
@@ -459,7 +541,10 @@ store.
 
 ## Retired Local Cell Records
 
-| Kind | Kind ID | Kind-specific body after the common prefix |
+These kinds are never written under the current framing, so they exist only in
+the legacy envelope and the unenveloped V3 form:
+
+| Kind | Legacy kind ID | Kind-specific body after the legacy 36-byte prefix |
 |---|---|---|
 | Replace | `24264FA9EE46A1ACC0E024AE69774B09` | `36..52` cell ID, `52..84` `SimpleArchive` handle, `84..256` reserved zeros |
 | Clear | `4FE372AE868D22A44DED7A60D579B651` | `36..52` cell ID, `52..256` reserved zeros |
@@ -470,8 +555,8 @@ was not invariant under pile concatenation and made independently edited policy
 silently order-dependent. The markers are retired permanently and must never be
 assigned new meaning.
 
-Current readers recognize both the enveloped form above and the fixed-width
-unenveloped V3 form solely to preserve migration evidence. They expose either
+Current readers recognize both the legacy enveloped form above and the
+fixed-width unenveloped V3 form solely to preserve migration evidence. They expose either
 form as `PileRecordContent::Opaque`, do not project a value into repository
 state, and do not treat its referenced archive as a retention root. Raw tooling
 through `PileRecords` can still copy or explicitly migrate the exact bytes.
@@ -481,10 +566,10 @@ rewrite while any such record remains.
 
 ## Want Records
 
-| Kind | Kind ID | Kind-specific body after the common prefix |
+| Kind | Record kind (rooted at) | Kind-specific body after the common prefix |
 |---|---|---|
-| Assert | `9A06797600FA90B8A8259B0ED029EC21` | `36` request kind, `37..69` field A, `69..101` field B, `101..133` field C, `133..256` reserved zeros |
-| Retract | `2D957A780A52E474F58A06D44D6FE46C` | same request layout |
+| Assert | `65EE9E4279FFE01D263E75A8E2DF6289B6DE403CB4468098A0EAB925F81C28ED` (`9A06797600FA90B8A8259B0ED029EC21`) | `64` request kind, `65..96` reserved zeros, `96..128` field A, `128..160` field B, `160..192` field C, `192..256` reserved zeros |
+| Retract | `A57C866A83A90635090A947D92464B19D9F898C0C961AB7A91C79A979F9F1483` (`2D957A780A52E474F58A06D44D6FE46C`) | same request layout |
 
 Both kind IDs were minted with `trible genid` on 2026-08-13 and encode `Merge`
 and `Derive` requests. An assertion and its retraction are keyed by the exact
@@ -510,15 +595,23 @@ receipt already defined by `CollectionStore`, not mutable state inside the
 want. The storage format persists those questions independently of whether a
 local or remote worker eventually supplies the receipt.
 
-Blob assertions continue to be written with the historical weak-pin kind
-`8F3EEFEDECD491F63F6EAAA5FD6F3D5E`, and Blob retractions with the historical
-weak-unpin kind `2D76662DFF0187EC36A8C90B12BB8B0D`. Their single handle decodes
-as the equivalent canonical `Blob` request. Keeping Blob writes on these kinds
+Blob assertions continue to be written under the historical weak-pin kind
+(`EC1C024C04AF08243DB3AE318C93FA500355C74395C0F553CFFC0AF0A4BA0346`, rooted at
+`8F3EEFEDECD491F63F6EAAA5FD6F3D5E`), and Blob retractions under the historical
+weak-unpin kind
+(`ACCB531FC7489357C40FCEF0DDE8BD9088F2AC1924A652EA211ADD5C30B95B46`, rooted at
+`2D76662DFF0187EC36A8C90B12BB8B0D`). Their body is `64..96` the blob handle and
+`96..256` reserved zeros, and the single handle decodes as the equivalent
+canonical `Blob` request. Keeping Blob writes on these kinds
 is essential to the envelope's forgetful-projection rule: an older reader sees
 the complete Blob LWW history and may safely ignore the new independent
 operation-want kinds.
 
 ## Legacy unenveloped records
+
+The legacy envelope's bodies all began at byte 36, four bytes short of a 32-byte
+boundary; the tables above give the current offsets, and the legacy ones are
+each exactly 28 lower.
 
 Unenveloped V3 blob, branch, and legacy blob-want records place their kind ID directly in
 `0..16`. Their semantic bodies begin at byte 16 rather than byte 36: a V3 blob

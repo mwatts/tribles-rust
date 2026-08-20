@@ -9,6 +9,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Pile records are framed 28/4/32, and a record kind resolves.** The
+  envelope's 36-byte prefix (16-byte marker, 16-byte kind, 4-byte span) left
+  every 32-byte field in every body four bytes short of a 32-byte boundary, so
+  each digest, handle, and signature component straddled two. The framing is
+  now a 28-byte magic, the 4-byte block span, and a **32-byte record kind**,
+  putting the body at byte 64 — aligned, and aligned at absolute file offsets
+  because records start on 256-byte boundaries. The arithmetic is exact: a
+  signed commit's six 32-byte fields fill `64..256` with nothing reserved and
+  nothing wasted.
+
+  The widened kind is a blob handle naming a `SimpleArchive` that **describes
+  the record's own layout**, so a reader meeting an unfamiliar record can
+  resolve what it is instead of only failing to recognise it — the move the
+  collection layer already made when descriptors replaced bare definition ids.
+  Each description is rooted at the 16-byte id the kind was already minted
+  under, so nothing was renamed. The handles are pinned in
+  `triblespace-core/src/repo/pile/record_kind.rs`, and a test recomputes each
+  one from its description so editing a description is a loud format change
+  rather than a silent reframing.
+
+  **The compatibility surface is v0.46.4** (tagged 2026-06-10, the last
+  released version): its three V1 markers are the only records anyone outside
+  this workspace can hold, and they are read forever. Everything introduced
+  since — the V3 family, all three collection-record generations, typed wants,
+  retired local cells, and the 36-byte legacy envelope — never shipped, is not
+  a compatibility commitment, and is read exactly once by the new
+  `trible pile migrate <pile> reframe --into <dest>`. Those decoders are marked
+  for deletion once the workspace piles have been reframed.
+
+  **An unknown frame is corruption, and that is the point.** An unknown *kind*
+  inside a valid frame still resolves to `Opaque` and is skipped by its span —
+  that is forward compatibility. An unknown *frame* means nothing about the
+  bytes is trustworthy, not even where the next record starts, so the decoder
+  fails at exactly that offset. 28 bytes is a sentinel rather than an
+  identifier: a mismatch is 224 bits of evidence that these bytes are not a
+  record, so a torn write or a mis-seek is caught where it happens. A torn tail
+  that is a proper prefix of the magic reports `CorruptPile` (which `amputate`
+  repairs) rather than `UnsupportedRecord` (which it refuses to truncate,
+  because the remedy there is `reframe`). The span stays early and at a fixed
+  offset ahead of anything version-specific, so a future reader can still cross
+  what it cannot interpret.
+
+  The magic was minted on 2026-08-20 from two `trible genid` calls,
+  `0371B249F0626B2ABDDB80E23EA96905` and
+  `9D9656A5EA5A497320351F3BE712CF82`, concatenated and truncated to 28 bytes;
+  the `KIND_PILE_RECORD` tag `29D9F7F6B5062623F65D63DBF4F633B3` was minted the
+  same day.
+
+  `PileRecordContent::Opaque` now carries an `OpaqueKind`, which distinguishes
+  a 16-byte legacy kind from a 32-byte resolvable one rather than flattening
+  the two.
+
 - **A recipe names a law; its arguments live on the descriptor.** Four
   collections derived a recipe id by hashing a minted algorithm id together
   with its arguments into a phantom entity and using the digest —
@@ -298,6 +350,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `trible pile amputate <path>` form is intentionally incomplete.
 
 ### Added
+
+- **`trible pile migrate <pile> reframe --into <dest>`** re-encodes a whole pile
+  into the current framing. Semantic and in source order: content-addressed blob
+  payloads keep their identities *and* their original insertion timestamps
+  (`Pile::put_at`), last-writer-wins pins and wants are replayed in order,
+  grow-only collection records and grants are re-inserted idempotently, and
+  records that never carried live state are dropped and counted. Every commit in
+  the result is verified afterwards rather than assumed to survive — a signature
+  covers a transcript, not a frame, but that claim spans two layers and the
+  cheap way to be sure is to check. Verified on APFS clones of a 12.8 GB and a
+  1.7 GB pile: 100% of records reframed, all 34,181 commits still
+  signature-valid, every collection resolving identically, no blob lost.
+
+- **`trible pile migrate run record-kind-descriptions`** stores every record-kind
+  description into a pile, so it can answer "what is this record?" about its own
+  bytes without an external lookup. Backed by
+  `Pile::publish_record_kind_descriptions`; idempotent under content addressing,
+  and its census distinguishes "already resident" from "left to store" so a
+  re-run reports honestly instead of repeating its worklist.
 
 - **Registers: `latest` generalised to a parameterisable resolution
   substrate.** `triblespace::core::query::register` makes "which states are

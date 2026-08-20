@@ -12,16 +12,17 @@ The current 256-byte generic envelope written ahead of every blob contains:
 
 | Field | Offset | Size | Purpose |
 |---|---:|---:|---|
-| Envelope marker | `0..16` | 16 | Identifies the generic forward-compatible framing. |
-| Blob kind ID | `16..32` | 16 | Selects blob semantics. |
-| Span | `32..36` | 4 | Total record size in 256-byte blocks, little-endian. |
-| Timestamp | `36..44` | 8 | Unix milliseconds when the payload was appended, little-endian. |
-| Length | `44..52` | 8 | Exact payload bytes excluding padding, little-endian. |
-| Hash | `52..84` | 32 | Digest used to validate and address the payload. |
-| Reserved | `84..256` | 172 | Required zeros. |
+| Framing magic | `0..28` | 28 | Identifies the current forward-compatible framing. |
+| Span | `28..32` | 4 | Total record size in 256-byte blocks, little-endian. |
+| Blob record kind | `32..64` | 32 | Handle of the description of this layout. |
+| Timestamp | `64..72` | 8 | Unix milliseconds when the payload was appended, little-endian. |
+| Length | `72..80` | 8 | Exact payload bytes excluding padding, little-endian. |
+| Reserved | `80..96` | 16 | Required zeros, aligning the hash to a 32-byte boundary. |
+| Hash | `96..128` | 32 | Digest used to validate and address the payload. |
+| Reserved | `128..256` | 128 | Required zeros. |
 
-The reader also accepts legacy V1/V3 blob headers and projects their timestamp,
-length, and hash through the same API.
+The reader also accepts the legacy envelope and legacy V1/V3 blob headers, and
+projects their timestamp, length, and hash through the same API.
 
 [`BlobMetadata`][blobmetadata] re-exposes the timestamp and length fields so
 callers can read when a blob was appended and how large the payload is.
