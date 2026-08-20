@@ -891,7 +891,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collection::{CollectionDescriptor, CollectionMerge};
+    use crate::blob::encodings::simplearchive::SimpleArchive;
+    use crate::blob::IntoBlob;
+    use crate::collection::descriptor;
+    use crate::collection::records::CollectionName;
+    use crate::collection::{CollectionHandle, CollectionMerge};
+    use ed25519_dalek::SigningKey;
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::pile::Pile;
     use futures::executor::block_on;
@@ -912,9 +917,19 @@ mod tests {
     #[test]
     fn collection_records_forward_through_the_store_mutex() {
         let id = |byte| Id::new([byte; 16]).unwrap();
-        let descriptor = CollectionDescriptor::naming(id(1), id(2), id(3));
+        let team = SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let facts = descriptor::naming(
+            &CollectionName::new("lazy").unwrap(),
+            team,
+            id(2),
+            id(3),
+        )
+        .into_facts();
+        // Nothing stores this descriptor: the test needs an identity to file
+        // records under, not a resolvable collection.
+        let collection: CollectionHandle = IntoBlob::<SimpleArchive>::to_blob(facts).get_handle();
         let record = CollectionRecord::Merge(CollectionMerge::new(
-            descriptor.handle(),
+            collection,
             Inline::new([4; 32]),
             Inline::new([5; 32]),
             Inline::new([6; 32]),
@@ -929,11 +944,9 @@ mod tests {
                 .unwrap(),
             vec![record]
         );
-        let selectors = [CollectionRecordSelector::MergeCollection(
-            descriptor.handle(),
-        )]
-        .into_iter()
-        .collect();
+        let selectors = [CollectionRecordSelector::MergeCollection(collection)]
+            .into_iter()
+            .collect();
         assert_eq!(
             CollectionStore::select_records(&mut lazy, &selectors).unwrap(),
             vec![record]

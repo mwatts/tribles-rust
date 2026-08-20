@@ -1529,9 +1529,10 @@ impl Error for YardReclaimError {}
 mod tests {
     use super::*;
     use crate::blob::encodings::rawbytes::RawBytes;
+    use crate::collection::descriptor::{identity_for_tests, named_for_tests};
     use crate::collection::{
-        empty_metadata_handle, CollectionCommit, CollectionDerive, CollectionDescriptor,
-        CollectionGossip, CollectionMerge,
+        empty_metadata_handle, CollectionCommit, CollectionDerive, CollectionGossip,
+        CollectionMerge,
     };
     use crate::trible::TribleSet;
     use ed25519_dalek::SigningKey;
@@ -1563,13 +1564,13 @@ mod tests {
     }
 
     fn merge_record(tag: u8) -> CollectionRecord {
-        let descriptor = CollectionDescriptor::naming(
-            pin_id(tag),
+        let descriptor = named_for_tests(
+            &format!("tagged-{tag}"),
             pin_id(tag.wrapping_add(1)),
             pin_id(tag.wrapping_add(2)),
         );
         CollectionRecord::Merge(CollectionMerge::new(
-            descriptor.handle(),
+            identity_for_tests(&descriptor),
             Inline::new([tag.wrapping_add(3); 32]),
             Inline::new([tag.wrapping_add(4); 32]),
             Inline::new([tag.wrapping_add(5); 32]),
@@ -1748,10 +1749,10 @@ mod tests {
     fn collection_gossips_union_across_generations_and_survive_reclaim() {
         let config = YardConfig::default();
         let (_dir, paths, mut yard) = yard_with_paths(2, config);
-        let descriptor = CollectionDescriptor::naming(pin_id(61), pin_id(62), pin_id(63));
-        let first = CollectionGossip::sign(&SigningKey::from_bytes(&[64; 32]), descriptor.handle());
-        let second =
-            CollectionGossip::sign(&SigningKey::from_bytes(&[65; 32]), descriptor.handle());
+        let collection =
+            identity_for_tests(&named_for_tests("gossiped", pin_id(62), pin_id(63)));
+        let first = CollectionGossip::sign(&SigningKey::from_bytes(&[64; 32]), collection);
+        let second = CollectionGossip::sign(&SigningKey::from_bytes(&[65; 32]), collection);
 
         yard.generations[1]
             .active_mut()
@@ -1812,25 +1813,23 @@ mod tests {
             .put::<RawBytes, _>(raw_blob(b"mentioned only by unsigned equations"))
             .unwrap();
 
-        let descriptor = CollectionDescriptor::naming(pin_id(31), pin_id(32), pin_id(33));
-        let descriptor_handle = yard
-            .put::<SimpleArchive, _>(CollectionDescriptor::to_blob(&descriptor))
+        let descriptor = named_for_tests("retained", pin_id(32), pin_id(33));
+        let collection = yard
+            .put::<SimpleArchive, _>(crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.into_facts()))
             .unwrap();
-        assert_eq!(descriptor_handle, descriptor.handle());
         let key = SigningKey::from_bytes(&[34; 32]);
-        let commit =
-            CollectionCommit::sign(&key, descriptor.handle(), Inline::new(data.raw), metadata);
+        let commit = CollectionCommit::sign(&key, collection, Inline::new(data.raw), metadata);
         commit.verify_strict().unwrap();
         let records = vec![
             CollectionRecord::Commit(commit),
             CollectionRecord::Merge(CollectionMerge::new(
-                descriptor.handle(),
+                collection,
                 Inline::new(equation_only.raw),
                 Inline::new([35; 32]),
                 Inline::new([36; 32]),
             )),
             CollectionRecord::Derive(CollectionDerive::new(
-                CollectionDescriptor::naming(pin_id(37), pin_id(38), pin_id(39)).handle(),
+                identity_for_tests(&named_for_tests("derived", pin_id(38), pin_id(39))),
                 Inline::new([36; 32]),
                 Inline::new(equation_only.raw),
             )),
@@ -1847,7 +1846,7 @@ mod tests {
             .get::<Blob<SimpleArchive>, SimpleArchive>(metadata)
             .is_ok());
         assert!(reader
-            .get::<Blob<SimpleArchive>, SimpleArchive>(descriptor.handle())
+            .get::<Blob<SimpleArchive>, SimpleArchive>(collection)
             .is_ok());
         assert!(reader.get::<Bytes, RawBytes>(equation_only).is_err());
         drop(reader);
@@ -1873,12 +1872,13 @@ mod tests {
         let forged_metadata = yard
             .put::<SimpleArchive, _>(TribleSet::new().to_blob())
             .unwrap();
-        let descriptor = CollectionDescriptor::naming(pin_id(38), pin_id(39), pin_id(40));
-        yard.put::<SimpleArchive, _>(CollectionDescriptor::to_blob(&descriptor))
+        let descriptor = named_for_tests("forged", pin_id(39), pin_id(40));
+        let collection = yard
+            .put::<SimpleArchive, _>(crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.into_facts()))
             .unwrap();
         let invalid = invalidate_collection_commit(CollectionCommit::sign(
             &SigningKey::from_bytes(&[41; 32]),
-            descriptor.handle(),
+            collection,
             Inline::new(forged_data.raw),
             forged_metadata,
         ));
@@ -1909,14 +1909,15 @@ mod tests {
     #[test]
     fn valid_dangling_native_commit_survives_yard_collection_and_reclaim() {
         let (dir, mut yard) = yard_with(1, YardConfig::default());
-        let descriptor = CollectionDescriptor::naming(pin_id(42), pin_id(43), pin_id(44));
-        yard.put::<SimpleArchive, _>(CollectionDescriptor::to_blob(&descriptor))
+        let descriptor = named_for_tests("dangling", pin_id(43), pin_id(44));
+        let collection = yard
+            .put::<SimpleArchive, _>(crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.into_facts()))
             .unwrap();
         let missing_data = Inline::new([45; 32]);
         let missing_metadata = Inline::<Handle<SimpleArchive>>::new([46; 32]);
         let commit = CollectionCommit::sign(
             &SigningKey::from_bytes(&[47; 32]),
-            descriptor.handle(),
+            collection,
             missing_data,
             missing_metadata,
         );

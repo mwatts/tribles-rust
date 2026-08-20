@@ -8,6 +8,8 @@
 
 /// Narrow write facade for a scoped fact collection.
 pub mod api;
+/// Reading one collection descriptor's facts.
+pub mod descriptor;
 pub mod discovery;
 /// Shared exact-ticket lifecycle for canonical derived collections.
 pub mod exact_derived;
@@ -29,6 +31,13 @@ pub mod simplearchive_union;
 pub mod store;
 /// Canonical raw `SuccinctArchiveBlob` set-union collection kind.
 pub mod succinctarchive_union;
+
+/// Ed25519 public key, re-exported.
+///
+/// A collection names its team by root public key, so this type is part of
+/// the collection API's surface. Downstream crates should not have to take a
+/// direct `ed25519-dalek` dependency to name a type this API demands of them.
+pub use ed25519_dalek::VerifyingKey;
 
 pub use api::*;
 pub use discovery::*;

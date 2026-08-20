@@ -9,11 +9,11 @@ use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
 use crate::blob::Blob;
 use crate::inline::encodings::hash::Handle;
 use crate::repo::{BlobStoreGet, BlobStoreMeta};
-use crate::trible::TribleSet;
+use crate::trible::{Fragment, TribleSet};
 
 use super::{join_many, validate_descriptor, SimpleArchiveUnionValidationError};
 use crate::collection::{
-    collection_physical_cover, CollectionData, CollectionDescriptor, CollectionSemantics,
+    collection_physical_cover, CollectionData, CollectionSemantics,
 };
 
 /// Failure to materialize one resolved `SimpleArchive` union collection.
@@ -113,7 +113,7 @@ where
 /// this boundary.
 pub fn materialize<R>(
     semantics: &CollectionSemantics,
-    descriptor: &CollectionDescriptor,
+    descriptor: &Fragment,
     reader: &R,
 ) -> Result<
     TribleSet,
@@ -127,7 +127,8 @@ where
 {
     validate_descriptor(descriptor).map_err(MaterializationError::Descriptor)?;
 
-    let collection = descriptor.handle();
+    let collection =
+        crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()).get_handle();
     let mut resident = BTreeSet::new();
     for data in semantics.members(collection).into_iter().flatten().copied() {
         let handle = Handle::<SimpleArchive>::from_hash(data);
@@ -190,6 +191,8 @@ mod tests {
 
     use crate::blob::encodings::UnknownBlob;
     use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
+    use crate::collection::descriptor::{identity_for_tests, named_for_tests};
+    use crate::collection::records::CollectionName;
     use crate::collection::{
         discover_collection_records, resolve_collection_semantics, CollectionClaimValidation,
         CollectionCommit, CollectionMerge, CollectionRecord, CollectionStore,
@@ -328,8 +331,15 @@ mod tests {
         Handle::<SimpleArchive>::to_hash(blob.get_handle())
     }
 
+    fn root(name: &str) -> Fragment {
+        super::super::descriptor(
+            &CollectionName::new(name).unwrap(),
+            SigningKey::from_bytes(&[1; 32]).verifying_key(),
+        )
+    }
+
     fn semantics(
-        descriptor: &CollectionDescriptor,
+        descriptor: &Fragment,
         roots: &[Blob<SimpleArchive>],
         merges: &[CollectionMerge],
     ) -> CollectionSemantics {
@@ -339,7 +349,7 @@ mod tests {
             .map(|(index, blob)| {
                 CollectionCommit::sign(
                     &SigningKey::from_bytes(&[(index + 1) as u8; 32]),
-                    descriptor.handle(),
+                    identity_for_tests(descriptor),
                     data(blob),
                     crate::collection::empty_metadata_handle(),
                 )
@@ -374,7 +384,7 @@ mod tests {
 
     #[test]
     fn empty_collection_materializes_without_store_access() {
-        let descriptor = super::super::descriptor(id(1));
+        let descriptor = root("first");
         let reader = ProbeReader::default();
 
         assert_eq!(
@@ -387,7 +397,7 @@ mod tests {
 
     #[test]
     fn direct_resident_leaves_materialize_in_deterministic_handle_order() {
-        let descriptor = super::super::descriptor(id(1));
+        let descriptor = root("first");
         let left = archive([row(1, 1, 1)]);
         let right = archive([row(2, 1, 2)]);
         let semantics = semantics(&descriptor, &[left.clone(), right.clone()], &[]);
@@ -408,12 +418,12 @@ mod tests {
 
     #[test]
     fn resident_compacted_result_replaces_nonresident_inputs() {
-        let descriptor = super::super::descriptor(id(1));
+        let descriptor = root("first");
         let left = archive([row(1, 1, 1)]);
         let right = archive([row(2, 1, 2)]);
         let result = super::super::join(&left, &right).unwrap();
         let merge = CollectionMerge::new(
-            descriptor.handle(),
+            identity_for_tests(&descriptor),
             data(&left),
             data(&right),
             data(&result),
@@ -431,7 +441,7 @@ mod tests {
 
     #[test]
     fn overlapping_upper_cover_is_fetched_only_once() {
-        let descriptor = super::super::descriptor(id(1));
+        let descriptor = root("first");
         let a = archive([row(1, 1, 1)]);
         let b = archive([row(2, 1, 2)]);
         let c = archive([row(3, 1, 3)]);
@@ -440,9 +450,9 @@ mod tests {
         let bc = super::super::join(&b, &c).unwrap();
         let bcd = super::super::join(&bc, &d).unwrap();
         let merges = [
-            CollectionMerge::new(descriptor.handle(), data(&a), data(&b), data(&ab)),
-            CollectionMerge::new(descriptor.handle(), data(&b), data(&c), data(&bc)),
-            CollectionMerge::new(descriptor.handle(), data(&bc), data(&d), data(&bcd)),
+            CollectionMerge::new(identity_for_tests(&descriptor), data(&a), data(&b), data(&ab)),
+            CollectionMerge::new(identity_for_tests(&descriptor), data(&b), data(&c), data(&bc)),
+            CollectionMerge::new(identity_for_tests(&descriptor), data(&bc), data(&d), data(&bcd)),
         ];
         let semantics = semantics(&descriptor, &[a.clone(), b, c, d], &merges);
         let mut reader = ProbeReader::default();
@@ -461,12 +471,12 @@ mod tests {
 
     #[test]
     fn missing_frontier_is_reported_before_fetching() {
-        let descriptor = super::super::descriptor(id(1));
+        let descriptor = root("first");
         let left = archive([row(1, 1, 1)]);
         let right = archive([row(2, 1, 2)]);
         let result = super::super::join(&left, &right).unwrap();
         let merge = CollectionMerge::new(
-            descriptor.handle(),
+            identity_for_tests(&descriptor),
             data(&left),
             data(&right),
             data(&result),
@@ -485,8 +495,7 @@ mod tests {
 
     #[test]
     fn wrong_descriptor_fails_before_store_access() {
-        let wrong =
-            CollectionDescriptor::naming(id(1), id(2), super::super::TRIBLE_SET_UNION_RECIPE_V1);
+        let wrong = named_for_tests("first", id(2), super::super::TRIBLE_SET_UNION_RECIPE_V1);
         let reader = ProbeReader::default();
 
         assert!(matches!(
@@ -501,7 +510,7 @@ mod tests {
 
     #[test]
     fn metadata_and_get_failures_remain_distinct() {
-        let descriptor = super::super::descriptor(id(1));
+        let descriptor = root("first");
         let leaf = archive([row(1, 1, 1)]);
         let semantics = semantics(&descriptor, std::slice::from_ref(&leaf), &[]);
 
@@ -532,7 +541,7 @@ mod tests {
 
     #[test]
     fn malformed_resident_element_is_a_decode_failure() {
-        let descriptor = super::super::descriptor(id(1));
+        let descriptor = root("first");
         let malformed = Blob::new(vec![0_u8; TRIBLE_LEN - 1].into());
         let semantics = semantics(&descriptor, std::slice::from_ref(&malformed), &[]);
         let mut reader = ProbeReader::default();

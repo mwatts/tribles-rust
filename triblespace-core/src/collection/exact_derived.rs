@@ -24,13 +24,14 @@ use crate::id::Id;
 use crate::inline::encodings::hash::{Blake3, Handle, Hash};
 use crate::inline::{Inline, InlineEncoding};
 use crate::repo::{BlobStore, BlobStoreGet, BlobStoreMeta, BlobStorePut};
+use crate::trible::Fragment;
 
 use super::discovery::{
     canonicalize_exact_ticket, discover_collection_records_for_ticket, validate_exact_ticket,
 };
 use super::{
     collection_physical_cover, resolve_collection_semantics, CollectionClaimValidation,
-    CollectionCommit, CollectionData, CollectionDerive, CollectionDescriptor, CollectionHandle,
+    CollectionCommit, CollectionData, CollectionDerive, CollectionHandle,
     CollectionMerge, CollectionRecord, CollectionSemantics, CollectionStore,
     CollectionValidationRequest, DiscoveredCollectionRecords,
 };
@@ -76,14 +77,14 @@ pub trait ExactDerivedAlgebra<Source: BlobEncoding, Target: BlobEncoding> {
     /// Validate the exact source descriptor and one canonical source element.
     fn validate_source(
         &self,
-        descriptor: &CollectionDescriptor,
+        descriptor: &Fragment,
         source: &Blob<Source>,
     ) -> Result<(), ExactAlgebraError>;
 
     /// Validate the exact target descriptor and one canonical target element.
     fn validate_target(
         &self,
-        descriptor: &CollectionDescriptor,
+        descriptor: &Fragment,
         target: &Blob<Target>,
     ) -> Result<(), ExactAlgebraError>;
 
@@ -317,8 +318,10 @@ impl Error for ExactDerivedCollectionError {
 /// Exact-ticket lifecycle for one fixed source-to-target homomorphism.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExactDerivedCollection<Source: BlobEncoding, Target: BlobEncoding> {
-    source: CollectionDescriptor,
-    target: CollectionDescriptor,
+    source: Fragment,
+    source_collection: CollectionHandle,
+    target: Fragment,
+    target_collection: CollectionHandle,
     encodings: PhantomData<fn() -> (Source, Target)>,
 }
 
@@ -336,27 +339,42 @@ where
     /// Panics when source and target are the same collection. An identity
     /// mapping is not a derived-collection lifecycle and would make claim
     /// dispatch ambiguous.
-    pub fn new(source: CollectionDescriptor, target: CollectionDescriptor) -> Self {
+    pub fn new(source: Fragment, target: Fragment) -> Self {
+        let source_collection: CollectionHandle =
+            crate::blob::IntoBlob::<SimpleArchive>::to_blob(source.facts().clone()).get_handle();
+        let target_collection: CollectionHandle =
+            crate::blob::IntoBlob::<SimpleArchive>::to_blob(target.facts().clone()).get_handle();
         assert_ne!(
-            source.handle(),
-            target.handle(),
+            source_collection, target_collection,
             "exact derived collection requires distinct source and target descriptors",
         );
         Self {
             source,
+            source_collection,
             target,
+            target_collection,
             encodings: PhantomData,
         }
     }
 
     /// Source descriptor.
-    pub fn source_descriptor(&self) -> &CollectionDescriptor {
+    pub fn source_descriptor(&self) -> &Fragment {
         &self.source
     }
 
     /// Target descriptor.
-    pub fn target_descriptor(&self) -> &CollectionDescriptor {
+    pub fn target_descriptor(&self) -> &Fragment {
         &self.target
+    }
+
+    /// Identity of the source collection.
+    pub fn source_collection(&self) -> CollectionHandle {
+        self.source_collection
+    }
+
+    /// Identity of the target collection.
+    pub fn target_collection(&self) -> CollectionHandle {
+        self.target_collection
     }
 
     /// Attach an already complete exact cover without writing.
@@ -451,7 +469,7 @@ where
                     }
                     let output_data = fresh_data_identity(&output);
                     let claim =
-                        CollectionDerive::new(self.target.handle(), input_data, output_data);
+                        CollectionDerive::new(self.target_collection, input_data, output_data);
                     cached.insert(
                         input_data,
                         PreparedDerive {
@@ -528,12 +546,16 @@ where
         &self,
         store: &mut S,
     ) -> Result<(), ExactDerivedCollectionError> {
-        for descriptor in [&self.source, &self.target] {
-            let blob = descriptor.to_blob();
+        for (descriptor, expected) in [
+            (&self.source, self.source_collection),
+            (&self.target, self.target_collection),
+        ] {
+            let blob =
+                crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone());
             let actual = store
                 .put::<SimpleArchive, _>(blob)
                 .map_err(|error| ExactDerivedCollectionError::storage("store descriptor", error))?;
-            if actual != descriptor.handle() {
+            if actual != expected {
                 return Err(ExactDerivedCollectionError::Resolution(
                     "blob store returned a noncanonical descriptor handle".to_owned(),
                 ));
@@ -554,14 +576,14 @@ where
         S::Reader: BlobStoreMeta,
         A: ExactDerivedAlgebra<Source, Target> + ?Sized,
     {
-        let ticket = canonicalize_exact_ticket(ticket, self.source.handle())
+        let ticket = canonicalize_exact_ticket(ticket, self.source_collection)
             .map_err(|error| ExactDerivedCollectionError::InvalidTicket(error.to_string()))?;
         let requested: BTreeSet<_> = ticket.iter().map(CollectionCommit::id).collect();
         let discovered = discover_collection_records_for_ticket(
             store,
             &requested,
-            self.source.handle(),
-            self.target.handle(),
+            self.source_collection,
+            self.target_collection,
         )
         .map_err(|error| ExactDerivedCollectionError::storage("discover exact ticket", error))?;
         let authorized = validate_exact_ticket(&discovered, &ticket)
@@ -663,7 +685,7 @@ where
         );
         // This kernel holds both descriptors, so it can state the lineage the
         // derive records observe.
-        let lineage = BTreeMap::from([(self.target.handle(), self.source.handle())]);
+        let lineage = BTreeMap::from([(self.target_collection, self.source_collection)]);
         let resolution =
             resolve_collection_semantics(&discovered, &lineage, &authorized, |request| {
             let claim = request.claim_id();
@@ -707,7 +729,7 @@ where
             }
         }
 
-        let target = self.target.handle();
+        let target = self.target_collection;
         let logically_supported: BTreeSet<_> = resolution
             .semantics()
             .frontier(target)
@@ -746,7 +768,7 @@ where
         let source_plan_parts = if !plan_source_residual || complete {
             None
         } else {
-            let source = self.source.handle();
+            let source = self.source_collection;
             let source_roots: BTreeMap<_, _> = roots
                 .iter()
                 .filter_map(|node| match (node, known.get(node)) {
@@ -818,7 +840,7 @@ where
             discovered
                 .merges()
                 .iter()
-                .filter(|claim| claim.collection() == self.source.handle())
+                .filter(|claim| claim.collection() == self.source_collection)
                 .copied()
                 .map(Candidate::SourceMerge),
         );
@@ -827,7 +849,7 @@ where
                 .derives()
                 .iter()
                 .filter(|claim| {
-                    claim.target() == self.target.handle()
+                    claim.target() == self.target_collection
                 })
                 .copied()
                 .map(Candidate::Derive),
@@ -836,7 +858,7 @@ where
             discovered
                 .merges()
                 .iter()
-                .filter(|claim| claim.collection() == self.target.handle())
+                .filter(|claim| claim.collection() == self.target_collection)
                 .copied()
                 .map(Candidate::TargetMerge),
         );
@@ -864,7 +886,7 @@ struct PreparedDerive<Target: BlobEncoding> {
 }
 
 struct SourcePlan<Source: BlobEncoding> {
-    descriptor: CollectionDescriptor,
+    descriptor: Fragment,
     semantics: CollectionSemantics,
     collection: CollectionHandle,
     resident: BTreeSet<CollectionData>,
@@ -1023,8 +1045,8 @@ fn evaluate_candidates<Source, Target, A>(
     candidate_indices: &BTreeSet<usize>,
     roots: &BTreeSet<TypedData>,
     known: &mut BTreeMap<TypedData, ScratchValue<Source, Target>>,
-    source_descriptor: &CollectionDescriptor,
-    target_descriptor: &CollectionDescriptor,
+    source_descriptor: &Fragment,
+    target_descriptor: &Fragment,
     algebra: &A,
 ) -> (BTreeSet<Id>, BTreeMap<Id, String>)
 where

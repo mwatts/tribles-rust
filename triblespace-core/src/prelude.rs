@@ -39,9 +39,10 @@ pub use crate::blob::BlobEncoding;
 pub use crate::blob::IntoBlob;
 pub use crate::blob::MemoryBlobStore;
 pub use crate::blob::TryFromBlob;
+pub use crate::collection::records::CollectionName;
 pub use crate::collection::{
     Collection, CollectionGossip, CollectionGossipStore, CollectionSnapshot, CollectionStore,
-    SimpleArchiveCollection,
+    SimpleArchiveCollection, VerifyingKey,
 };
 pub use crate::id::fucid;
 pub use crate::id::genid;

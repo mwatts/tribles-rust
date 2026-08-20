@@ -38,7 +38,10 @@ use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
 use tempfile::{tempdir, TempDir};
-use triblespace_core::collection::{discover_collection_records, Collection, CollectionStore};
+use triblespace_core::collection::records::CollectionName;
+use triblespace_core::collection::{
+    discover_collection_records, Collection, CollectionStore, VerifyingKey,
+};
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::InlineEncoding;
@@ -73,7 +76,7 @@ struct Fixture {
     legacy: PathBuf,
     collection: PathBuf,
     branch: Id,
-    scope: Id,
+    name: CollectionName,
     expected: TribleSet,
 }
 
@@ -143,7 +146,7 @@ fn main() {
             &fixture.collection,
             collection_counts,
             args.reps,
-            || collection_materialize(&fixture.collection, fixture.scope),
+            || collection_materialize(&fixture.collection, &fixture.name),
         );
 
         emit(
@@ -158,7 +161,7 @@ fn main() {
             "collection",
             collection_counts,
             "hot_semantic_materialize",
-            hot_collection_materialize(&fixture.collection, fixture.scope, args.reps),
+            hot_collection_materialize(&fixture.collection, &fixture.name, args.reps),
         );
 
         emit(
@@ -193,7 +196,7 @@ fn main() {
         );
 
         let legacy_facts = legacy_materialize(&fixture.legacy, fixture.branch);
-        let collection_facts = collection_materialize(&fixture.collection, fixture.scope);
+        let collection_facts = collection_materialize(&fixture.collection, &fixture.name);
         emit(
             case,
             "legacy",
@@ -214,14 +217,19 @@ fn main() {
         // identical to the in-process comparison.
         let executable = env::current_exe().expect("benchmark executable path");
         let (legacy_cold, legacy_rss) = sample_subprocess(args.reps, || {
-            subprocess_query(&executable, "legacy", &fixture.legacy, fixture.branch)
+            subprocess_query(
+                &executable,
+                "legacy",
+                &fixture.legacy,
+                &format!("{:X}", fixture.branch),
+            )
         });
         let (collection_cold, collection_rss) = sample_subprocess(args.reps, || {
             subprocess_query(
                 &executable,
                 "collection",
                 &fixture.collection,
-                fixture.scope,
+                fixture.name.as_str(),
             )
         });
         emit(
@@ -270,7 +278,7 @@ fn main() {
             collection_counts,
             "append_one_command",
             sample_measured(args.append_reps, || {
-                append_one_clone_collection(&fixture.collection, fixture.scope, case.facts)
+                append_one_clone_collection(&fixture.collection, &fixture.name, case.facts)
             }),
         );
 
@@ -291,7 +299,7 @@ fn main() {
             sample_measured(args.append_reps, || {
                 append_many_clone_collection(
                     &fixture.collection,
-                    fixture.scope,
+                    &fixture.name,
                     case.facts,
                     APPEND_BATCH,
                 )
@@ -402,10 +410,15 @@ fn child_command() {
     let mut args = env::args().skip(2);
     let model = args.next().expect("child model");
     let path = PathBuf::from(args.next().expect("child pile path"));
-    let id = Id::from_hex(&args.next().expect("child branch/scope id")).expect("child id");
+    // The selector is a branch id for the legacy model and a collection name
+    // for the collection model; each side parses what it needs.
+    let selector = args.next().expect("child branch id or collection name");
     let facts = match model.as_str() {
-        "legacy" => legacy_materialize(&path, id),
-        "collection" => collection_materialize(&path, id),
+        "legacy" => legacy_materialize(&path, Id::from_hex(&selector).expect("child branch id")),
+        "collection" => collection_materialize(
+            &path,
+            &CollectionName::new(&selector).expect("child collection name"),
+        ),
         _ => panic!("unknown child model {model}"),
     };
     let count = query_all(&facts);
@@ -426,7 +439,7 @@ fn profile_command() {
     while started.elapsed().as_secs_f64() < seconds {
         match model.as_str() {
             "legacy" => black_box(legacy_materialize(&fixture.legacy, fixture.branch)),
-            "collection" => black_box(collection_materialize(&fixture.collection, fixture.scope)),
+            "collection" => black_box(collection_materialize(&fixture.collection, &fixture.name)),
             _ => panic!("unknown profile model {model}"),
         };
         iterations += 1;
@@ -434,12 +447,12 @@ fn profile_command() {
     eprintln!("DONE iterations={iterations}");
 }
 
-fn subprocess_query(executable: &Path, model: &str, pile: &Path, id: Id) -> (usize, u64) {
+fn subprocess_query(executable: &Path, model: &str, pile: &Path, selector: &str) -> (usize, u64) {
     let output = Command::new(executable)
         .arg("__child")
         .arg(model)
         .arg(pile)
-        .arg(format!("{id:X}"))
+        .arg(selector)
         .output()
         .expect("spawn child command");
     assert!(
@@ -535,6 +548,16 @@ fn signing_key() -> SigningKey {
     SigningKey::from_bytes(&KEY_BYTES)
 }
 
+/// The benchmark collection's name, and its team of one: the same key that
+/// signs every commit here.
+fn collection_name() -> CollectionName {
+    CollectionName::new("faculty-benchmark").expect("legal collection name")
+}
+
+fn collection_team() -> VerifyingKey {
+    signing_key().verifying_key()
+}
+
 fn open_refreshed(path: &Path) -> Pile {
     let mut pile = Pile::open(path).expect("open pile");
     pile.refresh().expect("refresh pile");
@@ -561,9 +584,9 @@ fn build_fixture(case: Case) -> Fixture {
     }
     repo.close().unwrap();
 
-    let scope = fixed_id(3, 0);
+    let name = collection_name();
     let pile = open_refreshed(&collection);
-    let mut collection_facade = Collection::new(pile, scope, signing_key());
+    let mut collection_facade = Collection::new(pile, &name, collection_team(), signing_key());
     for fragment in fragments {
         collection_facade.commit(fragment).unwrap();
     }
@@ -574,14 +597,14 @@ fn build_fixture(case: Case) -> Fixture {
         legacy,
         collection,
         branch,
-        scope,
+        name,
         expected,
     }
 }
 
 fn validate_fixture(fixture: &Fixture) {
     let legacy = legacy_materialize(&fixture.legacy, fixture.branch);
-    let collection = collection_materialize(&fixture.collection, fixture.scope);
+    let collection = collection_materialize(&fixture.collection, &fixture.name);
     assert_eq!(legacy, fixture.expected, "legacy fixture changed semantics");
     assert_eq!(
         collection, fixture.expected,
@@ -605,9 +628,9 @@ fn legacy_materialize(path: &Path, branch: Id) -> TribleSet {
     facts
 }
 
-fn collection_materialize(path: &Path, scope: Id) -> TribleSet {
+fn collection_materialize(path: &Path, name: &CollectionName) -> TribleSet {
     let pile = open_refreshed(path);
-    let mut collection = Collection::new(pile, scope, signing_key());
+    let mut collection = Collection::new(pile, name, collection_team(), signing_key());
     let facts = collection.materialize().unwrap();
     collection.close().unwrap();
     facts
@@ -657,9 +680,9 @@ fn hot_legacy_materialize(path: &Path, branch: Id, reps: usize) -> Summary {
     summary
 }
 
-fn hot_collection_materialize(path: &Path, scope: Id, reps: usize) -> Summary {
+fn hot_collection_materialize(path: &Path, name: &CollectionName, reps: usize) -> Summary {
     let pile = open_refreshed(path);
-    let mut collection = Collection::new(pile, scope, signing_key());
+    let mut collection = Collection::new(pile, name, collection_team(), signing_key());
     let summary = sample(reps, || collection.materialize().unwrap().len());
     collection.close().unwrap();
     summary
@@ -787,11 +810,11 @@ fn append_one_clone_legacy(source: &Path, branch: Id, ordinal: usize) -> Duratio
     started.elapsed()
 }
 
-fn append_one_clone_collection(source: &Path, scope: Id, ordinal: usize) -> Duration {
+fn append_one_clone_collection(source: &Path, name: &CollectionName, ordinal: usize) -> Duration {
     let (_dir, path) = clone_fixture(source);
     let started = Instant::now();
     let pile = open_refreshed(&path);
-    let mut collection = Collection::new(pile, scope, signing_key());
+    let mut collection = Collection::new(pile, name, collection_team(), signing_key());
     collection
         .commit(Fragment::from(fact_set(ordinal, 1)))
         .unwrap();
@@ -818,14 +841,14 @@ fn append_many_clone_legacy(source: &Path, branch: Id, ordinal: usize, count: us
 
 fn append_many_clone_collection(
     source: &Path,
-    scope: Id,
+    name: &CollectionName,
     ordinal: usize,
     count: usize,
 ) -> Duration {
     let (_dir, path) = clone_fixture(source);
     let started = Instant::now();
     let pile = open_refreshed(&path);
-    let mut collection = Collection::new(pile, scope, signing_key());
+    let mut collection = Collection::new(pile, name, collection_team(), signing_key());
     for offset in 0..count {
         collection
             .commit(Fragment::from(fact_set(ordinal + offset, 1)))

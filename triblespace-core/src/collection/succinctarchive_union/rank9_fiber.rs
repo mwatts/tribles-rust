@@ -19,9 +19,10 @@ use crate::blob::encodings::succinctarchive::{
     SuccinctArchiveRank9IndexBlob, UnionArchive,
 };
 use crate::blob::{Blob, BlobEncoding};
+use crate::trible::{Fragment, TribleSet};
 use crate::collection::exact_derived::ExactCover;
 use crate::collection::{
-    CollectionData, CollectionDerive, CollectionDescriptor, CollectionRecord,
+    CollectionData, CollectionDerive, CollectionHandle, CollectionRecord,
     CollectionRecordSelector, CollectionStore,
 };
 use crate::inline::encodings::hash::{Blake3, Handle, Hash};
@@ -192,13 +193,24 @@ impl FiberProbe {
 
 #[derive(Clone)]
 pub(super) struct Rank9Fiber {
-    source: CollectionDescriptor,
-    target: CollectionDescriptor,
+    source: Fragment,
+    source_collection: CollectionHandle,
+    target: Fragment,
+    target_collection: CollectionHandle,
 }
 
 impl Rank9Fiber {
-    pub(super) fn new(source: CollectionDescriptor, target: CollectionDescriptor) -> Self {
-        Self { source, target }
+    pub(super) fn new(source: Fragment, target: Fragment) -> Self {
+        let source_collection: CollectionHandle =
+            crate::blob::IntoBlob::<SimpleArchive>::to_blob(source.facts().clone()).get_handle();
+        let target_collection: CollectionHandle =
+            crate::blob::IntoBlob::<SimpleArchive>::to_blob(target.facts().clone()).get_handle();
+        Self {
+            source,
+            source_collection,
+            target,
+            target_collection,
+        }
     }
 
     /// Attach persisted fibers when unambiguous and exact; otherwise rebuild
@@ -249,8 +261,8 @@ impl Rank9Fiber {
             member.runtime = None;
         }
 
-        self.publish_descriptor(store, "raw", self.source.clone())?;
-        self.publish_descriptor(store, "Rank9", self.target.clone())?;
+        self.publish_descriptor(store, "raw", self.source.clone(), self.source_collection)?;
+        self.publish_descriptor(store, "Rank9", self.target.clone(), self.target_collection)?;
 
         let mut claims = Vec::new();
         for member in &mut members {
@@ -275,7 +287,7 @@ impl Rank9Fiber {
             member.output = Some(output);
             if !member.claim_present {
                 claims.push(CollectionDerive::new(
-                    self.target.handle(),
+                    self.target_collection,
                     member.raw_data,
                     output,
                 ));
@@ -334,7 +346,7 @@ impl Rank9Fiber {
             if let Some(candidate) = unique {
                 full_validation_attempted = true;
                 let claim = CollectionDerive::new(
-                    self.target.handle(),
+                    self.target_collection,
                     raw_data,
                     candidate,
                 );
@@ -379,7 +391,7 @@ impl Rank9Fiber {
                 output = Some(canonical);
                 if claim_present && !full_validation_attempted {
                     let claim = CollectionDerive::new(
-                        self.target.handle(),
+                        self.target_collection,
                         raw_data,
                         canonical,
                     );
@@ -414,7 +426,7 @@ impl Rank9Fiber {
         ensure: bool,
     ) -> Result<BTreeMap<CollectionData, CandidateOutputs>, Rank9FiberError> {
         let mut candidates = BTreeMap::<CollectionData, CandidateOutputs>::new();
-        let selectors = [CollectionRecordSelector::DeriveTarget(self.target.handle())]
+        let selectors = [CollectionRecordSelector::DeriveTarget(self.target_collection)]
         .into_iter()
         .collect();
         let records = store
@@ -428,7 +440,7 @@ impl Rank9Fiber {
             let Some(raw) = raw_by_input.get(&input) else {
                 continue;
             };
-            if claim.target() != self.target.handle() {
+            if claim.target() != self.target_collection {
                 continue;
             }
             let Some(outputs) = candidates.get_mut(&input) else {
@@ -477,7 +489,7 @@ impl Rank9Fiber {
     where
         R: BlobStoreGet + BlobStoreMeta,
     {
-        if claim.target() != self.target.handle() {
+        if claim.target() != self.target_collection {
             return Ok(None);
         }
         let (input, output) = claim.mapping();
@@ -514,11 +526,13 @@ impl Rank9Fiber {
         &self,
         store: &mut S,
         role: &'static str,
-        descriptor: CollectionDescriptor,
+        descriptor: Fragment,
+        expected: CollectionHandle,
     ) -> Result<(), Rank9FiberError> {
-        let expected = descriptor.handle();
         let actual = store
-            .put::<SimpleArchive, _>(descriptor.to_blob())
+            .put::<SimpleArchive, _>(crate::blob::IntoBlob::<SimpleArchive>::to_blob(
+                descriptor.into_facts(),
+            ))
             .map_err(|error| Rank9FiberError::storage("store Rank9 descriptor", error))?;
         if actual != expected {
             return Err(Rank9FiberError::NonCanonicalDescriptorPut {
@@ -546,7 +560,7 @@ impl Rank9Fiber {
                     .output
                     .expect("every incomplete probe member is assigned before publication");
                 let claim = CollectionDerive::new(
-                    self.target.handle(),
+                    self.target_collection,
                     member.raw_data,
                     output,
                 );
@@ -587,8 +601,20 @@ impl Rank9Fiber {
             .first()
             .expect("nonempty fixed cover reaches publication")
             .raw_data;
-        self.verify_descriptor(&reader, "raw", self.source.clone(), raw_context)?;
-        self.verify_descriptor(&reader, "Rank9", self.target.clone(), raw_context)?;
+        self.verify_descriptor(
+            &reader,
+            "raw",
+            &self.source,
+            self.source_collection,
+            raw_context,
+        )?;
+        self.verify_descriptor(
+            &reader,
+            "Rank9",
+            &self.target,
+            self.target_collection,
+            raw_context,
+        )?;
 
         let mut segments = Vec::with_capacity(members.len());
         for member in members {
@@ -657,19 +683,23 @@ impl Rank9Fiber {
         &self,
         reader: &R,
         role: &'static str,
-        expected: CollectionDescriptor,
+        expected: &Fragment,
+        collection: CollectionHandle,
         raw: CollectionData,
     ) -> Result<(), Rank9FiberError> {
-        let blob: Blob<SimpleArchive> = reader.get(expected.handle()).map_err(|error| {
+        let blob: Blob<SimpleArchive> = reader.get(collection).map_err(|error| {
             Rank9FiberError::IncompletePublication {
                 raw,
                 rank9: None,
                 reason: format!("expected {role} descriptor is not readable: {error}"),
             }
         })?;
-        if Blob::<SimpleArchive>::new(blob.bytes.clone()).get_handle() != expected.handle()
-            || CollectionDescriptor::decode(&blob).ok() != Some(expected)
-        {
+        let fresh = Blob::<SimpleArchive>::new(blob.bytes.clone());
+        let decoded = <TribleSet as crate::blob::TryFromBlob<SimpleArchive>>::try_from_blob(
+            fresh.clone(),
+        )
+        .ok();
+        if fresh.get_handle() != collection || decoded.as_ref() != Some(expected.facts()) {
             return Err(Rank9FiberError::IncompletePublication {
                 raw,
                 rank9: None,

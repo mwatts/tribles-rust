@@ -1103,11 +1103,12 @@ mod tests {
     use crate::blob::encodings::simplearchive::SimpleArchive;
     use crate::blob::{Blob, IntoBlob};
     use crate::collection::simplearchive_union::{self, SimpleArchiveUnionValidationError};
-    use crate::collection::{CollectionDescriptor, CollectionRecord, CollectionStore};
+    use crate::collection::descriptor::{identity_for_tests, named_for_tests};
+    use crate::collection::{CollectionRecord, CollectionStore};
     use crate::inline::encodings::hash::{Blake3, Handle, Hash};
     use crate::inline::Inline;
     use crate::repo::{memoryrepo::MemoryRepo, BlobStore, BlobStoreGet};
-    use crate::trible::{Trible, TribleSet, TRIBLE_LEN};
+    use crate::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
     #[derive(Default)]
     struct ProbeStore {
@@ -1138,20 +1139,20 @@ mod tests {
     }
 
     fn commit(
-        definition: &CollectionDescriptor,
+        definition: &Fragment,
         element: CollectionData,
         key: u8,
     ) -> CollectionCommit {
         CollectionCommit::sign(
             &SigningKey::from_bytes(&[key; 32]),
-            definition.handle(),
+            identity_for_tests(definition),
             element,
             super::super::empty_metadata_handle(),
         )
     }
 
     fn discover(
-        _descriptors: &[CollectionDescriptor],
+        _descriptors: &[Fragment],
         commits: &[CollectionCommit],
         merges: &[CollectionMerge],
         derives: &[CollectionDerive],
@@ -1276,18 +1277,18 @@ mod tests {
 
     #[test]
     fn authorization_and_validator_status_are_distinct() {
-        let definition = CollectionDescriptor::naming(id(1), id(2), id(3));
-        let missing_collection = CollectionDescriptor::naming(id(9), id(2), id(3));
+        let definition = named_for_tests("c1", id(2), id(3));
+        let missing_collection = named_for_tests("c9", id(2), id(3));
         let authorized = commit(&definition, data(1), 1);
         let unauthorized = commit(&definition, data(2), 2);
         let missing_descriptor_commit = commit(&missing_collection, data(3), 3);
-        let rejected_merge = CollectionMerge::new(definition.handle(), data(4), data(5), data(6));
+        let rejected_merge = CollectionMerge::new(identity_for_tests(&definition), data(4), data(5), data(6));
         let callback_pending_merge =
-            CollectionMerge::new(definition.handle(), data(7), data(8), data(9));
+            CollectionMerge::new(identity_for_tests(&definition), data(7), data(8), data(9));
         let missing_descriptor_merge =
-            CollectionMerge::new(missing_collection.handle(), data(10), data(11), data(12));
+            CollectionMerge::new(identity_for_tests(&missing_collection), data(10), data(11), data(12));
         let missing_descriptor_derive = CollectionDerive::new(
-            missing_collection.handle(),
+            identity_for_tests(&missing_collection),
             data(1),
             data(13),
         );
@@ -1313,13 +1314,13 @@ mod tests {
             called.push(claim);
             let descriptor_available = match request {
                 CollectionValidationRequest::Commit { claim } => {
-                    claim.collection() == definition.handle()
+                    claim.collection() == identity_for_tests(&definition)
                 }
                 CollectionValidationRequest::Merge { claim } => {
-                    claim.collection() == definition.handle()
+                    claim.collection() == identity_for_tests(&definition)
                 }
                 CollectionValidationRequest::Derive { claim } => {
-                    claim.target() == definition.handle()
+                    claim.target() == identity_for_tests(&definition)
                 }
             };
             if claim == rejected_merge.id() {
@@ -1366,10 +1367,10 @@ mod tests {
         assert!(resolution.activation_pending().is_empty());
         assert!(resolution
             .semantics()
-            .contains(definition.handle(), authorized.data()));
+            .contains(identity_for_tests(&definition), authorized.data()));
         assert!(!resolution
             .semantics()
-            .contains(definition.handle(), unauthorized.data()));
+            .contains(identity_for_tests(&definition), unauthorized.data()));
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1385,7 +1386,7 @@ mod tests {
 
     #[test]
     fn callback_failure_names_the_claim_and_returns_no_snapshot() {
-        let definition = CollectionDescriptor::naming(id(1), id(2), id(3));
+        let definition = named_for_tests("c1", id(2), id(3));
         let root = commit(&definition, data(1), 1);
         let records = discover(&[definition], &[root.clone()], &[], &[], false);
         let error = resolve_with_derive_lineage::<(), _, _>(
@@ -1406,16 +1407,16 @@ mod tests {
 
     #[test]
     fn alternating_merge_derive_merge_reaches_the_least_fixed_point() {
-        let raw = CollectionDescriptor::naming(id(1), id(2), id(3));
+        let raw = named_for_tests("c1", id(2), id(3));
         // A deliberately different scope proves that the generic resolver does
         // not preempt the derivation validator's compatibility policy.
-        let rollup = CollectionDescriptor::naming(id(9), id(4), id(5));
+        let rollup = named_for_tests("c9", id(4), id(5));
         let raw_one = commit(&raw, data(1), 1);
         let raw_two = commit(&raw, data(2), 2);
         let rollup_four = commit(&rollup, data(4), 3);
-        let raw_merge = CollectionMerge::new(raw.handle(), data(1), data(2), data(3));
-        let derive = CollectionDerive::new(rollup.handle(), data(3), data(5));
-        let rollup_merge = CollectionMerge::new(rollup.handle(), data(4), data(5), data(6));
+        let raw_merge = CollectionMerge::new(identity_for_tests(&raw), data(1), data(2), data(3));
+        let derive = CollectionDerive::new(identity_for_tests(&rollup), data(3), data(5));
+        let rollup_merge = CollectionMerge::new(identity_for_tests(&rollup), data(4), data(5), data(6));
         let definitions = [raw.clone(), rollup.clone()];
         let commits = [raw_one.clone(), raw_two.clone(), rollup_four.clone()];
         let merges = [raw_merge, rollup_merge];
@@ -1424,44 +1425,44 @@ mod tests {
 
         let forward = discover(&definitions, &commits, &merges, &derives, false);
         let reverse = discover(&definitions, &commits, &merges, &derives, true);
-        let forward = resolve_with_derive_lineage(&forward, &[(rollup.handle(), raw.handle())], &authorized, accepted).unwrap();
-        let reverse = resolve_with_derive_lineage(&reverse, &[(rollup.handle(), raw.handle())], &authorized, accepted).unwrap();
+        let forward = resolve_with_derive_lineage(&forward, &[(identity_for_tests(&rollup), identity_for_tests(&raw))], &authorized, accepted).unwrap();
+        let reverse = resolve_with_derive_lineage(&reverse, &[(identity_for_tests(&rollup), identity_for_tests(&raw))], &authorized, accepted).unwrap();
         assert_eq!(forward, reverse);
         assert!(forward.validation_pending().is_empty());
         assert!(forward.activation_pending().is_empty());
 
         let semantics = forward.semantics();
         assert_eq!(
-            semantics.members(raw.handle()),
+            semantics.members(identity_for_tests(&raw)),
             Some(&BTreeSet::from([data(1), data(2), data(3)]))
         );
         assert_eq!(
-            semantics.members(rollup.handle()),
+            semantics.members(identity_for_tests(&rollup)),
             Some(&BTreeSet::from([data(4), data(5), data(6)]))
         );
         assert_eq!(
-            semantics.frontier(raw.handle()),
+            semantics.frontier(identity_for_tests(&raw)),
             Some(&BTreeSet::from([data(3)]))
         );
         assert_eq!(
-            semantics.frontier(rollup.handle()),
+            semantics.frontier(identity_for_tests(&rollup)),
             Some(&BTreeSet::from([data(6)]))
         );
         assert_eq!(
-            semantics.supporting_commit_ids(rollup.handle(), data(6)),
+            semantics.supporting_commit_ids(identity_for_tests(&rollup), data(6)),
             BTreeSet::from([raw_one.id(), raw_two.id(), rollup_four.id()])
         );
     }
 
     #[test]
     fn derive_lifts_source_subsumption_without_a_target_merge() {
-        let source = CollectionDescriptor::naming(id(1), id(2), id(3));
-        let target = CollectionDescriptor::naming(id(4), id(5), id(6));
+        let source = named_for_tests("c1", id(2), id(3));
+        let target = named_for_tests("c4", id(5), id(6));
         let first = commit(&source, data(1), 1);
         let second = commit(&source, data(2), 2);
-        let source_merge = CollectionMerge::new(source.handle(), data(1), data(2), data(3));
-        let lower = CollectionDerive::new(target.handle(), data(1), data(11));
-        let upper = CollectionDerive::new(target.handle(), data(3), data(13));
+        let source_merge = CollectionMerge::new(identity_for_tests(&source), data(1), data(2), data(3));
+        let lower = CollectionDerive::new(identity_for_tests(&target), data(1), data(11));
+        let upper = CollectionDerive::new(identity_for_tests(&target), data(3), data(13));
         let records = discover(
             &[source.clone(), target.clone()],
             &[first.clone(), second.clone()],
@@ -1471,20 +1472,20 @@ mod tests {
         );
         let resolution = resolve_with_derive_lineage(
             &records,
-            &[(target.handle(), source.handle())],
+            &[(identity_for_tests(&target), identity_for_tests(&source))],
             &BTreeSet::from([first.id(), second.id()]),
             accepted,
         )
         .unwrap();
         let semantics = resolution.semantics();
 
-        assert!(semantics.subsumes(target.handle(), data(11), data(13)));
+        assert!(semantics.subsumes(identity_for_tests(&target), data(11), data(13)));
         assert_eq!(
-            semantics.frontier(target.handle()),
+            semantics.frontier(identity_for_tests(&target)),
             Some(&BTreeSet::from([data(13)]))
         );
         assert_eq!(
-            collection_physical_cover(semantics, target.handle(), &BTreeSet::from([data(13)])),
+            collection_physical_cover(semantics, identity_for_tests(&target), &BTreeSet::from([data(13)])),
             CollectionPhysicalCover {
                 cover: BTreeSet::from([data(13)]),
                 missing: BTreeSet::new(),
@@ -1494,20 +1495,20 @@ mod tests {
 
     #[test]
     fn derive_lifts_order_across_unmapped_source_members() {
-        let source = CollectionDescriptor::naming(id(1), id(2), id(3));
-        let target = CollectionDescriptor::naming(id(4), id(5), id(6));
+        let source = named_for_tests("c1", id(2), id(3));
+        let target = named_for_tests("c4", id(5), id(6));
         let commits = [
             commit(&source, data(1), 1),
             commit(&source, data(2), 2),
             commit(&source, data(4), 3),
         ];
         let merges = [
-            CollectionMerge::new(source.handle(), data(1), data(2), data(3)),
-            CollectionMerge::new(source.handle(), data(3), data(4), data(7)),
+            CollectionMerge::new(identity_for_tests(&source), data(1), data(2), data(3)),
+            CollectionMerge::new(identity_for_tests(&source), data(3), data(4), data(7)),
         ];
         let derives = [
-            CollectionDerive::new(target.handle(), data(1), data(11)),
-            CollectionDerive::new(target.handle(), data(7), data(17)),
+            CollectionDerive::new(identity_for_tests(&target), data(1), data(11)),
+            CollectionDerive::new(identity_for_tests(&target), data(7), data(17)),
         ];
         let records = discover(
             &[source.clone(), target.clone()],
@@ -1517,20 +1518,20 @@ mod tests {
             false,
         );
         let authorized = commits.iter().map(CollectionCommit::id).collect();
-        let resolution = resolve_with_derive_lineage(&records, &[(target.handle(), source.handle())], &authorized, accepted).unwrap();
+        let resolution = resolve_with_derive_lineage(&records, &[(identity_for_tests(&target), identity_for_tests(&source))], &authorized, accepted).unwrap();
         let semantics = resolution.semantics();
 
-        assert!(semantics.subsumes(target.handle(), data(11), data(17)));
+        assert!(semantics.subsumes(identity_for_tests(&target), data(11), data(17)));
         assert_eq!(
-            semantics.frontier(target.handle()),
+            semantics.frontier(identity_for_tests(&target)),
             Some(&BTreeSet::from([data(17)]))
         );
     }
 
     #[test]
     fn derive_carries_incomparable_leaf_witnesses_through_unmapped_joins() {
-        let source = CollectionDescriptor::naming(id(1), id(2), id(3));
-        let target = CollectionDescriptor::naming(id(4), id(5), id(6));
+        let source = named_for_tests("c1", id(2), id(3));
+        let target = named_for_tests("c4", id(5), id(6));
         let commits = [
             commit(&source, data(1), 1),
             commit(&source, data(2), 2),
@@ -1538,16 +1539,16 @@ mod tests {
             commit(&source, data(8), 4),
         ];
         let merges = [
-            CollectionMerge::new(source.handle(), data(1), data(2), data(3)),
-            CollectionMerge::new(source.handle(), data(4), data(8), data(12)),
-            CollectionMerge::new(source.handle(), data(3), data(12), data(15)),
+            CollectionMerge::new(identity_for_tests(&source), data(1), data(2), data(3)),
+            CollectionMerge::new(identity_for_tests(&source), data(4), data(8), data(12)),
+            CollectionMerge::new(identity_for_tests(&source), data(3), data(12), data(15)),
         ];
         let derives = [
-            CollectionDerive::new(target.handle(), data(1), data(21)),
-            CollectionDerive::new(target.handle(), data(2), data(22)),
-            CollectionDerive::new(target.handle(), data(4), data(24)),
-            CollectionDerive::new(target.handle(), data(8), data(28)),
-            CollectionDerive::new(target.handle(), data(15), data(35)),
+            CollectionDerive::new(identity_for_tests(&target), data(1), data(21)),
+            CollectionDerive::new(identity_for_tests(&target), data(2), data(22)),
+            CollectionDerive::new(identity_for_tests(&target), data(4), data(24)),
+            CollectionDerive::new(identity_for_tests(&target), data(8), data(28)),
+            CollectionDerive::new(identity_for_tests(&target), data(15), data(35)),
         ];
         let records = discover(
             &[source.clone(), target.clone()],
@@ -1557,35 +1558,35 @@ mod tests {
             false,
         );
         let authorized = commits.iter().map(CollectionCommit::id).collect();
-        let resolution = resolve_with_derive_lineage(&records, &[(target.handle(), source.handle())], &authorized, accepted).unwrap();
+        let resolution = resolve_with_derive_lineage(&records, &[(identity_for_tests(&target), identity_for_tests(&source))], &authorized, accepted).unwrap();
         let semantics = resolution.semantics();
 
         for lower in [data(21), data(22), data(24), data(28)] {
-            assert!(semantics.subsumes(target.handle(), lower, data(35)));
+            assert!(semantics.subsumes(identity_for_tests(&target), lower, data(35)));
         }
         assert_eq!(
-            semantics.frontier(target.handle()),
+            semantics.frontier(identity_for_tests(&target)),
             Some(&BTreeSet::from([data(35)]))
         );
     }
 
     #[test]
     fn lifted_order_reaches_a_second_homomorphism() {
-        let source = CollectionDescriptor::naming(id(1), id(2), id(3));
-        let middle = CollectionDescriptor::naming(id(4), id(5), id(6));
-        let target = CollectionDescriptor::naming(id(7), id(8), id(9));
+        let source = named_for_tests("c1", id(2), id(3));
+        let middle = named_for_tests("c4", id(5), id(6));
+        let target = named_for_tests("c7", id(8), id(9));
         let commits = [commit(&source, data(1), 1), commit(&source, data(2), 2)];
         let merges = [CollectionMerge::new(
-            source.handle(),
+            identity_for_tests(&source),
             data(1),
             data(2),
             data(3),
         )];
         let derives = [
-            CollectionDerive::new(middle.handle(), data(1), data(11)),
-            CollectionDerive::new(middle.handle(), data(3), data(13)),
-            CollectionDerive::new(target.handle(), data(11), data(21)),
-            CollectionDerive::new(target.handle(), data(13), data(23)),
+            CollectionDerive::new(identity_for_tests(&middle), data(1), data(11)),
+            CollectionDerive::new(identity_for_tests(&middle), data(3), data(13)),
+            CollectionDerive::new(identity_for_tests(&target), data(11), data(21)),
+            CollectionDerive::new(identity_for_tests(&target), data(13), data(23)),
         ];
         let records = discover(
             &[source.clone(), middle.clone(), target.clone()],
@@ -1595,28 +1596,28 @@ mod tests {
             false,
         );
         let authorized = commits.iter().map(CollectionCommit::id).collect();
-        let resolution = resolve_with_derive_lineage(&records, &[(middle.handle(), source.handle()), (target.handle(), middle.handle())], &authorized, accepted).unwrap();
+        let resolution = resolve_with_derive_lineage(&records, &[(identity_for_tests(&middle), identity_for_tests(&source)), (identity_for_tests(&target), identity_for_tests(&middle))], &authorized, accepted).unwrap();
         let semantics = resolution.semantics();
 
-        assert!(semantics.subsumes(middle.handle(), data(11), data(13)));
-        assert!(semantics.subsumes(target.handle(), data(21), data(23)));
+        assert!(semantics.subsumes(identity_for_tests(&middle), data(11), data(13)));
+        assert!(semantics.subsumes(identity_for_tests(&target), data(21), data(23)));
         assert_eq!(
-            semantics.frontier(target.handle()),
+            semantics.frontier(identity_for_tests(&target)),
             Some(&BTreeSet::from([data(23)]))
         );
     }
 
     #[test]
     fn homomorphic_square_supplies_target_physical_fallback() {
-        let source = CollectionDescriptor::naming(id(1), id(2), id(3));
-        let target = CollectionDescriptor::naming(id(4), id(5), id(6));
+        let source = named_for_tests("c1", id(2), id(3));
+        let target = named_for_tests("c4", id(5), id(6));
         let first = commit(&source, data(1), 1);
         let second = commit(&source, data(2), 2);
-        let source_merge = CollectionMerge::new(source.handle(), data(1), data(2), data(3));
+        let source_merge = CollectionMerge::new(identity_for_tests(&source), data(1), data(2), data(3));
         let derives = [
-            CollectionDerive::new(target.handle(), data(1), data(11)),
-            CollectionDerive::new(target.handle(), data(2), data(12)),
-            CollectionDerive::new(target.handle(), data(3), data(13)),
+            CollectionDerive::new(identity_for_tests(&target), data(1), data(11)),
+            CollectionDerive::new(identity_for_tests(&target), data(2), data(12)),
+            CollectionDerive::new(identity_for_tests(&target), data(3), data(13)),
         ];
         let records = discover(
             &[source.clone(), target.clone()],
@@ -1627,7 +1628,7 @@ mod tests {
         );
         let resolution = resolve_with_derive_lineage(
             &records,
-            &[(target.handle(), source.handle())],
+            &[(identity_for_tests(&target), identity_for_tests(&source))],
             &BTreeSet::from([first.id(), second.id()]),
             accepted,
         )
@@ -1635,13 +1636,13 @@ mod tests {
         let semantics = resolution.semantics();
 
         assert_eq!(
-            semantics.frontier(target.handle()),
+            semantics.frontier(identity_for_tests(&target)),
             Some(&BTreeSet::from([data(13)]))
         );
         assert_eq!(
             collection_physical_cover(
                 semantics,
-                target.handle(),
+                identity_for_tests(&target),
                 &BTreeSet::from([data(11), data(12)])
             ),
             CollectionPhysicalCover {
@@ -1653,15 +1654,15 @@ mod tests {
 
     #[test]
     fn target_merge_completes_the_reverse_side_of_the_square() {
-        let source = CollectionDescriptor::naming(id(1), id(2), id(3));
-        let target = CollectionDescriptor::naming(id(4), id(5), id(6));
+        let source = named_for_tests("c1", id(2), id(3));
+        let target = named_for_tests("c4", id(5), id(6));
         let first = commit(&source, data(1), 1);
         let second = commit(&source, data(2), 2);
-        let source_merge = CollectionMerge::new(source.handle(), data(1), data(2), data(3));
-        let lower = CollectionDerive::new(target.handle(), data(1), data(11));
-        let upper = CollectionDerive::new(target.handle(), data(2), data(12));
-        let target_merge = CollectionMerge::new(target.handle(), data(11), data(12), data(13));
-        let implied = CollectionDerive::new(target.handle(), data(3), data(13));
+        let source_merge = CollectionMerge::new(identity_for_tests(&source), data(1), data(2), data(3));
+        let lower = CollectionDerive::new(identity_for_tests(&target), data(1), data(11));
+        let upper = CollectionDerive::new(identity_for_tests(&target), data(2), data(12));
+        let target_merge = CollectionMerge::new(identity_for_tests(&target), data(11), data(12), data(13));
+        let implied = CollectionDerive::new(identity_for_tests(&target), data(3), data(13));
         let records = discover(
             &[source.clone(), target.clone()],
             &[first.clone(), second.clone()],
@@ -1671,7 +1672,7 @@ mod tests {
         );
         let resolution = resolve_with_derive_lineage(
             &records,
-            &[(target.handle(), source.handle())],
+            &[(identity_for_tests(&target), identity_for_tests(&source))],
             &BTreeSet::from([first.id(), second.id()]),
             accepted,
         )
@@ -1680,24 +1681,24 @@ mod tests {
         assert!(resolution
             .semantics()
             .derive_inputs_by_output
-            .get(&(target.handle(), data(13)))
+            .get(&(identity_for_tests(&target), data(13)))
             .is_some_and(|producers| {
-                producers.contains(&(source.handle(), data(3), implied.id()))
+                producers.contains(&(identity_for_tests(&source), data(3), implied.id()))
             }));
     }
 
     #[test]
     fn commuting_square_conflicts_are_rejected() {
-        let source = CollectionDescriptor::naming(id(1), id(2), id(3));
-        let target = CollectionDescriptor::naming(id(4), id(5), id(6));
+        let source = named_for_tests("c1", id(2), id(3));
+        let target = named_for_tests("c4", id(5), id(6));
         let first = commit(&source, data(1), 1);
         let second = commit(&source, data(2), 2);
-        let source_merge = CollectionMerge::new(source.handle(), data(1), data(2), data(3));
-        let target_merge = CollectionMerge::new(target.handle(), data(11), data(12), data(13));
+        let source_merge = CollectionMerge::new(identity_for_tests(&source), data(1), data(2), data(3));
+        let target_merge = CollectionMerge::new(identity_for_tests(&target), data(11), data(12), data(13));
         let derives = [
-            CollectionDerive::new(target.handle(), data(1), data(11)),
-            CollectionDerive::new(target.handle(), data(2), data(12)),
-            CollectionDerive::new(target.handle(), data(3), data(14)),
+            CollectionDerive::new(identity_for_tests(&target), data(1), data(11)),
+            CollectionDerive::new(identity_for_tests(&target), data(2), data(12)),
+            CollectionDerive::new(identity_for_tests(&target), data(3), data(14)),
         ];
         let records = discover(
             &[source.clone(), target.clone()],
@@ -1710,7 +1711,7 @@ mod tests {
         assert!(matches!(
             resolve_with_derive_lineage(
                 &records,
-                &[(target.handle(), source.handle())],
+                &[(identity_for_tests(&target), identity_for_tests(&source))],
                 &BTreeSet::from([first.id(), second.id()]),
                 accepted,
             ),
@@ -1720,9 +1721,9 @@ mod tests {
 
     #[test]
     fn accepted_pending_merge_conflict_is_hard_and_permutation_independent() {
-        let definition = CollectionDescriptor::naming(id(1), id(2), id(3));
-        let first = CollectionMerge::new(definition.handle(), data(1), data(2), data(3));
-        let second = CollectionMerge::new(definition.handle(), data(1), data(2), data(4));
+        let definition = named_for_tests("c1", id(2), id(3));
+        let first = CollectionMerge::new(identity_for_tests(&definition), data(1), data(2), data(3));
+        let second = CollectionMerge::new(identity_for_tests(&definition), data(1), data(2), data(4));
         let definitions = [definition.clone()];
         let merges = [first.clone(), second.clone()];
         let forward = discover(&definitions, &[], &merges, &[], false);
@@ -1736,7 +1737,7 @@ mod tests {
         assert_eq!(
             forward,
             CollectionResolutionError::Conflict(Box::new(CollectionFunctionalConflict::Merge {
-                collection: definition.handle(),
+                collection: identity_for_tests(&definition),
                 low: data(1),
                 high: data(2),
                 first: ConflictingCollectionOutput {
@@ -1753,10 +1754,10 @@ mod tests {
 
     #[test]
     fn derive_conflicts_are_functional_by_exact_collection_pair_and_input() {
-        let source = CollectionDescriptor::naming(id(1), id(2), id(3));
-        let target = CollectionDescriptor::naming(id(4), id(5), id(6));
-        let first = CollectionDerive::new(target.handle(), data(1), data(2));
-        let second = CollectionDerive::new(target.handle(), data(1), data(3));
+        let source = named_for_tests("c1", id(2), id(3));
+        let target = named_for_tests("c4", id(5), id(6));
+        let first = CollectionDerive::new(identity_for_tests(&target), data(1), data(2));
+        let second = CollectionDerive::new(identity_for_tests(&target), data(1), data(3));
         let records = discover(
             &[source.clone(), target.clone()],
             &[],
@@ -1766,9 +1767,9 @@ mod tests {
         );
 
         assert_eq!(
-            resolve_with_derive_lineage(&records, &[(target.handle(), source.handle())], &BTreeSet::new(), accepted).unwrap_err(),
+            resolve_with_derive_lineage(&records, &[(identity_for_tests(&target), identity_for_tests(&source))], &BTreeSet::new(), accepted).unwrap_err(),
             CollectionResolutionError::Conflict(Box::new(CollectionFunctionalConflict::Derive {
-                target: target.handle(),
+                target: identity_for_tests(&target),
                 input: data(1),
                 first: ConflictingCollectionOutput {
                     claim: first.id(),
@@ -1784,9 +1785,9 @@ mod tests {
 
     #[test]
     fn rejected_equations_do_not_conflict_or_activate() {
-        let definition = CollectionDescriptor::naming(id(1), id(2), id(3));
-        let first = CollectionMerge::new(definition.handle(), data(1), data(2), data(3));
-        let second = CollectionMerge::new(definition.handle(), data(1), data(2), data(4));
+        let definition = named_for_tests("c1", id(2), id(3));
+        let first = CollectionMerge::new(identity_for_tests(&definition), data(1), data(2), data(3));
+        let second = CollectionMerge::new(identity_for_tests(&definition), data(1), data(2), data(4));
         let records = discover(
             &[definition],
             &[],
@@ -1815,10 +1816,10 @@ mod tests {
 
     #[test]
     fn pending_validation_and_authorization_growth_are_retried_monotonically() {
-        let definition = CollectionDescriptor::naming(id(1), id(2), id(3));
+        let definition = named_for_tests("c1", id(2), id(3));
         let first = commit(&definition, data(1), 1);
         let second = commit(&definition, data(2), 2);
-        let merge = CollectionMerge::new(definition.handle(), data(1), data(2), data(3));
+        let merge = CollectionMerge::new(identity_for_tests(&definition), data(1), data(2), data(3));
         let records = discover(
             &[definition.clone()],
             &[first.clone(), second.clone()],
@@ -1837,7 +1838,7 @@ mod tests {
         );
         assert!(!first_pass
             .semantics()
-            .contains(definition.handle(), data(3)));
+            .contains(identity_for_tests(&definition), data(3)));
 
         let authorized = BTreeSet::from([first.id(), second.id()]);
         let callback_pending = resolve_with_derive_lineage(&records, &[], &authorized, |request| {
@@ -1854,27 +1855,27 @@ mod tests {
         );
         assert!(!callback_pending
             .semantics()
-            .contains(definition.handle(), data(3)));
+            .contains(identity_for_tests(&definition), data(3)));
 
         let final_pass = resolve_with_derive_lineage(&records, &[], &authorized, accepted).unwrap();
         assert!(final_pass
             .semantics()
-            .contains(definition.handle(), data(3)));
+            .contains(identity_for_tests(&definition), data(3)));
         assert!(first_pass
             .semantics()
-            .members(definition.handle())
+            .members(identity_for_tests(&definition))
             .unwrap()
-            .is_subset(final_pass.semantics().members(definition.handle()).unwrap()));
+            .is_subset(final_pass.semantics().members(identity_for_tests(&definition)).unwrap()));
     }
 
     #[test]
     fn idempotent_and_subsuming_merges_preserve_frontier_and_provenance() {
-        let definition = CollectionDescriptor::naming(id(1), id(2), id(3));
+        let definition = named_for_tests("c1", id(2), id(3));
         let first = commit(&definition, data(1), 1);
         let same_data_other_commit = commit(&definition, data(1), 3);
         let second = commit(&definition, data(2), 2);
-        let self_merge = CollectionMerge::new(definition.handle(), data(1), data(1), data(1));
-        let subsuming = CollectionMerge::new(definition.handle(), data(1), data(2), data(2));
+        let self_merge = CollectionMerge::new(identity_for_tests(&definition), data(1), data(1), data(1));
+        let subsuming = CollectionMerge::new(identity_for_tests(&definition), data(1), data(2), data(2));
         let records = discover(
             &[definition.clone()],
             &[
@@ -1895,18 +1896,18 @@ mod tests {
         .unwrap();
         let semantics = resolution.semantics();
         assert_eq!(
-            semantics.frontier(definition.handle()),
+            semantics.frontier(identity_for_tests(&definition)),
             Some(&BTreeSet::from([data(2)]))
         );
         assert_eq!(
-            semantics.supporting_commit_ids(definition.handle(), data(2)),
+            semantics.supporting_commit_ids(identity_for_tests(&definition), data(2)),
             BTreeSet::from([first.id(), same_data_other_commit.id(), second.id()])
         );
 
         // The decomposition contains its own unavailable result. It must not
         // recurse forever or fake a proof from only the lower resident input.
         assert_eq!(
-            collection_physical_cover(semantics, definition.handle(), &BTreeSet::from([data(1)])),
+            collection_physical_cover(semantics, identity_for_tests(&definition), &BTreeSet::from([data(1)])),
             CollectionPhysicalCover {
                 cover: BTreeSet::new(),
                 missing: BTreeSet::from([data(2)]),
@@ -1916,22 +1917,22 @@ mod tests {
 
     #[test]
     fn physical_cover_reuses_overlaps_and_follows_nonresident_intermediates() {
-        let definition = CollectionDescriptor::naming(id(1), id(2), id(3));
+        let definition = named_for_tests("c1", id(2), id(3));
         let commits: Vec<_> = [(1, 1), (2, 2), (4, 3), (8, 4)]
             .into_iter()
             .map(|(element, key)| commit(&definition, data(element), key))
             .collect();
         let merges = [
-            CollectionMerge::new(definition.handle(), data(1), data(2), data(3)),
-            CollectionMerge::new(definition.handle(), data(2), data(4), data(6)),
-            CollectionMerge::new(definition.handle(), data(6), data(8), data(14)),
+            CollectionMerge::new(identity_for_tests(&definition), data(1), data(2), data(3)),
+            CollectionMerge::new(identity_for_tests(&definition), data(2), data(4), data(6)),
+            CollectionMerge::new(identity_for_tests(&definition), data(6), data(8), data(14)),
         ];
         let records = discover(&[definition.clone()], &commits, &merges, &[], false);
         let authorized = commits.iter().map(CollectionCommit::id).collect();
         let resolution = resolve_with_derive_lineage(&records, &[], &authorized, accepted).unwrap();
         let semantics = resolution.semantics();
         assert_eq!(
-            semantics.frontier(definition.handle()),
+            semantics.frontier(identity_for_tests(&definition)),
             Some(&BTreeSet::from([data(3), data(14)]))
         );
 
@@ -1940,7 +1941,7 @@ mod tests {
         assert_eq!(
             collection_physical_cover(
                 semantics,
-                definition.handle(),
+                identity_for_tests(&definition),
                 &BTreeSet::from([data(1), data(9), data(14)])
             ),
             CollectionPhysicalCover {
@@ -1949,14 +1950,14 @@ mod tests {
             }
         );
         assert_eq!(
-            collection_physical_cover(semantics, definition.handle(), &BTreeSet::new()).missing,
+            collection_physical_cover(semantics, identity_for_tests(&definition), &BTreeSet::new()).missing,
             BTreeSet::from([data(3), data(14)])
         );
     }
 
     #[test]
     fn sparse_physical_cover_matches_pairwise_reference_including_cycles() {
-        let collection = CollectionDescriptor::naming(id(1), id(2), id(3)).handle();
+        let collection = identity_for_tests(&named_for_tests("c1", id(2), id(3)));
         let elements = [data(1), data(2), data(3)];
         let members = BTreeSet::from(elements);
         let directed_edges: Vec<_> = elements
@@ -2007,7 +2008,7 @@ mod tests {
 
     #[test]
     fn many_independent_resident_members_cover_themselves() {
-        let collection = CollectionDescriptor::naming(id(1), id(2), id(3)).handle();
+        let collection = identity_for_tests(&named_for_tests("c1", id(2), id(3)));
         let members: BTreeSet<_> = (1..=4_096).map(numbered_data).collect();
         let semantics = CollectionSemantics {
             members: BTreeMap::from([(collection, members.clone())]),
@@ -2026,10 +2027,10 @@ mod tests {
 
     #[test]
     fn derives_propagate_commit_provenance_but_never_substitute_physical_bytes() {
-        let source = CollectionDescriptor::naming(id(1), id(2), id(3));
-        let target = CollectionDescriptor::naming(id(9), id(4), id(5));
+        let source = named_for_tests("c1", id(2), id(3));
+        let target = named_for_tests("c9", id(4), id(5));
         let root = commit(&source, data(1), 1);
-        let derive = CollectionDerive::new(target.handle(), data(1), data(2));
+        let derive = CollectionDerive::new(identity_for_tests(&target), data(1), data(2));
         let records = discover(
             &[source.clone(), target.clone()],
             &[root.clone()],
@@ -2038,21 +2039,21 @@ mod tests {
             false,
         );
         let resolution =
-            resolve_with_derive_lineage(&records, &[(target.handle(), source.handle())], &BTreeSet::from([root.id()]), accepted).unwrap();
+            resolve_with_derive_lineage(&records, &[(identity_for_tests(&target), identity_for_tests(&source))], &BTreeSet::from([root.id()]), accepted).unwrap();
         let semantics = resolution.semantics();
         assert_eq!(
-            semantics.supporting_commit_ids(target.handle(), data(2)),
+            semantics.supporting_commit_ids(identity_for_tests(&target), data(2)),
             BTreeSet::from([root.id()])
         );
         assert_eq!(
-            collection_physical_cover(semantics, target.handle(), &BTreeSet::from([data(1)])),
+            collection_physical_cover(semantics, identity_for_tests(&target), &BTreeSet::from([data(1)])),
             CollectionPhysicalCover {
                 cover: BTreeSet::new(),
                 missing: BTreeSet::from([data(2)]),
             }
         );
         assert_eq!(
-            collection_physical_cover(semantics, target.handle(), &BTreeSet::from([data(2)])),
+            collection_physical_cover(semantics, identity_for_tests(&target), &BTreeSet::from([data(2)])),
             CollectionPhysicalCover {
                 cover: BTreeSet::from([data(2)]),
                 missing: BTreeSet::new(),
@@ -2062,13 +2063,13 @@ mod tests {
 
     #[test]
     fn supporting_commit_walk_handles_an_active_merge_derive_cycle() {
-        let source = CollectionDescriptor::naming(id(1), id(2), id(3));
-        let target = CollectionDescriptor::naming(id(4), id(5), id(6));
+        let source = named_for_tests("c1", id(2), id(3));
+        let target = named_for_tests("c4", id(5), id(6));
         let first = commit(&source, data(1), 1);
         let second = commit(&source, data(2), 2);
-        let merge = CollectionMerge::new(source.handle(), data(1), data(2), data(3));
-        let forward = CollectionDerive::new(target.handle(), data(3), data(4));
-        let backward = CollectionDerive::new(source.handle(), data(4), data(3));
+        let merge = CollectionMerge::new(identity_for_tests(&source), data(1), data(2), data(3));
+        let forward = CollectionDerive::new(identity_for_tests(&target), data(3), data(4));
+        let backward = CollectionDerive::new(identity_for_tests(&source), data(4), data(3));
         let records = discover(
             &[source.clone(), target.clone()],
             &[first.clone(), second.clone()],
@@ -2078,7 +2079,7 @@ mod tests {
         );
         let resolution = resolve_with_derive_lineage(
             &records,
-            &[(target.handle(), source.handle()), (source.handle(), target.handle())],
+            &[(identity_for_tests(&target), identity_for_tests(&source)), (identity_for_tests(&source), identity_for_tests(&target))],
             &BTreeSet::from([first.id(), second.id()]),
             accepted,
         )
@@ -2087,7 +2088,7 @@ mod tests {
         assert_eq!(
             resolution
                 .semantics()
-                .supporting_commit_ids(target.handle(), data(4)),
+                .supporting_commit_ids(identity_for_tests(&target), data(4)),
             BTreeSet::from([first.id(), second.id()])
         );
     }
@@ -2119,12 +2120,16 @@ mod tests {
         reader.get(handle).ok()
     }
 
+    /// A descriptor read back out of storage: loose facts, with no fragment
+    /// structure to recover, so it is lifted into one for the validators.
     fn load_descriptor<R: BlobStoreGet>(
         reader: &R,
         handle: CollectionHandle,
-    ) -> Option<CollectionDescriptor> {
-        let blob = reader.get(handle).ok()?;
-        CollectionDescriptor::decode(&blob).ok()
+    ) -> Option<Fragment> {
+        let blob: Blob<SimpleArchive> = reader.get(handle).ok()?;
+        <TribleSet as crate::blob::TryFromBlob<SimpleArchive>>::try_from_blob(blob)
+            .ok()
+            .map(Fragment::from)
     }
 
     fn validate_union<R: BlobStoreGet>(
@@ -2167,14 +2172,17 @@ mod tests {
 
     #[test]
     fn simplearchive_union_validation_integrates_with_discovery_and_resolution() {
-        let definition = simplearchive_union::descriptor(id(1));
+        let definition = simplearchive_union::descriptor(
+            &crate::collection::records::CollectionName::new("resolved").unwrap(),
+            SigningKey::from_bytes(&[1; 32]).verifying_key(),
+        );
         let left = archive([row(1, 1, 1)]);
         let right = archive([row(2, 1, 2)]);
         let result = simplearchive_union::join(&left, &right).unwrap();
         let first = commit(&definition, archive_data(&left), 1);
         let second = commit(&definition, archive_data(&right), 2);
         let merge = CollectionMerge::new(
-            definition.handle(),
+            identity_for_tests(&definition),
             archive_data(&left),
             archive_data(&right),
             archive_data(&result),
@@ -2184,7 +2192,7 @@ mod tests {
         let mut store = MemoryRepo::default();
         store
             .blobs
-            .insert(CollectionDescriptor::to_blob(&definition));
+            .insert(IntoBlob::<SimpleArchive>::to_blob(definition.facts().clone()));
         for record in [
             CollectionRecord::Commit(first),
             CollectionRecord::Commit(second),
@@ -2204,7 +2212,7 @@ mod tests {
         assert_eq!(pending.validation_pending(), &BTreeSet::from([merge.id()]));
         assert!(!pending
             .semantics()
-            .contains(definition.handle(), merge.result()));
+            .contains(identity_for_tests(&definition), merge.result()));
 
         store.blobs.insert(result);
         let records = super::super::discover_collection_records(&mut store).unwrap();
@@ -2216,13 +2224,13 @@ mod tests {
         assert!(resolved.validation_pending().is_empty());
         assert!(resolved.rejected().is_empty());
         assert_eq!(
-            resolved.semantics().frontier(definition.handle()),
+            resolved.semantics().frontier(identity_for_tests(&definition)),
             Some(&BTreeSet::from([merge.result()]))
         );
         assert_eq!(
             resolved
                 .semantics()
-                .supporting_commit_ids(definition.handle(), merge.result()),
+                .supporting_commit_ids(identity_for_tests(&definition), merge.result()),
             authorized
         );
     }

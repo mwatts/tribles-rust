@@ -246,7 +246,11 @@ where
 mod tests {
     use super::*;
 
-    use crate::collection::{Collection, CollectionDescriptor, CollectionMerge};
+    use crate::blob::encodings::simplearchive::SimpleArchive;
+    use crate::blob::IntoBlob;
+    use crate::collection::descriptor;
+    use crate::collection::records::CollectionName;
+    use crate::collection::{Collection, CollectionHandle, CollectionMerge};
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::trible::Fragment;
     use ed25519_dalek::SigningKey;
@@ -257,9 +261,14 @@ mod tests {
 
     #[test]
     fn collection_records_delegate_only_to_the_record_side() {
-        let descriptor = CollectionDescriptor::naming(id(1), id(2), id(3));
+        let team = SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let facts =
+            descriptor::naming(&CollectionName::new("hybrid").unwrap(), team, id(2), id(3))
+                .into_facts();
+        // Only the identity matters here; nothing resolves this descriptor.
+        let collection: CollectionHandle = IntoBlob::<SimpleArchive>::to_blob(facts).get_handle();
         let record = CollectionRecord::Merge(CollectionMerge::new(
-            descriptor.handle(),
+            collection,
             Inline::new([4; 32]),
             Inline::new([5; 32]),
             Inline::new([6; 32]),
@@ -274,11 +283,9 @@ mod tests {
                 .unwrap(),
             vec![record]
         );
-        let selectors = [CollectionRecordSelector::MergeCollection(
-            descriptor.handle(),
-        )]
-        .into_iter()
-        .collect();
+        let selectors = [CollectionRecordSelector::MergeCollection(collection)]
+            .into_iter()
+            .collect();
         assert_eq!(
             CollectionStore::select_records(&mut hybrid, &selectors).unwrap(),
             vec![record]
@@ -298,11 +305,17 @@ mod tests {
     #[test]
     fn collection_publication_and_read_work_across_both_sides() {
         let hybrid = HybridStore::new(MemoryRepo::default(), MemoryRepo::default());
-        let mut collection = Collection::new(hybrid, id(7), SigningKey::from_bytes(&[8; 32]));
+        let signing_key = SigningKey::from_bytes(&[8; 32]);
+        let mut collection = Collection::new(
+            hybrid,
+            &CollectionName::new("hybrid").unwrap(),
+            signing_key.verifying_key(),
+            signing_key,
+        );
 
         let commit = collection.commit(Fragment::empty()).unwrap();
         assert_eq!(collection.materialize().unwrap().len(), 0);
-        assert_eq!(commit.collection(), collection.descriptor().handle());
+        assert_eq!(commit.collection(), collection.collection());
         assert!(collection.storage().blobs.blobs.len() >= 2);
         let storage = collection.storage_mut();
         assert_eq!(storage.branches.records().unwrap().count(), 1);

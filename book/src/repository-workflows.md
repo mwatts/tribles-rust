@@ -26,11 +26,15 @@ descriptor, and a signing key; every call to `Collection::commit(Fragment)`
 publishes one independent signed membership assertion:
 
 ```rust,ignore
-use triblespace::prelude::{Collection, Fragment};
+use triblespace::prelude::{Collection, CollectionName, Fragment};
 
 // `storage` implements BlobStorePut + CollectionStore.
-// `scope` is the stable Id of this dataset.
-let mut collection = Collection::new(storage, scope, signing_key);
+// A root collection is anchored by its `name` within a `team`, named by that
+// team's root public key. A single-node application is a team of one and
+// says so by passing its own verifying key.
+let name = CollectionName::new("models")?;
+let team = signing_key.verifying_key();
+let mut collection = Collection::new(storage, &name, team, signing_key);
 let commit = collection.commit(fragment)?;
 // Optional: choose an explicit durability boundary for one or many commits.
 collection.flush()?;
@@ -47,21 +51,23 @@ facts. Use `snapshot()` instead when facts, commits, and their validating reader
 must come from one coherent observed prefix; separate `ticket()` and
 `materialize()` calls are independent known-prefix observations.
 
-A collection descriptor is a canonical `SimpleArchive` naming one **anchor** --
-a dataset **scope** on a root, or the **source** collection a derivation is
-computed from -- together with its blob **representation**, its algebraic
-**recipe**, and any arguments that recipe takes. It also embeds the
-representation's and the recipe's own descriptions, so the descriptor states
-what they are rather than only naming them. Its 32-byte content handle is the
-`CollectionHandle`. `COMMIT`, `MERGE`, and `DERIVE`
+A collection descriptor is an ordinary `TribleSet` stored as a canonical
+`SimpleArchive`. There is no wrapper type: it is the facts of one `entity!`,
+naming an **anchor** -- a **name** and a **team** on a root, or the **source**
+collection a derivation is computed from -- together with its blob
+**representation**, its algebraic **recipe**, and any arguments that recipe
+takes. It also embeds the representation's and the recipe's own descriptions,
+so the descriptor states what they are rather than only naming them. Its
+32-byte content handle is the `CollectionHandle`, and that handle comes from
+storing the blob rather than from hashing a descriptor nobody kept. `COMMIT`, `MERGE`, and `DERIVE`
 are native typed algebra records rather than trible sets or blobs. Their exact
 dense payloads are 192, 128, and 128 bytes respectively, and carry descriptor
 handles directly, so any claim can resolve and verify its own collection
 semantics through the ordinary blob store. There is no separate definition
 record or registry whose synchronization could make an otherwise complete
 claim ambiguous. `Collection::new` constructs the canonical
-`SimpleArchive`-union descriptor for the supplied scope. The descriptor is the
-only collection-control structure represented as a `SimpleArchive`.
+`SimpleArchive`-union descriptor for the supplied name and team. The descriptor
+is the only collection-control structure represented as a `SimpleArchive`.
 
 The fragment remains self-contained across the publication boundary: its facts
 become the collection's canonical `SimpleArchive` data element, its metafacts
@@ -76,7 +82,7 @@ distinct commits coexist; there is no branch head, CAS retry, or implied
 
 When the backend also provides a blob reader with metadata lookup,
 `Collection::materialize()` returns the complete known union of commits signed
-by the facade's own key for this exact scoped collection. Commits signed by
+by the facade's own key for this exact named collection. Commits signed by
 other keys are not admitted. A failed signature authenticates none of its
 record fields and is therefore an inert diagnostic, never an owner-attributed
 veto. Every strictly verified own commit is ground truth: its descriptor, data
@@ -135,13 +141,13 @@ branches.
 
 Read-only consumers that already hold an immutable commit ticket do not need
 the publishing key. `SimpleArchiveCollection` fixes the same canonical
-descriptor from the dataset scope and accepts the complete signed records as a
-set:
+descriptor from the collection's name and team, and accepts the complete signed
+records as a set:
 
 ```rust,ignore
-use triblespace::prelude::SimpleArchiveCollection;
+use triblespace::prelude::{CollectionName, SimpleArchiveCollection};
 
-let models = SimpleArchiveCollection::new(model_scope);
+let models = SimpleArchiveCollection::new(CollectionName::new("models")?, team);
 let facts = models.attach_exact(&mut storage, &ticket)?;
 let snapshot = models.snapshot_exact(&mut storage, &ticket)?;
 ```
@@ -165,7 +171,7 @@ pin dependency:
 ```rust,ignore
 use triblespace::core::collection::succinctarchive_union::SuccinctArchiveCollection;
 
-let succinct = SuccinctArchiveCollection::new(scope);
+let succinct = SuccinctArchiveCollection::new(name.clone(), team);
 
 // `ticket` is the byte-identical set of signed SimpleArchive commits selected
 // by the caller. Completion publishes only reproducible unsigned evidence.
@@ -790,8 +796,10 @@ use triblespace::telemetry::Telemetry;
 let _guard = Telemetry::install_global_from_env("archive import");
 ```
 
-Set `TELEMETRY_PILE` and a 32-character hexadecimal
-`TELEMETRY_COLLECTION_SCOPE` to enable the sink. Every flushed batch becomes
+Set `TELEMETRY_PILE` and a `TELEMETRY_COLLECTION_NAME` — lowercase ASCII
+letters, digits and `-`, starting with a letter, at most 32 bytes — to enable
+the sink. The sink generates its own key per session, so its collection is a
+team of one rooted at that key. Every flushed batch becomes
 an independent signed collection commit carrying its telemetry schema as
 metafacts; no mutable branch head or compare-and-set retry is involved. You can
 tune batching via `TELEMETRY_FLUSH_MS`.

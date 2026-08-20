@@ -1158,9 +1158,10 @@ mod tests {
     use crate::blob::encodings::rawbytes::RawBytes;
     use ed25519_dalek::SigningKey;
 
+    use crate::collection::descriptor::{identity_for_tests, named_for_tests};
     use crate::collection::{
-        CollectionDescriptor, CollectionGossipStore, CollectionMerge, CollectionStore,
-        COLLECTION_MERGE_BYTES_LEN, COLLECTION_RECORD_KIND_MERGE_V1,
+        CollectionGossipStore, CollectionMerge, CollectionStore, COLLECTION_MERGE_BYTES_LEN,
+        COLLECTION_RECORD_KIND_MERGE_V1,
     };
     use crate::repo::async_store::{AsyncBlobStorePut, Blocking};
     use crate::repo::StorageFlush;
@@ -1173,13 +1174,13 @@ mod tests {
     }
 
     fn record(tag: u8) -> CollectionRecord {
-        let descriptor = CollectionDescriptor::naming(
-            Id::new([tag; 16]).unwrap(),
+        let descriptor = named_for_tests(
+            &format!("tagged-{tag}"),
             Id::new([tag.wrapping_add(1).max(1); 16]).unwrap(),
             Id::new([tag.wrapping_add(2).max(1); 16]).unwrap(),
         );
         CollectionRecord::Merge(CollectionMerge::new(
-            descriptor.handle(),
+            identity_for_tests(&descriptor),
             Inline::new([tag.wrapping_add(3); 32]),
             Inline::new([tag.wrapping_add(4); 32]),
             Inline::new([tag.wrapping_add(5); 32]),
@@ -1236,21 +1237,19 @@ mod tests {
             let mut store = remote();
             let first = CollectionGossip::sign(
                 &SigningKey::from_bytes(&[7; 32]),
-                CollectionDescriptor::naming(
-                    Id::new([1; 16]).unwrap(),
+                identity_for_tests(&named_for_tests(
+                    "first",
                     Id::new([2; 16]).unwrap(),
                     Id::new([3; 16]).unwrap(),
-                )
-                .handle(),
+                )),
             );
             let second = CollectionGossip::sign(
                 &SigningKey::from_bytes(&[8; 32]),
-                CollectionDescriptor::naming(
-                    Id::new([4; 16]).unwrap(),
+                identity_for_tests(&named_for_tests(
+                    "second",
                     Id::new([5; 16]).unwrap(),
                     Id::new([6; 16]).unwrap(),
-                )
-                .handle(),
+                )),
             );
 
             AsyncCollectionGossipStore::gossip(&mut store, second)
@@ -1276,12 +1275,11 @@ mod tests {
         let mut store = Blocking::new(remote()).unwrap();
         let grant = CollectionGossip::sign(
             &SigningKey::from_bytes(&[9; 32]),
-            CollectionDescriptor::naming(
-                Id::new([7; 16]).unwrap(),
+            identity_for_tests(&named_for_tests(
+                "third",
                 Id::new([8; 16]).unwrap(),
                 Id::new([9; 16]).unwrap(),
-            )
-            .handle(),
+            )),
         );
         CollectionGossipStore::gossip(&mut store, grant).unwrap();
         assert_eq!(

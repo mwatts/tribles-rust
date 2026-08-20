@@ -10,10 +10,13 @@ use ed25519_dalek::SigningKey;
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{IntoBlob, TryFromBlob};
+use triblespace_core::collection::records::CollectionName;
 use triblespace_core::collection::{
     Collection, CollectionData, CollectionDerive, CollectionGossip, CollectionGossipStore,
-    CollectionMerge, CollectionRecord, CollectionStore, simplearchive_union,
+    CollectionHandle, CollectionMerge, CollectionRecord, CollectionStore, VerifyingKey,
+    simplearchive_union,
 };
+use triblespace_core::trible::Fragment as DescriptorFragment;
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::time::NsTAIInterval;
 use triblespace_core::inline::{Inline, TryToInline};
@@ -32,6 +35,25 @@ use common::{
 
 fn id(byte: u8) -> Id {
     Id::new([byte; 16]).unwrap()
+}
+
+fn collection_name(name: &str) -> CollectionName {
+    CollectionName::new(name).unwrap()
+}
+
+/// The one team every collection in these simulations belongs to.
+fn test_team() -> VerifyingKey {
+    key(0xF3).verifying_key()
+}
+
+/// A named root of the canonical `SimpleArchive` union kind.
+fn named_root(name: &str) -> DescriptorFragment {
+    simplearchive_union::descriptor(&collection_name(name), test_team())
+}
+
+/// The identity of a descriptor these simulations only address, never store.
+fn collection_of(descriptor: &DescriptorFragment) -> CollectionHandle {
+    descriptor.facts().clone().to_blob().get_handle()
 }
 
 fn archive(byte: u8) -> Blob<SimpleArchive> {
@@ -97,13 +119,11 @@ fn direct_collection_evidence_fetch_is_verified_and_does_not_fetch_or_admit_blob
             (client_cap, client_sig.clone()),
         ]);
 
-        let descriptor = simplearchive_union::descriptor(id(1));
+        let descriptor = named_root("c1");
         let data = archive(2);
         let metadata = archive(3);
         server_store
-            .put::<SimpleArchive, _>(triblespace_core::collection::CollectionDescriptor::to_blob(
-                &descriptor,
-            ))
+            .put::<SimpleArchive, _>(descriptor.clone().into_facts().to_blob())
             .unwrap();
         server_store.put::<SimpleArchive, _>(data.clone()).unwrap();
         server_store
@@ -111,10 +131,15 @@ fn direct_collection_evidence_fetch_is_verified_and_does_not_fetch_or_admit_blob
             .unwrap();
         let mut fragment = Fragment::from(TribleSet::try_from_blob(data.clone()).unwrap());
         *fragment.metafacts_mut() = TribleSet::try_from_blob(metadata.clone()).unwrap();
-        let mut collection = Collection::new(&mut server_store, id(1), server_key.clone());
+        let mut collection = Collection::new(
+            &mut server_store,
+            &collection_name("c1"),
+            test_team(),
+            server_key.clone(),
+        );
         let commit = collection.commit(fragment).unwrap();
         server_store
-            .gossip(CollectionGossip::sign(&server_key, descriptor.handle()))
+            .gossip(CollectionGossip::sign(&server_key, collection_of(&descriptor)))
             .unwrap();
 
         let net = SimNet::new(0xC011EC7, SimConfig::default());
@@ -138,11 +163,11 @@ fn direct_collection_evidence_fetch_is_verified_and_does_not_fetch_or_admit_blob
         // Let both host tasks publish their capabilities before the direct op.
         SimNet::step(&vclock(), Duration::from_millis(1)).await;
         let (client, fetched) =
-            fetch_evidence_while_stepping(client, pk(&server_key), descriptor.handle()).await;
+            fetch_evidence_while_stepping(client, pk(&server_key), collection_of(&descriptor)).await;
 
         assert_eq!(fetched.len(), 1);
         assert_eq!(fetched[0].commit(), commit);
-        assert_eq!(fetched[0].grant().collection(), descriptor.handle());
+        assert_eq!(fetched[0].grant().collection(), collection_of(&descriptor));
 
         // Fetch is inert sparse evidence: neither the commit/grant nor any
         // blob it names is admitted into the client store.
@@ -151,7 +176,7 @@ fn direct_collection_evidence_fetch_is_verified_and_does_not_fetch_or_admit_blob
         let reader = client.store().reader().unwrap();
         assert!(
             reader
-                .get::<TribleSet, SimpleArchive>(descriptor.handle())
+                .get::<TribleSet, SimpleArchive>(collection_of(&descriptor))
                 .is_err()
         );
         assert!(
@@ -194,15 +219,18 @@ fn direct_collection_evidence_fetch_omits_commits_without_author_grants() {
             (client_cap, client_sig.clone()),
         ]);
 
-        let descriptor = simplearchive_union::descriptor(id(4));
+        let descriptor = named_root("c4");
         let data: Blob<SimpleArchive> = TribleSet::new().to_blob();
         server_store
-            .put::<SimpleArchive, _>(triblespace_core::collection::CollectionDescriptor::to_blob(
-                &descriptor,
-            ))
+            .put::<SimpleArchive, _>(descriptor.clone().into_facts().to_blob())
             .unwrap();
         server_store.put::<SimpleArchive, _>(data.clone()).unwrap();
-        Collection::new(&mut server_store, id(4), server_key.clone())
+        Collection::new(
+            &mut server_store,
+            &collection_name("c4"),
+            test_team(),
+            server_key.clone(),
+        )
             .commit(Fragment::empty())
             .unwrap();
 
@@ -226,7 +254,7 @@ fn direct_collection_evidence_fetch_omits_commits_without_author_grants() {
         SimNet::step(&vclock(), Duration::from_millis(1)).await;
 
         let (_client, fetched) =
-            fetch_evidence_while_stepping(client, pk(&server_key), descriptor.handle()).await;
+            fetch_evidence_while_stepping(client, pk(&server_key), collection_of(&descriptor)).await;
         assert!(fetched.is_empty());
     });
 }
@@ -268,7 +296,7 @@ fn branch_restricted_capability_cannot_enumerate_collections() {
         );
         SimNet::step(&vclock(), Duration::from_millis(1)).await;
 
-        let collection = simplearchive_union::descriptor(id(5)).handle();
+        let collection = collection_of(&named_root("c5"));
         let (_client, result) =
             fetch_evidence_result_while_stepping(client, pk(&server_key), collection).await;
         let error = result.unwrap_err();
@@ -294,12 +322,17 @@ fn direct_collection_reconcile_admits_sparse_evidence_without_blobs_pins_or_want
             (client_cap, client_sig.clone()),
         ]);
 
-        let descriptor = simplearchive_union::descriptor(id(6));
+        let descriptor = named_root("c6");
         let data = archive(7);
         let facts = TribleSet::try_from_blob(data.clone()).unwrap();
-        let mut collection = Collection::new(&mut server_store, id(6), server_key.clone());
+        let mut collection = Collection::new(
+            &mut server_store,
+            &collection_name("c6"),
+            test_team(),
+            server_key.clone(),
+        );
         let commit = collection.commit(Fragment::from(facts)).unwrap();
-        let grant = CollectionGossip::sign(&server_key, descriptor.handle());
+        let grant = CollectionGossip::sign(&server_key, collection_of(&descriptor));
         server_store.gossip(grant).unwrap();
 
         let net = SimNet::new(0xC011ECA, SimConfig::default());
@@ -324,7 +357,7 @@ fn direct_collection_reconcile_admits_sparse_evidence_without_blobs_pins_or_want
         let worker = std::thread::spawn(move || {
             let mut client = client;
             let outcome = client
-                .reconcile_collection_from(pk(&server_key), descriptor.handle(), |_, _| {
+                .reconcile_collection_from(pk(&server_key), collection_of(&descriptor), |_, _| {
                     Ok::<_, std::convert::Infallible>(true)
                 })
                 .unwrap();
@@ -375,23 +408,22 @@ fn configured_peer_probe_roundtrips_exact_operation_receipts_without_dht_or_goss
         let configured_store = store_with_caps(&all_caps);
         let unconfigured_store = store_with_caps(&all_caps);
 
-        let source = simplearchive_union::descriptor(id(20));
-        let target = simplearchive_union::descriptor(id(21));
-        let other = simplearchive_union::descriptor(id(22));
-        let merge_request = WantRequest::merge(source.handle(), data(1), data(2));
-        let merge_first = CollectionMerge::new(source.handle(), data(1), data(2), data(3));
-        let merge_conflict = CollectionMerge::new(source.handle(), data(1), data(2), data(4));
-        let merge_unrelated = CollectionMerge::new(source.handle(), data(1), data(9), data(5));
+        let source = named_root("c20");
+        let target = named_root("c21");
+        let other = named_root("c22");
+        let merge_request = WantRequest::merge(collection_of(&source), data(1), data(2));
+        let merge_first = CollectionMerge::new(collection_of(&source), data(1), data(2), data(3));
+        let merge_conflict = CollectionMerge::new(collection_of(&source), data(1), data(2), data(4));
+        let merge_unrelated = CollectionMerge::new(collection_of(&source), data(1), data(9), data(5));
         let merge_wrong_collection =
-            CollectionMerge::new(other.handle(), data(1), data(2), data(6));
+            CollectionMerge::new(collection_of(&other), data(1), data(2), data(6));
 
-        let derive_request = WantRequest::derive(source.handle(), target.handle(), data(7));
-        let derive_first =
-            CollectionDerive::new(source.handle(), target.handle(), data(7), data(8));
-        let derive_conflict =
-            CollectionDerive::new(source.handle(), target.handle(), data(7), data(9));
-        let derive_unrelated =
-            CollectionDerive::new(source.handle(), target.handle(), data(10), data(11));
+        // A derive names only its target: the target's descriptor already
+        // says what it derives from.
+        let derive_request = WantRequest::derive(collection_of(&target), data(7));
+        let derive_first = CollectionDerive::new(collection_of(&target), data(7), data(8));
+        let derive_conflict = CollectionDerive::new(collection_of(&target), data(7), data(9));
+        let derive_unrelated = CollectionDerive::new(collection_of(&target), data(10), data(11));
 
         for record in [
             CollectionRecord::Derive(derive_unrelated),
@@ -496,16 +528,16 @@ fn configured_peer_probe_unions_conflicting_receipts_split_across_peers() {
         let mut second_store = store_with_caps(&all_caps);
         let client_store = store_with_caps(&all_caps);
 
-        let descriptor = simplearchive_union::descriptor(id(24));
-        let request = WantRequest::merge(descriptor.handle(), data(1), data(2));
+        let descriptor = named_root("c24");
+        let request = WantRequest::merge(collection_of(&descriptor), data(1), data(2));
         let first = CollectionRecord::Merge(CollectionMerge::new(
-            descriptor.handle(),
+            collection_of(&descriptor),
             data(1),
             data(2),
             data(3),
         ));
         let conflicting = CollectionRecord::Merge(CollectionMerge::new(
-            descriptor.handle(),
+            collection_of(&descriptor),
             data(1),
             data(2),
             data(4),
@@ -575,16 +607,16 @@ fn configured_peer_probe_keeps_partial_evidence_and_recovers_conflict_after_stal
         let mut stalled_store = store_with_caps(&all_caps);
         let client_store = store_with_caps(&all_caps);
 
-        let descriptor = simplearchive_union::descriptor(id(25));
-        let request = WantRequest::merge(descriptor.handle(), data(1), data(2));
+        let descriptor = named_root("c25");
+        let request = WantRequest::merge(collection_of(&descriptor), data(1), data(2));
         let receipt = CollectionRecord::Merge(CollectionMerge::new(
-            descriptor.handle(),
+            collection_of(&descriptor),
             data(1),
             data(2),
             data(3),
         ));
         let conflict = CollectionRecord::Merge(CollectionMerge::new(
-            descriptor.handle(),
+            collection_of(&descriptor),
             data(1),
             data(2),
             data(4),
@@ -677,10 +709,10 @@ fn branch_restricted_capability_receives_no_operation_receipts() {
         let client_store = store_with_caps(&all_caps);
         let control_store = store_with_caps(&all_caps);
 
-        let descriptor = simplearchive_union::descriptor(id(23));
-        let request = WantRequest::merge(descriptor.handle(), data(1), data(2));
+        let descriptor = named_root("c23");
+        let request = WantRequest::merge(collection_of(&descriptor), data(1), data(2));
         let receipt = CollectionRecord::Merge(CollectionMerge::new(
-            descriptor.handle(),
+            collection_of(&descriptor),
             data(1),
             data(2),
             data(3),

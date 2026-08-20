@@ -4,10 +4,13 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
+use triblespace_core::blob::IntoBlob;
+use triblespace_core::collection::descriptor;
+use triblespace_core::collection::records::CollectionName;
 use triblespace_core::collection::{
     discover_collection_records, empty_metadata_handle, resolve_collection_semantics,
     CollectionClaimValidation, CollectionCommit, CollectionData, CollectionDerive,
-    CollectionDescriptor, CollectionHandle, CollectionMerge, CollectionRecord, CollectionStore,
+    CollectionHandle, CollectionMerge, CollectionRecord, CollectionStore,
     CollectionValidationRequest,
 };
 use triblespace_core::id::Id;
@@ -64,11 +67,26 @@ fn build(
         assert!(leaves.is_power_of_two());
     }
 
-    let source = CollectionDescriptor::naming(id(1), id(2), id(3));
-    let target = CollectionDescriptor::naming(id(4), id(5), id(6));
-    let source_collection = source.handle();
-    let target_collection = target.handle();
     let signing_key = SigningKey::from_bytes(&[7; 32]);
+    let team = signing_key.verifying_key();
+    let source = descriptor::naming(
+        &CollectionName::new("source").unwrap(),
+        team,
+        id(2),
+        id(3),
+    )
+    .into_facts();
+    let target = descriptor::naming(
+        &CollectionName::new("target").unwrap(),
+        team,
+        id(5),
+        id(6),
+    )
+    .into_facts();
+    let source_collection: CollectionHandle =
+        IntoBlob::<SimpleArchive>::to_blob(source.clone()).get_handle();
+    let target_collection: CollectionHandle =
+        IntoBlob::<SimpleArchive>::to_blob(target.clone()).get_handle();
     let leaf_data: Vec<_> = (0..leaves)
         .map(|i| data(b"source-leaf-v1", i as u64, &[]))
         .collect();
@@ -149,13 +167,13 @@ fn build(
     let mut store = MemoryRepo::default();
     assert_eq!(
         store
-            .put::<SimpleArchive, _>(CollectionDescriptor::to_blob(&source))
+            .put::<SimpleArchive, _>(IntoBlob::<SimpleArchive>::to_blob(source))
             .unwrap(),
         source_collection
     );
     assert_eq!(
         store
-            .put::<SimpleArchive, _>(CollectionDescriptor::to_blob(&target))
+            .put::<SimpleArchive, _>(IntoBlob::<SimpleArchive>::to_blob(target))
             .unwrap(),
         target_collection
     );

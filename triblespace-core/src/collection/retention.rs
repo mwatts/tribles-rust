@@ -189,8 +189,8 @@ mod tests {
         // over scopes 1 and 2; a derive no longer names its source, so the
         // lineage is stated here the way a descriptor would state it.
         std::collections::BTreeMap::from([(
-            simplearchive_union::descriptor(id(2)).handle(),
-            simplearchive_union::descriptor(id(1)).handle(),
+            identity_for_tests(&test_root("target")),
+            identity_for_tests(&test_root("source")),
         )])
     }
     use super::*;
@@ -202,20 +202,29 @@ mod tests {
 
     use crate::blob::encodings::longstring::LongString;
     use crate::blob::{Blob, IntoBlob, MemoryBlobStore};
+    use crate::collection::descriptor::identity_for_tests;
     use crate::collection::simplearchive_union::{self, SimpleArchiveUnionValidationError};
     use crate::collection::{
         discover_collection_records, resolve_collection_semantics, CollectionClaimValidation,
-        CollectionCommit, CollectionDerive, CollectionDescriptor, CollectionHandle, CollectionMerge,
+        CollectionCommit, CollectionDerive, CollectionHandle, CollectionMerge,
         CollectionRecord, CollectionStore, CollectionValidationRequest,
     };
     use crate::inline::encodings::hash::{Blake3, Hash};
     use crate::macros::entity;
     use crate::metadata;
     use crate::repo::{memoryrepo::MemoryRepo, BlobStore, BlobStoreGet, BlobStoreKeep};
-    use crate::trible::{Trible, TribleSet, TRIBLE_LEN};
+    use crate::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
     fn id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
+    }
+
+    /// One named root under a fixed team of one.
+    fn test_root(name: &str) -> Fragment {
+        simplearchive_union::descriptor(
+            &crate::collection::records::CollectionName::new(name).unwrap(),
+            SigningKey::from_bytes(&[1; 32]).verifying_key(),
+        )
     }
 
     fn row(entity: u8, attribute: u8, value: u8) -> [u8; TRIBLE_LEN] {
@@ -247,11 +256,15 @@ mod tests {
     fn load_descriptor<R: BlobStoreGet>(
         reader: &R,
         collection: CollectionHandle,
-    ) -> Option<CollectionDescriptor> {
+    ) -> Option<Fragment> {
         let blob: Blob<SimpleArchive> = reader.get(collection).ok()?;
         let blob = Blob::<SimpleArchive>::new(blob.bytes.clone());
         (blob.get_handle() == collection)
-            .then(|| CollectionDescriptor::decode(&blob).ok())
+            .then(|| {
+                <TribleSet as crate::blob::TryFromBlob<SimpleArchive>>::try_from_blob(blob)
+                    .ok()
+                    .map(Fragment::from)
+            })
             .flatten()
     }
 
@@ -312,18 +325,20 @@ mod tests {
 
     fn insert_record_fixture(
         store: &mut MemoryRepo,
-        descriptor: &CollectionDescriptor,
+        descriptor: &Fragment,
         data: Blob<SimpleArchive>,
         metadata: Blob<SimpleArchive>,
         key: &SigningKey,
     ) -> CollectionCommit {
         let commit = CollectionCommit::sign(
             key,
-            descriptor.handle(),
+            identity_for_tests(descriptor),
             self::data(&data),
             metadata.get_handle(),
         );
-        store.blobs.insert(descriptor.to_blob());
+        store
+            .blobs
+            .insert(IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()));
         store.blobs.insert(data);
         store.blobs.insert(metadata);
         CollectionStore::insert(store, CollectionRecord::Commit(commit)).unwrap();
@@ -332,7 +347,7 @@ mod tests {
 
     #[test]
     fn authorized_commits_are_exact_strong_roots_and_keep_attachments() {
-        let descriptor = simplearchive_union::descriptor(id(1));
+        let descriptor = test_root("source");
         let key = SigningKey::from_bytes(&[7; 32]);
         let content_text: Blob<LongString> = "retained content".to_owned().to_blob();
         let content_text_handle = content_text.get_handle();
@@ -369,7 +384,7 @@ mod tests {
         assert_eq!(
             recursive,
             BTreeSet::from([
-                descriptor.handle().transmute(),
+                identity_for_tests(&descriptor).transmute(),
                 content_handle.transmute(),
                 metadata_handle.transmute(),
             ])
@@ -380,10 +395,13 @@ mod tests {
         let retained_records = discover_collection_records(&mut store).unwrap();
         assert_eq!(retained_records.commits(), &[commit]);
         let reader = store.reader().unwrap();
-        let retained_descriptor: Blob<SimpleArchive> = reader.get(descriptor.handle()).unwrap();
+        let retained_descriptor: Blob<SimpleArchive> = reader.get(identity_for_tests(&descriptor)).unwrap();
         assert_eq!(
-            CollectionDescriptor::decode(&retained_descriptor).unwrap(),
-            descriptor
+            <TribleSet as crate::blob::TryFromBlob<SimpleArchive>>::try_from_blob(
+                retained_descriptor
+            )
+            .unwrap(),
+            *descriptor.facts()
         );
         assert!(reader
             .get::<Blob<SimpleArchive>, _>(Handle::from_hash(commit.data()))
@@ -402,8 +420,8 @@ mod tests {
 
     #[test]
     fn unsigned_equations_add_no_strong_roots_when_grounded_or_ungrounded() {
-        let source = simplearchive_union::descriptor(id(1));
-        let target = simplearchive_union::descriptor(id(2));
+        let source = test_root("source");
+        let target = test_root("target");
         let key = SigningKey::from_bytes(&[7; 32]);
         let left = archive([row(1, 1, 1)]);
         let right = archive([row(2, 1, 2)]);
@@ -424,18 +442,18 @@ mod tests {
             empty_metadata.clone(),
             &key,
         );
-        store.blobs.insert(CollectionDescriptor::to_blob(&target));
+        store.blobs.insert(IntoBlob::<SimpleArchive>::to_blob(target.facts().clone()));
 
         let active_merge_result = simplearchive_union::join(&left, &right).unwrap();
         let active_merge = CollectionMerge::new(
-            source.handle(),
+            identity_for_tests(&source),
             data(&left),
             data(&right),
             data(&active_merge_result),
         );
         let active_derive_output = archive([row(3, 1, 3)]);
         let active_derive = CollectionDerive::new(
-            target.handle(),
+            identity_for_tests(&target),
             data(&active_merge_result),
             data(&active_derive_output),
         );
@@ -444,14 +462,14 @@ mod tests {
         let orphan_right = archive([row(5, 1, 5)]);
         let orphan_merge_result = simplearchive_union::join(&orphan_left, &orphan_right).unwrap();
         let orphan_merge = CollectionMerge::new(
-            source.handle(),
+            identity_for_tests(&source),
             data(&orphan_left),
             data(&orphan_right),
             data(&orphan_merge_result),
         );
         let orphan_derive_output = archive([row(6, 1, 6)]);
         let orphan_derive = CollectionDerive::new(
-            target.handle(),
+            identity_for_tests(&target),
             data(&orphan_merge_result),
             data(&orphan_derive_output),
         );
@@ -506,7 +524,7 @@ mod tests {
         assert_eq!(
             recursive,
             BTreeSet::from([
-                source.handle().transmute(),
+                identity_for_tests(&source).transmute(),
                 left.get_handle().transmute(),
                 right.get_handle().transmute(),
                 empty_metadata.get_handle().transmute(),
@@ -528,13 +546,13 @@ mod tests {
 
     #[test]
     fn missing_required_commit_ground_truth_is_rejected() {
-        let descriptor = simplearchive_union::descriptor(id(1));
+        let descriptor = test_root("source");
         let key = SigningKey::from_bytes(&[7; 32]);
         let content = archive([row(1, 1, 1)]);
         let metadata = archive([row(2, 1, 2)]);
         let commit = CollectionCommit::sign(
             &key,
-            descriptor.handle(),
+            identity_for_tests(&descriptor),
             data(&content),
             metadata.get_handle(),
         );
@@ -543,7 +561,7 @@ mod tests {
         CollectionStore::insert(&mut complete, CollectionRecord::Commit(commit)).unwrap();
         complete
             .blobs
-            .insert(CollectionDescriptor::to_blob(&descriptor));
+            .insert(IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()));
         complete.blobs.insert(content.clone());
         complete.blobs.insert(metadata.clone());
         let records = discover_collection_records(&mut complete).unwrap();
@@ -562,11 +580,11 @@ mod tests {
         assert!(matches!(
             plan_collection_retention(&records, &resolution, &reader),
             Err(CollectionRetentionError::MissingDescriptor { collection })
-                if collection == descriptor.handle()
+                if collection == identity_for_tests(&descriptor)
         ));
 
         let mut missing_data = MemoryBlobStore::new();
-        missing_data.insert(CollectionDescriptor::to_blob(&descriptor));
+        missing_data.insert(IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()));
         missing_data.insert(metadata.clone());
         let reader = missing_data.reader().unwrap();
         assert!(matches!(
@@ -576,7 +594,7 @@ mod tests {
         ));
 
         let mut missing_metadata = MemoryBlobStore::new();
-        missing_metadata.insert(CollectionDescriptor::to_blob(&descriptor));
+        missing_metadata.insert(IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()));
         missing_metadata.insert(content);
         let reader = missing_metadata.reader().unwrap();
         assert!(matches!(

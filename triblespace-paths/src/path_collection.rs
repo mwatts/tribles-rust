@@ -5,14 +5,18 @@ use std::fmt;
 use std::sync::Arc;
 
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace_core::blob::IntoBlob;
 use triblespace_core::collection::exact_derived::{
     ExactAlgebraError, ExactCover, ExactDerivedAlgebra, ExactDerivedCollection,
     ExactDerivedCollectionError,
 };
+use triblespace_core::collection::records::CollectionName;
 use triblespace_core::collection::simplearchive_union;
-use triblespace_core::collection::{CollectionCommit, CollectionDescriptor, CollectionStore};
-use triblespace_core::id::Id;
+use triblespace_core::collection::{
+    CollectionCommit, CollectionHandle, CollectionStore, VerifyingKey,
+};
 use triblespace_core::repo::{BlobStore, BlobStoreMeta};
+use triblespace_core::trible::Fragment;
 
 use crate::path_summary_union;
 use crate::{Automaton, PathError, PathIndex, PathSummaryBlob, PathSummaryBlobError};
@@ -62,19 +66,30 @@ impl From<ExactDerivedCollectionError> for PathSummaryCollectionError {
 /// Canonical regular-path projection of one source `SimpleArchive` collection.
 #[derive(Clone, Debug)]
 pub struct PathSummaryCollection {
-    scope: Id,
+    name: CollectionName,
+    team: VerifyingKey,
     automaton: Automaton,
 }
 
 impl PathSummaryCollection {
-    /// Construct the canonical path projection for `scope` and `automaton`.
-    pub fn new(scope: Id, automaton: Automaton) -> Self {
-        Self { scope, automaton }
+    /// Construct the canonical path projection for one named root and
+    /// `automaton`.
+    pub fn new(name: CollectionName, team: VerifyingKey, automaton: Automaton) -> Self {
+        Self {
+            name,
+            team,
+            automaton,
+        }
     }
 
-    /// Dataset scope shared with the source collection.
-    pub fn scope(&self) -> Id {
-        self.scope
+    /// Name of the root collection this projection is taken over.
+    pub fn name(&self) -> &CollectionName {
+        &self.name
+    }
+
+    /// Team owning the root collection this projection is taken over.
+    pub fn team(&self) -> VerifyingKey {
+        self.team
     }
 
     /// Fixed automaton whose fingerprint participates in collection identity.
@@ -82,14 +97,24 @@ impl PathSummaryCollection {
         &self.automaton
     }
 
-    /// Canonical source `SimpleArchive` collection descriptor.
-    pub fn source_descriptor(&self) -> CollectionDescriptor {
-        simplearchive_union::descriptor(self.scope)
+    /// Canonical source `SimpleArchive` collection descriptor facts.
+    pub fn source_descriptor(&self) -> Fragment {
+        simplearchive_union::descriptor(&self.name, self.team)
+    }
+
+    /// Identity of the source collection this projection reads.
+    pub fn source_collection(&self) -> CollectionHandle {
+        IntoBlob::<SimpleArchive>::to_blob(self.source_descriptor().into_facts()).get_handle()
     }
 
     /// Canonical target path-summary collection descriptor.
-    pub fn descriptor(&self) -> CollectionDescriptor {
-        path_summary_union::descriptor(self.source_descriptor().handle(), &self.automaton)
+    pub fn descriptor(&self) -> Fragment {
+        path_summary_union::descriptor(self.source_collection(), &self.automaton)
+    }
+
+    /// Identity of the path summary this projection maintains.
+    pub fn collection(&self) -> CollectionHandle {
+        IntoBlob::<SimpleArchive>::to_blob(self.descriptor().into_facts()).get_handle()
     }
 
     /// Attach the exact endpoint relation already resident for `ticket`.
@@ -146,7 +171,7 @@ impl PathSummaryCollection {
 impl ExactDerivedAlgebra<SimpleArchive, PathSummaryBlob> for PathSummaryCollection {
     fn validate_source(
         &self,
-        descriptor: &CollectionDescriptor,
+        descriptor: &Fragment,
         source: &triblespace_core::blob::Blob<SimpleArchive>,
     ) -> Result<(), ExactAlgebraError> {
         if *descriptor != self.source_descriptor() {
@@ -160,7 +185,7 @@ impl ExactDerivedAlgebra<SimpleArchive, PathSummaryBlob> for PathSummaryCollecti
 
     fn validate_target(
         &self,
-        descriptor: &CollectionDescriptor,
+        descriptor: &Fragment,
         target: &triblespace_core::blob::Blob<PathSummaryBlob>,
     ) -> Result<(), ExactAlgebraError> {
         if *descriptor != self.descriptor() {
@@ -270,8 +295,23 @@ mod tests {
         }
     }
 
-    fn id(byte: u8) -> Id {
-        Id::new([byte; 16]).unwrap()
+    fn id(byte: u8) -> triblespace_core::id::Id {
+        triblespace_core::id::Id::new([byte; 16]).unwrap()
+    }
+
+    /// The one team every collection in these tests belongs to.
+    fn test_team() -> VerifyingKey {
+        SigningKey::from_bytes(&[1; 32]).verifying_key()
+    }
+
+    fn test_name(name: &str) -> CollectionName {
+        CollectionName::new(name).unwrap()
+    }
+
+    /// These tests only need an identity to file records under; the
+    /// descriptor itself is never stored.
+    fn collection_of(descriptor: &Fragment) -> CollectionHandle {
+        IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()).get_handle()
     }
 
     fn plus() -> Automaton {
@@ -300,7 +340,7 @@ mod tests {
 
     fn signed_commit(
         store: &mut CollectionOnly,
-        scope: Id,
+        name: &CollectionName,
         key: u8,
         data: &Blob<SimpleArchive>,
     ) -> CollectionCommit {
@@ -309,7 +349,7 @@ mod tests {
             .unwrap();
         CollectionCommit::sign(
             &SigningKey::from_bytes(&[key; 32]),
-            simplearchive_union::descriptor(scope).handle(),
+            collection_of(&simplearchive_union::descriptor(name, test_team())),
             Handle::<SimpleArchive>::to_hash(data.get_handle()),
             metadata,
         )
@@ -344,7 +384,7 @@ mod tests {
         }
 
         let automaton = Automaton::new(u32::MAX, [0], [0], []).unwrap();
-        let paths = PathSummaryCollection::new(id(9), automaton.clone());
+        let paths = PathSummaryCollection::new(test_name("c9"), test_team(), automaton.clone());
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&crate::automaton_fingerprint(&automaton).raw);
         bytes.extend_from_slice(&automaton.state_count().to_le_bytes());
@@ -362,7 +402,7 @@ mod tests {
     #[test]
     fn empty_ticket_is_local_bottom_and_writes_nothing() {
         let mut store = CollectionOnly::default();
-        let paths = PathSummaryCollection::new(id(9), plus());
+        let paths = PathSummaryCollection::new(test_name("c9"), test_team(), plus());
         let blobs = store.0.blobs.len();
         let record_count = records(&mut store).len();
         let index = paths.ensure_exact(&mut store, &[]).unwrap();
@@ -373,13 +413,13 @@ mod tests {
 
     #[test]
     fn missing_then_ensure_closes_cross_fragment_path() {
-        let scope = id(9);
-        let paths = PathSummaryCollection::new(scope, plus());
+        let name = test_name("c9");
+        let paths = PathSummaryCollection::new(name.clone(), test_team(), plus());
         let mut store = CollectionOnly::default();
         let left = put_data(&mut store, &edge(1, 2));
         let right = put_data(&mut store, &edge(2, 3));
-        let first = signed_commit(&mut store, scope, 1, &left);
-        let second = signed_commit(&mut store, scope, 2, &right);
+        let first = signed_commit(&mut store, &name, 1, &left);
+        let second = signed_commit(&mut store, &name, 2, &right);
         publish(&mut store, first);
         publish(&mut store, second);
         assert!(matches!(
@@ -395,19 +435,19 @@ mod tests {
 
     #[test]
     fn old_ticket_ignores_later_commit_and_its_cache_equation() {
-        let scope = id(9);
-        let paths = PathSummaryCollection::new(scope, plus());
+        let name = test_name("c9");
+        let paths = PathSummaryCollection::new(name.clone(), test_team(), plus());
         let mut store = CollectionOnly::default();
         let left = put_data(&mut store, &edge(1, 2));
         let right = put_data(&mut store, &edge(2, 3));
-        let first = signed_commit(&mut store, scope, 1, &left);
-        let second = signed_commit(&mut store, scope, 2, &right);
+        let first = signed_commit(&mut store, &name, 1, &left);
+        let second = signed_commit(&mut store, &name, 2, &right);
         publish(&mut store, first);
         publish(&mut store, second);
         paths.ensure_exact(&mut store, &[first, second]).unwrap();
 
         let later = put_data(&mut store, &edge(3, 4));
-        let third = signed_commit(&mut store, scope, 3, &later);
+        let third = signed_commit(&mut store, &name, 3, &later);
         publish(&mut store, third);
         let later_summary = path_summary_union::derive_element(&later, paths.automaton()).unwrap();
         store
@@ -415,7 +455,7 @@ mod tests {
             .unwrap();
         store
             .insert(CollectionRecord::Derive(CollectionDerive::new(
-                paths.descriptor().handle(),
+                paths.collection(),
                 third.data(),
                 Handle::<PathSummaryBlob>::to_hash(later_summary.get_handle()),
             )))
@@ -427,12 +467,12 @@ mod tests {
 
     #[test]
     fn duplicate_data_provenance_shares_one_derive() {
-        let scope = id(9);
-        let paths = PathSummaryCollection::new(scope, plus());
+        let name = test_name("c9");
+        let paths = PathSummaryCollection::new(name.clone(), test_team(), plus());
         let mut store = CollectionOnly::default();
         let data = put_data(&mut store, &edge(1, 2));
-        let first = signed_commit(&mut store, scope, 1, &data);
-        let second = signed_commit(&mut store, scope, 2, &data);
+        let first = signed_commit(&mut store, &name, 1, &data);
+        let second = signed_commit(&mut store, &name, 2, &data);
         publish(&mut store, first);
         publish(&mut store, second);
         paths
@@ -442,7 +482,7 @@ mod tests {
             .into_iter()
             .filter(|record| {
                 matches!(record, CollectionRecord::Derive(claim)
-                if claim.target() == paths.descriptor().handle())
+                if claim.target() == paths.collection())
             })
             .count();
         assert_eq!(derives, 1);
@@ -451,16 +491,16 @@ mod tests {
 
     #[test]
     fn derive_before_commit_is_inert_then_becomes_live() {
-        let scope = id(9);
-        let paths = PathSummaryCollection::new(scope, plus());
+        let name = test_name("c9");
+        let paths = PathSummaryCollection::new(name.clone(), test_team(), plus());
         let mut store = CollectionOnly::default();
         let source = put_data(&mut store, &edge(1, 2));
-        let commit = signed_commit(&mut store, scope, 7, &source);
+        let commit = signed_commit(&mut store, &name, 7, &source);
         let output = path_summary_union::derive_element(&source, paths.automaton()).unwrap();
         store.put::<PathSummaryBlob, _>(output.clone()).unwrap();
         store
             .insert(CollectionRecord::Derive(CollectionDerive::new(
-                paths.descriptor().handle(),
+                paths.collection(),
                 commit.data(),
                 Handle::<PathSummaryBlob>::to_hash(output.get_handle()),
             )))
@@ -478,13 +518,13 @@ mod tests {
 
     #[test]
     fn resident_source_merge_is_lowered_once() {
-        let scope = id(9);
-        let paths = PathSummaryCollection::new(scope, plus());
+        let name = test_name("c9");
+        let paths = PathSummaryCollection::new(name.clone(), test_team(), plus());
         let mut store = CollectionOnly::default();
         let left = put_data(&mut store, &edge(1, 2));
         let right = put_data(&mut store, &edge(2, 3));
-        let first = signed_commit(&mut store, scope, 1, &left);
-        let second = signed_commit(&mut store, scope, 2, &right);
+        let first = signed_commit(&mut store, &name, 1, &left);
+        let second = signed_commit(&mut store, &name, 2, &right);
         publish(&mut store, first);
         publish(&mut store, second);
         let joined = simplearchive_union::join(&left, &right).unwrap();
@@ -492,7 +532,7 @@ mod tests {
         let joined_data = Handle::<SimpleArchive>::to_hash(joined.get_handle());
         store
             .insert(CollectionRecord::Merge(CollectionMerge::new(
-                paths.source_descriptor().handle(),
+                paths.source_collection(),
                 first.data(),
                 second.data(),
                 joined_data,
@@ -503,7 +543,7 @@ mod tests {
             .into_iter()
             .filter_map(|record| match record {
                 CollectionRecord::Derive(claim)
-                    if claim.target() == paths.descriptor().handle() =>
+                    if claim.target() == paths.collection() =>
                 {
                     Some(claim.mapping().0)
                 }
@@ -515,13 +555,13 @@ mod tests {
 
     #[test]
     fn source_cover_can_overlap_an_already_supported_root() {
-        let scope = id(9);
-        let paths = PathSummaryCollection::new(scope, plus());
+        let name = test_name("c9");
+        let paths = PathSummaryCollection::new(name.clone(), test_team(), plus());
         let mut store = CollectionOnly::default();
         let left = put_data(&mut store, &edge(1, 2));
         let right = put_data(&mut store, &edge(2, 3));
-        let first = signed_commit(&mut store, scope, 1, &left);
-        let second = signed_commit(&mut store, scope, 2, &right);
+        let first = signed_commit(&mut store, &name, 1, &left);
+        let second = signed_commit(&mut store, &name, 2, &right);
         publish(&mut store, first);
         publish(&mut store, second);
         let joined = simplearchive_union::join(&left, &right).unwrap();
@@ -529,7 +569,7 @@ mod tests {
         let joined_data = Handle::<SimpleArchive>::to_hash(joined.get_handle());
         store
             .insert(CollectionRecord::Merge(CollectionMerge::new(
-                paths.source_descriptor().handle(),
+                paths.source_collection(),
                 first.data(),
                 second.data(),
                 joined_data,
@@ -542,7 +582,7 @@ mod tests {
             .unwrap();
         store
             .insert(CollectionRecord::Derive(CollectionDerive::new(
-                paths.descriptor().handle(),
+                paths.collection(),
                 first.data(),
                 Handle::<PathSummaryBlob>::to_hash(left_summary.get_handle()),
             )))
@@ -553,7 +593,7 @@ mod tests {
             .into_iter()
             .filter_map(|record| match record {
                 CollectionRecord::Derive(claim)
-                    if claim.target() == paths.descriptor().handle() =>
+                    if claim.target() == paths.collection() =>
                 {
                     Some(claim.mapping().0)
                 }
@@ -570,13 +610,13 @@ mod tests {
 
     #[test]
     fn existing_target_merge_is_the_single_physical_member() {
-        let scope = id(9);
-        let paths = PathSummaryCollection::new(scope, plus());
+        let name = test_name("c9");
+        let paths = PathSummaryCollection::new(name.clone(), test_team(), plus());
         let mut store = CollectionOnly::default();
         let left = put_data(&mut store, &edge(1, 2));
         let right = put_data(&mut store, &edge(2, 3));
-        let first = signed_commit(&mut store, scope, 1, &left);
-        let second = signed_commit(&mut store, scope, 2, &right);
+        let first = signed_commit(&mut store, &name, 1, &left);
+        let second = signed_commit(&mut store, &name, 2, &right);
         publish(&mut store, first);
         publish(&mut store, second);
         let left_summary = path_summary_union::derive_element(&left, paths.automaton()).unwrap();
@@ -585,7 +625,7 @@ mod tests {
             store.put::<PathSummaryBlob, _>(output.clone()).unwrap();
             store
                 .insert(CollectionRecord::Derive(CollectionDerive::new(
-                    paths.descriptor().handle(),
+                    paths.collection(),
                     Handle::<SimpleArchive>::to_hash(input.get_handle()),
                     Handle::<PathSummaryBlob>::to_hash(output.get_handle()),
                 )))
@@ -597,7 +637,7 @@ mod tests {
         let joined_data = Handle::<PathSummaryBlob>::to_hash(joined.get_handle());
         store
             .insert(CollectionRecord::Merge(CollectionMerge::new(
-                paths.descriptor().handle(),
+                paths.collection(),
                 Handle::<PathSummaryBlob>::to_hash(left_summary.get_handle()),
                 Handle::<PathSummaryBlob>::to_hash(right_summary.get_handle()),
                 joined_data,
@@ -614,8 +654,8 @@ mod tests {
 
     #[test]
     fn absent_source_bytes_report_the_commit() {
-        let scope = id(9);
-        let paths = PathSummaryCollection::new(scope, plus());
+        let name = test_name("c9");
+        let paths = PathSummaryCollection::new(name.clone(), test_team(), plus());
         let mut store = CollectionOnly::default();
         let absent = edge(1, 2).to_blob();
         let metadata = store
@@ -623,7 +663,7 @@ mod tests {
             .unwrap();
         let commit = CollectionCommit::sign(
             &SigningKey::from_bytes(&[5; 32]),
-            paths.source_descriptor().handle(),
+            paths.source_collection(),
             Handle::<SimpleArchive>::to_hash(absent.get_handle()),
             metadata,
         );

@@ -670,14 +670,14 @@ struct BuildShape {
     raw_bytes: usize,
 }
 
-fn benchmark_scope() -> Id {
-    // An intrinsic benchmark scope: fixed by this description so every
-    // iteration exercises byte-identical collection descriptors and records.
-    entity! {
-        metadata::name: "portable native exact-Succinct benchmark",
-    }
-    .root()
-    .expect("intrinsic benchmark description exports one root")
+fn benchmark_name() -> CollectionName {
+    CollectionName::new("portable-succinct-benchmark").expect("legal collection name")
+}
+
+/// The benchmark's team, a team of one: the same key that signs its commits.
+/// Fixed so every iteration exercises byte-identical descriptors and records.
+fn benchmark_team() -> VerifyingKey {
+    SigningKey::from_bytes(&[0x5A; 32]).verifying_key()
 }
 
 fn main() {
@@ -743,8 +743,9 @@ fn main() {
     // in a fresh scratch store (untimed), then time one fixed end-to-end call
     // that returns a query-ready exact cover. Source signing/publication is an
     // authority setup cost, not part of Succinct construction.
-    let scope = benchmark_scope();
-    let succinct = SuccinctArchiveCollection::new(scope);
+    let name = benchmark_name();
+    let team = benchmark_team();
+    let succinct = SuccinctArchiveCollection::new(name.clone(), team);
     let signing_key = SigningKey::from_bytes(&[0x5A; 32]);
     let mut all: Vec<(String, Outcome)> = Vec::new();
     let built = quiet_catch(|| {
@@ -753,7 +754,8 @@ fn main() {
         let mut ident: Option<BuildShape> = None;
         for i in 0..(build_warmup + build_iters) {
             let recording = i >= build_warmup;
-            let mut source = Collection::new(MemoryRepo::default(), scope, signing_key.clone());
+            let mut source =
+                Collection::new(MemoryRepo::default(), &name, team, signing_key.clone());
             for chunk in &chunks {
                 source
                     .commit(Fragment::from(chunk.content.clone()))

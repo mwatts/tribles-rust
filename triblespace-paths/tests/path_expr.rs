@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use ed25519_dalek::SigningKey;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::IntoBlob;
+use triblespace_core::collection::records::CollectionName;
 use triblespace_core::collection::{
     simplearchive_union, CollectionCommit, CollectionRecord, CollectionStore,
 };
@@ -89,8 +90,10 @@ fn canonical_expression_construction_stabilizes_automaton_fingerprints() {
 #[test]
 fn compiled_expression_roundtrips_through_native_collection_and_query_constraint() {
     let expression = PathExpr::from(Step::Forward(metadata::tag.id().into())).plus();
-    let scope = id(9);
-    let paths = PathSummaryCollection::new(scope, expression.compile());
+    let signing_key = SigningKey::from_bytes(&[17; 32]);
+    let team = signing_key.verifying_key();
+    let name = CollectionName::new("graph").unwrap();
+    let paths = PathSummaryCollection::new(name.clone(), team, expression.compile());
     let mut store = MemoryRepo::default();
     let mut graph = tagged_edge(1, 2);
     graph += tagged_edge(2, 3);
@@ -98,9 +101,14 @@ fn compiled_expression_roundtrips_through_native_collection_and_query_constraint
     let metadata = store
         .put::<SimpleArchive, _>(TribleSet::new().to_blob())
         .unwrap();
+    let source = store
+        .put::<SimpleArchive, _>(
+            simplearchive_union::descriptor(&name, team).into_facts().to_blob(),
+        )
+        .unwrap();
     let commit = CollectionCommit::sign(
-        &SigningKey::from_bytes(&[17; 32]),
-        simplearchive_union::descriptor(scope).handle(),
+        &signing_key,
+        source,
         Handle::<SimpleArchive>::to_hash(data),
         metadata,
     );

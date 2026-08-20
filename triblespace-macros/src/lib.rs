@@ -1,7 +1,7 @@
 //! Instrumented procedural-macro wrappers for TribleSpace.
 //!
 //! Compile-time metadata emission is optional. It is enabled when
-//! `TRIBLESPACE_METADATA_PILE`, `TRIBLESPACE_METADATA_COLLECTION_SCOPE`, and
+//! `TRIBLESPACE_METADATA_PILE`, `TRIBLESPACE_METADATA_COLLECTION_NAME`, and
 //! `TRIBLESPACE_METADATA_SIGNING_KEY` are all set to valid values. Each macro
 //! invocation is accumulated as one self-contained [`Fragment`] and published
 //! as one signed collection commit; partial configuration is inert.
@@ -14,9 +14,10 @@ use quote::{quote, ToTokens};
 
 use std::path::Path;
 
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use hex::FromHex;
 
+use triblespace_core::collection::records::CollectionName;
 use triblespace_core::collection::Collection;
 use triblespace_core::id::fucid;
 use triblespace_core::id::Id;
@@ -88,13 +89,14 @@ fn metadata_signing_key() -> Option<SigningKey> {
     Some(SigningKey::from_bytes(&bytes))
 }
 
-fn parse_collection_scope(value: &str) -> Option<Id> {
-    Id::from_hex(value)
+fn parse_collection_name(value: &str) -> Option<CollectionName> {
+    CollectionName::new(value).ok()
 }
 
 fn publish_metadata(
     pile_path: &Path,
-    collection_scope: Id,
+    collection_name: &CollectionName,
+    collection_team: VerifyingKey,
     signing_key: SigningKey,
     fragment: Fragment,
 ) {
@@ -102,7 +104,7 @@ fn publish_metadata(
         Ok(pile) => pile,
         Err(_) => return,
     };
-    let mut collection = Collection::new(pile, collection_scope, signing_key);
+    let mut collection = Collection::new(pile, collection_name, collection_team, signing_key);
     let _ = collection.commit(fragment);
     let _ = collection.close();
 }
@@ -136,13 +138,13 @@ where
         _ => return,
     };
 
-    let scope_value = match std::env::var("TRIBLESPACE_METADATA_COLLECTION_SCOPE") {
-        Ok(scope) if !scope.trim().is_empty() => scope,
+    let name_value = match std::env::var("TRIBLESPACE_METADATA_COLLECTION_NAME") {
+        Ok(name) if !name.trim().is_empty() => name,
         _ => return,
     };
 
-    let collection_scope = match parse_collection_scope(&scope_value) {
-        Some(scope) => scope,
+    let collection_name = match parse_collection_name(&name_value) {
+        Some(name) => name,
         None => return,
     };
 
@@ -150,6 +152,10 @@ where
         Some(key) => key,
         None => return,
     };
+
+    // The instrumentation pile is written by exactly one key, so its team is
+    // that key: a team of one, said explicitly rather than defaulted to.
+    let collection_team = signing_key.verifying_key();
 
     let span = invocation_span(input);
     let mut fragment = Fragment::empty();
@@ -194,7 +200,8 @@ where
     // no mutable branch head, parent selection, push, or retry protocol here.
     publish_metadata(
         Path::new(&pile_path),
-        collection_scope,
+        &collection_name,
+        collection_team,
         signing_key,
         context.fragment,
     );
@@ -509,30 +516,24 @@ mod instrumentation_tests {
     use triblespace_core::blob::encodings::longstring::LongString;
     use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace_core::blob::Blob;
-    use triblespace_core::collection::{
-        self, CollectionDescriptor, CollectionRecord, CollectionStore,
-    };
+    use triblespace_core::collection::{self, CollectionRecord, CollectionStore};
+    use triblespace_core::trible::TribleSet;
     use triblespace_core::inline::encodings::hash::Handle;
     use triblespace_core::repo::{BlobStore, BlobStoreGet, StorageClose};
 
-    fn id(byte: u8) -> Id {
-        Id::new([byte; 16]).unwrap()
-    }
-
     #[test]
-    fn collection_scope_uses_exact_non_nil_hex_ids() {
-        let encoded = "01010101010101010101010101010101";
-        assert_eq!(parse_collection_scope(encoded), Some(id(1)));
-        assert_eq!(parse_collection_scope(&encoded.to_lowercase()), Some(id(1)));
+    fn collection_name_accepts_only_legal_names() {
         assert_eq!(
-            parse_collection_scope("00000000000000000000000000000000"),
-            None
+            parse_collection_name("macro-metadata")
+                .as_ref()
+                .map(CollectionName::as_str),
+            Some("macro-metadata")
         );
-        assert_eq!(
-            parse_collection_scope("0x01010101010101010101010101010101"),
-            None
-        );
-        assert_eq!(parse_collection_scope("01"), None);
+        assert_eq!(parse_collection_name(""), None);
+        assert_eq!(parse_collection_name("Macro-Metadata"), None);
+        assert_eq!(parse_collection_name("macro metadata"), None);
+        assert_eq!(parse_collection_name("-macro"), None);
+        assert_eq!(parse_collection_name("macro-"), None);
     }
 
     #[test]
@@ -601,8 +602,10 @@ mod instrumentation_tests {
             invocation::source_tokens: attachment
         };
 
-        let scope = id(9);
-        publish_metadata(&path, scope, SigningKey::from_bytes(&[7; 32]), fragment);
+        let name = CollectionName::new("macro-metadata").unwrap();
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let team = signing_key.verifying_key();
+        publish_metadata(&path, &name, team, signing_key, fragment);
 
         let mut pile = Pile::open(&path).unwrap();
         let records = CollectionStore::records(&mut pile)
@@ -621,12 +624,16 @@ mod instrumentation_tests {
 
         let reader = pile.reader().unwrap();
         let descriptor_blob: Blob<SimpleArchive> = reader.get(commit.collection()).unwrap();
-        let descriptor = CollectionDescriptor::decode(&descriptor_blob).unwrap();
+        let descriptor =
+            <TribleSet as triblespace_core::blob::TryFromBlob<SimpleArchive>>::try_from_blob(
+                descriptor_blob,
+            )
+            .unwrap();
         assert_eq!(
             descriptor,
-            collection::simplearchive_union::descriptor(scope)
+            collection::simplearchive_union::descriptor(&name, team).into_facts(),
+            "the commit names the descriptor the facade published"
         );
-        assert_eq!(commit.collection(), descriptor.handle());
 
         let _: Blob<LongString> = reader.get(attachment).unwrap();
         StorageClose::close(pile).unwrap();

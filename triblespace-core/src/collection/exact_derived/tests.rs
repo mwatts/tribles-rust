@@ -11,22 +11,38 @@ use crate::blob::{IntoBlob, TryFromBlob};
 use crate::collection::exact_target_compaction::{
     compact_exact_target, ExactTargetCompactionError,
 };
+use crate::collection::descriptor::{self, identity_for_tests};
+use crate::collection::records::CollectionName;
 use crate::collection::simplearchive_union;
 use crate::inline::encodings::hash::Handle;
 use crate::metadata::MetaDescribe;
 use crate::repo::memoryrepo::MemoryRepo;
 use crate::repo::{BlobStoreList, BlobStorePut};
-use crate::trible::{Trible, TribleSet, TRIBLE_LEN};
+use crate::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
 fn id(byte: u8) -> Id {
     Id::new([byte; 16]).unwrap()
 }
 
+/// The one team every collection in these tests belongs to.
+fn test_team() -> ed25519_dalek::VerifyingKey {
+    SigningKey::from_bytes(&[1; 32]).verifying_key()
+}
+
+fn test_name(name: &str) -> CollectionName {
+    CollectionName::new(name).unwrap()
+}
+
+fn source_root() -> Fragment {
+    simplearchive_union::descriptor(&test_name("source"), test_team())
+}
+
 fn kernel() -> ExactDerivedCollection<SimpleArchive, UnknownBlob> {
     ExactDerivedCollection::new(
-        simplearchive_union::descriptor(id(1)),
-        CollectionDescriptor::naming(
-            id(2),
+        source_root(),
+        descriptor::naming(
+            &test_name("target"),
+            test_team(),
             <UnknownBlob as MetaDescribe>::id(),
             simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1,
         ),
@@ -60,7 +76,7 @@ struct TestAlgebra;
 impl ExactDerivedAlgebra<SimpleArchive, UnknownBlob> for TestAlgebra {
     fn validate_source(
         &self,
-        descriptor: &CollectionDescriptor,
+        descriptor: &Fragment,
         source: &Blob<SimpleArchive>,
     ) -> Result<(), ExactAlgebraError> {
         if descriptor != kernel().source_descriptor() {
@@ -74,7 +90,7 @@ impl ExactDerivedAlgebra<SimpleArchive, UnknownBlob> for TestAlgebra {
 
     fn validate_target(
         &self,
-        descriptor: &CollectionDescriptor,
+        descriptor: &Fragment,
         target: &Blob<UnknownBlob>,
     ) -> Result<(), ExactAlgebraError> {
         if descriptor != kernel().target_descriptor() {
@@ -146,7 +162,7 @@ impl SelectiveAlgebra {
 impl ExactDerivedAlgebra<SimpleArchive, UnknownBlob> for SelectiveAlgebra {
     fn validate_source(
         &self,
-        descriptor: &CollectionDescriptor,
+        descriptor: &Fragment,
         source: &Blob<SimpleArchive>,
     ) -> Result<(), ExactAlgebraError> {
         TestAlgebra.validate_source(descriptor, source)
@@ -154,7 +170,7 @@ impl ExactDerivedAlgebra<SimpleArchive, UnknownBlob> for SelectiveAlgebra {
 
     fn validate_target(
         &self,
-        descriptor: &CollectionDescriptor,
+        descriptor: &Fragment,
         target: &Blob<UnknownBlob>,
     ) -> Result<(), ExactAlgebraError> {
         TestAlgebra.validate_target(descriptor, target)
@@ -216,7 +232,7 @@ fn source_commit(store: &mut MemoryRepo, key: u8, blob: &Blob<SimpleArchive>) ->
         .unwrap();
     let commit = CollectionCommit::sign(
         &SigningKey::from_bytes(&[key; 32]),
-        kernel().source_descriptor().handle(),
+        kernel().source_collection(),
         data(blob),
         metadata,
     );
@@ -229,7 +245,7 @@ fn publish_derive(store: &mut MemoryRepo, input: &Blob<SimpleArchive>) -> Blob<U
     store.put::<UnknownBlob, _>(output.clone()).unwrap();
     store
         .insert(CollectionRecord::Derive(CollectionDerive::new(
-            kernel().target_descriptor().handle(),
+            kernel().target_collection(),
             data(input),
             data(&output),
         )))
@@ -246,7 +262,7 @@ fn publish_source_merge(
     store.put::<SimpleArchive, _>(result.clone()).unwrap();
     store
         .insert(CollectionRecord::Merge(CollectionMerge::new(
-            kernel().source_descriptor().handle(),
+            kernel().source_collection(),
             data(low),
             data(high),
             data(&result),
@@ -262,7 +278,7 @@ fn derived_inputs(store: &mut MemoryRepo) -> Vec<CollectionData> {
         .map(Result::unwrap)
         .filter_map(|record| match record {
             CollectionRecord::Derive(claim)
-                if claim.target() == kernel().target_descriptor().handle() =>
+                if claim.target() == kernel().target_collection() =>
             {
                 Some(claim.mapping().0)
             }
@@ -753,7 +769,7 @@ fn target_merge_records(store: &mut MemoryRepo) -> Vec<CollectionMerge> {
         .map(Result::unwrap)
         .filter_map(|record| match record {
             CollectionRecord::Merge(claim)
-                if claim.collection() == kernel().target_descriptor().handle() =>
+                if claim.collection() == kernel().target_collection() =>
             {
                 Some(claim)
             }
@@ -967,13 +983,13 @@ fn compaction_substitutes_new_resident_uppers_through_an_old_nonresident_proof()
         .unwrap();
     for claim in [
         CollectionMerge::new(
-            kernel().target_descriptor().handle(),
+            kernel().target_collection(),
             targets[1].0,
             targets[2].0,
             data(&old_intermediate),
         ),
         CollectionMerge::new(
-            kernel().target_descriptor().handle(),
+            kernel().target_collection(),
             targets[0].0,
             data(&old_intermediate),
             data(&old_upper),
@@ -1078,7 +1094,7 @@ fn compaction_drops_readers_and_puts_all_results_before_the_first_merge() {
         .iter()
         .position(|event| matches!(event, WriteEvent::Insert(CollectionRecord::Merge(_))))
         .expect("colliding cover publishes a MERGE");
-    let descriptor_data = Handle::<SimpleArchive>::to_hash(kernel().target_descriptor().handle());
+    let descriptor_data = Handle::<SimpleArchive>::to_hash(kernel().target_collection());
     assert!(store.events[..first_merge]
         .iter()
         .any(|event| matches!(event, WriteEvent::Put(data) if *data == descriptor_data)));
@@ -1103,7 +1119,7 @@ struct FailingJoinAlgebra;
 impl ExactDerivedAlgebra<SimpleArchive, UnknownBlob> for FailingJoinAlgebra {
     fn validate_source(
         &self,
-        descriptor: &CollectionDescriptor,
+        descriptor: &Fragment,
         source: &Blob<SimpleArchive>,
     ) -> Result<(), ExactAlgebraError> {
         TestAlgebra.validate_source(descriptor, source)
@@ -1111,7 +1127,7 @@ impl ExactDerivedAlgebra<SimpleArchive, UnknownBlob> for FailingJoinAlgebra {
 
     fn validate_target(
         &self,
-        descriptor: &CollectionDescriptor,
+        descriptor: &Fragment,
         target: &Blob<UnknownBlob>,
     ) -> Result<(), ExactAlgebraError> {
         TestAlgebra.validate_target(descriptor, target)
@@ -1388,7 +1404,7 @@ fn missing_derive_output_is_pending_and_ensure_rebuilds() {
     let missing = derive(&source).unwrap();
     store
         .insert(CollectionRecord::Derive(CollectionDerive::new(
-            kernel().target_descriptor().handle(),
+            kernel().target_collection(),
             data(&source),
             data(&missing),
         )))
@@ -1418,7 +1434,7 @@ fn corrupt_unsigned_endpoint_is_rejected_as_optional_evidence() {
     store.put::<UnknownBlob, _>(forged).unwrap();
     store
         .insert(CollectionRecord::Derive(CollectionDerive::new(
-            kernel().target_descriptor().handle(),
+            kernel().target_collection(),
             data(&source),
             data(&expected),
         )))
@@ -1447,7 +1463,7 @@ fn ungrounded_source_superset_cannot_escape_the_ticket() {
     store.put::<SimpleArchive, _>(ac.clone()).unwrap();
     store
         .insert(CollectionRecord::Merge(CollectionMerge::new(
-            kernel().source_descriptor().handle(),
+            kernel().source_collection(),
             data(&a),
             data(&c),
             data(&ac),
@@ -1473,8 +1489,12 @@ fn ungrounded_source_superset_cannot_escape_the_ticket() {
 #[test]
 fn algebra_rejects_a_lying_source_descriptor() {
     let source = archive([(1, 3)]);
-    let lying_source =
-        CollectionDescriptor::naming(id(1), <UnknownBlob as MetaDescribe>::id(), id(99));
+    let lying_source = descriptor::naming(
+        &test_name("source"),
+        test_team(),
+        <UnknownBlob as MetaDescribe>::id(),
+        id(99),
+    );
     let lifecycle = ExactDerivedCollection::<SimpleArchive, UnknownBlob>::new(
         lying_source.clone(),
         kernel().target_descriptor().clone(),
@@ -1486,7 +1506,7 @@ fn algebra_rejects_a_lying_source_descriptor() {
         .unwrap();
     let commit = CollectionCommit::sign(
         &SigningKey::from_bytes(&[7; 32]),
-        lying_source.handle(),
+        identity_for_tests(&lying_source),
         data(&source),
         metadata,
     );
@@ -1502,6 +1522,7 @@ fn algebra_rejects_a_lying_source_descriptor() {
 #[test]
 #[should_panic(expected = "distinct source and target descriptors")]
 fn identity_descriptor_pair_is_rejected() {
-    let descriptor = simplearchive_union::descriptor(id(1));
-    let _ = ExactDerivedCollection::<SimpleArchive, SimpleArchive>::new(descriptor.clone(), descriptor);
+    let descriptor = source_root();
+    let _ =
+        ExactDerivedCollection::<SimpleArchive, SimpleArchive>::new(descriptor.clone(), descriptor);
 }

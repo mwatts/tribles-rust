@@ -21,6 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace_core::collection::records::CollectionName;
 use triblespace_core::collection::{Collection, CollectionStore};
 use triblespace_core::id::Id;
 use triblespace_core::inline::Inline;
@@ -81,10 +82,26 @@ attributes! {
     "72244D02BFC88B514C64E37763AEB310" as pub policy_retraction_observes: GenId;
 }
 
-/// Scope for the node's one private policy collection.
+/// Name of the node's one private policy collection.
+///
+/// This replaced a minted scope id: the collection now says in the pile what
+/// it is, instead of being recognisable only to someone holding this source.
+/// Its team is the node's own key -- a team of one -- which is what a private
+/// per-node collection means.
+pub const POLICY_COLLECTION_NAME: &str = "policy";
+
+/// The policy collection's name, validated.
+pub fn policy_collection_name() -> CollectionName {
+    CollectionName::new(POLICY_COLLECTION_NAME).expect("the policy collection name is legal")
+}
+
+/// A non-nil id used only as a placeholder while deriving an intrinsic entity
+/// id; see [`team_root_placeholder`]. It is the id the policy collection's
+/// scope used to be minted under, kept so the version-DAG ids it feeds do not
+/// move.
 ///
 /// Minted with `trible genid` on 2026-08-12.
-pub const POLICY_COLLECTION_SCOPE: Id =
+const TEAM_ROOT_PLACEHOLDER: Id =
     triblespace_core::id::id_hex!("8067402E88FE8DBBFA559F2212C2353D");
 
 // Entity-kind ids, minted with `trible genid` on 2026-08-12.
@@ -141,8 +158,13 @@ where
     S: BlobStore + CollectionStore,
     S::Reader: BlobStoreMeta,
 {
-    Collection::new(&mut *store, POLICY_COLLECTION_SCOPE, signing_key.clone())
-        .materialize()
+    Collection::new(
+        &mut *store,
+        &policy_collection_name(),
+        signing_key.verifying_key(),
+        signing_key.clone(),
+    )
+    .materialize()
         .map_err(|error| storage_error("materializing policy collection", error))
 }
 
@@ -150,7 +172,12 @@ fn commit<S>(store: &mut S, signing_key: &SigningKey, fragment: Fragment) -> Res
 where
     S: BlobStorePut + CollectionStore + StorageFlush,
 {
-    let mut collection = Collection::new(&mut *store, POLICY_COLLECTION_SCOPE, signing_key.clone());
+    let mut collection = Collection::new(
+        &mut *store,
+        &policy_collection_name(),
+        signing_key.verifying_key(),
+        signing_key.clone(),
+    );
     collection
         .commit(fragment)
         .map_err(|error| storage_error("committing policy collection", error))?;
@@ -1042,7 +1069,7 @@ fn policy_candidate_from_versions(
 // A non-nil temporary id used only while deriving an intrinsic entity id. The
 // `id` field is not emitted by `policy_version_fragment`.
 fn team_root_placeholder() -> Id {
-    POLICY_COLLECTION_SCOPE
+    TEAM_ROOT_PLACEHOLDER
 }
 
 /// Append an issued credential to its `(team, subject, scope)` version DAG.

@@ -3,8 +3,10 @@
 //! [`CollectionCommit`], [`CollectionMerge`], and [`CollectionDerive`] are
 //! native algebra records, not graph data. Their canonical representations are
 //! the fixed-width byte layouts exposed by their `to_bytes`/`from_bytes`
-//! methods. Only [`CollectionDescriptor`] remains a self-describing
-//! [`SimpleArchive`]: its blob handle is the collection identity.
+//! methods. A collection *descriptor* is not a record at all: it is an
+//! ordinary [`TribleSet`] stored as a self-describing [`SimpleArchive`], and
+//! that blob's handle is the collection identity. See
+//! [`descriptor`](crate::collection::descriptor) for reading one.
 //!
 //! Structural decoding and semantic verification are deliberately separate.
 //! Every fixed-width commit or derive payload has a structural representation;
@@ -27,12 +29,11 @@ use crate::id_hex;
 use crate::inline::encodings::ed25519::{ED25519PublicKey, ED25519RComponent, ED25519SComponent};
 use crate::inline::encodings::genid::{GenId, IdParseError};
 use crate::inline::encodings::hash::{Blake3, Handle, Hash};
+use crate::inline::encodings::shortstring::ShortString;
 use crate::inline::{Inline, InlineEncoding};
 use crate::metadata;
-use crate::prelude::{attributes, entity};
-use crate::id::RawId;
-use crate::inline::RawInline;
-use crate::trible::{Fragment, TribleSet, TRIBLE_LEN};
+use crate::prelude::attributes;
+use crate::trible::{TribleSet, TRIBLE_LEN};
 
 /// Tag identifying a canonical collection descriptor.
 ///
@@ -62,8 +63,13 @@ pub const KIND_COLLECTION_DERIVE: Id = id_hex!("46C621338B6DD5B71C8E1E6DD74B087C
 /// Minted with `trible genid` on 2026-08-07, retired 2026-08-20.
 pub const KIND_COLLECTION_DERIVE_V1: Id = id_hex!("6DB0214CB4F3BD8259F0117CDC127331");
 
-/// Byte length of a canonical collection-descriptor `SimpleArchive`.
-pub const COLLECTION_DESCRIPTOR_ARCHIVE_LEN: u64 = (4 * TRIBLE_LEN) as u64;
+/// Byte length of a canonical bare root collection-descriptor `SimpleArchive`.
+///
+/// Five facts: the kind tag, the name and team that anchor the root, and the
+/// representation and recipe it names. A descriptor that embeds its
+/// representation's and recipe's own descriptions, or that carries recipe
+/// arguments, is longer.
+pub const COLLECTION_DESCRIPTOR_ARCHIVE_LEN: u64 = (5 * TRIBLE_LEN) as u64;
 /// Byte length of a dense signed commit.
 pub const COLLECTION_COMMIT_BYTES_LEN: usize = 6 * 32;
 /// Byte length of a dense merge equation.
@@ -78,16 +84,37 @@ pub const COLLECTION_RECORD_ID_VERSION: u32 = 1;
 pub const COLLECTION_RECORD_ID_DOMAIN: &[u8] = b"triblespace.collection.record.id";
 
 attributes! {
-    /// Stable extrinsic anchor of a *root* dataset.
+    /// The name a *root* collection is known by within its team.
     ///
-    /// Only a collection that is not derived from another carries one. A
-    /// derived collection needs no anchor of its own: its source already
-    /// anchors it, and its identity follows from that source together with its
-    /// representation, recipe and arguments. Minting an anchor for a derived
-    /// collection would assert a second, weaker claim about the same lineage.
+    /// Half of a root's anchor; see [`collection_team`] for the other half.
+    /// Together they replaced an opaque minted scope id, which discriminated
+    /// roots correctly but told a reader nothing: every faculty carried its
+    /// scope as a hex constant in its own source, so "which collection is
+    /// this?" was answerable only by someone holding the code.
     ///
-    /// Minted with `trible genid` on 2026-08-07.
-    "D3418873C70392E3ADAA05C00E11A583" unsafe as pub collection_scope: GenId;
+    /// The name is part of the identity, so it does not change. A rename is a
+    /// new collection, reached by deriving from the old one. Mutable labels
+    /// are ordinary facts published *about* a collection and are free to
+    /// disagree; this one is the address.
+    ///
+    /// Minted with `trible genid` on 2026-08-20.
+    "436A04C372CBBFBD9C619CF50F59C4A1" unsafe as pub collection_name: ShortString;
+    /// Root public key of the team a *root* collection belongs to.
+    ///
+    /// The other half of a root's anchor. A team has one immutable root
+    /// keypair, generated at team creation and thereafter archived offline, so
+    /// it is a genesis fact rather than an operational one and can be part of
+    /// an identity without going stale. Membership evolves as capabilities
+    /// delegated beneath it.
+    ///
+    /// Naming it here is what lets a collection authorize itself: a reader
+    /// holding this descriptor and the pile can walk cap chains from this root
+    /// and decide which commits may count, instead of being handed an
+    /// authorized set out of band. A pile with no team uses its own node key,
+    /// which is a team of one.
+    ///
+    /// Minted with `trible genid` on 2026-08-20.
+    "6C1ED6495491E32FEBB9FDD4EE5E8907" unsafe as pub collection_team: ED25519PublicKey;
     /// The collection this one derives from, by descriptor handle.
     ///
     /// This says *what* a derived collection is computed from; which state of
@@ -247,203 +274,106 @@ impl fmt::Display for CommitVerificationError {
 
 impl Error for CommitVerificationError {}
 
-/// Canonical self-describing blob payload for one concrete typed collection.
+
+/// A collection name that is legal as part of an identity.
 ///
-/// `scope` is an extrinsic dataset anchor shared by related
-/// representations. The descriptor entity has an intrinsic root, but the
-/// collection identity carried by claims is the descriptor blob's 32-byte
-/// [`CollectionHandle`]. Constructing a descriptor never manufactures an
-/// [`crate::id::ExclusiveId`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CollectionDescriptor {
-    facts: TribleSet,
+/// Names are compared byte for byte, because that is what hashing a
+/// descriptor does. So `compass`, `Compass` and `compass ` would be three
+/// different collections that a person reads as one. The charset exists to
+/// make that class of accident unrepresentable rather than merely unlikely:
+/// lowercase ASCII letters, digits and `-`, starting with a letter, ending
+/// with a letter or digit, at most 32 bytes.
+///
+/// It rejects rather than normalises. Silently lowercasing what a caller
+/// wrote would mean the stored identity is not the one they typed, and the
+/// whole reason a name replaced an opaque scope id was so that what is stored
+/// can be read back and recognised.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct CollectionName(String);
+
+/// Why a string cannot be a [`CollectionName`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InvalidCollectionName {
+    /// The name was empty.
+    Empty,
+    /// The name exceeded the 32 bytes a `ShortString` holds inline.
+    TooLong {
+        /// Length of the offending name, in bytes.
+        len: usize,
+    },
+    /// The name did not begin with a lowercase ASCII letter.
+    BadStart,
+    /// The name did not end with a lowercase ASCII letter or digit.
+    BadEnd,
+    /// The name contained a byte outside `[a-z0-9-]`.
+    BadByte {
+        /// The offending byte.
+        byte: u8,
+    },
 }
 
-impl CollectionDescriptor {
-    /// Construct a descriptor that carries its representation's and recipe's
-    /// own descriptions.
-    ///
-    /// The descriptor entity still names them by id, so this does not change
-    /// which schema or which law a collection uses. What changes is that their
-    /// descriptions travel inside the descriptor blob, so a reader holding
-    /// that one blob can say what the collection is without resolving anything
-    /// else. That matters for a peer receiving a collection it has never seen:
-    /// a bare id is only recognisable to someone who already holds the code
-    /// that minted it.
-    pub fn new(scope: Id, representation: Fragment, recipe: Fragment) -> Self {
-        let fragment = entity! {
-            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-            collection_scope: scope,
-            collection_representation*: representation,
-            collection_recipe*: recipe,
-        };
-        Self::from_fragment(&fragment)
-    }
-
-    /// Construct a descriptor for a collection derived from another.
-    ///
-    /// A derived collection carries no dataset anchor of its own. Its source
-    /// is what anchors it, so two derivations of the same shape over different
-    /// data are different collections because their sources differ. Naming the
-    /// source by handle rather than by a shared label means the lineage is
-    /// exact and cannot be joined by assertion.
-    pub fn derived(
-        source: CollectionHandle,
-        representation: Fragment,
-        recipe: Fragment,
-    ) -> Self {
-        let fragment = entity! {
-            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-            collection_source: source,
-            collection_representation*: representation,
-            collection_recipe*: recipe,
-        };
-        Self::from_fragment(&fragment)
-    }
-
-    /// The collection this one derives from, if it derives from one.
-    ///
-    /// A root collection has no source and answers `None`; that is not a
-    /// failure, it is what being a root means.
-    pub fn source(&self) -> Option<CollectionHandle> {
-        let attribute = collection_source.id();
-        self.facts
-            .iter()
-            .find(|fact| *fact.a() == attribute)
-            .map(|fact| *fact.v::<Handle<SimpleArchive>>())
-    }
-
-    /// Construct a descriptor that names its representation and recipe without
-    /// describing them.
-    ///
-    /// Prefer [`new`](Self::new), which embeds their descriptions. This exists
-    /// for callers holding only ids: the resulting collection is perfectly
-    /// usable, it just cannot tell a stranger what it means.
-    pub fn naming(scope: Id, representation: Id, recipe: Id) -> Self {
-        Self::new(
-            scope,
-            Fragment::rooted(representation, TribleSet::new()),
-            Fragment::rooted(recipe, TribleSet::new()),
-        )
-    }
-
-    /// Adopt a descriptor authored by [`entity!`](crate::macros::entity).
-    ///
-    /// This is how a parameterised recipe builds its collection: write the
-    /// descriptor as an ordinary intrinsic entity, with the recipe's own
-    /// arguments as further attributes on the same entity, and hand the
-    /// fragment here. Those arguments are covered by the descriptor blob's
-    /// hash and readable by anyone holding the pile, so two collections differ
-    /// exactly when their scope, representation, recipe, or arguments differ.
-    pub fn from_fragment(fragment: &Fragment) -> Self {
-        Self::from_tribles(fragment.facts())
-    }
-
-    /// Decode an exact collection-descriptor archive without external lookups.
-    pub fn decode(blob: &Blob<SimpleArchive>) -> Result<Self, RecordDecodeError> {
-        Ok(Self::from_tribles(&decode_archive(blob)?))
-    }
-
-    /// Decode an exact collection-descriptor entity from an already parsed set.
-    ///
-    /// Attributes beyond the structural four are recipe arguments. They are
-    /// kept verbatim rather than remodelled, so a descriptor for a recipe this
-    /// binary has never heard of still decodes, still answers questions about
-    /// its scope and law, and still re-emits byte-for-byte on the way out.
-    pub fn from_tribles(facts: &TribleSet) -> Self {
-        Self {
-            facts: facts.clone(),
+impl fmt::Display for InvalidCollectionName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => write!(f, "collection name is empty"),
+            Self::TooLong { len } => {
+                write!(f, "collection name is {len} bytes, the maximum is 32")
+            }
+            Self::BadStart => write!(
+                f,
+                "collection name must start with a lowercase ASCII letter"
+            ),
+            Self::BadEnd => write!(
+                f,
+                "collection name must end with a lowercase ASCII letter or digit"
+            ),
+            Self::BadByte { byte } => write!(
+                f,
+                "collection name may only contain [a-z0-9-]; found byte {byte:#04X}"
+            ),
         }
     }
+}
 
-    /// Intrinsic entity root inside the descriptor archive.
-    ///
-    /// This is not the collection identity carried by claims; use
-    /// [`handle`](Self::handle) for that.
-    /// Entity the descriptor's own attributes hang off.
-    ///
-    /// The archive holds more than one entity: the descriptor, plus the
-    /// embedded descriptions of its representation and its recipe. The
-    /// descriptor is the one tagged [`KIND_COLLECTION_DESCRIPTOR`].
-    ///
-    /// This is not the collection identity carried by claims; use
-    /// [`handle`](Self::handle) for that.
-    pub fn entity_id(&self) -> Result<Id, RecordDecodeError> {
-        let tag = metadata::tag.id();
-        let expected: Inline<GenId> =
-            crate::inline::IntoInline::to_inline(KIND_COLLECTION_DESCRIPTOR);
-        let mut found = None;
-        for fact in self.facts.iter() {
-            if *fact.a() == tag && fact.v::<GenId>().raw == expected.raw {
-                if found.is_some() {
-                    return Err(RecordDecodeError::MultipleEntities);
-                }
-                found = Some(*fact.e());
+impl Error for InvalidCollectionName {}
+
+impl CollectionName {
+    /// Accept a string as a collection name, or say exactly why it is not one.
+    pub fn new(text: &str) -> Result<Self, InvalidCollectionName> {
+        let bytes = text.as_bytes();
+        let Some(&first) = bytes.first() else {
+            return Err(InvalidCollectionName::Empty);
+        };
+        if bytes.len() > 32 {
+            return Err(InvalidCollectionName::TooLong { len: bytes.len() });
+        }
+        if !first.is_ascii_lowercase() {
+            return Err(InvalidCollectionName::BadStart);
+        }
+        let last = bytes[bytes.len() - 1];
+        if !(last.is_ascii_lowercase() || last.is_ascii_digit()) {
+            return Err(InvalidCollectionName::BadEnd);
+        }
+        for &byte in bytes {
+            if !(byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-') {
+                return Err(InvalidCollectionName::BadByte { byte });
             }
         }
-        found.ok_or(RecordDecodeError::WrongKind {
-            expected: KIND_COLLECTION_DESCRIPTOR,
-            actual: KIND_COLLECTION_DESCRIPTOR,
-        })
+        Ok(Self(text.to_owned()))
     }
 
-    /// Canonical content identity of this collection descriptor.
-    pub fn handle(&self) -> CollectionHandle {
-        self.to_blob().get_handle()
-    }
-
-    /// Extrinsic dataset scope shared by related collections.
-    pub fn scope(&self) -> Result<Id, RecordDecodeError> {
-        one_id(&self.facts, &collection_scope, "collection_scope")
-    }
-
-    /// Blob-representation descriptor id.
-    pub fn representation(&self) -> Result<Id, RecordDecodeError> {
-        one_id(
-            &self.facts,
-            &collection_representation,
-            "collection_representation",
-        )
-    }
-
-    /// Canonical construction/merge recipe id.
-    ///
-    /// This names the *law*. Its arguments, if any, are the remaining
-    /// attributes on the descriptor entity; see [`argument`](Self::argument).
-    pub fn recipe(&self) -> Result<Id, RecordDecodeError> {
-        one_id(&self.facts, &collection_recipe, "collection_recipe")
-    }
-
-    /// Look up one recipe argument by attribute.
-    pub fn argument(&self, attribute: Id) -> Option<RawInline> {
-        self.arguments()
-            .find(|(a, _)| *a == attribute)
-            .map(|(_, v)| v)
-    }
-
-    /// Every recipe argument carried by this descriptor.
-    pub fn arguments(&self) -> impl Iterator<Item = (Id, RawInline)> + '_ {
-        self.facts.iter().filter_map(|fact| {
-            let attribute = *fact.a();
-            (!structural_attributes().contains(&attribute))
-                .then(|| (attribute, fact.v::<GenId>().raw))
-        })
-    }
-
-
-    /// Reconstruct the exact one-root trible record.
-    ///
-    /// This is the archive the descriptor was decoded from, unchanged. There
-    /// is no second model of it to drift.
-    pub fn to_tribles(&self) -> TribleSet {
-        self.facts.clone()
-    }
-
-    /// Canonical `SimpleArchive` payload of this descriptor.
-    pub fn to_blob(&self) -> Blob<SimpleArchive> {
-        encode_archive(self.to_tribles())
+    /// The name as written, which is also the name as stored.
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
+
+impl fmt::Display for CollectionName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 
 /// Signed exogenous membership assertion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -834,18 +764,6 @@ pub const COLLECTION_RECORD_KIND_MERGE_V1: u8 = 2;
 pub const COLLECTION_RECORD_KIND_DERIVE_V1: u8 = 3;
 
 
-/// The four attributes every descriptor carries. Anything else on the entity
-/// is an argument to the recipe.
-fn structural_attributes() -> [Id; 4] {
-    [
-        metadata::tag.id(),
-        collection_scope.id(),
-        collection_representation.id(),
-        collection_recipe.id(),
-    ]
-}
-
-
 fn commit_bytes(
     collection: CollectionHandle,
     data_hash: CollectionData,
@@ -1037,6 +955,7 @@ mod tests {
 
     use hex_literal::hex;
 
+    use crate::blob::TryFromBlob;
     use crate::id::Id;
 
     fn id(byte: u8) -> Id {
@@ -1055,25 +974,56 @@ mod tests {
         SigningKey::from_bytes(&[7; 32])
     }
 
+    /// A root is anchored by its name *and* its team, and its identity is a
+    /// function of that anchor together with the representation and recipe it
+    /// names. Change any one of the four and it is a different collection.
     #[test]
-    fn collection_descriptor_is_scope_specific_and_roundtrips() {
-        let a = CollectionDescriptor::naming(id(1), id(2), id(3));
-        let b = CollectionDescriptor::naming(id(4), id(2), id(3));
-        let c = CollectionDescriptor::naming(id(1), id(4), id(3));
-        let d = CollectionDescriptor::naming(id(1), id(2), id(4));
-        assert_ne!(a.handle(), b.handle());
-        assert_ne!(a.handle(), c.handle());
-        assert_ne!(a.handle(), d.handle());
-        assert_eq!(CollectionDescriptor::decode(&a.to_blob()).unwrap(), a);
-        let root = a.entity_id().unwrap();
-        assert!(a.to_tribles().iter().all(|fact| fact.e() == &root));
+    fn collection_descriptor_is_anchor_specific_and_roundtrips() {
+        use crate::collection::descriptor;
+
+        let team = SigningKey::from_bytes(&[1; 32]).verifying_key();
+        let other_team = SigningKey::from_bytes(&[2; 32]).verifying_key();
+        let name = CollectionName::new("first").unwrap();
+        let other_name = CollectionName::new("second").unwrap();
+
+        let a = descriptor::naming(&name, team, id(2), id(3)).into_facts();
+        let renamed = descriptor::naming(&other_name, team, id(2), id(3)).into_facts();
+        let reteamed = descriptor::naming(&name, other_team, id(2), id(3)).into_facts();
+        let other_representation = descriptor::naming(&name, team, id(4), id(3)).into_facts();
+        let other_recipe = descriptor::naming(&name, team, id(2), id(4)).into_facts();
+
+        let handle = |facts: &TribleSet| {
+            <TribleSet as crate::blob::IntoBlob<SimpleArchive>>::to_blob(facts.clone()).get_handle()
+        };
+        assert_ne!(handle(&a), handle(&renamed));
+        assert_ne!(handle(&a), handle(&reteamed));
+        assert_ne!(handle(&a), handle(&other_representation));
+        assert_ne!(handle(&a), handle(&other_recipe));
+
+        // The descriptor is its own archive: encoding and decoding is the
+        // identity, because there is no second model of it to drift.
+        let blob = <TribleSet as crate::blob::IntoBlob<SimpleArchive>>::to_blob(a.clone());
+        assert_eq!(
+            <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(blob).unwrap(),
+            a
+        );
+        let root = descriptor::entity(&a).unwrap();
+        assert!(a.iter().all(|fact| fact.e() == &root));
+
+        assert_eq!(
+            descriptor::name(&a).unwrap().unwrap(),
+            name,
+            "the anchor reads back as what was written"
+        );
+        assert_eq!(descriptor::team(&a).unwrap().unwrap(), team);
     }
 
     #[test]
     fn malformed_archive_is_a_structural_error() {
         let malformed: Blob<SimpleArchive> = Blob::new(vec![0].into());
         assert_eq!(
-            CollectionDescriptor::decode(&malformed),
+            <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(malformed)
+                .map_err(RecordDecodeError::from),
             Err(RecordDecodeError::Archive(UnarchiveError::BadArchive))
         );
     }
@@ -1259,7 +1209,15 @@ mod tests {
 
     #[test]
     fn transcript_and_record_roots_are_golden() {
-        let descriptor = CollectionDescriptor::naming(id(1), id(2), id(3));
+        let descriptor = crate::collection::descriptor::naming(
+            &CollectionName::new("first").unwrap(),
+            SigningKey::from_bytes(&[1; 32]).verifying_key(),
+            id(2),
+            id(3),
+        )
+        .into_facts();
+        let descriptor_blob =
+            <TribleSet as crate::blob::IntoBlob<SimpleArchive>>::to_blob(descriptor.clone());
         let commit =
             CollectionCommit::sign(&fixture_key(), collection(1), hash(2), Inline::new([3; 32]));
         let merge = CollectionMerge::new(collection(1), hash(2), hash(3), hash(4));
@@ -1267,15 +1225,15 @@ mod tests {
 
         // Descriptor wire bytes are unchanged by the identity cutover.
         assert_eq!(
-            descriptor.entity_id().unwrap(),
-            id_hex!("D28DF8A2FAAABEDCD2943FD73920EECD")
+            crate::collection::descriptor::entity(&descriptor).unwrap(),
+            id_hex!("D3942D72389636880F528243079C24DF")
         );
         assert_eq!(
-            descriptor.handle().raw,
-            hex!("51F16FDE006E9A38C68B939A20B4255BC049C1795597BF05D499634AF3CCAA9F")
+            descriptor_blob.get_handle().raw,
+            hex!("27BDE8E0150DCEC4F5330DF88D12EAEE0E1B174AA59AB6F2E10A3F9B20B8B8D7")
         );
         assert_eq!(
-            descriptor.to_blob().bytes.len() as u64,
+            descriptor_blob.bytes.len() as u64,
             COLLECTION_DESCRIPTOR_ARCHIVE_LEN
         );
         assert_eq!(commit.to_bytes().len(), COLLECTION_COMMIT_BYTES_LEN);

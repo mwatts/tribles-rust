@@ -159,14 +159,18 @@ multiplicity through their other witnesses.
 
 ## Persist through the native collection algebra
 
-A durable path index is identified only by a source dataset scope and one
-automaton:
+A durable path index is identified only by its source collection — a name
+within a team — and one automaton:
 
 ```rust,ignore
+use triblespace::prelude::CollectionName;
 use triblespace_paths::PathSummaryCollection;
 
-let path_collection =
-    PathSummaryCollection::new(source_scope, friend_automaton.clone());
+let path_collection = PathSummaryCollection::new(
+    CollectionName::new("social")?,
+    team,
+    friend_automaton.clone(),
+);
 
 // `ticket` is the exact byte-identical set of signed source
 // CollectionCommit records selected by the caller.
@@ -235,8 +239,9 @@ would miss such paths. Merge order remains irrelevant because closure is
 derived only after the canonical semilattice join.
 
 The low-level `path_summary_union` module exposes the concrete law directly.
-`descriptor(scope, automaton)` identifies one target lattice by dataset scope,
-`PathSummaryBlob` representation, and canonical automaton fingerprint.
+`descriptor(source, automaton)` identifies one target lattice by the handle of
+the collection it summarises, the `PathSummaryBlob` representation, and the
+canonical automaton fingerprint.
 `derive_element` lowers one canonical `SimpleArchive` into direct product arcs,
 `join` unions two summaries, and `validate_derive` / `validate_merge` bind all
 supplied blobs to the record's exact identities and recompute the claimed

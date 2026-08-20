@@ -1,16 +1,17 @@
 //! `trible pile collection …` — a collection-aware view of a pile.
 //!
 //! A collection is identified by the blake3 handle of its *descriptor blob*,
-//! not by the entity id inside that blob. The descriptor is a small canonical
-//! `SimpleArchive` carrying exactly four tribles on one intrinsic entity: the
-//! `KIND_COLLECTION_DESCRIPTOR` tag plus the extrinsic `scope`, the blob
-//! `representation`, and the join `recipe`.
+//! not by the entity id inside that blob. The descriptor is an ordinary
+//! canonical `SimpleArchive` of one intrinsic entity: the
+//! `KIND_COLLECTION_DESCRIPTOR` tag, an anchor — `name` + `team` for a root,
+//! `source` for a derivation — plus the blob `representation` and the join
+//! `recipe`, and whatever arguments its recipe carries.
 //!
 //! Without this module the only way to look at one was
 //! `pile blob inspect <PILE> blake3:<HEX>`, which reports "256 bytes, Binary"
-//! and nothing else. Here the descriptor is decoded with
-//! [`CollectionDescriptor::decode`] — the same decoder resolution and
-//! retention use — so the CLI view can never drift from the semantics.
+//! and nothing else. Here the facts are read with the same
+//! [`descriptor`](triblespace_core::collection::descriptor) queries resolution
+//! and retention use, so the CLI view can never drift from the semantics.
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
@@ -20,9 +21,9 @@ use std::path::PathBuf;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
 use triblespace_core::blob::Blob;
-use triblespace_core::collection::records::{
-    CollectionDescriptor, CollectionHandle, CollectionRecord,
-};
+use triblespace_core::blob::TryFromBlob;
+use triblespace_core::collection::descriptor;
+use triblespace_core::collection::records::{CollectionHandle, CollectionRecord};
 use triblespace_core::collection::store::CollectionStore;
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::{Blake3, Hash};
@@ -185,7 +186,7 @@ fn referenced_collections(pile: &mut Pile) -> Result<BTreeMap<CollectionHandle, 
 
 /// The three decoded fields, or why they could not be decoded.
 enum Fields {
-    Decoded(CollectionDescriptor),
+    Decoded(TribleSet),
     Missing,
     Undecodable(String),
 }
@@ -196,8 +197,8 @@ impl Fields {
             Ok(blob) => blob,
             Err(_) => return Fields::Missing,
         };
-        match CollectionDescriptor::decode(&blob) {
-            Ok(descriptor) => Fields::Decoded(descriptor),
+        match <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(blob) {
+            Ok(facts) => Fields::Decoded(facts),
             Err(e) => Fields::Undecodable(format!("{e:?}")),
         }
     }
@@ -217,24 +218,34 @@ fn run_list(path: PathBuf, metadata: bool) -> Result<()> {
         for (handle, counts) in &refs {
             print!("  {}", handle_hex(*handle));
             match Fields::load(&reader, *handle) {
-                Fields::Decoded(descriptor) => {
-                    // A root carries a dataset anchor; a derivation carries
-                    // the collection it derives from instead. Show whichever
-                    // the descriptor actually has rather than demanding one.
-                    match (descriptor.source(), descriptor.scope()) {
-                        (Some(source), _) => {
-                            print!("  source={}", handle_hex(source))
-                        }
-                        (None, Ok(scope)) => print!("  scope={scope:X}"),
-                        (None, Err(e)) => print!("  <no anchor: {e}>"),
+                Fields::Decoded(facts) => {
+                    // A root is anchored by its name within a team; a
+                    // derivation is anchored by the collection it derives
+                    // from. Show whichever the descriptor actually has rather
+                    // than demanding one.
+                    match (
+                        descriptor::source(&facts),
+                        descriptor::name(&facts),
+                        descriptor::team(&facts),
+                    ) {
+                        (Some(source), _, _) => print!("  source={}", handle_hex(source)),
+                        (None, Some(Ok(name)), Some(Ok(team))) => print!(
+                            "  name={name}  team={}",
+                            hex::encode_upper(team.to_bytes())
+                        ),
+                        (None, Some(Ok(name)), _) => print!("  name={name}"),
+                        (None, _, _) => print!("  <no anchor>"),
                     }
                     print!(
                         "  representation={}  recipe={}",
                         named_id(
-                            descriptor.representation()?,
-                            representation_name(descriptor.representation()?)
+                            descriptor::representation(&facts)?,
+                            representation_name(descriptor::representation(&facts)?)
                         ),
-                        named_id(descriptor.recipe()?, recipe_name(descriptor.recipe()?)),
+                        named_id(
+                            descriptor::recipe(&facts)?,
+                            recipe_name(descriptor::recipe(&facts)?)
+                        ),
                     );
                 }
                 Fields::Missing => print!("  <descriptor blob not in pile>"),
@@ -298,24 +309,41 @@ fn run_show(path: PathBuf, handle: String) -> Result<()> {
             println!("descriptor blob: {} bytes", blob.bytes.len());
         }
 
-        let descriptor = CollectionDescriptor::decode(&blob)
+        let descriptor = <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(blob.clone())
             .map_err(|e| anyhow!("decode collection descriptor: {e:?}"))?;
-        println!("entity id:      {:X}", descriptor.entity_id()?);
-        match (descriptor.source(), descriptor.scope()) {
-            (Some(source), _) => println!("source:         {}", handle_hex(source)),
-            (None, Ok(scope)) => println!("scope:          {scope:X}"),
-            (None, Err(e)) => println!("anchor:         <none: {e}>"),
+        println!("entity id:      {:X}", descriptor::entity(&descriptor)?);
+        match (
+            descriptor::source(&descriptor),
+            descriptor::name(&descriptor),
+            descriptor::team(&descriptor),
+        ) {
+            (Some(source), _, _) => println!("source:         {}", handle_hex(source)),
+            (None, Some(Ok(name)), team) => {
+                println!("name:           {name}");
+                match team {
+                    Some(Ok(team)) => {
+                        println!("team:           {}", hex::encode_upper(team.to_bytes()))
+                    }
+                    Some(Err(e)) => println!("team:           <invalid: {e}>"),
+                    None => println!("team:           <none>"),
+                }
+            }
+            (None, Some(Err(e)), _) => println!("name:           <invalid: {e}>"),
+            (None, None, _) => println!("anchor:         <none>"),
         }
         println!(
             "representation: {}",
             named_id(
-                descriptor.representation()?,
-                representation_name(descriptor.representation()?)
+                descriptor::representation(&descriptor)?,
+                representation_name(descriptor::representation(&descriptor)?)
             )
         );
         println!(
             "recipe:         {}",
-            named_id(descriptor.recipe()?, recipe_name(descriptor.recipe()?))
+            named_id(
+                descriptor::recipe(&descriptor)?,
+                recipe_name(descriptor::recipe(&descriptor)?)
+            )
         );
 
         let facts: TribleSet = reader
@@ -373,8 +401,10 @@ fn referenced_ids(records: &[CollectionRecord]) -> std::collections::BTreeSet<Co
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
     use std::collections::BTreeSet;
-    use triblespace_core::blob::MemoryBlobStore;
+    use triblespace_core::blob::{IntoBlob, MemoryBlobStore};
+    use triblespace_core::collection::records::CollectionName;
     use triblespace_core::collection::simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1;
     use triblespace_core::id::fucid;
     use triblespace_core::repo::BlobStorePut;
@@ -386,44 +416,45 @@ mod tests {
     /// descriptor blob, never the entity id inside it.
     #[test]
     fn show_decodes_a_descriptor_addressed_by_its_blob_handle() {
-        let scope = *fucid();
+        let name = CollectionName::new("inspected").unwrap();
+        let team = SigningKey::from_bytes(&[7; 32]).verifying_key();
         let representation = <SimpleArchive as MetaDescribe>::id();
-        let descriptor = CollectionDescriptor::naming(scope, representation, TRIBLE_SET_UNION_RECIPE_V1);
+        let fragment =
+            descriptor::naming(&name, team, representation, TRIBLE_SET_UNION_RECIPE_V1);
+        let entity_id = fragment.root().expect("the descriptor has one root");
 
         let mut store = MemoryBlobStore::new();
         let handle: CollectionHandle = store
-            .put::<SimpleArchive, _>(descriptor.to_blob())
+            .put::<SimpleArchive, _>(fragment.into_facts().to_blob())
             .expect("store descriptor");
-        assert_eq!(
-            handle, descriptor.handle(),
-            "the stored blob's handle is the collection identity"
-        );
         assert_ne!(
             handle.raw[..16],
-            <[u8; 16]>::from(descriptor.entity_id().unwrap())[..],
+            <[u8; 16]>::from(entity_id)[..],
             "identity is the blob hash, not the intrinsic entity id"
         );
 
         let reader = store.reader().expect("reader");
         let blob: Blob<SimpleArchive> = reader.get(handle).expect("read descriptor blob");
-        assert_eq!(blob.bytes.len(), 256, "four tribles at 64 bytes each");
+        assert_eq!(blob.bytes.len(), 320, "five tribles at 64 bytes each");
 
-        let decoded = CollectionDescriptor::decode(&blob).expect("decode descriptor");
-        assert_eq!(decoded.scope().unwrap(), scope);
-        assert_eq!(decoded.representation().unwrap(), representation);
-        assert_eq!(decoded.recipe().unwrap(), TRIBLE_SET_UNION_RECIPE_V1);
-        assert_eq!(decoded.entity_id().unwrap(), descriptor.entity_id().unwrap());
+        let decoded = <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(blob)
+            .expect("decode descriptor");
+        assert_eq!(descriptor::name(&decoded).unwrap().unwrap(), name);
+        assert_eq!(descriptor::team(&decoded).unwrap().unwrap(), team);
+        assert_eq!(descriptor::representation(&decoded).unwrap(), representation);
+        assert_eq!(descriptor::recipe(&decoded).unwrap(), TRIBLE_SET_UNION_RECIPE_V1);
+        assert_eq!(descriptor::entity(&decoded).unwrap(), entity_id);
 
         // The trible dump `show` prints comes from the same bytes.
         let facts: TribleSet = reader
             .get::<TribleSet, SimpleArchive>(handle)
             .expect("unarchive descriptor");
-        assert_eq!(facts.len(), 4);
+        assert_eq!(facts.len(), 5);
         let entities: BTreeSet<Id> = facts.iter().map(|t| *t.e()).collect();
         assert_eq!(
             entities,
-            BTreeSet::from([descriptor.entity_id().unwrap()]),
-            "all four tribles hang off one intrinsic entity"
+            BTreeSet::from([entity_id]),
+            "all five tribles hang off one intrinsic entity"
         );
     }
 

@@ -4215,7 +4215,8 @@ mod tests {
     use std::time::UNIX_EPOCH;
     use tempfile;
 
-    use crate::collection::{empty_metadata_handle, CollectionDescriptor, CollectionHandle};
+    use crate::collection::descriptor::named_for_tests;
+    use crate::collection::{empty_metadata_handle, CollectionHandle};
     use crate::macros::entity;
     use crate::repo::lazy::Lazy;
     use crate::repo::yard::{Yard, YardCollectError, YardConfig, YardReclaimError};
@@ -5734,15 +5735,14 @@ mod tests {
         let forged_metadata = source
             .put::<SimpleArchive, _>(metadata_facts.to_blob())
             .unwrap();
-        let descriptor = CollectionDescriptor::naming(
-            collection_test_id(21),
+        let descriptor = named_for_tests(
+            "forged",
             collection_test_id(22),
             collection_test_id(23),
         );
         let descriptor_handle = source
-            .put::<SimpleArchive, _>(CollectionDescriptor::to_blob(&descriptor))
+            .put::<SimpleArchive, _>(crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.into_facts()))
             .unwrap();
-        assert_eq!(descriptor_handle, descriptor.handle());
         let invalid = invalidate_collection_commit(CollectionCommit::sign(
             &SigningKey::from_bytes(&[24; 32]),
             descriptor_handle,
@@ -5891,15 +5891,14 @@ mod tests {
             .put::<UnknownBlob, _>(Bytes::from_source(b"unowned".to_vec()))
             .unwrap();
 
-        let descriptor = CollectionDescriptor::naming(
-            collection_test_id(10),
+        let descriptor = named_for_tests(
+            "retained",
             collection_test_id(11),
             collection_test_id(12),
         );
         let descriptor_handle = source
-            .put::<SimpleArchive, _>(CollectionDescriptor::to_blob(&descriptor))
+            .put::<SimpleArchive, _>(crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.into_facts()))
             .unwrap();
-        assert_eq!(descriptor_handle, descriptor.handle());
         let key = SigningKey::from_bytes(&[13; 32]);
         let commit = CollectionCommit::sign(
             &key,

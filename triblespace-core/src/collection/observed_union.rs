@@ -50,6 +50,9 @@
 //! the same dataset but different edges are distinct collections, and cannot
 //! be confused for one another's cache.
 
+use ed25519_dalek::VerifyingKey;
+use crate::collection::records::CollectionName;
+
 use anybytes::Bytes;
 use std::error::Error;
 use std::fmt;
@@ -74,7 +77,7 @@ use super::records::{
     collection_recipe, collection_representation, collection_source, CollectionHandle,
     KIND_COLLECTION_DESCRIPTOR,
 };
-use super::{simplearchive_union, CollectionCommit, CollectionDescriptor, CollectionStore};
+use super::{simplearchive_union, CollectionCommit, CollectionStore};
 use crate::repo::{BlobStore, BlobStoreMeta};
 
 /// Width of one stored id.
@@ -230,7 +233,7 @@ pub fn join(
 }
 
 /// Construct the observed-set collection for one dataset scope and edge.
-pub fn descriptor(source: CollectionHandle, observes: Id) -> CollectionDescriptor {
+pub fn descriptor(source: CollectionHandle, observes: Id) -> Fragment {
     let observes: Inline<GenId> = crate::inline::IntoInline::to_inline(observes);
     let fragment = entity! { _ @
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,
@@ -239,7 +242,7 @@ pub fn descriptor(source: CollectionHandle, observes: Id) -> CollectionDescripto
         collection_recipe*: <ObservedUnionV1 as MetaDescribe>::describe(),
         register_observes: observes,
     };
-    CollectionDescriptor::from_fragment(&fragment)
+    fragment
 }
 
 /// The observed-union law.
@@ -314,19 +317,29 @@ impl RegisterOrder for ObservedIndex {
 /// collection.
 #[derive(Clone, Debug)]
 pub struct ObservedSetCollection {
-    scope: Id,
+    name: CollectionName,
+    team: VerifyingKey,
     observes: Id,
 }
 
 impl ObservedSetCollection {
-    /// Construct the observed-set projection for `scope` and `observes`.
-    pub fn new(scope: Id, observes: Id) -> Self {
-        Self { scope, observes }
+    /// Construct the observed-set projection over one named root.
+    pub fn new(name: CollectionName, team: VerifyingKey, observes: Id) -> Self {
+        Self {
+            name,
+            team,
+            observes,
+        }
     }
 
-    /// Dataset scope shared with the source collection.
-    pub fn scope(&self) -> Id {
-        self.scope
+    /// Name of the root collection this projection is taken over.
+    pub fn name(&self) -> &CollectionName {
+        &self.name
+    }
+
+    /// Team owning the root collection this projection is taken over.
+    pub fn team(&self) -> VerifyingKey {
+        self.team
     }
 
     /// The observation attribute this collection reads.
@@ -334,14 +347,20 @@ impl ObservedSetCollection {
         self.observes
     }
 
-    /// Canonical source `SimpleArchive` collection descriptor.
-    pub fn source_descriptor(&self) -> CollectionDescriptor {
-        simplearchive_union::descriptor(self.scope)
+    /// Canonical source `SimpleArchive` collection descriptor facts.
+    pub fn source_descriptor(&self) -> Fragment {
+        simplearchive_union::descriptor(&self.name, self.team)
+    }
+
+    /// Identity of the source collection this projection reads.
+    pub fn source_collection(&self) -> CollectionHandle {
+        crate::blob::IntoBlob::<SimpleArchive>::to_blob(self.source_descriptor().into_facts())
+            .get_handle()
     }
 
     /// Canonical target observed-set collection descriptor.
-    pub fn descriptor(&self) -> CollectionDescriptor {
-        descriptor(self.source_descriptor().handle(), self.observes)
+    pub fn descriptor(&self) -> Fragment {
+        descriptor(self.source_collection(), self.observes)
     }
 
     /// Attach the observed set already resident for `ticket`.
@@ -424,7 +443,7 @@ impl From<ExactDerivedCollectionError> for ObservedSetCollectionError {
 impl ExactDerivedAlgebra<SimpleArchive, ObservedSetBlob> for ObservedSetCollection {
     fn validate_source(
         &self,
-        descriptor: &CollectionDescriptor,
+        descriptor: &Fragment,
         source: &Blob<SimpleArchive>,
     ) -> Result<(), ExactAlgebraError> {
         if *descriptor != self.source_descriptor() {
@@ -438,7 +457,7 @@ impl ExactDerivedAlgebra<SimpleArchive, ObservedSetBlob> for ObservedSetCollecti
 
     fn validate_target(
         &self,
-        descriptor: &CollectionDescriptor,
+        descriptor: &Fragment,
         target: &Blob<ObservedSetBlob>,
     ) -> Result<(), ExactAlgebraError> {
         if *descriptor != self.descriptor() {
@@ -589,7 +608,17 @@ mod tests {
 
     #[test]
     fn the_observed_attribute_participates_in_collection_identity() {
-        let source = simplearchive_union::descriptor(*ufoid()).handle();
+        let root = |name: &str| {
+            crate::blob::IntoBlob::<SimpleArchive>::to_blob(
+                simplearchive_union::descriptor(
+                    &crate::collection::records::CollectionName::new(name).unwrap(),
+                    ed25519_dalek::SigningKey::from_bytes(&[1; 32]).verifying_key(),
+                )
+                .into_facts(),
+            )
+            .get_handle()
+        };
+        let source = root("source");
         assert_ne!(
             descriptor(source, metadata::supersedes.id()),
             descriptor(source, metadata::tag.id()),
@@ -597,7 +626,7 @@ mod tests {
         );
         // A derived collection carries no anchor of its own; two derivations
         // of the same shape differ exactly when their sources differ.
-        let other = simplearchive_union::descriptor(*ufoid()).handle();
+        let other = root("other-source");
         assert_ne!(
             descriptor(source, metadata::tag.id()),
             descriptor(other, metadata::tag.id()),

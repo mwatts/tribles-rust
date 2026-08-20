@@ -262,7 +262,8 @@ impl crate::repo::StorageClose for MemoryRepo {
 mod tests {
     use super::*;
 
-    use crate::collection::{CollectionDerive, CollectionDescriptor, CollectionMerge};
+    use crate::collection::descriptor::{identity_for_tests, named_for_tests};
+    use crate::collection::{CollectionDerive, CollectionMerge};
 
     fn handle(byte: u8) -> Inline<Handle<UnknownBlob>> {
         Inline::new([byte; 32])
@@ -296,24 +297,24 @@ mod tests {
 
     #[test]
     fn collection_records_are_idempotent_and_intrinsically_ordered() {
-        let descriptor = CollectionDescriptor::naming(
-            Id::new([1; 16]).unwrap(),
+        let descriptor = named_for_tests(
+            "merged",
             Id::new([2; 16]).unwrap(),
             Id::new([3; 16]).unwrap(),
         );
-        let target = CollectionDescriptor::naming(
-            Id::new([7; 16]).unwrap(),
+        let target = named_for_tests(
+            "derived",
             Id::new([8; 16]).unwrap(),
             Id::new([9; 16]).unwrap(),
         );
         let merge = CollectionRecord::Merge(CollectionMerge::new(
-            descriptor.handle(),
+            identity_for_tests(&descriptor),
             Inline::new([4; 32]),
             Inline::new([5; 32]),
             Inline::new([6; 32]),
         ));
         let derive = CollectionRecord::Derive(CollectionDerive::new(
-            target.handle(),
+            identity_for_tests(&target),
             Inline::new([10; 32]),
             Inline::new([11; 32]),
         ));
@@ -335,24 +336,21 @@ mod tests {
 
     #[test]
     fn collection_primary_selection_answers_group_and_exact_conflicting_operations() {
-        let source = CollectionDescriptor::naming(
-            Id::new([21; 16]).unwrap(),
+        let source = identity_for_tests(&named_for_tests(
+            "source",
             Id::new([22; 16]).unwrap(),
             Id::new([23; 16]).unwrap(),
-        )
-        .handle();
-        let target = CollectionDescriptor::naming(
-            Id::new([24; 16]).unwrap(),
+        ));
+        let target = identity_for_tests(&named_for_tests(
+            "target",
             Id::new([25; 16]).unwrap(),
             Id::new([26; 16]).unwrap(),
-        )
-        .handle();
-        let other = CollectionDescriptor::naming(
-            Id::new([27; 16]).unwrap(),
+        ));
+        let other = identity_for_tests(&named_for_tests(
+            "other",
             Id::new([28; 16]).unwrap(),
             Id::new([29; 16]).unwrap(),
-        )
-        .handle();
+        ));
         let input = Inline::new([30; 32]);
         let merge = CollectionRecord::Merge(CollectionMerge::new(
             source,
@@ -415,10 +413,11 @@ mod tests {
         let mut repo = MemoryRepo::default();
         let child = repo.put::<LongString, _>("owned child".to_owned()).unwrap();
         let fragment = entity! { crate::metadata::name: child };
-        let scope = *crate::id::ufoid();
+        let name = crate::collection::records::CollectionName::new("owned").unwrap();
         let key = SigningKey::from_bytes(&[23; 32]);
-        let descriptor = Collection::new(&mut repo, scope, key.clone()).descriptor().clone();
-        let commit = Collection::new(&mut repo, scope, key)
+        let team = key.verifying_key();
+        let collection = Collection::new(&mut repo, &name, team, key.clone()).collection();
+        let commit = Collection::new(&mut repo, &name, team, key)
             .commit(fragment)
             .unwrap();
         let orphan = repo.put::<LongString, _>("orphan".to_owned()).unwrap();
@@ -427,7 +426,7 @@ mod tests {
 
         let reader = repo.reader().unwrap();
         for retained in [
-            descriptor.handle().transmute(),
+            collection.transmute(),
             Inline::<Handle<UnknownBlob>>::new(commit.data().raw),
             commit.metadata().transmute(),
             child.transmute(),

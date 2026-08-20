@@ -7,6 +7,9 @@
 //! signatures, descriptor, data, and mandatory metadata are all checked before
 //! facts are returned.
 
+use ed25519_dalek::VerifyingKey;
+use crate::collection::records::CollectionName;
+
 use std::collections::BTreeSet;
 use std::convert::Infallible;
 
@@ -16,37 +19,52 @@ use crate::collection::discovery::{
     validate_exact_ticket,
 };
 use crate::collection::{
-    CollectionCommit, CollectionDescriptor, CollectionMaterializationError, CollectionStore,
+    CollectionCommit, CollectionHandle, CollectionMaterializationError, CollectionStore,
     DiscoveredCollectionRecords,
 };
-use crate::id::Id;
 use crate::repo::{BlobStore, BlobStoreGet, BlobStoreMeta};
-use crate::trible::TribleSet;
+use crate::trible::{Fragment, TribleSet};
 
 /// Read-only exact-ticket view of one canonical `SimpleArchive` union.
 ///
 /// The scope fixes the descriptor, while each call supplies the complete
 /// commit authority set. The facade borrows storage only for the duration of a
 /// read and has no API capable of inserting blobs or collection records.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SimpleArchiveCollection {
-    scope: Id,
+    name: CollectionName,
+    team: VerifyingKey,
 }
 
 impl SimpleArchiveCollection {
-    /// Construct a read-only exact-ticket facade for `scope`.
-    pub fn new(scope: Id) -> Self {
-        Self { scope }
+    /// Construct a read-only exact-ticket facade for one named root.
+    pub fn new(name: CollectionName, team: VerifyingKey) -> Self {
+        Self { name, team }
     }
 
-    /// Dataset scope carried by the canonical descriptor.
-    pub fn scope(&self) -> Id {
-        self.scope
+    /// Name this collection is known by within its team.
+    pub fn name(&self) -> &CollectionName {
+        &self.name
     }
 
-    /// Canonical `SimpleArchive` set-union descriptor.
-    pub fn descriptor(&self) -> CollectionDescriptor {
-        super::descriptor(self.scope)
+    /// Team owning this collection.
+    pub fn team(&self) -> VerifyingKey {
+        self.team
+    }
+
+    /// Canonical `SimpleArchive` set-union descriptor facts.
+    pub fn descriptor(&self) -> Fragment {
+        super::descriptor(&self.name, self.team)
+    }
+
+    /// Content identity of this collection's descriptor.
+    ///
+    /// This is the read side: the facade is not storing anything, it is
+    /// naming the collection a ticket must match. A write path takes its
+    /// handle from what `put` returns instead.
+    pub fn collection(&self) -> CollectionHandle {
+        use crate::blob::encodings::simplearchive::SimpleArchive;
+        crate::blob::IntoBlob::<SimpleArchive>::to_blob(self.descriptor().into_facts()).get_handle()
     }
 
     /// Attach the exact ticket as a materialized fact set without writing.
@@ -79,7 +97,7 @@ impl SimpleArchiveCollection {
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
     {
-        let commits = canonicalize_exact_ticket(ticket, self.descriptor().handle())
+        let commits = canonicalize_exact_ticket(ticket, self.collection())
             .map_err(CollectionMaterializationError::ExactTicket)?;
         if commits.is_empty() {
             return Ok(TribleSet::new());
@@ -113,7 +131,7 @@ impl SimpleArchiveCollection {
         S: BlobStore + CollectionStore,
         S::Reader: BlobStoreMeta,
     {
-        let commits = canonicalize_exact_ticket(ticket, self.descriptor().handle())
+        let commits = canonicalize_exact_ticket(ticket, self.collection())
             .map_err(CollectionMaterializationError::ExactTicket)?;
         self.snapshot_canonical(store, commits)
     }
@@ -136,6 +154,7 @@ impl SimpleArchiveCollection {
         S::Reader: BlobStoreMeta,
     {
         let descriptor = self.descriptor();
+        let collection = self.collection();
         if commits.is_empty() {
             return Collection::<S>::snapshot_from_observation(
                 store,
@@ -146,11 +165,8 @@ impl SimpleArchiveCollection {
         }
 
         let requested: BTreeSet<_> = commits.iter().map(CollectionCommit::id).collect();
-        let discovered = discover_collection_records_for_collection_ticket(
-            store,
-            &requested,
-            descriptor.handle(),
-        )
+        let discovered =
+            discover_collection_records_for_collection_ticket(store, &requested, collection)
         .map_err(CollectionMaterializationError::Discovery)?;
         validate_exact_ticket(&discovered, &commits)
             .map_err(CollectionMaterializationError::ExactTicket)?;
@@ -167,15 +183,20 @@ mod tests {
     use super::*;
     use crate::blob::encodings::{simplearchive::SimpleArchive, UnknownBlob};
     use crate::blob::{Blob, BlobEncoding, Bytes, IntoBlob};
+    use crate::collection::descriptor::identity_for_tests;
+    use crate::collection::records::CollectionName;
     use crate::collection::{CollectionRecord, CollectionRecordSelector, ExactTicketError};
     use crate::inline::encodings::hash::Handle;
     use crate::inline::{Inline, InlineEncoding};
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::BlobStorePut;
-    use crate::trible::{Trible, TribleSet, TRIBLE_LEN};
+    use crate::trible::{Trible, TRIBLE_LEN};
 
-    fn id(byte: u8) -> Id {
-        Id::new([byte; 16]).unwrap()
+    fn test_facade(name: &str) -> SimpleArchiveCollection {
+        SimpleArchiveCollection::new(
+            CollectionName::new(name).unwrap(),
+            SigningKey::from_bytes(&[1; 32]).verifying_key(),
+        )
     }
 
     fn facts(entity: u8) -> TribleSet {
@@ -192,7 +213,7 @@ mod tests {
 
     fn publish(
         store: &mut MemoryRepo,
-        descriptor: &CollectionDescriptor,
+        descriptor: &Fragment,
         key: u8,
         entity: u8,
     ) -> (CollectionCommit, Blob<SimpleArchive>) {
@@ -281,7 +302,7 @@ mod tests {
 
     #[test]
     fn mixed_authors_form_one_exact_sorted_set_and_unselected_commits_are_inert() {
-        let facade = SimpleArchiveCollection::new(id(1));
+        let facade = test_facade("first");
         let descriptor = facade.descriptor();
         let mut store = MemoryRepo::default();
         let (first, _) = publish(&mut store, &descriptor, 7, 1);
@@ -303,7 +324,7 @@ mod tests {
 
     #[test]
     fn exact_reads_select_records_once_and_open_one_coherent_reader() {
-        let facade = SimpleArchiveCollection::new(id(1));
+        let facade = test_facade("first");
         let descriptor = facade.descriptor();
         let mut inner = MemoryRepo::default();
         let (commit, _) = publish(&mut inner, &descriptor, 7, 1);
@@ -322,25 +343,25 @@ mod tests {
             store.last_selectors,
             Some(BTreeSet::from([
                 CollectionRecordSelector::Id(commit.id()),
-                CollectionRecordSelector::MergeCollection(descriptor.handle()),
+                CollectionRecordSelector::MergeCollection(identity_for_tests(&descriptor)),
             ])),
         );
     }
 
     #[test]
     fn conflicting_ticket_bytes_and_a_mismatched_stored_record_fail_closed() {
-        let facade = SimpleArchiveCollection::new(id(1));
+        let facade = test_facade("first");
         let descriptor = facade.descriptor();
         let metadata = crate::collection::empty_metadata_handle();
         let first = CollectionCommit::sign(
             &SigningKey::from_bytes(&[7; 32]),
-            descriptor.handle(),
+            identity_for_tests(&descriptor),
             Inline::new([3; 32]),
             metadata,
         );
         let conflicting = CollectionCommit::sign(
             &SigningKey::from_bytes(&[8; 32]),
-            descriptor.handle(),
+            identity_for_tests(&descriptor),
             Inline::new([4; 32]),
             metadata,
         )
@@ -382,7 +403,7 @@ mod tests {
 
     #[test]
     fn absent_mismatched_and_invalid_records_do_not_satisfy_a_ticket() {
-        let facade = SimpleArchiveCollection::new(id(1));
+        let facade = test_facade("first");
         let descriptor = facade.descriptor();
 
         let mut source = MemoryRepo::default();
@@ -428,8 +449,8 @@ mod tests {
 
     #[test]
     fn a_ticket_for_another_descriptor_is_rejected_before_storage_access() {
-        let facade = SimpleArchiveCollection::new(id(1));
-        let other = SimpleArchiveCollection::new(id(2));
+        let facade = test_facade("first");
+        let other = test_facade("second");
         let mut source = MemoryRepo::default();
         let (commit, _) = publish(&mut source, &other.descriptor(), 7, 1);
         let mut store = ReadOnlyCountingStore {
@@ -446,8 +467,8 @@ mod tests {
                     actual,
                 }
             )) if found == commit.id()
-                && expected == facade.descriptor().handle()
-                && actual == other.descriptor().handle()
+                && expected == facade.collection()
+                && actual == other.collection()
         ));
         assert_eq!(store.selections, 0);
         assert_eq!(store.readers, 0);
@@ -455,11 +476,11 @@ mod tests {
 
     #[test]
     fn every_signed_descriptor_data_and_metadata_dependency_is_mandatory() {
-        let facade = SimpleArchiveCollection::new(id(1));
+        let facade = test_facade("first");
         let descriptor = facade.descriptor();
         let mut base = MemoryRepo::default();
         let (commit, _) = publish(&mut base, &descriptor, 7, 1);
-        let descriptor_handle = descriptor.handle();
+        let descriptor_handle = identity_for_tests(&descriptor);
         let data_handle = Handle::<SimpleArchive>::from_hash(commit.data());
         let metadata_handle = commit.metadata();
 
@@ -479,7 +500,9 @@ mod tests {
             data_handle.transmute::<Handle<UnknownBlob>>(),
             metadata_handle.transmute::<Handle<UnknownBlob>>(),
         ]);
-        let wrong_descriptor = CollectionDescriptor::to_blob(&super::super::descriptor(id(9)));
+        let wrong_descriptor = crate::blob::IntoBlob::<SimpleArchive>::to_blob(
+            test_facade("ninth").descriptor().into_facts(),
+        );
         corrupt_descriptor
             .blobs
             .insert(Blob::with_handle(wrong_descriptor.bytes, descriptor_handle));
@@ -534,7 +557,7 @@ mod tests {
 
     #[test]
     fn exact_merge_cover_cannot_import_an_unselected_commit() {
-        let facade = SimpleArchiveCollection::new(id(1));
+        let facade = test_facade("first");
         let descriptor = facade.descriptor();
         let mut store = MemoryRepo::default();
         let (first, first_blob) = publish(&mut store, &descriptor, 7, 1);
@@ -553,7 +576,7 @@ mod tests {
 
     #[test]
     fn empty_attach_is_store_free_while_empty_snapshot_returns_one_reader() {
-        let facade = SimpleArchiveCollection::new(id(1));
+        let facade = test_facade("first");
         let mut store = ReadOnlyCountingStore::default();
 
         assert_eq!(

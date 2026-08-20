@@ -12,19 +12,34 @@ use std::time::Duration;
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{IntoBlob, TryFromBlob};
+use triblespace_core::collection::records::CollectionName;
 use triblespace_core::collection::{
-    Collection, CollectionGossip, CollectionGossipStore, CollectionRecord, CollectionStore,
-    simplearchive_union,
+    Collection, CollectionGossip, CollectionGossipStore, CollectionHandle, CollectionRecord,
+    CollectionStore, VerifyingKey, simplearchive_union,
 };
-use triblespace_core::id::Id;
+use triblespace_core::trible::Fragment as DescriptorFragment;
 use triblespace_core::repo::{BlobStore, BlobStoreGet, PinStore, WantStore};
 use triblespace_core::trible::{Fragment, TRIBLE_LEN, Trible, TribleSet};
 use triblespace_net::transport::sim::{SimConfig, SimNet};
 
 use common::{admin_cap, bring_up, key, run_paused, self_cap_of, store_with_caps, vclock};
 
-fn id(byte: u8) -> Id {
-    Id::new([byte; 16]).unwrap()
+fn collection_name(name: &str) -> CollectionName {
+    CollectionName::new(name).unwrap()
+}
+
+/// The one team every collection in these simulations belongs to.
+fn test_team() -> VerifyingKey {
+    key(0xF0).verifying_key()
+}
+
+fn named_root(name: &str) -> DescriptorFragment {
+    simplearchive_union::descriptor(&collection_name(name), test_team())
+}
+
+/// The identity of a descriptor these simulations only address, never store.
+fn collection_of(descriptor: &DescriptorFragment) -> CollectionHandle {
+    descriptor.facts().clone().to_blob().get_handle()
 }
 
 fn archive(byte: u8) -> Blob<SimpleArchive> {
@@ -48,19 +63,19 @@ fn live_gossip_admits_only_sparse_collection_evidence_idempotently() {
         let mut author_store = store_with_caps(&caps);
         let receiver_store = store_with_caps(&caps);
 
-        let descriptor = simplearchive_union::descriptor(id(0x31));
+        let descriptor = named_root("c31");
         let data = archive(0x41);
         let metadata = archive(0x51);
         let mut fragment = Fragment::from(TribleSet::try_from_blob(data.clone()).unwrap());
         *fragment.metafacts_mut() = TribleSet::try_from_blob(metadata.clone()).unwrap();
-        let commit = Collection::new(&mut author_store, id(0x31), author.clone())
+        let commit = Collection::new(&mut author_store, &collection_name("c31"), test_team(), author.clone())
             .commit(fragment)
             .unwrap();
-        assert_eq!(commit.collection(), descriptor.handle());
+        assert_eq!(commit.collection(), collection_of(&descriptor));
         assert_eq!(commit.data(), data.get_handle().into());
         assert_eq!(commit.metadata(), metadata.get_handle());
 
-        let grant = CollectionGossip::sign(&author, descriptor.handle());
+        let grant = CollectionGossip::sign(&author, collection_of(&descriptor));
         author_store.gossip(grant).unwrap();
 
         let net = SimNet::new(0xC011EC_6015, SimConfig::default());
@@ -111,7 +126,7 @@ fn live_gossip_admits_only_sparse_collection_evidence_idempotently() {
             let reader = store.reader().unwrap();
             assert!(
                 reader
-                    .get::<TribleSet, SimpleArchive>(descriptor.handle())
+                    .get::<TribleSet, SimpleArchive>(collection_of(&descriptor))
                     .is_err()
             );
             assert!(
@@ -155,15 +170,15 @@ fn periodic_replay_reaches_a_late_joiner_without_fetching_content() {
         let mut author_store = store_with_caps(&caps);
         let receiver_store = store_with_caps(&caps);
 
-        let descriptor = simplearchive_union::descriptor(id(0x32));
+        let descriptor = named_root("c32");
         let data = archive(0x42);
         let metadata = archive(0x52);
         let mut fragment = Fragment::from(TribleSet::try_from_blob(data.clone()).unwrap());
         *fragment.metafacts_mut() = TribleSet::try_from_blob(metadata.clone()).unwrap();
-        let commit = Collection::new(&mut author_store, id(0x32), author.clone())
+        let commit = Collection::new(&mut author_store, &collection_name("c32"), test_team(), author.clone())
             .commit(fragment)
             .unwrap();
-        let grant = CollectionGossip::sign(&author, descriptor.handle());
+        let grant = CollectionGossip::sign(&author, collection_of(&descriptor));
         author_store.gossip(grant).unwrap();
 
         let net = SimNet::new(0xC011EC_1A7E, SimConfig::default());
@@ -230,7 +245,7 @@ fn periodic_replay_reaches_a_late_joiner_without_fetching_content() {
         let reader = store.reader().unwrap();
         assert!(
             reader
-                .get::<TribleSet, SimpleArchive>(descriptor.handle())
+                .get::<TribleSet, SimpleArchive>(collection_of(&descriptor))
                 .is_err()
         );
         assert!(

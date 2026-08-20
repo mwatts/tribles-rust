@@ -10,10 +10,13 @@
 //! selected raw member or rebuilds that accelerator transiently when optional
 //! evidence is absent, invalid, or ambiguous.
 
+use ed25519_dalek::VerifyingKey;
+
 use std::error::Error;
 use std::fmt;
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
+use crate::trible::Fragment;
 use crate::blob::encodings::succinctarchive::{
     OrderedUniverse, SuccinctArchive, SuccinctArchiveBlob, SuccinctArchiveRank9IndexBlob,
     SuccinctArchiveRawBuildError, SuccinctArchiveRawMergeError, UnionArchive,
@@ -25,8 +28,11 @@ use crate::collection::exact_target_compaction::{
     compact_exact_target, ExactTargetCompactionError,
 };
 use crate::collection::simplearchive_union;
-use crate::collection::{CollectionCommit, CollectionDescriptor, CollectionStore};
-use crate::id::Id;
+use crate::collection::records::CollectionName;
+use crate::collection::records::{
+    collection_recipe, collection_representation, collection_source, KIND_COLLECTION_DESCRIPTOR,
+};
+use crate::collection::{CollectionCommit, CollectionHandle, CollectionStore};
 use crate::metadata::MetaDescribe;
 use crate::repo::{BlobStore, BlobStoreMeta};
 
@@ -87,30 +93,54 @@ impl From<super::Rank9FiberError> for SuccinctArchiveCollectionError {
 /// preserve the deterministic resident physical cover as Succinct shards.
 /// Persisted Rank9 `DERIVE` records are optional one-to-one fibers over that
 /// cover: they add no authority, retention, target merges, or shard selection.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SuccinctArchiveCollection {
-    scope: Id,
+    name: CollectionName,
+    team: VerifyingKey,
 }
 
 impl SuccinctArchiveCollection {
-    /// Construct the canonical Succinct projection for `scope`.
-    pub fn new(scope: Id) -> Self {
-        Self { scope }
+    /// Construct the canonical Succinct projection for one named root.
+    pub fn new(name: CollectionName, team: VerifyingKey) -> Self {
+        Self { name, team }
     }
 
-    /// Dataset scope shared by source and target descriptors.
-    pub fn scope(&self) -> Id {
-        self.scope
+    /// Name of the root collection this projection is taken over.
+    pub fn name(&self) -> &CollectionName {
+        &self.name
     }
 
-    /// Canonical source SimpleArchive-union descriptor.
-    pub fn source_descriptor(&self) -> CollectionDescriptor {
-        simplearchive_union::descriptor(self.scope)
+    /// Team owning the root collection this projection is taken over.
+    pub fn team(&self) -> VerifyingKey {
+        self.team
+    }
+
+    /// Canonical source SimpleArchive-union descriptor facts.
+    pub fn source_descriptor(&self) -> Fragment {
+        simplearchive_union::descriptor(&self.name, self.team)
+    }
+
+    /// Identity of the source collection this projection reads.
+    pub fn source_collection(&self) -> CollectionHandle {
+        crate::blob::IntoBlob::<SimpleArchive>::to_blob(self.source_descriptor().into_facts())
+            .get_handle()
     }
 
     /// Canonical target raw-SuccinctArchive-union descriptor.
-    pub fn descriptor(&self) -> CollectionDescriptor {
-        super::descriptor(self.source_descriptor().handle())
+    pub fn descriptor(&self) -> Fragment {
+        super::descriptor(self.source_collection())
+    }
+
+    /// Identity of the raw Succinct cover this projection maintains.
+    pub fn collection(&self) -> CollectionHandle {
+        crate::blob::IntoBlob::<SimpleArchive>::to_blob(self.descriptor().into_facts())
+            .get_handle()
+    }
+
+    /// Identity of the Rank9 fiber over that cover.
+    pub fn rank9_collection(&self) -> CollectionHandle {
+        crate::blob::IntoBlob::<SimpleArchive>::to_blob(self.rank9_descriptor().into_facts())
+            .get_handle()
     }
 
     /// ABI-, format-, and builder-version-qualified lifted Rank9 collection.
@@ -121,12 +151,15 @@ impl SuccinctArchiveCollection {
     /// target join is `i(a) join i(b) = i(a join b)`; this facade never produces
     /// target `MERGE` records because constructing that join needs the raw
     /// dependencies named by the sidecars.
-    pub fn rank9_descriptor(&self) -> CollectionDescriptor {
-        CollectionDescriptor::naming(
-            self.scope,
-            <SuccinctArchiveRank9IndexBlob as MetaDescribe>::id(),
-            super::current_rank9_lifted_union_recipe(),
-        )
+    pub fn rank9_descriptor(&self) -> Fragment {
+        let representation = <SuccinctArchiveRank9IndexBlob as MetaDescribe>::id();
+        let recipe = super::current_rank9_lifted_union_recipe();
+        crate::prelude::entity! {
+            crate::metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_source: self.collection(),
+            collection_representation: representation,
+            collection_recipe: recipe,
+        }
     }
 
     /// Attach the exact resident Succinct cover for `ticket` without writing.
@@ -249,7 +282,7 @@ fn classify_raw_merge_error(error: SuccinctArchiveRawMergeError) -> ExactAlgebra
 impl ExactDerivedAlgebra<SimpleArchive, SuccinctArchiveBlob> for SuccinctArchiveCollection {
     fn validate_source(
         &self,
-        descriptor: &CollectionDescriptor,
+        descriptor: &Fragment,
         source: &crate::blob::Blob<SimpleArchive>,
     ) -> Result<(), ExactAlgebraError> {
         if *descriptor != self.source_descriptor() {
@@ -262,7 +295,7 @@ impl ExactDerivedAlgebra<SimpleArchive, SuccinctArchiveBlob> for SuccinctArchive
 
     fn validate_target(
         &self,
-        descriptor: &CollectionDescriptor,
+        descriptor: &Fragment,
         target: &crate::blob::Blob<SuccinctArchiveBlob>,
     ) -> Result<(), ExactAlgebraError> {
         if *descriptor != self.descriptor() {
@@ -316,6 +349,8 @@ mod tests {
 
     use crate::blob::encodings::UnknownBlob;
     use crate::blob::{Blob, BlobEncoding, Bytes, IntoBlob, TryFromBlob};
+    use crate::collection::descriptor::{self, identity_for_tests};
+    use crate::collection::records::CollectionName;
     use crate::collection::{
         collection_physical_cover, discover_collection_records, resolve_collection_semantics,
         CollectionClaimValidation, CollectionData, CollectionDerive, CollectionMerge,
@@ -327,6 +362,15 @@ mod tests {
     use crate::repo::pile::{Pile, WantRewritePolicy};
     use crate::repo::{BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut, RetentionRoots};
     use crate::trible::{Trible, TribleSet, TRIBLE_LEN};
+
+    /// The one team every collection in these tests belongs to.
+    fn test_team() -> ed25519_dalek::VerifyingKey {
+        SigningKey::from_bytes(&[1; 32]).verifying_key()
+    }
+
+    fn test_collection(name: &str) -> SuccinctArchiveCollection {
+        SuccinctArchiveCollection::new(CollectionName::new(name).unwrap(), test_team())
+    }
 
     #[test]
     fn exact_succinct_capacity_classification_is_typed_and_contextual() {
@@ -347,7 +391,7 @@ mod tests {
             ExactAlgebraError::Capacity(_)
         ));
 
-        let collection = SuccinctArchiveCollection::new(Id::new([1; 16]).unwrap());
+        let collection = test_collection("first");
         let malformed = Blob::<SuccinctArchiveBlob>::new(Bytes::from(vec![0u8; 1]));
         assert!(matches!(
             collection.validate_target(&collection.descriptor(), &malformed),
@@ -746,10 +790,6 @@ mod tests {
         }
     }
 
-    fn id(byte: u8) -> Id {
-        Id::new([byte; 16]).unwrap()
-    }
-
     fn row(entity: u8, value: u8) -> Trible {
         let mut raw = [value; TRIBLE_LEN];
         raw[..16].fill(entity);
@@ -773,7 +813,7 @@ mod tests {
 
     fn signed_commit(
         store: &mut CollectionOnly,
-        scope: Id,
+        name: &CollectionName,
         key: u8,
         data: &Blob<SimpleArchive>,
     ) -> CollectionCommit {
@@ -782,7 +822,7 @@ mod tests {
             .unwrap();
         CollectionCommit::sign(
             &SigningKey::from_bytes(&[key; 32]),
-            simplearchive_union::descriptor(scope).handle(),
+            identity_for_tests(&simplearchive_union::descriptor(name, test_team())),
             Handle::<SimpleArchive>::to_hash(data.get_handle()),
             metadata,
         )
@@ -813,7 +853,7 @@ mod tests {
             .map(Result::unwrap)
             .filter_map(|record| match record {
                 CollectionRecord::Derive(claim)
-                    if claim.target() == collection.descriptor().handle() =>
+                    if claim.target() == collection.collection() =>
                 {
                     Some(claim)
                 }
@@ -834,7 +874,7 @@ mod tests {
             .map(Result::unwrap)
             .filter_map(|record| match record {
                 CollectionRecord::Derive(claim)
-                    if claim.target() == collection.rank9_descriptor().handle() =>
+                    if claim.target() == collection.rank9_collection() =>
                 {
                     Some(claim)
                 }
@@ -868,12 +908,12 @@ mod tests {
         TribleSet,
         Blob<SuccinctArchiveBlob>,
     ) {
-        let scope = id(scope_byte);
-        let collection = SuccinctArchiveCollection::new(scope);
+        let name = CollectionName::new(&format!("c{scope_byte}")).unwrap();
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team());
         let mut store = CollectionOnly::default();
         let expected = facts([(1, 3)]);
         let source = put_data(&mut store, &expected);
-        let commit = signed_commit(&mut store, scope, 1, &source);
+        let commit = signed_commit(&mut store, &name, 1, &source);
         publish(&mut store, commit);
         let cover = collection
             .kernel()
@@ -900,7 +940,7 @@ mod tests {
     ) -> CollectionCommit {
         let commit = CollectionCommit::sign(
             &SigningKey::from_bytes(&[key; 32]),
-            collection.source_descriptor().handle(),
+            collection.source_collection(),
             data(source),
             metadata,
         );
@@ -910,7 +950,7 @@ mod tests {
 
     #[test]
     fn rank9_descriptor_is_abi_profile_separated_and_wrong_recipe_is_inert() {
-        let collection = SuccinctArchiveCollection::new(id(7));
+        let collection = test_collection("c7");
         let current = collection.rank9_descriptor();
         let recipes = [
             super::super::RANK9_LIFTED_UNION_RECIPE_V1_32_LE,
@@ -919,32 +959,33 @@ mod tests {
             super::super::RANK9_LIFTED_UNION_RECIPE_V1_64_BE,
         ];
         assert_eq!(
-            current.representation().unwrap(),
+            descriptor::representation(&current).unwrap(),
             <SuccinctArchiveRank9IndexBlob as MetaDescribe>::id(),
         );
         assert_eq!(
-            current.recipe().unwrap(),
+            descriptor::recipe(&current).unwrap(),
             super::super::current_rank9_lifted_union_recipe(),
         );
         #[cfg(all(target_pointer_width = "32", target_endian = "little"))]
-        assert_eq!(current.recipe(), recipes[0]);
+        assert_eq!(descriptor::recipe(&current), recipes[0]);
         #[cfg(all(target_pointer_width = "32", target_endian = "big"))]
-        assert_eq!(current.recipe(), recipes[1]);
+        assert_eq!(descriptor::recipe(&current), recipes[1]);
         #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
-        assert_eq!(current.recipe().unwrap(), recipes[2]);
+        assert_eq!(descriptor::recipe(&current).unwrap(), recipes[2]);
         #[cfg(all(target_pointer_width = "64", target_endian = "big"))]
-        assert_eq!(current.recipe(), recipes[3]);
-        assert_ne!(current.recipe(), collection.descriptor().recipe());
+        assert_eq!(descriptor::recipe(&current), recipes[3]);
+        assert_ne!(descriptor::recipe(&current), descriptor::recipe(&collection.descriptor()));
         assert_eq!(recipes.into_iter().collect::<BTreeSet<_>>().len(), 4);
         let descriptors: BTreeSet<_> = recipes
             .into_iter()
             .map(|recipe| {
-                CollectionDescriptor::naming(
-                    collection.scope(),
-                    <SuccinctArchiveRank9IndexBlob as MetaDescribe>::id(),
-                    recipe,
-                )
-                .handle()
+                identity_for_tests(&crate::prelude::entity! {
+                    crate::metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+                    collection_source: collection.collection(),
+                    collection_representation:
+                        <SuccinctArchiveRank9IndexBlob as MetaDescribe>::id(),
+                    collection_recipe: recipe,
+                })
             })
             .collect();
         assert_eq!(descriptors.len(), 4);
@@ -956,16 +997,17 @@ mod tests {
             .unwrap();
         let wrong_recipe = recipes
             .into_iter()
-            .find(|recipe| *recipe != current.recipe().unwrap())
+            .find(|recipe| *recipe != descriptor::recipe(&current).unwrap())
             .unwrap();
-        let wrong_target = CollectionDescriptor::naming(
-            collection.scope(),
-            <SuccinctArchiveRank9IndexBlob as MetaDescribe>::id(),
-            wrong_recipe,
-        );
+        let wrong_target = crate::prelude::entity! {
+            crate::metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_source: collection.collection(),
+            collection_representation: <SuccinctArchiveRank9IndexBlob as MetaDescribe>::id(),
+            collection_recipe: wrong_recipe,
+        };
         store
             .insert(CollectionRecord::Derive(CollectionDerive::new(
-                wrong_target.handle(),
+                identity_for_tests(&wrong_target),
                 data(&raw),
                 data(&sidecar),
             )))
@@ -980,8 +1022,8 @@ mod tests {
 
     #[test]
     fn real_lifted_rank9_derives_close_the_commuting_square() {
-        let scope = id(9);
-        let collection = SuccinctArchiveCollection::new(scope);
+        let name = CollectionName::new("c9").unwrap();
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team());
         let a = facts([(1, 3)]).to_blob();
         let b = facts([(2, 4)]).to_blob();
         let raw_a = super::super::derive_element(&a).unwrap();
@@ -1002,13 +1044,13 @@ mod tests {
         let metadata = TribleSet::new().to_blob().get_handle();
         let first = CollectionCommit::sign(
             &SigningKey::from_bytes(&[1; 32]),
-            collection.source_descriptor().handle(),
+            collection.source_collection(),
             data(&a),
             metadata,
         );
         let second = CollectionCommit::sign(
             &SigningKey::from_bytes(&[2; 32]),
-            collection.source_descriptor().handle(),
+            collection.source_collection(),
             data(&b),
             metadata,
         );
@@ -1017,33 +1059,33 @@ mod tests {
             CollectionRecord::Commit(first),
             CollectionRecord::Commit(second),
             CollectionRecord::Derive(CollectionDerive::new(
-                collection.descriptor().handle(),
+                collection.collection(),
                 data(&a),
                 data(&raw_a),
             )),
             CollectionRecord::Derive(CollectionDerive::new(
-                collection.descriptor().handle(),
+                collection.collection(),
                 data(&b),
                 data(&raw_b),
             )),
             CollectionRecord::Merge(CollectionMerge::new(
-                collection.descriptor().handle(),
+                collection.collection(),
                 data(&raw_a),
                 data(&raw_b),
                 data(&raw_ab),
             )),
             CollectionRecord::Derive(CollectionDerive::new(
-                collection.rank9_descriptor().handle(),
+                collection.rank9_collection(),
                 data(&raw_a),
                 data(&rank_a),
             )),
             CollectionRecord::Derive(CollectionDerive::new(
-                collection.rank9_descriptor().handle(),
+                collection.rank9_collection(),
                 data(&raw_b),
                 data(&rank_b),
             )),
             CollectionRecord::Derive(CollectionDerive::new(
-                collection.rank9_descriptor().handle(),
+                collection.rank9_collection(),
                 data(&raw_ab),
                 data(&rank_ab),
             )),
@@ -1052,7 +1094,7 @@ mod tests {
         }
         assert!(!store.records().unwrap().map(Result::unwrap).any(|record| {
             matches!(record, CollectionRecord::Merge(claim)
-                if claim.collection() == collection.rank9_descriptor().handle())
+                if claim.collection() == collection.rank9_collection())
         }));
         let discovered = discover_collection_records(&mut store).unwrap();
         let authorized = BTreeSet::from([first.id(), second.id()]);
@@ -1063,12 +1105,12 @@ mod tests {
                 // the SimpleArchive one, and the Rank9 sidecar from the raw.
                 &std::collections::BTreeMap::from([
                     (
-                        collection.descriptor().handle(),
-                        collection.source_descriptor().handle(),
+                        collection.collection(),
+                        collection.source_collection(),
                     ),
                     (
-                        collection.rank9_descriptor().handle(),
-                        collection.descriptor().handle(),
+                        collection.rank9_collection(),
+                        collection.collection(),
                     ),
                 ]),
                 &authorized,
@@ -1076,7 +1118,7 @@ mod tests {
             )
             .unwrap();
         let semantics = resolution.semantics();
-        let rank9_collection = collection.rank9_descriptor().handle();
+        let rank9_collection = collection.rank9_collection();
         let expected_frontier = BTreeSet::from([data(&rank_ab)]);
         assert_eq!(
             semantics.frontier(rank9_collection),
@@ -1094,15 +1136,15 @@ mod tests {
 
     #[test]
     fn ensured_fibers_are_one_to_one_deterministic_exact_and_zero_write_when_complete() {
-        let scope = id(10);
-        let collection = SuccinctArchiveCollection::new(scope);
+        let name = CollectionName::new("c10").unwrap();
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team());
         let mut store = CollectionOnly::default();
         let left_facts = facts([(1, 3)]);
         let right_facts = facts([(2, 4)]);
         let left = put_data(&mut store, &left_facts);
         let right = put_data(&mut store, &right_facts);
-        let first = signed_commit(&mut store, scope, 1, &left);
-        let second = signed_commit(&mut store, scope, 2, &right);
+        let first = signed_commit(&mut store, &name, 1, &left);
+        let second = signed_commit(&mut store, &name, 2, &right);
         publish(&mut store, first);
         publish(&mut store, second);
 
@@ -1165,7 +1207,7 @@ mod tests {
             .unwrap();
         store
             .insert(CollectionRecord::Derive(CollectionDerive::new(
-                collection.rank9_descriptor().handle(),
+                collection.rank9_collection(),
                 data(&raw),
                 data(&malformed),
             )))
@@ -1186,7 +1228,7 @@ mod tests {
             .unwrap();
         other_store
             .insert(CollectionRecord::Derive(CollectionDerive::new(
-                other_collection.rank9_descriptor().handle(),
+                other_collection.rank9_collection(),
                 data(&other_raw),
                 data(&foreign),
             )))
@@ -1210,7 +1252,7 @@ mod tests {
                 .unwrap();
             store
                 .insert(CollectionRecord::Derive(CollectionDerive::new(
-                    collection.rank9_descriptor().handle(),
+                    collection.rank9_collection(),
                     data(&raw),
                     data(sidecar),
                 )))
@@ -1237,7 +1279,7 @@ mod tests {
             .unwrap();
         store
             .insert(CollectionRecord::Derive(CollectionDerive::new(
-                collection.rank9_descriptor().handle(),
+                collection.rank9_collection(),
                 data(&raw),
                 data(&canonical),
             )))
@@ -1263,7 +1305,7 @@ mod tests {
         base.put::<SuccinctArchiveRank9IndexBlob, _>(canonical.clone())
             .unwrap();
         base.insert(CollectionRecord::Derive(CollectionDerive::new(
-            collection.rank9_descriptor().handle(),
+            collection.rank9_collection(),
             data(&raw),
             data(&canonical),
         )))
@@ -1273,7 +1315,7 @@ mod tests {
             Bytes::from(b"corrupt canonical sidecar".to_vec()),
             canonical.get_handle(),
         ));
-        let mut store = FaultStore::new(base.repo, collection.rank9_descriptor().handle());
+        let mut store = FaultStore::new(base.repo, collection.rank9_collection());
         store.replace_rank9_on_put = Some(data(&canonical));
 
         let attached = collection.attach_exact(&mut store, &[commit]).unwrap();
@@ -1293,7 +1335,7 @@ mod tests {
     #[test]
     fn endpoint_failure_precedes_and_prevents_rank9_derive_publication() {
         let (collection, base, commit, _, _) = one_raw_fixture(15);
-        let mut store = FaultStore::new(base.repo, collection.rank9_descriptor().handle());
+        let mut store = FaultStore::new(base.repo, collection.rank9_collection());
         store.fail_rank9_put = true;
         assert!(matches!(
             collection.ensure_exact(&mut store, &[commit]),
@@ -1308,7 +1350,7 @@ mod tests {
     fn fresh_verification_rejects_dropped_sidecar_and_dropped_claim() {
         let (collection, base, commit, _, _) = one_raw_fixture(16);
         let mut dropped_sidecar =
-            FaultStore::new(base.repo, collection.rank9_descriptor().handle());
+            FaultStore::new(base.repo, collection.rank9_collection());
         dropped_sidecar.drop_rank9_put = true;
         assert!(matches!(
             collection.ensure_exact(&mut dropped_sidecar, &[commit]),
@@ -1320,7 +1362,7 @@ mod tests {
 
         let (collection, base, commit, _, raw) = one_raw_fixture(17);
         let canonical = SuccinctArchive::<OrderedUniverse>::build_rank9_index(raw).unwrap();
-        let mut dropped_claim = FaultStore::new(base.repo, collection.rank9_descriptor().handle());
+        let mut dropped_claim = FaultStore::new(base.repo, collection.rank9_collection());
         dropped_claim.drop_rank9_claim = true;
         assert!(matches!(
             collection.ensure_exact(&mut dropped_claim, &[commit]),
@@ -1335,13 +1377,13 @@ mod tests {
 
     #[test]
     fn partial_claim_publication_retries_to_exactly_one_claim_per_member() {
-        let scope = id(18);
-        let collection = SuccinctArchiveCollection::new(scope);
+        let name = CollectionName::new("c18").unwrap();
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team());
         let mut base = CollectionOnly::default();
         let left = put_data(&mut base, &facts([(1, 3)]));
         let right = put_data(&mut base, &facts([(2, 4)]));
-        let first = signed_commit(&mut base, scope, 1, &left);
-        let second = signed_commit(&mut base, scope, 2, &right);
+        let first = signed_commit(&mut base, &name, 1, &left);
+        let second = signed_commit(&mut base, &name, 2, &right);
         publish(&mut base, first);
         publish(&mut base, second);
         let cover = collection
@@ -1350,7 +1392,7 @@ mod tests {
             .unwrap();
         assert_eq!(cover.len(), 2);
         drop(cover);
-        let mut store = FaultStore::new(base.repo, collection.rank9_descriptor().handle());
+        let mut store = FaultStore::new(base.repo, collection.rank9_collection());
         store.fail_rank9_claim_at = Some(2);
 
         assert!(matches!(
@@ -1377,13 +1419,13 @@ mod tests {
 
     #[test]
     fn rank9_publication_drops_readers_and_orders_all_endpoints_before_claims() {
-        let scope = id(19);
-        let collection = SuccinctArchiveCollection::new(scope);
+        let name = CollectionName::new("c19").unwrap();
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team());
         let mut base = CollectionOnly::default();
         let left = put_data(&mut base, &facts([(1, 3)]));
         let right = put_data(&mut base, &facts([(2, 4)]));
-        let first = signed_commit(&mut base, scope, 1, &left);
-        let second = signed_commit(&mut base, scope, 2, &right);
+        let first = signed_commit(&mut base, &name, 1, &left);
+        let second = signed_commit(&mut base, &name, 2, &right);
         publish(&mut base, first);
         publish(&mut base, second);
         let cover = collection
@@ -1409,7 +1451,7 @@ mod tests {
             .iter()
             .position(|event| {
                 matches!(event, FiberWriteEvent::Insert(CollectionRecord::Derive(claim))
-                    if claim.target() == collection.rank9_descriptor().handle())
+                    if claim.target() == collection.rank9_collection())
             })
             .expect("fiber publication emits a Rank9 DERIVE");
         let sidecar_puts: Vec<_> = store
@@ -1427,9 +1469,9 @@ mod tests {
             .collect();
         assert_eq!(sidecar_puts.len(), 2);
         assert!(sidecar_puts.iter().all(|(index, _)| *index < first_claim));
-        let raw_descriptor = Handle::<SimpleArchive>::to_hash(collection.descriptor().handle());
+        let raw_descriptor = Handle::<SimpleArchive>::to_hash(collection.collection());
         let rank9_descriptor =
-            Handle::<SimpleArchive>::to_hash(collection.rank9_descriptor().handle());
+            Handle::<SimpleArchive>::to_hash(collection.rank9_collection());
         for descriptor in [raw_descriptor, rank9_descriptor] {
             assert!(store.events[..first_claim].iter().any(
                 |event| matches!(event, FiberWriteEvent::Put(_, data) if *data == descriptor)
@@ -1442,7 +1484,7 @@ mod tests {
             .iter()
             .filter_map(|event| match event {
                 FiberWriteEvent::Insert(CollectionRecord::Derive(claim))
-                    if claim.target() == collection.rank9_descriptor().handle() =>
+                    if claim.target() == collection.rank9_collection() =>
                 {
                     Some(claim.mapping().0)
                 }
@@ -1455,13 +1497,13 @@ mod tests {
 
     #[test]
     fn compaction_builds_only_the_selected_raw_cover_fiber_and_no_rank9_merge() {
-        let scope = id(20);
-        let collection = SuccinctArchiveCollection::new(scope);
+        let name = CollectionName::new("c20").unwrap();
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team());
         let mut store = CollectionOnly::default();
         let left = put_data(&mut store, &facts([(1, 3)]));
         let right = put_data(&mut store, &facts([(2, 4)]));
-        let first = signed_commit(&mut store, scope, 1, &left);
-        let second = signed_commit(&mut store, scope, 2, &right);
+        let first = signed_commit(&mut store, &name, 1, &left);
+        let second = signed_commit(&mut store, &name, 2, &right);
         publish(&mut store, first);
         publish(&mut store, second);
         let cover = collection
@@ -1482,7 +1524,7 @@ mod tests {
             .into_iter()
             .find_map(|record| match record {
                 CollectionRecord::Merge(claim)
-                    if claim.collection() == collection.descriptor().handle() =>
+                    if claim.collection() == collection.collection() =>
                 {
                     Some(claim.result())
                 }
@@ -1492,13 +1534,13 @@ mod tests {
         assert_eq!(rank9_claims[0].mapping().0, merged_raw);
         assert!(!records(&mut store).into_iter().any(|record| {
             matches!(record, CollectionRecord::Merge(claim)
-                if claim.collection() == collection.rank9_descriptor().handle())
+                if claim.collection() == collection.rank9_collection())
         }));
     }
 
     #[test]
     fn empty_ticket_is_one_authority_free_local_shard_and_performs_no_io() {
-        let collection = SuccinctArchiveCollection::new(id(7));
+        let collection = test_collection("c7");
         let mut store = PanicStore;
         for attached in [
             collection.attach_exact(&mut store, &[]).unwrap(),
@@ -1512,11 +1554,11 @@ mod tests {
 
     #[test]
     fn signed_empty_source_still_publishes_nonempty_ticket_provenance() {
-        let scope = id(7);
-        let collection = SuccinctArchiveCollection::new(scope);
+        let name = CollectionName::new("c7").unwrap();
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team());
         let mut store = CollectionOnly::default();
         let source = put_data(&mut store, &TribleSet::new());
-        let commit = signed_commit(&mut store, scope, 1, &source);
+        let commit = signed_commit(&mut store, &name, 1, &source);
         publish(&mut store, commit);
 
         let attached = collection.ensure_exact(&mut store, &[commit]).unwrap();
@@ -1526,7 +1568,7 @@ mod tests {
             .into_iter()
             .filter_map(|record| match record {
                 CollectionRecord::Derive(claim)
-                    if claim.target() == collection.descriptor().handle() =>
+                    if claim.target() == collection.collection() =>
                 {
                     Some(claim.mapping())
                 }
@@ -1540,15 +1582,15 @@ mod tests {
 
     #[test]
     fn missing_attach_then_ensure_builds_exact_raw_cover() {
-        let scope = id(7);
-        let collection = SuccinctArchiveCollection::new(scope);
+        let name = CollectionName::new("c7").unwrap();
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team());
         let mut store = CollectionOnly::default();
         let left_facts = facts([(1, 3)]);
         let right_facts = facts([(2, 4)]);
         let left = put_data(&mut store, &left_facts);
         let right = put_data(&mut store, &right_facts);
-        let first = signed_commit(&mut store, scope, 1, &left);
-        let second = signed_commit(&mut store, scope, 2, &right);
+        let first = signed_commit(&mut store, &name, 1, &left);
+        let second = signed_commit(&mut store, &name, 2, &right);
         publish(&mut store, first);
         publish(&mut store, second);
         assert!(matches!(
@@ -1566,15 +1608,15 @@ mod tests {
 
     #[test]
     fn explicit_compaction_returns_one_exact_real_succinct_shard() {
-        let scope = id(7);
-        let collection = SuccinctArchiveCollection::new(scope);
+        let name = CollectionName::new("c7").unwrap();
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team());
         let mut store = CollectionOnly::default();
         let left_facts = facts([(1, 3)]);
         let right_facts = facts([(2, 4)]);
         let left = put_data(&mut store, &left_facts);
         let right = put_data(&mut store, &right_facts);
-        let first = signed_commit(&mut store, scope, 1, &left);
-        let second = signed_commit(&mut store, scope, 2, &right);
+        let first = signed_commit(&mut store, &name, 1, &left);
+        let second = signed_commit(&mut store, &name, 2, &right);
         publish(&mut store, first);
         publish(&mut store, second);
 
@@ -1586,19 +1628,19 @@ mod tests {
         assert!(records(&mut store).into_iter().any(|record| matches!(
             record,
             CollectionRecord::Merge(claim)
-                if claim.collection() == collection.descriptor().handle()
+                if claim.collection() == collection.collection()
         )));
     }
 
     #[test]
     fn duplicate_provenance_shares_one_raw_derive() {
-        let scope = id(7);
-        let collection = SuccinctArchiveCollection::new(scope);
+        let name = CollectionName::new("c7").unwrap();
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team());
         let mut store = CollectionOnly::default();
         let expected = facts([(1, 3)]);
         let source = put_data(&mut store, &expected);
-        let first = signed_commit(&mut store, scope, 1, &source);
-        let second = signed_commit(&mut store, scope, 2, &source);
+        let first = signed_commit(&mut store, &name, 1, &source);
+        let second = signed_commit(&mut store, &name, 2, &source);
         publish(&mut store, first);
         publish(&mut store, second);
         let attached = collection
@@ -1609,7 +1651,7 @@ mod tests {
             .into_iter()
             .filter(|record| {
                 matches!(record, CollectionRecord::Derive(claim)
-                if claim.target() == collection.descriptor().handle())
+                if claim.target() == collection.collection())
             })
             .count();
         assert_eq!(derives, 1);
@@ -1620,15 +1662,15 @@ mod tests {
 
     #[test]
     fn resident_source_merge_is_reused_as_one_shard() {
-        let scope = id(7);
-        let collection = SuccinctArchiveCollection::new(scope);
+        let name = CollectionName::new("c7").unwrap();
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team());
         let mut store = CollectionOnly::default();
         let left_facts = facts([(1, 3)]);
         let right_facts = facts([(2, 4)]);
         let left = put_data(&mut store, &left_facts);
         let right = put_data(&mut store, &right_facts);
-        let first = signed_commit(&mut store, scope, 1, &left);
-        let second = signed_commit(&mut store, scope, 2, &right);
+        let first = signed_commit(&mut store, &name, 1, &left);
+        let second = signed_commit(&mut store, &name, 2, &right);
         publish(&mut store, first);
         publish(&mut store, second);
         let source_union = simplearchive_union::join(&left, &right).unwrap();
@@ -1636,7 +1678,7 @@ mod tests {
         let source_union_data = data(&source_union);
         store
             .insert(CollectionRecord::Merge(CollectionMerge::new(
-                collection.source_descriptor().handle(),
+                collection.source_collection(),
                 first.data(),
                 second.data(),
                 source_union_data,
@@ -1651,7 +1693,7 @@ mod tests {
             .into_iter()
             .filter_map(|record| match record {
                 CollectionRecord::Derive(claim)
-                    if claim.target() == collection.descriptor().handle() =>
+                    if claim.target() == collection.collection() =>
                 {
                     Some(claim.mapping().0)
                 }
@@ -1663,15 +1705,15 @@ mod tests {
 
     #[test]
     fn existing_target_merge_is_selected_as_one_shard() {
-        let scope = id(7);
-        let collection = SuccinctArchiveCollection::new(scope);
+        let name = CollectionName::new("c7").unwrap();
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team());
         let mut store = CollectionOnly::default();
         let left_facts = facts([(1, 3)]);
         let right_facts = facts([(2, 4)]);
         let left = put_data(&mut store, &left_facts);
         let right = put_data(&mut store, &right_facts);
-        let first = signed_commit(&mut store, scope, 1, &left);
-        let second = signed_commit(&mut store, scope, 2, &right);
+        let first = signed_commit(&mut store, &name, 1, &left);
+        let second = signed_commit(&mut store, &name, 2, &right);
         publish(&mut store, first);
         publish(&mut store, second);
         let left_raw = super::super::derive_element(&left).unwrap();
@@ -1680,7 +1722,7 @@ mod tests {
             store.put::<SuccinctArchiveBlob, _>(output.clone()).unwrap();
             store
                 .insert(CollectionRecord::Derive(CollectionDerive::new(
-                    collection.descriptor().handle(),
+                    collection.collection(),
                     data(input),
                     data(output),
                 )))
@@ -1690,7 +1732,7 @@ mod tests {
         store.put::<SuccinctArchiveBlob, _>(joined.clone()).unwrap();
         store
             .insert(CollectionRecord::Merge(CollectionMerge::new(
-                collection.descriptor().handle(),
+                collection.collection(),
                 data(&left_raw),
                 data(&right_raw),
                 data(&joined),
@@ -1705,15 +1747,15 @@ mod tests {
 
     #[test]
     fn corrupt_upper_target_artifact_falls_back_to_valid_lower_cover() {
-        let scope = id(7);
-        let collection = SuccinctArchiveCollection::new(scope);
+        let name = CollectionName::new("c7").unwrap();
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team());
         let mut store = CollectionOnly::default();
         let left_facts = facts([(1, 3)]);
         let right_facts = facts([(2, 4)]);
         let left = put_data(&mut store, &left_facts);
         let right = put_data(&mut store, &right_facts);
-        let first = signed_commit(&mut store, scope, 1, &left);
-        let second = signed_commit(&mut store, scope, 2, &right);
+        let first = signed_commit(&mut store, &name, 1, &left);
+        let second = signed_commit(&mut store, &name, 2, &right);
         publish(&mut store, first);
         publish(&mut store, second);
 
@@ -1723,7 +1765,7 @@ mod tests {
             store.put::<SuccinctArchiveBlob, _>(output.clone()).unwrap();
             store
                 .insert(CollectionRecord::Derive(CollectionDerive::new(
-                    collection.descriptor().handle(),
+                    collection.collection(),
                     data(input),
                     data(output),
                 )))
@@ -1735,7 +1777,7 @@ mod tests {
         store.put::<SuccinctArchiveBlob, _>(forged).unwrap();
         store
             .insert(CollectionRecord::Merge(CollectionMerge::new(
-                collection.descriptor().handle(),
+                collection.collection(),
                 data(&left_raw),
                 data(&right_raw),
                 data(&joined),
@@ -1751,18 +1793,18 @@ mod tests {
 
     #[test]
     fn old_ticket_stays_stable_after_later_commit_and_cache() {
-        let scope = id(7);
-        let collection = SuccinctArchiveCollection::new(scope);
+        let name = CollectionName::new("c7").unwrap();
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team());
         let mut store = CollectionOnly::default();
         let old_facts = facts([(1, 3)]);
         let old = put_data(&mut store, &old_facts);
-        let first = signed_commit(&mut store, scope, 1, &old);
+        let first = signed_commit(&mut store, &name, 1, &old);
         publish(&mut store, first);
         collection.ensure_exact(&mut store, &[first]).unwrap();
 
         let later_facts = facts([(2, 4)]);
         let later = put_data(&mut store, &later_facts);
-        let second = signed_commit(&mut store, scope, 2, &later);
+        let second = signed_commit(&mut store, &name, 2, &later);
         publish(&mut store, second);
         let later_raw = super::super::derive_element(&later).unwrap();
         store
@@ -1770,7 +1812,7 @@ mod tests {
             .unwrap();
         store
             .insert(CollectionRecord::Derive(CollectionDerive::new(
-                collection.descriptor().handle(),
+                collection.collection(),
                 second.data(),
                 data(&later_raw),
             )))
@@ -1783,17 +1825,17 @@ mod tests {
 
     #[test]
     fn missing_derive_output_is_not_support_and_ensure_rebuilds_it() {
-        let scope = id(7);
-        let collection = SuccinctArchiveCollection::new(scope);
+        let name = CollectionName::new("c7").unwrap();
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team());
         let mut store = CollectionOnly::default();
         let expected = facts([(1, 3)]);
         let source = put_data(&mut store, &expected);
-        let commit = signed_commit(&mut store, scope, 1, &source);
+        let commit = signed_commit(&mut store, &name, 1, &source);
         publish(&mut store, commit);
         let missing = super::super::derive_element(&source).unwrap();
         store
             .insert(CollectionRecord::Derive(CollectionDerive::new(
-                collection.descriptor().handle(),
+                collection.collection(),
                 commit.data(),
                 data(&missing),
             )))
@@ -1812,19 +1854,19 @@ mod tests {
 
     #[test]
     fn ungrounded_source_superset_never_enters_smaller_ticket() {
-        let scope = id(7);
-        let collection = SuccinctArchiveCollection::new(scope);
+        let name = CollectionName::new("c7").unwrap();
+        let collection = SuccinctArchiveCollection::new(name.clone(), test_team());
         let mut store = CollectionOnly::default();
         let expected = facts([(1, 3)]);
         let a = put_data(&mut store, &expected);
         let c = put_data(&mut store, &facts([(3, 5)]));
-        let commit = signed_commit(&mut store, scope, 1, &a);
+        let commit = signed_commit(&mut store, &name, 1, &a);
         publish(&mut store, commit);
         let superset = simplearchive_union::join(&a, &c).unwrap();
         store.put::<SimpleArchive, _>(superset.clone()).unwrap();
         store
             .insert(CollectionRecord::Merge(CollectionMerge::new(
-                collection.source_descriptor().handle(),
+                collection.source_collection(),
                 data(&a),
                 data(&c),
                 data(&superset),
@@ -1836,7 +1878,7 @@ mod tests {
             .into_iter()
             .filter_map(|record| match record {
                 CollectionRecord::Derive(claim)
-                    if claim.target() == collection.descriptor().handle() =>
+                    if claim.target() == collection.collection() =>
                 {
                     Some(claim.mapping().0)
                 }
@@ -1856,9 +1898,9 @@ mod tests {
         let mut source_store = Pile::open(&source_path).unwrap();
         let mut retained_store = Pile::open(&retained_path).unwrap();
 
-        let collection = SuccinctArchiveCollection::new(id(7));
-        let source_descriptor = CollectionDescriptor::to_blob(&collection.source_descriptor());
-        let target_descriptor = CollectionDescriptor::to_blob(&collection.descriptor());
+        let collection = test_collection("c7");
+        let source_descriptor = IntoBlob::<SimpleArchive>::to_blob(collection.source_descriptor().into_facts());
+        let target_descriptor = IntoBlob::<SimpleArchive>::to_blob(collection.descriptor().into_facts());
         source_store
             .put::<SimpleArchive, _>(source_descriptor.clone())
             .unwrap();
@@ -1896,23 +1938,23 @@ mod tests {
         }
         for record in [
             CollectionRecord::Merge(CollectionMerge::new(
-                collection.source_descriptor().handle(),
+                collection.source_collection(),
                 data(&a),
                 data(&b),
                 data(&ab),
             )),
             CollectionRecord::Derive(CollectionDerive::new(
-                collection.descriptor().handle(),
+                collection.collection(),
                 data(&ab),
                 data(&succinct_ab),
             )),
             CollectionRecord::Derive(CollectionDerive::new(
-                collection.descriptor().handle(),
+                collection.collection(),
                 data(&c),
                 data(&succinct_c),
             )),
             CollectionRecord::Merge(CollectionMerge::new(
-                collection.descriptor().handle(),
+                collection.collection(),
                 data(&succinct_ab),
                 data(&succinct_c),
                 data(&succinct_abc),
@@ -1929,7 +1971,7 @@ mod tests {
         assert_eq!(rank9_claims[0].mapping().0, data(&succinct_abc));
         let rank9_handle =
             Handle::<SuccinctArchiveRank9IndexBlob>::from_hash(rank9_claims[0].mapping().1);
-        let rank9_descriptor = CollectionDescriptor::to_blob(&collection.rank9_descriptor());
+        let rank9_descriptor = IntoBlob::<SimpleArchive>::to_blob(collection.rank9_descriptor().into_facts());
         source_store.flush().unwrap();
 
         let mut roots = RetentionRoots::new();
@@ -2010,10 +2052,10 @@ mod tests {
         let mut source_store = Pile::open(&source_path).unwrap();
         let mut retained_store = Pile::open(&retained_path).unwrap();
 
-        let collection = SuccinctArchiveCollection::new(id(8));
+        let collection = test_collection("c8");
         source_store
-            .put::<SimpleArchive, _>(CollectionDescriptor::to_blob(
-                &collection.source_descriptor(),
+            .put::<SimpleArchive, _>(IntoBlob::<SimpleArchive>::to_blob(
+                collection.source_descriptor().into_facts(),
             ))
             .unwrap();
         let metadata = source_store
@@ -2036,13 +2078,13 @@ mod tests {
         source_store.put::<SimpleArchive, _>(abc.clone()).unwrap();
         for record in [
             CollectionRecord::Merge(CollectionMerge::new(
-                collection.source_descriptor().handle(),
+                collection.source_collection(),
                 data(&a),
                 data(&b),
                 data(&ab),
             )),
             CollectionRecord::Merge(CollectionMerge::new(
-                collection.source_descriptor().handle(),
+                collection.source_collection(),
                 data(&ab),
                 data(&c),
                 data(&abc),
@@ -2075,7 +2117,7 @@ mod tests {
             .map(Result::unwrap)
             .filter_map(|record| match record {
                 CollectionRecord::Derive(claim)
-                    if claim.target() == collection.descriptor().handle() =>
+                    if claim.target() == collection.collection() =>
                 {
                     Some(claim.mapping().0)
                 }

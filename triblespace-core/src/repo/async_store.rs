@@ -735,9 +735,8 @@ mod tests {
     use crate::blob::encodings::simplearchive::SimpleArchive;
     use crate::blob::Blob;
     use crate::blob::MemoryBlobStore;
-    use crate::collection::{
-        CollectionDescriptor, CollectionMerge, CollectionRecord, CollectionStore,
-    };
+    use crate::collection::descriptor::{identity_for_tests, named_for_tests};
+    use crate::collection::{CollectionMerge, CollectionRecord, CollectionStore};
     use crate::id::{ExclusiveId, Id};
     use crate::macros::entity;
     use crate::repo::memoryrepo::MemoryRepo;
@@ -755,13 +754,13 @@ mod tests {
     }
 
     fn collection_record(tag: u8) -> CollectionRecord {
-        let descriptor = CollectionDescriptor::naming(
-            Id::new([tag; 16]).unwrap(),
+        let descriptor = named_for_tests(
+            &format!("tagged-{tag}"),
             Id::new([tag.wrapping_add(1).max(1); 16]).unwrap(),
             Id::new([tag.wrapping_add(2).max(1); 16]).unwrap(),
         );
         CollectionRecord::Merge(CollectionMerge::new(
-            descriptor.handle(),
+            identity_for_tests(&descriptor),
             Inline::new([tag.wrapping_add(3); 32]),
             Inline::new([tag.wrapping_add(4); 32]),
             Inline::new([tag.wrapping_add(5); 32]),

@@ -407,11 +407,14 @@ using the ordinary blob store.
 The descriptor archive holds a descriptor entity carrying:
 
 - `metadata::tag`, the descriptor kind;
-- exactly one anchor — `collection_scope` on a root, or `collection_source` on
-  a derivation, naming by handle the collection it derives from. A derivation
-  needs no anchor of its own, because its source already anchors it, and naming
-  that source by handle rather than by a shared label means a descriptor cannot
-  claim a lineage it does not have;
+- one anchor — `collection_name` plus `collection_team` on a root, or
+  `collection_source` on a derivation, naming by handle the collection it
+  derives from. A root is addressed by a name within a team, so a reader holding
+  the pile can say which collection this is instead of needing the code that
+  minted an opaque id. A derivation carries neither: its source already anchors
+  it and its team is inherited by walking that source to a root, and naming the
+  source by handle rather than by a shared label means a descriptor cannot claim
+  a lineage it does not have;
 - `collection_representation` and `collection_recipe`, naming the blob schema
   and the construction/merge law;
 - any arguments the recipe takes, as ordinary tribles — which attribute an

@@ -658,25 +658,38 @@ mod tests {
     use triblespace_core::blob::encodings::UnknownBlob;
     use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace_core::blob::{Blob, IntoBlob};
+    use triblespace_core::collection::records::CollectionName;
     use triblespace_core::collection::{
-        CollectionData, CollectionDescriptor, empty_metadata_handle, simplearchive_union,
+        CollectionData, CollectionHandle, empty_metadata_handle, simplearchive_union,
     };
-    use triblespace_core::id::Id;
+    use triblespace_core::trible::Fragment;
     use triblespace_core::inline::Inline;
     use triblespace_core::inline::encodings::hash::Handle;
     use triblespace_core::trible::TribleSet;
 
     use super::*;
 
-    fn id(byte: u8) -> Id {
-        Id::new([byte; 16]).unwrap()
+    /// The one team every collection in these tests belongs to.
+    fn test_team() -> triblespace_core::collection::VerifyingKey {
+        SigningKey::from_bytes(&[1; 32]).verifying_key()
     }
 
-    fn commit(author: &SigningKey, descriptor: &CollectionDescriptor) -> CollectionCommit {
+    /// A named root of the canonical `SimpleArchive` union kind.
+    fn root(name: &str) -> Fragment {
+        simplearchive_union::descriptor(&CollectionName::new(name).unwrap(), test_team())
+    }
+
+    /// These wire tests only need identities to address records by; nothing
+    /// stores the descriptors they come from.
+    fn collection_of(descriptor: &Fragment) -> CollectionHandle {
+        IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()).get_handle()
+    }
+
+    fn commit(author: &SigningKey, descriptor: &Fragment) -> CollectionCommit {
         let data: Blob<SimpleArchive> = TribleSet::new().to_blob();
         CollectionCommit::sign(
             author,
-            descriptor.handle(),
+            collection_of(descriptor),
             Handle::<SimpleArchive>::to_hash(data.get_handle()),
             empty_metadata_handle(),
         )
@@ -688,10 +701,10 @@ mod tests {
 
     #[test]
     fn operation_request_codec_reuses_want_bytes_and_rejects_blobs() {
-        let source = simplearchive_union::descriptor(id(41));
-        let target = simplearchive_union::descriptor(id(42));
-        let merge = WantRequest::merge(source.handle(), data(9), data(2));
-        let derive = WantRequest::derive(target.handle(), data(3));
+        let source = root("c41");
+        let target = root("c42");
+        let merge = WantRequest::merge(collection_of(&source), data(9), data(2));
+        let derive = WantRequest::derive(collection_of(&target), data(3));
 
         for request in [merge, derive] {
             let bytes = encode_collection_operation_request(request).unwrap();
@@ -742,15 +755,15 @@ mod tests {
 
     #[test]
     fn merge_receipt_response_is_untagged_exact_and_deterministic() {
-        let descriptor = simplearchive_union::descriptor(id(43));
-        let other_descriptor = simplearchive_union::descriptor(id(44));
-        let request = WantRequest::merge(descriptor.handle(), data(1), data(2));
-        let first = CollectionMerge::new(descriptor.handle(), data(1), data(2), data(3));
-        let conflicting = CollectionMerge::new(descriptor.handle(), data(1), data(2), data(4));
-        let unrelated = CollectionMerge::new(descriptor.handle(), data(1), data(9), data(5));
+        let descriptor = root("c43");
+        let other_descriptor = root("c44");
+        let request = WantRequest::merge(collection_of(&descriptor), data(1), data(2));
+        let first = CollectionMerge::new(collection_of(&descriptor), data(1), data(2), data(3));
+        let conflicting = CollectionMerge::new(collection_of(&descriptor), data(1), data(2), data(4));
+        let unrelated = CollectionMerge::new(collection_of(&descriptor), data(1), data(9), data(5));
         let wrong_collection =
-            CollectionMerge::new(other_descriptor.handle(), data(1), data(2), data(6));
-        let derive = CollectionDerive::new(other_descriptor.handle(), data(1), data(7));
+            CollectionMerge::new(collection_of(&other_descriptor), data(1), data(2), data(6));
+        let derive = CollectionDerive::new(collection_of(&other_descriptor), data(1), data(7));
         let signed = commit(&SigningKey::from_bytes(&[45; 32]), &descriptor);
 
         let encoded = encode_collection_operation_receipts(
@@ -791,12 +804,11 @@ mod tests {
 
     #[test]
     fn derive_receipts_preserve_conflicts_and_require_exact_inputs() {
-        let source = simplearchive_union::descriptor(id(46));
-        let target = simplearchive_union::descriptor(id(47));
-        let request = WantRequest::derive(target.handle(), data(1));
-        let first = CollectionDerive::new(target.handle(), data(1), data(2));
-        let conflicting = CollectionDerive::new(target.handle(), data(1), data(3));
-        let unrelated = CollectionDerive::new(target.handle(), data(9), data(2));
+        let target = root("c47");
+        let request = WantRequest::derive(collection_of(&target), data(1));
+        let first = CollectionDerive::new(collection_of(&target), data(1), data(2));
+        let conflicting = CollectionDerive::new(collection_of(&target), data(1), data(3));
+        let unrelated = CollectionDerive::new(collection_of(&target), data(9), data(2));
 
         let encoded = encode_collection_operation_receipts(
             request,
@@ -829,10 +841,10 @@ mod tests {
 
     #[test]
     fn receipt_response_decoder_enforces_count_framing_order_and_rejection() {
-        let descriptor = simplearchive_union::descriptor(id(48));
-        let request = WantRequest::merge(descriptor.handle(), data(1), data(2));
-        let first = CollectionMerge::new(descriptor.handle(), data(1), data(2), data(3));
-        let second = CollectionMerge::new(descriptor.handle(), data(1), data(2), data(4));
+        let descriptor = root("c48");
+        let request = WantRequest::merge(collection_of(&descriptor), data(1), data(2));
+        let first = CollectionMerge::new(collection_of(&descriptor), data(1), data(2), data(3));
+        let second = CollectionMerge::new(collection_of(&descriptor), data(1), data(2), data(4));
         let mut ordered = [first, second];
         ordered.sort_by_key(CollectionMerge::id);
 
@@ -882,9 +894,9 @@ mod tests {
     #[test]
     fn evidence_codec_roundtrips_and_checks_correspondence() {
         let author = SigningKey::from_bytes(&[7; 32]);
-        let descriptor = simplearchive_union::descriptor(id(1));
+        let descriptor = root("c1");
         let commit = commit(&author, &descriptor);
-        let grant = CollectionGossip::sign(&author, descriptor.handle());
+        let grant = CollectionGossip::sign(&author, collection_of(&descriptor));
         let evidence = CollectionCommitEvidence::new(grant, commit).unwrap();
 
         assert_eq!(COLLECTION_COMMIT_EVIDENCE_LEN, 320);
@@ -897,7 +909,7 @@ mod tests {
         let other = SigningKey::from_bytes(&[8; 32]);
         assert!(matches!(
             CollectionCommitEvidence::new(
-                CollectionGossip::sign(&other, descriptor.handle()),
+                CollectionGossip::sign(&other, collection_of(&descriptor)),
                 commit,
             ),
             Err(CollectionCommitEvidenceError::AuthorMismatch { .. })
@@ -909,8 +921,8 @@ mod tests {
         let first_author = SigningKey::from_bytes(&[9; 32]);
         let second_author = SigningKey::from_bytes(&[10; 32]);
         let ungranted_author = SigningKey::from_bytes(&[11; 32]);
-        let descriptor = simplearchive_union::descriptor(id(2));
-        let other_descriptor = simplearchive_union::descriptor(id(3));
+        let descriptor = root("c2");
+        let other_descriptor = root("c3");
         let first = commit(&first_author, &descriptor);
         let second = commit(&second_author, &descriptor);
         let ungranted = commit(&ungranted_author, &descriptor);
@@ -923,12 +935,12 @@ mod tests {
             CollectionRecord::Commit(first),
         ];
         let grants = vec![
-            CollectionGossip::sign(&second_author, descriptor.handle()),
-            CollectionGossip::sign(&first_author, other_descriptor.handle()),
-            CollectionGossip::sign(&first_author, descriptor.handle()),
+            CollectionGossip::sign(&second_author, collection_of(&descriptor)),
+            CollectionGossip::sign(&first_author, collection_of(&other_descriptor)),
+            CollectionGossip::sign(&first_author, collection_of(&descriptor)),
         ];
 
-        let selected = grant_backed_commits(&records, &grants, descriptor.handle());
+        let selected = grant_backed_commits(&records, &grants, collection_of(&descriptor));
         let mut expected = vec![first, second];
         expected.sort_by_key(CollectionCommit::id);
         assert_eq!(

@@ -997,60 +997,82 @@ mod tests {
     #[test]
     fn registers_share_a_law_and_differ_by_their_parameters() {
         use crate::collection::records::{
-            collection_recipe, collection_representation, collection_scope, CollectionDescriptor,
-            KIND_COLLECTION_DESCRIPTOR,
+            collection_name, collection_recipe, collection_representation, collection_team,
+            CollectionName, KIND_COLLECTION_DESCRIPTOR,
         };
+        use crate::collection::descriptor;
         // The law is one minted name, identical for every stated-order register.
         assert_eq!(
             StatedOrder::<TribleSet, NsTAIInterval>::recipe(),
             STATED_ORDER_RECIPE_V1
         );
 
-        let scope = *ufoid();
+        let team = ed25519_dalek::SigningKey::from_bytes(&[19; 32]).verifying_key();
         let representation = *ufoid();
-        fn describe(scope: Id, representation: Id, identity: Id, order: Id) -> CollectionDescriptor {
-            let scope_value: Inline<GenId> = scope.to_inline();
+        fn describe(
+            team: ed25519_dalek::VerifyingKey,
+            representation: Id,
+            identity: Id,
+            order: Id,
+        ) -> Fragment {
+            let name = CollectionName::new("register").unwrap();
             let representation: Inline<GenId> = representation.to_inline();
             let identity: Inline<GenId> = identity.to_inline();
             let order: Inline<GenId> = order.to_inline();
-            let fragment = crate::macros::entity! { _ @
+            crate::macros::entity! { _ @
                 crate::metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-                collection_scope: scope_value,
+                collection_name: name.as_str(),
+                collection_team: team,
                 collection_representation: representation,
                 collection_recipe*: <StatedOrderV1 as crate::metadata::MetaDescribe>::describe(),
                 register_identity: identity,
                 register_orders: order,
-            };
-            CollectionDescriptor::from_fragment(&fragment)
+            }
         }
 
-        let notes = describe(scope, representation, note_of.id(), note_at.id());
-        let statuses = describe(scope, representation, status_of.id(), note_at.id());
+        let notes = describe(team, representation, note_of.id(), note_at.id());
+        let statuses = describe(team, representation, status_of.id(), note_at.id());
         assert_ne!(
-            notes.handle(),
-            statuses.handle(),
+            descriptor::identity_for_tests(&notes),
+            descriptor::identity_for_tests(&statuses),
             "two registers over the same order attribute must be two collections"
         );
         // Swapping the order attribute is as much a different register as
         // swapping the identity.
         assert_ne!(
-            notes.handle(),
-            describe(scope, representation, note_of.id(), other_clock.id()).handle()
+            descriptor::identity_for_tests(&notes),
+            descriptor::identity_for_tests(&describe(
+                team,
+                representation,
+                note_of.id(),
+                other_clock.id()
+            ))
         );
         // And it is a function of the pair, not of the call.
-        assert_eq!(notes.handle(), describe(scope, representation, note_of.id(), note_at.id()).handle());
+        assert_eq!(
+            descriptor::identity_for_tests(&notes),
+            descriptor::identity_for_tests(&describe(
+                team,
+                representation,
+                note_of.id(),
+                note_at.id()
+            ))
+        );
         // The law itself is shared, not per-register.
-        assert_eq!(notes.recipe(), statuses.recipe());
+        assert_eq!(
+            descriptor::recipe(notes.facts()).unwrap(),
+            descriptor::recipe(statuses.facts()).unwrap()
+        );
 
         // The point of the change: the arguments are recoverable from the
         // descriptor. A reader holding only the pile can say what this
         // register is over.
         assert_eq!(
-            notes.argument(register_identity.id()),
+            descriptor::argument(notes.facts(), register_identity.id()),
             Some(<Id as crate::inline::IntoInline<GenId>>::to_inline(note_of.id()).raw),
         );
         assert_eq!(
-            notes.argument(register_orders.id()),
+            descriptor::argument(notes.facts(), register_orders.id()),
             Some(<Id as crate::inline::IntoInline<GenId>>::to_inline(note_at.id()).raw),
         );
     }

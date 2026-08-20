@@ -20,7 +20,7 @@ use tracing_subscriber::EnvFilter;
 
 const ENV_TELEMETRY_PILE: &str = "TELEMETRY_PILE";
 const ENV_PILE: &str = "PILE";
-const ENV_TELEMETRY_COLLECTION_SCOPE: &str = "TELEMETRY_COLLECTION_SCOPE";
+const ENV_TELEMETRY_COLLECTION_NAME: &str = "TELEMETRY_COLLECTION_NAME";
 const ENV_TELEMETRY_FLUSH_MS: &str = "TELEMETRY_FLUSH_MS";
 
 pub mod schema {
@@ -358,16 +358,14 @@ impl Telemetry {
         }
         let pile_path = PathBuf::from(pile_path);
 
-        let scope_hex = std::env::var(ENV_TELEMETRY_COLLECTION_SCOPE).ok()?;
-        let scope_hex = scope_hex.trim();
-        if scope_hex.len() != 32 {
-            log::warn!(
-                "TELEMETRY_COLLECTION_SCOPE must be a 32-char hex ID, got {} chars",
-                scope_hex.len()
-            );
-            return None;
-        }
-        let collection_scope = Id::from_hex(scope_hex)?;
+        let collection_name = std::env::var(ENV_TELEMETRY_COLLECTION_NAME).ok()?;
+        let collection_name = match CollectionName::new(collection_name.trim()) {
+            Ok(name) => name,
+            Err(error) => {
+                log::warn!("TELEMETRY_COLLECTION_NAME is not a collection name: {error}");
+                return None;
+            }
+        };
 
         let flush_ms = std::env::var(ENV_TELEMETRY_FLUSH_MS)
             .ok()
@@ -391,8 +389,12 @@ impl Telemetry {
             return None;
         }
 
+        // The sink generates its own key per session, so its collection is a
+        // team of one rooted at that key. It says so explicitly rather than
+        // letting the facade assume it.
         let signing_key = SigningKey::generate(&mut OsRng);
-        let mut collection = Collection::new(pile, collection_scope, signing_key);
+        let team = signing_key.verifying_key();
+        let mut collection = Collection::new(pile, &collection_name, team, signing_key);
 
         // Commit session start entity.
         let session_entity = ExclusiveId::force_ref(&session_id);

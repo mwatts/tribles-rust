@@ -15,13 +15,14 @@ use crate::blob::{Blob, BlobEncoding};
 use crate::inline::encodings::hash::Handle;
 use crate::inline::InlineEncoding;
 use crate::repo::{BlobStore, BlobStoreMeta, BlobStorePut};
+use crate::trible::Fragment;
 
 use super::exact_derived::{
     fresh_data_identity, ExactAlgebraError, ExactCover, ExactDerivedAlgebra,
     ExactDerivedCollection, ExactDerivedCollectionError,
 };
 use super::{
-    CollectionCommit, CollectionData, CollectionDescriptor, CollectionHandle, CollectionMerge,
+    CollectionCommit, CollectionData, CollectionHandle, CollectionMerge,
     CollectionRecord, CollectionStore,
 };
 
@@ -194,7 +195,13 @@ where
             return Ok(cover);
         }
 
-        match publish_round(exact.target_descriptor().clone(), store, cover, algebra)? {
+        match publish_round(
+            exact.target_descriptor().clone(),
+            exact.target_collection(),
+            store,
+            cover,
+            algebra,
+        )? {
             RoundOutcome::Published => {}
             RoundOutcome::CapacityStable(cover) => return Ok(cover),
         }
@@ -228,7 +235,8 @@ enum RoundOutcome<Target: BlobEncoding> {
 }
 
 fn publish_round<S, Source, Target, A>(
-    descriptor: CollectionDescriptor,
+    descriptor: Fragment,
+    collection: CollectionHandle,
     store: &mut S,
     cover: ExactCover<Target>,
     algebra: &A,
@@ -299,7 +307,7 @@ where
                 continue;
             }
         }
-        let claim = CollectionMerge::new(descriptor.handle(), low_data, high_data, result_data);
+        let claim = CollectionMerge::new(collection, low_data, high_data, result_data);
 
         if let Some(existing_tier) = locations.remove(&result_data) {
             let existing_bin = tiers
@@ -324,13 +332,14 @@ where
         return Ok(RoundOutcome::CapacityStable(cover));
     }
 
-    let expected_descriptor = descriptor.handle();
     let actual_descriptor = store
-        .put::<SimpleArchive, _>(CollectionDescriptor::to_blob(&descriptor))
+        .put::<SimpleArchive, _>(crate::blob::IntoBlob::<SimpleArchive>::to_blob(
+            descriptor.into_facts(),
+        ))
         .map_err(|error| ExactTargetCompactionError::storage("store target descriptor", error))?;
-    if actual_descriptor != expected_descriptor {
+    if actual_descriptor != collection {
         return Err(ExactTargetCompactionError::NonCanonicalDescriptorPut {
-            expected: expected_descriptor,
+            expected: collection,
             actual: actual_descriptor,
         });
     }

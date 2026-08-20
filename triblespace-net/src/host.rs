@@ -2225,7 +2225,6 @@ mod collection_evidence_gossip_tests {
         CollectionCommit, CollectionGossip, CollectionHandle, CollectionRecord, empty_metadata_handle,
         simplearchive_union,
     };
-    use triblespace_core::id::Id;
     use triblespace_core::inline::Inline;
     use triblespace_core::repo::{PinSnapshot, WantRequest};
 
@@ -2238,16 +2237,26 @@ mod collection_evidence_gossip_tests {
     use crate::collection_wire::{COLLECTION_COMMIT_EVIDENCE_LEN, CollectionCommitEvidence};
 
     fn evidence() -> CollectionCommitEvidence {
+        use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+        use triblespace_core::blob::IntoBlob;
+        use triblespace_core::collection::records::CollectionName;
+
         let author = SigningKey::from_bytes(&[0xA7; 32]);
-        let descriptor = simplearchive_union::descriptor(Id::new([0x3C; 16]).unwrap());
+        let descriptor = simplearchive_union::descriptor(
+            &CollectionName::new("gossiped").unwrap(),
+            author.verifying_key(),
+        );
+        // Gossip only ever carries the identity; nothing here stores the
+        // descriptor it names.
+        let collection =
+            IntoBlob::<SimpleArchive>::to_blob(descriptor.into_facts()).get_handle();
         let commit = CollectionCommit::sign(
             &author,
-            descriptor.handle(),
+            collection,
             Inline::new([0xD4; 32]),
             empty_metadata_handle(),
         );
-        CollectionCommitEvidence::new(CollectionGossip::sign(&author, descriptor.handle()), commit)
-            .unwrap()
+        CollectionCommitEvidence::new(CollectionGossip::sign(&author, collection), commit).unwrap()
     }
 
     struct EvidenceSnapshot {

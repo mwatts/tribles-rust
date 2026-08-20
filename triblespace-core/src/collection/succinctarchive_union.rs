@@ -21,7 +21,11 @@ use crate::id::ExclusiveId;
 use crate::metadata;
 use crate::prelude::entity;
 use crate::trible::Fragment;
-use super::records::RecordDecodeError;
+use super::descriptor as descriptor_facts;
+use super::records::{
+    collection_recipe, collection_representation, collection_source, RecordDecodeError,
+    KIND_COLLECTION_DESCRIPTOR,
+};
 use std::error::Error;
 use std::fmt;
 
@@ -37,9 +41,7 @@ use crate::inline::Inline;
 use crate::metadata::MetaDescribe;
 
 use super::simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1;
-use super::{
-    CollectionData, CollectionDerive, CollectionDescriptor, CollectionHandle, CollectionMerge,
-};
+use super::{CollectionData, CollectionDerive, CollectionHandle, CollectionMerge};
 
 mod collection;
 mod rank9_fiber;
@@ -327,16 +329,20 @@ impl Error for SuccinctArchiveUnionValidationError {
     }
 }
 
-/// Construct the raw SuccinctArchive collection for an extrinsic dataset scope.
+/// Describe the raw SuccinctArchive collection derived from one source.
+///
+/// A derivation is anchored by the collection it is computed from, so this
+/// takes that source's handle and carries no name or team of its own.
 ///
 /// This intentionally reuses the SimpleArchive collection's set-union recipe.
 /// Representation, not recipe proliferation, distinguishes the two lattices.
-pub fn descriptor(source: CollectionHandle) -> CollectionDescriptor {
-    CollectionDescriptor::derived(
-        source,
-        <SuccinctArchiveBlob as MetaDescribe>::describe(),
-        <TribleSetUnionV1 as MetaDescribe>::describe(),
-    )
+pub fn descriptor(source: CollectionHandle) -> Fragment {
+    entity! {
+        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+        collection_source: source,
+        collection_representation*: <SuccinctArchiveBlob as MetaDescribe>::describe(),
+        collection_recipe*: <TribleSetUnionV1 as MetaDescribe>::describe(),
+    }
 }
 
 /// Return the canonical empty raw SuccinctArchive artifact.
@@ -362,35 +368,37 @@ pub fn join(
 
 /// Validate an exact canonical `SimpleArchive -> SuccinctArchiveBlob` mapping.
 ///
-/// This checks both descriptors, requires their dataset scopes to agree, binds
-/// the record and supplied endpoint bytes in both directions, validates the
-/// target's portable format, and compares it byte-for-byte with a fresh direct
-/// construction from the source.
+/// This checks both descriptors, requires the target to name this exact source
+/// by handle, binds the record and supplied endpoint bytes in both directions,
+/// validates the target's portable format, and compares it byte-for-byte with a
+/// fresh direct construction from the source.
 pub fn validate_derive(
-    source_descriptor: &CollectionDescriptor,
-    target_descriptor: &CollectionDescriptor,
+    source_descriptor: &Fragment,
+    target_descriptor: &Fragment,
     claim: &CollectionDerive,
     input: &Blob<SimpleArchive>,
     output: &Blob<SuccinctArchiveBlob>,
 ) -> Result<(), SuccinctArchiveUnionValidationError> {
     validate_source_descriptor(source_descriptor)?;
     validate_descriptor(target_descriptor)?;
+    let source_collection: CollectionHandle =
+        crate::blob::IntoBlob::<SimpleArchive>::to_blob(source_descriptor.facts().clone())
+            .get_handle();
+    let target_collection: CollectionHandle =
+        crate::blob::IntoBlob::<SimpleArchive>::to_blob(target_descriptor.facts().clone())
+            .get_handle();
     // The target names its source by handle, so this checks the lineage
     // itself rather than a label both sides could independently claim.
-    match target_descriptor.source() {
-        Some(source) if source == source_descriptor.handle() => {}
+    match descriptor_facts::source(target_descriptor.facts()) {
+        Some(source) if source == source_collection => {}
         _ => {
             return Err(SuccinctArchiveUnionValidationError::WrongSource {
-                expected: source_descriptor.handle(),
-                actual: target_descriptor.source(),
+                expected: source_collection,
+                actual: descriptor_facts::source(target_descriptor.facts()),
             })
         }
     }
-    validate_collection(
-        DescriptorRole::Target,
-        target_descriptor.handle(),
-        claim.target(),
-    )?;
+    validate_collection(DescriptorRole::Target, target_collection, claim.target())?;
 
     let (expected_input, expected_output) = claim.mapping();
     validate_endpoint(ElementRole::DeriveInput, expected_input, input)?;
@@ -409,18 +417,16 @@ pub fn validate_derive(
 /// exact-validates both inputs while constructing their canonical union;
 /// byte-for-byte equality with that union proves the claimed result canonical.
 pub fn validate_merge(
-    descriptor: &CollectionDescriptor,
+    descriptor: &Fragment,
     claim: &CollectionMerge,
     low: &Blob<SuccinctArchiveBlob>,
     high: &Blob<SuccinctArchiveBlob>,
     result: &Blob<SuccinctArchiveBlob>,
 ) -> Result<(), SuccinctArchiveUnionValidationError> {
     validate_descriptor(descriptor)?;
-    validate_collection(
-        DescriptorRole::Target,
-        descriptor.handle(),
-        claim.collection(),
-    )?;
+    let collection: CollectionHandle =
+        crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()).get_handle();
+    validate_collection(DescriptorRole::Target, collection, claim.collection())?;
 
     let (expected_low, expected_high) = claim.inputs();
     validate_endpoint(ElementRole::MergeLow, expected_low, low)?;
@@ -435,7 +441,7 @@ pub fn validate_merge(
 }
 
 fn validate_source_descriptor(
-    descriptor: &CollectionDescriptor,
+    descriptor: &Fragment,
 ) -> Result<(), SuccinctArchiveUnionValidationError> {
     validate_descriptor_parts(
         DescriptorRole::Source,
@@ -445,7 +451,7 @@ fn validate_source_descriptor(
 }
 
 fn validate_descriptor(
-    descriptor: &CollectionDescriptor,
+    descriptor: &Fragment,
 ) -> Result<(), SuccinctArchiveUnionValidationError> {
     validate_descriptor_parts(
         DescriptorRole::Target,
@@ -456,10 +462,10 @@ fn validate_descriptor(
 
 fn validate_descriptor_parts(
     role: DescriptorRole,
-    descriptor: &CollectionDescriptor,
+    descriptor: &Fragment,
     expected_representation: Id,
 ) -> Result<(), SuccinctArchiveUnionValidationError> {
-    let representation = descriptor.representation()?;
+    let representation = descriptor_facts::representation(descriptor.facts())?;
     if representation != expected_representation {
         return Err(SuccinctArchiveUnionValidationError::WrongRepresentation {
             role,
@@ -467,7 +473,7 @@ fn validate_descriptor_parts(
             actual: representation,
         });
     }
-    let recipe = descriptor.recipe()?;
+    let recipe = descriptor_facts::recipe(descriptor.facts())?;
     if recipe != TRIBLE_SET_UNION_RECIPE_V1 {
         return Err(SuccinctArchiveUnionValidationError::WrongRecipe {
             role,
@@ -519,12 +525,24 @@ mod tests {
 
     use anybytes::Bytes;
 
+    use ed25519_dalek::SigningKey;
+
     use crate::blob::IntoBlob;
+    use crate::collection::descriptor::identity_for_tests;
+    use crate::collection::records::CollectionName;
     use crate::collection::simplearchive_union;
     use crate::trible::{Trible, TribleSet, TRIBLE_LEN};
 
     fn id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
+    }
+
+    /// The named `SimpleArchive` root these tests derive from.
+    fn raw_root(name: &str) -> Fragment {
+        simplearchive_union::descriptor(
+            &CollectionName::new(name).unwrap(),
+            SigningKey::from_bytes(&[1; 32]).verifying_key(),
+        )
     }
 
     fn row(entity: u8, attribute: u8, value: u8) -> [u8; TRIBLE_LEN] {
@@ -558,38 +576,53 @@ mod tests {
     /// sharing a label with it.
     #[test]
     fn the_index_derives_from_the_raw_collection_under_the_same_law() {
-        let source = simplearchive_union::descriptor(id(1));
-        let target = descriptor(source.handle());
+        let source = raw_root("first");
+        let target = descriptor(identity_for_tests(&source));
 
         // The target points at exactly this source, and carries no anchor of
         // its own: what it derives from is what anchors it.
-        assert_eq!(target.source(), Some(source.handle()));
-        assert!(target.scope().is_err(), "a derivation needs no anchor");
-        assert!(source.source().is_none(), "the raw collection is a root");
+        assert_eq!(
+            crate::collection::descriptor::source(target.facts()),
+            Some(identity_for_tests(&source))
+        );
+        assert!(
+            crate::collection::descriptor::name(target.facts()).is_none(),
+            "a derivation needs no anchor"
+        );
+        assert!(
+            crate::collection::descriptor::source(source.facts()).is_none(),
+            "the raw collection is a root"
+        );
         // A derivation of the same shape over different data is a different
         // collection, because its source is.
         assert_ne!(
-            target.handle(),
-            descriptor(simplearchive_union::descriptor(id(2)).handle()).handle()
+            identity_for_tests(&target),
+            identity_for_tests(&descriptor(identity_for_tests(&raw_root("second"))))
         );
 
-        assert_eq!(source.recipe(), target.recipe());
-        assert_eq!(target.recipe().unwrap(), TRIBLE_SET_UNION_RECIPE_V1);
         assert_eq!(
-            source.representation().unwrap(),
+            crate::collection::descriptor::recipe(source.facts()),
+            crate::collection::descriptor::recipe(target.facts())
+        );
+        assert_eq!(
+            crate::collection::descriptor::recipe(target.facts()).unwrap(),
+            TRIBLE_SET_UNION_RECIPE_V1
+        );
+        assert_eq!(
+            crate::collection::descriptor::representation(source.facts()).unwrap(),
             <SimpleArchive as MetaDescribe>::id()
         );
         assert_eq!(
-            target.representation().unwrap(),
+            crate::collection::descriptor::representation(target.facts()).unwrap(),
             <SuccinctArchiveBlob as MetaDescribe>::id()
         );
-        assert_ne!(source.handle(), target.handle());
+        assert_ne!(identity_for_tests(&source), identity_for_tests(&target));
     }
 
     #[test]
     fn canonical_empty_is_the_derived_bottom_and_merge_identity() {
-        let source_descriptor = simplearchive_union::descriptor(id(1));
-        let target_descriptor = descriptor(simplearchive_union::descriptor(id(1)).handle());
+        let source_descriptor = raw_root("first");
+        let target_descriptor = descriptor(identity_for_tests(&raw_root("first")));
         let source_empty: Blob<SimpleArchive> = TribleSet::new().to_blob();
         let derived_empty = derive_element(&source_empty).unwrap();
         let canonical_empty = empty();
@@ -598,7 +631,7 @@ mod tests {
         assert_eq!(derived_empty.get_handle(), canonical_empty.get_handle());
 
         let derive = CollectionDerive::new(
-            target_descriptor.handle(),
+            identity_for_tests(&target_descriptor),
             data_identity(&source_empty),
             data_identity(&canonical_empty),
         );
@@ -619,7 +652,7 @@ mod tests {
 
         let (low, high) = ordered(&canonical_empty, &element);
         let merge = CollectionMerge::new(
-            target_descriptor.handle(),
+            identity_for_tests(&target_descriptor),
             data_identity(low),
             data_identity(high),
             data_identity(&joined),
@@ -629,8 +662,8 @@ mod tests {
 
     #[test]
     fn derive_and_merge_commute_to_identical_canonical_bytes() {
-        let source_descriptor = simplearchive_union::descriptor(id(1));
-        let target_descriptor = descriptor(simplearchive_union::descriptor(id(1)).handle());
+        let source_descriptor = raw_root("first");
+        let target_descriptor = descriptor(identity_for_tests(&raw_root("first")));
         let shared = row(3, 10, 40);
         let left = archive([row(2, 10, 60), shared]);
         let right = archive([row(1, 10, 20), shared]);
@@ -653,7 +686,7 @@ mod tests {
             (&source_union, &derive_after_merge),
         ] {
             let claim = CollectionDerive::new(
-                target_descriptor.handle(),
+                identity_for_tests(&target_descriptor),
                 data_identity(input),
                 data_identity(output),
             );
@@ -669,7 +702,7 @@ mod tests {
 
         let (low, high) = ordered(&derived_left, &derived_right);
         let merge = CollectionMerge::new(
-            target_descriptor.handle(),
+            identity_for_tests(&target_descriptor),
             data_identity(low),
             data_identity(high),
             data_identity(&merge_after_derive),
@@ -679,13 +712,13 @@ mod tests {
 
     #[test]
     fn validators_reject_valid_but_wrong_canonical_outputs() {
-        let source_descriptor = simplearchive_union::descriptor(id(1));
-        let target_descriptor = descriptor(simplearchive_union::descriptor(id(1)).handle());
+        let source_descriptor = raw_root("first");
+        let target_descriptor = descriptor(identity_for_tests(&raw_root("first")));
         let input = archive([row(1, 9, 3)]);
         let wrong_source = archive([row(2, 9, 4)]);
         let wrong_output = derive_element(&wrong_source).unwrap();
         let claim = CollectionDerive::new(
-            target_descriptor.handle(),
+            identity_for_tests(&target_descriptor),
             data_identity(&input),
             data_identity(&wrong_output),
         );
@@ -707,7 +740,7 @@ mod tests {
         let wrong = empty();
         let (low, high) = ordered(&left, &right);
         let merge = CollectionMerge::new(
-            target_descriptor.handle(),
+            identity_for_tests(&target_descriptor),
             data_identity(low),
             data_identity(high),
             data_identity(&wrong),
@@ -721,12 +754,12 @@ mod tests {
 
     #[test]
     fn malformed_target_is_rejected_before_equation_admission() {
-        let source_descriptor = simplearchive_union::descriptor(id(1));
-        let target_descriptor = descriptor(simplearchive_union::descriptor(id(1)).handle());
+        let source_descriptor = raw_root("first");
+        let target_descriptor = descriptor(identity_for_tests(&raw_root("first")));
         let input = archive([row(1, 9, 3)]);
         let malformed = Blob::<SuccinctArchiveBlob>::new(Bytes::from(vec![0xAA; 17]));
         let claim = CollectionDerive::new(
-            target_descriptor.handle(),
+            identity_for_tests(&target_descriptor),
             data_identity(&input),
             data_identity(&malformed),
         );

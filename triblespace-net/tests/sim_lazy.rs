@@ -21,10 +21,10 @@ use triblespace_core::blob::Blob;
 use triblespace_core::blob::IntoBlob;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace_core::collection::records::CollectionName;
 use triblespace_core::collection::{
     CollectionMerge, CollectionRecord, CollectionStore, simplearchive_union,
 };
-use triblespace_core::id::Id;
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::prelude::BlobStore;
@@ -105,13 +105,20 @@ fn reconcile_tick_services_operation_want_from_configured_peer_without_dht() {
         let mut server_store = store_with_caps(&caps);
         let mut client_store = store_with_caps(&caps);
 
-        let descriptor = simplearchive_union::descriptor(Id::new([0x31; 16]).unwrap());
+        // Only the identity matters here; the descriptor is never stored.
+        let descriptor = simplearchive_union::descriptor(
+            &CollectionName::new("lazy").unwrap(),
+            key(0xF1).verifying_key(),
+        )
+        .into_facts()
+        .to_blob()
+        .get_handle();
         let a = Inline::new([1; 32]);
         let b = Inline::new([2; 32]);
         let result = Inline::new([3; 32]);
-        let request = WantRequest::merge(descriptor.handle(), a, b);
+        let request = WantRequest::merge(descriptor, a, b);
         let receipt =
-            CollectionRecord::Merge(CollectionMerge::new(descriptor.handle(), a, b, result));
+            CollectionRecord::Merge(CollectionMerge::new(descriptor, a, b, result));
         server_store.insert(receipt).unwrap();
         client_store.want(request).unwrap();
 

@@ -19,16 +19,17 @@ use std::error::Error;
 use std::fmt;
 
 use triblespace_core::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
-use triblespace_core::blob::{Blob, BlobEncoding};
+use triblespace_core::blob::{Blob, BlobEncoding, IntoBlob};
+use triblespace_core::collection::descriptor;
 use triblespace_core::collection::simplearchive_union::{self, TRIBLE_SET_UNION_RECIPE_V1};
 use triblespace_core::collection::{
-    CollectionData, CollectionDerive, CollectionDescriptor, CollectionHandle, CollectionMerge,
+    CollectionData, CollectionDerive, CollectionHandle, CollectionMerge,
 };
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::{Blake3, Hash};
 use triblespace_core::inline::Inline;
 use triblespace_core::metadata::MetaDescribe;
-use triblespace_core::trible::{Trible, TRIBLE_LEN};
+use triblespace_core::trible::{Trible, TribleSet, TRIBLE_LEN};
 
 use crate::persistence::{automaton_fingerprint, path_automaton_fingerprint, PathSummaryV1, PATH_SUMMARY_RECIPE_V1};
 use crate::{Automaton, GraphEdge, PathError, PathSummary, PathSummaryBlob, PathSummaryBlobError};
@@ -237,9 +238,9 @@ impl Error for PathSummaryUnionValidationError {
 pub fn descriptor(
     source: triblespace_core::collection::records::CollectionHandle,
     automaton: &Automaton,
-) -> CollectionDescriptor {
+) -> triblespace_core::trible::Fragment {
     let fingerprint = automaton_fingerprint(automaton);
-    let fragment = entity! { _ @
+    entity! { _ @
         triblespace_core::metadata::tag: triblespace_core::collection::records::KIND_COLLECTION_DESCRIPTOR,
         triblespace_core::collection::records::collection_source: source,
         triblespace_core::collection::records::collection_representation*:
@@ -247,8 +248,7 @@ pub fn descriptor(
         triblespace_core::collection::records::collection_recipe*:
             <PathSummaryV1 as MetaDescribe>::describe(),
         path_automaton_fingerprint: fingerprint,
-    };
-    CollectionDescriptor::from_fragment(&fragment)
+    }
 }
 
 /// Return the canonical empty path summary for one fixed automaton.
@@ -296,8 +296,8 @@ pub fn join(
 /// canonicality, and byte-exact output are checked. Authorization of source
 /// commits remains an independent collection-resolution concern.
 pub fn validate_derive(
-    source_descriptor: &CollectionDescriptor,
-    target_descriptor: &CollectionDescriptor,
+    source_descriptor: &TribleSet,
+    target_descriptor: &TribleSet,
     claim: &CollectionDerive,
     input: &Blob<SimpleArchive>,
     output: &Blob<PathSummaryBlob>,
@@ -305,15 +305,15 @@ pub fn validate_derive(
 ) -> Result<(), PathSummaryUnionValidationError> {
     validate_source_descriptor(source_descriptor)?;
     validate_target_descriptor(target_descriptor, automaton)?;
-    match target_descriptor.source() {
-        Some(source) if source == source_descriptor.handle() => {}
+    let source_collection: CollectionHandle =
+        IntoBlob::<SimpleArchive>::to_blob(source_descriptor.clone()).get_handle();
+    let target_collection: CollectionHandle =
+        IntoBlob::<SimpleArchive>::to_blob(target_descriptor.clone()).get_handle();
+    match descriptor::source(target_descriptor) {
+        Some(source) if source == source_collection => {}
         _ => return Err(PathSummaryUnionValidationError::WrongSource),
     }
-    validate_collection(
-        DescriptorRole::Target,
-        target_descriptor.handle(),
-        claim.target(),
-    )?;
+    validate_collection(DescriptorRole::Target, target_collection, claim.target())?;
 
     let (expected_input, expected_output) = claim.mapping();
     validate_endpoint(ElementRole::DeriveInput, expected_input, input)?;
@@ -332,7 +332,7 @@ pub fn validate_derive(
 /// are exact-decoded against the collection automaton before their freshly
 /// constructed union is compared byte-for-byte with the claimed result.
 pub fn validate_merge(
-    collection_descriptor: &CollectionDescriptor,
+    collection_descriptor: &TribleSet,
     claim: &CollectionMerge,
     low: &Blob<PathSummaryBlob>,
     high: &Blob<PathSummaryBlob>,
@@ -340,11 +340,9 @@ pub fn validate_merge(
     automaton: &Automaton,
 ) -> Result<(), PathSummaryUnionValidationError> {
     validate_target_descriptor(collection_descriptor, automaton)?;
-    validate_collection(
-        DescriptorRole::Target,
-        collection_descriptor.handle(),
-        claim.collection(),
-    )?;
+    let collection: CollectionHandle =
+        IntoBlob::<SimpleArchive>::to_blob(collection_descriptor.clone()).get_handle();
+    validate_collection(DescriptorRole::Target, collection, claim.collection())?;
 
     let (expected_low, expected_high) = claim.inputs();
     validate_endpoint(ElementRole::MergeLow, expected_low, low)?;
@@ -359,7 +357,7 @@ pub fn validate_merge(
 }
 
 fn validate_source_descriptor(
-    collection_descriptor: &CollectionDescriptor,
+    collection_descriptor: &TribleSet,
 ) -> Result<(), PathSummaryUnionValidationError> {
     validate_descriptor_parts(
         DescriptorRole::Source,
@@ -370,7 +368,7 @@ fn validate_source_descriptor(
 }
 
 fn validate_target_descriptor(
-    collection_descriptor: &CollectionDescriptor,
+    collection_descriptor: &TribleSet,
     automaton: &Automaton,
 ) -> Result<(), PathSummaryUnionValidationError> {
     validate_descriptor_parts(
@@ -380,7 +378,7 @@ fn validate_target_descriptor(
         PATH_SUMMARY_RECIPE_V1,
     )?;
     let expected = automaton_fingerprint(automaton);
-    match collection_descriptor.argument(path_automaton_fingerprint.id()) {
+    match descriptor::argument(collection_descriptor, path_automaton_fingerprint.id()) {
         Some(actual) if actual == expected.raw => Ok(()),
         _ => Err(PathSummaryUnionValidationError::WrongAutomaton),
     }
@@ -388,11 +386,11 @@ fn validate_target_descriptor(
 
 fn validate_descriptor_parts(
     role: DescriptorRole,
-    collection_descriptor: &CollectionDescriptor,
+    collection_descriptor: &TribleSet,
     expected_representation: Id,
     expected_recipe: Id,
 ) -> Result<(), PathSummaryUnionValidationError> {
-    let representation = collection_descriptor.representation()?;
+    let representation = descriptor::representation(collection_descriptor)?;
     if representation != expected_representation {
         return Err(PathSummaryUnionValidationError::WrongRepresentation {
             role,
@@ -400,7 +398,7 @@ fn validate_descriptor_parts(
             actual: representation,
         });
     }
-    let recipe = collection_descriptor.recipe()?;
+    let recipe = descriptor::recipe(collection_descriptor)?;
     if recipe != expected_recipe {
         return Err(PathSummaryUnionValidationError::WrongRecipe {
             role,
@@ -450,7 +448,11 @@ fn data_identity<S: BlobEncoding>(blob: &Blob<S>) -> CollectionData {
 mod tests {
     use super::*;
 
+    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::VerifyingKey;
     use triblespace_core::blob::IntoBlob;
+    use triblespace_core::collection::records::CollectionName;
+    use triblespace_core::trible::Fragment;
     use triblespace_core::id::ExclusiveId;
     use triblespace_core::inline::RawInline;
     use triblespace_core::metadata;
@@ -461,6 +463,26 @@ mod tests {
 
     fn id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
+    }
+
+    /// The one team every collection in these tests belongs to; a team of one.
+    fn team() -> VerifyingKey {
+        SigningKey::from_bytes(&[1; 32]).verifying_key()
+    }
+
+    fn name(text: &str) -> CollectionName {
+        CollectionName::new(text).unwrap()
+    }
+
+    /// The source collection these tests summarise.
+    fn source_collection() -> Fragment {
+        simplearchive_union::descriptor(&name("edges"), team())
+    }
+
+    /// These tests only need identities to bind claims to; nothing stores the
+    /// descriptors they come from.
+    fn collection_of(descriptor: &Fragment) -> CollectionHandle {
+        IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()).get_handle()
     }
 
     fn label(byte: u8) -> [u8; 16] {
@@ -505,48 +527,54 @@ mod tests {
     fn descriptor_identity_includes_source_representation_and_automaton() {
         let first_automaton = plus(label(7));
         let second_automaton = plus(label(8));
-        let source = simplearchive_union::descriptor(id(1));
-        let first = descriptor(source.handle(), &first_automaton);
-        let repeated = descriptor(source.handle(), &first_automaton);
-        let second = descriptor(source.handle(), &second_automaton);
+        let source = source_collection();
+        let first = descriptor(collection_of(&source), &first_automaton);
+        let repeated = descriptor(collection_of(&source), &first_automaton);
+        let second = descriptor(collection_of(&source), &second_automaton);
 
         assert_eq!(first, repeated);
         // A summary names the collection it summarises, and carries no anchor
         // of its own.
-        assert_eq!(first.source(), Some(source.handle()));
-        assert!(first.scope().is_err(), "a derivation needs no anchor");
+        assert_eq!(descriptor::source(first.facts()), Some(collection_of(&source)));
+        assert!(
+            descriptor::name(first.facts()).is_none(),
+            "a derivation needs no anchor"
+        );
+        assert!(
+            descriptor::team(first.facts()).is_none(),
+            "a derivation inherits its team"
+        );
         // The same automaton over a different source is a different summary.
         assert_ne!(
-            first.handle(),
-            descriptor(
-                simplearchive_union::descriptor(id(2)).handle(),
+            collection_of(&first),
+            collection_of(&descriptor(
+                collection_of(&simplearchive_union::descriptor(&name("other-edges"), team())),
                 &first_automaton
-            )
-            .handle()
+            ))
         );
         assert_eq!(
-            first.representation().unwrap(),
+            descriptor::representation(first.facts()).unwrap(),
             <PathSummaryBlob as MetaDescribe>::id()
         );
-        assert_ne!(first.representation(), source.representation());
-        assert_ne!(first.recipe(), source.recipe());
+        assert_ne!(descriptor::representation(first.facts()), descriptor::representation(source.facts()));
+        assert_ne!(descriptor::recipe(first.facts()), descriptor::recipe(source.facts()));
         // Two summaries over different automata share the law and are told
         // apart by its argument, so the recipe matches while the collections
         // differ. The automaton is readable from the descriptor rather than
         // hidden inside a derived recipe id.
-        assert_eq!(first.recipe(), second.recipe());
+        assert_eq!(descriptor::recipe(first.facts()), descriptor::recipe(second.facts()));
         assert_ne!(
-            first.argument(path_automaton_fingerprint.id()),
-            second.argument(path_automaton_fingerprint.id())
+            descriptor::argument(first.facts(), path_automaton_fingerprint.id()),
+            descriptor::argument(second.facts(), path_automaton_fingerprint.id())
         );
-        assert_ne!(first.handle(), second.handle());
+        assert_ne!(collection_of(&first), collection_of(&second));
     }
 
     #[test]
     fn canonical_empty_is_total_derived_bottom_and_join_identity() {
         let automaton = plus(label(7));
-        let source_descriptor = simplearchive_union::descriptor(id(1));
-        let target_descriptor = descriptor(simplearchive_union::descriptor(id(1)).handle(), &automaton);
+        let source_descriptor = source_collection();
+        let target_descriptor = descriptor(collection_of(&source_collection()), &automaton);
         let source_empty = archive(&TribleSet::new());
         let canonical_empty = empty(&automaton);
 
@@ -575,7 +603,7 @@ mod tests {
             (&unmatched_source, &derived_unmatched),
         ] {
             let claim = CollectionDerive::new(
-                target_descriptor.handle(),
+                collection_of(&target_descriptor),
                 data_identity(input),
                 data_identity(output),
             );
@@ -605,8 +633,8 @@ mod tests {
     #[test]
     fn derive_and_merge_commute_and_close_cross_fragment_paths() {
         let automaton = plus(metadata::tag.id().into());
-        let source_descriptor = simplearchive_union::descriptor(id(1));
-        let target_descriptor = descriptor(simplearchive_union::descriptor(id(1)).handle(), &automaton);
+        let source_descriptor = source_collection();
+        let target_descriptor = descriptor(collection_of(&source_collection()), &automaton);
         let left = archive(&edge_facts(1, 2));
         let right = archive(&edge_facts(2, 3));
 
@@ -628,7 +656,7 @@ mod tests {
             (&source_union, &derive_after_source_join),
         ] {
             let claim = CollectionDerive::new(
-                target_descriptor.handle(),
+                collection_of(&target_descriptor),
                 data_identity(input),
                 data_identity(output),
             );
@@ -645,7 +673,7 @@ mod tests {
 
         let (low, high) = ordered(&derived_left, &derived_right);
         let merge = CollectionMerge::new(
-            target_descriptor.handle(),
+            collection_of(&target_descriptor),
             data_identity(low),
             data_identity(high),
             data_identity(&join_after_derive),
@@ -668,8 +696,8 @@ mod tests {
     #[test]
     fn nullable_unmatched_domain_obeys_the_same_homomorphism() {
         let automaton = Automaton::new(1, [0], [0], []).unwrap();
-        let source_descriptor = simplearchive_union::descriptor(id(1));
-        let target_descriptor = descriptor(simplearchive_union::descriptor(id(1)).handle(), &automaton);
+        let source_descriptor = source_collection();
+        let target_descriptor = descriptor(collection_of(&source_collection()), &automaton);
         let left = archive(&edge_facts(1, 2));
         let right = archive(&edge_facts(2, 3));
         let source_union = simplearchive_union::join(&left, &right).unwrap();
@@ -681,7 +709,7 @@ mod tests {
 
         assert_eq!(derive_after_source_join.bytes, join_after_derive.bytes);
         let derive = CollectionDerive::new(
-            target_descriptor.handle(),
+            collection_of(&target_descriptor),
             data_identity(&source_union),
             data_identity(&derive_after_source_join),
         );
@@ -696,7 +724,7 @@ mod tests {
         .unwrap();
         let (low, high) = ordered(&derived_left, &derived_right);
         let merge = CollectionMerge::new(
-            target_descriptor.handle(),
+            collection_of(&target_descriptor),
             data_identity(low),
             data_identity(high),
             data_identity(&join_after_derive),
@@ -724,15 +752,15 @@ mod tests {
     #[test]
     fn validators_reject_wrong_descriptors_endpoints_and_equations() {
         let automaton = plus(metadata::tag.id().into());
-        let source_descriptor = simplearchive_union::descriptor(id(1));
-        let target_descriptor = descriptor(simplearchive_union::descriptor(id(1)).handle(), &automaton);
+        let source_descriptor = source_collection();
+        let target_descriptor = descriptor(collection_of(&source_collection()), &automaton);
         let input = archive(&edge_facts(1, 2));
         let other_input = archive(&edge_facts(3, 4));
         let output = derive_element(&input, &automaton).unwrap();
         let other_output = derive_element(&other_input, &automaton).unwrap();
 
         let wrong_equation = CollectionDerive::new(
-            target_descriptor.handle(),
+            collection_of(&target_descriptor),
             data_identity(&input),
             data_identity(&other_output),
         );
@@ -749,7 +777,7 @@ mod tests {
         ));
 
         let wrong_endpoint = CollectionDerive::new(
-            target_descriptor.handle(),
+            collection_of(&target_descriptor),
             data_identity(&other_input),
             data_identity(&output),
         );
@@ -769,9 +797,9 @@ mod tests {
         ));
 
         let foreign_automaton = plus(label(9));
-        let foreign_target = descriptor(simplearchive_union::descriptor(id(1)).handle(), &foreign_automaton);
+        let foreign_target = descriptor(collection_of(&source_collection()), &foreign_automaton);
         let foreign_claim = CollectionDerive::new(
-            foreign_target.handle(),
+            collection_of(&foreign_target),
             data_identity(&input),
             data_identity(&output),
         );
@@ -790,7 +818,7 @@ mod tests {
         let (low, high) = ordered(&output, &other_output);
         let wrong_result = empty(&automaton);
         let merge = CollectionMerge::new(
-            target_descriptor.handle(),
+            collection_of(&target_descriptor),
             data_identity(low),
             data_identity(high),
             data_identity(&wrong_result),
