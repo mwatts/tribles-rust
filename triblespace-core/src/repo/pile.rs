@@ -3853,8 +3853,11 @@ impl Error for PileReframeError {
 /// faithful rather than merely byte-preserving:
 ///
 /// * Blob payloads are content-addressed, so copying them changes no identity.
-///   Their original insertion timestamps are carried across; the wall clock at
-///   the moment of the rewrite is not a fact about when a blob arrived.
+///   Their insertion timestamps are not: a timestamp is a local fact about one
+///   file, never synced and never part of a handle, so a rewrite stamps them
+///   afresh. Its one consumer is a last-resort tie-break in `branch
+///   consolidate --by-name`, which only runs after preferring a branch that
+///   has a head, and which degenerates harmlessly to first-wins.
 /// * Pins and wants are last-writer-wins logs, so they are replayed in order
 ///   and the destination's final projection equals the source's.
 /// * Collection records and grants are grow-only sets, so order does not
@@ -3896,7 +3899,10 @@ pub fn reframe_into(
         };
         match record.content {
             PileRecordContent::Blob {
-                timestamp,
+                // The original insertion timestamp is deliberately not carried
+                // across. It is a local fact about one file -- never synced,
+                // never part of a handle -- and a rewrite is a fresh append.
+                timestamp: _,
                 data_offset,
                 data_len,
                 ..
