@@ -16,6 +16,8 @@
 
 use ed25519_dalek::VerifyingKey;
 
+use itertools::Itertools;
+
 use crate::id::Id;
 use crate::inline::encodings::genid::GenId;
 use crate::inline::encodings::shortstring::ShortString;
@@ -169,17 +171,24 @@ pub fn argument(facts: &TribleSet, attribute: Id) -> Option<RawInline> {
     .next()
 }
 
+/// `Itertools::exactly_one`, saying which field the rows came from.
+///
+/// The question is the same one the rest of the crate asks by that name; only
+/// the answer differs, because a decoder has to name the attribute it was
+/// reading. `ExactlyOneError` carries the leftover iterator, which is empty
+/// exactly when there was no first row at all -- that is how the two failures
+/// are told apart here.
 fn exactly_one<T>(
-    mut rows: impl Iterator<Item = T>,
+    rows: impl Iterator<Item = T>,
     field: &'static str,
 ) -> Result<T, RecordDecodeError> {
-    let Some(value) = rows.next() else {
-        return Err(RecordDecodeError::MissingField(field));
-    };
-    if rows.next().is_some() {
-        return Err(RecordDecodeError::RepeatedField(field));
-    }
-    Ok(value)
+    rows.exactly_one().map_err(|mut leftover| {
+        if leftover.next().is_some() {
+            RecordDecodeError::RepeatedField(field)
+        } else {
+            RecordDecodeError::MissingField(field)
+        }
+    })
 }
 
 /// A root descriptor under one fixed test team, named by `name`.
