@@ -15,12 +15,10 @@ use crate::{Automaton, PathSummary, Step};
 
 const HEADER_LEN: usize = 48;
 const FINGERPRINT_VERSION: u32 = 1;
-// Stable path-summary-v2 algorithm anchor, minted with `trible genid` on
-// 2026-07-28 when canonical summaries were restricted to matched support plus
-// nullable identity.
-const PATH_SUMMARY_ALGORITHM_ID_HEX: &str = "341216BFE738E2D82BFFF96F52E7FE06";
-
-// The algorithm id's bytes also serve as the automaton wire domain separator.
+// The automaton wire domain separator is the bytes of the stable
+// path-summary-v2 algorithm anchor `341216BFE738E2D82BFFF96F52E7FE06`, minted
+// with `trible genid` on 2026-07-28 when canonical summaries were restricted
+// to matched support plus nullable identity.
 const AUTOMATON_FINGERPRINT_DOMAIN: [u8; 16] = [
     0x34, 0x12, 0x16, 0xbf, 0xe7, 0x38, 0xe2, 0xd8, 0x2b, 0xff, 0xf9, 0x6f, 0x52, 0xe7, 0xfe, 0x06,
 ];

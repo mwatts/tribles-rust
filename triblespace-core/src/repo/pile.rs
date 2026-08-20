@@ -5510,7 +5510,6 @@ mod tests {
         let path_b = fresh_empty_pile_path(&dir, "selection-b.pile");
         let path_ab = dir.path().join("selection-ab.pile");
         let path_ba = dir.path().join("selection-ba.pile");
-        let source = collection_test_collection(1);
         let target = collection_test_collection(2);
         let input = collection_test_hash(8);
         let records = collection_test_records();

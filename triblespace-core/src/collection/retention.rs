@@ -215,10 +215,6 @@ mod tests {
     use crate::repo::{memoryrepo::MemoryRepo, BlobStore, BlobStoreGet, BlobStoreKeep};
     use crate::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
-    fn id(byte: u8) -> Id {
-        Id::new([byte; 16]).unwrap()
-    }
-
     /// One named root under a fixed team of one.
     fn test_root(name: &str) -> Fragment {
         simplearchive_union::descriptor(

@@ -21,17 +21,21 @@ use ed25519::signature::Signer;
 use ed25519::Signature;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
+#[cfg(test)]
 use crate::attribute::Attribute;
 use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
-use crate::blob::{Blob, TryFromBlob};
+use crate::blob::Blob;
 use crate::id::Id;
 use crate::id_hex;
 use crate::inline::encodings::ed25519::{ED25519PublicKey, ED25519RComponent, ED25519SComponent};
-use crate::inline::encodings::genid::{GenId, IdParseError};
+use crate::inline::encodings::genid::GenId;
+#[cfg(test)]
+use crate::inline::encodings::genid::IdParseError;
 use crate::inline::encodings::hash::{Blake3, Handle, Hash};
 use crate::inline::encodings::shortstring::ShortString;
-use crate::inline::{Inline, InlineEncoding};
-use crate::metadata;
+use crate::inline::Inline;
+#[cfg(test)]
+use crate::inline::InlineEncoding;
 use crate::prelude::attributes;
 use crate::trible::{TribleSet, TRIBLE_LEN};
 
@@ -177,22 +181,12 @@ pub fn empty_metadata_handle() -> Inline<Handle<SimpleArchive>> {
 pub enum RecordDecodeError {
     /// The bytes were not a canonical `SimpleArchive`.
     Archive(UnarchiveError),
-    /// The archive contained no facts.
-    Empty,
-    /// More than one entity occurred in a record archive.
-    MultipleEntities,
     /// A required field was absent.
     MissingField(&'static str),
     /// A single-valued field occurred more than once.
     RepeatedField(&'static str),
     /// A `GenId` field had a noncanonical or nil inline representation.
     InvalidId(&'static str),
-    /// The record's marker names another record kind.
-    WrongKind { expected: Id, actual: Id },
-    /// The stored subject was not the intrinsic root of the canonical fields.
-    NonCanonicalRoot { stored: Id, expected: Id },
-    /// The archive contained a fact outside the exact canonical record shape.
-    NonCanonicalFacts,
     /// A dense record had no kind byte or the wrong payload length.
     InvalidLength { expected: usize, actual: usize },
     /// A tagged dense record used an unknown variant byte.
@@ -205,26 +199,11 @@ impl fmt::Display for RecordDecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Archive(error) => write!(f, "invalid SimpleArchive record: {error}"),
-            Self::Empty => write!(f, "collection record is empty"),
-            Self::MultipleEntities => {
-                write!(f, "collection record must contain exactly one entity")
-            }
             Self::MissingField(field) => write!(f, "collection record is missing {field}"),
             Self::RepeatedField(field) => {
                 write!(f, "collection record contains repeated {field}")
             }
             Self::InvalidId(field) => write!(f, "collection record contains invalid {field}"),
-            Self::WrongKind { expected, actual } => write!(
-                f,
-                "collection record kind {actual:X} does not match expected {expected:X}"
-            ),
-            Self::NonCanonicalRoot { stored, expected } => write!(
-                f,
-                "collection record root {stored:X} does not match canonical root {expected:X}"
-            ),
-            Self::NonCanonicalFacts => {
-                write!(f, "collection record contains noncanonical or extra facts")
-            }
             Self::InvalidLength { expected, actual } => write!(
                 f,
                 "collection record has {actual} bytes; expected exactly {expected}"
@@ -870,33 +849,12 @@ fn encode_archive(facts: TribleSet) -> Blob<SimpleArchive> {
     <TribleSet as crate::blob::IntoBlob<SimpleArchive>>::to_blob(facts)
 }
 
-fn decode_archive(blob: &Blob<SimpleArchive>) -> Result<TribleSet, RecordDecodeError> {
-    Ok(<TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(
-        blob.clone(),
-    )?)
-}
-
-fn record_root_and_kind(facts: &TribleSet, expected: Id) -> Result<Id, RecordDecodeError> {
-    let mut iter = facts.iter();
-    let Some(first) = iter.next() else {
-        return Err(RecordDecodeError::Empty);
-    };
-    let root = *first.e();
-    if iter.any(|fact| fact.e() != &root) {
-        return Err(RecordDecodeError::MultipleEntities);
-    }
-    let actual = one_id(facts, &metadata::tag, "metadata::tag")?;
-    if actual != expected {
-        return Err(RecordDecodeError::WrongKind { expected, actual });
-    }
-    Ok(root)
-}
-
 #[cfg(test)]
 pub(crate) fn one_id_for_test(facts: &TribleSet, attribute: &Attribute<GenId>) -> Id {
     one_id(facts, attribute, "test").expect("present")
 }
 
+#[cfg(test)]
 fn one_id(
     facts: &TribleSet,
     attribute: &Attribute<GenId>,
@@ -908,6 +866,7 @@ fn one_id(
         .map_err(|_: IdParseError| RecordDecodeError::InvalidId(field))
 }
 
+#[cfg(test)]
 fn one_inline<S: InlineEncoding>(
     facts: &TribleSet,
     attribute: &Attribute<S>,
@@ -924,29 +883,6 @@ fn one_inline<S: InlineEncoding>(
         return Err(RecordDecodeError::RepeatedField(field));
     }
     Ok(value)
-}
-
-fn ensure_canonical(
-    stored_facts: &TribleSet,
-    stored_root: Id,
-    expected_root: Id,
-    expected_facts: TribleSet,
-) -> Result<(), RecordDecodeError> {
-    if stored_root != expected_root {
-        return Err(RecordDecodeError::NonCanonicalRoot {
-            stored: stored_root,
-            expected: expected_root,
-        });
-    }
-    let exact = stored_facts.len() == expected_facts.len()
-        && stored_facts
-            .eav
-            .iter_ordered()
-            .eq(expected_facts.eav.iter_ordered());
-    if !exact {
-        return Err(RecordDecodeError::NonCanonicalFacts);
-    }
-    Ok(())
 }
 
 #[cfg(test)]

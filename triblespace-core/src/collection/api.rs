@@ -1239,10 +1239,6 @@ mod tests {
         }
     }
 
-    fn id(byte: u8) -> Id {
-        Id::new([byte; 16]).unwrap()
-    }
-
     fn fragment(entity: u8, attachment: bool) -> Fragment {
         let mut row = [entity; TRIBLE_LEN];
         row[16..32].fill(1);

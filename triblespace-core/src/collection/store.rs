@@ -291,7 +291,6 @@ mod tests {
     #[test]
     fn default_pair_selection_includes_all_inputs_and_excludes_other_pairs() {
         let records = fixture();
-        let source = collection(1);
         let target = collection(2);
         let pair = [CollectionRecordSelector::DeriveTarget(target)]
             .into_iter()

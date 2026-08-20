@@ -533,10 +533,6 @@ mod tests {
     use crate::collection::simplearchive_union;
     use crate::trible::{Trible, TribleSet, TRIBLE_LEN};
 
-    fn id(byte: u8) -> Id {
-        Id::new([byte; 16]).unwrap()
-    }
-
     /// The named `SimpleArchive` root these tests derive from.
     fn raw_root(name: &str) -> Fragment {
         simplearchive_union::descriptor(
