@@ -36,7 +36,7 @@ use ed25519_dalek::SigningKey;
 
 use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
 use crate::blob::encodings::UnknownBlob;
-use crate::blob::{Blob, MemoryBlobStore};
+use crate::blob::Blob;
 use crate::id::Id;
 use crate::id_hex;
 use crate::inline::encodings::hash::{Blake3, Handle, Hash};
@@ -196,15 +196,6 @@ pub enum PublicationError<PutError, InsertError> {
     Validation(SimpleArchiveUnionValidationError),
     /// Commit metadata is not a canonical `SimpleArchive`.
     InvalidMetadata(UnarchiveError),
-    /// An embedded fragment blob is not stored under its actual byte identity.
-    InvalidEmbeddedBlob {
-        /// Type-erased identity used as the `MemoryBlobStore` key.
-        store_key: CollectionData,
-        /// Type-erased identity cached inside the stored `Blob`.
-        cached_handle: CollectionData,
-        /// Fresh Blake3 identity recomputed from the blob bytes.
-        actual: CollectionData,
-    },
     /// An element, result, metadata, or embedded-attachment write failed.
     DependencyPut(PutError),
     /// The final commit or merge record could not be admitted to the native record store.
@@ -217,12 +208,13 @@ pub enum PublicationError<PutError, InsertError> {
 /// to report an I/O failure: preparation does not touch the destination store.
 pub type PreparationError = PublicationError<Infallible, Infallible>;
 
-/// A canonical signed collection commit whose bytes have not been published.
+/// A canonical collection commit whose bytes have not been published.
 ///
 /// Preparation validates and normalizes the descriptor, data, metadata, and
-/// embedded fragment blobs entirely in memory. Call [`Self::stage`] to write
-/// every dependency while retaining the commit record itself. Dropping a
-/// prepared value has no storage effect.
+/// embedded fragment blobs entirely in memory, without touching any store and
+/// without needing a signing key. Call [`Self::stage`] to write every
+/// dependency and sign the resulting commit over the handles the store itself
+/// returned. Dropping a prepared value has no storage effect.
 #[derive(Clone, Debug)]
 #[must_use = "a prepared collection commit has no effect until it is staged and finalized"]
 pub struct PreparedCollectionCommit {
@@ -230,19 +222,17 @@ pub struct PreparedCollectionCommit {
     descriptor: Fragment,
     data: Blob<SimpleArchive>,
     metadata: Blob<SimpleArchive>,
-    commit: CollectionCommit,
 }
 
 impl PreparedCollectionCommit {
-    /// Inspect the exact canonical commit that finalization will publish.
-    pub fn commit(&self) -> &CollectionCommit {
-        &self.commit
-    }
-
-    /// Stage every dependency without publishing the commit record.
+    /// Stage every dependency and sign the commit over the stored handles.
     ///
     /// The exact store-call order is the collection descriptor blob,
-    /// embedded blobs (in handle order), data, and metadata.
+    /// embedded blobs (in handle order), data, and metadata. Every handle the
+    /// signed commit names is a handle one of those writes handed back, so the
+    /// commit's whole dependency closure is present by construction rather
+    /// than by two independent hash computations happening to agree.
+    ///
     /// On success the returned value retains the same mutable store borrow, so
     /// a caller may append unsigned `MERGE` or `DERIVE` artifacts through
     /// [`StagedCollectionCommit::store_mut`] before consuming the value with
@@ -250,6 +240,7 @@ impl PreparedCollectionCommit {
     pub fn stage<'store, S>(
         self,
         store: &'store mut S,
+        signing_key: &SigningKey,
     ) -> Result<StagedCollectionCommit<'store, S>, PublicationError<S::PutError, S::InsertError>>
     where
         S: BlobStorePut + CollectionStore,
@@ -259,10 +250,9 @@ impl PreparedCollectionCommit {
             descriptor,
             data,
             metadata,
-            commit,
         } = self;
 
-        store
+        let collection: CollectionHandle = store
             .put::<SimpleArchive, _>(crate::blob::IntoBlob::<SimpleArchive>::to_blob(
                 descriptor.into_facts(),
             ))
@@ -272,12 +262,19 @@ impl PreparedCollectionCommit {
                 .put::<UnknownBlob, _>(blob)
                 .map_err(PublicationError::DependencyPut)?;
         }
-        store
+        let data_handle = store
             .put::<SimpleArchive, _>(data)
             .map_err(PublicationError::DependencyPut)?;
-        store
+        let metadata_handle = store
             .put::<SimpleArchive, _>(metadata)
             .map_err(PublicationError::DependencyPut)?;
+
+        let commit = CollectionCommit::sign(
+            signing_key,
+            collection,
+            Handle::<SimpleArchive>::to_hash(data_handle),
+            metadata_handle,
+        );
         Ok(StagedCollectionCommit { store, commit })
     }
 }
@@ -347,17 +344,6 @@ where
                     "commit metadata is not a canonical SimpleArchive: {error}"
                 )
             }
-            Self::InvalidEmbeddedBlob {
-                store_key,
-                cached_handle,
-                actual,
-            } => write!(
-                f,
-                "embedded blob store key {} and cached handle {} do not both match byte identity {}",
-                hex::encode_upper(store_key.raw),
-                hex::encode_upper(cached_handle.raw),
-                hex::encode_upper(actual.raw),
-            ),
             Self::DependencyPut(error) => {
                 write!(f, "failed to write a collection dependency: {error}")
             }
@@ -375,7 +361,6 @@ where
         match self {
             Self::Validation(error) => Some(error),
             Self::InvalidMetadata(error) => Some(error),
-            Self::InvalidEmbeddedBlob { .. } => None,
             Self::DependencyPut(error) => Some(error),
             Self::RecordInsert(error) => Some(error),
         }
@@ -538,58 +523,55 @@ pub fn validate_merge(
     Ok(())
 }
 
-/// Prepare a canonical signed membership root entirely in memory.
+/// Prepare a canonical membership root entirely in memory.
 ///
 /// Supplied data and metadata are normalized from their bytes before either is
-/// validated or included in the signed transcript, so a forged
-/// [`Blob::with_handle`] cache cannot enter storage or determine the commit
-/// identity. No store is touched. The returned value can be inspected, staged,
-/// abandoned inertly, or finalized later.
+/// validated, so a forged [`Blob::with_handle`] cache cannot enter storage or
+/// determine the commit identity. No store is touched and no key is needed:
+/// the commit is signed by [`PreparedCollectionCommit::stage`] over the
+/// handles the store returns. The returned value can be staged, abandoned
+/// inertly, or finalized later.
 pub fn prepare_commit(
     descriptor: &Fragment,
     data: &Blob<SimpleArchive>,
     metadata: &Blob<SimpleArchive>,
-    signing_key: &SigningKey,
 ) -> Result<PreparedCollectionCommit, PreparationError> {
-    prepare_commit_with_embedded(descriptor, data, metadata, signing_key, Vec::new())
+    prepare_commit_with_embedded(descriptor, data, metadata, Vec::new())
 }
 
-/// Prepare a self-contained fact fragment as a canonical signed membership root.
+/// Prepare a self-contained fact fragment as a canonical membership root.
 ///
 /// The fragment's facts become collection data and its metafacts become commit
-/// metadata. Its one shared blob store may back handles in either set. This
-/// boundary recomputes every embedded blob's identity and requires both its
-/// [`MemoryBlobStore`] key and cached [`Blob`] handle to match the bytes. A
-/// mismatch is rejected rather than normalized because either fact set may
-/// name the forged identity. Fragment exports are not serialized. No
-/// destination store is touched.
+/// metadata. Its one shared blob store may back handles in either set, and its
+/// blobs are staged under the identities they already carry: bytes are hashed
+/// where they enter a trust boundary, and an in-memory fragment we just built
+/// is not such a boundary. Fragment exports are not serialized. No destination
+/// store is touched.
 pub fn prepare_fragment_commit(
     descriptor: &Fragment,
     fragment: Fragment,
-    signing_key: &SigningKey,
 ) -> Result<PreparedCollectionCommit, PreparationError> {
-    let (_, facts, metafacts, blobs) = fragment.into_parts();
+    let (_, facts, metafacts, mut blobs) = fragment.into_parts();
 
-    let mut embedded =
-        checked_embedded_blobs(blobs).map_err(|(store_key, cached_handle, actual)| {
-            PublicationError::InvalidEmbeddedBlob {
-                store_key,
-                cached_handle,
-                actual,
-            }
-        })?;
+    // The sort key is the identity `put` will file each blob under, so the
+    // staged order is the documented handle order.
+    let mut embedded: Vec<Blob<UnknownBlob>> = blobs
+        .reader()
+        .expect("MemoryBlobStore::reader is infallible")
+        .into_iter()
+        .map(|(_, blob)| blob)
+        .collect();
     embedded.sort_unstable_by_key(|blob| blob.get_handle().raw);
 
     let data: Blob<SimpleArchive> = crate::blob::IntoBlob::to_blob(facts);
     let metadata: Blob<SimpleArchive> = crate::blob::IntoBlob::to_blob(metafacts);
-    prepare_commit_with_embedded(descriptor, &data, &metadata, signing_key, embedded)
+    prepare_commit_with_embedded(descriptor, &data, &metadata, embedded)
 }
 
 fn prepare_commit_with_embedded(
     descriptor: &Fragment,
     data: &Blob<SimpleArchive>,
     metadata: &Blob<SimpleArchive>,
-    signing_key: &SigningKey,
     embedded: Vec<Blob<UnknownBlob>>,
 ) -> Result<PreparedCollectionCommit, PreparationError> {
     validate_descriptor(descriptor).map_err(PublicationError::Validation)?;
@@ -605,21 +587,11 @@ fn prepare_commit_with_embedded(
     let metadata = normalize_blob(metadata);
     validate_element(&metadata).map_err(PublicationError::InvalidMetadata)?;
 
-    let collection: CollectionHandle =
-        crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()).get_handle();
-    let commit = CollectionCommit::sign(
-        signing_key,
-        collection,
-        normalized_data_identity(&data),
-        metadata.get_handle(),
-    );
-
     Ok(PreparedCollectionCommit {
         embedded,
         descriptor: descriptor.clone(),
         data,
         metadata,
-        commit,
     })
 }
 
@@ -629,15 +601,6 @@ fn widen_preparation_error<PutError, InsertError>(
     match error {
         PublicationError::Validation(error) => PublicationError::Validation(error),
         PublicationError::InvalidMetadata(error) => PublicationError::InvalidMetadata(error),
-        PublicationError::InvalidEmbeddedBlob {
-            store_key,
-            cached_handle,
-            actual,
-        } => PublicationError::InvalidEmbeddedBlob {
-            store_key,
-            cached_handle,
-            actual,
-        },
         PublicationError::DependencyPut(never) => match never {},
         PublicationError::RecordInsert(never) => match never {},
     }
@@ -669,19 +632,15 @@ pub fn publish_commit<S>(
 where
     S: BlobStorePut + CollectionStore,
 {
-    let prepared =
-        prepare_commit(descriptor, data, metadata, signing_key).map_err(widen_preparation_error)?;
-    prepared.stage(store)?.finalize()
+    let prepared = prepare_commit(descriptor, data, metadata).map_err(widen_preparation_error)?;
+    prepared.stage(store, signing_key)?.finalize()
 }
 
 /// Publish a self-contained fact fragment as a signed membership root.
 ///
 /// The fragment's facts and metafacts become the signed data and metadata
-/// elements, and its shared blob store backs handles in either set. Before
-/// touching `store`, this boundary recomputes every embedded blob's identity
-/// and requires both its [`MemoryBlobStore`] key and cached [`Blob`] handle to
-/// match the bytes. A mismatch is rejected rather than normalized because a
-/// fact may name the forged identity.
+/// elements, and its shared blob store backs handles in either set. Embedded
+/// blobs are staged under the identities they already carry.
 ///
 /// Fragment exports are not serialized. The two fact sets become canonical
 /// `SimpleArchive` data and metadata elements. The shared prepared-publication
@@ -698,9 +657,9 @@ pub fn publish_fragment_commit<S>(
 where
     S: BlobStorePut + CollectionStore,
 {
-    let prepared = prepare_fragment_commit(descriptor, fragment, signing_key)
-        .map_err(widen_preparation_error)?;
-    prepared.stage(store)?.finalize()
+    let prepared =
+        prepare_fragment_commit(descriptor, fragment).map_err(widen_preparation_error)?;
+    prepared.stage(store, signing_key)?.finalize()
 }
 
 /// Publish an exact merge after writing its descriptor, inputs, and result.
@@ -843,28 +802,6 @@ fn validate_handle(
 
 fn normalize_blob(blob: &Blob<SimpleArchive>) -> Blob<SimpleArchive> {
     Blob::new(blob.bytes.clone())
-}
-
-fn checked_embedded_blobs(
-    mut blobs: MemoryBlobStore,
-) -> Result<Vec<Blob<UnknownBlob>>, (CollectionData, CollectionData, CollectionData)> {
-    let reader = blobs
-        .reader()
-        .expect("MemoryBlobStore::reader is infallible");
-    let mut checked = Vec::with_capacity(reader.len());
-    for (store_key, blob) in reader {
-        let cached_handle = blob.get_handle();
-        let actual = Blob::<UnknownBlob>::new(blob.bytes.clone()).get_handle();
-        if store_key != actual || cached_handle != actual {
-            return Err((
-                Handle::<UnknownBlob>::to_hash(store_key),
-                Handle::<UnknownBlob>::to_hash(cached_handle),
-                Handle::<UnknownBlob>::to_hash(actual),
-            ));
-        }
-        checked.push(blob);
-    }
-    Ok(checked)
 }
 
 fn normalized_data_identity(blob: &Blob<SimpleArchive>) -> CollectionData {
@@ -1235,13 +1172,8 @@ mod tests {
             metadata_archive.get_handle(),
         );
 
-        let prepared =
-            prepare_fragment_commit(&source_descriptor, fragment.clone(), &signing_key).unwrap();
-        let repeated = prepare_fragment_commit(&source_descriptor, fragment, &signing_key).unwrap();
-        assert_eq!(prepared.commit(), &expected);
-        assert_eq!(repeated.commit(), &expected);
-        assert_eq!(prepared.commit().id(), repeated.commit().id());
-        assert_eq!(prepared.commit().to_bytes(), repeated.commit().to_bytes());
+        let prepared = prepare_fragment_commit(&source_descriptor, fragment.clone()).unwrap();
+        let repeated = prepare_fragment_commit(&source_descriptor, fragment).unwrap();
 
         let derive = CollectionDerive::new(
             identity_for_tests(&target),
@@ -1265,12 +1197,16 @@ mod tests {
         .concat();
 
         let mut store = ProbeStore::default();
+        let mut signed = Vec::new();
         for prepared in [prepared, repeated] {
-            let mut staged = prepared.stage(&mut store).unwrap();
+            let mut staged = prepared.stage(&mut store, &signing_key).unwrap();
             assert_eq!(staged.commit(), &expected);
+            signed.push(*staged.commit());
             staged.store_mut().insert(derive_record).unwrap();
             assert_eq!(staged.finalize().unwrap(), expected);
         }
+        assert_eq!(signed[0].id(), signed[1].id());
+        assert_eq!(signed[0].to_bytes(), signed[1].to_bytes());
 
         let mut expected_events = sequence.clone();
         expected_events.extend(sequence);
@@ -1291,11 +1227,11 @@ mod tests {
         let (fragment, text_handle, payload_handle) = fragment_fixture();
         let expected_content: Blob<SimpleArchive> = fragment.facts().clone().to_blob();
         let expected_metadata: Blob<SimpleArchive> = fragment.metafacts().clone().to_blob();
-        let prepared = prepare_fragment_commit(&descriptor, fragment, &signing_key).unwrap();
-        let withheld = prepared.commit().clone();
+        let prepared = prepare_fragment_commit(&descriptor, fragment).unwrap();
 
         let mut pile = Pile::open(&path).unwrap();
-        let mut staged = prepared.stage(&mut pile).unwrap();
+        let mut staged = prepared.stage(&mut pile, &signing_key).unwrap();
+        let withheld = *staged.commit();
         {
             let discovered = discover_collection_records(staged.store_mut()).unwrap();
             let reader = staged.store_mut().reader().unwrap();
@@ -1361,15 +1297,14 @@ mod tests {
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let empty_archive: Blob<SimpleArchive> = TribleSet::new().to_blob();
 
-        let prepared =
-            prepare_fragment_commit(&descriptor, Fragment::empty(), &signing_key).unwrap();
+        let prepared = prepare_fragment_commit(&descriptor, Fragment::empty()).unwrap();
 
-        assert_eq!(prepared.commit().metadata(), empty_metadata_handle());
         assert_eq!(prepared.metadata.get_handle(), empty_metadata_handle());
         assert_eq!(prepared.metadata, empty_archive);
 
         let mut store = ProbeStore::default();
-        let staged = prepared.stage(&mut store).unwrap();
+        let staged = prepared.stage(&mut store, &signing_key).unwrap();
+        assert_eq!(staged.commit().metadata(), empty_metadata_handle());
         drop(staged);
         assert_eq!(
             store
@@ -1493,60 +1428,6 @@ mod tests {
             store.records.keys().copied().collect::<BTreeSet<_>>(),
             BTreeSet::from([expected.id()])
         );
-    }
-
-    #[test]
-    fn fragment_commit_rejects_forged_embedded_identities_before_writing() {
-        let descriptor = root("first");
-        let signing_key = SigningKey::from_bytes(&[7; 32]);
-
-        // This is the exact forged-cache shape that `entity!` deliberately
-        // preserves: both the fact and MemoryBlobStore key name the bogus
-        // cached handle even though the bytes hash elsewhere.
-        let bogus_text_handle = Inline::<Handle<LongString>>::new([0xAA; 32]);
-        let forged_text = Blob::<LongString>::with_handle(
-            Bytes::from(b"bytes behind a forged cached handle".to_vec()),
-            bogus_text_handle,
-        );
-        let actual_text_handle = Blob::<LongString>::new(forged_text.bytes.clone()).get_handle();
-        let forged_content = entity! { fragment_ns::text: forged_text };
-        let mut store = ProbeStore::default();
-        let error = publish_fragment_commit(&mut store, &descriptor, forged_content, &signing_key)
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            PublicationError::InvalidEmbeddedBlob {
-                store_key,
-                cached_handle,
-                actual,
-            } if store_key == Handle::<LongString>::to_hash(bogus_text_handle)
-                && cached_handle == Handle::<LongString>::to_hash(bogus_text_handle)
-                && actual == Handle::<LongString>::to_hash(actual_text_handle)
-        ));
-        assert!(store.events.is_empty());
-
-        // `MemoryBlobStore::from_iter` can independently forge its PATCH key
-        // even when the Blob's own cache is correct. Reject that shape too.
-        let payload: Blob<RawBytes> = vec![9, 8, 7].to_blob();
-        let actual_payload_handle: Inline<Handle<UnknownBlob>> = payload.get_handle().transmute();
-        let bogus_store_key = Inline::<Handle<UnknownBlob>>::new([0xBB; 32]);
-        let embedded: MemoryBlobStore =
-            std::iter::once((bogus_store_key, payload.transmute())).collect();
-        let forged_content = Fragment::from_facts_and_blobs(TribleSet::new(), embedded);
-        let mut store = ProbeStore::default();
-        let error = publish_fragment_commit(&mut store, &descriptor, forged_content, &signing_key)
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            PublicationError::InvalidEmbeddedBlob {
-                store_key,
-                cached_handle,
-                actual,
-            } if store_key == Handle::<UnknownBlob>::to_hash(bogus_store_key)
-                && cached_handle == Handle::<UnknownBlob>::to_hash(actual_payload_handle)
-                && actual == Handle::<UnknownBlob>::to_hash(actual_payload_handle)
-        ));
-        assert!(store.events.is_empty());
     }
 
     #[test]
