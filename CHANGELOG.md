@@ -91,8 +91,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and remain readable; new ones are written under the new shape.
 
 - **A derived collection is anchored by its source.** New `collection_source`
-  names, by handle, the collection a derivation is computed from. Scope
-  narrows to what it can honestly be — the extrinsic anchor of a *root*, still
+  names, by handle, the collection a derivation is computed from. The
+  extrinsic anchor — a minted scope when this landed, a name within a team
+  since — narrows to what it can honestly be: a property of a *root*, still
   needed there because without it every root collection sharing a
   representation and recipe would have one descriptor and one handle. The
   validators changed with it: they compared two descriptors' *scopes*, a label
@@ -105,14 +106,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   confused — enough to mislead a reader into asking why descriptors take ids
   when the pile stores handles. Handle means 32 bytes, Id means 16.
 
-- **`CollectionDescriptor` holds its facts and queries them.** It parsed into a
-  parallel struct and reconstructed on the way out; it now keeps the archive
-  contents unchanged, so an argument for a recipe this binary has never heard
-  of decodes, answers questions, and re-emits byte-for-byte. `scope`,
-  `representation`, `recipe` and `entity_id` are fallible queries rather than
-  infallible accessors behind a validating constructor — the failure surfaces
-  where the value is needed and names the missing field, instead of rejecting a
-  whole archive over one a caller may never read. The type is no longer `Copy`.
+- **A descriptor is a `TribleSet`, and a root is named within a team.**
+  `CollectionDescriptor` is deleted. It parsed an archive into a parallel
+  struct and reconstructed it on the way out, and of its eighteen methods two
+  did work — encode and decode — while the rest were queries hand-rolled as
+  `iter().find()` scans over the very `TribleSet` it wrapped. It enforced
+  nothing: `from_tribles` and `from_fragment` were public and wire data went
+  through neither. Its `structural_attributes()` array was a hand-maintained
+  mirror of the schema and had already drifted — `collection_source` was
+  missing, so every derived descriptor reported its own anchor as a recipe
+  argument.
+
+  A descriptor is now the facts themselves, and the collection is the handle of
+  those facts archived as a `SimpleArchive`. `collection::descriptor` is free
+  functions over `&TribleSet` — `entity`, `representation`, `recipe`, `source`,
+  `name`, `team`, `argument` — each a `pattern!`, each failing where the value
+  is needed and naming the missing field instead of rejecting a whole archive
+  over a field the caller may never read. An argument for a recipe this binary
+  has never heard of decodes, answers questions, and re-emits byte-for-byte.
+  No table classifies attributes as structural or argument, because which
+  attributes are arguments is the recipe's business and nothing else can have
+  the information. There is deliberately no helper for hashing a descriptor you
+  have not stored: on the write side a handle comes from what `put` handed
+  back, because one computed beside a store rather than by it can name a
+  collection whose descriptor is absent.
+
+  A **root** is anchored by `collection_name` plus `collection_team`, the
+  team's root public key, instead of an opaque minted scope id. The scope
+  discriminated roots correctly and told a reader nothing: every consumer
+  carried its scope as a hex constant in its own source, so “which collection
+  is this?” was answerable only by someone holding the code. A team's root
+  keypair is archived offline after creation, so it is a genesis fact and can
+  be part of an identity without going stale. A **derived** collection carries
+  `collection_source` instead and inherits its team transitively; it is not
+  forbidden from stating one, because a recipe we have not written yet may mean
+  something by it, and forbidding shapes is how forwards compatibility dies.
+
+  Because a commit signs a transcript containing the descriptor's handle, and
+  the handle is the hash of the descriptor, the existing signature already
+  covers the team. No record format moved. Existing collections live under the
+  old anchor and are not reachable through the new one until the naming
+  migration re-seats them.
+
+  Attributes minted with `trible genid` on 2026-08-20: `collection_name`
+  `436A04C372CBBFBD9C619CF50F59C4A1` (ShortString), `collection_team`
+  `6C1ED6495491E32FEBB9FDD4EE5E8907` (ED25519PublicKey).
 
 - **Decoding no longer re-derives a descriptor's intrinsic root.** A
   non-canonical root does not break anything; it names a second collection with
