@@ -408,22 +408,24 @@ fn configured_peer_probe_roundtrips_exact_operation_receipts_without_dht_or_goss
         let configured_store = store_with_caps(&all_caps);
         let unconfigured_store = store_with_caps(&all_caps);
 
-        let source = named_root("c20");
-        let target = named_root("c21");
+        let merged = named_root("c20");
+        let derived = named_root("c21");
         let other = named_root("c22");
-        let merge_request = WantRequest::merge(collection_of(&source), data(1), data(2));
-        let merge_first = CollectionMerge::new(collection_of(&source), data(1), data(2), data(3));
-        let merge_conflict = CollectionMerge::new(collection_of(&source), data(1), data(2), data(4));
-        let merge_unrelated = CollectionMerge::new(collection_of(&source), data(1), data(9), data(5));
+        let merge_request = WantRequest::merge(collection_of(&merged), data(1), data(2));
+        let merge_first = CollectionMerge::new(collection_of(&merged), data(1), data(2), data(3));
+        let merge_conflict = CollectionMerge::new(collection_of(&merged), data(1), data(2), data(4));
+        let merge_unrelated = CollectionMerge::new(collection_of(&merged), data(1), data(9), data(5));
         let merge_wrong_collection =
             CollectionMerge::new(collection_of(&other), data(1), data(2), data(6));
 
-        // A derive names only its target: the target's descriptor already
-        // says what it derives from.
-        let derive_request = WantRequest::derive(collection_of(&target), data(7));
-        let derive_first = CollectionDerive::new(collection_of(&target), data(7), data(8));
-        let derive_conflict = CollectionDerive::new(collection_of(&target), data(7), data(9));
-        let derive_unrelated = CollectionDerive::new(collection_of(&target), data(10), data(11));
+        // A derive names only the collection gaining a state, so a receipt is
+        // selected by that collection and the input -- there is no second
+        // endpoint to disagree about. (The two names below say which records
+        // each collection carries; they are not a lineage.)
+        let derive_request = WantRequest::derive(collection_of(&derived), data(7));
+        let derive_first = CollectionDerive::new(collection_of(&derived), data(7), data(8));
+        let derive_conflict = CollectionDerive::new(collection_of(&derived), data(7), data(9));
+        let derive_unrelated = CollectionDerive::new(collection_of(&derived), data(10), data(11));
 
         for record in [
             CollectionRecord::Derive(derive_unrelated),
