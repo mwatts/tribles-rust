@@ -3348,28 +3348,15 @@ impl Pile {
     /// a fixed header has no start offset to stabilize). The data is
     /// absolutely 256-aligned (zero-copy GPU-aliasable) in a current pile, which
     /// stays 256-aligned because every record span is a count of 256-byte blocks.
-    fn put_impl<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, InsertError>
-    where
-        S: BlobEncoding + 'static,
-        T: IntoBlob<S>,
-        Handle<S>: InlineEncoding,
-    {
-        self.put_at(item, None)
-    }
-
-    /// Append a blob, optionally carrying a caller-supplied insertion
-    /// timestamp instead of the current wall clock.
+    /// Append a blob.
     ///
-    /// Only a re-encode has any business setting one. When a pile is rewritten
-    /// into the current framing, "when did this blob arrive?" is a fact about
-    /// the original append; stamping every record with the moment of the
-    /// rewrite would answer a different question and silently destroy the
-    /// answer to this one.
-    fn put_at<S, T>(
-        &mut self,
-        item: T,
-        timestamp: Option<u64>,
-    ) -> Result<Inline<Handle<S>>, InsertError>
+    /// The insertion timestamp is always the current wall clock. It is a local
+    /// fact about this file -- it is never synced, and the one consumer is a
+    /// last-resort tie-break in `branch consolidate --by-name`, applied only
+    /// after preferring a branch that has a head. A re-encode resetting every
+    /// stamp to the moment of the rewrite therefore costs nothing worth
+    /// carrying an alternate append path for.
+    fn put_impl<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, InsertError>
     where
         S: BlobEncoding + 'static,
         T: IntoBlob<S>,
@@ -3421,10 +3408,7 @@ impl Pile {
                     return Ok(handle.transmute());
                 }
             }
-            let stamp = match timestamp {
-                Some(stamp) => stamp,
-                None => SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64,
-            };
+            let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
             let header = BlobRecordHeader::new(span_blocks, stamp, blob_size as u64, hash);
             let actual_record_size = record_size;
             // post-pad is < 256.
@@ -3925,7 +3909,7 @@ pub fn reframe_into(
                     })?;
                 let bytes = records.bytes().slice(data_offset..end);
                 destination
-                    .put_at::<UnknownBlob, _>(Blob::<UnknownBlob>::new(bytes), Some(timestamp))
+                    .put::<UnknownBlob, _>(Blob::<UnknownBlob>::new(bytes))
                     .map_err(PileReframeError::Destination)?;
                 stats.blobs += 1;
             }
@@ -4683,16 +4667,15 @@ mod tests {
             vec![grant]
         );
 
-        // Payload bytes, handles, and insertion timestamps all survive.
+        // Payload bytes and handles survive. Insertion timestamps do not, and
+        // must not be expected to: they are a local fact about a particular
+        // file, never synced, and a rewrite is a fresh append.
         let reader = result.reader().unwrap();
-        for ((handle, payload), timestamp) in handles
-            .iter()
-            .zip(&payloads)
-            .zip(&source_timestamps)
-        {
+        let newest_source = source_timestamps.iter().copied().max().unwrap();
+        for (handle, payload) in handles.iter().zip(&payloads) {
             let blob: Blob<UnknownBlob> = reader.get(*handle).unwrap();
             assert_eq!(blob.bytes.as_ref(), payload.as_slice());
-            assert_eq!(reader.metadata(*handle).unwrap().unwrap().timestamp, *timestamp);
+            assert!(reader.metadata(*handle).unwrap().unwrap().timestamp >= newest_source);
         }
         drop(reader);
         result.close().unwrap();
