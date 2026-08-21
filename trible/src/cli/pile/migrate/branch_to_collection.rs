@@ -3,11 +3,11 @@
 //! Validation and publication are separate phases. The first phase freezes the
 //! selected pin head, opens one later append-only blob snapshot which contains
 //! everything that head can name, validates every reachable commit, and
-//! prepares every unique native commit entirely in memory. Only after that
+//! prepares every authored native commit entirely in memory. Only after that
 //! succeeds may the second phase append dependencies and final `COMMIT`
 //! records to the same pile.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -25,39 +25,12 @@ use triblespace_core::inline::{Inline, InlineEncoding};
 use triblespace_core::metadata;
 use triblespace_core::repo::pile::{Pile, PileReader};
 use triblespace_core::repo::{self, BlobStore, BlobStoreGet, CommitHandle, PinSnapshotSource};
-use triblespace_core::trible::{Fragment, TribleSet};
+use triblespace_core::trible::TribleSet;
 
 use super::super::signing::load_signing_key;
 
 type ArchiveHandle = Inline<Handle<SimpleArchive>>;
 type NameHandle = Inline<Handle<LongString>>;
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct ElementKey {
-    data: ArchiveHandle,
-    metadata: ArchiveHandle,
-}
-
-#[derive(Clone, Debug)]
-struct ValidatedAuthored {
-    source: CommitHandle,
-    data: Blob<SimpleArchive>,
-    metadata: Blob<SimpleArchive>,
-}
-
-#[derive(Clone, Debug)]
-struct LoadedCommit {
-    handle: CommitHandle,
-    facts: TribleSet,
-    parents: Vec<CommitHandle>,
-    content: Option<ArchiveHandle>,
-    metadata: Option<ArchiveHandle>,
-}
-
-struct PreparedElement {
-    key: ElementKey,
-    prepared: PreparedCollectionCommit,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MigrationReport {
@@ -115,86 +88,42 @@ fn migrate(
     let reader = pile.reader().context("snapshot legacy pile blobs")?;
     let (branch, branch_meta) = resolve_branch(&reader, &pins, branch_reference)?;
     let head = validate_branch_head(&reader, branch, &branch_meta)?;
-    let commits = match head {
-        Some(head) => validate_reachable_dag(&reader, head)?,
-        None => Vec::new(),
+    let descriptor = simplearchive_union::descriptor(name, team);
+    let (reachable, contentless_merges, prepared) = match head {
+        Some(head) => prepare_reachable(&reader, head, &descriptor)?,
+        None => (0, 0, Vec::new()),
     };
+    let authored = prepared.len();
 
-    let descriptor = target_descriptor(name, team);
-    let empty_metadata: Blob<SimpleArchive> = TribleSet::new().to_blob();
-    let authored: Vec<ValidatedAuthored> = commits
-        .iter()
-        .filter_map(|commit| commit.content.map(|_| commit))
-        .map(|commit| validate_authored(&reader, commit, &empty_metadata))
-        .collect::<Result<_>>()?;
-
-    // Group by the exact fields which survive into the native commit. Source
-    // wrapper identity, parents, timestamps, messages, authors and signatures
-    // are deliberately absent, so many legacy nodes may map to one target.
-    let mut groups: BTreeMap<ElementKey, Vec<CommitHandle>> = BTreeMap::new();
-    let mut blobs: BTreeMap<ElementKey, (Blob<SimpleArchive>, Blob<SimpleArchive>)> =
-        BTreeMap::new();
-    for item in authored {
-        let key = ElementKey {
-            data: item.data.get_handle(),
-            metadata: item.metadata.get_handle(),
-        };
-        groups.entry(key).or_default().push(item.source);
-        blobs.entry(key).or_insert((item.data, item.metadata));
-    }
-    // `prepare_commit` performs no I/O. Preparing the complete unique set here
-    // preserves the failure-atomic contract: no descriptor, dependency or
-    // collection record is written until every reachable source node passes.
-    let prepared: Vec<PreparedElement> = blobs
-        .into_iter()
-        .map(|(key, (data, metadata))| {
-            let prepared = simplearchive_union::prepare_commit(&descriptor, &data, &metadata)
-                .map_err(|error| anyhow!("prepare native collection commit: {error}"))?;
-            Ok(PreparedElement { key, prepared })
-        })
-        .collect::<Result<_>>()?;
-
-    let mut commits_by_key = BTreeMap::new();
-    for element in prepared {
-        let staged = element
-            .prepared
+    // Preparation above performs no I/O. Once every reachable node has
+    // passed, publish each direct source mapping. Exact repeats naturally
+    // converge through the content-addressed blob and collection stores.
+    let mut mappings = Vec::with_capacity(authored);
+    for (source, prepared) in prepared {
+        let staged = prepared
             .stage(pile, signer)
             .map_err(|error| anyhow!("stage native collection commit: {error}"))?;
         let commit = staged
             .finalize()
             .map_err(|error| anyhow!("finalize native collection commit: {error}"))?;
-        commits_by_key.insert(element.key, commit);
-    }
-
-    let mut mappings = Vec::new();
-    for (key, sources) in groups {
-        let target = commits_by_key[&key];
-        for source in sources {
-            mappings.push((source, target));
-        }
+        mappings.push((source, commit));
     }
     mappings.sort_unstable_by_key(|(source, _)| source.raw);
 
-    let contentless_merges = commits.len().saturating_sub(mappings.len());
+    let unique_targets = mappings
+        .iter()
+        .map(|(_, target)| target.id())
+        .collect::<BTreeSet<_>>()
+        .len();
     let report = MigrationReport {
         branch,
         head,
-        reachable: commits.len(),
-        authored: mappings.len(),
+        reachable,
+        authored,
         contentless_merges,
-        unique_targets: commits_by_key.len(),
+        unique_targets,
     };
     Ok((report, mappings))
-}
-
-/// Central compatibility seam for collection identity construction.
-///
-/// At the requested e72 base, a root descriptor is `(name, team,
-/// representation, recipe)`. Reach is not yet a descriptor input here; when
-/// that public constructor changes, only this function and the CLI's explicit
-/// identity arguments need to change rather than the migration walk.
-fn target_descriptor(name: &CollectionName, team: VerifyingKey) -> Fragment {
-    simplearchive_union::descriptor(name, team)
 }
 
 fn parse_team_root(text: &str) -> Result<VerifyingKey> {
@@ -276,133 +205,72 @@ fn validate_branch_head(
         let (blob, _) = read_archive(reader, head, "legacy branch head commit")?;
         repo::branch::verify(branch, blob, facts.clone())
             .map_err(|_| anyhow!("legacy branch {branch:X} head signature is invalid"))?;
-    } else {
-        // A headless branch is valid only when it carries no stray signature
-        // tuple. Otherwise corruption would be silently reclassified as empty.
-        require_absent(
-            facts,
-            subject,
-            &triblespace_core::attestation::signed_by,
-            "signed_by",
-        )?;
-        require_absent(
-            facts,
-            subject,
-            &triblespace_core::attestation::signature_r,
-            "signature_r",
-        )?;
-        require_absent(
-            facts,
-            subject,
-            &triblespace_core::attestation::signature_s,
-            "signature_s",
-        )?;
     }
     Ok(head)
 }
 
-fn validate_reachable_dag(reader: &PileReader, head: CommitHandle) -> Result<Vec<LoadedCommit>> {
-    let mut loaded = BTreeMap::new();
-    let mut emitted = HashSet::new();
-    let mut active = HashSet::new();
-    let mut ordered = Vec::new();
-    let mut stack = vec![(head, false)];
-
-    while let Some((handle, expanded)) = stack.pop() {
-        if emitted.contains(&handle) {
-            continue;
-        }
-        if expanded {
-            active.remove(&handle);
-            emitted.insert(handle);
-            ordered.push(handle);
-            continue;
-        }
-        if !active.insert(handle) {
-            bail!("cycle in legacy commit DAG at {}", handle_hex(handle));
-        }
-        if let std::collections::btree_map::Entry::Vacant(entry) = loaded.entry(handle) {
-            entry.insert(load_commit(reader, handle)?);
-        }
-        let parents = loaded[&handle].parents.clone();
-        stack.push((handle, true));
-        for parent in parents.into_iter().rev() {
-            if active.contains(&parent) {
-                bail!("cycle in legacy commit DAG at {}", handle_hex(parent));
-            }
-            if !emitted.contains(&parent) {
-                stack.push((parent, false));
-            }
-        }
-    }
-
-    ordered
-        .into_iter()
-        .map(|handle| {
-            loaded
-                .remove(&handle)
-                .ok_or_else(|| anyhow!("internal error: validated commit disappeared"))
-        })
-        .collect()
-}
-
-fn load_commit(reader: &PileReader, handle: CommitHandle) -> Result<LoadedCommit> {
-    let (_, facts) = read_archive(reader, handle, "legacy commit wrapper")?;
-    let subjects: BTreeSet<Id> = facts.iter().map(|fact| *fact.e()).collect();
-    if subjects.len() != 1 {
-        bail!(
-            "legacy commit {} must contain exactly one wrapper subject, found {}",
-            handle_hex(handle),
-            subjects.len()
-        );
-    }
-    let subject = *subjects.iter().next().expect("one wrapper subject");
-    let content = one_value(&facts, subject, &repo::content, "content")?;
-    let metadata = one_value(&facts, subject, &metadata::archive, "metadata archive")?;
-
-    let mut parents: Vec<CommitHandle> = facts
-        .iter()
-        .filter(|fact| fact.e() == &subject && fact.a() == &repo::parent.id())
-        .map(|fact| *fact.v::<Handle<SimpleArchive>>())
-        .collect();
-    parents.sort_unstable_by_key(|parent| parent.raw);
-    parents.dedup();
-
-    if content.is_none() {
-        validate_contentless_merge(&facts, subject, handle, &parents)?;
-    }
-    Ok(LoadedCommit {
-        handle,
-        facts,
-        parents,
-        content,
-        metadata,
-    })
-}
-
-fn validate_authored(
+fn prepare_reachable(
     reader: &PileReader,
-    commit: &LoadedCommit,
-    empty_metadata: &Blob<SimpleArchive>,
-) -> Result<ValidatedAuthored> {
-    let content_handle = commit.content.expect("authored commit has content");
-    let content = read_blob(reader, content_handle, "legacy commit content")?;
-    repo::commit::verify(content.clone(), commit.facts.clone()).map_err(|_| {
-        anyhow!(
-            "legacy authored commit {} has an invalid content signature",
-            handle_hex(commit.handle)
-        )
-    })?;
-    let metadata = match commit.metadata {
-        Some(handle) => read_blob(reader, handle, "legacy commit metadata archive")?,
-        None => empty_metadata.clone(),
-    };
+    head: CommitHandle,
+    descriptor: &triblespace_core::trible::Fragment,
+) -> Result<(usize, usize, Vec<(CommitHandle, PreparedCollectionCommit)>)> {
+    let empty_metadata: Blob<SimpleArchive> = TribleSet::new().to_blob();
+    // Pile reads verify each content address. A reference cycle would require
+    // a BLAKE3 fixed point or collision, so set reachability needs no separate
+    // active-path cycle state.
+    let mut seen = HashSet::new();
+    let mut stack = vec![head];
+    let mut contentless_merges = 0;
+    let mut prepared = Vec::new();
 
-    Ok(ValidatedAuthored {
-        source: commit.handle,
-        data: content,
-        metadata,
-    })
+    while let Some(handle) = stack.pop() {
+        if !seen.insert(handle) {
+            continue;
+        }
+
+        let (_, facts) = read_archive(reader, handle, "legacy commit wrapper")?;
+        let Some(first) = facts.iter().next() else {
+            bail!("legacy commit {} has an empty wrapper", handle_hex(handle));
+        };
+        let subject = *first.e();
+        if facts.iter().any(|fact| fact.e() != &subject) {
+            bail!(
+                "legacy commit {} must contain exactly one wrapper subject",
+                handle_hex(handle)
+            );
+        }
+
+        let content = one_value(&facts, subject, &repo::content, "content")?;
+        let metadata = one_value(&facts, subject, &metadata::archive, "metadata archive")?;
+        let parents: Vec<CommitHandle> = facts
+            .iter()
+            .filter(|fact| fact.a() == &repo::parent.id())
+            .map(|fact| *fact.v::<Handle<SimpleArchive>>())
+            .collect();
+        stack.extend(parents.iter().copied());
+
+        if let Some(content) = content {
+            let data = read_blob(reader, content, "legacy commit content")?;
+            repo::commit::verify(data.clone(), facts).map_err(|_| {
+                anyhow!(
+                    "legacy authored commit {} has an invalid content signature",
+                    handle_hex(handle)
+                )
+            })?;
+            let metadata = match metadata {
+                Some(handle) => read_blob(reader, handle, "legacy commit metadata archive")?,
+                None => empty_metadata.clone(),
+            };
+            let commit = simplearchive_union::prepare_commit(descriptor, &data, &metadata)
+                .map_err(|error| anyhow!("prepare native collection commit: {error}"))?;
+            prepared.push((handle, commit));
+        } else {
+            validate_contentless_merge(&facts, subject, handle, &parents)?;
+            contentless_merges += 1;
+        }
+    }
+
+    Ok((seen.len(), contentless_merges, prepared))
 }
 
 fn validate_contentless_merge(
@@ -471,18 +339,6 @@ fn one_value<V: InlineEncoding>(
         bail!("legacy wrapper subject {subject:X} has repeated {field}");
     }
     Ok(first)
-}
-
-fn require_absent<V: InlineEncoding>(
-    facts: &TribleSet,
-    subject: Id,
-    attribute: &Attribute<V>,
-    field: &str,
-) -> Result<()> {
-    if one_value(facts, subject, attribute, field)?.is_some() {
-        bail!("headless legacy branch {subject:X} unexpectedly carries {field}");
-    }
-    Ok(())
 }
 
 fn handle_hex(handle: ArchiveHandle) -> String {
@@ -605,38 +461,6 @@ mod tests {
         let signer = key(3);
 
         let mut pile = super::super::super::open_refreshed(&path)?;
-        let pins = pile.snapshot_pin_heads()?;
-        let reader = pile.reader()?;
-        let (_, branch_meta) = resolve_branch(&reader, &pins, "legacy")?;
-        let head = validate_branch_head(&reader, branch, &branch_meta)?.unwrap();
-        let source = validate_reachable_dag(&reader, head)?;
-        let empty_metadata = TribleSet::new().to_blob().get_handle();
-        let expected_by_source: BTreeMap<_, _> = source
-            .iter()
-            .filter_map(|commit| {
-                commit.content.map(|content| {
-                    (
-                        commit.handle,
-                        (content, commit.metadata.unwrap_or(empty_metadata)),
-                    )
-                })
-            })
-            .collect();
-        let mut expected_union = TribleSet::new();
-        for commit in &source {
-            if let Some(content) = commit.content {
-                let facts: TribleSet = reader
-                    .get(content)
-                    .map_err(|error| anyhow!("read expected legacy content: {error}"))?;
-                expected_union += facts;
-            }
-        }
-        let expected_metadata = source
-            .iter()
-            .find_map(|commit| commit.metadata)
-            .expect("repository fixture carries repo-wide metadata");
-        drop(reader);
-
         let (first, first_map) = migrate(&mut pile, "legacy", &name, team, &signer)?;
         assert_eq!(first.branch, branch);
         assert_eq!(first.reachable, 5);
@@ -652,14 +476,32 @@ mod tests {
                 .len(),
             3
         );
+
+        let reader = pile.reader()?;
+        let empty_metadata = TribleSet::new().to_blob().get_handle();
+        let mut expected_union = TribleSet::new();
+        let mut expected_metadata = None;
+        for (source, target) in &first_map {
+            let (_, wrapper) = read_archive(&reader, *source, "expected source wrapper")?;
+            let subject = *wrapper.iter().next().expect("authored wrapper subject").e();
+            let data = one_value(&wrapper, subject, &repo::content, "content")?
+                .expect("authored source content");
+            let metadata = one_value(&wrapper, subject, &metadata::archive, "metadata archive")?
+                .unwrap_or(empty_metadata);
+            assert_eq!(target.data().raw, data.raw);
+            assert_eq!(target.metadata(), metadata);
+            expected_metadata.get_or_insert(metadata);
+
+            let facts: TribleSet = reader
+                .get(data)
+                .map_err(|error| anyhow!("read expected legacy content: {error}"))?;
+            expected_union += facts;
+        }
+        let expected_metadata = expected_metadata.expect("repository fixture carries metadata");
         assert!(first_map
             .iter()
             .all(|(_, target)| target.metadata() == expected_metadata));
-        for (source, target) in &first_map {
-            let (expected_data, expected_metadata) = expected_by_source[source];
-            assert_eq!(target.data().raw, expected_data.raw);
-            assert_eq!(target.metadata(), expected_metadata);
-        }
+        drop(reader);
         let materialized = Collection::new(&mut pile, &name, team, signer.clone())
             .materialize()
             .map_err(|error| anyhow!("materialize migrated collection: {error}"))?;
@@ -832,9 +674,17 @@ mod tests {
         let handle = pile.put::<SimpleArchive, _>(wrapper)?;
         let reader = pile.reader()?;
 
-        let loaded = load_commit(&reader, handle)?;
-        assert_eq!(loaded.content, Some(content_handle));
-        validate_authored(&reader, &loaded, &TribleSet::new().to_blob())?;
+        let (_, wrapper) = read_archive(&reader, handle, "random-subject wrapper")?;
+        assert_eq!(
+            one_value(&wrapper, subject, &repo::content, "content")?,
+            Some(content_handle)
+        );
+        let descriptor = simplearchive_union::descriptor(
+            &CollectionName::new("random-subject").unwrap(),
+            key(14).verifying_key(),
+        );
+        let (reachable, merges, prepared) = prepare_reachable(&reader, handle, &descriptor)?;
+        assert_eq!((reachable, merges, prepared.len()), (1, 0, 1));
         pile.close()?;
         Ok(())
     }

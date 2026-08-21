@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same-pile bridge from one legacy `Repository` branch to a native
   `SimpleArchive` union collection. The command requires the target collection
   name, team root, and signing key explicitly; validates the branch head and
-  complete reachable commit DAG before writing; preserves each authored
+  complete reachable commit history before writing; preserves each authored
   commit's exact `repo::content` and `metadata::archive`; skips verified
   contentless merges; resolves both current and historical branch-name
   encodings; and reports every source-to-target mapping, including deterministic

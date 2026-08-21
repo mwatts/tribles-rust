@@ -159,8 +159,8 @@ and the older inline ShortString names are understood; duplicate names are
 rejected instead of guessed. Before its first append, it freezes the selected
 pin head and validates the complete reachable commit DAG through one later
 append-only blob snapshot, including canonical wrapper/content/archive bytes,
-authored content signatures, parent availability, cycle freedom, and the
-current or historical intrinsic identity of contentless canonical merges.
+authored content signatures, parent availability, and the current or
+historical intrinsic identity of contentless canonical merges.
 Older authored commits may have random wrapper subjects; a unique subject and
 unique mapped `content` and `metadata::archive` fields are required, but
 today's intrinsic subject derivation is not retroactively imposed on them.
@@ -183,12 +183,6 @@ copies nothing because source and target are the same pile: any resident
 attachment closure remains resident and becomes reachable through the native
 commit, while a faculty that requires particular attachments must validate
 that schema before migration.
-
-At the collection-descriptor version documented here, a root identity is fixed
-by its name and team together with the `SimpleArchive` representation and
-union recipe. If a later descriptor version adds another identity dimension
-(for example a reach policy), the migration must expose and require it rather
-than choosing a default silently.
 
 ## Attach an exact direct fact view
 
