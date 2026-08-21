@@ -20,18 +20,26 @@ mod squash;
 
 #[derive(Parser)]
 pub enum PileCommand {
-    /// Operations on branches stored in a pile file. Branches are
-    /// the named-pin specialization that holds a commit-chain head;
-    /// `branch list` filters to those and shows commit-aware info.
-    /// For the generic pin view (all pins regardless of role), see
-    /// `pile pin`.
+    /// Operations on the commit-chain branches stored in a pile file.
+    ///
+    /// A branch is a named pin holding one commit-chain head, and it is a
+    /// different thing from a collection: a branch has a head that moves and
+    /// a history to walk back, while a collection is a grow-only set named
+    /// within a team whose identity is its descriptor. Both live in a pile.
+    /// `branch list` shows the branches with commit-aware columns; for the
+    /// raw pin view underneath them see `pile pin`, and for collections see
+    /// `pile collection`.
     Branch {
         #[command(subcommand)]
         cmd: branch::Command,
     },
-    /// Operations on the legacy pin storage primitive. Branches and unnamed
-    /// legacy/application pins show up here; private node policy lives in a
-    /// signer-owned collection. For the branch-specific view, see `pile branch`.
+    /// Operations on pins, the storage primitive a branch is made of.
+    ///
+    /// A pin is a mutable CAS cell in the pile; a branch is a pin that
+    /// carries a name and a commit head. Everything in the pile that pins
+    /// something shows up here regardless of role, which is why this is the
+    /// view for anonymous or stale cells. For the branch-specific view see
+    /// `pile branch`.
     Pin {
         #[command(subcommand)]
         cmd: pin::Command,
@@ -41,10 +49,13 @@ pub enum PileCommand {
         #[command(subcommand)]
         cmd: blob::Command,
     },
-    /// Collection-aware views of a pile. A collection is identified by the
-    /// blake3 handle of its descriptor blob; these subcommands decode that
-    /// descriptor instead of showing it as 256 opaque bytes the way
-    /// `pile blob inspect` does.
+    /// Collection-aware views of a pile.
+    ///
+    /// A collection is a grow-only set of signed records, named within a team
+    /// and identified by the blake3 handle of its descriptor blob. These
+    /// subcommands decode that descriptor — so a collection lists under the
+    /// name it was given, rather than as the opaque bytes `pile blob inspect`
+    /// would report. Every one of them takes either the name or the handle.
     Collection {
         #[command(subcommand)]
         cmd: collection::Command,
