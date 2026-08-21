@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A collection snapshot merges in parallel, and stops naming a value it
+  immediately consumes.** On a 404-commit, 26.26 M-fact collection
+  (`bultmann.pile`, 1.98 GB) `Collection::snapshot` spent 6.38 s, and the
+  collection calculus was 78 ms of it — discovery, 404 signature checks,
+  canonical validation of 1.86 GB of committed archives, and physical-cover
+  planning together are 1.2% of a snapshot. The rest was two byte-level steps
+  under the calculus: a **serial** binary-heap merge of the cover into one
+  canonical 1.68 GB archive (1.44 s), a BLAKE3 pass to name that archive
+  (0.72 s), and the `TribleSet` decode of it (4.16 s).
+
+  The merge is now partitioned by key range — regular sampling picks the cuts,
+  each worker merges one interval, and concatenating the runs in range order
+  reproduces the serial answer byte for byte, because disjoint key intervals
+  cannot share a duplicate. And `snapshot` no longer builds a `Blob` for the
+  union: it decodes the bytes through the new
+  `simplearchive::try_from_archive_bytes`. The handle it used to compute was
+  dropped one expression later; hashing 1.68 GB to name a value on its way into
+  a decoder is a fifth of the merge that produced it, spent on nothing.
+
+  Warm snapshot of that collection: **6.38 s -> 4.38 s**, with byte-identical
+  union bytes (verified against an independent sort/dedup of every commit's
+  rows) and an identical decoded set. What remains is the decode: ~2.3 s
+  building six PATCH orders over 16 chunks and ~1.75 s unioning those chunks,
+  which no equation record can avoid — see `INVENTORY.md`.
+
 - **Pile records are framed 28/4/32, and a record kind resolves.** The
   envelope's 36-byte prefix (16-byte marker, 16-byte kind, 4-byte span) left
   every 32-byte field in every body four bytes short of a 32-byte boundary, so

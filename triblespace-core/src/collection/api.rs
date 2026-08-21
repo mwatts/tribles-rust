@@ -1044,17 +1044,21 @@ where
                 })
             })?,
             _ => {
-                let union = simplearchive_union::join_many(members.iter().map(|(_, blob)| *blob))
-                    .map_err(|(index, source)| {
-                    CollectionMaterializationError::Materialize(
-                        MaterializationError::InvalidElement {
-                            data: members[index].0,
-                            source,
-                        },
-                    )
-                })?;
-                union
-                    .try_from_blob()
+                // The union's handle is never asked for here — it is decoded
+                // and dropped — so it is computed without one. Hashing 1.7 GB
+                // to name a value this expression consumes is a fifth of the
+                // merge that produced it.
+                let union =
+                    simplearchive_union::join_many_bytes(members.iter().map(|(_, blob)| *blob))
+                        .map_err(|(index, source)| {
+                            CollectionMaterializationError::Materialize(
+                                MaterializationError::InvalidElement {
+                                    data: members[index].0,
+                                    source,
+                                },
+                            )
+                        })?;
+                crate::blob::encodings::simplearchive::try_from_archive_bytes(union)
                     .expect("join_many emits one canonical SimpleArchive")
             }
         };

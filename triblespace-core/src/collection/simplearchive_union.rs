@@ -419,6 +419,18 @@ pub fn join(
 pub(crate) fn join_many<'a>(
     elements: impl IntoIterator<Item = &'a Blob<SimpleArchive>>,
 ) -> Result<Blob<SimpleArchive>, (usize, UnarchiveError)> {
+    Ok(Blob::new(join_many_bytes(elements)?))
+}
+
+/// Compute the canonical union's bytes without naming them.
+///
+/// Same output as [`join_many`], minus the Blake3 pass that turns bytes into a
+/// handle. Naming a blob is a separate act from computing one, and a caller
+/// that decodes the union and drops it — `snapshot_from_observation` does —
+/// pays a fifth of the merge for a handle it never reads.
+pub(crate) fn join_many_bytes<'a>(
+    elements: impl IntoIterator<Item = &'a Blob<SimpleArchive>>,
+) -> Result<Bytes, (usize, UnarchiveError)> {
     let elements: Vec<_> = elements.into_iter().collect();
     let mut element_rows = Vec::with_capacity(elements.len());
     for (index, element) in elements.iter().enumerate() {
@@ -426,20 +438,55 @@ pub(crate) fn join_many<'a>(
     }
 
     match elements.as_slice() {
-        [] => return Ok(Blob::new(Bytes::from(Vec::<[u8; TRIBLE_LEN]>::new()))),
-        [element] => return Ok(normalize_blob(element)),
+        [] => return Ok(Bytes::from(Vec::<[u8; TRIBLE_LEN]>::new())),
+        // Canonical bytes are already the union of themselves; `join_many`
+        // renames them, which is what `normalize_blob` did here before.
+        [element] => return Ok(element.bytes.clone()),
         _ => {}
     }
 
-    let capacity = element_rows
-        .iter()
-        .try_fold(0usize, |total, rows| total.checked_add(rows.len()))
-        .unwrap_or(0);
+    let slices: Vec<&[[u8; TRIBLE_LEN]]> = element_rows.iter().map(|rows| &rows[..]).collect();
+
+    #[cfg(feature = "parallel")]
+    {
+        if let Some(union) = parallel_merge_canonical(&slices) {
+            return Ok(Bytes::from(union));
+        }
+    }
+
+    Ok(Bytes::from(merge_canonical_range(&slices, None, None)))
+}
+
+/// Heap-merge the rows of every input that fall in `[low, high)`.
+///
+/// `None` bounds are open. Inputs are canonical — sorted and distinct — so one
+/// pass with one live row per input emits the range's union in order, and the
+/// only duplicates it can see are equal rows from different inputs.
+fn merge_canonical_range(
+    slices: &[&[[u8; TRIBLE_LEN]]],
+    low: Option<&[u8; TRIBLE_LEN]>,
+    high: Option<&[u8; TRIBLE_LEN]>,
+) -> Vec<[u8; TRIBLE_LEN]> {
+    let mut cursors = Vec::with_capacity(slices.len());
+    let mut capacity = 0usize;
+    for rows in slices {
+        let start = match low {
+            Some(low) => rows.partition_point(|row| row < low),
+            None => 0,
+        };
+        let end = match high {
+            Some(high) => rows.partition_point(|row| row < high),
+            None => rows.len(),
+        };
+        capacity = capacity.saturating_add(end.saturating_sub(start));
+        cursors.push((start, end));
+    }
+
     let mut union = Vec::with_capacity(capacity);
-    let mut heap = BinaryHeap::new();
-    for (element, rows) in element_rows.iter().enumerate() {
-        if let Some(first) = rows.first() {
-            heap.push(Reverse((*first, element, 0usize)));
+    let mut heap = BinaryHeap::with_capacity(slices.len());
+    for (element, (start, end)) in cursors.iter().copied().enumerate() {
+        if start < end {
+            heap.push(Reverse((slices[element][start], element, start)));
         }
     }
 
@@ -450,12 +497,92 @@ pub(crate) fn join_many<'a>(
             previous = Some(row);
         }
         let next = index + 1;
-        if let Some(row) = element_rows[element].get(next) {
-            heap.push(Reverse((*row, element, next)));
+        if next < cursors[element].1 {
+            heap.push(Reverse((slices[element][next], element, next)));
         }
     }
+    union
+}
 
-    Ok(Blob::new(Bytes::from(union)))
+/// Rows below which a partitioned merge is not worth its splitter search.
+#[cfg(feature = "parallel")]
+const PARALLEL_MERGE_THRESHOLD: usize = 1 << 16;
+
+/// Merge canonical inputs by disjoint key range, one range per worker.
+///
+/// The serial heap merge is one thread deciding 26 M times which of 404
+/// streams is next, and that decision is exactly what a key range makes
+/// independent: partitions cover disjoint key intervals, so each worker's
+/// output is a complete, deduplicated, sorted run and concatenating the runs in
+/// range order reproduces the serial result byte for byte. Splitters are chosen
+/// by regular sampling, so they affect balance only — never the output.
+///
+/// Returns `None` when the input is too small to be worth partitioning, leaving
+/// the caller on the serial path.
+#[cfg(feature = "parallel")]
+fn parallel_merge_canonical(slices: &[&[[u8; TRIBLE_LEN]]]) -> Option<Vec<[u8; TRIBLE_LEN]>> {
+    use rayon::prelude::*;
+
+    let total: usize = slices.iter().map(|rows| rows.len()).sum();
+    let workers = rayon::current_num_threads();
+    if total < PARALLEL_MERGE_THRESHOLD || workers < 2 {
+        return None;
+    }
+
+    // Regular sampling: every input contributes candidates at even offsets, so
+    // one huge member cannot alone decide the cut points and a skewed member
+    // cannot hide a dense key range from the sample.
+    let per_input = workers.min(64);
+    let mut samples = Vec::with_capacity(slices.len().saturating_mul(per_input));
+    for rows in slices {
+        if rows.is_empty() {
+            continue;
+        }
+        for step in 1..per_input {
+            let index = rows.len().saturating_mul(step) / per_input;
+            if index < rows.len() {
+                samples.push(rows[index]);
+            }
+        }
+    }
+    samples.sort_unstable();
+    samples.dedup();
+    if samples.is_empty() {
+        return None;
+    }
+
+    let cuts = workers.min(samples.len() + 1);
+    let mut splitters = Vec::with_capacity(cuts.saturating_sub(1));
+    for step in 1..cuts {
+        let index = samples.len().saturating_mul(step) / cuts;
+        let candidate = samples[index.min(samples.len() - 1)];
+        if splitters.last() != Some(&candidate) {
+            splitters.push(candidate);
+        }
+    }
+    if splitters.is_empty() {
+        return None;
+    }
+
+    let mut bounds: Vec<(Option<[u8; TRIBLE_LEN]>, Option<[u8; TRIBLE_LEN]>)> =
+        Vec::with_capacity(splitters.len() + 1);
+    let mut low = None;
+    for splitter in splitters {
+        bounds.push((low, Some(splitter)));
+        low = Some(splitter);
+    }
+    bounds.push((low, None));
+
+    let runs: Vec<Vec<[u8; TRIBLE_LEN]>> = bounds
+        .par_iter()
+        .map(|(low, high)| merge_canonical_range(slices, low.as_ref(), high.as_ref()))
+        .collect();
+
+    let mut union = Vec::with_capacity(runs.iter().map(Vec::len).sum());
+    for run in runs {
+        union.extend_from_slice(&run);
+    }
+    Some(union)
 }
 
 /// Validate a discovered commit as one canonical root of this collection.
@@ -1811,6 +1938,84 @@ mod tests {
 
         let expected = join(&join(&a, &b).unwrap(), &c).unwrap();
         assert_eq!(join_many([&c, &empty, &a, &b, &a]).unwrap(), expected);
+    }
+
+    /// One canonical archive of `count` rows drawn from a deterministic
+    /// sequence, so overlapping members really do share rows.
+    fn strided_archive(offset: u64, stride: u64, count: usize) -> Blob<SimpleArchive> {
+        let mut rows: Vec<[u8; TRIBLE_LEN]> = Vec::with_capacity(count);
+        for step in 0..count as u64 {
+            let key = offset + step * stride;
+            let mut row = [0u8; TRIBLE_LEN];
+            // A nonzero entity and attribute are what `Trible` demands; the
+            // value half carries the scrambled key so the rows are spread over
+            // the whole ordering rather than clustered under one prefix.
+            row[8..16].copy_from_slice(&(key % 977 + 1).to_be_bytes());
+            row[24..32].copy_from_slice(&(key % 31 + 1).to_be_bytes());
+            let mut mixed = key.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            mixed ^= mixed >> 29;
+            row[32..40].copy_from_slice(&mixed.to_be_bytes());
+            row[40..48].copy_from_slice(&key.to_be_bytes());
+            rows.push(row);
+        }
+        rows.sort_unstable();
+        rows.dedup();
+        raw_archive(rows)
+    }
+
+    /// The union any correct implementation must produce: every input row,
+    /// sorted and deduplicated by the standard library.
+    fn sort_dedup_oracle(elements: &[&Blob<SimpleArchive>]) -> Vec<[u8; TRIBLE_LEN]> {
+        let mut rows: Vec<[u8; TRIBLE_LEN]> = Vec::new();
+        for element in elements {
+            let view: View<[[u8; TRIBLE_LEN]]> = element.bytes.clone().view().unwrap();
+            rows.extend_from_slice(&view);
+        }
+        rows.sort_unstable();
+        rows.dedup();
+        rows
+    }
+
+    /// The partitioned merge is a performance decision, so it owes byte
+    /// identity to the answer it replaced — not merely the same set.
+    ///
+    /// Sizes are deliberately unequal and the strides deliberately overlap:
+    /// regular sampling has to survive one member large enough to dominate the
+    /// sample and duplicates dense enough to straddle a partition boundary. The
+    /// row count clears `PARALLEL_MERGE_THRESHOLD` so the parallel path is the
+    /// one under test.
+    #[test]
+    fn join_many_partitioned_merge_matches_the_sorted_oracle_byte_for_byte() {
+        let big = strided_archive(0, 1, 90_000);
+        let overlapping = strided_archive(0, 2, 45_000);
+        let shifted = strided_archive(1, 3, 30_000);
+        let disjoint = strided_archive(1_000_000, 1, 12_000);
+        let tiny = strided_archive(7, 500, 3);
+        let empty = archive([]);
+        let elements = [&big, &overlapping, &shifted, &disjoint, &tiny, &empty];
+
+        let expected = sort_dedup_oracle(&elements);
+        assert!(
+            expected.len() > PARALLEL_MERGE_THRESHOLD,
+            "the fixture must clear the partitioning threshold",
+        );
+
+        let union = join_many(elements).unwrap();
+        let rows: View<[[u8; TRIBLE_LEN]]> = union.bytes.clone().view().unwrap();
+        assert_eq!(&rows[..], &expected[..]);
+
+        // The serial range merge is the same function the partitions call, so
+        // agreeing with it pins the partition seams specifically.
+        let views: Vec<View<[[u8; TRIBLE_LEN]]>> = elements
+            .iter()
+            .map(|element| element.bytes.clone().view().unwrap())
+            .collect();
+        let slices: Vec<&[[u8; TRIBLE_LEN]]> = views.iter().map(|view| &view[..]).collect();
+        assert_eq!(merge_canonical_range(&slices, None, None), expected);
+
+        // Order of arrival cannot matter: the union is commutative.
+        let shuffled = join_many([&tiny, &disjoint, &empty, &shifted, &overlapping, &big]).unwrap();
+        assert_eq!(shuffled, union);
     }
 
     #[test]

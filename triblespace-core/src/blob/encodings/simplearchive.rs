@@ -108,8 +108,18 @@ impl TryFromBlob<SimpleArchive> for TribleSet {
     type Error = UnarchiveError;
 
     fn try_from_blob(blob: Blob<SimpleArchive>) -> Result<Self, Self::Error> {
-        try_from_blob_inner(blob, /*archive_backed:*/ true)
+        try_from_archive_bytes(blob.bytes)
     }
+}
+
+/// Decode canonical `SimpleArchive` bytes into a [`TribleSet`].
+///
+/// Identical to `TribleSet::try_from_blob`, minus the handle. A caller that
+/// computed the bytes itself and only wants to query them should not pay a
+/// Blake3 pass to name a value it is about to consume; naming is what
+/// [`Blob::new`] is for, and it is a separate decision.
+pub fn try_from_archive_bytes(bytes: Bytes) -> Result<TribleSet, UnarchiveError> {
+    try_from_bytes_inner(bytes, /*archive_backed:*/ true)
 }
 
 /// Decode a [`SimpleArchive`] blob into a [`TribleSet`] forcing the
@@ -117,14 +127,11 @@ impl TryFromBlob<SimpleArchive> for TribleSet {
 /// isolates leaf representation on the same serial decoder; above it this is
 /// an end-to-end heap-online baseline for the public bottom-up decoder.
 pub fn try_from_blob_heap_only(blob: Blob<SimpleArchive>) -> Result<TribleSet, UnarchiveError> {
-    try_from_blob_inner(blob, /*archive_backed:*/ false)
+    try_from_bytes_inner(blob.bytes, /*archive_backed:*/ false)
 }
 
-fn try_from_blob_inner(
-    blob: Blob<SimpleArchive>,
-    archive_backed: bool,
-) -> Result<TribleSet, UnarchiveError> {
-    let Ok(packed_tribles): Result<View<[[u8; 64]]>, _> = blob.bytes.clone().view() else {
+fn try_from_bytes_inner(bytes: Bytes, archive_backed: bool) -> Result<TribleSet, UnarchiveError> {
+    let Ok(packed_tribles): Result<View<[[u8; 64]]>, _> = bytes.clone().view() else {
         return Err(UnarchiveError::BadArchive);
     };
     let slice: &[[u8; 64]] = &packed_tribles;
@@ -136,7 +143,7 @@ fn try_from_blob_inner(
     // satisfy this; the heap-Leaf fallback handles the rare miss.
     let owner: Option<Arc<dyn ArchiveOwner>> =
         if archive_backed && (slice.as_ptr() as usize) & 0x0f == 0 {
-            Some(Arc::new(blob.bytes.clone()))
+            Some(Arc::new(bytes.clone()))
         } else {
             None
         };

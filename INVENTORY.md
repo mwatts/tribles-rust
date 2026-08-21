@@ -1,5 +1,55 @@
 # Inventory
 
+## Collection materialization
+
+Measured on `bultmann.pile` (404 commits, 26.26 M facts, 1.98 GB) after the
+partitioned merge landed. A warm `Collection::snapshot` is ~4.38 s, of which:
+
+- 78 ms — record discovery, 404 signature verifications, canonical validation
+  of 1.86 GB of committed archives, merge/resolution/physical-cover planning.
+  The whole collection calculus is 1.2% of a snapshot; optimizing it is
+  optimizing noise.
+- ~0.15 s — the partitioned canonical union.
+- ~2.3 s — per-chunk PATCH partition build, 16 chunks in parallel.
+- ~1.75 s — union-reduce of the 16 chunk `TribleSet`s.
+
+Ideas, in descending measured leverage:
+
+- **The six index orders do not cost the same.** Per 1.64 M-row chunk: `eav`
+  80 ms, `eva` 130 ms, `aev` 400 ms, `ave` 450 ms, `vea` 470 ms, `vae` 500 ms.
+  EAV is a bulk load of an already-sorted stream; the value-first orders resort
+  and build a bushy trie. Four orders are 87% of the build. A `TribleSet` whose
+  non-EAV orders are built on first use would let a consumer pay for the
+  orders its queries actually open. This is a public-API change — the six
+  `PATCH` fields are `pub` — so it wants a deliberate decision, not a
+  drive-by.
+- **Fuse the merge with the decode.** The partitioned merge already produces
+  exactly the shape `parallel_unarchive` wants: sorted, canonical,
+  worker-sized runs. Today they are concatenated into one 1.68 GB buffer that
+  the decoder immediately re-chunks. Handing each run to
+  `TribleSet::from_archive_partition` directly removes one full copy, one peak
+  1.68 GB allocation, and one revalidation pass.
+- **Partition the decode by key range per order, not by row range.** Chunks
+  are currently EAV-contiguous, which makes the EAV union nearly free and the
+  four value-first unions expensive — that asymmetry is the ~1.75 s reduce.
+  Per-order key-range partitions would give disjoint sub-tries whose union is a
+  stitch rather than a merge, but it needs a PATCH-level "concatenate disjoint
+  sorted sub-tries" primitive.
+
+Not an idea, a finding: **no `MERGE` or `DERIVE` record can make a cold read
+faster under the current admission rule.** Unsigned equations are admitted by
+recomputation — `api.rs` recomputes `join(low, high)` for every candidate
+merge, and `succinctarchive_union::validate_derive` compares the target
+"byte-for-byte with a fresh direct construction from the source". Validating a
+balanced merge tree over N leaves rewrites every byte once per level, which is
+strictly more memory traffic than one k-way merge, and attaching a persisted
+`SuccinctArchive` pair over these facts measured **105 s** against a 4.16 s
+`TribleSet` rebuild, because `from_blob_pair` proves the bytes by re-deriving
+every prefix, mask, and rotation. Persisted derivation can only pay off behind
+a *trusted* attach — bytes checked by content hash alone, admitted because a
+key the reader already treats as ground truth named them — which is a change
+to what "checkable" means, not a change to the code.
+
 ## Potential Removals
 - None at the moment.
 
