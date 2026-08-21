@@ -199,8 +199,16 @@ fn direct_collection_evidence_fetch_is_verified_and_does_not_fetch_or_admit_blob
     });
 }
 
+/// A collection that declares no reach serves nothing, to anyone.
+///
+/// This used to be "omits commits without author grants": a commit was
+/// withheld because nobody had signed a separate permission for it. There is
+/// no separate permission now, so the withholding has to come from the
+/// collection itself -- and it does, because a descriptor that declares no
+/// reach is a refusal, and a refusal that is part of the collection's name
+/// cannot be signed away afterwards.
 #[test]
-fn direct_collection_evidence_fetch_omits_commits_without_author_grants() {
+fn direct_collection_evidence_fetch_omits_a_collection_that_declares_no_reach() {
     let _guard = common::sim_guard();
     run_paused(0xC011EC8, async {
         let root = key(0xF1);
@@ -217,7 +225,12 @@ fn direct_collection_evidence_fetch_omits_commits_without_author_grants() {
             (client_cap, client_sig.clone()),
         ]);
 
-        let descriptor = named_root("c4");
+        // Deliberately NOT `named_root`, which declares `Reach::Public`.
+        let descriptor = simplearchive_union::descriptor(
+            &collection_name("c4"),
+            test_team(),
+            Reach::Private,
+        );
         let data: Blob<SimpleArchive> = TribleSet::new().to_blob();
         server_store
             .put::<SimpleArchive, _>(descriptor.clone().into_facts().to_blob())
@@ -228,7 +241,7 @@ fn direct_collection_evidence_fetch_omits_commits_without_author_grants() {
             &collection_name("c4"),
             test_team(),
             server_key.clone(),
-            Reach::Public,
+            Reach::Private,
         )
             .commit(Fragment::empty())
             .unwrap();

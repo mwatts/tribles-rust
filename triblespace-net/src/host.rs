@@ -2354,7 +2354,12 @@ mod collection_evidence_gossip_tests {
         let mut wrong_tag = first.clone();
         wrong_tag[0] ^= 0x80;
         assert_eq!(decode_collection_evidence_gossip_frame(&wrong_tag), None);
-        assert_eq!(decode_collection_evidence_gossip_frame(&first[..328]), None);
+        assert_eq!(
+            decode_collection_evidence_gossip_frame(
+                &first[..COLLECTION_EVIDENCE_GOSSIP_FRAME_LEN - 1]
+            ),
+            None
+        );
     }
 
     #[test]
