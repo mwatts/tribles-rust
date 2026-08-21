@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace_core::attribute::Attribute;
+use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::collection::records::CollectionName;
@@ -29,6 +30,7 @@ use triblespace_core::trible::{Fragment, TribleSet};
 use super::super::signing::load_signing_key;
 
 type ArchiveHandle = Inline<Handle<SimpleArchive>>;
+type NameHandle = Inline<Handle<LongString>>;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ElementKey {
@@ -221,12 +223,31 @@ fn resolve_branch(
         }
     }
 
+    let wanted: NameHandle = reference.to_owned().to_blob().get_handle();
     let mut matches = Vec::new();
     for raw in pins.iter_ordered() {
         let id = Id::new(*raw).expect("pin snapshot contains a nil id");
         let handle = *pins.get(raw).expect("iterated pin has a value");
         let (_, facts) = read_archive(reader, handle, "legacy branch metadata")?;
-        if super::load_branch_name(reader, &facts, id)?.as_deref() == Some(reference) {
+
+        let Ok(subject) = repo::branch::branch_entity(&facts, id) else {
+            continue;
+        };
+        let matches_name = {
+            let mut current_names = facts
+                .iter()
+                .filter(|fact| fact.e() == &subject && fact.a() == &metadata::name.id())
+                .map(|fact| *fact.v::<Handle<LongString>>());
+            let current = current_names.next();
+            if current_names.next().is_some() {
+                continue;
+            }
+            match current {
+                Some(name) => name == wanted,
+                None => super::legacy_branch_name(&facts, id)?.as_deref() == Some(reference),
+            }
+        };
+        if matches_name {
             matches.push((id, facts));
         }
     }
@@ -511,7 +532,6 @@ mod tests {
 
     use ed25519_dalek::Signer;
     use tempfile::NamedTempFile;
-    use triblespace_core::blob::encodings::longstring::LongString;
     use triblespace_core::collection::{Collection, CollectionStore};
     use triblespace_core::id::ExclusiveId;
     use triblespace_core::repo::{BlobStorePut, PinStore, Repository};
@@ -759,6 +779,35 @@ mod tests {
         let reader = pile.reader()?;
         let (resolved, _) = resolve_branch(&reader, &pins, hex_name)?;
         assert_eq!(resolved, branch);
+        pile.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn unrelated_nonresident_current_name_does_not_block_named_migration() -> Result<()> {
+        let file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+        let intended = legacy_fixture(&path)?;
+        let mut pile = super::super::super::open_refreshed(&path)?;
+
+        let unrelated = Id::new([0xFA; 16]).unwrap();
+        let nonresident_name: NameHandle = "never-stored-name".to_owned().to_blob().get_handle();
+        let unrelated_meta = repo::branch::branch_unsigned(unrelated, nonresident_name, None);
+        let unrelated_meta = pile.put::<SimpleArchive, _>(unrelated_meta)?;
+        assert!(matches!(
+            pile.update(unrelated, None, Some(unrelated_meta))?,
+            repo::PushResult::Success()
+        ));
+
+        let (report, mappings) = migrate(
+            &mut pile,
+            "legacy",
+            &CollectionName::new("name-resolution-target").unwrap(),
+            key(12).verifying_key(),
+            &key(13),
+        )?;
+        assert_eq!(report.branch, intended);
+        assert!(!mappings.is_empty());
         pile.close()?;
         Ok(())
     }
