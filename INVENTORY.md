@@ -18,38 +18,56 @@ The union-reduce that used to follow is gone: the decode no longer chops the
 archive into per-worker chunks, so there are no per-chunk sets to merge back
 together. What is left is one build per order.
 
+Per-order wall time for that build, all six over the whole 26.26 M-row
+archive on sixteen cores:
+
+    eav  97 ms   eva 162 ms   aev 288 ms   ave 458 ms   vea 513 ms   vae 604 ms
+
+Against the same orders built serially over the same rows, that is 13x to 22x
+— **82% to well over 100% of sixteen cores** (`aev` beats linear because the
+old per-chunk build rebuilt the same attribute-prefix spine sixteen times).
+There is essentially no parallelism left to win here. What remains is work:
+the four value-first orders are 88% of the build, and `vae` alone is 28%.
+
 Ideas, in descending measured leverage:
 
-- **The six index orders still do not cost the same.** Per 1.64 M rows: `eav`
-  80 ms, `eva` 130 ms, `aev` 400 ms, `ave` 450 ms, `vea` 470 ms, `vae` 500 ms.
-  EAV is a bulk load of an already-sorted stream; the value-first orders resort
-  and build a bushy trie, and they are 87% of the build.
-  - Building them lazily is a **public-API change** — the six `PATCH` fields
-    are `pub` — and it is a worse trade than it looks. `union`, `intersect` and
-    `difference` are defined index-by-index, so a lazy order would have to be
-    re-derived rather than combined after every set operation, and the first
-    query to open a cold order would pay a whole-archive build **serially, in
-    the middle of a join**, replacing a uniform cost model with a
-    data-dependent one. The engine's worst-case-optimal join is built on being
-    able to open any order for free. This wants a deliberate decision about
-    what a `TribleSet` promises, not a drive-by.
-  - Cheaper on work, and API-neutral: the resort currently re-reads a scattered
-    64-byte row at every trie level. Extracting the first eight order-tree
-    bytes into a compact `(prefix, row)` array once, sorting that, and touching
-    the full key only where prefixes tie would make every level after the first
-    a sequential scan. Untried.
-- **Fuse the merge with the decode.** The partitioned merge already produces
-  exactly the shape the decoder wants: sorted, canonical, worker-sized runs.
-  They are still concatenated into one 1.68 GB buffer that the decoder then
-  re-scans. Handing the runs over directly removes one full copy, one peak
-  1.68 GB allocation, and the validation half of the scan — worth roughly 0.2 s
-  of 2.8 s now, against a wider trust boundary (bytes admitted because *we*
-  produced them).
-- **Partitioning the decode by key range is done.** It landed as the shape it
-  always wanted: not a new "concatenate disjoint sorted sub-tries" primitive,
-  but the trie's own branch node. The MSD partition already splits rows into
-  disjoint key ranges per order; making the top pass count-and-scatter across
-  workers rather than swap in place is what let the whole archive be one build.
+- **Cut the work the value-first orders do, not the time they take.** Each trie
+  level re-reads a scattered 64-byte row per row — one cache miss per row per
+  level — and a shallow trie over random values is two or three such levels.
+  Carrying a compact `(tree-order prefix, row)` record instead would make every
+  level after the first a sequential scan, and would turn the
+  longest-common-prefix search from a byte loop into one integer compare.
+  Untried, and **it is not uniform across orders**: `vea`/`vae` sort on random
+  value bytes and would benefit throughout, but `aev`/`ave` share all sixteen
+  attribute bytes inside any one attribute's bucket, so a fixed-width prefix is
+  exhausted at the first level and the full-key path has to take over. Expect it
+  to pay on the two most expensive orders and to need a fallback for the other
+  two — which is also the reason it is a real piece of work rather than a
+  substitution.
+- **Building the six orders lazily is a public-API change** — the six `PATCH`
+  fields are `pub` — and it is a worse trade than the 88% suggests. `union`,
+  `intersect` and `difference` are defined index-by-index, so a lazy order
+  would have to be re-derived rather than combined after every set operation,
+  and the first query to open a cold order would pay a whole-archive build
+  **serially, in the middle of a join**, replacing a uniform cost model with a
+  data-dependent one. The engine's worst-case-optimal join is built on being
+  able to open any order for free. This wants a deliberate decision about what
+  a `TribleSet` promises, not a drive-by.
+- **Fuse the merge with the decode.** The partitioned merge produces sorted,
+  canonical, worker-sized runs and then concatenates them into one 1.68 GB
+  buffer that the decoder re-scans — roughly 0.2 s of 2.8 s, in a serial
+  `extend_from_slice` and a peak allocation. Two ways in, both with a price:
+  copy the runs into the destination in parallel (cheap, but keeps the
+  allocation and only removes ~0.1 s), or hand the runs to the decoder
+  unconcatenated, which now means teaching the trie build segmented row
+  addressing in its hottest inner loop for 7%.
+
+Measured and rejected: **building the six orders concurrently with each other**
+rather than one after another. Each needs its own row permutation, so six at a
+time costs 6 x 105 MB instead of 105 MB; interleaved medians were 2.27 s
+sequential, 2.26 s two at a time, 2.19 s three, 2.17 s six. A 4% gain, inside
+the run-to-run spread of a loaded machine, for five times the transient
+permutation memory on the one path whose job is large archives.
 
 Not an idea, a finding: **no `MERGE` or `DERIVE` record can make a cold read
 faster under the current admission rule.** Unsigned equations are admitted by
