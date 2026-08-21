@@ -7,6 +7,7 @@
 
 mod common;
 
+use triblespace_core::collection::Reach;
 use std::time::Duration;
 
 use triblespace_core::blob::Blob;
@@ -34,7 +35,7 @@ fn test_team() -> VerifyingKey {
 }
 
 fn named_root(name: &str) -> DescriptorFragment {
-    simplearchive_union::descriptor(&collection_name(name), test_team())
+    simplearchive_union::descriptor(&collection_name(name), test_team(), Reach::Private)
 }
 
 /// The identity of a descriptor these simulations only address, never store.
@@ -68,7 +69,7 @@ fn live_gossip_admits_only_sparse_collection_evidence_idempotently() {
         let metadata = archive(0x51);
         let mut fragment = Fragment::from(TribleSet::try_from_blob(data.clone()).unwrap());
         *fragment.metafacts_mut() = TribleSet::try_from_blob(metadata.clone()).unwrap();
-        let commit = Collection::new(&mut author_store, &collection_name("c31"), test_team(), author.clone())
+        let commit = Collection::new(&mut author_store, &collection_name("c31"), test_team(), author.clone(), Reach::Private)
             .commit(fragment)
             .unwrap();
         assert_eq!(commit.collection(), collection_of(&descriptor));
@@ -175,7 +176,7 @@ fn periodic_replay_reaches_a_late_joiner_without_fetching_content() {
         let metadata = archive(0x52);
         let mut fragment = Fragment::from(TribleSet::try_from_blob(data.clone()).unwrap());
         *fragment.metafacts_mut() = TribleSet::try_from_blob(metadata.clone()).unwrap();
-        let commit = Collection::new(&mut author_store, &collection_name("c32"), test_team(), author.clone())
+        let commit = Collection::new(&mut author_store, &collection_name("c32"), test_team(), author.clone(), Reach::Private)
             .commit(fragment)
             .unwrap();
         let grant = CollectionGossip::sign(&author, collection_of(&descriptor));

@@ -2217,13 +2217,14 @@ fn blob_in_scope(
 
 #[cfg(test)]
 mod collection_evidence_gossip_tests {
+    use triblespace_core::collection::Reach;
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
 
     use ed25519_dalek::SigningKey;
     use triblespace_core::collection::{
-        CollectionCommit, CollectionGossip, CollectionHandle, CollectionRecord, empty_metadata_handle,
-        simplearchive_union,
+        CollectionCommit, CollectionGossip, CollectionHandle, CollectionRecord,
+        empty_metadata_handle, simplearchive_union,
     };
     use triblespace_core::inline::Inline;
     use triblespace_core::repo::{PinSnapshot, WantRequest};
@@ -2245,6 +2246,7 @@ mod collection_evidence_gossip_tests {
         let descriptor = simplearchive_union::descriptor(
             &CollectionName::new("gossiped").unwrap(),
             author.verifying_key(),
+            Reach::Private,
         );
         // Gossip only ever carries the identity; nothing here stores the
         // descriptor it names.

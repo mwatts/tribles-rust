@@ -134,6 +134,38 @@ attributes! {
     /// Canonical recipe governing construction and merge for this collection.
     /// Minted with `trible genid` on 2026-08-07.
     "5D338C58D897B969BE1AE0956CCFE301" unsafe as pub collection_recipe: GenId;
+    /// How far this collection may travel, by the id of a *reach law*.
+    ///
+    /// This is the descriptor's answer to "may these bytes be relayed?", and
+    /// putting it here is what makes the answer unforgeable. Reach used to be
+    /// a separately signed record any keyholder could mint later, so "private"
+    /// meant only "nobody has signed one yet". Named in the descriptor, reach
+    /// is part of the collection's identity: a private collection and a public
+    /// one are *different collections* with different handles, and publishing
+    /// something after the fact is not forbidden but meaningless, because it
+    /// would have to name a handle whose own descriptor refuses to travel.
+    ///
+    /// Like [`collection_recipe`], this names a *law* rather than a value. A
+    /// law admits an "I do not implement that" answer, which a boolean cannot:
+    /// a reader meeting a mode it has never heard of denies rather than
+    /// guesses, so the fail-closed rule extends to modes invented after this
+    /// binary was built. Any arguments a richer mode needs -- an audience, a
+    /// subset of a team -- are further attributes on this same entity, read
+    /// the way [`descriptor::argument`](crate::collection::descriptor::argument)
+    /// reads a recipe's.
+    ///
+    /// The attribute is optional, and absence means *no reach*: a descriptor
+    /// that predates this field, or declines to declare, does not travel. That
+    /// direction is not a default chosen for convenience -- the opposite
+    /// default would silently publish every collection written before reach
+    /// existed, which is the exact hazard this field removes.
+    ///
+    /// Anchor minted with `trible genid` on 2026-08-21. Declared with the
+    /// anchored `as` form rather than the pinned `unsafe as` form used by its
+    /// neighbours: those preserve byte identities already written into piles,
+    /// whereas no row has ever carried this attribute, so its encoding is free
+    /// to participate in its identity.
+    "7CCF99CCE4657117EE8CDD1B8E11FDA3" as pub collection_reach: GenId;
 }
 
 /// Type-erased content identity of one collection element.
@@ -887,6 +919,7 @@ fn one_inline<S: InlineEncoding>(
 
 #[cfg(test)]
 mod tests {
+    use crate::collection::Reach;
     use super::*;
 
     use hex_literal::hex;
@@ -922,11 +955,11 @@ mod tests {
         let name = CollectionName::new("first").unwrap();
         let other_name = CollectionName::new("second").unwrap();
 
-        let a = descriptor::naming(&name, team, id(2), id(3)).into_facts();
-        let renamed = descriptor::naming(&other_name, team, id(2), id(3)).into_facts();
-        let reteamed = descriptor::naming(&name, other_team, id(2), id(3)).into_facts();
-        let other_representation = descriptor::naming(&name, team, id(4), id(3)).into_facts();
-        let other_recipe = descriptor::naming(&name, team, id(2), id(4)).into_facts();
+        let a = descriptor::naming(&name, team, id(2), id(3), Reach::Private).into_facts();
+        let renamed = descriptor::naming(&other_name, team, id(2), id(3), Reach::Private).into_facts();
+        let reteamed = descriptor::naming(&name, other_team, id(2), id(3), Reach::Private).into_facts();
+        let other_representation = descriptor::naming(&name, team, id(4), id(3), Reach::Private).into_facts();
+        let other_recipe = descriptor::naming(&name, team, id(2), id(4), Reach::Private).into_facts();
 
         let handle = |facts: &TribleSet| {
             <TribleSet as crate::blob::IntoBlob<SimpleArchive>>::to_blob(facts.clone()).get_handle()
@@ -1150,6 +1183,7 @@ mod tests {
             SigningKey::from_bytes(&[1; 32]).verifying_key(),
             id(2),
             id(3),
+            Reach::Private,
         )
         .into_facts();
         let descriptor_blob =

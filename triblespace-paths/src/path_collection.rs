@@ -1,5 +1,6 @@
 //! Exact-ticket materialization of native path-summary collections.
 
+use triblespace_core::collection::Reach;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -69,17 +70,42 @@ pub struct PathSummaryCollection {
     name: CollectionName,
     team: VerifyingKey,
     automaton: Automaton,
+    source_reach: Reach,
+    reach: Reach,
 }
 
 impl PathSummaryCollection {
     /// Construct the canonical path projection for one named root and
     /// `automaton`.
-    pub fn new(name: CollectionName, team: VerifyingKey, automaton: Automaton) -> Self {
+    /// `source_reach` completes the root's identity; `reach` is this
+    /// projection's own. A path summary over private material can be a
+    /// perfectly reasonable thing to publish, and a private summary over
+    /// published material an equally reasonable thing to keep, so neither
+    /// answer is derived from the other.
+    pub fn new(
+        name: CollectionName,
+        team: VerifyingKey,
+        automaton: Automaton,
+        source_reach: Reach,
+        reach: Reach,
+    ) -> Self {
         Self {
             name,
             team,
             automaton,
+            source_reach,
+            reach,
         }
+    }
+
+    /// How far the source collection may travel.
+    pub fn source_reach(&self) -> Reach {
+        self.source_reach
+    }
+
+    /// How far this projection may travel.
+    pub fn reach(&self) -> Reach {
+        self.reach
     }
 
     /// Name of the root collection this projection is taken over.
@@ -99,7 +125,7 @@ impl PathSummaryCollection {
 
     /// Canonical source `SimpleArchive` collection descriptor facts.
     pub fn source_descriptor(&self) -> Fragment {
-        simplearchive_union::descriptor(&self.name, self.team)
+        simplearchive_union::descriptor(&self.name, self.team, self.source_reach)
     }
 
     /// Identity of the source collection this projection reads.
@@ -109,7 +135,7 @@ impl PathSummaryCollection {
 
     /// Canonical target path-summary collection descriptor.
     pub fn descriptor(&self) -> Fragment {
-        path_summary_union::descriptor(self.source_collection(), &self.automaton)
+        path_summary_union::descriptor(self.source_collection(), &self.automaton, self.reach)
     }
 
     /// Identity of the path summary this projection maintains.
@@ -349,7 +375,7 @@ mod tests {
             .unwrap();
         CollectionCommit::sign(
             &SigningKey::from_bytes(&[key; 32]),
-            collection_of(&simplearchive_union::descriptor(name, test_team())),
+            collection_of(&simplearchive_union::descriptor(name, test_team(), Reach::Private)),
             Handle::<SimpleArchive>::to_hash(data.get_handle()),
             metadata,
         )
@@ -384,7 +410,7 @@ mod tests {
         }
 
         let automaton = Automaton::new(u32::MAX, [0], [0], []).unwrap();
-        let paths = PathSummaryCollection::new(test_name("c9"), test_team(), automaton.clone());
+        let paths = PathSummaryCollection::new(test_name("c9"), test_team(), automaton.clone(), Reach::Private, Reach::Private);
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&crate::automaton_fingerprint(&automaton).raw);
         bytes.extend_from_slice(&automaton.state_count().to_le_bytes());
@@ -402,7 +428,7 @@ mod tests {
     #[test]
     fn empty_ticket_is_local_bottom_and_writes_nothing() {
         let mut store = CollectionOnly::default();
-        let paths = PathSummaryCollection::new(test_name("c9"), test_team(), plus());
+        let paths = PathSummaryCollection::new(test_name("c9"), test_team(), plus(), Reach::Private, Reach::Private);
         let blobs = store.0.blobs.len();
         let record_count = records(&mut store).len();
         let index = paths.ensure_exact(&mut store, &[]).unwrap();
@@ -414,7 +440,7 @@ mod tests {
     #[test]
     fn missing_then_ensure_closes_cross_fragment_path() {
         let name = test_name("c9");
-        let paths = PathSummaryCollection::new(name.clone(), test_team(), plus());
+        let paths = PathSummaryCollection::new(name.clone(), test_team(), plus(), Reach::Private, Reach::Private);
         let mut store = CollectionOnly::default();
         let left = put_data(&mut store, &edge(1, 2));
         let right = put_data(&mut store, &edge(2, 3));
@@ -436,7 +462,7 @@ mod tests {
     #[test]
     fn old_ticket_ignores_later_commit_and_its_cache_equation() {
         let name = test_name("c9");
-        let paths = PathSummaryCollection::new(name.clone(), test_team(), plus());
+        let paths = PathSummaryCollection::new(name.clone(), test_team(), plus(), Reach::Private, Reach::Private);
         let mut store = CollectionOnly::default();
         let left = put_data(&mut store, &edge(1, 2));
         let right = put_data(&mut store, &edge(2, 3));
@@ -468,7 +494,7 @@ mod tests {
     #[test]
     fn duplicate_data_provenance_shares_one_derive() {
         let name = test_name("c9");
-        let paths = PathSummaryCollection::new(name.clone(), test_team(), plus());
+        let paths = PathSummaryCollection::new(name.clone(), test_team(), plus(), Reach::Private, Reach::Private);
         let mut store = CollectionOnly::default();
         let data = put_data(&mut store, &edge(1, 2));
         let first = signed_commit(&mut store, &name, 1, &data);
@@ -492,7 +518,7 @@ mod tests {
     #[test]
     fn derive_before_commit_is_inert_then_becomes_live() {
         let name = test_name("c9");
-        let paths = PathSummaryCollection::new(name.clone(), test_team(), plus());
+        let paths = PathSummaryCollection::new(name.clone(), test_team(), plus(), Reach::Private, Reach::Private);
         let mut store = CollectionOnly::default();
         let source = put_data(&mut store, &edge(1, 2));
         let commit = signed_commit(&mut store, &name, 7, &source);
@@ -519,7 +545,7 @@ mod tests {
     #[test]
     fn resident_source_merge_is_lowered_once() {
         let name = test_name("c9");
-        let paths = PathSummaryCollection::new(name.clone(), test_team(), plus());
+        let paths = PathSummaryCollection::new(name.clone(), test_team(), plus(), Reach::Private, Reach::Private);
         let mut store = CollectionOnly::default();
         let left = put_data(&mut store, &edge(1, 2));
         let right = put_data(&mut store, &edge(2, 3));
@@ -556,7 +582,7 @@ mod tests {
     #[test]
     fn source_cover_can_overlap_an_already_supported_root() {
         let name = test_name("c9");
-        let paths = PathSummaryCollection::new(name.clone(), test_team(), plus());
+        let paths = PathSummaryCollection::new(name.clone(), test_team(), plus(), Reach::Private, Reach::Private);
         let mut store = CollectionOnly::default();
         let left = put_data(&mut store, &edge(1, 2));
         let right = put_data(&mut store, &edge(2, 3));
@@ -611,7 +637,7 @@ mod tests {
     #[test]
     fn existing_target_merge_is_the_single_physical_member() {
         let name = test_name("c9");
-        let paths = PathSummaryCollection::new(name.clone(), test_team(), plus());
+        let paths = PathSummaryCollection::new(name.clone(), test_team(), plus(), Reach::Private, Reach::Private);
         let mut store = CollectionOnly::default();
         let left = put_data(&mut store, &edge(1, 2));
         let right = put_data(&mut store, &edge(2, 3));
@@ -655,7 +681,7 @@ mod tests {
     #[test]
     fn absent_source_bytes_report_the_commit() {
         let name = test_name("c9");
-        let paths = PathSummaryCollection::new(name.clone(), test_team(), plus());
+        let paths = PathSummaryCollection::new(name.clone(), test_team(), plus(), Reach::Private, Reach::Private);
         let mut store = CollectionOnly::default();
         let absent = edge(1, 2).to_blob();
         let metadata = store

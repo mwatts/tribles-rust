@@ -4,6 +4,7 @@
 
 mod common;
 
+use triblespace_core::collection::Reach;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -48,7 +49,7 @@ fn test_team() -> VerifyingKey {
 
 /// A named root of the canonical `SimpleArchive` union kind.
 fn named_root(name: &str) -> DescriptorFragment {
-    simplearchive_union::descriptor(&collection_name(name), test_team())
+    simplearchive_union::descriptor(&collection_name(name), test_team(), Reach::Private)
 }
 
 /// The identity of a descriptor these simulations only address, never store.
@@ -136,6 +137,7 @@ fn direct_collection_evidence_fetch_is_verified_and_does_not_fetch_or_admit_blob
             &collection_name("c1"),
             test_team(),
             server_key.clone(),
+            Reach::Private,
         );
         let commit = collection.commit(fragment).unwrap();
         server_store
@@ -230,6 +232,7 @@ fn direct_collection_evidence_fetch_omits_commits_without_author_grants() {
             &collection_name("c4"),
             test_team(),
             server_key.clone(),
+            Reach::Private,
         )
             .commit(Fragment::empty())
             .unwrap();
@@ -330,6 +333,7 @@ fn direct_collection_reconcile_admits_sparse_evidence_without_blobs_pins_or_want
             &collection_name("c6"),
             test_team(),
             server_key.clone(),
+            Reach::Private,
         );
         let commit = collection.commit(Fragment::from(facts)).unwrap();
         let grant = CollectionGossip::sign(&server_key, collection_of(&descriptor));

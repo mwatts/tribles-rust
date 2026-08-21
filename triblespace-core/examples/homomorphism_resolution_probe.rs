@@ -1,3 +1,4 @@
+use triblespace_core::collection::Reach;
 use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::hint::black_box;
@@ -74,6 +75,7 @@ fn build(
         team,
         id(2),
         id(3),
+        Reach::Private,
     )
     .into_facts();
     let target = descriptor::naming(
@@ -81,6 +83,7 @@ fn build(
         team,
         id(5),
         id(6),
+        Reach::Private,
     )
     .into_facts();
     let source_collection: CollectionHandle =

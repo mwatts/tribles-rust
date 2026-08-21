@@ -182,6 +182,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::collection::Reach;
     use super::*;
 
     use std::cell::RefCell;
@@ -335,6 +336,7 @@ mod tests {
         super::super::descriptor(
             &CollectionName::new(name).unwrap(),
             SigningKey::from_bytes(&[1; 32]).verifying_key(),
+            Reach::Private,
         )
     }
 

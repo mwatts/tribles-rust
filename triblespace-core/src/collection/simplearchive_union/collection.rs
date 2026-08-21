@@ -8,6 +8,8 @@
 //! facts are returned.
 
 use ed25519_dalek::VerifyingKey;
+
+use crate::collection::descriptor::Reach;
 use crate::collection::records::CollectionName;
 
 use std::collections::BTreeSet;
@@ -34,12 +36,22 @@ use crate::trible::{Fragment, TribleSet};
 pub struct SimpleArchiveCollection {
     name: CollectionName,
     team: VerifyingKey,
+    reach: Reach,
 }
 
 impl SimpleArchiveCollection {
     /// Construct a read-only exact-ticket facade for one named root.
-    pub fn new(name: CollectionName, team: VerifyingKey) -> Self {
-        Self { name, team }
+    ///
+    /// `reach` is not decoration on a read facade: it is part of the
+    /// descriptor this facade hashes, so a facade that names the wrong reach
+    /// names a different collection and matches no ticket.
+    pub fn new(name: CollectionName, team: VerifyingKey, reach: Reach) -> Self {
+        Self { name, team, reach }
+    }
+
+    /// How far this collection may travel.
+    pub fn reach(&self) -> Reach {
+        self.reach
     }
 
     /// Name this collection is known by within its team.
@@ -54,7 +66,7 @@ impl SimpleArchiveCollection {
 
     /// Canonical `SimpleArchive` set-union descriptor facts.
     pub fn descriptor(&self) -> Fragment {
-        super::descriptor(&self.name, self.team)
+        super::descriptor(&self.name, self.team, self.reach)
     }
 
     /// Content identity of this collection's descriptor.
@@ -196,6 +208,7 @@ mod tests {
         SimpleArchiveCollection::new(
             CollectionName::new(name).unwrap(),
             SigningKey::from_bytes(&[1; 32]).verifying_key(),
+            Reach::Private,
         )
     }
 

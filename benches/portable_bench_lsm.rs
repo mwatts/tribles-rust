@@ -64,6 +64,7 @@
 //! violation, 4 no measure had signal. BUILD-FAIL is expressed by
 //! compilation (the design point of this file), never emulated at runtime.
 
+use triblespace_core::collection::Reach;
 use std::time::Instant;
 
 use ed25519_dalek::SigningKey;
@@ -745,7 +746,7 @@ fn main() {
     // authority setup cost, not part of Succinct construction.
     let name = benchmark_name();
     let team = benchmark_team();
-    let succinct = SuccinctArchiveCollection::new(name.clone(), team);
+    let succinct = SuccinctArchiveCollection::new(name.clone(), team, Reach::Private, Reach::Private);
     let signing_key = SigningKey::from_bytes(&[0x5A; 32]);
     let mut all: Vec<(String, Outcome)> = Vec::new();
     let built = quiet_catch(|| {
@@ -755,7 +756,7 @@ fn main() {
         for i in 0..(build_warmup + build_iters) {
             let recording = i >= build_warmup;
             let mut source =
-                Collection::new(MemoryRepo::default(), &name, team, signing_key.clone());
+                Collection::new(MemoryRepo::default(), &name, team, signing_key.clone(), Reach::Private);
             for chunk in &chunks {
                 source
                     .commit(Fragment::from(chunk.content.clone()))

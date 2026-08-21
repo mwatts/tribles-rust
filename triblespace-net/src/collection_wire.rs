@@ -654,6 +654,7 @@ pub async fn op_collection_evidence<C: Conn>(
 
 #[cfg(test)]
 mod tests {
+    use triblespace_core::collection::Reach;
     use ed25519_dalek::SigningKey;
     use triblespace_core::blob::encodings::UnknownBlob;
     use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
@@ -676,7 +677,7 @@ mod tests {
 
     /// A named root of the canonical `SimpleArchive` union kind.
     fn root(name: &str) -> Fragment {
-        simplearchive_union::descriptor(&CollectionName::new(name).unwrap(), test_team())
+        simplearchive_union::descriptor(&CollectionName::new(name).unwrap(), test_team(), Reach::Private)
     }
 
     /// These wire tests only need identities to address records by; nothing

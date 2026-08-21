@@ -40,6 +40,7 @@ pub mod succinctarchive_union;
 pub use ed25519_dalek::VerifyingKey;
 
 pub use api::*;
+pub use descriptor::{Reach, REACH_PUBLIC};
 pub use discovery::*;
 pub use gossip::*;
 pub use records::*;

@@ -3,6 +3,7 @@
 //!
 //! Run with: `cargo run --example native_succinct_collection`
 
+use triblespace_core::collection::Reach;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use triblespace::core::collection::succinctarchive_union::SuccinctArchiveCollection;
@@ -23,7 +24,7 @@ fn main() {
     let name = CollectionName::new("literature").expect("legal collection name");
     let signing_key = SigningKey::generate(&mut OsRng);
     let team = signing_key.verifying_key();
-    let mut collection = Collection::new(pile, &name, team, signing_key);
+    let mut collection = Collection::new(pile, &name, team, signing_key, Reach::Private);
 
     // Each fragment is one independent signed collection member. Omitting an
     // explicit entity id makes every person intrinsic to their facts.
@@ -40,7 +41,7 @@ fn main() {
 
     // Build any missing canonical raw Succinct shards and their exact Rank9
     // fibers, then query the admitted physical cover directly.
-    let succinct = SuccinctArchiveCollection::new(name.clone(), team);
+    let succinct = SuccinctArchiveCollection::new(name.clone(), team, Reach::Private, Reach::Private);
     let archive = succinct
         .ensure_exact(collection.storage_mut(), &ticket)
         .expect("ensure exact Succinct projection");

@@ -1,3 +1,4 @@
+use crate::collection::Reach;
 use super::*;
 
 use std::convert::Infallible;
@@ -34,7 +35,7 @@ fn test_name(name: &str) -> CollectionName {
 }
 
 fn source_root() -> Fragment {
-    simplearchive_union::descriptor(&test_name("source"), test_team())
+    simplearchive_union::descriptor(&test_name("source"), test_team(), Reach::Private)
 }
 
 fn kernel() -> ExactDerivedCollection<SimpleArchive, UnknownBlob> {
@@ -45,6 +46,7 @@ fn kernel() -> ExactDerivedCollection<SimpleArchive, UnknownBlob> {
             test_team(),
             <UnknownBlob as MetaDescribe>::id(),
             simplearchive_union::TRIBLE_SET_UNION_RECIPE_V1,
+            Reach::Private,
         ),
     )
 }
@@ -1494,6 +1496,7 @@ fn algebra_rejects_a_lying_source_descriptor() {
         test_team(),
         <UnknownBlob as MetaDescribe>::id(),
         id(99),
+        Reach::Private,
     );
     let lifecycle = ExactDerivedCollection::<SimpleArchive, UnknownBlob>::new(
         lying_source.clone(),

@@ -20,7 +20,7 @@ use ed25519_dalek::VerifyingKey;
 
 use itertools::Itertools;
 
-use crate::id::Id;
+use crate::id::{id_hex, Id};
 use crate::inline::encodings::genid::GenId;
 use crate::inline::encodings::shortstring::ShortString;
 use crate::inline::{Inline, IntoInline, RawInline};
@@ -31,8 +31,8 @@ use crate::temp;
 use crate::trible::{Fragment, TribleSet};
 
 use super::records::{
-    collection_name, collection_recipe, collection_representation, collection_source,
-    collection_team, CollectionHandle, CollectionName, RecordDecodeError,
+    collection_name, collection_reach, collection_recipe, collection_representation,
+    collection_source, collection_team, CollectionHandle, CollectionName, RecordDecodeError,
     KIND_COLLECTION_DESCRIPTOR,
 };
 
@@ -50,6 +50,7 @@ pub fn naming(
     team: VerifyingKey,
     representation: Id,
     recipe: Id,
+    reach: Reach,
 ) -> Fragment {
     entity! {
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,
@@ -57,7 +58,93 @@ pub fn naming(
         collection_team: team,
         collection_representation: representation,
         collection_recipe: recipe,
+        collection_reach?: reach.declared(),
     }
+}
+
+/// The reach law naming "any holder may relay this collection's strictly
+/// verified commits to any peer that asks".
+///
+/// One law is implemented, and it is the coarse one. What it forecloses is
+/// per-recipient scoping: this says *whether* a collection travels, not *to
+/// whom*, so it cannot express "these two teammates but not the third". That
+/// is deliberate for now rather than permanent -- a narrower law is a
+/// different id carrying its audience as further attributes on the same
+/// entity, and needs no change to [`collection_reach`] to exist. What is
+/// permanent is that reach is not per-*author*: a collection travels or it
+/// does not, and an author who wants different answers for different material
+/// writes it into different collections. That is the same mechanism at a finer
+/// grain rather than a second one.
+///
+/// Minted with `trible genid` on 2026-08-21.
+pub const REACH_PUBLIC: Id = id_hex!("A7ACA286FE5599D92DB87E8A84A7767E");
+
+/// How far a collection may travel, as stated when its identity is fixed.
+///
+/// Building a descriptor requires saying this, which is the point. Reach used
+/// to be a separate signed grant that production code never minted, so the
+/// normal outcome of publishing was that nothing replicated and nothing
+/// complained. A required argument cannot be forgotten: the silent failure is
+/// gone because there is no second act left to omit.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum Reach {
+    /// The collection does not travel. Nothing is written to the descriptor,
+    /// so a private descriptor is byte-identical to one built before reach
+    /// existed and keeps the identity it already had.
+    Private,
+    /// The collection travels under [`REACH_PUBLIC`].
+    Public,
+}
+
+impl Reach {
+    /// The law id to declare, or `None` for a collection that stays put.
+    pub fn declared(self) -> Option<Id> {
+        match self {
+            Self::Private => None,
+            Self::Public => Some(REACH_PUBLIC),
+        }
+    }
+}
+
+/// The reach law this descriptor declares, if it declares one readably.
+///
+/// Answers the raw law id rather than a verdict, because a reader that
+/// implements a law this binary does not should be able to see which one it
+/// met. A descriptor declaring nothing, declaring something unreadable, or
+/// declaring twice all answer `None`: each is a descriptor that has not
+/// stated a single reach, and [`travels`] treats them alike.
+pub fn reach(facts: &TribleSet) -> Option<Id> {
+    let mut rows = find!(
+        (v: Id?),
+        pattern!(facts, [{ _?e @ collection_reach: ?v }])
+    )
+    .map(|(v,)| v);
+    let first = rows.next()?.ok()?;
+    if rows.next().is_some() {
+        return None;
+    }
+    Some(first)
+}
+
+/// Whether this collection may be relayed to a peer.
+///
+/// **Read the collection's own descriptor and nothing else.** Unlike
+/// [`team_root`], which walks [`collection_source`] because a derivation
+/// genuinely inherits its owner, reach never walks: a derived collection
+/// declares its own or has none. Inheriting would be wrong in both
+/// directions. A derivation can expose what its source did not -- an index
+/// over private material still leaks the material's shape -- so publishing a
+/// source must not publish everything computed from it. And an aggregate
+/// deliberately published over private inputs is an ordinary thing to want,
+/// which inheritance would forbid. Locality also keeps the answer decidable
+/// from one blob, which is what lets a relay refuse without resolving a chain
+/// it may not hold.
+///
+/// Absence is a `false`, not a missing answer. Every descriptor written
+/// before this attribute existed says nothing, and every one of them stays
+/// put.
+pub fn travels(facts: &TribleSet) -> bool {
+    reach(facts) == Some(REACH_PUBLIC)
 }
 
 /// The entity the descriptor's own attributes hang off.
@@ -318,6 +405,7 @@ pub(crate) fn named_for_tests(name: &str, representation: Id, recipe: Id) -> Fra
         team,
         representation,
         recipe,
+        Reach::Private,
     )
 }
 
@@ -371,6 +459,7 @@ mod tests {
             team,
             <SimpleArchive as crate::metadata::MetaDescribe>::id(),
             TRIBLE_SET_UNION_RECIPE_V1,
+            Reach::Private,
         )
     }
 
@@ -465,5 +554,177 @@ mod tests {
             team_root(shallow, |handle| resident.get(&handle).cloned()),
             Ok((identity_for_tests(&fragments[0]), team))
         );
+    }
+
+    /// A descriptor that declares no reach hashes exactly as it did before the
+    /// attribute existed.
+    ///
+    /// These four handles were captured from this crate at commit e72b20db,
+    /// the last one built before `collection_reach` was declared. They are
+    /// pinned rather than recomputed because recomputing them would prove
+    /// nothing: the question is whether today's builders agree with a version
+    /// of the code that is no longer here to ask.
+    ///
+    /// This is the whole reason the attribute is optional. `self.pile` holds
+    /// 69 collections of which only 23 are named, the other 46 being the same
+    /// data under earlier descriptor shapes; a mandatory field would have made
+    /// it 138.
+    #[test]
+    fn a_descriptor_without_reach_keeps_the_identity_it_had_before_reach_existed() {
+        let team = team_key(0xAA);
+        let name = CollectionName::new("ledger").unwrap();
+
+        let bare = naming(
+            &name,
+            team,
+            crate::id::id_hex!("11111111111111111111111111111111"),
+            crate::id::id_hex!("22222222222222222222222222222222"),
+            Reach::Private,
+        );
+        assert_eq!(
+            hex::encode_upper(identity_for_tests(&bare).raw),
+            "9D413F35934206B916104EE38F03E40E0D1F3AEE2332E00F61FB23B12B422F15"
+        );
+
+        let root = crate::collection::simplearchive_union::descriptor(&name, team, Reach::Private);
+        let root_handle = identity_for_tests(&root);
+        assert_eq!(
+            hex::encode_upper(root_handle.raw),
+            "8D492ED32C9A96F6F1B6EED0ED565376F8A9CA6C7073A155C8F84783747B465E"
+        );
+
+        let succinct =
+            crate::collection::succinctarchive_union::descriptor(root_handle, Reach::Private);
+        assert_eq!(
+            hex::encode_upper(identity_for_tests(&succinct).raw),
+            "C1E12A2FB1CA64CC38D138039F13C9F99DC9AE1A9F73FC610D4201E0FBB84052"
+        );
+
+        let observed = crate::collection::observed_union::descriptor(
+            root_handle,
+            crate::id::id_hex!("33333333333333333333333333333333"),
+            Reach::Private,
+        );
+        assert_eq!(
+            hex::encode_upper(identity_for_tests(&observed).raw),
+            "CCE515D8FE869D2709DC328894FDEBEDBE287FC1E69640C0AE2F71424B721F33"
+        );
+    }
+
+    /// Declaring reach is a rename, which is the entire point.
+    #[test]
+    fn declaring_reach_makes_a_different_collection() {
+        let team = team_key(9);
+        let name = CollectionName::new("ledger").unwrap();
+        let private = crate::collection::simplearchive_union::descriptor(&name, team, Reach::Private);
+        let public = crate::collection::simplearchive_union::descriptor(&name, team, Reach::Public);
+
+        assert_ne!(identity_for_tests(&private), identity_for_tests(&public));
+        assert_eq!(private.facts().len() + 1, public.facts().len());
+    }
+
+    /// A descriptor answers whether it travels, and silence is a refusal.
+    #[test]
+    fn reach_is_read_from_the_descriptor_and_absence_refuses() {
+        let team = team_key(10);
+        let name = CollectionName::new("ledger").unwrap();
+
+        let private =
+            crate::collection::simplearchive_union::descriptor(&name, team, Reach::Private);
+        assert_eq!(reach(private.facts()), None);
+        assert!(!travels(private.facts()));
+
+        let public = crate::collection::simplearchive_union::descriptor(&name, team, Reach::Public);
+        assert_eq!(reach(public.facts()), Some(REACH_PUBLIC));
+        assert!(travels(public.facts()));
+    }
+
+    /// A reach law this binary does not implement is a refusal, not a guess.
+    ///
+    /// This is the property a boolean could not have had. A future mode --
+    /// some subset of a team -- reaching an older reader must not be read as
+    /// "public" merely because it is not "absent".
+    #[test]
+    fn an_unknown_reach_law_does_not_travel() {
+        let unknown = crate::prelude::entity! {
+            metadata::tag: super::KIND_COLLECTION_DESCRIPTOR,
+            collection_reach: crate::id::id_hex!("44444444444444444444444444444444"),
+        };
+        assert_eq!(
+            reach(unknown.facts()),
+            Some(crate::id::id_hex!("44444444444444444444444444444444"))
+        );
+        assert!(!travels(unknown.facts()));
+    }
+
+    /// Two declarations are not a majority vote.
+    ///
+    /// A descriptor asserting both `REACH_PUBLIC` and something else has not
+    /// stated a reach, and the tie is broken closed rather than by picking the
+    /// permissive row.
+    #[test]
+    fn a_descriptor_declaring_two_reaches_declares_none() {
+        let e = crate::id::ExclusiveId::force(crate::id::id_hex!(
+            "55555555555555555555555555555555"
+        ));
+        let mut facts = TribleSet::new();
+        facts += crate::prelude::entity! { &e @
+            metadata::tag: super::KIND_COLLECTION_DESCRIPTOR,
+            collection_reach: REACH_PUBLIC,
+        }
+        .into_facts();
+        assert!(travels(&facts));
+
+        facts += crate::prelude::entity! { &e @
+            collection_reach: crate::id::id_hex!("44444444444444444444444444444444"),
+        }
+        .into_facts();
+        assert_eq!(reach(&facts), None);
+        assert!(!travels(&facts));
+    }
+
+    /// A derived collection declares its own reach and inherits nothing.
+    ///
+    /// Both directions matter. A public index over a private source would
+    /// leak the source's shape if reach were inherited downward, and a
+    /// deliberately published aggregate over private inputs would be
+    /// impossible if reach were inherited upward. Contrast
+    /// [`team_root`], which *does* walk, because ownership genuinely is
+    /// inherited.
+    #[test]
+    fn a_derived_collection_declares_reach_independently_of_its_source() {
+        let team = team_key(11);
+        let name = CollectionName::new("ledger").unwrap();
+
+        let private_root =
+            crate::collection::simplearchive_union::descriptor(&name, team, Reach::Private);
+        let private_root_handle = identity_for_tests(&private_root);
+
+        // A public derivation of a private source.
+        let public_index =
+            crate::collection::succinctarchive_union::descriptor(private_root_handle, Reach::Public);
+        assert!(!travels(private_root.facts()));
+        assert!(travels(public_index.facts()));
+
+        let public_root =
+            crate::collection::simplearchive_union::descriptor(&name, team, Reach::Public);
+        let public_root_handle = identity_for_tests(&public_root);
+
+        // And a private derivation of a public source.
+        let private_index = crate::collection::succinctarchive_union::descriptor(
+            public_root_handle,
+            Reach::Private,
+        );
+        assert!(travels(public_root.facts()));
+        assert!(!travels(private_index.facts()));
+
+        // Reading reach never walks `collection_source`, so an absent source
+        // descriptor cannot change the answer -- unlike `team_root`, which
+        // would report the chain unresolvable here.
+        let orphan = crate::prelude::entity! {
+            metadata::tag: super::KIND_COLLECTION_DESCRIPTOR,
+            collection_source: identity_for_tests(&public_root),
+        };
+        assert!(!travels(orphan.facts()));
     }
 }
