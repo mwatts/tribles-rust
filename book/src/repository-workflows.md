@@ -137,6 +137,53 @@ This collection path coexists with the branch-oriented `Repository` and
 updates; choosing the headless path does not change the semantics of existing
 branches.
 
+### Migrating one legacy branch directly
+
+`trible pile migrate <pile> branch-to-collection` converts one legacy
+`Repository` branch in place. It is deliberately a same-pile operation: the
+source commit blobs must already be in the pile that will receive the native
+records. The collection identity and authority policy are never inferred from
+the branch wrapper. Supply all three explicitly:
+
+```text
+trible pile migrate data.pile branch-to-collection \
+  --branch legacy-events \
+  --collection-name events \
+  --team-root <64-hex-character-ed25519-public-key> \
+  --signing-key ./writer.key
+```
+
+The command resolves `--branch` as an active 32-character hex branch id, or as
+an exact branch name when no such id is active. Both current LongString names
+and the older inline ShortString names are understood; duplicate names are
+rejected instead of guessed. Before its first append, it freezes the selected
+pin head and validates the complete reachable commit DAG through one later
+append-only blob snapshot, including canonical wrapper/content/archive bytes,
+authored content signatures, parent availability, and the current or
+historical intrinsic identity of contentless canonical merges.
+Older authored commits may have random wrapper subjects; a unique subject and
+unique mapped `content` and `metadata::archive` fields are required, but
+today's intrinsic subject derivation is not retroactively imposed on them.
+Discarded wrapper annotations do not become migration preconditions.
+
+Each authored node becomes `COMMIT(collection, repo::content,
+metadata::archive)`, re-signed by the supplied target key. An absent
+`metadata::archive` becomes the canonical empty archive. Repository wrapper
+parents, timestamps, messages, authors and signatures do not become collection
+metadata; contentless merge nodes are validated ancestry and are skipped. It
+follows that two source nodes with the same exact content and semantic metadata
+map to one native commit. The printed mapping makes that many-to-one collapse
+visible. Re-running with the same collection identity and signing key is
+idempotent: content-addressed dependencies and already-present native records
+are no-ops.
+
+The generic migration validates the two archive roots and their authentication,
+not application-specific meanings of 32-byte values inside their facts. It
+copies nothing because source and target are the same pile: any resident
+attachment closure remains resident and becomes reachable through the native
+commit, while a faculty that requires particular attachments must validate
+that schema before migration.
+
 ## Attach an exact direct fact view
 
 Read-only consumers that already hold an immutable commit ticket do not need

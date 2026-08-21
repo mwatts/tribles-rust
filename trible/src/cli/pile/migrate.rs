@@ -10,6 +10,8 @@ use triblespace_core::repo::BlobStoreMeta;
 use triblespace_core::repo::PushResult;
 use triblespace_core::trible::TribleSet;
 
+mod branch_to_collection;
+
 type NameHandle = Inline<Handle<blobencodings::LongString>>;
 type BranchMetaHandle = Inline<Handle<blobencodings::SimpleArchive>>;
 
@@ -45,6 +47,25 @@ pub enum Command {
         #[arg(long = "into")]
         into: PathBuf,
     },
+    /// Re-sign one verified legacy Repository branch as native collection commits.
+    ///
+    /// This is deliberately a same-pile migration: one frozen pin observation
+    /// selects the head, a later append-only blob snapshot validates everything
+    /// it reaches, and only then are native records appended to that pile.
+    BranchToCollection {
+        /// Legacy branch to migrate, by exact name or 32-hex-character id.
+        #[arg(long)]
+        branch: String,
+        /// Immutable name of the target root collection.
+        #[arg(long)]
+        collection_name: String,
+        /// Exact Ed25519 team-root public key (64 hex characters).
+        #[arg(long)]
+        team_root: String,
+        /// Durable target signing-key file (64-hex-character seed).
+        #[arg(long)]
+        signing_key: PathBuf,
+    },
     /// Run migrations (all by default, or a single named migration).
     Run {
         /// Optional migration name. If omitted, run all migrations in order.
@@ -63,6 +84,12 @@ pub fn run(pile_path: PathBuf, cmd: Command) -> Result<()> {
     match cmd {
         Command::List => list_migrations(&pile_path),
         Command::Reframe { into } => reframe(&pile_path, &into),
+        Command::BranchToCollection {
+            branch,
+            collection_name,
+            team_root,
+            signing_key,
+        } => branch_to_collection::run(pile_path, branch, collection_name, team_root, signing_key),
         Command::Run {
             migration,
             dry_run,
@@ -508,7 +535,6 @@ fn rename_duplicate_branch_names(
     Ok(renamed)
 }
 
-
 /// Count how many of this reader's record-kind description blobs the pile
 /// already holds.
 ///
@@ -575,7 +601,6 @@ fn migrate_record_kind_descriptions(pile_path: &PathBuf, dry_run: bool) -> Resul
     res.and(close_res)?;
     Ok(())
 }
-
 
 /// Re-encode `pile_path` into a fresh pile at `destination`.
 ///

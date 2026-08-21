@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add `trible pile migrate <pile> branch-to-collection` as the generic,
+  same-pile bridge from one legacy `Repository` branch to a native
+  `SimpleArchive` union collection. The command requires the target collection
+  name, team root, and signing key explicitly; validates the branch head and
+  complete reachable commit history before writing; preserves each authored
+  commit's exact `repo::content` and `metadata::archive`; skips verified
+  contentless merges; resolves both current and historical branch-name
+  encodings; and reports every source-to-target mapping, including deterministic
+  many-to-one collapse and idempotent replays.
+
 ### Changed
 
 - **A decoded archive is one build per index, not sixteen builds and a merge.**
