@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A decoded archive is one build per index, not sixteen builds and a merge.**
+  Decoding the 1.68 GB canonical union of a 404-commit, 26.26 M-fact collection
+  spent 4.0 s: 85 ms validating and hashing rows, 2.25 s building six PATCH
+  orders over sixteen per-worker chunks, and **1.6 s unioning those sixteen
+  `TribleSet`s back together**. That union bought nothing. It was the price of
+  the chunking, and the chunking existed only because parallelism lived at the
+  chunk boundary: the four value-first orders interleave across any range of
+  archive rows, so every chunk boundary put the same keys in the same subtries
+  and left the reduce to walk them a second time.
+
+  Parallelism now lives inside the build. `PATCH`'s bottom-up archive
+  constructor is an MSD-radix partition, which already splits a node's rows
+  into disjoint key ranges and hands each child a contiguous interval of one
+  permutation buffer — so the children can be built on separate workers with
+  nothing to synchronise, and a node wide enough to matter splits by counting
+  into per-worker histograms and scattering into a second buffer instead of by
+  the in-place American-flag pass, which is a chain of dependent swaps and can
+  only ever run on one worker. The decoder therefore builds each order over the
+  whole archive at once, and there is no union left to do.
+
+  Decode of that archive: **4.29 s -> 2.42 s** (interleaved medians, sixteen
+  cores under other load; the union phase goes from 1.6 s to 40 µs). Warm
+  `Collection::snapshot` on the same collection: **4.50 s -> 2.81 s**. The
+  decoded set is byte-identical — all six orders match an independent
+  online-insert build root-hash-for-root-hash, key-for-key and
+  fanout-for-fanout at full scale, and the snapshot's re-encoded facts still
+  hash to the same 32 bytes as an independent `sort_unstable` + `dedup` of
+  every one of the 404 commits' rows.
+
+  Row *order within a bucket* is now unspecified, and the tests say so rather
+  than depending on it: keys in an archive are distinct, so the subtrie a
+  bucket produces is a function of its key set alone. Boundary errors are still
+  reported ahead of anything a worker finds inside a run, which is what makes a
+  duplicate straddling two runs report as a duplicate.
+
 - **A collection snapshot merges in parallel, and stops naming a value it
   immediately consumes.** On a 404-commit, 26.26 M-fact collection
   (`bultmann.pile`, 1.98 GB) `Collection::snapshot` spent 6.38 s, and the

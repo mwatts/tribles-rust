@@ -3378,12 +3378,53 @@ where
         result
     }
 
+    /// Row count at or above which one trie node builds its children on
+    /// separate workers instead of recursing into them in order.
+    ///
+    /// The MSD partition already hands each child a disjoint, contiguous
+    /// interval of the one permutation buffer, so the fan-out costs no copy
+    /// and no synchronisation — only the task overhead this threshold pays
+    /// for. Below it a node is cheaper to walk than to schedule.
+    #[cfg(feature = "parallel")]
+    pub(crate) const PARALLEL_PARTITION_THRESHOLD: usize = 1 << 12;
+
+    /// Rows one worker is given before a partition pass is worth splitting.
+    ///
+    /// A counting pass is a sequential read and a scatter is a random write,
+    /// so a worker needs enough rows to amortise the histogram reduction and
+    /// the second buffer. Below two workers' worth, the in-place American-flag
+    /// pass is both cheaper and allocation-free.
+    #[cfg(feature = "parallel")]
+    pub(crate) const PARTITION_ROWS_PER_WORKER: usize = 1 << 13;
+
+    /// How many workers an out-of-place partition of `rows` should use, and
+    /// therefore whether it beats the in-place pass at all.
+    #[cfg(feature = "parallel")]
+    pub(crate) fn partition_workers(rows: usize) -> usize {
+        (rows / Self::PARTITION_ROWS_PER_WORKER)
+            .min(rayon::current_num_threads().max(1))
+            .max(1)
+    }
+
     /// Representative-LCP plus in-place MSD-radix worker for
     /// [`Self::from_archive_partition`].
     ///
     /// Trie construction is ownership-neutral. One deduplicated conservative
     /// owner cover on the returned PATCH guards every LocalLeaf regardless of
     /// later reshaping.
+    ///
+    /// With the `parallel` feature a node meets one of three regimes, by
+    /// size: wide enough for [`Self::partition_workers`] to want more than one
+    /// worker, it is split by the out-of-place counting pass and its children
+    /// are built concurrently; merely at or above
+    /// [`Self::PARALLEL_PARTITION_THRESHOLD`], it keeps the in-place pass and
+    /// only its children go concurrent; below that it is walked in order.
+    ///
+    /// All three build the same trie. Children own disjoint intervals of the
+    /// permutation and disjoint subtrees of the result, the child heads are
+    /// reassembled in ascending key order either way, and the node hash is an
+    /// XOR over children — so neither the order children are built in nor the
+    /// order rows sit in within a bucket can reach the answer.
     #[cfg(any(test, feature = "parallel"))]
     unsafe fn build_archive_partition_head(
         keys: &[[u8; KEY_LEN]],
@@ -3401,6 +3442,345 @@ where
             return (head, hashes[row]);
         }
 
+        // A node big enough to be worth the extra buffer counts and scatters
+        // its children across workers instead of walking them in place; a
+        // node merely big enough to be worth a task keeps the in-place pass
+        // and only recurses concurrently.
+        #[cfg(feature = "parallel")]
+        if Self::partition_workers(rows.len()) > 1 {
+            let (plan, mut permuted) = Self::partition_archive_rows_parallel(keys, rows, depth);
+            // SAFETY: `permuted` is the same multiset of row ordinals as
+            // `rows`, grouped by the same key byte.
+            return unsafe {
+                Self::build_archive_partition_children(keys, hashes, &mut permuted, &plan)
+            };
+        }
+
+        let plan = Self::partition_archive_rows(keys, rows, depth);
+        let end_depth = plan.end_depth;
+
+        #[cfg(feature = "parallel")]
+        if rows.len() >= Self::PARALLEL_PARTITION_THRESHOLD {
+            // SAFETY: same contract, on the in-place permutation.
+            return unsafe { Self::build_archive_partition_children(keys, hashes, rows, &plan) };
+        }
+
+        let first_bucket = plan.buckets[0];
+        let second_bucket = plan.buckets[1];
+        let first_end = plan.ends[first_bucket as usize] as usize;
+        let (first_head, first_hash) = unsafe {
+            Self::build_archive_partition_head(keys, hashes, &mut rows[..first_end], end_depth + 1)
+        };
+        let second_end = plan.ends[second_bucket as usize] as usize;
+        let (second_head, second_hash) = unsafe {
+            Self::build_archive_partition_head(
+                keys,
+                hashes,
+                &mut rows[first_end..second_end],
+                end_depth + 1,
+            )
+        };
+
+        let body = if plan.initial_slots == 2 {
+            Branch::new_with_child_hashes(
+                end_depth,
+                first_head.with_key(first_bucket),
+                second_head.with_key(second_bucket),
+                first_hash,
+                second_hash,
+            )
+        } else {
+            Branch::new_with_child_hashes_capacity(
+                end_depth,
+                first_head.with_key(first_bucket),
+                second_head.with_key(second_bucket),
+                first_hash,
+                second_hash,
+                plan.initial_slots,
+            )
+        };
+        let mut root = Head::new(0, body);
+        let mut hash = first_hash ^ second_hash;
+        if plan.fanout == 2 {
+            debug_assert_eq!(second_end, rows.len());
+            return (root, hash);
+        }
+
+        let mut editor = BranchMut::from_head(&mut root);
+        let mut range_start = second_end;
+        for &byte in &plan.buckets[2..plan.fanout] {
+            let range_end = plan.ends[byte as usize] as usize;
+            let (child, child_hash) = unsafe {
+                Self::build_archive_partition_head(
+                    keys,
+                    hashes,
+                    &mut rows[range_start..range_end],
+                    end_depth + 1,
+                )
+            };
+            hash ^= child_hash;
+            editor.install_child_growing(child.with_key(byte));
+            range_start = range_end;
+        }
+        debug_assert_eq!(range_start, rows.len());
+
+        // Rebuild structural aggregates once and install the exact XOR carried
+        // by recursion, avoiding another hash read from direct LocalLeaves.
+        editor.finish_bulk_aggregates(hash);
+        drop(editor);
+        (root, hash)
+    }
+
+    /// Build every child of one already-partitioned node concurrently.
+    ///
+    /// The partition hands each child a disjoint, contiguous interval of the
+    /// permutation, so `split_at_mut` is the whole proof that the concurrent
+    /// recursion cannot alias: disjoint rows, disjoint subtrees, and a node
+    /// hash that is an XOR over children.
+    ///
+    /// # Safety
+    ///
+    /// The caller's `keys`/`hashes` contract must hold, and `rows` must be
+    /// grouped by `plan` as [`Self::partition_archive_rows`] leaves it.
+    #[cfg(feature = "parallel")]
+    unsafe fn build_archive_partition_children(
+        keys: &[[u8; KEY_LEN]],
+        hashes: &[u128],
+        rows: &mut [u32],
+        plan: &ArchivePartitionPlan,
+    ) -> (Head<KEY_LEN, O, ()>, u128) {
+        use rayon::prelude::*;
+
+        let end_depth = plan.end_depth;
+        let mut remaining: &mut [u32] = rows;
+        let mut intervals: Vec<(u8, &mut [u32])> = Vec::with_capacity(plan.fanout);
+        let mut previous_end = 0usize;
+        for &byte in &plan.buckets[..plan.fanout] {
+            let end = plan.ends[byte as usize] as usize;
+            let (child, rest) = remaining.split_at_mut(end - previous_end);
+            intervals.push((byte, child));
+            remaining = rest;
+            previous_end = end;
+        }
+        debug_assert!(remaining.is_empty());
+
+        let children: Vec<(u8, Head<KEY_LEN, O, ()>, u128)> = intervals
+            .into_par_iter()
+            .map(|(byte, child_rows)| {
+                // SAFETY: the caller's contract holds for every subinterval,
+                // and the intervals are pairwise disjoint.
+                let (head, hash) = unsafe {
+                    Self::build_archive_partition_head(keys, hashes, child_rows, end_depth + 1)
+                };
+                (byte, head, hash)
+            })
+            .collect();
+
+        Self::assemble_archive_partition_branch(end_depth, plan.initial_slots, children)
+    }
+
+    /// Out-of-place counting-sort twin of [`Self::partition_archive_rows`].
+    ///
+    /// The in-place American-flag pass is a chain of dependent swaps and can
+    /// only ever run on one worker, which is exactly what caps a whole-archive
+    /// build: six root passes over every row, each a serial storm of cache
+    /// misses. Counting into per-worker histograms and scattering into a
+    /// second buffer costs one extra `u32` per row and runs on every worker.
+    ///
+    /// The result groups the same rows under the same key bytes. It does not
+    /// preserve their relative order within a bucket, and does not need to:
+    /// keys are distinct, so the trie a bucket produces is a function of its
+    /// key set alone, and children are installed in ascending byte order
+    /// either way.
+    #[cfg(feature = "parallel")]
+    fn partition_archive_rows_parallel(
+        keys: &[[u8; KEY_LEN]],
+        rows: &[u32],
+        depth: usize,
+    ) -> (ArchivePartitionPlan, Vec<u32>) {
+        use rayon::prelude::*;
+
+        let workers = Self::partition_workers(rows.len());
+        let stride = rows.len().div_ceil(workers).max(1);
+
+        // Every worker narrows the representative's prefix over its own run;
+        // the shortest agreement wins, which is the same minimum the ordered
+        // scan converges to.
+        let representative = &keys[rows[0] as usize];
+        let end_depth = rows[1..]
+            .par_chunks(stride)
+            .map(|chunk| {
+                let mut shortest = KEY_LEN;
+                for &row in chunk {
+                    let key = &keys[row as usize];
+                    let mut candidate_depth = depth;
+                    while candidate_depth < shortest {
+                        let key_index = O::TREE_TO_KEY[candidate_depth];
+                        if representative[key_index] != key[key_index] {
+                            shortest = candidate_depth;
+                            break;
+                        }
+                        candidate_depth += 1;
+                    }
+                    if shortest == depth {
+                        break;
+                    }
+                }
+                shortest
+            })
+            .min()
+            .unwrap_or(KEY_LEN);
+        assert!(
+            end_depth < KEY_LEN,
+            "duplicate archive keys cannot form a finite trie",
+        );
+
+        let key_index = O::TREE_TO_KEY[end_depth];
+        let histograms: Vec<[u32; 256]> = rows
+            .par_chunks(stride)
+            .map(|chunk| {
+                let mut counts = [0u32; 256];
+                for &row in chunk {
+                    counts[keys[row as usize][key_index] as usize] += 1;
+                }
+                counts
+            })
+            .collect();
+
+        let mut totals = [0u32; 256];
+        for counts in &histograms {
+            for (total, count) in totals.iter_mut().zip(counts.iter()) {
+                *total += count;
+            }
+        }
+
+        let mut buckets = [0u8; 256];
+        let mut fanout = 0usize;
+        let mut ends = [0u32; 256];
+        let mut bases = [0u32; 256];
+        let mut offset = 0u32;
+        for (byte, &total) in totals.iter().enumerate() {
+            if total == 0 {
+                continue;
+            }
+            buckets[fanout] = byte as u8;
+            fanout += 1;
+            bases[byte] = offset;
+            offset += total;
+            ends[byte] = offset;
+        }
+        debug_assert_eq!(offset as usize, rows.len());
+        debug_assert!((2..=256).contains(&fanout));
+        let initial_slots = if fanout == 2 {
+            2
+        } else {
+            fanout.next_power_of_two()
+        };
+
+        // Each worker's rows for a bucket land after every earlier worker's,
+        // so the per-worker cursors carve the bucket into disjoint windows.
+        let mut cursors: Vec<[u32; 256]> = vec![[0u32; 256]; histograms.len()];
+        let mut running = bases;
+        for (cursor, counts) in cursors.iter_mut().zip(histograms.iter()) {
+            for &byte in &buckets[..fanout] {
+                let byte = byte as usize;
+                cursor[byte] = running[byte];
+                running[byte] += counts[byte];
+            }
+        }
+
+        let mut permuted: Vec<u32> = Vec::with_capacity(rows.len());
+        let scatter = parallel_union::ScatterPtr(permuted.as_mut_ptr());
+        rows.par_chunks(stride)
+            .zip(cursors.into_par_iter())
+            .for_each(|(chunk, mut cursor)| {
+                for &row in chunk {
+                    let byte = keys[row as usize][key_index] as usize;
+                    let slot = cursor[byte] as usize;
+                    // SAFETY: slot is inside the buffer and inside this
+                    // worker's window of this bucket, so no other worker
+                    // writes it.
+                    unsafe { scatter.write_at(slot, row) };
+                    cursor[byte] += 1;
+                }
+            });
+        // SAFETY: the cursors partition `0..rows.len()`, so every slot was
+        // written exactly once above.
+        unsafe { permuted.set_len(rows.len()) };
+
+        (
+            ArchivePartitionPlan {
+                end_depth,
+                ends,
+                buckets,
+                fanout,
+                initial_slots,
+            },
+            permuted,
+        )
+    }
+
+    /// Install already-built children, in ascending key order, under one
+    /// branch at `end_depth`.
+    ///
+    /// Splitting this out is what lets the concurrent fan-out reuse the
+    /// ordered path's node construction: the children arrive as values, so
+    /// whether they were built in order or in parallel is invisible here.
+    #[cfg(feature = "parallel")]
+    fn assemble_archive_partition_branch(
+        end_depth: usize,
+        initial_slots: usize,
+        mut children: Vec<(u8, Head<KEY_LEN, O, ()>, u128)>,
+    ) -> (Head<KEY_LEN, O, ()>, u128) {
+        debug_assert!(children.len() >= 2);
+        let mut drain = children.drain(..);
+        let (first_bucket, first_head, first_hash) = drain.next().expect("two children");
+        let (second_bucket, second_head, second_hash) = drain.next().expect("two children");
+        let body = if initial_slots == 2 {
+            Branch::new_with_child_hashes(
+                end_depth,
+                first_head.with_key(first_bucket),
+                second_head.with_key(second_bucket),
+                first_hash,
+                second_hash,
+            )
+        } else {
+            Branch::new_with_child_hashes_capacity(
+                end_depth,
+                first_head.with_key(first_bucket),
+                second_head.with_key(second_bucket),
+                first_hash,
+                second_hash,
+                initial_slots,
+            )
+        };
+        let mut root = Head::new(0, body);
+        let mut hash = first_hash ^ second_hash;
+        let mut extra = drain.peekable();
+        if extra.peek().is_none() {
+            return (root, hash);
+        }
+        let mut editor = BranchMut::from_head(&mut root);
+        for (byte, child, child_hash) in extra {
+            hash ^= child_hash;
+            editor.install_child_growing(child.with_key(byte));
+        }
+        editor.finish_bulk_aggregates(hash);
+        drop(editor);
+        (root, hash)
+    }
+
+    /// One trie node's split: where its children diverge, which key bytes are
+    /// occupied, and where each child's rows now sit inside `rows`.
+    ///
+    /// The rows are permuted in place by an American-flag pass, so on return
+    /// bucket `buckets[i]` owns `rows[ends[buckets[i-1]]..ends[buckets[i]]]`.
+    #[cfg(any(test, feature = "parallel"))]
+    fn partition_archive_rows(
+        keys: &[[u8; KEY_LEN]],
+        rows: &mut [u32],
+        depth: usize,
+    ) -> ArchivePartitionPlan {
         // Tighten the representative's common prefix row-by-row. Once the
         // candidate reaches the incoming depth, no later row can shorten it.
         let representative = &keys[rows[0] as usize];
@@ -3437,17 +3817,15 @@ where
             *count += 1;
         }
 
-        let mut child_buckets = occupied;
-        let first_bucket = child_buckets
-            .drain_next_ascending()
-            .expect("a non-empty partition has one bucket");
-        let second_bucket = child_buckets
-            .drain_next_ascending()
-            .expect("a unique multi-row node has two buckets");
-        let first_extra = child_buckets.drain_next_ascending();
-        let fanout = first_extra.map_or(2, |_| 3 + child_buckets.popcount() as usize);
+        let mut buckets = [0u8; 256];
+        let mut fanout = 0usize;
+        let mut listing = occupied;
+        while let Some(byte) = listing.drain_next_ascending() {
+            buckets[fanout] = byte;
+            fanout += 1;
+        }
         debug_assert!((2..=256).contains(&fanout));
-        let initial_slots = if first_extra.is_none() {
+        let initial_slots = if fanout == 2 {
             2
         } else {
             fanout.next_power_of_two()
@@ -3457,8 +3835,7 @@ where
         // first unfilled position in each occupied interval.
         let mut next = [0u32; 256];
         let mut offset = 0u32;
-        let mut prefix_buckets = occupied;
-        while let Some(byte) = prefix_buckets.drain_next_ascending() {
+        for &byte in &buckets[..fanout] {
             let count = ends[byte as usize];
             next[byte as usize] = offset;
             offset += count;
@@ -3468,8 +3845,7 @@ where
 
         // American-flag partition. Every swap permanently fills one
         // destination position, so this is linear and needs no second buffer.
-        let mut partition_buckets = occupied;
-        while let Some(byte) = partition_buckets.drain_next_ascending() {
+        for &byte in &buckets[..fanout] {
             let bucket = byte as usize;
             while next[bucket] < ends[bucket] {
                 let position = next[bucket] as usize;
@@ -3486,73 +3862,28 @@ where
             }
         }
 
-        let first_end = ends[first_bucket as usize] as usize;
-        let (first_head, first_hash) = unsafe {
-            Self::build_archive_partition_head(keys, hashes, &mut rows[..first_end], end_depth + 1)
-        };
-        let second_end = ends[second_bucket as usize] as usize;
-        let (second_head, second_hash) = unsafe {
-            Self::build_archive_partition_head(
-                keys,
-                hashes,
-                &mut rows[first_end..second_end],
-                end_depth + 1,
-            )
-        };
-
-        let body = if initial_slots == 2 {
-            Branch::new_with_child_hashes(
-                end_depth,
-                first_head.with_key(first_bucket),
-                second_head.with_key(second_bucket),
-                first_hash,
-                second_hash,
-            )
-        } else {
-            Branch::new_with_child_hashes_capacity(
-                end_depth,
-                first_head.with_key(first_bucket),
-                second_head.with_key(second_bucket),
-                first_hash,
-                second_hash,
-                initial_slots,
-            )
-        };
-        let mut root = Head::new(0, body);
-        let mut hash = first_hash ^ second_hash;
-        let Some(mut byte) = first_extra else {
-            debug_assert_eq!(second_end, rows.len());
-            return (root, hash);
-        };
-
-        let mut editor = BranchMut::from_head(&mut root);
-        let mut range_start = second_end;
-        loop {
-            let range_end = ends[byte as usize] as usize;
-            let (child, child_hash) = unsafe {
-                Self::build_archive_partition_head(
-                    keys,
-                    hashes,
-                    &mut rows[range_start..range_end],
-                    end_depth + 1,
-                )
-            };
-            hash ^= child_hash;
-            editor.install_child_growing(child.with_key(byte));
-            range_start = range_end;
-            let Some(next_byte) = child_buckets.drain_next_ascending() else {
-                break;
-            };
-            byte = next_byte;
+        ArchivePartitionPlan {
+            end_depth,
+            ends,
+            buckets,
+            fanout,
+            initial_slots,
         }
-        debug_assert_eq!(range_start, rows.len());
-
-        // Rebuild structural aggregates once and install the exact XOR carried
-        // by recursion, avoiding another hash read from direct LocalLeaves.
-        editor.finish_bulk_aggregates(hash);
-        drop(editor);
-        (root, hash)
     }
+}
+
+/// Where one trie node's children start and end inside the shared permutation.
+#[cfg(any(test, feature = "parallel"))]
+struct ArchivePartitionPlan {
+    /// Tree depth at which this node's children diverge.
+    end_depth: usize,
+    /// Exclusive end offset of each occupied bucket, indexed by key byte.
+    ends: [u32; 256],
+    /// The occupied key bytes, ascending, in `buckets[..fanout]`.
+    buckets: [u8; 256],
+    fanout: usize,
+    /// Child-table capacity the branch is born with.
+    initial_slots: usize,
 }
 
 impl<const KEY_LEN: usize, O, V> PartialEq for PATCH<KEY_LEN, O, V>
@@ -3984,6 +4315,75 @@ mod tests {
         drop(owner);
         drop(storage);
         (patch, weak)
+    }
+
+    /// The out-of-place pass exists only to do what the in-place one does,
+    /// on more than one worker. Pin that: same split depth, same occupied
+    /// bytes, same interval per byte, same rows inside each interval.
+    ///
+    /// Order *within* an interval is deliberately unspecified — keys are
+    /// distinct, so a bucket's subtrie is a function of its key set — and the
+    /// assertion is written to say so rather than to accidentally depend on
+    /// it.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_partition_pass_agrees_with_the_in_place_pass() {
+        type Subject = PATCH<16, IdentitySchema>;
+        let len = 4 * Subject::PARTITION_ROWS_PER_WORKER;
+        let mut keys: Vec<[u8; 16]> = Vec::with_capacity(len);
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        for index in 0..len {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut mixed = state;
+            mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            mixed ^= mixed >> 31;
+            let mut key = [0u8; 16];
+            // Nine rows in ten share a first byte, and every row shares the
+            // seven bytes after it, so the representative's prefix has to be
+            // walked rather than rejected on the second row.
+            key[0] = if index % 10 == 0 {
+                (mixed & 0xff) as u8
+            } else {
+                0x5a
+            };
+            key[1..8].copy_from_slice(&[0x5a; 7]);
+            key[8..16].copy_from_slice(&(index as u64).to_be_bytes());
+            keys.push(key);
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        assert!(
+            keys.len() > 2 * Subject::PARTITION_ROWS_PER_WORKER,
+            "the fixture must be wide enough for the out-of-place pass",
+        );
+        assert!(Subject::partition_workers(keys.len()) > 1);
+
+        let rows: Vec<u32> = (0..keys.len() as u32).collect();
+        let mut in_place = rows.clone();
+        let ordered = Subject::partition_archive_rows(&keys, &mut in_place, 0);
+        let (concurrent, permuted) = Subject::partition_archive_rows_parallel(&keys, &rows, 0);
+
+        assert_eq!(ordered.end_depth, concurrent.end_depth);
+        assert_eq!(ordered.fanout, concurrent.fanout);
+        assert_eq!(ordered.initial_slots, concurrent.initial_slots);
+        assert_eq!(
+            ordered.buckets[..ordered.fanout],
+            concurrent.buckets[..concurrent.fanout],
+        );
+        assert_eq!(ordered.ends, concurrent.ends);
+
+        let mut start = 0usize;
+        for &byte in &ordered.buckets[..ordered.fanout] {
+            let end = ordered.ends[byte as usize] as usize;
+            let mut ordered_rows: Vec<u32> = in_place[start..end].to_vec();
+            let mut concurrent_rows: Vec<u32> = permuted[start..end].to_vec();
+            ordered_rows.sort_unstable();
+            concurrent_rows.sort_unstable();
+            assert_eq!(ordered_rows, concurrent_rows, "bucket {byte:#04x}");
+            start = end;
+        }
+        assert_eq!(start, keys.len());
     }
 
     fn key(byte: u8) -> [u8; 16] {

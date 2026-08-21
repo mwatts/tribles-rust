@@ -2,39 +2,54 @@
 
 ## Collection materialization
 
-Measured on `bultmann.pile` (404 commits, 26.26 M facts, 1.98 GB) after the
-partitioned merge landed. A warm `Collection::snapshot` is ~4.38 s, of which:
+Measured on a 404-commit, 26.26 M-fact collection (1.98 GB pile) after the
+whole-archive decode landed. A warm `Collection::snapshot` is ~2.8 s, of which:
 
-- 78 ms — record discovery, 404 signature verifications, canonical validation
-  of 1.86 GB of committed archives, merge/resolution/physical-cover planning.
-  The whole collection calculus is 1.2% of a snapshot; optimizing it is
+- ~80 ms — record discovery, 404 signature checks, canonical validation of
+  1.86 GB of committed archives, merge/resolution/physical-cover planning.
+  The whole collection calculus is under 3% of a snapshot; optimizing it is
   optimizing noise.
-- ~0.15 s — the partitioned canonical union.
-- ~2.3 s — per-chunk PATCH partition build, 16 chunks in parallel.
-- ~1.75 s — union-reduce of the 16 chunk `TribleSet`s.
+- ~0.3 s — the partitioned canonical union.
+- ~85 ms — validating and hashing the 26.26 M rows of the merged archive, one
+  contiguous run per worker.
+- ~2.1 s — six PATCH orders built bottom-up over the whole archive at once.
+
+The union-reduce that used to follow is gone: the decode no longer chops the
+archive into per-worker chunks, so there are no per-chunk sets to merge back
+together. What is left is one build per order.
 
 Ideas, in descending measured leverage:
 
-- **The six index orders do not cost the same.** Per 1.64 M-row chunk: `eav`
+- **The six index orders still do not cost the same.** Per 1.64 M rows: `eav`
   80 ms, `eva` 130 ms, `aev` 400 ms, `ave` 450 ms, `vea` 470 ms, `vae` 500 ms.
   EAV is a bulk load of an already-sorted stream; the value-first orders resort
-  and build a bushy trie. Four orders are 87% of the build. A `TribleSet` whose
-  non-EAV orders are built on first use would let a consumer pay for the
-  orders its queries actually open. This is a public-API change — the six
-  `PATCH` fields are `pub` — so it wants a deliberate decision, not a
-  drive-by.
+  and build a bushy trie, and they are 87% of the build.
+  - Building them lazily is a **public-API change** — the six `PATCH` fields
+    are `pub` — and it is a worse trade than it looks. `union`, `intersect` and
+    `difference` are defined index-by-index, so a lazy order would have to be
+    re-derived rather than combined after every set operation, and the first
+    query to open a cold order would pay a whole-archive build **serially, in
+    the middle of a join**, replacing a uniform cost model with a
+    data-dependent one. The engine's worst-case-optimal join is built on being
+    able to open any order for free. This wants a deliberate decision about
+    what a `TribleSet` promises, not a drive-by.
+  - Cheaper on work, and API-neutral: the resort currently re-reads a scattered
+    64-byte row at every trie level. Extracting the first eight order-tree
+    bytes into a compact `(prefix, row)` array once, sorting that, and touching
+    the full key only where prefixes tie would make every level after the first
+    a sequential scan. Untried.
 - **Fuse the merge with the decode.** The partitioned merge already produces
-  exactly the shape `parallel_unarchive` wants: sorted, canonical,
-  worker-sized runs. Today they are concatenated into one 1.68 GB buffer that
-  the decoder immediately re-chunks. Handing each run to
-  `TribleSet::from_archive_partition` directly removes one full copy, one peak
-  1.68 GB allocation, and one revalidation pass.
-- **Partition the decode by key range per order, not by row range.** Chunks
-  are currently EAV-contiguous, which makes the EAV union nearly free and the
-  four value-first unions expensive — that asymmetry is the ~1.75 s reduce.
-  Per-order key-range partitions would give disjoint sub-tries whose union is a
-  stitch rather than a merge, but it needs a PATCH-level "concatenate disjoint
-  sorted sub-tries" primitive.
+  exactly the shape the decoder wants: sorted, canonical, worker-sized runs.
+  They are still concatenated into one 1.68 GB buffer that the decoder then
+  re-scans. Handing the runs over directly removes one full copy, one peak
+  1.68 GB allocation, and the validation half of the scan — worth roughly 0.2 s
+  of 2.8 s now, against a wider trust boundary (bytes admitted because *we*
+  produced them).
+- **Partitioning the decode by key range is done.** It landed as the shape it
+  always wanted: not a new "concatenate disjoint sorted sub-tries" primitive,
+  but the trie's own branch node. The MSD partition already splits rows into
+  disjoint key ranges per order; making the top pass count-and-scatter across
+  workers rather than swap in place is what let the whole archive be one build.
 
 Not an idea, a finding: **no `MERGE` or `DERIVE` record can make a cold read
 faster under the current admission rule.** Unsigned equations are admitted by

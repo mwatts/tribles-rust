@@ -196,11 +196,27 @@ fn serial_unarchive(
     Ok(tribles)
 }
 
-#[cfg(any(test, feature = "parallel"))]
+#[cfg(test)]
 fn validate_and_hash_archive_slice(slice: &[[u8; 64]]) -> Result<Vec<u128>, UnarchiveError> {
-    let mut hashes = Vec::with_capacity(slice.len());
+    let mut hashes = vec![0u128; slice.len()];
+    validate_and_hash_archive_into(slice, &mut hashes)?;
+    Ok(hashes)
+}
+
+/// Validate one run of archive rows and write their key hashes in place.
+///
+/// Writing into a caller-owned slice is what lets the parallel decoder hash
+/// the whole archive into one contiguous vector: each worker fills its own
+/// disjoint window, and the trie build that follows indexes rows by their
+/// absolute archive ordinal rather than by a per-chunk one.
+#[cfg(any(test, feature = "parallel"))]
+fn validate_and_hash_archive_into(
+    slice: &[[u8; 64]],
+    hashes: &mut [u128],
+) -> Result<(), UnarchiveError> {
+    debug_assert_eq!(slice.len(), hashes.len());
     let mut previous: Option<&[u8; 64]> = None;
-    for row in slice {
+    for (row, hash) in slice.iter().zip(hashes.iter_mut()) {
         if Trible::as_transmute_force_raw(row).is_none() {
             return Err(UnarchiveError::BadTrible);
         }
@@ -213,19 +229,28 @@ fn validate_and_hash_archive_slice(slice: &[[u8; 64]]) -> Result<Vec<u128>, Unar
             }
         }
         previous = Some(row);
-        hashes.push(hash_key(&row[..]));
+        *hash = hash_key(&row[..]);
     }
-    Ok(hashes)
+    Ok(())
 }
 
+/// Whether every row of an archive this long has an ordinal the partition
+/// metadata can carry.
 #[cfg(any(test, feature = "parallel"))]
 #[inline]
-fn bottom_up_chunk_rows_fit(chunk_size: usize) -> bool {
-    u32::try_from(chunk_size).is_ok()
+fn archive_rows_fit_ordinals(rows: usize) -> bool {
+    u32::try_from(rows).is_ok()
 }
 
-/// Parallel unarchive: chunk the blob, verify boundary ordering, validate and
-/// build aligned chunks bottom-up, then reduce through `TribleSet::union`.
+/// Parallel unarchive: validate and hash the blob in worker-sized runs, then
+/// build each of the six indexes over the whole archive at once.
+///
+/// The six PATCH builds partition their own rows across workers, so the
+/// decoder no longer chops the archive into per-worker chunks and unions the
+/// resulting sets back together. That union was the price of the chunking, not
+/// of the decode: the four value-first orders interleave across any row range,
+/// so every chunk boundary put the same keys in the same subtries and left the
+/// reduce to walk them again. One build per order visits each key once.
 #[cfg(feature = "parallel")]
 fn parallel_unarchive(
     slice: &[[u8; 64]],
@@ -233,18 +258,62 @@ fn parallel_unarchive(
 ) -> Result<TribleSet, UnarchiveError> {
     use rayon::prelude::*;
 
+    // Validation is a linear scan, so give each worker one contiguous run.
     let n_threads = rayon::current_num_threads().max(1);
-    // Aim for ~1 chunk per worker so each thread gets a clean slice
-    // to crunch with maximal cache locality. Round up.
-    let chunk_size = slice.len().div_ceil(n_threads).max(1);
-    let chunks: Vec<&[[u8; 64]]> = slice.chunks(chunk_size).collect();
-    let use_bottom_up = owner.is_some() && bottom_up_chunk_rows_fit(chunk_size);
+    let scan_size = slice.len().div_ceil(n_threads).max(1);
+    // Row ordinals now index the whole archive, so the `u32` bound is on the
+    // archive rather than on a chunk of it.
+    let bottom_up = owner.is_some() && archive_rows_fit_ordinals(slice.len());
 
-    // Phase 1: validate boundary ordering (sequential, but it's a
-    // tiny O(num_chunks) scan over already-cache-hot slice ends).
-    for w in chunks.windows(2) {
-        let last_a = w[0].last().expect("non-empty chunk");
-        let first_b = w[1].first().expect("non-empty chunk");
+    // Phase 1: the seams between runs, checked before any worker looks
+    // inside one. This is a tiny O(runs) scan over already cache-hot run
+    // ends, and it keeps a straddling duplicate or inversion reported as
+    // such rather than as whatever a worker happens to meet first.
+    let runs: Vec<&[[u8; 64]]> = slice.chunks(scan_size).collect();
+    check_archive_run_boundaries(&runs)?;
+
+    if !bottom_up {
+        // Unaligned input keeps the heap-Leaf worker; an archive too long to
+        // address with u32 ordinals keeps the established online worker. Both
+        // are per-run and still reduce through `TribleSet::union`.
+        let sets: Result<Vec<TribleSet>, UnarchiveError> = runs
+            .par_iter()
+            .map(|run| serial_unarchive(run, owner.as_ref()))
+            .collect();
+        return Ok(sets?.into_par_iter().reduce(TribleSet::new, |a, b| a + b));
+    }
+
+    let owner = owner
+        .as_ref()
+        .expect("bottom-up eligibility requires an archive owner");
+
+    // Phase 2: validate and hash every row, one contiguous run per worker.
+    // Each run proves its own interior ordering and phase 1 proved the seams;
+    // ordering is transitive, so the pair is exactly the whole-archive check
+    // the serial decoder performs.
+    let mut hashes = vec![0u128; slice.len()];
+    slice
+        .par_chunks(scan_size)
+        .zip(hashes.par_chunks_mut(scan_size))
+        .try_for_each(|(rows, out)| validate_and_hash_archive_into(rows, out))?;
+
+    // Phase 3: one bottom-up build per index order, over the whole archive.
+    // SAFETY: owner presence proves 16-byte base alignment (and 64-byte
+    // strides preserve it); phase 2 proves canonical, distinct tribles;
+    // `hashes` corresponds index-for-index to `slice`; and `bottom_up` proves
+    // every row ordinal fits u32.
+    Ok(unsafe { TribleSet::from_archive_partition(slice, &hashes, owner) })
+}
+
+/// Reject a duplicate or an inversion straddling two validated runs.
+///
+/// A per-run scan proves each run internally ordered; this proves the seams,
+/// and ordering is transitive, so the pair is exactly the whole-archive check.
+#[cfg(feature = "parallel")]
+fn check_archive_run_boundaries(runs: &[&[[u8; 64]]]) -> Result<(), UnarchiveError> {
+    for w in runs.windows(2) {
+        let last_a = w[0].last().expect("non-empty run");
+        let first_b = w[1].first().expect("non-empty run");
         if last_a == first_b {
             return Err(UnarchiveError::BadCanonicalizationRedundancy);
         }
@@ -252,36 +321,7 @@ fn parallel_unarchive(
             return Err(UnarchiveError::BadCanonicalizationOrdering);
         }
     }
-
-    // Phase 2: each aligned, u32-addressable chunk is validated, hashed once
-    // per row, and partition-built into all six indexes. Unaligned input keeps
-    // the heap-Leaf worker; an impractically large chunk keeps the established
-    // online archive worker.
-    let chunk_sets: Result<Vec<TribleSet>, UnarchiveError> = chunks
-        .par_iter()
-        .map(|chunk| {
-            if use_bottom_up {
-                let owner = owner
-                    .as_ref()
-                    .expect("bottom-up eligibility requires an archive owner");
-                let hashes = validate_and_hash_archive_slice(chunk)?;
-                // SAFETY: owner presence proves 16-byte base alignment (and
-                // 64-byte strides preserve it); validation proves canonical,
-                // distinct tribles; hashes correspond index-for-index to this
-                // chunk; and `use_bottom_up` proves every row ordinal fits u32.
-                Ok(unsafe { TribleSet::from_archive_partition(chunk, &hashes, owner) })
-            } else {
-                serial_unarchive(chunk, owner.as_ref())
-            }
-        })
-        .collect();
-
-    // Phase 3: reduce the per-chunk sets via TribleSet::union (the
-    // 6-way index fan-out kicks in for any chunk pair above its
-    // own threshold).
-    Ok(chunk_sets?
-        .into_par_iter()
-        .reduce(TribleSet::new, |a, b| a + b))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -373,6 +413,69 @@ mod tests {
         assert_index_parity::<AVEOrder>(&candidate.ave, &baseline.ave, len);
         assert_index_parity::<VEAOrder>(&candidate.vea, &baseline.vea, len);
         assert_index_parity::<VAEOrder>(&candidate.vae, &baseline.vae, len);
+    }
+
+    /// An archive skewed the way a real collection is: a handful of
+    /// attributes with one carrying most rows, a heavy-tailed entity
+    /// distribution, and values that mostly share a long prefix. That shape
+    /// is what drives the value-first orders into one enormous, deeply-shared
+    /// subtrie — the node the decoder now splits across workers.
+    fn skewed_rows(len: usize) -> Vec<[u8; 64]> {
+        let mut rows = Vec::with_capacity(len);
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        for index in 0..len {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut mixed = state;
+            mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            mixed ^= mixed >> 31;
+
+            let mut row = [0u8; 64];
+            // Three attributes, one of them carrying eight rows in ten.
+            let attribute: u64 = match index % 10 {
+                0 => 2,
+                1 => 3,
+                _ => 1,
+            };
+            row[24..32].copy_from_slice(&attribute.to_be_bytes());
+            // A quarter of every fact hangs off one entity.
+            let entity: u64 = if index % 4 == 0 {
+                1
+            } else {
+                index as u64 / 3 + 2
+            };
+            row[8..16].copy_from_slice(&entity.to_be_bytes());
+            if index % 3 == 0 {
+                for chunk in row[32..].chunks_exact_mut(8) {
+                    mixed = mixed.wrapping_mul(0x2545_f491_4f6c_dd1d).rotate_left(17);
+                    chunk.copy_from_slice(&mixed.to_be_bytes());
+                }
+            } else {
+                // Values that agree for 24 bytes and diverge in the last 8,
+                // so the representative prefix has to be walked out.
+                row[32..56].copy_from_slice(&[0x5a; 24]);
+                row[56..64].copy_from_slice(&(index as u64).to_be_bytes());
+            }
+            rows.push(row);
+        }
+        rows.sort_unstable();
+        rows.dedup();
+        rows
+    }
+
+    #[test]
+    fn bottom_up_matches_serial_on_a_skewed_archive_above_the_parallel_split() {
+        let rows = skewed_rows(48_000);
+        let len = rows.len();
+        #[cfg(feature = "parallel")]
+        assert!(
+            PATCH::<64, EAVOrder>::partition_workers(len) > 1,
+            "the fixture must reach the concurrent partition pass",
+        );
+        let blob = blob_from_rows(rows);
+        let baseline = serial_for_test(blob.clone()).unwrap();
+        let candidate = bottom_up_for_test(blob).unwrap();
+        assert_all_six_parity(&candidate, &baseline, len);
     }
 
     #[test]
@@ -617,10 +720,10 @@ mod tests {
     }
 
     #[test]
-    fn bottom_up_chunk_row_limit_is_exact() {
-        assert!(bottom_up_chunk_rows_fit(u32::MAX as usize));
+    fn archive_row_ordinal_limit_is_exact() {
+        assert!(archive_rows_fit_ordinals(u32::MAX as usize));
         #[cfg(target_pointer_width = "64")]
-        assert!(!bottom_up_chunk_rows_fit(u32::MAX as usize + 1));
+        assert!(!archive_rows_fit_ordinals(u32::MAX as usize + 1));
     }
 
     #[cfg(feature = "parallel")]
