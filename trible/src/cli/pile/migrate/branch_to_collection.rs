@@ -1,10 +1,11 @@
 //! Direct legacy `Repository` branch to native collection migration.
 //!
-//! Validation and publication are separate phases. The first phase reads one
-//! immutable pile snapshot, validates the selected branch head and every
-//! reachable commit, and prepares every unique native commit entirely in
-//! memory. Only after that succeeds may the second phase append dependencies
-//! and final `COMMIT` records to the same pile.
+//! Validation and publication are separate phases. The first phase freezes the
+//! selected pin head, opens one later append-only blob snapshot which contains
+//! everything that head can name, validates every reachable commit, and
+//! prepares every unique native commit entirely in memory. Only after that
+//! succeeds may the second phase append dependencies and final `COMMIT`
+//! records to the same pile.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
@@ -12,12 +13,11 @@ use std::path::PathBuf;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace_core::attribute::Attribute;
-use triblespace_core::blob::encodings::longstring::LongString;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::collection::records::CollectionName;
 use triblespace_core::collection::simplearchive_union::{self, PreparedCollectionCommit};
-use triblespace_core::collection::{CollectionCommit, CollectionRecord, CollectionStore};
+use triblespace_core::collection::CollectionCommit;
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, InlineEncoding};
@@ -29,7 +29,6 @@ use triblespace_core::trible::{Fragment, TribleSet};
 use super::super::signing::load_signing_key;
 
 type ArchiveHandle = Inline<Handle<SimpleArchive>>;
-type NameHandle = Inline<Handle<LongString>>;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ElementKey {
@@ -66,8 +65,6 @@ struct MigrationReport {
     authored: usize,
     contentless_merges: usize,
     unique_targets: usize,
-    new_targets: usize,
-    existing_targets: usize,
 }
 
 pub(super) fn run(
@@ -84,22 +81,18 @@ pub(super) fn run(
 
     let mut pile = super::super::open_refreshed(&pile_path)?;
     let result = migrate(&mut pile, &branch, &name, team, &signer);
-    let result = match result {
-        Ok((report, mappings)) => {
-            print_report(
-                &pile_path,
-                &name,
-                team,
-                signer.verifying_key(),
-                report,
-                &mappings,
-            );
-            Ok(())
-        }
-        Err(error) => Err(error),
-    };
     let close = pile.close().map_err(|error| anyhow!("close pile: {error}"));
-    result.and(close)
+    let (report, mappings) = result?;
+    close?;
+    print_report(
+        &pile_path,
+        &name,
+        team,
+        signer.verifying_key(),
+        report,
+        &mappings,
+    );
+    Ok(())
 }
 
 fn migrate(
@@ -109,15 +102,17 @@ fn migrate(
     team: VerifyingKey,
     signer: &SigningKey,
 ) -> Result<(MigrationReport, Vec<(CommitHandle, CollectionCommit)>)> {
-    // One immutable source boundary. Native appends remap `pile`, but this
-    // reader continues to name exactly the legacy bytes validated here.
+    // Freeze the mutable names first, then take one append-only blob view.
+    // A concurrent append may enter the later reader, but cannot change the
+    // selected head; every handle reachable from that frozen head predates it.
+    // Native appends later remap `pile`, while this reader keeps the validated
+    // legacy bytes alive.
     let pins = pile
         .snapshot_pin_heads()
         .context("snapshot active legacy branch pins")?;
     let reader = pile.reader().context("snapshot legacy pile blobs")?;
-    let (branch, branch_meta_handle, branch_meta) =
-        resolve_branch(&reader, &pins, branch_reference)?;
-    let head = validate_branch_head(&reader, branch, branch_meta_handle, &branch_meta)?;
+    let (branch, branch_meta) = resolve_branch(&reader, &pins, branch_reference)?;
+    let head = validate_branch_head(&reader, branch, &branch_meta)?;
     let commits = match head {
         Some(head) => validate_reachable_dag(&reader, head)?,
         None => Vec::new(),
@@ -145,7 +140,6 @@ fn migrate(
         groups.entry(key).or_default().push(item.source);
         blobs.entry(key).or_insert((item.data, item.metadata));
     }
-
     // `prepare_commit` performs no I/O. Preparing the complete unique set here
     // preserves the failure-atomic contract: no descriptor, dependency or
     // collection record is written until every reachable source node passes.
@@ -158,34 +152,15 @@ fn migrate(
         })
         .collect::<Result<_>>()?;
 
-    let existing: BTreeSet<Id> = pile
-        .records()
-        .context("enumerate existing native collection records")?
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .filter_map(|record| match record {
-            CollectionRecord::Commit(commit) => Some(commit.id()),
-            _ => None,
-        })
-        .collect();
-
     let mut commits_by_key = BTreeMap::new();
-    let mut new_targets = 0usize;
-    let mut existing_targets = 0usize;
     for element in prepared {
         let staged = element
             .prepared
             .stage(pile, signer)
             .map_err(|error| anyhow!("stage native collection commit: {error}"))?;
-        let was_present = existing.contains(&staged.commit().id());
         let commit = staged
             .finalize()
             .map_err(|error| anyhow!("finalize native collection commit: {error}"))?;
-        if was_present {
-            existing_targets += 1;
-        } else {
-            new_targets += 1;
-        }
         commits_by_key.insert(element.key, commit);
     }
 
@@ -206,8 +181,6 @@ fn migrate(
         authored: mappings.len(),
         contentless_merges,
         unique_targets: commits_by_key.len(),
-        new_targets,
-        existing_targets,
     };
     Ok((report, mappings))
 }
@@ -237,32 +210,24 @@ fn resolve_branch(
     reader: &PileReader,
     pins: &repo::PinSnapshot,
     reference: &str,
-) -> Result<(Id, ArchiveHandle, TribleSet)> {
+) -> Result<(Id, TribleSet)> {
     if let Ok(id) = parse_branch_id(reference) {
         let raw: [u8; 16] = id.into();
-        let handle = pins
-            .get(&raw)
-            .copied()
-            .ok_or_else(|| anyhow!("no active legacy branch with id {id:X}"))?;
-        let facts = read_archive(reader, handle, "legacy branch metadata")?.1;
-        repo::branch::branch_entity(&facts, id)
-            .map_err(|_| anyhow!("pin {id:X} does not contain one branch metadata subject"))?;
-        return Ok((id, handle, facts));
+        if let Some(handle) = pins.get(&raw).copied() {
+            let facts = read_archive(reader, handle, "legacy branch metadata")?.1;
+            repo::branch::branch_entity(&facts, id)
+                .map_err(|_| anyhow!("pin {id:X} does not contain one branch metadata subject"))?;
+            return Ok((id, facts));
+        }
     }
 
-    let wanted: NameHandle = reference.to_owned().to_blob().get_handle();
     let mut matches = Vec::new();
     for raw in pins.iter_ordered() {
         let id = Id::new(*raw).expect("pin snapshot contains a nil id");
         let handle = *pins.get(raw).expect("iterated pin has a value");
-        let Ok((_, facts)) = read_archive(reader, handle, "legacy branch metadata") else {
-            continue;
-        };
-        let Ok(subject) = repo::branch::branch_entity(&facts, id) else {
-            continue;
-        };
-        if one_value(&facts, subject, &metadata::name, "branch name")? == Some(wanted) {
-            matches.push((id, handle, facts));
+        let (_, facts) = read_archive(reader, handle, "legacy branch metadata")?;
+        if super::load_branch_name(reader, &facts, id)?.as_deref() == Some(reference) {
+            matches.push((id, facts));
         }
     }
     match matches.len() {
@@ -281,32 +246,10 @@ fn parse_branch_id(text: &str) -> Result<Id> {
 fn validate_branch_head(
     reader: &PileReader,
     branch: Id,
-    _meta_handle: ArchiveHandle,
     facts: &TribleSet,
 ) -> Result<Option<CommitHandle>> {
     let subject = repo::branch::branch_entity(facts, branch)
         .map_err(|_| anyhow!("legacy branch {branch:X} has no unique metadata subject"))?;
-    one_value(facts, subject, &repo::branch, "branch id")?;
-    one_value(facts, subject, &metadata::name, "branch name")?;
-    one_value(facts, subject, &metadata::updated_at, "updated_at")?;
-    one_value(
-        facts,
-        subject,
-        &triblespace_core::attestation::signed_by,
-        "signed_by",
-    )?;
-    one_value(
-        facts,
-        subject,
-        &triblespace_core::attestation::signature_r,
-        "signature_r",
-    )?;
-    one_value(
-        facts,
-        subject,
-        &triblespace_core::attestation::signature_s,
-        "signature_s",
-    )?;
     let head = one_value(facts, subject, &repo::head, "branch head")?;
     if let Some(head) = head {
         let (blob, _) = read_archive(reader, head, "legacy branch head commit")?;
@@ -395,27 +338,6 @@ fn load_commit(reader: &PileReader, handle: CommitHandle) -> Result<LoadedCommit
     let subject = *subjects.iter().next().expect("one wrapper subject");
     let content = one_value(&facts, subject, &repo::content, "content")?;
     let metadata = one_value(&facts, subject, &metadata::archive, "metadata archive")?;
-    one_value(&facts, subject, &repo::message, "message")?;
-    one_value(&facts, subject, &repo::short_message, "short message")?;
-    one_value(&facts, subject, &metadata::created_at, "created_at")?;
-    one_value(
-        &facts,
-        subject,
-        &triblespace_core::attestation::signed_by,
-        "signed_by",
-    )?;
-    one_value(
-        &facts,
-        subject,
-        &triblespace_core::attestation::signature_r,
-        "signature_r",
-    )?;
-    one_value(
-        &facts,
-        subject,
-        &triblespace_core::attestation::signature_s,
-        "signature_s",
-    )?;
 
     let mut parents: Vec<CommitHandle> = facts
         .iter()
@@ -443,30 +365,17 @@ fn validate_authored(
     empty_metadata: &Blob<SimpleArchive>,
 ) -> Result<ValidatedAuthored> {
     let content_handle = commit.content.expect("authored commit has content");
-    let (content, _) = read_archive(reader, content_handle, "legacy commit content")?;
+    let content = read_blob(reader, content_handle, "legacy commit content")?;
     repo::commit::verify(content.clone(), commit.facts.clone()).map_err(|_| {
         anyhow!(
             "legacy authored commit {} has an invalid content signature",
             handle_hex(commit.handle)
         )
     })?;
-    simplearchive_union::validate_element(&content).with_context(|| {
-        format!(
-            "legacy authored commit {} content is not canonical",
-            handle_hex(commit.handle)
-        )
-    })?;
-
     let metadata = match commit.metadata {
-        Some(handle) => read_archive(reader, handle, "legacy commit metadata archive")?.0,
+        Some(handle) => read_blob(reader, handle, "legacy commit metadata archive")?,
         None => empty_metadata.clone(),
     };
-    simplearchive_union::validate_element(&metadata).with_context(|| {
-        format!(
-            "legacy authored commit {} metadata is not canonical",
-            handle_hex(commit.handle)
-        )
-    })?;
 
     Ok(ValidatedAuthored {
         source: commit.handle,
@@ -514,6 +423,16 @@ fn read_archive(
         .try_from_blob()
         .with_context(|| format!("decode canonical {what} {}", handle_hex(handle)))?;
     Ok((blob, facts))
+}
+
+fn read_blob(
+    reader: &PileReader,
+    handle: ArchiveHandle,
+    what: &str,
+) -> Result<Blob<SimpleArchive>> {
+    reader
+        .get(handle)
+        .with_context(|| format!("read {what} {}", handle_hex(handle)))
 }
 
 fn one_value<V: InlineEncoding>(
@@ -578,12 +497,10 @@ fn print_report(
         report.reachable, report.authored, report.contentless_merges
     );
     println!(
-        "{} source authored node(s) -> {} unique native COMMIT(s) ({} many-to-one collapse(s)); {} new, {} already present",
+        "{} source authored node(s) -> {} unique native COMMIT(s) ({} many-to-one collapse(s)); replay is idempotent",
         report.authored,
         report.unique_targets,
         report.authored.saturating_sub(report.unique_targets),
-        report.new_targets,
-        report.existing_targets,
     );
 }
 
@@ -594,6 +511,8 @@ mod tests {
 
     use ed25519_dalek::Signer;
     use tempfile::NamedTempFile;
+    use triblespace_core::blob::encodings::longstring::LongString;
+    use triblespace_core::collection::{Collection, CollectionStore};
     use triblespace_core::id::ExclusiveId;
     use triblespace_core::repo::{BlobStorePut, PinStore, Repository};
 
@@ -668,15 +587,30 @@ mod tests {
         let mut pile = super::super::super::open_refreshed(&path)?;
         let pins = pile.snapshot_pin_heads()?;
         let reader = pile.reader()?;
-        let (_, _, branch_meta) = resolve_branch(&reader, &pins, "legacy")?;
-        let head = validate_branch_head(
-            &reader,
-            branch,
-            *pins.get(&<[u8; 16]>::from(branch)).unwrap(),
-            &branch_meta,
-        )?
-        .unwrap();
+        let (_, branch_meta) = resolve_branch(&reader, &pins, "legacy")?;
+        let head = validate_branch_head(&reader, branch, &branch_meta)?.unwrap();
         let source = validate_reachable_dag(&reader, head)?;
+        let empty_metadata = TribleSet::new().to_blob().get_handle();
+        let expected_by_source: BTreeMap<_, _> = source
+            .iter()
+            .filter_map(|commit| {
+                commit.content.map(|content| {
+                    (
+                        commit.handle,
+                        (content, commit.metadata.unwrap_or(empty_metadata)),
+                    )
+                })
+            })
+            .collect();
+        let mut expected_union = TribleSet::new();
+        for commit in &source {
+            if let Some(content) = commit.content {
+                let facts: TribleSet = reader
+                    .get(content)
+                    .map_err(|error| anyhow!("read expected legacy content: {error}"))?;
+                expected_union += facts;
+            }
+        }
         let expected_metadata = source
             .iter()
             .find_map(|commit| commit.metadata)
@@ -689,7 +623,6 @@ mod tests {
         assert_eq!(first.authored, 4);
         assert_eq!(first.contentless_merges, 1);
         assert_eq!(first.unique_targets, 3);
-        assert_eq!((first.new_targets, first.existing_targets), (3, 0));
         assert_eq!(first_map.len(), 4);
         assert_eq!(
             first_map
@@ -702,13 +635,22 @@ mod tests {
         assert!(first_map
             .iter()
             .all(|(_, target)| target.metadata() == expected_metadata));
+        for (source, target) in &first_map {
+            let (expected_data, expected_metadata) = expected_by_source[source];
+            assert_eq!(target.data().raw, expected_data.raw);
+            assert_eq!(target.metadata(), expected_metadata);
+        }
+        let materialized = Collection::new(&mut pile, &name, team, signer.clone())
+            .materialize()
+            .map_err(|error| anyhow!("materialize migrated collection: {error}"))?;
+        assert_eq!(materialized, expected_union);
 
         pile.flush()?;
         let first_len = fs::metadata(&path)?.len();
         let (second, second_map) =
             migrate(&mut pile, &format!("{branch:X}"), &name, team, &signer)?;
         pile.flush()?;
-        assert_eq!((second.new_targets, second.existing_targets), (0, 3));
+        assert_eq!(second, first);
         assert_eq!(
             first_map
                 .iter()
@@ -721,6 +663,102 @@ mod tests {
         );
         assert_eq!(fs::metadata(&path)?.len(), first_len);
         assert_eq!(pile.records()?.collect::<Result<Vec<_>, _>>()?.len(), 3);
+        pile.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn authored_empty_and_absent_metadata_survive_while_merge_is_skipped() -> Result<()> {
+        let file = NamedTempFile::new()?;
+        let mut pile = Pile::open(file.path())?;
+        let author = key(8);
+
+        let empty: Blob<SimpleArchive> = TribleSet::new().to_blob();
+        pile.put::<SimpleArchive, _>(empty.clone())?;
+        let empty_wrapper =
+            repo::commit::commit_metadata(&author, [], None, Some(empty.clone()), None);
+        let empty_commit = pile.put::<SimpleArchive, _>(empty_wrapper)?;
+
+        let data: Blob<SimpleArchive> = fact(9).to_blob();
+        pile.put::<SimpleArchive, _>(data.clone())?;
+        let data_wrapper =
+            repo::commit::commit_metadata(&author, [], None, Some(data.clone()), None);
+        let data_commit = pile.put::<SimpleArchive, _>(data_wrapper)?;
+
+        let merge_wrapper =
+            repo::commit::commit_metadata(&author, [empty_commit, data_commit], None, None, None);
+        let merge_blob: Blob<SimpleArchive> = merge_wrapper.to_blob();
+        pile.put::<SimpleArchive, _>(merge_blob.clone())?;
+
+        let branch = Id::new([0xD8; 16]).unwrap();
+        let branch_name = pile.put::<LongString, _>("empty-and-merge".to_owned())?;
+        let branch_meta =
+            repo::branch::branch_metadata(&author, branch, branch_name, Some(merge_blob));
+        let branch_meta = pile.put::<SimpleArchive, _>(branch_meta)?;
+        assert!(matches!(
+            pile.update(branch, None, Some(branch_meta))?,
+            repo::PushResult::Success()
+        ));
+
+        let collection_name = CollectionName::new("empty-preserved").unwrap();
+        let team = key(10).verifying_key();
+        let signer = key(11);
+        let (report, mappings) = migrate(
+            &mut pile,
+            "empty-and-merge",
+            &collection_name,
+            team,
+            &signer,
+        )?;
+
+        assert_eq!(report.reachable, 3);
+        assert_eq!(report.authored, 2);
+        assert_eq!(report.contentless_merges, 1);
+        assert_eq!(mappings.len(), 2);
+        let empty_target = mappings
+            .iter()
+            .find(|(source, _)| *source == empty_commit)
+            .map(|(_, target)| *target)
+            .expect("authored empty commit has a mapping");
+        assert_eq!(empty_target.data().raw, empty.get_handle().raw);
+        assert_eq!(empty_target.metadata(), empty.get_handle());
+        let data_target = mappings
+            .iter()
+            .find(|(source, _)| *source == data_commit)
+            .map(|(_, target)| *target)
+            .expect("authored data commit has a mapping");
+        assert_eq!(data_target.data().raw, data.get_handle().raw);
+        assert_eq!(data_target.metadata(), empty.get_handle());
+
+        let materialized = Collection::new(&mut pile, &collection_name, team, signer)
+            .materialize()
+            .map_err(|error| anyhow!("materialize authored-empty fixture: {error}"))?;
+        assert_eq!(materialized, fact(9));
+        pile.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_hex_shaped_short_name_falls_back_from_absent_id() -> Result<()> {
+        let file = NamedTempFile::new()?;
+        let mut pile = Pile::open(file.path())?;
+        let branch = Id::new([0xE9; 16]).unwrap();
+        let hex_name = "ABABABABABABABABABABABABABABABAB";
+        let legacy_meta = triblespace_core::macros::entity! {
+            repo::branch: branch,
+            super::super::legacy_branch_metadata::legacy_name: hex_name,
+        }
+        .into_facts();
+        let legacy_meta = pile.put::<SimpleArchive, _>(legacy_meta)?;
+        assert!(matches!(
+            pile.update(branch, None, Some(legacy_meta))?,
+            repo::PushResult::Success()
+        ));
+
+        let pins = pile.snapshot_pin_heads()?;
+        let reader = pile.reader()?;
+        let (resolved, _) = resolve_branch(&reader, &pins, hex_name)?;
+        assert_eq!(resolved, branch);
         pile.close()?;
         Ok(())
     }
@@ -757,6 +795,12 @@ mod tests {
         let file = NamedTempFile::new()?;
         let mut pile = Pile::open(file.path())?;
         let author = key(5);
+        let valid_content: Blob<SimpleArchive> = fact(4).to_blob();
+        pile.put::<SimpleArchive, _>(valid_content.clone())?;
+        let valid_wrapper =
+            repo::commit::commit_metadata(&author, [], None, Some(valid_content), None);
+        let valid_parent = pile.put::<SimpleArchive, _>(valid_wrapper)?;
+
         let content: Blob<SimpleArchive> = fact(5).to_blob();
         let content_handle = pile.put(content.clone())?;
         let wrong_signature = author.sign(b"not the content archive");
@@ -764,6 +808,7 @@ mod tests {
         let wrapper = triblespace_core::macros::entity! {
             ExclusiveId::force_ref(&subject) @
                 repo::content: content_handle,
+                repo::parent: valid_parent,
                 triblespace_core::attestation::signed_by: author.verifying_key(),
                 triblespace_core::attestation::signature_r: wrong_signature,
                 triblespace_core::attestation::signature_s: wrong_signature,

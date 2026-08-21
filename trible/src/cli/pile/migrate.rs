@@ -49,9 +49,9 @@ pub enum Command {
     },
     /// Re-sign one verified legacy Repository branch as native collection commits.
     ///
-    /// This is deliberately a same-pile migration: source blobs are validated
-    /// through one immutable snapshot, then native records are appended to that
-    /// pile only after the complete reachable commit DAG has passed validation.
+    /// This is deliberately a same-pile migration: one frozen pin observation
+    /// selects the head, a later append-only blob snapshot validates everything
+    /// it reaches, and only then are native records appended to that pile.
     BranchToCollection {
         /// Legacy branch to migrate, by exact name or 32-hex-character id.
         #[arg(long)]

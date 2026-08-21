@@ -153,14 +153,18 @@ trible pile migrate data.pile branch-to-collection \
   --signing-key ./writer.key
 ```
 
-The command resolves `--branch` as an exact branch name or a 32-character hex
-branch id. Before its first append, it verifies the branch-head signature and
-the complete reachable commit DAG, including canonical wrapper/content/archive
-bytes, authored content signatures, parent availability, cycle freedom, and
-the current or historical intrinsic identity of contentless canonical merges.
+The command resolves `--branch` as an active 32-character hex branch id, or as
+an exact branch name when no such id is active. Both current LongString names
+and the older inline ShortString names are understood; duplicate names are
+rejected instead of guessed. Before its first append, it freezes the selected
+pin head and validates the complete reachable commit DAG through one later
+append-only blob snapshot, including canonical wrapper/content/archive bytes,
+authored content signatures, parent availability, cycle freedom, and the
+current or historical intrinsic identity of contentless canonical merges.
 Older authored commits may have random wrapper subjects; a unique subject and
-unique single-valued fields are required, but today's intrinsic subject
-derivation is not retroactively imposed on them.
+unique mapped `content` and `metadata::archive` fields are required, but
+today's intrinsic subject derivation is not retroactively imposed on them.
+Discarded wrapper annotations do not become migration preconditions.
 
 Each authored node becomes `COMMIT(collection, repo::content,
 metadata::archive)`, re-signed by the supplied target key. An absent
@@ -172,6 +176,13 @@ map to one native commit. The printed mapping makes that many-to-one collapse
 visible. Re-running with the same collection identity and signing key is
 idempotent: content-addressed dependencies and already-present native records
 are no-ops.
+
+The generic migration validates the two archive roots and their authentication,
+not application-specific meanings of 32-byte values inside their facts. It
+copies nothing because source and target are the same pile: any resident
+attachment closure remains resident and becomes reachable through the native
+commit, while a faculty that requires particular attachments must validate
+that schema before migration.
 
 At the collection-descriptor version documented here, a root identity is fixed
 by its name and team together with the `SimpleArchive` representation and
