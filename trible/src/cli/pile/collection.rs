@@ -874,22 +874,20 @@ fn run_log(path: PathBuf, reference: String, limit: usize, long: bool) -> Result
                 CollectionRecord::Merge(merge) => {
                     let (low, high) = merge.inputs();
                     println!(
-                        "merge   {:X}  low={}  high={}  result={}  signature={}",
+                        "merge   {:X}  low={}  high={}  result={}",
                         merge.id(),
                         short(low.raw),
                         short(high.raw),
                         short(merge.result().raw),
-                        signature_note(merge.verify_strict(), long),
                     );
                 }
                 CollectionRecord::Derive(derive) => {
                     let (input, output) = derive.mapping();
                     println!(
-                        "derive  {:X}  input={}  output={}  signature={}",
+                        "derive  {:X}  input={}  output={}",
                         derive.id(),
                         short(input.raw),
                         short(output.raw),
-                        signature_note(derive.verify_strict(), long),
                     );
                 }
             }
@@ -902,20 +900,6 @@ fn run_log(path: PathBuf, reference: String, limit: usize, long: bool) -> Result
     })();
     let close_res = pile.close().map_err(|e| anyhow!("pile close: {e:?}"));
     res.and(close_res)
-}
-
-/// A merge or derive may be unsigned — the equation stands on its inputs, not
-/// on who asserted it — so "no signature" is a fact about the record, not a
-/// failure to verify one.
-fn signature_note(
-    verified: Result<Option<ed25519_dalek::VerifyingKey>, impl std::fmt::Display>,
-    long: bool,
-) -> String {
-    match verified {
-        Ok(Some(key)) => format!("ok ({})", abbrev(&hex::encode_upper(key.to_bytes()), long)),
-        Ok(None) => "unsigned".to_owned(),
-        Err(e) => format!("INVALID ({e})"),
-    }
 }
 
 /// Every collection a set of records names, without the descriptor lookups.

@@ -83,6 +83,21 @@ a *trusted* attach — bytes checked by content hash alone, admitted because a
 key the reader already treats as ground truth named them — which is a change
 to what "checkable" means, not a change to the code.
 
+**Ruled out for `MERGE`, 2026-08-21.** Signed `MERGE` and `DERIVE` records were
+built and then removed. A signature on a *checkable* claim never makes the claim
+correct — recomputation does — so its only value is permission to skip the check,
+which is worth something exactly when checking is expensive. A `DERIVE` is
+expensive to check. A `MERGE` is not: `succinctarchive_union::join` is
+`SuccinctArchiveBlob::merge`, which parses each input, proves it canonical, merges
+the ordered domains once and k-way merges the sorted runs — no query runtime, no
+Rank9 accelerator, no wavelet. It is cheaper than re-deriving, which is why the
+path exists at all, so nobody would ever skip it and the signature bought nothing.
+A collection is also already named by `(name, team_root_key)`: anything inside it
+came from within the team boundary, so a per-signer signature establishes *which*
+member, not whether to trust — and an equation is found bad by checking it, at
+which point it is already rejected. That is forensics, not defence. `COMMIT` keeps
+its signature, because a commit asserts something no reader can recompute.
+
 ## Potential Removals
 - None at the moment.
 

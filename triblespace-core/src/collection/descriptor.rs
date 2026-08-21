@@ -190,7 +190,7 @@ pub enum TeamRootError {
     /// The chain reached a root that anchors to no team.
     ///
     /// A root with neither a source nor a team has no authority to inherit, so
-    /// nothing signed can ever be checked against it.
+    /// there is no owner to report for anything derived from it.
     NoTeam(CollectionHandle),
 }
 
@@ -226,10 +226,11 @@ impl std::error::Error for TeamRootError {}
 /// Walk [`collection_source`] to the root and read the team it anchors to.
 ///
 /// A root carries its own [`collection_team`]; a derived collection carries
-/// only its source and inherits the team transitively. Checking a signature on
-/// a record about a derived collection therefore means finding that root
-/// first. `lookup` answers with a descriptor's facts, or `None` when the
-/// descriptor is not available locally.
+/// only its source and inherits the team transitively. Asking who owns a
+/// derived collection therefore means walking to that root, which is what
+/// `trible pile collection show` does to report a derivation's team. `lookup`
+/// answers with a descriptor's facts, or `None` when the descriptor is not
+/// available locally.
 ///
 /// **The walk terminates by construction, and no cycle is representable.** A
 /// descriptor is named by the hash of its own bytes, and `collection_source`
