@@ -137,6 +137,48 @@ This collection path coexists with the branch-oriented `Repository` and
 updates; choosing the headless path does not change the semantics of existing
 branches.
 
+### Migrating one legacy branch directly
+
+`trible pile migrate <pile> branch-to-collection` converts one legacy
+`Repository` branch in place. It is deliberately a same-pile operation: the
+source commit blobs must already be in the pile that will receive the native
+records. The collection identity and authority policy are never inferred from
+the branch wrapper. Supply all three explicitly:
+
+```text
+trible pile migrate data.pile branch-to-collection \
+  --branch legacy-events \
+  --collection-name events \
+  --team-root <64-hex-character-ed25519-public-key> \
+  --signing-key ./writer.key
+```
+
+The command resolves `--branch` as an exact branch name or a 32-character hex
+branch id. Before its first append, it verifies the branch-head signature and
+the complete reachable commit DAG, including canonical wrapper/content/archive
+bytes, authored content signatures, parent availability, cycle freedom, and
+the current or historical intrinsic identity of contentless canonical merges.
+Older authored commits may have random wrapper subjects; a unique subject and
+unique single-valued fields are required, but today's intrinsic subject
+derivation is not retroactively imposed on them.
+
+Each authored node becomes `COMMIT(collection, repo::content,
+metadata::archive)`, re-signed by the supplied target key. An absent
+`metadata::archive` becomes the canonical empty archive. Repository wrapper
+parents, timestamps, messages, authors and signatures do not become collection
+metadata; contentless merge nodes are validated ancestry and are skipped. It
+follows that two source nodes with the same exact content and semantic metadata
+map to one native commit. The printed mapping makes that many-to-one collapse
+visible. Re-running with the same collection identity and signing key is
+idempotent: content-addressed dependencies and already-present native records
+are no-ops.
+
+At the collection-descriptor version documented here, a root identity is fixed
+by its name and team together with the `SimpleArchive` representation and
+union recipe. If a later descriptor version adds another identity dimension
+(for example a reach policy), the migration must expose and require it rather
+than choosing a default silently.
+
 ## Attach an exact direct fact view
 
 Read-only consumers that already hold an immutable commit ticket do not need
