@@ -19,5 +19,10 @@ cargo fmt -- --check
 # it, so a bare `cargo test` compiled them EMPTY and printed "test result: ok" with
 # 0 passed / 0 failed. 31 tests, including every collection-transfer test, never ran;
 # the gate was green because it was empty. Found 2026-08-21.
-cargo test --features sim
+#
+# The feature lives on `triblespace-net`, not on the root `triblespace` package, so
+# it must be named package-qualified: a bare `--features sim` resolves against the
+# root package and cargo refuses with "does not contain this feature" before running
+# a single test — a gate that fails to start is no better than one that starts empty.
+cargo test --workspace --features triblespace-net/sim
 ./scripts/build_book.sh
