@@ -5,23 +5,11 @@
 //! rewrite policy; its data and metadata are recursive blob roots which own
 //! their resident attachments.
 //!
-//! `MERGE` and `DERIVE` records are reproducible cache work, not authority.
-//! They therefore add no strong roots, whether their equations are active,
-//! accepted-but-ungrounded, or merely present in the store. A separate cache
-//! policy may retain selected equations and materializations without weakening
-//! this ground-truth boundary.
-//!
-//! **A signature does not change this, and deliberately so.** A signed
-//! equation is still an equation: recomputable from inputs that are themselves
-//! rooted by the commits that introduced them, and therefore never the only
-//! way back to anything. What a signature adds is evidence about who asserted
-//! the equation, which is a reason a reader may skip recomputing it -- not a
-//! reason the derived artifact must outlive its usefulness. Treating a signed
-//! derive as an ownership root would pin every artifact anyone ever bothered
-//! to sign, including the ones nothing now reads, and it would do it by
-//! confusing "someone vouched for this" with "this is ground truth". Only a
-//! commit is ground truth, because only a commit introduces something that
-//! cannot be recomputed.
+//! Unsigned `MERGE` and `DERIVE` records are reproducible cache work, not
+//! authority. They therefore add no strong roots, whether their equations are
+//! active, accepted-but-ungrounded, or merely present in the store. A separate
+//! cache policy may retain selected equations and materializations without
+//! weakening this ground-truth boundary.
 
 use std::error::Error;
 use std::fmt;
@@ -427,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn equations_add_no_strong_roots_signed_or_not_grounded_or_ungrounded() {
+    fn unsigned_equations_add_no_strong_roots_when_grounded_or_ungrounded() {
         let source = test_root("source");
         let target = test_root("target");
         let key = SigningKey::from_bytes(&[7; 32]);
@@ -452,28 +440,19 @@ mod tests {
         );
         store.blobs.insert(IntoBlob::<SimpleArchive>::to_blob(target.facts().clone()));
 
-        // The active equations are signed, and by the very key that anchors
-        // this collection's team -- the strongest endorsement available. The
-        // root set below is nevertheless the same one an unsigned run
-        // produces: a signature is a reason to skip recomputing an equation,
-        // never a reason to keep its artifact alive.
         let active_merge_result = simplearchive_union::join(&left, &right).unwrap();
-        let active_merge = CollectionMerge::sign(
-            &key,
+        let active_merge = CollectionMerge::new(
             identity_for_tests(&source),
             data(&left),
             data(&right),
             data(&active_merge_result),
         );
         let active_derive_output = archive([row(3, 1, 3)]);
-        let active_derive = CollectionDerive::sign(
-            &key,
+        let active_derive = CollectionDerive::new(
             identity_for_tests(&target),
             data(&active_merge_result),
             data(&active_derive_output),
         );
-        assert!(active_merge.signature().is_some());
-        assert!(active_derive.signature().is_some());
 
         let orphan_left = archive([row(4, 1, 4)]);
         let orphan_right = archive([row(5, 1, 5)]);

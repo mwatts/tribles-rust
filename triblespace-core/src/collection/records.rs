@@ -56,25 +56,6 @@ pub const KIND_COLLECTION_MERGE: Id = id_hex!("5F20FFC64313969B7E046A7677874D39"
 /// Minted with `trible genid` on 2026-08-11.
 pub const KIND_COLLECTION_DERIVE: Id = id_hex!("46C621338B6DD5B71C8E1E6DD74B087C");
 
-/// Stable semantic kind of a signed commutative `MERGE` equation.
-///
-/// The equation is the same one [`KIND_COLLECTION_MERGE`] states. The
-/// signature is evidence about who asserted it, carried so a reader that
-/// already trusts that asserter may admit the equation without recomputing
-/// it; it never makes the equation true, and a reader that recomputes needs
-/// none of it.
-///
-/// Minted with `trible genid` on 2026-08-21.
-pub const KIND_COLLECTION_SIGNED_MERGE: Id = id_hex!("84E166592582DAF1DC2B966A8FD9B71A");
-
-/// Stable semantic kind of a signed `DERIVE` equation.
-///
-/// The signed counterpart of [`KIND_COLLECTION_DERIVE`], on the same terms as
-/// [`KIND_COLLECTION_SIGNED_MERGE`].
-///
-/// Minted with `trible genid` on 2026-08-21.
-pub const KIND_COLLECTION_SIGNED_DERIVE: Id = id_hex!("B2518513A56D87F90E15BD0B7508C9ED");
-
 /// The three-field derive's predecessor, which also named its source.
 ///
 /// A derive's source is what the target's descriptor says it is, so naming it
@@ -99,35 +80,6 @@ pub const COLLECTION_COMMIT_BYTES_LEN: usize = 6 * 32;
 pub const COLLECTION_MERGE_BYTES_LEN: usize = 4 * 32;
 /// Byte length of a dense derive equation.
 pub const COLLECTION_DERIVE_BYTES_LEN: usize = 3 * 32;
-/// Byte length of a dense signed merge equation.
-///
-/// The four equation fields plus a public key and the two signature
-/// components: 224 bytes, which is 32 more than the 192 a 256-byte pile block
-/// leaves after its frame, so a stored signed merge spans two blocks where
-/// every other collection record spans one.
-///
-/// That overrun is worth paying, and the asymmetry with
-/// [`COLLECTION_SIGNED_DERIVE_BYTES_LEN`] is not an oversight. It would be
-/// tempting to sign derives only, on the theory that a merge is a cheap
-/// re-check -- and for a `SimpleArchive` collection it is, a linear pass over
-/// two sorted archives. But
-/// [`succinctarchive_union::join`](crate::collection::succinctarchive_union::join)
-/// is `SuccinctArchiveBlob::merge`, a full rebuild of the wavelet and rank
-/// structures, so in the one collection kind whose recomputation cost started
-/// this design a merge is at least as expensive as a derive. Signing derives
-/// only would have excluded exactly the LSM cover that makes a cold read fast.
-///
-/// The padding is also not a real cost. A signature is only ever worth adding
-/// where recomputing costs more than verifying one, which is never true of a
-/// cheap merge, so the second block lands only on records that stand for
-/// something large. Scanning the live piles on 2026-08-21 for the record-kind
-/// markers found no merge record at all, in any generation of the format.
-pub const COLLECTION_SIGNED_MERGE_BYTES_LEN: usize = COLLECTION_MERGE_BYTES_LEN + 3 * 32;
-/// Byte length of a dense signed derive equation.
-///
-/// Three equation fields plus a signature is `6 * 32`, exactly the shape of a
-/// [`CollectionCommit`].
-pub const COLLECTION_SIGNED_DERIVE_BYTES_LEN: usize = COLLECTION_DERIVE_BYTES_LEN + 3 * 32;
 
 /// Version of collection-record identity derivation.
 pub const COLLECTION_RECORD_ID_VERSION: u32 = 1;
@@ -215,31 +167,6 @@ pub const COMMIT_TRANSCRIPT_LEN: usize = COMMIT_TRANSCRIPT_DOMAIN.len()
     + 32 // data hash
     + 32; // metadata handle
 
-/// Version of the signed collection-equation transcript.
-pub const EQUATION_TRANSCRIPT_VERSION: u32 = 1;
-
-/// Domain prefix of the signed collection-equation transcript.
-pub const EQUATION_TRANSCRIPT_DOMAIN: &[u8] = b"triblespace.collection.equation.transcript";
-
-/// Number of bytes in a version-1 signed `MERGE` transcript.
-pub const MERGE_TRANSCRIPT_LEN: usize = EQUATION_TRANSCRIPT_DOMAIN.len()
-    + 16 // kind id
-    + 4 // version
-    + 32 // public key
-    + 32 // collection descriptor handle
-    + 32 // low input digest
-    + 32 // high input digest
-    + 32; // result digest
-
-/// Number of bytes in a version-1 signed `DERIVE` transcript.
-pub const DERIVE_TRANSCRIPT_LEN: usize = EQUATION_TRANSCRIPT_DOMAIN.len()
-    + 16 // kind id
-    + 4 // version
-    + 32 // public key
-    + 32 // target descriptor handle
-    + 32 // input digest
-    + 32; // output digest
-
 /// Return the canonical handle of an empty metadata archive.
 ///
 /// Metadata is mandatory in a [`CollectionCommit`]. Callers with no metadata
@@ -306,99 +233,25 @@ impl From<UnarchiveError> for RecordDecodeError {
     }
 }
 
-/// Semantic verification failure for a signed collection record.
-///
-/// Shared by the three record kinds that can carry a signature: a commit,
-/// which is always signed, and a merge or derive, which may be.
+/// Semantic verification failure for a signed collection commit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SignatureVerificationError {
+pub enum CommitVerificationError {
     /// The public-key bytes do not encode an Ed25519 verifying key.
     InvalidPublicKey,
     /// Strict Ed25519 verification rejected the transcript/signature pair.
     InvalidSignature,
 }
 
-impl fmt::Display for SignatureVerificationError {
+impl fmt::Display for CommitVerificationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidPublicKey => write!(f, "collection record has an invalid public key"),
-            Self::InvalidSignature => write!(f, "collection record signature is invalid"),
+            Self::InvalidPublicKey => write!(f, "collection commit has an invalid public key"),
+            Self::InvalidSignature => write!(f, "collection commit signature is invalid"),
         }
     }
 }
 
-impl Error for SignatureVerificationError {}
-
-/// The Ed25519 evidence a signed collection record carries.
-///
-/// A signature is never part of the statement a record makes. A commit's
-/// statement is *authority* -- "this key admits this element" -- and so it is
-/// meaningless unsigned. A merge or derive states an *equation*, which is true
-/// or false on its own, and its signature is evidence about who asserted it:
-/// grounds for a reader that trusts the signer to skip recomputing the
-/// equation, never grounds for the equation to hold.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CollectionSignature {
-    public_key: Inline<ED25519PublicKey>,
-    signature_r: Inline<ED25519RComponent>,
-    signature_s: Inline<ED25519SComponent>,
-}
-
-impl CollectionSignature {
-    /// Assemble the three raw fields without verifying them.
-    pub fn from_parts(
-        public_key: Inline<ED25519PublicKey>,
-        signature_r: Inline<ED25519RComponent>,
-        signature_s: Inline<ED25519SComponent>,
-    ) -> Self {
-        Self {
-            public_key,
-            signature_r,
-            signature_s,
-        }
-    }
-
-    /// Raw public-key field. It becomes trusted only after strict verification.
-    pub fn public_key(&self) -> Inline<ED25519PublicKey> {
-        self.public_key
-    }
-
-    /// Raw signature components.
-    pub fn components(&self) -> (Inline<ED25519RComponent>, Inline<ED25519SComponent>) {
-        (self.signature_r, self.signature_s)
-    }
-
-    /// Strictly verify this signature over an already-built transcript.
-    ///
-    /// Returns the parsed verifying key so a caller can hand it straight to a
-    /// team-membership check without re-parsing the raw bytes.
-    fn verify_strict(&self, transcript: &[u8]) -> Result<VerifyingKey, SignatureVerificationError> {
-        let public_key = VerifyingKey::from_bytes(&self.public_key.raw)
-            .map_err(|_| SignatureVerificationError::InvalidPublicKey)?;
-        let signature = Signature::from_components(self.signature_r.raw, self.signature_s.raw);
-        public_key
-            .verify_strict(transcript, &signature)
-            .map_err(|_| SignatureVerificationError::InvalidSignature)?;
-        Ok(public_key)
-    }
-
-    fn sign(signing_key: &SigningKey, transcript: &[u8]) -> Self {
-        let signature: Signature = signing_key.sign(transcript);
-        Self {
-            public_key: Inline::new(signing_key.verifying_key().to_bytes()),
-            signature_r: Inline::new(*signature.r_bytes()),
-            signature_s: Inline::new(*signature.s_bytes()),
-        }
-    }
-
-    fn raw_fields(&self) -> [[u8; 32]; 3] {
-        [
-            self.public_key.raw,
-            self.signature_r.raw,
-            self.signature_s.raw,
-        ]
-    }
-}
+impl Error for CommitVerificationError {}
 
 
 /// A collection name that is legal as part of an identity.
@@ -581,9 +434,9 @@ impl CollectionCommit {
     ///
     /// This proves only that the embedded public key signed the record. Key
     /// authorization is a separate caller policy.
-    pub fn verify_strict(&self) -> Result<(), SignatureVerificationError> {
+    pub fn verify_strict(&self) -> Result<(), CommitVerificationError> {
         let public_key = VerifyingKey::from_bytes(&self.public_key.raw)
-            .map_err(|_| SignatureVerificationError::InvalidPublicKey)?;
+            .map_err(|_| CommitVerificationError::InvalidPublicKey)?;
         self.verify_signature_strict(&public_key)
     }
 
@@ -595,7 +448,7 @@ impl CollectionCommit {
     pub(crate) fn verify_strict_with_key(
         &self,
         public_key: &VerifyingKey,
-    ) -> Result<(), SignatureVerificationError> {
+    ) -> Result<(), CommitVerificationError> {
         if public_key.to_bytes() != self.public_key.raw {
             return self.verify_strict();
         }
@@ -605,13 +458,13 @@ impl CollectionCommit {
     fn verify_signature_strict(
         &self,
         public_key: &VerifyingKey,
-    ) -> Result<(), SignatureVerificationError> {
+    ) -> Result<(), CommitVerificationError> {
         let signature = Signature::from_components(self.signature_r.raw, self.signature_s.raw);
         let transcript =
             commit_transcript(self.public_key, self.collection, self.data, self.metadata);
         public_key
             .verify_strict(&transcript, &signature)
-            .map_err(|_| SignatureVerificationError::InvalidSignature)
+            .map_err(|_| CommitVerificationError::InvalidSignature)
     }
 
     /// Exact bytes attested by this commit's signature.
@@ -668,12 +521,7 @@ impl CollectionCommit {
     }
 }
 
-/// Exact join equation inside one collection lattice.
-///
-/// The equation is the whole claim: `low join high = result` under the
-/// collection's recipe, true or false regardless of who wrote the record. A
-/// merge may additionally carry a [`CollectionSignature`], which asserts
-/// nothing further about the equation and only says who stands behind it.
+/// Unsigned exact join equation inside one collection lattice.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CollectionMerge {
     id: Id,
@@ -681,50 +529,20 @@ pub struct CollectionMerge {
     low: CollectionData,
     high: CollectionData,
     result: CollectionData,
-    signature: Option<CollectionSignature>,
 }
 
 impl CollectionMerge {
-    /// Construct an unsigned commutative merge record, sorting its two inputs
-    /// by digest.
+    /// Construct a commutative merge record, sorting its two inputs by digest.
     pub fn new(
         collection: CollectionHandle,
-        left: CollectionData,
-        right: CollectionData,
+        mut left: CollectionData,
+        mut right: CollectionData,
         result: CollectionData,
     ) -> Self {
-        Self::from_parts(collection, left, right, result, None)
-    }
-
-    /// Sign a canonical `MERGE(collection, low, high) = result` equation.
-    ///
-    /// Signing is an offer, not a promotion: the same equation asserted
-    /// without a signature remains admissible by recomputation, which is the
-    /// stronger guarantee because it needs no trust at all.
-    pub fn sign(
-        signing_key: &SigningKey,
-        collection: CollectionHandle,
-        left: CollectionData,
-        right: CollectionData,
-        result: CollectionData,
-    ) -> Self {
-        let (low, high) = ordered_inputs(left, right);
-        let public_key = Inline::new(signing_key.verifying_key().to_bytes());
-        let transcript = merge_transcript(public_key, collection, low, high, result);
-        let signature = CollectionSignature::sign(signing_key, &transcript);
-        Self::from_ordered(collection, low, high, result, Some(signature))
-    }
-
-    /// Assemble a merge from raw fields, sorting its two inputs by digest.
-    pub fn from_parts(
-        collection: CollectionHandle,
-        left: CollectionData,
-        right: CollectionData,
-        result: CollectionData,
-        signature: Option<CollectionSignature>,
-    ) -> Self {
-        let (low, high) = ordered_inputs(left, right);
-        Self::from_ordered(collection, low, high, result, signature)
+        if right < left {
+            std::mem::swap(&mut left, &mut right);
+        }
+        Self::from_ordered(collection, left, right, result)
     }
 
     fn from_ordered(
@@ -732,48 +550,23 @@ impl CollectionMerge {
         low: CollectionData,
         high: CollectionData,
         result: CollectionData,
-        signature: Option<CollectionSignature>,
     ) -> Self {
-        let id = match &signature {
-            None => collection_record_id(
-                KIND_COLLECTION_MERGE,
-                &merge_bytes(collection, low, high, result),
-            ),
-            Some(signature) => collection_record_id(
-                KIND_COLLECTION_SIGNED_MERGE,
-                &signed_merge_bytes(collection, low, high, result, signature),
-            ),
-        };
+        let bytes = merge_bytes(collection, low, high, result);
+        let id = collection_record_id(KIND_COLLECTION_MERGE, &bytes);
         Self {
             id,
             collection,
             low,
             high,
             result,
-            signature,
         }
     }
 
     /// Decode one exact, canonically ordered dense merge payload.
-    ///
-    /// The two layouts are told apart by length, which is what makes the
-    /// untagged form self-describing: [`COLLECTION_MERGE_BYTES_LEN`] is the
-    /// bare equation and [`COLLECTION_SIGNED_MERGE_BYTES_LEN`] is that
-    /// equation followed by a signature.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, RecordDecodeError> {
-        let signature = match bytes.len() {
-            COLLECTION_MERGE_BYTES_LEN => None,
-            COLLECTION_SIGNED_MERGE_BYTES_LEN => Some(signature_from_fields(bytes, 4)),
-            actual => {
-                return Err(RecordDecodeError::InvalidLength {
-                    expected: COLLECTION_MERGE_BYTES_LEN,
-                    actual,
-                })
-            }
-        };
-        let collection = Inline::new(field_at(bytes, 0));
-        let low: CollectionData = Inline::new(field_at(bytes, 1));
-        let high: CollectionData = Inline::new(field_at(bytes, 2));
+    pub fn from_bytes(bytes: [u8; COLLECTION_MERGE_BYTES_LEN]) -> Result<Self, RecordDecodeError> {
+        let collection = Inline::new(field(&bytes, 0));
+        let low = Inline::new(field(&bytes, 1));
+        let high = Inline::new(field(&bytes, 2));
         if high < low {
             return Err(RecordDecodeError::NonCanonicalMergeInputs);
         }
@@ -781,8 +574,7 @@ impl CollectionMerge {
             collection,
             low,
             high,
-            Inline::new(field_at(bytes, 3)),
-            signature,
+            Inline::new(field(&bytes, 3)),
         ))
     }
 
@@ -806,151 +598,51 @@ impl CollectionMerge {
         self.result
     }
 
-    /// Evidence about who asserted this equation, if anyone signed it.
-    pub fn signature(&self) -> Option<CollectionSignature> {
-        self.signature
-    }
-
-    /// This record's equation, stripped of any signature.
-    ///
-    /// The equation is the primary object, and this is its canonical name:
-    /// `merge.unsigned().id()` is the same id for every signer of one
-    /// equation, and the id a resolver synthesises for that equation as an
-    /// implied theorem.
-    pub fn unsigned(&self) -> Self {
-        Self::from_ordered(self.collection, self.low, self.high, self.result, None)
-    }
-
-    /// Strictly verify this record's signature, if it has one.
-    ///
-    /// `Ok(None)` means the record is unsigned, which is not a failure: an
-    /// unsigned equation is admitted by recomputing it. `Ok(Some(key))` means
-    /// `key` really did sign this exact equation; whether `key` is authorized
-    /// for the collection's team is a separate question.
-    pub fn verify_strict(&self) -> Result<Option<VerifyingKey>, SignatureVerificationError> {
-        let Some(signature) = &self.signature else {
-            return Ok(None);
-        };
-        let transcript = merge_transcript(
-            signature.public_key,
-            self.collection,
-            self.low,
-            self.high,
-            self.result,
-        );
-        signature.verify_strict(&transcript).map(Some)
-    }
-
-    /// Exact bytes a signature over this equation attests to.
-    pub fn signing_transcript(
-        &self,
-        public_key: Inline<ED25519PublicKey>,
-    ) -> [u8; MERGE_TRANSCRIPT_LEN] {
-        merge_transcript(public_key, self.collection, self.low, self.high, self.result)
-    }
-
-    /// Encode this equation into its exact dense layout.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        match &self.signature {
-            None => merge_bytes(self.collection, self.low, self.high, self.result).to_vec(),
-            Some(signature) => {
-                signed_merge_bytes(self.collection, self.low, self.high, self.result, signature)
-                    .to_vec()
-            }
-        }
+    /// Encode this equation into its exact dense 128-byte layout.
+    pub fn to_bytes(&self) -> [u8; COLLECTION_MERGE_BYTES_LEN] {
+        merge_bytes(self.collection, self.low, self.high, self.result)
     }
 }
 
-/// One exact observation of the canonical join homomorphism between two
-/// collection lattices.
-///
-/// Like a [`CollectionMerge`], the equation is the whole claim and an optional
-/// [`CollectionSignature`] is evidence about its asserter.
+/// One unsigned exact observation of the canonical join homomorphism between
+/// two collection lattices.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CollectionDerive {
     id: Id,
     target: CollectionHandle,
     input: CollectionData,
     output: CollectionData,
-    signature: Option<CollectionSignature>,
 }
 
 impl CollectionDerive {
-    /// Construct an unsigned canonical `DERIVE(target, input, output)` record.
+    /// Construct a canonical `DERIVE(target, input, output)` record.
     ///
     /// The target is named by descriptor handle, exactly as a commit names its
     /// collection, and that descriptor already says which collection is the
     /// source and by what recipe. A derive therefore says *which instance* of
     /// a mapping was computed, never *which mapping*.
-    pub fn new(target: CollectionHandle, input: CollectionData, output: CollectionData) -> Self {
-        Self::from_parts(target, input, output, None)
-    }
-
-    /// Sign a canonical `DERIVE(target, input) = output` equation.
-    ///
-    /// This is the equation whose recomputation is expensive enough to be
-    /// worth an assertion: re-deriving a `SuccinctArchive` from its source
-    /// rebuilds every prefix, mask and rotation. Signing offers a reader who
-    /// trusts the signer a way out of that work; it does not withdraw the
-    /// unsigned, recomputable form.
-    pub fn sign(
-        signing_key: &SigningKey,
+    pub fn new(
         target: CollectionHandle,
         input: CollectionData,
         output: CollectionData,
     ) -> Self {
-        let public_key = Inline::new(signing_key.verifying_key().to_bytes());
-        let transcript = derive_transcript(public_key, target, input, output);
-        let signature = CollectionSignature::sign(signing_key, &transcript);
-        Self::from_parts(target, input, output, Some(signature))
-    }
-
-    /// Assemble a derive from raw fields.
-    pub fn from_parts(
-        target: CollectionHandle,
-        input: CollectionData,
-        output: CollectionData,
-        signature: Option<CollectionSignature>,
-    ) -> Self {
-        let id = match &signature {
-            None => {
-                collection_record_id(KIND_COLLECTION_DERIVE, &derive_bytes(target, input, output))
-            }
-            Some(signature) => collection_record_id(
-                KIND_COLLECTION_SIGNED_DERIVE,
-                &signed_derive_bytes(target, input, output, signature),
-            ),
-        };
+        let bytes = derive_bytes(target, input, output);
+        let id = collection_record_id(KIND_COLLECTION_DERIVE, &bytes);
         Self {
             id,
             target,
             input,
             output,
-            signature,
         }
     }
 
     /// Decode one exact dense derive payload.
-    ///
-    /// The two layouts are told apart by length, exactly as
-    /// [`CollectionMerge::from_bytes`] does.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, RecordDecodeError> {
-        let signature = match bytes.len() {
-            COLLECTION_DERIVE_BYTES_LEN => None,
-            COLLECTION_SIGNED_DERIVE_BYTES_LEN => Some(signature_from_fields(bytes, 3)),
-            actual => {
-                return Err(RecordDecodeError::InvalidLength {
-                    expected: COLLECTION_DERIVE_BYTES_LEN,
-                    actual,
-                })
-            }
-        };
-        Ok(Self::from_parts(
-            Inline::new(field_at(bytes, 0)),
-            Inline::new(field_at(bytes, 1)),
-            Inline::new(field_at(bytes, 2)),
-            signature,
-        ))
+    pub fn from_bytes(bytes: [u8; COLLECTION_DERIVE_BYTES_LEN]) -> Self {
+        Self::new(
+            Inline::new(field(&bytes, 0)),
+            Inline::new(field(&bytes, 1)),
+            Inline::new(field(&bytes, 2)),
+        )
     }
 
     /// Intrinsic record id.
@@ -968,48 +660,9 @@ impl CollectionDerive {
         (self.input, self.output)
     }
 
-    /// Evidence about who asserted this equation, if anyone signed it.
-    pub fn signature(&self) -> Option<CollectionSignature> {
-        self.signature
-    }
-
-    /// This record's equation, stripped of any signature.
-    ///
-    /// See [`CollectionMerge::unsigned`]: this is the equation's canonical
-    /// name, independent of who asserted it.
-    pub fn unsigned(&self) -> Self {
-        Self::from_parts(self.target, self.input, self.output, None)
-    }
-
-    /// Strictly verify this record's signature, if it has one.
-    ///
-    /// `Ok(None)` means the record is unsigned. See
-    /// [`CollectionMerge::verify_strict`].
-    pub fn verify_strict(&self) -> Result<Option<VerifyingKey>, SignatureVerificationError> {
-        let Some(signature) = &self.signature else {
-            return Ok(None);
-        };
-        let transcript =
-            derive_transcript(signature.public_key, self.target, self.input, self.output);
-        signature.verify_strict(&transcript).map(Some)
-    }
-
-    /// Exact bytes a signature over this equation attests to.
-    pub fn signing_transcript(
-        &self,
-        public_key: Inline<ED25519PublicKey>,
-    ) -> [u8; DERIVE_TRANSCRIPT_LEN] {
-        derive_transcript(public_key, self.target, self.input, self.output)
-    }
-
-    /// Encode this equation into its exact dense layout.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        match &self.signature {
-            None => derive_bytes(self.target, self.input, self.output).to_vec(),
-            Some(signature) => {
-                signed_derive_bytes(self.target, self.input, self.output, signature).to_vec()
-            }
-        }
+    /// Encode this equation into its exact dense 96-byte layout.
+    pub fn to_bytes(&self) -> [u8; COLLECTION_DERIVE_BYTES_LEN] {
+        derive_bytes(self.target, self.input, self.output)
     }
 }
 
@@ -1043,20 +696,12 @@ impl CollectionRecord {
                 Ok(Self::Commit(CollectionCommit::from_bytes(bytes)))
             }
             COLLECTION_RECORD_KIND_MERGE_V1 => {
-                exact_len(payload, COLLECTION_MERGE_BYTES_LEN)?;
-                Ok(Self::Merge(CollectionMerge::from_bytes(payload)?))
+                let bytes = exact_array::<COLLECTION_MERGE_BYTES_LEN>(payload)?;
+                Ok(Self::Merge(CollectionMerge::from_bytes(bytes)?))
             }
             COLLECTION_RECORD_KIND_DERIVE_V1 => {
-                exact_len(payload, COLLECTION_DERIVE_BYTES_LEN)?;
-                Ok(Self::Derive(CollectionDerive::from_bytes(payload)?))
-            }
-            COLLECTION_RECORD_KIND_SIGNED_MERGE_V1 => {
-                exact_len(payload, COLLECTION_SIGNED_MERGE_BYTES_LEN)?;
-                Ok(Self::Merge(CollectionMerge::from_bytes(payload)?))
-            }
-            COLLECTION_RECORD_KIND_SIGNED_DERIVE_V1 => {
-                exact_len(payload, COLLECTION_SIGNED_DERIVE_BYTES_LEN)?;
-                Ok(Self::Derive(CollectionDerive::from_bytes(payload)?))
+                let bytes = exact_array::<COLLECTION_DERIVE_BYTES_LEN>(payload)?;
+                Ok(Self::Derive(CollectionDerive::from_bytes(bytes)))
             }
             unknown => Err(RecordDecodeError::UnknownKind(unknown)),
         }
@@ -1078,32 +723,11 @@ impl CollectionRecord {
                 tagged_bytes(COLLECTION_RECORD_KIND_COMMIT_V1, &record.to_bytes())
             }
             Self::Merge(record) => {
-                let kind = match record.signature() {
-                    None => COLLECTION_RECORD_KIND_MERGE_V1,
-                    Some(_) => COLLECTION_RECORD_KIND_SIGNED_MERGE_V1,
-                };
-                tagged_bytes(kind, &record.to_bytes())
+                tagged_bytes(COLLECTION_RECORD_KIND_MERGE_V1, &record.to_bytes())
             }
             Self::Derive(record) => {
-                let kind = match record.signature() {
-                    None => COLLECTION_RECORD_KIND_DERIVE_V1,
-                    Some(_) => COLLECTION_RECORD_KIND_SIGNED_DERIVE_V1,
-                };
-                tagged_bytes(kind, &record.to_bytes())
+                tagged_bytes(COLLECTION_RECORD_KIND_DERIVE_V1, &record.to_bytes())
             }
-        }
-    }
-
-    /// This record with any equation signature stripped.
-    ///
-    /// A commit is unchanged: its signature *is* its statement. A merge or
-    /// derive loses only the evidence about who asserted it, keeping the
-    /// equation, which is what a reader who recomputes needs.
-    pub fn unsigned_equation(&self) -> Self {
-        match self {
-            Self::Commit(record) => Self::Commit(*record),
-            Self::Merge(record) => Self::Merge(record.unsigned()),
-            Self::Derive(record) => Self::Derive(record.unsigned()),
         }
     }
 }
@@ -1117,14 +741,6 @@ pub const COLLECTION_RECORD_KIND_COMMIT_V1: u8 = 1;
 pub const COLLECTION_RECORD_KIND_MERGE_V1: u8 = 2;
 /// Dense generic-store tag for the version-1 [`CollectionRecord::Derive`] layout.
 pub const COLLECTION_RECORD_KIND_DERIVE_V1: u8 = 3;
-/// Dense generic-store tag for the signed [`CollectionRecord::Merge`] layout.
-///
-/// A separate tag rather than a length sniff at the outer level, so a reader
-/// that does not know about signed equations rejects the record by kind
-/// instead of misreading its length.
-pub const COLLECTION_RECORD_KIND_SIGNED_MERGE_V1: u8 = 4;
-/// Dense generic-store tag for the signed [`CollectionRecord::Derive`] layout.
-pub const COLLECTION_RECORD_KIND_SIGNED_DERIVE_V1: u8 = 5;
 
 
 fn commit_bytes(
@@ -1162,45 +778,6 @@ fn derive_bytes(
     concat_fields([target.raw, input.raw, output.raw])
 }
 
-fn signed_merge_bytes(
-    collection: CollectionHandle,
-    low: CollectionData,
-    high: CollectionData,
-    result: CollectionData,
-    signature: &CollectionSignature,
-) -> [u8; COLLECTION_SIGNED_MERGE_BYTES_LEN] {
-    let [public_key, r, s] = signature.raw_fields();
-    concat_fields([collection.raw, low.raw, high.raw, result.raw, public_key, r, s])
-}
-
-fn signed_derive_bytes(
-    target: CollectionHandle,
-    input: CollectionData,
-    output: CollectionData,
-    signature: &CollectionSignature,
-) -> [u8; COLLECTION_SIGNED_DERIVE_BYTES_LEN] {
-    let [public_key, r, s] = signature.raw_fields();
-    concat_fields([target.raw, input.raw, output.raw, public_key, r, s])
-}
-
-fn ordered_inputs(
-    mut left: CollectionData,
-    mut right: CollectionData,
-) -> (CollectionData, CollectionData) {
-    if right < left {
-        std::mem::swap(&mut left, &mut right);
-    }
-    (left, right)
-}
-
-fn signature_from_fields(bytes: &[u8], first: usize) -> CollectionSignature {
-    CollectionSignature::from_parts(
-        Inline::new(field_at(bytes, first)),
-        Inline::new(field_at(bytes, first + 1)),
-        Inline::new(field_at(bytes, first + 2)),
-    )
-}
-
 fn collection_record_id(kind: Id, payload: &[u8]) -> Id {
     let mut hasher = Blake3::new();
     hasher.update(COLLECTION_RECORD_ID_DOMAIN);
@@ -1226,23 +803,6 @@ fn field<const N: usize>(bytes: &[u8; N], index: usize) -> [u8; 32] {
     bytes[index * 32..(index + 1) * 32]
         .try_into()
         .expect("fixed dense record field")
-}
-
-fn field_at(bytes: &[u8], index: usize) -> [u8; 32] {
-    bytes[index * 32..(index + 1) * 32]
-        .try_into()
-        .expect("fixed dense record field")
-}
-
-fn exact_len(bytes: &[u8], expected: usize) -> Result<(), RecordDecodeError> {
-    if bytes.len() == expected {
-        Ok(())
-    } else {
-        Err(RecordDecodeError::InvalidLength {
-            expected,
-            actual: bytes.len(),
-        })
-    }
 }
 
 fn exact_array<const N: usize>(bytes: &[u8]) -> Result<[u8; N], RecordDecodeError> {
@@ -1283,67 +843,6 @@ fn commit_transcript(
     append(&metadata.raw);
     debug_assert_eq!(offset, COMMIT_TRANSCRIPT_LEN);
     transcript
-}
-
-fn merge_transcript(
-    public_key: Inline<ED25519PublicKey>,
-    collection: CollectionHandle,
-    low: CollectionData,
-    high: CollectionData,
-    result: CollectionData,
-) -> [u8; MERGE_TRANSCRIPT_LEN] {
-    let mut transcript = [0; MERGE_TRANSCRIPT_LEN];
-    let written = write_equation_transcript(
-        &mut transcript,
-        KIND_COLLECTION_SIGNED_MERGE,
-        public_key,
-        &[collection.raw, low.raw, high.raw, result.raw],
-    );
-    debug_assert_eq!(written, MERGE_TRANSCRIPT_LEN);
-    transcript
-}
-
-fn derive_transcript(
-    public_key: Inline<ED25519PublicKey>,
-    target: CollectionHandle,
-    input: CollectionData,
-    output: CollectionData,
-) -> [u8; DERIVE_TRANSCRIPT_LEN] {
-    let mut transcript = [0; DERIVE_TRANSCRIPT_LEN];
-    let written = write_equation_transcript(
-        &mut transcript,
-        KIND_COLLECTION_SIGNED_DERIVE,
-        public_key,
-        &[target.raw, input.raw, output.raw],
-    );
-    debug_assert_eq!(written, DERIVE_TRANSCRIPT_LEN);
-    transcript
-}
-
-/// Lay out one domain-separated equation transcript.
-///
-/// The kind id separates a signed merge from a signed derive, so a signature
-/// gathered over one equation shape can never be replayed as the other.
-fn write_equation_transcript(
-    transcript: &mut [u8],
-    kind: Id,
-    public_key: Inline<ED25519PublicKey>,
-    fields: &[[u8; 32]],
-) -> usize {
-    let mut offset = 0;
-    let mut append = |bytes: &[u8]| {
-        let end = offset + bytes.len();
-        transcript[offset..end].copy_from_slice(bytes);
-        offset = end;
-    };
-    append(EQUATION_TRANSCRIPT_DOMAIN);
-    append(&kind.raw());
-    append(&EQUATION_TRANSCRIPT_VERSION.to_be_bytes());
-    append(&public_key.raw);
-    for field in fields {
-        append(field);
-    }
-    offset
 }
 
 fn encode_archive(facts: TribleSet) -> Blob<SimpleArchive> {
@@ -1495,7 +994,7 @@ mod tests {
         let decoded = CollectionCommit::from_bytes(bad.to_bytes());
         assert_eq!(
             decoded.verify_strict(),
-            Err(SignatureVerificationError::InvalidSignature)
+            Err(CommitVerificationError::InvalidSignature)
         );
 
         let mut bad_r = first.signature_r;
@@ -1510,7 +1009,7 @@ mod tests {
         );
         assert_eq!(
             bad.verify_strict(),
-            Err(SignatureVerificationError::InvalidSignature)
+            Err(CommitVerificationError::InvalidSignature)
         );
 
         let mut invalid_key = [0; 32];
@@ -1526,7 +1025,7 @@ mod tests {
         let decoded = CollectionCommit::from_bytes(invalid_key.to_bytes());
         assert_eq!(
             decoded.verify_strict(),
-            Err(SignatureVerificationError::InvalidPublicKey)
+            Err(CommitVerificationError::InvalidPublicKey)
         );
     }
 
@@ -1584,166 +1083,15 @@ mod tests {
         assert_eq!(forward, reverse);
         assert_eq!(forward.to_bytes(), reverse.to_bytes());
         assert_eq!(
-            CollectionMerge::from_bytes(&forward.to_bytes()).unwrap(),
+            CollectionMerge::from_bytes(forward.to_bytes()).unwrap(),
             forward
         );
     }
 
     #[test]
-    fn a_signature_rides_beside_the_equation_it_never_changes() {
-        let key = SigningKey::from_bytes(&[13; 32]);
-        let signed = CollectionMerge::sign(&key, collection(1), hash(2), hash(3), hash(4));
-        let plain = CollectionMerge::new(collection(1), hash(2), hash(3), hash(4));
-
-        // The equation is identical; only the evidence differs, and stripping
-        // it recovers exactly the record nobody signed.
-        assert_eq!(signed.collection(), plain.collection());
-        assert_eq!(signed.inputs(), plain.inputs());
-        assert_eq!(signed.result(), plain.result());
-        assert_eq!(signed.unsigned(), plain);
-        assert_eq!(plain.unsigned(), plain);
-
-        // Distinct records, because an intrinsic id is a function of bytes and
-        // the store is keyed by it. `unsigned().id()` is the equation's own
-        // name, shared by every signer of it.
-        assert_ne!(signed.id(), plain.id());
-        assert_eq!(signed.unsigned().id(), plain.id());
-
-        let other = CollectionMerge::sign(
-            &SigningKey::from_bytes(&[14; 32]),
-            collection(1),
-            hash(2),
-            hash(3),
-            hash(4),
-        );
-        assert_ne!(other.id(), signed.id());
-        assert_eq!(other.unsigned().id(), signed.unsigned().id());
-    }
-
-    #[test]
-    fn signed_equations_roundtrip_and_verify() {
-        let key = SigningKey::from_bytes(&[15; 32]);
-        let merge = CollectionMerge::sign(&key, collection(1), hash(3), hash(2), hash(4));
-        let derive = CollectionDerive::sign(&key, collection(2), hash(5), hash(6));
-
-        assert_eq!(merge.to_bytes().len(), COLLECTION_SIGNED_MERGE_BYTES_LEN);
-        assert_eq!(derive.to_bytes().len(), COLLECTION_SIGNED_DERIVE_BYTES_LEN);
-        assert_eq!(CollectionMerge::from_bytes(&merge.to_bytes()), Ok(merge));
-        assert_eq!(CollectionDerive::from_bytes(&derive.to_bytes()), Ok(derive));
-
-        assert_eq!(merge.verify_strict(), Ok(Some(key.verifying_key())));
-        assert_eq!(derive.verify_strict(), Ok(Some(key.verifying_key())));
-
-        // Signing is commutative in the inputs, exactly as the equation is.
-        assert_eq!(
-            merge,
-            CollectionMerge::sign(&key, collection(1), hash(2), hash(3), hash(4))
-        );
-    }
-
-    #[test]
-    fn an_unsigned_equation_is_not_a_verification_failure() {
-        assert_eq!(
-            CollectionMerge::new(collection(1), hash(2), hash(3), hash(4)).verify_strict(),
-            Ok(None)
-        );
-        assert_eq!(
-            CollectionDerive::new(collection(2), hash(3), hash(4)).verify_strict(),
-            Ok(None)
-        );
-    }
-
-    #[test]
-    fn a_signature_does_not_travel_to_another_equation() {
-        let key = SigningKey::from_bytes(&[16; 32]);
-        let signed = CollectionMerge::sign(&key, collection(1), hash(2), hash(3), hash(4));
-        let signature = signed.signature().expect("signed");
-
-        // Same signature, different result: the transcript covers the whole
-        // equation, so the evidence no longer applies.
-        let moved =
-            CollectionMerge::from_parts(collection(1), hash(2), hash(3), hash(9), Some(signature));
-        assert_eq!(
-            moved.verify_strict(),
-            Err(SignatureVerificationError::InvalidSignature)
-        );
-
-        // Nor to the other equation shape: the transcript is domain-separated
-        // by record kind, so a merge signature cannot be replayed as a derive.
-        let crossed = CollectionDerive::from_parts(collection(1), hash(2), hash(3), Some(signature));
-        assert_eq!(
-            crossed.verify_strict(),
-            Err(SignatureVerificationError::InvalidSignature)
-        );
-    }
-
-    #[test]
-    fn signed_and_unsigned_layouts_are_told_apart_by_length() {
-        let key = SigningKey::from_bytes(&[17; 32]);
-        let signed = CollectionDerive::sign(&key, collection(2), hash(5), hash(6));
-        let plain = signed.unsigned();
-
-        assert_eq!(
-            CollectionDerive::from_bytes(&plain.to_bytes()),
-            Ok(plain),
-            "the bare equation still decodes as itself"
-        );
-        assert_eq!(
-            CollectionDerive::from_bytes(&signed.to_bytes()[..COLLECTION_DERIVE_BYTES_LEN]),
-            Ok(plain),
-            "the signed layout begins with its own equation"
-        );
-        assert_eq!(
-            CollectionDerive::from_bytes(&[0u8; 7]),
-            Err(RecordDecodeError::InvalidLength {
-                expected: COLLECTION_DERIVE_BYTES_LEN,
-                actual: 7,
-            })
-        );
-    }
-
-    #[test]
-    fn the_generic_codec_tags_signed_equations_separately() {
-        let key = SigningKey::from_bytes(&[18; 32]);
-        for record in [
-            CollectionRecord::Merge(CollectionMerge::sign(
-                &key,
-                collection(1),
-                hash(2),
-                hash(3),
-                hash(4),
-            )),
-            CollectionRecord::Derive(CollectionDerive::sign(&key, collection(2), hash(5), hash(6))),
-        ] {
-            let bytes = record.to_bytes();
-            assert!(matches!(
-                bytes[0],
-                COLLECTION_RECORD_KIND_SIGNED_MERGE_V1 | COLLECTION_RECORD_KIND_SIGNED_DERIVE_V1
-            ));
-            assert_eq!(CollectionRecord::from_bytes(&bytes), Ok(record));
-
-            // A reader that only knows the unsigned tags refuses the record by
-            // kind rather than misreading its length.
-            let mut mislabelled = bytes.clone();
-            mislabelled[0] = match bytes[0] {
-                COLLECTION_RECORD_KIND_SIGNED_MERGE_V1 => COLLECTION_RECORD_KIND_MERGE_V1,
-                _ => COLLECTION_RECORD_KIND_DERIVE_V1,
-            };
-            assert!(CollectionRecord::from_bytes(&mislabelled).is_err());
-
-            // Stripping the signature yields the plain equation and its tag.
-            let unsigned = record.unsigned_equation().to_bytes();
-            assert!(matches!(
-                unsigned[0],
-                COLLECTION_RECORD_KIND_MERGE_V1 | COLLECTION_RECORD_KIND_DERIVE_V1
-            ));
-        }
-    }
-
-    #[test]
     fn derive_roundtrips() {
         let record = CollectionDerive::new(collection(2), hash(3), hash(4));
-        assert_eq!(CollectionDerive::from_bytes(&record.to_bytes()), Ok(record));
+        assert_eq!(CollectionDerive::from_bytes(record.to_bytes()), record);
     }
 
     #[test]
@@ -1790,7 +1138,7 @@ mod tests {
         bytes[32..64].fill(9);
         bytes[64..96].fill(1);
         assert_eq!(
-            CollectionMerge::from_bytes(&bytes),
+            CollectionMerge::from_bytes(bytes),
             Err(RecordDecodeError::NonCanonicalMergeInputs)
         );
     }

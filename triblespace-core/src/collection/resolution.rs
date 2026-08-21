@@ -15,8 +15,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-use ed25519_dalek::VerifyingKey;
-
 use crate::id::Id;
 
 use super::{
@@ -28,56 +26,6 @@ type MemberKey = (CollectionHandle, CollectionData);
 type MergeProducer = (CollectionData, CollectionData, Id);
 type DeriveProducer = (CollectionHandle, CollectionData, Id);
 type DeriveOutput = (CollectionData, Id);
-
-/// Why one equation may be admitted without the reader having proved it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EquationAdmission {
-    /// The reader recomputed the equation and it held.
-    ///
-    /// This is the strong form. It rests on nobody: a party holding no key and
-    /// belonging to no team can reach it, which is exactly what makes an
-    /// unsigned `MERGE` or `DERIVE` worth keeping as the default.
-    Recomputed,
-    /// A key the collection's team authorizes asserted the equation, and the
-    /// reader took that instead of recomputing.
-    ///
-    /// This is the weak form, and it is weaker in a specific way: it does not
-    /// say the equation is true, it says someone the reader already trusts
-    /// says so. That is the same trust the reader extends to the team's
-    /// commits, so it is not a new boundary -- but it is a boundary, where
-    /// recomputation had none.
-    TeamSigned(VerifyingKey),
-}
-
-/// Decide how, if at all, one equation may be admitted.
-///
-/// Recomputation is tried first and always wins, because it is the stronger
-/// answer and the one that needs no trust. A signature is consulted only where
-/// recomputation has not settled the question.
-///
-/// `recomputed` distinguishes the three states a reader can be in, and the
-/// distinction is the whole point: `Some(true)` proved the equation,
-/// `Some(false)` **refuted** it, and `None` could not check it -- commonly
-/// because an endpoint's bytes are absent. A signature answers only the `None`
-/// case. It cannot repair a refuted equation, because the signature was never
-/// evidence *about the equation*; it is evidence about who asserted it, and an
-/// asserter being trusted does not make a false statement true. A reader that
-/// let `Some(false)` be overridden would have converted "checkable by anyone"
-/// into "whatever the team says", which is the trade this design exists to
-/// avoid.
-pub fn admit_equation(
-    recomputed: Option<bool>,
-    signer: Option<VerifyingKey>,
-    team_authorizes: impl FnOnce(&VerifyingKey) -> bool,
-) -> Option<EquationAdmission> {
-    match recomputed {
-        Some(true) => Some(EquationAdmission::Recomputed),
-        Some(false) => None,
-        None => signer
-            .filter(|key| team_authorizes(key))
-            .map(EquationAdmission::TeamSigned),
-    }
-}
 
 /// One claim presented for concrete semantic validation.
 ///
@@ -105,23 +53,12 @@ pub enum CollectionValidationRequest<'a> {
         claim: &'a CollectionCommit,
     },
     /// A merge whose descriptor, inputs, and result need exact validation.
-    ///
-    /// The callback admits it by recomputing the join, **or** by checking the
-    /// claim's signature against the collection's team -- see
-    /// [`admit_equation`], which states the precedence between the two, and
-    /// [`descriptor::team_root`](crate::collection::descriptor::team_root),
-    /// which finds the team a derived collection inherits. The signature, if
-    /// any, has already been strictly verified by discovery, so
-    /// [`CollectionMerge::verify_strict`] here only re-reads what is known.
     Merge {
         /// Structurally canonical merge claim.
         claim: &'a CollectionMerge,
     },
     /// A derivation whose endpoint representations and canonical map need
     /// validation.
-    ///
-    /// Admitted on the same two grounds as
-    /// [`Merge`](CollectionValidationRequest::Merge).
     Derive {
         /// Structurally canonical derive claim.
         claim: &'a CollectionDerive,
@@ -1136,39 +1073,6 @@ fn check_functional(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn recomputation_outranks_a_signature_and_a_refutation_outranks_both() {
-        use ed25519_dalek::SigningKey;
-
-        let team = SigningKey::from_bytes(&[1; 32]).verifying_key();
-        let stranger = SigningKey::from_bytes(&[2; 32]).verifying_key();
-        let in_team = |key: &VerifyingKey| *key == team;
-
-        // Proved for itself: the strong form, and it never consults a signer.
-        assert_eq!(
-            admit_equation(Some(true), None, in_team),
-            Some(EquationAdmission::Recomputed)
-        );
-        assert_eq!(
-            admit_equation(Some(true), Some(stranger), in_team),
-            Some(EquationAdmission::Recomputed)
-        );
-
-        // Could not be checked: a team signature is the way in, and only a
-        // team signature.
-        assert_eq!(admit_equation(None, None, in_team), None);
-        assert_eq!(admit_equation(None, Some(stranger), in_team), None);
-        assert_eq!(
-            admit_equation(None, Some(team), in_team),
-            Some(EquationAdmission::TeamSigned(team))
-        );
-
-        // Checked and wrong. No signature repairs this, because a signature
-        // was never evidence about the equation -- trusting the asserter does
-        // not make a false statement true.
-        assert_eq!(admit_equation(Some(false), Some(team), in_team), None);
-    }
-
 
     /// Resolve with a stated lineage.
     ///

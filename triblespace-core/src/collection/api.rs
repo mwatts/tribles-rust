@@ -27,11 +27,10 @@ use super::simplearchive_union::{
     self, MaterializationError, PublicationError, SimpleArchiveUnionValidationError,
 };
 use super::{
-    admit_equation, collection_physical_cover, descriptor, discover_collection_records_scoped,
-    resolve_collection_semantics, CollectionClaimValidation, CollectionCommit, CollectionData,
-    CollectionDiscoveryError, CollectionFunctionalConflict, CollectionHandle,
-    CollectionResolutionError, CollectionStore, CollectionValidationRequest,
-    DiscoveredCollectionRecords, ExactTicketError, RecordDecodeError,
+    collection_physical_cover, discover_collection_records_scoped, resolve_collection_semantics,
+    CollectionClaimValidation, CollectionCommit, CollectionData, CollectionDiscoveryError,
+    CollectionFunctionalConflict, CollectionHandle, CollectionResolutionError, CollectionStore,
+    CollectionValidationRequest, DiscoveredCollectionRecords, ExactTicketError, RecordDecodeError,
 };
 
 /// A scoped `SimpleArchive`-union collection and its signing authority.
@@ -846,10 +845,6 @@ where
         }
 
         let mut accepted_merges = BTreeSet::new();
-        // An equation the recompute pass actively *disproved*, as opposed to
-        // one it could not reach. No signature admits a member of this set:
-        // see `admit_equation`.
-        let mut refuted_merges = BTreeSet::new();
         let mut expected_hashes =
             BTreeMap::<(CollectionData, CollectionData), CollectionData>::new();
         while let Some((_, index)) = ready.pop_first() {
@@ -878,10 +873,6 @@ where
                     _ => None,
                 }
             };
-
-            if expected_data.is_some_and(|data| data != claim.result()) {
-                refuted_merges.insert(claim.id());
-            }
 
             if let Some(expected_data) = expected_data.filter(|data| *data == claim.result()) {
                 let retain_result = remaining_uses
@@ -950,44 +941,19 @@ where
             }
         }
 
-        // The team this collection anchors to. A facade owns one root
-        // collection, so its own descriptor carries the team directly and the
-        // source walk `descriptor::team_root` performs is a single step.
-        //
-        // This admits only the team *root* key, which in a real team is
-        // archived offline and signs nothing operational. That is deliberate
-        // for now: the shape of the rule is what this pass lands, and
-        // widening it to the keys the root has delegated to means resolving
-        // capability chains (`repo::capability::verify_chain`) from a pubkey,
-        // which needs an index the pile does not yet keep. Until then the
-        // signature path is exercised but rarely taken, and recomputation --
-        // which needs no key at all -- carries every real workload.
-        let team = descriptor::team(&decoded_descriptor).and_then(Result::ok);
-
         // A plain collection facade owns one root collection and derives
         // nothing, so it declares no lineage.
         let resolution =
             resolve_collection_semantics(&discovered, &BTreeMap::new(), &authorized, |request| {
             Ok::<CollectionClaimValidation<()>, Infallible>(match request {
                 CollectionValidationRequest::Commit { .. } => CollectionClaimValidation::Accepted,
-                // Recompute first, and fall back to a team signature only for
-                // equations the recompute pass could not reach. A refuted
-                // equation stays refuted whoever signed it.
-                CollectionValidationRequest::Merge { claim, .. } => {
-                    let recomputed = if accepted_merges.contains(&claim.id()) {
-                        Some(true)
-                    } else if refuted_merges.contains(&claim.id()) {
-                        Some(false)
-                    } else {
-                        None
-                    };
-                    let signer = claim.verify_strict().ok().flatten();
-                    match admit_equation(recomputed, signer, |key| team == Some(*key)) {
-                        Some(_) => CollectionClaimValidation::Accepted,
-                        None => CollectionClaimValidation::Pending,
-                    }
+                CollectionValidationRequest::Merge { claim, .. }
+                    if accepted_merges.contains(&claim.id()) =>
+                {
+                    CollectionClaimValidation::Accepted
                 }
-                CollectionValidationRequest::Derive { .. } => CollectionClaimValidation::Pending,
+                CollectionValidationRequest::Merge { .. }
+                | CollectionValidationRequest::Derive { .. } => CollectionClaimValidation::Pending,
             })
         });
 
