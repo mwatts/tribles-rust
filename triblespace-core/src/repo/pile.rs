@@ -50,7 +50,8 @@ use crate::blob::TryFromBlob;
 use crate::collection::store::selectors_match_record;
 use crate::collection::{
     CollectionCommit, CollectionDerive, CollectionGossip, CollectionGossipStore, CollectionMerge,
-    CollectionRecord, CollectionRecordSelector, CollectionStore, KIND_COLLECTION_GOSSIP,
+    CollectionRecord, CollectionRecordSelector, CollectionSignature, CollectionStore,
+    KIND_COLLECTION_GOSSIP,
 };
 use crate::id::Id;
 use crate::id::RawId;
@@ -219,6 +220,9 @@ const ENVELOPE_HEADER_LEN: usize = 256;
 const FRAME_BODY_OFFSET: usize = FRAME_MAGIC_LEN + 4 + 32;
 const ENVELOPE_BLOCK_LEN: usize = GPU_DATA_ALIGNMENT;
 const ENVELOPE_HEADER_BLOCKS: u32 = 1;
+/// Blocks spanned by a signed merge record, the only collection record whose
+/// fields do not fit the 192 bytes a single block leaves after its frame.
+const COLLECTION_SIGNED_MERGE_BLOCKS: u32 = 2;
 /// Post-data padding that rounds a fixed-header record up to a 256-byte block.
 fn block_post_pad(data_len: usize) -> usize {
     (ENVELOPE_BLOCK_LEN - (data_len % ENVELOPE_BLOCK_LEN)) % ENVELOPE_BLOCK_LEN
@@ -953,6 +957,79 @@ impl CollectionDeriveRecordHeader {
     }
 }
 
+/// Signed merge equation. The one collection record that outgrows a block:
+/// four 32-byte equation fields and a 96-byte signature are 224 bytes against
+/// the 192 a block leaves after the frame, so it spans two.
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct CollectionSignedMergeRecordHeader {
+    magic: [u8; FRAME_MAGIC_LEN],
+    span_blocks: [u8; 4],
+    record_kind: RawInline,
+    collection: RawInline,
+    low: RawInline,
+    high: RawInline,
+    result: RawInline,
+    public_key: RawInline,
+    signature_r: RawInline,
+    signature_s: RawInline,
+    reserved: [u8; 224],
+}
+
+impl CollectionSignedMergeRecordHeader {
+    fn new(record: &CollectionMerge, signature: &CollectionSignature) -> Self {
+        let (low, high) = record.inputs();
+        let (signature_r, signature_s) = signature.components();
+        Self {
+            magic: FRAME_MAGIC,
+            span_blocks: COLLECTION_SIGNED_MERGE_BLOCKS.to_le_bytes(),
+            record_kind: record_kind::KIND_COLLECTION_SIGNED_MERGE,
+            collection: record.collection().raw,
+            low: low.raw,
+            high: high.raw,
+            result: record.result().raw,
+            public_key: signature.public_key().raw,
+            signature_r: signature_r.raw,
+            signature_s: signature_s.raw,
+            reserved: [0u8; 224],
+        }
+    }
+}
+
+/// Signed derive equation: three equation fields plus a signature fill the
+/// block exactly, the same shape as a commit.
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct CollectionSignedDeriveRecordHeader {
+    magic: [u8; FRAME_MAGIC_LEN],
+    span_blocks: [u8; 4],
+    record_kind: RawInline,
+    target: RawInline,
+    input: RawInline,
+    output: RawInline,
+    public_key: RawInline,
+    signature_r: RawInline,
+    signature_s: RawInline,
+}
+
+impl CollectionSignedDeriveRecordHeader {
+    fn new(record: &CollectionDerive, signature: &CollectionSignature) -> Self {
+        let (input, output) = record.mapping();
+        let (signature_r, signature_s) = signature.components();
+        Self {
+            magic: FRAME_MAGIC,
+            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
+            record_kind: record_kind::KIND_COLLECTION_SIGNED_DERIVE,
+            target: record.target().raw,
+            input: input.raw,
+            output: output.raw,
+            public_key: signature.public_key().raw,
+            signature_r: signature_r.raw,
+            signature_s: signature_s.raw,
+        }
+    }
+}
+
 /// Signed grow-only publication grant for one author's commits in a
 /// descriptor-identified collection.
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
@@ -1007,20 +1084,28 @@ fn envelope_blocks_for_payload(data_len: usize) -> Option<u32> {
         .checked_add(ENVELOPE_HEADER_BLOCKS)
 }
 
-fn collection_record_header(record: &CollectionRecord) -> [u8; ENVELOPE_HEADER_LEN] {
-    let mut bytes = [0u8; ENVELOPE_HEADER_LEN];
+/// Frame one collection record for the pile.
+///
+/// Every kind but a signed merge is exactly one block; a signed merge is two,
+/// so this returns bytes rather than a fixed array.
+fn collection_record_header(record: &CollectionRecord) -> Vec<u8> {
     match record {
         CollectionRecord::Commit(record) => {
-            bytes.copy_from_slice(CollectionCommitRecordHeader::new(record).as_bytes())
+            CollectionCommitRecordHeader::new(record).as_bytes().to_vec()
         }
-        CollectionRecord::Merge(record) => {
-            bytes.copy_from_slice(CollectionMergeRecordHeader::new(record).as_bytes())
-        }
-        CollectionRecord::Derive(record) => {
-            bytes.copy_from_slice(CollectionDeriveRecordHeader::new(record).as_bytes())
-        }
+        CollectionRecord::Merge(record) => match record.signature() {
+            None => CollectionMergeRecordHeader::new(record).as_bytes().to_vec(),
+            Some(signature) => CollectionSignedMergeRecordHeader::new(record, &signature)
+                .as_bytes()
+                .to_vec(),
+        },
+        CollectionRecord::Derive(record) => match record.signature() {
+            None => CollectionDeriveRecordHeader::new(record).as_bytes().to_vec(),
+            Some(signature) => CollectionSignedDeriveRecordHeader::new(record, &signature)
+                .as_bytes()
+                .to_vec(),
+        },
     }
-    bytes
 }
 
 // Compile-time guarantee that every legacy and current fixed header is exactly
@@ -1060,6 +1145,11 @@ const _: () = {
     assert!(std::mem::size_of::<CollectionMergeRecordHeader>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<CollectionDeriveRecordHeader>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<CollectionGossipRecordHeader>() == ENVELOPE_HEADER_LEN);
+    assert!(std::mem::size_of::<CollectionSignedDeriveRecordHeader>() == ENVELOPE_HEADER_LEN);
+    assert!(
+        std::mem::size_of::<CollectionSignedMergeRecordHeader>()
+            == COLLECTION_SIGNED_MERGE_BLOCKS as usize * ENVELOPE_HEADER_LEN
+    );
 };
 
 /// A single record decoded from a pile file.
@@ -1401,6 +1491,54 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
                         Inline::new(header.target),
                         Inline::new(header.input),
                         Inline::new(header.output),
+                    )),
+                },
+            })
+        }
+        record_kind::KIND_COLLECTION_SIGNED_MERGE => {
+            if declared_blocks != COLLECTION_SIGNED_MERGE_BLOCKS {
+                return Err(corrupt());
+            }
+            let (header, _) = CollectionSignedMergeRecordHeader::try_read_from_prefix(bytes)
+                .map_err(|_| corrupt())?;
+            if nonzero(&[&header.reserved[..]]) || header.high < header.low {
+                return Err(corrupt());
+            }
+            Ok(PileRecord {
+                offset,
+                len,
+                content: PileRecordContent::Collection {
+                    record: CollectionRecord::Merge(CollectionMerge::from_parts(
+                        Inline::new(header.collection),
+                        Inline::new(header.low),
+                        Inline::new(header.high),
+                        Inline::new(header.result),
+                        Some(CollectionSignature::from_parts(
+                            Inline::<ED25519PublicKey>::new(header.public_key),
+                            Inline::<ED25519RComponent>::new(header.signature_r),
+                            Inline::<ED25519SComponent>::new(header.signature_s),
+                        )),
+                    )),
+                },
+            })
+        }
+        record_kind::KIND_COLLECTION_SIGNED_DERIVE => {
+            fixed_header()?;
+            let (header, _) = CollectionSignedDeriveRecordHeader::try_read_from_prefix(bytes)
+                .map_err(|_| corrupt())?;
+            Ok(PileRecord {
+                offset,
+                len,
+                content: PileRecordContent::Collection {
+                    record: CollectionRecord::Derive(CollectionDerive::from_parts(
+                        Inline::new(header.target),
+                        Inline::new(header.input),
+                        Inline::new(header.output),
+                        Some(CollectionSignature::from_parts(
+                            Inline::<ED25519PublicKey>::new(header.public_key),
+                            Inline::<ED25519RComponent>::new(header.signature_r),
+                            Inline::<ED25519SComponent>::new(header.signature_s),
+                        )),
                     )),
                 },
             })
@@ -3253,7 +3391,7 @@ impl CollectionStore for Pile {
 
             self.dirty = true;
             let written = self.file.write(&header)?;
-            if written != ENVELOPE_HEADER_LEN {
+            if written != header.len() {
                 return Err(CollectionInsertError::Io(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
                     "failed to write complete collection record",
@@ -4423,6 +4561,135 @@ mod tests {
         forged
     }
 
+    fn signed_collection_test_records() -> Vec<CollectionRecord> {
+        let key = SigningKey::from_bytes(&[31; 32]);
+        vec![
+            CollectionRecord::Merge(CollectionMerge::sign(
+                &key,
+                collection_test_collection(1),
+                collection_test_hash(6),
+                collection_test_hash(7),
+                collection_test_hash(8),
+            )),
+            CollectionRecord::Derive(CollectionDerive::sign(
+                &key,
+                collection_test_collection(2),
+                collection_test_hash(8),
+                collection_test_hash(9),
+            )),
+        ]
+    }
+
+    #[test]
+    fn signed_collection_records_roundtrip_through_the_pile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "signed-equations.pile");
+        let mut pile = Pile::open(&path).unwrap();
+
+        let records = signed_collection_test_records();
+        for record in &records {
+            pile.insert(*record).unwrap();
+        }
+        pile.flush().unwrap();
+        drop(pile);
+
+        // A signed merge is the one collection record that needs two blocks;
+        // a signed derive fills one exactly, like a commit.
+        let mut spans = Vec::new();
+        let mut reopened = PileRecords::open(&path).unwrap();
+        while let Some(record) = reopened.next() {
+            let record = record.unwrap();
+            if let PileRecordContent::Collection { record: decoded } = record.content {
+                spans.push((decoded, record.len));
+            }
+        }
+        spans.sort_by_key(|(record, _)| record.id());
+        let mut wanted = vec![
+            (
+                records[0],
+                COLLECTION_SIGNED_MERGE_BLOCKS as usize * ENVELOPE_HEADER_LEN,
+            ),
+            (records[1], ENVELOPE_HEADER_LEN),
+        ];
+        wanted.sort_by_key(|(record, _)| record.id());
+        assert_eq!(spans, wanted, "each record replays with its declared span");
+
+        // The signature survives the round trip, not merely the equation.
+        let mut pile = Pile::open(&path).unwrap();
+        let stored: Vec<CollectionRecord> = pile
+            .records()
+            .unwrap()
+            .map(|record| record.unwrap())
+            .collect();
+        for record in &records {
+            assert!(stored.contains(record));
+        }
+        for record in &stored {
+            match record {
+                CollectionRecord::Merge(merge) => {
+                    assert_eq!(merge.verify_strict().unwrap().is_some(), true)
+                }
+                CollectionRecord::Derive(derive) => {
+                    assert_eq!(derive.verify_strict().unwrap().is_some(), true)
+                }
+                CollectionRecord::Commit(_) => unreachable!("only equations were written"),
+            }
+        }
+    }
+
+    #[test]
+    fn signed_collection_record_headers_are_framed_and_zero_padded() {
+        let expected = [
+            (
+                record_kind::KIND_COLLECTION_SIGNED_MERGE,
+                COLLECTION_SIGNED_MERGE_BLOCKS,
+                Some(288usize),
+            ),
+            (
+                record_kind::KIND_COLLECTION_SIGNED_DERIVE,
+                ENVELOPE_HEADER_BLOCKS,
+                None,
+            ),
+        ];
+
+        for (record, (kind, blocks, reserved_start)) in
+            signed_collection_test_records().into_iter().zip(expected)
+        {
+            let header = collection_record_header(&record);
+            assert_eq!(header.len(), blocks as usize * ENVELOPE_HEADER_LEN);
+            assert_eq!(&header[..FRAME_MAGIC_LEN], FRAME_MAGIC.as_slice());
+            assert_eq!(
+                u32::from_le_bytes(
+                    header[FRAME_MAGIC_LEN..FRAME_BODY_OFFSET - 32]
+                        .try_into()
+                        .unwrap()
+                ),
+                blocks
+            );
+            assert_eq!(
+                &header[FRAME_BODY_OFFSET - 32..FRAME_BODY_OFFSET],
+                kind.as_slice()
+            );
+
+            let decoded = decode_record(&header, 0).unwrap();
+            assert!(matches!(
+                decoded.content,
+                PileRecordContent::Collection { record: decoded } if decoded == record
+            ));
+
+            let Some(reserved_start) = reserved_start else {
+                continue;
+            };
+            assert!(header[reserved_start..].iter().all(|byte| *byte == 0));
+            let mut nonzero_padding = header;
+            nonzero_padding[reserved_start] = 1;
+            assert!(matches!(
+                decode_record(&nonzero_padding, 0),
+                Err(ReadError::CorruptPile { valid_length: 0 })
+            ));
+        }
+    }
+
     #[test]
     fn enveloped_collection_record_headers_are_fixed_zero_padded_and_roundtrip() {
         let records = collection_test_records();
@@ -4742,16 +5009,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "self-describing.pile");
         let mut pile = Pile::open(&path).unwrap();
-        // Eleven description archives plus the deduplicated name, layout, and
-        // attribute-metafact blobs they reference.
-        assert_eq!(pile.publish_record_kind_descriptions().unwrap(), 40);
+        // Thirteen description archives plus the deduplicated name, layout,
+        // and attribute-metafact blobs they reference.
+        assert_eq!(pile.publish_record_kind_descriptions().unwrap(), 46);
 
         let branch_id = Id::new([3; 16]).unwrap();
         pile.update(branch_id, None, Some(Inline::new([4; 32])))
             .unwrap();
         pile.want(WantRequest::blob(Inline::<Handle<UnknownBlob>>::new([5; 32])))
             .unwrap();
-        for record in &collection_test_records() {
+        for record in collection_test_records()
+            .iter()
+            .chain(signed_collection_test_records().iter())
+        {
             pile.insert(*record).unwrap();
         }
         pile.gossip(collection_test_gossips()[0]).unwrap();
@@ -4781,7 +5051,7 @@ mod tests {
             assert_eq!(named, 1, "a record kind describes exactly one record kind");
             resolved += 1;
         }
-        assert!(resolved >= 16);
+        assert!(resolved >= 18);
         drop(reader);
         pile.close().unwrap();
     }

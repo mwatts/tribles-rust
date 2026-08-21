@@ -18,7 +18,7 @@ use crate::inline::Inline;
 
 use super::{
     CollectionCommit, CollectionDerive, CollectionHandle, CollectionMerge, CollectionRecord,
-    CollectionRecordSelector, CollectionStore, CommitVerificationError,
+    CollectionRecordSelector, CollectionStore, SignatureVerificationError,
 };
 
 /// One collection record with a discovery-time validation failure.
@@ -34,7 +34,13 @@ pub struct CollectionRecordDiagnostic {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CollectionRecordDiagnosticError {
     /// A structurally canonical commit failed strict Ed25519 verification.
-    InvalidCommit(CommitVerificationError),
+    InvalidCommit(SignatureVerificationError),
+    /// A merge's signature failed strict Ed25519 verification. The equation
+    /// survives as its unsigned form; only the claim of authorship is lost.
+    InvalidMergeSignature(SignatureVerificationError),
+    /// A derive's signature failed strict Ed25519 verification, on the same
+    /// terms as [`InvalidMergeSignature`](Self::InvalidMergeSignature).
+    InvalidDeriveSignature(SignatureVerificationError),
 }
 
 /// Failure to canonicalize or admit an exact commit ticket.
@@ -170,6 +176,14 @@ impl fmt::Display for CollectionRecordDiagnosticError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidCommit(error) => write!(f, "invalid collection commit: {error}"),
+            Self::InvalidMergeSignature(error) => write!(
+                f,
+                "collection merge signature discarded, equation kept: {error}",
+            ),
+            Self::InvalidDeriveSignature(error) => write!(
+                f,
+                "collection derive signature discarded, equation kept: {error}",
+            ),
         }
     }
 }
@@ -177,7 +191,9 @@ impl fmt::Display for CollectionRecordDiagnosticError {
 impl Error for CollectionRecordDiagnosticError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::InvalidCommit(error) => Some(error),
+            Self::InvalidCommit(error)
+            | Self::InvalidMergeSignature(error)
+            | Self::InvalidDeriveSignature(error) => Some(error),
         }
     }
 }
@@ -260,6 +276,48 @@ where
     }
 }
 
+/// Admit one merge, keeping the equation even when its evidence is bad.
+///
+/// A merge states an equation, which is true or false regardless of who wrote
+/// the record; a signature on it is separate evidence about who asserted it.
+/// A signature that fails strict verification is therefore not grounds to
+/// discard the equation, only grounds to discard the claim of authorship. The
+/// record is downgraded to its unsigned form -- still fully admissible by
+/// recomputation, which is the stronger guarantee anyway -- and the failure is
+/// reported. Dropping the record outright, as an invalid commit is dropped,
+/// would let anyone deny a true equation to a recomputing reader simply by
+/// publishing a forged signature over it.
+///
+/// A commit is different because its signature *is* its statement: an
+/// unsigned commit asserts no authority at all, so there is nothing left to
+/// downgrade to.
+fn admit_merge(record: CollectionMerge, discovered: &mut DiscoveredCollectionRecords) {
+    match record.verify_strict() {
+        Ok(_) => discovered.merges.push(record),
+        Err(error) => {
+            discovered.diagnostics.push(CollectionRecordDiagnostic {
+                id: record.id(),
+                error: CollectionRecordDiagnosticError::InvalidMergeSignature(error),
+            });
+            discovered.merges.push(record.unsigned());
+        }
+    }
+}
+
+/// Admit one derive, on the same terms as [`admit_merge`].
+fn admit_derive(record: CollectionDerive, discovered: &mut DiscoveredCollectionRecords) {
+    match record.verify_strict() {
+        Ok(_) => discovered.derives.push(record),
+        Err(error) => {
+            discovered.diagnostics.push(CollectionRecordDiagnostic {
+                id: record.id(),
+                error: CollectionRecordDiagnosticError::InvalidDeriveSignature(error),
+            });
+            discovered.derives.push(record.unsigned());
+        }
+    }
+}
+
 /// Discover and cryptographically classify native collection records.
 ///
 /// The store owns physical decoding and returns only structurally canonical
@@ -289,8 +347,8 @@ where
                     error: CollectionRecordDiagnosticError::InvalidCommit(error),
                 }),
             },
-            CollectionRecord::Merge(record) => discovered.merges.push(record),
-            CollectionRecord::Derive(record) => discovered.derives.push(record),
+            CollectionRecord::Merge(record) => admit_merge(record, &mut discovered),
+            CollectionRecord::Derive(record) => admit_derive(record, &mut discovered),
         }
     }
 
@@ -372,8 +430,8 @@ where
                 matching_commits.push(record)
             }
             CollectionRecord::Commit(_) => {}
-            CollectionRecord::Merge(record) => discovered.merges.push(record),
-            CollectionRecord::Derive(record) => discovered.derives.push(record),
+            CollectionRecord::Merge(record) => admit_merge(record, &mut discovered),
+            CollectionRecord::Derive(record) => admit_derive(record, &mut discovered),
         }
     }
 
@@ -439,8 +497,8 @@ where
                 matching_commits.push(record)
             }
             CollectionRecord::Commit(_) => {}
-            CollectionRecord::Merge(record) => discovered.merges.push(record),
-            CollectionRecord::Derive(record) => discovered.derives.push(record),
+            CollectionRecord::Merge(record) => admit_merge(record, &mut discovered),
+            CollectionRecord::Derive(record) => admit_derive(record, &mut discovered),
         }
     }
 
@@ -448,7 +506,7 @@ where
     let mut verifications =
         verify_matching_commits(&matching_commits, &move |commit| match &verifying_key {
             Ok(verifying_key) => commit.verify_strict_with_key(verifying_key),
-            Err(_) => Err(CommitVerificationError::InvalidPublicKey),
+            Err(_) => Err(SignatureVerificationError::InvalidPublicKey),
         })
         .into_iter();
     matching_commits.retain(|record| {
@@ -477,9 +535,9 @@ where
 fn verify_matching_commits<V>(
     commits: &[CollectionCommit],
     verify_commit: &V,
-) -> Vec<Result<(), CommitVerificationError>>
+) -> Vec<Result<(), SignatureVerificationError>>
 where
-    V: Fn(&CollectionCommit) -> Result<(), CommitVerificationError> + Sync,
+    V: Fn(&CollectionCommit) -> Result<(), SignatureVerificationError> + Sync,
 {
     use rayon::prelude::*;
 
@@ -500,9 +558,9 @@ where
 fn verify_matching_commits<V>(
     commits: &[CollectionCommit],
     verify_commit: &V,
-) -> Vec<Result<(), CommitVerificationError>>
+) -> Vec<Result<(), SignatureVerificationError>>
 where
-    V: Fn(&CollectionCommit) -> Result<(), CommitVerificationError> + Sync,
+    V: Fn(&CollectionCommit) -> Result<(), SignatureVerificationError> + Sync,
 {
     commits.iter().map(verify_commit).collect()
 }
@@ -515,7 +573,9 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
 
-    use crate::collection::{empty_metadata_handle, CollectionData, CollectionHandle};
+    use crate::collection::{
+        empty_metadata_handle, CollectionData, CollectionHandle, CollectionSignature,
+    };
     use crate::inline::Inline;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -602,6 +662,87 @@ mod tests {
     }
 
     #[test]
+    fn a_forged_equation_signature_costs_its_author_the_claim_not_the_equation() {
+        let key = SigningKey::from_bytes(&[9; 32]);
+        let merge = CollectionMerge::sign(&key, collection(1), hash(2), hash(3), hash(4));
+        let derive = CollectionDerive::sign(&key, collection(2), hash(4), hash(5));
+
+        let forge_merge = {
+            let signature = merge.signature().unwrap();
+            let (r, mut s) = signature.components();
+            s.raw[0] ^= 1;
+            CollectionMerge::from_parts(
+                merge.collection(),
+                hash(2),
+                hash(3),
+                merge.result(),
+                Some(CollectionSignature::from_parts(signature.public_key(), r, s)),
+            )
+        };
+        let forge_derive = {
+            let signature = derive.signature().unwrap();
+            let (r, mut s) = signature.components();
+            s.raw[0] ^= 1;
+            CollectionDerive::from_parts(
+                derive.target(),
+                hash(4),
+                hash(5),
+                Some(CollectionSignature::from_parts(signature.public_key(), r, s)),
+            )
+        };
+
+        let mut physical = vec![
+            CollectionRecord::Merge(forge_merge),
+            CollectionRecord::Derive(forge_derive),
+        ];
+        physical.sort_unstable_by_key(CollectionRecord::id);
+        let mut store = ProbeStore {
+            records: physical.into_iter().map(Ok).collect(),
+            ..ProbeStore::default()
+        };
+
+        let discovered = discover_collection_records(&mut store).unwrap();
+
+        // The equation survives, stripped of the evidence that did not hold.
+        // Dropping it instead -- as an invalid commit is dropped -- would let
+        // anyone deny a true equation to a recomputing reader by publishing a
+        // forged signature over it.
+        assert_eq!(discovered.merges, vec![merge.unsigned()]);
+        assert_eq!(discovered.derives, vec![derive.unsigned()]);
+        assert!(discovered.merges[0].signature().is_none());
+        assert!(discovered.derives[0].signature().is_none());
+
+        let reasons: Vec<_> = discovered
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.error.clone())
+            .collect();
+        assert!(reasons.contains(&CollectionRecordDiagnosticError::InvalidMergeSignature(
+            SignatureVerificationError::InvalidSignature
+        )));
+        assert!(reasons.contains(&CollectionRecordDiagnosticError::InvalidDeriveSignature(
+            SignatureVerificationError::InvalidSignature
+        )));
+    }
+
+    #[test]
+    fn a_valid_equation_signature_is_carried_through_discovery() {
+        let key = SigningKey::from_bytes(&[10; 32]);
+        let merge = CollectionMerge::sign(&key, collection(1), hash(2), hash(3), hash(4));
+        let mut store = ProbeStore {
+            records: vec![Ok(CollectionRecord::Merge(merge))],
+            ..ProbeStore::default()
+        };
+        let discovered = discover_collection_records(&mut store).unwrap();
+        assert_eq!(discovered.merges, vec![merge]);
+        assert!(discovered.diagnostics.is_empty());
+        assert_eq!(
+            discovered.merges[0].verify_strict(),
+            Ok(Some(key.verifying_key()))
+        );
+    }
+
+    #[test]
     fn exact_ticket_discovery_selects_only_the_fixed_source_target_proof_domain() {
         let source = collection(1);
         let target = collection(2);
@@ -678,7 +819,7 @@ mod tests {
             &[CollectionRecordDiagnostic {
                 id: invalid_commit.id(),
                 error: CollectionRecordDiagnosticError::InvalidCommit(
-                    CommitVerificationError::InvalidSignature,
+                    SignatureVerificationError::InvalidSignature,
                 ),
             }]
         );
@@ -740,7 +881,7 @@ mod tests {
             &[CollectionRecordDiagnostic {
                 id: relevant_invalid.id(),
                 error: CollectionRecordDiagnosticError::InvalidCommit(
-                    CommitVerificationError::InvalidSignature,
+                    SignatureVerificationError::InvalidSignature,
                 ),
             }]
         );
@@ -786,7 +927,7 @@ mod tests {
             &[CollectionRecordDiagnostic {
                 id: invalid_key_commit.id(),
                 error: CollectionRecordDiagnosticError::InvalidCommit(
-                    CommitVerificationError::InvalidPublicKey,
+                    SignatureVerificationError::InvalidPublicKey,
                 ),
             }]
         );
@@ -906,7 +1047,7 @@ mod tests {
         assert!(parallel_schedule.diagnostics().iter().all(|diagnostic| {
             diagnostic.error
                 == CollectionRecordDiagnosticError::InvalidCommit(
-                    CommitVerificationError::InvalidSignature,
+                    SignatureVerificationError::InvalidSignature,
                 )
         }));
     }

@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use triblespace_core::collection::{
     CollectionCommit, CollectionGossip, CollectionGossipStore, CollectionRecord, CollectionStore,
-    CommitVerificationError, GossipVerificationError,
+    SignatureVerificationError, GossipVerificationError,
 };
 use triblespace_core::id::Id;
 use triblespace_core::repo::StorageFlush;
@@ -207,7 +207,7 @@ pub enum IncomingBatchValidationError {
 pub enum IncomingValidationError {
     /// The commit signature is invalid.
     #[error("invalid commit signature: {0}")]
-    InvalidCommitSignature(CommitVerificationError),
+    InvalidCommitSignature(SignatureVerificationError),
     /// The gossip-grant signature is invalid.
     #[error("invalid gossip signature: {0}")]
     InvalidGossipSignature(GossipVerificationError),

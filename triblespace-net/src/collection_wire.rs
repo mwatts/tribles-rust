@@ -16,7 +16,7 @@ use triblespace_core::collection::{
     COLLECTION_COMMIT_BYTES_LEN, COLLECTION_DERIVE_BYTES_LEN, COLLECTION_GOSSIP_BYTES_LEN,
     COLLECTION_MERGE_BYTES_LEN,
     CollectionCommit, CollectionDerive, CollectionGossip, CollectionHandle, CollectionMerge,
-    CollectionRecord, CommitVerificationError, GossipVerificationError, RecordDecodeError,
+    CollectionRecord, SignatureVerificationError, GossipVerificationError, RecordDecodeError,
 };
 use triblespace_core::id::Id;
 use triblespace_core::repo::{WANT_REQUEST_BYTES_LEN, WantRequest, WantRequestDecodeError};
@@ -90,6 +90,10 @@ pub fn decode_collection_operation_request(
 ///
 /// Distinct results for the same inputs are retained as explicit conflicting
 /// evidence. Byte-identical duplicate records collapse by intrinsic id.
+///
+/// Equations are reduced to their unsigned form before deduplication, so a
+/// locally signed record and the same equation held unsigned collapse to one
+/// receipt rather than answering the same question twice.
 pub fn collection_operation_receipts(
     request: WantRequest,
     records: impl IntoIterator<Item = CollectionRecord>,
@@ -98,7 +102,10 @@ pub fn collection_operation_receipts(
     let receipts: BTreeMap<Id, CollectionRecord> = records
         .into_iter()
         .filter(|record| record_answers_request(*record, request))
-        .map(|record| (record.id(), record))
+        .map(|record| {
+            let record = record.unsigned_equation();
+            (record.id(), record)
+        })
         .collect();
     Ok(receipts.values().copied().collect())
 }
@@ -108,6 +115,13 @@ pub fn collection_operation_receipts(
 /// The four-byte big-endian count is followed by full untagged 128-byte merge
 /// or derive payloads. Selection, sorting, and deduplication happen here so a
 /// store's iteration order cannot leak into the wire representation.
+///
+/// Receipts carry the *equation*, never the signature a local record may
+/// happen to hold. A receipt answers "what does this operation produce", which
+/// is the equation and nothing else; the asker recomputes it, and evidence
+/// about who asserted it locally means nothing to them. Carrying signatures
+/// here would also widen every slot by 75% for a field the common case does
+/// not have. A peer that wants signed evidence asks for the record by id.
 pub fn encode_collection_operation_receipts(
     request: WantRequest,
     records: impl IntoIterator<Item = CollectionRecord>,
@@ -314,7 +328,7 @@ fn decode_operation_receipt(
     bytes: [u8; COLLECTION_OPERATION_RECEIPT_BYTES_LEN],
 ) -> Result<CollectionRecord, CollectionOperationWireError> {
     match request {
-        WantRequest::Merge { .. } => CollectionMerge::from_bytes(bytes)
+        WantRequest::Merge { .. } => CollectionMerge::from_bytes(&bytes)
             .map(CollectionRecord::Merge)
             .map_err(CollectionOperationWireError::InvalidReceipt),
         WantRequest::Derive { .. } => {
@@ -324,9 +338,9 @@ fn decode_operation_receipt(
             if bytes[COLLECTION_DERIVE_BYTES_LEN..].iter().any(|b| *b != 0) {
                 return Err(CollectionOperationWireError::BlobRequest);
             }
-            let mut exact = [0u8; COLLECTION_DERIVE_BYTES_LEN];
-            exact.copy_from_slice(&bytes[..COLLECTION_DERIVE_BYTES_LEN]);
-            Ok(CollectionRecord::Derive(CollectionDerive::from_bytes(exact)))
+            CollectionDerive::from_bytes(&bytes[..COLLECTION_DERIVE_BYTES_LEN])
+                .map(CollectionRecord::Derive)
+                .map_err(CollectionOperationWireError::InvalidReceipt)
         }
         WantRequest::Blob { .. } => Err(CollectionOperationWireError::BlobRequest),
     }
@@ -495,7 +509,7 @@ pub enum CollectionCommitEvidenceError {
     /// The grant failed strict Ed25519 verification.
     InvalidGrantSignature(GossipVerificationError),
     /// The commit failed strict Ed25519 verification.
-    InvalidCommitSignature(CommitVerificationError),
+    InvalidCommitSignature(SignatureVerificationError),
     /// Grant and commit name different authors.
     AuthorMismatch { grant: [u8; 32], commit: [u8; 32] },
     /// Grant and commit name different collections.
